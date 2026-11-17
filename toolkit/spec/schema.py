@@ -179,7 +179,7 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
-                       "unit_attribute", "calibration_target", "outcome_ratio")
+                       "unit_attribute", "calibration_target", "outcome_ratio", "group_outcome_scale")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -1429,6 +1429,30 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                 bad.append(f"decision test {i}: {pl['why']}")
         elif t == "calibration_target":      # F6 run 1, owner decision R1 (toolkit/analysis/decision_tests.py)
             bad += _calibration_target_problems(s, dt, i)
+        elif t == "group_outcome_scale":     # F6 run 2, owner decision D-002 (toolkit/analysis/decision_tests.py)
+            gsc = dt.get("group_outcome_scale")
+            if not isinstance(gsc, dict) or set(gsc) != {"by", "cases"}:
+                bad.append(f"decision test {i}: give group_outcome_scale {{by, cases: [{{group: factor}}]}}")
+                continue
+            try:
+                urows = list(s.units())
+            except Exception as e:  # noqa: BLE001 — the units table is validated elsewhere
+                bad.append(f"decision test {i}: the units table cannot be read ({e})")
+                continue
+            if not urows or gsc["by"] not in urows[0]:
+                bad.append(f"decision test {i}: group_outcome_scale.by {gsc['by']!r} is not a units column")
+                continue
+            groups = {str(r[gsc["by"]]) for r in urows}
+            cs_ = gsc["cases"]
+            if not (isinstance(cs_, list) and cs_ and all(isinstance(c, dict) and c for c in cs_)):
+                bad.append(f"decision test {i}: group_outcome_scale.cases: a non-empty list of {{group: factor}}")
+                continue
+            for c in cs_:
+                for g, f in c.items():
+                    if str(g) not in groups:
+                        bad.append(f"decision test {i}: group {g!r}: no unit has it in {gsc['by']}")
+                    if not (_isnum(f) and 0 < f < float("inf")):
+                        bad.append(f"decision test {i}: group {g!r}: a positive factor")
         elif t == "outcome_ratio":           # F6 run 2, owner decision DT13 (toolkit/analysis/decision_tests.py)
             orc = dt.get("outcome_ratio")
             if not isinstance(orc, dict) or set(orc) != {"component", "reference", "values"}:

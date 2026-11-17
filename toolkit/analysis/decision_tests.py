@@ -703,6 +703,32 @@ def _not_run(A, dt, why, extra=None) -> dict:
             "produced_by": "harness", "producer": PRODUCER, **(extra or {})}
 
 
+def _group_outcome_scale(A, dt, ben0, cost0, plan) -> dict:
+    """F6 run 2, owner decision D-002: the burden of every package, the comparator's included, in each listed group's
+    units multiplied by the group's factor (e.g. external level / engine level), so every benefit there scales by
+    it; costs and every other unit held, the plan re-solved for each case. Emulator outputs only: nothing is evaluated
+    anew. Not run when no listed group has a unit in the analysis."""
+    gc = dt["group_outcome_scale"]
+    by = gc["by"]
+    grp = {i: str(A.by_id[i].get(by)) for i in A.ids}
+    cases, lowers, check = [], [], {}
+    for n, case in enumerate(gc["cases"]):
+        f = {str(g): float(v) for g, v in case.items()}
+        hit = [i for i in A.ids if grp[i] in f]
+        if not hit:
+            return {"not_run": f"no unit of the analysis is in any listed {by} group of case {n + 1}"}
+        ben = {i: ({k: f[grp[i]] * ben0[i][k] for k in ben0[i]} if grp[i] in f else dict(ben0[i])) for i in A.ids}
+        if not check:
+            check = ben
+        label = "; ".join(f"{g} x{v:g}" for g, v in sorted(f.items()))
+        cases.append((label, ben, cost0, None, None))
+        lowers.append(_lowers_only_unchosen(ben0, ben, plan))
+    return {"varied": f"every package's burden in the listed {by} groups' units multiplied by the group's factor "
+                      "(comparator included, so every benefit there scales by it); costs held",
+            "cases": cases, "lowers": lowers,
+            "record": {"by": by, "cases": [dict(c) for c in gc["cases"]], "check": check}}
+
+
 def _outcome_ratio(A, dt, out0, ben0, cost0, plan) -> dict:
     """F6 run 2, owner decision (DT13): each package holding `component` has its primary-outcome burden set to
     `value` times its counterpart's, the package with `reference` in the component's place (the trial's relative
@@ -822,6 +848,12 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         extra["case"] = {"calibration_clamped_units": cr["clamped"]}
         extra["_ct"] = cr["record"]
         cases, lowers = [("case", ben, cost, None, None)], [False]
+    elif t == "group_outcome_scale":
+        gs = _group_outcome_scale(A, dt, ben0, cost0, plan)
+        if gs.get("not_run"):
+            return _not_run(A, dt, gs["not_run"])
+        varied, cases, lowers = gs["varied"], gs["cases"], gs["lowers"]
+        extra["_gs"] = gs["record"]
     elif t == "outcome_ratio":
         orr = _outcome_ratio(A, dt, out0, ben0, cost0, plan)
         if orr.get("not_run"):
@@ -998,6 +1030,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         rec["unit_attribute"] = extra["_ua"]
     if t == "calibration_target":   # each listed unit's target and calibrated value, before and after
         rec["calibration_target"] = extra["_ct"]
+    if t == "group_outcome_scale":  # each case's factors and the scaled benefits of the first case (a check)
+        rec["group_outcome_scale"] = extra["_gs"]
     if t == "outcome_ratio":        # the package pairs and one unit's recomputed benefit (a check)
         rec["outcome_ratio"] = extra["_or"]
     if comps:
