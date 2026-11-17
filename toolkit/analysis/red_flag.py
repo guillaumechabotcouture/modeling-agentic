@@ -40,7 +40,6 @@ RECORD = "mechanism_checks.yaml"
 def flags(alloc: dict, units: list, plan: dict) -> list:
     """[{group, component, dearest_share, units, chosen}] for each group whose dearest component wins nearly
     everywhere. `alloc`: the toolkit/alloc spec; `plan`: {unit id: package}."""
-    return []                       # α: tests first; the rule lands in β
     from toolkit.alloc import costs
     comps = alloc.get("components") or {}
     groups: dict = {}
@@ -77,7 +76,6 @@ def flags(alloc: dict, units: list, plan: dict) -> list:
 
 def record_problems(run_dir: str, flag: dict) -> list:
     """Why the run's mechanism record does not cover `flag` ([] when it does). Fail closed on an unreadable file."""
-    return []                       # α
     p = os.path.join(run_dir, RECORD)
     if not os.path.exists(p):
         return [f"no {RECORD}"]
@@ -103,7 +101,6 @@ def record_problems(run_dir: str, flag: dict) -> list:
 
 def findings(run_dir: str, point: dict | None) -> list:
     """Gate findings (toolkit/analysis/contract.py): one HIGH per uncovered flag; [] without a plan."""
-    return []                       # α
     if not isinstance(point, dict) or not isinstance(point.get("plan"), dict):
         return []
     from toolkit.alloc import costs
