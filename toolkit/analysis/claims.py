@@ -117,6 +117,17 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
             for k, _g in enumerate((d.get("units_changed_by_group") or [])[:GROUPS_SHOWN]):
                 cl.append(_c(f"dt.{tid}.group{k}", "count", arts["decision_tests"],
                              f"{f}.units_changed_by_group[{k}].changed", "units"))
+            # #248: what an outcome_ratio or burden_scale test set (its record's detail in the artifact)
+            for k, _v in enumerate((d.get("outcome_ratio") or {}).get("values") or []):
+                cl.append(_c(f"dt.{tid}.ratio{k}", "scalar", arts["decision_tests"],
+                             f"{f}.detail.outcome_ratio.values[{k}]", "ratio"))
+            bsr = d.get("burden_scale") or {}
+            for k, _s in enumerate(bsr.get("shares") or []):
+                cl.append(_c(f"dt.{tid}.share{k}", "scalar", arts["decision_tests"], f"{f}.detail.burden_scale.shares[{k}]",
+                             "share"))
+            for k, rid in enumerate(sorted(bsr.get("references") or {})):
+                cl.append(_c(f"dt.{tid}.factor{k}", "scalar", arts["decision_tests"],
+                             f"{f}.detail.burden_scale.references.{rid}.factor", "ratio"))
     for r in _spec_rows(A, claimable=True):     # spec-declared engine parameter values and the card values they replace
         n, f = r["name"], f"data.spec_values.{r['name']}"
         cl.append(_c(f"spec_value.{n}.value", "scalar", arts["engine"], f"{f}.value", r["units"]))
@@ -308,6 +319,28 @@ def variants_markdown(A, pv) -> str:
     return "\n".join(L) + "\n"
 
 
+def _tested_text(d: dict, t: str) -> str:
+    """#248: what an outcome_ratio or burden_scale test set, in words, its numbers as claims."""
+    orr = d.get("outcome_ratio") or {}
+    if orr.get("values"):
+        pairs = ", ".join(f"{k} → {v}" for k, v in sorted((orr.get("pairs") or {}).items()))
+        held = orr.get("unpaired") or []
+        return (f"Tested ratios of a package's {orr.get('outcome')} with {orr.get('component')} to the same package's "
+                f"with {orr.get('reference')} in its place: "
+                + ", ".join(f"[CLAIM:dt.{t}.ratio{k}]" for k in range(len(orr["values"])))
+                + f" (package pairs: {pairs}"
+                + (f"; held, with no counterpart: {', '.join(held)}" if held else "") + "). ")
+    bsr = d.get("burden_scale") or {}
+    if bsr.get("shares"):
+        refs = bsr.get("references") or {}
+        return ("Shares of each reference's factor (reference / model) applied: "
+                + ", ".join(f"[CLAIM:dt.{t}.share{k}]" for k in range(len(bsr["shares"])))
+                + "; factors: " + "; ".join(f"{rid} ({refs[rid].get('group')}): [CLAIM:dt.{t}.factor{k}]"
+                                            for k, rid in enumerate(sorted(refs)))
+                + ". " + (f"Assumption: {bsr['assumption']}. " if bsr.get("assumption") else ""))
+    return ""
+
+
 def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None, anchor=None) -> str:
     o = A.primary
     s = A.spec
@@ -454,5 +487,6 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None, a
                  + ", ".join(f"{g['group']}: [CLAIM:dt.{t}.group{k}]" for k, g in enumerate(grp[:GROUPS_SHOWN]))
                  + ")" if grp else "")
               + ". " + (f"Changes the plan on: {', '.join(d['triggered_by'])}. " if d.get("triggered_by") else "")
+              + _tested_text(d, t)
               + f"Result file: `{d['path']}`.", ""]
     return "\n".join(L) + "\n"

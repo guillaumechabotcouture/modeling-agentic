@@ -426,7 +426,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   "units_changed_by_group", "dollars_by_component")},
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
                                                     "rejected_values", "reachable_interaction", "unit_attribute",
-                                                    "burden_scale")
+                                                    "burden_scale", "outcome_ratio")
                                     if k in x}} for x in dts]}, DT.PRODUCER,
         [arts["point"], arts["uncertainty"]] + eng_files
         + sorted({os.path.join(run_dir, f) for x in dts for f in (x.get("arm_inputs") or {})})
@@ -1414,7 +1414,7 @@ def _self_test_joint(ok, q):
         ids_ = {c["id"] for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
                                                                    "calibration", "engine")}, R["point"],
                                                R["uncertainty"], R["stability"], [ro], R["calibration"])}
-        ok("[CLAIM:dt.DTo.ratio0]" in txt_ and "dt.DTo.ratio0" in ids_ and "a with b in its place" in txt_,
+        ok("[CLAIM:dt.DTo.ratio0]" in txt_ and "dt.DTo.ratio0" in ids_ and "package pairs: a → b" in txt_,
            f"JR11g (#248 P3) the results state each tested ratio (a claim) and the package pairs")
         saved_z = A.joint["z"].pop(listed[0])
         try:
@@ -2036,7 +2036,7 @@ def _self_test_burden_scale(ok, R, by):
                                           R["stability"], [rec], R["calibration"])}
     ok("[CLAIM:dt.DTb.share0]" in txt and "[CLAIM:dt.DTb.factor0]" in txt and "[CLAIM:dt.DTb.factor1]" in txt
        and {"dt.DTb.share0", "dt.DTb.share1", "dt.DTb.factor0", "dt.DTb.factor1"} <= ids,
-       "BS-R7 (#248) the results state each share and each reference's factor as claims")
+       "BS-R8 (#248) the results state each share and each reference's factor as claims")
     # Codex review of #246 P2-4: each reference's window is recorded, and a transfer across outcome, age band or
     # window is stated as an assumption
     ok(all("window" in v for v in (bs.get("references") or {}).values()) and "A" in (bs.get("assumption") or ""),

@@ -1446,9 +1446,12 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             if not (isinstance(vs, list) and vs and all(_isnum(v) and 0 < v < float("inf") for v in vs)):
                 bad.append(f"decision test {i}: outcome_ratio.values: positive ratios (the package's burden over its "
                            "counterpart's)")
-            elif all(abs(float(v) - 1.0) <= 1e-12 for v in vs):
-                bad.append(f"decision test {i}: outcome_ratio values of 1 only change nothing (an identity)")
             elif orc["component"] in comps and orc["reference"] in comps:
+                # #248 P2-3: a ratio of 1 sets the burden to the counterpart's, a real case, not an identity
+                cpk = s.packages().get(s.raw["comparator"].get("package"), set())
+                if orc["component"] in set(cpk):       # #248 P2-1 (Codex review of #245): benefits are measured from it
+                    bad.append(f"decision test {i}: the comparator holds {orc['component']}: the test would change "
+                               "the baseline every benefit is measured from")
                 pk = s.packages()
                 if not any(orc["component"] in set(cs) and orc["reference"] not in set(cs)
                            and any(set(c2) == (set(cs) - {orc["component"]}) | {orc["reference"]}
