@@ -1456,6 +1456,21 @@ def _self_test_boundary_engine(ok, R):
     finally:
         A.point_events = saved_ev
     ok(blocked, "BE-R5 (P1-3) the point evaluation's model corrections reach the re-solved plan's guard")
+    # Codex re-review of #252 (P1, P2): a correction on a substituted cell no longer bears on it; no record, not run
+    pu, (pc, _pr) = next(iter(be["pairs"].items()))
+    try:
+        A.point_events = [{"unit": pu, "package": pc, "kind": "reduction_clip"}]
+        try:
+            rec8 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        except AnalysisBlocked as e:
+            rec8 = {"status": f"blocked {e}"}
+        del A.point_events
+        rec9 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.point_events = saved_ev
+    ok(rec8.get("status") == "run", f"BE-R8 a point correction on a cell the engine replaces does not block ({rec8.get('status')})")
+    ok(rec9.get("status") == "not_run" and "corrections" in (rec9.get("reason") or ""),
+       f"BE-R9 without the point evaluation's recorded corrections: not run ({rec9.get('reason')})")
     from toolkit.analysis import boundary as BD_
     saved_be = A.boundary_engine
     try:
