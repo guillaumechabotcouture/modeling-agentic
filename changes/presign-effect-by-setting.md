@@ -1,0 +1,8 @@
+---
+phase: "v2 pre-sign checks"
+commit: "effect by setting"
+---
+
+## Changelog
+
+**Signing is refused while units sit outside the settings of the trials behind a component's effect and nothing tests the engine's effect there.** New `toolkit/engines/effect_settings.py` reads, for each spec component, the effect benchmarks that cover it (`benchmark_coverage.yaml`, cost benchmarks excluded), their arms' settings in the engine's pack, and each setting's unit attributes. These give the trials' covered range per attribute (a mapping attribute per key). It compares that range with the units table's values for every attribute the spec binds to a column. An attribute with one value in every pack setting is a pack convention and is skipped. Each (component, attribute) with units outside needs a `unit_attribute` decision test on that column, an owner-signed `setting_departures: [{component, attribute, reason}]` entry, or an `evidence.effect_by_setting` record (the output of the batch `--plan` describes) showing the effect there is not decision-moving: the averted share is within 25% of the covered edge's, and the order of the group's alternatives is unchanged. Parameter or interaction tests scale the effect in every unit; they are named on the problem but do not cover it. The check is registered in `toolkit/spec/preconditions.py` and judged only when signing, so runs already signed resume unchanged. It is listed on the sign-off sheet with what covers each row. No engine runs here. Retro-check on the F6 rebuilt spec: resistance is covered by DT10; species composition is outside the trial settings for every component. `--plan` sizes the batch at 3,600 benchmark-arm runs (about 260 core-hours).
