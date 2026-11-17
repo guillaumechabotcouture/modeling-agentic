@@ -448,6 +448,8 @@ def _gate_findings(run_dir: str) -> list[dict]:
     if man.get("deliverable_kind") != "estimates":
         out += _boundary(run_dir, bd_doc, pt_doc)
         out += _value_of_information(run_dir, unc_doc, voi_doc)
+        from toolkit.analysis import red_flag as RF      # the dearest option winning nearly everywhere needs a mechanism
+        out += RF.findings(run_dir, pt_doc if (pt_doc or {}).get("plan") else None)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
@@ -693,13 +695,13 @@ def _self_test() -> int:
     def kinds(d):
         return {x["kind"] for x in gate_findings(d)}
 
-    def complete_run(d, cal=None, drop_kind=None, finalize=True, unc=None):
+    def complete_run(d, cal=None, drop_kind=None, finalize=True, unc=None, plan=None):
         """A minimal completed run: every expected artifact kind and deliverable role."""
         S = Store(d, sha256(os.path.join(d, SPEC)), True, {"name": "t", "version": "1", "card_sha256": "x"})
         open(os.path.join(d, "units.csv"), "w").write("id\n1\n")
         pay = {"engine": {"card": {}, "parameters": []}, "batch": {"evaluation": "direct"},
                "calibration": cal or {"method": "none", "units": {}, "diagnostics": {}, "identifiability": {}},
-               "point": {"plan": {}, "averted": {}, "cost_allocated": 0, "mix": {}, "solver": {}},
+               "point": {"plan": plan or {}, "averted": {}, "cost_allocated": 0, "mix": {}, "solver": {}},
                "uncertainty": unc or {"draws": 2, "covers": [], "excludes": [], "label": "", "fixed_plan": {}},
                "stability": {"method": "m", "folds": [], "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"},
                "sensitivity": {"rows": []}, "decision_tests": {"tests": []}, "figures": {"figures": []},
@@ -731,6 +733,19 @@ def _self_test() -> int:
         ok(kinds(d) == {"analysis_contract_missing"}, "K3 an unreadable manifest fails closed")
         S = complete_run(d)
         ok(gate_findings(d) == [], f"K4 a completed harness run for the current signed spec passes: {gate_findings(d)}")
+        from toolkit.analysis import red_flag as RF
+        with tempfile.TemporaryDirectory() as d2:
+            open(os.path.join(d2, SPEC), "w").write("x: 1\n")
+            complete_run(d2, plan={"1": "a"})
+            seen, real = [], RF.findings
+            RF.findings = lambda rd, pt: seen.append(pt) or [{"kind": "red_flag_mechanism", "severity": "HIGH"}]
+            try:
+                got = kinds(d2)
+            finally:
+                RF.findings = real
+            ok("red_flag_mechanism" in got and seen and seen[0]["plan"] == {"1": "a"},
+               f"K4b the gate runs the most-expensive-option check on the point plan (toolkit/analysis/red_flag.py): {got}")
+            ok("red_flag_mechanism" in kinds(d2), "K4c with a spec the check cannot read it fails closed")
         rel = "analysis/sensitivity.yaml"
         doc = yaml.safe_load(open(os.path.join(d, rel)))
         doc["produced_by"] = "agent"

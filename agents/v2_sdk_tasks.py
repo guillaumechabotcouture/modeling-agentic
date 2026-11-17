@@ -220,7 +220,7 @@ PROMPTS["seed_world_model"] = seed_prompt_text().replace("{", "{{").replace("}",
     .replace("{{out_in}}", "{out_in}").replace("{{out}}", "{out}")
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
-        "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",),
+        "critique": (), "fix": ("analysis_settings.yaml", "models/ext/", "mechanism_checks.yaml"), "write": ("manuscript.md",),
         "seed_world_model": (SEED_FILE,)}
 
 
