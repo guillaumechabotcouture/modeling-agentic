@@ -703,6 +703,41 @@ def _not_run(A, dt, why, extra=None) -> dict:
             "produced_by": "harness", "producer": PRODUCER, **(extra or {})}
 
 
+def _outcome_ratio(A, dt, out0, ben0, cost0, plan) -> dict:
+    """F6 run 2, owner decision (DT13): each package holding `component` has its primary-outcome burden set to
+    `value` times its counterpart's, the package with `reference` in the component's place (the trial's relative
+    effect of one net type against another), for each value; benefits re-derived against the comparator, costs and
+    every other package held, the plan re-solved. Emulator outputs only: nothing is evaluated anew. Not run when no
+    package has a counterpart."""
+    oc = dt["outcome_ratio"]
+    c, ref = oc["component"], oc["reference"]
+    pairs = {}
+    for k, cs in A.pk.items():
+        if c in cs and ref not in cs:
+            kk = next((n for n, c2 in A.pk.items() if set(c2) == (set(cs) - {c}) | {ref}), None)
+            if kk is not None:
+                pairs[k] = kk
+    if not pairs:
+        return {"not_run": f"no package with {c} has a counterpart with {ref} in its place"}
+    o = A.primary
+    cases, lowers, check = [], [], {}
+    for v in oc["values"]:
+        r = float(v)
+        ben = {i: dict(ben0[i]) for i in A.ids}
+        for i in A.ids:
+            y0 = out0[i]["y"][A.comp][o]
+            for k, kk in pairs.items():
+                ben[i][k] = A.dfac * (y0 - r * out0[i]["y"][kk][o])
+        if not check:
+            check = {i: ben[i][next(iter(pairs))] for i in A.ids}
+        cases.append((v, ben, cost0, None, None))
+        lowers.append(_lowers_only_unchosen(ben0, ben, plan))
+    return {"varied": f"the {o} of every package with {c} set to each tested ratio times that of the same package with "
+                      f"{ref} in its place", "cases": cases, "lowers": lowers,
+            "record": {"component": c, "reference": ref, "values": list(oc["values"]), "outcome": o, "pairs": pairs,
+                       "check": check}}
+
+
 def _calibration_target(A, dt, z0) -> dict:
     """F6 run 1, owner decision R1: the listed units' calibration targets (calibration.target_column) multiplied by
     `scale` and their calibrated values redone on the outcome emulator's calibration metric (model.cal_grid, as
@@ -787,6 +822,12 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         extra["case"] = {"calibration_clamped_units": cr["clamped"]}
         extra["_ct"] = cr["record"]
         cases, lowers = [("case", ben, cost, None, None)], [False]
+    elif t == "outcome_ratio":
+        orr = _outcome_ratio(A, dt, out0, ben0, cost0, plan)
+        if orr.get("not_run"):
+            return _not_run(A, dt, orr["not_run"])
+        varied, cases, lowers = orr["varied"], orr["cases"], orr["lowers"]
+        extra["_or"] = orr["record"]
     elif t == "scenario_excluded":
         return _not_run(A, dt, f"the spec holds the scenario value {dt['parameter']} fixed by name: {dt['reason']}",
                         {"parameter": dt["parameter"]})
@@ -957,6 +998,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         rec["unit_attribute"] = extra["_ua"]
     if t == "calibration_target":   # each listed unit's target and calibrated value, before and after
         rec["calibration_target"] = extra["_ct"]
+    if t == "outcome_ratio":        # the package pairs and one unit's recomputed benefit (a check)
+        rec["outcome_ratio"] = extra["_or"]
     if comps:
         rec["relevance"] = {"components": sorted(comps), "units_with_component_point_plan": in_plan,
                             "components_in_any_draw_plan": in_draws}

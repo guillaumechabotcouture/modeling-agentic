@@ -108,7 +108,9 @@ docs/design/v2-spec-and-analysis.md §1):
                                            # type unit_attribute: unit_attribute {column, units: [ids] | all,
                                            # values | scale | set_from} (a units-table column, F6);
                                            # type calibration_target: calibration_target {units: [ids], scale}
-                                           # (the listed units' calibration targets scaled, F6 run 1)
+                                           # (the listed units' calibration targets scaled, F6 run 1);
+                                           # type outcome_ratio: outcome_ratio {component, reference, values}
+                                           # (a package's burden at a ratio of its counterpart's, F6 run 2)
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
       burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
     evidence:                              # F6: required when the options use a component whose engine card declares
@@ -177,7 +179,7 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
-                       "unit_attribute", "calibration_target")
+                       "unit_attribute", "calibration_target", "outcome_ratio")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -1427,6 +1429,29 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                 bad.append(f"decision test {i}: {pl['why']}")
         elif t == "calibration_target":      # F6 run 1, owner decision R1 (toolkit/analysis/decision_tests.py)
             bad += _calibration_target_problems(s, dt, i)
+        elif t == "outcome_ratio":           # F6 run 2, owner decision DT13 (toolkit/analysis/decision_tests.py)
+            orc = dt.get("outcome_ratio")
+            if not isinstance(orc, dict) or set(orc) != {"component", "reference", "values"}:
+                bad.append(f"decision test {i}: give outcome_ratio {{component, reference, values}}")
+                continue
+            for k in ("component", "reference"):
+                if orc[k] not in comps:
+                    bad.append(f"decision test {i}: outcome_ratio.{k}: unknown component {orc[k]!r}")
+            if orc["component"] == orc["reference"]:
+                bad.append(f"decision test {i}: outcome_ratio component and reference must differ")
+            vs = orc["values"]
+            if not (isinstance(vs, list) and vs and all(_isnum(v) and 0 < v < float("inf") for v in vs)):
+                bad.append(f"decision test {i}: outcome_ratio.values: positive ratios (the package's burden over its "
+                           "counterpart's)")
+            elif all(abs(float(v) - 1.0) <= 1e-12 for v in vs):
+                bad.append(f"decision test {i}: outcome_ratio values of 1 only change nothing (an identity)")
+            elif orc["component"] in comps and orc["reference"] in comps:
+                pk = s.packages()
+                if not any(orc["component"] in set(cs) and orc["reference"] not in set(cs)
+                           and any(set(c2) == (set(cs) - {orc["component"]}) | {orc["reference"]}
+                                   for c2 in pk.values()) for cs in pk.values()):
+                    bad.append(f"decision test {i}: no package with {orc['component']} has a counterpart with "
+                               f"{orc['reference']} in its place")
         elif t == "cost_items":
             m = dt.get("multipliers")
             if not isinstance(m, dict) or not m:
@@ -1860,6 +1885,21 @@ def _self_test() -> int:
         bad(lambda r: (r["calibration"].update(method="none"),
                        dct(calibration_target={"units": ["0"], "scale": 0.8})(r)), "emulator_inversion",
             "SP-CT6 a calibration_target test without an emulator-inversion calibration is refused")
+        # F6 run 2, owner decision (DT13): a package's burden set to a ratio of its counterpart's (one component swapped)
+        dor = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTo", "type": "outcome_ratio", "text": "t"}, **kw)))
+        bad(dor(), "give outcome_ratio", "SP-OR1 an outcome_ratio test without its mapping is refused")
+        bad(dor(outcome_ratio={"component": "zz", "reference": "b", "values": [0.8]}), "unknown component",
+            "SP-OR2 an unknown component is refused")
+        bad(dor(outcome_ratio={"component": "a", "reference": "a", "values": [0.8]}), "differ",
+            "SP-OR3 a component tested against itself is refused")
+        bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.0]}), "positive",
+            "SP-OR4 a ratio that is not positive is refused")
+        bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [1.0]}), "identity",
+            "SP-OR5 a ratio of 1 only (an identity) is refused")
+        r_o = copy.deepcopy(s.raw)
+        dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
+        ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")
         r_t = copy.deepcopy(s.raw)
         dct(calibration_target={"units": ["0", "3"], "scale": 0.8})(r_t)
         ok(validate(Spec(r_t, d)) == [], f"SP-CT7 a well-formed calibration_target test validates: "
