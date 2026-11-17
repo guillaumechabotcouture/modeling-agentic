@@ -1436,6 +1436,47 @@ def _self_test_boundary_engine(ok, R):
         A.boundary_engine = saved
     ok(rec2.get("status") == "not_run" and "boundary" in rec2.get("reason", ""),
        f"BE-R3 without the boundary check's engine tables: not run, with why ({rec2.get('reason')})")
+    # Codex review of #252 (3 P1, 2 P2)
+    pair = (be.get("pairs") or {}).get(u) or ()
+    others = [k for k in A.pk if k not in pair]
+    chk = (rec.get("boundary_engine") or {}).get("benefit") or {}
+    ok(u is not None and len(pair) == 2 and all(chk[u][k] == be["ben"][u][k] for k in pair)
+       and all(chk[u][k] == ben0[u][k] for k in others),
+       "BE-R4 (P1-1, P1-2) only the chosen package and its runner-up take the engine side's benefit and cost at a "
+       "boundary unit; every other package keeps the point tables'")
+    from toolkit.analysis.core import AnalysisBlocked
+    saved_ev = getattr(A, "point_events", None)
+    try:
+        A.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+    finally:
+        A.point_events = saved_ev
+    ok(blocked, "BE-R5 (P1-3) the point evaluation's model corrections reach the re-solved plan's guard")
+    from toolkit.analysis import boundary as BD_
+    saved_be = A.boundary_engine
+    try:
+        BD_.run(A, {i: A.comp for i in A.ids}, z0, out0, ben0, cost0, None, R["_run_dir"] if "_run_dir" in R else ".",
+                log=lambda *a_: None)
+        cleared = getattr(A, "boundary_engine", "missing") is None
+    except Exception:  # noqa: BLE001
+        cleared = getattr(A, "boundary_engine", "missing") is None
+    finally:
+        A.boundary_engine = saved_be
+    ok(cleared, "BE-R6 (P2-4) a later boundary check with no candidates clears the earlier engine tables")
+    orig_solve = A.solve
+    A.solve = lambda *a_, **k_: (_ for _ in ()).throw(RuntimeError("optimizer status infeasible"))
+    try:
+        rec7 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    except RuntimeError as e:
+        rec7 = {"status": f"raised {e}"}
+    finally:
+        A.solve = orig_solve
+    ok(rec7.get("status") == "not_run" and "infeasible" in (rec7.get("reason") or ""),
+       f"BE-R7 (P2-5) an infeasible re-solve is recorded as not run, with why ({rec7.get('status')})")
 
 
 def _self_test_stability_flagged(ok):
