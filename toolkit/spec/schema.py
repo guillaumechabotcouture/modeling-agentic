@@ -1451,6 +1451,13 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             vs = orc["values"]
             from toolkit.analysis import outcome_adjust as OAm      # F6 run 4 R3: "engine" removes a base adjustment
             based = {str(a.get("component")) for a in OAm.config(s.raw) or [] if isinstance(a, dict)}
+            for a in OAm.config(s.raw) or []:     # Codex review of #251 P1-1, P1-4
+                if isinstance(a, dict) and (orc.get("component") == a.get("reference") or orc.get("reference") ==
+                                            a.get("component") or (orc.get("component") == a.get("component")
+                                                                   and orc.get("reference") != a.get("reference"))):
+                    bad.append(f"decision test {i}: outcome_ratio {orc.get('component')} against "
+                               f"{orc.get('reference')} conflicts with the base adjustment {a.get('id')} "
+                               f"({a.get('component')} against {a.get('reference')})")
             if isinstance(vs, list) and "engine" in vs and orc.get("component") not in based:
                 bad.append(f"decision test {i}: outcome_ratio value \"engine\" needs a base outcome adjustment of "
                            f"{orc.get('component')} (analysis.outcome_adjustments)")
@@ -1458,7 +1465,8 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             if not (isinstance(vs, list) and vs and all(_isnum(v) and 0 < v < float("inf") for v in nums)):
                 bad.append(f"decision test {i}: outcome_ratio.values: positive ratios (the package's burden over its "
                            "counterpart's), or \"engine\"")
-            elif "engine" not in vs and all(abs(float(v) - 1.0) <= 1e-12 for v in vs):
+            elif "engine" not in vs and orc.get("component") not in based and all(abs(float(v) - 1.0) <= 1e-12
+                                                                                    for v in vs):
                 bad.append(f"decision test {i}: outcome_ratio values of 1 only change nothing (an identity)")
             elif orc["component"] in comps and orc["reference"] in comps:
                 pk = s.packages()

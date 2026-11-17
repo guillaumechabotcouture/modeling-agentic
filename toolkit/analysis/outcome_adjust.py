@@ -12,7 +12,7 @@ Spec (optional; checked by toolkit/spec/schema.py through problems()):
 In every evaluation (core.Analysis.evaluate: point, draws, stability, sensitivity, decision tests, plan variants, the
 boundary check's engine side), each package holding `component` and not `reference` has every reported outcome (and
 its window burden) set to `value` times that of its counterpart, the same package with `reference` in the
-component's place. Emulator or engine outputs only: no engine parameter, job or row changes, so stored engine rows
+component's place (every `y` entry, DALY parts included, the window burdens and the grouped outputs). Emulator or engine outputs only: no engine parameter, job or row changes, so stored engine rows
 are reused. Costs are left as computed. A model correction on a counterpart also bears on the package derived from it
 (its copy carries `derived_from`). The comparator may not hold an adjusted component, a reference may not itself be
 adjusted, and a component is adjusted at most once. An outcome_ratio decision test takes the value "engine" to remove
@@ -78,9 +78,37 @@ def problems(raw, pk: dict, comps, comparator: str | None) -> list[str]:
         seen.setdefault(c, a["id"])
         if comparator is not None and c in set(pk.get(comparator, ())):
             bad.append(f"{w}: the comparator {comparator} holds {c}: every benefit is measured from it")
-        if c in comps and r in comps and c != r and not counterparts(pk, c, r):
-            bad.append(f"{w}: no package with {c} has a counterpart with {r} in its place")
+        if c in comps and r in comps and c != r:
+            cp = counterparts(pk, c, r)
+            if not cp:
+                bad.append(f"{w}: no package with {c} has a counterpart with {r} in its place")
+            # Codex review of #251 P1-2: every package the adjustment touches is covered (none keeps the engine's)
+            orphan = sorted(k for k, cs in pk.items() if c in set(cs) and r not in set(cs) and k not in cp)
+            if orphan:
+                bad.append(f"{w}: packages {orphan[:5]} hold {c} but have no counterpart with {r} in its place")
+    # P1-3: one adjusted component per package (two would overwrite each other in an order-dependent way)
+    both = sorted(k for k, cs in pk.items() if len(set(cs) & adjusted) > 1)
+    if both:
+        bad.append(f"{P}: packages {both[:5]} hold more than one adjusted component")
+    # P1-5, P1-6: the burden validation and anchor read their arm's window and age-band outputs, which the adjustment
+    # cannot reach (only the arm is predicted there): the arm may not hold an adjusted component
+    bv = ((raw.get("validation") or {}).get("burden") or {})
+    arm = bv.get("arm") or comparator
+    if bv and arm in pk and set(pk[arm]) & adjusted:
+        bad.append(f"{P}: the validation.burden arm {arm} holds an adjusted component")
+    # P1-7: a likelihood or posterior calibration fits raw engine outcomes, not the adjusted ones
+    if str((raw.get("calibration") or {}).get("method")) in ("likelihood", "posterior"):
+        bad.append(f"{P}: not supported with a likelihood or posterior calibration (it fits the outcomes unadjusted)")
     return bad
+
+
+def _scaled(x, value):
+    """`x` with every number multiplied by value (nested mappings of the outputs' shape)."""
+    if isinstance(x, dict):
+        return {k: _scaled(v, value) for k, v in x.items()}
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        return value * float(x)
+    return x
 
 
 def build(raw, pk: dict) -> list[dict]:
@@ -93,18 +121,20 @@ def build(raw, pk: dict) -> list[dict]:
 def apply(adjust: list[dict], out: dict, ids, outcomes, events=()) -> list[dict]:
     """Set each adjusted package's reported outcomes (and window burdens) in `out` to value x its counterpart's, read
     before any change; returns the model corrections copied onto derived packages."""
+    import copy
     extra = []
     for i in ids:
         row = out[i]
-        ref = {key: {kk: dict(row[key][kk]) for a in adjust for kk in a["pairs"].values() if kk in (row.get(key) or {})}
-               for key in ("y", "burden") if isinstance(row.get(key), dict)}
+        # every outcome entry (the DALY parts included), the window burdens and the grouped outputs (Codex review of
+        # #251 P2-8), each read from the counterpart before any change
+        ref = {key: {kk: copy.deepcopy(row[key][kk]) for a in adjust for kk in a["pairs"].values()
+                     if kk in (row.get(key) or {})}
+               for key in ("y", "burden", "y_group") if isinstance(row.get(key), dict)}
         for a in adjust:
             for k, kk in a["pairs"].items():
                 for key, src in ref.items():
                     if kk in src and k in row[key]:
-                        for o in list(row[key][k]):
-                            if key == "burden" or o in outcomes:
-                                row[key][k][o] = a["value"] * float(src[kk][o])
+                        row[key][k] = _scaled(src[kk], a["value"])
     for a in adjust:
         inv = {}
         for k, kk in a["pairs"].items():
@@ -135,8 +165,9 @@ def _self_test() -> int:
     ev = apply(adj, out, ["u"], ["dalys"], [{"unit": "u", "package": "b+s", "kind": "clip"}])
     y = out["u"]["y"]
     ok(y["a"]["dalys"] == 0.5 * y["b"]["dalys"] and y["a+s"]["dalys"] == 0.5 * y["b+s"]["dalys"]
-       and y["a"]["other"] == 1.0 and out["u"]["burden"]["a"]["dalys"] == 0.5 * out["u"]["burden"]["b"]["dalys"],
-       "OA2 reported outcomes and window burdens follow the counterpart; unreported outputs are left")
+       and y["a"]["other"] == 0.5 * y["b"]["other"]
+       and out["u"]["burden"]["a"]["dalys"] == 0.5 * out["u"]["burden"]["b"]["dalys"] and y["b"]["dalys"] == 12.0,
+       "OA2 every outcome entry and window burden follows the counterpart; the counterpart itself is left")
     ok(ev == [{"unit": "u", "package": "a+s", "kind": "clip", "derived_from": "b+s"}],
        f"OA3 a counterpart's correction is copied onto the derived package ({ev})")
     ok(problems({"analysis": {}}, pk, set("abs"), "none") == [], "OA4 no field, no problem")
