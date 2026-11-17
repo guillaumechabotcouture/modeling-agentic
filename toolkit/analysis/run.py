@@ -343,6 +343,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                                "calibration_status": A.flagged[i]["status"]}
                                               if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
     point["cost_floors"] = floors0
+    if getattr(A, "adjust", None):    # F6 run 4 R3: the base outcome adjustments every evaluation applied
+        from toolkit.analysis import outcome_adjust as OA
+        point["outcome_adjustments"] = OA.record(A.adjust)
     if reserve is not None:
         point["reserve"] = reserve
     if getattr(A, "headline_variant", None):     # F6 S1-6: the headline plan is this variant's
@@ -1376,6 +1379,7 @@ def _self_test_joint(ok, q):
         dto2 = dict(dto, outcome_ratio={"component": "a", "reference": "zz", "values": [0.5]})
         ro2 = DT_.run_one(A, dto2, z0, ben0, cost0, plan, R["uncertainty"], out0)
         ok(ro2.get("status") == "not_run", f"JR11b no counterpart package: not run ({ro2.get('status')})")
+        _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R)
         saved_z = A.joint["z"].pop(listed[0])
         try:
             rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
@@ -1400,6 +1404,71 @@ def _self_test_joint(ok, q):
                and not os.path.exists(os.path.join(d, "analysis", "point.yaml")),
                f"JR5 a clamped emulator inversion blocks at the calibration step, before the point plan ({e.hits})")
     _ = p
+
+
+def _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R):
+    """F6 run 4, owner decision R3: base outcome adjustments in every evaluation (OA-R1..R6)."""
+    import copy
+    from toolkit.analysis import outcome_adjust as OA, decision_tests as DT_, boundary as BD
+    from toolkit.analysis.core import Analysis
+    from toolkit.spec import schema as SC
+    raw = copy.deepcopy(A.spec.raw)
+    raw["analysis"]["outcome_adjustments"] = [{"id": "OA1", "component": "a", "reference": "b", "value": 0.5,
+                                               "source": "toy trial"}]
+    sp = SC.Spec(raw, A.spec.base, getattr(A.spec, "path", None))
+    A2 = Analysis(sp, A.model, log=lambda *a_: None)
+    A2.joint, A2.theta0, A2.flagged = A.joint, dict(A.theta0), getattr(A, "flagged", {})
+    ok(A2.adjust and A2.adjust[0]["pairs"] == {"a": "b"} and not getattr(A, "adjust", None),
+       f"OA-R1 the spec's adjustment reaches the analysis, with its package pairs ({getattr(A2, 'adjust', None)})")
+    out2, ben2, _c = A2.evaluate(A2.theta0, z0)
+    i0 = A.ids[0]
+    ys = all(abs(out2[i]["y"]["a"][o] - 0.5 * out2[i]["y"]["b"][o]) <= 1e-9 * max(1.0, abs(out2[i]["y"]["b"][o]))
+             for i in A.ids for o in A.outcomes)
+    held = all(out2[i]["y"][k][o] == out0[i]["y"][k][o] for i in A.ids for k in A.pk if k != "a" for o in A.outcomes)
+    want = A.dfac * (out0[i0]["y"][A.comp][A.primary] - 0.5 * out0[i0]["y"]["b"][A.primary])
+    ok(ys and held and abs(ben2[i0]["a"] - want) <= 1e-9 * max(1.0, abs(want)),
+       "OA-R2 every reported outcome of package a is 0.5 x b's in the evaluation; every other package, the comparator "
+       "and the costs' inputs are as the model predicts; benefits follow")
+    saved_pred = A2.model.predict
+
+    def planted(zs, theta, ids, noise=None):
+        res = saved_pred(zs, theta, ids, noise=noise)
+        A2.model.last_events = [{"unit": ids[0], "package": "b", "kind": "reduction_clip"}]
+        return res
+    A2.model.predict = planted
+    try:
+        A2.evaluate(A2.theta0, z0)
+        evs = list(A2.last_events)
+    finally:
+        A2.model.predict = saved_pred
+        A2.model.last_events = []
+    ok({"unit": A.ids[0], "package": "a", "kind": "reduction_clip", "derived_from": "b"} in evs,
+       f"OA-R3 a model correction on the reference package also bears on the package derived from it ({evs})")
+    dte = {"id": "DTe", "type": "outcome_ratio", "text": "t",
+           "outcome_ratio": {"component": "a", "reference": "b", "values": ["engine", 0.5]}}
+    rec = DT_.run_one(A2, dte, z0, ben2, cost0, plan, R["uncertainty"], out2)
+    chk = (rec.get("outcome_ratio") or {}).get("check_by_value") or {}
+    eng_b = chk.get("engine", {}).get(i0)
+    ok(rec.get("status") == "run" and eng_b is not None and abs(eng_b - ben0[i0]["a"]) <= 1e-9 * max(1.0, abs(eng_b))
+       and A2.adjust and A2.adjust[0]["component"] == "a",
+       f"OA-R4 an outcome_ratio value \"engine\" re-evaluates with the component's base adjustment removed (the "
+       f"engine's own effect) and restores it ({rec.get('status')}, {eng_b} vs {ben0[i0]['a']})")
+    saved_ev = getattr(A2, "point_events", None)       # Codex re-review of #251 P1-2: numeric cases are guarded
+    try:
+        A2.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A2, dict(dte, outcome_ratio=dict(dte["outcome_ratio"], values=[0.5])), z0, ben2, cost0, plan,
+                        R["uncertainty"], out2)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+    finally:
+        A2.point_events = saved_ev
+    ok(blocked, "OA-R7 (re-review P1-2) a numeric outcome_ratio case is guarded with the point evaluation's corrections")
+    pk_run = BD.run_packages(A2, {"chosen": "a", "runner_up": "none"})
+    ok("b" in pk_run, f"OA-R5 the boundary check runs the counterpart of an adjusted package on the engine ({pk_run})")
+    ok(OA.record(A2.adjust)[0]["value"] == 0.5 and OA.record(A2.adjust)[0]["pairs"] == {"a": "b"},
+       "OA-R6 the adjustments are recorded (id, component, reference, value, source, pairs)")
 
 
 def _self_test_stability_flagged(ok):
