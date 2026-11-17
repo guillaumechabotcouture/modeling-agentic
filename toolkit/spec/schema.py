@@ -1946,8 +1946,12 @@ def _self_test() -> int:
             "SP-OR3 a component tested against itself is refused")
         bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.0]}), "positive",
             "SP-OR4 a ratio that is not positive is refused")
-        bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [1.0]}), "identity",
-            "SP-OR5 a ratio of 1 only (an identity) is refused")
+        r_1 = copy.deepcopy(s.raw)        # Codex review of #245 P2-3: a ratio of 1 sets a's burden to b's (not an identity)
+        dor(outcome_ratio={"component": "a", "reference": "b", "values": [1.0]})(r_1)
+        ok(validate(Spec(r_1, d)) == [], f"SP-OR5 a ratio of 1 is a real case: {validate(Spec(r_1, d))[:2]}")
+        bad(lambda r: (r["comparator"].update(package="a"),
+                       dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.5]})(r)), "comparator",
+            "SP-OR7 (Codex review of #245 P2-1) a test that changes the comparator's own burden is refused")
         r_o = copy.deepcopy(s.raw)
         dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
         ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")
