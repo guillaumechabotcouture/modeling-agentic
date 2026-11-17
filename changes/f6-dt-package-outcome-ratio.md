@@ -1,0 +1,8 @@
+---
+phase: "F6"
+commit: "DT-OR α"
+---
+
+## Changelog
+
+**An `outcome_ratio` decision test (F6 run 2, owner decision DT13).** In F6 run 2's batch the engine gives PBO nets about the same effect as pyrethroid nets (a ratio of about 1.01) in 93% of LGAs. This is not a bug (`F6_run2/pbo_engine_check_run2.md`): Churcher's Equation 4 saturates hut mortality at about 0.93 above x of about 0.3, so PBO nets deter rather than kill at moderate resistance, where no PBO cluster trial exists. The owner asked for a test that sets PBO's relative effect from the trials and states whether the net choice survives it. No existing type does: the engine's PBO parameters act through the saturated mechanism, and an engine hook would change the engine identity for every job. The new type, `outcome_ratio: {component, reference, values}` (`toolkit/analysis/decision_tests.py` `_outcome_ratio`), sets the primary-outcome burden of every package holding `component` to each value times that of its counterpart, the same package with `reference` in the component's place. Benefits are re-derived against the comparator, costs and every other package are held, and the plan is re-solved. It uses emulator outputs only and evaluates nothing anew. The engine, its identity and every stored row are untouched. It is not run when no package has a counterpart. `toolkit/spec/schema.py` refuses at sign-off: unknown components, a component tested against itself, ratios that are not positive, ratios of 1 only, and a spec in which no package has a counterpart. Self-tests SP-OR1-6 (schema) and JR11/JR11b (`run.py`, joint toy: package a's benefit recomputed from b's burden at the ratio, no new evaluation, plan re-solved; no counterpart, not run) failed first (the type was unknown).
