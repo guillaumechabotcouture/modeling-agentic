@@ -1897,6 +1897,22 @@ def _self_test() -> int:
             "SP-OR4 a ratio that is not positive is refused")
         bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [1.0]}), "identity",
             "SP-OR5 a ratio of 1 only (an identity) is refused")
+        # F6 run 2, owner decision D-002 (D-c): every package's burden in a group of units scaled (an external level)
+        dgs = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTg", "type": "group_outcome_scale", "text": "t"}, **kw)))
+        bad(dgs(), "give group_outcome_scale", "SP-GS1 a group_outcome_scale test without its mapping is refused")
+        bad(dgs(group_outcome_scale={"by": "nocol", "cases": [{"r0": 0.5}]}), "not a units column",
+            "SP-GS2 an unknown grouping column is refused")
+        bad(dgs(group_outcome_scale={"by": "region", "cases": [{"zz": 0.5}]}), "no unit",
+            "SP-GS3 a group no unit belongs to is refused")
+        bad(dgs(group_outcome_scale={"by": "region", "cases": [{"r0": 0.0}]}), "positive",
+            "SP-GS4 a factor that is not positive is refused")
+        bad(dgs(group_outcome_scale={"by": "region", "cases": []}), "non-empty",
+            "SP-GS5 no case is refused")
+        r_g = copy.deepcopy(s.raw)
+        dgs(group_outcome_scale={"by": "region", "cases": [{"r0": 0.25}, {"r0": 0.25, "r1": 0.5}]})(r_g)
+        ok(validate(Spec(r_g, d)) == [], f"SP-GS6 a well-formed group_outcome_scale test validates: "
+                                         f"{validate(Spec(r_g, d))[:3]}")
         r_o = copy.deepcopy(s.raw)
         dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
         ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")

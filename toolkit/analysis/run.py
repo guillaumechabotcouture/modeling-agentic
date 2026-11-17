@@ -1370,6 +1370,25 @@ def _self_test_joint(ok, q):
            and ro["results"] and not sent_ and (ro.get("outcome_ratio") or {}).get("pairs") == {"a": "b"},
            f"JR11 an outcome_ratio test sets package a's burden to half of b's, re-solves the plan, and evaluates "
            f"nothing anew ({ro.get('status')}, {got} vs {want}, {len(sent_)} evaluations)")
+        # F6 run 2, owner decision D-002: every package's burden in a group's units scaled, emulator only
+        reg = A.spec["decision_units"]["region"]
+        g0 = A.by_id[A.ids[0]][reg]
+        dtg = {"id": "DTg", "type": "group_outcome_scale", "text": "t",
+               "group_outcome_scale": {"by": reg, "cases": [{g0: 0.25}]}}
+        sent_.clear()
+        A.evaluate = lambda *a_, **k_: (sent_.append(1), orig_ev(*a_, **k_))[1]
+        try:
+            rg_ = DT_.run_one(A, dtg, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        finally:
+            A.evaluate = orig_ev
+        chk = (rg_.get("group_outcome_scale") or {}).get("check") or {}
+        other = next(i for i in A.ids if A.by_id[i][reg] != g0)
+        k_ = next(k for k in A.pk if k != A.comp)
+        ok(rg_.get("status") == "run" and not sent_ and rg_["results"]
+           and abs(chk.get(A.ids[0], {}).get(k_, 0) - 0.25 * ben0[A.ids[0]][k_]) <= 1e-9 * max(1.0, abs(ben0[A.ids[0]][k_]))
+           and abs(chk.get(other, {}).get(k_, 0) - ben0[other][k_]) <= 1e-9 * max(1.0, abs(ben0[other][k_])),
+           f"JR12 a group_outcome_scale test scales the group's benefits, holds the others, re-solves, evaluates "
+           f"nothing anew ({rg_.get('status')}, {len(sent_)} evaluations)")
         dto2 = dict(dto, outcome_ratio={"component": "a", "reference": "zz", "values": [0.5]})
         ro2 = DT_.run_one(A, dto2, z0, ben0, cost0, plan, R["uncertainty"], out0)
         ok(ro2.get("status") == "not_run", f"JR11b no counterpart package: not run ({ro2.get('status')})")
