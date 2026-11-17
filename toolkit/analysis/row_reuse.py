@@ -191,6 +191,56 @@ def _self_test() -> int:
             sent.clear()
             run(d, jobs[:2], eng, rel, log=lambda *a: None, max_workers=2)
         ok(sum(sent) == 2, "RR8 with no trusted source the jobs are computed")
+    # Codex review of #244 (2 P1, 2 P2, 1 P3), reproduced
+    with tempfile.TemporaryDirectory() as d:
+        spec = schema.load(schema.toy_spec(d))
+        eng = spec.engine()
+        _, jobs = B.design(spec)
+        jobs = jobs[:6]
+        rel = "analysis/batch/results.jsonl"
+        bd = os.path.join(d, "analysis", "batch")
+        run(d, jobs, eng, rel, log=lambda *a: None, max_workers=2)
+        # P1-1: a row file the current adapter never recorded is not relabelled by a later write of the record
+        rec = os.path.join(bd, RECORD)
+        ok(os.path.isfile(rec) and all(isinstance(v, str) for v in json.load(open(rec)).values()),
+           "RR10a the adapter is recorded per file digest (adapter_rows.json), not per directory")
+        json.dump({}, open(rec, "w"))          # as if the files were written by another adapter, unrecorded
+        sent.clear()
+        with mock.patch.object(B, "run", spy):
+            run(d, jobs, eng, rel, log=lambda *a: None, max_workers=2)
+        ok(sum(sent) == len(jobs), f"RR10b rows no record binds to the current adapter are not reused unattested, "
+                                   f"and no later call relabels them ({sum(sent)} sent)")
+        # P1-2: an untrusted completed file is never reused by compute.py underneath
+        rows = [json.loads(x) for x in open(os.path.join(d, rel))]
+        rows[0]["result"]["result"]["windows"] = {"cal": {"prev": 0.999}}
+        open(os.path.join(d, rel), "w").write("".join(json.dumps(r) + "\n" for r in rows))
+        for f in os.listdir(bd):
+            if f.endswith(".summary.json") or f.endswith(".reuse.json"):
+                os.remove(os.path.join(bd, f))
+        shutil.rmtree(os.path.join(bd, ARCHIVE), ignore_errors=True)
+        os.remove(rec)
+        r = run(d, jobs[:1], eng, rel, log=lambda *a: None, max_workers=2)
+        v = r["results"][jobs[0]["id"]]["windows"]
+        ok(v != {"cal": {"prev": 0.999}}, f"RR11 an untrusted completed file is not reused through compute.py ({v})")
+        # P2-1: a symlinked archive is refused, nothing written outside the run dir
+        with tempfile.TemporaryDirectory() as out:
+            shutil.rmtree(os.path.join(bd, ARCHIVE), ignore_errors=True)
+            os.symlink(out, os.path.join(bd, ARCHIVE))
+            try:
+                run(d, jobs[:1], eng, rel, log=lambda *a: None, max_workers=2)
+                got = "ran"
+            except Exception as e:  # noqa: BLE001
+                got = type(e).__name__
+            ok(os.listdir(out) == [], f"RR12 a symlinked archive directory receives nothing ({got}, {os.listdir(out)})")
+            os.remove(os.path.join(bd, ARCHIVE))
+        # P2-2: an empty archive directory does not block
+        os.makedirs(os.path.join(bd, ARCHIVE), exist_ok=True)
+        try:
+            run(d, jobs[:1], eng, rel, log=lambda *a: None, max_workers=2)
+            got = "ok"
+        except ValueError as e:
+            got = f"ValueError {e}"
+        ok(got == "ok", f"RR13 an empty archive directory does not block a retry ({got})")
     import inspect
     from toolkit.analysis import run as RN, boundary as BD
     ok("RR.run(" in inspect.getsource(RN) and "RR.run(" in inspect.getsource(BD),
