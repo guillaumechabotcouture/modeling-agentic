@@ -742,7 +742,8 @@ def _outcome_ratio(A, dt, out0, ben0, cost0, plan, z0=None) -> dict:
             ben = {i: dict(ben_e[i]) for i in A.ids}     # Codex review of #251 P1-1: the whole re-evaluation
         else:
             r = float(v)
-            evs[v] = list(getattr(A, "point_events", None) or [])     # Codex re-review of #251 P1-2: out0's corrections
+            pev = list(getattr(A, "point_events", None) or [])     # Codex re-review of #251 P1-2: out0's corrections,
+            evs[v] = pev + OA.derive_events(pev, pairs)             # and the counterparts' on the derived (r3 P1)
             ben = {i: dict(ben0[i]) for i in A.ids}
             for i in A.ids:
                 y0 = out0[i]["y"][A.comp][o]

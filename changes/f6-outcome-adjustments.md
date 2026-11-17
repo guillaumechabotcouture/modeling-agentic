@@ -13,4 +13,4 @@ commit: "OA α"
 - Tests: OA5-9, SP-OA12-13. Codex round 2 raised two P1s, both fixed with their tests written first (γ):
 - With base adjustments, an outcome_ratio test may vary only a base adjustment, an adjusted component against its base reference (`outcome_adjust.dt_problems`, used by sign-off and the run; OA10).
 - Numeric cases are guarded with the point evaluation's corrections (OA-R7).
-Open (follow-up): the adjustment checks do not run while `engine: auto` is still pending (P2).
+Open (follow-up): the adjustment checks do not run while `engine: auto` is still pending (P2). Codex round 3 raised one P1: a numeric ratio also derives from the counterpart without a base adjustment. Its corrections are now copied onto the derived packages (`derive_events`, OA11; δ).

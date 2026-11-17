@@ -116,6 +116,15 @@ def dt_problems(oc: dict, adjust) -> list[str]:
             f"varies a base adjustment (an adjusted component against its base reference), not {c} against {r}"]
 
 
+def derive_events(events, pairs: dict) -> list[dict]:
+    """Copies of the model corrections on each counterpart, onto every package derived from it (`pairs`: {derived:
+    counterpart}), so the guard of a plan choosing the derived package sees them."""
+    inv = {}
+    for k, kk in (pairs or {}).items():
+        inv.setdefault(kk, []).append(k)
+    return [dict(e, package=k, derived_from=e["package"]) for e in events or () for k in inv.get(e.get("package"), [])]
+
+
 def _scaled(x, value):
     """`x` with every number multiplied by value (nested mappings of the outputs' shape)."""
     if isinstance(x, dict):
@@ -150,12 +159,7 @@ def apply(adjust: list[dict], out: dict, ids, outcomes, events=()) -> list[dict]
                     if kk in src and k in row[key]:
                         row[key][k] = _scaled(src[kk], a["value"])
     for a in adjust:
-        inv = {}
-        for k, kk in a["pairs"].items():
-            inv.setdefault(kk, []).append(k)
-        for e in events or ():
-            for k in inv.get(e.get("package"), []):
-                extra.append(dict(e, package=k, derived_from=e["package"]))
+        extra += derive_events(events, a["pairs"])
     return extra
 
 
@@ -218,6 +222,9 @@ def _self_test() -> int:
                                                                                              "reference": "y"}, []),
        "OA10 (re-review P1-1) with base adjustments an outcome_ratio test must be an adjusted component against its "
        "base reference (a test on x against y could move b+x and leave a+x)")
+    ev = [{"unit": "u", "package": "b", "kind": "clip"}, {"unit": "u", "package": "s", "kind": "clip"}]
+    ok(derive_events(ev, {"a": "b"}) == [{"unit": "u", "package": "a", "kind": "clip", "derived_from": "b"}],
+       "OA11 (re-review r3 P1) a counterpart's correction is copied onto each package derived from it")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
