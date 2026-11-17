@@ -10,4 +10,7 @@ commit: "OA α"
 - Sign-off refuses: a package holding the component that has no counterpart (P1-2); a package holding two adjusted components (P1-3); an outcome_ratio test on a base adjustment's reference, or on an adjusted component against another reference (P1-4); a validation.burden or anchor arm holding an adjusted component, whose window and age-band outputs the adjustment cannot reach (P1-5, P1-6); and a likelihood or posterior calibration, which fits raw outcomes (P1-7).
 - Every `y` entry, DALY parts included, and the grouped outputs follow the counterpart (P2-8).
 - A ratio of 1 on an adjusted component is a real case (P2-9).
-- Tests: OA5-9, SP-OA12-13.
+- Tests: OA5-9, SP-OA12-13. Codex round 2 raised two P1s, both fixed with their tests written first (γ):
+- With base adjustments, an outcome_ratio test may vary only a base adjustment, an adjusted component against its base reference (`outcome_adjust.dt_problems`, used by sign-off and the run; OA10).
+- Numeric cases are guarded with the point evaluation's corrections (OA-R7).
+Open (follow-up): the adjustment checks do not run while `engine: auto` is still pending (P2).

@@ -102,6 +102,20 @@ def problems(raw, pk: dict, comps, comparator: str | None) -> list[str]:
     return bad
 
 
+def dt_problems(oc: dict, adjust) -> list[str]:
+    """An outcome_ratio test's conflicts with the base adjustments (sign-off and run): with any base adjustment, the
+    test must vary one of them, its component against its own reference. Any other test could move a package an
+    adjustment reads (b+x through x) while the derived package (a+x) keeps its value (Codex re-review of #251)."""
+    adjust = [a for a in adjust or [] if isinstance(a, dict)]
+    if not adjust:
+        return []
+    c, r = (oc or {}).get("component"), (oc or {}).get("reference")
+    if any(a.get("component") == c and a.get("reference") == r for a in adjust):
+        return []
+    return [f"with base outcome adjustments ({', '.join(str(a.get('id')) for a in adjust)}), an outcome_ratio test "
+            f"varies a base adjustment (an adjusted component against its base reference), not {c} against {r}"]
+
+
 def _scaled(x, value):
     """`x` with every number multiplied by value (nested mappings of the outputs' shape)."""
     if isinstance(x, dict):
@@ -197,6 +211,13 @@ def _self_test() -> int:
     ok(out["u"]["y"]["a"]["__yll"] == 0.5 * out["u"]["y"]["b"]["__yll"]
        and yg["a"]["g1"]["dalys"] == 0.5 * yg["b"]["g1"]["dalys"] and yg["a"]["g2"]["dalys"] == 3.0,
        "OA9 (P2-8) every y entry (DALY parts included) and the grouped outputs follow the counterpart")
+    # Codex re-review of #251 P1-1: with base adjustments, only a test of an adjustment itself is allowed
+    base = [{"id": "x", "component": "a", "reference": "b"}]
+    ok(dt_problems({"component": "x", "reference": "y"}, base)
+       and not dt_problems({"component": "a", "reference": "b"}, base) and not dt_problems({"component": "x",
+                                                                                             "reference": "y"}, []),
+       "OA10 (re-review P1-1) with base adjustments an outcome_ratio test must be an adjusted component against its "
+       "base reference (a test on x against y could move b+x and leave a+x)")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

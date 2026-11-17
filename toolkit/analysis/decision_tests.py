@@ -714,10 +714,10 @@ def _outcome_ratio(A, dt, out0, ben0, cost0, plan, z0=None) -> dict:
     package has a counterpart."""
     oc = dt["outcome_ratio"]
     c, ref = oc["component"], oc["reference"]
-    for a in getattr(A, "adjust", None) or []:      # Codex review of #251 P1-1, P1-4 (sign-off refuses these too)
-        if c == a["reference"] or ref == a["component"] or (c == a["component"] and ref != a["reference"]):
-            return {"not_run": f"the test's {c} against {ref} conflicts with the base adjustment {a['id']} "
-                               f"({a['component']} against {a['reference']})"}
+    from toolkit.analysis import outcome_adjust as OA   # Codex review of #251 P1-1, P1-4 (sign-off refuses these too)
+    conflict = OA.dt_problems(oc, getattr(A, "adjust", None))
+    if conflict:
+        return {"not_run": "; ".join(conflict)}
     pairs = {}
     for k, cs in A.pk.items():
         if c in cs and ref not in cs:
@@ -742,6 +742,7 @@ def _outcome_ratio(A, dt, out0, ben0, cost0, plan, z0=None) -> dict:
             ben = {i: dict(ben_e[i]) for i in A.ids}     # Codex review of #251 P1-1: the whole re-evaluation
         else:
             r = float(v)
+            evs[v] = list(getattr(A, "point_events", None) or [])     # Codex re-review of #251 P1-2: out0's corrections
             ben = {i: dict(ben0[i]) for i in A.ids}
             for i in A.ids:
                 y0 = out0[i]["y"][A.comp][o]

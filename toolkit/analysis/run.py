@@ -1453,6 +1453,18 @@ def _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R):
        and A2.adjust and A2.adjust[0]["component"] == "a",
        f"OA-R4 an outcome_ratio value \"engine\" re-evaluates with the component's base adjustment removed (the "
        f"engine's own effect) and restores it ({rec.get('status')}, {eng_b} vs {ben0[i0]['a']})")
+    saved_ev = getattr(A2, "point_events", None)       # Codex re-review of #251 P1-2: numeric cases are guarded
+    try:
+        A2.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A2, dict(dte, outcome_ratio=dict(dte["outcome_ratio"], values=[0.5])), z0, ben2, cost0, plan,
+                        R["uncertainty"], out2)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+    finally:
+        A2.point_events = saved_ev
+    ok(blocked, "OA-R7 (re-review P1-2) a numeric outcome_ratio case is guarded with the point evaluation's corrections")
     pk_run = BD.run_packages(A2, {"chosen": "a", "runner_up": "none"})
     ok("b" in pk_run, f"OA-R5 the boundary check runs the counterpart of an adjusted package on the engine ({pk_run})")
     ok(OA.record(A2.adjust)[0]["value"] == 0.5 and OA.record(A2.adjust)[0]["pairs"] == {"a": "b"},
