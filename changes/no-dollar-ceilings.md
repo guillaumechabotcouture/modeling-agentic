@@ -1,0 +1,8 @@
+---
+phase: "v2 debt"
+commit: "no hard dollar ceilings"
+---
+
+## Changelog
+
+**Spend caps and budgets warn, project, record and alert; they never stop a job or refuse a launch for dollars (owner decision, 2026-11-17).** `cloud/budget.py`: `launch_budget_ok` and `reattach_budget_ok` take `warn_over`. With it, a launch over the budget, or a re-attach past the cap, is admitted and reserved, with a WARNING text and a spend alert. Every launcher passes it (`vm_job`, `launch_watch`, `run_cluster.budget_guard`). Refusals that are not about dollars stand: no scope, an unsigned or unstarted budget, a name outside the prefixes. `alert()` appends to `~/.config/modeling-agentic/spend_alerts.jsonl` and prints `SPEND ALERT`; `budget.py alerts` lists them. `cap_level` and `cap_projection` give `under_cap`, `over_cap`, or `far_over_cap` at `CAP_ALERT_MULTIPLE` (1.5) × the cap, plus the burn rate and the projected spend. `cloud/vm_job.py` `run` and `wait --cap-usd`, and `cloud/launch_watch.py`, write a projection record on every reading (`cap_projection.json` or `cap_projection_<token>.json`, with a `level` field). Each upward crossing, and three unreadable readings in a row, logs a WARNING and records an alert. No stop at the cap, at any multiple of it, or on an unreadable cost: launch_watch exits 3 and 11 are retired. The hard stops left are the job's `--max-hours`, the cluster timeouts and the watch's `--max-hours`. `vm_job run` and `wait --cap-usd` now handle SIGTERM like Ctrl-C, so the cluster is stopped by id; before, SIGTERM skipped that `finally`.

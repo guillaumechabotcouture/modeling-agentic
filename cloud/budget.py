@@ -78,6 +78,66 @@ USD_PER_CREDIT = 0.061
 RATE_SAMPLE = 5                 # stopped clusters the measured rate is the median of
 RESERVATION_S = 2 * 3600        # a reservation lapses this long after it was made, if no cluster of its name appears
 MAX_DAYS = 60
+# No hard dollar ceilings (owner decision, 2026-11-17). Caps and budgets warn, project, record and alert; they never
+# stop a running job or refuse a launch for dollars. CAP_ALERT_MULTIPLE x a cap is the louder alert threshold
+# ("far_over_cap"); it stops nothing. Every crossing is appended to ALERTS_FILE in the budget directory (alert()),
+# which the supervising loop reads (`budget.py alerts`).
+CAP_ALERT_MULTIPLE = 1.5
+ALERTS_FILE = "spend_alerts.jsonl"
+
+
+def cap_level(usd, cap_usd) -> str:
+    """'under_cap', 'over_cap' (at or past the cap) or 'far_over_cap' (at or past CAP_ALERT_MULTIPLE x it)."""
+    return "far_over_cap" if usd >= CAP_ALERT_MULTIPLE * cap_usd else "over_cap" if usd >= cap_usd else "under_cap"
+
+
+def alert(kind, **fields) -> dict:
+    """Record a spend alert: one JSON line in <budget dir>/spend_alerts.jsonl and a SPEND ALERT line on stdout. A record
+    that cannot be written is said on stdout; it never raises (an alert never stops work)."""
+    rec = {"at": _iso(time.time()), "kind": str(kind), **fields}
+    path = _ENV.path(ALERTS_FILE)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(rec, sort_keys=True, default=str) + "\n")
+    except OSError as e:
+        print(f"SPEND ALERT (not recorded: {type(e).__name__}: {e})", flush=True)
+    print(f"SPEND ALERT {kind}: " + ", ".join(f"{k}={v}" for k, v in fields.items()), flush=True)
+    return rec
+
+
+def read_alerts(path=None) -> list:
+    """Every recorded spend alert, oldest first; a line that does not parse is kept as {'unreadable': line}."""
+    out = []
+    try:
+        with open(path or _ENV.path(ALERTS_FILE)) as f:
+            for ln in f:
+                if ln.strip():
+                    try:
+                        out.append(json.loads(ln))
+                    except ValueError:
+                        out.append({"unreadable": ln.strip()[:200]})
+    except OSError:
+        pass
+    return out
+
+
+def cap_projection(readings, cap_usd, deadline=None) -> dict:
+    """A spend record: the last reading, its level (cap_level), the burn rate over `readings` ([(unix time, usd),
+    ...]), when the cap and the alert threshold are projected to be crossed, and (with `deadline`) the spend then.
+    Rates need two readings."""
+    t, usd = readings[-1]
+    rate = None
+    if len(readings) >= 2 and t > readings[0][0]:
+        rate = max(0.0, (usd - readings[0][1]) / ((t - readings[0][0]) / 3600))
+
+    def hours_to(x):
+        return round(max(0.0, x - usd) / rate, 2) if rate else None
+    return {"at": _iso(t), "usd": round(usd, 2), "cap_usd": round(float(cap_usd), 2), "level": cap_level(usd, cap_usd),
+            "alert_multiple": CAP_ALERT_MULTIPLE, "usd_per_hour": round(rate, 4) if rate is not None else None,
+            "hours_to_cap": hours_to(cap_usd), "hours_to_far_over_cap": hours_to(CAP_ALERT_MULTIPLE * cap_usd),
+            "projected_usd_at_deadline": (round(usd + rate * max(0.0, deadline - t) / 3600, 2)
+                                          if rate is not None and deadline else None)}
 CLOCK_SKEW_S = 30            # tolerated difference between this clock and Coiled's
 # VM types seen on our clusters' instance records (read-only check, 2026-11-11): every scheduler and keeper, the
 # P6 compute workers, and vm_job --cpu 32 / --cpu 64. vm_job sizes by --cpu, and Coiled picked Standard_D<cpu>_v5.
@@ -740,11 +800,14 @@ class _Lock:
         return False
 
 
-def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, clusters_file=None) -> tuple[bool, str]:
+def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, clusters_file=None,
+                     warn_over=False) -> tuple[bool, str]:
     """ok only if the scope's owner-signed budget verifies and has started, `name` starts with one of its signed
     prefixes, and used + open reservations + `cap_usd` is within it. With `reserve`, a launch that fits records a
     reservation of `cap_usd` for `name` (under the same lock), under `invocation` (default MA_LAUNCH_INVOCATION) and,
-    when given, the launcher's clusters.json, whose ids for that invocation bind the reservation. Any error refuses."""
+    when given, the launcher's clusters.json, whose ids for that invocation bind the reservation. Any error refuses.
+    `warn_over` (every launcher, owner 2026-11-17: no launch is refused for dollars): a launch that does not fit is
+    admitted all the same, reserved, and recorded as a `launch_over_budget` alert; the text starts with WARNING."""
     env = _ENV
     try:
         cap = _num(cap_usd, "cap_usd")
@@ -760,7 +823,7 @@ def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, cluste
             if not name.startswith(tuple(s["prefixes"])):
                 return False, f"{name} is outside budget {scope}'s signed prefixes {s['prefixes']}"
             fits = round(s["used_usd"] + s["reserved_usd"] + cap, 6) <= round(s["budget_usd"], 6)
-            if fits and reserve:
+            if (fits or warn_over) and reserve:
                 keep = s["_keep"]
                 inv = invocation or os.environ.get("MA_LAUNCH_INVOCATION") or os.urandom(6).hex()
                 entry = {"scope": scope, "cap_usd": cap, "name": name, "invocation": str(inv), "time": now}
@@ -775,6 +838,12 @@ def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, cluste
         return False, f"budget check failed closed: {type(e).__name__}: {e}"
     warns = sorted({f"{r['name']}: {a}" for r in s["clusters"] for a in r.get("assumptions", [])
                     if a.startswith("WARNING")})
+    if warn_over and not fits:
+        alert("launch_over_budget", scope=scope, name=name, cap_usd=cap, used_usd=round(s["used_usd"], 2),
+              reserved_usd=round(s["reserved_usd"], 2), budget_usd=round(s["budget_usd"], 2))
+        return True, (f"WARNING: over budget, admitted (no launch is refused for dollars): {scope}: used "
+                      f"${s['used_usd']:.2f} + reserved ${s['reserved_usd']:.2f} + cap ${cap:.2f} > budget "
+                      f"${s['budget_usd']:.2f}" + "".join(f"\n{w}" for w in warns))
     return fits, (f"{scope}: used ${s['used_usd']:.2f} (billed ${s['billed_usd']:.2f}) + reserved "
                   f"${s['reserved_usd']:.2f} + cap ${cap:.2f} {'<=' if fits else '>'} budget ${s['budget_usd']:.2f}"
                   + "".join(f"\n{w}" for w in warns))
@@ -805,13 +874,16 @@ def lifetime_meter(scope):
     return meter
 
 
-def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocation=None) -> tuple[bool, str]:
+def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocation=None,
+                       warn_over=False) -> tuple[bool, str]:
     """`vm_job wait --cap-usd`: re-attach a cap to the running cluster `cluster_id`. Under the ledger lock: refused when
     its lifetime cost is at or above the cap, or when used + the other launches' reservations + the rest of the cap
     exceeds the budget. The rest is cap - lifetime cost, or cap - lifetime estimate for a cluster created before the
     budget's window; both costs come from the one details record the windowed spend read. When it fits, the cluster's reservations are replaced by one, bound to `cluster_id` through
     `clusters_file`, whose outstanding amount is the cap's remaining. A budget, listing or cost that cannot be read
-    raises (BudgetError or the source's error): the caller retries, then stops the cluster."""
+    raises (BudgetError or the source's error): the caller retries, then stops the cluster. `warn_over` (owner
+    2026-11-17): a cluster at or past the cap, or a rest that does not fit, is accepted with a WARNING text and a
+    `reattach_over_budget` alert; the reservation holds what is left of the cap (nothing, past it)."""
     env = _ENV
     cap = _num(cap_usd, "cap_usd")
     if cap <= 0:
@@ -829,7 +901,7 @@ def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocati
         # clock as the windowed row, so billing that advances between two requests cannot shrink the reservation.
         life_row = _cluster_cost(m["dets"][cluster_id], now, -math.inf, m["median"], m["prices"], m["sched_bound"])
         life = life_row["usd"]
-        if life >= cap:
+        if life >= cap and not warn_over:
             return False, (f"cluster {cluster_id} has already spent ${life:.2f} since its creation, at or above the "
                            f"${cap:.2f} cap")
         # What the window can still add before the lifetime meter stops the cluster. The meter stops at
@@ -842,6 +914,8 @@ def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocati
         # no live instance adds nothing more: the rest is cap - life (its final bill may be under its estimate).
         older = row["created"] < m["start"] and life_row["live_instances"]
         remaining = cap - (life_row["estimate_usd"] if older else life)
+        if warn_over:
+            remaining = max(0.0, remaining)
         own = [r for r in s["reservations"] if cluster_id in r["cluster_ids"]]
         others = s["reserved_usd"] - sum(r["outstanding_usd"] for r in own)
         fits = round(s["used_usd"] + others + remaining, 6) <= round(s["budget_usd"], 6)
@@ -849,7 +923,8 @@ def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocati
                f"${remaining:.2f} (cap ${cap:.2f} - ${cap - remaining:.2f} "
                f"{'lifetime estimate: created before the window' if older else 'spent'}) "
                f"{'<=' if fits else '>'} budget ${s['budget_usd']:.2f}")
-        if fits:
+        over = not fits or life >= cap
+        if fits or warn_over:
             fields = ("scope", "cap_usd", "name", "invocation", "time", "clusters_file")
             drop = [{k: r[k] for k in fields if k in r} for r in own]
             keep = [r for r in s["_keep"] if r not in drop]
@@ -860,6 +935,10 @@ def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocati
                 keep.append({"scope": scope, "cap_usd": remaining + row["usd"], "name": name, "invocation": inv,
                              "time": now, "clusters_file": os.path.abspath(str(clusters_file))})
             _write_json_atomic(env.reservations, keep)
+    if warn_over and over:
+        alert("reattach_over_budget", scope=scope, name=name, cluster_id=cluster_id, cap_usd=cap,
+              lifetime_usd=round(life, 2), why=why)
+        return True, f"WARNING: accepted over the cap or budget (no stop for dollars): {why}"
     return fits, why
 
 
@@ -951,6 +1030,13 @@ def _self_test() -> int:
         if not cond:
             fails.append(msg)
 
+    # BKS (owner decision, 2026-11-17): no hard dollar ceilings; caps warn, project and alert.
+    pr = cap_projection([(0.0, 4.0), (3600.0, 6.0)], 5.0, deadline=7200.0)
+    ok(cap_level(4.9, 5) == "under_cap" and cap_level(5, 5) == "over_cap" and cap_level(7.5, 5) == "far_over_cap"
+       and pr["usd"] == 6.0 and pr["level"] == "over_cap" and pr["usd_per_hour"] == 2.0
+       and pr["hours_to_far_over_cap"] == 0.75 and pr["projected_usd_at_deadline"] == 8.0
+       and cap_projection([(0.0, 6.0)], 5.0)["usd_per_hour"] is None,
+       f"BKS1 a cap has levels (not stops) and a projection gives the burn rate and the time to each: {pr}")
     def case(label, fn):
         try:
             fn()
@@ -1316,6 +1402,16 @@ def _self_test() -> int:
             ok(not launch_budget_ok("f6", 1, "lw-smoke-x1")[0], "BR11c a budget that starts in the future refuses")
             with_env(env(os.path.join(d, "none"), source=_FakeSource(items, dets)))
             ok(not launch_budget_ok("f6", 1, "lw-smoke-x1")[0], "BR11d no signed budget, no launch")
+            # BR11e (owner decision, 2026-11-17): with warn_over a launch over the budget is admitted, reserved and
+            # alerted; a launch outside the signed prefixes is still refused (not a dollar refusal).
+            with_env(env(r, source=_FakeSource(items, dets)))
+            with contextlib.redirect_stdout(io.StringIO()):
+                w1 = launch_budget_ok("f6", 50.01, "lw-smoke-x1", warn_over=True)
+                w2 = launch_budget_ok("f6", 1, "ev-z", warn_over=True)
+            al = read_alerts()
+            ok(w1[0] and w1[1].startswith("WARNING") and abs(spend("f6")["reserved_usd"] - 50.01) < 1e-6
+               and not w2[0] and al and al[-1]["kind"] == "launch_over_budget" and al[-1]["name"] == "lw-smoke-x1",
+               f"BR11e over the budget a launch is admitted, reserved and alerted, never refused for dollars: {w1} {al[-1:]}")
         case("BR11", bg11)
 
         def bg12():
@@ -1669,6 +1765,10 @@ def _self_test() -> int:
             ok(not g[0] and "already spent" in g[1] and m(40) >= 100.0 and job_meter("f6")(40) < 50,
                f"BR22c a cluster created before the budget's window is capped on its lifetime cost, not the window's: "
                f"{g[1]} lifetime={m(40):.2f}")
+            with contextlib.redirect_stdout(io.StringIO()):
+                gw = reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf, warn_over=True)
+            ok(gw[0] and gw[1].startswith("WARNING") and read_alerts()[-1]["kind"] == "reattach_over_budget",
+               f"BR22w (owner 2026-11-17) with warn_over a cluster past its cap is accepted and alerted: {gw}")
             r, src, ok1, cf = world("d", 100.0, 20, 10.0)
             src.det[40] = BudgetError("details unavailable")
             ok(refused(lambda: reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)) is not None
@@ -1752,9 +1852,14 @@ def main(argv=None) -> int:
     st.add_argument("--days", type=float, default=14, help=f"days until the budget expires (at most {MAX_DAYS})")
     for nm in ("show", "status"):
         sub.add_parser(nm).add_argument("--scope", default=None, help="default: every budget present")
+    sub.add_parser("alerts", help="every spend alert recorded (cap and budget crossings), oldest first") \
+        .add_argument("--last", type=int, default=50)
     a = ap.parse_args(argv)
     try:
-        if a.cmd == "init-key":
+        if a.cmd == "alerts":
+            for r in read_alerts()[-a.last:]:
+                print(json.dumps(r, sort_keys=True))
+        elif a.cmd == "init-key":
             print(f"owner key created: private half in the login keychain, public half in {_ENV.pub_file} "
                   f"({init_key()[:16]}...). Commit that file.")
         elif a.cmd == "set":
