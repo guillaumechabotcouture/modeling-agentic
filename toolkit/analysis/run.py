@@ -901,7 +901,7 @@ def _self_test() -> int:
                 pass
         ok(open(os.path.join(out, "v")).read() == "untouched",
            "AR-RW1 an analysis artifact and the manifest are not written through a link or a planted .tmp")
-    DG.check_capture(ok)
+    DG.check_capture(ok, failed=fails)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
