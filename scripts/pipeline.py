@@ -29,7 +29,9 @@ once and the harness runs them, like `make` (docs/design/stage-machine.md §3.2)
         inputs: [allocation.csv]
         outputs: ["figures/*.png"]
 
-Step keys: id, run, inputs, outputs, and optionally purpose, timeout_s; a
+Step keys: id, run, inputs, outputs, and optionally purpose, timeout_s (a soft
+deadline: warned about and recorded in models/pipeline_progress.json, the step
+killed only at its backstop; see DEFAULT_TIMEOUT_S); a
 compute step (`run: "compute: <path.py>::<fn>"`) also needs inputs_jsonl, out
 (one of its outputs) and purpose. Anything else is a validation error. A
 step's input that matches another step's output is an edge of the DAG.
@@ -65,7 +67,7 @@ the step runs in a temporary copy of the run directory, and nothing in the
 run directory changes; the copy is removed afterwards unless `--keep`.
 
 Like scripts/derived_rebuild.py: commands run from the run directory, without
-cloud credentials, each in its own process group (killed on timeout), within
+cloud credentials, each in its own process group (killed at its backstop), within
 an optional total time budget.
 
 Known limits: a script's undeclared data reads (an `open()` of a file not in
@@ -97,15 +99,25 @@ REPO = os.path.dirname(HERE)
 SPEC = os.path.join("models", "pipeline.yaml")
 STATE = os.path.join("models", "pipeline_state.json")
 REPORT = os.path.join("models", "pipeline_report.json")
+PROGRESS = os.path.join("models", "pipeline_progress.json")
 _RUN_ID = None           # the current run()'s id (MA_PIPELINE_RUN in its steps)
 # The runner's own records: written by the harness run only (protected in
 # agents/enforcement.py SCRIPT_OUTPUTS).
 OWN_FILES = ("models/pipeline_state.json", "models/pipeline_state.json.tmp",
-             "models/pipeline_report.json", "models/pipeline_report.json.tmp")
+             "models/pipeline_report.json", "models/pipeline_report.json.tmp",
+             "models/pipeline_progress.json")
 STEP_KEYS = {"id", "run", "inputs", "outputs", "purpose", "timeout_s", "inputs_jsonl", "out"}
 COMPUTE_KEYS = {"inputs_jsonl", "out"}
 TOP_KEYS = {"steps", "version"}
+# Warn, don't kill (owner, 2026-11-17: two real runs died at a fixed 1 h step limit; on the VM path the analyze step
+# needs 5-6 h). A step's `timeout_s` (default DEFAULT_TIMEOUT_S) is a SOFT deadline: past it the runner warns on
+# stderr and writes PROGRESS every PROGRESS_EVERY_S, and the step runs on. Only the backstop kills: the larger of
+# BACKSTOP_MULTIPLE x the soft deadline and BACKSTOP_FLOOR_S, for a runaway or a true hang. A caller's total
+# pipeline budget (`budget_s`, its own declared limit) still bounds a step.
 DEFAULT_TIMEOUT_S = 3600
+BACKSTOP_MULTIPLE = 3
+BACKSTOP_FLOOR_S = 24 * 3600.0
+PROGRESS_EVERY_S = 900.0
 KILL_GRACE_S = 10           # after a timeout kill: how long to wait for the step's pipes to close
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _GLOB = re.compile(r"[*?\[]")
@@ -718,12 +730,40 @@ def plan(run_dir: str, steps: list[dict] | None = None, state: dict | None = Non
 # Running
 # --------------------------------------------------------------------------- #
 
-def _run_cmd(cmd, cwd, timeout_s, env, shell=False):
-    """Own process group; on timeout the whole group is killed (as derived_rebuild)."""
+def backstop_s(soft_s: float) -> float:
+    """The wall time at which a step is killed: BACKSTOP_MULTIPLE x its soft deadline, or BACKSTOP_FLOOR_S."""
+    return max(BACKSTOP_MULTIPLE * float(soft_s), BACKSTOP_FLOOR_S)
+
+
+def _communicate(p, timeout_s, soft_s=None, on_overrun=None):
+    """p.communicate() to `timeout_s` (raises TimeoutExpired there). With `soft_s` and `on_overrun`, it calls
+    on_overrun(elapsed) once the soft deadline passes and every PROGRESS_EVERY_S after, the process running on."""
+    t0 = time.time()
+    if soft_s is None or on_overrun is None or soft_s >= timeout_s:
+        return p.communicate(timeout=timeout_s)
+    nxt = soft_s
+    while True:
+        try:
+            return p.communicate(timeout=max(0.01, min(nxt, timeout_s) - (time.time() - t0)))
+        except subprocess.TimeoutExpired:
+            el = time.time() - t0
+            if el >= timeout_s:
+                raise
+            if el >= nxt:
+                try:
+                    on_overrun(el)
+                except Exception as e:  # noqa: BLE001 -- a warning that fails never stops the step
+                    print(f"[pipeline] progress record failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                nxt = el + PROGRESS_EVERY_S
+
+
+def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None):
+    """Own process group; at `timeout_s` the whole group is killed (as derived_rebuild). `soft_s`/`on_overrun`: see
+    _communicate (the step's soft deadline: warned about, never killed)."""
     p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                          text=True, env=env, start_new_session=True, shell=shell)
     try:
-        _out, err = p.communicate(timeout=timeout_s)
+        _out, err = _communicate(p, timeout_s, soft_s, on_overrun)
         # Review #4: a process the step left in the background (`cmd &`) would keep
         # writing declared outputs after the step is recorded and its grant ends.
         try:
@@ -747,10 +787,14 @@ def _run_cmd(cmd, cwd, timeout_s, env, shell=False):
                 except OSError:
                     pass
             p.wait()
-        return None, f"timed out after {timeout_s:.0f}s (process group killed)"
+        past = f" at its backstop (soft deadline {soft_s:.0f}s)" if soft_s is not None else ""
+        return None, f"timed out after {timeout_s:.0f}s{past} (process group killed)"
 
 
-def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None) -> tuple[int | None, str]:
+def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None, soft_s: float | None = None,
+               on_overrun=None) -> tuple[int | None, str]:
+    """Run one step to `timeout_s` (its backstop); `soft_s`/`on_overrun` as _communicate. A compute step's batch
+    gets the backstop as its own wall limit, so the batch is not stopped at the soft deadline either."""
     env = script_env()
     env["MA_PIPELINE_RUN_DIR"] = run_dir     # the trusted root a harness step writes under (the dir it runs in)
     if _RUN_ID:
@@ -766,8 +810,8 @@ def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None) -
             cmd = [python or sys.executable, os.path.join(HERE, "compute.py"), "map", run_dir, "--fn", fn,
                    "--inputs", os.path.join(run_dir, step["inputs_jsonl"]), "--out", os.path.join(run_dir, step["out"]),
                    "--purpose", step["purpose"].strip(), "--timeout-s", str(max(1.0, timeout_s))]
-            return _run_cmd(cmd, run_dir, timeout_s + 60, env)
-        return _run_cmd(step["run"], run_dir, timeout_s, env, shell=True)
+            return _run_cmd(cmd, run_dir, timeout_s + 60, env, soft_s=soft_s, on_overrun=on_overrun)
+        return _run_cmd(step["run"], run_dir, timeout_s, env, shell=True, soft_s=soft_s, on_overrun=on_overrun)
     finally:
         shutil.rmtree(cache, ignore_errors=True)
 
@@ -816,8 +860,55 @@ def _trusted_outputs(rec) -> dict:
     return out if isinstance(out, dict) else {}
 
 
+def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_start: float, elapsed: float | None,
+                     last_s, state: str) -> None:
+    """PROGRESS, this step's entry: where it stands against its soft deadline and its backstop, and a projection of
+    when it ends (a compute step: from the rows its batch has written; otherwise its last recorded runtime)."""
+    now = time.time()
+    el = (now - t_start) if elapsed is None else elapsed
+    proj, basis = None, None
+    fn = _compute_fn(step)
+    if fn is not None:
+        try:
+            total = sum(1 for ln in open(os.path.join(run_dir, step["inputs_jsonl"])) if ln.strip())
+            done = sum(1 for ln in open(os.path.join(run_dir, step["out"])) if ln.strip())
+            if total and done:
+                proj, basis = el * total / done, f"{done} of {total} rows written"
+        except OSError:
+            pass
+    if proj is None and isinstance(last_s, (int, float)) and last_s > el:
+        proj, basis = float(last_s), "the step's last recorded runtime"
+    entry = {"state": state, "pipeline_run": _RUN_ID, "started_at": _iso(t_start), "at": _iso(now),
+             "elapsed_s": round(el, 1), "soft_deadline_s": soft_s, "backstop_s": hard_s,
+             "backstop_at": _iso(t_start + hard_s), "backstop_rule": f"max({BACKSTOP_MULTIPLE} x soft deadline, "
+             f"{BACKSTOP_FLOOR_S / 3600:g} h), within any pipeline budget",
+             "projected_total_s": round(proj, 1) if proj is not None else None, "projection_basis": basis,
+             "projected_past_backstop": (proj > hard_s) if proj is not None else None}
+    try:
+        doc = json.load(open(os.path.join(run_dir, PROGRESS)))
+        doc = doc if isinstance(doc, dict) and isinstance(doc.get("steps"), dict) else {"steps": {}}
+    except (OSError, ValueError):
+        doc = {"steps": {}}
+    doc["steps"][step["id"]] = entry
+    _write_json(run_dir, PROGRESS, doc)
+    if state == "running":
+        print(f"[pipeline] WARNING step {step['id']}: running {_dur(el)}, past its soft deadline of {_dur(soft_s)}; "
+              f"it runs on, killed only at its backstop of {_dur(hard_s)} ({entry['backstop_at']})"
+              + (f"; projected total {_dur(proj)} ({basis})" if proj is not None else "; no projection yet"),
+              file=sys.stderr, flush=True)
+
+
+def _dur(s: float) -> str:
+    s = float(s)
+    return f"{s:.0f} s" if s < 120 else f"{s / 60:.0f} min" if s < 7200 else f"{s / 3600:.1f} h"
+
+
+def _iso(t: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t))
+
+
 def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec: dict | None = None,
-             suspect=None) -> dict:
+             suspect=None, soft_s: float | None = None) -> dict:
     """Move the step's existing outputs aside, run it, and check it wrote every declared output.
 
     The step runs with its outputs absent (like `make clean` for this step), so only files
@@ -893,11 +984,24 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
                 row["restored"] = restore()
                 return row
         s0 = time.time()
+        last = rec.get("seconds") if isinstance(rec, dict) else None
+        over = []
+
+        def on_overrun(el):
+            over.append(el)
+            _progress_record(run_dir, step, soft_s, timeout_s, s0, el, last, "running")
         try:
-            rc, err = _exec_step(step, run_dir, timeout_s, python)
+            rc, err = _exec_step(step, run_dir, timeout_s, python, soft_s, on_overrun if soft_s is not None else None)
         except OSError as e:
             rc, err = None, f"{type(e).__name__}: {e}"
         row.update(returncode=rc, seconds=round(time.time() - s0, 1), ok=rc == 0)
+        if over:
+            row["over_soft_deadline"] = True
+            row["soft_deadline_s"], row["backstop_s"] = soft_s, timeout_s
+            try:
+                _progress_record(run_dir, step, soft_s, timeout_s, s0, None, last, "ok" if rc == 0 else "failed")
+            except Exception:  # noqa: BLE001 -- the record is a report, never the step's outcome
+                pass
         after = _snapshot(step, run_dir)
         row["written"] = sorted(r for r, m in after.items() if r not in keep or before.get(r) != m)
         row["removed"] = sorted(set(row["removed"]) - set(after))
@@ -1022,9 +1126,12 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
                            error=f"last run took {last:.0f}s; {left:.0f}s of the pipeline budget left")
                 failed.add(s["id"])
             else:
-                tmo = float(s.get("timeout_s") or DEFAULT_TIMEOUT_S)
-                res = _run_one(s, run_dir, tmo if left is None else min(tmo, left), python, rec,
-                               suspect=integrity.is_open if integrity is not None else None)
+                soft = float(s.get("timeout_s") or DEFAULT_TIMEOUT_S)
+                hard = backstop_s(soft) if left is None else min(backstop_s(soft), left)
+                res = _run_one(s, run_dir, hard, python, rec, suspect=integrity.is_open if integrity is not None else None,
+                               soft_s=min(soft, hard))
+                if res.get("over_soft_deadline"):
+                    produced.append(PROGRESS.replace(os.sep, "/"))
                 fp = res.pop("fingerprint", None) or fingerprint(s, run_dir)
                 row.update(res, status="ok" if res["ok"] else "failed")
                 produced += res["written"] + res["removed"]
@@ -1981,25 +2088,78 @@ def _self_test() -> int:
         rep = run(d, budget_s=0)
         ok([r["status"] for r in rep["steps"]] == ["not_started", "skipped", "skipped"],
            f"PL14 nothing starts once the budget is used: {rep['steps']}")
-        w(d, "models/a.py", "import time\ntime.sleep(30)\n")
-        t1 = time.time()
-        spec(d, [dict(three[0], timeout_s=1)] + three[1:])
-        rep = run(d)
-        ok(rep["steps"][0]["returncode"] is None and time.time() - t1 < 15, f"PL15 a timed-out step is killed: {rep['steps']}")
-        # PL15b (v2 analyze timeout, 2026-11-02): a process that left the step's group (as compute.py's pool
-        # processes do) and keeps its pipes open must not hang the runner after the kill.
-        w(d, "models/a.py", "import subprocess, sys, time\n"
-                            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
-                            "open('models/a.pid', 'w').write(str(c.pid))\ntime.sleep(30)\n")
-        t1 = time.time()
-        rep = run(d)
-        took = time.time() - t1
+        # Warn, don't kill (owner, 2026-11-17: two real runs died at the fixed 1 h step limit, whose analyze step
+        # needs 5-6 h on the VM path). A step's timeout_s is a soft deadline; only the backstop kills.
         try:
-            os.kill(int(open(os.path.join(d, "models", "a.pid")).read()), signal.SIGKILL)
-        except (OSError, ValueError):
-            pass
-        ok(rep["steps"][0]["returncode"] is None and took < 1 + KILL_GRACE_S + 10,
-           f"PL15b a timed-out step whose escaped child holds its pipes ends within the grace ({took:.0f}s)")
+            bk = [backstop_s(1), backstop_s(3600), backstop_s(10 * 3600), backstop_s(24 * 3600)]
+        except NameError as e:
+            bk = [repr(e)]
+        g_ = globals()
+        ok(bk == [24 * 3600, 24 * 3600, 30 * 3600, 72 * 3600] and g_.get("BACKSTOP_MULTIPLE") == 3
+           and g_.get("BACKSTOP_FLOOR_S") == 24 * 3600,
+           f"PL15a the backstop is 3x the soft deadline or 24 h, whichever is larger: {bk}")
+        saved = {k: g_.get(k) for k in ("BACKSTOP_FLOOR_S", "PROGRESS_EVERY_S")}
+        g_["BACKSTOP_FLOOR_S"], g_["PROGRESS_EVERY_S"] = 0.0, 0.5     # backstop 3 s for timeout_s=1
+        try:
+            # PL15c: a step past its soft deadline keeps running, writes a progress record while it runs (the step
+            # copies the record it can see at 1.8 s into its output) and finishes ok.
+            w(d, "models/a.py", "import time, shutil\ntime.sleep(1.8)\n"
+                                "shutil.copy('models/pipeline_progress.json', 'models/a.seen')\n"
+                                "open('models/a.out', 'w').write('5')\n")
+            spec(d, [dict(three[0], timeout_s=1, outputs=["models/a.out", "models/a.seen"])] + three[1:])
+            rep = run(d)
+            try:
+                seen = json.load(open(os.path.join(d, "models", "a.seen")))["steps"]["a"]
+            except (OSError, ValueError, KeyError, TypeError):
+                seen = {}
+            try:
+                final = json.load(open(os.path.join(d, PROGRESS)))["steps"]["a"]
+            except (NameError, OSError, ValueError, KeyError, TypeError):
+                final = {}
+            r0 = rep["steps"][0] if rep["steps"] else {}
+            ok(r0.get("status") == "ok" and r0.get("over_soft_deadline") is True
+               and seen.get("state") == "running" and seen.get("soft_deadline_s") == 1
+               and seen.get("backstop_s") == 3 and seen.get("elapsed_s", 0) >= 1
+               and "backstop_at" in seen and final.get("state") == "ok",
+               f"PL15c a step past its soft deadline is warned about, recorded while running, and finishes: "
+               f"{r0} seen={seen} final={final}")
+            # PL15: past the backstop it is killed, and reads as a timeout (stage_machine.resumable_failure).
+            w(d, "models/a.py", "import time\ntime.sleep(30)\n")
+            t1 = time.time()
+            spec(d, [dict(three[0], timeout_s=1)] + three[1:])
+            rep = run(d)
+            ok(rep["steps"][0]["returncode"] is None and time.time() - t1 < 15
+               and rep["steps"][0]["error"].startswith("timed out after ") and "backstop" in rep["steps"][0]["error"],
+               f"PL15 a step past its backstop is killed: {rep['steps']}")
+            # PL15b (v2 analyze timeout, 2026-11-02): a process that left the step's group (as compute.py's pool
+            # processes do) and keeps its pipes open must not hang the runner after the kill.
+            w(d, "models/a.py", "import subprocess, sys, time\n"
+                                "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
+                                "open('models/a.pid', 'w').write(str(c.pid))\ntime.sleep(30)\n")
+            t1 = time.time()
+            rep = run(d)
+            took = time.time() - t1
+            try:
+                os.kill(int(open(os.path.join(d, "models", "a.pid")).read()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+            ok(rep["steps"][0]["returncode"] is None and took < 3 + KILL_GRACE_S + 10,
+               f"PL15b a timed-out step whose escaped child holds its pipes ends within the grace ({took:.0f}s)")
+            # PL15d: a compute step's batch runs to the backstop, not the soft deadline.
+            got, real_run_cmd = [], g_["_run_cmd"]
+            g_["_run_cmd"] = lambda cmd, cwd, t, env, shell=False, **k: got.append((cmd, t, k.get("soft_s"))) or (0, "")
+            try:
+                _exec_step({"id": "k", "run": "compute: models/k.py::f", "inputs_jsonl": "models/k.jsonl",
+                            "out": "models/k.out", "purpose": "p"}, d, backstop_s(1.0), None, soft_s=1.0)
+            except TypeError as e:
+                got.append(repr(e))
+            finally:
+                g_["_run_cmd"] = real_run_cmd
+            cmd = got[0][0] if got and isinstance(got[0], tuple) else []
+            ok(cmd and cmd[cmd.index("--timeout-s") + 1] == "3.0" and got[0][1:] == (63.0, 1.0),
+               f"PL15d a compute step's batch gets the backstop as its wall limit: {got}")
+        finally:
+            g_.update(saved)
         ok("AZURE_CLIENT_SECRET" not in script_env({"AZURE_CLIENT_SECRET": "s", "HOME": "/h"}),
            "PL16 steps run without cloud credentials")
         # Scratch mode: runs in a copy; the run dir is untouched.
@@ -2110,7 +2270,12 @@ def _self_test() -> int:
            f"PR3 (review #2) a failed step's previous outputs are restored and it stays stale: {rep['steps']}")
         w(d, "models/b.py", "import time\nopen('models/b.out', 'w').write('partial')\ntime.sleep(30)\n")
         spec(d, [three[0], dict(three[1], timeout_s=1), three[2]])
-        rep = run(d)
+        saved = globals().get("BACKSTOP_FLOOR_S")
+        globals()["BACKSTOP_FLOOR_S"] = 0.0          # killed at its 3 s backstop (PL15a)
+        try:
+            rep = run(d)
+        finally:
+            globals()["BACKSTOP_FLOOR_S"] = saved
         ok(rep["steps"][0]["returncode"] is None and rd(d, "models/b.out") == good,
            f"PR4 (review #2) a killed step's previous outputs are restored: {rep['steps']}")
         # Anti-laundering: a hand edit is not restored as a good output.

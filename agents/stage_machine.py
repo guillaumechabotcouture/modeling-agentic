@@ -2860,10 +2860,16 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     d, T = toy_run("analyze_timeout")
     calls = os.path.join(td, "toy_calls.txt")
     os.environ.update(MA_TOY_CALLS=calls, MA_TOY_SLOW_FROM="3")
+    import pipeline as P_
+    saved = (P_.BACKSTOP_MULTIPLE, P_.BACKSTOP_FLOOR_S)
+    # The step's timeout_s is a soft deadline since 2026-11-17 (scripts/pipeline.py): kill it at 8 s here, the
+    # backstop a 24 h floor would otherwise put off, so the killed-step path is what this case exercises.
+    P_.BACKSTOP_MULTIPLE, P_.BACKSTOP_FLOOR_S = 1, 0.0
     try:
         s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(8), cross_engine_check=False)
     finally:
         os.environ.pop("MA_TOY_SLOW_FROM", None)
+        P_.BACKSTOP_MULTIPLE, P_.BACKSTOP_FLOOR_S = saved
     st = load_state(d)
     first = open(calls).read().split() if os.path.exists(calls) else []
     ok(s1 == "run_failed" and st.history[-1]["from"] == "ANALYZE" and st.history[-1].get("resumable") == "timeout"
