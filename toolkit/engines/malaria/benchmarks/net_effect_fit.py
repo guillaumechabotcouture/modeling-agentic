@@ -519,7 +519,7 @@ def launch_command(vcpus: int = VCPUS, wall_hours: float | None = None, verify: 
     return ["python3", "cloud/vm_job.py", "run", OPTION_A["job"], "net-effect-fit", "--tree", ".",
             "--store", OPTION_A["store"], "--store-account", "modelingagentic",
             "--cap-usd", "<owner cap>" if cap is None else f"{cap:g}",
-            "--budget-scope", "f6", "--cpu", str(vcpus), "--memory", f"{4 * vcpus} GiB", "--max-hours", hours, "--",
+            "--budget-scope", "f6", "--cpu", str(vcpus), "--memory", f"{7 * vcpus} GiB", "--max-hours", hours, "--",
             "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py", "run",
             "--approved", "<owner approval: option A net-effect fit, its cap>", "--margin-loo",
             "--verify", str(int(verify)), "--workers", str(vcpus)]
