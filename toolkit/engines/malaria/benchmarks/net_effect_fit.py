@@ -1278,6 +1278,10 @@ def _self_test() -> int:
         except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case, not a crash of the test
             ok(False, f"{label} ({type(ex).__name__}: {ex})")
 
+    # no self-test may start a real fit: run() refuses while the owner's cap is unset, so the shipped cap is set aside
+    # for the test (FA12 checks it) and restored at the end
+    shipped_cap = OPTION_A["cap_usd"]
+    OPTION_A["cap_usd"] = None
     base = yaml.safe_load(open(PACK))
     p = build_pack(base)
     train, held = split(p)          # the fit's own declaration (option A, fit record (b)), not the pack's fit_joint
@@ -2251,6 +2255,24 @@ def _self_test() -> int:
            f"FA10 a fresh fit (or smoke) on another declaration is refused before any engine set-up ({got[:120]}); the "
            f"launch job is {OPTION_A['job']} (an f6 budget prefix)")
     case("FA10", fa10)
+
+    def fa11():
+        # owner, 18 Nov (one VM, 96 vCPUs): a chunk barrier of 300 tasks idled up to a third of a large VM at each
+        # chunk's tail; a chunk is now max(300, 4 x workers) (still a fresh pool per chunk, for worker memory)
+        q = plan(p, vcpus=96)
+        nd, ns_, nset = OPTION_A["design_n"] + 2, len(base["seeds"]), 5
+        ok(_chunk(16) == 300 and _chunk(96) == 384 and _chunk(1) == 300
+           and q["waves"]["design"] == math.ceil(nd * nset * ns_ / 96) + math.ceil(OPTION_A["wave2_n"] * nset * ns_ / 96)
+           and "_chunk(self.workers)" in __import__("inspect").getsource(RecalRunner._map),
+           f"FA11 chunks of max(300, 4 x workers) in the runner and the plan: 96 vCPUs run {q['waves']['design']} "
+           f"design waves, {q['wall_hours']} h")
+    case("FA11", fa11)
+
+    def fa12():
+        ok(shipped_cap == 250.0, f"FA12 the owner's cap for the option A fit (18 Nov, 1 VM of 96 vCPUs) is $250: "
+                                 f"{shipped_cap}")
+    case("FA12", fa12)
+    OPTION_A["cap_usd"] = shipped_cap
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
