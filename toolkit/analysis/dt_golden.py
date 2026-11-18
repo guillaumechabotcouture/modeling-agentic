@@ -479,7 +479,31 @@ def _self_test() -> int:
         ok(g0 == (open(GOLDEN).read() if os.path.exists(GOLDEN) else None),
            "DG16m (r2 P2-6) an empty capture never overwrites the golden file")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16):
+    def dg17():          # Codex review r3 of #262 (written first; each failed)
+        run1 = {"test_id": "DT1", "path": "models/decision_tests/DT1.yaml", "status": "run", "verdict": "NO_CHANGE"}
+        with tempfile.TemporaryDirectory() as d:
+            tid = "prior_range_z:North East"
+            fixture(d, [dict(run1, test_id=tid, path=f"models/decision_tests/{tid}.yaml")],
+                    {f"{tid}.yaml": _rec(test_id=tid)})
+            ok(set(digest_dir(d)) == {tid}, "DG17 (r3 P2-1) an automatic id with a colon and a space, as run_all writes "
+                                            "it, is read")
+            nr = {"test_id": "DT2", "path": None, "status": "not_run", "verdict": "CHANGES_PLAN"}
+            none = dict(run1, test_id="None", path="models/decision_tests/None.yaml")
+            for tests, files, what in (
+                    ([nr], {}, "a not-run entry with a verdict other than NOT_RUN"),
+                    ([run1], {"DT1.yaml": {k: v for k, v in _rec().items() if k != "decision_changes"}},
+                     "a run result without decision_changes"),
+                    ([none], {"None.yaml": {k: v for k, v in _rec().items() if k != "test_id"}},
+                     "a result without a test id")):
+                for f_ in os.listdir(os.path.join(d, "models", "decision_tests")):
+                    os.remove(os.path.join(d, "models", "decision_tests", f_))
+                fixture(d, tests, files)
+                ok(_raises(lambda: digest_dir(d), StoredIncomplete), f"DG17b (r3 P2-2) refused: {what}")
+        import ntpath
+        ok(_plain_name("C:trial", ntpath) is False and _plain_name("prior_range_z:North East", os.path) is True,
+           "DG17c (r3 P1-3) a test id that would name a drive on Windows is not a plain file name there")
+
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
