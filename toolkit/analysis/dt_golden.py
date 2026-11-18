@@ -34,6 +34,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
@@ -48,9 +49,8 @@ DETAIL_KEYS = ("cost_multipliers", "unit_attribute", "calibration_target", "outc
                "parameter", "info")
 IGNORED = ("type", "perturb", "path", "producer", "produced_by")
 PARTS = ("decision", "detail", "words", "plans")
-STORED_PARTS = ("decision", "detail", "words")      # stored records from before this module carry no plans part
 TINY = 1e-9
-_PATH = re.compile(r"(?:[A-Za-z]:)?[\\/](?:[^\s\\/'\"]+[\\/])+([^\s\\/'\"]+)")
+_PATH = re.compile(r"(?:(?<=^)|(?<=[\s'\"(\[=,]))(?:[A-Za-z]:)?[\\/](?:[^\s\\/'\"()]+[\\/])+([^\s\\/'\"()]+)")
 
 
 class EngineJobRefused(RuntimeError):
@@ -111,6 +111,7 @@ def parts(rec: dict, summary: dict | None = None) -> dict:
             plans = [r.get("plan_sha256") if isinstance(r, dict) else None for r in res]
     wbc = decision.get("worst_by_criterion")
     if isinstance(wbc, dict):
+        detail["worst_labels"] = {k: v.get("value") for k, v in wbc.items() if isinstance(v, dict)}
         decision["worst_by_criterion"] = {k: ({kk: vv for kk, vv in v.items() if kk != "value"}
                                               if isinstance(v, dict) else v) for k, v in wbc.items()}
     if summary is not None:
@@ -129,19 +130,40 @@ def digest(rec: dict, summary: dict | None = None) -> dict:
 
 
 def _inside(path: str, root: str) -> bool:
+    """Whether path is root or under it: by real path, and by file identity of each existing ancestor (another letter
+    case on a case-insensitive volume, Codex r2 P1-2)."""
     p, r = os.path.realpath(path), os.path.realpath(root)
-    return p == r or p.startswith(r + os.sep)
+    if p == r or p.startswith(r + os.sep):
+        return True
+    while True:
+        try:
+            if os.path.exists(p) and os.path.samefile(p, r):
+                return True
+        except OSError:
+            pass
+        q = os.path.dirname(p)
+        if q == p:
+            return False
+        p = q
 
 
-def _regular_in(run_dir: str, rel: str) -> str:
-    """The absolute path of `rel` under run_dir when no component is a link and it is a regular file there."""
-    cur = os.path.realpath(run_dir)
-    for c in rel.split("/"):
+_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:+-]*")
+
+
+def _regular_in(run_dir: str, rel: str, missing=StoredIncomplete) -> str:
+    """The absolute path of `rel` under run_dir when no component is a link, none is `..`, and it is a regular file
+    there (Codex r2 P1-1, P1-3); `missing` is raised when nothing is there at all."""
+    cur, parts_ = os.path.realpath(run_dir), rel.split("/")
+    if any(c in ("", ".", "..") for c in parts_):
+        raise StoredIncomplete(f"{rel}: not a plain path under the run dir")
+    for c in parts_:
         cur = os.path.join(cur, c)
         if os.path.islink(cur):
             raise StoredIncomplete(f"{rel}: {cur} is a link (a result is read from the run dir only)")
+    if not os.path.lexists(cur):
+        raise missing(f"{rel}: missing")
     if not os.path.isfile(cur):
-        raise StoredIncomplete(f"{rel}: listed but missing")
+        raise StoredIncomplete(f"{rel}: not a regular file")
     return cur
 
 
@@ -151,19 +173,19 @@ def digest_dir(run_dir: str) -> dict:
     a run test without its result file, a result file elsewhere than models/decision_tests/<id>.yaml or through a link,
     or a result whose test id or status differs from its entry raises StoredIncomplete."""
     import yaml
-    p = os.path.join(run_dir, "analysis", "decision_tests.yaml")
-    if not os.path.isfile(p) or os.path.islink(p):
-        raise FileNotFoundError(f"{p}: no decision-test artifact (the analysis did not reach its decision tests)")
+    p = _regular_in(run_dir, "analysis/decision_tests.yaml", missing=FileNotFoundError)
     with open(p) as f:
         doc = yaml.safe_load(f)
-    tests = ((doc or {}).get("data") or {}).get("tests") if isinstance(doc, dict) else None
+    data = doc.get("data") if isinstance(doc, dict) else None
+    tests = data.get("tests") if isinstance(data, dict) else None
     if not isinstance(tests, list):
         raise StoredIncomplete(f"{p}: data.tests is not a list")
     out = {}
     for t in tests:
         tid = t.get("test_id") if isinstance(t, dict) else None
-        if not isinstance(tid, str) or not tid:
-            raise StoredIncomplete(f"{p}: an entry without a test id ({t!r:.120})")
+        tid = str(tid) if isinstance(tid, int) and not isinstance(tid, bool) else tid      # run_all keeps an int id
+        if not isinstance(tid, str) or not _ID.fullmatch(tid):
+            raise StoredIncomplete(f"{p}: an entry without a plain test id ({t!r:.120})")
         if tid in out:
             raise StoredIncomplete(f"{p}: test id {tid} is listed twice")
         st = t.get("status")
@@ -175,19 +197,22 @@ def digest_dir(run_dir: str) -> dict:
             out[tid] = digest({"status": st, "test_id": tid}, t)
             continue
         want = f"models/decision_tests/{tid}.yaml"
-        if t.get("path") != want:
+        if str(t.get("path") or "").replace("\\", "/") != want:
             raise StoredIncomplete(f"{p}: test {tid}: result file {t.get('path')!r}, not {want}")
         with open(_regular_in(run_dir, want)) as f:
             rec = yaml.safe_load(f)
-        if not isinstance(rec, dict) or rec.get("test_id") != tid or rec.get("status") != st:
-            raise StoredIncomplete(f"{want}: holds test {(rec or {}).get('test_id')!r} with status "
-                                   f"{(rec or {}).get('status')!r}, not {tid} {st}")
+        if not isinstance(rec, dict) or str(rec.get("test_id")) != tid or rec.get("status") != st:
+            raise StoredIncomplete(f"{want}: holds {rec!r:.80}, not test {tid} with status {st}")
+        vd = "CHANGES_PLAN" if rec.get("decision_changes") else "NO_CHANGE"
+        if "verdict" in t and t["verdict"] != vd:          # Codex r2 P2-2: the summary contradicts its result
+            raise StoredIncomplete(f"{p}: test {tid}: verdict {t['verdict']!r}, its result says {vd}")
         out[tid] = digest(rec, t)
     return out
 
 
 def compare(expected: dict, got: dict, parts: tuple | None = None) -> list[str]:
-    """One line per test missing, not expected, or with a part that differs (every part, or the named ones)."""
+    """One line per test missing, not expected, or with a part that differs (every part, the named ones, or with
+    parts="expected" those the expected record holds: a stored record from before plans existed has none)."""
     out = []
     for k in sorted(set(expected) | set(got)):
         if k not in got:
@@ -196,7 +221,8 @@ def compare(expected: dict, got: dict, parts: tuple | None = None) -> list[str]:
             out.append(f"{k}: not expected")
         else:
             e, g = expected[k] or {}, got[k] or {}
-            out += [f"{k}: {p} differs" for p in (parts or sorted(set(e) | set(g))) if e.get(p) != g.get(p)]
+            ps = sorted(e) if parts == "expected" else parts or sorted(set(e) | set(g))
+            out += [f"{k}: {p} differs" for p in ps if e.get(p) != g.get(p)]
     return out
 
 
@@ -206,7 +232,7 @@ class no_engine_jobs:
     raise EngineJobRefused; `refused` counts the attempts, so one an analysis caught and survived is still reported.
     One guard at a time per process: a second is refused (overlapping guards would restore each other's methods)."""
     METHODS = ("run", "run_batch", "run_series", "initial_state", "build_sim")
-    _active = None
+    _lock = threading.Lock()
 
     def __init__(self, engine_cls=None):
         self.cls, self.refused, self._saved = engine_cls, 0, []
@@ -217,7 +243,7 @@ class no_engine_jobs:
                                "do not cover this analysis")
 
     def __enter__(self):
-        if no_engine_jobs._active is not None:
+        if not no_engine_jobs._lock.acquire(blocking=False):      # Codex r2 P2-5: threads too
             raise RuntimeError("dt_golden: an engine-job guard is already active in this process (one retro at a time)")
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
         import compute
@@ -235,7 +261,6 @@ class no_engine_jobs:
             if callable(getattr(self.cls, m, None)):
                 self._saved.append((self.cls, m, self.cls.__dict__.get(m, _MISSING)))
                 setattr(self.cls, m, lambda *a, _m=m, **k: guard._refuse(f"{self.cls.__name__}.{_m} in-process"))
-        no_engine_jobs._active = self
         return self
 
     def __exit__(self, *exc):
@@ -245,7 +270,7 @@ class no_engine_jobs:
             else:
                 setattr(obj, name, val)
         self._saved = []
-        no_engine_jobs._active = None
+        no_engine_jobs._lock.release()
         return False
 
 
@@ -257,8 +282,8 @@ def write_out(path: str, text: str, run_dir: str) -> None:
     path = os.path.abspath(path)
     if _inside(path, run_dir) or _inside(os.path.dirname(path), run_dir):
         raise ValueError(f"{path} is inside the run dir {run_dir}; the collected run is never written")
-    if os.path.islink(path):
-        raise ValueError(f"{path} is a link; give a plain file path")
+    if os.path.islink(path) or (os.path.exists(path) and os.stat(path).st_nlink > 1):
+        raise ValueError(f"{path} is a link (symbolic or hard); give a plain file path")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
     with os.fdopen(fd, "w") as f:
         f.write(text)
@@ -301,13 +326,18 @@ def retro(run_dir: str, work: str, spec_rel: str = "decision_spec.yaml", unsigne
         raise FileNotFoundError(f"{os.path.join(run_dir, spec_rel)}: no decision spec")
     try:
         stored = digest_dir(run_dir)
-    except FileNotFoundError:          # no artifact at all; StoredIncomplete (a corrupt one) propagates
+    except FileNotFoundError:          # nothing there at all; a link, a directory or a corrupt one raises
         stored = None
     dst = os.path.join(work, os.path.basename(run_dir))
     shutil.copytree(run_dir, dst, symlinks=True)
     links = sorted(os.path.relpath(os.path.join(r, n), dst) for r, ds, fs in os.walk(dst) for n in ds + fs
                    if os.path.islink(os.path.join(r, n)) and not _inside(os.path.join(r, n), dst))
     for rel in ("analysis/decision_tests.yaml", "models/decision_tests"):      # Codex r1 P1-5: nothing stale is read
+        cur = dst
+        for c in rel.split("/"):               # Codex r2 P1-1: never through a link (a linked parent included)
+            cur = os.path.join(cur, c)
+            if os.path.islink(cur):
+                raise ValueError(f"{rel} in the run is under a link ({c}); the retro removes nothing through a link")
         q = os.path.join(dst, rel)
         if os.path.islink(q) or os.path.isfile(q):
             os.remove(q)
@@ -341,7 +371,7 @@ def retro(run_dir: str, work: str, spec_rel: str = "decision_spec.yaml", unsigne
             status, reason = "error", f"the re-run wrote no decision-test artifact or an incomplete one: {e}"
     return {"status": status, "reason": reason, "engine_jobs": g.refused, "draws": draws, "tests": len(digests),
             "digests": digests, "stored": "absent" if stored is None else "present",
-            "stored_vs_rerun": (compare(stored, digests, STORED_PARTS) if stored is not None and status == "complete"
+            "stored_vs_rerun": (compare(stored, digests, "expected") if stored is not None and status == "complete"
                                 else None), "links_outside": links, "work": dst}
 
 
@@ -410,13 +440,13 @@ def check_capture(ok, failed=()) -> None:
     _CAP.update(on=False, orig=None)
     ok(not probs, f"DG-P1 every run case records its allocation digest (plan_sha256) ({probs[:5]})")
     if os.environ.get(UPDATE_ENV) == "1":
-        if failed:
-            ok(False, f"DG-R1 {UPDATE_ENV}=1 refused: {len(failed)} earlier case(s) failed, so the capture may be "
-                      "partial; the golden file is unchanged")
+        if failed or not obs:
+            ok(False, f"DG-R1 {UPDATE_ENV}=1 refused: {len(failed)} earlier case(s) failed or nothing was captured, so "
+                      "the capture may be partial; the golden file is unchanged")
             return
         with open(GOLDEN, "w") as f:
             f.write(golden_text(obs))
-        ok(bool(obs), f"DG-R1 {len(obs)} golden records written to {GOLDEN} ({UPDATE_ENV}=1)")
+        ok(True, f"DG-R1 {len(obs)} golden records written to {GOLDEN} ({UPDATE_ENV}=1)")
         return
     try:
         with open(GOLDEN) as f:
@@ -588,8 +618,8 @@ def _self_test() -> int:
             fixture(d, [run1], {"DT1.yaml": _rec()})
             a = digest_dir(d)["DT1"]
             ok(a == digest(_rec(), run1), "DG11h a listed result is digested with its summary entry")
-            fixture(d, [dict(run1, verdict="CHANGES_PLAN")], {"DT1.yaml": _rec()})
-            ok(digest_dir(d)["DT1"]["decision"] != a["decision"], "DG11d (P1-6) the summary's verdict is decision")
+            fixture(d, [dict(run1, share_pct=99.0)], {"DT1.yaml": _rec()})
+            ok(digest_dir(d)["DT1"]["decision"] != a["decision"], "DG11d (P1-6) the summary's fields are decision")
             nr = {"test_id": "DT2", "path": None, "status": "not_run", "threshold_pct": 10.0, "statement": "x"}
             fixture(d, [nr], {})
             b = digest_dir(d)["DT2"]
