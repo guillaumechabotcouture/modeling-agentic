@@ -438,8 +438,9 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     if oa:          # owner R3 (external review point d): what every evaluation will apply, attested at sign-off
         out.append("## Base outcome adjustments")
         out.append("Applied in every evaluation (point, draws, sensitivity, decision tests, plan variants, the boundary "
-                   "check): each package holding the component has its outcomes set to the value times those of the "
-                   "same package with the reference in its place (toolkit/analysis/outcome_adjust.py).")
+                   "check): each package holding the component and not the reference has its outcomes set to the value "
+                   "times those of the same package with the reference in its place; a package holding both is left "
+                   "as the engine gives it (toolkit/analysis/outcome_adjust.py).")
         for a in oa if isinstance(oa, list) else []:
             if isinstance(a, dict):
                 out.append(f"- **{a.get('id')}**: {a.get('component')} = {a.get('value')} x {a.get('reference')}. "
