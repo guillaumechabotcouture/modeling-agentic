@@ -3,7 +3,8 @@
 refactor of the decision-test code (one generic `perturb` type, design note S2-S3) can show it changed nothing.
 
     python3 toolkit/analysis/dt_golden.py --self-test
-    python3 toolkit/analysis/dt_golden.py digest <run_dir>
+    python3 toolkit/analysis/dt_golden.py digest <run_dir> [--out F]
+    python3 toolkit/analysis/dt_golden.py retro <run_dir> --work <empty dir> (--write F | --expect F) [--unsigned]
 
 Parts of a record's digest (sha256 prefixes of canonical JSON; parts()): `decision` (status, plan changes, shares,
 regret, dollars moved, recommendations, benefit changes, identities, each case's results, the run's summary entry;
@@ -13,6 +14,13 @@ digits, below 1e-9 in size zero; an absolute path keeps its file name. Known lim
 space keeps its tail, and two values either side of a 6th-digit rounding boundary differ.
 
 `digest` reads analysis/decision_tests.yaml and models/decision_tests/<id>.yaml, and fails closed (digest_dir).
+
+`retro` copies the run into --work (outside the run dir by real path), removes the copy's decision-test outputs,
+re-runs the analysis there on the current code with the run's own number of draws, and digests it. Zero engine jobs:
+compute.map_fn and the engine's evaluating methods raise EngineJobRefused, so a run whose stored rows (row_reuse,
+#241/#244) do not cover the analysis, or a direct-path run, is refused, never computed (legacy rows may need
+MA_JC_LEGACY_ADAPTER_SHA256). The collected run is never written. --write refuses a re-run that differs from the
+stored results unless --accept-stored-diff; expected digests of real runs are kept outside the repo.
 
 Toy golden records: toolkit/analysis/dt_golden.json, checked by toolkit/analysis/run.py's self-test, which captures
 every record decision_tests.run_one returns (start_capture / check_capture), keyed by the calling self-test function,
@@ -26,7 +34,9 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
+import threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
@@ -43,6 +53,10 @@ IGNORED = ("type", "perturb", "path", "producer", "produced_by")
 PARTS = ("decision", "detail", "words", "plans")
 TINY = 1e-9
 _PATH = re.compile(r"(?:(?<=^)|(?<=[\s'\"(\[=,]))(?:[A-Za-z]:)?[\\/](?:[^\s\\/'\"()]+[\\/])+([^\s\\/'\"()]+)")
+
+
+class EngineJobRefused(RuntimeError):
+    """An engine job was requested during a retro (stored rows do not cover the analysis)."""
 
 
 class StoredIncomplete(ValueError):
@@ -115,6 +129,24 @@ def parts(rec: dict, summary: dict | None = None) -> dict:
 
 def digest(rec: dict, summary: dict | None = None) -> dict:
     return {k: _h(v) for k, v in parts(rec, summary).items()}
+
+
+def _inside(path: str, root: str) -> bool:
+    """Whether path is root or under it: by real path, and by file identity of each existing ancestor (another letter
+    case on a case-insensitive volume, Codex r2 P1-2)."""
+    p, r = os.path.realpath(path), os.path.realpath(root)
+    if p == r or p.startswith(r + os.sep):
+        return True
+    while True:
+        try:
+            if os.path.exists(p) and os.path.samefile(p, r):
+                return True
+        except OSError:
+            pass
+        q = os.path.dirname(p)
+        if q == p:
+            return False
+        p = q
 
 
 def _plain_name(tid: str, pathmod=os.path) -> bool:
@@ -204,8 +236,157 @@ def compare(expected: dict, got: dict, parts: tuple | None = None) -> list[str]:
     return out
 
 
+class no_engine_jobs:
+    """While active, scripts/compute.py's map_fn (every engine batch: batch.py, row_reuse.py, the joint calibration,
+    trajectories) and the engine class's evaluating methods (run, run_batch, run_series, initial_state, build_sim)
+    raise EngineJobRefused; `refused` counts the attempts, so one an analysis caught and survived is still reported.
+    One guard at a time per process: a second is refused (overlapping guards would restore each other's methods)."""
+    METHODS = ("run", "run_batch", "run_series", "initial_state", "build_sim")
+    _lock = threading.Lock()
+
+    def __init__(self, engine_cls=None):
+        self.cls, self.refused, self._saved = engine_cls, 0, []
+
+    def _refuse(self, what):
+        self.refused += 1
+        raise EngineJobRefused(f"an engine job was requested ({what}); a retro computes nothing: the stored rows "
+                               "do not cover this analysis")
+
+    def __enter__(self):
+        if not no_engine_jobs._lock.acquire(blocking=False):      # Codex r2 P2-5: threads too
+            raise RuntimeError("dt_golden: an engine-job guard is already active in this process (one retro at a time)")
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        orig = compute.map_fn
+        guard = self
+
+        def map_fn(run_dir, fn_spec, inputs, *a, **k):
+            if inputs:
+                guard._refuse(f"{len(inputs)} task(s) of {fn_spec} through scripts/compute.py, purpose "
+                              f"{k.get('purpose')!r}")
+            return orig(run_dir, fn_spec, inputs, *a, **k)
+        self._saved.append((compute, "map_fn", compute.__dict__["map_fn"]))
+        compute.map_fn = map_fn
+        for m in self.METHODS if self.cls is not None else ():
+            if callable(getattr(self.cls, m, None)):
+                self._saved.append((self.cls, m, self.cls.__dict__.get(m, _MISSING)))
+                setattr(self.cls, m, lambda *a, _m=m, **k: guard._refuse(f"{self.cls.__name__}.{_m} in-process"))
+        return self
+
+    def __exit__(self, *exc):
+        for obj, name, val in reversed(self._saved):
+            if val is _MISSING:
+                delattr(obj, name)
+            else:
+                setattr(obj, name, val)
+        self._saved = []
+        no_engine_jobs._lock.release()
+        return False
+
+
+_MISSING = object()
+
+
+def write_out(path: str, text: str, run_dir: str) -> None:
+    """An operator's output file (--out, --write): never inside the run dir, never through a link."""
+    path = os.path.abspath(path)
+    if _inside(path, run_dir) or _inside(os.path.dirname(path), run_dir):
+        raise ValueError(f"{path} is inside the run dir {run_dir}; the collected run is never written")
+    if os.path.islink(path) or (os.path.exists(path) and os.stat(path).st_nlink > 1):
+        raise ValueError(f"{path} is a link (symbolic or hard); give a plain file path")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+def write_allowed(rep: dict, accept_stored_diff: bool) -> tuple[bool, str]:
+    """Whether --write may record a retro's digests as the expectation."""
+    if rep.get("status") != "complete" or rep.get("engine_jobs"):
+        return False, f"the retro did not complete with zero engine jobs ({rep.get('status')}: {rep.get('reason')})"
+    if rep.get("stored_vs_rerun") and not accept_stored_diff:
+        return False, ("the re-run differs from the run's stored results " + "; ".join(rep["stored_vs_rerun"][:8])
+                       + " (pass --accept-stored-diff to record it anyway, and say why)")
+    return True, ""
+
+
+def stored_draws(run_dir: str):
+    """The number of draws the run's own uncertainty step used (analysis/uncertainty.yaml), or None."""
+    import yaml
+    try:
+        with open(os.path.join(run_dir, "analysis", "uncertainty.yaml")) as f:
+            n = ((yaml.safe_load(f) or {}).get("data") or {}).get("draws")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else None
+
+
+def retro(run_dir: str, work: str, spec_rel: str = "decision_spec.yaml", unsigned: bool = False, log=print,
+          runner=None) -> dict:
+    """The analysis of a copy of `run_dir` (in `work`, empty or absent, outside the run dir by real path) re-run on the
+    current code with zero engine jobs and the run's own number of draws, after the copy's decision-test outputs are
+    removed (so only freshly written results are read); its decision tests digested and compared with the run's stored
+    ones (module docstring). {status: complete | blocked | engine_job_refused | error, reason, engine_jobs, draws,
+    tests, digests, stored, stored_vs_rerun, links_outside, work}."""
+    run_dir, work = os.path.abspath(run_dir), os.path.abspath(work)
+    if _inside(work, run_dir):
+        raise ValueError(f"--work {work} is inside the run dir; the collected run is never written")
+    if os.path.exists(work) and os.listdir(work):
+        raise ValueError(f"--work {work} is not empty")
+    if not os.path.isfile(os.path.join(run_dir, spec_rel)):
+        raise FileNotFoundError(f"{os.path.join(run_dir, spec_rel)}: no decision spec")
+    try:
+        stored = digest_dir(run_dir)
+    except FileNotFoundError:          # nothing there at all; a link, a directory or a corrupt one raises
+        stored = None
+    dst = os.path.join(work, os.path.basename(run_dir))
+    shutil.copytree(run_dir, dst, symlinks=True)
+    links = sorted(os.path.relpath(os.path.join(r, n), dst) for r, ds, fs in os.walk(dst) for n in ds + fs
+                   if os.path.islink(os.path.join(r, n)) and not _inside(os.path.join(r, n), dst))
+    for rel in ("analysis/decision_tests.yaml", "models/decision_tests"):      # Codex r1 P1-5: nothing stale is read
+        cur = dst
+        for c in rel.split("/"):               # Codex r2 P1-1: never through a link (a linked parent included)
+            cur = os.path.join(cur, c)
+            if os.path.islink(cur):
+                raise ValueError(f"{rel} in the run is under a link ({c}); the retro removes nothing through a link")
+        q = os.path.join(dst, rel)
+        if os.path.islink(q) or os.path.isfile(q):
+            os.remove(q)
+        elif os.path.isdir(q):
+            shutil.rmtree(q)
+    from toolkit.analysis import run as RUN
+    from toolkit.spec import schema
+    cls = type(schema.load(os.path.join(dst, spec_rel)).engine())
+    draws = stored_draws(run_dir)
+    status, reason = "complete", None
+    paused, _CAP["paused"] = _CAP["paused"], True       # a retro inside a capturing self-test is not a golden record
+    try:
+        with no_engine_jobs(cls) as g:
+            try:
+                (runner or RUN.run)(dst, spec_rel, unsigned=unsigned, log=log, draws=draws)
+            except EngineJobRefused as e:
+                status, reason = "engine_job_refused", str(e)
+            except RUN.AnalysisBlocked as e:
+                status, reason = "blocked", f"{e.where}: {e.reason or ''}"
+            except Exception as e:  # noqa: BLE001 -- reported with the refused count (an engine refusal may be wrapped)
+                status, reason = "error", f"{type(e).__name__}: {str(e)[:500]}"
+    finally:
+        _CAP["paused"] = paused
+    if status == "complete" and g.refused:
+        status, reason = "engine_job_refused", f"{g.refused} engine job request(s) refused and caught by the analysis"
+    digests = {}
+    if status == "complete":
+        try:
+            digests = digest_dir(dst)
+        except (FileNotFoundError, StoredIncomplete) as e:
+            status, reason = "error", f"the re-run wrote no decision-test artifact or an incomplete one: {e}"
+    return {"status": status, "reason": reason, "engine_jobs": g.refused, "draws": draws, "tests": len(digests),
+            "digests": digests, "stored": "absent" if stored is None else "present",
+            "stored_vs_rerun": (compare(stored, digests, "expected") if stored is not None and status == "complete"
+                                else None), "links_outside": links, "work": dst}
+
+
 _CAP = {"on": False, "paused": False, "orig": None, "recs": {}, "counts": {}, "problems": []}
-_RUNNERS = {"_run", "run", "run_one", "run_all"}
+_RUNNERS = {"_run", "run", "run_one", "run_all", "_self_test_retro"}
 
 
 def _caller() -> str:
@@ -366,6 +547,56 @@ def _self_test() -> int:
                "g:DT1#0": {"decision": "a", "detail": "b", "words": "c", "plans": "d"}}
         ok(golden_read(golden_text(obs)) == obs, "DG6 the golden file round-trips (one line per self-test function)")
 
+    def dg7():
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        from toolkit.engines.contract import ToyEngine
+        orig_map, orig_run = compute.map_fn, ToyEngine.run
+        with tempfile.TemporaryDirectory() as d:
+            g = no_engine_jobs(ToyEngine)
+            with g:
+                r1 = _raises(lambda: compute.map_fn(d, "x.py::f", [1, 2]), EngineJobRefused)
+                r2 = _raises(lambda: ToyEngine().run({}, None, None, None, 0), EngineJobRefused)
+            ok(r1 and r2 and g.refused == 2, f"DG7 under the guard compute.map_fn and the engine's run raise "
+                                              f"EngineJobRefused ({r1}, {r2}, {g.refused})")
+        ok(compute.map_fn is orig_map and ToyEngine.run is orig_run, "DG7b the guard restores both on exit")
+
+    def dg8():
+        with tempfile.TemporaryDirectory() as d:
+            w = os.path.join(d, "work")
+            os.makedirs(os.path.join(w, "x"))
+            ok(_raises(lambda: retro(d, w, log=lambda *a: None)), "DG8 retro refuses a work dir that is not empty")
+            ok(_raises(lambda: retro(d, d, log=lambda *a: None)), "DG8b retro refuses the run dir as its work dir")
+
+    # ------------------------------------------------ Codex review r1 of #262 (written first; each failed)
+    def dg9():
+        from toolkit.engines.contract import ToyEngine
+
+        class StateEngine(ToyEngine):
+            def initial_state(self, params, unit, package=None, horizon=None):
+                return {"population": 100}
+        with no_engine_jobs(StateEngine) as g:
+            r = _raises(lambda: StateEngine().initial_state({}, None), EngineJobRefused)
+            nested = _raises(lambda: no_engine_jobs(ToyEngine).__enter__(), RuntimeError)
+        ok(r and g.refused == 1, "DG9 (P1-2) the engine's initial_state is an engine evaluation: refused")
+        ok(nested and not hasattr(StateEngine, "__dg_guard__"),
+           "DG9b (P2-5) a second guard while one is active is refused (no overlapping retros in one process)")
+
+    def dg10():
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real")
+            os.makedirs(real)
+            os.symlink(real, os.path.join(d, "alias"))
+            ok(_raises(lambda: retro(os.path.join(d, "alias"), os.path.join(real, "w"), log=lambda *a: None)),
+               "DG10 (P1-3) a work dir inside the run dir through another spelling (a link) is refused")
+            ok(_raises(lambda: write_out(os.path.join(d, "alias", "g.json"), "{}", real)),
+               "DG10b (P1-3) a --write/--out file inside the run dir is refused")
+            os.symlink(os.path.join(d, "target"), os.path.join(d, "out.json"))
+            ok(_raises(lambda: write_out(os.path.join(d, "out.json"), "{}", real))
+               and not os.path.exists(os.path.join(d, "target")), "DG10c (P1-3) an output that is a link is refused")
+            write_out(os.path.join(d, "fine.json"), "{}", real)
+            ok(open(os.path.join(d, "fine.json")).read() == "{}", "DG10d an output outside the run dir is written")
+
     def fixture(d, tests, files):
         os.makedirs(os.path.join(d, "analysis"), exist_ok=True)
         os.makedirs(os.path.join(d, "models", "decision_tests"), exist_ok=True)
@@ -408,6 +639,27 @@ def _self_test() -> int:
             os.remove(os.path.join(d, "models", "decision_tests", "DT1.yaml"))
             ok(_raises(lambda: digest_dir(d), StoredIncomplete),
                "DG11f (P1-7) a listed result file that is missing is StoredIncomplete, not an absent artifact")
+
+    def dg12():
+        from toolkit.spec import schema
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as w:
+            schema.toy_spec(d)
+            fixture(d, [{"test_id": "DT1", "path": "models/decision_tests/DT1.yaml", "status": "run"}],
+                    {"DT1.yaml": _rec()})
+            rep = retro(d, os.path.join(w, "work"), unsigned=True, log=lambda *a: None, runner=lambda *a, **k: None)
+            ok(rep["status"] == "error" and rep["tests"] == 0 and "no decision-test artifact" in (rep["reason"] or ""),
+               f"DG12 (P1-5) the copy's stored decision-test outputs are removed first: a re-run that writes none is "
+               f"an error, never the stored results ({rep['status']}: {rep['reason']})")
+            ok(write_allowed({"status": "complete", "engine_jobs": 0, "stored_vs_rerun": ["DT1: decision differs"]},
+                             False)[0] is False
+               and write_allowed({"status": "complete", "engine_jobs": 0, "stored_vs_rerun": ["x"]}, True)[0]
+               and write_allowed({"status": "complete", "engine_jobs": 0, "stored_vs_rerun": []}, False)[0],
+               "DG12b (P1-7) --write refuses a re-run that disagrees with the stored results unless accepted by name")
+            yaml.safe_dump({"data": {"draws": 2}}, open(os.path.join(d, "analysis", "uncertainty.yaml"), "w"))
+            seen = {}
+            retro(d, os.path.join(w, "work2"), unsigned=True, log=lambda *a: None,
+                  runner=lambda *a, **k: seen.update(k))
+            ok(seen.get("draws") == 2, f"DG12c (P2-1) the retro re-runs with the run's own number of draws ({seen})")
 
     def dg13():
         a = digest(_rec(perturbation_identity=[False]))
@@ -512,7 +764,38 @@ def _self_test() -> int:
         ok(_plain_name("C:trial", ntpath) is False and _plain_name("prior_range_z:North East", os.path) is True,
            "DG17c (r3 P1-3) a test id that would name a drive on Windows is not a plain file name there")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17):
+    def dg18():          # the retro cases of Codex review r2 (DG16 before the split)
+        from toolkit.spec import schema
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as w, \
+                tempfile.TemporaryDirectory() as side:
+            schema.toy_spec(d)
+            fixture(side, [], {})
+            os.symlink(os.path.join(side, "analysis"), os.path.join(d, "analysis"))
+            ok(_raises(lambda: retro(d, os.path.join(w, "k"), unsigned=True, log=lambda *a: None,
+                                     runner=lambda *a, **k: None))
+               and os.path.isfile(os.path.join(side, "analysis", "decision_tests.yaml")),
+               "DG16 (r2 P1-1) a run whose decision-test outputs sit under a link is refused; nothing outside is removed")
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "Run"))
+            alias = os.path.join(d, "run")
+            if os.path.exists(alias):          # a case-insensitive volume: another spelling of the same directory
+                ok(_inside(os.path.join(alias, "x"), os.path.join(d, "Run")),
+                   "DG16b (r2 P1-2) a path inside the run dir by another letter case is inside")
+            open(os.path.join(d, "Run", "f"), "w").write("keep")
+            os.link(os.path.join(d, "Run", "f"), os.path.join(d, "hard.json"))
+            ok(_raises(lambda: write_out(os.path.join(d, "hard.json"), "{}", os.path.join(d, "Run")))
+               and open(os.path.join(d, "Run", "f")).read() == "keep",
+               "DG16c (r2 P1-2) an output hard-linked to a file elsewhere is refused (never truncated)")
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as w:
+            schema.toy_spec(d)
+            os.makedirs(os.path.join(d, "analysis", "decision_tests.yaml"))
+            ok(_raises(lambda: retro(d, os.path.join(w, "k"), unsigned=True, log=lambda *a: None,
+                                     runner=lambda *a, **k: None)),
+               "DG16h (r2 P1-4) a summary that is not a regular file is refused, never read as absent")
+        import threading
+        ok(isinstance(no_engine_jobs._lock, type(threading.Lock())), "DG16l (r2 P2-5) the guard holds a process lock")
+
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg7, dg8, dg9, dg10, dg11, dg12, dg13, dg14, dg15, dg16, dg17, dg18):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
@@ -534,10 +817,46 @@ def main(argv=None) -> int:
         return _self_test()
     ap = argparse.ArgumentParser(description="decision-test golden records (module docstring)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("digest", help="digest a finished run's decision tests (JSON on stdout)").add_argument("run_dir")
+    d = sub.add_parser("digest", help="digest a finished run's decision tests")
+    d.add_argument("run_dir")
+    d.add_argument("--out")
+    r = sub.add_parser("retro", help="re-run a copy's analysis on stored rows (zero engine jobs) and digest it")
+    r.add_argument("run_dir")
+    r.add_argument("--work", required=True, help="an empty directory outside the run dir for the copy")
+    r.add_argument("--spec", default="decision_spec.yaml")
+    r.add_argument("--unsigned", action="store_true", help="re-run a copy whose spec signature does not verify here")
+    r.add_argument("--accept-stored-diff", action="store_true",
+                   help="--write even when the re-run differs from the run's stored results (say why in the record)")
+    g = r.add_mutually_exclusive_group(required=True)
+    g.add_argument("--write", help="record the re-run's digests to this file (outside the run dir; kept outside the repo)")
+    g.add_argument("--expect", help="compare the re-run's digests with this file")
     a = ap.parse_args(argv)
-    print(json.dumps(digest_dir(a.run_dir), indent=1, sort_keys=True))
-    return 0
+    if a.cmd == "digest":
+        got = digest_dir(a.run_dir)
+        text = json.dumps(got, indent=1, sort_keys=True)
+        if a.out:
+            write_out(a.out, text + "\n", a.run_dir)
+        print(text if not a.out else f"{len(got)} decision tests digested to {a.out}")
+        return 0
+    for f_ in (a.write, a.expect):
+        if f_ and _inside(f_, a.run_dir):
+            ap.error(f"{f_} is inside the run dir; the collected run is never written")
+    rep = retro(a.run_dir, a.work, a.spec, a.unsigned)
+    rep["expected_vs_rerun"] = None
+    code = 0 if rep["status"] == "complete" and rep["engine_jobs"] == 0 else 2 if rep["status"] == "blocked" else 1
+    if code == 0 and a.write:
+        allowed, why = write_allowed(rep, a.accept_stored_diff)
+        if allowed:
+            write_out(a.write, json.dumps(rep["digests"], indent=1, sort_keys=True) + "\n", a.run_dir)
+        else:
+            rep["write_refused"], code = why, 1
+    if code == 0 and a.expect:
+        with open(a.expect) as f:
+            rep["expected_vs_rerun"] = compare(json.load(f), rep["digests"])
+        code = 1 if rep["expected_vs_rerun"] else 0
+    print(json.dumps({k: v for k, v in rep.items() if k != "digests"}, indent=1))
+    return code
+
 
 if __name__ == "__main__":
     sys.exit(main())
