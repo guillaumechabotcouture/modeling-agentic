@@ -556,12 +556,16 @@ class SdkTasks:
         fb = ("\n\nThis is a repair: the gate refused your file. These are all of its errors; fix every one, "
               "check the whole file against the schema above, and keep the review:\n- "
               + "\n- ".join(feedback)) if feedback else ""
+        from toolkit.analysis import red_flag as RF       # heuristic notes the reviewer judges; never a gate
+        notes = RF.critic_notes(run_dir)
+        msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
+                                            + "\n- ".join(notes) if notes else "")
         return self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
             stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
-                             f"Review round {round_n}.", (f,), model)
+                             msg, (f,), model)
 
     def plan_fixes(self, packet):
         inp = self._input(packet)
