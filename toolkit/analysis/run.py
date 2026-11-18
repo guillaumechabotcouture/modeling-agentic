@@ -1416,6 +1416,17 @@ def _self_test_joint(ok, q):
                                                R["uncertainty"], R["stability"], [ro], R["calibration"])}
         ok("[CLAIM:dt.DTo.ratio0]" in txt_ and "dt.DTo.ratio0" in ids_ and "package pairs: a → b" in txt_,
            f"JR11g (#248 P3) the results state each tested ratio (a claim) and the package pairs")
+        # Codex review of #253 P1: the value "engine" (#251: the base adjustment removed) is not a number; it is named in
+        # words, and only the numeric ratios are claims (a scalar claim of "engine" fails the ledger and the run)
+        roe = dict(ro, path="p", outcome_ratio=dict(ro.get("outcome_ratio") or {}, values=["engine", 0.5]))
+        txe = CL.results_template(A, R["point"], R["uncertainty"], R["stability"], R["sensitivity"], [roe],
+                                  R["calibration"], R["emulator_accuracy"])
+        cle = [c for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
+                                                             "calibration", "engine")}, R["point"], R["uncertainty"],
+                                       R["stability"], [roe], R["calibration"]) if c["id"].startswith("dt.DTo.ratio")]
+        ok([c["id"] for c in cle] == ["dt.DTo.ratio1"] and "[CLAIM:dt.DTo.ratio1]" in txe
+           and "[CLAIM:dt.DTo.ratio0]" not in txe and "base adjustment removed" in txe,
+           f"JR11h (Codex #253 P1) \"engine\" is a case in words, the numeric ratios claims ({[c['id'] for c in cle]})")
         _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R)
         saved_z = A.joint["z"].pop(listed[0])
         try:
