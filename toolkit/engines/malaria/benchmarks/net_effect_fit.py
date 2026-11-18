@@ -2209,6 +2209,40 @@ def _self_test() -> int:
            and confounding({"correlation": {"names": ["pbo_gain_scale"], "matrix": [[1.0]]}}) == [],
            f"FA8 the fit output records each confounded pair's correlation in the joint sample ({c})")
     case("FA8", fa8)
+
+    def fa9():
+        # Codex review of the 7-parameter extension: an undefined correlation (0-2 accepted rows, matrix None) is
+        # recorded as such, never a crash before the output is written; the coefficient and count come from the
+        # exported rows the decision analysis draws (not every accepted candidate)
+        nm = ["pbo_gain_scale", "net_deter_sat"]
+        got = {}
+        for n in (0, 1, 2):
+            rows = [{"pbo_gain_scale": 0.5 + 0.1 * i, "net_deter_sat": 0.2 * i} for i in range(n)]
+            got[n] = confounding({"correlation": {"names": nm, "matrix": None}, "sample": rows})
+        rng = np.random.default_rng(1)
+        u = rng.random(400)
+        rows = [{"pbo_gain_scale": float(a), "net_deter_sat": float(1 - a + 0.01 * b)}
+                for a, b in zip(u, rng.random(400))]
+        c = confounding({"correlation": {"names": nm, "matrix": [[1.0, 0.9], [0.9, 1.0]]}, "sample": rows})
+        want = float(np.corrcoef([r[nm[0]] for r in rows], [r[nm[1]] for r in rows])[0, 1])
+        ok(all(g and g[0]["correlation"] is None and g[0]["sample_n"] == n for n, g in got.items())
+           and abs(c[0]["correlation"] - want) < 1e-9 and c[0]["sample_n"] == 400,
+           f"FA9 confounding: undefined with fewer than 3 rows (None, not a crash); computed on the exported rows "
+           f"({c[0]['correlation']:.3f} vs the candidates' 0.9)")
+    case("FA9", fa9)
+
+    def fa10():
+        # Codex review: a fresh fit runs only on option A's declaration (a fit on the pack's own five targets would be
+        # labelled option A and its posterior refused at replay); the history's targets only replay
+        got = ""
+        try:
+            run(p_w, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=True)
+        except ValueError as ex:
+            got = str(ex)
+        ok("OPTION_A" in got and OPTION_A["job"] == "f6-refit-optiona" and "v0.18" in PURPOSE,
+           f"FA10 a fresh fit (or smoke) on another declaration is refused before any engine set-up ({got[:120]}); the "
+           f"launch job is {OPTION_A['job']} (an f6 budget prefix)")
+    case("FA10", fa10)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
