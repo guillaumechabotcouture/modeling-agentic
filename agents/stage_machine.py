@@ -2100,6 +2100,20 @@ def _self_test() -> int:
         ok(s2 == "paused:awaiting_spec_amendment" and "draft_spec" not in T3.calls
            and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes,
            f"R3-2b a resume stays paused for the amendment and drafts nothing ({s2})")
+        # R3-2c (Codex review of #261): the pause is honoured on resume even if a restored copy lost the sign-off record,
+        # and keeps its first request; and it is written with no budget left (it costs no model call)
+        rq0 = json.load(open(os.path.join(d, "spec_rethink_request.json")))
+        os.remove(os.path.join(d, SIGNOFF_FILE))
+        T4 = StubTasks(T.s)
+        s3 = _SpikeMachine(d, T4, None, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s3 == "paused:awaiting_spec_amendment" and "draft_spec" not in T4.calls
+           and json.load(open(os.path.join(d, "spec_rethink_request.json")))["requested_at"] == rq0["requested_at"],
+           f"R3-2c a resumed amendment pause is honoured without the sign-off record and keeps its request ({s3})")
+        st5 = load_state(d)
+        st5.budget_usd, st5.spent_usd = 20.0, 20.0
+        save_state(d, st5)
+        s5 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s5 == "paused:awaiting_spec_amendment", f"R3-2d with no budget left the amendment pause still holds ({s5})")
 
         # T29: the deliverable destination must be a plain file inside the run, not one the harness owns.
         bad_paths = {}
