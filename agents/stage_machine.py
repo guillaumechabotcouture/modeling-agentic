@@ -903,11 +903,16 @@ def _spec_signed_sha(run_dir: str) -> str | None:
     """The spec sha256 a sign-off record binds (the spec's own record, or a brief's that hashed the spec), or None."""
     for f, get in ((SIGNOFF_FILE, lambda r: r.get("spec_sha256") or (r.get("sha256") or {}).get(AB.SPEC_FILE)),
                    ("decision_brief.signoff.json", lambda r: (r.get("sha256") or {}).get(AB.SPEC_FILE))):
-        try:
-            rec = json.load(open(os.path.join(run_dir, f)))
-        except (OSError, ValueError):
+        p = os.path.join(run_dir, f)
+        if not os.path.lexists(p):
             continue
-        if isinstance(rec, dict) and get(rec):
+        try:
+            rec = json.load(open(p))
+        except (OSError, ValueError):
+            return "unreadable"          # fail closed: an unreadable record still protects the spec (#261 re-review)
+        if not isinstance(rec, dict):
+            return "unreadable"
+        if get(rec):
             return get(rec)
     return None
 
@@ -1246,6 +1251,8 @@ class Machine:
         s = self.st.state
         if s == "FINAL":
             return s
+        if self.st.paused == AWAITING_SPEC_AMENDMENT:      # a state saved before the flag existed keeps its pause
+            self.st.tries["spec_amendment"] = True
         self.st.paused = None
         if s == "SPEC" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
             return self.h_SPEC()                 # the amendment pause costs no model call (Codex review of #261 P1-3)
@@ -2291,6 +2298,20 @@ def _self_test() -> int:
         save_state(d, st5)
         s5 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
         ok(s5 == "paused:awaiting_spec_amendment", f"R3-2d with no budget left the amendment pause still holds ({s5})")
+        # R3-2e (narrow re-review of #261): an unreadable sign-off record still protects the spec; a persisted pause is
+        # honoured even without the flag (a state saved before it existed)
+        d6 = os.path.join(td, "r32e")
+        os.makedirs(d6)
+        open(os.path.join(d6, SIGNOFF_FILE), "w").write('{"by": "own')
+        st6 = load_state(d)
+        st6.tries.pop("spec_amendment", None)
+        st6.paused = AWAITING_SPEC_AMENDMENT
+        save_state(d, st6)
+        T6 = StubTasks(T.s)
+        m6 = _SpikeMachine(d, T6, None, log=lambda *a: None, cross_engine_check=False)
+        m6.step()
+        ok(spec_signed_once(d6) and "draft_spec" not in T6.calls and load_state(d).paused == AWAITING_SPEC_AMENDMENT,
+           "R3-2e a truncated sign-off record still protects the spec; a persisted amendment pause is honoured")
 
         # R3-1 (F6 run 3): a write-up finding is never a FIX_LOOP task; the writer gets it with the draft.
         wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}
