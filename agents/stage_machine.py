@@ -267,7 +267,7 @@ def deliverable_problems(run_dir: str) -> list[str]:
     norm = os.path.relpath(target, root).replace(os.sep, "/")
     import pipeline as P
     owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
-        STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
+        STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, "spec_rethink_request.json", FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*")
     if owned_path(root, norm, owned):
@@ -890,28 +890,47 @@ AWAITING_SPEC_AMENDMENT = "awaiting_spec_amendment"
 SPEC_RETHINK_REQUEST = "spec_rethink_request.json"
 
 
+def _spec_signed_sha(run_dir: str) -> str | None:
+    """The spec sha256 a sign-off record binds (the spec's own record, or a brief's that hashed the spec), or None."""
+    for f, get in ((SIGNOFF_FILE, lambda r: r.get("spec_sha256") or (r.get("sha256") or {}).get(AB.SPEC_FILE)),
+                   ("decision_brief.signoff.json", lambda r: (r.get("sha256") or {}).get(AB.SPEC_FILE))):
+        try:
+            rec = json.load(open(os.path.join(run_dir, f)))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and get(rec):
+            return get(rec)
+    return None
+
+
 def spec_signed_once(run_dir: str) -> bool:
-    """A sign-off record exists for the run's spec: it was signed, so only the owner may change it."""
-    return any(os.path.lexists(os.path.join(run_dir, f)) for f in (SIGNOFF_FILE, "decision_brief.signoff.json"))
+    """A sign-off record binds the run's spec: it was signed, so only the owner may change it (a brief signed before
+    any spec existed does not count: Codex review of #261 P2-5)."""
+    return _spec_signed_sha(run_dir) is not None
 
 
 def rethink_request(run_dir: str, round_n: int) -> dict:
     """spec_rethink_request.json: why the run asks for a spec amendment (the latest fix plan's rethink briefs, the
     open findings the spec owns, with their remedies) and the signed spec it would amend (its sha256)."""
     briefs = []
-    for r in range(round_n, 0, -1):
-        try:
-            plan = json.load(open(os.path.join(run_dir, f"fix_plan_r{r}.json"))).get("plan") or {}
-        except (OSError, ValueError, AttributeError):
-            continue
-        briefs = [{"task": t.get("id"), "findings": t.get("findings"), "brief": t.get("brief")}
-                  for t in plan.get("tasks") or [] if isinstance(t, dict) and t.get("action") == "rethink"]
-        if briefs:
-            break
+    try:          # this round's fix plan only: an earlier round's (an engine rethink) is not this request's (#261 P2-6)
+        plan = json.load(open(os.path.join(run_dir, f"fix_plan_r{round_n}.json"))).get("plan") or {}
+    except (OSError, ValueError, AttributeError):
+        plan = {}
+    briefs = [{"task": t.get("id"), "findings": t.get("findings"), "brief": t.get("brief")}
+              for t in plan.get("tasks") or [] if isinstance(t, dict) and t.get("action") == "rethink"
+              and t.get("owner_state") == "SPEC"]
     led = FL.load(run_dir)
     fs = [{"id": f.id, "severity": f.severity, "claim": f.claim, "fix_requires": f.fix_requires}
           for f in FL.open_findings(led) if f.owner_state == "SPEC" or any(f.id in (b["findings"] or []) for b in briefs)]
-    doc = {"round": round_n, "requested_at": _now(), "signed_spec_sha256": signed_hash(run_dir), "briefs": briefs,
+    try:
+        prev = json.load(open(os.path.join(run_dir, SPEC_RETHINK_REQUEST)))
+    except (OSError, ValueError):
+        prev = None
+    if isinstance(prev, dict) and prev.get("round") == round_n:
+        return prev                  # a resume returns the request it made (Codex review of #261 P1-2)
+    doc = {"round": round_n, "requested_at": _now(), "signed_spec_sha256": _spec_signed_sha(run_dir),
+           "working_spec_sha256": signed_hash(run_dir), "briefs": briefs,
            "findings": fs, "next": "amend decision_spec.yaml and relaunch with reuse (a new run dir from this one's "
                                     "spec and stored rows); this run does not redraft or re-sign its spec"}
     _write_json(run_dir, SPEC_RETHINK_REQUEST, doc)
@@ -1146,6 +1165,8 @@ class Machine:
         if s == "FINAL":
             return s
         self.st.paused = None
+        if s == "SPEC" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
+            return self.h_SPEC()                 # the amendment pause costs no model call (Codex review of #261 P1-3)
         if s in LLM_STATES and self._out_of_budget():
             return self._budget_out(s)
         return getattr(self, "h_" + s)()
@@ -1169,11 +1190,12 @@ class Machine:
 
     # -------------------------------------------------- handlers
     def h_SPEC(self):
-        if spec_signed_once(self.run_dir):
+        if self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir):
             # F6 run 3 (gap 2): a rethink of a signed spec is the owner's amendment, never a redraft in this run (an
             # amended spec cannot be re-signed in a signed run dir): the request, then a pause; the owner amends and
             # relaunches with reuse
             req = rethink_request(self.run_dir, self.st.round)
+            self.st.tries["spec_amendment"] = True     # honoured on resume, whatever a restored copy lost (#261 P1-2)
             self.st.paused, self.st.status = AWAITING_SPEC_AMENDMENT, None
             save_state(self.run_dir, self.st)
             self.log(f"[machine] SPEC rethink of a signed spec: nothing redrafted. Read {SPEC_RETHINK_REQUEST} "
