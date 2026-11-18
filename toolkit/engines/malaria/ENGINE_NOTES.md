@@ -100,7 +100,7 @@ pending}` until it reports.
 of F6's LGAs), f is near 1, so hut mortality is near its ceiling (0.93). Equation 8 then cuts entry to 0.1-0.2, and
 the PBO net repels more than it kills: at x = 0.55, a new pyrethroid net kills 0.43 per attempt and a PBO net 0.11.
 Repelled mosquitoes retry and survive, so the community effect falls and the PBO benefit over pyrethroid nets goes to
-about 1.0 in the F6 batch. No pack trial is at x 0.3-0.9, and no source in hand measures entry at near-saturated hut
+about 1.0 in the F6 batch. No pack PBO trial setting has its main vector at x 0.3-0.9 (Muleba's funestus stratum, 4% of its vectors, is at 0.545), and no source in hand measures entry at near-saturated hut
 mortality. `pbo_gain_scale` cannot change this (a larger gain pushes f closer to 1), nor can `pbo_adv_decay`.
 
 **What changed.** One parameter, `net_deter_sat` θ in [0, 1] (kind `fixed`, units share, default 1), acting on PBO
