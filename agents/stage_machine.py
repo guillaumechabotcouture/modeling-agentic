@@ -897,11 +897,17 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
 
 OWNER_REQUEST_PRODUCER = "agents/stage_machine.py FIX_LOOP (owner amendments)"
 
+def pending_amendments(ledger: dict) -> list[str]:
+    """Findings, open or declared, whose remedy is an owner amendment the owner has not answered (Codex #258 P1-10)."""
+    return sorted(f.id for f in ledger.values() if f.status in ("open", "declared") and FX.needs_owner_amendment(f))
+
+
 def apply_owner_declines(decision: dict, ledger: dict) -> dict:
     """Codex review of #258 P1-11: a finding the owner declined (the run may not go on without it) holds the gate: a
     decision that would accept or declare is not accepted instead, with the decline as a non-declarable finding, so the
     run ends completed_scope_declined (route_gate) once the write-up is gated."""
-    declined = sorted(f.id for f in ledger.values() if f.status == "owner_declined")
+    fixed = set(map(str, decision.get("resolved_by_test") or []))     # its test passes: the decline is moot
+    declined = sorted(f.id for f in ledger.values() if f.status == "owner_declined" and f.id not in fixed)
     if not declined or decision.get("action") not in ("ACCEPT", "DECLARE_SCOPE"):
         return decision
     held = [{"kind": "scope_declaration_declined", "finding": fid, "severity": "HIGH", "scope_declarable": False,
@@ -1436,6 +1442,8 @@ class Machine:
                 opened = open_findings(self.run_dir, d)
                 d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget())
                 d = require_judged(d, opened)
+                # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
+                d = apply_owner_declines(d, FL.sync(self.run_dir, None, self.st.round, post_write=pw)[0])
             if d.get("action"):
                 import validate_critique_yaml as V
                 V._append_validator_history(self.run_dir, self.st.round, d, pw)
@@ -1466,17 +1474,11 @@ class Machine:
                 led = FL.load(self.run_dir)
                 # Codex review of #258 P1-10: a finding whose remedy is an owner amendment goes to the owner on every
                 # route, not only from the fix loop
-                amend = sorted(f.id for f in FL.open_findings(led) if FX.needs_owner_amendment(f))
+                amend = pending_amendments(led)
                 if amend:
-                    request_owner_amendments(self.run_dir, self.st.round, led, amend)
+                    self._request_owner(led, amend)
                     return self._go("OWNER_DECISION", f"{len(amend)} finding(s) need an owner amendment "
                                                       f"({', '.join(amend)[:120]})")
-                d = apply_owner_declines(d, led)
-                if d.get("rule_matched") == "owner_declined":
-                    _write_json(self.run_dir, tag, d)
-                    if pw:
-                        _write_json(self.run_dir, "final_gate.json", d)
-                    self.st.last_gate.update(action=d["action"], rule_matched=d["rule_matched"], rationale=d["rationale"])
         nxt, status, mode = route_gate(d, pw)
         lang = (d or {}).get("report_acceptance_language") or {}
         if nxt == "FINAL" and lang.get("remaining"):
@@ -1536,7 +1538,7 @@ class Machine:
         self.st.history.append({"at": _now(), "fix_loop": summ})
         if summ.get("owner_amendments"):
             # F6 run 3: their remedy is an owner amendment of the signed spec; the owner answers, no redraft runs.
-            request_owner_amendments(self.run_dir, self.st.round, FL.load(self.run_dir), summ["owner_amendments"])
+            self._request_owner(FL.load(self.run_dir), summ["owner_amendments"])
             return self._go("OWNER_DECISION", f"{len(summ['owner_amendments'])} finding(s) need an owner amendment "
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
@@ -1550,6 +1552,13 @@ class Machine:
             return self._go("WRITE", f"every open finding is the write-up's ({', '.join(summ['write_up'])[:120]})")
         return self._go("CRITIQUE", f"fix loop: {summ['rows']} task(s), {summ['passed']} passed their checks")
 
+    def _request_owner(self, led: dict, ids: list[str]) -> None:
+        """The request, and the fingerprints it asks, kept in run_state.json: the answers must be to them (Codex
+        re-review of #258 P1-8), whatever request file is there later."""
+        doc = request_owner_amendments(self.run_dir, self.st.round, led, ids)
+        self.st.tries["owner_request"] = [i["fingerprint"] for i in doc["items"]]
+        save_state(self.run_dir, self.st)
+
     def h_OWNER_DECISION(self):
         """Released only by the owner's own answers to every item of the pending request (scripts/scope_signoff.py sign
         --by owner, from the owner's shell); the machine, the harness here, then records them (harness_record), so the
@@ -1559,17 +1568,20 @@ class Machine:
             req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
         except (OSError, ValueError):
             req = None
-        items = (req.get("items") or []) if isinstance(req, dict) and req.get("pending") else []
+        want = list(self.st.tries.get("owner_request") or [])
         answers, bad = SS.load_answers(self.run_dir)
-        answered = bool(items) and not bad and all(
-            isinstance(answers.get(i.get("fingerprint")), dict) and answers[i["fingerprint"]].get("by") == "owner"
-            and answers[i["fingerprint"]].get("decision") in SS.DECISIONS for i in items)
+        answered = bool(want) and not bad and all(
+            isinstance(answers.get(fp), dict) and answers[fp].get("by") == "owner"
+            and answers[fp].get("decision") in SS.DECISIONS for fp in want)
         if answered:
             SS.harness_record(self.run_dir)
-            from lib.safe_io import write_nofollow
-            write_nofollow(self.run_dir, OWNER_REQUEST, json.dumps(dict(req, pending=False, answered_at=_now()),
-                                                                   indent=1).encode(), atomic=True)
-            return self._go("GATE", "the owner answered the scope declarations")
+            self.st.tries.pop("owner_request", None)
+            nxt = self._go("GATE", "the owner answered the scope declarations")    # persisted before the request closes
+            if isinstance(req, dict):
+                from lib.safe_io import write_nofollow
+                write_nofollow(self.run_dir, OWNER_REQUEST, json.dumps(dict(req, pending=False, answered_at=_now()),
+                                                                       indent=1).encode(), atomic=True)
+            return nxt
         self.st.paused = "awaiting_scope_signoff"
         save_state(self.run_dir, self.st)
         return "OWNER_DECISION"

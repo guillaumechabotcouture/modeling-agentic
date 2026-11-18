@@ -387,6 +387,9 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             f.resolution_type = "fix"
         a = answers.get(answer_fingerprint(f.id, f.claim, f.fix_requires))    # bound to this claim and remedy
         ans = a.get("decision") if a and str(a.get("finding")) == f.id else None
+        if ans is None and f.resolution_type == "owner_decision" and f.status in ("open", "declared") \
+                and any(isinstance(e, dict) and e.get("by") == "owner" for e in f.events):
+            f.resolution_type = "fix"        # answered as it was before; revised since, so it is asked again
         if ans and f.status in ("open", "declared"):
             f.status = "owner_accepted" if ans == "accept" else "owner_declined"
             f.resolution_type = "owner_decision"
