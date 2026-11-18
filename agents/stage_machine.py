@@ -2024,6 +2024,77 @@ def _self_test() -> int:
         ok(all("allowance_usd" in e for k, e in jj.items() if not k.endswith("spec_sha256")),
            "T28 every journal entry records the allowance it was given")
 
+        # R3-2 (F6 run 3, gap 2): a SPEC rethink of a signed spec drafts a proposal in proposals/rev<k>/ inside the run
+        # dir; the signed files are untouched, and only the owner's signature on the proposal promotes it, through a
+        # recorded commit point, with exactly the files of its manifest.
+        rk = {"id": "D-040", "severity": "HIGH", "target_stage": "PLAN", "claim": "the envelope is the wrong year",
+              "fix_requires": "redraft the envelope for the decision year"}
+        once40 = []
+
+        def spec40(question, run_dir):
+            sp = AB.toy_spec("units.csv")
+            sp.pop("engine")
+            sp["deliverable_file"] = {"path": "allocation_optimized.csv",
+                                      "columns": {"unit": "id", "package": "package", "dalys_averted": "dalys_averted"}}
+            if os.sep + "proposals" + os.sep + "rev" in run_dir:
+                sp["constraints"]["envelope_usd"] = 21000
+            return sp
+
+        def plan40(pk):
+            if any(f["id"] == "D-040" for f in pk["findings"]) and not once40:
+                once40.append(1)
+                return {"tasks": [{"id": "T1", "findings": ["D-040"], "action": "rethink", "owner_state": "SPEC",
+                                   "brief": "redraft"}]}
+            return {"tasks": []}
+        d, T, st = new_run("proposal", {"spec": spec40, "critics": {1: {"critique-domain": [rk]}}, "plan": plan40},
+                           signoff="owner", max_rounds=3)
+        _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        sign(d, "owner", "first")
+        signed_bytes = open(os.path.join(d, AB.SPEC_FILE), "rb").read()
+        mk = lambda: _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False)  # noqa: E731
+        s = mk().run()
+        pdir = os.path.join(d, "proposals", "rev1")
+        try:
+            prop = json.load(open(os.path.join(pdir, "proposal.json")))
+        except (OSError, ValueError):
+            prop = {}
+        ok(s == "paused:awaiting_signoff" and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes
+           and load_state(d).tries.get("spec_proposal") == "rev1" and prop.get("pending")
+           and AB.SPEC_FILE in (prop.get("manifest") or {})
+           and b"21000" in open(os.path.join(pdir, AB.SPEC_FILE), "rb").read(),
+           f"R3-2 the rethink's draft is a proposal in proposals/rev1 with a manifest; the signed spec is untouched ({s})")
+        if prop.get("pending"):
+            st2 = load_state(d)
+            st2.signoff = "lead"
+            save_state(d, st2)
+            ok(mk().run() == "paused:awaiting_signoff" and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes,
+               "R3-2b in lead mode the proposal still waits for the owner")
+            st2 = load_state(d)
+            st2.signoff = "owner"
+            save_state(d, st2)
+            sign(pdir, "owner", "the amendment")
+            open(os.path.join(pdir, "data_extra.csv"), "w").write("x\n")          # not in the manifest
+            open(os.path.join(d, AB.SPEC_FILE), "ab").write(b"# changed\n")      # the base spec moved
+            ok(mk().run() == "paused:awaiting_signoff" and not os.path.exists(os.path.join(d, "spec_history")),
+               "R3-2d a proposal whose base spec changed is not promoted")
+            open(os.path.join(d, AB.SPEC_FILE), "wb").write(signed_bytes)
+            try:
+                promote_proposal(d, "rev1", _stop_after="archived")              # an interrupted promotion
+            except RuntimeError:
+                pass
+            s3 = mk().run()
+            hist = os.path.join(d, "spec_history", "1", AB.SPEC_FILE)
+            try:
+                prom = json.load(open(os.path.join(pdir, "promotion.json")))
+            except (OSError, ValueError):
+                prom = {}
+            ok(not s3.startswith("paused") and b"21000" in open(os.path.join(d, AB.SPEC_FILE), "rb").read()
+               and os.path.exists(hist) and open(hist, "rb").read() == signed_bytes and prom.get("state") == "committed"
+               and (_signoff(d) or {}).get("note") == "the amendment"
+               and not os.path.exists(os.path.join(d, "data_extra.csv")),
+               f"R3-2c an interrupted promotion resumes from its record; only manifest files are promoted; the old "
+               f"spec is kept in spec_history ({s3}, {prom.get('state')})")
+
         # T29: the deliverable destination must be a plain file inside the run, not one the harness owns.
         bad_paths = {}
         for name, path in (("escape", "../escape.csv"), ("owned", "run_state.json"), ("report", "report.md"),

@@ -752,6 +752,27 @@ def _self_test() -> int:
         ok(all(res) and open(os.path.join(out, "v")).read() == "outside" and not os.path.exists(os.path.join(out, "new")),
            f"SI-AR2 appends through a link, a linked directory or a hard link are refused ({res})")
 
+    # SI-PR (F6 SP): the one root allowed inside a run dir is a spec proposal, <run>/proposals/rev<k>; nothing else
+    with tempfile.TemporaryDirectory() as d:
+        write(d, "metadata.json", "{}")
+        os.makedirs(os.path.join(d, "proposals", "rev1"))
+        os.makedirs(os.path.join(d, "proposals", "x"))
+        os.makedirs(os.path.join(d, "data"))
+        res = []
+        try:
+            publish(os.path.join(d, "proposals", "rev1", "a.txt"), "ok", os.path.join(d, "proposals", "rev1"))
+            res.append(open(os.path.join(d, "proposals", "rev1", "a.txt")).read() == "ok")
+        except LinkRefused:
+            res.append(False)
+        for root in (os.path.join(d, "proposals", "x"), os.path.join(d, "data"), os.path.join(d, "proposals")):
+            try:
+                publish(os.path.join(root, "b.txt"), "no", root)
+                res.append(False)
+            except LinkRefused:
+                res.append(True)
+        ok(all(res), f"SI-PR a proposal root <run>/proposals/rev<k> is accepted; any other root inside a run is refused "
+                     f"({res})")
+
     if failures:
         print("FAIL:", file=sys.stderr)
         for fl in failures:
