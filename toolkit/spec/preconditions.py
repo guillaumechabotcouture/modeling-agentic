@@ -244,8 +244,8 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
                            f"given the other: components within {sorted(x)}, with_any within {sorted(y)}); it "
                            f"rescales {sorted(tc)} given {sorted(wa)}")
     elif typ in ("outcome_ratio", "burden_scale"):      # #248 P2-5: refused explicitly
-        return False, (f"is a {typ} test: it re-derives burdens from the emulator's point outputs and holds the engine, "
-                       "so it cannot show what the departed engine effect does to the plan")
+        return False, (f"is a {typ} test: it re-derives burdens from the analysis's point outputs and does not vary "
+                       "the parameter or benchmark interaction carrying the departed engine effect")
     else:
         return False, f"is a {typ} test, which does not vary a component's effect"
     from toolkit.analysis import decision_tests as DT

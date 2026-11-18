@@ -1406,7 +1406,7 @@ def _self_test_joint(ok, q):
         # P2-5: an outcome_ratio test cannot carry an engine departure (it holds the engine): refused, saying why
         from toolkit.spec import preconditions as PC_
         okd, why_ = PC_.decision_test_runs(_NS(raw={"analysis": {"decision_tests": [dto]}}), "DTo", {"components": ["a"]})
-        ok(not okd and "emulator" in why_ and "outcome_ratio" in why_,
+        ok(not okd and "does not vary" in why_ and "outcome_ratio" in why_,
            f"JR11f (#248 P2-5) an outcome_ratio test is refused as an engine-departure test, with why ({why_})")
         # P3: results.md and the claims carry the tested ratios and the package pairs
         txt_ = CL.results_template(A, R["point"], R["uncertainty"], R["stability"], R["sensitivity"], [dict(ro, path="p")],

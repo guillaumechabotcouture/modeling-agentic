@@ -119,6 +119,8 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
                              f"{f}.units_changed_by_group[{k}].changed", "units"))
             # #248: what an outcome_ratio or burden_scale test set (its record's detail in the artifact)
             for k, _v in enumerate((d.get("outcome_ratio") or {}).get("values") or []):
+                if _v == "engine":         # #251: the base adjustment removed, a case named in words, not a number
+                    continue
                 cl.append(_c(f"dt.{tid}.ratio{k}", "scalar", arts["decision_tests"],
                              f"{f}.detail.outcome_ratio.values[{k}]", "ratio"))
             bsr = d.get("burden_scale") or {}
@@ -327,7 +329,8 @@ def _tested_text(d: dict, t: str) -> str:
         held = orr.get("unpaired") or []
         return (f"Tested ratios of a package's {orr.get('outcome')} with {orr.get('component')} to the same package's "
                 f"with {orr.get('reference')} in its place: "
-                + ", ".join(f"[CLAIM:dt.{t}.ratio{k}]" for k in range(len(orr["values"])))
+                + ", ".join("the engine's own effect (its base adjustment removed)" if v == "engine"
+                            else f"[CLAIM:dt.{t}.ratio{k}]" for k, v in enumerate(orr["values"]))
                 + f" (package pairs: {pairs}"
                 + (f"; held, with no counterpart: {', '.join(held)}" if held else "") + "). ")
     bsr = d.get("burden_scale") or {}
