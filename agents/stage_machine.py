@@ -2233,13 +2233,14 @@ def _self_test() -> int:
         save_state(d, st)
         FL.save(d, {"D-039": FL.Finding(id="D-039", kind="critique_blocker", severity="HIGH", source="critique-domain",
                                         status="owner_declined", resolution_type="owner_decision")})
-        _lg = globals()["legacy_gate"]
-        globals()["legacy_gate"] = lambda *a, **k: {"action": "DECLARE_SCOPE", "rule_matched": "3"}
+        _mod7 = sys.modules[Machine.__module__]
+        _lg = _mod7.legacy_gate
+        _mod7.legacy_gate = lambda *a, **k: {"action": "DECLARE_SCOPE", "rule_matched": "3"}
         try:
             m7 = _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False)
             m7.step()
         finally:
-            globals()["legacy_gate"] = _lg
+            _mod7.legacy_gate = _lg
         ok(load_state(d).status == "completed_scope_declined",
            f"R3-7d the legacy gate mode applies an owner decline too ({load_state(d).status})")
         # R3-5 (Codex review of #258 P1-10): the amendment check runs on every gate route: a structural PLAN blocker
