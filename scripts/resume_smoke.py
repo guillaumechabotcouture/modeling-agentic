@@ -52,19 +52,36 @@ def f(p):
     if p["i"] >= int(os.environ.get("{KILL}") or 99) and not os.path.exists(os.environ["{KILLED}"]):
         open(os.environ["{KILLED}"], "w").write("x")
         pid = int(open(os.environ["{KILLED}"] + ".driver").read())
-        if os.getsid(pid) == int(os.environ["{SID}"]) or os.getpgid(pid) == os.getpgid(0):
-            open(os.environ["{KILLED}"] + ".refused", "w").write("the step shares the smoke's session")
-            os._exit(3)                             # fail closed: the step is not in a session of its own
-        os.killpg(os.getpgid(pid), signal.SIGKILL)  # the batch step's process group dies mid-batch, as on a lost VM
+        try:
+            target = kill_target(os.getsid(0), int(os.environ["{SID}"]), os.getpgid(pid))
+        except OSError:
+            target = None
+        if target is None:
+            open(os.environ["{KILLED}"] + ".refused", "w").write("the step is not in a session of its own")
+            os._exit(3)                             # fail closed
+        os.killpg(target, signal.SIGKILL)           # the batch step's process group dies mid-batch, as on a lost VM
         os._exit(0)                                 # and this worker with it (it holds the step's output pipes)
     if p["i"] >= int(os.environ.get("{SLOW}") or 99):
-        parent = os.getppid()
+        driver = int(open(os.environ["{KILLED}"] + ".driver").read())   # recorded before the pool started
         for _ in range(600):                        # until the step is killed by its time limit
             time.sleep(0.1)
-            if os.getppid() != parent:
+            try:
+                os.kill(driver, 0)
+            except ProcessLookupError:
                 os._exit(0)                         # the step is gone: so is this worker
     return {{"v": p["i"]}}
 '''
+
+def kill_target(my_sid: int, smoke_sid: int, driver_pgid: int):
+    """The process group the toy may kill: its own step session's leader group (the driver's group, whose id is the
+    session id), and only when that session is not the smoke's; else None (fail closed). The saved id is signalled,
+    not looked up again."""
+    if my_sid == smoke_sid or driver_pgid != my_sid:
+        return None
+    return my_sid
+
+
+TOY_FN += "\n\n" + __import__("inspect").getsource(kill_target)
 
 DRIVER = '''import json
 import os
@@ -89,9 +106,6 @@ if __name__ == "__main__":
 '''
 
 
-def toy_kill_allowed(step_sid: int, smoke_sid: int) -> bool:
-    """The toy may kill the batch step only when the step runs in a session other than the smoke's."""
-    return step_sid != smoke_sid
 
 
 def judge(name: str, before: list, after: list, summary: dict, *, expect_kept=None, sig0=None, sig1=None,
@@ -107,6 +121,8 @@ def judge(name: str, before: list, after: list, summary: dict, *, expect_kept=No
         problems.append(f"the interrupted attempt persisted rows {kept}, not {sorted(expect_kept)}")
     if expect_kept is None and not 0 < len(kept) < N:
         problems.append(f"the interrupted attempt persisted {len(kept)} of {N} rows (a stop keeps some, not all)")
+    if expect_kept is None and not set(before[:-1]) <= set(kept):
+        problems.append(f"rows {sorted(set(before[:-1]) - set(kept))} finished (a later call started) but were not kept")
     recomputed = sorted(set(after) & set(kept))
     if summary.get("reused") != len(kept):
         problems.append(f"rows reused {summary.get('reused')} != ok rows the interrupted attempt kept {len(kept)}")
@@ -118,7 +134,7 @@ def judge(name: str, before: list, after: list, summary: dict, *, expect_kept=No
         problems.append(f"the resumed batch has {summary.get('n_ok')} of {N} ok rows")
     if rows is not None:
         bad = [r.get("i") for r in rows if not r.get("ok") or (r.get("result") or {}).get("v") != r.get("i")]
-        if len(rows) != N or bad:
+        if sorted(r.get("i") for r in rows) != list(range(N)) or bad:
             problems.append(f"the final rows do not carry their own inputs' results ({len(rows)} rows; wrong: {bad})")
     if stage:
         if not sig0 or not sig1 or sig0 != sig1:
@@ -154,8 +170,7 @@ def _kept_from_lines(lines) -> list:
         except ValueError:
             continue
         if isinstance(r, dict) and r.get("ok") and "_partial" not in r:
-            v = (r.get("result") or {}).get("v") if isinstance(r.get("result"), dict) else None
-            got.append(v if v is not None else r.get("i"))
+            got.append(r.get("i"))
     return got
 
 
@@ -279,7 +294,7 @@ def scenarios(work: str) -> list:
     finally:
         os.environ.pop(SLEEP, None)
     row = judge("cap_stop", before, _calls(calls)[len(before):], dict(s1, _kept=kept), rows=rows_of(d))
-    if not stopped or "compute cap" not in why_stopped and "allowance" not in why_stopped:
+    if not stopped or not why_stopped.startswith(compute.CAP_STOP):
         row["ok"], row["problems"] = False, row["problems"] + [f"the allowance did not stop the batch ({why_stopped})"]
     if sorted(kept) != returned:
         row["ok"], row["problems"] = False, row["problems"] + [f"rows on disk {sorted(kept)} != returned {returned}"]
