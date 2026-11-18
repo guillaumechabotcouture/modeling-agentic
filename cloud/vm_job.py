@@ -26,12 +26,13 @@ once it will construct a cluster. Each `run` poll saves the outputs, then reads 
 writes <out>/<name>/<job_id>/cap_projection.json (level under_cap / over_cap / far_over_cap at
 budget.CAP_ALERT_MULTIPLE x the cap, burn rate, projected spend), and each upward crossing, and three failed
 readings in a row, prints a WARNING and records a spend alert. Nothing is stopped for dollars or for an unreadable
-cost. The job's hard stops are its own --max-hours on the VM and the cluster's timeouts. SIGTERM ends `run` and
-`wait --cap-usd` as Ctrl-C does, so the cluster is stopped by id.
+cost. The job's hard stops are its own --max-hours on the VM and the cluster's timeouts. SIGTERM ends `run` as
+Ctrl-C does, so the cluster is stopped by id.
 
 Re-attaching a cap (2026-11-13: a session restart killed the `run` that metered a job, and its cluster ran on with
 no cap). `wait <name> <job_id> --cap-usd N` meters the cluster id recorded in job.json the way `run` does (records and
-alerts) and stops it by id once the job ends (the launcher that would have stopped it is gone). The cap is on the
+alerts) and stops it by id once the job has ended (the launcher that would have stopped it is gone); it never stops a
+job that is still running, whatever ends the wait. The cap is on the
 cluster's lifetime cost. The cluster's reservation is replaced by one of the rest of N (budget.reattach_budget_ok);
 a cost already past N, or a budget the rest does not fit, is accepted with a spend alert. A budget or cost that
 cannot be read is alerted, never a stop.
@@ -615,8 +616,7 @@ def _poll(a, dest, gone_ok=False, deadline=None, cluster=None, cid=None, meter=N
 def cmd_wait(a):
     dest = local_dir(a.name, a.job_id, a.out)
     if getattr(a, "cap_usd", None) is not None:
-        with _sigterm_as_interrupt():
-            return _wait_capped(a, dest)
+        return _wait_capped(a, dest)          # no SIGTERM handler: a monitor's end never stops the job
     a.name = _job_cluster(dest, a.name)
     return _poll(a, dest)
 
@@ -675,35 +675,24 @@ def _wait_gate(a, name, cid, dest, accepted):
 
 def _wait_capped(a, dest):
     """`wait --cap-usd`: the cluster id job.json records, gated (_wait_gate), attached by that id, then polled with
-    `run`'s cost readings on its lifetime cost (recorded and alerted, never a stop for dollars). Once gating starts,
-    it is stopped by id whatever ends the wait (a terminal state, an error, Ctrl-C, SIGTERM), as `run` would have;
-    only a refusal by the budget gate (no scope, a name outside its prefixes), before it accepted the cap, leaves it
-    as it was."""
+    `run`'s cost readings on its lifetime cost (recorded and alerted, never a stop for dollars). A monitor never stops
+    a detached job that is still running (lead decision, 2026-11-18): the cluster is stopped by id only once the job
+    has ended (a terminal state, or the job lost from its worker); an error, Ctrl-C or SIGTERM ends the wait and
+    leaves the cluster as it is, and the job's own end-of-run stop covers it."""
     rec = _job_record(dest)
     name, cid = rec.get("cluster") or a.name, rec.get("cluster_id")
     if cid is None:
         raise SystemExit(f"{a.job_id}: {dest}/job.json records no cluster id (only `run` records one); "
                          "`wait --cap-usd` meters and stops a cluster by its id only")
-    a.name, why, st, stop, accepted = name, "interrupted", None, True, []
-    try:
-        meter = _wait_gate(a, name, cid, dest, accepted)
-        if meter is None:
-            stop = False
-            return None
-        cl = ws.attach_existing(name, rc.WORKSPACE, cid)     # refuses any cluster but `cid`
-        print(f"{a.job_id}: metering cluster {name} ({cid}) to ${a.cap_usd:.2f}", flush=True)
-        st = _poll(a, dest, gone_ok=True, cluster=cl, cid=cid, meter=meter)
-        why = f"{a.job_id}: " + ((st or {}).get("state", {}).get("state") or "cluster gone")
-    except _CapRefused as e:
-        stop = bool(accepted)             # a refusal after the cap was accepted never leaves the cluster unmetered
-        why = f"{a.job_id}: {e.code}"
-        raise
-    except BaseException as e:  # noqa: BLE001 -- recorded, then re-raised after the stop
-        why = f"{a.job_id}: {type(e).__name__}: {e}"
-        raise
-    finally:
-        if stop:
-            _stop_by_id(name, cid, why[:200])
+    a.name, accepted = name, []
+    meter = _wait_gate(a, name, cid, dest, accepted)
+    if meter is None:
+        return None
+    cl = ws.attach_existing(name, rc.WORKSPACE, cid)     # refuses any cluster but `cid`
+    print(f"{a.job_id}: metering cluster {name} ({cid}) to ${a.cap_usd:.2f}", flush=True)
+    st = _poll(a, dest, gone_ok=True, cluster=cl, cid=cid, meter=meter)
+    if st is not None and st.get("state", {}).get("state") in DONE + ("missing", "lost"):
+        _stop_by_id(name, cid, f"{a.job_id}: {st['state']['state']}"[:200])
     return st
 
 
@@ -1553,7 +1542,7 @@ def _self_test_run(ok, real_gate=None) -> None:
                     W["polled"].append(workers[0])
                     if workers[0] != W["job_worker"]:     # another VM's disk has no record of this job
                         return {workers[0]: {"state": {"state": "missing"}, "files": {}, "log_tail": ""}}
-                    if W["polls"] == interrupt_at:
+                    if W["polls"] in (interrupt_at if isinstance(interrupt_at, tuple) else (interrupt_at,)):
                         raise KeyboardInterrupt
                     if W["polls"] == term_at:
                         import signal as _sig
@@ -2220,7 +2209,7 @@ def _self_test_run(ok, real_gate=None) -> None:
                 # cap. `wait --cap-usd` re-attaches it: the recorded id, metered as `run` does, stopped by id.
                 import budget
 
-                def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True, meter_fails=False):
+                def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True, meter_fails=False, interrupt=1):
                     jid, seen, lbo_calls, built = f"r32{label}", [], [], []
 
                     def meter(cid):
@@ -2250,7 +2239,8 @@ def _self_test_run(ok, real_gate=None) -> None:
                             mock.patch.object(budget, "reattach_budget_ok", reattach, create=True), \
                             mock.patch.object(budget, "job_meter", lambda s_: (_ for _ in ()).throw(AssertionError)), \
                             mock.patch.object(budget, "launch_budget_ok", lambda *x, **k: (False, "not this check")):
-                        W, msg, out, exc = world(d, jid, interrupt_at=1, extra=("--keep-on-failure",), then=[wait])
+                        W, msg, out, exc = world(d, jid, interrupt_at=interrupt, extra=("--keep-on-failure",),
+                                                 then=[wait])
                     ev = W["events"]
                     return W, ev, W["then"][0], seen, lbo_calls, isinstance(exc, KeyboardInterrupt)
 
@@ -2293,6 +2283,11 @@ def _self_test_run(ok, real_gate=None) -> None:
                        and (label == "g" or "cost_unreadable" in [x["kind"] for x in ALERTS]),
                        f"RN32{label} a cost or meter that cannot be read is alerted, never a stop; the cluster is "
                        f"stopped by id when the job ends: {res!r} {ALERTS} {ev[-4:]}")
+                W, ev, res, seen, lbo_calls, killed = rewait("k", [1.0], interrupt=(1, 2))
+                ok(killed and isinstance(res, KeyboardInterrupt) and ("attach_id", 100) in ev and W["stops"] == 0
+                   and W["clusters"][100] == "running",
+                   f"RN32k a `wait --cap-usd` monitor that is interrupted while the job runs leaves the cluster "
+                   f"running (it never stops a detached job): {res!r} stops={W['stops']}")
                 W, ev, res, seen, lbo_calls, killed = rewait("i", [2.0, 8.0, 8.0], meter_fails=1)
                 ok(res is None and ("delete", 100) in ev and W["stops"] == 1 and lbo_calls == [("f6", 5.0, 100,
                    "reattach_clusters.json", True)],
