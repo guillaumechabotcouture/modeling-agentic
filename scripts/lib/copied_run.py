@@ -50,11 +50,13 @@ def _sha(path: str) -> str | None:
 
 
 def run_root(path: str) -> str | None:
-    """The run dir `path` lies in: its outermost ancestor (or itself) holding a run's own file, so a run_state.json or
-    metadata.json written below the run root changes nothing; None outside a run."""
+    """The copied run dir `path` lies in: its outermost ancestor (or itself) that holds both a run's own file and a
+    marker, so a run file or marker written below it changes nothing, and a collection dir above it with a run file
+    of its own but no marker does not hide it; None when no such ancestor exists."""
     d, found = os.path.abspath(path), None
     while True:
-        if any(os.path.isfile(os.path.join(d, m)) and not os.path.islink(os.path.join(d, m)) for m in RUN_ROOT_MARKERS):
+        if any(os.path.isfile(os.path.join(d, m)) and not os.path.islink(os.path.join(d, m)) for m in RUN_ROOT_MARKERS) \
+                and os.path.isfile(os.path.join(d, MARKER)) and not os.path.islink(os.path.join(d, MARKER)):
             found = d
         nd = os.path.dirname(d)
         if nd == d:
@@ -101,8 +103,9 @@ def mark(run_dir: str, source: str, captured_at: str | None = None, hashes: dict
             h = _sha(os.path.join(run_dir, rel))
             if h:
                 files[rel] = h
-    else:
-        files = {str(r).replace(os.sep, "/"): h for r, h in hashes.items() if in_flight_name(r) and h}
+    else:       # added to the earlier entries (a poller's first digest cache may not hold what it marked before)
+        files = dict(_load(run_dir).get("files") or {})
+        files.update({str(r).replace(os.sep, "/"): h for r, h in hashes.items() if in_flight_name(r) and h})
     if not files:
         return None
     doc = {"copied_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "captured_at": captured_at,
@@ -206,8 +209,8 @@ def _self_test() -> int:
         open(os.path.join(r, "b", "y.jsonl.job.json"), "w").write("{}")
         mark(r, "poll 2", hashes={"b/y.jsonl.job.json": _sha(os.path.join(r, "b", "y.jsonl.job.json"))})
         ok(set(prev) <= set(_load(r)["files"]), "CR12 a poll's hashes add to the marker; earlier entries are kept")
-        ok(run_root(j) == os.path.abspath(d) and run_root(os.path.join(os.sep, "nonexistent", "x")) is None,
-           "CR9 the run root is the nearest ancestor holding run_state.json or metadata.json")
+        ok(run_root(jr) == os.path.abspath(r) and run_root(os.path.join(os.sep, "nonexistent", "x")) is None,
+           "CR9 the run root is the outermost ancestor holding a run file and a marker")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
