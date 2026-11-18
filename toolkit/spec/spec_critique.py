@@ -501,6 +501,29 @@ def _self_test() -> int:
     t = [f["text"] for f in findings(r, today=T) if f["check"] == "headline_comparator"][0]
     ok("which" in t and "alt" in t and "funded" in t, f"SC36 (P3) the fixed plans are named; the owner says which is "
                                                      f"funded: {t}")
+    # follow-up window (owner direction 2026-11-18): a flag, never a refusal
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "ev.yaml"), "w").write(
+            "inputs:\n"
+            "  'parameter:e1': {observations: [{source: Trial A, follow_up_years: 2}, {source: Trial B,"
+            " follow_up_years: 5}], chosen: {range: [0, 1]}}\n"
+            "  'parameter:e2': {observations: [{source: Trial C, follow_up_years: 6}], chosen: {range: [0, 1]}}\n"
+            "  'parameter:e3': {observations: [{source: Survey D}], chosen: {range: [0, 1]}}\n"
+            "  'parameter:e4': {observations: [{source: Trial E, follow_up_years: two}], chosen: {range: [0, 1]}}\n")
+        r = spec(evidence={"dossier": "ev.yaml"}, objective={"horizon": [2027.0, 2032.0]})
+        fu = [f for f in findings(r, run_dir=d, today=T) if f["check"] == "follow_up_window"]
+        txt = " ".join(f["text"] for f in fu)
+        ok(len(fu) == 1 and fu[0]["severity"] == "MEDIUM" and "parameter:e1" in txt and "Trial A" in txt
+           and "2" in txt and "5" in txt and "e2" not in txt and "e3" not in txt,
+           f"SC37 an effect input whose evidence followed up for less than the 5-year window is flagged: {fu}")
+        ok(any("e4" in f["text"] and "not a number" in f["text"] for f in fu) is False
+           and not any(f["check"] == "follow_up_window" and f["severity"] == "HIGH" for f in findings(r, d, T)),
+           "SC38 an unreadable follow-up is not compared (the dossier precondition owns its shape); never HIGH")
+        ok(not [f for f in findings(spec(evidence={"dossier": "ev.yaml"}, objective={"horizon": [2027.0, 2028.0]}),
+                                    d, T) if f["check"] == "follow_up_window"],
+           "SC39 no flag when every declared follow-up covers the window")
+        md = "\n".join(sheet_lines(r, d, T))
+        ok("| MEDIUM | 3 | follow_up_window |" in md, "SC40 the flag is on the sheet")
     print(f"{'FAIL' if fails else 'OK'}: " + (f"{len(fails)} case(s) failed" if fails else
                                                "all self-test cases passed."))
     return 1 if fails else 0
