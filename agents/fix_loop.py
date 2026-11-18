@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
@@ -33,6 +34,25 @@ import findings_ledger as FL  # noqa: E402
 IMPACT = "impact_ledger.jsonl"
 ACTIONS = ("fix", "rethink", "decision_test")
 RETHINK_STATES = ("SPEC", "ENGINE_CHOICE")
+# F6 run 3: a write-up finding (report or manuscript text) is the WRITE stage's. A FIX_LOOP task may edit only
+# analysis_settings.yaml and models/ext/, so a task for one can never pass its check; the writer gets it instead.
+WRITE_STATES = ("WRITE", "PRESENTATION")
+# F6 run 3: a finding whose required remedy is an owner amendment of the signed spec is the owner's, not a SPEC
+# rethink's. The critics are told to write "owner amendment" in fix_requires when the fix needs the signed spec changed
+# (agents/v2_sdk_tasks.py, critique prompt).
+_OWNER_AMENDMENT = re.compile(r"\bowner(?:'s)?\b[^.;\n]{0,80}\bamend|\bamend\w*\b[^.;\n]{0,80}\bowner\b", re.I)
+
+
+def is_write_up(f) -> bool:
+    """A finding (ledger Finding or packet row) only the writer can fix."""
+    st = f.get("owner_state") if isinstance(f, dict) else getattr(f, "owner_state", None)
+    return st in WRITE_STATES
+
+
+def needs_owner_amendment(f) -> bool:
+    """A finding whose required remedy is an owner amendment and which the owner has not answered yet."""
+    g = f.get if isinstance(f, dict) else (lambda k, _f=f: getattr(_f, k, None))
+    return g("resolution_type") != "owner_decision" and bool(_OWNER_AMENDMENT.search(str(g("fix_requires") or "")))
 # Files the harness writes; never counted as an agent's change.
 _HARNESS_OWNED = ("findings.jsonl", IMPACT, "run_state.json", "trace.jsonl", "validator_history.jsonl",
                   "done_when_registry.json", "open_problems.md", "open_problems.json", "final_gate.json",
@@ -48,6 +68,9 @@ to fix next and how. You receive one JSON packet:
   findings                 the open findings: id, kind, severity, blocking, owner_state (the stage
                            that can change it), resolution_type (fix | decision_test | owner_decision),
                            scope_declarable, claim, done_when, first_seen_round, attempts so far
+  write_up                 findings in the report or manuscript text: the WRITE stage fixes them; never plan them
+  owner_amendments         findings whose remedy is an owner amendment of the signed spec: the owner decides
+                           them; never plan them, and never rethink SPEC for them
   impact_history           one row per earlier fix task: findings, files changed, headline before and
                            after, whether its check passed, findings it opened
   budget                   spent, cap and what is left in USD
@@ -106,15 +129,24 @@ def impact_rows(run_dir: str) -> list[dict]:
 def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate: dict | None,
                  budget: dict | None, history_rows: int = 30) -> dict:
     att = attempts(run_dir)
-    fs = []
+    fs, write_up, owner = [], [], []
     for f in FL.open_findings(ledger):
-        fs.append({"id": f.id, "kind": f.kind, "severity": f.severity, "blocking": f.blocking,
-                   "owner_state": f.owner_state, "resolution_type": f.resolution_type,
-                   "scope_declarable": f.scope_declarable, "label": FL.short_label(f.claim), "claim": f.claim,
-                   "fix_requires": f.fix_requires, "done_when": f.done_when,
-                   "first_seen_round": f.first_seen_round, "attempts": att.get(f.id, 0)})
+        row = {"id": f.id, "kind": f.kind, "severity": f.severity, "blocking": f.blocking,
+               "owner_state": f.owner_state, "resolution_type": f.resolution_type,
+               "scope_declarable": f.scope_declarable, "label": FL.short_label(f.claim), "claim": f.claim,
+               "fix_requires": f.fix_requires, "done_when": f.done_when,
+               "first_seen_round": f.first_seen_round, "attempts": att.get(f.id, 0)}
+        if is_write_up(f):
+            write_up.append(row)
+        elif needs_owner_amendment(f):
+            owner.append(row)
+        else:
+            fs.append(row)
     g = gate or {}
+    by_id = lambda rows: sorted(rows, key=lambda r: r["id"])   # noqa: E731
     return {"round": round_n, "max_rounds": max_rounds,
+            # not plannable here: the WRITE stage's findings, and those the owner must amend (OWNER_DECISION)
+            "write_up": by_id(write_up), "owner_amendments": by_id(owner),
             "gate": {"action": g.get("action"), "rule": g.get("rule_matched"), "rationale": g.get("rationale"),
                      "escalation_required": g.get("escalation_required"),
                      "stalled": g.get("stalled_findings") or []},
@@ -126,6 +158,10 @@ def validate_plan(plan, packet: dict) -> list[str]:
     if not isinstance(plan, dict) or not isinstance(plan.get("tasks"), list):
         return ["the plan must be a JSON object with a `tasks` list"]
     by_id = {f["id"]: f for f in packet["findings"]}
+    elsewhere = {f["id"]: "is a write-up finding: the WRITE stage takes it, not a FIX_LOOP task"
+                 for f in packet.get("write_up") or []}
+    elsewhere.update({f["id"]: "needs an owner amendment of the signed spec: the owner decides it (OWNER_DECISION), "
+                               "not a task or a rethink" for f in packet.get("owner_amendments") or []})
     errs, used, tids = [], set(), set()
     for t in plan["tasks"]:
         if not isinstance(t, dict):
@@ -142,7 +178,9 @@ def validate_plan(plan, packet: dict) -> list[str]:
         if t.get("action") not in ACTIONS:
             errs.append(f"{tid}: action {t.get('action')!r} not in {ACTIONS}")
         for fid in fids:
-            if fid not in by_id:
+            if fid in elsewhere:
+                errs.append(f"{tid}: {fid} {elsewhere[fid]}")
+            elif fid not in by_id:
                 errs.append(f"{tid}: unknown finding {fid}")
             elif fid in used:
                 errs.append(f"{tid}: finding {fid} is in two tasks")
@@ -159,7 +197,7 @@ def validate_plan(plan, packet: dict) -> list[str]:
             errs.append(f"{tid}: empty brief")
     deferred = {d.get("finding") for d in plan.get("deferred") or [] if isinstance(d, dict) and str(d.get("reason") or "").strip()}
     for f in packet["findings"]:
-        if f["blocking"] and f["resolution_type"] != "owner_decision" and f["id"] not in used:
+        if f["blocking"] and f["resolution_type"] != "owner_decision" and f["id"] not in used and not is_write_up(f):
             errs.append(f"blocking finding {f['id']} is in no task" + (" (blocking findings cannot be deferred)"
                                                                       if f["id"] in deferred else ""))
     return errs
@@ -170,7 +208,7 @@ def default_plan(packet: dict) -> dict:
     the packet's order (blocking first, then severity), each a fix by its owner state."""
     tasks = []
     for f in packet["findings"]:
-        if f["blocking"] and f["resolution_type"] != "owner_decision":
+        if f["blocking"] and f["resolution_type"] != "owner_decision" and not is_write_up(f):
             tasks.append({"id": f"T{len(tasks) + 1}", "findings": [f["id"]], "action": "fix",
                           "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f.get('label') or FL.short_label(f['claim'])}", "files": []})
     return {"tasks": tasks, "deferred": [], "by": "harness default"}
@@ -281,8 +319,11 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
     if errs:
         log(f"[fix loop] planner output rejected twice ({'; '.join(errs)[:300]}); harness default plan")
         plan = default_plan(packet)
+    write_up = [f["id"] for f in packet["write_up"]]
+    owner = [f["id"] for f in packet["owner_amendments"]]
     _sio().write_nofollow(run_dir, f"fix_plan_r{round_n}.json",
-                          json.dumps({"round": round_n, "plan": plan, "rejected": errs}, indent=1).encode(), atomic=True)
+                          json.dumps({"round": round_n, "plan": plan, "rejected": errs, "write_up": write_up,
+                                      "owner_amendments": owner}, indent=1).encode(), atomic=True)
     done = {r.get("task") for r in impact_rows(run_dir) if r.get("round") == round_n}
     prog_p = os.path.join(run_dir, f"fix_progress_r{round_n}.json")
     try:
@@ -290,7 +331,8 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
     except (OSError, ValueError):
         progress = {}
     summary = {"round": round_n, "tasks": len(plan["tasks"]), "rows": 0, "passed": 0, "rethink": None,
-               "skipped_budget": 0, "rejected": 0, "resumed_done": 0, "plan_by": plan.get("by", "planner")}
+               "skipped_budget": 0, "rejected": 0, "resumed_done": 0, "plan_by": plan.get("by", "planner"),
+               "write_up": write_up, "owner_amendments": owner}
 
     def out_of_budget():
         b = budget() if budget else None

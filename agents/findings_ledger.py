@@ -308,7 +308,9 @@ def owner_answers(run_dir: str) -> dict[str, str]:
     except (OSError, ValueError):
         return {}
     out = {}
-    for a in doc.get("answers") or []:
+    ans = doc.get("answers") if isinstance(doc, dict) else None
+    # scripts/scope_signoff.py sign writes a mapping fingerprint -> answer; older records hold a list
+    for a in (ans.values() if isinstance(ans, dict) else ans or []):
         if isinstance(a, dict) and a.get("finding") and a.get("decision") in ("accept", "decline"):
             out[str(a["finding"])] = a["decision"]
     return out

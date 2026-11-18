@@ -53,7 +53,7 @@ STATES = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE
 # (raised, never taken).
 EDGES = {
     "SPEC": {"SIGN", "SPEC", "FINAL"},
-    "SIGN": {"EVIDENCE", "SIGN"},
+    "SIGN": {"EVIDENCE", "SIGN", "SPEC"},
     "EVIDENCE": {"ENGINE_CHOICE"},
     "ENGINE_CHOICE": {"PREREGISTER", "CONFIGURE", "FINAL"},
     # The world model (docs/design/v2c-orchestration.md §14): beliefs anchored before the engine batch, scored after
@@ -64,7 +64,7 @@ EDGES = {
     "SCORE": {"CRITIQUE", "FINAL"},
     "CRITIQUE": {"GATE", "WRITE", "FINAL"},
     "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "FINAL"},
-    "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "WRITE", "FINAL"},
+    "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "WRITE", "OWNER_DECISION", "FINAL"},
     "OWNER_DECISION": {"GATE", "OWNER_DECISION"},
     "WRITE": {"PRESENTATION", "GATE", "FINAL"},
     "PRESENTATION": {"GATE", "FINAL"},
@@ -78,6 +78,15 @@ CRITICS = ("critique-domain", "critique-redteam")
 PROTECTED_BY_FIX = (AB.SPEC_FILE, AB.SETTINGS_FILE)
 TASK_CAP_USD = 3.0            # one bounded task's allowance, at most what the run has left
 READBACK_CAP_USD = 0.25       # one crash read-back (resume for one tool-less turn), at most what is left
+# F6 run 3: a draft_spec started with a $0.13 allowance failed at once. A paid task is not started below this
+# allowance: the run pauses for the owner (paused:awaiting_budget, resumable with a higher --max-budget-usd).
+MIN_TASK_ALLOWANCE_USD = 0.50
+AWAITING_BUDGET = "awaiting_budget"
+OWNER_REQUEST = "scope_signoff_request.json"   # scripts/scope_signoff.py REQUEST: `show` / `sign` read it
+
+
+class AwaitingBudget(Exception):
+    """Raised by Machine._task when the next paid task's allowance is below MIN_TASK_ALLOWANCE_USD; step() pauses."""
 # Findings whose resolution bears on the primary decision: Phase 49 β's owner rule decides
 # whether they may be declared. Without that rule they are not declarable (fail closed).
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
@@ -886,6 +895,148 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
         return [f"the preconditions could not be checked: {type(e).__name__}: {e}"]
 
 
+OWNER_REQUEST_PRODUCER = "agents/stage_machine.py FIX_LOOP (owner amendments)"
+
+# F6 run 3: a SPEC rethink overwrote the owner-signed decision_spec.yaml in place. A rethink of a signed spec drafts
+# its proposal in proposal_dir(run_dir), <run_dir>.spec_proposal beside the run dir (lib.safe_io refuses a write root
+# inside a run dir), a copy of the spec's inputs laid out as a run dir, so every pre-sign check runs on it unchanged;
+# the signed files are never written. The owner signs the proposal there (`sign <run_dir>.spec_proposal`); SIGN then
+# moves the signed files aside to spec_history/<k>/, puts the proposal's in their place and keeps the proposal
+# directory in spec_history/<k>/proposal/.
+PROPOSAL_SUFFIX = ".spec_proposal"
+PROPOSAL_RECORD = "proposal.json"
+SPEC_HISTORY = "spec_history"
+SIGNOFF_SHEET = "decision_spec.signoff_sheet.md"
+# what a sign-off writes beside the spec (toolkit/spec/signoff.py, scripts/decision_brief.py, toolkit/spec/geometry.py)
+SIGN_ARTIFACTS = (SIGNOFF_FILE, "decision_brief.signoff.json", "decision_brief.signed", "data/geometry_signoff.json",
+                  "acceptance_lock.json", SIGNOFF_SHEET)
+# what the proposal starts from: the spec's own inputs (never the analysis, the critiques or a sign-off record)
+_PROPOSAL_SEED = (AB.SPEC_FILE, AB.SETTINGS_FILE, "decision_brief.yaml", "success_criteria.yaml", "data", "evidence")
+_PROPOSAL_SKIP = ("data/derived/", "data/geometry_signoff.json", "data/input_checks.json")
+
+
+def proposal_dir(run_dir: str) -> str:
+    return os.path.abspath(run_dir).rstrip(os.sep) + PROPOSAL_SUFFIX
+
+
+def spec_signed_once(run_dir: str) -> bool:
+    """A sign-off record exists for the run's spec (it was signed at least once)."""
+    return any(os.path.lexists(os.path.join(run_dir, f)) for f in (SIGNOFF_FILE, "decision_brief.signoff.json"))
+
+
+def proposal_pending(run_dir: str) -> bool:
+    try:
+        return bool(json.load(open(os.path.join(proposal_dir(run_dir), PROPOSAL_RECORD))).get("pending"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _plain_files(root: str, rel: str) -> list[str]:
+    """Regular files at `rel` under `root` (a file, or a directory walked), relative to `root`; links are skipped."""
+    p = os.path.join(root, rel)
+    if os.path.islink(p):
+        return []
+    if os.path.isfile(p):
+        return [rel]
+    out = []
+    for r, dirs, files in os.walk(p):
+        dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(r, x))]
+        out += [os.path.relpath(os.path.join(r, n), root).replace(os.sep, "/") for n in files
+                if not os.path.islink(os.path.join(r, n))]
+    return sorted(out)
+
+
+def _copy_into(src_root: str, dst_root: str, rel: str, dst_rel: str | None = None) -> None:
+    """src_root/rel -> dst_root/(dst_rel or rel), written with no link followed (dst_root is the safe_io root)."""
+    from lib.safe_io import write_nofollow
+    with open(os.path.join(src_root, rel), "rb") as f:
+        data = f.read()
+    dst_rel = dst_rel or rel
+    os.makedirs(os.path.dirname(os.path.join(dst_root, dst_rel)) or dst_root, exist_ok=True)
+    write_nofollow(dst_root, dst_rel, data, atomic=True)
+
+
+def _cited(root: str) -> list[str]:
+    """The files the spec at `root` cites, relative to it (scripts/pipeline.py cited_paths); [] when it is unreadable."""
+    import yaml
+    import pipeline as P
+    try:
+        spec = yaml.safe_load(open(os.path.join(root, AB.SPEC_FILE))) or {}
+        return sorted({str(r) for r in P.cited_paths(spec, root)})
+    except Exception:  # noqa: BLE001 -- the pre-sign checks report an unreadable spec
+        return []
+
+
+def seed_proposal(run_dir: str) -> str:
+    """The proposal directory, seeded once (from the signed spec's inputs) for a rethink; returns its path."""
+    pdir = proposal_dir(run_dir)
+    if os.path.isdir(pdir) and not os.path.islink(pdir):
+        return pdir
+    if os.path.lexists(pdir):
+        raise ValueError(f"{pdir} is not a plain directory")
+    tmp = pdir + ".tmp"
+    if os.path.isdir(tmp) and not os.path.islink(tmp):
+        import shutil
+        shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    for top in tuple(_PROPOSAL_SEED) + tuple(_cited(run_dir)):
+        for rel in _plain_files(run_dir, top):
+            if not any(rel == s_.rstrip("/") or rel.startswith(s_) for s_ in _PROPOSAL_SKIP):
+                _copy_into(run_dir, tmp, rel)
+    os.replace(tmp, pdir)
+    return pdir
+
+
+def promote_proposal(run_dir: str) -> str:
+    """The owner signed the proposal: every file the proposal holds, and every sign-off record of the earlier spec, is
+    moved to spec_history/<k>/; the proposal's files take their place; the proposal directory goes to
+    spec_history/<k>/proposal/. Returns spec_history/<k>."""
+    import shutil
+    pdir = proposal_dir(run_dir)
+    k = 1
+    while os.path.lexists(os.path.join(run_dir, SPEC_HISTORY, str(k))):
+        k += 1
+    hist_rel = f"{SPEC_HISTORY}/{k}"
+    hist = os.path.join(run_dir, hist_rel)
+    # only the spec, its inputs and its sign-off records: never the session's own files (budget ledger, task I/O)
+    keep = tuple(_PROPOSAL_SEED) + tuple(SIGN_ARTIFACTS) + tuple(_cited(pdir))
+    new = [r[2:] if r.startswith("./") else r for r in _plain_files(pdir, ".")]
+    new = [r for r in new if any(r == k_ or r.startswith(k_ + "/") for k_ in keep)]
+    old = set()
+    for rel in set(new) | set(SIGN_ARTIFACTS):
+        old |= set(_plain_files(run_dir, rel))
+    for rel in sorted(old):
+        _copy_into(run_dir, run_dir, rel, f"{hist_rel}/{rel}")
+    for rel in sorted(old - set(new)):
+        os.remove(os.path.join(run_dir, rel))
+    for rel in new:
+        _copy_into(pdir, run_dir, rel)
+    shutil.move(pdir, os.path.join(hist, "proposal"))
+    return hist_rel
+
+
+def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list[str]) -> dict:
+    """F6 run 3: the findings whose remedy is an owner amendment of the signed spec, written as a request in
+    scripts/scope_signoff.py's format, so the owner reads it with `scope_signoff.py show` and answers with `sign`
+    (accept: the run goes on without the amendment, declared; decline: the finding stays open, the owner's). Each item's
+    fingerprint binds its claim and remedy."""
+    items = []
+    for fid in ids:
+        f = ledger.get(fid)
+        claim, fix = (f.claim, f.fix_requires) if f is not None else ("", None)
+        fp = hashlib.sha256(json.dumps({"finding": fid, "claim": claim, "fix_requires": fix},
+                                       sort_keys=True).encode()).hexdigest()[:16]
+        items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix,
+                      "reason": "its required remedy is an owner amendment of the signed decision spec",
+                      "declarations": [], "declared": False, "fingerprint": fp})
+    doc = {"pending": True, "round": round_n, "requested_at": _now(), "items": items, "producer": OWNER_REQUEST_PRODUCER,
+           "decision_rationale": "the fix loop does not change the owner-signed spec: amend and re-sign it, or answer "
+                                 "accept (the run continues without the amendment) or decline"}
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, OWNER_REQUEST, json.dumps(doc, indent=1).encode(), atomic=True)
+    return doc
+
+
 # ------------------------------------------------------------------ the machine
 class Machine:
     def __init__(self, run_dir: str, tasks, state: RunState | None = None, backend=None, log=print,
@@ -953,7 +1104,7 @@ class Machine:
     def _visit(self) -> int:
         return sum(1 for h in self.st.history if h.get("to") == self.st.state)
 
-    def _task(self, key: str, name: str, *args, writeup: bool = False):
+    def _task(self, key: str, name: str, *args, writeup: bool = False, **kwargs):
         """One paid task through the journal. Returns its TaskResult, or None when the run has no
         allowance left for it (the caller takes the budget path). A completed task is not run
         again (its result is replayed, already charged); a task found started but not completed
@@ -971,6 +1122,16 @@ class Machine:
         allowance = self._allowance(writeup)
         if allowance is not None and allowance <= 0:
             return None
+        if allowance is not None and allowance < MIN_TASK_ALLOWANCE_USD:
+            self.st.paused, self.st.status = AWAITING_BUDGET, None
+            self.st.history.append({"at": _now(), "paused": AWAITING_BUDGET, "state": self.st.state, "task": name,
+                                    "key": key, "allowance_usd": allowance, "floor_usd": MIN_TASK_ALLOWANCE_USD,
+                                    "spent_usd": round(self.st.spent_usd, 4), "cap_usd": self.st.budget_usd})
+            save_state(self.run_dir, self.st)
+            self.log(f"[machine] {name} not started: its allowance ${allowance:.2f} is below the ${MIN_TASK_ALLOWANCE_USD:.2f} "
+                     f"floor (spent ${self.st.spent_usd:.2f} of ${self.st.budget_usd}). Paused for the owner; resume with "
+                     f"python3 main.py --v2 --resume {self.run_dir} --max-budget-usd <higher cap>")
+            raise AwaitingBudget(name)
         j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance)
         self.st.journal[key] = j
         save_state(self.run_dir, self.st)
@@ -981,7 +1142,7 @@ class Machine:
             # A crash read-back is a paid call too: a small cap, from what is left after this allowance.
             rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
             setter(a, readback_usd=rb)
-        res = getattr(self.tasks, name)(*args)
+        res = getattr(self.tasks, name)(*args, **kwargs)
         self._charge(res)
         out = res.output
         try:
@@ -1018,9 +1179,9 @@ class Machine:
     def _has_draft(self) -> bool:
         return os.path.exists(os.path.join(self.run_dir, "manuscript.md"))
 
-    def _spec(self) -> dict:
+    def _spec(self, rd: str | None = None) -> dict:
         import yaml
-        return yaml.safe_load(open(os.path.join(self.run_dir, AB.SPEC_FILE))) or {}
+        return yaml.safe_load(open(os.path.join(rd or self.run_dir, AB.SPEC_FILE))) or {}
 
     def harness_findings(self) -> list[dict]:
         out = self.backend.gate_findings(self.run_dir) + spec_signoff_findings(self.run_dir, self.st.signoff, self.backend)
@@ -1046,11 +1207,11 @@ class Machine:
         from toolkit.spec import geometry as GEO
         return GEO.findings(GEO.run(self.run_dir))
 
-    def _geometry_problems(self) -> list[str]:
+    def _geometry_problems(self, rd: str | None = None) -> list[str]:
         """Before SIGN: a HIGH geometry finding not accepted by name in the spec, or a check that failed on its
         declared inputs. Writes data/input_checks.json, which the sign-off sheet reads."""
         from toolkit.spec import geometry as GEO
-        return [f"{p['code']}: {p['claim']}" for p in GEO.problems(GEO.run(self.run_dir))]
+        return [f"{p['code']}: {p['claim']}" for p in GEO.problems(GEO.run(rd or self.run_dir))]
 
     def _geometry_owner_pending(self) -> list[str]:
         """HIGH geometry findings the spec proposes as exceptions and the owner has not approved."""
@@ -1071,19 +1232,20 @@ class Machine:
         else:
             sign(self.run_dir, by, note)
 
-    def _signed_by(self):
-        """Who signed the current spec, or None when it is unsigned or changed since."""
+    def _signed_by(self, rd: str | None = None):
+        """Who signed the current spec (of `rd`, the run dir by default), or None when it is unsigned or changed since."""
+        rd = rd or self.run_dir
         if getattr(self.backend, "sign", None):
-            if self.backend.signoff_status(self.run_dir) != "signed":
+            if self.backend.signoff_status(rd) != "signed":
                 return None
             try:
                 from toolkit.spec import signoff
-                rec = signoff._spec_record(self.run_dir) or {}
+                rec = signoff._spec_record(rd) or {}
             except Exception:  # noqa: BLE001
                 rec = {}
             return rec.get("signed_by") or rec.get("by") or "owner"
-        rec = _signoff(self.run_dir)
-        return rec.get("by") if rec and rec.get("spec_sha256") == signed_hash(self.run_dir) else None
+        rec = _signoff(rd)
+        return rec.get("by") if rec and rec.get("spec_sha256") == signed_hash(rd) else None
 
     def fix_guard(self, run_dir: str) -> list[str]:
         """What a fix task may not do: change decision_spec.yaml (compared with its sign-off, or with
@@ -1116,7 +1278,10 @@ class Machine:
         self.st.paused = None
         if s in LLM_STATES and self._out_of_budget():
             return self._budget_out(s)
-        return getattr(self, "h_" + s)()
+        try:
+            return getattr(self, "h_" + s)()
+        except AwaitingBudget:            # _task recorded the pause; the journal makes the handler safe to re-run
+            return s
 
     def run(self, max_steps: int = 200) -> str:
         if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
@@ -1140,59 +1305,85 @@ class Machine:
         n = self.st.tries.get("spec", 0)
         if n >= MAX_SPEC_TRIES:
             return self._go("FINAL", "the spec did not validate", "run_failed")
-        stage_inputs(self.run_dir, self.st.question)
+        # F6 run 3: a rethink of a signed spec drafts a proposal beside it (proposal_dir); the signed files stay as signed
+        rd = seed_proposal(self.run_dir) if spec_signed_once(self.run_dir) else self.run_dir
+        stage_inputs(rd, self.st.question)
         fb = self.st.tries.get("spec_feedback")
         # The key is fixed before the call and the try is counted only once the call returns, so an
         # interrupted draft resumes under the same key (charged once by _settle_interrupted).
-        res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, self.run_dir, fb)
+        res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, rd, fb)
         self.st.tries["spec"] = n + 1
         if res is None:
             return self._budget_out("SPEC")
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         if res.ok:
             try:
-                errs = self._derive() if self.st.derived_inputs else []
-                errs = errs or record_cited_inputs(self.run_dir)       # before anything reads a cited file
+                errs = self._derive(rd) if self.st.derived_inputs else []
+                errs = errs or record_cited_inputs(rd)       # before anything reads a cited file
                 if self.st.derived_inputs:
                     # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the
                     # spike adapter does not know them, so the harness runs them for it.
                     if not errs and not hasattr(self.backend, "candidate_rows"):
                         import pipeline as P
                         errs = [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
-                            self.run_dir, self._spec(), required=True)]
-                    errs = errs or self.backend.pre_sign_problems(self.run_dir, derived=True)
-                    errs = errs or self._geometry_problems()
+                            rd, self._spec(rd), required=True)]
+                    errs = errs or self.backend.pre_sign_problems(rd, derived=True)
+                    errs = errs or self._geometry_problems(rd)
                     if not errs:
-                        self._write_sheet()
+                        self._write_sheet(rd)
                 else:
-                    errs = errs or self.backend.pre_sign_problems(self.run_dir)
-                    errs = errs or self._geometry_problems()
+                    errs = errs or self.backend.pre_sign_problems(rd)
+                    errs = errs or self._geometry_problems(rd)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
         if errs:
             self.st.tries["spec_feedback"] = errs
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
+        if rd != self.run_dir:
+            _write_json(rd, PROPOSAL_RECORD, {"pending": True, "round": self.st.round, "drafted": _now(),
+                                              "signed_spec_sha256": signed_hash(self.run_dir)})
+            self.st.tries["spec_proposal"] = rd
+            return self._go("SIGN", f"spec proposal drafted beside the signed spec ({rd})")
         return self._go("SIGN", "spec drafted and valid")
 
-    def _derive(self) -> list[str]:
+    def _derive(self, rd: str | None = None) -> list[str]:
         """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
         to the planner with the script's stderr tail: the planner never needs a shell to learn whether its code
         works."""
         import pipeline as P
-        rep = P.derive(self.run_dir, unsandboxed_ok=self.st.derive_unsandboxed)
+        rep = P.derive(rd or self.run_dir, unsandboxed_ok=self.st.derive_unsandboxed)
         return [f"{p['code']}: {p['claim']}" for p in rep["problems"]]
 
-    def _write_sheet(self) -> None:
+    def _write_sheet(self, rd: str | None = None) -> None:
         """The sign-off sheet, with the source hashes it was made from, published with no link followed (review
         round 3: signoff.write_sheet)."""
         from toolkit.spec import signoff
-        signoff.write_sheet(self.run_dir, getattr(self.backend, "candidates", None))
+        signoff.write_sheet(rd or self.run_dir, getattr(self.backend, "candidates", None))
 
     def h_SIGN(self):
         mode = self.st.signoff
         if mode == "none":
             return self._go("EVIDENCE", "sign-off not required (--signoff none)")
+        pdir = proposal_dir(self.run_dir)
+        if self.st.tries.get("spec_proposal") and not proposal_pending(self.run_dir):
+            # the drafted proposal is gone (a copied run dir does not carry it): never go on with the old spec
+            self.st.tries.pop("spec_proposal", None)
+            return self._go("SPEC", f"the spec proposal ({pdir}) is missing: the rethink drafts it again")
+        if proposal_pending(self.run_dir):
+            # F6 run 3: a rethink's proposal replaces the signed spec only once the owner signs it (never the lead)
+            if self._signed_by(pdir) == "owner":
+                hist = promote_proposal(self.run_dir)
+                self.st.tries.pop("spec_proposal", None)
+                if self._signed_by() == "owner":
+                    return self._go("EVIDENCE", f"the owner signed the spec proposal; the earlier spec is in {hist}")
+                self.log(f"[machine] the promoted proposal does not verify as signed; the earlier spec is in {hist}")
+            else:
+                self.st.paused, self.st.status = "awaiting_signoff", None
+                save_state(self.run_dir, self.st)
+                self.log(f"[machine] a spec proposal waits for the owner (the signed spec is unchanged): read "
+                         f"{pdir}/{SIGNOFF_SHEET}, then python3 agents/stage_machine.py sign {pdir} --by owner")
+                return "SIGN"
         by = self._signed_by()
         # A HIGH geometry finding the spec proposes as an exception is the owner's to approve (review of #131, P1):
         # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
@@ -1458,15 +1649,42 @@ class Machine:
                            rebuild=self.rebuild, harness_ids=self.harness_ids, headline=self.backend.headline,
                            budget=self._budget, log=self.log, guard=self.fix_guard, protect=PROTECTED_BY_FIX)
         self.st.history.append({"at": _now(), "fix_loop": summ})
+        if summ.get("owner_amendments"):
+            # F6 run 3: their remedy is an owner amendment of the signed spec; the owner answers, no redraft runs.
+            request_owner_amendments(self.run_dir, self.st.round, FL.load(self.run_dir), summ["owner_amendments"])
+            return self._go("OWNER_DECISION", f"{len(summ['owner_amendments'])} finding(s) need an owner amendment "
+                                              f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
             return self._go(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})")
+        if not summ["tasks"] and summ.get("write_up") and self._has_draft():
+            # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
+            if self.st.round_pending:
+                self.st.round += 1
+                self.st.round_pending = False
+            self.st.write_mode = self.st.write_mode or "not_accepted"
+            return self._go("WRITE", f"every open finding is the write-up's ({', '.join(summ['write_up'])[:120]})")
         return self._go("CRITIQUE", f"fix loop: {summ['rows']} task(s), {summ['passed']} passed their checks")
 
     def h_OWNER_DECISION(self):
         try:
-            answered = bool((json.load(open(os.path.join(self.run_dir, SCOPE_SIGNOFF))) or {}).get("answers"))
+            answers = (json.load(open(os.path.join(self.run_dir, SCOPE_SIGNOFF))) or {}).get("answers")
+        except (OSError, ValueError, AttributeError):
+            answers = None
+        try:
+            req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
         except (OSError, ValueError):
-            answered = False
+            req = None
+        if isinstance(req, dict) and req.get("pending") and req.get("producer") == OWNER_REQUEST_PRODUCER:
+            # an owner-amendment request (FIX_LOOP): answered when every item has an accept/decline answer
+            got = answers if isinstance(answers, dict) else {}
+            answered = all(isinstance(got.get(i.get("fingerprint")), dict)
+                           and got[i["fingerprint"]].get("decision") in ("accept", "decline") for i in req.get("items") or [])
+            if answered:
+                from lib.safe_io import write_nofollow
+                write_nofollow(self.run_dir, OWNER_REQUEST, json.dumps(dict(req, pending=False, answered_at=_now()),
+                                                                       indent=1).encode(), atomic=True)
+        else:
+            answered = bool(answers)
         if answered:
             return self._go("GATE", "the owner answered the scope declarations")
         self.st.paused = "awaiting_scope_signoff"
@@ -1476,9 +1694,13 @@ class Machine:
     def h_WRITE(self):
         mode = self.st.write_mode or "not_accepted"
         self._world_model("refresh")
-        fb = self.st.tries.pop("language_feedback", None)      # a language repair (F6 S1-7)
+        fb = self.st.tries.get("language_feedback")             # a language repair (F6 S1-7)
+        # F6 run 3: the write-up findings the fix loop left to this stage, with their remedies
+        wf = [{"id": f.id, "claim": f.claim, "fix_requires": f.fix_requires}
+              for f in FL.open_findings(FL.load(self.run_dir)) if FX.is_write_up(f)]
         res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, *([fb] if fb else []),
-                         writeup=True)
+                         writeup=True, **({"findings": wf} if wf else {}))
+        self.st.tries.pop("language_feedback", None)
         if res is None:
             return self._go("FINAL", "no budget left for the write-up", "completed_no_report")
         if not res.ok or not self._has_draft():
@@ -1814,6 +2036,12 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
     (Machine.reopen_interrupted_analysis)."""
     st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed)
+    if st.paused == AWAITING_BUDGET and budget_usd and budget_usd > (st.budget_usd or 0):
+        # the owner resumes a run paused below the allowance floor with a higher cap: recorded, never lowered
+        st.history.append({"at": _now(), "budget_raised": {"from": st.budget_usd, "to": budget_usd},
+                           "spent_usd": round(st.spent_usd, 4)})
+        st.budget_usd = budget_usd
+        save_state(run_dir, st)
     m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
     m.reopen_interrupted_analysis()
     return m.run()
@@ -2050,7 +2278,7 @@ def _self_test() -> int:
         except (OSError, ValueError):
             req = {}
         ok(s == "paused:awaiting_scope_signoff" and load_state(d).state == "OWNER_DECISION"
-           and p.count("SPEC") == 1 and not any(c.startswith("fix:") for c in T.calls)
+           and "SPEC" not in p and not any(c.startswith("fix:") for c in T.calls)
            and req.get("pending") and [i.get("finding") for i in req.get("items") or []] == ["D-031"],
            f"R3-3 an owner-amendment finding pauses at OWNER_DECISION with a request, no redraft ({s}, {p[-4:]})")
         if req.get("pending"):
@@ -2058,7 +2286,7 @@ def _self_test() -> int:
             _SS.sign(d, "owner", all_decision="decline", note="R3-3")
             s2 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
             p2 = [h["to"] for h in load_state(d).history if "to" in h]
-            ok(not s2.startswith("paused") and p2.count("SPEC") == 1 and FL.load(d)["D-031"].status == "owner_declined",
+            ok(not s2.startswith("paused") and "SPEC" not in p2 and FL.load(d)["D-031"].status == "owner_declined",
                f"R3-3b the owner's answer resumes the run; the declined finding is not redrafted ({s2}, {p2[-5:]})")
 
         # R3-4 (F6 run 3): a paid task whose allowance is below the floor is not started: the run pauses for the owner
@@ -2087,7 +2315,7 @@ def _self_test() -> int:
             sp.pop("engine")
             sp["deliverable_file"] = {"path": "allocation_optimized.csv",
                                       "columns": {"unit": "id", "package": "package", "dalys_averted": "dalys_averted"}}
-            if os.path.basename(run_dir) == "spec_proposal":
+            if run_dir.endswith(".spec_proposal"):
                 sp["constraints"]["envelope_usd"] = 21000
             return sp
         once40 = []
@@ -2103,7 +2331,7 @@ def _self_test() -> int:
         sign(d, "owner", "first")
         signed_bytes = open(os.path.join(d, AB.SPEC_FILE), "rb").read()
         s = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
-        pdir = os.path.join(d, "spec_proposal")
+        pdir = d + ".spec_proposal"
         ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN"
            and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes
            and os.path.exists(os.path.join(pdir, AB.SPEC_FILE))
