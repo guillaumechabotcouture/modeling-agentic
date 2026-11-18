@@ -180,9 +180,9 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
         index[rel] = st["files"][rel]
         fetched_sha[rel] = h.hexdigest()
         got.append(rel)
-    json.dump(index, open(ip, "w"), indent=1)
+    # the digests first, then the markers, then the manifest last: a poll interrupted before the manifest is saved
+    # fetches those files again, so no downloaded record is left unmarked (Codex round 4 of #256)
     json.dump(fetched_sha, open(sp, "w"), indent=1)
-    json.dump(st["state"], open(os.path.join(dest, "state.json"), "w"), indent=1)
     # F6 run 3: a run dir copied out of a live run carries in-flight batch records of the VM's process. Every poll marks
     # each run dir with the bytes downloaded into it (hashed as they arrived, never re-read: Codex review of #256), so
     # a record fetched before its run root is marked once the root arrives, and one a local process rewrote does not
@@ -192,6 +192,8 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
         mine = {r[len(rd) + 1:]: v for r, v in fetched_sha.items() if r.startswith(rd + "/")}
         copied_run.mark(os.path.join(dest, rd), f"vm_job poll of job {job_id}",
                         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), hashes=mine)
+    json.dump(index, open(ip, "w"), indent=1)
+    json.dump(st["state"], open(os.path.join(dest, "state.json"), "w"), indent=1)
     st["fetched"] = got
     return st
 
