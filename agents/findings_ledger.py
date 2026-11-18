@@ -512,14 +512,26 @@ def _self_test() -> int:
         except (ValueError, OSError):
             pass
         ok(open(os.path.join(out, "v")).read() == "untouched", "L14 the ledger is not written through a planted .tmp link")
-    # L17 (F6 run 3): scripts/scope_signoff.py sign keys its answers by fingerprint; the ledger reads that form too
+    # L17 (F6 run 3; Codex review of #258 P1-8/P1-9): an owner answer counts only once the harness recorded it, and it
+    # binds to the finding's claim and remedy: a revised finding with the same id is not answered by it
     with tempfile.TemporaryDirectory() as d:
-        json.dump({"answers": {"ab12": {"finding": "D-031", "decision": "decline", "by": "owner"}}},
+        import scope_signoff as SS
+        claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
+        fp = answer_fingerprint("D-031", claim, fix)
+        json.dump({"answers": {fp: {"finding": "D-031", "decision": "decline", "by": "owner"}}},
                   open(os.path.join(d, "scope_signoff.json"), "w"))
-        l17 = owner_answers(d)
-        json.dump({"answers": [{"finding": "D-032", "decision": "accept"}]}, open(os.path.join(d, "scope_signoff.json"), "w"))
-        ok(l17 == {"D-031": "decline"} and owner_answers(d) == {"D-032": "accept"},
-           f"L17 owner answers are read from the fingerprint mapping scope_signoff.py writes, and from a list ({l17})")
+        save(d, {"D-031": Finding(id="D-031", kind="critique_blocker", severity="HIGH", source="harness", claim=claim,
+                                  fix_requires=fix)})
+        unverified = owner_answers(d)
+        SS.harness_record(d)
+        led17, _ = sync(d, None, 2)
+        st17 = led17["D-031"].status
+        led17["D-031"].claim, led17["D-031"].status = "a revised claim", "open"
+        save(d, led17)
+        led17b, _ = sync(d, None, 3)
+        ok(unverified == {} and st17 == "owner_declined" and led17b["D-031"].status == "open",
+           f"L17 a recorded owner answer applies to the finding it was given for, not to a revised one "
+           f"({unverified}, {st17}, {led17b['D-031'].status})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

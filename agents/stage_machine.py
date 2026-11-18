@@ -2140,11 +2140,24 @@ def _self_test() -> int:
            f"R3-3 an owner-amendment finding pauses at OWNER_DECISION with a request, no redraft ({s}, {p[-4:]})")
         if req.get("pending"):
             import scope_signoff as _SS
+            _SS.sign(d, "lead", all_decision="accept", note="R3-3c")     # Codex review of #258 P1-8: not the owner's
+            s_l = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            ok(s_l == "paused:awaiting_scope_signoff",
+               f"R3-3c an answer that is not the owner's does not release OWNER_DECISION ({s_l})")
             _SS.sign(d, "owner", all_decision="decline", note="R3-3")
             s2 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
             p2 = [h["to"] for h in load_state(d).history if "to" in h]
-            ok(not s2.startswith("paused") and "SPEC" not in p2 and FL.load(d)["D-031"].status == "owner_declined",
-               f"R3-3b the owner's answer resumes the run; the declined finding is not redrafted ({s2}, {p2[-5:]})")
+            ok(s2 == "completed_scope_declined" and "SPEC" not in p2 and FL.load(d)["D-031"].status == "owner_declined",
+               f"R3-3b the owner's decline resumes the run, is not redrafted, and constrains the gate: the run is not "
+               f"declared or accepted (Codex review of #258 P1-11) ({s2}, {p2[-5:]})")
+        # R3-5 (Codex review of #258 P1-10): the amendment check runs on every gate route: a structural PLAN blocker
+        # whose remedy is an owner amendment does not take GATE -> SPEC
+        amend5 = dict(amend, id="D-035", category="STRUCTURAL")
+        d, T, st = new_run("amend5", {"critics": {1: {"critique-domain": [amend5]}}, "structural": {1: "critique-domain"}})
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        p = [h["to"] for h in load_state(d).history if "to" in h]
+        ok(s == "paused:awaiting_scope_signoff" and "SPEC" not in p and p[-1] == "OWNER_DECISION",
+           f"R3-5 a structural blocker that needs an owner amendment goes to the owner, not to SPEC ({s}, {p[-3:]})")
 
         # R3-4 (F6 run 3): a paid task whose allowance is below the floor is not started: the run pauses for the owner
         # (resumable), and a resume with a higher cap continues.
