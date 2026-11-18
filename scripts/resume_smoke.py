@@ -252,14 +252,39 @@ def _self_test() -> int:
 
     s = {"reused": 3, "computed": 3, "n_ok": N, "_kept": [0, 1, 2]}
     sg = {"by": "lead", "spec_sha256": "h"}
-    ok(judge("x", [0, 1, 2, 3], [3, 4, 5], s, sg, dict(sg), "h", "completed")["ok"], "RS1 a clean resume passes")
-    ok(not judge("x", [0, 1, 2, 3], [2, 3, 4, 5], s)["ok"], "RS2 a kept row computed again fails")
-    ok(not judge("x", [0, 1, 2, 3], [3, 4, 5], dict(s, reused=2))["ok"], "RS3 fewer rows reused than kept fails")
-    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, sg, dict(sg, by="owner"), "h")["ok"], "RS4 a changed sign-off fails")
-    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, sg, dict(sg), "other")["ok"], "RS5 a signature that no longer binds "
-                                                                             "the spec fails")
-    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, None, None, None, "run_failed")["ok"], "RS6 an unfinished resume fails")
-    ok(not judge("x", [0, 1, 2], [3, 4, 5], dict(s, n_ok=5))["ok"], "RS7 a resumed batch with a failed row fails")
+    good = [{"i": i, "ok": True, "result": {"v": i}} for i in range(N)]
+    kw = dict(expect_kept=[0, 1, 2], sig0=sg, sig1=dict(sg), spec_sha="h", status="completed", stage=True,
+              reopened=True, rows=good)
+    ok(judge("x", [0, 1, 2, 3], [3, 4, 5], s, **kw)["ok"], "RS1 a clean resume passes")
+    ok(not judge("x", [0, 1, 2, 3], [2, 3, 4, 5], s, **kw)["ok"], "RS2 a kept row computed again fails")
+    ok(not judge("x", [0, 1, 2, 3], [3, 4, 5], dict(s, reused=2), **kw)["ok"], "RS3 fewer rows reused than kept fails")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, **dict(kw, sig1=dict(sg, by="owner")))["ok"],
+       "RS4 a changed sign-off fails")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, **dict(kw, spec_sha="other"))["ok"],
+       "RS5 a signature that no longer binds the spec fails")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, **dict(kw, status="run_failed"))["ok"], "RS6 an unfinished resume fails")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], dict(s, n_ok=5), **kw)["ok"], "RS7 a resumed batch with a failed row fails")
+    # Codex review of #255 (3 P1, P2s), reproduced before the fix
+    ok(not judge("x", [0, 1, 2], list(range(N)), dict(s, reused=0, computed=N, _kept=[]), **kw)["ok"],
+       "RS10 (P1) a journal that lost every kept row fails (the kept rows are required, not intersected)")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, **dict(kw, sig0=None, sig1=None))["ok"],
+       "RS11 (P1) a stage-machine scenario with no sign-off record fails")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, **dict(kw, sig0=dict(sg, by="x"), sig1=dict(sg, by="x")))["ok"],
+       "RS11b the sign-off must be the lead's")
+    ok(not judge("x", [0, 1, 2], [3, 3, 3], s, **kw)["ok"], "RS12 the resumed calls must be exactly the missing rows")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, **dict(kw, rows=good[:3] + [dict(good[3], result={"v": 9})] + good[4:]))
+       ["ok"], "RS13 each final row carries its own input's result")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, **dict(kw, reopened=False))["ok"],
+       "RS14 the resume must reopen the run at ANALYZE (FINAL -> ANALYZE, resumed_from run_failed)")
+    ok(not judge("c", [0, 1, 2, 3, 4, 5], [], dict(s, reused=N, computed=0, _kept=list(range(N))), rows=good)["ok"],
+       "RS15 a cap stop that stopped nothing (every row kept) fails")
+    ok(report_problems(2, [{"scenario": "cap_stop", "ok": True}]) != [] and report_problems(0, [
+        {"scenario": n, "ok": True} for n in SCENARIOS]) == [],
+       "RS16 the child must exit 0 and report exactly one row per scenario")
+    ok(_kept_from_lines(['{"i": 0, "ok": true}', '{"i": 1, "ok": true}', '{"i": 2, "o']) == [0, 1],
+       "RS17 (P3) a torn journal line is skipped, as compute.py's reuse skips it")
+    ok(toy_kill_allowed(os.getsid(0), os.getsid(0)) is False and toy_kill_allowed(os.getsid(0) + 1, os.getsid(0)),
+       "RS18 (P1) the toy kills only a process group in a session other than the smoke's")
     rep = run_tree(ROOT)
     ok(rep["ok"] and {x["scenario"] for x in rep["scenarios"]} == {"analyze_timeout", "killed_batch", "cap_stop"}
        and all(x["kept"] >= 1 and x["recomputed"] == 0 and x["reused"] == x["kept"] for x in rep["scenarios"]),
