@@ -182,7 +182,7 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
         got.append(rel)
     # the digests first, then the markers, then the manifest last: a poll interrupted before the manifest is saved
     # fetches those files again, so no downloaded record is left unmarked (Codex round 4 of #256)
-    json.dump(fetched_sha, open(sp, "w"), indent=1)
+    _write_json(sp, fetched_sha)                          # atomic: an interrupted write keeps the earlier digests
     # F6 run 3: a run dir copied out of a live run carries in-flight batch records of the VM's process. Every poll marks
     # each run dir with the bytes downloaded into it (hashed as they arrived, never re-read: Codex review of #256), so
     # a record fetched before its run root is marked once the root arrives, and one a local process rewrote does not
