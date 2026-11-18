@@ -556,6 +556,31 @@ def _self_test() -> int:
     rec = _record({"engine_version": "0.7"}, proof, "abc")
     ok("confirms" not in rec["note"] and (rec.get("confirmation") or {}).get("validate_once") == "pending",
        f"RP12 the re-stamp record marks the Coiled confirmation run pending, not done: {rec.get('confirmation')}")
+    # F6 OA2: the proof runs on Coiled in a shipped tree without git (cloud/vm_job.py --dir): the old tree comes from a
+    # tar of `git archive <old commit> toolkit`, and both commits are given; any of the three alone is refused
+    try:
+        import io
+        import tarfile
+        with tempfile.TemporaryDirectory() as d:
+            tp = os.path.join(d, "old.tar")
+            with tarfile.open(tp, "w") as t:
+                data = b"x = 1\n"
+                ti = tarfile.TarInfo("toolkit/probe.py")
+                ti.size = len(data)
+                t.addfile(ti, io.BytesIO(data))
+            root = old_tree(d, "unused-ref", tp)
+            got = open(os.path.join(root, "toolkit", "probe.py")).read()
+            refused = []
+            for kw in ({"old_tar": tp}, {"old_tar": tp, "old_commit": "a" * 40}, {"new_commit": "b" * 40}):
+                try:
+                    commits("unused-ref", **kw)
+                except ValueError:
+                    refused.append(sorted(kw))
+            ok(got == "x = 1\n" and commits("unused-ref", tp, "a" * 40, "b" * 40) == ("a" * 40, "b" * 40)
+               and len(refused) == 3,
+               f"RP-T1 a proof without git: the old tree from --old-tar, both commits given ({refused})")
+    except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"RP-T1 a proof without git ({type(ex).__name__}: {ex})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
