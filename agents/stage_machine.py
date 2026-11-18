@@ -65,7 +65,7 @@ EDGES = {
     "CRITIQUE": {"GATE", "WRITE", "FINAL"},
     "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "FINAL"},
     "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "WRITE", "OWNER_DECISION", "FINAL"},
-    "OWNER_DECISION": {"GATE", "OWNER_DECISION"},
+    "OWNER_DECISION": {"GATE", "OWNER_DECISION", "FINAL"},
     "WRITE": {"PRESENTATION", "GATE", "FINAL"},
     "PRESENTATION": {"GATE", "FINAL"},
     "FINAL": set(),
@@ -897,9 +897,27 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
 
 OWNER_REQUEST_PRODUCER = "agents/stage_machine.py FIX_LOOP (owner amendments)"
 
-def pending_amendments(ledger: dict) -> list[str]:
-    """Findings, open or declared, whose remedy is an owner amendment the owner has not answered (Codex #258 P1-10)."""
-    return sorted(f.id for f in ledger.values() if f.status in ("open", "declared") and FX.needs_owner_amendment(f))
+def pending_amendments(ledger: dict, resolved=()) -> list[str]:
+    """Findings, open or declared, whose remedy is an owner amendment the owner has not answered (Codex #258 P1-10);
+    not one whose test now passes (`resolved`: the gate's resolved_by_test)."""
+    done = set(map(str, resolved or ()))
+    return sorted(f.id for f in ledger.values() if f.status in ("open", "declared") and f.id not in done
+                  and FX.needs_owner_amendment(f))
+
+
+def drop_declined(run_dir: str, ids) -> None:
+    """A finding the owner declined is not a declared limitation: it leaves declared_findings.yaml (Codex #258)."""
+    import yaml
+    p = os.path.join(run_dir, DECLARED_FILE)
+    try:
+        doc = yaml.safe_load(open(p)) or {}
+    except (OSError, yaml.YAMLError):
+        return
+    if not isinstance(doc, dict) or not isinstance(doc.get("declared"), list):
+        return
+    keep = [x for x in doc["declared"] if not (isinstance(x, dict) and str(x.get("id")) in set(map(str, ids)))]
+    if len(keep) != len(doc["declared"]):
+        _put(run_dir, DECLARED_FILE, yaml.safe_dump(dict(doc, declared=keep), sort_keys=False, width=10**6))
 
 
 def apply_owner_declines(decision: dict, ledger: dict) -> dict:
@@ -1429,6 +1447,8 @@ class Machine:
         pw = self.st.post_write
         if self.st.gate_mode == "legacy":
             d = legacy_gate(self.run_dir, self.st.round, self.st.max_rounds, pw)
+            if (d or {}).get("action"):              # an owner decline holds this gate too (Codex round 3 of #258)
+                d = apply_owner_declines(d, FL.load(self.run_dir))
         else:
             sv = getattr(self.backend, "spec_violations", None)
             rv = getattr(self.backend, "registry_violations", None)
@@ -1443,7 +1463,11 @@ class Machine:
                 d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget())
                 d = require_judged(d, opened)
                 # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
-                d = apply_owner_declines(d, FL.sync(self.run_dir, None, self.st.round, post_write=pw)[0])
+                # (synced with this decision, so a gate finding is read as this gate states it: Codex round 3 of #258)
+                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw)[0])
+                if d.get("rule_matched") == "owner_declined":
+                    drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
+                                                 if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
             if d.get("action"):
                 import validate_critique_yaml as V
                 V._append_validator_history(self.run_dir, self.st.round, d, pw)
@@ -1474,7 +1498,7 @@ class Machine:
                 led = FL.load(self.run_dir)
                 # Codex review of #258 P1-10: a finding whose remedy is an owner amendment goes to the owner on every
                 # route, not only from the fix loop
-                amend = pending_amendments(led)
+                amend = pending_amendments(led, d.get("resolved_by_test"))
                 if amend:
                     self._request_owner(led, amend)
                     return self._go("OWNER_DECISION", f"{len(amend)} finding(s) need an owner amendment "
@@ -1569,6 +1593,11 @@ class Machine:
         except (OSError, ValueError):
             req = None
         want = list(self.st.tries.get("owner_request") or [])
+        if not want:
+            # a pause with no request this machine recorded (an older run, or a route that records none): it cannot be
+            # answered here, so it fails with how to go on, never waits (lead decision on Codex round 3 of #258)
+            return self._go("FINAL", "OWNER_DECISION has no recorded owner request: relaunch with reuse (a new run dir "
+                                     "from this one's spec and stored rows)", "run_failed")
         answers, bad = SS.load_answers(self.run_dir)
         answered = bool(want) and not bad and all(
             isinstance(answers.get(fp), dict) and answers[fp].get("by") == "owner"
@@ -2225,7 +2254,8 @@ def _self_test() -> int:
         d, T, st = new_run("noreq", {})
         st.state = "OWNER_DECISION"
         save_state(d, st)
-        s7 = _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False).run()
+        _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False).step()   # the handler itself
+        s7 = load_state(d).status
         ok(s7 == "run_failed" and "relaunch with reuse" in str(load_state(d).history[-1].get("why")),
            f"R3-7c a pause at OWNER_DECISION with no recorded request fails with how to go on ({s7})")
         d, T, st = new_run("legacydecl", {})
