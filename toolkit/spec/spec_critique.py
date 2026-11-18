@@ -46,7 +46,7 @@ if ROOT not in sys.path:
 CHECKS = {"headline_comparator": 2, "decision_date": 2, "baseline_burden": 3, "decision_input_ranges": 6}
 SECTION = "## Spec critique (decision design principles, before signing)"
 PAST_DAYS = 90             # an ISO decision date more than this before today is past
-DELIVERED_YEARS = 0.25     # a delivery window starting more than this before today has delivered actions
+CALENDAR_MIN = 1900        # a window starting earlier is in model years, not calendar years: not compared with today
 
 
 def _year_frac(d: datetime.date) -> float:
@@ -71,9 +71,14 @@ def _date_of(v):
         return None
 
 
-def _f(sev, check, text, fix, judgment=False):
+def _f(sev, check, text, fix, judgment=False, error=False):
     return {"check": check, "principle": CHECKS[check], "severity": sev, "text": text, "fix": fix,
-            "declared": None, "judgment": judgment}
+            "declared": None, "judgment": judgment, "error": error}
+
+
+def _estimates(raw) -> bool:
+    """An estimates deliverable has no allocation and no comparator (toolkit/spec/estimates.py)."""
+    return isinstance(raw.get("deliverable"), dict) and raw["deliverable"].get("kind") == "estimates"
 
 
 def _packages(raw) -> dict:
@@ -81,16 +86,29 @@ def _packages(raw) -> dict:
     return {k: v for k, v in pk.items() if k not in ("generate", "within_envelope")} if isinstance(pk, dict) else {}
 
 
+def _resolved(raw) -> dict:
+    """{package: components} as execution resolves them (toolkit/alloc/costs.py packages)."""
+    from toolkit.alloc import costs
+    o = raw.get("options") or {}
+    comps = o.get("components") or {c: {} for c in (o.get("engine_map") or {})}
+    return {k: set(v) for k, v in costs.packages(dict(o, components=comps,
+                                                      packages=o.get("packages") or {"generate": True})).items()}
+
+
 def _comparator(raw) -> list:
+    if _estimates(raw):
+        return [_f("INFO", "headline_comparator", "An estimates deliverable has no comparator plan.", "None")]
     pkg = str((raw.get("comparator") or {}).get("package"))
-    pk = _packages(raw)
-    gen = isinstance((raw.get("options") or {}).get("packages"), dict) and raw["options"]["packages"].get("generate")
+    pk = _resolved(raw)
     variants = [v.get("id") for v in ((raw.get("analysis") or {}).get("plan_variants") or {}).get("variants") or []
                 if isinstance(v, dict) and v.get("type") == "fixed_plan"]
-    if (pkg in pk and not pk[pkg]) or (gen and pkg == "none" and pkg not in pk):
-        held = (f" The funded plan is the fixed_plan variant {', '.join(map(str, variants))}, which the harness "
-                "reports only against the unconstrained optimum, never as the headline." if variants else
-                " No fixed_plan variant gives the funded plan.")
+    if pkg not in pk:
+        return [_f("HIGH", "headline_comparator", f"The comparator `{pkg}` is not a package of the options.",
+                   "Name a package the options define")]
+    if not pk[pkg]:
+        held = (f" The fixed_plan variant(s) {', '.join(map(str, variants))} are reported against the optimum (and "
+                "the optimum re-solved at their own cost), never as the headline; say which is the funded plan."
+                if variants else " No fixed_plan variant gives the funded plan.")
         return [_f("HIGH", "headline_comparator",
                    f"The comparator `{pkg}` has no components, so the headline compares the recommended plan with no "
                    f"action, which principle 2 makes context only.{held}",
@@ -114,9 +132,16 @@ def _decision_date(raw, today) -> list:
         start = float(win[0])
     except (TypeError, ValueError, IndexError):
         start = None
+    if start is not None and start < CALENDAR_MIN:
+        start = None
     now = _year_frac(today)
     out = []
-    if start is not None and start < now - DELIVERED_YEARS:
+    if start is not None and start < (d.year if year_only else _year_frac(d)):
+        out.append(_f("HIGH", "decision_date",
+                      f"The delivery window starts in {start:g}, before the decision date {raw.get('decision_date')}: "
+                      "actions delivered before the decision would be optimised.",
+                      "Start the delivery window at the decision date; delivered actions are fixed inputs"))
+    elif start is not None and start < now:
         out.append(_f("HIGH", "decision_date",
                       f"The delivery window starts in {start:g}, before today ({today.isoformat()}); the decision is "
                       f"dated {raw.get('decision_date')}. Actions delivered since then would be optimised as if open.",
@@ -129,17 +154,21 @@ def _decision_date(raw, today) -> list:
     return out
 
 
-def _burden(raw, run_dir) -> list:
+def _burden(raw, run_dir, data=None) -> list:
+    if _estimates(raw):
+        return [_f("INFO", "baseline_burden", "An estimates deliverable ranks no units.", "None")]
     tests = [t for t in (raw.get("analysis") or {}).get("decision_tests") or [] if isinstance(t, dict)]
-    scale = [str(t.get("id")) for t in tests if t.get("type") == "burden_scale"]
     sec = (raw.get("validation") or {}).get("burden")
+    scale = [str(t.get("id")) for t in tests if t.get("type") == "burden_scale"
+             and (t.get("burden_scale") or {}).get("references") and isinstance(sec, dict) and sec.get("csv")]
     anchors, why = 0, "no validation.burden section"
     if isinstance(sec, dict) and sec.get("csv"):
         try:
             from toolkit.analysis import burden as BV
             from toolkit.spec import schema
             sp = schema.Spec(raw, run_dir)
-            refs, _bad = BV.load_references(sp, BV.read_reference(run_dir, BV.config(sp)["csv"]))
+            data = BV.read_reference(run_dir, BV.config(sp)["csv"]) if data is None else data   # the sheet's read
+            refs, _bad = BV.load_references(sp, data)
             anchors = len(BV.anchor_rows(refs))
             why = "validation.burden has no anchor row (role anchor): its references only validate"
         except Exception as e:  # noqa: BLE001 -- fail closed: unreadable references anchor nothing
@@ -163,7 +192,9 @@ def _varied(raw, run_dir) -> tuple[set, set]:
     tests = [t for t in an.get("decision_tests") or [] if isinstance(t, dict)]
     ps = {t.get("parameter") for t in tests if t.get("type") == "parameter_value"
           and len(set(map(str, t.get("values") or []))) >= 2}
-    ps |= set(unc.get("priors") or {})              # a drawn prior gets its generated prior_range_<p> test
+    from toolkit.spec import priors as PRI
+    if not PRI.kind_excluded(unc, "priors"):
+        ps |= set(unc.get("priors") or {}) - set(PRI.excluded_parameters(unc))   # drawn: a prior_range_<p> test
     # an engine_parameters range is drawn (schema: range needs dist, engine_parameters.py)
     ps |= {p for p, v in (raw.get("engine_parameters") or {}).items() if isinstance(v, dict) and v.get("range")}
     try:
@@ -173,10 +204,14 @@ def _varied(raw, run_dir) -> tuple[set, set]:
         pass
     cols = {str((t.get("unit_attribute") or {}).get("column")) for t in tests if t.get("type") == "unit_attribute"}
     ea = (raw.get("decision_units") or {}).get("engine_attributes") or {}
-    return ps, {a for a, v in ea.items() if isinstance(v, dict) and str(v.get("column")) in cols}
+
+    def bound(v):           # the columns an attribute is bound to: {column} or {columns: [..] | {k: col}}
+        cs = v.get("columns")
+        return {str(v.get("column"))} | {str(c) for c in (cs.values() if isinstance(cs, dict) else cs or [])}
+    return ps, {a for a, v in ea.items() if isinstance(v, dict) and bound(v) & cols}
 
 
-def _ranges(raw, run_dir) -> list:
+def _ranges(raw, run_dir, dossier_bytes=None) -> list:
     an = raw.get("analysis") or {}
     tests = [t for t in an.get("decision_tests") or [] if isinstance(t, dict)]
     unc = raw.get("uncertainty") or {}
@@ -185,13 +220,18 @@ def _ranges(raw, run_dir) -> list:
     excl_p = {str(x.get("parameter")): str(x.get("reason") or "").strip() for x in unc.get("excluded") or []
               if isinstance(x, dict) and x.get("parameter") and str(x.get("reason") or "").strip()}
     ev = (raw.get("evidence") or {}).get("dossier")
-    if ev and run_dir:
+    if ev:
         import yaml
-        try:
-            with open(os.path.join(run_dir, ev), encoding="utf-8") as fh:
-                inputs = (yaml.safe_load(fh) or {}).get("inputs") or {}
-        except (OSError, ValueError, AttributeError, yaml.YAMLError):
-            inputs = {}                                # the dossier precondition reports an unreadable dossier
+        from toolkit.spec import evidence_dossier as ED
+        try:            # the bytes the sheet binds (write_sheet's one read), else a no-follow read of the run's file
+            b = dossier_bytes if dossier_bytes is not None else (ED.read_dossier(run_dir, ev) if run_dir else None)
+            if b is None:
+                raise ValueError("not found")
+            inputs = (yaml.safe_load(b.decode("utf-8")) or {}).get("inputs") or {}
+        except (ValueError, UnicodeDecodeError, AttributeError, yaml.YAMLError) as e:
+            out.append(_f("HIGH", "decision_input_ranges", f"The evidence dossier {ev} cannot be read ({e}), so its "
+                          "decision inputs are not checked.", "Fix the dossier", error=True))
+            inputs = {}
     inputs = inputs if isinstance(inputs, dict) else {}
     for k, e in sorted(inputs.items()):
         kind, _, name = str(k).partition(":")
@@ -220,7 +260,8 @@ def _ranges(raw, run_dir) -> list:
                       "Give a range and a decision test to each that can move the decision", judgment=True))
     srcs = [s for s in unc.get("sources") or [] if isinstance(s, dict) and s.get("kind") == "costs"]
     costed = set().union(*[set((s.get("items") or {})) for s in srcs]) if srcs else set()
-    costed |= {i for t in tests if t.get("type") == "cost_items" for i in (t.get("multipliers") or {})}
+    costed |= {i for t in tests if t.get("type") == "cost_items" for i, m in (t.get("multipliers") or {}).items()
+               if isinstance(m, (int, float)) and not isinstance(m, bool) and m != 1}
     excl = any(isinstance(x, dict) and x.get("kind") == "costs" for x in unc.get("excluded") or [])
     allocated = {c for cs in _packages(raw).values() for c in (cs or [])} or set(
         ((raw.get("options") or {}).get("components") or {}))
@@ -242,43 +283,49 @@ def _departures(raw) -> tuple[dict, list]:
         return got, [_f("HIGH", "headline_comparator", "principle_departures is not a list.", "Give a list of "
                         "{principle, check, reason}")]
     for i, d in enumerate(deps):
-        ok = (isinstance(d, dict) and d.get("check") in CHECKS and d.get("principle") == CHECKS[d.get("check")]
+        c = d.get("check") if isinstance(d, dict) else None
+        c = c if isinstance(c, str) and c in CHECKS else None
+        ok = (c is not None and d.get("principle") == CHECKS[c]
               and isinstance(d.get("reason"), str) and d["reason"].strip())
         if ok:
             got[d["check"]] = d["reason"].strip()
         else:
-            chk = d.get("check") if isinstance(d, dict) and d.get("check") in CHECKS else "headline_comparator"
+            chk = c or "headline_comparator"
             bad.append(_f("HIGH", chk, f"principle_departures[{i}] is malformed: {d!r}",
                           f"Give {{principle, check, reason}}, check one of {', '.join(CHECKS)} with its principle "
                           "number and a non-empty reason"))
     return got, bad
 
 
-def findings(raw: dict, run_dir: str | None = None, today: datetime.date | None = None) -> list[dict]:
-    """Every check's findings on the spec `raw` ({check, principle, severity, text, fix, declared, judgment}); a
-    finding whose check the spec declares carries the reason in `declared` and severity DECLARED."""
+def findings(raw: dict, run_dir: str | None = None, today: datetime.date | None = None, dossier_bytes=None,
+             burden_data=None) -> list[dict]:
+    """Every check's findings on the spec `raw` ({check, principle, severity, text, fix, declared, judgment, error});
+    a finding whose check the spec declares carries the reason in `declared` and severity DECLARED, except a check
+    that could not run, which stays HIGH. `dossier_bytes`, `burden_data`: what the sheet read and binds (Codex review
+    of #254 P1); None reads the run's files."""
     today = today or datetime.date.today()
     if not isinstance(raw, dict):
         return [_f("HIGH", "headline_comparator", "the spec is not a mapping", "Fix the spec")]
     out = []
     for name, fn in (("headline_comparator", lambda: _comparator(raw)),
                      ("decision_date", lambda: _decision_date(raw, today)),
-                     ("baseline_burden", lambda: _burden(raw, run_dir)),
-                     ("decision_input_ranges", lambda: _ranges(raw, run_dir))):
+                     ("baseline_burden", lambda: _burden(raw, run_dir, burden_data)),
+                     ("decision_input_ranges", lambda: _ranges(raw, run_dir, dossier_bytes))):
         try:
             out += fn()
         except Exception as e:  # noqa: BLE001 -- fail closed: a check that cannot run is a finding
-            out.append(_f("HIGH", name, f"the check could not run: {type(e).__name__}: {e}", "Fix the spec section"))
+            out.append(_f("HIGH", name, f"the check could not run: {type(e).__name__}: {e}", "Fix the spec section",
+                          error=True))
     deps, bad = _departures(raw)
     for f in out:
-        if f["check"] in deps and f["severity"] in ("HIGH", "MEDIUM"):
+        if f["check"] in deps and f["severity"] in ("HIGH", "MEDIUM") and not f["error"]:
             f["declared"], f["severity"] = deps[f["check"]], "DECLARED"
     return out + bad
 
 
-def sheet_lines(raw, run_dir, today=None) -> list[str]:
+def sheet_lines(raw, run_dir, today=None, dossier_bytes=None, burden_data=None) -> list[str]:
     """The sign-off sheet's section: each finding, with its principle, severity and fix, before signing."""
-    fs = findings(raw, run_dir, today)
+    fs = findings(raw, run_dir, today, dossier_bytes, burden_data)
     open_ = [f for f in fs if f["severity"] in ("HIGH", "MEDIUM")]
     out = [SECTION, "", f"{sum(f['severity'] == 'HIGH' for f in fs)} HIGH, "
            f"{sum(f['severity'] == 'MEDIUM' for f in fs)} MEDIUM, {sum(f['severity'] == 'DECLARED' for f in fs)} "
@@ -347,7 +394,9 @@ def _self_test() -> int:
     ok(sev(findings(spec(decision_date="soon"), today=T), "decision_date") == ["HIGH"], "SC12 an unreadable date")
     ok(sev(findings(spec(decision_date=True), today=T), "decision_date") == ["HIGH"], "SC12b a boolean date")
 
-    ok(sev(findings(spec(), today=T), "baseline_burden") == ["MEDIUM"], "SC13 a burden_scale test alone is MEDIUM")
+    r = spec(validation={"burden": {"csv": "b.csv"}},
+             analysis={"decision_tests": [{"id": "BS", "type": "burden_scale", "burden_scale": {"references": ["r1"]}}]})
+    ok(sev(findings(r, today=T), "baseline_burden") == ["MEDIUM"], "SC13 a burden_scale test alone is MEDIUM")
     ok(sev(findings(spec(analysis={"decision_tests": []}), today=T), "baseline_burden") == ["HIGH"],
        "SC14 no anchor and no test is HIGH")
     ok(sev(findings(spec(analysis={}, validation={"burden": {"csv": "missing.csv"}}), run_dir="/nonexistent",
