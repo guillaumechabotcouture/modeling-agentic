@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trial fit of the v0.17 net-effect parameters on the pack's training targets (design: ENGINE_NOTES.md, v0.17).
+"""Trial fit of the net-effect parameters (design: ENGINE_NOTES.md, v0.17; option A and v0.18's net_deter_sat below).
 Wave 1 ran on cluster 2375765 (net_effect_fit_wave1.yaml: sample invalid, 8/12 verified points in band); `run` is
 now wave 2, which reuses wave 1's engine results (load_wave1) and runs only new points (fit_waves). Wave 2 ran on
 cluster 2377496 (invalid, 9/12; its choice extrapolated past the design); `run --verify-round` reads wave 2's stored
@@ -109,7 +109,7 @@ WAVE1_TARGETS = ["B10", "B11", "B12", "B12b", "B12m"]     # the fit targets wave
 # it adds a same-trial contrast, not independent data. cap_usd is the owner's, set here when the fit is approved.
 OPTION_A = {"targets": ["B9", "B9b", "B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11", "B12", "B12b", "B12m"],
             "design_n": 108, "wave2_n": 111, "cap_usd": None,
-            "store": "outputs/_engine/net_effect_fit/option_a", "job": "f6-netfit-optiona"}
+            "store": "outputs/_engine/net_effect_fit/option_a", "job": "f6-refit-optiona"}
 # Verification round 2 (owner, 14 Nov): wave 2 (cluster 2377496) ran with candidates over the whole box, so its chosen
 # point and two failed points sat at cfp_half ~1,600 days, past wave 2's design box (extrapolation). This round reads
 # wave 2's engine results from its stored checkpoint (no design point rerun), refits with the candidates and the
@@ -926,21 +926,26 @@ def _control_check(runner, pack: dict, ctrl: dict, point: dict) -> dict:
         [BM.get(r, pack["settings"][s]["calibrate"]["value_path"]) for r in res[a]])), 4)} for s, a in ctrl.items()}
 
 
-PURPOSE = ("trial fit of the v0.17 net-effect parameters on the pack's training targets (ENGINE_NOTES.md, v0.17); "
+PURPOSE = ("trial fit of the net-effect parameters (engine v0.18, F6 option A: the fit's own target declaration "
+           "OPTION_A; ENGINE_NOTES.md, v0.17 and v0.18); "
            "adopted only through a signed spec's uncertainty.net_effect_posterior (load_posterior)")
 
 
 def confounding(reg: dict, pairs=CONFOUNDED) -> list:
     """Owner, 18 Nov: each CONFOUNDED pair's correlation in the joint sample (the surrogate's all-in-band region), so
     the output shows how far the trials separate them; a pair not both fitted is left out."""
-    c = reg.get("correlation") or {}
-    names, m = list(c.get("names") or []), c.get("matrix") or []
+    names = list((reg.get("correlation") or {}).get("names") or [])
+    rows = reg.get("sample") or reg.get("sample_unverified") or []       # the rows the decision analysis draws
     out = []
     for a, b in pairs:
         if a in names and b in names:
-            i, j = names.index(a), names.index(b)
-            out.append({"pair": [a, b], "correlation": m[i][j], "sample_n": len(reg.get("sample") or
-                                                                                reg.get("sample_unverified") or []),
+            r = None
+            if len(rows) >= 3:
+                x, y = (np.array([float(w[k]) for w in rows]) for k in (a, b))
+                if x.std() > 0 and y.std() > 0:
+                    r = round(float(np.corrcoef(x, y)[0, 1]), 4)
+            out.append({"pair": [a, b], "correlation": r, "sample_n": len(rows),
+                        "note": None if r is not None else "undefined: fewer than 3 exported rows or a constant column",
                         "hull": {k: (reg.get("hull") or {}).get(k) for k in (a, b)}})
     return out
 
@@ -1143,6 +1148,9 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
     bad = check(pack, base)
     if bad:
         raise ValueError("net_effect_fit: " + "; ".join(bad))
+    if not verify_round and sorted(pack["fit_joint"]["targets"]) != sorted(OPTION_A["targets"]):
+        raise ValueError(f"a fresh fit (or smoke) runs only on OPTION_A's declaration {OPTION_A['targets']}, not "
+                         f"{pack['fit_joint']['targets']} (the history's targets only replay)")
     if not smoke and not (approved or "").strip():
         raise ValueError("the full fit spends more than $20: pass --approved with the owner's approval (or --smoke)")
     if not smoke and (approved or "").strip().startswith("<"):
@@ -2226,7 +2234,7 @@ def _self_test() -> int:
         c = confounding({"correlation": {"names": nm, "matrix": [[1.0, 0.9], [0.9, 1.0]]}, "sample": rows})
         want = float(np.corrcoef([r[nm[0]] for r in rows], [r[nm[1]] for r in rows])[0, 1])
         ok(all(g and g[0]["correlation"] is None and g[0]["sample_n"] == n for n, g in got.items())
-           and abs(c[0]["correlation"] - want) < 1e-9 and c[0]["sample_n"] == 400,
+           and abs(c[0]["correlation"] - want) < 1e-4 and c[0]["sample_n"] == 400,
            f"FA9 confounding: undefined with fewer than 3 rows (None, not a crash); computed on the exported rows "
            f"({c[0]['correlation']:.3f} vs the candidates' 0.9)")
     case("FA9", fa9)
