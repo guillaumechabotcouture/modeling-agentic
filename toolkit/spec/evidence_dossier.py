@@ -1317,12 +1317,27 @@ def _self_test_round4(ok, T) -> None:
     try:
         from toolkit.analysis import batch as BA
         from toolkit.spec import schema
-        ex = _exec_context(mal, {}, {})
-        want = BA.fitted_ranges(schema.engine_class(mal)())["cfp_kill"][:2]
-        ok(tuple(ex["ranges"]["cfp_kill"]) == tuple(float(x) for x in want)
-           and abs(ex["values"]["cfp_kill"] - BA.fitted_ranges(schema.engine_class(mal)())["cfp_kill"][2]) < 1e-12,
-           f"ED-X1 a fitted parameter's value and range are execution's (fitted.yaml through batch.fitted_ranges), not "
-           f"the card file's: {ex['ranges'].get('cfp_kill')} vs {want}")
+        # execution is the reference either way: when it refuses the engine's fitted values (F6 option A: the pack's
+        # fit targets changed, 'refit required' until the pack is refitted), the dossier records execution's reason as a
+        # problem (fail closed) and shows no fitted range
+        try:
+            fr, refused = BA.fitted_ranges(schema.engine_class(mal)()), None
+        except Exception as e:  # noqa: BLE001 -- execution's own refusal is the expected value
+            fr, refused = None, e
+        if refused is None:
+            ex = _exec_context(mal, {}, {})
+            want = fr["cfp_kill"][:2]
+            ok(tuple(ex["ranges"]["cfp_kill"]) == tuple(float(x) for x in want)
+               and abs(ex["values"]["cfp_kill"] - fr["cfp_kill"][2]) < 1e-12,
+               f"ED-X1 a fitted parameter's value and range are execution's (fitted.yaml through batch.fitted_ranges), "
+               f"not the card file's: {ex['ranges'].get('cfp_kill')} vs {want}")
+        else:
+            ex = _exec_context(mal, {}, {})
+            ok(ex["fitted"] == {} and any("fitted values cannot be read" in p and str(refused) in p
+                                          for p in ex["problems"]),
+               f"ED-X1 while execution refuses the engine's fitted values, the dossier records execution's own reason as "
+               f"a problem and shows no fitted range (fail closed): {type(refused).__name__}: {refused} | "
+               f"{ex['problems']}")
         sha_t = card_table_sha256(mal, "hut_trial_coefficients")
         r = {"kind": "card_table", "name": "hut_trial_coefficients", "engines": [(mal, {})], "used_by": ["n"]}
         good = {"model_value": {"sha256": sha_t}, "model_source": "card", "chosen": {"value": {"sha256": sha_t},
