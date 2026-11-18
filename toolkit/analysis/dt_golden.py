@@ -9,7 +9,8 @@ Parts of a record's digest (sha256 prefixes of canonical JSON; parts()): `decisi
 regret, dollars moved, recommendations, benefit changes, identities, each case's results, the run's summary entry;
 not `type` or `perturb`, and any field not named here), `detail` (case labels and the type's own block), `words`
 (the sentences) and `plans` (each case's allocation digest, decision_tests.plan_sha256). Numbers: 6 significant
-digits, below 1e-9 in size zero; an absolute path keeps its file name.
+digits, below 1e-9 in size zero; an absolute path keeps its file name. Known limits: a path holding a
+space keeps its tail, and two values either side of a 6th-digit rounding boundary differ.
 
 `digest` reads analysis/decision_tests.yaml and models/decision_tests/<id>.yaml, and fails closed (digest_dir).
 
@@ -116,7 +117,14 @@ def digest(rec: dict, summary: dict | None = None) -> dict:
     return {k: _h(v) for k, v in parts(rec, summary).items()}
 
 
-_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:+-]*")
+def _plain_name(tid: str, pathmod=os.path) -> bool:
+    """Whether `<tid>.yaml` is one plain file name under a directory with this platform's path rules: no separator,
+    no `.`/`..`, no drive (Windows `C:x`), so joining it never leaves the directory (Codex r3 P1-3, P2-1: any id the
+    writers accept otherwise, spaces and colons included)."""
+    base = pathmod.join("base", "dir")
+    j = pathmod.join(base, f"{tid}.yaml")
+    return bool(tid) and tid not in (".", "..") and "/" not in tid and "\\" not in tid \
+        and pathmod.dirname(j) == base and pathmod.basename(j) == f"{tid}.yaml"
 
 
 def _regular_in(run_dir: str, rel: str, missing=StoredIncomplete) -> str:
@@ -153,7 +161,7 @@ def digest_dir(run_dir: str) -> dict:
     for t in tests:
         tid = t.get("test_id") if isinstance(t, dict) else None
         tid = str(tid) if isinstance(tid, int) and not isinstance(tid, bool) else tid      # run_all keeps an int id
-        if not isinstance(tid, str) or not _ID.fullmatch(tid):
+        if not isinstance(tid, str) or not _plain_name(tid):
             raise StoredIncomplete(f"{p}: an entry without a plain test id ({t!r:.120})")
         if tid in out:
             raise StoredIncomplete(f"{p}: test id {tid} is listed twice")
@@ -161,8 +169,8 @@ def digest_dir(run_dir: str) -> dict:
         if st not in ("run", "not_run"):
             raise StoredIncomplete(f"{p}: test {tid}: status {st!r} is neither run nor not_run")
         if st == "not_run":
-            if t.get("path"):
-                raise StoredIncomplete(f"{p}: test {tid} was not run but lists a result file")
+            if t.get("path") or t.get("verdict", "NOT_RUN") != "NOT_RUN":
+                raise StoredIncomplete(f"{p}: test {tid} was not run but lists a result file or another verdict")
             out[tid] = digest({"status": st, "test_id": tid}, t)
             continue
         want = f"models/decision_tests/{tid}.yaml"
@@ -170,8 +178,9 @@ def digest_dir(run_dir: str) -> dict:
             raise StoredIncomplete(f"{p}: test {tid}: result file {t.get('path')!r}, not {want}")
         with open(_regular_in(run_dir, want)) as f:
             rec = yaml.safe_load(f)
-        if not isinstance(rec, dict) or str(rec.get("test_id")) != tid or rec.get("status") != st:
-            raise StoredIncomplete(f"{want}: holds {rec!r:.80}, not test {tid} with status {st}")
+        if not isinstance(rec, dict) or "test_id" not in rec or str(rec["test_id"]) != tid or rec.get("status") != st \
+                or not isinstance(rec.get("decision_changes"), bool):
+            raise StoredIncomplete(f"{want}: holds {rec!r:.80}, not test {tid} with status {st} and decision_changes")
         vd = "CHANGES_PLAN" if rec.get("decision_changes") else "NO_CHANGE"
         if "verdict" in t and t["verdict"] != vd:          # Codex r2 P2-2: the summary contradicts its result
             raise StoredIncomplete(f"{p}: test {tid}: verdict {t['verdict']!r}, its result says {vd}")
