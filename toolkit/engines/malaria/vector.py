@@ -486,7 +486,8 @@ def _self_test_v017(ok, P) -> None:
                     for Pd in (P, dict(P, **NET_DEFAULTS)):
                         got = itn_effect(nt, x, ages, Pd, cx, holes)
                         same &= all(np.array_equal(a, b) for a, b in zip(got, ref))
-        ok(same and NET_DEFAULTS == {"net_kill_shift": 0.0, "pbo_gain_scale": 1.0, "pbo_adv_decay": 0.0},
+        ok(same and NET_DEFAULTS == {"net_kill_shift": 0.0, "pbo_gain_scale": 1.0, "pbo_adv_decay": 0.0,
+                                     "net_deter_sat": 1.0},
            "V31 at their defaults (kill shift 0, PBO gain scale 1, PBO advantage decay 0) the net outcomes equal the "
            "frozen v0.16 code bit for bit (pyrethroid, PBO, dual-AI; 6 resistance levels, 2 complexes, 9 ages, holes on/off)")
     case("V31", v31)
@@ -573,6 +574,56 @@ def _self_test_v017(ok, P) -> None:
            f"extra rate makes the engine's total equal the trial's ({ {k: round(v, 6) for k, v in applied.items()} }); "
            f"range over x 0-0.30, clipped at 0: {rr['range']}")
     case("V37", v37)
+
+    # v0.18 (F6 option A, owner 18 Nov: form P, fitted): net_deter_sat theta, the share of a PBO net's EXTRA entry
+    # reduction (deterrence) over a same-x pyrethroid net that it keeps: m_pbo(theta) = m_pyr + theta (m_pbo - m_pyr).
+    # theta = 1 is v0.17 bit for bit; theta = 0 leaves the PBO net a pyrethroid net's entry with PBO's hut mortality.
+    def v38():
+        same = True
+        for cx in ("gambiae", "funestus"):
+            for x in xs:
+                for holes in (True, False):
+                    ref = _itn_effect_v016(nt, x, ages, P, cx, holes)
+                    got = itn_effect(nt, x, ages, dict(P, net_deter_sat=1.0), cx, holes)
+                    same &= all(np.array_equal(a, b) for a, b in zip(got, ref))
+        C = CHURCHER
+        ex = lambda z: 1.0 / (1.0 + np.exp(-z))  # noqa: E731
+        ent = lambda l: np.clip(1 - (C["d1"] + C["d2"] * (l - C["tau"]) + C["d3"] * (l - C["tau"]) ** 2), 0, 1)  # noqa: E731
+        got0 = {}
+        for x in (0.088, 0.3, 0.55, 0.9):
+            l_p = ex(C["a1"] + C["a2"] * (x - C["tau"]))
+            l_b = ex(C["a1"] + C["a2"] * (float(pbo_bioassay(x)) - C["tau"]) )
+            m_p, m_b = ent(l_p), ent(l_b)
+            for th in (0.0, 0.5):
+                r, d, s, g = hut_new_net(x, True, deter_sat=th)
+                m = m_p + th * (m_b - m_p)
+                k = C["th1"] * np.exp(C["th2"] * (1 - l_b - C["tau"]))
+                j = np.clip(1 - l_b - k, 0, 1)
+                jp, kp, lp = m * j + 1 - m, m * k, m * l_b
+                s0 = np.clip(kp / C["k0"], 0, 1)
+                want = ((1 - s0) * jp / (jp + lp), (1 - s0) * lp / (jp + lp), s0)
+                got0[(x, th)] = bool(np.allclose([r, d, s], want, rtol=1e-12, atol=0)
+                                     and g == hut_new_net(x, True)[3])
+        pyr_same = all(np.array_equal(np.asarray(hut_new_net(x, False)), np.asarray(hut_new_net(x, False, deter_sat=0.0)))
+                       for x in xs)
+        k55 = (float(hut_new_net(0.55, True, deter_sat=0.0)[1]), float(hut_new_net(0.55, False)[1]))
+        ok(same and all(got0.values()) and pyr_same and k55[0] > k55[1],
+           f"V38 net_deter_sat: 1 is v0.17 bit for bit; theta mixes a PBO net's entry with a same-x pyrethroid net's "
+           f"(hut mortality and decay unchanged); pyrethroid nets are untouched; at 0, x 0.55, a new PBO net kills "
+           f"{k55[0]:.2f} per attempt against the pyrethroid net's {k55[1]:.2f} ({got0})")
+    case("V38", v38)
+
+    def v39():
+        bad = []
+        for v in (-0.01, 1.01, float("nan")):
+            try:
+                net_check(dict(P, net_deter_sat=v))
+                bad.append(v)
+            except ValueError:
+                pass
+        net_check(dict(P, net_deter_sat=0.0))
+        ok(not bad, f"V39 net_deter_sat outside [0, 1] or non-finite fails closed (accepted: {bad})")
+    case("V39", v39)
 
 
 def _self_test() -> int:

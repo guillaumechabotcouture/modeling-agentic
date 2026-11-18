@@ -3248,7 +3248,7 @@ def _self_test_v017(ok, e, unit) -> None:
         sp = {p.name: p for p in e.parameters()}
         got = {k: (sp[k].value, sp[k].units) for k in want if k in sp and sp[k].kind == "fixed"}
         ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 17) and got == want and not set(want) & POST_FORK
-           and V.NET_DEFAULTS == {k: v[0] for k, v in want.items()},
+           and {k: V.NET_DEFAULTS.get(k) for k in want} == {k: v[0] for k, v in want.items()},
            f"NE0 engine v0.17 has the net-effect parameters, kind fixed, at the v0.16-reproducing defaults ({got})")
     case("NE0", ne0)
 
@@ -3288,6 +3288,30 @@ def _self_test_v017(ok, e, unit) -> None:
                 pass
         ok(not bad, f"NE3 an out-of-domain net-effect parameter fails closed before the sim runs (accepted: {bad})")
     case("NE3", ne3)
+
+    def ne4():
+        # v0.18 (F6 option A, owner 18 Nov, form P): net_deter_sat, the share of a PBO net's extra entry reduction over
+        # a same-x pyrethroid net that it keeps; default 1 = v0.17 (vector.py V38); acts on past campaigns too
+        from toolkit.spec import priors as PR
+        sp = {p.name: p for p in e.parameters()}
+        q = sp.get("net_deter_sat")
+        a = dict(unit.attributes, itn_hist_years=[2017.0])
+        P0 = resolve_params(e, {})
+        pr = PR.load_card(e)["priors"].get("net_deter_sat")
+        h = Horizon(2015.0, 2015.2, (2015.0, 2015.2), {})
+        refused = False
+        try:
+            e.run({"n_agents": 200, "burnin_years": 0, "net_deter_sat": 1.5}, unit, Package("none", {}), h, 1)
+        except ValueError:
+            refused = True
+        ok(tuple(int(x) for x in VERSION.split(".")) >= (0, 18) and q is not None and q.kind == "fixed"
+           and q.value == 1.0 and q.units == "share" and "net_deter_sat" not in POST_FORK
+           and V.NET_DEFAULTS.get("net_deter_sat") == 1.0
+           and e._burnin_key(P0, a) != e._burnin_key(dict(P0, net_deter_sat=0.5), a)
+           and pr is not None and (pr.lo, pr.hi, pr.dist) == (0.0, 1.0, "uniform") and refused,
+           f"NE4 engine v0.18 has net_deter_sat (fixed, share, default 1 = v0.17), in the burn-in key, drawn uniform "
+           f"0-1 on the card, refused outside [0, 1] before the sim runs ({q}, {pr})")
+    case("NE4", ne4)
 
 
 def write_card(path: str) -> None:
