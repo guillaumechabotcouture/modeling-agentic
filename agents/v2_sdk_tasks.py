@@ -88,7 +88,8 @@ comparator and the objective match the question, hidden assumptions, overclaims.
 {file} in the critique-blockers schema: reviewer, round, verdict (PASS | REVISE),
 structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
-first_seen_round, claim, evidence, fix_requires, resolved (true/false), and done_when (required for
+first_seen_round, claim, evidence, fix_requires (when the fix needs the signed decision_spec.yaml changed, start it
+with "Owner amendment:": the owner decides it, no task can), resolved (true/false), and done_when (required for
 HIGH and MEDIUM). Use only those values: the gate refuses any other.
 A blocker with resolved: true also needs resolved_in_round: {round} and resolved_evidence: "<where
 the fix is, file and section>"; keep its done_when (the harness re-runs the test and reopens the
@@ -578,10 +579,15 @@ class SdkTasks:
                                                            evidence=json.dumps(evidence)[:2000] if evidence else "none",
                                                            settings=_settings_text(), out=OUT), "Make the fix.", owns)
 
-    def write(self, run_dir, mode, feedback=None):
+    def write(self, run_dir, mode, feedback=None, findings=None):
         fb = ("\n\nThis is a repair: the report was not accepted, and the harness will not deliver it while it "
               "uses acceptance language. Rewrite these passages (say what was tested and what is declared), "
               "keep everything else:\n- " + "\n- ".join(feedback)) if feedback else ""
+        if findings:     # F6 run 3: the fix loop leaves findings in the report text to the writer
+            fb += ("\n\nOpen findings in the report text (no other task edits it): fix each one in manuscript.md.\n- "
+                   + "\n- ".join(f"{f.get('id')}: {f.get('claim')}" + (f" Required: {f['fix_requires']}"
+                                                                         if f.get("fix_requires") else "")
+                                  for f in findings))
         return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT) + fb, "Write the draft.",
                              OWNS["write"])
 
@@ -835,6 +841,22 @@ def _self_test() -> int:
                 call()
             except Exception as e:  # noqa: BLE001 -- the failure is the finding
                 errors[k] = f"{type(e).__name__}: {e}"
+        # PS1 (F6 run 3): the write-up findings reach the writer's prompt
+        where = {}
+        orig_session = SdkTasks._session
+
+        def at_session(self_, kind, system, prompt, owns, model=None):
+            where[kind] = (self_.run_dir, self_.io_root, self_.allowance, system if kind == "write" else "")
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        SdkTasks._session = at_session
+        try:
+            t2 = SdkTasks(d)
+            t2.set_allowance(1.5)
+            t2.write(d, "declared", findings=[{"id": "R-030", "claim": "overstates", "fix_requires": "say tested"}])
+        finally:
+            SdkTasks._session = orig_session
+        ok("R-030: overstates Required: say tested" in where.get("write", ("", "", 0, ""))[3],
+           "PS1 the writer gets the write-up findings with their remedies")
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")

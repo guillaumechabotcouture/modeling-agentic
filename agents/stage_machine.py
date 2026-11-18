@@ -64,8 +64,8 @@ EDGES = {
     "SCORE": {"CRITIQUE", "FINAL"},
     "CRITIQUE": {"GATE", "WRITE", "FINAL"},
     "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "FINAL"},
-    "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "WRITE", "FINAL"},
-    "OWNER_DECISION": {"GATE", "OWNER_DECISION"},
+    "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "WRITE", "OWNER_DECISION", "FINAL"},
+    "OWNER_DECISION": {"GATE", "OWNER_DECISION", "FINAL"},
     "WRITE": {"PRESENTATION", "GATE", "FINAL"},
     "PRESENTATION": {"GATE", "FINAL"},
     "FINAL": set(),
@@ -78,6 +78,15 @@ CRITICS = ("critique-domain", "critique-redteam")
 PROTECTED_BY_FIX = (AB.SPEC_FILE, AB.SETTINGS_FILE)
 TASK_CAP_USD = 3.0            # one bounded task's allowance, at most what the run has left
 READBACK_CAP_USD = 0.25       # one crash read-back (resume for one tool-less turn), at most what is left
+# F6 run 3: a draft_spec started with a $0.13 allowance failed at once. A paid task is not started below this
+# allowance: the run pauses for the owner (paused:awaiting_budget, resumable with a higher --max-budget-usd).
+MIN_TASK_ALLOWANCE_USD = 0.50
+AWAITING_BUDGET = "awaiting_budget"
+OWNER_REQUEST = "scope_signoff_request.json"   # scripts/scope_signoff.py REQUEST: `show` / `sign` read it
+
+
+class AwaitingBudget(Exception):
+    """Raised by Machine._task when the next paid task's allowance is below MIN_TASK_ALLOWANCE_USD; step() pauses."""
 # Findings whose resolution bears on the primary decision: Phase 49 β's owner rule decides
 # whether they may be declared. Without that rule they are not declarable (fail closed).
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
@@ -937,6 +946,68 @@ def rethink_request(run_dir: str, round_n: int) -> dict:
     return doc
 
 
+OWNER_REQUEST_PRODUCER = "agents/stage_machine.py FIX_LOOP (owner amendments)"
+
+
+def pending_amendments(ledger: dict, resolved=()) -> list[str]:
+    """Findings, open or declared, whose remedy is an owner amendment the owner has not answered (Codex #258 P1-10);
+    not one whose test now passes (`resolved`: the gate's resolved_by_test)."""
+    done = set(map(str, resolved or ()))
+    return sorted(f.id for f in ledger.values() if f.status in ("open", "declared") and f.id not in done
+                  and FX.needs_owner_amendment(f))
+
+
+def drop_declined(run_dir: str, ids) -> None:
+    """A finding the owner declined is not a declared limitation: it leaves declared_findings.yaml (Codex #258)."""
+    import yaml
+    p = os.path.join(run_dir, DECLARED_FILE)
+    try:
+        doc = yaml.safe_load(open(p)) or {}
+    except (OSError, yaml.YAMLError):
+        return
+    if not isinstance(doc, dict) or not isinstance(doc.get("declared"), list):
+        return
+    keep = [x for x in doc["declared"] if not (isinstance(x, dict) and str(x.get("id")) in set(map(str, ids)))]
+    if len(keep) != len(doc["declared"]):
+        _put(run_dir, DECLARED_FILE, yaml.safe_dump(dict(doc, declared=keep), sort_keys=False, width=10**6))
+
+
+def apply_owner_declines(decision: dict, ledger: dict) -> dict:
+    """Codex review of #258 P1-11: a finding the owner declined (the run may not go on without it) holds the gate: a
+    decision that would accept or declare is not accepted instead, with the decline as a non-declarable finding, so the
+    run ends completed_scope_declined (route_gate) once the write-up is gated."""
+    fixed = set(map(str, decision.get("resolved_by_test") or []))     # its test passes: the decline is moot
+    declined = sorted(f.id for f in ledger.values() if f.status == "owner_declined" and f.id not in fixed)
+    if not declined or decision.get("action") not in ("ACCEPT", "DECLARE_SCOPE"):
+        return decision
+    held = [{"kind": "scope_declaration_declined", "finding": fid, "severity": "HIGH", "scope_declarable": False,
+             "claim": f"the owner declined to let the run go on without {fid}"} for fid in declined]
+    return dict(decision, action="RUN_FAILED", rule_matched="owner_declined",
+                unresolved_high=list(decision.get("unresolved_high") or []) + held,
+                rationale=f"the owner declined {', '.join(declined)[:200]}: the run is not accepted or declared")
+
+
+def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list[str]) -> dict:
+    """F6 run 3: the findings whose remedy is an owner amendment of the signed spec, written as a request in
+    scripts/scope_signoff.py's format, so the owner reads it with `scope_signoff.py show` and answers with `sign`
+    (accept: the run goes on without the amendment, declared; decline: the finding stays open, the owner's). Each item's
+    fingerprint binds its claim and remedy."""
+    items = []
+    for fid in ids:
+        f = ledger.get(fid)
+        claim, fix = (f.claim, f.fix_requires) if f is not None else ("", None)
+        fp = FL.answer_fingerprint(fid, claim, fix)       # the ledger binds the owner's answer to it
+        items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix,
+                      "reason": "its required remedy is an owner amendment of the signed decision spec",
+                      "declarations": [], "declared": False, "fingerprint": fp})
+    doc = {"pending": True, "round": round_n, "requested_at": _now(), "items": items, "producer": OWNER_REQUEST_PRODUCER,
+           "decision_rationale": "the fix loop does not change the owner-signed spec: amend and re-sign it, or answer "
+                                 "accept (the run continues without the amendment) or decline"}
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, OWNER_REQUEST, json.dumps(doc, indent=1).encode(), atomic=True)
+    return doc
+
+
 # ------------------------------------------------------------------ the machine
 class Machine:
     def __init__(self, run_dir: str, tasks, state: RunState | None = None, backend=None, log=print,
@@ -1004,7 +1075,7 @@ class Machine:
     def _visit(self) -> int:
         return sum(1 for h in self.st.history if h.get("to") == self.st.state)
 
-    def _task(self, key: str, name: str, *args, writeup: bool = False):
+    def _task(self, key: str, name: str, *args, writeup: bool = False, **kwargs):
         """One paid task through the journal. Returns its TaskResult, or None when the run has no
         allowance left for it (the caller takes the budget path). A completed task is not run
         again (its result is replayed, already charged); a task found started but not completed
@@ -1022,6 +1093,16 @@ class Machine:
         allowance = self._allowance(writeup)
         if allowance is not None and allowance <= 0:
             return None
+        if allowance is not None and allowance < MIN_TASK_ALLOWANCE_USD:
+            self.st.paused, self.st.status = AWAITING_BUDGET, None
+            self.st.history.append({"at": _now(), "paused": AWAITING_BUDGET, "state": self.st.state, "task": name,
+                                    "key": key, "allowance_usd": allowance, "floor_usd": MIN_TASK_ALLOWANCE_USD,
+                                    "spent_usd": round(self.st.spent_usd, 4), "cap_usd": self.st.budget_usd})
+            save_state(self.run_dir, self.st)
+            self.log(f"[machine] {name} not started: its allowance ${allowance:.2f} is below the ${MIN_TASK_ALLOWANCE_USD:.2f} "
+                     f"floor (spent ${self.st.spent_usd:.2f} of ${self.st.budget_usd}). Paused for the owner; resume with "
+                     f"python3 main.py --v2 --resume {self.run_dir} --max-budget-usd <higher cap>")
+            raise AwaitingBudget(name)
         j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance)
         self.st.journal[key] = j
         save_state(self.run_dir, self.st)
@@ -1032,7 +1113,7 @@ class Machine:
             # A crash read-back is a paid call too: a small cap, from what is left after this allowance.
             rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
             setter(a, readback_usd=rb)
-        res = getattr(self.tasks, name)(*args)
+        res = getattr(self.tasks, name)(*args, **kwargs)
         self._charge(res)
         out = res.output
         try:
@@ -1069,9 +1150,9 @@ class Machine:
     def _has_draft(self) -> bool:
         return os.path.exists(os.path.join(self.run_dir, "manuscript.md"))
 
-    def _spec(self) -> dict:
+    def _spec(self, rd: str | None = None) -> dict:
         import yaml
-        return yaml.safe_load(open(os.path.join(self.run_dir, AB.SPEC_FILE))) or {}
+        return yaml.safe_load(open(os.path.join(rd or self.run_dir, AB.SPEC_FILE))) or {}
 
     def harness_findings(self) -> list[dict]:
         out = self.backend.gate_findings(self.run_dir) + spec_signoff_findings(self.run_dir, self.st.signoff, self.backend)
@@ -1097,11 +1178,11 @@ class Machine:
         from toolkit.spec import geometry as GEO
         return GEO.findings(GEO.run(self.run_dir))
 
-    def _geometry_problems(self) -> list[str]:
+    def _geometry_problems(self, rd: str | None = None) -> list[str]:
         """Before SIGN: a HIGH geometry finding not accepted by name in the spec, or a check that failed on its
         declared inputs. Writes data/input_checks.json, which the sign-off sheet reads."""
         from toolkit.spec import geometry as GEO
-        return [f"{p['code']}: {p['claim']}" for p in GEO.problems(GEO.run(self.run_dir))]
+        return [f"{p['code']}: {p['claim']}" for p in GEO.problems(GEO.run(rd or self.run_dir))]
 
     def _geometry_owner_pending(self) -> list[str]:
         """HIGH geometry findings the spec proposes as exceptions and the owner has not approved."""
@@ -1122,19 +1203,20 @@ class Machine:
         else:
             sign(self.run_dir, by, note)
 
-    def _signed_by(self):
-        """Who signed the current spec, or None when it is unsigned or changed since."""
+    def _signed_by(self, rd: str | None = None):
+        """Who signed the current spec (of `rd`, the run dir by default), or None when it is unsigned or changed since."""
+        rd = rd or self.run_dir
         if getattr(self.backend, "sign", None):
-            if self.backend.signoff_status(self.run_dir) != "signed":
+            if self.backend.signoff_status(rd) != "signed":
                 return None
             try:
                 from toolkit.spec import signoff
-                rec = signoff._spec_record(self.run_dir) or {}
+                rec = signoff._spec_record(rd) or {}
             except Exception:  # noqa: BLE001
                 rec = {}
             return rec.get("signed_by") or rec.get("by") or "owner"
-        rec = _signoff(self.run_dir)
-        return rec.get("by") if rec and rec.get("spec_sha256") == signed_hash(self.run_dir) else None
+        rec = _signoff(rd)
+        return rec.get("by") if rec and rec.get("spec_sha256") == signed_hash(rd) else None
 
     def fix_guard(self, run_dir: str) -> list[str]:
         """What a fix task may not do: change decision_spec.yaml (compared with its sign-off, or with
@@ -1169,7 +1251,10 @@ class Machine:
             return self.h_SPEC()                 # the amendment pause costs no model call (Codex review of #261 P1-3)
         if s in LLM_STATES and self._out_of_budget():
             return self._budget_out(s)
-        return getattr(self, "h_" + s)()
+        try:
+            return getattr(self, "h_" + s)()
+        except AwaitingBudget:            # _task recorded the pause; the journal makes the handler safe to re-run
+            return s
 
     def run(self, max_steps: int = 200) -> str:
         if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
@@ -1204,33 +1289,34 @@ class Machine:
         n = self.st.tries.get("spec", 0)
         if n >= MAX_SPEC_TRIES:
             return self._go("FINAL", "the spec did not validate", "run_failed")
-        stage_inputs(self.run_dir, self.st.question)
+        rd = self.run_dir
+        stage_inputs(rd, self.st.question)
         fb = self.st.tries.get("spec_feedback")
         # The key is fixed before the call and the try is counted only once the call returns, so an
         # interrupted draft resumes under the same key (charged once by _settle_interrupted).
-        res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, self.run_dir, fb)
+        res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, rd, fb)
         self.st.tries["spec"] = n + 1
         if res is None:
             return self._budget_out("SPEC")
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         if res.ok:
             try:
-                errs = self._derive() if self.st.derived_inputs else []
-                errs = errs or record_cited_inputs(self.run_dir)       # before anything reads a cited file
+                errs = self._derive(rd) if self.st.derived_inputs else []
+                errs = errs or record_cited_inputs(rd)       # before anything reads a cited file
                 if self.st.derived_inputs:
                     # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the
                     # spike adapter does not know them, so the harness runs them for it.
                     if not errs and not hasattr(self.backend, "candidate_rows"):
                         import pipeline as P
                         errs = [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
-                            self.run_dir, self._spec(), required=True)]
-                    errs = errs or self.backend.pre_sign_problems(self.run_dir, derived=True)
-                    errs = errs or self._geometry_problems()
+                            rd, self._spec(rd), required=True)]
+                    errs = errs or self.backend.pre_sign_problems(rd, derived=True)
+                    errs = errs or self._geometry_problems(rd)
                     if not errs:
-                        self._write_sheet()
+                        self._write_sheet(rd)
                 else:
-                    errs = errs or self.backend.pre_sign_problems(self.run_dir)
-                    errs = errs or self._geometry_problems()
+                    errs = errs or self.backend.pre_sign_problems(rd)
+                    errs = errs or self._geometry_problems(rd)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
         if errs:
@@ -1239,19 +1325,19 @@ class Machine:
         self.st.tries.pop("spec_feedback", None)
         return self._go("SIGN", "spec drafted and valid")
 
-    def _derive(self) -> list[str]:
+    def _derive(self, rd: str | None = None) -> list[str]:
         """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
         to the planner with the script's stderr tail: the planner never needs a shell to learn whether its code
         works."""
         import pipeline as P
-        rep = P.derive(self.run_dir, unsandboxed_ok=self.st.derive_unsandboxed)
+        rep = P.derive(rd or self.run_dir, unsandboxed_ok=self.st.derive_unsandboxed)
         return [f"{p['code']}: {p['claim']}" for p in rep["problems"]]
 
-    def _write_sheet(self) -> None:
+    def _write_sheet(self, rd: str | None = None) -> None:
         """The sign-off sheet, with the source hashes it was made from, published with no link followed (review
         round 3: signoff.write_sheet)."""
         from toolkit.spec import signoff
-        signoff.write_sheet(self.run_dir, getattr(self.backend, "candidates", None))
+        signoff.write_sheet(rd or self.run_dir, getattr(self.backend, "candidates", None))
 
     def h_SIGN(self):
         mode = self.st.signoff
@@ -1426,6 +1512,7 @@ class Machine:
         pw = self.st.post_write
         if self.st.gate_mode == "legacy":
             d = legacy_gate(self.run_dir, self.st.round, self.st.max_rounds, pw)
+            # (owner amendments and declines are v2 rules: the legacy mode replays stored v1 gates and applies neither)
         else:
             sv = getattr(self.backend, "spec_violations", None)
             rv = getattr(self.backend, "registry_violations", None)
@@ -1439,6 +1526,12 @@ class Machine:
                 opened = open_findings(self.run_dir, d)
                 d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget())
                 d = require_judged(d, opened)
+                # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
+                # (synced with this decision, so a gate finding is read as this gate states it: Codex round 3 of #258)
+                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw)[0])
+                if d.get("rule_matched") == "owner_declined":
+                    drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
+                                                 if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
             if d.get("action"):
                 import validate_critique_yaml as V
                 V._append_validator_history(self.run_dir, self.st.round, d, pw)
@@ -1465,6 +1558,15 @@ class Machine:
                     if fid in led:
                         led[fid].blocking = True
                 FL.save(self.run_dir, led)
+            if self.st.v2_rules:
+                led = FL.load(self.run_dir)
+                # Codex review of #258 P1-10: a finding whose remedy is an owner amendment goes to the owner on every
+                # route, not only from the fix loop
+                amend = pending_amendments(led, d.get("resolved_by_test"))
+                if amend:
+                    self._request_owner(led, amend)
+                    return self._go("OWNER_DECISION", f"{len(amend)} finding(s) need an owner amendment "
+                                                      f"({', '.join(amend)[:120]})")
         nxt, status, mode = route_gate(d, pw)
         lang = (d or {}).get("report_acceptance_language") or {}
         if nxt == "FINAL" and lang.get("remaining"):
@@ -1522,17 +1624,60 @@ class Machine:
                            rebuild=self.rebuild, harness_ids=self.harness_ids, headline=self.backend.headline,
                            budget=self._budget, log=self.log, guard=self.fix_guard, protect=PROTECTED_BY_FIX)
         self.st.history.append({"at": _now(), "fix_loop": summ})
+        if summ.get("owner_amendments"):
+            # F6 run 3: their remedy is an owner amendment of the signed spec; the owner answers, no redraft runs.
+            self._request_owner(FL.load(self.run_dir), summ["owner_amendments"])
+            return self._go("OWNER_DECISION", f"{len(summ['owner_amendments'])} finding(s) need an owner amendment "
+                                              f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
             return self._go(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})")
+        if not summ["tasks"] and summ.get("write_up") and self._has_draft():
+            # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
+            if self.st.round_pending:
+                self.st.round += 1
+                self.st.round_pending = False
+            self.st.write_mode = self.st.write_mode or "not_accepted"
+            return self._go("WRITE", f"every open finding is the write-up's ({', '.join(summ['write_up'])[:120]})")
         return self._go("CRITIQUE", f"fix loop: {summ['rows']} task(s), {summ['passed']} passed their checks")
 
+    def _request_owner(self, led: dict, ids: list[str]) -> None:
+        """The request, and the fingerprints it asks, kept in run_state.json: the answers must be to them (Codex
+        re-review of #258 P1-8), whatever request file is there later."""
+        doc = request_owner_amendments(self.run_dir, self.st.round, led, ids)
+        self.st.tries["owner_request"] = [i["fingerprint"] for i in doc["items"]]
+        save_state(self.run_dir, self.st)
+
     def h_OWNER_DECISION(self):
+        """Released only by the owner's own answers to every item of the pending request (scripts/scope_signoff.py sign
+        --by owner, from the owner's shell); the machine, the harness here, then records them (harness_record), so the
+        ledger counts them (Codex review of #258 P1-8). No pending request, an empty one or a lead's answer: it waits."""
+        import scope_signoff as SS
         try:
-            answered = bool((json.load(open(os.path.join(self.run_dir, SCOPE_SIGNOFF))) or {}).get("answers"))
+            req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
         except (OSError, ValueError):
-            answered = False
+            req = None
+        want = list(self.st.tries.get("owner_request") or [])
+        if not want:
+            # a pause with no request this machine recorded (an older run, or a route that records none): it cannot be
+            # answered here, so it fails with how to go on, never waits (lead decision on Codex round 3 of #258); a
+            # report an earlier gate rendered is not delivered under it (Codex round 4)
+            if os.path.lexists(os.path.join(self.run_dir, "report.md")):
+                _quarantine_report(self.run_dir)
+            return self._go("FINAL", "OWNER_DECISION has no recorded owner request: relaunch with reuse (a new run dir "
+                                     "from this one's spec and stored rows)", "run_failed")
+        answers, bad = SS.load_answers(self.run_dir)
+        answered = bool(want) and not bad and all(
+            isinstance(answers.get(fp), dict) and answers[fp].get("by") == "owner"
+            and answers[fp].get("decision") in SS.DECISIONS for fp in want)
         if answered:
-            return self._go("GATE", "the owner answered the scope declarations")
+            SS.harness_record(self.run_dir)
+            self.st.tries.pop("owner_request", None)
+            nxt = self._go("GATE", "the owner answered the scope declarations")    # persisted before the request closes
+            if isinstance(req, dict):
+                from lib.safe_io import write_nofollow
+                write_nofollow(self.run_dir, OWNER_REQUEST, json.dumps(dict(req, pending=False, answered_at=_now()),
+                                                                       indent=1).encode(), atomic=True)
+            return nxt
         self.st.paused = "awaiting_scope_signoff"
         save_state(self.run_dir, self.st)
         return "OWNER_DECISION"
@@ -1540,9 +1685,13 @@ class Machine:
     def h_WRITE(self):
         mode = self.st.write_mode or "not_accepted"
         self._world_model("refresh")
-        fb = self.st.tries.pop("language_feedback", None)      # a language repair (F6 S1-7)
+        fb = self.st.tries.get("language_feedback")             # a language repair (F6 S1-7)
+        # F6 run 3: the write-up findings the fix loop left to this stage, with their remedies
+        wf = [{"id": f.id, "claim": f.claim, "fix_requires": f.fix_requires}
+              for f in FL.open_findings(FL.load(self.run_dir)) if FX.is_write_up(f)]
         res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, *([fb] if fb else []),
-                         writeup=True)
+                         writeup=True, **({"findings": wf} if wf else {}))
+        self.st.tries.pop("language_feedback", None)
         if res is None:
             return self._go("FINAL", "no budget left for the write-up", "completed_no_report")
         if not res.ok or not self._has_draft():
@@ -1878,6 +2027,12 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
     (Machine.reopen_interrupted_analysis)."""
     st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed)
+    if st.paused == AWAITING_BUDGET and budget_usd and budget_usd > (st.budget_usd or 0):
+        # the owner resumes a run paused below the allowance floor with a higher cap: recorded, never lowered
+        st.history.append({"at": _now(), "budget_raised": {"from": st.budget_usd, "to": budget_usd},
+                           "spent_usd": round(st.spent_usd, 4)})
+        st.budget_usd = budget_usd
+        save_state(run_dir, st)
     m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
     m.reopen_interrupted_analysis()
     return m.run()
@@ -2136,6 +2291,113 @@ def _self_test() -> int:
         save_state(d, st5)
         s5 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
         ok(s5 == "paused:awaiting_spec_amendment", f"R3-2d with no budget left the amendment pause still holds ({s5})")
+
+        # R3-1 (F6 run 3): a write-up finding is never a FIX_LOOP task; the writer gets it with the draft.
+        wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}
+        d, T, st = new_run("writeup", {"critics": {1: {"critique-redteam": [wup]}}}, max_rounds=2)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        p = [h["to"] for h in load_state(d).history if "to" in h]
+        got = getattr(T, "write_findings", None) or []
+        ok("FIX_LOOP" in p and not any(c.startswith("fix:") for c in T.calls)
+           and any(f.get("id") == "R-030" for f in got),
+           f"R3-1 a write-up finding goes to the writer, not to a FIX_LOOP task ({s}, {T.calls}, {got})")
+
+        # R3-3 (F6 run 3): a finding whose remedy is an owner amendment goes to OWNER_DECISION, never a SPEC rethink.
+        amend = {"id": "D-031", "severity": "HIGH", "target_stage": "PLAN", "claim": "the comparator omits the funded plan",
+                 "fix_requires": "Owner amendment: add the funded plan as the comparator."}
+        d, T, st = new_run("amend", {"critics": {1: {"critique-domain": [amend]}},
+                                     "plan": lambda pk: {"tasks": [{"id": "T1", "findings": [f["id"] for f in
+                                                                                                pk["findings"]][:1] or ["x"],
+                                                                    "action": "rethink", "owner_state": "SPEC",
+                                                                    "brief": "redraft the comparator"}]
+                                                         if pk["findings"] else {"tasks": []}}}, max_rounds=3)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        p = [h["to"] for h in load_state(d).history if "to" in h]
+        try:
+            req = json.load(open(os.path.join(d, "scope_signoff_request.json")))
+        except (OSError, ValueError):
+            req = {}
+        ok(s == "paused:awaiting_scope_signoff" and load_state(d).state == "OWNER_DECISION"
+           and "SPEC" not in p and not any(c.startswith("fix:") for c in T.calls)
+           and req.get("pending") and [i.get("finding") for i in req.get("items") or []] == ["D-031"],
+           f"R3-3 an owner-amendment finding pauses at OWNER_DECISION with a request, no redraft ({s}, {p[-4:]})")
+        if req.get("pending"):
+            import scope_signoff as _SS
+            # Codex re-review of #258 P1-8: the request the machine made is what must be answered, not whatever request
+            # file is there now
+            good_req = open(os.path.join(d, "scope_signoff_request.json")).read()
+            json.dump(dict(req, items=[dict(req["items"][0], fingerprint="stale0000000000")]),
+                      open(os.path.join(d, "scope_signoff_request.json"), "w"))
+            _SS.sign(d, "owner", all_decision="accept", note="stale")
+            open(os.path.join(d, "scope_signoff_request.json"), "w").write(good_req)
+            s_st = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            ok(s_st == "paused:awaiting_scope_signoff",
+               f"R3-3d an answer to a request the machine did not make does not release OWNER_DECISION ({s_st})")
+            _SS.sign(d, "lead", all_decision="accept", note="R3-3c")     # Codex review of #258 P1-8: not the owner's
+            s_l = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            ok(s_l == "paused:awaiting_scope_signoff",
+               f"R3-3c an answer that is not the owner's does not release OWNER_DECISION ({s_l})")
+            _SS.sign(d, "owner", all_decision="decline", note="R3-3")
+            s2 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            p2 = [h["to"] for h in load_state(d).history if "to" in h]
+            ok(s2 == "completed_scope_declined" and "SPEC" not in p2 and FL.load(d)["D-031"].status == "owner_declined"
+               and "`completed_scope_declined`" in open(os.path.join(d, "report.md")).read(),
+               f"R3-3b the owner's decline resumes the run, is not redrafted, and constrains the gate: the run is not "
+               f"declared or accepted (Codex review of #258 P1-11) ({s2}, {p2[-5:]})")
+        # R3-6 (Codex re-review of #258): a declared finding still needs the owner's answer (P1-10), and a decline of a
+        # finding its test has since resolved does not hold the gate (new P1-2)
+        f6d = FL.Finding(id="D-036", kind="critique_blocker", severity="HIGH", source="critique-domain", status="declared",
+                         fix_requires="Owner amendment: x")
+        f6x = FL.Finding(id="D-037", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                         status="owner_declined", resolution_type="owner_decision")
+        ok(pending_amendments({"D-036": f6d}) == ["D-036"]
+           and apply_owner_declines({"action": "ACCEPT", "resolved_by_test": ["D-037"]}, {"D-037": f6x})["action"]
+           == "ACCEPT" and apply_owner_declines({"action": "ACCEPT"}, {"D-037": f6x})["action"] == "RUN_FAILED",
+           "R3-6 a declared amendment is asked; a declined finding its test resolved does not hold the gate")
+        # R3-7 (Codex round 3 of #258): a declared amendment whose test passed is not asked (5); a declined finding
+        # leaves declared_findings.yaml (1); a pause with no recorded request fails loudly, never waits (2)
+        ok(pending_amendments({"D-036": f6d}, resolved=["D-036"]) == [],
+           "R3-7a a declared amendment whose test passes is not sent to the owner")
+        import yaml as _y7
+        d7 = os.path.join(td, "r37")
+        os.makedirs(d7)
+        _y7.safe_dump({"rule": "3m", "declared": [{"id": "D-037"}, {"id": "D-038"}]},
+                      open(os.path.join(d7, DECLARED_FILE), "w"))
+        drop_declined(d7, ["D-037"])
+        ok([x["id"] for x in _y7.safe_load(open(os.path.join(d7, DECLARED_FILE)))["declared"]] == ["D-038"],
+           "R3-7b a finding the owner declined is no longer listed as declared")
+        d, T, st = new_run("noreq", {})
+        st.state = "OWNER_DECISION"
+        save_state(d, st)
+        _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False).step()   # the handler itself
+        s7 = load_state(d).status
+        ok(s7 == "run_failed" and "relaunch with reuse" in str(load_state(d).history[-1].get("why")),
+           f"R3-7c a pause at OWNER_DECISION with no recorded request fails with how to go on ({s7})")
+        # R3-5 (Codex review of #258 P1-10): the amendment check runs on every gate route: a structural PLAN blocker
+        # whose remedy is an owner amendment does not take GATE -> SPEC
+        amend5 = dict(amend, id="D-035", category="STRUCTURAL")
+        d, T, st = new_run("amend5", {"critics": {1: {"critique-domain": [amend5]}}, "structural": {1: "critique-domain"}})
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        p = [h["to"] for h in load_state(d).history if "to" in h]
+        ok(s == "paused:awaiting_scope_signoff" and "SPEC" not in p and p[-1] == "OWNER_DECISION",
+           f"R3-5 a structural blocker that needs an owner amendment goes to the owner, not to SPEC ({s}, {p[-3:]})")
+
+        # R3-4 (F6 run 3): a paid task whose allowance is below the floor is not started: the run pauses for the owner
+        # (resumable), and a resume with a higher cap continues.
+        d, T, st = new_run("floor", {}, budget=20.0)
+        st.spent_usd = 20.0 - 10.0 - 0.13            # cap less the write-up reserve ($10) leaves $0.13
+        save_state(d, st)
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s == "paused:awaiting_budget" and T.calls == [] and load_state(d).state == "SPEC"
+           and load_state(d).status is None,
+           f"R3-4 a $0.13 allowance starts no task; the run pauses awaiting budget ({s}, {T.calls}, {T.allowances})")
+        T2 = StubTasks(T.s)
+        s2 = run_v2("toy question", d, T2, signoff="none", budget_usd=60.0, log=lambda *a: None,
+                    backend=spike, cross_engine_check=False)
+        ok(not s2.startswith("paused") and "draft_spec" in T2.calls
+           and load_state(d).budget_usd == 60.0
+           and any(h.get("budget_raised") for h in load_state(d).history),
+           f"R3-4b resumed with a higher cap, the run continues ({s2}, cap {load_state(d).budget_usd})")
 
         # T29: the deliverable destination must be a plain file inside the run, not one the harness owns.
         bad_paths = {}
