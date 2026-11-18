@@ -5614,7 +5614,31 @@ def _self_test_p35(ok) -> None:
 
 
 RUNNING, FINISHED, DIED, NO_JOB = "running", "finished", "died", "no detached job"
-_STATUS_EXIT = {FINISHED: 0, RUNNING: 3, DIED: 4, NO_JOB: 4}
+COPIED = "copied"         # F6 run 3: the records were copied from another machine; they describe a process there
+_STATUS_EXIT = {FINISHED: 0, RUNNING: 3, DIED: 4, NO_JOB: 4, COPIED: 4}
+
+
+def _copied_why(out: str, job: dict) -> tuple[str | None, dict | None]:
+    """Why the job record at `out` describes a process on another machine, or (None, None): the copy marker lists it
+    unchanged (scripts/lib/copied_run.py), its host is not this one, or (a record with neither host nor start token)
+    nothing of the batch was written for PROGRESS_STALE_S."""
+    try:
+        from lib import copied_run
+        ce = copied_run.copied_entry(out + JOB_EXT)
+    except Exception:  # noqa: BLE001 -- no marker reading: the other rules still apply
+        ce = None
+    if ce:
+        return f"copied from {ce.get('source')} (captured {ce.get('captured_at') or 'at an unknown time'})", ce
+    host = job.get("host")
+    if host and host != os.uname().nodename:
+        return f"the job record was written on {host}, not on this host", None
+    if not host and not job.get("pid_start"):
+        ts = [os.path.getmtime(p) for p in (out + PARTIAL_EXT, out + JOB_EXT, str(job.get("log") or ""))
+              if p and os.path.exists(p)]
+        if ts and time.time() - max(ts) > PROGRESS_STALE_S:
+            return (f"the record names no host or start token and nothing of the batch was written for "
+                    f"{int(time.time() - max(ts))} s"), None
+    return None, None
 
 
 def job_status(out: str) -> dict:
@@ -5628,6 +5652,18 @@ def job_status(out: str) -> dict:
     except (OSError, ValueError, KeyError, TypeError) as e:
         return {"state": NO_JOB, "out": out, "error": f"{out + JOB_EXT}: {type(e).__name__}"}
     st = {"out": out, "pid": pid, "n": job.get("n"), "elapsed_s": round(time.time() - t0, 1), "log": job.get("log")}
+    why, ce = _copied_why(out, job)
+    if why is not None:
+        try:
+            fresh = os.path.getmtime(out + ".summary.json") >= t0 - 1
+            summ = json.load(open(out + ".summary.json")) if fresh else None
+        except (OSError, ValueError):
+            summ = None
+        if isinstance(summ, dict):
+            return {"state": FINISHED, **st, "summary": {k: v for k, v in summ.items() if k not in ("bundle", "chunks")}}
+        return {"state": COPIED, **st, "why": why, **({"copied": ce} if ce else {}),
+                "next": "these records describe a batch on the machine the run was copied from; nothing runs here. "
+                        "On a resume, the same map command reuses its finished rows"}
     if _pid_alive(pid, job.get("pid_start")):
         rows = 0
         try:
@@ -5688,7 +5724,8 @@ def _detach_locked(argv, out, n, subprocess, run_dir) -> int:
     with lf:
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
                              stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
-    job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "started": t0, "n": n, "log": log, "argv": argv}
+    job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "host": os.uname().nodename, "started": t0, "n": n,
+           "log": log, "argv": argv}
     publish(out + JOB_EXT, json.dumps(job, indent=1), run_dir)
     print(json.dumps({"detached": True, "pid": p.pid, "out": out, "log": log,
                       "next": f"python3 scripts/compute.py wait {out} --timeout-s 540  "
@@ -5740,7 +5777,7 @@ def main() -> int:
             ap.error(f"usage: compute.py {a.cmd} <out.jsonl> [--timeout-s S]")
         end = time.time() + (a.timeout_s if a.timeout_s is not None else 540)
         st = job_status(a.run_dir)
-        while a.cmd == "wait" and st["state"] == RUNNING and time.time() < end:
+        while a.cmd == "wait" and st["state"] == RUNNING and time.time() < end:  # COPIED: nothing to wait for
             time.sleep(min(5.0, max(0.1, end - time.time())))
             st = job_status(a.run_dir)
         print(json.dumps(st))

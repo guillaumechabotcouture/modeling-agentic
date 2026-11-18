@@ -1587,6 +1587,10 @@ def fetch_checkpoint(cfg, store, label) -> dict:
         with tarfile.open(tgz, mode="r:gz") as t:
             t.extractall(dest, filter="data")
         json.dump(rec, open(os.path.join(dest, "checkpoint.json"), "w"), indent=1)
+        import copied_run       # F6 run 3: its batch records describe the VM's process, not one running here
+        if rec.get("run_dir") and os.path.isdir(os.path.join(dest, "runs", str(rec["run_dir"]))):
+            copied_run.mark(os.path.join(dest, "runs", str(rec["run_dir"])),
+                            f"run_cluster checkpoint {label} generation {g}", rec.get("time_utc"))
         note = "" if g == ptr.get("generation") else f" (the previous generation: {'; '.join(why)})"
         print(f"{label}: checkpoint generation {g} of {rec.get('time_utc')} (state {rec.get('run_state')}, "
               f"{rec.get('cached_batches')} cached batches, {rec.get('bytes')} bytes, sha256 verified){note} -> "
