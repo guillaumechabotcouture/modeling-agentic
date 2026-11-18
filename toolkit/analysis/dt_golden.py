@@ -660,7 +660,70 @@ def _self_test() -> int:
         ok(g0 == g1 and any(c is False and "refused" in m for c, m in seen),
            f"DG15 (P2-7) update mode refuses to rewrite the golden file after a failed case ({seen})")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg7, dg8, dg9, dg10, dg11, dg12, dg13, dg14, dg15):
+    # ------------------------------------------------ Codex review r2 of #262 (written first; each failed)
+    def dg16():
+        from toolkit.spec import schema
+        run1 = {"test_id": "DT1", "path": "models/decision_tests/DT1.yaml", "status": "run", "verdict": "NO_CHANGE"}
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as w, \
+                tempfile.TemporaryDirectory() as side:
+            schema.toy_spec(d)
+            fixture(side, [], {})
+            os.symlink(os.path.join(side, "analysis"), os.path.join(d, "analysis"))
+            ok(_raises(lambda: retro(d, os.path.join(w, "k"), unsigned=True, log=lambda *a: None,
+                                     runner=lambda *a, **k: None))
+               and os.path.isfile(os.path.join(side, "analysis", "decision_tests.yaml")),
+               "DG16 (r2 P1-1) a run whose decision-test outputs sit under a link is refused; nothing outside is removed")
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "Run"))
+            alias = os.path.join(d, "run")
+            if os.path.exists(alias):          # a case-insensitive volume: another spelling of the same directory
+                ok(_inside(os.path.join(alias, "x"), os.path.join(d, "Run")),
+                   "DG16b (r2 P1-2) a path inside the run dir by another letter case is inside")
+            open(os.path.join(d, "Run", "f"), "w").write("keep")
+            os.link(os.path.join(d, "Run", "f"), os.path.join(d, "hard.json"))
+            ok(_raises(lambda: write_out(os.path.join(d, "hard.json"), "{}", os.path.join(d, "Run")))
+               and open(os.path.join(d, "Run", "f")).read() == "keep",
+               "DG16c (r2 P1-2) an output hard-linked to a file elsewhere is refused (never truncated)")
+        with tempfile.TemporaryDirectory() as d:
+            fixture(d, [dict(run1, test_id="../x", path="models/decision_tests/../x.yaml")], {})
+            yaml.safe_dump(_rec(test_id="../x"), open(os.path.join(d, "models", "x.yaml"), "w"))
+            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG16d (r2 P1-3) a test id with path parts is refused")
+            fixture(d, [dict(run1, test_id=7, path="models/decision_tests/7.yaml")], {"7.yaml": _rec(test_id=7)})
+            ok(set(digest_dir(d)) == {"7"}, "DG16e (r2 P2-1) an integer test id, as run_all writes it, is read")
+            fixture(d, [dict(run1, verdict="NOT_RUN")], {"DT1.yaml": _rec()})
+            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG16f (r2 P2-2) a verdict contradicting its result")
+            fixture(d, [run1], {"DT1.yaml": ["a"]})
+            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG16g (r2 P3) a result that is not a mapping")
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as w:
+            schema.toy_spec(d)
+            os.makedirs(os.path.join(d, "analysis", "decision_tests.yaml"))
+            ok(_raises(lambda: retro(d, os.path.join(w, "k"), unsigned=True, log=lambda *a: None,
+                                     runner=lambda *a, **k: None)),
+               "DG16h (r2 P1-4) a summary that is not a regular file is refused, never read as absent")
+        e = {"A": {"decision": "1", "detail": "2", "words": "3", "plans": "4"}, "B": {"decision": "1"}}
+        g = {"A": {"decision": "1", "detail": "2", "words": "3", "plans": "5"}, "B": {"decision": "1", "plans": "6"}}
+        ok(compare(e, g, parts="expected") == ["A: plans differs"],
+           "DG16i (r2 P1-5) stored records are compared on the parts they hold, plans included when present")
+        w_ = lambda lab: _rec(worst_by_criterion={"share": {"value": lab}})  # noqa: E731
+        ok(digest(w_(0.5))["detail"] != digest(w_(0.8))["detail"], "DG16j (r2 P2-3) the worst case's label is detail")
+        ok(canon("north/a/site") != canon("north/b/site") and canon("(/tmp/a/p.yaml)") == "(p.yaml)",
+           f"DG16k (r2 P2-4) only absolute paths are shortened ({canon('north/a/site')})")
+        import threading
+        ok(isinstance(no_engine_jobs._lock, type(threading.Lock())), "DG16l (r2 P2-5) the guard holds a process lock")
+        seen = []
+        _CAP.update(on=True, paused=False, orig=lambda *a, **k: None, recs={}, counts={}, problems=[])
+        from toolkit.analysis import decision_tests as DTm
+        saved, g0 = DTm.run_one, open(GOLDEN).read() if os.path.exists(GOLDEN) else None
+        try:
+            os.environ[UPDATE_ENV] = "1"
+            check_capture(lambda c, m: seen.append((c, m)))
+        finally:
+            os.environ.pop(UPDATE_ENV, None)
+            DTm.run_one = saved
+        ok(g0 == (open(GOLDEN).read() if os.path.exists(GOLDEN) else None),
+           "DG16m (r2 P2-6) an empty capture never overwrites the golden file")
+
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg7, dg8, dg9, dg10, dg11, dg12, dg13, dg14, dg15, dg16):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
