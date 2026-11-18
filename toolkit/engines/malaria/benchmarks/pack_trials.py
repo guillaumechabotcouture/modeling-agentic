@@ -94,6 +94,15 @@ def _self_test() -> int:
            f"PT0 or_contrast: equal ORs give 1 with sqrt(2) times each log half-width ({t}, {lo}, {hi})")
     case("PT0", pt0)
 
+    def pt0b():
+        # Codex r1 P1-2 on #266: two ORs against one shared control are positively correlated; with equal per-arm
+        # variances the control contributes half of each OR's variance, so the contrast's variance is (v1 + v2) / 2
+        a = {"target": 0.5, "lower": 0.25, "upper": 1.0}
+        t, lo, hi = or_contrast(a, a, shared_control=True)
+        ok(t == 1.0 and abs(math.log(hi) - math.log(2)) < 0.01 and abs(math.log(lo) + math.log(2)) < 0.01,
+           f"PT0b or_contrast with a shared control: equal ORs give 1 with each OR's own log half-width ({lo}, {hi})")
+    case("PT0b", pt0b)
+
     def pt1():
         for i, (w, t, lo, hi) in LLINEUP.items():
             b = by.get(i)
@@ -110,6 +119,18 @@ def _self_test() -> int:
                and "2-10" in b.get("age_band", ""),
                f"PT1 {i}: a prevalence ratio (engine ratio, source risk_ratio) by microscopy at ages 2-10 in window {w}")
     case("PT1", pt1)
+
+    def pt1b():
+        # Codex r1 P1-1 on #266: LLINEUP's "2-10 years" includes ten-year-olds; the engine's pfpr_2_10 is 2 <= age < 10
+        from toolkit.engines.malaria import model as M
+        lo, hi = M.PFPR_BANDS["pfpr_2_10"]
+        for i in LLINEUP:
+            m = (by.get(i) or {}).get("estimand_mapping") or ""
+            ok((lo, hi) == (2.0, 10.0) and all(w in m for w in ("ten-year-olds", "2 <= age < 10", "calibrat"))
+               and "inclusive" in (by.get(i) or {}).get("age_band", ""),
+               f"PT1b {i}: the engine observable (ages [{lo}, {hi})) leaves out the trial's ten-year-olds, and the pack "
+               f"records that mapping, for the arms and the calibration ({m[:60]!r})")
+    case("PT1b", pt1b)
 
     def pt2():
         s = pack["settings"].get("llineup") or {}
@@ -144,12 +165,14 @@ def _self_test() -> int:
         b = by.get("B9g") or {}
         o = b.get("band_override") or {}
         t, lo, hi = or_contrast({"target": by["B10"]["target"], **{k: by["B10"]["published"][k] for k in ("lower", "upper")}},
-                                {"target": by["B9c"]["target"], **{k: by["B9c"]["published"][k] for k in ("lower", "upper")}})
+                                {"target": by["B9c"]["target"], **{k: by["B9c"]["published"][k] for k in ("lower", "upper")}},
+                                shared_control=True)
         ok(b.get("estimand") == {"type": "odds_ratio", "num": "mis_dual", "den": "mis_pbo", "value": "windows.m24.pfpr_6m14y"}
            and b.get("estimand_type") == "odds_ratio" and "published" not in b,
            "PT3 B9g is the Misungwi dual-AI vs PBO odds ratio at 24 months on the existing arms, with no published interval")
         ok(b.get("target") == t and b.get("band") == [lo, hi] and o.get("band") == [lo, hi] and o.get("level") == 0.95
-           and all(w in o.get("reason", "") for w in ("B10", "B9c", "delta", "independent", "derived")),
+           and all(w in o.get("reason", "") for w in ("B10", "B9c", "delta", "shared", "adjusted", "derived"))
+           and "independent" not in o.get("reason", ""),
            f"PT3 B9g's band is the derived delta-method interval of B10 / B9c ({t}, [{lo}, {hi}]; pack "
            f"{b.get('target')}, {b.get('band')}), recorded as a band_override with its level and reason")
     case("PT3", pt3)
@@ -162,12 +185,17 @@ def _self_test() -> int:
     case("PT4", pt4)
 
     def pt5():
+        # Codex r1 P2-4 on #266: each new row names the engine parameters carrying its effect (departure path)
         from toolkit.engines import benchmark_coverage as BC
+        from toolkit.engines.malaria import engine as E
         cov, probs = BC.load(os.path.join(os.path.dirname(HERE), BC.FILE))
         ent = (cov or {}).get("benchmarks") or {}
         ok(not probs and set(ent) == set(by)
            and all(ent.get(i, {}).get("covers") == {"net": ["pbo"]} for i in LLINEUP)
-           and ent.get("B9g", {}).get("covers") == {"net": ["dual"]} and ent["B9g"].get("versus") == {"net": "pbo"},
+           and ent.get("B9g", {}).get("covers") == {"net": ["dual"]} and ent["B9g"].get("versus") == {"net": "pbo"}
+           and all({"pbo_gain_scale", "pbo_adv_decay"} <= set(BC.effect_parameters(ent.get(i), "0.17")) for i in LLINEUP)
+           and {"cfp_kill", "cfp_half", "pbo_gain_scale"} <= set(BC.effect_parameters(ent.get("B9g"), "0.17"))
+           and not BC._param_problems(cov, E.VERSION, {x.name for x in E.MalariaEngine().parameters()}),
            f"PT5 the coverage file maps exactly the pack's ids; B9d-B9f cover PBO nets, B9g dual-AI nets against PBO "
            f"({probs})")
     case("PT5", pt5)
@@ -186,7 +214,8 @@ def _self_test() -> int:
                and not any(f"rerun required: {i}" in str(why) for i in missing),
                f"PT6 a pack benchmark with no stored row refuses the record as not yet run ({missing}: {why})")
         else:
-            ok(True, "PT6 every pack benchmark has a stored row")
+            ok(not any("not yet run" in str(x) for x in [why]),
+               f"PT6 every pack benchmark has a stored row, and the record names none as not yet run ({why})")
     case("PT6", pt6)
 
     if fails:

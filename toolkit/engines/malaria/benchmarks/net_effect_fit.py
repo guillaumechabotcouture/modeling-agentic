@@ -1665,7 +1665,15 @@ def _self_test() -> int:
                     got[label] = str(ex)
                 finally:
                     PACK = orig
-        ok(got.get("held") == "" and "declarations" in got.get("train", ""),
+        # Codex r1 P2-3 on #266: the check binds the pack the runner executes (build_pack's), not only the base
+        eff = build_pack(base)
+        eff["settings"]["misungwi"]["params"]["n_agents"] = 999
+        try:
+            load_wave1(WAVE1, e, base, pack=eff)
+            got["effective"] = ""
+        except (ValueError, TypeError) as ex:
+            got["effective"] = str(ex)
+        ok(got.get("held") == "" and "declarations" in got.get("train", "") and "declarations" in got["effective"],
            f"F19c wave 1 stays reusable when the pack gains a held-out benchmark and setting, and is refused when a "
            f"training target's declaration changes ({got})")
     case("F19c", f19c)
