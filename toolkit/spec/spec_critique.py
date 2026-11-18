@@ -393,6 +393,65 @@ def _self_test() -> int:
         ok(good, "SC21 the sheet section lists the findings" + ("" if good else f":\n{md}"))
     ok(sev(findings({"decision_date": 2026}, today=T), "baseline_burden") == ["HIGH"],
        "SC22 a sparse spec still gets every check (fail closed)")
+    # Codex review of #254 (1 P1, P2s), reproduced before the fix
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "ev.yaml"), "w").write("inputs:\n  'parameter:k': {no_data: {reason: r}, chosen: {value: 1}}\n")
+        shown = b"inputs:\n  'parameter:k': {no_data: {reason: r}, chosen: {value: 9876}}\n"
+        md = "\n".join(sheet_lines(spec(evidence={"dossier": "ev.yaml"}), d, T, dossier_bytes=shown))
+        ok("9876" in md and "= 1;" not in md and "= 1." not in md,
+           "SC23 (P1) the critique reads the dossier bytes the sheet binds, not the file again")
+        fs = findings(spec(evidence={"dossier": "missing.yaml"}), run_dir=d, today=T)
+        ok(any(f["severity"] == "HIGH" and "dossier" in f["text"] for f in fs if f["check"] == "decision_input_ranges"),
+           f"SC24 a named dossier that cannot be read is HIGH, not silence: {fs}")
+    try:
+        md = "\n".join(sheet_lines(spec(principle_departures=[{"check": []}]), None, T))
+        ok("principle_departures[0] is malformed" in md, "SC25 a departure with an unhashable check is a finding")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"SC25 a malformed departure must not stop the sheet: {type(e).__name__}: {e}")
+    r = spec(engine_parameters="bad", principle_departures=[
+        {"principle": 6, "check": "decision_input_ranges", "reason": "declared"}])
+    fs = [f for f in findings(r, today=T) if "could not run" in f["text"]]
+    ok(fs and all(f["severity"] == "HIGH" for f in fs), f"SC26 a departure never hides a check that failed: {fs}")
+    r = spec(comparator={"package": "none"})
+    r["options"]["packages"] = {"generate": True, "none": ["c1"]}
+    ok(sev(findings(r, today=T), "headline_comparator") == ["HIGH"],
+       "SC27 the comparator is resolved as execution resolves packages (generated `none` is empty)")
+    ok(sev(findings(spec(comparator={"package": "nope"}), today=T), "headline_comparator") == ["HIGH"],
+       "SC28 an unknown comparator package is HIGH")
+    r = spec()
+    r["analysis"]["decision_tests"] = [{"id": "BS", "type": "burden_scale"}]
+    ok(sev(findings(r, today=T), "baseline_burden") == ["HIGH"],
+       "SC29 a burden_scale test with no references and no validation.burden is not credited")
+    r = spec(deliverable={"kind": "estimates"})
+    ok(sev(findings(r, today=T), "baseline_burden") == ["INFO"] and sev(findings(spec(
+        deliverable={"kind": "estimates"}, comparator={"package": "none"}), today=T), "headline_comparator") == ["INFO"],
+       "SC30 an estimates deliverable (no allocation, no comparator) is not judged on them")
+    ok(sev(findings(spec(decision_date="2028-01-01", objective={"delivery": [2027.0, 2029.0]}), today=T),
+           "decision_date") == ["HIGH"], "SC31 delivery starting before the decision date is HIGH")
+    ok(sev(findings(spec(decision_date=2026, objective={"horizon": [0.0, 3.0]}), today=T), "decision_date") == [],
+       "SC32 a model-year window (not calendar years) is not compared with today")
+    ok(sev(findings(spec(objective={"delivery": [2026.8, 2028.0]}), today=T), "decision_date") == ["HIGH"],
+       "SC33 a delivery window that has already begun is HIGH (no grace)")
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "ev.yaml"), "w").write("inputs:\n  'parameter:k': {no_data: {reason: r}, chosen: {value: 1}}\n"
+                                                    "  'unit_attribute:b': {no_data: {reason: r}, chosen: {value: 1}}\n")
+        r = spec(evidence={"dossier": "ev.yaml"}, decision_units={"engine_attributes": {"b": {"columns": {"x": "inc"}}}})
+        r["uncertainty"]["priors"] = {"k": {"dist": "uniform", "range": [0, 2], "source": "s"}}
+        r["uncertainty"]["excluded"] = [{"kind": "priors", "reason": "not drawn"}]
+        r["analysis"]["decision_tests"] = [{"id": "U", "type": "unit_attribute", "unit_attribute": {"column": "inc"}}]
+        hi = " ".join(f["text"] for f in findings(r, run_dir=d, today=T) if f["severity"] == "HIGH")
+        ok("parameter:k" in hi and "unit_attribute:b" not in hi,
+           f"SC34 excluded priors are not drawn; a unit_attribute test reaches an attribute bound by columns: {hi}")
+    r = spec()
+    r["uncertainty"] = {"sources": [{"kind": "costs", "items": {"k1": [0.8, 1.2]}}]}
+    r["analysis"]["decision_tests"] = [{"id": "P", "type": "cost_items", "multipliers": {"k2": 1.0}}]
+    ok(sev(findings(r, today=T), "decision_input_ranges") == ["MEDIUM"], "SC35 a price test at multiplier 1 varies nothing")
+    r = spec(comparator={"package": "none"})
+    r["analysis"]["plan_variants"] = {"variants": [{"id": "alt", "type": "fixed_plan", "column": "a"},
+                                                   {"id": "funded", "type": "fixed_plan", "column": "b"}]}
+    t = [f["text"] for f in findings(r, today=T) if f["check"] == "headline_comparator"][0]
+    ok("which" in t and "alt" in t and "funded" in t, f"SC36 (P3) the fixed plans are named; the owner says which is "
+                                                     f"funded: {t}")
     print(f"{'FAIL' if fails else 'OK'}: " + (f"{len(fails)} case(s) failed" if fails else
                                                "all self-test cases passed."))
     return 1 if fails else 0
