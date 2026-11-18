@@ -31,6 +31,14 @@ benchmarks:
         note: "PBO vs pyrethroid nets at 21 months (Protopopoff 2018)"}
   B9c: {covers: {net: [pbo]}, estimand: durability, versus: {net: pyr},
         note: "PBO vs pyrethroid nets at 24 months (Mosha 2022, Misungwi)"}
+  B9d: {covers: {net: [pbo]}, estimand: effect_vs_component, versus: {net: pyr},
+        note: "PBO vs non-PBO nets, prevalence ratio at 6 months (Staedke 2020, LLINEUP)"}
+  B9e: {covers: {net: [pbo]}, estimand: durability, versus: {net: pyr},
+        note: "PBO vs non-PBO nets, prevalence ratio at 12 months (Staedke 2020, LLINEUP)"}
+  B9f: {covers: {net: [pbo]}, estimand: durability, versus: {net: pyr},
+        note: "PBO vs non-PBO nets, prevalence ratio at 18 months (Staedke 2020, LLINEUP)"}
+  B9g: {covers: {net: [dual]}, estimand: effect_vs_component, versus: {net: pbo},
+        note: "Dual-AI vs PBO nets, prevalence OR at 24 months (Mosha 2022, Misungwi; derived from B10 and B9c)"}
   B10: {covers: {net: [dual]}, estimand: effect_vs_component, versus: {net: pyr},
         note: "Dual-AI vs pyrethroid nets, prevalence at 24 months (Mosha 2022)"}
   B11: {covers: {net: [dual]}, estimand: effect_vs_component, versus: {net: pyr},

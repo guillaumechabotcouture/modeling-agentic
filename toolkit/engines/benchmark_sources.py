@@ -422,8 +422,8 @@ def load_evidence(engine, pack: dict | None = None, rows: list | None = None, pa
     engine's own pack; its absence is permitted only for an engine with no rows to check and no fitted values to back;
     an unreadable pack is always a problem). `rows`: stored result rows to validate (None: fitted values only); they
     must cover every benchmark of the pack unless `partial`. Problems: a pack that cannot be read, is not a non-empty
-    benchmark list or fails the source check; missing rows and rows scored against other declarations ('rerun
-    required'); fitted values without current provenance ('refit required'). Only an exact self-test toy may have
+    benchmark list or fails the source check; rows scored against other declarations ('rerun required'); pack
+    benchmarks with no stored row ('not yet run'); fitted values without current provenance ('refit required'). Only an exact self-test toy may have
     no pack."""
     from toolkit.engines.contract import engine_identity
     ref = f"{type(engine).__module__}:{type(engine).__name__}"
@@ -452,9 +452,12 @@ def load_evidence(engine, pack: dict | None = None, rows: list | None = None, pa
             probs.append("the stored rows are not a list of mappings with ids")
             rows = []
         ids = [b.get("id") for b in (pack or {}).get("benchmarks") or [] if isinstance(b, dict)]
-        stale = stale_ids(pack or {}, rows) + ([] if partial else [i for i in ids if i not in {r["id"] for r in rows}])
+        stale = stale_ids(pack or {}, rows)
+        unrun = [] if partial else [i for i in ids if i not in {r["id"] for r in rows}]
         if stale:
             probs.append(f"rerun required: {', '.join(str(x) for x in stale)}")
+        if unrun:               # a benchmark the stored rows never scored (e.g. added to the pack since): fail closed
+            probs.append(f"not yet run: {', '.join(str(x) for x in unrun)} (in the pack, no stored row; run the pack)")
     fitted, fsha, fprobs, fdoc = _fitted_in_use(engine, pack, toy)
     try:
         ident = engine_identity(engine)

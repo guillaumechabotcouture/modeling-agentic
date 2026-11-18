@@ -72,13 +72,17 @@ NET_PARAMS = {"net_kill_shift": ({"pyr", "pbo", "dual"}, [-0.618, 0.66]),
 #    Fagbohoun 2026 abstract, hut mortality 55% to 39% by 24 m (1472 days). 1650 is the longest.
 FIT_EXTRA = {"cfp_half": [270.0, 1650.0]}
 # Wave 2 (owner, 13 Nov, "option 1"): wave 1's engine results are reused from its output, a verbatim copy of the run
-# on cluster 2375765 (commit fb8deac; engine code identical to this one's, pack.yaml unchanged: WAVE1_PACK_SHA256).
+# on cluster 2375765 (commit fb8deac; engine code identical to this one's, pack.yaml then WAVE1_PACK_SHA256). F6 option
+# A: reuse is bound to what the fit ran, the training targets' declarations and the fit rule (benchmark_sources
+# fit_declarations: arms, settings, horizon, seeds, engine), WAVE1_FIT_DECLARATIONS_SHA256, so held-out benchmarks
+# added to the pack (B9d-B9g) leave it reusable.
 # 48 new LHS points in the wave-2 box: wave 1's accepted hull widened by `margin` of its width on each side, to the
 # new box edge on a side where the hull reached the old box edge (wave 1 holds no point past it). 48 points: 3 per
 # quadratic coefficient in 4 dimensions (15) plus 3; the plan stays under CAP_USD.
 WAVE1 = os.path.join(HERE, "net_effect_fit_wave1.yaml")
 WAVE1_SHA256 = "54958ad2e79716edf19f2b4b60f263ca41056d3202147ff4bfa23277b318a067"
 WAVE1_PACK_SHA256 = "32abb2bb6457ed7008c6410c55b4e0b620b2e982073a7dd5cbdcb7988114a905"
+WAVE1_FIT_DECLARATIONS_SHA256 = "cb5145f47875bfd2535c75415c4030e1441bf35b847ecef98b7c91fb27c77e2b"
 WAVE1_BOX = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
              "cfp_half": [547.5, 1277.5]}
 WAVE2 = {"n": 48, "seed": 23, "margin": 0.25}
@@ -565,7 +569,8 @@ def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256) -> dic
     """Wave 1's engine results, for reuse (no engine run repeated): every engine-evaluated point with its target values
     (46 design points, the verified sample points, the chosen point) and the calibration grid. Refused (ValueError,
     fail closed) unless the file's sha256 is `digest`, it is a full run (not a smoke) of this script, its engine
-    identity (name, code, parameters, configuration) is this engine's, the pack is the one it ran on, its seeds and
+    identity (name, code, parameters, configuration) is this engine's, the pack's fit declarations are the ones it ran
+    on (held-out benchmarks may have been added), its seeds and
     targets are the pack's, its calibration grid is this script's (CAL_N points across the kill shift's box) and does
     not clamp, and every point has a value for every target."""
     import hashlib
@@ -582,9 +587,9 @@ def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256) -> dic
             raise ValueError(f"wave 1 {path}: engine {k} {have.get(k)}, this engine's is {want[k]}")
     if base != yaml.safe_load(open(PACK)):
         raise ValueError(f"wave 1 {path}: the pack given is not pack.yaml")
-    if _pack_digest(PACK) != WAVE1_PACK_SHA256:
-        raise ValueError(f"wave 1 {path}: pack.yaml (sha256 {_pack_digest(PACK)}) is not the pack wave 1 ran on "
-                         f"({WAVE1_PACK_SHA256})")
+    if _fit_digest(base) != WAVE1_FIT_DECLARATIONS_SHA256:
+        raise ValueError(f"wave 1 {path}: the pack's fit declarations (sha256 {_fit_digest(base)}) are not the "
+                         f"declarations wave 1 ran on ({WAVE1_FIT_DECLARATIONS_SHA256})")
     fr, train = doc.get("fit_rule") or {}, split(base)[0]
     if list(fr.get("seeds") or []) != list(base["seeds"]):
         raise ValueError(f"wave 1 {path}: seeds {fr.get('seeds')}, the pack's are {base['seeds']}")
@@ -620,9 +625,11 @@ def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256) -> dic
             "calibration_grid": {"values": vals, "m0": {s: [float(v) for v in m0[s]] for s in m0}}}
 
 
-def _pack_digest(path: str) -> str:
+def _fit_digest(pack: dict) -> str:
+    """sha256 of what a fit's engine runs depend on: each training target's declaration and the fit rule."""
     import hashlib
-    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    from toolkit.engines.benchmark_sources import fit_declarations
+    return hashlib.sha256(json.dumps(fit_declarations(pack), sort_keys=True).encode()).hexdigest()
 
 
 def fit_waves(pack: dict, runner, wave1: dict, box2: dict, n: int = WAVE2["n"], seed: int = WAVE2["seed"],
