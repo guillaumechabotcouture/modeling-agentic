@@ -1348,9 +1348,16 @@ def _validate_uncertainty(s, pnames) -> list[str]:
     return bad
 
 
+# Owner R3 (external review point a): the analysis keys the code reads; any other is refused, so a misspelt or
+# unsupported signed field cannot silently do nothing
+ANALYSIS_KEYS = {"evaluation", "emulator", "direct", "cost_outputs", "diagnostics", "stability", "sensitivity",
+                 "share_threshold", "regret_threshold", "dollars_threshold", "decision_tests", "plan_variants",
+                 "value_of_information", "workers", "outcome_adjustments"}
+
+
 def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
     an = s.raw["analysis"]
-    bad = []
+    bad = [f"analysis: unknown key {k} (known: {', '.join(sorted(ANALYSIS_KEYS))})" for k in sorted(set(an) - ANALYSIS_KEYS)]
     if an.get("evaluation") not in EVALUATIONS:
         return [f"analysis.evaluation: one of {EVALUATIONS}"]
     if an["evaluation"] == "emulator":
