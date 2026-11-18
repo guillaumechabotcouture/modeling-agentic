@@ -6,34 +6,23 @@ refactor of the decision-test code (one generic `perturb` type, design note S2-S
     python3 toolkit/analysis/dt_golden.py digest <run_dir> [--out F]
     python3 toolkit/analysis/dt_golden.py retro <run_dir> --work <empty dir> (--write F | --expect F) [--unsigned]
 
-A record's digest has three parts, each a sha256 prefix of a canonical JSON form:
-  decision  what the test decided: status, plan changes, shares, regret, dollars moved, recommendations, benefit
-            changes, and each tested case's results (without its label). It excludes `type` and `perturb`, so a test
-            restated in another form keeps its decision digest.
-  detail    what was tested: each case's label and the type's own block (cost_multipliers, unit_attribute,
-            calibration_target, outcome_ratio, burden_scale, boundary_engine, spec_value, relevance, the arm ratios,
-            rejected values, identities, unpaired packages, automatic).
-  words     the sentences (statement, varied, question, criterion, reason).
-Numbers are rounded to 6 significant digits (platform noise in the emulator fits stays below that), integers and
-floats compare equal, and an absolute path keeps only its file name (self-tests run in temporary directories).
+Parts of a record's digest (sha256 prefixes of canonical JSON; parts()): `decision` (status, plan changes, shares,
+regret, dollars moved, recommendations, benefit changes, identities, each case's results, the run's summary entry;
+not `type` or `perturb`, and any field not named here), `detail` (case labels and the type's own block), `words`
+(the sentences) and `plans` (each case's allocation digest, decision_tests.plan_sha256). Numbers: 6 significant
+digits, below 1e-9 in size zero; an absolute path keeps its file name.
 
-`digest` reads a finished run's analysis/decision_tests.yaml and each test's models/decision_tests/<id>.yaml (a test
-that was not run has no file; its entry is digested from the summary). It fails closed: a run with no decision-test
-artifact, or a listed result file that is missing, raises.
+`digest` reads analysis/decision_tests.yaml and models/decision_tests/<id>.yaml, and fails closed (digest_dir).
+`retro` copies the run into --work (outside the run dir by real path), removes the copy's decision-test outputs,
+re-runs the analysis there on the current code with the run's own number of draws, and digests it. Zero engine jobs:
+compute.map_fn and the engine's evaluating methods raise EngineJobRefused, so a run whose stored rows (row_reuse,
+#241/#244) do not cover the analysis, or a direct-path run, is refused, never computed (legacy rows may need
+MA_JC_LEGACY_ADAPTER_SHA256). The collected run is never written. --write refuses a re-run that differs from the
+stored results unless --accept-stored-diff; expected digests of real runs are kept outside the repo.
 
-`retro` copies the run dir into --work, re-runs the analysis there on the current code (toolkit/analysis/run.py),
-and digests the result. Zero engine jobs: scripts/compute.py's map_fn and the engine's own run / run_batch /
-run_series raise EngineJobRefused, so every engine row must come from the stored rows (row_reuse, #241/#244). A run
-whose stored rows do not cover the analysis, or a direct-path run (it evaluates the engine in-process), is refused,
-never computed. Legacy rows may need MA_JC_LEGACY_ADAPTER_SHA256 (toolkit/analysis/row_reuse.py). The collected run
-dir is never written. --write records the digests to F; --expect compares with F (exit 1 on any difference). The
-report also compares the re-run with the run's own stored results. Expected digests of real runs are kept outside
-the repo.
-
-The toy golden records are toolkit/analysis/dt_golden.json, checked by toolkit/analysis/run.py's self-test: every
-record decision_tests.run_one returns there is captured (start_capture / check_capture), keyed by the self-test
-function that asked for it, the test id and the call's order. A PR that changes a digest says why in its description;
-MA_DT_GOLDEN_UPDATE=1 rewrites the file from the observed records.
+Toy golden records: toolkit/analysis/dt_golden.json, checked by toolkit/analysis/run.py's self-test, which captures
+every record decision_tests.run_one returns (start_capture / check_capture), keyed by the calling self-test function,
+test id and call order. A PR that changes a digest says why; MA_DT_GOLDEN_UPDATE=1 rewrites the file.
 """
 from __future__ import annotations
 
