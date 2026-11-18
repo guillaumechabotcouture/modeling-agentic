@@ -942,6 +942,14 @@ def _self_test() -> int:
                 mk = {}
             ok(list(mk.get("files") or {}) == ["analysis/batch/results.jsonl.job.json"] and "j2" in str(mk.get("source")),
                f"RC40b a copied run dir is marked with its in-flight records ({mk})")
+            # RC40c (Codex review of #256 P1-2): a later poll that fetches another file does not re-mark a record a
+            # local process rewrote in the copy
+            import copied_run as _CR
+            lj = os.path.join(dest2, "out", "runs", "R", "analysis", "batch", "results.jsonl.job.json")
+            open(lj, "w").write('{"pid": 8, "local": true}')
+            open(os.path.join(ws.JOBS, "j2", "out", "runs", "R", "notes.md"), "w").write("new")
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(lj) is None, "RC40c a later poll does not mark a record rewritten locally as copied")
             for bad in ("work/job.py", "state.json", "../../etc/passwd", "out/../state.json"):
                 try:
                     ws.job_chunk("j1", bad, 0, 10)

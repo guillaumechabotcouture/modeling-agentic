@@ -4444,6 +4444,9 @@ def _self_test_checkpoint(ok) -> None:
     ok(list(mk10.get("files") or {}) == ["models/b.jsonl.partial.jsonl"] and "checkpoint R1" in str(mk10.get("source"))
        and mk10.get("captured_at") == got.get("time_utc"),
        f"CK10b (F6 run 3) the fetched run dir is marked: its batch journal is a copy, not a live batch ({mk10})")
+    ok(_checkpoint_run_root(dest, "R_x") == os.path.join(dest, "runs", "R_x")
+       and all(_checkpoint_run_root(dest, bad) is None for bad in ("../R1", "/tmp", "runs/R_x", "", "..", None, "nope")),
+       "CK10c (Codex review of #256 P1-4) the record's run_dir is one name of a directory in the extraction, or none")
     store.files[gen(n)[0]] = data + b"tampered"
     out3 = tempfile.mkdtemp()
     cfg3 = RunConfig(name="t", question_file="q", out_dir=out3, labels=("R1",))

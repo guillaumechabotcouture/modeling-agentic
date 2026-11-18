@@ -3962,6 +3962,7 @@ def _self_test_copied(ok) -> None:
     from lib import copied_run as CR
     me, start = os.getpid(), _pid_start(os.getpid())
     with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "run_state.json"), "w").write("{}")       # the run root the marker is read at
         bd = os.path.join(d, "analysis", "batch")
         os.makedirs(os.path.join(bd, PROGRESS_DIR))
         out = os.path.join(bd, "results.jsonl")
@@ -3992,6 +3993,27 @@ def _self_test_copied(ok) -> None:
            f"CP5 a job record the copy marker lists, unchanged, is reported copied (exit 4) ({st['state']})")
         job(pid_start=start, host=os.uname().nodename, n=5)
         ok(job_status(out)["state"] == RUNNING, "CP6 a job record rewritten after the copy is read as usual")
+        # Codex review of #256 P1-1: a summary from an earlier batch at the same --out (its mtime refreshed by a copy)
+        # does not finish this one; the summary must name this job's launch
+        job(pid_start=start, host=os.uname().nodename, launch="L2")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 2, "launch": "L1"}))
+        st = job_status(out)
+        ok(st["state"] == RUNNING, f"CP7 a summary of another launch does not finish this job ({st['state']})")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L2"}))
+        ok(job_status(out)["state"] == FINISHED, "CP7b this launch's summary finishes it")
+        job(pid_start=start, host=os.uname().nodename)          # an older record (no launch), copied
+        open(out + ".summary.json", "w").write(json.dumps({"n": 2}))
+        CR.mark(d, "test copy 2", "2026-11-16T00:00:00Z")
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP8 a copied job with a summary it cannot be bound to reads copied, not finished "
+                                  f"(a copy refreshes mtimes) ({st['state']})")
+        os.remove(out + ".summary.json")
+        # P1-3: only the run root's marker counts; one planted below it is ignored
+        job(pid_start=start, host=os.uname().nodename, n=6)
+        os.remove(os.path.join(d, CR.MARKER))
+        CR.mark(bd, "planted", None)
+        st = job_status(out)
+        ok(st["state"] == RUNNING, f"CP9 a marker below the run root is ignored ({st['state']})")
 
 
 def _self_test_xhost(ok) -> None:

@@ -120,6 +120,29 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         ok(mark(d, "test") is None and not os.path.exists(os.path.join(d, MARKER)),
            "CR6 a copy with no in-flight record gets no marker")
+    # Codex review of #256: the marker is read at the run root only (P1-3), however deep the file; a poll marks only
+    # what it fetched and keeps earlier entries, so a local rewrite stops matching (P1-2)
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "run_state.json"), "w").write("{}")
+        deep = os.path.join(d, *"a b c d e f g h".split())
+        os.makedirs(deep)
+        j = os.path.join(deep, "x.jsonl.job.json")
+        open(j, "w").write("{}")
+        k = os.path.join(d, "y.jsonl.job.json")
+        open(k, "w").write("{}")
+        mark(d, "poll 1")
+        ok(copied_entry(j) is not None, "CR7 a file eight levels below the run root is found by the root's marker")
+        os.makedirs(os.path.join(d, "a", PROGRESS_DIR))
+        open(os.path.join(d, "a", "z.json"), "w").write("{}")
+        mark(os.path.join(d, "a"), "planted")
+        ok(copied_entry(j) is not None and copied_entry(j)["source"] == "poll 1",
+           "CR7b a marker below the run root is ignored")
+        open(k, "w").write('{"pid": 9}')                 # a local process rewrote it
+        mark(d, "poll 2", only=["a/b/c/d/e/f/g/h/x.jsonl.job.json"])
+        ok(copied_entry(k) is None and copied_entry(j) is not None,
+           "CR8 a later poll marks only what it fetched; a file rewritten locally is not re-marked")
+        ok(run_root(j) == os.path.abspath(d) and run_root(os.path.join(os.sep, "nonexistent", "x")) is None,
+           "CR9 the run root is the nearest ancestor holding run_state.json or metadata.json")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
