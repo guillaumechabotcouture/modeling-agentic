@@ -300,6 +300,25 @@ def _self_test() -> int:
             ok(rs3 == [] and n3 and "nothing compared" in "\n".join(sheet_lines(r3, run)),
                "ES10 an engine without a pack is said to be not compared, not 'every unit inside'")
             ok(sheet_lines(dict(raw, options={}), run) == [], "ES11 a spec without an engine map gets no section")
+            # Codex review of 1d57036 (1 P1, P2s), reproduced before the fix
+            rows_n = [dict(rb, settings=[2020, "s1"])]
+            try:
+                md = "\n".join(render(raw, rows_n, []))
+                ok("2020" in md, "ES12 (P1) a numeric setting id renders")
+            except Exception as e:  # noqa: BLE001
+                ok(False, f"ES12 (P1) a numeric setting id must not stop the sheet: {type(e).__name__}: {e}")
+            ok(_flat("sp", {"q": 0.4}, set(), {"sp": ["p", "q"]}) == {"sp.q": 0.4, "sp.p": 0.0},
+               "ES13 a key a setting's mapping omits is zero for a key the units table binds")
+            ok(conventions(REF, {"r", "f"}, {}) == {"f"} and _same([1e-10, 3e-10]) is False,
+               "ES14 distinct tiny setting values are not a convention")
+            r4 = dict(raw, decision_units=dict(raw["decision_units"], engine_attributes={"y": {"column": "r"}}))
+            md = "\n".join(sheet_lines(r4, run))
+            ok("No unit is outside" not in md and "no attribute" in md, f"ES15 nothing compared is not an all-clear: {md}")
+            r5 = dict(raw, decision_units=dict(raw["decision_units"], engine_attributes={
+                "r": {"column": "r", "value": 0.2}}))
+            ok(not [x for x in outside(r5, run)[0] if x["attribute"] == "r"], "ES16 a fixed-value binding is not a column")
+            md = "\n".join(render(raw, [dict(rb, engine="e1:A"), dict(rb, engine="e2:B")], []))
+            ok("e1:A" in md and "e2:B" in md, "ES17 rows of several candidate engines name their engine")
         finally:
             BC.OVERRIDES.pop(REF, None)
     print(f"{'FAIL' if fails else 'OK'}: " + (f"{len(fails)} case(s) failed" if fails else
