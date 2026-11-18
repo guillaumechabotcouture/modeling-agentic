@@ -12,9 +12,10 @@ transmission is calibrated to the trial's non-PBO arm at 6 months (556/3844 = 0.
 B9g is Mosha et al. 2022 (Misungwi; Lancet 399:1227): the dual-AI (chlorfenapyr) arm against the PBO arm at 24 months,
 read from the same trial's two contrasts with its one pyrethroid-only control, B10 (OR 0.45, 0.30-0.67) and B9c
 (aOR 0.99, 0.67-1.45). The trial publishes no direct dual-vs-PBO interval, so the band is derived (`or_contrast`):
-the ratio of the two ORs, with each log standard error from its published 95% interval's half-width and the two taken
-as independent (delta method). The shared control arm correlates them positively, so this band is wider than a direct
-interval would be. The engine computes the same contrast directly (odds ratio of mis_dual against mis_pbo on common
+the ratio of the two ORs, with each log standard error from its published 95% interval's half-width (delta method).
+The shared control arm correlates them positively, so treating them as independent would give a band wider than a direct
+interval would be (Codex r1 on #266: the shared-control covariance is used, under equal per-arm variances, so
+the control arm's variance cancels). The engine computes the same contrast directly (odds ratio of mis_dual against mis_pbo on common
 random numbers), which equals the ratio of the two engine ORs against mis_pyr.
 
 The checks here only read the pack, the coverage file and the stored results; they run no engine simulation.
@@ -39,13 +40,16 @@ LLINEUP_CONTROL_6M = (556, 3844)          # Table 2, as-treated, non-PBO arm at 
 LLINEUP_USE = ((0.5, 0.85), (1.5, 0.73))  # reported use the previous night at 6 and 18 months (years, share)
 
 
-def or_contrast(num: dict, den: dict, level: float = 0.95, digits: int = 3) -> tuple[float, float, float]:
+def or_contrast(num: dict, den: dict, level: float = 0.95, digits: int = 3,
+                shared_control: bool = False) -> tuple[float, float, float]:
     """(target, lo, hi) of OR_num / OR_den from two published intervals {target, lower, upper} at `level`: the log
-    standard errors are each interval's log half-width over the normal quantile, combined as independent."""
+    standard errors are each interval's log half-width over the normal quantile. Independent: var = v1 + v2. With
+    `shared_control` (both ORs against one control arm), each log OR's variance is its arm's plus the control's,
+    taken as equal halves (equal per-arm variances), so the control's share cancels: var = (v1 + v2) / 2."""
     z = NormalDist().inv_cdf(0.5 + level / 2)
     se = [(math.log(x["upper"]) - math.log(x["lower"])) / (2 * z) for x in (num, den)]
     c = math.log(num["target"]) - math.log(den["target"])
-    s = math.hypot(*se)
+    s = math.hypot(*se) / (math.sqrt(2.0) if shared_control else 1.0)
     return tuple(round(v, digits) for v in (math.exp(c), math.exp(c - z * s), math.exp(c + z * s)))
 
 
@@ -231,7 +235,7 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["b9g"]:
         p = {b["id"]: b for b in load_pack()["benchmarks"]}
         print(or_contrast({"target": p["B10"]["target"], **p["B10"]["published"]},
-                          {"target": p["B9c"]["target"], **p["B9c"]["published"]}))
+                          {"target": p["B9c"]["target"], **p["B9c"]["published"]}, shared_control=True))
         sys.exit(0)
     print(__doc__)
     sys.exit(2)
