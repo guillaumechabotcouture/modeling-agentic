@@ -343,6 +343,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                                "calibration_status": A.flagged[i]["status"]}
                                               if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
     point["cost_floors"] = floors0
+    if getattr(A, "adjust", None):    # F6 run 4 R3: the base outcome adjustments every evaluation applied
+        from toolkit.analysis import outcome_adjust as OA
+        point["outcome_adjustments"] = OA.record(A.adjust)
     if reserve is not None:
         point["reserve"] = reserve
     if getattr(A, "headline_variant", None):     # F6 S1-6: the headline plan is this variant's
@@ -585,6 +588,7 @@ def _self_test() -> int:
            and not [f for f in contract.gate_findings(d) if f["kind"].startswith("emulator_boundary_")
                     and f["kind"] != "emulator_boundary_ranking"],
            f"BD-R1 the boundary artifact, its engine rows and its results line ({bd['matched']} of {bd['units']})")
+        _self_test_boundary_engine(ok, R)
         from toolkit.analysis.model import DirectModel
         Ab, r0 = R["_A"], bd["rows"][0]
         zb = {i: v["z"] for i, v in R["calibration"]["units"].items()}
@@ -1383,11 +1387,11 @@ def _self_test_joint(ok, q):
                  dfac=1.0, point_events=[])
         fo = {"u": {"y": {k: {"dalys": v} for k, v in (("none", 10.0), ("a", 6.0), ("b", 8.0), ("ac", 5.0))}}}
         fb = {"u": {"none": 0.0, "a": 4.0, "b": 2.0, "ac": 5.0}}
-        fr = DT_._outcome_ratio(fa, dto, fo, fb, {}, {"u": "a"})
+        fr = DT_._outcome_ratio(fa, dto, fo, fb, {}, {"u": "a"}, {"u": 0.0})
         ok((fr.get("record") or {}).get("unpaired") == ["ac"] and fr.get("unpaired") == ["ac"]
            and "without one" in fr.get("varied", "") and fr["cases"][0][1]["u"]["ac"] == 5.0,
            f"JR11c (#248 P2-4) a package with no counterpart is held and disclosed ({fr.get('record')}, {fr.get('varied')})")
-        # P2-2: the re-solved plans are guarded with the point evaluation's model corrections; without them, not run
+        # P2-2 (fixed in #251): the re-solved plans are guarded with the point evaluation's model corrections
         saved_pe = getattr(A, "point_events", None)
         try:
             A.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
@@ -1397,10 +1401,6 @@ def _self_test_joint(ok, q):
             except AnalysisBlocked:
                 blocked_ = True
             ok(blocked_, "JR11d (#248 P2-2) a point correction bearing on the re-solved plan stops an outcome_ratio test")
-            del A.point_events
-            ro4 = DT_.run_one(A, dto, z0, ben0, cost0, plan, R["uncertainty"], out0)
-            ok(ro4.get("status") == "not_run" and "corrections" in ro4.get("reason", ""),
-               f"JR11e (#248 P2-2) without the point evaluation's corrections: not run ({ro4.get('reason')})")
         finally:
             A.point_events = saved_pe
         # P2-5: an outcome_ratio test cannot carry an engine departure (it holds the engine): refused, saying why
@@ -1416,6 +1416,7 @@ def _self_test_joint(ok, q):
                                                R["uncertainty"], R["stability"], [ro], R["calibration"])}
         ok("[CLAIM:dt.DTo.ratio0]" in txt_ and "dt.DTo.ratio0" in ids_ and "package pairs: a → b" in txt_,
            f"JR11g (#248 P3) the results state each tested ratio (a claim) and the package pairs")
+        _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R)
         saved_z = A.joint["z"].pop(listed[0])
         try:
             rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
@@ -1440,6 +1441,163 @@ def _self_test_joint(ok, q):
                and not os.path.exists(os.path.join(d, "analysis", "point.yaml")),
                f"JR5 a clamped emulator inversion blocks at the calibration step, before the point plan ({e.hits})")
     _ = p
+
+
+def _self_test_boundary_engine(ok, R):
+    """F6 run 4, owner decision R3 (RIG-002): a boundary_engine decision test re-solves the plan with the boundary
+    check's engine benefits and costs in place of the emulator's at its units (stored engine rows, no new job)."""
+    from toolkit.analysis import decision_tests as DT_
+    A = R["_A"]
+    z0 = {i: R["point"]["per_unit"][i]["z"] for i in A.ids}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    plan = R["point"]["plan"]
+    dt = {"id": "DTb", "type": "boundary_engine", "text": "t", "finding": "emulator_boundary_ranking:emulator_boundary"}
+    be = getattr(A, "boundary_engine", None) or {}
+    sent = []
+    orig = A.evaluate
+    A.evaluate = lambda *a_, **k_: (sent.append(1), orig(*a_, **k_))[1]
+    try:
+        rec = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.evaluate = orig
+    units = (rec.get("boundary_engine") or {}).get("units") or []
+    ok(rec.get("status") == "run" and units and sorted(units) == sorted(be.get("ben") or {}) and not sent
+       and rec.get("finding") == "emulator_boundary_ranking:emulator_boundary",
+       f"BE-R1 a boundary_engine test re-solves with the boundary check's engine tables at its units, with no new "
+       f"evaluation, under the finding it is declared for ({rec.get('status')}, {len(units)} units, {len(sent)} evals)")
+    u = units[0] if units else None
+    ok(u is not None and all(rec["boundary_engine"]["benefit"][u][k] == be["ben"][u][k] for k in be["pairs"][u]),
+       "BE-R2 at a boundary unit the two compared packages take the engine side's benefit")
+    saved = A.boundary_engine
+    try:
+        del A.boundary_engine
+        rec2 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.boundary_engine = saved
+    ok(rec2.get("status") == "not_run" and "boundary" in rec2.get("reason", ""),
+       f"BE-R3 without the boundary check's engine tables: not run, with why ({rec2.get('reason')})")
+    # Codex review of #252 (3 P1, 2 P2)
+    pair = (be.get("pairs") or {}).get(u) or ()
+    others = [k for k in A.pk if k not in pair]
+    chk = (rec.get("boundary_engine") or {}).get("benefit") or {}
+    ok(u is not None and len(pair) == 2 and all(chk[u][k] == be["ben"][u][k] for k in pair)
+       and all(chk[u][k] == ben0[u][k] for k in others),
+       "BE-R4 (P1-1, P1-2) only the chosen package and its runner-up take the engine side's benefit and cost at a "
+       "boundary unit; every other package keeps the point tables'")
+    from toolkit.analysis.core import AnalysisBlocked
+    saved_ev = getattr(A, "point_events", None)
+    try:
+        A.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+    finally:
+        A.point_events = saved_ev
+    ok(blocked, "BE-R5 (P1-3) the point evaluation's model corrections reach the re-solved plan's guard")
+    # Codex re-review of #252 (P1, P2): a correction on a substituted cell no longer bears on it; no record, not run
+    pu, (pc, _pr) = next(iter(be["pairs"].items()))
+    try:
+        A.point_events = [{"unit": pu, "package": pc, "kind": "reduction_clip"}]
+        try:
+            rec8 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+        except AnalysisBlocked as e:
+            rec8 = {"status": f"blocked {e}"}
+        del A.point_events
+        rec9 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    finally:
+        A.point_events = saved_ev
+    ok(rec8.get("status") == "run", f"BE-R8 a point correction on a cell the engine replaces does not block ({rec8.get('status')})")
+    ok(rec9.get("status") == "not_run" and "corrections" in (rec9.get("reason") or ""),
+       f"BE-R9 without the point evaluation's recorded corrections: not run ({rec9.get('reason')})")
+    from toolkit.analysis import boundary as BD_
+    saved_be = A.boundary_engine
+    try:
+        BD_.run(A, {i: A.comp for i in A.ids}, z0, out0, ben0, cost0, None, R["_run_dir"] if "_run_dir" in R else ".",
+                log=lambda *a_: None)
+        cleared = getattr(A, "boundary_engine", "missing") is None
+    except Exception:  # noqa: BLE001
+        cleared = getattr(A, "boundary_engine", "missing") is None
+    finally:
+        A.boundary_engine = saved_be
+    ok(cleared, "BE-R6 (P2-4) a later boundary check with no candidates clears the earlier engine tables")
+    orig_solve = A.solve
+    A.solve = lambda *a_, **k_: (_ for _ in ()).throw(RuntimeError("optimizer status infeasible"))
+    try:
+        rec7 = DT_.run_one(A, dt, z0, ben0, cost0, plan, R["uncertainty"], out0)
+    except RuntimeError as e:
+        rec7 = {"status": f"raised {e}"}
+    finally:
+        A.solve = orig_solve
+    ok(rec7.get("status") == "not_run" and "infeasible" in (rec7.get("reason") or ""),
+       f"BE-R7 (P2-5) an infeasible re-solve is recorded as not run, with why ({rec7.get('status')})")
+
+
+def _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R):
+    """F6 run 4, owner decision R3: base outcome adjustments in every evaluation (OA-R1..R6)."""
+    import copy
+    from toolkit.analysis import outcome_adjust as OA, decision_tests as DT_, boundary as BD
+    from toolkit.analysis.core import Analysis
+    from toolkit.spec import schema as SC
+    raw = copy.deepcopy(A.spec.raw)
+    raw["analysis"]["outcome_adjustments"] = [{"id": "OA1", "component": "a", "reference": "b", "value": 0.5,
+                                               "source": "toy trial"}]
+    sp = SC.Spec(raw, A.spec.base, getattr(A.spec, "path", None))
+    A2 = Analysis(sp, A.model, log=lambda *a_: None)
+    A2.joint, A2.theta0, A2.flagged = A.joint, dict(A.theta0), getattr(A, "flagged", {})
+    ok(A2.adjust and A2.adjust[0]["pairs"] == {"a": "b"} and not getattr(A, "adjust", None),
+       f"OA-R1 the spec's adjustment reaches the analysis, with its package pairs ({getattr(A2, 'adjust', None)})")
+    out2, ben2, _c = A2.evaluate(A2.theta0, z0)
+    i0 = A.ids[0]
+    ys = all(abs(out2[i]["y"]["a"][o] - 0.5 * out2[i]["y"]["b"][o]) <= 1e-9 * max(1.0, abs(out2[i]["y"]["b"][o]))
+             for i in A.ids for o in A.outcomes)
+    held = all(out2[i]["y"][k][o] == out0[i]["y"][k][o] for i in A.ids for k in A.pk if k != "a" for o in A.outcomes)
+    want = A.dfac * (out0[i0]["y"][A.comp][A.primary] - 0.5 * out0[i0]["y"]["b"][A.primary])
+    ok(ys and held and abs(ben2[i0]["a"] - want) <= 1e-9 * max(1.0, abs(want)),
+       "OA-R2 every reported outcome of package a is 0.5 x b's in the evaluation; every other package, the comparator "
+       "and the costs' inputs are as the model predicts; benefits follow")
+    saved_pred = A2.model.predict
+
+    def planted(zs, theta, ids, noise=None):
+        res = saved_pred(zs, theta, ids, noise=noise)
+        A2.model.last_events = [{"unit": ids[0], "package": "b", "kind": "reduction_clip"}]
+        return res
+    A2.model.predict = planted
+    try:
+        A2.evaluate(A2.theta0, z0)
+        evs = list(A2.last_events)
+    finally:
+        A2.model.predict = saved_pred
+        A2.model.last_events = []
+    ok({"unit": A.ids[0], "package": "a", "kind": "reduction_clip", "derived_from": "b"} in evs,
+       f"OA-R3 a model correction on the reference package also bears on the package derived from it ({evs})")
+    dte = {"id": "DTe", "type": "outcome_ratio", "text": "t",
+           "outcome_ratio": {"component": "a", "reference": "b", "values": ["engine", 0.5]}}
+    rec = DT_.run_one(A2, dte, z0, ben2, cost0, plan, R["uncertainty"], out2)
+    chk = (rec.get("outcome_ratio") or {}).get("check_by_value") or {}
+    eng_b = chk.get("engine", {}).get(i0)
+    ok(rec.get("status") == "run" and eng_b is not None and abs(eng_b - ben0[i0]["a"]) <= 1e-9 * max(1.0, abs(eng_b))
+       and A2.adjust and A2.adjust[0]["component"] == "a",
+       f"OA-R4 an outcome_ratio value \"engine\" re-evaluates with the component's base adjustment removed (the "
+       f"engine's own effect) and restores it ({rec.get('status')}, {eng_b} vs {ben0[i0]['a']})")
+    saved_ev = getattr(A2, "point_events", None)       # Codex re-review of #251 P1-2: numeric cases are guarded
+    try:
+        A2.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+        try:
+            DT_.run_one(A2, dict(dte, outcome_ratio=dict(dte["outcome_ratio"], values=[0.5])), z0, ben2, cost0, plan,
+                        R["uncertainty"], out2)
+            blocked = False
+        except AnalysisBlocked:
+            blocked = True
+    finally:
+        A2.point_events = saved_ev
+    ok(blocked, "OA-R7 (re-review P1-2) a numeric outcome_ratio case is guarded with the point evaluation's corrections")
+    pk_run = BD.run_packages(A2, {"chosen": "a", "runner_up": "none"})
+    ok("b" in pk_run, f"OA-R5 the boundary check runs the counterpart of an adjusted package on the engine ({pk_run})")
+    ok(OA.record(A2.adjust)[0]["value"] == 0.5 and OA.record(A2.adjust)[0]["pairs"] == {"a": "b"},
+       "OA-R6 the adjustments are recorded (id, component, reference, value, source, pairs)")
+
 
 
 def _self_test_stability_flagged(ok):
