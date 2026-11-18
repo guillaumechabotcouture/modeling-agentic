@@ -315,6 +315,8 @@ REVIEWED: dict = {
                                  "tempfile-dir": (1, "write_archive's anonymous TemporaryFile beside the archive it "
                                                      "writes (the checkpoint staging dir on the agent VM, outside any run "
                                                      "dir), deleted on close")},
+    "scripts/resume_smoke.py": {"open-write": (3, "the smoke's own temporary work dir (toy runs it creates) and the "
+                                                   "--json report the operator names")},
     "scripts/score_critiques.py": {"open-write": (3, _EVAL)},
     "scripts/sdk_scenarios.py": {"open-write": (15, _EVAL)},
     "scripts/telemetry.py": {"open-write": (1, "the operator's --out CSV")},

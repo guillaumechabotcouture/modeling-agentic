@@ -16,6 +16,9 @@ Checks (principle numbers from .claude/orchestration/decision_design_principles.
                            delivered would be optimised as if still open.
   baseline_burden (3)      no validation.burden anchor row (role anchor) sets the absolute burden: the engine's own
                            burden would rank the units. A burden_scale decision test lowers it to MEDIUM.
+  follow_up_window (3)     a dossier input whose observations declare follow_up_years shorter than the objective
+                           window (objective.horizon): the effect is carried past what the evidence observed
+                           (MEDIUM, for the owner's judgment).
   decision_input_ranges (6) a dossier decision input that is a parameter held at a point value (HIGH); an
                            engine_parameters value with a range that no decision test varies (HIGH), or a point value
                            nothing varies (MEDIUM); an allocated component's cost item with no uncertainty range and
@@ -43,7 +46,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-CHECKS = {"headline_comparator": 2, "decision_date": 2, "baseline_burden": 3, "decision_input_ranges": 6}
+CHECKS = {"headline_comparator": 2, "decision_date": 2, "baseline_burden": 3, "decision_input_ranges": 6,
+          "follow_up_window": 3}
 SECTION = "## Spec critique (decision design principles, before signing)"
 PAST_DAYS = 90             # an ISO decision date more than this before today is past
 CALENDAR_MIN = 1900        # a window starting earlier is in model years, not calendar years: not compared with today
@@ -274,6 +278,49 @@ def _ranges(raw, run_dir, dossier_bytes=None) -> list:
     return out
 
 
+def _follow_up(raw, run_dir, dossier_bytes=None) -> list:
+    """A dossier input whose observations declare `follow_up_years` shorter than the objective window: the effect is
+    carried past the time the evidence observed it. A flag for the owner (MEDIUM), never a refusal. An observation
+    without a numeric follow_up_years is not compared; an unreadable dossier is reported by decision_input_ranges."""
+    ev = (raw.get("evidence") or {}).get("dossier")
+    win = (raw.get("objective") or {}).get("horizon") or []
+    try:
+        span = float(win[1]) - float(win[0])
+    except (TypeError, ValueError, IndexError):
+        return []
+    if not ev or span <= 0:
+        return []
+    import yaml
+    from toolkit.spec import evidence_dossier as ED
+    try:
+        b = dossier_bytes if dossier_bytes is not None else (ED.read_dossier(run_dir, ev) if run_dir else None)
+        inputs = (yaml.safe_load(b.decode("utf-8")) or {}).get("inputs") if b is not None else None
+    except (ValueError, UnicodeDecodeError, AttributeError, yaml.YAMLError):
+        return []
+    short = []
+    for k, e in sorted(inputs.items()) if isinstance(inputs, dict) else []:
+        for o in (e.get("observations") or []) if isinstance(e, dict) and isinstance(e.get("observations"), list) else []:
+            fu = _num(o.get("follow_up_years")) if isinstance(o, dict) else None
+            if fu is not None and fu < span:
+                short.append(f"`{k}` ({o.get('source')}: {fu:g} years)")
+    if not short:
+        return []
+    return [_f("MEDIUM", "follow_up_window", f"{len(short)} evidence observation(s) followed the effect for less than "
+               f"the objective window of {span:g} years: {'; '.join(short)}. The engine carries the effect past what "
+               "they observed.", "Confirm how the effect is assumed to hold (or wane) beyond the follow-up, and that "
+               "a decision test varies it", judgment=True)]
+
+
+def _num(x):
+    if isinstance(x, bool):
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+
 def _departures(raw) -> tuple[dict, list]:
     got, bad = {}, []
     deps = raw.get("principle_departures")
@@ -310,7 +357,8 @@ def findings(raw: dict, run_dir: str | None = None, today: datetime.date | None 
     for name, fn in (("headline_comparator", lambda: _comparator(raw)),
                      ("decision_date", lambda: _decision_date(raw, today)),
                      ("baseline_burden", lambda: _burden(raw, run_dir, burden_data)),
-                     ("decision_input_ranges", lambda: _ranges(raw, run_dir, dossier_bytes))):
+                     ("decision_input_ranges", lambda: _ranges(raw, run_dir, dossier_bytes)),
+                     ("follow_up_window", lambda: _follow_up(raw, run_dir, dossier_bytes))):
         try:
             out += fn()
         except Exception as e:  # noqa: BLE001 -- fail closed: a check that cannot run is a finding
@@ -501,6 +549,29 @@ def _self_test() -> int:
     t = [f["text"] for f in findings(r, today=T) if f["check"] == "headline_comparator"][0]
     ok("which" in t and "alt" in t and "funded" in t, f"SC36 (P3) the fixed plans are named; the owner says which is "
                                                      f"funded: {t}")
+    # follow-up window (owner direction 2026-11-18): a flag, never a refusal
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "ev.yaml"), "w").write(
+            "inputs:\n"
+            "  'parameter:e1': {observations: [{source: Trial A, follow_up_years: 2}, {source: Trial B,"
+            " follow_up_years: 5}], chosen: {range: [0, 1]}}\n"
+            "  'parameter:e2': {observations: [{source: Trial C, follow_up_years: 6}], chosen: {range: [0, 1]}}\n"
+            "  'parameter:e3': {observations: [{source: Survey D}], chosen: {range: [0, 1]}}\n"
+            "  'parameter:e4': {observations: [{source: Trial E, follow_up_years: two}], chosen: {range: [0, 1]}}\n")
+        r = spec(evidence={"dossier": "ev.yaml"}, objective={"horizon": [2027.0, 2032.0]})
+        fu = [f for f in findings(r, run_dir=d, today=T) if f["check"] == "follow_up_window"]
+        txt = " ".join(f["text"] for f in fu)
+        ok(len(fu) == 1 and fu[0]["severity"] == "MEDIUM" and "parameter:e1" in txt and "Trial A" in txt
+           and "2" in txt and "5" in txt and "e2" not in txt and "e3" not in txt,
+           f"SC37 an effect input whose evidence followed up for less than the 5-year window is flagged: {fu}")
+        ok(any("e4" in f["text"] and "not a number" in f["text"] for f in fu) is False
+           and not any(f["check"] == "follow_up_window" and f["severity"] == "HIGH" for f in findings(r, d, T)),
+           "SC38 an unreadable follow-up is not compared (the dossier precondition owns its shape); never HIGH")
+        ok(not [f for f in findings(spec(evidence={"dossier": "ev.yaml"}, objective={"horizon": [2027.0, 2028.0]}),
+                                    d, T) if f["check"] == "follow_up_window"],
+           "SC39 no flag when every declared follow-up covers the window")
+        md = "\n".join(sheet_lines(r, d, T))
+        ok("| MEDIUM | 3 | follow_up_window |" in md, "SC40 the flag is on the sheet")
     print(f"{'FAIL' if fails else 'OK'}: " + (f"{len(fails)} case(s) failed" if fails else
                                                "all self-test cases passed."))
     return 1 if fails else 0
