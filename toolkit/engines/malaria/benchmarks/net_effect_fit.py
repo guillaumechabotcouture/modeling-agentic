@@ -82,6 +82,9 @@ FIT_EXTRA = {"cfp_half": [270.0, 1650.0]}
 WAVE1 = os.path.join(HERE, "net_effect_fit_wave1.yaml")
 WAVE1_SHA256 = "54958ad2e79716edf19f2b4b60f263ca41056d3202147ff4bfa23277b318a067"
 WAVE1_PACK_SHA256 = "32abb2bb6457ed7008c6410c55b4e0b620b2e982073a7dd5cbdcb7988114a905"
+# Codex r2 on #268: this digest is of the REUSING fit's effective pack (wave 2 and verification round 2, cfp_half box
+# 270-1650 days per FIT_EXTRA), not of wave 1's own run (box 547.5-1277.5, WAVE1_BOX; digest 191fb4d0...). The widening
+# is the owner's 13 Nov "option 1"; wave 1's box is checked against its output by its recorded plan, not by this digest.
 WAVE1_FIT_DECLARATIONS_SHA256 = "e0fa57b0822d064c21ea78fd22d00ce214f1f43e704af930766e6aaa4f2a84dc"
 WAVE1_BOX = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
              "cfp_half": [547.5, 1277.5]}
