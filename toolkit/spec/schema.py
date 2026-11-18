@@ -1348,9 +1348,16 @@ def _validate_uncertainty(s, pnames) -> list[str]:
     return bad
 
 
+# Owner R3 (external review point a): the analysis keys the code reads; any other is refused, so a misspelt or
+# unsupported signed field cannot silently do nothing
+ANALYSIS_KEYS = {"evaluation", "emulator", "direct", "cost_outputs", "diagnostics", "stability", "sensitivity",
+                 "share_threshold", "regret_threshold", "dollars_threshold", "decision_tests", "plan_variants",
+                 "value_of_information", "workers", "outcome_adjustments"}
+
+
 def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
     an = s.raw["analysis"]
-    bad = []
+    bad = [f"analysis: unknown key {k} (known: {', '.join(sorted(ANALYSIS_KEYS))})" for k in sorted(set(an) - ANALYSIS_KEYS)]
     if an.get("evaluation") not in EVALUATIONS:
         return [f"analysis.evaluation: one of {EVALUATIONS}"]
     if an["evaluation"] == "emulator":
@@ -2024,6 +2031,9 @@ def _self_test() -> int:
         ok(validate(Spec(r_be, d)) == [], f"SP-BE3 a boundary_engine test validates: {validate(Spec(r_be, d))[:3]}")
         _self_test_burden_scale(ok, s, d, bad)
         _self_test_outcome_adjustments(ok, s, d, bad)
+        # external review of v2 (owner R3, point a): a signed analysis field the code does not read is refused
+        bad(lambda r: r["analysis"].update(outcome_adjustmnts=[]), "unknown key",
+            "SP-AK1 an unknown analysis key is refused (a misspelt signed field would otherwise be a no-op)")
         r_t = copy.deepcopy(s.raw)
         dct(calibration_target={"units": ["0", "3"], "scale": 0.8})(r_t)
         ok(validate(Spec(r_t, d)) == [], f"SP-CT7 a well-formed calibration_target test validates: "
