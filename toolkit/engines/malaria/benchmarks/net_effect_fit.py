@@ -2028,28 +2028,86 @@ def _self_test() -> int:
     def fa3():
         q = plan(p)
         nd = OPTION_A["design_n"]
-        ok(nd == 3 * (6 + 1) * (6 + 2) // 2 and q["wave1_points_run"] == nd and q["design_points"] == OPTION_A["wave2_n"]
+        ns_, nset = len(base["seeds"]), 5
+        ok(nd == 3 * (6 + 1) * (6 + 2) // 2 and q["wave1_points_run"] == nd + 2
+           and q["waves"]["design"] == _waves((nd + 2) * nset * ns_, VCPUS) + _waves(OPTION_A["wave2_n"] * nset * ns_,
+                                                                                    VCPUS)
+           and q["waves"]["chosen"] == 2 * nset * _waves(ns_, VCPUS)
+           and q["design_points"] == OPTION_A["wave2_n"]
            and q["reused_points"] == 0 and q["calibration_reused"] is False and q["calibration_runs"] > 0
            and q["not_fitted"] == [] and len(q["settings"]) == 5,
            f"FA3 the option A plan runs a fresh fit: no wave-1 point or calibration grid is reused (the training "
            f"targets changed), {nd} wave-1 points (3 per quadratic coefficient in 6 dimensions), "
-           f"{OPTION_A['wave2_n']} wave-2 points, the calibration grid ({q.get('calibration_runs')} runs): "
+           f"{OPTION_A['wave2_n']} wave-2 points, the calibration grid ({q.get('calibration_runs')} runs); wave 1 "
+           f"also runs benchmark.fit_joint's centre point and its own chosen point (Codex r1 P1-3), each design batch "
+           f"priced on its own: "
            f"${q['usd_real'][0]}-{q['usd_real'][1]} at the measured price")
     case("FA3", fa3)
 
     def fa4():
-        got = {}
-        for label, kw in (("the old verification round", {"verify_round": True}), ("no owner cap", {})):
-            try:
-                run(p, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=False, cap_usd=1e9, **kw)
-                got[label] = ""
-            except ValueError as ex:
-                got[label] = str(ex)
-        ok("declarations" in got["the old verification round"] and "cap" in got["no owner cap"]
-           and OPTION_A["cap_usd"] is None,
+        got, saved = {}, OPTION_A["cap_usd"]
+        OPTION_A["cap_usd"] = None             # Codex r1 P2: the refusal is tested whatever the production cap is
+        try:
+            for label, kw in (("the old verification round", {"verify_round": True}), ("no owner cap", {})):
+                try:
+                    run(p, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=False, cap_usd=1e9, **kw)
+                    got[label] = ""
+                except ValueError as ex:
+                    got[label] = str(ex)
+        finally:
+            OPTION_A["cap_usd"] = saved
+        ok("declarations" in got["the old verification round"] and "cap" in got["no owner cap"],
            f"FA4 option A refuses the old rounds' reuse (wave 1 ran on other fit declarations) and a full fit whose "
            f"cap is not the owner's (OPTION_A cap_usd unset until the owner sets it): {got}")
     case("FA4", fa4)
+
+    def fa5():
+        # Codex r1 P1-1: the owner's cap is the cap (no historical $25 floor under it); a caller may only lower it
+        got = {}
+        for label, args in (("owner 100, caller none", (False, False, None, 100.0)),
+                            ("owner 100, caller 40", (False, False, 40.0, 100.0)),
+                            ("owner 100, caller 400", (False, False, 400.0, 100.0)),
+                            ("verify round, caller none", (True, False, None, None)),
+                            ("smoke", (False, True, None, None))):
+            try:
+                got[label] = run_cap(*args)
+            except ValueError as ex:
+                got[label] = str(ex)
+        ok(got["owner 100, caller none"] == 100.0 and got["owner 100, caller 40"] == 40.0
+           and got["owner 100, caller 400"] == 100.0
+           and got["verify round, caller none"] == min(CAP_USD, VERIFY_ROUND["plan_cap_usd"])
+           and got["smoke"] is None,
+           f"FA5 option A's cap is the owner's OPTION_A cap, which a caller may lower but not raise; the verification "
+           f"round keeps its own: {got}")
+    case("FA5", fa5)
+
+    def fa6():
+        # Codex r1 P1-2, P2: an invalid verification count, a placeholder approval and a historical plan on this pack
+        # are refused before pricing or any engine set-up
+        got = {}
+        for label, fn in (("verify -100000", lambda: plan(p, verify=-100000)),
+                          ("verify 0", lambda: plan(p, verify=0)),
+                          ("verify round on the option A pack", lambda: plan(p, verify_round=True)),
+                          ("placeholder approval", lambda: run(p, base, 1, os.path.join(HERE, "x.yaml"),
+                                                               approved="<owner approval: x>", smoke=False))):
+            try:
+                fn()
+                got[label] = ""
+            except ValueError as ex:
+                got[label] = str(ex)
+        ok(all(got.values()) and "approval" in got["placeholder approval"]
+           and "verify" in got["verify 0"] and "WAVE1_TARGETS" in got["verify round on the option A pack"],
+           f"FA6 refused before pricing or engine set-up, each for its own reason: {got}")
+    case("FA6", fa6)
+
+    def fa7():
+        # Codex r1 P1-4: the launch's vm_job timeout covers the plan's upper wall time (vm_job's default is 24 h)
+        q = plan(p)
+        cmd = launch_command(VCPUS, q["wall_hours"][1])
+        mh = float(cmd[cmd.index("--max-hours") + 1]) if "--max-hours" in cmd else 0.0
+        ok(mh >= q["wall_hours"][1] + 1 and "--max-hours" in q["launch"],
+           f"FA7 the launch passes --max-hours {mh} above the plan's upper wall time {q['wall_hours'][1]} h")
+    case("FA7", fa7)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
