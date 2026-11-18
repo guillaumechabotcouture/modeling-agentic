@@ -555,7 +555,7 @@ def _self_test() -> int:
         i2 = _uq("uq_i2.yaml", "n_successful: 1\nscalar_outputs:\n"
                  "  x:\n    mean: 100\n    ci_low: 101\n    ci_high: 99\n"
                  "  y:\n    mean: 5\n    ci_low: 5\n    ci_high: 5\n")
-        ok([v["family"] for v in i2 if v["kind"] == "ci_degenerate"] == ["x"]
+        ok([(v["family"], v["severity"]) for v in i2 if v["kind"] == "ci_degenerate"] == [("x", "HIGH")]
            and all("inverted" in v["claim"] for v in i2 if v["kind"] == "ci_degenerate"),
            f"I2: inverted bounds are HIGH with a single draw too; a constant single-draw output is not; got {i2}")
         _decl(None)

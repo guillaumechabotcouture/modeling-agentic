@@ -42,6 +42,11 @@ def explicit_delivery(horizon) -> bool:
     return getattr(horizon, "delivery", None) is not None
 
 
+def _two_numbers(d) -> bool:
+    return isinstance(d, (list, tuple)) and len(d) == 2 and all(
+        isinstance(x, numbers.Real) and not isinstance(x, bool) for x in d)
+
+
 def delivery_problems(horizon) -> list[str]:
     """Why the delivery period is unusable: not two numbers t0 < t1, or not inside the decision window."""
     d = getattr(horizon, "delivery", None)
@@ -49,8 +54,7 @@ def delivery_problems(horizon) -> list[str]:
         return []
     # Fail closed on the shape before coercing: a string iterates as characters ("15" would read as [1.0, 5.0]), a
     # mapping as its keys, a bool as a number.
-    if not (isinstance(d, (list, tuple)) and len(d) == 2
-            and all(isinstance(x, numbers.Real) and not isinstance(x, bool) for x in d)):
+    if not _two_numbers(d):
         return [f"delivery period {d!r}: give [t0, t1], two numbers"]
     t0, t1 = (float(x) for x in d)
     w0, w1 = (float(x) for x in horizon.window)
@@ -67,7 +71,8 @@ def make_horizon(start, stop, window, windows=None, delivery=None) -> Horizon:
     w = tuple(window)
     if delivery is None:
         return Horizon(float(start), float(stop), w, dict(windows or {}))
-    return DeliveryHorizon(float(start), float(stop), w, dict(windows or {}), tuple(float(x) for x in delivery))
+    d = tuple(float(x) for x in delivery) if _two_numbers(delivery) else delivery   # malformed: kept, refused later
+    return DeliveryHorizon(float(start), float(stop), w, dict(windows or {}), d)
 
 
 def _self_test() -> int:
@@ -96,6 +101,9 @@ def _self_test() -> int:
            f"H5 a delivery period {bad!r} that is not a list or tuple of two real numbers is refused")
     ok(delivery_problems(DeliveryHorizon(0, 5, (0, 5), {}, delivery=(1, 2.5))) == [],
        "H5 a tuple of two numbers stays usable")
+    # H5b (Codex on #264, P1): make_horizon, the factory batch workers use, must not coerce "15" into (1.0, 5.0).
+    ok(all(delivery_problems(make_horizon(0, 5, [0, 5], delivery=bad)) for bad in ("15", ["1", "2"], [True, 2], [1])),
+       "H5b make_horizon keeps a malformed delivery period as given, so delivery_problems refuses it")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

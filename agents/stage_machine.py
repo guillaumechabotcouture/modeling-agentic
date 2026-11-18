@@ -455,9 +455,11 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
         try:
             import yaml
             with open(p) as fh:
-                doc = yaml.safe_load(fh) or {}
-            why = None if isinstance(doc, dict) and isinstance(doc.get("blockers") or [], list) else \
-                f"top level is {type(doc).__name__}, or its blockers are not a list"
+                doc = yaml.safe_load(fh)
+            # No defaults before the check (Codex on #264, P1): an empty or truncated file, or one without a
+            # `blockers` list (a required key), is unreadable, never "no blockers".
+            why = None if isinstance(doc, dict) and isinstance(doc.get("blockers"), list) else \
+                f"top level is {type(doc).__name__}, or it has no `blockers` list"
         except Exception as e:  # noqa: BLE001
             why = f"{type(e).__name__}: {str(e)[:160]}"
         if why is not None:
@@ -2374,7 +2376,8 @@ def _self_test() -> int:
         # decide (a schema error the critic is asked to repair; once the repairs are used the run ends
         # completed_gate_error), so open_findings, which runs only on a gate action, never sees it; and
         # open_findings itself reports such a file as an open HIGH, never skips it or raises.
-        for tag, body in (("garbled", "blockers: [unclosed\n  : -\n"), ("list", "- a\n- b\n"), ("text", "just prose\n")):
+        for tag, body in (("garbled", "blockers: [unclosed\n  : -\n"), ("list", "- a\n- b\n"), ("text", "just prose\n"),
+                          ("empty", ""), ("no_blockers", "reviewer: critique-domain\n"), ("false", "blockers: false\n")):
             dof = os.path.join(td, f"of_{tag}")
             os.makedirs(dof)
             shutil.copy(os.path.join(FX_DIR, "critique_redteam.yaml"), dof)
