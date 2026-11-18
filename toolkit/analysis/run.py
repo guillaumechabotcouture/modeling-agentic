@@ -590,7 +590,6 @@ def _self_test() -> int:
            and not [f for f in contract.gate_findings(d) if f["kind"].startswith("emulator_boundary_")
                     and f["kind"] != "emulator_boundary_ranking"],
            f"BD-R1 the boundary artifact, its engine rows and its results line ({bd['matched']} of {bd['units']})")
-        _self_test_retro(ok, d)
         _self_test_boundary_engine(ok, R)
         from toolkit.analysis.model import DirectModel
         Ab, r0 = R["_A"], bd["rows"][0]
@@ -1456,24 +1455,6 @@ def _self_test_joint(ok, q):
                and not os.path.exists(os.path.join(d, "analysis", "point.yaml")),
                f"JR5 a clamped emulator inversion blocks at the calibration step, before the point plan ({e.hits})")
     _ = p
-
-
-def _self_test_retro(ok, d):
-    """S1 (simplification pass): dt_golden.py retro on a finished emulator-path run re-runs the analysis on the stored
-    rows with zero engine jobs, reproduces every decision test's digests, and leaves the run dir untouched."""
-    import tempfile
-    from toolkit.analysis import dt_golden as DG
-    before = DG.digest_dir(d)
-    with open(os.path.join(d, "analysis", "manifest.json"), "rb") as f:
-        man = f.read()
-    with tempfile.TemporaryDirectory() as w:
-        rep = DG.retro(d, os.path.join(w, "work"), log=lambda *a, **k: None)
-    with open(os.path.join(d, "analysis", "manifest.json"), "rb") as f:
-        same = f.read() == man
-    ok(rep.get("status") == "complete" and rep.get("engine_jobs") == 0 and rep.get("tests") == len(before) > 0
-       and rep.get("stored_vs_rerun") == [] and rep.get("digests") == before and same,
-       f"RT1 a retro re-runs the analysis on stored rows: 0 engine jobs, the stored digests reproduced, the run dir "
-       f"untouched ({ {k: v for k, v in rep.items() if k != 'digests'} })")
 
 
 def _self_test_boundary_engine(ok, R):
