@@ -414,6 +414,14 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
            f"Signing accepts `{SPEC}` (sha256 `{hashlib.sha256(spec_bytes).hexdigest()[:16]}`) and the derived data "
            f"recorded in `{DERIVATIONS_RECORD}` (sha256 `{rsha[:16]}`). "
            "It also accepts what follows.", ""]
+    from toolkit.spec import evidence_dossier as ED
+    if dossier_bytes is None and ED.dossier_reference(raw):
+        try:
+            dossier_bytes = ED.read_dossier(run_dir, ED.dossier_reference(raw))
+        except ValueError:
+            dossier_bytes = None
+    from toolkit.spec import spec_critique as SC     # pre-sign spec critique, on the bytes this sheet shows and binds
+    out += SC.sheet_lines(raw, run_dir, dossier_bytes=dossier_bytes, burden_data=burden_bytes)
     eng = raw.get("engine")
     refs = [eng["ref"]] if isinstance(eng, dict) and eng.get("ref") else \
         (list(eng.get("candidates") or []) if isinstance(eng, dict) else [])
@@ -467,12 +475,6 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
     from toolkit.analysis import burden as BV
     out += BV.sheet_lines(raw, run_dir, burden_bytes)   # F6 S2-5: reference sources the owner attests are independent
-    from toolkit.spec import evidence_dossier as ED
-    if dossier_bytes is None and ED.dossier_reference(raw):
-        try:
-            dossier_bytes = ED.read_dossier(run_dir, ED.dossier_reference(raw))
-        except ValueError:
-            dossier_bytes = None
     out += ED.sheet_lines(raw, run_dir, dossier_bytes, closure)   # F6: each input, execution's vs the chosen value
     from toolkit.engines import benchmark_coverage as BC
     out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
@@ -487,6 +489,7 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
 
 def _self_test() -> int:
     import tempfile
+    from toolkit.spec.spec_critique import SECTION as SC_SECTION
     import yaml
     fails = []
 
@@ -736,6 +739,10 @@ def _self_test() -> int:
             "k": {"value": 0.9, "source": "a toy survey", "reason": "toy setting", "basis": "setting_data"}}
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         md = sheet(d)
+        cr = md.split(SC_SECTION)[-1].split("\n## ")[0] if SC_SECTION in md else ""
+        ok("| headline_comparator |" in cr
+           and md.index(SC_SECTION) < md.index("## Engine defaults accepted by name"),
+           f"SV0 the sheet opens with the pre-sign spec critique (toolkit/spec/spec_critique.py): {cr[:400]!r}")
         sec = md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0] \
             if "## Engine parameter values set by the spec" in md else ""
         ok(sec and "**HIGH**" in sec and sec.count("HIGH") == 1 and "a toy sweep" in sec and "toy headline" in sec

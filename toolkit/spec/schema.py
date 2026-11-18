@@ -119,6 +119,8 @@ docs/design/v2-spec-and-analysis.md §1):
     evidence:                              # F6: required when the options use a component whose engine card declares
       dossier: evidence_dossier.yaml       # decision inputs: signing refuses until each has a checked, sourced entry
                                            # (toolkit/spec/evidence_dossier.py); the signature binds the file's sha256
+    principle_departures:                  # optional: a decision design principle the spec departs from, by the
+      - {principle: 2, check: headline_comparator, reason: "..."}   # pre-sign check that finds it (spec_critique.py)
     deliverable:
       kind: package_per_unit
       allocation_file: allocation_optimized.csv
