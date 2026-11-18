@@ -384,6 +384,20 @@ def start_capture() -> None:
     DTm.run_one = run_one
 
 
+def golden_text(obs: dict) -> str:
+    """The golden file: one line per self-test function, {"<id>#<n>": "decision.detail.words[.plans]"}."""
+    by = {}
+    for k, v in obs.items():
+        fn, rest = k.rsplit(":", 1)
+        by.setdefault(fn, {})[rest] = ".".join(v[p] for p in PARTS if p in v)
+    return "{\n" + ",\n".join(f" {json.dumps(fn)}: {json.dumps(r, sort_keys=True)}" for fn, r in sorted(by.items())) \
+        + "\n}\n"
+
+
+def golden_read(text: str) -> dict:
+    return {f"{fn}:{k}": dict(zip(PARTS, v.split("."))) for fn, r in json.loads(text).items() for k, v in r.items()}
+
+
 def check_capture(ok, failed=()) -> None:
     """Stop capturing and compare the records with GOLDEN. MA_DT_GOLDEN_UPDATE=1 rewrites it instead, only when no
     earlier case of the self-test failed (a partial capture never becomes the baseline)."""
@@ -401,13 +415,12 @@ def check_capture(ok, failed=()) -> None:
                       "partial; the golden file is unchanged")
             return
         with open(GOLDEN, "w") as f:
-            f.write("{\n" + ",\n".join(f" {json.dumps(k)}: {json.dumps(v, sort_keys=True)}" for k, v in obs.items())
-                    + "\n}\n")
+            f.write(golden_text(obs))
         ok(bool(obs), f"DG-R1 {len(obs)} golden records written to {GOLDEN} ({UPDATE_ENV}=1)")
         return
     try:
         with open(GOLDEN) as f:
-            exp = json.load(f)
+            exp = golden_read(f.read())
     except (OSError, ValueError) as e:
         exp, err = {}, f"{type(e).__name__}: {e}"
     else:
@@ -456,7 +469,6 @@ def _self_test() -> int:
            "DG1 type, perturb and path leave the decision and detail digests; a sentence changes only the words")
         c = digest(_rec(share_units_changed=0.25))
         ok(c["decision"] != a["decision"], "DG1b a changed share changes the decision digest")
-    case("DG1", dg1)
 
     def dg2():
         a = digest(_rec())
@@ -470,7 +482,6 @@ def _self_test() -> int:
         ok(digest(r2)["decision"] != a["decision"], "DG2b a change at the 4th significant digit changes the digest")
         ok(canon(1) == canon(1.0) and canon(True) is True and canon(float("nan")) == "nan"
            and canon({"b": 1, "a": {3, 1}}) == {"a": [1, 3], "b": 1.0}, "DG2c ints equal floats; bools, NaN, sets")
-    case("DG2", dg2)
 
     def dg3():
         a = digest(_rec())
@@ -483,14 +494,6 @@ def _self_test() -> int:
            "DG3b the type's own block is detail")
         r = _rec(new_field=1)
         ok(digest(r)["decision"] != a["decision"], "DG3c an unknown field is decision (pinned, never ignored)")
-    case("DG3", dg3)
-
-    def dg4():
-        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
-            a = digest(_rec(arm_source=os.path.join(d1, "results.yaml")))
-            b = digest(_rec(arm_source=os.path.join(d2, "results.yaml")))
-            ok(a == b, "DG4 an absolute path keeps only its file name")
-    case("DG4", dg4)
 
     def dg5():
         e = {"A": {"decision": "1", "detail": "2", "words": "3"}, "B": {"decision": "1", "detail": "2", "words": "3"}}
@@ -498,23 +501,11 @@ def _self_test() -> int:
         diff = compare(e, g)
         ok(sorted(diff) == ["A: detail differs", "B: missing", "C: not expected"] and compare(e, e) == [],
            f"DG5 compare lists each differing part, missing and unexpected test ({diff})")
-    case("DG5", dg5)
 
     def dg6():
-        with tempfile.TemporaryDirectory() as d:
-            ok(_raises(lambda: digest_dir(d)), "DG6 a run without analysis/decision_tests.yaml is refused (fail closed)")
-            os.makedirs(os.path.join(d, "analysis"))
-            os.makedirs(os.path.join(d, "models", "decision_tests"))
-            yaml.safe_dump(_rec(), open(os.path.join(d, "models", "decision_tests", "DT1.yaml"), "w"))
-            tests = [{"test_id": "DT1", "path": "models/decision_tests/DT1.yaml", "status": "run"},
-                     {"test_id": "DT2", "path": None, "status": "not_run", "statement": "This test was not run: x."}]
-            yaml.safe_dump({"data": {"tests": tests}}, open(os.path.join(d, "analysis", "decision_tests.yaml"), "w"))
-            got = digest_dir(d)
-            ok(set(got) == {"DT1", "DT2"} and got["DT1"] == digest(_rec(), tests[0]) and got["DT2"]["decision"]
-               != got["DT1"]["decision"], f"DG6b each listed test digested, a not-run test from the summary ({got})")
-            os.remove(os.path.join(d, "models", "decision_tests", "DT1.yaml"))
-            ok(_raises(lambda: digest_dir(d)), "DG6c a listed result file that is missing is refused")
-    case("DG6", dg6)
+        obs = {"f.<locals>.one:DT1#0": {"decision": "a", "detail": "b", "words": "c"},
+               "g:DT1#0": {"decision": "a", "detail": "b", "words": "c", "plans": "d"}}
+        ok(golden_read(golden_text(obs)) == obs, "DG6 the golden file round-trips (one line per self-test function)")
 
     def dg7():
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -529,7 +520,6 @@ def _self_test() -> int:
             ok(r1 and r2 and g.refused == 2, f"DG7 under the guard compute.map_fn and the engine's run raise "
                                               f"EngineJobRefused ({r1}, {r2}, {g.refused})")
         ok(compute.map_fn is orig_map and ToyEngine.run is orig_run, "DG7b the guard restores both on exit")
-    case("DG7", dg7)
 
     def dg8():
         with tempfile.TemporaryDirectory() as d:
@@ -537,7 +527,6 @@ def _self_test() -> int:
             os.makedirs(os.path.join(w, "x"))
             ok(_raises(lambda: retro(d, w, log=lambda *a: None)), "DG8 retro refuses a work dir that is not empty")
             ok(_raises(lambda: retro(d, d, log=lambda *a: None)), "DG8b retro refuses the run dir as its work dir")
-    case("DG8", dg8)
 
     # ------------------------------------------------ Codex review r1 of #262 (written first; each failed)
     def dg9():
@@ -552,7 +541,6 @@ def _self_test() -> int:
         ok(r and g.refused == 1, "DG9 (P1-2) the engine's initial_state is an engine evaluation: refused")
         ok(nested and not hasattr(StateEngine, "__dg_guard__"),
            "DG9b (P2-5) a second guard while one is active is refused (no overlapping retros in one process)")
-    case("DG9", dg9)
 
     def dg10():
         with tempfile.TemporaryDirectory() as d:
@@ -568,7 +556,6 @@ def _self_test() -> int:
                and not os.path.exists(os.path.join(d, "target")), "DG10c (P1-3) an output that is a link is refused")
             write_out(os.path.join(d, "fine.json"), "{}", real)
             ok(open(os.path.join(d, "fine.json")).read() == "{}", "DG10d an output outside the run dir is written")
-    case("DG10", dg10)
 
     def fixture(d, tests, files):
         os.makedirs(os.path.join(d, "analysis"), exist_ok=True)
@@ -597,8 +584,10 @@ def _self_test() -> int:
                 fixture(d, tests, files)
                 ok(_raises(lambda: digest_dir(d), ValueError), f"DG11c (P1-6) refused: {what}")
         with tempfile.TemporaryDirectory() as d:
+            ok(_raises(lambda: digest_dir(d), FileNotFoundError), "DG11g a run without the artifact is refused")
             fixture(d, [run1], {"DT1.yaml": _rec()})
             a = digest_dir(d)["DT1"]
+            ok(a == digest(_rec(), run1), "DG11h a listed result is digested with its summary entry")
             fixture(d, [dict(run1, verdict="CHANGES_PLAN")], {"DT1.yaml": _rec()})
             ok(digest_dir(d)["DT1"]["decision"] != a["decision"], "DG11d (P1-6) the summary's verdict is decision")
             nr = {"test_id": "DT2", "path": None, "status": "not_run", "threshold_pct": 10.0, "statement": "x"}
@@ -610,7 +599,6 @@ def _self_test() -> int:
             os.remove(os.path.join(d, "models", "decision_tests", "DT1.yaml"))
             ok(_raises(lambda: digest_dir(d), StoredIncomplete),
                "DG11f (P1-7) a listed result file that is missing is StoredIncomplete, not an absent artifact")
-    case("DG11", dg11)
 
     def dg12():
         from toolkit.spec import schema
@@ -632,7 +620,6 @@ def _self_test() -> int:
             retro(d, os.path.join(w, "work2"), unsigned=True, log=lambda *a: None,
                   runner=lambda *a, **k: seen.update(k))
             ok(seen.get("draws") == 2, f"DG12c (P2-1) the retro re-runs with the run's own number of draws ({seen})")
-    case("DG12", dg12)
 
     def dg13():
         a = digest(_rec(perturbation_identity=[False]))
@@ -647,7 +634,6 @@ def _self_test() -> int:
            == digest(p("bb"))["decision"], "DG13c (P2-3) each case's allocation digest is its own part (plans)")
         ok(compare({"A": {"decision": "1"}}, {"A": {"decision": "1", "plans": "2"}}, parts=("decision",)) == [],
            "DG13d compare over named parts (stored records from before plans existed)")
-    case("DG13", dg13)
 
     def dg14():
         ok(canon("C:\\run\\inputs\\results.yaml") == "results.yaml" and
@@ -655,7 +641,8 @@ def _self_test() -> int:
            f"DG14 (P2-4) Windows paths and paths inside sentences keep their file name "
            f"({canon('prior from /tmp/abc/priors.yaml (card)')})")
         ok(canon(1e-14) == canon(0) and canon(-1e-13) == 0.0, "DG14b (P2-4) values below 1e-9 in size are zero")
-    case("DG14", dg14)
+        ok(digest(_rec(arm_source="/tmp/a/results.yaml")) == digest(_rec(arm_source="/var/b/results.yaml")),
+           "DG4 an absolute path keeps only its file name")
 
     def dg15():
         seen = []
@@ -672,8 +659,9 @@ def _self_test() -> int:
             DTm.run_one = saved
         ok(g0 == g1 and any(c is False and "refused" in m for c, m in seen),
            f"DG15 (P2-7) update mode refuses to rewrite the golden file after a failed case ({seen})")
-    case("DG15", dg15)
 
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg7, dg8, dg9, dg10, dg11, dg12, dg13, dg14, dg15):
+        case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
 

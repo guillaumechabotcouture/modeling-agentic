@@ -1178,8 +1178,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
 
 
 def plan_sha256(choice) -> str:
-    """sha256 of a plan ({unit: package}), canonical JSON: which unit receives which package, which the shares and
-    moves do not show (two units swapped give the same summaries)."""
+    """sha256 of a plan {unit: package}: which unit gets which package (the shares and moves do not show it)."""
     import hashlib
     import json
     return hashlib.sha256(json.dumps({str(k): str(v) for k, v in dict(choice).items()}, sort_keys=True).encode()
