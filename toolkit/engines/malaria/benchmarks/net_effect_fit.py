@@ -436,12 +436,19 @@ WAVE1_POINTS = 46 + VERIFY + 1        # wave 1's engine-evaluated points: design
 
 
 def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPUS, wave2_n: int = OPTION_A["wave2_n"],
-         wave1_n: int = OPTION_A["design_n"], verify_round: bool = False) -> dict:
+         wave1_n: int = OPTION_A["design_n"] + 2, verify_round: bool = False) -> dict:
     """Run counts and the price of the allocated VM (review round 2): vcpus x the wall time of each _map wave
     (calibration: cal_n calls of 42 single-arm tasks, none when wave 1's grid is reused; design: the wave-2 points,
     plus wave 1's when it runs here (a smoke); the chosen point: one call per training setting; the sample: one call),
     at VM_FACTOR x the laptop task time, plus START_H and POOL_S per pool. The defaults are option A's fresh fit (the
-    calibration grid, wave 1 and wave 2 all run); a verification round reuses wave 1's grid and points."""
+    calibration grid, wave 1 and wave 2 all run; wave 1's count includes benchmark.fit_joint's centre point and its own
+    chosen point, Codex r1 P1-3 on #269); a verification round reuses wave 1's grid and points. Refused (ValueError)
+    for a verification count below 1 or a verification round on a pack other than the one it ran on."""
+    if isinstance(verify, bool) or not isinstance(verify, int) or verify < 1:
+        raise ValueError(f"verify must be a whole number of joint-sample points >= 1, not {verify!r}")
+    if verify_round and list(pack["fit_joint"]["targets"]) != WAVE1_TARGETS:
+        raise ValueError(f"a verification round reuses wave 2's points, run on WAVE1_TARGETS {WAVE1_TARGETS}; this "
+                         f"pack's targets are {pack['fit_joint']['targets']}")
     fj, byid = pack["fit_joint"], {b["id"]: b for b in pack["benchmarks"]}
     arms = sorted({a for t in fj["targets"] for a in BM._arms_of(byid[t]["estimand"])})
     settings = _fit_settings(pack)
@@ -456,9 +463,11 @@ def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPU
     groups, sims = pts * len(settings) * ns, pts * len(arms) * ns
     cpu_h = (groups * GROUP_S + sims * ARM_S + cal * (GROUP_S + ARM_S)) / 3600
     dtasks = npts * len(settings) * ns
-    waves = {"calibration": cal_n * _waves(cal_tasks, vcpus), "design": _waves(dtasks, vcpus) if dtasks else 0,
-             "chosen": len(settings) * _waves(ns, vcpus), "sample": _waves(verify * len(settings) * ns, vcpus)}
-    pools = cal_n + len(settings) + sum(-(-n // 300) for n in (dtasks, verify * len(settings) * ns))
+    batches = [n * len(settings) * ns for n in (int(wave1_n), int(wave2_n)) if n]     # each design batch runs alone
+    waves = {"calibration": cal_n * _waves(cal_tasks, vcpus), "design": sum(_waves(t, vcpus) for t in batches),
+             "chosen": (2 if wave1_n else 1) * len(settings) * _waves(ns, vcpus),
+             "sample": _waves(verify * len(settings) * ns, vcpus)}
+    pools = cal_n + len(settings) + sum(-(-n // 300) for n in (*batches, verify * len(settings) * ns))
     lap = waves["calibration"] * _task_s(1) + (waves["design"] + waves["chosen"] + waves["sample"]) * _task_s(per_set)
     wall = [lap * f / 3600 + START_H + pools * POOL_S / 3600 for f in VM_FACTOR]
     vh = [vcpus * w for w in wall]
@@ -474,19 +483,22 @@ def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPU
             "vm_vcpu_hours": [round(v, 1) for v in vh],
             "usd": [round(vh[0] * USD_PER_VCPU_H[0], 1), round(vh[1] * USD_PER_VCPU_H[1], 1)],
             "usd_real": [round(v * USD_REAL_PER_VCPU_H, 1) for v in vh],
-            "launch": " ".join(launch_command(vcpus))}
+            "launch": " ".join(launch_command(vcpus, wall[1]))}
 
 
-def launch_command(vcpus: int = VCPUS) -> list:
+def launch_command(vcpus: int = VCPUS, wall_hours: float | None = None) -> list:
     """The option A launch (F6, OA3): one VM through cloud/vm_job.py, whose job meter stops the VM at --cap-usd in USD
     (cloud/budget.py); the fit writes a copy of its output under $JOB_OUT. Until the owner sets OPTION_A["cap_usd"] and
     gives the approval text, the command carries placeholders that vm_job and `run` refuse (fail closed). The
-    verification round's launch (owner, 14 Nov: cap $15, job f6-refit-netfit-v017r2, store round2) ran and is history."""
+    verification round's launch (owner, 14 Nov: cap $15, job f6-refit-netfit-v017r2, store round2) ran and is history.
+    --max-hours covers the plan's upper wall time plus an hour (vm_job's default is 24 h; Codex r1 P1-4 on #269)."""
+    import math
     cap = OPTION_A["cap_usd"]
+    hours = "<plan wall hours + 1>" if wall_hours is None else str(int(math.ceil(float(wall_hours) + 1)))
     return ["python3", "cloud/vm_job.py", "run", OPTION_A["job"], "net-effect-fit", "--tree", ".",
             "--store", OPTION_A["store"], "--store-account", "modelingagentic",
             "--cap-usd", "<owner cap>" if cap is None else f"{cap:g}",
-            "--budget-scope", "f6", "--cpu", str(vcpus), "--memory", f"{4 * vcpus} GiB", "--",
+            "--budget-scope", "f6", "--cpu", str(vcpus), "--memory", f"{4 * vcpus} GiB", "--max-hours", hours, "--",
             "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py", "run",
             "--approved", "<owner approval: option A net-effect fit, its cap>", "--margin-loo",
             "--workers", str(vcpus)]
@@ -1072,8 +1084,22 @@ def posterior_ranges(ne: dict, margin=0.0, bounds: dict | None = None) -> dict:
     return out
 
 
+def run_cap(verify_round: bool, smoke: bool, caller: float | None, owner: float | None) -> float | None:
+    """The cap `run` enforces (Codex r1 P1-1 on #269). Option A: the owner's OPTION_A cap (refused while unset), which a
+    caller may lower but not raise; the verification round: its own plan cap under the historical CAP_USD; a smoke:
+    none (it is small and writes only its scratch file)."""
+    if smoke:
+        return None
+    if verify_round:
+        return min(CAP_USD if caller is None else float(caller), VERIFY_ROUND["plan_cap_usd"])
+    if owner is None:
+        raise ValueError("option A's fit has no owner cap (OPTION_A['cap_usd'] is unset): the owner sets it with the "
+                         "fit's approval")
+    return float(owner) if caller is None else min(float(caller), float(owner))
+
+
 def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
-        verify: int = VERIFY, cap_usd: float = CAP_USD, vcpus: int | None = None, resume_from: str | None = None,
+        verify: int = VERIFY, cap_usd: float | None = None, vcpus: int | None = None, resume_from: str | None = None,
         margin_loo: bool = False, verify_round: bool = False, resume_account: str | None = None) -> int:
     """Wave 2 of the fit (with `verify_round`, VERIFY_ROUND: wave 2's points read from its stored checkpoint, a new
     joint sample verified): wave 1's points and calibration grid reused (load_wave1), WAVE2's points run, the surrogate
@@ -1086,18 +1112,14 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
         raise ValueError("net_effect_fit: " + "; ".join(bad))
     if not smoke and not (approved or "").strip():
         raise ValueError("the full fit spends more than $20: pass --approved with the owner's approval (or --smoke)")
+    if not smoke and (approved or "").strip().startswith("<"):
+        raise ValueError(f"--approved {approved!r} is the launch command's placeholder, not the owner's approval")
     nv = vcpus or max(int(workers), 1)
     fresh = smoke or not verify_round          # F6 option A: a fresh fit (smoke: the same steps, small)
-    q = plan(pack, verify, 2, nv, 3, int(pack["fit_joint"]["design"]["n"]) + 1) if smoke else plan(
+    q = plan(pack, verify, 2, nv, 3, int(pack["fit_joint"]["design"]["n"]) + 2) if smoke else plan(
         pack, verify, 0, nv, verify_round=True) if verify_round else plan(
-        pack, verify, CAL_N, nv, OPTION_A["wave2_n"], int(pack["fit_joint"]["design"]["n"]))
-    if verify_round:
-        cap_usd = min(cap_usd, VERIFY_ROUND["plan_cap_usd"])
-    elif not smoke:
-        if OPTION_A["cap_usd"] is None:
-            raise ValueError("option A's fit has no owner cap (OPTION_A['cap_usd'] is unset): the owner sets it with "
-                             "the fit's approval")
-        cap_usd = min(cap_usd, float(OPTION_A["cap_usd"]))
+        pack, verify, CAL_N, nv, OPTION_A["wave2_n"], int(pack["fit_joint"]["design"]["n"]) + 2)
+    cap_usd = run_cap(verify_round, smoke, cap_usd, OPTION_A["cap_usd"])
     if not smoke and max(q["usd"][1], q["usd_real"][1]) > cap_usd:
         raise ValueError(f"the plan's upper cost ${max(q['usd'][1], q['usd_real'][1])} on {q['vcpus']} vCPUs is above "
                          f"the cap ${cap_usd}")
@@ -2056,7 +2078,9 @@ def _self_test() -> int:
                     got[label] = str(ex)
         finally:
             OPTION_A["cap_usd"] = saved
-        ok("declarations" in got["the old verification round"] and "cap" in got["no owner cap"],
+        # the old round is refused at its plan (WAVE1_TARGETS, FA6) before load_wave1 (declarations) is reached
+        ok(("declarations" in got["the old verification round"] or "WAVE1_TARGETS" in got["the old verification round"])
+           and "cap" in got["no owner cap"],
            f"FA4 option A refuses the old rounds' reuse (wave 1 ran on other fit declarations) and a full fit whose "
            f"cap is not the owner's (OPTION_A cap_usd unset until the owner sets it): {got}")
     case("FA4", fa4)

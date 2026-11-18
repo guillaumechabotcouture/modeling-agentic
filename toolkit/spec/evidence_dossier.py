@@ -1333,7 +1333,9 @@ def _self_test_round4(ok, T) -> None:
                f"not the card file's: {ex['ranges'].get('cfp_kill')} vs {want}")
         else:
             ex = _exec_context(mal, {}, {})
-            ok(ex["fitted"] == {} and any("fitted values cannot be read" in p and str(refused) in p
+            # Codex r1 P2 on #269: only execution's evidence refusal of a stale fit counts, not any reader error
+            ok(type(refused).__name__ == "EvidenceError" and str(refused).startswith("refit required:")
+               and ex["fitted"] == {} and any("fitted values cannot be read" in p and str(refused) in p
                                           for p in ex["problems"]),
                f"ED-X1 while execution refuses the engine's fitted values, the dossier records execution's own reason as "
                f"a problem and shows no fitted range (fail closed): {type(refused).__name__}: {refused} | "
