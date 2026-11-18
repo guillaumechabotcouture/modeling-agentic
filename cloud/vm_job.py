@@ -951,6 +951,16 @@ def _self_test() -> int:
             open(os.path.join(ws.JOBS, "j2", "out", "runs", "R", "notes.md"), "w").write("new")
             sync_outputs(run, "j2", dest2)
             ok(_CR.copied_entry(lj) is None, "RC40c a later poll does not mark a record rewritten locally as copied")
+            # RC40d (Codex re-review of #256): a job record fetched before its run's run_state.json is marked once the
+            # run root appears
+            rj = os.path.join(ws.JOBS, "j2", "out", "runs", "S")
+            os.makedirs(os.path.join(rj, "analysis"))
+            open(os.path.join(rj, "analysis", "b.jsonl.job.json"), "w").write('{"pid": 6}')
+            sync_outputs(run, "j2", dest2)
+            open(os.path.join(rj, "run_state.json"), "w").write("{}")
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "S", "analysis", "b.jsonl.job.json")) is not None,
+               "RC40d a record fetched before its run root is marked when the root arrives")
             for bad in ("work/job.py", "state.json", "../../etc/passwd", "out/../state.json"):
                 try:
                     ws.job_chunk("j1", bad, 0, 10)

@@ -4001,14 +4001,22 @@ def _self_test_copied(ok) -> None:
         open(out + ".summary.json", "w").write(json.dumps({"n": 2, "launch": "L1"}))
         st = job_status(out)
         ok(st["state"] == RUNNING, f"CP7 a summary of another launch does not finish this job ({st['state']})")
-        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L2"}))
-        ok(job_status(out)["state"] == FINISHED, "CP7b this launch's summary finishes it")
+        open(out, "w").write('{"ok": true}\n')
+        dig = hashlib.sha256(open(out, "rb").read()).hexdigest()
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L2", "out_sha256": dig}))
+        ok(job_status(out)["state"] == FINISHED, "CP7b this launch's summary, matching the results, finishes it")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L2", "out_sha256": "0" * 64}))
+        ok(job_status(out)["state"] != FINISHED, "CP7c a summary whose out_sha256 is not the results file's does not")
         job(pid_start=start, host=os.uname().nodename)          # an older record (no launch), copied
         open(out + ".summary.json", "w").write(json.dumps({"n": 2}))
         CR.mark(d, "test copy 2", "2026-11-16T00:00:00Z")
         st = job_status(out)
         ok(st["state"] == COPIED, f"CP8 a copied job with a summary it cannot be bound to reads copied, not finished "
                                   f"(a copy refreshes mtimes) ({st['state']})")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 2, "out_sha256": dig}))
+        st = job_status(out)
+        ok(st["state"] == FINISHED, f"CP10 a copied legacy job whose summary's out_sha256 is the results file's is "
+                                    f"finished ({st['state']})")
         os.remove(out + ".summary.json")
         # P1-3: only the run root's marker counts; one planted below it is ignored
         job(pid_start=start, host=os.uname().nodename, n=6)

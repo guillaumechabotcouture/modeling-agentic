@@ -178,10 +178,15 @@ def _self_test() -> int:
         mark(os.path.join(d, "a"), "planted")
         ok(copied_entry(j) is not None and copied_entry(j)["source"] == "poll 1",
            "CR7b a marker below the run root is ignored")
+        kd = _sha(k)                                     # the bytes the copy downloaded
         open(k, "w").write('{"pid": 9}')                 # a local process rewrote it
-        mark(d, "poll 2", only=["a/b/c/d/e/f/g/h/x.jsonl.job.json"])
-        ok(copied_entry(k) is None and copied_entry(j) is not None,
-           "CR8 a later poll marks only what it fetched; a file rewritten locally is not re-marked")
+        mark(d, "poll 2", hashes={"a/b/c/d/e/f/g/h/x.jsonl.job.json": _sha(j), "y.jsonl.job.json": kd,
+                                  "notes.md": "ab"})
+        ok(copied_entry(k) is None and copied_entry(j) is not None and "notes.md" not in _load(d)["files"],
+           "CR8 a poll marks the bytes it downloaded (never re-hashed); a file rewritten locally does not match")
+        open(os.path.join(d, "a", "run_state.json"), "w").write("{}")      # planted below the run root
+        ok(run_root(j) == os.path.abspath(d) and copied_entry(j) is not None,
+           "CR10 the run root is the outermost run dir: a run_state.json planted below it changes nothing")
         ok(run_root(j) == os.path.abspath(d) and run_root(os.path.join(os.sep, "nonexistent", "x")) is None,
            "CR9 the run root is the nearest ancestor holding run_state.json or metadata.json")
     if fails:
