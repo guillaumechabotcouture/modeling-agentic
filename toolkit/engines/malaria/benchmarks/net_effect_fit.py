@@ -2092,7 +2092,9 @@ def _self_test() -> int:
                             ("owner 100, caller 40", (False, False, 40.0, 100.0)),
                             ("owner 100, caller 400", (False, False, 400.0, 100.0)),
                             ("verify round, caller none", (True, False, None, None)),
-                            ("smoke", (False, True, None, None))):
+                            ("smoke", (False, True, None, None)),
+                            ("caller nan", (False, False, float("nan"), 100.0)),
+                            ("owner inf", (False, False, None, float("inf")))):
             try:
                 got[label] = run_cap(*args)
             except ValueError as ex:
@@ -2100,7 +2102,7 @@ def _self_test() -> int:
         ok(got["owner 100, caller none"] == 100.0 and got["owner 100, caller 40"] == 40.0
            and got["owner 100, caller 400"] == 100.0
            and got["verify round, caller none"] == min(CAP_USD, VERIFY_ROUND["plan_cap_usd"])
-           and got["smoke"] is None,
+           and got["smoke"] is None and "finite" in str(got["caller nan"]) and "finite" in str(got["owner inf"]),
            f"FA5 option A's cap is the owner's OPTION_A cap, which a caller may lower but not raise; the verification "
            f"round keeps its own: {got}")
     case("FA5", fa5)
@@ -2119,18 +2121,26 @@ def _self_test() -> int:
                 got[label] = ""
             except ValueError as ex:
                 got[label] = str(ex)
-        ok(all(got.values()) and "approval" in got["placeholder approval"]
-           and "verify" in got["verify 0"] and "WAVE1_TARGETS" in got["verify round on the option A pack"],
+        ok("placeholder" in got["placeholder approval"] and "whole number" in got["verify -100000"]
+           and "whole number" in got["verify 0"] and "WAVE1_TARGETS" in got["verify round on the option A pack"]
+           and plan(p_w, verify_round=True)["launch"] is None,
            f"FA6 refused before pricing or engine set-up, each for its own reason: {got}")
     case("FA6", fa6)
 
     def fa7():
         # Codex r1 P1-4: the launch's vm_job timeout covers the plan's upper wall time (vm_job's default is 24 h)
-        q = plan(p)
-        cmd = launch_command(VCPUS, q["wall_hours"][1])
-        mh = float(cmd[cmd.index("--max-hours") + 1]) if "--max-hours" in cmd else 0.0
-        ok(mh >= q["wall_hours"][1] + 1 and "--max-hours" in q["launch"],
-           f"FA7 the launch passes --max-hours {mh} above the plan's upper wall time {q['wall_hours'][1]} h")
+        import shlex
+        got = {}
+        for v in (VERIFY, 1):
+            q = plan(p, verify=v)
+            cmd = shlex.split(q["launch"])                  # the printed command, as a shell reads it (Codex r2)
+            mh = float(cmd[cmd.index("--max-hours") + 1]) if "--max-hours" in cmd else 0.0
+            tail = cmd[cmd.index("--") + 1:]
+            got[v] = (mh, q["wall_hours"][1], tail[tail.index("--verify") + 1] if "--verify" in tail else None,
+                      cmd[cmd.index("--memory") + 1])
+        ok(all(mh >= w + 1 and vv == str(v) and mem.endswith("GiB") for v, (mh, w, vv, mem) in got.items()),
+           f"FA7 the printed launch passes --max-hours above the plan's upper wall time and the priced --verify "
+           f"count, and reads as one argument per value: {got}")
     case("FA7", fa7)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

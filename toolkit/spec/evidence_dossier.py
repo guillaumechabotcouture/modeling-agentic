@@ -1334,7 +1334,8 @@ def _self_test_round4(ok, T) -> None:
         else:
             ex = _exec_context(mal, {}, {})
             # Codex r1 P2 on #269: only execution's evidence refusal of a stale fit counts, not any reader error
-            ok(type(refused).__name__ == "EvidenceError" and str(refused).startswith("refit required:")
+            ok(type(refused).__name__ == "EvidenceError"
+               and str(refused) == "refit required: B9, B9b, B9c, B9d, B9e, B9f, B9g, fit_rule"
                and ex["fitted"] == {} and any("fitted values cannot be read" in p and str(refused) in p
                                           for p in ex["problems"]),
                f"ED-X1 while execution refuses the engine's fitted values, the dossier records execution's own reason as "
