@@ -59,7 +59,7 @@ poll copies new or changed files (and the log) to <out>/<name>/<job_id>/, so a V
 stops for any other reason loses at most one poll interval of outputs.
 
 The job's command runs in the shipped tree (`--tree`: git archive of HEAD; `--dir`: a
-plain directory), with secrets (`--anthropic-key`) in its environment only.
+plain directory, less .git, .venv, __pycache__ and a top-level runs/), with secrets (`--anthropic-key`) in its environment only.
 
 A command that runs main.py must state its pipeline (`--v2` or `--v1`; refused otherwise, before
 anything is created: main.py's default changed once, 2026-11-05). The job's environment names
@@ -251,6 +251,19 @@ def _code_commit(tree: str | None, src_dir: str | None) -> str:
     return pipeline_id.code_commit(src_dir) if src_dir else pipeline_id.UNKNOWN
 
 
+TARBALL_SKIP_ANY = {".git", ".venv", "__pycache__"}   # left out of a --dir archive at any depth
+TARBALL_SKIP_TOP = {"runs"}                            # left out at the top level: run outputs (gitignored)
+
+
+def _tarball_filter(ti: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    """A --dir archive leaves out VCS data, the virtualenv, bytecode and the run outputs, as `--tree`'s git
+    archive does (none of them are tracked)."""
+    parts = [p for p in ti.name.split("/") if p not in ("", ".")]
+    if any(p in TARBALL_SKIP_ANY for p in parts) or (parts and parts[0] in TARBALL_SKIP_TOP):
+        return None
+    return ti
+
+
 def _tarball(tree: str | None, src_dir: str | None) -> bytes | None:
     if tree:
         if subprocess.check_output(["git", "-C", tree, "status", "--porcelain"], text=True).strip():
@@ -259,7 +272,7 @@ def _tarball(tree: str | None, src_dir: str | None) -> bytes | None:
     if src_dir:
         b = io.BytesIO()
         with tarfile.open(fileobj=b, mode="w:gz") as t:
-            t.add(src_dir, arcname=".")
+            t.add(src_dir, arcname=".", filter=_tarball_filter)
         return b.getvalue()
     return None
 
@@ -1043,8 +1056,24 @@ def _self_test_pipeline(ok) -> None:
                 t.addfile(ti, io.BytesIO(b))
         ok(g["_launch_commit"](arch.getvalue(), "/nonexistent-tree", None) == "0123456",
            "VP8 the launch record's commit is the archive's, not the checkout's HEAD at submit time")
-        ok(g["_launch_commit"](_tarball(None, os.path.dirname(HERE)), None, os.path.dirname(HERE)) == "unknown",
+        # A small --dir tree holding the unexpanded stamp, as a checkout does (never the repo root: tarring it
+        # read runs/ and .venv into memory, external review 2026-11-17).
+        d8 = os.path.join(td, "src_vp8b")
+        os.makedirs(os.path.join(d8, "scripts", "lib"))
+        open(os.path.join(d8, "scripts", "lib", "code_commit.txt"), "w").write("$Format:%H$\n")
+        ok(g["_launch_commit"](_tarball(None, d8), None, d8) == "unknown",
            "VP8b (Codex r2) a --dir archive (no stamp) records commit unknown, not the live checkout's HEAD")
+        # VP10 (external review 2026-11-17): a --dir archive leaves out VCS, virtualenv, run outputs and bytecode.
+        d10 = os.path.join(td, "src_vp10")
+        for rel in (".git/HEAD", ".venv/bin/python", "runs/r1/report.md", "__pycache__/a.pyc",
+                    "scripts/__pycache__/b.pyc", "scripts/keep.py", "data/runs_note.txt", "data/x/runs/kept.csv"):
+            os.makedirs(os.path.dirname(os.path.join(d10, rel)), exist_ok=True)
+            open(os.path.join(d10, rel), "w").write("x")
+        with tarfile.open(fileobj=io.BytesIO(_tarball(None, d10)), mode="r:gz") as t:
+            names = {n[2:] if n.startswith("./") else n for n in t.getnames()}
+        ok({"scripts/keep.py", "data/runs_note.txt", "data/x/runs/kept.csv"} <= names
+           and not any(n.split("/")[0] in (".git", ".venv", "runs") or "__pycache__" in n.split("/") for n in names),
+           f"VP10 a --dir archive excludes .git, .venv, top-level runs/ and __pycache__ ({sorted(names)})")
         # VP9 (Codex r1 P2): a --dir archive (./-prefixed names) still records its input hashes.
         d2 = os.path.join(td, "srcdir")
         os.makedirs(os.path.join(d2, "data", "evals", "q"))

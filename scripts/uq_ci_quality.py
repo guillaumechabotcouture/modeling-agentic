@@ -255,15 +255,15 @@ def check(uq_report_path: str) -> list[dict]:
                 f"{output_name} mean {mean_f:.6g} vs 95% CI "
                 f"[{lo_f:.6g}, {hi_f:.6g}]"
                 + (f", p_nonzero {p:.3g}" if rare else ""))))
-        if not multi_draw:
-            continue  # effort floors own the n_draws minimum
         if lo_f > hi_f:
-            # Inverted bounds are a broken summary: no declaration or pin
-            # can exempt them.
+            # Inverted bounds are a broken summary at any draw count: no
+            # declaration, pin or single-draw run can exempt them.
             degenerate_by_family.setdefault(family, []).append((output_name, (
                 f"{output_name} 95% CI [{lo_f:.6g}, {hi_f:.6g}] is inverted "
                 f"(ci_low > ci_high)")))
             continue
+        if not multi_draw:
+            continue  # effort floors own the n_draws minimum
         if output_name in declared or (
                 stats.get("deterministic") is True
                 and str(stats.get("deterministic_reason") or "").strip()):
@@ -549,6 +549,15 @@ def _self_test() -> int:
                                  if v["kind"] == "ci_degenerate"),
            f"I1: inverted bounds are HIGH even under a matching pin or "
            f"with p_nonzero; got {i1}")
+        # I2 (external review 2026-11-17): inverted bounds are a broken summary at any draw count; the single-draw
+        # skip (effort floors own the n_draws minimum) must not hide them.
+        _decl(None)
+        i2 = _uq("uq_i2.yaml", "n_successful: 1\nscalar_outputs:\n"
+                 "  x:\n    mean: 100\n    ci_low: 101\n    ci_high: 99\n"
+                 "  y:\n    mean: 5\n    ci_low: 5\n    ci_high: 5\n")
+        ok([v["family"] for v in i2 if v["kind"] == "ci_degenerate"] == ["x"]
+           and all("inverted" in v["claim"] for v in i2 if v["kind"] == "ci_degenerate"),
+           f"I2: inverted bounds are HIGH with a single draw too; a constant single-draw output is not; got {i2}")
         _decl(None)
         r1 = _uq("uq_r1.yaml", "n_successful: 200\nscalar_outputs:\n"
                  "  x:\n    mean: 100\n    ci_low: 100\n    ci_high: 100\n"
