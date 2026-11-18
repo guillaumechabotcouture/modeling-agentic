@@ -94,6 +94,37 @@ Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
 
+## v0.18 scope: how much deterrence a PBO net keeps (F6 option A; owner, 2026-11-18, form P, fitted)
+
+**Why.** Equation 4 makes a PBO net a pyrethroid net at a higher bioassay mortality f(x). Above x of about 0.3 (93%
+of F6's LGAs), f is near 1, so hut mortality is near its ceiling (0.93). Equation 8 then cuts entry to 0.1-0.2, and
+the PBO net repels more than it kills: at x = 0.55, a new pyrethroid net kills 0.43 per attempt and a PBO net 0.11.
+Repelled mosquitoes retry and survive, so the community effect falls and the PBO benefit over pyrethroid nets goes to
+about 1.0 in the F6 batch. No pack trial is at x 0.3-0.9, and no source in hand measures entry at near-saturated hut
+mortality. `pbo_gain_scale` cannot change this (a larger gain pushes f closer to 1), nor can `pbo_adv_decay`.
+
+**What changed.** One parameter, `net_deter_sat` θ in [0, 1] (kind `fixed`, units share, default 1), acting on PBO
+nets only (`vector.hut_new_net`): a PBO net's entry becomes m_pyr + θ (m_pbo − m_pyr), with m_pyr the entry of a
+pyrethroid net at the same x and kill shift. Hut mortality l (and so k, j and the insecticide decay γ) stays the PBO
+net's. θ = 1 is Churcher's PBO net, on the same code path (V38 checks every net type, 6 resistance levels, 2 complexes
+and 9 ages bit for bit against the frozen v0.16 code). θ = 0 gives a PBO net a pyrethroid net's entry with PBO's
+higher hut mortality: at x = 0.55 it kills 0.58 per attempt; at Muleba (x = 0.088), 0.61 instead of 0.47. Pyrethroid and
+dual-AI nets do not change.
+
+**Rejected form (owner, 18 Nov).** A threshold on hut mortality for every net type (deterrence frozen above l_ref)
+needs a second constant with no source. At l_ref = 0.875 it does not restore PBO's killing (0.22 at x = 0.55); at 0.70
+it also changes pyrethroid nets at x ≥ 0.55 and the trial sites.
+
+**How it is set.** θ acts at the trial sites, so the PBO trials (B9-B9f, and B9g through the PBO arm) inform it. It
+joins the net-effect fit as its seventh parameter (`benchmarks/net_effect_fit.py`). It is confounded with
+`pbo_gain_scale` (both move a PBO net's killing per attempt), and the fit output reports their joint posterior. The card prior is
+its domain, uniform 0-1 (`priors.yaml`).
+
+**Evidence.** The engine identity changes, so the stored evidence (results, fitted values, equilibration and
+guess-sensitivity) is refused until `benchmarks/restamp_proof.py prove` shows the v0.17 and v0.18 outputs identical
+at the default and `restamp` re-stamps it. That proof runs engines, so it runs on Coiled through `cloud/vm_job.py`,
+not on a laptop.
+
 ## v0.17 scope: the net-type relative effects as parameters with ranges (owner, 2026-11-12 and 13; written before any fit)
 
 **What changed.** Up to v0.16 the inputs that decide between net types were module constants: the Churcher 2016 hut-trial coefficients (`vector.CHURCHER`, the PBO equation among them) and the way PBO's advantage decays. The uncertainty step never varied them, and the value-of-information estimate ignored them. v0.17 adds three engine parameters (kind `fixed`). At their defaults the engine gives v0.16's outputs exactly. All three are drawn card priors (`priors.yaml`).

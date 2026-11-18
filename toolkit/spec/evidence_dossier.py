@@ -17,7 +17,9 @@ shows it as a table and the signature binds its sha256, so an edit after sign-of
         model_value: ...                the value(s) the model uses
         model_source: "..."             where they come from
         observations:                   field or trial measurements, at least one ...
-          - {source, where, year, sites, n, sampling_frame, value}     where: URL or table
+          - {source, where, year, sites, n, sampling_frame, value}     where: URL or table; optional
+            follow_up_years: how long the study followed the effect (the sheet flags one shorter than the
+            objective window: toolkit/spec/spec_critique.py follow_up_window)
         comparison: "..."               ... and how they compare with the model value on the same estimand
         no_data: {reason, borrowing_rule}    ... or, instead, "no data" said explicitly with the rule borrowed by
         chosen: {value: ... | range: [lo, hi], rule: "..."}           the value or range used, and why
