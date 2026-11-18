@@ -57,10 +57,12 @@ def mark(run_dir: str, source: str, captured_at: str | None = None) -> dict | No
            "source": source, "files": files,
            "note": "these records were written by a process on the machine the run was copied from; they describe "
                    "it, not a process running here"}
-    tmp = os.path.join(run_dir, MARKER + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(doc, f, indent=1)
-    os.replace(tmp, os.path.join(run_dir, MARKER))
+    try:
+        from lib.safe_io import write_nofollow
+    except ImportError:            # run as scripts/lib/copied_run.py: scripts/ is not on the path
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, MARKER, json.dumps(doc, indent=1).encode(), atomic=True)   # no link followed, atomic
     return doc
 
 
