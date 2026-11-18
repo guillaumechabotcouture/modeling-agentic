@@ -221,8 +221,11 @@ def _self_test() -> int:
         missing = [i for i in by if i not in have]
         doc, why = BM.verified_results(MalariaEngine())
         if missing:
-            ok(doc is None and f"not yet run: {', '.join(missing)}" in str(why)
-               and not any(f"rerun required: {i}" in str(why) for i in missing),
+            # the rows' own check, apart from the identity check that refuses first after an engine version (v0.18)
+            from toolkit.engines.benchmark_sources import load_evidence
+            probs = " ".join(load_evidence(MalariaEngine(), rows=res.get("benchmarks") or []).problems)
+            ok(doc is None and f"not yet run: {', '.join(missing)}" in probs
+               and not any(f"rerun required: {i}" in probs for i in missing),
                f"PT6 a pack benchmark with no stored row refuses the record as not yet run ({missing}: {why})")
         else:
             ok(doc is not None and why is None,

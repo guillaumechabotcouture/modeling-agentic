@@ -41,6 +41,10 @@ v0.17 net-effect parameters (NET_DEFAULTS; the defaults reproduce the lines abov
   pbo_gain_scale  s:      logit(f_s) = logit(x) + s (logit(f) - logit(x)); s = 1 is Equation 4, s = 0 no PBO gain
   pbo_adv_decay   lambda: a PBO net of age t gives r_p(t) + exp(-lambda t)(r_b(t) - r_p(t)) (and d, insecticide
                   content alike), r_p a pyrethroid net of the same age; lambda = 0 keeps Churcher's PBO net
+v0.18 (F6 option A): net_deter_sat theta: a PBO net's entry m_b becomes m_p + theta (m_b - m_p), m_p a pyrethroid
+                  net's entry at the same x (and shift); l, k, j and gamma stay the PBO net's; theta = 1 keeps
+                  Churcher's PBO net (above x of about 0.3 its hut mortality saturates near 0.93, entry falls to
+                  0.1-0.2 and it repels more than it kills; no trial in the pack tests that deterrence)
 Note: Table 6 gives the funestus PBO row as two coefficients (2.53, 0.89); the linear form
 used for it is our reading of the table (flagged unverified in the engine card).
 
@@ -106,7 +110,10 @@ CHURCHER_SOURCE = "Churcher et al. 2016 eLife 10.7554/eLife.16090, Table 6 (PMC5
 #   net_kill_shift  added to alpha1 (hut-mortality logit, Equation 2) for every net type
 #   pbo_gain_scale  multiplies PBO's gain in bioassay-mortality logit (Equation 4)
 #   pbo_adv_decay   per year: a PBO net's outcomes move toward a same-age pyrethroid net's, weight exp(-decay t)
-NET_DEFAULTS = {"net_kill_shift": 0.0, "pbo_gain_scale": 1.0, "pbo_adv_decay": 0.0}
+# v0.18 (F6 option A, owner 18 Nov, form P; ENGINE_NOTES.md, v0.18):
+#   net_deter_sat   theta in [0, 1]: the share of a PBO net's extra entry reduction (deterrence) over a same-x
+#                   pyrethroid net that it keeps, m_pbo(theta) = m_pyr + theta (m_pbo - m_pyr); 1 = v0.17
+NET_DEFAULTS = {"net_kill_shift": 0.0, "pbo_gain_scale": 1.0, "pbo_adv_decay": 0.0, "net_deter_sat": 1.0}
 
 # Briet et al. 2020 Malar J, Additional file 2 Table S9 (PermaNet 2.0): (b0, b1 holes, b2 insecticide, b3 interaction).
 BRIET = {
@@ -237,6 +244,8 @@ def net_check(P) -> None:
         raise ValueError(f"net-effect parameters must be finite numbers: {v}")
     if v["pbo_gain_scale"] < 0 or v["pbo_adv_decay"] < 0:
         raise ValueError(f"pbo_gain_scale and pbo_adv_decay must be >= 0: {v}")
+    if not 0.0 <= v["net_deter_sat"] <= 1.0:
+        raise ValueError(f"net_deter_sat must be in [0, 1] (v0.18): {v['net_deter_sat']}")
 
 
 def pbo_bioassay(x, complex_: str = "gambiae", gain_scale: float = 1.0):
@@ -316,16 +325,30 @@ def adv_decay_from_prs(early, late, dt_years: float, clip: bool = True) -> tuple
     return pt, (max(0.0, pt - 1.959964 * s) if clip else pt - 1.959964 * s), pt + 1.959964 * s
 
 
-def hut_new_net(x, pbo: bool, complex_: str = "gambiae", kill_shift: float = 0.0, pbo_gain_scale: float = 1.0):
+def _entry(l):
+    """Churcher 2016 entry relative to an untreated hut, from hut mortality l (Equation 8), capped to [0, 1]."""
+    C = CHURCHER
+    return np.clip(1 - (C["d1"] + C["d2"] * (l - C["tau"]) + C["d3"] * (l - C["tau"]) ** 2), 0.0, 1.0)
+
+
+def hut_new_net(x, pbo: bool, complex_: str = "gambiae", kill_shift: float = 0.0, pbo_gain_scale: float = 1.0,
+                deter_sat: float = 1.0):
     """Churcher 2016 per-attempt outcomes of a NEW net: (r0, d0, s0, gamma per day). v0.17: kill_shift is added to
     the hut-mortality intercept alpha1 (Equation 2), so killing, deterrence, feeding and the insecticide decay all
-    follow Churcher's own relationships from the shifted hut mortality; pbo_gain_scale as in pbo_bioassay."""
+    follow Churcher's own relationships from the shifted hut mortality; pbo_gain_scale as in pbo_bioassay. v0.18:
+    deter_sat (net_deter_sat, PBO nets only) keeps that share of the PBO net's extra entry reduction over a
+    pyrethroid net at the same x (1: Churcher's PBO net, the same code path; 0: a pyrethroid net's entry); hut
+    mortality, and so killing among entering mosquitoes and the decay, stay the PBO net's."""
     C = CHURCHER
     x = np.clip(np.asarray(x, float), 0.0, 1.0)
+    x0 = x
     if pbo:
         x = pbo_bioassay(x, complex_, pbo_gain_scale)
     l = _expit(C["a1"] + kill_shift + C["a2"] * (x - C["tau"]))
-    m = np.clip(1 - (C["d1"] + C["d2"] * (l - C["tau"]) + C["d3"] * (l - C["tau"]) ** 2), 0.0, 1.0)
+    m = _entry(l)
+    if pbo and deter_sat != 1.0:
+        m_p = _entry(_expit(C["a1"] + kill_shift + C["a2"] * (x0 - C["tau"])))
+        m = m_p + float(deter_sat) * (m - m_p)
     k = C["th1"] * np.exp(C["th2"] * (1 - l - C["tau"]))
     j = np.clip(1 - l - k, 0.0, 1.0)
     jp, kp, lp = m * j + (1 - m), m * k, m * l
@@ -344,10 +367,11 @@ def itn_effect(net_type, x, age_d, P, complex_: str = "gambiae", holes: bool = T
     holes=False)."""
     net_type = np.asarray(net_type)
     age_d = np.maximum(np.asarray(age_d, float), 0.0)
-    shift, scale, lam = (float(P.get(k, d)) for k, d in NET_DEFAULTS.items())
+    shift, scale, lam, dsat = (float(P.get(k, NET_DEFAULTS[k])) for k in ("net_kill_shift", "pbo_gain_scale",
+                                                                            "pbo_adv_decay", "net_deter_sat"))
     out = []
     for pbo in (False, True):
-        r0, d0, _, gam = hut_new_net(x, pbo, complex_, shift, scale)
+        r0, d0, _, gam = hut_new_net(x, pbo, complex_, shift, scale, dsat)
         dec = np.exp(-gam * age_d)
         r = (r0 - CHURCHER["rM"]) * dec + CHURCHER["rM"]
         d = d0 * dec

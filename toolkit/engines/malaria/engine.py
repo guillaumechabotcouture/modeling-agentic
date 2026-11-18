@@ -131,6 +131,13 @@ pbo_adv_decay, the fading of a PBO net's advantage over a pyrethroid net. Their 
 bit for bit (vector.py V31); the identity fields of the evidence change, so the evidence is re-stamped after
 benchmarks/restamp_proof.py proves the outputs identical. Self-tests V31-V35 (vector.py) and NE0-NE3 (selftest_late.py).
 The trial fit (training targets only) is designed in ENGINE_NOTES.md, v0.17, and benchmarks/net_effect_fit.py.
+
+v0.18 (F6 option A, owner 2026-11-18, form P): net_deter_sat, the share of a PBO net's extra entry reduction over a
+pyrethroid net at the same bioassay mortality that it keeps. Above x of about 0.3, Equation 4 lifts a PBO net's hut
+mortality near its ceiling (0.93) and Equation 8's entry falls to 0.1-0.2, so the PBO net repels more than it kills
+and its benefit over a pyrethroid net vanishes; no pack trial tests that deterrence. Default 1 gives the v0.17 net
+outcomes bit for bit (vector.py V38); the evidence is re-stamped after benchmarks/restamp_proof.py proves the
+outputs identical. Self-tests V38-V39 (vector.py) and NE4 (selftest_late.py).
 """
 from __future__ import annotations
 
@@ -159,7 +166,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.17"
+VERSION = "0.18"
 # v0.12: case-management sources (ENGINE_NOTES.md, v0.12)
 ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
 ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
@@ -195,6 +202,12 @@ _PARAMS = [
     ("pbo_adv_decay", 0.0, "fixed", "per year", None, None, "decay rate of a PBO net's advantage over a same-age "
      "pyrethroid net (PBO lost from the net; Churcher 2016 has no such term); 0 = v0.16; drawn over the card prior "
      "from Staedke et al. 2020 Lancet (LLINEUP) Table 2 (priors.yaml)", "unverified"),
+    # v0.18 (F6 option A, owner 18 Nov, form P; ENGINE_NOTES.md, v0.18): the default reproduces v0.17 (vector.py V38)
+    ("net_deter_sat", 1.0, "fixed", "share", None, None, "share of a PBO net's extra entry reduction (deterrence) over "
+     "a pyrethroid net at the same bioassay mortality that it keeps (vector.hut_new_net): 1 = Churcher 2016's PBO net "
+     "(" + V.CHURCHER_SOURCE + ", Equations 4 and 8), 0 = a pyrethroid net's entry with the PBO net's hut mortality; "
+     "no trial in the pack measures it at near-saturated hut mortality; fitted with the PBO trials by the net-effect "
+     "fit (benchmarks/net_effect_fit.py)", "unverified"),
     ("irs_kill", 0.5, "fitted", "probability", 0.0, 0.95, "fitted: B12, B12b, B12m", "unverified"),
     ("irs_rep", 0.10, "fixed", "probability", None, None, A8, "unverified"),
     ("irs_half", 0.4 * 365., "fixed", "days", None, None, A8 + " (decay of the generic short-lived product only)", "unverified"),
