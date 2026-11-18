@@ -1167,7 +1167,7 @@ def _self_test_benchmark_gate(ok) -> None:
     # the engine is refused either for its uncovered cm component or, while a pack benchmark is not yet run (F6 option
     # A: B9d-B9g until the cloud pack run), for its refused benchmark record; the alias must match either way
     ok(not rc["eligible"] and strip(rc) == strip(ra)
-       and any("component cm" in w or "benchmark record refused" in w for w in ra["why_not"]),
+       and any("component cm" in w or ("benchmark record refused" in w and "not yet run" in w) for w in ra["why_not"]),
        f"G24 an alias import of the malaria engine is assessed exactly like the canonical reference "
        f"({strip(ra)[:1]})")
 
