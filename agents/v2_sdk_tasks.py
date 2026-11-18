@@ -532,14 +532,6 @@ class SdkTasks:
         return name
 
     def draft_spec(self, question, run_dir, feedback):
-        if run_dir and os.path.abspath(run_dir) != self.run_dir:
-            # F6 run 3: a rethink of a signed spec drafts in <run>.spec_proposal/ beside the run dir
-            # (agents/stage_machine.py proposal_dir), one session there with this call's allowance; the signed files in
-            # the run dir are outside its reach
-            t = SdkTasks(run_dir, allow_cloud=self.cloud, task_cap_usd=self.cap, max_turns=self.turns,
-                         query_fn=self.query_fn)
-            t.set_allowance(self.allowance, readback_usd=self.readback)
-            return t.draft_spec(question, run_dir, feedback)
         R = enforcement.REPO_ROOT
         p = f"Question:\n{question}\n" + (f"\nThe last draft failed validation:\n- " + "\n- ".join(feedback) if feedback else "")
         return self._session("draft_spec", PROMPTS["draft_spec"].format(
@@ -845,8 +837,7 @@ def _self_test() -> int:
                 call()
             except Exception as e:  # noqa: BLE001 -- the failure is the finding
                 errors[k] = f"{type(e).__name__}: {e}"
-        # PS1 (F6 run 3): a draft in the spec proposal dir runs its session there, with the call's allowance; the
-        # write-up findings reach the writer's prompt
+        # PS1 (F6 run 3): the write-up findings reach the writer's prompt
         where = {}
         orig_session = SdkTasks._session
 
@@ -857,16 +848,11 @@ def _self_test() -> int:
         try:
             t2 = SdkTasks(d)
             t2.set_allowance(1.5)
-            os.makedirs(d + ".spec_proposal", exist_ok=True)
-            t2.draft_spec("Q?", d + ".spec_proposal", None)
             t2.write(d, "declared", findings=[{"id": "R-030", "claim": "overstates", "fix_requires": "say tested"}])
         finally:
             SdkTasks._session = orig_session
-        pd_ = os.path.abspath(d) + ".spec_proposal"
-        ok(where.get("draft_spec", ())[:3] == (pd_, pd_, 1.5)
-           and "R-030: overstates Required: say tested" in where.get("write", ("", "", 0, ""))[3],
-           f"PS1 a proposal draft runs in the proposal dir; the writer gets the write-up findings {where.get('draft_spec')}")
-        __import__("shutil").rmtree(pd_, ignore_errors=True)
+        ok("R-030: overstates Required: say tested" in where.get("write", ("", "", 0, ""))[3],
+           "PS1 the writer gets the write-up findings with their remedies")
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")

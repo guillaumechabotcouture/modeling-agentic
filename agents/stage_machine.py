@@ -53,7 +53,7 @@ STATES = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE
 # (raised, never taken).
 EDGES = {
     "SPEC": {"SIGN", "SPEC", "FINAL"},
-    "SIGN": {"EVIDENCE", "SIGN", "SPEC"},
+    "SIGN": {"EVIDENCE", "SIGN"},
     "EVIDENCE": {"ENGINE_CHOICE"},
     "ENGINE_CHOICE": {"PREREGISTER", "CONFIGURE", "FINAL"},
     # The world model (docs/design/v2c-orchestration.md §14): beliefs anchored before the engine batch, scored after
@@ -897,133 +897,6 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
 
 OWNER_REQUEST_PRODUCER = "agents/stage_machine.py FIX_LOOP (owner amendments)"
 
-# F6 run 3: a SPEC rethink overwrote the owner-signed decision_spec.yaml in place. A rethink of a signed spec drafts
-# its proposal in proposal_dir(run_dir, k), <run_dir>.spec_proposal.<k> beside the run dir (lib.safe_io refuses a
-# write root inside a run dir), a copy of the spec's inputs laid out as a run dir, so every pre-sign check runs on it
-# unchanged; the signed files are never written. The owner signs the proposal there (`sign <run_dir>.spec_proposal.<k>
-# --by owner`); SIGN then copies the signed files to spec_history/<j>/, puts the proposal's in their place and keeps a
-# copy of the proposal in spec_history/<j>/proposal/.
-PROPOSAL_SUFFIX = ".spec_proposal"
-PROPOSAL_RECORD = "proposal.json"
-SEEDED = ".seeded"
-SPEC_HISTORY = "spec_history"
-SIGNOFF_SHEET = "decision_spec.signoff_sheet.md"
-# what a sign-off writes beside the spec (toolkit/spec/signoff.py, scripts/decision_brief.py, toolkit/spec/geometry.py)
-SIGN_ARTIFACTS = (SIGNOFF_FILE, "decision_brief.signoff.json", "decision_brief.signed", "data/geometry_signoff.json",
-                  "acceptance_lock.json", SIGNOFF_SHEET)
-# what the proposal starts from: the spec's own inputs (never the analysis, the critiques or a sign-off record)
-_PROPOSAL_SEED = (AB.SPEC_FILE, AB.SETTINGS_FILE, "decision_brief.yaml", "success_criteria.yaml", "data", "evidence")
-_PROPOSAL_SKIP = ("data/derived/", "data/geometry_signoff.json", "data/input_checks.json")
-
-
-def proposal_dir(run_dir: str, k: int) -> str:
-    """The proposal directory of SPEC visit `k`, beside the run dir (one per rethink; none is ever removed)."""
-    return f"{os.path.abspath(run_dir).rstrip(os.sep)}{PROPOSAL_SUFFIX}.{int(k)}"
-
-
-def spec_signed_once(run_dir: str) -> bool:
-    """A sign-off record exists for the run's spec (it was signed at least once)."""
-    return any(os.path.lexists(os.path.join(run_dir, f)) for f in (SIGNOFF_FILE, "decision_brief.signoff.json"))
-
-
-def proposal_pending(pdir: str | None) -> bool:
-    if not pdir:
-        return False
-    try:
-        return bool(json.load(open(os.path.join(pdir, PROPOSAL_RECORD))).get("pending"))
-    except (OSError, ValueError, AttributeError):
-        return False
-
-
-def _plain_files(root: str, rel: str) -> list[str]:
-    """Regular files at `rel` under `root` (a file, or a directory walked), relative to `root`; links are skipped."""
-    p = os.path.join(root, rel)
-    if os.path.islink(p):
-        return []
-    if os.path.isfile(p):
-        return [rel]
-    out = []
-    for r, dirs, files in os.walk(p):
-        dirs[:] = [x for x in dirs if not os.path.islink(os.path.join(r, x))]
-        out += [os.path.relpath(os.path.join(r, n), root).replace(os.sep, "/") for n in files
-                if not os.path.islink(os.path.join(r, n))]
-    return sorted(out)
-
-
-def _copy_into(src_root: str, dst_root: str, rel: str, dst_rel: str | None = None) -> None:
-    """src_root/rel -> dst_root/(dst_rel or rel), written with no link followed (dst_root is the safe_io root)."""
-    from lib.safe_io import write_nofollow
-    with open(os.path.join(src_root, rel), "rb") as f:
-        data = f.read()
-    dst_rel = dst_rel or rel
-    os.makedirs(os.path.dirname(os.path.join(dst_root, dst_rel)) or dst_root, exist_ok=True)
-    write_nofollow(dst_root, dst_rel, data, atomic=True)
-
-
-def _cited(root: str) -> list[str]:
-    """The files the spec at `root` cites, relative to it (scripts/pipeline.py cited_paths); [] when it is unreadable."""
-    import yaml
-    import pipeline as P
-    try:
-        spec = yaml.safe_load(open(os.path.join(root, AB.SPEC_FILE))) or {}
-        return sorted({str(r) for r in P.cited_paths(spec, root)})
-    except Exception:  # noqa: BLE001 -- the pre-sign checks report an unreadable spec
-        return []
-
-
-def seed_proposal(run_dir: str, k: int) -> str:
-    """The proposal directory of SPEC visit `k`, seeded from the signed spec's inputs and cited files (once: SEEDED is
-    written last, so an interrupted seeding is redone over the same files); returns its path."""
-    from lib.safe_io import write_nofollow
-    pdir = proposal_dir(run_dir, k)
-    if os.path.lexists(pdir) and (os.path.islink(pdir) or not os.path.isdir(pdir)):
-        raise ValueError(f"{pdir} is not a plain directory")
-    if os.path.isfile(os.path.join(pdir, SEEDED)):
-        return pdir
-    os.makedirs(pdir, exist_ok=True)
-    for top in tuple(_PROPOSAL_SEED) + tuple(_cited(run_dir)):
-        for rel in _plain_files(run_dir, top):
-            if not any(rel == s_.rstrip("/") or rel.startswith(s_) for s_ in _PROPOSAL_SKIP):
-                _copy_into(run_dir, pdir, rel)
-    write_nofollow(pdir, SEEDED, _now().encode(), atomic=True)
-    return pdir
-
-
-def promote_proposal(run_dir: str, pdir: str) -> str:
-    """The owner signed the proposal in `pdir`: every spec file it holds, and every sign-off record of the earlier spec,
-    is copied to spec_history/<k>/ (and removed when the proposal has none in its place); the proposal's files take
-    their place; the whole proposal is copied to spec_history/<k>/proposal/ and its record marked promoted. Every write
-    goes through lib.safe_io; nothing is moved. Returns spec_history/<k>."""
-    from lib.safe_io import remove_nofollow, write_nofollow
-    k = 1
-    while os.path.lexists(os.path.join(run_dir, SPEC_HISTORY, str(k))):
-        k += 1
-    hist_rel = f"{SPEC_HISTORY}/{k}"
-    # only the spec, its inputs and its sign-off records: never the session's own files (budget ledger, task I/O)
-    keep = tuple(_PROPOSAL_SEED) + tuple(SIGN_ARTIFACTS) + tuple(_cited(pdir))
-    every = _plain_files(pdir, ".")
-    new = [r for r in every if any(r == k_ or r.startswith(k_ + "/") for k_ in keep)]
-    old = set()
-    for rel in set(new) | set(SIGN_ARTIFACTS):
-        old |= set(_plain_files(run_dir, rel))
-    for rel in sorted(old):
-        _copy_into(run_dir, run_dir, rel, f"{hist_rel}/{rel}")
-    for rel in sorted(old - set(new)):
-        remove_nofollow(run_dir, rel)
-    for rel in new:
-        _copy_into(pdir, run_dir, rel)
-    for rel in every:
-        _copy_into(pdir, run_dir, rel, f"{hist_rel}/proposal/{rel}")
-    rec = {}
-    try:
-        rec = json.load(open(os.path.join(pdir, PROPOSAL_RECORD)))
-    except (OSError, ValueError):
-        pass
-    write_nofollow(pdir, PROPOSAL_RECORD, json.dumps(dict(rec, pending=False, promoted_to=hist_rel, promoted=_now()),
-                                                     indent=1).encode(), atomic=True)
-    return hist_rel
-
-
 def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list[str]) -> dict:
     """F6 run 3: the findings whose remedy is an owner amendment of the signed spec, written as a request in
     scripts/scope_signoff.py's format, so the owner reads it with `scope_signoff.py show` and answers with `sign`
@@ -1314,8 +1187,7 @@ class Machine:
         n = self.st.tries.get("spec", 0)
         if n >= MAX_SPEC_TRIES:
             return self._go("FINAL", "the spec did not validate", "run_failed")
-        # F6 run 3: a rethink of a signed spec drafts a proposal beside it (proposal_dir); the signed files stay as signed
-        rd = seed_proposal(self.run_dir, self._visit()) if spec_signed_once(self.run_dir) else self.run_dir
+        rd = self.run_dir
         stage_inputs(rd, self.st.question)
         fb = self.st.tries.get("spec_feedback")
         # The key is fixed before the call and the try is counted only once the call returns, so an
@@ -1349,11 +1221,6 @@ class Machine:
             self.st.tries["spec_feedback"] = errs
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
-        if rd != self.run_dir:
-            _write_json(rd, PROPOSAL_RECORD, {"pending": True, "round": self.st.round, "drafted": _now(),
-                                              "signed_spec_sha256": signed_hash(self.run_dir)})
-            self.st.tries["spec_proposal"] = rd
-            return self._go("SIGN", f"spec proposal drafted beside the signed spec ({rd})")
         return self._go("SIGN", "spec drafted and valid")
 
     def _derive(self, rd: str | None = None) -> list[str]:
@@ -1374,25 +1241,6 @@ class Machine:
         mode = self.st.signoff
         if mode == "none":
             return self._go("EVIDENCE", "sign-off not required (--signoff none)")
-        pdir = self.st.tries.get("spec_proposal")
-        if pdir and not proposal_pending(pdir):
-            # the drafted proposal is gone (a copied run dir does not carry it): never go on with the old spec
-            self.st.tries.pop("spec_proposal", None)
-            return self._go("SPEC", f"the spec proposal ({pdir}) is missing: the rethink drafts it again")
-        if proposal_pending(pdir):
-            # F6 run 3: a rethink's proposal replaces the signed spec only once the owner signs it (never the lead)
-            if self._signed_by(pdir) == "owner":
-                hist = promote_proposal(self.run_dir, pdir)
-                self.st.tries.pop("spec_proposal", None)
-                if self._signed_by() == "owner":
-                    return self._go("EVIDENCE", f"the owner signed the spec proposal; the earlier spec is in {hist}")
-                self.log(f"[machine] the promoted proposal does not verify as signed; the earlier spec is in {hist}")
-            else:
-                self.st.paused, self.st.status = "awaiting_signoff", None
-                save_state(self.run_dir, self.st)
-                self.log(f"[machine] a spec proposal waits for the owner (the signed spec is unchanged): read "
-                         f"{pdir}/{SIGNOFF_SHEET}, then python3 agents/stage_machine.py sign {pdir} --by owner")
-                return "SIGN"
         by = self._signed_by()
         # A HIGH geometry finding the spec proposes as an exception is the owner's to approve (review of #131, P1):
         # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
@@ -2314,54 +2162,6 @@ def _self_test() -> int:
            and load_state(d).budget_usd == 60.0
            and any(h.get("budget_raised") for h in load_state(d).history),
            f"R3-4b resumed with a higher cap, the run continues ({s2}, cap {load_state(d).budget_usd})")
-
-        # R3-2 (F6 run 3): a SPEC rethink on a signed spec drafts its proposal beside it (spec_proposal/); the signed
-        # file is untouched, and only a fresh owner signature on the proposal lets the run go on.
-        rk = {"id": "D-040", "severity": "HIGH", "target_stage": "PLAN", "claim": "the envelope is the wrong year"}
-
-        def spec40(question, run_dir):
-            sp = AB.toy_spec("units.csv")
-            sp.pop("engine")
-            sp["deliverable_file"] = {"path": "allocation_optimized.csv",
-                                      "columns": {"unit": "id", "package": "package", "dalys_averted": "dalys_averted"}}
-            if ".spec_proposal." in run_dir:
-                sp["constraints"]["envelope_usd"] = 21000
-            return sp
-        once40 = []
-        d, T, st = new_run("proposal", {"spec": spec40, "critics": {1: {"critique-domain": [rk]}},
-                                        "plan": lambda pk: {"tasks": [{"id": "T1", "findings": ["D-040"], "action": "rethink",
-                                                                       "owner_state": "SPEC", "brief": "redraft"}]}
-                                        if any(f["id"] == "D-040" for f in pk["findings"]) and not once40.append(1)
-                                        and len(once40) == 1 else {"tasks": [], "deferred": [
-                                            {"finding": f["id"], "reason": "t"} for f in pk["findings"]]}},
-                           signoff="owner", max_rounds=3)
-        m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
-        m.run()
-        sign(d, "owner", "first")
-        signed_bytes = open(os.path.join(d, AB.SPEC_FILE), "rb").read()
-        s = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
-        pdir = load_state(d).tries.get("spec_proposal") or (d + ".spec_proposal.0")
-        ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN"
-           and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes
-           and os.path.exists(os.path.join(pdir, AB.SPEC_FILE))
-           and b"21000" in open(os.path.join(pdir, AB.SPEC_FILE), "rb").read(),
-           f"R3-2 the rethink's draft is a proposal beside the untouched signed spec; SIGN waits ({s})")
-        if os.path.exists(os.path.join(pdir, AB.SPEC_FILE)):
-            st2 = load_state(d)
-            st2.signoff = "lead"                                  # a lead sign-off does not sign a proposal
-            save_state(d, st2)
-            s_lead = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
-            ok(s_lead == "paused:awaiting_signoff" and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes,
-               f"R3-2b in lead mode the proposal still waits for the owner ({s_lead})")
-            sign(pdir, "owner", "the amendment")
-            s3 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
-            hist = os.path.join(d, "spec_history", "1", AB.SPEC_FILE)
-            ok(not s3.startswith("paused") and b"21000" in open(os.path.join(d, AB.SPEC_FILE), "rb").read()
-               and os.path.exists(hist) and open(hist, "rb").read() == signed_bytes
-               and json.load(open(os.path.join(pdir, "proposal.json"))).get("promoted_to") == "spec_history/1"
-               and os.path.exists(os.path.join(d, "spec_history", "1", "proposal", AB.SPEC_FILE))
-               and (_signoff(d) or {}).get("note") == "the amendment",
-               f"R3-2c once the owner signs the proposal it replaces the spec, the old one kept in spec_history ({s3})")
 
         # T29: the deliverable destination must be a plain file inside the run, not one the harness owns.
         bad_paths = {}
