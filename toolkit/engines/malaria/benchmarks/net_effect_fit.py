@@ -63,9 +63,12 @@ PROTECTED = ("fitted.yaml", "results.yaml")
 # leave it (a target out of band everywhere in it is reported infeasible, a principle-4 finding, not a reason to
 # widen). F6 option A: the PBO boxes are their card priors (priors.yaml: pbo_gain_scale 0.316-1.0 from Gleave 2021's
 # hut-trial mortality RR, pbo_adv_decay 0-1.895 per year from LLINEUP's Table 2), used now that PBO trials are targets.
+# Engine v0.18 (owner, 18 Nov, form P, fitted): net_deter_sat, PBO nets only, over its card prior (its domain 0-1).
 NET_PARAMS = {"net_kill_shift": ({"pyr", "pbo", "dual"}, [-0.618, 0.66]),
               "pbo_gain_scale": ({"pbo"}, [0.316, 1.0]),
-              "pbo_adv_decay": ({"pbo"}, [0.0, 1.895])}
+              "pbo_adv_decay": ({"pbo"}, [0.0, 1.895]),
+              "net_deter_sat": ({"pbo"}, [0.0, 1.0])}
+CONFOUNDED = [("pbo_gain_scale", "net_deter_sat")]   # owner, 18 Nov: report their joint posterior in the fit output
 # owner, 13 Nov: cfp_half joins the fit. cfp_half is the half-life, in days of net age, of the chlorfenapyr kill share
 # (vector.py: cfp_kill exp(-ln2 t / cfp_half)). Wave 1's box, 547.5-1277.5 days (attempt 8's 1.5-3.5 y), put its
 # accepted region at both box edges. Wave 2's box, 270-1650 days, is a design box, not a prior: no published half-life
@@ -98,13 +101,14 @@ WAVE1_BOX = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill
              "cfp_half": [547.5, 1277.5]}
 WAVE2 = {"n": 48, "seed": 23, "margin": 0.25}
 WAVE1_TARGETS = ["B10", "B11", "B12", "B12b", "B12m"]     # the fit targets waves 1 and 2 and verification round 2 ran on
-# F6 option A (owner, 18 Nov; AMENDMENTS.md section 11): a fresh fit on the net trials at their own estimands. Wave 1:
-# 3 points per quadratic coefficient in the 6 fitted dimensions (28 coefficients: 84), as DESIGN did in 4; wave 2: the
-# same rule plus 3, as WAVE2 did (48 = 3 x 15 + 3), in wave 1's accepted hull widened by WAVE2's margin. Shared data:
+# F6 option A (owner, 18 Nov; AMENDMENTS.md section 11): a fresh fit on the net trials at their own estimands, with
+# its own target declaration (fit record (b)). Wave 1: 3 points per quadratic coefficient in the 7 fitted dimensions
+# (36 coefficients: 108), as DESIGN did in 4; wave 2: the same rule plus 3, as WAVE2 did (48 = 3 x 15 + 3), in wave 1's
+# accepted hull widened by WAVE2's margin. Shared data:
 # pbo_adv_decay's prior box was derived from LLINEUP (B9d, B9f), now also targets; B9g is B10 / B9c of the same arms, so
 # it adds a same-trial contrast, not independent data. cap_usd is the owner's, set here when the fit is approved.
 OPTION_A = {"targets": ["B9", "B9b", "B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11", "B12", "B12b", "B12m"],
-            "design_n": 84, "wave2_n": 87, "cap_usd": None,
+            "design_n": 108, "wave2_n": 111, "cap_usd": None,
             "store": "outputs/_engine/net_effect_fit/option_a", "job": "f6-netfit-optiona"}
 # Verification round 2 (owner, 14 Nov): wave 2 (cluster 2377496) ran with candidates over the whole box, so its chosen
 # point and two failed points sat at cfp_half ~1,600 days, past wave 2's design box (extrapolation). This round reads
@@ -155,16 +159,21 @@ def train_nets(pack: dict, train: list) -> set:
     return {str((pack["arms"][a].get("package") or {}).get("net")) for a in arms} - {"None"}
 
 
-def build_pack(base: dict, smoke: bool = False) -> dict:
-    """The pack with its own targets and a joint fit over its fitted parameters, cfp_half, and every net-effect
-    parameter that a training arm identifies. Benchmarks, settings and targets are the pack's (smoke: small runs)."""
+def build_pack(base: dict, smoke: bool = False, targets: list | None = None) -> dict:
+    """The pack with the fit's own targets and a joint fit over the pack's fitted parameters, cfp_half, and every
+    net-effect parameter that a training arm identifies. Benchmarks and settings are the pack's (smoke: small runs).
+    `targets`: the fit's declared targets, OPTION_A's by default (owner, 18 Nov, fit record (b): the net-effect fit
+    declares its own, apart from the pack's fit_joint, so fitted.yaml stays valid); WAVE1_TARGETS for the history."""
     p = copy.deepcopy(base)
-    train, _ = split(base)
+    train = list(OPTION_A["targets"] if targets is None else targets)
+    unknown = sorted(set(train) - {b["id"] for b in base["benchmarks"]})
+    if unknown:
+        raise ValueError(f"net-effect fit targets {unknown} are not benchmarks of the pack")
     nets = train_nets(base, train)
     params = {k: list(b) for k, (acts, b) in NET_PARAMS.items() if acts & nets}
     params.update({k: list(v) for k, v in base["fit_joint"]["params"].items()})
     params.update({k: list(v) for k, v in FIT_EXTRA.items()})
-    option_a = sorted(train) == sorted(OPTION_A["targets"])         # F6 option A: a fresh wave 1 in 6 dimensions
+    option_a = sorted(train) == sorted(OPTION_A["targets"])         # F6 option A: a fresh wave 1 in 7 dimensions
     design = dict(DESIGN, n=OPTION_A["design_n"]) if option_a else dict(DESIGN)
     p["fit_joint"] = {"rule": "joint-v1", "params": params, "targets": train, "design": design}
     if smoke:
@@ -176,12 +185,15 @@ def build_pack(base: dict, smoke: bool = False) -> dict:
 
 
 def check(pack: dict, base: dict) -> list[str]:
-    """Why `pack` may not be fitted: a target that is not one of the base pack's fit targets (held out)."""
-    train, held = split(base)
+    """Why `pack` may not be fitted: its targets are not one of the fit's declarations (OPTION_A's, or the history's,
+    the pack's own fit targets WAVE1_TARGETS); a target in neither is held out."""
+    decl = [list(OPTION_A["targets"]), list(split(base)[0])]
     t = list(pack["fit_joint"]["targets"])
-    bad = [f"{x} is held out in pack.yaml (not one of its fit targets {train}): it may not be a target" for x in t
-           if x in held]
-    return bad + ([f"targets {t} differ from the pack's fit targets {train}"] if sorted(t) != sorted(train) else [])
+    known = set().union(*map(set, decl))
+    bad = [f"{x} is held out (in no declaration of this fit, {decl}): it may not be a target" for x in t
+           if x not in known]
+    return bad + ([f"targets {t} differ from the fit's declarations {decl}"]
+                  if not any(sorted(t) == sorted(d) for d in decl) else [])
 
 
 def _fit_settings(pack: dict) -> list:
@@ -625,7 +637,7 @@ def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256, pack: 
             raise ValueError(f"wave 1 {path}: engine {k} {have.get(k)}, this engine's is {want[k]}")
     if base != yaml.safe_load(open(PACK)):
         raise ValueError(f"wave 1 {path}: the pack given is not pack.yaml")
-    eff = build_pack(base) if pack is None else pack       # the pack the runner executes (Codex r1 P2 on #266)
+    eff = build_pack(base, targets=WAVE1_TARGETS) if pack is None else pack   # the runner's pack (Codex r1 on #266)
     if _fit_digest(eff) != WAVE1_FIT_DECLARATIONS_SHA256:
         raise ValueError(f"wave 1 {path}: the effective pack's fit declarations (sha256 {_fit_digest(eff)}) are not "
                          f"the declarations wave 1 ran on ({WAVE1_FIT_DECLARATIONS_SHA256})")
@@ -842,7 +854,7 @@ def point_in_band(p: dict, bands: dict, seeds) -> tuple[bool, dict]:
 
 def pack_bands() -> dict:
     """The fit's targets' bands from pack.yaml (the loader's replay uses these, never bands written in the file)."""
-    return target_bands(build_pack(yaml.safe_load(open(PACK))))
+    return target_bands(build_pack(yaml.safe_load(open(PACK))))         # the option A declaration's bands
 
 
 def pack_seeds() -> list:
@@ -918,9 +930,26 @@ PURPOSE = ("trial fit of the v0.17 net-effect parameters on the pack's training 
            "adopted only through a signed spec's uncertainty.net_effect_posterior (load_posterior)")
 
 
+def confounding(reg: dict, pairs=CONFOUNDED) -> list:
+    """Owner, 18 Nov: each CONFOUNDED pair's correlation in the joint sample (the surrogate's all-in-band region), so
+    the output shows how far the trials separate them; a pair not both fitted is left out."""
+    c = reg.get("correlation") or {}
+    names, m = list(c.get("names") or []), c.get("matrix") or []
+    out = []
+    for a, b in pairs:
+        if a in names and b in names:
+            i, j = names.index(a), names.index(b)
+            out.append({"pair": [a, b], "correlation": m[i][j], "sample_n": len(reg.get("sample") or
+                                                                                reg.get("sample_unverified") or []),
+                        "hull": {k: (reg.get("hull") or {}).get(k) for k in (a, b)}})
+    return out
+
+
 def document(eng, reg: dict, q: dict, smoke: bool, **rest) -> dict:
-    """The output file's document (run() writes it; load_posterior reads it): the plan's box, the joint region."""
-    return BM.stamp(dict({"purpose": PURPOSE, "smoke": smoke, "plan": q}, **rest, joint_region=reg), eng)
+    """The output file's document (run() writes it; load_posterior reads it): the plan's box, the joint region and
+    the confounded pairs' joint posterior (confounding)."""
+    return BM.stamp(dict({"purpose": PURPOSE, "smoke": smoke, "plan": q}, **rest, joint_region=reg,
+                         confounding=confounding(reg)), eng)
 
 
 def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> None:
@@ -1243,14 +1272,29 @@ def _self_test() -> int:
 
     base = yaml.safe_load(open(PACK))
     p = build_pack(base)
-    train, held = split(base)
-    # F6 option A: waves 1-2 and the verification round ran on the pack with WAVE1_TARGETS; the tests of their reuse
-    # and refusals use that pack (base_w, p_w), written to a temporary PACK where load_wave1 reads the file
+    train, held = split(p)          # the fit's own declaration (option A, fit record (b)), not the pack's fit_joint
+    # F6 option A: waves 1-2 and the verification round ran with the pack's own fit targets (WAVE1_TARGETS, still the
+    # pack's fit_joint); the tests of their reuse and refusals use that declaration (p_w), with PACK at a temporary
+    # copy where load_wave1 reads the file
     base_w = copy.deepcopy(base)
-    base_w["fit_joint"]["targets"] = list(WAVE1_TARGETS)
-    p_w, (train_w, held_w) = build_pack(base_w), split(base_w)
+    p_w = build_pack(base_w, targets=WAVE1_TARGETS)
+    train_w, held_w = split(p_w)
 
     import contextlib
+
+    @contextlib.contextmanager
+    def wave1_identity():
+        # engine v0.18 changed the code identity, so wave 1's output (v0.17) is refused by its identity first; the
+        # reuse tests below check the other conditions with the identity wave 1 recorded (a test double)
+        from toolkit.engines import contract as CT
+        orig = CT.engine_identity
+        rec = (yaml.safe_load(open(WAVE1)) or {}).get("engine_identity") or {}
+        CT.engine_identity = lambda eng: dict(orig(eng), **{k: rec[k] for k in ("name", "code_sha256", "params_sha256",
+                                                                                 "config_sha256") if k in rec})
+        try:
+            yield
+        finally:
+            CT.engine_identity = orig
 
     @contextlib.contextmanager
     def as_pack(doc):
@@ -1266,18 +1310,19 @@ def _self_test() -> int:
                 PACK = orig
     byid = {b["id"]: b for b in p["benchmarks"]}
     arms_ok = all(a in p["arms"] for t in p["fit_joint"]["targets"] for a in BM._arms_of(byid[t]["estimand"]))
-    ok(p["fit_joint"]["targets"] == train == base["fit_joint"]["targets"] and arms_ok and not check(p, base)
+    ok(p["fit_joint"]["targets"] == train == OPTION_A["targets"] and arms_ok and not check(p, base)
+       and base["fit_joint"]["targets"] == WAVE1_TARGETS == train_w
        and {"B7", "B8", "B15"} <= set(held) and not set(held) & set(train)
        and {"B9", "B9b", "B9c"} <= set(held_w) and not check(p_w, base_w),
-       f"F1 the targets are the pack's own fit targets {train}; B7, B8, B15 and the rest are held out (waves 1-2: "
-       f"B9, B9b, B9c held out too)")
-    for t in ("B9c", "B7"):
+       f"F1 the targets are the fit's own declaration {train} (fit record (b)); the pack's fit_joint keeps "
+       f"{WAVE1_TARGETS}; B7, B8, B15 and the rest are held out (waves 1-2: B9, B9b, B9c held out too)")
+    for t, want in (("B9c", "differ from the fit's declarations"), ("B7", "B7 is held out")):
         q = copy.deepcopy(p_w)
         q["fit_joint"]["targets"].append(t)
-        ok(any(f"{t} is held out" in x for x in check(q, base_w)),
-           f"F1b a held-out benchmark ({t}) as a target is refused")
+        ok(any(want in x for x in check(q, base_w)),
+           f"F1b a target list that is no declaration of the fit ({t} added to waves 1-2's) is refused: {want}")
     ok(list(p_w["fit_joint"]["params"]) == ["net_kill_shift", "cfp_kill", "irs_kill", "cfp_half"]
-       and "pbo" not in train_nets(base_w, train_w) and p_w["fit_joint"]["params"]["cfp_half"] == [270.0, 1650.0],
+       and "pbo" not in train_nets(p_w, train_w) and p_w["fit_joint"]["params"]["cfp_half"] == [270.0, 1650.0],
        "F2 the fit takes net_kill_shift (training arms use pyrethroid and dual-AI nets), cfp_kill, irs_kill and cfp_half "
        "(owner, 13 Nov; wave-2 box 270-1650 days, from the durability studies); on waves 1-2's targets the PBO "
        "parameters stay out: no training arm has a PBO net")
@@ -1301,7 +1346,8 @@ def _self_test() -> int:
            and q["settings"] == ["benin", "irs_added", "misungwi", "muleba"]
            and q["calibration_runs"] == 0 and q["calibration_reused"] is True
            and q["arm_runs"] == (n2 + 1 + 12) * 8 * 8
-           and q["not_fitted"] == ["pbo_adv_decay", "pbo_gain_scale"] and q["held_out_untouched"] == held_w
+           and q["not_fitted"] == ["net_deter_sat", "pbo_adv_decay", "pbo_gain_scale"]
+           and q["held_out_untouched"] == held_w
            and q["vcpus"] == VCPUS and w["calibration"] == 0 and w["chosen"] == 4
            and w["design"] == _waves(n2 * 4 * 8, VCPUS) and w["sample"] == _waves(12 * 4 * 8, VCPUS)
            and q["usd"][1] > naive and len(q["usd_real"]) == 2 and q["usd_real"][1] < CAP_USD
@@ -1684,7 +1730,7 @@ def _self_test() -> int:
     case("F28", f28)
 
     def f19():
-        with as_pack(base_w):
+        with as_pack(base_w), wave1_identity():
             f19_(base_w, train_w)
 
     def f19_(base, train):
@@ -1750,7 +1796,7 @@ def _self_test() -> int:
         train_pk = copy.deepcopy(base_w)
         train_pk["settings"]["muleba"]["calibrate"]["grid"] = [8, 16, 32]
         got, orig = {}, PACK
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, wave1_identity():
             for label, pk in (("held", held_pk), ("train", train_pk)):
                 PACK = os.path.join(d, f"{label}.yaml")
                 yaml.safe_dump(pk, open(PACK, "w"), sort_keys=False)
@@ -1763,10 +1809,10 @@ def _self_test() -> int:
                     PACK = orig
         # Codex r1 P2-3 on #266: the check binds the pack the runner executes (build_pack's), not only the base
         # (F6 option A: on the pack wave 1 ran on, base_w, so the refusal is the effective pack's, not the new targets')
-        eff = build_pack(base_w)
+        eff = build_pack(base_w, targets=WAVE1_TARGETS)
         eff["settings"]["misungwi"]["params"]["n_agents"] = 999
         try:
-            with as_pack(base_w):
+            with as_pack(base_w), wave1_identity():
                 load_wave1(WAVE1, e, base_w)                  # the unchanged effective pack is accepted first
                 got["effective_ok"] = ""
                 load_wave1(WAVE1, e, base_w, pack=eff)
@@ -2030,25 +2076,27 @@ def _self_test() -> int:
     # so the PBO trials (B9, B9b, B9c, LLINEUP's B9d-B9f) and Misungwi's dual-AI vs PBO contrast (B9g) become training
     # targets beside B10, B11 and the IRS targets; B7, B8, B15 and the rest stay held out
     def fa1():
-        tr, ho = split(base)
-        ok(tr == OPTION_A["targets"] == base["fit_joint"]["targets"]
+        tr, ho = split(p)
+        ok(tr == OPTION_A["targets"] and base["fit_joint"]["targets"] == WAVE1_TARGETS
            and {"B9", "B9b", "B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11"} <= set(tr)
            and {"B12", "B12b", "B12m"} <= set(tr) and {"B7", "B8", "B15"} <= set(ho) and not set(tr) & set(ho),
-           f"FA1 option A: the pack's fit targets are the net trials at their own estimands plus the IRS targets "
-           f"({tr}); B7, B8, B15 and the rest are held out")
+           f"FA1 option A: the net-effect fit's own declaration (fit record (b)) is the net trials at their own "
+           f"estimands plus the IRS targets ({tr}); the pack's fit_joint keeps {WAVE1_TARGETS}, so fitted.yaml stays "
+           f"valid; B7, B8, B15 and the rest are held out")
     case("FA1", fa1)
 
     def fa2():
         card = PR.load_card(e)["priors"]
         bx = p["fit_joint"]["params"]
-        ok(sorted(bx) == sorted(["net_kill_shift", "pbo_gain_scale", "pbo_adv_decay", "cfp_kill", "irs_kill",
-                                 "cfp_half"])
-           and "pbo" in train_nets(base, split(base)[0])
-           and all(bx[k] == [card[k].lo, card[k].hi] for k in ("net_kill_shift", "pbo_gain_scale", "pbo_adv_decay"))
+        ok(sorted(bx) == sorted(["net_kill_shift", "pbo_gain_scale", "pbo_adv_decay", "net_deter_sat", "cfp_kill",
+                                 "irs_kill", "cfp_half"])
+           and "pbo" in train_nets(p, split(p)[0])
+           and all(bx[k] == [card[k].lo, card[k].hi] for k in ("net_kill_shift", "pbo_gain_scale", "pbo_adv_decay",
+                                                                "net_deter_sat"))
            and calibration_params(p) == {"net_kill_shift"}
            and _fit_settings(p) == ["benin", "irs_added", "llineup", "misungwi", "muleba"],
-           f"FA2 option A fits net_kill_shift, pbo_gain_scale, pbo_adv_decay, cfp_kill, cfp_half and irs_kill; the "
-           f"three net-effect boxes are their card priors; the calibration arms still depend on net_kill_shift only; "
+           f"FA2 option A fits net_kill_shift, pbo_gain_scale, pbo_adv_decay, net_deter_sat (v0.18), cfp_kill, "
+           f"cfp_half and irs_kill; the four net-effect boxes are their card priors; the calibration arms still depend on net_kill_shift only; "
            f"the LLINEUP site joins ({ {k: bx[k] for k in sorted(bx)} })")
     case("FA2", fa2)
 
@@ -2056,7 +2104,7 @@ def _self_test() -> int:
         q = plan(p)
         nd = OPTION_A["design_n"]
         ns_, nset = len(base["seeds"]), 5
-        ok(nd == 3 * (6 + 1) * (6 + 2) // 2 and q["wave1_points_run"] == nd + 2
+        ok(nd == 3 * (7 + 1) * (7 + 2) // 2 and q["wave1_points_run"] == nd + 2
            and q["waves"]["design"] == _waves((nd + 2) * nset * ns_, VCPUS) + _waves(OPTION_A["wave2_n"] * nset * ns_,
                                                                                     VCPUS)
            and q["waves"]["chosen"] == 2 * nset * _waves(ns_, VCPUS)
@@ -2064,7 +2112,7 @@ def _self_test() -> int:
            and q["reused_points"] == 0 and q["calibration_reused"] is False and q["calibration_runs"] > 0
            and q["not_fitted"] == [] and len(q["settings"]) == 5,
            f"FA3 the option A plan runs a fresh fit: no wave-1 point or calibration grid is reused (the training "
-           f"targets changed), {nd} wave-1 points (3 per quadratic coefficient in 6 dimensions), "
+           f"targets changed), {nd} wave-1 points (3 per quadratic coefficient in 7 dimensions), "
            f"{OPTION_A['wave2_n']} wave-2 points, the calibration grid ({q.get('calibration_runs')} runs); wave 1 "
            f"also runs benchmark.fit_joint's centre point and its own chosen point (Codex r1 P1-3), each design batch "
            f"priced on its own: "
@@ -2147,6 +2195,20 @@ def _self_test() -> int:
            f"FA7 the printed launch passes --max-hours above the plan's upper wall time and the priced --verify "
            f"count, and reads as one argument per value: {got}")
     case("FA7", fa7)
+
+    def fa8():
+        # owner, 18 Nov: the output reports pbo_gain_scale and net_deter_sat's joint posterior (both move a PBO net's
+        # killing per attempt at the trial sites)
+        nm, bx = ["pbo_gain_scale", "net_deter_sat"], np.array([[0.316, 1.0], [0.0, 1.0]])
+        g = np.linspace(0, 1, 7)
+        X = np.array([[u, v] for u in g for v in g])
+        r = joint_region(X, {"T": np.exp(X[:, 0] + X[:, 1])}, {"T": [np.exp(0.95), np.exp(1.05)]}, nm, bx, 3)
+        c = confounding(r)
+        doc = document(e, r, {}, True)
+        ok(len(c) == 1 and c[0]["pair"] == nm and c[0]["correlation"] < -0.9 and doc.get("confounding") == c
+           and confounding({"correlation": {"names": ["pbo_gain_scale"], "matrix": [[1.0]]}}) == [],
+           f"FA8 the fit output records each confounded pair's correlation in the joint sample ({c})")
+    case("FA8", fa8)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
