@@ -2281,6 +2281,20 @@ def _self_test() -> int:
         ok(shipped_cap == 250.0, f"FA12 the owner's cap for the option A fit (18 Nov, 1 VM of 96 vCPUs) is $250: "
                                  f"{shipped_cap}")
     case("FA12", fa12)
+
+    def fa13():
+        # owner, 18 Nov: the Esv5 family (25 x E8s_v5 quota on record; Dsv5 headroom unknown). Coiled tries the first
+        # type and does not fall back on a quota refusal, so the launch's memory must make an E*s_v5 type first
+        import shlex
+        from cloud import budget as BU
+        got = {}
+        for v in (16, 96):
+            cmd = shlex.split(plan(p, vcpus=v)["launch"])
+            mem = cmd[cmd.index("--memory") + 1]
+            got[v] = BU.resolve_vm_types(v, mem)[0][0]
+        ok(got == {16: "Standard_E16s_v5", 96: "Standard_E96s_v5"},
+           f"FA13 the printed launch resolves to the Esv5 family first ({got})")
+    case("FA13", fa13)
     OPTION_A["cap_usd"] = shipped_cap
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
