@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
-"""Red flag: the most expensive option of a component group wins in nearly every unit (owner, 2026-11-17).
+"""Red flag, a critic heuristic: the most expensive option of a component group wins in nearly every unit.
 
     python3 toolkit/analysis/red_flag.py --self-test
 
 When an optimiser chooses the dearest alternative almost everywhere, either its extra effect is real and large
-everywhere, or the engine overstates it (for example an effect carried outside the settings its trials covered). The
-plan cannot go to WRITE on that pattern until the run records why it wins. The gate (toolkit/analysis/contract.py)
-raises a HIGH finding, not declarable, until `mechanism_checks.yaml` in the run directory holds a check for it:
-
-    checks:
-      - group: <options.components group>
-        component: <the component that wins>
-        why_it_wins: "<the mechanism: which part of benefit per cost (burden, relative effect, price) makes it win,
-                      and why that holds in these units>"
-        evidence: ["<a trial, benchmark or dossier entry that the mechanism rests on, with how it compares>", ...]
+everywhere, or the engine overstates it. This is a note the critics see, never a gate and never a finding: the v2
+critique task (agents/v2_sdk_tasks.py critique) adds `critic_notes(run_dir)` to the reviewer's message, and the
+reviewer judges whether it needs a blocker (owner direction 2026-11-18: no one-incident rules in the gate).
 
 Rule: a group (two or more components sharing options.components.<c>.group) whose components carry fixed cost items;
 in each unit whose plan holds one of the group, the dearest is the component with the highest fixed cost in that unit
 (cost items with a basis other than per_outcome, through toolkit/alloc/costs.py item_cost; per_outcome items depend
-on the model and are left out, which the finding states). The flag is raised when the dearest is chosen in at least
+on the model and are left out, which the note states). The note is written when the dearest is chosen in at least
 SHARE of those units and in at least MIN_UNITS of them. Nothing here names a disease.
 """
 from __future__ import annotations
@@ -34,7 +27,6 @@ if ROOT not in sys.path:
 
 SHARE = 0.9          # "nearly all units"
 MIN_UNITS = 5        # a pattern, not a handful of units
-RECORD = "mechanism_checks.yaml"
 
 
 def flags(alloc: dict, units: list, plan: dict) -> list:
@@ -74,59 +66,30 @@ def flags(alloc: dict, units: list, plan: dict) -> list:
     return out
 
 
-def record_problems(run_dir: str, flag: dict) -> list:
-    """Why the run's mechanism record does not cover `flag` ([] when it does). Fail closed on an unreadable file."""
-    p = os.path.join(run_dir, RECORD)
+def critic_notes(run_dir: str) -> list[str]:
+    """The heuristic notes for the critics ([] when there is no plan or nothing to note). Never raises: a note that
+    cannot be computed says so."""
+    p = os.path.join(run_dir, "analysis", "point.yaml")
     if not os.path.exists(p):
-        return [f"no {RECORD}"]
+        return []
     try:
+        from toolkit.alloc import costs
+        from toolkit.spec import schema
         with open(p, encoding="utf-8") as fh:
-            doc = yaml.safe_load(fh)
-    except (OSError, ValueError, yaml.YAMLError) as e:
-        return [f"{RECORD} unreadable: {type(e).__name__}"]
-    checks = doc.get("checks") if isinstance(doc, dict) else None
-    if not isinstance(checks, list):
-        return [f"{RECORD} has no list `checks`"]
-    for c in checks:
-        if not isinstance(c, dict) or c.get("group") != flag["group"] or c.get("component") != flag["component"]:
-            continue
-        why, ev = c.get("why_it_wins"), c.get("evidence")
-        if not (isinstance(why, str) and why.strip()):
-            return [f"{RECORD}: the check of {flag['component']} has no why_it_wins"]
-        if not (isinstance(ev, list) and ev and all(isinstance(x, str) and x.strip() for x in ev)):
-            return [f"{RECORD}: the check of {flag['component']} has no evidence list"]
-        return []
-    return [f"{RECORD} has no check for group {flag['group']}, component {flag['component']}"]
-
-
-def findings(run_dir: str, point: dict | None) -> list:
-    """Gate findings (toolkit/analysis/contract.py): one HIGH per uncovered flag; [] without a plan."""
-    if not isinstance(point, dict) or not isinstance(point.get("plan"), dict):
-        return []
-    from toolkit.alloc import costs
-    from toolkit.spec import schema
-    try:
-        sp = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
-        alloc = sp.alloc_spec()
-        fl = flags(alloc, costs.load_units(alloc, run_dir), point["plan"])
-    except Exception as e:  # noqa: BLE001 -- fail closed: the check could not run
-        return [{"kind": "red_flag_mechanism", "severity": "HIGH", "stage": "ANALYZE", "scope_declarable": False,
-                 "key": "red_flag", "source": "toolkit/analysis/red_flag.py",
-                 "claim": f"the most-expensive-option check could not run: {type(e).__name__}: {e}"}]
-    out = []
-    for f in fl:
-        bad = record_problems(run_dir, f)
-        if bad:
-            out.append({"kind": "red_flag_mechanism", "severity": "HIGH", "stage": "ANALYZE",
-                        "scope_declarable": False, "key": f"red_flag:{f['group']}:{f['component']}",
-                        "source": "toolkit/analysis/red_flag.py",
-                        "claim": (f"The dearest option of group {f['group']} is chosen in {100 * f['dearest_share']:.0f}% "
-                                  f"of the {f['units']} units whose plan holds the group ({f['component']} wins: "
-                                  f"{f['chosen']}; fixed cost items only, per-outcome costs left out). Before WRITE, "
-                                  f"record in {RECORD} why it wins (which of burden, relative effect or price drives "
-                                  f"it, and why that holds in these units) with the trial or benchmark evidence it "
-                                  f"rests on: {'; '.join(bad)}")})
-    return out
+            doc = yaml.safe_load(fh) or {}
+        plan = (doc.get("data") or doc).get("plan")
+        if not isinstance(plan, dict) or not plan:
+            return []
+        alloc = schema.load(os.path.join(run_dir, "decision_spec.yaml")).alloc_spec()
+        fl = flags(alloc, costs.load_units(alloc, run_dir), plan)
+    except Exception as e:  # noqa: BLE001 -- a heuristic: say it could not run, never stop the review
+        return [f"The most-expensive-option heuristic could not run ({type(e).__name__}: {e})."]
+    return [f"Heuristic (not a finding): the dearest option of group {f['group']} is chosen in "
+            f"{100 * f['dearest_share']:.0f}% of the {f['units']} units whose plan holds the group ({f['component']} "
+            f"wins: {f['chosen']}; fixed cost items only). Check the mechanism: which of burden, relative effect or "
+            f"price makes it win, and whether its effect in these units rests on trial evidence or on the engine "
+            f"carrying an effect beyond the settings its trials covered. Raise a blocker only if it does not hold."
+            for f in fl]
 
 
 def _self_test() -> int:
@@ -161,24 +124,25 @@ def _self_test() -> int:
         ok(len(flags(a3, units, plan)) == 1, "RF6 per-outcome items are left out of the price comparison")
     except Exception as e:  # noqa: BLE001
         ok(False, f"RF1-6 raised {type(e).__name__}: {e}")
-    f = {"group": "g", "component": "hi"}
     with tempfile.TemporaryDirectory() as d:
-        ok(record_problems(d, f) == [f"no {RECORD}"], "RF7 no record: the flag stands")
-        p = os.path.join(d, RECORD)
-        for body, want in (("{not yaml", "unreadable"), ("checks: 3\n", "no list"),
-                           ("checks: [{group: g, component: lo, why_it_wins: w, evidence: [e]}]\n", "no check"),
-                           ("checks: [{group: g, component: hi, why_it_wins: ' ', evidence: [e]}]\n", "why_it_wins"),
-                           ("checks: [{group: g, component: hi, why_it_wins: w, evidence: []}]\n", "evidence")):
-            open(p, "w").write(body)
-            got = record_problems(d, f)
-            ok(len(got) == 1 and want in got[0], f"RF8 a record that does not cover the flag ({want}): {got}")
-        open(p, "w").write("checks: [{group: g, component: hi, why_it_wins: 'the trial shows a larger effect at a "
-                           "small price gap', evidence: ['benchmark T2 in band']}]\n")
-        ok(record_problems(d, f) == [], "RF9 a complete record covers the flag")
-        ok(findings(d, None) == [] and findings(d, {"plan": "x"}) == [], "RF10 no plan: nothing to check")
-        fs = findings(d, {"plan": {}})
-        ok(len(fs) == 1 and fs[0]["severity"] == "HIGH" and fs[0]["scope_declarable"] is False
-           and "could not run" in fs[0]["claim"], f"RF11 an unreadable spec fails closed: {fs}")
+        ok(critic_notes(d) == [], "RF7 no analysis: no note")
+        os.makedirs(os.path.join(d, "analysis"))
+        open(os.path.join(d, "analysis", "point.yaml"), "w").write("data: {plan: {'1': a}}\n")
+        got = critic_notes(d)
+        ok(len(got) == 1 and "could not run" in got[0], f"RF8 a note that cannot be computed says so, never raises: {got}")
+        from unittest import mock
+        with mock.patch(__name__ + ".flags", lambda *a: [{"group": "g", "component": "hi", "dearest_share": 1.0,
+                                                          "units": 10, "chosen": {"hi": 10}}]), \
+                mock.patch("toolkit.spec.schema.load", lambda p: type("S", (), {"alloc_spec": lambda self: alloc})()), \
+                mock.patch("toolkit.alloc.costs.load_units", lambda a, d: units):
+            got = critic_notes(d)
+        ok(len(got) == 1 and got[0].startswith("Heuristic (not a finding)") and "group g" in got[0],
+           f"RF9 a flag becomes a note for the critics: {got}")
+    import ast
+    src = open(os.path.join(ROOT, "toolkit", "analysis", "contract.py")).read()
+    ok("red_flag" not in src, "RF10 the gate (toolkit/analysis/contract.py) does not use it")
+    tasks = open(os.path.join(ROOT, "agents", "v2_sdk_tasks.py")).read()
+    ok("critic_notes(run_dir)" in tasks and ast.parse(tasks) is not None, "RF11 the critique task adds the notes")
     print(f"{'FAIL' if fails else 'OK'}: " + (f"{len(fails)} case(s) failed" if fails else
                                                "all self-test cases passed."))
     return 1 if fails else 0
