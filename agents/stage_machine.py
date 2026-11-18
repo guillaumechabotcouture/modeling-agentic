@@ -2024,6 +2024,41 @@ def _self_test() -> int:
         ok(all("allowance_usd" in e for k, e in jj.items() if not k.endswith("spec_sha256")),
            "T28 every journal entry records the allowance it was given")
 
+        # R3-2 (F6 run 3, gap 2; narrowed, lead decision): a SPEC rethink of a signed spec never redrafts it in the run.
+        # The machine writes spec_rethink_request.json (why: the rethink's brief, the findings and their remedies) and
+        # pauses for the owner, who amends the spec and relaunches with reuse; the signed files stay as signed.
+        rk = {"id": "D-040", "severity": "HIGH", "target_stage": "PLAN", "claim": "the envelope is the wrong year",
+              "fix_requires": "redraft the envelope for the decision year"}
+        once40 = []
+
+        def plan40(pk):
+            if any(f["id"] == "D-040" for f in pk["findings"]) and not once40:
+                once40.append(1)
+                return {"tasks": [{"id": "T1", "findings": ["D-040"], "action": "rethink", "owner_state": "SPEC",
+                                   "brief": "redraft the envelope"}]}
+            return {"tasks": []}
+        d, T, st = new_run("rethink_signed", {"critics": {1: {"critique-domain": [rk]}}, "plan": plan40},
+                           signoff="owner", max_rounds=3)
+        _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        sign(d, "owner", "first")
+        signed_bytes = open(os.path.join(d, AB.SPEC_FILE), "rb").read()
+        T2 = StubTasks(T.s)
+        s = _SpikeMachine(d, T2, None, log=lambda *a: None, cross_engine_check=False).run()
+        try:
+            rq = json.load(open(os.path.join(d, "spec_rethink_request.json")))
+        except (OSError, ValueError):
+            rq = {}
+        ok(s == "paused:awaiting_spec_amendment" and "draft_spec" not in T2.calls
+           and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes
+           and "D-040" in json.dumps(rq.get("findings")) and "redraft the envelope" in json.dumps(rq.get("briefs"))
+           and rq.get("signed_spec_sha256") == hashlib.sha256(signed_bytes).hexdigest(),
+           f"R3-2 a rethink of a signed spec writes the request and pauses; nothing is redrafted ({s}, {T2.calls[-3:]})")
+        T3 = StubTasks(T.s)
+        s2 = _SpikeMachine(d, T3, None, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s2 == "paused:awaiting_spec_amendment" and "draft_spec" not in T3.calls
+           and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes,
+           f"R3-2b a resume stays paused for the amendment and drafts nothing ({s2})")
+
         # T29: the deliverable destination must be a plain file inside the run, not one the harness owns.
         bad_paths = {}
         for name, path in (("escape", "../escape.csv"), ("owned", "run_state.json"), ("report", "report.md"),
