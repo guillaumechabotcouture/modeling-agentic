@@ -163,7 +163,8 @@ declined such a declaration and no rounds were left to fix it.
 A v2 run prints `paused:<reason>` when its state machine
 stops for the owner, at SIGN (the decision spec: `python3
 agents/stage_machine.py sign <run_dir> --by owner`) or at OWNER_DECISION
-(scope declarations, or findings whose remedy is an owner amendment), or before a paid task whose
+(scope declarations, or findings whose remedy is an owner amendment: `python3 scripts/scope_signoff.py sign
+<run_dir> --by owner`), or before a paid task whose
 allowance is below the floor (`paused:awaiting_budget`: resume with a higher `--max-budget-usd`), and exits 2;
 `main.py --resume <run_dir>` continues from `run_state.json`.
 

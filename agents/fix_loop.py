@@ -40,7 +40,7 @@ WRITE_STATES = ("WRITE", "PRESENTATION")
 # F6 run 3: a finding whose required remedy is an owner amendment of the signed spec is the owner's, not a SPEC
 # rethink's. The critics are told to write "owner amendment" in fix_requires when the fix needs the signed spec changed
 # (agents/v2_sdk_tasks.py, critique prompt).
-_OWNER_AMENDMENT = re.compile(r"\bowner(?:'s)?\b[^.;\n]{0,80}\bamend|\bamend\w*\b[^.;\n]{0,80}\bowner\b", re.I)
+_OWNER_AMENDMENT = re.compile(r"^\s*owner amendment\b", re.I)     # the documented prefix only (Codex #258 P2-4)
 
 
 def is_write_up(f) -> bool:
@@ -136,10 +136,10 @@ def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate
                "scope_declarable": f.scope_declarable, "label": FL.short_label(f.claim), "claim": f.claim,
                "fix_requires": f.fix_requires, "done_when": f.done_when,
                "first_seen_round": f.first_seen_round, "attempts": att.get(f.id, 0)}
-        if is_write_up(f):
-            write_up.append(row)
-        elif needs_owner_amendment(f):
+        if needs_owner_amendment(f):           # the owner's decision first, whatever the stage (Codex #258 P2-4)
             owner.append(row)
+        elif is_write_up(f):
+            write_up.append(row)
         else:
             fs.append(row)
     g = gate or {}
@@ -598,17 +598,21 @@ def _self_test() -> int:
                                      owner_state="SPEC", blocking=True, claim="the comparator omits the funded plan",
                                      fix_requires="Owner amendment: add the funded plan as the comparator."),
                  "D-005": FL.Finding(id="D-005", kind="critique_blocker", severity="HIGH", source="critique-domain",
-                                     owner_state="SPEC", blocking=True, claim="c",
-                                     fix_requires="Redraft the spec's packages after the owner's amendment is signed."),
+                                     owner_state="WRITE", blocking=True, claim="c",
+                                     fix_requires="Owner amendment: the report's comparator follows the spec's."),
+                 "D-008": FL.Finding(id="D-008", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                     owner_state="SPEC", blocking=False, claim="c",
+                                     fix_requires="No owner amendment is needed: restate the year."),
                  "D-006": FL.Finding(id="D-006", kind="critique_blocker", severity="HIGH", source="critique-domain",
                                      owner_state="SPEC", blocking=True, claim="c", fix_requires="Name the decision year."),
                  "D-007": FL.Finding(id="D-007", kind="critique_blocker", severity="HIGH", source="critique-domain",
                                      owner_state="SPEC", blocking=True, claim="c", resolution_type="owner_decision",
                                      fix_requires="owner amendment")}
         pk18 = build_packet(d, led18, 1, 3, None, None)
-        ok([f["id"] for f in pk18["findings"]] == ["D-006", "D-007"]
+        ok([f["id"] for f in pk18["findings"]] == ["D-006", "D-007", "D-008"]
            and [f["id"] for f in pk18.get("owner_amendments") or []] == ["D-004", "D-005"],
-           f"F18 findings whose remedy is an owner amendment leave the packet for the owner ({pk18.get('owner_amendments')})")
+           f"F18 findings whose remedy starts 'Owner amendment' leave the packet for the owner, a write-up one too; a "
+           f"remedy that only mentions one does not ({pk18.get('owner_amendments')})")
         e18 = validate_plan({"tasks": [{"id": "T1", "findings": ["D-006"], "action": "rethink", "owner_state": "SPEC",
                                         "brief": "x"},
                                        {"id": "T2", "findings": ["D-004"], "action": "rethink", "owner_state": "SPEC",

@@ -300,20 +300,24 @@ def decision_test_result(run_dir: str, rel: str) -> dict:
     return {"file": rel, "valid": True, "decision_changes": dc, "finding": doc.get("finding")}
 
 
-def owner_answers(run_dir: str) -> dict[str, str]:
-    """Phase 49 β answers (finding -> accept | decline), read when scope_signoff.json exists."""
-    p = os.path.join(run_dir, "scope_signoff.json")
+def answer_fingerprint(fid: str, claim, fix_requires) -> str:
+    """What an owner answer binds to: the finding and its claim and remedy as asked (agents/stage_machine.py writes it
+    into the request); a revised finding with the same id has another fingerprint and is asked again."""
+    return hashlib.sha256(json.dumps({"finding": fid, "claim": claim, "fix_requires": fix_requires},
+                                     sort_keys=True).encode()).hexdigest()[:16]
+
+
+def owner_answers(run_dir: str) -> dict[str, dict]:
+    """The owner's answers (fingerprint -> {finding, decision, ...}) that the harness recorded (scripts/scope_signoff.py
+    verified_answers: the answer's hash under a nonce trace.jsonl also holds), signed by the owner. Nothing else counts
+    (Codex review of #258 P1-8): not a lead's answer, not one written to scope_signoff.json without the harness."""
     try:
-        doc = json.load(open(p))
-    except (OSError, ValueError):
+        import scope_signoff as SS
+        verified, _bad = SS.verified_answers(run_dir)
+    except Exception:  # noqa: BLE001 -- unreadable: no answer counts (fail closed)
         return {}
-    out = {}
-    ans = doc.get("answers") if isinstance(doc, dict) else None
-    # scripts/scope_signoff.py sign writes a mapping fingerprint -> answer; older records hold a list
-    for a in (ans.values() if isinstance(ans, dict) else ans or []):
-        if isinstance(a, dict) and a.get("finding") and a.get("decision") in ("accept", "decline"):
-            out[str(a["finding"])] = a["decision"]
-    return out
+    return {fp: a for fp, a in verified.items() if isinstance(a, dict) and a.get("by") == "owner"
+            and a.get("finding") and a.get("decision") in ("accept", "decline")}
 
 
 # ------------------------------------------------------------------ sync
@@ -381,7 +385,8 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             f.decision_test = decision_test_result(run_dir, hit["decision_test"])
         if not f.scope_declarable:
             f.resolution_type = "fix"
-        ans = next((answers[n] for n in names if n and n in answers), None)
+        a = answers.get(answer_fingerprint(f.id, f.claim, f.fix_requires))    # bound to this claim and remedy
+        ans = a.get("decision") if a and str(a.get("finding")) == f.id else None
         if ans and f.status in ("open", "declared"):
             f.status = "owner_accepted" if ans == "accept" else "owner_declined"
             f.resolution_type = "owner_decision"
