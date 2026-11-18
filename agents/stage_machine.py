@@ -2420,6 +2420,37 @@ def _self_test() -> int:
            and any(h.get("budget_raised") for h in load_state(d).history),
            f"R3-4b resumed with a higher cap, the run continues ({s2}, cap {load_state(d).budget_usd})")
 
+        # R3-8 (fix 4 of Codex round 3 on #258): the decline override reads the ledger synced with this gate's decision,
+        # so a gate-supplied finding the owner declined, and that this gate states with a revised claim, is not held by
+        # the old decline: the answer was given to the old claim, so the finding is open again
+        import scope_signoff as _SS8
+        d, T, st = new_run("stale_decline", {})
+        st.state = "GATE"
+        save_state(d, st)
+        v8 = {"kind": "k_demo", "key": "x", "severity": "HIGH", "stage": "ANALYZE", "scope_declarable": True,
+              "claim": "the new claim", "fix_requires": "use the new data"}
+        fid8 = FL.gate_id(v8)
+        old = FL.Finding(id=fid8, kind="k_demo", key="x", severity="HIGH", source="rigor-artifacts", claim="the old claim",
+                         fix_requires="use the new data", status="owner_declined", resolution_type="owner_decision")
+        old.events.append({"round": 1, "status": "owner_declined", "by": "owner"})
+        FL.save(d, {fid8: old})
+        fp8 = FL.answer_fingerprint(fid8, "the old claim", "use the new data")
+        json.dump({"answers": {fp8: {"finding": fid8, "decision": "decline", "by": "owner"}}},
+                  open(os.path.join(d, SCOPE_SIGNOFF), "w"))
+        _SS8.harness_record(d)
+        _mod8 = sys.modules[Machine.__module__]
+        _vg = _mod8.v2_gate
+        _mod8.v2_gate = lambda *a, **k: {"action": "DECLARE_SCOPE", "rule_matched": "3", "rounds_remaining": 0,
+                                         "rigor_violations": [v8], "unresolved_high": [dict(v8)]}
+        try:
+            _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False).step()
+        finally:
+            _mod8.v2_gate = _vg
+        g8 = json.load(open(os.path.join(d, "gate_r1.json")))
+        ok(g8.get("rule_matched") != "owner_declined" and FL.load(d)[fid8].status != "owner_declined",
+           f"R3-8 a declined gate finding restated with a revised claim is not held by the old decline "
+           f"({g8.get('rule_matched')}, {FL.load(d)[fid8].status})")
+
         # T29: the deliverable destination must be a plain file inside the run, not one the harness owns.
         bad_paths = {}
         for name, path in (("escape", "../escape.csv"), ("owned", "run_state.json"), ("report", "report.md"),
