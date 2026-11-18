@@ -276,7 +276,7 @@ def deliverable_problems(run_dir: str) -> list[str]:
     norm = os.path.relpath(target, root).replace(os.sep, "/")
     import pipeline as P
     owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
-        STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
+        STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, "spec_rethink_request.json", FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*")
     if owned_path(root, norm, owned):
@@ -895,7 +895,64 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
         return [f"the preconditions could not be checked: {type(e).__name__}: {e}"]
 
 
+AWAITING_SPEC_AMENDMENT = "awaiting_spec_amendment"
+SPEC_RETHINK_REQUEST = "spec_rethink_request.json"
+
+
+def _spec_signed_sha(run_dir: str) -> str | None:
+    """The spec sha256 a sign-off record binds (the spec's own record, or a brief's that hashed the spec), or None."""
+    for f, get in ((SIGNOFF_FILE, lambda r: r.get("spec_sha256") or (r.get("sha256") or {}).get(AB.SPEC_FILE)),
+                   ("decision_brief.signoff.json", lambda r: (r.get("sha256") or {}).get(AB.SPEC_FILE))):
+        p = os.path.join(run_dir, f)
+        if not os.path.lexists(p):
+            continue
+        try:
+            rec = json.load(open(p))
+        except (OSError, ValueError):
+            return "unreadable"          # fail closed: an unreadable record still protects the spec (#261 re-review)
+        if not isinstance(rec, dict):
+            return "unreadable"
+        if get(rec):
+            return get(rec)
+    return None
+
+
+def spec_signed_once(run_dir: str) -> bool:
+    """A sign-off record binds the run's spec: it was signed, so only the owner may change it (a brief signed before
+    any spec existed does not count: Codex review of #261 P2-5)."""
+    return _spec_signed_sha(run_dir) is not None
+
+
+def rethink_request(run_dir: str, round_n: int) -> dict:
+    """spec_rethink_request.json: why the run asks for a spec amendment (the latest fix plan's rethink briefs, the
+    open findings the spec owns, with their remedies) and the signed spec it would amend (its sha256)."""
+    briefs = []
+    try:          # this round's fix plan only: an earlier round's (an engine rethink) is not this request's (#261 P2-6)
+        plan = json.load(open(os.path.join(run_dir, f"fix_plan_r{round_n}.json"))).get("plan") or {}
+    except (OSError, ValueError, AttributeError):
+        plan = {}
+    briefs = [{"task": t.get("id"), "findings": t.get("findings"), "brief": t.get("brief")}
+              for t in plan.get("tasks") or [] if isinstance(t, dict) and t.get("action") == "rethink"
+              and t.get("owner_state") == "SPEC"]
+    led = FL.load(run_dir)
+    fs = [{"id": f.id, "severity": f.severity, "claim": f.claim, "fix_requires": f.fix_requires}
+          for f in FL.open_findings(led) if f.owner_state == "SPEC" or any(f.id in (b["findings"] or []) for b in briefs)]
+    try:
+        prev = json.load(open(os.path.join(run_dir, SPEC_RETHINK_REQUEST)))
+    except (OSError, ValueError):
+        prev = None
+    if isinstance(prev, dict) and prev.get("round") == round_n:
+        return prev                  # a resume returns the request it made (Codex review of #261 P1-2)
+    doc = {"round": round_n, "requested_at": _now(), "signed_spec_sha256": _spec_signed_sha(run_dir),
+           "working_spec_sha256": signed_hash(run_dir), "briefs": briefs,
+           "findings": fs, "next": "amend decision_spec.yaml and relaunch with reuse (a new run dir from this one's "
+                                    "spec and stored rows); this run does not redraft or re-sign its spec"}
+    _write_json(run_dir, SPEC_RETHINK_REQUEST, doc)
+    return doc
+
+
 OWNER_REQUEST_PRODUCER = "agents/stage_machine.py FIX_LOOP (owner amendments)"
+
 
 def pending_amendments(ledger: dict, resolved=()) -> list[str]:
     """Findings, open or declared, whose remedy is an owner amendment the owner has not answered (Codex #258 P1-10);
@@ -1194,7 +1251,11 @@ class Machine:
         s = self.st.state
         if s == "FINAL":
             return s
+        if self.st.paused == AWAITING_SPEC_AMENDMENT:      # a state saved before the flag existed keeps its pause
+            self.st.tries["spec_amendment"] = True
         self.st.paused = None
+        if s == "SPEC" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
+            return self.h_SPEC()                 # the amendment pause costs no model call (Codex review of #261 P1-3)
         if s in LLM_STATES and self._out_of_budget():
             return self._budget_out(s)
         try:
@@ -1221,6 +1282,17 @@ class Machine:
 
     # -------------------------------------------------- handlers
     def h_SPEC(self):
+        if self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir):
+            # F6 run 3 (gap 2): a rethink of a signed spec is the owner's amendment, never a redraft in this run (an
+            # amended spec cannot be re-signed in a signed run dir): the request, then a pause; the owner amends and
+            # relaunches with reuse
+            req = rethink_request(self.run_dir, self.st.round)
+            self.st.tries["spec_amendment"] = True     # honoured on resume, whatever a restored copy lost (#261 P1-2)
+            self.st.paused, self.st.status = AWAITING_SPEC_AMENDMENT, None
+            save_state(self.run_dir, self.st)
+            self.log(f"[machine] SPEC rethink of a signed spec: nothing redrafted. Read {SPEC_RETHINK_REQUEST} "
+                     f"({len(req['findings'])} finding(s)); amend the spec and relaunch with reuse")
+            return "SPEC"
         n = self.st.tries.get("spec", 0)
         if n >= MAX_SPEC_TRIES:
             return self._go("FINAL", "the spec did not validate", "run_failed")
@@ -2177,6 +2249,69 @@ def _self_test() -> int:
         jj = load_state(d).journal
         ok(all("allowance_usd" in e for k, e in jj.items() if not k.endswith("spec_sha256")),
            "T28 every journal entry records the allowance it was given")
+
+        # R3-2 (F6 run 3, gap 2; narrowed, lead decision): a SPEC rethink of a signed spec never redrafts it in the run.
+        # The machine writes spec_rethink_request.json (why: the rethink's brief, the findings and their remedies) and
+        # pauses for the owner, who amends the spec and relaunches with reuse; the signed files stay as signed.
+        rk = {"id": "D-040", "severity": "HIGH", "target_stage": "PLAN", "claim": "the envelope is the wrong year",
+              "fix_requires": "redraft the envelope for the decision year"}
+        once40 = []
+
+        def plan40(pk):
+            if any(f["id"] == "D-040" for f in pk["findings"]) and not once40:
+                once40.append(1)
+                return {"tasks": [{"id": "T1", "findings": ["D-040"], "action": "rethink", "owner_state": "SPEC",
+                                   "brief": "redraft the envelope"}]}
+            return {"tasks": []}
+        d, T, st = new_run("rethink_signed", {"critics": {1: {"critique-domain": [rk]}}, "plan": plan40},
+                           signoff="owner", max_rounds=3)
+        _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        sign(d, "owner", "first")
+        signed_bytes = open(os.path.join(d, AB.SPEC_FILE), "rb").read()
+        T2 = StubTasks(T.s)
+        s = _SpikeMachine(d, T2, None, log=lambda *a: None, cross_engine_check=False).run()
+        try:
+            rq = json.load(open(os.path.join(d, "spec_rethink_request.json")))
+        except (OSError, ValueError):
+            rq = {}
+        ok(s == "paused:awaiting_spec_amendment" and "draft_spec" not in T2.calls
+           and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes
+           and "D-040" in json.dumps(rq.get("findings")) and "redraft the envelope" in json.dumps(rq.get("briefs"))
+           and rq.get("signed_spec_sha256") == hashlib.sha256(signed_bytes).hexdigest(),
+           f"R3-2 a rethink of a signed spec writes the request and pauses; nothing is redrafted ({s}, {T2.calls[-3:]})")
+        T3 = StubTasks(T.s)
+        s2 = _SpikeMachine(d, T3, None, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s2 == "paused:awaiting_spec_amendment" and "draft_spec" not in T3.calls
+           and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == signed_bytes,
+           f"R3-2b a resume stays paused for the amendment and drafts nothing ({s2})")
+        # R3-2c (Codex review of #261): the pause is honoured on resume even if a restored copy lost the sign-off record,
+        # and keeps its first request; and it is written with no budget left (it costs no model call)
+        rq0 = json.load(open(os.path.join(d, "spec_rethink_request.json")))
+        os.remove(os.path.join(d, SIGNOFF_FILE))
+        T4 = StubTasks(T.s)
+        s3 = _SpikeMachine(d, T4, None, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s3 == "paused:awaiting_spec_amendment" and "draft_spec" not in T4.calls
+           and json.load(open(os.path.join(d, "spec_rethink_request.json")))["requested_at"] == rq0["requested_at"],
+           f"R3-2c a resumed amendment pause is honoured without the sign-off record and keeps its request ({s3})")
+        st5 = load_state(d)
+        st5.budget_usd, st5.spent_usd = 20.0, 20.0
+        save_state(d, st5)
+        s5 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s5 == "paused:awaiting_spec_amendment", f"R3-2d with no budget left the amendment pause still holds ({s5})")
+        # R3-2e (narrow re-review of #261): an unreadable sign-off record still protects the spec; a persisted pause is
+        # honoured even without the flag (a state saved before it existed)
+        d6 = os.path.join(td, "r32e")
+        os.makedirs(d6)
+        open(os.path.join(d6, SIGNOFF_FILE), "w").write('{"by": "own')
+        st6 = load_state(d)
+        st6.tries.pop("spec_amendment", None)
+        st6.paused = AWAITING_SPEC_AMENDMENT
+        save_state(d, st6)
+        T6 = StubTasks(T.s)
+        m6 = _SpikeMachine(d, T6, None, log=lambda *a: None, cross_engine_check=False)
+        m6.step()
+        ok(spec_signed_once(d6) and "draft_spec" not in T6.calls and load_state(d).paused == AWAITING_SPEC_AMENDMENT,
+           "R3-2e a truncated sign-off record still protects the spec; a persisted amendment pause is honoured")
 
         # R3-1 (F6 run 3): a write-up finding is never a FIX_LOOP task; the writer gets it with the draft.
         wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}
