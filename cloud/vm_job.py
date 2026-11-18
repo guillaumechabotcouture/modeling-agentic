@@ -107,6 +107,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -153,6 +154,11 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
     st = run(ws.job_state, job_id)
     ip = os.path.join(dest, ".manifest.json")
     index = json.load(open(ip)) if os.path.exists(ip) else {}
+    sp = os.path.join(dest, ".fetched_sha256.json")       # rel -> sha256 of the bytes downloaded (copy provenance)
+    try:
+        fetched_sha = json.load(open(sp)) if os.path.exists(sp) else {}
+    except ValueError:
+        fetched_sha = {}
     got = []
     for rel in files_to_fetch(st["files"], index):
         size = st["files"][rel][0]
@@ -161,16 +167,31 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
             continue
         os.makedirs(os.path.dirname(target), exist_ok=True)
         tmp, have = target + ".part", 0
+        h = hashlib.sha256()
         with open(tmp, "wb") as f:
             while have < size:
                 b = run(ws.job_chunk, job_id, rel, have, min(CHUNK, size - have))
                 if not b:
                     break
                 f.write(b)
+                h.update(b)
                 have += len(b)
         os.replace(tmp, target)
         index[rel] = st["files"][rel]
+        fetched_sha[rel] = h.hexdigest()
         got.append(rel)
+    # the digests first, then the markers, then the manifest last: a poll interrupted before the manifest is saved
+    # fetches those files again, so no downloaded record is left unmarked (Codex round 4 of #256)
+    _write_json(sp, fetched_sha)                          # atomic: an interrupted write keeps the earlier digests
+    # F6 run 3: a run dir copied out of a live run carries in-flight batch records of the VM's process. Every poll marks
+    # each run dir with the bytes downloaded into it (hashed as they arrived, never re-read: Codex review of #256), so
+    # a record fetched before its run root is marked once the root arrives, and one a local process rewrote does not
+    # match.
+    import copied_run
+    for rd in sorted({os.path.dirname(r) for r in index if os.path.basename(r) == "run_state.json"}):
+        mine = {r[len(rd) + 1:]: v for r, v in fetched_sha.items() if r.startswith(rd + "/")}
+        copied_run.mark(os.path.join(dest, rd), f"vm_job poll of job {job_id}",
+                        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), hashes=mine)
     json.dump(index, open(ip, "w"), indent=1)
     json.dump(st["state"], open(os.path.join(dest, "state.json"), "w"), indent=1)
     st["fetched"] = got
@@ -196,7 +217,8 @@ def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
 
 def _write_json(path: str, obj) -> None:
     tmp = path + ".tmp"
-    json.dump(obj, open(tmp, "w"), indent=1)
+    with open(tmp, "w") as fh:         # closed (and flushed) before the replace: a failed flush keeps the old file
+        json.dump(obj, fh, indent=1)
     os.replace(tmp, path)
 
 
@@ -917,6 +939,121 @@ def _self_test() -> int:
                and "key set: True" in open(os.path.join(dest, "job.log")).read(),
                f"RC39 a poll saves the job's outputs and log locally: {s1['fetched']}")
             ok(sync_outputs(run, "j1", dest)["fetched"] == [], "RC40 a second poll with nothing new fetches nothing")
+            # RC40b (F6 run 3): a run dir copied out of a live run is marked: its batch records describe the VM's process
+            code2 = io.BytesIO()
+            with tarfile.open(fileobj=code2, mode="w:gz") as t:
+                src = (b"import os\nr = os.path.join(os.environ['JOB_OUT'], 'runs', 'R')\n"
+                       b"os.makedirs(os.path.join(r, 'analysis', 'batch'))\n"
+                       b"open(os.path.join(r, 'run_state.json'), 'w').write('{}')\n"
+                       b"open(os.path.join(r, 'analysis', 'batch', 'results.jsonl.job.json'), 'w').write('{\"pid\": 7}')\n")
+                ti = tarfile.TarInfo("job.py")
+                ti.size = len(src)
+                t.addfile(ti, io.BytesIO(src))
+            ws.job_task("j2", code2.getvalue(), [sys.executable, "job.py"], {}, 1.0, heartbeat_s=1)
+            dest2 = os.path.join(d, "local2")
+            sync_outputs(run, "j2", dest2)
+            try:
+                mk = json.load(open(os.path.join(dest2, "out", "runs", "R", "copied_run.json")))
+            except (OSError, ValueError):
+                mk = {}
+            ok(list(mk.get("files") or {}) == ["analysis/batch/results.jsonl.job.json"] and "j2" in str(mk.get("source")),
+               f"RC40b a copied run dir is marked with its in-flight records ({mk})")
+            # RC40c (Codex review of #256 P1-2): a later poll that fetches another file does not re-mark a record a
+            # local process rewrote in the copy
+            import copied_run as _CR
+            lj = os.path.join(dest2, "out", "runs", "R", "analysis", "batch", "results.jsonl.job.json")
+            open(lj, "w").write('{"pid": 8, "local": true}')
+            open(os.path.join(ws.JOBS, "j2", "out", "runs", "R", "notes.md"), "w").write("new")
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(lj) is None, "RC40c a later poll does not mark a record rewritten locally as copied")
+            # RC40d (Codex re-review of #256): a job record fetched before its run's run_state.json is marked once the
+            # run root appears
+            rj = os.path.join(ws.JOBS, "j2", "out", "runs", "S")
+            os.makedirs(os.path.join(rj, "analysis"))
+            open(os.path.join(rj, "analysis", "b.jsonl.job.json"), "w").write('{"pid": 6}')
+            sync_outputs(run, "j2", dest2)
+            open(os.path.join(rj, "run_state.json"), "w").write("{}")
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "S", "analysis", "b.jsonl.job.json")) is not None,
+               "RC40d a record fetched before its run root is marked when the root arrives")
+            # RC40e (Codex round 4 of #256): a poll interrupted while saving its digests does not leave the manifest
+            # claiming files whose digests were lost: the retry fetches them again and marks them
+            rt = os.path.join(ws.JOBS, "j2", "out", "runs", "T")
+            os.makedirs(os.path.join(rt, "analysis"))
+            open(os.path.join(rt, "run_state.json"), "w").write("{}")
+            open(os.path.join(rt, "analysis", "c.jsonl.job.json"), "w").write('{"pid": 5}')
+            real_dump, boom = json.dump, {"n": 0}
+
+            def flaky(obj, fh, *a, **k):
+                if str(getattr(fh, "name", "")).endswith(".fetched_sha256.json") and not boom["n"]:
+                    boom["n"] += 1
+                    raise OSError("interrupted")
+                return real_dump(obj, fh, *a, **k)
+            json.dump = flaky
+            try:
+                try:
+                    sync_outputs(run, "j2", dest2)
+                except OSError:
+                    pass
+            finally:
+                json.dump = real_dump
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "T", "analysis", "c.jsonl.job.json")) is not None,
+               "RC40e a poll interrupted before its digests are saved is redone and marks the record")
+            # RC40f (Codex round 5): the digest cache is replaced atomically, so an interrupted write keeps the digest of
+            # a record fetched by an earlier poll, before its run root arrived
+            ru = os.path.join(ws.JOBS, "j2", "out", "runs", "U")
+            os.makedirs(os.path.join(ru, "analysis"))
+            open(os.path.join(ru, "analysis", "d.jsonl.job.json"), "w").write('{"pid": 4}')
+            sync_outputs(run, "j2", dest2)
+            open(os.path.join(ru, "run_state.json"), "w").write("{}")
+            boom["n"] = 0
+
+            def flaky2(obj, fh, *a, **k):
+                if ".fetched_sha256.json" in str(getattr(fh, "name", "")) and not boom["n"]:
+                    boom["n"] += 1
+                    raise OSError("interrupted")
+                return real_dump(obj, fh, *a, **k)
+            json.dump = flaky2
+            try:
+                try:
+                    sync_outputs(run, "j2", dest2)
+                except OSError:
+                    pass
+            finally:
+                json.dump = real_dump
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "U", "analysis", "d.jsonl.job.json")) is not None,
+               "RC40f an interrupted digest-cache write keeps an earlier poll's digest")
+            # RC40g (Codex round 6): a write whose flush fails at close never replaces the file
+            wp = os.path.join(d, "w.json")
+            _write_json(wp, {"a": 1})
+            real_open = open
+
+            class _BadClose:
+                def __init__(self, f):
+                    self.f = f
+
+                def write(self, x):
+                    return self.f.write(x)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *e):
+                    self.f.close()
+                    raise OSError("disk full at close")
+            import builtins
+            builtins.open = lambda p_, m="r", *a_, **k_: (_BadClose(real_open(p_, m, *a_, **k_))
+                                                         if str(p_).endswith("w.json.tmp") else real_open(p_, m, *a_, **k_))
+            try:
+                try:
+                    _write_json(wp, {"a": 2})
+                except OSError:
+                    pass
+            finally:
+                builtins.open = real_open
+            ok(json.load(open(wp)) == {"a": 1}, "RC40g a failed close keeps the previous file")
             for bad in ("work/job.py", "state.json", "../../etc/passwd", "out/../state.json"):
                 try:
                     ws.job_chunk("j1", bad, 0, 10)
