@@ -73,16 +73,16 @@ NET_PARAMS = {"net_kill_shift": ({"pyr", "pbo", "dual"}, [-0.618, 0.66]),
 FIT_EXTRA = {"cfp_half": [270.0, 1650.0]}
 # Wave 2 (owner, 13 Nov, "option 1"): wave 1's engine results are reused from its output, a verbatim copy of the run
 # on cluster 2375765 (commit fb8deac; engine code identical to this one's, pack.yaml then WAVE1_PACK_SHA256). F6 option
-# A: reuse is bound to what the fit ran, the training targets' declarations and the fit rule (benchmark_sources
-# fit_declarations: arms, settings, horizon, seeds, engine), WAVE1_FIT_DECLARATIONS_SHA256, so held-out benchmarks
-# added to the pack (B9d-B9g) leave it reusable.
+# A: reuse is bound to what the fit runs, the training targets' declarations and the fit rule (benchmark_sources
+# fit_declarations: arms, settings, horizon, seeds, engine) of the effective pack (build_pack of the pack wave 1 ran
+# on), WAVE1_FIT_DECLARATIONS_SHA256, so held-out benchmarks added to the pack (B9d-B9g) leave it reusable.
 # 48 new LHS points in the wave-2 box: wave 1's accepted hull widened by `margin` of its width on each side, to the
 # new box edge on a side where the hull reached the old box edge (wave 1 holds no point past it). 48 points: 3 per
 # quadratic coefficient in 4 dimensions (15) plus 3; the plan stays under CAP_USD.
 WAVE1 = os.path.join(HERE, "net_effect_fit_wave1.yaml")
 WAVE1_SHA256 = "54958ad2e79716edf19f2b4b60f263ca41056d3202147ff4bfa23277b318a067"
 WAVE1_PACK_SHA256 = "32abb2bb6457ed7008c6410c55b4e0b620b2e982073a7dd5cbdcb7988114a905"
-WAVE1_FIT_DECLARATIONS_SHA256 = "cb5145f47875bfd2535c75415c4030e1441bf35b847ecef98b7c91fb27c77e2b"
+WAVE1_FIT_DECLARATIONS_SHA256 = "e0fa57b0822d064c21ea78fd22d00ce214f1f43e704af930766e6aaa4f2a84dc"
 WAVE1_BOX = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
              "cfp_half": [547.5, 1277.5]}
 WAVE2 = {"n": 48, "seed": 23, "margin": 0.25}
@@ -565,7 +565,7 @@ def wave2_box(hull: dict, old: dict, new: dict, margin: float) -> dict:
     return out
 
 
-def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256) -> dict:
+def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256, pack: dict | None = None) -> dict:
     """Wave 1's engine results, for reuse (no engine run repeated): every engine-evaluated point with its target values
     (46 design points, the verified sample points, the chosen point) and the calibration grid. Refused (ValueError,
     fail closed) unless the file's sha256 is `digest`, it is a full run (not a smoke) of this script, its engine
@@ -587,9 +587,10 @@ def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256) -> dic
             raise ValueError(f"wave 1 {path}: engine {k} {have.get(k)}, this engine's is {want[k]}")
     if base != yaml.safe_load(open(PACK)):
         raise ValueError(f"wave 1 {path}: the pack given is not pack.yaml")
-    if _fit_digest(base) != WAVE1_FIT_DECLARATIONS_SHA256:
-        raise ValueError(f"wave 1 {path}: the pack's fit declarations (sha256 {_fit_digest(base)}) are not the "
-                         f"declarations wave 1 ran on ({WAVE1_FIT_DECLARATIONS_SHA256})")
+    eff = build_pack(base) if pack is None else pack       # the pack the runner executes (Codex r1 P2 on #266)
+    if _fit_digest(eff) != WAVE1_FIT_DECLARATIONS_SHA256:
+        raise ValueError(f"wave 1 {path}: the effective pack's fit declarations (sha256 {_fit_digest(eff)}) are not "
+                         f"the declarations wave 1 ran on ({WAVE1_FIT_DECLARATIONS_SHA256})")
     fr, train = doc.get("fit_rule") or {}, split(base)[0]
     if list(fr.get("seeds") or []) != list(base["seeds"]):
         raise ValueError(f"wave 1 {path}: seeds {fr.get('seeds')}, the pack's are {base['seeds']}")
@@ -1071,7 +1072,7 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
         raise ValueError(f"the calibration arms depend on {sorted(calibration_params(pack))}, not only {CAL_PARAM}")
     eng = BM.load_engine(pack["engine"], None)
     runner = RecalRunner(pack, eng, workers, pack["seeds"], mode="fit", evidence=BM.load_evidence(eng, pack=pack))
-    wave1 = None if smoke else load_wave1(WAVE1, eng, base)        # before any engine run: refused fails closed
+    wave1 = None if smoke else load_wave1(WAVE1, eng, base, pack=pack)   # before any engine run: refused fails closed
     if verify_round and not smoke:          # wave 2's engine results, under the sha256 recorded when it was stored
         import tempfile
         resume_from = fetch_cache(VERIFY_ROUND["cache_blob"], VERIFY_ROUND["cache_sha256"],
