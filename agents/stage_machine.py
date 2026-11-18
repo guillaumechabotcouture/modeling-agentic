@@ -886,6 +886,38 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
         return [f"the preconditions could not be checked: {type(e).__name__}: {e}"]
 
 
+AWAITING_SPEC_AMENDMENT = "awaiting_spec_amendment"
+SPEC_RETHINK_REQUEST = "spec_rethink_request.json"
+
+
+def spec_signed_once(run_dir: str) -> bool:
+    """A sign-off record exists for the run's spec: it was signed, so only the owner may change it."""
+    return any(os.path.lexists(os.path.join(run_dir, f)) for f in (SIGNOFF_FILE, "decision_brief.signoff.json"))
+
+
+def rethink_request(run_dir: str, round_n: int) -> dict:
+    """spec_rethink_request.json: why the run asks for a spec amendment (the latest fix plan's rethink briefs, the
+    open findings the spec owns, with their remedies) and the signed spec it would amend (its sha256)."""
+    briefs = []
+    for r in range(round_n, 0, -1):
+        try:
+            plan = json.load(open(os.path.join(run_dir, f"fix_plan_r{r}.json"))).get("plan") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        briefs = [{"task": t.get("id"), "findings": t.get("findings"), "brief": t.get("brief")}
+                  for t in plan.get("tasks") or [] if isinstance(t, dict) and t.get("action") == "rethink"]
+        if briefs:
+            break
+    led = FL.load(run_dir)
+    fs = [{"id": f.id, "severity": f.severity, "claim": f.claim, "fix_requires": f.fix_requires}
+          for f in FL.open_findings(led) if f.owner_state == "SPEC" or any(f.id in (b["findings"] or []) for b in briefs)]
+    doc = {"round": round_n, "requested_at": _now(), "signed_spec_sha256": signed_hash(run_dir), "briefs": briefs,
+           "findings": fs, "next": "amend decision_spec.yaml and relaunch with reuse (a new run dir from this one's "
+                                    "spec and stored rows); this run does not redraft or re-sign its spec"}
+    _write_json(run_dir, SPEC_RETHINK_REQUEST, doc)
+    return doc
+
+
 # ------------------------------------------------------------------ the machine
 class Machine:
     def __init__(self, run_dir: str, tasks, state: RunState | None = None, backend=None, log=print,
@@ -1137,6 +1169,16 @@ class Machine:
 
     # -------------------------------------------------- handlers
     def h_SPEC(self):
+        if spec_signed_once(self.run_dir):
+            # F6 run 3 (gap 2): a rethink of a signed spec is the owner's amendment, never a redraft in this run (an
+            # amended spec cannot be re-signed in a signed run dir): the request, then a pause; the owner amends and
+            # relaunches with reuse
+            req = rethink_request(self.run_dir, self.st.round)
+            self.st.paused, self.st.status = AWAITING_SPEC_AMENDMENT, None
+            save_state(self.run_dir, self.st)
+            self.log(f"[machine] SPEC rethink of a signed spec: nothing redrafted. Read {SPEC_RETHINK_REQUEST} "
+                     f"({len(req['findings'])} finding(s)); amend the spec and relaunch with reuse")
+            return "SPEC"
         n = self.st.tries.get("spec", 0)
         if n >= MAX_SPEC_TRIES:
             return self._go("FINAL", "the spec did not validate", "run_failed")
