@@ -10,9 +10,11 @@ Parts of a record's digest (sha256 prefixes of canonical JSON; parts()): `decisi
 regret, dollars moved, recommendations, benefit changes, identities, each case's results, the run's summary entry;
 not `type` or `perturb`, and any field not named here), `detail` (case labels and the type's own block), `words`
 (the sentences) and `plans` (each case's allocation digest, decision_tests.plan_sha256). Numbers: 6 significant
-digits, below 1e-9 in size zero; an absolute path keeps its file name.
+digits, below 1e-9 in size zero; an absolute path keeps its file name. Known limits: a path holding a
+space keeps its tail, and two values either side of a 6th-digit rounding boundary differ.
 
 `digest` reads analysis/decision_tests.yaml and models/decision_tests/<id>.yaml, and fails closed (digest_dir).
+
 `retro` copies the run into --work (outside the run dir by real path), removes the copy's decision-test outputs,
 re-runs the analysis there on the current code with the run's own number of draws, and digests it. Zero engine jobs:
 compute.map_fn and the engine's evaluating methods raise EngineJobRefused, so a run whose stored rows (row_reuse,
@@ -147,7 +149,14 @@ def _inside(path: str, root: str) -> bool:
         p = q
 
 
-_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:+-]*")
+def _plain_name(tid: str, pathmod=os.path) -> bool:
+    """Whether `<tid>.yaml` is one plain file name under a directory with this platform's path rules: no separator,
+    no `.`/`..`, no drive (Windows `C:x`), so joining it never leaves the directory (Codex r3 P1-3, P2-1: any id the
+    writers accept otherwise, spaces and colons included)."""
+    base = pathmod.join("base", "dir")
+    j = pathmod.join(base, f"{tid}.yaml")
+    return bool(tid) and tid not in (".", "..") and "/" not in tid and "\\" not in tid \
+        and pathmod.dirname(j) == base and pathmod.basename(j) == f"{tid}.yaml"
 
 
 def _regular_in(run_dir: str, rel: str, missing=StoredIncomplete) -> str:
@@ -184,7 +193,7 @@ def digest_dir(run_dir: str) -> dict:
     for t in tests:
         tid = t.get("test_id") if isinstance(t, dict) else None
         tid = str(tid) if isinstance(tid, int) and not isinstance(tid, bool) else tid      # run_all keeps an int id
-        if not isinstance(tid, str) or not _ID.fullmatch(tid):
+        if not isinstance(tid, str) or not _plain_name(tid):
             raise StoredIncomplete(f"{p}: an entry without a plain test id ({t!r:.120})")
         if tid in out:
             raise StoredIncomplete(f"{p}: test id {tid} is listed twice")
@@ -192,8 +201,8 @@ def digest_dir(run_dir: str) -> dict:
         if st not in ("run", "not_run"):
             raise StoredIncomplete(f"{p}: test {tid}: status {st!r} is neither run nor not_run")
         if st == "not_run":
-            if t.get("path"):
-                raise StoredIncomplete(f"{p}: test {tid} was not run but lists a result file")
+            if t.get("path") or t.get("verdict", "NOT_RUN") != "NOT_RUN":
+                raise StoredIncomplete(f"{p}: test {tid} was not run but lists a result file or another verdict")
             out[tid] = digest({"status": st, "test_id": tid}, t)
             continue
         want = f"models/decision_tests/{tid}.yaml"
@@ -201,8 +210,9 @@ def digest_dir(run_dir: str) -> dict:
             raise StoredIncomplete(f"{p}: test {tid}: result file {t.get('path')!r}, not {want}")
         with open(_regular_in(run_dir, want)) as f:
             rec = yaml.safe_load(f)
-        if not isinstance(rec, dict) or str(rec.get("test_id")) != tid or rec.get("status") != st:
-            raise StoredIncomplete(f"{want}: holds {rec!r:.80}, not test {tid} with status {st}")
+        if not isinstance(rec, dict) or "test_id" not in rec or str(rec["test_id"]) != tid or rec.get("status") != st \
+                or not isinstance(rec.get("decision_changes"), bool):
+            raise StoredIncomplete(f"{want}: holds {rec!r:.80}, not test {tid} with status {st} and decision_changes")
         vd = "CHANGES_PLAN" if rec.get("decision_changes") else "NO_CHANGE"
         if "verdict" in t and t["verdict"] != vd:          # Codex r2 P2-2: the summary contradicts its result
             raise StoredIncomplete(f"{p}: test {tid}: verdict {t['verdict']!r}, its result says {vd}")
@@ -692,8 +702,70 @@ def _self_test() -> int:
 
     # ------------------------------------------------ Codex review r2 of #262 (written first; each failed)
     def dg16():
-        from toolkit.spec import schema
         run1 = {"test_id": "DT1", "path": "models/decision_tests/DT1.yaml", "status": "run", "verdict": "NO_CHANGE"}
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as side:
+            fixture(side, [], {})
+            os.makedirs(os.path.join(d, "models"))
+            os.symlink(os.path.join(side, "analysis"), os.path.join(d, "analysis"))
+            ok(_raises(lambda: digest_dir(d), StoredIncomplete),
+               "DG16 (r2 P1-4) a summary under a linked directory is refused, never read as absent")
+        with tempfile.TemporaryDirectory() as d:
+            fixture(d, [dict(run1, test_id="../x", path="models/decision_tests/../x.yaml")], {})
+            yaml.safe_dump(_rec(test_id="../x"), open(os.path.join(d, "models", "x.yaml"), "w"))
+            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG16d (r2 P1-3) a test id with path parts is refused")
+            fixture(d, [dict(run1, test_id=7, path="models/decision_tests/7.yaml")], {"7.yaml": _rec(test_id=7)})
+            ok(set(digest_dir(d)) == {"7"}, "DG16e (r2 P2-1) an integer test id, as run_all writes it, is read")
+            fixture(d, [dict(run1, verdict="NOT_RUN")], {"DT1.yaml": _rec()})
+            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG16f (r2 P2-2) a verdict contradicting its result")
+            fixture(d, [run1], {"DT1.yaml": ["a"]})
+            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG16g (r2 P3) a result that is not a mapping")
+        e = {"A": {"decision": "1", "detail": "2", "words": "3", "plans": "4"}, "B": {"decision": "1"}}
+        g = {"A": {"decision": "1", "detail": "2", "words": "3", "plans": "5"}, "B": {"decision": "1", "plans": "6"}}
+        ok(compare(e, g, parts="expected") == ["A: plans differs"],
+           "DG16i (r2 P1-5) stored records are compared on the parts they hold, plans included when present")
+        w_ = lambda lab: _rec(worst_by_criterion={"share": {"value": lab}})  # noqa: E731
+        ok(digest(w_(0.5))["detail"] != digest(w_(0.8))["detail"], "DG16j (r2 P2-3) the worst case's label is detail")
+        ok(canon("north/a/site") != canon("north/b/site") and canon("(/tmp/a/p.yaml)") == "(p.yaml)",
+           f"DG16k (r2 P2-4) only absolute paths are shortened ({canon('north/a/site')})")
+        seen = []
+        _CAP.update(on=True, paused=False, orig=lambda *a, **k: None, recs={}, counts={}, problems=[])
+        from toolkit.analysis import decision_tests as DTm
+        saved, g0 = DTm.run_one, open(GOLDEN).read() if os.path.exists(GOLDEN) else None
+        try:
+            os.environ[UPDATE_ENV] = "1"
+            check_capture(lambda c, m: seen.append((c, m)))
+        finally:
+            os.environ.pop(UPDATE_ENV, None)
+            DTm.run_one = saved
+        ok(g0 == (open(GOLDEN).read() if os.path.exists(GOLDEN) else None),
+           "DG16m (r2 P2-6) an empty capture never overwrites the golden file")
+
+    def dg17():          # Codex review r3 of #262 (written first; each failed)
+        run1 = {"test_id": "DT1", "path": "models/decision_tests/DT1.yaml", "status": "run", "verdict": "NO_CHANGE"}
+        with tempfile.TemporaryDirectory() as d:
+            tid = "prior_range_z:North East"
+            fixture(d, [dict(run1, test_id=tid, path=f"models/decision_tests/{tid}.yaml")],
+                    {f"{tid}.yaml": _rec(test_id=tid)})
+            ok(set(digest_dir(d)) == {tid}, "DG17 (r3 P2-1) an automatic id with a colon and a space, as run_all writes "
+                                            "it, is read")
+            nr = {"test_id": "DT2", "path": None, "status": "not_run", "verdict": "CHANGES_PLAN"}
+            none = dict(run1, test_id="None", path="models/decision_tests/None.yaml")
+            for tests, files, what in (
+                    ([nr], {}, "a not-run entry with a verdict other than NOT_RUN"),
+                    ([run1], {"DT1.yaml": {k: v for k, v in _rec().items() if k != "decision_changes"}},
+                     "a run result without decision_changes"),
+                    ([none], {"None.yaml": {k: v for k, v in _rec().items() if k != "test_id"}},
+                     "a result without a test id")):
+                for f_ in os.listdir(os.path.join(d, "models", "decision_tests")):
+                    os.remove(os.path.join(d, "models", "decision_tests", f_))
+                fixture(d, tests, files)
+                ok(_raises(lambda: digest_dir(d), StoredIncomplete), f"DG17b (r3 P2-2) refused: {what}")
+        import ntpath
+        ok(_plain_name("C:trial", ntpath) is False and _plain_name("prior_range_z:North East", os.path) is True,
+           "DG17c (r3 P1-3) a test id that would name a drive on Windows is not a plain file name there")
+
+    def dg18():          # the retro cases of Codex review r2 (DG16 before the split)
+        from toolkit.spec import schema
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as w, \
                 tempfile.TemporaryDirectory() as side:
             schema.toy_spec(d)
@@ -714,46 +786,16 @@ def _self_test() -> int:
             ok(_raises(lambda: write_out(os.path.join(d, "hard.json"), "{}", os.path.join(d, "Run")))
                and open(os.path.join(d, "Run", "f")).read() == "keep",
                "DG16c (r2 P1-2) an output hard-linked to a file elsewhere is refused (never truncated)")
-        with tempfile.TemporaryDirectory() as d:
-            fixture(d, [dict(run1, test_id="../x", path="models/decision_tests/../x.yaml")], {})
-            yaml.safe_dump(_rec(test_id="../x"), open(os.path.join(d, "models", "x.yaml"), "w"))
-            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG16d (r2 P1-3) a test id with path parts is refused")
-            fixture(d, [dict(run1, test_id=7, path="models/decision_tests/7.yaml")], {"7.yaml": _rec(test_id=7)})
-            ok(set(digest_dir(d)) == {"7"}, "DG16e (r2 P2-1) an integer test id, as run_all writes it, is read")
-            fixture(d, [dict(run1, verdict="NOT_RUN")], {"DT1.yaml": _rec()})
-            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG16f (r2 P2-2) a verdict contradicting its result")
-            fixture(d, [run1], {"DT1.yaml": ["a"]})
-            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG16g (r2 P3) a result that is not a mapping")
         with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as w:
             schema.toy_spec(d)
             os.makedirs(os.path.join(d, "analysis", "decision_tests.yaml"))
             ok(_raises(lambda: retro(d, os.path.join(w, "k"), unsigned=True, log=lambda *a: None,
                                      runner=lambda *a, **k: None)),
                "DG16h (r2 P1-4) a summary that is not a regular file is refused, never read as absent")
-        e = {"A": {"decision": "1", "detail": "2", "words": "3", "plans": "4"}, "B": {"decision": "1"}}
-        g = {"A": {"decision": "1", "detail": "2", "words": "3", "plans": "5"}, "B": {"decision": "1", "plans": "6"}}
-        ok(compare(e, g, parts="expected") == ["A: plans differs"],
-           "DG16i (r2 P1-5) stored records are compared on the parts they hold, plans included when present")
-        w_ = lambda lab: _rec(worst_by_criterion={"share": {"value": lab}})  # noqa: E731
-        ok(digest(w_(0.5))["detail"] != digest(w_(0.8))["detail"], "DG16j (r2 P2-3) the worst case's label is detail")
-        ok(canon("north/a/site") != canon("north/b/site") and canon("(/tmp/a/p.yaml)") == "(p.yaml)",
-           f"DG16k (r2 P2-4) only absolute paths are shortened ({canon('north/a/site')})")
         import threading
         ok(isinstance(no_engine_jobs._lock, type(threading.Lock())), "DG16l (r2 P2-5) the guard holds a process lock")
-        seen = []
-        _CAP.update(on=True, paused=False, orig=lambda *a, **k: None, recs={}, counts={}, problems=[])
-        from toolkit.analysis import decision_tests as DTm
-        saved, g0 = DTm.run_one, open(GOLDEN).read() if os.path.exists(GOLDEN) else None
-        try:
-            os.environ[UPDATE_ENV] = "1"
-            check_capture(lambda c, m: seen.append((c, m)))
-        finally:
-            os.environ.pop(UPDATE_ENV, None)
-            DTm.run_one = saved
-        ok(g0 == (open(GOLDEN).read() if os.path.exists(GOLDEN) else None),
-           "DG16m (r2 P2-6) an empty capture never overwrites the golden file")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg7, dg8, dg9, dg10, dg11, dg12, dg13, dg14, dg15, dg16):
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg7, dg8, dg9, dg10, dg11, dg12, dg13, dg14, dg15, dg16, dg17, dg18):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
