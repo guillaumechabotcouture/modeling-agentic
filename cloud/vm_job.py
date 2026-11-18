@@ -176,9 +176,10 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
     # F6 run 3: a run dir copied out of a live run carries in-flight batch records of the VM's process; mark them
     import copied_run
     for rd in sorted({os.path.dirname(r) for r in index if os.path.basename(r) == "run_state.json"}):
-        if any(r.startswith(rd + "/") for r in got):
+        mine = [r[len(rd) + 1:] for r in got if r.startswith(rd + "/")]
+        if mine:      # only the bytes this poll fetched (Codex review of #256 P1-2); earlier entries kept as they were
             copied_run.mark(os.path.join(dest, rd), f"vm_job poll of job {job_id}",
-                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), only=mine)
     st["fetched"] = got
     return st
 

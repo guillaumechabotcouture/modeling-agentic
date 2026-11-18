@@ -24,12 +24,41 @@ PROGRESS_DIR = ".compute_progress"                  # scripts/compute.py PROGRES
 IN_FLIGHT_SUFFIXES = (".partial.jsonl", ".job.json")  # scripts/compute.py PARTIAL_EXT, JOB_EXT
 
 
+RUN_ROOT_MARKERS = ("run_state.json", "metadata.json")   # a run dir's own files (v2 state; lib.safe_io RUN_MARKERS)
+
+
 def _sha(path: str) -> str | None:
+    """The sha256 of a regular file, streamed through a descriptor opened with no link followed; None for anything
+    else (a link, a FIFO, a device, unreadable): a file whose bytes cannot be read is never marked."""
+    import stat
     try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except OSError:
         return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        h = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+        return h.hexdigest()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def run_root(path: str) -> str | None:
+    """The run dir `path` lies in: its nearest ancestor (or itself) holding a run's own file; None outside a run."""
+    d = os.path.abspath(path)
+    while True:
+        if any(os.path.isfile(os.path.join(d, m)) and not os.path.islink(os.path.join(d, m)) for m in RUN_ROOT_MARKERS):
+            return d
+        nd = os.path.dirname(d)
+        if nd == d:
+            return None
+        d = nd
 
 
 def in_flight(run_dir: str) -> list[str]:
@@ -47,10 +76,27 @@ def in_flight(run_dir: str) -> list[str]:
     return sorted(out)
 
 
-def mark(run_dir: str, source: str, captured_at: str | None = None) -> dict | None:
-    """Write the marker for a copied run dir (None when it holds no in-flight record). An earlier marker's entries are
-    kept for files still unchanged; every file listed now is recorded with its current sha256."""
-    files = {rel: _sha(os.path.join(run_dir, rel)) for rel in in_flight(run_dir)}
+def _load(run_dir: str) -> dict:
+    try:
+        doc = json.load(open(os.path.join(run_dir, MARKER)))
+        return doc if isinstance(doc, dict) and isinstance(doc.get("files"), dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def mark(run_dir: str, source: str, captured_at: str | None = None, only=None) -> dict | None:
+    """Write the marker for a copied run dir (None when it would list nothing). `only`: the paths (relative to the run
+    dir) this copy wrote, e.g. one poll's fetched files; each in-flight one is recorded with its sha256, and an earlier
+    marker's entries for other files are kept as they were, so a file a local process rewrote since stops matching.
+    Without `only` (a fresh extraction) every in-flight file is recorded."""
+    flight = set(in_flight(run_dir))
+    rels = flight if only is None else {str(r).replace(os.sep, "/") for r in only} & flight
+    prev = _load(run_dir)
+    files = {k: v for k, v in (prev.get("files") or {}).items() if only is not None and k not in rels}
+    for rel in sorted(rels):
+        h = _sha(os.path.join(run_dir, rel))
+        if h:
+            files[rel] = h
     if not files:
         return None
     doc = {"copied_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "captured_at": captured_at,
@@ -66,28 +112,22 @@ def mark(run_dir: str, source: str, captured_at: str | None = None) -> dict | No
     return doc
 
 
-def copied_entry(path: str, max_up: int = 6) -> dict | None:
-    """The marker that lists `path` with its current bytes ({marker, run_dir, captured_at, source, copied_at}), found
-    in `path`'s ancestors; None when no marker lists it or the file has changed since the copy."""
+def copied_entry(path: str) -> dict | None:
+    """The run root's marker entry for `path` while its bytes are those copied ({marker, run_dir, captured_at, source,
+    copied_at}); None when it is not in a run dir, the root has no readable marker, the marker does not list it, or
+    the file changed since. A marker anywhere below the run root is never read (Codex review of #256 P1-3)."""
     path = os.path.abspath(path)
-    d = os.path.dirname(path)
-    for _ in range(max_up):
-        m = os.path.join(d, MARKER)
-        if os.path.isfile(m) and not os.path.islink(m):
-            try:
-                doc = json.load(open(m))
-            except (OSError, ValueError):
-                return None
-            rel = os.path.relpath(path, d).replace(os.sep, "/")
-            want = (doc.get("files") or {}).get(rel) if isinstance(doc, dict) else None
-            if want and want == _sha(path):
-                return {"marker": m, "run_dir": d, "captured_at": doc.get("captured_at"),
-                        "copied_at": doc.get("copied_at"), "source": doc.get("source")}
-            return None
-        nd = os.path.dirname(d)
-        if nd == d:
-            break
-        d = nd
+    root = run_root(os.path.dirname(path))
+    if root is None:
+        return None
+    m = os.path.join(root, MARKER)
+    if os.path.islink(m):
+        return None
+    doc = _load(root)
+    want = (doc.get("files") or {}).get(os.path.relpath(path, root).replace(os.sep, "/"))
+    if want and want == _sha(path):
+        return {"marker": m, "run_dir": root, "captured_at": doc.get("captured_at"),
+                "copied_at": doc.get("copied_at"), "source": doc.get("source")}
     return None
 
 
@@ -101,6 +141,7 @@ def _self_test() -> int:
             fails.append(m)
 
     with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "run_state.json"), "w").write("{}")
         os.makedirs(os.path.join(d, "analysis", "batch", PROGRESS_DIR))
         open(os.path.join(d, "analysis", "batch", PROGRESS_DIR, "a.json"), "w").write("{}")
         open(os.path.join(d, "analysis", "batch", "results.jsonl.partial.jsonl"), "w").write("{}\n")

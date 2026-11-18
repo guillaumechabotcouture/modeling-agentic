@@ -2843,6 +2843,8 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
     summary["out_sha256"] = hashlib.sha256(body).hexdigest()     # Codex round 1 P1-1: which results it describes
     if os.environ.get("MA_PIPELINE_RUN"):        # the pipeline run that computed it (scripts/pipeline.py)
         summary["pipeline_run"] = os.environ["MA_PIPELINE_RUN"]
+    if os.environ.get("MA_COMPUTE_LAUNCH"):      # the detached launch that computed it (job_status binds to it)
+        summary["launch"] = os.environ["MA_COMPUTE_LAUNCH"]
     from lib.safe_io import remove_nofollow, write_nofollow
     base, name = _out_base(out, run_dir)
     try:
@@ -5674,18 +5676,38 @@ def job_status(out: str) -> dict:
     except (OSError, ValueError, KeyError, TypeError) as e:
         return {"state": NO_JOB, "out": out, "error": f"{out + JOB_EXT}: {type(e).__name__}"}
     st = {"out": out, "pid": pid, "n": job.get("n"), "elapsed_s": round(time.time() - t0, 1), "log": job.get("log")}
+
+    def summary(trust_mtime: bool):
+        """This job's summary: the one naming its launch when the record has one (Codex review of #256 P1-1: a copy
+        refreshes mtimes, so an earlier batch's summary at the same --out would look fresh); else, for an older record,
+        one written after it started, when mtimes can be trusted (not for a copy)."""
+        try:
+            summ = json.load(open(out + ".summary.json"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(summ, dict):
+            return None
+        if job.get("launch"):
+            return summ if summ.get("launch") == job["launch"] else None
+        try:
+            return summ if trust_mtime and os.path.getmtime(out + ".summary.json") >= t0 - 1 else None
+        except OSError:
+            return None
+
+    def finished(summ):
+        return {"state": FINISHED, **st, "summary": {k: v for k, v in summ.items() if k not in ("bundle", "chunks")}}
     why, ce = _copied_why(out, job)
     if why is not None:
-        try:
-            fresh = os.path.getmtime(out + ".summary.json") >= t0 - 1
-            summ = json.load(open(out + ".summary.json")) if fresh else None
-        except (OSError, ValueError):
-            summ = None
-        if isinstance(summ, dict):
-            return {"state": FINISHED, **st, "summary": {k: v for k, v in summ.items() if k not in ("bundle", "chunks")}}
+        summ = summary(trust_mtime=False)
+        if summ is not None:
+            return finished(summ)
         return {"state": COPIED, **st, "why": why, **({"copied": ce} if ce else {}),
                 "next": "these records describe a batch on the machine the run was copied from; nothing runs here. "
-                        "On a resume, the same map command reuses its finished rows"}
+                        "On a resume, the same map command reuses the finished rows whose fingerprint still matches "
+                        "(compute.py reuse-check <run_dir> shows which)"}
+    summ = summary(trust_mtime=True)
+    if summ is not None and job.get("launch"):
+        return finished(summ)
     if _pid_alive(pid, job.get("pid_start")):
         rows = 0
         try:
@@ -5694,13 +5716,8 @@ def job_status(out: str) -> dict:
         except OSError:
             pass
         return {"state": RUNNING, "rows_done": rows, **st}
-    try:
-        fresh = os.path.getmtime(out + ".summary.json") >= t0 - 1
-        summ = json.load(open(out + ".summary.json")) if fresh else None
-    except (OSError, ValueError):
-        summ = None
-    if isinstance(summ, dict):
-        return {"state": FINISHED, **st, "summary": {k: v for k, v in summ.items() if k not in ("bundle", "chunks")}}
+    if summ is not None:
+        return finished(summ)
     tail = ""
     try:
         tail = open(job.get("log") or "").read()[-1500:]
@@ -5744,10 +5761,13 @@ def _detach_locked(argv, out, n, subprocess, run_dir) -> int:
     finally:
         os.close(base)
     with lf:
+        import secrets
+        launch = secrets.token_hex(8)       # the summary this child writes names it (Codex review of #256 P1-1)
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
-                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
+                             env=dict(os.environ, MA_COMPUTE_LAUNCH=launch))
     job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "host": os.uname().nodename, "started": t0, "n": n,
-           "log": log, "argv": argv}
+           "log": log, "argv": argv, "launch": launch}
     publish(out + JOB_EXT, json.dumps(job, indent=1), run_dir)
     print(json.dumps({"detached": True, "pid": p.pid, "out": out, "log": log,
                       "next": f"python3 scripts/compute.py wait {out} --timeout-s 540  "
