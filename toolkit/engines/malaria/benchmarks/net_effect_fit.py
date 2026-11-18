@@ -1916,6 +1916,58 @@ def _self_test() -> int:
            and "log" in ACCEPTANCE_STATISTIC and "geometric" in ACCEPTANCE_RULE,
            f"F27c the output records the statistic the rule used: {r['verified'].get('acceptance_statistic')!r}")
     case("F27", f27)
+
+    # F6 option A (owner, 18 Nov; OA3): the net-effect parameters are fitted to the net trials at their own estimands,
+    # so the PBO trials (B9, B9b, B9c, LLINEUP's B9d-B9f) and Misungwi's dual-AI vs PBO contrast (B9g) become training
+    # targets beside B10, B11 and the IRS targets; B7, B8, B15 and the rest stay held out
+    def fa1():
+        tr, ho = split(base)
+        ok(tr == OPTION_A["targets"] == base["fit_joint"]["targets"]
+           and {"B9", "B9b", "B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11"} <= set(tr)
+           and {"B12", "B12b", "B12m"} <= set(tr) and {"B7", "B8", "B15"} <= set(ho) and not set(tr) & set(ho),
+           f"FA1 option A: the pack's fit targets are the net trials at their own estimands plus the IRS targets "
+           f"({tr}); B7, B8, B15 and the rest are held out")
+    case("FA1", fa1)
+
+    def fa2():
+        card = PR.load_card(e)["priors"]
+        bx = p["fit_joint"]["params"]
+        ok(sorted(bx) == sorted(["net_kill_shift", "pbo_gain_scale", "pbo_adv_decay", "cfp_kill", "irs_kill",
+                                 "cfp_half"])
+           and "pbo" in train_nets(base, split(base)[0])
+           and all(bx[k] == [card[k].lo, card[k].hi] for k in ("net_kill_shift", "pbo_gain_scale", "pbo_adv_decay"))
+           and calibration_params(p) == {"net_kill_shift"}
+           and _fit_settings(p) == ["benin", "irs_added", "llineup", "misungwi", "muleba"],
+           f"FA2 option A fits net_kill_shift, pbo_gain_scale, pbo_adv_decay, cfp_kill, cfp_half and irs_kill; the "
+           f"three net-effect boxes are their card priors; the calibration arms still depend on net_kill_shift only; "
+           f"the LLINEUP site joins ({ {k: bx[k] for k in sorted(bx)} })")
+    case("FA2", fa2)
+
+    def fa3():
+        q = plan(p)
+        nd = OPTION_A["design_n"]
+        ok(nd == 3 * (6 + 1) * (6 + 2) // 2 and q["wave1_points_run"] == nd and q["design_points"] == OPTION_A["wave2_n"]
+           and q["reused_points"] == 0 and q["calibration_reused"] is False and q["calibration_runs"] > 0
+           and q["not_fitted"] == [] and len(q["settings"]) == 5,
+           f"FA3 the option A plan runs a fresh fit: no wave-1 point or calibration grid is reused (the training "
+           f"targets changed), {nd} wave-1 points (3 per quadratic coefficient in 6 dimensions), "
+           f"{OPTION_A['wave2_n']} wave-2 points, the calibration grid ({q.get('calibration_runs')} runs): "
+           f"${q['usd_real'][0]}-{q['usd_real'][1]} at the measured price")
+    case("FA3", fa3)
+
+    def fa4():
+        got = {}
+        for label, kw in (("the old verification round", {"verify_round": True}), ("no owner cap", {})):
+            try:
+                run(p, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=False, cap_usd=1e9, **kw)
+                got[label] = ""
+            except ValueError as ex:
+                got[label] = str(ex)
+        ok("declarations" in got["the old verification round"] and "cap" in got["no owner cap"]
+           and OPTION_A["cap_usd"] is None,
+           f"FA4 option A refuses the old rounds' reuse (wave 1 ran on other fit declarations) and a full fit whose "
+           f"cap is not the owner's (OPTION_A cap_usd unset until the owner sets it): {got}")
+    case("FA4", fa4)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
