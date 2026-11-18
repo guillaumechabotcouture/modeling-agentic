@@ -106,9 +106,10 @@ WAVE1_TARGETS = ["B10", "B11", "B12", "B12b", "B12m"]     # the fit targets wave
 # (36 coefficients: 108), as DESIGN did in 4; wave 2: the same rule plus 3, as WAVE2 did (48 = 3 x 15 + 3), in wave 1's
 # accepted hull widened by WAVE2's margin. Shared data:
 # pbo_adv_decay's prior box was derived from LLINEUP (B9d, B9f), now also targets; B9g is B10 / B9c of the same arms, so
-# it adds a same-trial contrast, not independent data. cap_usd is the owner's, set here when the fit is approved.
+# it adds a same-trial contrast, not independent data. cap_usd is the owner's, set here when the fit is approved:
+# 2026-11-18, one VM of 96 vCPUs (E96s_v5), $250 (about 2.4x the plan's measured-rate upper bound).
 OPTION_A = {"targets": ["B9", "B9b", "B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11", "B12", "B12b", "B12m"],
-            "design_n": 108, "wave2_n": 111, "cap_usd": None,
+            "design_n": 108, "wave2_n": 111, "cap_usd": 250.0,
             "store": "outputs/_engine/net_effect_fit/option_a", "job": "f6-refit-optiona"}
 # Verification round 2 (owner, 14 Nov): wave 2 (cluster 2377496) ran with candidates over the whole box, so its chosen
 # point and two failed points sat at cfp_half ~1,600 days, past wave 2's design box (extrapolation). This round reads
@@ -307,7 +308,7 @@ class RecalRunner(BM.Runner):
         checkpoint is read from it, a new one is appended as it finishes. Every result passes through its JSON form,
         so a resumed run returns exactly what an uninterrupted one does."""
         if self.ckpt is None:
-            return BM.Runner._map(self, jobs, chunk)
+            return BM.Runner._map(self, jobs, max(chunk, _chunk(self.workers)))
         from concurrent.futures import ProcessPoolExecutor, as_completed
         by = {}
         for n, j in enumerate(jobs):
@@ -334,6 +335,7 @@ class RecalRunner(BM.Runner):
             for i in todo:
                 land(i, self.task_fn(tasks[i]))
         else:
+            chunk = max(chunk, _chunk(self.workers))
             for c in range(0, len(todo), chunk):
                 part = todo[c:c + chunk]
                 with ProcessPoolExecutor(min(self.workers, len(part)), **BM._pool_kw()) as ex:
@@ -440,8 +442,15 @@ def _task_s(k: int) -> float:
     return GROUP_S + k * ARM_S
 
 
-def _waves(n_tasks: int, vcpus: int, chunk: int = 300) -> int:
-    """benchmark.Runner._map runs tasks in chunks of 300, each on a fresh pool of `vcpus` workers."""
+def _chunk(workers: int) -> int:
+    """Tasks per fresh process pool: 300 (worker memory, the spike's limit), and at least 4 per worker so a large VM is
+    not idled at each chunk's tail (owner, 18 Nov: one VM of 96 vCPUs)."""
+    return max(300, 4 * int(workers))
+
+
+def _waves(n_tasks: int, vcpus: int, chunk: int | None = None) -> int:
+    """RecalRunner._map runs tasks in chunks of _chunk(vcpus), each on a fresh pool of `vcpus` workers."""
+    chunk = _chunk(vcpus) if chunk is None else chunk
     return sum(-(-min(chunk, n_tasks - i) // vcpus) for i in range(0, n_tasks, chunk))
 
 
