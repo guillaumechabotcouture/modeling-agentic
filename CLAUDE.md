@@ -152,7 +152,7 @@ the live attachment picture.
 | Exit | Statuses |
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
-| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff` (v2) |
+| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff`, `paused:awaiting_budget` (v2) |
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
 
@@ -163,8 +163,10 @@ declined such a declaration and no rounds were left to fix it.
 A v2 run prints `paused:<reason>` when its state machine
 stops for the owner, at SIGN (the decision spec: `python3
 agents/stage_machine.py sign <run_dir> --by owner`) or at OWNER_DECISION
-(scope declarations), and exits 2; `main.py --resume <run_dir>`
-continues from `run_state.json`.
+(scope declarations, or findings whose remedy is an owner amendment: `python3 scripts/scope_signoff.py sign
+<run_dir> --by owner`), or before a paid task whose
+allowance is below the floor (`paused:awaiting_budget`: resume with a higher `--max-budget-usd`), and exits 2;
+`main.py --resume <run_dir>` continues from `run_state.json`.
 
 Every run records which pipeline ran: `metadata.json` holds `pipeline`
 (`v1`|`v2`), `commit` and `launcher` (plus one `invocations` entry per

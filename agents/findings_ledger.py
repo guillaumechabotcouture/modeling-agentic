@@ -300,18 +300,24 @@ def decision_test_result(run_dir: str, rel: str) -> dict:
     return {"file": rel, "valid": True, "decision_changes": dc, "finding": doc.get("finding")}
 
 
-def owner_answers(run_dir: str) -> dict[str, str]:
-    """Phase 49 β answers (finding -> accept | decline), read when scope_signoff.json exists."""
-    p = os.path.join(run_dir, "scope_signoff.json")
+def answer_fingerprint(fid: str, claim, fix_requires) -> str:
+    """What an owner answer binds to: the finding and its claim and remedy as asked (agents/stage_machine.py writes it
+    into the request); a revised finding with the same id has another fingerprint and is asked again."""
+    return hashlib.sha256(json.dumps({"finding": fid, "claim": claim, "fix_requires": fix_requires},
+                                     sort_keys=True).encode()).hexdigest()[:16]
+
+
+def owner_answers(run_dir: str) -> dict[str, dict]:
+    """The owner's answers (fingerprint -> {finding, decision, ...}) that the harness recorded (scripts/scope_signoff.py
+    verified_answers: the answer's hash under a nonce trace.jsonl also holds), signed by the owner. Nothing else counts
+    (Codex review of #258 P1-8): not a lead's answer, not one written to scope_signoff.json without the harness."""
     try:
-        doc = json.load(open(p))
-    except (OSError, ValueError):
+        import scope_signoff as SS
+        verified, _bad = SS.verified_answers(run_dir)
+    except Exception:  # noqa: BLE001 -- unreadable: no answer counts (fail closed)
         return {}
-    out = {}
-    for a in doc.get("answers") or []:
-        if isinstance(a, dict) and a.get("finding") and a.get("decision") in ("accept", "decline"):
-            out[str(a["finding"])] = a["decision"]
-    return out
+    return {fp: a for fp, a in verified.items() if isinstance(a, dict) and a.get("by") == "owner"
+            and a.get("finding") and a.get("decision") in ("accept", "decline")}
 
 
 # ------------------------------------------------------------------ sync
@@ -379,7 +385,11 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             f.decision_test = decision_test_result(run_dir, hit["decision_test"])
         if not f.scope_declarable:
             f.resolution_type = "fix"
-        ans = next((answers[n] for n in names if n and n in answers), None)
+        a = answers.get(answer_fingerprint(f.id, f.claim, f.fix_requires))    # bound to this claim and remedy
+        ans = a.get("decision") if a and str(a.get("finding")) == f.id else None
+        if ans is None and f.resolution_type == "owner_decision" and f.status in ("open", "declared") \
+                and any(isinstance(e, dict) and e.get("by") == "owner" for e in f.events):
+            f.resolution_type = "fix"        # answered as it was before; revised since, so it is asked again
         if ans and f.status in ("open", "declared"):
             f.status = "owner_accepted" if ans == "accept" else "owner_declined"
             f.resolution_type = "owner_decision"
@@ -510,6 +520,28 @@ def _self_test() -> int:
         except (ValueError, OSError):
             pass
         ok(open(os.path.join(out, "v")).read() == "untouched", "L14 the ledger is not written through a planted .tmp link")
+    # L17 (F6 run 3; Codex review of #258 P1-8/P1-9): an owner answer counts only once the harness recorded it, and it
+    # binds to the finding's claim and remedy: a revised finding with the same id is not answered by it
+    with tempfile.TemporaryDirectory() as d:
+        import scope_signoff as SS
+        claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
+        fp = answer_fingerprint("D-031", claim, fix)
+        json.dump({"answers": {fp: {"finding": "D-031", "decision": "decline", "by": "owner"}}},
+                  open(os.path.join(d, "scope_signoff.json"), "w"))
+        save(d, {"D-031": Finding(id="D-031", kind="critique_blocker", severity="HIGH", source="harness", claim=claim,
+                                  fix_requires=fix)})
+        unverified = owner_answers(d)
+        SS.harness_record(d)
+        led17, _ = sync(d, None, 2)
+        st17 = led17["D-031"].status
+        led17["D-031"].claim, led17["D-031"].status = "a revised claim", "open"
+        save(d, led17)
+        led17b, _ = sync(d, None, 3)
+        import fix_loop as FX_
+        ok(unverified == {} and st17 == "owner_declined" and led17b["D-031"].status == "open"
+           and FX_.needs_owner_amendment(led17b["D-031"]),
+           f"L17 a recorded owner answer applies to the finding it was given for; a revised one is asked again "
+           f"({unverified}, {st17}, {led17b['D-031'].status})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
