@@ -350,8 +350,17 @@ def _self_test() -> int:
        "RS16 the child must exit 0 and report exactly one row per scenario")
     ok(_kept_from_lines(['{"i": 0, "ok": true}', '{"i": 1, "ok": true}', '{"i": 2, "o']) == [0, 1],
        "RS17 (P3) a torn journal line is skipped, as compute.py's reuse skips it")
-    ok(toy_kill_allowed(os.getsid(0), os.getsid(0)) is False and toy_kill_allowed(os.getsid(0) + 1, os.getsid(0)),
-       "RS18 (P1) the toy kills only a process group in a session other than the smoke's")
+    ok(kill_target(7, 7, 7) is None and kill_target(9, 7, 8) is None and kill_target(9, 7, 9) == 9,
+       "RS18 (P1) the toy signals only its own step session's leader group, never one in the smoke's session")
+    ok("def kill_target" in TOY_FN and "kill_target(os.getsid(0)" in TOY_FN,
+       "RS18b the toy worker runs that same guard")
+    ok(not judge("x", [0, 1, 2], [3, 4, 5], s, **dict(kw, rows=good[:5] + [good[4]]))["ok"],
+       "RS19 every input must appear once in the final rows")
+    cs = {"reused": 1, "computed": 5, "n_ok": N, "_kept": [0]}
+    ok(not judge("c", [0, 1, 2], [1, 2, 3, 4, 5], cs, rows=good)["ok"],
+       "RS20 a cap stop that lost a row it finished (a later call started) fails")
+    ok(judge("c", [0, 1, 2], [2, 3, 4, 5], dict(cs, reused=2, computed=4, _kept=[0, 1]), rows=good)["ok"],
+       "RS20b a cap stop that kept every row it finished passes")
     rep = run_tree(ROOT)
     ok(rep["ok"] and {x["scenario"] for x in rep["scenarios"]} == {"analyze_timeout", "killed_batch", "cap_stop"}
        and all(x["kept"] >= 1 and x["recomputed"] == 0 and x["reused"] == x["kept"] for x in rep["scenarios"]),
