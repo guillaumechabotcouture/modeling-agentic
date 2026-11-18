@@ -42,6 +42,7 @@ import copy
 import json
 import math
 import os
+import shlex
 import sys
 import time
 
@@ -483,16 +484,15 @@ def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPU
             "vm_vcpu_hours": [round(v, 1) for v in vh],
             "usd": [round(vh[0] * USD_PER_VCPU_H[0], 1), round(vh[1] * USD_PER_VCPU_H[1], 1)],
             "usd_real": [round(v * USD_REAL_PER_VCPU_H, 1) for v in vh],
-            "launch": " ".join(launch_command(vcpus, wall[1]))}
+            "launch": None if verify_round else shlex.join(launch_command(vcpus, wall[1], verify))}
 
 
-def launch_command(vcpus: int = VCPUS, wall_hours: float | None = None) -> list:
+def launch_command(vcpus: int = VCPUS, wall_hours: float | None = None, verify: int = VERIFY) -> list:
     """The option A launch (F6, OA3): one VM through cloud/vm_job.py, whose job meter stops the VM at --cap-usd in USD
     (cloud/budget.py); the fit writes a copy of its output under $JOB_OUT. Until the owner sets OPTION_A["cap_usd"] and
     gives the approval text, the command carries placeholders that vm_job and `run` refuse (fail closed). The
     verification round's launch (owner, 14 Nov: cap $15, job f6-refit-netfit-v017r2, store round2) ran and is history.
     --max-hours covers the plan's upper wall time plus an hour (vm_job's default is 24 h; Codex r1 P1-4 on #269)."""
-    import math
     cap = OPTION_A["cap_usd"]
     hours = "<plan wall hours + 1>" if wall_hours is None else str(int(math.ceil(float(wall_hours) + 1)))
     return ["python3", "cloud/vm_job.py", "run", OPTION_A["job"], "net-effect-fit", "--tree", ".",
@@ -501,7 +501,7 @@ def launch_command(vcpus: int = VCPUS, wall_hours: float | None = None) -> list:
             "--budget-scope", "f6", "--cpu", str(vcpus), "--memory", f"{4 * vcpus} GiB", "--max-hours", hours, "--",
             "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py", "run",
             "--approved", "<owner approval: option A net-effect fit, its cap>", "--margin-loo",
-            "--workers", str(vcpus)]
+            "--verify", str(int(verify)), "--workers", str(vcpus)]
 
 
 def target_bands(pack: dict) -> dict:
@@ -1090,6 +1090,10 @@ def run_cap(verify_round: bool, smoke: bool, caller: float | None, owner: float 
     none (it is small and writes only its scratch file)."""
     if smoke:
         return None
+    bad = [x for x in (caller, owner) if x is not None and not (isinstance(x, (int, float)) and math.isfinite(x)
+                                                                 and x > 0)]
+    if bad:
+        raise ValueError(f"a cap must be a finite positive number of USD, not {bad}")
     if verify_round:
         return min(CAP_USD if caller is None else float(caller), VERIFY_ROUND["plan_cap_usd"])
     if owner is None:
@@ -1113,7 +1117,8 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
     if not smoke and not (approved or "").strip():
         raise ValueError("the full fit spends more than $20: pass --approved with the owner's approval (or --smoke)")
     if not smoke and (approved or "").strip().startswith("<"):
-        raise ValueError(f"--approved {approved!r} is the launch command's placeholder, not the owner's approval")
+        raise ValueError(f"--approved {approved!r} is the launch command's placeholder text, not the owner's "
+                         f"approval")
     nv = vcpus or max(int(workers), 1)
     fresh = smoke or not verify_round          # F6 option A: a fresh fit (smoke: the same steps, small)
     q = plan(pack, verify, 2, nv, 3, int(pack["fit_joint"]["design"]["n"]) + 2) if smoke else plan(
