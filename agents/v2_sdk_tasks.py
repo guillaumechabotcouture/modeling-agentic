@@ -423,7 +423,6 @@ class SdkTasks:
         self.turns = max_turns
         self.query_fn = query_fn
         self.n = 0
-        self.ledger_dir = self.run_dir     # where spend is charged (a proposal session charges its run's ledger)
 
     def set_allowance(self, usd: float, readback_usd: float | None = None) -> None:
         """The call's dollar cap, and the cap of one crash read-back (0: none; the whole allowance
@@ -435,10 +434,10 @@ class SdkTasks:
         """Exactly the reported cost when there is one; otherwise the whole allowance. Never the
         duration estimate charge_session uses for a session with no id (Codex R2-2)."""
         from agents import run_budget as RB
-        ledger = RB.load_budget_ledger(self.ledger_dir)
+        ledger = RB.load_budget_ledger(self.run_dir)
         self.n += 1
         RB.charge_session(ledger, self.n, result, allowance, session_id=sid, elapsed_s=None, source=source)
-        RB.write_budget_ledger(self.ledger_dir, ledger, None)
+        RB.write_budget_ledger(self.run_dir, ledger, None)
         return float(ledger["sessions"][-1].get("total_cost_usd") or 0.0)
 
     def _session(self, kind: str, system: str, prompt: str, owns: tuple, model: str | None = None) -> TaskResult:
@@ -532,17 +531,6 @@ class SdkTasks:
         return name
 
     def draft_spec(self, question, run_dir, feedback):
-        if run_dir and os.path.abspath(run_dir) != self.run_dir:
-            # F6 SP: a rethink of a signed spec drafts in <run>/proposals/rev<k>/ (agents/stage_machine.py): the
-            # session works there (the signed files are outside its reach) and charges the run's own ledger
-            t = SdkTasks(run_dir, allow_cloud=self.cloud, task_cap_usd=self.cap, max_turns=self.turns,
-                         query_fn=self.query_fn)
-            t.ledger_dir, t.n = self.ledger_dir, self.n
-            t.set_allowance(self.allowance, readback_usd=self.readback)
-            try:
-                return t.draft_spec(question, run_dir, feedback)
-            finally:
-                self.n = t.n
         R = enforcement.REPO_ROOT
         p = f"Question:\n{question}\n" + (f"\nThe last draft failed validation:\n- " + "\n- ".join(feedback) if feedback else "")
         return self._session("draft_spec", PROMPTS["draft_spec"].format(
@@ -567,12 +555,16 @@ class SdkTasks:
         fb = ("\n\nThis is a repair: the gate refused your file. These are all of its errors; fix every one, "
               "check the whole file against the schema above, and keep the review:\n- "
               + "\n- ".join(feedback)) if feedback else ""
+        from toolkit.analysis import red_flag as RF       # heuristic notes the reviewer judges; never a gate
+        notes = RF.critic_notes(run_dir)
+        msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
+                                            + "\n- ".join(notes) if notes else "")
         return self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
             stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
-                             f"Review round {round_n}.", (f,), model)
+                             msg, (f,), model)
 
     def plan_fixes(self, packet):
         inp = self._input(packet)
@@ -843,25 +835,6 @@ def _self_test() -> int:
                 call()
             except Exception as e:  # noqa: BLE001 -- the failure is the finding
                 errors[k] = f"{type(e).__name__}: {e}"
-        # PS2 (F6 SP): a draft in a spec proposal dir runs its session there, with the call's allowance, and charges
-        # the run's own budget ledger
-        where = {}
-        orig_session = SdkTasks._session
-
-        def at_session(self_, kind, system, prompt, owns, model=None):
-            where[kind] = (self_.run_dir, self_.allowance, self_.ledger_dir)
-            return TaskResult(True, {"ok": True}, 0.0, "fake")
-        SdkTasks._session = at_session
-        try:
-            t2 = SdkTasks(d)
-            t2.set_allowance(1.5)
-            pd_ = os.path.join(d, "proposals", "rev1")
-            os.makedirs(pd_, exist_ok=True)
-            t2.draft_spec("Q?", pd_, None)
-        finally:
-            SdkTasks._session = orig_session
-        ok(where.get("draft_spec") == (os.path.abspath(pd_), 1.5, os.path.abspath(d)),
-           f"PS2 a proposal draft runs in the proposal dir and charges the run's ledger {where.get('draft_spec')}")
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")

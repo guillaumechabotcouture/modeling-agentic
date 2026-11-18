@@ -37,7 +37,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import stat
 import sys
 import time
@@ -366,17 +365,6 @@ def _marker_in(dirs) -> str | None:
     return None
 
 
-PROPOSAL_ROOT = re.compile(r"rev[0-9]+")    # agents/stage_machine.py: a SPEC rethink's proposal, <run>/proposals/rev<k>
-
-
-def _proposal_root(run_dir: str, root: str) -> bool:
-    """The one root accepted inside a run dir (F6 SP): <run_dir>/proposals/rev<k>, a spec proposal laid out as a run
-    dir, with no link at either component. Nothing else below a run dir is exempt."""
-    rel = os.path.relpath(root, run_dir).split(os.sep)
-    return (len(rel) == 2 and rel[0] == "proposals" and bool(PROPOSAL_ROOT.fullmatch(rel[1]))
-            and not os.path.islink(os.path.join(run_dir, rel[0])) and not os.path.islink(root))
-
-
 def anchored(path: str, root: str) -> tuple[int, str]:
     """(root fd, rel) for a no-follow write of `path` under the trusted `root` the caller passes (the harness always
     knows its run dir). The root is required: omitted or None is refused, and so is a path not lexically under it;
@@ -404,7 +392,7 @@ def anchored(path: str, root: str) -> tuple[int, str]:
             raise LinkRefused(f"{path}: not under the root {root}")
     up = ar.split(os.sep)
     above = _marker_in(os.sep.join(up[:i]) or os.sep for i in range(1, len(up)))
-    if above and not _proposal_root(above, ar):
+    if above:
         raise LinkRefused(f"{root}: inside the run dir {above}; pass that run dir as the root")
     if not _marker_in([ar]):
         parts = rel.split(os.sep)[:-1]
@@ -763,27 +751,6 @@ def _self_test() -> int:
                 res.append(True)
         ok(all(res) and open(os.path.join(out, "v")).read() == "outside" and not os.path.exists(os.path.join(out, "new")),
            f"SI-AR2 appends through a link, a linked directory or a hard link are refused ({res})")
-
-    # SI-PR (F6 SP): the one root allowed inside a run dir is a spec proposal, <run>/proposals/rev<k>; nothing else
-    with tempfile.TemporaryDirectory() as d:
-        write(d, "metadata.json", "{}")
-        os.makedirs(os.path.join(d, "proposals", "rev1"))
-        os.makedirs(os.path.join(d, "proposals", "x"))
-        os.makedirs(os.path.join(d, "data"))
-        res = []
-        try:
-            publish(os.path.join(d, "proposals", "rev1", "a.txt"), "ok", os.path.join(d, "proposals", "rev1"))
-            res.append(open(os.path.join(d, "proposals", "rev1", "a.txt")).read() == "ok")
-        except LinkRefused:
-            res.append(False)
-        for root in (os.path.join(d, "proposals", "x"), os.path.join(d, "data"), os.path.join(d, "proposals")):
-            try:
-                publish(os.path.join(root, "b.txt"), "no", root)
-                res.append(False)
-            except LinkRefused:
-                res.append(True)
-        ok(all(res), f"SI-PR a proposal root <run>/proposals/rev<k> is accepted; any other root inside a run is refused "
-                     f"({res})")
 
     if failures:
         print("FAIL:", file=sys.stderr)
