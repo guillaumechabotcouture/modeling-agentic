@@ -182,7 +182,7 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
 DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
-                       "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale")
+                       "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale", "boundary_engine")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -1469,6 +1469,12 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                                    for c2 in pk.values()) for cs in pk.values()):
                     bad.append(f"decision test {i}: no package with {orc['component']} has a counterpart with "
                                f"{orc['reference']} in its place")
+        elif t == "boundary_engine":         # F6 run 4 R3 (RIG-002): the boundary check's engine tables, re-solved
+            extra_k = sorted(set(dt) - {"id", "type", "text", "finding"})
+            if extra_k:
+                bad.append(f"decision test {i}: boundary_engine takes no parameters (got {extra_k})")
+            if an.get("evaluation") != "emulator":
+                bad.append(f"decision test {i}: boundary_engine needs the emulator path (analysis.evaluation emulator)")
         elif t == "burden_scale":            # F6 run 3, owner decision D-c (toolkit/analysis/decision_tests.py)
             bsc = dt.get("burden_scale")
             if not isinstance(bsc, dict) or set(bsc) != {"references", "shares"}:
@@ -2007,6 +2013,15 @@ def _self_test() -> int:
         r_o = copy.deepcopy(s.raw)
         dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
         ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")
+        # F6 run 4 R3 (RIG-002): the boundary check's engine tables in place of the emulator's, re-solved
+        dbe = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTbe", "type": "boundary_engine", "text": "t"}, **kw)))
+        bad(dbe(units=["0"]), "boundary_engine takes no", "SP-BE1 a boundary_engine test takes no parameters")
+        bad(lambda r: (r["analysis"].update(evaluation="direct"), dbe()(r)), "emulator",
+            "SP-BE2 a boundary_engine test needs the emulator path (the boundary check runs only there)")
+        r_be = copy.deepcopy(s.raw)
+        dbe()(r_be)
+        ok(validate(Spec(r_be, d)) == [], f"SP-BE3 a boundary_engine test validates: {validate(Spec(r_be, d))[:3]}")
         _self_test_burden_scale(ok, s, d, bad)
         _self_test_outcome_adjustments(ok, s, d, bad)
         r_t = copy.deepcopy(s.raw)

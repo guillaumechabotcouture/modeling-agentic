@@ -951,6 +951,34 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
             return _not_run(A, dt, bsr["not_run"])
         varied, cases, lowers, evs = bsr["varied"], bsr["cases"], bsr["lowers"], bsr["evs"]
         extra["_bs"] = bsr["record"]
+    elif t == "boundary_engine":       # F6 run 4 R3 (RIG-002): the engine side of the boundary check, re-solved
+        be = getattr(A, "boundary_engine", None)
+        if not be or not be.get("ben"):
+            return _not_run(A, dt, "the boundary check produced no engine tables (it runs on the emulator path, for "
+                                   "units with a runner-up)")
+        from toolkit.analysis.core import CostTable
+        ben = {i: dict(ben0[i]) for i in A.ids}
+        tot = {i: dict(cost0[i]) for i in A.ids}
+        byc = {i: {k: dict(v) for k, v in (getattr(cost0, "by_component", {}).get(i) or {}).items()} for i in A.ids}
+        for u, pair in be["pairs"].items():       # only the two compared cells (Codex review of #252 P1-1, P1-2)
+            for k in pair:
+                ben[u][k] = be["ben"][u][k]
+                tot[u][k] = be["cost"][u][k]
+                byc.setdefault(u, {})[k] = dict(be["cost_by"][u][k])
+        cost = CostTable(tot, byc)
+        pev = getattr(A, "point_events", None)       # #252 review P1-3; re-review: no record, not run
+        if pev is None:
+            return _not_run(A, dt, "the point evaluation's model corrections are not recorded (Analysis.point_events), "
+                                   "so the re-solved plan could not be guarded")
+        subst = {(u, k) for u, pair in be["pairs"].items() for k in pair}
+        # re-review P1: a correction on a cell the engine now supplies no longer bears on it
+        evs["engine_at_boundary"] = [e for e in pev if (str(e.get("unit")), e.get("package")) not in subst]
+        varied = ("at the units of the boundary check, the benefits and costs of the packages run on the engine taken "
+                  "from the engine instead of the emulator")
+        cases, lowers = [("engine_at_boundary", ben, cost, None, None)], [False]
+        extra["_be"] = {"units": sorted(be["ben"]), "pairs": {u: list(p) for u, p in be["pairs"].items()},
+                        "run_packages": be["run"], "check": {u: dict(be["ben"][u]) for u in sorted(be["ben"])},
+                        "benefit": {u: dict(ben[u]) for u in sorted(be["ben"])}}
     elif t == "scenario_excluded":
         return _not_run(A, dt, f"the spec holds the scenario value {dt['parameter']} fixed by name: {dt['reason']}",
                         {"parameter": dt["parameter"]})
@@ -1053,6 +1081,9 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         try:
             sol = A.solve(ben, cost, budget=budget, feas=feas)
         except RuntimeError as e:
+            if t == "boundary_engine" and str(e).strip() == "optimizer status infeasible":     # #252 review P2-5
+                return _not_run(A, dt, "with the engine's costs at the boundary units no allocation that meets the "
+                                       "constraints fits the budget the plan is solved within (the solver proves it infeasible)")
             if t != "cost_items" or str(e).strip() != "optimizer status infeasible":
                 raise
             # Codex r1: the price case has no affordable plan; the record keeps the prices and says why
@@ -1123,6 +1154,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         rec["calibration_target"] = extra["_ct"]
     if t == "outcome_ratio":        # the package pairs and one unit's recomputed benefit (a check)
         rec["outcome_ratio"] = extra["_or"]
+    if t == "boundary_engine":      # the boundary units, the packages run on the engine there, their benefits
+        rec["boundary_engine"] = extra["_be"]
     if t == "burden_scale":         # each reference's group, model and external values, factor; one unit per group
         rec["burden_scale"] = extra["_bs"]
     if comps:
