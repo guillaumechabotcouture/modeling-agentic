@@ -157,8 +157,8 @@ def _self_test() -> int:
     def pt4():
         from toolkit.engines.benchmark_sources import check_pack
         bad = [x for x in check_pack(pack) if x.split(":")[0] in NEW_IDS]
-        ok(not set(NEW_IDS) & set(pack["fit_joint"]["targets"]) and not bad,
-           f"PT4 B9d-B9g are held out (not fit_joint targets) and pass the source check ({bad})")
+        ok(set(NEW_IDS) <= set(pack["fit_joint"]["targets"]) and not bad,
+           f"PT4 B9d-B9g are fit targets (F6 option A, OA3: the net-effect fit) and pass the source check ({bad})")
     case("PT4", pt4)
 
     def pt5():
