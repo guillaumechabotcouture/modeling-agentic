@@ -659,6 +659,12 @@ def _wait_gate(a, name, cid, dest, accepted):
             print(f"{a.job_id}: budget or cost reading failed ({type(e).__name__}: {str(e)[:120]})", flush=True)
             if i < 2:
                 time.sleep(5)
+    if not accepted:
+        # Codex on #265 (P1): the budget never accepted this cap (an unreadable or unsigned budget raises inside it),
+        # so this wait takes no ownership of the cluster: alerted, and left as it was.
+        budget.alert("cost_unreadable", job_id=a.job_id, cluster_id=cid, cap_usd=a.cap_usd, where="wait --cap-usd gate")
+        raise _CapRefused(f"{a.job_id} on {name}: the budget could not be read 3 times before accepting the cap; the "
+                          "cluster is left as it was (retry `wait --cap-usd`, or `down` it)")
     # Never a stop for bookkeeping (owner decision, 2026-11-17): alerted, then metered by a meter rebuilt at each
     # reading, whose failures _cap_reading reports.
     print(f"WARNING: {a.job_id} on {name}: the budget or cluster {cid}'s cost could not be read 3 times in a row; "
@@ -2273,7 +2279,13 @@ def _self_test_run(ok, real_gate=None) -> None:
                 W, ev, res, seen, lbo_calls, killed = rewait("e", [1.0], lbo_ok=False)
                 ok(isinstance(res, SystemExit) and "budget" in str(res.code) and ("attach_id", 100) not in ev
                    and W["stops"] == 0, f"RN32e a refusal that is not about dollars still refuses: {res!r}")
-                for label, readings, mf in (("f", [RuntimeError("api")], False), ("h", [1.0], True),
+                ALERTS.clear()
+                W, ev, res, seen, lbo_calls, killed = rewait("f", [RuntimeError("api")])
+                ok(isinstance(res, SystemExit) and "left as it was" in str(res.code) and ("attach_id", 100) not in ev
+                   and W["stops"] == 0 and [x["kind"] for x in ALERTS] == ["cost_unreadable"],
+                   f"RN32f a budget that cannot be read before it accepts the cap is alerted, and the cluster is "
+                   f"left as it was (no ownership taken, Codex on #265): {res!r} {ALERTS}")
+                for label, readings, mf in (("h", [1.0], True),
                                             ("g", [1.0, RuntimeError("api")], False), ("j", [1.0], 3)):
                     ALERTS.clear()
                     W, ev, res, seen, lbo_calls, killed = rewait(label, readings, meter_fails=mf)
@@ -2367,8 +2379,8 @@ def main(argv=None) -> int:
         if nm == "wait":
             p.add_argument("--every", type=float, default=300)
             p.add_argument("--cap-usd", type=float, default=None,
-                           help="re-attach a cost cap: meter the job's recorded cluster id and stop it by id at the "
-                                "cap or when the job ends")
+                           help="re-attach a cost cap: meter the job's recorded cluster id (alerts past the cap, "
+                                "never a stop for dollars) and stop it by id when the job ends")
             p.add_argument("--budget-scope", default=None, help="default: the scope whose prefix the name has")
     dn = sub.add_parser("down")
     dn.add_argument("name")
