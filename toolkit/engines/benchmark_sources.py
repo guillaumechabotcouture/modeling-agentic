@@ -992,9 +992,15 @@ def _self_test() -> int:
         empty = load_evidence(eng, pack=dict(toy, benchmarks=[])).problems
         missing = load_evidence(eng, pack=toy, rows=[]).problems
         partial = load_evidence(eng, pack=toy, rows=[], partial=True).problems
-        ok(unreadable and empty and any("rerun required: T1" in x for x in missing) and partial == (),
-           f"BS68 an unreadable pack, an empty pack and missing rows are problems; partial rows are explicit: "
-           f"{unreadable} | {empty} | {missing} | {partial}")
+        ok(unreadable and empty and any("not yet run: T1" in x for x in missing)
+           and not any("rerun required" in x for x in missing) and partial == (),
+           f"BS68 an unreadable pack, an empty pack and missing rows are problems (a missing row is 'not yet run', not "
+           f"a stale 'rerun required'); partial rows are explicit: {unreadable} | {empty} | {missing} | {partial}")
+        t2 = dict(toy, benchmarks=list(toy["benchmarks"]) + [dict(toy["benchmarks"][0], id="T9")])
+        both = load_evidence(eng, pack=t2, rows=[{"id": "T1", "band_sha256": "an older declaration"}]).problems
+        ok(any("rerun required: T1" in x for x in both) and any("not yet run: T9" in x for x in both)
+           and not any("rerun required: T1, T9" in x or "rerun required: T9" in x for x in both),
+           f"BS68b a stale row and a benchmark never run are named apart, both refused: {both}")
         with tempfile.TemporaryDirectory() as d:
             rp = os.path.join(d, "results.yaml")
             yaml.safe_dump(BM.stamp({"note": "no rows"}, eng), open(rp, "w"))

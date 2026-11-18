@@ -1633,6 +1633,36 @@ def _self_test() -> int:
                       f"{wrong or 'none'})")
     case("F19", f19)
 
+    def f19c():
+        # F6 option A: a held-out benchmark (and its setting) added to the pack does not touch what wave 1 ran, so its
+        # results stay reusable; a change to a training target's declaration (here a training setting) refuses them
+        import tempfile
+        global PACK
+        held_pk = copy.deepcopy(base)
+        held_pk["settings"]["zz_site"] = copy.deepcopy(held_pk["settings"]["misungwi"])
+        held_pk["arms"].update(zz_a={"setting": "zz_site", "package": {"net": "pyr"}},
+                               zz_b={"setting": "zz_site", "package": {"net": "pbo"}})
+        held_pk["benchmarks"].append(dict(byid["B9c"], id="ZZ1", estimand=dict(byid["B9c"]["estimand"], num="zz_b",
+                                                                                 den="zz_a")))
+        train_pk = copy.deepcopy(base)
+        train_pk["settings"]["muleba"]["calibrate"]["grid"] = [8, 16, 32]
+        got, orig = {}, PACK
+        with tempfile.TemporaryDirectory() as d:
+            for label, pk in (("held", held_pk), ("train", train_pk)):
+                PACK = os.path.join(d, f"{label}.yaml")
+                yaml.safe_dump(pk, open(PACK, "w"), sort_keys=False)
+                try:
+                    load_wave1(WAVE1, e, yaml.safe_load(open(PACK)))
+                    got[label] = ""
+                except ValueError as ex:
+                    got[label] = str(ex)
+                finally:
+                    PACK = orig
+        ok(got.get("held") == "" and "declarations" in got.get("train", ""),
+           f"F19c wave 1 stays reusable when the pack gains a held-out benchmark and setting, and is refused when a "
+           f"training target's declaration changes ({got})")
+    case("F19c", f19c)
+
     def f20():
         old = {"a": [0.0, 1.0], "b": [10.0, 20.0], "c": [0.0, 1.0]}
         new = {"a": [0.0, 1.0], "b": [5.0, 30.0], "c": [0.0, 1.0]}
