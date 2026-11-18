@@ -217,7 +217,8 @@ def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
 
 def _write_json(path: str, obj) -> None:
     tmp = path + ".tmp"
-    json.dump(obj, open(tmp, "w"), indent=1)
+    with open(tmp, "w") as fh:         # closed (and flushed) before the replace: a failed flush keeps the old file
+        json.dump(obj, fh, indent=1)
     os.replace(tmp, path)
 
 
@@ -1024,6 +1025,35 @@ def _self_test() -> int:
             sync_outputs(run, "j2", dest2)
             ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "U", "analysis", "d.jsonl.job.json")) is not None,
                "RC40f an interrupted digest-cache write keeps an earlier poll's digest")
+            # RC40g (Codex round 6): a write whose flush fails at close never replaces the file
+            wp = os.path.join(d, "w.json")
+            _write_json(wp, {"a": 1})
+            real_open = open
+
+            class _BadClose:
+                def __init__(self, f):
+                    self.f = f
+
+                def write(self, x):
+                    return self.f.write(x)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *e):
+                    self.f.close()
+                    raise OSError("disk full at close")
+            import builtins
+            builtins.open = lambda p_, m="r", *a_, **k_: (_BadClose(real_open(p_, m, *a_, **k_))
+                                                         if str(p_).endswith("w.json.tmp") else real_open(p_, m, *a_, **k_))
+            try:
+                try:
+                    _write_json(wp, {"a": 2})
+                except OSError:
+                    pass
+            finally:
+                builtins.open = real_open
+            ok(json.load(open(wp)) == {"a": 1}, "RC40g a failed close keeps the previous file")
             for bad in ("work/job.py", "state.json", "../../etc/passwd", "out/../state.json"):
                 try:
                     ws.job_chunk("j1", bad, 0, 10)
