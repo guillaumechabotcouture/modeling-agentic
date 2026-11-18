@@ -2312,6 +2312,10 @@ def _self_test() -> int:
         m6.step()
         ok(spec_signed_once(d6) and "draft_spec" not in T6.calls and load_state(d).paused == AWAITING_SPEC_AMENDMENT,
            "R3-2e a truncated sign-off record still protects the spec; a persisted amendment pause is honoured")
+        # R3-2f (lead follow-up): the pause says when the signing evidence is missing or unreadable (a warning, no block)
+        rq6 = json.load(open(os.path.join(d, "spec_rethink_request.json")))
+        ok(rq6.get("signing_evidence") == "missing" and "requested_at" in rq6,
+           f"R3-2f the amendment request notes missing signing evidence ({rq6.get('signing_evidence')})")
 
         # R3-1 (F6 run 3): a write-up finding is never a FIX_LOOP task; the writer gets it with the draft.
         wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}
