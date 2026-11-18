@@ -259,16 +259,39 @@ def _run_tree(root: str, cs: list, tmp: str, tag: str) -> dict:
     return json.load(open(op))
 
 
-def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None, context: dict | None = None) -> dict:
+def old_tree(tmp: str, old_ref: str, old_tar: str | None = None) -> str:
+    """The old code tree under tmp/old: `git archive <old_ref> toolkit`, or (F6 OA2: a shipped tree on Coiled has no
+    git) the tar of it given as `old_tar`."""
+    old_root = os.path.join(tmp, "old")
+    os.makedirs(old_root)
+    if old_tar:
+        subprocess.run(["tar", "-x", "-C", old_root, "-f", old_tar], check=True)
+    else:
+        tar = subprocess.run(["git", "archive", old_ref, "toolkit"], cwd=ROOT, check=True, capture_output=True).stdout
+        subprocess.run(["tar", "-x", "-C", old_root], input=tar, check=True)
+    return old_root
+
+
+def commits(old_ref: str, old_tar: str | None = None, old_commit: str | None = None,
+            new_commit: str | None = None) -> tuple:
+    """(old commit, new commit): from git, or all given together with --old-tar (fail closed on a partial set)."""
+    given = [old_tar, old_commit, new_commit]
+    if any(given) and not all(given):
+        raise ValueError("a proof without git needs --old-tar, --old-commit and --new-commit together")
+    if all(given):
+        return old_commit, new_commit
+    return _git("rev-parse", old_ref), _git("rev-parse", "HEAD")
+
+
+def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None, context: dict | None = None,
+          old_tar: str | None = None, old_commit: str | None = None, new_commit: str | None = None) -> dict:
     pack = yaml.safe_load(open(os.path.join(HERE, "pack.yaml")))
     cs = cases(pack, seeds)
     if settings:
         cs = [c for c in cs if c["kind"] != "pack" or c["setting"] in settings]
+    oc, nc = commits(old_ref, old_tar, old_commit, new_commit)
     with tempfile.TemporaryDirectory() as tmp:
-        old_root = os.path.join(tmp, "old")
-        os.makedirs(old_root)
-        tar = subprocess.run(["git", "archive", old_ref, "toolkit"], cwd=ROOT, check=True, capture_output=True).stdout
-        subprocess.run(["tar", "-x", "-C", old_root], input=tar, check=True)
+        old_root = old_tree(tmp, old_ref, old_tar)
         if workers >= 2:
             with ThreadPoolExecutor(2) as ex:
                 fo = ex.submit(_run_tree, old_root, cs, tmp, "old")
@@ -276,8 +299,7 @@ def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None,
                 old, new = fo.result(), fn.result()
         else:
             old, new = _run_tree(old_root, cs, tmp, "old"), _run_tree(ROOT, cs, tmp, "new")
-    return proof_doc(old_ref, _git("rev-parse", old_ref), _git("rev-parse", "HEAD"), old, new, cs, seeds,
-                     context or {})
+    return proof_doc(old_ref, oc, nc, old, new, cs, seeds, context or {})
 
 
 def proof_doc(old_ref: str, old_commit: str, new_commit: str, old: dict, new: dict, cs: list, seeds: list,
@@ -598,14 +620,21 @@ def main(argv=None) -> int:
     ap.add_argument("--cluster-id", default="", help="where the proof runs (recorded under execution)")
     ap.add_argument("--run-id", default="", help="the run's id (recorded under execution)")
     ap.add_argument("--workspace", default="", help="the Coiled workspace (recorded under execution)")
+    ap.add_argument("--old-tar", default=None, help="tar of `git archive <old commit> toolkit` (a tree without git)")
+    ap.add_argument("--old-commit", default=None, help="with --old-tar: the old commit")
+    ap.add_argument("--new-commit", default=None, help="with --old-tar: the commit of this tree")
     a = ap.parse_args(argv)
     if a.cmd == "restamp":
         return restamp()
     ctx = {k: v for k, v in (("coiled_cluster_id", a.cluster_id), ("run_id", a.run_id),
                              ("workspace", a.workspace)) if v}
     doc = prove(a.old_ref, [int(x) for x in a.seeds.split(",")], min(a.workers, 2),
-                [x for x in a.settings.split(",") if x] or None, context=ctx)
+                [x for x in a.settings.split(",") if x] or None, context=ctx, old_tar=a.old_tar,
+                old_commit=a.old_commit, new_commit=a.new_commit)
     yaml.safe_dump(doc, open(OUT, "w"), sort_keys=False, width=110)
+    if os.environ.get("JOB_OUT"):                 # a Coiled job (cloud/vm_job.py): its stored outputs
+        yaml.safe_dump(doc, open(os.path.join(os.environ["JOB_OUT"], os.path.basename(OUT)), "w"), sort_keys=False,
+                       width=110)
     bad = [k for k, r in doc["cases"].items() if not r["equal"]]
     print(f"{doc['n_cases']} cases, identical: {doc['identical']}" + (f"; differ: {bad}" if bad else ""))
     return 0 if doc["identical"] else 1
