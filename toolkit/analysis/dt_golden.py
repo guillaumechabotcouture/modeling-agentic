@@ -64,44 +64,249 @@ class EngineJobRefused(RuntimeError):
 
 
 def canon(x):
-    raise NotImplementedError
+    """The canonical form digested: numbers to 6 significant digits (ints equal floats), sets sorted, an absolute
+    path to its file name, mappings by string key."""
+    import numpy as np
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    if x is None:
+        return None
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        v = float(x)
+        if not math.isfinite(v):
+            return "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")
+        v = float(f"{v:.{SIG}g}")
+        return 0.0 if v == 0 else v
+    if isinstance(x, str):
+        return os.path.basename(x) if os.path.isabs(x) else x
+    if isinstance(x, dict):
+        return {str(k): canon(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return [canon(v) for v in (x.tolist() if isinstance(x, np.ndarray) else x)]
+    if isinstance(x, (set, frozenset)):
+        return sorted((canon(v) for v in x), key=lambda v: json.dumps(v, sort_keys=True))
+    return str(x)
 
 
 def _h(x) -> str:
-    raise NotImplementedError
+    return hashlib.sha256(json.dumps(canon(x), sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 
 def parts(rec: dict) -> dict:
-    raise NotImplementedError
+    """{decision, detail, words} of one decision-test record (module docstring). A field this module does not name
+    is decision: pinned, never ignored."""
+    if not isinstance(rec, dict):
+        raise ValueError(f"a decision-test record is a mapping, not {type(rec).__name__}")
+    words = {k: rec[k] for k in WORD_KEYS if k in rec}
+    detail = {k: rec[k] for k in DETAIL_KEYS if k in rec}
+    decision = {k: v for k, v in rec.items() if k not in WORD_KEYS and k not in DETAIL_KEYS and k not in IGNORED}
+    res = rec.get("results")
+    if isinstance(res, list):
+        detail["cases"] = [{k: r.get(k) for k in ("value",) + DETAIL_KEYS if k in r} if isinstance(r, dict) else r
+                           for r in res]
+        decision["results"] = [{k: v for k, v in r.items() if k != "value" and k not in DETAIL_KEYS}
+                               if isinstance(r, dict) else r for r in res]
+    return {"decision": decision, "detail": detail, "words": words}
 
 
 def digest(rec: dict) -> dict:
-    raise NotImplementedError
+    return {k: _h(v) for k, v in parts(rec).items()}
 
 
 def digest_dir(run_dir: str) -> dict:
-    raise NotImplementedError
+    """{test id: digest} of a finished run's decision tests (fail closed: no artifact, a malformed one, a duplicated
+    id or a listed result file that is missing raises)."""
+    import yaml
+    p = os.path.join(run_dir, "analysis", "decision_tests.yaml")
+    if not os.path.isfile(p):
+        raise FileNotFoundError(f"{p}: no decision-test artifact (the analysis did not reach its decision tests)")
+    with open(p) as f:
+        doc = yaml.safe_load(f)
+    tests = ((doc or {}).get("data") or {}).get("tests") if isinstance(doc, dict) else None
+    if not isinstance(tests, list):
+        raise ValueError(f"{p}: data.tests is not a list")
+    out = {}
+    for t in tests:
+        tid = str((t or {}).get("test_id"))
+        if tid in out:
+            raise ValueError(f"{p}: test id {tid} is listed twice")
+        if t.get("path"):
+            f_ = os.path.join(run_dir, t["path"])
+            if not os.path.isfile(f_):
+                raise FileNotFoundError(f"{f_}: listed for decision test {tid} but missing")
+            with open(f_) as f:
+                out[tid] = digest(yaml.safe_load(f))
+        else:
+            out[tid] = digest({"status": t.get("status"), "test_id": tid, "statement": t.get("statement")})
+    return out
 
 
 def compare(expected: dict, got: dict) -> list[str]:
-    raise NotImplementedError
+    """One line per test missing, not expected, or with a part that differs."""
+    out = []
+    for k in sorted(set(expected) | set(got)):
+        if k not in got:
+            out.append(f"{k}: missing")
+        elif k not in expected:
+            out.append(f"{k}: not expected")
+        else:
+            out += [f"{k}: {p} differs" for p in ("decision", "detail", "words")
+                    if (expected[k] or {}).get(p) != (got[k] or {}).get(p)]
+    return out
 
 
 class no_engine_jobs:
+    """While active, scripts/compute.py's map_fn (every engine batch: batch.py, row_reuse.py, the joint calibration,
+    trajectories) and the engine class's run / run_batch / run_series raise EngineJobRefused; `refused` counts the
+    attempts, so one an analysis caught and survived is still reported."""
+    METHODS = ("run", "run_batch", "run_series")
+
     def __init__(self, engine_cls=None):
-        raise NotImplementedError
+        self.cls, self.refused, self._saved = engine_cls, 0, []
+
+    def _refuse(self, what):
+        self.refused += 1
+        raise EngineJobRefused(f"an engine job was requested ({what}); a retro computes nothing: the stored rows "
+                               "do not cover this analysis")
+
+    def __enter__(self):
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        orig = compute.map_fn
+        guard = self
+
+        def map_fn(run_dir, fn_spec, inputs, *a, **k):
+            if inputs:
+                guard._refuse(f"{len(inputs)} task(s) of {fn_spec} through scripts/compute.py, purpose "
+                              f"{k.get('purpose')!r}")
+            return orig(run_dir, fn_spec, inputs, *a, **k)
+        self._saved.append((compute, "map_fn", compute.__dict__["map_fn"]))
+        compute.map_fn = map_fn
+        for m in self.METHODS if self.cls is not None else ():
+            if callable(getattr(self.cls, m, None)):
+                self._saved.append((self.cls, m, self.cls.__dict__.get(m, _MISSING)))
+                setattr(self.cls, m, lambda *a, _m=m, **k: guard._refuse(f"{self.cls.__name__}.{_m} in-process"))
+        return self
+
+    def __exit__(self, *exc):
+        for obj, name, val in reversed(self._saved):
+            if val is _MISSING:
+                delattr(obj, name)
+            else:
+                setattr(obj, name, val)
+        self._saved = []
+        return False
+
+
+_MISSING = object()
 
 
 def retro(run_dir: str, work: str, spec_rel: str = "decision_spec.yaml", unsigned: bool = False, log=print) -> dict:
-    raise NotImplementedError
+    """The analysis of a copy of `run_dir` (in `work`, empty or absent, outside the run dir) re-run on the current code
+    with zero engine jobs; its decision tests digested and compared with the run's stored ones (module docstring).
+    {status: complete | blocked | engine_job_refused | error, reason, engine_jobs, tests, digests, stored,
+    stored_vs_rerun, work}."""
+    run_dir, work = os.path.abspath(run_dir), os.path.abspath(work)
+    if work == run_dir or work.startswith(run_dir + os.sep):
+        raise ValueError(f"--work {work} is inside the run dir; the collected run is never written")
+    if os.path.exists(work) and os.listdir(work):
+        raise ValueError(f"--work {work} is not empty")
+    if not os.path.isfile(os.path.join(run_dir, spec_rel)):
+        raise FileNotFoundError(f"{os.path.join(run_dir, spec_rel)}: no decision spec")
+    try:
+        stored = digest_dir(run_dir)
+    except FileNotFoundError:
+        stored = None
+    dst = os.path.join(work, os.path.basename(run_dir))
+    shutil.copytree(run_dir, dst, symlinks=True)
+    from toolkit.analysis import run as RUN
+    from toolkit.spec import schema
+    cls = type(schema.load(os.path.join(dst, spec_rel)).engine())
+    status, reason = "complete", None
+    paused, _CAP["paused"] = _CAP["paused"], True       # a retro inside a capturing self-test is not a golden record
+    try:
+        with no_engine_jobs(cls) as g:
+            try:
+                RUN.run(dst, spec_rel, unsigned=unsigned, log=log)
+            except EngineJobRefused as e:
+                status, reason = "engine_job_refused", str(e)
+            except RUN.AnalysisBlocked as e:
+                status, reason = "blocked", f"{e.where}: {e.reason or ''}"
+            except Exception as e:  # noqa: BLE001 -- reported with the refused count (an engine refusal may be wrapped)
+                status, reason = "error", f"{type(e).__name__}: {str(e)[:500]}"
+    finally:
+        _CAP["paused"] = paused
+    if status == "complete" and g.refused:
+        status, reason = "engine_job_refused", f"{g.refused} engine job request(s) refused and caught by the analysis"
+    digests = digest_dir(dst) if status == "complete" else {}
+    return {"status": status, "reason": reason, "engine_jobs": g.refused, "tests": len(digests), "digests": digests,
+            "stored": "absent" if stored is None else "present",
+            "stored_vs_rerun": compare(stored, digests) if stored is not None and status == "complete" else None,
+            "work": dst}
+
+
+_CAP = {"on": False, "paused": False, "orig": None, "recs": {}, "counts": {}}
+_RUNNERS = {"_run", "run", "run_one", "run_all", "_self_test_retro"}
+
+
+def _caller() -> str:
+    """The run.py self-test function that asked for the record (the nearest frame of run.py outside the runners)."""
+    f = sys._getframe(2)
+    tail = os.path.join("toolkit", "analysis", "run.py")
+    while f is not None:
+        if f.f_code.co_filename.endswith(tail) and f.f_code.co_name not in _RUNNERS:
+            return f.f_code.co_name
+        f = f.f_back
+    return "other"
 
 
 def start_capture() -> None:
-    raise NotImplementedError
+    """Every record decision_tests.run_one returns from here on is digested (check_capture compares them)."""
+    from toolkit.analysis import decision_tests as DTm
+    from toolkit.analysis.artifacts import plain
+    if _CAP["on"]:
+        raise RuntimeError("dt_golden: capture already started")
+    orig = DTm.run_one
+    _CAP.update(on=True, paused=False, orig=orig, recs={}, counts={})
+
+    def run_one(*a, **k):
+        rec = orig(*a, **k)
+        if _CAP["on"] and not _CAP["paused"]:
+            who, tid = _caller(), str(rec.get("test_id"))
+            n = _CAP["counts"].get((who, tid), 0)
+            _CAP["counts"][(who, tid)] = n + 1
+            _CAP["recs"][f"{who}:{tid}#{n}"] = digest(plain(rec))
+        return rec
+    DTm.run_one = run_one
 
 
 def check_capture(ok) -> None:
-    raise NotImplementedError
+    """Stop capturing and compare the records with GOLDEN (MA_DT_GOLDEN_UPDATE=1 rewrites it instead)."""
+    from toolkit.analysis import decision_tests as DTm
+    if not _CAP["on"]:
+        ok(False, "DG-R1 the golden capture was not started")
+        return
+    DTm.run_one = _CAP["orig"]
+    obs = dict(sorted(_CAP["recs"].items()))
+    _CAP.update(on=False, orig=None)
+    if os.environ.get(UPDATE_ENV) == "1":
+        with open(GOLDEN, "w") as f:
+            f.write("{\n" + ",\n".join(f" {json.dumps(k)}: {json.dumps(v, sort_keys=True)}" for k, v in obs.items())
+                    + "\n}\n")
+        ok(bool(obs), f"DG-R1 {len(obs)} golden records written to {GOLDEN} ({UPDATE_ENV}=1)")
+        return
+    try:
+        with open(GOLDEN) as f:
+            exp = json.load(f)
+    except (OSError, ValueError) as e:
+        exp, err = {}, f"{type(e).__name__}: {e}"
+    else:
+        err = None
+    diff = compare(exp, obs)
+    ok(obs and not diff and err is None, f"DG-R1 every decision-test record of this self-test matches its golden "
+                                         f"record ({len(obs)} records; {err or ''} {diff[:12]})")
+    if diff or err:
+        print("DT_GOLDEN_OBSERVED " + json.dumps(obs, sort_keys=True))
 
 
 # --------------------------------------------------------------------------- self-test
@@ -242,7 +447,40 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    raise NotImplementedError
+    ap = argparse.ArgumentParser(description="decision-test golden records (module docstring)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("digest", help="digest a finished run's decision tests")
+    d.add_argument("run_dir")
+    d.add_argument("--out")
+    r = sub.add_parser("retro", help="re-run a copy's analysis on stored rows (zero engine jobs) and digest it")
+    r.add_argument("run_dir")
+    r.add_argument("--work", required=True, help="an empty directory outside the run dir for the copy")
+    r.add_argument("--spec", default="decision_spec.yaml")
+    r.add_argument("--unsigned", action="store_true", help="re-run a copy whose spec signature does not verify here")
+    g = r.add_mutually_exclusive_group(required=True)
+    g.add_argument("--write", help="record the re-run's digests to this file (kept outside the repo)")
+    g.add_argument("--expect", help="compare the re-run's digests with this file")
+    a = ap.parse_args(argv)
+    if a.cmd == "digest":
+        got = digest_dir(a.run_dir)
+        text = json.dumps(got, indent=1, sort_keys=True)
+        if a.out:
+            with open(a.out, "w") as f:
+                f.write(text + "\n")
+        print(text if not a.out else f"{len(got)} decision tests digested to {a.out}")
+        return 0
+    rep = retro(a.run_dir, a.work, a.spec, a.unsigned)
+    rep["expected_vs_rerun"] = None
+    code = 0 if rep["status"] == "complete" and rep["engine_jobs"] == 0 else 2 if rep["status"] == "blocked" else 1
+    if code == 0 and a.write:
+        with open(a.write, "w") as f:
+            f.write(json.dumps(rep["digests"], indent=1, sort_keys=True) + "\n")
+    if code == 0 and a.expect:
+        with open(a.expect) as f:
+            rep["expected_vs_rerun"] = compare(json.load(f), rep["digests"])
+        code = 1 if rep["expected_vs_rerun"] else 0
+    print(json.dumps({k: v for k, v in rep.items() if k != "digests"}, indent=1))
+    return code
 
 
 if __name__ == "__main__":
