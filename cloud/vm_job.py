@@ -973,6 +973,30 @@ def _self_test() -> int:
             sync_outputs(run, "j2", dest2)
             ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "S", "analysis", "b.jsonl.job.json")) is not None,
                "RC40d a record fetched before its run root is marked when the root arrives")
+            # RC40e (Codex round 4 of #256): a poll interrupted while saving its digests does not leave the manifest
+            # claiming files whose digests were lost: the retry fetches them again and marks them
+            rt = os.path.join(ws.JOBS, "j2", "out", "runs", "T")
+            os.makedirs(os.path.join(rt, "analysis"))
+            open(os.path.join(rt, "run_state.json"), "w").write("{}")
+            open(os.path.join(rt, "analysis", "c.jsonl.job.json"), "w").write('{"pid": 5}')
+            real_dump, boom = json.dump, {"n": 0}
+
+            def flaky(obj, fh, *a, **k):
+                if str(getattr(fh, "name", "")).endswith(".fetched_sha256.json") and not boom["n"]:
+                    boom["n"] += 1
+                    raise OSError("interrupted")
+                return real_dump(obj, fh, *a, **k)
+            json.dump = flaky
+            try:
+                try:
+                    sync_outputs(run, "j2", dest2)
+                except OSError:
+                    pass
+            finally:
+                json.dump = real_dump
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "T", "analysis", "c.jsonl.job.json")) is not None,
+               "RC40e a poll interrupted before its digests are saved is redone and marks the record")
             for bad in ("work/job.py", "state.json", "../../etc/passwd", "out/../state.json"):
                 try:
                     ws.job_chunk("j1", bad, 0, 10)
