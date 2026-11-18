@@ -4015,8 +4015,13 @@ def _self_test_copied(ok) -> None:
                                   f"(a copy refreshes mtimes) ({st['state']})")
         open(out + ".summary.json", "w").write(json.dumps({"n": 2, "out_sha256": dig}))
         st = job_status(out)
-        ok(st["state"] == FINISHED, f"CP10 a copied legacy job whose summary's out_sha256 is the results file's is "
-                                    f"finished ({st['state']})")
+        ok(st["state"] == COPIED, f"CP10 a copied legacy job (no launch) is never read finished: its summary may be an "
+                                  f"earlier batch's at the same --out ({st['state']})")
+        job(pid_start=start, host=os.uname().nodename, launch="L3")
+        CR.mark(d, "test copy 3", None)
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L3"}))
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP11 a summary with no out_sha256 does not finish a job ({st['state']})")
         os.remove(out + ".summary.json")
         # P1-3: only the run root's marker counts; one planted below it is ignored
         job(pid_start=start, host=os.uname().nodename, n=6)

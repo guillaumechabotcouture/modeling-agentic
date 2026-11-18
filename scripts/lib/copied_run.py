@@ -191,8 +191,21 @@ def _self_test() -> int:
         ok(copied_entry(k) is None and copied_entry(j) is not None and "notes.md" not in _load(d)["files"],
            "CR8 a poll marks the bytes it downloaded (never re-hashed); a file rewritten locally does not match")
         open(os.path.join(d, "a", "run_state.json"), "w").write("{}")      # planted below the run root
-        ok(run_root(j) == os.path.abspath(d) and copied_entry(j) is not None,
-           "CR10 the run root is the outermost run dir: a run_state.json planted below it changes nothing")
+        ok(copied_entry(j) is not None,
+           "CR10 a run_state.json planted below the marked run root changes nothing")
+    with tempfile.TemporaryDirectory() as d:     # a collection dir with its own metadata.json above the marked run
+        open(os.path.join(d, "metadata.json"), "w").write("{}")
+        r = os.path.join(d, "runs", "R")
+        os.makedirs(os.path.join(r, "b"))
+        open(os.path.join(r, "run_state.json"), "w").write("{}")
+        jr = os.path.join(r, "b", "x.jsonl.job.json")
+        open(jr, "w").write("{}")
+        mark(r, "poll")
+        ok(copied_entry(jr) is not None, "CR11 the marked run dir is found below a collection dir with its own metadata")
+        prev = _load(r)["files"]
+        open(os.path.join(r, "b", "y.jsonl.job.json"), "w").write("{}")
+        mark(r, "poll 2", hashes={"b/y.jsonl.job.json": _sha(os.path.join(r, "b", "y.jsonl.job.json"))})
+        ok(set(prev) <= set(_load(r)["files"]), "CR12 a poll's hashes add to the marker; earlier entries are kept")
         ok(run_root(j) == os.path.abspath(d) and run_root(os.path.join(os.sep, "nonexistent", "x")) is None,
            "CR9 the run root is the nearest ancestor holding run_state.json or metadata.json")
     if fails:
