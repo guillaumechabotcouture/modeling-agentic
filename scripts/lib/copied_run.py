@@ -50,15 +50,21 @@ def _sha(path: str) -> str | None:
 
 
 def run_root(path: str) -> str | None:
-    """The run dir `path` lies in: its nearest ancestor (or itself) holding a run's own file; None outside a run."""
-    d = os.path.abspath(path)
+    """The run dir `path` lies in: its outermost ancestor (or itself) holding a run's own file, so a run_state.json or
+    metadata.json written below the run root changes nothing; None outside a run."""
+    d, found = os.path.abspath(path), None
     while True:
         if any(os.path.isfile(os.path.join(d, m)) and not os.path.islink(os.path.join(d, m)) for m in RUN_ROOT_MARKERS):
-            return d
+            found = d
         nd = os.path.dirname(d)
         if nd == d:
-            return None
+            return found
         d = nd
+
+
+def in_flight_name(rel: str) -> bool:
+    parts = str(rel).replace(os.sep, "/").split("/")
+    return (len(parts) > 1 and parts[-2] == PROGRESS_DIR) or parts[-1].endswith(IN_FLIGHT_SUFFIXES)
 
 
 def in_flight(run_dir: str) -> list[str]:
@@ -84,19 +90,19 @@ def _load(run_dir: str) -> dict:
         return {}
 
 
-def mark(run_dir: str, source: str, captured_at: str | None = None, only=None) -> dict | None:
-    """Write the marker for a copied run dir (None when it would list nothing). `only`: the paths (relative to the run
-    dir) this copy wrote, e.g. one poll's fetched files; each in-flight one is recorded with its sha256, and an earlier
-    marker's entries for other files are kept as they were, so a file a local process rewrote since stops matching.
-    Without `only` (a fresh extraction) every in-flight file is recorded."""
-    flight = set(in_flight(run_dir))
-    rels = flight if only is None else {str(r).replace(os.sep, "/") for r in only} & flight
-    prev = _load(run_dir)
-    files = {k: v for k, v in (prev.get("files") or {}).items() if only is not None and k not in rels}
-    for rel in sorted(rels):
-        h = _sha(os.path.join(run_dir, rel))
-        if h:
-            files[rel] = h
+def mark(run_dir: str, source: str, captured_at: str | None = None, hashes: dict | None = None) -> dict | None:
+    """Write the marker for a copied run dir (None when it would list nothing). `hashes`: {path relative to the run
+    dir: sha256 of the bytes the copy wrote}, e.g. every file a poller downloaded, hashed as it was downloaded and never
+    re-read, so a file a local process rewrote since does not match; its in-flight entries are recorded. Without
+    `hashes` (a fresh extraction) every in-flight file is hashed as it is now."""
+    if hashes is None:
+        files = {}
+        for rel in in_flight(run_dir):
+            h = _sha(os.path.join(run_dir, rel))
+            if h:
+                files[rel] = h
+    else:
+        files = {str(r).replace(os.sep, "/"): h for r, h in hashes.items() if in_flight_name(r) and h}
     if not files:
         return None
     doc = {"copied_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "captured_at": captured_at,

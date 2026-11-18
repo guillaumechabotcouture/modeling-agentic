@@ -1591,6 +1591,9 @@ def fetch_checkpoint(cfg, store, label) -> dict:
         rroot = _checkpoint_run_root(dest, rec.get("run_dir"))
         if rroot is not None:
             copied_run.mark(rroot, f"run_cluster checkpoint {label} generation {g}", rec.get("time_utc"))
+        else:
+            print(f"{label}: WARNING the record's run_dir {rec.get('run_dir')!r} is not one directory of the extraction: "
+                  "its batch records are not marked as copied")
         note = "" if g == ptr.get("generation") else f" (the previous generation: {'; '.join(why)})"
         print(f"{label}: checkpoint generation {g} of {rec.get('time_utc')} (state {rec.get('run_state')}, "
               f"{rec.get('cached_batches')} cached batches, {rec.get('bytes')} bytes, sha256 verified){note} -> "

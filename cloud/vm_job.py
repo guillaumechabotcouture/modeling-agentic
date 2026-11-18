@@ -107,6 +107,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -153,6 +154,11 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
     st = run(ws.job_state, job_id)
     ip = os.path.join(dest, ".manifest.json")
     index = json.load(open(ip)) if os.path.exists(ip) else {}
+    sp = os.path.join(dest, ".fetched_sha256.json")       # rel -> sha256 of the bytes downloaded (copy provenance)
+    try:
+        fetched_sha = json.load(open(sp)) if os.path.exists(sp) else {}
+    except ValueError:
+        fetched_sha = {}
     got = []
     for rel in files_to_fetch(st["files"], index):
         size = st["files"][rel][0]
@@ -161,25 +167,31 @@ def sync_outputs(run, job_id: str, dest: str) -> dict:
             continue
         os.makedirs(os.path.dirname(target), exist_ok=True)
         tmp, have = target + ".part", 0
+        h = hashlib.sha256()
         with open(tmp, "wb") as f:
             while have < size:
                 b = run(ws.job_chunk, job_id, rel, have, min(CHUNK, size - have))
                 if not b:
                     break
                 f.write(b)
+                h.update(b)
                 have += len(b)
         os.replace(tmp, target)
         index[rel] = st["files"][rel]
+        fetched_sha[rel] = h.hexdigest()
         got.append(rel)
     json.dump(index, open(ip, "w"), indent=1)
+    json.dump(fetched_sha, open(sp, "w"), indent=1)
     json.dump(st["state"], open(os.path.join(dest, "state.json"), "w"), indent=1)
-    # F6 run 3: a run dir copied out of a live run carries in-flight batch records of the VM's process; mark them
+    # F6 run 3: a run dir copied out of a live run carries in-flight batch records of the VM's process. Every poll marks
+    # each run dir with the bytes downloaded into it (hashed as they arrived, never re-read: Codex review of #256), so
+    # a record fetched before its run root is marked once the root arrives, and one a local process rewrote does not
+    # match.
     import copied_run
     for rd in sorted({os.path.dirname(r) for r in index if os.path.basename(r) == "run_state.json"}):
-        mine = [r[len(rd) + 1:] for r in got if r.startswith(rd + "/")]
-        if mine:      # only the bytes this poll fetched (Codex review of #256 P1-2); earlier entries kept as they were
-            copied_run.mark(os.path.join(dest, rd), f"vm_job poll of job {job_id}",
-                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), only=mine)
+        mine = {r[len(rd) + 1:]: v for r, v in fetched_sha.items() if r.startswith(rd + "/")}
+        copied_run.mark(os.path.join(dest, rd), f"vm_job poll of job {job_id}",
+                        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), hashes=mine)
     st["fetched"] = got
     return st
 

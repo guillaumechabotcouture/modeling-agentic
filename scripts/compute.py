@@ -5695,10 +5695,19 @@ def job_status(out: str) -> dict:
             return None
         if not isinstance(summ, dict):
             return None
+        try:
+            with open(out, "rb") as f:
+                digest_ok = summ.get("out_sha256") == hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            digest_ok = False
+        if summ.get("out_sha256") is not None and not digest_ok:
+            return None                     # it describes other results (an earlier batch, an incomplete copy)
         if job.get("launch"):
             return summ if summ.get("launch") == job["launch"] else None
+        if not trust_mtime:                 # a copy: only the results digest binds an older record's summary
+            return summ if digest_ok else None
         try:
-            return summ if trust_mtime and os.path.getmtime(out + ".summary.json") >= t0 - 1 else None
+            return summ if os.path.getmtime(out + ".summary.json") >= t0 - 1 else None
         except OSError:
             return None
 
