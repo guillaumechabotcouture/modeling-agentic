@@ -80,9 +80,10 @@ every call, for a generation carrying it or started after it. Resuming from one:
   fingerprinted by size and mtime (ns), which neither the tarball (whole seconds) nor git archive keeps, and a
   symlink there is not archived: either one changes every batch's fingerprint. reuse-check (step 3) shows it.
 Before any paid launch, fresh or resumed, run the resume smoke on the tree the launch ships (`git archive HEAD`
-extracted): `python3 scripts/resume_smoke.py <tree>`. It interrupts toy v2 runs at each resumable state (ANALYZE
-timeout, batch killed, compute cap stop), resumes them with that tree's code, and exits 1 unless every kept engine
-row is reused, none is recomputed and the sign-off still binds the spec. Local, toy engines only, about a minute.
+extracted): `python3 scripts/resume_smoke.py <tree>`. It interrupts toy v2 runs at the two resumable ANALYZE states
+(step timeout, batch killed) and resumes them with that tree's code, and stops a toy batch at its compute allowance and
+reruns it (a cap stop is not resumable by --resume; a relaunch reruns the batch). It exits 1 unless every kept
+engine row is reused, none is recomputed and the lead's sign-off still binds the spec. Local, toy engines only, about a minute.
 
 Exit codes of `launch` (and `relaunch`), for a watchdog. Once a run is submitted the launch is never
 reported as failed, because the run keeps going whatever happens to this process (F5 resume launch,

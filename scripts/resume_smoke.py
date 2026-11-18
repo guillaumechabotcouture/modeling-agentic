@@ -28,11 +28,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CALLS, SLOW, KILL, KILLED, SLEEP = "MA_RS_CALLS", "MA_RS_SLOW_FROM", "MA_RS_KILL_AT", "MA_RS_KILLED", "MA_RS_SLEEP"
+SID = "MA_RS_SMOKE_SID"       # the smoke's own session: the toy never signals a process group in it
+SCENARIOS = ("analyze_timeout", "killed_batch", "cap_stop")
 N = 6
 CUT = 3
 
@@ -49,6 +52,9 @@ def f(p):
     if p["i"] >= int(os.environ.get("{KILL}") or 99) and not os.path.exists(os.environ["{KILLED}"]):
         open(os.environ["{KILLED}"], "w").write("x")
         pid = int(open(os.environ["{KILLED}"] + ".driver").read())
+        if os.getsid(pid) == int(os.environ["{SID}"]) or os.getpgid(pid) == os.getpgid(0):
+            open(os.environ["{KILLED}"] + ".refused", "w").write("the step shares the smoke's session")
+            os._exit(3)                             # fail closed: the step is not in a session of its own
         os.killpg(os.getpgid(pid), signal.SIGKILL)  # the batch step's process group dies mid-batch, as on a lost VM
         os._exit(0)                                 # and this worker with it (it holds the step's output pipes)
     if p["i"] >= int(os.environ.get("{SLOW}") or 99):
@@ -56,7 +62,7 @@ def f(p):
         for _ in range(600):                        # until the step is killed by its time limit
             time.sleep(0.1)
             if os.getppid() != parent:
-                break
+                os._exit(0)                         # the step is gone: so is this worker
     return {{"v": p["i"]}}
 '''
 
@@ -83,29 +89,74 @@ if __name__ == "__main__":
 '''
 
 
-def judge(name: str, before: list, after: list, summary: dict, sig0=None, sig1=None, spec_sha=None,
-          status=None) -> dict:
+def toy_kill_allowed(step_sid: int, smoke_sid: int) -> bool:
+    """The toy may kill the batch step only when the step runs in a session other than the smoke's."""
+    return step_sid != smoke_sid
+
+
+def judge(name: str, before: list, after: list, summary: dict, *, expect_kept=None, sig0=None, sig1=None,
+          spec_sha=None, status=None, stage=False, reopened=None, rows=None) -> dict:
     """The assertions for one scenario. `before`/`after`: the toy function's calls in the interrupted attempt and on
-    resume; `summary`: the resumed batch's compute.py summary; sig0/sig1: the sign-off record before and after;
-    `status`: the resumed run's terminal status (None at batch level)."""
-    kept = sorted(set(before) & set(int(x) for x in summary.get("_kept", [])))
+    resume; `summary`: the resumed batch's compute.py summary, with `_kept` the ok rows the interrupted attempt
+    persisted; `expect_kept`: the rows it must have persisted (else a non-empty proper subset); `stage`: a
+    stage-machine scenario, whose lead sign-off (sig0 before, sig1 after) must exist, be unchanged and bind the spec
+    (`spec_sha`), whose resume must reopen at ANALYZE (`reopened`) and finish (`status`); `rows`: the final rows."""
+    kept = sorted({int(x) for x in summary.get("_kept", [])})
     problems = []
+    if expect_kept is not None and kept != sorted(expect_kept):
+        problems.append(f"the interrupted attempt persisted rows {kept}, not {sorted(expect_kept)}")
+    if expect_kept is None and not 0 < len(kept) < N:
+        problems.append(f"the interrupted attempt persisted {len(kept)} of {N} rows (a stop keeps some, not all)")
     recomputed = sorted(set(after) & set(kept))
     if summary.get("reused") != len(kept):
         problems.append(f"rows reused {summary.get('reused')} != ok rows the interrupted attempt kept {len(kept)}")
     if recomputed:
         problems.append(f"rows recomputed on resume: {recomputed}")
+    if sorted(after) != sorted(set(range(N)) - set(kept)):
+        problems.append(f"the resumed calls {sorted(after)} are not exactly the missing rows")
     if summary.get("n_ok") != N:
         problems.append(f"the resumed batch has {summary.get('n_ok')} of {N} ok rows")
-    if sig0 is not None or sig1 is not None:
-        if not sig0 or sig0 != sig1:
-            problems.append("the sign-off record changed or is missing across the resume")
+    if rows is not None:
+        bad = [r.get("i") for r in rows if not r.get("ok") or (r.get("result") or {}).get("v") != r.get("i")]
+        if len(rows) != N or bad:
+            problems.append(f"the final rows do not carry their own inputs' results ({len(rows)} rows; wrong: {bad})")
+    if stage:
+        if not sig0 or not sig1 or sig0 != sig1:
+            problems.append("the sign-off record is missing or changed across the resume")
+        elif sig1.get("by") != "lead":
+            problems.append(f"the sign-off is by {sig1.get('by')!r}, not the lead")
         elif sig1.get("spec_sha256") != spec_sha:
             problems.append("the sign-off record no longer binds the spec")
-    if status is not None and status not in ("completed", "completed_scope_declared"):
-        problems.append(f"the resumed run ended {status}")
+        if not reopened:
+            problems.append("the resume did not reopen the run at ANALYZE (FINAL -> ANALYZE, resumed_from run_failed)")
+        if status not in ("completed", "completed_scope_declared"):
+            problems.append(f"the resumed run ended {status}")
     return {"scenario": name, "kept": len(kept), "reused": summary.get("reused"), "computed": summary.get("computed"),
             "recomputed": len(recomputed), "status": status, "ok": not problems, "problems": problems}
+
+
+def report_problems(returncode: int, rows) -> list:
+    """Why a child's report does not stand: a non-zero exit, or not exactly one row per scenario."""
+    out = [] if returncode == 0 else [f"the smoke exited {returncode}"]
+    names = [r.get("scenario") for r in rows or [] if isinstance(r, dict)]
+    if sorted(names) != sorted(SCENARIOS):
+        out.append(f"the report has scenarios {names}, not one each of {list(SCENARIOS)}")
+    return out
+
+
+def _kept_from_lines(lines) -> list:
+    """Ok rows' inputs (the toy result's v) from result or journal lines; a torn line is skipped, as compute.py's
+    reuse skips it."""
+    got = []
+    for x in lines:
+        try:
+            r = json.loads(x)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("ok") and "_partial" not in r:
+            v = (r.get("result") or {}).get("v") if isinstance(r.get("result"), dict) else None
+            got.append(v if v is not None else r.get("i"))
+    return got
 
 
 def _calls(path) -> list:
@@ -117,8 +168,7 @@ def _kept(rd) -> list:
     out = os.path.join(rd, "analysis", "batch", "rows.jsonl")
     for p in (out, out + ".partial.jsonl"):
         if os.path.exists(p):
-            rows = [json.loads(x) for x in open(p) if x.strip()]
-            got = [r.get("i") for r in rows if r.get("ok") and "_partial" not in r]
+            got = _kept_from_lines([x for x in open(p) if x.strip()])
             if got:
                 return got
     return []
@@ -151,7 +201,8 @@ def scenarios(work: str) -> list:
             for s in steps:
                 if s["id"] == "analyze":
                     s["inputs"] = s["inputs"] + ["analysis/toy_rows.json"]
-            return [{"id": "batch", "run": f"{sys.executable} {drv} {run_dir}", "inputs": [AB.SPEC_FILE],
+            run = " ".join(shlex.quote(x) for x in (sys.executable, drv, run_dir))
+            return [{"id": "batch", "run": run, "inputs": [AB.SPEC_FILE],
                      "outputs": ["analysis/toy_rows.json"], "timeout_s": self.tmo}] + steps
 
     def toy_run(name):
@@ -172,14 +223,20 @@ def scenarios(work: str) -> list:
         except (OSError, ValueError):
             return None
 
+    def rows_of(d):
+        p = os.path.join(d, "analysis", "batch", "rows.jsonl")
+        return [json.loads(x) for x in open(p) if x.strip()] if os.path.exists(p) else []
+
     out = []
-    for name, env, want in (("analyze_timeout", {SLOW: str(CUT)}, "timeout"),
-                            ("killed_batch", {KILL: str(CUT)}, "killed")):
+    os.environ[SID] = str(os.getsid(0))
+    # the killed scenario gets a generous step limit: its kill, not the limit, must end the first attempt
+    for name, env, want, tmo in (("analyze_timeout", {SLOW: str(CUT)}, "timeout", 30),
+                                 ("killed_batch", {KILL: str(CUT)}, "killed", 120)):
         d, T = toy_run(name)
         calls = os.path.join(work, f"{name}.calls")
         os.environ.update({CALLS: calls, KILLED: os.path.join(work, f"{name}.killed"), **env})
         try:
-            s1 = SM.run_v2("toy question", d, T, signoff="lead", log=quiet, backend=Batch(8), cross_engine_check=False)
+            s1 = SM.run_v2("toy question", d, T, signoff="lead", log=quiet, backend=Batch(tmo), cross_engine_check=False)
         finally:
             for k in env:
                 os.environ.pop(k, None)
@@ -190,12 +247,17 @@ def scenarios(work: str) -> list:
             out.append({"scenario": name, "ok": False, "problems": [
                 f"the interruption did not end run_failed resumable {want!r} ({s1}, {why})"]})
             continue
+        n_hist = len(st.history)
         s2 = SM.run_v2("toy question", d, T, signoff="lead", log=quiet, backend=Batch(120), cross_engine_check=False)
         summ = json.load(open(os.path.join(d, "analysis", "batch", "rows.jsonl.summary.json")))
         after = _calls(calls)[len(before):]
+        new = SM.load_state(d).history[n_hist:]
+        reopened = bool(new) and new[0].get("from") == "FINAL" and new[0].get("to") == "ANALYZE" \
+            and new[0].get("resumed_from") == "run_failed"
         with open(os.path.join(d, AB.SPEC_FILE), "rb") as fh:
             spec_sha = hashlib.sha256(fh.read()).hexdigest()
-        out.append(judge(name, before, after, dict(summ, _kept=kept), sig0, sig(d), spec_sha, s2))
+        out.append(judge(name, before, after, dict(summ, _kept=kept), expect_kept=list(range(CUT)), sig0=sig0,
+                         sig1=sig(d), spec_sha=spec_sha, status=s2, stage=True, reopened=reopened, rows=rows_of(d)))
     # cap_stop: the per-call allowance stops the batch; rerun with an allowance (a relaunch)
     d = os.path.join(work, "cap_stop")
     os.makedirs(os.path.join(d, "models"))
@@ -208,15 +270,19 @@ def scenarios(work: str) -> list:
         _rows, s0 = compute.run_map(d, os.path.join(d, "models", "toy_fn.py") + "::f", [{"i": i} for i in range(N)],
                                     outp, backend="local", max_workers=1, max_core_hours=1.5 / 3600, ledger=False)
         stopped = (s0.get("failed_by_kind") or {}).get(compute.STOPPED, 0)
-        before, kept = _calls(calls), [r["i"] for r in _rows if r.get("ok")]
+        why_stopped = str(s0.get("stopped") or "")
+        before, kept = _calls(calls), _kept(d)
+        returned = sorted(r["i"] for r in _rows if r.get("ok"))
         os.environ.pop(SLEEP, None)
         _rows, s1 = compute.run_map(d, os.path.join(d, "models", "toy_fn.py") + "::f", [{"i": i} for i in range(N)],
                                     outp, backend="local", max_workers=1, ledger=False)
     finally:
         os.environ.pop(SLEEP, None)
-    row = judge("cap_stop", before, _calls(calls)[len(before):], dict(s1, _kept=kept))
-    if not stopped:
-        row["ok"], row["problems"] = False, row["problems"] + [f"the allowance did not stop the batch ({s0})"]
+    row = judge("cap_stop", before, _calls(calls)[len(before):], dict(s1, _kept=kept), rows=rows_of(d))
+    if not stopped or "compute cap" not in why_stopped and "allowance" not in why_stopped:
+        row["ok"], row["problems"] = False, row["problems"] + [f"the allowance did not stop the batch ({why_stopped})"]
+    if sorted(kept) != returned:
+        row["ok"], row["problems"] = False, row["problems"] + [f"rows on disk {sorted(kept)} != returned {returned}"]
     row["note"] = ("a cap stop is not resumable by --resume (stage_machine.analysis_failure_cause: infra only); "
                    "rerun the batch, as a relaunch does, and its rows are reused")
     out.append(row)
@@ -240,7 +306,8 @@ def run_tree(tree: str) -> dict:
         return {"tree": tree, "ok": False, "scenarios": [],
                 "problems": [f"the smoke did not report: {(r.stderr or r.stdout)[-800:]}"]}
     rows = json.loads(line[len("RESUME_SMOKE "):])
-    return {"tree": tree, "ok": bool(rows) and all(x.get("ok") for x in rows), "scenarios": rows, "problems": []}
+    bad = report_problems(r.returncode, rows)
+    return {"tree": tree, "ok": not bad and all(x.get("ok") for x in rows), "scenarios": rows, "problems": bad}
 
 
 def _self_test() -> int:
