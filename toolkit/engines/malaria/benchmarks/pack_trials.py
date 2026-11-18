@@ -198,10 +198,17 @@ def _self_test() -> int:
            and all(ent.get(i, {}).get("covers") == {"net": ["pbo"]} for i in LLINEUP)
            and ent.get("B9g", {}).get("covers") == {"net": ["dual"]} and ent["B9g"].get("versus") == {"net": "pbo"}
            and all({"pbo_gain_scale", "pbo_adv_decay"} <= set(BC.effect_parameters(ent.get(i), "0.17")) for i in LLINEUP)
-           and {"cfp_kill", "cfp_half", "pbo_gain_scale"} <= set(BC.effect_parameters(ent.get("B9g"), "0.17"))
+           and set(BC.effect_parameters(ent.get("B9g"), "0.17")) == {"cfp_kill", "cfp_half", "pbo_gain_scale",
+                                                                      "pbo_adv_decay", "net_kill_shift"}
+           and all(set(BC.effect_parameters(ent.get(i), "0.17")) == {"pbo_gain_scale", "pbo_adv_decay",
+                                                                       "net_kill_shift"} for i in LLINEUP)
            and not BC._param_problems(cov, E.VERSION, {x.name for x in E.MalariaEngine().parameters()}),
-           f"PT5 the coverage file maps exactly the pack's ids; B9d-B9f cover PBO nets, B9g dual-AI nets against PBO "
-           f"({probs})")
+           f"PT5 the coverage file maps exactly the pack's ids; B9d-B9f cover PBO nets, B9g dual-AI nets against PBO; "
+           f"each names every parameter that moves it (B9g: net_kill_shift too, Codex r2) ({probs})")
+        mp = str(by["B9g"].get("estimand_mapping") or "")
+        ok(all(w in mp for w in ("microscopy", "RDT", "46.4", "29.6")),
+           f"PT5b B9g's exposure and diagnostic caveats are in its estimand_mapping, not only in comments (Codex r2 "
+           f"P3): {mp[:120]!r}")
     case("PT5", pt5)
 
     def pt6():
@@ -218,8 +225,9 @@ def _self_test() -> int:
                and not any(f"rerun required: {i}" in str(why) for i in missing),
                f"PT6 a pack benchmark with no stored row refuses the record as not yet run ({missing}: {why})")
         else:
-            ok(not any("not yet run" in str(x) for x in [why]),
-               f"PT6 every pack benchmark has a stored row, and the record names none as not yet run ({why})")
+            ok(doc is not None and why is None,
+               f"PT6 every pack benchmark has a stored row and the record is accepted (Codex r2: not only 'no not yet "
+               f"run' in another refusal) ({why})")
     case("PT6", pt6)
 
     if fails:

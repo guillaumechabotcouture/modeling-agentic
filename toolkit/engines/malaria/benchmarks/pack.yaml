@@ -248,6 +248,10 @@ benchmarks:
          equal per-arm variances (equal cluster numbers per arm) the control contributes half of each variance and
          cancels from the contrast, var = (v1 + v2) / 2. Without the covariance term the band would be 0.26-0.793"},
      estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
+     estimand_mapping: "not represented by the engine (Codex r1-r2 on #266/#268): study-net use at 24 months was
+       higher in the chlorfenapyr arm (46.4%) than in the PBO arm (29.6%), while the two simulated arms share one use;
+       the trial measured RDT positivity, the engine reads microscopy (as for B9c and B10). A miss may reflect either,
+       not only product efficacy",
      estimand: {type: odds_ratio, num: mis_dual, den: mis_pbo, value: windows.m24.pfpr_6m14y}}
   - {id: B10, metric: "Dual-AI vs pyrethroid nets, prevalence OR at 24 m", target: 0.45, band: [0.30, 0.67],
      source: "C17 Mosha 2022 Lancet (PMID 35339225)",
