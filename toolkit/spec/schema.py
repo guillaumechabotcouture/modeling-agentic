@@ -2024,6 +2024,9 @@ def _self_test() -> int:
         ok(validate(Spec(r_be, d)) == [], f"SP-BE3 a boundary_engine test validates: {validate(Spec(r_be, d))[:3]}")
         _self_test_burden_scale(ok, s, d, bad)
         _self_test_outcome_adjustments(ok, s, d, bad)
+        # external review of v2 (owner R3, point a): a signed analysis field the code does not read is refused
+        bad(lambda r: r["analysis"].update(outcome_adjustmnts=[]), "unknown key",
+            "SP-AK1 an unknown analysis key is refused (a misspelt signed field would otherwise be a no-op)")
         r_t = copy.deepcopy(s.raw)
         dct(calibration_target={"units": ["0", "3"], "scale": 0.8})(r_t)
         ok(validate(Spec(r_t, d)) == [], f"SP-CT7 a well-formed calibration_target test validates: "

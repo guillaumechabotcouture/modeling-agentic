@@ -1065,6 +1065,19 @@ def _self_test() -> int:
                f"recorded: {w3[:100]} | {w4[:100]}")
     except Exception as e:  # noqa: BLE001
         ok(False, f"ED13-ED14 the brief's signer: {type(e).__name__}: {e}")
+    # owner R3 (point d): the sheet shows the base outcome adjustments the analysis will apply
+    import yaml as _y
+    with tempfile.TemporaryDirectory() as d2:
+        raw = _y.safe_load(open(schema.toy_spec(d2)))
+        plain_md = sheet(d2, spec_bytes=_y.safe_dump(raw).encode())
+        raw["analysis"]["outcome_adjustments"] = [{"id": "OA1", "component": "a", "reference": "b", "value": 0.5,
+                                                   "source": "toy trial 2020"}]
+        md = sheet(d2, spec_bytes=_y.safe_dump(raw).encode())
+        sec = md.split("## Base outcome adjustments")[-1].split("\n## ")[0] if "## Base outcome adjustments" in md else ""
+        ok("OA1" in sec and "0.5" in sec and "toy trial 2020" in sec and "every evaluation" in sec
+           and "## Base outcome adjustments" not in plain_md,
+           "SS-OA1 the sheet lists each base outcome adjustment (id, component, reference, value, source), and a spec "
+           "without the field gets no such section (existing sheets unchanged)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
