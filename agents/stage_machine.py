@@ -1447,8 +1447,7 @@ class Machine:
         pw = self.st.post_write
         if self.st.gate_mode == "legacy":
             d = legacy_gate(self.run_dir, self.st.round, self.st.max_rounds, pw)
-            if (d or {}).get("action"):              # an owner decline holds this gate too (Codex round 3 of #258)
-                d = apply_owner_declines(d, FL.load(self.run_dir))
+            # (owner amendments and declines are v2 rules: the legacy mode replays stored v1 gates and applies neither)
         else:
             sv = getattr(self.backend, "spec_violations", None)
             rv = getattr(self.backend, "registry_violations", None)
@@ -1595,7 +1594,10 @@ class Machine:
         want = list(self.st.tries.get("owner_request") or [])
         if not want:
             # a pause with no request this machine recorded (an older run, or a route that records none): it cannot be
-            # answered here, so it fails with how to go on, never waits (lead decision on Codex round 3 of #258)
+            # answered here, so it fails with how to go on, never waits (lead decision on Codex round 3 of #258); a
+            # report an earlier gate rendered is not delivered under it (Codex round 4)
+            if os.path.lexists(os.path.join(self.run_dir, "report.md")):
+                _quarantine_report(self.run_dir)
             return self._go("FINAL", "OWNER_DECISION has no recorded owner request: relaunch with reuse (a new run dir "
                                      "from this one's spec and stored rows)", "run_failed")
         answers, bad = SS.load_answers(self.run_dir)
@@ -2239,8 +2241,7 @@ def _self_test() -> int:
            == "ACCEPT" and apply_owner_declines({"action": "ACCEPT"}, {"D-037": f6x})["action"] == "RUN_FAILED",
            "R3-6 a declared amendment is asked; a declined finding its test resolved does not hold the gate")
         # R3-7 (Codex round 3 of #258): a declared amendment whose test passed is not asked (5); a declined finding
-        # leaves declared_findings.yaml (1); a pause with no recorded request fails loudly, never waits (2); the legacy
-        # gate applies the decline too (3)
+        # leaves declared_findings.yaml (1); a pause with no recorded request fails loudly, never waits (2)
         ok(pending_amendments({"D-036": f6d}, resolved=["D-036"]) == [],
            "R3-7a a declared amendment whose test passes is not sent to the owner")
         import yaml as _y7
@@ -2258,21 +2259,6 @@ def _self_test() -> int:
         s7 = load_state(d).status
         ok(s7 == "run_failed" and "relaunch with reuse" in str(load_state(d).history[-1].get("why")),
            f"R3-7c a pause at OWNER_DECISION with no recorded request fails with how to go on ({s7})")
-        d, T, st = new_run("legacydecl", {})
-        st.state, st.gate_mode, st.post_write = "GATE", "legacy", True
-        save_state(d, st)
-        FL.save(d, {"D-039": FL.Finding(id="D-039", kind="critique_blocker", severity="HIGH", source="critique-domain",
-                                        status="owner_declined", resolution_type="owner_decision")})
-        _mod7 = sys.modules[Machine.__module__]
-        _lg = _mod7.legacy_gate
-        _mod7.legacy_gate = lambda *a, **k: {"action": "DECLARE_SCOPE", "rule_matched": "3"}
-        try:
-            m7 = _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False)
-            m7.step()
-        finally:
-            _mod7.legacy_gate = _lg
-        ok(load_state(d).status == "completed_scope_declined",
-           f"R3-7d the legacy gate mode applies an owner decline too ({load_state(d).status})")
         # R3-5 (Codex review of #258 P1-10): the amendment check runs on every gate route: a structural PLAN blocker
         # whose remedy is an owner amendment does not take GATE -> SPEC
         amend5 = dict(amend, id="D-035", category="STRUCTURAL")
