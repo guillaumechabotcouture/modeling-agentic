@@ -53,6 +53,7 @@ def _flat(attr, v, scalar_keys: set, keyed: dict) -> dict:
     out = {}
     if isinstance(v, dict):
         vals = {k: _num(x) for k, x in v.items()}
+        vals.update({k: 0.0 for k in keyed.get(attr, ()) if k not in v})     # a key the mapping omits has zero share
         out = {f"{attr}.{k}": x for k, x in vals.items() if x is not None}
         if attr in scalar_keys and out:
             out[attr] = sum(out.values()) / len(out)
@@ -81,6 +82,8 @@ def unit_values(raw, run_dir) -> tuple[dict, dict, dict, str | None]:
     du = raw.get("decision_units") or {}
     cols = {}
     for a, b in (du.get("engine_attributes") or {}).items():
+        if isinstance(b, dict) and "value" in b:
+            continue                                # a fixed value for every unit, not a column
         if isinstance(b, dict) and isinstance(b.get("column"), str) and "split" not in b:
             cols[a] = b["column"]
         elif isinstance(b, dict) and isinstance(b.get("columns"), dict):
@@ -147,8 +150,14 @@ def conventions(ref, scalar_keys: set, keyed: dict) -> set:
     for st in sts:
         for a, v in ((st or {}).get("unit") or {}).items():
             for k, x in _flat(a, v, scalar_keys, keyed).items():
-                seen.setdefault(k, []).append(round(x, 9))
-    return {k for k, v in seen.items() if len(sts) > 1 and len(v) == len(sts) and len(set(v)) == 1}
+                seen.setdefault(k, []).append(x)
+    return {k for k, v in seen.items() if len(sts) > 1 and len(v) == len(sts) and _same(v)}
+
+
+def _same(vals) -> bool:
+    """Every value equal (exactly, up to float noise relative to the values themselves)."""
+    lo, hi = min(vals), max(vals)
+    return hi - lo <= 1e-12 * max(abs(lo), abs(hi))
 
 
 def tested_by(raw, row) -> list:
@@ -182,6 +191,9 @@ def outside(raw, run_dir) -> tuple[list, list]:
             notes.append(f"`{ref}`: no benchmark pack with covering effect benchmarks: nothing compared")
             continue
         conv = conventions(ref, scalar, keyed)
+        if not any(k in vals and k not in conv for rs in tr.values() for k in rs):
+            notes.append(f"`{ref}`: no attribute the units table binds is stated by the trial settings: nothing "
+                         "compared")
         for comp, rs in sorted(tr.items()):
             for k, r in sorted(rs.items()):
                 if k not in vals or k in conv:
@@ -207,17 +219,26 @@ def sheet_lines(raw, run_dir) -> list[str]:
         rows, notes = outside(raw, run_dir)
     except Exception as e:  # noqa: BLE001 -- the sheet says so rather than omitting the section
         return [SECTION, "", f"Could not be computed: {type(e).__name__}: {e}", ""]
+    try:
+        return render(raw, rows, notes)
+    except Exception as e:  # noqa: BLE001 -- the sheet says so rather than failing to render
+        return [SECTION, "", f"Could not be rendered: {type(e).__name__}: {e}", ""]
+
+
+def render(raw, rows, notes) -> list[str]:
     out = [SECTION, "", "Where a unit's setting lies outside every trial setting behind a component's effect, the "
            "engine's effect there is an extrapolation. Shown for the owner; it does not refuse signing.", ""]
     out += [f"- {n}" for n in notes] + ([""] if notes else [])
     if not rows:
         return out + (["No unit is outside the compared trial settings."] if not notes else []) + [""]
-    out += ["| Component | Attribute | Trials' range (settings) | Units outside (population share) | Tested by |",
-            "|---|---|---|---|---|"]
+    many = len({r["engine"] for r in rows}) > 1
+    out += [("| Engine " if many else "") + "| Component | Attribute | Trials' range (settings) | Units outside "
+            "(population share) | Tested by |", ("|---" if many else "") + "|---|---|---|---|---|"]
     for r in rows:
         t = tested_by(raw, r)
-        out.append(f"| {r['component']} | {r['attribute']} | {r['covered'][0]:g} to {r['covered'][1]:g} "
-                   f"({', '.join(r['settings'])}) | {r['units_outside']} of {r['units']} "
+        out.append((f"| `{r['engine']}` " if many else "")
+                   + f"| {r['component']} | {r['attribute']} | {r['covered'][0]:g} to {r['covered'][1]:g} "
+                   f"({', '.join(map(str, r['settings']))}) | {r['units_outside']} of {r['units']} "
                    f"({100 * r['population_share']:.0f}% of {r['population_column'] or 'units'}), "
                    f"{r['range_outside'][0]:g} to {r['range_outside'][1]:g} | "
                    + (f"unit_attribute test(s) {', '.join(t)}" if t else "no test varies it") + " |")
