@@ -414,6 +414,14 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
            f"Signing accepts `{SPEC}` (sha256 `{hashlib.sha256(spec_bytes).hexdigest()[:16]}`) and the derived data "
            f"recorded in `{DERIVATIONS_RECORD}` (sha256 `{rsha[:16]}`). "
            "It also accepts what follows.", ""]
+    from toolkit.spec import evidence_dossier as ED
+    if dossier_bytes is None and ED.dossier_reference(raw):
+        try:
+            dossier_bytes = ED.read_dossier(run_dir, ED.dossier_reference(raw))
+        except ValueError:
+            dossier_bytes = None
+    from toolkit.spec import spec_critique as SC     # pre-sign spec critique, on the bytes this sheet shows and binds
+    out += SC.sheet_lines(raw, run_dir, dossier_bytes=dossier_bytes, burden_data=burden_bytes)
     eng = raw.get("engine")
     refs = [eng["ref"]] if isinstance(eng, dict) and eng.get("ref") else \
         (list(eng.get("candidates") or []) if isinstance(eng, dict) else [])
@@ -434,6 +442,18 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
         out.append(f"- **{a}**: " + ("; ".join(means) if means else "the chosen engine's default")
                    + f". Reason: {why}")
     out.append("")
+    oa = (raw.get("analysis") or {}).get("outcome_adjustments")
+    if oa:          # owner R3 (external review point d): what every evaluation will apply, attested at sign-off
+        out.append("## Base outcome adjustments")
+        out.append("Applied in every evaluation (point, draws, sensitivity, decision tests, plan variants, the boundary "
+                   "check): each package holding the component and not the reference has its outcomes set to the value "
+                   "times those of the same package with the reference in its place; a package holding both is left "
+                   "as the engine gives it (toolkit/analysis/outcome_adjust.py).")
+        for a in oa if isinstance(oa, list) else []:
+            if isinstance(a, dict):
+                out.append(f"- **{a.get('id')}**: {a.get('component')} = {a.get('value')} x {a.get('reference')}. "
+                           f"Source: {a.get('source')}")
+        out.append("")
     try:
         import pipeline as P
         ders, ign, errs = P.load_derivations(run_dir)
@@ -455,12 +475,6 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
     from toolkit.analysis import burden as BV
     out += BV.sheet_lines(raw, run_dir, burden_bytes)   # F6 S2-5: reference sources the owner attests are independent
-    from toolkit.spec import evidence_dossier as ED
-    if dossier_bytes is None and ED.dossier_reference(raw):
-        try:
-            dossier_bytes = ED.read_dossier(run_dir, ED.dossier_reference(raw))
-        except ValueError:
-            dossier_bytes = None
     out += ED.sheet_lines(raw, run_dir, dossier_bytes, closure)   # F6: each input, execution's vs the chosen value
     from toolkit.engines import benchmark_coverage as BC
     out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
@@ -477,6 +491,7 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
 
 def _self_test() -> int:
     import tempfile
+    from toolkit.spec.spec_critique import SECTION as SC_SECTION
     import yaml
     fails = []
 
@@ -726,6 +741,10 @@ def _self_test() -> int:
             "k": {"value": 0.9, "source": "a toy survey", "reason": "toy setting", "basis": "setting_data"}}
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         md = sheet(d)
+        cr = md.split(SC_SECTION)[-1].split("\n## ")[0] if SC_SECTION in md else ""
+        ok("| headline_comparator |" in cr
+           and md.index(SC_SECTION) < md.index("## Engine defaults accepted by name"),
+           f"SV0 the sheet opens with the pre-sign spec critique (toolkit/spec/spec_critique.py): {cr[:400]!r}")
         sec = md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0] \
             if "## Engine parameter values set by the spec" in md else ""
         ok(sec and "**HIGH**" in sec and sec.count("HIGH") == 1 and "a toy sweep" in sec and "toy headline" in sec
@@ -1067,6 +1086,19 @@ def _self_test() -> int:
                f"recorded: {w3[:100]} | {w4[:100]}")
     except Exception as e:  # noqa: BLE001
         ok(False, f"ED13-ED14 the brief's signer: {type(e).__name__}: {e}")
+    # owner R3 (point d): the sheet shows the base outcome adjustments the analysis will apply
+    import yaml as _y
+    with tempfile.TemporaryDirectory() as d2:
+        raw = _y.safe_load(open(schema.toy_spec(d2)))
+        plain_md = sheet(d2, spec_bytes=_y.safe_dump(raw).encode())
+        raw["analysis"]["outcome_adjustments"] = [{"id": "OA1", "component": "a", "reference": "b", "value": 0.5,
+                                                   "source": "toy trial 2020"}]
+        md = sheet(d2, spec_bytes=_y.safe_dump(raw).encode())
+        sec = md.split("## Base outcome adjustments")[-1].split("\n## ")[0] if "## Base outcome adjustments" in md else ""
+        ok("OA1" in sec and "0.5" in sec and "toy trial 2020" in sec and "every evaluation" in sec
+           and "## Base outcome adjustments" not in plain_md,
+           "SS-OA1 the sheet lists each base outcome adjustment (id, component, reference, value, source), and a spec "
+           "without the field gets no such section (existing sheets unchanged)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
