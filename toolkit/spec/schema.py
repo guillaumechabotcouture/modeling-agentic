@@ -1470,6 +1470,10 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                                                                                     for v in vs):
                 bad.append(f"decision test {i}: outcome_ratio values of 1 only change nothing (an identity)")
             elif orc["component"] in comps and orc["reference"] in comps:
+                cpk = s.packages().get(s.raw["comparator"].get("package"), set())
+                if orc["component"] in set(cpk):       # #248 P2-1 (Codex review of #245): benefits are measured from it
+                    bad.append(f"decision test {i}: the comparator holds {orc['component']}: the test would change "
+                               "the baseline every benefit is measured from")
                 pk = s.packages()
                 if not any(orc["component"] in set(cs) and orc["reference"] not in set(cs)
                            and any(set(c2) == (set(cs) - {orc["component"]}) | {orc["reference"]}
@@ -2016,7 +2020,10 @@ def _self_test() -> int:
         bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.0]}), "positive",
             "SP-OR4 a ratio that is not positive is refused")
         bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [1.0]}), "identity",
-            "SP-OR5 a ratio of 1 only (an identity) is refused")
+            "SP-OR5 a ratio of 1 only (an identity) is refused")      # #251: allowed only for an adjusted component
+        bad(lambda r: (r["comparator"].update(package="a"),
+                       dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.5]})(r)), "comparator",
+            "SP-OR7 (Codex review of #245 P2-1) a test that changes the comparator's own burden is refused")
         r_o = copy.deepcopy(s.raw)
         dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
         ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")

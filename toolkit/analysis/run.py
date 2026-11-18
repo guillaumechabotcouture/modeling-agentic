@@ -429,7 +429,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   "units_changed_by_group", "dollars_by_component")},
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
                                                     "rejected_values", "reachable_interaction", "unit_attribute",
-                                                    "burden_scale")
+                                                    "burden_scale", "outcome_ratio")
                                     if k in x}} for x in dts]}, DT.PRODUCER,
         [arts["point"], arts["uncertainty"]] + eng_files
         + sorted({os.path.join(run_dir, f) for x in dts for f in (x.get("arm_inputs") or {})})
@@ -1380,6 +1380,53 @@ def _self_test_joint(ok, q):
         dto2 = dict(dto, outcome_ratio={"component": "a", "reference": "zz", "values": [0.5]})
         ro2 = DT_.run_one(A, dto2, z0, ben0, cost0, plan, R["uncertainty"], out0)
         ok(ro2.get("status") == "not_run", f"JR11b no counterpart package: not run ({ro2.get('status')})")
+        # #248 (Codex review of #245). P2-4: a package holding the component with no counterpart is disclosed (held,
+        # listed as missing_subtraction) and the test does not claim to cover it.
+        from types import SimpleNamespace as _NS
+        fa = _NS(pk={"none": set(), "a": {"a"}, "b": {"b"}, "ac": {"a", "c"}}, primary="dalys", ids=["u"], comp="none",
+                 dfac=1.0, point_events=[])
+        fo = {"u": {"y": {k: {"dalys": v} for k, v in (("none", 10.0), ("a", 6.0), ("b", 8.0), ("ac", 5.0))}}}
+        fb = {"u": {"none": 0.0, "a": 4.0, "b": 2.0, "ac": 5.0}}
+        fr = DT_._outcome_ratio(fa, dto, fo, fb, {}, {"u": "a"}, {"u": 0.0})
+        ok((fr.get("record") or {}).get("unpaired") == ["ac"] and fr.get("unpaired") == ["ac"]
+           and "without one" in fr.get("varied", "") and fr["cases"][0][1]["u"]["ac"] == 5.0,
+           f"JR11c (#248 P2-4) a package with no counterpart is held and disclosed ({fr.get('record')}, {fr.get('varied')})")
+        # P2-2 (fixed in #251): the re-solved plans are guarded with the point evaluation's model corrections
+        saved_pe = getattr(A, "point_events", None)
+        try:
+            A.point_events = [{"unit": A.ids[0], "package": "*", "kind": "reduction_clip"}]
+            try:
+                DT_.run_one(A, dto, z0, ben0, cost0, plan, R["uncertainty"], out0)
+                blocked_ = False
+            except AnalysisBlocked:
+                blocked_ = True
+            ok(blocked_, "JR11d (#248 P2-2) a point correction bearing on the re-solved plan stops an outcome_ratio test")
+        finally:
+            A.point_events = saved_pe
+        # P2-5: an outcome_ratio test cannot carry an engine departure (it holds the engine): refused, saying why
+        from toolkit.spec import preconditions as PC_
+        okd, why_ = PC_.decision_test_runs(_NS(raw={"analysis": {"decision_tests": [dto]}}), "DTo", {"components": ["a"]})
+        ok(not okd and "does not vary" in why_ and "outcome_ratio" in why_,
+           f"JR11f (#248 P2-5) an outcome_ratio test is refused as an engine-departure test, with why ({why_})")
+        # P3: results.md and the claims carry the tested ratios and the package pairs
+        txt_ = CL.results_template(A, R["point"], R["uncertainty"], R["stability"], R["sensitivity"], [dict(ro, path="p")],
+                                   R["calibration"], R["emulator_accuracy"])
+        ids_ = {c["id"] for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
+                                                                   "calibration", "engine")}, R["point"],
+                                               R["uncertainty"], R["stability"], [ro], R["calibration"])}
+        ok("[CLAIM:dt.DTo.ratio0]" in txt_ and "dt.DTo.ratio0" in ids_ and "package pairs: a → b" in txt_,
+           f"JR11g (#248 P3) the results state each tested ratio (a claim) and the package pairs")
+        # Codex review of #253 P1: the value "engine" (#251: the base adjustment removed) is not a number; it is named in
+        # words, and only the numeric ratios are claims (a scalar claim of "engine" fails the ledger and the run)
+        roe = dict(ro, path="p", outcome_ratio=dict(ro.get("outcome_ratio") or {}, values=["engine", 0.5]))
+        txe = CL.results_template(A, R["point"], R["uncertainty"], R["stability"], R["sensitivity"], [roe],
+                                  R["calibration"], R["emulator_accuracy"])
+        cle = [c for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
+                                                             "calibration", "engine")}, R["point"], R["uncertainty"],
+                                       R["stability"], [roe], R["calibration"]) if c["id"].startswith("dt.DTo.ratio")]
+        ok([c["id"] for c in cle] == ["dt.DTo.ratio1"] and "[CLAIM:dt.DTo.ratio1]" in txe
+           and "[CLAIM:dt.DTo.ratio0]" not in txe and "base adjustment removed" in txe,
+           f"JR11h (Codex #253 P1) \"engine\" is a case in words, the numeric ratios claims ({[c['id'] for c in cle]})")
         _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R)
         saved_z = A.joint["z"].pop(listed[0])
         try:
@@ -2150,6 +2197,15 @@ def _self_test_burden_scale(ok, R, by):
         BV_._value = orig_v
     ok(rec6.get("status") == "not_run" and "finite" in rec6.get("reason", ""),
        f"BS-R6 an infinite model value: not run ({rec6.get('status')}: {rec6.get('reason')})")
+    # #248 item 8 (#246 P2-5): results.md and the claims show the shares, each reference's factor and the assumption
+    txt = CL.results_template(A, R["point"], R["uncertainty"], R["stability"], R["sensitivity"], [dict(rec, path="p")],
+                              R["calibration"], R["emulator_accuracy"])
+    ids = {c["id"] for c in CL.claim_spec(A, {k: "x" for k in ("point", "uncertainty", "stability", "decision_tests",
+                                                              "calibration", "engine")}, R["point"], R["uncertainty"],
+                                          R["stability"], [rec], R["calibration"])}
+    ok("[CLAIM:dt.DTb.share0]" in txt and "[CLAIM:dt.DTb.factor0]" in txt and "[CLAIM:dt.DTb.factor1]" in txt
+       and {"dt.DTb.share0", "dt.DTb.share1", "dt.DTb.factor0", "dt.DTb.factor1"} <= ids,
+       "BS-R8 (#248) the results state each share and each reference's factor as claims")
     # Codex review of #246 P2-4: each reference's window is recorded, and a transfer across outcome, age band or
     # window is stated as an assumption
     ok(all("window" in v for v in (bs.get("references") or {}).values()) and "A" in (bs.get("assumption") or ""),

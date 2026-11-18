@@ -711,19 +711,22 @@ def _outcome_ratio(A, dt, out0, ben0, cost0, plan, z0=None) -> dict:
     `value` times its counterpart's, the package with `reference` in the component's place (the trial's relative
     effect of one net type against another), for each value; benefits re-derived against the comparator, costs and
     every other package held, the plan re-solved. Emulator outputs only: nothing is evaluated anew. Not run when no
-    package has a counterpart."""
+    package has a counterpart. A package holding `component` with no counterpart is held and disclosed (`unpaired`,
+    the record's missing_subtraction; #248 P2-4)."""
     oc = dt["outcome_ratio"]
     c, ref = oc["component"], oc["reference"]
     from toolkit.analysis import outcome_adjust as OA   # Codex review of #251 P1-1, P1-4 (sign-off refuses these too)
     conflict = OA.dt_problems(oc, getattr(A, "adjust", None))
     if conflict:
         return {"not_run": "; ".join(conflict)}
-    pairs = {}
+    pairs, unpaired = {}, []
     for k, cs in A.pk.items():
         if c in cs and ref not in cs:
             kk = next((n for n, c2 in A.pk.items() if set(c2) == (set(cs) - {c}) | {ref}), None)
             if kk is not None:
                 pairs[k] = kk
+            else:
+                unpaired.append(k)       # Codex review of #245 P2-4: disclosed, never claimed as tested
     if not pairs:
         return {"not_run": f"no package with {c} has a counterpart with {ref} in its place"}
     o = A.primary
@@ -754,11 +757,14 @@ def _outcome_ratio(A, dt, out0, ben0, cost0, plan, z0=None) -> dict:
         by_value[str(v)] = {i: ben[i][next(iter(pairs))] for i in A.ids}
         cases.append((v, ben, cost0, None, None))
         lowers.append(_lowers_only_unchosen(ben0, ben, plan))
-    return {"varied": f"the {o} of every package with {c} set to each tested ratio times that of the same package with "
-                      f"{ref} in its place", "cases": cases, "lowers": lowers,
+    unpaired.sort()
+    return {"varied": f"the {o} of every package with {c} that has a counterpart set to each tested ratio times that "
+                      f"of the same package with {ref} in its place"
+                      + (f" ({len(unpaired)} without one held: {unpaired[:5]})" if unpaired else ""),
+            "cases": cases, "lowers": lowers,
             "record": {"component": c, "reference": ref, "values": list(oc["values"]), "outcome": o, "pairs": pairs,
-                       "check": check, "check_by_value": by_value,
-                       "base_adjustments": [a["id"] for a in getattr(A, "adjust", None) or []]}, "evs": evs}
+                       "unpaired": unpaired, "check": check, "check_by_value": by_value,
+                       "base_adjustments": [a["id"] for a in getattr(A, "adjust", None) or []]}, "evs": evs, "unpaired": unpaired}
 
 
 def burden_scale_refs(spec, bs) -> tuple[list[dict], list[str]]:
@@ -945,6 +951,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         varied, cases, lowers = orr["varied"], orr["cases"], orr["lowers"]
         evs.update(orr.get("evs") or {})
         extra["_or"] = orr["record"]
+        extra["_missing"] = list(orr["unpaired"])        # the packages with the component that have no counterpart
     elif t == "burden_scale":
         bsr = _burden_scale(A, dt, z0, out0, ben0, cost0)
         if bsr.get("not_run"):
