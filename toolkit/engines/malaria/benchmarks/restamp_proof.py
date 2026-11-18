@@ -603,6 +603,32 @@ def _self_test() -> int:
                f"RP-T1 a proof without git: the old tree from --old-tar, both commits given ({refused})")
     except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case
         ok(False, f"RP-T1 a proof without git ({type(ex).__name__}: {ex})")
+    # Codex review of #270 (P1s): a restamp binds the proof to the evidence it advances (each file's stamped identity
+    # is the proof's old side), and only a full-scope proof re-stamps (every case of the pack's settings, the evidence
+    # cases and the scenarios); an unknown --settings name is refused before any run
+    try:
+        pk = yaml.safe_load(open(os.path.join(HERE, "pack.yaml")))
+        full = {c["id"] for c in cases(pk, [11])}
+        oid, nid = {"code_sha256": "old"}, {"code_sha256": "new"}
+        good = {"identical": True, "old": {"identity": oid}, "new": {"identity": nid}, "scope": {"seeds": [11]},
+                "cases": {i: {"equal": True} for i in full}}
+        docs = {f: {"engine_identity": oid} for f in STAMPED}
+        part = dict(good, cases={i: v for i, v in good["cases"].items() if not i.startswith("pack:")})
+        self_cmp = dict(good, old={"identity": nid})
+        stale = dict(docs, **{STAMPED[0]: {"engine_identity": {"code_sha256": "other"}}})
+        unknown = None
+        try:
+            check_settings(pk, ["mulleba"])
+        except ValueError as ex:
+            unknown = str(ex)
+        ok(restamp_problems(good, docs, pk) == [] and restamp_problems(part, docs, pk)
+           and restamp_problems(self_cmp, docs, pk) and restamp_problems(good, stale, pk)
+           and unknown and "mulleba" in unknown and check_settings(pk, ["muleba"]) == ["muleba"],
+           f"RP-T2 a re-stamp needs a full-scope proof whose old side is the stored evidence's identity; a filtered "
+           f"proof, a self-comparison and a stale file are refused; an unknown setting is refused before a run "
+           f"({restamp_problems(part, docs, pk)[:1]}, {restamp_problems(self_cmp, docs, pk)[:1]})")
+    except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"RP-T2 restamp binding ({type(ex).__name__}: {ex})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
