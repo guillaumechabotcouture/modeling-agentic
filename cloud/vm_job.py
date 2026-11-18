@@ -999,6 +999,31 @@ def _self_test() -> int:
             sync_outputs(run, "j2", dest2)
             ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "T", "analysis", "c.jsonl.job.json")) is not None,
                "RC40e a poll interrupted before its digests are saved is redone and marks the record")
+            # RC40f (Codex round 5): the digest cache is replaced atomically, so an interrupted write keeps the digest of
+            # a record fetched by an earlier poll, before its run root arrived
+            ru = os.path.join(ws.JOBS, "j2", "out", "runs", "U")
+            os.makedirs(os.path.join(ru, "analysis"))
+            open(os.path.join(ru, "analysis", "d.jsonl.job.json"), "w").write('{"pid": 4}')
+            sync_outputs(run, "j2", dest2)
+            open(os.path.join(ru, "run_state.json"), "w").write("{}")
+            boom["n"] = 0
+
+            def flaky2(obj, fh, *a, **k):
+                if ".fetched_sha256.json" in str(getattr(fh, "name", "")) and not boom["n"]:
+                    boom["n"] += 1
+                    raise OSError("interrupted")
+                return real_dump(obj, fh, *a, **k)
+            json.dump = flaky2
+            try:
+                try:
+                    sync_outputs(run, "j2", dest2)
+                except OSError:
+                    pass
+            finally:
+                json.dump = real_dump
+            sync_outputs(run, "j2", dest2)
+            ok(_CR.copied_entry(os.path.join(dest2, "out", "runs", "U", "analysis", "d.jsonl.job.json")) is not None,
+               "RC40f an interrupted digest-cache write keeps an earlier poll's digest")
             for bad in ("work/job.py", "state.json", "../../etc/passwd", "out/../state.json"):
                 try:
                     ws.job_chunk("j1", bad, 0, 10)
