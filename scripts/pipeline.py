@@ -30,7 +30,7 @@ once and the harness runs them, like `make` (docs/design/stage-machine.md §3.2)
         outputs: ["figures/*.png"]
 
 Step keys: id, run, inputs, outputs, and optionally purpose, timeout_s (a soft
-deadline: warned about and recorded in models/pipeline_progress.json, the step
+deadline: warned about and recorded in pipeline_progress.json, the step
 killed only at its backstop; see DEFAULT_TIMEOUT_S); a
 compute step (`run: "compute: <path.py>::<fn>"`) also needs inputs_jsonl, out
 (one of its outputs) and purpose. Anything else is a validation error. A
@@ -99,13 +99,15 @@ REPO = os.path.dirname(HERE)
 SPEC = os.path.join("models", "pipeline.yaml")
 STATE = os.path.join("models", "pipeline_state.json")
 REPORT = os.path.join("models", "pipeline_report.json")
-PROGRESS = os.path.join("models", "pipeline_progress.json")
+# At the run root, not under models/ (Codex on #267, P1): compute.py's code fingerprint hashes models/ and data/,
+# so a progress write there would change a running batch's fingerprint and discard its rows on resume.
+PROGRESS = "pipeline_progress.json"
 _RUN_ID = None           # the current run()'s id (MA_PIPELINE_RUN in its steps)
 # The runner's own records: written by the harness run only (protected in
 # agents/enforcement.py SCRIPT_OUTPUTS).
 OWN_FILES = ("models/pipeline_state.json", "models/pipeline_state.json.tmp",
              "models/pipeline_report.json", "models/pipeline_report.json.tmp",
-             "models/pipeline_progress.json")
+             "pipeline_progress.json")
 STEP_KEYS = {"id", "run", "inputs", "outputs", "purpose", "timeout_s", "inputs_jsonl", "out"}
 COMPUTE_KEYS = {"inputs_jsonl", "out"}
 TOP_KEYS = {"steps", "version"}
@@ -2104,7 +2106,7 @@ def _self_test() -> int:
             # PL15c: a step past its soft deadline keeps running, writes a progress record while it runs (the step
             # copies the record it can see at 1.8 s into its output) and finishes ok.
             w(d, "models/a.py", "import time, shutil\ntime.sleep(1.8)\n"
-                                "shutil.copy('models/pipeline_progress.json', 'models/a.seen')\n"
+                                "shutil.copy('pipeline_progress.json', 'models/a.seen')\n"
                                 "open('models/a.out', 'w').write('5')\n")
             spec(d, [dict(three[0], timeout_s=1, outputs=["models/a.out", "models/a.seen"])] + three[1:])
             rep = run(d)
@@ -2123,6 +2125,13 @@ def _self_test() -> int:
                and "backstop_at" in seen and final.get("state") == "ok",
                f"PL15c a step past its soft deadline is warned about, recorded while running, and finishes: "
                f"{r0} seen={seen} final={final}")
+            # PL15e (Codex on #267, P1): a progress write leaves a batch's code fingerprint (compute.py: models/ and
+            # data/) unchanged, so a resumed batch keeps its rows.
+            import compute as _compute
+            fp0 = _compute.code_fingerprint(d, "models/a.py::f")
+            _progress_record(d, {"id": "z", "run": "x"}, 1.0, 3.0, time.time(), 2.0, None, "running")
+            ok(_compute.code_fingerprint(d, "models/a.py::f") == fp0,
+               "PL15e writing the progress record does not change a batch's code fingerprint")
             # PL15: past the backstop it is killed, and reads as a timeout (stage_machine.resumable_failure).
             w(d, "models/a.py", "import time\ntime.sleep(30)\n")
             t1 = time.time()

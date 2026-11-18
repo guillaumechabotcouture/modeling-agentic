@@ -121,7 +121,7 @@ SCRIPT_OUTPUTS = (
     "models/pipeline_state.json.tmp",
     "models/pipeline_report.json",
     "models/pipeline_report.json.tmp",
-    "models/pipeline_progress.json",  # a step past its soft deadline (scripts/pipeline.py PROGRESS)
+    "pipeline_progress.json",  # a step past its soft deadline (scripts/pipeline.py PROGRESS)
     # Phase 44 α: the model card (main.py finalize, scripts/model_card.py) and
     # the what-if query log (scripts/ask.py).
     "model_card.yaml",
