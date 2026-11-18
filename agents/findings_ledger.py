@@ -534,8 +534,10 @@ def _self_test() -> int:
         led17["D-031"].claim, led17["D-031"].status = "a revised claim", "open"
         save(d, led17)
         led17b, _ = sync(d, None, 3)
-        ok(unverified == {} and st17 == "owner_declined" and led17b["D-031"].status == "open",
-           f"L17 a recorded owner answer applies to the finding it was given for, not to a revised one "
+        import fix_loop as FX_
+        ok(unverified == {} and st17 == "owner_declined" and led17b["D-031"].status == "open"
+           and FX_.needs_owner_amendment(led17b["D-031"]),
+           f"L17 a recorded owner answer applies to the finding it was given for; a revised one is asked again "
            f"({unverified}, {st17}, {led17b['D-031'].status})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

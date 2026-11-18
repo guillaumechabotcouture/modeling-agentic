@@ -2166,6 +2166,16 @@ def _self_test() -> int:
            f"R3-3 an owner-amendment finding pauses at OWNER_DECISION with a request, no redraft ({s}, {p[-4:]})")
         if req.get("pending"):
             import scope_signoff as _SS
+            # Codex re-review of #258 P1-8: the request the machine made is what must be answered, not whatever request
+            # file is there now
+            good_req = open(os.path.join(d, "scope_signoff_request.json")).read()
+            json.dump(dict(req, items=[dict(req["items"][0], fingerprint="stale0000000000")]),
+                      open(os.path.join(d, "scope_signoff_request.json"), "w"))
+            _SS.sign(d, "owner", all_decision="accept", note="stale")
+            open(os.path.join(d, "scope_signoff_request.json"), "w").write(good_req)
+            s_st = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            ok(s_st == "paused:awaiting_scope_signoff",
+               f"R3-3d an answer to a request the machine did not make does not release OWNER_DECISION ({s_st})")
             _SS.sign(d, "lead", all_decision="accept", note="R3-3c")     # Codex review of #258 P1-8: not the owner's
             s_l = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
             ok(s_l == "paused:awaiting_scope_signoff",
@@ -2173,9 +2183,20 @@ def _self_test() -> int:
             _SS.sign(d, "owner", all_decision="decline", note="R3-3")
             s2 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
             p2 = [h["to"] for h in load_state(d).history if "to" in h]
-            ok(s2 == "completed_scope_declined" and "SPEC" not in p2 and FL.load(d)["D-031"].status == "owner_declined",
+            ok(s2 == "completed_scope_declined" and "SPEC" not in p2 and FL.load(d)["D-031"].status == "owner_declined"
+               and "`completed_scope_declined`" in open(os.path.join(d, "report.md")).read(),
                f"R3-3b the owner's decline resumes the run, is not redrafted, and constrains the gate: the run is not "
                f"declared or accepted (Codex review of #258 P1-11) ({s2}, {p2[-5:]})")
+        # R3-6 (Codex re-review of #258): a declared finding still needs the owner's answer (P1-10), and a decline of a
+        # finding its test has since resolved does not hold the gate (new P1-2)
+        f6d = FL.Finding(id="D-036", kind="critique_blocker", severity="HIGH", source="critique-domain", status="declared",
+                         fix_requires="Owner amendment: x")
+        f6x = FL.Finding(id="D-037", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                         status="owner_declined", resolution_type="owner_decision")
+        ok(pending_amendments({"D-036": f6d}) == ["D-036"]
+           and apply_owner_declines({"action": "ACCEPT", "resolved_by_test": ["D-037"]}, {"D-037": f6x})["action"]
+           == "ACCEPT" and apply_owner_declines({"action": "ACCEPT"}, {"D-037": f6x})["action"] == "RUN_FAILED",
+           "R3-6 a declared amendment is asked; a declined finding its test resolved does not hold the gate")
         # R3-5 (Codex review of #258 P1-10): the amendment check runs on every gate route: a structural PLAN blocker
         # whose remedy is an owner amendment does not take GATE -> SPEC
         amend5 = dict(amend, id="D-035", category="STRUCTURAL")
