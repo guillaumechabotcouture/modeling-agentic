@@ -54,6 +54,7 @@ function fmt(v, name, unit) {
   // percentage under a name ending in _pct, is shown as a percentage to three significant digits.
   if (/(^|_)share(_|$)/.test(n) || n.endsWith("_pct")) { const x = n.endsWith("_pct") ? v : 100 * v; return (Math.abs(x) >= 1000 ? loc(x, 0, 0) : String(Number(x.toPrecision(3)))) + "%"; }
   if (Number.isInteger(v)) return Math.abs(v) < 10000 ? String(v) : loc(v, 0, 0);
+  if (Math.abs(v) >= 1000 && Math.abs(v) < 10000) return String(Number(v.toPrecision(6)));      // as a whole number under ten thousand: no separator (a decimal year reads as one)
   return Math.abs(v) >= 1000 ? loc(v, 0, 1) : String(Number(v.toPrecision(4)));
 }
 const clip = (s, n) => (s = String(s == null ? "–" : s), s.length > n ? "…" + s.slice(s.length - n + 1) : s);
@@ -246,10 +247,10 @@ function scale(lo, hi, a, b, log) {
   const g = v => (log ? Math.log10(v) : v), l = g(lo), h = g(hi) === g(lo) ? g(lo) + 1 : g(hi);
   return v => a + (g(v) - l) / (h - l) * (b - a);
 }
-function ticks(lo, hi, log) {
+function ticks(lo, hi, log, about = 5) {
   const out = [];
   if (log) { for (let e = Math.ceil(Math.log10(lo)); e <= Math.floor(Math.log10(hi)); e++) out.push(10 ** e); return out.length ? out : [lo, hi]; }
-  const raw = (hi - lo) / 5 || 1, mag = 10 ** Math.floor(Math.log10(raw)), by = [1, 2, 5, 10].map(m => m * mag).find(s => s >= raw);
+  const raw = (hi - lo) / about || 1, mag = 10 ** Math.floor(Math.log10(raw)), by = [1, 2, 5, 10].map(m => m * mag).find(s => s >= raw);
   for (let i = Math.ceil(lo / by - 1e-9); i * by <= hi + by * 1e-9; i++) out.push(Number((i * by).toPrecision(12)));     // counted in whole steps, so zero is 0
   return out;
 }
@@ -274,6 +275,13 @@ const word = (c, k) => (c.decl.labels && c.decl.labels[c.names[k]]) || label(c.n
 const marks = c => (Array.isArray(c.decl.limits) ? c.decl.limits.filter(m => m && typeof m.value === "number" && (!c.log || m.value > 0)) : []);
 const swatch = (...shapes) => sv("svg", {width: 22, height: 12, viewBox: "0 0 22 12"}, shapes);
 const diamond = (x, y, r, cls) => sv("path", {class: cls, d: `M${x - r} ${y}L${x} ${y - r}L${x + r} ${y}L${x} ${y + r}Z`});
+// Shaded periods along a chart's x or time axis (decl.bands: [{low, high, label}]): their rectangles and their legend entries.
+const spans = c => (Array.isArray(c.decl.bands) ? c.decl.bands.filter(b => b && typeof b.low === "number" && typeof b.high === "number" && b.high >= b.low) : []);
+const spanRects = (c, f, lo, hi, y0, y1) => spans(c).map((b, k) => {
+  const a = f(Math.max(b.low, lo)), z = f(Math.min(b.high, hi));
+  return z > a ? sv("rect", {class: `span b${k % 2}`, x: a, y: y0, width: z - a, height: y1 - y0}) : null;
+});
+const spanKey = c => spans(c).map((b, k) => [swatch(sv("rect", {class: `span b${k % 2}`, x: 1, y: 1, width: 20, height: 10})), `${b.label} (${fmt(b.low)} to ${fmt(b.high)})`]);
 const key = items => el("div", {class: "legend"}, items.map(([shape, text]) => el("span", null, shape, " ", text)));
 // Frame for charts with one row of marks per table row: names down the left, a hover target per row.
 function rowChart(t, rows, c, right, drawRow, under) {
@@ -352,10 +360,10 @@ const DRAW = {
   lines(t, c) {
     const rows = t.rows.filter(r => typeof r[c.x] === "number" && typeof r[c.y] === "number" && (!c.log || r[c.y] > 0));
     const more = ["model", "low", "high"].filter(k => c[k] != null), band = c.low != null && c.high != null;
-    const ex = extent(rows.map(r => r[c.x])), ey = extent([...rows.flatMap(r => [r[c.y], ...more.map(k => r[c[k]])]), ...marks(c).map(m => m.value)], c.log);
+    const ex = c.ex || extent(rows.map(r => r[c.x])), ey = extent([...rows.flatMap(r => [r[c.y], ...more.map(k => r[c[k]])]), ...marks(c).map(m => m.value)], c.log);
     if (!ex || !ey) return null;
-    const H = 320, fx = scale(ex[0], ex[1], 64, W - 20), fy = scale(ey[0], ey[1], H - 40, 10, c.log);
-    const g = sv("svg", {class: "chart", viewBox: `0 0 ${W} ${H}`, role: "img"}, ticks(ey[0], ey[1], c.log).map(v => [
+    const W = c.small ? 430 : 860, H = c.small ? 230 : 320, fx = scale(ex[0], ex[1], 64, W - 20), fy = scale(ey[0], ey[1], H - 40, 22, c.log);      // c.small: one of several panels side by side
+    const g = sv("svg", {class: `chart${c.small ? " small" : ""}`, viewBox: `0 0 ${W} ${H}`, role: "img"}, spanRects(c, fx, ex[0], ex[1], 22, H - 40), ticks(ey[0], ey[1], c.log).map(v => [
       sv("line", {class: "gridline", x1: 64, x2: W - 20, y1: fy(v), y2: fy(v)}), sv("text", {x: 58, y: fy(v) + 4, "text-anchor": "end", text: fmt(v)})]),
       ticks(ex[0], ex[1]).map(v => sv("text", {x: fx(v), y: H - 24, "text-anchor": "middle", text: fmt(v)})),
       sv("line", {class: "axis", x1: 64, x2: W - 20, y1: H - 40, y2: H - 40}),
@@ -365,21 +373,73 @@ const DRAW = {
       sv("text", {x: 4, y: 10, text: word(c, "y") + (c.log ? ", log scale" : "")}));
     const ok = v => typeof v === "number" && (!c.log || v > 0), path = (pts, k) => pts.filter(r => ok(r[c[k]])).map((r, i) => `${i ? "L" : "M"}${fx(r[c.x])} ${fy(r[c[k]])}`).join("");
     const groups = c.group == null ? [null] : [...new Set(rows.map(r => r[c.group]))];
+    const wide = k => (c.model == null && groups.length > 1 && k === 0 ? " under" : "");      // the first of several lines is wide and pale: a line lying on it leaves it in sight
     groups.forEach((name, k) => {
       const pts = rows.filter(r => c.group == null || r[c.group] === name).sort((a, b) => a[c.x] - b[c.x]), cls = `c${Math.min(k, 5) + 1}`;
       if (band) { const in2 = pts.filter(r => ok(r[c.low]) && ok(r[c.high]));
         if (in2.length) g.append(sv("path", {class: "c2 band", d: in2.map((r, i) => `${i ? "L" : "M"}${fx(r[c.x])} ${fy(r[c.high])}`).join("") + [...in2].reverse().map(r => `L${fx(r[c.x])} ${fy(r[c.low])}`).join("") + "Z"})); }
       if (c.model != null) g.append(sv("path", {class: "c2 line", d: path(pts, "model")}));
-      else g.append(sv("path", {class: `${cls} line`, d: path(pts, "y")}));
-      for (const r of pts) g.append(sv("circle", {class: cls, cx: fx(r[c.x]), cy: fy(r[c.y]), r: 3}),
-        tip(sv("circle", {class: "hit", cx: fx(r[c.x]), cy: fy(r[c.y]), r: 9}), () => rowPairs(t, r)));
+      else g.append(sv("path", {class: `${cls} line${wide(k)}`, d: path(pts, "y")}));
+      const dots = c.model != null || pts.length <= 40;      // a long series is its line; every point still answers to the pointer
+      for (const r of pts) g.append(dots ? sv("circle", {class: cls, cx: fx(r[c.x]), cy: fy(r[c.y]), r: 3}) : null,
+        tip(sv("circle", {class: "hit", cx: fx(r[c.x]), cy: fy(r[c.y]), r: dots ? 9 : 5}), () => rowPairs(t, r)));
     });
     if (c.model != null) return [key([[swatch(sv("circle", {class: "c1", cx: 11, cy: 6, r: 3})), word(c, "y")],
       [swatch(sv("line", {class: "c2 line", x1: 1, x2: 21, y1: 6, y2: 6})), word(c, "model")],
       band ? [swatch(sv("rect", {class: "c2 band", x: 1, y: 1, width: 20, height: 10})), `${word(c, "low")} (${label(c.names.low)} to ${label(c.names.high)})`] : null,
-      groups.length === 1 && groups[0] != null ? [null, `${label(c.names.group)}: ${fmt(groups[0])}`] : null].filter(Boolean)), g];
-    return [groups.length > 1 ? key(groups.map((name, k) => [swatch(sv("line", {class: `c${Math.min(k, 5) + 1} line`, x1: 1, x2: 21, y1: 6, y2: 6})),
-      `${label(c.names.group)}: ${fmt(name)}`])) : null, g];
+      groups.length === 1 && groups[0] != null ? [null, `${label(c.names.group)}: ${fmt(groups[0])}`] : null, ...spanKey(c)].filter(Boolean)), g];
+    const items = [...(groups.length > 1 ? groups.map((name, k) => [swatch(sv("line", {class: `c${Math.min(k, 5) + 1} line${wide(k)}`, x1: 1, x2: 21, y1: 6, y2: 6})),
+      `${label(c.names.group)}: ${fmt(name)}` + (wide(k) ? " (the wide line: another line lying on it leaves it in sight)" : "")]) : []), ...spanKey(c)];
+    return [items.length ? key(items) : null, g];
+  },
+  // One row per event against one time axis: a block per value of the group column, in it a line of marks per value of y.
+  timeline(t, c) {
+    const rows = t.rows.filter(r => typeof r[c.x] === "number"), end = r => (c.high != null && typeof r[c.high] === "number" && r[c.high] > r[c.x] ? r[c.high] : null);
+    const ext = extent([...rows.flatMap(r => [r[c.x], end(r)]), ...spans(c).flatMap(b => [b.low, b.high]), ...marks(c).map(m => m.value)]);
+    if (!rows.length || !ext) return null;
+    const kinds = c.mark == null ? [] : [...new Set(rows.map(r => r[c.mark]))].sort(compare), cls = r => `c${c.mark == null ? 1 : Math.min(kinds.indexOf(r[c.mark]), 5) + 1}`;
+    const amount = r => (c.size != null && typeof r[c.size] === "number" && r[c.size] > 0 ? r[c.size] : null);
+    const blocks = c.group == null ? [[null, rows]] : [...new Set(rows.map(r => r[c.group]))].map(v => [v, rows.filter(r => r[c.group] === v)]);
+    const items = [];
+    for (const [v, rs] of blocks) {
+      const most = Math.max(0, ...rs.map(r => amount(r) || 0));
+      if (c.group != null && !(blocks.length === 1 && (v == null || v === ""))) items.push({header: `${label(c.names.group)}: ${fmt(v)}`});      // one block with no name needs no heading
+      for (const lane of [...new Set(rs.map(r => r[c.y]))].sort(compare)) items.push({lane, most, rows: rs.filter(r => r[c.y] === lane).sort((a, b) => a[c.x] - b[c.x])});
+    }
+    const L = 230, f = scale(ext[0], ext[1], L, W - 24), side = x => (x < L + 70 ? "start" : x > W - 94 ? "end" : "middle");      // a name near an edge is set inside the chart
+    // the names of the limits: one that would run into the name before it is set on a second row, above
+    const lims = marks(c).map(m => ({m, x: f(m.value)})).sort((a, b) => a.x - b.x);
+    let taken = -Infinity;
+    for (const l of lims) {
+      const w = String(l.m.label).length * 5.8, from = side(l.x) === "start" ? l.x : side(l.x) === "end" ? l.x - w : l.x - w / 2;
+      l.row = from < taken + 8 ? 1 : 0;
+      if (!l.row) taken = from + w;
+    }
+    const top = lims.length ? (lims.some(l => l.row) ? 48 : 36) : 20, h = 24, bottom = top + items.length * h;
+    const g = sv("svg", {class: "chart", viewBox: `0 0 ${W} ${bottom + 34}`, role: "img"}, spanRects(c, f, ext[0], ext[1], top, bottom),
+      ticks(ext[0], ext[1], false, 16).map(v => [sv("line", {class: "gridline", x1: f(v), x2: f(v), y1: top, y2: bottom}),
+        [10, bottom + 14].map(y => sv("text", {x: f(v), y, "text-anchor": "middle", text: fmt(v, c.names.x)}))]),
+      lims.map(l => [sv("line", {class: "limit", x1: l.x, x2: l.x, y1: top - 3 - 12 * l.row, y2: bottom}),
+        sv("text", {class: "limit", x: l.x, y: top - 6 - 12 * l.row, "text-anchor": side(l.x), text: l.m.label})]),
+      sv("text", {x: W - 24, y: bottom + 28, "text-anchor": "end", text: word(c, "x")}));
+    let stacked = 0, lasting = 0;
+    items.forEach((it, k) => {
+      const y = top + k * h + h / 2;
+      if (it.header != null) return g.append(sv("line", {class: "axis", x1: 0, x2: W - 24, y1: y - h / 2 + 1, y2: y - h / 2 + 1}), sv("text", {class: "name", x: 0, y: y + 5, "font-weight": 600, text: clip(it.header, 60)}));
+      g.append(sv("text", {class: "name", x: L - 10, y: y + 4, "text-anchor": "end", text: clip(fmt(it.lane), 34)}), sv("line", {class: "gridline", x1: L, x2: W - 24, y1: y, y2: y}));
+      const at = [];
+      for (const r of it.rows) {
+        const x1 = f(r[c.x]), e = end(r), n = at.filter(x => Math.abs(x - x1) < 1.5).length, dy = n ? (n % 2 ? -1 : 1) * Math.min(8, Math.ceil(n / 2) * 6) : 0;     // marks at one place: one above the other
+        const rad = amount(r) != null && it.most > 0 ? 2.5 + 3.5 * Math.sqrt(amount(r) / it.most) : 4.5;
+        at.push(x1); stacked += n ? 1 : 0; lasting += e != null ? 1 : 0;
+        g.append(e != null ? sv("rect", {class: `${cls(r)} lasting`, x: x1, y: y + dy - rad / 2, width: Math.max(3, f(e) - x1), height: rad, rx: 1.5}) : sv("circle", {class: `${cls(r)} event`, cx: x1, cy: y + dy, r: rad}),
+          tip(e != null ? sv("rect", {class: "hit", x: x1, y: y + dy - 5, width: Math.max(6, f(e) - x1), height: 10}) : sv("circle", {class: "hit", cx: x1, cy: y + dy, r: Math.max(5, rad)}), () => rowPairs(t, r)));
+      }
+    });
+    return [key([...kinds.map((v, k) => [swatch(sv("circle", {class: `c${Math.min(k, 5) + 1}`, cx: 11, cy: 6, r: 4.5})), `${word(c, "mark")}: ${fmt(v)}`]), ...spanKey(c),
+      lasting ? [swatch(sv("rect", {class: "c1", x: 1, y: 3, width: 20, height: 6, rx: 1.5})), `a bar: from ${word(c, "x")} to ${word(c, "high")}`] : null,
+      c.size != null ? [swatch(sv("circle", {class: "sized", cx: 5, cy: 6, r: 2.5}), sv("circle", {class: "sized", cx: 15, cy: 6, r: 5.5})), `a larger mark: more ${word(c, "size")}, against the most in its block`] : null].filter(Boolean)), g,
+      stacked ? el("p", {class: "about small", text: `${stacked} mark${stacked === 1 ? " shares its" : "s share their"} place on a line with another and ${stacked === 1 ? "is" : "are"} drawn just above or below it, at ${stacked === 1 ? "its" : "their"} true place along the axis.`}) : null];
   },
   // Links run left to right: a node sits one column to the right of the furthest-right node it depends on.
   graph(t, c, tables) {
@@ -522,7 +582,7 @@ function imagesView(d, tables, run) {
   return [alert, jump, ...groups.flatMap(g => [g.head, ...g.rows.map(one)])];
 }
 
-const COLUMN_KEYS = ["x", "y", "low", "high", "group", "model", "model_alt", "outer_low", "outer_high", "panels"];
+const COLUMN_KEYS = ["x", "y", "low", "high", "group", "model", "model_alt", "outer_low", "outer_high", "panels", "mark", "size"];
 const PANEL_ROWS = 80;      // panels holding more rows than this together are shown one at a time
 // A chart, and under it the harness figure of the same data when the declaration carries one (decl.image).
 function chartView(decl, tables, run, where) {
@@ -561,6 +621,15 @@ function chartDrawn(decl, tables, where) {
   const panels = [...new Set(t.rows.map(r => r[c.panels]))].map(v => [v, {...t, rows: t.rows.filter(r => r[c.panels] === v)}]);
   if (!panels.length) return cannot(`table "${decl.table}" has no rows with numbers to plot`);
   const head = ([v, sub]) => `${label(decl.panels)}: ${fmt(v)} (${sub.rows.length} row${sub.rows.length === 1 ? "" : "s"})`;
+  if (decl.kind === "lines") {      // lines over one x axis: every panel, small and side by side, each on its own value axis
+    const ex = extent(t.rows.map(r => r[c.x])), drawn = panels.map(p => [p, DRAW.lines(p[1], {...c, small: true, ex}, tables) || []]);
+    const isKey = n => n && n.classList && n.classList.contains("legend"), legend = drawn.flatMap(([, parts]) => parts.filter(isKey))[0];
+    if (!drawn.some(([, parts]) => parts.length)) return cannot(`table "${decl.table}" has no rows with numbers to plot`);
+    fig.append(...[legend, el("div", {class: "multiples"}, drawn.map(([p, parts]) => el("div", null, el("h4", {text: `${label(decl.panels)}: ${fmt(p[0])}`}),
+      parts.length ? parts.filter(n => n && !isKey(n)) : el("p", {class: "muted", text: "No rows with numbers to plot."})))),
+      el("p", {class: "about small", text: `${panels.length} panels on one ${word(c, "x")} axis, each on its own ${word(c, "y")} axis: compare shapes across panels, and levels only by the axis values.`}), from].filter(Boolean));
+    return fig;
+  }
   const one = (p, legend) => [el("h4", {text: head(p)}), ...(DRAW[decl.kind](p[1], c, tables) || [el("p", {class: "muted", text: "No rows with numbers to plot."})])
     .filter(n => n && (legend || !(n.classList && n.classList.contains("legend"))))];
   if (panels.length > 1 && t.rows.length > PANEL_ROWS) {
