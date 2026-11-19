@@ -2438,7 +2438,9 @@ def _self_test() -> int:
         q = plan(p, vcpus=96)
         ext = rb.get("extension") or {}
         n_ext = int(ext.get("n") or 0)
-        ok(q.get("refit_b") is True and q["calibration_runs"] == 0 and q["design_points"] == n_ext
+        # Codex review of #285: the monitored arm (mul_pbo) runs with Muleba, so the plan counts it
+        ok(q.get("refit_b") is True and "mul_pbo" in q["arms"] and len(q["arms"]) == 12
+           and q["calibration_runs"] == 0 and q["design_points"] == n_ext
            and q["wave1_points_run"] == 1 and q["arm_runs"] < 30000,
            f"FB4 refit b prices only new tasks: wave 1's re-chosen point, {n_ext} extension points, the chosen point "
            f"and {VERIFY} sample points ({q['arm_runs']} arm runs, {q['wall_hours']} h, ${q['usd_real']})")
