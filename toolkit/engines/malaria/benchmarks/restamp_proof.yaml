@@ -1,22 +1,7 @@
 producer: toolkit/engines/malaria/benchmarks/restamp_proof.py
 old:
-  ref: 7d8b7d4
-  commit: 7d8b7d4499dd4a335f8d0a324aeca1ab77bcf511
-  identity:
-    code_sha256: 71ae9f59544b6828f09f5912800237f8710ede9fdded78d1810b614070bc8d09
-    config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
-    name: malaria-starsim
-    params_sha256: 904e10d90448de5a9ece0c3a833cd667d1e0ed133527190c29c8b9adfcba2173
-    version: '0.16'
-  engine_version: '0.16'
-  environment:
-    machine: arm64
-    numpy: 2.4.4
-    platform: macOS-27.0.1-arm64-arm-64bit-Mach-O
-    python: 3.14.3
-    starsim: 3.3.2
-new:
-  commit_of_tree_base: 58009c8541f4bc0c9763ab1a0e035ad5f51bdaaf
+  ref: ad514a4
+  commit: ad514a48de09dc5b48492d601f9d6a1206a247f7
   identity:
     code_sha256: a1d13a378ef15c780c77c9b591700a3fb9b46c29939b897cca5b513a500f16ff
     config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
@@ -25,13 +10,28 @@ new:
     version: '0.17'
   engine_version: '0.17'
   environment:
-    machine: arm64
+    machine: x86_64
     numpy: 2.4.4
-    platform: macOS-27.0.1-arm64-arm-64bit-Mach-O
+    platform: Linux-7.0.0-1017-azure-x86_64-with-glibc2.41
     python: 3.14.3
-    starsim: 3.3.2
+    starsim: 3.3.4
+new:
+  commit_of_tree_base: f7bd9f5ebfe8e64ef96adfa83358d810badea003
+  identity:
+    code_sha256: 54d96482eedbb0ec7f7b8951525a6ded8e139ef1ec69a3e16b35c8288d5c5e47
+    config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
+    name: malaria-starsim
+    params_sha256: d8ac214bf9321ed7aec17a260b926edeb48a73180e55372b312d6fc8c5d9d54a
+    version: '0.18'
+  engine_version: '0.18'
+  environment:
+    machine: x86_64
+    numpy: 2.4.4
+    platform: Linux-7.0.0-1017-azure-x86_64-with-glibc2.41
+    python: 3.14.3
+    starsim: 3.3.4
 execution:
-  run_id: local-v017-4
+  run_id: f6-oa2-restamp
 scope:
   pack_settings:
   - benin
@@ -45,6 +45,7 @@ scope:
   - eir_30
   - eir_300
   - irs_added
+  - llineup
   - misungwi
   - muleba
   - sahel_smc
@@ -102,99 +103,103 @@ scope:
 cases:
   equilibration:28.0:doubled:seed1:
     equal: true
-    old_sha256: 2b5d90a767f83286eeafbb87b49a06d7971ce7b36f18446051d435177a113307
-    new_sha256: 2b5d90a767f83286eeafbb87b49a06d7971ce7b36f18446051d435177a113307
+    old_sha256: 583e8f34da3bdb7207d9b52cca0a0c09085125f31897edeaf5bc256c6cc0e444
+    new_sha256: 583e8f34da3bdb7207d9b52cca0a0c09085125f31897edeaf5bc256c6cc0e444
   equilibration:3.5:base:seed1:
     equal: true
-    old_sha256: 0dc727a06d158c9663fb6bbecdbe6db7880a1baab74a991ef171995bf50cc3f1
-    new_sha256: 0dc727a06d158c9663fb6bbecdbe6db7880a1baab74a991ef171995bf50cc3f1
+    old_sha256: 6e78c0cca2321cbc43d25cbcd79010e8005d5e79e84bcbe1781b9aa9e65731be
+    new_sha256: 6e78c0cca2321cbc43d25cbcd79010e8005d5e79e84bcbe1781b9aa9e65731be
   equilibration:9.0:guess_hi:seed2:
     equal: true
-    old_sha256: 5ead0b325f596d1c3fa0c9075d7ba3cc1b458660ef7e84d98585b7351dd21f44
-    new_sha256: 5ead0b325f596d1c3fa0c9075d7ba3cc1b458660ef7e84d98585b7351dd21f44
+    old_sha256: 73e21ba70c380f163c5afa4aba7b72c8cbbde9212f4628793e23d5557a5d6fb6
+    new_sha256: 73e21ba70c380f163c5afa4aba7b72c8cbbde9212f4628793e23d5557a5d6fb6
   guess_sensitivity:28.0:x0.25:seed2:
     equal: true
-    old_sha256: 09aed07f6a17abbcfdb64c80f8c47b85dfc0e4f22d7b180c90e84c68694f5a08
-    new_sha256: 09aed07f6a17abbcfdb64c80f8c47b85dfc0e4f22d7b180c90e84c68694f5a08
+    old_sha256: 753f95734a9bad829ab45e63788993fd10992bd91bed6edba0ff02f633e11d66
+    new_sha256: 753f95734a9bad829ab45e63788993fd10992bd91bed6edba0ff02f633e11d66
   guess_sensitivity:3.5:x1:seed1:
     equal: true
-    old_sha256: f2fae059f173ddd4a1f9911878a6498345e5be6ef64ceb09036dc5e08c4455a0
-    new_sha256: f2fae059f173ddd4a1f9911878a6498345e5be6ef64ceb09036dc5e08c4455a0
+    old_sha256: 60223c29c3931e10daaad84067ae06e290e255944429898ba337b5ca6aa26c89
+    new_sha256: 60223c29c3931e10daaad84067ae06e290e255944429898ba337b5ca6aa26c89
   pack:benin:11:
     equal: true
-    old_sha256: 89bcdeba3b0bf4ed6f566b8ca91a415c4fc9584b4e89db24421d765a357dc425
-    new_sha256: 89bcdeba3b0bf4ed6f566b8ca91a415c4fc9584b4e89db24421d765a357dc425
+    old_sha256: 014b7101419418426a7b792abe52664f4b8b65bc26bcc6c4e90a87cd223c9a49
+    new_sha256: 014b7101419418426a7b792abe52664f4b8b65bc26bcc6c4e90a87cd223c9a49
   pack:ce_ref:11:
     equal: true
-    old_sha256: 7de2976af6991e224ccb1361ef2e58c064d7f9c17c3c7d89ef318cc41044d3e7
-    new_sha256: 7de2976af6991e224ccb1361ef2e58c064d7f9c17c3c7d89ef318cc41044d3e7
+    old_sha256: 8cddc013f9e8bc007b0dcc2f2ed4c4b2c67442c656410c71a5582d4999745f3a
+    new_sha256: 8cddc013f9e8bc007b0dcc2f2ed4c4b2c67442c656410c71a5582d4999745f3a
   pack:ce_res:11:
     equal: true
-    old_sha256: 7ceb7f2dd52226a57cd4fd568431adf5cdc870ac0718e28f79a8f18909f2f521
-    new_sha256: 7ceb7f2dd52226a57cd4fd568431adf5cdc870ac0718e28f79a8f18909f2f521
+    old_sha256: 8748d8fd5dd26e7cbcf077cafafb69df82f18181982414ed1ea4364f4c47f5a5
+    new_sha256: 8748d8fd5dd26e7cbcf077cafafb69df82f18181982414ed1ea4364f4c47f5a5
   pack:cochrane_itn:11:
     equal: true
-    old_sha256: 8e0d5be143ccc5cee0a9341aefd3cf5197a78027bf2bbfb6fdee644bd7c68fe3
-    new_sha256: 8e0d5be143ccc5cee0a9341aefd3cf5197a78027bf2bbfb6fdee644bd7c68fe3
+    old_sha256: 9a45f578cbfcfd661bcba5a5379e8773ac1af9c9200f5718e6521cb3280349e2
+    new_sha256: 9a45f578cbfcfd661bcba5a5379e8773ac1af9c9200f5718e6521cb3280349e2
   pack:eir_100:11:
     equal: true
-    old_sha256: 3e03c683af400f79ae9a9e56197abed9fce27fbc5ceb10934ab64847140e34da
-    new_sha256: 3e03c683af400f79ae9a9e56197abed9fce27fbc5ceb10934ab64847140e34da
+    old_sha256: 145148f6aaa3657bd0076ba74fc8894bcd4e3b84a9c8b0fe9f770a74efe0640a
+    new_sha256: 145148f6aaa3657bd0076ba74fc8894bcd4e3b84a9c8b0fe9f770a74efe0640a
   pack:eir_10:11:
     equal: true
-    old_sha256: a46e468be13b1ac133d04b8ceeae8565b71c71bed4c3f4229a7097af8c96078f
-    new_sha256: a46e468be13b1ac133d04b8ceeae8565b71c71bed4c3f4229a7097af8c96078f
+    old_sha256: 62d7c8930b63bb3370fba2fdd7ba47868cd7606a1db560249e24b494db639f71
+    new_sha256: 62d7c8930b63bb3370fba2fdd7ba47868cd7606a1db560249e24b494db639f71
   pack:eir_1:11:
     equal: true
-    old_sha256: dd08869cbdc1daedef2de257cc8558bf91fa3eb50a2024d19b047cb0f0a1abfa
-    new_sha256: dd08869cbdc1daedef2de257cc8558bf91fa3eb50a2024d19b047cb0f0a1abfa
+    old_sha256: fff08d33fe3fdf070ec2f75a2c7b02abd66fe2aeeac12befcc72774fbfb041ad
+    new_sha256: fff08d33fe3fdf070ec2f75a2c7b02abd66fe2aeeac12befcc72774fbfb041ad
   pack:eir_300:11:
     equal: true
-    old_sha256: cf439ca6c951a63a8faa6b045907dd19d39229368dbe00c79edd31ef37273069
-    new_sha256: cf439ca6c951a63a8faa6b045907dd19d39229368dbe00c79edd31ef37273069
+    old_sha256: a5876e7527b14f1929146399f091805a479ec70d8af03823e46572b9a7ae2531
+    new_sha256: a5876e7527b14f1929146399f091805a479ec70d8af03823e46572b9a7ae2531
   pack:eir_30:11:
     equal: true
-    old_sha256: f2df66e6a59011d27cc8d7bc284b49ef6dc2eaaee7f369c2bd2bc3644b9b2fdf
-    new_sha256: f2df66e6a59011d27cc8d7bc284b49ef6dc2eaaee7f369c2bd2bc3644b9b2fdf
+    old_sha256: 2c0525ca61f57f4c62432294bd3e577eaf17f418785692229a0657e9907309de
+    new_sha256: 2c0525ca61f57f4c62432294bd3e577eaf17f418785692229a0657e9907309de
   pack:eir_3:11:
     equal: true
-    old_sha256: f66d538c34bedf9039a663d8dd68d0bf66a28177175f8f26fb51e2ccb634f524
-    new_sha256: f66d538c34bedf9039a663d8dd68d0bf66a28177175f8f26fb51e2ccb634f524
+    old_sha256: 1c066a1475c3a341ad479859f6a1f8faf637ff6541f34be3f9bc16c7c89cea1c
+    new_sha256: 1c066a1475c3a341ad479859f6a1f8faf637ff6541f34be3f9bc16c7c89cea1c
   pack:irs_added:11:
     equal: true
-    old_sha256: 61f832084b50b73d0dc22f35e10f72a2fc7539285c5caf2513b07f5f9e1a4aa1
-    new_sha256: 61f832084b50b73d0dc22f35e10f72a2fc7539285c5caf2513b07f5f9e1a4aa1
+    old_sha256: 3a822e6218a2b3d845bb19345676f3b9dd1b9c067f8892db26e7be6467d7775b
+    new_sha256: 3a822e6218a2b3d845bb19345676f3b9dd1b9c067f8892db26e7be6467d7775b
+  pack:llineup:11:
+    equal: true
+    old_sha256: dc9265a65def965e5893a8ea56830d0061d162ea71ca930e9463da3a4400581f
+    new_sha256: dc9265a65def965e5893a8ea56830d0061d162ea71ca930e9463da3a4400581f
   pack:misungwi:11:
     equal: true
-    old_sha256: 8810a36b5520f52f3d1dfa7ba076d4c37e9b0313cbcecf09eaa30518adfdeb1b
-    new_sha256: 8810a36b5520f52f3d1dfa7ba076d4c37e9b0313cbcecf09eaa30518adfdeb1b
+    old_sha256: d1e4cfff96b32a754133f5d205abd362b0e28a77bd1e75ac5ba372a351a5d865
+    new_sha256: d1e4cfff96b32a754133f5d205abd362b0e28a77bd1e75ac5ba372a351a5d865
   pack:muleba:11:
     equal: true
-    old_sha256: 0cca630d144276b1f7d29feccf204cb4f9ad422b810ae0aa9dbc4cf65ccfecbe
-    new_sha256: 0cca630d144276b1f7d29feccf204cb4f9ad422b810ae0aa9dbc4cf65ccfecbe
+    old_sha256: d8473d3c9750f44d4174c35f001f266e37c03e4f84f9c7185df068a8f0975888
+    new_sha256: d8473d3c9750f44d4174c35f001f266e37c03e4f84f9c7185df068a8f0975888
   pack:sahel_smc:11:
     equal: true
-    old_sha256: 6a3929d4256674325c1d7ef54cc9095177e67c6dc21ba5efa188b39b32829f9d
-    new_sha256: 6a3929d4256674325c1d7ef54cc9095177e67c6dc21ba5efa188b39b32829f9d
+    old_sha256: 1543e21bad6ec9ce8f32e64250aac266c3b64756355380c6bfc8fae7fe6a8204
+    new_sha256: 1543e21bad6ec9ce8f32e64250aac266c3b64756355380c6bfc8fae7fe6a8204
   scenario:boundaries:seed22:
     equal: true
-    old_sha256: fb538255b25d2120ef8501b384b2b3657a3fb6206178fda46caa1012bb3d68de
-    new_sha256: fb538255b25d2120ef8501b384b2b3657a3fb6206178fda46caa1012bb3d68de
+    old_sha256: c1c7b4fcea7b945f34c4d8a3004c57628e158b213d32ee09a5f0fa9adccf19ac
+    new_sha256: c1c7b4fcea7b945f34c4d8a3004c57628e158b213d32ee09a5f0fa9adccf19ac
   scenario:empty_history_v010:seed24:
     equal: true
-    old_sha256: 89e9661392befe9fd052e26bdc65f1db62bce5ae6009d7b552f05d51edf3fdca
-    new_sha256: 89e9661392befe9fd052e26bdc65f1db62bce5ae6009d7b552f05d51edf3fdca
+    old_sha256: effab90754187cf4eb53d8f6b2121997fba6f8e7faaf1c47b1c4816189ec5209
+    new_sha256: effab90754187cf4eb53d8f6b2121997fba6f8e7faaf1c47b1c4816189ec5209
   scenario:gc7_delivery_routine:seed21:
     equal: true
-    old_sha256: dca32f99ed161e6178b6e1519e319ea8d527c8c579c7c259c777d9f7a85f8dbc
-    new_sha256: dca32f99ed161e6178b6e1519e319ea8d527c8c579c7c259c777d9f7a85f8dbc
+    old_sha256: 593e5c8cf5846a8a142bd92e358475712fa25972b52fc29dd9f33c536b8a9051
+    new_sha256: 593e5c8cf5846a8a142bd92e358475712fa25972b52fc29dd9f33c536b8a9051
   scenario:heterogeneous:seed23:
     equal: true
-    old_sha256: 2b269616dfc0e18bdbd574b55ac20087b7b67d0263ced5e35f6e7eed3aee7909
-    new_sha256: 2b269616dfc0e18bdbd574b55ac20087b7b67d0263ced5e35f6e7eed3aee7909
+    old_sha256: 8902ced3261cc6e5f2402cde1f6cb7f4f12c22cfef0cc61c2bba4f1f66597c8e
+    new_sha256: 8902ced3261cc6e5f2402cde1f6cb7f4f12c22cfef0cc61c2bba4f1f66597c8e
   scenario:past_smc_v013:seed25:
     equal: true
-    old_sha256: 838b2f2376dd87cbc5a4d5a3b8e52206c040dab5c171a495f9d51b1d02874d21
-    new_sha256: 838b2f2376dd87cbc5a4d5a3b8e52206c040dab5c171a495f9d51b1d02874d21
-n_cases: 24
+    old_sha256: d364c1f766953eed1d7871a6bb514d4816c0428778bb42c92dd315e77d66591e
+    new_sha256: d364c1f766953eed1d7871a6bb514d4816c0428778bb42c92dd315e77d66591e
+n_cases: 25
 identical: true
