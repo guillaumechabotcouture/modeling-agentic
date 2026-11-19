@@ -1,6 +1,6 @@
 "use strict";
-// The review workbench page. It draws whatever a view returns ({checks, facts, tables, charts, notes}) and has no
-// code for any one view. Text that comes from a run is only ever set as text, never parsed as markup.
+// The review workbench page. It draws whatever a view returns ({checks, facts, tables, charts, notes} and, when the
+// view has any, images) and has no code for any one view. Text that comes from a run is only ever set as text, never parsed as markup.
 
 const SVG = "http://www.w3.org/2000/svg";
 function make(ns, tag, props, kids) {
@@ -74,9 +74,9 @@ function tip(node, pairs) {
 // Codes the specification defines (a scorecard case, a gap, a goal, a few terms). Their meanings come from the server
 // (/api/glossary, read from the specification's own tables); none is written here. A code is recognised only with
 // its kind in front of it ("goal G2"), so a run's own name that looks like a code ("group G2") is left alone.
-const GLOSS = {entries: [], source: "", why: null, re: null, by: new Map(), used: new Set()};
+const GLOSS = {entries: [], source: "", why: null, re: null, by: new Map(), used: new Set(), kinds: {}};
 function setGlossary(g) {
-  Object.assign(GLOSS, {entries: (g && g.entries) || [], source: (g && g.source) || "", why: (g && g.why) || null, re: null});
+  Object.assign(GLOSS, {entries: (g && g.entries) || [], source: (g && g.source) || "", why: (g && g.why) || null, re: null, kinds: (g && g.kinds) || {}});
   GLOSS.by.clear(); GLOSS.used.clear();
   for (const e of GLOSS.entries) GLOSS.by.set((e.kind === "term" ? e.code : `${e.kind} ${e.code}`).toLowerCase(), e);
   const alts = [...GLOSS.by.keys()].sort((a, b) => b.length - a.length).map(k => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
@@ -91,7 +91,7 @@ function gloss(text) {
   for (const m of text.matchAll(GLOSS.re)) {
     const e = GLOSS.by.get(m[1].toLowerCase());
     GLOSS.used.add(e);
-    out.push(text.slice(last, m.index), el("abbr", {class: "term", title: `${e.meaning} (${e.section})`, text: m[0]}));
+    out.push(text.slice(last, m.index), el("abbr", {class: "term", title: `${GLOSS.kinds[e.kind] ? GLOSS.kinds[e.kind] + " " : ""}${e.meaning} (${e.section})`, text: m[0]}));
     last = m.index + m[0].length;
   }
   out.push(text.slice(last));
@@ -103,8 +103,12 @@ function glossaryFoot() {
     text: `The meanings of the codes on this page are not available (${GLOSS.why}), so each code is shown as it is.`})) : null;
   const used = GLOSS.entries.filter(e => GLOSS.used.has(e));
   if (!used.length) return null;
+  // What each kind of code is, in a sentence, so the entries read without the document they are defined in.
+  const kinds = [...new Set(used.map(e => e.kind))].map(k => GLOSS.kinds[k]).filter(Boolean);
   return el("section", {class: "glossary"}, el("h2", {text: "Glossary"}),
-    el("p", {class: "about", text: `The codes and terms this page uses, as ${GLOSS.source} defines them. Pointing at a dotted word shows the same text.`}),
+    el("p", {class: "about", text: "The codes and terms this page uses, each with its meaning in full. Pointing at a dotted word shows the same text. "
+      + `They are defined in ${GLOSS.source}, in the part named after each entry; nothing here needs that document to be read.`}),
+    kinds.map(k => el("p", {class: "about", text: k})),
     el("dl", {class: "terms"}, used.map(e => el("div", null, el("dt", {text: e.kind === "term" ? e.code : `${e.kind} ${e.code}`}),
       el("dd", {text: `${e.meaning} (${e.section})`})))));
 }
@@ -296,17 +300,21 @@ const DRAW = {
       rows = groups.flatMap(gname => [{header: `${label(c.names.group)}: ${fmt(gname)}`}, ...rows.filter(r => r[c.group] === gname)]);
     }
     const num = v => typeof v === "number" && (!c.log || v > 0);
-    const chart = rowChart(t, rows, c, 30, (r, y) => [
-      has("low") && num(r[c.low]) && num(r[c.high]) ? sv("line", {class: "c1 whisker", x1: f(r[c.low]), x2: f(r[c.high]), y1: y, y2: y}) : null,
-      has("model_alt") && num(r[c.model_alt]) ? diamond(f(r[c.model_alt]), y, 5, "c2 hollow") : null,
-      has("model") && num(r[c.model]) ? diamond(f(r[c.model]), y, 5, "c2") : null,
-      num(r[c.y]) ? sv("circle", {class: "c1", cx: f(r[c.y]), cy: y, r: 4}) : null],
-      (a, b, y0, y1) => (f = scale(ext[0], ext[1], a, b, c.log), axisX(f, ext, y0, y1, c.log, word(c, "y"), marks(c))));
+    let apart = 0;      // rows where the two marks would cover each other: the observed is drawn above the line, the model's below
+    const chart = rowChart(t, rows, c, 30, (r, y) => {
+      const close = has("model") && num(r[c.model]) && num(r[c.y]) && Math.abs(f(r[c.model]) - f(r[c.y])) < 9, d = close ? 4 : 0;
+      apart += close ? 1 : 0;
+      return [has("low") && num(r[c.low]) && num(r[c.high]) ? sv("line", {class: "c1 whisker", x1: f(r[c.low]), x2: f(r[c.high]), y1: y, y2: y}) : null,
+        has("model_alt") && num(r[c.model_alt]) ? diamond(f(r[c.model_alt]), y, 5, "c2 hollow") : null,
+        num(r[c.y]) ? sv("circle", {class: "c1", cx: f(r[c.y]), cy: y - d, r: 4}) : null,
+        has("model") && num(r[c.model]) ? diamond(f(r[c.model]), y + d, 5, "c2") : null];
+    }, (a, b, y0, y1) => (f = scale(ext[0], ext[1], a, b, c.log), axisX(f, ext, y0, y1, c.log, word(c, "y"), marks(c))));
     return [key([[swatch(has("low") ? sv("line", {class: "c1 whisker", x1: 1, x2: 21, y1: 6, y2: 6}) : null, sv("circle", {class: "c1", cx: 11, cy: 6, r: 4})),
       word(c, "y") + (has("low") ? `, with its interval (${label(c.names.low)} to ${label(c.names.high)})` : "")],
       has("model") ? [swatch(diamond(11, 6, 5, "c2")), word(c, "model")] : null,
       has("model_alt") ? [swatch(diamond(11, 6, 5, "c2 hollow")), word(c, "model_alt")] : null].filter(Boolean)), chart,
-      all.length > cap ? el("p", {class: "about small", text: `The first ${cap} of ${all.length} rows are drawn; the table below holds them all.`}) : null];
+      apart ? el("p", {class: "about small", text: `In ${apart} row${apart === 1 ? "" : "s"} the two marks would cover each other: there the ${word(c, "y")} is drawn just above the line and the ${word(c, "model")} just below it, at their true places along the axis.`}) : null,
+      all.length > cap ? el("p", {class: "about small", text: `The first ${cap} of ${all.length} rows are drawn; the table holds them all.`}) : null];
   },
   ranges(t, c) {
     const ok = r => [c.outer_low, c.outer_high, c.low, c.high].every(i => typeof r[i] === "number") && r[c.outer_high] > r[c.outer_low];
@@ -314,16 +322,21 @@ const DRAW = {
     if (!rows.length) return null;
     // A wide range that spans a factor of 100 or more above zero is drawn on a log scale, and its row says so.
     const isLog = r => r[c.outer_low] > 0 && r[c.outer_high] / r[c.outer_low] >= 100;
+    // A row's scale runs over its wide range and over anything of the row that lies beyond it, so a value outside the
+    // wide range is drawn where it is, past the end of the track, and the row says so.
     const chart = rowChart(t, rows, c, 345, (r, y, a, b) => {
-      const lg = isLog(r), g = scale(r[c.outer_low], r[c.outer_high], a, b, lg);
-      const f = v => Math.max(a, Math.min(b, g(lg ? Math.max(v, r[c.outer_low]) : v))), x1 = f(r[c.low]), x2 = f(r[c.high]);
-      return [sv("rect", {class: "track", x: a, y: y - 3, width: b - a, height: 6, rx: 3}),
+      const lg = isLog(r), shown = [r[c.low], r[c.high], c.y != null ? r[c.y] : null].filter(v => typeof v === "number" && (!lg || v > 0));
+      const lo = Math.min(r[c.outer_low], ...shown), hi = Math.max(r[c.outer_high], ...shown), g = scale(lo, hi, a, b, lg);
+      const f = v => Math.max(a, Math.min(b, g(lg ? Math.max(v, lo) : v))), x1 = f(r[c.low]), x2 = f(r[c.high]), beyond = lo < r[c.outer_low] || hi > r[c.outer_high];
+      return [sv("rect", {class: "track", x: f(r[c.outer_low]), y: y - 3, width: Math.max(2, f(r[c.outer_high]) - f(r[c.outer_low])), height: 6, rx: 3}),
         sv("rect", {class: "c1", x: Math.min(x1, x2), y: y - 6, width: Math.max(2, Math.abs(x2 - x1)), height: 12, rx: 3}),
+        // where a row reaches beyond its wide range, the two ends of that range are marked over the bar that would hide them
+        ...(beyond ? [r[c.outer_low], r[c.outer_high]].map(v => sv("line", {class: "rangeend", x1: f(v), x2: f(v), y1: y - 9, y2: y + 9})) : []),
         c.y != null && typeof r[c.y] === "number" ? diamond(f(r[c.y]), y, 5, "c2") : null,
-        sv("text", {x: b + 8, y: y + 4, text: `${fmt(r[c.low])} to ${fmt(r[c.high])} within ${fmt(r[c.outer_low])} to ${fmt(r[c.outer_high])}` + (lg ? ", log scale" : "")})];
+        sv("text", {x: b + 8, y: y + 4, text: `${fmt(r[c.low])} to ${fmt(r[c.high])} ${beyond ? "reaches beyond" : "within"} ${fmt(r[c.outer_low])} to ${fmt(r[c.outer_high])}` + (lg ? ", log scale" : "")})];
     });
     const span = (k1, k2) => (c.decl.labels && c.decl.labels[c.names[k1]]) || `${label(c.names[k1])} to ${label(c.names[k2])}`;
-    return [key([[swatch(sv("rect", {class: "track", x: 1, y: 3, width: 20, height: 6, rx: 3})), `${span("outer_low", "outer_high")} (each row on its own scale)`],
+    return [key([[swatch(sv("rect", {class: "track", x: 1, y: 3, width: 20, height: 6, rx: 3})), `${span("outer_low", "outer_high")} (each row on its own scale; what lies beyond it is drawn past its end, which a short upright line marks)`],
       [swatch(sv("rect", {class: "c1", x: 1, y: 1, width: 20, height: 10, rx: 3})), span("low", "high")],
       c.y != null ? [swatch(diamond(11, 6, 5, "c2")), word(c, "y")] : null].filter(Boolean)), chart];
   },
@@ -404,9 +417,96 @@ const DRAW = {
     return [key(words.map(w => [mark(w), (MARKS[w] || [])[3] || ""])), g,
       el("p", {class: "about small", text: "A box shows the last part of a file's path; point at it for the full path and to pick out its links."})];
   }};
+// ------------------------------------------------------------------------------------------------ images
+// A view may declare `images` over one of its tables, and a chart may carry `image` (the keys are in workbench.py's
+// docstring). An image is a file of the run, asked of the server by the path and the hash the view named; the server
+// sends it only when the file still has that hash.
+const fileUrl = (run, path, sha) => `/api/file?run=${encodeURIComponent(run)}&path=${encodeURIComponent(path)}&sha=${encodeURIComponent(sha)}`;
+// Where the fault lies when the server refuses an image, by its answer (the statuses are in workbench.py's docstring).
+const FAULT = {409: "The fault is with the run's file: it changed after this page read it. Read the files again to see it as it is now.",
+  404: "The fault is with the run's file: it is no longer in the run folder.", 415: "The fault is with the run's file: it is not an image of the kind its name says.",
+  413: "The fault is with the run's file: it is too large to show.", 403: "The fault is with this page: it asked for a file the server has not named for this run, so the page is out of date. Read the files again.",
+  400: "The fault is with this page: its request was incomplete.", 503: "The fault is with the server: it is busy sending other images. Read the files again in a moment.",
+  500: "The fault is with the server: it failed on this request."};
+const noImage = why => el("p", {class: "noimage", role: "status", text: `This image cannot be shown: ${why}`});
+// One image at a readable size; a click (or Enter) shows it at the full width of the page, and another puts it back.
+// An image that does not load is replaced by a sentence with the server's reason, never left as a broken picture.
+function imageBox(run, path, sha, title) {
+  if (run == null || !path || !sha) return noImage(!path ? "the view names no file for it." : !sha ? `the view names no hash for ${path}.` : "the page does not know which run it belongs to.");
+  const url = fileUrl(run, path, sha), box = el("div", {class: "shot"}), wide = () => box.classList.toggle("full");
+  box.append(el("img", {src: url, alt: title || path, title: "Click to see it at full width, and again to put it back", tabindex: 0, on: {
+    click: wide, keydown: e => { if (e.key === "Enter") wide(); },
+    error: () => {
+      const says = noImage(`${path} could not be loaded.`);
+      box.replaceChildren(says);
+      fetch(url).then(r => (r.ok ? null : r.text().then(why => { says.textContent = `This image cannot be shown: ${path} was ${why}. ${FAULT[r.status] || ""}`.trim(); })))
+        .catch(() => { says.textContent = `This image cannot be shown: ${path} could not be loaded. The fault is with the server: it is not answering (it may have been stopped).`; });
+    }}}));
+  return box;
+}
+// A caption without the part that only repeats the title: nothing when it says no more, the rest when it begins with it.
+function captionBeyond(title, caption) {
+  const flat = x => String(x || "").trim().replace(/[.;:,\s]+$/, "").toLowerCase(), t = flat(title), c = String(caption || "").trim();
+  if (!t || !c.toLowerCase().startsWith(t)) return c;
+  const rest = c.slice(t.length).replace(/^[.;:,\s]+/, "");
+  return rest ? rest[0].toUpperCase() + rest.slice(1) : "";
+}
+// d: {table, path, hash, title, caption, group, details, flag, reason, after}. `flag`: a column holding a status or state word; a row whose word is
+// not an ok one is first in its group, and a button at the top goes to it. `reason`: a column saying why a row has no image; such a row is a
+// card with that sentence. One figure per row of the table, gathered under each value of
+// the group column; above each image the detail columns with their names, under it its caption. A detail that is a status or state word is
+// shown with its mark, and one in a column named view that is a view's id links to that view.
+function imagesView(d, tables, run) {
+  const t = tables[d.table], cannot = why => [el("p", {class: "muted", text: `These images cannot be shown: ${why}.`})];
+  if (!t || !Array.isArray(t.columns) || !Array.isArray(t.rows)) return cannot(`the view has no table "${d.table}"`);
+  const at = k => (d[k] == null ? -1 : t.columns.indexOf(d[k])), text = (r, k) => (at(k) >= 0 && typeof r[at(k)] === "string" ? r[at(k)] : "");
+  if (at("path") < 0 || at("hash") < 0) return cannot(`table "${d.table}" has no column for an image's path or for its hash`);
+  if (!t.rows.length) return [el("p", {class: "muted", text: "No image."})];
+  const details = (Array.isArray(d.details) ? d.details : []).filter(c => t.columns.includes(c));
+  const value = (c, v) => {
+    const seen = c === "view" && state.runs && (state.runs.views || []).find(x => x.id === v);
+    return MARKS[v] ? mark(v) : seen ? el("a", {href: link(run, v), text: seen.label}) : gloss(fmt(v, c, true));
+  };
+  const raised = r => { const w = at("flag") >= 0 ? r[at("flag")] : null; return MARKS[w] && MARKS[w][2] !== "ok" ? w : null; };
+  const name = r => text(r, "title") || text(r, "path") || (r[0] != null ? fmt(r[0]) : "No title");
+  const cards = new Map();
+  const one = r => {
+    const none = !text(r, "path") && !text(r, "hash") && text(r, "reason"), beyond = captionBeyond(text(r, "title"), text(r, "caption"));
+    const card = el("figure", {class: `image${none ? " absent" : ""}${raised(r) ? " raised" : ""}`},
+    el("figcaption", {text: name(r)}),
+    text(r, "title") && text(r, "path") ? el("p", {class: "read mono", text: text(r, "path")}) : null,
+    details.some(c => r[t.columns.indexOf(c)] != null) ? el("dl", {class: "under"}, details.filter(c => r[t.columns.indexOf(c)] != null)      // a detail the run does not record is left out
+      .map(c => el("div", null, el("dt", {text: label(c, true)}), el("dd", null, value(c, r[t.columns.indexOf(c)]))))) : null,
+    none ? el("p", {class: "noimage", role: "status", text: `No image: ${text(r, "reason")}`}) : imageBox(run, text(r, "path"), text(r, "hash"), text(r, "title")),
+    beyond ? el("p", {class: "caption"}, gloss(beyond)) : null);
+    cards.set(r, card);
+    return card;
+  };
+  const first = rows => [...rows.filter(raised), ...rows.filter(r => !raised(r))];      // what needs a look comes first
+  const flagged = t.rows.filter(raised);
+  const alert = flagged.length ? el("div", {class: "tools raisedlist"}, `${flagged.length} image${flagged.length === 1 ? "" : "s"} here ${flagged.length === 1 ? "needs" : "need"} a look; go to: `,
+    flagged.map(r => el("button", {text: `${name(r)} (${MARKS[raised(r)][1]})`, on: {click: () => cards.get(r) && cards.get(r).scrollIntoView({block: "start"})}}))) : null;
+  if (at("group") < 0) return [alert, ...first(t.rows).map(one)];
+  const groups = [...new Set(t.rows.map(r => r[at("group")]))].map(g => {
+    const rows = first(t.rows.filter(r => r[at("group")] === g)), shown = rows.filter(r => text(r, "path")).length;
+    const words = `${label(fmt(g))} (${shown} image${shown === 1 ? "" : "s"}${shown < rows.length ? `, ${rows.length - shown} not drawn` : ""})`;
+    return {words, head: el("h3", {text: `${label(d.group)}: ${words}`}), rows};
+  });
+  // a long page of images: one button per group goes to where that group starts
+  const jump = groups.length > 1 ? el("div", {class: "tools"}, `Go to ${label(d.group)}: `, groups.map(g => el("button", {text: g.words, on: {click: () => g.head.scrollIntoView({block: "start"})}}))) : null;
+  return [alert, jump, ...groups.flatMap(g => [g.head, ...g.rows.map(one)])];
+}
+
 const COLUMN_KEYS = ["x", "y", "low", "high", "group", "model", "model_alt", "outer_low", "outer_high", "panels"];
 const PANEL_ROWS = 80;      // panels holding more rows than this together are shown one at a time
-function chartView(decl, tables) {
+// A chart, and under it the harness figure of the same data when the declaration carries one (decl.image).
+function chartView(decl, tables, run, where) {
+  const fig = chartDrawn(decl, tables, where), im = decl.image;
+  if (im && typeof im === "object") fig.append(el("p", {class: "about small", text: `The harness figure of the same data${im.title ? `: ${im.title}` : ""} (${im.path || "no file named"}).`}),
+    imageBox(run, im.path, im.hash, im.title), captionBeyond(im.title, im.caption) ? el("p", {class: "caption"}, gloss(captionBeyond(im.title, im.caption))) : null);
+  return fig;
+}
+function chartDrawn(decl, tables, where) {
   const fig = el("figure", null, el("figcaption", {text: decl.title || `${decl.kind} of ${decl.table}`}),
     el("p", {class: "about"}, gloss(decl.how_to_read || "This chart does not say how to read it.")));
   const cannot = why => (fig.append(el("p", {class: "muted", text: `This chart cannot be drawn: ${why}.`})), fig);
@@ -425,7 +525,7 @@ function chartView(decl, tables) {
   for (const [col] of only) if (!t.columns.includes(col)) return cannot(`table "${decl.table}" has no column "${col}"`);
   if (only.length) t = {...t, rows: t.rows.filter(r => only.every(([col, v]) => r[t.columns.indexOf(col)] === v))};
   const said = only.length ? `, rows with ${only.map(([col, v]) => `${label(col)} ${fmt(v)}`).join(" and ")}` : "";
-  const from = el("p", {class: "about small", text: `Drawn from the table "${label(decl.table)}" below${said}. Point at a mark to see its row.`});
+  const from = el("p", {class: "about small", text: `Drawn from the table "${label(decl.table)}" ${where || "below"}${said}. Point at a mark to see its row.`});
   if (c.panels == null) {
     const parts = DRAW[decl.kind](t, c, tables);
     if (!parts) return cannot(`table "${decl.table}" has no rows with numbers to plot`);
@@ -488,19 +588,36 @@ function renderView(data, run, here) {
     return el("div", {class: text.length > 44 ? "wide" : null}, el("dt", {text: label(k)}), el("dd", null, gloss(text)));
   })));
   const done = () => { state.over = null; state.keep = true; route(); };       // after a save: read the run's files again, stay in place
+  const lead = Object.entries(tables).filter(([, t]) => t && t.lead);       // what the reader came for: before the notes and charts
+  const none = Object.keys(tables).filter(k => tables[k] == null);      // present with the value null: not recorded
+  // A chart or an image block that names a table in `after` is drawn directly after that table. The tables are drawn
+  // in this order (the leading ones first), so a chart can say whether the table it reads is above or below it.
+  const drawnOrder = [...lead.map(([k]) => k), ...Object.keys(tables).filter(k => tables[k] != null && !tables[k].lead)];
+  const placed = d => (d && d.after != null && tables[d.after] != null ? d.after : null);
+  const side = d => { const own = drawnOrder.indexOf(d.table), by = placed(d) ? drawnOrder.indexOf(placed(d)) : (tables[d.table] || {}).lead ? drawnOrder.length : -1;
+    return own >= 0 && own <= by ? "above" : "below"; };
+  const charts = (data.charts || []).filter(d => d && typeof d === "object"), images = (Array.isArray(data.images) ? data.images : []).filter(d => d && typeof d === "object");
+  const after = name => [...charts.filter(d => placed(d) === name).map(d => chartView(d, tables, run, side(d))), ...images.filter(d => placed(d) === name).map(d => imagesView(d, tables, run))];
   const one = (name, t, head) => [el(head, {text: label(name).replace(/^./, ch => ch.toUpperCase())}), t.about ? el("p", {class: "about"}, gloss(t.about)) : null,
     Array.isArray(t.columns) && Array.isArray(t.rows) ? (t.rows.length || t.actions ? tableView(t, {run, done}) : el("p", {class: "muted", text: "No rows."}))
-      : el("p", {class: "muted", text: "Not available: this table has no columns and rows."})];
-  const lead = Object.entries(tables).filter(([, t]) => t && t.lead);       // what the reader came for: before the notes and charts
+      : el("p", {class: "muted", text: "Not available: this table has no columns and rows."}), ...after(name)];
   for (const [name, t] of lead) out.push(...one(name, t, "h2"));
-  if (notes.length) out.push(el("h2", {text: "Notes"}), notes.map(([k, v]) => el("p", null, el("strong", {text: `${label(k).replace(/^./, ch => ch.toUpperCase())}. `}), gloss(fmt(v)))));
-  if ((data.charts || []).length) out.push(el("h2", {text: "Charts"}), data.charts.map(d => chartView(d, tables)));
+  const looseImages = images.filter(d => !placed(d)), looseCharts = charts.filter(d => !placed(d));
+  if (looseImages.length) out.push(el("h2", {text: "Images"}), el("p", {class: "about", text: "Each image is a file of the run as the harness wrote it, "
+    + "sent by this server only while the file has the hash this view read. Click an image to see it at the full width of the page."}),
+    looseImages.map(d => imagesView(d, tables, run)));
+  const said = notes.filter(([k]) => !none.includes(k));      // a note named after a table the run does not record is its reason, shown there
+  if (said.length) out.push(el("h2", {text: "Notes"}), said.map(([k, v]) => el("p", null, el("strong", {text: `${label(k).replace(/^./, ch => ch.toUpperCase())}. `}), gloss(fmt(v)))));
+  if (looseCharts.length) out.push(el("h2", {text: "Charts"}), looseCharts.map(d => chartView(d, tables, run, side(d))));
   if (Object.keys(tables).length > lead.length) out.push(el("h2", {text: "Tables"}),
     el("p", {class: "about", text: "Click a column name to sort. Units are in the column names."}));
-  const none = Object.keys(tables).filter(k => tables[k] == null);      // present with the value null: not recorded
-  for (const [name, t] of Object.entries(tables)) if (t != null && !t.lead) out.push(...one(name, t, "h3"));
+  const pictured = new Set(images.map(d => d.table));      // a table whose rows are drawn above as images is kept closed
+  for (const [name, t] of Object.entries(tables)) if (t != null && !t.lead) out.push(...(pictured.has(name) ? [el("details", null,
+    el("summary", {text: `Show the table "${label(name)}" behind the images above (${(t.rows || []).length} rows)`}), one(name, t, "h3"))] : one(name, t, "h3")));
   if (none.length) out.push(el("h3", {text: "Not recorded"}), el("p", {class: "muted",
-    text: `This run's files record nothing for ${none.length === 1 ? "this table" : "these tables"}: ${none.map(k => label(k)).join(", ")}. The notes above say why.`}));
+    text: `This run's files record nothing for ${none.length === 1 ? "this table" : "these tables"}. For each, the reason this view gives:`}),
+    el("ul", {class: "muted"}, none.map(k => el("li", null, el("strong", {text: `${label(k).replace(/^./, ch => ch.toUpperCase())}: `}),
+      gloss(data.notes && typeof data.notes[k] === "string" ? data.notes[k] : "this view gives no reason.")))));
   return out;
 }
 

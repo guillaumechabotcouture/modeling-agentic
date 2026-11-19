@@ -25,6 +25,17 @@ SOURCE = "docs/design/review-workbench.md"
 # (section number, what the page calls a code of that table, the form of a code in the table's first column)
 TABLES = (("7", "gap", r"H\d+"), ("8", "scorecard case", r"C\d+"), ("10", "goal", r"G\d+[a-z]?"))
 TERMS = ("workbench threshold", "near miss")
+# What each kind of code is, in one sentence, so that an entry can be read without the specification. The entries'
+# own meanings still come from the specification's tables; these say what the tables' columns are.
+KINDS = {
+    "scorecard case": "A scorecard case is one kind of problem a past run had, which the workbench must show at the earliest stage it can "
+                      "be seen. \"Earliest stage\" is that stage, \"Check\" the check that should raise it, and \"Now\" its score: 0 not "
+                      "visible in the page, 1 shown in the page, 2 found in the page by a fresh reader of a run with that defect planted.",
+    "gap": "A gap is something no run file records today, so the workbench cannot check it until the harness writes it. \"Missing\" "
+           "is what is not recorded and \"Needed by\" the scorecard cases or views that need it.",
+    "goal": "A goal is one stage of building the workbench itself. \"Slice\" is what the stage builds and \"Done when\" what must "
+            "hold for it to count as built.",
+    "term": "A term is a phrase the workbench uses with one fixed meaning, given here in the words of its rule."}
 MAX_BYTES = 1 << 20
 
 
@@ -74,8 +85,8 @@ def load(path=None):
             raise ValueError("the file is larger than 1 MB")
         entries, problems = parse(text.decode("utf-8"))
     except (OSError, ValueError) as e:
-        return {"entries": [], "source": SOURCE, "why": f"{SOURCE} could not be read ({' '.join(str(e).split())[:120]})"}
-    return {"entries": entries, "source": SOURCE, "why": "; ".join(problems) or None}
+        return {"entries": [], "source": SOURCE, "kinds": dict(KINDS), "why": f"{SOURCE} could not be read ({' '.join(str(e).split())[:120]})"}
+    return {"entries": entries, "source": SOURCE, "kinds": dict(KINDS), "why": "; ".join(problems) or None}
 
 
 def _self_test():
@@ -122,6 +133,9 @@ def _self_test():
        real["why"] is None and {("scorecard case", "C13"), ("gap", "H3"), ("goal", "G6"), ("goal", "G2b"),
                                 ("term", "workbench threshold")} <= codes
        and all(e["meaning"] and e["section"] for e in real["entries"]), str((real["why"], sorted(codes))))
+    ok("G7 the glossary reads without the specification: each kind of entry it gives has a sentence saying what it is and what its columns are",
+       {e["kind"] for e in real["entries"]} <= set(real["kinds"]) and all(k in s and len(s) > 60 for k, s in real["kinds"].items())
+       and all(h in real["kinds"]["scorecard case"] for h in ("Earliest stage", "Check", "Now")), str(real.get("kinds")))
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
 

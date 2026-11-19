@@ -258,7 +258,8 @@ def _tests(run):
 
 
 def _ran(tests, tid):
-    return (tests or {}).get(tid, {}).get("state") == "ran"
+    """The test ran for the verified signed spec (checks.decision_tests `counts`, §3)."""
+    return (tests or {}).get(tid, {}).get("counts") is True
 
 
 def derive(run):
@@ -377,9 +378,13 @@ def derive(run):
         flags.append(("not_available", f"{CHOICE} engine_departures is not a list, so the departures are not in the register."))
     def identity(d):       # a departure is {engine, benchmark | component, reason, decision_test} (benchmark_coverage.py)
         return _text(d.get("engine")), "component" if d.get("component") else "benchmark", _text(d.get("component") or d.get("benchmark"))
-    held = {}
+    held, refusal = {}, {}
+    granting = {"verified": verified, "why": spec["unverified"], "signed_by": spec["signed_by"], "doc": spec["doc"]}
     for s in _entries(flags, spec["rel"], spec["doc"], "engine_departures"):
         held.setdefault(identity(s), []).append(_stem(s.get("decision_test")))
+        # checks.departure_refused: the one rule on what grants a departure, shared with the Model view
+        refusal[identity(s), _stem(s.get("decision_test"))] = checks.departure_refused(
+            granting, identity(s)[1], identity(s)[2], _text(s.get("decision_test")))
     for d in _entries(flags, CHOICE, doc or {}, "engine_departures"):
         name = _text(d.get("component") or d.get("benchmark"))
         word = d.get("status")
@@ -401,6 +406,10 @@ def derive(run):
                                      f"{_stem(d.get('decision_test')) or '(none)'}, but the signed entry names "
                                      f"{', '.join(t or '(none)' for t in held[identity(d)])}: the signature does not cover "
                                      "that test, so the departure is shown open."))
+        elif disposition == "declared" and verified and (refusal[identity(d), _stem(d.get("decision_test"))] or ("no_test",))[0] != "no_test":
+            disposition = "open"       # a departure with no test stays a declared row with no test (declared_untested)
+            flags.append(("problem", f"{CHOICE} marks the engine departure for {name} signed, but "
+                                     f"{refusal[identity(d), _stem(d.get('decision_test'))][1]}: it is shown open."))
         elif disposition == "declared" and not verified:
             disposition = "open"
         _place(rows, _row(f"departure:{name}", "assumption", d.get("reason"), "engine_departures", "ENGINE_CHOICE",
@@ -750,6 +759,32 @@ def _self_test():
         need(look(b.folder(hm))["tests"]["DT4"]["state"] == "ran" and look(b.folder(hm, "declared_test_not_run"))["tests"]["DT4"]["state"] == "not_run",
              "the producer's two consistent pairs are ran and not_run")
 
+    def departure_grant():
+        from views.fit_bench import rewrite
+        m = look(b.edited(hm, rejson("decision_spec.signoff.json", lambda so: so.update(signed_by="lead")), dec))
+        for rid in ("departure:B2", "departure:B"):
+            need(by(m)[rid]["disposition"] == "open" and by(m)[rid]["signed_by"] is None and problem(m, rid.split(":")[1], "owner"),
+                 f"{rid}: a departure in a spec a lead signed is open, whatever the choice record says ({by(m)[rid]['disposition']}, {m['flags']})")
+        need(by(m)["excluded:c1"]["disposition"] == "declared" and by(m)["excluded:c1"]["signed_by"] == "lead",
+             "a row that needs no owner's signature keeps its disposition, with who signed")
+        for what, change in (("another spec's hash", lambda doc: doc.update(spec_sha256="1" * 64)), ("no spec hash", lambda doc: doc.pop("spec_sha256"))):
+            m = look(b.edited(hm, rewrite(fx.DT, change), dec))
+            need(m["tests"]["DT4"]["state"] == "ran" and not m["tests"]["DT4"]["counts"] and by(m)["departure:B2"]["decides"] == "unknown",
+                 f"{what}: a test of another spec says nothing of what a declared row decides ({by(m)['departure:B2']['decides']})")
+
+        def kind(d):
+            with open(os.path.join(d, checks.SIGNED_COPY), encoding="utf-8") as f:
+                was = f.read()
+            now = was.replace("type: interaction_rescale", "type: outcome_ratio")
+            assert now != was
+            with open(os.path.join(d, checks.SIGNED_COPY), "w", encoding="utf-8") as f:
+                f.write(now)
+            rejson("decision_spec.signoff.json", lambda so: so["sha256"].update({SPEC: hashlib.sha256(now.encode()).hexdigest()}))(d)
+        m = look(b.edited(hm, kind, dec))
+        need(by(m)["departure:B2"]["disposition"] == "open" and problem(m, "B2", "outcome_ratio") and by(m)["departure:B"]["disposition"] == "declared",
+             f"a departure whose test is of a kind that does not vary the effect is open, as in the Model view ({by(m)['departure:B2']['disposition']}, {m['flags']})")
+
+    b.case("RR13 an engine departure is granted by the one rule the Model view uses: the owner's signature and a test that varies the effect (review 4)", departure_grant)
     b.case("RR6 an engine departure counts only against the signed entry of the same engine, typed name and test (review 2)", departure_identity)
     b.case("RR7 a list entry that is no mapping is a problem named by its position, never dropped (review 5)", malformed_entries)
     b.case("RR8 the ledger and the sheet are read whole: a row beyond 8 MiB is in the register (review 6)", whole_files)

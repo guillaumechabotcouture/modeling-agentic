@@ -120,6 +120,33 @@ def charts(m):
     return out
 
 
+# §5.12, figure to view: the calibration figures and the posterior diagnostics belong beside Fit. Each chart below is
+# shown with the harness figure of the same data where the run has one: (kind, table, the level its rows are limited
+# to or None) and the figure names in order of preference. A figure is shown beside one chart only.
+BESIDE = ((("interval_points", "targets", "group"), ("calibration_fit",)),
+          (("interval_points", "targets", "unit"), ("calibration_unit_fit", "calibration_fit")),
+          (("bars", "targets", None), ("calibration_residuals",)),
+          (("bars", "groups", None), ("calibration_residuals",)),
+          (("ranges", "parameters", None), ("calibration_region",)),
+          (("lines", "series", None), ("diagnostics_ppc",)))
+
+
+def beside(charts, figures):
+    """The charts, each with `image` ({path, hash, title, caption}: the chart key of workbench.py) where `figures`
+    (checks.harness_figures) holds the harness figure of the same data."""
+    used = set()
+    for (kind, table, level), names in BESIDE:
+        ch = next((c for c in charts if (c["kind"], c["table"]) == (kind, table) and "image" not in c
+                   and (level is None or (c.get("where") or {}).get("level") == level)), None)
+        name = next((n for n in names if n in (figures or {}) and n not in used), None)
+        if ch is not None and name is not None:
+            used.add(name)
+            f = figures[name]
+            ch["image"] = {"path": f["path"], "hash": f["sha256"], "title": f["title"] or name.replace("_", " "),
+                           **({"caption": f["caption"]} if f["caption"] else {})}
+    return charts
+
+
 # ---------------------------------------------------------------------------------------------- self-test
 
 def _self_test():
@@ -154,7 +181,38 @@ def _self_test():
              "unit targets: no emulator mark is declared where the file records none, and the chart says so")
         need(not any(ch["table"] == "series" for ch in look_at(folder(hm))["charts"]), "no chart of a table the method does not record")
 
+    def f_images():
+        import hashlib
+        import workbench
+
+        def sha(d, rel):
+            with open(os.path.join(d, rel), "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+
+        def image(v, kind, table, level=None):
+            return next(ch for ch in v["charts"] if (ch["kind"], ch["table"]) == (kind, table) and (level is None or ch["where"]["level"] == level)).get("image")
+        d = folder(hm)
+        v = look_at(d)
+        for (kind, table, level), name in ((("interval_points", "targets", "group"), "calibration_fit"), (("interval_points", "targets", "unit"), "calibration_unit_fit"),
+                                           (("bars", "targets", None), "calibration_residuals")):
+            got = image(v, kind, table, level)
+            need(isinstance(got, dict) and got.get("path") == f"figures/{name}.png" and got.get("hash") == sha(d, f"figures/{name}.png") and got.get("title"),
+                 f"the {kind} chart of {table} {level or ''} shows the harness figure {name} beside it, by the hash of the image as read ({got})")
+        need(image(v, "interval_points", "changes") is None and image(v, "bars", "groups") is None,
+             "a chart with no harness figure of the same data, or whose figure is beside another chart, carries none")
+        used = [ch["image"]["path"] for ch in v["charts"] if ch.get("image")]
+        need(len(used) == len(set(used)) and not workbench.chart_problems(v), f"no figure is shown twice, and every declaration is one the page can draw ({used})")
+        d = folder(post, figures="estimates")
+        got = image(look_at(d), "lines", "series")
+        need(isinstance(got, dict) and got.get("path") == "figures/diagnostics_ppc.png" and got.get("hash") == sha(d, "figures/diagnostics_ppc.png"),
+             f"the fit over time shows the harness figure of the predictive check ({got})")
+        gone = b.edited(hm, lambda folder_: os.remove(os.path.join(folder_, "figures", "calibration_fit.png")))
+        need(image(look_at(gone), "interval_points", "targets", "group") is None, "a figure whose image is not in the run is not declared")
+        none = b.edited(hm, lambda folder_: os.remove(os.path.join(folder_, "analysis", "figures.yaml")))
+        need(not any(ch.get("image") for ch in look_at(none)["charts"]), "a run with no figure index: the charts are drawn with no figure beside them")
+
     case("H1 every chart declaration names an existing table and its columns", f10)
+    case("H2 a chart carries the harness figure of the same data where the run has one (§5.12: the calibration figures belong beside Fit)", f_images)
     return b.done()
 
 

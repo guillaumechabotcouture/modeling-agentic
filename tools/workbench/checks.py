@@ -121,30 +121,107 @@ def bound(record, rel, now):
     return hash_state(held.get(rel), now)
 
 
-def decision_tests(run):
-    """({test id: {status, verdict, statement, state, share_pct, threshold_pct}}, None) from
+def decision_tests(run, spec=None):
+    """({test id: {status, verdict, statement, state, counts, spec, spec_says, share_pct, threshold_pct}}, None) from
     analysis/decision_tests.yaml, or (None, why). share_pct and threshold_pct are the test's own numbers (the share of
     units that change package, and the share above which the plan is said to change), null where it records none.
     The one loader of decision tests, for every view. state: `ran` (status run with a verdict of NO_CHANGE or
     CHANGES_PLAN: the only pair that establishes that a test ran), `not_run` (status not_run, verdict NOT_RUN),
     `contradiction` (the producer's words in a pair it does not write, so the record contradicts itself), or
-    `unknown` (a status or verdict word the producer does not write)."""
+    `unknown` (a status or verdict word the producer does not write).
+    `counts` (§3: a decision test counts only when its file records the same signed spec): true when the test ran
+    and the file's header holds the hash of the verified signed spec (`spec`, verified_spec's result, read here when
+    not given). Only a test that counts can excuse anything; a view that raises something a test found (a verdict
+    that changes the plan) reads `state`. `spec` says how the file's spec hash stands (same, other, not_recorded,
+    unverified) and `spec_says` gives the sentence when it is not the same."""
     doc, why = run.large(DT)
     if doc is None:
         return None, why
     tests = doc.get("data", {}).get("tests") if isinstance(doc.get("data"), dict) else None
     if not isinstance(tests, list) or not all(isinstance(t, dict) and t.get("test_id") for t in tests):
         return None, f"{DT} holds no list of tests (data.tests)"
+    spec = spec or verified_spec(run)
+    held = digest(doc.get("spec_sha256"))
+    if not spec["verified"]:
+        tie, tie_says = "unverified", f"no signed spec could be verified ({spec['why']}), so no test is tied to one"
+    elif held is None:
+        tie, tie_says = "not_recorded", f"{DT} records no valid hash of the spec it was run for (spec_sha256)"
+    elif held != spec["sha"]:
+        tie, tie_says = "other", (f"{DT} records another spec ({held[:8]}) than the verified signed copy "
+                                  f"({spec['sha'][:8]}), so its tests were not run for the spec that was signed")
+    else:
+        tie, tie_says = "same", None
     out = {}
     for t in tests:
         status, verdict = t.get("status"), t.get("verdict")
         pair = (status, verdict) if isinstance(status, str) and isinstance(verdict, str) else None
         state = TEST_PAIRS.get(pair) or ("contradiction" if pair and status in TEST_STATUSES and verdict in VERDICTS else "unknown")
         out[str(t["test_id"])] = {"status": status, "verdict": verdict, "state": state,
+                                  "counts": state == "ran" and tie == "same", "spec": tie, "spec_says": tie_says,
                                   "statement": " ".join(str(t.get("statement") or "").split())[:4000],
                                   **{k: t.get(k) if isinstance(t.get(k), (int, float)) and not isinstance(t.get(k), bool) else None
                                      for k in ("share_pct", "threshold_pct")}}
     return out, None
+
+
+# What grants an engine departure, in the producer's words (toolkit/engines/benchmark_coverage.py): "A departure:
+# {engine, benchmark | component, reason, decision_test}. It counts only when the spec is signed by the owner (the
+# sign-off record's signed_by), and only when its decision test varies the related effect: a parameter_value test on
+# one of the entry's effect_parameters, or an interaction_rescale test naming a spec component that delivers the
+# covered engine component." departure_problems() there: "decision_test ... must be an analysis.decision_tests id".
+# toolkit/spec/preconditions.py decision_test_runs(): an interaction test whose benchmark is not the departed one
+# "tests benchmark ...'s interaction, not the departed", and any other type "does not vary a component's effect".
+DEPARTURE_TESTS = ("parameter_value", "interaction_rescale")
+
+
+def departure_refused(spec, kind, subject, test):
+    """Why the signed spec `spec` (verified_spec's shape: verified, why, signed_by, doc) does not grant its own engine
+    departure for the `kind` (benchmark or component) `subject` with the decision test `test`: (word, sentence), or
+    None when it does. The one rule for every view that lets a departure excuse something (§3), read from the
+    verified signed spec and its sign-off record alone, never from the engine choice. Words: unverified, not_owner,
+    no_test, bad_test. Not checked here: which engine parameters carry the effect (the engine's coverage file, which
+    is not in the run folder), and whether the test ran (decision_tests' `counts`)."""
+    if not spec["verified"]:
+        return "unverified", f"no signed spec could be verified ({spec['why']})"
+    if spec["signed_by"] != "owner":
+        return "not_owner", (f"the spec that holds it is signed by {spec['signed_by']!r}, not by the owner, and a departure counts only "
+                             "under the owner's signature, so it grants nothing")
+    if not test:
+        return "no_test", "it names no decision test"
+    held = spec["doc"].get("analysis")
+    held = held.get("decision_tests") if isinstance(held, dict) else None
+    dt = next((t for t in held if isinstance(t, dict) and str(t.get("id")) == str(test)), None) if isinstance(held, list) else None
+    if dt is None:
+        return "bad_test", f"the verified signed spec declares no decision test {test} (analysis.decision_tests)"
+    if dt.get("type") not in DEPARTURE_TESTS:
+        return "bad_test", (f"its test {test} is a {dt.get('type')} test, and a departure is carried only by a test that varies the "
+                            f"effect ({' or '.join(DEPARTURE_TESTS)})")
+    if dt["type"] == "interaction_rescale" and (kind != "benchmark" or str(dt.get("benchmark")) != str(subject)):
+        return "bad_test", (f"its test {test} rescales the interaction of benchmark {dt.get('benchmark')}, which is not the departed "
+                            f"{kind} {subject}")
+    return None
+
+
+FIGURES = "analysis/figures.yaml"
+
+
+def harness_figures(run):
+    """{figure name: {figure, path, sha256, title, caption}} for the figures the run's figure index lists whose image
+    can be read, each with the hash of the image as read, or None when the run has no readable index. For a view that
+    shows a harness figure beside its own chart or table (§5.12); the Figures view reads the index in full itself."""
+    doc, _ = run.large(FIGURES)
+    figs = doc["data"].get("figures") if doc is not None and isinstance(doc.get("data"), dict) else None
+    if not isinstance(figs, list):
+        return None
+    out = {}
+    for e in figs:
+        name, rel = (e.get("figure") or e.get("id"), e.get("path")) if isinstance(e, dict) else (None, None)
+        if isinstance(name, str) and isinstance(rel, str) and name not in out:
+            sha = run.sha(rel)
+            if sha is not None:
+                out[name] = {"figure": name, "path": rel, "sha256": sha, **{k: " ".join(e[k].split())[:2000] if isinstance(e.get(k), str) and e[k].strip() else None
+                                                                           for k in ("title", "caption")}}
+    return out
 
 
 def verified_spec(run):
@@ -576,6 +653,27 @@ def _self_test():
            good["verified"] and isinstance(good["doc"], dict) and good["signed_by"] == "owner" and good["why"] is None
            and all(not b["verified"] and b["doc"] is None and b["signed_by"] is None and b["why"] for b in bad),
            str((good["why"], [b["why"] for b in bad])))
+        def tests_of(name, edit=None):
+            d = os.path.join(tmp, name)
+            os.makedirs(os.path.join(d, os.path.dirname(SIGNED_COPY)))
+            workbench._toy(d)
+            shutil.copyfile(os.path.join(d, SPEC), os.path.join(d, SIGNED_COPY))
+            sha = verified_spec(workbench.Run(d))["sha"]
+            head = {"spec_sha256": sha, "data": {"tests": [{"test_id": "T1", "status": "run", "verdict": "NO_CHANGE"},
+                                                            {"test_id": "T2", "status": "not_run", "verdict": "NOT_RUN"}]}}
+            (edit or (lambda d, head: None))(d, head)
+            open(os.path.join(d, DT), "w").write(json.dumps(head))
+            return decision_tests(workbench.Run(d))[0]
+        same = tests_of("s11")
+        other = tests_of("s11a", lambda d, head: head.update(spec_sha256="1" * 64))
+        none = tests_of("s11b", lambda d, head: head.pop("spec_sha256"))
+        unsigned = tests_of("s11c", lambda d, head: os.remove(os.path.join(d, SPEC_SIGNOFF)))
+        ok("S11 a decision test counts only when its file records the verified signed spec (§3): with another spec's "
+           "hash, none, or no verified signed spec, a test that ran still ran and counts for nothing",
+           same["T1"]["counts"] and same["T1"]["spec"] == "same" and not same["T2"]["counts"]
+           and [(t["T1"]["state"], t["T1"]["counts"], t["T1"]["spec"]) for t in (other, none, unsigned)]
+           == [("ran", False, "other"), ("ran", False, "not_recorded"), ("ran", False, "unverified")]
+           and all(t["T1"]["spec_says"] for t in (other, none, unsigned)), str((same, other, none, unsigned)))
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
 

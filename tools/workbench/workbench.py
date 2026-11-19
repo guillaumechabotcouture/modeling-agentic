@@ -35,7 +35,8 @@ it. A chart is a declaration over one of the result's tables (CHART_KEYS lists e
                      each value
     ranges           x: the label column; outer_low, outer_high: the wide range; low, high: the narrow range
                      inside it; y: a point (each row is drawn on its own wide range, on a log scale where the
-                     wide range spans a factor of 100 or more above zero, and the row says so)
+                     wide range spans a factor of 100 or more above zero, and the row says so; a point or a narrow
+                     range that lies outside the wide range is drawn where it is, past the end of the wide range)
     graph            table holds one row per link, x: the column a link comes from, y: the column it goes to;
                      nodes: the table with one row per node (first column its name); group: the column, in both
                      tables, whose value marks a node or link (same, changed, missing, outside)
@@ -45,6 +46,13 @@ Keys any kind but graph takes:
                      rows than fit a page, the reader picks one panel at a time
     labels           {column: words}: what a column's mark is called in the legend and on the axis (with its unit)
     limits           [{value, label}]: reference lines on the value axis (bars, interval_points, lines)
+Any kind also takes:
+    image            {path, hash, title, caption}: the harness figure of the same data, shown beside the chart (§3)
+                     through the file endpoint below; path is the image's place in the run folder and hash its sha256;
+                     title and caption are the harness's own words for the figure (optional)
+    after            a table's name: the chart is drawn directly after that table, wherever the page draws the table,
+                     and not in the page's list of charts. An `images` declaration takes the same key. With no such
+                     table in the result, or one the run does not record, the block stays where it would have been.
 A table may carry `about` (one sentence on what its rows are and where they come from) and `labels` ({column:
 words}, shown under the column's name in its header) beside columns and rows.
 A table may also carry `lead` (true: the page shows it straight after the facts, before the notes and charts,
@@ -59,6 +67,35 @@ the whole on a click, where another long text is cut to one line) and `actions`,
                      key, text (true) is free text; a field left empty is not sent unless it is required
              add     {label, fields}: a form above the table that adds a row; it is sent with `row` null
 A fact or column whose name ends in _usd or _minutes is shown with that unit.
+
+Images (§5.12). Beside the five keys a view may return `images`, a list of declarations over its tables (IMAGE_KEYS):
+    {table, path, hash, title, caption, group, details, flag, reason, after}
+    table            the table with one row per image
+    path, hash       the columns holding the image's place in the run folder and its sha256
+    title, caption   the columns holding the words shown above and under the image (optional)
+    group            a column: images are gathered under each value of it (optional)
+    details          a list of columns shown under each image, each with its name (optional)
+    flag             a column holding a status or state word: an image whose word is not an ok one is drawn first in
+                     its group, and a button at the top of the block goes to it (optional)
+    reason           a column saying why a row has no image: a row with no path and no hash and a reason is drawn as
+                     a card with that sentence, in its group, and nothing is asked of the server for it (optional)
+    after            a table's name: the block is drawn directly after that table (as for a chart, above; optional)
+A caption that only repeats the image's title is not shown; one that begins with the title shows what it adds.
+A note (`notes`) named after a table the run does not record (present in `tables` with the value null) is the reason
+the page gives for that table under "Not recorded"; with no such note the page says the view gives no reason.
+The page asks for each image at GET /api/file?run=<id>&path=<rel>&sha=<hash>. The server answers with the file's
+bytes only when all of these hold, and with a reason otherwise: the Host is loopback and the method GET; the run is
+one the workbench found; the name ends as a raster image the server checks does (FILE_TYPES: PNG, which is what the
+harness writes; a vector file can carry a script and is refused); a view of that run folder (its path and its device
+and inode as found, not its short id) that this server has sent to the page (/api/view) named that path with that
+hash, in an `images` table or a chart's `image` (the last NAMED_KEPT view results are remembered, NAMED_PAIRS images
+each); the path is inside the run and no credential file, read through the confined reader with no link followed and
+no second hard link; the bytes read, hashed from that one read, have the hash asked for; and they have the structure
+of that kind of image (png_problem: signature, header, image data, end, each chunk with its checksum, nothing after).
+At most FILES_AT_ONCE images are held in memory at once, each until its answer is written (answer). The answer carries its own content policy (FILE_CSP: sandbox, nothing
+allowed), not the page's, and is never stored. Answers: 200 the image, 400 no path or no hash, 403 not named or not
+inside the run, 404 no such run or file, 409 the file no longer has that hash, 413 too large, 415 not a raster image
+the server checks, 503 too many images being sent (ask again).
 
 The one write (§6 "Review notes"). POST /api/note?run=<id> with a JSON body {row, kind, statement, disposition,
 decides, note, same_as} appends one line to <run>/owner/review_notes.jsonl and writes nothing else, ever. It is
@@ -123,14 +160,27 @@ SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "data", "figures", 
 # The views, in the order of the reader's jobs (§2): verify the run as a modeller would, then the deterministic
 # steps, the register, development and spend. `goal` is the slice of §10 that builds the view.
 PATH = [("overview", "Overview", "G1"), ("spec", "Spec and evidence", "G6"), ("model", "Model", "G4"), ("fit", "Fit", "G2"),
-        ("scenarios", "Scenarios", "G7"), ("outcomes", "Outcomes", "G5"), ("steps", "Steps", "G1"),
+        ("scenarios", "Scenarios", "G7"), ("outcomes", "Outcomes", "G5"), ("steps", "Steps", "G1"), ("figures", "Figures", "G2b"),
         ("register", "Science register", "G3"), ("world", "World model", "G10"), ("development", "Development", "G8"),
         ("spend", "Spend", "G9")]
 VIEW_FNS = {}                # name -> view function, filled on first use; a test may put one here
 KEYS = {"checks": list, "facts": dict, "tables": dict, "charts": list, "notes": dict}
 CHART_KINDS = ("interval_points", "ranges", "bars", "lines", "graph")
 CHART_COLUMNS = ("x", "y", "low", "high", "group", "model", "model_alt", "outer_low", "outer_high", "panels")
-CHART_KEYS = ("kind", "table", "title", "how_to_read", *CHART_COLUMNS, "nodes", "scale", "where", "labels", "limits")
+CHART_KEYS = ("kind", "table", "title", "how_to_read", *CHART_COLUMNS, "nodes", "scale", "where", "labels", "limits", "image", "after")
+IMAGE_KEYS = ("table", "path", "hash", "title", "caption", "group", "details", "flag", "reason", "after")     # a view's `images` declaration
+CHART_IMAGE_KEYS = ("path", "hash", "title", "caption")                           # a chart's `image`
+# The file endpoint (§5.12) serves raster images only: the ending a name must have, its content type and the function
+# that says what in the bytes is not that kind of image (None when they are one). A vector image can carry a script,
+# so it is not on the list; nor is a raster kind the harness does not write (it writes PNG) and that is not checked here.
+FILE_TYPES = {".png": ("image/png", lambda data: png_problem(data))}
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+FILE_CSP = "sandbox; default-src 'none'; frame-ancestors 'none'"       # an image is sent under this, not under the page's policy
+MAX_FILE = 32 << 20          # an image larger than this is not served
+NAMED_KEPT = 64              # view results whose named images the server remembers (the oldest goes first)
+NAMED_PAIRS = 2048           # images remembered for one view result; a result that names more has the rest refused
+FILES_AT_ONCE = 4            # images held in memory at once, each until its answer is written (4 x MAX_FILE at most)
+FILE_WAIT = 20.0             # seconds a request for an image waits for one of those places before it is told to ask again
 ACTION_KEYS = ("post", "key", "label", "about", "fields", "add")       # a table's `actions` (the module docstring)
 FIELD_KEYS = ("name", "label", "choices", "rows", "text", "required")
 ACTION_POSTS = ("/api/note",)                 # the addresses a page may post to: the one write the workbench has
@@ -190,6 +240,8 @@ def chart_problems(result):
         if not ch.get("title") or not ch.get("how_to_read"):
             out.append(f"{name}: no title or no how-to-read sentence")
         out += [f"{name}: unknown key {k!r}" for k in ch if k not in CHART_KEYS]
+        if ch.get("after") is not None and ch["after"] not in tables:
+            out.append(f"{name}: after names no table of the result ({ch['after']!r})")
         if not isinstance(cols, list):
             out.append(f"{name}: no table {ch.get('table')!r}")
             continue
@@ -199,7 +251,84 @@ def chart_problems(result):
         if not all(isinstance(m, dict) and isinstance(m.get("value"), (int, float)) and m.get("label")
                    for m in ch.get("limits") or []):
             out.append(f"{name}: limits are not a list of {{value, label}}")
+        im = ch.get("image")
+        if im is not None and not (isinstance(im, dict) and set(im) <= set(CHART_IMAGE_KEYS) and isinstance(im.get("path"), str)
+                                   and checks.digest(im.get("hash"))):
+            out.append(f"{name}: image is not {{path, hash, title, caption}} with a path and a sha256")
     return out
+
+
+def image_problems(result):
+    """What is wrong with a view result's `images` declarations, as sentences (none when the page can draw them)."""
+    out, tables = [], result.get("tables") or {}
+    for d in result.get("images") or []:
+        if not isinstance(d, dict):
+            out.append("images: a declaration is not a mapping")
+            continue
+        t = tables.get(d.get("table"))
+        cols = t.get("columns") if isinstance(t, dict) else None
+        out += [f"images: unknown key {k!r}" for k in d if k not in IMAGE_KEYS]
+        if not isinstance(cols, list):
+            out.append(f"images: no table {d.get('table')!r}")
+            continue
+        if d.get("after") is not None and d["after"] not in tables:
+            out.append(f"images: after names no table of the result ({d['after']!r})")
+        named = [d.get(k) for k in ("path", "hash")] + [d[k] for k in ("title", "caption", "group", "flag", "reason") if d.get(k) is not None]
+        named += d["details"] if isinstance(d.get("details"), list) else [None] if "details" in d else []
+        out += [f"images: table {d['table']} has no column {c!r}" for c in named if c not in cols]
+    return out
+
+
+def png_problem(data):
+    """What in `data` is not a PNG image, or None: the signature; then chunks, each with a length inside the file and
+    the checksum of its type and body; the header chunk (IHDR, 13 bytes, a width and a height above zero) first; at
+    least one chunk of image data (IDAT); the end chunk (IEND, empty) last, with nothing after it. Bytes that only
+    begin as a PNG does (a signature, or a header with no image) are not an image, and bytes after the end are not
+    part of one."""
+    import zlib
+    if not data.startswith(PNG_SIGNATURE):
+        return "it does not begin as a PNG does"
+    at, kinds = len(PNG_SIGNATURE), []
+    while at < len(data):
+        if at + 12 > len(data):
+            return "it ends inside a chunk"
+        size, kind = int.from_bytes(data[at:at + 4], "big"), data[at + 4:at + 8]
+        end = at + 12 + size
+        if end > len(data):
+            return "a chunk is longer than the file"
+        if zlib.crc32(data[at + 4:end - 4]) & 0xFFFFFFFF != int.from_bytes(data[end - 4:end], "big"):
+            return "a chunk does not have its checksum"
+        if not kinds and (kind != b"IHDR" or size != 13 or not int.from_bytes(data[at + 8:at + 12], "big")
+                          or not int.from_bytes(data[at + 12:at + 16], "big")):
+            return "it has no header chunk with a width and a height"
+        kinds.append(kind)
+        at = end
+        if kind == b"IEND":
+            break
+    if not kinds or kinds[-1] != b"IEND" or data[at - 12:at - 8] != bytes(4):
+        return "it has no end chunk"
+    if at != len(data):
+        return "it holds bytes after its end chunk"
+    if b"IDAT" not in kinds:
+        return "it holds no image data"
+    return None
+
+
+def named_images(result):
+    """The (path, sha256) pairs a view result names: the rows of its `images` tables and its charts' `image`. Only
+    these can be asked of the file endpoint (§5.12)."""
+    out, tables = set(), result.get("tables") or {}
+    for d in result.get("images") or []:
+        t = tables.get(d.get("table")) if isinstance(d, dict) else None
+        cols = t.get("columns") if isinstance(t, dict) and isinstance(t.get("rows"), list) else None
+        if isinstance(cols, list) and d.get("path") in cols and d.get("hash") in cols:
+            at, sha = cols.index(d["path"]), cols.index(d["hash"])
+            out |= {(r[at], r[sha]) for r in t["rows"] if isinstance(r, list) and len(r) == len(cols)}
+    for ch in result.get("charts") or []:
+        im = ch.get("image") if isinstance(ch, dict) else None
+        if isinstance(im, dict):
+            out.add((im.get("path"), im.get("hash")))
+    return set(sorted((p, h) for p, h in out if isinstance(p, str) and p and checks.digest(h))[:NAMED_PAIRS])
 
 
 def _view_module(name):
@@ -210,6 +339,10 @@ def _view_module(name):
         from views import overview as m
     elif name == "fit":
         from views import fit as m
+    elif name == "model":
+        from views import model as m
+    elif name == "figures":
+        from views import figures as m
     elif name == "steps":
         from views import steps as m
     elif name == "register":
@@ -245,7 +378,8 @@ def unavailable(name, says):
 
 
 def run_view(run, name):
-    """One view's result for one run, always in the {checks, facts, tables, charts, notes} shape."""
+    """One view's result for one run, always in the {checks, facts, tables, charts, notes} shape; a view's `images`
+    declarations (a list) are passed through beside them when it gives any."""
     fn, why = load_view(name)
     if fn is None:
         goal = next((g for i, _, g in PATH if i == name), None)
@@ -256,7 +390,7 @@ def run_view(run, name):
         return unavailable(name, f"This view failed on the run's files ({type(e).__name__}: {e}).")
     if not isinstance(out, dict) or any(not isinstance(out.get(k, t()), t) for k, t in KEYS.items()):
         return unavailable(name, "This view returned something other than checks, facts, tables, charts and notes.")
-    return {k: out.get(k, t()) for k, t in KEYS.items()}
+    return {**{k: out.get(k, t()) for k, t in KEYS.items()}, **({"images": out["images"]} if isinstance(out.get("images"), list) else {})}
 
 
 def clean(x):
@@ -681,6 +815,11 @@ class Workbench:
         self.found = {}                          # path -> (device, inode) of the folder when it was first found
         self.token = secrets.token_urlsafe(32)   # made at start; only the page this server serves holds it
         self.writing = threading.Lock()          # one note is appended at a time
+        # (run folder, its device and inode, view) -> the (path, sha256) pairs that view result named. The folder as it
+        # was found, never the run's short id: an id that comes to lead elsewhere carries no permission with it.
+        self.named = {}
+        self.file_slots = threading.BoundedSemaphore(FILES_AT_ONCE)       # held by answer() from the read to the write
+        self.file_wait = FILE_WAIT
         self.glossary = glossary.load(spec)      # read once at start from the specification's own tables
 
     def scan(self):
@@ -723,7 +862,51 @@ class Workbench:
         p = p or self.scan().get(rid)
         if p is None or name not in [i for i, _, _ in PATH]:
             return None
-        return clean(self.run(p).view(name))
+        run = self.run(p)
+        out = clean(run.view(name))
+        with self.lock:      # what this answer names is what the page may ask the file endpoint for, in this folder only
+            self.named.pop((run.path, run.ident, name), None)
+            self.named[(run.path, run.ident, name)] = named_images(out)
+            while len(self.named) > NAMED_KEPT:
+                self.named.pop(next(iter(self.named)))
+        return out
+
+    def api_file(self, rid, rel, sha):
+        """The file endpoint (§5.12): (status, content type, body, headers) for one image of one run. The rules are
+        in the module docstring; every refusal says why and holds none of the file's bytes."""
+        def no(code, why):
+            return code, "text/plain; charset=utf-8", f"not served: {why}".encode(), {}
+        with self.lock:
+            p = self.runs.get(rid)
+        p = p or self.scan().get(rid)
+        if p is None:
+            return no(404, "no such run")
+        if not rel or checks.digest(sha) is None:
+            return no(400, "the request must give a path and a sha256 (path=, sha=)")
+        kind = FILE_TYPES.get(os.path.splitext(rel)[1].lower())
+        if kind is None:
+            return no(415, f"only raster images are served ({', '.join(FILE_TYPES)})")
+        run = self.run(p)        # the folder the id leads to now: its path and the identity recorded when it was found
+        with self.lock:
+            named = any((rel, sha) in pairs for (path, ident, _), pairs in self.named.items() if (path, ident) == (run.path, run.ident))
+        if not named:
+            return no(403, "no view of this run that the page has been sent names this path with this hash")
+        try:
+            check_rel(rel)
+        except ValueError as e:
+            return no(403, str(e))
+        data, why = run.read(rel, MAX_FILE + 1)      # that same folder: confined, no link followed, no second hard link
+        if data is None:
+            return no(404 if str(why).endswith("is not in the run folder") else 403, why)
+        if len(data) > MAX_FILE:
+            return no(413, f"{rel} is larger than {MAX_FILE >> 20} MB")
+        if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), sha):       # the bytes read are the bytes hashed and sent
+            return no(409, f"{rel} no longer has the hash the view named: read the files again")
+        bad = kind[1](data)
+        if bad:
+            return no(415, f"{rel} is not an image of its kind: {bad}")
+        return 200, kind[0], data, {"Content-Security-Policy": FILE_CSP, "Content-Disposition": "inline",
+                                    "Cross-Origin-Resource-Policy": "same-origin"}
 
     def add_note(self, rid, body):
         """(status, answer) for one review note posted for the run `rid`: checked against the schema and the run's
@@ -768,9 +951,10 @@ class Workbench:
         return 200, {"ok": True, "file": review_notes.FILE, "at": note["at"]}
 
     def handle(self, method, target, host, body=b"", headers=None):
-        """(status, content type, body). Loopback Host only. GET reads: /api/runs lists the runs, /api/view gives one
-        view of one run, /api/glossary the meanings of the codes the page shows (glossary.py reads them from the
-        specification). The one write is POST /api/note (the module docstring says what it refuses); `headers` holds
+        """(status, content type, body), and for /api/file a fourth element: the headers to send in place of the usual
+        ones ({name: value}; an image has its own content policy). Loopback Host only. GET reads: /api/runs lists the
+        runs, /api/view gives one view of one run, /api/file one image a view named (api_file), /api/glossary the
+        meanings of the codes the page shows (glossary.py reads them from the specification). The one write is POST /api/note (the module docstring says what it refuses); `headers` holds
         the request's headers by lower-case name."""
         if not re.fullmatch(_LOOPBACK, host or ""):
             return 403, "text/plain", b"loopback only"
@@ -805,29 +989,54 @@ class Workbench:
         if u.path == "/api/view":
             d = self.api_view((q.get("run") or [""])[0], (q.get("view") or [""])[0])
             return (200, "application/json", json.dumps(d).encode()) if d else (404, "text/plain", b"no such run or view")
+        if u.path == "/api/file":
+            return self.api_file((q.get("run") or [""])[0], (q.get("path") or [""])[0], (q.get("sha") or [""])[0])
         return 404, "text/plain", b"not found"
+
+
+def response_headers(ctype, length, more=None):
+    """The headers of every answer; `more` (what Workbench.handle gives for a file) replaces those of the same name,
+    so an image goes out under its own content policy. Nothing the server sends is stored by the browser."""
+    out = {"Content-Type": ctype, "Content-Length": str(length), "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+           "Referrer-Policy": "no-referrer", "Content-Security-Policy": CSP}
+    return {**out, **(more or {})}
+
+
+def answer(wb, method, target, host, body, headers, send):
+    """One request answered through `send(status, headers, body)`, which writes to the socket. An image is held in
+    memory from its read until `send` returns, so a request for one takes one of FILES_AT_ONCE places first and keeps
+    it through the write; when none comes free within wb.file_wait seconds it is told to ask again (503), holding
+    nothing. So slow readers cannot make the server hold more than FILES_AT_ONCE images at once."""
+    is_file = urllib.parse.urlsplit(target).path == "/api/file"
+    held = wb.file_slots.acquire(timeout=wb.file_wait) if is_file else False
+    try:
+        if is_file and not held:
+            code, ctype, out, more = 503, "text/plain; charset=utf-8", b"not served: the server is sending other images; ask again", [{"Retry-After": "1"}]
+        else:
+            try:
+                code, ctype, out, *more = wb.handle(method, target, host, body, headers)
+            except Exception as e:      # the page shows the reason; the server stays up
+                code, ctype, out, more = 500, "text/plain", f"{type(e).__name__}: {e}".encode(), []
+        send(code, response_headers(ctype, len(out), more[0] if more else None), out)
+    finally:
+        if held:
+            wb.file_slots.release()
 
 
 def serve(wb, port):
     class H(http.server.BaseHTTPRequestHandler):
         def _do(self):
-            try:
-                size = self.headers.get("Content-Length") or "0"
-                size = int(size) if size.isdigit() else 0
-                sent = self.rfile.read(min(size, NOTE_BODY + 1)) if self.command == "POST" else b""
-                code, ctype, body = wb.handle(self.command, self.path, self.headers.get("Host"), sent,
-                                              {k.lower(): v for k, v in self.headers.items()})
-            except Exception as e:      # the page shows the reason; the server stays up
-                code, ctype, body = 500, "text/plain", f"{type(e).__name__}: {e}".encode()
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Content-Security-Policy", CSP)
-            self.end_headers()
-            self.wfile.write(body)
+            size = self.headers.get("Content-Length") or "0"
+            size = int(size) if size.isdigit() else 0
+            sent = self.rfile.read(min(size, NOTE_BODY + 1)) if self.command == "POST" else b""
+
+            def send(code, headers, body):
+                self.send_response(code)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+            answer(wb, self.command, self.path, self.headers.get("Host"), sent, {k.lower(): v for k, v in self.headers.items()}, send)
         do_GET = do_POST = do_PUT = do_DELETE = _do
 
         def log_message(self, *a):
@@ -1368,16 +1577,233 @@ def _self_test():
            "other run" not in json.dumps(wb2.api_runs()), json.dumps(wb2.api_runs())[:300])
 
         _self_test_notes(tmp, ok)
+        _self_test_files(tmp, ok)
 
         node = shutil.which("node")
         if node is None:
             print("  skip W36 the page script's own cases (page_test.js): node is not installed here")
         else:
             r = subprocess.run([node, os.path.join(HERE, "page_test.js")], capture_output=True, text=True, timeout=120)
-            ok("W36 the page script's own cases pass (page_test.js: ticks, collapsed checks, view order, glossary, run list)",
+            ok("W36 the page script's own cases pass (page_test.js: ticks, collapsed checks, view order, glossary, run list, images)",
                r.returncode == 0, (r.stdout + r.stderr)[-900:])
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
+
+
+def _read_file(tmp, built, d, rel):
+    """A fixture file as the builder wrote it (from a second build), to put back what a test changed."""
+    from views.fit_bench import fixture_builder
+    again = os.path.join(tmp, "imaged", "again")
+    if not os.path.isdir(again):
+        fixture_builder().build(again)
+    with open(os.path.join(again, rel), "rb") as f:
+        return f.read()
+
+
+def _self_test_files(tmp, ok):
+    """§5.12, the file endpoint, written before it is built: GET /api/file?run=<id>&path=<rel>&sha=<hash> serves an
+    image of a run to the page. Each case holds it to one rule: only a file inside the run, read with no link followed;
+    only with the hash the request names; only when a view of that run has declared that path with that hash (its
+    `images`: {table, path, hash, title, caption} over one of its tables); only an image; under a sandboxed content
+    policy; loopback Host only. What the cases assume where §5.12 is silent: `images` is a sixth key of a view's result,
+    which /api/view passes through; Workbench.handle answers the endpoint with a fourth element, the headers to send
+    beside the usual ones ({name: value}), since the content policy of an image is not the page's; a refusal is any
+    status but 200, with none of the file's bytes in the body."""
+    from views.fit_bench import fixture_builder
+    d = os.path.join(tmp, "imaged", "run")
+    built = fixture_builder().build(d)
+    wb = Workbench([], [d])
+    rid = next(iter(wb.scan()))
+    image = "figures/headline.png"
+    with open(os.path.join(d, image), "rb") as f:
+        png = f.read()
+
+    def put(rel, data=png):
+        with open(os.path.join(d, rel), "wb") as f:
+            f.write(data)
+        return hashlib.sha256(data).hexdigest()
+    outside = os.path.join(tmp, "imaged", "elsewhere.png")
+    with open(outside, "wb") as f:
+        f.write(png + b"elsewhere")
+    os.symlink("headline.png", os.path.join(d, "figures", "linked.png"))
+    os.link(outside, os.path.join(d, "figures", "also_elsewhere.png"))
+    secret = {rel: put(rel, png + rel.encode()) for rel in ("figures/id_rsa.png", "figures/credentials.png", ".env")}
+    other = {rel: built[rel] for rel in ("figures/headline.csv", "figures/headline.svg", "analysis/point.yaml", "report.md")}
+    changed = put("figures/frontier.png", png + b"drawn again")           # replaced after the view named its first hash
+    named = {image: built[image], "figures/parameters.png": "0" * 64, "figures/frontier.png": built["figures/frontier.png"],
+             "figures/linked.png": built[image], "figures/also_elsewhere.png": hashlib.sha256(png + b"elsewhere").hexdigest(),
+             "../elsewhere.png": hashlib.sha256(png + b"elsewhere").hexdigest(), outside: hashlib.sha256(png + b"elsewhere").hexdigest(),
+             **secret, **other}
+    declared = [{"table": "images", "path": "path", "hash": "sha256", "title": "title", "caption": "caption"}]
+    VIEW_FNS["spec"] = lambda run: {"checks": [], "facts": {}, "charts": [], "notes": {}, "images": declared, "tables": {"images": {
+        "columns": ["figure", "path", "sha256", "title", "caption"], "about": "planted",
+        "rows": [[os.path.basename(rel), rel, sha, None, None] for rel, sha in named.items()]}}}
+
+    def get(rel, sha, host="127.0.0.1:8790", run=rid, method="GET"):
+        q = urllib.parse.urlencode({"run": run, "path": rel, "sha": sha})
+        out = wb.handle(method, f"/api/file?{q}", host)
+        return out[0], out[1], out[2], (out[3] if len(out) > 3 else {})
+
+    def refused(rel, sha, data=png, **how):
+        code, _, body, _ = get(rel, sha, **how)
+        return code != 200 and (data[8:] not in body)
+    try:
+        ok("W37 the rail lists Figures between Steps and the Science register, built by goal G2b (§9, §10)",
+           [(i, g) for i, _, g in PATH][6:9] == [("steps", "G1"), ("figures", "G2b"), ("register", "G3")], str([i for i, _, _ in PATH]))
+        ok("W38 /api/view passes a view's `images` declarations through beside checks, facts, tables, charts and notes",
+           (wb.api_view(rid, "spec") or {}).get("images") == declared, str(sorted(wb.api_view(rid, "spec") or {})))
+        code, ctype, body, headers = get(image, built[image])
+        ok("W39 the file endpoint serves an image a view named, by the hash the view named, as image/png",
+           (code, ctype, body) == (200, "image/png", png), str((code, ctype, len(body))))
+        policy = {k.lower(): v for k, v in headers.items()}.get("content-security-policy", "")
+        ok("W40 an image is sent under a sandboxed content policy that allows nothing (sandbox; default-src 'none'), not the page's",
+           code == 200 and "sandbox" in policy and "default-src 'none'" in policy and "script-src" not in policy, str(headers))
+        ok("W41 it refuses a file of the run that no view named, although the request gives its true hash",
+           get(image, built[image])[0] == 200 and refused("figures/timeline.png", built["figures/timeline.png"])
+           and refused("allocation.csv", built["allocation.csv"]))
+        ok("W42 it refuses a hash other than the one the view named for that path, and a path named with a hash the file does not have",
+           get(image, built[image])[0] == 200 and refused(image, "0" * 64) and refused(image, "") and refused(image, built["figures/frontier.png"])
+           and refused("figures/parameters.png", "0" * 64) and refused("figures/parameters.png", built["figures/parameters.png"]))
+        ok("W43 it refuses a file that changed after the view named it: the bytes served always have the hash in the request",
+           get(image, built[image])[0] == 200 and refused("figures/frontier.png", built["figures/frontier.png"], png + b"drawn again")
+           and refused("figures/frontier.png", changed, png + b"drawn again"))
+        ok("W44 it refuses a path outside the run, relative or absolute, although a view named it with the file's hash",
+           get(image, built[image])[0] == 200 and refused("../elsewhere.png", named["../elsewhere.png"], png + b"elsewhere")
+           and refused(outside, named[outside], png + b"elsewhere") and refused("figures/../../elsewhere.png", named[outside], png + b"elsewhere")
+           and refused("figures/./headline.png", built[image]))
+        ok("W45 it refuses a link and a file with a second hard link, each named with the hash of what it leads to",
+           get(image, built[image])[0] == 200 and refused("figures/linked.png", built[image])
+           and refused("figures/also_elsewhere.png", named["figures/also_elsewhere.png"], png + b"elsewhere"))
+        ok("W46 it refuses a credential file name, although a view named it with its hash",
+           get(image, built[image])[0] == 200 and all(refused(rel, sha, png + rel.encode()) for rel, sha in secret.items()))
+        ok("W47 it refuses what is not an image (a table, a vector file, an artifact, a report), although a view named it with its hash",
+           get(image, built[image])[0] == 200 and all(get(rel, sha)[0] != 200 for rel, sha in other.items()))
+        ok("W48 it answers a loopback Host only, GET only, and a run the workbench found only",
+           get(image, built[image])[0] == 200 and get(image, built[image], host="evil.example")[0] == 403
+           and get(image, built[image], method="POST")[0] == 405 and get(image, built[image], run="nope")[0] == 404
+           and wb.handle("GET", f"/api/file?run={rid}", "localhost")[0] != 200
+           and wb.handle("GET", f"/api/file?run={rid}&path={image}", "localhost")[0] != 200)
+        def snapshot():
+            """Every path below the run folder now, with what it is: a file's hash, a link's target, or a folder."""
+            out = {}
+            for at, dirs, files in os.walk(d):
+                for n in dirs + files:
+                    full = os.path.join(at, n)
+                    out[os.path.relpath(full, d)] = ("link " + os.readlink(full) if os.path.islink(full) else "folder" if os.path.isdir(full)
+                                                     else hashlib.sha256(open(full, "rb").read()).hexdigest())
+            return out
+
+        def wrote_nothing(request):
+            """request() answered 200, and the run folder is the same immediately before and after it."""
+            before = snapshot()
+            code = request()[0]
+            return code == 200 and snapshot() == before
+
+        def writing(what):
+            def request():
+                out = get(image, built[image])
+                with open(os.path.join(d, what), "ab") as f:
+                    f.write(b"written during the request")
+                return out
+            return request
+        ok("W49 serving a file writes nothing: every path of the run folder is the same immediately before and after the request",
+           wrote_nothing(lambda: get(image, built[image])))
+        caught = [not wrote_nothing(writing("figures/timeline.csv")), not wrote_nothing(writing("figures/made_by_the_request.txt"))]
+        os.remove(os.path.join(d, "figures", "made_by_the_request.txt"))
+        put("figures/timeline.csv", _read_file(tmp, built, d, "figures/timeline.csv"))
+        ok("W58 review 10: that comparison catches a request that answers 200 and changes a file, or makes a new one", caught == [True, True], str(caught))
+        twin = os.path.realpath(os.path.join(tmp, "imaged", "twin"))
+        shutil.copytree(d, twin, symlinks=True)
+        with wb.lock:
+            was = wb.runs[rid]
+            wb.runs[rid], wb.found[twin] = twin, folder_id(twin)        # the id now leads to another folder with the same bytes
+        elsewhere = get(image, built[image])[0]
+        with wb.lock:
+            wb.runs[rid] = was
+        ok("W55 review 1: what a view of one run folder named is no permission in another folder that comes to have its id",
+           elsewhere == 403 and get(image, built[image])[0] == 200, str(elsewhere))
+        many = {f"figures/n{i}.png": hashlib.sha256(str(i).encode()).hexdigest() for i in range(NAMED_PAIRS + 50)}
+        VIEW_FNS["fit"] = lambda run: {"checks": [], "facts": {}, "charts": [], "notes": {}, "images": declared, "tables": {"images": {
+            "columns": ["figure", "path", "sha256", "title", "caption"], "rows": [[rel, rel, sha, None, None] for rel, sha in many.items()]}}}
+        wb.api_view(rid, "fit")
+        for i in range(NAMED_KEPT + 5):
+            wb.named[("/nowhere", (0, i), "fit")] = set()
+        wb.api_view(rid, "fit")
+        pushed_out = get(image, built[image])[0]          # the view that named it was the oldest remembered
+        wb.api_view(rid, "spec")
+        ok("W59 review 1: the remembered set is bounded: so many view results, each so many images; a view pushed out is asked for again",
+           len(wb.named) <= NAMED_KEPT and all(len(v) <= NAMED_PAIRS for v in wb.named.values()) and pushed_out == 403
+           and get(image, built[image])[0] == 200, str((len(wb.named), max(len(v) for v in wb.named.values()), pushed_out)))
+        riff = b"RIFF" + (36).to_bytes(4, "little") + b"WAVEfmt " + bytes(28)
+        ihdr = png[:8 + 25]                                    # the signature and the header chunk
+        cut = {"figures/sound.webp": riff, "figures/sound.png": riff, "figures/signature_only.png": png[:8], "figures/header_only.png": ihdr,
+               "figures/no_end.png": png[:-12], "figures/bad_crc.png": png[:29] + bytes([png[29] ^ 1]) + png[30:], "figures/tail.png": png + b"<script>",
+               "figures/photo.jpg": b"\xff\xd8\xff\xe0" + bytes(16), "figures/anim.gif": b"GIF89a" + bytes(16)}
+        shas = {rel: put(rel, data) for rel, data in cut.items()}
+        VIEW_FNS["fit"] = lambda run: {"checks": [], "facts": {}, "charts": [], "notes": {}, "images": declared, "tables": {"images": {
+            "columns": ["figure", "path", "sha256", "title", "caption"], "rows": [[rel, rel, sha, None, None] for rel, sha in shas.items()]}}}
+        wb.api_view(rid, "fit")
+        got = {rel: get(rel, sha) for rel, sha in shas.items()}
+        ok("W56 review 2: a file is served only when it has the structure of the image its name says: a sound file named as an image, a "
+           "signature with nothing after it, a header with no image data, no end, a damaged chunk and bytes after the end are all refused",
+           all(code == 415 and (len(cut[rel]) <= 8 or cut[rel][8:] not in body) for rel, (code, _, body, _) in got.items()) and get(image, built[image])[0] == 200,
+           str({rel: code for rel, (code, _, _, _) in got.items()}))
+        slow = Workbench([], [d])
+        slow.scan()
+        slow.named = dict(wb.named)
+        slow.file_wait = 0.01
+        seen, target = [], "/api/file?" + urllib.parse.urlencode({"run": rid, "path": image, "sha": built[image]})
+
+        def send(code, headers, body, depth=[0]):
+            seen.append(code)
+            if depth[0] < FILES_AT_ONCE:           # while this answer is still being written, another request arrives
+                depth[0] += 1
+                answer(slow, "GET", target, "127.0.0.1:8790", b"", {}, send)
+        answer(slow, "GET", target, "127.0.0.1:8790", b"", {}, send)
+        after = []
+        answer(slow, "GET", target, "127.0.0.1:8790", b"", {}, lambda code, headers, body: after.append((code, headers.get("Content-Type"))))
+        ok("W57 review 9: no more than FILES_AT_ONCE images are held at once, each until it is written; one more waits, then is told to ask again",
+           seen == [200] * FILES_AT_ONCE + [503] and after == [(200, "image/png")], str((seen, after)))
+        fake = put("figures/not_an_image.png", b"<svg xmlns='http://www.w3.org/2000/svg'><script>1</script></svg>")
+        chart = {"kind": "bars", "table": "t", "x": "a", "y": "b", "title": "T", "how_to_read": "H"}
+        VIEW_FNS["model"] = lambda run: {"tables": {"t": {"columns": ["a", "b"], "rows": [["x", 1]]}}, "charts": [
+            dict(chart, image={"path": "figures/timeline.png", "hash": built["figures/timeline.png"], "title": "as drawn"}),
+            dict(chart, image={"path": "figures/not_an_image.png", "hash": fake})]}
+        before = refused("figures/timeline.png", built["figures/timeline.png"])
+        doc = wb.api_view(rid, "model")
+        ok("W50 a chart's `image` names a file too: it is served once the view that carries it has been sent, and not before",
+           before and chart_problems(doc) == [] and get("figures/timeline.png", built["figures/timeline.png"])[:2] == (200, "image/png")
+           and [len(chart_problems({**doc, "charts": [dict(chart, image=im)]})) for im in (
+               {"path": "figures/timeline.png"}, {"path": "figures/timeline.png", "hash": "abc"}, "figures/timeline.png",
+               {"path": "figures/timeline.png", "hash": "0" * 64, "width": 3})] == [1, 1, 1, 1], str(chart_problems(doc)))
+        code, _, body, _ = get("figures/not_an_image.png", fake)
+        ok("W51 a file named as an image that does not begin as one is refused, although a view named it with its hash",
+           code == 415 and b"script" not in body, str((code, body)))
+        codes = [get(image, built[image])[0], get(image, "0" * 64)[0], get("figures/timeline.csv", "0" * 64)[0], get("../elsewhere.png", named["../elsewhere.png"])[0],
+                 get("figures/frontier.png", built["figures/frontier.png"])[0], get("figures/none.png", "0" * 64)[0], get(image, "abc")[0], get(image, built[image], run="nope")[0]]
+        ok("W52 each refusal has its own answer and a reason in plain text: 403 not named or outside the run, 409 the file changed, 415 not a "
+           "raster image, 400 no hash, 404 no such run", codes == [200, 403, 415, 403, 409, 403, 400, 404]
+           and get(image, "0" * 64)[2].startswith(b"not served: ") and get(image, "0" * 64)[1].startswith("text/plain"), str(codes))
+        sent, page = response_headers("image/png", 3, get(image, built[image])[3]), response_headers("text/html", 3)
+        ok("W53 the handler sends an image under its own policy and the page under the page's; nothing is stored, and no type is guessed",
+           sent["Content-Security-Policy"] == FILE_CSP and page["Content-Security-Policy"] == CSP and "img-src 'self'" in CSP
+           and all(h["Cache-Control"] == "no-store" and h["X-Content-Type-Options"] == "nosniff" for h in (sent, page))
+           and sent["Content-Type"] == "image/png" and sent["Content-Length"] == "3", str(sent))
+        good = {"images": declared, "tables": {"images": {"columns": ["figure", "path", "sha256", "title", "caption"], "rows": []}}}
+        script = open(os.path.join(STATIC, "app.js")).read()
+        ok("W54 image declarations: every documented key is read by the page; an unknown key, table or column is reported; "
+           "the Figures view's own declaration on a fixture run is one the page can draw",
+           image_problems(good) == [] and [len(image_problems({**good, "images": [dict(declared[0], **e)]})) for e in (
+               {"colour": "red"}, {"table": "none"}, {"hash": "z"}, {"group": "z"}, {"details": ["figure", "z"]}, {"details": "figure"},
+               {"flag": "z"}, {"reason": "z"}, {"after": "none"})] == [1] * 9 and image_problems({**good, "images": [dict(declared[0], after="images", flag="title", reason="caption")]}) == []
+           and len(chart_problems({"tables": {"t": {"columns": ["a", "b"], "rows": []}}, "charts": [{"kind": "bars", "table": "t", "x": "a", "y": "b", "title": "T", "how_to_read": "H", "after": "none"}]})) == 1
+           and all(re.search(rf"\bd\.{k}\b|\b(at\(|text\(r, )\"{k}\"\)", script) for k in IMAGE_KEYS) and all(k in __doc__ for k in IMAGE_KEYS + ("IMAGE_KEYS", "FILE_TYPES", "FILE_CSP"))
+           and all(re.search(rf"\bim\.{k}\b", script) for k in CHART_IMAGE_KEYS)
+           and image_problems(wb.api_view(rid, "figures")) == [] and len(named_images(wb.api_view(rid, "figures"))) > 3
+           and wb.api_view(rid, "figures")["images"][0]["table"] == "images", str(image_problems(wb.api_view(rid, "figures"))))
+    finally:
+        for name in ("spec", "model", "fit"):
+            VIEW_FNS.pop(name, None)
 
 
 def _self_test_notes(tmp, ok):

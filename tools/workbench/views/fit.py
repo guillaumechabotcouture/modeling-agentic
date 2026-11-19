@@ -32,7 +32,7 @@ from views.fit_adapters import (BLOCK_MEANING, CAL, COLUMNS, CONTRACTED, DT, ESS
                                 GROUP_BIAS, GROUP_COLUMNS, JC, NEAR, RHAT_MAX, SIGNED, SIGNOFF, STATUSES, UNC,
                                 UNIT_BOUND_SHARE,
                                 _at_bound, _cap, _dicts, _g, _names, groups, model)
-from views.fit_charts import charts as _charts  # noqa: E402
+from views.fit_charts import beside as _beside, charts as _charts  # noqa: E402
 
 CHECKS = {"status": "C13", "region": "C13", "changes": "C2", "emulator_vs_engine": None, "unit_bounds": None,
           "target_error": "C3", "constrained": "C14", "replicates": None, "near_cutoff": None, "group_bias": None,
@@ -70,7 +70,7 @@ def _covered(covers):
     """(covered by a declaration whose test ran, the words for the sentence)."""
     if not covers:
         return False, "not covered by any signed declaration"
-    said = "; ".join(sorted({f"{c['test']} ({'verdict ' + str(c['verdict']) if c['ran'] else 'did not run'})" for c in covers}))
+    said = "; ".join(sorted({f"{c['test']} ({'verdict ' + str(c['verdict']) if c['ran'] else c.get('why') or 'did not run'})" for c in covers}))
     return all(c["ran"] for c in covers), f"declared with decision test {said}"
 
 
@@ -433,7 +433,7 @@ def view(run):
                               f"({type(e).__name__}: {' '.join(str(e).split())[:120]}).", [(m["file"], "data")]))
         _relate(out)
         try:
-            charts = _charts(m)
+            charts = _beside(_charts(m), _checks.harness_figures(run))
         except Exception as e:
             charts, m["notes"]["charts_not_available"] = [], f"The charts could not be declared ({type(e).__name__}: {e})."
         return {"checks": out, "facts": {k: m["facts"].get(k) for k in FACTS}, "tables": m["tables"], "charts": charts,
@@ -481,7 +481,7 @@ PLANTED = (
 
 def _self_test():
     import shutil
-    from views.fit_bench import Bench, absent, check, close, data, fixture_builder, need, rewrite, row, says, statuses, table
+    from views.fit_bench import Bench, absent, check, close, data, fixture_builder, need, restamp, rewrite, row, says, statuses, table
     b = Bench(view)
     folder, look_at, case, tmp, wb_dir = b.folder, b.look_at, b.case, b.tmp, _WB
     jc_rel, cal_rel = JC, CAL
@@ -752,13 +752,15 @@ def _self_test():
 
         def edit(d):
             with open(os.path.join(d, "decision_spec.yaml"), encoding="utf-8") as f:
-                spec = yaml.safe_load(f)
+                was = f.read()
+            spec = yaml.safe_load(was)
             change(spec)
             text = yaml.safe_dump(spec, sort_keys=False)
             for rel in ("decision_spec.yaml", SIGNED):
                 with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
                     f.write(text)
             if resign:
+                restamp(d, hashlib.sha256(was.encode()).hexdigest(), hashlib.sha256(text.encode()).hexdigest())
                 with open(os.path.join(d, "decision_spec.signoff.json"), encoding="utf-8") as f:
                     so = json.load(f)
                 so["sha256"]["decision_spec.yaml"] = hashlib.sha256(text.encode()).hexdigest()
@@ -1009,6 +1011,10 @@ def _self_test():
             c = check(look_at(b.edited(hm, pair("DT2", **words), "C13_blocked_declared")), "status")
             need(c["status"] == "problem", f"{words}: a declared test whose status and verdict are no pair the analysis "
                                            f"writes did not run, as in the register ({c['status']}: {c['says']!r})")
+
+        c = check(look_at(b.edited(hm, rewrite(dt, lambda doc: doc.update(spec_sha256="1" * 64)), "C13_blocked_declared")), "status")
+        need(c["status"] == "problem" and "another spec" in says(c),
+             f"a declared test recorded for another spec than the signed one covers nothing, as in the register and the Model view ({c['status']}: {c['says']!r})")
 
         def to_brief(d):
             os.rename(os.path.join(d, "decision_spec.signoff.json"), os.path.join(d, "decision_brief.signoff.json"))
