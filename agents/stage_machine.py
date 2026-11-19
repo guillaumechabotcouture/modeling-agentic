@@ -2406,6 +2406,22 @@ def _self_test() -> int:
         s7 = load_state(d).status
         ok(s7 == "run_failed" and "relaunch with reuse" in str(load_state(d).history[-1].get("why")),
            f"R3-7c a pause at OWNER_DECISION with no recorded request fails with how to go on ({s7})")
+        # R3-7e (narrow Codex review of #272): a resume whose preconditions fail ends the run run_failed before any
+        # handler runs; an earlier report.md is not left deliverable under that status; malformed signing evidence is
+        # "unreadable", never a crash or "present"
+        d, T, st = new_run("noreq_resume", {})
+        st.state = "OWNER_DECISION"
+        save_state(d, st)
+        open(os.path.join(d, "report.md"), "w").write("# Report\n\nStatus: completed\n")
+        s7e = _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s7e == "run_failed" and not os.path.exists(os.path.join(d, "report.md"))
+           and os.path.exists(os.path.join(d, "report_withheld.md")),
+           f"R3-7e a run failed on resume does not leave an earlier report deliverable ({s7e})")
+        d7f = os.path.join(td, "r37f")
+        os.makedirs(d7f)
+        for bad in ({"sha256": "invalid"}, {"spec_sha256": "invalid"}, ["x"]):
+            json.dump(bad, open(os.path.join(d7f, SIGNOFF_FILE), "w"))
+            ok(_spec_signed_sha(d7f) == "unreadable", f"R3-7f a malformed sign-off record reads unreadable ({bad})")
         # R3-5 (Codex review of #258 P1-10): the amendment check runs on every gate route: a structural PLAN blocker
         # whose remedy is an owner amendment does not take GATE -> SPEC
         amend5 = dict(amend, id="D-035", category="STRUCTURAL")
@@ -2459,7 +2475,9 @@ def _self_test() -> int:
         finally:
             _mod8.v2_gate = _vg
         g8 = json.load(open(os.path.join(d, "gate_r1.json")))
-        ok(g8.get("rule_matched") != "owner_declined" and FL.load(d)[fid8].status != "owner_declined",
+        f8 = FL.load(d)[fid8]
+        ok(g8.get("action") == "DECLARE_SCOPE" and g8.get("rule_matched") != "owner_declined" and f8.status == "open"
+           and f8.claim == "the new claim",
            f"R3-8 a declined gate finding restated with a revised claim is not held by the old decline "
            f"({g8.get('rule_matched')}, {FL.load(d)[fid8].status})")
 
