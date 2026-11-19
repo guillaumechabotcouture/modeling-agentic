@@ -50,14 +50,23 @@ def _cpuinfo(path="/proc/cpuinfo") -> dict:
 
 
 def _vm_size(timeout=2.0):
-    try:
-        import urllib.request
-        req = urllib.request.Request(IMDS, headers={"Metadata": "true"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:      # noqa: S310 (the fixed link-local IMDS address)
-            d = json.loads(r.read().decode())
-        return {"vm_size": d.get("vmSize"), "location": d.get("location")}
-    except Exception as e:  # noqa: BLE001 -- off Azure, or IMDS blocked: recorded, never raised
-        return {"vm_size": None, "error": type(e).__name__}
+    """The Azure VM size from IMDS, bounded in total by `timeout` (a reply that trickles in cannot hold a worker)."""
+    import threading
+    box = {}
+
+    def ask():
+        try:
+            import urllib.request
+            req = urllib.request.Request(IMDS, headers={"Metadata": "true"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:      # noqa: S310 (the fixed link-local address)
+                d = json.loads(r.read(65536).decode())
+            box["r"] = {"vm_size": d.get("vmSize"), "location": d.get("location")}
+        except Exception as e:  # noqa: BLE001 -- off Azure, or IMDS blocked: recorded, never raised
+            box["r"] = {"vm_size": None, "error": type(e).__name__}
+    t = threading.Thread(target=ask, daemon=True)
+    t.start()
+    t.join(timeout)
+    return box.get("r") or {"vm_size": None, "error": f"no answer within {timeout:g} s"}
 
 
 def probe(cpuinfo_path="/proc/cpuinfo", imds=True) -> dict:
@@ -132,12 +141,14 @@ def _workers(client_factory=None, timeout_s: float = RUN_TIMEOUT_S) -> dict:
 
 
 def _key(p: dict) -> dict:
-    blas = p.get("blas") if isinstance(p.get("blas"), list) else []
+    blas = p.get("blas")
+    env = {k: v for k, v in sorted((p.get("threads_env") or {}).items()) if v is not None}
     return {"cpu_model": (p.get("cpu") or {}).get("model"), "vm_size": (p.get("azure") or {}).get("vm_size"),
             "flags": " ".join((p.get("cpu") or {}).get("flags") or []),
-            "blas": " ".join(sorted(f"{b.get('internal_api')}-{b.get('version')}-{b.get('architecture')}"
-                                    f"-{b.get('threading_layer')}-t{b.get('num_threads')}" for b in blas)),
-            "threads_env": " ".join(f"{k}={v}" for k, v in sorted((p.get("threads_env") or {}).items()) if v)}
+            "blas": None if not isinstance(blas, list) else
+            json.dumps(sorted([b.get(k) for k in ("internal_api", "version", "architecture", "threading_layer",
+                                                  "num_threads")] for b in blas), default=str),
+            "threads_env": json.dumps(env)}
 
 
 def merge(doc: dict, local: dict, workers: dict) -> dict:
@@ -169,11 +180,12 @@ def merge(doc: dict, local: dict, workers: dict) -> dict:
     doc["n_workers_seen"] = len(seen)
     same = all(len(v) == 1 for k, v in doc["distinct"].items() if k != "vm_size") and \
         len([v for v in doc["distinct"]["vm_size"] if v != "None"]) <= 1
-    doc["one_platform"] = None if not seen or "None" in doc["distinct"]["cpu_model"] else same
+    unknown = not seen or "None" in doc["distinct"]["cpu_model"] or "None" in doc["distinct"]["blas"]
+    doc["one_platform"] = None if unknown else same
     return doc
 
 
-def record(out: str, client_factory=None, local=None) -> dict:
+def record(out: str, client_factory=None, local=None, lock_s: float = 60.0) -> dict:
     """One round. Never raises: a problem is returned under `error` (and printed by main). An existing record that
     cannot be read is never overwritten. Rounds on one record are serialised by a lock file."""
     import fcntl
@@ -182,9 +194,17 @@ def record(out: str, client_factory=None, local=None) -> dict:
     except OSError as e:
         return {"error": f"the record cannot be written: {type(e).__name__}: {e}"}
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        t0 = time.time()
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() - t0 > lock_s:
+                    return {"error": f"{out}.lock held for over {lock_s:g} s; this round skipped"}
+                time.sleep(0.1)
         doc = {"producer": "cloud/platform_probe.py"}
-        if os.path.exists(out):
+        if os.path.lexists(out):
             try:
                 doc = json.load(open(out))
                 if not isinstance(doc, dict):
@@ -218,19 +238,25 @@ def main(argv=None) -> int:
     r.add_argument("--until", default=None, help="stop once this file exists")
     a = ap.parse_args(argv)
     import math
-    if not math.isfinite(a.every) or a.every < 0:
-        print(f"--every {a.every}: seconds >= 0", file=sys.stderr)
+    if not math.isfinite(a.every) or not 0 <= a.every <= 86400:
+        print(f"--every {a.every}: seconds in [0, 86400]", file=sys.stderr)
         return 2
+
+    def say(msg):
+        try:
+            print(msg, flush=True)
+        except (OSError, ValueError):            # a closed log pipe never fails the probe
+            pass
     while True:
         try:
             d = record(a.out)
             if "error" in d:
-                print(f"platform probe: {d['error']}", flush=True)
+                say(f"platform probe: {d['error']}")
             if "distinct" in d:
-                print(f"platform: {d['n_workers_seen']} worker(s), one platform: {d['one_platform']}, "
-                      f"cpu {d['distinct']['cpu_model']}", flush=True)
+                say(f"platform: {d['n_workers_seen']} worker(s), one platform: {d['one_platform']}, "
+                    f"cpu {d['distinct']['cpu_model']}")
         except Exception as e:  # noqa: BLE001 -- fail soft: never stop the job
-            print(f"platform probe failed: {type(e).__name__}: {e}", flush=True)
+            say(f"platform probe failed: {type(e).__name__}: {e}")
         if not a.every or (a.until and os.path.exists(a.until)):
             return 0
         time.sleep(a.every)
@@ -364,8 +390,53 @@ def _self_test() -> int:
         [t.start() for t in th]
         [t.join() for t in th]
         ok(json.load(open(p18))["n_workers_seen"] == 6, "PP18 overlapping rounds on one record lose no worker")
-        ok(main(["record", os.path.join(d, "p19.json"), "--every", "nan"]) == 2,
-           "PP19 a negative or non-finite --every is refused")
+        ok(main(["record", os.path.join(d, "p19.json"), "--every", "nan"]) == 2
+           and main(["record", os.path.join(d, "p19.json"), "--every", "1e20"]) == 2,
+           "PP19 a negative, non-finite or over-a-day --every is refused")
+        # Codex re-review of #274 (P1s):
+        a20 = w("Xeon 8370C", "Standard_E8s_v5")
+        a20["threads_env"] = {"MKL_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
+        b20 = w("Xeon 8370C", "Standard_E8s_v5")
+        b20["threads_env"] = {"MKL_NUM_THREADS": "1 OMP_NUM_THREADS=1"}
+        d20 = record(os.path.join(d, "p20.json"), lambda: FakeClient({"tls://a": b20}), local=a20)
+        ok(d20["one_platform"] is False, f"PP20 thread settings compare exactly, not as joined text: {d20['distinct']}")
+        a21 = dict(w("Xeon 8370C", "Standard_E8s_v5"), blas={"error": "ImportError"})
+        b21 = dict(w("Xeon 8370C", "Standard_E8s_v5"), blas=[])
+        d21 = record(os.path.join(d, "p21.json"), lambda: FakeClient({"tls://a": b21}), local=a21)
+        ok(d21["one_platform"] is None, f"PP21 a BLAS that could not be read makes the answer unknown: {d21['one_platform']}")
+        import fcntl
+        p22 = os.path.join(d, "p22.json")
+        held = open(p22 + ".lock", "a")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        t0 = time.time()
+        d22 = record(p22, lambda: FakeClient({}), local=loc, lock_s=0.5)
+        held.close()
+        ok(time.time() - t0 < 3 and "lock" in d22.get("error", ""), f"PP22 a held lock is waited for a bounded time: {d22}")
+        p23 = os.path.join(d, "p23.json")
+        os.symlink(os.path.join(d, "nodir", "target.json"), p23)
+        d23 = record(p23, lambda: FakeClient({}), local=loc)
+        ok(os.path.islink(p23) and "error" in d23, f"PP23 an output path that is a dangling link is not replaced: {d23}")
+        import urllib.request
+        slow = lambda *a_, **k: time.sleep(10)     # noqa: E731 -- an IMDS that never finishes its answer
+        t0 = time.time()
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = slow
+        try:
+            v = _vm_size(timeout=0.5)
+        finally:
+            urllib.request.urlopen = orig
+        ok(time.time() - t0 < 3 and v.get("vm_size") is None, f"PP24 the IMDS read is bounded in total: {v}")
+
+        class Pipe:
+            def write(self, s):
+                raise BrokenPipeError
+
+            def flush(self):
+                raise BrokenPipeError
+        import contextlib
+        with contextlib.redirect_stdout(Pipe()):
+            rc25 = main(["record", os.path.join(d, "p25.json")])
+        ok(rc25 == 0, "PP25 a closed log pipe does not fail the probe")
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1
