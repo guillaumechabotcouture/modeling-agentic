@@ -619,11 +619,68 @@ def _self_test() -> int:
        and "net_kill_shift" not in effect_parameters(mdoc["benchmarks"]["B8"], "0.16")
        and "net_kill_shift" in effect_parameters(mdoc["benchmarks"]["B8"], "0.17"),
        f"BC10 the malaria coverage's effect parameters exist in the engine; net_kill_shift counts from v0.17 ({bad})")
+    _self_test_posterior(ok, cov, both)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_posterior(ok, cov, both):
+    """BC11-BC15 (owner, 19 Nov): a benchmark a declared posterior's fit trains on takes its status from the fit's
+    verified chosen point; a held-out one gates on the record (and accepts a signed departure) as before."""
+    import hashlib
+    import tempfile
+    try:
+        bad = [{"id": "I", "status": "out_of_band"}, {"id": "P", "status": "out_of_band"},
+               {"id": "Q", "status": "in_band"}]
+        rec = lambda: (bad, None)  # noqa: E731
+        g0 = gate(cov, [], "e", both, rec, [], "unsigned")
+        g1 = gate(cov, [], "e", both, rec, [], "unsigned", trained={"I"})
+        ok(sorted(b["id"] for b in g0["blocking"]) == ["I", "P"] and [b["id"] for b in g1["blocking"]] == ["P"]
+           and g1["status_source"] == {"I": "posterior_chosen_point", "P": "results.yaml", "Q": "results.yaml"}
+           and g0["status_source"] == {"I": "results.yaml", "P": "results.yaml", "Q": "results.yaml"},
+           f"BC11 a trained benchmark takes its status from the posterior's chosen point, a held-out one from the "
+           f"record; the output records each status source: {g1['blocking']} {g1.get('status_source')}")
+        dep = {"engine": "e", "benchmark": "P", "reason": "why", "decision_test": "DT"}
+        g2 = gate(cov, [], "e", both, rec, [dep], "signed", trained={"I"}, runs=lambda *a: (True, ""))
+        g3 = gate(cov, [], "e", both, rec, [dep], "unsigned", trained={"I"}, runs=lambda *a: (True, ""))
+        ok(g2["why_not"] == [] and [d["benchmark"] for d in g2["departures"]] == ["P"] and g3["blocking"],
+           f"BC12 a held-out benchmark out of band still needs an owner-signed departure: {g2['why_not']} "
+           f"{g3['blocking']}")
+    except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+        ok(False, f"BC11-BC12 ({type(e).__name__}: {e})")
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.spec import schema
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        rows = [{"eff_a": 0.3 + 0.01 * i, "eff_b": 0.2 + 0.01 * i} for i in range(12)]
+        f = os.path.join(d, "nef.yaml")
+        NEF._fixture_placeholder(f, schema.load(p).engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
+        trained_by_replay = sorted(NEF.pack_bands())
+        doc = yaml.safe_load(open(f))
+        doc["plan"]["targets_train"] = [trained_by_replay[0], "not_a_replayed_target"]
+        yaml.safe_dump(doc, open(f, "w"), sort_keys=False)
+        raw["uncertainty"]["net_effect_posterior"] = {"path": "nef.yaml",
+                                                      "sha256": hashlib.sha256(open(f, "rb").read()).hexdigest()}
+        res = {}
+        for label, r in (("none", {k: v for k, v in raw.items() if k != "uncertainty"} | {
+                "uncertainty": {k: v for k, v in raw["uncertainty"].items() if k != "net_effect_posterior"}}),
+                         ("good", raw),
+                         ("bad", dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior={
+                             "path": "nef.yaml", "sha256": "0" * 64})))):
+            try:
+                res[label] = posterior_trained(r, r["engine"]["ref"], r["engine"].get("config"), d)
+            except Exception as e:  # noqa: BLE001
+                res[label] = (None, f"{type(e).__name__}: {e}")
+        ok(res["none"] == (None, None), f"BC13 without a posterior nothing is trained: {res['none']}")
+        ok(res["good"] == ({trained_by_replay[0]}, None),
+           f"BC14 the trained benchmarks are the file's targets_train that the loader's replay verified the chosen "
+           f"point on: {res['good']}")
+        ok(res["bad"][0] is None and "net_effect_posterior does not load" in str(res["bad"][1]),
+           f"BC15 a declared posterior that does not load fails closed: {res['bad']}")
 
 
 if __name__ == "__main__":
