@@ -1,6 +1,6 @@
 ---
 phase: "F6"
-commit: "OA refit b α–γ"
+commit: "OA refit b α–δ"
 ---
 
 ## Changelog
@@ -10,4 +10,4 @@ commit: "OA refit b α–γ"
 - the wave-2 box is pinned to that box;
 - a call that runs Muleba still runs the monitored arms.
 
-`--margin-loo` is refused (owner). An optional extension wave (`extension`: an LHS past a parameter's old ceiling) is wired, and stays unset until the owner sets the ceiling. `plan` prices only the new tasks: 1,344 arm runs without the extension (the monitored arm counted), about $9–13 on 48 vCPUs. The launch ships the tree plus the checkpoint (`vm_job --dir`) and resumes from it. Job f6-refit-optiona-b, cap $100. Self-tests FB1–FB6; F4, F10, FA1, FA3, FA4, FA10–FA12 updated.
+`--margin-loo` is refused (owner). pbo_adv_decay's ceiling for this fit is 2.23 per year (owner, option (a): the 99% interval of LLINEUP's waning minus the engine's own waning at x = 0.30; `PAD_CEILING` sets the fit box and the posterior's hard bound; priors.yaml keeps 1.895 because its test sits inside the engine fingerprint), with 100 extension points in 1.895–2.23, and the output records whether the chosen value sits within 2% of the ceiling. `plan` prices only the new tasks: 10,944 arm runs, 3.3–4.8 h and $40–58 on 96 vCPUs. The launch ships the tree plus the checkpoint (`vm_job --dir`) and resumes from it. Job f6-refit-optiona-b, cap $100. Self-tests FB1–FB8; F4, F10, FA1, FA3, FA4, FA10–FA12 updated.

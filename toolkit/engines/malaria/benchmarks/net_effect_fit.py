@@ -64,9 +64,18 @@ PROTECTED = ("fitted.yaml", "results.yaml")
 # widen). F6 option A: the PBO boxes are their card priors (priors.yaml: pbo_gain_scale 0.316-1.0 from Gleave 2021's
 # hut-trial mortality RR, pbo_adv_decay 0-1.895 per year from LLINEUP's Table 2), used now that PBO trials are targets.
 # Engine v0.18 (owner, 18 Nov, form P, fitted): net_deter_sat, PBO nets only, over its card prior (its domain 0-1).
+# Refit b, owner option (a), 2026-11-19: pbo_adv_decay's ceiling for this fit is 2.23 per year, the 99% interval of
+# LLINEUP's waning (as-treated, 6 -> 18 m: 0.546 + 2.576 x 0.535 = 1.924) minus the engine's own waning at bioassay
+# mortality x = 0.30 (-0.306 at the fitted net_deter_sat 0.451, vector.engine_adv_decay), the same rule as the card
+# prior's 95% bound (1.895). The 18 Nov fit's choice sat at 1.868 of 1.895. It sets this fit's box and the posterior's
+# hard bound (hard_bounds). The card prior file (priors.yaml, 0-1.895) is not edited: its test sits inside the engine's
+# code fingerprint, and an edit there would forfeit the stored checkpoint (ENGINE_NOTES.md, v0.18, refit b).
+PAD_CEILING = {"param": "pbo_adv_decay", "lo": 0.0, "hi": 2.23, "theta": 0.451,
+               "basis": "99% interval of LLINEUP's waning (as-treated, 6 -> 18 m) minus the engine's own waning at "
+                        "x = 0.30 (owner, 2026-11-19, option (a))"}
 NET_PARAMS = {"net_kill_shift": ({"pyr", "pbo", "dual"}, [-0.618, 0.66]),
               "pbo_gain_scale": ({"pbo"}, [0.316, 1.0]),
-              "pbo_adv_decay": ({"pbo"}, [0.0, 1.895]),
+              "pbo_adv_decay": ({"pbo"}, [PAD_CEILING["lo"], PAD_CEILING["hi"]]),
               "net_deter_sat": ({"pbo"}, [0.0, 1.0])}
 CONFOUNDED = [("pbo_gain_scale", "net_deter_sat")]   # owner, 18 Nov: report their joint posterior in the fit output
 # owner, 13 Nov: cfp_half joins the fit. cfp_half is the half-life, in days of net age, of the chlorfenapyr kill share
@@ -129,7 +138,7 @@ OPTION_A = {"targets": ["B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11", "B12", 
                         "design_box": {"net_kill_shift": [-0.618, 0.66], "pbo_gain_scale": [0.316, 1.0],
                                        "pbo_adv_decay": [0.0, 1.895], "net_deter_sat": [0.0, 1.0],
                                        "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95], "cfp_half": [270.0, 1650.0]},
-                        "extension": None}}
+                        "extension": {"n": 100, "seed": 37, "param": "pbo_adv_decay", "range": [1.895, 2.23]}}}
 # Verification round 2 (owner, 14 Nov): wave 2 (cluster 2377496) ran with candidates over the whole box, so its chosen
 # point and two failed points sat at cfp_half ~1,600 days, past wave 2's design box (extrapolation). This round reads
 # wave 2's engine results from its stored checkpoint (no design point rerun), refits with the candidates and the
@@ -836,6 +845,16 @@ def extension_points(design_box: dict, ext: dict | None) -> list:
             for u in BM.lhs(int(ext["n"]), len(names), int(ext["seed"]))]
 
 
+def edge_diagnostic(point: dict) -> dict:
+    """Owner, 19 Nov: whether the chosen pbo_adv_decay sits within 2% of the refit-b ceiling; if so, the engine cannot
+    reproduce LLINEUP's waning inside the widened prior, and the report says so."""
+    v, c = float(point[PAD_CEILING["param"]]), float(PAD_CEILING["hi"])
+    near = v >= c * 0.98
+    line = (f"pbo_adv_decay {v:.3f} is within 2% of its ceiling {c:g}: the engine cannot reproduce LLINEUP's waning "
+            f"inside the widened prior" if near else f"pbo_adv_decay {v:.3f} is below 98% of its ceiling {c:g}")
+    return {"value": v, "ceiling": c, "within_2pct": near, "line": line}
+
+
 def calibration_ok(cal: dict) -> list:
     """Sites whose control arm is off its calibration target by more than CAL_TOL (relative)."""
     return sorted(s for s, c in (cal or {}).items()
@@ -1158,6 +1177,8 @@ def hard_bounds(engine, names, both: bool = False) -> dict:
     out = {}
     for k in names:
         b = ([(*UNIT_BOUNDS[units[k]], f"card units {units[k]}")] if units.get(k) in UNIT_BOUNDS else []) + (
+            [(PAD_CEILING["lo"], PAD_CEILING["hi"], "refit b ceiling: " + PAD_CEILING["basis"])]
+            if k == PAD_CEILING["param"] else
             [(float(card[k].lo), float(card[k].hi), "priors.yaml range")] if k in card else [])
         if b:
             out[k] = b if both else (max(x[0] for x in b), min(x[1] for x in b), "; ".join(x[2] for x in b))
@@ -1357,7 +1378,8 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
                "band": byid[t].get("band")} for t in (OPTION_A.get("monitor") or []) if not smoke}
     waves["refit_b"] = ({"cache_sha256": OPTION_A["refit_b"]["cache_sha256"], "wave2_box": "the design box (pinned)",
                          "extension": ext, "extension_points": len(extra), "margin_loo": margin_loo,
-                         "departure": OPTION_A.get("departure"), "monitored": mon} if rb else None)
+                         "departure": OPTION_A.get("departure"), "monitored": mon,
+                         "pad_ceiling": PAD_CEILING, "edge": edge_diagnostic(best)} if rb else None)
     doc = document(eng, reg, q, smoke, approved=approved, cap_usd=cap_usd, n_sims=runner.nsims, waves=waves,
                    wall_s=round(time.time() - t0, 1), fitted_at=time.strftime("%F %T"),
                    calibration_grid={CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
@@ -2210,8 +2232,8 @@ def _self_test() -> int:
         ok(sorted(bx) == sorted(["net_kill_shift", "pbo_gain_scale", "pbo_adv_decay", "net_deter_sat", "cfp_kill",
                                  "irs_kill", "cfp_half"])
            and "pbo" in train_nets(p, split(p)[0])
-           and all(bx[k] == [card[k].lo, card[k].hi] for k in ("net_kill_shift", "pbo_gain_scale", "pbo_adv_decay",
-                                                                "net_deter_sat"))
+           and all(bx[k] == [card[k].lo, card[k].hi] for k in ("net_kill_shift", "pbo_gain_scale", "net_deter_sat"))
+           and bx["pbo_adv_decay"] == [PAD_CEILING["lo"], PAD_CEILING["hi"]]       # refit b's ceiling (FB7)
            and calibration_params(p) == {"net_kill_shift"}
            and _fit_settings(p) == ["benin", "irs_added", "llineup", "misungwi", "muleba"],
            f"FA2 option A fits net_kill_shift, pbo_gain_scale, pbo_adv_decay, net_deter_sat (v0.18), cfp_kill, "
@@ -2487,7 +2509,8 @@ def _self_test() -> int:
         from toolkit.engines.malaria import vector as V
         pt, lo, hi = V.adv_decay_from_prs((0.74, 0.62, 0.87), (0.84, 0.72, 0.98), 1.0, clip=False)
         s = (hi - pt) / 1.959964
-        k30 = V.engine_adv_decay(0.30, 182.5, 547.5, dict(V.NET_DEFAULTS, cfp_kill=0.0, cfp_half=1.0))
+        k30 = V.engine_adv_decay(0.30, 182.5, 547.5, dict(V.NET_DEFAULTS, cfp_kill=0.0, cfp_half=1.0,
+                                                           net_deter_sat=PAD_CEILING["theta"]))  # at the fitted theta
         ceil = round(pt + 2.575829 * s - k30, 2)
         hb = hard_bounds(e, ["pbo_adv_decay"])["pbo_adv_decay"]
         ext = rb.get("extension") or {}

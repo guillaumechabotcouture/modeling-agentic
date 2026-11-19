@@ -125,6 +125,38 @@ guess-sensitivity) is refused until `benchmarks/restamp_proof.py prove` shows th
 at the default and `restamp` re-stamps it. That proof runs engines, so it runs on Coiled through `cloud/vm_job.py`,
 not on a laptop.
 
+## v0.18, option A refit b: Muleba held out, pbo_adv_decay's ceiling widened (owner, 2026-11-19; no engine change)
+
+**What the 18 Nov fit found** (f6-refit-optiona, rc 2). No parameter set reproduces Muleba's durable PBO effect together
+with LLINEUP's waning:
+- B9b with B9f, and B9 with B9f, are jointly in band at 0 of 220 design points.
+- B9 with B9b is jointly in band at 6 points. All 6 have pbo_adv_decay 0.06–0.27, and at those points B9f is
+  0.22–0.32 against a band of 0.72–0.98.
+
+One global waning rate cannot carry both trials. B9 and B9b are therefore held out of the net-effect fit and
+monitored (`net_effect_fit.py` OPTION_A, `departure`).
+
+**The ceiling.** The fit chose pbo_adv_decay 1.868, against the card prior's 1.895. The prior's rule
+(`vector.pbo_adv_decay_extra`) takes LLINEUP's total waning of the PBO advantage from 6 to 18 months (as-treated
+prevalence ratios 0.74 and 0.84) and subtracts the engine's own waning. The bound is set at bioassay mortality x = 0.30,
+where the engine's PBO advantage grows with net age.
+
+| Basis | LLINEUP total waning, upper bound | Engine's own waning at x = 0.30 | Ceiling |
+|---|---|---|---|
+| Card prior (95%, θ = 1) | 1.594 | −0.301 | 1.895 |
+| Same rule at the fitted θ = 0.451 | 1.594 | −0.306 | 1.900 |
+| Refit b (99%, θ = 0.451) | 0.546 + 2.576 × 0.535 = 1.924 | −0.306 | 2.23 |
+
+The refit-b row is the owner's choice (option a). The refit adds 100 extension points with pbo_adv_decay in
+1.895–2.23; every other parameter spans the design box. The fit's box and the posterior's hard bound are set from
+`net_effect_fit.PAD_CEILING`.
+
+`priors.yaml` keeps 0–1.895, because its test (engine.py NE2) is inside the engine's code fingerprint. Editing it would
+change the code identity and forfeit the stored checkpoint of the 18 Nov fit.
+
+The fit output records whether the chosen value sits within 2% of 2.23 (`waves.refit_b.edge`). If it does, the engine
+cannot reproduce LLINEUP's waning inside the widened prior, and the report says so.
+
 ## v0.17 scope: the net-type relative effects as parameters with ranges (owner, 2026-11-12 and 13; written before any fit)
 
 **What changed.** Up to v0.16 the inputs that decide between net types were module constants: the Churcher 2016 hut-trial coefficients (`vector.CHURCHER`, the PBO equation among them) and the way PBO's advantage decays. The uncertainty step never varied them, and the value-of-information estimate ignored them. v0.17 adds three engine parameters (kind `fixed`). At their defaults the engine gives v0.16's outputs exactly. All three are drawn card priors (`priors.yaml`).
