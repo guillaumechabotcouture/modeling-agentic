@@ -661,59 +661,84 @@ def _self_test() -> int:
 
 
 def _self_test_posterior(ok, cov, both):
-    """BC11-BC15 (owner, 19 Nov): a benchmark a declared posterior's fit trains on takes its status from the fit's
-    verified chosen point; a held-out one gates on the record (and accepts a signed departure) as before."""
+    """BC11-BC16 (owner, 19 Nov): a benchmark a declared posterior's fit trains on takes its status from the fit's
+    verified chosen point, when the fit verified it against the same declaration the record is bound to; a held-out
+    one gates on the record (and accepts a signed departure) as before."""
     import hashlib
     import tempfile
     try:
-        bad = [{"id": "I", "status": "out_of_band"}, {"id": "P", "status": "out_of_band"},
-               {"id": "Q", "status": "in_band"}]
+        bad = [{"id": "I", "status": "out_of_band", "band_sha256": "dI"},
+               {"id": "P", "status": "out_of_band", "band_sha256": "dP"},
+               {"id": "Q", "status": "in_band", "band_sha256": "dQ"}]
         rec = lambda: (bad, None)  # noqa: E731
         g0 = gate(cov, [], "e", both, rec, [], "unsigned")
-        g1 = gate(cov, [], "e", both, rec, [], "unsigned", trained={"I"})
+        g1 = gate(cov, [], "e", both, rec, [], "unsigned", trained={"I": "dI"})
         ok(sorted(b["id"] for b in g0["blocking"]) == ["I", "P"] and [b["id"] for b in g1["blocking"]] == ["P"]
            and g1["status_source"] == {"I": "posterior_chosen_point", "P": "results.yaml", "Q": "results.yaml"}
            and g0["status_source"] == {"I": "results.yaml", "P": "results.yaml", "Q": "results.yaml"},
            f"BC11 a trained benchmark takes its status from the posterior's chosen point, a held-out one from the "
            f"record; the output records each status source: {g1['blocking']} {g1.get('status_source')}")
+        g1b = gate(cov, [], "e", both, rec, [], "unsigned", trained={"I": "another declaration"})
+        ok(sorted(b["id"] for b in g1b["blocking"]) == ["I", "P"] and g1b["status_source"]["I"] == "results.yaml",
+           f"BC11b (Codex r1) a trained benchmark verified against another declaration (same id, other band, arms or "
+           f"setting) gates on the record: {g1b['blocking']}")
         dep = {"engine": "e", "benchmark": "P", "reason": "why", "decision_test": "DT"}
-        g2 = gate(cov, [], "e", both, rec, [dep], "signed", trained={"I"}, runs=lambda *a: (True, ""))
-        g3 = gate(cov, [], "e", both, rec, [dep], "unsigned", trained={"I"}, runs=lambda *a: (True, ""))
+        g2 = gate(cov, [], "e", both, rec, [dep], "signed", trained={"I": "dI"}, runs=lambda *a: (True, ""))
+        g3 = gate(cov, [], "e", both, rec, [dep], "unsigned", trained={"I": "dI"}, runs=lambda *a: (True, ""))
         ok(g2["why_not"] == [] and [d["benchmark"] for d in g2["departures"]] == ["P"] and g3["blocking"],
            f"BC12 a held-out benchmark out of band still needs an owner-signed departure: {g2['why_not']} "
            f"{g3['blocking']}")
     except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
         ok(False, f"BC11-BC12 ({type(e).__name__}: {e})")
     from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines.benchmark_sources import band_digest
     from toolkit.spec import schema
+    base = yaml.safe_load(open(NEF.PACK))
+    decl = {b["id"]: b for b in base["benchmarks"]}
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
         raw = yaml.safe_load(open(p))
         rows = [{"eff_a": 0.3 + 0.01 * i, "eff_b": 0.2 + 0.01 * i} for i in range(12)]
         f = os.path.join(d, "nef.yaml")
         NEF._fixture_placeholder(f, schema.load(p).engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
-        trained_by_replay = sorted(NEF.pack_bands())
-        doc = yaml.safe_load(open(f))
-        doc["plan"]["targets_train"] = [trained_by_replay[0], "not_a_replayed_target"]
-        yaml.safe_dump(doc, open(f, "w"), sort_keys=False)
-        raw["uncertainty"]["net_effect_posterior"] = {"path": "nef.yaml",
-                                                      "sha256": hashlib.sha256(open(f, "rb").read()).hexdigest()}
+        replayed = sorted(NEF.pack_bands())
+        t0, t1 = replayed[0], replayed[1]
+
+        def signed(edit):
+            doc = yaml.safe_load(open(f))
+            edit(doc)
+            yaml.safe_dump(doc, open(os.path.join(d, "nef2.yaml"), "w"), sort_keys=False)
+            return {"path": "nef2.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef2.yaml"), "rb").read())
+                    .hexdigest()}
+        none = {k: v for k, v in raw.items() if k != "uncertainty"} | {
+            "uncertainty": {k: v for k, v in raw["uncertainty"].items() if k != "net_effect_posterior"}}
+        cases = {"none": lambda: none,
+                 "good": lambda: dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior=signed(
+                     lambda doc: doc["plan"].update(targets_train=[t0, t1, "not_a_replayed_target"],
+                                                    held_out_untouched=[t1])))),
+                 "bad": lambda: dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior={
+                     "path": "nef.yaml", "sha256": "0" * 64}))}
         res = {}
-        for label, r in (("none", {k: v for k, v in raw.items() if k != "uncertainty"} | {
-                "uncertainty": {k: v for k, v in raw["uncertainty"].items() if k != "net_effect_posterior"}}),
-                         ("good", raw),
-                         ("bad", dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior={
-                             "path": "nef.yaml", "sha256": "0" * 64})))):
+        for label, mk in cases.items():
             try:
+                r = mk()
                 res[label] = posterior_trained(r, r["engine"]["ref"], r["engine"].get("config"), d)
             except Exception as e:  # noqa: BLE001
                 res[label] = (None, f"{type(e).__name__}: {e}")
         ok(res["none"] == (None, None), f"BC13 without a posterior nothing is trained: {res['none']}")
-        ok(res["good"] == ({trained_by_replay[0]}, None),
-           f"BC14 the trained benchmarks are the file's targets_train that the loader's replay verified the chosen "
-           f"point on: {res['good']}")
+        ok(res["good"] == ({t0: band_digest(decl[t0], base)}, None),
+           f"BC14 the trained benchmarks are the file's targets_train, less any it lists as held out, that the "
+           f"loader's replay verified the chosen point on, each with its declaration's digest: {res['good']}")
         ok(res["bad"][0] is None and "net_effect_posterior does not load" in str(res["bad"][1]),
            f"BC15 a declared posterior that does not load fails closed: {res['bad']}")
+        try:            # Codex r1: the toy-engine exemption does not skip loading a declared posterior
+            r = cases["bad"]()
+            got = assess(r["engine"]["ref"], r["engine"].get("config"), r, "unsigned", base=d)
+        except Exception as e:  # noqa: BLE001
+            got = {"why_not": [f"{type(e).__name__}: {e}"]}
+        ok(any("net_effect_posterior does not load" in w for w in got["why_not"]),
+           f"BC16 an engine whose declared posterior does not load is not eligible, toy engines included: "
+           f"{got['why_not'][:1]}")
 
 
 if __name__ == "__main__":
