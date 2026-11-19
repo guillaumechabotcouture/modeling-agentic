@@ -294,10 +294,10 @@ def _self_test_posterior(ok) -> None:
     u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
     rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
 
-    def run_dir(d, eng=None, post=None, sources=None):
+    def run_dir(d, eng=None, post=None, sources=None, point=None):
         p = schema.toy_spec(d)
         NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), eng or schema.load(p).engine(), rows,
-                                 {"eff_a": [0, 1], "eff_b": [0, 1]})
+                                 {"eff_a": [0, 1], "eff_b": [0, 1]}, point=point)
         raw = yaml.safe_load(open(p))
         raw["uncertainty"]["net_effect_posterior"] = post or {
             "path": "nef.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()}
@@ -373,10 +373,16 @@ def _self_test_posterior(ok) -> None:
     rows_hi = rows
     with tempfile.TemporaryDirectory() as d:
         rows[:] = [{"eff_a": round(0.55 + 0.15 * x, 6), "eff_b": r["eff_b"]} for x, r in zip(u, rows_hi)]
-        run_dir(d)                                   # eff_a's hull 0.55-0.70 leaves its point value 0.5 outside
+        # eff_a's hull 0.55-0.70 leaves the fit's chosen point 0.5, the run's point value (v2-posterior-point), outside
+        run_dir(d, point={"eff_a": 0.5, "eff_b": rows[0]["eff_b"]})
         got = problems(d, None, None)
         ok(any("point value" in g and "eff_a" in g for g in got),
            f"PC17 a run whose point value of a posterior column is outside its range is refused: {got[:1]}")
+    with tempfile.TemporaryDirectory() as d:
+        run_dir(d, point=False)
+        got = problems(d, None, None)
+        ok(any("net_effect_posterior" in g and "chosen point" in g for g in got),
+           f"PC18 (v2-posterior-point) a posterior without a verified chosen point cannot be signed: {got[:1]}")
 
 
 def _self_test() -> int:

@@ -1800,6 +1800,84 @@ def _self_test_posterior_ranges(ok, q):
         s = rep["parameter_samples"]["eff_a"]
         ok(hull["eff_a"][0] <= s["ci_low"] < s["ci_high"] <= hull["eff_a"][1],
            f"RNP2 the draws of a posterior column stay inside its hull: {s}")
+        ok(man["engine"].get("point_source") == {"eff_a": "posterior_chosen_point", "eff_b": "posterior_chosen_point"}
+           and man["engine"].get("posterior_point") == rows[0],
+           f"RNP3 (v2-posterior-point) the manifest records each posterior column's point source and the fit's chosen "
+           f"point: {man['engine'].get('point_source')} {man['engine'].get('posterior_point')}")
+    _self_test_posterior_point(ok)
+
+
+def _self_test_posterior_point(ok):
+    """RPP1-RPP5 (v2-posterior-point): with a declared net-effect posterior, the fit's verified chosen point is the point
+    value of every posterior column, in the analysis (core.Analysis.theta0) and in the joint calibration's held values
+    (joint_calibration.theta0) alike; a spec value that differs from it is refused, and a fit without a chosen point
+    fails closed. Without the field nothing changes. No engine runs: the analysis is only constructed."""
+    import hashlib
+    import tempfile
+    import numpy as np
+    import yaml
+    from toolkit.analysis import joint_calibration as JC
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    u = [float(v) for v in np.random.default_rng(5).uniform(0, 1, 24)]
+    rows = [{"eff_a": round(0.3 + 0.4 * x, 6), "eff_b": round(0.12 + 0.3 * (1 - x), 6), "synergy": round(0.2 * x, 6)}
+            for x in u]
+    chosen = {"eff_a": 0.41, "eff_b": 0.27, "synergy": 0.05}
+
+    def setup(d, point=None, spec_value=None, posterior=True):
+        """The toy spec; with `spec_value`, synergy is a spec engine parameter drawn over a range and a posterior
+        column too (without, the posterior holds the two fitted columns)."""
+        p = schema.toy_spec(d, n=24)
+        r = yaml.safe_load(open(p))
+        cols = ["eff_a", "eff_b"] + (["synergy"] if spec_value is not None else [])
+        if spec_value is not None:
+            r["engine_parameters"] = {"synergy": {"value": spec_value, "range": [0.0, 0.2], "dist": "uniform",
+                                                  "source": "self-test", "reason": "self-test",
+                                                  "basis": "owner_judgement"}}
+            r["uncertainty"]["excluded"] = [x for x in r["uncertainty"]["excluded"] if x.get("parameter") != "synergy"]
+        if posterior:
+            NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(),
+                                     [{k: x[k] for k in cols} for x in rows], {k: [0, 1] for k in cols},
+                                     point={k: chosen[k] for k in cols} if point is None else point)
+            sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
+            r["uncertainty"]["net_effect_posterior"] = {"path": "nef.yaml", "sha256": sha}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        return schema.load(p)
+
+    def both(spec):
+        out = []
+        for f in (lambda: Analysis(spec, None, log=lambda *a, **k: None).theta0, lambda: JC.theta0(spec)):
+            try:
+                out.append(f())
+            except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+                out.append(f"{type(e).__name__}: {e}")
+        return out
+    with tempfile.TemporaryDirectory() as d:
+        a0, j0 = both(setup(d, posterior=False, spec_value=0.07))
+        ok(isinstance(a0, dict) and a0 == j0 and (a0["eff_a"], a0["eff_b"], a0["synergy"]) == (0.5, 0.3, 0.07),
+           f"RPP1 without a posterior the point values are unchanged (fitted values, the spec value): {a0} {j0}")
+    with tempfile.TemporaryDirectory() as d:
+        a1, j1 = both(setup(d))
+        ok(isinstance(a1, dict) and isinstance(j1, dict) and (a1["eff_a"], a1["eff_b"]) == (0.41, 0.27)
+           and a1 == j1 and a1["synergy"] == 0.0,
+           f"RPP2 with a posterior every posterior column's point value is the fit's chosen point, in the analysis and "
+           f"the joint calibration alike: {a1} {j1}")
+    with tempfile.TemporaryDirectory() as d:
+        a2, j2 = both(setup(d, spec_value=0.12))
+        ok(all(isinstance(x, str) and "synergy" in x and "chosen point" in x for x in (a2, j2)),
+           f"RPP3 a spec engine_parameters value of a posterior column that differs from the chosen point is refused: "
+           f"{str(a2)[:160]} | {str(j2)[:80]}")
+    with tempfile.TemporaryDirectory() as d:
+        a3, _ = both(setup(d, spec_value=chosen["synergy"]))
+        ok(isinstance(a3, dict) and {k: a3[k] for k in chosen} == chosen,
+           f"RPP4 a spec value equal to the chosen point is accepted: {a3}")
+    with tempfile.TemporaryDirectory() as d:
+        a3b, j3b = both(setup(d, spec_value=chosen["synergy"] + 4e-7))     # within the 6-decimal rounding of a fit file
+        ok(isinstance(a3b, dict) and a3b == j3b and a3b["synergy"] == chosen["synergy"],
+           f"RPP4b a spec value equal to the chosen point within rounding is accepted, at the chosen point: {a3b}")
+    with tempfile.TemporaryDirectory() as d:
+        a4, j4 = both(setup(d, point=False))
+        ok(all(isinstance(x, str) and "chosen point" in x for x in (a4, j4)),
+           f"RPP5 a posterior file without a verified chosen point fails closed: {str(a4)[:160]} | {str(j4)[:80]}")
 
 
 def _self_test_test_ranges(ok, q):
