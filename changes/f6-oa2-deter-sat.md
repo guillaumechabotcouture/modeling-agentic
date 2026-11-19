@@ -1,6 +1,6 @@
 ---
 phase: "F6"
-commit: "OA2 α–δ"
+commit: "OA2 α–ζ"
 ---
 
 ## Changelog
