@@ -454,6 +454,95 @@ share of the comparator; 42 decision tests: 32 no change, 9 change the plan, 1 n
 funded plan as a variant; value of information "indicative"; burden references 2 within, 3
 outside; against F5, a six-package mix. The values are in the acceptance file (§9).
 
+The generic Outcomes model (what `views/outcomes.py` returns). An adapter per deliverable kind
+(the spec's `deliverable.kind`: `package_per_unit`, `estimates`) fills what its kind has; the
+names of outcomes, packages, components and groups come from the run.
+
+`facts`: `deliverable_kind`, `headline_outcome` (its name), `headline_point`,
+`headline_median`, `headline_low`, `headline_high`, `interval_level`, `n_draws`,
+`comparator_total`, `share_of_comparator`, `n_units`, `n_packages_in_plan`, `cost_allocated`,
+`budget_allocatable`, `reserve`, `cost_per_outcome`, `n_tests`, `n_tests_no_change`,
+`n_tests_change_plan`, `n_tests_not_run`, `n_tests_near_miss`, `voi_status`, `evpi`,
+`evpi_share`, `n_inputs`, `n_inputs_supported`, `n_prior_dominated`, `stability_verdict`,
+`units_same_package_share`, `n_variants`, `n_burden_refs`, `n_burden_outside`,
+`dearest_share`, `against` (the comparison run's label, or null).
+
+`tables.plan`: `package, units, share, cost, cost_per_unit_rank` (rank among packages that
+differ only in one component's option, from the signed spec's costs). `tables.components`:
+`component, units`. `tables.tests`: `id, question, varied, status, verdict, share_pct,
+share_threshold_pct, regret_pct, regret_threshold_pct, moved_pct, moved_threshold_pct,
+near_miss, issue (the register row it is linked to, or null)`. `tables.voi`: `input, kind,
+evppi, share_of_evpi, above_noise, prior_dominated`. `tables.variants`: `id, outcome, low,
+high, cost, value_lost_pct, over_budget_share, units_changed`. `tables.burden`: `id, group,
+outcome, ratio, band_low, band_high, state, report_only`. `tables.stability`: one row per
+measure the method records (`measure, value, verdict`). `tables.emulator`: `measure, value,
+threshold, passes`. `tables.outputs` (estimates kind): `name, median, low, high, scale`, and
+`tables.decision`: `output, threshold, direction, probability_required, probability, verdict`.
+`tables.shift` (when a comparison run is chosen with `&against=<run id>`): `item, this_run,
+other_run, change`, and `tables.spec_diff`: `key, this_run, other_run` to two levels of the two
+verified signed specs. Charts: the headline with its interval; plan mix; tests by share
+against the threshold; value of information by input; variants against the plan; burden ratios
+against their bands; each with the matching harness figure (§5.12) where the run has one.
+
+Rules: every threshold is read from the run's own decision-test and analysis records; the
+workbench's own thresholds are those named in §5.7 and are labelled. A test "ran" by the shared
+loader of §6. `tests_that_move` is `look` for each plan-changing test and for each near miss,
+and names the register row the test is linked to or says it is linked to none. `dearest_wins`
+uses the signed spec's costs. `share_of_burden` and `point_vs_draws` are `look`.
+`run_shift` is `not_available` until a comparison run is chosen, and never compares runs whose
+verified signed specs name different questions.
+
+Settled from the first acceptance pass on two kinds and three engines (2026-11-19):
+
+- `point_vs_draws`: no run stores quartiles or per-draw values (gap H17), so the rule is on
+  what is stored: the point value outside the interval is `problem`; differing from the median
+  by more than 5% of the median is `look` (workbench threshold), and the sentence gives both.
+- The estimates kind keeps its decision tests in `analysis/estimates.yaml`; its adapter reads
+  them there and maps the producer's words to the same verdicts, through the shared loader's
+  rules (a test counts only with a real verdict).
+- `dearest_wins` is `look`, never more (the producer calls it a flag, not a finding), and needs
+  at least the producer's minimum number of units (`toolkit/analysis/red_flag.py`).
+  `cost_per_unit_rank` is 1 for the dearest option of its group and is null where a package
+  mixes options of several groups or the options are priced on different bases.
+- `moved_pct` is the share the producer compares with its threshold. A near miss is a test
+  with no change whose share, regret or moved value is within 25% of its threshold. `issue` is
+  the register row the test is linked to by a structured key; a test linked only to its own
+  `test:<id>` row has none.
+- `stability_verdict` is the plan's verdict; the value verdict is a row of `tables.stability`.
+  `burden_refs` is `look` when the only references outside their band are report-only ones
+  named by a decision test that ran, and `problem` otherwise.
+- `tables.shift` items: one row per package (units), the headline, the envelope and the
+  comparator text; `change` is the difference for numbers and "differs" for text.
+  `tables.spec_diff` lists keys; a cell holds a scalar's value or the count of entries.
+- Checks added: `outcomes.stability_agreement` (the plan's and the value's stability verdicts
+  disagree: `look`); `outcomes.infeasible_tests` (tests under which the point plan cannot be
+  afforded or applied: `look`, with the ids); `outcomes.variant_budget` (a plan variant over
+  budget in more draws than the spec's allowance: `look`); `outcomes.fixed_inputs` (inputs
+  held at one value that change the plan when a test varies them: `look`). Facts gain
+  `n_units_stable` (units keeping their package in at least 90% of draws).
+- Settled while the Outcomes fixtures were written: a test that did not run is `look`, except
+  the producer's own not-run scenario for an input the verified signed spec excludes, which is
+  listed and does not raise the check. An interval with its ends reversed is `problem`.
+  `voi_support` is `look` when the analysis calls its result indicative, when no input is above
+  its noise floor, or when a prior-dominated input is above it (C14), and `not_available` below
+  the method's minimum number of draws. A fixed input is one the uncertainty record lists as
+  fixed; a test covers it when the test's spec entry names that parameter. The budget
+  allowance is the signed spec's own; with none, `variant_budget` is `not_available`. The
+  near-miss rule applies to `dearest_wins` too. A package's components are read from the
+  signed spec's package definitions where it has them, else from the package name's parts. A
+  table `headline` (`outcome, point, median, low, high, comparator_total, share`) feeds the
+  headline chart. `&against=` naming no known run is refused by the server. For `estimates`,
+  `components` and `stability` are null.
+- Settled in the build: prices for `dearest_wins` are the signed spec's cost items as written,
+  per head, with no price index applied (the harness's cost code is not imported).
+  `dearest_share` is the largest share over the groups of options. The near-miss rule is
+  applied to every Outcomes threshold; for the headline factor it is on the excess over 1. A
+  view may declare `choose: {param, label, options}` for a parameter the reader picks (the
+  comparison run); the server fills the option list of runs and refuses a run compared with
+  itself. A table may be `plain` (its cells are the run's own words, not states to mark).
+- What is kind-specific: for `estimates`, the plan, variants, burden, value of information and
+  emulator tables are null and most checks are `not_available`; the view says so in one line.
+
 ### 5.8 Science register
 
 See §6 for the derivation table. The generic Register model (what `views/register.py` returns):
@@ -748,6 +837,7 @@ path, waits for the F6 report. The workbench shows the gap in the view until the
 | H14 | The sign-off sheet's hash in the sign-off record. The sheet is compared at signing but never recorded, so nothing binds what the owner read; a HIGH row on the sheet cannot be shown as accepted by signing | Register |
 | H15 | A figure's provenance record hashes its sources but not its own table or vector file, and overview images are recorded nowhere, so a changed table cannot be detected | Figures |
 | H16 | Reports do not reference their figures: on R4 and FLU no report, manuscript or results text names any figure file, and the render record lists none, so which figures a report relies on cannot be derived (DEN cites figures by path) | Figures |
+| H17 | Per-draw values of the headline (or its quartiles), so the point value can be placed among the draws, and paired per-draw values for a variant against the plan | Outcomes |
 
 ## 8. The catch-early scorecard
 
@@ -926,6 +1016,23 @@ The questions as they were put:
   Candidate checks not yet specified: targets matched by an equal number of free parameters
   (FLU: five targets, five free ratios, so they do not test fit); best point far from the
   posterior median along a ridge (DEN).
+- 2026-11-19, loop iteration 4, step 4 for Outcomes: view built by a fresh agent (an adapter
+  per deliverable kind, twelve checks, the comparison with another run and a control to choose
+  it). Self-tests pass (outcomes 89 cases); acceptance passes on all 17 files with no entry
+  changed. The lead re-ran everything and read the comparison screenshot. Not yet built: a
+  check on the estimates decision (a verdict left undetermined, or a probability near the one
+  required); a chart for stability.
+- 2026-11-19, loop iteration 4, step 3 for Outcomes: fixtures for both deliverable kinds and a
+  second run for comparison, 36 variants, 89 failing cases and server cases for `&against`,
+  by a fresh agent who checked the cases against a scratch view. The clean run had still held
+  a plan-changing test and a not-run test; both are now variants. Acceptance re-derived.
+- 2026-11-19: #280 (fixtures) and #281 (Model and Figures views, file endpoint, image renderer)
+  merged into v2 at green checks, after one external review round (8 P1, 2 P2, all fixed test
+  first and confirmed). Scorecard 14 of 32.
+- 2026-11-19, loop iteration 4, step 2 for Outcomes (acceptance derived by a fresh agent on
+  R4, FLU, DEN and R4 against F6 run 3): the model holds for both allocation runs; the
+  estimates kind fills about half of it. On R4, 1 of 9 plan-changing tests is linked to an
+  issue. Rules settled in §5.7; four checks added; gap H17.
 - 2026-11-19: the ten review findings on the Model and Figures views were each reproduced with
   a failing test and fixed, and the walkthrough's reader findings were fixed in the same pass.
   The file endpoint now serves one image type, validated by structure. Departures follow the

@@ -238,8 +238,10 @@ def _self_test():
                 need(c.get("case") == names[name], f"{name}: scorecard case {names[name]} (got {c.get('case')})")
 
     def m_facts():
-        want = {(hm, None): [6, 0, 1, 2, 3, 0, 1, 3, 0, 1, 0, 0], (post, None): [6, 0, 1, 2, 3, 0, 1, 3, 0, 1, 0, 0],
-                (hm, dec): [9, 0, 4, 3, 2, 0, 1, 2, 0, 1, 0, 0], (post, dec): [8, 0, 4, 2, 2, 0, 1, 2, 0, 1, 0, 0]}
+        # the clean run holds no plan-changing test (§9); variant test_changes_linked holds one that a row names
+        want = {(hm, None): [6, 0, 1, 2, 3, 0, 0, 3, 0, 1, 0, 0], (post, None): [6, 0, 1, 2, 3, 0, 0, 3, 0, 1, 0, 0],
+                (hm, "test_changes_linked"): [6, 0, 1, 2, 3, 0, 1, 3, 0, 1, 0, 0],
+                (hm, dec): [9, 0, 4, 3, 2, 0, 0, 2, 0, 1, 0, 0], (post, dec): [8, 0, 4, 2, 2, 0, 0, 2, 0, 1, 0, 0]}
         for (method, variant), counts in want.items():
             f = look_at(folder(method, variant))["facts"]
             need(sorted(f) == sorted(fact_names), f"{method}: exactly the twelve facts (got {sorted(f)})")
@@ -392,17 +394,18 @@ def _self_test():
         need("no source gives q5" in r["statement"], f"the statement is the entry's reason ({r['statement']!r})")
 
     def d_tests():
-        v = look_at(folder(hm))
-        need(not [i for i in ids(v) if i.startswith("test:")],
-             "no row for a plan-changing test a row names (DT9), nor for tests that did not change the plan or did not run")
+        for variant in (None, "test_changes_linked", "test_not_run"):
+            need(not [i for i in ids(look_at(folder(hm, variant))) if i.startswith("test:")],
+                 "no row for a plan-changing test a row names (DT9), nor for tests that did not change the plan or did not run")
         r = row(look_at(folder(hm, "test_unlinked")), "test:DT1")
         has(r, kind="uncertainty", source="decision_tests", disposition="open", decides="yes", tests="DT1", verdicts="CHANGES_PLAN",
             first_visible_stage="ANALYZE")
         need("changes the plan and is linked to no issue" in r["statement"], f"the row carries the sentence ({r['statement']!r})")
 
     def d_decides():
+        has(row(look_at(folder(hm, "test_changes_linked")), "nodata:unit_attribute:x1"), decides="yes", verdicts="CHANGES_PLAN")
         v = look_at(folder(hm, dec))
-        has(row(v, "nodata:unit_attribute:x1"), decides="yes", verdicts="CHANGES_PLAN")
+        has(row(v, "nodata:unit_attribute:x1"), decides="no", verdicts="NO_CHANGE")
         has(row(v, "R-001"), decides="no")
         has(row(v, "D-001"), decides="unknown", tests="")
         has(row(look_at(folder(hm, "declared_test_not_run")), "departure:B2"), decides="unknown", tests="DT4", verdicts="NOT_RUN")
@@ -410,7 +413,10 @@ def _self_test():
         def odd(doc):
             next(t for t in doc["data"]["tests"] if t["test_id"] == "DT3")["verdict"] = "MAYBE"
         has(row(look_at(edited(hm, rewrite(dt_file, odd), dec)), "R-001"), decides="unknown")
-        mixed = look_at(edited(hm, notes(note("nodata:unit_attribute:x1", same_as="R-001")), dec))
+        def changes(doc):       # DT9, the test the dossier's entry for x1 names, changes the plan
+            next(t for t in doc["data"]["tests"] if t["test_id"] == "DT9")["verdict"] = "CHANGES_PLAN"
+        both = notes(note("nodata:unit_attribute:x1", same_as="R-001"))
+        mixed = look_at(edited(hm, lambda d: (both(d), rewrite(dt_file, changes)(d)), dec))
         kept = [r for r in rows(mixed) if r["id"] in ("R-001", "nodata:unit_attribute:x1")]
         need(len(kept) == 1 and kept[0]["decides"] == "yes", f"one plan-changing test among a row's tests makes it yes ({kept})")
 
@@ -468,7 +474,8 @@ def _self_test():
         need("nodata:parameter:p2" not in ids(high), "with a sheet row for p2, the dossier's entry for it is merged into that row")
         has(row(high, "presign:p2"), tests="DT8", source="signoff_sheet,evidence_dossier", disposition="open")
         need({"departure:B", "departure:B2"} <= set(ids(look_at(folder(hm, dec)))), "an id that only begins like another is not merged")
-        need("scenario_excluded_c1" not in row(clean, "excluded:c1")["tests"], "a test whose name holds the input's name is not linked by it")
+        need("scenario_excluded_c1" not in row(look_at(folder(hm, "test_not_run")), "excluded:c1")["tests"],
+             "a test whose name holds the input's name is not linked by it")
         v = look_at(folder(hm, "merge_excluded_nodata"))
         need(sorted(ids(v)) == sorted(ids(clean) + ["excluded:q4"]), f"one row for the pair ({sorted(set(ids(v)) ^ set(ids(clean)))})")
         has(row(v, "excluded:q4"), tests="DT1", disposition="declared", source="uncertainty_excluded,evidence_dossier", decides="no")
