@@ -1438,7 +1438,19 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
     out_rows = [rows[i] for i in ids]
     by = {s: sum(r["status"] == s for r in out_rows) for s in STATUSES}
     d0 = docs[0]
-    out = {"benchmarks": out_rows, "settings_calibrated": d0.get("settings_calibrated", {}),
+    # every input's calibrated settings (a setting only a later run calibrated is kept; a conflict is refused) and
+    # its initialisation record, which must agree; each input's provenance (its rows and any re-stamp record) is kept
+    cal = {}
+    for d in docs:
+        for s, v in (d.get("settings_calibrated") or {}).items():
+            if s in cal and cal[s] != v:
+                raise ValueError(f"merge: setting {s} was calibrated differently in two inputs")
+            cal[s] = v
+    inits = [d["initialisation"] for d in docs if "initialisation" in d]
+    if any(x != inits[0] for x in inits):
+        raise ValueError("merge: the inputs record different initialisations")
+    prov = [{"rows": [r["id"] for r in d.get("benchmarks") or []], "restamped": d.get("restamped")} for d in docs]
+    out = {"benchmarks": out_rows, "settings_calibrated": cal,
            "fitted_used": d0.get("fitted_used", {}), "configs_validated": dict(sorted(validated.items())),
            "configs_not_exercised": sorted(set(pack.get("configs") or {}) - set(validated)),
            "seeds": d0.get("seeds"), "n_sims": nsims,
@@ -1448,8 +1460,11 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
     for k in ("engine_version", "fit_rule"):
         if k in d0:
             out[k] = d0[k]
+    if inits:
+        out["initialisation"] = inits[0]
     if any("wall_s" in d for d in docs):
         out["wall_s"] = round(wall, 1)
+    out["merged_from"] = prov
     return stamp(out, engine)
 
 
