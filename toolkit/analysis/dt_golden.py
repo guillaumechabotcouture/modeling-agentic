@@ -134,42 +134,65 @@ def _tid(v):
     return v if isinstance(v, str) else str(v) if isinstance(v, (bool, int, float, datetime.date)) else None
 
 
-def _read(rd: str, rel: str, missing=StoredIncomplete):
-    """The YAML of rd/rel (rd: the run dir resolved once by the caller, Codex r5 P1-1), read through one descriptor
-    with no link followed at any component (lib.safe_io.read_nofollow; Codex r4 P1: no check-then-open race)."""
+class _pinned:
+    """One descriptor on the run dir for a whole digest (Codex r6 P1-1): every read is relative to it, so a directory
+    replaced by a link mid-digest cannot mix two runs."""
+
+    def __init__(self, run_dir):
+        self.path = os.path.realpath(run_dir)
+
+    def __enter__(self):
+        try:
+            self.fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"{self.path}: no run dir") from e
+        return self.fd
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+        return False
+
+
+def _read(dfd: int, rel: str, missing=StoredIncomplete):
+    """The YAML of rel under the pinned run-dir descriptor, each component opened relative to the last with
+    O_NOFOLLOW (no link followed anywhere, no check-then-open race; Codex r2 P1-1, r4 P1, r6 P1-1); `missing` is raised
+    when nothing is there."""
+    import errno
     import stat
     import yaml
-    from toolkit.analysis.artifacts import _safe_io
-    _regular_in(rd, rel, missing)          # the clear message for a missing, linked or odd path
-    try:
-        data, st = _safe_io().read_nofollow(rd, rel)
-    except FileNotFoundError as e:
-        raise missing(f"{rel}: missing") from e
-    except OSError as e:                         # LinkRefused included
-        raise StoredIncomplete(f"{rel}: not read without following a link ({e})") from e
-    if not stat.S_ISREG(st.st_mode):
-        raise StoredIncomplete(f"{rel}: not a regular file")
-    try:
-        return yaml.safe_load(data)
-    except yaml.YAMLError as e:
-        raise StoredIncomplete(f"{rel}: not YAML ({e})") from e
-
-
-def _regular_in(run_dir: str, rel: str, missing=StoredIncomplete) -> str:
-    """The absolute path of `rel` under run_dir when no component is a link, none is `..`, and it is a regular file
-    there (Codex r2 P1-1, P1-3); `missing` is raised when nothing is there at all."""
-    cur, parts_ = os.path.realpath(run_dir), rel.split("/")
+    parts_ = rel.split("/")
     if any(c in ("", ".", "..") for c in parts_):
         raise StoredIncomplete(f"{rel}: not a plain path under the run dir")
-    for c in parts_:
-        cur = os.path.join(cur, c)
-        if os.path.islink(cur):
-            raise StoredIncomplete(f"{rel}: {cur} is a link (a result is read from the run dir only)")
-    if not os.path.lexists(cur):
-        raise missing(f"{rel}: missing")
-    if not os.path.isfile(cur):
-        raise StoredIncomplete(f"{rel}: not a regular file")
-    return cur
+    nf, opened, cur = getattr(os, "O_NOFOLLOW", 0), [], dfd
+    try:
+        for c in parts_[:-1]:
+            cur = os.open(c, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nf, dir_fd=cur)
+            opened.append(cur)
+        fd = os.open(parts_[-1], os.O_RDONLY | nf | getattr(os, "O_NONBLOCK", 0), dir_fd=cur)
+    except FileNotFoundError as e:
+        raise missing(f"{rel}: missing") from e
+    except OSError as e:
+        why = "a link" if e.errno in (errno.ELOOP, errno.ENOTDIR, getattr(errno, "EMLINK", -1)) else e.strerror
+        raise StoredIncomplete(f"{rel}: not read ({why}; a result is read from the run dir only)") from e
+    finally:
+        for x in opened:
+            os.close(x)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise StoredIncomplete(f"{rel}: not a regular file")
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 20)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    try:
+        return yaml.safe_load(b"".join(chunks))
+    except yaml.YAMLError as e:
+        raise StoredIncomplete(f"{rel}: not YAML ({e})") from e
 
 
 def digest_dir(run_dir: str) -> dict:
@@ -177,7 +200,12 @@ def digest_dir(run_dir: str) -> dict:
     raises FileNotFoundError; a malformed artifact, an entry without an id or with an unknown status, a repeated id,
     a run test without its result file, a result file elsewhere than models/decision_tests/<id>.yaml or through a link,
     or a result whose test id or status differs from its entry raises StoredIncomplete."""
-    p, rd = "analysis/decision_tests.yaml", os.path.realpath(run_dir)
+    with _pinned(run_dir) as rd:
+        return _digest_dir(rd)
+
+
+def _digest_dir(rd: int) -> dict:
+    p = "analysis/decision_tests.yaml"
     doc = _read(rd, p, missing=FileNotFoundError)
     data = doc.get("data") if isinstance(doc, dict) else None
     tests = data.get("tests") if isinstance(data, dict) else None
@@ -260,9 +288,9 @@ def start_capture() -> None:
             who, tid = _caller(), str(rec.get("test_id"))
             n = _CAP["counts"].get((who, tid), 0)
             _CAP["counts"][(who, tid)] = n + 1
-            pr = canon(parts(plain(rec)))
+            pr = parts(plain(rec))          # hashed once (Codex r6 P1-2); its canonical form kept for the report
             _CAP["recs"][f"{who}:{tid}#{n}"] = {k: _h(v) for k, v in pr.items()}
-            _CAP["parts"][f"{who}:{tid}#{n}"] = pr
+            _CAP["parts"][f"{who}:{tid}#{n}"] = canon(pr)
             if rec.get("status") == "run" and not all("plan_sha256" in r for r in rec.get("results") or []):
                 _CAP["problems"].append(f"{who}:{tid}#{n}: a case without plan_sha256")
         return rec
@@ -577,7 +605,7 @@ def _self_test() -> int:
                     {"None.yaml": _rec(test_id=None)})
             ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG19b (r4 P2-2) a null test id is no identity")
         import inspect
-        ok("read_nofollow" in inspect.getsource(_read) and "open(" not in inspect.getsource(digest_dir),
+        ok("O_NOFOLLOW" in inspect.getsource(_read) and " open(" not in inspect.getsource(_digest_dir),
            "DG19c (r4 P1) every read goes through lib.safe_io.read_nofollow (one descriptor, no link followed)")
 
     def dg20():          # Codex review r5 of #262, and the CI recording that differed (written first; each failed)
@@ -593,7 +621,7 @@ def _self_test() -> int:
             ok(got == {"2026-11-18"}, f"DG20 (r5 P1-2) an unquoted YAML date id, as run_all names its file ({got})")
         import inspect
         src = inspect.getsource(digest_dir)
-        ok(src.count("os.path.realpath(run_dir)") == 1 and "realpath" not in inspect.getsource(_read),
+        ok("_pinned(run_dir)" in src and "realpath" not in inspect.getsource(_read),
            "DG20b (r5 P1-1) the run dir is resolved once per digest, so a retargeted alias cannot swap runs mid-read")
         printed = []
         _CAP.update(on=True, paused=False, orig=lambda *a, **k: None, recs={"f:X#0": {"decision": "1"}}, counts={},
