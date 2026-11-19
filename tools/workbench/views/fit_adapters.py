@@ -44,7 +44,12 @@ GROUP_COLUMNS = ["group", "targets", "mean_signed_score", "largest_score", "mode
 STATUSES = ("ok", "look", "problem", "not_available")
 JC, CAL, UNC, DT, EST = ("analysis/joint_calibration.yaml", "analysis/calibration.yaml", "analysis/uncertainty.yaml",
                          "analysis/decision_tests.yaml", "analysis/estimates.yaml")
-SPEC, SIGNED = "decision_spec.yaml", "decision_brief.signed/decision_spec.yaml"
+SPEC, SIGNED, SIGNOFF = "decision_spec.yaml", "decision_brief.signed/decision_spec.yaml", "decision_spec.signoff.json"
+FLAG_MODE = "flag"           # calibration.joint.unmatched.mode under which the harness lets flagged units proceed
+#                              (toolkit/analysis/joint_calibration.py UNMATCHED_MODES: block, flag)
+# The status words the history-matching code writes (toolkit/calibration/history_matching.py: "blocked" if blocks
+# else "matched"), each with the generic status of §3a. Any other word is not known and never guessed at.
+HM_STATUS = {"matched": "ok", "blocked": "blocked"}
 # Thresholds. NEAR and BOUND are §3's (near miss; a bound reached). The rest are workbench thresholds (§3a, §5.5),
 # used only where the method records none of its own, and named as such in each sentence.
 NEAR, BOUND = 0.25, 1e-6
@@ -114,19 +119,36 @@ def _quantile(xs, q):
 # ------------------------------------------------------------------------------------------- shared reads
 
 def _spec(run):
-    """(the spec the view reads, the file it came from, one sentence saying which copy that is). §3: the signed
-    copy is read wherever it and the spec on disk differ."""
+    """(the spec the view reads, the file it came from, one sentence saying which copy that is, why no signed spec
+    could be verified or None). §3: the signed copy is read wherever it and the spec on disk differ. It is verified
+    only when its sha256 is the one the sign-off record holds for the spec; declarations and allowances count from
+    a verified copy only, and a copy that is not verified is read for names alone."""
     signed, disk = run.sha(SIGNED), run.sha(SPEC)
+    so, so_why = run.json(SIGNOFF)
+    want = _get(so, "sha256", SPEC)
+    want = want if isinstance(want, str) and re.fullmatch(r"[0-9a-f]{64}", want) else None
     rel = SIGNED if signed else SPEC
     spec, why = run.large(rel)
-    if signed and disk and signed != disk:
+    if not signed:
+        unverified = f"the run has no readable signed copy of the spec ({SIGNED})"
+    elif so is None:
+        unverified = f"the sign-off record could not be read ({so_why})"
+    elif want is None:
+        unverified = f"the sign-off record ({SIGNOFF}) holds no sha256 for {SPEC}"
+    elif want != signed:
+        unverified = (f"the signed copy ({SIGNED}, {signed[:8]}) differs from the hash the sign-off record holds "
+                      f"({want[:8]})")
+    else:
+        unverified = None
+    if unverified:
+        say = (f"No signed spec could be verified: {unverified}. {rel} is read for names only, and no declaration or "
+               f"allowance in it counts." if spec else f"No spec could be read ({why}).")
+    elif disk and signed != disk:
         say = (f"The spec on disk ({disk[:8]}) differs from the signed copy ({signed[:8]}); this view reads the "
                f"signed copy, {SIGNED}.")
-    elif signed:
-        say = f"The signed spec ({SIGNED}, {signed[:8]}) and the spec on disk are the same file."
     else:
-        say = f"The run has no signed copy of the spec; {SPEC} is read." if spec else f"No spec could be read ({why})."
-    return (spec if isinstance(spec, dict) else {}), rel, say
+        say = f"The signed spec ({SIGNED}, {signed[:8]}) and the spec on disk are the same file."
+    return (spec if isinstance(spec, dict) else {}), rel, say, unverified
 
 
 def _units(run, spec):
@@ -180,7 +202,7 @@ def _part(why, name, fn):
 
 def _history_matching(run, doc):
     jc, why = doc["data"], {}
-    spec, spec_rel, spec_say = _spec(run)
+    spec, spec_rel, spec_say, unverified = _spec(run)
     tests, dominated = _tests(run), _prior_dominated(run)
     pairs = _get(jc, "survey_changes", "pairs")
     pairs = [p for p in pairs if isinstance(p, dict)] if isinstance(pairs, list) else None
@@ -246,11 +268,21 @@ def _history_matching(run, doc):
     def changes():
         if pairs is None:
             raise TypeError("survey_changes.pairs is not a list")
-        return [[p.get("group"), p.get("from"), p.get("to"), _num(p.get("observed_natural")),
-                 _num(p.get("modelled_natural")), _num(p.get("z")), p.get("flagged") is True] for p in pairs]
+        rows = []
+        for k, p in enumerate(pairs):
+            # The one state in which the producer computes no pair is `not_computable` with its reason (history_matching
+            # _survey_changes, change_stats). A pair with neither that nor a z and a flag is treated the same way.
+            z, flag, lost = _num(p.get("z")), p.get("flagged"), p.get("not_computable")
+            if lost is not None or z is None or not isinstance(flag, bool):
+                uncomputed[k] = " ".join(str(lost).split()) if lost is not None else "the file records no z or no flag for it"
+                z, flag = None, None
+            rows.append([p.get("group"), p.get("from"), p.get("to"), _num(p.get("observed_natural")),
+                         _num(p.get("modelled_natural")), z, flag])
+        return rows
 
-    # Declarations (§3, §3a): the method's own list, counted only where the signed spec holds the same entry.
-    signed_list = _get(spec, "calibration", "joint", "unmatched", "declared")
+    # Declarations (§3, §3a): the method's own list, counted only where the verified signed spec holds the same entry.
+    signed_spec = {} if unverified else spec
+    signed_list = _get(signed_spec, "calibration", "joint", "unmatched", "declared")
     signed_list = [d for d in signed_list if isinstance(d, dict)] if isinstance(signed_list, list) else []
     declared = []
     for d in _get(jc, "unmatched_decision", "declared") or []:
@@ -260,7 +292,11 @@ def _history_matching(run, doc):
                 (s.get("target"), s.get("offset"), s.get("decision_test")) == (d.get("target"), d.get("offset"), d.get("decision_test"))
                 for s in signed_list)})
     flagged_units = {str(f.get("unit")) for f in _get(jc, "unmatched_decision", "flagged") or [] if isinstance(f, dict)}
-    max_units = _get(spec, "calibration", "joint", "unmatched", "max_units")
+    mode, max_units = (_get(signed_spec, "calibration", "joint", "unmatched", k) for k in ("mode", "max_units"))
+    max_units = max_units if isinstance(max_units, int) and not isinstance(max_units, bool) else None
+    no_allowance = (f"no signed spec could be verified ({unverified})" if unverified else
+                    f"the signed spec's unmatched mode is '{mode}', not '{FLAG_MODE}'" if mode != FLAG_MODE else
+                    "the signed spec sets no max_units" if max_units is None else None)
 
     def strings(x):
         if isinstance(x, dict):
@@ -278,14 +314,15 @@ def _history_matching(run, doc):
                 str(x) for comp in det_d.get("by_component") or [] if isinstance(comp, dict) for x in comp.get("blocks") or []]
             cover = [d for d in declared if d["key"] in named]
             loose = [str(x) for k in ("units", "unmatched", "conflicting") for x in det_d.get(k) or []]
-            allowed = bool(loose) and set(loose) <= flagged_units and isinstance(max_units, int) and len(flagged_units) <= max_units
+            allowed = bool(loose) and set(loose) <= flagged_units and not no_allowance and len(flagged_units) <= max_units
             info = {"code": str(b.get("code")), "cover": [_cover(tests, d["test"], "unmatched_decision.declared")
                                                            for d in cover if d["signed"] and d["test"]],
                     "unsigned": [d["key"] for d in cover if not d["signed"] or not d["test"]],
                     "uncovered": [x for x in need if x not in {d["key"] for d in cover}]
                                  + ([] if allowed or not loose else [f"{len(loose)} unit(s)"])
                                  + ([] if need or loose else ["the block names no target, offset or unit a declaration could cover"]),
-                    "allowance": (len(loose), max_units) if allowed else None}
+                    "allowance": (len(loose), max_units) if allowed else None,
+                    "no_allowance": no_allowance if loose and not allowed else None}
             block_info.append(info)
             ok = bool(info["cover"]) and not info["unsigned"] and not [x for x in need if x not in {d["key"] for d in cover}]
             rows.append([info["code"], BLOCK_MEANING.get(info["code"], info["code"]), ok,
@@ -294,7 +331,9 @@ def _history_matching(run, doc):
         return rows
 
     def change_cover():
-        """{group: the declarations that name it}: the method's list, scope_declaration.yaml and findings.jsonl."""
+        """[the declarations that cover each pair, in the pairs' order]: scope_declaration.yaml and findings.jsonl
+        cover the one pair whose id they name; the method's list, where the signed spec holds the entry, covers the
+        pairs of the group it names (§3a)."""
         out = {}
         scope, _ = run.large("scope_declaration.yaml")
         found, _ = run.read("findings.jsonl", 8 << 20)
@@ -304,18 +343,21 @@ def _history_matching(run, doc):
                 rows.append(json.loads(line))
             except ValueError:
                 continue
+        def names(x, pid):       # the harness writes a pair's finding as change:<pair id>, after the finding's kind
+            return pid is not None and str(x) in (pid, f"change:{pid}") or str(x).endswith(f":change:{pid}")
+        out = []
         for p in pairs or []:
-            g, pid, got = p.get("group"), str(p.get("id") or "\0"), []
+            g, pid, got = p.get("group"), (str(p["id"]) if p.get("id") is not None else None), []
             got += [_cover(tests, d["test"], "unmatched_decision.declared") for d in declared
                     if d["signed"] and d["test"] and str(g) in re.split(r"[|:]", d["key"])]
             for d in _get(scope, "declarations") or []:
-                if isinstance(d, dict) and str(d.get("blocker_id", "")).endswith(pid) and d.get("decision_test"):
+                if isinstance(d, dict) and pid and names(d.get("blocker_id", ""), pid) and d.get("decision_test"):
                     got.append(_cover(tests, os.path.splitext(os.path.basename(str(d["decision_test"])))[0], "scope_declaration.yaml"))
             for r in rows:
                 test = _get(r, "decision_test", "file") if isinstance(r, dict) else None
-                if test and r.get("status") == "declared" and pid in (str(r.get("id")), str(r.get("key"))):
+                if test and pid and r.get("status") == "declared" and (names(r.get("id"), pid) or names(r.get("key"), pid)):
                     got.append(_cover(tests, os.path.splitext(os.path.basename(str(test)))[0], "findings.jsonl"))
-            out[g] = got
+            out.append(got)
         return out
 
     def offsets():
@@ -327,14 +369,16 @@ def _history_matching(run, doc):
         return [[s.get("id"), _get(s, "report", "status"),
                  [b.get("code") for b in _get(s, "report", "blocks") or [] if isinstance(b, dict)]] for s in jc["sensitivity"]]
 
-    widest, block_info = {}, []
+    widest, block_info, uncomputed = {}, [], {}
     t_rows, p_rows = _part(why, "targets", targets), _part(why, "parameters", parameters)
     c_rows, b_rows = _part(why, "changes", changes), _part(why, "blocks", blocks)
     o_rows, s_rows = _part(why, "offsets", offsets), _part(why, "sensitivity", sensitivity)
     reg = jc.get("region") if isinstance(jc.get("region"), dict) else {}
     runs = [_num(v.get("runs")) for v in ver_u.values() if isinstance(v, dict) and _num(v.get("runs")) is not None]
-    status = jc.get("status") if isinstance(jc.get("status"), str) else None
+    word = jc.get("status")
+    status = HM_STATUS.get(word) if isinstance(word, str) else None
     proceed = _get(jc, "unmatched_decision", "proceed")
+    sc = jc.get("survey_changes") if isinstance(jc.get("survey_changes"), dict) else {}
     facts = {
         "method": "history_matching", "status": status, "proceeded": proceed if isinstance(proceed, bool) else None,
         "n_targets_group": sum(r[1] == "group" for r in t_rows) if t_rows is not None else None,
@@ -373,7 +417,7 @@ def _history_matching(run, doc):
             f"{_g(facts['units_at_bound'])} of {_g(facts['n_units'])} units have an accepted interval that reaches a "
             f"bound of it ({up} the upper, {low} the lower). Verification: the engine is then run at the best point "
             f"({_g(facts['engine_replicates'])} run(s) per unit) and each target's I is recomputed from the engine's "
-            f"value; a target above the cutoff there is 'verification failed'. Status {status}."),
+            f"value; a target above the cutoff there is 'verification failed'. The method's own status word is {word!r}."),
         "score": (
             f"score is the implausibility I of a target at the best point computed from the engine's verification run "
             f"(model is that engine value); score_alt is I from the emulator at the same point (its value, model_alt, is "
@@ -427,7 +471,11 @@ def _history_matching(run, doc):
     return {
         "file": JC, "facts": facts, "why": why, "notes": notes,
         "tables": {k: _table(k, v, about.get(k, ""), labels.get(k)) if v is not None else None for k, v in tables.items()},
-        "blocks": block_info, "change_cover": _part(why, "declarations", change_cover) or {}, "widest": widest,
+        "blocks": block_info, "change_cover": _part(why, "declarations", change_cover) or [], "widest": widest,
+        "status_word": word, "unverified": unverified,
+        "changes_uncomputed": uncomputed, "changes_asked": _get(spec, "calibration", "joint", "changes") is not None,
+        "change_ids": [p.get("id") for p in pairs or []],
+        "changes_reason": " ".join(str(sc.get("reason")).split()) if sc.get("status") != "computed" and sc.get("reason") else None,
         "bound_units": [[u, group_of.get(str(u)), {"hi": "upper", "lo": "lower"}.get(
             "".join(rec["region_touches_bound"]) if len(rec["region_touches_bound"]) == 1 else "", "both")]
             for u, rec in units.items() if isinstance(rec, dict) and isinstance(rec.get("region_touches_bound"), list)
@@ -452,7 +500,7 @@ def _posterior(run, doc):
     dg = c["diagnostics"]
     if not isinstance(dg, dict):
         raise TypeError("data.diagnostics is not a mapping")
-    spec, spec_rel, spec_say = _spec(run)
+    spec, spec_rel, spec_say, unverified = _spec(run)
     dominated = _prior_dominated(run)
     unit_rows, _, units_rel = _units(run, spec)
     grouping = _get(spec, "calibration", "targets", "groups")
@@ -467,7 +515,7 @@ def _posterior(run, doc):
             groups = f.get("groups")
             group = "+".join(str(g) for g in groups) if isinstance(groups, list) else (None if groups is None else str(groups))
             rows.append([f"{f.get('source')}:{f.get('unit')}:{group}", "unit", group, None, f.get("source"), obs,
-                         max(0.0, obs - 1.96 * sd), obs + 1.96 * sd, sd, exp, None, (exp - obs) / sd, None, None])
+                         obs - 1.96 * sd, obs + 1.96 * sd, sd, exp, None, (exp - obs) / sd, None, None])
         return rows
 
     def parameters():
@@ -500,7 +548,8 @@ def _posterior(run, doc):
     p_rows, s_rows = _part(why, "parameters", parameters), _part(why, "series", series)
     n_targets = dg.get("n_targets") if isinstance(dg.get("n_targets"), int) else (len(t_rows) if t_rows is not None else None)
     ess = _num(dg.get("ess_bulk_min")) if dg.get("ess_bulk_min") is not None else _num(dg.get("ess"))
-    facts = {"method": "posterior", "status": "ok" if dg.get("converged") is True else "not_converged", "proceeded": None,
+    facts = {"method": "posterior", "status": {True: "ok", False: "not_converged"}.get(dg.get("converged"))
+             if isinstance(dg.get("converged"), bool) else None, "proceeded": None,
              "n_targets_group": 0, "n_targets_unit": n_targets,
              "n_parameters": dg.get("n_parameters") if isinstance(dg.get("n_parameters"), int) else (len(p_rows) if p_rows is not None else None),
              "region_accepted": None, "region_candidates": None, "region_share_of_prior": None, "cutoff": None,
@@ -532,7 +581,7 @@ def _posterior(run, doc):
                   "observation. This method records no cutoff on it and no second (emulator) value."),
         "units_of_measure": ("observed and model are on the scale the source records (a count where the noise model is "
                              "binomial or Poisson); sd_total is the square root of the noise model's variance on that "
-                             "scale; low and high are observed ∓ 1.96 sd_total (low floored at 0): from the noise "
+                             "scale; low and high are observed ∓ 1.96 sd_total (not floored at zero): from the noise "
                              "model at the best point, not the source's own interval."),
         "spec": spec_say,
         "not_recorded": ("This method (posterior) records no changes between rounds, no blocks, no offsets, no "
@@ -568,7 +617,9 @@ def _posterior(run, doc):
     return {
         "file": CAL, "facts": facts, "why": why, "notes": notes,
         "tables": {k: _table(k, v, about.get(k, ""), labels.get(k)) if v is not None else None for k, v in tables.items()},
-        "blocks": [], "change_cover": {}, "widest": widest, "min_accepted": None,
+        "blocks": [], "change_cover": [], "widest": widest, "min_accepted": None,
+        "status_word": dg.get("converged"), "unverified": unverified, "changes_uncomputed": {}, "changes_asked": False, "change_ids": [],
+        "changes_reason": None,
         "fields": {"targets": "data.diagnostics.fit", "parameters": "data.priors, data.sample.rows, data.theta or data.map",
                    "changes": "data", "blocks": "data", "status": "data.diagnostics.converged", "units": "data",
                    "replicates": "data", "cutoff": "data", "diagnostics": "data.diagnostics (rhat_max, ess_bulk_min or ess)"},
@@ -638,7 +689,7 @@ def groups(m):
 
 # ---------------------------------------------------------------------------------------------- self-test
 
-from views.fit_bench import Bench, absent, close, data, need, row, table  # noqa: E402,F401  (the self-tests' harness)
+from views.fit_bench import Bench, absent, close, data, need, rewrite, row, table  # noqa: E402,F401  (the self-tests' harness)
 
 
 def _as_view(run):
@@ -718,7 +769,7 @@ def _self_test():
             r = row(v, "offsets", "key", key)
             need(close(r["mean"], b["mean"]) and close(r["sd"], b["sd"]) and close(r["accepted_share"], 1.0), f"offset row {r}")
         s = row(v, "sensitivity", "setting", "sd_015")
-        need(s["status"] == "ok" and not s["blocks"], f"sensitivity row {s}")
+        need(s["status"] == "matched" and not s["blocks"], f"sensitivity row {s} (the method's own word)")
 
     def f7():
         d = folder(post)
@@ -727,7 +778,7 @@ def _self_test():
         want = {"method": post, "status": "ok", "proceeded": None, "n_targets_group": 0, "n_targets_unit": 24,
                 "n_parameters": 3, "region_accepted": None, "region_candidates": None, "region_share_of_prior": None,
                 "cutoff": None, "change_limit": None, "engine_replicates": None, "units_at_bound": None, "n_units": 12,
-                "grouping": "stratum", "rhat_max": 1.004, "ess_min": 910.0}
+                "grouping": "stratum", "rhat_max": 1.0, "ess_min": 910.0}
         need(set(facts) == set(FACTS), f"facts are exactly {FACTS} (got {sorted(facts)})")
         bad = {k: facts[k] for k in want if facts[k] != want[k]}
         need(not bad, f"facts differ from the files: {bad}")
@@ -745,7 +796,7 @@ def _self_test():
         need(r["level"] == "unit" and r["group"] == "G1" and r["source"] == "S1" and close(r["observed"], f["observed"])
              and close(r["model"], f["expected"]) and close(r["sd_total"], sd)
              and close(r["score"], (f["expected"] - f["observed"]) / sd)
-             and close(r["low"], max(0.0, f["observed"] - 1.96 * sd)) and close(r["high"], f["observed"] + 1.96 * sd)
+             and close(r["low"], f["observed"] - 1.96 * sd) and close(r["high"], f["observed"] + 1.96 * sd)
              and r["model_alt"] is None and r["score_alt"] is None, f"target row {r}")
         for p in ("p1", "p2", "p3"):
             r, (lo, hi) = row(v, "parameters", "name", p), cal["priors"][p]["range"]
@@ -762,12 +813,20 @@ def _self_test():
                  f"{method}: notes.method and notes.score are sentences")
             need(number in notes["method"].replace(",", ""), f"{method}: notes.method carries this run's numbers ({number})")
 
+    def f_signed_low():
+        def small(doc):
+            doc["data"]["diagnostics"]["fit"][0].update(observed=1.0, variance=4.0)
+        r = row(look_at(b.edited(post, rewrite(cal_rel, small))), "targets", "id", "S1:U01:G1")
+        need(close(r["low"], 1.0 - 1.96 * 2.0) and close(r["high"], 1.0 + 1.96 * 2.0),
+             f"the interval is observed -/+ 1.96 sd with no floor at zero: an outcome may be signed ({r['low']}, {r['high']})")
+
     case("A1 history matching, clean fixture: the seventeen facts, read from the files", f2)
     case("A2 history matching, clean fixture: six tables with exactly the columns of §3a; series null", f3)
     case("A3 history matching, clean fixture: target rows (engine as model, emulator as model_alt, window, group)", f4)
     case("A4 history matching, clean fixture: parameter, change, offset and sensitivity rows", f5)
     case("A5 posterior, clean fixture: facts, target, parameter and series rows; unrecorded tables null", f7)
     case("A6 notes say how the method works and what the score is, with this run's numbers", f8)
+    case("R11 posterior: a target's interval is not floored at zero", f_signed_low)
     return b.done()
 
 

@@ -11,6 +11,8 @@ outcome check; the other checks' cases are in workbench.py --self-test (W7 to W1
 """
 from __future__ import annotations
 
+import re
+
 STATUSES = ("ok", "look", "problem", "not_available")
 ACCEPTED = ("completed", "completed_with_report_restored")
 DECLARED = ("completed_scope_declared",)     # §3: ended with declared limits; the reader judges, so `look`
@@ -49,7 +51,26 @@ STAGE_COLUMNS = ["stage", "visits", "model_spend_usd", "working_minutes", "waiti
 
 
 def _short(sha):
-    return (sha or "")[:10] or "none"
+    return str(sha or "")[:10] or "none"
+
+
+def digest(x):
+    """x when it is a sha256 in hex, else None: anything else recorded as a hash is no hash."""
+    return x if isinstance(x, str) and re.fullmatch(r"[0-9a-f]{64}", x) else None
+
+
+def hash_state(recorded, now):
+    """A file against the hash recorded for it: missing (the file cannot be read), not_recorded (no valid hash was
+    recorded), changed or same. The one rule for every comparison of hashes here: a missing file or a missing or
+    invalid recorded hash is never a match."""
+    if now is None:
+        return "missing"
+    if digest(recorded) is None:
+        return "not_recorded"
+    return "same" if now == recorded else "changed"
+
+
+STALE = ("changed", "missing", "not_recorded")       # the states of a recorded input that is not known to be the same
 
 
 def pipeline(run):
@@ -106,7 +127,8 @@ def signed_spec(run):
     rows, changed = [], []
     for rel, sha in sorted(signed.items()):
         now = run.sha(rel)
-        state = "same" if now == sha else ("missing" if now is None else "changed since signing")
+        state = {"changed": "changed since signing", "not_recorded": "no valid hash recorded"}.get(
+            hash_state(sha, now), hash_state(sha, now))
         if state != "same":
             changed.append(rel)
         rows.append([rel, _short(sha), _short(now), state])
@@ -115,7 +137,8 @@ def signed_spec(run):
     ev = [("decision_spec.signoff.json", "sha256")]
     if changed:
         return _r("steps.signed_spec", "steps", title, "problem",
-                  f"{len(changed)} signed file(s) differ from what the owner signed ({', '.join(changed)}; {who}). "
+                  f"{len(changed)} signed file(s) differ from what the owner signed, are missing, or were signed with no "
+                  f"valid hash ({', '.join(changed)}; {who}). "
                   "Anything computed after the change did not use the signed version.", ev, table, "C10")
     return _r("steps.signed_spec", "steps", title, "ok", f"All {len(rows)} signed file(s) are unchanged ({who}).",
               ev, table, "C10")
@@ -125,14 +148,14 @@ def artifact_spec(run):
     title = "Every analysis file was computed from the signed spec"
     arts = run.artifacts()
     so, _ = run.json("decision_spec.signoff.json")
-    signed = ((so or {}).get("sha256") or {}).get("decision_spec.yaml") if isinstance((so or {}).get("sha256"), dict) else None
+    signed = digest(((so or {}).get("sha256") or {}).get("decision_spec.yaml")) if isinstance((so or {}).get("sha256"), dict) else None
     env = [a for a in arts if a.get("spec_sha256")]
     if not env:
         return _r("steps.artifact_spec", "steps", title, "not_available",
                   "No analysis file records the spec it was computed from.", [("analysis/*.yaml", "spec_sha256")], case="C10")
     if not signed:
         return _r("steps.artifact_spec", "steps", title, "not_available",
-                  "There is no signed spec hash to compare with.", [("decision_spec.signoff.json", "sha256")], case="C10")
+                  "There is no valid signed spec hash to compare with.", [("decision_spec.signoff.json", "sha256")], case="C10")
     off = [a for a in env if a["spec_sha256"] != signed]
     unsigned = [a for a in env if a.get("spec_signed") is False]
     rows = {"columns": ["file", "spec it used", "signed spec", "state"],
@@ -157,14 +180,15 @@ def inputs_fresh(run):
     rows, stale, checked = [], set(), 0
     for a in arts:
         for i in a["inputs"]:
-            if i["state"] in ("changed", "missing"):
+            if i["state"] in STALE:
                 stale.add(a["path"])
                 rows.append([a["path"], i["path"], _short(i["sha256"]), _short(i["now"]), i["state"]])
             checked += i["state"] != "outside"
     ev = [("analysis/*.yaml", "inputs")]
     if stale:
         return _r("steps.inputs_fresh", "steps", title, "problem",
-                  f"{len(stale)} analysis file(s) were computed from inputs that have since changed or gone. "
+                  f"{len(stale)} analysis file(s) were computed from inputs that have since changed or gone, or whose "
+                  "hash was not recorded. "
                   "Their numbers do not describe the files now in the run folder.", ev,
                   {"columns": ["analysis file", "input", "hash when computed", "hash now", "state"], "rows": rows}, "C10")
     return _r("steps.inputs_fresh", "steps", title, "ok",
@@ -179,10 +203,11 @@ def manifest(run):
     bad = []
     for group in ("artifacts", "deliverables"):
         for rel, rec in sorted((man.get(group) or {}).items()):
-            now = run.sha(rel)
-            if now != (rec or {}).get("sha256"):
-                bad.append([rel, group[:-1], _short((rec or {}).get("sha256")), _short(now),
-                            "missing" if now is None else "changed after the analysis wrote it"])
+            now, want = run.sha(rel), rec.get("sha256") if isinstance(rec, dict) else None
+            state = hash_state(want, now)
+            if state != "same":
+                bad.append([rel, group[:-1], _short(want), _short(now),
+                            {"changed": "changed after the analysis wrote it", "not_recorded": "no valid hash recorded"}.get(state, state)])
     n = len(man.get("artifacts") or {}) + len(man.get("deliverables") or {})
     ev = [("analysis/manifest.json", "artifacts"), ("analysis/manifest.json", "deliverables")]
     rows = {"columns": ["file", "kind", "hash in manifest", "hash now", "state"], "rows": bad} if bad else None
@@ -191,8 +216,8 @@ def manifest(run):
                   "The analysis did not finish: its manifest is not marked complete.", ev, rows)
     if bad:
         return _r("steps.manifest", "steps", title, "problem",
-                  f"{len(bad)} of {n} harness-written files differ from the manifest. A file changed after the "
-                  "analysis wrote it was not written by the analysis.", ev, rows)
+                  f"{len(bad)} of {n} harness-written files differ from the manifest, are missing, or have no valid "
+                  "hash in it. A file changed after the analysis wrote it was not written by the analysis.", ev, rows)
     return _r("steps.manifest", "steps", title, "ok", f"All {n} harness-written files match the manifest.", ev)
 
 

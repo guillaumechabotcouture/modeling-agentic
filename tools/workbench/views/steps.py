@@ -44,14 +44,14 @@ def view(run):
     edges, nodes = [], {}
     for a in arts:
         want = (listed.get(a["path"]) or {}).get("sha256")
-        nodes[a["path"]] = ["analysis file", "missing" if a["sha256"] is None else
-                            None if not want else "changed" if want != a["sha256"] else "same"]
+        state = checks.hash_state(want, a["sha256"])
+        nodes[a["path"]] = ["analysis file", None if state == "not_recorded" else state]
     for a in arts:
         for i in a["inputs"]:
             edges.append([a["path"], i["path"], i["state"], _short(i["sha256"]), _short(i["now"])])
             node = nodes.setdefault(i["path"], ["harness file outside the run folder" if i["state"] == "outside"
                                                 else "input in the run folder", i["state"]])
-            if i["state"] in ("changed", "missing") or node[1] is None:
+            if i["state"] in checks.STALE or node[1] is None:
                 node[1] = i["state"]
     for node in nodes.values():
         node[1] = node[1] or "not_recorded"
@@ -79,7 +79,7 @@ def view(run):
         "transitions": len(hist), "tasks": len(tasks),
         "failed_tasks": ", ".join(t["key"] for t in tasks if t["ok"] is False) or "none",
         "analysis_files": len(arts),
-        "files_with_changed_input": len({e[0] for e in edges if e[2] in ("changed", "missing")}),
+        "files_with_changed_input": len({e[0] for e in edges if e[2] in checks.STALE}),
         "last_file_written": (f"{wr['ago']} ago ({wr['file']}, {wr['utc']})" if wr["ago"] else None),
         "working_minutes": round(sum(r[3] or 0 for r in stages), 1),
         "waiting_for_owner_minutes": round(sum(r[4] or 0 for r in stages), 1)}
@@ -105,7 +105,7 @@ def view(run):
                       "columns": ["file", "kind", "producer", "engine", "written_at", "spec_used", "inputs",
                                   "changed_inputs", "state"],
                       "rows": [[a["path"], a["kind"], a["producer"], a["engine"], a["written_at"], _short(a["spec_sha256"]),
-                                len(a["inputs"]), sum(i["state"] in ("changed", "missing") for i in a["inputs"]),
+                                len(a["inputs"]), sum(i["state"] in checks.STALE for i in a["inputs"]),
                                 nodes[a["path"]][1]] for a in arts]},
         "inputs": {"about": "One row per input an analysis file records (the inputs field of its header). state "
                             "compares the input on disk now with the hash recorded when the file was computed; "

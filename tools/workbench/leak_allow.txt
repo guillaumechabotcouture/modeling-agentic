@@ -1,0 +1,3 @@
+# Reviewed chance matches for tools/workbench/leak_check.py: one per line, `file, number, reason`.
+# An entry passes that number in that file only. Never list a value that was read from a run.
+tools/workbench/static/app.css, 121211, the dark theme's background colour (a hex colour, not a quantity); the runs hold long decimals and map coordinates that begin with the same digits

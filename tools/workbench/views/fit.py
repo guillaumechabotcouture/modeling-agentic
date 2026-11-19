@@ -29,7 +29,8 @@ if _WB not in sys.path:
     sys.path.insert(0, _WB)
 import checks as _checks  # noqa: E402
 from views.fit_adapters import (BLOCK_MEANING, CAL, COLUMNS, CONTRACTED, DT, ESS_MIN, FACTS, GAP_MAX,  # noqa: E402
-                                GROUP_BIAS, GROUP_COLUMNS, JC, NEAR, RHAT_MAX, SIGNED, STATUSES, UNC, UNIT_BOUND_SHARE,
+                                GROUP_BIAS, GROUP_COLUMNS, JC, NEAR, RHAT_MAX, SIGNED, SIGNOFF, STATUSES, UNC,
+                                UNIT_BOUND_SHARE,
                                 _at_bound, _cap, _dicts, _g, _names, groups, model)
 from views.fit_charts import charts as _charts  # noqa: E402
 
@@ -73,19 +74,42 @@ def _covered(covers):
     return all(c["ran"] for c in covers), f"declared with decision test {said}"
 
 
+def _unverified(m, bad):
+    """What a problem sentence adds when no signed spec could be verified (§3): nothing in a spec then counts."""
+    return (f" No signed spec could be verified: {m['unverified']}; so no declaration or allowance in a spec counts."
+            if bad and m.get("unverified") else "")
+
+
 def check_status(m):
     f, ev = m["facts"], [(m["file"], m["fields"]["status"])]
-    if f["status"] == "ok":
-        return _r("status", "ok", f"The calibration ({f['method']}) finished with status ok and no block.", ev)
+    t, why = m["tables"]["blocks"], m["why"].get("blocks")
+    if f["status"] is None:
+        return _r("status", "not_available", f"Not available: the calibration's own status is {m.get('status_word')!r}, "
+                  f"which is not a value this view knows the method ({f['method']}) to write, so nothing is concluded "
+                  f"from it.", ev)
     if f["status"] == "not_converged":
         return _r("status", "problem", f"The calibration ({f['method']}) did not converge, so its best point and "
                   f"its ranges are not a fit.", ev)
-    if f["status"] != "blocked" or m["tables"]["blocks"] is None:
-        why = m["why"].get("blocks")
-        return _r("status", "problem" if not why else "not_available",
-                  f"The calibration's status is '{f['status']}', which this view does not know." if not why else
-                  f"Not available: the blocks table {why}.", ev)
-    ev += [(m["file"], m["fields"]["blocks"]), (DT, "data.tests[].status, verdict"), (SIGNED, "calibration.joint.unmatched")]
+    if why or f["status"] not in ("ok", "blocked") or (t is None and f["status"] == "blocked"):
+        return _r("status", "not_available", f"Not available: the blocks table {why}." if why else
+                  f"Not available: the calibration's status is '{f['status']}' and this method ({f['method']}) records "
+                  f"no blocks to check it against.", ev)
+    codes = [str(r[0]) for r in t["rows"]] if t is not None else []
+    both = ev + [(m["file"], m["fields"]["blocks"])]
+    # The status is checked against the block list before anything is concluded from either (they are written
+    # together; a file in which they disagree was not written by the method as it stands).
+    if f["status"] == "ok" and codes:
+        return _r("status", "problem", f"The calibration's status ({m.get('status_word')!r}) says it finished with no "
+                  f"block, but the file lists {len(codes)} block(s): {_names(codes)}. The two contradict each other, so "
+                  f"neither is relied on.", both, {"columns": t["columns"], "rows": t["rows"]})
+    if f["status"] == "ok":
+        return _r("status", "ok", f"The calibration ({f['method']}) finished with status ok and no block.", ev)
+    if not codes:
+        return _r("status", "problem", "The calibration's status is blocked, but the file lists no block, so nothing says "
+                  "what it is blocked on and no declaration can cover it. The two contradict each other, so neither is "
+                  "relied on.", both)
+    ev += [(m["file"], m["fields"]["blocks"]), (DT, "data.tests[].status, verdict"), (SIGNED, "calibration.joint.unmatched"),
+           (SIGNOFF, "sha256")]
     parts, bad, rows = [], False, _dicts(m["tables"]["blocks"])
     for b in m["blocks"]:
         ran, said = _covered(b["cover"])
@@ -101,12 +125,14 @@ def check_status(m):
         if b["allowance"]:
             text += (f", and its {b['allowance'][0]} unit(s) are inside the signed spec's allowance of "
                      f"{b['allowance'][1]} flagged units, which no test covers")
+        if b.get("no_allowance"):
+            text += f", and no allowance covers its unit(s): {b['no_allowance']}"
         parts.append(text)
     went = {True: "the run proceeded", False: "the run did not proceed", None: "whether the run proceeded is not recorded"}[f["proceeded"]]
     bad = bad or f["proceeded"] is not True
     return _r("status", "problem" if bad else "look",
               f"The calibration is blocked by {len(parts)} block(s) and {went}: " + "; ".join(parts)
-              + ("." if bad else ". Declared and signed, so for you to judge."), ev,
+              + ("." if bad else ". Declared and signed, so for you to judge.") + _unverified(m, bad), ev,
               {"columns": m["tables"]["blocks"]["columns"], "rows": m["tables"]["blocks"]["rows"]} if rows else None)
 
 
@@ -142,27 +168,50 @@ def check_changes(m):
     if t is None:
         return _no(m, "changes", "changes", "changes")
     limit, rows = f["change_limit"], _dicts(t)
-    flagged = [r for r in rows if r["flagged"]]
-    near = [r for r in rows if not r["flagged"] and limit and r["z"] is not None and abs(r["z"]) >= (1 - NEAR) * limit]
+    lost, asked, cover, ids = m["changes_uncomputed"], m["changes_asked"], m["change_cover"], m["change_ids"]
+    for k, r in enumerate(rows):       # a pair is told apart by its place: a group may have more than one
+        r["k"], r["name"] = k, r["group"] if r["group"] is not None else (ids[k] if k < len(ids) and ids[k] else "a pair")
+    done = [r for r in rows if r["k"] not in lost]
     ev = [(m["file"], m["fields"]["changes"] + ", data.survey_changes.z_max")]
-    if not flagged and not near:
+    ask = "calibration.joint.changes"
+    if not done and not asked:
+        reason = m["changes_reason"] or "; ".join(sorted(set(lost.values()))) or "the file records no pair"
+        return _r("changes", "not_available", f"Not available: the method computed no change between rounds ({reason}), "
+                  f"and the spec does not ask for this diagnostic ({ask}).", ev)
+    if not rows:
+        return _r("changes", "problem", f"The spec asks for the change between rounds ({ask}), but the file records no "
+                  f"pair ({m['changes_reason'] or 'no reason is recorded'}).", ev + [(SIGNED, ask)])
+    flagged = [r for r in done if r["flagged"]]
+    near = [r for r in done if not r["flagged"] and limit and abs(r["z"]) >= (1 - NEAR) * limit]
+    if not flagged and not near and not lost:
         return _r("changes", "ok", f"None of the {len(rows)} group changes between rounds is flagged, and none has "
                   f"|z| within 25% of the method's limit {_g(limit)}.", ev)
     parts, bad = [], False
     for r in flagged:
-        ran, said = _covered(m["change_cover"].get(r["group"]) or [])
+        ran, said = _covered(cover[r["k"]] if r["k"] < len(cover) else [])
         bad = bad or not ran
-        parts.append(f"{r['group']} is flagged (modelled change {_g(r['modelled'], 3)} against {_g(r['observed'], 3)} "
+        parts.append(f"{r['name']} is flagged (modelled change {_g(r['modelled'], 3)} against {_g(r['observed'], 3)} "
                      f"observed, z {_g(r['z'], 3)} against the limit {_g(limit)}), {said}")
+    for r in rows:
+        if r["k"] in lost and asked:       # a diagnostic the spec asks for: the declared-items rule of §3
+            ran, said = _covered(cover[r["k"]] if r["k"] < len(cover) else [])
+            bad = bad or not ran
+            parts.append(f"{r['name']} could not be computed ({lost[r['k']]}), though the spec asks for this diagnostic "
+                         f"({ask}), {said}")
+        elif r["k"] in lost:
+            parts.append(f"{r['name']} could not be computed ({lost[r['k']]}); the spec does not ask for this "
+                         f"diagnostic ({ask}), so it is not counted as passed and is for you to judge")
     if near:
         parts.append("near misses, inside the limit " + _g(limit) + " but within 25% of it: "
-                     + _names((f"{r['group']} z {_g(r['z'], 3)}" for r in near), 8))
-    if flagged:
+                     + _names((f"{r['name']} z {_g(r['z'], 3)}" for r in near), 8))
+    if flagged or (lost and asked):
         ev += [(DT, "data.tests[].status, verdict"), (m["file"], "data.unmatched_decision.declared"),
-               ("scope_declaration.yaml", "declarations"), ("findings.jsonl", "status declared")]
-    keep = {r["group"] for r in flagged + near}
-    return _r("changes", "problem" if bad else "look", "Change between rounds: " + "; ".join(parts) + ".", ev,
-              {"columns": t["columns"], "rows": [r for r in t["rows"] if r[0] in keep]})
+               ("scope_declaration.yaml", "declarations"), ("findings.jsonl", "status declared"),
+               (SIGNED, "calibration.joint"), (SIGNOFF, "sha256")]
+    keep = {r["k"] for r in flagged + near} | set(lost)
+    return _r("changes", "problem" if bad else "look", "Change between rounds: " + "; ".join(parts) + "."
+              + _unverified(m, bad), ev,
+              {"columns": t["columns"], "rows": [r for k, r in enumerate(t["rows"]) if k in keep]})
 
 
 def check_emulator_vs_engine(m):
@@ -420,7 +469,7 @@ PLANTED = (
 
 def _self_test():
     import shutil
-    from views.fit_bench import Bench, absent, check, close, fixture_builder, need, rewrite, row, says, statuses, table
+    from views.fit_bench import Bench, absent, check, close, data, fixture_builder, need, rewrite, row, says, statuses, table
     b = Bench(view)
     folder, look_at, case, tmp, wb_dir = b.folder, b.look_at, b.case, b.tmp, _WB
     jc_rel, cal_rel = JC, CAL
@@ -675,6 +724,169 @@ def _self_test():
                 hits += [f"{os.path.relpath(os.path.join(root, n), wb_dir)}: {w}" for w in words if w in text]
         need(not hits, f"domain words in the code: {hits[:6]}")
 
+
+    # ---- cases from the code review of the workbench (R<n>: the finding's number) ----
+    def both(*edits):
+        return lambda d: [e(d) for e in edits]
+
+    def no_copy(d):
+        os.remove(os.path.join(d, SIGNED))
+
+    def spec_edit(change, resign=True):
+        """An edit: the spec changed by change(spec) in both copies; the sign-off record follows when `resign`."""
+        import hashlib
+        import json
+        import yaml
+
+        def edit(d):
+            with open(os.path.join(d, "decision_spec.yaml"), encoding="utf-8") as f:
+                spec = yaml.safe_load(f)
+            change(spec)
+            text = yaml.safe_dump(spec, sort_keys=False)
+            for rel in ("decision_spec.yaml", SIGNED):
+                with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
+                    f.write(text)
+            if resign:
+                with open(os.path.join(d, "decision_spec.signoff.json"), encoding="utf-8") as f:
+                    so = json.load(f)
+                so["sha256"]["decision_spec.yaml"] = hashlib.sha256(text.encode()).hexdigest()
+                with open(os.path.join(d, "decision_spec.signoff.json"), "w", encoding="utf-8") as f:
+                    json.dump(so, f)
+        return edit
+
+    def scope(*declared):
+        """An edit: scope_declaration.yaml with one declaration per (blocker id, decision test id)."""
+        import yaml
+
+        def edit(d):
+            with open(os.path.join(d, "scope_declaration.yaml"), "w", encoding="utf-8") as f:
+                yaml.safe_dump({"declarations": [{"id": f"SD-{k}", "blocker_id": bid, "decision_test":
+                                                  f"models/decision_tests/{t}.yaml"} for k, (bid, t) in enumerate(declared)]}, f)
+        return edit
+
+    def unit_miss(doc):
+        jc = doc["data"]
+        jc.update(status="blocked", blocked=True, blocks=[{"code": "verification_failed", "detail": {"units": ["U01"], "targets": []}}])
+        jc["units"]["U01"].update(status="verification_failed", matched=False)
+        jc["unmatched_decision"].update(proceed=True, flagged=[{"unit": "U01", "status": "verification_failed", "reason": "r"}])
+
+    def f_verified():
+        for defect, name in (("C13_blocked_declared", "status"), ("C2_change_flagged_declared", "changes")):
+            c = check(look_at(b.edited(hm, no_copy, defect)), name)
+            need(c["status"] == "problem" and "no signed spec could be verified" in says(c),
+                 f"{defect} with the signed copy removed: the spec on disk authorises nothing ({c['status']}: {c['says']!r})")
+
+        def unsign(d):
+            os.remove(os.path.join(d, "decision_spec.signoff.json"))
+        c = check(look_at(b.edited(hm, unsign, "C13_blocked_declared")), "status")
+        need(c["status"] == "problem" and "no signed spec could be verified" in says(c),
+             f"a signed copy with no sign-off record to compare its hash with authorises nothing ({c['status']}: {c['says']!r})")
+        flag = check(look_at(b.edited(hm, rewrite(jc_rel, unit_miss))), "status")
+        need(flag["status"] == "look" and "allowance of 2" in says(flag) and "no test covers" in says(flag),
+             f"a unit miss inside the signed allowance under mode flag is look, and says so ({flag['status']}: {flag['says']!r})")
+
+        def to_block(spec):
+            spec["calibration"]["joint"]["unmatched"]["mode"] = "block"
+        blk = check(look_at(b.edited(hm, both(rewrite(jc_rel, unit_miss), spec_edit(to_block)))), "status")
+        need(blk["status"] == "problem" and "mode is 'block'" in blk["says"],
+             f"under the signed mode block the allowance does not apply ({blk['status']}: {blk['says']!r})")
+        gone = check(look_at(b.edited(hm, both(rewrite(jc_rel, unit_miss), no_copy))), "status")
+        need(gone["status"] == "problem" and "no signed spec could be verified" in says(gone),
+             f"with no verified signed copy there is no allowance ({gone['status']}: {gone['says']!r})")
+
+    def f_pairs():
+        other_id = "survey_a:grp_r0->unit_r2:G2"
+
+        def second_pair(first):
+            def change(doc):
+                sc = doc["data"]["survey_changes"]
+                g2 = next(p for p in sc["pairs"] if p["group"] == "G2")
+                other = dict(g2, id=other_id, z=0.4, flagged=False, **{"from": "grp_r0"})
+                rest = [p for p in sc["pairs"] if p is not g2]
+                sc["pairs"] = rest + ([other, g2] if first else [g2, other])
+            return change
+        for first in (False, True):
+            d = b.edited(hm, both(rewrite(jc_rel, second_pair(first)),
+                                  scope((f"calibration_change_discrepancy:change:{other_id}", "DT1"))), "C2_change_flagged")
+            c = check(look_at(d), "changes")
+            need(c["status"] == "problem" and "dt1" not in says(c) and len(c["rows"]["rows"]) == 1,
+                 f"a declaration for another pair of the same group covers nothing, whatever the rows' order "
+                 f"(other pair first: {first}; {c['status']}: {c['says']!r})")
+        own = next(p["id"] for p in data(folder(hm, "C2_change_flagged"), jc_rel)["survey_changes"]["pairs"] if p["group"] == "G2")
+        d = b.edited(hm, both(rewrite(jc_rel, second_pair(False)),
+                              scope((f"calibration_change_discrepancy:change:{own}", "DT1"))), "C2_change_flagged")
+        c = check(look_at(d), "changes")
+        need(c["status"] == "look" and "dt1" in says(c), f"the flagged pair's own declaration covers it ({c['status']}: {c['says']!r})")
+
+    def f_status_words():
+        d = folder(hm)
+        need(data(d, jc_rel)["status"] == "matched" and data(d, jc_rel)["sensitivity"][0]["report"]["status"] == "matched",
+             "the fixture writes the producer's own word for success (matched)")
+        v = look_at(d)
+        need(v["facts"]["status"] == "ok" and check(v, "status")["status"] == "ok", f"matched is the generic ok ({v['facts']['status']})")
+
+        def odd(doc):
+            doc["data"]["status"] = "finished"
+        v = look_at(b.edited(hm, rewrite(jc_rel, odd)))
+        c = check(v, "status")
+        need(c["status"] == "not_available" and "'finished'" in c["says"] and v["facts"]["status"] is None,
+             f"a status word the producer cannot write is not_available and named ({c['status']}: {c['says']!r})")
+
+        def odd_flag(doc):
+            doc["data"]["diagnostics"]["converged"] = "yes"
+        c = check(look_at(b.edited(post, rewrite(cal_rel, odd_flag))), "status")
+        need(c["status"] == "not_available" and "'yes'" in c["says"], f"so is a convergence flag that is no boolean ({c['says']!r})")
+
+    def f_contradiction():
+        def ok_with_block(doc):
+            doc["data"]["blocks"] = [{"code": "empty_region", "detail": {}}]
+        c = check(look_at(b.edited(hm, rewrite(jc_rel, ok_with_block))), "status")
+        need(c["status"] == "problem" and "empty region" in says(c) and "contradict" in says(c),
+             f"a status of success beside a block is a contradiction ({c['status']}: {c['says']!r})")
+
+        def blocked_no_block(doc):
+            doc["data"].update(status="blocked", blocked=True, blocks=[])
+            doc["data"]["unmatched_decision"]["proceed"] = True
+        c = check(look_at(b.edited(hm, rewrite(jc_rel, blocked_no_block))), "status")
+        need(c["status"] == "problem" and "contradict" in says(c) and "declared and signed" not in says(c),
+             f"a blocked status with no block is a contradiction ({c['status']}: {c['says']!r})")
+
+    def f_uncomputed():
+        why = "the group's units have no positive weight"
+        pid = next(p["id"] for p in data(folder(hm), jc_rel)["survey_changes"]["pairs"] if p["group"] == "G3")
+
+        def lose(doc):
+            sc = doc["data"]["survey_changes"]
+            sc["pairs"] = [p if p["group"] != "G3" else {**{k: p[k] for k in ("id", "survey", "from", "to", "group", "by")},
+                                                         "not_computable": why} for p in sc["pairs"]]
+
+        def ask(spec):
+            spec["calibration"]["joint"]["changes"] = {"by": "stratum"}
+        v = look_at(b.edited(hm, rewrite(jc_rel, lose)))
+        c, r = check(v, "changes"), row(v, "changes", "group", "G3")
+        need(c["status"] == "look" and "g3" in says(c) and why in says(c) and r["flagged"] is None and r["z"] is None,
+             f"a pair that could not be computed is never counted as passed ({c['status']}: {c['says']!r}; {r})")
+        c = check(look_at(b.edited(hm, both(rewrite(jc_rel, lose), spec_edit(ask)))), "changes")
+        need(c["status"] == "problem" and why in says(c),
+             f"where the signed spec asks for the diagnostic, an uncomputed pair nothing declares is a problem ({c['status']}: {c['says']!r})")
+        c = check(look_at(b.edited(hm, both(rewrite(jc_rel, lose), spec_edit(ask),
+                                            scope((f"calibration_change_not_computable:change:{pid}", "DT1"))))), "changes")
+        need(c["status"] == "look" and "dt1" in says(c), f"and look when a declaration with a test that ran covers it ({c['status']}: {c['says']!r})")
+
+        def lose_all(doc):
+            sc = doc["data"]["survey_changes"]
+            sc.update(status="not_computable", reason="a single round (grp_r1)", flagged=[],
+                      pairs=[{"id": "survey_a", "survey": "survey_a", "not_computable": "a single round (grp_r1)"}])
+
+        def none_declared(doc):
+            doc["data"]["survey_changes"].update(status="not_computable", reason="no change pairs are declared", flagged=[], pairs=[])
+        for edit, word in ((lose_all, "a single round"), (none_declared, "no change pairs are declared")):
+            c = check(look_at(b.edited(hm, rewrite(jc_rel, edit))), "changes")
+            need(c["status"] == "not_available" and word in says(c),
+                 f"an optional diagnostic with nothing computed is not_available with the method's reason ({c['status']}: {c['says']!r})")
+            c = check(look_at(b.edited(hm, both(rewrite(jc_rel, edit), spec_edit(ask)))), "changes")
+            need(c["status"] == "problem", f"and a problem where the signed spec asks for it ({c['status']}: {c['says']!r})")
+
     case("F1 history matching, clean fixture: the eleven checks, every one ok or not recorded by the method", f1)
     case("F2 posterior, clean fixture: six checks ok, five not_available naming the method", f6)
     case("F3 every check carries one sentence, the file and field read, and its scorecard case", f9)
@@ -694,6 +906,11 @@ def _self_test():
     case(f"F{n + 9} no file under tools/workbench/ holds a domain word (§3a)", f_words)
     case(f"F{n + 10} the status sentence says it is the method's own verdict and which other checks raise something", f_relates)
     case(f"F{n + 11} units whose interval reaches a bound are named, not only counted", f_names_units)
+    case("R5 declarations and allowances count only from a signed copy whose hash the sign-off record holds, under mode flag", f_verified)
+    case("R6 a declaration covers the change pair it names, not another pair of the same group", f_pairs)
+    case("R7 the producer's status words are mapped to the generic ones; an unknown word is not_available and named", f_status_words)
+    case("R8 a status that contradicts the block list is a problem", f_contradiction)
+    case("R9 a change pair that could not be computed is carried through with its reason", f_uncomputed)
     return b.done()
 
 

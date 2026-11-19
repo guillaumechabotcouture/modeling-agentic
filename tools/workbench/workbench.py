@@ -8,8 +8,8 @@
     python3 tools/workbench/workbench.py --self-test
 
 Serves tools/workbench/static/ on 127.0.0.1 only and makes no outbound call. It reads run files and never writes
-to a run. It imports no engine and no harness loader; every read goes through lib.safe_io.read_nofollow, confined
-to the run directory.
+to a run. It imports no engine and no harness loader; every read goes through a descriptor that lib.safe_io opens with
+no link followed (dir_fd_nofollow, open_nofollow), confined to the run directory as it was found at discovery.
 
 A view is a module views/<name>.py whose `view(run)` returns {checks, facts, tables, charts, notes}; the page
 (static/) draws any such result and has no code for a particular view. GET /api/view?run=<id>&view=<name> returns
@@ -49,6 +49,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -65,7 +66,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 for _p in (os.path.join(REPO, "scripts"), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-from lib.safe_io import LinkRefused, read_nofollow  # noqa: E402
+from lib.safe_io import LinkRefused, dir_fd_nofollow, open_nofollow  # noqa: E402
 import checks  # noqa: E402
 import glossary  # noqa: E402
 
@@ -199,40 +200,132 @@ def ago(seconds):
     return "less than a minute"
 
 
-class Run:
-    """One run directory, read lazily. Every reader returns (value, why_not): never raises on a bad file."""
+def folder_id(path):
+    """(device, inode) of a directory, itself and not what a link at that path points to; (None, None) when it is
+    not a directory or cannot be read. Recorded when a run is found, and compared on every later read."""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None, None
+    return (st.st_dev, st.st_ino) if stat.S_ISDIR(st.st_mode) else (None, None)
 
-    def __init__(self, path, repo=REPO, now=None):
-        self.path, self.repo, self.now, self._cache = os.path.realpath(path), repo, now, {}
+
+class Run:
+    """One run directory, read lazily. Every reader returns (value, why_not): never raises on a bad file.
+
+    Every read goes through a descriptor: the run folder is opened with no link followed and must still be the
+    directory found at discovery (`ident`, its device and inode: a folder swapped for another, or for a link, is
+    refused); the file is opened below that descriptor with no link followed at any component; and a file with more
+    than one hard link is refused, since its content may belong to a file elsewhere."""
+
+    def __init__(self, path, repo=REPO, now=None, ident=None):
+        # With no identity given, this is the discovery: the path is resolved once, here, and its identity recorded.
+        self.path = os.path.realpath(path) if ident is None else path
+        self.ident = folder_id(self.path) if ident is None else tuple(ident)
+        self.repo, self.now, self._cache = repo, now, {}
+
+    def _root(self):
+        """A descriptor on the run folder (the caller closes it); LinkRefused when it is not the folder found."""
+        fd = dir_fd_nofollow(self.path, [])
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != self.ident:
+            os.close(fd)
+            raise LinkRefused("the run folder is not the directory found at discovery (its device and inode differ), "
+                              "so nothing is read from it")
+        return fd
+
+    def _dir(self, parts):
+        """A descriptor on a folder of the run, each component opened with no link followed (the caller closes it)."""
+        root = self._root()
+        try:
+            return dir_fd_nofollow(root, list(parts))
+        finally:
+            os.close(root)
+
+    def _open(self, rel, fn):
+        """(fn(descriptor, its fstat), None) for the plain file `rel`, or (None, why)."""
+        try:
+            root = self._root()
+            try:
+                fd = open_nofollow(root, check_rel(rel))
+            finally:
+                os.close(root)
+        except FileNotFoundError:
+            return None, f"{rel} is not in the run folder"
+        except (ValueError, OSError) as e:
+            return None, f"{rel} could not be read ({e})"
+        try:
+            st = os.fstat(fd)
+            if st.st_nlink > 1:
+                return None, (f"{rel} could not be read (it has {st.st_nlink} hard links: a file also linked from "
+                              f"elsewhere is not read)")
+            return fn(fd, st), None
+        except OSError as e:
+            return None, f"{rel} could not be read ({e})"
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _pieces(fd, max_bytes=None):
+        left = -1 if max_bytes is None else max_bytes
+        while left != 0:
+            b = os.read(fd, 1 << 20 if left < 0 else min(left, 1 << 20))
+            if not b:
+                return
+            left -= len(b) if left > 0 else 0
+            yield b
+
+    def names(self, rel):
+        """The names in a folder of the run, listed through a descriptor opened with no link followed; none when it
+        cannot be opened that way (a folder that is a link is not listed)."""
+        try:
+            fd = self._dir(check_rel(rel).split("/"))
+        except (ValueError, OSError):
+            return []
+        try:
+            return sorted(os.listdir(fd))
+        except OSError:
+            return []
+        finally:
+            os.close(fd)
 
     def last_written(self, limit=WALK_LIMIT):
         """{at, file, cut}: the newest modification time among the run's files and the file that has it, from a walk
-        of the run folder that follows no link and stops after `limit` files (cut is then True). Only file times are
-        read, never contents. at is None when no file's time could be read."""
+        of the run folder that follows no link and stops after `limit` files (cut is then True). Each folder is
+        opened by descriptor, component by component, so one replaced by a link during the walk is not entered. Only
+        file times are read, never contents. at is None when no file's time could be read."""
         key = ("last_written", limit)
         if key not in self._cache:
-            at, rel, n, cut, stack = None, None, 0, False, [self.path]
+            at, rel, n, cut, stack = None, None, 0, False, [()]
             while stack and not cut:
+                parts = stack.pop()
                 try:
-                    entries = sorted(os.scandir(stack.pop()), key=lambda e: e.name)
+                    fd = self._dir(parts)
+                except (ValueError, OSError):
+                    continue
+                try:
+                    with os.scandir(fd) as it:
+                        entries = sorted(it, key=lambda e: e.name)
+                    for e in entries:
+                        try:
+                            if e.is_symlink():
+                                continue
+                            if e.is_dir(follow_symlinks=False):
+                                stack.append(parts + (e.name,))
+                                continue
+                            n += 1
+                            if n > limit:
+                                cut = True
+                                break
+                            t = e.stat(follow_symlinks=False).st_mtime
+                        except OSError:
+                            continue
+                        if at is None or t > at:
+                            at, rel = t, "/".join(parts + (e.name,))
                 except OSError:
                     continue
-                for e in entries:
-                    try:
-                        if e.is_symlink():
-                            continue
-                        if e.is_dir(follow_symlinks=False):
-                            stack.append(e.path)
-                            continue
-                        n += 1
-                        if n > limit:
-                            cut = True
-                            break
-                        t = e.stat(follow_symlinks=False).st_mtime
-                    except OSError:
-                        continue
-                    if at is None or t > at:
-                        at, rel = t, os.path.relpath(e.path, self.path)
+                finally:
+                    os.close(fd)
             self._cache[key] = {"at": at, "file": rel, "cut": cut}
         return self._cache[key]
 
@@ -249,18 +342,19 @@ class Run:
                 "says": f"The newest file in the run folder{among}, {lw['file']}, was written {words} ago ({utc})."}
 
     def read(self, rel, max_bytes=None):
-        try:
-            return read_nofollow(self.path, check_rel(rel), max_bytes)[0], None
-        except FileNotFoundError:
-            return None, f"{rel} is not in the run folder"
-        except (ValueError, LinkRefused, OSError) as e:
-            return None, f"{rel} could not be read ({e})"
+        return self._open(rel, lambda fd, st: b"".join(self._pieces(fd, max_bytes)))
 
     def sha(self, rel):
+        """The file's sha256, hashed piece by piece from the confined descriptor (a file of any size costs one
+        piece of memory); None when it cannot be read."""
         key = ("sha", rel)
         if key not in self._cache:
-            b, _ = self.read(rel)
-            self._cache[key] = hashlib.sha256(b).hexdigest() if b is not None else None
+            def digest(fd, st):
+                h = hashlib.sha256()
+                for b in self._pieces(fd):
+                    h.update(b)
+                return h.hexdigest()
+            self._cache[key] = self._open(rel, digest)[0]
         return self._cache[key]
 
     def json(self, rel):
@@ -283,14 +377,12 @@ class Run:
     def large(self, rel):
         """A YAML mapping of any size up to MAX_LARGE, parsed with PyYAML's C loader and kept in the server's memory
         by the file's size and modification time: every later request, from any Run of this folder, gets the parsed
-        document back until the file changes. The stat and the read both go through the confined, no-link reader.
-        The caller must not change the document it is given."""
-        try:
-            _, st = read_nofollow(self.path, check_rel(rel), 0)
-        except FileNotFoundError:
-            return None, f"{rel} is not in the run folder"
-        except (ValueError, LinkRefused, OSError) as e:
-            return None, f"{rel} could not be read ({e})"
+        document back until the file changes. The stat and the read are of one descriptor, opened by the confined,
+        no-link reader. The caller must not change the document it is given."""
+        out, why = self._open(rel, lambda fd, st: self._large(rel, fd, st))
+        return out if why is None else (None, why)
+
+    def _large(self, rel, fd, st):
         key = (self.path, rel)
         with _LARGE_LOCK:        # one parse at a time: a second request for the same file waits and then finds it
             kept = _LARGE.get(key)
@@ -299,9 +391,7 @@ class Run:
                 return kept[2]
             if st.st_size > MAX_LARGE:
                 return None, f"{rel} is larger than {MAX_LARGE >> 20} MB and is not read"
-            b, why = self.read(rel, MAX_LARGE + 1)
-            if b is None:
-                return None, why
+            b = b"".join(self._pieces(fd, MAX_LARGE + 1))
             try:
                 LARGE_PARSES[0] += 1
                 d = yaml.load(b, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
@@ -345,12 +435,9 @@ class Run:
             return self._cache["artifacts"]
         man, _ = self.json("analysis/manifest.json")
         listed = dict((man or {}).get("artifacts") or {})
-        try:
-            for name in sorted(os.listdir(os.path.join(self.path, "analysis"))):
-                if name.endswith(".yaml"):
-                    listed.setdefault(f"analysis/{name}", {})
-        except OSError:
-            pass
+        for name in self.names("analysis"):
+            if name.endswith(".yaml"):
+                listed.setdefault(f"analysis/{name}", {})
         out = []
         for rel, rec in sorted(listed.items()):
             env, why = self.envelope(rel) if rel.endswith(".yaml") else (None, "not a YAML artifact")
@@ -361,7 +448,7 @@ class Run:
                     now, state = None, "outside"       # a harness file (engine card, priors): not in the run folder
                 else:
                     now = self.sha(ipath)
-                    state = "same" if now == isha else ("missing" if now is None else "changed")
+                    state = checks.hash_state(isha, now)
                 inputs.append({"path": ipath, "sha256": isha, "now": now, "state": state})
             eng = env.get("engine") if isinstance(env.get("engine"), dict) else {}
             out.append({"path": rel, "kind": (rec or {}).get("kind") or str(env.get("schema") or "").split("/")[0],
@@ -453,13 +540,20 @@ def chosen_roots(roots, run_dirs):
 class Workbench:
     def __init__(self, roots, run_dirs=(), spec=None):
         self.roots, self.run_dirs, self.runs, self.lock = list(roots), [os.path.realpath(p) for p in run_dirs], {}, threading.Lock()
+        self.found = {}                          # path -> (device, inode) of the folder when it was first found
         self.glossary = glossary.load(spec)      # read once at start from the specification's own tables
 
     def scan(self):
         paths = self.run_dirs + discover(self.roots)
         with self.lock:
+            for p in paths:
+                self.found.setdefault(p, folder_id(p))
             self.runs = {hashlib.sha1(p.encode()).hexdigest()[:10]: p for p in paths}
         return self.runs
+
+    def run(self, path):
+        """The run at a path the scan found, held to the folder it was then (Run refuses another in its place)."""
+        return Run(path, ident=self.found.get(path, (None, None)))
 
     def label(self, path):
         """The run's place under its root, with the long question-derived folder name shortened."""
@@ -476,7 +570,7 @@ class Workbench:
     def api_runs(self):
         rows = []
         for rid, p in self.scan().items():
-            s = Run(p).summary()
+            s = self.run(p).summary()
             rows.append({"id": rid, "label": self.label(p), "dir": p, **s,
                          "copy": bool(re.search(r"(before|backup|pristine|\.bak)", p, re.I))})
         rows.sort(key=lambda r: -(r["last_written"] or 0))
@@ -489,7 +583,7 @@ class Workbench:
         p = p or self.scan().get(rid)
         if p is None or name not in [i for i, _, _ in PATH]:
             return None
-        return clean(Run(p).view(name))
+        return clean(self.run(p).view(name))
 
     def handle(self, method, target, host):
         """(status, content type, body). Loopback Host only; GET only: the workbench has no write yet.
@@ -726,8 +820,15 @@ def _self_test():
         ok("W12 fail closed: an unreadable run gives not_available everywhere, never a crash or an ok",
            all(c["status"] == "not_available" for c in checks.run_all(Run(d3))), str([c["status"] for c in checks.run_all(Run(d3))]))
         os.symlink("/etc/hosts", os.path.join(d3, "metadata.json"))
-        ok("W13 confined reads: no link followed, no path outside the run, no credential file",
-           Run(d3).read("metadata.json")[0] is None and Run(d).read("../x")[0] is None and Run(d).read(".env")[0] is None)
+        for rel in ("../x", ".env", "data/id_rsa.pub", "data/.env.local"):       # harmless files, so "not found" cannot pass for a refusal
+            open(os.path.join(d, rel), "w").write("harmless\n")
+        refused = {rel: Run(d).read(rel) for rel in ("../x", ".env", "data/id_rsa.pub", "data/.env.local", "data/units.csv")}
+        ok("W13 confined reads: no link followed, no path outside the run, no credential file, each refused for its own reason "
+           "although the file exists",
+           Run(d3).read("metadata.json")[0] is None and "link" in Run(d3).read("metadata.json")[1]
+           and refused["../x"] == (None, "../x could not be read ('../x': not a relative path inside the run directory)")
+           and all(refused[rel] == (None, f"{rel} could not be read ({rel}: credential files are not read)")
+                   for rel in (".env", "data/id_rsa.pub", "data/.env.local")) and refused["data/units.csv"][0] is not None, str(refused))
         ok("W14 the server answers loopback GETs only",
            wb.handle("GET", "/api/runs", "evil.example")[0] == 403 and wb.handle("POST", "/api/runs", "127.0.0.1:1")[0] == 405
            and wb.handle("GET", "/api/runs", "127.0.0.1:8790")[0] == 200 and wb.handle("GET", "/api/view?run=nope&view=steps", "localhost")[0] == 404)
@@ -780,7 +881,7 @@ def _self_test():
 
         acc, lines = os.path.join(tmp, "steps.yaml"), []
         entries = [{"path": "facts.status", "equals": "completed", "source": "run_state.json status"},
-                   {"path": "facts.model_spend_usd", "approx": 3.001, "source": "run_state.json spent_usd"},
+                   {"path": "facts.model_spend_usd", "approx": 3.0 + 1e-3, "source": "run_state.json spent_usd"},
                    {"path": "tables.tasks[key=SPEC#0:try1].allowance_usd", "equals": 3.0},
                    {"path": "tables.artifacts[file=analysis/point.yaml].kind", "equals": "point"},
                    {"path": "checks[id=steps.pipeline].status", "equals": "problem"}]
@@ -817,7 +918,7 @@ def _self_test():
         n0 = LARGE_PARSES[0]
         first, again = Run(d5).large("analysis/big.yaml"), Run(d5).large("analysis/big.yaml")
         ok("W26 a large YAML file is parsed once and kept in memory: a second Run of the folder gets the same document",
-           first[1] is None and first[0]["data"]["rows"][1999] == [1999, 999.5] and again[0] is first[0]
+           first[1] is None and first[0]["data"]["rows"][1999] == [1999, 1999 * 0.5] and again[0] is first[0]
            and LARGE_PARSES[0] == n0 + 1, str((first[1], LARGE_PARSES[0] - n0)))
         open(big, "a").write("  - [2000, 1000.0]\n")
         later = Run(d5).large("analysis/big.yaml")
@@ -892,6 +993,138 @@ def _self_test():
            chosen_roots(None, [d]) == [] and chosen_roots(None, []) == [os.path.join(REPO, "runs")]
            and chosen_roots(["x"], [d]) == ["x"] and listed["roots"] == [] and listed["run_dirs"] == [os.path.realpath(d)]
            and len(listed["runs"]) == 1, str({k: listed[k] for k in ("roots", "run_dirs")}))
+
+        # ---- cases from the code review of the workbench (R<n>: the finding's number) ----
+        def toy(name):
+            dd = os.path.join(tmp, "review", name)
+            os.makedirs(dd)
+            _toy(dd)
+            return dd
+
+        def edit_json(dd, rel, change):
+            doc = json.load(open(os.path.join(dd, rel)))
+            change(doc)
+            open(os.path.join(dd, rel), "w").write(json.dumps(doc))
+
+        def states(c):
+            return {r[0] if c["id"] != "steps.inputs_fresh" else r[1]: r[-1] for r in (c["rows"] or {}).get("rows", [])}
+        d7 = toy("lost-manifest")
+        edit_json(d7, "analysis/manifest.json", lambda m: m["artifacts"].update({"analysis/lost.yaml": {}}))
+        c = st(Run(d7), "steps.manifest")
+        ok("R10a a listed file that is missing never matches a manifest entry that records no hash",
+           c["status"] == "problem" and states(c) == {"analysis/lost.yaml": "missing"}, str(c))
+        edit_json(d7, "analysis/manifest.json", lambda m: (m["artifacts"].pop("analysis/lost.yaml"),
+                                                           m["deliverables"].update({"allocation.csv": {"sha256": "abc"}})))
+        c = st(Run(d7), "steps.manifest")
+        ok("R10b a file the manifest records no valid hash for is not said to have changed: no hash was recorded",
+           c["status"] == "problem" and states(c) == {"allocation.csv": "no valid hash recorded"}, str(c))
+        d7 = toy("lost-signed")
+        edit_json(d7, "decision_spec.signoff.json", lambda so: so["sha256"].update({"data/gone.csv": None}))
+        c = st(Run(d7), "steps.signed_spec")
+        ok("R10c a signed file that is missing is never the same as what was signed, whatever hash was recorded",
+           c["status"] == "problem" and states(c) == {"data/gone.csv": "missing", "decision_spec.yaml": "same"}, str(c))
+        edit_json(d7, "decision_spec.signoff.json", lambda so: (so["sha256"].pop("data/gone.csv"), so["sha256"].update({"data/units.csv": "abc"})))
+        c = st(Run(d7), "steps.signed_spec")
+        ok("R10d a file signed with no valid hash is not said to be unchanged",
+           c["status"] == "problem" and states(c) == {"data/units.csv": "no valid hash recorded", "decision_spec.yaml": "same"}, str(c))
+        d7 = toy("lost-input")
+        claims = open(os.path.join(d7, "analysis", "claims.yaml")).read()
+        open(os.path.join(d7, "analysis", "claims.yaml"), "w").write(claims.replace("inputs:\n", "inputs:\n  data/absent.csv: null\n", 1))
+        c = st(Run(d7), "steps.inputs_fresh")
+        ok("R10e a recorded input that is missing is never fresh, whatever hash was recorded",
+           c["status"] == "problem" and states(c) == {"data/absent.csv": "missing"}, str(c))
+        open(os.path.join(d7, "analysis", "claims.yaml"), "w").write(claims.replace("inputs:\n", "inputs:\n  allocation.csv: ''\n", 1))
+        c = st(Run(d7), "steps.inputs_fresh")
+        ok("R10f an input recorded with no valid hash is never fresh",
+           c["status"] == "problem" and states(c) == {"allocation.csv": "not_recorded"}, str(c))
+        d7 = toy("nohash-spec")
+        edit_json(d7, "decision_spec.signoff.json", lambda so: so["sha256"].update({"decision_spec.yaml": "abc"}))
+        for name in ("point", "claims"):
+            text = open(os.path.join(d7, "analysis", f"{name}.yaml")).read()
+            open(os.path.join(d7, "analysis", f"{name}.yaml"), "w").write(re.sub(r"spec_sha256: \w+", "spec_sha256: abc", text))
+        c = st(Run(d7), "steps.artifact_spec")
+        ok("R10g a signed spec hash that is no digest is nothing an analysis file can be said to match",
+           c["status"] == "not_available", str(c))
+
+        outside = os.path.join(tmp, "elsewhere")
+        os.makedirs(os.path.join(outside, "deep"))
+        open(os.path.join(outside, "private_name.yaml"), "w").write("schema: toy/1\ndata: {}\n")
+        open(os.path.join(outside, "deep", "newest.txt"), "w").write("x")
+        d8 = toy("linked-analysis")
+        shutil.rmtree(os.path.join(d8, "analysis"))
+        os.symlink(outside, os.path.join(d8, "analysis"))
+        listed = [a["path"] for a in Run(d8).artifacts()] + [r[0] for r in Run(d8).view("steps")["tables"].get("artifacts", {}).get("rows", [])]
+        ok("R2a a linked analysis folder is not listed: no file name from outside the run reaches the artifacts table",
+           not any("private_name" in x for x in listed), str(listed))
+        d8 = toy("swapped-folder")
+        os.makedirs(os.path.join(d8, "sub"))
+        open(os.path.join(d8, "sub", "inside.txt"), "w").write("x")
+        future = time.time() + 5000
+        os.utime(os.path.join(outside, "deep", "newest.txt"), (future, future))
+        real_scandir, swapped = os.scandir, []
+
+        class Listed(list):          # what os.scandir gives, already read: usable in a `with`, as os.scandir's is
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def swapping(where):         # the folder queued for the walk is replaced by a link before it is opened
+            if not swapped:
+                swapped.append(1)
+                entries = Listed(real_scandir(where))
+                os.rename(os.path.join(d8, "sub"), os.path.join(d8, "sub_was"))
+                os.symlink(os.path.join(outside, "deep"), os.path.join(d8, "sub"))
+                return entries
+            return real_scandir(where)
+        os.scandir = swapping
+        try:
+            lw = Run(d8).last_written()
+        finally:
+            os.scandir = real_scandir
+        ok("R2b the walk for the last file written opens each folder with no link followed: a folder replaced by a link "
+           "after it was listed is not entered", swapped and "newest" not in str(lw["file"]) and (lw["at"] or 0) < future - 1, str(lw))
+
+        d9 = toy("big-hash")
+        with open(os.path.join(d9, "data", "big.bin"), "wb") as f:
+            f.truncate(48 << 20)
+        import tracemalloc
+        tracemalloc.start()
+        got = Run(d9).sha("data/big.bin")
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        zeros = hashlib.sha256()
+        for _ in range(48):
+            zeros.update(bytes(1 << 20))
+        ok("R4 a file is hashed piece by piece: hashing a 48 MiB file holds a few MiB at most",
+           got == zeros.hexdigest() and peak < (8 << 20), f"peak {peak >> 20} MiB")
+
+        d10, other = toy("hard-link"), toy("other-run")
+        edit_json(other, "metadata.json", lambda m: m.update(question="the other run's question"))
+        os.remove(os.path.join(d10, "metadata.json"))
+        os.link(os.path.join(other, "metadata.json"), os.path.join(d10, "metadata.json"))
+        os.link(os.path.join(other, "analysis", "point.yaml"), os.path.join(d10, "analysis", "linked.yaml"))
+        r10 = Run(d10)
+        whys = [r10.read("metadata.json"), r10.json("metadata.json"), r10.large("analysis/linked.yaml")]
+        ok("R3 a file with more than one hard link is refused, by every reader, and the reason says so",
+           all(v is None and "hard link" in str(why) for v, why in whys) and r10.sha("analysis/linked.yaml") is None
+           and "other run" not in json.dumps(r10.summary()), str(whys))
+
+        wb2 = Workbench([os.path.join(tmp, "review2")])
+        d11 = os.path.join(tmp, "review2", "mine")
+        os.makedirs(d11)
+        _toy(d11)
+        rid2 = next(iter(wb2.scan()))
+        os.rename(d11, os.path.join(tmp, "mine-moved"))
+        os.symlink(other, d11)
+        v2 = wb2.api_view(rid2, "steps")
+        ok("R1 a run folder replaced after discovery is not read: every check is not_available and says the folder changed",
+           v2 is None or (all(c["status"] == "not_available" for c in v2["checks"]) and "other run" not in json.dumps(v2)
+                          and any("device and inode" in c["says"] for c in v2["checks"])),
+           str([(c["status"], c["says"][:90]) for c in (v2 or {}).get("checks", [])]))
+        ok("R1b the run list shows nothing read from the replacement either",
+           "other run" not in json.dumps(wb2.api_runs()), json.dumps(wb2.api_runs())[:300])
 
         node = shutil.which("node")
         if node is None:
