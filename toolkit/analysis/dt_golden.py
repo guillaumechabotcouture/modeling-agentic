@@ -554,7 +554,36 @@ def _self_test() -> int:
         ok("read_nofollow" in inspect.getsource(_read) and "open(" not in inspect.getsource(digest_dir),
            "DG19c (r4 P1) every read goes through lib.safe_io.read_nofollow (one descriptor, no link followed)")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19):
+    def dg20():          # Codex review r5 of #262, and the CI recording that differed (written first; each failed)
+        import datetime
+        run1 = {"path": "models/decision_tests/2026-11-18.yaml", "status": "run", "verdict": "NO_CHANGE"}
+        with tempfile.TemporaryDirectory() as d:
+            day = datetime.date(2026, 11, 18)
+            fixture(d, [dict(run1, test_id=day)], {"2026-11-18.yaml": _rec(test_id=day)})
+            try:
+                got = set(digest_dir(d))
+            except Exception as e:  # noqa: BLE001
+                got = e
+            ok(got == {"2026-11-18"}, f"DG20 (r5 P1-2) an unquoted YAML date id, as run_all names its file ({got})")
+        import inspect
+        src = inspect.getsource(digest_dir)
+        ok(src.count("os.path.realpath(run_dir)") == 1 and "realpath" not in inspect.getsource(_read),
+           "DG20b (r5 P1-1) the run dir is resolved once per digest, so a retargeted alias cannot swap runs mid-read")
+        printed = []
+        _CAP.update(on=True, paused=False, orig=lambda *a, **k: None, recs={"f:X#0": {"decision": "1"}}, counts={},
+                    problems=[], parts={"f:X#0": {"decision": {"share": 0.5}}})
+        from toolkit.analysis import decision_tests as DTm
+        saved, out = DTm.run_one, sys.stdout
+        import io
+        sys.stdout = buf = io.StringIO()
+        try:
+            check_capture(lambda c, m: printed.append(c))
+        finally:
+            sys.stdout, DTm.run_one = out, saved
+        ok("DT_GOLDEN_PARTS" in buf.getvalue() and '"share": 0.5' in buf.getvalue(),
+           "DG20c a mismatch prints the canonical parts of each differing record (the field that moved can be read)")
+
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19, dg20):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
