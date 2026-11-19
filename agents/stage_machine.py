@@ -918,7 +918,10 @@ def _spec_signed_sha(run_dir: str) -> str | None:
     def nested(r):
         m = r.get("sha256")
         return m.get(AB.SPEC_FILE) if isinstance(m, dict) else (False if m is not None else None)
-    for f, get in ((SIGNOFF_FILE, lambda r: r.get("spec_sha256") if "spec_sha256" in r else nested(r)),
+    def own(r):        # the spec's own record: spec_sha256 (spike) or the nested map (toolkit); a present but empty
+        v = r.get("spec_sha256") or nested(r)          # spec_sha256 with no nested digest is not a binding: unreadable
+        return False if v is None and "spec_sha256" in r else v
+    for f, get in ((SIGNOFF_FILE, own),
                    ("decision_brief.signoff.json", nested)):
         p = os.path.join(run_dir, f)
         if not os.path.lexists(p):
