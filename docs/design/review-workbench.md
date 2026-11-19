@@ -54,6 +54,14 @@ One reader: the owner, an expert epidemiological modeller.
   spec's declared lists, `scope_declaration.yaml`, and `findings.jsonl` rows with status
   `declared`. An item inside an allowance the signed spec sets (for example a maximum number of
   flagged units) is also `look`, and the sentence gives the allowance and says no test covers it.
+- Only a verified signed spec can excuse anything: declarations and allowances count only from
+  the signed copy, and only when its hash equals the one in the sign-off record. With no
+  verified signed copy, a flagged item is `problem`.
+- A missing file, or a recorded hash that is absent or malformed, is never a match.
+- A producer's status word is mapped explicitly; an unknown word is `not_available` naming it.
+  A record that contradicts itself (a status that disagrees with its own list of blocks) is
+  `problem`.
+- Something the harness could not compute is never reported as passed.
 - A bound is "reached" when a value is within 1e-6 of it, relative to the prior range's width.
 - A check reuses a threshold already defined in code, named with its file. It adds a new threshold
   only where §5 says so, and labels it "workbench threshold".
@@ -642,6 +650,13 @@ walked through it (layer 4). The loop moves to the next goal once a slice is bui
 
 Contracts the layers share:
 
+- **Three fixtures per check, not two.** Besides the clean run and the planted defect, each
+  check has a fixture whose inputs contradict each other or are missing a piece (a status
+  against its own blocks, a declaration with no verified signature, a hash that is absent, a
+  value the harness could not compute), and the check must not answer `ok` or `look` on it. The
+  first external review found eleven fail-open cases of this kind that clean-and-defect
+  fixtures could not show. Fixtures write the producer's real words, read from the producer's
+  code, never a convenient stand-in.
 - **Fixture builder.** `tools/workbench/fixtures.py` `build(dir, upto=None, defect=None,
   method=...)` writes a small clean run with every file §5 reads (three groups, twelve units,
   two survey rounds), shaped like the named method's real files. `upto` is one of launch,
@@ -674,7 +689,9 @@ Contracts the layers share:
   the keep folder under `workbench/acceptance/`. Before a push, `python3
   tools/workbench/leak_check.py <run> ...` must pass: it fails if a number with four
   or more significant digits in any tracked workbench file or in this file also appears in the
-  named runs' analysis files or inputs.
+  named runs' analysis files or inputs. `--range <base>..<head>` scans the added lines of every
+  commit to be pushed, so a value removed by a later commit is still caught; reviewed chance
+  matches are listed with a reason in `tools/workbench/leak_allow.txt`.
 - **Acceptance file.** `<keep>/workbench/acceptance/<view>_<run name>.yaml`: a list of `{path, equals |
   approx, source}`, where `path` addresses the endpoint's JSON (for example
   `facts.region_accepted`) and `source` is the run file and key the value came from. Written in
@@ -752,6 +769,12 @@ The questions as they were put:
   Candidate checks not yet specified: targets matched by an equal number of free parameters
   (FLU: five targets, five free ratios, so they do not test fit); best point far from the
   posterior median along a ridge (DEN).
+- 2026-11-18, loop step 6 (external review by Codex of the first three pull requests): 14 P1 and
+  1 P2, none judged wrong. Each was reproduced with a failing test and fixed: seven fail-open
+  cases in the Fit and Steps checks (rules now in §3), three weaknesses in the leak check, four
+  in the server's file handling, one test that could not fail. Acceptance on the reference runs
+  was unchanged. Left open: scope declarations and findings are not yet tied to the verified
+  signed spec; the range scan covers `tools/workbench/` and this file only.
 - 2026-11-18, before the first push: the lead found that the repository is public and that this
   file and the acceptance files quoted values from the licensed reference runs. Nothing had been
   pushed. Acceptance files moved to the keep folder; values removed here (counts, statuses and
