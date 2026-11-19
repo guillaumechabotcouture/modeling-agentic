@@ -1052,6 +1052,13 @@ def document(eng, reg: dict, q: dict, smoke: bool, **rest) -> dict:
                          confounding=confounding(reg)), eng)
 
 
+def target_digests(base: dict, ids) -> dict:
+    """{id: band_digest} of the fit targets' declarations in the pack the fit ran with (written with its output; the
+    loader trusts a training target's chosen-point verification only for the declaration it was computed under)."""
+    from toolkit.engines.benchmark_sources import band_digest
+    return {b["id"]: band_digest(b, base) for b in base["benchmarks"] if b["id"] in set(ids)}
+
+
 def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True, point=None) -> None:
     """A placeholder output in run()'s own format, through finalize() and document() (self-tests only). `point`: the
     chosen point's values (default the first row; False leaves the chosen point without one)."""
@@ -1065,7 +1072,9 @@ def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = 
     reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], ch)
     fit = {"parameters": {k: {"value": v} for k, v in ch.get("point", {}).items()}}     # as run()'s **fit
     yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []},
-                            fit_rule={"seeds": pack_seeds()}, **fit), open(path, "w"), sort_keys=False)
+                            fit_rule={"seeds": pack_seeds()},
+                            target_digests=target_digests(yaml.safe_load(open(PACK)), pack_bands()), **fit),
+                   open(path, "w"), sort_keys=False)
 
 
 class PosteriorRefused(ValueError):
@@ -1147,8 +1156,9 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
     if rec != seeds:
         no(f"the run's recorded seeds {rec} are not pack.yaml's {seeds}")
     try:
+        bands = pack_bands()        # the targets the replay checks the chosen point on (finalize's default)
         rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
-                           edge, seeds=seeds)
+                           edge, bands=bands, seeds=seeds)
         why = rr["acceptance"]
     except (KeyError, TypeError, ValueError, AttributeError) as ex:
         code, why = 2, [f"{type(ex).__name__}: {ex}"]
@@ -1164,7 +1174,18 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
             tol = 1e-6 * max(1.0, hi - lo) if math.isfinite(hi - lo) else 1e-6     # the sample is rounded to 6 decimals
             if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
                 no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its hard bound [{lo}, {hi}] ({what})")
-    return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X}
+    # `trained` {id: declaration digest}: the file's training targets, less any it also lists as held out, that the
+    # replay verified the chosen point in band on, each with the digest of the pack declaration the replay used
+    from toolkit.engines.benchmark_sources import band_digest
+    pl, base = doc.get("plan") or {}, yaml.safe_load(open(PACK))
+    tt, ho = pl.get("targets_train"), pl.get("held_out_untouched") or []
+    decl = {b["id"]: b for b in base["benchmarks"]}
+    # the digest the fit recorded when it ran (target_digests) must be the current declaration's (Codex r2)
+    td = doc.get("target_digests") if isinstance(doc.get("target_digests"), dict) else {}
+    trained = {k: td[k] for k in sorted(set(bands) & set(tt) - set(ho)) if decl[k].get("band") == bands[k]
+               and td.get(k) == band_digest(decl[k], base)} if isinstance(tt, list) and isinstance(ho, list) else {}
+    return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X,
+            "trained": trained}
 
 
 # hard bounds a card's units imply (owner, 14 Nov, f6-posterior-ranges): a value outside them is not physical
@@ -1390,6 +1411,7 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
                          "pad_ceiling": PAD_CEILING, "edge": edge_diagnostic(best, fit["verification"])}
                         if rb else None)
     doc = document(eng, reg, q, smoke, approved=approved, cap_usd=cap_usd, n_sims=runner.nsims, waves=waves,
+                   target_digests=target_digests(pack, bands),       # the pack it evaluated (Codex r3)
                    wall_s=round(time.time() - t0, 1), fitted_at=time.strftime("%F %T"),
                    calibration_grid={CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
                                      "at_grid_edge": grid_edge}, **fit)
