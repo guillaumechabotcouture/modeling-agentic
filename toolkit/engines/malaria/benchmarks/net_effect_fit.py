@@ -1079,9 +1079,14 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
             tol = 1e-6 * max(1.0, hi - lo) if math.isfinite(hi - lo) else 1e-6     # the sample is rounded to 6 decimals
             if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
                 no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its hard bound [{lo}, {hi}] ({what})")
-    # `trained`: the file's training targets the replay verified the chosen point in band on (benchmark eligibility)
-    tt = (doc.get("plan") or {}).get("targets_train")
-    trained = sorted(set(bands) & set(tt)) if isinstance(tt, list) else []
+    # `trained` {id: declaration digest}: the file's training targets, less any it also lists as held out, that the
+    # replay verified the chosen point in band on, each with the digest of the pack declaration the replay used
+    from toolkit.engines.benchmark_sources import band_digest
+    pl, base = doc.get("plan") or {}, yaml.safe_load(open(PACK))
+    tt, ho = pl.get("targets_train"), pl.get("held_out_untouched") or []
+    decl = {b["id"]: b for b in base["benchmarks"]}
+    trained = {k: band_digest(decl[k], base) for k in sorted(set(bands) & set(tt) - set(ho))
+               if decl[k].get("band") == bands[k]} if isinstance(tt, list) and isinstance(ho, list) else {}
     return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X,
             "trained": trained}
 

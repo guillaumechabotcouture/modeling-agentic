@@ -247,12 +247,13 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
     """Benchmark precondition for one engine. `record()` returns (rows, problem) for the configuration in use;
     `pack` is the pack the coverage file was written for; `runs(test_id, effect, rows)` -> (ok, why) says whether a
     departure's decision test runs and changes the effect (toolkit/spec/preconditions.decision_test_runs).
-    `trained`: the benchmarks a declared net-effect posterior's fit trains on (posterior_trained); each takes its status
-    from the fit's verified chosen point, every other one from the record. Returns {why_not, departures, blocking,
+    `trained` {id: declaration digest}: the benchmarks a declared net-effect posterior's fit trains on
+    (posterior_trained); one whose record row is bound to that same declaration (band_sha256) takes its status from the
+    fit's verified chosen point, every other one from the record. Returns {why_not, departures, blocking,
     reported, uncovered, record, status_source {benchmark: posterior_chosen_point | results.yaml}}."""
     out = {"why_not": [], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": None,
            "card_rows_disagree": [], "status_source": {}}
-    trained = set(trained or ())
+    trained = dict(trained or {})
     if cov is None:
         if pack is not None or has_benchmarks:
             out["why_not"].append(f"the engine has a benchmark pack but no {FILE} saying which components it covers")
@@ -341,8 +342,9 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
             st, role = r.get("status", "missing"), r.get("role", "unknown")
             # owner, 19 Nov: a fit target of the declared posterior is in band at the chosen point the run uses
             # (load_posterior's finalize replay); the record's card-default row does not gate it
-            out["status_source"][i] = "posterior_chosen_point" if i in trained else "results.yaml"
-            if st == "in_band" or i in trained:
+            fitted_here = i in trained and r.get("band_sha256") == trained[i]      # the same declaration (Codex r1)
+            out["status_source"][i] = "posterior_chosen_point" if fitted_here else "results.yaml"
+            if st == "in_band" or fitted_here:
                 continue
             comps = sorted({f"{c}={v}" for _s, c, v in hits})
             pending.append((i, f"benchmark {i} ({r.get('metric', '')}; role {role}: "
@@ -388,6 +390,10 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
     except Exception:  # noqa: BLE001
         cref = ref
     cov, probs = load(path_for(ref))
+    trained, why = posterior_trained(raw, ref, config, base)       # before the toy exemption (Codex r1)
+    if why:
+        return {"why_not": [why], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": None,
+                "card_rows_disagree": [], "status_source": {}}
     if cov is None and cref in BS.TOY_ENGINE_REFS and cref not in OVERRIDES and ref not in OVERRIDES:
         return {"why_not": [], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": "toy",
                 "card_rows_disagree": []}
@@ -431,10 +437,6 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
                                                    base or os.getcwd()).packages().values()))
     except Exception:  # noqa: BLE001 -- a spec without the sections pruning needs: the declared packages
         pass
-    trained, why = posterior_trained(raw, ref, config, base, engine())
-    if why:
-        return {"why_not": [why], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": None,
-                "card_rows_disagree": [], "status_source": {}}
     out = gate(cov, probs, name, raw, record, list(raw.get("engine_departures") or []), departures_status,
                _pack(ref), has_benchmarks=bool(rp and os.path.exists(str(rp))), runs=runs, version=version,
                param_names=pnames, trained=trained)
@@ -447,9 +449,9 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
 
 
 def posterior_trained(raw: dict, ref: str, config: dict | None, base: str | None, engine=None) -> tuple:
-    """(set of benchmark ids, None): the benchmarks a declared uncertainty.net_effect_posterior's fit trains on and the
-    loader verified the chosen point in band on (its `trained`); (None, None) without the field; (None, why) when the
-    declared posterior does not load (fail closed)."""
+    """({benchmark id: declaration digest}, None): the benchmarks a declared uncertainty.net_effect_posterior's fit
+    trains on and the loader verified the chosen point in band on (its `trained`); (None, None) without the field;
+    (None, why) when the declared posterior does not load (fail closed)."""
     if "net_effect_posterior" not in (raw.get("uncertainty") or {}):
         return None, None
     try:
@@ -459,9 +461,9 @@ def posterior_trained(raw: dict, ref: str, config: dict | None, base: str | None
                                                                                          config or {}}},
                          base or os.getcwd())
         ne = UQ.net_effect_sample(sp, engine if engine is not None else sp.engine())
-        if not isinstance(ne.get("trained"), list):
+        if not isinstance(ne.get("trained"), dict):
             raise ValueError("the loaded posterior does not say which benchmarks its fit trains on")
-        return set(ne["trained"]), None
+        return dict(ne["trained"]), None
     except Exception as e:  # noqa: BLE001 -- fail closed
         return None, f"uncertainty.net_effect_posterior does not load ({type(e).__name__}: {e}): benchmark " \
                      "eligibility cannot take the fit's chosen point"
