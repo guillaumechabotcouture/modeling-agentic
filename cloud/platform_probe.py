@@ -67,9 +67,10 @@ def probe(cpuinfo_path="/proc/cpuinfo", imds=True) -> dict:
            "threads_env": {k: os.environ.get(k) for k in THREAD_VARS}, "at": time.strftime("%FT%TZ", time.gmtime())}
     if platform.system() == "Darwin":
         out["cpu"] = {"model": platform.processor() or None, "logical_cpus": os.cpu_count(), "flags": []}
+    from importlib import metadata         # versions read from the installed distributions; nothing is imported
     for mod in ("numpy", "scipy", "starsim"):
         try:
-            out[mod] = __import__(mod).__version__
+            out[mod] = metadata.version(mod)
         except Exception:  # noqa: BLE001
             out[mod] = None
     try:
