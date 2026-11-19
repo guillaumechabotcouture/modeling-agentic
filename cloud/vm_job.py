@@ -677,7 +677,7 @@ def _wait_capped(a, dest):
     """`wait --cap-usd`: the cluster id job.json records, gated (_wait_gate), attached by that id, then polled with
     `run`'s cost readings on its lifetime cost (recorded and alerted, never a stop for dollars). A monitor never stops
     a detached job that is still running (lead decision, 2026-11-18): the cluster is stopped by id only once the job
-    has ended (a terminal state, or the job lost from its worker); an error, Ctrl-C or SIGTERM ends the wait and
+    has ended for certain (a terminal state in DONE); an error, Ctrl-C or SIGTERM ends the wait and
     leaves the cluster as it is, and the job's own end-of-run stop covers it."""
     rec = _job_record(dest)
     name, cid = rec.get("cluster") or a.name, rec.get("cluster_id")
@@ -691,7 +691,9 @@ def _wait_capped(a, dest):
     cl = ws.attach_existing(name, rc.WORKSPACE, cid)     # refuses any cluster but `cid`
     print(f"{a.job_id}: metering cluster {name} ({cid}) to ${a.cap_usd:.2f}", flush=True)
     st = _poll(a, dest, gone_ok=True, cluster=cl, cid=cid, meter=meter)
-    if st is not None and st.get("state", {}).get("state") in DONE + ("missing", "lost"):
+    # Only a confirmed end (Codex re-review of #265): 'missing' (one unreadable state file) and 'lost' (a stale
+    # heartbeat) do not show the process exited, so they leave the cluster to the job's own end-of-run stop.
+    if st is not None and st.get("state", {}).get("state") in DONE:
         _stop_by_id(name, cid, f"{a.job_id}: {st['state']['state']}"[:200])
     return st
 
@@ -764,6 +766,9 @@ def _stop_by_id(name, cid, why):
                   f"its grace period, or it stops after its idle timeout")
 
 
+_CLEANING = [False]     # True while `run` stops its cluster: a SIGTERM then is ignored, so the stop completes
+
+
 class Terminated(KeyboardInterrupt):
     """SIGTERM, handled as Ctrl-C is, so the finally that stops the cluster by id runs (the default action skipped
     it, 2026-11-17)."""
@@ -777,7 +782,9 @@ def _sigterm_as_interrupt():
 
     def handler(signum, frame):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        raise Terminated("SIGTERM")
+        if not _CLEANING[0]:         # during the stop itself (Codex re-review of #265): ignored, the stop completes
+            raise Terminated("SIGTERM")
+    _CLEANING[0] = False
     try:
         prev = signal.signal(signal.SIGTERM, handler)
     except ValueError:                  # not the main thread: nothing to install
@@ -865,6 +872,7 @@ def _run_locked(a, dest):
         why = f"{type(e).__name__}: {e}"
         raise
     finally:
+        _CLEANING[0] = True
         cl = box.get("cl")
         if "constructing" not in box:
             pass    # refused or failed before the constructor was called: nothing of ours to stop
@@ -2115,6 +2123,45 @@ def _self_test_run(ok, real_gate=None) -> None:
                    f"RN34 SIGTERM while polling stops the cluster by id, and the previous handler is restored: "
                    f"exc={exc!r} events={W['events'][-3:]}")
             case("RN34", rn34)
+
+            def rn34b():
+                # RN34b (Codex re-review of #265, P1): a SIGTERM that arrives once `run` is stopping the cluster is
+                # ignored, so the stop by id completes.
+                import signal as _sig
+                got = None
+                try:
+                    with _sigterm_as_interrupt():
+                        _CLEANING[0] = True
+                        os.kill(os.getpid(), _sig.SIGTERM)
+                        time.sleep(0.2)
+                        got = "survived"
+                except BaseException as e:  # noqa: BLE001
+                    got = repr(e)
+                finally:
+                    _CLEANING[0] = False
+                ok(got == "survived", f"RN34b a SIGTERM during the cleanup does not interrupt the stop: {got}")
+            case("RN34b", rn34b)
+
+            def rn32l():
+                # RN32l (Codex re-review of #265, P1): `wait --cap-usd` stops the cluster only on a confirmed end of
+                # the job ('done', 'failed', ...), never on 'missing' (one unreadable state file) or 'lost' (a stale
+                # heartbeat), which do not show the process exited.
+                res = {}
+                for state in ("missing", "lost", "done", "failed"):
+                    stops = []
+                    a = types.SimpleNamespace(name="vmx", job_id="j32l", cap_usd=5.0, every=60, max_hours=1.0)
+                    with mock.patch.dict(globals(), {
+                            "_job_record": lambda dest: {"cluster": "vmx-c", "cluster_id": 7},
+                            "_wait_gate": lambda *x, **k: (lambda cid: 1.0),
+                            "_poll": lambda *x, s_=state, **k: {"state": {"job_id": "j32l", "state": s_}},
+                            "_stop_by_id": lambda name, cid, why: stops.append(cid)}), \
+                            mock.patch.object(ws, "attach_existing", lambda *x: object()), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        _wait_capped(a, d)
+                    res[state] = stops
+                ok(res == {"missing": [], "lost": [], "done": [7], "failed": [7]},
+                   f"RN32l `wait --cap-usd` stops the cluster only once the job has ended for certain: {res}")
+            case("RN32l", rn32l)
 
 
             def rn30():

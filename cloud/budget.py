@@ -891,6 +891,8 @@ def reattach_budget_ok(scope, cap_usd, name, cluster_id, clusters_file, invocati
     with _Lock(env.reservations):
         now = env.clock()
         s = _spend(scope, env, now)
+        if now < _ts(s["start_utc"]):          # as launch_budget_ok (Codex re-review of #265): not a dollar refusal
+            return False, f"the {scope} budget starts at {s['start_utc']}: no re-attach before it"
         if not name.startswith(tuple(s["prefixes"])):
             return False, f"{name} is outside budget {scope}'s signed prefixes {s['prefixes']}"
         row = next((x for x in s["clusters"] if x["id"] == cluster_id), None)
@@ -1769,6 +1771,16 @@ def _self_test() -> int:
                 gw = reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf, warn_over=True)
             ok(gw[0] and gw[1].startswith("WARNING") and read_alerts()[-1]["kind"] == "reattach_over_budget",
                f"BR22w (owner 2026-11-17) with warn_over a cluster past its cap is accepted and alerted: {gw}")
+            # BR22s (Codex re-review of #265, P1): a budget that has not started never accepts a re-attach, even with
+            # warn_over (an unstarted budget is not a dollar refusal).
+            r, src, ok1, cf = world("s", 100.0, 20, 10.0)
+            with_env(env(signed("k22s2", usd=100.0, start=clock[0] + 86400), source=src))
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    gs = reattach_budget_ok("f6", 5, "lw-smoke-w", 40, cf, warn_over=True)
+                except Exception as e:  # noqa: BLE001
+                    gs = (False, f"raised {type(e).__name__}: {e}")
+            ok(not gs[0], f"BR22s a budget that starts in the future refuses a re-attach, warn_over or not: {gs}")
             r, src, ok1, cf = world("d", 100.0, 20, 10.0)
             src.det[40] = BudgetError("details unavailable")
             ok(refused(lambda: reattach_budget_ok("f6", 50, "lw-smoke-w", 40, cf)) is not None
