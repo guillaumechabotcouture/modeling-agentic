@@ -153,6 +153,17 @@ def load_state(run_dir: str) -> RunState | None:
     return st
 
 
+def _withhold_report(run_dir: str) -> None:
+    """A report an earlier gate rendered is not delivered under a failed status: a regular report.md is moved to
+    report_withheld.md; a link at that name is removed (never followed)."""
+    p = os.path.join(run_dir, "report.md")
+    if os.path.islink(p):
+        from lib.safe_io import remove_nofollow
+        remove_nofollow(run_dir, "report.md")
+    elif os.path.isfile(p):
+        _quarantine_report(run_dir)
+
+
 def _quarantine_report(run_dir: str) -> None:
     """F6 S1-7: move report.md to report_withheld.md through lib.safe_io (no link followed at either name;
     a linked report.md is refused, a link at the destination is replaced)."""
@@ -901,8 +912,14 @@ SPEC_RETHINK_REQUEST = "spec_rethink_request.json"
 
 def _spec_signed_sha(run_dir: str) -> str | None:
     """The spec sha256 a sign-off record binds (the spec's own record, or a brief's that hashed the spec), or None."""
-    for f, get in ((SIGNOFF_FILE, lambda r: r.get("spec_sha256") or (r.get("sha256") or {}).get(AB.SPEC_FILE)),
-                   ("decision_brief.signoff.json", lambda r: (r.get("sha256") or {}).get(AB.SPEC_FILE))):
+    import re as _re
+    hexd = _re.compile(r"[0-9a-f]{64}")
+
+    def nested(r):
+        m = r.get("sha256")
+        return m.get(AB.SPEC_FILE) if isinstance(m, dict) else (False if m is not None else None)
+    for f, get in ((SIGNOFF_FILE, lambda r: r.get("spec_sha256") if "spec_sha256" in r else nested(r)),
+                   ("decision_brief.signoff.json", nested)):
         p = os.path.join(run_dir, f)
         if not os.path.lexists(p):
             continue
@@ -912,8 +929,11 @@ def _spec_signed_sha(run_dir: str) -> str | None:
             return "unreadable"          # fail closed: an unreadable record still protects the spec (#261 re-review)
         if not isinstance(rec, dict):
             return "unreadable"
-        if get(rec):
-            return get(rec)
+        v = get(rec)
+        if v is False or (v is not None and not (isinstance(v, str) and hexd.fullmatch(v))):
+            return "unreadable"          # a malformed binding is not a signature (narrow Codex review of #272)
+        if v:
+            return v
     return None
 
 
@@ -1267,6 +1287,7 @@ class Machine:
         if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
             miss = evidence_gate(self.run_dir, signoff=self.st.signoff)
             if miss:
+                _withhold_report(self.run_dir)       # never deliverable under run_failed (narrow Codex review of #272)
                 self._go("FINAL", "the run's preconditions do not hold on resume: " + "; ".join(miss[:5]), "run_failed")
                 save_state(self.run_dir, self.st)
                 return self.st.status or self.st.state
@@ -1676,8 +1697,7 @@ class Machine:
             # a pause with no request this machine recorded (an older run, or a route that records none): it cannot be
             # answered here, so it fails with how to go on, never waits (lead decision on Codex round 3 of #258); a
             # report an earlier gate rendered is not delivered under it (Codex round 4)
-            if os.path.lexists(os.path.join(self.run_dir, "report.md")):
-                _quarantine_report(self.run_dir)
+            _withhold_report(self.run_dir)
             return self._go("FINAL", "OWNER_DECISION has no recorded owner request: relaunch with reuse (a new run dir "
                                      "from this one's spec and stored rows)", "run_failed")
         answers, bad = SS.load_answers(self.run_dir)
