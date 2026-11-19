@@ -7,7 +7,9 @@ const fs = require("fs"), path = require("path");
 class Node {
   constructor(tag) {
     this.tag = tag; this.attrs = {}; this.kids = []; this.listeners = {}; this.style = {};
-    this.classList = {toggle() {}, contains: c => String(this.attrs.class || "").split(" ").includes(c)};
+    const words = () => String(this.attrs.class || "").split(" ").filter(Boolean);
+    this.classList = {contains: c => words().includes(c),
+      toggle: (c, on) => { const add = on === undefined ? !words().includes(c) : on; this.attrs.class = [...words().filter(w => w !== c), ...(add ? [c] : [])].join(" "); }};
   }
   setAttribute(k, v) { this.attrs[k] = String(v); }
   append(...k) { this.kids.push(...k); }
@@ -31,7 +33,7 @@ global.fetch = () => new Promise(() => {});      // the page's first request nev
 
 const src = fs.readFileSync(path.join(__dirname, "static", "app.js"), "utf8");
 const names = ["ticks", "checkCard", "checksView", "setGlossary", "gloss", "glossaryFoot", "state", "scanned", "actionForm", "tableView",
-  "renderView", "post"];
+  "renderView", "post", "imagesView", "imageBox", "chartView"];
 const page = new Function(`${src}\n;return {${names.map(n => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`).join(", ")}};`)();
 
 const fails = [];
@@ -187,5 +189,90 @@ ok("P15 the add button opens the form that adds a row, and closes it again", () 
   add.listeners.click();
   return (open === 2 && t.all("textarea").length === 0) || `${open} text boxes when open, ${t.all("textarea").length} when closed`;
 });
-console.log(fails.length ? `FAILED: ${JSON.stringify(fails)}` : "OK: all page cases passed.");
-process.exit(fails.length ? 1 : 0);
+// ---- images (§5.12): a view's `images` declaration and a chart's `image`, drawn by generic code
+const sha = n => String(n).repeat(64), shots = {columns: ["name", "file", "sha256", "title", "caption", "part", "state", "view"], rows: [
+  ["a", "pics/a b.png", sha(1), "Title of <b>A</b>", "Caption of A.", "first_part", "same", "b"],
+  ["b", "pics/b.png", sha(2), null, null, "second_part", "changed", "nowhere"],
+  ["c", "pics/c.png", sha(3), "Title of C", "Caption of C.", "first_part", "same", "b"]]};
+const decl = {table: "shots", path: "file", hash: "sha256", title: "title", caption: "caption", group: "part", details: ["state", "view"]};
+const drawn = (d, t = shots) => { const box = new Node("div"); box.append(...page.imagesView(d, {shots: t}, "r 1").flat(Infinity).filter(Boolean)); return box; };
+ok("P17 images: one figure per row with its title, its caption and the image asked of the file endpoint by run, path and hash; "
+  + "gathered under each value of the declared column; text from a run is never markup", () => {
+  page.state.runs = {views: [{id: "a", label: "View A"}, {id: "b", label: "View B"}]};
+  const box = drawn(decl), figs = box.all("figure"), imgs = box.all("img"), heads = box.all("h3").map(h => h.textContent);
+  if (figs.length !== 3 || imgs.length !== 3) return `${figs.length} figures, ${imgs.length} images`;
+  if (!same(heads, ["part: first part (2 images)", "part: second part (1 image)"])) return JSON.stringify(heads);
+  if (imgs[0].attrs.src !== `/api/file?run=r%201&path=pics%2Fa%20b.png&sha=${sha(1)}`) return imgs[0].attrs.src;
+  const text = box.textContent, at = w => text.indexOf(w), order = ["part: first part", "Title of <b>A</b>", "Caption of A.", "Title of C", "part: second part", "pics/b.png"].map(at);
+  if (!order.every(i => i >= 0) || !same(order, [...order].sort((a, b) => a - b)) || box.all("b").length) return `${order} in ${text}`;
+  return (imgs[0].attrs.alt === "Title of <b>A</b>" && imgs[2].attrs.alt === "pics/b.png") || `alt: ${imgs.map(i => i.attrs.alt)}`;
+});
+ok("P18 the columns named in details are listed with each image, before it, with their names; a state word has its mark, and a view's id links to that view", () => {
+  const figs = drawn(decl).all("figure"), first = figs[0].all("dl")[0], last = figs[2];
+  if (!first || !same(first.all("dt").map(x => x.textContent), ["state", "view"])) return first ? first.textContent : "no list with the image";
+  if (figs[0].kids.indexOf(first) > figs[0].kids.findIndex(k => k instanceof Node && k.all("img").length)) return "the details come after the image, where a tall image hides them";
+  const jump = drawn(decl).all("button").map(b => b.textContent);
+  if (!same(jump, ["first part (2 images)", "second part (1 image)"]) || drawn({...decl, group: undefined}).all("button").length) return `buttons to each group: ${JSON.stringify(jump)}`;
+  const marks = first.all("span").filter(x => x.classList.contains("mark")), links = first.all("a");
+  if (marks.length !== 1 || !marks[0].classList.contains("t-ok") || links.length !== 1 || links[0].textContent !== "View B" || links[0].attrs.href !== "#run=r%201&view=b") return first.textContent;
+  const bare = drawn(decl, {...shots, rows: [["a", "pics/a.png", sha(1), "T", "C", "p", null, "b"], ["b", "pics/b.png", sha(2), "T", "C", "p", null, null]]}).all("figure");
+  if (!same(bare[0].all("dt").map(x => x.textContent), ["view"]) || bare[1].all("dl").length) return "a detail the run does not record (null) is listed all the same";
+  return (last.all("a").length === 0 && last.textContent.includes("nowhere") && last.all("span").some(x => x.classList.contains("t-problem"))) || last.textContent;
+});
+ok("P19 a click shows an image at full width and another puts it back", () => {
+  const img = drawn(decl).all("img")[0], box = page.imageBox("r1", "pics/a.png", sha(1), "A"), own = box.all("img")[0];
+  if (!img.listeners.click || !/full width/.test(img.attrs.title)) return "the image does not say that a click enlarges it";
+  own.listeners.click();
+  const wide = box.classList.contains("full");
+  own.listeners.keydown({key: "Enter"});
+  return (wide && !box.classList.contains("full")) || `after a click: ${wide}; after Enter: ${box.classList.contains("full")}`;
+});
+ok("P21 a row with no hash or no path, a table that is not there and a column that is not there each say so, and ask the server for nothing", () => {
+  const holes = {...shots, rows: [["a", "pics/a.png", null, "T", "C", "p", "same", "b"], ["b", null, sha(2), "T", "C", "p", "same", "b"]]};
+  const box = drawn(decl, holes), none = drawn({...decl, table: "absent"}), wrong = drawn({...decl, hash: "absent"}), empty = drawn(decl, {...shots, rows: []});
+  if (box.all("img").length || box.all("figure").length !== 2 || !box.textContent.includes("names no hash for pics/a.png") || !box.textContent.includes("names no file")) return box.textContent;
+  return (!none.all("img").length && none.textContent.includes('no table "absent"') && !wrong.all("img").length && /no column/.test(wrong.textContent)
+    && empty.textContent === "No image.") || `${none.textContent} | ${wrong.textContent} | ${empty.textContent}`;
+});
+const bars = {kind: "bars", table: "by_x", x: "x", y: "n", title: "Chart title", how_to_read: "How to read it."}, byX = {by_x: {columns: ["x", "n"], rows: [["a", 1]]}};
+ok("P22 a chart that carries an image shows the harness figure under the chart, asked of the file endpoint; a chart without one shows none; "
+  + "a chart that cannot be drawn still shows its figure", () => {
+  const image = {path: "pics/a.png", hash: sha(1), title: "Figure title"};
+  const withIt = page.chartView({...bars, image}, byX, "r1"), without = page.chartView(bars, byX, "r1"), undrawn = page.chartView({...bars, table: "absent", image}, byX, "r1");
+  const img = withIt.all("img")[0];
+  if (!img || img.attrs.src !== `/api/file?run=r1&path=pics%2Fa.png&sha=${sha(1)}` || !withIt.textContent.includes("Figure title") || !withIt.all("svg").length) return withIt.textContent;
+  if (withIt.textContent.indexOf("Drawn from the table") > withIt.textContent.indexOf("The harness figure")) return "the figure is not under the chart";
+  return (without.all("img").length === 0 && undrawn.all("img").length === 1 && /cannot be drawn/.test(undrawn.textContent)
+    && page.chartView({...bars, image: {path: "pics/a.png"}}, byX, "r1").textContent.includes("names no hash")) || `${without.all("img").length} ${undrawn.textContent}`;
+});
+ok("P23 a view's images are drawn after the facts and before the notes, charts and tables, and their table is kept closed; a view with none has no such section", () => {
+  const data = {checks: [], facts: {n_images: 3}, notes: {terms: "What the words mean."}, charts: [bars], images: [decl], tables: {...byX, shots: {...shots, about: "The table of images."}}};
+  const text = v => page.renderView(v, "r1", "v").flat(Infinity).filter(n => n instanceof Node).map(n => n.textContent).join(" | ");
+  const at = w => text(data).indexOf(w), order = ["Facts", "Images", "Title of C", "What the words mean.", "Chart title", "The table of images."].map(at);
+  const closed = page.renderView(data, "r1", "v").flat(Infinity).filter(n => n instanceof Node && n.tag === "details");
+  if (closed.length !== 1 || !closed[0].textContent.includes("The table of images.") || !/behind the images above \(3 rows\)/.test(closed[0].all("summary")[0].textContent)) return "the table behind the images is not kept closed under one line";
+  return (order.every(i => i >= 0) && same(order, [...order].sort((a, b) => a - b)) && !text({...data, images: []}).includes("Images |")
+    && !text({...data, images: undefined}).includes("full width")) || `${order} in ${text(data)}`;
+});
+// An image that does not load: the cases below wait for the page's request for the server's reason.
+async function later(name, fn) {
+  let why = null;
+  try { const r = await fn(); if (r !== true) why = String(r); } catch (e) { why = `${e.name}: ${e.message}`; }
+  console.log(`  ${why == null ? "ok  " : "FAIL"} ${name}${why == null ? "" : ": " + why.slice(0, 300)}`);
+  if (why != null) fails.push(name.split(" ")[0]);
+}
+(async () => {
+  await later("P20 an image that cannot be loaded is replaced by a sentence naming the file, then by the server's reason; never a broken picture", async () => {
+    const asked = [];
+    global.fetch = url => (asked.push(url), Promise.resolve({ok: false, text: () => Promise.resolve("not served: the file no longer has that hash")}));
+    const box = page.imageBox("r1", "pics/a.png", sha(1), "A");
+    box.all("img")[0].listeners.error();
+    const first = box.textContent, gone = box.all("img").length === 0;
+    await new Promise(r => setTimeout(r, 0));
+    global.fetch = () => new Promise(() => {});
+    return (gone && first.includes("pics/a.png could not be loaded") && same(asked, [`/api/file?run=r1&path=pics%2Fa.png&sha=${sha(1)}`])
+      && box.textContent.includes("not served: the file no longer has that hash") && box.all("p")[0].attrs.role === "status") || `${first} | ${box.textContent}`;
+  });
+  console.log(fails.length ? `FAILED: ${JSON.stringify(fails)}` : "OK: all page cases passed.");
+  process.exit(fails.length ? 1 : 0);
+})();

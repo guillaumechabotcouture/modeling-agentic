@@ -1,0 +1,8 @@
+---
+phase: "v2"
+commit: "WB ε"
+---
+
+## Changelog
+
+**Review workbench: Model and Figures views; the harness figures shown in the page.** **Model** (`views/model.py`, `model_read.py`, `model_checks.py`): the engine chosen and each candidate's reasons, every benchmark against its band with its seed range, role and gating, departures with their decision tests, spec-set values against the engine card, and parameters with their sources. Eight checks on one generic model: a gating benchmark that is not in band needs a verified signed departure whose test ran; the choice record's list is compared with the table; near misses, seed ranges that cross a band edge, a fitted parameter on its bound and unsourced parameters are for the reader to judge; an engine record with no benchmark says so. **Figures** (`views/figures.py`): every figure of the run's set by tier as the harness drew it, with its sources and whether they still have the hashes it was drawn from (the spec compared with the verified signed copy), figures not produced with the harness's reason, and where a report names each; two adapters, chosen by the producer of `analysis/figures.yaml`. **File endpoint**: `GET /api/file` serves a raster image only from inside the run, only a path and hash a view of that run has named, only when the bytes read have that hash, with a sandboxed content policy. The page gains a generic image renderer, and a chart may carry the harness figure beside it. `--accept` passes against acceptance values re-derived from stored runs on three engines for Model and on two figure producers for Figures; the earlier views' acceptance is unchanged. Stacked on the fixtures.

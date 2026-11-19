@@ -1,6 +1,6 @@
 "use strict";
-// The review workbench page. It draws whatever a view returns ({checks, facts, tables, charts, notes}) and has no
-// code for any one view. Text that comes from a run is only ever set as text, never parsed as markup.
+// The review workbench page. It draws whatever a view returns ({checks, facts, tables, charts, notes} and, when the
+// view has any, images) and has no code for any one view. Text that comes from a run is only ever set as text, never parsed as markup.
 
 const SVG = "http://www.w3.org/2000/svg";
 function make(ns, tag, props, kids) {
@@ -404,9 +404,67 @@ const DRAW = {
     return [key(words.map(w => [mark(w), (MARKS[w] || [])[3] || ""])), g,
       el("p", {class: "about small", text: "A box shows the last part of a file's path; point at it for the full path and to pick out its links."})];
   }};
+// ------------------------------------------------------------------------------------------------ images
+// A view may declare `images` over one of its tables, and a chart may carry `image` (the keys are in workbench.py's
+// docstring). An image is a file of the run, asked of the server by the path and the hash the view named; the server
+// sends it only when the file still has that hash.
+const fileUrl = (run, path, sha) => `/api/file?run=${encodeURIComponent(run)}&path=${encodeURIComponent(path)}&sha=${encodeURIComponent(sha)}`;
+const noImage = why => el("p", {class: "noimage", role: "status", text: `This image cannot be shown: ${why}`});
+// One image at a readable size; a click (or Enter) shows it at the full width of the page, and another puts it back.
+// An image that does not load is replaced by a sentence with the server's reason, never left as a broken picture.
+function imageBox(run, path, sha, title) {
+  if (run == null || !path || !sha) return noImage(!path ? "the view names no file for it." : !sha ? `the view names no hash for ${path}.` : "the page does not know which run it belongs to.");
+  const url = fileUrl(run, path, sha), box = el("div", {class: "shot"}), wide = () => box.classList.toggle("full");
+  box.append(el("img", {src: url, alt: title || path, title: "Click to see it at full width, and again to put it back", tabindex: 0, on: {
+    click: wide, keydown: e => { if (e.key === "Enter") wide(); },
+    error: () => {
+      const says = noImage(`${path} could not be loaded.`);
+      box.replaceChildren(says);
+      fetch(url).then(r => (r.ok ? null : r.text().then(why => { says.textContent = `This image cannot be shown: ${path} was ${why}.`; }))).catch(() => {});
+    }}}));
+  return box;
+}
+// d: {table, path, hash, title, caption, group, details}. One figure per row of the table, gathered under each value of
+// the group column; above each image the detail columns with their names, under it its caption. A detail that is a status or state word is
+// shown with its mark, and one in a column named view that is a view's id links to that view.
+function imagesView(d, tables, run) {
+  const t = tables[d.table], cannot = why => [el("p", {class: "muted", text: `These images cannot be shown: ${why}.`})];
+  if (!t || !Array.isArray(t.columns) || !Array.isArray(t.rows)) return cannot(`the view has no table "${d.table}"`);
+  const at = k => (d[k] == null ? -1 : t.columns.indexOf(d[k])), text = (r, k) => (at(k) >= 0 && typeof r[at(k)] === "string" ? r[at(k)] : "");
+  if (at("path") < 0 || at("hash") < 0) return cannot(`table "${d.table}" has no column for an image's path or for its hash`);
+  if (!t.rows.length) return [el("p", {class: "muted", text: "No image."})];
+  const details = (Array.isArray(d.details) ? d.details : []).filter(c => t.columns.includes(c));
+  const value = (c, v) => {
+    const seen = c === "view" && state.runs && (state.runs.views || []).find(x => x.id === v);
+    return MARKS[v] ? mark(v) : seen ? el("a", {href: link(run, v), text: seen.label}) : gloss(fmt(v, c, true));
+  };
+  const one = r => el("figure", {class: "image"},
+    el("figcaption", {text: text(r, "title") || text(r, "path") || "No title"}),
+    text(r, "title") ? el("p", {class: "read mono", text: text(r, "path")}) : null,
+    details.some(c => r[t.columns.indexOf(c)] != null) ? el("dl", {class: "under"}, details.filter(c => r[t.columns.indexOf(c)] != null)      // a detail the run does not record is left out
+      .map(c => el("div", null, el("dt", {text: label(c, true)}), el("dd", null, value(c, r[t.columns.indexOf(c)]))))) : null,
+    imageBox(run, text(r, "path"), text(r, "hash"), text(r, "title")),
+    text(r, "caption") ? el("p", {class: "caption"}, gloss(text(r, "caption"))) : null);
+  if (at("group") < 0) return t.rows.map(one);
+  const groups = [...new Set(t.rows.map(r => r[at("group")]))].map(g => {
+    const rows = t.rows.filter(r => r[at("group")] === g), words = `${label(fmt(g))} (${rows.length} image${rows.length === 1 ? "" : "s"})`;
+    return {words, head: el("h3", {text: `${label(d.group)}: ${words}`}), rows};
+  });
+  // a long page of images: one button per group goes to where that group starts
+  const jump = groups.length > 1 ? el("div", {class: "tools"}, `Go to ${label(d.group)}: `, groups.map(g => el("button", {text: g.words, on: {click: () => g.head.scrollIntoView({block: "start"})}}))) : null;
+  return [jump, ...groups.flatMap(g => [g.head, ...g.rows.map(one)])];
+}
+
 const COLUMN_KEYS = ["x", "y", "low", "high", "group", "model", "model_alt", "outer_low", "outer_high", "panels"];
 const PANEL_ROWS = 80;      // panels holding more rows than this together are shown one at a time
-function chartView(decl, tables) {
+// A chart, and under it the harness figure of the same data when the declaration carries one (decl.image).
+function chartView(decl, tables, run) {
+  const fig = chartDrawn(decl, tables), im = decl.image;
+  if (im && typeof im === "object") fig.append(el("p", {class: "about small", text: `The harness figure of the same data${im.title ? `: ${im.title}` : ""} (${im.path || "no file named"}).`}),
+    imageBox(run, im.path, im.hash, im.title));
+  return fig;
+}
+function chartDrawn(decl, tables) {
   const fig = el("figure", null, el("figcaption", {text: decl.title || `${decl.kind} of ${decl.table}`}),
     el("p", {class: "about"}, gloss(decl.how_to_read || "This chart does not say how to read it.")));
   const cannot = why => (fig.append(el("p", {class: "muted", text: `This chart cannot be drawn: ${why}.`})), fig);
@@ -493,12 +551,18 @@ function renderView(data, run, here) {
       : el("p", {class: "muted", text: "Not available: this table has no columns and rows."})];
   const lead = Object.entries(tables).filter(([, t]) => t && t.lead);       // what the reader came for: before the notes and charts
   for (const [name, t] of lead) out.push(...one(name, t, "h2"));
+  const images = (Array.isArray(data.images) ? data.images : []).filter(d => d && typeof d === "object");
+  if (images.length) out.push(el("h2", {text: "Images"}), el("p", {class: "about", text: "Each image is a file of the run as the harness wrote it, "
+    + "sent by this server only while the file has the hash this view read. Click an image to see it at the full width of the page."}),
+    images.map(d => imagesView(d, tables, run)));
   if (notes.length) out.push(el("h2", {text: "Notes"}), notes.map(([k, v]) => el("p", null, el("strong", {text: `${label(k).replace(/^./, ch => ch.toUpperCase())}. `}), gloss(fmt(v)))));
-  if ((data.charts || []).length) out.push(el("h2", {text: "Charts"}), data.charts.map(d => chartView(d, tables)));
+  if ((data.charts || []).length) out.push(el("h2", {text: "Charts"}), data.charts.map(d => chartView(d, tables, run)));
   if (Object.keys(tables).length > lead.length) out.push(el("h2", {text: "Tables"}),
     el("p", {class: "about", text: "Click a column name to sort. Units are in the column names."}));
   const none = Object.keys(tables).filter(k => tables[k] == null);      // present with the value null: not recorded
-  for (const [name, t] of Object.entries(tables)) if (t != null && !t.lead) out.push(...one(name, t, "h3"));
+  const pictured = new Set(images.map(d => d.table));      // a table whose rows are drawn above as images is kept closed
+  for (const [name, t] of Object.entries(tables)) if (t != null && !t.lead) out.push(...(pictured.has(name) ? [el("details", null,
+    el("summary", {text: `Show the table "${label(name)}" behind the images above (${(t.rows || []).length} rows)`}), one(name, t, "h3"))] : one(name, t, "h3")));
   if (none.length) out.push(el("h3", {text: "Not recorded"}), el("p", {class: "muted",
     text: `This run's files record nothing for ${none.length === 1 ? "this table" : "these tables"}: ${none.map(k => label(k)).join(", ")}. The notes above say why.`}));
   return out;
