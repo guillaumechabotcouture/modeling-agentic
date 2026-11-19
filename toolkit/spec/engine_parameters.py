@@ -637,13 +637,16 @@ def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, worker
     base = {k: v for k, v in dict(vals, **post).items() if k not in fk}
     runner = BM.Runner(pack, pe, workers, seeds, base_params=base, evidence=ev,      # the evidence it validated
                        mode="fit" if set(post) & fk else "score")
-    out = BM.run_pack(pack, pe, runner, dict(fitted or {}, **{k: v for k, v in post.items() if k in fk}))
+    fit = {k: v for k, v in (fitted or {}).items() if k not in post}   # a caller never overrides a column (Codex r4)
+    out = BM.run_pack(pack, pe, runner, dict(fit, **{k: v for k, v in post.items() if k in fk}))
     return BM.stamp(dict(out, spec_parameters=vals, posterior_point=post, arm_engines=_arm_records(pack, runner, base)),
                     pe)
 
 
 def posterior_point(spec) -> dict:
     """A declared net-effect posterior's verified chosen point ({} without one): the arms' point (v2-posterior-point)."""
+    if "net_effect_posterior" not in ((_raw(spec).get("uncertainty") or {})):
+        return {}
     from toolkit.analysis import uncertainty as UQ
     ne = UQ.net_effect_sample(spec, spec.engine())
     return {} if ne is None else UQ.posterior_point(spec, ne, {})
@@ -726,6 +729,8 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
     if bench_id is not None and bench_id not in bms:
         return [], f"benchmark {bench_id} has no arm record in {SPEC_BENCH_RECORD}; {how}"
     doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
+    if (doc.get("posterior_point") or {}) != posterior_point(spec):     # the file's own point too (Codex r4)
+        return [], f"{SPEC_BENCH} holds arms at {doc.get('posterior_point')}, not at the chosen point; {how}"
     out = list(doc.get("benchmarks") or [])
     from toolkit.engines.benchmark_sources import load_evidence
     ev = load_evidence(engine, rows=out, partial=True)   # S1-2b: the engine's own pack (a toy may have none)

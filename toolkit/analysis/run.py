@@ -1907,7 +1907,21 @@ def _self_test_posterior_point(ok):
         rec["posterior_point"] = {"eff_a": 0.5, "eff_b": 0.3}           # arms recorded at another point
         json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
         other = DT.interaction_arms(s9, s9.engine(), "T2")
+        # Codex r4: the ratios are the chosen point's (not the defaults'); the file's own point is checked too; a
+        # caller's `fitted` entry never overrides a posterior column
+        dflt = yaml.safe_load(open(bench))["benchmarks"][0]["arm_or"][0]["a10"]
+        rec["posterior_point"] = rec_point
+        json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
+        bp = os.path.join(d, PV.SPEC_BENCH)
+        bd = yaml.safe_load(open(bp))
+        yaml.safe_dump(dict(bd, posterior_point={"eff_a": 0.5, "eff_b": 0.3}), open(bp, "w"), sort_keys=False)
+        rec["sha256"] = hashlib.sha256(open(bp, "rb").read()).hexdigest()
+        json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
+        filept = DT.interaction_arms(s9, s9.engine(), "T2")
+        sb = PV.spec_benchmarks(_toy_pack(), s9.engine(), s9, fitted={"eff_a": 0.6})
         ok("not_run" in before and rec_point == {"eff_a": 0.41, "eff_b": 0.27} and "arm" in after
+           and abs(after["arm"]["a10"] - dflt) > 1e-3 and "chosen point" in filept.get("not_run", "")
+           and abs(sb["benchmarks"][0]["arm_or"][0]["a10"] - after["arm"]["a10"]) < 1e-9
            and PV.SPEC_BENCH in after["src"] and "chosen point" in other.get("not_run", ""),
            f"RPP9 with a posterior an interaction test runs on arms the harness step computed at the chosen point, and "
            f"is not run without them or on arms from another point: {before} | {after.get('src')} | {other}")
