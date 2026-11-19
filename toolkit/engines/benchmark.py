@@ -2003,6 +2003,25 @@ def _self_test() -> int:
             other = True
         ok(same and short and other, "BP50 (v2d β) per-case runs merge into the full results in pack order; a missing "
            "case or another code identity is refused")
+        # F6 option A: a run of new cases merged into a stored file keeps what each input knew: the union of the
+        # settings calibrated (a setting only the new run calibrated is not lost; one calibrated differently in two
+        # inputs is refused), the initialisation record, and each input's provenance (a re-stamp record stays)
+        a = dict(parts[0], settings_calibrated={"s1": {"value": 1.0}}, initialisation={"method": "m"},
+                 restamped={"by": "proof"})
+        b = dict(parts[1], settings_calibrated={"s1": {"value": 1.0}, "s2": {"value": 2.0}}, initialisation={"method": "m"})
+        m2 = merge_results(p14, [a, b], eng)
+        try:
+            merge_results(p14, [a, dict(b, settings_calibrated={"s1": {"value": 9.0}})], eng)
+            clash = False
+        except ValueError:
+            clash = True
+        prov = m2.get("merged_from") or []
+        ok(m2["settings_calibrated"] == {"s1": {"value": 1.0}, "s2": {"value": 2.0}} and clash
+           and m2.get("initialisation") == {"method": "m"}
+           and [p.get("restamped") for p in prov] == [{"by": "proof"}, None]
+           and [p.get("rows") for p in prov] == [["P1"], ["P2"]],
+           f"BP50b merge keeps the union of calibrated settings (refusing a conflict), the initialisation and each "
+           f"input's provenance ({m2.get('settings_calibrated')}, {prov})")
     except NameError as ex:
         ok(False, f"BP50 merge_results ({ex})")
     # Codex r1-11: a coverage row carries its declaration and calibration-code digests; merge re-checks both
