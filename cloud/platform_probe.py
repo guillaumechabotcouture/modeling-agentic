@@ -146,8 +146,9 @@ def _key(p: dict) -> dict:
     return {"cpu_model": (p.get("cpu") or {}).get("model"), "vm_size": (p.get("azure") or {}).get("vm_size"),
             "flags": " ".join((p.get("cpu") or {}).get("flags") or []),
             "blas": None if not isinstance(blas, list) else
-            json.dumps(sorted([b.get(k) for k in ("internal_api", "version", "architecture", "threading_layer",
-                                                  "num_threads")] for b in blas), default=str),
+            json.dumps(sorted(json.dumps([b.get(k) for k in ("internal_api", "version", "architecture",
+                                                             "threading_layer", "num_threads")], default=str)
+                              for b in blas)),
             "threads_env": json.dumps(env)}
 
 
@@ -194,17 +195,24 @@ def record(out: str, client_factory=None, local=None, lock_s: float = 60.0) -> d
     except OSError as e:
         return {"error": f"the record cannot be written: {type(e).__name__}: {e}"}
     try:
-        t0 = time.time()
+        t0 = time.monotonic()
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except OSError:
-                if time.time() - t0 > lock_s:
+                if time.monotonic() - t0 > lock_s:
                     return {"error": f"{out}.lock held for over {lock_s:g} s; this round skipped"}
                 time.sleep(0.1)
         doc = {"producer": "cloud/platform_probe.py"}
-        if os.path.lexists(out):
+        try:
+            os.lstat(out)
+            present = True
+        except FileNotFoundError:          # only a missing file starts a fresh record
+            present = False
+        except OSError as e:
+            return {"error": f"{out}: its status cannot be read ({type(e).__name__}: {e}); not overwritten"}
+        if present:
             try:
                 doc = json.load(open(out))
                 if not isinstance(doc, dict):
@@ -437,6 +445,26 @@ def _self_test() -> int:
         with contextlib.redirect_stdout(Pipe()):
             rc25 = main(["record", os.path.join(d, "p25.json")])
         ok(rc25 == 0, "PP25 a closed log pipe does not fail the probe")
+        # Codex third review of #274 (P1): only a missing file allows a fresh record
+        p26 = os.path.join(d, "p26.json")
+        open(p26, "w").write("{invalid json")
+        real_lstat = os.lstat
+
+        def eio(path, *a_, **k):
+            if os.fspath(path) == p26:
+                raise OSError(5, "Input/output error")
+            return real_lstat(path, *a_, **k)
+        os.lstat = eio
+        try:
+            d26 = record(p26, lambda: FakeClient({}), local=loc)
+        finally:
+            os.lstat = real_lstat
+        ok(open(p26).read() == "{invalid json" and "error" in d26,
+           f"PP26 an output whose status cannot be read (EIO) is not replaced: {d26.get('error')}")
+        none_v = w("Xeon 8370C", "Standard_E8s_v5")
+        none_v["blas"] = none_v["blas"] + [dict(none_v["blas"][0], version=None)]
+        d27 = record(os.path.join(d, "p27.json"), lambda: FakeClient({"tls://a": none_v}), local=none_v)
+        ok("distinct" in d27 and "error" not in d27, f"PP27 BLAS metadata with a missing version still compares: {d27}")
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1
@@ -447,4 +475,9 @@ def _self_test() -> int:
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--self-test"]:
         sys.exit(_self_test())
-    sys.exit(main())
+    rc = main()
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):          # a closed log pipe: no output left to give, and not a failure
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    sys.exit(rc)
