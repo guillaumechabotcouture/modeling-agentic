@@ -2479,6 +2479,33 @@ def _self_test() -> int:
            and extension_points(dbx, None) == [],
            f"FB6 the extension wave lies past the old ceiling, inside the design box elsewhere ({pts[:1]})")
     case("FB6", fb6)
+
+    def fb7():
+        # owner, 19 Nov, option (a): pbo_adv_decay's ceiling is 2.23 per year (LLINEUP's 99% waning bound minus the
+        # engine's own waning at x = 0.30); the fit's box and the posterior's hard bound reach it; 100 extension points
+        # lie in 1.895-2.23; the card prior file is not edited (its test sits inside the engine's code fingerprint)
+        from toolkit.engines.malaria import vector as V
+        pt, lo, hi = V.adv_decay_from_prs((0.74, 0.62, 0.87), (0.84, 0.72, 0.98), 1.0, clip=False)
+        s = (hi - pt) / 1.959964
+        k30 = V.engine_adv_decay(0.30, 182.5, 547.5, dict(V.NET_DEFAULTS, cfp_kill=0.0, cfp_half=1.0))
+        ceil = round(pt + 2.575829 * s - k30, 2)
+        hb = hard_bounds(e, ["pbo_adv_decay"])["pbo_adv_decay"]
+        ext = rb.get("extension") or {}
+        ok(ceil == 2.23 == PAD_CEILING["hi"] and NET_PARAMS["pbo_adv_decay"][1] == [0.0, 2.23]
+           and (hb[0], hb[1]) == (0.0, 2.23) and ext.get("n") == 100 and ext.get("range") == [1.895, 2.23]
+           and ext.get("param") == "pbo_adv_decay" and rb["design_box"]["pbo_adv_decay"] == [0.0, 1.895]
+           and p["fit_joint"]["params"]["pbo_adv_decay"] == [0.0, 2.23],
+           f"FB7 the widened pbo_adv_decay ceiling {ceil} (99% LLINEUP bound {pt + 2.575829 * s:.3f} minus the engine's "
+           f"waning at x 0.30 {k30:.3f}) sets the fit box and the hard bound; 100 extension points ({hb}, {ext})")
+    case("FB7", fb7)
+
+    def fb8():
+        # owner, 19 Nov: a one-line diagnostic: does the chosen pbo_adv_decay sit within 2% of the new ceiling
+        near, far = edge_diagnostic({"pbo_adv_decay": 2.20}), edge_diagnostic({"pbo_adv_decay": 1.60})
+        ok(near["within_2pct"] is True and far["within_2pct"] is False and near["ceiling"] == 2.23
+           and "cannot reproduce LLINEUP's waning" in near["line"] and "cannot" not in far["line"],
+           f"FB8 the edge diagnostic: {near['line']} | {far['line']}")
+    case("FB8", fb8)
     OPTION_A["cap_usd"] = shipped_cap
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
