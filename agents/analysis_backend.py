@@ -218,6 +218,7 @@ def eligible_engines(spec: dict, engines=None, departures: str = "signed") -> li
                      "benchmarks_not_in_band": bg.get("blocking") or [],
                      "benchmarks_reported": bg.get("reported") or [],
                      "card_benchmark_rows_disagree_with_record": bg.get("card_rows_disagree") or [],
+                     "benchmark_status_source": bg.get("status_source") or {},
                      "components_without_benchmark": bg.get("uncovered") or {}})
     return rows
 

@@ -1061,8 +1061,9 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
     if rec != seeds:
         no(f"the run's recorded seeds {rec} are not pack.yaml's {seeds}")
     try:
+        bands = pack_bands()        # the targets the replay checks the chosen point on (finalize's default)
         rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
-                           edge, seeds=seeds)
+                           edge, bands=bands, seeds=seeds)
         why = rr["acceptance"]
     except (KeyError, TypeError, ValueError, AttributeError) as ex:
         code, why = 2, [f"{type(ex).__name__}: {ex}"]
@@ -1078,7 +1079,11 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
             tol = 1e-6 * max(1.0, hi - lo) if math.isfinite(hi - lo) else 1e-6     # the sample is rounded to 6 decimals
             if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
                 no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its hard bound [{lo}, {hi}] ({what})")
-    return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X}
+    # `trained`: the file's training targets the replay verified the chosen point in band on (benchmark eligibility)
+    tt = (doc.get("plan") or {}).get("targets_train")
+    trained = sorted(set(bands) & set(tt)) if isinstance(tt, list) else []
+    return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X,
+            "trained": trained}
 
 
 # hard bounds a card's units imply (owner, 14 Nov, f6-posterior-ranges): a value outside them is not physical
