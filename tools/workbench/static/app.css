@@ -84,6 +84,8 @@ dl.facts dt { color: var(--ink2); flex: 0 0 200px; }
 dl.facts dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 
 .tools { display: flex; gap: 12px; align-items: center; margin: 6px 0; color: var(--ink2); font-size: 12.5px; }
+.tools.choose { padding: 8px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); font-size: 13.5px; flex-wrap: wrap; }
+.tools.choose select { font: inherit; max-width: 560px; padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); }
 input[type=search] { font: inherit; padding: 4px 8px; width: 260px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); }
 button { font: inherit; font-size: 12.5px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); cursor: pointer; }
 button:disabled { color: var(--ink3); cursor: default; }
@@ -99,7 +101,8 @@ td.clip { cursor: pointer; max-width: 30ch; white-space: nowrap; overflow: hidde
 table.wide { font-size: 12px; } table.wide th, table.wide td { padding-right: 8px; } table.wide td.clip { max-width: 15ch; }
 table.wide th .sub { font-size: 10.5px; max-width: 11ch; min-width: 0; }
 td.clip.open { white-space: normal; overflow-wrap: break-word; max-width: 46ch; }
-td.whole, table.wide td.whole { min-width: 30ch; max-width: 64ch; overflow-wrap: break-word; }
+table.wide td.whole { min-width: 20ch; max-width: 64ch; overflow-wrap: break-word; }
+td.whole { min-width: 30ch; max-width: 64ch; overflow-wrap: break-word; }
 td.whole .lines { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
 td.whole[title] { cursor: pointer; } td.whole .lines.open { display: block; }
 table.wide th { white-space: normal; overflow-wrap: normal; } table.wide td { overflow-wrap: break-word; }

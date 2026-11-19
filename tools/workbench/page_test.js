@@ -33,7 +33,7 @@ global.fetch = () => new Promise(() => {});      // the page's first request nev
 
 const src = fs.readFileSync(path.join(__dirname, "static", "app.js"), "utf8");
 const names = ["ticks", "checkCard", "checksView", "setGlossary", "gloss", "glossaryFoot", "state", "scanned", "actionForm", "tableView",
-  "renderView", "post", "imagesView", "imageBox", "chartView"];
+  "renderView", "post", "imagesView", "imageBox", "chartView", "chooseView"];
 const page = new Function(`${src}\n;return {${names.map(n => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`).join(", ")}};`)();
 
 const fails = [];
@@ -333,6 +333,37 @@ async function later(name, fn) {
   console.log(`  ${why == null ? "ok  " : "FAIL"} ${name}${why == null ? "" : ": " + why.slice(0, 300)}`);
   if (why != null) fails.push(name.split(" ")[0]);
 }
+ok("P32 a view's `choose` is one control at the top of its page: the options under their groups, the value in the address marked as chosen; "
+  + "a pick is written to the address under the declared parameter and none removes it; a view without one has no control", () => {
+  const choose = {param: "against", label: "Compare with", options: [{value: "r2", label: "run two", group: "same"}, {value: "r3", label: "<b>three</b>", group: "other"},
+    {value: "r4", label: "run four"}]};
+  global.location.hash = "#run=r1&view=v&against=r3";
+  const view = page.renderView({checks: [], facts: {a: 1}, tables: {}, charts: [], notes: {}, choose}, "r1", "v").flat(Infinity).filter(n => n instanceof Node);
+  const box = view[0], select = box.all("select")[0], options = box.all("option");
+  if (!box.textContent.startsWith("Compare with") || !select) return `the control is not first: ${box.textContent}`;
+  if (!same(options.map(o => o.textContent), ["none", "run two", "<b>three</b>", "run four"]) || box.all("b").length) return `options ${JSON.stringify(options.map(o => o.textContent))}`;
+  if (!same(box.all("optgroup").map(g => g.attrs.label), ["same", "other"])) return `groups ${JSON.stringify(box.all("optgroup").map(g => g.attrs.label))}`;
+  if (!same(options.filter(o => "selected" in o.attrs).map(o => o.attrs.value), ["r3"])) return "the value in the address is not the one marked as chosen";
+  select.listeners.change({target: {value: "r2"}});
+  const picked = global.location.hash;
+  select.listeners.change({target: {value: ""}});
+  const cleared = global.location.hash;
+  global.location.hash = "";
+  const plain = page.renderView({checks: [], facts: {a: 1}, tables: {}, charts: [], notes: {}}, "r1", "v").flat(Infinity).filter(n => n instanceof Node);
+  const empty = page.chooseView({param: "against", label: "Compare with", options: []});
+  return (picked === "#run=r1&view=v&against=r2" && cleared === "#run=r1&view=v" && !plain.some(n => n.all("select").length)
+    && page.chooseView({param: "against", label: "x", options: "runs"}) === null && empty.textContent.includes("nothing else to choose")) || `${picked} | ${cleared}`;
+});
+ok("P33 a status or state word has its mark, but for a column the table names in plain, whose words are the run's own and are shown as written", () => {
+  const t = {columns: ["id", "state"], rows: [["a", "outside"]]};
+  const marked = page.tableView(t).all("span").some(n => n.classList.contains("mark")), plain = page.tableView({...t, plain: ["state"]});
+  return (marked && !plain.all("span").some(n => n.classList.contains("mark")) && plain.textContent.includes("outside")) || `marked ${marked}`;
+});
+ok("P34 a chart's harness figure with no caption beyond its title has nothing appended after the image (never the word null)", () => {
+  const tables = {t: {columns: ["x", "y"], rows: [["a", 1]]}};
+  const fig = page.chartView({kind: "bars", table: "t", x: "x", y: "y", title: "T", how_to_read: "H", image: {path: "figures/a.png", hash: sha(1), title: "A"}}, tables, "r1");
+  return (!fig.kids.some(k => k == null) && fig.all("img").length === 1) || "a null was appended to the figure";
+});
 (async () => {
   await later("P20 an image that cannot be loaded is replaced by a sentence naming the file, then by the server's reason; never a broken picture", async () => {
     const asked = [];

@@ -78,6 +78,12 @@ DT = "analysis/decision_tests.yaml"
 # it: NOT_RUN when the status is not_run, else CHANGES_PLAN or NO_CHANGE. Any other pair is no pair the producer writes.
 TEST_PAIRS = {("run", "NO_CHANGE"): "ran", ("run", "CHANGES_PLAN"): "ran", ("not_run", "NOT_RUN"): "not_run"}
 TEST_STATUSES, VERDICTS = ("run", "not_run"), ("NO_CHANGE", "CHANGES_PLAN", "NOT_RUN")
+# A test's own numbers, each in percent beside the threshold the producer compares it with (toolkit/analysis/moves.py):
+# the share of units that change package, the regret of keeping the point plan, and the share of the budget moved
+# (dollars_share_pct is the one compared with dollars_threshold_pct).
+TEST_NUMBERS = ("share_pct", "threshold_pct", "regret_pct", "regret_threshold_pct", "dollars_share_pct", "dollars_threshold_pct")
+EST = "analysis/estimates.yaml"
+EST_VERDICTS = ("yes", "no", "undetermined")       # toolkit/analysis/estimates.py: a decision rule's verdicts
 
 
 def signoff_record(run):
@@ -122,9 +128,10 @@ def bound(record, rel, now):
 
 
 def decision_tests(run, spec=None):
-    """({test id: {status, verdict, statement, state, counts, spec, spec_says, share_pct, threshold_pct}}, None) from
-    analysis/decision_tests.yaml, or (None, why). share_pct and threshold_pct are the test's own numbers (the share of
-    units that change package, and the share above which the plan is said to change), null where it records none.
+    """({test id: {status, verdict, statement, state, counts, spec, spec_says, feasible, share_pct, threshold_pct, ...}},
+    None) from analysis/decision_tests.yaml, in the file's order, or (None, why). share_pct and threshold_pct are the
+    test's own numbers (the share of units that change package, and the share above which the plan is said to change),
+    with the rest of TEST_NUMBERS, null where it records none; `feasible` is its point_plan_feasible (true, false or null).
     The one loader of decision tests, for every view. state: `ran` (status run with a verdict of NO_CHANGE or
     CHANGES_PLAN: the only pair that establishes that a test ran), `not_run` (status not_run, verdict NOT_RUN),
     `contradiction` (the producer's words in a pair it does not write, so the record contradicts itself), or
@@ -141,16 +148,7 @@ def decision_tests(run, spec=None):
     if not isinstance(tests, list) or not all(isinstance(t, dict) and t.get("test_id") for t in tests):
         return None, f"{DT} holds no list of tests (data.tests)"
     spec = spec or verified_spec(run)
-    held = digest(doc.get("spec_sha256"))
-    if not spec["verified"]:
-        tie, tie_says = "unverified", f"no signed spec could be verified ({spec['why']}), so no test is tied to one"
-    elif held is None:
-        tie, tie_says = "not_recorded", f"{DT} records no valid hash of the spec it was run for (spec_sha256)"
-    elif held != spec["sha"]:
-        tie, tie_says = "other", (f"{DT} records another spec ({held[:8]}) than the verified signed copy "
-                                  f"({spec['sha'][:8]}), so its tests were not run for the spec that was signed")
-    else:
-        tie, tie_says = "same", None
+    tie, tie_says = _tie(run, DT, doc, spec)
     out = {}
     for t in tests:
         status, verdict = t.get("status"), t.get("verdict")
@@ -159,8 +157,57 @@ def decision_tests(run, spec=None):
         out[str(t["test_id"])] = {"status": status, "verdict": verdict, "state": state,
                                   "counts": state == "ran" and tie == "same", "spec": tie, "spec_says": tie_says,
                                   "statement": " ".join(str(t.get("statement") or "").split())[:4000],
+                                  "feasible": t.get("point_plan_feasible") if isinstance(t.get("point_plan_feasible"), bool) else None,
                                   **{k: t.get(k) if isinstance(t.get(k), (int, float)) and not isinstance(t.get(k), bool) else None
-                                     for k in ("share_pct", "threshold_pct")}}
+                                     for k in TEST_NUMBERS}}
+    return out, None
+
+
+def _tie(run, rel, doc, spec):
+    """How an analysis file's recorded spec hash stands against the verified signed spec: (word, sentence or None)."""
+    held = digest(doc.get("spec_sha256"))
+    if not spec["verified"]:
+        return "unverified", f"no signed spec could be verified ({spec['why']}), so no test is tied to one"
+    if held is None:
+        return "not_recorded", f"{rel} records no valid hash of the spec it was run for (spec_sha256)"
+    if held != spec["sha"]:
+        return "other", (f"{rel} records another spec ({held[:8]}) than the verified signed copy ({spec['sha'][:8]}), so its "
+                         "tests were not run for the spec that was signed")
+    return "same", None
+
+
+def estimates_tests(run, spec=None):
+    """The decision tests of an `estimates` deliverable, which the producer keeps in analysis/estimates.yaml
+    (data.decision_tests), in the shape and by the rules of decision_tests above: ({test id: {status, verdict, state,
+    counts, spec, spec_says, statement, parameter, ...}}, None) or (None, why). The producer's words
+    (toolkit/analysis/estimates.py) are mapped explicitly: status `run` with `decision_changes` true is the verdict
+    CHANGES_PLAN and with false NO_CHANGE, and only when an end that the data do not reject holds one of the rule's
+    verdicts (EST_VERDICTS), since a test counts only with a real verdict; `not_assessable` did not run (NOT_RUN); any
+    other status, or a run test with no verdict, is `unknown`. `status` stays the producer's own word."""
+    doc, why = run.large(EST)
+    if doc is None:
+        return None, why
+    tests = doc.get("data", {}).get("decision_tests") if isinstance(doc.get("data"), dict) else None
+    if not isinstance(tests, list) or not all(isinstance(t, dict) and t.get("id") for t in tests):
+        return None, f"{EST} holds no list of tests (data.decision_tests)"
+    spec = spec or verified_spec(run)
+    tie, tie_says = _tie(run, EST, doc, spec)
+    out = {}
+    for t in tests:
+        status, changes = t.get("status"), t.get("decision_changes")
+        ends = [e for e in t.get("ends") or [] if isinstance(e, dict) and not e.get("rejected_by_data")]
+        real = isinstance(changes, bool) and (any(e.get("verdict") in EST_VERDICTS for e in ends) or not ends) \
+            and all(e.get("verdict") in EST_VERDICTS for e in ends)
+        if status == "run" and real:
+            state, verdict = "ran", "CHANGES_PLAN" if changes else "NO_CHANGE"
+        elif status == "not_assessable":
+            state, verdict = "not_run", "NOT_RUN"
+        else:
+            state, verdict = "unknown", None
+        out[str(t["id"])] = {"status": status, "verdict": verdict, "state": state, "counts": state == "ran" and tie == "same",
+                             "spec": tie, "spec_says": tie_says, "statement": "", "feasible": None,
+                             "parameter": t.get("parameter") if isinstance(t.get("parameter"), str) else None,
+                             **{k: None for k in TEST_NUMBERS}}
     return out, None
 
 
@@ -206,7 +253,7 @@ FIGURES = "analysis/figures.yaml"
 
 
 def harness_figures(run):
-    """{figure name: {figure, path, sha256, title, caption}} for the figures the run's figure index lists whose image
+    """{figure name: {figure, path, sha256, title, caption, tier, group}} for the figures the run's figure index lists whose image
     can be read, each with the hash of the image as read, or None when the run has no readable index. For a view that
     shows a harness figure beside its own chart or table (§5.12); the Figures view reads the index in full itself."""
     doc, _ = run.large(FIGURES)
@@ -220,7 +267,7 @@ def harness_figures(run):
             sha = run.sha(rel)
             if sha is not None:
                 out[name] = {"figure": name, "path": rel, "sha256": sha, **{k: " ".join(e[k].split())[:2000] if isinstance(e.get(k), str) and e[k].strip() else None
-                                                                           for k in ("title", "caption")}}
+                                                                           for k in ("title", "caption", "tier", "group")}}
     return out
 
 

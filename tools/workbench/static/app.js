@@ -180,7 +180,7 @@ function tableView(t, opts = {}) {
     on: {click: () => { desc = sort === i && !desc; sort = i; page = 0; draw(); }}}));
   const cell = (v, i, r) => {
     const c = t.columns[i], td = el("td", {class: numeric[i] ? "num" : fmt(v, c).length <= (wide ? 12 : 20) ? "tight" : null});      // a short value stays on one line; a longer one wraps to fit the page
-    if ((c === "status" || c === "state") && MARKS[v]) td.append(mark(v));
+    if ((c === "status" || c === "state") && MARKS[v] && !(Array.isArray(t.plain) && t.plain.includes(c))) td.append(mark(v));
     else if (typeof v === "string" && Array.isArray(t.wrap) && t.wrap.includes(c)) {     // a text the view asks to be read: its first lines, the whole on a click
       const lines = el("div", {class: "lines"}, gloss(v));
       td.className = "whole";
@@ -502,8 +502,8 @@ const PANEL_ROWS = 80;      // panels holding more rows than this together are s
 // A chart, and under it the harness figure of the same data when the declaration carries one (decl.image).
 function chartView(decl, tables, run, where) {
   const fig = chartDrawn(decl, tables, where), im = decl.image;
-  if (im && typeof im === "object") fig.append(el("p", {class: "about small", text: `The harness figure of the same data${im.title ? `: ${im.title}` : ""} (${im.path || "no file named"}).`}),
-    imageBox(run, im.path, im.hash, im.title), captionBeyond(im.title, im.caption) ? el("p", {class: "caption"}, gloss(captionBeyond(im.title, im.caption))) : null);
+  if (im && typeof im === "object") fig.append(...[el("p", {class: "about small", text: `The harness figure of the same data${im.title ? `: ${im.title}` : ""} (${im.path || "no file named"}).`}),
+    imageBox(run, im.path, im.hash, im.title), captionBeyond(im.title, im.caption) ? el("p", {class: "caption"}, gloss(captionBeyond(im.title, im.caption))) : null].filter(Boolean));     // a figure with no caption has none: nothing is appended for it
   return fig;
 }
 function chartDrawn(decl, tables, where) {
@@ -580,8 +580,24 @@ function checksView(checks, run, here) {
   }
   return out;
 }
+// A view may declare `choose` (the keys are in workbench.py's docstring): one control at the top of its page. The value picked is kept in the
+// page's address under the declared parameter, and the address is what asks the server for the view, so a choice survives a reload and a link.
+function chooseView(c) {
+  if (!c || typeof c !== "object" || typeof c.param !== "string" || !c.param || !Array.isArray(c.options)) return null;
+  const read = () => new URLSearchParams(location.hash.slice(1)), now = read().get(c.param) || "";
+  const go = v => { const p = read(); if (v) p.set(c.param, v); else p.delete(c.param); state.keep = true; location.hash = "#" + p.toString(); };
+  const options = c.options.filter(o => o && typeof o.value === "string" && o.value), groups = [...new Set(options.map(o => o.group || ""))];
+  const one = o => el("option", {value: o.value, text: o.label || o.value, selected: o.value === now});
+  const select = el("select", {"aria-label": c.label || c.param, on: {change: e => go(e.target.value)}}, el("option", {value: "", text: "none", selected: !now}),
+    groups.map(name => (name ? el("optgroup", {label: name}, options.filter(o => o.group === name).map(one)) : options.filter(o => !o.group).map(one))));
+  const stale = now && !options.some(o => o.value === now);     // the address holds a value the view does not offer
+  return el("div", {class: "tools choose"}, el("label", null, `${c.label || label(c.param)}: `, select),
+    options.length ? null : el("span", {class: "muted", text: "There is nothing else to choose from."}),
+    stale ? el("span", {class: "muted", text: `The address names "${now}", which is not offered here.`}) : null);
+}
 function renderView(data, run, here) {
   const out = [], facts = Object.entries(data.facts || {}), notes = Object.entries(data.notes || {}), tables = data.tables || {};
+  if (data.choose) out.push(chooseView(data.choose));
   if ((data.checks || []).length) out.push(...checksView(data.checks, run, here));
   if (facts.length) out.push(el("h2", {text: "Facts"}), el("dl", {class: "facts"}, facts.map(([k, v]) => {
     const text = fmt(v, k, true);
@@ -676,8 +692,10 @@ async function route() {
     const run = state.runs.runs.find(r => r.id === id);
     if (!run) throw new Error("This run is not under the folders the workbench was started on.");
     const url = v => `/api/view?run=${encodeURIComponent(id)}&view=${encodeURIComponent(v)}`;
+    // whatever else the address holds (a value picked in a view's `choose` control) goes to the server with the request for that view
+    const more = [...p.entries()].filter(([k]) => k !== "run" && k !== "view").map(([k, v]) => `&${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("");
     if (!state.over || state.over.id !== id) { main.replaceChildren(el("p", {class: "muted", text: "Reading the run's files…"})); state.over = {id, data: await get(url("overview"))}; }
-    const data = here === "overview" ? state.over.data : await get(url(here));
+    const data = here === "overview" ? state.over.data : await get(url(here) + more);
     if (turn !== state.turn) return;
     GLOSS.used.clear();
     showRail(run, here);
