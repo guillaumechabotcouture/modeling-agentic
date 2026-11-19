@@ -2439,7 +2439,10 @@ def _self_test() -> int:
            f"R3-7e a run failed on resume does not leave an earlier report deliverable ({s7e})")
         d7f = os.path.join(td, "r37f")
         os.makedirs(d7f)
-        for bad in ({"sha256": "invalid"}, {"spec_sha256": "invalid"}, ["x"]):
+        ok_hex = "a" * 64
+        json.dump({"spec_sha256": None, "sha256": {AB.SPEC_FILE: ok_hex}}, open(os.path.join(d7f, SIGNOFF_FILE), "w"))
+        ok(_spec_signed_sha(d7f) == ok_hex, "R3-7g a null spec_sha256 beside a valid nested digest is still signed")
+        for bad in ({"sha256": "invalid"}, {"spec_sha256": "invalid"}, ["x"], {"spec_sha256": None}):
             json.dump(bad, open(os.path.join(d7f, SIGNOFF_FILE), "w"))
             ok(_spec_signed_sha(d7f) == "unreadable", f"R3-7f a malformed sign-off record reads unreadable ({bad})")
         # R3-5 (Codex review of #258 P1-10): the amendment check runs on every gate route: a structural PLAN blocker
