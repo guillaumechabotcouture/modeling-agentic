@@ -1906,19 +1906,36 @@ def _self_test_posterior_point(ok):
         a8, j8 = both(s8)
         ok(all(isinstance(x, str) and "net_effect_posterior" in x for x in (a8, j8)),
            f"RPP8 an empty uncertainty.net_effect_posterior is refused: {str(a8)[:120]}")
-    # Codex r1 P1-4: a chosen point that differs from the fit's recorded parameter values is refused
+    # Codex r1 P1-4, r2 P1-1/P1-2: a chosen point that is not exactly the fit's recorded parameter values (a different
+    # value, a value within 1e-6, NaN), or that holds a coordinate the sample does not, is refused
+    def edited(d, edit):
+        s = setup(d)
+        f = os.path.join(d, "nef.yaml")
+        doc = yaml.safe_load(open(f))
+        edit(doc)
+        yaml.safe_dump(doc, open(f, "w"), sort_keys=False)
+        r = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+        r["uncertainty"]["net_effect_posterior"]["sha256"] = hashlib.sha256(open(f, "rb").read()).hexdigest()
+        yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+        return both(schema.load(os.path.join(d, "decision_spec.yaml")))[0], s
+    got10 = {}
+    for label, val in (("0.45", 0.45), ("0.409999", 0.409999), ("nan", float("nan"))):
+        with tempfile.TemporaryDirectory() as d:
+            got10[label] = edited(d, lambda doc: doc["parameters"]["eff_a"].update(value=val))[0]
+    ok(all(isinstance(x, str) and "parameters" in x and "eff_a" in x for x in got10.values()),
+       f"RPP10 a chosen point that is not exactly the fit's recorded parameter values is refused: "
+       f"{ {k: str(v)[:60] for k, v in got10.items()} }")
     with tempfile.TemporaryDirectory() as d:
-        s10 = setup(d)
-        f10 = os.path.join(d, "nef.yaml")
-        doc = yaml.safe_load(open(f10))
-        doc["parameters"]["eff_a"]["value"] = 0.45
-        yaml.safe_dump(doc, open(f10, "w"), sort_keys=False)
-        r10 = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
-        r10["uncertainty"]["net_effect_posterior"]["sha256"] = hashlib.sha256(open(f10, "rb").read()).hexdigest()
-        yaml.safe_dump(r10, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
-        a10, _ = both(schema.load(os.path.join(d, "decision_spec.yaml")))
-        ok(isinstance(a10, str) and "parameters" in a10 and "eff_a" in a10,
-           f"RPP10 a chosen point that differs from the fit's recorded parameter values is refused: {str(a10)[:160]}")
+        def extra(doc):
+            doc["joint_region"]["verified"]["chosen"]["point"]["synergy"] = 0.19
+            doc["parameters"]["synergy"] = {"value": 0.19}
+        a12, _ = edited(d, extra)
+        ok(isinstance(a12, str) and "synergy" in a12,
+           f"RPP12 a chosen point with a coordinate the sample does not hold is refused: {str(a12)[:160]}")
+    with tempfile.TemporaryDirectory() as d:
+        a13, _ = both(setup(d, spec_value=0.049999))           # exactly 1e-6 from the chosen 0.05
+        ok(isinstance(a13, dict) and a13["synergy"] == 0.05,
+           f"RPP13 a spec value exactly 1e-6 from the chosen point is accepted (float subtraction): {str(a13)[:120]}")
     # Codex r1 P1-1: the likelihood and posterior calibrations build engine parameters without theta0, so they could
     # not run at the chosen point: refused with a posterior rather than run at engine defaults
     with tempfile.TemporaryDirectory() as d:
