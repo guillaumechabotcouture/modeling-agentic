@@ -1438,7 +1438,19 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
     out_rows = [rows[i] for i in ids]
     by = {s: sum(r["status"] == s for r in out_rows) for s in STATUSES}
     d0 = docs[0]
-    out = {"benchmarks": out_rows, "settings_calibrated": d0.get("settings_calibrated", {}),
+    # every input's calibrated settings (a setting only a later run calibrated is kept; a conflict is refused) and
+    # its initialisation record, which must agree; each input's provenance (its rows and any re-stamp record) is kept
+    cal = {}
+    for d in docs:
+        for s, v in (d.get("settings_calibrated") or {}).items():
+            if s in cal and cal[s] != v:
+                raise ValueError(f"merge: setting {s} was calibrated differently in two inputs")
+            cal[s] = v
+    inits = [d["initialisation"] for d in docs if "initialisation" in d]
+    if any(x != inits[0] for x in inits):
+        raise ValueError("merge: the inputs record different initialisations")
+    prov = [{"rows": [r["id"] for r in d.get("benchmarks") or []], "restamped": d.get("restamped")} for d in docs]
+    out = {"benchmarks": out_rows, "settings_calibrated": cal,
            "fitted_used": d0.get("fitted_used", {}), "configs_validated": dict(sorted(validated.items())),
            "configs_not_exercised": sorted(set(pack.get("configs") or {}) - set(validated)),
            "seeds": d0.get("seeds"), "n_sims": nsims,
@@ -1448,8 +1460,11 @@ def merge_results(pack: dict, docs: list, engine) -> dict:
     for k in ("engine_version", "fit_rule"):
         if k in d0:
             out[k] = d0[k]
+    if inits:
+        out["initialisation"] = inits[0]
     if any("wall_s" in d for d in docs):
         out["wall_s"] = round(wall, 1)
+    out["merged_from"] = prov
     return stamp(out, engine)
 
 
@@ -2003,6 +2018,25 @@ def _self_test() -> int:
             other = True
         ok(same and short and other, "BP50 (v2d β) per-case runs merge into the full results in pack order; a missing "
            "case or another code identity is refused")
+        # F6 option A: a run of new cases merged into a stored file keeps what each input knew: the union of the
+        # settings calibrated (a setting only the new run calibrated is not lost; one calibrated differently in two
+        # inputs is refused), the initialisation record, and each input's provenance (a re-stamp record stays)
+        a = dict(parts[0], settings_calibrated={"s1": {"value": 1.0}}, initialisation={"method": "m"},
+                 restamped={"by": "proof"})
+        b = dict(parts[1], settings_calibrated={"s1": {"value": 1.0}, "s2": {"value": 2.0}}, initialisation={"method": "m"})
+        m2 = merge_results(p14, [a, b], eng)
+        try:
+            merge_results(p14, [a, dict(b, settings_calibrated={"s1": {"value": 9.0}})], eng)
+            clash = False
+        except ValueError:
+            clash = True
+        prov = m2.get("merged_from") or []
+        ok(m2["settings_calibrated"] == {"s1": {"value": 1.0}, "s2": {"value": 2.0}} and clash
+           and m2.get("initialisation") == {"method": "m"}
+           and [p.get("restamped") for p in prov] == [{"by": "proof"}, None]
+           and [p.get("rows") for p in prov] == [["P1"], ["P2"]],
+           f"BP50b merge keeps the union of calibrated settings (refusing a conflict), the initialisation and each "
+           f"input's provenance ({m2.get('settings_calibrated')}, {prov})")
     except NameError as ex:
         ok(False, f"BP50 merge_results ({ex})")
     # Codex r1-11: a coverage row carries its declaration and calibration-code digests; merge re-checks both

@@ -52,7 +52,7 @@ so `--resume` continues from the last completed state.
 | ANALYZE | S1 runner: the stale steps only | ok → CRITIQUE; failed → FINAL `run_failed` |
 | CRITIQUE | tasks: domain and red-team critics write `critique_*.yaml` for the round (presentation is its own state) | → GATE |
 | GATE | today's gate (§2.1), pre-write or post-write | by action, table below |
-| FIX_LOOP | §5 | → CRITIQUE (round + 1) |
+| FIX_LOOP | §5 | → CRITIQUE (round + 1); → OWNER_DECISION when a finding's remedy is an owner amendment; → WRITE when only write-up findings remain and a draft exists (F6 run 3) |
 | OWNER_DECISION | Phase 49 β AWAIT_OWNER: waits for `scope_signoff.json` | answered → GATE; not yet → pause `awaiting_scope_signoff` |
 | WRITE | task `write` → `manuscript.md`; harness renders `report.md` with the numbers from artifacts | → PRESENTATION |
 | PRESENTATION | task: presentation critic on the draft | → GATE (post-write) |

@@ -79,6 +79,11 @@ every call, for a generation carrying it or started after it. Resuming from one:
   Engine rows survive the round trip only where the fingerprint does: a file over 64 MB under models/ or data/ is
   fingerprinted by size and mtime (ns), which neither the tarball (whole seconds) nor git archive keeps, and a
   symlink there is not archived: either one changes every batch's fingerprint. reuse-check (step 3) shows it.
+Before any paid launch, fresh or resumed, run the resume smoke on the tree the launch ships (`git archive HEAD`
+extracted): `python3 scripts/resume_smoke.py <tree>`. It interrupts toy v2 runs at the two resumable ANALYZE states
+(step timeout, batch killed) and resumes them with that tree's code, and stops a toy batch at its compute allowance and
+reruns it (a cap stop is not resumable by --resume; a relaunch reruns the batch). It exits 1 unless every kept
+engine row is reused, none is recomputed and the lead's sign-off still binds the spec. Local, toy engines only, about a minute.
 
 Exit codes of `launch` (and `relaunch`), for a watchdog. Once a run is submitted the launch is never
 reported as failed, because the run keeps going whatever happens to this process (F5 resume launch,
@@ -1587,6 +1592,13 @@ def fetch_checkpoint(cfg, store, label) -> dict:
         with tarfile.open(tgz, mode="r:gz") as t:
             t.extractall(dest, filter="data")
         json.dump(rec, open(os.path.join(dest, "checkpoint.json"), "w"), indent=1)
+        import copied_run       # F6 run 3: its batch records describe the VM's process, not one running here
+        rroot = _checkpoint_run_root(dest, rec.get("run_dir"))
+        if rroot is not None:
+            copied_run.mark(rroot, f"run_cluster checkpoint {label} generation {g}", rec.get("time_utc"))
+        else:
+            print(f"{label}: WARNING the record's run_dir {rec.get('run_dir')!r} is not one directory of the extraction: "
+                  "its batch records are not marked as copied")
         note = "" if g == ptr.get("generation") else f" (the previous generation: {'; '.join(why)})"
         print(f"{label}: checkpoint generation {g} of {rec.get('time_utc')} (state {rec.get('run_state')}, "
               f"{rec.get('cached_batches')} cached batches, {rec.get('bytes')} bytes, sha256 verified){note} -> "
@@ -1594,6 +1606,16 @@ def fetch_checkpoint(cfg, store, label) -> dict:
         return rec
     raise SystemExit(f"{label}: no checkpoint generation matches its record's sha256 ({'; '.join(why)}); run "
                      "`checkpoint` again later")
+
+
+def _checkpoint_run_root(dest, name):
+    """The extracted run dir a checkpoint record names: one plain name of a real directory (not a link) directly under
+    <dest>/runs/, or None (Codex review of #256 P1-4: the record is not trusted as a path)."""
+    if not isinstance(name, str) or not name or name in (".", "..") or os.path.basename(name) != name \
+            or os.sep in name or (os.altsep and os.altsep in name):
+        return None
+    p = os.path.join(dest, "runs", name)
+    return p if os.path.isdir(p) and not os.path.islink(p) and not os.path.islink(os.path.join(dest, "runs")) else None
 
 
 def ws_sha256(path) -> str:
@@ -4433,6 +4455,16 @@ def _self_test_checkpoint(ok) -> None:
     ok(got.get("sha256") == rec["sha256"] and os.path.exists(os.path.join(dest, "runs", "R_x", "run_state.json"))
        and json.load(open(os.path.join(dest, "checkpoint.json"))).get("sha256") == rec["sha256"],
        f"CK10 `checkpoint` reads the pointer, downloads, verifies and extracts the latest generation: {got}")
+    try:
+        mk10 = json.load(open(os.path.join(dest, "runs", "R_x", "copied_run.json")))
+    except (OSError, ValueError):
+        mk10 = {}
+    ok(list(mk10.get("files") or {}) == ["models/b.jsonl.partial.jsonl"] and "checkpoint R1" in str(mk10.get("source"))
+       and mk10.get("captured_at") == got.get("time_utc"),
+       f"CK10b (F6 run 3) the fetched run dir is marked: its batch journal is a copy, not a live batch ({mk10})")
+    ok(_checkpoint_run_root(dest, "R_x") == os.path.join(dest, "runs", "R_x")
+       and all(_checkpoint_run_root(dest, bad) is None for bad in ("../R1", "/tmp", "runs/R_x", "", "..", None, "nope")),
+       "CK10c (Codex review of #256 P1-4) the record's run_dir is one name of a directory in the extraction, or none")
     store.files[gen(n)[0]] = data + b"tampered"
     out3 = tempfile.mkdtemp()
     cfg3 = RunConfig(name="t", question_file="q", out_dir=out3, labels=("R1",))

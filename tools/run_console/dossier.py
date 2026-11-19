@@ -677,6 +677,15 @@ def _restamp(eng: dict, repo: str) -> dict:
     rs = doc.get("restamped")
     base = {"available": True, "file": rel, "sha256": sha, "new_version": ident.get("version") or doc.get("engine_version"),
             "code_sha256": ident.get("code_sha256")}
+    # a merged file (benchmark.merge_results) keeps each input's re-stamp record under merged_from: name the rows a
+    # proof re-stamped apart from the rows recomputed (Codex review of #276)
+    groups = [g for g in _l(doc.get("merged_from")) if isinstance(g, dict)]
+    if not isinstance(rs, dict) and any(isinstance(g.get("restamped"), dict) for g in groups):
+        rs = next(g["restamped"] for g in groups if isinstance(g.get("restamped"), dict))
+        base.update(restamped_rows=[str(i) for g in groups if isinstance(g.get("restamped"), dict)
+                                    for i in _l(g.get("rows"))],
+                    recomputed_rows=[str(i) for g in groups if not isinstance(g.get("restamped"), dict)
+                                     for i in _l(g.get("rows"))])
     if not isinstance(rs, dict):
         return {**base, "state": "recomputed", "by": doc.get("producer"), "validate_once": "not needed"}
     conf = _m(rs.get("confirmation"))
@@ -1682,6 +1691,26 @@ def _self_test() -> int:
                                      f"({len(used)} used; missing {missing})")
         case("DS5", ds5)
         _self_test_review1(ok, td)
+
+        def ds6():
+            # Codex review of #276: a merged results file (benchmark.merge_results) keeps each input's re-stamp record
+            # under merged_from; the dossier names which rows a proof re-stamped and which were recomputed, never
+            # "recomputed" for all
+            import hashlib as _h
+            rp = os.path.join(td, "ds6repo")
+            rel = "toolkit/engines/toy6/benchmarks/results.yaml"
+            os.makedirs(os.path.dirname(os.path.join(rp, rel)), exist_ok=True)
+            rec = {"by": "restamp_proof.py (byte-identity proof, not recomputed)", "old_engine_version": "0.1",
+                   "proof_identical": True, "confirmation": {"validate_once": "pending"}}
+            doc = {"producer": "toolkit/engines/benchmark.py", "engine_identity": {"version": "0.2", "code_sha256": "c"},
+                   "merged_from": [{"rows": ["B1", "B2"], "restamped": rec}, {"rows": ["B3"], "restamped": None}]}
+            data = yaml.safe_dump(doc).encode()
+            open(os.path.join(rp, rel), "wb").write(data)
+            r = _restamp({"inputs": {rel: _h.sha256(data).hexdigest()}}, rp)
+            ok(r.get("state") == "proof" and r.get("restamped_rows") == ["B1", "B2"]
+               and r.get("recomputed_rows") == ["B3"] and r.get("validate_once") == "pending",
+               f"DS6 a merged results file: the proof's rows and the recomputed rows named apart ({r})")
+        case("DS6", ds6)
     finally:
         shutil.rmtree(td, ignore_errors=True)
     if fails:

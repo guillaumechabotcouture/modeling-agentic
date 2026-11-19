@@ -2844,6 +2844,8 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
     summary["out_sha256"] = hashlib.sha256(body).hexdigest()     # Codex round 1 P1-1: which results it describes
     if os.environ.get("MA_PIPELINE_RUN"):        # the pipeline run that computed it (scripts/pipeline.py)
         summary["pipeline_run"] = os.environ["MA_PIPELINE_RUN"]
+    if os.environ.get("MA_COMPUTE_LAUNCH"):      # the detached launch that computed it (job_status binds to it)
+        summary["launch"] = os.environ["MA_COMPUTE_LAUNCH"]
     from lib.safe_io import remove_nofollow, write_nofollow
     base, name = _out_base(out, run_dir)
     try:
@@ -3441,6 +3443,7 @@ def _self_test() -> int:
     _self_test_p35(ok)
     _self_test_p37(ok)
     _self_test_p42(ok)
+    _self_test_copied(ok)
     _self_test_p45d(ok)
     _self_test_sched(ok)
     try:
@@ -3953,6 +3956,80 @@ def _self_test_wall(ok) -> None:
         open(os.path.join(d, "models", "helper.py"), "w").write("X = 1\n")
         ok(fp1 == fp0 and code_fingerprint(d, "models/fn.py::f") != fp1,
            "SW5 the pipeline runner's own definition and records are not part of a batch's fingerprint; model code is")
+
+
+def _self_test_copied(ok) -> None:
+    """F6 run 3: a batch's records copied out of a live run (a cp loop, the checkpoint fetch, vm_job's poll sync) are
+    not a batch running here. Its job record names a live pid here (this process), so only the copy can say so."""
+    import tempfile
+    from lib import copied_run as CR
+    me, start = os.getpid(), _pid_start(os.getpid())
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "run_state.json"), "w").write("{}")       # the run root the marker is read at
+        bd = os.path.join(d, "analysis", "batch")
+        os.makedirs(os.path.join(bd, PROGRESS_DIR))
+        out = os.path.join(bd, "results.jsonl")
+        open(out + PARTIAL_EXT, "w").write('{"fn": "f"}\n{"ok": true}\n')
+
+        def job(**kw):
+            open(out + JOB_EXT, "w").write(json.dumps(dict({"pid": me, "started": time.time() - 900, "n": 4,
+                                                             "log": out + ".log"}, **kw)))
+        job(pid_start=start, host=os.uname().nodename)
+        ok(job_status(out)["state"] == RUNNING, "CP1 a job of this host with a live pid is running")
+        job(pid_start=start, host="another-host")
+        st = job_status(out)
+        ok(st["state"] == COPIED and "another-host" in st.get("why", ""),
+           f"CP2 a job record from another host is a copy, not a live batch here ({st['state']})")
+        job()                                       # an older record: no host, no start token
+        old = time.time() - 2 * PROGRESS_STALE_S
+        for f in (out + PARTIAL_EXT, out + JOB_EXT):
+            os.utime(f, (old, old))
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP3 a record with no host or start token and a journal quiet past the stale limit "
+                                  f"is stale ({st['state']})")
+        open(out + PARTIAL_EXT, "a").write('{"ok": true}\n')
+        ok(job_status(out)["state"] == RUNNING, "CP4 the same record with a fresh journal is still read as running")
+        job(pid_start=start, host=os.uname().nodename)
+        CR.mark(d, "test copy", "2026-11-16T00:00:00Z")
+        st = job_status(out)
+        ok(st["state"] == COPIED and st.get("copied", {}).get("source") == "test copy" and _STATUS_EXIT[COPIED] == 4,
+           f"CP5 a job record the copy marker lists, unchanged, is reported copied (exit 4) ({st['state']})")
+        job(pid_start=start, host=os.uname().nodename, n=5)
+        ok(job_status(out)["state"] == RUNNING, "CP6 a job record rewritten after the copy is read as usual")
+        # Codex review of #256 P1-1: a summary from an earlier batch at the same --out (its mtime refreshed by a copy)
+        # does not finish this one; the summary must name this job's launch
+        job(pid_start=start, host=os.uname().nodename, launch="L2")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 2, "launch": "L1"}))
+        st = job_status(out)
+        ok(st["state"] == RUNNING, f"CP7 a summary of another launch does not finish this job ({st['state']})")
+        open(out, "w").write('{"ok": true}\n')
+        dig = hashlib.sha256(open(out, "rb").read()).hexdigest()
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L2", "out_sha256": dig}))
+        ok(job_status(out)["state"] == FINISHED, "CP7b this launch's summary, matching the results, finishes it")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L2", "out_sha256": "0" * 64}))
+        ok(job_status(out)["state"] != FINISHED, "CP7c a summary whose out_sha256 is not the results file's does not")
+        job(pid_start=start, host=os.uname().nodename)          # an older record (no launch), copied
+        open(out + ".summary.json", "w").write(json.dumps({"n": 2}))
+        CR.mark(d, "test copy 2", "2026-11-16T00:00:00Z")
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP8 a copied job with a summary it cannot be bound to reads copied, not finished "
+                                  f"(a copy refreshes mtimes) ({st['state']})")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 2, "out_sha256": dig}))
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP10 a copied legacy job (no launch) is never read finished: its summary may be an "
+                                  f"earlier batch's at the same --out ({st['state']})")
+        job(pid_start=start, host=os.uname().nodename, launch="L3")
+        CR.mark(d, "test copy 3", None)
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L3"}))
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP11 a summary with no out_sha256 does not finish a job ({st['state']})")
+        os.remove(out + ".summary.json")
+        # P1-3: only the run root's marker counts; one planted below it is ignored
+        job(pid_start=start, host=os.uname().nodename, n=6)
+        os.remove(os.path.join(d, CR.MARKER))
+        CR.mark(bd, "planted", None)
+        st = job_status(out)
+        ok(st["state"] == RUNNING, f"CP9 a marker below the run root is ignored ({st['state']})")
 
 
 def _self_test_xhost(ok) -> None:
@@ -5575,7 +5652,31 @@ def _self_test_p35(ok) -> None:
 
 
 RUNNING, FINISHED, DIED, NO_JOB = "running", "finished", "died", "no detached job"
-_STATUS_EXIT = {FINISHED: 0, RUNNING: 3, DIED: 4, NO_JOB: 4}
+COPIED = "copied"         # F6 run 3: the records were copied from another machine; they describe a process there
+_STATUS_EXIT = {FINISHED: 0, RUNNING: 3, DIED: 4, NO_JOB: 4, COPIED: 4}
+
+
+def _copied_why(out: str, job: dict) -> tuple[str | None, dict | None]:
+    """Why the job record at `out` describes a process on another machine, or (None, None): the copy marker lists it
+    unchanged (scripts/lib/copied_run.py), its host is not this one, or (a record with neither host nor start token)
+    nothing of the batch was written for PROGRESS_STALE_S."""
+    try:
+        from lib import copied_run
+        ce = copied_run.copied_entry(out + JOB_EXT)
+    except Exception:  # noqa: BLE001 -- no marker reading: the other rules still apply
+        ce = None
+    if ce:
+        return f"copied from {ce.get('source')} (captured {ce.get('captured_at') or 'at an unknown time'})", ce
+    host = job.get("host")
+    if host and host != os.uname().nodename:
+        return f"the job record was written on {host}, not on this host", None
+    if not host and not job.get("pid_start"):
+        ts = [os.path.getmtime(p) for p in (out + PARTIAL_EXT, out + JOB_EXT, str(job.get("log") or ""))
+              if p and os.path.exists(p)]
+        if ts and time.time() - max(ts) > PROGRESS_STALE_S:
+            return (f"the record names no host or start token and nothing of the batch was written for "
+                    f"{int(time.time() - max(ts))} s"), None
+    return None, None
 
 
 def job_status(out: str) -> dict:
@@ -5589,6 +5690,46 @@ def job_status(out: str) -> dict:
     except (OSError, ValueError, KeyError, TypeError) as e:
         return {"state": NO_JOB, "out": out, "error": f"{out + JOB_EXT}: {type(e).__name__}"}
     st = {"out": out, "pid": pid, "n": job.get("n"), "elapsed_s": round(time.time() - t0, 1), "log": job.get("log")}
+
+    def summary(trust_mtime: bool):
+        """This job's summary: the one naming its launch when the record has one (Codex review of #256 P1-1: a copy
+        refreshes mtimes, so an earlier batch's summary at the same --out would look fresh); else, for an older record,
+        one written after it started, when mtimes can be trusted (not for a copy)."""
+        try:
+            summ = json.load(open(out + ".summary.json"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(summ, dict):
+            return None
+        if job.get("launch") and summ.get("launch") != job["launch"]:
+            return None                     # another launch's summary (checked before reading any results)
+        if not job.get("launch") and not trust_mtime:
+            return None                     # a copied older record: its summary may be an earlier batch's at this --out
+        if job.get("launch") or summ.get("out_sha256") is not None:
+            from lib import copied_run
+            if not summ.get("out_sha256") or copied_run._sha(out) != summ["out_sha256"]:
+                return None                 # it describes other results, or results not all here (streamed, no link)
+        if job.get("launch"):
+            return summ
+        try:
+            return summ if os.path.getmtime(out + ".summary.json") >= t0 - 1 else None
+        except OSError:
+            return None
+
+    def finished(summ):
+        return {"state": FINISHED, **st, "summary": {k: v for k, v in summ.items() if k not in ("bundle", "chunks")}}
+    why, ce = _copied_why(out, job)
+    if why is not None:
+        summ = summary(trust_mtime=False)
+        if summ is not None:
+            return finished(summ)
+        return {"state": COPIED, **st, "why": why, **({"copied": ce} if ce else {}),
+                "next": "these records describe a batch on the machine the run was copied from; nothing runs here. "
+                        "On a resume, the same map command reuses the finished rows whose fingerprint still matches "
+                        "(compute.py reuse-check <run_dir> shows which)"}
+    summ = summary(trust_mtime=True)
+    if summ is not None and job.get("launch"):
+        return finished(summ)
     if _pid_alive(pid, job.get("pid_start")):
         rows = 0
         try:
@@ -5597,13 +5738,8 @@ def job_status(out: str) -> dict:
         except OSError:
             pass
         return {"state": RUNNING, "rows_done": rows, **st}
-    try:
-        fresh = os.path.getmtime(out + ".summary.json") >= t0 - 1
-        summ = json.load(open(out + ".summary.json")) if fresh else None
-    except (OSError, ValueError):
-        summ = None
-    if isinstance(summ, dict):
-        return {"state": FINISHED, **st, "summary": {k: v for k, v in summ.items() if k not in ("bundle", "chunks")}}
+    if summ is not None:
+        return finished(summ)
     tail = ""
     try:
         tail = open(job.get("log") or "").read()[-1500:]
@@ -5647,9 +5783,13 @@ def _detach_locked(argv, out, n, subprocess, run_dir) -> int:
     finally:
         os.close(base)
     with lf:
+        import secrets
+        launch = secrets.token_hex(8)       # the summary this child writes names it (Codex review of #256 P1-1)
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
-                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
-    job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "started": t0, "n": n, "log": log, "argv": argv}
+                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
+                             env=dict(os.environ, MA_COMPUTE_LAUNCH=launch))
+    job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "host": os.uname().nodename, "started": t0, "n": n,
+           "log": log, "argv": argv, "launch": launch}
     publish(out + JOB_EXT, json.dumps(job, indent=1), run_dir)
     print(json.dumps({"detached": True, "pid": p.pid, "out": out, "log": log,
                       "next": f"python3 scripts/compute.py wait {out} --timeout-s 540  "
@@ -5701,7 +5841,7 @@ def main() -> int:
             ap.error(f"usage: compute.py {a.cmd} <out.jsonl> [--timeout-s S]")
         end = time.time() + (a.timeout_s if a.timeout_s is not None else 540)
         st = job_status(a.run_dir)
-        while a.cmd == "wait" and st["state"] == RUNNING and time.time() < end:
+        while a.cmd == "wait" and st["state"] == RUNNING and time.time() < end:  # COPIED: nothing to wait for
             time.sleep(min(5.0, max(0.1, end - time.time())))
             st = job_status(a.run_dir)
         print(json.dumps(st))

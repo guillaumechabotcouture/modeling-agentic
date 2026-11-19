@@ -64,6 +64,28 @@ settings:
     params: {n_agents: 5000}
     calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m24.pfpr_6m14y, target: 0.458,
                 grid: [8, 16, 32, 64, 128]}
+  llineup:             # Staedke 2020 (LLINEUP, Uganda; Lancet 395:1292-1303): 104 clusters (health sub-districts) in
+                       # eastern and western Uganda, PBO vs non-PBO LLINs in the 2017-18 national campaign. From the paper:
+                       # very high pyrethroid resistance (Vgsc-L1014S, Cyp4j5-L43F, Coeae1d markers; no discriminating-
+                       # dose mortality reported), outcome microscopy prevalence at ages 2-10, surveys 6, 12 and 18 months
+                       # after distribution; non-PBO arm (as-treated) 556/3844 = 14.5% at 6 months; reported use the
+                       # previous night 85%, 79%, 73% at 6, 12, 18 months. ASSUMPTIONS written from that description:
+                       # resistance 0.15 (bioassay mortality, mid-point of Gleave 2021's high category, below 30%, as
+                       # for pbo_adv_decay's prior); species mix (the paper reports none; An. gambiae s.s. dominant with
+                       # An. funestus and An. arabiensis, as in Uganda's surveillance); bimodal seasonality (rains
+                       # March-May and September-November, peaks a month later); case management and the previous
+                       # campaign (2013-14, three years earlier) as at the other sites; the distribution, which ran
+                       # over 12 months across clusters, at one date. Retention of use: the median that gives
+                       # S(1.5 y) / S(0.5 y) = 0.73 / 0.85 under the engine's survival curve (k = 20), 1088.1 days,
+                       # derived from the trial's reported use only, as for Muleba (pack_trials.py PT2).
+    unit: {season: [0.8, 0.7, 0.9, 1.3, 1.4, 1.1, 0.8, 0.8, 1.0, 1.2, 1.1, 0.9], resistance: 0.15,
+           species: {gambiae: 0.7, funestus: 0.2, arabiensis: 0.1}, cm_ft: 0.3, itn_use: 0.85, itn_use_at: 0.5,
+           itn_hist_years: [2017.0], campaign_year: 2020.0}
+    horizon: {start: 2014.0, stop: 2021.7, window: [2020.0, 2021.6],
+              windows: {pre: [2019.0, 2020.0], m6: [2020.42, 2020.58], m12: [2020.92, 2021.08], m18: [2021.42, 2021.58]}}
+    params: {n_agents: 5000, net_retention_half: 1088.1}
+    calibrate: {attribute: m0, arm_package: {net: pyr}, value_path: windows.m6.pfpr_2_10, target: 0.145,
+                grid: [1, 2, 4, 8, 16, 32, 64]}
   benin:               # Accrombessi 2023 (Zou, Benin): pyrethroid arm 1.03 cases per child-year
     unit: {season: [0.4, 0.5, 0.9, 1.3, 1.5, 1.6, 1.2, 0.9, 1.3, 1.4, 0.6, 0.4], resistance: 0.30,
            species: {gambiae: 1.0}, cm_ft: 0.3, itn_use: 0.7, itn_hist_years: [2017.0], campaign_year: 2020.0}
@@ -118,6 +140,8 @@ arms:
   mis_pyr: {setting: misungwi, package: {net: pyr}}
   mis_pbo: {setting: misungwi, package: {net: pbo}}
   mis_dual: {setting: misungwi, package: {net: dual}}
+  ug_pyr: {setting: llineup, package: {net: pyr}}
+  ug_pbo: {setting: llineup, package: {net: pbo}}
   ben_pyr: {setting: benin, package: {net: pyr}}
   ben_dual: {setting: benin, package: {net: dual}}
   irs_itn: {setting: irs_added, package: {net: pyr}}
@@ -178,6 +202,59 @@ benchmarks:
      published: {lower: 0.67, upper: 1.45, level: 0.95, scale: ratio, table: "abstract, Findings: PBO group vs pyrethroid-only, 24 months"},
      estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
      estimand: {type: odds_ratio, num: mis_pbo, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
+  # F6 option A (owner decision 2026-11-18): LLINEUP at its own estimand, a prevalence ratio (Table 2, as-treated:
+  # clusters grouped by the nets households held at the 6-month survey; the intention-to-treat ratios are weaker,
+  # 0.78, 0.80 and 0.94). Held out of this pack's own fit; a training target of the net-effect fit (owner, 18 Nov,
+  # fit record (b): declared in net_effect_fit.py OPTION_A, posterior through net_effect_posterior); also the source of
+  # pbo_adv_decay's prior range (priors.yaml), so that prior and these targets share data.
+  - {id: B9d, metric: "PBO vs non-PBO nets, prevalence ratio at 6 m (LLINEUP, ages 2-10)", target: 0.74, band: [0.62, 0.87],
+     source: "Staedke 2020 Lancet 395:1292-1303 (LLINEUP, Uganda, 104 clusters; doi 10.1016/S0140-6736(20)30214-2)",
+     published: {lower: 0.62, upper: 0.87, level: 0.95, scale: ratio, table: "Table 2, as-treated analysis, PBO vs non-PBO LLIN, 6 months"},
+     estimand_type: risk_ratio, diagnostic: "microscopy", age_band: "2-10 years (inclusive)",
+     estimand_mapping: "the trial's ages 2-10 years include ten-year-olds (up to the 11th birthday); the engine's
+       pfpr_2_10 is 2 <= age < 10, so ten-year-olds are left out of both arms and of the setting's calibration to the
+       control arm; the PBO effect varies little between adjacent ages, so the ratio is taken to stand for the
+       trial's (an engine observable for ages 2 to 11 is a later engine version)",
+     estimand: {type: ratio, num: ug_pbo, den: ug_pyr, value: windows.m6.pfpr_2_10}}
+  - {id: B9e, metric: "PBO vs non-PBO nets, prevalence ratio at 12 m (LLINEUP, ages 2-10)", target: 0.73, band: [0.63, 0.85],
+     source: "Staedke 2020 Lancet 395:1292-1303 (LLINEUP, Uganda, 104 clusters; doi 10.1016/S0140-6736(20)30214-2)",
+     published: {lower: 0.63, upper: 0.85, level: 0.95, scale: ratio, table: "Table 2, as-treated analysis, PBO vs non-PBO LLIN, 12 months"},
+     estimand_type: risk_ratio, diagnostic: "microscopy", age_band: "2-10 years (inclusive)",
+     estimand_mapping: "the trial's ages 2-10 years include ten-year-olds (up to the 11th birthday); the engine's
+       pfpr_2_10 is 2 <= age < 10, so ten-year-olds are left out of both arms and of the setting's calibration to the
+       control arm; the PBO effect varies little between adjacent ages, so the ratio is taken to stand for the
+       trial's (an engine observable for ages 2 to 11 is a later engine version)",
+     estimand: {type: ratio, num: ug_pbo, den: ug_pyr, value: windows.m12.pfpr_2_10}}
+  - {id: B9f, metric: "PBO vs non-PBO nets, prevalence ratio at 18 m (LLINEUP, ages 2-10)", target: 0.84, band: [0.72, 0.98],
+     source: "Staedke 2020 Lancet 395:1292-1303 (LLINEUP, Uganda, 104 clusters; doi 10.1016/S0140-6736(20)30214-2)",
+     published: {lower: 0.72, upper: 0.98, level: 0.95, scale: ratio, table: "Table 2, as-treated analysis, PBO vs non-PBO LLIN, 18 months"},
+     estimand_type: risk_ratio, diagnostic: "microscopy", age_band: "2-10 years (inclusive)",
+     estimand_mapping: "the trial's ages 2-10 years include ten-year-olds (up to the 11th birthday); the engine's
+       pfpr_2_10 is 2 <= age < 10, so ten-year-olds are left out of both arms and of the setting's calibration to the
+       control arm; the PBO effect varies little between adjacent ages, so the ratio is taken to stand for the
+       trial's (an engine observable for ages 2 to 11 is a later engine version)",
+     estimand: {type: ratio, num: ug_pbo, den: ug_pyr, value: windows.m18.pfpr_2_10}}
+  # The only same-trial comparison of the two net types: Misungwi's dual-AI arm against its PBO arm, both against one
+  # pyrethroid-only control (B10 / B9c). No new arm; the band is derived (pack_trials.py or_contrast, PT3). Held out of
+  # this pack's fit; a net-effect fit target (OPTION_A);
+  # not fully independent evidence, since B10 is a fit target. Known differences the engine does not represent (Codex
+  # r1 on #266): study-net use at 24 months was higher in the chlorfenapyr arm (46.4%) than in the PBO arm (29.6%),
+  # and the arms share one simulated use; the trial measured RDT positivity, the engine reads microscopy (as for B9c
+  # and B10). A miss may reflect either, not only product efficacy.
+  - {id: B9g, metric: "Dual-AI vs PBO nets, prevalence OR at 24 m (Misungwi, derived from B10 and B9c)", target: 0.455,
+     band: [0.307, 0.674], source: "C17 Mosha 2022 Lancet 399:1227 (PMID 35339225): chlorfenapyr and PBO groups, each vs pyrethroid-only, 24 months",
+     band_override: {band: [0.307, 0.674], level: 0.95, status: derived_pending_owner_review,
+       reason: "derived: the trial publishes no direct dual-AI vs PBO interval. Target = adjusted OR 0.45 (B10) / adjusted
+         OR 0.99 (B9c), both from Table 2 against the one pyrethroid-only control; each log standard error is its
+         published 95% interval's log half-width / 1.96 (delta method). The shared control correlates the two: with
+         equal per-arm variances (equal cluster numbers per arm) the control contributes half of each variance and
+         cancels from the contrast, var = (v1 + v2) / 2. Without the covariance term the band would be 0.26-0.793"},
+     estimand_type: odds_ratio, diagnostic: "RDT", age_band: "6 months to 14 years",
+     estimand_mapping: "not represented by the engine (Codex r1-r2 on #266/#268): study-net use at 24 months was
+       higher in the chlorfenapyr arm (46.4%) than in the PBO arm (29.6%), while the two simulated arms share one use;
+       the trial measured RDT positivity, the engine reads microscopy (as for B9c and B10). A miss may reflect either,
+       not only product efficacy",
+     estimand: {type: odds_ratio, num: mis_dual, den: mis_pbo, value: windows.m24.pfpr_6m14y}}
   - {id: B10, metric: "Dual-AI vs pyrethroid nets, prevalence OR at 24 m", target: 0.45, band: [0.30, 0.67],
      source: "C17 Mosha 2022 Lancet (PMID 35339225)",
      published: {lower: 0.3, upper: 0.67, level: 0.95, scale: ratio, table: "abstract, Findings: chlorfenapyr group vs pyrethroid-only, 24 months"},
@@ -266,7 +343,10 @@ benchmarks:
      value: per_capita_all.dalys, costs_num: {nets_given: 0.380}}}
 
 # v0.2: one joint fit of the parameters no published source sets. Pyrethroid and PBO nets use the Churcher 2016
-# hut-trial coefficients, so B7, B8, B9, B9b and B9c are held out. Every benchmark not in `targets` is held out.
+# hut-trial coefficients, so B7, B8, B9, B9b, B9c and B9d-B9g are held out of this fit. Every benchmark not in
+# `targets` is held out of it. F6 option A (owner, 18 Nov, fit record (b)): the net-effect fit declares its own targets
+# (net_effect_fit.py OPTION_A: B9-B9g with B10-B12m) and writes its posterior, never fitted.yaml, so this fit and
+# fitted.yaml stay as they are; B9-B9g are then training data of the net-effect parameters, not tests of them.
 fit_joint:
   rule: joint-v1
   params: {cfp_kill: [0.0, 0.8], irs_kill: [0.0, 0.95]}

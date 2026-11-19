@@ -259,16 +259,78 @@ def _run_tree(root: str, cs: list, tmp: str, tag: str) -> dict:
     return json.load(open(op))
 
 
-def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None, context: dict | None = None) -> dict:
+def old_tree(tmp: str, old_ref: str, old_tar: str | None = None) -> str:
+    """The old code tree under tmp/old: `git archive <old_ref> toolkit`, or (F6 OA2: a shipped tree on Coiled has no
+    git) the tar of it given as `old_tar`."""
+    old_root = os.path.join(tmp, "old")
+    os.makedirs(old_root)
+    if old_tar:
+        subprocess.run(["tar", "-x", "-C", old_root, "-f", old_tar], check=True)
+    else:
+        tar = subprocess.run(["git", "archive", old_ref, "toolkit"], cwd=ROOT, check=True, capture_output=True).stdout
+        subprocess.run(["tar", "-x", "-C", old_root], input=tar, check=True)
+    return old_root
+
+
+def commits(old_ref: str, old_tar: str | None = None, old_commit: str | None = None,
+            new_commit: str | None = None) -> tuple:
+    """(old commit, new commit): from git, or all given together with --old-tar (fail closed on a partial set)."""
+    given = [old_tar, old_commit, new_commit]
+    if any(given) and not all(given):
+        raise ValueError("a proof without git needs --old-tar, --old-commit and --new-commit together")
+    if all(given):
+        return old_commit, new_commit
+    return _git("rev-parse", old_ref), _git("rev-parse", "HEAD")
+
+
+def check_settings(pack: dict, settings: list) -> list:
+    """--settings names, refused (ValueError) unless each is a pack setting (Codex review of #270: a typo removed every
+    pack case and still gave `identical: true`)."""
+    bad = sorted(set(settings) - set(pack["settings"]))
+    if bad:
+        raise ValueError(f"unknown pack settings {bad}; the pack's are {sorted(pack['settings'])}")
+    return list(settings)
+
+
+def restamp_problems(proof: dict, docs: dict, pack: dict) -> list:
+    """Why `proof` may not re-stamp the evidence `docs` ({file: stored document}): it does not pass; its case set is
+    not the full scope (every pack setting at its seeds, the evidence cases and the scenarios: a filtered proof is
+    diagnostic only); its old and new identities are equal (a self-comparison); or a file's stored engine identity is
+    not the proof's old side (Codex review of #270: the evidence advances only from the code the proof ran as old)."""
+    out = []
+    if not proof or not proof.get("identical"):
+        return ["no passing proof"]
+    want = {c["id"] for c in cases(pack, list((proof.get("scope") or {}).get("seeds") or []))}
+    have = set(proof.get("cases") or {})
+    if have != want:
+        out.append(f"the proof's cases are not the full scope (missing {sorted(want - have)[:5]}, extra "
+                   f"{sorted(have - want)[:5]}): a filtered proof is diagnostic, not a re-stamp")
+    old, new = (proof.get("old") or {}).get("identity"), (proof.get("new") or {}).get("identity")
+    if not old or old == new:
+        out.append("the proof's old and new sides are the same code (a self-comparison)")
+    ov = str((proof.get("old") or {}).get("engine_version"))
+    for f, d in docs.items():
+        d = d or {}
+        if isinstance(d.get("engine_identity"), dict):     # results, fitted: the code they are stamped for
+            code = d["engine_identity"].get("code_sha256")
+            if code != (old or {}).get("code_sha256"):
+                out.append(f"{f} is stamped for other engine code ({str(code)[:12]}) than the proof's old side "
+                           f"({str((old or {}).get('code_sha256'))[:12]})")
+        elif str(d.get("engine_version")) != ov:          # equilibration, guess sensitivity: their engine version
+            out.append(f"{f} is stamped for engine {d.get('engine_version')}, the proof's old side is {ov}")
+    return out
+
+
+def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None, context: dict | None = None,
+          old_tar: str | None = None, old_commit: str | None = None, new_commit: str | None = None) -> dict:
     pack = yaml.safe_load(open(os.path.join(HERE, "pack.yaml")))
     cs = cases(pack, seeds)
     if settings:
+        check_settings(pack, settings)
         cs = [c for c in cs if c["kind"] != "pack" or c["setting"] in settings]
+    oc, nc = commits(old_ref, old_tar, old_commit, new_commit)
     with tempfile.TemporaryDirectory() as tmp:
-        old_root = os.path.join(tmp, "old")
-        os.makedirs(old_root)
-        tar = subprocess.run(["git", "archive", old_ref, "toolkit"], cwd=ROOT, check=True, capture_output=True).stdout
-        subprocess.run(["tar", "-x", "-C", old_root], input=tar, check=True)
+        old_root = old_tree(tmp, old_ref, old_tar)
         if workers >= 2:
             with ThreadPoolExecutor(2) as ex:
                 fo = ex.submit(_run_tree, old_root, cs, tmp, "old")
@@ -276,8 +338,7 @@ def prove(old_ref: str, seeds: list, workers: int, settings: list | None = None,
                 old, new = fo.result(), fn.result()
         else:
             old, new = _run_tree(old_root, cs, tmp, "old"), _run_tree(ROOT, cs, tmp, "new")
-    return proof_doc(old_ref, _git("rev-parse", old_ref), _git("rev-parse", "HEAD"), old, new, cs, seeds,
-                     context or {})
+    return proof_doc(old_ref, oc, nc, old, new, cs, seeds, context or {})
 
 
 def proof_doc(old_ref: str, old_commit: str, new_commit: str, old: dict, new: dict, cs: list, seeds: list,
@@ -406,6 +467,11 @@ def restamp() -> int:
         print("refused: commit restamp_proof.py first (the record names the commit of the proof script)")
         return 1
     commit = _git("log", "-n", "1", "--format=%H", "--", me)
+    docs = {f: yaml.safe_load(open(os.path.join(HERE, f))) or {} for f in STAMPED}
+    why = restamp_problems(proof, docs, yaml.safe_load(open(os.path.join(HERE, "pack.yaml"))))
+    if why:
+        print("refused: " + "; ".join(why))
+        return 1
     texts = {}
     for f in STAMPED:
         p = os.path.join(HERE, f)
@@ -556,6 +622,60 @@ def _self_test() -> int:
     rec = _record({"engine_version": "0.7"}, proof, "abc")
     ok("confirms" not in rec["note"] and (rec.get("confirmation") or {}).get("validate_once") == "pending",
        f"RP12 the re-stamp record marks the Coiled confirmation run pending, not done: {rec.get('confirmation')}")
+    # F6 OA2: the proof runs on Coiled in a shipped tree without git (cloud/vm_job.py --dir): the old tree comes from a
+    # tar of `git archive <old commit> toolkit`, and both commits are given; any of the three alone is refused
+    try:
+        import io
+        import tarfile
+        with tempfile.TemporaryDirectory() as d:
+            tp = os.path.join(d, "old.tar")
+            with tarfile.open(tp, "w") as t:
+                data = b"x = 1\n"
+                ti = tarfile.TarInfo("toolkit/probe.py")
+                ti.size = len(data)
+                t.addfile(ti, io.BytesIO(data))
+            root = old_tree(d, "unused-ref", tp)
+            got = open(os.path.join(root, "toolkit", "probe.py")).read()
+            refused = []
+            for kw in ({"old_tar": tp}, {"old_tar": tp, "old_commit": "a" * 40}, {"new_commit": "b" * 40}):
+                try:
+                    commits("unused-ref", **kw)
+                except ValueError:
+                    refused.append(sorted(kw))
+            ok(got == "x = 1\n" and commits("unused-ref", tp, "a" * 40, "b" * 40) == ("a" * 40, "b" * 40)
+               and len(refused) == 3,
+               f"RP-T1 a proof without git: the old tree from --old-tar, both commits given ({refused})")
+    except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"RP-T1 a proof without git ({type(ex).__name__}: {ex})")
+    # Codex review of #270 (P1s): a restamp binds the proof to the evidence it advances (each file's stamped identity
+    # is the proof's old side), and only a full-scope proof re-stamps (every case of the pack's settings, the evidence
+    # cases and the scenarios); an unknown --settings name is refused before any run
+    try:
+        pk = yaml.safe_load(open(os.path.join(HERE, "pack.yaml")))
+        full = {c["id"] for c in cases(pk, [11])}
+        oid, nid = {"code_sha256": "old"}, {"code_sha256": "new"}
+        good = {"identical": True, "old": {"identity": oid}, "new": {"identity": nid}, "scope": {"seeds": [11]},
+                "cases": {i: {"equal": True} for i in full}}
+        good["old"]["engine_version"] = "0.17"
+        docs = {f: ({"engine_identity": oid} if i % 2 else {"engine_version": "0.17"}) for i, f in enumerate(STAMPED)}
+        part = dict(good, cases={i: v for i, v in good["cases"].items() if not i.startswith("pack:")})
+        self_cmp = dict(good, old={"identity": nid})
+        stale = dict(docs, **{STAMPED[1]: {"engine_identity": {"code_sha256": "other"}}})
+        stale_v = dict(docs, **{STAMPED[0]: {"engine_version": "0.16"}})
+        unknown = None
+        try:
+            check_settings(pk, ["mulleba"])
+        except ValueError as ex:
+            unknown = str(ex)
+        ok(restamp_problems(good, docs, pk) == [] and restamp_problems(part, docs, pk)
+           and restamp_problems(self_cmp, docs, pk) and restamp_problems(good, stale, pk)
+           and restamp_problems(good, stale_v, pk)
+           and unknown and "mulleba" in unknown and check_settings(pk, ["muleba"]) == ["muleba"],
+           f"RP-T2 a re-stamp needs a full-scope proof whose old side is the stored evidence's identity; a filtered "
+           f"proof, a self-comparison and a stale file are refused; an unknown setting is refused before a run "
+           f"({restamp_problems(part, docs, pk)[:1]}, {restamp_problems(self_cmp, docs, pk)[:1]})")
+    except Exception as ex:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"RP-T2 restamp binding ({type(ex).__name__}: {ex})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -573,14 +693,21 @@ def main(argv=None) -> int:
     ap.add_argument("--cluster-id", default="", help="where the proof runs (recorded under execution)")
     ap.add_argument("--run-id", default="", help="the run's id (recorded under execution)")
     ap.add_argument("--workspace", default="", help="the Coiled workspace (recorded under execution)")
+    ap.add_argument("--old-tar", default=None, help="tar of `git archive <old commit> toolkit` (a tree without git)")
+    ap.add_argument("--old-commit", default=None, help="with --old-tar: the old commit")
+    ap.add_argument("--new-commit", default=None, help="with --old-tar: the commit of this tree")
     a = ap.parse_args(argv)
     if a.cmd == "restamp":
         return restamp()
     ctx = {k: v for k, v in (("coiled_cluster_id", a.cluster_id), ("run_id", a.run_id),
                              ("workspace", a.workspace)) if v}
     doc = prove(a.old_ref, [int(x) for x in a.seeds.split(",")], min(a.workers, 2),
-                [x for x in a.settings.split(",") if x] or None, context=ctx)
+                [x for x in a.settings.split(",") if x] or None, context=ctx, old_tar=a.old_tar,
+                old_commit=a.old_commit, new_commit=a.new_commit)
     yaml.safe_dump(doc, open(OUT, "w"), sort_keys=False, width=110)
+    if os.environ.get("JOB_OUT"):                 # a Coiled job (cloud/vm_job.py): its stored outputs
+        yaml.safe_dump(doc, open(os.path.join(os.environ["JOB_OUT"], os.path.basename(OUT)), "w"), sort_keys=False,
+                       width=110)
     bad = [k for k, r in doc["cases"].items() if not r["equal"]]
     print(f"{doc['n_cases']} cases, identical: {doc['identical']}" + (f"; differ: {bad}" if bad else ""))
     return 0 if doc["identical"] else 1

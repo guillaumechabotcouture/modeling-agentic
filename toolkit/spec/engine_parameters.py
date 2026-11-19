@@ -1346,7 +1346,7 @@ def _self_test() -> int:
             md = signoff.sheet(d)
             ok("## Engine parameter values set by the spec" in md and "HIGH" in md and "base" in md
                and "0.4" in md and "0.6" in md and WHY in md and SRC in md
-               and md.count("HIGH") == 1,
+               and md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0].count("HIGH") == 1,
                "EP20 the sign-off sheet lists each spec value with its source and reason, and a HIGH note for the one "
                "outside the card's range")
             R = RUN.run(d, log=q, compute_kw={"max_workers": 2})
