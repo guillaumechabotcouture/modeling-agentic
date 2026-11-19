@@ -609,7 +609,27 @@ def _self_test() -> int:
         ok("DT_GOLDEN_PARTS" in buf.getvalue() and '"share": 0.5' in buf.getvalue(),
            "DG20c a mismatch prints the canonical parts of each differing record (the field that moved can be read)")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19, dg20):
+    def dg21():          # Codex review r6 of #262 (written first; each failed)
+        from toolkit.analysis import decision_tests as DTm
+        rec = _rec(question=b"see /tmp/file")
+        saved = DTm.run_one
+        _CAP.update(on=False)
+        DTm.run_one = lambda *a, **k: rec
+        try:
+            start_capture()
+            DTm.run_one()
+            got = dict(_CAP["recs"])
+        finally:
+            DTm.run_one = saved
+            _CAP.update(on=False, orig=None)
+        from toolkit.analysis.artifacts import plain
+        ok(list(got.values()) == [digest(plain(rec))], "DG21 (r6 P1-2) the capture's digest is digest(plain(rec)), once")
+        import inspect
+        src = inspect.getsource(digest_dir)
+        ok("_pinned" in src and "with _pinned(" in src,
+           "DG21b (r6 P1-1) one directory descriptor is pinned for the whole digest")
+
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19, dg20, dg21):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
