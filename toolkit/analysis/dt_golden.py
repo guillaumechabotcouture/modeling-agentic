@@ -128,20 +128,21 @@ def _plain_name(tid: str, pathmod=os.path) -> bool:
 
 
 def _tid(v):
-    """A test id as run_all names its file (f"{id}.yaml"): a string, or a number or bool in its str form; None (no
+    """A test id as run_all names its file (f"{id}.yaml"): a string, or a number, bool or YAML date in its str form; None (no
     identity) for anything else, null included (Codex r4 P2)."""
-    return v if isinstance(v, str) else str(v) if isinstance(v, (bool, int, float)) else None
+    import datetime
+    return v if isinstance(v, str) else str(v) if isinstance(v, (bool, int, float, datetime.date)) else None
 
 
-def _read(run_dir: str, rel: str, missing=StoredIncomplete):
-    """The YAML of run_dir/rel, read through one descriptor with no link followed at any component
-    (lib.safe_io.read_nofollow; Codex r4 P1: no check-then-open race)."""
+def _read(rd: str, rel: str, missing=StoredIncomplete):
+    """The YAML of rd/rel (rd: the run dir resolved once by the caller, Codex r5 P1-1), read through one descriptor
+    with no link followed at any component (lib.safe_io.read_nofollow; Codex r4 P1: no check-then-open race)."""
     import stat
     import yaml
     from toolkit.analysis.artifacts import _safe_io
-    _regular_in(run_dir, rel, missing)          # the clear message for a missing, linked or odd path
+    _regular_in(rd, rel, missing)          # the clear message for a missing, linked or odd path
     try:
-        data, st = _safe_io().read_nofollow(os.path.realpath(run_dir), rel)
+        data, st = _safe_io().read_nofollow(rd, rel)
     except FileNotFoundError as e:
         raise missing(f"{rel}: missing") from e
     except OSError as e:                         # LinkRefused included
@@ -176,8 +177,8 @@ def digest_dir(run_dir: str) -> dict:
     raises FileNotFoundError; a malformed artifact, an entry without an id or with an unknown status, a repeated id,
     a run test without its result file, a result file elsewhere than models/decision_tests/<id>.yaml or through a link,
     or a result whose test id or status differs from its entry raises StoredIncomplete."""
-    p = "analysis/decision_tests.yaml"
-    doc = _read(run_dir, p, missing=FileNotFoundError)
+    p, rd = "analysis/decision_tests.yaml", os.path.realpath(run_dir)
+    doc = _read(rd, p, missing=FileNotFoundError)
     data = doc.get("data") if isinstance(doc, dict) else None
     tests = data.get("tests") if isinstance(data, dict) else None
     if not isinstance(tests, list):
@@ -200,7 +201,7 @@ def digest_dir(run_dir: str) -> dict:
         want = f"models/decision_tests/{tid}.yaml"
         if str(t.get("path") or "").replace("\\", "/") != want:
             raise StoredIncomplete(f"{p}: test {tid}: result file {t.get('path')!r}, not {want}")
-        rec = _read(run_dir, want)
+        rec = _read(rd, want)
         if not isinstance(rec, dict) or _tid(rec.get("test_id")) != tid or rec.get("status") != st \
                 or not isinstance(rec.get("decision_changes"), bool):
             raise StoredIncomplete(f"{want}: holds {rec!r:.80}, not test {tid} with status {st} and decision_changes")
@@ -251,7 +252,7 @@ def start_capture() -> None:
     if _CAP["on"]:
         raise RuntimeError("dt_golden: capture already started")
     orig = DTm.run_one
-    _CAP.update(on=True, paused=False, orig=orig, recs={}, counts={}, problems=[])
+    _CAP.update(on=True, paused=False, orig=orig, recs={}, counts={}, problems=[], parts={})
 
     def run_one(*a, **k):
         rec = orig(*a, **k)
@@ -259,7 +260,9 @@ def start_capture() -> None:
             who, tid = _caller(), str(rec.get("test_id"))
             n = _CAP["counts"].get((who, tid), 0)
             _CAP["counts"][(who, tid)] = n + 1
-            _CAP["recs"][f"{who}:{tid}#{n}"] = digest(plain(rec))
+            pr = canon(parts(plain(rec)))
+            _CAP["recs"][f"{who}:{tid}#{n}"] = {k: _h(v) for k, v in pr.items()}
+            _CAP["parts"][f"{who}:{tid}#{n}"] = pr
             if rec.get("status") == "run" and not all("plan_sha256" in r for r in rec.get("results") or []):
                 _CAP["problems"].append(f"{who}:{tid}#{n}: a case without plan_sha256")
         return rec
@@ -312,6 +315,8 @@ def check_capture(ok, failed=()) -> None:
                                          f"record ({len(obs)} records; {err or ''} {diff[:12]})")
     if diff or err:
         print("DT_GOLDEN_OBSERVED " + json.dumps(obs, sort_keys=True))
+        bad = sorted({d_.split(": ")[0] for d_ in diff} & set(_CAP.get("parts") or {}))
+        print("DT_GOLDEN_PARTS " + json.dumps({k: _CAP["parts"][k] for k in bad}, sort_keys=True))
 
 
 # --------------------------------------------------------------------------- self-test
