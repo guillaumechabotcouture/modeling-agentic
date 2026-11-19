@@ -183,7 +183,18 @@ def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | 
 
 
 def _declared_range(spec, eng, p):
-    """The parameter's declared range: its drawn prior's, else the engine's (lo, hi); None when it has none."""
+    """The parameter's declared range: a net-effect posterior column's posterior range (its sample's hull within its
+    hard bounds, uncertainty.net_effect_sample; the card prior may be narrower than the fit's, F6 refit b), else its
+    drawn prior's, else the engine's (lo, hi); None when it has none, or when the spec's posterior cannot be loaded
+    (fail closed)."""
+    from toolkit.analysis import uncertainty as UQ
+    try:
+        ne = UQ.net_effect_sample(spec, eng)
+    except Exception:  # noqa: BLE001 -- a posterior that is refused gives no range to span
+        return None
+    if ne is not None and p in (ne.get("ranges") or {}):
+        lo, hi = ne["ranges"][p][:2]
+        return float(lo), float(hi)
     try:
         from toolkit.spec import priors as PRI
         pr = PRI.drawn(spec).get(p)
