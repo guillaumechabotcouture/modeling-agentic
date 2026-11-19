@@ -1885,10 +1885,32 @@ def _self_test_posterior_point(ok):
         p6 = DT.prerun_evidence(s6)["point"]
         ok((p6["eff_a"], p6["eff_b"]) == (0.41, 0.27) and p6 == JC.theta0(s6),
            f"RPP6 the pre-run evidence the sign-off checks read has the same point as the analysis: {p6}")
-        # Codex r1 P1-2: an interaction_rescale test's arm ratios are not computed at the chosen point: not run
-        ia = DT.interaction_arms(s6, s6.engine(), "T1")
-        ok("not_run" in ia and "chosen point" in ia["not_run"],
-           f"RPP9 an interaction test's arm ratios are not run with a posterior (not at its chosen point): {ia}")
+    # Codex r1 P1-2: an interaction_rescale test reads arm ratios computed at the chosen point by the harness step
+    # (analysis/benchmarks_at_spec_values), and is not run without them or with arms computed at another point
+    from toolkit.spec import engine_parameters as PV
+    with tempfile.TemporaryDirectory() as d:
+        bench = _toy_bench(d)[0]
+        p9 = schema.toy_spec(d, n=12, bench=bench)
+        r9 = yaml.safe_load(open(p9))
+        NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p9).engine(), [
+            {k: x[k] for k in ("eff_a", "eff_b")} for x in rows], {"eff_a": [0, 1], "eff_b": [0, 1]},
+            point={"eff_a": 0.41, "eff_b": 0.27})
+        r9["uncertainty"]["net_effect_posterior"] = {
+            "path": "nef.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()}
+        yaml.safe_dump(r9, open(p9, "w"), sort_keys=False)
+        s9 = schema.load(p9)
+        before = DT.interaction_arms(s9, s9.engine(), "T2")
+        PV.write_spec_benchmarks(d, _toy_pack())
+        rec = json.load(open(os.path.join(d, PV.SPEC_BENCH_RECORD)))
+        after = DT.interaction_arms(s9, s9.engine(), "T2")
+        rec_point = rec.get("posterior_point")
+        rec["posterior_point"] = {"eff_a": 0.5, "eff_b": 0.3}           # arms recorded at another point
+        json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
+        other = DT.interaction_arms(s9, s9.engine(), "T2")
+        ok("not_run" in before and rec_point == {"eff_a": 0.41, "eff_b": 0.27} and "arm" in after
+           and PV.SPEC_BENCH in after["src"] and "chosen point" in other.get("not_run", ""),
+           f"RPP9 with a posterior an interaction test runs on arms the harness step computed at the chosen point, and "
+           f"is not run without them or on arms from another point: {before} | {after.get('src')} | {other}")
     # Codex r1 P1-5: the conflict tolerance is the fit's 6-decimal rounding, whatever the value's magnitude
     import types
     from toolkit.analysis import uncertainty as UQ
