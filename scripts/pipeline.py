@@ -103,6 +103,7 @@ REPORT = os.path.join("models", "pipeline_report.json")
 # so a progress write there would change a running batch's fingerprint and discard its rows on resume.
 PROGRESS = "pipeline_progress.json"
 _RUN_ID = None           # the current run()'s id (MA_PIPELINE_RUN in its steps)
+_PROGRESS_DOC: dict = {}  # (run dir, run id) -> PROGRESS as this process last wrote it
 # The runner's own records: written by the harness run only (protected in
 # agents/enforcement.py SCRIPT_OUTPUTS).
 OWN_FILES = ("models/pipeline_state.json", "models/pipeline_state.json.tmp",
@@ -341,8 +342,8 @@ def load(run_dir: str) -> tuple[list[dict], list[str]]:
         if not st["outputs"]:
             errs.append(f"{where}: declares no outputs")
         if "timeout_s" in st and (not isinstance(st["timeout_s"], (int, float)) or isinstance(st["timeout_s"], bool)
-                                  or st["timeout_s"] <= 0):
-            errs.append(f"{where}: `timeout_s` must be a positive number")
+                                  or not 0 < st["timeout_s"] < float("inf")):    # NaN fails too (Codex on #267)
+            errs.append(f"{where}: `timeout_s` must be a positive finite number")
         if "purpose" in st and (not isinstance(st["purpose"], str) or not st["purpose"].strip()):
             errs.append(f"{where}: `purpose` must be a non-empty string")
         fn = _compute_fn(st)
@@ -618,6 +619,8 @@ def fingerprint(step: dict, run_dir: str) -> dict:
         if not m:
             missing.append(pat)
         for rel in m:
+            if rel == PROGRESS:           # the runner rewrites it while the step runs (Codex on #267): never an input
+                continue
             ins[rel] = _sha(os.path.join(run_dir, rel))
     code = {_rel(p, run_dir): _sha(p) for p in code_files(step, run_dir)}
     key = hashlib.sha256(json.dumps({"spec": spec, "inputs": ins, "code": code}, sort_keys=True).encode()).hexdigest()
@@ -740,23 +743,31 @@ def backstop_s(soft_s: float) -> float:
 def _communicate(p, timeout_s, soft_s=None, on_overrun=None):
     """p.communicate() to `timeout_s` (raises TimeoutExpired there). With `soft_s` and `on_overrun`, it calls
     on_overrun(elapsed) once the soft deadline passes and every PROGRESS_EVERY_S after, the process running on."""
-    t0 = time.time()
+    t0 = time.monotonic()
     if soft_s is None or on_overrun is None or soft_s >= timeout_s:
         return p.communicate(timeout=timeout_s)
     nxt = soft_s
     while True:
         try:
-            return p.communicate(timeout=max(0.01, min(nxt, timeout_s) - (time.time() - t0)))
+            return p.communicate(timeout=max(0.01, min(nxt, timeout_s) - (time.monotonic() - t0)))
         except subprocess.TimeoutExpired:
-            el = time.time() - t0
+            el = time.monotonic() - t0
             if el >= timeout_s:
                 raise
             if el >= nxt:
                 try:
                     on_overrun(el)
                 except Exception as e:  # noqa: BLE001 -- a warning that fails never stops the step
-                    print(f"[pipeline] progress record failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                    _warn(f"[pipeline] progress record failed: {type(e).__name__}: {e}")
                 nxt = el + PROGRESS_EVERY_S
+
+
+def _warn(msg: str) -> None:
+    """A line on stderr; a stderr that cannot be written (a closed pipe) is ignored (Codex on #267)."""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None):
@@ -765,7 +776,16 @@ def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None
     p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                          text=True, env=env, start_new_session=True, shell=shell)
     try:
-        _out, err = _communicate(p, timeout_s, soft_s, on_overrun)
+        try:
+            _out, err = _communicate(p, timeout_s, soft_s, on_overrun)
+        except subprocess.TimeoutExpired:
+            raise
+        except BaseException:
+            try:                    # anything else escaping the wait: the step's group never outlives it
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            raise
         # Review #4: a process the step left in the background (`cmd &`) would keep
         # writing declared outputs after the step is recorded and its grant ends.
         try:
@@ -886,18 +906,15 @@ def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_s
              f"{BACKSTOP_FLOOR_S / 3600:g} h), within any pipeline budget",
              "projected_total_s": round(proj, 1) if proj is not None else None, "projection_basis": basis,
              "projected_past_backstop": (proj > hard_s) if proj is not None else None}
-    try:
-        doc = json.load(open(os.path.join(run_dir, PROGRESS)))
-        doc = doc if isinstance(doc, dict) and isinstance(doc.get("steps"), dict) else {"steps": {}}
-    except (OSError, ValueError):
-        doc = {"steps": {}}
+    # Kept in memory for this pipeline run and only ever replaced on disk, never read back (Codex on #267: a FIFO at
+    # the path would block the deadline loop, and an edited entry would be republished as the harness's).
+    doc = _PROGRESS_DOC.setdefault((run_dir, _RUN_ID), {"pipeline_run": _RUN_ID, "steps": {}})
     doc["steps"][step["id"]] = entry
     _write_json(run_dir, PROGRESS, doc)
     if state == "running":
-        print(f"[pipeline] WARNING step {step['id']}: running {_dur(el)}, past its soft deadline of {_dur(soft_s)}; "
+        _warn(f"[pipeline] WARNING step {step['id']}: running {_dur(el)}, past its soft deadline of {_dur(soft_s)}; "
               f"it runs on, killed only at its backstop of {_dur(hard_s)} ({entry['backstop_at']})"
-              + (f"; projected total {_dur(proj)} ({basis})" if proj is not None else "; no projection yet"),
-              file=sys.stderr, flush=True)
+              + (f"; projected total {_dur(proj)} ({basis})" if proj is not None else "; no projection yet"))
 
 
 def _dur(s: float) -> str:
@@ -1000,10 +1017,6 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
         if over:
             row["over_soft_deadline"] = True
             row["soft_deadline_s"], row["backstop_s"] = soft_s, timeout_s
-            try:
-                _progress_record(run_dir, step, soft_s, timeout_s, s0, None, last, "ok" if rc == 0 else "failed")
-            except Exception:  # noqa: BLE001 -- the record is a report, never the step's outcome
-                pass
         after = _snapshot(step, run_dir)
         row["written"] = sorted(r for r, m in after.items() if r not in keep or before.get(r) != m)
         row["removed"] = sorted(set(row["removed"]) - set(after))
@@ -1025,6 +1038,12 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
             now = set(_snapshot(step, run_dir))
             row["removed"] = sorted((set(before) | set(row["written"])) - now)
             row["written"] = sorted((set(row["written"]) & now) - set(row["restored"]))
+        if over:              # the final state once its outputs are checked (Codex on #267: never `ok` for a rollback)
+            try:
+                _progress_record(run_dir, step, soft_s, timeout_s, s0, row["seconds"], last,
+                                 "ok" if row["ok"] else "failed")
+            except Exception:  # noqa: BLE001 -- the record is a report, never the step's outcome
+                pass
         return row
     finally:
         shutil.rmtree(aside, ignore_errors=True)
@@ -2132,6 +2151,59 @@ def _self_test() -> int:
             _progress_record(d, {"id": "z", "run": "x"}, 1.0, 3.0, time.time(), 2.0, None, "running")
             ok(_compute.code_fingerprint(d, "models/a.py::f") == fp0,
                "PL15e writing the progress record does not change a batch's code fingerprint")
+            # PL15f-i (Codex re-review of #267, round 2, 4 P1):
+            # f: a step whose inputs glob matches the progress record ("*.json") still finishes ok past its deadline.
+            w(d, "models/g.py", "import time\ntime.sleep(1.8)\nopen('models/g.out', 'w').write('g')\n")
+            w(d, "cfg.json", "{}")
+            spec(d, three + [{"id": "g", "run": f"{py} models/g.py", "inputs": ["*.json"], "outputs": ["models/g.out"],
+                              "timeout_s": 1}])
+            rep = run(d)
+            rg = next((r for r in rep["steps"] if r["id"] == "g"), {})
+            ok(rg.get("status") == "ok" and rg.get("over_soft_deadline"),
+               f"PL15f a step whose inputs match the progress record finishes past its soft deadline: {rg}")
+            spec(d, three)
+            # g: a broken stderr (the warning cannot be printed) never escapes the runner: the step finishes.
+            import io
+            class _Broken(io.StringIO):
+                def write(self, *a):
+                    raise BrokenPipeError(32, "Broken pipe")
+            w(d, "models/a.py", "import time\ntime.sleep(1.8)\nopen('models/a.out', 'w').write('5')\n")
+            spec(d, [dict(three[0], timeout_s=1)] + three[1:])
+            real_err = sys.stderr
+            sys.stderr = _Broken()
+            try:
+                rep = run(d)
+                r0, esc = (rep["steps"][0] if rep["steps"] else {}), None
+            except BaseException as e:  # noqa: BLE001
+                r0, esc = {}, e
+            finally:
+                sys.stderr = real_err
+            ok(esc is None and r0.get("status") == "ok",
+               f"PL15g a warning that cannot be written (broken stderr) never escapes; the step finishes: {esc!r} {r0}")
+            # h: a FIFO planted at the progress path never blocks the runner (it is never read, only replaced).
+            if hasattr(os, "mkfifo"):
+                try:
+                    os.remove(os.path.join(d, PROGRESS))
+                except OSError:
+                    pass
+                os.mkfifo(os.path.join(d, PROGRESS))
+                w(d, "models/a.py", "import time\ntime.sleep(1.8)\nopen('models/a.out', 'w').write('6')\n")
+                t1 = time.time()
+                import threading
+                box = {}
+                th = threading.Thread(target=lambda: box.update(rep=run(d)), daemon=True)
+                th.start()
+                th.join(20)
+                ok(not th.is_alive() and (box.get("rep") or {}).get("steps", [{}])[0].get("status") == "ok",
+                   f"PL15h a FIFO at the progress path does not block the runner ({time.time() - t1:.0f}s, {box})")
+            # i: a timeout_s that is not finite is a validation error (a NaN backstop would never be reached).
+            spec(d, [dict(three[0], timeout_s=float("nan"))] + three[1:])
+            errs_nan = load(d)[1]
+            spec(d, [dict(three[0], timeout_s=float("inf"))] + three[1:])
+            errs_inf = load(d)[1]
+            ok(any("timeout_s" in e for e in errs_nan) and any("timeout_s" in e for e in errs_inf),
+               f"PL15i a NaN or infinite timeout_s is refused: {errs_nan} {errs_inf}")
+            spec(d, [dict(three[0], timeout_s=1)] + three[1:])
             # PL15: past the backstop it is killed, and reads as a timeout (stage_machine.resumable_failure).
             w(d, "models/a.py", "import time\ntime.sleep(30)\n")
             t1 = time.time()
