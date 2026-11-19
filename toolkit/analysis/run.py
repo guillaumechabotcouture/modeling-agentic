@@ -1775,7 +1775,7 @@ def _self_test_posterior_ranges(ok, q):
         u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
         rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
         NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(), rows,
-                                 {"eff_a": [0, 1], "eff_b": [0, 1]})
+                                 {"eff_a": [0, 1], "eff_b": [0, 1]}, point={"eff_a": 0.433, "eff_b": 0.288})
         hull = {k: [min(r[k] for r in rows), max(r[k] for r in rows)] for k in ("eff_a", "eff_b")}
         sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
         r = yaml.safe_load(open(p))
@@ -1803,7 +1803,7 @@ def _self_test_posterior_ranges(ok, q):
         ok(hull["eff_a"][0] <= s["ci_low"] < s["ci_high"] <= hull["eff_a"][1],
            f"RNP2 the draws of a posterior column stay inside its hull: {s}")
         ok(man["engine"].get("point_source") == {"eff_a": "posterior_chosen_point", "eff_b": "posterior_chosen_point"}
-           and man["engine"].get("posterior_point") == rows[0],
+           and man["engine"].get("posterior_point") == {"eff_a": 0.433, "eff_b": 0.288},
            f"RNP3 (v2-posterior-point) the manifest records each posterior column's point source and the fit's chosen "
            f"point: {man['engine'].get('point_source')} {man['engine'].get('posterior_point')}")
     _self_test_posterior_point(ok)
@@ -1885,6 +1885,48 @@ def _self_test_posterior_point(ok):
         p6 = DT.prerun_evidence(s6)["point"]
         ok((p6["eff_a"], p6["eff_b"]) == (0.41, 0.27) and p6 == JC.theta0(s6),
            f"RPP6 the pre-run evidence the sign-off checks read has the same point as the analysis: {p6}")
+        # Codex r1 P1-2: an interaction_rescale test's arm ratios are not computed at the chosen point: not run
+        ia = DT.interaction_arms(s6, s6.engine(), "T1")
+        ok("not_run" in ia and "chosen point" in ia["not_run"],
+           f"RPP9 an interaction test's arm ratios are not run with a posterior (not at its chosen point): {ia}")
+    # Codex r1 P1-5: the conflict tolerance is the fit's 6-decimal rounding, whatever the value's magnitude
+    import types
+    from toolkit.analysis import uncertainty as UQ
+    big = types.SimpleNamespace(raw={"engine_parameters": {"h": {"value": 1000.0004}}})
+    try:
+        UQ.posterior_point(big, {"point": {"h": 1000.0}}, {})
+        w7 = "accepted"
+    except ValueError as e:
+        w7 = str(e)
+    ok("chosen point" in w7, f"RPP7 a spec value 4e-4 from a chosen point of 1000 is refused: {w7[:120]}")
+    # Codex r1 P1-6: a declared but empty net_effect_posterior is refused, never read as no posterior
+    with tempfile.TemporaryDirectory() as d:
+        s8 = setup(d, posterior=False)
+        s8.raw["uncertainty"]["net_effect_posterior"] = None
+        a8, j8 = both(s8)
+        ok(all(isinstance(x, str) and "net_effect_posterior" in x for x in (a8, j8)),
+           f"RPP8 an empty uncertainty.net_effect_posterior is refused: {str(a8)[:120]}")
+    # Codex r1 P1-4: a chosen point that differs from the fit's recorded parameter values is refused
+    with tempfile.TemporaryDirectory() as d:
+        s10 = setup(d)
+        f10 = os.path.join(d, "nef.yaml")
+        doc = yaml.safe_load(open(f10))
+        doc["parameters"]["eff_a"]["value"] = 0.45
+        yaml.safe_dump(doc, open(f10, "w"), sort_keys=False)
+        r10 = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+        r10["uncertainty"]["net_effect_posterior"]["sha256"] = hashlib.sha256(open(f10, "rb").read()).hexdigest()
+        yaml.safe_dump(r10, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+        a10, _ = both(schema.load(os.path.join(d, "decision_spec.yaml")))
+        ok(isinstance(a10, str) and "parameters" in a10 and "eff_a" in a10,
+           f"RPP10 a chosen point that differs from the fit's recorded parameter values is refused: {str(a10)[:160]}")
+    # Codex r1 P1-1: the likelihood and posterior calibrations build engine parameters without theta0, so they could
+    # not run at the chosen point: refused with a posterior rather than run at engine defaults
+    with tempfile.TemporaryDirectory() as d:
+        s11 = setup(d)
+        s11.raw["calibration"]["method"] = "likelihood"
+        a11, j11 = both(s11)
+        ok(all(isinstance(x, str) and "calibration.method" in x for x in (a11, j11)),
+           f"RPP11 a posterior with a likelihood calibration is refused: {str(a11)[:140]}")
 
 
 def _self_test_test_ranges(ok, q):

@@ -977,8 +977,9 @@ def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = 
     if point is not False:
         ch["point"] = dict(rows[0] if point is None else point)
     reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], ch)
+    fit = {"parameters": {k: {"value": v} for k, v in ch.get("point", {}).items()}}     # as run()'s **fit
     yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []},
-                            fit_rule={"seeds": pack_seeds()}), open(path, "w"), sort_keys=False)
+                            fit_rule={"seeds": pack_seeds()}, **fit), open(path, "w"), sort_keys=False)
 
 
 class PosteriorRefused(ValueError):

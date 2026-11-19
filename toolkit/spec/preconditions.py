@@ -373,8 +373,9 @@ def _self_test_posterior(ok) -> None:
     rows_hi = rows
     with tempfile.TemporaryDirectory() as d:
         rows[:] = [{"eff_a": round(0.55 + 0.15 * x, 6), "eff_b": r["eff_b"]} for x, r in zip(u, rows_hi)]
-        # eff_a's hull 0.55-0.70 leaves the fit's chosen point 0.5, the run's point value (v2-posterior-point), outside
-        run_dir(d, point={"eff_a": 0.5, "eff_b": rows[0]["eff_b"]})
+        # eff_a's hull 0.55-0.70 leaves the fit's chosen point 0.52 (not the fitted 0.5), the run's point value
+        # (v2-posterior-point), outside
+        run_dir(d, point={"eff_a": 0.52, "eff_b": rows[0]["eff_b"]})
         got = problems(d, None, None)
         ok(any("point value" in g and "eff_a" in g for g in got),
            f"PC17 a run whose point value of a posterior column is outside its range is refused: {got[:1]}")
