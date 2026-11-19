@@ -49,7 +49,8 @@ class Tasks(Protocol):
     def critique(self, run_dir: str, reviewer: str, round_n: int, feedback: list | None = None) -> TaskResult: ...
     def plan_fixes(self, packet: dict) -> TaskResult: ...
     def fix(self, task: dict, run_dir: str, evidence: dict | None) -> TaskResult: ...
-    def write(self, run_dir: str, mode: str, feedback: list | None = None) -> TaskResult: ...
+    def write(self, run_dir: str, mode: str, feedback: list | None = None,
+              findings: list | None = None) -> TaskResult: ...
 
 
 def _sio():
@@ -186,7 +187,8 @@ class StubTasks:
                 done.append(fid)
         return self._r(f"fix:{task['id']}", note=f"edited for {done}" if done else "no scripted edit")
 
-    def write(self, run_dir, mode, feedback=None):
+    def write(self, run_dir, mode, feedback=None, findings=None):
+        self.write_findings = list(findings or [])       # the write-up findings the machine passed (F6 run 3)
         A = {}
         try:
             A = json.load(open(os.path.join(run_dir, "analysis", "analysis.json")))
