@@ -558,6 +558,27 @@ Corrections from deriving the register by hand on R4, F5 and FLU (2026-11-18):
 - What is specific to some runs: only `findings`, `uncertainty_excluded` and `decision_tests`
   exist on FLU. The model is unchanged; absent sources are absent from `by_source`.
 
+Settled while the register's fixtures and tests were written (2026-11-18):
+
+- The clean fixture's spec has no departure, limitation or assumption comment; those lines are a
+  planted variant. A comment line counts when it holds a capitalised marker followed by a colon.
+- A scope declaration that names no existing finding keeps its row and makes
+  `register.undisposed` a `problem`: a declaration of nothing is a contradiction.
+- Older-run sources override an open finding; a finding the owner declined stays open.
+- A finding raised by a harness check is `science` when a science source merges into it.
+- `by_source` and every register check count science rows only.
+- A finding's `first_visible_stage` is the ledger's own stage field for it.
+- A lead-signed declaration keeps its disposition; the `signed_by` column and a note say who.
+- Tables added: `by_disposition` (`disposition, rows`) for the chart, and `notes` (`at, row,
+  disposition, derived_disposition, statement, note`) for the owner's notes beside the derived
+  values. A note that adds a row gets the id `note:<n>` in order of writing; in a `same_as` note
+  the row named first survives. A malformed note line makes a check `register.notes` a
+  `problem` and is shown, never dropped.
+- A tested row whose test did not run is `problem`; with the decision tests file missing, the
+  checks that need it are `not_available`.
+- With no verified signed spec, rows that rest on the spec are shown open and
+  `register.undisposed` is `problem`.
+
 `decides`: yes when a linked decision test's verdict is CHANGES_PLAN, no when every linked test
 is NO_CHANGE, else unknown. `first_visible_stage`: a finding's `target_stage`; for other sources
 the stage that writes the source file (sign-off for the spec, sheet and dossier; engine choice;
@@ -598,6 +619,7 @@ path, waits for the F6 report. The workbench shows the gap in the view until the
 | H9 | The launch tree pushed or recorded (base commit and pull requests added) | C9 |
 | H10 | The engine choice's hash in the analysis headers | Model |
 | H12 | The comparison figure's spec diff (`toolkit/analysis/figures.py` `spec_differences`) misses spec sections: for F6 run 3 against run 4 it named only decision tests, while the signed specs also differ in `analysis.outcome_adjustments`, which is what doubled the headline | C6 |
+| H13 | A harness-written file in the analysis folder that is outside the manifest and records no spec hash (`analysis/benchmarks_at_spec_values.yaml`), so nothing ties it to the signed spec | Steps |
 
 ## 8. The catch-early scorecard
 
@@ -691,7 +713,8 @@ Contracts the layers share:
   or more significant digits in any tracked workbench file or in this file also appears in the
   named runs' analysis files or inputs. `--range <base>..<head>` scans the added lines of every
   commit to be pushed, so a value removed by a later commit is still caught; reviewed chance
-  matches are listed with a reason in `tools/workbench/leak_allow.txt`.
+  matches are listed with a reason in `tools/workbench/leak_allow.txt`, each for one file and
+  one exact value.
 - **Acceptance file.** `<keep>/workbench/acceptance/<view>_<run name>.yaml`: a list of `{path, equals |
   approx, source}`, where `path` addresses the endpoint's JSON (for example
   `facts.region_accepted`) and `source` is the run file and key the value came from. Written in
@@ -769,6 +792,18 @@ The questions as they were put:
   Candidate checks not yet specified: targets matched by an equal number of free parameters
   (FLU: five targets, five free ratios, so they do not test fit); best point far from the
   posterior median along a ridge (DEN).
+- 2026-11-18, loop iteration 2, steps 2 and 3: register fixtures (17 defects, four of them
+  contradictions or missing pieces) and 56 failing cases written by a fresh agent, who checked
+  them against a scratch derivation and 22 mutants. Acceptance re-derived under the corrected
+  rules; science rows open: 34 of 47 on R4, 9 of 17 on F5, 16 of 19 on FLU (plus 13 process
+  rows, all open).
+- 2026-11-18, second Codex round on the review fixes: 8 more P1. Seven are being fixed test
+  first (a scope declaration excusing a flagged change with no verified spec; the unit allowance
+  excusing conflicting units; an artifact with no spec hash dropping out of the check; the leak
+  check joining CSV fields, missing leading-dot decimals, an allow entry excusing a different
+  number, and a git setting emptying the commit scan; hash and parse from one read). The eighth,
+  a race while files are replaced during a read, is answered by stating the limit: the workbench
+  does not defend against run files changing while it reads them.
 - 2026-11-18, loop step 6 (external review by Codex of the first three pull requests): 14 P1 and
   1 P2, none judged wrong. Each was reproduced with a failing test and fixed: seven fail-open
   cases in the Fit and Steps checks (rules now in §3), three weaknesses in the leak check, four
