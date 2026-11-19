@@ -302,7 +302,7 @@ def _joint():
         "figure_data": {"names": list(PARAMS), "prior": {p: {**prior[p], "point": BEST[p]} for p in PARAMS},
                         "cutoff": CUTOFF, "fit": fit,
                         "waves": [{k: wave[k] for k in ("wave", "share_of_prior", "accepted", "candidates", "ranges")}]},
-        "status": "ok", "blocked": False, "blocks": [], "cutoff": CUTOFF, "shared": prior,
+        "status": "matched", "blocked": False, "blocks": [], "cutoff": CUTOFF, "shared": prior,
         "unit_parameter": {"name": "u0", "lo": UNIT_LO, "hi": UNIT_HI, "scale": "log"},
         "region": region, "best": {"theta": dict(BEST), "z": best_z, "score": 1.9},
         "units": units, "unmatched": [], "conflicting": [], "n_units": len(UNITS), "n_matched": len(UNITS),
@@ -333,7 +333,7 @@ def _joint():
         "figures": {"figures": [], "not_produced": []},
         "sensitivity": [{"id": "sd_015", "label": "sd 0.15 on the round 2 unit target",
                          "targets": {"unit_r2": {"sd": 0.15}},
-                         "report": {"method": "history_matching", "status": "ok", "blocked": False, "blocks": [],
+                         "report": {"method": "history_matching", "status": "matched", "blocked": False, "blocks": [],
                                     "cutoff": CUTOFF, "region": {**_region(), "accepted": 410, "share_of_prior": 0.14},
                                     "n_units": len(UNITS), "n_matched": len(UNITS)}}],
         "sample": {"sample_id": hashlib.sha256(b"fixture sample").hexdigest(), "names": names,
@@ -373,7 +373,7 @@ def _posterior():
                             "observation": "per-source (calibration.sources)", "evaluation": "run_batch",
                             "loglik_at_mode": -41.2, "start_search_refusals": 0, "fit": fit,
                             "sampler": "adaptive_metropolis", "chains": 4, "warmup": 400, "draws_per_chain": 800,
-                            "rhat_max": 1.004, "ess_bulk_min": 910.0, "acceptance": 0.24, "doublings": 0},
+                            "rhat_max": 1.0, "ess_bulk_min": 910.0, "acceptance": 0.24, "doublings": 0},
             "identifiability": {"method": "Fisher information of the likelihood at its maximum; contraction "
                                           "1 - var_post/var_prior on each prior's own scale",
                                 "classes": {p: "identified" for p in PARAMS},
@@ -991,7 +991,7 @@ def _self_test():
         at_bound = sum(bool(u["region_touches_bound"]) for u in jc_doc["units"].values())
         ok("X9 the clean history-matching run sits clear of every threshold and its near-miss band",
            max(zs) < 0.75 * Z_MAX and max(gaps) < 0.75 and at_bound / len(UNITS) < 0.75 * 0.25
-           and jc_doc["status"] == "ok" and not jc_doc["blocks"]
+           and jc_doc["status"] == "matched" and not jc_doc["blocks"]
            and all(v["runs"] > 1 for v in jc_doc["verification"]["units"].values())
            and all(PRIOR[p][0] < lo and hi < PRIOR[p][1] for p, (lo, hi) in jc_doc["region"]["ranges"].items()))
         ok("X10 every defect entry names its case, check, status, methods and one-sentence edit",
