@@ -283,6 +283,26 @@ def golden_read(text: str) -> dict:
     return {f"{fn}:{k}": dict(zip(PARTS, v.split("."))) for fn, r in json.loads(text).items() for k, v in r.items()}
 
 
+def platform_line() -> dict:
+    """The CPU and BLAS this process computes on (a golden mismatch across machines is read against it)."""
+    import platform
+    out = {"machine": platform.machine(), "python": platform.python_version()}
+    try:
+        info = open("/proc/cpuinfo").read()
+        out["cpu"] = next((ln.split(":", 1)[1].strip() for ln in info.splitlines() if ln.startswith("model name")), None)
+        flags = next((ln for ln in info.splitlines() if ln.startswith("flags")), "")
+        out["avx512f"], out["avx2"] = " avx512f" in flags, " avx2" in flags
+    except OSError:
+        out["cpu"] = platform.processor()
+    try:
+        from threadpoolctl import threadpool_info
+        out["blas"] = [{k: x.get(k) for k in ("internal_api", "version", "architecture", "num_threads")}
+                       for x in threadpool_info()]
+    except Exception:  # noqa: BLE001 -- optional
+        out["blas"] = None
+    return out
+
+
 def check_capture(ok, failed=()) -> None:
     """Stop capturing and compare the records with GOLDEN. MA_DT_GOLDEN_UPDATE=1 rewrites it instead, only when no
     earlier case of the self-test failed (a partial capture never becomes the baseline)."""
@@ -311,6 +331,7 @@ def check_capture(ok, failed=()) -> None:
     else:
         err = None
     diff = compare(exp, obs)
+    print("DT_GOLDEN_PLATFORM " + json.dumps(platform_line(), sort_keys=True))
     ok(obs and not diff and err is None, f"DG-R1 every decision-test record of this self-test matches its golden "
                                          f"record ({len(obs)} records; {err or ''} {diff[:12]})")
     if diff or err:
