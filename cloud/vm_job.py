@@ -39,7 +39,7 @@ were lost. Coiled counts `idle_timeout` from cluster start, not from the first t
 is no setting for "only after work"), so an `up` with no `start` behind it is wasted.
 `up`, `start`, `status`, `wait` and `down` remain for interactive use; `up` warns.
 
-    python cloud/vm_job.py up <name> [--cpu 4] [--memory "16 GiB"] [--idle-timeout "20 minutes"]
+    python cloud/vm_job.py up <name> [--cpu 4] [--memory "16 GiB"] [--worker-vm-type T] [--idle-timeout "20 minutes"]
     python cloud/vm_job.py start <name> <job_id> [--tree PATH | --dir PATH] [--max-hours 24]
                                   [--setup-sdk] [--anthropic-key] -- <command ...>
     python cloud/vm_job.py status <name> <job_id>          # state + log tail; saves outputs locally
@@ -420,6 +420,14 @@ def _vm_request(a) -> dict:
         import budget
         try:
             workers, note = budget.resolve_vm_types(a.cpu, a.memory)
+            one = getattr(a, "worker_vm_type", None)
+            if one:                     # one VM type, so one CPU family for the whole batch (F6 rerun prep)
+                tab = budget.vm_table()
+                if one not in tab:
+                    raise budget.BudgetError(f"--worker-vm-type {one} has no price in cloud/vm_prices.yaml")
+                if tab[one]["vcpu"] != int(a.cpu):
+                    raise budget.BudgetError(f"--worker-vm-type {one} has {tab[one]['vcpu']} vCPUs, not --cpu {a.cpu}")
+                workers, note = [one], None
             a._vm = {"worker_vm_types": workers, "scheduler_vm_types": budget.scheduler_vm_types()}
         except budget.BudgetError as e:
             raise SystemExit(f"{a.name}: refusing before any cluster is created: {e}") from None
@@ -1585,6 +1593,45 @@ def _self_test_vm_types(ok) -> None:
                f"cpu/memory request Coiled could resolve to an unpriced type): cpu/memory {bad}, pinned {pinned}")
         case("VT5", vt5)
 
+        def vt6():
+            # F6 rerun prep (2026-11-18): decision-test outputs differed across machines in CI. --cpu/--memory give a
+            # list across VM families (Standard_D8_v5 and Standard_D8as_v5 here: Intel and AMD); --worker-vm-type
+            # pins exactly one priced type, and refuses an unpriced one or one whose vCPUs differ from --cpu.
+            def one(t, cpu=8):
+                made, msg = [], None
+                a = types.SimpleNamespace(name="lw-smoke-vt", cpu=cpu, memory="32 GiB", idle_timeout="10 minutes",
+                                          workers=1, budget_scope="f6", cap_usd=1.0, worker_vm_type=t)
+
+                class FakeCluster:
+                    def __init__(self, **kw):
+                        made.append(kw)
+
+                    def get_client(self):
+                        return types.SimpleNamespace(wait_for_workers=lambda n, timeout=None: None)
+                with mock.patch.dict(sys.modules, {"coiled": types.SimpleNamespace(Cluster=FakeCluster)}), \
+                        mock.patch.object(budget, "PRICES_FILE", nof8), \
+                        mock.patch.dict(globals(), {"_budget_gate": lambda *x, **k: None}), \
+                        mock.patch.object(rc, "cluster_states", lambda n: []), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        cmd_up(a)
+                    except SystemExit as e:
+                        msg = str(e.code)
+                return made, msg
+            made, msg = one(None)
+            ok(msg is None and len((made[0] if made else {}).get("worker_vm_types") or []) == 2,
+               f"VT6a without --worker-vm-type the request resolves to every matching priced type: {made} {msg}")
+            made, msg = one("Standard_D8_v5")
+            ok(msg is None and made and made[0].get("worker_vm_types") == ["Standard_D8_v5"],
+               f"VT6b --worker-vm-type pins the workers to exactly that type: {made} {msg}")
+            made, msg = one("Standard_F8s_v2")
+            ok(not made and msg and "vm_prices.yaml" in msg, f"VT6c an unpriced --worker-vm-type is refused before any "
+               f"cluster: {msg}")
+            made, msg = one("Standard_D2_v5")
+            ok(not made and msg and "8" in msg and "2" in msg,
+               f"VT6d a --worker-vm-type whose vCPUs differ from --cpu is refused: {msg}")
+        case("VT6", vt6)
+
 
 def _self_test_run(ok, real_gate=None) -> None:
     """RN: `run` brings the cluster up, submits at once, waits with status lines, then stops it. On 2026-11-03 an
@@ -2435,6 +2482,9 @@ def main(argv=None) -> int:
         p.add_argument("--memory", default="16 GiB")
         p.add_argument("--idle-timeout", default="20 minutes")
         p.add_argument("--workers", type=int, default=1, help="workers of the one cluster (one scheduler for all)")
+        p.add_argument("--worker-vm-type", default=None,
+                       help="exactly this priced VM type for every worker (one CPU family), instead of every priced "
+                            "type matching --cpu/--memory; its vCPUs must equal --cpu")
 
     def start_args(p):
         p.add_argument("job_id")
