@@ -429,6 +429,57 @@ ok("P40 reader 7: an image of one pixel, or of one colour throughout, is said to
   const one = load(1, 1, [0, 0, 0, 0]), blank = load(640, 480, new Array(64).fill(255)), fine = load(640, 480, [255, 255, 255, 255, 0, 0, 0, 255]);
   return (/1 pixel/.test(one) && /pics\/a\.png/.test(one) && /one colour/.test(blank) && fine === "") || JSON.stringify([one, blank, fine]);
 });
+// ---- the timeline kind, shaded periods (bands) and side-by-side panels of lines (workbench.py's docstring)
+const events = {events: {columns: ["id", "block", "lane", "sort", "from", "to", "n"], rows: [
+  [0, "G1", "A", "past", 2020.5, null, 4], [1, "G1", "A", "now", 2026.25, null, 2], [2, "G1", "B", "now", 2026.5, null, 1], [3, "G1", "B", "now", 2026.5, null, 3],
+  [4, "G2", "A", "later", 2028.5, 2029.0, 4], [5, "G2", "A", "<b>odd</b>", 2027.0, null, null], [6, "G2", "B", "now", null, null, 1]]}};
+const timeline = {kind: "timeline", table: "events", x: "from", high: "to", y: "lane", group: "block", mark: "sort", size: "n", title: "T", how_to_read: "H",
+  bands: [{low: 2026, high: 2029, label: "the window"}, {low: 2026, high: 2028, label: "the period"}], limits: [{value: 2028, label: "period ends"}]};
+const cls = (n, word) => String(n.attrs.class || "").split(" ").includes(word);
+ok("P41 a timeline draws a dot per event at a point and a bar per event that lasts, in a block per group and a line per value of y, against one axis; "
+  + "a row with no time is left out; marks at one place are set apart; the legend names each value of the mark column, as text", () => {
+  const fig = page.chartView(timeline, events, "r1"), dots = fig.all("circle").filter(n => cls(n, "event")), bars = fig.all("rect").filter(n => cls(n, "lasting"));
+  if (dots.length !== 5 || bars.length !== 1) return `${dots.length} dots and ${bars.length} bars`;
+  const text = fig.textContent, names = fig.all("text").map(n => n.textContent);
+  if (!["block: G1", "block: G2"].every(w => names.includes(w)) || names.filter(w => w === "A").length !== 2 || names.filter(w => w === "B").length !== 1) return `blocks and lines: ${names.join(" | ")}`;
+  if (!["sort: past", "sort: now", "sort: later", "sort: <b>odd</b>"].every(w => text.includes(w)) || fig.all("b").length) return `legend: ${text}`;
+  const same = dots.filter(n => n.attrs.cx === dots[2].attrs.cx).map(n => n.attrs.cy);
+  if (same.length !== 2 || same[0] === same[1] || !/1 mark shares its place/.test(text)) return `two events at one place are drawn at ${same}`;
+  const x = n => Number(n.attrs.cx), radius = n => Number(n.attrs.r);
+  if (!(x(dots[0]) < x(dots[1]) && x(dots[1]) < x(dots[2])) || !(radius(dots[0]) > radius(dots[1])) || !/a larger mark: more n/.test(text)) return "time runs left to right and a larger value is a larger mark";
+  const hits = fig.all("circle").filter(n => cls(n, "hit")).length + fig.all("rect").filter(n => cls(n, "hit")).length;
+  return hits === 6 || `${hits} marks answer to the pointer`;
+});
+ok("P42 bands are shaded periods on the time axis, each named in the legend with its ends; limits are lines on that axis; a timeline with neither draws without them; "
+  + "a block with no name has no heading", () => {
+  const fig = page.chartView(timeline, events, "r1"), shaded = fig.all("rect").filter(n => cls(n, "span") && Number(n.attrs.height) > 12);
+  if (shaded.length !== 2 || !(Number(shaded[0].attrs.width) > Number(shaded[1].attrs.width))) return `${shaded.length} shaded periods`;
+  if (!fig.textContent.includes("the window (2026 to 2029)") || !fig.textContent.includes("the period (2026 to 2028)") || !fig.all("text").some(n => n.textContent === "period ends")) return fig.textContent;
+  const {bands, limits, group, ...bare} = timeline, one = {events: {...events.events, rows: events.events.rows.slice(0, 2).map(r => r.map((v, i) => (i === 1 ? "" : v)))}};
+  const plain = page.chartView({...bare, group: "block"}, one, "r1");
+  if (plain.all("rect").some(n => cls(n, "span")) || plain.textContent.includes("block:")) return `drawn with no bands: ${plain.textContent}`;
+  return page.chartView({...timeline, x: "absent"}, events, "r1").textContent.includes('no column "absent"') || "a column the table lacks is not said";
+});
+const series = {series: {columns: ["panel", "arm", "t", "v"], rows: ["P1", "P2", "P3"].flatMap((p, k) => ["a", "b"].flatMap(arm =>
+  Array.from({length: 60}, (_, i) => [p, arm, 2024 + i / 12, (k + 1) * (arm === "a" ? 1 : 0.8) * (1 + 0.1 * Math.sin(i))])))}};
+ok("P43 lines with panels: every panel is drawn, small and side by side on one x axis, each with its heading; one legend; the band is shaded in each; "
+  + "a long series is its line with a pointer target per point; a chart with no panels is unchanged", () => {
+  const decl = {kind: "lines", table: "series", x: "t", y: "v", group: "arm", panels: "panel", title: "T", how_to_read: "H", bands: [{low: 2025, high: 2026, label: "the period"}]};
+  const fig = page.chartView(decl, series, "r1"), charts = fig.all("svg").filter(n => cls(n, "chart"));
+  if (charts.length !== 3 || !charts.every(n => cls(n, "small")) || fig.all("select").length) return `${charts.length} panels drawn`;
+  if (fig.all("h4").map(n => n.textContent).join("|") !== "panel: P1|panel: P2|panel: P3") return fig.all("h4").map(n => n.textContent).join("|");
+  if (fig.all("div").filter(n => cls(n, "legend")).length !== 1 || !fig.textContent.includes("arm: a") || !fig.textContent.includes("the period (2025 to 2026)")) return `legend: ${fig.textContent.slice(0, 300)}`;
+  if (!charts.every(n => n.all("rect").filter(r => cls(r, "span")).length === 1 && n.all("path").filter(q => cls(q, "line")).length === 2)) return "each panel: one shaded period, two lines";
+  const hits = charts[0].all("circle").filter(n => cls(n, "hit")).length, dots = charts[0].all("circle").filter(n => !cls(n, "hit")).length;
+  if (hits !== 120 || dots !== 0) return `${hits} pointer targets and ${dots} dots in a panel of 120 points`;
+  const whole = page.chartView({...decl, panels: undefined, where: {panel: "P1"}}, series, "r1");
+  return (whole.all("svg").filter(n => cls(n, "chart") && !cls(n, "small")).length === 1) || "a chart with no panels is not drawn at full size";
+});
+ok("P44 a number under ten thousand takes no separator, with or without a fraction (a decimal year reads as one); a larger one keeps them", () => {
+  const t = {t: {columns: ["x", "y"], rows: [[2031.5, 5e4 + 1 / 2], [2033.4167, 1500], [2024, 5 / 8]]}};
+  const text = page.renderView({checks: [], facts: {end: 2031.5}, tables: t, charts: [], notes: {}}, "r1", "v").flat(Infinity).filter(n => n instanceof Node).map(n => n.textContent).join(" | ");
+  return (["2031.5", "2033.42", "2024", ["50", "000.5"].join(","), "1500", "0.625"].every(w => text.includes(w)) && !text.includes("2,0")) || text;
+});
 (async () => {
   await later("P20 an image that cannot be loaded is replaced by a sentence naming the file, then by the server's reason; never a broken picture", async () => {
     const asked = [];

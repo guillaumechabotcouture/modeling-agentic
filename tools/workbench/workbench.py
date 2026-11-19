@@ -30,7 +30,8 @@ it (with &against=<run id>, the view compared with that other run: `choose`, bel
     {kind, table, title, how_to_read, x, y, low, high, group, model, model_alt, scale ("log" or absent), ...}
     bars             x: the label column, y: the value column
     lines            x and y: number columns; group: one line per value. With model, y is drawn as points and the
-                     model column as the line; with low and high, a band is drawn between them
+                     model column as the line; with low and high, a band is drawn between them. With panels, the
+                     panels are drawn side by side, small, on one time (x) axis and each on its own value axis
     interval_points  x: the label column; y with low and high: the observed value and its interval; model: the
                      model's value; model_alt: a second model value (hollow mark); group: rows are gathered under
                      each value
@@ -38,6 +39,12 @@ it (with &against=<run id>, the view compared with that other run: `choose`, bel
                      inside it; y: a point (each row is drawn on its own wide range, on a log scale where the
                      wide range spans a factor of 100 or more above zero, and the row says so; a point or a narrow
                      range that lies outside the wide range is drawn where it is, past the end of the wide range)
+    timeline         one row per event against one time axis. x: when the event starts (a number); high: when it ends
+                     (a row with one is drawn as a bar from x to high, a row without as a dot at x); group: rows are
+                     gathered into one block per value; y: within a block, one line of marks per value; mark: the
+                     column whose value gives each mark its colour, listed in the legend; size: a number column, a
+                     larger mark for a larger value (against the largest of its block). limits here are lines on
+                     the time axis. Marks at one place on a line are set one above the other
     graph            table holds one row per link, x: the column a link comes from, y: the column it goes to;
                      nodes: the table with one row per node (first column its name); group: the column, in both
                      tables, whose value marks a node or link (same, changed, missing, outside)
@@ -46,7 +53,10 @@ Keys any kind but graph takes:
     panels           a column: one chart per value of it, each on its own axis; when the panels together hold more
                      rows than fit a page, the reader picks one panel at a time
     labels           {column: words}: what a column's mark is called in the legend and on the axis (with its unit)
-    limits           [{value, label}]: reference lines on the value axis (bars, interval_points, lines)
+    limits           [{value, label}]: reference lines on the value axis (bars, interval_points, lines) or on the
+                     time axis (timeline)
+    bands            [{low, high, label}]: shaded periods along the x axis of a lines chart or the time axis of a
+                     timeline, each named in the legend (later bands are drawn over earlier ones)
 Any kind also takes:
     image            {path, hash, title, caption}: the harness figure of the same data, shown beside the chart (§3)
                      through the file endpoint below; path is the image's place in the run folder and hash its sha256;
@@ -183,9 +193,9 @@ PATH = [("overview", "Overview", "G1"), ("spec", "Spec and evidence", "G6"), ("m
         ("spend", "Spend", "G9")]
 VIEW_FNS = {}                # name -> view function, filled on first use; a test may put one here
 KEYS = {"checks": list, "facts": dict, "tables": dict, "charts": list, "notes": dict}
-CHART_KINDS = ("interval_points", "ranges", "bars", "lines", "graph")
-CHART_COLUMNS = ("x", "y", "low", "high", "group", "model", "model_alt", "outer_low", "outer_high", "panels")
-CHART_KEYS = ("kind", "table", "title", "how_to_read", *CHART_COLUMNS, "nodes", "scale", "where", "labels", "limits", "image", "after")
+CHART_KINDS = ("interval_points", "ranges", "bars", "lines", "timeline", "graph")
+CHART_COLUMNS = ("x", "y", "low", "high", "group", "model", "model_alt", "outer_low", "outer_high", "panels", "mark", "size")
+CHART_KEYS = ("kind", "table", "title", "how_to_read", *CHART_COLUMNS, "nodes", "scale", "where", "labels", "limits", "bands", "image", "after")
 IMAGE_KEYS = ("table", "path", "hash", "title", "caption", "group", "details", "flag", "reason", "after")     # a view's `images` declaration
 CHART_IMAGE_KEYS = ("path", "hash", "title", "caption")                           # a chart's `image`
 CHOOSE_KEYS = ("param", "label", "options")                                       # a view's `choose`
@@ -272,6 +282,9 @@ def chart_problems(result):
         if not all(isinstance(m, dict) and isinstance(m.get("value"), (int, float)) and m.get("label")
                    for m in ch.get("limits") or []):
             out.append(f"{name}: limits are not a list of {{value, label}}")
+        if not all(isinstance(m, dict) and all(isinstance(m.get(k), (int, float)) and not isinstance(m.get(k), bool) for k in ("low", "high"))
+                   and m["low"] <= m["high"] and m.get("label") for m in ch.get("bands") or []):
+            out.append(f"{name}: bands are not a list of {{low, high, label}}")
         im = ch.get("image")
         if im is not None and not (isinstance(im, dict) and set(im) <= set(CHART_IMAGE_KEYS) and isinstance(im.get("path"), str)
                                    and checks.digest(im.get("hash"))):
@@ -387,6 +400,10 @@ def _view_module(name):
         from views import register as m
     elif name == "outcomes":
         from views import outcomes as m
+    elif name == "spec":
+        from views import spec as m
+    elif name == "scenarios":
+        from views import scenarios as m
     else:
         return None
     return m
@@ -1296,8 +1313,8 @@ def _self_test():
            and hist[2]["minutes"] == 60.0, str(hist))
         path = {p["view"]: p for p in table(over["tables"]["views"])}
         ok("W6 the overview lists views not built yet with the goal that builds them, and each view's worst status",
-           (path["spec"]["status"], path["spec"]["goal"]) == ("not_built", "G6") and path["steps"]["status"] == "problem"
-           and "Spec and evidence (goal G6)" in over["notes"]["not_built"], str(path))
+           (path["world"]["status"], path["world"]["goal"]) == ("not_built", "G10") and path["steps"]["status"] == "problem"
+           and "World model (goal G10)" in over["notes"]["not_built"], str(path))
 
         w("decision_spec.yaml", "question: toy, redrafted after signing\n")
         r = Run(d)
@@ -1361,8 +1378,8 @@ def _self_test():
                    for c in doc["charts"]) and cols[doc["charts"][0]["nodes"]][0] == "file", str(doc["charts"]))
         ok("W19 an unknown view is a 404; a view that is not built says so with its goal, and is not a 500",
            wb.handle("GET", f"/api/view?run={rid}&view=nope", "localhost")[0] == 404
-           and wb.api_view(rid, "spec")["checks"][0]["status"] == "not_available"
-           and "goal G6" in wb.api_view(rid, "spec")["checks"][0]["says"])
+           and wb.api_view(rid, "world")["checks"][0]["status"] == "not_available"
+           and "goal G10" in wb.api_view(rid, "world")["checks"][0]["says"])
         global _view_module
         real, in_folder = _view_module, [n for n, _, _ in PATH if os.path.exists(os.path.join(HERE, "views", f"{n}.py"))]
 
@@ -1371,7 +1388,7 @@ def _self_test():
         try:
             listed = [n for n, _, _ in PATH if real(n) is not None]
             _view_module = broken
-            why, c = load_view("spec")[1], wb.api_view(rid, "spec")["checks"][0]
+            why, c = load_view("world")[1], wb.api_view(rid, "world")["checks"][0]
         finally:
             _view_module = real
         ok("W19b the view registry is a list of import statements that names every view module in views/ and no other; "
