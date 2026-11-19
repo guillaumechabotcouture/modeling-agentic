@@ -164,6 +164,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     ne = UQ_.net_effect_sample(spec, eng)   # f6-posterior-ranges: loaded, verified; its hull sets its columns' ranges
     if ne is not None:                      # before any artifact: the manifest and every artifact record where from
         info["net_effect_posterior_ranges"] = UQ_.posterior_range_record(ne)
+        # v2-posterior-point: each posterior column's point value is the fit's verified chosen point
+        info["point_source"], info["posterior_point"] = UQ_.point_source(ne), dict(ne["point"])
     card = eng.describe()
     arts = {}
     # Codex r2 P1-7: the files the engine reads (benchmark results, fitted values) are inputs of what uses them
@@ -1858,7 +1860,7 @@ def _self_test_posterior_point(ok):
     with tempfile.TemporaryDirectory() as d:
         a1, j1 = both(setup(d))
         ok(isinstance(a1, dict) and isinstance(j1, dict) and (a1["eff_a"], a1["eff_b"]) == (0.41, 0.27)
-           and a1 == j1 and a1["synergy"] == 0.0,
+           and a1 == j1,
            f"RPP2 with a posterior every posterior column's point value is the fit's chosen point, in the analysis and "
            f"the joint calibration alike: {a1} {j1}")
     with tempfile.TemporaryDirectory() as d:
@@ -1878,6 +1880,11 @@ def _self_test_posterior_point(ok):
         a4, j4 = both(setup(d, point=False))
         ok(all(isinstance(x, str) and "chosen point" in x for x in (a4, j4)),
            f"RPP5 a posterior file without a verified chosen point fails closed: {str(a4)[:160]} | {str(j4)[:80]}")
+    with tempfile.TemporaryDirectory() as d:     # the sign-off precondition's pre-run point (decision_tests)
+        s6 = setup(d)
+        p6 = DT.prerun_evidence(s6)["point"]
+        ok((p6["eff_a"], p6["eff_b"]) == (0.41, 0.27) and p6 == JC.theta0(s6),
+           f"RPP6 the pre-run evidence the sign-off checks read has the same point as the analysis: {p6}")
 
 
 def _self_test_test_ranges(ok, q):

@@ -105,8 +105,46 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
     ne = NEF.load_posterior(post["path"], eng, varied, post["sha256"], post["data"])
     ne["margin"] = post["margin"]
     ne["ranges"] = NEF.posterior_ranges(ne, post["margin"], NEF.hard_bounds(eng, ne["names"]))
+    ne["point"] = chosen_point(post, ne["names"])
     spec._net_effect_sample = (key, ne)
     return ne
+
+
+def chosen_point(post: dict, names) -> dict:
+    """{column: value} of the fit's verified chosen point (joint_region.verified.chosen.point in the signed bytes that
+    load_posterior replayed): the point value of every posterior column (v2-posterior-point). A file without one, or
+    with a column missing or not a finite number, is refused (fail closed; no fallback to card or fitted values)."""
+    import yaml
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    doc = yaml.safe_load(post["data"])
+    pt = ((((doc.get("joint_region") or {}).get("verified") or {}).get("chosen") or {}).get("point"))
+    if not isinstance(pt, dict) or any(isinstance(pt.get(k), bool) or not isinstance(pt.get(k), (int, float))
+                                       or not np.isfinite(pt[k]) for k in names):
+        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: no verified chosen point with a finite value "
+                                   f"for each of {list(names)} (joint_region.verified.chosen.point: {pt!r})")
+    return {k: float(pt[k]) for k in names}
+
+
+def posterior_point(spec, ne: dict | None, theta: dict) -> dict:
+    """`theta` with every posterior column at the fit's chosen point (core.Analysis.theta0, joint_calibration.theta0).
+    A spec engine_parameters value of a column that differs from it (beyond 1e-6 x max(1, |value|), the fit file's
+    6-decimal rounding) is refused. `theta` unchanged without a posterior."""
+    if ne is None:
+        return theta
+    from toolkit.spec import engine_parameters as PV
+    sv = PV.values(spec)
+    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv and abs(sv[k] - v) > 1e-6 * max(1.0, abs(v))}
+    if bad:
+        raise ValueError("engine_parameters: " + "; ".join(
+            f"{k} is set to {a}, but the net-effect posterior's verified chosen point is {b}; the chosen point is the "
+            f"point value of a posterior column: set the spec value to it or remove the value" for k, (a, b) in
+            sorted(bad.items())))
+    return dict(theta, **ne["point"])
+
+
+def point_source(ne: dict | None) -> dict:
+    """The manifest's record of where each posterior column's point value came from ({} without a posterior)."""
+    return {k: "posterior_chosen_point" for k in (ne or {}).get("point", {})}
 
 
 def with_posterior_ranges(ne: dict | None, fitted: dict, priors: dict | None = None) -> tuple:

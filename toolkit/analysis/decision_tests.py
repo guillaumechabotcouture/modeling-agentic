@@ -244,8 +244,9 @@ def prerun_evidence(spec) -> dict:
     dr = {k: fr[k] for k in names + pnames}
     box = {k: (float(v[0]), float(v[1])) for k, v in fr.items()} if kind == "emulator" else None
     fbox = design_features_box(spec) if kind == "emulator" else None
-    return {"kind": kind, "box": box, "features_box": fbox, "point": PV.params(spec, {k: v[2] for k, v in dr.items()}),
-            "packages": spec.packages(), "engine": eng}
+    from toolkit.analysis import uncertainty as UQ       # v2-posterior-point: posterior columns at the chosen point
+    point = UQ.posterior_point(spec, UQ.net_effect_sample(spec, eng), PV.params(spec, {k: v[2] for k, v in dr.items()}))
+    return {"kind": kind, "box": box, "features_box": fbox, "point": point, "packages": spec.packages(), "engine": eng}
 
 
 def interaction_arms(spec, eng, bench) -> dict:
