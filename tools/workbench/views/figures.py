@@ -17,14 +17,20 @@ The rules, with each place §5.12 is silent marked "assumed":
  A2  tables.figures has the fourteen columns of §5.12 and then `view` (settled). `sources` and `used_in` are joined
      with ", " in recorded order (used_in in the order report.md, manuscript.md, results.md, report_render.json), and
      used_in is "" for a figure no text names (assumed). A column the producer does not record is null. For a figure
-     not produced, path, table, fresh and in_manifest are null, sources is "" and a text names it when it holds
-     figures/<figure>.png or that file name (assumed).
+     not produced, path, table, fresh and in_manifest are null and sources is "". A text names a figure, produced or
+     not, when it holds the file name of any form the producer writes for it (FORMS): toolkit/analysis/figures.py
+     _save() publishes `os.path.join(out_dir, f"{name}.png")` and `os.path.join(out_dir, f"{name}.svg")`, and
+     render() writes its table, `os.path.join(dest, f"{name}.csv")`; the index entry's own path, svg and table
+     count too. The provenance record (`png + ".provenance.json"`) is no form of the figure.
  A3  `fresh` is the worst state of the figure's recorded sources: missing, changed, not_recorded, same, in that
      order (assumed order; the words are settled). A figure with no readable provenance record, or a record that
      holds no source, is not_recorded.
  A4  tables.sources (id, figure, source, recorded, now, state) has one row per recorded source hash and per
-     `presentation` entry of each figure's provenance record; `now` for the spec is the hash of the verified signed
-     copy. With no verified signed copy the spec's `now` is null and its state is `missing` when the signed copy
+     `presentation` entry of each figure's provenance record, and per source the index lists for the figure that
+     the record holds no hash for (recorded null, state not_recorded: a source with no recorded hash is never a
+     match, §3). A file the record names more than once has one row, with the worst state of its entries and that
+     entry's hash: every entry is held against the file, not the first alone. `now` for the spec is the hash of the
+     verified signed copy. With no verified signed copy the spec's `now` is null and its state is `missing` when the signed copy
      cannot be read and `not_recorded` when the sign-off record does not hold its hash (assumed).
  A5  figures.figure_fresh: `problem` when a source changed or is missing; `not_available` when a figure's
      provenance record is missing or cannot be parsed, or holds no valid hash for a source, and nothing is stale;
@@ -37,7 +43,10 @@ The rules, with each place §5.12 is silent marked "assumed":
      or the manifest's hash for it is not the file's (a missing file is never a match).
  A9  `images` is a list beside checks, facts, tables, charts and notes; its one entry names tables.images, which
      starts with the five settled columns (figure, path, sha256, title, caption) and has one row per produced figure
-     whose image could be read, with the hash of the image as read. Assumed, so that the page can show each figure
+     whose image could be read, with the hash of the image as read. From the walkthrough (§12): a figure with no
+     image (not produced, or produced with an image that cannot be read) has a row too, in the set's order, with
+     path and sha256 null and `reason` saying why, so the page shows a card for it in its tier; the entry names
+     `flag` (fresh: an image whose sources changed is shown first, with a button that goes to it) and `reason`. Assumed, so that the page can show each figure
      under its tier with what the reader needs beside it: the table goes on with tier, shows, sources, fresh,
      used_in and view, and the entry names them (`group`: the column images are gathered under; `details`: the
      columns listed under each image).
@@ -64,16 +73,18 @@ COLUMNS = {
     "figures": ["figure", "tier", "group", "title", "caption", "shows", "produced", "reason", "path", "table", "sources",
                 "fresh", "in_manifest", "used_in", "view"],
     "sources": ["id", "figure", "source", "recorded", "now", "state"],
-    "images": ["figure", "path", "sha256", "title", "caption", "tier", "shows", "sources", "fresh", "used_in", "view"],
+    "images": ["figure", "path", "sha256", "title", "caption", "tier", "shows", "sources", "fresh", "used_in", "view", "reason"],
     "not_produced": ["figure", "tier", "reason", "used_in", "view"],
 }
 CHECKS = ("figure_fresh", "figure_missing", "figure_unused", "figure_in_manifest")
-TITLES = {"figure_fresh": "Each figure's sources still have the hashes it was drawn from",
-          "figure_missing": "Every figure of the set was produced, with its image",
-          "figure_unused": "Every decision figure is named by a report",
-          "figure_in_manifest": "Every figure's image is in the analysis manifest with its hash"}
+# A title names what is compared, not the outcome, so it reads the same beside ok and beside a problem.
+TITLES = {"figure_fresh": "The sources of the figures against their recorded hashes",
+          "figure_missing": "Figures of the set not produced, or with no image in the run",
+          "figure_unused": "Decision figures against the texts that name them",
+          "figure_in_manifest": "Figure images against the analysis manifest"}
 IMAGES = {"table": "images", "path": "path", "hash": "sha256", "title": "title", "caption": "caption", "group": "tier",
-          "details": ["shows", "sources", "fresh", "used_in", "view"]}
+          "details": ["shows", "sources", "fresh", "used_in", "view"], "flag": "fresh", "reason": "reason"}
+FORMS = (".png", ".svg", ".csv")      # toolkit/analysis/figures.py: _save() writes <name>.png and <name>.svg, render() <name>.csv
 TEXTS = ("report.md", "manuscript.md", "results.md", "report_render.json")
 REPORTS = TEXTS[:2]                                    # with neither, no figure can be said to be unused (§5.12)
 INDEX, MANIFEST, SCHEMA = "analysis/figures.yaml", "analysis/manifest.json", "analysis.figures/1"
@@ -91,13 +102,13 @@ def _text(x):
 
 
 def _standard(e):
-    return {"figure": _text(e.get("figure")), **{k: _text(e.get(k)) for k in ("tier", "group", "title", "caption", "shows", "path", "table")},
+    return {"figure": _text(e.get("figure")), **{k: _text(e.get(k)) for k in ("tier", "group", "title", "caption", "shows", "path", "table", "svg")},
             "sources": e.get("sources")}
 
 
 def _estimates(e):      # toolkit/analysis/estimates.py _fig(): id, path, svg, sources, tier and nothing else
     return {"figure": _text(e.get("id")), "tier": _text(e.get("tier")), "group": None, "title": None, "caption": None, "shows": None,
-            "path": _text(e.get("path")), "table": None, "sources": e.get("sources")}
+            "path": _text(e.get("path")), "table": None, "svg": _text(e.get("svg")), "sources": e.get("sources")}
 
 
 ADAPTERS = {"toolkit/analysis/figures.py": (_standard, "the standard figure set"),
@@ -139,9 +150,11 @@ def _signed(run):
                                                                  "finding, and makes no figure stale." if differs else ""))
 
 
-def _record(run, name, path, signed, spec_state):
+def _record(run, name, path, signed, spec_state, listed=()):
     """The rows of tables.sources for one figure from its provenance record, or (None, why) when the record cannot be
-    read as {source_hashes: {file: hash}, presentation: [{path, sha256}]}."""
+    read as {source_hashes: {file: hash}, presentation: [{path, sha256}]}. `listed`: the sources the figure index
+    gives for the figure; one the record holds no hash for is a row with no recorded hash. A file with several
+    entries gets the worst state of them all."""
     rel = f"{path}.provenance.json"
     rec, why = run.json(rel)
     if rec is None:
@@ -149,17 +162,15 @@ def _record(run, name, path, signed, spec_state):
     hashes, shown = rec.get("source_hashes"), rec.get("presentation", [])
     if not isinstance(hashes, dict) or not isinstance(shown, list) or not all(isinstance(p, dict) and _text(p.get("path")) for p in shown):
         return None, f"{rel} does not hold source_hashes as a mapping and presentation as a list of files"
-    rows, seen = [], set()
+    rows, held = [], {}
     for src, recorded in list(hashes.items()) + [(p["path"], p.get("sha256")) for p in shown]:
-        src = str(src)
-        if src in seen:
-            continue
-        seen.add(src)
-        if src == SPEC:      # §5.12: against the verified signed copy, never the file on disk
-            now, state = signed, spec_state or checks.hash_state(recorded, signed)
-        else:
-            now = run.sha(src)
-            state = checks.hash_state(recorded, now)
+        held.setdefault(str(src), []).append(recorded)
+    for src in listed:
+        held.setdefault(src, [None])         # the index lists it and the record holds no hash for it
+    for src, entries in held.items():
+        now = signed if src == SPEC else run.sha(src)      # §5.12: the spec against the verified signed copy, never the file on disk
+        states = [(spec_state if src == SPEC and spec_state else checks.hash_state(recorded, now), recorded) for recorded in entries]
+        state, recorded = min(states, key=lambda x: WORST.index(x[0]))
         rows.append([f"{name}|{src}", name, src, recorded if isinstance(recorded, str) else None, now, state])
     return rows, (None if rows else f"{rel} records no source")
 
@@ -215,7 +226,8 @@ def view(run):
         e, m = produced.get(name), absent.get(name, {})
         tier = (e or {}).get("tier") or _text(m.get("tier")) or tier_of.get(name)
         group, path = (e or {}).get("group"), (e or {}).get("path")
-        file_name = re.escape(os.path.basename(path or f"figures/{name}.png"))
+        forms = {f"{name}{end}" for end in FORMS} | {os.path.basename(x) for x in (path, (e or {}).get("svg"), (e or {}).get("table")) if x}
+        file_name = "(?:" + "|".join(re.escape(f) for f in sorted(forms)) + ")"
         used = ", ".join(rel for rel, text in texts.items() if re.search(rf"(?<![\w.-]){file_name}(?!\w|\.\w)", text))
         where = beside(name, tier, group)
         fresh = in_manifest = image = None
@@ -226,7 +238,7 @@ def view(run):
             image = run.sha(path)
             if image is None:
                 no_image.append([name, path, run.read(path, 1)[1]])
-            got, why = _record(run, name, path, signed, spec_state)
+            got, why = _record(run, name, path, signed, spec_state, [s for s in e["sources"] if isinstance(s, str)] if isinstance(e.get("sources"), list) else ())
             sources += got or []
             states = [r[5] for r in got or []]
             fresh = next((w for w in WORST if w in states), "not_recorded")
@@ -240,7 +252,12 @@ def view(run):
                 if not in_manifest:
                     outside.append([name, path, "not listed" if rec is None else "listed with another hash, or with none, or the image is missing"])
             if image is not None:
-                images.append([name, path, image, e["title"], e["caption"], tier, e["shows"], srcs, fresh, used, where])
+                images.append([name, path, image, e["title"], e["caption"], tier, e["shows"], srcs, fresh, used, where, None])
+            else:
+                images.append([name, None, None, e["title"], e["caption"], tier, e["shows"], srcs, fresh, used, where,
+                               f"the index lists it as produced, but its image cannot be shown ({no_image[-1][2]})"])
+        elif not e:
+            images.append([name, None, None, None, None, tier, None, None, None, used or None, where, _text(m.get("reason")) or "the index gives no reason"])
         rows.append([name, tier, group, (e or {}).get("title"), (e or {}).get("caption"), (e or {}).get("shows"), e is not None,
                      None if e else _text(m.get("reason")), path, (e or {}).get("table"), srcs, fresh, in_manifest, used, where])
 
@@ -334,7 +351,8 @@ def view(run):
                                                  "those columns are empty.")
     notes = {"producer": f"{INDEX} was written by {producer}: {set_name}.{recorded_no} Tier names are the run's own.",
              "spec": spec_says,
-             "used": "A figure is used when a text (" + ", ".join(TEXTS) + ") holds its path or its file name; a bare figure name is an "
+             "used": "A figure is used when a text (" + ", ".join(TEXTS) + ") holds the path or the file name of its image, its vector "
+                     "copy or its table (" + ", ".join("<figure>" + end for end in FORMS) + "); a bare figure name is an "
                      "ordinary word and does not count. Texts in this run: " + (", ".join(texts) or "none") + ".",
              "view": "The view column names the view each figure belongs beside: spec (data coverage and unit attributes), model "
                      "(parameters, design coverage, sensitivity), fit (calibration figures, validation and diagnostics), scenarios "
@@ -350,17 +368,19 @@ def view(run):
                          "rows": [[r[0], r[i_tier], r[col["reason"]], r[col["used_in"]], r[i_view]] for r in not_made],
                          "about": f"The figures of the set that were not produced, each with the harness's reason ({INDEX} data.not_produced). "
                                   "used_in names a text that relies on one all the same."},
-        "sources": {"columns": COLUMNS["sources"], "rows": sources,
+        "sources": {"columns": COLUMNS["sources"], "rows": sorted(sources, key=lambda r: r[5] == "same"),      # stable: what differs first
                     "about": "One row per file a figure was drawn from (its provenance record's source_hashes, then its presentation "
-                             "entries): the hash recorded when the figure was drawn, the hash now, and the state. For the spec, now is "
-                             "the verified signed copy's hash."},
+                             "entries, then any source the index lists that the record holds no hash for): the hash recorded when the "
+                             "figure was drawn, the hash now, and the state. The rows whose state is not `same` come first. For the "
+                             "spec, now is the verified signed copy's hash."},
         "figures": {"columns": COLUMNS["figures"], "rows": rows, "wrap": ["caption"],
                     "about": f"One row per figure of the set, by tier in the run's order ({INDEX}). fresh is the worst state of its "
                              "sources; in_manifest says whether the manifest holds its image with the file's hash; used_in names the "
                              "texts that hold its path or file name; view is the view it belongs beside."},
         "images": {"columns": COLUMNS["images"], "rows": images,
-                   "about": "One row per produced figure whose image could be read, with the hash of the image as read: the page asks "
-                            "the server for exactly these bytes."}}
+                   "about": "One row per figure of the set, in its order. A produced figure whose image could be read has the hash of "
+                            "the image as read: the page asks the server for exactly these bytes. A figure with no image has no "
+                            "path and no hash, and reason says why."}}
     return {"checks": [fresh_check, missing_check, unused_check, manifest_check], "facts": facts, "tables": tables, "charts": [],
             "notes": notes, "images": [dict(IMAGES)]}
 
@@ -521,11 +541,11 @@ def _self_test():
             d = folder(method, figures=figures)
             v = look_at(d)
             need(v.get("images") == [IMAGES] and COLUMNS["images"][:5] == ["figure", "path", "sha256", "title", "caption"]
-                 and set(IMAGES) - {"group", "details"} == {"table", "path", "hash", "title", "caption"}
-                 and all(c in COLUMNS["images"] for c in [IMAGES["group"]] + IMAGES["details"]),
+                 and set(IMAGES) - {"group", "details", "flag", "reason"} == {"table", "path", "hash", "title", "caption"}
+                 and all(c in COLUMNS["images"] for c in [IMAGES["group"], IMAGES["flag"], IMAGES["reason"]] + IMAGES["details"]),
                  f"{label}: images is one declaration over tables.images, whose first five columns are the settled ones (got {v.get('images')!r})")
             got, shown = table(v, "images"), [r for r in table(v, "figures") if r["produced"]]
-            need([r["path"] for r in got] == [r["path"] for r in shown], f"{label}: one row per produced figure")
+            need([r["path"] for r in got] == [r["path"] for r in shown], f"{label}: one row per produced figure (the clean run has every image)")
             need(all(r["sha256"] == sha(d, r["path"]) for r in got), f"{label}: each with the hash of its image as read")
             need(all(all(r[k] == s[k] for k in COLUMNS["images"][3:]) for r, s in zip(got, shown)),
                  f"{label}: and the figure's own title, caption, tier, sources, freshness, use and view")
@@ -586,7 +606,7 @@ def _self_test():
         need(statuses(v)["figure_unused"] == "ok" and row(v, "figures", "figure", "frontier")["used_in"] == "results.md", "the file name alone, in the results text, counts")
         v = look_at(edited(hm, rejson("report_render.json", lambda doc: doc.update(figures=["figures/frontier.png"])), defect=base))
         need(statuses(v)["figure_unused"] == "ok" and row(v, "figures", "figure", "frontier")["used_in"] == "report_render.json", "so does the render record")
-        v = look_at(edited(hm, retext("manuscript.md", lambda text: text.replace("figures/data_coverage.png", "figures/data_coverage.csv"))))
+        v = look_at(edited(hm, retext("manuscript.md", lambda text: text.replace("figures/data_coverage.png", "the data coverage figure"))))
         need(row(v, "figures", "figure", "data_coverage")["used_in"] == "" and statuses(v)["figure_unused"] == "ok",
              "a figure outside the decision tier that no text names raises nothing")
         c = check(look_at(folder(hm, base)), "figure_unused")
@@ -597,6 +617,41 @@ def _self_test():
         need("trajectories" in says(c) and "trajectory runs" in says(c), f"a figure not produced is listed with the harness's reason ({says(c)})")
         c = check(look_at(folder(hm, "figure_not_produced_named")), "figure_missing")
         need("report.md" in c["says"], f"and the sentence names the text that relies on it ({says(c)})")
+
+    # ------------------------------------------------------------------------------- the external review
+    def r_provenance():
+        def fresh(edit, defect=None):
+            v = look_at(edited(hm, edit, defect=defect))
+            return v, word(row(v, "figures", "figure", "headline")["fresh"]), statuses(v)["figure_fresh"]
+        v, state, status = fresh(record("headline", lambda doc: doc["source_hashes"].pop("analysis/point.yaml")))
+        need((state, status) == ("not_recorded", "not_available") and row(v, "sources", "id", "headline|analysis/point.yaml")["state"] == "not_recorded"
+             and "analysis/point.yaml" in check(v, "figure_fresh")["says"],
+             f"a source the index lists with no hash in the record is not known to be the same ({state}, {status}: {says(check(v, 'figure_fresh'))})")
+        for what, entry, want in (("a second entry with a hash that is no hash", {"path": labels_file, "sha256": "abc"}, ("not_recorded", "not_available")),
+                                  ("a second entry with another hash", {"path": labels_file, "sha256": "0" * 64}, ("changed", "problem")),
+                                  ("a presentation entry that gives a source another hash", {"path": "analysis/point.yaml", "sha256": "0" * 64}, ("changed", "problem")),
+                                  ("a second entry with no hash at all", {"path": labels_file}, ("not_recorded", "not_available"))):
+            v, state, status = fresh(record("headline", lambda doc, entry=entry: doc["presentation"].append(entry)))
+            need((state, status) == want, f"{what}: every entry for a file is held against the file, not the first alone ({state}, {status})")
+            need(len([r for r in table(v, "sources") if r["id"] == f"headline|{entry['path']}"]) == 1, f"{what}: still one row for the file")
+        v, state, status = fresh(record("headline", lambda doc: doc["presentation"].append(dict(doc["presentation"][0]))))
+        need((state, status) == ("same", "ok"), f"an entry repeated with the same hash changes nothing ({state}, {status})")
+
+    def r_forms():
+        def renamed(rel, old, new):
+            def change(text):
+                need(old in text, f"{rel} holds {old}")
+                return text.replace(old, new)
+            return retext(rel, change)
+        for end in (".svg", ".csv"):
+            v = look_at(edited(hm, renamed("report.md", "figures/trajectories.png", "figures/trajectories" + end), defect="figure_not_produced_named"))
+            need(statuses(v)["figure_missing"] == "problem" and row(v, "figures", "figure", "trajectories")["used_in"] == "report.md",
+                 f"a report that names the {end} form of a figure that was not produced relies on it ({statuses(v)['figure_missing']})")
+        base = "figure_unused"
+        for end, used in ((".svg", True), (".csv", True), (".png.provenance.json", False), (".pdf", False)):
+            v = look_at(edited(hm, retext("results.md", lambda text, end=end: text + f"\nSee figures/frontier{end}.\n"), defect=base))
+            need((statuses(v)["figure_unused"] == "ok") is used and bool(row(v, "figures", "figure", "frontier")["used_in"]) is used,
+                 f"figures/frontier{end} in a text: the figure is {'used' if used else 'not used'} (the forms are the producer's: image, vector copy, table)")
 
     def planted(method, defect, figures):
         def fn():
@@ -658,6 +713,29 @@ def _self_test():
         look_at(d)
         need(before == {os.path.join(at, f): sha(at, f) for at, _, files in os.walk(d) for f in files}, "the view only reads")
 
+    def w_reader():
+        import re
+        v = look_at(folder(hm))
+        claims = [c["title"] for c in v["checks"] if re.match(r"(Each|Every|No|All)\b", c["title"]) or re.search(r"\b(is|are|was|were|has|have|still)\b", c["title"])]
+        need(not claims, f"a check's title names what is compared and does not state the passing condition ({claims})")
+        need(v["images"][0].get("flag") == "fresh" and v["images"][0].get("reason") == "reason" and workbench.image_problems(v) == [],
+             f"the images declaration names the column that raises an image and the one that says why there is none ({v['images']})")
+        v = look_at(folder(hm, "figure_not_produced"))
+        card = [r for r in table(v, "images") if r["figure"] == "trajectories"]
+        need(len(card) == 1, "a figure that was not produced has a row among the images, so the page shows a card for it in its tier")
+        holds(card[0], {"path": None, "sha256": None, "tier": "simulation", "reason": fx.NO_TRAJECTORIES, "view": "scenarios"}, "with no image, and the harness's reason")
+        names = [r["figure"] for r in table(v, "images")]
+        need(names == [r["figure"] for r in table(v, "figures")], "the images are in the order of the figure set, the card where the figure would be")
+        need(all(isinstance(p, str) for p, _ in workbench.named_images(v)) and len(workbench.named_images(v)) == 12, "a card with no image names no file to the server")
+        v = look_at(folder(hm, "figure_image_missing"))
+        card = next(r for r in table(v, "images") if r["figure"] == "parameters")
+        need(card["path"] is None and card["sha256"] is None and "figures/parameters.png" in str(card["reason"]),
+             f"a figure listed as produced whose image is not in the run has a card that says so ({card['reason']})")
+        v = look_at(folder(hm, "figure_stale_source"))
+        states = [r["state"] for r in table(v, "sources")]
+        need(states[0] == "changed" and states.index("same") == states.count("changed"), f"the sources table opens on the rows that are not the same ({states[:4]})")
+        need("first" in v["tables"]["sources"]["about"], "and says so")
+
     def w_source():
         with open(os.path.abspath(__file__), encoding="utf-8") as f:
             text = f.read().lower()
@@ -689,12 +767,15 @@ def _self_test():
             spec = fx.DEFECTS[defect]
             also = "".join(f", {k} {s}" for k, s in spec.get("also", {}).items())
             case(f"P{n} {method}, {figures} set, {defect}: {spec['check']} is {spec['status']}{also}, and no other check changes", planted(method, defect, figures))
+    case("R7 review 7: every source the index lists needs a recorded hash, and every entry for a file is held against it", r_provenance)
+    case("R8 review 8: a text uses a figure by any form the producer writes for it: image, vector copy or table", r_forms)
     case("Y1 no figure index: every check not_available with the file's name; tables and counts null", y_none)
     case("Y2 an index that cannot be parsed, another schema, an unknown producer: not_available naming it, never guessed at", y_unrecognised)
     case("Y3 no report and no manuscript yet: figure_unused is not_available, the other checks are judged (assumed: A7)", y_reports)
     case("Y4 no manifest, or a manifest hash that is no hash: never a match", y_manifest)
     case("Y5 a provenance record missing, malformed or with a hash that is no hash: not_available, and a stale source still a problem", y_records)
     case("Y6 the view only reads: no file of the run changes", y_reads_only)
+    case("W3 the reader's findings: neutral titles, a card for a figure with no image, the image that needs a look raised, the sources that differ first", w_reader)
     case("W1 no domain word in this file (§3a)", w_source)
     case("W2 no domain word in the view's result, for either producer (§3a)", w_words)
     return b.done()

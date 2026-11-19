@@ -22,14 +22,15 @@ from views.model_read import g  # noqa: E402
 
 CHECKS = {"benchmarks": "C4", "departures": None, "choice_text": None, "spec_values": None, "choice_bound": None,
           "seed_range": None, "parameters_sourced": None, "fitted_at_bound": None}       # name -> scorecard case
-TITLES = {"benchmarks": "Each benchmark is in its band, or a signed departure covers it",
-          "departures": "Each signed departure names a decision test that ran",
-          "choice_text": "The engine choice and the engine record agree on which benchmarks are not in band",
-          "spec_values": "Values the spec sets lie inside the engine card's range",
-          "choice_bound": "The analysis files record the engine choice they used",
-          "seed_range": "A benchmark in band stays in band for every seed",
-          "parameters_sourced": "Each engine parameter has a checked source and a range",
-          "fitted_at_bound": "No fitted parameter sits on the end of its fitted range"}
+# A title names what is compared, not the outcome, so it reads the same beside ok and beside a problem.
+TITLES = {"benchmarks": "Benchmarks against their bands, and the signed departures that cover them",
+          "departures": "Signed departures and their decision tests",
+          "choice_text": "The engine choice's list of benchmarks not in band, against the engine record",
+          "spec_values": "Values the spec sets, against the engine card's range",
+          "choice_bound": "The engine choice the analysis files used, against the file in the run",
+          "seed_range": "Seed ranges of the benchmarks in band, against their bands",
+          "parameters_sourced": "Sources and ranges of the engine's parameters",
+          "fitted_at_bound": "Fitted parameters against the ends of their fitted ranges"}
 ENGINE, CHOICE, DT, SIGNED = R.ENGINE_REC, R.CHOICE, R.DT, R.SIGNED
 SHOWN = 6        # ids named in a sentence before "and n more"; every row is in the check's table
 
@@ -64,20 +65,27 @@ def _judge(m, r):
             return "look", "near", f"{r['id']} at {g(r['computed'])} (edge {g(edge)} of its band {g(r['band_low'])} to {g(r['band_high'])})"
         return "ok", "clear", ""
     what = f"{name} is {r['status']}: {r['why_not']}"
+    if r["no_band"]:
+        return "not_available", "unplaced", f"{name} is {r['status']} with no band recorded to judge it by"
     c = r["cover"]
     if c is not None and c["state"] == "ok":
         return "look", "covered", f"{what}; its departure covers it: {c['says']}"
     if not r["gates"]:
         return "look", "not_gating", f"{what}; it does not gate"
+    if r["exempt_refused"]:
+        return "problem", "uncovered", f"{what}; {r['exempt_refused']}"
     why = (f"its departure does not count ({c['says']})" if c is not None else
            "no departure in the verified signed spec names it" if m["spec"]["verified"] else
            f"no signed spec could be verified ({m['spec']['why']}), so no departure counts")
     return "problem", "uncovered", f"{what}; {why}"
 
 
-SAID = (("uncovered", "Gating and not in band, with nothing signed that covers it"), ("contradiction", "A row that contradicts itself"),
-        ("unknown", "Not judged"), ("unplaced", "Not judged"), ("covered", "Not in band under a signed departure whose test ran"),
-        ("not_gating", "Not in band and not gating (the engine choice only reports it, or it covers no component)"),
+SAID = (("uncovered", "Gating (the engine is eligible for the spec only if the benchmark is in band or a signed departure covers it) and not "
+                      "in band, with nothing signed that covers it"), ("contradiction", "A row that contradicts itself"),
+        ("unknown", "Not judged"), ("unplaced", "Not judged"),
+        ("covered", "Not in band under a signed departure (the owner's signed acceptance of it, with a decision test that runs the plan "
+                    "across the doubt) whose test ran"),
+        ("not_gating", "Not in band and not gating (the engine choice the analysis used only reports it, or it covers no component)"),
         ("near", "In band within a quarter of the band's log width of an edge (near miss, workbench threshold)"))
 
 
@@ -125,12 +133,15 @@ def check_departures(m):
     worst = checks.worst([s for _, s in each])
     said = "; ".join(f"{r['kind']} {r['subject']}: {r['says']}" for r, _ in sorted(each, key=lambda x: checks.WORST_FIRST.index(x[1])))
     tail = {"look": " Each is declared and signed, and its test ran: whether the departure is acceptable is for you to judge.",
-            "problem": " A departure whose test did not run, or that the verified signed spec does not hold, excuses nothing.",
+            "problem": " A departure excuses nothing unless the verified spec that holds it is signed by the owner and its decision "
+                       "test, of a kind that varies the effect, ran for that spec.",
             "not_available": ""}[worst]
     if not spec["verified"]:
         tail += f" No signed spec could be verified: {spec['why']}."
     table = {"columns": ["subject", "kind", "judged", "why"], "rows": [[r["subject"], r["kind"], s, r["says"]] for r, s in each]}
-    return _r("departures", worst, f"{len(rows)} departure(s). {said}.{tail}", ev, table)
+    meant = ("A departure is the owner's signed acceptance of a benchmark not in band, or of a component no benchmark covers, with a "
+             "decision test that runs the plan across the doubt. ")
+    return _r("departures", worst, f"{len(rows)} departure(s). {meant}{said}.{tail}", ev, table)
 
 
 def check_choice_text(m):
@@ -170,7 +181,8 @@ def check_choice_text(m):
 
 
 def check_spec_values(m):
-    ev = [(ENGINE, "data.spec_values[].outside_card_range, outside, range, card_range"), (ENGINE, "spec_sha256"), (checks.SPEC_SIGNOFF, "sha256")]
+    ev = [(ENGINE, "data.spec_values[].outside_card_range, outside, range, card_range"), (SIGNED, "engine_parameters[].value, range, outside_card_range"),
+          (ENGINE, "spec_sha256"), (checks.SPEC_SIGNOFF, "sha256")]
     if m["engine"]["why"]:
         return _no_record(m, "spec_values", "spec_values")
     if not m["spec_values_ok"]:
@@ -179,9 +191,10 @@ def check_spec_values(m):
     if not rows:
         return _r("spec_values", "ok", "The spec sets no engine parameter value.", ev[:1])
     wrong = [r for r in rows if r["wrong"]]
+    differ = [r for r in rows if r["differs"] and not r["wrong"]]
     flagged = [r for r in rows if r["flag"] is True and not r["wrong"]]
-    # The record's own flag is the spec's (toolkit/spec/engine_parameters.py rows()): it is a signed declaration
-    # only when the record was computed from the spec that is verified as signed.
+    # The record's row describes what the spec sets (toolkit/spec/engine_parameters.py rows()); the value, the range
+    # and the allowance (outside_card_range) are the verified signed spec's own, and the row must agree with them.
     from_signed = spec["verified"] and m["engine"]["spec_sha"] == spec["sha"]
 
     def what(r):
@@ -190,14 +203,18 @@ def check_spec_values(m):
     if wrong:
         return _r("spec_values", "problem", f"{len(wrong)} of {len(rows)} spec-set value(s) have a record that contradicts itself: "
                   + "; ".join(f"{r['name']}: {r['wrong']}" for r in wrong[:SHOWN]) + ".", ev)
+    if differ:
+        return _r("spec_values", "problem", f"{len(differ)} of {len(rows)} spec-set value(s) in the engine record are not what the verified "
+                  f"signed spec sets ({SIGNED} engine_parameters): " + "; ".join(f"{r['name']}: {r['differs']}" for r in differ[:SHOWN])
+                  + ". The engine record cannot set a value, a range or an allowance that the signed spec does not.", ev)
     if flagged and not from_signed:
         why = (f"no signed spec could be verified ({spec['why']})" if not spec["verified"] else
                f"the engine record was computed from another spec ({str(m['engine']['spec_sha'])[:8]}) than the signed copy ({spec['sha'][:8]})")
         return _r("spec_values", "problem", f"{len(flagged)} of {len(rows)} spec-set value(s) outside the card: "
                   + "; ".join(what(r) for r in flagged[:SHOWN]) + f". Nothing signed declares it: {why}.", ev)
     if flagged:
-        return _r("spec_values", "look", f"{len(flagged)} of {len(rows)} spec-set value(s) outside the card, declared in the spec signed by "
-                  f"{spec['signed_by']}: " + "; ".join(what(r) for r in flagged[:SHOWN]) + ". Whether the reason given holds is for you to judge.", ev)
+        return _r("spec_values", "look", f"{len(flagged)} of {len(rows)} spec-set value(s) outside the card, each set and flagged in the "
+                  f"verified spec signed by {spec['signed_by']} ({SIGNED} engine_parameters): " + "; ".join(what(r) for r in flagged[:SHOWN]) + ". Whether the reason given holds is for you to judge.", ev)
     return _r("spec_values", "ok", f"{len(rows)} spec-set value(s), none outside the card's range.", ev)
 
 

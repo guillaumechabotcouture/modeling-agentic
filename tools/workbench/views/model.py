@@ -16,7 +16,9 @@ The rules, each from §3 or §5.4 (its "Settled" lists win over an earlier line)
  A1  facts: the fifteen names of §5.4 (FACTS below); check ids are model.<name> for the eight checks of CHECKS. A
      count is null when the file it comes from cannot be read, never zero.
  A2  tables.parameters has the ten columns of the generic model followed by value_used, spec_low and spec_high
-     (assumed: appended in that order). For a parameter the spec does not set, owner_value, card_value,
+     (assumed: appended in that order) and benchmarks_at (assumed, from the walkthrough of §12: for a parameter that
+     is fitted to benchmarks and also set by the spec, the card's fitted value, which the benchmark table was computed
+     at; null otherwise; notes.fitted_and_set names each with its benchmarks). For a parameter the spec does not set, owner_value, card_value,
      outside_card, spec_low and spec_high are null and value_used is the card's value (assumed). A table
      spec_values (assumed name) repeats the values the spec sets beside the card's value and range, so they can be
      read first.
@@ -74,7 +76,7 @@ COLUMNS = {
                    "gates", "source", "departure_test", "departure_verdict"],
     "departures": ["subject", "kind", "reason", "status", "signed", "test", "verdict", "share_pct", "share_threshold_pct"],
     "parameters": ["name", "value", "low", "high", "units", "kind", "source", "owner_value", "card_value", "outside_card",
-                   "value_used", "spec_low", "spec_high"],
+                   "value_used", "spec_low", "spec_high", "benchmarks_at"],
     "mechanisms": ["text"],
     "benchmarks_at_spec_values": ["id", "computed", "status", "spec_hash", "test"],
     "images": ["figure", "path", "sha256", "title", "caption"],
@@ -96,8 +98,16 @@ def _table(name, rows, about, columns=None, empty=None, **more):
     return {"columns": list(cols), "rows": [[r[c] for c in cols] for r in rows], "about": about, **more}
 
 
+def _beside(m):
+    """The harness figure shown beside the chart of the values the spec sets (§5.12: the figure named parameters), or
+    None when the run has none or the chart is not drawn."""
+    drawn = m["spec_values"] and any(r["card_low"] is not None and r["spec_low"] is not None for r in m["spec_values"])
+    return next((r for r in m["images"] or [] if r["figure"] == "parameters"), None) if drawn else None
+
+
 def _tables(m):
     e = m["engine"]
+    beside = (_beside(m) or {}).get("figure")
     return {
         "benchmarks": _table("benchmarks", m["benchmarks"], (
             f"One row per benchmark of the engine as this run used it ({ENGINE} data.card.benchmarks): a published result the "
@@ -135,13 +145,15 @@ def _tables(m):
             f"One row per parameter of the engine as this run used it ({ENGINE} data.parameters), in the record's order. value, "
             "low, high: the card's; owner_value, spec_low, spec_high: what the signed spec sets instead (null where it sets "
             "none); card_value: the card value a spec-set value replaces; value_used: the spec's value where it sets one, else "
-            "the card's. kind: fixed, fitted (to benchmarks), calibrated (per run) or scenario."), wrap=["source"]),
+            "the card's. kind: fixed, fitted (to benchmarks), calibrated (per run) or scenario. benchmarks_at: for a parameter "
+            "that is fitted to benchmarks and that the spec also sets, the value the benchmark table above was computed at (the "
+            "card's fitted value, not the spec's); null for every other parameter."), wrap=["source"]),
         "mechanisms": _table("mechanisms", None if m["mechanisms"] is None else [{"text": t} for t in m["mechanisms"]],
                              f"What the engine models, in its card's own words ({ENGINE} data.card.mechanisms)"
                              + (f", for {e['name']} {e['version']}." if e["name"] else "."), wrap=["text"]),
-        "images": _table("images", m["images"], (
+        "images": _table("images", None if m["images"] is None else [r for r in m["images"] if r["figure"] != beside], (
             f"The harness figures that belong beside this view ({R.FIGS}: {', '.join(R.MODEL_FIGURES)}), each with the hash of the "
-            "image as read.")),
+            "image as read. A figure shown beside one of the charts is not repeated here.")),
     }
 
 
@@ -151,34 +163,38 @@ def _charts(m, tables):
     if banded:
         wide = any(r["band_low"] > 0 and r["band_high"] / r["band_low"] > 100 for r in banded)
         left = len(rows) - len(banded)
-        out.append({"kind": "ranges", "table": "benchmarks", "x": "id", "y": "computed", "outer_low": "band_low", "outer_high": "band_high",
+        out.append({"kind": "ranges", "table": "benchmarks", "after": "benchmarks", "x": "id", "y": "computed", "outer_low": "band_low", "outer_high": "band_high",
                     "low": "seed_min", "high": "seed_max", **({"scale": "log"} if wide else {}),
                     "title": "Each benchmark's band, with the engine's value and its range over seeds",
                     "labels": {"band_low": "band", "seed_min": "range over seeds", "computed": "computed value (mean over seeds)"},
-                    "how_to_read": "One row per benchmark, each on its own band. The bar is the range of single-seed values and the "
-                                   "mark the computed value. A value or seed range outside the band is drawn at the band's edge: the "
-                                   "numbers at the right and the next chart show how far out it is."
+                    "how_to_read": "One row per benchmark, each on its own band (the grey track). The bar is the range of single-seed "
+                                   "values and the mark the computed value. A value or a seed range outside the band is drawn where "
+                                   "it is, past the end of the track, and the row says it reaches beyond the band."
                                    + (f" {left} benchmark(s) with no band or no seed values are not drawn." if left else "")})
         positive = all(v is None or v > 0 for r in banded for v in (r["band_low"], r["computed"], r["target"]))
-        out.append({"kind": "interval_points", "table": "benchmarks", "x": "id", "y": "target", "low": "band_low", "high": "band_high",
+        out.append({"kind": "interval_points", "table": "benchmarks", "after": "benchmarks", "x": "id", "y": "target", "low": "band_low", "high": "band_high",
                     "model": "computed", "group": "status", **({"scale": "log"} if positive else {}),
                     "title": "Published value and band against the engine's value, by status",
-                    "labels": {"target": "published value, with its band", "computed": "the engine's computed value"},
+                    "labels": {"target": "published value", "computed": "the engine's computed value"},
                     "how_to_read": "One row per benchmark, gathered by the producer's status, all on one axis"
-                                   + (" (log scale)" if positive else "") + ". The line is the band and the diamond the engine's "
-                                   "value: a diamond off the line is out of band, one near the line's end is a near miss."})
+                                   + (" (log scale)" if positive else "") + ". The line is the band, the dot the published value and "
+                                   "the diamond the engine's value: a diamond off the line is out of band, one near the line's end "
+                                   "is a near miss (within a quarter of the band's log width of an edge)."})
     if tables["spec_values"] and any(r["card_low"] is not None and r["spec_low"] is not None for r in m["spec_values"]):
-        out.append({"kind": "ranges", "table": "spec_values", "x": "name", "y": "value", "outer_low": "card_low", "outer_high": "card_high",
-                    "low": "spec_low", "high": "spec_high", "title": "Values the spec sets: the spec's range inside the card's range",
+        fig = _beside(m)
+        out.append({"kind": "ranges", "table": "spec_values", "after": "spec_values", "x": "name", "y": "value", "outer_low": "card_low", "outer_high": "card_high",
+                    **({"image": {"path": fig["path"], "hash": fig["sha256"], "title": fig["title"] or "the engine's parameters",
+                                  **({"caption": fig["caption"]} if fig["caption"] else {})}} if fig else {}),
+                    "low": "spec_low", "high": "spec_high", "title": "Values the spec sets: the spec's range against the card's range",
                     "labels": {"card_low": "the card's range", "spec_low": "the spec's range", "value": "the spec's value"},
-                    "how_to_read": "One row per parameter the spec sets with a range, each on the card's own range. A bar that "
-                                   "reaches an end of its row may go beyond it: the table gives the numbers. Parameters the spec "
-                                   "sets with no range, or the card gives none for, are in the table only. The harness figure "
-                                   "named parameters, under Images, draws every parameter."})
+                    "how_to_read": "One row per parameter the spec sets with a range, each on the card's own range (the grey track). "
+                                   "A bar or a mark past the end of the track lies outside the card's range. Parameters the spec "
+                                   "sets with no range, or the card gives none for, are in the table only."
+                                   + (" The harness figure under this chart draws every parameter." if fig else "")})
     return out
 
 
-def _notes(m):
+def _notes(m, tables):
     e, c, spec = m["engine"], m["choice"], m["spec"]
     notes = {"engine": (f"Read from {ENGINE}: the engine card as this run used it ({e['name']} {e['version']}), never the repository's "
                         "card, which moves on after a run." if not e["why"] else f"The engine record could not be used: {e['why']}.")}
@@ -197,12 +213,36 @@ def _notes(m):
                                "departure from a benchmark to show.")
     if m["recomputed_says"]:
         notes["benchmarks_at_spec_values"] = m["recomputed_says"]
-    notes["reading"] = ("Benchmark: a published result the engine is run against. Band: the range its value must fall in. Seed range: "
-                        "the spread of that value over the random seeds the benchmark was run with. Gating: a benchmark that makes "
-                        "the engine ineligible unless it is in band or a signed departure covers it. Departure: the owner's signed "
-                        "acceptance of a benchmark not in band, or of a component with no benchmark, with a decision test that runs "
-                        "the plan across the doubt. Near miss: within a quarter of the band's log width of an edge, or within 25% of "
-                        "a test's threshold (workbench thresholds).")
+    both = [r for r in m["parameters"] or [] if r["benchmarks_at"] is not None]
+    if both:
+        again = sorted({r["id"] for r in m["recomputed"] or [] if r["id"]})
+        notes["fitted_and_set"] = (
+            f"{len(both)} parameter(s) are fitted to benchmarks and also set by the spec: " + "; ".join(
+                f"{r['name']} (fitted to {', '.join(r['fitted_to']) or 'benchmarks the record does not list'}; the benchmark table was computed "
+                f"at the card's value {R.g(r['benchmarks_at'])}, and the run uses the spec's value {R.g(r['value_used'])})" for r in both)
+            + ". So the benchmark table does not show the engine as the run used it for these parameters. "
+            + (f"The run recomputed {', '.join(again)} at the spec's values (table benchmarks_at_spec_values)." if again else
+               "The run holds no benchmark recomputed at the spec's values."))
+    # A table the run does not record (null) has a note of its own name saying why: the page shows it under "Not recorded".
+    gone = e["why"] and f"The engine record could not be used: {e['why']}."
+    why = {"benchmarks": gone or f"{ENGINE} holds no list of benchmarks (data.card.benchmarks).",
+           "parameters": gone or f"{ENGINE} holds no list of parameters (data.parameters).",
+           "mechanisms": gone or f"{ENGINE} holds no list of mechanisms (data.card.mechanisms).",
+           "spec_values": gone or f"data.spec_values in {ENGINE} is not a mapping of parameters.",
+           "departures": f"No signed spec could be verified ({spec['why']}), and {CHOICE} holds no list of departures.",
+           "candidates": f"The engine choice could not be read: {c['why']}.",
+           "benchmarks_at_spec_values": f"The run has no {R.BSV}: the harness writes it only where a decision test of the spec reads a "
+                                        "benchmark recomputed at the values the spec sets.",
+           "images": f"The run has no readable figure index ({R.FIGS}), so no harness figure can be shown beside this view."}
+    for name, t in tables.items():
+        if t is None:
+            notes.setdefault(name, why.get(name, "The run's files do not record it."))
+    notes = {"reading": ("Benchmark: a published result the engine is run against. Band: the range its value must fall in. Seed range: "
+                         "the spread of that value over the random seeds the benchmark was run with. Gating: a benchmark that makes "
+                         "the engine ineligible unless it is in band or a signed departure covers it. Departure: the owner's signed "
+                         "acceptance of a benchmark not in band, or of a component with no benchmark, with a decision test that runs "
+                         "the plan across the doubt. Near miss: within a quarter of the band's log width of an edge, or within 25% of "
+                         "a test's threshold (workbench thresholds)."), **notes}       # the terms first: the checks above use them
     return notes
 
 
@@ -228,7 +268,7 @@ def view(run):
     tables = _tables(m)
     images = ([{"table": "images", "path": "path", "hash": "sha256", "title": "title", "caption": "caption"}] if tables["images"] else [])
     return {"checks": out, "facts": {k: facts[k] for k in FACTS}, "tables": tables, "charts": _charts(m, tables),
-            "notes": _notes(m), "images": images}
+            "notes": _notes(m, tables), "images": images}
 
 
 # ---------------------------------------------------------------------------------------------- self-test
@@ -242,7 +282,7 @@ def _self_test():
     import yaml
 
     import workbench
-    from views.fit_bench import Bench, check, close, fixture_builder, need, rewrite, says, statuses
+    from views.fit_bench import Bench, check, close, fixture_builder, need, restamp, rewrite, says, statuses
     fx = fixture_builder()
     b = Bench(lambda run: view(run))        # the module's `view` as it is when a case runs
     folder, look_at, case, edited = b.folder, b.look_at, b.case, b.edited
@@ -308,6 +348,20 @@ def _self_test():
     unverified = {"the sign-off record is missing": remove(signoff_file),
                   "the sign-off record holds another hash for the spec": rejson(signoff_file, lambda so: so["sha256"].update({"decision_spec.yaml": "0" * 64})),
                   "the signed copy is missing": remove(signed_file)}
+
+    def resign(change):
+        """The signed copy rewritten by change(spec) as if that spec had been the one signed: the sign-off record and
+        every analysis header hold its new hash."""
+        def edit(d):
+            old = sha(d, signed_file)
+            rewrite(signed_file, change)(d)
+            new = sha(d, signed_file)
+            rejson(signoff_file, lambda so: so["sha256"].update({"decision_spec.yaml": new}))(d)
+            restamp(d, old, new)
+        return edit
+
+    def spec_test(tid, **change):
+        return resign(lambda spec: next(t for t in spec["analysis"]["decision_tests"] if t["id"] == tid).update(change))
 
     # ------------------------------------------------------------------------------- the generic model (§5.4)
     def m_shape():
@@ -430,8 +484,12 @@ def _self_test():
         v = look_at(d)
         need(any(i == {"table": "images", "path": "path", "hash": "sha256", "title": "title", "caption": "caption"} for i in images(v)),
              "the view declares its harness figures over tables.images (assumed: A10)")
-        holds(row(v, "images", "figure", "parameters"), {"path": "figures/parameters.png", "sha256": sha(d, "figures/parameters.png")},
-              "the harness figure of the engine's parameters, with the hash of the image as read")
+        beside = next(c["image"] for c in v["charts"] if c["table"] == "spec_values")
+        holds(beside, {"path": "figures/parameters.png", "hash": sha(d, "figures/parameters.png")},
+              "the harness figure of the engine's parameters, with the hash of the image as read, beside the chart of the same data")
+        shown = look_at(edited(hm, record(lambda data: data.pop("spec_values"))))
+        holds(row(shown, "images", "figure", "parameters"), {"path": "figures/parameters.png", "sha256": sha(d, "figures/parameters.png")},
+              "with no such chart the figure is among the view's images")
         v = look_at(folder(post, figures="estimates"))
         need(images(v) is not None and table(v, "images") == [], "a figure set with no figure for this view: no row, and no failure")
 
@@ -506,8 +564,10 @@ def _self_test():
     def s_spec_values():
         c = check(look_at(folder(hm, "spec_value_outside_card")), "spec_values")
         need("p2" in says(c) and "range" in says(c), f"the sentence names the parameter and which of value and range is outside ({says(c)})")
-        v = look_at(edited(hm, record(lambda data: data["spec_values"]["p2"].update(value=6.5, outside="value", outside_card_range=True))))
-        need(statuses(v)["spec_values"] == "look" and "value" in says(check(v, "spec_values")), "a value outside the card, flagged, is look and said to be the value")
+        v = look_at(edited(hm, both(resign(lambda spec: spec["engine_parameters"]["p2"].update(value=6.5, outside_card_range=True)),
+                                    record(lambda data: data["spec_values"]["p2"].update(value=6.5, outside="value", outside_card_range=True)))))
+        need(statuses(v)["spec_values"] == "look" and "value" in says(check(v, "spec_values")),
+             f"a value outside the card that the signed spec itself sets and flags is look, and said to be the value ({says(check(v, 'spec_values'))})")
         v = look_at(edited(hm, record(lambda data: data.pop("spec_values"))))
         need(statuses(v)["spec_values"] == "ok" and v["facts"]["n_owner_values"] == 0, "an engine record with no spec_values: the spec sets none (the harness writes the key only when it does)")
         for name, edit in unverified.items():
@@ -546,6 +606,89 @@ def _self_test():
         v = look_at(folder(hm, "signed_by_lead"))
         need(statuses(v)["departures"] == "problem" and statuses(v)["benchmarks"] == "problem" and "unsigned" in says(check(v, "departures")),
              "a departure the engine choice marks unsigned (a lead's signature) does not count, and covers nothing")
+
+    # ------------------------------------------------------------------------------- the external review (§3: an exemption is the signed spec's)
+    out_b4 = dict(computed=1.5, per_seed=[1.5] * 4, seed_min=1.5, seed_max=1.5, status="out_of_band", in_band=False)
+
+    def v_choice_exempts():
+        report = chosen(lambda c: c["benchmarks_reported"].append({"id": "B3", "why": fx.REPORTED_WHY, "status": "out_of_band", "role": "held_out"}))
+        v = look_at(edited(hm, report, defect="C4_out_of_band"))
+        need(statuses(v)["choice_bound"] == "problem" and statuses(v)["benchmarks"] == "problem" and row(v, "benchmarks", "id", "B3")["gates"] is True,
+             f"a choice record changed after the analysis cannot report a benchmark out of its gate ({statuses(v)['benchmarks']}: {says(check(v, 'benchmarks'))})")
+        need("not the one the analysis used" in check(v, "benchmarks")["says"], "and the sentence says why the choice record's list does not count")
+        v = look_at(edited(hm, both(bench("B3", covers={}), rejson(choice_file, lambda doc: doc.update(at="2026-01-01T00:00:00+00:00"))), defect="C4_out_of_band"))
+        need(statuses(v)["benchmarks"] == "problem", "nor does an empty `covers` switch a gate off beside a choice record the analysis did not use")
+        named = "choice_unbound_named"
+        moved = both(bench("B4", **out_b4), chosen(lambda c: c["benchmarks_reported"][0].update(status="out_of_band")))
+        v = look_at(edited(hm, moved, defect=named))
+        need(statuses(v)["benchmarks"] == "look" and row(v, "benchmarks", "id", "B4")["gates"] is False,
+             f"with no hash in the headers, a reported-only benchmark stays out of the gate when the verified signed spec names the engine and "
+             f"the chosen candidate is the engine of the record ({statuses(v)['benchmarks']})")
+        v = look_at(edited(hm, both(moved, chosen(lambda c: c.update(version="0.2"))), defect=named))
+        need(statuses(v)["benchmarks"] == "problem", "a chosen candidate of another version than the engine record exempts nothing")
+        v = look_at(edited(hm, moved, defect="choice_unbound_open"))
+        need(statuses(v)["benchmarks"] == "problem", "nor does a choice record that nothing ties to the analysis (gap H10)")
+        for name, edit in unverified.items():
+            v = look_at(edited(hm, both(moved, edit), defect=named))
+            need(statuses(v)["benchmarks"] == "problem", f"{name}: a spec that is not verified names no engine")
+
+    def v_row_first():
+        v = look_at(edited(hm, bench("B4", status="out_of_band", in_band=False)))
+        c = check(v, "benchmarks")
+        need(c["status"] == "problem" and "b4" in says(c) and "inside its band" in says(c),
+             f"a row said to be out of band whose value is inside its band contradicts itself, reported only or not ({c['status']}: {says(c)})")
+
+        def unbanded(bid, **more):
+            def change(data):
+                r = next(r for r in data["card"]["benchmarks"] if r["id"] == bid)
+                r.pop("band")
+                r.update(status="out_of_band", in_band=False, **more)
+            return record(change)
+        c = check(look_at(edited(hm, unbanded("B4"))), "benchmarks")
+        need(c["status"] == "not_available" and "b4" in says(c) and "no band" in says(c),
+             f"a row not in band with no band to judge it by is not available, reported only or not ({c['status']}: {says(c)})")
+        c = check(look_at(edited(hm, unbanded("B2"), defect="C4_out_of_band_departure")), "benchmarks")
+        need(c["status"] == "not_available", f"and so under a signed departure ({c['status']})")
+        c = check(look_at(edited(hm, unbanded("B3", computed=0.75, rules_checked=4, rules_met=3))), "benchmarks")
+        need(c["status"] == "problem" and "rules" in says(c), f"a row the producer judges by rules has no band by design, and is judged ({c['status']}: {says(c)})")
+        c = check(look_at(edited(hm, bench("B3", status="out_of_band", in_band=False, rules_checked=4, rules_met=3))), "benchmarks")
+        need(c["status"] == "problem" and "inside its band" not in says(c), "and its value is not held against a band")
+
+    def v_departure_owner():
+        base = "C4_out_of_band_departure"
+        need(statuses(look_at(edited(hm, resign(lambda spec: spec.update(note="signed again, unchanged in substance")), base)))["departures"] == "look",
+             "a spec signed again, with every header following it, still carries its departure (the test's own control)")
+        v = look_at(edited(hm, rejson(signoff_file, lambda so: so.update(signed_by="lead")), base))
+        need(statuses(v)["departures"] == "problem" and statuses(v)["benchmarks"] == "problem" and "lead" in says(check(v, "departures"))
+             and row(v, "departures", "subject", "B2")["signed"] is False and v["facts"]["n_departures"] == 0,
+             f"a departure in a spec signed by anyone but the owner grants nothing, whatever the choice record says ({statuses(v)}: {says(check(v, 'departures'))})")
+        for what, change in (("another spec's hash", lambda doc: doc.update(spec_sha256="1" * 64)), ("no spec hash", lambda doc: doc.pop("spec_sha256"))):
+            v = look_at(edited(hm, rewrite(tests_file, change), base))
+            need(statuses(v)["departures"] == "problem" and statuses(v)["benchmarks"] == "problem" and "spec" in says(check(v, "departures")),
+                 f"a decision tests file with {what} holds no test of the signed spec ({statuses(v)}: {says(check(v, 'departures'))})")
+        for what, edit, word in (("a kind of test the producer refuses for a departure", spec_test("DT4", type="outcome_ratio"), "outcome ratio"),
+                                 ("an interaction test of another benchmark", spec_test("DT4", benchmark="B3"), "b3"),
+                                 ("a test the signed spec does not declare", resign(lambda spec: spec["analysis"].update(
+                                     decision_tests=[t for t in spec["analysis"]["decision_tests"] if t["id"] != "DT4"])), "declares no")):
+            v = look_at(edited(hm, edit, base))
+            need(statuses(v)["departures"] == "problem" and statuses(v)["benchmarks"] == "problem" and word in says(check(v, "departures")),
+                 f"{what} carries no departure ({statuses(v)['departures']}: {says(check(v, 'departures'))})")
+        v = look_at(edited(hm, spec_test("DT5", type="interaction_rescale", benchmark="B2"), "departure_component"))
+        need(statuses(v)["departures"] == "problem", "an interaction test cannot carry a departure for a component with no benchmark")
+
+    def v_spec_values_signed():
+        def claim(**change):
+            return record(lambda data: data["spec_values"]["p2"].update(change))
+        for what, edit in (("a value", claim(value=7.0, outside_card_range=True, outside="value")),
+                           ("a range", claim(range=[1.0, 7.0], outside_card_range=True, outside="range")),
+                           ("an allowance", claim(card_range=[1.0, 5.0], outside_card_range=True, outside="range")),
+                           ("a value inside the card", claim(value=4.0))):
+            c = check(look_at(edited(hm, edit)), "spec_values")
+            need(c["status"] == "problem" and "p2" in says(c) and "signed spec" in says(c),
+                 f"{what} the engine record gives and the verified signed spec does not: a problem ({c['status']}: {says(c)})")
+        c = check(look_at(edited(hm, record(lambda data: data["spec_values"].update(p3=dict(data["spec_values"]["p2"]))))), "spec_values")
+        need(c["status"] == "problem" and "p3" in says(c), f"a spec-set value for a parameter the signed spec does not set ({c['status']}: {says(c)})")
+        need(statuses(look_at(folder(hm, "spec_value_outside_card")))["spec_values"] == "look", "what the signed spec itself sets and flags is still for the reader")
 
     def planted(method, defect):
         def fn():
@@ -615,6 +758,36 @@ def _self_test():
         look_at(d)
         need(before == {os.path.join(at, f): sha(at, f) for at, _, files in os.walk(d) for f in files}, "the view only reads")
 
+    def w_reader():
+        d = folder(hm)
+        v = look_at(d)
+        claims = [c["title"] for c in v["checks"] if re.match(r"(Each|Every|No|All)\b", c["title"]) or re.search(r"\b(is|are|lies?|stays|sits|has|have|agree)\b", c["title"])]
+        need(not claims, f"a check's title names what is compared and does not state the passing condition, so it reads the same beside a problem ({claims})")
+        need(v["charts"] and all(c.get("after") == c["table"] for c in v["charts"]), "each chart is placed directly after the table it is drawn from")
+        par = next(c for c in v["charts"] if c["table"] == "spec_values")
+        need({k: par.get("image", {}).get(k) for k in ("path", "hash")} == {"path": "figures/parameters.png", "hash": sha(d, "figures/parameters.png")}
+             and par["image"]["title"] and par["image"].get("caption") and "parameters" not in [r["figure"] for r in table(v, "images")],
+             f"the harness figure of the parameters is shown beside the chart of the values the spec sets, and not a second time ({par.get('image')})")
+        band = next(c for c in v["charts"] if c["kind"] == "ranges" and c["table"] == "benchmarks")
+        need("past the end" in band["how_to_read"] and "at the band's edge" not in band["how_to_read"], "the band chart says a value outside its band is drawn where it is")
+        holds(row(v, "parameters", "name", "p2"), {"benchmarks_at": 3.0}, "a parameter fitted to benchmarks and set by the spec: the value the benchmarks were computed at")
+        holds(row(v, "parameters", "name", "p1"), {"benchmarks_at": None}, "a parameter that is not both: no such value")
+        note = v["notes"].get("fitted_and_set", "")
+        need("p2" in note and "B1" in note and "B4" in note and "3.1" in note, f"and a note says which benchmarks, at which value, beside the value the run used ({note})")
+        for what, folder_ in (("the clean run", d), ("no engine record", edited(hm, remove(engine_file))), ("no engine choice", edited(hm, remove(choice_file))),
+                              ("no figure index", edited(hm, remove(fx.FIGS)))):
+            got = look_at(folder_)
+            silent = [n for n, t in got["tables"].items() if t is None and not str(got["notes"].get(n) or "").strip()]
+            need(not silent, f"{what}: each table the run does not record has a note of its own name saying why ({silent})")
+        c = check(look_at(folder(hm, "C4_out_of_band")), "benchmarks")
+        need("gating (" in says(c), f"`gating` is defined where the check first uses it ({says(c)})")
+        c = check(look_at(folder(hm, "C4_out_of_band_departure")), "departures")
+        need("a departure is" in says(c), f"`departure` is defined where the check first uses it ({says(c)})")
+        c = check(look_at(folder(hm, "departure_near_miss")), "departures")
+        need("near miss (" in says(c), f"`near miss` is defined where the check first uses it ({says(c)})")
+        c = check(look_at(folder(hm, "C4_near_edge")), "benchmarks")
+        need("near miss" in says(c) and "quarter" in says(c), "and so in the benchmarks check")
+
     def w_source():
         with open(os.path.abspath(__file__), encoding="utf-8") as f:
             text = f.read().lower()
@@ -659,6 +832,11 @@ def _self_test():
     case("X4 no decision tests file, or a test record the producer never writes: no departure's test counts as run", x_tests)
     case("X5 records that contradict themselves or each other are problems; a record with no benchmark list is not an empty one", x_contradiction)
     case("X6 the view only reads: no file of the run changes", x_reads_only)
+    case("V3 review 3: reported only, or covering nothing, switches a gate off only beside the choice record the analysis used", v_choice_exempts)
+    case("V4 review 4: a departure counts only in a spec the owner signed, with a test of that spec of a kind the producer accepts", v_departure_owner)
+    case("V5 review 5: a row's status is held against its own numbers before any exemption; no band to judge by is not available", v_row_first)
+    case("V6 review 6: a spec-set value, range or allowance is the verified signed spec's own, and the engine record must agree", v_spec_values_signed)
+    case("W3 the reader's findings: neutral titles, charts after their tables, the harness figure beside its chart, terms defined at first use, a reason for each table not recorded", w_reader)
     case("W1 no domain word in this file (§3a)", w_source)
     case("W2 no domain word in the view's result; the model is the same for another calibration method (§3a)", w_words)
     return b.done()

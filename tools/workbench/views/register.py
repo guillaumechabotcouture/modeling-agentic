@@ -89,7 +89,7 @@ def _self_test():
     import yaml
 
     import checks as _checks
-    from views.fit_bench import Bench, check, fixture_builder, need, rewrite, says, statuses
+    from views.fit_bench import Bench, check, fixture_builder, need, restamp, rewrite, says, statuses
     fx = fixture_builder()
     b = Bench(lambda run: view(run))        # the module's `view` as it is when a case runs
     folder, look_at, case, edited = b.folder, b.look_at, b.case, b.edited
@@ -195,13 +195,15 @@ def _self_test():
         """The spec changed in both copies, and the sign-off record's hash with it (a re-signed amendment)."""
         def edit(d):
             with open(os.path.join(d, signed_file), encoding="utf-8") as f:
-                spec = yaml.safe_load(f)
+                was = f.read()
+            spec = yaml.safe_load(was)
             change(spec)
             text = yaml.safe_dump(spec, sort_keys=False)
             for rel in (spec_file, signed_file):
                 with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
                     f.write(text)
             rejson(signoff_file, lambda so: so["sha256"].update({spec_file: hashlib.sha256(text.encode()).hexdigest()}))(d)
+            restamp(d, hashlib.sha256(was.encode()).hexdigest(), hashlib.sha256(text.encode()).hexdigest())
         return edit
 
     def notes(*lines):

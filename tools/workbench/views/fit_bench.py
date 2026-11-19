@@ -106,6 +106,16 @@ def rewrite(rel, change):
     return edit
 
 
+def restamp(d, old, new):
+    """In a copy of a built run, every analysis file that records the spec hash `old` records `new`: what a signed
+    amendment followed by the analysis leaves, so a test that re-signs a spec keeps the files tied to it."""
+    for name in sorted(os.listdir(os.path.join(d, "analysis"))) if os.path.isdir(os.path.join(d, "analysis")) else []:
+        if name.endswith(".yaml"):
+            text = read_nofollow(d, f"analysis/{name}")[0].decode("utf-8")
+            if old in text:
+                write_nofollow(d, f"analysis/{name}", text.replace(old, new).encode("utf-8"))
+
+
 def check(v, name):
     found = [c for c in v["checks"] if str(c.get("id")).split(".")[-1] == name]
     need(len(found) == 1, f"one check named {name} (found {len(found)})")

@@ -62,6 +62,11 @@ One reader: the owner, an expert epidemiological modeller.
   A record that contradicts itself (a status that disagrees with its own list of blocks) is
   `problem`.
 - Something the harness could not compute is never reported as passed.
+- An exemption is read from the verified signed spec itself, never from a file computed from
+  it: an engine record, a choice record or a figure index can describe what the spec allows,
+  but cannot grant it. Where the producer requires the owner's signature (a departure), a
+  spec signed by anyone else grants nothing. A decision test counts only when its file records
+  the same signed spec.
 - A bound is "reached" when a value is within 1e-6 of it, relative to the prior range's width.
 - A check reuses a threshold already defined in code, named with its file. It adds a new threshold
   only where §5 says so, and labels it "workbench threshold".
@@ -757,7 +762,7 @@ walked through or resting on text).
 | C1 | Trial ratios applied over the whole window, not the trial follow-up (F6 run 3) | sign-off | spec `effect_window` | 0 |
 | C2 | Model matches levels but not the change between survey rounds (F5) | calibration | fit `changes` | 2 |
 | C3 | Assumed survey error understates some states' uncertainty (F5) | calibration | fit `target_error` | 1 |
-| C4 | Benchmark out of band or just inside it (B8) | engine choice | model `benchmarks` | 0 |
+| C4 | Benchmark out of band or just inside it (B8) | engine choice | model `benchmarks` | 2 |
 | C5 | Window cut off campaigns; SMC rebound (F2–F3) | before the outcome batch | scenarios `trajectories_present` | 0 |
 | C6 | Large package shift between runs, unflagged (F2–F3) | analysis | outcomes `run_shift` | 0 |
 | C7 | Headline averts an implausible share of burden (E7 attempt 6) | analysis | outcomes `share_of_burden` | 0 |
@@ -921,6 +926,33 @@ The questions as they were put:
   Candidate checks not yet specified: targets matched by an equal number of free parameters
   (FLU: five targets, five free ratios, so they do not test fit); best point far from the
   posterior median along a ridge (DEN).
+- 2026-11-19: the ten review findings on the Model and Figures views were each reproduced with
+  a failing test and fixed, and the walkthrough's reader findings were fixed in the same pass.
+  The file endpoint now serves one image type, validated by structure. Departures follow the
+  producer's rule through one shared loader (owner's signature; a test that records the same
+  signed spec). Page declaration keys added: `after` (place a chart or image block after a
+  named table), `flag` and `reason` on images (raise first; placeholder card), and a chart's
+  `image`; the Fit and Model charts show the matching harness figure. Acceptance on 13 files
+  passes; statuses on R4 are unchanged. Still open: a departure with no test at all is
+  `problem` in Model but `look` in the register (to align on the producer's rule); the part of
+  the producer's rule about which kind of test may cover a departure is not applied, because
+  the coverage record is not in the run; the fact `choice_bound` reads "no" beside an ok check.
+- 2026-11-19, loop iteration 3, step 5 (walkthrough): a fresh agent saw four pages only (a
+  gating benchmark out of band with no departure; a stale figure source; a figure a report
+  names that was not produced; a clean run). It named all three planted defects with check,
+  row and source file, and nothing of the kind on the clean run. C4 scores 2 (14 of 32).
+  Reader findings to fix. Model: the engine's mark hides under the published one when close;
+  a value outside its band is drawn at the edge; "not recorded" points to notes that do not
+  say why; a parameter fitted to benchmarks and also set by the spec needs the value the
+  benchmarks were computed at; a chart says "table below" when the table is above; a failing
+  check's title should not state the passing condition; define gating, departure and near miss
+  where first used. Figures: captions that only repeat the title; the stale figure not first
+  and with no jump link; a not-produced figure needs a placeholder card in its tier; the
+  sources table should open on rows that are not "same"; an image that fails to load says
+  whether the page or the run is at fault; the glossary must read without the design document.
+- 2026-11-19, external review of the Model and Figures views and the file endpoint: 8 P1 and 2
+  P2. Common cause: trusting a derived file to say what the signed spec allows (rule added to
+  §3). Being fixed test first with the reader findings above.
 - 2026-11-19, loop iteration 3, step 4 for Model: view built by a fresh agent (reader, eight
   checks, charts), with the clean-fixture repair of §9 (the clean run holds nothing declared;
   a variant `declared` holds one of each kind). Self-tests pass (model 56 cases); acceptance

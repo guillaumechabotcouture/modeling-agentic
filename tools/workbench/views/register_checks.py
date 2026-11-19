@@ -177,6 +177,8 @@ def _how(m, tid):
         return f"{tid}: not in the file"
     if t["state"] == "contradiction":
         return f"{tid}: status {t['status']} and verdict {t['verdict']} contradict each other"
+    if t["state"] == "ran":
+        return f"{tid}: {t['spec_says']}"
     return f"{tid}: status {t['status']!s}" + ("" if t["state"] == "not_run" else f", verdict {t['verdict']!s}, a pair the analysis does not write")
 
 
@@ -191,12 +193,12 @@ def check_declared_untested(m, sci):
     if m["tests"] is None:
         return _no_tests(m, "declared_untested", ev)
     held = [r for r in sci if r["disposition"] in ("declared", "tested") and not r["noted"]]
-    not_run = [(r, t) for r in held for t in r["tests"] if m["tests"].get(t, {}).get("state") != "ran"]
+    not_run = [(r, t) for r in held for t in r["tests"] if m["tests"].get(t, {}).get("counts") is not True]
     bare = [r for r in held if not r["tests"] and r["disposition"] == "declared"]
     old = [r for r in held if not r["tests"] and r["disposition"] == "tested"]
     parts = []
     if not_run:
-        parts.append(f"{len(not_run)} declared or tested row(s) name a decision test that did not run: "
+        parts.append(f"{len(not_run)} declared or tested row(s) name a decision test that did not run for the signed spec: "
                      + ", ".join(f"{r['id']} ({_how(m, t)})" for r, t in not_run[:12]) + ".")
     if bare:
         parts.append(f"{len(bare)} declared row(s) name no decision test: {_ids(bare)}.")
@@ -440,6 +442,9 @@ def _self_test():
              f"a test no row names, recorded as not run and as changing the plan, is a problem and no row ({c['status']}: {c['says']})")
         v = b.look_at(b.edited(hm, pair("DT4", status="done"), "declared"))
         need(check(v, "declared_untested")["status"] == "problem", "a status word the producer does not write is not a test that ran")
+        v = b.look_at(b.edited(hm, rewrite(DT, lambda doc: doc.update(spec_sha256="1" * 64)), "declared"))
+        c = check(v, "declared_untested")
+        need(c["status"] == "problem" and "another spec" in c["says"], f"a test recorded for another spec than the signed one covers no declared row ({c['status']}: {c['says']})")
 
     def rows_of(v, name="rows"):
         t = v["tables"][name]

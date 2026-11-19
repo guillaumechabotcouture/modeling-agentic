@@ -12,7 +12,14 @@ The producers' words are mapped explicitly (§3); a word they do not write is `u
 - benchmark statuses: toolkit/engines/benchmark.py STATUSES (in_band, out_of_band, not_assessable, band_mis_based);
   `in_band` on a row is `status == "in_band"` there, so a row where the two differ contradicts itself;
 - a departure's status in the engine choice: toolkit/engines/benchmark_coverage.py signature() (signed, proposed,
-  unsigned); only `signed` is a signature of the owner on an unchanged spec;
+  unsigned); only `signed` is a signature of the owner on an unchanged spec. The choice record describes that; it
+  does not grant it (§3). The producer's own rule is applied to the verified signed spec and its sign-off record:
+  "It counts only when the spec is signed by the owner (the sign-off record's signed_by), and only when its decision
+  test varies the related effect: a parameter_value test on one of the entry's effect_parameters, or an
+  interaction_rescale test naming a spec component that delivers the covered engine component"
+  (benchmark_coverage.py), and toolkit/spec/preconditions.py decision_test_runs refuses every other kind of test
+  and an interaction test whose benchmark is not the departed one. What needs the engine's coverage file (which
+  parameters carry the effect) is not in the run folder and is not checked here;
 - a parameter's `verified`: toolkit/engines/contract.py (fetched, matched, unverified).
 
 read(run) returns a mapping:
@@ -29,9 +36,12 @@ read(run) returns a mapping:
               status), `edge` ((the nearer edge, its distance as a share of the band's width) for a row in band
               with a band, on the log scale where the band is above zero), `seeds_out` (the seed beyond an edge),
               `cover` (the departure that covers it, when one does), `why_not` (the producer's own reason a row is
-              not in band)
-  departures  [row]: the nine columns and `state` (ok, not_signed, not_counted, no_test, not_run, contradiction,
-              unknown_test, unknown_status, no_tests_file), `near` (share within 25% of the test's own threshold)
+              not in band), `no_band` (not in band with no band to judge it by), `exempt` (why it does not gate) and
+              `exempt_refused` (why a reported-only or covers-nothing row gates all the same)
+  choice_used (the choice record is the one the analysis used, why not): only then can it take a row out of the gate
+  departures  [row]: the nine columns and `state` (ok, not_signed, not_owner, not_counted, no_test, bad_test,
+              other_spec, not_run, contradiction, unknown_test, unknown_status, no_tests_file), `near` (share within
+              25% of the test's own threshold)
               and `says`; one row per departure of the verified signed spec, then any the choice record alone holds
   parameters, spec_values, mechanisms, candidates, recomputed, images: rows as the tables show them
 """
@@ -53,6 +63,9 @@ SCHEMA = "analysis.engine/1"
 BENCH_STATUSES = ("in_band", "out_of_band", "not_assessable", "band_mis_based")       # toolkit/engines/benchmark.py STATUSES
 NOT_IN_BAND = BENCH_STATUSES[1:]
 DEPARTURE_STATUSES = ("signed", "proposed", "unsigned")      # toolkit/engines/benchmark_coverage.py signature()
+# toolkit/engines/benchmark.py: a row judged by rules, by a tolerance or by class shares is in or out of band on that
+# record, not on `band` alone (a rules row has no band at all), so its value is not held against a band here.
+JUDGED_OTHERWISE = ("rules_checked", "tolerance", "class_share")
 VERIFIED_WORDS = ("fetched", "matched", "unverified")        # toolkit/engines/contract.py ParamSpec.verified
 NEAR = 0.25                  # §3 and §5.4: a near miss is within a quarter of the band's log width, or of a threshold
 BOUND = 1e-6                 # §3: a bound is reached within 1e-6 of the range's width
@@ -137,8 +150,10 @@ def _departures(spec, choice, tests, tests_why):
         recorded.setdefault(_identity(d), d)
     rows, seen = [], set()
 
-    def row(d, signed):
+    def row(d, held):
         engine, kind, subject, test = _identity(d)
+        refused = checks.departure_refused(spec, kind, subject, test) if held else None      # the rule the register uses too
+        signed = held and (refused or ("",))[0] != "not_owner"       # "only when the spec is signed by the owner"
         rec = recorded.get((engine, kind, subject, test))
         word = rec.get("status") if rec is not None else None
         t = (tests or {}).get(test) if test else None
@@ -146,8 +161,10 @@ def _departures(spec, choice, tests, tests_why):
         r = {"subject": subject, "kind": kind, "reason": _text(d.get("reason")), "status": word if isinstance(word, str) else None,
              "signed": signed, "test": test, "verdict": (t or {}).get("verdict") if isinstance((t or {}).get("verdict"), str) else None,
              "share_pct": share, "share_threshold_pct": limit, "engine": engine, "near": False}
-        if not signed:
+        if not held:
             r.update(state="not_signed", says=f"{CHOICE} gives it the status {word!r}, and the verified signed spec does not hold it")
+        elif not signed:
+            r.update(state="not_owner", says=f"{refused[1]} ({CHOICE} gives it the status {word!r})")
         elif choice["why"] is not None or choice["departures"] is None:
             r.update(state="unknown_status", says=f"{CHOICE} records no status for it ({choice['why'] or 'it holds no engine_departures list'})")
         elif rec is None:
@@ -156,18 +173,20 @@ def _departures(spec, choice, tests, tests_why):
             r.update(state="unknown_status", says=f"{CHOICE} gives it the status {word!r}, a word the engine choice does not write")
         elif word != "signed":
             r.update(state="not_counted", says=f"{CHOICE} gives it the status {word} (not the owner's signature on an unchanged spec), so it does not count")
-        elif not test:
-            r.update(state="no_test", says="it names no decision test")
+        elif refused:
+            r.update(state=refused[0], says=refused[1])
         elif tests is None:
             r.update(state="no_tests_file", says=f"its test {test} cannot be read ({tests_why})")
         elif t is None:
             r.update(state="not_run", says=f"{DT} holds no test {test}")
+        elif t["state"] == "ran" and not t["counts"]:
+            r.update(state="other_spec", says=f"its test {test} is recorded with verdict {t['verdict']}, but {t['spec_says']}")
         elif t["state"] == "ran":
             r["near"] = bool(t["verdict"] == "NO_CHANGE" and num(share) is not None and num(limit) is not None
                              and limit > 0 and share >= (1 - NEAR) * limit)
             at = f" at {g(share)}% of units against its {g(limit)}% threshold" if num(share) is not None and num(limit) is not None else ""
             r.update(state="ok", says=f"its test {test} ran with verdict {t['verdict']}{at}"
-                                      + (f", within {NEAR:.0%} of the threshold (near miss)" if r["near"] else ""))
+                                      + (f", a near miss (within {NEAR:.0%} of the threshold it passed; a workbench threshold)" if r["near"] else ""))
         elif t["state"] == "not_run":
             r.update(state="not_run", says=f"its test {test} did not run (status {t['status']}, verdict {t['verdict']})")
         elif t["state"] == "contradiction":
@@ -187,7 +206,30 @@ def _departures(spec, choice, tests, tests_why):
     return rows
 
 
-def _benchmarks(data, engine, choice, departures):
+def _choice_used(m):
+    """(the choice record is the one the analysis used, why not) (§3: a choice record can describe what the spec
+    allows and cannot grant it). It is when its chosen candidate is the engine of the engine record and either every
+    analysis header holds the hash the file has now, or no header holds one and the verified signed spec names the
+    engine (the harness then writes null: toolkit/analysis/artifacts.py)."""
+    c, e = m["choice"], m["engine"]
+    if c["why"] or c["chosen"] is None:
+        return False, c["why"] or f"{CHOICE} holds no candidate with the reference of the engine it chose"
+    name, version = _text(c["chosen"].get("name"), 200), _text(c["chosen"].get("version"), 60)
+    if (name, version) != (e["name"], e["version"]):
+        return False, f"its chosen candidate ({name} {version}) is not the engine of the engine record ({e['name']} {e['version']})"
+    held = [state for _, h, state in m["headers"] if h is not None]
+    if held:
+        if len(held) == len(m["headers"]) and all(state == "same" for state in held):
+            return True, None
+        return False, "the analysis headers hold another hash for it than the file has now, or disagree on it"
+    if not m["spec"]["verified"]:
+        return False, f"no analysis header holds its hash and no signed spec could be verified ({m['spec']['why']})"
+    if not m["engine_named"]:
+        return False, "no analysis header holds its hash and the verified signed spec leaves the engine to be chosen"
+    return True, None
+
+
+def _benchmarks(data, engine, choice, departures, used=(True, None)):
     rows = data["card"].get("benchmarks")
     if not isinstance(rows, list):
         return None
@@ -200,10 +242,15 @@ def _benchmarks(data, engine, choice, departures):
         state = word if isinstance(word, str) and word in BENCH_STATUSES else "unknown"
         dep = cover.get(bid)
         covers = b.get("covers")
+        exempt = ("the engine choice only reports it" if bid in choice["reported"] else
+                  "it covers no component" if "covers" in b and isinstance(covers, (dict, list)) and not covers else None)
+        other = next((k for k in JUDGED_OTHERWISE if b.get(k) is not None), None)
         r = {"id": bid, "metric": _text(b.get("metric")), "role": _text(b.get("role"), 60), "target": num(b.get("target")),
              "band_low": lo, "band_high": hi, "computed": value, "seed_min": smin, "seed_max": smax,
              "status": word if isinstance(word, str) else None,
-             "gates": not (bid in choice["reported"] or ("covers" in b and isinstance(covers, (dict, list)) and not covers)),
+             "gates": not (exempt and used[0]), "exempt": exempt if used[0] else None,
+             "exempt_refused": f"{exempt}, but {CHOICE} is not the one the analysis used ({used[1]}), so it gates" if exempt and not used[0] else None,
+             "no_band": state in NOT_IN_BAND and lo is None and other is None,
              "source": _text(b.get("source")), "departure_test": dep["test"] if dep else None,
              "departure_verdict": dep["verdict"] if dep else None,
              "state": state, "contradiction": None, "edge": None, "seeds_out": None, "cover": dep, "why_not": None}
@@ -211,6 +258,8 @@ def _benchmarks(data, engine, choice, departures):
             r["contradiction"] = f"its in_band is {b['in_band']!r} beside the status {word}"
         elif state == "in_band" and lo is not None and value is not None and not lo <= value <= hi:
             r["contradiction"] = f"its status is in_band while its value {g(value)} is outside its band {g(lo)} to {g(hi)}"
+        elif state == "out_of_band" and other is None and lo is not None and value is not None and lo <= value <= hi:
+            r["contradiction"] = f"its status is out_of_band while its value {g(value)} is inside its band {g(lo)} to {g(hi)}"
         elif state == "in_band" and lo is not None and value is not None and hi > lo:
             log = lo > 0 and value > 0
             width = math.log(hi / lo) if log else hi - lo
@@ -227,14 +276,26 @@ def _benchmarks(data, engine, choice, departures):
         elif state == "not_assessable":
             r["why_not"] = f"it could not be assessed ({_text(b.get('not_assessable_because'), 160) or 'no reason recorded'})"
         elif state == "out_of_band":
-            r["why_not"] = (f"computed {g(value)} against its band {g(lo)} to {g(hi)}" if lo is not None else
-                            f"computed {g(value)}; it is judged by rules, with no band")
+            r["why_not"] = (f"computed {g(value)} against its band {g(lo)} to {g(hi)}" if lo is not None and other is None else
+                            f"computed {g(value)}; the producer judges it by its own rules ({other}), not by a band" if other else
+                            f"computed {g(value)}, with no band recorded")
         out.append(r)
     return out
 
 
-def _parameters(data):
-    """(rows of the parameters table, rows of the spec-set values, the record's spec_values or why it is unusable)."""
+def _same(a, b):
+    return a is None and b is None or (a is not None and b is not None and abs(a - b) <= 1e-9 * max(1.0, abs(a), abs(b)))
+
+
+def _parameters(data, spec):
+    """(rows of the parameters table, rows of the spec-set values, the record's spec_values or why it is unusable).
+    A value's `differs` says where the engine record's row is not what the verified signed spec's own
+    engine_parameters entry sets (§3: the record describes what the spec sets and cannot grant it). The spec's entry
+    is read as toolkit/spec/engine_parameters.py reads it: `value` a number, `range` two numbers in order,
+    `outside_card_range` true only when it is true."""
+    signed = spec["doc"].get("engine_parameters") if spec["verified"] else None
+    signed = signed if isinstance(signed, dict) else {}
+    fitted = data["card"].get("fitted") if isinstance(data["card"].get("fitted"), dict) else {}
     pars = data.get("parameters")
     sv = data.get("spec_values", {})
     sv_ok = isinstance(sv, dict) and all(isinstance(v, dict) for v in sv.values())
@@ -250,7 +311,11 @@ def _parameters(data):
                          "owner_value": num(s.get("value")) if s else None, "card_value": num(s.get("card_value")) if s else None,
                          "outside_card": (s.get("outside_card_range") if isinstance(s.get("outside_card_range"), bool) else None) if s else None,
                          "value_used": num(s.get("value")) if s and num(s.get("value")) is not None else num(p.get("value")),
-                         "spec_low": slo, "spec_high": shi, "verified": p.get("verified")})
+                         "spec_low": slo, "spec_high": shi, "verified": p.get("verified"),
+                         # fitted to benchmarks and also set by the spec: the benchmark table was computed at the card's value
+                         "benchmarks_at": num(fitted[p.get("name")].get("value")) if s and num(s.get("value")) is not None
+                         and isinstance(fitted.get(p.get("name")), dict) else None,
+                         "fitted_to": [str(b) for b in fitted[p.get("name")].get("benchmarks") or []] if isinstance(fitted.get(p.get("name")), dict) else []})
     values = []
     for name, s in by.items():
         clo, chi = _pair(s.get("card_range"))
@@ -271,7 +336,21 @@ def _parameters(data):
             wrong = (f"its outside_card_range is {str(flag).lower()} while its {found or 'value and range'} "
                      f"{'lies outside' if found else 'lie inside'} the card's range" if clo is not None else
                      "its outside_card_range is true while the record gives no card range")
-        values.append({"name": str(name), "units": _text(s.get("units"), 80), "card_value": num(s.get("card_value")), "card_low": clo,
+        differs = None
+        if spec["verified"]:
+            e = signed.get(name)
+            if not isinstance(e, dict):
+                differs = "the verified signed spec sets no such engine parameter"
+            else:
+                want_lo, want_hi = _pair(e.get("range"))
+                if want_lo is not None and not want_lo < want_hi:
+                    want_lo = want_hi = None
+                off = ([f"value {g(value)} against the spec's {g(num(e.get('value')))}"] if value is None or not _same(value, num(e.get("value"))) else []) + (
+                    [f"range {g(slo)} to {g(shi)} against the spec's {g(want_lo)} to {g(want_hi)}"] if not (_same(slo, want_lo) and _same(shi, want_hi)) else []) + (
+                    [f"outside_card_range {str(flag).lower()} against the spec's {str(e.get('outside_card_range') is True).lower()}"]
+                    if isinstance(flag, bool) and flag is not (e.get("outside_card_range") is True) else [])
+                differs = "; ".join(off) or None
+        values.append({"name": str(name), "differs": differs, "units": _text(s.get("units"), 80), "card_value": num(s.get("card_value")), "card_low": clo,
                        "card_high": chi, "value": value, "spec_low": slo, "spec_high": shi, "outside": found if flag is True else None,
                        "uncertainty": _text(s.get("uncertainty"), 300), "source": _text(s.get("source")), "reason": _text(s.get("reason")),
                        "flag": flag, "wrong": wrong})
@@ -311,18 +390,8 @@ def _recomputed(run, spec):
 def _images(run):
     """Rows of the harness figures that belong beside this view (§5.12), each with the hash of the image as read, or
     None when the run has no figure index."""
-    doc, _ = run.large(FIGS)
-    figs = doc["data"].get("figures") if doc is not None and isinstance(doc.get("data"), dict) else None
-    if not isinstance(figs, list):
-        return None
-    rows = []
-    for e in _dicts(figs):
-        name, rel = e.get("figure") or e.get("id"), e.get("path")
-        if name in MODEL_FIGURES and isinstance(rel, str):
-            sha = run.sha(rel)
-            if sha is not None:
-                rows.append({"figure": name, "path": rel, "sha256": sha, "title": _text(e.get("title"), 400), "caption": _text(e.get("caption"))})
-    return rows
+    figs = checks.harness_figures(run)
+    return None if figs is None else [f for name, f in figs.items() if name in MODEL_FIGURES]
 
 
 def read(run):
@@ -333,9 +402,13 @@ def read(run):
          "benchmarks": None, "parameters": None, "spec_values": None, "spec_values_ok": None, "mechanisms": None, "fitted": None,
          "candidates": None, "headers": _headers(run)}
     m["departures"] = _departures(spec, choice, tests, tests_why)
+    engine_set = (spec["doc"] or {}).get("engine")
+    m["engine_named"] = (None if not spec["verified"] else
+                         bool(engine_set) and engine_set != "auto" and not (isinstance(engine_set, dict) and engine_set.get("auto") is True))
+    m["choice_used"] = _choice_used(m)
     if data is not None:
-        m["benchmarks"] = _benchmarks(data, engine, choice, m["departures"])
-        m["parameters"], m["spec_values"], sv = _parameters(data)
+        m["benchmarks"] = _benchmarks(data, engine, choice, m["departures"], m["choice_used"])
+        m["parameters"], m["spec_values"], sv = _parameters(data, spec)
         m["spec_values_ok"] = sv is not None
         mech = data["card"].get("mechanisms")
         m["mechanisms"] = [_text(x) for x in mech if _text(x)] if isinstance(mech, list) else None
@@ -350,9 +423,6 @@ def read(run):
                            for c in _dicts(choice["candidates"])]
     m["recomputed"], m["recomputed_says"] = _recomputed(run, spec)
     m["images"] = _images(run)
-    engine_set = (spec["doc"] or {}).get("engine")
-    m["engine_named"] = (None if not spec["verified"] else
-                         bool(engine_set) and engine_set != "auto" and not (isinstance(engine_set, dict) and engine_set.get("auto") is True))
     return m
 
 
@@ -436,8 +506,8 @@ def _self_test():
         m = look(b.edited(hm, rejson(CHOICE, lambda doc: doc["engine_departures"][0].update(status="agreed")), "C4_out_of_band_departure"))
         need(m["departures"][0]["state"] == "unknown_status" and "'agreed'" in m["departures"][0]["says"], "a status word the engine choice does not write is named")
         m = look(b.folder(hm, "signed_by_lead"))
-        need({r["state"] for r in m["departures"]} == {"not_counted"} and all("unsigned" in r["says"] for r in m["departures"]),
-             "a departure the engine choice marks unsigned (a lead's signature) does not count")
+        need({r["state"] for r in m["departures"]} == {"not_owner"} and all("unsigned" in r["says"] and not r["signed"] for r in m["departures"]),
+             "a departure in a spec a lead signed does not count, and the engine choice marks it unsigned")
         m = look(b.edited(hm, rejson(CHOICE, lambda doc: doc.pop("engine_departures")), "departure_component"))
         need(m["departures"][0]["state"] == "unknown_status", "a choice record with no departures list says nothing of a signed departure")
         m = look(b.edited(hm, rewrite(SIGNED, lambda doc: doc["engine_departures"][0].update(engine="other-engine")), "C4_out_of_band_departure"))

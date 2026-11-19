@@ -172,11 +172,12 @@ def _units(run, spec):
 
 
 def _tests(run):
-    """{decision test id: (it ran, its verdict)} through checks.decision_tests, the loader the register uses too: a
-    test ran only with status run and a verdict of no change or changes plan. A file that cannot be read that way
-    gives no test, so nothing a declaration names ran."""
+    """{decision test id: (it counts, its verdict, why it does not count)} through checks.decision_tests, the loader
+    the register and the Model view use too: a test counts only with status run, a verdict of no change or changes
+    plan, and a file that records the verified signed spec (§3). A file that cannot be read that way gives no test,
+    so nothing a declaration names ran."""
     tests, _ = checks.decision_tests(run)
-    return {tid: (t["state"] == "ran", t["verdict"]) for tid, t in (tests or {}).items()}
+    return {tid: (t["counts"], t["verdict"], t["spec_says"] if t["state"] == "ran" else None) for tid, t in (tests or {}).items()}
 
 
 def _prior_dominated(run):
@@ -187,8 +188,8 @@ def _prior_dominated(run):
 
 
 def _cover(tests, test, where):
-    ran, verdict = tests.get(str(test), (False, None))
-    return {"test": str(test), "ran": ran, "verdict": verdict, "where": where}
+    ran, verdict, why = tests.get(str(test), (False, None, None))
+    return {"test": str(test), "ran": ran, "verdict": verdict, "where": where, "why": why}
 
 
 def _part(why, name, fn):
