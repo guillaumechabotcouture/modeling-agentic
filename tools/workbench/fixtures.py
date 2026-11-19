@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fixture runs for the review workbench (docs/design/review-workbench.md §9, §3a).
 
-    python3 tools/workbench/fixtures.py <dir> [--method M] [--figures SET] [--defect NAME] [--upto STAGE]   # write one run
+    python3 tools/workbench/fixtures.py <dir> [--method M] [--figures SET] [--kind K] [--other NAME] [--defect NAME] [--upto STAGE]
     python3 tools/workbench/fixtures.py --list                                               # every planted edit
     python3 tools/workbench/fixtures.py --self-test
 
@@ -44,6 +44,23 @@ It also holds every file the Model view (§5.4) and the Figures view (§5.12) re
   posterior method), every figure produced, each with a one-pixel PNG, a vector copy, its table and its provenance
   record (scripts/figure_validator.py); the manifest lists each image; report.md names each decision figure by path or
   file name, manuscript.md one more, and report_render.json holds the report's hash.
+It also holds every file the Outcomes view (§5.7) reads, shaped as the producers write them and in the order
+toolkit/analysis/run.py writes them: analysis/point.yaml (the plan over the twelve units: packages A+B and A+C, which
+differ in the option of one group of components, the cheaper option B in nine units; mix, per-unit rows, cost from the
+signed spec's per-person cost items, the budget and its reserve), uncertainty.yaml (the headline's median, equal to
+the point value, and its interval; what was drawn and what was held at one value), decision_tests.yaml with one result
+file per test under models/decision_tests/ (every test ran, with no change and clear of its three thresholds),
+stability.yaml (both verdicts ROBUST), value_of_information.yaml (computed on 500 draws; two inputs above their noise
+floor, neither prior-dominated), plan_variants.yaml (one variant, within budget), burden_validation.yaml (four
+references inside their bands, two of them report-only, one of those named by decision test DT10), emulator.yaml and
+emulator_boundary.yaml (rows that hold every component), and allocation.csv. A plan-changing test, a near miss and a
+test that did not run are variants, as every declared case is. `kind="estimates"` (posterior method, estimates figure
+set) writes the run of an `estimates` deliverable instead: no plan, tests file or allocation; analysis/estimates.yaml
+holds the outputs, the decision rule's verdict and the decision tests. `other=<name>` (OTHERS) writes a second run of
+the same question for the cross-run comparison: `second` differs in one spec key (constraints.envelope_usd) and what
+follows from it; the rest are the runs the planted comparisons are read against (DEFECTS entries with `against`).
+Not the producers' shape, and said here: analysis/emulator.yaml records the spec and the units table as its inputs
+(a stored run records its batch files, which the fixture does not write).
 The clean run holds no analysis/benchmarks_at_spec_values.yaml: that file has no artifact header and sits outside the
 manifest (gap H13), which the Steps view raises; variant spec_benchmarks_recomputed adds it with its record file.
 
@@ -149,6 +166,31 @@ HISTORY = [("SPEC", "SIGN", 30, 1.0), ("SIGN", "EVIDENCE", 60, 1.0), ("EVIDENCE"
            ("CRITIQUE", "GATE", 260, 3.0), ("GATE", "WRITE", 270, 3.0), ("WRITE", "PRESENTATION", 290, 3.6),
            ("PRESENTATION", "FINAL", 300, 3.8)]
 REACHED = {"launch": 1, "sign-off": 4, "calibration": 5, "analysis": 6, "final": 10}   # transitions made by each stage
+# What the Outcomes view (§5.7) reads beside those, and the producers' own words and numbers (X41 holds each to the
+# producer's source): toolkit/analysis/value_of_information.py STATUSES, stability.py's verdicts, burden.py STATUSES and
+# roles, variants.py's statuses, boundary.py's status, red_flag.py SHARE and MIN_UNITS, thresholds.yaml.
+POINT, STAB, VOI, PV, BV, EMU, EMB = (f"analysis/{n}.yaml" for n in (
+    "point", "stability", "value_of_information", "plan_variants", "burden_validation", "emulator", "emulator_boundary"))
+BURDEN_CSV, TESTS_DIR = "data/derived/burden_references.csv", "models/decision_tests/"
+KINDS = ("package_per_unit", "estimates")              # toolkit/spec/schema.py DELIVERABLE_KINDS
+OUTCOME, HEADLINE, TIER = "outcome", "total_outcome_averted", "tier"
+PRICE = {"A": 1.0, "B": 2.0, "C": 3.0}                 # per person; B and C are the two options of one group, C the dearer
+ENVELOPE, RESERVE_SHARE, ALLOWANCE, DRAWS = 100000.0, 0.95, 0.1, 500
+VOI_STATUSES = ("computed", "indicative", "too_few_draws", "no_eligible_plan")
+VOI_MIN_DRAWS, VOI_INFORMATIVE_DRAWS = 30, 500
+STABILITY_VERDICTS = ("ROBUST", "FRAGILE", "UNSTABLE", "NOT_RUN")
+VALUE_LOSS = {"value_loss_pct_robust": 1.0, "value_loss_pct_fragile": 5.0}
+BURDEN_STATUSES, BURDEN_ROLES, BURDEN_BAND = ("within", "outside", "information", "unmatched"), ("checked", "report_only", "anchor"), [0.5, 2.0]
+VARIANT_STATUSES = ("evaluated", "solved", "not_solved")
+TEST_THRESHOLDS = {"share": 0.10, "regret": 0.01, "dollars": 0.05}     # thresholds.yaml decision_tests
+BOUNDARY_MIN, DEAREST_SHARE, DEAREST_MIN_UNITS = 0.8, 0.9, 5
+EST_VERDICTS = ("yes", "no", "undetermined")           # toolkit/analysis/estimates.py: a decision rule's verdicts
+# The comparison runs of the cross-run check (§5.7 run_shift): `build(..., other=<name>)` writes the same question's
+# second run. `second` differs from the clean run in one spec key and what follows from it, and in nothing a
+# threshold counts; the others are what the planted comparisons are made against.
+OTHERS = ("second", "shifted", "shifted_same_spec", "headline", "other_question", "unverified")
+STAGE_OF.update({STAB: "analysis", VOI: "analysis", PV: "analysis", BV: "analysis", EMU: "calibration", EMB: "analysis",
+                 BURDEN_CSV: "launch"})
 
 
 def stage_of(rel):
@@ -156,6 +198,8 @@ def stage_of(rel):
     calibration (the Fit view reads them from there); every other figure file is written at the end of the analysis."""
     if rel.startswith("figures/"):
         return "calibration" if rel.startswith("figures/calibration_") and rel.endswith(".csv") else "analysis"
+    if rel.startswith(TESTS_DIR):
+        return "analysis"
     return STAGE_OF[rel]
 
 
@@ -192,21 +236,35 @@ def _at(minute):
 # ------------------------------------------------------------------------------------------- the run, as objects
 
 def _spec(method):
+    items = [{"id": f"price_{c}", "component": c, "value": v, "price_year": "2025", "price_rule": "as_published",
+              "basis": "per_person", "includes": [f"supply of {c}"]} for c, v in PRICE.items()]
     spec = {"schema_version": 1, "question": "Which package should each unit get? (synthetic fixture)",
             "decision_date": "2026-06-01", "engine": "auto",
             "engine_parameters": {"p2": {"value": 3.1, "units": "ratio", "source": "the owner's range",
                                          "reason": "no measurement", "basis": "owner_judgement", "range": [1.0, 5.5],
                                          "dist": "uniform"}},
             "decision_units": {"csv": "data/derived/units.csv", "id": "unit_id", "label": "name", "region": GROUPING},
-            "options": {"components": {"A": {}, "B": {}}, "packages": {"generate": True}},
-            "comparator": {"package": "A"},
-            "uncertainty": {"draws": 50, "excluded": [
+            "options": {"populations": {"total": "pop"},
+                        "components": {"A": {}, "B": {"group": TIER}, "C": {"group": TIER}}, "packages": {"generate": True},
+                        "engine_map": {"A": {"A": 1}, "B": {"B": 0.5}, "C": {"B": 1}},
+                        "prices": {"base_year": 2025}, "cost_items": items},
+            "objective": {"outcome": OUTCOME, "sense": "avert", "horizon": [2026.0, 2029.0], "discounting": "none"},
+            "constraints": {"envelope_usd": ENVELOPE},
+            "comparator": {"package": "A", "text": "every unit keeps component A alone"},
+            "outcomes_reported": [OUTCOME],
+            "uncertainty": {"level": 0.95, "draws": DRAWS, "seed": 1,
+                            "affordability": {"max_share_over_budget": ALLOWANCE, "enforce": True}, "excluded": [
                 {"parameter": HELD, "reason": f"{HELD} is a scenario value held fixed by name; DT7 runs it at both ends"}]},
-            "analysis": {"decision_tests": [{"id": "DT1", "type": "parameter_values", "parameter": "p2",
+            "analysis": {"evaluation": "emulator", "stability": {"holdout_group": GROUPING},
+                         "plan_variants": {"variants": [{"id": "one_option", "type": "group_rule", "components": ["B", "C"],
+                                                         "by": GROUPING, "text": "the cheaper option of the group in every unit"}]},
+                         "decision_tests": [{"id": "DT1", "type": "parameter_values", "parameter": "p2",
                                              "values": [1.6, 4.4], "text": "Does the plan change across p2's range?"},
                                             *_spec_tests(method)]},
+            "validation": {"burden": {"csv": BURDEN_CSV, "group": GROUPING, "arm": "comparator", "window": [2026.0, 2027.0]}},
             "deliverable": {"kind": "package_per_unit", "allocation_file": "allocation.csv",
-                            "columns": {"unit": "unit_id", "package": "package", "value": "outcome_averted"}}}
+                            "columns": {"unit": "unit_id", "package": "package", "value": "outcome_averted"},
+                            "headline": {"name": HEADLINE, "outcome": OUTCOME}}}
     if method == "history_matching":
         spec["calibration"] = {"method": "emulator_inversion", "joint": {
             "shared": list(PARAMS), "discrepancy_sd": SD_MD, "waves": 1, "points_per_unit": 4, "shared_points": 16,
@@ -241,7 +299,8 @@ def _spec_tests(method):
               if method == "history_matching" else []),
             test("DT7", "parameter_value", parameter=HELD, values=[0.0, 1.0]),
             test("DT8", "parameter_value", parameter="p2", values=[1.0, 5.5]),
-            test("DT9", "unit_attribute", unit_attribute={"column": "x1", "units": "all"})]
+            test("DT9", "unit_attribute", unit_attribute={"column": "x1", "units": "all"}),
+            test("DT10", "burden_scale", burden_scale={"references": ["ref_G3"], "shares": [1.0]})]
 
 
 def _source(kind, assumed=False):
@@ -501,16 +560,341 @@ def _estimates():
                                      "coverage": 1.0, "level": 0.95, "draws": 50}}
 
 
-def _test(tid, ran=True, changes=False):
-    share = 25.0 if changes else 0.0
-    return {"test_id": tid, "path": f"models/decision_tests/{tid}.yaml" if ran else None,
+def _test(tid, ran=True, changes=False, share=None, feasible=True):
+    """One row of analysis/decision_tests.yaml as toolkit/analysis/run.py writes it from a test's record: the share of
+    units that change package, the regret and the dollars moved, each in percent beside its threshold, and the
+    criteria that fired (toolkit/analysis/moves.py: infeasible, share, regret, dollars). A test under which the point
+    plan is not feasible changes the plan by the producer's rule."""
+    share = (25.0 if changes else 0.0) if share is None else share
+    regret, dollars = (2.0, 6.0) if changes else (0.0, 0.0)
+    fired = [] if not ran else (["infeasible"] if not feasible else []) + [k for k, v in (
+        ("share", share), ("regret", regret), ("dollars", dollars)) if v > 100 * TEST_THRESHOLDS[k]]
+    moved = int(ENVELOPE * dollars / 100)
+
+    def n(x):
+        return x if ran else None
+    return {"test_id": tid, "path": f"{TESTS_DIR}{tid}.yaml" if ran else None,
             "status": "run" if ran else "not_run",
-            "verdict": "NOT_RUN" if not ran else "CHANGES_PLAN" if changes else "NO_CHANGE",
-            "can_move_plan": True if ran else None, "threshold_pct": 10.0, "share_pct": share if ran else None,
-            "regret_pct": (2.0 if changes else 0.0) if ran else None,
+            "verdict": "NOT_RUN" if not ran else "CHANGES_PLAN" if fired else "NO_CHANGE",
+            "can_move_plan": True if ran else None, "threshold_pct": 100 * TEST_THRESHOLDS["share"], "share_pct": n(share),
+            "regret_pct": n(regret), "regret_threshold_pct": n(100 * TEST_THRESHOLDS["regret"]),
+            "dollars_moved_pct": n(dollars), "dollars_threshold_pct": n(100 * TEST_THRESHOLDS["dollars"]),
+            "dollars_reallocated_pct": n(dollars / 2), "dollars_share_pct": n(dollars), "population_changed_pct": n(share),
+            "regret": n(_r(6.9 * regret)), "objective_gap": n(0.0), "point_plan_feasible": n(feasible),
+            "dollars_moved": n(moved), "dollars_reallocated": n(moved / 2), "population_changed": n(int(219 * share)),
+            "triggered_by": n(fired), "units_changed_by_group": n([]),
+            "dollars_by_component": n({"A": 0.0, "B": -float(moved), "C": float(moved)}),
             "statement": ("This test was not run: its values could not be reached." if not ran else
                           f"This test changes the plan: {share:g}% of units change package, above the 10% threshold."
-                          if changes else "This test can move the plan: it was re-solved for each value.")}
+                          if changes else "This test can move the plan: it was re-solved for each value."),
+            "detail": {}}
+
+
+VARIED = {"parameter_values": "engine parameter {parameter} set to each listed value",
+          "parameter_value": "engine parameter {parameter} set to each listed value",
+          "interaction_rescale": "the joint effect of the listed components rescaled to each listed ratio",
+          "calibration_target": "the calibration targets of the listed units scaled",
+          "calibration_offset": "the offset of the named group left free",
+          "unit_attribute": "a column of the units table replaced for the listed units",
+          "burden_scale": "every package's outcomes in the units of each listed external reference's group scaled"}
+CRITERION = ("the package changes in more than 10% of units, or keeping the point plan loses more than 1.0% of the "
+             "re-optimised objective, or more than 5% of the allocatable budget is reallocated across units and "
+             "components, or the point plan is not feasible under the test")
+
+
+def _test_file(row, entry):
+    """models/decision_tests/<id>.yaml for a test that ran (toolkit/analysis/decision_tests.py): the question, what was
+    varied and the criterion in words, and the numbers of the row as shares."""
+    def share(k):
+        return None if row.get(k) is None else _r(row[k] / 100)
+    changes = row["verdict"] == "CHANGES_PLAN"
+    return {"statement": row["statement"], "status": row["status"], "can_move_plan": row["can_move_plan"],
+            "finding": entry.get("finding") or f"decision_test:{row['test_id']}", "test_id": row["test_id"],
+            "type": entry.get("type"), "question": entry.get("text", ""),
+            "varied": VARIED.get(entry.get("type"), "").format(parameter=entry.get("parameter")),
+            "criterion": CRITERION, "decision_changes": changes, "triggered_by": row["triggered_by"],
+            "point_plan_feasible": row["point_plan_feasible"], "share_units_changed": share("share_pct"),
+            "units_changed_by_group": [], "regret_share": share("regret_pct"), "regret": row["regret"],
+            "objective_gap": row["objective_gap"], "dollars_share": share("dollars_share_pct"),
+            "dollars_moved": row["dollars_moved"], "dollars_moved_share": share("dollars_moved_pct"),
+            "share_threshold": TEST_THRESHOLDS["share"], "regret_threshold": TEST_THRESHOLDS["regret"],
+            "dollars_threshold": TEST_THRESHOLDS["dollars"],
+            "results": [{"value": v, "units_changed": int(len(UNITS) * (row["share_pct"] or 0) / 100),
+                         "point_plan_feasible": row["point_plan_feasible"], "decision_changes": changes}
+                        for v in (entry.get("values") or [1.0])],
+            "rejected_values": [], "produced_by": "harness", "producer": "toolkit/analysis/decision_tests.py"}
+
+
+# ------------------------------------------------------------------------------------------- the Outcomes files (§5.7)
+
+def _pop(u):
+    return 1000 + 150 * UNITS.index(u)
+
+
+def _averted(u, package):
+    return {"A": 0.0, "A+B": 40.0, "A+C": 44.0}[package] + (3.0 * UNITS.index(u) if package != "A" else 0.0)
+
+
+def _unit_cost(u, package):
+    return _pop(u) * sum(PRICE[c] for c in package.split("+"))
+
+
+def _summary(median, spread=0.1):
+    """A draws summary as toolkit/analysis/uncertainty.py writes one."""
+    return {"median": _r(median), "ci_low": _r(median * (1 - spread)), "ci_high": _r(median * (1 + spread)),
+            "mean": _r(median), "level": 0.95}
+
+
+def _clean_plan(dearer=3):
+    """Each unit's package: the cheaper option of the group (A+B) but in the last `dearer` units (A+C)."""
+    return {u: "A+C" if i >= len(UNITS) - dearer else "A+B" for i, u in enumerate(UNITS)}
+
+
+def _point(plan, envelope, scale):
+    """analysis/point.yaml `data` (toolkit/analysis/core.py through run.py): the plan, its mix by component and by
+    package, each unit's benefit and cost, the totals and the budget reserve the spec's affordability rule asks for."""
+    per = {u: {"package": p, "benefit": _r(scale * _averted(u, p)), "cost": _unit_cost(u, p),
+               "averted": {OUTCOME: _r(scale * _averted(u, p))}, "z": 0.0} for u, p in plan.items()}
+    total, cost = _r(sum(x["benefit"] for x in per.values())), sum(x["cost"] for x in per.values())
+    names = sorted(set(plan.values()), key=lambda k: (-list(plan.values()).count(k), k))
+    rule = {"max_share_over_budget": ALLOWANCE, "enforce": True}
+    return {"averted": {OUTCOME: total}, "averted_discounted_objective": total,
+            "comparator_total": {OUTCOME: _r(0.4 * sum(map(_pop, UNITS)))},
+            "mix": {**{c: sum(c in p.split("+") for p in plan.values()) for c in PRICE}, "no_package": 0},
+            "packages": {k: list(plan.values()).count(k) for k in names},
+            "cost_allocated": cost, "units_on_comparator": list(plan.values()).count("A"), "budget_allocatable": envelope,
+            "discount_factor": 1.0, "cost_per_outcome_averted": _r(cost / total), "plan": dict(plan), "n_units": len(plan),
+            "solver": {"status": "optimal", "method": "ilp", "objective": total, "cost": cost},
+            "per_unit": per,
+            "reserve": {"rule": rule, "outcome": OUTCOME, "fraction": RESERVE_SHARE, "budget_allocatable": envelope,
+                        "budget_planned": RESERVE_SHARE * envelope, "reserve_usd": _r((1 - RESERVE_SHARE) * envelope),
+                        "draws": DRAWS, "seed": 1, "value_given_up": 0.0, "value_given_up_pct": 0.0}}
+
+
+def _afford(cost, envelope, draws, share):
+    return {"budget_allocatable": envelope, "draws": draws, "draws_over_budget": int(round(share * draws)),
+            "share_over_budget": share, "fixed_plan_cost": _summary(cost, 0.04),
+            "rule": {"max_share_over_budget": ALLOWANCE, "enforce": True}, "rule_met": share <= ALLOWANCE}
+
+
+def _interval(dominated):
+    return {"level": 0.95, "covers": ["engine_parameters", "calibration", "costs"], "excludes": [],
+            "prior_dominated": list(dominated), "spec_fixed": [], "fixed": [HELD], "fixed_other": 0}
+
+
+def _uncertainty(point, draws):
+    """analysis/uncertainty.yaml `data` (toolkit/analysis/uncertainty.py): the headline with the plan held fixed, as a
+    median and an interval over the draws; what was drawn and what was held at one value; the cost against the budget."""
+    h = point["averted"][OUTCOME]
+    return {"draws": draws, "seed": 1, "covers": _interval([])["covers"], "excludes": [],
+            "label": "95% interval over engine parameters, calibration and costs",
+            "fixed_plan": {OUTCOME: _summary(h)}, "reoptimised_objective": _summary(1.01 * h),
+            "units_same_package_share_median": 1.0, "units_same_package_in_90pct_of_draws": len(UNITS),
+            "components_in_any_draw_plan": sorted(PRICE), "interval": _interval(["p3"]), "calibration_clamped": 0,
+            "headline": {"name": HEADLINE, "outcome": OUTCOME},
+            "draw_plan": {"sources": [{"kind": k, "status": "drawn", "what": f"{k.replace('_', ' ')}, each draw"}
+                                      for k in _interval([])["covers"]],
+                          "drawn": [{"name": p, "kind": "calibrated", "value": BEST[p], "units": "share", "status": "drawn",
+                                     "source_kind": "calibration", "range": RANGE[p], "dist": "sample",
+                                     "source": "the calibration's accepted sample"} for p in PARAMS],
+                          "fixed": [{"name": HELD, "kind": "scenario", "value": 0.5, "units": "share", "status": "fixed",
+                                     "reason": f"{HELD} is held fixed by name in the signed spec", "card_range": [0.0, 1.0],
+                                     "source": "fixture study one, table 5"}],
+                          "prior_dominated": ["p3"]},
+            "affordability": _afford(point["cost_allocated"], point["budget_allocatable"], draws, 0.01),
+            "prior_dominated": ["p3"]}
+
+
+def _voi(point, draws, evppi=None):
+    """analysis/value_of_information.yaml `data` (toolkit/analysis/value_of_information.py): the status follows the
+    number of draws (below min_draws nothing is computed; below informative_draws every value is indicative); each
+    input's value beside its permutation noise floor."""
+    h, evpi = point["averted"][OUTCOME], 6.0
+    if draws < VOI_MIN_DRAWS:
+        return {"status": "too_few_draws", "draws": draws, "min_draws": VOI_MIN_DRAWS, "evpi": None, "inputs": [],
+                "informative_draws": VOI_INFORMATIVE_DRAWS}
+    values = {"p1": 3.6, "p2": 1.8, "p3": 0.1, **(evppi or {})}
+
+    def row(name, value, floor=0.5):
+        return {"input": name, "kind": "input", "members": [name], "bins": 4, "status": "computed", "evppi": value,
+                "pct": _r(100 * value / h), "share_of_evpi": _r(value / evpi), "df": 3, "knots": 3, "noise_floor": floor,
+                "noise_mean": _r(floor / 2), "conditional_plans": 2, "policy_share_over_budget": 0.01,
+                "policy_rule": "within the allowance", "above_noise_floor": value > floor, "exceeds_evpi": False,
+                "supported": value > floor}
+    return {"status": "computed" if draws >= VOI_INFORMATIVE_DRAWS else "indicative", "draws": draws,
+            "min_draws": VOI_MIN_DRAWS, "informative_draws": VOI_INFORMATIVE_DRAWS, "level": 0.95,
+            "max_share_over_budget": ALLOWANCE, "decide_now": "point", "decide_now_method": "the plan of the point analysis",
+            "expected_value_decide_now": h, "expected_value_perfect_information": _r(h + evpi),
+            "evpi": {"value": evpi, "pct": _r(100 * evpi / h), "se_paired": 0.5},
+            "inputs": [row(k, v) for k, v in sorted(values.items(), key=lambda kv: -kv[1])],
+            "interval_note": "each value is reported beside its permutation noise floor",
+            "outcome": OUTCOME, "discount_factor": 1.0, "budget_allocatable": point["budget_allocatable"], "groups": {},
+            "groups_not_computed": [],
+            "not_drawn": [{"input": HELD, "kind": "parameter", "reason": "held fixed by name in the signed spec"}],
+            "evppi_over": "the drawn inputs"}
+
+
+def _stability(loss=0.4):
+    """analysis/stability.yaml `data` (toolkit/analysis/stability.py): one fold per group left out. `verdict` is about
+    which package each unit keeps; `value_verdict` is the worst fold's loss of value against thresholds.yaml."""
+    folds = [{"units_changed": 0, "share_units_changed": 0.0, "point_plan_feasible": True, "point_plan_infeasible": [],
+              "regret": 0.0, "regret_share": 0.0, "triggered_by": [], "decision_changes": False, "group": g, "n_units": 4,
+              "rank_corr": 0.97, "package_concordance_pct": 100.0, "benefit_gap_pct": 0.3,
+              "total_benefit_loss_pct": _r(loss * (1 - 0.25 * k)), "z_shift_mean": 0.02} for k, g in enumerate(GROUPS)]
+    return {"method": f"leave-one-{GROUPING}-out", "holdout_group": GROUPING, "calibration_method": "emulator_inversion",
+            "n_folds": len(folds), "folds": folds, "folds_not_run": [],
+            "metrics": {"total_benefit_loss_pct_mean": _r(loss * 0.75), "total_benefit_loss_pct_worst_fold": loss,
+                        "rank_correlation_mean": 0.97, "rank_correlation_worst_fold": 0.97, "folds_with_rank_corr": 3,
+                        "package_concordance_pct_mean": 100.0, "package_concordance_pct_worst_fold": 100.0,
+                        "package_concordance_pct_worst_fold_ge5": None, "benefit_gap_pct_mean": 0.3,
+                        "benefit_gap_pct_worst_fold": 0.3, "regret_pct_worst_fold": 0.0, "dollars_moved_worst_fold": 0,
+                        "population_changed_worst_fold": 0},
+            "verdict": "ROBUST",
+            "value_verdict": ("ROBUST" if loss <= VALUE_LOSS["value_loss_pct_robust"] else
+                              "FRAGILE" if loss <= VALUE_LOSS["value_loss_pct_fragile"] else "UNSTABLE"),
+            "components": {"by_component": {c: {"provided": n, "absent": len(UNITS) - n, "changed": 0}
+                                            for c, n in (("A", 12), ("B", 9), ("C", 3))},
+                           "stable_provision": 24, "stable_absence": 12, "changed": 0},
+            "value_thresholds_pct": dict(VALUE_LOSS), "headline_metric": "total_benefit_loss_pct_worst_fold"}
+
+
+def _variants(point, draws, over=0.02):
+    """analysis/plan_variants.yaml `data` (toolkit/analysis/variants.py): the optimised plan and one variant under a
+    rule (the cheaper option of the group in every unit), with what it gives up and how often it costs more than the
+    allocatable budget over the draws."""
+    plan = {u: p.replace("C", "B") for u, p in point["plan"].items()}
+    h, obj = point["averted"][OUTCOME], _r(sum(_averted(u, p) for u, p in plan.items()) * point["averted"][OUTCOME]
+                                           / sum(_averted(u, p) for u, p in point["plan"].items()))
+    cost, changed = sum(_unit_cost(u, p) for u, p in plan.items()), sum(plan[u] != point["plan"][u] for u in plan)
+    return {"headline": "unconstrained", "outcome": OUTCOME,
+            "unconstrained": {"objective": h, "cost": point["cost_allocated"], "units_no_package": 0,
+                              "units_on_comparator": point["units_on_comparator"], "recommendation": "the optimised plan",
+                              "plan": dict(point["plan"])},
+            "variants": [{"id": "one_option", "type": "group_rule", "text": "the cheaper option of the group in every unit",
+                          "components": ["B", "C"], "by": GROUPING, "objective": obj, "cost": cost, "units_no_package": 0,
+                          "units_on_comparator": list(plan.values()).count("A"), "recommendation": "one option per group",
+                          "status": "solved", "plan": plan, "value_lost": _r(h - obj), "value_lost_pct": _r(100 * (h - obj) / h),
+                          "units_changed": changed, "share_units_changed": _r(changed / len(plan)),
+                          "units_changed_by_group": [],
+                          "uncertainty": {"draws": draws, "interval": _interval(["p3"]), "averted": {OUTCOME: _summary(obj)},
+                                          "affordability": _afford(cost, point["budget_allocatable"], draws, over)}}]}
+
+
+def _burden(draws, ratios=None):
+    """analysis/burden_validation.yaml `data` (toolkit/analysis/burden.py): the model's comparator level against
+    external references, each as a ratio against its band. Two rows are checked and two are report-only; the spec's
+    decision test DT10 names one of the report-only rows (ref_G3)."""
+    ratios = {"ref_G1": 1.05, "ref_G2": 0.95, "ref_G3": 1.1, "ref_all": 0.9, **(ratios or {})}
+    rows = []
+    for rid, ratio in ratios.items():
+        rows.append({"id": rid, "group": rid[4:], "age_band": "all", "outcome": OUTCOME, "measure": "count", "per": None,
+                     "year": 2025.0, "year_gap": 1.0, "value": 1000.0, "lower": 900.0, "upper": 1100.0, "kind": "estimated",
+                     "role": "report_only" if rid in ("ref_G3", "ref_all") else "checked", "interval": "published",
+                     "window": [2026.0, 2027.0], "group_by": None, "source": f"fixture reference table, row {rid}",
+                     "source_id": "REF-1", "derived_from": [], "tolerance": {"type": "ratio", "ratio_band": list(BURDEN_BAND)},
+                     "model": {"point": _r(1000 * ratio), "median": _r(1000 * ratio), "low": _r(900 * ratio),
+                               "high": _r(1100 * ratio), "interval_from": "the uncertainty draws", "note": ""},
+                     "ratio": ratio, "ratio_interval": [_r(0.9 * ratio), _r(1.1 * ratio)],
+                     "status": "within" if BURDEN_BAND[0] <= ratio <= BURDEN_BAND[1] else "outside"})
+    count = {k: sum(r["status"] == k for r in rows) for k in BURDEN_STATUSES}
+    return {"arm": "comparator", "group_column": GROUPING, "window": [2026.0, 2027.0], "csv": BURDEN_CSV, "draws": draws,
+            "references": rows, "summary": {**count, "report_only": 2, "n": len(rows)},
+            "statement": f"{count['within']} of {len(rows)} references are within their band."}
+
+
+def _emulator():
+    """analysis/emulator.yaml `data` (toolkit/analysis/run.py): the emulator's accuracy on its held-out points."""
+    return {"accuracy": {"holdout_points": 40, "training_points": 160, "gps": 3, "cal_logit_rmse": 0.05,
+                         "reduction_r2_median": 0.97, "reduction_r2_p10": 0.91, "reduction_mae_median": 0.01,
+                         "base_log_rmse": 0.04},
+            "fit_seconds": 12.5, "features": ["x1", "pop"], "training_corrections": {},
+            "domain": {"inputs": list(PARAMS), "lo": [PRIOR[p][0] for p in PARAMS], "hi": [PRIOR[p][1] for p in PARAMS]}}
+
+
+def _boundary(plan, runner=None, units=UNITS[6:]):
+    """analysis/emulator_boundary.yaml `data` (toolkit/analysis/boundary.py): the units whose package and runner-up are
+    closest, run on the engine. On the clean run the rows between them hold every component."""
+    runner = runner or {"A+B": "A+C", "A+C": "A+B", "A": "A+B"}
+    rows = [{"unit": u, "chosen": plan[u], "runner_up": runner[plan[u]], "gap": _r(0.02 + 0.01 * k),
+             "emulator": {"ratio_chosen": _r(1.2 + 0.01 * k), "ratio_runner_up": _r(1.1 + 0.01 * k)},
+             "engine": {"ratio_chosen": _r(1.21 + 0.01 * k), "ratio_runner_up": _r(1.09 + 0.01 * k)},
+             "engine_tie": False, "match": True} for k, u in enumerate(units)]
+    return {"status": "judged", "units_requested": len(rows), "units": len(rows), "matched": len(rows),
+            "share_matched": 1.0, "threshold": BOUNDARY_MIN, "tie_rel_gap": 0.01, "engine_ties": 0, "passes": True,
+            "rows": rows, "held_out_source": "engine runs at the calibrated values, three per unit",
+            "engine_runs": 3 * len(rows)}
+
+
+def _replan(m, plan=None, envelope=None, scale=None, draws=None):
+    """Recompute every file that follows from the plan, the envelope, the size of each unit's benefit or the number of
+    draws, so the files of a variant agree with each other as the clean run's do."""
+    a = m["plan_args"]
+    a.update({k: v for k, v in (("plan", plan), ("envelope", envelope), ("scale", scale), ("draws", draws)) if v is not None})
+    m["spec"]["constraints"]["envelope_usd"], m["spec"]["uncertainty"]["draws"] = a["envelope"], a["draws"]
+    m["point"] = _point(a["plan"], a["envelope"], a["scale"])
+    dominated = m["unc"]["prior_dominated"] if "unc" in m else ["p3"]
+    m["unc"] = _uncertainty(m["point"], a["draws"])
+    m["unc"]["prior_dominated"] = dominated
+    m["voi"], m["pv"] = _voi(m["point"], a["draws"]), _variants(m["point"], a["draws"])
+    m["bv"], m["emb"] = _burden(a["draws"]), _boundary(a["plan"])
+
+
+def _estimates_spec(spec):
+    """The signed spec of an `estimates` deliverable (toolkit/spec/estimates.py): outputs and a decision rule on one
+    of them; no units to allocate to, so no options, comparator, constraints or plan."""
+    for k in ("options", "comparator", "objective", "constraints", "outcomes_reported", "validation"):
+        del spec[k]
+    spec["analysis"] = {"evaluation": "direct"}
+    spec["uncertainty"] = {"level": 0.95, "draws": DRAWS, "seed": 1}
+    spec["deliverable"] = {"kind": "estimates", "windows": {"w1": [2026.0, 2027.0]},
+                           "outputs": [{"name": "q1", "metric": "m1", "window": "w1", "scale": "ratio"},
+                                       {"name": "q2", "metric": "m2", "window": "w1", "scale": "share"}],
+                           "decision": {"kind": "threshold", "output": "q1", "threshold": 1.0, "direction": "below",
+                                        "probability": 0.9}}
+
+
+def _estimates_full(est):
+    """What analysis/estimates.yaml `data` holds beside the predictive band for the `estimates` deliverable
+    (toolkit/analysis/estimates.py): each output as a median and an interval, the decision rule's verdict, and the
+    decision tests, one per parameter range, each end with the rule's verdict there."""
+    def output(median, sd, scale):
+        return {"mean": median, "median": median, "sd": sd, "ci_low": _r(median - 1.96 * sd),
+                "ci_high": _r(median + 1.96 * sd), "n": DRAWS, "metric": "m1", "window": "w1", "scale": scale,
+                "label": "95% interval over calibration and observation"}
+
+    def test(p):
+        ends = [{"value": v, "kind": "declared", "median": {"q1": 0.8}, "interval": {"q1": [0.7, 0.9]}, "loglik_drop": 0.4,
+                 "rejected_by_data": False, "fit_verified": True, "verdict": "yes", "probability": 0.97} for v in PRIOR[p]]
+        return {"id": f"prior_range_{p}", "parameter": p, "class": "identified", "values": list(PRIOR[p]),
+                "source": "the declared prior range", "status": "run", "ends": ends, "decision_changes": False,
+                "ends_rejected_by_data": []}
+    est.update({"outputs": {"q1": output(0.8, 0.05, "ratio"), "q2": output(0.3, 0.02, "share")},
+                "windows": {"w1": [2026.0, 2027.0]},
+                "decision": {"output": "q1", "threshold": 1.0, "direction": "below", "probability_required": 0.9,
+                             "probability": 0.97, "verdict": "yes",
+                             "statement": "q1 is below 1.0 with probability 0.97, above the 0.9 the rule asks for."},
+                "decision_tests": [test(p) for p in PARAMS[:2]],
+                "parameters": {p: {"median": BEST[p], "interval": RANGE[p],
+                                   "prior": {"dist": "uniform", "source": "fixture prior", "range": PRIOR[p]}} for p in PARAMS}})
+    return est
+
+
+def _other(m, name):
+    """The second run of the same question (`build(..., other=name)`, OTHERS)."""
+    more = {u: "A+C" if i >= 6 else "A+B" for i, u in enumerate(UNITS)}       # three more units on the dearer option
+    if name == "second":
+        _replan(m, envelope=110000.0)
+    elif name == "shifted":
+        _replan(m, plan=more, envelope=110000.0)
+    elif name == "shifted_same_spec":
+        _replan(m, plan=more)
+    elif name == "headline":
+        m["spec"]["comparator"]["text"] = "every unit keeps component A alone, at the earlier level of delivery"
+        _replan(m, scale=1.6)
+    elif name == "other_question":
+        m["spec"]["question"] = "Which units should get component C first? (synthetic fixture)"
+    elif name == "unverified":
+        m["signed_after"] = lambda spec: spec["constraints"].update(envelope_usd=120000.0)
 
 
 def _set_test(m, tid, **how):
@@ -825,7 +1209,7 @@ def _report_files(m):
                                 "writer_span": [len(lines[0]) + 2, len(report)]}, indent=1)}
 
 
-def _model(method, figures="standard"):
+def _model(method, figures="standard", kind="package_per_unit"):
     names = (["figures/estimates_q1.png", "estimates_q2.png"], ["figures/diagnostics_ppc.png"]) if figures == "estimates" \
         else (["figures/headline.png", "figures/frontier.png", "decision_tests.png"], ["figures/data_coverage.png"])
     m = {"method": method, "spec": _spec(method),
@@ -841,8 +1225,9 @@ def _model(method, figures="standard"):
          "fig": {"set": figures, "producer": None, "not_produced": {}, "stale": {}, "no_path": (), "no_record": (),
                  "bad_record": (), "unlisted": (), "dropped": (), "redrawn": (), "report": names[0], "manuscript": names[1]}, "unc": {"draws": 50, "seed": 1, "calibration_clamped": 0,
                                                           "prior_dominated": ["p3"]},
-         "dt": {"tests": [_test("DT1")] + [_test(t["id"], changes=t["id"] == "DT9") for t in _spec_tests(method)]
-                + [_test(f"scenario_excluded_{HELD}", ran=False)]},
+         # every test ran and none changes the plan or comes near a threshold (§9: a plan-changing test, a near miss and a
+         # test that did not run are each something the Outcomes view raises, so each is a variant)
+         "dt": {"tests": [_test("DT1")] + [_test(t["id"]) for t in _spec_tests(method)]},
          # the register's sources (§6); `comments` are comment lines of the spec, `disk` an edit made to the spec on
          # disk after the sign-off, `old` the two files an older run keeps dispositions in
          "findings": _findings(), "ledger_extra": [], "choice": _choice(), "dossier": _dossier(), "high": [],
@@ -856,6 +1241,19 @@ def _model(method, figures="standard"):
         m["jc"] = _joint()
     else:
         m["cal"], m["est"] = _posterior(), _estimates()
+    # the Outcomes files (§5.7): `plan_args` what the plan-dependent files are computed from (_replan); `raw` {file:
+    # a change to its text as written}; `signed_after` an edit made to the signed copy of the spec after the sign-off
+    m.update(kind=kind, plan_args={"plan": _clean_plan(), "envelope": ENVELOPE, "scale": 1.0, "draws": DRAWS},
+             stab=_stability(), emu=_emulator(), raw={}, signed_after=None)
+    _replan(m)
+    if kind == "estimates":
+        _estimates_spec(m["spec"])
+        m["est"], m["dt"] = _estimates_full(m["est"]), None
+        m["unc"] = {"draws": DRAWS, "seed": 1, "covers": ["calibration", "observation"], "excludes": [],
+                    "label": "95% interval over calibration and observation",
+                    "interval": {"level": 0.95, "covers": ["calibration", "observation"], "excludes": [], "prior_dominated": ["p3"]},
+                    "fixed_plan": {"not_applicable": "an estimates deliverable has no plan"},
+                    "outputs": copy.deepcopy(m["est"]["outputs"]), "prior_dominated": ["p3"]}
     return m
 
 
@@ -1325,6 +1723,10 @@ SIGNED = SPEC_FILES + [JC, DT]
 DECLARED = SPEC_FILES + [CHOICE, ENGINE_REC, LEDGER, SCOPE, GATES[1]]     # what the `declared` variant itself changes
 DEPARTED = SPEC_FILES + [CHOICE]                                           # what a signed departure itself changes
 UNIT_FILES = [JC, "figures/calibration_fit.csv", "figures/calibration_residuals.csv", "figures/calibration_unit_fit.csv"]
+# `across` lists the checks of OTHER views the same edit must move, by their full ids ({"register.undisposed": "look"}); an
+# Outcomes case holds every view's checks to it, so an edit that moves a check it does not name is caught. `against`
+# (Outcomes, run_shift): the edit is to the comparison, not to the run: the clean run is read against the run that
+# `build(..., other=<against>)` writes. `kinds`: the deliverable kinds an edit is defined for (default package_per_unit).
 # Defect name -> view (the view whose check moves; none: the Fit view), case (scorecard, or None), check (the one
 # check of that view that moves), status (what it moves to), also (any other check of that view the same edit must
 # move, by rule), unpinned (checks of that view whose status the edit leaves open), figure_sets (the figure sets a
@@ -1361,6 +1763,7 @@ DEFECTS = {
                 "the signed spec and in unmatched_decision.declared that names decision test DT2, which ran with "
                 "verdict NO_CHANGE."},
     "C13_blocked_test_not_run": {
+        "across": {'outcomes.tests_that_move': 'look'},
         "case": "C13", "check": "status", "status": "problem", "methods": HM, "files": SIGNED,
         "apply": lambda m: _blocked_declared(m, ran=False),
         "edit": "The same block and declaration naming DT2, but analysis/decision_tests.yaml records DT2 with "
@@ -1390,6 +1793,7 @@ DEFECTS = {
         "case": "C3", "check": "target_error", "status": "look", "methods": HM, "apply": _assumed, "files": [JC],
         "edit": "The source text of unit target unit_r2:U07 labels its sd 0.3 an ASSUMPTION."},
     "C14_prior_dominated": {
+        "across": {'outcomes.voi_support': 'look'},
         "case": "C14", "check": "constrained", "status": "look", "methods": BOTH, "apply": _dominated, "files": [UNC],
         "edit": "analysis/uncertainty.yaml data.prior_dominated gains p1, whose range contracted by more than half."},
     "emulator_vs_engine": {
@@ -1455,6 +1859,7 @@ DEFECTS = {
         "edit": "The same finding D-001 (HIGH, blocking) has status declared with decision test DT1, which ran with "
                 "verdict NO_CHANGE, and scope_declaration.yaml declares it by its id with that test."},
     "test_unlinked": {
+        "across": {'outcomes.tests_that_move': 'look'},
         "view": "register", "case": None, "check": "tests_unlinked", "status": "look", "methods": BOTH,
         "apply": lambda m: _set_test(m, "DT1", changes=True), "files": [DT], "also": {"undisposed": "look"},
         "edit": "analysis/decision_tests.yaml records DT1, a test no finding, declaration or dossier entry names, with "
@@ -1469,6 +1874,7 @@ DEFECTS = {
                 "grp_r1:G1 with DT6 (history matching), and the ledger holds finding R-001 as declared with DT3, "
                 "which scope_declaration.yaml declares by its id."},
     "declared_test_not_run": {
+        "across": {'outcomes.tests_that_move': 'look'},
         "view": "register", "case": None, "check": "declared_untested", "status": "problem", "methods": BOTH,
         "apply": _on_declared(lambda m: _set_test(m, "DT4", ran=False)), "files": DECLARED + [DT],
         "edit": "On the run of variant declared, analysis/decision_tests.yaml records DT4, the test the signed engine "
@@ -1554,6 +1960,7 @@ DEFECTS = {
         "edit": "scope_declaration.yaml gains a declaration whose blocker_id X-404 is the id of no finding in "
                 "findings.jsonl, with decision test DT1."},
     "decision_tests_missing": {
+        "across": {'outcomes.tests_that_move': 'not_available', 'outcomes.infeasible_tests': 'not_available', 'outcomes.fixed_inputs': 'not_available'},
         "view": "register", "case": None, "check": "declared_untested", "status": "not_available", "methods": BOTH,
         "apply": _no_tests_file, "files": [DT] + [f"figures/decision_tests{e}" for e in (".png", ".svg", ".csv")],
         "also": {"tests_unlinked": "not_available", "decides_unknown": "not_available"},
@@ -1573,6 +1980,7 @@ DEFECTS = {
                 "status out_of_band; the signed spec gains a departure for B2 naming decision test DT4, which ran "
                 "with verdict NO_CHANGE, and engine_choice.json records it as signed with the benchmark's status."},
     "C4_out_of_band_departure_not_run": {
+        "across": {'outcomes.tests_that_move': 'look'},
         "view": "model", "case": "C4", "check": "benchmarks", "status": "problem", "methods": BOTH,
         "apply": lambda m: _b2_out(m, ran=False), "files": DEPARTED + [ENGINE_REC, DT], "also": {"departures": "problem"},
         "edit": "Benchmark B2 is out of band as in C4_out_of_band_departure, and analysis/decision_tests.yaml records "
@@ -1658,6 +2066,7 @@ DEFECTS = {
                 "decision test DT5, which ran with verdict NO_CHANGE and no unit changing package; engine_choice.json "
                 "records it as signed with benchmark_status no benchmark."},
     "departure_near_miss": {
+        "across": {'outcomes.tests_that_move': 'look'},
         "view": "model", "case": None, "check": "departures", "status": "look", "methods": BOTH,
         "apply": lambda m: (_b2_out(m), _share("DT4", 9.0)(m)), "files": DEPARTED + [ENGINE_REC, DT],
         "also": {"benchmarks": "look"},
@@ -1672,6 +2081,7 @@ DEFECTS = {
                 "decision tests and, having no artifact header, left outside the manifest."},
     # §9, the third fixture for the Model view
     "departure_test_not_run": {
+        "across": {'outcomes.tests_that_move': 'look'},
         "view": "model", "case": None, "check": "departures", "status": "problem", "methods": BOTH,
         "apply": lambda m: (_depart(m, "B"), _set_test(m, "DT5", ran=False)), "files": DEPARTED + [DT],
         "edit": "The signed spec holds the departure for component B as in departure_component, and "
@@ -1769,15 +2179,238 @@ DEFECTS = {
                 "diagnostics_ppc in the estimates set) has no path key."},
 }
 
+# ---- the Outcomes view's edits (§5.7)
+
+def _headline_draws(median, low, high):
+    """The draws' summary of the headline moved against the point value (shares of the point value)."""
+    def edit(m):
+        h = m["point"]["averted"][OUTCOME]
+        m["unc"]["fixed_plan"][OUTCOME].update(median=_r(median * h), ci_low=_r(low * h), ci_high=_r(high * h))
+    return edit
+
+
+def _evppi(**values):
+    return lambda m: m.update(voi=_voi(m["point"], m["plan_args"]["draws"], values))
+
+
+def _ratio(rid, ratio, test_ran=True):
+    def edit(m):
+        m["bv"] = _burden(m["plan_args"]["draws"], {rid: ratio})
+        if not test_ran:
+            _set_test(m, "DT10", ran=False)
+    return edit
+
+
+def _unknown_package(m):
+    point = m["point"]
+    point["plan"]["U01"] = point["per_unit"]["U01"]["package"] = "A+D"
+    point["packages"] = {k: list(point["plan"].values()).count(k) for k in sorted(set(point["plan"].values()))}
+
+
+def _variant_no_cost(m):
+    v = m["pv"]["variants"][0]
+    v.update(status="not_solved", cost=None, objective=None, value_lost=None, value_lost_pct=None, plan=None)
+    v["uncertainty"] = None
+
+
+def _pair(tid, **words):
+    def edit(m):
+        next(t for t in m["dt"]["tests"] if t["test_id"] == tid).update(words)
+    return edit
+
+
+def _stops_short(key):
+    """A file that stops inside the list under `key`, which is never closed."""
+    return lambda text: text[:text.index(f"  {key}:")] + f"  {key}: [{{test_id: DT1,\n"
+
+
+def _reversed_interval(m):
+    f = m["unc"]["fixed_plan"][OUTCOME]
+    f["ci_low"], f["ci_high"] = f["ci_high"], f["ci_low"]
+
+
+def _est_test(**how):
+    def edit(m):
+        t = m["est"]["decision_tests"][0]
+        if "verdict" in how:
+            t["ends"][1].update(verdict=how["verdict"], probability=0.4)
+            t["decision_changes"] = True
+        if "status" in how:
+            t["status"] = how["status"]
+    return edit
+
+
+PLAN_FILES = [POINT, "allocation.csv", RESULTS]
+EST_KIND = ("estimates",)
+
+
+def _out(check, status, apply, files, edit, case=None, **more):
+    return {"view": "outcomes", "case": case, "check": check, "status": status, "methods": BOTH, "apply": apply,
+            "files": files, "edit": edit, **more}
+
+
+def _nothing(m):
+    return None
+
+
+OUTCOME_CHECKS = ("dearest_wins", "share_of_burden", "point_vs_draws", "tests_that_move", "burden_refs", "voi_support",
+                  "boundary_coverage", "run_shift", "stability_agreement", "infeasible_tests", "variant_budget", "fixed_inputs")
+DEFECTS.update({
+    "C8_dearest_wins": _out(
+        "dearest_wins", "look", lambda m: _replan(m, plan=_clean_plan(dearer=11)), PLAN_FILES, case="C8",
+        edit="The plan gives the dearer option of the group (A+C) to eleven of the twelve units, 92% against the "
+             "producer's 90%, and every file computed from the plan follows."),
+    "C8_dearest_few_units": _out(
+        "dearest_wins", "ok", lambda m: _replan(m, plan={u: "A+C" if i >= 8 else "A" for i, u in enumerate(UNITS)}),
+        PLAN_FILES, case="C8",
+        edit="The plan leaves eight units on the comparator package and gives the dearer option to the other four, "
+             "all of the units that hold the group but fewer than the producer's minimum of five."),
+    "C7_share_of_burden": _out(
+        "share_of_burden", "look", lambda m: _replan(m, scale=7.0), PLAN_FILES, case="C7",
+        edit="Every unit's benefit is seven times larger, so the headline is 55% of the comparator total, and the "
+             "draws and every file computed from the point follow."),
+    "point_outside_interval": _out(
+        "point_vs_draws", "problem", _headline_draws(0.8, 0.72, 0.88), [UNC],
+        edit="In analysis/uncertainty.yaml the headline's median over the draws is 80% of the point value and its "
+             "interval ends at 88% of it, so the point value lies above the interval."),
+    "point_far_from_median": _out(
+        "point_vs_draws", "look", _headline_draws(0.93, 0.84, 1.02), [UNC],
+        edit="In analysis/uncertainty.yaml the headline's median over the draws is 93% of the point value, which is "
+             "inside the interval and 7.5% of the median above it."),
+    "interval_reversed": _out(
+        "point_vs_draws", "problem", _reversed_interval, [UNC],
+        edit="In analysis/uncertainty.yaml the two ends of the headline's interval are exchanged, so its lower end is "
+             "above its upper end."),
+    "test_changes_linked": _out(
+        "tests_that_move", "look", lambda m: _set_test(m, "DT9", changes=True), [DT],
+        edit="DT9, the test the dossier's entry for unit attribute x1 names, has the verdict CHANGES_PLAN with 25% "
+             "of units against the 10% threshold."),
+    "test_changes_unlinked": _out(
+        "tests_that_move", "look", lambda m: _set_test(m, "DT1", changes=True), [DT],
+        across={"register.tests_unlinked": "look", "register.undisposed": "look"},
+        edit="DT1, a test no finding, declaration or dossier entry names, has the verdict CHANGES_PLAN with 25% of "
+             "units against the 10% threshold."),
+    "test_near_miss": _out(
+        "tests_that_move", "look", lambda m: _set_test(m, "DT1", share=8.0), [DT],
+        edit="DT1 keeps the verdict NO_CHANGE with 8% of units changing package, within a quarter of its 10% threshold."),
+    "test_not_run": _out(
+        "tests_that_move", "ok", lambda m: m["dt"]["tests"].append(_test(f"scenario_excluded_{HELD}", ran=False)), [DT],
+        edit="analysis/decision_tests.yaml holds one more test, the automatic one for the scenario value the spec "
+             "holds fixed by name, with status not_run and verdict NOT_RUN: the producer's own not-run scenario for an "
+             "input the signed spec excludes, which is listed and does not raise the check (§5.7, settled)."),
+    "test_pair_contradicts": _out(
+        "tests_that_move", "problem", _pair("DT1", verdict="NOT_RUN"), [DT], across={"register.tests_unlinked": "problem"},
+        edit="DT1 has status run beside the verdict NOT_RUN, a pair the analysis does not write."),
+    "tests_unparsable": _out(
+        "tests_that_move", "not_available", lambda m: m["raw"].update({DT: _stops_short("tests")}), [DT],
+        also={"infeasible_tests": "not_available", "fixed_inputs": "not_available"},
+        across={f"register.{k}": "not_available" for k in ("tests_unlinked", "declared_untested", "decides_unknown")},
+        edit="analysis/decision_tests.yaml stops inside its list of tests, which is never closed."),
+    "burden_report_only_tested": _out(
+        "burden_refs", "look", _ratio("ref_G3", 2.6), [BV],
+        edit="Reference ref_G3, which is report-only and named by decision test DT10 that ran, has a ratio of 2.6 "
+             "against its band of 0.5 to 2 and the status outside."),
+    "burden_report_only_untested": _out(
+        "burden_refs", "problem", _ratio("ref_all", 2.6), [BV],
+        edit="Reference ref_all, which is report-only and named by no decision test, has a ratio of 2.6 against "
+             "its band of 0.5 to 2 and the status outside."),
+    "burden_checked_outside": _out(
+        "burden_refs", "problem", _ratio("ref_G1", 2.6), [BV],
+        edit="Reference ref_G1, a checked row, has a ratio of 2.6 against its band of 0.5 to 2 and the status outside."),
+    "burden_test_not_run": _out(
+        "burden_refs", "problem", _ratio("ref_G3", 2.6, test_ran=False), [BV, DT], also={"tests_that_move": "look"},
+        edit="Reference ref_G3 is outside its band as in burden_report_only_tested, and DT10, the test that names "
+             "it, has status not_run."),
+    "voi_indicative": _out(
+        "voi_support", "look", lambda m: _replan(m, draws=200), SPEC_FILES, case="C14",
+        edit="The signed spec asks for 200 draws, below the 500 the producer calls informative, so the value of "
+             "information has the status indicative and every file follows the spec."),
+    "voi_too_few_draws": _out(
+        "voi_support", "not_available", lambda m: _replan(m, draws=20), SPEC_FILES, case="C14",
+        edit="The signed spec asks for 20 draws, below the producer's minimum of 30, so the value of information "
+             "has the status too_few_draws with no value computed."),
+    "voi_none_above_floor": _out(
+        "voi_support", "look", _evppi(p1=0.3, p2=0.2), [VOI], case="C14",
+        edit="In analysis/value_of_information.yaml every input's value is below its noise floor of 0.5, so none is "
+             "supported."),
+    "C14_dominated_carries_value": _out(
+        "voi_support", "look", _evppi(p3=2.4), [VOI], case="C14",
+        edit="Input p3, which the uncertainty file lists as prior-dominated, has a value of 2.4 against its noise "
+             "floor of 0.5: above the floor and 40% of the total."),
+    "boundary_uncovered": _out(
+        "boundary_coverage", "look", lambda m: m.update(emb=_boundary(m["point"]["plan"], {"A+B": "A"}, UNITS[3:9])), [EMB],
+        edit="The emulator boundary check holds six units whose package is A+B with the runner-up A, so component C "
+             "is in no row."),
+    "stability_disagree": _out(
+        "stability_agreement", "look", lambda m: m.update(stab=_stability(loss=2.0)), [STAB],
+        edit="In analysis/stability.yaml the worst fold loses 2% of the value, so value_verdict is FRAGILE beside the "
+             "plan's verdict ROBUST."),
+    "test_infeasible": _out(
+        "infeasible_tests", "look", lambda m: _set_test(m, "DT1", feasible=False), [DT], also={"tests_that_move": "look"},
+        across={"register.tests_unlinked": "look", "register.undisposed": "look"},
+        edit="Under DT1 the point plan is not feasible (point_plan_feasible false, triggered_by infeasible), which "
+             "by the producer's rule gives the verdict CHANGES_PLAN."),
+    "variant_over_budget": _out(
+        "variant_budget", "look", lambda m: m.update(pv=_variants(m["point"], m["plan_args"]["draws"], over=0.3)), [PV],
+        edit="The plan variant costs more than the allocatable budget in 30% of draws, against the 10% the signed "
+             "spec allows, with rule_met false."),
+    "variant_no_cost": _out(
+        "variant_budget", "not_available", _variant_no_cost, [PV],
+        edit="The plan variant has the status not_solved, with no cost, no plan and no draws."),
+    "fixed_input_changes_plan": _out(
+        "fixed_inputs", "look", lambda m: _set_test(m, "DT7", changes=True), [DT], also={"tests_that_move": "look"},
+        edit=f"DT7, which varies {HELD}, an input the uncertainty file lists as held at one value, has the verdict "
+             "CHANGES_PLAN."),
+    "plan_unknown_package": _out(
+        "dearest_wins", "not_available", _unknown_package, PLAN_FILES,
+        edit="The plan gives unit U01 the package A+D, and the signed spec defines no component D."),
+    "unknown_deliverable_kind": _out(
+        "dearest_wins", "not_available", lambda m: m["spec"]["deliverable"].update(kind="ranking"), SPEC_FILES,
+        also={k: "not_available" for k in OUTCOME_CHECKS[1:] if k != "run_shift"},
+        edit="The signed spec's deliverable.kind is ranking, which is neither of the two kinds the analysis writes."),
+    "C6_shift_spec_differs": _out(
+        "run_shift", "look", _nothing, [], case="C6", against="shifted",
+        edit="Nothing in this run: it is compared with the run `shifted`, in which three more units of twelve get the "
+             "dearer option and the signed spec's constraints.envelope_usd differs."),
+    "C6_shift_same_spec": _out(
+        "run_shift", "problem", _nothing, [], case="C6", against="shifted_same_spec",
+        edit="Nothing in this run: it is compared with the run `shifted_same_spec`, in which three more units of "
+             "twelve get the dearer option and the signed spec is the same in every key."),
+    "C6_headline_shift": _out(
+        "run_shift", "look", _nothing, [], case="C6", against="headline",
+        edit="Nothing in this run: it is compared with the run `headline`, whose headline is 1.6 times this one's "
+             "and whose signed spec differs in comparator.text."),
+    "C6_second_run": _out(
+        "run_shift", "ok", _nothing, [], case="C6", against="second",
+        edit="Nothing in this run: it is compared with the run `second`, which has the same plan and headline and "
+             "a signed spec that differs in constraints.envelope_usd alone."),
+    "C6_other_question": _out(
+        "run_shift", "not_available", _nothing, [], case="C6", against="other_question",
+        edit="Nothing in this run: it is compared with the run `other_question`, whose signed spec asks another question."),
+    "C6_unverified": _out(
+        "run_shift", "not_available", _nothing, [], case="C6", against="unverified",
+        edit="Nothing in this run: it is compared with the run `unverified`, whose signed copy of the spec was "
+             "edited after the sign-off and no longer has the recorded hash."),
+    "estimates_test_changes": _out(
+        "tests_that_move", "look", _est_test(verdict="no"), [EST], kinds=EST_KIND, methods=POST, figure_sets=FIGURE_SETS[1:],
+        edit="In analysis/estimates.yaml the first decision test has decision_changes true: at one end of the "
+             "parameter's range the rule's verdict is no where the estimate's is yes."),
+    "estimates_test_unknown_status": _out(
+        "tests_that_move", "not_available", _est_test(status="done"), [EST], kinds=EST_KIND, methods=POST, figure_sets=FIGURE_SETS[1:],
+        edit="In analysis/estimates.yaml the first decision test has the status done, a word the producer does not write."),
+})
+
 
 REGISTER_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "register")
 MODEL_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "model")
 FIGURES_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "figures")
+OUTCOMES_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "outcomes")
 
 
 def artifacts(method):
     """The analysis files that carry an artifact header, for a method (standard figure set)."""
-    return ([JC, CAL] if method == "history_matching" else [CAL, EST]) + [ENGINE_REC, "analysis/point.yaml", UNC, DT, FIGS]
+    return ([JC, CAL] if method == "history_matching" else [CAL, EST]) + [ENGINE_REC, POINT, UNC, DT, FIGS,
+                                                                           EMU, EMB, VOI, BV, STAB, PV]
 
 
 def figure_sets(defect):
@@ -1913,6 +2546,15 @@ def _render(m, stage):
          "producer": "toolkit/spec/signoff.py"}, indent=1)
     files[CHOICE] = json.dumps(m["choice"], indent=1)
     files[LABELS] = _yaml({"labels": {"units": {u: f"unit {u}" for u in UNITS[:2]}}, "theme": "light"})
+    plans = m["kind"] == "package_per_unit"
+    if plans:
+        files[BURDEN_CSV] = _csv(["id", "group", "outcome", "year", "value", "lower", "upper", "kind", "source_id", "role"],
+                                 [[r["id"], r["group"], r["outcome"], r["year"], r["value"], r["lower"], r["upper"], r["kind"],
+                                   r["source_id"], r["role"]] for r in _burden(DRAWS)["references"]])
+
+    def cut(rel):       # a change to a file's text as written (a file that stops short), made before anything hashes it
+        if rel in m["raw"] and rel in files:
+            files[rel] = m["raw"][rel](files[rel])
     files.update(_register_files(m))
     data_in = ["decision_spec.yaml", "data/derived/units.csv", "data/derived/targets.csv"]
     artifact(ENGINE_REC, "engine", "toolkit/analysis/run.py", ["decision_spec.yaml"], m["eng"], 95)
@@ -1926,6 +2568,8 @@ def _render(m, stage):
             "producer": "toolkit/spec/engine_parameters.py:write_spec_benchmarks", "sha256": sha(BSV),
             "spec_parameters": m["bsv"]["spec_parameters"], "spec_sha256": sha("decision_spec.yaml"), "written_at": _at(85)},
             indent=1, sort_keys=True)
+    if plans:      # the emulator is fitted before the calibration (run.py); its batch files are not in the fixture
+        artifact(EMU, "emulator", "toolkit/analysis/run.py", data_in[:2], m["emu"], 98)
     if method == "history_matching":
         artifact(JC, "joint_calibration", "toolkit/analysis/joint_calibration.py", data_in, m["jc"], 100)
         artifact(CAL, "calibration", "toolkit/analysis/calibration.py", ["data/derived/units.csv", JC],
@@ -1933,23 +2577,47 @@ def _render(m, stage):
     else:
         artifact(CAL, "calibration", "toolkit/analysis/calibration.py", data_in[1:], m["cal"], 110)
     files.update(_figures(m))
-    artifact("analysis/point.yaml", "point", "toolkit/analysis/point.py", [CAL],
-             {"n_units": len(UNITS), "mix": {"A": 7, "A+B": 5}}, 150, stale=m["stale"])
-    artifact(UNC, "uncertainty", "toolkit/analysis/uncertainty.py", ["analysis/point.yaml"], m["unc"], 200)
-    if m["dt"] is not None:
-        artifact(DT, "decision_tests", "toolkit/analysis/decision_tests.py", ["analysis/point.yaml", UNC] + [BSV] * bool(m["bsv"]), m["dt"], 230)
+    unc = copy.deepcopy(m["unc"])
+    for part in ("interval", "draw_plan"):          # the lists of prior-dominated inputs are one list, written three times
+        if part in unc:
+            unc[part]["prior_dominated"] = list(unc["prior_dominated"])
+    if plans:      # in the order toolkit/analysis/run.py writes them
+        point = m["point"]
+        artifact(POINT, "point", "toolkit/analysis/core.py", [CAL], point, 150, stale=m["stale"])
+        artifact(EMB, "emulator_boundary", "toolkit/analysis/boundary.py", [POINT], m["emb"], 160)
+        artifact(UNC, "uncertainty", "toolkit/analysis/uncertainty.py", [POINT], unc, 200)
+        cut(UNC)
+        artifact(VOI, "value_of_information", "toolkit/analysis/value_of_information.py", [UNC], m["voi"], 205)
+        artifact(BV, "burden_validation", "toolkit/analysis/burden.py", [POINT, UNC, BURDEN_CSV], m["bv"], 210)
+        artifact(STAB, "stability", "toolkit/analysis/stability.py", [POINT, CAL], m["stab"], 215)
+        artifact(PV, "plan_variants", "toolkit/analysis/variants.py", [POINT], m["pv"], 220)
+        if m["dt"] is not None:
+            artifact(DT, "decision_tests", "toolkit/analysis/decision_tests.py", [POINT, UNC] + [BSV] * bool(m["bsv"]), m["dt"], 230)
+            cut(DT)
+            entries = {t["id"]: t for t in m["spec"]["analysis"]["decision_tests"]}
+            for row in m["dt"]["tests"]:
+                if row["path"]:
+                    files[row["path"]] = _yaml(_test_file(row, entries.get(row["test_id"], {})))
+        files["allocation.csv"] = _csv(["unit_id", "package", "outcome_averted"],
+                                       [[u, x["package"], x["benefit"]] for u, x in point["per_unit"].items()])
+        files[RESULTS] = ("# Results (synthetic fixture)\n\n- units: 12\n- packages: "
+                          + ", ".join(f"{k} in {n}" for k, n in point["packages"].items())
+                          + f"\n- {HEADLINE}: {point['averted'][OUTCOME]:g}\n")
+    else:
+        artifact(UNC, "uncertainty", "toolkit/analysis/uncertainty.py", [CAL], unc, 200)
+        files[RESULTS] = "# Results (synthetic fixture)\n\n- outputs: q1, q2\n"
     if "est" in m:
         artifact(EST, "estimates", "toolkit/analysis/estimates.py", [CAL], m["est"], 232)
-    files["allocation.csv"] = _csv(["unit_id", "package", "outcome_averted"],
-                                   [[u, "A" if i % 12 < 7 else "A+B", 40 + 3 * i] for i, u in enumerate(UNITS)])
-    files[RESULTS] = "# Results (synthetic fixture)\n\n- units: 12\n- packages: A, A+B\n"
+        cut(EST)
     images = _figure_files(m, files, sha, artifact)
     arts = [r for r in files if r.startswith("analysis/") and r.endswith(".yaml") and r != BSV]
     files["analysis/manifest.json"] = json.dumps({
         "artifacts": {r: {"kind": r[9:-5], "producer": f"toolkit/analysis/{r[9:-5]}.py", "sha256": sha(r)} for r in arts},
         "complete": True,
-        "deliverables": {"allocation.csv": {"producer": "toolkit/analysis/run.py", "role": "allocation",
-                                            "sha256": sha("allocation.csv")},
+        "deliverables": {**({"allocation.csv": {"producer": "toolkit/analysis/run.py", "role": "allocation",
+                                                "sha256": sha("allocation.csv")}} if plans else {}),
+                         **{r: {"producer": "toolkit/analysis/decision_tests.py", "role": "decision_test", "sha256": sha(r)}
+                            for r in sorted(files) if r.startswith(TESTS_DIR)},
                          **images,
                          RESULTS: {"producer": "toolkit/analysis/claims.py", "role": "results", "sha256": sha(RESULTS)}},
         "engine": ENGINE, "engine_choice_sha256": sha(CHOICE) if m["bound"] else None,
@@ -1991,6 +2659,10 @@ def _render(m, stage):
         disk = copy.deepcopy(m["spec"])
         m["disk"](disk)
         files["decision_spec.yaml"] = _spec_text(disk, m["comments"])
+    if m["signed_after"]:
+        signed = copy.deepcopy(m["spec"])
+        m["signed_after"](signed)
+        files[SPEC_FILES[1]] = _spec_text(signed, m["comments"])
     keep = STAGES[:STAGES.index(stage) + 1]
     return {r: t for r, t in files.items() if stage_of(r) in keep}
 
@@ -1999,7 +2671,7 @@ def _raw(content):
     return content if isinstance(content, bytes) else content.encode("utf-8")
 
 
-def build(dir, upto=None, defect=None, method="history_matching", figures="standard"):
+def build(dir, upto=None, defect=None, method="history_matching", figures="standard", kind="package_per_unit", other=None):
     """Write one fixture run into `dir` (created if missing). Returns {path: sha256} of the files written. Each file is
     written with lib.safe_io.write_nofollow below `dir`: a link at any name under it is refused, never followed.
     `figures` names the producer whose shape analysis/figures.yaml has (FIGURE_SETS): `standard` is
@@ -2014,10 +2686,20 @@ def build(dir, upto=None, defect=None, method="history_matching", figures="stand
     stage = "final" if upto is None else upto
     if stage not in STAGES:
         raise ValueError(f"unknown stage {upto!r}; one of {', '.join(STAGES)}")
-    m = _model(method, figures)
+    if kind not in KINDS:
+        raise ValueError(f"unknown deliverable kind {kind!r}; one of {', '.join(KINDS)}")
+    if kind == "estimates" and (method != "posterior" or figures != "estimates"):
+        raise ValueError("the estimates deliverable is built with the posterior method and the estimates figure set")
+    if other is not None and (other not in OTHERS or kind != "package_per_unit"):
+        raise ValueError(f"unknown comparison run {other!r}; one of {', '.join(OTHERS)}, for the package_per_unit kind")
+    m = _model(method, figures, kind)
+    if other is not None:
+        _other(m, other)
     if defect is not None:
         if defect not in DEFECTS:
             raise ValueError(f"unknown defect {defect!r}; see --list")
+        if kind not in DEFECTS[defect].get("kinds", KINDS[:1]):
+            raise ValueError(f"defect {defect} is not defined for the {kind} deliverable")
         if method not in DEFECTS[defect]["methods"]:
             raise ValueError(f"defect {defect} is not defined for method {method}")
         if figures != "standard" and figures not in figure_sets(defect):
@@ -2161,11 +2843,14 @@ def _register_cases(tmp, ok):
         choice, spec = json.loads(text(CHOICE)), yaml.safe_load(text(SPEC_FILES[1]))
         dossier = yaml.safe_load(text(DOSSIER))["inputs"]
         verdicts = sorted({t["verdict"] for t in tests.values()})
-        changing = [k for k, t in tests.items() if t["verdict"] == "CHANGES_PLAN"]
-        ok(f"X17 {method}: decision tests of each verdict; every test a dossier entry names ran; the one plan-changing "
-           f"test is named by a row; the test that did not run is named by none",
-           verdicts == ["CHANGES_PLAN", "NOT_RUN", "NO_CHANGE"] and set(named) <= ran and changing == ["DT9"]
-           and "DT9" in named and len(set(named)) == len(named) == 3, str((verdicts, sorted(set(named) - ran), named)))
+        moved = {v: sorted(t["test_id"] for t in yaml.safe_load(built(v, DT))["data"]["tests"] if t["verdict"] != "NO_CHANGE")
+                 for v in ("test_changes_linked", "test_changes_unlinked", "test_not_run")}
+        ok(f"X17 {method}: on the clean run every decision test ran with no change (§9) and every test a dossier entry "
+           f"names ran; the variants hold a plan-changing test a row names, one no row names, and a test that did not run",
+           verdicts == ["NO_CHANGE"] and set(tests) == ran and set(named) <= ran and len(set(named)) == len(named) == 3
+           and "DT9" in named and "DT1" not in named
+           and moved == {"test_changes_linked": ["DT9"], "test_changes_unlinked": ["DT1"], "test_not_run": [f"scenario_excluded_{HELD}"]},
+           str((verdicts, sorted(set(named) - ran), named, moved)))
         eng = yaml.safe_load(text(ENGINE_REC))["data"]["card"]["benchmarks"]
         chosen = choice["candidates"][0]
         status = {b["id"]: b["status"] for b in eng}
@@ -2247,7 +2932,7 @@ def _register_cases(tmp, ok):
            == {"D-001": "fixed", "D-002": "open", "R-001": "open", STALE_ID: "fixed"})
     ok("X25 twenty-one edits name the register as their view, each for both methods; the Fit view's edits name none",
        len(REGISTER_DEFECTS) == 21 and all(DEFECTS[n]["methods"] == METHODS for n in REGISTER_DEFECTS)
-       and all(s.get("view") in (None, "register", "model", "figures") for s in DEFECTS.values()))
+       and all(s.get("view") in (None, "register", "model", "figures", "outcomes") for s in DEFECTS.values()))
 
 
 def _producer_words():
@@ -2421,6 +3106,212 @@ def _figures_cases(tmp, ok):
        and len(FIGURES_DEFECTS) == 12 and sum("estimates" in figure_sets(n) for n in FIGURES_DEFECTS) == 9, str(len(FIGURES_DEFECTS)))
 
 
+def _outcome_words():
+    """What the producers of the Outcomes files hold, read from their source without importing it."""
+    import ast
+
+    def source(*parts):
+        with open(os.path.join(REPO, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def constant(text, name):
+        return next(ast.literal_eval(n.value) for n in ast.parse(text).body if isinstance(n, ast.Assign)
+                    and any(getattr(t, "id", None) == name for t in n.targets))
+    th = yaml.safe_load(source("toolkit", "analysis", "thresholds.yaml"))
+    flag, stab, run = source("toolkit", "analysis", "red_flag.py"), source("toolkit", "analysis", "stability.py"), source("toolkit", "analysis", "run.py")
+    return {"voi": constant(source("toolkit", "analysis", "value_of_information.py"), "STATUSES"),
+            "burden": constant(source("toolkit", "analysis", "burden.py"), "STATUSES"),
+            "roles": constant(source("toolkit", "analysis", "burden.py"), "OPTIONAL")["role"],
+            "kinds": constant(source("toolkit", "spec", "schema.py"), "DELIVERABLE_KINDS"),
+            "criteria": constant(source("toolkit", "analysis", "moves.py"), "CRITERIA"),
+            "dearest": (constant(flag, "SHARE"), constant(flag, "MIN_UNITS")), "th": th,
+            "quoted": all(f'"{w}"' in stab for w in STABILITY_VERDICTS) and all(f'"{w}"' in source("toolkit", "analysis", "variants.py") for w in VARIANT_STATUSES)
+            and '"judged" if n else "not_judged"' in source("toolkit", "analysis", "boundary.py")
+            and '"NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"' in run
+            and all(f'"{w}"' in source("toolkit", "analysis", "estimates.py") for w in EST_VERDICTS)
+            and CRITERION.split(", or")[0].replace("10%", "{thr:.0%}") in source("toolkit", "analysis", "decision_tests.py"),
+            "order": [k for k in ("emulator", "calibration", "point", "emulator_boundary", "uncertainty", "value_of_information",
+                                  "burden_validation", "stability", "plan_variants", "decision_tests")
+                      if f'S.write("{k}"' in run],
+            "written": sorted(("emulator", "calibration", "point", "emulator_boundary", "uncertainty", "value_of_information",
+                               "burden_validation", "stability", "plan_variants", "decision_tests"),
+                              key=lambda k: run.index(f'S.write("{k}"'))}
+
+
+def _outcomes_cases(tmp, ok):
+    """The Outcomes view's files (§5.7): shaped as the producers write them, agreeing with each other on the clean
+    run and clear of every rule and of its near-miss band."""
+    w = _outcome_words()
+    ok("X41 the status words, verdicts, kinds, criteria and thresholds of the Outcomes files are the producers' own",
+       tuple(w["voi"]) == VOI_STATUSES and tuple(w["burden"]) == BURDEN_STATUSES and tuple(w["roles"]) == BURDEN_ROLES
+       and tuple(w["kinds"]) == KINDS and list(w["criteria"]) == list(TEST_THRESHOLDS) and w["dearest"] == (DEAREST_SHARE, DEAREST_MIN_UNITS)
+       and w["th"]["stability"] == VALUE_LOSS and w["th"]["burden"]["default_ratio_band"] == BURDEN_BAND
+       and (w["th"]["value_of_information"]["min_draws"], w["th"]["value_of_information"]["informative_draws"]) == (VOI_MIN_DRAWS, VOI_INFORMATIVE_DRAWS)
+       and w["th"]["emulator"]["boundary_rank_agreement_min"] == BOUNDARY_MIN
+       and [w["th"]["decision_tests"][k] for k in ("share_threshold", "regret_share_threshold", "dollars_share_threshold")] == list(TEST_THRESHOLDS.values())
+       and w["quoted"] and w["order"] == w["written"], str({k: v for k, v in w.items() if k != "th"}))
+    for method in METHODS:
+        d = os.path.join(tmp, "clean", method)
+
+        def doc(rel, d=d):
+            with open(os.path.join(d, rel), encoding="utf-8") as f:
+                return json.load(f) if rel.endswith(".json") else yaml.safe_load(f)
+
+        def data(rel, d=d):
+            return doc(rel, d)["data"]
+        spec, point, unc, tests = doc(SPEC_FILES[1]), data(POINT), data(UNC), data(DT)["tests"]
+        with open(os.path.join(d, "allocation.csv"), encoding="utf-8") as f:
+            alloc = [line.strip().split(",") for line in f][1:]
+        heads = _headers(d, {r: 1 for r in artifacts(method)})
+        at = [heads[r][2]["written_at"] for r in (EMU, CAL, POINT, EMB, UNC, VOI, BV, STAB, PV, DT)]
+        ok(f"X42 {method}: every file the Outcomes view reads is there, each with the producer's name in its header and "
+           f"written in the order toolkit/analysis/run.py writes them",
+           all(heads[r][2]["producer"] == f"toolkit/analysis/{n}.py" for r, n in (
+               (POINT, "core"), (UNC, "uncertainty"), (DT, "decision_tests"), (STAB, "stability"), (VOI, "value_of_information"),
+               (PV, "variants"), (BV, "burden"), (EMU, "run"), (EMB, "boundary"))) and at == sorted(at)
+           and all(os.path.exists(os.path.join(d, t["path"])) for t in tests))
+        items = {i["component"]: i for i in spec["options"]["cost_items"]}
+        groups = {}
+        for c, v in spec["options"]["components"].items():
+            groups.setdefault(v.get("group"), []).append(c)
+        options = groups[TIER]
+        dearest = max(options, key=lambda c: items[c]["value"])
+        holds = [p for p in point["plan"].values() if set(p.split("+")) & set(options)]
+        share = sum(dearest in p.split("+") for p in holds) / len(holds)
+        cost = sum(sum(items[c]["value"] for c in p.split("+")) * (1000 + 150 * i) for i, p in enumerate(point["plan"].values()))
+        ok(f"X43 {method}: a plan over the twelve units with two packages that differ in the option of one group; the "
+           f"cheaper option in most units; the plan, its mix, its cost from the signed spec's cost items, the "
+           f"allocation file and the per-unit rows are one plan",
+           len(point["plan"]) == 12 and sorted(point["packages"]) == ["A+B", "A+C"] and sorted(options) == ["B", "C"] and dearest == "C"
+           and share < 0.75 * DEAREST_SHARE and len(holds) >= DEAREST_MIN_UNITS
+           and all(i["basis"] == "per_person" for i in items.values()) and cost == point["cost_allocated"] == point["solver"]["cost"]
+           and [(r[0], r[1]) for r in alloc] == list(point["plan"].items()) == [(u, x["package"]) for u, x in point["per_unit"].items()]
+           and abs(sum(float(r[2]) for r in alloc) - point["averted"][OUTCOME]) < 1e-6
+           and point["mix"] == {"A": 12, "B": 9, "C": 3, "no_package": 0} and point["packages"] == {"A+B": 9, "A+C": 3}
+           and point["budget_allocatable"] == spec["constraints"]["envelope_usd"] and cost <= point["reserve"]["budget_planned"]
+           and abs(point["reserve"]["reserve_usd"] + point["reserve"]["budget_planned"] - point["budget_allocatable"]) < 1e-6
+           and abs(point["cost_per_outcome_averted"] - cost / point["averted"][OUTCOME]) < 1e-5, str((share, cost)))
+        f = unc["fixed_plan"][OUTCOME]
+        h = point["averted"][OUTCOME]
+        ok(f"X44 {method}: the headline's point value equals its median and lies inside the interval; it is under half "
+           f"of the comparator and clear of that threshold; the headline is the signed spec's",
+           f["median"] == h and f["ci_low"] < h < f["ci_high"] and h / point["comparator_total"][OUTCOME] < 0.75 * 0.5
+           and unc["headline"] == spec["deliverable"]["headline"] == {"name": HEADLINE, "outcome": OUTCOME}
+           and unc["draws"] == spec["uncertainty"]["draws"] and unc["interval"]["prior_dominated"] == unc["prior_dominated"]
+           == unc["draw_plan"]["prior_dominated"])
+        near = [t["test_id"] for t in tests for k, lim in (("share_pct", "threshold_pct"), ("regret_pct", "regret_threshold_pct"),
+                                                             ("dollars_share_pct", "dollars_threshold_pct")) if t[k] >= 0.75 * t[lim]]
+        named = {t["id"]: t for t in spec["analysis"]["decision_tests"]}
+        files = {t["test_id"]: doc(t["path"]) for t in tests}
+        ok(f"X45 {method}: every decision test ran with no change, feasible and clear of its three thresholds; each "
+           f"has its result file with the spec entry's question and finding; one test varies the input held fixed",
+           all(t["status"] == "run" and t["verdict"] == "NO_CHANGE" and t["point_plan_feasible"] is True and t["triggered_by"] == [] for t in tests)
+           and not near and set(named) == set(files)
+           and all(x["question"] == named[k]["text"] and x["finding"] == named[k].get("finding", f"decision_test:{k}") and x["decision_changes"] is False
+                   and x["share_threshold"] == TEST_THRESHOLDS["share"] for k, x in files.items())
+           and [x["name"] for x in unc["draw_plan"]["fixed"]] == [HELD] == unc["interval"]["fixed"] and named["DT7"]["parameter"] == HELD, str(near))
+        stab, voi, pv, bv, emb = data(STAB), data(VOI), data(PV), data(BV), data(EMB)
+        above = [r["input"] for r in voi["inputs"] if r["above_noise_floor"]]
+        ok(f"X46 {method}: the two stability verdicts agree; value of information is computed on enough draws, with inputs "
+           f"above their noise floor, none of them prior-dominated",
+           stab["verdict"] == stab["value_verdict"] == "ROBUST" and stab["metrics"]["total_benefit_loss_pct_worst_fold"] < 0.75 * VALUE_LOSS["value_loss_pct_robust"]
+           and stab["value_thresholds_pct"] == VALUE_LOSS and stab["holdout_group"] == GROUPING
+           and voi["status"] == "computed" and voi["draws"] == unc["draws"] >= voi["informative_draws"] and above == ["p1", "p2"]
+           and not set(above) & set(unc["prior_dominated"]) and all(r["supported"] == r["above_noise_floor"] == (r["evppi"] > r["noise_floor"]) for r in voi["inputs"])
+           and voi["expected_value_decide_now"] == h)
+        v = pv["variants"][0]
+        rows = {r["id"]: r for r in bv["references"]}
+        covered = {c for r in emb["rows"] for k in ("chosen", "runner_up") for c in r[k].split("+")}
+        ok(f"X47 {method}: the plan variant is within budget in all but 2% of draws against the spec's 10%; every burden "
+           f"reference is inside its band and clear of its ends; the boundary check holds every component and agrees "
+           f"with the plan",
+           v["status"] == "solved" and v["cost"] <= pv["unconstrained"]["cost"] <= point["budget_allocatable"] and v["value_lost"] >= 0
+           and v["uncertainty"]["affordability"]["share_over_budget"] < 0.75 * spec["uncertainty"]["affordability"]["max_share_over_budget"]
+           and v["uncertainty"]["affordability"]["rule_met"] is True and pv["unconstrained"]["plan"] == point["plan"]
+           and [x["id"] for x in spec["analysis"]["plan_variants"]["variants"]] == [v["id"]]
+           and all(r["status"] == "within" and 1.25 * r["tolerance"]["ratio_band"][0] < r["ratio"] < 0.75 * r["tolerance"]["ratio_band"][1] for r in rows.values())
+           and bv["summary"] == {"within": 4, "outside": 0, "information": 0, "unmatched": 0, "report_only": 2, "n": 4}
+           and [k for k, r in rows.items() if r["role"] == "report_only"] == ["ref_G3", "ref_all"]
+           and named["DT10"]["burden_scale"]["references"] == ["ref_G3"]
+           and covered == set(spec["options"]["components"]) and emb["passes"] is True and emb["status"] == "judged"
+           and all(r["chosen"] == point["plan"][r["unit"]] for r in emb["rows"]), str(sorted(covered)))
+
+        second = os.path.join(tmp, "other", method, "second")
+        got = {name: build(os.path.join(tmp, "other", method, name), method=method, other=name) for name in OTHERS}
+        s2, p2 = doc(SPEC_FILES[1], second), data(POINT, second)
+        differ = sorted(f"{a}.{b}" for a in spec for b in (spec[a] if isinstance(spec[a], dict) else [""])
+                        if (spec[a][b] if b else spec[a]) != (s2[a][b] if b else s2[a]))
+        ok(f"X48 {method}: the second run asks the same question with a signed spec that differs in one key; its plan and "
+           f"headline are the clean run's, and its own files agree with its spec",
+           differ == ["constraints.envelope_usd"] and s2["question"] == spec["question"] and p2["plan"] == point["plan"]
+           and p2["averted"] == point["averted"] and p2["budget_allocatable"] == s2["constraints"]["envelope_usd"]
+           and json.loads(open(os.path.join(second, "decision_spec.signoff.json")).read())["sha256"]["decision_spec.yaml"] == got["second"][SPEC_FILES[1]])
+
+        def other(name, rel):
+            return doc(rel, os.path.join(tmp, "other", method, name))
+        moved = {name: sum(a != b for a, b in zip(other(name, POINT)["data"]["plan"].values(), point["plan"].values())) for name in OTHERS}
+        ok(f"X49 {method}: the comparison runs: a package's units shift by a quarter of the units with and without a spec "
+           f"key that differs; a headline 1.6 times larger; another question; a signed copy that no longer has the recorded hash",
+           moved == {"second": 0, "shifted": 3, "shifted_same_spec": 3, "headline": 0, "other_question": 0, "unverified": 0}
+           and other("shifted", SPEC_FILES[1]) == s2 and other("shifted_same_spec", SPEC_FILES[1]) == spec
+           and abs(other("headline", POINT)["data"]["averted"][OUTCOME] / h - 1.6) < 1e-6
+           and other("headline", SPEC_FILES[1])["comparator"]["text"] != spec["comparator"]["text"]
+           and other("other_question", SPEC_FILES[1])["question"] != spec["question"]
+           and got["unverified"][SPEC_FILES[1]] != got["unverified"]["decision_spec.yaml"]
+           == other("unverified", "decision_spec.signoff.json")["sha256"]["decision_spec.yaml"], str(moved))
+
+        def built(name, rel, method=method):
+            with open(os.path.join(tmp, "defect", method, name, rel), encoding="utf-8") as f:
+                return f.read()
+        broken = 0
+        for name, rel in (("tests_unparsable", DT),):
+            try:
+                yaml.safe_load(built(name, rel))
+            except yaml.YAMLError:
+                broken += 1
+        fr = yaml.safe_load(built("interval_reversed", UNC))["data"]["fixed_plan"][OUTCOME]
+        few = yaml.safe_load(built("C8_dearest_few_units", POINT))["data"]["plan"]
+        ok(f"X50 {method}: the third fixtures: a tests file that is not YAML, an interval whose ends are exchanged, a plan "
+           f"with a package the spec does not define, a variant with no cost, too few draws with nothing computed, a "
+           f"kind the analysis does not write; and the dearest option in fewer units than the producer's minimum",
+           broken == 1 and fr["ci_low"] > fr["ci_high"]
+           and "A+D" in yaml.safe_load(built("plan_unknown_package", POINT))["data"]["plan"].values() and "A+D,".join(["U01,", ""]) in built("plan_unknown_package", "allocation.csv")
+           and yaml.safe_load(built("variant_no_cost", PV))["data"]["variants"][0]["cost"] is None
+           and yaml.safe_load(built("voi_too_few_draws", VOI))["data"] == {"status": "too_few_draws", "draws": 20, "min_draws": VOI_MIN_DRAWS, "evpi": None,
+                                                                         "inputs": [], "informative_draws": VOI_INFORMATIVE_DRAWS}
+           and yaml.safe_load(built("unknown_deliverable_kind", SPEC_FILES[1]))["deliverable"]["kind"] not in KINDS
+           and sum("C" in x for x in few.values()) == 4 < DEAREST_MIN_UNITS and sum(x != "A" for x in few.values()) == 4)
+
+    d = os.path.join(tmp, "clean", "estimates_kind")
+    clean = build(d, method="posterior", figures="estimates", kind="estimates")
+    with open(os.path.join(d, EST), encoding="utf-8") as f:
+        est = yaml.safe_load(f)["data"]
+    with open(os.path.join(d, SPEC_FILES[1]), encoding="utf-8") as f:
+        spec = yaml.safe_load(f)
+    ok("X51 the estimates kind: no plan, tests file or allocation; analysis/estimates.yaml holds the outputs, the decision "
+       "rule's verdict in the producer's words and the decision tests, each run with no change of the verdict",
+       spec["deliverable"]["kind"] == "estimates" and not {POINT, DT, "allocation.csv", STAB, VOI, PV, BV, EMU, EMB} & set(clean)
+       and "options" not in spec and est["decision"]["verdict"] in EST_VERDICTS and est["decision"]["output"] == spec["deliverable"]["decision"]["output"]
+       and all(t["status"] == "run" and t["decision_changes"] is False and all(e["verdict"] == est["decision"]["verdict"] for e in t["ends"])
+               for t in est["decision_tests"]) and len(est["decision_tests"]) == 2 and sorted(est["outputs"]) == ["q1", "q2"]
+       and clean == build(os.path.join(tmp, "again", "estimates_kind"), method="posterior", figures="estimates", kind="estimates"))
+    for name in OUTCOMES_DEFECTS:
+        if "estimates" not in DEFECTS[name].get("kinds", KINDS[:1]):
+            continue
+        got = build(os.path.join(tmp, "defect", "estimates_kind", name), defect=name, method="posterior", figures="estimates", kind="estimates")
+        diff = {r for r in set(got) | set(clean) if got.get(r) != clean.get(r)}
+        expect = _follows(d, clean, touched(name, "posterior", "estimates"))
+        ok(f"X8 estimates kind: {name} changes the files its edit names, the files that hash them, and no others",
+           diff == expect, f"unexpected {sorted(diff - expect)}, missing {sorted(expect - diff)}")
+    checks = {DEFECTS[n]["check"] for n in OUTCOMES_DEFECTS}
+    third = {DEFECTS[n]["check"] for n in OUTCOMES_DEFECTS if DEFECTS[n]["status"] in ("problem", "not_available")}
+    ok("X52 the Outcomes view's edits: every check has one that fires; the comparison edits name a comparison run and "
+       "change no file; an edit for the estimates kind names it",
+       checks == set(OUTCOME_CHECKS) and {"tests_that_move", "point_vs_draws", "burden_refs", "voi_support", "variant_budget", "run_shift", "dearest_wins"} <= third
+       and all((DEFECTS[n].get("against") in OTHERS) == (DEFECTS[n]["check"] == "run_shift") and (DEFECTS[n]["files"] == []) == ("against" in DEFECTS[n])
+               for n in OUTCOMES_DEFECTS) and len(OUTCOMES_DEFECTS) == 36, str((sorted(set(OUTCOME_CHECKS) - checks), len(OUTCOMES_DEFECTS))))
+
+
 def _self_test():
     fails = []
 
@@ -2478,14 +3369,17 @@ def _self_test():
                    set(got) == set(clean[method]) - later, str(sorted(set(got) ^ (set(clean[method]) - later))))
 
             for name, spec in DEFECTS.items():
-                if method not in spec["methods"]:
+                if method not in spec["methods"] or "package_per_unit" not in spec.get("kinds", KINDS[:1]):
                     continue
                 got = build(os.path.join(tmp, "defect", method, name), defect=name, method=method)
                 diff = {r for r in set(got) | set(clean[method]) if got.get(r) != clean[method].get(r)}
                 expect = (_follows(d, clean[method], touched(name, method)) if spec.get("follows", True)
                           else set(touched(name, method)))
+                # a test's own result file follows its row in the tests file, or its entry in the signed spec
+                own = {r for r in diff if r.startswith(TESTS_DIR)}
                 ok(f"X8 {method}: {name} changes the files its edit names, the files that hash them, and no others",
-                   diff == expect, f"unexpected {sorted(diff - expect)}, missing {sorted(expect - diff)}")
+                   diff - own == expect and (not own or DT in expect or SPEC_FILES[1] in expect),
+                   f"unexpected {sorted(diff - own - expect)}, missing {sorted(expect - diff)}")
 
         jc_doc = _headers(os.path.join(tmp, "clean", "history_matching"), {JC: 1})[JC][2]["data"]
         zs = [abs(p["z"]) for p in jc_doc["survey_changes"]["pairs"]]
@@ -2527,9 +3421,13 @@ def _self_test():
             ok(f"X8 estimates figure set: {name} changes the files its edit names, the files that hash them, and no others",
                diff == expect, f"unexpected {sorted(diff - expect)}, missing {sorted(expect - diff)}")
         _figures_cases(tmp, ok)
+        _outcomes_cases(tmp, ok)
         for bad in ({"method": "unknown"}, {"defect": "unknown"}, {"upto": "unknown"},
                     {"defect": "C2_change_flagged", "method": "posterior"}, {"figures": "unknown"}, {"figures": "estimates"},
-                    {"figures": "estimates", "method": "posterior", "defect": "figure_not_produced"}):
+                    {"figures": "estimates", "method": "posterior", "defect": "figure_not_produced"},
+                    {"kind": "unknown"}, {"kind": "estimates"}, {"other": "unknown"}, {"defect": "estimates_test_changes"},
+                    {"kind": "estimates", "method": "posterior", "figures": "estimates", "defect": "C8_dearest_wins"},
+                    {"kind": "estimates", "method": "posterior", "figures": "estimates", "other": "second"}):
             try:
                 build(os.path.join(tmp, "bad"), **bad)
                 refused = False
@@ -2554,6 +3452,8 @@ def main():
     ap.add_argument("dir", nargs="?")
     ap.add_argument("--method", default="history_matching", choices=METHODS)
     ap.add_argument("--figures", default="standard", choices=FIGURE_SETS)
+    ap.add_argument("--kind", default="package_per_unit", choices=KINDS)
+    ap.add_argument("--other", choices=OTHERS, help="write the same question's comparison run of that name")
     ap.add_argument("--defect", choices=sorted(DEFECTS))
     ap.add_argument("--upto", choices=STAGES)
     ap.add_argument("--list", action="store_true")
@@ -2567,7 +3467,7 @@ def main():
         return 0
     if not a.dir:
         ap.error("a directory to write the run into is needed")
-    print(f"{len(build(a.dir, upto=a.upto, defect=a.defect, method=a.method, figures=a.figures))} files written to {a.dir}")
+    print(f"{len(build(a.dir, upto=a.upto, defect=a.defect, method=a.method, figures=a.figures, kind=a.kind, other=a.other))} files written to {a.dir}")
     return 0
 
 
