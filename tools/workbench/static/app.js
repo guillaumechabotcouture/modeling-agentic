@@ -109,6 +109,44 @@ function glossaryFoot() {
       el("dd", {text: `${e.meaning} (${e.section})`})))));
 }
 
+// ------------------------------------------------------------------------------------------------ actions
+// The one way the page writes: a table may declare `actions` (the keys are in workbench.py's docstring). The form is
+// built from the declaration alone; what it sends is the row's key and the fields the reader filled in.
+async function post(url, body) {
+  const meta = document.querySelector ? document.querySelector('meta[name="workbench-token"]') : null;
+  const r = await fetch(url, {method: "POST", body: JSON.stringify(body),
+    headers: {"Content-Type": "application/json", "X-Workbench-Token": meta ? meta.getAttribute("content") : ""}});
+  if (!r.ok) {
+    let why = await r.text();
+    try { why = JSON.parse(why).error || why; } catch (e) { /* the reason is plain text */ }
+    throw new Error(why);
+  }
+  return r.json();
+}
+// a: {label, about, fields} (a table's actions, or its `add`); row: the row's key, or null for a row to add.
+function actionForm(a, row, others, send, close) {
+  const says = el("span", {class: "muted", role: "status"});
+  const inputs = (a.fields || []).map(f => [f, f.text ? el("textarea", {rows: 2, "aria-label": f.label})
+    : el("select", {"aria-label": f.label}, el("option", {value: "", text: f.required ? "choose" : "leave as it is"}),
+      (f.rows ? others : f.choices || []).map(v => el("option", {value: v, text: v})))]);
+  const save = el("button", {text: "Save", on: {click: async () => {
+    const body = {row};
+    for (const [f, input] of inputs) {
+      const v = String(input.value == null ? "" : input.value).trim();
+      if (v) body[f.name] = v;
+      else if (f.required) { says.textContent = `${f.label} is needed.`; return; }
+    }
+    if (Object.keys(body).length < 2) { says.textContent = "Nothing to save: choose or write something first."; return; }
+    save.disabled = true;
+    says.textContent = "Saving.";
+    try { await send(body); } catch (e) { says.textContent = `Not saved: ${e.message}`; save.disabled = false; }
+  }}});
+  return el("div", {class: "form"}, el("div", {class: "formhead", text: row == null ? a.label : `${a.label}: ${row}`}),
+    inputs.map(([f, input]) => el("label", {class: f.text ? "long" : null}, el("span", {text: f.label + (f.required ? " (needed)" : "")}), input)),
+    el("div", {class: "tools"}, save, el("button", {text: "Cancel", on: {click: close}}), says),
+    a.about ? el("p", {class: "about small", text: a.about}) : null);
+}
+
 // ------------------------------------------------------------------------------------------------ tables
 const PAGE = 25, LONG = 60;
 function compare(a, b) {
@@ -116,8 +154,20 @@ function compare(a, b) {
   return typeof a === "number" && typeof b === "number" ? a - b : String(a).localeCompare(String(b), "en", {numeric: true});
 }
 // A table that sorts on a header click, filters on one text box and pages long lists. opts.href(row) links a row.
+// With opts.run and a table that declares actions, each row has a button that opens the declared form under it.
 function tableView(t, opts = {}) {
   let sort = null, desc = false, page = 0, q = "";
+  const a = t.actions && opts.run != null && Array.isArray(t.actions.fields) ? t.actions : null, keyAt = a ? t.columns.indexOf(a.key) : -1;
+  const forms = new Map(), add = a && a.add && Array.isArray(a.add.fields) ? a.add : null, adding = el("div");
+  const send = body => post(`${a.post}?run=${encodeURIComponent(opts.run)}`, body).then(() => opts.done && opts.done());
+  let addOpen = false;
+  const showAdd = on => { addOpen = on; adding.replaceChildren(...(on ? [actionForm({...add, about: a.about}, null, [], send, () => showAdd(false))] : [])); };
+  const toggle = r => () => {
+    const k = r[keyAt];
+    if (forms.has(k)) forms.delete(k);
+    else forms.set(k, actionForm(a, k, t.rows.map(x => x[keyAt]).filter(x => x !== k), send, toggle(r)));
+    draw();
+  };
   const numeric = t.columns.map((_, i) => t.rows.some(r => typeof r[i] === "number") && t.rows.every(r => r[i] == null || typeof r[i] === "number"));
   const body = el("tbody"), info = el("span"), wide = t.columns.length > 10;     // a wide table is set smaller, its long texts on one line
   const step = d => () => { page += d; draw(); };
@@ -125,8 +175,15 @@ function tableView(t, opts = {}) {
   const heads = t.columns.map((c, i) => el("th", {class: numeric[i] ? "num" : null, title: "Click to sort by this column",
     on: {click: () => { desc = sort === i && !desc; sort = i; page = 0; draw(); }}}));
   const cell = (v, i, r) => {
-    const c = t.columns[i], td = el("td", {class: numeric[i] ? "num" : fmt(v, c).length <= 20 ? "tight" : null});      // a short value stays on one line; a longer one wraps to fit the page
+    const c = t.columns[i], td = el("td", {class: numeric[i] ? "num" : fmt(v, c).length <= (wide ? 12 : 20) ? "tight" : null});      // a short value stays on one line; a longer one wraps to fit the page
     if ((c === "status" || c === "state") && MARKS[v]) td.append(mark(v));
+    else if (typeof v === "string" && Array.isArray(t.wrap) && t.wrap.includes(c)) {     // a text the view asks to be read: its first lines, the whole on a click
+      const lines = el("div", {class: "lines"}, gloss(v));
+      td.className = "whole";
+      if (v.length > 4 * LONG) { td.title = "Click to show the whole text"; td.addEventListener("click", () => lines.classList.toggle("open")); }
+      td.append(lines);
+    }
+    else if (typeof v === "string" && v.length > (wide ? 12 : 20) && !/\s/.test(v)) td.append(...v.split(/(?<=[:\/,_|])/).flatMap((part, k) => (k ? [el("wbr"), part] : [part])));     // a long name or path may break after a separator, never inside a word
     else if (i === 0 && opts.href) td.append(el("a", {href: opts.href(r), text: fmt(v, c)}));
     else if (typeof v === "string" && v.length > (wide ? LONG : 3 * LONG)) {      // a long text: one line of it, the whole on hover, and a click to open it
       td.textContent = v; td.title = v; td.className = "clip";
@@ -144,7 +201,9 @@ function tableView(t, opts = {}) {
       const words = t.labels && t.labels[t.columns[i]];
       th.replaceChildren(label(t.columns[i], true) + (sort === i ? (desc ? " ▼" : " ▲") : ""), words ? el("span", {class: "sub", text: words}) : "");
     });
-    body.replaceChildren(...rows.slice(page * PAGE, page * PAGE + PAGE).map(r => el("tr", null, r.map((v, i) => cell(v, i, r)))));
+    body.replaceChildren(...rows.slice(page * PAGE, page * PAGE + PAGE).flatMap(r => [
+      el("tr", null, a && keyAt >= 0 ? el("td", {class: "tight"}, el("button", {text: a.label, on: {click: toggle(r)}})) : null, r.map((v, i) => cell(v, i, r))),
+      a && forms.has(r[keyAt]) ? el("tr", {class: "formrow"}, el("td", {colspan: t.columns.length + 1}, forms.get(r[keyAt]))) : null]).filter(Boolean));
     const shown = rows.length === t.rows.length ? `${rows.length} rows` : `${rows.length} of ${t.rows.length} rows match`;
     info.textContent = (pages > 1 ? `${shown}; showing ${page * PAGE + 1} to ${Math.min(rows.length, page * PAGE + PAGE)}` : shown).replace(/^1 rows/, "1 row");
     prev.disabled = page === 0;
@@ -154,8 +213,9 @@ function tableView(t, opts = {}) {
     on: {input: e => { q = e.target.value.trim().toLowerCase(); page = 0; draw(); }}});
   const long = t.rows.length > PAGE;
   const node = el("div", null,
-    el("div", {class: "tools"}, t.rows.length > 8 && !opts.noBox ? box : null, info, long ? prev : null, long ? next : null),
-    el("div", {class: "scroll"}, el("table", {class: wide ? "wide" : null}, el("thead", null, el("tr", null, heads)), body)));
+    el("div", {class: "tools"}, t.rows.length > 8 && !opts.noBox ? box : null, info, long ? prev : null, long ? next : null,
+      add ? el("button", {text: add.label, on: {click: () => showAdd(!addOpen)}}) : null), adding,
+    el("div", {class: "scroll"}, el("table", {class: wide ? "wide" : null}, el("thead", null, el("tr", null, a && keyAt >= 0 ? el("th", {class: "plain"}) : null, heads)), body)));
   node.filter = text => { q = text.trim().toLowerCase(); page = 0; draw(); };
   draw();
   // A table still wider than the page after wrapping says so: its right-hand columns are reached by scrolling it.
@@ -427,17 +487,18 @@ function renderView(data, run, here) {
     const text = fmt(v, k, true);
     return el("div", {class: text.length > 44 ? "wide" : null}, el("dt", {text: label(k)}), el("dd", null, gloss(text)));
   })));
+  const done = () => { state.over = null; state.keep = true; route(); };       // after a save: read the run's files again, stay in place
+  const one = (name, t, head) => [el(head, {text: label(name).replace(/^./, ch => ch.toUpperCase())}), t.about ? el("p", {class: "about"}, gloss(t.about)) : null,
+    Array.isArray(t.columns) && Array.isArray(t.rows) ? (t.rows.length || t.actions ? tableView(t, {run, done}) : el("p", {class: "muted", text: "No rows."}))
+      : el("p", {class: "muted", text: "Not available: this table has no columns and rows."})];
+  const lead = Object.entries(tables).filter(([, t]) => t && t.lead);       // what the reader came for: before the notes and charts
+  for (const [name, t] of lead) out.push(...one(name, t, "h2"));
   if (notes.length) out.push(el("h2", {text: "Notes"}), notes.map(([k, v]) => el("p", null, el("strong", {text: `${label(k).replace(/^./, ch => ch.toUpperCase())}. `}), gloss(fmt(v)))));
   if ((data.charts || []).length) out.push(el("h2", {text: "Charts"}), data.charts.map(d => chartView(d, tables)));
-  if (Object.keys(tables).length) out.push(el("h2", {text: "Tables"}),
+  if (Object.keys(tables).length > lead.length) out.push(el("h2", {text: "Tables"}),
     el("p", {class: "about", text: "Click a column name to sort. Units are in the column names."}));
   const none = Object.keys(tables).filter(k => tables[k] == null);      // present with the value null: not recorded
-  for (const [name, t] of Object.entries(tables)) {
-    if (t == null) continue;
-    out.push(el("h3", {text: label(name)}), t.about ? el("p", {class: "about"}, gloss(t.about)) : null);
-    out.push(Array.isArray(t.columns) && Array.isArray(t.rows) ? (t.rows.length ? tableView(t) : el("p", {class: "muted", text: "No rows."}))
-      : el("p", {class: "muted", text: "Not available: this table has no columns and rows."}));
-  }
+  for (const [name, t] of Object.entries(tables)) if (t != null && !t.lead) out.push(...one(name, t, "h3"));
   if (none.length) out.push(el("h3", {text: "Not recorded"}), el("p", {class: "muted",
     text: `This run's files record nothing for ${none.length === 1 ? "this table" : "these tables"}: ${none.map(k => label(k)).join(", ")}. The notes above say why.`}));
   return out;
@@ -509,7 +570,8 @@ async function route() {
         el("button", {text: "Read the files again", on: {click: () => { state.runs = state.over = null; route(); }}})),
       ...renderView(data, id, here).flat(Infinity).filter(Boolean));
     main.append(glossaryFoot() || "");
-    scrollTo(0, 0);
+    if (!state.keep) scrollTo(0, 0);
+    state.keep = false;
   } catch (e) {
     main.replaceChildren(el("div", {class: "card check t-na"}, mark("not_available"), el("p", {class: "says", text: e.message})));
   }

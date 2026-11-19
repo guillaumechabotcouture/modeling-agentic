@@ -30,7 +30,8 @@ global.innerWidth = global.innerHeight = 1000;
 global.fetch = () => new Promise(() => {});      // the page's first request never answers: nothing is drawn at load
 
 const src = fs.readFileSync(path.join(__dirname, "static", "app.js"), "utf8");
-const names = ["ticks", "checkCard", "checksView", "setGlossary", "gloss", "glossaryFoot", "state", "scanned"];
+const names = ["ticks", "checkCard", "checksView", "setGlossary", "gloss", "glossaryFoot", "state", "scanned", "actionForm", "tableView",
+  "renderView", "post"];
 const page = new Function(`${src}\n;return {${names.map(n => `${n}: typeof ${n} === "undefined" ? undefined : ${n}`).join(", ")}};`)();
 
 const fails = [];
@@ -101,6 +102,90 @@ ok("P7 fail closed: with no glossary the text is shown as it is, and the foot sa
 ok("P8 the run list says what was scanned: run folders given by name, and the roots searched, each only when there are any", () => {
   const a = page.scanned({roots: [], run_dirs: ["/x/run1"]}), b = page.scanned({roots: ["/keep"], run_dirs: []});
   return (a.includes("/x/run1") && !a.includes("under") && b.includes("under /keep") && !b.includes("given")) || `${a} | ${b}`;
+});
+// ---- the one write: a table's `actions` (workbench.py's docstring), drawn by generic code
+const actions = {post: "/api/note", key: "id", label: "Review", about: "Saved as one line of the notes file.", fields: [
+  {name: "disposition", label: "Disposition", choices: ["open", "declared"]}, {name: "same_as", label: "Same as row", rows: true},
+  {name: "note", label: "Note", text: true}],
+  add: {label: "Add a row", fields: [{name: "kind", label: "Kind", choices: ["issue", "assumption"], required: true},
+    {name: "statement", label: "Statement", text: true, required: true}, {name: "note", label: "Note", text: true}]}};
+const button = (node, words) => node.all("button").find(b => b.textContent === words);
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+ok("P9 a row's form sends the row's key and only the fields filled in; another row is offered by its key, as text", () => {
+  const sent = [], form = page.actionForm(actions, "A-1", ["B-2", "<b>C</b>"], body => (sent.push(body), Promise.resolve()), () => {});
+  const [disposition, sameAs] = form.all("select"), note = form.all("textarea")[0];
+  const offered = sameAs.all("option").map(o => o.textContent);
+  if (!same(offered.slice(1), ["B-2", "<b>C</b>"]) || sameAs.all("b").length) return `the other rows are offered as ${JSON.stringify(offered)}`;
+  if (!form.textContent.includes("A-1") || !form.textContent.includes("Saved as one line")) return `the form does not name its row or say what Save does: ${form.textContent}`;
+  disposition.value = "declared"; note.value = "  accepted as a limit  ";
+  button(form, "Save").listeners.click();
+  return same(sent, [{row: "A-1", disposition: "declared", note: "accepted as a limit"}]) || JSON.stringify(sent);
+});
+ok("P10 a form with nothing filled in sends nothing and says so", () => {
+  const sent = [], form = page.actionForm(actions, "A-1", [], body => (sent.push(body), Promise.resolve()), () => {});
+  button(form, "Save").listeners.click();
+  return (sent.length === 0 && /nothing/i.test(form.textContent)) || `${JSON.stringify(sent)} | ${form.textContent}`;
+});
+ok("P11 the form that adds a row sends row null; a field that is needed and empty stops it, with the field named", () => {
+  const sent = [], form = page.actionForm(actions.add, null, [], body => (sent.push(body), Promise.resolve()), () => {});
+  const kind = form.all("select")[0], statement = form.all("textarea")[0];
+  kind.value = "assumption";
+  button(form, "Save").listeners.click();
+  if (sent.length || !form.textContent.includes("Statement is needed")) return `sent ${JSON.stringify(sent)}; says "${form.textContent}"`;
+  statement.value = "The two rounds share one frame.";
+  button(form, "Save").listeners.click();
+  return same(sent, [{row: null, kind: "assumption", statement: "The two rounds share one frame."}]) || JSON.stringify(sent);
+});
+const noted = {columns: ["id", "statement"], rows: [["A-1", "first <i>statement</i>"], ["B-2", "second"]], actions};
+ok("P12 a table that declares actions has a button on each row and one to add a row, only when the page knows the run; "
+  + "the button opens that row's form", () => {
+  const plain = page.tableView({...noted, actions: undefined}, {run: "r1"}), unknown = page.tableView(noted, {});
+  if (plain.all("button").length || unknown.all("button").length) return "a table with no actions, or with no run to post for, has buttons";
+  const t = page.tableView(noted, {run: "r1"}), rows = t.all("button").filter(b => b.textContent === "Review");
+  if (rows.length !== 2 || !button(t, "Add a row")) return `${rows.length} row buttons; add: ${!!button(t, "Add a row")}`;
+  if (t.all("select").length) return "a form is open before any button is pressed";
+  rows[1].listeners.click();
+  const form = t.all("tr").find(r => r.all("select").length);
+  if (!form || !form.textContent.includes("B-2")) return "the second row's button does not open its form";
+  const offered = form.all("select")[1].all("option").map(o => o.textContent).slice(1);
+  return (same(offered, ["A-1"]) && t.all("i").length === 0) || `offers ${JSON.stringify(offered)}; markup from a row's text was built`;
+});
+ok("P13 a save posts JSON to the declared address for this run, with the token the server put in the page", () => {
+  const calls = [];
+  global.document.querySelector = q => (q === 'meta[name="workbench-token"]' ? {getAttribute: () => "tok-1"} : null);
+  global.fetch = (url, o) => (calls.push([url, o]), Promise.resolve({ok: true, json: () => Promise.resolve({ok: true})}));
+  const t = page.tableView(noted, {run: "r 1", done: () => calls.push("done")});
+  t.all("button").filter(b => b.textContent === "Review")[0].listeners.click();
+  const form = t.all("tr").find(r => r.all("select").length);
+  form.all("select")[0].value = "open";
+  button(form, "Save").listeners.click();
+  const [url, o] = calls[0] || [];
+  global.fetch = () => new Promise(() => {});
+  return (url === "/api/note?run=r%201" && o.method === "POST" && o.headers["X-Workbench-Token"] === "tok-1"
+    && o.headers["Content-Type"] === "application/json" && o.body === JSON.stringify({row: "A-1", disposition: "open"})) || JSON.stringify(calls);
+});
+ok("P14 a table marked lead is drawn straight after the facts, before the notes and the charts; the others stay under Tables", () => {
+  const data = {checks: [], facts: {n_open: 2}, notes: {terms: "What the words mean."}, charts: [{kind: "bars", table: "by_x", x: "x", y: "n",
+    title: "Chart title", how_to_read: "How to read it."}], tables: {rows: {columns: ["id"], rows: [["A-1"]], about: "The leading table.", lead: true},
+    by_x: {columns: ["x", "n"], rows: [["a", 1]], about: "The other table."}}};
+  const text = page.renderView(data, "r1", "v").flat(Infinity).filter(n => n instanceof Node).map(n => n.textContent).join(" | ");
+  const at = w => text.indexOf(w), order = ["Facts", "The leading table.", "What the words mean.", "Chart title", "Tables", "The other table."].map(at);
+  return (order.every(i => i >= 0) && same(order, [...order].sort((a, b) => a - b)) && text.split("The leading table.").length === 2) || `${order} in ${text}`;
+});
+ok("P16 a column the table names in wrap holds its whole text; another long text in a wide table is cut to one line; a long name may break only after a separator", () => {
+  const long = "word ".repeat(40).trim(), cols = ["id", "a", "b", "c", "d", "e", "f", "g", "h", "i", "statement", "other"];
+  const t = page.tableView({columns: cols, rows: [["A-1", 1, 2, 3, 4, 5, 6, 7, 8, 9, long, long]], wrap: ["statement"]});
+  const cells = t.all("td"), whole = cells[10], cut = cells[11];
+  const name = page.tableView({columns: ["id"], rows: [["kind_of:a_long/name,with:parts"]]}).all("td")[0];
+  if (name.textContent !== "kind_of:a_long/name,with:parts" || name.all("wbr").length !== 6) return `a long name is ${name.textContent} with ${name.all("wbr").length} places to break`;
+  return (whole.attrs.class === "whole" && whole.textContent === long && cut.attrs.class === "clip" && cut.attrs.title === long) || `${whole.attrs.class} | ${cut.attrs.class}`;
+});
+ok("P15 the add button opens the form that adds a row, and closes it again", () => {
+  const t = page.tableView(noted, {run: "r1"}), add = button(t, "Add a row");
+  add.listeners.click();
+  const open = t.all("textarea").length;
+  add.listeners.click();
+  return (open === 2 && t.all("textarea").length === 0) || `${open} text boxes when open, ${t.all("textarea").length} when closed`;
 });
 console.log(fails.length ? `FAILED: ${JSON.stringify(fails)}` : "OK: all page cases passed.");
 process.exit(fails.length ? 1 : 0);

@@ -7,8 +7,8 @@
     python3 tools/workbench/workbench.py --accept <run dir> <acceptance yaml>     # compare a view with quoted values
     python3 tools/workbench/workbench.py --self-test
 
-Serves tools/workbench/static/ on 127.0.0.1 only and makes no outbound call. It reads run files and never writes
-to a run. It imports no engine and no harness loader; every read goes through a descriptor that lib.safe_io opens with
+Serves tools/workbench/static/ on 127.0.0.1 only and makes no outbound call. It reads run files and writes one
+file: the owner's review notes, <run>/owner/review_notes.jsonl (POST /api/note, below). It imports no engine and no harness loader; every read goes through a descriptor that lib.safe_io opens with
 no link followed (dir_fd_nofollow, open_nofollow), confined to the run directory as it was found at discovery.
 
 Limit: the workbench is for the owner's own stored runs, and it does not defend against run files being replaced
@@ -47,19 +47,42 @@ Keys any kind but graph takes:
     limits           [{value, label}]: reference lines on the value axis (bars, interval_points, lines)
 A table may carry `about` (one sentence on what its rows are and where they come from) and `labels` ({column:
 words}, shown under the column's name in its header) beside columns and rows.
+A table may also carry `lead` (true: the page shows it straight after the facts, before the notes and charts,
+because it is what the reader came for), `wrap` (a list of columns whose text is given room: its first four lines, and
+the whole on a click, where another long text is cut to one line) and `actions`, the one way a view lets the reader write:
+    actions  {post, key, label, about, fields, add}
+             post    the address the page posts to; the server has one, /api/note (ACTION_POSTS)
+             key     the column whose value names the row; it is sent as `row`
+             label   the words on each row's button; about: one sentence shown in the form
+             fields  what the form on a row asks for, a list of {name, label, choices | rows | text, required}:
+                     choices is a list of words to pick from, rows (true) offers the table's other rows by their
+                     key, text (true) is free text; a field left empty is not sent unless it is required
+             add     {label, fields}: a form above the table that adds a row; it is sent with `row` null
 A fact or column whose name ends in _usd or _minutes is shown with that unit.
+
+The one write (§6 "Review notes"). POST /api/note?run=<id> with a JSON body {row, kind, statement, disposition,
+decides, note, same_as} appends one line to <run>/owner/review_notes.jsonl and writes nothing else, ever. It is
+refused unless: the Host is loopback and any Origin is too; the X-Workbench-Token header is the token made when the
+server started (the server puts it in the page it serves, in a meta tag, so only that page has it); the body is JSON
+of the schema in review_notes.py with no other key (the time is the server's; no file name comes from the client);
+the run is one the workbench found; and every row the note names is in that run's register. The line is appended
+with lib.safe_io.write_nofollow below a descriptor on the run folder as it was found, so an owner folder or notes
+file that is a link, or a notes file also linked from elsewhere, is refused. Answers: 200 written, 400 bad note,
+403 token, Host or Origin, 404 no such run, 405 any other address or method, 409 the file cannot be written safely,
+413 body too long, 415 not JSON.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
 import hashlib
+import hmac
 import http.server
-import importlib
 import json
 import math
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -78,9 +101,10 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 for _p in (os.path.join(REPO, "scripts"), HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-from lib.safe_io import LinkRefused, dir_fd_nofollow, open_nofollow  # noqa: E402
+from lib.safe_io import LinkRefused, dir_fd_nofollow, open_nofollow, remove_nofollow, write_nofollow  # noqa: E402
 import checks  # noqa: E402
 import glossary  # noqa: E402
+import review_notes  # noqa: E402
 
 STATIC = os.path.join(HERE, "static")
 STATIC_FILES = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -107,6 +131,50 @@ KEYS = {"checks": list, "facts": dict, "tables": dict, "charts": list, "notes": 
 CHART_KINDS = ("interval_points", "ranges", "bars", "lines", "graph")
 CHART_COLUMNS = ("x", "y", "low", "high", "group", "model", "model_alt", "outer_low", "outer_high", "panels")
 CHART_KEYS = ("kind", "table", "title", "how_to_read", *CHART_COLUMNS, "nodes", "scale", "where", "labels", "limits")
+ACTION_KEYS = ("post", "key", "label", "about", "fields", "add")       # a table's `actions` (the module docstring)
+FIELD_KEYS = ("name", "label", "choices", "rows", "text", "required")
+ACTION_POSTS = ("/api/note",)                 # the addresses a page may post to: the one write the workbench has
+NOTE_FIELDS = ("row", "kind", "statement", "disposition", "decides", "note", "same_as")      # what a client may send
+NOTE_BODY = 32 << 10                          # bytes of a POST body read
+TOKEN_MARK = "__WORKBENCH_TOKEN__"            # in static/index.html; the served page holds the server's token there
+_LOOPBACK = r"(127\.0\.0\.1|localhost)(:\d+)?"
+
+
+def action_problems(result):
+    """What is wrong with a view result's `actions` declarations, as sentences (none when the page can draw them)."""
+    out = []
+
+    def fields(name, fs):
+        if not isinstance(fs, list) or not fs:
+            return [f"{name}: no list of fields"]
+        bad = []
+        for f in fs:
+            kinds = [k for k in ("choices", "rows", "text") if isinstance(f, dict) and f.get(k)]
+            if not isinstance(f, dict) or not f.get("name") or not f.get("label") or len(kinds) != 1 \
+                    or any(k not in FIELD_KEYS for k in f) or ("choices" in kinds and not isinstance(f["choices"], list)):
+                bad.append(f"{name}: a field is not {{name, label, one of choices | rows | text, required}} ({f})")
+        return bad
+    for tname, t in (result.get("tables") or {}).items():
+        a = t.get("actions") if isinstance(t, dict) else None
+        if a is None:
+            continue
+        name = f"actions of table {tname}"
+        if not isinstance(a, dict):
+            out.append(f"{name}: not a mapping")
+            continue
+        out += [f"{name}: unknown key {k!r}" for k in a if k not in ACTION_KEYS]
+        if a.get("post") not in ACTION_POSTS:
+            out.append(f"{name}: the server has no address {a.get('post')!r} to post to")
+        if a.get("key") not in (t.get("columns") or []):
+            out.append(f"{name}: table {tname} has no column {a.get('key')!r}")
+        if not a.get("label"):
+            out.append(f"{name}: no label")
+        out += fields(name, a.get("fields"))
+        if "add" in a:
+            add = a["add"] if isinstance(a["add"], dict) else {}
+            out += ([] if add.get("label") and set(add) <= {"label", "fields"} else [f"{name}: add is not {{label, fields}}"])
+            out += fields(f"{name}, add", add.get("fields"))
+    return out
 
 
 def chart_problems(result):
@@ -134,15 +202,31 @@ def chart_problems(result):
     return out
 
 
+def _view_module(name):
+    """The module views/<name>.py of a view that is built, or None. The registry is this list of ordinary import
+    statements, one per module (no name is ever imported from data); each runs on first use, so a module that cannot
+    be imported costs its own view only. A new view adds its line here (W19b holds the list to the folder)."""
+    if name == "overview":
+        from views import overview as m
+    elif name == "fit":
+        from views import fit as m
+    elif name == "steps":
+        from views import steps as m
+    elif name == "register":
+        from views import register as m
+    else:
+        return None
+    return m
+
+
 def load_view(name):
-    """(the function views.<name>.view, None), or (None, why): 'not built' when there is no such module."""
+    """(the function views.<name>.view, None), or (None, why): 'not built' when the registry has no such module."""
     if name not in VIEW_FNS:
         try:
-            VIEW_FNS[name] = importlib.import_module(f"views.{name}").view
-        except ModuleNotFoundError as e:
-            if e.name not in ("views", f"views.{name}"):
-                return None, f"views/{name}.py could not be loaded ({e})"
-            return None, "not built"
+            m = _view_module(name)
+            if m is None:
+                return None, "not built"
+            VIEW_FNS[name] = m.view
         except Exception as e:      # a view that cannot be imported must not take the page down
             return None, f"views/{name}.py could not be loaded ({type(e).__name__}: {e})"
     return VIEW_FNS[name], None
@@ -577,6 +661,8 @@ class Workbench:
     def __init__(self, roots, run_dirs=(), spec=None):
         self.roots, self.run_dirs, self.runs, self.lock = list(roots), [os.path.realpath(p) for p in run_dirs], {}, threading.Lock()
         self.found = {}                          # path -> (device, inode) of the folder when it was first found
+        self.token = secrets.token_urlsafe(32)   # made at start; only the page this server serves holds it
+        self.writing = threading.Lock()          # one note is appended at a time
         self.glossary = glossary.load(spec)      # read once at start from the specification's own tables
 
     def scan(self):
@@ -621,20 +707,77 @@ class Workbench:
             return None
         return clean(self.run(p).view(name))
 
-    def handle(self, method, target, host):
-        """(status, content type, body). Loopback Host only; GET only: the workbench has no write yet.
-        /api/runs lists the runs, /api/view gives one view of one run, /api/glossary the meanings of the codes the
-        page shows (glossary.py reads them from the specification)."""
-        if not re.fullmatch(r"(127\.0\.0\.1|localhost)(:\d+)?", host or ""):
+    def add_note(self, rid, body):
+        """(status, answer) for one review note posted for the run `rid`: checked against the schema and the run's
+        register, then appended as one line to <run>/owner/review_notes.jsonl. Nothing else is written."""
+        try:
+            doc = json.loads(body.decode("utf-8"))
+        except ValueError:
+            return 400, {"error": "the body is not JSON"}
+        if not isinstance(doc, dict) or any(k not in NOTE_FIELDS for k in doc):
+            return 400, {"error": f"the body is not an object with only the keys {', '.join(NOTE_FIELDS)}"}
+        note = {"at": review_notes.now(), **{k: doc.get(k) for k in review_notes.KEYS[1:]}}
+        note["note"] = "" if note["note"] is None else note["note"]
+        if doc.get("same_as") is not None:
+            note["same_as"] = doc["same_as"]
+        note, why = review_notes.check(note)
+        if note is None:
+            return 400, {"error": f"the note is not written: {why}"}
+        with self.lock:
+            p = self.runs.get(rid)
+        p = p or self.scan().get(rid)
+        if p is None:
+            return 404, {"error": "no such run"}
+        with self.writing:
+            run = self.run(p)
+            rows = run.view("register")["tables"].get("rows") or {}
+            at = rows.get("columns", []).index("id") if "id" in rows.get("columns", []) else None
+            held = {r[at] for r in rows.get("rows", [])} if at is not None else set()
+            for k in ("row", "same_as"):
+                if note.get(k) is not None and note[k] not in held:
+                    return 400, {"error": f"the note is not written: the register holds no row {note[k]!r}"}
+            existing, why = run.read(review_notes.FILE, review_notes.MAX_FILE + 1)
+            if existing is None and not str(why).endswith("is not in the run folder"):
+                return 409, {"error": f"the note is not written: {why}"}
+            try:
+                root = run._root()
+                try:
+                    review_notes.append(root, note, existing)
+                finally:
+                    os.close(root)
+            except (ValueError, OSError) as e:       # a link at the folder or the file, a file linked from elsewhere
+                return 409, {"error": f"the note is not written: {e}"}
+        return 200, {"ok": True, "file": review_notes.FILE, "at": note["at"]}
+
+    def handle(self, method, target, host, body=b"", headers=None):
+        """(status, content type, body). Loopback Host only. GET reads: /api/runs lists the runs, /api/view gives one
+        view of one run, /api/glossary the meanings of the codes the page shows (glossary.py reads them from the
+        specification). The one write is POST /api/note (the module docstring says what it refuses); `headers` holds
+        the request's headers by lower-case name."""
+        if not re.fullmatch(_LOOPBACK, host or ""):
             return 403, "text/plain", b"loopback only"
-        if method != "GET":
-            return 405, "text/plain", b"read only"
         u = urllib.parse.urlsplit(target)
         q = urllib.parse.parse_qs(u.query)
+        if method == "POST" and u.path in ACTION_POSTS:
+            h = headers or {}
+            origin = h.get("origin")
+            if origin is not None and not re.fullmatch(r"https?://" + _LOOPBACK, origin):
+                return 403, "text/plain", b"loopback only"
+            if not hmac.compare_digest(str(h.get("x-workbench-token") or "").encode(), self.token.encode()):
+                return 403, "text/plain", b"the token is not this server's: reload the page"
+            if str(h.get("content-type") or "").split(";")[0].strip().lower() != "application/json":
+                return 415, "text/plain", b"the body must be application/json"
+            if len(body or b"") > NOTE_BODY:
+                return 413, "text/plain", b"the body is too long"
+            code, doc = self.add_note((q.get("run") or [""])[0], body or b"")
+            return code, "application/json", json.dumps(doc).encode()
+        if method != "GET":
+            return 405, "text/plain", b"read only, but for POST /api/note"
         if u.path in STATIC_FILES:
             name, ctype = STATIC_FILES[u.path]
             with open(os.path.join(STATIC, name), "rb") as f:
-                return 200, ctype, f.read()
+                data = f.read()
+            return 200, ctype, data.replace(TOKEN_MARK.encode(), self.token.encode()) if name == "index.html" else data
         if u.path == "/api/runs":
             return 200, "application/json", json.dumps(clean(self.api_runs())).encode()
         if u.path == "/api/glossary":
@@ -649,7 +792,11 @@ def serve(wb, port):
     class H(http.server.BaseHTTPRequestHandler):
         def _do(self):
             try:
-                code, ctype, body = wb.handle(self.command, self.path, self.headers.get("Host"))
+                size = self.headers.get("Content-Length") or "0"
+                size = int(size) if size.isdigit() else 0
+                sent = self.rfile.read(min(size, NOTE_BODY + 1)) if self.command == "POST" else b""
+                code, ctype, body = wb.handle(self.command, self.path, self.headers.get("Host"), sent,
+                                              {k.lower(): v for k, v in self.headers.items()})
             except Exception as e:      # the page shows the reason; the server stays up
                 code, ctype, body = 500, "text/plain", f"{type(e).__name__}: {e}".encode()
             self.send_response(code)
@@ -891,6 +1038,21 @@ def _self_test():
            wb.handle("GET", f"/api/view?run={rid}&view=nope", "localhost")[0] == 404
            and wb.api_view(rid, "spec")["checks"][0]["status"] == "not_available"
            and "goal G6" in wb.api_view(rid, "spec")["checks"][0]["says"])
+        global _view_module
+        real, in_folder = _view_module, [n for n, _, _ in PATH if os.path.exists(os.path.join(HERE, "views", f"{n}.py"))]
+
+        def broken(name):
+            raise ImportError("planted")
+        try:
+            listed = [n for n, _, _ in PATH if real(n) is not None]
+            _view_module = broken
+            why, c = load_view("spec")[1], wb.api_view(rid, "spec")["checks"][0]
+        finally:
+            _view_module = real
+        ok("W19b the view registry is a list of import statements that names every view module in views/ and no other; "
+           "a view module that cannot be imported gives not_available with the reason, never a crash",
+           listed == in_folder and "could not be loaded" in why and c["status"] == "not_available" and "planted" in c["says"],
+           str((listed, in_folder, why, c)))
 
         def boom(run):
             raise KeyError("no such field")
@@ -1164,6 +1326,8 @@ def _self_test():
         ok("R1b the run list shows nothing read from the replacement either",
            "other run" not in json.dumps(wb2.api_runs()), json.dumps(wb2.api_runs())[:300])
 
+        _self_test_notes(tmp, ok)
+
         node = shutil.which("node")
         if node is None:
             print("  skip W36 the page script's own cases (page_test.js): node is not installed here")
@@ -1173,6 +1337,131 @@ def _self_test():
                r.returncode == 0, (r.stdout + r.stderr)[-900:])
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
+
+
+def _self_test_notes(tmp, ok):
+    """The one write (§6 "Review notes"): POST /api/note appends one line to <run>/owner/review_notes.jsonl."""
+    import review_notes
+    from views.fit_bench import fixture_builder
+    d = os.path.join(tmp, "noted", "run")
+    fixture_builder().build(d, defect="C12_open_high")
+    wb, rel = Workbench([], [d]), review_notes.FILE
+    rid = next(iter(wb.scan()))
+    file = os.path.join(d, rel)
+
+    def post(body, token=None, host="127.0.0.1:8790", run=rid, path="/api/note", **headers):
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        return wb.handle("POST", f"{path}?run={urllib.parse.quote(run)}", host, raw,
+                         {"x-workbench-token": wb.token if token is None else token, "content-type": "application/json", **headers})
+
+    def tree(skip=(rel,)):
+        out = {}
+        for root, _, names in os.walk(d):
+            for n in names:
+                r = os.path.relpath(os.path.join(root, n), d)
+                if r not in skip:
+                    out[r] = hashlib.sha256(open(os.path.join(root, n), "rb").read()).hexdigest()
+        return out
+
+    def lines():
+        return open(file, "rb").read().split(b"\n")[:-1] if os.path.exists(file) else []
+
+    def row(rid_):
+        t = wb.api_view(rid, "register")["tables"]["rows"]
+        return next((dict(zip(t["columns"], r)) for r in t["rows"] if r[0] == rid_), None)
+    before = tree()
+    page = wb.handle("GET", "/", "localhost")[2].decode()
+    static = open(os.path.join(STATIC, "index.html")).read()
+    ok("N1 the token is made at server start and put in the page; the static file holds none, and two servers differ",
+       len(wb.token) >= 32 and f'content="{wb.token}"' in page and wb.token not in static and TOKEN_MARK in static
+       and Workbench([], [d]).token != wb.token)
+    good = {"row": "D-001", "disposition": "declared", "note": "accepted as a stated limit"}
+    refused = [post(good, token=""), post(good, token="x" * len(wb.token)), post(good, token=wb.token + "x"),
+               wb.handle("POST", f"/api/note?run={rid}", "127.0.0.1", json.dumps(good).encode(), {})]
+    ok("N2 a POST with no token or a wrong one is refused (403) and writes nothing",
+       [r[0] for r in refused] == [403] * 4 and not os.path.exists(os.path.dirname(file)), str([r[:1] for r in refused]))
+    away = [post(good, host="evil.example"), post(good, host="127.0.0.1.evil.example:8790"), post(good, host=""),
+            post(good, origin="http://evil.example"), post(good, origin="null")]
+    ok("N3 a POST whose Host is not loopback, or that comes from another origin, is refused (403) and writes nothing",
+       [r[0] for r in away] == [403] * 5 and not os.path.exists(os.path.dirname(file)), str([r[0] for r in away]))
+    bad = [b"not json", b"[1, 2]", {**good, "disposition": "closed"}, {**good, "file": "../../elsewhere.jsonl"},
+           {**good, "at": "2020-01-01T00:00:00+00:00"}, {"row": "Z-999", "disposition": "declared"}, {"row": "D-001"},
+           {"row": "D-001", "same_as": "Z-999"}, {"row": "D-001", "same_as": "D-001"}, {"row": None, "kind": "issue"},
+           {"row": None, "statement": "s"}, {"row": "D-001", "statement": "restated", "note": "x"}, {"row": 7, "note": "x"},
+           {"row": "D-001", "note": {"a": 1}}, b"\xff\xfe"]
+    got = [post(x)[0] for x in bad]
+    ok("N4 a note outside the schema is refused (400) with the reason and writes nothing: not JSON, an unknown key or "
+       "word, a row the register does not hold, a note that says nothing, a time or a file name from the client",
+       got == [400] * len(bad) and not os.path.exists(os.path.dirname(file)) and b"closed" in post(bad[2])[2], str(got))
+    lost = [post(good, run="nope"), post(good, run=d), post(good, run="../run"), post(good, path="/api/runs"),
+            post(good, path="/api/view"), wb.handle("PUT", f"/api/note?run={rid}", "localhost", b"{}", {"x-workbench-token": wb.token}),
+            post(good, **{"content-type": "text/plain"}), post(b" " * (NOTE_BODY + 1))]
+    ok("N5 a run that is not one the workbench found (an unknown id, a path), another address, another method, another "
+       "content type or an over-long body is refused, and nothing is written",
+       [r[0] for r in lost] == [404, 404, 404, 405, 405, 405, 415, 413] and not os.path.exists(os.path.dirname(file)), str([r[0] for r in lost]))
+    first = post(good)
+    one = lines()
+    ok("N6 a good note is appended as one line with the server's time, and the register shows it beside the derived value",
+       first[0] == 200 and len(one) == 1 and json.loads(one[0])["row"] == "D-001" and _ts(json.loads(one[0])["at"]) is not None
+       and sorted(json.loads(one[0])) == sorted(review_notes.KEYS)
+       and (row("D-001")["disposition"], row("D-001")["signed_by"]) == ("declared", "owner")
+       and wb.api_view(rid, "register")["tables"]["notes"]["rows"][0][2:4] == ["declared", "open"], str((first, one)))
+    crafted = 'x"}\n{"at": "2026-01-02T09:00:00+00:00", "row": "D-002", "kind": null, "statement": null, ' \
+              '"disposition": "withdrawn", "decides": null, "note": ""}\r\n'
+    second = post({"row": "D-002", "note": crafted, "decides": "no"})
+    two = lines()
+    ok("N7 append, not overwrite: the first line is unchanged; a note whose text holds a line break and a JSON object "
+       "is still one line and changes no other row",
+       second[0] == 200 and len(two) == 2 and two[0] == one[0] and json.loads(two[1])["note"] == crafted
+       and row("D-002")["disposition"] == "implemented" and row("D-002")["decides"] == "no", str((second, len(two))))
+    third = post({"row": None, "kind": "uncertainty", "statement": "The two rounds may not share a sampling frame."})
+    fourth = post({"row": "note:1", "same_as": "D-002"})
+    ok("N8 a new row and a same-as note: the row is added as note:1, and the row named second is folded into it",
+       third[0] == 200 and fourth[0] == 200 and len(lines()) == 4 and row("D-002") is None
+       and "findings" in row("note:1")["source"] and wb.api_view(rid, "register")["facts"]["n_owner_notes"] == 4, str((third, fourth)))
+    ok("N9 nothing else is ever written: every other file of the run is as it was, and the owner folder holds that one file",
+       tree() == before and os.listdir(os.path.join(d, "owner")) == [os.path.basename(rel)], str(set(tree()) ^ set(before)))
+    elsewhere = os.path.join(tmp, "noted", "elsewhere")
+    os.makedirs(elsewhere)
+    outside = os.path.join(elsewhere, os.path.basename(rel))
+    kept = open(file, "rb").read()
+    remove_nofollow(d, rel)
+    os.symlink(outside, file)           # lib.safe_io makes no link: the three planted ones are plain os calls
+    a = post(good)
+    remove_nofollow(d, rel)
+    os.rmdir(os.path.join(d, "owner"))
+    os.symlink(elsewhere, os.path.join(d, "owner"))
+    b = post(good)
+    remove_nofollow(d, "owner")
+    os.makedirs(os.path.join(d, "owner"))
+    write_nofollow(elsewhere, os.path.basename(rel), kept)
+    os.link(outside, file)
+    c = post(good)
+    ok("N10 a note is written nowhere but that file: a notes file that is a link, an owner folder that is a link and a "
+       "notes file also linked from elsewhere are each refused, and the file elsewhere is as it was",
+       [a[0], b[0], c[0]] == [409] * 3 and open(outside, "rb").read() == kept and os.listdir(elsewhere) == [os.path.basename(rel)],
+       str([a, b, c]))
+    doc = {"tables": {"t": {"columns": ["id", "x"], "rows": [], "actions": {
+        "post": "/api/note", "key": "id", "label": "Review", "about": "A",
+        "fields": [{"name": "disposition", "label": "D", "choices": ["a"]}, {"name": "same_as", "label": "S", "rows": True},
+                   {"name": "note", "label": "N", "text": True, "required": True}],
+        "add": {"label": "Add", "fields": [{"name": "statement", "label": "S", "text": True}]}}}}}
+
+    def wrong(**edit):
+        t = json.loads(json.dumps(doc))
+        t["tables"]["t"]["actions"].update(edit)
+        return action_problems(t)
+    script = open(os.path.join(STATIC, "app.js")).read()
+    ok("N11 action declarations: every documented key is read by the page; an unknown address, key or column, and a "
+       "field that is not one of choices, rows or text, are each reported",
+       action_problems(doc) == [] and all(len(wrong(**e)) == 1 for e in (
+           {"post": "/api/runs"}, {"key": "z"}, {"colour": "red"}, {"label": ""},
+           {"fields": [{"name": "n", "label": "L"}]}, {"fields": [{"name": "n", "label": "L", "text": True, "size": 3}]},
+           {"add": {"label": "Add", "fields": [{"label": "L", "text": True}]}}))
+       and all(re.search(rf"\b(a|f|actions|add)\.{k}\b", script) for k in ACTION_KEYS + FIELD_KEYS)
+       and all(k in __doc__ for k in ACTION_KEYS + FIELD_KEYS + ("lead", "actions", "wrap"))
+       and all(re.search(rf"\bt\.{k}\b", script) for k in ("lead", "actions", "wrap")),
+       str([k for k in ACTION_KEYS + FIELD_KEYS if not re.search(rf"\b(a|f|actions|add)\.{k}\b", script)]))
 
 
 def main():

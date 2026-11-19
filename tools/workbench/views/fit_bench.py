@@ -10,8 +10,11 @@ import os
 import sys
 
 _WB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _WB not in sys.path:
-    sys.path.insert(0, _WB)
+_REPO = os.path.dirname(os.path.dirname(_WB))
+for _p in (_REPO, os.path.join(_REPO, "scripts"), _WB):     # _REPO: tools.workbench.fixtures; scripts: lib.safe_io
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from lib.safe_io import read_nofollow, write_nofollow  # noqa: E402
 
 
 class Bench:
@@ -20,7 +23,8 @@ class Bench:
 
     def __init__(self, view):
         import tempfile
-        self.view, self.tmp, self.built, self.fails = view, tempfile.mkdtemp(prefix="fit-self-test-"), {}, []
+        self._tmp = tempfile.TemporaryDirectory(prefix="fit-self-test-")      # removed by done(), or when collected
+        self.view, self.tmp, self.built, self.fails = view, self._tmp.name, {}, []
 
     def folder(self, method, defect=None, upto=None):
         """A built fixture run's folder (built once per variant; never edited in place)."""
@@ -32,12 +36,16 @@ class Bench:
         return self.built[key]
 
     def edited(self, method, edit, defect=None):
-        """A copy of a built run with one file rewritten or removed by `edit(folder)`."""
-        import shutil
-        d = os.path.join(self.tmp, f"edited{len(os.listdir(self.tmp))}")
-        shutil.copytree(self.folder(method, defect), d)
-        edit(d)
-        return d
+        """A copy of a built run with one file rewritten or removed by `edit(folder)`. The builder writes plain files
+        only; each is read and written below the bench's folder with no link followed (lib.safe_io)."""
+        src, name = self.folder(method, defect), f"edited{len(os.listdir(self.tmp))}"
+        os.makedirs(os.path.join(self.tmp, name))
+        for at, _, files in os.walk(src):
+            for f in files:
+                rel = os.path.relpath(os.path.join(at, f), src).replace(os.sep, "/")
+                write_nofollow(self.tmp, f"{name}/{rel}", read_nofollow(self.tmp, f"{os.path.basename(src)}/{rel}")[0])
+        edit(os.path.join(self.tmp, name))
+        return os.path.join(self.tmp, name)
 
     def look_at(self, d):
         import workbench
@@ -57,20 +65,18 @@ class Bench:
             self.fails.append(name.split()[0])
 
     def done(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        self._tmp.cleanup()
         print("OK: all self-test cases passed." if not self.fails else f"FAILED: {self.fails}")
         return 1 if self.fails else 0
 
 
 def fixture_builder():
-    """tools/workbench/fixtures.py, loaded by its path: scripts/ holds another module of that name."""
-    import importlib.util
-    if "workbench_fixtures" not in sys.modules:
-        spec = importlib.util.spec_from_file_location("workbench_fixtures", os.path.join(_WB, "fixtures.py"))
-        sys.modules["workbench_fixtures"] = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(sys.modules["workbench_fixtures"])
-    return sys.modules["workbench_fixtures"]
+    """tools/workbench/fixtures.py, imported by its full name from the repo root: scripts/ holds another module
+    named fixtures, so the bare name would depend on the order of sys.path."""
+    from tools.workbench import fixtures
+    if os.path.dirname(os.path.abspath(fixtures.__file__)) != _WB:
+        raise ImportError(f"tools.workbench.fixtures was loaded from {fixtures.__file__}, not from {_WB}")
+    return fixtures
 
 
 def need(cond, why):
@@ -95,8 +101,7 @@ def rewrite(rel, change):
         with open(os.path.join(d, rel), encoding="utf-8") as f:
             doc = yaml.safe_load(f)
         change(doc)
-        with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
-            yaml.safe_dump(doc, f, sort_keys=False)
+        write_nofollow(d, rel, yaml.safe_dump(doc, sort_keys=False).encode("utf-8"))
     return edit
 
 

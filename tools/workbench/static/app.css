@@ -96,9 +96,13 @@ th .sub { display: block; font-weight: 400; font-size: 11.5px; color: var(--ink3
 select { font: inherit; padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); }
 td.tight { white-space: nowrap; }
 td.clip { cursor: pointer; max-width: 30ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-table.wide { font-size: 12px; } table.wide th, table.wide td { padding-right: 9px; } table.wide td.clip { max-width: 15ch; }
+table.wide { font-size: 12px; } table.wide th, table.wide td { padding-right: 8px; } table.wide td.clip { max-width: 15ch; }
 table.wide th .sub { font-size: 10.5px; max-width: 11ch; min-width: 0; }
 td.clip.open { white-space: normal; overflow-wrap: break-word; max-width: 46ch; }
+td.whole, table.wide td.whole { min-width: 30ch; max-width: 64ch; overflow-wrap: break-word; }
+td.whole .lines { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
+td.whole[title] { cursor: pointer; } td.whole .lines.open { display: block; }
+table.wide th { white-space: normal; overflow-wrap: normal; } table.wide td { overflow-wrap: break-word; }
 tr.link { cursor: pointer; } tr.link:hover td { background: var(--na-bg); }
 
 figure { margin: 10px 0 18px; }
@@ -131,3 +135,11 @@ svg.focus .edge.hot { opacity: 1; } svg.focus .node.hot { opacity: 1; }
 #tip { position: fixed; z-index: 9; pointer-events: none; max-width: 420px; padding: 8px 10px; border-radius: 6px; font-size: 12.5px;
   background: var(--surface); color: var(--ink); border: 1px solid var(--line); box-shadow: 0 4px 14px rgba(0, 0, 0, .18); }
 #tip div { display: flex; gap: 10px; } #tip span:first-child { color: var(--ink2); flex: 0 0 auto; } #tip span:last-child { overflow-wrap: anywhere; }
+th.plain { cursor: default; }
+tr.formrow td { max-width: none; background: var(--na-bg); padding: 10px 12px; }
+.form { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: flex-end; max-width: min(1000px, 74vw); font-size: 13px; }
+.form .formhead { flex: 0 0 100%; font-weight: 600; overflow-wrap: anywhere; }
+.form label { display: flex; flex-direction: column; gap: 2px; color: var(--ink2); font-size: 12.5px; }
+.form label.long { flex: 1 1 340px; }
+.form textarea { font: inherit; font-size: 13px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); resize: vertical; }
+.form .tools, .form p { flex: 0 0 100%; margin: 0; }
