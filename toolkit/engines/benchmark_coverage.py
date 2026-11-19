@@ -748,14 +748,25 @@ def _self_test_posterior(ok, cov, both):
         ok(got17["no record"] == ({}, None) and got17["stale"] == ({}, None),
            f"BC17 a fit that did not record its target's declaration digest, or recorded another one, trains nothing "
            f"on it: {got17}")
-        try:            # Codex r1: the toy-engine exemption does not skip loading a declared posterior
-            r = cases["bad"]()
+        try:            # Codex r1: the toy-engine exemption does not skip loading a declared posterior (r3: a
+            r = cases["bad"]()           # raise is a failing case, not the result)
             got = assess(r["engine"]["ref"], r["engine"].get("config"), r, "unsigned", base=d)
         except Exception as e:  # noqa: BLE001
-            got = {"why_not": [f"{type(e).__name__}: {e}"]}
-        ok(any("net_effect_posterior does not load" in w for w in got["why_not"]),
+            got = {"why_not": [], "raised": f"{type(e).__name__}: {e}"}
+        ok(any("net_effect_posterior does not load" in w for w in got["why_not"]) and "raised" not in got,
            f"BC16 an engine whose declared posterior does not load is not eligible, toy engines included: "
-           f"{got['why_not'][:1]}")
+           f"{got['why_not'][:1]} {got.get('raised', '')}")
+    try:                # Codex r3: a malformed uncertainty section is not a posterior and does not raise here
+        got18 = posterior_trained({"uncertainty": 1}, "x:y", None, None)
+    except Exception as e:  # noqa: BLE001
+        got18 = f"{type(e).__name__}: {e}"
+    ok(got18 == (None, None), f"BC18 a malformed uncertainty section declares no posterior: {got18}")
+    # Codex r3: run() records the digests of the pack it evaluated; in a normal fit that pack's declarations are
+    # the pack file's, so a current fit's targets count
+    eff = NEF.build_pack(base)
+    ok(NEF.target_digests(eff, NEF.pack_bands()) == NEF.target_digests(base, NEF.pack_bands())
+       and "target_digests=target_digests(pack, bands)" in open(NEF.__file__).read(),
+       "BC19 the fit writes the digests of the pack it evaluated, which a normal fit shares with the pack file")
 
 
 if __name__ == "__main__":
