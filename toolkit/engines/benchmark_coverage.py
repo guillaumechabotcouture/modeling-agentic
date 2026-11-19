@@ -733,6 +733,21 @@ def _self_test_posterior(ok, cov, both):
            f"loader's replay verified the chosen point on, each with its declaration's digest: {res['good']}")
         ok(res["bad"][0] is None and "net_effect_posterior does not load" in str(res["bad"][1]),
            f"BC15 a declared posterior that does not load fails closed: {res['bad']}")
+        # Codex r2: the declaration digest is the one the fit recorded when it ran; a fit file without it, or whose
+        # recorded digest is not the current declaration's (same id and band, other arms), trains nothing on that id
+        got17 = {}
+        for label, edit in (("no record", lambda doc: (doc["plan"].update(targets_train=[t0]),
+                                                      doc.pop("target_digests", None))),
+                            ("stale", lambda doc: (doc["plan"].update(targets_train=[t0]),
+                                                   doc.setdefault("target_digests", {}).update({t0: "0" * 64})))):
+            r = dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior=signed(edit)))
+            try:
+                got17[label] = posterior_trained(r, r["engine"]["ref"], r["engine"].get("config"), d)
+            except Exception as e:  # noqa: BLE001
+                got17[label] = (None, f"{type(e).__name__}: {e}")
+        ok(got17["no record"] == ({}, None) and got17["stale"] == ({}, None),
+           f"BC17 a fit that did not record its target's declaration digest, or recorded another one, trains nothing "
+           f"on it: {got17}")
         try:            # Codex r1: the toy-engine exemption does not skip loading a declared posterior
             r = cases["bad"]()
             got = assess(r["engine"]["ref"], r["engine"].get("config"), r, "unsigned", base=d)
