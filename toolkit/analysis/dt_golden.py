@@ -121,10 +121,37 @@ def _plain_name(tid: str, pathmod=os.path) -> bool:
     """Whether `<tid>.yaml` is one plain file name under a directory with this platform's path rules: no separator,
     no `.`/`..`, no drive (Windows `C:x`), so joining it never leaves the directory (Codex r3 P1-3, P2-1: any id the
     writers accept otherwise, spaces and colons included)."""
-    base = pathmod.join("base", "dir")
-    j = pathmod.join(base, f"{tid}.yaml")
-    return bool(tid) and tid not in (".", "..") and "/" not in tid and "\\" not in tid \
-        and pathmod.dirname(j) == base and pathmod.basename(j) == f"{tid}.yaml"
+    base, name = pathmod.join("base", "dir"), f"{tid}.yaml"
+    j = pathmod.join(base, name)
+    return bool(tid) and "/" not in tid and "\\" not in tid and name not in (".", "..") \
+        and pathmod.dirname(j) == base and pathmod.basename(j) == name
+
+
+def _tid(v):
+    """A test id as run_all names its file (f"{id}.yaml"): a string, or a number or bool in its str form; None (no
+    identity) for anything else, null included (Codex r4 P2)."""
+    return v if isinstance(v, str) else str(v) if isinstance(v, (bool, int, float)) else None
+
+
+def _read(run_dir: str, rel: str, missing=StoredIncomplete):
+    """The YAML of run_dir/rel, read through one descriptor with no link followed at any component
+    (lib.safe_io.read_nofollow; Codex r4 P1: no check-then-open race)."""
+    import stat
+    import yaml
+    from toolkit.analysis.artifacts import _safe_io
+    _regular_in(run_dir, rel, missing)          # the clear message for a missing, linked or odd path
+    try:
+        data, st = _safe_io().read_nofollow(os.path.realpath(run_dir), rel)
+    except FileNotFoundError as e:
+        raise missing(f"{rel}: missing") from e
+    except OSError as e:                         # LinkRefused included
+        raise StoredIncomplete(f"{rel}: not read without following a link ({e})") from e
+    if not stat.S_ISREG(st.st_mode):
+        raise StoredIncomplete(f"{rel}: not a regular file")
+    try:
+        return yaml.safe_load(data)
+    except yaml.YAMLError as e:
+        raise StoredIncomplete(f"{rel}: not YAML ({e})") from e
 
 
 def _regular_in(run_dir: str, rel: str, missing=StoredIncomplete) -> str:
@@ -149,18 +176,15 @@ def digest_dir(run_dir: str) -> dict:
     raises FileNotFoundError; a malformed artifact, an entry without an id or with an unknown status, a repeated id,
     a run test without its result file, a result file elsewhere than models/decision_tests/<id>.yaml or through a link,
     or a result whose test id or status differs from its entry raises StoredIncomplete."""
-    import yaml
-    p = _regular_in(run_dir, "analysis/decision_tests.yaml", missing=FileNotFoundError)
-    with open(p) as f:
-        doc = yaml.safe_load(f)
+    p = "analysis/decision_tests.yaml"
+    doc = _read(run_dir, p, missing=FileNotFoundError)
     data = doc.get("data") if isinstance(doc, dict) else None
     tests = data.get("tests") if isinstance(data, dict) else None
     if not isinstance(tests, list):
         raise StoredIncomplete(f"{p}: data.tests is not a list")
     out = {}
     for t in tests:
-        tid = t.get("test_id") if isinstance(t, dict) else None
-        tid = str(tid) if isinstance(tid, int) and not isinstance(tid, bool) else tid      # run_all keeps an int id
+        tid = _tid(t.get("test_id")) if isinstance(t, dict) else None
         if not isinstance(tid, str) or not _plain_name(tid):
             raise StoredIncomplete(f"{p}: an entry without a plain test id ({t!r:.120})")
         if tid in out:
@@ -176,9 +200,8 @@ def digest_dir(run_dir: str) -> dict:
         want = f"models/decision_tests/{tid}.yaml"
         if str(t.get("path") or "").replace("\\", "/") != want:
             raise StoredIncomplete(f"{p}: test {tid}: result file {t.get('path')!r}, not {want}")
-        with open(_regular_in(run_dir, want)) as f:
-            rec = yaml.safe_load(f)
-        if not isinstance(rec, dict) or "test_id" not in rec or str(rec["test_id"]) != tid or rec.get("status") != st \
+        rec = _read(run_dir, want)
+        if not isinstance(rec, dict) or _tid(rec.get("test_id")) != tid or rec.get("status") != st \
                 or not isinstance(rec.get("decision_changes"), bool):
             raise StoredIncomplete(f"{want}: holds {rec!r:.80}, not test {tid} with status {st} and decision_changes")
         vd = "CHANGES_PLAN" if rec.get("decision_changes") else "NO_CHANGE"
@@ -528,7 +551,7 @@ def _self_test() -> int:
                     {"None.yaml": _rec(test_id=None)})
             ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG19b (r4 P2-2) a null test id is no identity")
         import inspect
-        ok("read_nofollow" in inspect.getsource(digest_dir),
+        ok("read_nofollow" in inspect.getsource(_read) and "open(" not in inspect.getsource(digest_dir),
            "DG19c (r4 P1) every read goes through lib.safe_io.read_nofollow (one descriptor, no link followed)")
 
     for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19):
