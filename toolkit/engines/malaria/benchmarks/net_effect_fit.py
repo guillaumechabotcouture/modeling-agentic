@@ -72,13 +72,20 @@ NET_PARAMS = {"net_kill_shift": ({"pyr", "pbo", "dual"}, [-0.618, 0.66]),
 #    Fagbohoun 2026 abstract, hut mortality 55% to 39% by 24 m (1472 days). 1650 is the longest.
 FIT_EXTRA = {"cfp_half": [270.0, 1650.0]}
 # Wave 2 (owner, 13 Nov, "option 1"): wave 1's engine results are reused from its output, a verbatim copy of the run
-# on cluster 2375765 (commit fb8deac; engine code identical to this one's, pack.yaml unchanged: WAVE1_PACK_SHA256).
+# on cluster 2375765 (commit fb8deac; engine code identical to this one's, pack.yaml then WAVE1_PACK_SHA256). F6 option
+# A: reuse is bound to what the fit runs, the training targets' declarations and the fit rule (benchmark_sources
+# fit_declarations: arms, settings, horizon, seeds, engine) of the effective pack (build_pack of the pack wave 1 ran
+# on), WAVE1_FIT_DECLARATIONS_SHA256, so held-out benchmarks added to the pack (B9d-B9g) leave it reusable.
 # 48 new LHS points in the wave-2 box: wave 1's accepted hull widened by `margin` of its width on each side, to the
 # new box edge on a side where the hull reached the old box edge (wave 1 holds no point past it). 48 points: 3 per
 # quadratic coefficient in 4 dimensions (15) plus 3; the plan stays under CAP_USD.
 WAVE1 = os.path.join(HERE, "net_effect_fit_wave1.yaml")
 WAVE1_SHA256 = "54958ad2e79716edf19f2b4b60f263ca41056d3202147ff4bfa23277b318a067"
 WAVE1_PACK_SHA256 = "32abb2bb6457ed7008c6410c55b4e0b620b2e982073a7dd5cbdcb7988114a905"
+# Codex r2 on #268: this digest is of the REUSING fit's effective pack (wave 2 and verification round 2, cfp_half box
+# 270-1650 days per FIT_EXTRA), not of wave 1's own run (box 547.5-1277.5, WAVE1_BOX; digest 191fb4d0...). The widening
+# is the owner's 13 Nov "option 1"; wave 1's box is checked against its output by its recorded plan, not by this digest.
+WAVE1_FIT_DECLARATIONS_SHA256 = "e0fa57b0822d064c21ea78fd22d00ce214f1f43e704af930766e6aaa4f2a84dc"
 WAVE1_BOX = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
              "cfp_half": [547.5, 1277.5]}
 WAVE2 = {"n": 48, "seed": 23, "margin": 0.25}
@@ -561,11 +568,12 @@ def wave2_box(hull: dict, old: dict, new: dict, margin: float) -> dict:
     return out
 
 
-def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256) -> dict:
+def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256, pack: dict | None = None) -> dict:
     """Wave 1's engine results, for reuse (no engine run repeated): every engine-evaluated point with its target values
     (46 design points, the verified sample points, the chosen point) and the calibration grid. Refused (ValueError,
     fail closed) unless the file's sha256 is `digest`, it is a full run (not a smoke) of this script, its engine
-    identity (name, code, parameters, configuration) is this engine's, the pack is the one it ran on, its seeds and
+    identity (name, code, parameters, configuration) is this engine's, the pack's fit declarations are the ones it ran
+    on (held-out benchmarks may have been added), its seeds and
     targets are the pack's, its calibration grid is this script's (CAL_N points across the kill shift's box) and does
     not clamp, and every point has a value for every target."""
     import hashlib
@@ -582,9 +590,10 @@ def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256) -> dic
             raise ValueError(f"wave 1 {path}: engine {k} {have.get(k)}, this engine's is {want[k]}")
     if base != yaml.safe_load(open(PACK)):
         raise ValueError(f"wave 1 {path}: the pack given is not pack.yaml")
-    if _pack_digest(PACK) != WAVE1_PACK_SHA256:
-        raise ValueError(f"wave 1 {path}: pack.yaml (sha256 {_pack_digest(PACK)}) is not the pack wave 1 ran on "
-                         f"({WAVE1_PACK_SHA256})")
+    eff = build_pack(base) if pack is None else pack       # the pack the runner executes (Codex r1 P2 on #266)
+    if _fit_digest(eff) != WAVE1_FIT_DECLARATIONS_SHA256:
+        raise ValueError(f"wave 1 {path}: the effective pack's fit declarations (sha256 {_fit_digest(eff)}) are not "
+                         f"the declarations wave 1 ran on ({WAVE1_FIT_DECLARATIONS_SHA256})")
     fr, train = doc.get("fit_rule") or {}, split(base)[0]
     if list(fr.get("seeds") or []) != list(base["seeds"]):
         raise ValueError(f"wave 1 {path}: seeds {fr.get('seeds')}, the pack's are {base['seeds']}")
@@ -620,9 +629,11 @@ def load_wave1(path: str, engine, base: dict, digest: str = WAVE1_SHA256) -> dic
             "calibration_grid": {"values": vals, "m0": {s: [float(v) for v in m0[s]] for s in m0}}}
 
 
-def _pack_digest(path: str) -> str:
+def _fit_digest(pack: dict) -> str:
+    """sha256 of what a fit's engine runs depend on: each training target's declaration and the fit rule."""
     import hashlib
-    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    from toolkit.engines.benchmark_sources import fit_declarations
+    return hashlib.sha256(json.dumps(fit_declarations(pack), sort_keys=True).encode()).hexdigest()
 
 
 def fit_waves(pack: dict, runner, wave1: dict, box2: dict, n: int = WAVE2["n"], seed: int = WAVE2["seed"],
@@ -1064,7 +1075,7 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
         raise ValueError(f"the calibration arms depend on {sorted(calibration_params(pack))}, not only {CAL_PARAM}")
     eng = BM.load_engine(pack["engine"], None)
     runner = RecalRunner(pack, eng, workers, pack["seeds"], mode="fit", evidence=BM.load_evidence(eng, pack=pack))
-    wave1 = None if smoke else load_wave1(WAVE1, eng, base)        # before any engine run: refused fails closed
+    wave1 = None if smoke else load_wave1(WAVE1, eng, base, pack=pack)   # before any engine run: refused fails closed
     if verify_round and not smoke:          # wave 2's engine results, under the sha256 recorded when it was stored
         import tempfile
         resume_from = fetch_cache(VERIFY_ROUND["cache_blob"], VERIFY_ROUND["cache_sha256"],
@@ -1632,6 +1643,44 @@ def _self_test() -> int:
                       f"grid, from the recorded file ({len(why)} refusals; for another reason or not at all: "
                       f"{wrong or 'none'})")
     case("F19", f19)
+
+    def f19c():
+        # F6 option A: a held-out benchmark (and its setting) added to the pack does not touch what wave 1 ran, so its
+        # results stay reusable; a change to a training target's declaration (here a training setting) refuses them
+        import tempfile
+        global PACK
+        held_pk = copy.deepcopy(base)
+        held_pk["settings"]["zz_site"] = copy.deepcopy(held_pk["settings"]["misungwi"])
+        held_pk["arms"].update(zz_a={"setting": "zz_site", "package": {"net": "pyr"}},
+                               zz_b={"setting": "zz_site", "package": {"net": "pbo"}})
+        held_pk["benchmarks"].append(dict(byid["B9c"], id="ZZ1", estimand=dict(byid["B9c"]["estimand"], num="zz_b",
+                                                                                 den="zz_a")))
+        train_pk = copy.deepcopy(base)
+        train_pk["settings"]["muleba"]["calibrate"]["grid"] = [8, 16, 32]
+        got, orig = {}, PACK
+        with tempfile.TemporaryDirectory() as d:
+            for label, pk in (("held", held_pk), ("train", train_pk)):
+                PACK = os.path.join(d, f"{label}.yaml")
+                yaml.safe_dump(pk, open(PACK, "w"), sort_keys=False)
+                try:
+                    load_wave1(WAVE1, e, yaml.safe_load(open(PACK)))
+                    got[label] = ""
+                except ValueError as ex:
+                    got[label] = str(ex)
+                finally:
+                    PACK = orig
+        # Codex r1 P2-3 on #266: the check binds the pack the runner executes (build_pack's), not only the base
+        eff = build_pack(base)
+        eff["settings"]["misungwi"]["params"]["n_agents"] = 999
+        try:
+            load_wave1(WAVE1, e, base, pack=eff)
+            got["effective"] = ""
+        except (ValueError, TypeError) as ex:
+            got["effective"] = str(ex)
+        ok(got.get("held") == "" and "declarations" in got.get("train", "") and "declarations" in got["effective"],
+           f"F19c wave 1 stays reusable when the pack gains a held-out benchmark and setting, and is refused when a "
+           f"training target's declaration changes ({got})")
+    case("F19c", f19c)
 
     def f20():
         old = {"a": [0.0, 1.0], "b": [10.0, 20.0], "c": [0.0, 1.0]}
