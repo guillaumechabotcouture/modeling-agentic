@@ -62,6 +62,12 @@ One reader: the owner, an expert epidemiological modeller.
   A record that contradicts itself (a status that disagrees with its own list of blocks) is
   `problem`.
 - Something the harness could not compute is never reported as passed.
+- A recorded word is checked against the recorded numbers beside it wherever the producer's
+  rule can be recomputed from them (a ratio against its band, a draw count against its
+  minimum, a share against its threshold, a list against its count); a word that disagrees is
+  `problem`. A view carries the shared loaders' verdict on a test and never re-derives it.
+  An unknown schema word or a malformed row is `not_available` naming it, never an empty
+  clean result.
 - An exemption is read from the verified signed spec itself, never from a file computed from
   it: an engine record, a choice record or a figure index can describe what the spec allows,
   but cannot grant it. Where the producer requires the owner's signature (a departure), a
@@ -540,6 +546,18 @@ Settled from the first acceptance pass on two kinds and three engines (2026-11-1
   view may declare `choose: {param, label, options}` for a parameter the reader picks (the
   comparison run); the server fills the option list of runs and refuses a run compared with
   itself. A table may be `plain` (its cells are the run's own words, not states to mark).
+- Settled by the external review: `dearest_wins` prices each option per unit as the producer
+  does (basis, eligible population, reach share, people per commodity, years), from the
+  verified signed spec and the units table; with an input it cannot read it is
+  `not_available`. A plan list that disagrees with the recorded unit count makes it `problem`
+  (a contradiction, the one case above `look`). Tests recorded against another spec make
+  `tests_that_move` `problem`, and with no verified spec `not_available`. A table
+  `outside_spec` (`item, this_run, other_run, same`) sets the two runs' launch commit,
+  pipeline, engine identity and recorded input hashes side by side, differing rows first. A
+  clean pair whose specs differ in a key with no shift is `look`. The headline factor is the
+  ratio of magnitudes; a zero or a change of sign is `look`, named. A view may declare
+  `fact_labels` (plain words for facts; facts a table already shows are hidden) and `fold`
+  (rows with no verdict or threshold are folded).
 - What is kind-specific: for `estimates`, the plan, variants, burden, value of information and
   emulator tables are null and most checks are `not_available`; the view says so in one line.
 
@@ -854,15 +872,15 @@ walked through or resting on text).
 | C3 | Assumed survey error understates some states' uncertainty (F5) | calibration | fit `target_error` | 1 |
 | C4 | Benchmark out of band or just inside it (B8) | engine choice | model `benchmarks` | 2 |
 | C5 | Window cut off campaigns; SMC rebound (F2–F3) | before the outcome batch | scenarios `trajectories_present` | 0 |
-| C6 | Large package shift between runs, unflagged (F2–F3) | analysis | outcomes `run_shift` | 0 |
-| C7 | Headline averts an implausible share of burden (E7 attempt 6) | analysis | outcomes `share_of_burden` | 0 |
-| C8 | Dearest option wins nearly everywhere (F6 run 3) | analysis | outcomes `dearest_wins` | 0 |
+| C6 | Large package shift between runs, unflagged (F2–F3) | analysis | outcomes `run_shift` | 2 |
+| C7 | Headline averts an implausible share of burden (E7 attempt 6) | analysis | outcomes `share_of_burden` | 1 |
+| C8 | Dearest option wins nearly everywhere (F6 run 3) | analysis | outcomes `dearest_wins` | 2 |
 | C9 | Wrong pipeline or unknown code ran (2026-11-05) | launch | steps `pipeline`, development `launch_tree` | 1 |
 | C10 | Signed spec differs from the spec used or on disk (F6 run 4) | sign-off | steps `signed_spec`, `inputs_fresh` | 1 |
 | C11 | Spend or time far above the estimate (P6, F6 run 1) | during the run | steps `cost`, spend | 1 |
 | C12 | A reviewer's condition dropped with no disposition (F6 run 3) | review | register | 2 |
 | C13 | Calibration blocked, tiny region, parameters on bounds (F6 run 4) | calibration | fit `status`, `region` | 2 |
-| C14 | Inputs the data do not constrain carry the decision (F6) | analysis | fit `constrained`, outcomes `voi_support` | 1 |
+| C14 | Inputs the data do not constrain carry the decision (F6) | analysis | fit `constrained`, outcomes `voi_support` | 2 |
 | C15 | Wrong source behind an input (first malaria review) | evidence | spec `dossier_coverage` | 0 |
 | C16 | A stage loops or a task fails silently (WM6) | during the run | steps `progress` | 1 |
 
@@ -1016,6 +1034,38 @@ The questions as they were put:
   Candidate checks not yet specified: targets matched by an equal number of free parameters
   (FLU: five targets, five free ratios, so they do not test fit); best point far from the
   posterior median along a ridge (DEN).
+- 2026-11-19, external review of the Outcomes view: 9 P1 and 1 P2, each reproduced with a
+  failing test and fixed; common cause, a status word trusted over the numbers beside it (rule
+  added to §3). The walkthrough's reader findings were fixed in the same pass; the builder's
+  codes are off every card in every view. Acceptance on 17 files passes with no entry changed;
+  the dearest-option result on R4 is unchanged under the producer's pricing. Still open: the
+  Overview's views table keeps a goal column; a few sentences still name a gap code; overlap
+  tolerance references and the noise-floor flag are not recomputed.
+- 2026-11-19, loop iteration 4, step 5 (walkthrough): a fresh agent saw four pages only (a pair
+  of runs with a shift and no spec key that differs; a clean pair; the dearest option nearly
+  everywhere; an unconstrained input carrying value of information) and used the comparison
+  itself. It named all three planted defects with check, rows and source file, and nothing of
+  the kind on the clean pair. C6, C8 and C14 score 2; C7 is flagged in the page and scores 1
+  until walked through (20 of 32). Reader findings to fix:
+  1. a shift with no spec key that differs says "something outside the spec changed" and stops:
+     the comparison must also set the two runs' launch commit, engine identity and recorded
+     input hashes side by side (a table `outside_spec`: `item, this_run, other_run, same`), so
+     the reader sees what did change;
+  2. the comparison control must be an ordinary named form control whose choice is in the
+     address, and a check that waits for a choice says "choose a run to compare with", not the
+     wording of a file that could not be read (a fifth status word is not added: the sentence
+     and the legend say it);
+  3. a collapsed `ok` line must not cut off a count the reader needs (a differing spec key on a
+     clean comparison is `look`, since a key changed with no shift is still a change);
+  4. the register's row-id prefixes (`nodata:`, `excluded:`, `departure:`, `test:`) are
+     defined in the glossary and where they appear;
+  5. the page's workbench-building codes (scorecard case, goal, gap) move out of the reader's
+     way: shown on hover or in the glossary only, not in every card's corner;
+  6. facts that repeat a table in raw field names are dropped or given plain labels; rows with
+     no verdict or threshold are folded; a table is not shown twice; one number format for
+     shares; value-of-information shares that sum past one are explained;
+  7. a harness image that is blank or one pixel is said to be so (the fixture's stand-in images
+     look like a failed load).
 - 2026-11-19, loop iteration 4, step 4 for Outcomes: view built by a fresh agent (an adapter
   per deliverable kind, twelve checks, the comparison with another run and a control to choose
   it). Self-tests pass (outcomes 89 cases); acceptance passes on all 17 files with no entry

@@ -5,6 +5,7 @@
     python3 tools/workbench/workbench.py --run-dir <run dir>                      # that run only
     python3 tools/workbench/workbench.py --retro <run dir>                        # print each check's result
     python3 tools/workbench/workbench.py --accept <run dir> <acceptance yaml>     # compare a view with quoted values
+    python3 tools/workbench/workbench.py --accept <run dir> <acceptance yaml> --run-dir <other run>   # ... against that run
     python3 tools/workbench/workbench.py --self-test
 
 Serves tools/workbench/static/ on 127.0.0.1 only and makes no outbound call. It reads run files and writes one
@@ -25,7 +26,7 @@ A stored run is not expected to change; a run still being written may show a mix
 
 A view is a module views/<name>.py whose `view(run)` returns {checks, facts, tables, charts, notes}; the page
 (static/) draws any such result and has no code for a particular view. GET /api/view?run=<id>&view=<name> returns
-it. A chart is a declaration over one of the result's tables (CHART_KEYS lists every key a view may use):
+it (with &against=<run id>, the view compared with that other run: `choose`, below). A chart is a declaration over one of the result's tables (CHART_KEYS lists every key a view may use):
     {kind, table, title, how_to_read, x, y, low, high, group, model, model_alt, scale ("log" or absent), ...}
     bars             x: the label column, y: the value column
     lines            x and y: number columns; group: one line per value. With model, y is drawn as points and the
@@ -53,8 +54,19 @@ Any kind also takes:
     after            a table's name: the chart is drawn directly after that table, wherever the page draws the table,
                      and not in the page's list of charts. An `images` declaration takes the same key. With no such
                      table in the result, or one the run does not record, the block stays where it would have been.
+A view may also return `choose`, the one control a view puts at the top of its page (CHOOSE_KEYS):
+    choose           {param, label, options}: the reader picks one value for the address parameter `param` (the page
+                     keeps it in its own address and sends it with the request for the view). label: the words beside
+                     the control. options: a list of {value, label, group} (group optional: options are gathered under
+                     it), or the word "runs", which the server replaces with the other runs it found, those whose
+                     recorded question is this run's first. The server reads one such parameter, `against`: the id of
+                     another run of its list, given to a view whose function takes it (`view(run, against=None)`) as
+                     that run. An `against` that names no run of the list, is empty or is given twice is refused
+                     (404), never answered as the run alone; a view that takes the run alone is called with the run alone.
 A table may carry `about` (one sentence on what its rows are and where they come from) and `labels` ({column:
 words}, shown under the column's name in its header) beside columns and rows.
+A table may carry `plain` (a list of columns): a status or state word in such a column is the run's own word and is
+shown as written, without the mark the page gives the workbench's own status and file-state words.
 A table may also carry `lead` (true: the page shows it straight after the facts, before the notes and charts,
 because it is what the reader came for), `wrap` (a list of columns whose text is given room: its first four lines, and
 the whole on a click, where another long text is cut to one line) and `actions`, the one way a view lets the reader write:
@@ -66,7 +78,13 @@ the whole on a click, where another long text is cut to one line) and `actions`,
                      choices is a list of words to pick from, rows (true) offers the table's other rows by their
                      key, text (true) is free text; a field left empty is not sent unless it is required
              add     {label, fields}: a form above the table that adds a row; it is sent with `row` null
-A fact or column whose name ends in _usd or _minutes is shown with that unit.
+A table may carry `fold` (a list of columns): its rows with nothing in any of those columns are reported only, and
+the page keeps them under one line that opens, after the rows that hold something.
+A fact or column whose name ends in _usd or _minutes is shown with that unit; one whose name holds the word share (a
+fraction) or ends in _pct (a percentage) is shown as a percentage, the one format for a share.
+A view may also return `fact_labels` ({fact: words}): the plain words the page shows for a fact in place of its name;
+a fact given the empty string is held by one of the view's tables and the page does not repeat it. The facts
+themselves are unchanged in the answer.
 
 Images (§5.12). Beside the five keys a view may return `images`, a list of declarations over its tables (IMAGE_KEYS):
     {table, path, hash, title, caption, group, details, flag, reason, after}
@@ -170,6 +188,9 @@ CHART_COLUMNS = ("x", "y", "low", "high", "group", "model", "model_alt", "outer_
 CHART_KEYS = ("kind", "table", "title", "how_to_read", *CHART_COLUMNS, "nodes", "scale", "where", "labels", "limits", "image", "after")
 IMAGE_KEYS = ("table", "path", "hash", "title", "caption", "group", "details", "flag", "reason", "after")     # a view's `images` declaration
 CHART_IMAGE_KEYS = ("path", "hash", "title", "caption")                           # a chart's `image`
+CHOOSE_KEYS = ("param", "label", "options")                                       # a view's `choose`
+CHOOSE_PARAMS = ("against",)                  # the address parameters the server reads for a view: another run's id
+OPTION_KEYS = ("value", "label", "group")
 # The file endpoint (§5.12) serves raster images only: the ending a name must have, its content type and the function
 # that says what in the bytes is not that kind of image (None when they are one). A vector image can carry a script,
 # so it is not on the list; nor is a raster kind the harness does not write (it writes PNG) and that is not checked here.
@@ -255,6 +276,23 @@ def chart_problems(result):
         if im is not None and not (isinstance(im, dict) and set(im) <= set(CHART_IMAGE_KEYS) and isinstance(im.get("path"), str)
                                    and checks.digest(im.get("hash"))):
             out.append(f"{name}: image is not {{path, hash, title, caption}} with a path and a sha256")
+    return out
+
+
+def choose_problems(result):
+    """What is wrong with a view result's `choose` declaration, as sentences (none when the page can draw it)."""
+    c = result.get("choose")
+    if c is None:
+        return []
+    if not isinstance(c, dict) or set(c) != set(CHOOSE_KEYS):
+        return [f"choose is not {{{', '.join(CHOOSE_KEYS)}}}"]
+    out = [] if c["param"] in CHOOSE_PARAMS else [f"choose: the server reads no parameter {c['param']!r}"]
+    out += [] if isinstance(c["label"], str) and c["label"].strip() else ["choose: no label"]
+    opts = c["options"]
+    if opts != "runs" and not (isinstance(opts, list) and all(
+            isinstance(o, dict) and set(o) <= set(OPTION_KEYS) and isinstance(o.get("value"), str) and o["value"] and isinstance(o.get("label"), str)
+            for o in opts)):
+        out.append('choose: options are neither "runs" nor a list of {value, label, group}')
     return out
 
 
@@ -347,6 +385,8 @@ def _view_module(name):
         from views import steps as m
     elif name == "register":
         from views import register as m
+    elif name == "outcomes":
+        from views import outcomes as m
     else:
         return None
     return m
@@ -377,20 +417,34 @@ def unavailable(name, says):
             "facts": {}, "tables": {}, "charts": [], "notes": {}}
 
 
-def run_view(run, name):
+def takes_against(fn):
+    """True when a view's function takes the comparison run (`view(run, against=None)`)."""
+    import inspect
+    try:
+        return "against" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def run_view(run, name, against=None):
     """One view's result for one run, always in the {checks, facts, tables, charts, notes} shape; a view's `images`
-    declarations (a list) are passed through beside them when it gives any."""
+    declarations (a list) and its `choose` declaration (a mapping the page can draw) are passed through beside them
+    when it gives any. `against`: the comparison run, given only to a view whose function takes one."""
     fn, why = load_view(name)
     if fn is None:
         goal = next((g for i, _, g in PATH if i == name), None)
         return unavailable(name, f"This view is not built yet; goal {goal} builds it." if why == "not built" else why)
     try:
-        out = fn(run)
+        out = fn(run, against=against) if against is not None and takes_against(fn) else fn(run)
     except Exception as e:
         return unavailable(name, f"This view failed on the run's files ({type(e).__name__}: {e}).")
     if not isinstance(out, dict) or any(not isinstance(out.get(k, t()), t) for k, t in KEYS.items()):
         return unavailable(name, "This view returned something other than checks, facts, tables, charts and notes.")
-    return {**{k: out.get(k, t()) for k, t in KEYS.items()}, **({"images": out["images"]} if isinstance(out.get("images"), list) else {})}
+    words = out.get("fact_labels")
+    words = {k: v for k, v in words.items() if isinstance(k, str) and isinstance(v, str) and k in out.get("facts", {})} if isinstance(words, dict) else None
+    return {**{k: out.get(k, t()) for k, t in KEYS.items()}, **({"images": out["images"]} if isinstance(out.get("images"), list) else {}),
+            **({"fact_labels": words} if words else {}),
+            **({"choose": out["choose"]} if isinstance(out.get("choose"), dict) and not choose_problems(out) else {})}
 
 
 def clean(x):
@@ -454,6 +508,7 @@ class Run:
         self.path = os.path.realpath(path) if ident is None else path
         self.ident = folder_id(self.path) if ident is None else tuple(ident)
         self.repo, self.now, self._cache = repo, now, {}
+        self.label = None        # the server's short name for the run, set where one run is shown beside another
 
     def _root(self):
         """A descriptor on the run folder (the caller closes it); LinkRefused when it is not the folder found."""
@@ -855,15 +910,36 @@ class Workbench:
         rows.sort(key=lambda r: -(r["last_written"] or 0))
         return {"runs": rows, "roots": self.roots, "run_dirs": self.run_dirs, "views": view_list()}
 
-    def api_view(self, rid, name):
-        """The data endpoint (§9): one view of one run, or None when there is no such run or view."""
+    def others(self, path):
+        """The other runs of the list as a `choose` control's options: those whose recorded question is this run's
+        first, each group by label. The question is the one the run's state records, a hint for the reader; a view
+        that compares two runs holds them to their signed specs itself."""
+        ask = " ".join(str(self.run(path).summary()["question"]).split())
+        rows = []
+        for rid, p in self.scan().items():
+            if p != path:
+                same = bool(ask) and " ".join(str(self.run(p).summary()["question"]).split()) == ask
+                rows.append((not same, self.label(p), {"value": rid, "label": self.label(p),
+                                                       "group": "the same recorded question" if same else "another recorded question"}))
+        return [o for _, _, o in sorted(rows, key=lambda r: r[:2])]
+
+    def api_view(self, rid, name, against=None):
+        """The data endpoint (§9): one view of one run, or None when there is no such run or view. `against`: the id
+        of the comparison run, which must be another run of the list (the caller refuses one that is not)."""
         with self.lock:
-            p = self.runs.get(rid)
+            p, q = self.runs.get(rid), self.runs.get(against) if against else None
         p = p or self.scan().get(rid)
         if p is None or name not in [i for i, _, _ in PATH]:
             return None
         run = self.run(p)
-        out = clean(run.view(name))
+        if q is not None:       # never kept as the answer for the run alone (Run.view keeps one result per view)
+            other = self.run(q)
+            other.label = self.label(q)
+            out = clean(run_view(run, name, other))
+        else:
+            out = clean(run.view(name))
+        if isinstance(out.get("choose"), dict) and out["choose"].get("options") == "runs":
+            out["choose"] = {**out["choose"], "options": self.others(p)}
         with self.lock:      # what this answer names is what the page may ask the file endpoint for, in this folder only
             self.named.pop((run.path, run.ident, name), None)
             self.named[(run.path, run.ident, name)] = named_images(out)
@@ -959,7 +1035,7 @@ class Workbench:
         if not re.fullmatch(_LOOPBACK, host or ""):
             return 403, "text/plain", b"loopback only"
         u = urllib.parse.urlsplit(target)
-        q = urllib.parse.parse_qs(u.query)
+        q = urllib.parse.parse_qs(u.query, keep_blank_values=True)       # a parameter given empty is still given
         if method == "POST" and u.path in ACTION_POSTS:
             h = headers or {}
             origin = h.get("origin")
@@ -987,7 +1063,15 @@ class Workbench:
         if u.path == "/api/glossary":
             return 200, "application/json", json.dumps(clean(self.glossary)).encode()
         if u.path == "/api/view":
-            d = self.api_view((q.get("run") or [""])[0], (q.get("view") or [""])[0])
+            rid, given = (q.get("run") or [""])[0], q.get("against")
+            against = given[0] if given else None
+            if given is not None:       # whenever the address holds it: exactly one id, not empty, of another run of the list
+                with self.lock:
+                    known = against in self.runs
+                if len(given) != 1 or not against or not (known or against in self.scan()) or against == rid:
+                    return 404, "text/plain", (b"no such comparison run: `against` must be the id of another run of this server's list, "
+                                               b"so nothing is compared")
+            d = self.api_view(rid, (q.get("view") or [""])[0], against)
             return (200, "application/json", json.dumps(d).encode()) if d else (404, "text/plain", b"no such run or view")
         if u.path == "/api/file":
             return self.api_file((q.get("run") or [""])[0], (q.get("path") or [""])[0], (q.get("sha") or [""])[0])
@@ -1088,19 +1172,31 @@ def lookup(doc, path):
 def accept(wb, run_dir, path, out=print):
     """Compare the data endpoint's answer for one run with an acceptance file (§9): a list of
     {path, equals | approx, source}, bare or under `expect:` beside `run:` and `view:`
-    (the view is `view:`, else the file's name). One line per entry; 1 on any difference."""
-    name = os.path.splitext(os.path.basename(path))[0]
+    (the view is `view:`, else the file's name). One line per entry; 1 on any difference.
+    A top-level `against:` names the comparison run by its path (whole, or its end under the keep folder): the view is
+    asked for with that run as `&against=`, and the run must be one the workbench was given (`--run-dir`)."""
+    name, against = os.path.splitext(os.path.basename(path))[0], None
     try:
         with open(path) as f:
             entries = yaml.safe_load(f)
-        if isinstance(entries, dict):      # the full form: {run, view, expect: [...]}
-            name, entries = str(entries.get("view") or name), entries.get("expect")
+        if isinstance(entries, dict):      # the full form: {run, view, against, expect: [...]}
+            name, against, entries = str(entries.get("view") or name), entries.get("against"), entries.get("expect")
         assert isinstance(entries, list) and all(isinstance(e, dict) for e in entries), "it is not a list of entries"
+        assert against is None or (isinstance(against, str) and against.strip("/")), "`against` is not a run's path"
     except (OSError, yaml.YAMLError, AssertionError) as e:
         out(f"DIFF  {path}: the acceptance file could not be read ({e})")
         return 1
-    rid = next((k for k, p in wb.scan().items() if p == os.path.realpath(run_dir)), "")
-    code, _, body = wb.handle("GET", f"/api/view?run={rid}&view={urllib.parse.quote(name)}", "127.0.0.1")
+    runs = wb.scan()
+    rid = next((k for k, p in runs.items() if p == os.path.realpath(run_dir)), "")
+    more = ""
+    if against is not None:
+        end = os.sep + against.strip("/").replace("/", os.sep)
+        other = [k for k, p in runs.items() if k != rid and (p == os.path.realpath(os.path.expanduser(against)) or p.endswith(end))]
+        if len(other) != 1:
+            out(f"DIFF  {path}: `against` ({against}) names {len(other)} of the runs given; give that run with --run-dir")
+            return 1
+        more = f"&against={other[0]}"
+    code, _, body = wb.handle("GET", f"/api/view?run={rid}&view={urllib.parse.quote(name)}{more}", "127.0.0.1")
     doc, bad = (json.loads(body) if code == 200 else None), 0
     for e in entries:
         p, src = str(e.get("path")), f"  [{e.get('source')}]" if e.get("source") else ""
@@ -1302,7 +1398,9 @@ def _self_test():
                "statuses, worst first within a view, each check naming its view",
                [c["step"] for c in mine] == ["spec", "model"] + ["steps"] * 8 and order[2] == "problem"
                and order[2:] == sorted(order[2:], key=checks.WORST_FIRST.index)
-               and [c["step"] for c in o["checks"]][:len(mine)] == [c["step"] for c in mine]
+               # the views between them in reading order (Outcomes, once it exists) keep their own place
+               and [c["step"] for c in o["checks"] if c["step"] in ("spec", "model")] == ["spec", "model"]
+               and [c["step"] for c in o["checks"]].index("steps") > [c["step"] for c in o["checks"]].index("model")
                and o["facts"]["checks_problem"] == [c["status"] for c in o["checks"]].count("problem") and o["facts"]["question"] == "toy question", str(order))
         finally:
             for k in ("spec", "model", "fit"):
@@ -1578,6 +1676,7 @@ def _self_test():
 
         _self_test_notes(tmp, ok)
         _self_test_files(tmp, ok)
+        _self_test_against(tmp, ok)
 
         node = shutil.which("node")
         if node is None:
@@ -1806,6 +1905,57 @@ def _self_test_files(tmp, ok):
             VIEW_FNS.pop(name, None)
 
 
+def _self_test_against(tmp, ok):
+    """The comparison run of the Outcomes view (§5.7): `GET /api/view?run=<id>&view=outcomes&against=<run id>` gives
+    the view the other run as its second argument, `view(run, against=None)`. These cases fail until the server reads
+    the parameter; they travel with the view's code (§9)."""
+    from views.fit_bench import fixture_builder
+    one, two = os.path.join(tmp, "against", "one"), os.path.join(tmp, "against", "two")
+    fixture_builder().build(one)
+    fixture_builder().build(two, other="second")
+    wb = Workbench([], [one, two])
+    ids = {os.path.basename(p): k for k, p in wb.scan().items()}
+
+    def seen(run, against=None):
+        return {"facts": {"run": run.path, "against": None if against is None else against.path}}
+
+    def get(view, **more):
+        q = urllib.parse.urlencode({"run": ids["one"], "view": view, **more})
+        code, _, body = wb.handle("GET", f"/api/view?{q}", "127.0.0.1")
+        return code, (json.loads(body) if code == 200 else body.decode())
+    VIEW_FNS.update(outcomes=seen, spec=lambda run: {"facts": {"run": run.path}})
+    try:
+        alone, both = get("outcomes"), get("outcomes", against=ids["two"])
+        ok("W55 `&against=<run id>` gives the view the other run as its second argument; with no such parameter the view is given none",
+           alone[0] == both[0] == 200 and alone[1]["facts"] == {"run": os.path.realpath(one), "against": None}
+           and both[1]["facts"] == {"run": os.path.realpath(one), "against": os.path.realpath(two)}, str((alone, both))[:300])
+        again = get("outcomes")
+        ok("W56 the answer with a comparison is not kept as the answer for the run alone, nor the other way round",
+           again[0] == 200 and again[1]["facts"]["against"] is None
+           and get("outcomes", against=ids["two"])[1]["facts"].get("against") == os.path.realpath(two), str(again)[:300])
+        missing = get("outcomes", against="no-such-run")
+        ok("W57 an `against` that names no run is a 404 that says so: a comparison is never made with nothing, and never "
+           "answered as the run alone",
+           missing[0] == 404 and "against" in missing[1], str(missing)[:300])
+        plain = get("spec", against=ids["two"])
+        ok("W58 a view that takes the run alone is called with the run alone, whatever the address holds",
+           plain[0] == 200 and plain[1]["facts"] == {"run": os.path.realpath(one)}, str(plain)[:300])
+        blank = wb.handle("GET", f"/api/view?run={ids['one']}&view=outcomes&against=", "127.0.0.1")
+        twice = wb.handle("GET", f"/api/view?run={ids['one']}&view=outcomes&against={ids['two']}&against={ids['two']}", "127.0.0.1")
+        ok("W60 an `against` given empty, or given twice, is refused: whenever the address holds the parameter it must be one "
+           "known run's id, and the run is never answered alone", blank[0] == 404 and b"against" in blank[2] and twice[0] == 404, str((blank[0], twice[0])))
+        VIEW_FNS.update(spec=lambda run: {"facts": {"n_a": 1, "b": 2}, "fact_labels": {"n_a": "plain words", "b": "", "c": "no such fact", "n_b": 3}})
+        named = get("spec")
+        ok("W61 a view's `fact_labels` reach the page beside its facts: words for a fact, or the empty string for one a table holds; "
+           "a label for no fact, or one that is no text, is dropped", named[0] == 200 and named[1].get("fact_labels") == {"n_a": "plain words", "b": ""}
+           and named[1]["facts"] == {"n_a": 1, "b": 2}, str(named)[:300])
+        outside = get("outcomes", against="../two")
+        ok("W59 `against` is a run id of this server's list, never a path", outside[0] == 404, str(outside)[:300])
+    finally:
+        for name in ("outcomes", "spec"):
+            VIEW_FNS.pop(name, None)
+
+
 def _self_test_notes(tmp, ok):
     """The one write (§6 "Review notes"): POST /api/note appends one line to <run>/owner/review_notes.jsonl."""
     import review_notes
@@ -1948,7 +2098,7 @@ def main():
     if a.retro:
         return retro(a.retro)
     if a.accept:
-        return accept(Workbench([], [a.accept[0]]), *a.accept)
+        return accept(Workbench([], [a.accept[0], *a.run_dir]), *a.accept)
     serve(Workbench(chosen_roots(a.roots, a.run_dir), a.run_dir), a.port)
     return 0
 
