@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""The review workbench: a local page for verifying a v2 run (docs/design/review-workbench.md).
+
+    python3 tools/workbench/workbench.py --roots ~/modeling-agentic-keep runs     # every run under these roots
+    python3 tools/workbench/workbench.py --run-dir <run dir>                      # that run only
+    python3 tools/workbench/workbench.py --retro <run dir>                        # print each check's result
+    python3 tools/workbench/workbench.py --accept <run dir> <acceptance yaml>     # compare a view with quoted values
+    python3 tools/workbench/workbench.py --self-test
+
+Serves tools/workbench/static/ on 127.0.0.1 only and makes no outbound call. It reads run files and never writes
+to a run. It imports no engine and no harness loader; every read goes through lib.safe_io.read_nofollow, confined
+to the run directory.
+
+A view is a module views/<name>.py whose `view(run)` returns {checks, facts, tables, charts, notes}; the page
+(static/) draws any such result and has no code for a particular view. GET /api/view?run=<id>&view=<name> returns
+it. A chart is a declaration over one of the result's tables (CHART_KEYS lists every key a view may use):
+    {kind, table, title, how_to_read, x, y, low, high, group, model, model_alt, scale ("log" or absent), ...}
+    bars             x: the label column, y: the value column
+    lines            x and y: number columns; group: one line per value. With model, y is drawn as points and the
+                     model column as the line; with low and high, a band is drawn between them
+    interval_points  x: the label column; y with low and high: the observed value and its interval; model: the
+                     model's value; model_alt: a second model value (hollow mark); group: rows are gathered under
+                     each value
+    ranges           x: the label column; outer_low, outer_high: the wide range; low, high: the narrow range
+                     inside it; y: a point (each row is drawn on its own wide range, on a log scale where the
+                     wide range spans a factor of 100 or more above zero, and the row says so)
+    graph            table holds one row per link, x: the column a link comes from, y: the column it goes to;
+                     nodes: the table with one row per node (first column its name); group: the column, in both
+                     tables, whose value marks a node or link (same, changed, missing, outside)
+Keys any kind but graph takes:
+    where            {column: value}: only the rows whose column has that value are drawn
+    panels           a column: one chart per value of it, each on its own axis; when the panels together hold more
+                     rows than fit a page, the reader picks one panel at a time
+    labels           {column: words}: what a column's mark is called in the legend and on the axis (with its unit)
+    limits           [{value, label}]: reference lines on the value axis (bars, interval_points, lines)
+A table may carry `about` (one sentence on what its rows are and where they come from) and `labels` ({column:
+words}, shown under the column's name in its header) beside columns and rows.
+A fact or column whose name ends in _usd or _minutes is shown with that unit.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import http.server
+import importlib
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+
+import yaml
+
+# tools/, outside scripts/ and toolkit/: compute.code_fingerprint hashes those, so a workbench edit never
+# invalidates a stored engine batch.
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+for _p in (os.path.join(REPO, "scripts"), HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from lib.safe_io import LinkRefused, read_nofollow  # noqa: E402
+import checks  # noqa: E402
+import glossary  # noqa: E402
+
+STATIC = os.path.join(HERE, "static")
+STATIC_FILES = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                "/app.css": ("app.css", "text/css; charset=utf-8")}
+CSP = ("default-src 'none'; script-src 'self'; connect-src 'self'; img-src 'self'; style-src 'self'; "
+       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+_CREDENTIAL = re.compile(r"^(?:\.env(?:\..*)?|\.netrc|id_(?:rsa|ed25519|ecdsa).*|.*\.(?:pem|key|p12)|credentials.*)$", re.I)
+MAX_PARSE = 4 << 20          # a JSON or YAML file larger than this is not parsed whole by Run.json
+MAX_LARGE = 64 << 20         # Run.large reads up to this much, with the C loader, and keeps the result
+LARGE_KEPT = 96 << 20        # source bytes of parsed files kept in the server's memory (least recently used goes first)
+_LARGE, _LARGE_LOCK, LARGE_PARSES = {}, threading.Lock(), [0]     # (run, rel) -> (size, mtime_ns, result); a count
+WALK_LIMIT = 20000           # files looked at when finding the last one written; a larger run folder says it was cut short
+HEAD = 256 << 10             # an artifact's envelope (everything before `data:`) sits in its first bytes
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "data", "figures", "analysis", "models", "evidence_planner"}
+# The views, in the order of the reader's jobs (§2): verify the run as a modeller would, then the deterministic
+# steps, the register, development and spend. `goal` is the slice of §10 that builds the view.
+PATH = [("overview", "Overview", "G1"), ("spec", "Spec and evidence", "G6"), ("model", "Model", "G4"), ("fit", "Fit", "G2"),
+        ("scenarios", "Scenarios", "G7"), ("outcomes", "Outcomes", "G5"), ("steps", "Steps", "G1"),
+        ("register", "Science register", "G3"), ("world", "World model", "G10"), ("development", "Development", "G8"),
+        ("spend", "Spend", "G9")]
+VIEW_FNS = {}                # name -> view function, filled on first use; a test may put one here
+KEYS = {"checks": list, "facts": dict, "tables": dict, "charts": list, "notes": dict}
+CHART_KINDS = ("interval_points", "ranges", "bars", "lines", "graph")
+CHART_COLUMNS = ("x", "y", "low", "high", "group", "model", "model_alt", "outer_low", "outer_high", "panels")
+CHART_KEYS = ("kind", "table", "title", "how_to_read", *CHART_COLUMNS, "nodes", "scale", "where", "labels", "limits")
+
+
+def chart_problems(result):
+    """What is wrong with a view result's chart declarations, as sentences (none when the page can draw them all):
+    an unknown kind or key, no title or how-to-read sentence, a table or column the result does not hold."""
+    out, tables = [], result.get("tables") or {}
+    for ch in result.get("charts") or []:
+        name = f"chart {ch.get('title')!r}"
+        t = tables.get(ch.get("table"))
+        cols = t.get("columns") if isinstance(t, dict) else None
+        if ch.get("kind") not in CHART_KINDS:
+            out.append(f"{name}: unknown kind {ch.get('kind')!r}")
+        if not ch.get("title") or not ch.get("how_to_read"):
+            out.append(f"{name}: no title or no how-to-read sentence")
+        out += [f"{name}: unknown key {k!r}" for k in ch if k not in CHART_KEYS]
+        if not isinstance(cols, list):
+            out.append(f"{name}: no table {ch.get('table')!r}")
+            continue
+        named = [ch[k] for k in CHART_COLUMNS if ch.get(k) is not None]
+        named += list(ch.get("where") or {}) + list(ch.get("labels") or {})
+        out += [f"{name}: table {ch['table']} has no column {c!r}" for c in named if c not in cols]
+        if not all(isinstance(m, dict) and isinstance(m.get("value"), (int, float)) and m.get("label")
+                   for m in ch.get("limits") or []):
+            out.append(f"{name}: limits are not a list of {{value, label}}")
+    return out
+
+
+def load_view(name):
+    """(the function views.<name>.view, None), or (None, why): 'not built' when there is no such module."""
+    if name not in VIEW_FNS:
+        try:
+            VIEW_FNS[name] = importlib.import_module(f"views.{name}").view
+        except ModuleNotFoundError as e:
+            if e.name not in ("views", f"views.{name}"):
+                return None, f"views/{name}.py could not be loaded ({e})"
+            return None, "not built"
+        except Exception as e:      # a view that cannot be imported must not take the page down
+            return None, f"views/{name}.py could not be loaded ({type(e).__name__}: {e})"
+    return VIEW_FNS[name], None
+
+
+def view_list():
+    """The views in reading order: id, label, the goal that builds each, and whether it exists."""
+    return [{"id": i, "label": lab, "goal": goal, "built": load_view(i)[1] != "not built"} for i, lab, goal in PATH]
+
+
+def unavailable(name, says):
+    """The result every view gives when it has nothing to show: one `not_available` check with the reason."""
+    label = next((lab for i, lab, _ in PATH if i == name), name)
+    return {"checks": [checks.result(f"{name}.view", name, f"The {label} view", "not_available", says)],
+            "facts": {}, "tables": {}, "charts": [], "notes": {}}
+
+
+def run_view(run, name):
+    """One view's result for one run, always in the {checks, facts, tables, charts, notes} shape."""
+    fn, why = load_view(name)
+    if fn is None:
+        goal = next((g for i, _, g in PATH if i == name), None)
+        return unavailable(name, f"This view is not built yet; goal {goal} builds it." if why == "not built" else why)
+    try:
+        out = fn(run)
+    except Exception as e:
+        return unavailable(name, f"This view failed on the run's files ({type(e).__name__}: {e}).")
+    if not isinstance(out, dict) or any(not isinstance(out.get(k, t()), t) for k, t in KEYS.items()):
+        return unavailable(name, "This view returned something other than checks, facts, tables, charts and notes.")
+    return {k: out.get(k, t()) for k, t in KEYS.items()}
+
+
+def clean(x):
+    """JSON the browser can parse: a number that is not finite becomes null, and an unknown type its text."""
+    if isinstance(x, float):
+        return x if math.isfinite(x) else None
+    if isinstance(x, dict):
+        return {str(k): clean(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [clean(v) for v in x]
+    return x if isinstance(x, (str, int, bool, type(None))) else str(x)
+
+
+def check_rel(rel):
+    rel = str(rel or "")
+    parts = rel.replace("\\", "/").split("/")
+    if not rel or os.path.isabs(rel) or "\0" in rel or any(p in ("", ".", "..") for p in parts):
+        raise ValueError(f"{rel[:120]!r}: not a relative path inside the run directory")
+    if any(_CREDENTIAL.match(x) for x in parts):
+        raise ValueError(f"{rel[:120]}: credential files are not read")
+    return rel
+
+
+def _ts(s):
+    try:
+        t = _dt.datetime.fromisoformat(str(s))
+        return t if t.tzinfo else t.replace(tzinfo=_dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def ago(seconds):
+    """A length of time in plain words: less than a minute, 5 minutes, 2 hours, 3 days."""
+    for size, word in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= size:
+            n = int(seconds // size)
+            return f"{n} {word}{'' if n == 1 else 's'}"
+    return "less than a minute"
+
+
+class Run:
+    """One run directory, read lazily. Every reader returns (value, why_not): never raises on a bad file."""
+
+    def __init__(self, path, repo=REPO, now=None):
+        self.path, self.repo, self.now, self._cache = os.path.realpath(path), repo, now, {}
+
+    def last_written(self, limit=WALK_LIMIT):
+        """{at, file, cut}: the newest modification time among the run's files and the file that has it, from a walk
+        of the run folder that follows no link and stops after `limit` files (cut is then True). Only file times are
+        read, never contents. at is None when no file's time could be read."""
+        key = ("last_written", limit)
+        if key not in self._cache:
+            at, rel, n, cut, stack = None, None, 0, False, [self.path]
+            while stack and not cut:
+                try:
+                    entries = sorted(os.scandir(stack.pop()), key=lambda e: e.name)
+                except OSError:
+                    continue
+                for e in entries:
+                    try:
+                        if e.is_symlink():
+                            continue
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                            continue
+                        n += 1
+                        if n > limit:
+                            cut = True
+                            break
+                        t = e.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    if at is None or t > at:
+                        at, rel = t, os.path.relpath(e.path, self.path)
+            self._cache[key] = {"at": at, "file": rel, "cut": cut}
+        return self._cache[key]
+
+    def written(self):
+        """The last file written, for a sentence: {at, file, ago (plain words), utc, says}, or says alone when no
+        file's time could be read."""
+        lw = self.last_written()
+        if lw["at"] is None:
+            return {**lw, "ago": None, "utc": None, "says": "No file's modification time could be read in the run folder."}
+        words = ago(max(0.0, (time.time() if self.now is None else self.now) - lw["at"]))
+        utc = _dt.datetime.fromtimestamp(lw["at"], _dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        among = f" among the first {WALK_LIMIT:,} files looked at" if lw["cut"] else ""
+        return {**lw, "ago": words, "utc": utc,
+                "says": f"The newest file in the run folder{among}, {lw['file']}, was written {words} ago ({utc})."}
+
+    def read(self, rel, max_bytes=None):
+        try:
+            return read_nofollow(self.path, check_rel(rel), max_bytes)[0], None
+        except FileNotFoundError:
+            return None, f"{rel} is not in the run folder"
+        except (ValueError, LinkRefused, OSError) as e:
+            return None, f"{rel} could not be read ({e})"
+
+    def sha(self, rel):
+        key = ("sha", rel)
+        if key not in self._cache:
+            b, _ = self.read(rel)
+            self._cache[key] = hashlib.sha256(b).hexdigest() if b is not None else None
+        return self._cache[key]
+
+    def json(self, rel):
+        """A JSON or YAML mapping, parsed whole (files up to MAX_PARSE)."""
+        key = ("doc", rel)
+        if key not in self._cache:
+            b, why = self.read(rel, MAX_PARSE + 1)
+            if b is None:
+                self._cache[key] = (None, why)
+            elif len(b) > MAX_PARSE:
+                self._cache[key] = (None, f"{rel} is larger than {MAX_PARSE >> 20} MB and is not read whole")
+            else:
+                try:
+                    d = json.loads(b) if rel.endswith(".json") else yaml.safe_load(b)
+                    self._cache[key] = (d, None) if isinstance(d, dict) else (None, f"{rel} is not a mapping")
+                except (ValueError, yaml.YAMLError) as e:
+                    self._cache[key] = (None, f"{rel} could not be parsed ({str(e)[:120]})")
+        return self._cache[key]
+
+    def large(self, rel):
+        """A YAML mapping of any size up to MAX_LARGE, parsed with PyYAML's C loader and kept in the server's memory
+        by the file's size and modification time: every later request, from any Run of this folder, gets the parsed
+        document back until the file changes. The stat and the read both go through the confined, no-link reader.
+        The caller must not change the document it is given."""
+        try:
+            _, st = read_nofollow(self.path, check_rel(rel), 0)
+        except FileNotFoundError:
+            return None, f"{rel} is not in the run folder"
+        except (ValueError, LinkRefused, OSError) as e:
+            return None, f"{rel} could not be read ({e})"
+        key = (self.path, rel)
+        with _LARGE_LOCK:        # one parse at a time: a second request for the same file waits and then finds it
+            kept = _LARGE.get(key)
+            if kept and kept[:2] == (st.st_size, st.st_mtime_ns):
+                _LARGE[key] = _LARGE.pop(key)
+                return kept[2]
+            if st.st_size > MAX_LARGE:
+                return None, f"{rel} is larger than {MAX_LARGE >> 20} MB and is not read"
+            b, why = self.read(rel, MAX_LARGE + 1)
+            if b is None:
+                return None, why
+            try:
+                LARGE_PARSES[0] += 1
+                d = yaml.load(b, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+                out = (d, None) if isinstance(d, dict) else (None, f"{rel} is not a mapping")
+            except (ValueError, yaml.YAMLError) as e:
+                out = (None, f"{rel} could not be parsed ({' '.join(str(e).split())[:120]})")
+            _LARGE.pop(key, None)
+            _LARGE[key] = (st.st_size, st.st_mtime_ns, out)
+            while len(_LARGE) > 1 and sum(v[0] for v in _LARGE.values()) > LARGE_KEPT:
+                _LARGE.pop(next(iter(_LARGE)))
+            return out
+
+    def envelope(self, rel):
+        """A harness artifact's header (schema, producer, spec_sha256, inputs, written_at): the YAML before its
+        top-level `data:` key, read from the file's first bytes so a 13 MB artifact costs the same as a small one."""
+        b, why = self.read(rel, HEAD)
+        if b is None:
+            return None, why
+        head = re.split(rb"(?m)^data:", b, maxsplit=1)[0]
+        try:
+            d = yaml.safe_load(head)
+        except yaml.YAMLError:
+            d = None
+        return (d, None) if isinstance(d, dict) else (None, f"{rel} has no readable header")
+
+    def commit_known(self, commit):
+        """True/False when git can say whether `commit` is in this checkout; None when git cannot be asked."""
+        if not commit or not re.fullmatch(r"[0-9a-f]{7,40}", str(commit)):
+            return None
+        try:
+            r = subprocess.run(["git", "-C", self.repo, "cat-file", "-e", f"{commit}^{{commit}}"],
+                               capture_output=True, timeout=10)
+            return r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def artifacts(self):
+        """Every harness-written analysis file with its header and, per recorded input, whether the file on disk
+        still has the hash it had when the artifact was computed."""
+        if "artifacts" in self._cache:
+            return self._cache["artifacts"]
+        man, _ = self.json("analysis/manifest.json")
+        listed = dict((man or {}).get("artifacts") or {})
+        try:
+            for name in sorted(os.listdir(os.path.join(self.path, "analysis"))):
+                if name.endswith(".yaml"):
+                    listed.setdefault(f"analysis/{name}", {})
+        except OSError:
+            pass
+        out = []
+        for rel, rec in sorted(listed.items()):
+            env, why = self.envelope(rel) if rel.endswith(".yaml") else (None, "not a YAML artifact")
+            env = env or {}
+            inputs = []
+            for ipath, isha in sorted((env.get("inputs") or {}).items() if isinstance(env.get("inputs"), dict) else []):
+                if str(ipath).startswith(".."):
+                    now, state = None, "outside"       # a harness file (engine card, priors): not in the run folder
+                else:
+                    now = self.sha(ipath)
+                    state = "same" if now == isha else ("missing" if now is None else "changed")
+                inputs.append({"path": ipath, "sha256": isha, "now": now, "state": state})
+            eng = env.get("engine") if isinstance(env.get("engine"), dict) else {}
+            out.append({"path": rel, "kind": (rec or {}).get("kind") or str(env.get("schema") or "").split("/")[0],
+                        "producer": env.get("producer") or (rec or {}).get("producer"),
+                        "written_at": env.get("written_at"), "spec_sha256": env.get("spec_sha256"),
+                        "spec_signed": env.get("spec_signed"), "engine": " ".join(
+                            str(eng.get(k)) for k in ("name", "version") if eng.get(k)) or None,
+                        "sha256": self.sha(rel), "in_manifest": rel in ((man or {}).get("artifacts") or {}),
+                        "inputs": inputs, "why": why if not env else None})
+        self._cache["artifacts"] = out
+        return out
+
+    def steps(self):
+        """The stage history with time and model spend per transition, and the task journal."""
+        state, why = self.json("run_state.json")
+        if state is None:
+            return {"why": why, "history": [], "tasks": []}
+        hist, prev_t, prev_usd = [], None, 0.0
+        meta, _ = self.json("metadata.json")
+        prev_t = _ts((meta or {}).get("started"))
+        for h in state.get("history") or []:
+            if not isinstance(h, dict) or "from" not in h or "to" not in h:
+                continue                # other entries (a fix loop's summary) are not transitions
+            t, usd = _ts(h.get("at")), h.get("spent_usd")
+            usd = float(usd) if isinstance(usd, (int, float)) else None
+            mins = round((t - prev_t).total_seconds() / 60, 1) if t and prev_t else None
+            hist.append({"at": h.get("at"), "from": str(h.get("from")), "to": str(h.get("to")), "why": str(h.get("why") or ""),
+                         "round": h.get("round"), "spent_usd": usd, "minutes": mins,
+                         "usd": round(usd - prev_usd, 4) if usd is not None else None})
+            prev_t, prev_usd = t or prev_t, usd if usd is not None else prev_usd
+        tasks = []
+        for key, j in (state.get("journal") or {}).items():
+            if not isinstance(j, dict):
+                continue
+            a, b = _ts(j.get("started")), _ts(j.get("completed"))
+            tasks.append({"key": key, "stage": key.split("#")[0], "task": j.get("task"), "status": j.get("status"),
+                          "ok": j.get("ok"), "started": j.get("started"),
+                          "minutes": round((b - a).total_seconds() / 60, 1) if a and b else None,
+                          "usd": j.get("usd") if isinstance(j.get("usd"), (int, float)) else None,
+                          "allowance_usd": j.get("allowance_usd") if isinstance(j.get("allowance_usd"), (int, float)) else None,
+                          "note": str(j.get("note") or (j.get("output") or {}).get("notes") or "")
+                          if isinstance(j.get("output"), (dict, type(None))) else str(j.get("note") or "")})
+        return {"why": None, "history": hist, "tasks": tasks, "state": state.get("state"), "status": state.get("status"),
+                "paused": state.get("paused"), "round": state.get("round"), "max_rounds": state.get("max_rounds"),
+                "budget_usd": state.get("budget_usd"), "spent_usd": state.get("spent_usd")}
+
+    def summary(self):
+        state, why = self.json("run_state.json")
+        meta, _ = self.json("metadata.json")
+        state, meta = state or {}, meta or {}
+        q = str(state.get("question") or meta.get("question") or "")
+        w = self.written()
+        return {"question": q[:400], "state": state.get("state"), "status": state.get("status") or meta.get("status"),
+                "paused": state.get("paused"), "pipeline": meta.get("pipeline") or "unknown",
+                "commit": meta.get("commit"), "launcher": meta.get("launcher"), "started": meta.get("started"),
+                "finished": meta.get("finished"), "spent_usd": state.get("spent_usd"), "engine": meta.get("engine"),
+                "round": state.get("round"), "last_written": w["at"], "last_written_file": w["file"],
+                "last_written_ago": w["ago"], "last_written_utc": w["utc"], "why": why}
+
+    def view(self, name):
+        """A view's result, computed once per Run (the overview asks for every other view)."""
+        if ("view", name) not in self._cache:
+            self._cache[("view", name)] = run_view(self, name)
+        return self._cache[("view", name)]
+
+    views = staticmethod(lambda: view_list())
+
+
+def discover(roots, max_depth=9):
+    """Every directory under the roots that holds a run_state.json."""
+    found = []
+    for root in roots:
+        root = os.path.realpath(os.path.expanduser(root))
+        for d, dirs, files in os.walk(root):
+            depth = d[len(root):].count(os.sep)
+            if "run_state.json" in files:
+                found.append(d)
+                dirs[:] = []
+                continue
+            dirs[:] = [] if depth >= max_depth else [x for x in dirs if x not in SKIP_DIRS and not x.startswith(".")]
+    return sorted(set(found))
+
+
+def chosen_roots(roots, run_dirs):
+    """The folders to search for runs: those given; else none when run folders are named one by one; else runs/."""
+    return list(roots) if roots is not None else ([] if run_dirs else [os.path.join(REPO, "runs")])
+
+
+class Workbench:
+    def __init__(self, roots, run_dirs=(), spec=None):
+        self.roots, self.run_dirs, self.runs, self.lock = list(roots), [os.path.realpath(p) for p in run_dirs], {}, threading.Lock()
+        self.glossary = glossary.load(spec)      # read once at start from the specification's own tables
+
+    def scan(self):
+        paths = self.run_dirs + discover(self.roots)
+        with self.lock:
+            self.runs = {hashlib.sha1(p.encode()).hexdigest()[:10]: p for p in paths}
+        return self.runs
+
+    def label(self, path):
+        """The run's place under its root, with the long question-derived folder name shortened."""
+        for root in [os.path.realpath(os.path.expanduser(r)) for r in self.roots]:
+            if path.startswith(root + os.sep):
+                path = path[len(root) + 1:]
+                break
+        parts = [p for p in path.split(os.sep) if p not in ("out", "runs", "work")]
+        if parts and re.match(r"_?\d{4}-\d\d-\d\d_\d+_", parts[-1]):
+            tail = re.sub(r"^(_?\d{4}-\d\d-\d\d)_\d+_.{0,40}?(-[a-z]\d+)?(_.*)?$", r"\1\2\3", parts[-1])
+            parts[-1] = tail
+        return " / ".join(parts[-4:])
+
+    def api_runs(self):
+        rows = []
+        for rid, p in self.scan().items():
+            s = Run(p).summary()
+            rows.append({"id": rid, "label": self.label(p), "dir": p, **s,
+                         "copy": bool(re.search(r"(before|backup|pristine|\.bak)", p, re.I))})
+        rows.sort(key=lambda r: -(r["last_written"] or 0))
+        return {"runs": rows, "roots": self.roots, "run_dirs": self.run_dirs, "views": view_list()}
+
+    def api_view(self, rid, name):
+        """The data endpoint (§9): one view of one run, or None when there is no such run or view."""
+        with self.lock:
+            p = self.runs.get(rid)
+        p = p or self.scan().get(rid)
+        if p is None or name not in [i for i, _, _ in PATH]:
+            return None
+        return clean(Run(p).view(name))
+
+    def handle(self, method, target, host):
+        """(status, content type, body). Loopback Host only; GET only: the workbench has no write yet.
+        /api/runs lists the runs, /api/view gives one view of one run, /api/glossary the meanings of the codes the
+        page shows (glossary.py reads them from the specification)."""
+        if not re.fullmatch(r"(127\.0\.0\.1|localhost)(:\d+)?", host or ""):
+            return 403, "text/plain", b"loopback only"
+        if method != "GET":
+            return 405, "text/plain", b"read only"
+        u = urllib.parse.urlsplit(target)
+        q = urllib.parse.parse_qs(u.query)
+        if u.path in STATIC_FILES:
+            name, ctype = STATIC_FILES[u.path]
+            with open(os.path.join(STATIC, name), "rb") as f:
+                return 200, ctype, f.read()
+        if u.path == "/api/runs":
+            return 200, "application/json", json.dumps(clean(self.api_runs())).encode()
+        if u.path == "/api/glossary":
+            return 200, "application/json", json.dumps(clean(self.glossary)).encode()
+        if u.path == "/api/view":
+            d = self.api_view((q.get("run") or [""])[0], (q.get("view") or [""])[0])
+            return (200, "application/json", json.dumps(d).encode()) if d else (404, "text/plain", b"no such run or view")
+        return 404, "text/plain", b"not found"
+
+
+def serve(wb, port):
+    class H(http.server.BaseHTTPRequestHandler):
+        def _do(self):
+            try:
+                code, ctype, body = wb.handle(self.command, self.path, self.headers.get("Host"))
+            except Exception as e:      # the page shows the reason; the server stays up
+                code, ctype, body = 500, "text/plain", f"{type(e).__name__}: {e}".encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", CSP)
+            self.end_headers()
+            self.wfile.write(body)
+        do_GET = do_POST = do_PUT = do_DELETE = _do
+
+        def log_message(self, *a):
+            pass
+    for p in ([port] if port else range(8790, 8810)):
+        try:
+            srv = http.server.ThreadingHTTPServer(("127.0.0.1", p), H)
+            break
+        except OSError:
+            if port:
+                raise
+    else:
+        raise OSError("no free port in 8790-8809")
+    print(f"review workbench: http://127.0.0.1:{srv.server_address[1]}/  ({len(wb.scan())} runs)", flush=True)
+    srv.serve_forever()
+
+
+def retro(run_dir):
+    """Print each check's result for one run: the loop's evidence that a view catches what it claims to."""
+    cs = Run(run_dir).view("overview")["checks"]
+    for c in cs:
+        print(f"[{c['status']:^13}] {c['id']:<22} {c['case'] or '':<4} {c['says']}")
+    return 0 if cs else 1
+
+
+def lookup(doc, path):
+    """The value at `path` in a view's result: facts.x, tables.t[col=value].col2, checks[id=x].status.
+    `[col=value]` picks the first row (of a table or a list) whose `col` reads as `value`."""
+    cur, pos = doc, 0
+    for m in re.finditer(r"([^.\[\]]+)(?:\[([^=\]]+)=([^\]]*)\])?(?:\.|$)", path):
+        if m.start() != pos:
+            break
+        pos, (name, col, want) = m.end(), m.groups()
+        if not isinstance(cur, dict) or name not in cur:
+            raise LookupError(f"no '{name}'")
+        cur = cur[name]
+        if col is not None:
+            if isinstance(cur, dict) and isinstance(cur.get("columns"), list):
+                cur = [dict(zip(cur["columns"], r)) for r in cur.get("rows") or []]
+            rows = [r for r in cur if isinstance(r, dict) and str(r.get(col)) == want] if isinstance(cur, list) else []
+            if not rows:
+                raise LookupError(f"no row of '{name}' has {col} = {want}")
+            cur = rows[0]
+    if pos != len(path) or not path:
+        raise LookupError("the path is not of the form a.b[col=value].c")
+    return cur
+
+
+def accept(wb, run_dir, path, out=print):
+    """Compare the data endpoint's answer for one run with an acceptance file (§9): a list of
+    {path, equals | approx, source}, bare or under `expect:` beside `run:` and `view:`
+    (the view is `view:`, else the file's name). One line per entry; 1 on any difference."""
+    name = os.path.splitext(os.path.basename(path))[0]
+    try:
+        with open(path) as f:
+            entries = yaml.safe_load(f)
+        if isinstance(entries, dict):      # the full form: {run, view, expect: [...]}
+            name, entries = str(entries.get("view") or name), entries.get("expect")
+        assert isinstance(entries, list) and all(isinstance(e, dict) for e in entries), "it is not a list of entries"
+    except (OSError, yaml.YAMLError, AssertionError) as e:
+        out(f"DIFF  {path}: the acceptance file could not be read ({e})")
+        return 1
+    rid = next((k for k, p in wb.scan().items() if p == os.path.realpath(run_dir)), "")
+    code, _, body = wb.handle("GET", f"/api/view?run={rid}&view={urllib.parse.quote(name)}", "127.0.0.1")
+    doc, bad = (json.loads(body) if code == 200 else None), 0
+    for e in entries:
+        p, src = str(e.get("path")), f"  [{e.get('source')}]" if e.get("source") else ""
+        kind = next((k for k in ("equals", "approx") if k in e), None)
+        try:
+            if doc is None:
+                raise LookupError(f"the endpoint has no view '{name}' for this run ({code})")
+            if kind is None:
+                raise LookupError("the entry has neither equals nor approx")
+            got, want = lookup(doc, p), e[kind]
+            num = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (got, want))
+            same = abs(got - want) <= 1e-3 * abs(want) if kind == "approx" and num else kind == "equals" and got == want
+            if not same:
+                raise LookupError(f"expected {kind} {want!r}, got {got!r}")
+            out(f"ok    {p} {kind} {want!r}{src}")
+        except LookupError as err:
+            bad += 1
+            out(f"DIFF  {p}: {err.args[0]}{src}")
+    return 1 if bad or not entries else 0
+
+
+# ---------------------------------------------------------------------------------------------- self-test
+
+def _toy(d, **over):
+    """A small finished run shaped like a stored v2 run: signed spec, two artifacts with headers, a manifest."""
+    def w(rel, text):
+        p = os.path.join(d, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(text if isinstance(text, str) else json.dumps(text))
+        return hashlib.sha256(open(p, "rb").read()).hexdigest()
+    spec = w("decision_spec.yaml", "question: toy\n")
+    units = w("data/units.csv", "unit,pop\na,1\n")
+    w("decision_spec.signoff.json", {"signed_by": "owner", "signed_at": "2026-01-01T00:00:00+00:00",
+                                     "sha256": {"decision_spec.yaml": spec}})
+    head = "schema: analysis.{k}/1\nproducer: toolkit/analysis/{k}.py\nspec_sha256: {s}\nspec_signed: true\n" \
+           "engine: {{name: toy, version: '0.1'}}\nwritten_at: '2026-01-01T01:00:00+00:00'\ninputs:\n{i}data:\n  x: 1\n"
+    point = w("analysis/point.yaml", head.format(k="point", s=spec, i=f"  decision_spec.yaml: {spec}\n  data/units.csv: {units}\n"
+                                                 "  ../../toolkit/engines/toy/card.yaml: abc\n"))
+    claims = w("analysis/claims.yaml", head.format(k="claims", s=spec, i=f"  analysis/point.yaml: {point}\n") + "  big: " + "y" * 10)
+    alloc = w("allocation.csv", "unit,package\na,p\n")
+    w("analysis/manifest.json", {"complete": True, "artifacts": {
+        "analysis/point.yaml": {"kind": "point", "producer": "toolkit/analysis/point.py", "sha256": point},
+        "analysis/claims.yaml": {"kind": "claims", "producer": "toolkit/analysis/claims.py", "sha256": claims}},
+        "deliverables": {"allocation.csv": {"producer": "toolkit/analysis/run.py", "role": "allocation", "sha256": alloc}}})
+    w("metadata.json", {"pipeline": "v2", "commit": "", "started": "2026-01-01T00:00:00+00:00", "status": "completed",
+                        "invocations": [{"pipeline": "v2", "commit": "", "at": "2026-01-01T00:00:00"}], **over.get("meta", {})})
+    hist = over.get("history") or [("SPEC", "SIGN", 1.0, 5), ("SIGN", "ANALYZE", 1.0, 6), ("ANALYZE", "CRITIQUE", 1.0, 66),
+                                   ("CRITIQUE", "GATE", 2.5, 70), ("GATE", "WRITE", 2.5, 71), ("WRITE", "FINAL", 3.0, 75)]
+    w("run_state.json", {"question": "toy question", "state": "FINAL", "status": "completed", "paused": None, "round": 1,
+                         "budget_usd": 30.0, "spent_usd": hist[-1][2],
+                         "history": [{"at": f"2026-01-01T{m // 60:02d}:{m % 60:02d}:00+00:00", "from": a, "to": b,
+                                      "why": "ok", "round": 1, "spent_usd": u} for a, b, u, m in hist],
+                         "journal": {"SPEC#0:try1": {"task": "draft_spec", "status": "completed", "ok": True, "usd": 1.0,
+                                                     "allowance_usd": 3.0, "started": "2026-01-01T00:00:00+00:00",
+                                                     "completed": "2026-01-01T00:05:00+00:00", "note": "drafted"},
+                                     **over.get("journal", {})}, **over.get("state", {})})
+    return w
+
+
+def _self_test():
+    fails = []
+
+    def ok(name, cond, detail=""):
+        print(f"  {'ok  ' if cond else 'FAIL'} {name}" + (f": {detail}" if not cond and detail else ""))
+        if not cond:
+            fails.append(name)
+
+    def st(run, cid):
+        return next(c for c in checks.run_all(run) if c["id"] == cid)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = os.path.join(tmp, "keep", "job", "out", "runs", "2026-01-01_000000_toy-question-about-a-thing")
+        os.makedirs(d)
+        w = _toy(d)
+        wb = Workbench([os.path.join(tmp, "keep")])
+        runs = wb.api_runs()["runs"]
+        ok("W1 discovery finds the run and labels it by its place under the root",
+           len(runs) == 1 and runs[0]["label"] == "job / 2026-01-01" and runs[0]["pipeline"] == "v2", str(runs))
+        rid = runs[0]["id"]
+        v, over = wb.api_view(rid, "steps"), wb.api_view(rid, "overview")
+
+        def table(t):
+            return [dict(zip(t["columns"], r)) for r in t["rows"]]
+        by = {c["id"]: c["status"] for c in v["checks"]}
+        ok("W2 a clean finished run: every check ok except the commit (none recorded: problem)",
+           {k: s for k, s in by.items() if s != "ok"} == {"steps.pipeline": "problem"}, str(by))
+        ok("W3 every check names the file and field it read, and one plain sentence",
+           all(c["says"] and c["evidence"] for c in v["checks"]))
+        a = {x["file"]: x for x in table(v["tables"]["artifacts"])}
+        ok("W4 artifact headers read from the file's first bytes; a harness input is marked outside the run folder",
+           a["analysis/point.yaml"]["producer"] == "toolkit/analysis/point.py"
+           and [i["state"] for i in table(v["tables"]["inputs"]) if i["file"] == "analysis/point.yaml"]
+           == ["outside", "same", "same"], str(v["tables"]["inputs"]))
+        hist = table(v["tables"]["history"])
+        ok("W5 steps: time and spend per transition", [h["model_spend_usd"] for h in hist] == [1.0, 0.0, 0.0, 1.5, 0.0, 0.5]
+           and hist[2]["minutes"] == 60.0, str(hist))
+        path = {p["view"]: p for p in table(over["tables"]["views"])}
+        ok("W6 the overview lists views not built yet with the goal that builds them, and each view's worst status",
+           (path["spec"]["status"], path["spec"]["goal"]) == ("not_built", "G6") and path["steps"]["status"] == "problem"
+           and "Spec and evidence (goal G6)" in over["notes"]["not_built"], str(path))
+
+        w("decision_spec.yaml", "question: toy, redrafted after signing\n")
+        r = Run(d)
+        ok("W7 C10: a spec edited after signing is a problem, and the artifact that read it is stale",
+           st(r, "steps.signed_spec")["status"] == "problem" and st(r, "steps.inputs_fresh")["status"] == "problem"
+           and st(r, "steps.inputs_fresh")["rows"]["rows"][0][:2] == ["analysis/point.yaml", "decision_spec.yaml"])
+        ok("W8 C10: artifacts still record the signed spec's hash, so that check stays ok",
+           st(r, "steps.artifact_spec")["status"] == "ok")
+        w("allocation.csv", "unit,package\na,edited\n")
+        ok("W9 a deliverable changed after the analysis wrote it is a problem", st(Run(d), "steps.manifest")["status"] == "problem")
+
+        d2 = os.path.join(tmp, "keep", "loop")
+        os.makedirs(d2)
+        _toy(d2, history=[("SPEC", "SIGN", 1, 1), ("CRITIQUE", "GATE", 1, 2), ("GATE", "CRITIQUE", 1, 3),
+                          ("CRITIQUE", "GATE", 1, 4), ("GATE", "CRITIQUE", 1, 5), ("CRITIQUE", "FINAL", 1, 6)],
+             state={"status": "run_failed"},
+             journal={"SPEC#1:try2": {"task": "draft_spec", "status": "completed", "ok": False, "usd": 2.9,
+                                      "allowance_usd": 3.0, "note": "ResultError"}})
+        r2 = Run(d2)
+        ok("W10 C16: repeated transitions and a failed task are a problem naming the task",
+           st(r2, "steps.progress")["status"] == "problem" and "SPEC#1:try2" in st(r2, "steps.progress")["says"])
+        ok("W11 a run that ended run_failed is a problem; a task at its allowance is flagged",
+           st(r2, "steps.outcome")["status"] == "problem" and st(r2, "steps.cost")["status"] == "look")
+
+        d3 = os.path.join(tmp, "keep", "broken")
+        os.makedirs(d3)
+        open(os.path.join(d3, "run_state.json"), "w").write("{not json")
+        ok("W12 fail closed: an unreadable run gives not_available everywhere, never a crash or an ok",
+           all(c["status"] == "not_available" for c in checks.run_all(Run(d3))), str([c["status"] for c in checks.run_all(Run(d3))]))
+        os.symlink("/etc/hosts", os.path.join(d3, "metadata.json"))
+        ok("W13 confined reads: no link followed, no path outside the run, no credential file",
+           Run(d3).read("metadata.json")[0] is None and Run(d).read("../x")[0] is None and Run(d).read(".env")[0] is None)
+        ok("W14 the server answers loopback GETs only",
+           wb.handle("GET", "/api/runs", "evil.example")[0] == 403 and wb.handle("POST", "/api/runs", "127.0.0.1:1")[0] == 405
+           and wb.handle("GET", "/api/runs", "127.0.0.1:8790")[0] == 200 and wb.handle("GET", "/api/view?run=nope&view=steps", "localhost")[0] == 404)
+        ok("W15 the page and its script are served; the script builds no HTML from run text",
+           wb.handle("GET", "/", "localhost")[0] == 200
+           and not re.search(r"innerHTML|insertAdjacentHTML|document\.write", open(os.path.join(STATIC, "app.js")).read()))
+        page = open(os.path.join(STATIC, "index.html")).read()
+        ok("W16 the page holds no inline script or style, and every static file is served under the policy's 'self'",
+           not re.search(r"<style|style=|<script(?![^>]*\bsrc=)[^>]*>|\bon\w+=|https?://", page)
+           and all(wb.handle("GET", u, "localhost")[0] == 200 for u in STATIC_FILES))
+
+        code, ctype, body = wb.handle("GET", f"/api/view?run={rid}&view=steps", "localhost")
+        doc = json.loads(body)
+        ok("W17 the data endpoint returns checks, facts, tables, charts and notes, and the Steps tables",
+           code == 200 and sorted(doc) == sorted(KEYS) and len(doc["checks"]) == 8
+           and {"history", "tasks", "artifacts", "inputs"} <= set(doc["tables"])
+           and all(len(r) == len(t["columns"]) for t in doc["tables"].values() for r in t["rows"]), str(sorted(doc)))
+        cols = {n: t["columns"] for n, t in doc["tables"].items()}
+        ok("W18 every chart names a kind the page draws, a table of the result and columns of that table",
+           [c["kind"] for c in doc["charts"]] == ["graph", "bars", "bars"]
+           and all(c["title"] and c["how_to_read"] and all(c[k] in cols[c["table"]] for k in ("x", "y", "group") if k in c)
+                   for c in doc["charts"]) and cols[doc["charts"][0]["nodes"]][0] == "file", str(doc["charts"]))
+        ok("W19 an unknown view is a 404; a view that is not built says so with its goal, and is not a 500",
+           wb.handle("GET", f"/api/view?run={rid}&view=nope", "localhost")[0] == 404
+           and wb.api_view(rid, "spec")["checks"][0]["status"] == "not_available"
+           and "goal G6" in wb.api_view(rid, "spec")["checks"][0]["says"])
+
+        def boom(run):
+            raise KeyError("no such field")
+        VIEW_FNS.update(spec=boom, model=lambda run: ["not", "a", "result"],
+                        fit=lambda run: {"facts": {"x": float("nan")}, "tables": {}})
+        try:
+            code, _, body = wb.handle("GET", f"/api/view?run={rid}&view=spec", "localhost")
+            c = json.loads(body)["checks"][0]
+            ok("W20 a view that raises gives not_available with the reason, never a 500",
+               code == 200 and c["status"] == "not_available" and "KeyError" in c["says"], str(c))
+            ok("W21 a view returning another shape is not_available; missing parts are filled; a NaN reaches the page as null",
+               wb.api_view(rid, "model")["checks"][0]["status"] == "not_available"
+               and wb.api_view(rid, "fit") == {"checks": [], "facts": {"x": None}, "tables": {}, "charts": [], "notes": {}})
+            o = wb.api_view(rid, "overview")
+            order = [c["status"] for c in o["checks"]]
+            ok("W22 the overview gathers the checks of every view that exists: views in reading order whatever their "
+               "statuses, worst first within a view, each check naming its view",
+               [c["step"] for c in o["checks"]] == ["spec", "model"] + ["steps"] * 8 and order[2] == "problem"
+               and order[2:] == sorted(order[2:], key=checks.WORST_FIRST.index)
+               and o["facts"]["checks_problem"] == order.count("problem") and o["facts"]["question"] == "toy question", str(order))
+        finally:
+            for k in ("spec", "model", "fit"):
+                VIEW_FNS.pop(k)
+
+        acc, lines = os.path.join(tmp, "steps.yaml"), []
+        entries = [{"path": "facts.status", "equals": "completed", "source": "run_state.json status"},
+                   {"path": "facts.model_spend_usd", "approx": 3.001, "source": "run_state.json spent_usd"},
+                   {"path": "tables.tasks[key=SPEC#0:try1].allowance_usd", "equals": 3.0},
+                   {"path": "tables.artifacts[file=analysis/point.yaml].kind", "equals": "point"},
+                   {"path": "checks[id=steps.pipeline].status", "equals": "problem"}]
+        open(acc, "w").write(yaml.safe_dump(entries))
+        good = accept(wb, d, acc, lines.append)
+        open(acc, "w").write(yaml.safe_dump(entries + [{"path": "facts.model_spend_usd", "approx": 3.1},
+                                                       {"path": "tables.tasks[key=none].ok", "equals": True},
+                                                       {"path": "facts.status"}]))
+        bad = []
+        ok("W23 --accept: one line per entry; 0 when every quoted value matches, 1 on any difference",
+           good == 0 and len(lines) == 5 and all(x.startswith("ok ") for x in lines) and accept(wb, d, acc, bad.append) == 1
+           and [x[:4] for x in bad] == ["ok  "] * 5 + ["DIFF"] * 3 and accept(wb, d, os.path.join(tmp, "none.yaml"), bad.append) == 1,
+           str(lines + bad))
+
+        d4 = os.path.join(tmp, "keep", "declared")
+        os.makedirs(d4)
+        _toy(d4, state={"status": "completed_scope_declared"})
+        c = st(Run(d4), "steps.outcome")
+        ok("W24 a run that ended with a declared scope is for the reader to judge (look), not a problem",
+           c["status"] == "look" and "declared" in c["says"] and st(r2, "steps.outcome")["status"] == "problem")
+        _toy(d4, history=[("SPEC", "SIGN", 1.0, 5), ("SIGN", "ANALYZE", 1.0, 65), ("ANALYZE", "FINAL", 2.0, 75)])
+        s4 = json.load(open(os.path.join(d4, "run_state.json")))
+        s4["history"].insert(1, {"at": "2026-01-01T00:30:00+00:00", "fix_loop": {"round": 1}})
+        open(os.path.join(d4, "run_state.json"), "w").write(json.dumps(s4))
+        v4 = Run(d4).view("steps")
+        ok("W25 a history entry that is not a transition is left out; time waiting for the owner is counted apart",
+           len(v4["tables"]["history"]["rows"]) == 3 and v4["facts"]["waiting_for_owner_minutes"] == 60.0
+           and v4["facts"]["working_minutes"] == 15.0, str(v4["facts"]))
+
+        d5 = os.path.join(tmp, "keep", "large")
+        os.makedirs(os.path.join(d5, "analysis"))
+        big = os.path.join(d5, "analysis", "big.yaml")
+        open(big, "w").write("schema: toy/1\ndata:\n  rows:\n" + "".join(f"  - [{i}, {i * 0.5}]\n" for i in range(2000)))
+        n0 = LARGE_PARSES[0]
+        first, again = Run(d5).large("analysis/big.yaml"), Run(d5).large("analysis/big.yaml")
+        ok("W26 a large YAML file is parsed once and kept in memory: a second Run of the folder gets the same document",
+           first[1] is None and first[0]["data"]["rows"][1999] == [1999, 999.5] and again[0] is first[0]
+           and LARGE_PARSES[0] == n0 + 1, str((first[1], LARGE_PARSES[0] - n0)))
+        open(big, "a").write("  - [2000, 1000.0]\n")
+        later = Run(d5).large("analysis/big.yaml")
+        ok("W27 the kept document is keyed by size and modification time: a changed file is parsed again",
+           later[0] is not first[0] and len(later[0]["data"]["rows"]) == 2001 and LARGE_PARSES[0] == n0 + 2)
+        os.symlink(big, os.path.join(d5, "analysis", "link.yaml"))
+        open(os.path.join(d5, "analysis", "bad.yaml"), "w").write("a: [unclosed\n  - {")
+        ok("W28 the large reader fails closed: no link followed, no path outside the run, a reason for a file it cannot parse",
+           Run(d5).large("analysis/link.yaml")[0] is None and Run(d5).large("../large/analysis/big.yaml")[0] is None
+           and Run(d5).large("analysis/none.yaml") == (None, "analysis/none.yaml is not in the run folder")
+           and Run(d5).large("analysis/bad.yaml")[0] is None and "parsed" in Run(d5).large("analysis/bad.yaml")[1])
+
+        script = open(os.path.join(STATIC, "app.js")).read()
+        good = {"tables": {"t": {"columns": ["a", "b", "c"], "rows": [["x", 1, 2]]}}, "charts": [
+            {"kind": "bars", "table": "t", "x": "a", "y": "b", "title": "T", "how_to_read": "H", "where": {"a": "x"},
+             "panels": "a", "labels": {"b": "b (count)"}, "limits": [{"value": 1, "label": "limit"}]}]}
+        wrong = [dict(good["charts"][0], **edit) for edit in (
+            {"kind": "pie"}, {"colour": "red"}, {"y": "z"}, {"where": {"z": 1}}, {"labels": {"z": "?"}},
+            {"panels": "z"}, {"limits": [3]}, {"title": ""}, {"table": "none"})]
+        ok("W29 chart declarations: every documented key is read by the page; an unknown kind, key, table or column, "
+           "a missing title, and limits that are not {value, label} are each reported",
+           chart_problems(good) == [] and all(len(chart_problems(dict(good, charts=[w]))) == 1 for w in wrong)
+           and all(re.search(rf"\b(decl|c|d)\.{k}\b", script) for k in CHART_KEYS)
+           and all(k in __doc__ for k in CHART_KEYS),
+           str([chart_problems(dict(good, charts=[w])) for w in wrong]
+               + [k for k in CHART_KEYS if not re.search(rf"\b(decl|c|d)\.{k}\b", script)]))
+        for name in ("steps", "fit"):
+            vv = wb.api_view(rid, name)
+            ok(f"W30 the {name} view's own chart declarations on the toy run are ones the page can draw",
+               chart_problems(vv) == [], str(chart_problems(vv)))
+
+        code, _, body = wb.handle("GET", "/api/glossary", "localhost")
+        g = json.loads(body) if code == 200 else {}
+        codes = {(e["kind"], e["code"]) for e in g.get("entries") or []}
+        from views import fit as fit_view
+        used = ({("scorecard case", c["case"]) for c in over["checks"] if c["case"]}
+                | {("scorecard case", c) for c in fit_view.CHECKS.values() if c} | {("goal", goal) for _, _, goal in PATH})
+        ok("W31 the glossary is served from the specification's own tables: it defines every scorecard case a check "
+           "names and every goal of the rail, and the page script holds no meaning of its own",
+           g.get("why") is None and used <= codes and all(e["meaning"] for e in g["entries"])
+           and "/api/glossary" in script and not any(e["meaning"][:40] in script for e in g["entries"]),
+           str((code, g.get("why"), sorted(used - codes))))
+        lost = Workbench([], spec=os.path.join(tmp, "no-spec.md"))
+        gl = json.loads(lost.handle("GET", "/api/glossary", "localhost")[2])
+        ok("W32 fail closed: with no readable specification the glossary is empty and says why",
+           gl["entries"] == [] and "could not be read" in str(gl["why"]), str(gl))
+
+        d6, t0 = os.path.join(tmp, "keep", "running"), 1_700_000_000
+        os.makedirs(d6)
+        _toy(d6, state={"state": "ANALYZE", "status": None})
+        for root, _, names in os.walk(d6):
+            for n in names:
+                os.utime(os.path.join(root, n), (t0, t0))
+        os.utime(os.path.join(d6, "analysis", "point.yaml"), (t0 + 600, t0 + 600))
+        os.symlink("/etc/hosts", os.path.join(d6, "analysis", "link.yaml"))
+        lw, later = Run(d6).last_written(), Run(d6, now=t0 + 600 + 2 * 3600 + 60)
+        ok("W33 the last file written is the newest among the run's files (no link followed); the walk is bounded and says "
+           "when it was cut short", lw == {"at": t0 + 600, "file": "analysis/point.yaml", "cut": False}
+           and Run(d6).last_written(limit=2)["cut"] is True and Run(os.path.join(tmp, "none")).last_written()["at"] is None, str(lw))
+        summ = later.summary()
+        ok("W34 time since the last file was written, in plain words, in the run summary and the Steps outcome sentence",
+           [ago(x) for x in (30, 90, 59 * 60, 2 * 3600 + 60, 26 * 3600, 3 * 86400 + 5)]
+           == ["less than a minute", "1 minute", "59 minutes", "2 hours", "1 day", "3 days"]
+           and (summ["last_written"], summ["last_written_file"], summ["last_written_ago"]) == (t0 + 600, "analysis/point.yaml", "2 hours")
+           and "2 hours ago" in st(later, "steps.outcome")["says"] and "analysis/point.yaml" in st(later, "steps.outcome")["says"]
+           and "2 hours ago" in str(later.view("overview")["facts"].get("last_file_written")),
+           str((summ, st(later, "steps.outcome")["says"])))
+
+        alone = Workbench(chosen_roots(None, [d]), [d])
+        listed = alone.api_runs()
+        ok("W35 a run given by --run-dir is listed as that folder: the default root is not scanned or named beside it",
+           chosen_roots(None, [d]) == [] and chosen_roots(None, []) == [os.path.join(REPO, "runs")]
+           and chosen_roots(["x"], [d]) == ["x"] and listed["roots"] == [] and listed["run_dirs"] == [os.path.realpath(d)]
+           and len(listed["runs"]) == 1, str({k: listed[k] for k in ("roots", "run_dirs")}))
+
+        node = shutil.which("node")
+        if node is None:
+            print("  skip W36 the page script's own cases (page_test.js): node is not installed here")
+        else:
+            r = subprocess.run([node, os.path.join(HERE, "page_test.js")], capture_output=True, text=True, timeout=120)
+            ok("W36 the page script's own cases pass (page_test.js: ticks, collapsed checks, view order, glossary, run list)",
+               r.returncode == 0, (r.stdout + r.stderr)[-900:])
+    print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
+    return 1 if fails else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--roots", nargs="*", default=None, help="folders to search for runs (default: runs/, unless --run-dir is given)")
+    ap.add_argument("--run-dir", action="append", default=[])
+    ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--retro", metavar="RUN_DIR")
+    ap.add_argument("--accept", nargs=2, metavar=("RUN_DIR", "ACCEPTANCE_YAML"))
+    ap.add_argument("--self-test", action="store_true")
+    a = ap.parse_args()
+    if a.self_test:
+        return _self_test()
+    if a.retro:
+        return retro(a.retro)
+    if a.accept:
+        return accept(Workbench([], [a.accept[0]]), *a.accept)
+    serve(Workbench(chosen_roots(a.roots, a.run_dir), a.run_dir), a.port)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
