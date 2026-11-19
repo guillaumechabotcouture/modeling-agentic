@@ -1286,7 +1286,7 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
                         "calibration_check": _control_check(runner, pack, ctrl, reg["sample"][i])})
     reg, code = finalize(reg, checked, chosen, grid_edge, bands=bands, seeds=list(runner.seeds))
     doc = document(eng, reg, q, smoke, approved=approved, cap_usd=cap_usd, n_sims=runner.nsims, waves=waves,
-                   target_digests=target_digests(base, bands),
+                   target_digests=target_digests(pack, bands),       # the pack it evaluated (Codex r3)
                    wall_s=round(time.time() - t0, 1), fitted_at=time.strftime("%F %T"),
                    calibration_grid={CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
                                      "at_grid_edge": grid_edge}, **fit)

@@ -452,7 +452,8 @@ def posterior_trained(raw: dict, ref: str, config: dict | None, base: str | None
     """({benchmark id: declaration digest}, None): the benchmarks a declared uncertainty.net_effect_posterior's fit
     trains on and the loader verified the chosen point in band on (its `trained`); (None, None) without the field;
     (None, why) when the declared posterior does not load (fail closed)."""
-    if "net_effect_posterior" not in (raw.get("uncertainty") or {}):
+    u = raw.get("uncertainty") if isinstance(raw, dict) else None
+    if not isinstance(u, dict) or "net_effect_posterior" not in u:      # malformed: schema validation says so
         return None, None
     try:
         from toolkit.analysis import uncertainty as UQ
@@ -705,6 +706,11 @@ def _self_test_posterior(ok, cov, both):
         NEF._fixture_placeholder(f, schema.load(p).engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
         replayed = sorted(NEF.pack_bands())
         t0, t1 = replayed[0], replayed[1]
+        held = next(k for k in decl if k not in replayed)     # a real benchmark the replay does not check (Codex r3)
+
+        def good(doc):
+            doc["plan"].update(targets_train=[t0, t1, held, "not_a_replayed_target"], held_out_untouched=[t1])
+            doc.setdefault("target_digests", {})[held] = band_digest(decl[held], base)
 
         def signed(edit):
             doc = yaml.safe_load(open(f))
@@ -716,8 +722,7 @@ def _self_test_posterior(ok, cov, both):
             "uncertainty": {k: v for k, v in raw["uncertainty"].items() if k != "net_effect_posterior"}}
         cases = {"none": lambda: none,
                  "good": lambda: dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior=signed(
-                     lambda doc: doc["plan"].update(targets_train=[t0, t1, "not_a_replayed_target"],
-                                                    held_out_untouched=[t1])))),
+                     good))),
                  "bad": lambda: dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior={
                      "path": "nef.yaml", "sha256": "0" * 64}))}
         res = {}
