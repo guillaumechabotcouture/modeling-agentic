@@ -16,6 +16,15 @@ and the Fit view (§5.5) read, with the key names and nesting of a stored v2 run
   predictive band of a fit over time (a stored run writes that file for the `estimates` deliverable; the fixture
   carries it beside its allocation so the Fit view's `series` table has a case).
 
+It also holds every file the science register (§5.8, §6) is derived from, shaped as the producers write them
+(agents/findings_ledger.py for findings.jsonl; a stored run for the rest): findings.jsonl (critics' findings and one
+raised by a harness check), scope_declaration.yaml, engine_choice.json with engine_departures, the signed spec's
+calibration.joint.unmatched.declared (history matching) and uncertainty.excluded, decision_spec.signoff_sheet.md with
+one row marked HIGH, evidence_dossier.yaml with no-data entries, and decision tests of each verdict. On the clean run
+every science row has a disposition, every declared row names a decision test that ran, the one plan-changing test is
+linked to a row, and the signed spec holds no comment line that starts a departure, limitation or assumption (such a
+line is itself something the register raises, so it is planted: defect prose_only).
+
 Names are neutral on purpose (§3a): units U01.., groups G1.., parameters p1.., components A and B, and a grouping
 column called `stratum` so that a view which hard-codes a column name fails. No figure image is written.
 
@@ -44,6 +53,11 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
+_SCRIPTS = os.path.join(REPO, "scripts")
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+from lib.safe_io import write_nofollow  # noqa: E402
+
 METHODS = ("history_matching", "posterior")
 STAGES = ("launch", "sign-off", "calibration", "analysis", "final")
 GROUPING = "stratum"
@@ -62,6 +76,14 @@ JC, CAL, UNC, DT = ("analysis/joint_calibration.yaml", "analysis/calibration.yam
                     "analysis/decision_tests.yaml")
 EST = "analysis/estimates.yaml"                        # the posterior fixture's fit over time (a predictive band)
 SPEC_FILES = ["decision_spec.yaml", "decision_brief.signed/decision_spec.yaml"]
+# What the science register reads beside the spec and the decision tests (§6).
+LEDGER, SCOPE, CHOICE, SHEET, DOSSIER = ("findings.jsonl", "scope_declaration.yaml", "engine_choice.json",
+                                         "decision_spec.signoff_sheet.md", "evidence_dossier.yaml")
+OLD_DECLARED, OLD_GATE = "declared_findings.yaml", "final_gate.json"       # where an older run keeps dispositions
+ENGINE_REF = "toolkit.engines.toy.engine:ToyEngine"
+HELD = "c1"                                            # a scenario value the signed spec excludes from the draws by name
+CAL_DECLARED = {"target": "grp_r1:G1", "decision_test": "DT6",
+                "reason": "the earlier-round value for G1 is matched only at the primary error setting; tested by DT6"}
 ENGINE = {"name": "toy-engine", "version": "0.1", "card_sha256": hashlib.sha256(b"toy card").hexdigest()}
 HARNESS_INPUT = {"../../toolkit/engines/toy/priors.yaml": hashlib.sha256(b"toy priors").hexdigest()}
 # Which stage writes each file. run_state.json and metadata.json are written at every stage.
@@ -70,7 +92,9 @@ STAGE_OF = {"decision_spec.yaml": "launch", "data/derived/units.csv": "launch", 
             "decision_spec.signoff.json": "sign-off", "decision_brief.signed/decision_spec.yaml": "sign-off",
             JC: "calibration", CAL: "calibration", "figures/": "calibration",
             "analysis/point.yaml": "analysis", UNC: "analysis", DT: "analysis", EST: "analysis", "allocation.csv": "analysis",
-            "analysis/manifest.json": "analysis"}
+            "analysis/manifest.json": "analysis",
+            SHEET: "sign-off", DOSSIER: "sign-off", CHOICE: "sign-off",
+            LEDGER: "final", SCOPE: "final", OLD_DECLARED: "final", OLD_GATE: "final"}
 HISTORY = [("SPEC", "SIGN", 30, 1.0), ("SIGN", "EVIDENCE", 60, 1.0), ("EVIDENCE", "ENGINE_CHOICE", 70, 1.4),
            ("ENGINE_CHOICE", "CONFIGURE", 80, 1.8), ("CONFIGURE", "ANALYZE", 90, 2.0), ("ANALYZE", "CRITIQUE", 240, 2.0),
            ("CRITIQUE", "GATE", 260, 3.0), ("GATE", "WRITE", 270, 3.0), ("WRITE", "PRESENTATION", 290, 3.6),
@@ -116,9 +140,16 @@ def _spec(method):
             "decision_units": {"csv": "data/derived/units.csv", "id": "unit_id", "label": "name", "region": GROUPING},
             "options": {"components": {"A": {}, "B": {}}, "packages": {"generate": True}},
             "comparator": {"package": "A"},
-            "uncertainty": {"draws": 50},
+            "uncertainty": {"draws": 50, "excluded": [
+                {"parameter": HELD, "reason": f"{HELD} is a scenario value held fixed by name; DT7 runs it at both ends"}]},
             "analysis": {"decision_tests": [{"id": "DT1", "type": "parameter_values", "parameter": "p2",
-                                             "values": [1.6, 4.4], "text": "Does the plan change across p2's range?"}]},
+                                             "values": [1.6, 4.4], "text": "Does the plan change across p2's range?"},
+                                            *_spec_tests(method)]},
+            "engine_departures": [
+                {"engine": ENGINE["name"], "benchmark": "B2", "decision_test": "DT4",
+                 "reason": "B2 is held out and outside its band; DT4 runs the plan across the band"},
+                {"engine": ENGINE["name"], "component": "B", "decision_test": "DT5",
+                 "reason": "no benchmark compares component B with its absence; DT5 runs its effect from none to the top"}],
             "deliverable": {"kind": "package_per_unit", "allocation_file": "allocation.csv",
                             "columns": {"unit": "unit_id", "package": "package", "value": "outcome_averted"}}}
     if method == "history_matching":
@@ -133,7 +164,7 @@ def _spec(method):
                          "metric": "m1", "scale": "logit", "survey": "survey_a", "source": _source("group")}],
             "sensitivity": [{"id": "sd_015", "label": "sd 0.15 on the round 2 unit target",
                              "targets": {"unit_r2": {"sd": 0.15}}}],
-            "unmatched": {"mode": "flag", "max_units": 2, "declared": []}}}
+            "unmatched": {"mode": "flag", "max_units": 2, "declared": [dict(CAL_DECLARED)]}}}
     else:
         spec["calibration"] = {"method": "posterior", "parameters": list(PARAMS),
                                "priors": {p: {"dist": "uniform", "range": PRIOR[p]} for p in PARAMS},
@@ -141,6 +172,21 @@ def _spec(method):
                                            for s, q in (("S1", "q1"), ("S2", "q2"))],
                                "targets": {"csv": "data/derived/targets.csv", "groups": GROUPING}}
     return spec
+
+
+def _spec_tests(method):
+    """The decision tests the spec declares for the register's rows (each names its finding, as a stored spec's do)."""
+    def test(tid, kind, finding=None, **what):
+        return {"id": tid, "type": kind, **what, "text": f"Does the plan change under {tid}?",
+                "finding": finding or f"decision_test:{tid}"}
+    return [test("DT3", "parameter_value", "R-001", parameter="p1", values=[0.42, 0.58]),
+            test("DT4", "interaction_rescale", components=["B"], with_any=["A"], benchmark="B2", values=[0.5, 2.0]),
+            test("DT5", "parameter_value", parameter="b_add", values=[0.0, 0.1]),
+            *([test("DT6", "calibration_target", calibration_target={"units": list(UNITS[:4])})]
+              if method == "history_matching" else []),
+            test("DT7", "parameter_value", parameter=HELD, values=[0.0, 1.0]),
+            test("DT8", "parameter_value", parameter="p2", values=[1.0, 5.5]),
+            test("DT9", "unit_attribute", unit_attribute={"column": "x1", "units": "all"})]
 
 
 def _source(kind, assumed=False):
@@ -400,21 +446,157 @@ def _estimates():
                                      "coverage": 1.0, "level": 0.95, "draws": 50}}
 
 
-def _test(tid, ran=True):
+def _test(tid, ran=True, changes=False):
+    share = 25.0 if changes else 0.0
     return {"test_id": tid, "path": f"models/decision_tests/{tid}.yaml" if ran else None,
-            "status": "run" if ran else "not_run", "verdict": "NO_CHANGE" if ran else "NOT_RUN",
-            "can_move_plan": True if ran else None, "threshold_pct": 10.0, "share_pct": 0.0 if ran else None,
-            "regret_pct": 0.0 if ran else None,
-            "statement": "This test can move the plan: it was re-solved for each value." if ran
-            else "This test was not run: its values could not be reached."}
+            "status": "run" if ran else "not_run",
+            "verdict": "NOT_RUN" if not ran else "CHANGES_PLAN" if changes else "NO_CHANGE",
+            "can_move_plan": True if ran else None, "threshold_pct": 10.0, "share_pct": share if ran else None,
+            "regret_pct": (2.0 if changes else 0.0) if ran else None,
+            "statement": ("This test was not run: its values could not be reached." if not ran else
+                          f"This test changes the plan: {share:g}% of units change package, above the 10% threshold."
+                          if changes else "This test can move the plan: it was re-solved for each value.")}
+
+
+def _set_test(m, tid, **how):
+    m["dt"]["tests"] = [_test(tid, **how) if t["test_id"] == tid else t for t in m["dt"]["tests"]]
+
+
+# The ledger's own vocabulary (agents/findings_ledger.py): STATUSES, and OWNER_STATE for the stages used here.
+OWNER_STATE = {"PLAN": "SPEC", "ANALYZE": "ANALYZE", "WRITE": "WRITE"}
+SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+STALE_ID = "analysis_contract_stale:analysis/point.yaml"     # a finding a harness check raises about the run's files
+
+
+def _finding(fid, source, severity, stage, claim, status="fixed", test=None, blocking=False):
+    """One row of findings.jsonl with the ledger's twenty fields and the events the ledger writes on the way to
+    `status` (a critic's finding follows its critique file; a gate finding absent at a later gate is fixed)."""
+    critic = source.startswith("critique")
+    kind, _, key = ("critique_blocker", "", "") if critic else fid.partition(":")
+    events = [{"by": source, "round": 1, "status": "open"}]
+    if status == "fixed":
+        events.append({"by": source, "round": 2, "status": "fixed"} if critic else
+                      {"by": "gate", "note": "absent at this gate", "round": 2, "status": "fixed"})
+    elif status == "declared":
+        events.append({"by": "scope_declaration", "round": 1, "status": "declared"})
+    elif status in ("owner_accepted", "owner_declined"):
+        events += [{"by": "scope_declaration", "round": 1, "status": "declared"}, {"by": "owner", "round": 1, "status": status}]
+    return {"id": fid, "kind": kind, "severity": severity, "source": source, "key": key,
+            "owner_state": OWNER_STATE[stage], "owner_state_known": True, "target_stage": stage,
+            "resolution_type": "decision_test" if test else "fix", "status": status, "blocking": blocking,
+            "scope_declarable": True, "first_seen_round": 1, "last_seen_round": 2 if status == "fixed" else 1,
+            "instances": 1, "claim": claim,
+            "fix_requires": "State the limit in the report, or test it." if critic else None,
+            "done_when": [{"contains": "limit", "file": "manuscript.md"}] if critic else None,
+            "decision_test": ({"decision_changes": False, "file": f"models/decision_tests/{test}.yaml",
+                               "finding": fid, "valid": True} if test else None),
+            "events": events}
+
+
+def _findings():
+    return {f["id"]: f for f in (
+        _finding("D-001", "critique-domain", "HIGH", "PLAN",
+                 "The comparator leaves out a delivery already funded, so the gain of every package is overstated."),
+        _finding("D-002", "critique-domain", "MEDIUM", "WRITE",
+                 "The report gives the point value of the headline without its interval."),
+        _finding("R-001", "critique-redteam", "MEDIUM", "ANALYZE",
+                 "The plan may depend on p1, which the fit narrows only to the middle of its prior.",
+                 status="declared", test="DT3"),
+        _finding(STALE_ID, "rigor-artifacts", "HIGH", "ANALYZE",
+                 "analysis/point.yaml was computed from an input whose hash has changed since."))}
+
+
+def _declaration(n, blocker, test, why):
+    return {"id": f"SD-{n:03d}", "blocker_id": blocker, "why_unresolved": why,
+            **({"decision_test": f"models/decision_tests/{test}.yaml"} if test else {})}
+
+
+def _departures(status="signed"):
+    """engine_choice.json engine_departures: the spec's entries as the engine choice records them
+    (toolkit/engines/benchmark_coverage.py: status signed, proposed or unsigned; the benchmark's own status and role)."""
+    spec = _spec("posterior")["engine_departures"]
+    return [{**spec[0], "status": status, "benchmark_status": "out_of_band", "role": "held_out", "components": ["B"]},
+            {**spec[1], "status": status, "benchmark_status": "no benchmark", "role": "none", "components": ["B"]}]
+
+
+def _choice():
+    deps = _departures()
+    return {"at": _at(75),
+            "candidates": [{"ref": ENGINE_REF, "config": {}, "name": ENGINE["name"], "version": ENGINE["version"],
+                            "eligible": True, "why_not": [], "mechanisms": ["components A and B on one outcome"],
+                            "benchmarks": 3, "departures": copy.deepcopy(deps), "benchmark_record": "benchmarks/results.yaml",
+                            "benchmarks_not_in_band": [],
+                            "benchmarks_reported": [{"id": "B2", "why": "held out; outside its band; a signed departure",
+                                                     "status": "out_of_band", "role": "held_out"}],
+                            "card_benchmark_rows_disagree_with_record": [], "components_without_benchmark": {}}],
+            "engine": {"ref": ENGINE_REF, "config": {}},
+            "why": "the one eligible engine; its two departures from benchmark evidence are signed with their tests",
+            "engine_departures": deps}
+
+
+def _no_data(value, reason, rule, test=None, source="spec default accepted by name"):
+    return {"model_value": value, "model_source": source, "no_data": {"reason": reason, "borrowing_rule": rule},
+            "chosen": {"value": value, "rule": rule}, **({"decision_test": test} if test else {})}
+
+
+def _dossier():
+    return {"meta": {"compiled": "2026-01-01", "status": "fixture dossier: four entries",
+                     "format": "toolkit/spec/evidence_dossier.py", "local_only": True},
+            "inputs": {
+                "parameter:p1": {
+                    "model_value": {"value": BEST["p1"], "range": PRIOR["p1"], "dist": "uniform"},
+                    "model_source": "fixture prior for p1",
+                    "observations": [{"source": "study one", "where": "G1", "year": "2019", "sites": "3", "n": "400",
+                                      "sampling_frame": "households", "value": "0.45"},
+                                     {"source": "study two", "where": "G3", "year": "2021", "sites": "2", "n": "250",
+                                      "sampling_frame": "households", "value": "0.55"}],
+                    "comparison": "the model value sits between the two observations",
+                    "chosen": {"range": PRIOR["p1"], "rule": "the prior range"}, "decision_test": "DT3"},
+                "parameter:p2": _no_data(BEST["p2"], "no measurement of p2 was found", "draw over the owner's range",
+                                         "DT8", "spec engine_parameters.p2 (owner's range)"),
+                f"parameter:{HELD}": _no_data(0.5, f"no source gives {HELD}", "hold at the default; run both ends as a "
+                                              "scenario", "DT7"),
+                "unit_attribute:x1": _no_data("the units table's column x1", "x1 is a modelled surface, not a measurement",
+                                              "use the surface; test the plan against the flat alternative", "DT9")}}
+
+
+def _sheet_text(m, spec_sha):
+    """decision_spec.signoff_sheet.md, in the words of toolkit/spec (engine_parameters.py writes the HIGH lines). One
+    row is marked HIGH; the word also appears where it marks nothing (the geometry section's sentence, a table cell)."""
+    lines = ["# Decision spec sign-off sheet", "",
+             f"Signing accepts `decision_spec.yaml` (sha256 `{spec_sha[:16]}`). It also accepts what follows.", "",
+             "## Engine defaults accepted by name",
+             "- **seed**: 1: the engine's own seed. Reason: the result does not depend on it", "",
+             "## Input geometry check",
+             "Proposed exceptions to HIGH findings (the owner's sign-off approves them; a lead sign-off does not):",
+             "- none", "",
+             "## Engine parameter values set by the spec",
+             "- **p2** = 3.1. Basis: owner_judgement. Source: the owner's range. Reason: no measurement. "
+             "Uncertainty: drawn over [1, 5.5] (uniform).",
+             f"  - `{ENGINE_REF}`: card value 3 (fitted; fixture card); card range 1 to 5", ""]
+    lines += [f"- **HIGH**: the uncertainty range of {name} (1 to 5.5) reaches outside the card range of `{ENGINE_REF}` "
+              f"(1 to 5; outside_card_range: true). Signing accepts it; its source and reason are above."
+              for name in m["high"]]
+    lines += ["", "## Evidence dossier (inputs that drive an option's effect)",
+              "| input | used by | model value | chosen | observations |", "|---|---|---|---|---|",
+              "| parameter:p1 | component A | 0.5 | 0.5 (owner decision, HIGH confidence in both studies) | 2 |", ""]
+    return "\n".join(lines)
 
 
 def _model(method):
     m = {"method": method, "spec": _spec(method), "unc": {"draws": 50, "seed": 1, "calibration_clamped": 0,
                                                           "prior_dominated": ["p3"]},
-         "dt": {"tests": [_test("DT1")]}}
+         "dt": {"tests": [_test("DT1")] + [_test(t["id"], changes=t["id"] == "DT9") for t in _spec_tests(method)]
+                + [_test(f"scenario_excluded_{HELD}", ran=False)]},
+         # the register's sources (§6); `comments` are comment lines of the spec, `disk` an edit made to the spec on
+         # disk after the sign-off, `old` the two files an older run keeps dispositions in
+         "findings": _findings(), "ledger_extra": [], "choice": _choice(), "dossier": _dossier(), "high": ["p2"],
+         "scope": {"declarations": [_declaration(1, "R-001", "DT3", "The data cannot narrow p1 further; DT3 runs the "
+                                                 "plan at both ends of its accepted range.")]},
+         "signed_by": "owner", "signoff_note": "fixture sign-off", "comments": [], "disk": None, "old": None}
     if method == "history_matching":
         m["jc"] = _joint()
+        m["jc"]["unmatched_decision"]["declared"].append(dict(CAL_DECLARED))
     else:
         m["cal"], m["est"] = _posterior(), _estimates()
     return m
@@ -575,6 +757,89 @@ def _no_series(m):
     del m["est"]["posterior_predictive"]
 
 
+# ---- the science register's edits (§5.8, §6)
+
+def _restate(m, fid, **how):
+    f = m["findings"][fid]
+    m["findings"][fid] = _finding(fid, f["source"], f["severity"], f["target_stage"], f["claim"], **how)
+
+
+def _left_open(fid, blocking=False):
+    return lambda m: _restate(m, fid, status="open", blocking=blocking)
+
+
+def _c12_declared(m):
+    _restate(m, "D-001", status="declared", test="DT1", blocking=True)
+    m["scope"]["declarations"].append(_declaration(2, "D-001", "DT1", "The funded delivery cannot be costed from the "
+                                                   "inputs of this run; DT1 runs the plan across the range that it moves."))
+
+
+def _each_departure(m):
+    return [d for deps in (m["choice"]["engine_departures"], m["choice"]["candidates"][0]["departures"]) for d in deps]
+
+
+def _departure_no_test(m):
+    for d in _each_departure(m):
+        if d.get("component") == "B":
+            del d["decision_test"]
+
+
+def _disk_only(m):
+    m["disk"] = lambda spec: spec["uncertainty"]["excluded"].append(
+        {"parameter": "q7", "reason": "added to the file after the sign-off; no signature covers it"})
+
+
+def _merge_test(m):
+    m["dossier"]["inputs"]["unit_attribute:x2"] = _no_data(
+        "the units table's column x2", "x2 has no measurement", "use the default; DT3 covers it with p1", "DT3")
+
+
+def _merge_input(m):
+    m["spec"]["uncertainty"]["excluded"].append({"parameter": "q4", "reason": "q4 is held fixed by name"})
+    m["dossier"]["inputs"]["unit_attribute:q4"] = _no_data(
+        "the units table's column q4", "q4 has no measurement", "hold at the default; DT1 runs the plan across it", "DT1")
+
+
+def _lead(m):
+    m.update(signed_by="lead", signoff_note="lead mode: the harness accepts the drafted spec")
+    for d in _each_departure(m):
+        d["status"] = "unsigned"       # toolkit/engines/benchmark_coverage.py signature(): a lead's signature
+
+
+def _older(m):
+    for fid in ("D-002", "R-001"):
+        _restate(m, fid, status="open")
+    m["scope"] = None
+    m["old"] = {"declared": ["R-001"], "tested": ["D-002"]}
+
+
+PROSE = ["# DEPARTURE (owner decision, fixture): the comparator is the funded plan, not the status quo; DT1 covers it.",
+         "# LIMITATION (owner-visible): the best point of p2 sits near the floor of its range.",
+         "# The values below are drawn from two studies. ASSUMPTION (owner-visible): the two share one sampling frame.",
+         "# The tests of the declared choice are listed under analysis; see the DEPARTURE block above."]
+
+
+def _prose(m):
+    m["comments"] = list(PROSE)
+
+
+def _bad_line(m):
+    whole = json.dumps(m["findings"]["D-002"], sort_keys=True)
+    m["ledger_extra"].append(whole[:len(whole) // 2])       # a row cut off in the middle, as a write that stopped
+
+
+def _odd_status(m):
+    m["findings"]["D-002"]["status"] = "resolved"            # not one of the ledger's STATUSES
+
+
+def _ghost(m):
+    m["scope"]["declarations"].append(_declaration(2, "X-404", "DT1", "Declared by an id that no finding has."))
+
+
+def _no_tests_file(m):
+    m["dt"] = None
+
+
 HM, BOTH, POST = ("history_matching",), METHODS, ("posterior",)
 SIGNED = SPEC_FILES + [JC, DT]
 UNIT_FILES = [JC, "figures/calibration_fit.csv", "figures/calibration_residuals.csv", "figures/calibration_unit_fit.csv"]
@@ -692,7 +957,98 @@ DEFECTS = {
     "series_not_recorded": {
         "case": None, "check": "status", "status": "ok", "methods": POST, "apply": _no_series, "files": [EST],
         "edit": "analysis/estimates.yaml loses data.posterior_predictive, so the method records no fit over time."},
+    # The science register (§5.8, §6): `view` names the view whose check moves (the entries above are the Fit view's).
+    # `follows: False` marks an edit made after the run finished, which no recorded hash follows.
+    "C12_open_high": {
+        "view": "register", "case": "C12", "check": "undisposed", "status": "problem", "methods": BOTH,
+        "apply": _left_open("D-001", blocking=True), "files": [LEDGER], "also": {"decides_unknown": "look"},
+        "edit": "In findings.jsonl the critic's finding D-001 (HIGH) is left with status open and blocking true, its "
+                "last event open, with no decision test and no declaration."},
+    "C12_declared_tested": {
+        "view": "register", "case": "C12", "check": "undisposed", "status": "ok", "methods": BOTH,
+        "apply": _c12_declared, "files": [LEDGER, SCOPE],
+        "edit": "The same finding D-001 (HIGH, blocking) has status declared with decision test DT1, which ran with "
+                "verdict NO_CHANGE, and scope_declaration.yaml declares it by its id with that test."},
+    "test_unlinked": {
+        "view": "register", "case": None, "check": "tests_unlinked", "status": "look", "methods": BOTH,
+        "apply": lambda m: _set_test(m, "DT1", changes=True), "files": [DT], "also": {"undisposed": "look"},
+        "edit": "analysis/decision_tests.yaml records DT1, a test no finding, declaration or dossier entry names, with "
+                "verdict CHANGES_PLAN (25% of units against the 10% threshold)."},
+    "declared_test_not_run": {
+        "view": "register", "case": None, "check": "declared_untested", "status": "problem", "methods": BOTH,
+        "apply": lambda m: _set_test(m, "DT4", ran=False), "files": [DT],
+        "edit": "analysis/decision_tests.yaml records DT4, the test the signed engine departure for benchmark B2 "
+                "names, with status not_run and verdict NOT_RUN."},
+    "declared_no_test": {
+        "view": "register", "case": None, "check": "declared_untested", "status": "look", "methods": BOTH,
+        "apply": _departure_no_test, "files": [CHOICE], "also": {"decides_unknown": "look"},
+        "edit": "In engine_choice.json the signed engine departure for component B loses its decision_test key."},
+    "open_no_test": {
+        "view": "register", "case": None, "check": "decides_unknown", "status": "look", "methods": BOTH,
+        "apply": _left_open("D-002"), "files": [LEDGER], "also": {"undisposed": "look"},
+        "edit": "In findings.jsonl the critic's finding D-002 (MEDIUM, not blocking) is left with status open and no "
+                "decision test."},
+    "process_open": {
+        "view": "register", "case": None, "check": "undisposed", "status": "ok", "methods": BOTH,
+        "apply": _left_open(STALE_ID, blocking=True), "files": [LEDGER],
+        "edit": "In findings.jsonl the finding a harness check raised about a run file (analysis_contract_stale for "
+                "analysis/point.yaml, source rigor-artifacts, HIGH) is left with status open and blocking true."},
+    "declared_only_on_disk": {
+        "view": "register", "case": None, "check": "declared_untested", "status": "ok", "methods": BOTH,
+        "apply": _disk_only, "files": ["decision_spec.yaml"], "follows": False,
+        "edit": "After the sign-off, decision_spec.yaml on disk gains an uncertainty.excluded entry for parameter q7 "
+                "that the signed copy, and the hash in the sign-off record, do not hold."},
+    "merge_shared_test": {
+        "view": "register", "case": None, "check": "undisposed", "status": "ok", "methods": BOTH,
+        "apply": _merge_test, "files": [DOSSIER],
+        "edit": "evidence_dossier.yaml gains a no-data entry unit_attribute:x2 whose decision_test is DT3, the test "
+                "the declared finding R-001 already names."},
+    "merge_excluded_nodata": {
+        "view": "register", "case": None, "check": "declared_untested", "status": "ok", "methods": BOTH,
+        "apply": _merge_input, "files": SPEC_FILES + [DOSSIER],
+        "edit": "The signed spec's uncertainty.excluded gains parameter q4 and evidence_dossier.yaml gains a no-data "
+                "entry unit_attribute:q4 whose decision_test is DT1, which ran with verdict NO_CHANGE."},
+    "signed_by_lead": {
+        "view": "register", "case": None, "check": "undisposed", "status": "look", "methods": BOTH,
+        "apply": _lead, "files": ["decision_spec.signoff.json", CHOICE],
+        "edit": "The spec is signed by lead instead of the owner: decision_spec.signoff.json records signed_by lead, "
+                "and engine_choice.json, as the producer writes it under a lead's signature, marks both engine "
+                "departures unsigned."},
+    "older_layout": {
+        "view": "register", "case": None, "check": "undisposed", "status": "ok", "methods": BOTH,
+        "apply": _older, "files": [LEDGER, SCOPE, OLD_DECLARED, OLD_GATE],
+        "also": {"declared_untested": "look", "decides_unknown": "look"},
+        "edit": "The run has an older layout: findings.jsonl holds D-002 and R-001 as open with no decision test, "
+                "there is no scope_declaration.yaml, declared_findings.yaml lists R-001 as declared and "
+                "final_gate.json lists D-002 under resolved_by_test."},
+    "prose_only": {
+        "view": "register", "case": None, "check": "prose_only", "status": "look", "methods": BOTH,
+        "apply": _prose, "files": SPEC_FILES,
+        "edit": "Both copies of the spec gain four comment lines: one starts a DEPARTURE, one a LIMITATION, one "
+                "starts an ASSUMPTION in the middle of the line, and one only mentions a departure."},
+    # §9, the third fixture: inputs that contradict each other or miss a piece; no check may answer ok or look
+    "findings_bad_line": {
+        "view": "register", "case": "C12", "check": "undisposed", "status": "problem", "methods": BOTH,
+        "apply": _bad_line, "files": [LEDGER],
+        "edit": "findings.jsonl gains a last line that is a row cut off in the middle, which is not valid JSON."},
+    "finding_unknown_status": {
+        "view": "register", "case": "C12", "check": "undisposed", "status": "not_available", "methods": BOTH,
+        "apply": _odd_status, "files": [LEDGER],
+        "edit": "In findings.jsonl finding D-002 has the status resolved, a word the ledger does not write."},
+    "scope_names_no_finding": {
+        "view": "register", "case": "C12", "check": "undisposed", "status": "problem", "methods": BOTH,
+        "apply": _ghost, "files": [SCOPE],
+        "edit": "scope_declaration.yaml gains a declaration whose blocker_id X-404 is the id of no finding in "
+                "findings.jsonl, with decision test DT1."},
+    "decision_tests_missing": {
+        "view": "register", "case": None, "check": "declared_untested", "status": "not_available", "methods": BOTH,
+        "apply": _no_tests_file, "files": [DT],
+        "also": {"tests_unlinked": "not_available", "decides_unknown": "not_available"},
+        "edit": "analysis/decision_tests.yaml is not in the run folder, and the manifest does not list it."},
 }
+
+
+REGISTER_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "register")
 
 
 def touched(defect, method):
@@ -719,6 +1075,36 @@ def _head_commit():
     except (OSError, subprocess.SubprocessError):
         pass
     return "0" * 40          # no git: Run.commit_known cannot ask either, and the Steps check stays ok
+
+
+def _spec_text(spec, comments):
+    """The spec as YAML; comment lines go in front of its `calibration` key, where a stored spec keeps most of them."""
+    text = _yaml(spec)
+    return text.replace("\ncalibration:", "\n" + "\n".join(comments) + "\ncalibration:", 1) if comments else text
+
+
+def _register_files(m):
+    """findings.jsonl as the ledger saves it (open rows first, then by severity and id; keys sorted), the scope
+    declaration, and the two files an older run keeps dispositions in."""
+    rows = sorted(m["findings"].values(), key=lambda f: (f["status"] != "open", SEVERITY_ORDER[f["severity"]], f["id"]))
+    out = {LEDGER: "".join(json.dumps(f, sort_keys=True) + "\n" for f in rows) + "".join(x + "\n" for x in m["ledger_extra"])}
+    if m["scope"] is not None:
+        out[SCOPE] = _yaml(m["scope"])
+    if m["old"]:
+        named = [m["findings"][i] for i in m["old"]["declared"]]
+        why = (f"{len(named)} blocker(s) unresolved, rounds exhausted. Must write scope_declaration.yaml acknowledging "
+               "each blocker by id.")
+        out[OLD_DECLARED] = _yaml({"rule": 3, "rationale": why, "declared": [
+            {k: f[k] for k in ("id", "severity", "source", "claim")} for f in named]})
+        out[OLD_GATE] = json.dumps({
+            "unresolved_high": [], "accept_blockers": [], "structural_mismatch": False, "structural_reviewers": [],
+            "spec_violations": [], "registry_violations": [], "rigor_violations": [], "blocker_attempts": {},
+            "escalation_required": True, "rounds_remaining": 0, "action": "DECLARE_SCOPE", "rule_matched": 3,
+            "rationale": why, "declared": [], "declared_prev": [],
+            "done_when_status": {i: {"passes": True, "detail": "pass manuscript.md exists; pass manuscript.md: found 'limit'",
+                                     "mechanical": True, "frozen_round": 1} for i in m["old"]["tested"]},
+            "resolved_by_test": list(m["old"]["tested"]), "post_write": True}, indent=1)
+    return out
 
 
 def _figures(m):
@@ -763,7 +1149,8 @@ def _render(m, stage):
                             "engine_choice_sha256": None, "inputs": {**{i: sha(i) for i in inputs}, **HARNESS_INPUT},
                             "written_at": _at(minute), "data": data})
 
-    files["decision_spec.yaml"] = _yaml(m["spec"])
+    # as signed; an edit made to the file on disk after the sign-off (m["disk"]) replaces it once every hash is taken
+    files["decision_spec.yaml"] = _spec_text(m["spec"], m["comments"])
     cols = ["unit_id", GROUPING, "name", "pop", "target_r2", "x1"]
     files["data/derived/units.csv"] = _csv(cols, [[u, _group(u), f"unit {u}", 1000 + 150 * i, _r(0.10 + 0.02 * i),
                                                    _r(0.5 + 0.03 * _wobble(i))] for i, u in enumerate(UNITS)])
@@ -778,8 +1165,12 @@ def _render(m, stage):
              for f in m["cal"]["diagnostics"]["fit"]])
     files["decision_brief.signed/decision_spec.yaml"] = files["decision_spec.yaml"]
     files["decision_spec.signoff.json"] = json.dumps(
-        {"signed_by": "owner", "signed_at": _at(50), "note": "fixture sign-off",
+        {"signed_by": m["signed_by"], "signed_at": _at(50), "note": m["signoff_note"],
          "sha256": {"decision_spec.yaml": sha("decision_spec.yaml")}}, indent=1)
+    files[SHEET] = _sheet_text(m, sha("decision_spec.yaml"))
+    files[DOSSIER] = _yaml(m["dossier"])
+    files[CHOICE] = json.dumps(m["choice"], indent=1)
+    files.update(_register_files(m))
     data_in = ["decision_spec.yaml", "data/derived/units.csv", "data/derived/targets.csv"]
     if method == "history_matching":
         artifact(JC, "joint_calibration", "toolkit/analysis/joint_calibration.py", data_in, m["jc"], 100)
@@ -791,7 +1182,8 @@ def _render(m, stage):
     artifact("analysis/point.yaml", "point", "toolkit/analysis/point.py", [CAL],
              {"n_units": len(UNITS), "mix": {"A": 7, "A+B": 5}}, 150)
     artifact(UNC, "uncertainty", "toolkit/analysis/uncertainty.py", ["analysis/point.yaml"], m["unc"], 200)
-    artifact(DT, "decision_tests", "toolkit/analysis/decision_tests.py", ["analysis/point.yaml", UNC], m["dt"], 230)
+    if m["dt"] is not None:
+        artifact(DT, "decision_tests", "toolkit/analysis/decision_tests.py", ["analysis/point.yaml", UNC], m["dt"], 230)
     if "est" in m:
         artifact(EST, "estimates", "toolkit/analysis/estimates.py", [CAL], m["est"], 232)
     files["allocation.csv"] = _csv(["unit_id", "package", "outcome_averted"],
@@ -803,7 +1195,7 @@ def _render(m, stage):
         "deliverables": {"allocation.csv": {"producer": "toolkit/analysis/run.py", "role": "allocation",
                                             "sha256": sha("allocation.csv")}},
         "engine": ENGINE, "engine_choice_sha256": None,
-        "expected": {"decision_tests": {t["test_id"]: t["path"] for t in m["dt"]["tests"]},
+        "expected": {"decision_tests": {t["test_id"]: t["path"] for t in (m["dt"] or {"tests": []})["tests"]},
                      "kinds": [r[9:-5] for r in arts]},
         "finished_at": _at(235), "produced_by": "harness", "reason": "", "settings_sha256": None,
         "spec_sha256": sha("decision_spec.yaml"), "spec_signed": True, "status": "complete", "wall_s": 8100.0}, indent=1)
@@ -826,12 +1218,17 @@ def _render(m, stage):
                                     "output": {"ok": True, "notes": "drafted the decision spec"}}},
         "history": [{"at": _at(t), "from": a, "to": b, "why": "ok", "round": 1, "spent_usd": usd}
                     for a, b, t, usd in hist]}, indent=1)
+    if m["disk"]:
+        disk = copy.deepcopy(m["spec"])
+        m["disk"](disk)
+        files["decision_spec.yaml"] = _spec_text(disk, m["comments"])
     keep = STAGES[:STAGES.index(stage) + 1]
     return {r: t for r, t in files.items() if STAGE_OF["figures/" if r.startswith("figures/") else r] in keep}
 
 
 def build(dir, upto=None, defect=None, method="history_matching"):
-    """Write one fixture run into `dir` (created if missing). Returns {path: sha256} of the files written."""
+    """Write one fixture run into `dir` (created if missing). Returns {path: sha256} of the files written. Each file is
+    written with lib.safe_io.write_nofollow below `dir`: a link at any name under it is refused, never followed."""
     if method not in METHODS:
         raise ValueError(f"unknown method {method!r}; one of {', '.join(METHODS)}")
     stage = "final" if upto is None else upto
@@ -845,11 +1242,9 @@ def build(dir, upto=None, defect=None, method="history_matching"):
             raise ValueError(f"defect {defect} is not defined for method {method}")
         DEFECTS[defect]["apply"](m)
     out = {}
+    os.makedirs(dir, exist_ok=True)
     for rel, text in _render(m, stage).items():
-        path = os.path.join(dir, rel)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+        write_nofollow(dir, rel, text.encode("utf-8"))
         out[rel] = hashlib.sha256(text.encode()).hexdigest()
     return out
 
@@ -875,11 +1270,12 @@ def _headers(dir, shas):
 def _follows(clean_dir, clean, first):
     """`first` plus every file that records a hash of a changed file, found from the clean run's own headers."""
     changed, heads = set(first), _headers(clean_dir, clean)
+    signed = SPEC_FILES[1] in changed       # the spec as signed changed: every file that records its hash follows
     while True:
         more = {r for r, (_, inputs, _) in heads.items()
-                if "decision_spec.yaml" in changed or any(i in changed for i in inputs)}
-        if "decision_spec.yaml" in changed:
-            more.add("decision_spec.signoff.json")
+                if signed or any(i in changed for i in inputs if i != "decision_spec.yaml")}
+        if signed:
+            more |= {"decision_spec.signoff.json", SHEET}
         if any(r.startswith("analysis/") or r == "allocation.csv" for r in changed | more):
             more.add("analysis/manifest.json")
         if more <= changed:
@@ -915,6 +1311,108 @@ def _underived(dir):
     if sorted(sc["flagged"]) != sorted(p["id"] for p in sc["pairs"] if p["flagged"]):
         out.append("survey_changes.flagged does not list the flagged pairs")
     return out
+
+
+def _ledger_words():
+    """(the fields of a ledger row, its status words), read from the producer's source without importing it."""
+    import ast
+    with open(os.path.join(REPO, "agents", "findings_ledger.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    fields = next([s.target.id for s in n.body if isinstance(s, ast.AnnAssign)] for n in tree.body
+                  if isinstance(n, ast.ClassDef) and n.name == "Finding")
+    words = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                 and any(getattr(t, "id", None) == "STATUSES" for t in n.targets))
+    return fields, words
+
+
+def _register_cases(tmp, ok):
+    """The register's files (§6): shaped as the producers write them, and agreeing with each other on the clean run."""
+    fields, words = _ledger_words()
+    for method in METHODS:
+        d = os.path.join(tmp, "clean", method)
+
+        def text(rel, d=d):
+            with open(os.path.join(d, rel), encoding="utf-8") as f:
+                return f.read()
+        rows = [json.loads(line) for line in text(LEDGER).splitlines()]
+        ok(f"X15 {method}: each findings.jsonl row has exactly the ledger's fields and one of its status words",
+           len(rows) == 4 and all(sorted(r) == sorted(fields) and r["status"] in words for r in rows)
+           and all(e["status"] in words for r in rows for e in r["events"]), str([sorted(set(r) ^ set(fields)) for r in rows]))
+        critics = [r for r in rows if r["source"].startswith("critique")]
+        ok(f"X16 {method}: no finding is open; critics' findings and one raised by a harness check are both present",
+           all(r["status"] != "open" for r in rows) and len(critics) == 3
+           and [r["id"] for r in rows if r not in critics] == [STALE_ID]
+           and {r["severity"] for r in critics} == {"HIGH", "MEDIUM"})
+        tests = {t["test_id"]: t for t in yaml.safe_load(text(DT))["data"]["tests"]}
+        ran = {k for k, t in tests.items() if t["status"] == "run"}
+        scope, choice, spec = yaml.safe_load(text(SCOPE)), json.loads(text(CHOICE)), yaml.safe_load(text(SPEC_FILES[1]))
+        dossier = yaml.safe_load(text(DOSSIER))["inputs"]
+        named = ([os.path.basename(e["decision_test"])[:-5] for e in scope["declarations"]]
+                 + [e["decision_test"] for e in choice["engine_departures"]]
+                 + [e["decision_test"] for e in dossier.values() if "no_data" in e]
+                 + [e["decision_test"] for e in (spec["calibration"].get("joint") or {}).get("unmatched", {}).get("declared", [])]
+                 + [os.path.basename(r["decision_test"]["file"])[:-5] for r in rows if r["decision_test"]])
+        verdicts = sorted({t["verdict"] for t in tests.values()})
+        changing = [k for k, t in tests.items() if t["verdict"] == "CHANGES_PLAN"]
+        ok(f"X17 {method}: decision tests of each verdict; every test a declaration names ran; the one plan-changing "
+           f"test is named by a row; the test that did not run is named by none",
+           verdicts == ["CHANGES_PLAN", "NOT_RUN", "NO_CHANGE"] and set(named) <= ran and changing == ["DT9"]
+           and "DT9" in named and len(set(named)) == len(named) - 1, str((verdicts, sorted(set(named) - ran), named)))
+        ids = {r["id"] for r in rows}
+        ok(f"X18 {method}: the scope declaration names a finding the ledger holds as declared with the same test, and "
+           f"each engine departure is signed with the keys the engine choice writes",
+           all(e["blocker_id"] in ids for e in scope["declarations"])
+           and all(r["status"] != "declared" or r["decision_test"]["file"] in [e["decision_test"] for e in scope["declarations"]] for r in rows)
+           and [sorted(e) for e in choice["engine_departures"]] == [
+               sorted(["engine", k, "reason", "decision_test", "status", "benchmark_status", "role", "components"])
+               for k in ("benchmark", "component")] and all(e["status"] == "signed" for e in choice["engine_departures"])
+           and [{k: e[k] for k in s} for e, s in zip(choice["engine_departures"], spec["engine_departures"])] == spec["engine_departures"])
+        sheet = text(SHEET).splitlines()
+        ok(f"X19 {method}: the sign-off sheet marks one row HIGH, names the signed spec's hash, and holds the word "
+           f"HIGH where it marks nothing",
+           sum(line.startswith("- **HIGH**:") for line in sheet) == 1 and sum("HIGH" in line for line in sheet) == 3
+           and hashlib.sha256(text(SPEC_FILES[1]).encode()).hexdigest()[:16] in sheet[2])
+        no_data = [k for k, e in dossier.items() if "no_data" in e]
+        ok(f"X20 {method}: the dossier holds no-data entries and one with observations; the signed spec excludes an "
+           f"input by name{' and declares a calibration miss' if method == 'history_matching' else ''}; no comment line",
+           len(no_data) == 3 and any("observations" in e for e in dossier.values())
+           and spec["uncertainty"]["excluded"][0]["parameter"] == HELD and f"parameter:{HELD}" in no_data
+           and (method != "history_matching" or spec["calibration"]["joint"]["unmatched"]["declared"] == [CAL_DECLARED])
+           and not any(line.lstrip().startswith("#") for line in text(SPEC_FILES[1]).splitlines()))
+
+        def built(name, rel, d=d, method=method):
+            with open(os.path.join(tmp, "defect", method, name, rel), encoding="utf-8") as f:
+                return f.read()
+        signed, disk = built("declared_only_on_disk", SPEC_FILES[1]), built("declared_only_on_disk", SPEC_FILES[0])
+        ok(f"X21 {method}: declared_only_on_disk changes the spec on disk alone; the signed copy and the sign-off "
+           f"record's hash are the clean run's",
+           "q7" in disk and "q7" not in signed and signed == text(SPEC_FILES[1])
+           and built("declared_only_on_disk", "decision_spec.signoff.json") == text("decision_spec.signoff.json"))
+        prose = [line for line in built("prose_only", SPEC_FILES[1]).splitlines() if line.startswith("#")]
+        ok(f"X22 {method}: prose_only puts the same four comment lines in both copies of the spec, which still parse",
+           prose == PROSE and built("prose_only", SPEC_FILES[0]) == built("prose_only", SPEC_FILES[1])
+           and yaml.safe_load(built("prose_only", SPEC_FILES[1])) == spec)
+        last = built("findings_bad_line", LEDGER).splitlines()[-1]
+        try:
+            json.loads(last)
+            parses = True
+        except ValueError:
+            parses = False
+        odd = [json.loads(x)["status"] for x in built("finding_unknown_status", LEDGER).splitlines()]
+        ok(f"X23 {method}: the bad ledger line is not JSON and the four rows before it are; the odd status is not a "
+           f"word the ledger writes",
+           not parses and len(built("findings_bad_line", LEDGER).splitlines()) == 5
+           and [w for w in odd if w not in words] == ["resolved"])
+        old = yaml.safe_load(built("older_layout", OLD_DECLARED))
+        gate = json.loads(built("older_layout", OLD_GATE))
+        ok(f"X24 {method}: the older layout has no scope declaration, and its two files name findings the ledger holds as open",
+           not os.path.exists(os.path.join(tmp, "defect", method, "older_layout", SCOPE))
+           and [e["id"] for e in old["declared"]] == ["R-001"] and gate["resolved_by_test"] == ["D-002"]
+           and {json.loads(x)["id"]: json.loads(x)["status"] for x in built("older_layout", LEDGER).splitlines()}
+           == {"D-001": "fixed", "D-002": "open", "R-001": "open", STALE_ID: "fixed"})
+    ok("X25 seventeen edits name the register as their view, each for both methods; the Fit view's edits name none",
+       len(REGISTER_DEFECTS) == 17 and all(DEFECTS[n]["methods"] == METHODS for n in REGISTER_DEFECTS)
+       and all(s.get("view") in (None, "register") for s in DEFECTS.values()))
 
 
 def _self_test():
@@ -979,7 +1477,8 @@ def _self_test():
                     continue
                 got = build(os.path.join(tmp, "defect", method, name), defect=name, method=method)
                 diff = {r for r in set(got) | set(clean[method]) if got.get(r) != clean[method].get(r)}
-                expect = _follows(d, clean[method], touched(name, method))
+                expect = (_follows(d, clean[method], touched(name, method)) if spec.get("follows", True)
+                          else set(touched(name, method)))
                 ok(f"X8 {method}: {name} changes the files its edit names, the files that hash them, and no others",
                    diff == expect, f"unexpected {sorted(diff - expect)}, missing {sorted(expect - diff)}")
 
@@ -995,7 +1494,7 @@ def _self_test():
            and all(v["runs"] > 1 for v in jc_doc["verification"]["units"].values())
            and all(PRIOR[p][0] < lo and hi < PRIOR[p][1] for p, (lo, hi) in jc_doc["region"]["ranges"].items()))
         ok("X10 every defect entry names its case, check, status, methods and one-sentence edit",
-           all(s["check"] and s["status"] in ("ok", "look", "problem") and s["methods"] and s["edit"].endswith(".")
+           all(s["check"] and s["status"] in ("ok", "look", "problem", "not_available") and s["methods"] and s["edit"].endswith(".")
                and s["edit"].count(". ") == 0 and "case" in s for s in DEFECTS.values()),
            str([n for n, s in DEFECTS.items() if s["edit"].count(". ")]))
         for name in [None] + [n for n, spec in DEFECTS.items() if "history_matching" in spec["methods"]]:
@@ -1010,6 +1509,7 @@ def _self_test():
                share[OFFSET] < 0.01 and all(v == 1.0 for k, v in share.items() if k != OFFSET)
                and comp["no_accepted"] == jc["blocks"][0]["detail"]["failed"] and comp["acceptance_in_region"] < 1.0,
                str((share, comp)))
+        _register_cases(tmp, ok)
         for bad in ({"method": "unknown"}, {"defect": "unknown"}, {"upto": "unknown"},
                     {"defect": "C2_change_flagged", "method": "posterior"}):
             try:
