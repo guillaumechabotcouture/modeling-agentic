@@ -13,8 +13,9 @@ kernels by, the thread settings (OMP/OpenBLAS/MKL), the BLAS libraries loaded an
 MA_COMPUTE_TLS_DIR, as scripts/compute.py; no scheduler: the local host only), and merges into <out.json>: a worker
 seen before keeps its first probe, a new one is added, so workers that join or replace a lost VM are recorded too.
 `--every S` repeats until `--until <file>` exists (a job runs it in the background beside main.py). The file's
-`distinct` block lists each CPU model, VM size, flag set and BLAS seen, so one line answers "one platform or several".
-A probe that fails records its error; nothing here raises past `record` (fail soft: never stops the job).
+`distinct` block lists each CPU model, VM size, flag set and BLAS seen, so one line answers "one platform or several"
+(`one_platform`: null until at least one worker has answered). A probe that fails records its error; nothing here
+raises past `record` (fail soft: never stops the job), and an existing record it cannot read is never overwritten.
 """
 from __future__ import annotations
 
@@ -94,19 +95,40 @@ def _security():
                     require_encryption=True)
 
 
-def _workers(client_factory=None) -> dict:
-    """{worker address: probe}, or {"_error": why}. No scheduler in the environment: {}."""
+RUN_TIMEOUT_S = 120.0       # a broadcast that does not answer in this long is recorded as an error (the loop goes on)
+
+
+def _workers(client_factory=None, timeout_s: float = RUN_TIMEOUT_S) -> dict:
+    """{worker address: probe | {"_error": why}}, or {"_error": why} when the scheduler cannot be asked. No scheduler
+    in the environment: {}. One worker failing keeps the others' answers (on_error="return"); the whole call is
+    bounded by `timeout_s` (a worker that never replies cannot hold the loop)."""
     addr = os.environ.get("MA_COMPUTE_SCHEDULER")
     if not addr and client_factory is None:
         return {}
-    try:
-        if client_factory is None:
-            from distributed import Client
-            client_factory = lambda: Client(addr, timeout="60s", security=_security())  # noqa: E731
-        with client_factory() as c:
-            return dict(c.run(probe))
-    except Exception as e:  # noqa: BLE001 -- recorded; the next round tries again
-        return {"_error": f"{type(e).__name__}: {str(e)[:300]}"}
+    import threading
+    box = {}
+
+    def ask():
+        try:
+            factory = client_factory
+            if factory is None:
+                from distributed import Client
+                factory = lambda: Client(addr, timeout="60s", security=_security())  # noqa: E731
+            try:                       # workers need not have this file: send probe by value, as compute.py does
+                import cloudpickle
+                cloudpickle.register_pickle_by_value(sys.modules[probe.__module__])
+            except Exception:  # noqa: BLE001
+                pass
+            with factory() as c:
+                got = c.run(probe, on_error="return")
+            box["r"] = {a: (p if isinstance(p, dict) else {"_error": f"{type(p).__name__}: {str(p)[:300]}"})
+                        for a, p in dict(got).items()}
+        except Exception as e:  # noqa: BLE001 -- recorded; the next round tries again
+            box["r"] = {"_error": f"{type(e).__name__}: {str(e)[:300]}"}
+    t = threading.Thread(target=ask, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    return box.get("r") or {"_error": f"the workers did not answer within {timeout_s:g} s"}
 
 
 def _key(p: dict) -> dict:
@@ -114,46 +136,76 @@ def _key(p: dict) -> dict:
     return {"cpu_model": (p.get("cpu") or {}).get("model"), "vm_size": (p.get("azure") or {}).get("vm_size"),
             "flags": " ".join((p.get("cpu") or {}).get("flags") or []),
             "blas": " ".join(sorted(f"{b.get('internal_api')}-{b.get('version')}-{b.get('architecture')}"
-                                    f"-t{b.get('num_threads')}" for b in blas)),
+                                    f"-{b.get('threading_layer')}-t{b.get('num_threads')}" for b in blas)),
             "threads_env": " ".join(f"{k}={v}" for k, v in sorted((p.get("threads_env") or {}).items()) if v)}
 
 
 def merge(doc: dict, local: dict, workers: dict) -> dict:
-    """`doc` with the local probe (first kept, latest under `job_host_last`) and new workers added."""
+    """`doc` with the local probe (first kept; each later one that differs kept under `job_host_seen`) and new workers
+    added. A worker is its address and its host, so a replacement VM on a reused address is a new worker. A worker
+    that failed is recorded as an error, not as seen (the next round asks it again). `one_platform` is null (unknown)
+    until a worker has answered or when a compared CPU model is unknown."""
     doc = dict(doc or {})
     doc.setdefault("job_host", local)
     doc["job_host_last"] = local
+    hosts = doc.setdefault("job_host_seen", [doc["job_host"]])
+    if all(_key(h) != _key(local) for h in hosts):
+        hosts.append(local)
     seen = doc.setdefault("workers", {})
     errs = doc.setdefault("errors", [])
+    now = time.strftime("%FT%TZ", time.gmtime())
     for addr, p in (workers or {}).items():
         if addr == "_error":
-            errs.append({"at": time.strftime("%FT%TZ", time.gmtime()), "error": p})
-        elif addr not in seen:
-            seen[addr] = p
-    every = [doc["job_host"]] + list(seen.values())
+            errs.append({"at": now, "error": p})
+        elif "_error" in p:
+            errs.append({"at": now, "worker": addr, "error": p["_error"]})
+        else:
+            k = f"{addr} {p.get('host')}"
+            if k not in seen:
+                seen[k] = p
+    every = list(hosts) + list(seen.values())
     doc["distinct"] = {k: sorted({str(_key(p)[k]) for p in every}) for k in ("cpu_model", "vm_size", "flags",
                                                                               "blas", "threads_env")}
     doc["n_workers_seen"] = len(seen)
-    doc["one_platform"] = all(len(v) == 1 for k, v in doc["distinct"].items() if k != "vm_size") and \
+    same = all(len(v) == 1 for k, v in doc["distinct"].items() if k != "vm_size") and \
         len([v for v in doc["distinct"]["vm_size"] if v != "None"]) <= 1
+    doc["one_platform"] = None if not seen or "None" in doc["distinct"]["cpu_model"] else same
     return doc
 
 
 def record(out: str, client_factory=None, local=None) -> dict:
+    """One round. Never raises: a problem is returned under `error` (and printed by main). An existing record that
+    cannot be read is never overwritten. Rounds on one record are serialised by a lock file."""
+    import fcntl
     try:
-        doc = json.load(open(out))
-    except (OSError, ValueError):
+        lock = open(out + ".lock", "a")
+    except OSError as e:
+        return {"error": f"the record cannot be written: {type(e).__name__}: {e}"}
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
         doc = {"producer": "cloud/platform_probe.py"}
-    try:
-        loc = local if local is not None else probe()
-    except Exception as e:  # noqa: BLE001
-        loc = {"error": f"{type(e).__name__}: {e}"}
-    doc = merge(doc, loc, _workers(client_factory))
-    tmp = out + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(doc, f, indent=1, sort_keys=True)
-    os.replace(tmp, out)
-    return doc
+        if os.path.exists(out):
+            try:
+                doc = json.load(open(out))
+                if not isinstance(doc, dict):
+                    raise ValueError("not a mapping")
+            except (OSError, ValueError) as e:
+                return {"error": f"{out} exists but cannot be read ({type(e).__name__}: {e}); not overwritten"}
+        try:
+            loc = local if local is not None else probe()
+        except Exception as e:  # noqa: BLE001
+            loc = {"error": f"{type(e).__name__}: {e}"}
+        doc = merge(doc, loc, _workers(client_factory))
+        tmp = f"{out}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(doc, f, indent=1, sort_keys=True)
+            os.replace(tmp, out)
+        except OSError as e:
+            return dict(doc, error=f"the record cannot be written: {type(e).__name__}: {e}")
+        return doc
+    finally:
+        lock.close()
 
 
 def main(argv=None) -> int:
@@ -165,11 +217,18 @@ def main(argv=None) -> int:
     r.add_argument("--every", type=float, default=0, help="seconds between rounds (0: one round)")
     r.add_argument("--until", default=None, help="stop once this file exists")
     a = ap.parse_args(argv)
+    import math
+    if not math.isfinite(a.every) or a.every < 0:
+        print(f"--every {a.every}: seconds >= 0", file=sys.stderr)
+        return 2
     while True:
         try:
             d = record(a.out)
-            print(f"platform: {d['n_workers_seen']} worker(s), one platform: {d['one_platform']}, "
-                  f"cpu {d['distinct']['cpu_model']}", flush=True)
+            if "error" in d:
+                print(f"platform probe: {d['error']}", flush=True)
+            if "distinct" in d:
+                print(f"platform: {d['n_workers_seen']} worker(s), one platform: {d['one_platform']}, "
+                      f"cpu {d['distinct']['cpu_model']}", flush=True)
         except Exception as e:  # noqa: BLE001 -- fail soft: never stop the job
             print(f"platform probe failed: {type(e).__name__}: {e}", flush=True)
         if not a.every or (a.until and os.path.exists(a.until)):
@@ -219,14 +278,14 @@ def _self_test() -> int:
             def __exit__(self, *a):
                 return False
 
-            def run(self, fn):
+            def run(self, fn, **kw):
                 return self.table
         out = os.path.join(d, "platform.json")
         d1 = record(out, lambda: FakeClient({"tls://a": w("Xeon 8370C", "Standard_E8s_v5")}), local=loc)
         ok(d1["n_workers_seen"] == 1 and d1["one_platform"] is True, f"PP4 one worker on the job's platform: {d1['distinct']}")
         d2 = record(out, lambda: FakeClient({"tls://a": w("other", "x"), "tls://b": w("AMD EPYC 7763", "Standard_E8as_v5")}),
                     local=loc)
-        ok(d2["n_workers_seen"] == 2 and d2["workers"]["tls://a"]["cpu"]["model"] == "Xeon 8370C"
+        ok(d2["n_workers_seen"] == 2 and d2["workers"]["tls://a None"]["cpu"]["model"] == "Xeon 8370C"
            and d2["one_platform"] is False and "AMD EPYC 7763" in d2["distinct"]["cpu_model"],
            f"PP5 a later round adds a new worker, keeps a seen worker's first probe, and flags two platforms: "
            f"{d2['distinct']}")
@@ -248,8 +307,65 @@ def _self_test() -> int:
                 os.environ["MA_COMPUTE_SCHEDULER"] = env0
         until = os.path.join(d, "stop")
         open(until, "w").close()
-        ok(main(["record", os.path.join(d, "p3.json"), "--every", "1", "--until", until]) == 0
-           and os.path.exists(os.path.join(d, "p3.json")), "PP9 `record --every --until` stops once the file exists")
+        env0 = os.environ.pop("MA_COMPUTE_SCHEDULER", None)       # Codex P2: the self-test never reaches a live one
+        try:
+            ok(main(["record", os.path.join(d, "p3.json"), "--every", "1", "--until", until]) == 0
+               and os.path.exists(os.path.join(d, "p3.json")), "PP9 `record --every --until` stops once the file exists")
+        finally:
+            if env0 is not None:
+                os.environ["MA_COMPUTE_SCHEDULER"] = env0
+
+        # Codex review of #274 (P1s), each a case:
+        class Partial(FakeClient):
+            def run(self, fn, **kw):
+                return {"tls://a": w("Xeon 8370C", "Standard_E8s_v5"), "tls://b": OSError("worker gone")} \
+                    if kw.get("on_error") == "return" else (_ for _ in ()).throw(OSError("worker gone"))
+        d10 = record(os.path.join(d, "p10.json"), lambda: Partial({}), local=loc)
+        ok("tls://a" in str(d10["workers"]) and d10["n_workers_seen"] == 1 and d10["errors"],
+           f"PP10 one worker failing the broadcast keeps the others' probes and records its error: {d10['workers'].keys()}")
+        p11 = os.path.join(d, "p11.json")
+        open(p11, "w").write("{not json")
+        d11 = record(p11, lambda: FakeClient({"tls://a": w("Xeon 8370C", "Standard_E8s_v5")}), local=loc)
+        ok(open(p11).read() == "{not json" and "error" in d11,
+           f"PP11 an existing record that cannot be read is never overwritten: {d11.get('error')}")
+        d12 = record(os.path.join(d, "missing_dir", "p.json"), lambda: FakeClient({}), local=loc)
+        ok("error" in d12, f"PP12 an output that cannot be written is reported, not raised: {d12.get('error')}")
+
+        class Hang(FakeClient):
+            def run(self, fn, **kw):
+                time.sleep(5)
+                return {}
+        t0 = time.time()
+        d13 = _workers(lambda: Hang({}), timeout_s=0.5)
+        ok(time.time() - t0 < 3 and "_error" in d13, f"PP13 a broadcast that never returns is bounded: {d13}")
+        p14 = os.path.join(d, "p14.json")
+        record(p14, lambda: FakeClient({"tls://a": w("Xeon 8370C", "Standard_E8s_v5")}), local=loc)
+        r2 = dict(w("AMD EPYC 7763", "Standard_E8as_v5"), host="other-host")
+        d14 = record(p14, lambda: FakeClient({"tls://a": r2}), local=loc)
+        ok(d14["n_workers_seen"] == 2 and d14["one_platform"] is False,
+           f"PP14 a replacement worker on a reused address is a new worker: {d14['distinct']['cpu_model']}")
+        p15 = os.path.join(d, "p15.json")
+        record(p15, lambda: FakeClient({"tls://a": w("Xeon 8370C", "Standard_E8s_v5")}), local=loc)
+        d15 = record(p15, lambda: FakeClient({}), local=w("AMD EPYC 7763", "Standard_E8s_v5"))
+        ok(d15["one_platform"] is False and "AMD EPYC 7763" in d15["distinct"]["cpu_model"],
+           f"PP15 a later local probe on another CPU counts: {d15['distinct']['cpu_model']}")
+        pth = w("Xeon 8370C", "Standard_E8s_v5")
+        omp = w("Xeon 8370C", "Standard_E8s_v5")
+        pth["blas"][0]["threading_layer"], omp["blas"][0]["threading_layer"] = "pthreads", "openmp"
+        d16 = record(os.path.join(d, "p16.json"), lambda: FakeClient({"tls://a": pth, "tls://b": omp}), local=pth)
+        ok(d16["one_platform"] is False, f"PP16 BLAS builds differing in threading layer differ: {d16['distinct']['blas']}")
+        d17 = record(os.path.join(d, "p17.json"), boom, local=loc)
+        ok(d17["one_platform"] is None and d17["n_workers_seen"] == 0,
+           f"PP17 no worker seen: one platform is unknown (null), not true: {d17['one_platform']}")
+        import threading
+        p18 = os.path.join(d, "p18.json")
+        th = [threading.Thread(target=record, args=(p18, (lambda i=i: FakeClient({f"tls://{i}": w("Xeon 8370C", "Standard_E8s_v5")})),
+                                                    loc)) for i in range(6)]
+        [t.start() for t in th]
+        [t.join() for t in th]
+        ok(json.load(open(p18))["n_workers_seen"] == 6, "PP18 overlapping rounds on one record lose no worker")
+        ok(main(["record", os.path.join(d, "p19.json"), "--every", "nan"]) == 2,
+           "PP19 a negative or non-finite --every is refused")
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1
