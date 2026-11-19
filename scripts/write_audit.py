@@ -337,7 +337,7 @@ REVIEWED: dict = {
     "toolkit/engines/malaria/benchmarks/guess_sensitivity.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/benchmarks/net_effect_fit.py": {"open-write": (2, _REPO + " (net_effect_fit.yaml or a smoke's --out; a copy under the job's JOB_OUT)")},
     "toolkit/engines/malaria/benchmarks/render_notes.py": {"open-write": (1, _REPO)},
-    "toolkit/engines/malaria/benchmarks/restamp_proof.py": {"open-write": (3, _REPO)},
+    "toolkit/engines/malaria/benchmarks/restamp_proof.py": {"open-write": (4, _REPO + " (restamp_proof.yaml and the evidence files; a copy of the proof under the job's JOB_OUT)")},
     "toolkit/engines/malaria/benchmarks/runtime.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/engine.py": {"open-write": (1, _REPO + " (write_card)")},
     "tools/run_console/run_console.py": {"open-write": (2, "the console's temporary answers file (mkstemp)"),
