@@ -1,6 +1,6 @@
 ---
 phase: "F6"
-commit: "OA refit b α–β"
+commit: "OA refit b α–γ"
 ---
 
 ## Changelog
@@ -10,4 +10,4 @@ commit: "OA refit b α–β"
 - the wave-2 box is pinned to that box;
 - a call that runs Muleba still runs the monitored arms.
 
-`--margin-loo` is refused (owner). An optional extension wave (`extension`: an LHS past a parameter's old ceiling) is wired, and stays unset until the owner sets the ceiling. `plan` prices only the new tasks: 1,232 arm runs without the extension, about $9–12 on 48 vCPUs. The launch ships the tree plus the checkpoint (`vm_job --dir`) and resumes from it. Job f6-refit-optiona-b, cap $100. Self-tests FB1–FB6; F4, F10, FA1, FA3, FA4, FA10–FA12 updated.
+`--margin-loo` is refused (owner). An optional extension wave (`extension`: an LHS past a parameter's old ceiling) is wired, and stays unset until the owner sets the ceiling. `plan` prices only the new tasks: 1,344 arm runs without the extension (the monitored arm counted), about $9–13 on 48 vCPUs. The launch ships the tree plus the checkpoint (`vm_job --dir`) and resumes from it. Job f6-refit-optiona-b, cap $100. Self-tests FB1–FB6; F4, F10, FA1, FA3, FA4, FA10–FA12 updated.

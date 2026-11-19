@@ -284,7 +284,8 @@ class RecalRunner(BM.Runner):
     def prefetch(self, arms, fitted_list):
         # refit b: a call that runs a monitored target's setting runs its arms too, so a task holds the same arms as
         # the 18 Nov run's (all 12 targets) and the stored checkpoint matches; sorted, as every caller passes them
-        mon = {a for t in OPTION_A.get("monitor") or [] for a in BM._arms_of(self._decl[t]["estimand"])}
+        mon = {a for t in (OPTION_A.get("monitor") or [] if OPTION_A.get("refit_b") else [])   # refit b only
+               for a in BM._arms_of(self._decl[t]["estimand"])}
         sets = {self._p["arms"][a]["setting"] for a in arms}
         add = {a for a in mon if self._p["arms"][a]["setting"] in sets}
         arms = sorted(set(arms) | add) if add - set(arms) else arms
@@ -503,6 +504,9 @@ def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPU
     fj, byid = pack["fit_joint"], {b["id"]: b for b in pack["benchmarks"]}
     arms = sorted({a for t in fj["targets"] for a in BM._arms_of(byid[t]["estimand"])})
     settings = _fit_settings(pack)
+    if rb:      # the monitored arms run with their setting (RecalRunner.prefetch), so they are priced too
+        arms = sorted(set(arms) | {a for t in OPTION_A.get("monitor") or [] for a in BM._arms_of(byid[t]["estimand"])
+                                   if pack["arms"][a]["setting"] in settings})
     per_set = max(sum(1 for a in arms if pack["arms"][a]["setting"] == s) for s in settings)
     cached = int(WAVE2["n"]) if verify_round else 0    # a verification round reads wave 2's points from its cache
     wave2_n, wave1_n, cal_n = (0, 0, 0) if verify_round else (wave2_n, wave1_n, cal_n)
@@ -751,7 +755,10 @@ def fit_waves(pack: dict, runner, wave1: dict, box2: dict, n: int = WAVE2["n"], 
            for u in BM.lhs(int(n), d, int(seed))] + [dict(x) for x in (extra or [])]     # refit b: the extension
     arms = sorted({a for t in targets for a in BM._arms_of(byid[t]["estimand"])})
     t0 = time.time()
-    runner.prefetch(arms, new)
+    k_ext = len(extra or [])        # refit b: the stored wave-2 batch alone (its tasks as ran), then the extension
+    runner.prefetch(arms, new[:len(new) - k_ext])
+    if k_ext:
+        runner.prefetch(arms, new[len(new) - k_ext:])
     print(f"wave 2: {len(new)} design points x {len(arms)} arms x {len(runner.seeds)} seeds in {time.time() - t0:.0f}s"
           f" (wave 1: {len(wave1['points'])} points reused)", flush=True)
     Y2 = {t: [float(runner.evaluate(byid[t], th)["computed"]) for th in new] for t in targets}
