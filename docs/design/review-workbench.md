@@ -792,6 +792,13 @@ The questions as they were put:
   Candidate checks not yet specified: targets matched by an equal number of free parameters
   (FLU: five targets, five free ratios, so they do not test fit); best point far from the
   posterior median along a ridge (DEN).
+- 2026-11-19, loop iteration 2, step 4: register view built by a fresh agent (derivation, six
+  checks, the review-notes endpoint and page control). Self-tests pass (register 56 cases);
+  acceptance passes on R4, F5 and FLU with no entry changed. First CI run failed two repo-wide
+  audits (writes through `lib.safe_io`; guarded dynamic imports); the workbench now complies
+  as the audits stand (a static view registry, safe writes), with no edit under `scripts/`,
+  which is inside the code fingerprint. Still to do for G3: the lead's read of the screenshots,
+  an external review of the register and notes endpoint, the planted-defect walkthrough.
 - 2026-11-18, loop iteration 2, steps 2 and 3: register fixtures (17 defects, four of them
   contradictions or missing pieces) and 56 failing cases written by a fresh agent, who checked
   them against a scratch derivation and 22 mutants. Acceptance re-derived under the corrected
