@@ -677,6 +677,15 @@ def _restamp(eng: dict, repo: str) -> dict:
     rs = doc.get("restamped")
     base = {"available": True, "file": rel, "sha256": sha, "new_version": ident.get("version") or doc.get("engine_version"),
             "code_sha256": ident.get("code_sha256")}
+    # a merged file (benchmark.merge_results) keeps each input's re-stamp record under merged_from: name the rows a
+    # proof re-stamped apart from the rows recomputed (Codex review of #276)
+    groups = [g for g in _l(doc.get("merged_from")) if isinstance(g, dict)]
+    if not isinstance(rs, dict) and any(isinstance(g.get("restamped"), dict) for g in groups):
+        rs = next(g["restamped"] for g in groups if isinstance(g.get("restamped"), dict))
+        base.update(restamped_rows=[str(i) for g in groups if isinstance(g.get("restamped"), dict)
+                                    for i in _l(g.get("rows"))],
+                    recomputed_rows=[str(i) for g in groups if not isinstance(g.get("restamped"), dict)
+                                     for i in _l(g.get("rows"))])
     if not isinstance(rs, dict):
         return {**base, "state": "recomputed", "by": doc.get("producer"), "validate_once": "not needed"}
     conf = _m(rs.get("confirmation"))
