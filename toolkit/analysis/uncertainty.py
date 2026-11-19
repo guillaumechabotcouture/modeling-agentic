@@ -129,12 +129,13 @@ def chosen_point(post: dict, names) -> dict:
                                    f"(joint_region.verified.chosen.point: {pt!r})")
     # run() writes the chosen point from its fit's parameter values: they must be the same numbers (Codex r1 P1-4, r2)
     fp = doc.get("parameters") if isinstance(doc.get("parameters"), dict) else {}
-    off = [k for k in names if not isinstance(fp.get(k), dict) or isinstance(fp[k].get("value"), bool)
-           or not isinstance(fp[k].get("value"), (int, float)) or not float(fp[k]["value"]) == float(pt[k])]
+    off = sorted(set(fp) - set(names)) + [      # a recorded parameter the sample lacks (Codex r3), or another value
+        k for k in names if not isinstance(fp.get(k), dict) or isinstance(fp[k].get("value"), bool)
+        or not isinstance(fp[k].get("value"), (int, float)) or not float(fp[k]["value"]) == float(pt[k])]
     if off:
         raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: the chosen point of {off} is not the fit's "
                                    f"recorded parameter values (parameters: {[fp.get(k) for k in off]}; chosen point: "
-                                   f"{[pt[k] for k in off]})")
+                                   f"{[pt.get(k) for k in off]})")
     return {k: float(pt[k]) for k in names}
 
 
@@ -152,7 +153,9 @@ def posterior_point(spec, ne: dict | None, theta: dict) -> dict:
                          "engine at its default values, not at the posterior's chosen point; not supported")
     from toolkit.spec import engine_parameters as PV
     sv = PV.values(spec)
-    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv and abs(sv[k] - v) > POINT_TOL * (1 + 1e-6)}
+    # the float subtraction's own error (a few ulps at the values' magnitude) is not a difference (Codex r2-r3)
+    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv
+           and abs(sv[k] - v) > POINT_TOL + 4 * float(np.spacing(max(abs(sv[k]), abs(v))))}
     if bad:
         raise ValueError("engine_parameters: " + "; ".join(
             f"{k} is set to {a}, but the net-effect posterior's verified chosen point is {b}; the chosen point is the "

@@ -1938,12 +1938,24 @@ def _self_test_posterior_point(ok):
            f"RPP13 a spec value exactly 1e-6 from the chosen point is accepted (float subtraction): {str(a13)[:120]}")
     # Codex r1 P1-1: the likelihood and posterior calibrations build engine parameters without theta0, so they could
     # not run at the chosen point: refused with a posterior rather than run at engine defaults
+    got11 = {}
+    for meth in ("likelihood", "posterior"):
+        with tempfile.TemporaryDirectory() as d:
+            s11 = setup(d)
+            s11.raw["calibration"]["method"] = meth
+            got11[meth] = both(s11)
+    ok(all(isinstance(x, str) and "calibration.method" in x for v in got11.values() for x in v),
+       f"RPP11 a posterior with a likelihood or posterior calibration is refused: "
+       f"{ {k: str(v[0])[:80] for k, v in got11.items()} }")
+    # Codex r3: a recorded parameter the sample does not hold is refused; the 1e-6 tolerance is not widened
     with tempfile.TemporaryDirectory() as d:
-        s11 = setup(d)
-        s11.raw["calibration"]["method"] = "likelihood"
-        a11, j11 = both(s11)
-        ok(all(isinstance(x, str) and "calibration.method" in x for x in (a11, j11)),
-           f"RPP11 a posterior with a likelihood calibration is refused: {str(a11)[:140]}")
+        a14, _ = edited(d, lambda doc: doc["parameters"].update(synergy={"value": 0.19}))
+        ok(isinstance(a14, str) and "synergy" in a14,
+           f"RPP14 a fit recording a parameter its sample and chosen point do not hold is refused: {str(a14)[:160]}")
+    with tempfile.TemporaryDirectory() as d:
+        a15, _ = both(setup(d, spec_value=0.0500010000005))
+        ok(isinstance(a15, str) and "chosen point" in a15,
+           f"RPP15 a spec value more than 1e-6 from the chosen point is refused: {str(a15)[:120]}")
 
 
 def _self_test_test_ranges(ok, q):
