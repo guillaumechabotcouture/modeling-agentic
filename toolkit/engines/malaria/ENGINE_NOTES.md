@@ -154,7 +154,7 @@ The refit-b row is the owner's choice (option a). The refit adds 100 extension p
 `priors.yaml` keeps 0–1.895, because its test (engine.py NE2) is inside the engine's code fingerprint. Editing it would
 change the code identity and forfeit the stored checkpoint of the 18 Nov fit.
 
-The fit output records whether the chosen value sits within 2% of 2.23 (`waves.refit_b.edge`). If it does, the engine
+The fit output records whether the chosen value sits within 2% of 2.23 (`waves.refit_b.edge`). If it does and a LLINEUP target (B9d–B9f) misses at the chosen point, the engine
 cannot reproduce LLINEUP's waning inside the widened prior, and the report says so.
 
 ## v0.17 scope: the net-type relative effects as parameters with ranges (owner, 2026-11-12 and 13; written before any fit)

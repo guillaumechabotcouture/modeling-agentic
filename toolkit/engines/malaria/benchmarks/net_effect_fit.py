@@ -845,14 +845,22 @@ def extension_points(design_box: dict, ext: dict | None) -> list:
             for u in BM.lhs(int(ext["n"]), len(names), int(ext["seed"]))]
 
 
-def edge_diagnostic(point: dict) -> dict:
-    """Owner, 19 Nov: whether the chosen pbo_adv_decay sits within 2% of the refit-b ceiling; if so, the engine cannot
-    reproduce LLINEUP's waning inside the widened prior, and the report says so."""
+def edge_diagnostic(point: dict, verification: dict | None = None) -> dict:
+    """Owner, 19 Nov: whether the chosen pbo_adv_decay sits within 2% of the refit-b ceiling. Within 2% and a LLINEUP
+    target (B9d-B9f) out of band at the chosen point: the engine cannot reproduce LLINEUP's waning inside the widened
+    prior. Within 2% and all three in band: it reproduces it only at the prior's edge (Codex review of #285)."""
     v, c = float(point[PAD_CEILING["param"]]), float(PAD_CEILING["hi"])
     near = v >= c * 0.98
-    line = (f"pbo_adv_decay {v:.3f} is within 2% of its ceiling {c:g}: the engine cannot reproduce LLINEUP's waning "
-            f"inside the widened prior" if near else f"pbo_adv_decay {v:.3f} is below 98% of its ceiling {c:g}")
-    return {"value": v, "ceiling": c, "within_2pct": near, "line": line}
+    missed = [t for t in ("B9d", "B9e", "B9f") if not ((verification or {}).get(t) or {}).get("in_band", False)]
+    if not near:
+        line = f"pbo_adv_decay {v:.3f} is below 98% of its ceiling {c:g}"
+    elif missed:
+        line = (f"pbo_adv_decay {v:.3f} is within 2% of its ceiling {c:g} and {', '.join(missed)} miss at the chosen "
+                f"point: the engine cannot reproduce LLINEUP's waning inside the widened prior")
+    else:
+        line = (f"pbo_adv_decay {v:.3f} is within 2% of its ceiling {c:g}: the engine reproduces LLINEUP's waning only "
+                f"at the edge of the widened prior")
+    return {"value": v, "ceiling": c, "within_2pct": near, "llineup_missed": missed, "line": line}
 
 
 def calibration_ok(cal: dict) -> list:
@@ -1379,7 +1387,8 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
     waves["refit_b"] = ({"cache_sha256": OPTION_A["refit_b"]["cache_sha256"], "wave2_box": "the design box (pinned)",
                          "extension": ext, "extension_points": len(extra), "margin_loo": margin_loo,
                          "departure": OPTION_A.get("departure"), "monitored": mon,
-                         "pad_ceiling": PAD_CEILING, "edge": edge_diagnostic(best)} if rb else None)
+                         "pad_ceiling": PAD_CEILING, "edge": edge_diagnostic(best, fit["verification"])}
+                        if rb else None)
     doc = document(eng, reg, q, smoke, approved=approved, cap_usd=cap_usd, n_sims=runner.nsims, waves=waves,
                    wall_s=round(time.time() - t0, 1), fitted_at=time.strftime("%F %T"),
                    calibration_grid={CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
@@ -2524,10 +2533,16 @@ def _self_test() -> int:
 
     def fb8():
         # owner, 19 Nov: a one-line diagnostic: does the chosen pbo_adv_decay sit within 2% of the new ceiling
-        near, far = edge_diagnostic({"pbo_adv_decay": 2.20}), edge_diagnostic({"pbo_adv_decay": 1.60})
-        ok(near["within_2pct"] is True and far["within_2pct"] is False and near["ceiling"] == 2.23
-           and "cannot reproduce LLINEUP's waning" in near["line"] and "cannot" not in far["line"],
-           f"FB8 the edge diagnostic: {near['line']} | {far['line']}")
+        # (Codex review of #285: "cannot reproduce" only when a LLINEUP target also misses at the chosen point)
+        miss = {"B9d": {"in_band": True}, "B9e": {"in_band": False}, "B9f": {"in_band": True}}
+        hit = {t: {"in_band": True} for t in ("B9d", "B9e", "B9f")}
+        near_miss = edge_diagnostic({"pbo_adv_decay": 2.20}, miss)
+        near_hit = edge_diagnostic({"pbo_adv_decay": 2.20}, hit)
+        far = edge_diagnostic({"pbo_adv_decay": 1.60}, miss)
+        ok(near_miss["within_2pct"] is True and far["within_2pct"] is False and near_miss["ceiling"] == 2.23
+           and "cannot reproduce LLINEUP's waning" in near_miss["line"] and "B9e" in near_miss["line"]
+           and "cannot" not in near_hit["line"] and "edge" in near_hit["line"] and "cannot" not in far["line"],
+           f"FB8 the edge diagnostic: {near_miss['line']} | {near_hit['line']} | {far['line']}")
     case("FB8", fb8)
     OPTION_A["cap_usd"] = shipped_cap
     if fails:

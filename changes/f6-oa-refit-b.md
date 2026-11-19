@@ -1,6 +1,6 @@
 ---
 phase: "F6"
-commit: "OA refit b α–δ"
+commit: "OA refit b α–ε"
 ---
 
 ## Changelog
