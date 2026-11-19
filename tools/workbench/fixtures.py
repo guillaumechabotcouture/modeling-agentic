@@ -61,6 +61,18 @@ the same question for the cross-run comparison: `second` differs in one spec key
 follows from it; the rest are the runs the planted comparisons are read against (DEFECTS entries with `against`).
 Not the producers' shape, and said here: analysis/emulator.yaml records the spec and the units table as its inputs
 (a stored run records its batch files, which the fixture does not write).
+It also holds every file the Spec and evidence view (§5.3) and the Scenarios view (§5.6) read, shaped as the producers
+write them: a signed spec that names who decides, a decision date and a delivery period the producer's own rule accepts
+(toolkit/spec/spec_critique.py), no outcome adjustment (each is a variant: _adjust), one engine parameter value whose
+source the spec itself marks, and the dossier it names; evidence_dossier.yaml, whose observations record the optional `follow_up_years` the producer reads
+and a `checked` mark (no producer writes that mark today: gap H2; the key is the fixture's, and said so in _obs); the
+sign-off sheet with every section toolkit/spec/signoff.py writes for any spec, its spec critique and its last line of
+source hashes; two archived sign-offs under evidence_planner/superseded_signoff_<date>/; analysis/batch.yaml;
+analysis/figure_data.yaml with the stored schedule (toolkit/analysis/figure_data.py; no arm, no `charged`) and
+figures/timeline.csv; analysis/trajectories.yaml with its producer's own header, which has no spec hash and which the
+manifest does not list (toolkit/analysis/trajectories.py), and the dynamics checks where the producer stores them, on
+the trajectories figure's entry in analysis/figures.yaml (toolkit/analysis/figures.py trajectory_checks). The estimates
+kind has no schedule, batch or trajectory record. A run stopped before the outcome batch is `upto="calibration"`.
 The clean run holds no analysis/benchmarks_at_spec_values.yaml: that file has no artifact header and sits outside the
 manifest (gap H13), which the Steps view raises; variant spec_benchmarks_recomputed adds it with its record file.
 
@@ -191,6 +203,30 @@ EST_VERDICTS = ("yes", "no", "undetermined")           # toolkit/analysis/estima
 OTHERS = ("twin", "second", "shifted", "shifted_same_spec", "headline", "other_question", "unverified")
 STAGE_OF.update({STAB: "analysis", VOI: "analysis", PV: "analysis", BV: "analysis", EMU: "calibration", EMB: "analysis",
                  BURDEN_CSV: "launch"})
+# What the Spec and evidence view (§5.3) and the Scenarios view (§5.6) read beside those, and the producers' own words
+# (X53 holds each to the producer's source).
+FD, BATCH, TRAJ, SETTINGS = "analysis/figure_data.yaml", "analysis/batch.yaml", "analysis/trajectories.yaml", "analysis_settings.yaml"
+SIGNOFF, TIMELINE = "decision_spec.signoff.json", "figures/timeline.csv"
+ARCHIVE = "evidence_planner/superseded_signoff_"        # tools/run_console/dossier.py ARCHIVE_DIR and ARCHIVE_PREFIX
+WINDOW, DELIVERY, SIM_START = [2026.0, 2029.0], [2026.0, 2028.0], 2024.0
+EVENT_KINDS = ("history", "decision", "routine")       # toolkit/engines/hooks.py KINDS
+DYNAMICS_STATUSES = ("pass", "flag", "info")           # toolkit/analysis/figures.py trajectory_checks
+MARKS = ("fetched", "matched", "unverified")           # toolkit/engines/contract.py: a parameter source's `verified`
+HOOKS_CONTRACT = "figures-hooks/1"                     # toolkit/engines/hooks.py
+SELECTION = "purposive: per region, the units at the lowest, median and highest comparator burden"
+# The sections toolkit/spec/signoff.py sheet() writes for every spec, in its order; and those it writes only for a spec
+# that has the thing (outcome adjustments, a burden reference file, candidate engines).
+SHEET_ALWAYS = ("## Spec critique (decision design principles, before signing)", "## Engine defaults accepted by name",
+                "## Staged inputs and columns not used", "## Derivations", "## Input geometry check",
+                "## Engine parameter values set by the spec", "## Evidence dossier (inputs that drive an option's effect)")
+SHEET_SOME = ("## Base outcome adjustments", "## Burden validation references", "## Candidate engines (pre-sign check)")
+SHEET_SOURCES = "<!-- signoff-sheet-sources: "
+DIFFERS = "Inputs whose chosen value or range differs from what execution will use"
+OA = {"id": "OA1", "component": "C", "reference": "B", "value": 0.8, "source": "fixture study four, table 2"}
+FOLLOW_UP, CHECKED = "follow_up_years", "checked"      # the dossier observation's optional field the producer reads
+#                                                        (toolkit/spec/spec_critique.py), and the mark gap H2 asks for
+EARLIER = ("2025-12-30", "2025-12-31")                 # the archived sign-offs, oldest first
+STAGE_OF.update({FD: "analysis", BATCH: "analysis", TRAJ: "analysis", SETTINGS: "launch"})
 
 
 def stage_of(rel):
@@ -200,6 +236,8 @@ def stage_of(rel):
         return "calibration" if rel.startswith("figures/calibration_") and rel.endswith(".csv") else "analysis"
     if rel.startswith(TESTS_DIR):
         return "analysis"
+    if rel.startswith(ARCHIVE):
+        return "sign-off"
     return STAGE_OF[rel]
 
 
@@ -238,17 +276,23 @@ def _at(minute):
 def _spec(method):
     items = [{"id": f"price_{c}", "component": c, "value": v, "price_year": "2025", "price_rule": "as_published",
               "basis": "per_person", "includes": [f"supply of {c}"]} for c, v in PRICE.items()]
+    # The decision is dated on the day the delivery period starts, which is the day it is signed (_at): the producer's
+    # rule (toolkit/spec/spec_critique.py _decision_date) flags a delivery period that starts before either.
     spec = {"schema_version": 1, "question": "Which package should each unit get? (synthetic fixture)",
-            "decision_date": "2026-06-01", "engine": "auto",
+            "decision_maker": "programme lead (synthetic fixture)",
+            "decision_date": "2026-01-01", "engine": "auto",
             "engine_parameters": {"p2": {"value": 3.1, "units": "ratio", "source": "the owner's range",
                                          "reason": "no measurement", "basis": "owner_judgement", "range": [1.0, 5.5],
-                                         "dist": "uniform"}},
-            "decision_units": {"csv": "data/derived/units.csv", "id": "unit_id", "label": "name", "region": GROUPING},
+                                         "dist": "uniform", "verified": "matched"}},
+            "horizon": {"start": SIM_START, "stop": WINDOW[1]},
+            "decision_units": {"csv": "data/derived/units.csv", "id": "unit_id", "label": "name", "region": GROUPING,
+                               "engine_attributes": {"x1": {"column": "x1"}}},
             "options": {"populations": {"total": "pop"},
                         "components": {"A": {}, "B": {"group": TIER}, "C": {"group": TIER}}, "packages": {"generate": True},
                         "engine_map": {"A": {"A": 1}, "B": {"B": 0.5}, "C": {"B": 1}},
                         "prices": {"base_year": 2025}, "cost_items": items},
-            "objective": {"outcome": OUTCOME, "sense": "avert", "horizon": [2026.0, 2029.0], "discounting": "none"},
+            "objective": {"outcome": OUTCOME, "sense": "avert", "horizon": list(WINDOW), "delivery": list(DELIVERY),
+                          "discounting": "none"},
             "constraints": {"envelope_usd": ENVELOPE},
             "comparator": {"package": "A", "text": "every unit keeps component A alone"},
             "outcomes_reported": [OUTCOME],
@@ -262,6 +306,7 @@ def _spec(method):
                                              "values": [1.6, 4.4], "text": "Does the plan change across p2's range?"},
                                             *_spec_tests(method)]},
             "validation": {"burden": {"csv": BURDEN_CSV, "group": GROUPING, "arm": "comparator", "window": [2026.0, 2027.0]}},
+            "evidence": {"dossier": DOSSIER},
             "deliverable": {"kind": "package_per_unit", "allocation_file": "allocation.csv",
                             "columns": {"unit": "unit_id", "package": "package", "value": "outcome_averted"},
                             "headline": {"name": HEADLINE, "outcome": OUTCOME}}}
@@ -665,7 +710,7 @@ def _point(plan, envelope, scale):
             "cost_allocated": cost, "units_on_comparator": list(plan.values()).count("A"), "budget_allocatable": envelope,
             "discount_factor": 1.0, "cost_per_outcome_averted": _r(cost / total), "plan": dict(plan), "n_units": len(plan),
             "solver": {"status": "optimal", "method": "ilp", "objective": total, "cost": cost},
-            "per_unit": per,
+            "engine_identity": _identity(), "per_unit": per,
             "reserve": {"rule": rule, "outcome": OUTCOME, "fraction": RESERVE_SHARE, "budget_allocatable": envelope,
                         "budget_planned": RESERVE_SHARE * envelope, "reserve_usd": _r((1 - RESERVE_SHARE) * envelope),
                         "draws": DRAWS, "seed": 1, "value_given_up": 0.0, "value_given_up_pct": 0.0}}
@@ -842,7 +887,7 @@ def _replan(m, plan=None, envelope=None, scale=None, draws=None):
 def _estimates_spec(spec):
     """The signed spec of an `estimates` deliverable (toolkit/spec/estimates.py): outputs and a decision rule on one
     of them; no units to allocate to, so no options, comparator, constraints or plan."""
-    for k in ("options", "comparator", "objective", "constraints", "outcomes_reported", "validation"):
+    for k in ("options", "comparator", "objective", "constraints", "outcomes_reported", "validation", "evidence"):
         del spec[k]
     spec["analysis"] = {"evaluation": "direct"}
     spec["uncertainty"] = {"level": 0.95, "draws": DRAWS, "seed": 1}
@@ -981,19 +1026,35 @@ def _no_data(value, reason, rule, test=None, source="spec default accepted by na
             "chosen": {"value": value, "rule": rule}, **({"decision_test": test} if test else {})}
 
 
+def _obs(source, where, year, sites, n, value, follow_up=5.0):
+    """One observation of a dossier entry: the seven fields toolkit/spec/evidence_dossier.py asks for (OBS_FIELDS), the
+    optional follow-up it documents, and a mark that the source was opened and checked. No producer writes that mark
+    today (gap H2 of §7); the fixture records it under `checked`, as the date the source was opened, so that the clean
+    run has observations that are marked and a variant has one that is not."""
+    return {"source": source, "where": where, "year": year, "sites": sites, "n": n, "sampling_frame": "households",
+            "value": value, FOLLOW_UP: follow_up, CHECKED: "2025-12-15"}
+
+
 def _dossier():
-    return {"meta": {"compiled": "2026-01-01", "status": "fixture dossier: four entries",
+    """evidence_dossier.yaml (toolkit/spec/evidence_dossier.py): five entries. Two hold observations, each followed for
+    five years against the three-year outcome window, well clear of it; one of them is the study that the outcome
+    adjustment of the C1 variants gives as its source, word for word. Three say `no_data`, each with a decision test."""
+    return {"meta": {"compiled": "2026-01-01", "status": "fixture dossier: five entries",
                      "format": "toolkit/spec/evidence_dossier.py", "local_only": True},
             "inputs": {
                 "parameter:p1": {
                     "model_value": {"value": BEST["p1"], "range": PRIOR["p1"], "dist": "uniform"},
                     "model_source": "fixture prior for p1",
-                    "observations": [{"source": "study one", "where": "G1", "year": "2019", "sites": "3", "n": "400",
-                                      "sampling_frame": "households", "value": "0.45"},
-                                     {"source": "study two", "where": "G3", "year": "2021", "sites": "2", "n": "250",
-                                      "sampling_frame": "households", "value": "0.55"}],
+                    "observations": [_obs("study one", "G1", "2019", "3", "400", "0.45"),
+                                     _obs("study two", "G3", "2021", "2", "250", "0.55")],
                     "comparison": "the model value sits between the two observations",
                     "chosen": {"range": PRIOR["p1"], "rule": "the prior range"}, "decision_test": "DT3"},
+                "parameter:b_add": {
+                    "model_value": {"value": 0.05, "range": [0.0, 0.1], "dist": "uniform"},
+                    "model_source": "fixture study two, table 4",
+                    "observations": [_obs(OA["source"], "all three groups", "2022", "6", "900", "0.8")],
+                    "comparison": "the ratio the study reports is the one the outcome adjustment applies",
+                    "chosen": {"range": [0.0, 0.1], "rule": "the engine's range"}, "decision_test": "DT5"},
                 "parameter:p2": _no_data(BEST["p2"], "no measurement of p2 was found", "draw over the owner's range",
                                          "DT8", "spec engine_parameters.p2 (owner's range)"),
                 f"parameter:{HELD}": _no_data(0.5, f"no source gives {HELD}", "hold at the default; run both ends as a "
@@ -1002,29 +1063,245 @@ def _dossier():
                                               "use the surface; test the plan against the flat alternative", "DT9")}}
 
 
-def _sheet_text(m, spec_sha):
-    """decision_spec.signoff_sheet.md, in the words of toolkit/spec (engine_parameters.py writes the HIGH lines). The
-    clean sheet marks no row HIGH (the card's range holds the spec's); with m["high"] the card's range is narrower and
-    the row is marked. The word also appears where it marks nothing (the geometry section's sentence, a table cell)."""
+def _critique(m):
+    """The rows of the sheet's spec critique, (severity, principle, check, finding, what resolves it), as
+    toolkit/spec/spec_critique.py findings() gives them for this spec, in its words and in the sheet's order (by
+    severity). The clean spec has no HIGH row: its comparator has components, its delivery period starts on the decision
+    date, a burden-scale test stands in for an anchor (MEDIUM), every no-data input is drawn, tested or excluded with
+    a reason, and its cost items have no range (MEDIUM). m["critique"] holds rows a variant adds."""
+    spec, rows = m["spec"], []
+    if spec["deliverable"]["kind"] == "estimates":
+        rows += [("INFO", 2, "headline_comparator", "An estimates deliverable has no comparator plan.", "None"),
+                 ("INFO", 3, "baseline_burden", "An estimates deliverable ranks no units.", "None")]
+    else:
+        scale = [t["id"] for t in spec["analysis"]["decision_tests"] if t["type"] == "burden_scale"]
+        held = [(x["parameter"], x["reason"]) for x in spec["uncertainty"].get("excluded", []) if "parameter" in x]
+        rows += [("INFO", 2, "headline_comparator", f"The comparator is package `{spec['comparator']['package']}`.",
+                  "owner judgment: Confirm it is the plan as currently funded in every unit"),
+                 ("MEDIUM", 3, "baseline_burden", "The engine's own burden ranks the units (validation.burden has no anchor "
+                  "row (role anchor): its references only validate); decision test(s) " + ", ".join(scale) + " scale it "
+                  "to external estimates, as a test, not in the plan.",
+                  "Anchor the burden (validation.burden anchor rows) or declare this check")]
+        rows += [("INFO", 6, "decision_input_ranges", "Held at a point, excluded from the draws with a reason "
+                  "(uncertainty.excluded): " + "; ".join(f"`parameter:{p}`: {why}" for p, why in held) + ".",
+                  "owner judgment: Confirm the reason shows the input cannot move the decision")] if held else []
+        rows += [("MEDIUM", 6, "decision_input_ranges", "Cost item(s) " + ", ".join(sorted(i["id"] for i in spec["options"]["cost_items"]))
+                  + " of allocated components have no uncertainty range and no price test.",
+                  "Add them to the costs uncertainty source with a multiplier range, or to a cost_items test")]
+    rows += m["critique"]
+    order = {"HIGH": 0, "MEDIUM": 1, "DECLARED": 2, "INFO": 3}
+    return sorted(rows, key=lambda r: order[r[0]])
+
+
+def _sheet_text(m, spec_sha, sha=None):
+    """decision_spec.signoff_sheet.md as toolkit/spec/signoff.py sheet() and write_sheet() write it: every section the
+    code writes for any spec (SHEET_ALWAYS), in its order and under its headings, the sections it writes for a spec that
+    has the thing (SHEET_SOME), and the last line with the hashes the sheet was generated from. Bodies are shortened to
+    what a view reads; no heading or marker is renamed. The clean sheet marks no row HIGH (the card's range holds the
+    spec's, and the critique has no HIGH finding); with m["high"] the card's range is narrower and
+    toolkit/spec/engine_parameters.py marks the row. The word also appears where it marks nothing (the critique's
+    count line, a table cell). `sha`: the hash of a file of the run, for the files the sheet names."""
     card_high = 5 if m["high"] else 6
+    spec, rows = m["spec"], _critique(m)
+    count = {k: sum(r[0] == k for r in rows) for k in ("HIGH", "MEDIUM", "DECLARED")}
     lines = ["# Decision spec sign-off sheet", "",
-             f"Signing accepts `decision_spec.yaml` (sha256 `{spec_sha[:16]}`). It also accepts what follows.", "",
-             "## Engine defaults accepted by name",
-             "- **seed**: 1: the engine's own seed. Reason: the result does not depend on it", "",
-             "## Input geometry check",
-             "Proposed exceptions to HIGH findings (the owner's sign-off approves them; a lead sign-off does not):",
-             "- none", "",
-             "## Engine parameter values set by the spec",
-             "- **p2** = 3.1. Basis: owner_judgement. Source: the owner's range. Reason: no measurement. "
-             "Uncertainty: drawn over [1, 5.5] (uniform).",
-             f"  - `{ENGINE_REF}`: card value 3 (fitted; fixture card); card range 1 to {card_high}", ""]
-    lines += [f"- **HIGH**: the uncertainty range of {name} (1 to 5.5) reaches outside the card range of `{ENGINE_REF}` "
-              f"(1 to 5; outside_card_range: true). Signing accepts it; its source and reason are above."
-              for name in m["high"]]
-    lines += ["", "## Evidence dossier (inputs that drive an option's effect)",
-              "| input | used by | model value | chosen | observations |", "|---|---|---|---|---|",
-              "| parameter:p1 | component A | 0.5 | 0.5 (owner decision, HIGH confidence in both studies) | 2 |", ""]
-    return "\n".join(lines)
+             f"Signing accepts `decision_spec.yaml` (sha256 `{spec_sha[:16]}`) and the derived data recorded in "
+             "`data/derivations_record.json` (sha256 `none`). It also accepts what follows.", ""]
+    sections = {
+        SHEET_ALWAYS[0]: ["", f"{count['HIGH']} HIGH, {count['MEDIUM']} MEDIUM, {count['DECLARED']} declared. These are the "
+                          "findings the gate would raise after compute; signing with one open accepts it.", "",
+                          "| Severity | Principle | Check | Finding | What resolves it |", "|---|---|---|---|---|",
+                          *[f"| {a} | {b} | {c} | {d} | {e} |" for a, b, c, d, e in rows], ""],
+        SHEET_ALWAYS[1]: ["None: every engine unit attribute is bound to the units table, a value or the calibration.", ""]}
+    oa = (spec.get("analysis") or {}).get("outcome_adjustments")
+    if oa:
+        sections[SHEET_SOME[0]] = [
+            "Applied in every evaluation (point, draws, sensitivity, decision tests, plan variants, the boundary check): "
+            "each package holding the component and not the reference has its outcomes set to the value times those of "
+            "the same package with the reference in its place; a package holding both is left as the engine gives it "
+            "(toolkit/analysis/outcome_adjust.py).",
+            *[f"- **{a['id']}**: {a['component']} = {a['value']} x {a['reference']}. Source: {a['source']}" for a in oa], ""]
+    sections[SHEET_ALWAYS[2]] = ["None: every column of every staged table is used.", ""]
+    sections[SHEET_ALWAYS[3]] = [""]
+    sections[SHEET_ALWAYS[4]] = ["No record (data/input_checks.json is missing): the check has not run.", ""]
+    values = [f"- **{n}** = {e.get('value')} {e.get('units')}. Basis: {e.get('basis')}. Source: {e.get('source')}. "
+              f"Reason: {e.get('reason')}. Uncertainty: drawn over {e.get('range')} ({e.get('dist')})."
+              for n, e in (spec.get("engine_parameters") or {}).items()]
+    sections[SHEET_ALWAYS[5]] = [
+        *values, f"  - `{ENGINE_REF}`: card value 3 ratio (fitted; fitted once to benchmarks B1 and B4 (fixture card)); "
+                 f"card range 1 to {card_high} ratio",
+        *([""] + [f"- **HIGH**: the uncertainty range of {name} (1 to 5.5 ratio) reaches outside the card range of "
+                  f"`{ENGINE_REF}` (1 to 5 ratio; outside_card_range: true). Signing accepts it; its source and reason "
+                  "are above." for name in m["high"]] if m["high"] else []), ""]
+    if (spec.get("validation") or {}).get("burden"):
+        sections[SHEET_SOME[1]] = [
+            "", "Signing attests that no reference below comes from, or is derived from, a source the calibration fits "
+            f"(calibration sources: none declared). Reference file `{BURDEN_CSV}` (sha256 `{sha(BURDEN_CSV)[:16]}`).", "",
+            "| Reference | Kind | Source id | Derived from | Citation |", "|---|---|---|---|---|",
+            *[f"| {r['id']} | {r['kind']} | {r['source_id']} | none | {r['source']} |" for r in _burden(DRAWS)["references"]], ""]
+    if (spec.get("evidence") or {}).get("dossier"):
+        def row(key, e):
+            field = (f"no data: {e['no_data']['reason']}; borrowing rule: {e['no_data']['borrowing_rule']}" if "no_data" in e else
+                     "; ".join(f"{o['value']} ({o['source']}, {o['where']}, {o['year']}, n {o['n']}, {o['sampling_frame']})"
+                               for o in e["observations"]))
+            chosen = e["chosen"].get("range", e["chosen"].get("value"))
+            note = " (owner decision, HIGH confidence in both studies)" if key == "parameter:p1" else ""
+            return (f"| {key} | component {'B' if key.endswith('b_add') else 'A'} | {chosen} (the spec's own value) | "
+                    f"{e['model_value']} ({e['model_source']}) | {field} | {chosen}{note} | {e['chosen']['rule']}"
+                    + (f"; {e['decision_test']}" if e.get("decision_test") else "") + " | same |")
+        sections[SHEET_ALWAYS[6]] = [
+            f"Signing attests `{DOSSIER}` (sha256 `{sha(DOSSIER)[:16]}`).", "", f"**{DIFFERS}** (0; advisory: the owner decides):",
+            "- none", "", "| Input | Used by | Execution will use | Model value (source) | Field / trial value (source) | Chosen | "
+            "Rule; test | Differs |", "|---|---|---|---|---|---|---|---|",
+            *[row(k, e) for k, e in sorted(m["dossier"]["inputs"].items())], "", "Every decision input has a sourced entry.", ""]
+    else:
+        sections[SHEET_ALWAYS[6]] = ["None: no component in the spec's options has declared decision inputs.", ""]
+    sections[SHEET_SOME[2]] = [*[f"- `{c['ref']}`: " + ("eligible" if c["eligible"] else "ineligible: " + "; ".join(c["why_not"]))
+                                 for c in m["choice"]["candidates"]], ""]
+    for head, body in sections.items():
+        if head not in m["sheet_without"]:
+            lines += [head, *body]
+    sources = {"spec_sha256": spec_sha,
+               "burden_references_sha256": sha(BURDEN_CSV) if (spec.get("validation") or {}).get("burden") else "none",
+               "evidence_dossier_sha256": sha(DOSSIER) if (spec.get("evidence") or {}).get("dossier") else "none",
+               "derivations_sha256": "none", "geometry_evidence_sha256": "none"}
+    return "\n".join(lines).rstrip("\n") + f"\n\n{SHEET_SOURCES}{json.dumps(sources, sort_keys=True)} -->\n"
+
+
+# ---- the schedule and the trajectory record (§5.6), the archived sign-offs (§5.3)
+
+def _schedule(m):
+    """analysis/figure_data.yaml `data.schedule` (toolkit/analysis/figure_data.py schedule()): per group, the engine's
+    delivery events with the number of units that hold each, in the order the producer sorts them. Components are the
+    engine's (A and B); the label tells the two options of the group apart. History and routine events are the
+    comparator's and hold in every arm; decision events follow each unit's package in the plan, lie inside the
+    delivery period and are the only ones the decision pays for (toolkit/engines/hooks.py). The stored rows have no
+    arm and no `charged` key: the producer drops them."""
+    obj, plan = m["spec"]["objective"], m["point"]["plan"]
+    d0, d1 = obj.get("delivery") or obj["horizon"]
+    regions = {}
+    for g in GROUPS:
+        packages, ev = [plan[u].split("+") for u in UNITS if _group(u) == g], {}
+        for component, label, kind, t0, n in (
+                ("A", "past round", "history", SIM_START + 0.5, len(packages)), ("A", "past round", "history", SIM_START + 1.5, len(packages)),
+                ("A", "round", "decision", d0 + 0.25, sum("A" in x for x in packages)),
+                *[("B", label, "decision", d0 + dt, sum(option in x for x in packages))
+                  for dt in (0.5, 1.5) for option, label in (("B", "half round"), ("C", "full round"))],
+                ("A", "routine round", "routine", d1 + 0.5, len(packages))):
+            if n:
+                ev[json.dumps([component, label, kind, round(t0, 4), None])] = n
+        regions[g] = {"units": len(packages), "events": [dict(zip(("component", "label", "kind", "t0", "t1"), json.loads(k)), units=n)
+                                                         for k, n in sorted(ev.items())]}
+    out = {"status": "ok", "delivery": [float(d0), float(d1)], "window": [float(x) for x in obj["horizon"]],
+           "start": float(m["spec"]["horizon"]["start"]), "regions": regions}
+    if m["sched_edit"]:
+        m["sched_edit"](out)
+    return out
+
+
+def _figure_data(m):
+    """analysis/figure_data.yaml `data`: the keys the views read (the schedule; each unit's comparator level, which the
+    trajectory step samples units by). The plan's frontier, costs and replay are left out."""
+    level = {u: _r(0.4 * (1 + 0.05 * _wobble(i))) for i, u in enumerate(UNITS)}
+    return {"primary": OUTCOME, "comparator": m["spec"]["comparator"]["package"], "region": GROUPING,
+            "burden": {u: {"population": float(_pop(u)), "per_person": v, "comparator_total": _r(v * _pop(u))} for u, v in level.items()},
+            "schedule": _schedule(m)}
+
+
+def _timeline_csv(schedule):
+    """figures/timeline.csv, the table of the harness's timeline figure (toolkit/analysis/figures.py fig_timeline)."""
+    return _csv(["region", "component", "label", "kind", "t0", "t1", "units", "region_units"],
+                [[g, e["component"], e["label"], e["kind"], e["t0"], e["t1"], e["units"], r["units"]]
+                 for g, r in schedule["regions"].items() for e in r["events"]])
+
+
+def _sample(fd):
+    """toolkit/analysis/trajectories.py sample_units(): per group, three units spread over the comparator level."""
+    out = {}
+    for g in GROUPS:
+        ids = sorted((u for u in UNITS if _group(u) == g), key=lambda u: (fd["burden"][u]["per_person"], u))
+        out[g] = [ids[k] for k in sorted({int(round(k * (len(ids) - 1) / 2)) for k in range(3)})]
+    return out
+
+
+def _trajectories(m, fd):
+    """analysis/trajectories.yaml `data` (toolkit/analysis/trajectories.py run()): the sample, and one monthly series per
+    arm for the sampled units pooled (`total`) and per group, from the start of the simulated period. The plan's series
+    is the comparator's until delivery starts (but for m["series_gap"], a relative difference a variant plants) and
+    below it after. Per-unit series and per-seed effects are left out. `engine` is the engine's full identity, which
+    the producer holds to analysis/point.yaml `engine_identity`; `analysis_engine` is the analysis header's engine."""
+    spec, sample = m["spec"], _sample(fd)
+    d0, d1 = fd["schedule"]["delivery"]
+    start, stop = spec["horizon"]["start"], spec["horizon"]["stop"]
+    t = [_r(start + k / 12) for k in range(int(round((stop - start) * 12)))]
+
+    def panel(level, ids):
+        comparator = [_r(level * (1 + 0.1 * math.sin(2 * math.pi * x))) for x in t]
+        plan = [_r(c * ((1 + m["series_gap"]) if x < d0 else 0.7 if x < d1 else 0.85)) for x, c in zip(t, comparator)]
+        return {"t": t, "arms": {"comparator": {"m1": comparator}, "plan": {"m1": plan}}, "target": {}, "units": list(ids)}
+
+    def level(ids):
+        return sum(fd["burden"][u]["per_person"] * fd["burden"][u]["population"] for u in ids) / sum(fd["burden"][u]["population"] for u in ids)
+    every = [u for ids in sample.values() for u in ids]
+    return {"status": "ok", "sample": sample, "per_region": 3, "seeds": 3, "analysis_engine": dict(ENGINE), "engine": _identity(),
+            "hooks_contract": HOOKS_CONTRACT, "selection": SELECTION, "metrics": ["m1"],
+            "metric_info": {"m1": {"label": "level of m1", "units": "share", "aggregate": "mean", "denominator": "people"}},
+            "calibration_metric": None, "delivery": [d0, d1], "window": list(fd["schedule"]["window"]),
+            "series": {"total": panel(level(every), every), "regions": {g: panel(level(ids), ids) for g, ids in sample.items()}},
+            "compute": {"backend": "local", "workers": 2, "n": 3 * len(every), "n_failed": 0, "wall_s": 40.0}}
+
+
+def _dynamics(tr):
+    """The checks the harness pairs with the trajectory figure (toolkit/analysis/figures.py trajectory_checks()),
+    recomputed here from the record by the producer's rule and written in its words: the largest relative difference
+    between the arms before delivery starts (`flag` above 1e-9); and, when delivery ends before the outcome window does,
+    the step in the plan's series across the end of delivery, for information. This spec names no calibration metric
+    and window, so the producer writes no comparison with a target interval."""
+    d0, d1 = tr["delivery"]
+    panels, worst = {"total": tr["series"]["total"], **tr["series"]["regions"]}, 0.0
+    for s in panels.values():
+        pre = [(c, p) for x, c, p in zip(s["t"], s["arms"]["comparator"]["m1"], s["arms"]["plan"]["m1"]) if x < d0 - 1e-9]
+        if pre:
+            worst = max(worst, max(abs(c - p) for c, p in pre) / max(max(abs(c) for c, _ in pre), 1e-12))
+    rows = [{"check": "plan_equals_comparator_before_delivery", "value": _r(worst), "status": "pass" if worst <= 1e-9 else "flag",
+             "detail": "largest relative difference before delivery"}]
+    if d1 < tr["window"][1] - 1e-9:
+        s = tr["series"]["total"]
+        i1 = next(i for i, x in enumerate(s["t"]) if x >= d1)
+        plan = s["arms"]["plan"]["m1"]
+        rows.append({"check": "end_of_delivery_step", "value": {"m1": _r((plan[i1] - plan[i1 - 1]) / max(abs(plan[i1 - 1]), 1e-12))},
+                     "status": "info", "detail": "relative step in the plan's series across the end of delivery (month before vs after)"})
+    return rows
+
+
+def _earlier(spec):
+    """The two specs signed before the current one, oldest first: the first differs from the second in who decides,
+    the second from the current spec in the seed of the draws, so each sign-off changed one section of the spec."""
+    second = copy.deepcopy(spec)
+    second["uncertainty"]["seed"] = 2
+    first = copy.deepcopy(second)
+    first["decision_maker"] = "programme lead and deputy (synthetic fixture)"
+    return [first, second]
+
+
+def _archive(m, files):
+    """evidence_planner/superseded_signoff_<date>/: the sign-offs a later one replaced, as a stored run keeps them (each
+    folder holds the record and the spec it signed, under either of the two names a stored run uses; the later one
+    also the sheet the owner read). m["archive_bare"]: one more folder that holds a sheet and no record."""
+    notes = ("first sign-off (fixture)", "who decides corrected (fixture)")
+    for n, (day, spec) in enumerate(zip(EARLIER, m["earlier"])):
+        text = _spec_text(spec, [])
+        sha, folder = hashlib.sha256(text.encode()).hexdigest(), f"{ARCHIVE}{day}/"
+        files[folder + (SPEC_FILES[1] if n else f"decision_spec.signed_{sha[:8]}.yaml")] = text
+        files[folder + SIGNOFF] = json.dumps({"signed_by": "owner", "signed_at": f"{day}T10:00:00+00:00", "note": notes[n],
+                                              "sha256": {"decision_spec.yaml": sha}, "producer": "toolkit/spec/signoff.py",
+                                              "schema_version": 1}, indent=1)
+        if n:
+            files[folder + SHEET] = (f"# Decision spec sign-off sheet\n\nSigning accepts `decision_spec.yaml` (sha256 `{sha[:16]}`) "
+                                     "and the derived data recorded in `data/derivations_record.json` (sha256 `none`). It also "
+                                     "accepts what follows.\n\n" + "\n\n".join(SHEET_ALWAYS[1:6]) + "\n")
+    if m["archive_bare"]:
+        files[f"{ARCHIVE}{EARLIER[1]}b/{SHEET}"] = "# Decision spec sign-off sheet\n\nA sheet that was written and never signed.\n"
 
 
 # ---- the engine record and the figure set (§5.4, §5.12)
@@ -1137,8 +1414,8 @@ def _figure_set(m):
             ("parameters", "data_model", [ENGINE_REC], "6 engine parameters; 1 set by the spec", "engine parameters and their ranges"),
             *[(os.path.basename(rel)[:-4], "data_model", [cal], f"{os.path.basename(rel)[12:-4].replace('_', ' ')} of the "
                "calibration, 12 units", "calibration diagnostics") for rel in _figures(m)],
-            ("timeline", "simulation", [], "what each package delivers, and when", "delivery schedule"),
-            ("trajectories", "simulation", ["analysis/point.yaml"], "outcome over time under the plan and the comparator",
+            ("timeline", "simulation", [FD], "what each package delivers, and when", "delivery schedule"),
+            ("trajectories", "simulation", [TRAJ], "outcome over time under the plan and the comparator",
              "simulated outcome over time"),
             ("headline", "decision", ["analysis/point.yaml", UNC], "the plan against the comparator, with its interval",
              "headline result"),
@@ -1156,7 +1433,8 @@ def _figure_files(m, files, sha, artifact):
     entries, missing, listed, earlier = [], [], {}, hashlib.sha256(b"the source as it was when the figure was drawn").hexdigest()
     plan = _figure_set(m)
     for name, tier, drawn_from, title, shows in plan:
-        reason = f["not_produced"].get(name) or (NO_TESTS_FILE if DT in drawn_from and m["dt"] is None else None)
+        reason = (f["not_produced"].get(name) or (NO_TESTS_FILE if DT in drawn_from and m["dt"] is None else None)
+                  or (NO_TRAJECTORIES if TRAJ in drawn_from and TRAJ not in files else None))
         if reason:
             missing.append({"figure": name, "reason": reason, "tier": tier})
             continue
@@ -1168,6 +1446,8 @@ def _figure_files(m, files, sha, artifact):
                      "caption": f"{title[0].upper()}{title[1:]}; drawn by the harness from the files listed as its sources.",
                      "shows": shows, "sources": sources, "offset_free": True, "theme": "light", "tier": tier,
                      "group": "decision" if tier == "decision" else "diagnostics", "presentation": copy.deepcopy(shown)}
+            if name == "trajectories":      # toolkit/analysis/figures.py fig_trajectories(): the checks travel with the figure
+                entry["checks"] = m["dynamics"]
         else:
             entry = {"id": name, "path": png, "svg": png[:-4] + ".svg", "sources": sources, "tier": tier}
         if name in f["no_path"]:
@@ -1247,6 +1527,13 @@ def _model(method, figures="standard", kind="package_per_unit"):
     # a change to its text as written}; `signed_after` an edit made to the signed copy of the spec after the sign-off
     m.update(kind=kind, plan_args={"plan": _clean_plan(), "envelope": ENVELOPE, "scale": 1.0, "draws": DRAWS},
              stab=_stability(), emu=_emulator(), raw={}, signed_after=None)
+    # the Spec and Scenarios files (§5.3, §5.6): `critique` rows a variant adds to the sheet's spec critique;
+    # `sheet_without` headings the sheet lacks; `no_sheet` the run holds no sheet; `archive_bare` one more archive
+    # folder with a sheet and no record; `earlier` the specs of the archived sign-offs; `sched_edit` a change to the
+    # stored schedule; `traj` whether the run holds a trajectory record, `traj_edit` a change to it, `series_gap` the
+    # relative difference between the arms before delivery starts, `dyn_edit` a change to the checks as stored
+    m.update(critique=[], sheet_without=(), no_sheet=False, archive_bare=False, sched_edit=None, traj=True, traj_edit=None,
+             series_gap=0.0, dyn_edit=None, dynamics=[])
     _replan(m)
     if kind == "estimates":
         _estimates_spec(m["spec"])
@@ -1256,6 +1543,7 @@ def _model(method, figures="standard", kind="package_per_unit"):
                     "interval": {"level": 0.95, "covers": ["calibration", "observation"], "excludes": [], "prior_dominated": ["p3"]},
                     "fixed_plan": {"not_applicable": "an estimates deliverable has no plan"},
                     "outputs": copy.deepcopy(m["est"]["outputs"]), "prior_dominated": ["p3"]}
+    m["earlier"] = _earlier(m["spec"])
     return m
 
 
@@ -2406,7 +2694,211 @@ DEFECTS.update({
 })
 
 
+# ---- the Spec and evidence view (§5.3) and the Scenarios view (§5.6)
+SPEC_CHECKS = ("effect_window", "values_sourced", "dossier_coverage", "signoff_note", "presign_sections", "presign_high",
+               "decision_date")
+SCENARIOS_CHECKS = ("trajectories_present", "dynamics", "schedule_window")
+TRAJ_FIGURE = ["figures/trajectories" + end for end in (".png", ".svg", ".csv", ".png.provenance.json")]
+SECOND = f"{ARCHIVE}{EARLIER[1]}/"
+
+
+def _cited(m):
+    """The dossier observation whose source is, word for word, the source of the outcome adjustment a variant adds."""
+    return next(o for e in m["dossier"]["inputs"].values() for o in e.get("observations", []) if o["source"] == OA["source"])
+
+
+def _follow_up(years=None, where=None):
+    def edit(m):
+        o = _cited(m)
+        if years is None:
+            del o[FOLLOW_UP]
+        else:       # the producer's own finding for it (toolkit/spec/spec_critique.py _follow_up), on the sheet
+            o[FOLLOW_UP] = years
+            m["critique"].append(("MEDIUM", 3, "follow_up_window", "1 evidence observation(s) followed the effect for less "
+                                  f"than the objective window of 3 years: `parameter:b_add` ({o['source']}: {years:g} years). "
+                                  "The engine carries the effect past what they observed.",
+                                  "owner judgment: Confirm how the effect is assumed to hold (or wane) beyond the follow-up, "
+                                  "and that a decision test varies it"))
+        if where:
+            o["where"] = where
+    return edit
+
+
+def _adjust(then=None):
+    """The signed spec holds one outcome adjustment (OA), whose source is, word for word, the source of one dossier
+    observation; `then` is a further edit. The clean spec holds none (§5.3: an outcome adjustment is a `look` for the
+    reader, since no field records how long its evidence was followed), so every case with one is a variant."""
+    def edit(m):
+        m["spec"]["analysis"]["outcome_adjustments"] = [dict(OA)]
+        if then:
+            then(m)
+    return edit
+
+
+def _unmark(first_only):
+    def edit(m):
+        marked = [o for e in m["dossier"]["inputs"].values() for o in e.get("observations", [])]
+        for o in marked[:1] if first_only else marked:
+            del o[CHECKED]
+    return edit
+
+
+def _date(value, finding):
+    def edit(m):       # the producer's own HIGH finding for the date (spec_critique.py _decision_date), on the sheet
+        m["spec"]["decision_date"] = value
+        m["critique"].append(("HIGH", 2, "decision_date", finding, "Start the delivery window at the decision date; delivered "
+                              "actions are fixed inputs" if "before the decision date" in finding else "Give the date the decision is made"))
+    return edit
+
+
+def _many_sections(m):
+    m["signoff_note"] = ""
+    second = m["earlier"][1]
+    second["constraints"]["envelope_usd"] = 0.9 * ENVELOPE
+    second["comparator"]["text"] = "every unit keeps component A alone, as first drafted"
+    second["objective"].pop("delivery")
+    second["outcomes_reported"] = [OUTCOME, "cost"]
+    second["decision_date"] = "2025-12-31"
+
+
+def _event(group, **event):
+    def edit(schedule):
+        schedule["regions"][group]["events"].append({"component": "B", "label": "full round", "kind": "decision", "t1": None,
+                                                     "units": 1, **event})
+    return lambda m: m.update(sched_edit=edit)
+
+
+def _sv(check, status, apply, files, edit, view="spec", case=None, **more):
+    return {"view": view, "case": case, "check": check, "status": status, "methods": BOTH, "apply": apply, "files": files,
+            "edit": edit, **more}
+
+
+DEFECTS.update({
+    "C1_outcome_adjustment": _sv(
+        "effect_window", "look", _adjust(), SPEC_FILES, case="C1", also={"values_sourced": "look"},
+        edit="The signed spec holds one outcome adjustment (OA1: component C at 0.8 times reference B) whose source is, word "
+             "for word, the source of a dossier observation that records follow_up_years 5 against the three-year outcome "
+             "window; the adjustment itself has no field for a follow-up and no key that cites the entry."),
+    "C1_follow_up_short": _sv(
+        "effect_window", "look", _adjust(_follow_up(1.0)), SPEC_FILES + [DOSSIER], case="C1", also={"values_sourced": "look"},
+        edit="The signed spec holds the outcome adjustment OA1, and in evidence_dossier.yaml the observation with the same "
+             "source text records follow_up_years 1 against the three-year outcome window, with the producer's MEDIUM row "
+             "for it in the sheet's spec critique."),
+    "C1_follow_up_prose_only": _sv(
+        "effect_window", "look", _adjust(_follow_up(where="all three groups; followed for five years")), SPEC_FILES + [DOSSIER],
+        case="C1", also={"values_sourced": "look"},
+        edit="The signed spec holds the outcome adjustment OA1, and in evidence_dossier.yaml the observation with the same "
+             "source text has no follow_up_years field while its `where` text says it was followed for five years."),
+    "C1_source_not_in_dossier": _sv(
+        "effect_window", "look", _adjust(lambda m: m["spec"]["analysis"]["outcome_adjustments"][0].update(source="fixture study five, table 1")),
+        SPEC_FILES, case="C1", also={"values_sourced": "look"},
+        edit="The signed spec holds the outcome adjustment OA1 with a source text that no observation of the dossier has."),
+    "value_unverified": _sv(
+        "values_sourced", "look", lambda m: m["spec"]["engine_parameters"]["p2"].update(verified="unverified"), SPEC_FILES,
+        edit="The signed spec marks the source of the value it sets for p2 as unverified."),
+    "value_no_mark": _sv(
+        "values_sourced", "look", lambda m: m["spec"]["engine_parameters"]["p2"].pop("verified"), SPEC_FILES,
+        edit="The signed spec's entry for the value it sets for p2 carries no mark for its source, while analysis/engine.yaml "
+             "marks the engine card's own source for p2 as matched."),
+    "value_unknown_mark": _sv(
+        "values_sourced", "not_available", lambda m: m["spec"]["engine_parameters"]["p2"].update(verified="seen"), SPEC_FILES,
+        edit="The signed spec marks the source of the value it sets for p2 with the word seen, which is none of the three "
+             "words a source's mark takes."),
+    "C15_no_data_no_test": _sv(
+        "dossier_coverage", "look", lambda m: m["dossier"]["inputs"][f"parameter:{HELD}"].pop("decision_test"), [DOSSIER], case="C15",
+        across={"register.declared_untested": "look", "register.decides_unknown": "look"},
+        edit=f"In evidence_dossier.yaml the entry for {HELD}, which says no data, names no decision test."),
+    "C15_observation_unchecked": _sv(
+        "dossier_coverage", "look", _unmark(True), [DOSSIER], case="C15",
+        edit="In evidence_dossier.yaml one of the three observations has no `checked` field, and the other two keep theirs."),
+    "C15_no_checked_marks": _sv(
+        "dossier_coverage", "look", _unmark(False), [DOSSIER], case="C15",
+        edit="In evidence_dossier.yaml no observation has a `checked` field, as in every stored run (gap H2)."),
+    "dossier_unparsable": _sv(
+        "dossier_coverage", "not_available", lambda m: m["raw"].update({DOSSIER: lambda text: text[:text.index("    observations:")] + "    observations: [{source: study one,\n"}),
+        [DOSSIER], case="C15",
+        across={"register.declared_untested": "look", "register.decides_unknown": "look", "register.undisposed": "not_available"},
+        edit="evidence_dossier.yaml stops inside its first list of observations, which is never closed."),
+    "signoff_note_empty": _sv(
+        "signoff_note", "look", lambda m: m.update(signoff_note=""), [SIGNOFF],
+        edit="decision_spec.signoff.json has an empty note; the signature changed one section of the spec (uncertainty)."),
+    "signoff_note_empty_many_sections": _sv(
+        "signoff_note", "look", _many_sections, [SIGNOFF, SECOND + SPEC_FILES[1], SECOND + SIGNOFF, SECOND + SHEET],
+        edit="decision_spec.signoff.json has an empty note, and the spec signed before it differs from the current one in "
+             "six sections (comparator, constraints, decision_date, objective, outcomes_reported, uncertainty)."),
+    "archive_no_record": _sv(
+        "signoff_note", "not_available", lambda m: m.update(archive_bare=True), [f"{ARCHIVE}{EARLIER[1]}b/{SHEET}"],
+        edit="One more folder of archived sign-offs holds a sheet and no sign-off record."),
+    "sheet_section_missing": _sv(
+        "presign_sections", "look", lambda m: m.update(sheet_without=(SHEET_ALWAYS[0],)), [SHEET],
+        edit="decision_spec.signoff_sheet.md has no spec critique section, as a sheet written before that section existed."),
+    "sheet_missing": _sv(
+        "presign_sections", "not_available", lambda m: m.update(no_sheet=True), [SHEET], also={"presign_high": "not_available"},
+        edit="The run holds no decision_spec.signoff_sheet.md."),
+    "presign_high_bullet": _sv(
+        "presign_high", "look", lambda m: m.update(high=["p2"]), [SHEET], across={"register.undisposed": "problem"},
+        edit="decision_spec.signoff_sheet.md marks one line HIGH (the range of p2 against the card's), the edit of sheet_high."),
+    "decision_date_after_delivery_start": _sv(
+        "decision_date", "look", _date("2026-09-01", "The delivery window starts in 2026, before the decision date 2026-09-01: "
+                                       "actions delivered before the decision would be optimised."),
+        SPEC_FILES, also={"presign_high": "look"},
+        edit="The signed spec dates the decision 2026-09-01, after its delivery period starts (2026.0), and the sheet's spec "
+             "critique holds the producer's HIGH row for it."),
+    "decision_date_unreadable": _sv(
+        "decision_date", "look", _date("soon", "decision_date 'soon' is not a year or an ISO date."), SPEC_FILES,
+        also={"presign_high": "look"},
+        edit="The signed spec's decision_date is the word soon, and the sheet's spec critique holds the producer's HIGH row for it."),
+    "spec_unverified": _sv(
+        "effect_window", "not_available", lambda m: m.update(signed_after=lambda spec: spec["constraints"].update(envelope_usd=1.2 * ENVELOPE)),
+        [SPEC_FILES[1]], follows=False, also={k: "not_available" for k in SPEC_CHECKS[1:]},
+        across={"model.departures": "not_available", "figures.figure_fresh": "not_available", "register.undisposed": "problem",
+                "register.prose_only": "not_available",
+                **{f"outcomes.{k}": "not_available" for k in ("dearest_wins", "tests_that_move", "boundary_coverage",
+                                                              "infeasible_tests", "variant_budget", "fixed_inputs")}},
+        edit="The signed copy of the spec was edited after the sign-off and no longer has the hash the sign-off record holds."),
+    # the Scenarios view
+    "C5_no_trajectories": _sv(
+        "trajectories_present", "problem", lambda m: m.update(traj=False), [TRAJ, *TRAJ_FIGURE], view="scenarios", case="C5",
+        also={"dynamics": "not_available"}, across={"figures.figure_missing": "look"},
+        edit="The run has its batch and point files and no analysis/trajectories.yaml, and analysis/figures.yaml lists the "
+             "trajectories figure as not produced with the producer's reason."),
+    "trajectories_other_engine": _sv(
+        "trajectories_present", "problem", lambda m: m.update(traj_edit=lambda tr: tr["engine"].update(code_sha256=hashlib.sha256(b"other code").hexdigest())),
+        [TRAJ], view="scenarios", case="C5", also={"dynamics": "not_available"},
+        edit="analysis/trajectories.yaml records an engine whose code hash is not the one analysis/point.yaml records as "
+             "the analysis's engine identity."),
+    "dynamics_flag": _sv(
+        "dynamics", "problem", lambda m: m.update(series_gap=0.02), [TRAJ], view="scenarios", case="C5",
+        edit="In analysis/trajectories.yaml the plan's series is 2% above the comparator's before delivery starts, and the "
+             "check plan_equals_comparator_before_delivery in analysis/figures.yaml has that value and the status flag."),
+    "dynamics_unknown_status": _sv(
+        "dynamics", "not_available", lambda m: m.update(dyn_edit=lambda rows: rows[0].update(status="warn")), [FIGS], view="scenarios",
+        edit="In analysis/figures.yaml the first check of the trajectories figure has the status warn, a word the producer does not write."),
+    "schedule_decision_outside": _sv(
+        "schedule_window", "look", _event("G1", t0=DELIVERY[1] + 0.25), [FD, TIMELINE], view="scenarios",
+        edit="The stored schedule of group G1 holds a decision event at 2028.25, after the delivery period ends (2028.0) and "
+             "inside the outcome window."),
+    "schedule_event_after_window": _sv(
+        "schedule_window", "look", _event("G2", component="A", label="routine round", kind="routine", t0=WINDOW[1] + 0.5, units=4),
+        [FD, TIMELINE], view="scenarios",
+        edit="The stored schedule of group G2 holds a routine event at 2029.5, after the outcome window ends (2029.0)."),
+    "schedule_unknown_kind": _sv(
+        "schedule_window", "not_available", _event("G3", kind="campaign", t0=DELIVERY[0] + 0.75), [FD, TIMELINE], view="scenarios",
+        edit="The stored schedule of group G3 holds an event of the kind campaign, which is none of the three kinds the hook writes."),
+    "no_schedule_kind": _sv(
+        "schedule_window", "not_available", _nothing, [], view="scenarios", kinds=EST_KIND, methods=POST, figure_sets=FIGURE_SETS[1:],
+        also={"trajectories_present": "not_available", "dynamics": "not_available"},
+        edit="Nothing: the run of an estimates deliverable has no schedule, no batch and no trajectory record."),
+})
+# What the edits of the views built earlier move in these two views.
+for _n in ("sheet_high", "spec_value_outside_card"):      # each marks one line of the sheet HIGH
+    DEFECTS[_n].setdefault("across", {})["spec.presign_high"] = "look"
+for _n in ("figure_not_produced", "figure_not_produced_named", "figures_unknown_producer"):
+    DEFECTS[_n].setdefault("across", {})["scenarios.dynamics"] = "not_available"
+
 REGISTER_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "register")
+SPEC_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "spec")
+SCENARIOS_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "scenarios")
 MODEL_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "model")
 FIGURES_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "figures")
 OUTCOMES_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "outcomes")
@@ -2415,7 +2907,7 @@ OUTCOMES_DEFECTS = tuple(n for n, s in DEFECTS.items() if s.get("view") == "outc
 def artifacts(method):
     """The analysis files that carry an artifact header, for a method (standard figure set)."""
     return ([JC, CAL] if method == "history_matching" else [CAL, EST]) + [ENGINE_REC, POINT, UNC, DT, FIGS,
-                                                                           EMU, EMB, VOI, BV, STAB, PV]
+                                                                           EMU, EMB, VOI, BV, STAB, PV, BATCH, FD]
 
 
 def figure_sets(defect):
@@ -2540,22 +3032,27 @@ def _render(m, stage):
             [[f["unit"], f["groups"][0], f["source"], f["latent"], int(f["observed"]), int(f["n"])]
              for f in m["cal"]["diagnostics"]["fit"]])
     files["decision_brief.signed/decision_spec.yaml"] = files["decision_spec.yaml"]
-    files[SHEET] = _sheet_text(m, sha("decision_spec.yaml"))
+    files[SETTINGS] = _yaml({"uncertainty": {"draws": DRAWS}, "analysis": {"workers": 2}})
     files[DOSSIER] = _yaml(m["dossier"])
+    if DOSSIER in m["raw"]:
+        files[DOSSIER] = m["raw"][DOSSIER](files[DOSSIER])
+    plans = m["kind"] == "package_per_unit"
+    if plans:
+        files[BURDEN_CSV] = _csv(["id", "group", "outcome", "year", "value", "lower", "upper", "kind", "source_id", "role"],
+                                 [[r["id"], r["group"], r["outcome"], r["year"], r["value"], r["lower"], r["upper"], r["kind"],
+                                   r["source_id"], r["role"]] for r in _burden(DRAWS)["references"]])
+    if not m["no_sheet"]:       # written from the spec, the dossier and the reference file, whose hashes its last line holds
+        files[SHEET] = _sheet_text(m, sha("decision_spec.yaml"), sha)
+    _archive(m, files)
     # The record holds what toolkit/spec/signoff.py sign() lists under sha256 (`{SPEC: sha, **extra}`, extra being
     # the derivation record, a reference file and the evidence files): here the spec and the dossier. The sheet's hash
     # is not there: sign() compares it with the one the owner was shown (expect_sheet_sha256) and records none.
     files["decision_spec.signoff.json"] = json.dumps(
         {"signed_by": m["signed_by"], "signed_at": _at(50), "note": m["signoff_note"],
          "sha256": {"decision_spec.yaml": sha("decision_spec.yaml"), DOSSIER: sha(DOSSIER)},
-         "producer": "toolkit/spec/signoff.py"}, indent=1)
+         "producer": "toolkit/spec/signoff.py", "schema_version": 1}, indent=1)
     files[CHOICE] = json.dumps(m["choice"], indent=1)
     files[LABELS] = _yaml({"labels": {"units": {u: f"unit {u}" for u in UNITS[:2]}}, "theme": "light"})
-    plans = m["kind"] == "package_per_unit"
-    if plans:
-        files[BURDEN_CSV] = _csv(["id", "group", "outcome", "year", "value", "lower", "upper", "kind", "source_id", "role"],
-                                 [[r["id"], r["group"], r["outcome"], r["year"], r["value"], r["lower"], r["upper"], r["kind"],
-                                   r["source_id"], r["role"]] for r in _burden(DRAWS)["references"]])
 
     def cut(rel):       # a change to a file's text as written (a file that stops short), made before anything hashes it
         if rel in m["raw"] and rel in files:
@@ -2605,6 +3102,30 @@ def _render(m, stage):
                     files[row["path"]] = _yaml(_test_file(row, entries.get(row["test_id"], {})))
         files["allocation.csv"] = _csv(["unit_id", "package", "outcome_averted"],
                                        [[u, x["package"], x["benefit"]] for u, x in point["per_unit"].items()])
+        # the outcome batch's own record (toolkit/analysis/batch.py through run.py); its rows are not in the fixture
+        artifact(BATCH, "batch", "toolkit/analysis/batch.py", data_in[1:2], {
+            "evaluation": "emulator", "points": 64, "jobs": 192, "packages": ["A", "A+B", "A+C"],
+            "fitted_names": ["p2", "f1"], "prior_names": [],
+            "summary": {"n": 192, "n_failed": 0, "reused": 0, "computed": 192, "path": "analysis/batch/results.jsonl",
+                        "rejected_rows": 0}}, 97)
+        # what the figures are drawn from: the schedule, written with the analysis; the trajectory record, written by
+        # the trajectory step after it, with its own header (no spec hash, and the manifest does not list it)
+        fd = _figure_data(m)
+        artifact(FD, "figure_data", "toolkit/analysis/figure_data.py", [POINT, UNC], fd, 231)
+        if m["fig"]["set"] == "standard" and "timeline" not in m["fig"]["not_produced"]:
+            files[TIMELINE] = _timeline_csv(fd["schedule"])
+        if m["traj"]:
+            tr = _trajectories(m, fd)
+            m["dynamics"] = _dynamics(tr)
+            if m["traj_edit"]:
+                m["traj_edit"](tr)
+            if m["dyn_edit"]:
+                m["dyn_edit"](m["dynamics"])
+            files[TRAJ] = _yaml({"schema": "analysis.trajectories/1", "produced_by": "harness",
+                                 "producer": "toolkit/analysis/trajectories.py",
+                                 "inputs": {i: sha(i) for i in ("decision_spec.yaml", POINT, CAL, FD, "data/derived/units.csv",
+                                                                SETTINGS, CHOICE)},
+                                 "written_at": _at(233), "data": tr})
         files[RESULTS] = ("# Results (synthetic fixture)\n\n- units: 12\n- packages: "
                           + ", ".join(f"{k} in {n}" for k, n in point["packages"].items())
                           + f"\n- {HEADLINE}: {point['averted'][OUTCOME]:g}\n")
@@ -2615,7 +3136,7 @@ def _render(m, stage):
         artifact(EST, "estimates", "toolkit/analysis/estimates.py", [CAL], m["est"], 232)
         cut(EST)
     images = _figure_files(m, files, sha, artifact)
-    arts = [r for r in files if r.startswith("analysis/") and r.endswith(".yaml") and r != BSV]
+    arts = [r for r in files if r.startswith("analysis/") and r.endswith(".yaml") and r not in (BSV, TRAJ)]
     files["analysis/manifest.json"] = json.dumps({
         "artifacts": {r: {"kind": r[9:-5], "producer": f"toolkit/analysis/{r[9:-5]}.py", "sha256": sha(r)} for r in arts},
         "complete": True,
@@ -2732,7 +3253,7 @@ def _headers(dir, shas):
         if rel.startswith("analysis/") and rel.endswith(".yaml") and rel != BSV:     # BSV has no artifact header
             with open(os.path.join(dir, rel), encoding="utf-8") as f:
                 doc = yaml.safe_load(f)
-            out[rel] = (doc["spec_sha256"], doc["inputs"], doc)
+            out[rel] = (doc.get("spec_sha256"), doc["inputs"], doc)
     return out
 
 
@@ -2760,6 +3281,8 @@ def _follows(clean_dir, clean, first):
             more |= {"decision_spec.signoff.json", SHEET}
         if DOSSIER in changed | more:                    # the sign-off record holds its hash
             more.add("decision_spec.signoff.json")
+        if {DOSSIER, BURDEN_CSV} & (changed | more) and SHEET in clean:      # so does the sheet's last line
+            more.add(SHEET)
         if any((r.startswith("analysis/") and r not in (BSV, BSV_REC)) or r in ("allocation.csv", RESULTS) for r in changed | more):
             more.add("analysis/manifest.json")
         if more <= changed:
@@ -2894,11 +3417,12 @@ def _register_cases(tmp, ok):
         ok(f"X19 {method}: the clean sign-off sheet marks no row HIGH, names the signed spec's hash, and holds the word "
            f"HIGH where it marks nothing",
            sum(line.startswith("- **HIGH**:") for line in sheet) == 0 and sum("HIGH" in line for line in sheet) == 2
+           and not any(line.startswith("| HIGH |") for line in sheet)
            and hashlib.sha256(text(SPEC_FILES[1]).encode()).hexdigest()[:16] in sheet[2])
         no_data = [k for k, e in dossier.items() if "no_data" in e]
         ok(f"X20 {method}: the dossier holds no-data entries and one with observations; the signed spec excludes an "
            f"input by name; no comment line",
-           len(no_data) == 3 and any("observations" in e for e in dossier.values())
+           len(no_data) == 3 and sum("observations" in e for e in dossier.values()) == 2
            and spec["uncertainty"]["excluded"][0]["parameter"] == HELD and f"parameter:{HELD}" in no_data
            and not any(line.lstrip().startswith("#") for line in text(SPEC_FILES[1]).splitlines()))
 
@@ -2937,7 +3461,7 @@ def _register_cases(tmp, ok):
            == {"D-001": "fixed", "D-002": "open", "R-001": "open", STALE_ID: "fixed"})
     ok("X25 twenty-one edits name the register as their view, each for both methods; the Fit view's edits name none",
        len(REGISTER_DEFECTS) == 21 and all(DEFECTS[n]["methods"] == METHODS for n in REGISTER_DEFECTS)
-       and all(s.get("view") in (None, "register", "model", "figures", "outcomes") for s in DEFECTS.values()))
+       and all(s.get("view") in (None, "register", "model", "figures", "outcomes", "spec", "scenarios") for s in DEFECTS.values()))
 
 
 def _producer_words():
@@ -3073,7 +3597,8 @@ def _figures_cases(tmp, ok):
         ok(f"X36 {label}: analysis/figures.yaml names its producer and holds every figure as produced, with the "
            f"producer's own keys; nothing is listed as not produced",
            index["producer"] == FIG_PRODUCER[figures] and index["schema"] == "analysis.figures/1" and data["not_produced"] == []
-           and all(list(e) == want for e in entries) and list(data) == ["figures", "not_produced", "tiers", "groups", "overviews"])
+           and all(list(e) == want + ["checks"] * (e.get("figure") == "trajectories") for e in entries)
+           and list(data) == ["figures", "not_produced", "tiers", "groups", "overviews"])
         names = [e["figure" if standard else "id"] for e in entries]
         if standard:
             ok(f"X37 {label}: three tiers under the producer's names, every figure name one of its tier in the producer's "
@@ -3300,7 +3825,7 @@ def _outcomes_cases(tmp, ok):
        and all(t["status"] == "run" and t["decision_changes"] is False and all(e["verdict"] == est["decision"]["verdict"] for e in t["ends"])
                for t in est["decision_tests"]) and len(est["decision_tests"]) == 2 and sorted(est["outputs"]) == ["q1", "q2"]
        and clean == build(os.path.join(tmp, "again", "estimates_kind"), method="posterior", figures="estimates", kind="estimates"))
-    for name in OUTCOMES_DEFECTS:
+    for name in DEFECTS:
         if "estimates" not in DEFECTS[name].get("kinds", KINDS[:1]):
             continue
         got = build(os.path.join(tmp, "defect", "estimates_kind", name), defect=name, method="posterior", figures="estimates", kind="estimates")
@@ -3315,6 +3840,230 @@ def _outcomes_cases(tmp, ok):
        checks == set(OUTCOME_CHECKS) and {"tests_that_move", "point_vs_draws", "burden_refs", "voi_support", "variant_budget", "run_shift", "dearest_wins"} <= third
        and all((DEFECTS[n].get("against") in OTHERS) == (DEFECTS[n]["check"] == "run_shift") and (DEFECTS[n]["files"] == []) == ("against" in DEFECTS[n])
                for n in OUTCOMES_DEFECTS) and len(OUTCOMES_DEFECTS) == 37, str((sorted(set(OUTCOME_CHECKS) - checks), len(OUTCOMES_DEFECTS))))
+
+
+def _spec_scenarios_words():
+    """Whether each word and sentence the Spec and Scenarios fixtures copy is still in the producer that writes it,
+    read from the source without importing it."""
+    import ast
+
+    def source(*parts):
+        with open(os.path.join(REPO, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def constant(text, name):
+        return next(ast.literal_eval(n.value) for n in ast.parse(text).body if isinstance(n, ast.Assign)
+                    and any(getattr(t, "id", None) == name for t in n.targets))
+    sign, crit, geo = source("toolkit", "spec", "signoff.py"), source("toolkit", "spec", "spec_critique.py"), source("toolkit", "spec", "geometry.py")
+    par, dos, bur = source("toolkit", "spec", "engine_parameters.py"), source("toolkit", "spec", "evidence_dossier.py"), source("toolkit", "analysis", "burden.py")
+    hooks, traj, figs = source("toolkit", "engines", "hooks.py"), source("toolkit", "analysis", "trajectories.py"), source("toolkit", "analysis", "figures.py")
+    always = [constant(crit, "SECTION"), *[h for h in SHEET_ALWAYS[1:4] if f'"{h}"' in sign], *[SHEET_ALWAYS[4]] * (f'out = ["{SHEET_ALWAYS[4]}"]' in geo),
+              *[SHEET_ALWAYS[5]] * (f'out = ["{SHEET_ALWAYS[5]}"]' in par), constant(dos, "SECTION")]
+    rows = _critique(_model("history_matching")) + [("", 0, "", "decision_date {!r} is not a year or an ISO date.", ""),
+                                                    ("", 0, "", "followed the effect for less than", "")]
+    quoted = [x for x in ("the findings the gate would raise after compute; signing with one open accepts it.",
+                          "| Severity | Principle | Check | Finding | What resolves it |", "Anchor the burden (validation.burden anchor rows) or declare this check",
+                          "of allocated components", "Confirm it is the plan as currently funded in every unit",
+                          "actions delivered before the decision would be optimised.", "is not a year or an ISO date.",
+                          "followed the effect for less than") if x not in crit]
+    return {"always": tuple(always), "some": all(f'"{h}"' in sign + bur for h in SHEET_SOME), "kinds": constant(hooks, "KINDS"),
+            "contract": constant(hooks, "HOOKS_CONTRACT"), "footer": constant(sign, "SHEET_SOURCES"), "differs": constant(dos, "DIFFERS_HEADING"),
+            "oa": constant(source("toolkit", "analysis", "outcome_adjust.py"), "REQUIRED"), "quoted": quoted, "n_rows": len(rows),
+            "more": SELECTION in traj and '"schema": "analysis.trajectories/1"' in traj and '"pass" if worst <= 1e-9 else "flag"' in figs
+            and '"status": "info"' in figs and 'o.get("follow_up_years")' in crit and "fetched | matched | unverified" in source("toolkit", "engines", "contract.py")
+            and 'ARCHIVE_DIR, ARCHIVE_PREFIX = "evidence_planner", "superseded_signoff_"' in source("tools", "run_console", "dossier.py")
+            and '"verified")' in par and "No record ({ARTIFACT} is missing): the check has not run." in geo and 'ARTIFACT = "data/input_checks.json"' in geo}
+
+
+def _spec_scenarios_cases(tmp, ok):
+    """The files of the Spec and evidence view (§5.3) and the Scenarios view (§5.6): shaped as the producers write them,
+    agreeing with each other on the clean run and clear of every rule of the two views."""
+    import datetime
+    w = _spec_scenarios_words()
+    ok("X53 the sheet's headings and sentences, the event kinds, the trajectory record's words and the archive's names are the producers' own",
+       w["always"] == SHEET_ALWAYS and w["some"] and tuple(w["kinds"]) == EVENT_KINDS and w["contract"] == HOOKS_CONTRACT
+       and w["footer"] == SHEET_SOURCES and w["differs"] == DIFFERS and set(w["oa"]) == set(OA) and not w["quoted"] and w["more"], str(w))
+    for method in METHODS:
+        d = os.path.join(tmp, "clean", method)
+
+        def text(rel, d=d):
+            with open(os.path.join(d, rel), encoding="utf-8") as f:
+                return f.read()
+
+        def doc(rel, d=d):
+            return json.loads(text(rel, d)) if rel.endswith(".json") else yaml.safe_load(text(rel, d))
+
+        def sha(rel, d=d):
+            return hashlib.sha256(text(rel, d).encode()).hexdigest()
+        spec, record, dossier = doc(SPEC_FILES[1]), doc(SIGNOFF), doc(DOSSIER)["inputs"]
+        obj = spec["objective"]
+        day, signed = datetime.date.fromisoformat(spec["decision_date"]), datetime.date.fromisoformat(record["signed_at"][:10])
+        frac = lambda x: x.year + (x - datetime.date(x.year, 1, 1)).days / (365 + 1 / 4)      # noqa: E731  (spec_critique.py _year_frac)
+        ok(f"X54 {method}: the signed spec names who decides and dates the decision so that the producer's rule raises "
+           f"nothing: the delivery period, inside the outcome window, starts neither before the decision date nor before "
+           f"the day of the signature, and the date is not past on that day",
+           spec["decision_maker"] and obj["delivery"][0] >= frac(day) and obj["delivery"][0] >= frac(signed) and (signed - day).days <= 90
+           and obj["horizon"][0] <= obj["delivery"][0] < obj["delivery"][1] <= obj["horizon"][1] and spec["evidence"] == {"dossier": DOSSIER})
+        obs = [o for e in dossier.values() for o in e.get("observations", [])]
+        cited = [o for o in obs if o["source"] == OA["source"]]
+        span = obj["horizon"][1] - obj["horizon"][0]
+        ok(f"X55 {method}: no outcome adjustment (§5.3: one is for the reader to judge, so each is a variant), and one "
+           f"dossier observation with the source a variant's adjustment gives, word for word; every observation records a "
+           f"follow-up clear of the outcome window and a checked mark; every no-data entry names a decision test; the one "
+           f"spec-set value has a source the spec itself marks matched",
+           "outcome_adjustments" not in spec["analysis"] and len(cited) == 1 and len(obs) == 3
+           and all(o[FOLLOW_UP] >= span / 0.75 and o[CHECKED] for o in obs)
+           and all(e.get("decision_test") for e in dossier.values() if "no_data" in e)
+           and all("no_data" in e or e.get("observations") for e in dossier.values())
+           and [(e["verified"], bool(e["source"])) for e in spec["engine_parameters"].values()] == [("matched", True)]
+           and spec["engine_parameters"]["p2"]["verified"] in MARKS)
+        sheet = text(SHEET).splitlines()
+        heads = [x for x in sheet if x.startswith("## ")]
+        foot = json.loads(sheet[-1][len(SHEET_SOURCES):-4])
+        severities = [x.split("|")[1].strip() for x in sheet if x.startswith("| ") and x.split("|")[1].strip() in ("HIGH", "MEDIUM", "DECLARED", "INFO")]
+        ok(f"X56 {method}: the sheet holds every section the sign-off code writes for any spec, in its order, and the two "
+           f"it writes for this spec (none for outcome adjustments, which it has not); its critique has no HIGH row and its count line says so; its last line holds the "
+           f"hashes of the spec, the dossier and the reference file; the signature has a note",
+           [h for h in heads if h in SHEET_ALWAYS] == list(SHEET_ALWAYS) and set(heads) == set(SHEET_ALWAYS + SHEET_SOME[1:])
+           and severities == ["MEDIUM", "MEDIUM", "INFO", "INFO"] and "0 HIGH, 2 MEDIUM, 0 declared." in text(SHEET)
+           and foot == {"spec_sha256": sha(SPEC_FILES[1]), "burden_references_sha256": sha(BURDEN_CSV), "evidence_dossier_sha256": sha(DOSSIER),
+                        "derivations_sha256": "none", "geometry_evidence_sha256": "none"}
+           and record["note"].strip() and record["signed_by"] == "owner", str((heads, severities)))
+        chain = []
+        for day_ in EARLIER:
+            folder = os.path.join(d, ARCHIVE + day_)
+            rec = doc(f"{ARCHIVE}{day_}/{SIGNOFF}")
+            copies = [os.path.join(at, n) for at, _, names in os.walk(folder) for n in names if n.startswith("decision_spec") and n.endswith(".yaml")]
+            with open(copies[0], "rb") as f:
+                raw = f.read()
+            chain.append((rec, hashlib.sha256(raw).hexdigest(), yaml.safe_load(raw), len(copies)))
+        specs = [c[2] for c in chain] + [spec]
+        changed = [sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k)) for a, b in zip(specs, specs[1:])]
+        ok(f"X57 {method}: two archived sign-offs, each a record with a note and the one spec copy whose hash it holds, "
+           f"older than the current one; each sign-off changed one section of the spec; no archive folder lacks its record",
+           all(n == 1 and rec["sha256"]["decision_spec.yaml"] == h and rec["note"] for rec, h, _, n in chain)
+           and [c[0]["signed_at"] for c in chain] == sorted(c[0]["signed_at"] for c in chain) and chain[-1][0]["signed_at"] < record["signed_at"]
+           and changed == [["decision_maker"], ["uncertainty"]]
+           and sorted(os.listdir(os.path.join(d, "evidence_planner"))) == ["superseded_signoff_" + x for x in EARLIER], str(changed))
+        fd, point, tr = doc(FD)["data"], doc(POINT), doc(TRAJ)
+        sch, plan = fd["schedule"], point["data"]["plan"]
+        events = [(g, e) for g, r in sch["regions"].items() for e in r["events"]]
+        (d0, d1), w1 = sch["delivery"], sch["window"][1]
+        per_group = {g: {lab: sum(c in plan[u].split("+") for u in UNITS if _group(u) == g) for c, lab in (("B", "half round"), ("C", "full round"))}
+                     for g in GROUPS}
+        with open(os.path.join(d, TIMELINE), encoding="utf-8") as f:
+            table = [line.strip().split(",") for line in f][1:]
+        ok(f"X58 {method}: the stored schedule has the producer's keys and no arm; every kind is one the hook writes; each "
+           f"decision event lies inside the delivery period and holds the units whose package has its option; no event "
+           f"starts at or after the end of the outcome window; history lies before delivery and routine outside it; the "
+           f"timeline's table has one row per event; the batch and point files exist",
+           sch["status"] == "ok" and [sch["delivery"], sch["window"]] == [obj["delivery"], obj["horizon"]] and sch["start"] == spec["horizon"]["start"]
+           and all(list(e) == ["component", "label", "kind", "t0", "t1", "units"] and e["kind"] in EVENT_KINDS and e["t0"] < w1 for _, e in events)
+           and {e["kind"] for _, e in events} == set(EVENT_KINDS)
+           and all(d0 <= e["t0"] < d1 for _, e in events if e["kind"] == "decision")
+           and all(e["t0"] < d0 for _, e in events if e["kind"] == "history") and all(not d0 <= e["t0"] < d1 for _, e in events if e["kind"] == "routine")
+           and all(e["units"] == per_group[g][e["label"]] for g, e in events if e["component"] == "B")
+           and len(table) == len(events) and [r[3] for r in table] == [e["kind"] for _, e in events]
+           and os.path.exists(os.path.join(d, BATCH)) and doc(BATCH)["producer"] == "toolkit/analysis/batch.py"
+           and doc(FD)["producer"] == "toolkit/analysis/figure_data.py", str(len(events)))
+        data, entry = tr["data"], next(e for e in doc(FIGS)["data"]["figures"] if e.get("figure") == "trajectories")
+        total = data["series"]["total"]
+        ok(f"X59 {method}: the trajectory record has its producer's header (no spec hash) and words; its inputs have the "
+           f"hashes of the files; its engine is the analysis's identity in the point file and its analysis engine the "
+           f"header's; nine sampled units, three per group; the arms are equal before delivery and the plan lower after",
+           list(tr) == ["schema", "produced_by", "producer", "inputs", "written_at", "data"] and tr["producer"] == "toolkit/analysis/trajectories.py"
+           and all(sha(i) == h for i, h in tr["inputs"].items()) and len(tr["inputs"]) == 7
+           and data["status"] == "ok" and data["engine"] == point["data"]["engine_identity"] and data["analysis_engine"] == point["engine"]
+           and [len(v) for v in data["sample"].values()] == [3, 3, 3] and data["seeds"] == 3 and list(data["series"]["regions"]) == list(GROUPS)
+           and data["delivery"] == sch["delivery"] and data["window"] == sch["window"] and total["t"][0] == sch["start"]
+           and all((c == p) == (x < d0) for x, c, p in zip(total["t"], total["arms"]["comparator"]["m1"], total["arms"]["plan"]["m1"])))
+        ok(f"X60 {method}: the dynamics checks travel with the trajectories figure in analysis/figures.yaml, in the "
+           f"producer's words; they are what the producer's rule gives for the record; none is flagged",
+           entry["checks"] == _dynamics(data) and [(c["check"], c["status"]) for c in entry["checks"]]
+           == [("plan_equals_comparator_before_delivery", "pass"), ("end_of_delivery_step", "info")]
+           and all(c["status"] in DYNAMICS_STATUSES for c in entry["checks"]) and entry["checks"][0]["value"] == 0.0
+           and TRAJ in entry["sources"] and TRAJ in doc(FIGS)["inputs"], str(entry["checks"]))
+
+        def built(name, rel, method=method):
+            with open(os.path.join(tmp, "defect", method, name, rel), encoding="utf-8") as f:
+                return f.read()
+
+        def there(name, rel, method=method):
+            return os.path.exists(os.path.join(tmp, "defect", method, name, rel))
+        try:
+            yaml.safe_load(built("dossier_unparsable", DOSSIER))
+            parses = True
+        except yaml.YAMLError:
+            parses = False
+        short = yaml.safe_load(built("C1_follow_up_short", DOSSIER))["inputs"]["parameter:b_add"]["observations"][0]
+        prose = yaml.safe_load(built("C1_follow_up_prose_only", DOSSIER))["inputs"]["parameter:b_add"]["observations"][0]
+        marks = [[CHECKED in o for e in yaml.safe_load(built(v, DOSSIER))["inputs"].values() for o in e.get("observations", [])]
+                 for v in ("C15_observation_unchecked", "C15_no_checked_marks")]
+        late = yaml.safe_load(built("decision_date_after_delivery_start", SPEC_FILES[1]))
+        many = [yaml.safe_load(built("signoff_note_empty_many_sections", rel)) for rel in (SECOND + SPEC_FILES[1], SPEC_FILES[1])]
+        adjusted = {v: yaml.safe_load(built(v, SPEC_FILES[1]))["analysis"].get("outcome_adjustments")
+                    for v in ("C1_outcome_adjustment", "C1_follow_up_short", "C1_follow_up_prose_only", "C1_source_not_in_dossier")}
+        plain_oa = yaml.safe_load(built("C1_outcome_adjustment", DOSSIER))["inputs"]["parameter:b_add"]["observations"][0]
+        ok(f"X61 {method}: the Spec edits: an outcome adjustment with the producer's keys and its section on the sheet, whose "
+           f"source one dossier observation has word for word (in three of the four); a follow-up shorter than the window "
+           f"with the producer's finding on the sheet; "
+           f"one in prose alone; a spec-set value with no mark; one or every observation unmarked; a dossier that is not YAML; a signed copy that no "
+           f"longer has the recorded hash; a decision date after the start of delivery with the producer's HIGH row; an "
+           f"empty note on a signature that changed six sections; a sheet with no critique section; no sheet; an "
+           f"archive folder with a sheet alone",
+           all(len(a) == 1 and set(a[0]) == set(OA) for a in adjusted.values())
+           and [a[0]["source"] == OA["source"] for a in adjusted.values()] == [True, True, True, False]
+           and all(SHEET_SOME[0] in built(v, SHEET) for v in adjusted) and plain_oa[FOLLOW_UP] >= span / 0.75
+           and "verified" not in yaml.safe_load(built("value_no_mark", SPEC_FILES[1]))["engine_parameters"]["p2"]
+           and short[FOLLOW_UP] < span and "| MEDIUM | 3 | follow_up_window |" in built("C1_follow_up_short", SHEET)
+           and FOLLOW_UP not in prose and "five years" in prose["where"] and marks == [[False, True, True], [False] * 3] and not parses
+           and hashlib.sha256(built("spec_unverified", SPEC_FILES[1]).encode()).hexdigest() != json.loads(built("spec_unverified", SIGNOFF))["sha256"]["decision_spec.yaml"]
+           and built("spec_unverified", SIGNOFF) == text(SIGNOFF)
+           and frac(datetime.date.fromisoformat(late["decision_date"])) > late["objective"]["delivery"][0]
+           and "| HIGH | 2 | decision_date |" in built("decision_date_after_delivery_start", SHEET) and "1 HIGH, 2 MEDIUM" in built("decision_date_after_delivery_start", SHEET)
+           and json.loads(built("signoff_note_empty_many_sections", SIGNOFF))["note"] == ""
+           and len([k for k in set(many[0]) | set(many[1]) if many[0].get(k) != many[1].get(k)]) == 6
+           and SHEET_ALWAYS[0] not in built("sheet_section_missing", SHEET) and all(h in built("sheet_section_missing", SHEET) for h in SHEET_ALWAYS[1:])
+           and not there("sheet_missing", SHEET)
+           and os.listdir(os.path.join(tmp, "defect", method, "archive_no_record", ARCHIVE + EARLIER[1] + "b")) == [SHEET]
+           and yaml.safe_load(built("value_unknown_mark", SPEC_FILES[1]))["engine_parameters"]["p2"]["verified"] not in MARKS)
+
+        def schedule(name):
+            s_ = yaml.safe_load(built(name, FD))["data"]["schedule"]
+            return [e for r in s_["regions"].values() for e in r["events"]]
+        flagged = next(e for e in yaml.safe_load(built("dynamics_flag", FIGS))["data"]["figures"] if e.get("figure") == "trajectories")["checks"]
+        none = yaml.safe_load(built("C5_no_trajectories", FIGS))["data"]
+        other = yaml.safe_load(built("trajectories_other_engine", TRAJ))["data"]["engine"]
+        ok(f"X62 {method}: the Scenarios edits: no trajectory record beside the batch and point files, with the figure "
+           f"listed as not produced in the producer's words; a record for another engine code; a flagged check that the "
+           f"record's own series give; a status word the producer does not write; a decision event after delivery; an "
+           f"event after the window; a kind the hook does not write; and a run stopped at the calibration has neither a "
+           f"batch nor a point file",
+           not there("C5_no_trajectories", TRAJ) and there("C5_no_trajectories", BATCH) and there("C5_no_trajectories", POINT)
+           and {"figure": "trajectories", "reason": NO_TRAJECTORIES, "tier": "simulation"} in none["not_produced"]
+           and other["code_sha256"] != point["data"]["engine_identity"]["code_sha256"] and other["name"] == ENGINE["name"]
+           and flagged[0]["status"] == "flag" and flagged[0]["value"] > 1e-9
+           and flagged == _dynamics(yaml.safe_load(built("dynamics_flag", TRAJ))["data"])
+           and next(e for e in yaml.safe_load(built("dynamics_unknown_status", FIGS))["data"]["figures"] if e.get("figure") == "trajectories")["checks"][0]["status"] not in DYNAMICS_STATUSES
+           and [e["t0"] for e in schedule("schedule_decision_outside") if e["kind"] == "decision" and not d0 <= e["t0"] < d1] == [d1 + 0.25]
+           and [e["t0"] for e in schedule("schedule_event_after_window") if e["t0"] >= w1] == [w1 + 0.5]
+           and [e["kind"] for e in schedule("schedule_unknown_kind") if e["kind"] not in EVENT_KINDS] == ["campaign"]
+           and not {BATCH, POINT, TRAJ, FD} & set(os.listdir(os.path.join(tmp, "upto", method, "calibration", "analysis")) and
+                                                 {f"analysis/{n}" for n in os.listdir(os.path.join(tmp, "upto", method, "calibration", "analysis"))}))
+    kind = os.path.join(tmp, "clean", "estimates_kind")
+    with open(os.path.join(kind, SHEET), encoding="utf-8") as f:
+        sheet = f.read()
+    ok("X63 the estimates kind has no schedule, batch or trajectory record and its spec no outcome adjustment; its sheet "
+       "holds every section written for any spec and no HIGH row",
+       not {FD, BATCH, TRAJ} & {f"analysis/{n}" for n in os.listdir(os.path.join(kind, "analysis"))}
+       and all(h in sheet for h in SHEET_ALWAYS) and "0 HIGH, 0 MEDIUM, 0 declared." in sheet and "| HIGH |" not in sheet)
+    third = {v: {c for n in names for c, st in {DEFECTS[n]["check"]: DEFECTS[n]["status"], **DEFECTS[n].get("also", {})}.items()
+                 if st in ("problem", "not_available")} for v, names in (("spec", SPEC_DEFECTS), ("scenarios", SCENARIOS_DEFECTS))}
+    fires = {v: {DEFECTS[n]["check"] for n in names if DEFECTS[n]["status"] in ("look", "problem")} for v, names in (("spec", SPEC_DEFECTS), ("scenarios", SCENARIOS_DEFECTS))}
+    ok("X64 the edits of the Spec view (20) and of the Scenarios view (8): every check has one that fires and one whose "
+       "inputs contradict each other or miss a piece, on which it is neither ok nor look",
+       fires["spec"] == set(SPEC_CHECKS) == third["spec"] and fires["scenarios"] == set(SCENARIOS_CHECKS) == third["scenarios"]
+       and len(SPEC_DEFECTS) == 20 and len(SCENARIOS_DEFECTS) == 8, str((fires, third, len(SPEC_DEFECTS), len(SCENARIOS_DEFECTS))))
 
 
 def _self_test():
@@ -3352,10 +4101,12 @@ def _self_test():
             with open(os.path.join(d, "decision_spec.signoff.json")) as f:
                 so = json.load(f)
             listed = {**man["artifacts"], **man["deliverables"]}
-            ok(f"X4 {method}: headers, sign-off and manifest all record the spec and files on disk",
-               all(s == spec_sha for s, _, _ in heads.values()) and so["sha256"] == {"decision_spec.yaml": spec_sha, DOSSIER: clean[method][DOSSIER]}
+            ok(f"X4 {method}: headers, sign-off and manifest all record the spec and files on disk; the trajectory record "
+               f"alone has no spec hash in its header and is outside the manifest, as its producer writes it",
+               all(s == spec_sha for r, (s, _, _) in heads.items() if r != TRAJ) and heads[TRAJ][0] is None
+               and so["sha256"] == {"decision_spec.yaml": spec_sha, DOSSIER: clean[method][DOSSIER]}
                and clean[method]["decision_brief.signed/decision_spec.yaml"] == spec_sha
-               and set(man["artifacts"]) == set(heads) and all(clean[method][r] == v["sha256"] for r, v in listed.items()))
+               and set(man["artifacts"]) == set(heads) - {TRAJ} and all(clean[method][r] == v["sha256"] for r, v in listed.items()))
             with open(os.path.join(d, "run_state.json")) as f:
                 state = json.load(f)
             moves = [(h["from"], h["to"]) for h in state["history"]]
@@ -3381,7 +4132,10 @@ def _self_test():
                 expect = (_follows(d, clean[method], touched(name, method)) if spec.get("follows", True)
                           else set(touched(name, method)))
                 # a test's own result file follows its row in the tests file, or its entry in the signed spec
+                # and the timeline figure's table follows the stored schedule, which no file hashes
                 own = {r for r in diff if r.startswith(TESTS_DIR)}
+                drawn = {TIMELINE} & diff if FD in expect else set()
+                expect, diff = expect - {TIMELINE}, diff - drawn
                 ok(f"X8 {method}: {name} changes the files its edit names, the files that hash them, and no others",
                    diff - own == expect and (not own or DT in expect or SPEC_FILES[1] in expect),
                    f"unexpected {sorted(diff - own - expect)}, missing {sorted(expect - diff)}")
@@ -3427,6 +4181,7 @@ def _self_test():
                diff == expect, f"unexpected {sorted(diff - expect)}, missing {sorted(expect - diff)}")
         _figures_cases(tmp, ok)
         _outcomes_cases(tmp, ok)
+        _spec_scenarios_cases(tmp, ok)
         for bad in ({"method": "unknown"}, {"defect": "unknown"}, {"upto": "unknown"},
                     {"defect": "C2_change_flagged", "method": "posterior"}, {"figures": "unknown"}, {"figures": "estimates"},
                     {"figures": "estimates", "method": "posterior", "defect": "figure_not_produced"},
