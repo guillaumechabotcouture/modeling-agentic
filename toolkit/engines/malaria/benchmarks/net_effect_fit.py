@@ -2299,6 +2299,85 @@ def _self_test() -> int:
         ok(got == {16: "Standard_E16s_v5", 96: "Standard_E96s_v5"},
            f"FA13 the printed launch resolves to the Esv5 family first ({got})")
     case("FA13", fa13)
+
+    # F6 option A refit b (owner, 19 Nov): Muleba's B9 and B9b leave the training targets (declared departure) and are
+    # monitored; the stored cache of 18 Nov is reused (its tasks must match exactly); the wave-2 box is the box as ran;
+    # --margin-loo off; an optional extension wave past pad's old ceiling
+    rb = OPTION_A.get("refit_b") or {}
+
+    def fb1():
+        ok(OPTION_A["targets"] == ["B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11", "B12", "B12b", "B12m"]
+           and OPTION_A.get("monitor") == ["B9", "B9b"] and "0/220" in str(OPTION_A.get("departure"))
+           and not set(OPTION_A["monitor"]) & set(OPTION_A["targets"]) and set(OPTION_A["monitor"]) <= set(held),
+           f"FB1 B9 and B9b are held out of the fit and monitored, with the departure stated ({OPTION_A.get('monitor')})")
+    case("FB1", fb1)
+
+    def fb2():
+        # the 18 Nov tasks held every arm of the 12 targets per setting and seed; dropping B9/B9b would leave Muleba's
+        # tasks without mul_pbo and miss the cache: the runner adds a monitored target's arms to a call that runs its
+        # setting, so the tasks are the same
+        rr = RecalRunner(p, e, 1, [11], mode="fit", evidence=BM.load_evidence(e, pack=p))
+        seen = []
+        rr._arm_jobs = lambda a, f: (seen.append(a), [("job", a)])[1]
+        rr._map = lambda jobs, chunk=300: [{"windows": {}} for _ in jobs]
+        rr.set_calibration({"muleba": 60.0, "misungwi": 11.0, "benin": 10.0, "irs_added": 20.0, "llineup": 3.3})
+        arms10 = sorted({a for t in OPTION_A["targets"] for a in BM._arms_of(byid[t]["estimand"])})
+        arms12 = sorted(set(arms10) | {a for t in OPTION_A["monitor"] for a in BM._arms_of(byid[t]["estimand"])})
+        rr.prefetch(arms10, [{"net_kill_shift": 0.0, "cfp_kill": 0.4}])
+        seen2 = list(seen)
+        seen.clear()
+        rr.prefetch(["mis_dual", "mis_pyr"], [{"net_kill_shift": 0.1, "cfp_kill": 0.4}])
+        ok(seen2 == arms12 and seen == ["mis_dual", "mis_pyr"],
+           f"FB2 a call running Muleba gains the monitored arms in the 18 Nov order ({seen2}); one without it does not "
+           f"({seen})")
+    case("FB2", fb2)
+
+    def fb3():
+        got = {}
+        for label, kw in (("no cache", {}), ("margin-loo", {"margin_loo": True, "resume_from": "/nonexistent"}),
+                          ("another cache", {"resume_from": HERE})):
+            try:
+                run(p, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=False, cap_usd=1e9, **kw)
+                got[label] = ""
+            except ValueError as ex:
+                got[label] = str(ex)
+        ok(rb.get("cache_sha256") == "b0c557b808a0b89905ba16b633868957a9794dc72346c9cba2fb363d368cebff"
+           and "resume" in got["no cache"] and "margin" in got["margin-loo"] and "sha256" in got["another cache"],
+           f"FB3 refit b runs only from the stored 18 Nov cache (pinned sha256) and without --margin-loo: {got}")
+    case("FB3", fb3)
+
+    def fb4():
+        q = plan(p, vcpus=96)
+        ext = rb.get("extension") or {}
+        n_ext = int(ext.get("n") or 0)
+        ok(q.get("refit_b") is True and q["calibration_runs"] == 0 and q["design_points"] == n_ext
+           and q["wave1_points_run"] == 1 and q["arm_runs"] < 30000,
+           f"FB4 refit b prices only new tasks: wave 1's re-chosen point, {n_ext} extension points, the chosen point "
+           f"and {VERIFY} sample points ({q['arm_runs']} arm runs, {q['wall_hours']} h, ${q['usd_real']})")
+    case("FB4", fb4)
+
+    def fb5():
+        import shlex
+        cmd = shlex.split(plan(p, vcpus=96)["launch"])
+        tail = cmd[cmd.index("--") + 1:]
+        ok(cmd[3] == "f6-refit-optiona-b" and "--dir" in cmd and "--tree" not in cmd
+           and tail[tail.index("--resume-from") + 1] == rb.get("resume_dir") and "--margin-loo" not in tail
+           and cmd[cmd.index("--cap-usd") + 1] == "100",
+           f"FB5 the refit-b launch ships the tree and the cache (--dir), resumes from it, no --margin-loo, cap $100: "
+           f"{' '.join(cmd)}")
+    case("FB5", fb5)
+
+    def fb6():
+        # the extension wave (when set): LHS points with pad past the old ceiling and every other parameter over the
+        # design box; the box the surrogate and the choice use then reaches the new ceiling
+        ext = {"n": 7, "seed": 37, "param": "pbo_adv_decay", "range": [1.895, 2.23]}
+        pts = extension_points(rb["design_box"], ext)
+        dbx = rb["design_box"]
+        ok(len(pts) == 7 and all(1.895 <= q["pbo_adv_decay"] <= 2.23 for q in pts)
+           and all(dbx[k][0] <= q[k] <= dbx[k][1] for q in pts for k in dbx if k != "pbo_adv_decay")
+           and extension_points(dbx, None) == [],
+           f"FB6 the extension wave lies past the old ceiling, inside the design box elsewhere ({pts[:1]})")
+    case("FB6", fb6)
     OPTION_A["cap_usd"] = shipped_cap
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
