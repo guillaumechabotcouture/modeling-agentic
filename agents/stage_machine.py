@@ -463,8 +463,20 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
             continue
         try:
             import yaml
-            doc = yaml.safe_load(open(p)) or {}
-        except Exception:  # noqa: BLE001 -- the gate already failed closed on an unreadable file
+            with open(p) as fh:
+                doc = yaml.safe_load(fh)
+            # No defaults before the check (Codex on #264, P1): an empty or truncated file, or one without a
+            # `blockers` list (a required key), is unreadable, never "no blockers".
+            why = None if isinstance(doc, dict) and isinstance(doc.get("blockers"), list) else \
+                f"top level is {type(doc).__name__}, or it has no `blockers` list"
+        except Exception as e:  # noqa: BLE001
+            why = f"{type(e).__name__}: {str(e)[:160]}"
+        if why is not None:
+            # The gate refuses to act on such a file (a schema error), so this is not reached from GATE; kept fail
+            # closed for any other caller: an open HIGH, never skipped (external review 2026-11-17).
+            out.append({"id": f"critique_unreadable:{reviewer}", "source": "harness", "severity": "HIGH",
+                        "tested": False, "claim": f"{name} could not be read as a critique ({why})",
+                        "fix_requires": "the critic rewrites its YAML"})
             continue
         for b in doc.get("blockers") or []:
             if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
@@ -2756,6 +2768,26 @@ def _self_test() -> int:
             {"kind": "critique_presentation_missing", "severity": "MEDIUM", "claim": "no review"}]}
         ok({o["id"] for o in open_findings(d43, g43)} == {"done_when_unmet:D-001", "critique_presentation_missing"},
            "T43 a resolved blocker whose test fails, and a missing presentation review, stay open")
+        # OF1-OF2 (external review 2026-11-17): an unreadable reviewer YAML is fail-closed. The gate refuses to
+        # decide (a schema error the critic is asked to repair; once the repairs are used the run ends
+        # completed_gate_error), so open_findings, which runs only on a gate action, never sees it; and
+        # open_findings itself reports such a file as an open HIGH, never skips it or raises.
+        for tag, body in (("garbled", "blockers: [unclosed\n  : -\n"), ("list", "- a\n- b\n"), ("text", "just prose\n"),
+                          ("empty", ""), ("no_blockers", "reviewer: critique-domain\n"), ("false", "blockers: false\n")):
+            dof = os.path.join(td, f"of_{tag}")
+            os.makedirs(dof)
+            shutil.copy(os.path.join(FX_DIR, "critique_redteam.yaml"), dof)
+            open(os.path.join(dof, "critique_domain.yaml"), "w").write(body)
+            gof = v2_gate(dof, 1, 2, False, [], history=False)
+            ok(gof.get("action") is None and any("critique_domain.yaml" in str(e) for e in gof.get("schema_errors") or []),
+               f"OF1 [{tag}] the gate takes no action on an unreadable reviewer YAML and names it ({gof})")
+            try:
+                oof = open_findings(dof, {"action": "ACCEPT", "rigor_violations": []})
+            except Exception as e:  # noqa: BLE001
+                oof = [f"raised {type(e).__name__}"]
+            ok(any(isinstance(o, dict) and o.get("id") == "critique_unreadable:critique-domain"
+                   and o.get("severity") == "HIGH" for o in oof),
+               f"OF2 [{tag}] open_findings reports the unreadable reviewer YAML as an open HIGH ({oof})")
         fr = os.path.join(td, "t44")
         os.makedirs(os.path.join(fr, "models"))
         shutil.copy(os.path.join(FX_DIR, "claims_ledger.yaml"), os.path.join(fr, "models", "claims_ledger.yaml"))
