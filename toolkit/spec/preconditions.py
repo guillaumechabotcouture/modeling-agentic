@@ -59,7 +59,7 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     load_posterior's sha256, finalize() replay, seeds, engine identity and hard bounds), its columns' ranges from
     posterior_ranges, and the run's design box (batch.design_box) must cover them. Without it the owner could sign a
     spec whose posterior the analysis refuses only at its start (f6-posterior-ranges)."""
-    if (spec.raw.get("uncertainty") or {}).get("net_effect_posterior") is None:
+    if "net_effect_posterior" not in (spec.raw.get("uncertainty") or {}):       # empty: refused by posterior_input
         return []
     if getattr(spec, "engine_pending", False):
         return ["net_effect_posterior: engine: auto is still pending; the posterior is bound to one engine's fit and "

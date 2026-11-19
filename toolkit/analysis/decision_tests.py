@@ -253,6 +253,9 @@ def interaction_arms(spec, eng, bench) -> dict:
     """The arm odds ratios an interaction test reads: at the spec values when the spec sets engine parameters
     (verified_spec_benchmarks), else from the engine's verified results. {arm, src, inputs} or {not_run}."""
     from toolkit.spec import engine_parameters as PV
+    if "net_effect_posterior" in (spec.raw.get("uncertainty") or {}):
+        # v2-posterior-point (Codex r1 P1-2): the outcomes are at the posterior's chosen point; no arm ratios are
+        return {"not_run": "benchmark arm ratios are not computed at the net-effect posterior's chosen point"}
     if PV.values(spec):
         # the outcomes are at the spec values, so the arms must be too (review round 2, R2-1): never derive the
         # rescaling from arms at the card values and apply it to outcomes at the spec values

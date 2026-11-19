@@ -43,6 +43,7 @@ if ROOT not in sys.path:
 from toolkit.analysis.core import q  # noqa: E402
 PRODUCER = "toolkit/analysis/uncertainty.py"
 ORDER = ("engine_parameters", "calibration", "costs", "emulator")
+POINT_TOL = 1e-6           # v2-posterior-point: a value within the fit file's 6-decimal rounding of the chosen point
 NE_STREAM = 0x6E6566        # the net-effect posterior's row choice: its own stream, the other sources' draws unchanged
 
 
@@ -51,10 +52,11 @@ def posterior_input(spec) -> dict | None:
     the spec, the owner-signed sha256 and the file's bytes, read once per spec and refused unless their sha256 is the
     signed one (Codex r1 P1-1, P2-4). The manifest, the engine artifact's input and the Drawer all use these bytes.
     Optional `margin` (default 0): the share of the sample's hull width each side of its columns' ranges is widened by
-    (net_effect_sample). None without the field."""
-    p = (spec.raw.get("uncertainty") or {}).get("net_effect_posterior")
-    if p is None:
+    (net_effect_sample). None without the field; a field left empty is refused (Codex r1 P1-6, v2-posterior-point)."""
+    u = spec.raw.get("uncertainty") or {}
+    if "net_effect_posterior" not in u:
         return None
+    p = u["net_effect_posterior"]
     if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip() \
             or not isinstance(p.get("sha256"), str) or set(p) - {"path", "sha256", "margin"}:
         raise ValueError("uncertainty.net_effect_posterior: {path: net_effect_fit.py's output file, sha256: its "
@@ -122,18 +124,31 @@ def chosen_point(post: dict, names) -> dict:
                                        or not np.isfinite(pt[k]) for k in names):
         raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: no verified chosen point with a finite value "
                                    f"for each of {list(names)} (joint_region.verified.chosen.point: {pt!r})")
+    fp = doc.get("parameters") if isinstance(doc.get("parameters"), dict) else {}     # run()'s fit values (Codex r1 P1-4)
+    off = [k for k in names if not isinstance(fp.get(k), dict) or isinstance(fp[k].get("value"), bool)
+           or not isinstance(fp[k].get("value"), (int, float)) or abs(float(fp[k]["value"]) - float(pt[k])) > POINT_TOL]
+    if off:
+        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: the chosen point of {off} is not the fit's "
+                                   f"recorded parameter values (parameters: {[fp.get(k) for k in off]}; chosen point: "
+                                   f"{[pt[k] for k in off]})")
     return {k: float(pt[k]) for k in names}
 
 
 def posterior_point(spec, ne: dict | None, theta: dict) -> dict:
     """`theta` with every posterior column at the fit's chosen point (core.Analysis.theta0, joint_calibration.theta0).
-    A spec engine_parameters value of a column that differs from it (beyond 1e-6 x max(1, |value|), the fit file's
-    6-decimal rounding) is refused. `theta` unchanged without a posterior."""
+    A spec engine_parameters value of a column that differs from it by more than POINT_TOL (the fit file's 6-decimal
+    rounding, whatever the magnitude: Codex r1 P1-5) is refused. So is a likelihood or posterior calibration, whose
+    engine parameters are the calibrated ones over engine defaults, never this point (Codex r1 P1-1). `theta`
+    unchanged without a posterior."""
     if ne is None:
         return theta
+    m = (spec.raw.get("calibration") or {}).get("method")
+    if m in ("likelihood", "posterior"):
+        raise ValueError(f"uncertainty.net_effect_posterior with calibration.method {m}: that calibration evaluates the "
+                         "engine at its default values, not at the posterior's chosen point; not supported")
     from toolkit.spec import engine_parameters as PV
     sv = PV.values(spec)
-    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv and abs(sv[k] - v) > 1e-6 * max(1.0, abs(v))}
+    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv and abs(sv[k] - v) > POINT_TOL}
     if bad:
         raise ValueError("engine_parameters: " + "; ".join(
             f"{k} is set to {a}, but the net-effect posterior's verified chosen point is {b}; the chosen point is the "
