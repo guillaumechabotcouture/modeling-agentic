@@ -558,6 +558,24 @@ Corrections from deriving the register by hand on R4, F5 and FLU (2026-11-18):
 - What is specific to some runs: only `findings`, `uncertainty_excluded` and `decision_tests`
   exist on FLU. The model is unchanged; absent sources are absent from `by_source`.
 
+Settled by the external review of the register (2026-11-19):
+
+- Identity before coincidence: a declaration or departure is matched to its own entry (engine,
+  typed component or benchmark, explicit finding id) before any match by a shared test.
+- One loader for decision tests and one for the sign-off record, shared by every view. The
+  sign-off record is chosen as the producer chooses it (`toolkit/spec/signoff.py`). A test
+  "ran" only with status run and a real verdict; a status and verdict that disagree are
+  `problem`.
+- A file the sign-off record does not bind is not signed. Until gap H14 lands, a HIGH row on
+  the sign-off sheet is open, and the sentence says the record does not bind the sheet.
+- Nothing is read in part: the ledger and the sheet are streamed; a malformed list entry or
+  note line is a `problem` naming its position.
+- The rows table also has `evidence` (for an implemented row, the gate's recorded result) and
+  a fact `n_implemented_unverified`; a table `tests` gives each decision test's own question.
+  With fewer than twelve science rows (workbench threshold) the charts are left out.
+- Row order: blocking and highest-severity open rows; open rows whose test changes the plan;
+  other open rows; rows with a disposition; process rows.
+
 Settled while the register's fixtures and tests were written (2026-11-18):
 
 - The clean fixture's spec has no departure, limitation or assumption comment; those lines are a
@@ -620,6 +638,7 @@ path, waits for the F6 report. The workbench shows the gap in the view until the
 | H10 | The engine choice's hash in the analysis headers | Model |
 | H12 | The comparison figure's spec diff (`toolkit/analysis/figures.py` `spec_differences`) misses spec sections: for F6 run 3 against run 4 it named only decision tests, while the signed specs also differ in `analysis.outcome_adjustments`, which is what doubled the headline | C6 |
 | H13 | A harness-written file in the analysis folder that is outside the manifest and records no spec hash (`analysis/benchmarks_at_spec_values.yaml`), so nothing ties it to the signed spec | Steps |
+| H14 | The sign-off sheet's hash in the sign-off record. The sheet is compared at signing but never recorded, so nothing binds what the owner read; a HIGH row on the sheet cannot be shown as accepted by signing | Register |
 
 ## 8. The catch-early scorecard
 
@@ -642,7 +661,7 @@ walked through or resting on text).
 | C9 | Wrong pipeline or unknown code ran (2026-11-05) | launch | steps `pipeline`, development `launch_tree` | 1 |
 | C10 | Signed spec differs from the spec used or on disk (F6 run 4) | sign-off | steps `signed_spec`, `inputs_fresh` | 1 |
 | C11 | Spend or time far above the estimate (P6, F6 run 1) | during the run | steps `cost`, spend | 1 |
-| C12 | A reviewer's condition dropped with no disposition (F6 run 3) | review | register | 0 |
+| C12 | A reviewer's condition dropped with no disposition (F6 run 3) | review | register | 2 |
 | C13 | Calibration blocked, tiny region, parameters on bounds (F6 run 4) | calibration | fit `status`, `region` | 2 |
 | C14 | Inputs the data do not constrain carry the decision (F6) | analysis | fit `constrained`, outcomes `voi_support` | 1 |
 | C15 | Wrong source behind an input (first malaria review) | evidence | spec `dossier_coverage` | 0 |
@@ -792,6 +811,29 @@ The questions as they were put:
   Candidate checks not yet specified: targets matched by an equal number of free parameters
   (FLU: five targets, five free ratios, so they do not test fit); best point far from the
   posterior median along a ridge (DEN).
+- 2026-11-19, external review of the register and the notes endpoint: 9 P1 and 1 P2, none
+  judged wrong, each reproduced with a failing test and fixed (rules in §6). The six reader
+  findings below were fixed in the same pass. Acceptance re-derived: one class of entry changed
+  on R4 and F5 (the sheet's HIGH row is open, not declared: gap H14). Science rows open: 35 of
+  47 on R4, 10 of 17 on F5, 16 of 19 on FLU.
+- 2026-11-19, loop iteration 2, step 5 (walkthrough): a fresh agent saw three pages only (an
+  open blocking finding, a declared item whose test did not run, a clean run). It named both
+  planted defects with their check, row and source file, and raised neither on the clean run.
+  C12 scores 2 (12 of 32 in all). Its reader findings on the register, to fix next:
+  1. row order: blocking and highest-severity rows first, then rows whose test changes the
+     plan, then the rest; within a disposition, by severity;
+  2. "implemented" cannot be verified from the page: a row is `implemented` only with its
+     evidence shown (the gate's recorded result for the finding's done-when test); without it
+     the disposition reads "implemented, not verified" and counts as open for
+     `register.undisposed`;
+  3. a check's sentence names the rows it counts (first few ids), and says when its count
+     differs from a fact of a similar name and why;
+  4. define on the page: science and process rows (and mark process rows), first visible
+     stage, blocking; show each decision test's own question beside its id;
+  5. the sources note must not say a source gave no row when rows list it; drop charts and
+     summary tables that only repeat the facts when there are few rows;
+  6. fixture realism: a process finding about a stale input must agree with the Steps check on
+     the same fixture.
 - 2026-11-19, loop iteration 2, step 4: register view built by a fresh agent (derivation, six
   checks, the review-notes endpoint and page control). Self-tests pass (register 56 cases);
   acceptance passes on R4, F5 and FLU with no entry changed. First CI run failed two repo-wide
