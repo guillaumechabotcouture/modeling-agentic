@@ -1595,6 +1595,22 @@ def _self_test() -> int:
                                   f"{sorted(k for k, v in why.items() if not v) or 'none'}")
     case("F28", f28)
 
+    import contextlib
+
+    @contextlib.contextmanager
+    def wave1_identity():
+        # engine v0.18 changed the code identity, so wave 1's output (v0.17) is refused by its identity first; the
+        # reuse tests check the other conditions with the identity wave 1 recorded (a test double)
+        from toolkit.engines import contract as CT
+        orig = CT.engine_identity
+        rec = (yaml.safe_load(open(WAVE1)) or {}).get("engine_identity") or {}
+        CT.engine_identity = lambda eng: dict(orig(eng), **{k: rec[k] for k in ("name", "code_sha256", "params_sha256",
+                                                                                 "config_sha256") if k in rec})
+        try:
+            yield
+        finally:
+            CT.engine_identity = orig
+
     def f19():
         import hashlib
         import tempfile
@@ -1642,7 +1658,8 @@ def _self_test() -> int:
         ok(not wrong, f"F19b wave 1 is reused only under the same engine identity, pack, seeds, targets and calibration "
                       f"grid, from the recorded file ({len(why)} refusals; for another reason or not at all: "
                       f"{wrong or 'none'})")
-    case("F19", f19)
+    with wave1_identity():
+        case("F19", f19)
 
     def f19c():
         # F6 option A: a held-out benchmark (and its setting) added to the pack does not touch what wave 1 ran, so its
@@ -1680,7 +1697,8 @@ def _self_test() -> int:
         ok(got.get("held") == "" and "declarations" in got.get("train", "") and "declarations" in got["effective"],
            f"F19c wave 1 stays reusable when the pack gains a held-out benchmark and setting, and is refused when a "
            f"training target's declaration changes ({got})")
-    case("F19c", f19c)
+    with wave1_identity():
+        case("F19c", f19c)
 
     def f20():
         old = {"a": [0.0, 1.0], "b": [10.0, 20.0], "c": [0.0, 1.0]}
