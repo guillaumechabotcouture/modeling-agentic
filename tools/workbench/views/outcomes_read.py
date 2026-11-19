@@ -95,14 +95,76 @@ def near(value, threshold):
     return v is not None and t is not None and t > 0 and (1 - NEAR) * t <= v <= t
 
 
+def schema(rel):
+    """The schema word this view reads an analysis file as (toolkit/analysis: `analysis.<file name>/1`)."""
+    return f"analysis.{os.path.basename(rel)[:-len('.yaml')]}/1"
+
+
 def data(run, rel):
-    """(the `data` mapping of an analysis file, None) or (None, why)."""
+    """(the `data` mapping of an analysis file, None) or (None, why). The adapter boundary (§3a): a file whose header
+    names another schema than the one this view reads, or none, is not read as if it were that one."""
     doc, why = run.large(rel)
     if doc is None:
         return None, why
+    if doc.get("schema") != schema(rel):
+        return None, (f"{rel} has the schema {doc.get('schema')!r}, which this view does not know (it reads {schema(rel)}), so nothing "
+                      "in it is read as if it were that one")
     if not isinstance(doc.get("data"), dict):
         return None, f"{rel} holds no data mapping"
     return doc["data"], None
+
+
+def rows(D, key, rel):
+    """(the list of mappings at D[key], None), or (None, why) when it is no list or an entry is no mapping: a row that
+    cannot be read is named by its position, never dropped (§6: nothing is read in part)."""
+    got = D.get(key)
+    if not isinstance(got, list):
+        return None, f"{rel} holds no list at data.{key}"
+    bad = [i for i, e in enumerate(got) if not isinstance(e, dict)]
+    if bad:
+        return None, f"{rel} data.{key}[{bad[0]}] is no mapping" + (f" (nor are {len(bad) - 1} more entries)" if len(bad) > 1 else "") + ", so the list is not read in part"
+    return got, None
+
+
+def units(run, doc):
+    """(the rows of the units table as {unit id: row}, None) or (None, why): the table the verified signed spec names
+    (decision_units.csv, with its id column decision_units.id), read inside the run folder."""
+    import csv
+    import io
+    rel, col = at(doc, "decision_units", "csv"), at(doc, "decision_units", "id")
+    if not isinstance(rel, str) or not isinstance(col, str):
+        return None, "the verified signed spec names no units table and id column (decision_units.csv, decision_units.id)"
+    raw, why = run.read(rel, 32 << 20)
+    if raw is None:
+        return None, f"the units table {rel} could not be read ({why})"
+    try:
+        table = list(csv.DictReader(io.StringIO(raw.decode("utf-8", "replace"))))
+    except csv.Error as e:
+        return None, f"the units table {rel} is no CSV table ({e})"
+    if not table or col not in table[0]:
+        return None, f"the units table {rel} has no rows or no id column {col}"
+    return {str(r[col]): r for r in table}, None
+
+
+def provenance(run, rel):
+    """What a run records of itself outside its spec, for a comparison with another run (§12, reader finding 1): the
+    launch commit and pipeline (metadata.json), the engine identity in the header of the analysis file `rel`, and
+    every input hash an analysis file records, by input path. Recorded files only; a part not recorded is absent."""
+    out = {}
+    meta, _ = run.json("metadata.json")
+    for k, name in (("commit", "launch commit"), ("pipeline", "pipeline")):
+        out[name] = meta.get(k) if isinstance(meta, dict) and isinstance(meta.get(k), (str, int, float)) else None
+    doc, _ = run.large(rel)
+    eng = doc.get("engine") if doc is not None and isinstance(doc.get("engine"), dict) else {}
+    for k, v in eng.items():
+        out[f"engine {k}"] = v
+    held = {}
+    for a in run.artifacts():
+        for i in a["inputs"]:
+            held.setdefault(str(i["path"]), set()).add(str(i["sha256"])[:10] if checks.digest(i["sha256"]) else "no valid hash")
+    for path in sorted(held, key=lambda x: (x.startswith("analysis/"), x)):       # the run's inputs first, then what the analysis computed from them
+        out[f"input {path}"] = ", ".join(sorted(held[path]))
+    return out
 
 
 def absent(why):
@@ -128,7 +190,7 @@ def empty(kind, s):
             "plan_rows": None, "components": None, "dearest": None, "point": None, "headline": None, "outcomes": None, "voi": None,
             "variants": None, "burden": None, "stability": None, "stability_rows": None, "emulator": None, "boundary": None,
             "fixed": None, "dominated": None, "outputs": None, "decision": None, "allowance": None, "tests": None, "link_why": None,
-            "facts": {"deliverable_kind": kind}}
+            "tie": None, "plan_clash": None, "provenance": None, "facts": {"deliverable_kind": kind}}
 
 
 def entries(s):
@@ -159,7 +221,8 @@ def issues(run):
 def test_rows(run, s, loaded, ask):
     """The generic model's test rows from a shared loader's result (`loaded`: {id: record}). `ask(id, record)` gives
     (question, varied). Each row has the columns of TEST_COLUMNS and, for the checks, `state`, `counts`, `feasible`,
-    `excused` (the producer's own not-run scenario for an input the verified signed spec excludes) and `parameter`."""
+    `excused` (the producer's own not-run scenario for an input the verified signed spec excludes), `parameter`, and
+    the loader's own judgement carried whole: `spec` and `spec_says` (how the file's spec hash stands) and `clash`."""
     linked, why = issues(run)
     left_out, spec_tests = set(excluded(s)), entries(s)
     rows = []
@@ -169,13 +232,33 @@ def test_rows(run, s, loaded, ask):
                "share_pct": t["share_pct"], "share_threshold_pct": t["threshold_pct"], "regret_pct": t["regret_pct"],
                "regret_threshold_pct": t["regret_threshold_pct"], "moved_pct": t["dollars_share_pct"],
                "moved_threshold_pct": t["dollars_threshold_pct"], "issue": linked.get(tid),
-               "state": t["state"], "counts": t["counts"], "feasible": t["feasible"],
+               "state": t["state"], "counts": t["counts"], "feasible": t["feasible"], "spec": t["spec"], "spec_says": t["spec_says"],
+               "clash": t.get("clash"),
                "parameter": t.get("parameter") or text((spec_tests.get(tid) or {}).get("parameter"), 200)}
         row["near_miss"] = t["state"] == "ran" and t["verdict"] == "NO_CHANGE" and any(
             near(row[k], row[k.replace("_pct", "_threshold_pct")]) for k in ("share_pct", "regret_pct", "moved_pct"))
         row["excused"] = t["state"] == "not_run" and tid.startswith(SCENARIO) and tid[len(SCENARIO):] in left_out
         rows.append(row)
     return rows, why
+
+
+def tie(loaded):
+    """(how the tests' file stands against the verified signed spec, the loader's sentence when it is not the same):
+    the shared loader's own word, carried into the model so no check judges it again. None with no test."""
+    first = next(iter(loaded.values()), None)
+    return (first["spec"], first["spec_says"]) if first else None
+
+
+def test_counts(m):
+    """The four counts of test results for the facts: null unless the tests' file records the verified signed spec."""
+    t = m["tests"]
+    counted = t is not None and (m["tie"] is None or m["tie"][0] == "same")
+
+    def count(fn):
+        return sum(1 for r in t if fn(r)) if counted else None
+    return {"n_tests": None if t is None else len(t), "n_tests_no_change": count(lambda r: r["state"] == "ran" and r["verdict"] == "NO_CHANGE"),
+            "n_tests_change_plan": count(lambda r: r["state"] == "ran" and r["verdict"] == "CHANGES_PLAN"),
+            "n_tests_not_run": count(lambda r: r["state"] == "not_run"), "n_tests_near_miss": count(lambda r: r["near_miss"])}
 
 
 def order(rows):

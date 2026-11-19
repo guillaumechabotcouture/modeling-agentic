@@ -84,6 +84,41 @@ TEST_STATUSES, VERDICTS = ("run", "not_run"), ("NO_CHANGE", "CHANGES_PLAN", "NOT
 TEST_NUMBERS = ("share_pct", "threshold_pct", "regret_pct", "regret_threshold_pct", "dollars_share_pct", "dollars_threshold_pct")
 EST = "analysis/estimates.yaml"
 EST_VERDICTS = ("yes", "no", "undetermined")       # toolkit/analysis/estimates.py: a decision rule's verdicts
+# The producer's rule for a verdict, recomputed from the test's own recorded numbers (§3: a record that contradicts
+# itself). toolkit/analysis/moves.py: `rec["triggered_by"] = (["infeasible"] if why else []) + [k for k in CRITERIA if
+# fires(rec, k, thr[k])]`, `rec["decision_changes"] = bool(rec["triggered_by"])`, and fires() is strict: `return
+# rec["share_units_changed"] > t`, `rec["dollars_share"] > t`, `rec["regret_share"] > t`. The recorded numbers are each
+# criterion's worst over the test's values (aggregate()), so a recorded number above its threshold is a value that fired.
+CRITERIA = (("share", "share_pct", "threshold_pct"), ("regret", "regret_pct", "regret_threshold_pct"),
+            ("dollars", "dollars_share_pct", "dollars_threshold_pct"))
+EDGE = 1e-9         # a number is above its threshold when it is so by more than rounding (the file holds 100 x the share)
+
+
+def _number(x):
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+
+def test_clash(t):
+    """Why a decision test's recorded verdict contradicts its own recorded numbers, or None. NO_CHANGE is contradicted
+    by a criterion whose number is strictly above its threshold, by a point plan recorded as not feasible, and by a
+    non-empty triggered_by. CHANGES_PLAN is contradicted by an empty triggered_by, and by a feasible point plan with
+    all three numbers recorded and none above its threshold (with no regret share recorded the producer judges regret
+    on a number the file does not hold, so nothing is said)."""
+    verdict, by = t.get("verdict"), t.get("triggered_by")
+    pairs = [(k, _number(t.get(v)), _number(t.get(th))) for k, v, th in CRITERIA]
+    fired = [f"{k} {v:g}% is above its threshold {th:g}%" for k, v, th in pairs if v is not None and th is not None and v > th * (1 + EDGE)]
+    if t.get("point_plan_feasible") is False:
+        fired.insert(0, "the point plan is recorded as not feasible")
+    if isinstance(by, list) and by:
+        fired.append(f"triggered_by names {', '.join(map(str, by))}")
+    if verdict == "NO_CHANGE" and fired:
+        return f"the verdict is NO_CHANGE and {'; '.join(fired)}"
+    if verdict == "CHANGES_PLAN" and not fired:
+        if isinstance(by, list):
+            return "the verdict is CHANGES_PLAN and triggered_by names no criterion"
+        if t.get("point_plan_feasible") is True and all(v is not None and th is not None for _, v, th in pairs):
+            return "the verdict is CHANGES_PLAN, the point plan is feasible and no recorded number is above its threshold"
+    return None
 
 
 def signoff_record(run):
@@ -134,7 +169,8 @@ def decision_tests(run, spec=None):
     with the rest of TEST_NUMBERS, null where it records none; `feasible` is its point_plan_feasible (true, false or null).
     The one loader of decision tests, for every view. state: `ran` (status run with a verdict of NO_CHANGE or
     CHANGES_PLAN: the only pair that establishes that a test ran), `not_run` (status not_run, verdict NOT_RUN),
-    `contradiction` (the producer's words in a pair it does not write, so the record contradicts itself), or
+    `contradiction` (the producer's words in a pair it does not write, or a verdict its own recorded numbers
+    contradict by the producer's rule, with the reason in `clash`: the record contradicts itself), or
     `unknown` (a status or verdict word the producer does not write).
     `counts` (§3: a decision test counts only when its file records the same signed spec): true when the test ran
     and the file's header holds the hash of the verified signed spec (`spec`, verified_spec's result, read here when
@@ -154,7 +190,9 @@ def decision_tests(run, spec=None):
         status, verdict = t.get("status"), t.get("verdict")
         pair = (status, verdict) if isinstance(status, str) and isinstance(verdict, str) else None
         state = TEST_PAIRS.get(pair) or ("contradiction" if pair and status in TEST_STATUSES and verdict in VERDICTS else "unknown")
-        out[str(t["test_id"])] = {"status": status, "verdict": verdict, "state": state,
+        clash = test_clash(t) if state == "ran" else None
+        state = "contradiction" if clash else state
+        out[str(t["test_id"])] = {"status": status, "verdict": verdict, "state": state, "clash": clash,
                                   "counts": state == "ran" and tie == "same", "spec": tie, "spec_says": tie_says,
                                   "statement": " ".join(str(t.get("statement") or "").split())[:4000],
                                   "feasible": t.get("point_plan_feasible") if isinstance(t.get("point_plan_feasible"), bool) else None,
@@ -181,9 +219,13 @@ def estimates_tests(run, spec=None):
     (data.decision_tests), in the shape and by the rules of decision_tests above: ({test id: {status, verdict, state,
     counts, spec, spec_says, statement, parameter, ...}}, None) or (None, why). The producer's words
     (toolkit/analysis/estimates.py) are mapped explicitly: status `run` with `decision_changes` true is the verdict
-    CHANGES_PLAN and with false NO_CHANGE, and only when an end that the data do not reject holds one of the rule's
-    verdicts (EST_VERDICTS), since a test counts only with a real verdict; `not_assessable` did not run (NOT_RUN); any
-    other status, or a run test with no verdict, is `unknown`. `status` stays the producer's own word."""
+    CHANGES_PLAN and with false NO_CHANGE; `not_assessable` did not run (NOT_RUN); any other status is `unknown`.
+    A test ran only by the producer's own rule, recomputed here: `kept = [e for e in res["ends"] if not
+    e["rejected_by_data"]]`, `res["decision_changes"] = any(e["verdict"] != decision["verdict"] for e in kept)`. So it
+    needs the decision's verdict (data.decision.verdict), at least one end the data do not reject, and one of the
+    rule's verdicts (EST_VERDICTS) at each such end: without them it is `unknown` (it ran with no verdict). A recorded
+    decision_changes that those ends contradict is a `contradiction`, with the reason in `clash`. `status` stays the
+    producer's own word."""
     doc, why = run.large(EST)
     if doc is None:
         return None, why
@@ -193,18 +235,25 @@ def estimates_tests(run, spec=None):
     spec = spec or verified_spec(run)
     tie, tie_says = _tie(run, EST, doc, spec)
     out = {}
+    rule = doc["data"]["decision"].get("verdict") if isinstance(doc["data"].get("decision"), dict) else None
     for t in tests:
-        status, changes = t.get("status"), t.get("decision_changes")
-        ends = [e for e in t.get("ends") or [] if isinstance(e, dict) and not e.get("rejected_by_data")]
-        real = isinstance(changes, bool) and (any(e.get("verdict") in EST_VERDICTS for e in ends) or not ends) \
-            and all(e.get("verdict") in EST_VERDICTS for e in ends)
+        status, changes, clash = t.get("status"), t.get("decision_changes"), None
+        listed = t.get("ends") if isinstance(t.get("ends"), list) else []
+        ends = [e for e in listed if isinstance(e, dict) and e.get("rejected_by_data") is False]
+        real = (isinstance(changes, bool) and rule in EST_VERDICTS and bool(ends) and all(isinstance(e, dict) for e in listed)
+                and all(e.get("verdict") in EST_VERDICTS for e in ends))
         if status == "run" and real:
             state, verdict = "ran", "CHANGES_PLAN" if changes else "NO_CHANGE"
+            other = sorted({e["verdict"] for e in ends if e["verdict"] != rule})
+            if bool(other) != changes:
+                state = "contradiction"
+                clash = (f"decision_changes is {str(changes).lower()} and " + (f"an end the data do not reject has the verdict {', '.join(other)}" if other
+                         else "every end the data do not reject has the decision's verdict") + f" (the decision's verdict is {rule})")
         elif status == "not_assessable":
             state, verdict = "not_run", "NOT_RUN"
         else:
             state, verdict = "unknown", None
-        out[str(t["id"])] = {"status": status, "verdict": verdict, "state": state, "counts": state == "ran" and tie == "same",
+        out[str(t["id"])] = {"status": status, "verdict": verdict, "state": state, "clash": clash, "counts": state == "ran" and tie == "same",
                              "spec": tie, "spec_says": tie_says, "statement": "", "feasible": None,
                              "parameter": t.get("parameter") if isinstance(t.get("parameter"), str) else None,
                              **{k: None for k in TEST_NUMBERS}}
@@ -721,6 +770,48 @@ def _self_test():
            and [(t["T1"]["state"], t["T1"]["counts"], t["T1"]["spec"]) for t in (other, none, unsigned)]
            == [("ran", False, "other"), ("ran", False, "not_recorded"), ("ran", False, "unverified")]
            and all(t["T1"]["spec_says"] for t in (other, none, unsigned)), str((same, other, none, unsigned)))
+        row = {"test_id": "T1", "status": "run", "verdict": "NO_CHANGE", "point_plan_feasible": True, "triggered_by": [],
+               "share_pct": 0.0, "threshold_pct": 10.0, "regret_pct": 0.0, "regret_threshold_pct": 1.0, "dollars_share_pct": 0.0, "dollars_threshold_pct": 5.0}
+
+        def judged(**words):
+            return tests_of(f"s12{len(os.listdir(tmp))}", lambda d, head: head["data"].update(tests=[{**row, **words}]))["T1"]
+        fired = [judged(share_pct=25.0), judged(regret_pct=1.5), judged(dollars_share_pct=5.5), judged(point_plan_feasible=False), judged(triggered_by=["regret"]),
+                 judged(verdict="CHANGES_PLAN", point_plan_feasible=True)]
+        kept = [judged(), judged(share_pct=10.0), judged(verdict="CHANGES_PLAN", share_pct=25.0, triggered_by=["share"]),
+                judged(verdict="CHANGES_PLAN", point_plan_feasible=False, triggered_by=["infeasible"]),
+                judged(verdict="CHANGES_PLAN", regret_pct=None, triggered_by=None, point_plan_feasible=True)]
+        ok("S12 a test's verdict against its own numbers, by the producer's rule (toolkit/analysis/moves.py fires: strictly above "
+           "the threshold; an infeasible point plan changes the plan): a recorded word the numbers contradict is a contradiction "
+           "and counts for nothing; a share equal to its threshold does not fire",
+           all(t["state"] == "contradiction" and not t["counts"] and t["clash"] for t in fired)
+           and all(t["state"] == "ran" and t["counts"] and t["clash"] is None for t in kept), str([(t["state"], t["clash"]) for t in fired + kept]))
+
+        def est_of(name, edit=None, rule="yes"):
+            d = os.path.join(tmp, name)
+            os.makedirs(os.path.join(d, os.path.dirname(SIGNED_COPY)))
+            workbench._toy(d)
+            shutil.copyfile(os.path.join(d, SPEC), os.path.join(d, SIGNED_COPY))
+            end = {"value": 1.0, "kind": "declared", "rejected_by_data": False, "fit_verified": True, "verdict": "yes"}
+            t = {"id": "E1", "parameter": "p1", "status": "run", "decision_changes": False, "ends": [dict(end), dict(end, value=2.0)]}
+            (edit or (lambda t: None))(t)
+            doc = {"spec_sha256": verified_spec(workbench.Run(d))["sha"], "data": {"decision_tests": [t], **({"decision": {"verdict": rule}} if rule else {})}}
+            open(os.path.join(d, EST), "w").write(json.dumps(doc))
+            return estimates_tests(workbench.Run(d))[0]["E1"]
+        clean = est_of("s13")
+        no_ends = est_of("s13a", lambda t: t.update(ends=[]))
+        all_rejected = est_of("s13b", lambda t: [e.update(rejected_by_data=True) for e in t["ends"]])
+        other_end = est_of("s13c", lambda t: t["ends"][1].update(verdict="no"))
+        said_changes = est_of("s13d", lambda t: t.update(decision_changes=True))
+        changes = est_of("s13e", lambda t: (t["ends"][1].update(verdict="no"), t.update(decision_changes=True)))
+        rejected = est_of("s13f", lambda t: t["ends"].append({"value": 3.0, "rejected_by_data": True, "verdict": "no"}))
+        no_rule = est_of("s13g", rule=None)
+        ok("S13 an estimates test, by the producer's rule (toolkit/analysis/estimates.py: decision_changes is whether any end the "
+           "data do not reject has a verdict other than the decision's): it ran only with such an end and a real verdict at each; "
+           "a recorded flag the ends contradict is a contradiction; an end the data reject does not count",
+           (clean["state"], clean["verdict"], changes["state"], changes["verdict"], rejected["state"]) == ("ran", "NO_CHANGE", "ran", "CHANGES_PLAN", "ran")
+           and [t["state"] for t in (no_ends, all_rejected, no_rule)] == ["unknown"] * 3
+           and [t["state"] for t in (other_end, said_changes)] == ["contradiction"] * 2 and other_end["clash"] and not other_end["counts"],
+           str([(t["state"], t["verdict"], t.get("clash")) for t in (clean, no_ends, all_rejected, other_end, said_changes, changes, rejected, no_rule)]))
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
 

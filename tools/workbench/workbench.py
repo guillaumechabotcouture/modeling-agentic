@@ -61,8 +61,8 @@ A view may also return `choose`, the one control a view puts at the top of its p
                      it), or the word "runs", which the server replaces with the other runs it found, those whose
                      recorded question is this run's first. The server reads one such parameter, `against`: the id of
                      another run of its list, given to a view whose function takes it (`view(run, against=None)`) as
-                     that run. An `against` that names no run of the list is refused (404), never answered as the run
-                     alone; a view that takes the run alone is called with the run alone.
+                     that run. An `against` that names no run of the list, is empty or is given twice is refused
+                     (404), never answered as the run alone; a view that takes the run alone is called with the run alone.
 A table may carry `about` (one sentence on what its rows are and where they come from) and `labels` ({column:
 words}, shown under the column's name in its header) beside columns and rows.
 A table may carry `plain` (a list of columns): a status or state word in such a column is the run's own word and is
@@ -78,7 +78,13 @@ the whole on a click, where another long text is cut to one line) and `actions`,
                      choices is a list of words to pick from, rows (true) offers the table's other rows by their
                      key, text (true) is free text; a field left empty is not sent unless it is required
              add     {label, fields}: a form above the table that adds a row; it is sent with `row` null
-A fact or column whose name ends in _usd or _minutes is shown with that unit.
+A table may carry `fold` (a list of columns): its rows with nothing in any of those columns are reported only, and
+the page keeps them under one line that opens, after the rows that hold something.
+A fact or column whose name ends in _usd or _minutes is shown with that unit; one whose name holds the word share (a
+fraction) or ends in _pct (a percentage) is shown as a percentage, the one format for a share.
+A view may also return `fact_labels` ({fact: words}): the plain words the page shows for a fact in place of its name;
+a fact given the empty string is held by one of the view's tables and the page does not repeat it. The facts
+themselves are unchanged in the answer.
 
 Images (§5.12). Beside the five keys a view may return `images`, a list of declarations over its tables (IMAGE_KEYS):
     {table, path, hash, title, caption, group, details, flag, reason, after}
@@ -434,7 +440,10 @@ def run_view(run, name, against=None):
         return unavailable(name, f"This view failed on the run's files ({type(e).__name__}: {e}).")
     if not isinstance(out, dict) or any(not isinstance(out.get(k, t()), t) for k, t in KEYS.items()):
         return unavailable(name, "This view returned something other than checks, facts, tables, charts and notes.")
+    words = out.get("fact_labels")
+    words = {k: v for k, v in words.items() if isinstance(k, str) and isinstance(v, str) and k in out.get("facts", {})} if isinstance(words, dict) else None
     return {**{k: out.get(k, t()) for k, t in KEYS.items()}, **({"images": out["images"]} if isinstance(out.get("images"), list) else {}),
+            **({"fact_labels": words} if words else {}),
             **({"choose": out["choose"]} if isinstance(out.get("choose"), dict) and not choose_problems(out) else {})}
 
 
@@ -1026,7 +1035,7 @@ class Workbench:
         if not re.fullmatch(_LOOPBACK, host or ""):
             return 403, "text/plain", b"loopback only"
         u = urllib.parse.urlsplit(target)
-        q = urllib.parse.parse_qs(u.query)
+        q = urllib.parse.parse_qs(u.query, keep_blank_values=True)       # a parameter given empty is still given
         if method == "POST" and u.path in ACTION_POSTS:
             h = headers or {}
             origin = h.get("origin")
@@ -1054,11 +1063,12 @@ class Workbench:
         if u.path == "/api/glossary":
             return 200, "application/json", json.dumps(clean(self.glossary)).encode()
         if u.path == "/api/view":
-            rid, against = (q.get("run") or [""])[0], (q.get("against") or [None])[0]
-            if against is not None:
+            rid, given = (q.get("run") or [""])[0], q.get("against")
+            against = given[0] if given else None
+            if given is not None:       # whenever the address holds it: exactly one id, not empty, of another run of the list
                 with self.lock:
                     known = against in self.runs
-                if not (known or against in self.scan()) or against == rid:
+                if len(given) != 1 or not against or not (known or against in self.scan()) or against == rid:
                     return 404, "text/plain", (b"no such comparison run: `against` must be the id of another run of this server's list, "
                                                b"so nothing is compared")
             d = self.api_view(rid, (q.get("view") or [""])[0], against)
@@ -1930,6 +1940,15 @@ def _self_test_against(tmp, ok):
         plain = get("spec", against=ids["two"])
         ok("W58 a view that takes the run alone is called with the run alone, whatever the address holds",
            plain[0] == 200 and plain[1]["facts"] == {"run": os.path.realpath(one)}, str(plain)[:300])
+        blank = wb.handle("GET", f"/api/view?run={ids['one']}&view=outcomes&against=", "127.0.0.1")
+        twice = wb.handle("GET", f"/api/view?run={ids['one']}&view=outcomes&against={ids['two']}&against={ids['two']}", "127.0.0.1")
+        ok("W60 an `against` given empty, or given twice, is refused: whenever the address holds the parameter it must be one "
+           "known run's id, and the run is never answered alone", blank[0] == 404 and b"against" in blank[2] and twice[0] == 404, str((blank[0], twice[0])))
+        VIEW_FNS.update(spec=lambda run: {"facts": {"n_a": 1, "b": 2}, "fact_labels": {"n_a": "plain words", "b": "", "c": "no such fact", "n_b": 3}})
+        named = get("spec")
+        ok("W61 a view's `fact_labels` reach the page beside its facts: words for a fact, or the empty string for one a table holds; "
+           "a label for no fact, or one that is no text, is dropped", named[0] == 200 and named[1].get("fact_labels") == {"n_a": "plain words", "b": ""}
+           and named[1]["facts"] == {"n_a": 1, "b": 2}, str(named)[:300])
         outside = get("outcomes", against="../two")
         ok("W59 `against` is a run id of this server's list, never a path", outside[0] == 404, str(outside)[:300])
     finally:

@@ -5,7 +5,7 @@ with another run of the same question.
 
     python3 tools/workbench/views/outcomes.py --self-test
 
-`view(run, against=None)` returns {checks, facts, tables, charts, notes, images, choose}. `against` is the comparison
+`view(run, against=None)` returns {checks, facts, tables, charts, notes, images, choose, fact_labels}. `against` is the comparison
 run chosen in the page (`&against=<run id>`; workbench.py W55 to W59 hold the server to it). The modules:
  outcomes_read.py       what they share: file names, the signed spec, test rows, the harness figures
  outcomes_package.py    the adapter for the deliverable kind package_per_unit
@@ -175,7 +175,7 @@ def _self_test():
     def m_shape():
         for method in fx.METHODS:
             v = seen(folder(method))
-            need(set(v) - {"images", "choose"} == {"checks", "facts", "tables", "charts", "notes"}, f"{method}: the five parts, with images and choose (got {sorted(v)})")
+            need(set(v) - {"images", "choose", "fact_labels"} == {"checks", "facts", "tables", "charts", "notes"}, f"{method}: the five parts, with images and choose (got {sorted(v)})")
             need(v["choose"] == {"param": "against", "label": v["choose"]["label"], "options": "runs"} and v["choose"]["label"],
                  "the view declares how the page chooses the comparison run: the server fills the options with the runs it found")
             need(tuple(sorted(v["facts"])) == tuple(sorted(FACTS)), f"{method}: exactly the facts of §5.7 (differs in {sorted(set(v['facts']) ^ set(FACTS))})")
@@ -189,7 +189,7 @@ def _self_test():
                 need(isinstance(ev, list) and ev and all(isinstance(e, dict) and e.get("file") and "field" in e for e in ev), f"{name}: names the file and field read ({ev})")
                 need(c.get("case") == CHECKS[name], f"{name}: scorecard case {CHECKS[name]} (got {c.get('case')})")
             need(set(v["tables"]) >= set(COLUMNS), f"{method}: every table of the model is present, null where not recorded (missing {sorted(set(COLUMNS) - set(v['tables']))})")
-            need(all(v["tables"][k] is None for k in ("outputs", "decision", "shift", "spec_diff")),
+            need(all(v["tables"][k] is None for k in ("outputs", "decision", "shift", "spec_diff", "outside_spec")),
                  f"{method}: outputs and decision belong to the estimates kind, shift and spec_diff to a comparison: null here")
             need(all(isinstance(v["tables"][k], dict) and v["tables"][k].get("about") for k in COLUMNS if v["tables"][k] is not None), "each table says what its rows are")
             need(all(isinstance(t, str) and t.strip() for t in v["notes"].values()) and v["notes"], "notes are plain text")
@@ -394,7 +394,8 @@ def _self_test():
         def unsigned(d):
             with open(os.path.join(d, fx.SPEC_FILES[1]), "a", encoding="utf-8") as f:
                 f.write("note: edited after the sign-off\n")
-        need(status(seen(edited(hm, unsigned, "test_not_run")), "tests_that_move") == "look", "with no verified signed spec nothing excuses the scenario that did not run")
+        need(status(seen(edited(hm, unsigned, "test_not_run")), "tests_that_move") == "not_available",
+             "with no verified signed spec nothing excuses the scenario that did not run, and no test is tied to a signed spec: never ok (review 1)")
         c = check(seen(folder(hm, "test_pair_contradicts")), "tests_that_move")
         need(c["status"] == "problem" and "DT1" in c["says"], f"a status and a verdict that contradict each other are a problem ({c['status']}: {c['says']})")
         for words in ({"status": "done"}, {"verdict": "MAYBE"}):
@@ -432,7 +433,9 @@ def _self_test():
         has(row(v, "shift", "comparator"), change=None)
         need([r["key"] for r in table(v, "spec_diff")] == ["constraints.envelope_usd"], f"spec_diff lists the one key that differs, to two levels ({table(v, 'spec_diff')})")
         has(row(v, "spec_diff", "constraints.envelope_usd"), this_run=100000.0, other_run=110000.0)
-        need(status(v, "run_shift") == "ok", "the same plan and headline under a spec that differs in one key: ok")
+        need(status(v, "run_shift") == "look", "the same plan and headline under a spec that differs in one key: look (a key changed is still a change)")
+        v = seen(clean, folder(hm, other="twin"))
+        need(status(v, "run_shift") == "ok" and table(v, "spec_diff") == [] and all(r["same"] for r in table(v, "outside_spec")), "the clean pair: ok, no key differs, nothing recorded differs")
         v = seen(clean, folder(hm, other="shifted"))
         has(row(v, "shift", "A+C"), this_run=3, other_run=6, change=-3)
         c = check(v, "run_shift")
@@ -490,7 +493,7 @@ def _self_test():
         need(got == "not_available", f"nor when it is this run's signed spec that cannot be verified ({got})")
         got = status(seen(clean, edited(hm, without(fx.POINT), other="shifted")), "run_shift")
         need(got == "not_available", f"a comparison run with no plan is not_available, never ok ({got})")
-        for other, want in (("shifted", "look"), ("second", "ok")):
+        for other, want in (("shifted", "look"), ("second", "look"), ("twin", "ok")):
             need(status(seen(folder(post), folder(post, other=other)), "run_shift") == want, f"posterior, against {other}: {want}")
 
     def s_new_checks():
@@ -531,6 +534,128 @@ def _self_test():
              "the Fit view's C14 edit (p1 listed as prior-dominated) is raised here too: p1 is above its floor")
         got = status(seen(edited(hm, doc_edit(fx.VOI, lambda doc: doc.update(status="done")))), "voi_support")
         need(got == "not_available", f"a status word the producer does not write is not_available ({got})")
+
+    # ------------------------------------------------------------------ the external review's findings, one case each
+    def header_edit(rel, **words):
+        """An edit to an analysis file's header (beside `data`): a key set, or removed when its value is None."""
+        def change(doc):
+            for k, v in words.items():
+                doc.pop(k, None) if v is None else doc.update({k: v})
+        return rewrite(rel, change)
+
+    def v_other_spec():
+        v = seen(edited(hm, header_edit(fx.DT, spec_sha256="0" * 64)))
+        c, f = check(v, "tests_that_move"), v["facts"]
+        need(c["status"] == "problem" and "another spec" in c["says"], f"tests run for another spec than the signed one: problem, saying so ({c['status']}: {c['says']})")
+        need(f["n_tests"] == 9 and all(f[k] is None for k in ("n_tests_no_change", "n_tests_change_plan", "n_tests_near_miss")),
+             f"and none of them is counted as a result ({ {k: f[k] for k in f if k.startswith('n_tests')} })")
+        need(status(v, "infeasible_tests") == "not_available" and status(v, "fixed_inputs") == "not_available", "nor passed by the checks that read the tests")
+        v = seen(edited(hm, header_edit(fx.DT, spec_sha256=None)))
+        c = check(v, "tests_that_move")
+        need(c["status"] == "not_available" and "spec_sha256" in c["says"] and v["facts"]["n_tests_no_change"] is None,
+             f"a tests file that records no spec: not_available, with the loader's reason ({c['status']}: {c['says']})")
+        v = seen(edited(post, header_edit(fx.EST, spec_sha256="0" * 64), figures="estimates", kind="estimates"))
+        need(status(v, "tests_that_move") == "problem" and v["facts"]["n_tests_no_change"] is None, "the estimates kind too")
+
+    def v_estimates_verdict():
+        base = dict(figures="estimates", kind="estimates")
+        c = check(seen(edited(post, doc_edit(fx.EST, lambda d: d["decision_tests"][0].update(ends=[])), **base)), "tests_that_move")
+        need(c["status"] == "not_available", f"status run with no end: the test ran with no verdict ({c['status']}: {c['says']})")
+        c = check(seen(edited(post, doc_edit(fx.EST, lambda d: d["decision_tests"][0]["ends"][1].update(verdict="no")), **base)), "tests_that_move")
+        need(c["status"] == "problem" and "prior_range_p1" in c["says"] and "decision_changes" in c["says"],
+             f"an accepted end against the decision's verdict with decision_changes false: problem, naming the test and why ({c['status']}: {c['says']})")
+
+    def v_burden_word():
+        def high(d):
+            d["references"][0].update(ratio=3.0)
+            d["references"][0]["model"].update(point=3000.0)
+        v = seen(edited(hm, doc_edit(fx.BV, high)))
+        c = check(v, "burden_refs")
+        need(c["status"] == "problem" and "ref_G1" in c["says"] and "within" in c["says"],
+             f"a ratio outside its band recorded as within contradicts itself: problem ({c['status']}: {c['says']})")
+        need(v["facts"]["n_burden_outside"] is None, "and the count of references outside is not given from words that contradict the numbers")
+
+        def low(d):
+            d["references"][0].update(status="outside")
+        need(status(seen(edited(hm, doc_edit(fx.BV, low))), "burden_refs") == "problem", "nor a ratio inside its band recorded as outside")
+
+    def reach(spec):       # two options priced per person reached, on one eligible population: B reaches all of it, C a tenth
+        o = spec["options"]
+        o["populations"]["elig"] = "pop"
+        o["components"]["B"].update(eligible="elig", reach_share=1.0)
+        o["components"]["C"].update(eligible="elig", reach_share=0.1)
+        for i in o["cost_items"]:
+            if i["component"] in ("B", "C"):
+                i.update(basis="per_reached", value={"B": 2.0, "C": 3.0}[i["component"]])
+
+    def all_on(package):
+        def change(d):
+            for u in d["plan"]:
+                d["plan"][u] = d["per_unit"][u]["package"] = package
+        return doc_edit(fx.POINT, change)
+
+    def v_reach():
+        def both(d):
+            resign(reach)(d)
+            all_on("A+B")(d)
+        v = seen(edited(hm, both))
+        c = check(v, "dearest_wins")
+        need(c["status"] == "look" and close(v["facts"]["dearest_share"], 1.0) and re.search(r"option B\b", c["says"]),
+             f"priced as the producer prices a unit (price x eligible population x reach share), B is the dearest and wins in every unit ({c['status']}: {c['says']})")
+        has(row(v, "plan", "A+B"), units=12, cost_per_unit_rank=1)
+
+        def no_share(d):
+            resign(lambda spec: (reach(spec), spec["options"]["components"]["C"].pop("reach_share")))(d)
+        c = check(seen(edited(hm, no_share)), "dearest_wins")
+        need(c["status"] == "not_available" and "reach_share" in c["says"], f"a price per person reached with no reach share cannot be reproduced ({c['status']}: {c['says']})")
+        c = check(seen(edited(hm, without("data/derived/units.csv"))), "dearest_wins")
+        need(c["status"] == "not_available" and "units.csv" in c["says"], f"nor can any price without the units table ({c['status']}: {c['says']})")
+
+    def v_truncated_plan():
+        def cut(d):
+            for u in d["per_unit"]:
+                d["per_unit"][u]["package"] = "A+C"
+            d["plan"] = {u: "A+C" for u in list(d["per_unit"])[:4]}
+        v = seen(edited(hm, doc_edit(fx.POINT, cut)))
+        c = check(v, "dearest_wins")
+        need(c["status"] == "problem" and "12" in c["says"] and "4" in c["says"], f"a plan of 4 units beside 12 recorded units contradicts itself: problem ({c['status']}: {c['says']})")
+        need(v["facts"]["n_packages_in_plan"] is None and v["facts"]["dearest_share"] is None and v["tables"]["plan"] is None, "and no plan is shown from it")
+        c = check(seen(edited(hm, doc_edit(fx.POINT, lambda d: d["per_unit"][fx.UNITS[0]].update(package="A")))), "dearest_wins")
+        need(c["status"] == "problem" and fx.UNITS[0] in c["says"], f"a unit whose package differs between plan and per_unit ({c['says']})")
+        got = status(seen(folder(hm), edited(hm, doc_edit(fx.POINT, cut), other="second")), "run_shift")
+        need(got == "not_available", f"a comparison run whose plan contradicts itself is not compared ({got})")
+
+    def v_voi_draws():
+        c = check(seen(edited(hm, doc_edit(fx.VOI, lambda d: d.update(draws=10)))), "voi_support")
+        need(c["status"] == "problem" and "10" in c["says"] and str(fx.VOI_MIN_DRAWS) in c["says"],
+             f"computed on fewer draws than its own recorded minimum: the record contradicts itself ({c['status']}: {c['says']})")
+        c = check(seen(edited(hm, doc_edit(fx.VOI, lambda d: d.update(draws=fx.VOI_INFORMATIVE_DRAWS - 1)))), "voi_support")
+        need(c["status"] == "problem", f"computed below informative_draws, where the producer writes indicative ({c['status']}: {c['says']})")
+        c = check(seen(edited(hm, doc_edit(fx.VOI, lambda d: d.pop("min_draws")))), "voi_support")
+        need(c["status"] == "not_available", f"with no recorded minimum the status word cannot be checked ({c['status']})")
+
+    def v_fired():
+        c = check(seen(edited(hm, tests_edit("DT1", share_pct=25.0))), "tests_that_move")
+        need(c["status"] == "problem" and "DT1" in c["says"] and "25" in c["says"], f"no change recorded beside a share above its threshold: problem ({c['status']}: {c['says']})")
+        got = status(seen(edited(hm, tests_edit("DT1", point_plan_feasible=False))), "tests_that_move")
+        need(got == "problem", f"nor beside a point plan that is not feasible ({got})")
+
+    def v_shapes():
+        c = check(seen(edited(hm, header_edit(fx.PV, schema="analysis.plan_variants/2"))), "variant_budget")
+        need(c["status"] == "not_available" and "analysis.plan_variants/2" in c["says"], f"a schema this view does not know is named, never read as the one it knows ({c['status']}: {c['says']})")
+        v = seen(edited(hm, doc_edit(fx.PV, lambda d: d.update(variants=[None]))))
+        c = check(v, "variant_budget")
+        need(c["status"] == "not_available" and "variants[0]" in c["says"] and v["facts"]["n_variants"] is None and v["tables"]["variants"] is None,
+             f"a row that is no mapping is named by its position; no row is dropped and nothing is counted ({c['status']}: {c['says']})")
+        for rel, key, name in ((fx.BV, "references", "burden_refs"), (fx.VOI, "inputs", "voi_support"), (fx.EMB, "rows", "boundary_coverage")):
+            got = status(seen(edited(hm, doc_edit(rel, lambda d, key=key: d[key].append("not a row")))), name)
+            need(got == "not_available", f"{rel} {key}: a row that is no mapping makes {name} not_available ({got})")
+            got = status(seen(edited(hm, header_edit(rel, schema="analysis.other/1"))), name)
+            need(got == "not_available", f"{rel}: another schema makes {name} not_available ({got})")
+        v = seen(edited(hm, header_edit(fx.POINT, schema=None)))
+        need({status(v, n) for n in ("dearest_wins", "share_of_burden", "point_vs_draws")} == {"not_available"}, "a point file that names no schema is not read")
+        got = status(seen(edited(post, header_edit(fx.EST, schema="analysis.estimates/9"), figures="estimates", kind="estimates")), "tests_that_move")
+        need(got == "not_available", f"the estimates file too ({got})")
 
     # ------------------------------------------------------------------ each planted edit, across every view
     def planted(method, name):
@@ -642,6 +767,14 @@ def _self_test():
     case("S6 run_shift: not_available with no comparison, across questions and with an unverified spec; problem with no spec key", s_run_shift)
     case("S7 the four added checks, boundary coverage, share of burden, and n_units_stable", s_new_checks)
     case("S8 voi_support: too few draws, nothing above its floor, and a prior-dominated input that carries value (C14)", s_voi)
+    case("V1 review 1: decision tests whose file records another spec, or none, are never passed or counted", v_other_spec)
+    case("V2 review 2: an estimates test ran only with an accepted end and a verdict; ends that contradict the recorded flag are a problem", v_estimates_verdict)
+    case("V3 review 3: a reference's recorded word against its own ratio and band (toolkit/analysis/burden.py verdict)", v_burden_word)
+    case("V4 review 4: an option is priced per unit as the producer prices it: basis, eligible population, reach share", v_reach)
+    case("V5 review 5: a plan that disagrees with the recorded units and their packages is a problem, not a short plan", v_truncated_plan)
+    case("V6 review 6: the value of information's status word against its own draws and recorded minimum", v_voi_draws)
+    case("V7 review 7: a verdict of no change beside a criterion that fired is a problem", v_fired)
+    case("V8 review 8: an unknown schema or a row that is no mapping is not_available, naming it", v_shapes)
     n = 0
     for method in fx.METHODS:
         for name in fx.OUTCOMES_DEFECTS:

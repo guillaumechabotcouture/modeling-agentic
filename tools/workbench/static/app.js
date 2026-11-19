@@ -20,7 +20,7 @@ const sv = (tag, props, ...kids) => make(SVG, tag, props, kids);
 // Each status or state word: its symbol, its words, its colour role and what it asks of the reader.
 const MARKS = {
   problem: ["✕", "Problem", "problem", "needs you"], look: ["◐", "Look", "look", "for you to judge"],
-  not_available: ["–", "Not available", "na", "a file could not be read or recognised"],
+  not_available: ["–", "Not available", "na", "nothing to judge: a file could not be read or recognised, or the check waits for a choice of yours"],
   ok: ["✓", "OK", "ok", "nothing to do"], not_built: ["○", "Not built", "na", "this view does not exist yet"],
   same: ["✓", "same", "ok", "the file has its recorded hash"], changed: ["≠", "changed", "problem", "the file differs from its recorded hash"],
   missing: ["?", "missing", "look", "the file is not in the run folder"],
@@ -50,6 +50,9 @@ function fmt(v, name, unit) {
   if (n.endsWith("_usd")) return (unit ? "$" : "") + loc(v, 2, 2);
   if (n.endsWith("_minutes") && unit)
     return `${loc(v, 0, 1)} min` + (v >= 2880 ? ` (${loc(v / 1440, 0, 1)} days)` : v >= 120 ? ` (${loc(v / 60, 0, 1)} hours)` : "");
+  // One format for a share (§9: a name's suffix carries the unit): a fraction under a name with the word share, or a
+  // percentage under a name ending in _pct, is shown as a percentage to three significant digits.
+  if (/(^|_)share(_|$)/.test(n) || n.endsWith("_pct")) { const x = n.endsWith("_pct") ? v : 100 * v; return (Math.abs(x) >= 1000 ? loc(x, 0, 0) : String(Number(x.toPrecision(3)))) + "%"; }
   if (Number.isInteger(v)) return Math.abs(v) < 10000 ? String(v) : loc(v, 0, 0);
   return Math.abs(v) >= 1000 ? loc(v, 0, 1) : String(Number(v.toPrecision(4)));
 }
@@ -78,10 +81,16 @@ const GLOSS = {entries: [], source: "", why: null, re: null, by: new Map(), used
 function setGlossary(g) {
   Object.assign(GLOSS, {entries: (g && g.entries) || [], source: (g && g.source) || "", why: (g && g.why) || null, re: null, kinds: (g && g.kinds) || {}});
   GLOSS.by.clear(); GLOSS.used.clear();
-  for (const e of GLOSS.entries) GLOSS.by.set((e.kind === "term" ? e.code : `${e.kind} ${e.code}`).toLowerCase(), e);
-  const alts = [...GLOSS.by.keys()].sort((a, b) => b.length - a.length).map(k => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  if (alts.length) GLOSS.re = new RegExp(`\\b(${alts.join("|")})(?:e?s)?(?![A-Za-z0-9])`, "gi");
+  for (const e of GLOSS.entries) GLOSS.by.set(glossKey(e).toLowerCase(), e);
+  // A code is a word of the text. A row-id prefix ("nodata:") is the start of an id: it has no word before it and the
+  // rest of the id (or the end of the text, where a long id is broken into parts) straight after it.
+  const esc = keys => keys.sort((a, b) => b.length - a.length).map(k => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const keys = [...GLOSS.by.keys()], words = esc(keys.filter(k => !k.endsWith(":"))), starts = esc(keys.filter(k => k.endsWith(":")));
+  const parts = [words ? `\\b(${words})(?:e?s)?(?![A-Za-z0-9])` : "()(?!)", starts ? `(?<![\\w:])(${starts})(?=\\w|$)` : null].filter(Boolean);
+  if (keys.length) GLOSS.re = new RegExp(parts.join("|"), "gi");
 }
+const glossKey = e => (e.kind === "term" || e.kind === "row id" ? e.code : `${e.kind} ${e.code}`);
+const glossTitle = e => `${e.kind === "row id" ? "" : GLOSS.kinds[e.kind] ? GLOSS.kinds[e.kind] + " " : ""}${e.meaning} (${e.section})`;
 // A text as a list of strings and marked codes: each code the glossary defines carries its meaning on hover.
 function gloss(text) {
   text = String(text == null ? "" : text);
@@ -89,9 +98,9 @@ function gloss(text) {
   const out = [];
   let last = 0;
   for (const m of text.matchAll(GLOSS.re)) {
-    const e = GLOSS.by.get(m[1].toLowerCase());
+    const e = GLOSS.by.get((m[1] || m[2]).toLowerCase());
     GLOSS.used.add(e);
-    out.push(text.slice(last, m.index), el("abbr", {class: "term", title: `${GLOSS.kinds[e.kind] ? GLOSS.kinds[e.kind] + " " : ""}${e.meaning} (${e.section})`, text: m[0]}));
+    out.push(text.slice(last, m.index), el("abbr", {class: "term", title: glossTitle(e), text: m[0]}));
     last = m.index + m[0].length;
   }
   out.push(text.slice(last));
@@ -109,7 +118,7 @@ function glossaryFoot() {
     el("p", {class: "about", text: "The codes and terms this page uses, each with its meaning in full. Pointing at a dotted word shows the same text. "
       + `They are defined in ${GLOSS.source}, in the part named after each entry; nothing here needs that document to be read.`}),
     kinds.map(k => el("p", {class: "about", text: k})),
-    el("dl", {class: "terms"}, used.map(e => el("div", null, el("dt", {text: e.kind === "term" ? e.code : `${e.kind} ${e.code}`}),
+    el("dl", {class: "terms"}, used.map(e => el("div", null, el("dt", {text: glossKey(e)}),
       el("dd", {text: `${e.meaning} (${e.section})`})))));
 }
 
@@ -187,7 +196,7 @@ function tableView(t, opts = {}) {
       if (v.length > 4 * LONG) { td.title = "Click to show the whole text"; td.addEventListener("click", () => lines.classList.toggle("open")); }
       td.append(lines);
     }
-    else if (typeof v === "string" && v.length > (wide ? 12 : 20) && !/\s/.test(v)) td.append(...v.split(/(?<=[:\/,_|])/).flatMap((part, k) => (k ? [el("wbr"), part] : [part])));     // a long name or path may break after a separator, never inside a word
+    else if (typeof v === "string" && v.length > (wide ? 12 : 20) && !/\s/.test(v)) td.append(...v.split(/(?<=[:\/,_|])/).flatMap((part, k) => (k ? [el("wbr"), part] : gloss(part))));     // a long name or path may break after a separator, never inside a word
     else if (i === 0 && opts.href) td.append(el("a", {href: opts.href(r), text: fmt(v, c)}));
     else if (typeof v === "string" && v.length > (wide ? LONG : 3 * LONG)) {      // a long text: one line of it, the whole on hover, and a click to open it
       td.textContent = v; td.title = v; td.className = "clip";
@@ -253,9 +262,9 @@ function extent(values, log, zero) {
   return [log ? lo / 1.15 : lo - pad, log ? hi * 1.15 : hi + pad];
 }
 // The bottom axis of a chart whose rows run down the page: grid lines, tick values and the column's name with its unit.
-function axisX(f, [lo, hi], y0, y1, log, name, limits) {
+function axisX(f, [lo, hi], y0, y1, log, name, limits, col) {
   return [ticks(lo, hi, log).map(v => [sv("line", {class: "gridline", x1: f(v), x2: f(v), y1: y0, y2: y1}),
-    sv("text", {x: f(v), y: y1 + 14, "text-anchor": "middle", text: fmt(v)})]),
+    sv("text", {x: f(v), y: y1 + 14, "text-anchor": "middle", text: fmt(v, col)})]),
     (limits || []).map(m => [sv("line", {class: "limit", x1: f(m.value), x2: f(m.value), y1: y0 - 3, y2: y1}),
       sv("text", {class: "limit", x: f(m.value), y: y0 - 6, "text-anchor": "middle", text: m.label})]),
     sv("text", {x: f(hi), y: y1 + 28, "text-anchor": "end", text: name + (log ? ", log scale" : "")})];
@@ -288,7 +297,7 @@ const DRAW = {
     return [rowChart(t, rows, c, 170, (r, y) => [
       sv("rect", {class: "c1", x: Math.min(f(r[c.y]), zero()), y: y - 7, width: Math.max(1, Math.abs(f(r[c.y]) - zero())), height: 14, rx: 3}),
       sv("text", {class: "name", x: Math.max(f(r[c.y]), zero()) + 6, y: y + 4, text: fmt(r[c.y], c.names.y, true)})],
-      (a, b, y0, y1) => (f = scale(ext[0], ext[1], a, b, c.log), axisX(f, ext, y0, y1, c.log, word(c, "y"), marks(c))))];
+      (a, b, y0, y1) => (f = scale(ext[0], ext[1], a, b, c.log), axisX(f, ext, y0, y1, c.log, word(c, "y"), marks(c), c.names.y)))];
   },
   interval_points(t, c) {
     const cap = 80, has = k => c[k] != null, all = t.rows.filter(r => ["y", "model"].some(k => has(k) && typeof r[c[k]] === "number"));
@@ -308,7 +317,7 @@ const DRAW = {
         has("model_alt") && num(r[c.model_alt]) ? diamond(f(r[c.model_alt]), y, 5, "c2 hollow") : null,
         num(r[c.y]) ? sv("circle", {class: "c1", cx: f(r[c.y]), cy: y - d, r: 4}) : null,
         has("model") && num(r[c.model]) ? diamond(f(r[c.model]), y + d, 5, "c2") : null];
-    }, (a, b, y0, y1) => (f = scale(ext[0], ext[1], a, b, c.log), axisX(f, ext, y0, y1, c.log, word(c, "y"), marks(c))));
+    }, (a, b, y0, y1) => (f = scale(ext[0], ext[1], a, b, c.log), axisX(f, ext, y0, y1, c.log, word(c, "y"), marks(c), c.names.y)));
     return [key([[swatch(has("low") ? sv("line", {class: "c1 whisker", x1: 1, x2: 21, y1: 6, y2: 6}) : null, sv("circle", {class: "c1", cx: 11, cy: 6, r: 4})),
       word(c, "y") + (has("low") ? `, with its interval (${label(c.names.low)} to ${label(c.names.high)})` : "")],
       has("model") ? [swatch(diamond(11, 6, 5, "c2")), word(c, "model")] : null,
@@ -433,9 +442,25 @@ const noImage = why => el("p", {class: "noimage", role: "status", text: `This im
 // An image that does not load is replaced by a sentence with the server's reason, never left as a broken picture.
 function imageBox(run, path, sha, title) {
   if (run == null || !path || !sha) return noImage(!path ? "the view names no file for it." : !sha ? `the view names no hash for ${path}.` : "the page does not know which run it belongs to.");
-  const url = fileUrl(run, path, sha), box = el("div", {class: "shot"}), wide = () => box.classList.toggle("full");
-  box.append(el("img", {src: url, alt: title || path, title: "Click to see it at full width, and again to put it back", tabindex: 0, on: {
+  const url = fileUrl(run, path, sha), box = el("div", {class: "shot"}), wide = () => box.classList.toggle("full"), shot = {};
+  // An image that loads and holds no picture is said to be so (a file of one pixel, or of one colour throughout, looks like a failed load).
+  const empty = img => {
+    const w = img.naturalWidth, h = img.naturalHeight;
+    if (!(w > 0 && h > 0)) return null;
+    if (w * h <= 4) return `${path} is an image of ${w} by ${h} pixel${w * h === 1 ? "" : "s"}: the file loaded, and it holds no picture.`;
+    try {
+      const cv = document.createElement("canvas"), ctx = cv.getContext && cv.getContext("2d");
+      if (!ctx) return null;
+      cv.width = cv.height = 16;
+      ctx.drawImage(img, 0, 0, 16, 16);
+      const d = ctx.getImageData(0, 0, 16, 16).data;
+      for (let i = 4; i < d.length; i++) if (d[i] !== d[i % 4]) return null;
+      return `${path} is an image of ${w} by ${h} pixels of one colour throughout: the file loaded, and it holds no picture.`;
+    } catch (e) { return null; }
+  };
+  box.append(shot.img = el("img", {src: url, alt: title || path, title: "Click to see it at full width, and again to put it back", tabindex: 0, on: {
     click: wide, keydown: e => { if (e.key === "Enter") wide(); },
+    load: () => { const says = empty(shot.img); if (says) box.append(el("p", {class: "noimage", role: "status", text: says})); },
     error: () => {
       const says = noImage(`${path} could not be loaded.`);
       box.replaceChildren(says);
@@ -555,17 +580,24 @@ const viewName = id => ((state.runs.views.find(v => v.id === id) || {}).label ||
 
 // A check that asks something of the reader (problem, look) is an open card. One that asks nothing (ok, not available)
 // is one line with its title, which opens to the same card.
-function checkCard(c) {
+// The scorecard case of a check is a code of the workbench's own building: it is on the title's hover and in the
+// glossary at the foot, not on the card. The check's id is the card's anchor and a line of the opened card.
+// `tables`: the view's tables; a check whose rows are one of them points to it and does not show the table twice.
+function checkCard(c, tables) {
   const read = (c.evidence || []).map(e => (e.field ? `${e.file} (${e.field})` : e.file)).join("; ");
   const table = c.rows || c.table, n = table && table.rows ? table.rows.length : 0, quiet = c.status === "ok" || c.status === "not_available";
-  const head = [mark(c.status), el("span", {class: "title", text: c.title || c.id}), quiet ? el("span", {class: "brief", text: c.says}) : null,
-    el("span", {class: "case"}, gloss((c.case ? `scorecard case ${c.case} · ` : "") + c.id))];
-  const body = [el("p", {class: "says"}, gloss(c.says)), read ? el("p", {class: "read", text: `Read from: ${read}`}) : null,
-    n ? el("details", null, el("summary", {text: `Show the ${n} row${n > 1 ? "s" : ""} behind this check`}), tableView(table)) : null];
-  return quiet ? el("details", {class: `card check line ${tone(c.status)}`}, el("summary", {class: "head", title: "Click to open this check"}, head), body)
-    : el("div", {class: `card check ${tone(c.status)}`}, el("div", {class: "head"}, head), body);
+  const entry = c.case ? GLOSS.by.get(`scorecard case ${c.case}`.toLowerCase()) : null;
+  if (entry) GLOSS.used.add(entry);
+  const hover = `Check ${c.id}` + (c.case ? ` · scorecard case ${c.case}` + (entry ? `: ${entry.meaning} (${entry.section})` : "") : "");
+  const head = [mark(c.status), el("span", {class: "title", title: hover, text: c.title || c.id}), quiet ? el("span", {class: "brief", text: c.says}) : null];
+  const twin = n ? Object.keys(tables || {}).find(k => tables[k] && JSON.stringify([tables[k].columns, tables[k].rows]) === JSON.stringify([table.columns, table.rows])) : null;
+  const body = [el("p", {class: "says"}, gloss(c.says)), el("p", {class: "read", text: (read ? `Read from: ${read}. ` : "") + `Check id: ${c.id}`}),
+    twin ? el("p", {class: "read", text: `The ${n} row${n > 1 ? "s" : ""} behind this check ${n > 1 ? "are" : "is"} the table "${label(twin)}" on this page.`})
+      : n ? el("details", null, el("summary", {text: `Show the ${n} row${n > 1 ? "s" : ""} behind this check`}), tableView(table)) : null];
+  return quiet ? el("details", {class: `card check line ${tone(c.status)}`, id: `check-${c.id}`}, el("summary", {class: "head", title: "Click to open this check"}, head), body)
+    : el("div", {class: `card check ${tone(c.status)}`, id: `check-${c.id}`}, el("div", {class: "head"}, head), body);
 }
-function checksView(checks, run, here) {
+function checksView(checks, run, here, tables) {
   const groups = new Map();
   for (const c of checks) groups.set(c.step, [...(groups.get(c.step) || []), c]);
   const quiet = checks.filter(c => c.status === "ok" || c.status === "not_available").length;
@@ -576,7 +608,7 @@ function checksView(checks, run, here) {
   for (const [step, cs] of groups) {        // in the order given: the views' reading order, whatever their statuses
     if (groups.size > 1 || (step && step !== here))
       out.push(el("h3", null, `${viewName(step)} · `, el("a", {href: link(run, step), text: "open this view for the evidence"})));
-    out.push(...[...cs].sort((a, b) => rank(a.status) - rank(b.status)).map(checkCard));
+    out.push(...[...cs].sort((a, b) => rank(a.status) - rank(b.status)).map(c => checkCard(c, tables)));
   }
   return out;
 }
@@ -588,20 +620,23 @@ function chooseView(c) {
   const go = v => { const p = read(); if (v) p.set(c.param, v); else p.delete(c.param); state.keep = true; location.hash = "#" + p.toString(); };
   const options = c.options.filter(o => o && typeof o.value === "string" && o.value), groups = [...new Set(options.map(o => o.group || ""))];
   const one = o => el("option", {value: o.value, text: o.label || o.value, selected: o.value === now});
-  const select = el("select", {"aria-label": c.label || c.param, on: {change: e => go(e.target.value)}}, el("option", {value: "", text: "none", selected: !now}),
+  const id = `choose-${c.param}`;     // an ordinary named control: its name is the address parameter, its value what the address holds
+  const select = el("select", {name: c.param, id, on: {change: e => go(e.target.value)}}, el("option", {value: "", text: "none", selected: !now}),
     groups.map(name => (name ? el("optgroup", {label: name}, options.filter(o => o.group === name).map(one)) : options.filter(o => !o.group).map(one))));
   const stale = now && !options.some(o => o.value === now);     // the address holds a value the view does not offer
-  return el("div", {class: "tools choose"}, el("label", null, `${c.label || label(c.param)}: `, select),
+  return el("div", {class: "tools choose"}, el("label", {for: id, text: `${c.label || label(c.param)}: `}), select,
     options.length ? null : el("span", {class: "muted", text: "There is nothing else to choose from."}),
     stale ? el("span", {class: "muted", text: `The address names "${now}", which is not offered here.`}) : null);
 }
 function renderView(data, run, here) {
   const out = [], facts = Object.entries(data.facts || {}), notes = Object.entries(data.notes || {}), tables = data.tables || {};
   if (data.choose) out.push(chooseView(data.choose));
-  if ((data.checks || []).length) out.push(...checksView(data.checks, run, here));
-  if (facts.length) out.push(el("h2", {text: "Facts"}), el("dl", {class: "facts"}, facts.map(([k, v]) => {
+  if ((data.checks || []).length) out.push(...checksView(data.checks, run, here, tables));
+  // A view may give its facts plain words (fact_labels: {fact: words}); a fact it gives the empty string is held by one of its tables and is not repeated here.
+  const words = data.fact_labels && typeof data.fact_labels === "object" ? data.fact_labels : {}, shown = facts.filter(([k]) => words[k] !== "");
+  if (shown.length) out.push(el("h2", {text: "Facts"}), el("dl", {class: "facts"}, shown.map(([k, v]) => {
     const text = fmt(v, k, true);
-    return el("div", {class: text.length > 44 ? "wide" : null}, el("dt", {text: label(k)}), el("dd", null, gloss(text)));
+    return el("div", {class: text.length > 44 ? "wide" : null}, el("dt", {text: typeof words[k] === "string" ? words[k] : label(k)}), el("dd", null, gloss(text)));
   })));
   const done = () => { state.over = null; state.keep = true; route(); };       // after a save: read the run's files again, stay in place
   const lead = Object.entries(tables).filter(([, t]) => t && t.lead);       // what the reader came for: before the notes and charts
@@ -614,9 +649,17 @@ function renderView(data, run, here) {
     return own >= 0 && own <= by ? "above" : "below"; };
   const charts = (data.charts || []).filter(d => d && typeof d === "object"), images = (Array.isArray(data.images) ? data.images : []).filter(d => d && typeof d === "object");
   const after = name => [...charts.filter(d => placed(d) === name).map(d => chartView(d, tables, run, side(d))), ...images.filter(d => placed(d) === name).map(d => imagesView(d, tables, run))];
+  // A table may name `fold` columns: its rows with nothing in any of them are kept under one line that opens, after the rows that have something.
+  const folded = t => {
+    const at = (Array.isArray(t.fold) ? t.fold : []).map(c => t.columns.indexOf(c)).filter(i => i >= 0), bare = r => at.every(i => r[i] == null);
+    if (!at.length || !t.rows.some(bare) || t.actions) return [tableView(t, {run, done})];
+    const rest = t.rows.filter(bare), kept = t.rows.filter(r => !bare(r));
+    return [kept.length ? tableView({...t, rows: kept}, {run, done}) : null, el("details", null, el("summary",
+      {text: `Show the ${rest.length} row${rest.length === 1 ? "" : "s"} with no ${t.fold.map(c => label(c)).join(" or ")} (reported only)`}), tableView({...t, rows: rest}, {run, done}))];
+  };
   const one = (name, t, head) => [el(head, {text: label(name).replace(/^./, ch => ch.toUpperCase())}), t.about ? el("p", {class: "about"}, gloss(t.about)) : null,
-    Array.isArray(t.columns) && Array.isArray(t.rows) ? (t.rows.length || t.actions ? tableView(t, {run, done}) : el("p", {class: "muted", text: "No rows."}))
-      : el("p", {class: "muted", text: "Not available: this table has no columns and rows."}), ...after(name)];
+    ...(Array.isArray(t.columns) && Array.isArray(t.rows) ? (t.rows.length || t.actions ? folded(t) : [el("p", {class: "muted", text: "No rows."})])
+      : [el("p", {class: "muted", text: "Not available: this table has no columns and rows."})]), ...after(name)];
   for (const [name, t] of lead) out.push(...one(name, t, "h2"));
   const looseImages = images.filter(d => !placed(d)), looseCharts = charts.filter(d => !placed(d));
   if (looseImages.length) out.push(el("h2", {text: "Images"}), el("p", {class: "about", text: "Each image is a file of the run as the harness wrote it, "
@@ -676,9 +719,9 @@ function showRail(run, here) {
   const status = id => { const r = over && over.rows.find(x => x[at("view")] === id); return r ? r[at("status")] : null; };
   const heads = {spec: "Verify the run", steps: "Inspect and track"};
   rail.replaceChildren(...state.runs.views.flatMap(v => [heads[v.id] ? el("div", {class: "railhead", text: heads[v.id]}) : null,
-    el("a", {href: link(run.id, v.id), class: (v.id === here ? "here " : "") + (v.built ? "" : "unbuilt"), "aria-current": v.id === here ? "page" : null},
-      mark(v.built ? status(v.id) || "not_available" : "not_built", true), el("span", {text: v.label}),
-      v.built ? null : el("span", {class: "goal"}, gloss(`goal ${v.goal}`)))]).filter(Boolean));
+    el("a", {href: link(run.id, v.id), class: (v.id === here ? "here " : "") + (v.built ? "" : "unbuilt"), "aria-current": v.id === here ? "page" : null,
+      title: v.built ? null : `This view is not built yet (goal ${v.goal} of the workbench builds it).`},      // the goal is a code of the workbench's building: on hover only
+      mark(v.built ? status(v.id) || "not_available" : "not_built", true), el("span", {text: v.label}))]).filter(Boolean));
 }
 async function route() {
   const p = new URLSearchParams(location.hash.slice(1)), id = p.get("run"), here = p.get("view") || "overview", turn = ++state.turn;

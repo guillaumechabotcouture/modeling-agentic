@@ -73,7 +73,12 @@ def _table(columns, rows):
 
 
 def check_dearest_wins(m):
-    ev = [(R.SIGNED, "options.components[].group, options.cost_items"), (R.POINT, "data.plan"), (RED_FLAG, "SHARE, MIN_UNITS")]
+    ev = [(R.SIGNED, "options.components[].group, .eligible, .reach_share; options.cost_items; options.populations; options.prices"),
+          (R.SIGNED, "decision_units.csv, decision_units.id (the units table)"), (R.POINT, "data.plan, data.per_unit, data.n_units"),
+          (RED_FLAG, "SHARE, MIN_UNITS, flags()"), ("toolkit/alloc/costs.py", "item_cost()")]
+    if m["plan_clash"]:
+        return _r("dearest_wins", "problem", f"The point file's plan contradicts its own record of the units: {m['plan_clash']}. No share is counted "
+                                             "from a plan that does not agree with the units recorded beside it.", ev)
     if m["plan"] is None:
         return _file(m, "dearest_wins", R.POINT, "data.plan")
     if not m["spec"]["verified"]:
@@ -83,24 +88,26 @@ def check_dearest_wins(m):
         return _na("dearest_wins", f"the plan names {some(unknown)}, which the verified signed spec does not define as a package of its "
                                    "components, so the plan cannot be priced" if m["options"] else "the verified signed spec lists no components (options.components)", ev)
     groups = m["options"]["groups"]
-    left = [f"{name} ({grp['why']})" for name, grp in sorted(groups.items()) if grp["why"]]
+    left = [f"group {name}: {grp['why']}" for name, grp in sorted(groups.items()) if grp["why"]]
+    rule = (f"the producer flags a share of {pct(DEAREST_SHARE)} or more in at least {DEAREST_MIN_UNITS} units ({RED_FLAG} SHARE, MIN_UNITS); "
+            "an option's cost in a unit is computed as the producer computes it, from the verified signed spec's cost items that do not depend "
+            "on the model and the units table")
+    if left:
+        return _na("dearest_wins", "the cost of an option in a unit cannot be reproduced from the recorded inputs, and none is guessed (" + "; ".join(left) + ")", ev)
     rows = _table(["group", "dearest_option", "units_holding_the_group", "units_with_the_dearest", "share"],
                   [[d["group"], d["option"], d["units"], d["hits"], d["share"]] for d in m["dearest"]])
-    tail = f" Not ranked: {'; '.join(left)}." if left else ""
-    rule = (f"the producer flags a share of {pct(DEAREST_SHARE)} or more in at least {DEAREST_MIN_UNITS} units ({RED_FLAG} SHARE, MIN_UNITS); "
-            "prices are the verified signed spec's cost items that do not depend on the model")
     if not m["dearest"]:
-        return _r("dearest_wins", "ok", f"No group of options to judge: {'no group has two or more options with different prices' if not left else 'none can be ranked'} "
-                                        f"({rule}).{tail}", ev)
-    said = "; ".join(f"group {d['group']}: its dearest option {d['option']} is in {d['hits']} of the {d['units']} units whose plan holds the group "
-                     f"({pct(d['share'])})" for d in m["dearest"])
+        return _r("dearest_wins", "ok", "No group of options to judge: no group has two or more options whose costs differ in a unit whose plan holds one "
+                                        f"({rule}).", ev)
+    said = "; ".join(f"group {d['group']}: the dearest option, most often option {d['option']}, is the one chosen in {d['hits']} of the {d['units']} units whose plan "
+                     f"holds the group ({pct(d['share'])})" for d in m["dearest"])
     enough = [d for d in m["dearest"] if d["units"] >= DEAREST_MIN_UNITS]
     if any(d["share"] >= DEAREST_SHARE for d in enough):
         return _r("dearest_wins", "look", f"The dearest option wins nearly everywhere: {said}; {rule}. Either its extra effect is real and large "
-                                          f"everywhere or the engine overstates it; for you to judge (a flag, never a finding).{tail}", ev, rows)
+                                          "everywhere or the engine overstates it; for you to judge (a flag, never a finding).", ev, rows)
     if any(near(d["share"], DEAREST_SHARE) for d in enough):
-        return _r("dearest_wins", "look", f"Near miss (within 25% of the share, a {WB}): {said}; {rule}.{tail}", ev, rows)
-    return _r("dearest_wins", "ok", f"No dearest option wins nearly everywhere: {said}; {rule}.{tail}", ev, rows)
+        return _r("dearest_wins", "look", f"Near miss (within 25% of the share, a {WB}): {said}; {rule}.", ev, rows)
+    return _r("dearest_wins", "ok", f"No dearest option wins nearly everywhere: {said}; {rule}.", ev, rows)
 
 
 def check_share_of_burden(m):
@@ -151,6 +158,20 @@ def _linked(rows):
                                 f"linked to no register row: {some(loose, 16)}" if loose else "") if x).rstrip(";")
 
 
+def _tied(m, name, ev):
+    """The answer of a check that reads the decision tests when their file does not record the verified signed spec
+    (§3: a decision test counts only when its file records the same signed spec), or None when it does. The word and
+    the sentence are the shared loader's (checks.decision_tests, checks.estimates_tests), never judged again here.
+    Another spec's tests beside the signed spec are two files that contradict each other: `problem`, said once, by
+    tests_that_move; no recorded hash, or no verified signed spec, is `not_available`."""
+    word, says = m["tie"] or ("same", None)
+    if word == "same":
+        return None
+    if word == "other" and name == "tests_that_move":
+        return _r(name, "problem", f"The {len(m['tests'])} decision tests are not this spec's: {says}. None of them is counted or passed here.", ev)
+    return _na(name, f"{says}, so no decision test is counted or passed here", ev)
+
+
 def check_tests_that_move(m):
     rel = _tests_file(m)
     ev = [(rel, "data.decision_tests[].status, .decision_changes" if m["kind"] == "estimates" else "data.tests[].status, .verdict and the shares beside their thresholds"),
@@ -158,11 +179,14 @@ def check_tests_that_move(m):
     t = m["tests"]
     if t is None:
         return _file(m, "tests_that_move", rel, "a list of decision tests")
+    if _tied(m, "tests_that_move", ev):
+        return _tied(m, "tests_that_move", ev)
     table = _table(R.TEST_COLUMNS, [[r[c] for c in R.TEST_COLUMNS] for r in t if r["state"] != "ran" or r["verdict"] == "CHANGES_PLAN" or r["near_miss"]])
-    clash = [r["id"] for r in t if r["state"] == "contradiction"]
+    clash = [r for r in t if r["state"] == "contradiction"]
     if clash:
-        return _r("tests_that_move", "problem", f"{len(clash)} decision test(s) have a status and a verdict that contradict each other, a pair the "
-                                                f"analysis does not write ({some(clash)}), so whether they ran cannot be said.", ev, table)
+        return _r("tests_that_move", "problem", f"{len(clash)} decision test(s) contradict their own record: "
+                  + "; ".join(f"{r['id']} ({r['clash'] or f'status {r['status']} with verdict {r['verdict']}, a pair the analysis does not write'})" for r in clash[:R.SHOWN])
+                  + (f" and {len(clash) - R.SHOWN} more" if len(clash) > R.SHOWN else "") + ". Whether they ran, or what they found, cannot be said.", ev, table)
     odd = [f"{r['id']} (status {r['status']!r}, verdict {r['verdict']!r})" for r in t if r["state"] == "unknown"]
     if odd:
         return _na("tests_that_move", f"{len(odd)} decision test(s) hold a status or verdict the producer does not write, or ran with no verdict: {some(odd)}", ev)
@@ -193,6 +217,11 @@ def check_burden_refs(m):
     b = m["burden"]
     if b is None:
         return _file(m, "burden_refs", R.BV, "a list of references")
+    clash = [r for r in b if r["clash"]]
+    if clash:
+        return _r("burden_refs", "problem", f"{len(clash)} of {len(b)} external references contradict their own numbers: "
+                  + "; ".join(f"{r['id']} ({r['clash']})" for r in clash[:R.SHOWN]) + ". The producer judges a ratio band on the model's point value over "
+                  "the reference's value (toolkit/analysis/burden.py verdict).", ev)
     odd = [f"{r['id']} ({r['state']!r}, role {r['role']!r})" for r in b if r["state"] not in K.BURDEN_STATUSES or r["role"] not in K.BURDEN_ROLES]
     if odd:
         return _na("burden_refs", f"{len(odd)} reference(s) hold a status or role the producer does not write: {some(odd)}", ev)
@@ -234,6 +263,17 @@ def check_voi_support(m):
         return _file(m, "voi_support", R.VOI, "a value of information")
     if v["status"] not in K.VOI_STATUSES:
         return _na("voi_support", f"{R.VOI} has the status {v['status']!r}, which the producer does not write", ev)
+    if v["status"] != "no_eligible_plan":
+        # The producer's rule for the word, recomputed from the recorded counts (toolkit/analysis/value_of_information.py:
+        # `if n < th["min_draws"]: return dict(out, status="too_few_draws")`, then
+        # `status="computed" if n >= th["informative_draws"] else "indicative"`).
+        n, least, enough = v["draws"], v["min_draws"], v["informative_draws"]
+        if n is None or least is None or (enough is None and n >= least):
+            return _na("voi_support", f"{R.VOI} records the status {v['status']} without the draws, min_draws or informative_draws it follows from, so the word cannot be checked", ev)
+        word = "too_few_draws" if n < least else "computed" if n >= enough else "indicative"
+        if word != v["status"]:
+            return _r("voi_support", "problem", f"The value of information contradicts its own record: its status is {v['status']}, and {g(n)} draws against a "
+                                                f"minimum of {g(least)} and {g(enough)} for an informative result is {word} by the producer's rule. Nothing is read from it.", ev)
     if v["status"] in ("too_few_draws", "no_eligible_plan"):
         return _na("voi_support", f"the value of information was not computed (status {v['status']}: {g(v['draws'])} draws against the method's "
                                   f"minimum of {g(v['min_draws'])}), so nothing can be said of which inputs carry value", ev)
@@ -304,6 +344,8 @@ def check_infeasible_tests(m):
     t = m["tests"]
     if t is None:
         return _file(m, "infeasible_tests", R.DT, "a list of decision tests")
+    if _tied(m, "infeasible_tests", ev):
+        return _tied(m, "infeasible_tests", ev)
     known = [r for r in t if r["feasible"] is not None]
     if not known:
         return _na("infeasible_tests", f"no test of {R.DT} records whether the point plan stays feasible (point_plan_feasible), so it was not computed", ev)
@@ -354,13 +396,15 @@ def check_fixed_inputs(m):
         return _file(m, "fixed_inputs", R.DT, "a list of decision tests")
     if not m["spec"]["verified"]:
         return _unsigned(m, "fixed_inputs", "list of tests to say which input each varies", ev)
+    if _tied(m, "fixed_inputs", ev):
+        return _tied(m, "fixed_inputs", ev)
     varied = [r for r in m["tests"] if r["parameter"] in m["fixed"]]
     odd = [r["id"] for r in varied if r["state"] in ("contradiction", "unknown")]
     if odd:
         return _na("fixed_inputs", f"{some(odd)} varies an input held at one value and its status and verdict cannot be read", ev)
     moving = [r for r in varied if r["state"] == "ran" and r["verdict"] == "CHANGES_PLAN"]
     table = _table(["input", "test", "verdict"], [[r["parameter"], r["id"], r["verdict"]] for r in varied])
-    head = f"{plural(len(m['fixed']), 'input')} held at one value in the draws; {plural(len(varied), 'decision test')} vary one of them"
+    head = f"{plural(len(m['fixed']), 'input')} held at one value in the draws; {plural(len(varied), 'decision test varies', 'decision tests vary')} one of them"
     if moving:
         return _r("fixed_inputs", "look", f"{head}; {len(moving)} of those change the plan: "
                                           + "; ".join(f"{r['parameter']} (test {r['id']})" for r in moving)
@@ -419,6 +463,7 @@ def _self_test():
         m["headline"] = {**m["headline"], "share": 0.4}
         need(got(m)["share_of_burden"]["status"] == "look" and "near miss" in got(m)["share_of_burden"]["says"], "a share within 25% of the threshold is a near miss")
         m["dearest"] = [{"group": "t", "option": "C", "units": 12, "hits": 9, "share": 0.75}]
+        m["options"]["groups"] = {}
         need(got(m)["dearest_wins"]["status"] == "look", "the near-miss rule applies to dearest_wins")
         m["dearest"] = [{"group": "t", "option": "C", "units": 4, "hits": 4, "share": 1.0}]
         need(got(m)["dearest_wins"]["status"] == "ok", "fewer units than the producer's minimum: ok")

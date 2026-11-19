@@ -414,7 +414,7 @@ def _self_test():
             next(t for t in doc["data"]["tests"] if t["test_id"] == "DT3")["verdict"] = "MAYBE"
         has(row(look_at(edited(hm, rewrite(dt_file, odd), dec)), "R-001"), decides="unknown")
         def changes(doc):       # DT9, the test the dossier's entry for x1 names, changes the plan
-            next(t for t in doc["data"]["tests"] if t["test_id"] == "DT9")["verdict"] = "CHANGES_PLAN"
+            next(t for t in doc["data"]["tests"] if t["test_id"] == "DT9").update(verdict="CHANGES_PLAN", share_pct=25.0, triggered_by=["share"])     # as the producer writes a change
         both = notes(note("nodata:unit_attribute:x1", same_as="R-001"))
         mixed = look_at(edited(hm, lambda d: (both(d), rewrite(dt_file, changes)(d)), dec))
         kept = [r for r in rows(mixed) if r["id"] in ("R-001", "nodata:unit_attribute:x1")]

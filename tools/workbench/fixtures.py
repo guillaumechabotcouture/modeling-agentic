@@ -188,7 +188,7 @@ EST_VERDICTS = ("yes", "no", "undetermined")           # toolkit/analysis/estima
 # The comparison runs of the cross-run check (§5.7 run_shift): `build(..., other=<name>)` writes the same question's
 # second run. `second` differs from the clean run in one spec key and what follows from it, and in nothing a
 # threshold counts; the others are what the planted comparisons are made against.
-OTHERS = ("second", "shifted", "shifted_same_spec", "headline", "other_question", "unverified")
+OTHERS = ("twin", "second", "shifted", "shifted_same_spec", "headline", "other_question", "unverified")
 STAGE_OF.update({STAB: "analysis", VOI: "analysis", PV: "analysis", BV: "analysis", EMU: "calibration", EMB: "analysis",
                  BURDEN_CSV: "launch"})
 
@@ -882,7 +882,9 @@ def _estimates_full(est):
 def _other(m, name):
     """The second run of the same question (`build(..., other=name)`, OTHERS)."""
     more = {u: "A+C" if i >= 6 else "A+B" for i, u in enumerate(UNITS)}       # three more units on the dearer option
-    if name == "second":
+    if name == "twin":
+        pass                                # the same spec, plan and headline: the clean pair of a comparison
+    elif name == "second":
         _replan(m, envelope=110000.0)
     elif name == "shifted":
         _replan(m, plan=more, envelope=110000.0)
@@ -2381,9 +2383,12 @@ DEFECTS.update({
         edit="Nothing in this run: it is compared with the run `headline`, whose headline is 1.6 times this one's "
              "and whose signed spec differs in comparator.text."),
     "C6_second_run": _out(
-        "run_shift", "ok", _nothing, [], case="C6", against="second",
+        "run_shift", "look", _nothing, [], case="C6", against="second",
         edit="Nothing in this run: it is compared with the run `second`, which has the same plan and headline and "
-             "a signed spec that differs in constraints.envelope_usd alone."),
+             "a signed spec that differs in constraints.envelope_usd alone (a key changed with no shift is still a change)."),
+    "C6_twin_run": _out(
+        "run_shift", "ok", _nothing, [], case="C6", against="twin",
+        edit="Nothing in this run: it is compared with the run `twin`, which has the same signed spec, plan and headline."),
     "C6_other_question": _out(
         "run_shift", "not_available", _nothing, [], case="C6", against="other_question",
         edit="Nothing in this run: it is compared with the run `other_question`, whose signed spec asks another question."),
@@ -3252,7 +3257,7 @@ def _outcomes_cases(tmp, ok):
         moved = {name: sum(a != b for a, b in zip(other(name, POINT)["data"]["plan"].values(), point["plan"].values())) for name in OTHERS}
         ok(f"X49 {method}: the comparison runs: a package's units shift by a quarter of the units with and without a spec "
            f"key that differs; a headline 1.6 times larger; another question; a signed copy that no longer has the recorded hash",
-           moved == {"second": 0, "shifted": 3, "shifted_same_spec": 3, "headline": 0, "other_question": 0, "unverified": 0}
+           moved == {"twin": 0, "second": 0, "shifted": 3, "shifted_same_spec": 3, "headline": 0, "other_question": 0, "unverified": 0}
            and other("shifted", SPEC_FILES[1]) == s2 and other("shifted_same_spec", SPEC_FILES[1]) == spec
            and abs(other("headline", POINT)["data"]["averted"][OUTCOME] / h - 1.6) < 1e-6
            and other("headline", SPEC_FILES[1])["comparator"]["text"] != spec["comparator"]["text"]
@@ -3309,7 +3314,7 @@ def _outcomes_cases(tmp, ok):
        "change no file; an edit for the estimates kind names it",
        checks == set(OUTCOME_CHECKS) and {"tests_that_move", "point_vs_draws", "burden_refs", "voi_support", "variant_budget", "run_shift", "dearest_wins"} <= third
        and all((DEFECTS[n].get("against") in OTHERS) == (DEFECTS[n]["check"] == "run_shift") and (DEFECTS[n]["files"] == []) == ("against" in DEFECTS[n])
-               for n in OUTCOMES_DEFECTS) and len(OUTCOMES_DEFECTS) == 36, str((sorted(set(OUTCOME_CHECKS) - checks), len(OUTCOMES_DEFECTS))))
+               for n in OUTCOMES_DEFECTS) and len(OUTCOMES_DEFECTS) == 37, str((sorted(set(OUTCOME_CHECKS) - checks), len(OUTCOMES_DEFECTS))))
 
 
 def _self_test():

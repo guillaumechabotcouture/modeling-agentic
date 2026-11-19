@@ -364,6 +364,71 @@ ok("P34 a chart's harness figure with no caption beyond its title has nothing ap
   const fig = page.chartView({kind: "bars", table: "t", x: "x", y: "y", title: "T", how_to_read: "H", image: {path: "figures/a.png", hash: sha(1), title: "A"}}, tables, "r1");
   return (!fig.kids.some(k => k == null) && fig.all("img").length === 1) || "a null was appended to the figure";
 });
+const deep = (node, pred) => [...(pred(node) ? [node] : []), ...node.kids.filter(k => k instanceof Node).flatMap(k => deep(k, pred))];
+ok("P35 reader 2: the `choose` control is an ordinary named form control (name and id are the address parameter, a label is tied to it); "
+  + "the legend says a check may be waiting for a choice", () => {
+  global.location.hash = "#run=r1&view=v";
+  const box = page.chooseView({param: "against", label: "Compare with", options: [{value: "r2", label: "Run two"}]});
+  const select = box.all("select")[0], lab = box.all("label")[0];
+  const legend = page.checksView([check("not_available")], "r1", "v").flat(Infinity).filter(n => n instanceof Node).map(n => n.textContent).join(" ");
+  return (select.attrs.name === "against" && select.attrs.id === "choose-against" && lab.attrs.for === "choose-against" && /choice/.test(legend)) || `${JSON.stringify(select.attrs)} | ${legend.slice(0, 200)}`;
+});
+ok("P36 reader 3: the line of an ok check holds its whole sentence, and no style cuts it to one line", () => {
+  const long = "Against the other: no package changes. " + "x".repeat(300) + " 3 keys of the two specs differ.";
+  const line = page.checkCard({...check("ok"), says: long}).all("summary")[0];
+  const css = fs.readFileSync(path.join(__dirname, "static", "app.css"), "utf8"), rule = (css.match(/summary \.brief \{[^}]*\}/) || [""])[0];
+  return (line.textContent.includes("3 keys of the two specs differ.") && rule && !/ellipsis|nowrap/.test(rule)) || `rule: ${rule}`;
+});
+ok("P37 reader 4: a register row-id prefix the glossary defines carries its meaning where it appears, in a sentence and in a table cell, "
+  + "and only as a prefix of an id", () => {
+  page.setGlossary({source: "the spec", why: null, kinds: {"row id": "A row id names where a register row comes from."}, entries: [
+    {code: "nodata:", kind: "row id", meaning: "meaning of nodata", section: "§6"}, {code: "test:", kind: "row id", meaning: "meaning of test", section: "§6"}]});
+  const marked = t => page.gloss(t).filter(p => p instanceof Node).map(p => [p.textContent, p.attrs.title]);
+  const a = marked("DT9 (register row nodata:unit_attribute:x1) and its test: DT1; row test:DT1.");
+  const cell = page.tableView({columns: ["id", "issue"], rows: [["DT9", "nodata:unit_attribute:x1_and_a_long_tail"]]});
+  const inCell = cell.all("abbr").map(n => n.textContent);
+  const foot = page.glossaryFoot().textContent;
+  return (same(a.map(x => x[0]), ["nodata:", "test:"]) && a[0][1].includes("meaning of nodata") && same(inCell, ["nodata:"]) && foot.includes("meaning of nodata")
+    && foot.includes("A row id names")) || JSON.stringify([a, inCell]);
+});
+ok("P38 reader 5: a check's card shows no scorecard case in its corner; the case is on hover and in the glossary, and the check's id stays "
+  + "reachable (an anchor, and a line in the opened card); an unbuilt view's goal is on hover only", () => {
+  page.setGlossary(glossary);
+  for (const s of ["ok", "look"]) {
+    const c = page.checkCard(check(s)), shown = deep(c, n => n.classList.contains("title"))[0];
+    if (/C13|scorecard/.test(c.textContent)) return `${s}: the card's text names the case: ${c.textContent}`;
+    if (c.attrs.id !== "check-v.name" || !c.textContent.includes("v.name")) return `${s}: the id is not reachable: ${JSON.stringify(c.attrs)} ${c.textContent}`;
+    if (!/scorecard case C13/.test(shown.attrs.title || "") || !/meaning of C13/.test(shown.attrs.title || "")) return `${s}: the title's hover is ${shown.attrs.title}`;
+  }
+  return page.glossaryFoot().textContent.includes("meaning of C13") || "the glossary at the foot does not list the case of a check on the page";
+});
+ok("P39 reader 6: facts take the view's plain labels, and one the view marks as held by a table is not repeated; a share is a percentage wherever it is shown; "
+  + "rows with nothing in a table's fold columns are folded; a check whose rows are a table of the page points to it", () => {
+  const t = {columns: ["measure", "value", "verdict"], rows: [["a", 1, "ROBUST"], ["b", 2, null], ["c", 3, null]], about: "A.", fold: ["verdict"]};
+  const shift = {columns: ["item", "share"], rows: [["x", 0.25]], about: "S."};
+  const view = {checks: [{...check("look"), rows: {columns: shift.columns, rows: shift.rows}}], facts: {n_tests_no_change: 3, headline_point: 12.5, dearest_share: 0.875, moved_pct: 12.5},
+    fact_labels: {n_tests_no_change: "tests with no change", headline_point: ""}, tables: {stability: t, shift}, charts: [], notes: {}};
+  const nodes = page.renderView(view, "r1", "v").flat(Infinity).filter(n => n instanceof Node), text = nodes.map(n => n.textContent).join(" | ");
+  const facts = nodes.find(n => n.tag === "dl" && n.classList.contains("facts")).textContent;
+  if (!facts.includes("tests with no change") || /n tests no change|headline point|12\.5(?!%)/.test(facts)) return `facts: ${facts}`;
+  if (!facts.includes("87.5%") || !facts.includes("12.5%") || !text.includes("25%")) return `a share is not a percentage: ${facts} ${text.slice(0, 300)}`;
+  const folded = nodes.flatMap(n => deep(n, k => k.tag === "details" && /2 rows with no verdict/.test(k.textContent)));
+  if (!folded.length) return `no fold: ${text.slice(0, 400)}`;
+  const card = nodes.find(n => n.classList.contains("check"));
+  return (card.all("table").length === 0 && /table .?shift/i.test(card.textContent)) || `the check repeats the table: ${card.textContent}`;
+});
+ok("P40 reader 7: an image of one pixel, or of one colour throughout, is said to be so; any other image is left as it is", () => {
+  const load = (w, h, pixels) => {
+    const box = page.imageBox("r1", "pics/a.png", sha(1), "A"), img = box.all("img")[0];
+    Object.assign(img, {naturalWidth: w, naturalHeight: h});
+    global.document.createElement = t => (t === "canvas" ? {getContext: () => ({drawImage() {}, getImageData: () => ({data: pixels})})} : new Node(t));
+    img.listeners.load();
+    global.document.createElement = t => new Node(t);
+    return box.textContent;
+  };
+  const one = load(1, 1, [0, 0, 0, 0]), blank = load(640, 480, new Array(64).fill(255)), fine = load(640, 480, [255, 255, 255, 255, 0, 0, 0, 255]);
+  return (/1 pixel/.test(one) && /pics\/a\.png/.test(one) && /one colour/.test(blank) && fine === "") || JSON.stringify([one, blank, fine]);
+});
 (async () => {
   await later("P20 an image that cannot be loaded is replaced by a sentence naming the file, then by the server's reason; never a broken picture", async () => {
     const asked = [];

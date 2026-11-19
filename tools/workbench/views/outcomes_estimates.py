@@ -36,11 +36,11 @@ def read(run, s):
     why = {}
     E, why[R.EST] = R.data(run, R.EST)
     U, why[R.UNC] = R.data(run, R.UNC)
-    m = {**R.empty("estimates", s), "why": why}
-    loaded, tests_why = checks.estimates_tests(run, s)
+    m = {**R.empty("estimates", s), "why": why, "provenance": R.provenance(run, R.EST)}
+    loaded, tests_why = checks.estimates_tests(run, s) if E is not None else (None, why[R.EST])     # the adapter boundary: another schema is not handed to the loader
     if loaded is not None:
         rows, m["link_why"] = R.test_rows(run, s, loaded, lambda tid, t: (None, t.get("parameter")))
-        m["tests"] = R.order(rows)
+        m["tests"], m["tie"] = R.order(rows), R.tie(loaded)
     else:
         why[R.EST] = why[R.EST] or tests_why
     outs = at(E, "outputs")
@@ -63,17 +63,11 @@ def read(run, s):
     if U is not None:
         dom = U.get("prior_dominated") if isinstance(U.get("prior_dominated"), list) else at(U, "interval", "prior_dominated")
         m["dominated"] = [str(x) for x in dom] if isinstance(dom, list) else []
-    t = m["tests"]
-
-    def count(fn):
-        return None if t is None else sum(1 for r in t if fn(r))
     m["facts"] = {
         "deliverable_kind": "estimates", "headline_outcome": name, "headline_point": None, "headline_median": row.get("median"),
         "headline_low": row.get("low"), "headline_high": row.get("high"), "interval_level": level,
         "n_draws": num(at(U, "draws")) if num(at(U, "draws")) is not None else num(at(outs, name, "n")),
-        "n_tests": None if t is None else len(t), "n_tests_no_change": count(lambda r: r["state"] == "ran" and r["verdict"] == "NO_CHANGE"),
-        "n_tests_change_plan": count(lambda r: r["state"] == "ran" and r["verdict"] == "CHANGES_PLAN"),
-        "n_tests_not_run": count(lambda r: r["state"] == "not_run"), "n_tests_near_miss": count(lambda r: r["near_miss"]),
+        **R.test_counts(m),
         "n_prior_dominated": None if m["dominated"] is None else len(m["dominated"])}
     return m
 
