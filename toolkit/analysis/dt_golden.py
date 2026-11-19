@@ -512,7 +512,26 @@ def _self_test() -> int:
         ok(_plain_name("C:trial", ntpath) is False and _plain_name("prior_range_z:North East", os.path) is True,
            "DG17c (r3 P1-3) a test id that would name a drive on Windows is not a plain file name there")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17):
+    def dg19():          # Codex review r4 of #262 (written first; each failed)
+        run1 = {"path": "models/decision_tests/DT1.yaml", "status": "run", "verdict": "NO_CHANGE"}
+        for raw, name in ((1.5, "1.5"), (True, "True"), (".", "."), ("..", "..")):
+            with tempfile.TemporaryDirectory() as d:
+                fixture(d, [dict(run1, test_id=raw, path=f"models/decision_tests/{name}.yaml")],
+                        {f"{name}.yaml": _rec(test_id=raw)})
+                try:
+                    got = set(digest_dir(d))
+                except Exception as e:  # noqa: BLE001
+                    got = e
+                ok(got == {name}, f"DG19 (r4 P2-1) id {raw!r}, as run_all writes it ({name}.yaml), is read ({got})")
+        with tempfile.TemporaryDirectory() as d:
+            fixture(d, [dict(run1, test_id="None", path="models/decision_tests/None.yaml")],
+                    {"None.yaml": _rec(test_id=None)})
+            ok(_raises(lambda: digest_dir(d), StoredIncomplete), "DG19b (r4 P2-2) a null test id is no identity")
+        import inspect
+        ok("read_nofollow" in inspect.getsource(digest_dir),
+           "DG19c (r4 P1) every read goes through lib.safe_io.read_nofollow (one descriptor, no link followed)")
+
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
