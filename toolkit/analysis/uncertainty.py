@@ -114,19 +114,23 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
 
 def chosen_point(post: dict, names) -> dict:
     """{column: value} of the fit's verified chosen point (joint_region.verified.chosen.point in the signed bytes that
-    load_posterior replayed): the point value of every posterior column (v2-posterior-point). A file without one, or
-    with a column missing or not a finite number, is refused (fail closed; no fallback to card or fitted values)."""
+    load_posterior replayed): the point value of every posterior column (v2-posterior-point). Refused (fail closed; no
+    fallback to card or fitted values): a file without one; a point whose coordinates are not exactly the sample's
+    columns, or hold a value that is not a finite number; a point that is not exactly the fit's recorded `parameters`
+    values."""
     import yaml
     from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
     doc = yaml.safe_load(post["data"])
     pt = ((((doc.get("joint_region") or {}).get("verified") or {}).get("chosen") or {}).get("point"))
-    if not isinstance(pt, dict) or any(isinstance(pt.get(k), bool) or not isinstance(pt.get(k), (int, float))
-                                       or not np.isfinite(pt[k]) for k in names):
-        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: no verified chosen point with a finite value "
-                                   f"for each of {list(names)} (joint_region.verified.chosen.point: {pt!r})")
-    fp = doc.get("parameters") if isinstance(doc.get("parameters"), dict) else {}     # run()'s fit values (Codex r1 P1-4)
+    if not isinstance(pt, dict) or sorted(pt) != sorted(names) or any(
+            isinstance(pt[k], bool) or not isinstance(pt[k], (int, float)) or not np.isfinite(pt[k]) for k in names):
+        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: no verified chosen point whose coordinates are "
+                                   f"the sample's columns {list(names)}, each a finite number "
+                                   f"(joint_region.verified.chosen.point: {pt!r})")
+    # run() writes the chosen point from its fit's parameter values: they must be the same numbers (Codex r1 P1-4, r2)
+    fp = doc.get("parameters") if isinstance(doc.get("parameters"), dict) else {}
     off = [k for k in names if not isinstance(fp.get(k), dict) or isinstance(fp[k].get("value"), bool)
-           or not isinstance(fp[k].get("value"), (int, float)) or abs(float(fp[k]["value"]) - float(pt[k])) > POINT_TOL]
+           or not isinstance(fp[k].get("value"), (int, float)) or not float(fp[k]["value"]) == float(pt[k])]
     if off:
         raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: the chosen point of {off} is not the fit's "
                                    f"recorded parameter values (parameters: {[fp.get(k) for k in off]}; chosen point: "
@@ -148,7 +152,7 @@ def posterior_point(spec, ne: dict | None, theta: dict) -> dict:
                          "engine at its default values, not at the posterior's chosen point; not supported")
     from toolkit.spec import engine_parameters as PV
     sv = PV.values(spec)
-    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv and abs(sv[k] - v) > POINT_TOL}
+    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv and abs(sv[k] - v) > POINT_TOL * (1 + 1e-6)}
     if bad:
         raise ValueError("engine_parameters: " + "; ".join(
             f"{k} is set to {a}, but the net-effect posterior's verified chosen point is {b}; the chosen point is the "
