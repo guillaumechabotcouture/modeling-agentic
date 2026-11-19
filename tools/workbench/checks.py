@@ -72,6 +72,7 @@ def hash_state(recorded, now):
 
 STALE = ("changed", "missing", "not_recorded")       # the states of a recorded input that is not known to be the same
 SPEC, SPEC_SIGNOFF, BRIEF_SIGNOFF = "decision_spec.yaml", "decision_spec.signoff.json", "decision_brief.signoff.json"
+SIGNED_COPY = "decision_brief.signed/decision_spec.yaml"
 DT = "analysis/decision_tests.yaml"
 # toolkit/analysis/decision_tests.py writes status "run" or "not_run"; toolkit/analysis/run.py derives the verdict from
 # it: NOT_RUN when the status is not_run, else CHANGES_PLAN or NO_CHANGE. Any other pair is no pair the producer writes.
@@ -121,7 +122,9 @@ def bound(record, rel, now):
 
 
 def decision_tests(run):
-    """({test id: {status, verdict, statement, state}}, None) from analysis/decision_tests.yaml, or (None, why).
+    """({test id: {status, verdict, statement, state, share_pct, threshold_pct}}, None) from
+    analysis/decision_tests.yaml, or (None, why). share_pct and threshold_pct are the test's own numbers (the share of
+    units that change package, and the share above which the plan is said to change), null where it records none.
     The one loader of decision tests, for every view. state: `ran` (status run with a verdict of NO_CHANGE or
     CHANGES_PLAN: the only pair that establishes that a test ran), `not_run` (status not_run, verdict NOT_RUN),
     `contradiction` (the producer's words in a pair it does not write, so the record contradicts itself), or
@@ -138,8 +141,38 @@ def decision_tests(run):
         pair = (status, verdict) if isinstance(status, str) and isinstance(verdict, str) else None
         state = TEST_PAIRS.get(pair) or ("contradiction" if pair and status in TEST_STATUSES and verdict in VERDICTS else "unknown")
         out[str(t["test_id"])] = {"status": status, "verdict": verdict, "state": state,
-                                  "statement": " ".join(str(t.get("statement") or "").split())[:4000]}
+                                  "statement": " ".join(str(t.get("statement") or "").split())[:4000],
+                                  **{k: t.get(k) if isinstance(t.get(k), (int, float)) and not isinstance(t.get(k), bool) else None
+                                     for k in ("share_pct", "threshold_pct")}}
     return out, None
+
+
+def verified_spec(run):
+    """The signed copy of the spec and whether it is verified (§3): {doc, sha, verified, why, signed_by, signed_at,
+    record}. One loader for every view that lets a signed declaration or allowance excuse something. `verified` is
+    true only when the signed copy can be read and parsed and its sha256 is the one the sign-off record (the record
+    signoff_record selects) holds for the spec; the hash and the document come from one read (Run.hashed), so a hash
+    that verifies speaks for the document returned. With no verified copy `doc` is None and `why` says what is
+    missing: nothing in a spec that is not verified can excuse anything."""
+    sha, doc, why = run.hashed(SIGNED_COPY)
+    so, so_rel, so_why = signoff_record(run)
+    held = so.get("sha256") if isinstance(so, dict) and isinstance(so.get("sha256"), dict) else {}
+    want = digest(held.get(SPEC))
+    if sha is None:
+        bad = f"the run has no readable signed copy of the spec ({why})"
+    elif so is None:
+        bad = f"the sign-off record could not be read ({so_why})"
+    elif want is None:
+        bad = f"the sign-off record ({so_rel}) holds no sha256 for {SPEC}"
+    elif want != sha:
+        bad = f"the signed copy ({SIGNED_COPY}, {sha[:8]}) differs from the hash the sign-off record holds ({want[:8]})"
+    elif not isinstance(doc, dict):
+        bad = why or f"{SIGNED_COPY} is not a mapping"
+    else:
+        bad = None
+    ok = bad is None
+    return {"doc": doc if ok else None, "sha": sha, "verified": ok, "why": bad, "record": so_rel,
+            "signed_by": so.get("signed_by") if ok else None, "signed_at": so.get("signed_at") if ok else None}
 
 
 def pipeline(run):
@@ -415,6 +448,7 @@ def run_all(run):
 def _self_test():
     import json
     import os
+    import shutil
     import sys
     import tempfile
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -520,6 +554,28 @@ def _self_test():
            "words in another pair contradict each other; any other word is unknown",
            why is None and [tests[f"T{i}"]["state"] for i in range(1, 9)] == ["ran", "ran", "not_run", "contradiction",
                                                                              "contradiction", "unknown", "unknown", "unknown"], str(tests))
+
+        def spec_of(name, edit=None):
+            d = os.path.join(tmp, name)
+            os.makedirs(os.path.join(d, os.path.dirname(SIGNED_COPY)))
+            workbench._toy(d)
+            shutil.copyfile(os.path.join(d, SPEC), os.path.join(d, SIGNED_COPY))
+            if edit:
+                edit(d)
+            return verified_spec(workbench.Run(d))
+
+        def other_hash(d):
+            so = json.load(open(os.path.join(d, SPEC_SIGNOFF)))
+            so["sha256"][SPEC] = "0" * 64
+            json.dump(so, open(os.path.join(d, SPEC_SIGNOFF), "w"))
+        good = spec_of("s10")
+        bad = [spec_of("s10a", lambda d: os.remove(os.path.join(d, SIGNED_COPY))), spec_of("s10b", lambda d: os.remove(os.path.join(d, SPEC_SIGNOFF))),
+               spec_of("s10c", other_hash), spec_of("s10d", lambda d: open(os.path.join(d, SIGNED_COPY), "a").write("\n# edited after the sign-off\n"))]
+        ok("S10 the signed spec, one loader: verified only when the signed copy has the hash the sign-off record holds; "
+           "with no copy, no record or another hash it gives no document, no signer and the reason",
+           good["verified"] and isinstance(good["doc"], dict) and good["signed_by"] == "owner" and good["why"] is None
+           and all(not b["verified"] and b["doc"] is None and b["signed_by"] is None and b["why"] for b in bad),
+           str((good["why"], [b["why"] for b in bad])))
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
 

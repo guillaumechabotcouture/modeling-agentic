@@ -26,19 +26,20 @@ class Bench:
         self._tmp = tempfile.TemporaryDirectory(prefix="fit-self-test-")      # removed by done(), or when collected
         self.view, self.tmp, self.built, self.fails = view, self._tmp.name, {}, []
 
-    def folder(self, method, defect=None, upto=None):
-        """A built fixture run's folder (built once per variant; never edited in place)."""
+    def folder(self, method, defect=None, upto=None, figures="standard"):
+        """A built fixture run's folder (built once per variant; never edited in place). `figures` names the figure
+        set of the build (fixtures.FIGURE_SETS)."""
         fixtures = fixture_builder()
-        key = (method, defect, upto)
+        key = (method, defect, upto, figures)
         if key not in self.built:
             self.built[key] = os.path.join(self.tmp, f"run{len(self.built)}")
-            fixtures.build(self.built[key], upto=upto, defect=defect, method=method)
+            fixtures.build(self.built[key], upto=upto, defect=defect, method=method, figures=figures)
         return self.built[key]
 
-    def edited(self, method, edit, defect=None):
+    def edited(self, method, edit, defect=None, figures="standard"):
         """A copy of a built run with one file rewritten or removed by `edit(folder)`. The builder writes plain files
         only; each is read and written below the bench's folder with no link followed (lib.safe_io)."""
-        src, name = self.folder(method, defect), f"edited{len(os.listdir(self.tmp))}"
+        src, name = self.folder(method, defect, figures=figures), f"edited{len(os.listdir(self.tmp))}"
         os.makedirs(os.path.join(self.tmp, name))
         for at, _, files in os.walk(src):
             for f in files:

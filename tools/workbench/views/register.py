@@ -94,6 +94,7 @@ def _self_test():
     b = Bench(lambda run: view(run))        # the module's `view` as it is when a case runs
     folder, look_at, case, edited = b.folder, b.look_at, b.case, b.edited
     hm, post = "history_matching", "posterior"
+    dec = "declared"        # §9: the clean run holds nothing declared; this variant holds one of each declaration
     names = {"undisposed": "C12", "tests_unlinked": None, "declared_untested": None, "decides_unknown": None,
              "prose_only": None, "notes": None}
     columns = ["id", "nature", "kind", "statement", "source", "first_visible_stage", "decides", "disposition", "evidence",
@@ -110,8 +111,8 @@ def _self_test():
         "decision_spec.yaml", "decision_brief.signed/decision_spec.yaml", "decision_spec.signoff.json",
         "owner/review_notes.jsonl")
     stale = fx.STALE_ID
-    clean_ids = {"D-001", "D-002", "R-001", stale, "departure:B2", "departure:B", "calibration:grp_r1:G1", "excluded:c1",
-                 "nodata:parameter:p2", "nodata:unit_attribute:x1"}
+    clean_ids = {"D-001", "D-002", "R-001", stale, "excluded:c1", "nodata:parameter:p2", "nodata:unit_attribute:x1"}
+    declared_ids = clean_ids | {"departure:B2", "departure:B", "calibration:grp_r1:G1"}
 
     # ---- readers of a view result
     def table(v, name, cols=None):
@@ -235,15 +236,17 @@ def _self_test():
                 need(c.get("case") == names[name], f"{name}: scorecard case {names[name]} (got {c.get('case')})")
 
     def m_facts():
-        want = {hm: [9, 0, 4, 3, 2, 0, 1, 2, 0, 1, 0, 0], post: [8, 0, 4, 2, 2, 0, 1, 2, 0, 1, 0, 0]}
-        for method in (hm, post):
-            f = look_at(folder(method))["facts"]
+        want = {(hm, None): [6, 0, 1, 2, 3, 0, 1, 3, 0, 1, 0, 0], (post, None): [6, 0, 1, 2, 3, 0, 1, 3, 0, 1, 0, 0],
+                (hm, dec): [9, 0, 4, 3, 2, 0, 1, 2, 0, 1, 0, 0], (post, dec): [8, 0, 4, 2, 2, 0, 1, 2, 0, 1, 0, 0]}
+        for (method, variant), counts in want.items():
+            f = look_at(folder(method, variant))["facts"]
             need(sorted(f) == sorted(fact_names), f"{method}: exactly the twelve facts (got {sorted(f)})")
-            need([f[k] for k in fact_names] == want[method], f"{method}: {dict(zip(fact_names, want[method]))} (got {f})")
+            need([f[k] for k in fact_names] == counts, f"{method}, {variant or 'clean'}: {dict(zip(fact_names, counts))} (got {f})")
 
     def m_rows():
-        for method, want in ((hm, clean_ids), (post, clean_ids - {"calibration:grp_r1:G1"})):
-            v = look_at(folder(method))
+        for method, variant, want in ((hm, None, clean_ids), (post, None, clean_ids), (hm, dec, declared_ids),
+                                      (post, dec, declared_ids - {"calibration:grp_r1:G1"})):
+            v = look_at(folder(method, variant))
             got = ids(v)
             need(len(set(got)) == len(got) and set(got) == want, f"{method}: one row per id, {sorted(want)} (got {sorted(got)})")
             need(isinstance(v["tables"]["rows"].get("about"), str) and v["tables"]["rows"]["about"], "tables.rows says what its rows are")
@@ -256,13 +259,14 @@ def _self_test():
                 need(r["blocking"] in (True, False, None), f"row {r['id']}: blocking is true, false or null")
 
     def m_by_source():
-        want = {hm: [["findings", 3, 0], ["engine_departures", 2, 0], ["calibration_declared", 1, 0],
-                     ["uncertainty_excluded", 1, 0], ["evidence_dossier", 2, 0]]}
-        want[post] = [r for r in want[hm] if r[0] != "calibration_declared"]
-        for method in (hm, post):
-            v = look_at(folder(method))
+        want = {(hm, dec): [["findings", 3, 0], ["engine_departures", 2, 0], ["calibration_declared", 1, 0],
+                            ["uncertainty_excluded", 1, 0], ["evidence_dossier", 2, 0]]}
+        want[(post, dec)] = [r for r in want[(hm, dec)] if r[0] != "calibration_declared"]
+        want[(hm, None)] = want[(post, None)] = [["findings", 3, 0], ["uncertainty_excluded", 1, 0], ["evidence_dossier", 2, 0]]
+        for (method, variant), rows_wanted in want.items():
+            v = look_at(folder(method, variant))
             got = [[r["source"], r["rows"], r["open"]] for r in table(v, "by_source", ["source", "rows", "open"])]
-            need(got == want[method], f"{method}: science rows by first source, in §6's order; a source the run does not "
+            need(got == rows_wanted, f"{method}, {variant or 'clean'}: science rows by first source, in §6's order; a source the run does not "
                                       f"have is absent (got {got})")
             need(sum(r[1] for r in got) == v["facts"]["n_rows"] and sum(r[2] for r in got) == v["facts"]["n_open"],
                  f"{method}: the counts add up to n_rows and n_open")
@@ -291,7 +295,8 @@ def _self_test():
         need(v["notes"] and all(isinstance(k, str) and isinstance(t, str) and t.strip() for k, t in v["notes"].items()), "notes is {name: text}")
         text = " ".join(v["notes"].values())
         need(signed_file in text and "owner" in text, f"a note says which copy of the spec was read and who signed it ({text!r})")
-        need("scope_declaration" not in [r["source"] for r in table(v, "by_source")], "a source with no row of its own is not in by_source")
+        need("scope_declaration" not in [r["source"] for r in table(look_at(folder(hm, dec)), "by_source")],
+             "a source with no row of its own (a scope declaration merged into its finding) is not in by_source")
 
     # ------------------------------------------------------------------------------- derivation rules (§6)
     def d_status_words():
@@ -307,7 +312,9 @@ def _self_test():
         need("point value of the headline" in claim, f"the statement is the finding's claim ({claim!r})")
 
     def d_scope():
-        v = look_at(folder(hm))
+        need(not os.path.exists(os.path.join(folder(hm), scope_file)) and row(look_at(folder(hm)), "R-001")["source"] == "findings",
+             "the clean run has no scope declaration")
+        v = look_at(folder(hm, dec))
         r = row(v, "R-001")
         has(r, disposition="declared", tests="DT3", verdicts="NO_CHANGE", source="findings,scope_declaration", decides="no")
         need(split(r["files"]) == [ledger_file, scope_file], f"both files are named ({r['files']!r})")
@@ -316,28 +323,30 @@ def _self_test():
         def no_blocker(doc):
             doc["declarations"].append({"id": "SD-009", "why_unresolved": "no finding id was given",
                                         "decision_test": "models/decision_tests/DT1.yaml"})
-        r = row(look_at(edited(hm, rewrite(scope_file, no_blocker))), "SD-009")
+        r = row(look_at(edited(hm, rewrite(scope_file, no_blocker), dec)), "SD-009")
         has(r, kind="issue", disposition="declared", tests="DT1", source="scope_declaration", nature="science")
         need("no finding id was given" in r["statement"], f"the statement is why_unresolved ({r['statement']!r})")
 
     def d_departures():
-        v = look_at(folder(hm))
+        need(not [i for i in ids(look_at(folder(hm))) if i.startswith("departure:")], "the clean run has no departure, and no such row")
+        v = look_at(folder(hm, dec))
         for rid, test in (("departure:B2", "DT4"), ("departure:B", "DT5")):
             has(row(v, rid), kind="assumption", disposition="declared", tests=test, source="engine_departures", decides="no")
 
         def proposed(doc):
             doc["engine_departures"][1]["status"] = "proposed"
-        v = look_at(edited(hm, rejson(choice_file, proposed)))
+        v = look_at(edited(hm, rejson(choice_file, proposed), dec))
         has(row(v, "departure:B"), disposition="open", signed_by=None)
         has(row(v, "departure:B2"), disposition="declared")
         need(check(v, "undisposed")["status"] == "look", f"an unsigned departure is an open row ({check(v, 'undisposed')['says']!r})")
 
     def d_calibration():
-        has(row(look_at(folder(hm)), "calibration:grp_r1:G1"), kind="issue", disposition="tested", tests="DT6", verdicts="NO_CHANGE",
+        has(row(look_at(folder(hm, dec)), "calibration:grp_r1:G1"), kind="issue", disposition="tested", tests="DT6", verdicts="NO_CHANGE",
             source="calibration_declared", decides="no")
+        need(not [i for i in ids(look_at(folder(hm))) if i.startswith("calibration:")], "the clean run declares no miss, and has no such row")
         v = look_at(folder(hm, "C13_blocked_declared"))
         has(row(v, f"calibration:{fx.OFFSET}"), disposition="tested", tests="DT2", source="calibration_declared")
-        need(not [i for i in ids(look_at(folder(post))) if i.startswith("calibration:")], "a method with no such list has no such row")
+        need(not [i for i in ids(look_at(folder(post, dec))) if i.startswith("calibration:")], "a method with no such list has no such row")
 
     def d_excluded():
         v = look_at(folder(hm))
@@ -390,7 +399,7 @@ def _self_test():
         need("changes the plan and is linked to no issue" in r["statement"], f"the row carries the sentence ({r['statement']!r})")
 
     def d_decides():
-        v = look_at(folder(hm))
+        v = look_at(folder(hm, dec))
         has(row(v, "nodata:unit_attribute:x1"), decides="yes", verdicts="CHANGES_PLAN")
         has(row(v, "R-001"), decides="no")
         has(row(v, "D-001"), decides="unknown", tests="")
@@ -398,13 +407,13 @@ def _self_test():
 
         def odd(doc):
             next(t for t in doc["data"]["tests"] if t["test_id"] == "DT3")["verdict"] = "MAYBE"
-        has(row(look_at(edited(hm, rewrite(dt_file, odd))), "R-001"), decides="unknown")
-        mixed = look_at(edited(hm, notes(note("nodata:unit_attribute:x1", same_as="R-001"))))
+        has(row(look_at(edited(hm, rewrite(dt_file, odd), dec)), "R-001"), decides="unknown")
+        mixed = look_at(edited(hm, notes(note("nodata:unit_attribute:x1", same_as="R-001")), dec))
         kept = [r for r in rows(mixed) if r["id"] in ("R-001", "nodata:unit_attribute:x1")]
         need(len(kept) == 1 and kept[0]["decides"] == "yes", f"one plan-changing test among a row's tests makes it yes ({kept})")
 
     def d_stage():
-        v = look_at(folder(hm))
+        v = look_at(folder(hm, dec))
         want = {"D-001": "SPEC", "D-002": "WRITE", "R-001": "ANALYZE", "departure:B": "ENGINE_CHOICE",
                 "calibration:grp_r1:G1": "SIGN", "excluded:c1": "SIGN", "nodata:parameter:p2": "SIGN", "nodata:unit_attribute:x1": "SIGN"}
         got = {i: row(v, i)["first_visible_stage"] for i in want}
@@ -423,12 +432,12 @@ def _self_test():
         v = look_at(folder(hm, "process_open"))
         has(row(v, stale), nature="process", disposition="open", severity="HIGH", blocking=True)
         f = v["facts"]
-        need((f["n_process"], f["n_process_open"], f["n_open"], f["n_rows"]) == (1, 1, 0, 9), f"process rows are counted apart ({f})")
+        need((f["n_process"], f["n_process_open"], f["n_open"], f["n_rows"]) == (1, 1, 0, 6), f"process rows are counted apart ({f})")
         need(next(r for r in table(v, "by_source") if r["source"] == "findings")["open"] == 0, "by_source counts science rows")
         need(statuses(v) == {n: "ok" for n in names}, f"an open process row moves no check (got {statuses(v)})")
 
     def d_signed_by():
-        v = look_at(folder(hm))
+        v = look_at(folder(hm, dec))
         for rid in ("calibration:grp_r1:G1", "excluded:c1", "departure:B2", "departure:B"):
             has(row(v, rid), signed_by="owner")
         has(row(v, "D-001"), signed_by=None)
@@ -443,7 +452,7 @@ def _self_test():
         has(row(look_at(edited(hm, ledger(accepted))), "R-001"), disposition="declared", signed_by="owner")
 
     def d_merge_test():
-        clean, v = look_at(folder(hm)), look_at(folder(hm, "merge_shared_test"))
+        clean, v = look_at(folder(hm, dec)), look_at(folder(hm, "merge_shared_test"))
         need(sorted(ids(v)) == sorted(ids(clean)), f"a later source naming a test already on a row adds no row ({sorted(set(ids(v)) ^ set(ids(clean)))})")
         has(row(v, "R-001"), disposition="declared", tests="DT3", source="findings,scope_declaration,evidence_dossier")
         need(dossier_file in row(v, "R-001")["files"], "the later source's file is added")
@@ -456,7 +465,7 @@ def _self_test():
         high = look_at(folder(hm, "sheet_high"))
         need("nodata:parameter:p2" not in ids(high), "with a sheet row for p2, the dossier's entry for it is merged into that row")
         has(row(high, "presign:p2"), tests="DT8", source="signoff_sheet,evidence_dossier", disposition="open")
-        need({"departure:B", "departure:B2"} <= set(ids(clean)), "an id that only begins like another is not merged")
+        need({"departure:B", "departure:B2"} <= set(ids(look_at(folder(hm, dec)))), "an id that only begins like another is not merged")
         need("scenario_excluded_c1" not in row(clean, "excluded:c1")["tests"], "a test whose name holds the input's name is not linked by it")
         v = look_at(folder(hm, "merge_excluded_nodata"))
         need(sorted(ids(v)) == sorted(ids(clean) + ["excluded:q4"]), f"one row for the pair ({sorted(set(ids(v)) ^ set(ids(clean)))})")
@@ -567,24 +576,27 @@ def _self_test():
         want = {"undisposed": "ok", "prose_only": "ok", "notes": "ok", "tests_unlinked": "not_available",
                 "declared_untested": "not_available", "decides_unknown": "not_available"}
         need(statuses(v) == want, f"before the decision tests exist: {want} (got {statuses(v)})")
-        need({"excluded:c1", "nodata:parameter:p2", "departure:B"} <= set(ids(v)) and "R-001" not in ids(v), "rows from the files the run has so far")
+        need({"excluded:c1", "nodata:parameter:p2"} <= set(ids(v)) and "R-001" not in ids(v), "rows from the files the run has so far")
+        v = look_at(folder(hm, dec, upto="sign-off"))
+        need(statuses(v) == want and {"excluded:c1", "departure:B", "calibration:grp_r1:G1"} <= set(ids(v)) and "R-001" not in ids(v),
+             f"and the same with declarations signed: their rows are there before any test is (got {statuses(v)})")
 
     def x_unverified():
         ways = {"the sign-off record is missing": remove(signoff_file), "the signed copy is missing": remove(signed_file),
                 "the signed copy is not the one signed": retext(signed_file, lambda text: text + "\n# edited after the sign-off\n")}
         for why, edit in ways.items():
-            v = look_at(edited(hm, edit))
+            v = look_at(edited(hm, edit, dec))
             c = check(v, "undisposed")
             need(c["status"] == "problem" and "no signed spec could be verified" in says(c), f"{why}: undisposed is a problem and says so ({c['status']}: {c['says']!r})")
             carried = [r for r in rows(v) if split(r["source"])[0] in ("calibration_declared", "uncertainty_excluded", "signoff_sheet")]
-            need(all(r["disposition"] not in ("declared", "tested") and r["signed_by"] is None for r in carried),
+            need(len(carried) == 2 and all(r["disposition"] not in ("declared", "tested") and r["signed_by"] is None for r in carried),
                  f"{why}: nothing the spec or its sheet carries is declared or tested ({[(r['id'], r['disposition']) for r in carried]})")
             need(check(v, "prose_only")["status"] == "not_available", f"{why}: prose_only has no signed copy to read")
 
     def x_unparsable():
         for rel in (scope_file, choice_file, dossier_file):
             for text in ("\x00 [ not: a document", "- a\n- list\n" if rel.endswith(".yaml") else "[1, 2]"):
-                c = check(look_at(edited(hm, write(rel, text))), "undisposed")
+                c = check(look_at(edited(hm, write(rel, text), dec)), "undisposed")
                 need(unraised(c) and rel in c["says"], f"{rel} unreadable: undisposed is not ok or look, and names the file ({c['status']}: {c['says']!r})")
         for text in ("data: [unclosed\n", "schema: analysis.decision_tests/1\ndata: 7\n"):
             st = statuses(look_at(edited(hm, write(dt_file, text))))
@@ -597,7 +609,7 @@ def _self_test():
             c = check(v, "undisposed")
             need(c["status"] == "problem" and ledger_file in c["says"], f"a ledger whose lines are not finding rows is a problem ({c['status']}: {c['says']!r})")
             need("D-001" not in ids(v) and set(statuses(v).values()) <= set(_checks.STATUSES), "and nothing is guessed at")
-        v = look_at(edited(hm, remove(ledger_file)))
+        v = look_at(edited(hm, remove(ledger_file), dec))
         c = check(v, "undisposed")
         need("findings" not in [r["source"] for r in table(v, "by_source")], "a run with no ledger has no findings source")
         need(c["status"] == "problem" and "R-001" in c["says"] and ledger_file in c["says"],
@@ -629,8 +641,8 @@ def _self_test():
         need(check(v, "undisposed")["status"] == "look" and check(v, "decides_unknown")["status"] == "look", "an open row the owner added is undisposed like any other")
 
     def n_same_as():
-        clean = look_at(folder(hm))
-        v = look_at(edited(hm, notes(note("nodata:unit_attribute:x1", same_as="R-001", note="the same question"))))
+        clean = look_at(folder(hm, dec))
+        v = look_at(edited(hm, notes(note("nodata:unit_attribute:x1", same_as="R-001", note="the same question")), dec))
         kept = [r for r in rows(v) if r["id"] in ("R-001", "nodata:unit_attribute:x1")]
         need(len(kept) == 1 and v["facts"]["n_rows"] == clean["facts"]["n_rows"] - 1, f"the two rows become one ({[r['id'] for r in kept]})")
         need(set(split(kept[0]["tests"])) == {"DT3", "DT9"} and {"findings", "evidence_dossier"} <= set(split(kept[0]["source"])),
@@ -671,7 +683,7 @@ def _self_test():
                     text = f.read().lower()
                 hits += [f"{os.path.relpath(os.path.join(root, n), _WB)}: {w}" for w in listed if w in text]
         need(not hits, f"domain words in the code: {hits[:6]}")
-        for defect in (None, "C12_open_high", "prose_only", "older_layout"):
+        for defect in (None, dec, "C12_open_high", "prose_only", "older_layout"):
             text = json.dumps(look_at(folder(hm, defect)), default=str).lower()
             need(not [w for w in listed if w in text], f"the view's result on a fixture holds no domain word ({defect})")
         v = look_at(folder(post))

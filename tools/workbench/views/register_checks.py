@@ -430,7 +430,7 @@ def _self_test():
         def pair(tid, **words):
             return rewrite(DT, lambda doc: next(t for t in doc["data"]["tests"] if t["test_id"] == tid).update(words))
         for words in ({"verdict": "NOT_RUN"}, {"status": "not_run"}):
-            v = b.look_at(b.edited(hm, pair("DT4", **words)))
+            v = b.look_at(b.edited(hm, pair("DT4", **words), "declared"))
             c = check(v, "declared_untested")
             need(c["status"] == "problem" and "departure:B2" in c["says"] and "DT4" in c["says"] and "contradict" in c["says"],
                  f"{words}: a declared row whose test's status and verdict contradict each other is a problem ({c['status']}: {c['says']})")
@@ -438,7 +438,7 @@ def _self_test():
         c = check(v, "tests_unlinked")
         need(c["status"] == "problem" and "DT1" in c["says"] and "test:DT1" not in [r[0] for r in v["tables"]["rows"]["rows"]],
              f"a test no row names, recorded as not run and as changing the plan, is a problem and no row ({c['status']}: {c['says']})")
-        v = b.look_at(b.edited(hm, pair("DT4", status="done")))
+        v = b.look_at(b.edited(hm, pair("DT4", status="done"), "declared"))
         need(check(v, "declared_untested")["status"] == "problem", "a status word the producer does not write is not a test that ran")
 
     def rows_of(v, name="rows"):
@@ -465,7 +465,7 @@ def _self_test():
         d1 = row_of(v, "D-001")
         need(d1["disposition"] == "implemented" and "gate_r2.json" in d1["evidence"] and "passed" in d1["evidence"],
              f"a fixed finding is implemented with the gate's recorded result for its done-when test shown ({d1['disposition']}: {d1['evidence']!r})")
-        need((v["facts"]["n_implemented"], v["facts"]["n_implemented_unverified"]) == (2, 0), f"facts ({v['facts']})")
+        need((v["facts"]["n_implemented"], v["facts"]["n_implemented_unverified"]) == (3, 0), f"facts ({v['facts']})")
         proc = row_of(v, fx.STALE_ID, "process")
         need(proc["disposition"] == "implemented" and "gate" in proc["evidence"], f"a harness finding's evidence is the gate it was absent from ({proc})")
         v = b.look_at(b.folder(hm, "implemented_unverified"))
@@ -474,7 +474,7 @@ def _self_test():
              f"the ledger says fixed and the gate's last result for its test is not a pass ({d2['disposition']}: {d2['evidence']!r})")
         need(c["status"] == "look" and "D-002" in c["says"] and "not verified" in c["says"] and "D-002" in str(c["rows"]),
              f"it counts as a row with no disposition ({c['status']}: {c['says']})")
-        need((v["facts"]["n_implemented"], v["facts"]["n_implemented_unverified"], v["facts"]["n_open"]) == (1, 1, 0), f"facts ({v['facts']})")
+        need((v["facts"]["n_implemented"], v["facts"]["n_implemented_unverified"], v["facts"]["n_open"]) == (2, 1, 0), f"facts ({v['facts']})")
         v = b.look_at(b.folder(hm, "implemented_no_gate"))
         c = check(v, "undisposed")
         need(c["status"] == "problem" and "D-001" in c["says"] and row_of(v, "D-001")["disposition"] == UNVERIFIED
@@ -502,14 +502,14 @@ def _self_test():
         need(all(w in terms for w in ("First visible stage", "Blocking", "process", "science")), f"the page defines its columns' words ({terms})")
         cols = v["tables"]["rows"]["columns"]
         need(cols.index("nature") == 1, f"nature is beside the id, where a process row is seen as one without scrolling ({cols})")
-        tests = rows_of(v, "tests")
+        tests = rows_of(b.look_at(b.folder(hm, "declared")), "tests")       # §9: R-001 is declared with DT3 on this variant only
         dt3 = next(t for t in tests if t["test"] == "DT3")
         need(dt3["question"] == "Does the plan change under DT3?" and dt3["verdict"] == "NO_CHANGE" and dt3["rows"] == "R-001",
              f"each decision test is shown with the spec's own question, its verdict and the rows that name it ({dt3})")
-        need(len(tests) == len(derive(__import__("workbench").Run(b.folder(hm, "process_open")))["tests"]), "every test of the file is listed")
+        need(len(tests) == len(derive(__import__("workbench").Run(b.folder(hm, "declared")))["tests"]), "every test of the file is listed")
 
     def sources_and_summaries():
-        v = b.look_at(b.folder(hm))
+        v = b.look_at(b.folder(hm, "declared"))       # §9: only this variant has a scope declaration to merge
         said = v["notes"].get("sources", "")
         need("scope declaration" in said and "merged" in said and "No science row" not in said.split("merged")[0].split(".")[-1],
              f"a source whose rows were merged into earlier rows is said to be merged, not absent ({said!r})")

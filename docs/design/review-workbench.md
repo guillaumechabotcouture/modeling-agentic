@@ -272,6 +272,57 @@ Acceptance (R4): engine malaria-starsim 0.17, 4 ineligible candidates; 17 benchm
 out, out of band, signed departure, its decision test just under the share threshold (near
 miss); B19 "band cannot be reached"; one owner-set value outside the card range.
 
+The generic Model model (what `views/model.py` returns). `facts`: `engine_name`,
+`engine_version`, `n_candidates`, `n_eligible`, `n_benchmarks`, `n_in_band`, `n_out_of_band`,
+`n_unreachable`, `n_near_edge`, `n_not_gating`, `n_departures`, `n_owner_values`,
+`n_owner_values_outside_card`, `choice_bound` (bool). `tables.candidates`: `name, version,
+eligible, n_reasons, first_reason`. `tables.benchmarks`: `id, metric, role (fit or held_out),
+target, band_low, band_high, computed, seed_min, seed_max, status, gates (bool), source,
+departure_test, departure_verdict`. `tables.departures`: `subject, kind (component or
+benchmark), reason, status, signed (bool, by §3's verified-spec rule), test, verdict,
+share_pct, share_threshold_pct`. `tables.parameters`: `name, value, low, high, units, kind,
+source, owner_value, card_value, outside_card`. `tables.mechanisms`: `text`. Charts:
+`ranges` of each benchmark's band with the computed value and seed range, on a log scale where
+the band spans more than a factor of ten. Statuses use the producer's own words
+(`toolkit/engines/benchmark.py`), mapped explicitly. All benchmark values are read from the
+run's own copy; a run with no engine record gives `not_available`.
+
+Settled from the first acceptance pass on three engines (2026-11-19):
+
+- `gates` is false when the run lists the benchmark as reported only, or its `covers` is
+  recorded and empty; otherwise true (fail closed). `model.benchmarks`: a gating benchmark that
+  is not in band and has no verified signed departure whose test ran is `problem`; one that is
+  not gating, or is covered, is `look`; in band and within a quarter of the band's log width of
+  an edge is a near miss (`look`). An engine whose record lists no benchmark at all is `look`:
+  nothing ties it to a trial or a reference. Facts gain `n_not_assessable`; `n_unreachable`
+  counts every row whose band cannot be reached, whatever the reason.
+- `model.choice_text` reads no free text: it compares the choice record's own list of
+  benchmarks not in band with the table; a difference is `problem`.
+- `model.choice_bound`: a null choice hash is `ok` when the verified signed spec names the
+  engine, and `look` (gap H10) when the spec leaves the engine to be chosen.
+- `model.spec_values` uses the record's own flag for a value or range outside the card, and the
+  sentence says which. Values are "spec-set"; the `signed_by` of the spec says whose they are.
+- `tables.parameters` has `value_used` (the spec's value where it sets one, else the card's),
+  `spec_low` and `spec_high`. A table `benchmarks_at_spec_values` (`id, computed, status,
+  spec_hash, test`) holds benchmarks recomputed at the spec's values, when the run has them.
+  A candidate with no readable name is shown by its reference. A table the run records with no
+  rows has `rows: []`; one it does not record is null.
+- Checks added: `model.seed_range` (a benchmark in band whose seed range crosses an edge:
+  `look`); `model.parameters_sourced` (the count of parameters marked unverified or with no
+  range: `look` above none, with the count; a workbench check, not a threshold);
+  `model.fitted_at_bound` (a fitted parameter on the bound of its fitted range: `look`).
+- Settled while the Model fixtures were written: `model.choice_text` compares the choice
+  record's list with the table's rows that gate, are not in band and are not covered by a
+  departure (the producer's list leaves out covered and reported-only rows). `covers` is read
+  from the benchmark row where the run records it. A band that cannot be reached is `look`. An
+  unknown status word or a benchmark with no band is `not_available` for that row's check. A
+  status that contradicts the row's own numbers is `problem`. `model.departures` is `look` for
+  any signed departure whose test ran (declared and signed, for the reader to judge) and
+  `problem` when the test did not run or the departure is not in the verified signed spec. The
+  log scale is used where a band spans more than a factor of one hundred.
+- What is engine-specific: only R4's engine has benchmarks, departures and recomputed
+  benchmarks; the other two engines' records list none, which the view states.
+
 ### 5.5 Fit
 
 The generic model is in §3a. What follows is the `history_matching` adapter, with R4 as its
@@ -479,6 +530,57 @@ Checks: `figure_fresh` (a figure whose recorded sources have changed since it wa
 report or manuscript relies on it); `figure_unused` (a decision-tier figure the report does not
 use); `figure_in_manifest`.
 
+The generic Figures model (what `views/figures.py` returns). `facts`: `n_figures`,
+`n_produced`, `n_not_produced`, one count per tier (`n_<tier>` and `n_<tier>_produced`),
+`n_stale`, `n_missing_file`, `n_used`. `tables.figures`: `figure, tier, group, title, caption,
+shows, produced (bool), reason, path, table, sources (joined), fresh (same, changed, missing,
+not recorded), in_manifest, used_in (joined)`. `tables.sources`: `figure, source, recorded,
+now, state`. A view may declare `images`: `{table, path, hash, title, caption}` and the page
+shows each image through a file endpoint, `GET /api/file?run=<id>&path=<rel>&sha=<hash>`, which
+serves a file only from inside the run, only with the hash the view named, and with a sandboxed
+content policy. Freshness uses each figure's provenance record
+(`figures/<name>.png.provenance.json`) against the files now on disk, by the hash rules of §3.
+"Used" means the report, manuscript or results text, or the render record, names the figure.
+
+Settled from the first acceptance pass (2026-11-19):
+
+- Freshness compares each recorded source with the file on disk, except the spec, which is
+  compared with the verified signed copy (§3); the spec on disk differing from the signed copy
+  is the Steps view's finding, not a stale figure. `presentation` entries are sources too.
+  `n_stale` counts figures with a changed or missing source; `n_missing_file` counts produced
+  figures whose image is absent.
+- Statuses: a stale figure is `problem`; a figure not produced is `look`, and `problem` when a
+  report names it; a produced decision-tier figure no report names is `look`.
+- "Used" is a match on the figure's path or file name only; a bare figure name is an ordinary
+  word and does not count.
+- Two producers write `analysis/figures.yaml` under one schema. The adapter is chosen by the
+  `producer` field as well as the schema; the `estimates` producer's entries use `id` and carry
+  no title, caption or table, and those columns are null. Tier names come from the run; a tier
+  the standard set does not have (for example `diagnostics`) is shown under its own name.
+- `tables.sources` has a first column `id` (`<figure>|<source>`) so one row can be addressed.
+- A view returns the five keys of §9 and, optionally, `images`: a list of `{table, path, hash,
+  title, caption}` over a table `images` (`figure, path, sha256, title, caption`). The file
+  endpoint serves raster images only (a vector file can carry a script and is refused), and
+  only a path and hash that a view of that run has named. `fresh` uses the words same, changed,
+  missing and `not_recorded`. A missing image or a figure outside the manifest is `problem`; a
+  missing or malformed provenance record makes that figure's freshness `not_available`; with
+  no report file in the run, `figure_unused` is `not_available`. `tables.figures` has a column
+  `view` naming the view the figure belongs beside.
+- Settled in the build: an `images` declaration may also name `group` (the column images are
+  grouped by) and `details` (columns shown above each image, so a stale mark is read before a
+  tall figure); the `images` table carries those columns (`tier, shows, sources, fresh,
+  used_in, view`). A chart declaration may carry `image: {path, hash, title}` to show the
+  harness figure beside it. The server serves an image only after a view answer for that run
+  has named its path and hash. A table `not_produced` (`figure, tier, reason, named_by`) lists
+  the figures the harness did not draw. With no verified signed copy of the spec, a figure's
+  spec source is `missing` (a problem) when the copy cannot be read and `not_recorded` when the
+  sign-off holds no hash for it.
+- Tier to view: data coverage and unit attributes beside Spec and evidence; parameters, design
+  coverage and sensitivity beside Model; calibration figures, burden validation and posterior
+  diagnostics beside Fit; the simulation tier beside Scenarios; the decision tier and estimate
+  figures beside Outcomes. The mapping is by the figure's `group` and `tier` where the run
+  records them, with this list as the fallback for names.
+
 How figures inform the other views:
 
 - Each tier maps to a step of the verification path: `data_model` to Spec and evidence, Model
@@ -639,6 +741,8 @@ path, waits for the F6 report. The workbench shows the gap in the view until the
 | H12 | The comparison figure's spec diff (`toolkit/analysis/figures.py` `spec_differences`) misses spec sections: for F6 run 3 against run 4 it named only decision tests, while the signed specs also differ in `analysis.outcome_adjustments`, which is what doubled the headline | C6 |
 | H13 | A harness-written file in the analysis folder that is outside the manifest and records no spec hash (`analysis/benchmarks_at_spec_values.yaml`), so nothing ties it to the signed spec | Steps |
 | H14 | The sign-off sheet's hash in the sign-off record. The sheet is compared at signing but never recorded, so nothing binds what the owner read; a HIGH row on the sheet cannot be shown as accepted by signing | Register |
+| H15 | A figure's provenance record hashes its sources but not its own table or vector file, and overview images are recorded nowhere, so a changed table cannot be detected | Figures |
+| H16 | Reports do not reference their figures: on R4 and FLU no report, manuscript or results text names any figure file, and the render record lists none, so which figures a report relies on cannot be derived (DEN cites figures by path) | Figures |
 
 ## 8. The catch-early scorecard
 
@@ -698,6 +802,12 @@ Contracts the layers share:
   first external review found eleven fail-open cases of this kind that clean-and-defect
   fixtures could not show. Fixtures write the producer's real words, read from the producer's
   code, never a convenient stand-in.
+- **The clean run is consistent across views.** It holds nothing declared: no departure, no
+  declared miss, no scope declaration, because a signed declaration is a `look` (§3) and the
+  clean run has none. Every declared case is a variant. Two files of the clean run never
+  disagree with each other (a choice record and an engine record give one benchmark the same
+  status). A tests pull request holds only what passes (fixtures); a view's failing-by-design
+  cases travel with the view's code.
 - **Fixture builder.** `tools/workbench/fixtures.py` `build(dir, upto=None, defect=None,
   method=...)` writes a small clean run with every file §5 reads (three groups, twelve units,
   two survey rounds), shaped like the named method's real files. `upto` is one of launch,
@@ -811,6 +921,38 @@ The questions as they were put:
   Candidate checks not yet specified: targets matched by an equal number of free parameters
   (FLU: five targets, five free ratios, so they do not test fit); best point far from the
   posterior median along a ridge (DEN).
+- 2026-11-19, loop iteration 3, step 4 for Model: view built by a fresh agent (reader, eight
+  checks, charts), with the clean-fixture repair of §9 (the clean run holds nothing declared;
+  a variant `declared` holds one of each kind). Self-tests pass (model 56 cases); acceptance
+  passes on R4, FLU and WM6 with no entry changed, and the earlier views' acceptance is
+  unchanged. The lead re-ran everything and read the R4 screenshot. To fix in the page: a value
+  outside its band is drawn at the band's edge; a chart cannot follow its own table; the fact
+  `choice_bound` reads "no" beside a check that is ok.
+- 2026-11-19, loop iteration 3, step 4 for Figures: view, file endpoint and generic image
+  renderer built by a fresh agent. Self-tests pass (figures 44, server 83, page 23); acceptance
+  passes on R4, FLU and DEN with no entry changed. The lead read the R4 screenshot: the harness
+  images render, each under its sources and freshness. On R4: one stale figure (a changed
+  derivation file), five not produced, and none of the eight decision figures named by a report.
+- 2026-11-19, loop iteration 3, step 3: fixtures (24 Model and 12 Figures variants), failing
+  cases for both views and for the file endpoint, and the six acceptance files re-derived, by a
+  fresh agent who checked the cases against scratch views and 34 mutants. Under the settled
+  rules R4's figures show 1 stale, not 24. Its assumptions are folded into §5.4, §5.12 and §9.
+  One to undo in the build: the clean fixture kept a signed departure for the register's sake
+  and so disagreed with itself; the clean run now holds nothing declared.
+- 2026-11-19: the first stack merged into v2 at green checks and no open P1 (#277 the
+  specification, #278 the fixtures, #279 the page with the Overview, Steps, Fit and Science
+  register views, the review notes and the leak check). Three external review rounds found 31
+  P1 in all; each was fixed test first or, for one race, answered by a stated limit. Work
+  continues on branches cut from v2; later views land as a tests pull request and a code pull
+  request each.
+- 2026-11-19, loop iteration 3, step 2 for Model (acceptance derived by a fresh agent on R4,
+  FLU and WM6, three engines): R4's engine has 17 benchmarks; the other two engines' records
+  list none. Rules settled in §5.4; the acceptance files are re-derived under them in step 3.
+- 2026-11-19, loop iteration 3, step 2 for Figures (acceptance derived by a fresh agent on R4,
+  FLU and DEN): figure sets of 29, 20 and 4, of which 24, 14 and 4 produced. On R4 and FLU no
+  produced decision figure is named by any report text (gap H16). The estimates deliverable
+  writes a different entry shape under the same schema. Corrections are in §5.12; the
+  acceptance files are re-derived under them in step 3.
 - 2026-11-19, external review of the register and the notes endpoint: 9 P1 and 1 P2, none
   judged wrong, each reproduced with a failing test and fixed (rules in §6). The six reader
   findings below were fixed in the same pass. Acceptance re-derived: one class of entry changed

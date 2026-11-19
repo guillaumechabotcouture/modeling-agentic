@@ -546,6 +546,7 @@ def _self_test():
     fx = fixture_builder()
     b = Bench(derive)
     hm = "history_matching"
+    dec = "declared"        # §9: the clean run holds nothing declared; this variant holds one of each declaration
 
     def look(d):
         import workbench
@@ -613,7 +614,7 @@ def _self_test():
             doc["engine_departures"][0]["status"] = "agreed"
             with open(os.path.join(d, fx.CHOICE), "w", encoding="utf-8") as f:
                 json.dump(doc, f)
-        m = look(b.edited(hm, unheld))
+        m = look(b.edited(hm, unheld, dec))
         need(by(m)["departure:Z"]["disposition"] == "open" and any(s == "problem" and "Z" in why for s, why in m["flags"]),
              "a departure marked signed that the signed spec does not hold is open, and flagged as a contradiction")
         need(by(m)["departure:B2"]["disposition"] is None and any(s == "not_available" and "'agreed'" in why for s, why in m["flags"]),
@@ -649,16 +650,16 @@ def _self_test():
                            ("another test", to(decision_test="DT1")), ("another engine", to(engine="other-engine")),
                            ("a component of the benchmark's name", lambda d: rejson(fx.CHOICE, lambda doc: doc["engine_departures"][0].update(
                                component=doc["engine_departures"][0].pop("benchmark")))(d))):
-            m = look(b.edited(hm, edit))
+            m = look(b.edited(hm, edit, dec))
             need(by(m)["departure:B2"]["disposition"] == "open" and by(m)["departure:B2"]["signed_by"] is None and problem(m, "B2"),
                  f"{name}: the departure is open and the mismatch is a problem ({by(m)['departure:B2']['disposition']}, {m['flags']})")
             need(by(m)["departure:B"]["disposition"] == "declared", "the other departure, which matches its signed entry, still counts")
 
     def malformed_entries():
         from views.fit_bench import rewrite
-        m = look(b.edited(hm, rewrite(fx.SCOPE, lambda doc: doc["declarations"].append(None))))
+        m = look(b.edited(hm, rewrite(fx.SCOPE, lambda doc: doc["declarations"].append(None)), dec))
         need(problem(m, fx.SCOPE, "Entry 2"), f"a declaration that is no mapping is a problem, named by its position ({m['flags']})")
-        m = look(b.edited(hm, rejson(fx.CHOICE, lambda doc: doc["engine_departures"].insert(0, "B2"))))
+        m = look(b.edited(hm, rejson(fx.CHOICE, lambda doc: doc["engine_departures"].insert(0, "B2")), dec))
         need(problem(m, fx.CHOICE, "Entry 1") and by(m)["departure:B2"]["disposition"] == "declared",
              f"so is an engine departure that is no mapping; the entries that are mappings are still read ({m['flags']})")
 
@@ -722,13 +723,13 @@ def _self_test():
             found.sort(key=lambda r: r["id"] != "D-001")
             with open(os.path.join(d, fx.LEDGER), "w", encoding="utf-8") as f:
                 f.write("".join(json.dumps(r) + "\n" for r in found))
-        m = look(b.edited(hm, shared))
+        m = look(b.edited(hm, shared, dec))
         need("scope_declaration" in by(m)["R-001"]["sources"] and "scope_declaration" not in by(m)["D-001"]["sources"],
              f"a declaration that names R-001 goes to R-001, though D-001 comes first and shares its test "
              f"({by(m)['D-001']['sources']}, {by(m)['R-001']['sources']})")
         from views.fit_bench import rewrite
         m = look(b.edited(hm, rewrite(fx.SCOPE, lambda doc: doc["declarations"].append(
-            {"id": "SD-002", "blocker_id": "X-404", "why_unresolved": "w", "decision_test": "models/decision_tests/DT3.yaml"}))))
+            {"id": "SD-002", "blocker_id": "X-404", "why_unresolved": "w", "decision_test": "models/decision_tests/DT3.yaml"})), dec))
         need("X-404" in by(m) and by(m)["R-001"]["sources"] == ["findings", "scope_declaration"],
              "a declaration that names a finding the ledger does not hold keeps its own row, whatever test it shares")
 
@@ -737,13 +738,13 @@ def _self_test():
 
         def odd(doc):
             next(t for t in doc["data"]["tests"] if t["test_id"] == "DT4")["verdict"] = "NOT_RUN"
-        m = look(b.edited(hm, rewrite(fx.DT, odd)))
+        m = look(b.edited(hm, rewrite(fx.DT, odd), dec))
         need(m["tests"]["DT4"]["state"] == "contradiction" and by(m)["departure:B2"]["decides"] == "unknown",
              f"status run with verdict NOT_RUN contradict each other: the test did not establish anything ({m['tests'].get('DT4')})")
 
         def other(doc):
             next(t for t in doc["data"]["tests"] if t["test_id"] == "DT4").update(status="not_run", verdict="NO_CHANGE")
-        m = look(b.edited(hm, rewrite(fx.DT, other)))
+        m = look(b.edited(hm, rewrite(fx.DT, other), dec))
         need(m["tests"]["DT4"]["state"] == "contradiction" and by(m)["departure:B2"]["decides"] == "unknown",
              "nor does status not_run with a verdict of no change")
         need(look(b.folder(hm))["tests"]["DT4"]["state"] == "ran" and look(b.folder(hm, "declared_test_not_run"))["tests"]["DT4"]["state"] == "not_run",
