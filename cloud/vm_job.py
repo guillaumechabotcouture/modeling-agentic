@@ -728,8 +728,11 @@ def _wait_capped(a, dest):
     st = _poll(a, dest, gone_ok=True, cluster=cl, cid=cid, meter=meter)
     # Only a confirmed end (Codex re-review of #265): 'missing' (one unreadable state file) and 'lost' (a stale
     # heartbeat) do not show the process exited, so they leave the cluster to the job's own end-of-run stop.
-    if st is not None and st.get("state", {}).get("state") in DONE:
-        _stop_by_id(name, cid, f"{a.job_id}: {st['state']['state']}"[:200])
+    # A record with a pid and no return code (the worker could not wait for its child, Codex round 3 on #265) does
+    # not show the process exited either.
+    js = (st or {}).get("state") or {}
+    if js.get("state") in DONE and not (js.get("pid") is not None and js.get("rc") is None):
+        _stop_by_id(name, cid, f"{a.job_id}: {js['state']}"[:200])
     return st
 
 
@@ -2315,20 +2318,23 @@ def _self_test_run(ok, real_gate=None) -> None:
                 # the job ('done', 'failed', ...), never on 'missing' (one unreadable state file) or 'lost' (a stale
                 # heartbeat), which do not show the process exited.
                 res = {}
-                for state in ("missing", "lost", "done", "failed"):
+                for state in ("missing", "lost", "done", "failed", "failed_pid"):
                     stops = []
                     a = types.SimpleNamespace(name="vmx", job_id="j32l", cap_usd=5.0, every=60, max_hours=1.0)
                     with mock.patch.dict(globals(), {
                             "_job_record": lambda dest: {"cluster": "vmx-c", "cluster_id": 7},
                             "_wait_gate": lambda *x, **k: (lambda cid: 1.0),
-                            "_poll": lambda *x, s_=state, **k: {"state": {"job_id": "j32l", "state": s_}},
+                            "_poll": lambda *x, s_=state, **k: {"state": (
+                                {"job_id": "j32l", "state": "failed", "pid": 4242} if s_ == "failed_pid" else
+                                {"job_id": "j32l", "state": s_, **({"rc": 3} if s_ == "failed" else {})})},
                             "_stop_by_id": lambda name, cid, why: stops.append(cid)}), \
                             mock.patch.object(ws, "attach_existing", lambda *x: object()), \
                             contextlib.redirect_stdout(io.StringIO()):
                         _wait_capped(a, d)
                     res[state] = stops
-                ok(res == {"missing": [], "lost": [], "done": [7], "failed": [7]},
-                   f"RN32l `wait --cap-usd` stops the cluster only once the job has ended for certain: {res}")
+                ok(res == {"missing": [], "lost": [], "done": [7], "failed": [7], "failed_pid": []},
+                   f"RN32l `wait --cap-usd` stops the cluster only once the job has ended for certain; a 'failed' record "
+                   f"with a pid and no return code (Codex round 3 on #265) is not an end: {res}")
             case("RN32l", rn32l)
 
 
