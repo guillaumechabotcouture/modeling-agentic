@@ -966,16 +966,20 @@ def document(eng, reg: dict, q: dict, smoke: bool, **rest) -> dict:
                          confounding=confounding(reg)), eng)
 
 
-def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> None:
-    """A placeholder output in run()'s own format, through finalize() and document() (self-tests only)."""
+def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True, point=None) -> None:
+    """A placeholder output in run()'s own format, through finalize() and document() (self-tests only). `point`: the
+    chosen point's values (default the first row; False leaves the chosen point without one)."""
     ks = [(-1, 0, 1, 0)[i % 4] for i in range(len(pack_seeds()))]       # one seed value per pack seed
     mid = lambda f: {t: [round(float(np.sqrt(lo * hi)) * f * (1 + 0.01 * k), 4) for k in ks]  # noqa: E731
                      for t, (lo, hi) in pack_bands().items()}            # seed values around each band's middle
     pt = {"point": rows[0], "per_seed": mid(1.0 if gate_ok else 3.0), "calibration_check": {}}
-    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"per_seed": mid(1.0), "all_in_band": True,
-                                                                "disproved_by_verification": [], "calibration_check": {}})
+    ch = {"per_seed": mid(1.0), "all_in_band": True, "disproved_by_verification": [], "calibration_check": {}}
+    if point is not False:
+        ch["point"] = dict(rows[0] if point is None else point)
+    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], ch)
+    fit = {"parameters": {k: {"value": v} for k, v in ch.get("point", {}).items()}}     # as run()'s **fit
     yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []},
-                            fit_rule={"seeds": pack_seeds()}), open(path, "w"), sort_keys=False)
+                            fit_rule={"seeds": pack_seeds()}, **fit), open(path, "w"), sort_keys=False)
 
 
 class PosteriorRefused(ValueError):
