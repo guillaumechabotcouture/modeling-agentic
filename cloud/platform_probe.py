@@ -146,9 +146,9 @@ def _key(p: dict) -> dict:
     return {"cpu_model": (p.get("cpu") or {}).get("model"), "vm_size": (p.get("azure") or {}).get("vm_size"),
             "flags": " ".join((p.get("cpu") or {}).get("flags") or []),
             "blas": None if not isinstance(blas, list) else
-            json.dumps(sorted(json.dumps([b.get(k) for k in ("internal_api", "version", "architecture",
-                                                             "threading_layer", "num_threads")], default=str)
-                              for b in blas)),
+            json.dumps(sorted(([b.get(k) for k in ("internal_api", "version", "architecture", "threading_layer",
+                                                   "num_threads")] for b in blas),
+                              key=lambda row: json.dumps(row, default=str)), default=str),
             "threads_env": json.dumps(env)}
 
 
@@ -464,7 +464,9 @@ def _self_test() -> int:
         none_v = w("Xeon 8370C", "Standard_E8s_v5")
         none_v["blas"] = none_v["blas"] + [dict(none_v["blas"][0], version=None)]
         d27 = record(os.path.join(d, "p27.json"), lambda: FakeClient({"tls://a": none_v}), local=none_v)
-        ok("distinct" in d27 and "error" not in d27, f"PP27 BLAS metadata with a missing version still compares: {d27}")
+        ok("distinct" in d27 and "error" not in d27 and
+           json.loads(d27["distinct"]["blas"][0])[0][1] in ("0.3.30", None),
+           f"PP27 BLAS metadata with a missing version still compares, rows kept as rows: {d27.get('distinct')}")
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1
@@ -477,7 +479,8 @@ if __name__ == "__main__":
         sys.exit(_self_test())
     rc = main()
     try:
-        sys.stdout.flush()
+        if sys.stdout is not None:         # None: started with stdout closed
+            sys.stdout.flush()
     except (OSError, ValueError):          # a closed log pipe: no output left to give, and not a failure
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     sys.exit(rc)
