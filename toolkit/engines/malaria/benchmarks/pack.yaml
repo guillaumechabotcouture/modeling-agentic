@@ -345,7 +345,7 @@ benchmarks:
 # v0.2: one joint fit of the parameters no published source sets. Pyrethroid and PBO nets use the Churcher 2016
 # hut-trial coefficients, so B7, B8, B9, B9b, B9c and B9d-B9g are held out of this fit. Every benchmark not in
 # `targets` is held out of it. F6 option A (owner, 18 Nov, fit record (b)): the net-effect fit declares its own targets
-# (net_effect_fit.py OPTION_A: B9-B9g with B10-B12m) and writes its posterior, never fitted.yaml, so this fit and
+# (net_effect_fit.py OPTION_A: B9c-B9g with B10-B12m; B9 and B9b monitored, refit b of 19 Nov) and writes its posterior, never fitted.yaml, so this fit and
 # fitted.yaml stay as they are; B9-B9g are then training data of the net-effect parameters, not tests of them.
 fit_joint:
   rule: joint-v1
