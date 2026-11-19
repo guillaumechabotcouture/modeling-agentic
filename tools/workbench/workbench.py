@@ -62,7 +62,7 @@ A fact or column whose name ends in _usd or _minutes is shown with that unit.
 
 The one write (§6 "Review notes"). POST /api/note?run=<id> with a JSON body {row, kind, statement, disposition,
 decides, note, same_as} appends one line to <run>/owner/review_notes.jsonl and writes nothing else, ever. It is
-refused unless: the Host is loopback and any Origin is too; the X-Workbench-Token header is the token made when the
+refused unless: the Host is loopback and any Origin is http:// followed by that same Host (name and port); the X-Workbench-Token header is the token made when the
 server started (the server puts it in the page it serves, in a meta tag, so only that page has it); the body is JSON
 of the schema in review_notes.py with no other key (the time is the server's; no file name comes from the client);
 the run is one the workbench found; and every row the note names is in that run's register. The line is appended
@@ -376,7 +376,7 @@ class Run:
         """The names in a folder of the run, listed through a descriptor opened with no link followed; none when it
         cannot be opened that way (a folder that is a link is not listed)."""
         try:
-            fd = self._dir(check_rel(rel).split("/"))
+            fd = self._dir(check_rel(rel).split("/") if rel else [])      # "" is the run folder itself
         except (ValueError, OSError):
             return []
         try:
@@ -440,6 +440,24 @@ class Run:
 
     def read(self, rel, max_bytes=None):
         return self._open(rel, lambda fd, st: b"".join(self._pieces(fd, max_bytes)))
+
+    def lines(self, rel, fn):
+        """([fn(line number, the line's bytes) for every line that is not blank, where fn gives something], None), or
+        (None, why). The file is read to its end piece by piece and never cut at a size: a row cannot be lost
+        beyond a read limit. Only what `fn` returns is kept."""
+        def read(fd, st):
+            out, tail, n = [], b"", 0
+            for piece in self._pieces(fd):
+                parts = (tail + piece).split(b"\n")
+                tail = parts.pop()
+                for raw in parts:
+                    n += 1
+                    got = fn(n, raw) if raw.strip() else None
+                    if got is not None:
+                        out.append(got)
+            got = fn(n + 1, tail) if tail.strip() else None
+            return out + ([got] if got is not None else [])
+        return self._open(rel, read)
 
     def sha(self, rel):
         """The file's sha256, hashed piece by piece from the confined descriptor (a file of any size costs one
@@ -761,8 +779,10 @@ class Workbench:
         if method == "POST" and u.path in ACTION_POSTS:
             h = headers or {}
             origin = h.get("origin")
-            if origin is not None and not re.fullmatch(r"https?://" + _LOOPBACK, origin):
-                return 403, "text/plain", b"loopback only"
+            # The server speaks http only, and the page that may post is the one it served: an Origin, when a browser
+            # sends one, must be this scheme and the request's own authority (name and port), not merely loopback.
+            if origin is not None and origin != f"http://{host}":
+                return 403, "text/plain", b"this page only: the Origin is not this server's address"
             if not hmac.compare_digest(str(h.get("x-workbench-token") or "").encode(), self.token.encode()):
                 return 403, "text/plain", b"the token is not this server's: reload the page"
             if str(h.get("content-type") or "").split(";")[0].strip().lower() != "application/json":
@@ -1219,10 +1239,31 @@ def _self_test():
         ok("R10b a file the manifest records no valid hash for is not said to have changed: no hash was recorded",
            c["status"] == "problem" and states(c) == {"allocation.csv": "no valid hash recorded"}, str(c))
         d7 = toy("lost-signed")
-        edit_json(d7, "decision_spec.signoff.json", lambda so: so["sha256"].update({"data/gone.csv": None}))
+        edit_json(d7, "decision_spec.signoff.json", lambda so: so["sha256"].update({"data/gone.csv": None, "data/lost.csv": "0" * 64}))
         c = st(Run(d7), "steps.signed_spec")
         ok("R10c a signed file that is missing is never the same as what was signed, whatever hash was recorded",
-           c["status"] == "problem" and states(c) == {"data/gone.csv": "missing", "decision_spec.yaml": "same"}, str(c))
+           c["status"] == "problem" and states(c) == {"data/gone.csv": "missing", "data/lost.csv": "missing", "decision_spec.yaml": "same"}, str(c))
+        # toolkit/spec/signoff.py sign() records null for the derivation record when the run has none, and
+        # derived_changed() accepts it while the file stays absent (`if signed is None and now is None: return []`)
+        d7, derived = toy("absent-signed"), "data/derivations_record.json"
+        edit_json(d7, "decision_spec.signoff.json", lambda so: so["sha256"].update({derived: None}))
+        c = st(Run(d7), "steps.signed_spec")
+        ok("R10h a file the producer records null for (absent when signed) and that is still absent is unchanged, and said so",
+           c["status"] == "ok" and states(c) == {derived: "absent when signed, absent now", "decision_spec.yaml": "same"}
+           and "absent when signed" in c["says"], str(c))
+        os.makedirs(os.path.join(d7, "data"), exist_ok=True)
+        open(os.path.join(d7, derived), "w").write("{}")
+        c = st(Run(d7), "steps.signed_spec")
+        ok("R10i the same file present now appeared after signing: a problem",
+           c["status"] == "problem" and states(c) == {derived: "appeared after signing", "decision_spec.yaml": "same"}
+           and "appeared after signing" in c["says"], str(c))
+        os.remove(os.path.join(d7, derived))
+        os.symlink("units.csv", os.path.join(d7, derived))
+        c = st(Run(d7), "steps.signed_spec")
+        ok("R10j a link at that name is not an absent file: never a match",
+           c["status"] == "problem" and states(c)[derived] == "missing", str(c))
+        d7 = toy("lost-signed-2")
+        edit_json(d7, "decision_spec.signoff.json", lambda so: so["sha256"].update({"data/gone.csv": None}))
         edit_json(d7, "decision_spec.signoff.json", lambda so: (so["sha256"].pop("data/gone.csv"), so["sha256"].update({"data/units.csv": "abc"})))
         c = st(Run(d7), "steps.signed_spec")
         ok("R10d a file signed with no valid hash is not said to be unchanged",
@@ -1381,9 +1422,12 @@ def _self_test_notes(tmp, ok):
     ok("N2 a POST with no token or a wrong one is refused (403) and writes nothing",
        [r[0] for r in refused] == [403] * 4 and not os.path.exists(os.path.dirname(file)), str([r[:1] for r in refused]))
     away = [post(good, host="evil.example"), post(good, host="127.0.0.1.evil.example:8790"), post(good, host=""),
-            post(good, origin="http://evil.example"), post(good, origin="null")]
-    ok("N3 a POST whose Host is not loopback, or that comes from another origin, is refused (403) and writes nothing",
-       [r[0] for r in away] == [403] * 5 and not os.path.exists(os.path.dirname(file)), str([r[0] for r in away]))
+            post(good, origin="http://evil.example"), post(good, origin="null"),
+            post(good, origin="http://127.0.0.1:9999"), post(good, origin="http://localhost:8790"),
+            post(good, origin="https://127.0.0.1:8790"), post(good, origin="http://127.0.0.1")]
+    ok("N3 a POST whose Host is not loopback, or that comes from another origin (a remote one, another loopback port or "
+       "name, another scheme), is refused (403) and writes nothing",
+       [r[0] for r in away] == [403] * 9 and not os.path.exists(os.path.dirname(file)), str([r[0] for r in away]))
     bad = [b"not json", b"[1, 2]", {**good, "disposition": "closed"}, {**good, "file": "../../elsewhere.jsonl"},
            {**good, "at": "2020-01-01T00:00:00+00:00"}, {"row": "Z-999", "disposition": "declared"}, {"row": "D-001"},
            {"row": "D-001", "same_as": "Z-999"}, {"row": "D-001", "same_as": "D-001"}, {"row": None, "kind": "issue"},
@@ -1399,7 +1443,7 @@ def _self_test_notes(tmp, ok):
     ok("N5 a run that is not one the workbench found (an unknown id, a path), another address, another method, another "
        "content type or an over-long body is refused, and nothing is written",
        [r[0] for r in lost] == [404, 404, 404, 405, 405, 405, 415, 413] and not os.path.exists(os.path.dirname(file)), str([r[0] for r in lost]))
-    first = post(good)
+    first = post(good, origin="http://127.0.0.1:8790")        # the page's own origin: this server's scheme and authority
     one = lines()
     ok("N6 a good note is appended as one line with the server's time, and the register shows it beside the derived value",
        first[0] == 200 and len(one) == 1 and json.loads(one[0])["row"] == "D-001" and _ts(json.loads(one[0])["at"]) is not None

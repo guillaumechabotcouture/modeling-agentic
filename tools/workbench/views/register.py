@@ -11,10 +11,14 @@ appends to it). Fixtures and planted edits: fixtures.py (DEFECTS entries whose `
 
 What the cases fix, from §5.8 and §6:
 
-- facts: n_rows, n_open, n_declared, n_tested, n_implemented, n_withdrawn, n_decides_yes, n_decides_unknown,
-  n_owner_notes, n_process, n_process_open. All but the last two count science rows only.
-- tables.rows: id, kind, statement, source, first_visible_stage, decides, disposition, tests, verdicts, severity,
-  blocking, files, nature, signed_by. tables.by_source: source, rows, open.
+- facts: n_rows, n_open, n_declared, n_tested, n_implemented, n_implemented_unverified, n_withdrawn, n_decides_yes,
+  n_decides_unknown, n_owner_notes, n_process, n_process_open. All but the last two count science rows only.
+- tables.rows: id, nature, kind, statement, source, first_visible_stage, decides, disposition, evidence, tests,
+  verdicts, severity, blocking, files, signed_by. tables.by_source: source, rows, open. tables.tests: test, question,
+  status, verdict, rows.
+- §12's reader findings (2026-11-19): reading order; `implemented` only with the gate's recorded result shown
+  (`evidence`), else "implemented, not verified", counted with the open rows by register.undisposed; sentences name
+  the rows they count; the terms are defined; few rows: no chart and no table by disposition.
 - checks, in this order: register.undisposed (C12), register.tests_unlinked, register.declared_untested,
   register.decides_unknown, register.prose_only, register.notes (§6: a note line that cannot be used).
 - rows are derived in the order of §6's table; a later source that shares a row's id, one of its decision test ids, or
@@ -92,11 +96,12 @@ def _self_test():
     hm, post = "history_matching", "posterior"
     names = {"undisposed": "C12", "tests_unlinked": None, "declared_untested": None, "decides_unknown": None,
              "prose_only": None, "notes": None}
-    columns = ["id", "kind", "statement", "source", "first_visible_stage", "decides", "disposition", "tests", "verdicts",
-               "severity", "blocking", "files", "nature", "signed_by"]
+    columns = ["id", "nature", "kind", "statement", "source", "first_visible_stage", "decides", "disposition", "evidence",
+               "tests", "verdicts", "severity", "blocking", "files", "signed_by"]
     fact_names = ["n_rows", "n_open", "n_declared", "n_tested", "n_implemented", "n_withdrawn", "n_decides_yes",
-                  "n_decides_unknown", "n_owner_notes", "n_process", "n_process_open"]
+                  "n_decides_unknown", "n_owner_notes", "n_process", "n_process_open", "n_implemented_unverified"]
     words = ["open", "declared", "tested", "implemented", "withdrawn"]
+    unverified = "implemented, not verified"        # §12: the ledger's fixed with no gate result that verifies it
     sources = ["findings", "scope_declaration", "engine_departures", "calibration_declared", "uncertainty_excluded",
                "signoff_sheet", "evidence_dossier", "decision_tests", "owner_note"]
     ledger_file, scope_file, choice_file, sheet_file, dossier_file, dt_file = (
@@ -106,7 +111,7 @@ def _self_test():
         "owner/review_notes.jsonl")
     stale = fx.STALE_ID
     clean_ids = {"D-001", "D-002", "R-001", stale, "departure:B2", "departure:B", "calibration:grp_r1:G1", "excluded:c1",
-                 "presign:p2", "nodata:unit_attribute:x1"}
+                 "nodata:parameter:p2", "nodata:unit_attribute:x1"}
 
     # ---- readers of a view result
     def table(v, name, cols=None):
@@ -230,10 +235,10 @@ def _self_test():
                 need(c.get("case") == names[name], f"{name}: scorecard case {names[name]} (got {c.get('case')})")
 
     def m_facts():
-        want = {hm: [9, 0, 5, 2, 2, 0, 1, 2, 0, 1, 0], post: [8, 0, 5, 1, 2, 0, 1, 2, 0, 1, 0]}
+        want = {hm: [9, 0, 4, 3, 2, 0, 1, 2, 0, 1, 0, 0], post: [8, 0, 4, 2, 2, 0, 1, 2, 0, 1, 0, 0]}
         for method in (hm, post):
             f = look_at(folder(method))["facts"]
-            need(sorted(f) == sorted(fact_names), f"{method}: exactly the eleven facts (got {sorted(f)})")
+            need(sorted(f) == sorted(fact_names), f"{method}: exactly the twelve facts (got {sorted(f)})")
             need([f[k] for k in fact_names] == want[method], f"{method}: {dict(zip(fact_names, want[method]))} (got {f})")
 
     def m_rows():
@@ -244,7 +249,7 @@ def _self_test():
             need(isinstance(v["tables"]["rows"].get("about"), str) and v["tables"]["rows"]["about"], "tables.rows says what its rows are")
             for r in rows(v):
                 need(r["kind"] in ("issue", "uncertainty", "assumption") and r["decides"] in ("yes", "no", "unknown")
-                     and r["disposition"] in words and r["nature"] in ("science", "process"), f"row {r['id']}: known words ({r})")
+                     and r["disposition"] in words + [unverified] and r["nature"] in ("science", "process"), f"row {r['id']}: known words ({r})")
                 need(isinstance(r["statement"], str) and r["statement"].strip() and r["source"] and r["files"]
                      and split(r["source"])[0] in sources, f"row {r['id']}: a statement, a source of §6's list and its file ({r})")
                 need(len(split(r["tests"])) == len(split(r["verdicts"])), f"row {r['id']}: one verdict per test ({r['tests']!r}, {r['verdicts']!r})")
@@ -252,7 +257,7 @@ def _self_test():
 
     def m_by_source():
         want = {hm: [["findings", 3, 0], ["engine_departures", 2, 0], ["calibration_declared", 1, 0],
-                     ["uncertainty_excluded", 1, 0], ["signoff_sheet", 1, 0], ["evidence_dossier", 1, 0]]}
+                     ["uncertainty_excluded", 1, 0], ["evidence_dossier", 2, 0]]}
         want[post] = [r for r in want[hm] if r[0] != "calibration_declared"]
         for method in (hm, post):
             v = look_at(folder(method))
@@ -265,7 +270,12 @@ def _self_test():
 
     def m_charts():
         import workbench
-        v = look_at(folder(hm))
+        need(look_at(folder(hm))["charts"] == [] and look_at(folder(hm))["tables"]["by_disposition"] is None,
+             "with few rows the charts and the table by disposition are left out: they would only repeat the facts (§12)")
+
+        def more(found):        # enough science rows for the summaries to say something the facts do not
+            found += [{**finding(found, "D-002"), "id": f"R-8{i:02d}", "source": "critique-redteam"} for i in range(12)]
+        v = look_at(edited(hm, ledger(more)))
         need(workbench.chart_problems(v) == [], f"every chart names a table and columns the result holds ({workbench.chart_problems(v)})")
         need(len(v["charts"]) == 2 and all(c.get("kind") == "bars" for c in v["charts"]), f"two bars charts (got {v['charts']})")
         by_x = {c.get("x"): c for c in v["charts"]}
@@ -273,7 +283,8 @@ def _self_test():
         need(by_x["source"]["table"] == "by_source" and by_x["source"]["y"] == "rows", f"by source: {by_x['source']}")
         need(by_x["disposition"]["table"] == "by_disposition" and by_x["disposition"]["y"] == "rows", f"by disposition: {by_x['disposition']}")
         got = [[r["disposition"], r["rows"]] for r in table(v, "by_disposition", ["disposition", "rows"])]
-        need(got == [[w, v["facts"][f"n_{w}"]] for w in words], f"by_disposition has one row per word with the facts' counts (got {got})")
+        need(got == [[w, v["facts"][f"n_{w}"]] for w in words] + [[unverified, v["facts"]["n_implemented_unverified"]]],
+             f"by_disposition has one row per word with the facts' counts (got {got})")
 
     def m_notes():
         v = look_at(folder(hm))
@@ -342,15 +353,20 @@ def _self_test():
 
     def d_sheet():
         v = look_at(folder(hm))
-        has(row(v, "presign:p2"), kind="issue", disposition="declared", severity="HIGH")
+        need(not [i for i in ids(v) if i.startswith("presign:")] and check(v, "undisposed")["status"] == "ok",
+             "the clean sheet marks no finding HIGH, though the word is on two of its lines: no row, and nothing raised")
+        # toolkit/spec/signoff.py sign() records no hash for the sheet, so a line it marks HIGH is not declared by signing
+        v = look_at(folder(hm, "sheet_high"))
+        has(row(v, "presign:p2"), kind="issue", disposition="open", severity="HIGH", signed_by=None, first_visible_stage="SIGN")
         need(len([i for i in ids(v) if i.startswith("presign:")]) == 1,
              "one row, though the word HIGH is on three lines of the sheet: only a line that marks a finding HIGH counts")
+        need([[r["rows"], r["open"]] for r in table(v, "by_source") if r["source"] == "signoff_sheet"] == [[1, 1]], "counted open under its source")
 
         def second(text):
             return text.replace("\n## Evidence dossier", "- **HIGH**: q9 = 7 is outside the card range of `ref` (1 to 5; "
                                 "outside_card_range: true). Signing accepts it; its source and reason are above.\n\n## Evidence dossier")
         v = look_at(edited(hm, retext(sheet_file, second)))
-        has(row(v, "presign:q9"), disposition="declared", source="signoff_sheet", severity="HIGH")
+        has(row(v, "presign:q9"), disposition="open", source="signoff_sheet", severity="HIGH", signed_by=None)
 
     def d_dossier():
         v = look_at(folder(hm))
@@ -390,7 +406,7 @@ def _self_test():
     def d_stage():
         v = look_at(folder(hm))
         want = {"D-001": "SPEC", "D-002": "WRITE", "R-001": "ANALYZE", "departure:B": "ENGINE_CHOICE",
-                "calibration:grp_r1:G1": "SIGN", "excluded:c1": "SIGN", "presign:p2": "SIGN", "nodata:unit_attribute:x1": "SIGN"}
+                "calibration:grp_r1:G1": "SIGN", "excluded:c1": "SIGN", "nodata:parameter:p2": "SIGN", "nodata:unit_attribute:x1": "SIGN"}
         got = {i: row(v, i)["first_visible_stage"] for i in want}
         need(got == want, f"the stage machine's names (got {got})")
         v = look_at(folder(hm, "scope_names_no_finding"))
@@ -413,11 +429,11 @@ def _self_test():
 
     def d_signed_by():
         v = look_at(folder(hm))
-        for rid in ("calibration:grp_r1:G1", "excluded:c1", "presign:p2", "departure:B2", "departure:B"):
+        for rid in ("calibration:grp_r1:G1", "excluded:c1", "departure:B2", "departure:B"):
             has(row(v, rid), signed_by="owner")
         has(row(v, "D-001"), signed_by=None)
         v = look_at(folder(hm, "signed_by_lead"))
-        for rid, disposition in (("calibration:grp_r1:G1", "tested"), ("excluded:c1", "declared"), ("presign:p2", "declared")):
+        for rid, disposition in (("calibration:grp_r1:G1", "tested"), ("excluded:c1", "declared")):
             has(row(v, rid), signed_by="lead", disposition=disposition)
         has(row(v, "departure:B2"), disposition="open", signed_by=None)
         need("lead" in " ".join(v["notes"].values()), f"a note says the spec was signed by lead, not the owner ({v['notes']})")
@@ -434,9 +450,12 @@ def _self_test():
 
     def d_merge_input():
         clean = look_at(folder(hm))
-        need("nodata:parameter:c1" not in ids(clean) and "nodata:parameter:p2" not in ids(clean), "the dossier's entries for c1 and p2 are merged")
+        need("nodata:parameter:c1" not in ids(clean), "the dossier's entry for c1 is merged")
         has(row(clean, "excluded:c1"), tests="DT7", source="uncertainty_excluded,evidence_dossier", disposition="declared", decides="no")
-        has(row(clean, "presign:p2"), tests="DT8", source="signoff_sheet,evidence_dossier", disposition="declared")
+        has(row(clean, "nodata:parameter:p2"), tests="DT8", source="evidence_dossier", disposition="tested")
+        high = look_at(folder(hm, "sheet_high"))
+        need("nodata:parameter:p2" not in ids(high), "with a sheet row for p2, the dossier's entry for it is merged into that row")
+        has(row(high, "presign:p2"), tests="DT8", source="signoff_sheet,evidence_dossier", disposition="open")
         need({"departure:B", "departure:B2"} <= set(ids(clean)), "an id that only begins like another is not merged")
         need("scenario_excluded_c1" not in row(clean, "excluded:c1")["tests"], "a test whose name holds the input's name is not linked by it")
         v = look_at(folder(hm, "merge_excluded_nodata"))
@@ -496,6 +515,10 @@ def _self_test():
             need("D-001" in str((c.get("rows") or {}).get("rows")), "and lists it in the rows behind the check")
         if defect == "C12_declared_tested":
             has(row(v, "D-001"), disposition="declared", tests="DT1", verdicts="NO_CHANGE", decides="no", severity="HIGH", blocking=True)
+        if defect == "sheet_high":
+            has(row(v, "presign:p2"), disposition="open", severity="HIGH", signed_by=None)
+            need("presign:p2" in c["says"] and f"does not bind {sheet_file}" in c["says"],
+                 f"names the row and says the sign-off record does not bind the sheet ({c['says']!r})")
         if defect == "test_unlinked":
             need("DT1" in c["says"] and "D-001" not in check(v, "undisposed")["says"], f"names the test ({c['says']!r})")
         if defect == "declared_test_not_run":
@@ -544,7 +567,7 @@ def _self_test():
         want = {"undisposed": "ok", "prose_only": "ok", "notes": "ok", "tests_unlinked": "not_available",
                 "declared_untested": "not_available", "decides_unknown": "not_available"}
         need(statuses(v) == want, f"before the decision tests exist: {want} (got {statuses(v)})")
-        need({"excluded:c1", "presign:p2", "departure:B"} <= set(ids(v)) and "R-001" not in ids(v), "rows from the files the run has so far")
+        need({"excluded:c1", "nodata:parameter:p2", "departure:B"} <= set(ids(v)) and "R-001" not in ids(v), "rows from the files the run has so far")
 
     def x_unverified():
         ways = {"the sign-off record is missing": remove(signoff_file), "the signed copy is missing": remove(signed_file),
@@ -655,17 +678,17 @@ def _self_test():
         need(set(v["tables"]) == set(look_at(folder(hm))["tables"]) and rows(v), "the model is the same for another method: only its rows differ")
 
     case("G1 the six checks, in order, each ok on the clean run, with one sentence, the file and field read, and its scorecard case", m_checks)
-    case("G2 facts: the nine counts of §5.8 and the two process counts of §6, on both clean runs", m_facts)
-    case("G3 tables.rows: the twelve columns of §5.8 then nature and signed_by; one row per id; known words in every cell", m_rows)
+    case("G2 facts: the nine counts of §5.8, the two process counts of §6 and the count of fixes not verified (§12), on both clean runs", m_facts)
+    case("G3 tables.rows: the columns of §5.8 with nature beside the id, evidence beside the disposition (§12), and signed_by; one row per id; known words", m_rows)
     case("G4 tables.by_source: source, rows, open; a source the run does not have is absent (assumed: science rows, first source)", m_by_source)
-    case("G5 charts: bars of rows by source and by disposition, each naming a table and columns that exist (assumed: table by_disposition)", m_charts)
+    case("G5 charts: with enough rows, bars by source and by disposition over tables that exist; with few rows, none (§12)", m_charts)
     case("G6 notes say which copy of the spec was read and who signed it", m_notes)
     case("D1 findings: each status word of the ledger maps to its disposition; kind, severity, blocking and claim come through", d_status_words)
     case("D2 a scope declaration's id is its blocker_id, else its id; it is merged into the finding it names; a test path is reduced to its id", d_scope)
     case("D3 engine departures: departure:<component or benchmark>, an assumption, declared when signed, else open", d_departures)
     case("D4 a declared calibration miss: calibration:<target or offset>, tested by its decision test", d_calibration)
     case("D5 an excluded input: excluded:<parameter or kind>, an assumption, declared; with no test, declared_untested is look", d_excluded)
-    case("D6 a sign-off sheet row counts only where the sheet marks a finding HIGH: presign:<input>, declared by signing (assumed: severity HIGH)", d_sheet)
+    case("D6 a sign-off sheet row counts only where the sheet marks a finding HIGH: presign:<input>, open while the sign-off record does not bind the sheet (assumed: severity HIGH)", d_sheet)
     case("D7 a dossier entry with no data keeps its whole key; tested only through its decision_test key, else open", d_dossier)
     case("D8 a plan-changing test that no row names becomes test:<id>, open, with its sentence; a linked one does not", d_tests)
     case("D9 decides: yes on any CHANGES_PLAN, no when every test is NO_CHANGE, else unknown", d_decides)

@@ -30,7 +30,7 @@ def view(run):
     if st.get("why"):
         out["notes"]["not_available"] = f"The stage history is not available: {st['why']}."
         return out
-    meta, so = (run.json(f)[0] or {} for f in ("metadata.json", "decision_spec.signoff.json"))
+    meta, so = run.json("metadata.json")[0] or {}, checks.signoff_record(run)[0] or {}      # the record every view selects
     man, man_why = run.json("analysis/manifest.json")
     man = man or {}
     hist, tasks, arts, wr = st["history"], st["tasks"], run.artifacts(), run.written()
@@ -84,7 +84,7 @@ def view(run):
         "working_minutes": round(sum(r[3] or 0 for r in stages), 1),
         "waiting_for_owner_minutes": round(sum(r[4] or 0 for r in stages), 1)}
     out["notes"]["facts"] = ("Read from run_state.json (status, state, history, journal, spent_usd, budget_usd), "
-                             "metadata.json (pipeline, commit, launcher), decision_spec.signoff.json (sha256) and the "
+                             "metadata.json (pipeline, commit, launcher), the sign-off record (sha256) and the "
                              "header of each analysis/*.yaml. Hashes are shown by their first 8 characters. Last file written "
                              "is the newest modification time among the files of the run folder. Model spend is "
                              "language-model spend only; cloud compute is not recorded in the run folder.")

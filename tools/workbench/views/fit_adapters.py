@@ -27,6 +27,7 @@ import sys
 _WB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _WB not in sys.path:
     sys.path.insert(0, _WB)
+import checks  # noqa: E402  (the sign-off record's selection and the decision tests' loader, shared by every view)
 
 FACTS = ("method", "status", "proceeded", "n_targets_group", "n_targets_unit", "n_parameters", "region_accepted",
          "region_candidates", "region_share_of_prior", "cutoff", "change_limit", "engine_replicates", "units_at_bound",
@@ -127,7 +128,7 @@ def _spec(run):
     # (Run.hashed), so an allowance can only come from the document whose hash verified.
     signed, spec, why = run.hashed(SIGNED)
     disk = run.sha(SPEC)
-    so, so_why = run.json(SIGNOFF)
+    so, so_rel, so_why = checks.signoff_record(run)      # the producer's own selection of the record, as in every view
     want = _get(so, "sha256", SPEC)
     want = want if isinstance(want, str) and re.fullmatch(r"[0-9a-f]{64}", want) else None
     rel = SIGNED if signed else SPEC
@@ -138,10 +139,10 @@ def _spec(run):
     elif so is None:
         unverified = f"the sign-off record could not be read ({so_why})"
     elif want is None:
-        unverified = f"the sign-off record ({SIGNOFF}) holds no sha256 for {SPEC}"
+        unverified = f"the sign-off record ({so_rel}) holds no sha256 for {SPEC}"
     elif want != signed:
-        unverified = (f"the signed copy ({SIGNED}, {signed[:8]}) differs from the hash the sign-off record holds "
-                      f"({want[:8]})")
+        unverified = (f"the signed copy ({SIGNED}, {signed[:8]}) differs from the hash the sign-off record ({so_rel}) "
+                      f"holds ({want[:8]})")
     else:
         unverified = None
     if unverified:
@@ -171,13 +172,11 @@ def _units(run, spec):
 
 
 def _tests(run):
-    """{decision test id: (it ran, its verdict)} from analysis/decision_tests.yaml."""
-    doc, _ = run.large(DT)
-    out = {}
-    for t in _get(doc, "data", "tests") or []:
-        if isinstance(t, dict) and t.get("test_id") is not None:
-            out[str(t["test_id"])] = (t.get("status") == "run", t.get("verdict"))
-    return out
+    """{decision test id: (it ran, its verdict)} through checks.decision_tests, the loader the register uses too: a
+    test ran only with status run and a verdict of no change or changes plan. A file that cannot be read that way
+    gives no test, so nothing a declaration names ran."""
+    tests, _ = checks.decision_tests(run)
+    return {tid: (t["state"] == "ran", t["verdict"]) for tid, t in (tests or {}).items()}
 
 
 def _prior_dominated(run):

@@ -997,6 +997,36 @@ def _self_test():
     case("R8 a status that contradicts the block list is a problem", f_contradiction)
     case("R9 a change pair that could not be computed is carried through with its reason", f_uncomputed)
     case("S2 the signed spec is hashed and parsed from one read; a parse kept from other bytes is never used", f_s2)
+    def f_shared_rules():
+        import json
+        dt = "analysis/decision_tests.yaml"
+
+        def pair(tid, **words):
+            return rewrite(dt, lambda doc: next(t for t in doc["data"]["tests"] if t["test_id"] == tid).update(words))
+        clean = check(look_at(b.folder(hm, "C13_blocked_declared")), "status")
+        need(clean["status"] == "look", f"the declared block whose test ran is for the reader to judge ({clean['status']})")
+        for words in ({"verdict": "NOT_RUN"}, {"status": "not_run"}, {"status": "done"}):
+            c = check(look_at(b.edited(hm, pair("DT2", **words), "C13_blocked_declared")), "status")
+            need(c["status"] == "problem", f"{words}: a declared test whose status and verdict are no pair the analysis "
+                                           f"writes did not run, as in the register ({c['status']}: {c['says']!r})")
+
+        def to_brief(d):
+            os.rename(os.path.join(d, "decision_spec.signoff.json"), os.path.join(d, "decision_brief.signoff.json"))
+        c = check(look_at(b.edited(hm, to_brief, "C13_blocked_declared")), "status")
+        need(c["status"] == "look" and "no signed spec could be verified" not in says(c),
+             f"the brief's sign-off record, when it holds the spec's hash, verifies the signed copy ({c['status']}: {c['says']!r})")
+
+        def stale_brief(d):       # a brief record with another hash for the spec is the one the producer selects
+            with open(os.path.join(d, "decision_spec.signoff.json"), encoding="utf-8") as f:
+                so = json.load(f)
+            so["sha256"]["decision_spec.yaml"] = "0" * 64
+            with open(os.path.join(d, "decision_brief.signoff.json"), "w", encoding="utf-8") as f:
+                json.dump(so, f)
+        c = check(look_at(b.edited(hm, stale_brief, "C13_blocked_declared")), "status")
+        need(c["status"] == "problem" and "decision_brief.signoff.json" in c["says"],
+             f"and when its hash is another, nothing is verified, whatever the spec-only record holds ({c['status']}: {c['says']!r})")
+
+    case("S5 one loader of decision tests and one selection of the sign-off record, shared with the register and Steps", f_shared_rules)
     case("S3 with no verified signed spec, scope_declaration.yaml and findings.jsonl excuse no flagged pair", f_s3)
     case("S4 conflicting units are outside the unit allowance and always a problem", f_s4)
     return b.done()

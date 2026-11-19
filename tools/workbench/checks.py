@@ -71,6 +71,75 @@ def hash_state(recorded, now):
 
 
 STALE = ("changed", "missing", "not_recorded")       # the states of a recorded input that is not known to be the same
+SPEC, SPEC_SIGNOFF, BRIEF_SIGNOFF = "decision_spec.yaml", "decision_spec.signoff.json", "decision_brief.signoff.json"
+DT = "analysis/decision_tests.yaml"
+# toolkit/analysis/decision_tests.py writes status "run" or "not_run"; toolkit/analysis/run.py derives the verdict from
+# it: NOT_RUN when the status is not_run, else CHANGES_PLAN or NO_CHANGE. Any other pair is no pair the producer writes.
+TEST_PAIRS = {("run", "NO_CHANGE"): "ran", ("run", "CHANGES_PLAN"): "ran", ("not_run", "NOT_RUN"): "not_run"}
+TEST_STATUSES, VERDICTS = ("run", "not_run"), ("NO_CHANGE", "CHANGES_PLAN", "NOT_RUN")
+
+
+def signoff_record(run):
+    """(the sign-off record that covers the spec, the file it is in, why there is none). The record is selected as
+    the producer selects it (toolkit/spec/signoff.py _spec_record): the brief's record when it holds a hash for the
+    spec, else the spec-only record. Every view that asks which spec was signed, by whom and with which files asks
+    here, so no two views can answer from different records."""
+    brief, brief_why = run.json(BRIEF_SIGNOFF)
+    if isinstance(brief, dict) and isinstance(brief.get("sha256"), dict) and brief["sha256"].get(SPEC) is not None:
+        return brief, BRIEF_SIGNOFF, None
+    so, why = run.json(SPEC_SIGNOFF)
+    if so is None and brief is None and not str(brief_why).endswith("is not in the run folder"):
+        why = f"{why}; {brief_why}"
+    return so, SPEC_SIGNOFF, why
+
+
+# The files a sign-off records null for when they did not exist at signing, and takes as unchanged while they stay
+# absent. toolkit/spec/signoff.py: sign() records `extra = {DERIVATIONS_RECORD: dsha, ...}` with dsha None for an absent
+# file, and derived_changed() answers `if signed is None and now is None: return []`. scripts/decision_brief.py: sign()
+# records `hashlib.sha256(b).hexdigest() if b is not None else None` for each frozen file and status() compares that
+# with the file's hash now (None when absent). No other file is on the list: the spec must exist to be signed, a
+# reference file with no recorded hash is changed (signoff.py burden_changed), and so is a missing dossier
+# (toolkit/spec/evidence_dossier.py state: `or data is None`).
+ABSENT_WHEN_SIGNED = ("data/derivations_record.json", "decision_brief.yaml", "success_criteria.yaml")
+
+
+def signed_state(held, rel, now, absent):
+    """A file the sign-off record lists, against what the record holds for it: hash_state's words, and two more for a
+    file of ABSENT_WHEN_SIGNED recorded as null: `absent` (absent when signed, absent now: unchanged) and `appeared`
+    (it exists now, or something that is no plain file is at its name). `absent`: the file is not in the run folder.
+    A key the record does not hold, or a hash that is no digest, is never a match."""
+    if rel in ABSENT_WHEN_SIGNED and rel in held and held[rel] is None:
+        return "absent" if absent else "appeared" if now is not None else "missing"
+    return hash_state(held.get(rel), now)
+
+
+def bound(record, rel, now):
+    """A file against the hash the sign-off record holds for it: hash_state's words. A file the record holds no valid
+    hash for is `not_recorded`: nothing binds its bytes to the signature, so it is not a signed file."""
+    held = record.get("sha256") if isinstance(record, dict) and isinstance(record.get("sha256"), dict) else {}
+    return hash_state(held.get(rel), now)
+
+
+def decision_tests(run):
+    """({test id: {status, verdict, statement, state}}, None) from analysis/decision_tests.yaml, or (None, why).
+    The one loader of decision tests, for every view. state: `ran` (status run with a verdict of NO_CHANGE or
+    CHANGES_PLAN: the only pair that establishes that a test ran), `not_run` (status not_run, verdict NOT_RUN),
+    `contradiction` (the producer's words in a pair it does not write, so the record contradicts itself), or
+    `unknown` (a status or verdict word the producer does not write)."""
+    doc, why = run.large(DT)
+    if doc is None:
+        return None, why
+    tests = doc.get("data", {}).get("tests") if isinstance(doc.get("data"), dict) else None
+    if not isinstance(tests, list) or not all(isinstance(t, dict) and t.get("test_id") for t in tests):
+        return None, f"{DT} holds no list of tests (data.tests)"
+    out = {}
+    for t in tests:
+        status, verdict = t.get("status"), t.get("verdict")
+        pair = (status, verdict) if isinstance(status, str) and isinstance(verdict, str) else None
+        state = TEST_PAIRS.get(pair) or ("contradiction" if pair and status in TEST_STATUSES and verdict in VERDICTS else "unknown")
+        out[str(t["test_id"])] = {"status": status, "verdict": verdict, "state": state,
+                                  "statement": " ".join(str(t.get("statement") or "").split())[:4000]}
+    return out, None
 
 
 def pipeline(run):
@@ -111,36 +180,44 @@ def pipeline(run):
 
 def signed_spec(run):
     title = "The spec on disk is the spec the owner signed"
-    so, why = run.json("decision_spec.signoff.json")
+    so, so_rel, why = signoff_record(run)
     if so is None:
         state, _ = run.json("run_state.json")
         if (state or {}).get("state") in ("SPEC", "SIGN"):
             return _r("steps.signed_spec", "steps", title, "look",
                       "The spec is not signed yet. Needs you: the run waits at sign-off.",
-                      [("decision_spec.signoff.json", "sha256")], case="C10")
+                      [(so_rel, "sha256")], case="C10")
         return _r("steps.signed_spec", "steps", title, "not_available", why,
-                  [("decision_spec.signoff.json", "sha256")], case="C10")
+                  [(so_rel, "sha256")], case="C10")
     signed = so.get("sha256") if isinstance(so.get("sha256"), dict) else {}
     if not signed:
         return _r("steps.signed_spec", "steps", title, "not_available",
-                  "The sign-off record lists no file hashes.", [("decision_spec.signoff.json", "sha256")], case="C10")
-    rows, changed = [], []
+                  "The sign-off record lists no file hashes.", [(so_rel, "sha256")], case="C10")
+    rows, changed, absent = [], [], []
+    words = {"changed": "changed since signing", "not_recorded": "no valid hash recorded",
+             "absent": "absent when signed, absent now", "appeared": "appeared after signing"}
     for rel, sha in sorted(signed.items()):
         now = run.sha(rel)
-        state = {"changed": "changed since signing", "not_recorded": "no valid hash recorded"}.get(
-            hash_state(sha, now), hash_state(sha, now))
-        if state != "same":
+        state = signed_state(signed, rel, now, now is None and str(run.read(rel, 1)[1]).endswith("is not in the run folder"))
+        if state == "absent":
+            absent.append(rel)
+        elif state != "same":
             changed.append(rel)
-        rows.append([rel, _short(sha), _short(now), state])
+        rows.append([rel, _short(sha), _short(now), words.get(state, state)])
     table = {"columns": ["file", "signed", "on disk now", "state"], "rows": rows}
     who = f"signed by {so.get('signed_by')} at {str(so.get('signed_at'))[:16]}"
-    ev = [("decision_spec.signoff.json", "sha256")]
+    ev = [(so_rel, "sha256")]
+    appeared = [r[0] for r in rows if r[3] == words["appeared"]]
     if changed:
         return _r("steps.signed_spec", "steps", title, "problem",
                   f"{len(changed)} signed file(s) differ from what the owner signed, are missing, or were signed with no "
                   f"valid hash ({', '.join(changed)}; {who}). "
-                  "Anything computed after the change did not use the signed version.", ev, table, "C10")
-    return _r("steps.signed_spec", "steps", title, "ok", f"All {len(rows)} signed file(s) are unchanged ({who}).",
+                  + (f"{', '.join(appeared)} did not exist at signing (the record holds null for it) and appeared after "
+                     f"signing. " if appeared else "")
+                  + "Anything computed after the change did not use the signed version.", ev, table, "C10")
+    return _r("steps.signed_spec", "steps", title, "ok",
+              f"All {len(rows) - len(absent)} signed file(s) are unchanged ({who})."
+              + (f" {', '.join(absent)} was absent when signed (the record holds null for it) and is absent now." if absent else ""),
               ev, table, "C10")
 
 
@@ -149,14 +226,14 @@ def artifact_spec(run):
     or malformed is never a match), so a file that records no spec cannot drop out of the comparison."""
     title = "Every analysis file was computed from the signed spec"
     arts = run.artifacts()
-    so, _ = run.json("decision_spec.signoff.json")
+    so, so_rel, _ = signoff_record(run)
     signed = digest(((so or {}).get("sha256") or {}).get("decision_spec.yaml")) if isinstance((so or {}).get("sha256"), dict) else None
     if not arts:
         return _r("steps.artifact_spec", "steps", title, "not_available",
                   "The run holds no analysis file.", [("analysis/*.yaml", "spec_sha256")], case="C10")
     if not signed:
         return _r("steps.artifact_spec", "steps", title, "not_available",
-                  "There is no valid signed spec hash to compare with.", [("decision_spec.signoff.json", "sha256")], case="C10")
+                  "There is no valid signed spec hash to compare with.", [(so_rel, "sha256")], case="C10")
 
     def state(a):
         if digest(a.get("spec_sha256")) is None:
@@ -168,8 +245,7 @@ def artifact_spec(run):
     n = {k: states.count(k) for k in ("no valid spec hash recorded", "other spec", "spec not signed when computed")}
     rows = {"columns": ["file", "spec it used", "signed spec", "state"],
             "rows": [[a["path"], _short(digest(a.get("spec_sha256"))), _short(signed), s] for a, s in zip(arts, states)]}
-    ev = [("analysis/*.yaml", "spec_sha256, spec_signed"), ("analysis/manifest.json", "artifacts"),
-          ("decision_spec.signoff.json", "sha256")]
+    ev = [("analysis/*.yaml", "spec_sha256, spec_signed"), ("analysis/manifest.json", "artifacts"), (so_rel, "sha256")]
     outside = [a["path"] for a, s in zip(arts, states) if s == "no valid spec hash recorded" and not a.get("in_manifest")]
     if outside and n["no valid spec hash recorded"] == len(outside) and not n["other spec"] and not n["spec not signed when computed"]:
         # A file the analysis manifest does not list and that records no spec: the analysis does not claim it, so it
@@ -404,6 +480,46 @@ def _self_test():
            clean["status"] == "ok" and [c["status"] for c in (null, short, extra)] == ["problem", "problem", "look"]
            and "analysis/claims.yaml" in str(null["rows"]) and "analysis/extra.yaml" in str(extra["rows"])
            and "no valid spec hash" in null["says"], str([(c["status"], c["says"]) for c in (clean, null, short, extra)]))
+        def record(name, edit):
+            d = os.path.join(tmp, name)
+            os.makedirs(d)
+            workbench._toy(d)
+            edit(d)
+            run = workbench.Run(d)
+            return signoff_record(run), signed_spec(run), artifact_spec(run)
+
+        def brief_only(d):
+            os.rename(os.path.join(d, SPEC_SIGNOFF), os.path.join(d, BRIEF_SIGNOFF))
+
+        def brief_other(d, spec_hash="0" * 64):
+            so = json.load(open(os.path.join(d, SPEC_SIGNOFF)))
+            so["sha256"] = {SPEC: spec_hash} if spec_hash else {"decision_brief.yaml": "1" * 64}
+            json.dump({**so, "signed_by": "lead"}, open(os.path.join(d, BRIEF_SIGNOFF), "w"))
+        (rec, rel, _), signed, arts = record("s6brief", brief_only)
+        ok("S6 the sign-off record is the brief's when it holds the spec's hash (toolkit/spec/signoff.py _spec_record): "
+           "the Steps checks read it", rel == BRIEF_SIGNOFF and rec["signed_by"] == "owner" and signed["status"] == "ok"
+           and arts["status"] == "ok" and any(e["file"] == BRIEF_SIGNOFF for e in signed["evidence"]), str((rel, signed["status"], signed["says"], arts["status"])))
+        (rec, rel, _), signed, arts = record("s6both", brief_other)
+        ok("S7 with both records the brief's is selected, so a spec that is not the one it signed is a problem",
+           rel == BRIEF_SIGNOFF and rec["signed_by"] == "lead" and signed["status"] == "problem" and arts["status"] == "problem",
+           str((rel, signed["status"], arts["status"])))
+        (rec, rel, _), signed, arts = record("s6spec", lambda d: brief_other(d, None))
+        ok("S8 a brief record that holds no hash for the spec is not the spec's sign-off: the spec-only record is",
+           rel == SPEC_SIGNOFF and rec["signed_by"] == "owner" and signed["status"] == "ok" and arts["status"] == "ok", str((rel, signed["status"])))
+        d = os.path.join(tmp, "s9")
+        os.makedirs(d)
+        workbench._toy(d)
+        os.makedirs(os.path.join(d, "analysis"), exist_ok=True)
+        open(os.path.join(d, DT), "w").write(json.dumps({"data": {"tests": [
+            {"test_id": "T1", "status": "run", "verdict": "NO_CHANGE"}, {"test_id": "T2", "status": "run", "verdict": "CHANGES_PLAN"},
+            {"test_id": "T3", "status": "not_run", "verdict": "NOT_RUN"}, {"test_id": "T4", "status": "run", "verdict": "NOT_RUN"},
+            {"test_id": "T5", "status": "not_run", "verdict": "NO_CHANGE"}, {"test_id": "T6", "status": "done", "verdict": "NO_CHANGE"},
+            {"test_id": "T7", "status": "run", "verdict": None}, {"test_id": "T8", "status": "run"}]}}))
+        tests, why = decision_tests(workbench.Run(d))
+        ok("S9 decision tests, one loader: only status run with a verdict of no change or changes plan ran; the producer's "
+           "words in another pair contradict each other; any other word is unknown",
+           why is None and [tests[f"T{i}"]["state"] for i in range(1, 9)] == ["ran", "ran", "not_run", "contradiction",
+                                                                             "contradiction", "unknown", "unknown", "unknown"], str(tests))
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
 

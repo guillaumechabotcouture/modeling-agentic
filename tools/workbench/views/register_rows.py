@@ -9,21 +9,28 @@ table; a later source's row is merged into an earlier one when it has the same i
 it, or names the same input (`excluded:x` and `nodata:parameter:x`). The owner's review notes
 (owner/review_notes.jsonl, review_notes.py) are applied last, in the order they were written.
 
-The model: {rows, flags, spec, tests, tests_why, prose, notes, bad_notes, notes_why, folded, nothing}.
+The model: {rows, flags, spec, tests, tests_why, asks, prose, notes, bad_notes, notes_why, folded, nothing}.
   rows    one dict per row with the columns of COLUMNS, where `sources`, `files` and `tests` are lists, and
           `derived` (the disposition before any note), `noted` (a note set the disposition) and `decided` (a note
           set whether the row decides).
   flags   [(status, sentence)]: what a file says that the rows cannot carry (a ledger line that is no finding, a
           declaration of nothing, a status word no producer writes, a file that cannot be parsed, no verified
           signed spec). status is problem or not_available.
-  tests   {test id: {status, verdict, statement}} from analysis/decision_tests.yaml, or None with `tests_why`.
+  tests   {test id: {status, verdict, statement, state}} (checks.decision_tests), or None with `tests_why`; `asks`
+          {test id: the signed spec's question}.
   prose   [(line number, text)] of the verified signed spec's comment lines that start a departure, limitation or
           assumption, or None with no verified signed spec; `prose_more` {line number: the comment lines after it}.
   nothing True when the run has none of the register's files.
 
 Rules applied here (§3): only a verified signed spec can declare anything, so with no verified copy the rows that
-rest on the spec, its sign-off sheet or a signed engine departure are shown open; a file the sign-off record holds a
-hash for counts only while it has that hash; a status word no producer writes gives a row no disposition.
+rest on the spec, its sign-off sheet or a signed engine departure are shown open; the sign-off record is the one the
+producer selects (checks.signoff_record); a file counts as signed only while it has the hash that record holds for
+it, and a file the record holds no hash for is not signed; a status word no producer writes gives a row no
+disposition. A declaration or departure is matched to its own entry by identity (the finding id it names; the
+engine, the typed component or benchmark and the test of the signed entry) before any match by a shared test. The
+ledger and the sheet are read to their end, never cut at a size; a list entry that is no mapping is a problem. A
+finding the ledger holds as fixed is `implemented` only with the gate's recorded result that verifies it (`evidence`),
+else "implemented, not verified" (§12).
 """
 from __future__ import annotations
 
@@ -41,23 +48,27 @@ if _WB not in sys.path:
 import checks  # noqa: E402
 import review_notes  # noqa: E402
 
-COLUMNS = ["id", "kind", "statement", "source", "first_visible_stage", "decides", "disposition", "tests", "verdicts",
-           "severity", "blocking", "files", "nature", "signed_by"]
+COLUMNS = ["id", "nature", "kind", "statement", "source", "first_visible_stage", "decides", "disposition", "evidence",
+           "tests", "verdicts", "severity", "blocking", "files", "signed_by"]
 SOURCES = ("findings", "scope_declaration", "engine_departures", "calibration_declared", "uncertainty_excluded",
            "signoff_sheet", "evidence_dossier", "decision_tests", "owner_note")
 WORDS = review_notes.DISPOSITIONS
+# §12 (reader finding 2): the ledger's `fixed` is `implemented` only with the gate's recorded result that verifies it
+# shown on the row; without it the row reads as below and counts as a row with no disposition.
+UNVERIFIED = "implemented, not verified"
+GATE = re.compile(r"gate_r(\d+)(_post)?\.json")        # agents/stage_machine.py: gate_r<round>.json, gate_r<round>_post.json
 LEDGER, SCOPE, CHOICE, SHEET, DOSSIER, DT = ("findings.jsonl", "scope_declaration.yaml", "engine_choice.json",
                                              "decision_spec.signoff_sheet.md", "evidence_dossier.yaml",
                                              "analysis/decision_tests.yaml")
 OLD_DECLARED, OLD_GATE = "declared_findings.yaml", "final_gate.json"
-SPEC, SIGNED, SIGNOFF = "decision_spec.yaml", "decision_brief.signed/decision_spec.yaml", "decision_spec.signoff.json"
+SPEC, SIGNED, SIGNOFF = checks.SPEC, "decision_brief.signed/decision_spec.yaml", checks.SPEC_SIGNOFF
 NOTES = review_notes.FILE
 # Each producer's own words, mapped explicitly (§3): agents/findings_ledger.py STATUSES, and the status
 # toolkit/engines/benchmark_coverage.py gives an engine departure.
 LEDGER_WORDS = {"open": "open", "declared": "declared", "fixed": "implemented", "owner_accepted": "declared",
                 "owner_declined": "open"}
 DEPARTURE_WORDS = {"signed": "declared", "proposed": "open", "unsigned": "open"}
-VERDICTS = ("NO_CHANGE", "CHANGES_PLAN", "NOT_RUN")       # toolkit/analysis/run.py
+VERDICTS = checks.VERDICTS                                # toolkit/analysis/run.py
 CHANGES, NO_CHANGE, NO_RECORD = "CHANGES_PLAN", "NO_CHANGE", "NO_RECORD"
 SEVERITIES = ("HIGH", "MEDIUM", "LOW")                    # agents/findings_ledger.py; the first is the highest
 NAMED = ("departure", "calibration", "excluded", "presign", "nodata")    # row ids of the form <prefix>:<input name>
@@ -87,7 +98,7 @@ def _row(rid, kind, statement, source, stage, disposition, rel, tests=(), **more
     return {"id": rid, "kind": kind, "statement": _text(statement) or "(the file gives no text for this row)",
             "sources": [source], "first_visible_stage": stage, "disposition": disposition,
             "tests": [t for t in dict.fromkeys(_stem(t) for t in tests) if t], "severity": None, "blocking": None,
-            "files": [rel], "nature": "science", "signed_by": None, "decides": "unknown", "noted": False,
+            "files": [rel], "nature": "science", "signed_by": None, "decides": "unknown", "noted": False, "evidence": None,
             "decided": False, "name": name if source != "findings" and prefix in NAMED and name else None, **more}
 
 
@@ -108,12 +119,16 @@ def _same_input(a, b):
     return bool(a["name"] and b["name"]) and (a["id"].endswith(":" + b["name"]) or b["id"].endswith(":" + a["name"]))
 
 
-def _place(rows, new):
-    """Add a row, or merge it into the first earlier row of another source that shares its id, a test or its input."""
-    for r in rows:
-        other = new["sources"][0] not in r["sources"]
-        if r["id"] == new["id"] or (other and (set(r["tests"]) & set(new["tests"]) or _same_input(r, new))):
-            return _fold(r, new)
+def _place(rows, new, by_id_only=False):
+    """Add a row, or merge it into an earlier one: the row with its id first, wherever that row is; only then, and
+    only for a row that names nothing by id (`by_id_only` false), the first row of another source that shares a
+    test or its input. So a declaration that names a finding goes to that finding, never to one that shares its test."""
+    same = next((r for r in rows if r["id"] == new["id"]), None)
+    if same is None and not by_id_only:
+        same = next((r for r in rows if new["sources"][0] not in r["sources"]
+                     and (set(r["tests"]) & set(new["tests"]) or _same_input(r, new))), None)
+    if same is not None:
+        return _fold(same, new)
     rows.append(new)
     return new
 
@@ -123,14 +138,14 @@ def _spec(run, others):
     text}. `doc` is the verified signed copy; with no verified copy it is whichever copy could be read, for names
     only. One read of the signed copy gives the hash, the document and the comment lines."""
     raw, why = run.read(SIGNED, MAX_TEXT + 1)
-    so, so_why = run.json(SIGNOFF)
+    so, so_rel, so_why = checks.signoff_record(run)      # the producer's own selection of the record
     out = {"doc": {}, "rel": SIGNED, "unverified": None, "unsigned": False, "text": None, "say": "",
-           "signed_by": (so or {}).get("signed_by"), "signed_at": (so or {}).get("signed_at"),
-           "record": so.get("sha256") if isinstance((so or {}).get("sha256"), dict) else {}}
+           "signed_by": (so or {}).get("signed_by"), "signed_at": (so or {}).get("signed_at"), "signoff": so_rel,
+           "so": so, "record": so.get("sha256") if isinstance((so or {}).get("sha256"), dict) else {}}
     if raw is None and _absent(why) and so is None and _absent(so_why) and not others:
         out.update(unsigned=True, rel=None, say="The spec is not signed yet, so the register holds nothing from it.")
         return out
-    signed, doc, bad = None, None, why
+    signed, doc, bad = None, None, why or f"{SIGNED} is larger than {MAX_TEXT >> 20} MB and is not read"
     if raw is not None and len(raw) <= MAX_TEXT:
         signed = hashlib.sha256(raw).hexdigest()
         try:
@@ -144,7 +159,7 @@ def _spec(run, others):
     elif so is None:
         out["unverified"] = f"the sign-off record could not be read ({so_why})"
     elif want is None:
-        out["unverified"] = f"the sign-off record ({SIGNOFF}) holds no sha256 for {SPEC}"
+        out["unverified"] = f"the sign-off record ({so_rel}) holds no sha256 for {SPEC}"
     elif want != signed:
         out["unverified"] = (f"the signed copy ({SIGNED}, {signed[:8]}) differs from the hash the sign-off record "
                              f"holds ({want[:8]})")
@@ -162,7 +177,8 @@ def _spec(run, others):
     else:
         out["text"] = raw.decode("utf-8", "replace")
         who = f"signed by {out['signed_by']} at {_text(out['signed_at'])[:16]}"
-        out["say"] = (f"The register reads the signed copy of the spec, {SIGNED} ({signed[:8]}, {who}). " + (
+        out["say"] = (f"The register reads the signed copy of the spec, {SIGNED} ({signed[:8]}, {who}; the sign-off "
+                      f"record is {so_rel}). " + (
             f"The spec on disk ({disk[:8]}) differs from it; nothing that is only in the spec on disk is a row."
             if disk and disk != signed else "The spec on disk is the same file." if disk else
             f"{SPEC} is not in the run folder."))
@@ -178,15 +194,71 @@ def _list(doc, *keys):
     return [x for x in doc if isinstance(x, dict)] if isinstance(doc, list) else []
 
 
+def _entries(flags, rel, doc, *keys):
+    """The mappings of a list in a file, in order. An entry that is no mapping is never dropped silently: it is a
+    `problem` that names the list and the entry's position, since what it was meant to declare is not in the register."""
+    for k in keys:
+        doc = doc.get(k) if isinstance(doc, dict) else None
+    out = []
+    for n, x in enumerate(doc if isinstance(doc, list) else [], 1):
+        if isinstance(x, dict):
+            out.append(x)
+        else:
+            flags.append(("problem", f"Entry {n} of {'.'.join(keys)} in {rel} is not a mapping (it is {_text(repr(x), 60)}), "
+                                     "so what it declares, if anything, is not in the register."))
+    return out
+
+
+def _gates(run, flags):
+    """[(file, its done_when_status)] for the run's gate records, oldest first: gate_r<n>.json then gate_r<n>_post.json
+    for each round, and final_gate.json last (the stage machine writes it from the last gate)."""
+    names = run.names("")
+    found = sorted((int(m.group(1)), bool(m.group(2)), n) for n in names for m in [GATE.fullmatch(n)] if m)
+    out = []
+    for rel in [n for _, _, n in found] + ([OLD_GATE] if OLD_GATE in names else []):
+        doc, why = run.json(rel)
+        if doc is None and rel != OLD_GATE:      # final_gate.json is flagged where the older dispositions are read
+            flags.append(("not_available", f"{why}, so the results it records for done-when tests are not known."))
+        out.append((rel, doc.get("done_when_status") if doc is not None and isinstance(doc.get("done_when_status"), dict) else {}))
+    return out
+
+
+def _fixed(f, gates):
+    """(verified, the evidence in words) for a finding the ledger holds as `fixed`. The ledger sets it two ways
+    (agents/findings_ledger.py): a critic's finding follows the critic's own `resolved` mark, and what verifies it is
+    the gate's recorded result for its done-when test (scripts/done_when.py run: done_when_status[id] with passes
+    and result), taken from the last gate record that holds the finding; a gate finding is fixed when it is absent
+    from a later pre-write gate (the event "absent at this gate"), and what verifies it is that round's gate record."""
+    if not isinstance(f.get("source"), str) or f["source"].startswith("critique"):
+        rel, e = next(((rel, dws[f["id"]]) for rel, dws in reversed(gates) if isinstance(dws.get(f["id"]), dict)), (None, None))
+        if e is None:
+            return False, ("no gate record holds a result for its done-when test; the ledger's fixed follows the critic's "
+                           "own mark, which nothing here verifies")
+        result = e.get("result") if isinstance(e.get("result"), str) else None
+        said = result or ("passed" if e.get("passes") is True else "failed" if e.get("passes") is False else "not_judged")
+        if e.get("passes") is True and said == "passed":
+            return True, f"{rel}: its done-when test passed ({_text(e.get('detail'), 200) or 'no detail recorded'})"
+        return False, (f"{rel}, the last gate record that holds it, gives its done-when test as {said.replace('_', ' ')}"
+                       + (f" ({_text(e.get('detail'), 200)})" if e.get("detail") else "") + "; the ledger's fixed follows "
+                       "the critic's own mark")
+    events = [e for e in f.get("events") or [] if isinstance(e, dict) and e.get("status") == "fixed" and e.get("by") == "gate"]
+    if not events:
+        return False, f"{LEDGER} holds no gate event that says how it was fixed"
+    rnd = events[-1].get("round")
+    rel = f"gate_r{rnd}.json"
+    if any(name == rel for name, _ in gates):
+        return True, f"{LEDGER} events: {_text(events[-1].get('note')) or 'fixed'} in round {rnd}; that gate's record is {rel}"
+    return False, f"{LEDGER} events say it was absent at the gate of round {rnd}, and the run holds no {rel}"
+
+
 def _tests(run):
-    doc, why = run.large(DT)
-    if doc is None:
-        return None, f"{DT} is not in the run folder" if _absent(why) else why
-    tests = doc.get("data", {}).get("tests") if isinstance(doc.get("data"), dict) else None
-    if not isinstance(tests, list) or not all(isinstance(t, dict) and t.get("test_id") for t in tests):
-        return None, f"{DT} holds no list of tests (data.tests)"
-    return {str(t["test_id"]): {"status": t.get("status"), "verdict": t.get("verdict"),
-                                "statement": _text(t.get("statement"))} for t in tests}, None
+    """checks.decision_tests: the one loader of decision tests, shared with the Fit view."""
+    tests, why = checks.decision_tests(run)
+    return tests, (f"{DT} is not in the run folder" if tests is None and _absent(why) else why)
+
+
+def _ran(tests, tid):
+    return (tests or {}).get(tid, {}).get("state") == "ran"
 
 
 def derive(run):
@@ -196,7 +268,7 @@ def derive(run):
     spec = _spec(run, any(present.values()))
     tests, tests_why = _tests(run)
     out = {"rows": rows, "flags": flags, "spec": spec, "tests": tests, "tests_why": tests_why, "prose": None,
-           "notes": [], "bad_notes": [], "notes_why": None, "folded": [], "nothing": spec["unsigned"], "present": present}
+           "notes": [], "bad_notes": [], "notes_why": None, "folded": [], "nothing": spec["unsigned"], "present": present, "asks": {}}
     if spec["unsigned"]:
         return out
     verified = spec["unverified"] is None
@@ -212,27 +284,38 @@ def derive(run):
             flags.append(("not_available", f"{why}, so the rows it holds are not in the register."))
         return doc
 
+    bound = {}
+
     def signed_file(rel):
-        """False when the sign-off record holds a hash for the file and the file no longer has it (§3)."""
-        if rel not in spec["record"]:
-            return True
-        state = checks.hash_state(spec["record"][rel], run.sha(rel))
-        if state != "same":
-            flags.append(("problem", f"{rel} is not the file that was signed (against the hash in {SIGNOFF}: "
-                                     f"{state.replace('_', ' ')}), so its rows are shown open."))
-        return state == "same"
+        """True only when the sign-off record holds a hash for the file and the file still has it (§3: an absent hash
+        is never a match). The producer binds the files it lists under the record's sha256 (toolkit/spec/signoff.py
+        sign: the spec, the derivation record, a reference file, the evidence files; never the sign-off sheet, whose
+        hash sign() compares with the one shown to the owner and does not record); a file the record does not
+        list is not a signed file, whatever it says. Flagged once, when a row first rests on it."""
+        if not verified:
+            return False
+        if rel not in bound:
+            bound[rel] = checks.bound(spec["so"], rel, run.sha(rel))
+            if bound[rel] == "not_recorded":
+                flags.append(("problem", f"The sign-off record ({spec['signoff']}) does not bind {rel}: it holds no "
+                                         "hash for it, so nothing shows it is the file that was signed, and its rows "
+                                         "are shown open."))
+            elif bound[rel] != "same":
+                flags.append(("problem", f"{rel} is not the file that was signed (against the hash in {spec['signoff']}: "
+                                         f"{bound[rel].replace('_', ' ')}), so its rows are shown open."))
+        return bound[rel] == "same"
 
     # 1. findings.jsonl, and the two files in which an older run keeps dispositions
-    raw, why = run.read(LEDGER, MAX_TEXT)
-    if present[LEDGER] and raw is None:
-        flags.append(("not_available", f"{why}, so no finding is in the register."))
-    for n, line in enumerate((raw or b"").decode("utf-8", "replace").split("\n"), 1):
-        if not line.strip():
-            continue
+    def finding(n, raw):
         try:
-            f = json.loads(line)
-        except ValueError:
-            f = None
+            return n, json.loads(raw.decode("utf-8"))
+        except ValueError:          # not JSON, or not UTF-8
+            return n, None
+    found, why = run.lines(LEDGER, finding) if present[LEDGER] else ([], None)      # the whole file, whatever its size
+    if found is None:
+        flags.append(("not_available", f"{why}, so no finding is in the register."))
+    gates = _gates(run, flags) if present[LEDGER] else []
+    for n, f in found or []:
         if not (isinstance(f, dict) and isinstance(f.get("id"), str) and f["id"].strip() and "status" in f):
             flags.append(("problem", f"Line {n} of {LEDGER} is not a finding row (a JSON object with an id and a "
                                      "status), so a finding may be missing from the register."))
@@ -245,13 +328,17 @@ def derive(run):
         dt = f.get("decision_test")
         stage = f.get("owner_state") if f.get("owner_state_known") is not False and f.get("owner_state") else f.get("target_stage")
         critic = not isinstance(f.get("source"), str) or f["source"].startswith("critique")
-        r = _place(rows, _row(f["id"], "issue", f.get("claim"), "findings", stage, LEDGER_WORDS[word] if known else None,
+        disposition, shown = (LEDGER_WORDS[word] if known else None), None
+        if disposition == "implemented":
+            proven, shown = _fixed(f, gates)
+            disposition = disposition if proven else UNVERIFIED
+        r = _place(rows, _row(f["id"], "issue", f.get("claim"), "findings", stage, disposition,
                               LEDGER, [dt.get("file")] if isinstance(dt, dict) else [], severity=f.get("severity"),
                               blocking=f.get("blocking") if isinstance(f.get("blocking"), bool) else None,
                               nature="science" if critic else "process",
-                              signed_by="owner" if word == "owner_accepted" else None, ledger=word))
+                              signed_by="owner" if word == "owner_accepted" else None, ledger=word, evidence=shown))
         by_id[r["id"]] = r
-    older = [(OLD_DECLARED, "declared", lambda d: [x.get("id") for x in _list(d, "declared")] if isinstance(d.get("declared"), list) else None),
+    older = [(OLD_DECLARED, "declared", lambda d: [x.get("id") for x in _entries(flags, OLD_DECLARED, d, "declared")] if isinstance(d.get("declared"), list) else None),
              (OLD_GATE, "tested", lambda d: d.get("resolved_by_test", []) if isinstance(d.get("resolved_by_test", []), list) else None)]
     for rel, word, ids in older:
         doc = doc_of(rel)
@@ -272,7 +359,7 @@ def derive(run):
     doc = doc_of(SCOPE)
     if doc is not None and not isinstance(doc.get("declarations"), list):
         flags.append(("not_available", f"{SCOPE} holds no list of declarations, so what it declares is not in the register."))
-    for d in _list(doc or {}, "declarations"):
+    for d in _entries(flags, SCOPE, doc or {}, "declarations"):
         rid = _text(d.get("blocker_id") or d.get("id"))
         if not rid:
             flags.append(("problem", f"A declaration in {SCOPE} has no blocker_id and no id."))
@@ -280,15 +367,20 @@ def derive(run):
         if rid not in by_id:
             flags.append(("problem", f"{SCOPE} declares {rid}, which {LEDGER} does not hold: a declaration that "
                                      "names no finding is a declaration of nothing."))
+        # a declaration that names a finding (blocker_id) is matched by that id alone, before and instead of any test
         _place(rows, _row(rid, "issue", d.get("why_unresolved"), "scope_declaration", "GATE", "declared", SCOPE,
-                          [d.get("decision_test")]))
+                          [d.get("decision_test")]), by_id_only=bool(_text(d.get("blocker_id"))))
 
     # 3. engine_choice.json engine_departures
     doc = doc_of(CHOICE)
     if doc is not None and not isinstance(doc.get("engine_departures", []), list):
         flags.append(("not_available", f"{CHOICE} engine_departures is not a list, so the departures are not in the register."))
-    held = {_text(s.get(k)) for s in _list(spec["doc"], "engine_departures") for k in ("component", "benchmark") if s.get(k)}
-    for d in _list(doc or {}, "engine_departures"):
+    def identity(d):       # a departure is {engine, benchmark | component, reason, decision_test} (benchmark_coverage.py)
+        return _text(d.get("engine")), "component" if d.get("component") else "benchmark", _text(d.get("component") or d.get("benchmark"))
+    held = {}
+    for s in _entries(flags, spec["rel"], spec["doc"], "engine_departures"):
+        held.setdefault(identity(s), []).append(_stem(s.get("decision_test")))
+    for d in _entries(flags, CHOICE, doc or {}, "engine_departures"):
         name = _text(d.get("component") or d.get("benchmark"))
         word = d.get("status")
         if not name:
@@ -298,10 +390,17 @@ def derive(run):
         if disposition is None:
             flags.append(("not_available", f"Engine departure {name} in {CHOICE} has the status {word!r}, a word the "
                                            "engine choice does not write, so its disposition is not known."))
-        elif disposition == "declared" and verified and name not in held:
+        elif disposition == "declared" and verified and identity(d) not in held:
             disposition = "open"
             flags.append(("problem", f"{CHOICE} marks the engine departure for {name} signed, but the signed spec's "
-                                     "engine_departures does not hold it: the two files disagree."))
+                                     f"engine_departures does not hold it (engine {identity(d)[0] or 'not named'}, "
+                                     f"{identity(d)[1]} {name}): the two files disagree, so it is shown open."))
+        elif disposition == "declared" and verified and _stem(d.get("decision_test")) not in held[identity(d)]:
+            disposition = "open"
+            flags.append(("problem", f"{CHOICE} gives the engine departure for {name} the decision test "
+                                     f"{_stem(d.get('decision_test')) or '(none)'}, but the signed entry names "
+                                     f"{', '.join(t or '(none)' for t in held[identity(d)])}: the signature does not cover "
+                                     "that test, so the departure is shown open."))
         elif disposition == "declared" and not verified:
             disposition = "open"
         _place(rows, _row(f"departure:{name}", "assumption", d.get("reason"), "engine_departures", "ENGINE_CHOICE",
@@ -311,13 +410,13 @@ def derive(run):
     # 4, 5. the signed spec: declared calibration misses and excluded inputs
     def carried(word):
         return (word, spec["signed_by"]) if verified else ("open", None)
-    for d in _list(spec["doc"], "calibration", "joint", "unmatched", "declared"):
+    for d in _entries(flags, spec["rel"], spec["doc"], "calibration", "joint", "unmatched", "declared"):
         name = _text(d.get("target") or d.get("offset"))
         if name:
             word, who = carried("tested" if d.get("decision_test") else "declared")
             _place(rows, _row(f"calibration:{name}", "issue", d.get("reason"), "calibration_declared", "SIGN", word,
                               spec["rel"], [d.get("decision_test")], signed_by=who))
-    for d in _list(spec["doc"], "uncertainty", "excluded"):
+    for d in _entries(flags, spec["rel"], spec["doc"], "uncertainty", "excluded"):
         name = _text(d.get("parameter") or d.get("kind"))
         if name:
             word, who = carried("declared")
@@ -325,19 +424,18 @@ def derive(run):
                               spec["rel"], signed_by=who))
 
     # 6. the sign-off sheet's rows marked HIGH
-    raw, why = run.read(SHEET, MAX_TEXT)
-    if present[SHEET] and raw is None:
+    def high(n, raw):
+        m = HIGH_LINE.match(raw.decode("utf-8", "replace"))
+        return (n, m) if m else None
+    marked, why = run.lines(SHEET, high) if present[SHEET] else ([], None)          # the whole file, whatever its size
+    if marked is None:
         flags.append(("not_available", f"{why}, so the rows it marks HIGH are not in the register."))
-    sheet_ok = signed_file(SHEET) if raw is not None else True
-    for n, line in enumerate((raw or b"").decode("utf-8", "replace").split("\n"), 1):
-        m = HIGH_LINE.match(line)
-        if not m:
-            continue
+    for n, m in marked or []:
         name = next((x.group(1) for x in (p.match(m.group(1)) for p in HIGH_NAME) if x), None)
         if name is None:
             flags.append(("not_available", f"Line {n} of {SHEET} marks a finding HIGH in a form that is not "
                                            "recognised, so the input it is about is not known."))
-        word, who = carried("declared") if sheet_ok else ("open", None)
+        word, who = carried("declared") if signed_file(SHEET) else ("open", None)
         _place(rows, _row(f"presign:{name or f'line {n}'}", "issue", m.group(1), "signoff_sheet", "SIGN", word, SHEET,
                           signed_by=who, severity="HIGH"))
 
@@ -345,20 +443,20 @@ def derive(run):
     doc = doc_of(DOSSIER)
     if doc is not None and not isinstance(doc.get("inputs"), dict):
         flags.append(("not_available", f"{DOSSIER} holds no inputs mapping, so its entries are not in the register."))
-    dossier_ok = signed_file(DOSSIER) if doc is not None else True
     inputs = doc.get("inputs") if doc is not None and isinstance(doc.get("inputs"), dict) else {}
     for key, e in inputs.items():
         if isinstance(e, dict) and e.get("no_data"):
             nd, test = e["no_data"], e.get("decision_test")
             test = test if isinstance(test, str) else None      # only the structured key names a test
             _place(rows, _row(f"nodata:{key}", "uncertainty", nd.get("reason") if isinstance(nd, dict) else nd,
-                              "evidence_dossier", "SIGN", "tested" if test and dossier_ok else "open", DOSSIER, [test]))
+                              "evidence_dossier", "SIGN", "tested" if test and signed_file(DOSSIER) else "open", DOSSIER, [test]))
 
     # 8. plan-changing decision tests that no row names
     linked = {t for r in rows for t in r["tests"]}
     asks = {str(t.get("id")): _text(t.get("text")) for t in _list(spec["doc"], "analysis", "decision_tests")}    # the spec's own question
+    out["asks"] = asks
     for tid, t in (tests or {}).items():
-        if t["verdict"] == CHANGES and tid not in linked:
+        if t["state"] == "ran" and t["verdict"] == CHANGES and tid not in linked:
             said = " ".join(x for x in (asks.get(tid), t["statement"], UNLINKED) if x)
             _place(rows, _row(f"test:{tid}", "uncertainty", said, "decision_tests", "ANALYZE", "open", DT, [tid]))
 
@@ -367,9 +465,9 @@ def derive(run):
     _notes(run, out, present[NOTES])
     for r in rows:
         r["verdicts"] = [_verdict(tests, t) for t in r["tests"]]
-        if not r["decided"]:
-            r["decides"] = ("yes" if CHANGES in r["verdicts"] else
-                            "no" if r["verdicts"] and all(v == NO_CHANGE for v in r["verdicts"]) else "unknown")
+        if not r["decided"]:        # only a test that ran says anything: a verdict beside a status that denies it does not
+            said = [v if _ran(tests, t) else None for t, v in zip(r["tests"], r["verdicts"])]
+            r["decides"] = "yes" if CHANGES in said else "no" if said and all(v == NO_CHANGE for v in said) else "unknown"
     if verified:
         lines = spec["text"].split("\n")
         out["prose"] = [(n, line.strip()) for n, line in enumerate(lines, 1) if _starts(line)]
@@ -432,7 +530,8 @@ def _notes(run, out, there):
                 _fold(r, other)
                 out["folded"].append((r["id"], other["id"]))
             if note["disposition"] is not None:
-                r.update(disposition=note["disposition"], noted=True, signed_by="owner")
+                r.update(disposition=note["disposition"], noted=True, signed_by="owner",
+                         evidence=f"the owner's note of {str(note['at'])[:10]} ({NOTES})")
         if note["decides"] is not None:      # the owner's unknown leaves the row among those whose bearing is unknown
             r.update(decides=note["decides"], decided=note["decides"] != "unknown")
         out["notes"].append({"at": note["at"], "row": r["id"], "disposition": note["disposition"],
@@ -491,15 +590,18 @@ def _self_test():
         def listed(d):
             with open(os.path.join(d, SIGNOFF), encoding="utf-8") as f:
                 so = json.load(f)
-            for rel in (fx.SHEET, fx.DOSSIER):
-                with open(os.path.join(d, rel), "rb") as f:
+            for rel in (fx.SHEET, fx.DOSSIER):      # the sheet's hash: one no producer records today (the rule is kept
+                with open(os.path.join(d, rel), "rb") as f:     # for a record that does; no fixture is built with it)
                     so["sha256"][rel] = hashlib.sha256(f.read()).hexdigest()
             with open(os.path.join(d, SIGNOFF), "w", encoding="utf-8") as f:
                 json.dump(so, f)
-        m = look(b.edited(hm, listed))
+        m = look(b.folder(hm, "sheet_high"))
+        need(by(m)["presign:p2"]["disposition"] == "open" and by(m)["nodata:unit_attribute:x1"]["disposition"] == "tested",
+             f"as the producer signs: the dossier is a signed file, the sheet is not ({m['flags']})")
+        m = look(b.edited(hm, listed, "sheet_high"))
         need(m["flags"] == [] and by(m)["presign:p2"]["disposition"] == "declared", f"signed files that still have their hash count ({m['flags']})")
         for rel, rid in ((fx.SHEET, "presign:p2"), (fx.DOSSIER, "nodata:unit_attribute:x1")):
-            m = look(b.edited(hm, lambda d, rel=rel: (listed(d), text(rel, lambda t: t + "\n")(d))))
+            m = look(b.edited(hm, lambda d, rel=rel: (listed(d), text(rel, lambda t: t + "\n")(d)), "sheet_high"))
             need(by(m)[rid]["disposition"] == "open" and any(s == "problem" and rel in why for s, why in m["flags"]),
                  f"{rel} changed after the sign-off: its rows are open and it is flagged ({m['flags']})")
 
@@ -528,6 +630,132 @@ def _self_test():
         need(m["notes_why"] and m["notes"] == [] and by(m)["D-001"]["disposition"] == "open",
              f"a notes file that is a link is not read, and says so ({m['notes_why']})")
 
+    def rejson(rel, change):
+        def edit(d):
+            with open(os.path.join(d, rel), encoding="utf-8") as f:
+                doc = json.load(f)
+            change(doc)
+            with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+        return edit
+
+    def problem(m, *words):
+        return any(s == "problem" and all(w in why for w in words) for s, why in m["flags"])
+
+    def departure_identity():
+        def to(**change):
+            return rejson(fx.CHOICE, lambda doc: doc["engine_departures"][0].update(change))
+        for name, edit in (("another engine and another test", to(engine="other-engine", decision_test="DT1")),
+                           ("another test", to(decision_test="DT1")), ("another engine", to(engine="other-engine")),
+                           ("a component of the benchmark's name", lambda d: rejson(fx.CHOICE, lambda doc: doc["engine_departures"][0].update(
+                               component=doc["engine_departures"][0].pop("benchmark")))(d))):
+            m = look(b.edited(hm, edit))
+            need(by(m)["departure:B2"]["disposition"] == "open" and by(m)["departure:B2"]["signed_by"] is None and problem(m, "B2"),
+                 f"{name}: the departure is open and the mismatch is a problem ({by(m)['departure:B2']['disposition']}, {m['flags']})")
+            need(by(m)["departure:B"]["disposition"] == "declared", "the other departure, which matches its signed entry, still counts")
+
+    def malformed_entries():
+        from views.fit_bench import rewrite
+        m = look(b.edited(hm, rewrite(fx.SCOPE, lambda doc: doc["declarations"].append(None))))
+        need(problem(m, fx.SCOPE, "Entry 2"), f"a declaration that is no mapping is a problem, named by its position ({m['flags']})")
+        m = look(b.edited(hm, rejson(fx.CHOICE, lambda doc: doc["engine_departures"].insert(0, "B2"))))
+        need(problem(m, fx.CHOICE, "Entry 1") and by(m)["departure:B2"]["disposition"] == "declared",
+             f"so is an engine departure that is no mapping; the entries that are mappings are still read ({m['flags']})")
+
+    def whole_files():
+        def pad_to(size, d):       # a valid row that ends the ledger exactly at `size` bytes: the reviewer's valid prefix
+            row = {"id": "PAD-1", "status": "fixed", "source": "rigor-artifacts", "severity": "LOW", "claim": ""}
+            row["claim"] = "x" * (size - os.path.getsize(os.path.join(d, fx.LEDGER)) - len(json.dumps(row)) - 1)
+            return json.dumps(row)
+        late = json.dumps({"id": "Z-777", "status": "open", "source": "critique-domain", "severity": "HIGH", "blocking": True,
+                           "claim": "a finding written after eight megabytes of ledger"})
+        m = look(b.edited(hm, lambda d: text(fx.LEDGER, lambda t: t + pad_to(MAX_TEXT, d) + "\n" + late + "\n")(d)))
+        need("Z-777" in by(m) and by(m)["Z-777"]["disposition"] == "open" and by(m)["Z-777"]["blocking"] is True,
+             f"a finding beyond 8 MiB of ledger is a row ({[k for k in by(m)][:8]}, {m['flags']})")
+        filler = "".join(f"- line {i} of a long sheet\n" for i in range(400000))
+        high = "- **HIGH**: q9 = 7 is outside the card range. Signing accepts it.\n"
+        m = look(b.edited(hm, text(fx.SHEET, lambda t: t + "\n" + filler + high)))
+        need("presign:q9" in by(m), f"a HIGH line beyond 8 MiB of sheet is a row ({[k for k in by(m)]})")
+
+    def unbound_sheet():
+        m = look(b.folder(hm))
+        need(m["flags"] == [] and not [i for i in by(m) if i.startswith("presign:")],
+             f"a sheet that marks no row HIGH raises nothing, though the record does not bind it ({m['flags']})")
+        second = text(fx.SHEET, lambda t: t + "\n- **HIGH**: q9 = 7 is outside the card range. Signing accepts it.\n")
+        m = look(b.edited(hm, second, "sheet_high"))
+        for rid in ("presign:q9", "presign:p2"):
+            need(by(m)[rid]["disposition"] == "open" and by(m)[rid]["signed_by"] is None,
+                 f"{rid}: a sheet line the sign-off record does not bind is not declared by signing ({by(m)[rid]})")
+        need(problem(m, fx.SHEET, "does not bind") and problem(m, fx.SHEET, "no hash")
+             and sum(fx.SHEET in why for _, why in m["flags"]) == 1, f"and the missing binding is a problem, said once ({m['flags']})")
+        m = look(b.edited(hm, rejson(SIGNOFF, lambda so: so["sha256"].pop(fx.DOSSIER, None))))
+        need(by(m)["nodata:unit_attribute:x1"]["disposition"] == "open" and problem(m, fx.DOSSIER, "no hash"),
+             f"nor is a dossier entry the record does not bind tested ({m['flags']})")
+
+    def brief_record():
+        brief = "decision_brief.signoff.json"
+
+        def moved(d):
+            os.rename(os.path.join(d, SIGNOFF), os.path.join(d, brief))
+        m = look(b.edited(hm, moved))
+        need(m["flags"] == [] and m["prose"] == [] and by(m)["excluded:c1"]["disposition"] == "declared"
+             and by(m)["excluded:c1"]["signed_by"] == "owner" and brief in m["spec"]["say"],
+             f"the brief's record, when it holds the spec's hash, is the sign-off (toolkit/spec/signoff.py _spec_record) ({m['flags']})")
+
+        def both(d, spec_in_brief):
+            with open(os.path.join(d, SIGNOFF), encoding="utf-8") as f:
+                so = json.load(f)
+            other = {**so, "signed_by": "lead", "sha256": {k: v for k, v in so["sha256"].items() if spec_in_brief or k != SPEC}}
+            with open(os.path.join(d, brief), "w", encoding="utf-8") as f:
+                json.dump(other, f)
+        m = look(b.edited(hm, lambda d: both(d, True)))
+        need(by(m)["excluded:c1"]["signed_by"] == "lead", "with both records, the brief's is selected when it holds the spec's hash")
+        m = look(b.edited(hm, lambda d: both(d, False)))
+        need(by(m)["excluded:c1"]["signed_by"] == "owner" and m["flags"] == [], "and the spec-only record when the brief's does not")
+
+    def explicit_id():
+        def shared(d):
+            with open(os.path.join(d, fx.LEDGER), encoding="utf-8") as f:
+                found = [json.loads(x) for x in f if x.strip()]
+            first = next(r for r in found if r["id"] == "D-001")
+            first.update(status="declared", decision_test={"file": "models/decision_tests/DT3.yaml", "finding": "D-001", "valid": True})
+            found.sort(key=lambda r: r["id"] != "D-001")
+            with open(os.path.join(d, fx.LEDGER), "w", encoding="utf-8") as f:
+                f.write("".join(json.dumps(r) + "\n" for r in found))
+        m = look(b.edited(hm, shared))
+        need("scope_declaration" in by(m)["R-001"]["sources"] and "scope_declaration" not in by(m)["D-001"]["sources"],
+             f"a declaration that names R-001 goes to R-001, though D-001 comes first and shares its test "
+             f"({by(m)['D-001']['sources']}, {by(m)['R-001']['sources']})")
+        from views.fit_bench import rewrite
+        m = look(b.edited(hm, rewrite(fx.SCOPE, lambda doc: doc["declarations"].append(
+            {"id": "SD-002", "blocker_id": "X-404", "why_unresolved": "w", "decision_test": "models/decision_tests/DT3.yaml"}))))
+        need("X-404" in by(m) and by(m)["R-001"]["sources"] == ["findings", "scope_declaration"],
+             "a declaration that names a finding the ledger does not hold keeps its own row, whatever test it shares")
+
+    def contradictory_test():
+        from views.fit_bench import rewrite
+
+        def odd(doc):
+            next(t for t in doc["data"]["tests"] if t["test_id"] == "DT4")["verdict"] = "NOT_RUN"
+        m = look(b.edited(hm, rewrite(fx.DT, odd)))
+        need(m["tests"]["DT4"]["state"] == "contradiction" and by(m)["departure:B2"]["decides"] == "unknown",
+             f"status run with verdict NOT_RUN contradict each other: the test did not establish anything ({m['tests'].get('DT4')})")
+
+        def other(doc):
+            next(t for t in doc["data"]["tests"] if t["test_id"] == "DT4").update(status="not_run", verdict="NO_CHANGE")
+        m = look(b.edited(hm, rewrite(fx.DT, other)))
+        need(m["tests"]["DT4"]["state"] == "contradiction" and by(m)["departure:B2"]["decides"] == "unknown",
+             "nor does status not_run with a verdict of no change")
+        need(look(b.folder(hm))["tests"]["DT4"]["state"] == "ran" and look(b.folder(hm, "declared_test_not_run"))["tests"]["DT4"]["state"] == "not_run",
+             "the producer's two consistent pairs are ran and not_run")
+
+    b.case("RR6 an engine departure counts only against the signed entry of the same engine, typed name and test (review 2)", departure_identity)
+    b.case("RR7 a list entry that is no mapping is a problem named by its position, never dropped (review 5)", malformed_entries)
+    b.case("RR8 the ledger and the sheet are read whole: a row beyond 8 MiB is in the register (review 6)", whole_files)
+    b.case("RR9 a sheet or dossier the sign-off record holds no hash for is not signed: its rows are open (review 7)", unbound_sheet)
+    b.case("RR10 the sign-off record is selected as the producer selects it: the brief's when it holds the spec's hash (review 8)", brief_record)
+    b.case("RR11 a declaration goes to the finding it names before any row that shares its test (review 9)", explicit_id)
+    b.case("RR12 a decision test whose status and verdict contradict each other did not run (review 3)", contradictory_test)
     b.case("RR1 the model's shape on a clean run; a test reference is reduced to its id", shape)
     b.case("RR2 merging: the same input by its whole name, a shared test across sources, the earlier disposition kept", helpers)
     b.case("RR3 a file the sign-off record holds a hash for counts only while it has that hash (§3)", signed_files)

@@ -33,7 +33,7 @@ KINDS = ("issue", "uncertainty", "assumption")
 DISPOSITIONS = ("open", "declared", "tested", "implemented", "withdrawn")
 DECIDES = ("yes", "no", "unknown")
 LIMITS = {"row": 400, "same_as": 400, "statement": 2000, "note": 4000}       # characters
-MAX_FILE = 4 << 20            # the notes file is read whole; a larger one is not appended to
+MAX_FILE = 4 << 20            # the notes file is read whole; no note is appended that would take it past this
 
 
 def check(note):
@@ -85,7 +85,11 @@ def parse(data):
     """[(line number, note or None, why not, the line's text)] for the notes file's bytes; blank lines are skipped."""
     out = []
     for n, raw in enumerate(data.split(b"\n"), 1):
-        text = raw.decode("utf-8", "replace")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:      # never applied with a byte replaced: shown, in a form that is safe to display
+            out.append((n, None, "it is not valid UTF-8", raw.decode("ascii", "backslashreplace")))
+            continue
         if not text.strip():
             continue
         try:
@@ -104,10 +108,11 @@ def append(root_fd, note, existing=None):
     note, why = check(note)
     if note is None:
         raise ValueError(why)
-    if existing is not None and len(existing) > MAX_FILE:
-        raise ValueError(f"{FILE} is larger than {MAX_FILE >> 20} MB")
     lead = b"\n" if existing and not existing.endswith(b"\n") else b""
-    write_nofollow(root_fd, FILE, lead + encode(note), append=True)
+    line = lead + encode(note)
+    if len(existing or b"") + len(line) > MAX_FILE:     # the reader takes no file above MAX_FILE: nor does the writer make one
+        raise ValueError(f"{FILE} would be larger than {MAX_FILE >> 20} MB with this note, and a file that large is not read")
+    write_nofollow(root_fd, FILE, line, append=True)
 
 
 def now():
@@ -174,8 +179,28 @@ def _self_test():
             except ValueError:          # lib.safe_io.LinkRefused is a ValueError
                 refused = True
             ok("RN6 a notes file that is a link is not written through", refused and os.path.getsize(other) == 0)
+            os.remove(os.path.join(tmp, FILE))
+            line = encode(good[0])
+            for room, fits in ((len(line), True), (len(line) - 1, False)):
+                with open(os.path.join(tmp, FILE), "wb") as f:      # a file with `room` bytes left below the limit
+                    f.write(line + b" " * (MAX_FILE - len(line) - 1 - room) + b"\n")
+                held = open(os.path.join(tmp, FILE), "rb").read()
+                try:
+                    append(fd, good[0], held)
+                    wrote = True
+                except ValueError:
+                    wrote = False
+                size = os.path.getsize(os.path.join(tmp, FILE))
+                ok(f"RN7 a note is appended only when the file with it stays within the limit the reader accepts "
+                   f"({'it fits' if fits else 'one byte over'})",
+                   wrote == fits and size <= MAX_FILE and size == len(held) + (len(line) if fits else 0), f"{wrote}, {size}")
         finally:
             os.close(fd)
+    bad = encode(note("A-1", disposition="withdrawn", note="x")).replace(b'"x"', b'"\xff"')
+    got = parse(bad + encode(good[1]))
+    ok("RN8 a line that is not valid UTF-8 is not applied: it is kept with its number and a readable excerpt, and the next line is read",
+       len(got) == 2 and got[0][1] is None and "UTF-8" in str(got[0][2]) and got[0][0] == 1 and got[0][3].isprintable()
+       and got[1][1] == good[1], str(got))
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
 
