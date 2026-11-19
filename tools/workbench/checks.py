@@ -145,30 +145,50 @@ def signed_spec(run):
 
 
 def artifact_spec(run):
+    """Every analysis file the manifest or the analysis folder lists takes part (§3: a recorded hash that is absent
+    or malformed is never a match), so a file that records no spec cannot drop out of the comparison."""
     title = "Every analysis file was computed from the signed spec"
     arts = run.artifacts()
     so, _ = run.json("decision_spec.signoff.json")
     signed = digest(((so or {}).get("sha256") or {}).get("decision_spec.yaml")) if isinstance((so or {}).get("sha256"), dict) else None
-    env = [a for a in arts if a.get("spec_sha256")]
-    if not env:
+    if not arts:
         return _r("steps.artifact_spec", "steps", title, "not_available",
-                  "No analysis file records the spec it was computed from.", [("analysis/*.yaml", "spec_sha256")], case="C10")
+                  "The run holds no analysis file.", [("analysis/*.yaml", "spec_sha256")], case="C10")
     if not signed:
         return _r("steps.artifact_spec", "steps", title, "not_available",
                   "There is no valid signed spec hash to compare with.", [("decision_spec.signoff.json", "sha256")], case="C10")
-    off = [a for a in env if a["spec_sha256"] != signed]
-    unsigned = [a for a in env if a.get("spec_signed") is False]
+
+    def state(a):
+        if digest(a.get("spec_sha256")) is None:
+            return "no valid spec hash recorded"
+        if a["spec_sha256"] != signed:
+            return "other spec"
+        return "spec not signed when computed" if a.get("spec_signed") is False else "signed spec"
+    states = [state(a) for a in arts]
+    n = {k: states.count(k) for k in ("no valid spec hash recorded", "other spec", "spec not signed when computed")}
     rows = {"columns": ["file", "spec it used", "signed spec", "state"],
-            "rows": [[a["path"], _short(a["spec_sha256"]), _short(signed),
-                      "other spec" if a in off else ("spec not signed when computed" if a in unsigned else "signed spec")]
-                     for a in env]}
-    ev = [("analysis/*.yaml", "spec_sha256"), ("decision_spec.signoff.json", "sha256")]
-    if off or unsigned:
+            "rows": [[a["path"], _short(digest(a.get("spec_sha256"))), _short(signed), s] for a, s in zip(arts, states)]}
+    ev = [("analysis/*.yaml", "spec_sha256, spec_signed"), ("analysis/manifest.json", "artifacts"),
+          ("decision_spec.signoff.json", "sha256")]
+    outside = [a["path"] for a, s in zip(arts, states) if s == "no valid spec hash recorded" and not a.get("in_manifest")]
+    if outside and n["no valid spec hash recorded"] == len(outside) and not n["other spec"] and not n["spec not signed when computed"]:
+        # A file the analysis manifest does not list and that records no spec: the analysis does not claim it, so it
+        # cannot be tied to the signed spec either way. For the reader to judge, and a harness gap, not a mismatch.
+        return _r("steps.artifact_spec", "steps", title, "look",
+                  f"The {len(arts) - len(outside)} analysis file(s) in the manifest record the signed spec "
+                  f"({_short(signed)}). {len(outside)} file(s) in the analysis folder are outside the manifest and "
+                  f"record no spec hash ({', '.join(outside[:4])}{' and more' if len(outside) > 4 else ''}), so nothing "
+                  "ties them to the signed spec.", ev, rows, "C10")
+    if any(n.values()):
+        missing = [a["path"] for a, s in zip(arts, states) if s == "no valid spec hash recorded"]
         return _r("steps.artifact_spec", "steps", title, "problem",
-                  f"{len(off)} analysis file(s) were computed from a spec other than the signed one, "
-                  f"and {len(unsigned)} from an unsigned spec.", ev, rows, "C10")
+                  f"Of {len(arts)} analysis file(s), {n['other spec']} were computed from a spec other than the signed "
+                  f"one, {n['spec not signed when computed']} from a spec that was not signed when they were "
+                  f"computed, and {len(missing)} record no valid spec hash"
+                  + (f" ({', '.join(missing[:4])}{' and more' if len(missing) > 4 else ''})" if missing else "")
+                  + ". A file that does not record the signed spec cannot be said to come from it.", ev, rows, "C10")
     return _r("steps.artifact_spec", "steps", title, "ok",
-              f"All {len(env)} analysis files record the signed spec ({_short(signed)}).", ev, rows, "C10")
+              f"All {len(arts)} analysis files record the signed spec ({_short(signed)}).", ev, rows, "C10")
 
 
 def inputs_fresh(run):
@@ -356,6 +376,34 @@ def _self_test():
         open(os.path.join(d, "run_state.json"), "w").write(json.dumps(["not", "a", "mapping"]))
         ok("K4 fail closed: every check on an unreadable run is not_available, with a sentence",
            all(c["status"] == "not_available" and c["says"] for c in run_all(workbench.Run(d))))
+        def spec_check(name, edit=None):
+            d = os.path.join(tmp, name)
+            os.makedirs(d)
+            workbench._toy(d)
+            if edit:
+                edit(d)
+            return artifact_spec(workbench.Run(d))
+
+        def header(rel, old, new):
+            def edit(d):
+                p = os.path.join(d, rel)
+                text = open(p).read()
+                assert old in text, (rel, old)
+                open(p, "w").write(text.replace(old, new, 1))
+            return edit
+
+        def stray(d):       # a file in analysis/ that the manifest does not list and that records no spec
+            open(os.path.join(d, "analysis", "extra.yaml"), "w").write("producer: toolkit/x.py\nvalues: {a: 1}\n")
+        clean = spec_check("s5clean")
+        null = spec_check("s5null", lambda d: [header("analysis/claims.yaml", "spec_signed: true", "spec_signed: false")(d),
+                                               header("analysis/claims.yaml", "spec_sha256: ", "spec_sha256: null\nwas: ")(d)])
+        short = spec_check("s5short", header("analysis/claims.yaml", "spec_sha256: ", "spec_sha256: abc\nwas: "))
+        extra = spec_check("s5extra", stray)
+        ok("S5 every analysis file takes part in the signed-spec check: an absent or malformed spec hash, or a file the "
+           "manifest lists, is a problem; a file outside the manifest that records none is for the reader to judge",
+           clean["status"] == "ok" and [c["status"] for c in (null, short, extra)] == ["problem", "problem", "look"]
+           and "analysis/claims.yaml" in str(null["rows"]) and "analysis/extra.yaml" in str(extra["rows"])
+           and "no valid spec hash" in null["says"], str([(c["status"], c["says"]) for c in (clean, null, short, extra)]))
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
 

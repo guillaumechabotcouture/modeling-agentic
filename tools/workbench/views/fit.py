@@ -102,6 +102,10 @@ def check_status(m):
         return _r("status", "problem", f"The calibration's status ({m.get('status_word')!r}) says it finished with no "
                   f"block, but the file lists {len(codes)} block(s): {_names(codes)}. The two contradict each other, so "
                   f"neither is relied on.", both, {"columns": t["columns"], "rows": t["rows"]})
+    if f["status"] == "ok" and m.get("conflicting"):
+        return _r("status", "problem", f"The calibration's status ({m.get('status_word')!r}) says it finished with no "
+                  f"block, but the file lists {len(m['conflicting'])} conflicting unit(s) ({_names(m['conflicting'])}). "
+                  f"The two contradict each other, so neither is relied on.", both)
     if f["status"] == "ok":
         return _r("status", "ok", f"The calibration ({f['method']}) finished with status ok and no block.", ev)
     if not codes:
@@ -114,7 +118,7 @@ def check_status(m):
     for b in m["blocks"]:
         ran, said = _covered(b["cover"])
         only_allowed = bool(b["allowance"]) and not b["cover"] and not b["uncovered"] and not b["unsigned"]
-        hole = not only_allowed and (b["uncovered"] or b["unsigned"] or not ran)
+        hole = b.get("conflicting") or (not only_allowed and (b["uncovered"] or b["unsigned"] or not ran))
         bad = bad or bool(hole)
         text = f"{b['code']} ({BLOCK_MEANING.get(b['code'], 'no meaning on record for this code')})"
         text += "" if only_allowed else f" is {said}"
@@ -127,11 +131,19 @@ def check_status(m):
                      f"{b['allowance'][1]} flagged units, which no test covers")
         if b.get("no_allowance"):
             text += f", and no allowance covers its unit(s): {b['no_allowance']}"
+        if b.get("conflicting"):
+            text += (f", and it lists {len(b['conflicting'])} conflicting unit(s) ({_names(b['conflicting'])}), which "
+                     f"no allowance or declaration covers")
         parts.append(text)
     went = {True: "the run proceeded", False: "the run did not proceed", None: "whether the run proceeded is not recorded"}[f["proceeded"]]
     bad = bad or f["proceeded"] is not True
+    clash = m.get("conflicting") or []
+    if clash:        # the method lets no report with a conflicting unit proceed (joint_calibration.py unmatched_decision)
+        bad = True
+        parts.append(f"the file lists {len(clash)} conflicting unit(s) ({_names(clash)}: each can be matched alone, not "
+                     f"together with the others), and the method lets no such report proceed")
     return _r("status", "problem" if bad else "look",
-              f"The calibration is blocked by {len(parts)} block(s) and {went}: " + "; ".join(parts)
+              f"The calibration is blocked by {len(m['blocks'])} block(s) and {went}: " + "; ".join(parts)
               + ("." if bad else ". Declared and signed, so for you to judge.") + _unverified(m, bad), ev,
               {"columns": m["tables"]["blocks"]["columns"], "rows": m["tables"]["blocks"]["rows"]} if rows else None)
 
@@ -887,6 +899,79 @@ def _self_test():
             c = check(look_at(b.edited(hm, both(rewrite(jc_rel, edit), spec_edit(ask)))), "changes")
             need(c["status"] == "problem", f"and a problem where the signed spec asks for it ({c['status']}: {c['says']!r})")
 
+    # ---- cases from the second code review (S<n>: the finding's number) ----
+    def flagged_pair_id():
+        return next(p["id"] for p in data(folder(hm, "C2_change_flagged"), jc_rel)["survey_changes"]["pairs"] if p["group"] == "G2")
+
+    def found(pid, test):
+        """An edit: findings.jsonl with one declared row for the pair, naming a decision test."""
+        import json
+
+        def edit(d):
+            with open(os.path.join(d, "findings.jsonl"), "w", encoding="utf-8") as f:
+                f.write(json.dumps({"id": f"change:{pid}", "status": "declared",
+                                    "decision_test": {"file": f"models/decision_tests/{test}.yaml"}}) + "\n")
+        return edit
+
+    def f_s3():
+        own = flagged_pair_id()
+        declare = scope((f"calibration_change_discrepancy:change:{own}", "DT1"))
+        c = check(look_at(b.edited(hm, declare, "C2_change_flagged")), "changes")
+        need(c["status"] == "look" and "dt1" in says(c), f"with the signed spec verified, the declaration covers the pair ({c['status']})")
+        for name, edit in (("scope_declaration.yaml", declare), ("findings.jsonl", found(own, "DT1"))):
+            c = check(look_at(b.edited(hm, both(no_copy, edit), "C2_change_flagged")), "changes")
+            need(c["status"] == "problem" and "dt1" not in says(c) and "no signed spec could be verified" in says(c),
+                 f"with no verified signed spec a declaration in {name} excuses nothing ({c['status']}: {c['says']!r})")
+
+    def f_s4():
+        def conflict(doc):
+            jc = doc["data"]
+            jc.update(status="blocked", blocked=True, conflicting=["U01"],
+                      blocks=[{"code": "unmatched_units", "detail": {"unmatched": [], "conflicting": ["U01"]}}])
+            jc["units"]["U01"].update(status="conflicting", matched=False)
+            jc["unmatched_decision"].update(proceed=True, flagged=[{"unit": "U01", "status": "conflicting", "reason": "r"}])
+        c = check(look_at(b.edited(hm, rewrite(jc_rel, conflict))), "status")
+        need(c["status"] == "problem" and "conflicting unit" in says(c) and "inside the signed spec's allowance" not in says(c),
+             f"a conflicting unit is never inside the allowance, even flagged and under the maximum ({c['status']}: {c['says']!r})")
+
+        def beside(doc):       # the report lists a conflicting unit that no block names, beside a unit miss inside the allowance
+            unit_miss(doc)
+            doc["data"]["conflicting"] = ["U02"]
+        c = check(look_at(b.edited(hm, rewrite(jc_rel, beside))), "status")
+        need(c["status"] == "problem" and "conflicting unit" in says(c),
+             f"a report that lists conflicting units is a problem whatever its blocks name ({c['status']}: {c['says']!r})")
+
+        def matched_with_conflict(doc):
+            doc["data"]["conflicting"] = ["U02"]
+        c = check(look_at(b.edited(hm, rewrite(jc_rel, matched_with_conflict))), "status")
+        need(c["status"] == "problem" and "contradict" in says(c),
+             f"a status of success beside a conflicting unit is a contradiction ({c['status']}: {c['says']!r})")
+
+    def f_s2():
+        import workbench
+
+        def to_block(spec):
+            spec["calibration"]["joint"]["unmatched"]["mode"] = "block"
+        d = b.edited(hm, both(rewrite(jc_rel, unit_miss), spec_edit(to_block)))
+        p = os.path.join(d, SIGNED)
+        signed_text, st = open(p, encoding="utf-8").read(), os.stat(p)
+        need("mode: block" in signed_text, "the signed copy sets mode block")
+        forged = signed_text.replace("mode: block", "mode: flag ")       # the same size, another document
+
+        def put(text):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+        put(forged)
+        c = check(view(workbench.Run(d)), "status")
+        need(c["status"] == "problem" and "no signed spec could be verified" in says(c),
+             f"a copy whose hash the sign-off record does not hold authorises nothing ({c['status']}: {c['says']!r})")
+        put(signed_text)       # the signed bytes again, with the size and modification time the forged copy had
+        c = check(view(workbench.Run(d)), "status")
+        need(c["status"] == "problem" and "mode is 'block'" in c["says"],
+             f"the spec that is parsed is the bytes that were hashed, not a document kept from an earlier read of a "
+             f"file of the same size and time ({c['status']}: {c['says']!r})")
+
     case("F1 history matching, clean fixture: the eleven checks, every one ok or not recorded by the method", f1)
     case("F2 posterior, clean fixture: six checks ok, five not_available naming the method", f6)
     case("F3 every check carries one sentence, the file and field read, and its scorecard case", f9)
@@ -911,6 +996,9 @@ def _self_test():
     case("R7 the producer's status words are mapped to the generic ones; an unknown word is not_available and named", f_status_words)
     case("R8 a status that contradicts the block list is a problem", f_contradiction)
     case("R9 a change pair that could not be computed is carried through with its reason", f_uncomputed)
+    case("S2 the signed spec is hashed and parsed from one read; a parse kept from other bytes is never used", f_s2)
+    case("S3 with no verified signed spec, scope_declaration.yaml and findings.jsonl excuse no flagged pair", f_s3)
+    case("S4 conflicting units are outside the unit allowance and always a problem", f_s4)
     return b.done()
 
 

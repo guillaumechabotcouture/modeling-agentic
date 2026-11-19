@@ -11,6 +11,18 @@ Serves tools/workbench/static/ on 127.0.0.1 only and makes no outbound call. It 
 to a run. It imports no engine and no harness loader; every read goes through a descriptor that lib.safe_io opens with
 no link followed (dir_fd_nofollow, open_nofollow), confined to the run directory as it was found at discovery.
 
+Limit: the workbench is for the owner's own stored runs, and it does not defend against run files being replaced
+while it reads them. Known places where two reads are assumed to see the same thing:
+  - discovery finds a run folder by its path and its identity (device, inode) is recorded a moment later, so a
+    folder swapped in between is the one that gets pinned;
+  - a check that compares a file's hash with a recorded one (Run.sha) and a view that parses the same file
+    (Run.json, Run.large, Run.envelope) read it separately; the one exception is the signed spec copy, which the Fit
+    view hashes and parses from a single read (Run.hashed), because declarations and allowances count from it;
+  - Run.large keeps a parsed file by its path, size and modification time, so a file rewritten with the same size
+    and time is not parsed again;
+  - a Run keeps what it read (hashes, parsed files, the artifact list) for its own lifetime, one request.
+A stored run is not expected to change; a run still being written may show a mix of old and new files for a moment.
+
 A view is a module views/<name>.py whose `view(run)` returns {checks, facts, tables, charts, notes}; the page
 (static/) draws any such result and has no code for a particular view. GET /api/view?run=<id>&view=<name> returns
 it. A chart is a declaration over one of the result's tables (CHART_KEYS lists every key a view may use):
@@ -80,6 +92,7 @@ MAX_PARSE = 4 << 20          # a JSON or YAML file larger than this is not parse
 MAX_LARGE = 64 << 20         # Run.large reads up to this much, with the C loader, and keeps the result
 LARGE_KEPT = 96 << 20        # source bytes of parsed files kept in the server's memory (least recently used goes first)
 _LARGE, _LARGE_LOCK, LARGE_PARSES = {}, threading.Lock(), [0]     # (run, rel) -> (size, mtime_ns, result); a count
+_HASHED, HASHED_KEPT = {}, 16     # sha256 of the bytes read -> (parsed document, why not): Run.hashed
 WALK_LIMIT = 20000           # files looked at when finding the last one written; a larger run folder says it was cut short
 HEAD = 256 << 10             # an artifact's envelope (everything before `data:`) sits in its first bytes
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "data", "figures", "analysis", "models", "evidence_planner"}
@@ -403,6 +416,29 @@ class Run:
             while len(_LARGE) > 1 and sum(v[0] for v in _LARGE.values()) > LARGE_KEPT:
                 _LARGE.pop(next(iter(_LARGE)))
             return out
+
+    def hashed(self, rel):
+        """(sha256, parsed YAML mapping or None, why_not) of a file from ONE read: the bytes that are hashed are the
+        bytes that are parsed, so a hash that verifies speaks for the document returned. A parse is kept by its
+        digest alone (never by path, size or time), so it can only be given back for the same bytes. sha256 is None
+        when the file cannot be read or is larger than MAX_LARGE. The caller must not change the document."""
+        b, why = self.read(rel, MAX_LARGE + 1)
+        if b is None:
+            return None, None, why
+        if len(b) > MAX_LARGE:
+            return None, None, f"{rel} is larger than {MAX_LARGE >> 20} MB and is not read"
+        sha = hashlib.sha256(b).hexdigest()
+        with _LARGE_LOCK:
+            if sha not in _HASHED:
+                try:
+                    d = yaml.load(b, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+                    _HASHED[sha] = (d, None) if isinstance(d, dict) else (None, "it is not a mapping")
+                except (ValueError, yaml.YAMLError) as e:
+                    _HASHED[sha] = (None, f"it could not be parsed ({' '.join(str(e).split())[:120]})")
+                while len(_HASHED) > HASHED_KEPT:
+                    _HASHED.pop(next(iter(_HASHED)))
+            d, bad = _HASHED[sha]
+        return sha, d, (f"{rel}: {bad}" if bad else None)
 
     def envelope(self, rel):
         """A harness artifact's header (schema, producer, spec_sha256, inputs, written_at): the YAML before its
@@ -869,12 +905,14 @@ def _self_test():
                wb.api_view(rid, "model")["checks"][0]["status"] == "not_available"
                and wb.api_view(rid, "fit") == {"checks": [], "facts": {"x": None}, "tables": {}, "charts": [], "notes": {}})
             o = wb.api_view(rid, "overview")
-            order = [c["status"] for c in o["checks"]]
+            mine = [c for c in o["checks"] if c["step"] in ("spec", "model", "fit", "steps")]   # the views this case sets up
+            order = [c["status"] for c in mine]
             ok("W22 the overview gathers the checks of every view that exists: views in reading order whatever their "
                "statuses, worst first within a view, each check naming its view",
-               [c["step"] for c in o["checks"]] == ["spec", "model"] + ["steps"] * 8 and order[2] == "problem"
+               [c["step"] for c in mine] == ["spec", "model"] + ["steps"] * 8 and order[2] == "problem"
                and order[2:] == sorted(order[2:], key=checks.WORST_FIRST.index)
-               and o["facts"]["checks_problem"] == order.count("problem") and o["facts"]["question"] == "toy question", str(order))
+               and [c["step"] for c in o["checks"]][:len(mine)] == [c["step"] for c in mine]
+               and o["facts"]["checks_problem"] == [c["status"] for c in o["checks"]].count("problem") and o["facts"]["question"] == "toy question", str(order))
         finally:
             for k in ("spec", "model", "fit"):
                 VIEW_FNS.pop(k)

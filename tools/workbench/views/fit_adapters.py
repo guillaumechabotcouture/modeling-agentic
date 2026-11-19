@@ -123,12 +123,16 @@ def _spec(run):
     could be verified or None). §3: the signed copy is read wherever it and the spec on disk differ. It is verified
     only when its sha256 is the one the sign-off record holds for the spec; declarations and allowances count from
     a verified copy only, and a copy that is not verified is read for names alone."""
-    signed, disk = run.sha(SIGNED), run.sha(SPEC)
+    # One read of the signed copy: the digest compared with the sign-off record is of the bytes that are parsed
+    # (Run.hashed), so an allowance can only come from the document whose hash verified.
+    signed, spec, why = run.hashed(SIGNED)
+    disk = run.sha(SPEC)
     so, so_why = run.json(SIGNOFF)
     want = _get(so, "sha256", SPEC)
     want = want if isinstance(want, str) and re.fullmatch(r"[0-9a-f]{64}", want) else None
     rel = SIGNED if signed else SPEC
-    spec, why = run.large(rel)
+    if not signed:
+        _, spec, why = run.hashed(SPEC)
     if not signed:
         unverified = f"the run has no readable signed copy of the spec ({SIGNED})"
     elif so is None:
@@ -292,6 +296,8 @@ def _history_matching(run, doc):
                 (s.get("target"), s.get("offset"), s.get("decision_test")) == (d.get("target"), d.get("offset"), d.get("decision_test"))
                 for s in signed_list)})
     flagged_units = {str(f.get("unit")) for f in _get(jc, "unmatched_decision", "flagged") or [] if isinstance(f, dict)}
+    conflicting = jc.get("conflicting")        # the report's own list; anything but an empty list is named
+    conflicting = [str(x) for x in conflicting] if isinstance(conflicting, (list, tuple)) else ([str(conflicting)] if conflicting else [])
     mode, max_units = (_get(signed_spec, "calibration", "joint", "unmatched", k) for k in ("mode", "max_units"))
     max_units = max_units if isinstance(max_units, int) and not isinstance(max_units, bool) else None
     no_allowance = (f"no signed spec could be verified ({unverified})" if unverified else
@@ -313,15 +319,22 @@ def _history_matching(run, doc):
             need = [str(x) for x in det_d.get("targets") or []] + [str(x) for x in det_d.get("blocks") or []] + [
                 str(x) for comp in det_d.get("by_component") or [] if isinstance(comp, dict) for x in comp.get("blocks") or []]
             cover = [d for d in declared if d["key"] in named]
-            loose = [str(x) for k in ("units", "unmatched", "conflicting") for x in det_d.get(k) or []]
-            allowed = bool(loose) and set(loose) <= flagged_units and not no_allowance and len(flagged_units) <= max_units
+            loose = [str(x) for k in ("units", "unmatched") for x in det_d.get(k) or []]
+            # Conflicting units are outside the allowance: the producer lets no report that lists one proceed
+            # (toolkit/analysis/joint_calibration.py unmatched_decision: `and not rep.get("conflicting")`;
+            # _blocks_consistent: `d.get("conflicting") == []`).
+            clash = [str(x) for x in det_d.get("conflicting") or []] if isinstance(det_d.get("conflicting"), (list, tuple)) \
+                else ([str(det_d["conflicting"])] if det_d.get("conflicting") else [])
+            allowed = (bool(loose) and not clash and not conflicting and set(loose) <= flagged_units and not no_allowance
+                       and len(flagged_units) <= max_units)
             info = {"code": str(b.get("code")), "cover": [_cover(tests, d["test"], "unmatched_decision.declared")
                                                            for d in cover if d["signed"] and d["test"]],
                     "unsigned": [d["key"] for d in cover if not d["signed"] or not d["test"]],
                     "uncovered": [x for x in need if x not in {d["key"] for d in cover}]
                                  + ([] if allowed or not loose else [f"{len(loose)} unit(s)"])
-                                 + ([] if need or loose else ["the block names no target, offset or unit a declaration could cover"]),
-                    "allowance": (len(loose), max_units) if allowed else None,
+                                 + ([f"{len(clash)} conflicting unit(s)"] if clash else [])
+                                 + ([] if need or loose or clash else ["the block names no target, offset or unit a declaration could cover"]),
+                    "allowance": (len(loose), max_units) if allowed else None, "conflicting": clash,
                     "no_allowance": no_allowance if loose and not allowed else None}
             block_info.append(info)
             ok = bool(info["cover"]) and not info["unsigned"] and not [x for x in need if x not in {d["key"] for d in cover}]
@@ -333,8 +346,10 @@ def _history_matching(run, doc):
     def change_cover():
         """[the declarations that cover each pair, in the pairs' order]: scope_declaration.yaml and findings.jsonl
         cover the one pair whose id they name; the method's list, where the signed spec holds the entry, covers the
-        pairs of the group it names (§3a)."""
-        out = {}
+        pairs of the group it names (§3a). With no verified signed spec nothing excuses anything (§3): every
+        pair's list is empty, whatever those two files hold."""
+        if unverified:
+            return [[] for _ in pairs or []]
         scope, _ = run.large("scope_declaration.yaml")
         found, _ = run.read("findings.jsonl", 8 << 20)
         rows = []
@@ -472,7 +487,7 @@ def _history_matching(run, doc):
         "file": JC, "facts": facts, "why": why, "notes": notes,
         "tables": {k: _table(k, v, about.get(k, ""), labels.get(k)) if v is not None else None for k, v in tables.items()},
         "blocks": block_info, "change_cover": _part(why, "declarations", change_cover) or [], "widest": widest,
-        "status_word": word, "unverified": unverified,
+        "status_word": word, "unverified": unverified, "conflicting": conflicting,
         "changes_uncomputed": uncomputed, "changes_asked": _get(spec, "calibration", "joint", "changes") is not None,
         "change_ids": [p.get("id") for p in pairs or []],
         "changes_reason": " ".join(str(sc.get("reason")).split()) if sc.get("status") != "computed" and sc.get("reason") else None,
@@ -618,7 +633,7 @@ def _posterior(run, doc):
         "file": CAL, "facts": facts, "why": why, "notes": notes,
         "tables": {k: _table(k, v, about.get(k, ""), labels.get(k)) if v is not None else None for k, v in tables.items()},
         "blocks": [], "change_cover": [], "widest": widest, "min_accepted": None,
-        "status_word": dg.get("converged"), "unverified": unverified, "changes_uncomputed": {}, "changes_asked": False, "change_ids": [],
+        "status_word": dg.get("converged"), "unverified": unverified, "conflicting": [], "changes_uncomputed": {}, "changes_asked": False, "change_ids": [],
         "changes_reason": None,
         "fields": {"targets": "data.diagnostics.fit", "parameters": "data.priors, data.sample.rows, data.theta or data.map",
                    "changes": "data", "blocks": "data", "status": "data.diagnostics.converged", "units": "data",

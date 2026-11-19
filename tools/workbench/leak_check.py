@@ -18,27 +18,41 @@ digits, truncated and rounded to every length from four up, so a run's long valu
 in a committed file. Small integers (counts) and year-like values (1900 to 2100, with or without a fraction) are
 not checked: the specification may quote counts.
 
+How a number is read (`numbers`): in a CSV file the row is split on its delimiter first, so `1,0.25` is two numbers;
+elsewhere a comma is a thousands separator only when every group after the first has exactly three digits and no
+decimal part comes before it (`58,203,117` is one number, `1,0.25` and `7,1234` are two). A decimal may start with
+its point (`.25`).
+
 A run holds millions of numbers, so an ordinary constant can match one by chance. tools/workbench/leak_allow.txt
-lists such matches after review, one per line: `file, number, reason`. An entry passes that number in that file
-only, needs a reason, and is never to be used for a value that was read from a run.
+lists such matches after review, one per line: `file, number, reason`. An entry passes that exact numeric value
+(its sign and scale: an entry for 1.25 does not pass 125 or -1.25) in that file only, needs a reason, and is
+never to be used for a value that was read from a run.
 
 Residual: a value restated in other units, or to fewer than four digits, is not caught; the rule in the
-specification, not this check, keeps those out.
+specification, not this check, keeps those out. Nor is a number split across a line break, a grouped number in a
+quoted CSV field that spans lines, or a CSV whose delimiter is not a comma and whose values use a decimal comma.
 """
 from __future__ import annotations
 
+import csv
 import os
 import re
 import subprocess
 import sys
 import tempfile
+from decimal import Decimal, InvalidOperation
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 SPEC = "docs/design/review-workbench.md"
 PATHS = ("tools/workbench", SPEC)                    # what the workbench commits
 ALLOW = "tools/workbench/leak_allow.txt"
-NUM = re.compile(r"(?<![\w.])-?\d[\d,]*\.?\d*(?:[eE][-+]?\d+)?(?![\w])")
+# A number as written in text. PLAIN: digits with an optional decimal part, or a decimal part alone (.5); a comma
+# is never part of it. NUM also reads grouped thousands (58,203,117): a comma belongs to the number only when every
+# group after the first has exactly three digits, no decimal part comes before it and no further `,digit` follows.
+_TAIL = r"(?:[eE][-+]?\d+)?(?!\w)"
+PLAIN = re.compile(r"(?<![\w.])-?(?:\d+(?:\.\d*)?|\.\d+)" + _TAIL)
+NUM = re.compile(r"(?<![\w.])-?(?:(?:\d{1,3}(?:,\d{3})+(?!\d|,\d)|\d+)(?:\.\d*)?|\.\d+)" + _TAIL)
 MIN_DIGITS = 4
 CHUNK = 1 << 20                                      # a run file is read this many characters at a time
 REACH = 4096                                         # how far back from a piece's end a place to cut is looked for
@@ -49,7 +63,7 @@ def digits(tok):
     """The significant digits of a number token, or None when it is not one this check compares."""
     t = tok.replace(",", "").lstrip("-")
     mant = re.split(r"[eE]", t)[0]
-    if not re.fullmatch(r"\d+\.?\d*", mant):
+    if not re.fullmatch(r"\d+\.?\d*|\.\d+", mant):
         return None
     if 1900 <= float(mant) <= 2100 and "e" not in t.lower():
         return None                                  # a year or a point in time
@@ -60,6 +74,48 @@ def digits(tok):
     else:
         sig = sig.rstrip("0") if len(mant.lstrip("0")) >= 5 else ""
     return sig if len(sig) >= MIN_DIGITS else None
+
+
+def value(tok):
+    """The exact numeric value of a number token (sign and scale kept; a trailing zero changes nothing), or None."""
+    try:
+        return Decimal(tok.replace(",", ""))
+    except InvalidOperation:
+        return None
+
+
+def is_csv(path):
+    return path.lower().endswith(".csv")
+
+
+def numbers(text, csv_rows=False):
+    """The number tokens of a text. In the rows of a CSV file (`csv_rows`) the delimiter is split on first: a comma
+    there never joins two fields into one number, and a quoted field is read as text on its own. Elsewhere a comma
+    is a thousands separator only under NUM's rule; a grouped number with a decimal part may also be two values
+    written with no space between them (a short integer, then a decimal), so its last group with the decimal part
+    is given as a number too."""
+    if csv_rows:
+        if '"' not in text:
+            for m in PLAIN.finditer(text):
+                yield m.group(0)
+            return
+        for line in text.split("\n"):
+            if '"' not in line:
+                for m in PLAIN.finditer(line):
+                    yield m.group(0)
+                continue
+            try:
+                fields = next(csv.reader([line]), [])
+            except csv.Error:
+                fields = [line]
+            for field in fields:
+                yield from numbers(field)
+        return
+    for m in NUM.finditer(text):
+        tok = m.group(0)
+        yield tok
+        if "," in tok and "." in tok:
+            yield tok.rsplit(",", 1)[1]
 
 
 def forms(sig):
@@ -79,8 +135,9 @@ def is_text(path):
 
 def pieces(path, chunk=CHUNK):
     """The text of a file in pieces of about `chunk` characters, so a file of any size is read without being held
-    whole. A piece ends after a character that cannot be part of a number; where the last REACH characters hold none
-    (a long row of values with no space), it ends after a comma, which separates values in such a row."""
+    whole. A piece ends at the end of a line where it holds one (so a CSV row is read whole). Otherwise it ends after
+    a character that cannot be part of a number; where the last REACH characters hold none (a long row of values with
+    no space), it ends after a comma, which separates values in such a row."""
     with open(path, errors="replace") as f:
         tail = ""
         while True:
@@ -90,6 +147,11 @@ def pieces(path, chunk=CHUNK):
                 if text:
                     yield text
                 return
+            k = text.rfind("\n") + 1
+            if k:
+                yield text[:k]
+                tail = text[k:]
+                continue
             k, lo = len(text), max(0, len(text) - REACH)
             while k > lo and (text[k - 1].isalnum() or text[k - 1] in "_.,+-"):
                 k -= 1
@@ -121,9 +183,9 @@ def held(run_dirs, wanted, chunk=CHUNK):
                 try:
                     if os.path.islink(p) or not os.path.isfile(p) or not is_text(p):
                         continue                     # a link is not followed; a binary file holds no text number
+                    rows = is_csv(p)
                     for text in pieces(p, chunk):
-                        for m in NUM.finditer(text):
-                            tok = m.group(0)
+                        for tok in numbers(text, rows):
                             if len(tok) < MIN_DIGITS:
                                 continue
                             sig = digits(tok)
@@ -135,7 +197,7 @@ def held(run_dirs, wanted, chunk=CHUNK):
 
 
 def entry(line):
-    """(file, digit string, reason) of a line of the allow file, or None for a blank or comment line; a line that
+    """(file, exact numeric value, reason) of a line of the allow file, or None for a blank or comment line; a line that
     is neither raises ValueError saying what it lacks."""
     line = line.strip()
     if not line or line.startswith("#"):
@@ -145,11 +207,13 @@ def entry(line):
         raise ValueError("an entry is `file, number, reason`, and the reason is required")
     if digits(parts[1]) is None:
         raise ValueError(f"{parts[1]!r} is not a number this check compares (write it without thousands separators)")
-    return parts[0], digits(parts[1]), parts[2]
+    if not NUM.fullmatch(parts[1]) or "," in parts[1] or value(parts[1]) is None:
+        raise ValueError(f"{parts[1]!r} is not one number (write it without thousands separators)")
+    return parts[0], value(parts[1]), parts[2]
 
 
 def load_allow(repo=REPO, rel=ALLOW):
-    """({(file, digit string)} of the reviewed chance matches, [(file, line, why)] for every entry refused). No
+    """({(file, exact numeric value)} of the reviewed chance matches, [(file, line, why)] for every entry refused). No
     allow file means no entry."""
     allow, bad = set(), []
     try:
@@ -190,10 +254,12 @@ def _scan(run_dirs, lines, problems, allow, chunk, allow_file):
                 text = e[2] if e else text
             except ValueError:
                 pass
-        toks += [(label, rel, n, m.group(0), digits(m.group(0))) for m in NUM.finditer(text)]
+        toks += [(label, rel, n, tok, digits(tok)) for tok in numbers(text, is_csv(rel))]
     wanted = {t[4] for t in toks if t[4]}
     found, lost = held(run_dirs, wanted, chunk)       # also when nothing is wanted: a run that cannot be read is said
-    return problems + lost + [(label, n, tok) for label, rel, n, tok, sig in toks if sig in found and (rel, sig) not in allow]
+    # Candidates are found on significant digits; an allow entry passes one exact value (sign and scale) in one file.
+    return problems + lost + [(label, n, tok) for label, rel, n, tok, sig in toks
+                              if sig in found and (rel, value(tok)) not in allow]
 
 
 def check(run_dirs, files, repo=REPO, allow=(), chunk=CHUNK, allow_file=ALLOW):
@@ -217,13 +283,21 @@ def added_lines(rng, repo=REPO, paths=PATHS):
     base, sep, tip = rng.partition("..")
     if not (sep and base and tip) or rng.startswith("-") or "..." in rng or any(c.isspace() for c in rng):
         raise OSError(f"{rng!r} is not a range of the form <base>..<head>")
+    # The prefixes are stated, so a reader's diff.noprefix or diff.mnemonicPrefix cannot change the headers read below.
     r = subprocess.run(["git", "-C", repo, "-c", "core.quotePath=false", "log", "-p", "-m", "-U0", "--no-color",
-                        "--no-ext-diff", "--no-textconv", "--no-renames", "--format=%x00commit %H", rng, "--", *paths],
-                       capture_output=True)
+                        "--no-ext-diff", "--no-textconv", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
+                        "--format=%x00commit %H", rng, "--", *paths], capture_output=True)
     if r.returncode != 0:
         raise OSError(f"git could not list the commits of {rng} ({r.stderr.decode(errors='replace').strip()[:200]})")
+    return _added(r.stdout.decode(errors="replace"))
+
+
+def _added(text):
+    """The added lines in the output of `git log -p` as added_lines asks for it. Fail closed: a destination header
+    that is neither `+++ b/<file>` nor `+++ /dev/null`, or a hunk with no such header before it, raises OSError
+    instead of being passed over (the lines under it would otherwise go unread)."""
     out, commit, rel, n, left = [], None, None, 0, 0
-    for line in r.stdout.decode(errors="replace").split("\n"):
+    for line in text.split("\n"):
         if left and line[:1] in "+-\\":             # inside a hunk: its lines are counted, never read as headers
             if line[:1] == "+":
                 out.append((commit, rel, n, line[1:]))
@@ -232,10 +306,21 @@ def added_lines(rng, repo=REPO, paths=PATHS):
         left = 0
         if line.startswith("\0commit "):
             commit, rel = line[8:].strip(), None
+        elif line.startswith("diff "):
+            rel = None                               # a new file: its destination header must follow
         elif line.startswith("+++ "):
-            rel = line[6:] if line[4:6] == "b/" else None       # +++ /dev/null: the file was deleted
-        elif (m := re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)) and rel is not None:
-            n, left = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
+            if line == "+++ /dev/null":
+                rel = False                          # the file was deleted: its hunks add nothing
+            elif line.startswith("+++ b/") and len(line) > 6:
+                rel = line[6:].rstrip("\t")
+            else:
+                raise OSError(f"a destination header git wrote is not one this check reads ({line[:80]!r})")
+        elif line.startswith("@@"):
+            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
+            if m is None or rel is None:
+                raise OSError(f"a hunk has no destination header this check reads before it, or is not a plain hunk ({line[:80]!r})")
+            if rel is not False:
+                n, left = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
     return out
 
 
@@ -357,6 +442,37 @@ def _self_test():
             assert sorted(where(later)) == want, f"a later clean-up commit does not hide it ({later})"
             return none == []
         ok("R12a --range scans the lines each commit of the range adds, whatever the working tree holds now", history)
+        def prefixes():
+            want = sorted(where(check_range(runs, f"{git('rev-list', '--max-parents=0', 'HEAD')}..HEAD", repo, paths=("d",))))
+            assert want, "the range has hits to lose"
+            for key in ("diff.noprefix", "diff.mnemonicPrefix"):
+                git("config", key, "true")
+                try:
+                    got = sorted(where(check_range(runs, f"{git('rev-list', '--max-parents=0', 'HEAD')}..HEAD", repo, paths=("d",))))
+                finally:
+                    git("config", "--unset", key)
+                assert got == want, f"with {key} set the range scan finds the same lines ({got})"
+            return True
+        ok("S6a --range reads the same added lines whatever the reader's git display settings (diff.noprefix, "
+           "diff.mnemonicPrefix)", prefixes)
+
+        def header():
+            head = "\0commit " + "a" * 40 + "\n\ndiff --git a/d/x.md b/d/x.md\n--- a/d/x.md\n"
+            hunk = "@@ -0,0 +1 @@\n+line\n"
+            assert _added(head + "+++ b/d/x.md\n" + hunk) == [("a" * 40, "d/x.md", 1, "line")], "the form asked for is read"
+            assert _added(head.replace("--- a/d/x.md", "--- /dev/null") + "+++ /dev/null\n") == [], "a deleted file adds nothing"
+            for odd in ("+++ d/x.md\n", "+++ w/d/x.md\n", '+++ "b/d/x.md"\n'):
+                try:
+                    _added(head + odd + hunk)
+                except OSError:
+                    continue
+                raise AssertionError(f"a destination header that is not `+++ b/<file>` is refused, not skipped ({odd!r})")
+            try:
+                _added("\0commit " + "a" * 40 + "\n\n@@ -0,0 +1 @@\n+line\n")
+            except OSError:
+                return True
+            raise AssertionError("a hunk with no destination header before it is refused")
+        ok("S6b --range fails closed on a destination header it does not recognise", header)
         ok("R12b --range fails closed when git cannot list the commits",
            lambda: all(check_range(runs, r, repo, paths=("d",)) and "could not" in str(check_range(runs, r, repo, paths=("d",))[0][2])
                        for r in ("no-such-ref..HEAD", "HEAD", "..", "--all..HEAD")))
@@ -374,6 +490,56 @@ def _self_test():
             return where(quoted) == [("allow.txt", 1)]
         ok("R13b leak_allow.txt passes a reviewed chance match by file and number; each entry needs a reason, and a "
            "reason is itself scanned", allowed)
+
+        # ---- second code review, findings 7 and 8. Invented values; the short forms are cut at run time. ----
+        v7, w7, grouped = "0.381726450917", "419.265830746", "58,203,117"
+        u7 = "345.607182934"
+
+        def tokens():
+            two = f"1,{v7}"
+            assert list(numbers(two)) == ["1", v7], f"a comma before a decimal joins nothing ({list(numbers(two))})"
+            assert list(numbers(f"total {grouped} doses")) == [grouped], "groups of three digits in prose are one number"
+            assert list(numbers("7,1234 and 0.5,123 and 1,234,5678")) == ["7", "1234", "0.5", "123", "1", "234", "5678"], \
+                f"a comma joins only groups of exactly three digits ({list(numbers('7,1234 and 0.5,123 and 1,234,5678'))})"
+            lead = v7[1:6]
+            assert list(numbers(f"X = {lead}")) == [lead] and digits(lead) == v7[2:6] and digits("-" + lead) == v7[2:6], \
+                f"a decimal with no digit before its point is read ({list(numbers(f'X = {lead}'))})"
+            assert list(numbers("obj.1234 v1.2.3456")) == [], "an attribute or a version part is not a leading-dot decimal"
+            assert list(numbers(f"[5,{v7},8]")) == ["5", v7, "8"], "a list of values is not joined"
+            amb = f"12,{w7}"
+            assert list(numbers(amb)) == [amb, w7], f"a token that may be one number or two values is read both ways ({list(numbers(amb))})"
+            rows = [["12", "345", "678"], ["9", "100", "20.5"]]
+            assert list(numbers("\n".join(",".join(r) for r in rows), True)) == rows[0] + rows[1], "a CSV row is split on its delimiter"
+            assert list(numbers(f'a,"{grouped}",3\n', True)) == [grouped, "3"], "a quoted CSV field is one field"
+            return True
+        ok("S7a the tokenizer: CSV fields are never joined, grouped thousands in prose are one number, a leading-dot "
+           "decimal is read", tokens)
+
+        def csv_values():
+            put(run, "table.csv", f"k,v\n1,{v7}\n2,{w7},\n")
+            put(run, "list.json", "[" + ",".join(["12", u7, "7"]) + "]")
+            put(repo, "d/s7.py", f"A = {v7[:6]}\nB = {v7[1:6]}\nC = {w7[:6]}\nD = {u7[:7]}\n")
+            try:
+                return where(check(runs, ["d/s7.py"], repo)) == [("d/s7.py", 1), ("d/s7.py", 2), ("d/s7.py", 3), ("d/s7.py", 4)]
+            finally:
+                os.remove(os.path.join(run, "table.csv"))
+                os.remove(os.path.join(run, "list.json"))
+        ok("S7b a value in a run's CSV row, after another field, is found; so is one committed with a leading dot, and "
+           "one after a short integer in a run's list", csv_values)
+
+        def exact():
+            scaled, neg = f"{short[2:4]}.{short[4:6]}", "-" + short
+            put(repo, "d/s8.py", f"X = {short}\nY = {scaled}\nZ = {neg}\nW = {short}0\n")
+            put(repo, "allow8.txt", f"d/s8.py, {short}, an invented test constant\n")
+            allow, bad = load_allow(repo, "allow8.txt")
+            hits = check(runs, ["d/s8.py"], repo, allow=allow)
+            assert not bad and where(check(runs, ["d/s8.py"], repo)) == [("d/s8.py", k) for k in (1, 2, 3, 4)], "all four match the run"
+            assert where(hits) == [("d/s8.py", 2), ("d/s8.py", 3)], \
+                f"an entry passes its own value (a trailing zero is the same value), not another scale or sign of the same digits ({hits})"
+            put(repo, "allow8.txt", f"d/s8.py, {neg}, an invented test constant\n")
+            return where(check(runs, ["d/s8.py"], repo, allow=load_allow(repo, "allow8.txt")[0])) == [("d/s8.py", k) for k in (1, 2, 4)]
+        ok("S8 an allow entry passes the exact numeric value in its file (sign and scale), not every number with the "
+           "same digits", exact)
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
 
