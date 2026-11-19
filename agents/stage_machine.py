@@ -1287,6 +1287,14 @@ class Machine:
             # amended spec cannot be re-signed in a signed run dir): the request, then a pause; the owner amends and
             # relaunches with reuse
             req = rethink_request(self.run_dir, self.st.round)
+            sha = _spec_signed_sha(self.run_dir)
+            ev = "present" if sha not in (None, "unreadable") else ("unreadable" if sha else "missing")
+            if req.get("signing_evidence") != ev:        # a warning on the request, never a block (lead follow-up)
+                req = dict(req, signing_evidence=ev)
+                _write_json(self.run_dir, SPEC_RETHINK_REQUEST, req)
+            if ev != "present":
+                self.log(f"[machine] WARNING: the spec's sign-off record is {ev}; the amendment pause holds, but the "
+                         "relaunch must start from a signed spec")
             self.st.tries["spec_amendment"] = True     # honoured on resume, whatever a restored copy lost (#261 P1-2)
             self.st.paused, self.st.status = AWAITING_SPEC_AMENDMENT, None
             save_state(self.run_dir, self.st)
