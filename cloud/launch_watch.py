@@ -220,6 +220,8 @@ def missing_action(st, missing_since, relaunched, now, window_s):
     if not st or st["cluster"] != "running":
         return None
     for lb, r in st["runs"].items():
+        if r["state"] == "unknown":       # this poll could not read the label: its timer neither starts nor resets
+            continue
         if r["state"] != "missing":
             missing_since.pop(lb, None)
             continue

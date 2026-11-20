@@ -740,8 +740,11 @@ class RunState:
         def loop():
             while not self._stop.wait(STATE_BEAT_S):
                 self.set()
-        self._thread = threading.Thread(target=loop, daemon=True, name=f"ma-state-{self.label}")
-        self._thread.start()
+        try:
+            self._thread = threading.Thread(target=loop, daemon=True, name=f"ma-state-{self.label}")
+            self._thread.start()
+        except RuntimeError:     # no thread to be had: the run goes on; the record is written at each phase only
+            self._thread = None
 
     def stop(self, phase):
         self._stop.set()

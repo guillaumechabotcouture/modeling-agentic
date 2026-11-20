@@ -1746,12 +1746,16 @@ def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=Non
 def local_is_current(dest: str, launch_id: str) -> bool | None:
     """True: dest holds this launch's collected run; False: an earlier launch's
     (set aside before collecting); None: nothing collected yet."""
-    p = os.path.join(dest, "result.json")
-    if not os.path.exists(p):
-        return None
+    p, part = os.path.join(dest, "result.json"), os.path.join(dest, "result.partial.json")
     try:
+        if not os.path.exists(p):
+            # a partial copy (collect: large files only on the VM) is never "collected": an earlier launch's is
+            # set aside like a full one, this launch's is fetched again over itself
+            if os.path.exists(part) and json.load(open(part)).get("launch_id") != launch_id:
+                return False
+            return None
         return json.load(open(p)).get("launch_id") == launch_id
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         return False
 
 
@@ -1818,6 +1822,11 @@ def collect(cfg, shutdown_after: bool = True, accept_partial: bool = False):
             ck_note = (f"; only a checkpoint exists, of {ck.get('time_utc')} (state {ck.get('run_state')}, "
                        f"{ck.get('cached_batches')} cached batches): fetch it with `checkpoint --label {label}`"
                        if ck else "")
+            part = os.path.join(dest, "result.partial.json")
+            if accept_partial and os.path.exists(part):     # this launch's (local_is_current), fetched earlier
+                os.replace(part, os.path.join(dest, "result.json"))
+                print(f"{label}: the partial copy in {dest} is accepted as collected")
+                continue
             if not running:
                 print(f"{label}: not in storage ({type(e).__name__}) and the cluster has stopped{ck_note}")
                 continue
@@ -5199,7 +5208,7 @@ def _self_test_liveness(ok) -> None:
         collect(cfg2, accept_partial=True)
     ok(os.path.exists(os.path.join(pd, "result.json")) and not os.path.exists(os.path.join(pd, "result.partial.json")),
        "LV9d `collect --accept-partial` after the cluster stopped finishes this launch's partial copy")
-    ok(marks == ["B", "A"] and downs == ["lv"] and os.path.exists(os.path.join(tmp, "A", "result.json")),
+    ok(marks == ["B"] and downs == ["lv"] and os.path.exists(os.path.join(tmp, "A", "result.json")),
        f"LV9b `collect --accept-partial` (the files were copied by hand, or are given up) finishes the label: "
        f"{marks} {downs}")
 

@@ -1,6 +1,6 @@
 ---
 phase: "v2 autonomy"
-commit: "1E-ii α–δ"
+commit: "1E-ii α–ζ"
 ---
 
 ## Changelog
