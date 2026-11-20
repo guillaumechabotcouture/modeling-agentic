@@ -123,7 +123,18 @@ DEFAULT_TIMEOUT_S = 3600
 BACKSTOP_MULTIPLE = 3
 BACKSTOP_FLOOR_S = 24 * 3600.0
 PROGRESS_EVERY_S = 900.0
-KILL_GRACE_S = 10           # after a timeout kill: how long to wait for the step's pipes to close
+KILL_GRACE_S = 10           # after SIGKILL: the bounded wait for the step to be reaped
+# At a step's backstop (v2 autonomy 1D-i): SIGTERM to its process group first, and this long for every process in it
+# to end (compute.py flushes its rows and stops its batch on SIGTERM), then SIGKILL for whatever is left.
+TERM_GRACE_S = 25.0
+# A step's stdout and stderr: <LOG_DIR>/<step id>.log, appended to on every execution (lib.safe_io, no link followed).
+# A diagnostic record, not a harness-certified one. A `.log` under models/ is outside compute.py's code fingerprint
+# (_FP_SKIP_EXT; self-test PD5b), so a log that grows while a batch runs never discards the batch's rows.
+LOG_DIR = "models/logs"
+LOG_TAIL = 800              # characters of a step's output kept in its report row's `error`
+# The model API's credentials: no step calls the model (the harness's LLM tasks run outside the pipeline).
+SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+_CURRENT = object()         # _progress_record's default run id: the run() in progress
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _GLOB = re.compile(r"[*?\[]")
 
@@ -166,7 +177,14 @@ def script_env(environ=None) -> dict:
         pre = tuple(_enforcement().CLOUD_ENV_PREFIXES)
     except Exception:  # noqa: BLE001 — fail closed: strip the known families
         pre = ("AZ_", "AZURE_", "OPENAI_", "AWS_", "GOOGLE_")
-    return {k: v for k, v in env.items() if not k.startswith(pre)}
+    out = {k: v for k, v in env.items() if not k.startswith(pre) and k not in SECRET_ENV}
+    # A bare `python3` or console script in a step's command is the harness interpreter's (its venv), not whatever
+    # is first on the caller's PATH.
+    if sys.executable:
+        here = os.path.dirname(os.path.abspath(sys.executable))
+        path = [x for x in out.get("PATH", "").split(os.pathsep) if x]
+        out["PATH"] = os.pathsep.join(path if path[:1] == [here] else [here] + path)
+    return out
 
 
 def _sha(path: str) -> str | None:
@@ -617,10 +635,12 @@ def fingerprint(step: dict, run_dir: str) -> dict:
     spec = {k: v for k, v in step.items() if not k.startswith("_")}
     ins, missing = {}, []
     prog = os.path.realpath(os.path.join(run_dir, PROGRESS))
+    logs = os.path.realpath(os.path.join(run_dir, LOG_DIR)) + os.sep      # step logs: written while steps run
     for pat in step_inputs(step):
         # The runner rewrites PROGRESS while a step runs (Codex on #267): never an input, also through a link, and
         # excluded before the missing check, so it alone never satisfies a glob.
-        m = [r for r in _matches(run_dir, pat) if os.path.realpath(os.path.join(run_dir, r)) != prog]
+        m = [r for r in _matches(run_dir, pat) if (rp := os.path.realpath(os.path.join(run_dir, r))) != prog
+             and not rp.startswith(logs)]
         if not m:
             missing.append(pat)
         for rel in m:
@@ -787,17 +807,105 @@ def _warn(msg: str) -> None:
         pass
 
 
-def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None):
-    """Own process group; at `timeout_s` the whole group is killed (as derived_rebuild). `soft_s`/`on_overrun`: see
-    _communicate (the step's soft deadline: warned about, never killed)."""
-    # errors="replace" (Codex round 4 on #267): output that is not UTF-8 never hides the step's outcome.
-    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                         text=True, errors="replace", env=env, start_new_session=True, shell=shell)
-    try:
+class _Sink:
+    """Where a command's output goes. With `rel`: the step's log, run_dir/rel, opened for append with no link
+    followed (lib.safe_io); stdout and stderr both land there. Without: an unnamed temporary file, for stderr only.
+    A file, never a pipe: a process that left the step's group cannot hold the runner by keeping a pipe open, and a
+    step that is flushing after SIGTERM never blocks on a pipe nobody reads."""
+
+    def __init__(self, run_dir: str | None = None, rel: str | None = None, header: str = ""):
+        self.run_dir, self.rel = run_dir, rel
+        if rel is None:
+            self.fh = tempfile.TemporaryFile()
+        else:
+            from lib.safe_io import open_append_nofollow
+            self.fh = open_append_nofollow(run_dir, rel)
+            self.note(header)
+        self.start = os.fstat(self.fh.fileno()).st_size
+
+    def note(self, text: str) -> None:
+        """A line of the runner's own in a step log (never fatal)."""
+        if self.rel is not None:
+            try:
+                self.fh.write(text)
+                self.fh.flush()
+            except (OSError, ValueError):
+                pass
+
+    def tail(self, n: int = LOG_TAIL) -> str:
+        """The last `n` characters this execution wrote ("" when the file cannot be read without following a link)."""
+        fd = None
         try:
-            _out, err = _communicate(p, timeout_s, soft_s, on_overrun)
+            if self.rel is None:
+                fd = os.dup(self.fh.fileno())
+            else:
+                from lib.safe_io import open_nofollow
+                fd = open_nofollow(self.run_dir, self.rel)
+            size = os.fstat(fd).st_size
+            start = self.start if self.start <= size else 0      # truncated by the step: what is there now
+            off = max(start, size - 4 * n)
+            return os.pread(fd, size - off, off).decode("utf-8", "replace")[-n:]
+        except (OSError, ValueError):
+            return ""
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def close(self) -> None:
+        try:
+            self.fh.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _stop_group(p, grace_s: float) -> str:
+    """Stop a step's process group at its limit; returns how, for the error text. With a grace: SIGTERM, then up to
+    `grace_s` for every process in the group to end, not only its leader (a shell that leads the group ends at once
+    while the process it started is still flushing). Then SIGKILL for whatever is left, and a bounded wait."""
+    how = "process group killed"
+    if grace_s > 0:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        how, end = f"SIGTERM, then SIGKILL after the {grace_s:.0f}s grace", time.monotonic() + grace_s
+        while time.monotonic() < end:
+            p.poll()                              # reap the leader, so an ended group reads as gone
+            try:
+                os.killpg(p.pid, 0)
+            except (ProcessLookupError, PermissionError):     # no process left (or only ones already dead)
+                how = f"SIGTERM, ended within the {grace_s:.0f}s grace"
+                break
+            except OSError:
+                pass
+            time.sleep(0.05)
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        p.wait(timeout=KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        how += f"; not reaped within {KILL_GRACE_S}s"
+    return how
+
+
+def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None, log=None, grace_s=0.0):
+    """Own process group; at `timeout_s` the whole group is stopped (_stop_group: SIGTERM and `grace_s` first when a
+    grace is given, then SIGKILL). `soft_s`/`on_overrun`: see _communicate (the step's soft deadline: warned about,
+    never killed). `log`: the step's _Sink (stdout and stderr); without one stdout is dropped and stderr is kept
+    for the returned tail only. Returns (returncode or None at the limit, the tail of the output or the reason)."""
+    sink = log if log is not None else _Sink()
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=sink.fh if log is not None else subprocess.DEVNULL, stderr=sink.fh,
+                             stdin=subprocess.DEVNULL, env=env, start_new_session=True, shell=shell)
+        try:
+            _communicate(p, timeout_s, soft_s, on_overrun)
         except subprocess.TimeoutExpired:
-            raise
+            how = _stop_group(p, grace_s)
+            past = f" at its backstop (soft deadline {soft_s:.0f}s)" if soft_s is not None else ""
+            tail = sink.tail().strip() if log is not None else ""
+            return None, f"timed out after {timeout_s:.0f}s{past} ({how})" + (f"; last output: {tail}" if tail else "")
         except BaseException:
             try:                    # anything else escaping the wait: the step's group never outlives it
                 os.killpg(p.pid, signal.SIGKILL)
@@ -810,31 +918,30 @@ def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None
             os.killpg(p.pid, signal.SIGKILL)
         except OSError:
             pass
-        return p.returncode, (err or "")[-800:]
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        # A process that left the group (a compute pool process makes its own) can keep the step's pipes open:
-        # do not wait for their end-of-file past a short grace (a plain communicate() hung the runner for good).
-        try:
-            p.communicate(timeout=KILL_GRACE_S)
-        except subprocess.TimeoutExpired:
-            for fh in (p.stdout, p.stderr):
-                try:
-                    fh.close()
-                except OSError:
-                    pass
-            p.wait()
-        past = f" at its backstop (soft deadline {soft_s:.0f}s)" if soft_s is not None else ""
-        return None, f"timed out after {timeout_s:.0f}s{past} (process group killed)"
+        return p.returncode, sink.tail()
+    finally:
+        if log is None:
+            sink.close()
+
+
+def step_log(step: dict) -> str:
+    """The run-relative path of a step's log (a step id holds no path separator)."""
+    return f"{LOG_DIR}/{step['id']}.log"
 
 
 def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None, soft_s: float | None = None,
-               on_overrun=None) -> tuple[int | None, str]:
+               on_overrun=None, info: dict | None = None) -> tuple[int | None, str]:
     """Run one step to `timeout_s` (its backstop); `soft_s`/`on_overrun` as _communicate. A compute step's batch
-    gets the backstop as its own wall limit, so the batch is not stopped at the soft deadline either."""
+    gets the backstop as its own wall limit, so the batch is not stopped at the soft deadline either. The step's
+    output goes to its log (step_log); `info` receives `log`, or `log_error` when the log cannot be opened without
+    following a link (the step then runs as before the log existed: stderr's tail only)."""
+    rel, sink = step_log(step), None
+    try:
+        sink = _Sink(run_dir, rel, f"=== step {step['id']} | pipeline run {_RUN_ID} | started {_iso(time.time())} ===\n")
+    except (OSError, ValueError) as e:
+        _warn(f"[pipeline] step {step['id']}: no log ({rel}: {e}); the step runs without one")
+    if info is not None:
+        info.update({"log": rel} if sink is not None else {"log_error": f"{rel} could not be opened; no log kept"})
     env = script_env()
     env["MA_PIPELINE_RUN_DIR"] = run_dir     # the trusted root a harness step writes under (the dir it runs in)
     if _RUN_ID:
@@ -850,9 +957,18 @@ def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None, s
             cmd = [python or sys.executable, os.path.join(HERE, "compute.py"), "map", run_dir, "--fn", fn,
                    "--inputs", os.path.join(run_dir, step["inputs_jsonl"]), "--out", os.path.join(run_dir, step["out"]),
                    "--purpose", step["purpose"].strip(), "--timeout-s", str(max(1.0, timeout_s))]
-            return _run_cmd(cmd, run_dir, timeout_s + 60, env, soft_s=soft_s, on_overrun=on_overrun)
-        return _run_cmd(step["run"], run_dir, timeout_s, env, shell=True, soft_s=soft_s, on_overrun=on_overrun)
+            res = _run_cmd(cmd, run_dir, timeout_s + 60, env, soft_s=soft_s, on_overrun=on_overrun, log=sink,
+                           grace_s=TERM_GRACE_S)
+        else:
+            res = _run_cmd(step["run"], run_dir, timeout_s, env, shell=True, soft_s=soft_s, on_overrun=on_overrun,
+                           log=sink, grace_s=TERM_GRACE_S)
+        if sink is not None:
+            sink.note(f"=== ended {_iso(time.time())} | " + (f"returncode {res[0]}" if res[0] is not None
+                                                             else res[1].split("; last output:")[0]) + " ===\n")
+        return res
     finally:
+        if sink is not None:
+            sink.close()
         shutil.rmtree(cache, ignore_errors=True)
 
 
@@ -901,10 +1017,11 @@ def _trusted_outputs(rec) -> dict:
 
 
 def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_start: float, elapsed: float | None,
-                     last_s, state: str) -> None:
+                     last_s, state: str, rid=_CURRENT) -> None:
     """PROGRESS, this step's entry: where it stands against its soft deadline and its backstop, and a projection of
     when it ends (a compute step: from the rows its batch has written; otherwise its last recorded runtime)."""
     now = time.time()
+    rid = _RUN_ID if rid is _CURRENT else rid     # the step's own run: a late report outlives run()'s reset of the id
     el = (now - t_start) if elapsed is None else elapsed
     proj, basis = None, None
     fn = _compute_fn(step)
@@ -918,7 +1035,7 @@ def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_s
             pass
     if proj is None and isinstance(last_s, (int, float)) and last_s > el:
         proj, basis = float(last_s), "the step's last recorded runtime"
-    entry = {"state": state, "pipeline_run": _RUN_ID, "started_at": _iso(t_start), "at": _iso(now),
+    entry = {"state": state, "pipeline_run": rid, "started_at": _iso(t_start), "at": _iso(now),
              "elapsed_s": round(el, 1), "soft_deadline_s": soft_s, "backstop_s": hard_s,
              "backstop_at": _iso(t_start + hard_s), "backstop_rule": f"max({BACKSTOP_MULTIPLE} x soft deadline, "
              f"{BACKSTOP_FLOOR_S / 3600:g} h), within any pipeline budget",
@@ -929,7 +1046,7 @@ def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_s
     # Under one lock, the check and the write (Codex round 4 on #267): a 'running' report that passed the check
     # cannot land on disk after the final state.
     with _PROGRESS_LOCK:
-        doc = _PROGRESS_DOC.setdefault((run_dir, _RUN_ID), {"pipeline_run": _RUN_ID, "steps": {}})
+        doc = _PROGRESS_DOC.setdefault((run_dir, rid), {"pipeline_run": rid, "steps": {}})
         prev = doc["steps"].get(step["id"]) or {}
         if state == "running" and prev.get("started_at") == entry["started_at"] and prev.get("state") != "running":
             return                # a late report (its thread) never overwrites the step's final state
@@ -1028,16 +1145,17 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
                 return row
         s0 = time.time()
         last = rec.get("seconds") if isinstance(rec, dict) else None
-        over = []
+        over, rid, info = [], _RUN_ID, {}
 
         def on_overrun(el):
             over.append(el)
-            _progress_record(run_dir, step, soft_s, timeout_s, s0, el, last, "running")
+            _progress_record(run_dir, step, soft_s, timeout_s, s0, el, last, "running", rid)
         try:
-            rc, err = _exec_step(step, run_dir, timeout_s, python, soft_s, on_overrun if soft_s is not None else None)
+            rc, err = _exec_step(step, run_dir, timeout_s, python, soft_s, on_overrun if soft_s is not None else None,
+                                 info=info)
         except OSError as e:
             rc, err = None, f"{type(e).__name__}: {e}"
-        row.update(returncode=rc, seconds=round(time.time() - s0, 1), ok=rc == 0)
+        row.update(info, returncode=rc, seconds=round(time.time() - s0, 1), ok=rc == 0)
         if over:
             row["over_soft_deadline"] = True
             row["soft_deadline_s"], row["backstop_s"] = soft_s, timeout_s
@@ -1065,7 +1183,7 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
         if over:              # the final state once its outputs are checked (Codex on #267: never `ok` for a rollback)
             try:
                 _progress_record(run_dir, step, soft_s, timeout_s, s0, row["seconds"], last,
-                                 "ok" if row["ok"] else "failed")
+                                 "ok" if row["ok"] else "failed", rid)
             except Exception:  # noqa: BLE001 -- the record is a report, never the step's outcome
                 pass
         return row
@@ -1082,6 +1200,15 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
     ArtifactIntegrity) the run holds a harness grant for the outputs of the
     steps it runs, and marks each file those steps wrote as harness-written.
     `only` + `force` run one step regardless of staleness (scratch mode)."""
+    global _RUN_ID
+    prev = _RUN_ID
+    try:
+        return _run(run_dir, budget_s, integrity, python, only, force)
+    finally:
+        _RUN_ID = prev       # a step run outside this run() never exports this run's id (MA_PIPELINE_RUN)
+
+
+def _run(run_dir, budget_s, integrity, python, only, force) -> dict:
     global _RUN_ID
     run_dir = os.path.realpath(run_dir)
     t0 = time.time()
