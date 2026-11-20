@@ -1130,7 +1130,10 @@ def _self_test_run_dir_forms(ok):
                     st = (status(form[sign_as]), status(form[check_as]))
                     cl = [((ED.state(form[f]).get("binding") or {}).get("record") or {}).get("closure") or {}
                           for f in ("rel", "abs")]
-                    keys = sorted(k for k in cl[0] if k.startswith("run:")) if cl[0] == cl[1] else ["differ"]
+                    import hashlib
+                    want = hashlib.sha256(open(os.path.join(top, rel, "units.csv"), "rb").read()).hexdigest()
+                    keys = (sorted(k for k in cl[0] if k.startswith("run:"))
+                            if cl[0] == cl[1] and cl[0].get("run:units.csv") == want else ["differ"])
                 except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
                     st, keys = (f"{type(e).__name__}: {e}",), []
                 got[label] = (st, keys)
