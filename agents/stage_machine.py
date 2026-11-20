@@ -512,12 +512,12 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
             continue
         for b in doc.get("blockers") or []:
             if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
-                    or str(b.get("id")) in closed):
+                    or str(b.get("id")).strip() in closed):
                 continue
             if not drafted and OP.after_write_item(b):     # the gate's own rule (V._defer_write_findings)
                 continue
             dw = b.get("done_when")
-            out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
+            out.append({"id": str(b.get("id")).strip(), "source": reviewer, "severity": b.get("severity"),
                         "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or ""),
                         "fix_requires": _remedy(b)})
     critic_open = {o["id"] for o in out}

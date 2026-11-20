@@ -212,7 +212,7 @@ def from_critiques(run_dir: str) -> tuple[list[Finding], list[str]]:
                 continue
             st, known = owner_state_for(b.get("target_stage"))
             found.append(Finding(
-                id=str(b["id"]), kind="critique_blocker", severity=str(b.get("severity") or "HIGH").upper(),
+                id=str(b["id"]).strip(), kind="critique_blocker", severity=str(b.get("severity") or "HIGH").upper(),
                 source=reviewer, owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                 status="fixed" if b.get("resolved") else "open", first_seen_round=b.get("first_seen_round"),
                 last_seen_round=doc.get("round"), claim=str(b.get("claim") or ""), fix_requires=remedy(b),
