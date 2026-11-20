@@ -204,7 +204,9 @@ benchmarks:
      estimand: {type: odds_ratio, num: mis_pbo, den: mis_pyr, value: windows.m24.pfpr_6m14y}}
   # F6 option A (owner decision 2026-11-18): LLINEUP at its own estimand, a prevalence ratio (Table 2, as-treated:
   # clusters grouped by the nets households held at the 6-month survey; the intention-to-treat ratios are weaker,
-  # 0.78, 0.80 and 0.94). Held out for now; also the source of pbo_adv_decay's prior range (priors.yaml).
+  # 0.78, 0.80 and 0.94). Held out of this pack's own fit; a training target of the net-effect fit (owner, 18 Nov,
+  # fit record (b): declared in net_effect_fit.py OPTION_A, posterior through net_effect_posterior); also the source of
+  # pbo_adv_decay's prior range (priors.yaml), so that prior and these targets share data.
   - {id: B9d, metric: "PBO vs non-PBO nets, prevalence ratio at 6 m (LLINEUP, ages 2-10)", target: 0.74, band: [0.62, 0.87],
      source: "Staedke 2020 Lancet 395:1292-1303 (LLINEUP, Uganda, 104 clusters; doi 10.1016/S0140-6736(20)30214-2)",
      published: {lower: 0.62, upper: 0.87, level: 0.95, scale: ratio, table: "Table 2, as-treated analysis, PBO vs non-PBO LLIN, 6 months"},
@@ -233,7 +235,8 @@ benchmarks:
        trial's (an engine observable for ages 2 to 11 is a later engine version)",
      estimand: {type: ratio, num: ug_pbo, den: ug_pyr, value: windows.m18.pfpr_2_10}}
   # The only same-trial comparison of the two net types: Misungwi's dual-AI arm against its PBO arm, both against one
-  # pyrethroid-only control (B10 / B9c). No new arm; the band is derived (pack_trials.py or_contrast, PT3). Held out;
+  # pyrethroid-only control (B10 / B9c). No new arm; the band is derived (pack_trials.py or_contrast, PT3). Held out of
+  # this pack's fit; a net-effect fit target (OPTION_A);
   # not fully independent evidence, since B10 is a fit target. Known differences the engine does not represent (Codex
   # r1 on #266): study-net use at 24 months was higher in the chlorfenapyr arm (46.4%) than in the PBO arm (29.6%),
   # and the arms share one simulated use; the trial measured RDT positivity, the engine reads microscopy (as for B9c
@@ -340,8 +343,10 @@ benchmarks:
      value: per_capita_all.dalys, costs_num: {nets_given: 0.380}}}
 
 # v0.2: one joint fit of the parameters no published source sets. Pyrethroid and PBO nets use the Churcher 2016
-# hut-trial coefficients, so B7, B8, B9, B9b, B9c and (F6 option A, until the net-effect fit uses them) B9d-B9g are
-# held out. Every benchmark not in `targets` is held out.
+# hut-trial coefficients, so B7, B8, B9, B9b, B9c and B9d-B9g are held out of this fit. Every benchmark not in
+# `targets` is held out of it. F6 option A (owner, 18 Nov, fit record (b)): the net-effect fit declares its own targets
+# (net_effect_fit.py OPTION_A: B9c-B9g with B10-B12m; B9 and B9b monitored, refit b of 19 Nov) and writes its posterior, never fitted.yaml, so this fit and
+# fitted.yaml stay as they are; B9-B9g are then training data of the net-effect parameters, not tests of them.
 fit_joint:
   rule: joint-v1
   params: {cfp_kill: [0.0, 0.8], irs_kill: [0.0, 0.95]}

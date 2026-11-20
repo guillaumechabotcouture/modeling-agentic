@@ -676,6 +676,9 @@ def input_closure(run: dict, spec: bytes, read, run_dir: str | None, engines: li
     declarations). Run-side keys are relative to the run dir (a parent-relative input keeps a key such as
     run:../shared/units.csv), so the same tree unpacked elsewhere matches. A
     file absent is recorded as "absent". `owners`, when given, receives {tree key: [engine refs that read it]}."""
+    # v2-closure-paths: a relative run dir resolved the spec's inputs against the working directory, then joined them
+    # to the run dir again (keys such as run:runs/<R>/data/...); an absolute one keys every input as before
+    run_dir = None if run_dir is None else os.path.abspath(run_dir)
     out = {"run:decision_spec.yaml": sha(spec)}
     paths, probs = _execution_input_paths(run, run_dir)
 

@@ -41,6 +41,8 @@ decision_inputs:
       pbo:
         - {kind: parameter, name: pbo_gain_scale, why: "the scale on PBO's gain in bioassay mortality"}
         - {kind: parameter, name: pbo_adv_decay, why: "how fast a PBO net's advantage over a pyrethroid net decays"}
+        - {kind: parameter, name: net_deter_sat, why: "how much of a PBO net's extra deterrence over a pyrethroid net
+            it keeps (v0.18): whether it kills or repels where resistance is moderate"}
       dual:
         - {kind: parameter, name: cfp_kill, why: "the fitted chlorfenapyr kill of the dual active-ingredient net"}
         - {kind: parameter, name: cfp_half, why: "how fast the chlorfenapyr kill decays"}

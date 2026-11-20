@@ -184,8 +184,11 @@ def _self_test() -> int:
     def pt4():
         from toolkit.engines.benchmark_sources import check_pack
         bad = [x for x in check_pack(pack) if x.split(":")[0] in NEW_IDS]
-        ok(not set(NEW_IDS) & set(pack["fit_joint"]["targets"]) and not bad,
-           f"PT4 B9d-B9g are held out (not fit_joint targets) and pass the source check ({bad})")
+        from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+        ok(not set(NEW_IDS) & set(pack["fit_joint"]["targets"]) and set(NEW_IDS) <= set(NEF.OPTION_A["targets"])
+           and not bad,
+           f"PT4 B9d-B9g are held out of the pack's own fit and are targets of the net-effect fit's own declaration "
+           f"(F6 option A, fit record (b)); they pass the source check ({bad})")
     case("PT4", pt4)
 
     def pt5():
@@ -221,8 +224,11 @@ def _self_test() -> int:
         missing = [i for i in by if i not in have]
         doc, why = BM.verified_results(MalariaEngine())
         if missing:
-            ok(doc is None and f"not yet run: {', '.join(missing)}" in str(why)
-               and not any(f"rerun required: {i}" in str(why) for i in missing),
+            # the rows' own check, apart from the identity check that refuses first after an engine version (v0.18)
+            from toolkit.engines.benchmark_sources import load_evidence
+            probs = " ".join(load_evidence(MalariaEngine(), rows=res.get("benchmarks") or []).problems)
+            ok(doc is None and f"not yet run: {', '.join(missing)}" in probs
+               and not any(f"rerun required: {i}" in probs for i in missing),
                f"PT6 a pack benchmark with no stored row refuses the record as not yet run ({missing}: {why})")
         else:
             ok(doc is not None and why is None,

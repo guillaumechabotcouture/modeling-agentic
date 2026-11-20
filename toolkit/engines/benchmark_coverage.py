@@ -243,13 +243,17 @@ def signature(run_dir: str | None, by: str | None = None) -> str:
 
 # ------------------------------------------------------------------ the check
 def gate(cov, cov_problems, engine_name, raw, record, departures, departures_status, pack=None,
-         has_benchmarks: bool = False, runs=None, version: str = "0", param_names=None) -> dict:
+         has_benchmarks: bool = False, runs=None, version: str = "0", param_names=None, trained=None) -> dict:
     """Benchmark precondition for one engine. `record()` returns (rows, problem) for the configuration in use;
     `pack` is the pack the coverage file was written for; `runs(test_id, effect, rows)` -> (ok, why) says whether a
     departure's decision test runs and changes the effect (toolkit/spec/preconditions.decision_test_runs).
-    Returns {why_not, departures, blocking, reported, uncovered, record}."""
+    `trained` {id: declaration digest}: the benchmarks a declared net-effect posterior's fit trains on
+    (posterior_trained); one whose record row is bound to that same declaration (band_sha256) takes its status from the
+    fit's verified chosen point, every other one from the record. Returns {why_not, departures, blocking,
+    reported, uncovered, record, status_source {benchmark: posterior_chosen_point | results.yaml}}."""
     out = {"why_not": [], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": None,
-           "card_rows_disagree": []}
+           "card_rows_disagree": [], "status_source": {}}
+    trained = dict(trained or {})
     if cov is None:
         if pack is not None or has_benchmarks:
             out["why_not"].append(f"the engine has a benchmark pack but no {FILE} saying which components it covers")
@@ -331,10 +335,16 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
         byid = {r["id"]: r for r in rows}
         for rp in out["reported"]:
             rp.update(status=byid[rp["id"]].get("status"), role=byid[rp["id"]].get("role", "unknown"))
+        for rp in out["reported"]:
+            out["status_source"][rp["id"]] = "results.yaml"
         for i, hits in sorted(relevant.items()):
             r = byid[i]
             st, role = r.get("status", "missing"), r.get("role", "unknown")
-            if st == "in_band":
+            # owner, 19 Nov: a fit target of the declared posterior is in band at the chosen point the run uses
+            # (load_posterior's finalize replay); the record's card-default row does not gate it
+            fitted_here = i in trained and r.get("band_sha256") == trained[i]      # the same declaration (Codex r1)
+            out["status_source"][i] = "posterior_chosen_point" if fitted_here else "results.yaml"
+            if st == "in_band" or fitted_here:
                 continue
             comps = sorted({f"{c}={v}" for _s, c, v in hits})
             pending.append((i, f"benchmark {i} ({r.get('metric', '')}; role {role}: "
@@ -380,6 +390,10 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
     except Exception:  # noqa: BLE001
         cref = ref
     cov, probs = load(path_for(ref))
+    trained, why = posterior_trained(raw, ref, config, base)       # before the toy exemption (Codex r1)
+    if why:
+        return {"why_not": [why], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": None,
+                "card_rows_disagree": [], "status_source": {}}
     if cov is None and cref in BS.TOY_ENGINE_REFS and cref not in OVERRIDES and ref not in OVERRIDES:
         return {"why_not": [], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": "toy",
                 "card_rows_disagree": []}
@@ -425,13 +439,35 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
         pass
     out = gate(cov, probs, name, raw, record, list(raw.get("engine_departures") or []), departures_status,
                _pack(ref), has_benchmarks=bool(rp and os.path.exists(str(rp))), runs=runs, version=version,
-               param_names=pnames)
+               param_names=pnames, trained=trained)
     if card_benchmarks and out["record"] == "verified":
         rows = {r.get("id"): r for r in record()[0]}
         out["card_rows_disagree"] = sorted(str(c.get("id")) for c in card_benchmarks if isinstance(c, dict)
                                            and c.get("id") in rows and (c.get("status"), c.get("computed")) !=
                                            (rows[c["id"]].get("status"), rows[c["id"]].get("computed")))
     return out
+
+
+def posterior_trained(raw: dict, ref: str, config: dict | None, base: str | None, engine=None) -> tuple:
+    """({benchmark id: declaration digest}, None): the benchmarks a declared uncertainty.net_effect_posterior's fit
+    trains on and the loader verified the chosen point in band on (its `trained`); (None, None) without the field;
+    (None, why) when the declared posterior does not load (fail closed)."""
+    u = raw.get("uncertainty") if isinstance(raw, dict) else None
+    if not isinstance(u, dict) or "net_effect_posterior" not in u:      # malformed: schema validation says so
+        return None, None
+    try:
+        from toolkit.analysis import uncertainty as UQ
+        from toolkit.spec import schema
+        sp = schema.Spec({k: v for k, v in raw.items() if k != "_packages"} | {"engine": {"ref": ref, "config":
+                                                                                         config or {}}},
+                         base or os.getcwd())
+        ne = UQ.net_effect_sample(sp, engine if engine is not None else sp.engine())
+        if not isinstance(ne.get("trained"), dict):
+            raise ValueError("the loaded posterior does not say which benchmarks its fit trains on")
+        return dict(ne["trained"]), None
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        return None, f"uncertainty.net_effect_posterior does not load ({type(e).__name__}: {e}): benchmark " \
+                     "eligibility cannot take the fit's chosen point"
 
 
 def departure_targets(raw: dict, ref: str, base: str | None = None) -> dict:
@@ -619,11 +655,123 @@ def _self_test() -> int:
        and "net_kill_shift" not in effect_parameters(mdoc["benchmarks"]["B8"], "0.16")
        and "net_kill_shift" in effect_parameters(mdoc["benchmarks"]["B8"], "0.17"),
        f"BC10 the malaria coverage's effect parameters exist in the engine; net_kill_shift counts from v0.17 ({bad})")
+    _self_test_posterior(ok, cov, both)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_posterior(ok, cov, both):
+    """BC11-BC16 (owner, 19 Nov): a benchmark a declared posterior's fit trains on takes its status from the fit's
+    verified chosen point, when the fit verified it against the same declaration the record is bound to; a held-out
+    one gates on the record (and accepts a signed departure) as before."""
+    import hashlib
+    import tempfile
+    try:
+        bad = [{"id": "I", "status": "out_of_band", "band_sha256": "dI"},
+               {"id": "P", "status": "out_of_band", "band_sha256": "dP"},
+               {"id": "Q", "status": "in_band", "band_sha256": "dQ"}]
+        rec = lambda: (bad, None)  # noqa: E731
+        g0 = gate(cov, [], "e", both, rec, [], "unsigned")
+        g1 = gate(cov, [], "e", both, rec, [], "unsigned", trained={"I": "dI"})
+        ok(sorted(b["id"] for b in g0["blocking"]) == ["I", "P"] and [b["id"] for b in g1["blocking"]] == ["P"]
+           and g1["status_source"] == {"I": "posterior_chosen_point", "P": "results.yaml", "Q": "results.yaml"}
+           and g0["status_source"] == {"I": "results.yaml", "P": "results.yaml", "Q": "results.yaml"},
+           f"BC11 a trained benchmark takes its status from the posterior's chosen point, a held-out one from the "
+           f"record; the output records each status source: {g1['blocking']} {g1.get('status_source')}")
+        g1b = gate(cov, [], "e", both, rec, [], "unsigned", trained={"I": "another declaration"})
+        ok(sorted(b["id"] for b in g1b["blocking"]) == ["I", "P"] and g1b["status_source"]["I"] == "results.yaml",
+           f"BC11b (Codex r1) a trained benchmark verified against another declaration (same id, other band, arms or "
+           f"setting) gates on the record: {g1b['blocking']}")
+        dep = {"engine": "e", "benchmark": "P", "reason": "why", "decision_test": "DT"}
+        g2 = gate(cov, [], "e", both, rec, [dep], "signed", trained={"I": "dI"}, runs=lambda *a: (True, ""))
+        g3 = gate(cov, [], "e", both, rec, [dep], "unsigned", trained={"I": "dI"}, runs=lambda *a: (True, ""))
+        ok(g2["why_not"] == [] and [d["benchmark"] for d in g2["departures"]] == ["P"] and g3["blocking"],
+           f"BC12 a held-out benchmark out of band still needs an owner-signed departure: {g2['why_not']} "
+           f"{g3['blocking']}")
+    except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+        ok(False, f"BC11-BC12 ({type(e).__name__}: {e})")
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    from toolkit.engines.benchmark_sources import band_digest
+    from toolkit.spec import schema
+    base = yaml.safe_load(open(NEF.PACK))
+    decl = {b["id"]: b for b in base["benchmarks"]}
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        rows = [{"eff_a": 0.3 + 0.01 * i, "eff_b": 0.2 + 0.01 * i} for i in range(12)]
+        f = os.path.join(d, "nef.yaml")
+        NEF._fixture_placeholder(f, schema.load(p).engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
+        replayed = sorted(NEF.pack_bands())
+        t0, t1 = replayed[0], replayed[1]
+        held = next(k for k in decl if k not in replayed)     # a real benchmark the replay does not check (Codex r3)
+
+        def good(doc):
+            doc["plan"].update(targets_train=[t0, t1, held, "not_a_replayed_target"], held_out_untouched=[t1])
+            doc.setdefault("target_digests", {})[held] = band_digest(decl[held], base)
+
+        def signed(edit):
+            doc = yaml.safe_load(open(f))
+            edit(doc)
+            yaml.safe_dump(doc, open(os.path.join(d, "nef2.yaml"), "w"), sort_keys=False)
+            return {"path": "nef2.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef2.yaml"), "rb").read())
+                    .hexdigest()}
+        none = {k: v for k, v in raw.items() if k != "uncertainty"} | {
+            "uncertainty": {k: v for k, v in raw["uncertainty"].items() if k != "net_effect_posterior"}}
+        cases = {"none": lambda: none,
+                 "good": lambda: dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior=signed(
+                     good))),
+                 "bad": lambda: dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior={
+                     "path": "nef.yaml", "sha256": "0" * 64}))}
+        res = {}
+        for label, mk in cases.items():
+            try:
+                r = mk()
+                res[label] = posterior_trained(r, r["engine"]["ref"], r["engine"].get("config"), d)
+            except Exception as e:  # noqa: BLE001
+                res[label] = (None, f"{type(e).__name__}: {e}")
+        ok(res["none"] == (None, None), f"BC13 without a posterior nothing is trained: {res['none']}")
+        ok(res["good"] == ({t0: band_digest(decl[t0], base)}, None),
+           f"BC14 the trained benchmarks are the file's targets_train, less any it lists as held out, that the "
+           f"loader's replay verified the chosen point on, each with its declaration's digest: {res['good']}")
+        ok(res["bad"][0] is None and "net_effect_posterior does not load" in str(res["bad"][1]),
+           f"BC15 a declared posterior that does not load fails closed: {res['bad']}")
+        # Codex r2: the declaration digest is the one the fit recorded when it ran; a fit file without it, or whose
+        # recorded digest is not the current declaration's (same id and band, other arms), trains nothing on that id
+        got17 = {}
+        for label, edit in (("no record", lambda doc: (doc["plan"].update(targets_train=[t0]),
+                                                      doc.pop("target_digests", None))),
+                            ("stale", lambda doc: (doc["plan"].update(targets_train=[t0]),
+                                                   doc.setdefault("target_digests", {}).update({t0: "0" * 64})))):
+            r = dict(raw, uncertainty=dict(raw["uncertainty"], net_effect_posterior=signed(edit)))
+            try:
+                got17[label] = posterior_trained(r, r["engine"]["ref"], r["engine"].get("config"), d)
+            except Exception as e:  # noqa: BLE001
+                got17[label] = (None, f"{type(e).__name__}: {e}")
+        ok(got17["no record"] == ({}, None) and got17["stale"] == ({}, None),
+           f"BC17 a fit that did not record its target's declaration digest, or recorded another one, trains nothing "
+           f"on it: {got17}")
+        try:            # Codex r1: the toy-engine exemption does not skip loading a declared posterior (r3: a
+            r = cases["bad"]()           # raise is a failing case, not the result)
+            got = assess(r["engine"]["ref"], r["engine"].get("config"), r, "unsigned", base=d)
+        except Exception as e:  # noqa: BLE001
+            got = {"why_not": [], "raised": f"{type(e).__name__}: {e}"}
+        ok(any("net_effect_posterior does not load" in w for w in got["why_not"]) and "raised" not in got,
+           f"BC16 an engine whose declared posterior does not load is not eligible, toy engines included: "
+           f"{got['why_not'][:1]} {got.get('raised', '')}")
+    try:                # Codex r3: a malformed uncertainty section is not a posterior and does not raise here
+        got18 = posterior_trained({"uncertainty": 1}, "x:y", None, None)
+    except Exception as e:  # noqa: BLE001
+        got18 = f"{type(e).__name__}: {e}"
+    ok(got18 == (None, None), f"BC18 a malformed uncertainty section declares no posterior: {got18}")
+    # Codex r3: run() records the digests of the pack it evaluated; in a normal fit that pack's declarations are
+    # the pack file's, so a current fit's targets count
+    eff = NEF.build_pack(base)
+    ok(NEF.target_digests(eff, NEF.pack_bands()) == NEF.target_digests(base, NEF.pack_bands())
+       and "target_digests=target_digests(pack, bands)" in open(NEF.__file__).read(),
+       "BC19 the fit writes the digests of the pack it evaluated, which a normal fit shares with the pack file")
 
 
 if __name__ == "__main__":

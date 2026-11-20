@@ -153,6 +153,17 @@ def load_state(run_dir: str) -> RunState | None:
     return st
 
 
+def _withhold_report(run_dir: str) -> None:
+    """A report an earlier gate rendered is not delivered under a failed status: a regular report.md is moved to
+    report_withheld.md; a link at that name is removed (never followed)."""
+    p = os.path.join(run_dir, "report.md")
+    if os.path.islink(p):
+        from lib.safe_io import remove_nofollow
+        remove_nofollow(run_dir, "report.md")
+    elif os.path.isfile(p):
+        _quarantine_report(run_dir)
+
+
 def _quarantine_report(run_dir: str) -> None:
     """F6 S1-7: move report.md to report_withheld.md through lib.safe_io (no link followed at either name;
     a linked report.md is refused, a link at the destination is replaced)."""
@@ -913,8 +924,17 @@ SPEC_RETHINK_REQUEST = "spec_rethink_request.json"
 
 def _spec_signed_sha(run_dir: str) -> str | None:
     """The spec sha256 a sign-off record binds (the spec's own record, or a brief's that hashed the spec), or None."""
-    for f, get in ((SIGNOFF_FILE, lambda r: r.get("spec_sha256") or (r.get("sha256") or {}).get(AB.SPEC_FILE)),
-                   ("decision_brief.signoff.json", lambda r: (r.get("sha256") or {}).get(AB.SPEC_FILE))):
+    import re as _re
+    hexd = _re.compile(r"[0-9a-f]{64}")
+
+    def nested(r):
+        m = r.get("sha256")
+        return m.get(AB.SPEC_FILE) if isinstance(m, dict) else (False if m is not None else None)
+    def own(r):        # the spec's own record: spec_sha256 (spike) or the nested map (toolkit); a present but empty
+        v = r.get("spec_sha256") or nested(r)          # spec_sha256 with no nested digest is not a binding: unreadable
+        return False if v is None and "spec_sha256" in r else v
+    for f, get in ((SIGNOFF_FILE, own),
+                   ("decision_brief.signoff.json", nested)):
         p = os.path.join(run_dir, f)
         if not os.path.lexists(p):
             continue
@@ -924,8 +944,11 @@ def _spec_signed_sha(run_dir: str) -> str | None:
             return "unreadable"          # fail closed: an unreadable record still protects the spec (#261 re-review)
         if not isinstance(rec, dict):
             return "unreadable"
-        if get(rec):
-            return get(rec)
+        v = get(rec)
+        if v is False or (v is not None and not (isinstance(v, str) and hexd.fullmatch(v))):
+            return "unreadable"          # a malformed binding is not a signature (narrow Codex review of #272)
+        if v:
+            return v
     return None
 
 
@@ -1279,6 +1302,7 @@ class Machine:
         if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
             miss = evidence_gate(self.run_dir, signoff=self.st.signoff)
             if miss:
+                _withhold_report(self.run_dir)       # never deliverable under run_failed (narrow Codex review of #272)
                 self._go("FINAL", "the run's preconditions do not hold on resume: " + "; ".join(miss[:5]), "run_failed")
                 save_state(self.run_dir, self.st)
                 return self.st.status or self.st.state
@@ -1299,6 +1323,14 @@ class Machine:
             # amended spec cannot be re-signed in a signed run dir): the request, then a pause; the owner amends and
             # relaunches with reuse
             req = rethink_request(self.run_dir, self.st.round)
+            sha = _spec_signed_sha(self.run_dir)
+            ev = "present" if sha not in (None, "unreadable") else ("unreadable" if sha else "missing")
+            if req.get("signing_evidence") != ev:        # a warning on the request, never a block (lead follow-up)
+                req = dict(req, signing_evidence=ev)
+                _write_json(self.run_dir, SPEC_RETHINK_REQUEST, req)
+            if ev != "present":
+                self.log(f"[machine] WARNING: the spec's sign-off record is {ev}; the amendment pause holds, but the "
+                         "relaunch must start from a signed spec")
             self.st.tries["spec_amendment"] = True     # honoured on resume, whatever a restored copy lost (#261 P1-2)
             self.st.paused, self.st.status = AWAITING_SPEC_AMENDMENT, None
             save_state(self.run_dir, self.st)
@@ -1680,8 +1712,7 @@ class Machine:
             # a pause with no request this machine recorded (an older run, or a route that records none): it cannot be
             # answered here, so it fails with how to go on, never waits (lead decision on Codex round 3 of #258); a
             # report an earlier gate rendered is not delivered under it (Codex round 4)
-            if os.path.lexists(os.path.join(self.run_dir, "report.md")):
-                _quarantine_report(self.run_dir)
+            _withhold_report(self.run_dir)
             return self._go("FINAL", "OWNER_DECISION has no recorded owner request: relaunch with reuse (a new run dir "
                                      "from this one's spec and stored rows)", "run_failed")
         answers, bad = SS.load_answers(self.run_dir)
@@ -2324,6 +2355,10 @@ def _self_test() -> int:
         m6.step()
         ok(spec_signed_once(d6) and "draft_spec" not in T6.calls and load_state(d).paused == AWAITING_SPEC_AMENDMENT,
            "R3-2e a truncated sign-off record still protects the spec; a persisted amendment pause is honoured")
+        # R3-2f (lead follow-up): the pause says when the signing evidence is missing or unreadable (a warning, no block)
+        rq6 = json.load(open(os.path.join(d, "spec_rethink_request.json")))
+        ok(rq6.get("signing_evidence") == "missing" and "requested_at" in rq6,
+           f"R3-2f the amendment request notes missing signing evidence ({rq6.get('signing_evidence')})")
 
         # R3-1 (F6 run 3): a write-up finding is never a FIX_LOOP task; the writer gets it with the draft.
         wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}
@@ -2406,6 +2441,25 @@ def _self_test() -> int:
         s7 = load_state(d).status
         ok(s7 == "run_failed" and "relaunch with reuse" in str(load_state(d).history[-1].get("why")),
            f"R3-7c a pause at OWNER_DECISION with no recorded request fails with how to go on ({s7})")
+        # R3-7e (narrow Codex review of #272): a resume whose preconditions fail ends the run run_failed before any
+        # handler runs; an earlier report.md is not left deliverable under that status; malformed signing evidence is
+        # "unreadable", never a crash or "present"
+        d, T, st = new_run("noreq_resume", {})
+        st.state = "OWNER_DECISION"
+        save_state(d, st)
+        open(os.path.join(d, "report.md"), "w").write("# Report\n\nStatus: completed\n")
+        s7e = _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False).run()
+        ok(s7e == "run_failed" and not os.path.exists(os.path.join(d, "report.md"))
+           and os.path.exists(os.path.join(d, "report_withheld.md")),
+           f"R3-7e a run failed on resume does not leave an earlier report deliverable ({s7e})")
+        d7f = os.path.join(td, "r37f")
+        os.makedirs(d7f)
+        ok_hex = "a" * 64
+        json.dump({"spec_sha256": None, "sha256": {AB.SPEC_FILE: ok_hex}}, open(os.path.join(d7f, SIGNOFF_FILE), "w"))
+        ok(_spec_signed_sha(d7f) == ok_hex, "R3-7g a null spec_sha256 beside a valid nested digest is still signed")
+        for bad in ({"sha256": "invalid"}, {"spec_sha256": "invalid"}, ["x"], {"spec_sha256": None}):
+            json.dump(bad, open(os.path.join(d7f, SIGNOFF_FILE), "w"))
+            ok(_spec_signed_sha(d7f) == "unreadable", f"R3-7f a malformed sign-off record reads unreadable ({bad})")
         # R3-5 (Codex review of #258 P1-10): the amendment check runs on every gate route: a structural PLAN blocker
         # whose remedy is an owner amendment does not take GATE -> SPEC
         amend5 = dict(amend, id="D-035", category="STRUCTURAL")
@@ -2431,6 +2485,39 @@ def _self_test() -> int:
            and load_state(d).budget_usd == 60.0
            and any(h.get("budget_raised") for h in load_state(d).history),
            f"R3-4b resumed with a higher cap, the run continues ({s2}, cap {load_state(d).budget_usd})")
+
+        # R3-8 (fix 4 of Codex round 3 on #258): the decline override reads the ledger synced with this gate's decision,
+        # so a gate-supplied finding the owner declined, and that this gate states with a revised claim, is not held by
+        # the old decline: the answer was given to the old claim, so the finding is open again
+        import scope_signoff as _SS8
+        d, T, st = new_run("stale_decline", {})
+        st.state = "GATE"
+        save_state(d, st)
+        v8 = {"kind": "k_demo", "key": "x", "severity": "HIGH", "stage": "ANALYZE", "scope_declarable": True,
+              "claim": "the new claim", "fix_requires": "use the new data"}
+        fid8 = FL.gate_id(v8)
+        old = FL.Finding(id=fid8, kind="k_demo", key="x", severity="HIGH", source="rigor-artifacts", claim="the old claim",
+                         fix_requires="use the new data", status="owner_declined", resolution_type="owner_decision")
+        old.events.append({"round": 1, "status": "owner_declined", "by": "owner"})
+        FL.save(d, {fid8: old})
+        fp8 = FL.answer_fingerprint(fid8, "the old claim", "use the new data")
+        json.dump({"answers": {fp8: {"finding": fid8, "decision": "decline", "by": "owner"}}},
+                  open(os.path.join(d, SCOPE_SIGNOFF), "w"))
+        _SS8.harness_record(d)
+        _mod8 = sys.modules[Machine.__module__]
+        _vg = _mod8.v2_gate
+        _mod8.v2_gate = lambda *a, **k: {"action": "DECLARE_SCOPE", "rule_matched": "3", "rounds_remaining": 0,
+                                         "rigor_violations": [v8], "unresolved_high": [dict(v8)]}
+        try:
+            _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False).step()
+        finally:
+            _mod8.v2_gate = _vg
+        g8 = json.load(open(os.path.join(d, "gate_r1.json")))
+        f8 = FL.load(d)[fid8]
+        ok(g8.get("action") == "DECLARE_SCOPE" and g8.get("rule_matched") != "owner_declined" and f8.status == "open"
+           and f8.claim == "the new claim",
+           f"R3-8 a declined gate finding restated with a revised claim is not held by the old decline "
+           f"({g8.get('rule_matched')}, {FL.load(d)[fid8].status})")
 
         # T29: the deliverable destination must be a plain file inside the run, not one the harness owns.
         bad_paths = {}

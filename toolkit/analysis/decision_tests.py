@@ -244,15 +244,18 @@ def prerun_evidence(spec) -> dict:
     dr = {k: fr[k] for k in names + pnames}
     box = {k: (float(v[0]), float(v[1])) for k, v in fr.items()} if kind == "emulator" else None
     fbox = design_features_box(spec) if kind == "emulator" else None
-    return {"kind": kind, "box": box, "features_box": fbox, "point": PV.params(spec, {k: v[2] for k, v in dr.items()}),
-            "packages": spec.packages(), "engine": eng}
+    from toolkit.analysis import uncertainty as UQ       # v2-posterior-point: posterior columns at the chosen point
+    point = UQ.posterior_point(spec, UQ.net_effect_sample(spec, eng), PV.params(spec, {k: v[2] for k, v in dr.items()}))
+    return {"kind": kind, "box": box, "features_box": fbox, "point": point, "packages": spec.packages(), "engine": eng}
 
 
 def interaction_arms(spec, eng, bench) -> dict:
     """The arm odds ratios an interaction test reads: at the spec values when the spec sets engine parameters
     (verified_spec_benchmarks), else from the engine's verified results. {arm, src, inputs} or {not_run}."""
     from toolkit.spec import engine_parameters as PV
-    if PV.values(spec):
+    # v2-posterior-point: with a posterior the outcomes are at its chosen point, so the arms must be too (the harness
+    # step computes them there and verified_spec_benchmarks checks its record)
+    if PV.values(spec) or "net_effect_posterior" in (spec.raw.get("uncertainty") or {}):
         # the outcomes are at the spec values, so the arms must be too (review round 2, R2-1): never derive the
         # rescaling from arms at the card values and apply it to outcomes at the spec values
         rows, why = PV.verified_spec_benchmarks(eng, spec, bench)

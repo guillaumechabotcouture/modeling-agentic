@@ -94,6 +94,69 @@ Each file's `restamped:` record holds the v0.8 re-stamp, with the v0.7 and v0.6 
 confirming Coiled run of `validate_once.sh` has not run yet: each v0.8 record says `confirmation: {validate_once:
 pending}` until it reports.
 
+## v0.18 scope: how much deterrence a PBO net keeps (F6 option A; owner, 2026-11-18, form P, fitted)
+
+**Why.** Equation 4 makes a PBO net a pyrethroid net at a higher bioassay mortality f(x). Above x of about 0.3 (93%
+of F6's LGAs), f is near 1, so hut mortality is near its ceiling (0.93). Equation 8 then cuts entry to 0.1-0.2, and
+the PBO net repels more than it kills: at x = 0.55, a new pyrethroid net kills 0.43 per attempt and a PBO net 0.11.
+Repelled mosquitoes retry and survive, so the community effect falls and the PBO benefit over pyrethroid nets goes to
+about 1.0 in the F6 batch. No pack PBO trial setting has its main vector at x 0.3-0.9 (Muleba's funestus stratum, 4% of its vectors, is at 0.545), and no source in hand measures entry at near-saturated hut
+mortality. `pbo_gain_scale` cannot change this (a larger gain pushes f closer to 1), nor can `pbo_adv_decay`.
+
+**What changed.** One parameter, `net_deter_sat` θ in [0, 1] (kind `fixed`, units share, default 1), acting on PBO
+nets only (`vector.hut_new_net`): a PBO net's entry becomes m_pyr + θ (m_pbo − m_pyr), with m_pyr the entry of a
+pyrethroid net at the same x and kill shift. Hut mortality l (and so k, j and the insecticide decay γ) stays the PBO
+net's. θ = 1 is Churcher's PBO net, on the same code path (V38 checks every net type, 6 resistance levels, 2 complexes
+and 9 ages bit for bit against the frozen v0.16 code). θ = 0 gives a PBO net a pyrethroid net's entry with PBO's
+higher hut mortality: at x = 0.55 it kills 0.58 per attempt; at Muleba (x = 0.088), 0.61 instead of 0.47. Pyrethroid and
+dual-AI nets do not change.
+
+**Rejected form (owner, 18 Nov).** A threshold on hut mortality for every net type (deterrence frozen above l_ref)
+needs a second constant with no source. At l_ref = 0.875 it does not restore PBO's killing (0.22 at x = 0.55); at 0.70
+it also changes pyrethroid nets at x ≥ 0.55 and the trial sites.
+
+**How it is set.** θ acts at the trial sites, so the PBO trials (B9-B9f, and B9g through the PBO arm) inform it. It
+joins the net-effect fit as its seventh parameter (`benchmarks/net_effect_fit.py`). It is confounded with
+`pbo_gain_scale` (both move a PBO net's killing per attempt), and the fit output reports their joint posterior. The card prior is
+its domain, uniform 0-1 (`priors.yaml`).
+
+**Evidence.** The engine identity changes, so the stored evidence (results, fitted values, equilibration and
+guess-sensitivity) is refused until `benchmarks/restamp_proof.py prove` shows the v0.17 and v0.18 outputs identical
+at the default and `restamp` re-stamps it. That proof runs engines, so it runs on Coiled through `cloud/vm_job.py`,
+not on a laptop.
+
+## v0.18, option A refit b: Muleba held out, pbo_adv_decay's ceiling widened (owner, 2026-11-19; no engine change)
+
+**What the 18 Nov fit found** (f6-refit-optiona, rc 2). No parameter set reproduces Muleba's durable PBO effect together
+with LLINEUP's waning:
+- B9b with B9f, and B9 with B9f, are jointly in band at 0 of 220 design points.
+- B9 with B9b is jointly in band at 6 points. All 6 have pbo_adv_decay 0.06–0.27, and at those points B9f is
+  0.22–0.32 against a band of 0.72–0.98.
+
+One global waning rate cannot carry both trials. B9 and B9b are therefore held out of the net-effect fit and
+monitored (`net_effect_fit.py` OPTION_A, `departure`).
+
+**The ceiling.** The fit chose pbo_adv_decay 1.868, against the card prior's 1.895. The prior's rule
+(`vector.pbo_adv_decay_extra`) takes LLINEUP's total waning of the PBO advantage from 6 to 18 months (as-treated
+prevalence ratios 0.74 and 0.84) and subtracts the engine's own waning. The bound is set at bioassay mortality x = 0.30,
+where the engine's PBO advantage grows with net age.
+
+| Basis | LLINEUP total waning, upper bound | Engine's own waning at x = 0.30 | Ceiling |
+|---|---|---|---|
+| Card prior (95%, θ = 1) | 1.594 | −0.301 | 1.895 |
+| Same rule at the fitted θ = 0.451 | 1.594 | −0.306 | 1.900 |
+| Refit b (99%, θ = 0.451) | 0.546 + 2.576 × 0.535 = 1.924 | −0.306 | 2.23 |
+
+The refit-b row is the owner's choice (option a). The refit adds 100 extension points with pbo_adv_decay in
+1.895–2.23; every other parameter spans the design box. The fit's box and the posterior's hard bound are set from
+`net_effect_fit.PAD_CEILING`.
+
+`priors.yaml` keeps 0–1.895, because its test (engine.py NE2) is inside the engine's code fingerprint. Editing it would
+change the code identity and forfeit the stored checkpoint of the 18 Nov fit.
+
+The fit output records whether the chosen value sits within 2% of 2.23 (`waves.refit_b.edge`). If it does and a LLINEUP target (B9d–B9f) misses at the chosen point, the engine
+cannot reproduce LLINEUP's waning inside the widened prior, and the report says so.
+
 ## v0.17 scope: the net-type relative effects as parameters with ranges (owner, 2026-11-12 and 13; written before any fit)
 
 **What changed.** Up to v0.16 the inputs that decide between net types were module constants: the Churcher 2016 hut-trial coefficients (`vector.CHURCHER`, the PBO equation among them) and the way PBO's advantage decays. The uncertainty step never varied them, and the value-of-information estimate ignored them. v0.17 adds three engine parameters (kind `fixed`). At their defaults the engine gives v0.16's outputs exactly. All three are drawn card priors (`priors.yaml`).
