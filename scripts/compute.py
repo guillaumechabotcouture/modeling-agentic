@@ -2029,7 +2029,13 @@ def _settle_dead(led, r, now=None, run_dir=None, foreign=False) -> tuple[float, 
 
     A caller on another host (`foreign`): nothing is signalled from here (its
     pids are that host's; its scheduler may be gone), so its remote chunks are
-    bounded by their shares and local work in flight charges the reservation."""
+    bounded by their shares and local work in flight charges the reservation.
+    When its record carries a heartbeat, a remote chunk is charged its cores x
+    the time from its start to the caller's last heartbeat (plus one interval
+    and the stop grace), at most its share: a run resumed from a checkpoint on
+    another host was charged every chunk's whole share for work its old
+    cluster never did. This is an estimate, not a bound: a chunk on a cluster
+    that outlived its caller can run on to its share (`inflight_basis`)."""
     now = time.time() if now is None else now
     held = float(r.get("core_s") or 0)
     path, _ = _progress_path(r.get("progress"), run_dir)
@@ -2039,13 +2045,15 @@ def _settle_dead(led, r, now=None, run_dir=None, foreign=False) -> tuple[float, 
         p = json.load(open(path))
         done = float(p["core_s"])
         out = list(p.get("out") or [])
-        float(p["t"])
+        t_rec, hb = float(p["t"]), float(p.get("hb_s") or 0)
     except (OSError, ValueError, KeyError, TypeError) as e:
         return held, f"caller died; progress record unreadable ({type(e).__name__}); charged its reservation", {}
+    by_hb = bool(foreign and hb > 0)
     if p.get("remote_unconfirmed"):
         return held, "caller died; remote chunks not confirmed stopped; charged its reservation", {}
     if foreign:
-        stopped, how = (False, "on another host: not stopped from here") if out else (True, "nothing in flight")
+        stopped, how = (False, "on another host: not stopped from here"
+                        + ("; charged up to its last heartbeat" if by_hb else "")) if out else (True, "nothing in flight")
     elif out:
         stopped, how = _stop_orphans(p, r.get("backend"))
     else:
@@ -2062,7 +2070,7 @@ def _settle_dead(led, r, now=None, run_dir=None, foreign=False) -> tuple[float, 
             if stopped:
                 bound += min(cores * max(0.0, now - started), share if share is not None else float("inf"))
             elif share is not None:
-                bound += share
+                bound += min(share, cores * (max(0.0, t_rec + hb - started) + SHARE_STOP_GRACE_S)) if by_hb else share
             else:
                 return held, f"caller died; work in flight not stopped ({how}); charged its reservation", {}
     except (KeyError, TypeError, ValueError) as e:
@@ -2075,7 +2083,8 @@ def _settle_dead(led, r, now=None, run_dir=None, foreign=False) -> tuple[float, 
            + f" ({held:.0f} core-s)")
     return charge, why, {"done_core_s": round(done, 1), "inflight_bound_core_s": round(bound, 1),
                          "inflight_estimate_core_s": None if est is None else round(est, 1),
-                         "reserved_core_s": round(held, 1)}
+                         "reserved_core_s": round(held, 1),
+                         **({"inflight_basis": "last_heartbeat"} if by_hb and out else {})}
 
 
 def _group_live(pgid: int) -> bool:
