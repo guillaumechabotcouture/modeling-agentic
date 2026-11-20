@@ -400,6 +400,61 @@ def _self_test() -> int:
     ok(e14 is None and ag12["regret_share"] == 0.5 and ag12["regret"] == 100.0 and w12["regret"]["value"] == "B"
        and w12.get("regret_abs", {}).get("value") == "A",
        f"MV23 the percentage and the absolute regret maxima come from their own values ({e14!r}, {list(w12)})")
+    # MV24-MV29 (owner decision, 2026-11-20): tested values whose regret agrees within TIE_RTOL of the re-optimised
+    # objective are tied, and the first in declared order is the one reported. Two CI runners reported different
+    # worst values for tests whose every value had zero regret: noise below 1e-9 chose between them.
+    import random
+
+    def row(value, objective, regret):
+        return dict(m, value=value, reoptimised_objective=objective, point_plan_objective_under_test=objective - regret,
+                    objective_gap=regret, regret=regret, regret_share=regret / objective if objective > 0 else None,
+                    share_units_changed=0.0, units_changed=0, triggered_by=[], decision_changes=False)
+
+    def witness(rows_, crit="regret"):
+        a, err = attempt(aggregate, rows_)
+        w_ = ((a or {}).get("worst_by_criterion") or {}).get(crit) or {}
+        return w_.get("value"), w_.get("tie"), w_.get("tied"), a or {}, err
+    tol = globals().get("TIE_RTOL", 0.0)
+    got = [witness([row("A", 88.0, na), row("B", 352.0, nb)], c)[:3]
+           for na, nb in ((0.0, 3e-12), (3e-12, 0.0), (-2e-13, 1e-13), (0.0, 0.0)) for c in ("regret", "regret_abs")]
+    ok(tol > 0 and set(got) == {("A", True, 2)},
+       f"MV24 values whose regret differs by noise are tied: the first tested value is reported, with tie: true and "
+       f"the size of the tied set, for the share and the absolute regret alike ({sorted(set(got), key=str)})")
+    rnd, seen = random.Random(7), set()
+    for _ in range(200):
+        noise = [rnd.uniform(-1, 1) * 0.5 * tol * 100.0 for _ in range(3)]
+        v, t, n, a, _e = witness([row(k, 100.0 * (i + 1), 2.0 + noise[i] * (i + 1)) for i, k in enumerate("ABC")], "regret_abs")
+        seen.add((v, t, n, a.get("reoptimised_objective"), a.get("decision_changes"), tuple(a.get("triggered_by") or ())))
+    ok(tol > 0 and seen == {("A", True, 3, 100.0, False, ())},
+       f"MV25 200 shuffles of noise below the tolerance give one witness, one top-level objective and one verdict "
+       f"({len(seen)} distinct outcomes)")
+    v1 = witness([row("A", 100.0, 0.0), row("B", 100.0, 0.5), row("C", 100.0, 0.5 - 1e-9)])
+    v2 = witness([row("A", 100.0, 0.0), row("B", 100.0, 0.5)])
+    ok(v1[:3] == ("B", True, 2) and v2[:3] == ("B", None, None) and "tie" not in v2[3]["worst_by_criterion"]["regret"],
+       f"MV26 a larger regret still wins; among the tied the first in declared order is reported; without a tie no "
+       f"tie field is written ({v1[:3]}, {v2[:3]})")
+    big = witness([row("A", 1e6, 10.0), row("B", 1e6, 10.0 + 0.5 * tol * 1e6)], "regret_abs")
+    small = witness([row("A", 1.0, 0.1), row("B", 1.0, 0.1 + 0.5 * tol * 1e6)], "regret_abs")
+    zero = witness([dict(row("A", 1.0, 0.0), reoptimised_objective=0.0, regret=0.0, regret_share=None),
+                    dict(row("B", 1.0, 0.0), reoptimised_objective=0.0, regret=1e-12, regret_share=None)], "regret_abs")
+    ok(tol > 0 and big[:3] == ("A", True, 2) and small[:3] == ("B", None, None) and zero[:3] == ("B", None, None),
+       f"MV27 the tolerance is a share of the re-optimised objective: the same absolute difference ties under a large "
+       f"objective and not under a small one; under a zero objective only equal regrets tie ({big[:3]}, {small[:3]}, "
+       f"{zero[:3]})")
+    rows_n = [row("A", 88.0, 3e-12), row("B", 352.0, 0.0)]
+    a_n, _e = attempt(aggregate, rows_n)
+    a_n = a_n or {}
+    ok(a_n.get("results") == [dict({f: r.get(f) for f in SUMMARY}, value=r["value"]) for r in rows_n]
+       and a_n.get("decision_changes") is False and a_n.get("triggered_by") == []
+       and {k: (v.get("value"), v.get("tie")) for k, v in (a_n.get("worst_by_criterion") or {}).items()
+            if k not in ("regret", "regret_abs")} == {k: ("A", None) for k in ("share", "dollars", "dollars_moved",
+                                                                              "dollars_reallocated", "population")},
+       "MV28 the verdict, the criteria that fired, every tested value's row and the other criteria's worst values are "
+       "as before")
+    doc_t = dict(a_n, varied="v", criterion="c", share_threshold=thr["share"], regret_threshold=thr["regret"],
+                 dollars_threshold=thr["dollars"])
+    ok(bool(a_n) and MM._result_conflicts("t.yaml", doc_t, "x", None) == [],
+       "MV29 the loader accepts a result with a tie recorded")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
