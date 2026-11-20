@@ -138,19 +138,36 @@ def _retired_calls(cmd, depth: int = 0) -> bool:
     only to refuse; a command that passes keeps the classification it had before the retirement."""
     try:
         argvs = _split_commands(cmd)
-    except PipelineError:
+    except (PipelineError, ValueError):        # a string this lexer cannot read keeps its old classification
         return False
     for argv in argvs:
-        for i, t in enumerate(argv):
-            if os.path.basename(t) == "main.py" or (t == "-m" and i + 1 < len(argv) and argv[i + 1] == "main"):
-                rest = argv[i + 1:] if t != "-m" else argv[i + 2:]
-                if _flag_tokens(rest)[0]:
-                    return True
+        while argv and (os.path.basename(argv[0]) == "env" or "=" in argv[0]):   # env VAR=x prefixes
+            argv = argv[1:]
+        if not argv:
+            continue
+        head = os.path.basename(argv[0])
+        rest = None
+        if head.startswith("python"):          # python [opts] main.py ... | -m main ... | -mmain ...
+            for i, t in enumerate(argv[1:], 1):
+                if os.path.basename(t) == "main.py":
+                    rest = argv[i + 1:]
+                elif t == "-m" and i + 1 < len(argv) and argv[i + 1] == "main":
+                    rest = argv[i + 2:]
+                elif t == "-mmain":
+                    rest = argv[i + 1:]
+                elif t.startswith("-"):
+                    continue
                 break
-        if argv and os.path.basename(argv[0]) in _SHELLS and "-c" in argv[1:] and depth < 3:
-            j = argv.index("-c", 1)
-            if j + 1 < len(argv) and _retired_calls(argv[j + 1], depth + 1):
-                return True
+        elif any(os.path.basename(t) == "main.py" for t in argv):
+            rest = argv[[os.path.basename(t) for t in argv].index("main.py") + 1:]
+        if rest is not None and _flag_tokens(rest)[0]:
+            return True
+        if head in _SHELLS and depth < 3:      # sh -c '...', bash -lc '...', bash -ec '...'
+            for j, t in enumerate(argv[1:], 1):
+                if t.startswith("-") and not t.startswith("--") and "c" in t[1:]:
+                    if j + 1 < len(argv) and _retired_calls(argv[j + 1], depth + 1):
+                        return True
+                    break
     return False
 
 
@@ -253,6 +270,8 @@ def resume_conflict(meta: dict, pipeline: str, run_path: str | None = None, expl
         if rec != pipeline:
             return f"this run was recorded as pipeline {rec}; resume it with --{rec}"
         return None
+    if run_path is not None and not os.path.isdir(run_path):
+        return f"{run_path} not found"
     by_files = None if run_path is None else ("v2" if os.path.exists(os.path.join(run_path, "run_state.json")) else "v1")
     if by_files in RETIRED:
         return (f"this run records no pipeline, and its files are pipeline {by_files}'s (no run_state.json), "
@@ -265,6 +284,17 @@ def resume_conflict(meta: dict, pipeline: str, run_path: str | None = None, expl
         return (f"this run records no pipeline, and its files are pipeline {by_files}'s "
                 f"({'has' if by_files == 'v2' else 'no'} run_state.json): it cannot be resumed with --{pipeline}")
     return None
+
+
+def retired_resume(meta: dict, run_path: str | None = None) -> str | None:
+    """Why a run may not be resumed because its pipeline is retired, or None: recorded as v1, or with no
+    record and no run_state.json (v1's files). The other resume rules are resume_conflict's."""
+    meta = meta if isinstance(meta, dict) else {}
+    if "pipeline" in meta:
+        return resume_conflict(meta, DEFAULT, run_path) if meta.get("pipeline") in RETIRED else None
+    if run_path is None or not os.path.isdir(run_path) or os.path.exists(os.path.join(run_path, "run_state.json")):
+        return None
+    return resume_conflict(meta, DEFAULT, run_path)
 
 
 def label(meta) -> tuple[str, str]:
@@ -338,12 +368,17 @@ def _self_test() -> int:
                      ("python3 main.py Q;echo --v2", "an attached ; ends them"),
                      ("python3 main.py Q&&echo --v2", "an attached && ends them"),
                      ("python3 main.py Q --v2; python3 main.py R", "a second main.py without a pipeline"),
-                     ("python3 main.py $(echo --v2) Q", "a command substitution main.py's arguments depend on")):
+                     ):
         try:
             got = from_command(cmd)
             ok(False, f"PI29 refused ({why}): got {got}")
         except PipelineError as e:
             ok(RETIRED_MESSAGE not in str(e), f"PI29 refused: {why} ({e})")
+    try:
+        got = from_command("python3 main.py $(echo x) Q --v2")
+        ok(False, f"PI29c a command substitution in main.py's arguments is refused (got {got})")
+    except PipelineError as e:
+        ok("command substitution" in str(e), f"PI29c a command substitution in main.py's arguments is refused: {e}")
     try:
         got = from_command("python3 main.py Q --v2 && python3 main.py R --v1")
         ok(False, f"PI29b a command with a second main.py --v1 call is refused (got {got})")
@@ -352,7 +387,8 @@ def _self_test() -> int:
     # PI39 (Codex on the retirement PR, P1): main.py run as a module or inside a shell wrapper is seen
     # for --v1; a wrapper relying on the default keeps working as before (not read as a main.py call).
     for cmd in (["python3", "-m", "main", "--v1", "Q?"], "python3 -m main --v1 'Q?'",
-                ["bash", "-c", "python3 main.py --v1 'Q?'"], "sh -c 'cd x && python3 main.py Q --v1'"):
+                ["bash", "-c", "python3 main.py --v1 'Q?'"], "sh -c 'cd x && python3 main.py Q --v1'",
+                "bash -lc 'python3 main.py --v1 Q'", "python3 -mmain --v1 Q", ["/usr/bin/env", "bash", "-ec", "python3 main.py --v1"]):
         try:
             got = from_command(cmd)
             ok(False, f"PI39 {cmd!r} is refused as retired (got {got})")
@@ -361,6 +397,15 @@ def _self_test() -> int:
     ok(from_command(["bash", "-c", "python3 main.py 'Q?'"]) is None
        and from_command("python3 -m main Q --v2") is None,
        "PI39b wrapped or module commands without --v1 are classified as before")
+    # PI39c (Codex round 2): the scan never changes a v2 command's classification.
+    for cmd, want in (("python3 main.py Q --v2 && echo -m main --v1", "v2"),
+                      (["bash", "-c", "python3 main.py --v2 $'What\\'s next?'"], None),
+                      (["bash", "-c", "echo 'unclosed"], None)):
+        try:
+            got = from_command(cmd)
+            ok(got == want, f"PI39c {cmd!r} classifies as {want} (got {got})")
+        except PipelineError as e:
+            ok(False, f"PI39c {cmd!r} classifies as {want}, not refused: {e}")
     ok(from_command("python3 main.py Q --v2\ncp -r runs $JOB_OUT/") == "v2", "PI30 a later line does not hide main.py's flag")
     ok(from_command("python3 main.py A --v2 && python3 main.py B --v2") == "v2", "PI31 several calls that agree")
     # PI36-38 (Codex r2): comments, redirections and continued lines.
@@ -378,6 +423,10 @@ def _self_test() -> int:
         open(os.path.join(rs, "run_state.json"), "w").write("{}")
         ok(not resume_conflict({}, "v2", rs, explicit_flag=True),
            "PI32 a run with no recorded pipeline but a run_state.json resumes as v2")
+        missing = os.path.join(td, "no-such-run")
+        why = resume_conflict({}, "v2", missing, explicit_flag=True)
+        ok(why and "not found" in why and RETIRED_MESSAGE not in why,
+           f"PI33f (Codex P2) a resume of a missing directory says so, not that it is v1's ({why})")
         why = resume_conflict({}, "v2", td, explicit_flag=False)
         ok(why and RETIRED_MESSAGE in why and "--v1" not in why,
            f"PI33d (Codex P2) a bare resume of an old run with v1's files gets the retirement message ({why})")
@@ -425,6 +474,8 @@ def _self_test() -> int:
     ok(label({"pipeline": "v1", "commit": "abc1234"}) == ("v1", "abc1234"), "PI24 recorded values are read")
     ok(resume_conflict({"pipeline": "v1"}, "v2") and not resume_conflict({}, "v2")
        and not resume_conflict({"pipeline": "v2"}, "v2"), "PI25 a recorded pipeline must match on resume")
+    why = resume_conflict({"pipeline": "v2"}, "v1")
+    ok(why and "recorded as pipeline v2" in why, f"PI25b a recorded v2 run asked for as another pipeline is refused ({why})")
     ok(same_commit("abc1234", "abc1234def") and not same_commit("abc1234", "abd1234")
        and not same_commit(UNKNOWN, UNKNOWN) and same_commit("abc1234def-dirty", "abc1234"),
        "PI26 commit prefixes match; unknown never matches")

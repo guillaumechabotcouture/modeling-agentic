@@ -14,7 +14,7 @@ disease-agnostic: every question-specific fact is in the rubric and the truth fi
     python3 scripts/eval_suite.py grade --root <dir> [--out suite_scores.json]
         <dir>/<q>/<label>/runs/<run>/ as `collect` writes it (~/modeling-agentic-keep/evals/<tag>);
         the answer key is the one whose input hashes match the run's
-    python3 scripts/eval_suite.py run [--tag T] [--reps N] [--pipeline v2|v1] [--execute] [q ...]
+    python3 scripts/eval_suite.py run [--tag T] [--reps N] [--pipeline v2] [--execute] [q ...]   (v1 is retired)
         preflight (inputs current, nothing hidden in the launch tarball), then print the
         launch commands, each stating its pipeline (EVAL_PIPELINE, default v2); --execute runs
         them (each launch costs up to the US$35 cap)
@@ -1085,18 +1085,22 @@ def input_problems(tree, questions, private_dir=None, data_dir=DATA) -> list[str
     return probs
 
 
-def launch_tree(tree_arg, q) -> str:
-    """The tree a launch would ship: --tree, else the config's (~/modeling-agentic-launch)."""
+def launch_tree(tree_arg, q, pipeline: str = "v2") -> str:
+    """The tree a launch would ship: --tree, else the config's (~/modeling-agentic-launch), read with the
+    pipeline the launch selects (an inherited EVAL_PIPELINE never decides it)."""
     if tree_arg:
         return os.path.abspath(os.path.expanduser(tree_arg))
     sys.path.insert(0, os.path.join(REPO, "cloud"))
     import run_cluster
-    saved = os.environ.pop("EVAL_TREE", None)
+    saved = {k: os.environ.pop(k, None) for k in ("EVAL_TREE", "EVAL_PIPELINE")}
+    os.environ["EVAL_PIPELINE"] = pipeline
     try:
         return run_cluster.load_config(os.path.join(REPO, "cloud", "configs", f"eval_{q}.py")).tree
     finally:
-        if saved is not None:
-            os.environ["EVAL_TREE"] = saved
+        os.environ.pop("EVAL_PIPELINE", None)
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
 
 
 # Lines that name the suite, a question or a shipped eval path; a planted keyword within
@@ -1327,7 +1331,7 @@ def _run_command(ap, args, private) -> int:
                   "anywhere else. Run `python3 scripts/eval_suite.py run` without --local.")
             return 2
         qs = args.questions or suite_questions()
-        tree = launch_tree(args.tree, qs[0])
+        tree = launch_tree(args.tree, qs[0], args.pipeline)
         with use_private(private):
             stale = {q: check_inputs(q) for q in qs}
             probs = [f"{q}: inputs differ from the generator: {d}" for q, d in stale.items() if d]
@@ -1664,6 +1668,19 @@ def _self_test_s19_pipeline(ok, td):
         rc = e.code
     ok(rc not in (0, None) and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
        f"S19q (Codex P2) `run --pipeline v1` exits with the retirement message ({rc}, {err.getvalue()[-160:]!r})")
+    # S19r (Codex round 2): an inherited EVAL_PIPELINE=v1 does not break the config lookup of a v2 launch.
+    old_ep = os.environ.get("EVAL_PIPELINE")
+    os.environ["EVAL_PIPELINE"] = "v1"
+    try:
+        t = launch_tree(None, suite_questions()[0], pipeline="v2")
+        ok(bool(t), f"S19r the default launch tree is found for --pipeline v2 under EVAL_PIPELINE=v1 ({t})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"S19r the default launch tree is found for --pipeline v2 under EVAL_PIPELINE=v1: {type(e).__name__}: {e}")
+    finally:
+        if old_ep is None:
+            os.environ.pop("EVAL_PIPELINE", None)
+        else:
+            os.environ["EVAL_PIPELINE"] = old_ep
 
 
 def _test_s12_repo_tree(ok, td):

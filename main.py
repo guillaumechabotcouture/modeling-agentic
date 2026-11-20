@@ -1054,15 +1054,29 @@ def _self_test_pipeline(ok, _outcome) -> None:
                 rc = drive("--resume", rp)
             ok(rc == 1 and not calls and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
                f"PV7c a v1 eval run is refused as retired ({rc}, {err.getvalue()[-160:]!r})")
-            # PV7d (Codex P1): the lead pipeline's entry refuses whatever identity a caller passes.
-            n_before = len(os.listdir(os.path.join(REPO_ROOT, "runs"))) if os.path.isdir(os.path.join(REPO_ROOT, "runs")) else 0
-            try:
-                asyncio.run(saved["run"]("Q?", 1, 1, identity={"pipeline": "v1", "commit": "abc1234", "launcher": "direct"}))
-                ok(False, "PV7d main.run refuses to start the lead pipeline")
-            except pipeline_id.PipelineError as e:
-                n_after = len(os.listdir(os.path.join(REPO_ROOT, "runs"))) if os.path.isdir(os.path.join(REPO_ROOT, "runs")) else 0
-                ok(str(e) == pipeline_id.RETIRED_MESSAGE and n_after == n_before,
-                   f"PV7d main.run refuses before creating a run dir: {e}")
+            # PV7d (Codex P1): the lead pipeline's entry refuses whatever identity a caller passes, or none.
+            def _no_dir(q):
+                raise AssertionError("main.run created a run dir")
+            g["create_run_dir"] = _no_dir
+            for ident in ({"pipeline": "v1", "commit": "abc1234", "launcher": "direct"},
+                          {"pipeline": "v2", "commit": "abc1234", "launcher": "direct"}, None):
+                try:
+                    asyncio.run(saved["run"]("Q?", 1, 1, identity=ident))
+                    ok(False, f"PV7d main.run refuses to start the lead pipeline (identity {ident})")
+                except pipeline_id.PipelineError as e:
+                    ok(str(e) == pipeline_id.RETIRED_MESSAGE, f"PV7d main.run refuses before creating a run dir: {e}")
+                except AssertionError as e:
+                    ok(False, f"PV7d main.run refuses before creating a run dir (identity {ident}): {e}")
+            g["create_run_dir"] = saved["create_run_dir"]
+            # PV7e (Codex round 2): main_v2 called directly does not resume (or restamp) a run recorded as v1.
+            from agents import stage_machine as _sm3
+            _sm3.init_run(rp, "Q?")
+            json.dump({"question": "Q?", "pipeline": "v1"}, open(os.path.join(rp, "metadata.json"), "w"))
+            import argparse as _ap
+            rc = saved["main_v2"](_ap.Namespace(resume=rp, question=None, cloud=False, max_rounds=1, signoff="lead",
+                                                max_budget_usd=None, dev_unsandboxed_derivations=False))
+            ok(rc == 1 and json.load(open(os.path.join(rp, "metadata.json"))).get("pipeline") == "v1",
+               f"PV7e main_v2 refuses a run recorded as v1 and leaves its record alone ({rc})")
             # PV8: a real main_v2 (machine stubbed at run_v2) stamps metadata.json, and the machine's
             # init_run keeps the stamp instead of replacing metadata.json.
             g["main_v2"] = saved["main_v2"]
@@ -1111,8 +1125,25 @@ def _self_test_pipeline(ok, _outcome) -> None:
             ok(rc == 1 and not calls and "records no pipeline" in err.getvalue() and "--v2" in err.getvalue(),
                f"PV11c (Codex r2) ... nor on the default: a run with no recorded pipeline needs "
                f"an explicit flag ({rc}, {calls}, {err.getvalue()[-160:]!r})")
-            rc = drive("--v2", "--resume", rp)
-            ok(rc == 0 and [c[0] for c in calls] == ["v2"], f"PV11d ... and resumes with an explicit --v2 ({rc}, {calls})")
+            from agents import stage_machine as _sm4, v2_sdk_tasks as _vt4
+            got_run: list = []
+            sm4, vt4 = _sm4.run_v2, _vt4.SdkTasks
+            _sm4.run_v2 = lambda question, run_dir, tasks, **kw: got_run.append((question, run_dir)) or "completed"
+            _vt4.SdkTasks = lambda *a, **k: None
+            g["main_v2"] = saved["main_v2"]
+            try:
+                rc = drive("--v2", "--resume", rp)
+            finally:
+                _sm4.run_v2, _vt4.SdkTasks = sm4, vt4
+                g["main_v2"] = fake_v2
+            ok(rc == 0 and got_run == [("Q?", rp)],
+               f"PV11d ... and the real main_v2 resumes it with an explicit --v2: its directory and saved question "
+               f"({rc}, {got_run})")
+            # PV11e (Codex round 2): --preflight-only with --resume of an unrecorded v2 run still runs the preflight.
+            json.dump({"question": "Q?"}, open(os.path.join(rp, "metadata.json"), "w"))   # unrecorded again
+            rc = drive("--preflight-only", "--resume", rp)
+            ok(rc == 3 and [c[0] for c in calls] == ["preflight"],
+               f"PV11e --preflight-only --resume runs the preflight, as before ({rc}, {calls})")
             json.dump({"question": "Q?", "pipeline": "V2!"}, open(os.path.join(rp, "metadata.json"), "w"))
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
@@ -3021,6 +3052,10 @@ def main_v2(args, ident: dict | None = None) -> int:
     ident = ident or pipeline_id.identity("v2", REPO_ROOT)
     if args.resume:
         run_path = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
+        why = pipeline_id.retired_resume(_metadata_dict(os.path.join(run_path, "metadata.json")), run_path)
+        if why:                        # a run recorded as v1 is never resumed or restamped (retired)
+            print(f"Error: {why}", file=sys.stderr)
+            return 1
         st = stage_machine.load_state(run_path)
         if st is None:
             print(f"Error: {run_path} has no run_state.json (not a v2 run; {pipeline_id.RETIRED_MESSAGE})")
@@ -3105,10 +3140,10 @@ def main() -> int:
     # the launch archive: no evals/, no .git), so agents cannot reach answer keys by any
     # route. Checked on the question the run will actually use, including --resume, and
     # before the v2 dispatch so --v2 runs get the same refusal.
-    if args.resume:   # a run continues under the pipeline it was recorded with; a v1 run never (retired)
+    _rp = None
+    if args.resume:   # a run recorded as v1 is never resumed (retired): said before any other refusal
         _rp = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
-        why = pipeline_id.resume_conflict(_metadata_dict(os.path.join(_rp, "metadata.json")), pipeline, _rp,
-                                          explicit_flag=bool(args.v1 or args.v2))
+        why = pipeline_id.retired_resume(_metadata_dict(os.path.join(_rp, "metadata.json")), _rp)
         if why:
             print(f"Error: {why}", file=sys.stderr)
             return 1
@@ -3120,6 +3155,12 @@ def main() -> int:
         return _preflight_and_report(args)
     ident = pipeline_id.identity(pipeline, REPO_ROOT, args.launcher)
     print(f"Pipeline: {ident['pipeline']} | commit {ident['commit']} | launcher {ident['launcher']}", flush=True)
+    if args.resume:   # a run continues under the pipeline it was recorded with
+        why = pipeline_id.resume_conflict(_metadata_dict(os.path.join(_rp, "metadata.json")), pipeline, _rp,
+                                          explicit_flag=bool(args.v1 or args.v2))
+        if why:
+            print(f"Error: {why}", file=sys.stderr)
+            return 1
     try:
         return main_v2(args, ident)
     except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
