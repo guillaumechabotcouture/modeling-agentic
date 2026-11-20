@@ -3058,7 +3058,7 @@ def main_v2(args, ident: dict | None = None) -> int:
             return 1
         st = stage_machine.load_state(run_path)
         if st is None:
-            print(f"Error: {run_path} has no run_state.json (not a v2 run; {pipeline_id.RETIRED_MESSAGE})")
+            print(f"Error: {run_path} has no run_state.json: no v2 run state to resume")
             return 1
         question = st.question
     else:
