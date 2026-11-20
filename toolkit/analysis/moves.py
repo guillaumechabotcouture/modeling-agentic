@@ -490,6 +490,26 @@ def _self_test() -> int:
                  dollars_threshold=thr["dollars"])
     ok(bool(a_n) and MM._result_conflicts("t.yaml", doc_t, "x", None) == [],
        "MV29 the loader accepts a result with a tie recorded")
+    # MV30-MV32: Codex review of the tie rule (written first; each failed)
+    fire = dict(row("B", 1e9, 500.0), triggered_by=["regret"], decision_changes=True)
+    v30 = witness([row("A", 1e9, 0.0), fire])
+    ok(v30[:3] == ("B", None, None) and v30[3].get("regret") == 500.0 and v30[3].get("decision_changes") is True
+       and witness([row("A", 1e9, 0.0), fire], "regret_abs")[0] == "B",
+       f"MV30 (P1) a value that fires on regret is never tied with one that does not: the reported regret is the one "
+       f"behind the verdict ({v30[:3]}, {v30[3].get('regret')})")
+    v31 = [witness([row("A", 50.0, 1.9995), row("B", 100.0, 2.0), row("C", 1000.0, 2.0 + n_)], "regret_abs")
+           for n_ in (-1e-12, 1e-12, 0.0)]
+    ok(len({(v[0], v[1], v[2], v[3].get("reoptimised_objective")) for v in v31}) == 1,
+       f"MV31 (P1) the tolerance does not depend on which value noise makes the largest: one witness, one tied set "
+       f"({[v[:3] for v in v31]})")
+    nan = float("nan")
+    v32 = [witness([dict(row("A", 100.0, 1.0), regret=a_, regret_share=a_), dict(row("B", 100.0, 1.0), regret=b_,
+                                                                                regret_share=b_)], "regret_abs")
+           for a_, b_ in ((nan, 1.0), (1.0, nan))]
+    ok([v[4] for v in v32] == [None, None] and [v[0] for v in v32] == ["A", "B"]
+       and all(v[3].get("regret") != v[3].get("regret") for v in v32),
+       f"MV32 (P1) a regret that is not a number is reported as it is, whatever its place (no exception, never hidden "
+       f"behind a finite value) ({[(v[0], repr(v[4])) for v in v32]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
