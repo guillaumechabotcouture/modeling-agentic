@@ -529,7 +529,8 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
         # Every gate finding counts (a resolved blocker whose test fails is done_when_unmet; a missing
         # presentation review is critique_presentation_missing); only one that restates an open
         # critic blocker (same id as its key) is a duplicate.
-        if str(v.get("key") or "") in critic_open or fid in seen:
+        # (a regression is its own HIGH finding beside the open one it is keyed by)
+        if (str(v.get("key") or "") in critic_open and v.get("kind") != "done_when_regressed") or fid in seen:
             continue
         seen.add(fid)
         out.append({"id": fid, "source": "harness", "severity": v.get("severity"),
@@ -1339,7 +1340,7 @@ class Machine:
     def _rethink_reasons(self, to: str, planned: bool) -> list[str]:
         import yaml
         import validate_critique_yaml as V
-        g, out, named = self.st.last_gate or {}, [], set()
+        g, out, named, seen = self.st.last_gate or {}, [], set(), set()
         if not planned:
             if g.get("action") == "RETHINK_STRUCTURAL" and g.get("rationale"):
                 out.append(f"gate: {g['rationale']}")
@@ -1349,8 +1350,10 @@ class Machine:
                     sm = doc.get("structural_mismatch") or {}
                     if sm.get("detected"):
                         out.append(f"{reviewer}: {sm.get('description')}")
-                    named |= {str(b.get("id")) for b in doc.get("blockers") or []
-                              if isinstance(b, dict) and b.get("category") == "STRUCTURAL" and not b.get("resolved")}
+                    for b in doc.get("blockers") or []:       # its own text: not every reviewer's is in the ledger
+                        if isinstance(b, dict) and b.get("category") == "STRUCTURAL" and not b.get("resolved"):
+                            out.append(f"{b.get('id')}: {b.get('claim')}" + (f" Required: {_remedy(b)}" if _remedy(b) else ""))
+                            seen.add(str(b.get("id")))
                 except Exception:  # noqa: BLE001 -- the gate already judged the file; here it only adds reasons
                     continue
         else:
@@ -1367,7 +1370,7 @@ class Machine:
         except Exception as e:  # noqa: BLE001 -- the reasons read so far are kept
             led, out = [], out + [f"the findings ledger could not be read ({type(e).__name__})"]
         out += [f"{f.id}: {f.claim}" + (f" Required: {f.fix_requires}" if f.fix_requires else "")
-                for f in led if f.id in named or f.owner_state == to]
+                for f in led if (f.id in named or f.owner_state == to) and f.id not in seen]
         return [" ".join(str(x).split())[:600] for x in out][:20]
 
     def rebuild(self, run_dir: str) -> dict:

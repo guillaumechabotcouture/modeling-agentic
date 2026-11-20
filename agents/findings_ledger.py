@@ -91,8 +91,8 @@ def tests_of(dw) -> list | None:
     scripts/done_when.py reads it), or None."""
     t = dw if isinstance(dw, list) else [dw] if isinstance(dw, dict) else None
     try:          # as save() writes it: a test it could not write (YAML keys of mixed types) is no test here
-        json.dumps(t, sort_keys=True, default=str)
-    except (TypeError, ValueError):
+        json.dumps(t, sort_keys=True)
+    except (TypeError, ValueError, RecursionError):
         return None
     return t
 
