@@ -887,6 +887,9 @@ def _validate_pending(s: Spec) -> list[str]:
             bad.append(f"decision test {dt.get('id')}: type {dt.get('type')!r} not in {DECISION_TEST_TYPES}")
         if any(ch.isdigit() for ch in str(dt.get("text") or "")):
             bad.append(f"decision test {dt.get('id')}: text must be descriptive, with no numbers")
+        if "with" in dt and dt.get("type") != "parameter_value":       # as after the engine choice (Codex r2)
+            bad.append(f"decision test {dt.get('id')}: with (companion parameters) is only for a parameter_value "
+                       "test")
     bad += _validate_deliverable(s)
     return bad
 

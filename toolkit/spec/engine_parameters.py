@@ -523,18 +523,16 @@ def companions(dt) -> dict:
     return {str(k): float(v) for k, v in w.items() if _isnum(v)} if isinstance(w, dict) else {}
 
 
-def test_settings(dt) -> dict:
+def test_settings(dt, numbers_only: bool = False) -> dict:
     """{parameter: [values]} a parameter_value decision test sets: its own parameter's values and each companion's
-    value. Every reader of what a test sets (the design box, held spec values, hard bounds) uses this."""
+    value. Every reader of what a test sets (the design box, held spec values, hard bounds) uses this. The test's own
+    values are read as the runner reads them, with float(): a quoted number counts and a value that is not a number
+    raises ValueError (as these readers did before `with`; Codex r1-r2). `numbers_only`: only values written as
+    numbers, nothing raised (tested_boxes' rule before `with`)."""
     if not isinstance(dt, dict) or dt.get("type") != "parameter_value":
         return {}
     out = {k: [v] for k, v in companions(dt).items()}
-    vs = []
-    for x in dt.get("values") or []:        # as the runner reads them: float(), a quoted number included (Codex r1)
-        try:
-            vs.append(float(x))
-        except (TypeError, ValueError):
-            pass
+    vs = [float(x) for x in dt.get("values") or [] if not numbers_only or _isnum(x)]
     if vs and isinstance(dt.get("parameter"), str):
         out[dt["parameter"]] = out.get(dt["parameter"], []) + vs
     return out
@@ -547,7 +545,7 @@ def tested_boxes(spec) -> dict:
     hv = held(spec)
     out = {}
     for dt in ((_raw(spec).get("analysis") or {}).get("decision_tests") or []):
-        for n, vs in test_settings(dt).items():
+        for n, vs in (test_settings(dt, numbers_only=True) if isinstance(dt, dict) else {}).items():
             if n in hv:
                 lo, hi = out.get(n, [hv[n]] * 2)
                 out[n] = [min(lo, *vs), max(hi, *vs)]

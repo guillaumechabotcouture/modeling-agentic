@@ -130,6 +130,9 @@ def departure_verdicts(departures, targets, records) -> list[dict]:
         why = None
         if rec is None or rec.get("status") != "run":
             why = f"its decision test {tid} was not run ({(rec or {}).get('reason', 'no harness record')})"
+        elif rec.get("with"):        # v2-dt-with: the companions alone could produce the change (Codex r1-r2)
+            why = (f"{tid} held companion parameters (with: {', '.join(sorted(map(str, rec['with'])))}); a test that "
+                   "carries a departure varies only the parameter carrying the effect")
         elif not any(x is False for x in rec.get("perturbation_identity") or []):
             why = f"every perturbation of {tid} is an identity at the calibrated point"
         elif set(rec.get("missing_subtraction") or []) & target:

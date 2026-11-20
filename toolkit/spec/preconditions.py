@@ -182,10 +182,9 @@ def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | 
         return False, (f"does not execute on the emulator path: {name} is neither drawn nor set by engine_parameters, "
                        "so it is not an emulator input"), list(t.get("values") or [])
     from toolkit.spec import engine_parameters as PV
-    off = sorted(n for n in PV.companions(t) if n not in drawn and n not in eps)     # v2-dt-with: its companions too
-    if an.get("evaluation") == "emulator" and off:
-        return False, (f"does not execute on the emulator path: its companion parameter(s) {off} (with) are neither "
-                       "drawn nor set by engine_parameters, so they are not emulator inputs"), list(t.get("values") or [])
+    if PV.companions(t) or "with" in t:     # v2-dt-with (Codex r1-r2): a range test varies only its own parameter
+        return False, ("holds companion parameters (with): the dossier's range test varies only its own parameter, at "
+                       "the run's point values of the others"), list(t.get("values") or [])
     return True, "", list(t.get("values") or [])
 
 
