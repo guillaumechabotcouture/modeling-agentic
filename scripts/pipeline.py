@@ -219,11 +219,18 @@ def _is_step_log(path: str, run_dir: str) -> bool:
         return False
 
 
-def _names_step_log(pat: str) -> bool:
-    """Whether a declared path or glob names a step log by its spelling (any case): <LOG_DIR>/<...>.log."""
+def _names_step_log(pat: str, run_dir: str) -> bool:
+    """Whether a declared output path or glob sits directly in the step logs' directory: LOG_DIR as spelled, or
+    another spelling of the same existing directory (a case-insensitive volume). The directory is the runner's for
+    outputs, so no declared output (nor the integrity watch on it) covers a log by naming that directory."""
     import posixpath
-    norm = posixpath.normpath(pat.replace(os.sep, "/")).lower()
-    return posixpath.dirname(norm) == LOG_DIR and norm.endswith(".log")
+    d = posixpath.dirname(posixpath.normpath(pat.replace(os.sep, "/")))
+    if d == LOG_DIR:
+        return True
+    try:
+        return os.path.samefile(os.path.join(run_dir, d), os.path.join(run_dir, LOG_DIR))
+    except (OSError, ValueError):
+        return False
 
 
 def _matches(run_dir: str, pat: str) -> list[str]:
@@ -381,8 +388,8 @@ def load(run_dir: str) -> tuple[list[dict], list[str]]:
                 st[k] = []
         if not st["outputs"]:
             errs.append(f"{where}: declares no outputs")
-        errs += [f"{where}: output {o} names one of the runner's step logs ({LOG_DIR}/*.log); write it elsewhere"
-                 for o in st["outputs"] if _names_step_log(o)]
+        errs += [f"{where}: output {o} is in {LOG_DIR}/, which holds the runner's step logs; write it elsewhere"
+                 for o in st["outputs"] if _names_step_log(o, run_dir)]
         if "timeout_s" in st and (not isinstance(st["timeout_s"], (int, float)) or isinstance(st["timeout_s"], bool)
                                   or not 0 < st["timeout_s"] < float("inf")):    # NaN fails too (Codex on #267)
             errs.append(f"{where}: `timeout_s` must be a positive finite number")
@@ -633,8 +640,8 @@ def code_files(step: dict, run_dir: str) -> list[str]:
             continue
         t = t.split("=", 1)[1] if re.match(r"^\w+=", t) else t
         p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(t)))
-        if not os.path.isfile(p) or _is_step_log(p, run_dir):
-            continue
+        if not os.path.isfile(p) or (_is_step_log(p, run_dir) and not t.endswith(".py")):
+            continue                              # a log named as an argument is not code (a `.py` name for it is)
         if _inside(p, run_dir) or p.endswith(".py"):
             named.add(p)
             if p.endswith(".py") and _inside(p, run_dir):
@@ -644,8 +651,8 @@ def code_files(step: dict, run_dir: str) -> list[str]:
     # `--out out.csv` changed the step's code key while it ran. Imports are still followed.
     outs = list(step.get("_all_outputs") or step_outputs(step))
     data = outs + step_inputs(step)
-    return sorted(p for p in named | py if not _is_step_log(p, run_dir)       # also one reached through an import
-                  and not (_inside(p, run_dir) and any(path_match(_rel(p, run_dir), pat) for pat in data)))
+    return sorted(p for p in named | py
+                  if not (_inside(p, run_dir) and any(path_match(_rel(p, run_dir), pat) for pat in data)))
 
 
 def _rel(p: str, run_dir: str) -> str:
