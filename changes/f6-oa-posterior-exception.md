@@ -1,6 +1,6 @@
 ---
 phase: "F6"
-commit: "OA posterior exception α–β"
+commit: "OA posterior exception α–γ"
 ---
 
 ## Changelog
@@ -17,4 +17,4 @@ commit: "OA posterior exception α–β"
 
 The exception travels with the posterior's range record, which the manifest and the uncertainty report carry. The sign-off sheet shows it as a HIGH owner-signed departure.
 
-Checked against refit b2's stored output, with no engine run: refused without the exception; 55 rows loaded with `keep`, 54 with `exclude`. Self-tests FE1 (net_effect_fit.py) and UE1 (uncertainty.py).
+Checked against refit b2's stored output, with no engine run: refused without the exception; 55 rows loaded with `keep`, 54 with `exclude`. Only target misses are waived: the failed point's seed evidence and calibration still bind, the declaration matches the failures one to one, the file must record the sample as invalid with its declared count of verified points, and only the owner may sign an exception (sign-off precondition). Self-tests FE1, FE2 (net_effect_fit.py), UE1 (uncertainty.py), PC12 (preconditions.py).

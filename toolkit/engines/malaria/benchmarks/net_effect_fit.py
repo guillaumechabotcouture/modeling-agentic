@@ -1202,21 +1202,33 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
     bands = pack_bands()            # the targets the replay checks the chosen point on (finalize's default)
     exc = None
     if exception is not None:       # owner, 20 Nov: a declared exception, matched to the file's recorded failures
+        if reg.get("sample") or not reg.get("sample_unverified") or reg.get("sample_status") != "invalid":
+            no("an exception applies only to a sample the fit recorded as invalid (sample_unverified)")
+        need = (doc.get("plan") or {}).get("verified_sample_points")
+        if isinstance(need, int) and len(pts) < need:
+            no(f"the fit verified {len(pts)} sample points, fewer than the {need} it declared: not an exception's case")
         fails = []
-        for p in pts:
+        for p in pts:               # only target misses are waivable: seed evidence and calibration bind every point
+            if seed_count_errors(p, bands, seeds) or calibration_ok(p.get("calibration_check") or {}):
+                no(f"verified point {p.get('point')} fails on its seed evidence or calibration, which no exception "
+                   f"waives")
             if not point_in_band(p, bands, seeds)[0]:
                 per = _per_seed(p)
                 fails.append({"point": p["point"], "targets": sorted(
                     t for t, b in bands.items() if not ci_in_band(per.get(t) or [], b, len(seeds)))})
         decl = [{"point": dict(x["point"]), "targets": sorted(x["targets"])} for x in exception["failed_points"]]
-        if not fails or len(fails) != len(decl) or not all(
-                any(_same_point(f["point"], x["point"]) and f["targets"] == x["targets"] for x in decl) for f in fails):
+        pair = [[j for j, x in enumerate(decl) if _same_point(f["point"], x["point"]) and f["targets"] == x["targets"]]
+                for f in fails]          # one to one: each failure matches exactly one declaration, and vice versa
+        if not fails or len(fails) != len(decl) or any(len(m) != 1 for m in pair) \
+                or sorted(m[0] for m in pair) != list(range(len(decl))):
             no(f"the declared exception {decl} is not the file's recorded failures {fails} (the same points, the same "
-               f"targets)")
-        pts = [p for p in pts if not any(_same_point(p["point"], f["point"]) for f in fails)]
+               f"targets, one to one)")
+        failed = [f["point"] for f in fails]       # the file's own coordinates of the matched points
+        pts = [p for p in pts if not any(p["point"] == fp for fp in failed)]
+        rows = list(reg["sample_unverified"])
         if exception.get("draws") == "exclude":
-            rows = [r for r in rows if not any(_same_point(r, f["point"]) for f in fails)]
-            X = [[float(r[k]) for k in names] for r in rows]
+            rows = [r for r in rows if not any(r == fp for fp in failed)]
+        X = [[float(r[k]) for k in names] for r in rows]
         exc = dict(exception, failed_points=decl)
     try:            # with an exception: the rest of the evidence must pass the rule as it stands
         rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
