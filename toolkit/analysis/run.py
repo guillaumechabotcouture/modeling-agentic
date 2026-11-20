@@ -120,10 +120,24 @@ def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> 
     return {"solution": sol, "reserve": reserve, "pre": pre}
 
 
+def _stop_where(e) -> str | None:
+    """The step of a stop the toolkit declares besides AnalysisBlocked (a refused calibration, calibration input,
+    burden anchor or engine batch; a solver defect), else None: any other error is a crash and leaves no manifest."""
+    from toolkit.alloc.optimize import OptimizerError
+    from toolkit.analysis.burden import AnchorError
+    from toolkit.calibration.history_matching import CalibrationInputError
+    for cls, where in ((C.CalibrationRefused, "calibration"), (CalibrationInputError, "calibration"),
+                       (AnchorError, "burden_anchor"), (OptimizerError, "optimizer"), (Bt.BatchRefused, "batch")):
+        if isinstance(e, cls):
+            return where
+    return None
+
+
 def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None = None, draws=None,
         unsigned: bool = False, log=print, compute_kw: dict | None = None) -> dict:
     """The analysis. A step whose model corrections bear on a plan stops it: analysis/blocked.yaml records where and
-    which, and the manifest is published with status blocked (never complete)."""
+    which, and the manifest is published with status blocked (never complete). A stop the toolkit declares by its
+    own exception (`_stop_where`) is recorded the same way, with the exception's name and code, and raised again."""
     holder = {}
     try:
         return _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder)
@@ -136,6 +150,17 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
                     [holder["calibration"]] if holder.get("calibration") else [])
             S.finalize("blocked", f"{e.where}: {e.reason}" if e.reason else
                        f"{e.where}: {len(e.hits)} model corrections bear on the plan")
+        raise
+    except Exception as e:  # noqa: BLE001 -- recorded when it is a declared stop, and always raised again
+        S, where = holder.get("S"), _stop_where(e)
+        if S is not None and where is not None:
+            try:
+                S.write("blocked", {"reason": str(e)[:4000], "where": where, "corrections": [], "n_on_plan": 0,
+                                    "exception": type(e).__name__, "code": getattr(e, "code", None)}, PRODUCER,
+                        [holder["calibration"]] if holder.get("calibration") else [])
+                S.finalize("blocked", f"{where}: {type(e).__name__}: {e}"[:2000])
+            except Exception as w:  # noqa: BLE001 -- the stop itself is what the caller must see
+                log(f"  the stop could not be recorded ({type(w).__name__}: {w}); no manifest is published")
         raise
 
 

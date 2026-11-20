@@ -33,7 +33,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from toolkit.analysis.artifacts import (ENVELOPE, EXPECTED_KINDS, EXPECTED_ROLES, KINDS, MANIFEST,  # noqa: E402
                                         PRODUCED_BY, PRODUCER_PREFIX, sha256)
-from toolkit.analysis.figures import presentation_findings, resolve_source  # noqa: E402
+from toolkit.analysis.figures import presentation_findings, render_findings, resolve_source  # noqa: E402
 
 SPEC = "decision_spec.yaml"
 ENGINE_CHOICE = "engine_choice.json"     # toolkit/spec/schema.py ENGINE_CHOICE
@@ -407,6 +407,12 @@ def _gate_findings(run_dir: str) -> list[dict]:
                                                          "was computed", f"{rel}:{src}"))
         if kind == "joint_calibration":       # F6 S2-3b: the change between survey rounds by group
             out += _survey_changes(run_dir, doc.get("data") or {})
+        if kind == "figures":                 # v2 autonomy 1C-a: a figure that failed to render is a MEDIUM finding
+            npd = (doc["data"].get("not_produced") or []) if isinstance(doc.get("data"), dict) else []
+            if not isinstance(npd, list) or not all(isinstance(x, dict) for x in npd):
+                out.append(_f("analysis_contract_schema", f"artifact {rel}: not_produced is not a list of records", rel))
+            else:
+                out += render_findings(npd)
         if kind == "calibration":
             out += _calibration(rel, doc.get("data") or {})
             cal_doc = (rel, doc.get("data") or {})

@@ -69,6 +69,11 @@ class Missing(Exception):
     """A figure's input is absent; the message is its not-produced reason."""
 
 
+class PresentationRefused(ValueError):
+    """A declared presentation input (boundaries, crosswalk) that is refused: it stops the render (fail closed) and
+    is never recorded as one figure's own failure."""
+
+
 def _fv():
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import figure_validator
@@ -148,7 +153,10 @@ class RunData:
         if self.pres.get("boundaries") is None:
             return None
         if self._geo is None:
-            self._geo = load_boundaries(self.pres["boundaries"], self.ids, self.region, self.dir)
+            try:
+                self._geo = load_boundaries(self.pres["boundaries"], self.ids, self.region, self.dir)
+            except ValueError as e:
+                raise PresentationRefused(str(e)) from e
         return self._geo
 
     def use(self, rel: str):
@@ -312,6 +320,45 @@ def _publish(path: str, data, root: str) -> None:
     followed (lib.safe_io)."""
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().publish(path, data, root)
+
+
+def _finite(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _axis_max(vals, floor: float = 1e-9) -> float:
+    """An axis's upper end from its values: the largest finite one, never below `floor` (no NaN, infinite or
+    zero-span limit)."""
+    return max([float(v) for v in vals if v is not None and math.isfinite(float(v))] + [floor])
+
+
+def _prop_max(vals) -> float:
+    """The upper end of a proportion axis: 6% above the largest value, never above 1 (nor a zero span)."""
+    return min(_axis_max(vals, 1e-3 / 1.06) * 1.06, 1.0)
+
+
+def _discard(dest: str, name: str, root: str) -> None:
+    """Remove what a figure that failed part way had already published (no link followed), so no file of a figure
+    the index does not list is left; best effort."""
+    from toolkit.analysis.artifacts import _safe_io
+    for end in (".png", ".svg", ".png.provenance.json", ".csv"):
+        try:
+            _safe_io().remove_nofollow(root, os.path.relpath(os.path.join(dest, name + end), root))
+        except (OSError, ValueError):
+            pass
+
+
+RENDER_FAILED = "figure_render_failed"
+
+
+def render_findings(not_produced) -> list[dict]:
+    """One MEDIUM finding per figure that failed while it was drawn or saved (`render_failed` in its not-produced
+    record): figure_render_failed:<figure>. A figure without its inputs is not one. The contract check
+    (toolkit/analysis/contract.py) reads these from the manifest-hashed analysis/figures.yaml."""
+    return [{"kind": RENDER_FAILED, "severity": "MEDIUM", "stage": "ANALYZE", "key": str(x.get("figure")),
+             "claim": f"figure {x.get('figure')} ({x.get('tier')} tier) was not produced: {x.get('reason')}",
+             "scope_declarable": True, "source": PRODUCER}
+            for x in not_produced or [] if isinstance(x, dict) and x.get("render_failed")]
 
 
 def _fig_bytes(fig, fmt: str, **kw) -> bytes:
@@ -1518,7 +1565,7 @@ def fig_calibration(R, t):
         sd = float((cs.get("target_uncertainty") or {}).get("region_sd_logit") or 0.0)
         e_rmse = ((R.opt("emulator") or {}).get("accuracy") or {}).get("cal_logit_rmse")
         metric = R.labels.metric(cs.get("metric", "metric"))
-        m = max(tgt.values()) * 1.06
+        m = _prop_max(tgt.values())
 
         def targets_panel(ax):
             for yv, r in enumerate(regs[::-1]):
@@ -1546,8 +1593,8 @@ def fig_calibration(R, t):
             FS.style(a2, t, grid="x")
             x = np.array([tgt[i] for i in R.ids])
             y = np.array([mod[i] for i in R.ids])
-            m = float(max(x.max(), y.max())) * 1.06
-            gx = np.linspace(max(m / 400, 1e-4), m, 200)
+            m = _prop_max([x.max(), y.max()])
+            gx = np.linspace(max(m / 400, 1e-4), min(m, 1 - 1e-6), 200)      # the logit is undefined at 1
             if e_rmse:
                 a1.fill_between(gx, il(lg(gx) - 1.96 * e_rmse), il(lg(gx) + 1.96 * e_rmse), color=t["band"], lw=0,
                                 zorder=0, label="emulator held-out error (95%)")
@@ -1618,7 +1665,9 @@ def fig_calibration(R, t):
         a1.set_ylabel("model expected", fontsize=8)
         pr = []
         for yv, r in enumerate(regs[::-1]):
-            v = [(float(f["expected"]) - float(f["observed"])) / math.sqrt(max(float(f.get("variance", f["expected"])), 1e-9))
+            # a variance recorded as null (not only an absent one) falls back to the expected value
+            v = [(float(f["expected"]) - float(f["observed"]))
+                 / math.sqrt(max(float(f["expected"] if f.get("variance") is None else f["variance"]), 1e-9))
                  for f in fit if str(f.get("unit")) in R.by_id and R.region(str(f["unit"])) == r]
             pr += v
             a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], zorder=3)
@@ -1736,7 +1785,7 @@ def fig_dollars(R, t):
     a1.set_yticks([0])
     a1.set_yticklabels(["whole plan"], fontsize=8)
     a1.set_ylim(-0.5, 1.4)
-    a1.set_xlim(0, max(env, left) * 1.01)
+    a1.set_xlim(0, _axis_max([env, left]) * 1.01)
     FS.set_axis_format(a1, "x", "money")
     import matplotlib.patches as mp
     if comps:
@@ -1765,8 +1814,9 @@ def fig_dollars(R, t):
             ax.locator_params(axis="x", nbins=2)
             ax.tick_params(labelsize=6.5)
         topc = max(comps, key=lambda c: bc[c])
-        title = (f"The plan uses {FS.fmt((tot + fixed) / env, 'percent')} of the {FS.fmt(env, 'money')} envelope; "
-                 f"{R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars")
+        used = (f"The plan uses {FS.fmt((tot + fixed) / env, 'percent')} of the {FS.fmt(env, 'money')} envelope"
+                if env > 0 else f"The plan costs {FS.fmt(tot + fixed, 'money')} against a zero envelope")
+        title = f"{used}; {R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars"
         if unspent > 0.005 * env:
             title = (f"{FS.fmt(unspent, 'money')} of the {FS.fmt(env, 'money')} envelope is unspent; "
                      f"{R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars")
@@ -1817,11 +1867,13 @@ def fig_cost_per_outcome(R, t):
         if st[k] in ("cost", "free"):
             x = v["cost"] / v["averted"]
             ci = v.get("usd_per_outcome_interval")
-            if ci:
+            if ci and all(_finite(ci.get(e)) for e in ("ci_low", "ci_high")):
                 have_ci = True
                 a1.plot([ci["ci_low"], ci["ci_high"]], [y, y], color=t["cat"][0], lw=2, solid_capstyle="round",
                         zorder=2)
                 vals += [ci["ci_low"], ci["ci_high"]]
+            elif ci:                                 # an end that is not a finite number: no line (the table has it)
+                withheld.append((k, {"reason": "an interval end is not a finite number"}))
             elif v.get("interval_withheld"):
                 withheld.append((k, v["interval_withheld"]))
             a1.scatter([x], [y], s=34, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
@@ -1836,7 +1888,7 @@ def fig_cost_per_outcome(R, t):
     a1.text(1.02, nrow - 0.3, U, transform=a1.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
     a1.set_yticks(range(nrow))
     a1.set_yticklabels([R.labels.package(R.pk[k]) for k in order[::-1]], fontsize=7.5)
-    a1.set_xlim(0, max(vals) * 1.08)
+    a1.set_xlim(0, _axis_max(vals) * 1.08)
     a1.set_ylim(-0.6, nrow - 0.4)
     FS.set_axis_format(a1, "x", "money")
     a1.set_title(f"$ per {_sing(olab)} averted, by package" + (f" (line: {lvl:.0%} UI)" if have_ci else ""),
@@ -1854,7 +1906,7 @@ def fig_cost_per_outcome(R, t):
         a2.text(1.02, len(cs) - 0.3, U, transform=a2.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
         a2.set_yticks(range(len(cs))[::-1])
         a2.set_yticklabels([R.labels.component(c) for c in cs], fontsize=7.5)
-        a2.set_xlim(0, max(vals + usd) * 1.08)
+        a2.set_xlim(0, _axis_max(vals + usd) * 1.08)
         a2.set_ylim(-0.6, len(cs) - 0.4)
         FS.set_axis_format(a2, "x", "money")
         a2.set_title(f"$ per {_sing(olab)} averted by adding each component (point estimate)", fontsize=8.5,
@@ -2212,13 +2264,10 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
                      "reason": (f"no decision figure set declared for kind {kind} (toolkit/analysis/figures.py "
                                 f"DECISION_SETS)" if kind else "the spec declares no deliverable.kind; decision "
                                 "figures are chosen by it (DECISION_SETS), with no default")})
-    for name in [n for n in names if not only or n in only]:
-        R.used = []
-        try:
-            got = FUNCS[name](R, t)
-        except Missing as e:
-            notp.append({"figure": name, "reason": str(e), "tier": TIER_OF[name]})
-            continue
+    import matplotlib.pyplot as plt
+
+    def one(name):
+        got = FUNCS[name](R, t)
         fig, title, cap, rows, shows = got[:5]
         extra = got[5] if len(got) > 5 else {}
         if len(title) > TITLE_MAX:
@@ -2235,11 +2284,29 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         cap = cap if len(cap) <= CAPTION_MAX else cap[:CAPTION_MAX - 1].rsplit(" ", 1)[0] + "…"
         cap += extra.pop("caption_note", "")
         rel = (lambda p: os.path.relpath(p, run_dir)) if harness else (lambda p: p)
-        figs.append(dict({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
-                          "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
-                          "theme": theme, "tier": TIER_OF[name],
-                          "group": "decision" if TIER_OF[name] == "decision" else "diagnostics",
-                          "presentation": R.presentation_record()}, **extra))
+        return dict({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
+                     "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
+                     "theme": theme, "tier": TIER_OF[name],
+                     "group": "decision" if TIER_OF[name] == "decision" else "diagnostics",
+                     "presentation": R.presentation_record()}, **extra)
+    for name in [n for n in names if not only or n in only]:
+        R.used = []
+        opened = set(plt.get_fignums())
+        try:
+            figs.append(one(name))
+        except Missing as e:
+            notp.append({"figure": name, "reason": str(e), "tier": TIER_OF[name]})
+        except PresentationRefused:
+            raise                       # a refused declared input is not one figure's failure: fail closed, as before
+        except Exception as e:  # noqa: BLE001 -- v2 autonomy 1C-a: one figure's failure (its draw, title, save,
+            # validation or table) is its own: recorded with the error, a MEDIUM finding (render_findings), and the
+            # other figures are still drawn; it never ends the analysis
+            _discard(dest, name, run_dir if harness else dest)
+            notp.append({"figure": name, "reason": f"render failed: {type(e).__name__}: {e}"[:500],
+                         "tier": TIER_OF[name], "render_failed": True})
+        finally:
+            for num in set(plt.get_fignums()) - opened:      # whatever this figure opened, drawn or not, is closed
+                plt.close(num)
     res = {"figures": figs, "not_produced": notp, "tiers": {k: list(v) for k, v in tiers_for(R.spec).items()},
            "groups": {"decision": list(tiers_for(R.spec)["decision"]),
                       "diagnostics": [n for k in ("data_model", "simulation") for n in tiers_for(R.spec)[k]]}}

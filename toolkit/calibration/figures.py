@@ -493,31 +493,37 @@ def render(fd, dest: str, root: str, labels=None, theme: str = "light", sources=
     from lib.safe_io import write_nofollow
     t = FS.setup(theme)
     figs, notp = [], []
-    for name in NAMES:
-        try:
-            fig, title, cap, rows = draw(name, fd, t, labels)
-        except NoData as e:
-            notp.append({"figure": name, "reason": str(e), "tier": TIER})
-            continue
-        except Exception as e:  # noqa: BLE001 -- Codex r3 P2-12: one figure's failure is its own, recorded
-            notp.append({"figure": name, "reason": f"{type(e).__name__}: {e}", "tier": TIER})
-            plt.close("all")
-            continue
+    import toolkit.analysis.figures as AF     # the figures' one in-memory renderer (write_audit)
+
+    def one(name):
+        fig, title, cap, rows = draw(name, fd, t, labels)
         FS.title(fig, title, t)
-        from toolkit.analysis.figures import _fig_bytes     # the figures' one in-memory renderer (write_audit)
-        png = _fig_bytes(fig, "png", dpi=FS.DPI)
-        plt.close(fig)
-        rel = os.path.relpath(os.path.join(dest, f"{name}.png"), root)
-        write_nofollow(root, rel, png, atomic=True)
+        png = AF._fig_bytes(fig, "png", dpi=FS.DPI)
         s = io.StringIO()
         if rows:
             w = csv.DictWriter(s, fieldnames=list(rows[0]), extrasaction="ignore")
             w.writeheader()
             w.writerows(rows)
+        rel = os.path.relpath(os.path.join(dest, f"{name}.png"), root)
         trel = os.path.relpath(os.path.join(dest, f"{name}.csv"), root)
+        write_nofollow(root, rel, png, atomic=True)           # both rendered before either is written
         write_nofollow(root, trel, s.getvalue().encode(), atomic=True)
-        figs.append({"figure": name, "path": rel, "table": trel, "title": title, "caption": cap, "tier": TIER,
-                     "group": "diagnostics", "sources": list(sources), "theme": theme})
+        return {"figure": name, "path": rel, "table": trel, "title": title, "caption": cap, "tier": TIER,
+                "group": "diagnostics", "sources": list(sources), "theme": theme}
+    for name in NAMES:
+        opened = set(plt.get_fignums())
+        try:
+            figs.append(one(name))
+        except NoData as e:
+            notp.append({"figure": name, "reason": str(e), "tier": TIER})
+        except Exception as e:  # noqa: BLE001 -- Codex r3 P2-12, v2 autonomy 1C-a: one figure's failure (its draw,
+            # title, render or write) is its own, recorded
+            AF._discard(dest, name, root)
+            notp.append({"figure": name, "reason": f"render failed: {type(e).__name__}: {e}"[:500], "tier": TIER,
+                         "render_failed": True})
+        finally:
+            for num in set(plt.get_fignums()) - opened:      # whatever this figure opened is closed
+                plt.close(num)
     return {"figures": figs, "not_produced": notp}
 
 
