@@ -87,7 +87,7 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     hb = NEF.hard_bounds(eng, list(ne["ranges"]))
     from toolkit.spec import engine_parameters as PV
     for t in (spec.raw.get("analysis") or {}).get("decision_tests") or []:
-        for n, vs in sorted(PV.test_settings(t).items()):       # its own values and each companion's (`with`)
+        for n, vs in sorted(PV.test_settings(t, names=hb).items()):     # its own values and each companion's
             if n in hb:
                 lo, hi, what = hb[n]
                 bad = [v for v in vs if not lo <= float(v) <= hi]

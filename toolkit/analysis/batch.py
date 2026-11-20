@@ -68,7 +68,7 @@ def test_value_ranges(spec, names) -> dict:
     from toolkit.spec import engine_parameters as PV
     out = {}
     for dt in (spec["analysis"].get("decision_tests") or []):
-        for n, vs in PV.test_settings(dt).items():       # its own values and each companion's (`with`)
+        for n, vs in PV.test_settings(dt, names=names).items():     # its own values and each companion's (`with`)
             if n in names:
                 lo, hi = out.get(n, (min(vs), max(vs)))
                 out[n] = (min(lo, *vs), max(hi, *vs))

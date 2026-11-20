@@ -592,6 +592,14 @@ def _entry_problems(key: str, e, r: dict, run: dict, run_dir: str | None, memo: 
                 bad.append(f"entry {key}: a range needs its decision_test (one the run executes that varies it)")
             else:
                 bad += _test_problems(key, r, rg, e["decision_test"].strip(), run, run_dir, memo)
+        elif _text(e.get("decision_test")):
+            # v2-dt-with (Codex r3): the run calibrates this input, so no test is required; one named anyway is shown
+            # on the sheet as its range test, so it cannot be a conditional test (companions held with `with`)
+            an = run.get("analysis") if isinstance(run.get("analysis"), dict) else {}
+            if any(isinstance(t, dict) and str(t.get("id")) == e["decision_test"].strip() and "with" in t
+                   for t in an.get("decision_tests") or []):
+                bad.append(f"entry {key}: decision_test {e['decision_test'].strip()} holds companion parameters "
+                           "(with): a range test varies only its own parameter")
     return bad
 
 

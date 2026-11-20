@@ -523,15 +523,19 @@ def companions(dt) -> dict:
     return {str(k): float(v) for k, v in w.items() if _isnum(v)} if isinstance(w, dict) else {}
 
 
-def test_settings(dt, numbers_only: bool = False) -> dict:
+def test_settings(dt, numbers_only: bool = False, names=None) -> dict:
     """{parameter: [values]} a parameter_value decision test sets: its own parameter's values and each companion's
     value. Every reader of what a test sets (the design box, held spec values, hard bounds) uses this. The test's own
     values are read as the runner reads them, with float(): a quoted number counts and a value that is not a number
     raises ValueError (as these readers did before `with`; Codex r1-r2). `numbers_only`: only values written as
-    numbers, nothing raised (tested_boxes' rule before `with`)."""
+    numbers, nothing raised (tested_boxes' rule before `with`). `names`: the parameters the reader uses; a test's own
+    values are read only when its parameter is one of them, so a value the reader never used raises nothing (Codex
+    r3), and only those parameters are returned."""
     if not isinstance(dt, dict) or dt.get("type") != "parameter_value":
         return {}
-    out = {k: [v] for k, v in companions(dt).items()}
+    out = {k: [v] for k, v in companions(dt).items() if names is None or k in names}
+    if names is not None and dt.get("parameter") not in names:
+        return out
     vs = [float(x) for x in dt.get("values") or [] if not numbers_only or _isnum(x)]
     if vs and isinstance(dt.get("parameter"), str):
         out[dt["parameter"]] = out.get(dt["parameter"], []) + vs
@@ -545,7 +549,7 @@ def tested_boxes(spec) -> dict:
     hv = held(spec)
     out = {}
     for dt in ((_raw(spec).get("analysis") or {}).get("decision_tests") or []):
-        for n, vs in (test_settings(dt, numbers_only=True) if isinstance(dt, dict) else {}).items():
+        for n, vs in test_settings(dt, numbers_only=True, names=hv).items():
             if n in hv:
                 lo, hi = out.get(n, [hv[n]] * 2)
                 out[n] = [min(lo, *vs), max(hi, *vs)]
