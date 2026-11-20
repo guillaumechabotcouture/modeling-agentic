@@ -2810,6 +2810,50 @@ def _self_test_isolation(ok, base):
     e_c, hi_c = drawn(R, fig_cost_per_outcome)
     ok(e_c is None and hi_c is not None and math.isfinite(hi_c),
        f"FG_AXIS_FINITE cost per outcome keeps a finite axis when an interval end is not finite ({e_c}, {hi_c})")
+    # Codex r3: an interval that is not drawn is told apart from one the analysis withheld; a component whose cost
+    # per outcome is not finite has no row
+    k1 = sorted(bp)[1]
+    bp[k1].pop("usd_per_outcome_interval", None)
+    bp[k1]["interval_withheld"] = {"reason": "planted reason", "share_draws_nonpositive": 0.25}
+    ci_ = dict(fd["component_increment"])
+    c0 = sorted(ci_)[0]
+    ci_[c0] = dict(ci_[c0], outcome_per_usd=1e-310)
+    R.override["figure_data"] = dict(fd, by_package=bp, component_increment=ci_)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got_m, e_m = attempt(lambda: fig_cost_per_outcome(R, t))
+    cap_m = got_m[2] if got_m else ""
+    n_comp = len(got_m[0].axes[1].get_yticks()) if got_m and len(got_m[0].axes) > 1 else None
+    plt.close("all")
+    ok(e_m is None and " 1 intervals withheld: planted reason" in cap_m and "1 interval not drawn" in cap_m,
+       f"FG_WITHHELD_MIXED the caption counts a withheld interval and one not drawn for a non-finite end apart "
+       f"({e_m}, {cap_m!r})")
+    ok(e_m is None and n_comp == len(ci_) - 1,
+       f"FG_COMPONENT_FINITE a component whose cost per outcome is not finite has no row ({e_m}, {n_comp} of "
+       f"{len(ci_)})")
+    # Codex r3: a figure that fails removes only what its own attempt published, never a file already there
+    out_c = os.path.join(base, "iso_c")
+    os.makedirs(out_c)
+    for end in (".png", ".svg", ".csv", ".png.provenance.json"):
+        with open(os.path.join(out_c, "frontier" + end), "w") as fh:
+            fh.write("kept\n")
+    orig_save = g["_save"]
+
+    def bad_save(fig, out_dir, name, *a, **k):
+        if name == "frontier":
+            raise OSError("planted: refused before any write")
+        return orig_save(fig, out_dir, name, *a, **k)
+    g["_save"] = bad_save
+    try:
+        res, err = attempt(lambda: render(d, out_c, only=["frontier", "dollars"]))
+    finally:
+        g["_save"] = orig_save
+    kept = sorted(f for f in os.listdir(out_c) if f.startswith("frontier.")
+                  and open(os.path.join(out_c, f)).read() == "kept\n")
+    ok(err is None and [x["figure"] for x in res["not_produced"] if x.get("render_failed")] == ["frontier"]
+       and len(kept) == 4,
+       f"FG_DISCARD_OWN a figure that fails before it writes leaves the files already at its paths ({err}, {kept})")
+    plt.close("all")
 
 
 def _self_test() -> int:
