@@ -18,7 +18,14 @@ to the run dir itself is the caller's and is not protected against a parent dire
 
 Toy golden records: toolkit/analysis/dt_golden.json, checked by toolkit/analysis/run.py's self-test, which captures
 every record decision_tests.run_one returns (start_capture / check_capture), keyed by the calling self-test function,
-test id and call order. A PR that changes a digest says why; MA_DT_GOLDEN_UPDATE=1 rewrites the file.
+test id and call order. A PR that changes a record says why; MA_DT_GOLDEN_UPDATE=1 rewrites the file.
+
+That check runs on machines that differ (CI runners with different BLAS kernels gave different late digits, 2026-11-20),
+so it compares in two ways (tolerant, compare_numbers): the exact parts (everything but the floating-point values: plan
+digests, verdicts, recommendations, whole-number counts, words) must be equal, and the floating-point values must
+agree within RTOL relative and ATOL absolute. The file records the platform it was recorded on. A failed check prints
+one line per record; `dt_golden.py record <log> --source <where>` rebuilds the file from such a log. digest() and
+`digest <run_dir>` stay strict: they compare runs on one machine.
 """
 from __future__ import annotations
 
@@ -44,6 +51,9 @@ DETAIL_KEYS = ("cost_multipliers", "unit_attribute", "calibration_target", "outc
 IGNORED = ("type", "perturb", "path", "producer", "produced_by")
 PARTS = ("decision", "detail", "words", "plans")
 TINY = 1e-9
+RTOL, ATOL = 1e-4, 1e-6     # the golden check's tolerance on numbers: |a - b| <= ATOL + RTOL * max(|a|, |b|)
+NUM_SIG = 10                # digits kept for a number compared within the tolerance
+_NUM = "\x00number"         # a floating-point value's place in the exact part
 _PATH = re.compile(r"(?:(?<=^)|(?<=[\s'\"(\[=,]))(?:[A-Za-z]:)?[\\/](?:[^\s\\/'\"()]+[\\/])+([^\s\\/'\"()]+)")
 
 
@@ -117,6 +127,69 @@ def parts(rec: dict, summary: dict | None = None) -> dict:
 
 def digest(rec: dict, summary: dict | None = None) -> dict:
     return {k: _h(v) for k, v in parts(rec, summary).items()}
+
+
+def _split(x, nums: list):
+    """x in canonical form with every finite floating-point value moved to `nums` (in order: mappings by string key,
+    lists as they are) and its place marked. What stays is exact: keys, strings, booleans, whole numbers (int), nan and
+    inf, sets."""
+    import numpy as np
+    if isinstance(x, (bool, np.bool_)) or x is None or isinstance(x, str):
+        return canon(x)
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+    if isinstance(x, (float, np.floating)):
+        v = float(x)
+        if not math.isfinite(v):
+            return canon(v)
+        nums.append(0.0 if abs(v) < TINY else float(f"{v:.{NUM_SIG}g}"))
+        return _NUM
+    if isinstance(x, dict):
+        return {k: _split(v, nums) for k, v in sorted(((str(k), v) for k, v in x.items()), key=lambda kv: kv[0])}
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return [_split(v, nums) for v in (x.tolist() if isinstance(x, np.ndarray) else x)]
+    return canon(x)
+
+
+def _tolerant(pr: dict) -> dict:
+    exact, numbers = {}, {}
+    for k, v in pr.items():
+        nums = []
+        skel = _split(v, nums)
+        exact[k] = hashlib.sha256(json.dumps(skel, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+        if nums:
+            numbers[k] = nums
+    return {"exact": exact, "numbers": numbers}
+
+
+def tolerant(rec: dict, summary: dict | None = None) -> dict:
+    """{"exact": {part: digest}, "numbers": {part: [values]}} of one record, for a comparison across machines: the
+    exact parts hold everything but the floating-point values (plan digests, verdicts, recommendations, whole-number
+    counts, labels' structure, words) and compare exactly; the numbers compare within RTOL and ATOL
+    (compare_numbers). digest() stays the strict form, for one machine."""
+    return _tolerant(parts(rec, summary))
+
+
+def compare_numbers(expected: dict, got: dict, rtol: float = RTOL, atol: float = ATOL) -> list[str]:
+    """One line per record and part whose numbers differ beyond |a - b| <= atol + rtol * max(|a|, |b|), or whose count
+    differs, for the records both sides hold; a record whose numbers were never recorded (None) is a difference."""
+    out = []
+    for k in sorted(set(expected) & set(got)):
+        e, g = expected[k], got[k]
+        if e is None or g is None:
+            out.append(f"{k}: numbers not recorded")
+            continue
+        for p_ in sorted(set(e) | set(g)):
+            a, b = e.get(p_) or [], g.get(p_) or []
+            if len(a) != len(b):
+                out.append(f"{k}: {p_}: {len(b)} numbers, {len(a)} recorded")
+                continue
+            bad = [(x, y) for x, y in zip(a, b) if not abs(x - y) <= atol + rtol * max(abs(x), abs(y))]
+            if bad:
+                rel = max(abs(x - y) / max(abs(x), abs(y)) for x, y in bad)
+                out.append(f"{k}: {p_}: {len(bad)} of {len(a)} numbers beyond tolerance (largest relative difference "
+                           f"{rel:.1e}, absolute {max(abs(x - y) for x, y in bad):.1e})")
+    return out
 
 
 def _plain_name(tid: str, pathmod=os.path) -> bool:
@@ -293,7 +366,7 @@ def start_capture() -> None:
     if _CAP["on"]:
         raise RuntimeError("dt_golden: capture already started")
     orig = DTm.run_one
-    _CAP.update(on=True, paused=False, orig=orig, recs={}, counts={}, problems=[], parts={})
+    _CAP.update(on=True, paused=False, orig=orig, recs={}, counts={}, problems=[], parts={}, nums={})
 
     def run_one(*a, **k):
         rec = orig(*a, **k)
@@ -301,8 +374,9 @@ def start_capture() -> None:
             who, tid = _caller(), str(rec.get("test_id"))
             n = _CAP["counts"].get((who, tid), 0)
             _CAP["counts"][(who, tid)] = n + 1
-            pr = parts(plain(rec))          # hashed once (Codex r6 P1-2); its canonical form kept for the report
-            _CAP["recs"][f"{who}:{tid}#{n}"] = {k: _h(v) for k, v in pr.items()}
+            pr = parts(plain(rec))          # split once (Codex r6 P1-2); its canonical form kept for the report
+            tl = _tolerant(pr)
+            _CAP["recs"][f"{who}:{tid}#{n}"], _CAP["nums"][f"{who}:{tid}#{n}"] = tl["exact"], tl["numbers"]
             _CAP["parts"][f"{who}:{tid}#{n}"] = canon(pr)
             if rec.get("status") == "run" and not all("plan_sha256" in r for r in rec.get("results") or []):
                 _CAP["problems"].append(f"{who}:{tid}#{n}: a case without plan_sha256")
@@ -310,18 +384,58 @@ def start_capture() -> None:
     DTm.run_one = run_one
 
 
-def golden_text(obs: dict) -> str:
-    """The golden file: one line per self-test function, {"<id>#<n>": "decision.detail.words[.plans]"}."""
+RECORDED_ON = "_recorded_on"
+
+
+def golden_text(obs: dict, nums: dict | None = None, recorded_on: dict | None = None) -> str:
+    """The golden file: one line per self-test function, {"<id>#<n>": ["decision.detail.words[.plans]", {part:
+    [numbers]}]} (the exact parts, then the numbers compared within the tolerance), and one line for the platform it
+    was recorded on. Without `nums` a record is its exact parts alone (the form before numbers were recorded)."""
     by = {}
     for k, v in obs.items():
         fn, rest = k.rsplit(":", 1)
-        by.setdefault(fn, {})[rest] = ".".join(v[p] for p in PARTS if p in v)
-    return "{\n" + ",\n".join(f" {json.dumps(fn)}: {json.dumps(r, sort_keys=True)}" for fn, r in sorted(by.items())) \
-        + "\n}\n"
+        ex = ".".join(v[p] for p in PARTS if p in v)
+        by.setdefault(fn, {})[rest] = ex if nums is None else [ex, nums.get(k) or {}]
+    lines = [f" {json.dumps(fn)}: {json.dumps(r, sort_keys=True)}" for fn, r in sorted(by.items())]
+    if recorded_on is not None:
+        lines.insert(0, f" {json.dumps(RECORDED_ON)}: {json.dumps(recorded_on, sort_keys=True)}")
+    return "{\n" + ",\n".join(lines) + "\n}\n"
+
+
+def _golden_rows(text: str):
+    for fn, r in json.loads(text).items():
+        if fn != RECORDED_ON:
+            for k, v in r.items():
+                yield f"{fn}:{k}", v
 
 
 def golden_read(text: str) -> dict:
-    return {f"{fn}:{k}": dict(zip(PARTS, v.split("."))) for fn, r in json.loads(text).items() for k, v in r.items()}
+    """{record: {part: exact digest}} of a golden file."""
+    return {k: dict(zip(PARTS, (v if isinstance(v, str) else v[0]).split("."))) for k, v in _golden_rows(text)}
+
+
+def golden_numbers(text: str) -> tuple:
+    """({record: {part: [numbers]}, or None where none were recorded}, the platform the file was recorded on)."""
+    return ({k: None if isinstance(v, str) else v[1] for k, v in _golden_rows(text)},
+            json.loads(text).get(RECORDED_ON))
+
+
+def from_log(text: str) -> tuple:
+    """(exact parts, numbers, platform) from the lines a failed check printed (DT_GOLDEN_RECORD, DT_GOLDEN_PLATFORM),
+    as a CI log holds them. Refused (ValueError) without records or a platform, or when the log shows a failed case
+    other than DG-R1: that capture may be partial."""
+    obs, nums, plat = {}, {}, None
+    for ln in text.splitlines():
+        if "DT_GOLDEN_RECORD " in ln:
+            r = json.loads(ln.split("DT_GOLDEN_RECORD ", 1)[1])
+            obs[r["key"]], nums[r["key"]] = r["exact"], r["numbers"]
+        elif "DT_GOLDEN_PLATFORM " in ln:
+            plat = json.loads(ln.split("DT_GOLDEN_PLATFORM ", 1)[1])
+        elif "DT_GOLDEN_" not in ln and re.search(r"(?:^|Z |\t)FAIL (?!DG-R1)", ln):
+            raise ValueError(f"the log shows a failed case, so the capture may be partial: {ln.strip()[-160:]}")
+    if not obs or not isinstance(plat, dict):
+        raise ValueError("the log holds no DT_GOLDEN_RECORD lines or no DT_GOLDEN_PLATFORM line")
+    return obs, nums, plat
 
 
 def platform_line() -> dict:
@@ -353,6 +467,7 @@ def check_capture(ok, failed=()) -> None:
         return
     DTm.run_one = _CAP["orig"]
     obs, probs = dict(sorted(_CAP["recs"].items())), list(_CAP["problems"])
+    nums = {k: (_CAP.get("nums") or {}).get(k) or {} for k in obs}
     _CAP.update(on=False, orig=None)
     ok(not probs, f"DG-P1 every run case records its allocation digest (plan_sha256) ({probs[:5]})")
     if os.environ.get(UPDATE_ENV) == "1":
@@ -361,24 +476,31 @@ def check_capture(ok, failed=()) -> None:
                       "the capture may be partial; the golden file is unchanged")
             return
         with open(GOLDEN, "w") as f:
-            f.write(golden_text(obs))
+            f.write(golden_text(obs, nums, platform_line()))
         ok(True, f"DG-R1 {len(obs)} golden records written to {GOLDEN} ({UPDATE_ENV}=1)")
         return
     try:
         with open(GOLDEN) as f:
-            exp = golden_read(f.read())
-    except (OSError, ValueError) as e:
-        exp, err = {}, f"{type(e).__name__}: {e}"
+            text = f.read()
+        exp, (exp_nums, recorded_on) = golden_read(text), golden_numbers(text)
+    except (OSError, ValueError, TypeError, IndexError, AttributeError) as e:
+        exp, exp_nums, recorded_on, err = {}, {}, None, f"{type(e).__name__}: {e}"
     else:
         err = None
-    diff = compare(exp, obs)
+    diff = compare(exp, obs) + compare_numbers(exp_nums, nums)
     print("DT_GOLDEN_PLATFORM " + json.dumps(platform_line(), sort_keys=True))
-    ok(obs and not diff and err is None, f"DG-R1 every decision-test record of this self-test matches its golden "
-                                         f"record ({len(obs)} records; {err or ''} {diff[:12]})")
-    if diff or err:
-        print("DT_GOLDEN_OBSERVED " + json.dumps(obs, sort_keys=True))
-        bad = sorted({d_.split(": ")[0] for d_ in diff} & set(_CAP.get("parts") or {}))
-        print("DT_GOLDEN_PARTS " + json.dumps({k: _CAP["parts"][k] for k in bad}, sort_keys=True))
+    ok(obs and not diff and err is None,
+       f"DG-R1 every decision-test record of this self-test matches its golden record: exact parts exactly, numbers "
+       f"within {RTOL:g} relative and {ATOL:g} absolute ({len(obs)} records; {err or ''} {diff[:12]})")
+    if diff or err:         # one line per record (a long line is dropped from a CI log)
+        print("DT_GOLDEN_FILE recorded on " + json.dumps(recorded_on, sort_keys=True))
+        for d_ in diff:
+            print("DT_GOLDEN_DIFF " + d_)
+        for k in obs:
+            print("DT_GOLDEN_RECORD " + json.dumps({"key": k, "exact": obs[k], "numbers": nums[k]}, sort_keys=True))
+        bad = {d_.split(": ")[0] for d_ in diff}
+        for k in sorted(set(_CAP.get("parts") or {}) & (bad if len(bad) < len(obs) else set(obs))):
+            print("DT_GOLDEN_PARTS " + json.dumps({k: _CAP["parts"][k]}, sort_keys=True))
 
 
 # --------------------------------------------------------------------------- self-test
@@ -802,7 +924,17 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="decision-test golden records (module docstring)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("digest", help="digest a finished run's decision tests (JSON on stdout)").add_argument("run_dir")
+    rc_ = sub.add_parser("record", help="rewrite the golden file from the log of a run.py self-test whose DG-R1 failed")
+    rc_.add_argument("log")
+    rc_.add_argument("--source", required=True, help="where the log is from (for example: CI run <id>)")
     a = ap.parse_args(argv)
+    if a.cmd == "record":
+        with open(a.log, errors="replace") as f:
+            obs, nums, plat = from_log(f.read())
+        with open(GOLDEN, "w") as f:
+            f.write(golden_text(dict(sorted(obs.items())), nums, dict(plat, source=a.source)))
+        print(f"{len(obs)} golden records written to {GOLDEN} (recorded on {plat.get('cpu')}, {a.source})")
+        return 0
     print(json.dumps(digest_dir(a.run_dir), indent=1, sort_keys=True))
     return 0
 
