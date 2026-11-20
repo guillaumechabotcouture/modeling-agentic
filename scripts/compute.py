@@ -3474,6 +3474,10 @@ def _self_test() -> int:
         _self_test_fp_dispatch(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"FPX: {type(e).__name__}: {e}")
+    try:
+        _self_test_durable(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CD: {type(e).__name__}: {e}")
     # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
         os.makedirs(os.path.join(rd, "models"))
@@ -3519,6 +3523,269 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_durable(ok) -> None:
+    """CD1-CD9 (v2 autonomy brief, PR 1D item 2): the dask dispatch loop against a fake client (no cluster).
+    A dropped scheduler connection ended the batch and charged what was in flight; an unread scheduler view
+    with nothing out spun without a bound; a chunk whose future failed before the next view showed its worker
+    retired used an infra retry and half the processes; the bundle could be scattered to the run's own VM; the
+    bundle carried logs, figures and partial rows; a dead caller on another host was charged each chunk's whole
+    share; and a call the ledger's own history showed would not fit its allowance started without a warning."""
+    import tempfile
+    from unittest import mock
+    import distributed
+    from distributed.comm.core import CommClosedError
+    run_vm, w1, w2 = "tls://10.0.0.9:1", "tls://10.0.0.5:1", "tls://10.0.0.6:1"
+
+    class Fut:
+        def __init__(self, key, got=None, exc=None, on_result=None):
+            self.key, self.got, self.exc, self.on_result = key, got, exc, on_result
+            self.status = "error" if exc else ("pending" if got is None else "finished")
+
+        def done(self):
+            return self.status != "pending"
+
+        def result(self, timeout=None):
+            if self.on_result:
+                self.on_result()
+            if self.exc:
+                raise self.exc
+            return self.got
+
+        def cancel(self):
+            if self.status == "pending":
+                self.status, self.exc = "cancelled", cf.CancelledError()
+
+    class Fake:
+        """distributed.Client for _map_dask: every chunk finishes at once with ok rows, unless a fault is set."""
+        status = "running"
+
+        def __init__(self, tagged, chunk_exc=None, retire=True, join=None, **fail):
+            self.tagged, self.gone, self.retired = list(tagged), set(), set()
+            self.chunk_exc, self.retire, self.join = chunk_exc, retire, join
+            self.fail = {"submit": 0, "marker": 0, "wait": 0, "view": False, **fail}
+            self.submits, self.scatters, self.views, self.waits = [], [], 0, 0
+
+        def __call__(self, *a, **kw):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def upload_file(self, *a, **kw):
+            pass
+
+        register_plugin = upload_file
+
+        def scheduler_info(self):
+            return {"workers": {run_vm: {"resources": {}},
+                                **{a: {"resources": {"compute": 1}} for a in self.tagged if a not in self.gone}}}
+
+        def run(self, fn, *a, workers=None, **kw):
+            return {w: 2 for w in workers or []}
+
+        def scatter(self, data, workers=None, **kw):
+            self.scatters.append(None if workers is None else sorted(workers))
+            return Fut("bundle", got=b"")
+
+        def cancel(self, futs):
+            for f in futs:
+                f.cancel()
+
+        def submit(self, fn, *a, key=None, workers=None, **kw):
+            if fn is _demand_marker:
+                if self.fail["marker"] > 0:
+                    self.fail["marker"] -= 1
+                    raise CommClosedError("marker")
+                return Fut(key)
+            w, ch = workers[0], a[4]
+            self.submits.append({"key": key, "worker": w, "procs": a[6], "bundle": a[0], "failed": False})
+            if self.fail["submit"] > 0:
+                self.fail["submit"] -= 1
+                self.submits[-1]["failed"] = True
+                raise CommClosedError("submit")
+            exc = self.chunk_exc(sum(not s["failed"] for s in self.submits) - 1) if self.chunk_exc else None
+            if exc is not None:                    # its worker leaves between two scheduler views
+                return Fut(key, exc=exc, on_result=lambda: (self.gone.add(w), self.retire and self.retired.add(w)))
+            return Fut(key, got={"rows": [{"i": i, "ok": True, "result": {}, "seconds": 1.0, "worker": w}
+                                          for i, _ in ch], "core_s": float(len(ch)), "summary": {}})
+
+        def run_on_scheduler(self, fn, res, key):
+            self.views += 1
+            if self.fail["view"]:
+                raise OSError("scheduler not answering")
+            if self.join and self.views >= self.join[0] and self.join[1] not in self.tagged:
+                self.tagged.append(self.join[1])
+            return {"workers": {run_vm: [False, 1, True],
+                                **{a: [True, 0, True] for a in self.tagged if a not in self.gone}},
+                    "held": key is not None, "retired": sorted(self.retired)}
+
+    cur = {}
+
+    def fake_wait(pending, timeout=None, return_when=None):
+        c = cur["c"]
+        c.waits += 1
+        if c.fail["wait"] > 0:
+            c.fail["wait"] -= 1
+            raise CommClosedError("wait")
+        done = {f for f in pending if f.done()}
+        return done, set(pending) - done
+
+    env = {"MA_COMPUTE_SCHEDULER": "tls://sched:8786", "MA_COMPUTE_RESOURCE": "compute",
+           "MA_COMPUTE_EXCLUDE_WORKERS": run_vm, "MA_COMPUTE_DISPATCH_S": "0.01", "MA_COMPUTE_INFRA_BACKOFF_S": "0",
+           "MA_COMPUTE_COMM_WAIT_S": "0.05", "MA_COMPUTE_SETTLE_S": "0.1", "MA_COMPUTE_TARGET_WORKERS": "2"}
+
+    def run(fake, n=16, limit=20.0, **more):
+        """(rows, summary, progress, error) of one _map_dask call against `fake`."""
+        cur["c"], prog = fake, {}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(distributed, "Client", fake), \
+                mock.patch.object(distributed, "wait", fake_wait), mock.patch.dict(os.environ, {**env, **more}), \
+                mock.patch.dict(globals(), {"make_bundle": lambda rd: (b"x", {"sha256": "0"})}):
+            try:
+                rows, info = _map_dask(d, "models/m.py::f", [{"x": i} for i in range(n)], None,
+                                       deadline=time.time() + limit, progress=prog)
+                return rows, info, prog, None
+            except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+                return [], {}, prog, f"{type(e).__name__}: {e}"
+
+    def all_ok(rows, n=16):
+        return sorted(r["i"] for r in rows if r.get("ok")) == list(range(n))
+
+    # CD1 a connection that drops under submit (a chunk, a demand marker) is retried, and a retried chunk is
+    # the same task for the scheduler (same key): nothing is placed twice.
+    fk = Fake([w1, w2], submit=2, marker=1)
+    rows, info, prog, err = run(fk)
+    failed = [s["key"] for s in fk.submits if s["failed"]]
+    ok(err is None and all_ok(rows) and prog.get("comm_retries", 0) >= 3 and failed and failed[0] is not None
+       and len({s["key"] for s in fk.submits[:3]}) == 1,
+       f"CD1 a dropped connection under submit is retried with the same task key: err={err} "
+       f"ok={sum(bool(r.get('ok')) for r in rows)} retries={prog.get('comm_retries')} keys={failed[:2]}")
+    # CD2 the same under wait; a connection that stays down ends the call after a bounded number of tries.
+    fk = Fake([w1, w2], wait=2)
+    rows, info, prog, err = run(fk)
+    ok(err is None and all_ok(rows) and prog.get("comm_retries", 0) >= 2,
+       f"CD2a a dropped connection under wait is retried: err={err} retries={prog.get('comm_retries')}")
+    fk = Fake([w1, w2], wait=10 ** 6)
+    rows, info, prog, err = run(fk)
+    ok(err is not None and "CommClosedError" in err and 3 <= fk.waits <= COMM_RETRIES + 3,
+       f"CD2b a connection that stays down raises after bounded retries: err={err} waits={fk.waits}")
+    # CD3 a scheduler view that cannot be read, with nothing out, is waited for within a bound; the queued
+    # inputs then fail as infra (it spun until the deadline, or for good without one).
+    fk = Fake([w1, w2], view=True)
+    t0 = time.time()
+    rows, info, prog, err = run(fk, limit=4.0, MA_COMPUTE_NO_WORKER_WAIT_S="0.3")
+    ok(err is None and "scheduler" in str(info.get("stopped")) and time.time() - t0 < 3.0
+       and sum(r.get("kind") == INFRA for r in rows) == 16,
+       f"CD3 an unreadable scheduler view stops the call within its bound: err={err} "
+       f"stopped={info.get('stopped')} after {time.time() - t0:.1f} s")
+    # CD4 a chunk whose future fails (KilledWorker, CancelledError) before the next view shows its worker
+    # retired on purpose is a scale-down: no infra retry used, the same processes. A worker that crashed
+    # (not recorded as retired) still takes the infra path.
+    for exc in (distributed.KilledWorker("t", mock.Mock(address=w1), 3), cf.CancelledError("t")):
+        name = type(exc).__name__
+        fk = Fake([w1, w2], chunk_exc=lambda k, e=exc: e if k == 0 else None)
+        rows, info, prog, err = run(fk)
+        lostc = [c for c in info.get("chunks", []) if c.get("error")]
+        ok(err is None and all_ok(rows) and len(lostc) == 1 and lostc[0].get("scaled_down") is True
+           and "backoff_s" not in lostc[0] and all(s["procs"] is None for s in fk.submits),
+           f"CD4 {name} on a worker retired on purpose is a scale-down (no infra retry, same processes): "
+           f"err={err} chunk={lostc[:1]} procs={sorted({str(s['procs']) for s in fk.submits})}")
+    fk = Fake([w1, w2], chunk_exc=lambda k: cf.CancelledError("t") if k == 0 else None, retire=False)
+    rows, info, prog, err = run(fk)
+    lostc = [c for c in info.get("chunks", []) if c.get("error")]
+    ok(err is None and all_ok(rows) and len(lostc) == 1 and not lostc[0].get("scaled_down")
+       and lostc[0].get("losses") == 1 and any(s["procs"] == 1 for s in fk.submits),
+       f"CD4b a worker that crashed still uses an infra retry with half the processes: err={err} {lostc[:1]}")
+    # CD5 the bundle goes to tagged compute workers only: at the start when some are up, else when the first
+    # one joins (never to the run's own VM, and no chunk is placed without it).
+    fk = Fake([w1, w2])
+    rows, info, prog, err = run(fk)
+    ok(err is None and all_ok(rows) and fk.scatters == [[w1, w2]],
+       f"CD5a the bundle is scattered to the tagged workers: err={err} scatters={fk.scatters}")
+    fk = Fake([], join=(5, w1))
+    rows, info, prog, err = run(fk)
+    ok(err is None and all_ok(rows) and fk.scatters == [[w1]] and fk.views >= 5
+       and all(s["bundle"] is not None for s in fk.submits) and not info.get("bundle_rescatters"),
+       f"CD5b with no compute worker yet, the bundle waits for the first one: err={err} scatters={fk.scatters}")
+    # CD6 the bundle leaves out what the fingerprint ignores (logs, figures, partial rows, job records, the
+    # ledger), and nothing else: inputs, earlier results and everything under data/ stay.
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as repo, \
+            mock.patch.dict(globals(), {"REPO": repo}):
+        d = os.path.realpath(d)
+        keep = ["models/m.py", "models/inputs.jsonl", "models/res.jsonl", "data/notes.log", "data/map.png"]
+        drop = ["models/run.log", "models/fig.png", "models/b.jsonl.partial.jsonl", "models/b.jsonl.job.json",
+                "models/res.jsonl.summary.json", "models/compute_ledger.json", "models/sub/trace.svg"]
+        for rel in keep + drop:
+            os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
+            open(os.path.join(d, rel), "w").write("def f(p):\n    return p\n" if rel.endswith(".py") else rel)
+        data, binfo = make_bundle(d)
+        with tarfile.open(fileobj=io.BytesIO(data)) as t:
+            got = sorted(os.path.relpath("/" + m, d) for m in t.getnames())
+        fp0 = code_fingerprint(d, "models/m.py::f")
+        for rel in drop:
+            os.remove(os.path.join(d, rel))
+        fp1 = code_fingerprint(d, "models/m.py::f")
+        # res.jsonl is another call's results file only while its summary is beside it: restore that first
+        open(os.path.join(d, "models/res.jsonl.summary.json"), "w").write("{}")
+        changed = []
+        for rel in keep:
+            open(os.path.join(d, rel), "a").write("#\n")
+            changed.append(code_fingerprint(d, "models/m.py::f") != fp0)
+        ok(got == sorted(keep) and binfo.get("skipped_outputs") == len(drop) and fp0 == fp1 and all(changed),
+           f"CD6 the bundle holds exactly the files the fingerprint covers: bundled={got} "
+           f"skipped={binfo.get('skipped_outputs')} fingerprint kept={fp0 == fp1} changed={changed}")
+    # CD7 a dead caller on another host: each chunk it had out is bounded by its cores x the time from its
+    # start to the caller's last heartbeat (plus one interval and the stop grace), never above its share.
+    now = time.time()
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, PROGRESS_DIR))
+        res = {"core_s": 432000.0, "pid": 1941, "host": "another-host", "backend": "dask", "n": 64,
+               "progress": os.path.join(PROGRESS_DIR, "abc.json"), "started": now - 900}
+
+        def settle(started, share, **kw):
+            p = {"t": now - 400, "core_s": 1000.0, "remote_unconfirmed": False, "call_id": "c",
+                 "out": [{"n": 32, "share": share, "started": now - started, "cores": 8}], **kw}
+            open(os.path.join(d, PROGRESS_DIR, "abc.json"), "w").write(json.dumps(p))
+            return _settle_dead({}, res, now=now, run_dir=d, foreign=True)
+        grace = 8 * SHARE_STOP_GRACE_S
+        c1, why1, parts1 = settle(500, 50000.0, hb_s=30.0)          # out 100 s before the last heartbeat
+        c2, _, _ = settle(500, 300.0, hb_s=30.0)                    # its share is the smaller bound
+        c3, _, _ = settle(500, 50000.0)                             # no heartbeat recorded: the share, as before
+        ok(abs(c1 - (1000.0 + 8 * (100 + 30) + grace)) < 1e-6 and "last heartbeat" in why1
+           and parts1.get("inflight_basis") == "last_heartbeat"
+           and abs(c2 - (1000.0 + 300.0 + grace)) < 1e-6 and abs(c3 - (1000.0 + 50000.0 + grace)) < 1e-6,
+           f"CD7 a foreign dead caller's chunks are bounded by time to its last heartbeat, at most their share: "
+           f"{c1:.0f} {c2:.0f} {c3:.0f} ({why1})")
+    # CD8 a call the ledger's history says will not fit its allowance says so before it starts, in its summary
+    # and ledger record (a per-call cap stopped part of a batch that had started with no such notice).
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "models"))
+        open(os.path.join(d, "models", "m.py"), "w").write("def f(p):\n    return {'y': p['x']}\n")
+        open(os.path.join(d, LEDGER_REL), "w").write(json.dumps({"core_seconds": 0.0, "reservations": {}, "calls": [
+            {"fn": "models/m.py::f", "n": 10, "n_failed": 0, "task_core_s": 1000.0}]}))
+        rows, summ = map_fn(d, "models/m.py::f", [{"x": i} for i in range(6)], backend="local", max_workers=1,
+                            max_core_hours=0.01)
+        look = summ.get("cap_outlook") or {}
+        rec = json.load(open(os.path.join(d, LEDGER_REL)))["calls"][-1]
+        ok(look.get("projected_core_s") == 600.0 and look.get("allowance_core_s") == 36.0 and look.get("over") is True
+           and (rec.get("cap_outlook") or {}).get("over") is True and sum(r["ok"] for r in rows) == 6,
+           f"CD8 the ledger's history projects the call past its allowance before launch: {look}")
+    # CD9 with no history, the call's own first tasks give the projection (noted once, never a stop).
+    prog = {"_n": 1200, "_allow": 1000.0, "done_tasks": 100, "core_s": 100.0}
+    _cap_outlook(prog)
+    first = dict(prog.get("cap_outlook") or {})
+    prog.update(done_tasks=200, core_s=400.0)
+    _cap_outlook(prog)
+    small = {"_n": 1200, "_allow": 1000.0, "done_tasks": 2, "core_s": 100.0}
+    _cap_outlook(small)
+    ok(first.get("projected_core_s") == 1200.0 and first.get("over") is True
+       and prog["cap_outlook"]["projected_core_s"] == 2400.0 and prog.get("_cap_warned") is True
+       and "cap_outlook" not in small,
+       f"CD9 measured task time projects the call past its allowance mid-batch: {first} then {prog.get('cap_outlook')}")
 
 
 def _self_test_s18(ok) -> None:
