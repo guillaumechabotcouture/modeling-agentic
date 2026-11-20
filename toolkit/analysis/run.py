@@ -2103,9 +2103,47 @@ def _self_test_test_ranges(ok, q):
         rd["analysis"]["decision_tests"][1]["with"] = {"base": 0.6}
         dos = PCm.chosen_range_test_runs(rd, "DTc", "parameter:dw", {"dw": (0.005, 0.02)})
         dos_ok = PCm.chosen_range_test_runs(r, "DTc", "parameter:dw", {"dw": (0.005, 0.02), "eff_a": (0.3, 0.7)})
-        ok(carries[0] is False and "with" in carries[1] and dos[0] is False and "base" in dos[1] and dos_ok[0] is True,
-           f"RPW9 a test with companions cannot carry a benchmark departure, and the dossier's range test needs every "
-           f"companion to be an emulator input: {carries[1][:90]} | {dos[1][:90]}")
+        ok(carries[0] is False and "with" in carries[1] and dos[0] is False and "with" in dos[1]
+           and dos_ok[0] is False and "with" in dos_ok[1],
+           f"RPW9 a test with companions cannot carry a benchmark departure or be the dossier's range test (Codex r1, "
+           f"r2): {carries[1][:90]} | {dos[1][:90]}")
+        # Codex r2 on v2-dt-with
+        rq = copy.deepcopy(rh)
+        rq["analysis"]["decision_tests"] = [{"id": "DTq", "type": "parameter_value", "parameter": "synergy",
+                                             "values": ["0.1"], "text": "t"}]
+        try:
+            PV.test_settings({"type": "parameter_value", "parameter": "eff_a", "values": [0.5, "oops"]})
+            malformed = "accepted"
+        except ValueError as e:
+            malformed = f"ValueError: {e}"
+        ok(PV.tested_boxes(schema.Spec(rq, d)) == {} and malformed.startswith("ValueError"),
+           f"RPW11 without `with`, a held spec value's box ignores a quoted value and a value that is not a number is "
+           f"an error where a test's values are read, both as before: {PV.tested_boxes(schema.Spec(rq, d))} "
+           f"{malformed[:60]}")
+        rec_w = {"status": "run", "perturbation_identity": [False], "package_components": {"k": ["a"]},
+                 "benefit_change_by_package": {"k": 1.0}}
+        dv = [DT.departure_verdicts([{"benchmark": "B", "decision_test": "T", "engine": "e"}],
+                                    {"B": {"components": ["a"]}}, {"T": dict(rec_w, **x)})[0]
+              for x in ({}, {"with": {"eff_a": 1.0}})]
+        ok(dv[0]["effective"] is True and dv[1]["effective"] is False and "with" in dv[1]["why"],
+           f"RPW12 the run's departure verdict never credits a test that held companions: {dv[1]['why'][:100]}")
+        ra = copy.deepcopy(re_)
+        ra["engine"] = "auto"
+        try:
+            pend = [e for e in schema.validate(schema.Spec(ra, d), pending_ok=True) if "DTe" in e and "with" in e]
+        except Exception as e:  # noqa: BLE001
+            pend = [f"{type(e).__name__}: {e}"] if "with" in str(e) and "DTe" in str(e) else []
+        ok(bool(pend), f"RPW13 `with` on another test type is refused while the engine is still pending too: "
+                       f"{pend[:1]}")
+        from toolkit.spec import spec_critique as SCm
+        rv = copy.deepcopy(r)
+        rv["analysis"]["decision_tests"] = [{"id": "DTv", "type": "parameter_value", "parameter": "base",
+                                             "values": [0.3, 0.6], "text": "t", "with": {"eff_a": 0.6}}]
+        v_with = SCm._varied(rv, d)[0]
+        rv["analysis"]["decision_tests"][0].pop("with")
+        ok("base" not in v_with and "base" in SCm._varied(rv, d)[0],
+           f"RPW14 the pre-sign critique does not count a test with companions as varying its parameter: "
+           f"{sorted(map(str, v_with))[:4]}")
         summ = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))
         row = next(x for x in summ["data"]["tests"] if x.get("test_id") == "DTc")
         ok((row.get("detail") or {}).get("with") == {"eff_a": 0.75},
