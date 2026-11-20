@@ -664,9 +664,9 @@ def recycle_every(procs: int) -> int:
 
 def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple[bytes, dict]:
     """tar.gz of the run's models/ and data/ and the repo's scripts/ and toolkit/, with
-    ABSOLUTE member paths so workers recreate the same layout. The files code_fingerprint
-    ignores (`_fp_ignored`: logs, figures, summaries, partial rows, the ledger) are left out:
-    no row may depend on them, and a long run's logs and partial rows were shipped to every VM."""
+    ABSOLUTE member paths so workers recreate the same layout. Logs and the records this
+    module keeps beside a batch are left out (`_bundle_skips`): a long run's
+    logs and partial rows were shipped to every VM."""
     run_dir = os.path.realpath(run_dir)
     skipped, n, n_out = [], 0, 0
     buf = io.BytesIO()
@@ -690,7 +690,7 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                 names, in_data = set(files), root == os.path.join(run_dir, "data")
                 for fn in files:
                     p = os.path.join(dp, fn)
-                    if _fp_ignored(fn, names, in_data, dp == os.path.join(run_dir, "models")):
+                    if _bundle_skips(fn, names, in_data, dp == os.path.join(run_dir, "models")):
                         n_out += 1
                         continue
                     try:
@@ -2502,12 +2502,21 @@ def _fp_ignored(fn: str, names, in_data: bool, runner: bool) -> bool:
     """Whether code_fingerprint leaves out file `fn` (`names`: the files of its directory; `in_data`: under the
     run's data/, where nothing is left out; `runner`: directly in the run's models/): logs, figures, summaries,
     the ledger, a batch's partial rows or detached-job record, the pipeline runner's own files. Another call's
-    results file (its `.summary.json` is beside it) is never left out, whatever its extension. make_bundle
-    leaves out the same files, so the two cannot drift apart."""
+    results file (its `.summary.json` is beside it) is never left out, whatever its extension."""
     if in_data or fn + ".summary.json" in names:
         return False
     return (fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json") or fn.endswith((PARTIAL_EXT, JOB_EXT))
             or fn.startswith("compute_ledger.json") or (runner and fn in _FP_RUNNER_FILES))
+
+
+def _bundle_skips(fn: str, names, in_data: bool, runner: bool) -> bool:
+    """Whether make_bundle leaves out file `fn` (arguments as `_fp_ignored`): only a file the fingerprint
+    ignores, and of those only logs and the records this module writes beside a batch (summaries, partial
+    rows, job records, the ledger). The other ignored files (figures, `.out`, `.err`, `.tmp`, the pipeline
+    runner's files) are still shipped: a model that reads one found it on the workers before."""
+    return _fp_ignored(fn, names, in_data, runner) and (
+        fn.endswith((".log", ".summary.json", PARTIAL_EXT, JOB_EXT))
+        or fn.startswith("compute_ledger.json"))
 
 
 FP_DISPATCH_EXEMPT = (
