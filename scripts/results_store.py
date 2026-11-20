@@ -519,11 +519,144 @@ def _self_test() -> int:
         delete("outputs/ck/x", service=sv)
         if ("outputs", "ck/x") in sv.store:
             fails.append("S13 delete removes a blob")
+    try:
+        _self_test_durable(fails)
+    except Exception as e:  # noqa: BLE001
+        fails.append(f"S18-S24 raised {type(e).__name__}: {e}")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_durable(fails) -> None:
+    """S18-S24 (v2 autonomy 1E-i): one reused client with timeouts, retries with backoff, and uploads and downloads
+    that never hold a file whole. Fake blob clients; no network."""
+    import json
+    import tempfile
+    import time
+    import types
+    from unittest import mock
+    block = b"q" * 2**20
+
+    class _Client:        # Azure's streaming call shapes; whole-file reads and byte uploads are refused
+        def __init__(self, st, key, calls, fail):
+            self.st, self.key, self.calls, self.fail = st, key, calls, fail
+
+        def upload_blob(self, data, overwrite=False, length=None, timeout=None):
+            self.calls.append(("up", timeout))
+            if isinstance(data, (bytes, bytearray)):
+                raise AssertionError("upload_blob was given the whole file as bytes")
+            if self.fail and self.fail("up", len(self.calls)):
+                raise OSError("transient")
+            self.st[self.key] = b"".join(iter(lambda: data.read(2**16), b""))
+
+        def download_blob(self, timeout=None):
+            self.calls.append(("down", timeout))
+            if self.fail and self.fail("down", len(self.calls)):
+                raise OSError("transient")
+            v, cut = self.st[self.key], self.fail and self.fail("cut", len(self.calls))
+
+            def chunks(_d):
+                for i in range(0, len(v), 2**20):
+                    if cut and i:
+                        raise OSError("connection reset mid-stream")
+                    yield v[i:i + 2**20]
+
+            def readall(_d):
+                raise AssertionError("readall: the blob would be held whole")
+            return type("D", (), {"chunks": chunks, "readall": readall})()
+
+    class _Svc:
+        def __init__(self, fail=None):
+            self.st, self.calls, self.fail = {}, [], fail
+
+        def get_blob_client(self, c, n):
+            return _Client(self.st, (c, n), self.calls, self.fail)
+
+    made = []
+    blob_mod = types.SimpleNamespace(BlobServiceClient=lambda url, **kw: made.append((url, kw)) or object())
+    ident = types.SimpleNamespace(DefaultAzureCredential=lambda **kw: "cred")
+    with mock.patch.dict(sys.modules, {"azure": types.SimpleNamespace(), "azure.identity": ident,
+                                       "azure.storage": types.SimpleNamespace(), "azure.storage.blob": blob_mod}):
+        same = _service("acct18") is _service("acct18") and _service("other18") is not _service("acct18")
+    kw = made[0][1] if made else {}
+    if not same or len(made) != 2 or (kw.get("connection_timeout"), kw.get("read_timeout")) != (30, 120):
+        fails.append(f"S18 RS_STREAM_TIMEOUT one client per account, reused, with connection and read timeouts: "
+                     f"{len(made)} built, {sorted(kw)}")
+    slept = []
+    with tempfile.TemporaryDirectory() as d, mock.patch.object(time, "sleep", slept.append):
+        src = os.path.join(d, "big.bin")
+        with open(src, "wb") as f:
+            for _ in range(3):
+                f.write(block)
+        svc, got = _Svc(), {}
+        try:
+            r = upload_retry(src, "outputs/s/big.bin", service=svc)
+            got = download("outputs/s/big.bin", os.path.join(d, "out", "big.bin"), service=svc)
+            same = sha256_file(os.path.join(d, "out", "big.bin")) == sha256_file(src) == got["sha256"] == r["sha256"]
+        except Exception as e:  # noqa: BLE001
+            same = f"{type(e).__name__}: {e}"
+        if same is not True or got.get("bytes") != 3 * 2**20:
+            fails.append(f"S19 upload_retry and download stream chunk by chunk, with a chunked sha256: {same}")
+        if not svc.calls or {t for _, t in svc.calls} != {300}:
+            fails.append(f"S20 RS_STREAM_TIMEOUT every storage call carries the per-call timeout: {svc.calls[:4]}")
+        slept.clear()
+        flaky = _Svc(fail=lambda what, n: what == "down" and n <= 4)
+        flaky.st[("outputs", "s/f.bin")] = block
+        try:
+            got = download("outputs/s/f.bin", os.path.join(d, "f.bin"), service=flaky)["bytes"]
+        except Exception as e:  # noqa: BLE001
+            got = f"{type(e).__name__}: {e}"
+        if got != 2**20 or len(slept) != 4 or slept != sorted(slept) or not 30 <= sum(slept) <= 62:
+            fails.append(f"S21 a download is retried: five attempts with a growing wait: {got}, waits {slept}")
+        dead = _Svc(fail=lambda what, n: what == "up")
+        try:
+            upload_retry(src, "outputs/s/dead.bin", service=dead)
+            got = "no error"
+        except RuntimeError as e:
+            got = str(e)
+        if "5 attempts" not in got or len(dead.calls) != 5:
+            fails.append(f"S22 an upload that keeps failing raises after five attempts: {got} ({len(dead.calls)} calls)")
+        cut = _Svc(fail=lambda what, n: what == "cut")
+        cut.st[("outputs", "s/c.bin")] = block * 2
+        dest = os.path.join(d, "keep", "c.bin")
+        os.makedirs(os.path.dirname(dest))
+        with open(dest, "wb") as f:
+            f.write(b"the earlier good copy")
+        try:
+            download("outputs/s/c.bin", dest, service=cut)
+            got = "no error"
+        except RuntimeError:
+            got = "raised"
+        left = sorted(os.listdir(os.path.dirname(dest)))
+        if got != "raised" or left != ["c.bin"] or open(dest, "rb").read() != b"the earlier good copy":
+            fails.append(f"S23 a download cut mid-stream raises, keeps the earlier copy and leaves no partial file: "
+                         f"{got} {left}")
+        # S24: the end-of-run store (agents/run_finish.py) through the same streaming client: the archive is written
+        # to disk and streamed up; the in-memory archive_dir is never called; the staging file is removed.
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from agents import run_finish
+        import results_store as rs
+        run = os.path.join(d, "runs", "2026-01-01_000000_q")
+        os.makedirs(os.path.join(run, "models"))
+        with open(os.path.join(run, "report.md"), "w") as f:
+            f.write("report\n")
+        with open(os.path.join(run, "models", "big.bin"), "wb") as f:
+            f.write(block)
+        boom = mock.Mock(side_effect=AssertionError("archive_dir: the run archive would be built in memory"))
+        for svc, want in ((_Svc(), True), (_Svc(fail=lambda what, n: what == "up"), False)):
+            with mock.patch.object(rs, "archive_dir", boom), mock.patch.dict(os.environ, {"MA_STORAGE_PREFIX": "t"}):
+                blob = run_finish.store_run_results(run, service=svc)
+            meta = json.load(open(os.path.join(run, "metadata.json")))
+            left = sorted(os.listdir(os.path.dirname(run)))
+            good = (blob == "outputs/t/2026-01-01_000000_q.tar.gz" and meta.get("stored") == blob
+                    and ("outputs", "t/2026-01-01_000000_q.tar.gz") in svc.st) if want else \
+                (blob is None and "5 attempts" in str(meta.get("store_error")))
+            if not good or left != ["2026-01-01_000000_q"]:
+                fails.append(f"S24 store_run_results streams the run archive (stored={want}) and removes its "
+                             f"staging file: {blob} {meta} {left}")
 
 
 def main() -> int:

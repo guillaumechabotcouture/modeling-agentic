@@ -4814,6 +4814,122 @@ def _self_test_checkpoint(ok) -> None:
        f"CK28 (Codex round 3) 30 labels whose storage reads hang: the call ends at its 0.3 s deadline ({took:.2f}s)")
 
 
+def _self_test_storage(ok) -> None:
+    """WS1-WS6 (v2 autonomy 1E-i): the agent VM's end-of-run paths never hold an archive whole, the returned
+    tarball keeps large files when main.py's own store failed, teardown waits for a checkpoint upload in flight,
+    and the checkpointer records its health. Fake store, fake main.py, no cloud."""
+    import hashlib
+    import io
+    import tempfile
+    import threading
+    from unittest import mock
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+    import results_store
+
+    def code(store_error):
+        main_py = ("import json, os\nrd = 'runs/R_x'\nos.makedirs(rd)\n"
+                   "open(rd + '/big.bin', 'wb').write(b'x' * 4096)\nopen(rd + '/small.txt', 'w').write('s')\n"
+                   f"json.dump({{'stored': 'outputs/t/R_x.tar.gz', 'store_error': {store_error!r}}}, "
+                   "open(rd + '/metadata.json', 'w'))\n")
+        b = io.BytesIO()
+        with tarfile.open(fileobj=b, mode="w:gz") as t:
+            ti = tarfile.TarInfo("main.py")
+            ti.size = len(main_py.encode())
+            t.addfile(ti, io.BytesIO(main_py.encode()))
+        return b.getvalue()
+    root = tempfile.mkdtemp()
+    got = {}
+    for label, err in (("OK", None), ("BAD", "OSError: storage unreachable")):
+        with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"), \
+                mock.patch.object(ws, "MAX_RETURN_FILE", 1024):
+            res = ws.run_job_impl(label, code(err), "q", [], "k", None)
+        tar = res.get("tarball")
+        on_disk = isinstance(tar, str) and os.path.dirname(tar) == os.path.join(root, label) and os.path.exists(tar)
+        names = tarfile.open(tar, mode="r:gz").getnames() if on_disk else []
+        got[label] = (on_disk, "runs/R_x/big.bin" in names, [p for p, _ in res["skipped_large_files"]],
+                      ws.run_stored(tar) if on_disk else "?")
+    ok(got["OK"] == (True, False, ["runs/R_x/big.bin"], "outputs/t/R_x.tar.gz"),
+       f"WS1 the returned tarball is written to disk, never returned as bytes; a stored run's large files stay in "
+       f"storage only: {got['OK']}")
+    ok(got["BAD"] == (True, True, [], None),
+       f"WS2 WS_FALLBACK_LARGE_FILE main.py's store failed: the tarball held for collect keeps every large file: "
+       f"{got['BAD']}")
+
+    class Store:
+        write_archive, sha256_file = staticmethod(results_store.write_archive), staticmethod(results_store.sha256_file)
+        is_sensitive_path = staticmethod(results_store.is_sensitive_path)
+
+        def __init__(self, gate=None, fail=False):
+            self.files, self.gate, self.fail = {}, gate, fail
+
+        def archive_dir(self, *a, **kw):
+            raise AssertionError("archive_dir: the archive would be built in memory")
+
+        def upload_file(self, path, blob, account=None):
+            if self.gate is not None:
+                self.gate.wait(10)
+            if self.fail:
+                raise OSError("storage unreachable")
+            self.files[blob] = open(path, "rb").read()
+            return {"blob": blob}
+        upload_retry = upload_file
+
+        def download(self, blob, path, account=None):
+            open(path, "wb").write(self.files[blob])
+
+        def list_blobs(self, prefix, account=None):
+            return [{"name": n} for n in sorted(self.files) if n.startswith(prefix)]
+
+        def delete(self, blob, account=None):
+            self.files.pop(blob, None)
+    home, d = os.path.join(root, "home"), os.path.join(root, "OK")
+    st = Store()
+    blob = ws.store_transcripts(d, st, "runs/t", "L1", "OK", None, ["sk-ant-TESTSECRET12345"], home=home)
+    os.makedirs(os.path.join(home, "s1"))
+    open(os.path.join(home, "s1", "t.jsonl"), "w").write("key sk-ant-TESTSECRET12345\n")
+    blob2 = ws.store_transcripts(d, st, "runs/t", "L1", "OK", None, ["sk-ant-TESTSECRET12345"], home=home)
+    body = tarfile.open(fileobj=io.BytesIO(st.files.get(blob2, b"")), mode="r:gz").extractfile("transcripts/s1/t.jsonl").read()
+    ok(blob == blob2 == "outputs/runs/t/launch_L1/transcripts_OK.tar.gz" and b"TESTSECRET" not in body,
+       f"WS3 the transcripts are archived by the streaming writer, redacted; a VM with no transcripts yet still "
+       f"stores an (empty) archive: {blob} {body!r}")
+    out = os.path.join(root, "out")
+    os.makedirs(out)
+    open(os.path.join(out, "a.bin"), "wb").write(b"a" * 3000)
+    with mock.patch.object(ws, "_sha_file", mock.Mock(wraps=getattr(ws, "_sha_file", None)), create=True) as spy:
+        rec = ws.store_outputs(out, "outputs/j", None, st)
+    ok(rec["verified"] and rec["files"] == {"a.bin": hashlib.sha256(b"a" * 3000).hexdigest()} and spy.call_count == 2,
+       f"WS4 store_outputs hashes each file and its read-back block by block (ws._sha_file), never with one "
+       f"whole-file read: {rec['why']} calls={spy.call_count}")
+    # WS5 WS_CK_WAIT_IDLE: teardown stops the timer, then waits for the upload in flight (the cluster may shut down
+    # right after). WS6: the counters reach .checkpoint/status.json after every checkpoint, stored or failed.
+    work = os.path.join(root, "W")
+    os.makedirs(os.path.join(work, "runs", "R_x"))
+    json.dump({"state": "ANALYZE", "round": 1}, open(os.path.join(work, "runs", "R_x", "run_state.json"), "w"))
+    gate = threading.Event()
+    st5 = Store(gate=gate)
+    c = ws.Checkpointer("W", work, "runs/t", "L1", None, st5, 3600, log=lambda m: None)
+    c.start()
+    c.trigger("t")
+    threading.Timer(0.4, gate.set).start()
+    box = type("B", (), {"box": c})
+    ws.stop_checkpointer(box, idle_s=10)
+    ok(c.done == 1 and ws.checkpoint_pointer("runs/t", "L1", "W") in st5.files,
+       f"WS5 WS_CK_WAIT_IDLE teardown returns only once the checkpoint in flight is stored (done={c.done})")
+    ws.stop_checkpointer(None), ws.stop_checkpointer(type("B", (), {"box": None}))
+    sp = os.path.join(work, ws.CKDIR, "status.json")
+    s1 = json.load(open(sp)) if os.path.exists(sp) else {}
+    st5.fail, before = True, time.time()
+    c.trigger("t2")
+    c.wait_idle(10)
+    s2 = json.load(open(sp)) if os.path.exists(sp) else {}
+    ok((s1.get("done"), s1.get("failed"), s1.get("generation"), s1.get("last_error")) == (1, 0, 1, None)
+       and s1.get("last_ok_epoch") and s1.get("label") == "W",
+       f"WS6 a stored checkpoint is recorded in .checkpoint/status.json: {s1}")
+    ok((s2.get("done"), s2.get("failed")) == (1, 1) and "storage unreachable" in str(s2.get("last_error"))
+       and s2.get("last_ok_epoch") == s1.get("last_ok_epoch") and (s2.get("updated_epoch") or 0) >= before,
+       f"WS6b a failed checkpoint is counted with its error; the last good time is kept: {s2}")
+
+
 def _self_test_sheet(ok) -> None:
     """2026-11-12: a canary relaunch died in 8 s at SIGN because its spec was amended after its sign-off sheet was
     generated; the pre-launch checks did not look at the sheet. A launch now refuses a resumed run at SIGN whose
@@ -5172,6 +5288,10 @@ def _self_test() -> int:
         _self_test_checkpoint(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CK: {type(e).__name__}: {e}")
+    try:
+        _self_test_storage(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"WS: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
