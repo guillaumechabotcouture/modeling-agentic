@@ -308,7 +308,7 @@ def _read_claims(ledger_path: str) -> list:
         raise FileNotFoundError(f"claims_ledger not found: {ledger_path}")
     with open(ledger_path) as f:
         doc = yaml.safe_load(f) or {}
-    raw = (doc.get("claims") or []) if isinstance(doc, dict) else None
+    raw = doc.get("claims") or []
     if not isinstance(raw, list):
         raise ValueError(f"{ledger_path}: top-level `claims:` must be a list")
     return raw
@@ -321,9 +321,14 @@ def load_claims_tolerant(ledger_path: str) -> tuple[dict[str, dict], dict[str, s
     refused whole, as by load_claims; an id given twice is invalid both times."""
     good: dict[str, dict] = {}
     bad: dict[str, str] = {}
-    for i, c in enumerate(_read_claims(ledger_path)):
+    try:
+        raw = _read_claims(ledger_path)
+    except AttributeError as e:          # a ledger that is not a mapping (load_claims raises this as it always did)
+        raise ValueError(f"{ledger_path}: the ledger is not a mapping with a `claims:` list") from e
+    for i, c in enumerate(raw):
         cid = c.get("id") if isinstance(c, dict) else None
-        name = cid if isinstance(cid, str) and cid else f"claims[{i}]"
+        # a row without an id the reference syntax can express is named by position (no id can be `claims[i]`)
+        name = cid if isinstance(cid, str) and _CLAIM_ID_RE.fullmatch(cid) else f"claims[{i}]"
         try:
             one = _validate_claims([c], ledger_path, i)
             if name in good or name in bad:

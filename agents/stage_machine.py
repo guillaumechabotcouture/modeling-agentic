@@ -491,7 +491,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     out = []
     for reviewer, name in V.FILENAMES.items():
         p = os.path.join(run_dir, name)
-        if not os.path.exists(p) or (reviewer == "critique-presentation" and not draft):
+        if not os.path.exists(p) or (reviewer == "critique-presentation" and not drafted):
             continue
         try:
             import yaml
@@ -738,11 +738,12 @@ def report_claim_findings(run_dir: str) -> list[dict]:
             "scope_declarable": False, "claim": f"The claims ledger's entry {cid} is invalid and cannot be rendered: {why}"}
            for cid, why in sorted(invalid.items())]
     # A reference is read as the renderer reads it (render_claims.render_text strips the id).
-    for cid in sorted({c.strip() for c in re.findall(r"\[CLAIM:([^\]]*)\]", text)} - set(claims) - set(invalid)):
+    refs = {c if "\n" in c else c.strip() for c in re.findall(r"\[CLAIM:([^\]]*)\]", text)}   # no id spans lines
+    for cid in sorted(refs - set(claims) - set(invalid)):
         out.append({"kind": "report_claim_unresolved", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                     "key": cid, "scope_declarable": False,
                     "claim": f"The report has [CLAIM:{cid}], which is not in the claims ledger."})
-    bare = re.sub(r"\[CLAIM:[^\]]*\]", " ", text)         # an id inside a reference is not a bare id
+    bare = re.sub(r"\[CLAIM:[^\]\n]*\]", " ", text)       # an id inside a reference is not a bare id
     for cid in sorted(c for c in claims if "." in c or "_" in c):     # a plain word is not an id
         if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", bare):
             out.append({"kind": "report_claim_id_raw", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
@@ -1182,7 +1183,7 @@ class Machine:
         # A write-up task spends up to the cap itself, so its read-back allowance is part of what an interrupted
         # one is charged (_interrupted_charge): the cap holds on resume.
         j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance, writeup=bool(writeup),
-                 readback_usd=rb if writeup and b is not None else 0.0)
+                 readback_usd=rb if writeup else 0.0)
         self.st.journal[key] = j
         save_state(self.run_dir, self.st)
         setter = getattr(self.tasks, "set_allowance", None)
@@ -1323,13 +1324,26 @@ class Machine:
         findings that state owns, each with its remedy. An unsigned spec is redrafted with them as its feedback and a
         fresh count of tries (a signed one is the owner's to amend: h_SPEC); the engine pick is told the engine the
         run left. Nothing read here can stop the back-edge: a file that is not what it should be adds no reason."""
+        try:
+            out = self._rethink_reasons(to, planned)
+        except Exception as e:  # noqa: BLE001 -- advisory text: the back-edge is taken without it
+            out = [f"the reasons could not be read ({type(e).__name__})"]
+        if to == "SPEC" and not (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
+            self.st.tries["spec"] = 0
+            if out:
+                self.st.tries["spec_feedback"] = [f"rethink after review round {self.st.round}: {x}" for x in out]
+        elif to == "ENGINE_CHOICE":
+            self.st.tries["rethink_engine"] = {"engine": self.st.engine, "round": self.st.round, "why": out}
+        return self._go(to, why)
+
+    def _rethink_reasons(self, to: str, planned: bool) -> list[str]:
         import yaml
         import validate_critique_yaml as V
         g, out, named = self.st.last_gate or {}, [], set()
         if not planned:
             if g.get("action") == "RETHINK_STRUCTURAL" and g.get("rationale"):
                 out.append(f"gate: {g['rationale']}")
-            for reviewer in CRITICS:
+            for reviewer in V.FILENAMES:           # every reviewer the gate may have read
                 try:
                     doc = yaml.safe_load(open(os.path.join(self.run_dir, V.FILENAMES[reviewer])))
                     sm = doc.get("structural_mismatch") or {}
@@ -1348,16 +1362,13 @@ class Machine:
                 if isinstance(t, dict) and t.get("action") == "rethink" and t.get("owner_state") == to:
                     out.append(f"fix plan: {t.get('brief')}")
                     named |= {str(x) for x in (t.get("findings") if isinstance(t.get("findings"), list) else [])}
+        try:
+            led = FL.open_findings(FL.load(self.run_dir))
+        except Exception as e:  # noqa: BLE001 -- the reasons read so far are kept
+            led, out = [], out + [f"the findings ledger could not be read ({type(e).__name__})"]
         out += [f"{f.id}: {f.claim}" + (f" Required: {f.fix_requires}" if f.fix_requires else "")
-                for f in FL.open_findings(FL.load(self.run_dir)) if f.id in named or f.owner_state == to]
-        out = [" ".join(str(x).split())[:600] for x in out][:20]
-        if to == "SPEC" and not (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
-            self.st.tries["spec"] = 0
-            if out:
-                self.st.tries["spec_feedback"] = [f"rethink after review round {self.st.round}: {x}" for x in out]
-        elif to == "ENGINE_CHOICE":
-            self.st.tries["rethink_engine"] = {"engine": self.st.engine, "round": self.st.round, "why": out}
-        return self._go(to, why)
+                for f in led if f.id in named or f.owner_state == to]
+        return [" ".join(str(x).split())[:600] for x in out][:20]
 
     def rebuild(self, run_dir: str) -> dict:
         """The S1 pipeline, then the report again when a draft exists (a write-up fix edits

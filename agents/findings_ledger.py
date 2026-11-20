@@ -83,10 +83,18 @@ class Finding:
         return asdict(self)
 
 
+_DW_ROWS = ("done_when_regressed", "done_when_unmet", "done_when_dropped")    # gate rows keyed by a finding's id
+
+
 def tests_of(dw) -> list | None:
     """A finding's done_when as the ledger keeps it: a list of checks (one mapping is a list of one, as
     scripts/done_when.py reads it), or None."""
-    return dw if isinstance(dw, list) else [dw] if isinstance(dw, dict) else None
+    t = dw if isinstance(dw, list) else [dw] if isinstance(dw, dict) else None
+    try:          # as save() writes it: a test it could not write (YAML keys of mixed types) is no test here
+        json.dumps(t, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None
+    return t
 
 
 def frozen_tests(run_dir: str) -> dict[str, list | None]:
@@ -97,8 +105,11 @@ def frozen_tests(run_dir: str) -> dict[str, list | None]:
     if _scripts not in sys.path:
         sys.path.insert(0, _scripts)
     import done_when as DW
-    return {str(k): None if t.get("withdrawn") else tests_of(t["done_when"])
-            for k, t in DW.load_registry(run_dir)["tests"].items()
+    try:
+        tests = DW.load_registry(run_dir)["tests"]
+    except Exception:  # noqa: BLE001 -- a registry that cannot be decoded: the gate reports it (done_when_unavailable)
+        return {}
+    return {str(k): None if t.get("withdrawn") else tests_of(t["done_when"]) for k, t in tests.items()
             if isinstance(t, dict) and (t.get("withdrawn") or tests_of(t.get("done_when")))}
 
 
@@ -395,9 +406,11 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
                 _event(f, round_n, "fixed", "gate", "absent at this gate")
     frozen = frozen_tests(run_dir)
     for f in led.values():
-        if f.source.startswith("critique") and f.id in frozen:
-            f.done_when = frozen[f.id]       # the frozen test, never a critic's later edit of it
-        names = {f.id, f.kind, f.key, f"{f.kind}:{f.key}" if f.key else f.kind}
+        fk = f.id if f.source.startswith("critique") else f.key if f.kind in _DW_ROWS else None
+        if fk in frozen:
+            f.done_when = frozen[fk]         # the frozen test (none once withdrawn), never a critic's later edit
+        # a regressed or unmet row is keyed by its finding's id: a declaration of that finding does not declare it
+        names = {f.id, f.kind, None if f.kind in _DW_ROWS[:2] else f.key, f"{f.kind}:{f.key}" if f.key else f.kind}
         hit = next((decl[n] for n in names if n and n in decl), None)
         if hit is not None and f.status == "open":
             f.status = "declared"
