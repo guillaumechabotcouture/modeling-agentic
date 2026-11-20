@@ -375,13 +375,23 @@ RENDER_FAILED = "figure_render_failed"
 
 
 def render_findings(not_produced) -> list[dict]:
-    """One MEDIUM finding per figure that failed while it was drawn or saved (`render_failed` in its not-produced
-    record): figure_render_failed:<figure>. A figure without its inputs is not one. The contract check
+    """One finding per figure that failed while it was drawn or saved (`render_failed` in its not-produced record):
+    figure_render_failed:<figure>. By the tier its record carries (TIER_OF; owner decision on #293, 2026-11-20): a
+    decision figure is HIGH and not declarable, so it blocks acceptance; a diagnostic or trace figure (the other
+    tiers of TIERS) is MEDIUM and declarable; a record with no tier, or one this module does not know, is treated
+    as a decision figure (fail closed). A figure without its inputs is not a finding. The contract check
     (toolkit/analysis/contract.py) reads these from the manifest-hashed analysis/figures.yaml."""
-    return [{"kind": RENDER_FAILED, "severity": "MEDIUM", "stage": "ANALYZE", "key": str(x.get("figure")),
-             "claim": f"figure {x.get('figure')} ({x.get('tier')} tier) was not produced: {x.get('reason')}",
-             "scope_declarable": True, "source": PRODUCER}
-            for x in not_produced or [] if isinstance(x, dict) and x.get("render_failed")]
+    out = []
+    for x in not_produced or []:
+        if not (isinstance(x, dict) and x.get("render_failed")):
+            continue
+        tier = x.get("tier")
+        minor = isinstance(tier, str) and tier in TIERS        # TIERS holds the non-decision tiers only
+        out.append({"kind": RENDER_FAILED, "severity": "MEDIUM" if minor else "HIGH", "stage": "ANALYZE",
+                    "key": str(x.get("figure")),
+                    "claim": f"figure {x.get('figure')} ({tier} tier) was not produced: {x.get('reason')}",
+                    "scope_declarable": minor, "source": PRODUCER})
+    return out
 
 
 def _fig_bytes(fig, fmt: str, **kw) -> bytes:
@@ -2326,8 +2336,8 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         except PresentationRefused:
             raise                       # a refused declared input is not one figure's failure: fail closed, as before
         except Exception as e:  # noqa: BLE001 -- v2 autonomy 1C-a: one figure's failure (its draw, title, save,
-            # validation or table) is its own: recorded with the error, a MEDIUM finding (render_findings), and the
-            # other figures are still drawn; it never ends the analysis
+            # validation or table) is its own: recorded with the error, a finding by its tier (render_findings), and
+            # the other figures are still drawn; it never ends the analysis
             _discard(dest, name, run_dir if harness else dest, before)
             notp.append({"figure": name, "reason": f"render failed: {type(e).__name__}: {e}"[:500],
                          "tier": TIER_OF[name], "render_failed": True})
