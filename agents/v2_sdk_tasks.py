@@ -866,6 +866,38 @@ def _self_test() -> int:
         pk = json.load(open(os.path.join(d, "_task_input.json")))
         ok('{"tasks": [{"id": "T1"' in (seen_prompts.get("plan_fixes") or "") and pk["findings"] == [{"id": "R-001"}],
            "PF4 plan_fixes keeps the plan's JSON example and writes the packet the prompt names")
+        # S_SINGLE_NO_LLM, S_ENGINE_FORMS (v2 autonomy 1B-i): one eligible engine is chosen with no session; the draft
+        # prompt gives both engine forms, and what it says holds for every registered engine.
+        sessions = []
+
+        def count_session(self_, kind, system, prompt, owns, model=None):
+            sessions.append(kind)
+            return TaskResult(True, {"engine": "e2", "why": "picked"}, 0.4, "fake")
+        SdkTasks._session = count_session
+        try:
+            t4 = SdkTasks(d)
+            r1 = t4.pick_engine({}, [{"ref": "e1", "eligible": True}, {"ref": "e2", "eligible": False}])
+            n1 = len(sessions)
+            r2 = t4.pick_engine({}, [{"ref": "e1", "eligible": True}, {"ref": "e2", "eligible": True}])
+        finally:
+            SdkTasks._session = orig_session
+        ok(n1 == 0 and r1.ok and r1.usd == 0.0 and (r1.output or {}).get("engine") == "e1"
+           and "no pick task" in str((r1.output or {}).get("why")),
+           f"S_SINGLE_NO_LLM one eligible engine: chosen by the harness, no session, no cost ({n1} session(s), {r1})")
+        ok(sessions == ["pick_engine"] and (r2.output or {}).get("engine") == "e2",
+           f"S_SINGLE_NO_LLM2 two eligible engines: the pick task runs ({sessions})")
+        dp = " ".join(PROMPTS["draft_spec"].split())
+        ok(all(k in dp for k in ("engine: auto", "engine: {{ref:", "config:", "as written", "estimates spec"))
+           and "Write `engine: auto`: the harness chooses" not in dp,
+           "S_ENGINE_FORMS the draft prompt says when to write `engine: auto` and when to name the engine with its "
+           "configuration")
+        from agents import analysis_backend as _AB
+        forms = getattr(_AB, "spec_forms", lambda: {})()
+        ok(bool(forms) and {f["auto"] for f in forms.values()} <= {True, False, "estimates"}
+           and (all(f["auto"] is True for f in forms.values()) or "cannot configure" in dp)
+           and (not any(f["auto"] == "estimates" for f in forms.values()) or "`dynamics`" in dp),
+           f"S_ENGINE_FORMS2 each case among the registered engines (auto, an estimates spec's dynamics, named only) is "
+           f"one the prompt covers ({sorted({str(f['auto']) for f in forms.values()})})")
     # World-model seed task (F6 world-model trials): the world model's own seed documentation in the prompt, no results
     # readable, one owned output outside the harness's analysis/ tree.
     try:

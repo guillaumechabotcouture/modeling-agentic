@@ -1173,6 +1173,88 @@ def _self_test_benchmark_gate(ok) -> None:
        f"({strip(ra)[:1]})")
 
 
+def _self_test_engine_choice(ok) -> None:
+    """v2 autonomy 1B-i (engine choice): the signed configuration is the one considered, a spec that names its engine
+    has that one candidate, and one eligible engine needs no pick task."""
+    import tempfile
+    import yaml
+    me = sys.modules[__name__]
+    TOY = "toolkit.engines.contract:ToyEngine"
+    EMP = "toolkit.engines.empirical.engine:PackageRateEngine"
+    REN = "toolkit.engines.renewal.engine:RenewalEngine"
+    # B_EXPLICIT_*: `engine: {ref, config}` is kept as written; the engine's own function of the spec does not replace it
+    r = eligible_engines({"engine": {"ref": TOY, "config": {"results_path": "signed.yaml"}}},
+                         [(TOY, None, lambda spec: {"results_path": "derived.yaml"})])[0]
+    ok(r.get("config") == {"results_path": "signed.yaml"},
+       f"B_EXPLICIT_CONFIG a named engine's signed configuration is used as written ({r.get('config')})")
+    panel = {"options": {"components": {"p": {}, "q": {}, "r": {}}, "engine_map": {"p": {"p": 1}, "q": {"q": 1}}},
+             "objective": {"outcome": "cases"}}
+    signed = {"components": ["p", "q"], "outcome": "deaths"}
+    r = eligible_engines(dict(panel, engine={"ref": EMP, "config": signed}))
+    ok(len(r) == 1 and r[0].get("config") == signed,
+       f"B_EXPLICIT_EMPIRICAL the package-rate engine keeps the signed configuration, not the one derived from the "
+       f"spec's components ({[(x['ref'], x.get('config')) for x in r]})")
+    big = {"components": [f"c{i}" for i in range(EMPIRICAL_MAX_COMPONENTS + 1)]}
+    r = eligible_engines(dict(panel, engine={"ref": EMP, "config": big}))
+    ok(len(r) == 1 and not r[0]["eligible"] and "at most" in str(r[0]["why_not"]),
+       "B_EXPLICIT_EMPIRICAL_MAX a signed configuration over the component limit is refused before the engine is built")
+    r = eligible_engines(dict(panel, engine={"ref": EMP}), [e for e in ENGINES if e[0] == EMP])[0]
+    ok(r.get("config") == {"components": ["p", "q", "r"], "outcome": "cases"},
+       f"B_EXPLICIT_NONE a named engine with no configuration is still configured from the spec ({r.get('config')})")
+    gi = {"generation_interval": {"dt": "week", "w": [0.5, 0.5]}, "dt": "week"}
+    with tempfile.TemporaryDirectory() as d:
+        alloc = dict(toy_spec(os.path.join(d, "u.csv")), engine={"ref": REN, "config": gi})
+        r = eligible_engines(alloc)
+        ok(len(r) == 1 and r[0].get("config") == gi and "card unreadable" not in str(r[0].get("why_not")),
+           f"B_EXPLICIT_RENEWAL_ALLOC an allocation spec that names the renewal engine with its configuration gets that "
+           f"engine's card ({[(x['ref'], x.get('why_not')) for x in r]})")
+    # B_NAMED_ONLY: a spec that names its engine has one candidate; `auto` keeps the registry or the signed candidates
+    refs = lambda spec, engines=None: [e[0] for e in candidate_entries(spec, engines)]      # noqa: E731
+    every = [e[0] for e in ENGINES]
+    ok(refs({"engine": TOY}) == [TOY] and refs({"engine": {"ref": EMP, "config": signed}}) == [EMP],
+       f"B_NAMED_ONLY a spec that names its engine has that engine as its one candidate ({refs({'engine': TOY})})")
+    ok(refs({"engine": "x.y:Z"}) == ["x.y:Z"] and tuple(candidate_entries({"engine": "x.y:Z"})[0][1:]) == (None, None),
+       "B_NAMED_ONLY2 a named engine that is not registered is considered alone, with no card file or function")
+    ok(refs({"engine": "auto"}) == every and refs({}) == every and refs({"engine": {"auto": True}}) == every
+       and refs({"engine": {"auto": True, "candidates": [TOY]}}) == [TOY]
+       and refs({"engine": {"auto": True, "ref": TOY}}) == every,
+       "B_NAMED_ONLY3 engine: auto (or no engine) keeps every registered engine, or the signed candidates")
+    ok(refs({"engine": TOY}, ENGINES) == every, "B_NAMED_ONLY4 an explicit engine list is considered as given")
+    # the spike adapter's choice_spec: a signed `auto` stays `auto` after a choice, so a back-edge sees every engine
+    with tempfile.TemporaryDirectory() as d:
+        write_toy_units(os.path.join(d, "units.csv"))
+        yaml.safe_dump(dict(toy_spec("units.csv"), engine="auto"), open(os.path.join(d, SPEC_FILE), "w"))
+        yaml.safe_dump(toy_settings(), open(os.path.join(d, SETTINGS_FILE), "w"))
+        json.dump(engine_choice_record(TOY, "w", []), open(os.path.join(d, ENGINE_CHOICE), "w"))
+        cs = choice_spec(d)
+        ok(refs(cs) == every and merged_spec(d)["engine"] == TOY,
+           f"B_NAMED_ONLY5 after a choice, the choice of a spec signed `engine: auto` is still among every engine "
+           f"({refs(cs)}); the analysis reads the engine chosen")
+        yaml.safe_dump(toy_spec("units.csv"), open(os.path.join(d, SPEC_FILE), "w"))
+        ok(refs(choice_spec(d)) == [TOY], "B_NAMED_ONLY6 a spec signed with a named engine: that engine alone")
+    # B_SINGLE_NO_LLM: one eligible engine is the choice; the record says the pick task did not run
+    sole, why = getattr(me, "sole_pick", lambda rows: "missing"), getattr(me, "SOLE_WHY", None)
+    one = [{"ref": "a.b:C", "eligible": True}, {"ref": "a.b:D", "eligible": False, "why_not": ["x"]}]
+    two = one[:1] + [{"ref": "a.b:D", "eligible": True}]
+    ok(sole(one) == {"engine": "a.b:C", "why": why} and why and sole(two) is None and sole([]) is None
+       and sole(one[1:]) is None and sole({"eligible": ["e"]}) is None and sole(None) is None,
+       f"B_SINGLE_NO_LLM exactly one eligible engine is the choice, with the harness's reason; otherwise none "
+       f"({sole(one)!r})")
+    rec1, rec2 = engine_choice_record("a.b:C", why, one), engine_choice_record("a.b:C", "it fits", two)
+    ok(rec1.get("pick") == {"eligible": 1, "task": "skipped_single_eligible"}
+       and rec2.get("pick") == {"eligible": 2, "task": "ran"}
+       and engine_choice_record("a.b:C", "kept after a rethink", one).get("pick") == {"eligible": 1, "task": "ran"},
+       f"B_SINGLE_NO_LLM2 engine_choice.json records how many engines were eligible and whether the pick task ran "
+       f"({rec1.get('pick')}, {rec2.get('pick')})")
+    # B_SPEC_FORMS: what the draft prompt says of `auto` and `{ref, config}` holds for every registered engine
+    forms = getattr(me, "spec_forms", lambda: {})()
+    ok(set(forms) == set(every) and all(f.get("named") for f in forms.values())
+       and forms.get(TOY, {}).get("auto") is True and forms.get(EMP, {}).get("auto") is True
+       and forms.get(COMPARTMENTAL, {}).get("auto") is False and forms.get(REN, {}).get("auto") == "estimates",
+       f"B_SPEC_FORMS each registered engine is configurable by `auto`, by an estimates spec, or only when named "
+       f"({ {k.rsplit(':', 1)[-1]: v.get('auto') for k, v in forms.items()} })")
+
+
 def _self_test() -> int:
     import tempfile
     fails = []
@@ -1343,6 +1425,7 @@ def _self_test() -> int:
         rows2 = eligible_engines(dict(tspec, engine_needs=_api.engine_needs(tspec)))
         ok(not next(r for r in rows2 if r["ref"].endswith("RenewalEngine"))["eligible"],
            "B23b an allocation spec: the renewal engine is not eligible")
+    _self_test_engine_choice(ok)
     _self_test_benchmark_gate(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
