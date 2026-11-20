@@ -182,7 +182,7 @@ def script_env(environ=None) -> dict:
     # is first on the caller's PATH.
     if sys.executable:
         here = os.path.dirname(os.path.abspath(sys.executable))
-        path = [x for x in out.get("PATH", "").split(os.pathsep) if x]
+        path = (out["PATH"] if out.get("PATH") else os.defpath).split(os.pathsep)
         out["PATH"] = os.pathsep.join(path if path[:1] == [here] else [here] + path)
     return out
 
@@ -206,11 +206,20 @@ def _inside(path: str, root: str) -> bool:
         return False
 
 
+def _is_step_log(path: str, run_dir: str) -> bool:
+    """A step log, under any name: a `.log` file directly in the run's LOG_DIR (a real directory; behind a link the
+    runner writes no log). The runner appends to these while steps run, so they are reserved: never a step's input,
+    output or code, whatever a declaration matches. Other files in that directory are ordinary files."""
+    logs = os.path.join(os.path.realpath(run_dir), *LOG_DIR.split("/"))
+    rp = os.path.realpath(path)
+    return rp.endswith(".log") and os.path.dirname(rp) == logs and os.path.realpath(logs) == logs
+
+
 def _matches(run_dir: str, pat: str) -> list[str]:
-    """Run-relative files matching a declared path or glob (inside the run dir only)."""
+    """Run-relative files matching a declared path or glob (inside the run dir only; never a step log)."""
     out = []
     for p in glob.glob(os.path.join(run_dir, pat), recursive=True):
-        if os.path.isfile(p) and _inside(p, run_dir):
+        if os.path.isfile(p) and _inside(p, run_dir) and not _is_step_log(p, run_dir):
             out.append(os.path.relpath(p, run_dir).replace(os.sep, "/"))
     return sorted(out)
 
@@ -611,7 +620,7 @@ def code_files(step: dict, run_dir: str) -> list[str]:
             continue
         t = t.split("=", 1)[1] if re.match(r"^\w+=", t) else t
         p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(t)))
-        if not os.path.isfile(p):
+        if not os.path.isfile(p) or _is_step_log(p, run_dir):
             continue
         if _inside(p, run_dir) or p.endswith(".py"):
             named.add(p)
@@ -635,12 +644,10 @@ def fingerprint(step: dict, run_dir: str) -> dict:
     spec = {k: v for k, v in step.items() if not k.startswith("_")}
     ins, missing = {}, []
     prog = os.path.realpath(os.path.join(run_dir, PROGRESS))
-    logs = os.path.realpath(os.path.join(run_dir, LOG_DIR)) + os.sep      # step logs: written while steps run
     for pat in step_inputs(step):
         # The runner rewrites PROGRESS while a step runs (Codex on #267): never an input, also through a link, and
         # excluded before the missing check, so it alone never satisfies a glob.
-        m = [r for r in _matches(run_dir, pat) if (rp := os.path.realpath(os.path.join(run_dir, r))) != prog
-             and not rp.startswith(logs)]
+        m = [r for r in _matches(run_dir, pat) if os.path.realpath(os.path.join(run_dir, r)) != prog]
         if not m:
             missing.append(pat)
         for rel in m:
@@ -862,27 +869,32 @@ def _stop_group(p, grace_s: float) -> str:
     """Stop a step's process group at its limit; returns how, for the error text. With a grace: SIGTERM, then up to
     `grace_s` for every process in the group to end, not only its leader (a shell that leads the group ends at once
     while the process it started is still flushing). Then SIGKILL for whatever is left, and a bounded wait."""
-    how = "process group killed"
-    if grace_s > 0:
-        try:
-            os.killpg(p.pid, signal.SIGTERM)
-        except OSError:
-            pass
-        how, end = f"SIGTERM, then SIGKILL after the {grace_s:.0f}s grace", time.monotonic() + grace_s
-        while time.monotonic() < end:
-            p.poll()                              # reap the leader, so an ended group reads as gone
+    how, gone = "process group killed", False
+    try:
+        if grace_s > 0:
             try:
-                os.killpg(p.pid, 0)
-            except (ProcessLookupError, PermissionError):     # no process left (or only ones already dead)
-                how = f"SIGTERM, ended within the {grace_s:.0f}s grace"
-                break
+                os.killpg(p.pid, signal.SIGTERM)
             except OSError:
                 pass
-            time.sleep(0.05)
-    try:
-        os.killpg(p.pid, signal.SIGKILL)
-    except OSError:
-        pass
+            how, end = f"SIGTERM, then SIGKILL after the {grace_s:.0f}s grace", time.monotonic() + grace_s
+            while time.monotonic() < end:
+                p.poll()                              # reap the leader, so an ended group reads as gone
+                try:
+                    os.killpg(p.pid, 0)
+                except (ProcessLookupError, PermissionError):     # no process left (or only ones already dead)
+                    how, gone = f"SIGTERM, ended within the {grace_s:.0f}s grace", True
+                    break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+    finally:
+        # Also when the grace is interrupted (Codex round 1): the group never outlives the runner's wait. A group
+        # already seen gone gets no signal (its id may have been given to another group).
+        if not gone:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
     try:
         p.wait(timeout=KILL_GRACE_S)
     except subprocess.TimeoutExpired:
@@ -904,7 +916,7 @@ def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None
         except subprocess.TimeoutExpired:
             how = _stop_group(p, grace_s)
             past = f" at its backstop (soft deadline {soft_s:.0f}s)" if soft_s is not None else ""
-            tail = sink.tail().strip() if log is not None else ""
+            tail = sink.tail().strip()
             return None, f"timed out after {timeout_s:.0f}s{past} ({how})" + (f"; last output: {tail}" if tail else "")
         except BaseException:
             try:                    # anything else escaping the wait: the step's group never outlives it
@@ -1201,21 +1213,22 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
     steps it runs, and marks each file those steps wrote as harness-written.
     `only` + `force` run one step regardless of staleness (scratch mode)."""
     global _RUN_ID
-    prev = _RUN_ID
+    # F6: an id for this run of the pipeline, in its report and in its steps' environment, so a reader knows which
+    # batch summaries this run wrote without trusting mtimes (a run dir copied or restored from a checkpoint)
+    rid = _RUN_ID = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.urandom(4).hex()}"
     try:
         return _run(run_dir, budget_s, integrity, python, only, force)
     finally:
-        _RUN_ID = prev       # a step run outside this run() never exports this run's id (MA_PIPELINE_RUN)
+        # A step run outside this run() never exports this run's id (MA_PIPELINE_RUN). Only this run's own id is
+        # reset: one process runs one pipeline at a time, and an id another run() set is left alone.
+        if _RUN_ID == rid:
+            _RUN_ID = None
 
 
 def _run(run_dir, budget_s, integrity, python, only, force) -> dict:
-    global _RUN_ID
     run_dir = os.path.realpath(run_dir)
     t0 = time.time()
     steps, errs = load(run_dir)
-    # F6: an id for this run of the pipeline, in its report and in its steps' environment, so a reader knows which
-    # batch summaries this run wrote without trusting mtimes (a run dir copied or restored from a checkpoint)
-    _RUN_ID = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.urandom(4).hex()}"
     report = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "errors": errs, "plan": [], "steps": [], "ok": not errs,
               "pipeline_run": _RUN_ID}
     if errs:
@@ -3212,8 +3225,8 @@ def _self_test_durability(ok) -> None:
                 run(d)
             except ValueError:
                 pass
-        ok(globals()["_RUN_ID"] == "another-run", f"PD7c run() leaves another run's id alone: {globals()['_RUN_ID']}")
-        globals()["_RUN_ID"] = None
+            seen = globals()["_RUN_ID"]          # read here: patch.dict puts the globals back on exit
+        ok(seen == "another-run", f"PD7c run() leaves another run's id alone: {seen}")
     # PD8-PD10: the steps' environment.
     env = script_env({"ANTHROPIC_API_KEY": "k", "ANTHROPIC_AUTH_TOKEN": "t", "CLAUDE_CODE_OAUTH_TOKEN": "o",
                       "HOME": "/h", "PATH": "/pd-bin::/usr/bin"})
