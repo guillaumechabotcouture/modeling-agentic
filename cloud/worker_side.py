@@ -720,13 +720,14 @@ class RunState:
     def set(self, phase=None):
         """Write the record, with a new phase or (None: the timer) the current one, read under the lock so a beat
         never puts an earlier phase back."""
-        import json, os, time
+        import json, os, time, uuid
         with self._lock:
             phase = self.phase = phase or self.phase
             try:
                 os.makedirs(WORK, exist_ok=True)
-                tmp = f"{state_path(self.label)}.{os.getpid()}.tmp"
-                with open(tmp, "w") as f:
+                tmp = f"{state_path(self.label)}.{uuid.uuid4().hex}.tmp"       # fresh, created exclusively: a link
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)   # is never followed
+                with os.fdopen(fd, "w") as f:
                     json.dump({"label": self.label, "phase": phase, "pid": os.getpid(),
                                "started_at": self.started, "updated_at": time.time()}, f)
                 os.replace(tmp, state_path(self.label))

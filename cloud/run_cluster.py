@@ -1823,7 +1823,9 @@ def collect(cfg, shutdown_after: bool = True, accept_partial: bool = False):
                        f"{ck.get('cached_batches')} cached batches): fetch it with `checkpoint --label {label}`"
                        if ck else "")
             part = os.path.join(dest, "result.partial.json")
-            if accept_partial and os.path.exists(part):     # this launch's (local_is_current), fetched earlier
+            # this launch's partial copy (local_is_current), fetched earlier, and its VM is gone: accepted as it
+            # is. With the VM up, the run is fetched again below and the VM is told (its hold ends).
+            if accept_partial and os.path.exists(part) and not running:
                 os.replace(part, os.path.join(dest, "result.json"))
                 print(f"{label}: the partial copy in {dest} is accepted as collected")
                 continue
