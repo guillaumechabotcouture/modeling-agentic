@@ -664,7 +664,8 @@ def _self_test() -> int:
             DTm.run_one = saved
             _CAP.update(on=False, orig=None)
         from toolkit.analysis.artifacts import plain
-        ok(list(got.values()) == [digest(plain(rec))], "DG21 (r6 P1-2) the capture's digest is digest(plain(rec)), once")
+        ok(list(got.values()) == [tolerant(plain(rec))["exact"]],
+           "DG21 (r6 P1-2) the capture's exact parts are those of plain(rec), computed once")
         import inspect
         src = inspect.getsource(digest_dir)
         ok("_pinned" in src and "with _pinned(" in src,
@@ -697,7 +698,88 @@ def _self_test() -> int:
             ok(not _plain_name(bad) and _raises(lambda: digest_dir(d), StoredIncomplete),
                "DG22c (r7 P1) a test id holding a NUL is not a plain file name: StoredIncomplete, not a bare ValueError")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19, dg20, dg21, dg22):
+    def dg23():          # the runner-CPU dependence of the digests (CI, 2026-11-20; written first; each failed)
+        import io
+        r = _rec()
+        res = r["results"][0]
+
+        def moved(f):       # the record with its two floating-point results moved by the relative amount f
+            return _rec(share_units_changed=0.125 * (1 + f), results=[dict(res, objective=res["objective"] * (1 + f))])
+        t, near, far = tolerant(r), tolerant(moved(RTOL / 10)), tolerant(moved(RTOL * 100))
+        ok(t["exact"] == near["exact"] == far["exact"] and t["numbers"] != near["numbers"]
+           and digest(r) != digest(moved(RTOL / 10)),
+           "DG23a floating-point values are compared as numbers, outside the exact part (the plain digest moves with "
+           "them)")
+        e, g1, g2 = {"A": t["numbers"]}, {"A": near["numbers"]}, {"A": far["numbers"]}
+        d2 = compare_numbers(e, g2)
+        ok(compare_numbers(e, e) == [] and compare_numbers(e, g1) == [] and len(d2) == 1
+           and d2[0].startswith("A: decision: ") and "beyond tolerance" in d2[0],
+           f"DG23b numbers within the tolerance match; beyond it the record, its part and the size are named ({d2})")
+        for label, other in (("a changes-plan verdict", _rec(decision_changes=True)),
+                             ("a recommendation", _rec(recommendation={"with": "a", "without": "c"})),
+                             ("a whole-number count", _rec(n_units=4)),
+                             ("a plan digest", _rec(results=[dict(res, plan_sha256="b" * 64)]))):
+            base = tolerant(_rec(n_units=3, results=[dict(res, plan_sha256="a" * 64)]))
+            o = tolerant(dict(_rec(n_units=3, results=[dict(res, plan_sha256="a" * 64)]),
+                              **{k: v for k, v in other.items() if other[k] != r.get(k)}))
+            ok(base["exact"] != o["exact"] and base["numbers"] == o["numbers"],
+               f"DG23c {label} is exact: it changes the exact part and no number")
+        ok(compare_numbers({"A": {"decision": [1.0, 2.0]}}, {"A": {"decision": [1.0]}}) != []
+           and compare_numbers({"A": {"decision": [1.0]}}, {"A": {}}) != []
+           and compare_numbers({"A": None}, {"A": {"decision": [1.0]}}) != [],
+           "DG23d a number that is missing, extra or was never recorded is a difference (fail closed)")
+        ok(compare_numbers({"A": {"decision": [0.0]}}, {"A": {"decision": [ATOL / 10]}}) == []
+           and compare_numbers({"A": {"decision": [0.0]}}, {"A": {"decision": [ATOL * 100]}}) != [],
+           "DG23e next to zero the absolute tolerance applies")
+        obs = {"f:DT1#0": t["exact"], "g.<locals>.one:DT1#0": t["exact"]}
+        nums = {"f:DT1#0": t["numbers"], "g.<locals>.one:DT1#0": {}}
+        text = golden_text(obs, nums, {"cpu": "toy", "blas": None})
+        ok(golden_read(text) == obs and golden_numbers(text) == (nums, {"cpu": "toy", "blas": None})
+           and len(text.splitlines()) == 5,
+           "DG23f the golden file round-trips its exact parts, its numbers and where it was recorded (one line per "
+           "self-test function and one for the platform)")
+        old_text = golden_text({"f:DT1#0": digest(r)})
+        ok(golden_numbers(old_text) == ({"f:DT1#0": None}, None),
+           "DG23g a golden file from before numbers were recorded reads as numbers not recorded")
+        from toolkit.analysis import decision_tests as DTm
+        g, saved_run = globals(), DTm.run_one
+
+        def check(got, golden):
+            seen, buf, out = [], io.StringIO(), sys.stdout
+            _CAP.update(on=True, paused=False, orig=saved_run, recs={"f:DT1#0": got["exact"]}, counts={}, problems=[],
+                        nums={"f:DT1#0": got["numbers"]}, parts={"f:DT1#0": canon(parts(r))})
+            sys.stdout = buf
+            try:
+                with tempfile.TemporaryDirectory() as d:
+                    saved, g["GOLDEN"] = g["GOLDEN"], os.path.join(d, "golden.json")
+                    try:
+                        open(g["GOLDEN"], "w").write(golden)
+                        check_capture(lambda c, m: seen.append((bool(c), m)))
+                    finally:
+                        g["GOLDEN"] = saved
+            finally:
+                sys.stdout, DTm.run_one = out, saved_run
+                _CAP.update(on=False, orig=None)
+            return [c for c, m in seen if "DG-R1" in m], buf.getvalue()
+        gold = golden_text({"f:DT1#0": t["exact"]}, {"f:DT1#0": t["numbers"]}, {"cpu": "toy"})
+        a, _ = check(near, gold)
+        b, said = check(far, gold)
+        c, _ = check(tolerant(_rec(decision_changes=True)), gold)
+        dd, _ = check(t, old_text)
+        ok(a == [True] and b == [False] and c == [False] and dd == [False],
+           f"DG23h the self-test's check passes on late-digit differences and fails on a larger one, on a flipped "
+           f"verdict and on a golden file without numbers ({a} {b} {c} {dd})")
+        log = "\n".join(f"self-tests (3)\tstep\t2026-11-20T00:00:00.0Z {ln}" for ln in said.splitlines())
+        o2, n2, m2 = from_log(log)
+        ok(o2 == {"f:DT1#0": far["exact"]} and n2 == {"f:DT1#0": far["numbers"]} and isinstance(m2, dict)
+           and "machine" in m2 and "recorded on" in said.lower(),
+           "DG23i a mismatch prints one line per record and the platform next to the recording's, and a golden file "
+           "can be rebuilt from that log")
+        ok(_raises(lambda: from_log(log + "\nx Z FAIL R4 something else"), ValueError)
+           and _raises(lambda: from_log("no records here"), ValueError),
+           "DG23j a log with another failed case, or without records, is refused as a recording")
+
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19, dg20, dg21, dg22, dg23):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
