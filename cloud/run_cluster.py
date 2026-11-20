@@ -5006,6 +5006,124 @@ def _self_test_storage(ok) -> None:
        f"WS6b a failed checkpoint is counted with its error; the last good time is kept: {s2}")
 
 
+def _self_test_liveness(ok) -> None:
+    """LV1-LV9 (v2 autonomy 1E-ii): the agent VM's heartbeat record from before pip, fetch_meta's preparing and
+    dead, per-label isolation in `status`, no attach by name on the read paths, and a label whose large files
+    exist only on the VM stays pending in `collect`. Fakes only; no cloud."""
+    import types
+    import subprocess
+    import tempfile
+    from unittest import mock
+    root = tempfile.mkdtemp()
+    with mock.patch.object(ws, "WORK", root):
+        ok(ws.fetch_meta("N")["state"] == "missing", "LV1 no state record and no run.log: missing (unchanged)")
+        os.makedirs(os.path.join(root, "OLD"))
+        open(os.path.join(root, "OLD", "run.log"), "w").write("x")
+        ok(ws.fetch_meta("OLD")["state"] == "running", "LV1b a run.log with no state record (an older worker): running")
+        seen = {}
+
+        def fake_run(td, label, code, *a, state=None, **kw):
+            seen["td"], seen["during"] = os.path.isdir(td), ws.fetch_meta(label)
+            state.set("running")
+            os.makedirs(os.path.join(root, label), exist_ok=True)
+            open(os.path.join(root, label, "run.log"), "w").write("log")
+            seen["running"] = ws.fetch_meta(label)
+            t0 = json.load(open(ws.state_path(label)))["updated_at"]
+            time.sleep(0.25)
+            seen["beat"] = json.load(open(ws.state_path(label)))["updated_at"] > t0
+            if kw.get("boom"):
+                raise RuntimeError("pip failed")
+            state.set("done")
+            return {"label": label}
+        with mock.patch.object(ws, "_run_to_disk", fake_run), mock.patch.object(ws, "STATE_BEAT_S", 0.05):
+            ws.run_to_disk("A", b"")
+            a_during, a_running, a_beat = seen["during"], seen["running"], seen["beat"]
+            try:
+                ws.run_to_disk("B", b"", boom=True)
+            except RuntimeError:
+                pass
+        ok(a_during["state"] == "preparing" and a_during.get("phase") == "preparing",
+           f"LV2 before pip and unpacking end, the label reads preparing, not missing: {a_during}")
+        ok(a_running["state"] == "running" and a_beat,
+           f"LV3 main.py started: running; the record is rewritten on a timer: {a_running} beat={a_beat}")
+        b = ws.fetch_meta("B")
+        ok(b["state"] == "dead" and b.get("phase") == "failed",
+           f"LV4 LW_DEAD_PID_DETECTED the task ended without a result (a run.log exists): dead, not running: {b}")
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        for label, rec in (("STALE", {"phase": "running", "pid": os.getpid(), "updated_at": time.time() - 3600}),
+                           ("NOPID", {"phase": "running", "pid": gone.pid, "updated_at": time.time()}),
+                           ("JUNK", "not a record")):
+            json.dump(rec, open(ws.state_path(label), "w"))
+        ok(ws.fetch_meta("STALE")["state"] == "dead" and ws.fetch_meta("NOPID")["state"] == "dead",
+           "LV5 a heartbeat older than the limit, or one whose process is gone, reads dead")
+        ok(ws.fetch_meta("JUNK")["state"] == "missing", "LV5b an unreadable state record changes nothing")
+    ok(relaunch_refusal("preparing", False) and relaunch_refusal("dead", False)
+       and relaunch_refusal("missing", False) is None,
+       "LV6 a preparing run is never re-fired; a dead one keeps its work dir until someone has looked")
+    # LV7: one label whose VM cannot be read does not hide the others; LV8: nothing on these paths attaches by name
+    tmp = tempfile.mkdtemp()
+    cfg = RunConfig(name="lv", question_file="q", labels=("A", "B"), out_dir=tmp, tree=os.path.dirname(HERE))
+    json.dump({lb: {"launch_id": "L1", "worker": f"w{lb}"} for lb in "AB"}, open(cfg.state_file, "w"))
+    no_attach = lambda *a, **k: (_ for _ in ()).throw(AssertionError("attach by name"))  # noqa: E731
+
+    def on_worker(client, fn, label, *a, worker=None):
+        if label == "A":
+            raise OSError("worker unreachable")
+        return {"state": "running", "log_bytes": 3}
+    out = io.StringIO()
+    with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: n == "lv", "attach": no_attach,
+                                     "connect_existing": lambda n, *a, **k: object(), "_on_worker": on_worker}), \
+            contextlib.redirect_stdout(out):
+        try:
+            status(cfg)
+        except BaseException as e:  # noqa: BLE001
+            print(f"raised {type(e).__name__}: {e}")
+    text = out.getvalue()
+    ok("A: unknown" in text and "OSError" in text and "B: running" in text and "raised" not in text,
+       f"LV7 status isolates a label whose worker cannot be read and never attaches by name: {text!r}")
+    stops = []
+    with mock.patch.dict(globals(), {"live_id": lambda n, lister=None: {"lv": 11}.get(n), "attach": no_attach,
+                                     "_stop_id": lambda n, cid: stops.append((n, cid)),
+                                     "connect_existing": lambda n, *a, **k: None}), \
+            contextlib.redirect_stdout(io.StringIO()):
+        shutdown(cfg)
+        try:
+            existing_client("lv")
+            gone_msg = None
+        except SystemExit as e:
+            gone_msg = str(e)
+    ok(stops == [("lv", 11)] and gone_msg and "not running" in gone_msg,
+       f"LV8 shutdown stops each live cluster by its id; a cluster that is gone is refused, never created: {stops}")
+    # LV9: the tarball on the VM lacks large files that are in no store: collected, but the label stays pending, it
+    # is not marked collected and nothing is shut down
+    marks, downs = [], []
+
+    def on_worker9(client, fn, label, *a, worker=None):
+        if fn is ws.mark_collected:
+            marks.append(label)
+        return {"state": "done"}
+
+    def download9(client, label, w, tgz):
+        with tarfile.open(tgz, mode="w:gz"):
+            pass
+        return {"exit_code": 0, "duration_s": 1, "run_stored": None,
+                "unstored_large_files": [["runs/R/big.bin", 9]] if label == "A" else []}
+    rs = types.ModuleType("results_store")
+    out = io.StringIO()
+    with mock.patch.dict(sys.modules, {"results_store": rs}), \
+            mock.patch.dict(globals(), {"is_running": lambda n, lister=None: True, "attach": no_attach,
+                                        "connect_existing": lambda n, *a, **k: object(),
+                                        "collect_from_storage": lambda *a, **k: (_ for _ in ()).throw(KeyError("x")),
+                                        "checkpoint_record": lambda *a, **k: None, "_on_worker": on_worker9,
+                                        "_download": download9, "shutdown": lambda c: downs.append(c.name)}), \
+            contextlib.redirect_stdout(out):
+        collect(cfg)
+    ok(marks == ["B"] and not downs and "A: " in out.getvalue() and "only on the VM" in out.getvalue(),
+       f"LV9 a label whose large files exist only on its VM is fetched but stays pending; no shutdown: {marks} "
+       f"{downs} {out.getvalue()!r}")
+
+
 def _self_test_sheet(ok) -> None:
     """2026-11-12: a canary relaunch died in 8 s at SIGN because its spec was amended after its sign-off sheet was
     generated; the pre-launch checks did not look at the sheet. A launch now refuses a resumed run at SIGN whose
@@ -5368,6 +5486,10 @@ def _self_test() -> int:
         _self_test_storage(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"WS: {type(e).__name__}: {e}")
+    try:
+        _self_test_liveness(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"LV: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
