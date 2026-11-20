@@ -738,6 +738,27 @@ def _self_test_durable(fails) -> None:
             if not good or left != ["2026-01-01_000000_q"]:
                 fails.append(f"S24 store_run_results streams the run archive (stored={want}) and removes its "
                              f"staging file: {blob} {meta} {left}")
+        # S26 (Codex 1E-i round 2): a regular file that cannot be read is never silently absent from a store that
+        # is then recorded as complete: the store fails and says so. Links and _truth/ stay intentional exclusions.
+        locked = os.path.join(run, "models", "locked.bin")
+        with open(locked, "wb") as f:
+            f.write(b"data")
+        os.symlink(locked, os.path.join(run, "models", "a_link"))
+        os.chmod(locked, 0)
+        try:
+            readable = os.access(locked, os.R_OK)      # root reads anything: the case cannot be made there
+            with mock.patch.dict(os.environ, {"MA_STORAGE_PREFIX": "t"}):
+                blob = run_finish.store_run_results(run, service=_Svc())
+            err = str(json.load(open(os.path.join(run, "metadata.json"))).get("store_error"))
+        finally:
+            os.chmod(locked, 0o644)
+        if not readable and (blob is not None or "models/locked.bin" not in err):
+            fails.append(f"S26 an unreadable file fails the end-of-run store, named in store_error: {blob} {err}")
+        os.remove(locked)
+        with mock.patch.dict(os.environ, {"MA_STORAGE_PREFIX": "t"}):
+            blob = run_finish.store_run_results(run, service=_Svc())
+        if blob is None:
+            fails.append("S26b a link in the run dir (left out on purpose) does not fail the store")
 
 
 def main() -> int:

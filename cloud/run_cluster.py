@@ -4867,6 +4867,16 @@ def _self_test_storage(ok) -> None:
        and ws.run_stored(res["tarball"], "timeout") is None and ws.run_stored(res["tarball"], 2) == "outputs/t/R_x.tar.gz",
        f"WS2b a killed main.py: the receipt in metadata.json is not trusted (large files kept, no stored run "
        f"recorded): exit {res['exit_code']} {names}")
+    # WS2d (Codex 1E-i round 2): a link an agent left at the tarball's staging name is removed, never written through
+    planted = ("os.makedirs('runs/R_x/models')\nopen('runs/R_x/models/out.csv', 'w').write('result')\n"
+               "os.symlink('runs/R_x/models/out.csv', 'result.tar.gz.tmp')\n"
+               "os.symlink('runs/R_x/models/out.csv', 'result.tar.gz')\n")
+    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"):
+        res = ws.run_job_impl("LINK", code("x", planted), "q", [], "k", None)
+    kept = open(os.path.join(root, "LINK", "runs", "R_x", "models", "out.csv"), "rb").read()[:20]
+    ok(kept == b"result" and not os.path.islink(res["tarball"])
+       and "runs/R_x/models/out.csv" in tarfile.open(res["tarball"], mode="r:gz").getnames(),
+       f"WS2d links planted at result.tar.gz(.tmp) are replaced; the output they point to is intact: {kept!r}")
     real_add = tarfile.TarFile.add
 
     def full_disk(self, name, *a, **kw):
