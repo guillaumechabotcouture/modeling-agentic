@@ -846,6 +846,7 @@ def _self_test() -> int:
         finally:
             del ToyEngine.fitted_path
             EPm.benchmark_pack = orig_bp
+        _self_test_stop_records(ok, d, q)
         _self_test_round2(ok, d, q)
         _self_test_reserve_e2e(ok, d, q)
         _self_test_floors_e2e(ok, d, q)
@@ -905,6 +906,52 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_stop_records(ok, d, q):
+    """v2 autonomy 1C-a (item 4.7): every stop the toolkit declares (a refused calibration, calibration input, anchor,
+    batch, or a solver defect) leaves analysis/blocked.yaml and a manifest with status blocked, then raises as before;
+    any other error leaves no manifest."""
+    import yaml
+    from toolkit.alloc.optimize import OptimizerError
+    from toolkit.analysis import contract
+    from toolkit.analysis.burden import AnchorError
+    from toolkit.calibration.history_matching import CalibrationInputError
+    cases = [("calibration", lambda: C.CalibrationRefused("posterior_ess", "planted")),
+             ("calibration", lambda: CalibrationInputError(["planted"])),
+             ("burden_anchor", lambda: AnchorError("planted")),
+             ("optimizer", lambda: OptimizerError("planted")),
+             ("batch", lambda: Bt.BatchRefused("batch_stale", "planted")),
+             (None, lambda: KeyError("planted"))]
+    orig = EmulatorModel.predict
+    bp = os.path.join(d, "analysis", "blocked.yaml")
+    for where, make in cases:
+        exc = make()
+
+        def planted(self, zs, theta, ids, noise=None, _e=exc):
+            raise _e
+        EmulatorModel.predict = planted
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+            got = None
+        except Exception as e:  # noqa: BLE001 -- the planted stop, raised again by run()
+            got = e
+        finally:
+            EmulatorModel.predict = orig
+        name = type(exc).__name__
+        kinds = {x["kind"] for x in contract.gate_findings(d)}
+        blk = (yaml.safe_load(open(bp))["data"] if os.path.exists(bp) else {})
+        if where is None:
+            ok(got is exc and kinds == {"analysis_contract_missing"} and blk.get("exception") != name,
+               f"RUN_BLOCKED_OTHER an error that is not a declared stop ({name}) leaves no manifest and no blocked "
+               f"record of its own ({kinds})")
+            continue
+        ok(got is exc and kinds == {"analysis_contract_blocked"} and blk.get("exception") == name
+           and blk.get("where") == where and "planted" in str(blk.get("reason")),
+           f"RUN_BLOCKED_CAL {name} is raised again after analysis/blocked.yaml and a blocked manifest record it "
+           f"({kinds}, {({k: blk.get(k) for k in ('where', 'exception', 'reason')})})")
+    run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+    ok(contract.gate_findings(d) == [], "RUN_BLOCKED_RERUN a rerun after a recorded stop publishes a complete manifest")
 
 
 def _self_test_moves(ok, d, R):

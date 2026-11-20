@@ -2601,6 +2601,101 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
     return d
 
 
+def _self_test_isolation(ok, base):
+    """v2 autonomy 1C-a (items 4.1-4.5): one figure's failure is its own (not produced, a MEDIUM finding, its figure
+    closed); the calibration, dollars and cost-per-outcome figures draw at the edge values that stopped them."""
+    import warnings
+    import matplotlib.pyplot as plt
+    d = toy_run(os.path.join(base, "run_iso"))
+    t = FS.setup("light")
+
+    def attempt(f):
+        try:
+            return f(), None
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            return None, f"{type(e).__name__}: {e}"
+
+    def boom(R, t_):
+        _fig(t_, 4, 3)                  # a figure left open by a draw that then fails
+        raise ZeroDivisionError("planted")
+    orig = FUNCS["dollars"]
+    plt.close("all")
+    FUNCS["dollars"] = boom
+    try:
+        res, err = attempt(lambda: render(d, os.path.join(base, "iso_a")))
+    finally:
+        FUNCS["dollars"] = orig
+    notp = {x["figure"]: x for x in (res or {}).get("not_produced", [])}
+    made = {f["figure"] for f in (res or {}).get("figures", [])}
+    ok(err is None and notp.get("dollars", {}).get("render_failed") is True
+       and "ZeroDivisionError" in notp["dollars"]["reason"] and {"headline", "frontier", "cost_per_outcome"} <= made
+       and not notp.get("trajectories", {}).get("render_failed"),
+       f"FG_ISOLATE a figure whose draw fails is not produced, with the error; the others are drawn ({err}, "
+       f"{sorted(made)})")
+    ok(err is None and plt.get_fignums() == [], f"FG_ISOLATE_b no figure stays open after a failed draw "
+                                                 f"({plt.get_fignums()})")
+    plt.close("all")
+    fnd, e2 = attempt(lambda: render_findings((res or {}).get("not_produced", [])))
+    ok(e2 is None and [(x["kind"], x["key"], x["severity"]) for x in fnd] == [("figure_render_failed", "dollars",
+                                                                              "MEDIUM")],
+       f"FG_ISOLATE_c a failed figure is one MEDIUM finding figure_render_failed:<figure>; a figure without its "
+       f"inputs is none ({e2}, {fnd})")
+    g = globals()
+    orig_csv = g["_write_csv"]
+
+    def bad_csv(path, rows, root):
+        if os.path.basename(path) == "frontier.csv":
+            raise OSError("planted")
+        return orig_csv(path, rows, root)
+    g["_write_csv"] = bad_csv
+    out_b = os.path.join(base, "iso_b")
+    try:
+        res, err = attempt(lambda: render(d, out_b))
+    finally:
+        g["_write_csv"] = orig_csv
+    notp = {x["figure"]: x for x in (res or {}).get("not_produced", [])}
+    left = sorted(f for f in os.listdir(out_b) if f.startswith("frontier.")) if os.path.isdir(out_b) else None
+    ok(err is None and notp.get("frontier", {}).get("render_failed") is True
+       and "frontier" not in {f["figure"] for f in res["figures"]} and plt.get_fignums() == [] and left == [],
+       f"FG_ISOLATE_d a failure while saving is the figure's own: not listed, no file of it left ({err}, {left})")
+    plt.close("all")
+
+    def drawn(R, f=fig_calibration):
+        """(error, the first axis's upper x limit): the draw with every warning an error."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            got, err_ = attempt(lambda: f(R, t))
+        hi = got[0].axes[0].get_xlim()[1] if got else None
+        plt.close("all")
+        return err_, hi
+    R = RunData(d)
+    for u in R.units:
+        u["tgt"] = "0.97"
+    e_a, hi_a = drawn(R)
+    R.override["figure_data"] = dict(R.art("figure_data"), calibration={"units": {i: {"modelled": 0.96} for i in R.ids}})
+    e_b, hi_b = drawn(R)
+    ok(e_a is None and e_b is None and hi_a <= 1.0 and hi_b <= 1.0,
+       f"FG_HIGH_PREV calibration targets near 1 draw with no invalid value and an axis that ends at 1 ({e_a}, {e_b}, "
+       f"{hi_a}, {hi_b})")
+    R = RunData(d)
+    R._cache[os.path.join("analysis", "calibration.yaml")] = {"data": {"method": "likelihood", "diagnostics": {
+        "fit": [{"unit": i, "observed": 3.0, "expected": 2.5, "variance": None} for i in R.ids]}}}
+    e_v, _ = drawn(R)
+    ok(e_v is None, f"FG_VARIANCE_NONE a fit row whose variance is recorded as null uses its expected value ({e_v})")
+    R = RunData(d)
+    fd = R.art("figure_data")
+    R.override["figure_data"] = dict(fd, dollars=dict(fd["dollars"], envelope_usd=0.0))
+    e_d, _ = drawn(R, fig_dollars)
+    ok(e_d is None, f"FG_ZERO_ENVELOPE the dollars figure draws with a zero envelope ({e_d})")
+    bp = {k: dict(v) for k, v in fd["by_package"].items()}
+    k0 = sorted(bp)[0]
+    bp[k0]["usd_per_outcome_interval"] = {"ci_low": 0.004, "ci_high": float("inf")}
+    R.override["figure_data"] = dict(fd, by_package=bp)
+    e_c, hi_c = drawn(R, fig_cost_per_outcome)
+    ok(e_c is None and hi_c is not None and math.isfinite(hi_c),
+       f"FG_AXIS_FINITE cost per outcome keeps a finite axis when an interval end is not finite ({e_c}, {hi_c})")
+
+
 def _self_test() -> int:
     import hashlib
     import subprocess
@@ -3159,6 +3254,7 @@ def _self_test() -> int:
            and set(grp.get("diagnostics", [])) >= {"calibration_fit", "sensitivity", "trajectories"}
            and all(f.get("group") in ("decision", "diagnostics") for f in idx["figures"]),
            f"F27 figures.yaml separates decision figures from modeller diagnostics: {grp}")
+        _self_test_isolation(ok, base)
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

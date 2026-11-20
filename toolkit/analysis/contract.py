@@ -749,6 +749,17 @@ def _self_test() -> int:
         S = complete_run(d)
         S.finalize("blocked", "corrections bear on the plan")
         ok(kinds(d) == {"analysis_contract_blocked"}, "K9 a blocked run is reported as blocked")
+        # v2 autonomy 1C-a (item 4.1): a figure that failed to render is a MEDIUM finding of its own
+        S = complete_run(d)
+        S.write("figures", {"figures": [], "not_produced": [
+            {"figure": "f_a", "tier": "decision", "reason": "ValueError: x", "render_failed": True},
+            {"figure": "f_b", "tier": "simulation", "reason": "needs an input this run does not have"}]},
+            "toolkit/analysis/figures.py")
+        S.finalize("complete")
+        got = [(x["kind"], x["key"], x["severity"], x["scope_declarable"]) for x in gate_findings(d)]
+        ok(got == [("figure_render_failed", "f_a", "MEDIUM", True)],
+           f"K9b a figure that failed to render is one MEDIUM finding figure_render_failed:<figure>; a figure "
+           f"without its inputs is none ({got})")
         complete_run(d)
         open(os.path.join(d, "units.csv"), "a").write("2\n")
         ok("analysis_contract_stale" in kinds(d), "K10 an input changed after the artifact was computed (Codex P1-10)")

@@ -551,6 +551,29 @@ def _self_test() -> int:
         res3 = render(fd3, os.path.join(d, "f3"), d)
         ok("calibration_residuals" in {f["figure"] for f in res3["figures"]},
            "CF5 residuals with constant observed values draw without a trend, never fail the figure set")
+        # v2 autonomy 1C-a (item 4.6): a failure after the draw (title, render, write) is the figure's own too
+        import matplotlib.pyplot as plt
+        import toolkit.analysis.figures as AF
+        orig, n = AF._fig_bytes, [0]
+
+        def flaky(fig, fmt, **kw):
+            n[0] += 1
+            if n[0] == 2:
+                raise OSError("planted")
+            return orig(fig, fmt, **kw)
+        AF._fig_bytes = flaky
+        plt.close("all")
+        try:
+            res6, err6 = render(fd, os.path.join(d, "f6"), d), None
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            res6, err6 = {"figures": [], "not_produced": []}, f"{type(e).__name__}: {e}"
+        finally:
+            AF._fig_bytes = orig
+        bad6 = [x for x in res6["not_produced"] if x.get("render_failed")]
+        ok(err6 is None and len(bad6) == 1 and "OSError" in bad6[0]["reason"]
+           and len(res6["figures"]) == len(NAMES) - 1 and plt.get_fignums() == [],
+           f"CF6 a figure that fails while it is rendered is not produced, with the error; the others are written and "
+           f"none stays open ({err6}, {bad6}, {plt.get_fignums()})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
