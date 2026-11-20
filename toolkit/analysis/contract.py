@@ -759,12 +759,16 @@ def _self_test() -> int:
         S = complete_run(d)
         S.write("figures", {"figures": [], "not_produced": [
             {"figure": "f_a", "tier": "decision", "reason": "ValueError: x", "render_failed": True},
-            {"figure": "f_b", "tier": "simulation", "reason": "needs an input this run does not have"}]},
+            {"figure": "f_b", "tier": "simulation", "reason": "needs an input this run does not have"},
+            {"figure": "f_c", "tier": "data_model", "reason": "ValueError: x", "render_failed": True},
+            {"figure": "f_d", "tier": "simulation", "reason": "ValueError: x", "render_failed": True}]},
             "toolkit/analysis/figures.py")
         S.finalize("complete")
         got = [(x["kind"], x["key"], x["severity"], x["scope_declarable"]) for x in gate_findings(d)]
-        ok(got == [("figure_render_failed", "f_a", "MEDIUM", True)],
-           f"K9b a figure that failed to render is one MEDIUM finding figure_render_failed:<figure>; a figure "
+        ok(got == [("figure_render_failed", "f_a", "HIGH", False), ("figure_render_failed", "f_c", "MEDIUM", True),
+                   ("figure_render_failed", "f_d", "MEDIUM", True)],
+           f"K9b a figure that failed to render is one finding figure_render_failed:<figure>: HIGH and "
+           f"non-declarable in the decision tier (owner, 2026-11-20), MEDIUM and declarable in the others; a figure "
            f"without its inputs is none ({got})")
         for bad in ({}, False, "x", [1]):       # Codex r1: a value that is not a list of records is never read as none
             S = complete_run(d)

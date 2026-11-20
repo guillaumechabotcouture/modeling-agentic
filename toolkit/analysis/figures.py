@@ -2730,10 +2730,25 @@ def _self_test_isolation(ok, base):
                                                  f"({plt.get_fignums()})")
     plt.close("all")
     fnd, e2 = attempt(lambda: render_findings((res or {}).get("not_produced", [])))
-    ok(e2 is None and [(x["kind"], x["key"], x["severity"]) for x in fnd] == [("figure_render_failed", "dollars",
-                                                                              "MEDIUM")],
-       f"FG_ISOLATE_c a failed figure is one MEDIUM finding figure_render_failed:<figure>; a figure without its "
-       f"inputs is none ({e2}, {fnd})")
+    ok(e2 is None and [(x["kind"], x["key"], x["severity"], x["scope_declarable"]) for x in fnd]
+       == [("figure_render_failed", "dollars", "HIGH", False)] and TIER_OF["dollars"] == "decision",
+       f"FG_ISOLATE_c a failed decision figure is one HIGH, non-declarable finding figure_render_failed:<figure>; "
+       f"a figure without its inputs is none ({e2}, {fnd})")
+    # owner decision on #293 (2026-11-20): by the figure's tier. Decision tier: HIGH, not declarable (it blocks
+    # acceptance); the diagnostic and trace tiers: MEDIUM, declarable; a tier that is absent or unknown: as decision
+    recs = [{"figure": n, "tier": TIER_OF[n], "reason": "x", "render_failed": True} for n in ORDER]
+    fnd, e3 = attempt(lambda: {x["key"]: (x["severity"], x["scope_declarable"]) for x in render_findings(recs)})
+    want = {n: (("HIGH", False) if TIER_OF[n] == "decision" else ("MEDIUM", True)) for n in ORDER}
+    ok(e3 is None and fnd == want and len(set(want.values())) == 2,
+       f"FG_TIER every figure's failure is HIGH and non-declarable in the decision tier, MEDIUM and declarable in "
+       f"the others ({e3}, {sorted((k, v) for k, v in (fnd or {}).items() if v != want.get(k))})")
+    odd = [{"figure": "a", "reason": "x", "render_failed": True},
+           {"figure": "b", "tier": "no_such_tier", "reason": "x", "render_failed": True},
+           {"figure": "c", "tier": None, "reason": "x", "render_failed": True}]
+    fnd, e4 = attempt(lambda: [(x["severity"], x["scope_declarable"]) for x in render_findings(odd)])
+    ok(e4 is None and fnd == [("HIGH", False)] * 3,
+       f"FG_TIER_UNKNOWN a failed figure whose record names no tier, or one this module does not know, is HIGH and "
+       f"non-declarable (fail closed) ({e4}, {fnd})")
     g = globals()
     orig_csv = g["_write_csv"]
 
