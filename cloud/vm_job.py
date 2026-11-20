@@ -233,26 +233,73 @@ def retired_tree_problem(cmd, code: bytes | None) -> str | None:
             f"run v1); {pipeline_id.RETIRED_MESSAGE}: refusing")
 
 
+_SHELL_NAMES = ("sh", "bash", "zsh", "dash")
+_PREFIX_NAMES = ("env", "exec", "command", "nohup", "nice", "time", "timeout", "stdbuf", "setsid",
+                 "do", "then", "else", "elif", "if", "while", "until", "!", "{")   # and shell keywords that start a command
+
+
+def _strip_shell_comments(text: str) -> str:
+    """What a shell runs: an unquoted `#` that starts a word ends its line (`issue#42` is a word)."""
+    out, q, prev, i = [], None, " ", 0
+    while i < len(text):
+        c = text[i]
+        if q:
+            if c == "\\" and q == '"' and i + 1 < len(text):
+                out.append(text[i:i + 2])
+                i, prev = i + 2, "x"
+                continue
+            if c == q:
+                q = None
+        elif c == "\\" and i + 1 < len(text):
+            out.append(text[i:i + 2])
+            i, prev = i + 2, "x"
+            continue
+        elif c in "'\"":
+            q = c
+        elif c == "#" and (prev.isspace() or prev in ";&|()"):
+            while i < len(text) and text[i] != "\n":
+                i += 1
+            continue
+        out.append(c)
+        prev = c
+        i += 1
+    return "".join(out)
+
+
 def _has_v1_token(cmd, depth: int = 0) -> bool:
-    """`--v1` as a word of the command, or of the script a shell wrapper runs (`bash -c '... --v1'`), never as
-    part of a longer word: a quoted question that mentions --v1 is one word."""
-    import shlex
-    if isinstance(cmd, (list, tuple)):
-        words = [str(w) for w in cmd]
-    else:
-        try:
-            lex = shlex.shlex(str(cmd), posix=True, punctuation_chars=";&|()<>")
-            lex.whitespace_split = True
-            words = list(lex)
-        except ValueError:
-            words = str(cmd).split()
-    for k, w in enumerate(words):
-        if w == "--v1" or w.startswith("--v1="):
-            return True
-        if (depth < 3 and k + 1 < len(words) and w.startswith("-") and not w.startswith("--") and "c" in w[1:]
-                and k >= 1 and os.path.basename(words[k - 1]) in ("sh", "bash", "zsh", "dash")
-                and _has_v1_token(words[k + 1], depth + 1)):
-            return True
+    """Whether a command passes `--v1` to a Python program (python ... main.py / -m main / any script; an
+    executable main.py), behind env/exec/nohup/timeout prefixes, or inside a shell wrapper's -c script and its
+    positional arguments. `--v1` must be a whole word, and other programs' arguments do not count (a quoted
+    question that mentions --v1, `grep -- --v1 file`)."""
+    try:
+        if isinstance(cmd, (list, tuple)):
+            argvs = [[str(w) for w in cmd]]
+        else:
+            argvs = pipeline_id._split_commands(_strip_shell_comments(str(cmd)))
+    except (pipeline_id.PipelineError, ValueError):
+        argvs = [str(cmd).split()]
+    for argv in argvs:
+        while argv and (os.path.basename(argv[0]) in _PREFIX_NAMES or ("=" in argv[0] and not argv[0].startswith("-"))):
+            argv = argv[1:]
+            while argv and (argv[0].startswith("-") or argv[0].rstrip("smhd").replace(".", "").isdigit()):
+                argv = argv[2:] if argv[0] in ("-u", "-C", "-S", "-s", "-k", "--unset", "--chdir", "--signal") else argv[1:]
+        if not argv:
+            continue
+        head = os.path.basename(argv[0])
+        if head.startswith("python") or head == "main.py":
+            if any(w == "--v1" or w.startswith("--v1=") for w in argv[1:]):
+                return True
+        elif head in _SHELL_NAMES and depth < 3:
+            k = 1
+            while k < len(argv) and argv[k][:1] in "-+" and argv[k] not in ("-", "--"):
+                opt = argv[k]
+                if "c" in opt[1:] and not opt.startswith("--"):
+                    script, positional = (argv[k + 1] if k + 1 < len(argv) else ""), argv[k + 3:]
+                    if _has_v1_token(script, depth + 1) or (
+                            any(w == "--v1" for w in positional) and any(v in script for v in ("$@", "$*", "$1", "$2", "$3"))):
+                        return True
+                    break
+                k += 2 if opt in ("-o", "+o") else 1
     return False
 
 
@@ -1310,6 +1357,14 @@ def _self_test_pipeline(ok) -> None:
            is None, "VP2f (Codex round 5) a question that mentions --v1 is not a --v1 flag")
         ok(rtp("python3 -m main --v1 --resume runs/R1", None) and not rtp("python3 main.py --v2 Q", None),
            "VP2g a --v1 command that ships no code (a reused VM checkout) is refused; a v2 one is not")
+        # VP2h (Codex round 6): shell options before -c, a # inside a word, and --v1 given to another program
+        for cmd, want in (("bash -o pipefail -c 'python3 main.py --v1 Q'", True),
+                          ("python3 -m main --launcher issue#42 --v1 Q", True),
+                          ("python3 main.py --v2 Q && grep -F -- --v1 archived-commands.txt", False),
+                          ("python3 main.py --v2 Q # once ran with --v1", False),
+                          ("env A=1 timeout 60 python3 -u main.py --v1", True)):
+            got = bool(rtp(cmd, trees["old"]))
+            ok(got == want, f"VP2h {cmd!r}: {'refused' if want else 'accepted'} on a pre-retirement tree (got {got})")
     for cmd in (["python3 main.py 'Q?' --v1"], ["python3", "main.py", "--v1", "--resume", "runs/R1"]):
         try:
             got = jp(cmd)
