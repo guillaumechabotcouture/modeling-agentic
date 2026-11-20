@@ -3705,8 +3705,9 @@ def _self_test_durable(ok) -> None:
         def __init__(self, tagged, chunk_exc=None, retire=True, join=None, **fail):
             self.tagged, self.gone, self.retired = list(tagged), set(), set()
             self.chunk_exc, self.retire, self.join = chunk_exc, retire, join
-            self.fail = {"submit": 0, "marker": 0, "wait": 0, "view": False, **fail}
+            self.fail = {"submit": 0, "marker": 0, "wait": 0, "view": False, "scatter": 0, "lose_at": 0, **fail}
             self.submits, self.scatters, self.views, self.waits = [], [], 0, 0
+            self.bundles, self.lost, self.stale = [], False, 0
 
         def __call__(self, *a, **kw):
             return self
@@ -3731,7 +3732,11 @@ def _self_test_durable(ok) -> None:
 
         def scatter(self, data, workers=None, **kw):
             self.scatters.append(None if workers is None else sorted(workers))
-            return Fut("bundle", got=b"")
+            if self.fail["scatter"] > 0:
+                self.fail["scatter"] -= 1
+                raise KeyError(workers[0] if workers else "no worker")      # as dask does for a stale address
+            self.bundles.append(Fut(f"bundle{len(self.bundles)}", got=b""))
+            return self.bundles[-1]
 
         def cancel(self, futs):
             for f in futs:
@@ -3745,6 +3750,7 @@ def _self_test_durable(ok) -> None:
                 return Fut(key)
             w, ch = workers[0], a[4]
             self.submits.append({"key": key, "worker": w, "procs": a[6], "bundle": a[0], "failed": False})
+            self.stale += bool(self.lost and a[0] is self.bundles[0])       # placed on a bundle no worker holds
             if self.fail["submit"] > 0:
                 self.fail["submit"] -= 1
                 self.submits[-1]["failed"] = True
@@ -3761,9 +3767,12 @@ def _self_test_durable(ok) -> None:
                 raise OSError("scheduler not answering")
             if self.join and self.views >= self.join[0] and self.join[1] not in self.tagged:
                 self.tagged.append(self.join[1])
+            if self.views == self.fail["lose_at"]:  # the bundle's only copy leaves; the next scatter fails once
+                self.lost, self.fail["scatter"] = True, 1
             return {"workers": {run_vm: [False, 1, True],
                                 **{a: [True, 0, True] for a in self.tagged if a not in self.gone}},
-                    "held": key is not None, "retired": sorted(self.retired)}
+                    "held": key is not None and not (self.lost and key == self.bundles[0].key),
+                    "retired": sorted(self.retired)}
 
     cur = {}
 
@@ -3852,6 +3861,18 @@ def _self_test_durable(ok) -> None:
     ok(err is None and all_ok(rows) and fk.scatters == [[w1]] and fk.views >= 5
        and all(s["bundle"] is not None for s in fk.submits) and not info.get("bundle_rescatters"),
        f"CD5b with no compute worker yet, the bundle waits for the first one: err={err} scatters={fk.scatters}")
+    # CD5c (review round 1) a compute worker that left between the worker table and the first scatter (dask
+    # raises on its stale address) does not end the batch: the bundle is scattered in the loop instead.
+    fk = Fake([w1, w2], scatter=1)
+    rows, info, prog, err = run(fk)
+    ok(err is None and all_ok(rows) and len(fk.scatters) == 2,
+       f"CD5c a failed first scatter is taken up in the loop: err={err} scatters={fk.scatters}")
+    # CD5d (review round 1) the bundle's only copy is lost and the scatter that replaces it fails: no chunk is
+    # placed on the lost bundle (it would fail without its model running, and use an infra retry).
+    fk = Fake([w1, w2], lose_at=2)
+    rows, info, prog, err = run(fk)
+    ok(err is None and all_ok(rows) and fk.lost and fk.stale == 0 and len(fk.bundles) == 2,
+       f"CD5d no chunk is placed on a lost bundle: err={err} stale={fk.stale} scatters={len(fk.scatters)}")
     # CD6 the bundle leaves out what the fingerprint ignores (logs, figures, partial rows, job records, the
     # ledger), and nothing else: inputs, earlier results and everything under data/ stay.
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as repo, \
@@ -3923,6 +3944,17 @@ def _self_test_durable(ok) -> None:
     _cap_outlook(prog)
     small = {"_n": 1200, "_allow": 1000.0, "done_tasks": 2, "core_s": 100.0}
     _cap_outlook(small)
+    # (review round 1) a notice never stops a call: stderr closed under it; and a dead caller's settlement
+    # record (no n_failed: its finished tasks are unknown) is not read as history.
+    shut, raised = {"_n": 1200, "_allow": 1000.0, "done_tasks": 100, "core_s": 100.0}, None
+    with mock.patch.object(sys, "stderr", mock.Mock(write=mock.Mock(side_effect=BrokenPipeError()))):
+        try:
+            _cap_outlook(shut)
+        except Exception as e:  # noqa: BLE001 -- before the change this case fails here
+            raised = e
+    hist = _cap_history({"calls": [{"fn": "f", "n": 10, "task_core_s": 9000.0, "stopped": "caller died"}]}, "f", 5, 1.0)
+    ok(raised is None and (shut.get("cap_outlook") or {}).get("over") is True and hist is None,
+       f"CD9b a closed stderr does not stop the call, and a settlement record is not history: {raised!r} {hist}")
     ok(first.get("projected_core_s") == 1200.0 and first.get("over") is True
        and prog["cap_outlook"]["projected_core_s"] == 2400.0 and prog.get("_cap_warned") is True
        and "cap_outlook" not in small,
