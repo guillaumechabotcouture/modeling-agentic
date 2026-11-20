@@ -25,7 +25,8 @@ so it compares in two ways (tolerant, compare_numbers): the exact parts (everyth
 digests, verdicts, recommendations, whole-number counts, words) must be equal, and the floating-point values must
 agree within RTOL relative and ATOL absolute. The file records the platform it was recorded on. A failed check prints
 one line per record; `dt_golden.py record <log> --source <where>` rebuilds the file from such a log. digest() and
-`digest <run_dir>` stay strict: they compare runs on one machine.
+`digest <run_dir>` are unchanged: strict digests, for a caller comparing runs made on one machine. Known limit of the
+tolerant check: two case labels closer than the tolerance are not told apart.
 """
 from __future__ import annotations
 
@@ -52,8 +53,6 @@ IGNORED = ("type", "perturb", "path", "producer", "produced_by")
 PARTS = ("decision", "detail", "words", "plans")
 TINY = 1e-9
 RTOL, ATOL = 1e-4, 1e-6     # the golden check's tolerance on numbers: |a - b| <= ATOL + RTOL * max(|a|, |b|)
-NUM_SIG = 10                # digits kept for a number compared within the tolerance
-_NUM = "\x00number"         # a floating-point value's place in the exact part
 _PATH = re.compile(r"(?:(?<=^)|(?<=[\s'\"(\[=,]))(?:[A-Za-z]:)?[\\/](?:[^\s\\/'\"()]+[\\/])+([^\s\\/'\"()]+)")
 
 
@@ -129,26 +128,41 @@ def digest(rec: dict, summary: dict | None = None) -> dict:
     return {k: _h(v) for k, v in parts(rec, summary).items()}
 
 
-def _split(x, nums: list):
-    """x in canonical form with every finite floating-point value moved to `nums` (in order: mappings by string key,
-    lists as they are) and its place marked. What stays is exact: keys, strings, booleans, whole numbers (int), nan and
-    inf, sets."""
+def _split(x, nums: list, exact: bool = False):
+    """x as a tagged tree, with every finite floating-point value moved to `nums` as it is (in order: mappings by
+    string key, lists as they are) and its place tagged ["f"]. What stays is exact, each value under its type's tag,
+    so no value can stand in another's place: strings, booleans, None, whole numbers (int, unrounded), nan and inf,
+    mappings (two keys with one string form are refused) and sets. A set has no order to pair numbers by, so its
+    floating-point members stay in the exact part (`exact`)."""
     import numpy as np
-    if isinstance(x, (bool, np.bool_)) or x is None or isinstance(x, str):
-        return canon(x)
+    if isinstance(x, (bool, np.bool_)):
+        return ["b", bool(x)]
+    if x is None:
+        return ["z"]
+    if isinstance(x, str):
+        return ["s", canon(x)]
     if isinstance(x, (int, np.integer)):
-        return int(x)
+        return ["i", int(x)]
     if isinstance(x, (float, np.floating)):
         v = float(x)
         if not math.isfinite(v):
-            return canon(v)
-        nums.append(0.0 if abs(v) < TINY else float(f"{v:.{NUM_SIG}g}"))
-        return _NUM
+            return ["x", canon(v)]
+        if exact:
+            return ["F", repr(v)]
+        nums.append(v)
+        return ["f"]
+    if isinstance(x, np.ndarray):
+        return _split(x.tolist(), nums, exact)
     if isinstance(x, dict):
-        return {k: _split(v, nums) for k, v in sorted(((str(k), v) for k, v in x.items()), key=lambda kv: kv[0])}
-    if isinstance(x, (list, tuple, np.ndarray)):
-        return [_split(v, nums) for v in (x.tolist() if isinstance(x, np.ndarray) else x)]
-    return canon(x)
+        items = sorted(((str(k), v) for k, v in x.items()), key=lambda kv: kv[0])
+        if len({k for k, _ in items}) != len(items):
+            raise ValueError("two keys of a mapping have the same string form: not digested")
+        return ["d", {k: _split(v, nums, exact) for k, v in items}]
+    if isinstance(x, (list, tuple)):
+        return ["l", [_split(v, nums, exact) for v in x]]
+    if isinstance(x, (set, frozenset)):
+        return ["S", sorted((_split(v, nums, True) for v in x), key=lambda v: json.dumps(v, sort_keys=True))]
+    return ["o", str(x)]
 
 
 def _tolerant(pr: dict) -> dict:
@@ -184,9 +198,10 @@ def compare_numbers(expected: dict, got: dict, rtol: float = RTOL, atol: float =
             if len(a) != len(b):
                 out.append(f"{k}: {p_}: {len(b)} numbers, {len(a)} recorded")
                 continue
-            bad = [(x, y) for x, y in zip(a, b) if not abs(x - y) <= atol + rtol * max(abs(x), abs(y))]
+            bad = [(x, y) for x, y in zip(a, b) if not (math.isfinite(x) and math.isfinite(y)
+                                                        and abs(x - y) <= atol + rtol * max(abs(x), abs(y)))]
             if bad:
-                rel = max(abs(x - y) / max(abs(x), abs(y)) for x, y in bad)
+                rel = max(abs(x - y) / max(abs(x), abs(y), 1e-300) for x, y in bad)
                 out.append(f"{k}: {p_}: {len(bad)} of {len(a)} numbers beyond tolerance (largest relative difference "
                            f"{rel:.1e}, absolute {max(abs(x - y) for x, y in bad):.1e})")
     return out
@@ -410,32 +425,64 @@ def _golden_rows(text: str):
 
 
 def golden_read(text: str) -> dict:
-    """{record: {part: exact digest}} of a golden file."""
-    return {k: dict(zip(PARTS, (v if isinstance(v, str) else v[0]).split("."))) for k, v in _golden_rows(text)}
+    """{record: {part: exact digest}} of a golden file; a record with other than three or four exact parts is refused
+    (ValueError)."""
+    out = {}
+    for k, v in _golden_rows(text):
+        ex = v if isinstance(v, str) else v[0] if isinstance(v, list) and len(v) == 2 else None
+        hs = ex.split(".") if isinstance(ex, str) else []
+        if len(hs) not in (len(PARTS) - 1, len(PARTS)) or not all(hs):
+            raise ValueError(f"golden record {k}: not three or four exact parts")
+        out[k] = dict(zip(PARTS, hs))
+    return out
 
 
-def golden_numbers(text: str) -> tuple:
-    """({record: {part: [numbers]}, or None where none were recorded}, the platform the file was recorded on)."""
-    return ({k: None if isinstance(v, str) else v[1] for k, v in _golden_rows(text)},
-            json.loads(text).get(RECORDED_ON))
+def golden_numbers(text: str, strict: bool = False) -> tuple:
+    """({record: {part: [numbers]}, or None where none were recorded}, the platform the file was recorded on). Numbers
+    that are not finite floating-point values are refused (ValueError); with `strict`, so is a file with numbers and
+    no platform line."""
+    nums = {}
+    for k, v in _golden_rows(text):
+        nums[k] = None if isinstance(v, str) else v[1]
+        if nums[k] is not None and not (isinstance(nums[k], dict) and all(
+                p_ in PARTS and isinstance(a, list) and all(type(x) in (int, float) and math.isfinite(x) for x in a)
+                for p_, a in nums[k].items())):
+            raise ValueError(f"golden record {k}: its numbers are not lists of finite numbers by part")
+    on = json.loads(text).get(RECORDED_ON)
+    if strict and not isinstance(on, dict) and any(v is not None for v in nums.values()):
+        raise ValueError("the golden file does not say where it was recorded")
+    return nums, on
+
+
+_LINE = re.compile(r"(?:^|Z |\t)\s*(DT_GOLDEN_[A-Z]+|FAIL|FAILED:)(?: (.*))?$")
 
 
 def from_log(text: str) -> tuple:
-    """(exact parts, numbers, platform) from the lines a failed check printed (DT_GOLDEN_RECORD, DT_GOLDEN_PLATFORM),
-    as a CI log holds them. Refused (ValueError) without records or a platform, or when the log shows a failed case
-    other than DG-R1: that capture may be partial."""
-    obs, nums, plat = {}, {}, None
+    """(exact parts, numbers, platform) of the one capture a failed check printed (its DT_GOLDEN_PLATFORM line, its
+    DT_GOLDEN_RECORD lines and the DT_GOLDEN_END line counting them), as a CI log holds them. Refused (ValueError):
+    no capture, two captures, a log cut short (fewer records than the end line counts), a record twice, or a failed
+    case other than DG-R1 (that capture may be partial)."""
+    obs, nums, plats, ends = {}, {}, [], []
     for ln in text.splitlines():
-        if "DT_GOLDEN_RECORD " in ln:
-            r = json.loads(ln.split("DT_GOLDEN_RECORD ", 1)[1])
+        m = _LINE.search(ln)
+        if not m:
+            continue
+        kind, rest = m.group(1), m.group(2) or ""
+        if kind == "DT_GOLDEN_RECORD":
+            r = json.loads(rest)
+            if r["key"] in obs:
+                raise ValueError(f"the log holds record {r['key']} twice (two captures?)")
             obs[r["key"]], nums[r["key"]] = r["exact"], r["numbers"]
-        elif "DT_GOLDEN_PLATFORM " in ln:
-            plat = json.loads(ln.split("DT_GOLDEN_PLATFORM ", 1)[1])
-        elif "DT_GOLDEN_" not in ln and re.search(r"(?:^|Z |\t)FAIL (?!DG-R1)", ln):
+        elif kind == "DT_GOLDEN_PLATFORM":
+            plats.append(json.loads(rest))
+        elif kind == "DT_GOLDEN_END":
+            ends.append(int(rest))
+        elif (kind == "FAIL" and not rest.startswith("DG-R1 ")) or (kind == "FAILED:" and not rest.startswith("1 case")):
             raise ValueError(f"the log shows a failed case, so the capture may be partial: {ln.strip()[-160:]}")
-    if not obs or not isinstance(plat, dict):
-        raise ValueError("the log holds no DT_GOLDEN_RECORD lines or no DT_GOLDEN_PLATFORM line")
-    return obs, nums, plat
+    if len(plats) != 1 or ends != [len(obs)] or not obs or not isinstance(plats[0], dict):
+        raise ValueError(f"the log does not hold one whole capture ({len(plats)} platform line(s), {len(obs)} "
+                         f"record(s), end line(s) {ends})")
+    return obs, nums, plats[0]
 
 
 def platform_line() -> dict:
@@ -482,8 +529,8 @@ def check_capture(ok, failed=()) -> None:
     try:
         with open(GOLDEN) as f:
             text = f.read()
-        exp, (exp_nums, recorded_on) = golden_read(text), golden_numbers(text)
-    except (OSError, ValueError, TypeError, IndexError, AttributeError) as e:
+        exp, (exp_nums, recorded_on) = golden_read(text), golden_numbers(text, strict=True)
+    except (OSError, ValueError, TypeError, IndexError, AttributeError, KeyError) as e:
         exp, exp_nums, recorded_on, err = {}, {}, None, f"{type(e).__name__}: {e}"
     else:
         err = None
@@ -498,6 +545,7 @@ def check_capture(ok, failed=()) -> None:
             print("DT_GOLDEN_DIFF " + d_)
         for k in obs:
             print("DT_GOLDEN_RECORD " + json.dumps({"key": k, "exact": obs[k], "numbers": nums[k]}, sort_keys=True))
+        print(f"DT_GOLDEN_END {len(obs)}")
         bad = {d_.split(": ")[0] for d_ in diff}
         for k in sorted(set(_CAP.get("parts") or {}) & (bad if len(bad) < len(obs) else set(obs))):
             print("DT_GOLDEN_PARTS " + json.dumps({k: _CAP["parts"][k]}, sort_keys=True))
@@ -929,7 +977,8 @@ def _self_test() -> int:
         for label, bad in (("a number that is not finite", good.replace(first, "1e999", 1)),
                            ("a boolean where a number goes", good.replace(first, "true", 1)),
                            ("a string where a number goes", good.replace(first, '"x"', 1)),
-                           ("a fifth exact part", good.replace(t["exact"]["words"], t["exact"]["words"] + ".deadbeefdeadbeef")),
+                           ("a fifth exact part", good.replace(t["exact"]["words"],
+                                                               t["exact"]["words"] + ".deadbeefdeadbeef.deadbeefdeadbeef")),
                            ("no platform line", golden_text({"f:DT1#0": t["exact"]}, {"f:DT1#0": t["numbers"]}))):
             ok(bad != good and _raises(lambda b=bad: (golden_read(b), golden_numbers(b, strict=True)), ValueError),
                f"DG24g (r8 P1) a golden file with {label} is refused")
@@ -1019,8 +1068,11 @@ def main(argv=None) -> int:
     if a.cmd == "record":
         with open(a.log, errors="replace") as f:
             obs, nums, plat = from_log(f.read())
+        text = golden_text(dict(sorted(obs.items())), nums, dict(plat, source=a.source))
+        if golden_read(text) != obs or golden_numbers(text, strict=True)[0] != nums:   # before the file is opened
+            raise ValueError("the log's records do not make a golden file that reads back the same")
         with open(GOLDEN, "w") as f:
-            f.write(golden_text(dict(sorted(obs.items())), nums, dict(plat, source=a.source)))
+            f.write(text)
         print(f"{len(obs)} golden records written to {GOLDEN} (recorded on {plat.get('cpu')}, {a.source})")
         return 0
     print(json.dumps(digest_dir(a.run_dir), indent=1, sort_keys=True))
