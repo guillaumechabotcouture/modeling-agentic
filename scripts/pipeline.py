@@ -835,53 +835,101 @@ def _warn(msg: str) -> None:
 
 
 class _Sink:
-    """Where a command's output goes. With `rel`: the step's log, run_dir/rel, opened for append with no link
-    followed (lib.safe_io); stdout and stderr both land there. Without: an unnamed temporary file, for stderr only.
-    A file, never a pipe: a process that left the step's group cannot hold the runner by keeping a pipe open, and a
-    step that is flushing after SIGTERM never blocks on a pipe nobody reads."""
+    """Where a command's output goes: the step's log, run_dir/rel, opened for append with no link followed
+    (lib.safe_io), or nowhere (no `rel`). The runner reads the command's pipes and writes here itself (_pump), so
+    the command never holds the log; `tail` keeps the last bytes for the report row."""
 
     def __init__(self, run_dir: str | None = None, rel: str | None = None, header: str = ""):
-        self.run_dir, self.rel = run_dir, rel
-        if rel is None:
-            self.fh = tempfile.TemporaryFile()
-        else:
+        self.rel, self.fh, self.lock, self.buf = rel, None, threading.Lock(), bytearray()
+        if rel is not None:
             from lib.safe_io import open_append_nofollow
             self.fh = open_append_nofollow(run_dir, rel)
             self.note(header)
-        self.start = os.fstat(self.fh.fileno()).st_size
 
     def note(self, text: str) -> None:
-        """A line of the runner's own in a step log (never fatal)."""
-        if self.rel is not None:
-            try:
-                self.fh.write(text)
-                self.fh.flush()
-            except (OSError, ValueError):
-                pass
+        """A line of the runner's own in a step log."""
+        self.write(text.encode("utf-8", "replace"), keep=False)
+
+    def write(self, data: bytes, keep: bool = True) -> None:
+        """Append to the log (never fatal: a full disk does not stop the step) and to the kept tail."""
+        with self.lock:
+            if keep:
+                self.buf += data
+                del self.buf[:-4 * LOG_TAIL]
+            if self.fh is not None:
+                try:
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(self.fh.fileno(), view):]
+                except (OSError, ValueError):
+                    pass
 
     def tail(self, n: int = LOG_TAIL) -> str:
-        """The last `n` characters this execution wrote ("" when the file cannot be read without following a link)."""
-        fd = None
-        try:
-            if self.rel is None:
-                fd = os.dup(self.fh.fileno())
-            else:
-                from lib.safe_io import open_nofollow
-                fd = open_nofollow(self.run_dir, self.rel)
-            size = os.fstat(fd).st_size
-            start = self.start if self.start <= size else 0      # truncated by the step: what is there now
-            off = max(start, size - 4 * n)
-            return os.pread(fd, size - off, off).decode("utf-8", "replace")[-n:]
-        except (OSError, ValueError):
-            return ""
-        finally:
-            if fd is not None:
-                os.close(fd)
+        with self.lock:
+            return bytes(self.buf).decode("utf-8", "replace")[-n:]
 
     def close(self) -> None:
+        with self.lock:               # a reader still running (a holder that outlived the wait) writes nowhere after
+            fh, self.fh = self.fh, None
         try:
-            self.fh.close()
+            if fh is not None:
+                fh.close()
         except (OSError, ValueError):
+            pass
+
+
+def _pump(pipe, sink) -> None:
+    """Read a command's pipe to its end, into `sink` (None: read and dropped). Its own thread, so the pipe is always
+    drained: a step that is flushing after SIGTERM never blocks on a full pipe."""
+    try:
+        while True:
+            data = os.read(pipe.fileno(), 65536)
+            if not data:
+                return
+            if sink is not None:
+                sink.write(data)
+    except (OSError, ValueError):
+        return
+
+
+class _Piped:
+    """A Popen whose one output pipe a reader thread drains into `sink`. communicate(timeout) is over, as Popen's
+    is, when the process has exited AND the pipe is at end-of-file: every process that inherited it has ended, also
+    one that left the step's group (a batch's pool process finishing its writes; CI on #302, self-test PD17). When
+    the OS refuses a thread, Popen's own communicate() reads the pipe and the sink gets the output at the end."""
+
+    def __init__(self, proc, pipe, sink):
+        self.proc, self.sink, self.pid = proc, sink, proc.pid
+        self.reader = threading.Thread(target=_pump, args=(pipe, sink), daemon=True)
+        try:
+            self.reader.start()
+        except RuntimeError as e:
+            self.reader = None
+            _warn(f"[pipeline] output reader not started ({e}); the step's output is kept when it ends")
+
+    def _whole(self, timeout) -> None:
+        self.sink.write(next((x for x in self.proc.communicate(timeout=timeout) if x), b""))
+
+    def communicate(self, timeout=None):
+        if self.reader is None:
+            self._whole(timeout)
+            return None, None
+        end = None if timeout is None else time.monotonic() + timeout
+        self.proc.wait(timeout=timeout)
+        self.reader.join(None if end is None else min(max(0.0, end - time.monotonic()), threading.TIMEOUT_MAX))
+        if self.reader.is_alive():
+            raise subprocess.TimeoutExpired(self.proc.args, timeout)
+        return None, None
+
+    def drain(self, timeout: float) -> None:
+        """After a kill: a bounded wait for the pipe's end. A holder outside the group may keep it open; the reader
+        is a daemon thread that ends with it, and writes nowhere once the sink is closed."""
+        if self.reader is not None:
+            self.reader.join(timeout)
+            return
+        try:
+            self._whole(timeout)
+        except subprocess.TimeoutExpired:
             pass
 
 
@@ -925,32 +973,39 @@ def _stop_group(p, grace_s: float) -> str:
 def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None, log=None, grace_s=0.0):
     """Own process group; at `timeout_s` the whole group is stopped (_stop_group: SIGTERM and `grace_s` first when a
     grace is given, then SIGKILL). `soft_s`/`on_overrun`: see _communicate (the step's soft deadline: warned about,
-    never killed). `log`: the step's _Sink (stdout and stderr); without one stdout is dropped and stderr is kept
-    for the returned tail only. Returns (returncode or None at the limit, the tail of the output or the reason)."""
+    never killed). `log`: the step's _Sink, which receives stdout and stderr; without one stdout is dropped and
+    stderr is read for the returned tail only. Returns (returncode or None at the limit, the tail of the output or
+    the reason)."""
     sink = log if log is not None else _Sink()
+    # One pipe either way: stdout and stderr together (a log), or stderr alone.
+    out, err = (subprocess.PIPE, subprocess.STDOUT) if log is not None else (subprocess.DEVNULL, subprocess.PIPE)
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=env,
+                            start_new_session=True, shell=shell)
     try:
-        p = subprocess.Popen(cmd, cwd=cwd, stdout=sink.fh if log is not None else subprocess.DEVNULL, stderr=sink.fh,
-                             stdin=subprocess.DEVNULL, env=env, start_new_session=True, shell=shell)
+        p = _Piped(proc, proc.stdout if log is not None else proc.stderr, sink)
         try:
             _communicate(p, timeout_s, soft_s, on_overrun)
         except subprocess.TimeoutExpired:
-            how = _stop_group(p, grace_s)
+            how = _stop_group(proc, grace_s)
+            # A process that left the group (a compute pool process makes its own) can keep the step's pipes open:
+            # their end is not waited for past a short grace (a plain wait hung the runner for good).
+            p.drain(KILL_GRACE_S)
             past = f" at its backstop (soft deadline {soft_s:.0f}s)" if soft_s is not None else ""
             tail = sink.tail().strip()
             return None, f"timed out after {timeout_s:.0f}s{past} ({how})" + (f"; last output: {tail}" if tail else "")
-        except BaseException:
-            try:                    # anything else escaping the wait: the step's group never outlives it
-                os.killpg(p.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            raise
         # Review #4: a process the step left in the background (`cmd &`) would keep
         # writing declared outputs after the step is recorded and its grant ends.
         try:
-            os.killpg(p.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
-        return p.returncode, sink.tail()
+        return proc.returncode, sink.tail()
+    except BaseException:
+        try:                    # anything else escaping the wait: the step's group never outlives it
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        raise
     finally:
         if log is None:
             sink.close()
