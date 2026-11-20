@@ -383,7 +383,7 @@ def _blockers(critiques: dict):
 
 def _listed(critiques: dict) -> set:
     """Ids every critic in CRITICS lists this round, at any severity (Codex r1 on A5: a finding kept at LOW is listed)."""
-    return {str(b["id"]).strip() for reviewer, doc in (critiques or {}).items() if reviewer in CRITICS
+    return {str(b["id"]) for reviewer, doc in (critiques or {}).items() if reviewer in CRITICS
             for b in (doc or {}).get("blockers") or [] if isinstance(b, dict) and b.get("id")}
 
 
@@ -407,7 +407,7 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
         if isinstance(tests[bid], dict):
             tests[bid]["outside_brief_round"] = round_n if bid in exclude else None
     for reviewer, b in _blockers(critiques):
-        bid = str(b["id"]).strip()        # as the gate's key reads it (stall_rule.finding_key)
+        bid = str(b["id"])
         if bid in exclude:
             continue
         (closed_ids if b.get("resolved") is True else open_ids).add(bid)

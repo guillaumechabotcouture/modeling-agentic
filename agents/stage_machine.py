@@ -428,6 +428,12 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                     refused[reviewer] = raw
             except Exception:                                # unreadable: its schema errors stand
                 pass
+    # An id with surrounding whitespace is refused: the gate's key strips it (stall_rule.finding_key) and the
+    # registry and the ledger do not, so two findings could share a key. The critic repairs its file.
+    for reviewer, doc in critiques.items():
+        schema_errors += [f"{V.FILENAMES[reviewer]}: blocker id {b.get('id')!r} has surrounding whitespace"
+                          for b in doc.get("blockers") or []
+                          if isinstance(b, dict) and isinstance(b.get("id"), str) and b["id"] != b["id"].strip()]
     if strict_done_when:
         # v2blind1: critics wrote done_when as prose, done_when.py counted every test as missing,
         # and the open MEDIUMs were accepted. A HIGH or MEDIUM blocker's test is part of the schema
@@ -512,12 +518,12 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
             continue
         for b in doc.get("blockers") or []:
             if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
-                    or str(b.get("id")).strip() in closed):
+                    or str(b.get("id")) in closed):
                 continue
             if not drafted and OP.after_write_item(b):     # the gate's own rule (V._defer_write_findings)
                 continue
             dw = b.get("done_when")
-            out.append({"id": str(b.get("id")).strip(), "source": reviewer, "severity": b.get("severity"),
+            out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
                         "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or ""),
                         "fix_requires": _remedy(b)})
     critic_open = {o["id"] for o in out}
