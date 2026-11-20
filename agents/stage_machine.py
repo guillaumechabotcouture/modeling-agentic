@@ -3732,11 +3732,39 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         got = [o["id"] for o in open_findings(d, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
             {"kind": "done_when_regressed", "key": "D-071", "severity": "HIGH", "claim": "c"}]})]
         ok("done_when_regressed:D-071" in got and "D-071" in got, f"CX3-6 a regression is listed beside its finding ({got})")
+        yaml.safe_dump({"blockers": [{"id": "D-072 ", "severity": "MEDIUM", "target_stage": "ANALYZE", "claim": "c"}]},
+                       open(os.path.join(d, "critique_domain.yaml"), "w"))
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "resolved_by_test": ["D-072"]})]
+        ok("D-072 " not in got and "D-072" not in got, f"CX3-2 a critic id is read stripped: its passed test closes it ({got})")
+
+    def r3_presentation():
+        # CX3-1 (documented behaviour, pinned): a presentation task that fails and writes no review goes on to the
+        # gate, where the missing review is a MEDIUM finding; a resume that replays that failed task from the journal
+        # does the same, whatever is left of the cap.
+        class NoReview(StubTasks):
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                return self._r(f"critique:{reviewer}:{round_n}", False, note="no review written")
+        states = []
+        for name, journal in (("live", None), ("replay", {"task": "critique", "status": "completed", "ok": False})):
+            d, T, st = new_run("a1_cx31" + name, {}, budget=20.0)
+            st.state, st.spent_usd = "PRESENTATION", 20.0 if journal else 16.5
+            if journal:
+                st.journal["PRESENTATION#0:r1"] = journal
+            save_state(d, st)
+            mk(d, NoReview(T.s), st).step()
+            states.append(load_state(d).state)
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
+        for r in CRITICS:
+            StubTasks({}).critique(d, r, 1)
+        kinds = [(v.get("kind"), v.get("severity")) for v in v2_gate(d, 1, 3, True, [], history=False).get("rigor_violations") or []]
+        ok(states == ["GATE", "GATE"] and ("critique_presentation_missing", "MEDIUM") in kinds,
+           f"CX3-1 a failed presentation task goes to the gate, live and replayed alike; the gate reports the missing "
+           f"review ({states}, {kinds})")
 
     for name, fn in (("T_PRES_BUDGET", budget), ("T_PW_GATE", post_write), ("F_HARNESS_IDS", ids),
                      ("T_RETHINK", rethink), ("T_CLAIM", claims), ("CX1-3", r1_resume), ("CX1-4", r1_readback),
                      ("CX1-5", r1_open), ("CX1-7", r1_rethink), ("CX1-2", r1_claims), ("CX2-1", r2_machine),
-                     ("CX2-4", r2_findings)):
+                     ("CX2-4", r2_findings), ("CX3-1", r3_presentation)):
         case(name, fn)
 
 
