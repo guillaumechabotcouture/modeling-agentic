@@ -346,7 +346,8 @@ STEP_WALL_CEILING_S = 24 * 3600.0
 
 
 def step_wall_s(environ=None) -> float | None:
-    """Wall-clock limit for a pipeline step that runs the run's engine batches: the time the cluster's target pool
+    """Soft deadline for a pipeline step that runs the run's engine batches (scripts/pipeline.py warns past it and
+    kills only at its backstop, BACKSTOP_MULTIPLE x it or BACKSTOP_FLOOR_S): the time the cluster's target pool
     (MA_COMPUTE_TARGET_WORKERS x MA_COMPUTE_PROCS_PER_WORKER or MA_COMPUTE_CORES_PER_WORKER cores) takes to use
     the whole run cap (MA_COMPUTE_MAX_CORE_HOURS), times STEP_WALL_MARGIN, plus STEP_WALL_OWN_S, at most
     STEP_WALL_CEILING_S. The ledger holds every call in the step to the run cap, so this limit is a backstop that

@@ -63,9 +63,10 @@ def validate(spec, base: str | None = None) -> list[str]:
 def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
     """One step: the analysis reads the spec and its data and writes analysis/ and the deliverables. The engine
     batch inside it is resumable (scripts/compute.py keeps rows per input), so a rerun after a spec edit only
-    computes what changed in the batch; the steps after it are cheap. On a cluster the step's wall-clock limit
-    (`timeout_s`) comes from the run's compute cap (scripts/compute.py `step_wall_s`); without one the runner's
-    default applies. An unreadable compute budget raises ValueError."""
+    computes what changed in the batch; the steps after it are cheap. On a cluster the step's soft deadline
+    (`timeout_s`, warned about; scripts/pipeline.py kills only at its backstop, 3x it or 24 h) comes from the run's
+    compute cap (scripts/compute.py `step_wall_s`); without one the runner's default applies. An unreadable compute
+    budget raises ValueError."""
     if os.path.join(ROOT, "scripts") not in sys.path:
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import compute

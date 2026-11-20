@@ -218,6 +218,7 @@ def eligible_engines(spec: dict, engines=None, departures: str = "signed") -> li
                      "benchmarks_not_in_band": bg.get("blocking") or [],
                      "benchmarks_reported": bg.get("reported") or [],
                      "card_benchmark_rows_disagree_with_record": bg.get("card_rows_disagree") or [],
+                     "benchmark_status_source": bg.get("status_source") or {},
                      "components_without_benchmark": bg.get("uncovered") or {}})
     return rows
 
@@ -1164,7 +1165,10 @@ def _self_test_benchmark_gate(ok) -> None:
     rc = eligible_engines(f6, [(canon, None, None)])[0]
     ra = eligible_engines(f6, [("toolkit.engines.malaria:MalariaEngine", None, None)])[0]
     strip = lambda r: sorted(w.replace(r["ref"], "") for w in r["why_not"])  # noqa: E731
-    ok(not rc["eligible"] and strip(rc) == strip(ra) and any("component cm" in w for w in ra["why_not"]),
+    # the engine is refused either for its uncovered cm component or, while a pack benchmark is not yet run (F6 option
+    # A: B9d-B9g until the cloud pack run), for its refused benchmark record; the alias must match either way
+    ok(not rc["eligible"] and strip(rc) == strip(ra)
+       and any("component cm" in w or ("benchmark record refused" in w and "not yet run" in w) for w in ra["why_not"]),
        f"G24 an alias import of the malaria engine is assessed exactly like the canonical reference "
        f"({strip(ra)[:1]})")
 

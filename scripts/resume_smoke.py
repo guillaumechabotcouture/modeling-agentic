@@ -250,11 +250,19 @@ def scenarios(work: str) -> list:
         d, T = toy_run(name)
         calls = os.path.join(work, f"{name}.calls")
         os.environ.update({CALLS: calls, KILLED: os.path.join(work, f"{name}.killed"), **env})
+        # A step's timeout_s is a soft deadline (scripts/pipeline.py, 2026-11-17): the timeout scenario kills at its
+        # limit by setting the backstop to it (multiple 1, no 24 h floor) for the first attempt only.
+        import pipeline as P_
+        saved = {k: getattr(P_, k) for k in ("BACKSTOP_MULTIPLE", "BACKSTOP_FLOOR_S") if hasattr(P_, k)}
+        if name == "analyze_timeout" and saved:
+            P_.BACKSTOP_MULTIPLE, P_.BACKSTOP_FLOOR_S = 1, 0.0
         try:
             s1 = SM.run_v2("toy question", d, T, signoff="lead", log=quiet, backend=Batch(tmo), cross_engine_check=False)
         finally:
             for k in env:
                 os.environ.pop(k, None)
+            for k, v in saved.items():
+                setattr(P_, k, v)
         st = SM.load_state(d)
         why = SM.resumable_failure(d, st)
         before, kept, sig0 = _calls(calls), _kept(d), sig(d)

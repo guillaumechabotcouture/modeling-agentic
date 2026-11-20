@@ -43,6 +43,7 @@ if ROOT not in sys.path:
 from toolkit.analysis.core import q  # noqa: E402
 PRODUCER = "toolkit/analysis/uncertainty.py"
 ORDER = ("engine_parameters", "calibration", "costs", "emulator")
+POINT_TOL = 1e-6           # v2-posterior-point: a value within the fit file's 6-decimal rounding of the chosen point
 NE_STREAM = 0x6E6566        # the net-effect posterior's row choice: its own stream, the other sources' draws unchanged
 
 
@@ -51,14 +52,17 @@ def posterior_input(spec) -> dict | None:
     the spec, the owner-signed sha256 and the file's bytes, read once per spec and refused unless their sha256 is the
     signed one (Codex r1 P1-1, P2-4). The manifest, the engine artifact's input and the Drawer all use these bytes.
     Optional `margin` (default 0): the share of the sample's hull width each side of its columns' ranges is widened by
-    (net_effect_sample). None without the field."""
-    p = (spec.raw.get("uncertainty") or {}).get("net_effect_posterior")
-    if p is None:
+    (net_effect_sample). None without the field; a field left empty is refused (Codex r1 P1-6, v2-posterior-point)."""
+    u = spec.raw.get("uncertainty") or {}
+    if "net_effect_posterior" not in u:
         return None
+    p = u["net_effect_posterior"]
     if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip() \
-            or not isinstance(p.get("sha256"), str) or set(p) - {"path", "sha256", "margin"}:
+            or not isinstance(p.get("sha256"), str) or set(p) - {"path", "sha256", "margin", "exception"}:
         raise ValueError("uncertainty.net_effect_posterior: {path: net_effect_fit.py's output file, sha256: its "
-                         "signed digest, margin (optional): a share of the sample's hull width in [0, 1]}")
+                         "signed digest, margin (optional): a share of the sample's hull width in [0, 1], exception "
+                         "(optional): an owner-signed acceptance of recorded verification failures}")
+    exc = posterior_exception(spec)
     m = p.get("margin", 0.0)
     if isinstance(m, bool) or not isinstance(m, (int, float)) or not np.isfinite(m) or not 0 <= m <= 1:
         raise ValueError(f"uncertainty.net_effect_posterior.margin {m!r}: a share of the sample's hull width in [0, 1]")
@@ -68,7 +72,50 @@ def posterior_input(spec) -> dict | None:
         from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
         got = {"path": path, "sha256": dig, "data": NEF.read_signed(path, dig)}
         spec._net_effect_posterior = got
-    return dict(got, margin=float(m))
+    return dict(got, margin=float(m), exception=exc)
+
+
+EXCEPTION_KEYS = ("failed_points", "rule", "evidence", "reason", "draws")
+
+
+def posterior_exception(spec) -> dict | None:
+    """uncertainty.net_effect_posterior.exception (owner, 2026-11-20): the owner-signed acceptance of a net-effect
+    sample whose verification recorded failures. {failed_points: [{point: {parameter: value}, targets: [id, ...]}],
+    rule: the rule they fail, evidence: what else was verified, reason, draws: keep | exclude (the failed points in or
+    out of the draws)}. The loader accepts the sample only when it matches the file's recorded failures exactly
+    (net_effect_fit.load_posterior). None without it; a malformed one is refused (ValueError)."""
+    e = ((spec.raw.get("uncertainty") or {}).get("net_effect_posterior") or {}).get("exception")
+    if e is None:
+        return None
+    pts = e.get("failed_points") if isinstance(e, dict) else None
+    good = (isinstance(e, dict) and set(e) == set(EXCEPTION_KEYS) and isinstance(pts, list) and pts
+            and all(isinstance(e[k], str) and e[k].strip() for k in ("rule", "evidence", "reason"))
+            and e["draws"] in ("keep", "exclude")
+            and all(isinstance(x, dict) and set(x) == {"point", "targets"} and isinstance(x["point"], dict)
+                    and x["point"] and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                           for v in x["point"].values())
+                    and isinstance(x["targets"], list) and x["targets"]
+                    and all(isinstance(t, str) and t for t in x["targets"]) for x in pts))
+    if not good:
+        raise ValueError(f"uncertainty.net_effect_posterior.exception: {{{', '.join(EXCEPTION_KEYS)}}}; failed_points "
+                         f"a non-empty list of {{point: {{parameter: number}}, targets: [benchmark id, ...]}}, draws "
+                         f"keep or exclude, the rest non-empty text (got {e!r})")
+    return e
+
+
+def exception_sheet_lines(raw: dict) -> list:
+    """The sign-off sheet's HIGH line for a declared net-effect posterior exception (owner-signed departure)."""
+    post = ((raw.get("uncertainty") or {}).get("net_effect_posterior") or {})
+    e = post.get("exception") if isinstance(post, dict) else None
+    if not isinstance(e, dict):
+        return []
+    pts = [f"{', '.join(map(str, x.get('targets') or []))} at {x.get('point')}" for x in e.get("failed_points") or []
+           if isinstance(x, dict)]
+    return ["## Net-effect posterior exception (owner-signed departure)",
+            f"- **HIGH**: the net-effect posterior `{post.get('path')}` (sha256 {str(post.get('sha256'))[:12]}…) is "
+            f"accepted although its verification failed ({e.get('rule')}): {'; '.join(pts)}. Evidence: "
+            f"{e.get('evidence')}. Reason: {e.get('reason')}. The failed point(s) are "
+            f"{'kept in' if e.get('draws') == 'keep' else 'excluded from'} the draws.", ""]
 
 
 def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None = None, held=()) -> dict | None:
@@ -98,15 +145,75 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
         varied.update({k: tuple(v[:2]) for k, v in fitted.items()})
     varied = {k: v for k, v in varied.items() if k not in held}
     from toolkit.engines.contract import engine_identity      # Codex r1 P2-3: the engine is part of what was verified
-    key = (post["sha256"], post["margin"], tuple(sorted(varied)), tuple(sorted(engine_identity(eng).items())))
+    import json as _json
+    key = (post["sha256"], post["margin"], tuple(sorted(varied)), tuple(sorted(engine_identity(eng).items())),
+           _json.dumps(post.get("exception"), sort_keys=True))
     cache = getattr(spec, "_net_effect_sample", None)
     if cache is not None and cache[0] == key:
         return cache[1]
-    ne = NEF.load_posterior(post["path"], eng, varied, post["sha256"], post["data"])
+    ne = NEF.load_posterior(post["path"], eng, varied, post["sha256"], post["data"], exception=post.get("exception"))
     ne["margin"] = post["margin"]
     ne["ranges"] = NEF.posterior_ranges(ne, post["margin"], NEF.hard_bounds(eng, ne["names"]))
+    ne["point"] = chosen_point(post, ne["names"])
     spec._net_effect_sample = (key, ne)
     return ne
+
+
+def chosen_point(post: dict, names) -> dict:
+    """{column: value} of the fit's verified chosen point (joint_region.verified.chosen.point in the signed bytes that
+    load_posterior replayed): the point value of every posterior column (v2-posterior-point). Refused (fail closed; no
+    fallback to card or fitted values): a file without one; a point whose coordinates are not exactly the sample's
+    columns, or hold a value that is not a finite number; a point that is not exactly the fit's recorded `parameters`
+    values."""
+    import yaml
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    doc = yaml.safe_load(post["data"])
+    pt = ((((doc.get("joint_region") or {}).get("verified") or {}).get("chosen") or {}).get("point"))
+    if not isinstance(pt, dict) or sorted(pt) != sorted(names) or any(
+            isinstance(pt[k], bool) or not isinstance(pt[k], (int, float)) or not np.isfinite(pt[k]) for k in names):
+        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: no verified chosen point whose coordinates are "
+                                   f"the sample's columns {list(names)}, each a finite number "
+                                   f"(joint_region.verified.chosen.point: {pt!r})")
+    # run() writes the chosen point from its fit's parameter values: they must be the same numbers (Codex r1 P1-4, r2)
+    fp = doc.get("parameters") if isinstance(doc.get("parameters"), dict) else {}
+    off = sorted(set(fp) - set(names)) + [      # a recorded parameter the sample lacks (Codex r3), or another value
+        k for k in names if not isinstance(fp.get(k), dict) or isinstance(fp[k].get("value"), bool)
+        or not isinstance(fp[k].get("value"), (int, float)) or not float(fp[k]["value"]) == float(pt[k])]
+    if off:
+        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: the chosen point of {off} is not the fit's "
+                                   f"recorded parameter values (parameters: {[fp.get(k) for k in off]}; chosen point: "
+                                   f"{[pt.get(k) for k in off]})")
+    return {k: float(pt[k]) for k in names}
+
+
+def posterior_point(spec, ne: dict | None, theta: dict) -> dict:
+    """`theta` with every posterior column at the fit's chosen point (core.Analysis.theta0, joint_calibration.theta0).
+    A spec engine_parameters value of a column that differs from it by more than POINT_TOL (the fit file's 6-decimal
+    rounding, whatever the magnitude: Codex r1 P1-5) is refused. So is a likelihood or posterior calibration, whose
+    engine parameters are the calibrated ones over engine defaults, never this point (Codex r1 P1-1). `theta`
+    unchanged without a posterior."""
+    if ne is None:
+        return theta
+    m = (spec.raw.get("calibration") or {}).get("method")
+    if m in ("likelihood", "posterior"):
+        raise ValueError(f"uncertainty.net_effect_posterior with calibration.method {m}: that calibration evaluates the "
+                         "engine at its default values, not at the posterior's chosen point; not supported")
+    from toolkit.spec import engine_parameters as PV
+    sv = PV.values(spec)
+    # the float subtraction's own error (a few ulps at the values' magnitude) is not a difference (Codex r2-r3)
+    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv
+           and abs(sv[k] - v) > POINT_TOL + 4 * float(np.spacing(max(abs(sv[k]), abs(v))))}
+    if bad:
+        raise ValueError("engine_parameters: " + "; ".join(
+            f"{k} is set to {a}, but the net-effect posterior's verified chosen point is {b}; the chosen point is the "
+            f"point value of a posterior column: set the spec value to it or remove the value" for k, (a, b) in
+            sorted(bad.items())))
+    return dict(theta, **ne["point"])
+
+
+def point_source(ne: dict | None) -> dict:
+    """The manifest's record of where each posterior column's point value came from ({} without a posterior)."""
+    return {k: "posterior_chosen_point" for k in (ne or {}).get("point", {})}
 
 
 def with_posterior_ranges(ne: dict | None, fitted: dict, priors: dict | None = None) -> tuple:
@@ -127,8 +234,9 @@ def with_posterior_ranges(ne: dict | None, fitted: dict, priors: dict | None = N
 
 def posterior_range_record(ne: dict) -> dict:
     """What the manifest and the uncertainty report record of the ranges the sample set."""
-    return {"sha256": ne["sha256"], "range_source": "posterior_hull", "margin": ne["margin"],
-            "ranges": {k: [float(lo), float(hi)] for k, (lo, hi) in ne["ranges"].items()}}
+    return dict({"sha256": ne["sha256"], "range_source": "posterior_hull", "margin": ne["margin"],
+                 "ranges": {k: [float(lo), float(hi)] for k, (lo, hi) in ne["ranges"].items()}},
+                **({"exception": ne["exception"]} if ne.get("exception") else {}))
 
 
 def _pu():
@@ -651,6 +759,10 @@ def _self_test() -> int:
                 ok(True, f"U12 {label} fails closed")
     _self_test_reserve(ok)
     try:
+        _self_test_exception(ok)
+    except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"UE1 the posterior exception ({type(e).__name__}: {e})")
+    try:
         _self_test_posterior(ok)
     except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
         ok(False, f"NP1-NP4 the net-effect posterior in the draws ({type(e).__name__}: {e})")
@@ -659,6 +771,37 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_exception(ok):
+    """UE1 (owner, 2026-11-20): uncertainty.net_effect_posterior.exception is validated with the posterior field, is
+    passed to the loader, recorded with the posterior's ranges (manifest and report) and shown as a HIGH owner-signed
+    departure on the sign-off sheet."""
+    class Sp:
+        def __init__(s, raw):
+            s.raw = raw
+
+        def resolve(s, p):
+            return p
+    exc = {"failed_points": [{"point": {"a": 0.1}, "targets": ["T1"]}], "rule": "the 14 Nov acceptance rule",
+           "evidence": "13 of 14 verified points pass", "reason": "a narrow miss", "draws": "keep"}
+    got = {}
+    for label, e in (("good", exc), ("no reason", {k: v for k, v in exc.items() if k != "reason"}),
+                     ("bad draws", dict(exc, draws="maybe")), ("no points", dict(exc, failed_points=[])),
+                     ("a target not a string", dict(exc, failed_points=[{"point": {"a": 0.1}, "targets": [3]}]))):
+        try:
+            got[label] = posterior_exception(Sp({"uncertainty": {"net_effect_posterior": {
+                "path": "p.yaml", "sha256": "0" * 64, "exception": e}}}))
+        except ValueError as ex:
+            got[label] = str(ex)
+    lines = exception_sheet_lines({"uncertainty": {"net_effect_posterior": {"path": "p.yaml", "sha256": "ab" * 32,
+                                                                             "exception": exc}}})
+    rec = posterior_range_record({"sha256": "s", "margin": 0.0, "ranges": {"a": (0.0, 1.0)}, "exception": exc})
+    ok(got["good"] == exc and all(isinstance(got[k], str) for k in got if k != "good")
+       and any("**HIGH**" in x and "T1" in x and "a narrow miss" in x for x in lines)
+       and exception_sheet_lines({"uncertainty": {}}) == [] and rec.get("exception") == exc,
+       f"UE1 the posterior exception: validated ({sorted(k for k in got if isinstance(got[k], str))} refused), on the "
+       f"sheet as HIGH, in the range record ({lines[:2]})")
 
 
 def _self_test_posterior(ok):

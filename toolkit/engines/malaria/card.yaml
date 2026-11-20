@@ -1,5 +1,5 @@
 name: malaria-starsim
-version: '0.17'
+version: '0.18'
 mechanisms:
 - 'Griffin-lite human natural history and immunity (fixed: Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324;
   2014 Nat Commun; 2015 Lancet Infect Dis)'
@@ -730,6 +730,18 @@ parameters:
   hi: null
   source: decay rate of a PBO net's advantage over a same-age pyrethroid net (PBO lost from the net; Churcher 2016
     has no such term); 0 = v0.16; drawn over the card prior from Staedke et al. 2020 Lancet (LLINEUP) Table 2 (priors.yaml)
+  verified: unverified
+- name: net_deter_sat
+  value: 1.0
+  kind: fixed
+  units: share
+  lo: null
+  hi: null
+  source: 'share of a PBO net''s extra entry reduction (deterrence) over a pyrethroid net at the same bioassay mortality
+    that it keeps (vector.hut_new_net): 1 = Churcher 2016''s PBO net (Churcher et al. 2016 eLife 10.7554/eLife.16090,
+    Table 6 (PMC5025277), Equations 4 and 8), 0 = a pyrethroid net''s entry with the PBO net''s hut mortality; no
+    trial in the pack measures it at near-saturated hut mortality; fitted with the PBO trials by the net-effect
+    fit (benchmarks/net_effect_fit.py)'
   verified: unverified
 - name: irs_kill
   value: 0.45125

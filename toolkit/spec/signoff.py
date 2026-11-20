@@ -478,6 +478,8 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += ED.sheet_lines(raw, run_dir, dossier_bytes, closure)   # F6: each input, execution's vs the chosen value
     from toolkit.engines import benchmark_coverage as BC
     out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
+    from toolkit.analysis import uncertainty as UQ
+    out += UQ.exception_sheet_lines(raw)                # owner, 2026-11-20: a net-effect posterior exception, HIGH
     from toolkit.engines import effect_settings as ES
     out += ES.sheet_lines(raw, run_dir)                 # units outside the trials' settings, and what covers each
     if candidates:
@@ -1099,11 +1101,73 @@ def _self_test() -> int:
            and "## Base outcome adjustments" not in plain_md,
            "SS-OA1 the sheet lists each base outcome adjustment (id, component, reference, value, source), and a spec "
            "without the field gets no such section (existing sheets unchanged)")
+    _self_test_run_dir_forms(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_run_dir_forms(ok):
+    """SG-RD1-RD2 (v2-closure-paths): a run dir given as a relative or an absolute path names the same run. A spec
+    signed through one form has the status `signed` through the other, and the closure's run keys are relative to the
+    run dir in both."""
+    import tempfile
+    from toolkit.spec import evidence_dossier as ED
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as top:
+        got = {}
+        try:
+            os.chdir(top)
+            for label, sign_as, check_as in (("relative then absolute", "rel", "abs"),
+                                             ("absolute then relative", "abs", "rel")):
+                rel = os.path.join("runs", label.split()[0])
+                os.makedirs(os.path.join(top, rel))
+                schema.toy_spec(os.path.join(top, rel))
+                form = {"rel": rel, "abs": os.path.join(top, rel)}
+                try:
+                    write_sheet(form[sign_as])
+                    sign(form[sign_as], "lead", note="self-test")
+                    st = (status(form[sign_as]), status(form[check_as]))
+                    cl = [((ED.state(form[f]).get("binding") or {}).get("record") or {}).get("closure") or {}
+                          for f in ("rel", "abs")]
+                    import hashlib
+                    want = hashlib.sha256(open(os.path.join(top, rel, "units.csv"), "rb").read()).hexdigest()
+                    keys = (sorted(k for k in cl[0] if k.startswith("run:"))
+                            if cl[0] == cl[1] and cl[0].get("run:units.csv") == want else ["differ"])
+                except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+                    st, keys = (f"{type(e).__name__}: {e}",), []
+                got[label] = (st, keys)
+        finally:
+            os.chdir(cwd)
+    ok(all(v[0] == ("signed", "signed") for v in got.values()),
+       f"SG-RD1 a spec signed through a relative run dir is signed through the absolute one, and the reverse: "
+       f"{ {k: v[0] for k, v in got.items()} }")
+    ok(all(v[1] and v[1] != ["differ"] and not any(k.startswith("run:runs") for k in v[1]) for v in got.values()),
+       f"SG-RD2 the closure's run keys are relative to the run dir whatever form it was given in: "
+       f"{ {k: v[1][:3] for k, v in got.items()} }")
+    # SG-RD3 (lead, 20 Nov): signed in tree A through a relative path, the tree copied to another root B and checked
+    # through B's absolute path (a resume on a cloud worker) is still signed
+    import shutil
+    with tempfile.TemporaryDirectory() as top:
+        a, b = os.path.join(top, "rootA"), os.path.join(top, "elsewhere", "rootB")
+        rel = os.path.join("runs", "R")
+        os.makedirs(os.path.join(a, rel))
+        schema.toy_spec(os.path.join(a, rel))
+        try:
+            os.chdir(a)
+            write_sheet(rel)
+            sign(rel, "lead", note="self-test")
+            os.chdir(cwd)
+            shutil.copytree(a, b)
+            st3 = (status(os.path.join(a, rel)), status(os.path.join(b, rel)))
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            st3 = (f"{type(e).__name__}: {e}",)
+        finally:
+            os.chdir(cwd)
+    ok(st3 == ("signed", "signed"), f"SG-RD3 a spec signed through a relative path in one tree is signed in a copy of "
+                                    f"the tree under another root, checked through its absolute path: {st3}")
 
 
 def main(argv=None) -> int:

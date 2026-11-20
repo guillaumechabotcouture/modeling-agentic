@@ -29,7 +29,9 @@ once and the harness runs them, like `make` (docs/design/stage-machine.md §3.2)
         inputs: [allocation.csv]
         outputs: ["figures/*.png"]
 
-Step keys: id, run, inputs, outputs, and optionally purpose, timeout_s; a
+Step keys: id, run, inputs, outputs, and optionally purpose, timeout_s (a soft
+deadline: warned about and recorded in pipeline_progress.json, the step
+killed only at its backstop; see DEFAULT_TIMEOUT_S); a
 compute step (`run: "compute: <path.py>::<fn>"`) also needs inputs_jsonl, out
 (one of its outputs) and purpose. Anything else is a validation error. A
 step's input that matches another step's output is an edge of the DAG.
@@ -65,7 +67,7 @@ the step runs in a temporary copy of the run directory, and nothing in the
 run directory changes; the copy is removed afterwards unless `--keep`.
 
 Like scripts/derived_rebuild.py: commands run from the run directory, without
-cloud credentials, each in its own process group (killed on timeout), within
+cloud credentials, each in its own process group (killed at its backstop), within
 an optional total time budget.
 
 Known limits: a script's undeclared data reads (an `open()` of a file not in
@@ -89,6 +91,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import nullcontext
 
@@ -97,15 +100,29 @@ REPO = os.path.dirname(HERE)
 SPEC = os.path.join("models", "pipeline.yaml")
 STATE = os.path.join("models", "pipeline_state.json")
 REPORT = os.path.join("models", "pipeline_report.json")
+# At the run root, not under models/ (Codex on #267, P1): compute.py's code fingerprint hashes models/ and data/,
+# so a progress write there would change a running batch's fingerprint and discard its rows on resume.
+PROGRESS = "pipeline_progress.json"
 _RUN_ID = None           # the current run()'s id (MA_PIPELINE_RUN in its steps)
+_PROGRESS_DOC: dict = {}  # (run dir, run id) -> PROGRESS as this process last wrote it
+_PROGRESS_LOCK = threading.Lock()   # one check-and-write of PROGRESS at a time (Codex round 4 on #267)
 # The runner's own records: written by the harness run only (protected in
 # agents/enforcement.py SCRIPT_OUTPUTS).
 OWN_FILES = ("models/pipeline_state.json", "models/pipeline_state.json.tmp",
-             "models/pipeline_report.json", "models/pipeline_report.json.tmp")
+             "models/pipeline_report.json", "models/pipeline_report.json.tmp",
+             "pipeline_progress.json")
 STEP_KEYS = {"id", "run", "inputs", "outputs", "purpose", "timeout_s", "inputs_jsonl", "out"}
 COMPUTE_KEYS = {"inputs_jsonl", "out"}
 TOP_KEYS = {"steps", "version"}
+# Warn, don't kill (owner, 2026-11-17: two real runs died at a fixed 1 h step limit; on the VM path the analyze step
+# needs 5-6 h). A step's `timeout_s` (default DEFAULT_TIMEOUT_S) is a SOFT deadline: past it the runner warns on
+# stderr and writes PROGRESS every PROGRESS_EVERY_S, and the step runs on. Only the backstop kills: the larger of
+# BACKSTOP_MULTIPLE x the soft deadline and BACKSTOP_FLOOR_S, for a runaway or a true hang. A caller's total
+# pipeline budget (`budget_s`, its own declared limit) still bounds a step.
 DEFAULT_TIMEOUT_S = 3600
+BACKSTOP_MULTIPLE = 3
+BACKSTOP_FLOOR_S = 24 * 3600.0
+PROGRESS_EVERY_S = 900.0
 KILL_GRACE_S = 10           # after a timeout kill: how long to wait for the step's pipes to close
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _GLOB = re.compile(r"[*?\[]")
@@ -327,8 +344,8 @@ def load(run_dir: str) -> tuple[list[dict], list[str]]:
         if not st["outputs"]:
             errs.append(f"{where}: declares no outputs")
         if "timeout_s" in st and (not isinstance(st["timeout_s"], (int, float)) or isinstance(st["timeout_s"], bool)
-                                  or st["timeout_s"] <= 0):
-            errs.append(f"{where}: `timeout_s` must be a positive number")
+                                  or not 0 < st["timeout_s"] < float("inf")):    # NaN fails too (Codex on #267)
+            errs.append(f"{where}: `timeout_s` must be a positive finite number")
         if "purpose" in st and (not isinstance(st["purpose"], str) or not st["purpose"].strip()):
             errs.append(f"{where}: `purpose` must be a non-empty string")
         fn = _compute_fn(st)
@@ -599,8 +616,11 @@ def fingerprint(step: dict, run_dir: str) -> dict:
     """What a step's result depends on: its definition, its input files and its code."""
     spec = {k: v for k, v in step.items() if not k.startswith("_")}
     ins, missing = {}, []
+    prog = os.path.realpath(os.path.join(run_dir, PROGRESS))
     for pat in step_inputs(step):
-        m = _matches(run_dir, pat)
+        # The runner rewrites PROGRESS while a step runs (Codex on #267): never an input, also through a link, and
+        # excluded before the missing check, so it alone never satisfies a glob.
+        m = [r for r in _matches(run_dir, pat) if os.path.realpath(os.path.join(run_dir, r)) != prog]
         if not m:
             missing.append(pat)
         for rel in m:
@@ -718,12 +738,72 @@ def plan(run_dir: str, steps: list[dict] | None = None, state: dict | None = Non
 # Running
 # --------------------------------------------------------------------------- #
 
-def _run_cmd(cmd, cwd, timeout_s, env, shell=False):
-    """Own process group; on timeout the whole group is killed (as derived_rebuild)."""
-    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                         text=True, env=env, start_new_session=True, shell=shell)
+def backstop_s(soft_s: float) -> float:
+    """The wall time at which a step is killed: BACKSTOP_MULTIPLE x its soft deadline, or BACKSTOP_FLOOR_S."""
+    return max(BACKSTOP_MULTIPLE * float(soft_s), BACKSTOP_FLOOR_S)
+
+
+def _communicate(p, timeout_s, soft_s=None, on_overrun=None):
+    """p.communicate() to `timeout_s` (raises TimeoutExpired there). With `soft_s` and `on_overrun`, it calls
+    on_overrun(elapsed) once the soft deadline passes and every PROGRESS_EVERY_S after, the process running on."""
+    t0 = time.monotonic()
+    if soft_s is None or on_overrun is None or soft_s >= timeout_s:
+        return p.communicate(timeout=timeout_s)
+    nxt, worker = soft_s, None
+    while True:
+        try:
+            # Each wait is at most PROGRESS_EVERY_S (Codex round 4 on #267: a 30-day wait overflows the OS poller).
+            el = time.monotonic() - t0
+            return p.communicate(timeout=max(0.01, min(nxt, timeout_s, el + PROGRESS_EVERY_S) - el))
+        except subprocess.TimeoutExpired:
+            el = time.monotonic() - t0
+            if el >= timeout_s:
+                raise
+            if el >= nxt:
+                # Off this loop (Codex round 3 on #267): a stderr or disk that blocks never holds the backstop. One
+                # report at a time; a report still running when the next is due is skipped.
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(target=_report, args=(on_overrun, el), daemon=True)
+                    try:
+                        worker.start()
+                    except RuntimeError as e:     # the OS refused a thread (Codex round 4): the step runs on
+                        worker = None
+                        _warn(f"[pipeline] progress report not started: {e}")
+                nxt = el + PROGRESS_EVERY_S
+
+
+def _report(on_overrun, el) -> None:
     try:
-        _out, err = p.communicate(timeout=timeout_s)
+        on_overrun(el)
+    except Exception as e:  # noqa: BLE001 -- a warning that fails never stops the step
+        _warn(f"[pipeline] progress record failed: {type(e).__name__}: {e}")
+
+
+def _warn(msg: str) -> None:
+    """A line on stderr; a stderr that cannot be written (a closed pipe) is ignored (Codex on #267)."""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None):
+    """Own process group; at `timeout_s` the whole group is killed (as derived_rebuild). `soft_s`/`on_overrun`: see
+    _communicate (the step's soft deadline: warned about, never killed)."""
+    # errors="replace" (Codex round 4 on #267): output that is not UTF-8 never hides the step's outcome.
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                         text=True, errors="replace", env=env, start_new_session=True, shell=shell)
+    try:
+        try:
+            _out, err = _communicate(p, timeout_s, soft_s, on_overrun)
+        except subprocess.TimeoutExpired:
+            raise
+        except BaseException:
+            try:                    # anything else escaping the wait: the step's group never outlives it
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            raise
         # Review #4: a process the step left in the background (`cmd &`) would keep
         # writing declared outputs after the step is recorded and its grant ends.
         try:
@@ -747,10 +827,14 @@ def _run_cmd(cmd, cwd, timeout_s, env, shell=False):
                 except OSError:
                     pass
             p.wait()
-        return None, f"timed out after {timeout_s:.0f}s (process group killed)"
+        past = f" at its backstop (soft deadline {soft_s:.0f}s)" if soft_s is not None else ""
+        return None, f"timed out after {timeout_s:.0f}s{past} (process group killed)"
 
 
-def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None) -> tuple[int | None, str]:
+def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None, soft_s: float | None = None,
+               on_overrun=None) -> tuple[int | None, str]:
+    """Run one step to `timeout_s` (its backstop); `soft_s`/`on_overrun` as _communicate. A compute step's batch
+    gets the backstop as its own wall limit, so the batch is not stopped at the soft deadline either."""
     env = script_env()
     env["MA_PIPELINE_RUN_DIR"] = run_dir     # the trusted root a harness step writes under (the dir it runs in)
     if _RUN_ID:
@@ -766,8 +850,8 @@ def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None) -
             cmd = [python or sys.executable, os.path.join(HERE, "compute.py"), "map", run_dir, "--fn", fn,
                    "--inputs", os.path.join(run_dir, step["inputs_jsonl"]), "--out", os.path.join(run_dir, step["out"]),
                    "--purpose", step["purpose"].strip(), "--timeout-s", str(max(1.0, timeout_s))]
-            return _run_cmd(cmd, run_dir, timeout_s + 60, env)
-        return _run_cmd(step["run"], run_dir, timeout_s, env, shell=True)
+            return _run_cmd(cmd, run_dir, timeout_s + 60, env, soft_s=soft_s, on_overrun=on_overrun)
+        return _run_cmd(step["run"], run_dir, timeout_s, env, shell=True, soft_s=soft_s, on_overrun=on_overrun)
     finally:
         shutil.rmtree(cache, ignore_errors=True)
 
@@ -816,8 +900,58 @@ def _trusted_outputs(rec) -> dict:
     return out if isinstance(out, dict) else {}
 
 
+def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_start: float, elapsed: float | None,
+                     last_s, state: str) -> None:
+    """PROGRESS, this step's entry: where it stands against its soft deadline and its backstop, and a projection of
+    when it ends (a compute step: from the rows its batch has written; otherwise its last recorded runtime)."""
+    now = time.time()
+    el = (now - t_start) if elapsed is None else elapsed
+    proj, basis = None, None
+    fn = _compute_fn(step)
+    if fn is not None:
+        try:
+            total = sum(1 for ln in open(os.path.join(run_dir, step["inputs_jsonl"])) if ln.strip())
+            done = sum(1 for ln in open(os.path.join(run_dir, step["out"])) if ln.strip())
+            if total and done:
+                proj, basis = el * total / done, f"{done} of {total} rows written"
+        except OSError:
+            pass
+    if proj is None and isinstance(last_s, (int, float)) and last_s > el:
+        proj, basis = float(last_s), "the step's last recorded runtime"
+    entry = {"state": state, "pipeline_run": _RUN_ID, "started_at": _iso(t_start), "at": _iso(now),
+             "elapsed_s": round(el, 1), "soft_deadline_s": soft_s, "backstop_s": hard_s,
+             "backstop_at": _iso(t_start + hard_s), "backstop_rule": f"max({BACKSTOP_MULTIPLE} x soft deadline, "
+             f"{BACKSTOP_FLOOR_S / 3600:g} h), within any pipeline budget",
+             "projected_total_s": round(proj, 1) if proj is not None else None, "projection_basis": basis,
+             "projected_past_backstop": (proj > hard_s) if proj is not None else None}
+    # Kept in memory for this pipeline run and only ever replaced on disk, never read back (Codex on #267: a FIFO at
+    # the path would block the deadline loop, and an edited entry would be republished as the harness's).
+    # Under one lock, the check and the write (Codex round 4 on #267): a 'running' report that passed the check
+    # cannot land on disk after the final state.
+    with _PROGRESS_LOCK:
+        doc = _PROGRESS_DOC.setdefault((run_dir, _RUN_ID), {"pipeline_run": _RUN_ID, "steps": {}})
+        prev = doc["steps"].get(step["id"]) or {}
+        if state == "running" and prev.get("started_at") == entry["started_at"] and prev.get("state") != "running":
+            return                # a late report (its thread) never overwrites the step's final state
+        doc["steps"][step["id"]] = entry
+        _write_json(run_dir, PROGRESS, doc)
+    if state == "running":
+        _warn(f"[pipeline] WARNING step {step['id']}: running {_dur(el)}, past its soft deadline of {_dur(soft_s)}; "
+              f"it runs on, killed only at its backstop of {_dur(hard_s)} ({entry['backstop_at']})"
+              + (f"; projected total {_dur(proj)} ({basis})" if proj is not None else "; no projection yet"))
+
+
+def _dur(s: float) -> str:
+    s = float(s)
+    return f"{s:.0f} s" if s < 120 else f"{s / 60:.0f} min" if s < 7200 else f"{s / 3600:.1f} h"
+
+
+def _iso(t: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t))
+
+
 def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec: dict | None = None,
-             suspect=None) -> dict:
+             suspect=None, soft_s: float | None = None) -> dict:
     """Move the step's existing outputs aside, run it, and check it wrote every declared output.
 
     The step runs with its outputs absent (like `make clean` for this step), so only files
@@ -893,11 +1027,20 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
                 row["restored"] = restore()
                 return row
         s0 = time.time()
+        last = rec.get("seconds") if isinstance(rec, dict) else None
+        over = []
+
+        def on_overrun(el):
+            over.append(el)
+            _progress_record(run_dir, step, soft_s, timeout_s, s0, el, last, "running")
         try:
-            rc, err = _exec_step(step, run_dir, timeout_s, python)
+            rc, err = _exec_step(step, run_dir, timeout_s, python, soft_s, on_overrun if soft_s is not None else None)
         except OSError as e:
             rc, err = None, f"{type(e).__name__}: {e}"
         row.update(returncode=rc, seconds=round(time.time() - s0, 1), ok=rc == 0)
+        if over:
+            row["over_soft_deadline"] = True
+            row["soft_deadline_s"], row["backstop_s"] = soft_s, timeout_s
         after = _snapshot(step, run_dir)
         row["written"] = sorted(r for r, m in after.items() if r not in keep or before.get(r) != m)
         row["removed"] = sorted(set(row["removed"]) - set(after))
@@ -919,6 +1062,12 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
             now = set(_snapshot(step, run_dir))
             row["removed"] = sorted((set(before) | set(row["written"])) - now)
             row["written"] = sorted((set(row["written"]) & now) - set(row["restored"]))
+        if over:              # the final state once its outputs are checked (Codex on #267: never `ok` for a rollback)
+            try:
+                _progress_record(run_dir, step, soft_s, timeout_s, s0, row["seconds"], last,
+                                 "ok" if row["ok"] else "failed")
+            except Exception:  # noqa: BLE001 -- the record is a report, never the step's outcome
+                pass
         return row
     finally:
         shutil.rmtree(aside, ignore_errors=True)
@@ -1022,9 +1171,11 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
                            error=f"last run took {last:.0f}s; {left:.0f}s of the pipeline budget left")
                 failed.add(s["id"])
             else:
-                tmo = float(s.get("timeout_s") or DEFAULT_TIMEOUT_S)
-                res = _run_one(s, run_dir, tmo if left is None else min(tmo, left), python, rec,
-                               suspect=integrity.is_open if integrity is not None else None)
+                soft = float(s.get("timeout_s") or DEFAULT_TIMEOUT_S)
+                hard = backstop_s(soft) if left is None else min(backstop_s(soft), left)
+                res = _run_one(s, run_dir, hard, python, rec, suspect=integrity.is_open if integrity is not None else None,
+                               soft_s=min(soft, hard))
+
                 fp = res.pop("fingerprint", None) or fingerprint(s, run_dir)
                 row.update(res, status="ok" if res["ok"] else "failed")
                 produced += res["written"] + res["removed"]
@@ -1044,6 +1195,15 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
                 produced.append(_write_json(run_dir, STATE, state))
             report["steps"].append(row)
         report["ok"] = not failed
+        doc = _PROGRESS_DOC.get((run_dir, _RUN_ID))
+        if doc is not None:
+            # The runner's own record, republished (Codex round 3 on #267): a later step that overwrote the file
+            # cannot have its bytes certified as harness-written.
+            try:
+                with _PROGRESS_LOCK:
+                    produced.append(_write_json(run_dir, PROGRESS, doc))
+            except OSError:
+                pass
         _finish(run_dir, report, t0, integrity, produced, by_id)
     return report
 
@@ -1981,25 +2141,243 @@ def _self_test() -> int:
         rep = run(d, budget_s=0)
         ok([r["status"] for r in rep["steps"]] == ["not_started", "skipped", "skipped"],
            f"PL14 nothing starts once the budget is used: {rep['steps']}")
-        w(d, "models/a.py", "import time\ntime.sleep(30)\n")
-        t1 = time.time()
-        spec(d, [dict(three[0], timeout_s=1)] + three[1:])
-        rep = run(d)
-        ok(rep["steps"][0]["returncode"] is None and time.time() - t1 < 15, f"PL15 a timed-out step is killed: {rep['steps']}")
-        # PL15b (v2 analyze timeout, 2026-11-02): a process that left the step's group (as compute.py's pool
-        # processes do) and keeps its pipes open must not hang the runner after the kill.
-        w(d, "models/a.py", "import subprocess, sys, time\n"
-                            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
-                            "open('models/a.pid', 'w').write(str(c.pid))\ntime.sleep(30)\n")
-        t1 = time.time()
-        rep = run(d)
-        took = time.time() - t1
+        # Warn, don't kill (owner, 2026-11-17: two real runs died at the fixed 1 h step limit, whose analyze step
+        # needs 5-6 h on the VM path). A step's timeout_s is a soft deadline; only the backstop kills.
         try:
-            os.kill(int(open(os.path.join(d, "models", "a.pid")).read()), signal.SIGKILL)
-        except (OSError, ValueError):
-            pass
-        ok(rep["steps"][0]["returncode"] is None and took < 1 + KILL_GRACE_S + 10,
-           f"PL15b a timed-out step whose escaped child holds its pipes ends within the grace ({took:.0f}s)")
+            bk = [backstop_s(1), backstop_s(3600), backstop_s(10 * 3600), backstop_s(24 * 3600)]
+        except NameError as e:
+            bk = [repr(e)]
+        g_ = globals()
+        ok(bk == [24 * 3600, 24 * 3600, 30 * 3600, 72 * 3600] and g_.get("BACKSTOP_MULTIPLE") == 3
+           and g_.get("BACKSTOP_FLOOR_S") == 24 * 3600,
+           f"PL15a the backstop is 3x the soft deadline or 24 h, whichever is larger: {bk}")
+        saved = {k: g_.get(k) for k in ("BACKSTOP_FLOOR_S", "PROGRESS_EVERY_S")}
+        g_["BACKSTOP_FLOOR_S"], g_["PROGRESS_EVERY_S"] = 0.0, 0.5     # backstop 3 s for timeout_s=1
+        try:
+            # PL15c: a step past its soft deadline keeps running, writes a progress record while it runs (the step
+            # copies the record it can see at 1.8 s into its output) and finishes ok.
+            w(d, "models/a.py", "import time, shutil\ntime.sleep(1.8)\n"
+                                "shutil.copy('pipeline_progress.json', 'models/a.seen')\n"
+                                "open('models/a.out', 'w').write('5')\n")
+            spec(d, [dict(three[0], timeout_s=1, outputs=["models/a.out", "models/a.seen"])] + three[1:])
+            rep = run(d)
+            try:
+                seen = json.load(open(os.path.join(d, "models", "a.seen")))["steps"]["a"]
+            except (OSError, ValueError, KeyError, TypeError):
+                seen = {}
+            try:
+                final = json.load(open(os.path.join(d, PROGRESS)))["steps"]["a"]
+            except (NameError, OSError, ValueError, KeyError, TypeError):
+                final = {}
+            r0 = rep["steps"][0] if rep["steps"] else {}
+            ok(r0.get("status") == "ok" and r0.get("over_soft_deadline") is True
+               and seen.get("state") == "running" and seen.get("soft_deadline_s") == 1
+               and seen.get("backstop_s") == 3 and seen.get("elapsed_s", 0) >= 1
+               and "backstop_at" in seen and final.get("state") == "ok",
+               f"PL15c a step past its soft deadline is warned about, recorded while running, and finishes: "
+               f"{r0} seen={seen} final={final}")
+            # PL15e (Codex on #267, P1): a progress write leaves a batch's code fingerprint (compute.py: models/ and
+            # data/) unchanged, so a resumed batch keeps its rows.
+            import compute as _compute
+            fp0 = _compute.code_fingerprint(d, "models/a.py::f")
+            _progress_record(d, {"id": "z", "run": "x"}, 1.0, 3.0, time.time(), 2.0, None, "running")
+            ok(_compute.code_fingerprint(d, "models/a.py::f") == fp0,
+               "PL15e writing the progress record does not change a batch's code fingerprint")
+            # PL15f-i (Codex re-review of #267, round 2, 4 P1):
+            # f: a step whose inputs glob matches the progress record ("*.json") still finishes ok past its deadline.
+            w(d, "models/g.py", "import time\ntime.sleep(1.8)\nopen('models/g.out', 'w').write('g')\n")
+            w(d, "cfg.json", "{}")
+            spec(d, three + [{"id": "g", "run": f"{py} models/g.py", "inputs": ["*.json"], "outputs": ["models/g.out"],
+                              "timeout_s": 1}])
+            rep = run(d)
+            rg = next((r for r in rep["steps"] if r["id"] == "g"), {})
+            ok(rg.get("status") == "ok" and rg.get("over_soft_deadline"),
+               f"PL15f a step whose inputs match the progress record finishes past its soft deadline: {rg}")
+            spec(d, three)
+            # g: a broken stderr (the warning cannot be printed) never escapes the runner: the step finishes.
+            import io
+            class _Broken(io.StringIO):
+                def write(self, *a):
+                    raise BrokenPipeError(32, "Broken pipe")
+            w(d, "models/a.py", "import time\ntime.sleep(1.8)\nopen('models/a.out', 'w').write('5')\n")
+            spec(d, [dict(three[0], timeout_s=1)] + three[1:])
+            real_err = sys.stderr
+            sys.stderr = _Broken()
+            try:
+                rep = run(d)
+                r0, esc = (rep["steps"][0] if rep["steps"] else {}), None
+            except BaseException as e:  # noqa: BLE001
+                r0, esc = {}, e
+            finally:
+                sys.stderr = real_err
+            ok(esc is None and r0.get("status") == "ok",
+               f"PL15g a warning that cannot be written (broken stderr) never escapes; the step finishes: {esc!r} {r0}")
+            # h: a FIFO planted at the progress path never blocks the runner (it is never read, only replaced).
+            if hasattr(os, "mkfifo"):
+                try:
+                    os.remove(os.path.join(d, PROGRESS))
+                except OSError:
+                    pass
+                os.mkfifo(os.path.join(d, PROGRESS))
+                w(d, "models/a.py", "import time\ntime.sleep(1.8)\nopen('models/a.out', 'w').write('6')\n")
+                t1 = time.time()
+                import threading
+                box = {}
+                th = threading.Thread(target=lambda: box.update(rep=run(d)), daemon=True)
+                th.start()
+                th.join(20)
+                ok(not th.is_alive() and (box.get("rep") or {}).get("steps", [{}])[0].get("status") == "ok",
+                   f"PL15h a FIFO at the progress path does not block the runner ({time.time() - t1:.0f}s, {box})")
+            # i: a timeout_s that is not finite is a validation error (a NaN backstop would never be reached).
+            spec(d, [dict(three[0], timeout_s=float("nan"))] + three[1:])
+            errs_nan = load(d)[1]
+            spec(d, [dict(three[0], timeout_s=float("inf"))] + three[1:])
+            errs_inf = load(d)[1]
+            ok(any("timeout_s" in e for e in errs_nan) and any("timeout_s" in e for e in errs_inf),
+               f"PL15i a NaN or infinite timeout_s is refused: {errs_nan} {errs_inf}")
+            spec(d, [dict(three[0], timeout_s=1)] + three[1:])
+            # PL15j-l (Codex round 3 on #267, 3 P1):
+            # j: the progress record alone (also through a link) never satisfies a step's input glob: it is missing.
+            for f_ in ("cfg.json",):
+                try:
+                    os.remove(os.path.join(d, f_))
+                except OSError:
+                    pass
+            _write_json(d, PROGRESS, {"steps": {}})
+            os.makedirs(os.path.join(d, "lnk"), exist_ok=True)
+            try:
+                os.symlink(os.path.join(d, PROGRESS), os.path.join(d, "lnk", "p.json"))
+            except OSError:
+                pass
+            fpj = fingerprint({"id": "j", "run": "true", "inputs": ["*.json", "lnk/*.json"], "outputs": ["x"]}, d)
+            ok(sorted(fpj["missing_inputs"]) == ["*.json", "lnk/*.json"] and not fpj["inputs"],
+               f"PL15j the progress record (or a link to it) is never an input, and alone it leaves the glob missing: "
+               f"{fpj['missing_inputs']} {fpj['inputs']}")
+            shutil.rmtree(os.path.join(d, "lnk"), ignore_errors=True)
+            # k: a stderr that blocks (a full pipe whose reader stays open) never holds the backstop: the step is
+            # killed at its 3 s backstop although each warning write blocks for 8 s.
+            class _Slow(io.StringIO):
+                def write(self, *a):
+                    time.sleep(8)
+                    return 0
+            w(d, "models/a.py", "import time\ntime.sleep(30)\n")
+            spec(d, [dict(three[0], timeout_s=1)] + three[1:])
+            real_err, t1 = sys.stderr, time.time()
+            sys.stderr = _Slow()
+            try:
+                rep = run(d)
+            finally:
+                sys.stderr = real_err
+            took = time.time() - t1
+            ok(rep["steps"][0]["returncode"] is None and took < 3 + KILL_GRACE_S + 4,
+               f"PL15k a blocking stderr does not delay the backstop kill ({took:.1f}s): {rep['steps'][0].get('error')}")
+            # l: a later step that overwrites the progress record cannot have its bytes certified as the runner's:
+            # the runner republishes its own record before the run ends.
+            w(d, "models/a.py", "import time\ntime.sleep(1.8)\nopen('models/a.out', 'w').write('7')\n")
+            w(d, "models/b.py", "open('pipeline_progress.json', 'w').write('forged')\n"
+                                "v = int(open('models/a.out').read()) + int(open('data/y.csv').read())\n"
+                                "open('models/b.out', 'w').write(str(v))\n")
+            spec(d, [dict(three[0], timeout_s=1)] + three[1:])
+            rep = run(d)
+            try:
+                after = json.load(open(os.path.join(d, PROGRESS)))
+            except (OSError, ValueError):
+                after = {}
+            ok(after.get("pipeline_run") == rep.get("pipeline_run") and "a" in (after.get("steps") or {}),
+               f"PL15l the progress record on disk is the runner's own at the end of the run: {str(after)[:160]}")
+            w(d, "models/b.py", "v = int(open('models/a.out').read()) + int(open('data/y.csv').read())\n"
+                                "open('models/b.out', 'w').write(str(v))\n")
+            # PL15m-p (Codex round 4 on #267, in-scope P1s):
+            # m: a warning thread the OS refuses to start never kills the step.
+            import contextlib
+            import io
+            from unittest import mock as _mock
+            slow = [sys.executable, "-c", "import time; time.sleep(1.5)"]
+            with _mock.patch.object(threading.Thread, "start",
+                                    lambda self: (_ for _ in ()).throw(RuntimeError("can't start new thread"))):
+                try:
+                    res_m = _run_cmd(slow, d, 20, None, soft_s=0.3, on_overrun=lambda el: None)
+                except BaseException as e:  # noqa: BLE001
+                    res_m = e
+            ok(isinstance(res_m, tuple) and res_m[0] == 0,
+               f"PL15m a warning thread that cannot start never kills the step: {res_m!r}")
+            # n: a 'running' report that serialized before the final state never lands after it.
+            real_wj, gate_n = _write_json, threading.Event()
+
+            def slow_wj(run_dir, rel, obj):
+                snap = json.loads(json.dumps(obj))
+                if (snap.get("steps", {}).get("race") or {}).get("state") == "running":
+                    gate_n.set()
+                    time.sleep(1.0)
+                return real_wj(run_dir, rel, snap)
+            t_n = time.time()
+            with _mock.patch.dict(globals(), {"_write_json": slow_wj}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                th_n = threading.Thread(target=_progress_record, daemon=True,
+                                        args=(d, {"id": "race", "run": "x"}, 1.0, 3.0, t_n, 2.0, None, "running"))
+                th_n.start()
+                gate_n.wait(5)
+                _progress_record(d, {"id": "race", "run": "x"}, 1.0, 3.0, t_n, 2.5, None, "ok")
+                th_n.join(5)
+            try:
+                st_n = (json.load(open(os.path.join(d, PROGRESS))).get("steps") or {}).get("race", {}).get("state")
+            except (OSError, ValueError):
+                st_n = None
+            ok(st_n == "ok", f"PL15n a late 'running' report never replaces the final state on disk: {st_n}")
+            # o: output that is not UTF-8 never hides the resumable kill message.
+            junk = [sys.executable, "-c", "import sys, time; sys.stderr.buffer.write(b'\\xff\\xfe'); "
+                                          "sys.stderr.flush(); time.sleep(30)"]
+            try:
+                res_o = _run_cmd(junk, d, 2, None)
+            except BaseException as e:  # noqa: BLE001
+                res_o = e
+            ok(isinstance(res_o, tuple) and res_o[0] is None and res_o[1].startswith("timed out after "),
+               f"PL15o non-UTF-8 output never hides the resumable kill message: {res_o!r}")
+            # p: an accepted finite timeout far beyond the OS poller's limit (30 days) never kills the step at once.
+            try:
+                res_p = _run_cmd([sys.executable, "-c", "pass"], d, backstop_s(2592000.0), None,
+                                 soft_s=2592000.0, on_overrun=lambda el: None)
+            except BaseException as e:  # noqa: BLE001
+                res_p = e
+            ok(isinstance(res_p, tuple) and res_p[0] == 0,
+               f"PL15p a 30-day soft deadline never kills a step at once: {res_p!r}")
+            # PL15: past the backstop it is killed, and reads as a timeout (stage_machine.resumable_failure).
+            w(d, "models/a.py", "import time\ntime.sleep(30)\n")
+            t1 = time.time()
+            spec(d, [dict(three[0], timeout_s=1)] + three[1:])
+            rep = run(d)
+            ok(rep["steps"][0]["returncode"] is None and time.time() - t1 < 15
+               and rep["steps"][0]["error"].startswith("timed out after ") and "backstop" in rep["steps"][0]["error"],
+               f"PL15 a step past its backstop is killed: {rep['steps']}")
+            # PL15b (v2 analyze timeout, 2026-11-02): a process that left the step's group (as compute.py's pool
+            # processes do) and keeps its pipes open must not hang the runner after the kill.
+            w(d, "models/a.py", "import subprocess, sys, time\n"
+                                "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)\n"
+                                "open('models/a.pid', 'w').write(str(c.pid))\ntime.sleep(30)\n")
+            t1 = time.time()
+            rep = run(d)
+            took = time.time() - t1
+            try:
+                os.kill(int(open(os.path.join(d, "models", "a.pid")).read()), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+            ok(rep["steps"][0]["returncode"] is None and took < 3 + KILL_GRACE_S + 10,
+               f"PL15b a timed-out step whose escaped child holds its pipes ends within the grace ({took:.0f}s)")
+            # PL15d: a compute step's batch runs to the backstop, not the soft deadline.
+            got, real_run_cmd = [], g_["_run_cmd"]
+            g_["_run_cmd"] = lambda cmd, cwd, t, env, shell=False, **k: got.append((cmd, t, k.get("soft_s"))) or (0, "")
+            try:
+                _exec_step({"id": "k", "run": "compute: models/k.py::f", "inputs_jsonl": "models/k.jsonl",
+                            "out": "models/k.out", "purpose": "p"}, d, backstop_s(1.0), None, soft_s=1.0)
+            except TypeError as e:
+                got.append(repr(e))
+            finally:
+                g_["_run_cmd"] = real_run_cmd
+            cmd = got[0][0] if got and isinstance(got[0], tuple) else []
+            ok(cmd and cmd[cmd.index("--timeout-s") + 1] == "3.0" and got[0][1:] == (63.0, 1.0),
+               f"PL15d a compute step's batch gets the backstop as its wall limit: {got}")
+        finally:
+            g_.update(saved)
         ok("AZURE_CLIENT_SECRET" not in script_env({"AZURE_CLIENT_SECRET": "s", "HOME": "/h"}),
            "PL16 steps run without cloud credentials")
         # Scratch mode: runs in a copy; the run dir is untouched.
@@ -2110,7 +2488,12 @@ def _self_test() -> int:
            f"PR3 (review #2) a failed step's previous outputs are restored and it stays stale: {rep['steps']}")
         w(d, "models/b.py", "import time\nopen('models/b.out', 'w').write('partial')\ntime.sleep(30)\n")
         spec(d, [three[0], dict(three[1], timeout_s=1), three[2]])
-        rep = run(d)
+        saved = globals().get("BACKSTOP_FLOOR_S")
+        globals()["BACKSTOP_FLOOR_S"] = 0.0          # killed at its 3 s backstop (PL15a)
+        try:
+            rep = run(d)
+        finally:
+            globals()["BACKSTOP_FLOOR_S"] = saved
         ok(rep["steps"][0]["returncode"] is None and rd(d, "models/b.out") == good,
            f"PR4 (review #2) a killed step's previous outputs are restored: {rep['steps']}")
         # Anti-laundering: a hand edit is not restored as a good output.

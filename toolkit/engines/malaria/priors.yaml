@@ -131,6 +131,18 @@ priors:
       taken as equal). Mechanism: LLINEUP p. 1298, PBO in nets withdrawn at 12 months was below the manufacturers'
       minimum target in 80% of PermaNet 3.0 and 90% of Olyset Plus. Uniform: 0 is the engine's point value and a
       triangular mode there would contradict the evidence"
+  net_deter_sat:
+    dist: uniform
+    range: [0.0, 1.0]
+    source: "v0.18 (F6 option A, owner 2026-11-18, form P): the domain of the parameter itself. 1 is Churcher et al.
+      2016 eLife 10.7554/eLife.16090 (PMC5025277) Equations 4 and 8 as published (a PBO net is a pyrethroid net at the
+      higher bioassay mortality, its entry from Equation 8 at that hut mortality); 0 gives a PBO net a pyrethroid
+      net's entry at the same mortality and keeps PBO's hut mortality. No source in hand measures entry at the
+      near-saturated hut mortality (0.88-0.93) a PBO net reaches above bioassay mortality 0.3, so the whole domain is
+      the prior; the PBO trials inform it through the net-effect fit (benchmarks/net_effect_fit.py)"
+    verified: unverified
+    note: "uniform over the domain: no evidence sets a mode. Confounded with pbo_gain_scale at the trial sites (both
+      move a PBO net's killing per attempt); the fit output reports their joint posterior"
   dw_moderate:
     dist: triangular
     range: [0.032, 0.074]

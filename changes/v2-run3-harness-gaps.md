@@ -1,0 +1,8 @@
+---
+phase: "F6"
+commit: "R3 α–σ"
+---
+
+## Changelog
+
+**Three v2 machine gaps F6 run 3 exposed (it ended budget_exhausted); the spec-proposal gap is its own PR.** (1) Write-up findings (owner state WRITE or PRESENTATION) are no longer FIX_LOOP tasks, which may edit only analysis_settings.yaml and models/ext/ and so could never pass their checks: `agents/fix_loop.py` moves them out of the planner's packet (`write_up`) and refuses a task naming one, and the machine passes them, with their remedies, to the writer (`write(..., findings=)`); a loop left with only write-up findings and a draft goes to WRITE. (2) A finding whose `fix_requires` starts "Owner amendment:" (the critique prompt asks for that prefix) is the owner's, on every gate route and from the fix loop: the machine writes `scope_signoff_request.json` in scripts/scope_signoff.py's format and goes to OWNER_DECISION (new edge FIX_LOOP -> OWNER_DECISION), which only the owner's answers to every item release (`scope_signoff.py sign --by owner`); the machine then records them (`harness_record`), and the findings ledger counts only recorded owner answers bound to the finding's claim and remedy (`answer_fingerprint`), so a revised finding is asked again. A decline holds the gate: a decision that would accept or declare is not accepted, and the run ends `completed_scope_declined`. (3) A paid task whose allowance is below `MIN_TASK_ALLOWANCE_USD` ($0.50) is not started: the run pauses `paused:awaiting_budget` (exit 2), and `main.py --v2 --resume <run> --max-budget-usd <higher>` raises the cap (recorded in the history) and continues. Self-tests F17-F18, R3-1, R3-3-R3-5, L17 and PS1 failed first.
