@@ -200,9 +200,17 @@ def parse_task_skill_paths(agents_dir: str) -> set[str]:
     for fn in sorted(os.listdir(agents_dir)):
         if fn.endswith(".py"):
             try:
-                found.update(_SKILL_PATH.findall(open(os.path.join(agents_dir, fn)).read()))
+                src = open(os.path.join(agents_dir, fn)).read()
             except OSError:
                 continue
+            try:                       # a path in a comment is no attachment: drop comment tokens first
+                import io
+                import tokenize
+                toks = [t for t in tokenize.generate_tokens(io.StringIO(src).readline) if t.type != tokenize.COMMENT]
+                src = tokenize.untokenize(toks)
+            except (tokenize.TokenError, SyntaxError, IndentationError):
+                pass
+            found.update(_SKILL_PATH.findall(src))
     return found
 
 
@@ -356,6 +364,7 @@ def _run_self_test() -> int:
                 '    # a comment that mentions skill-x but not as a real ref\n'
                 '    "asta-literature-search",\n'
                 ']\n'
+                '# old reference: .claude/skills/skill-x/SKILL.md\n'
             )
         r5 = validate(d)
         ok(set(r5["attached"]) == {"alpha", "beta", "asta-literature-search"},

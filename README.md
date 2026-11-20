@@ -22,7 +22,7 @@ shares with it. These shared parts remain:
 - the rigor scripts it runs, described below;
 - the skills.
 
-Old v1 run directories stay readable: their `metadata.json` says `pipeline: v1`, and they are never resumed.
+Old v1 run directories stay readable and are never resumed. Their `metadata.json` says `pipeline: v1`; runs from before 2026-11-05 carry no `pipeline` field and are recognised by having no `run_state.json`.
 
 ## v2: the stage machine
 

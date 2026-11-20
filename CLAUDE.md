@@ -14,8 +14,8 @@ optimization, decision rules, sensitivity analyses) for public-health
 questions in any disease area: for example "How should a national
 program allocate its malaria budget across districts?", "Where should
 measles campaigns run next year?", or "Which TB case-finding package
-should each district get?". One pipeline runs; a retired one remains in
-the tree until it is deleted:
+should each district get?". One pipeline runs; the other is retired and
+its code removed:
 
 - **v1 (retired by the owner on 2026-11-20)**: a **lead** agent chained
   the stages PLAN → DATA → MODEL → ANALYZE → CRITIQUE → GATE → WRITE,
@@ -154,10 +154,9 @@ local SKILL.md), allowed via `_MCP_SKILLS`.
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
 
-`awaiting_signoff` (the decision brief) and `awaiting_scope_signoff` (Phase 49
-β: declarations of findings that bear on the primary decision) are resumable
-with `--resume` once signed; `completed_scope_declined` means the owner
-declined such a declaration and no rounds were left to fix it.
+`awaiting_signoff`, `awaiting_scope_signoff` and `completed_scope_declined`
+are statuses of the retired v1 pipeline: old run records may hold them, and
+those runs are never resumed.
 A v2 run prints `paused:<reason>` when its state machine
 stops for the owner, at SIGN (the decision spec: `python3
 agents/stage_machine.py sign <run_dir> --by owner`) or at OWNER_DECISION

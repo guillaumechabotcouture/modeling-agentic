@@ -94,16 +94,14 @@ def _self_test_pipeline(ok, _outcome) -> None:
     import tempfile
     g = globals()
     calls: list = []
-    saved = {k: g.get(k) for k in ("main_v2", "run", "create_run_dir", "store_run_results", "run_preflight")}
+    # PV7d: the lead session's entry point is gone with v1 (checked before any stub is installed).
+    ok("run" not in g, "PV7d main.py has no lead-session entry point (main.run)")
+    saved = {k: g.get(k) for k in ("main_v2", "create_run_dir", "store_run_results", "run_preflight")}
     saved_argv = sys.argv
 
     def fake_v2(args, ident=None):
         calls.append(("v2", ident))
         return 0
-
-    async def fake_run(*a, **kw):
-        calls.append(("v1", kw.get("identity")))
-        return "completed"
 
     def drive(*argv):
         calls.clear()
@@ -118,7 +116,7 @@ def _self_test_pipeline(ok, _outcome) -> None:
         return {"ok": False, "problems": ["self-test"], "sdk_version": "-"}
 
     try:
-        g["main_v2"], g["run"], g["run_preflight"] = fake_v2, fake_run, no_preflight
+        g["main_v2"], g["run_preflight"] = fake_v2, no_preflight
         rc = drive("--signoff", "lead", "--max-budget-usd", "35", "Q?")   # the eval config's flags that day
         ok(rc == 0 and [c[0] for c in calls] == ["v2"], f"PV1 no pipeline flag runs v2 ({rc}, {calls})")
         ok(calls and calls[0][1] and calls[0][1].get("pipeline") == "v2"
@@ -162,8 +160,6 @@ def _self_test_pipeline(ok, _outcome) -> None:
                 rc = drive("--resume", rp)
             ok(rc == 1 and not calls and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
                f"PV7c a v1 eval run is refused as retired ({rc}, {err.getvalue()[-160:]!r})")
-            # PV7d: the lead session's entry point is gone with v1 (its code was deleted).
-            ok("run" not in g or g.get("run") is fake_run, "PV7d main.py has no lead-session entry point")
             # PV7e (Codex round 2): main_v2 called directly does not resume (or restamp) a run recorded as v1.
             from agents import stage_machine as _sm3
             _sm3.init_run(rp, "Q?")
@@ -615,7 +611,7 @@ def _run_self_test() -> int:
         w("identifiability.yaml", "producer: scripts/identifiability.py\nverdict: CLEAN\n")
         igr.on_post("m2")
         ok(igr.open_events == [] and igr.events[0].get("resolved"),
-           f"IR2 producer rewrite resolves it; the run is not tampered: {igr.events}")
+           f"IR2 a producer rewrite resolves the violation and leaves none open: {igr.events}")
         w(REPORT_NAME, '{"producer": "agents/integrity.py", "violations": []}')
         igr.final_check()
         igr.on_pre("m3", "Bash", {"command": f"python3 scripts/identifiability.py {td}"}, "modeler")
@@ -1057,6 +1053,10 @@ def _run_self_test() -> int:
 
     def _fake_query(child_error, lead_writes):
         async def q(prompt, options):
+            # (γ Codex review) the probe session gets the tools a subagent Write needs, as tools and as allowed_tools
+            for _lst in (getattr(options, "tools", None), getattr(options, "allowed_tools", None)):
+                if not (isinstance(_lst, list) and {"Agent", "Write"} <= set(_lst)):
+                    raise AssertionError(f"WD6 the probe's tool lists lack Agent or Write: {_lst}")
             path = re.search(r"file path: (\S+?)\. ", prompt).group(1)
             yield AssistantMessage(content=[_TU("w1", "Write", {"file_path": path, "content": "PREFLIGHT_WRITE"})],
                                    model="m", parent_tool_use_id="a1")
@@ -1084,6 +1084,16 @@ def _run_self_test() -> int:
     finally:
         _preflight_mod.query = _real_query
 
+
+    # OC1-OC2 (γ Codex review): the owner-command restriction is shared: scripts/pipeline.py checks every declared
+    # shell step through enforcement.bash_reason (its SO11-SO13 cases went with the v1 hooks they drove).
+    _oc_run = "runs/x"
+    for _cmd in ("python3 agents/stage_machine.py sign runs/x --by owner",
+                 "python3 toolkit/spec/geometry.py approve runs/x --by owner",
+                 "python3 scripts/decision_brief.py sign runs/x --by lead"):
+        ok(bool(enforcement.bash_reason(_cmd, _oc_run, "modeler")), f"OC1 an owner command is refused: {_cmd}")
+    for _cmd in ("python3 toolkit/spec/geometry.py check runs/x", "python3 toolkit/spec/signoff.py sheet runs/x --write"):
+        ok(enforcement.bash_reason(_cmd, _oc_run, "modeler") is None, f"OC2 an ordinary spec command passes: {_cmd}")
 
     # PF1 (Phase 21 α): preflight evaluation.
     exe = sys.executable
@@ -1226,34 +1236,33 @@ def main() -> int:
     parser.add_argument("--max-rounds", type=int, default=5,
                         help="Max critique-revision rounds (default: 5)")
     parser.add_argument("--max-sessions", type=int, default=10,
-                        help="Max sessions for context recovery (default: 10)")
+                        help="Accepted for existing launch configs; unused by v2 (it capped the retired v1 lead's sessions)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume an existing run directory (e.g., runs/2026-04-07_1523_...)")
     parser.add_argument("--cloud", action="store_true",
                         help="Pass cloud credentials (AZ_*/AZURE_*) to agents so UQ "
                              "can run on Azure Batch. Off by default (Phase 21 α).")
     parser.add_argument("--cross-model", action="store_true",
-                        help="Add the gpt-6.1-sol cross-model critic (Codex CLI) to "
-                             "every STAGE 6. Sends run artifacts to OpenAI.")
+                        help="Accepted for existing launch configs; unused by v2 (it added a cross-model critic to v1's "
+                             "STAGE 6). With --preflight-only, the preflight also checks the Codex login.")
     parser.add_argument("--max-budget-usd", type=float, default=None,
                         help="Hard dollar cap for the whole run (all sessions, including "
                              "earlier invocations of a resumed run). Stops with status "
                              "budget_exhausted; the final gate still runs.")
     parser.add_argument("--methods-critic", action="store_true",
-                        help="Add critique-methods to every STAGE 6. Off by default: in E5 "
-                             "it caught no planted defect the other critics missed.")
+                        help="Accepted for existing launch configs; unused by v2 (it added critique-methods to v1's STAGE 6).")
     parser.add_argument("--signoff", choices=["owner", "lead", "none"], default="owner",
-                        help="Who signs the decision brief before compute (Phase 33): the owner "
-                             "(default; the run waits), the lead (unattended test runs), or none")
+                        help="Who signs the decision spec before compute: the owner (default; the run pauses at SIGN), "
+                             "the lead (unattended test runs), or none")
     parser.add_argument("--signoff-hours", type=float, default=24.0,
-                        help="How long an owner sign-off wait lasts before the run pauses (resumable)")
+                        help="Accepted for existing launch configs; unused by v2 (it timed the retired v1 sign-off wait)")
     parser.add_argument("--self-test", action="store_true",
                         help="Run inline self-tests (no API calls) and exit")
     parser.add_argument("--preflight-only", action="store_true",
                         help="Run the ~1-minute live preflight (real CLI, models, "
                              "PATH, framework imports) and exit")
     parser.add_argument("--skip-preflight", action="store_true",
-                        help="Skip the live preflight before a run (not recommended)")
+                        help="Accepted for existing launch commands; v2 runs no preflight before a run")
     parser.add_argument("--v1", action="store_true",
                         help="Refused: pipeline v1 is retired (owner, 2026-11-20); use v2 (the default).")
     parser.add_argument("--v2", action="store_true",
