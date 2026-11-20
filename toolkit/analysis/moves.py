@@ -164,23 +164,57 @@ SUMMARY = ("units_changed", "share_units_changed", "point_plan_feasible", "point
            "units_changed_by_group", "triggered_by", "decision_changes")
 
 
+TIE_RTOL = 1e-6     # tested values whose regret agrees within this share of the re-optimised objective are tied
+
+
+def worst_regret(rows: list, key: str) -> tuple:
+    """(the tested value reported as worst on `key` (regret or regret_share), the size of its tied set), or (None, 0)
+    when no row has the key. Rows whose value is within TIE_RTOL of the largest are tied with it, and the first of
+    them in the declared order is reported: a solver's noise (seen below 1e-9 of the objective) must not choose the
+    value a result reports, and with it the top-level numbers taken from that value. `regret_share` is already a
+    share of the objective, so the tolerance is TIE_RTOL itself; for `regret` it is TIE_RTOL times the larger
+    re-optimised objective of the two rows (nothing under a zero objective: only equal regrets tie there)."""
+    c = [r for r in rows if r.get(key) is not None]
+    if not c:
+        return None, 0
+    top = max(c, key=lambda r: r[key])
+
+    def scale(r):
+        return 1.0 if key == "regret_share" else max(abs(float(r.get("reoptimised_objective") or 0.0)),
+                                                     abs(float(top.get("reoptimised_objective") or 0.0)))
+    tied = [r for r in c if top[key] - r[key] <= TIE_RTOL * scale(r)]
+    return tied[0], len(tied)
+
+
 def aggregate(rows: list) -> dict:
     """A test's summary over its tested values (compare() rows with `value`): `worst_by_criterion` gives, for the
     share, regret, dollars and population, the worst value with its own coherent summary (Codex r1 P2-3); the
-    top-level numbers are each criterion's worst, the breakdowns those of the value they come from."""
+    top-level numbers are each criterion's worst, the breakdowns those of the value they come from. On regret, values
+    within TIE_RTOL are tied and the first tested value is reported, with `tie: true` and `tied: <how many>` in its
+    worst_by_criterion entry (worst_regret); verdicts and each value's own row do not depend on it."""
     def worst(key):
         c = [r for r in rows if r.get(key) is not None]
         return max(c, key=lambda r: r[key]) if c else None
     rg = [r for r in rows if "regret" in (r.get("triggered_by") or []) and r.get("regret_share") is None]
+    ties = {}
+
+    def wr(name, *keys):
+        for key in keys:
+            r, n = worst_regret(rows, key)
+            if r is not None:
+                ties[name] = n
+                return r
+        return rows[0]
     w = {"share": worst("share_units_changed"),
-         "regret": worst("regret_share") or worst("regret") or rows[0],        # the percentage maximum (Codex r3 P2-3)
-         "regret_abs": worst("regret") or rows[0],                            # the absolute maximum
+         "regret": wr("regret", "regret_share", "regret"),                    # the percentage maximum (Codex r3 P2-3)
+         "regret_abs": wr("regret_abs", "regret"),                            # the absolute maximum
          "dollars": worst("dollars_share") or rows[0],                        # the dollars criterion
          "dollars_reallocated": worst("dollars_reallocated") or rows[0], "dollars_moved": worst("dollars_moved") or rows[0],
          "population": worst("population_changed")}
     if rg:      # a value that fires on regret under a non-positive optimum (no share): its own witness
-        w["regret_nonpositive_optimum"] = max(rg, key=lambda r: r["regret"])
-    wb = {k: dict({f: r.get(f) for f in SUMMARY}, value=r.get("value")) for k, r in w.items()}
+        w["regret_nonpositive_optimum"], ties["regret_nonpositive_optimum"] = worst_regret(rg, "regret")
+    wb = {k: dict({f: r.get(f) for f in SUMMARY}, value=r.get("value"),
+                  **({"tie": True, "tied": ties[k]} if ties.get(k, 0) > 1 else {})) for k, r in w.items()}
     trig = [k for k in ("infeasible",) + CRITERIA if any(k in (r.get("triggered_by") or []) for r in rows)]
     return {"decision_changes": bool(trig), "triggered_by": trig,
             "point_plan_feasible": all(r.get("point_plan_feasible", True) for r in rows),
@@ -408,7 +442,8 @@ def _self_test() -> int:
     def row(value, objective, regret):
         return dict(m, value=value, reoptimised_objective=objective, point_plan_objective_under_test=objective - regret,
                     objective_gap=regret, regret=regret, regret_share=regret / objective if objective > 0 else None,
-                    share_units_changed=0.0, units_changed=0, triggered_by=[], decision_changes=False)
+                    share_units_changed=0.0, units_changed=0, dollars_share=0.0, dollars_moved=0.0,
+                    dollars_reallocated=0.0, triggered_by=[], decision_changes=False)
 
     def witness(rows_, crit="regret"):
         a, err = attempt(aggregate, rows_)
