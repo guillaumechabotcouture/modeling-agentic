@@ -3182,10 +3182,31 @@ def _self_test_durability(ok) -> None:
            f"PD11 a FIFO at the log path never blocks the runner (blocked: {hung}): {got}")
         os.remove(os.path.join(d, log))
         # PD12 (Codex round 1): the runner's own log never counts as a step's declared output.
-        r = one(d, "pass\n", outputs=["models/logs/*.log"])
+        r = one(d, "pass\n", outputs=["models/*/a.log"])
         ok(r.get("status") == "failed" and "not produced" in (r.get("error") or "")
            and os.path.isfile(os.path.join(d, log)),
            f"PD12 a step's log never satisfies a declared output, and a failed step's log is kept: {r}")
+        # PD14 (Codex round 2): an output declared as a step log is refused when the pipeline loads, so no step
+        # (a compute step's `out` is one of its outputs) can replace a log.
+        r = one(d, "pass\n", outputs=["models/LOGS/b.log"])
+        ok("step logs" in (r.get("error") or "") and "log" not in r,
+           f"PD14 a declared output that names a step log is refused at load: {r}")
+        up = os.path.join(d, "models", "LOGS", "a.log")
+        ok(not os.path.exists(up) or _is_step_log(up, d),
+           "PD14b a step log under another spelling of its directory (a case-insensitive volume) is still a step log")
+        # PD15 (Codex round 2): a `<log>.summary.json` beside the log would make compute.py's fingerprint hash the
+        # log as a results file: the step then runs without a log.
+        w(d, log + ".summary.json", "{}")
+        r = one(d, "import sys\nsys.exit(6)\n")
+        ok(r.get("returncode") == 6 and r.get("log_error") and "log" not in r,
+           f"PD15 a results summary beside the log path: the step runs without a log: {r}")
+        os.remove(os.path.join(d, log + ".summary.json"))
+        # PD16 (Codex round 2): a module name that is a link to a step log is never the step's code.
+        os.symlink(os.path.join(d, log), os.path.join(d, "models", "pdalias.py"))
+        w(d, "models/a.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import pdalias\n")
+        cf = code_files({"id": "a", "run": f"{py} models/a.py", "inputs": [], "outputs": ["models/a.out"]}, d)
+        ok(not any(_is_step_log(c, d) for c in cf), f"PD16 a link to a step log is never a step's code: {cf}")
+        os.remove(os.path.join(d, "models", "pdalias.py"))
         # PD13 (Codex round 1): an interrupt during the grace still kills the step's group.
         c = subprocess.Popen([sys.executable, "-c", "import signal, sys, time\n"
                               "signal.signal(signal.SIGTERM, signal.SIG_IGN)\nprint('up', flush=True)\ntime.sleep(60)"],
