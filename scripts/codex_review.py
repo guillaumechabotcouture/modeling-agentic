@@ -101,7 +101,10 @@ mode, root = os.environ["FAKE_MODE"], os.environ["FAKE_ROOT"]
 n = int(open(os.environ["FAKE_COUNT"]).read() or 0) + 1 if os.path.exists(os.environ["FAKE_COUNT"]) else 1
 open(os.environ["FAKE_COUNT"], "w").write(str(n))
 dn, s0 = os.stat("/dev/null"), os.fstat(0)
-open(os.environ["FAKE_ARGS"], "a").write(repr((sys.argv[1:], s0.st_rdev == dn.st_rdev)) + "\n")
+cd = sys.argv[sys.argv.index("-C") + 1]
+diff = os.path.join(cd, "PR.diff")
+seen = {"files": sorted(os.listdir(cd)), "diff": open(diff).read() if os.path.exists(diff) else None}
+open(os.environ["FAKE_ARGS"], "a").write(repr((sys.argv[1:], s0.st_rdev == dn.st_rdev, seen)) + "\n")
 if mode == "hang" or (mode == "hang-once" and n == 1):
     time.sleep(60)
 d = os.path.join(root, time.strftime("%Y/%m/%d"))
@@ -155,11 +158,13 @@ def _self_test() -> int:
 
         def cr1():
             rc, err, n, args, out, dt = go("ok", "ok")
-            a0, stdin_null = args[0]
+            a0, stdin_null, _ = args[0]
             ok(rc == 0 and err is None and n == 1 and open(out).read() == "review ok" and os.path.exists(out + ".log"),
                f"CR1 a session that starts and grows runs to the end once: rc={rc} n={n} err={err}")
-            ok(stdin_null and a0[:3] == ["exec", "--sandbox", "read-only"] and a0[-1] == "review this",
-               f"CR2 codex gets stdin from /dev/null and the read-only sandbox, always: {a0[:3]} stdin_null={stdin_null}")
+            ok(stdin_null and a0[:4] == ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
+               and a0[-1] == "review this",
+               f"CR2 codex gets stdin from /dev/null, the read-only sandbox and --skip-git-repo-check, always: "
+               f"{a0[:4]} stdin_null={stdin_null}")
             rc, err, n, args, out, dt = go("hang-once", "h1")
             ok(rc == 0 and n == 2 and dt < 20, f"CR3 a hung first attempt is killed and retried once: rc={rc} n={n}")
             rc, err, n, args, out, dt = go("hang", "h2")
@@ -172,6 +177,119 @@ def _self_test() -> int:
                 except ValueError:
                     ok(True, f"CR5 an extra argument that changes the sandbox or the session file is refused: {bad}")
         case("CR1-5", cr1)
+
+        # A toy repository: main (c0, then cm on other.py) and a PR branch (c1 a.py, c2 b.py, a merge of main, c3 b.py).
+        repo = os.path.join(d, "repo")
+        os.makedirs(repo)
+
+        def g(*a):
+            return subprocess.check_output(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@example.org",
+                                            "-c", "commit.gpgsign=false", *a], text=True,
+                                           stderr=subprocess.STDOUT).strip()
+
+        def commit(msg, **files):
+            for name, text in files.items():
+                open(os.path.join(repo, name), "w").write(text)
+            g("add", "-A")
+            g("commit", "-q", "-m", msg)
+            return g("rev-parse", "HEAD")
+
+        def toy():
+            g("init", "-q", "-b", "main")
+            commit("c0", **{"a.py": "a = 1\n", "other.py": "o = 1\n"})
+            g("checkout", "-q", "-b", "pr")
+            commit("c1 first", **{"a.py": "a = 2\n"})
+            c2 = commit("c2 second", **{"b.py": "b = 1\n"})
+            g("checkout", "-q", "main")
+            commit("cm base moves", **{"other.py": "o = 2\n"})
+            g("checkout", "-q", "pr")
+            g("merge", "-q", "--no-ff", "-m", "merge main", "main")
+            c3 = commit("c3 third", **{"b.py": "b = 3\n"})
+            open(os.path.join(repo, "untracked.txt"), "w").write("not in the commit")
+            return c2, c3
+        c2 = c3 = None
+        try:
+            c2, c3 = toy()
+        except BaseException as e:  # noqa: BLE001
+            ok(False, f"CR6-15 the toy repository could not be built ({type(e).__name__}: {e})")
+
+        def go_pr(tag, out_dir, mode="ok", **kw):
+            env = {"FAKE_MODE": mode, "FAKE_ROOT": root, "FAKE_COUNT": os.path.join(d, f"n_{tag}"),
+                   "FAKE_ARGS": os.path.join(d, f"a_{tag}")}
+            os.environ.update(env)
+            rc, err, buf = None, None, io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    rc = review_pr(repo, "pr", "main", out_dir, codex=fake, root=root, window_s=3.0, poll_s=0.2, **kw)
+                except SystemExit as e:
+                    err = str(e.code)
+            n = int(open(env["FAKE_COUNT"]).read()) if os.path.exists(env["FAKE_COUNT"]) else 0
+            args = ([eval(x) for x in open(env["FAKE_ARGS"]).read().splitlines()]  # noqa: S307 -- our own fake
+                    if os.path.exists(env["FAKE_ARGS"]) else [])
+            return rc, err, n, args, buf.getvalue()
+
+        def cr6():
+            out_dir = os.path.join(d, "rounds_a")
+            rc, err, n, args, said = go_pr("pr1", out_dir, prompt="look at the units")
+            a0, stdin_null, seen = args[0]
+            cd = a0[a0.index("-C") + 1]
+            ok(rc == 0 and err is None and seen["files"] == ["PR.diff", "a.py", "b.py", "other.py"]
+               and os.path.realpath(cd) != os.path.realpath(repo),
+               f"CR6 codex runs in a clean export of the head commit: tracked files and PR.diff, no .git, nothing "
+               f"untracked: rc={rc} err={err} files={seen['files']}")
+            df = seen["diff"] or ""
+            ok("+a = 2" in df and "+b = 3" in df and "other.py" not in df,
+               "CR7 PR.diff is the PR's own change (base...head): the base's later commits are not in it")
+            ok(stdin_null and "--skip-git-repo-check" in a0 and a0[1:3] == ["--sandbox", "read-only"]
+               and not os.path.exists(cd),
+               f"CR8 the PR review runs read-only with --skip-git-repo-check and stdin from /dev/null, and the export "
+               f"is removed afterwards: stdin_null={stdin_null}")
+            ok(c3 in a0[-1] and "PR.diff" in a0[-1] and a0[-1].rstrip().endswith("look at the units")
+               and open(os.path.join(out_dir, "round-1.md")).read() == "review ok",
+               "CR9 the prompt names the head commit and PR.diff, then the builder's own prompt; the last message is "
+               "round-1.md")
+        case("CR6-9", cr6)
+
+        def cr10():
+            rc, err, n, args, said = go_pr("pr2", os.path.join(d, "rounds_b"), since=c2)
+            a0, _, seen = args[0]
+            df = seen["diff"] or ""
+            ok(rc == 0 and "+b = 3" in df and "-b = 1" in df and "a.py" not in df and "other.py" not in df,
+               f"CR10 narrowed to the commits since a reviewed one, PR.diff holds only the PR's files' changes since "
+               f"it (not earlier commits, not the merged base): rc={rc} err={err}")
+            ok("c3 third" in a0[-1] and "c1 first" not in a0[-1] and c2[:12] in a0[-1],
+               "CR11 the narrowed prompt lists the commits under review and the commit already reviewed")
+            rc, err, n, args, said = go_pr("pr3", os.path.join(d, "rounds_c"), since=g("rev-parse", "main"))
+            ok(rc is None and err and "ancestor" in err and n == 0,
+               f"CR12 a narrowing commit that the PR did not have before the base moved is refused before codex "
+               f"starts: {err}")
+            rc, err, n, args, said = go_pr("pr4", os.path.join(d, "rounds_d"), since="nosuchref")
+            ok(rc is None and err and n == 0, f"CR12b an unknown commit is refused before codex starts: {err}")
+        case("CR10-12", cr10)
+
+        def cr13():
+            out_dir = os.path.join(d, "rounds_e")
+            r = [go_pr(f"cap{i}", out_dir, cap=2) for i in (1, 2, 3)]
+            ok([x[0] for x in r] == [0, 0, None] and r[2][2] == 0 and "round" in (r[2][1] or "")
+               and sorted(os.listdir(out_dir)) == ["round-1.md", "round-1.md.log", "round-2.md", "round-2.md.log"],
+               f"CR13 rounds are counted from the round files; past the cap the review is refused before codex "
+               f"starts: {[x[0] for x in r]} {r[2][1]}")
+            rc, err, n, args, said = go_pr("hung", os.path.join(d, "rounds_f"), mode="hang", cap=1)
+            ok(bool(err) and "hung" in err and next_round(os.path.join(d, "rounds_f"), 1)[0] == 1,
+               f"CR14 a review that hung wrote no round file and does not count as a round: {err}")
+        case("CR13-14", cr13)
+
+        def cr15():
+            calls = []
+
+            def run(argv, **kw):
+                calls.append(list(argv))
+                return '{"headRefOid": "h", "baseRefOid": "b"}' if argv[0] == "gh" else ""
+            got = pr_refs(190, repo, run=run)
+            ok(got == ("h", "b") and calls[0][:4] == ["gh", "pr", "view", "190"]
+               and any(c[0] == "git" and "fetch" in c and "h" in c and "b" in c for c in calls[1:]),
+               f"CR15 --pr asks gh for the head and base commits and fetches both (a fake runner; no network): {calls}")
+        case("CR15", cr15)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
