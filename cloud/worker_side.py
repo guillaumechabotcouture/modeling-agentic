@@ -149,8 +149,12 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
                             p = os.path.join(root, fn)
                             # left out: stored, or no room for them; a link to a large file always (as before:
                             # the collector's extraction refuses a link that leaves the run)
-                            if (skip_large or os.path.islink(p)) and os.path.getsize(p) > MAX_RETURN_FILE:
-                                skipped.append((os.path.relpath(p, work), os.path.getsize(p)))
+                            try:
+                                size = os.path.getsize(p)
+                            except OSError:        # a link whose target is gone: archived as the link it is
+                                size = 0
+                            if (skip_large or os.path.islink(p)) and size > MAX_RETURN_FILE:
+                                skipped.append((os.path.relpath(p, work), size))
                                 continue
                             t.add(p, arcname=os.path.relpath(p, work))
                 t.add(log_path, arcname="run.log")
@@ -587,7 +591,11 @@ def store_transcripts(d, store, prefix, launch_id, label, account, secrets, home
     os.makedirs(d, exist_ok=True)
     # `store` is the launched tree's results_store, which may be older than this file (a pinned tree): `strict`
     # only where it exists. A fresh staging name, then a rename: a link left at transcripts.tar.gz is replaced.
-    kw = {"strict": True} if "strict" in inspect.signature(store.write_archive).parameters else {}
+    try:
+        inspect.signature(store.write_archive).bind_partial(strict=True)
+        kw = {"strict": True}
+    except TypeError:
+        kw = {}
     tmp = f"{d}/.transcripts.{uuid.uuid4().hex}.tmp"
     try:
         store.write_archive(home, "transcripts", tmp, list(secrets), **kw)
