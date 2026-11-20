@@ -5,7 +5,7 @@ Planted-defect regression eval for the deterministic gates (runs in CI).
 E5 measured which defects the gates catch by planting known defects in real
 run fixtures. Those fixtures are 100-400 MB of gitignored run output, so
 they can't run on every pull request. This eval uses the same planter
-(scripts/plant_defects.py) and matcher (scripts/score_critiques.py) on the
+(scripts/plant_defects.py; E5's lexical matcher, scripts/score_critiques.py, was removed with v1) on the
 synthetic positive-control run (scripts/lib/positive_control.py), which is
 built from code in seconds:
 

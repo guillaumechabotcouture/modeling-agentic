@@ -1,9 +1,14 @@
 # Retiring pipeline v1: inventory and deletion plan
 
 The owner retired pipeline v1 on 2026-11-20. PR #292 (α) makes every path that would start or resume v1
-refuse with "pipeline v1 is retired (owner, 2026-11-20); use v2". This document lists what only v1 uses,
-what v2 shares, and what each delete PR removes. Old v1 run directories stay readable: their
-`metadata.json` says `pipeline: v1`, and the gates and the review tools still read their files.
+refuse with "pipeline v1 is retired (owner, 2026-11-20); use v2". The refusal takes effect only when #292
+lands: this tooling PR (β) is independent of it, and the orchestration PR (γ) is stacked on both. This document
+lists what only v1 uses, what v2 shares, and what each delete PR removes.
+
+Old v1 run directories stay readable. Their `metadata.json` says `pipeline: v1`; runs from before
+2026-11-05 carry no `pipeline` field. `pipeline_id.label` reads those as `unknown`, and `resume_conflict`
+judges them by their files: a directory without `run_state.json` is v1's. The gates and the review tools
+still read their files.
 
 ## Method
 
@@ -21,7 +26,8 @@ what v2 shares, and what each delete PR removes. Old v1 run directories stay rea
   every other tracked `.py` file. A name counts as v1-only when every file that uses it is v1-only code.
 - **Strings.** String literals that name a `.py` file were recorded as edges too, then checked by hand.
   Most are mentions in docstrings. The ones that actually run or load a file are listed in the tables:
-  - the validator and its gates, run by the legacy gate;
+  - the validator and the checks it invokes, run by the legacy gate (`stage_machine.legacy_gate`);
+  - `scripts/golden_traces.py` and `scripts/gate_replay.py`, test drivers that invoke the validator on stored runs;
   - `replay.deterministic_critic`, called by `regression_eval.py`;
   - `replay_coiled.py`, loaded by `cloud/run_cluster.py` RC60f.
 - **Launch flags.** `cloud/worker_side.py` passes `--max-sessions` to every run, and configs pass
@@ -29,19 +35,23 @@ what v2 shares, and what each delete PR removes. Old v1 run directories stay rea
 
 ## Constraints from v2
 
-- `agents/stage_machine.py` reads the source of `_recompute_action` in `scripts/validate_critique_yaml.py`
-  (AWAIT_OWNER). That function and everything it calls are shared.
+- `scripts/validate_critique_yaml.py` `_recompute_action` is shared, together with everything it calls. The live call
+  chain is `stage_machine.v2_gate` (around line 450), then `_incorporate_rigor_violations`, then `_recompute_action`.
+  `stage_machine._owner_rule` also reads the function's source (AWAIT_OWNER), but only once `OWNER_LIFECYCLE_WIRED`
+  is true; it is false today.
 - The v2 legacy gate mode (`stage_machine.legacy_gate`) runs the STAGE 7 validator with the final gate's
-  flags through `agents/run_finish.gate_command`. The validator, every gate it runs, and `gate_command`
-  are therefore shared. This covers `open_problems`, `spec_compliance`, `presentation_pass`, `data_schema`,
-  `cross_model_critic` and the rest of `scripts/`.
+  flags through `agents/run_finish.gate_command`. The validator, the checks it invokes, and `gate_command` are
+  therefore shared. That covers `open_problems`, `spec_compliance`, `presentation_pass` and `data_schema`.
+  `cross_model_critic` produces an artifact the validator reads (`critique_crossmodel.yaml`), and the validator
+  reports when it is missing.
 - Importing any `agents.*` module runs `agents/__init__.py`. Today that file imports all eleven v1 prompt
   modules and puts `scripts/` on `sys.path`. The slimmed package must keep the `sys.path` line so v2
   imports resolve as before (`run_finish.store_run_results`, for one, imports `results_store` from there).
-- **Fingerprint.** `scripts/compute.py` `code_fingerprint` hashes `scripts/`, `toolkit/` and the requirements
-  files. Any delete PR that touches `scripts/` gives a merged tree a new fingerprint, so its engine
-  rows do not reuse rows computed on an older tree. PR #292 touches `scripts/` too. Merge timing is the
-  owner's call: for example, after the F6 run's reuse window closes.
+- **Fingerprint.** `scripts/compute.py` `code_fingerprint` hashes the code content of `scripts/` and `toolkit/` and
+  the requirements files. It leaves out `scripts/lib/code_commit.txt` and, in `compute.py` itself, the designated
+  dispatch changes. A PR that changes fingerprinted content gives a merged tree a new fingerprint, so its engine
+  rows do not reuse rows computed on an older tree. This PR's deletions under `scripts/` do that, and so does #292.
+  Merge timing is the owner's call: for example, after the F6 run's reuse window closes.
 - This retirement stays out of `agents/stage_machine.py`, `toolkit/analysis/figures.py`,
   `toolkit/analysis/run.py` and `scripts/results_store.py`, which other work is changing now.
 
@@ -61,8 +71,8 @@ Each is imported only by the others in this list, except where noted.
 | `scripts/score_critiques.py` | 426 | E5 critic-arm matcher | none (`regression_eval.py` names it only in its docstring) |
 | `scripts/telemetry.py` | 259 | per-turn table from the lead and subagent transcripts | `replay.py` |
 | `agents/output_caps.py` | 272 | E2 history-growth levers for `replay.py` | `replay.py` |
-| `scripts/sdk_scenarios.py` | 598 | Claude CLI kill, resume and cap scenarios for the lead session | `docs/experiments/launchers/dev_vm.py` (archived) |
-| `scripts/watch_run.py` | 154 | follows `status.json` that `agents/observability.py` (v1 heartbeat) uploads | none |
+| `scripts/sdk_scenarios.py` | 598 | Claude CLI kill, resume and cap scenarios for the lead session | archived launchers: `docs/experiments/launchers/dev_vm.py`, and `e7r7_cluster.py`, which refuses to launch without it |
+| `scripts/watch_run.py` | 154 | follows `status.json` that `agents/observability.py` (v1 heartbeat) uploads | archived: `docs/experiments/launchers/e7r7_cluster.py` requires it in its tarball |
 
 Total: 9 files, 3,938 lines. The edits elsewhere are small:
 - `regression_eval.py` holds `deterministic_critic` (R6);
@@ -70,8 +80,8 @@ Total: 9 files, 3,938 lines. The edits elsewhere are small:
 - `self_tests.py` drops `output_caps` and the `replay_coiled` exemption;
 - `write_audit.py` and `import_audit.py` drop the deleted files and recount the moved sites.
 
-The experiment write-ups under `docs/experiments/` and `experiments/` keep their references: they record
-what ran.
+The experiment write-ups under `docs/experiments/` and `experiments/`, and the archived launchers, keep their
+references: they record what ran. Reproducing E1, E2, E5 or E7 needs a checkout from before the retirement.
 
 ### Deleted in the orchestration PR (v1 retirement γ, stacked on #292 and β)
 
@@ -83,7 +93,7 @@ what ran.
 | `agents/observability.py` | 440 | heartbeat and `status.json` of the lead session; imported only by `main.run` |
 | `agents/__init__.py` registry | ~440 of 457 | `build_agents`, `_registry`, skill selection, the lead prompt and hook re-exports; the package keeps its docstring and the `scripts/` `sys.path` line |
 | `agents/run_finish.py`, v1 part | ~700 of 829 | `finalize_run`, `final_writeup`, `presentation_fix_pass`, `run_final_gate`, `determine_status`, report restore, verdict banner, model card write. Kept: `gate_command`, `VALIDATOR`, `exit_code_for` and its status sets, `store_run_results`, `_store_blob_name`, `detect_current_round` |
-| `main.py`, v1 part | ~2,100 | `run()` and its helpers (resume context, sign-off waits, the lead's brief answers), and the self-test cases of the code above. Kept: `main()` with every flag, `main_v2`, `run_v2_and_store`, `eval_refusal`, `create_run_dir`, the PV, EV and ST cases, and the cases that test kept shared modules (enforcement, integrity, run budget) |
+| `main.py`, v1 part | ~2,100 | `run()` and its helpers (resume context, sign-off waits, the lead's brief answers), and the self-test cases of the code above, including PV9 (it tested `_restore_protected_meta`, the v1 finalizer's helper, which goes). Kept: `main()` with every flag, `main_v2`, `run_v2_and_store`, `eval_refusal`, `create_run_dir`, the other PV cases, the EV and ST cases, and the cases that test kept shared modules (enforcement, integrity, run budget) |
 | `scripts/validate_skill_attachments.py` | edit | it parses the attachment matrix in `agents/__init__.py`. With the registry gone it checks frontmatter and the skills v2 loads (`decision-spec`), and every skill becomes unattached |
 | README.md, CLAUDE.md | edit | the v1 description (agents table, STAGE 7 walkthrough, CLI rows) becomes a short historical note |
 
@@ -94,13 +104,13 @@ validate_skill_attachments, docs) are what reviewers need to read.
 
 | File or part | Why it stays |
 |---|---|
-| `agents/integrity.py` (1,319) | the hash record of protected run artifacts. At run time only the v1 hooks and `run_finish` feed it, but `scripts/pipeline.py` (shared: v2 calls `pipeline.validate` and `run`) takes an `integrity` argument, and its `harness_build` and PO self-tests are written against `ArtifactIntegrity`. Removing it means re-specifying `pipeline.py`'s grant model. |
+| `agents/integrity.py` (1,319) | the hash record of protected run artifacts. At run time only v1 code writes to it: the hooks; `run_finish`; `main.run`, which closes the session; `run_session.log_message`, which records task starts and ends; and `run_budget.write_budget_ledger`, which credits ledger writes through the object it is passed. But `scripts/pipeline.py` (shared: v2 calls `pipeline.validate` and `run`) takes an `integrity` argument, and its `harness_build` and PO self-tests are written against `ArtifactIntegrity`. Removing it means re-specifying `pipeline.py`'s grant model. |
 | `scripts/pipeline.py` `harness_build` | v1-only callers (`hooks.py`, `run_finish._rebuild_derived`). It goes with `integrity.py`. |
-| `agents/enforcement.py`: `check_tool_use`, the owner-command and kill policies and their helpers | the v1 agents' permission policy; its only runtime caller is `hooks.py`. The module is shared: v2 uses `deny_output`, `filtered_env`, `MODEL_*`, `REPO_ROOT` and `HARNESS_FILES`, and `scripts/pipeline.py` uses `bash_reason`, `SCRIPT_OUTPUTS` and `OWNED_BY`. Its tests live in `main.py`'s self-test and stay with it. |
+| `agents/enforcement.py` `check_tool_use` | the v1 agents' permission entry point; its only runtime caller is `hooks.py`. Everything it reaches through `bash_reason` is shared: the owner-command and kill policies (`owner_command_reason`, `kill_reason`) and their helpers, because `scripts/pipeline.py` checks every shell step through `_bash_refusal`, which calls `bash_reason`, which calls them. The rest of the module is shared too: v2 uses `deny_output`, `filtered_env`, `MODEL_*`, `REPO_ROOT` and `HARNESS_FILES`, and `pipeline.py` uses `SCRIPT_OUTPUTS` and `OWNED_BY`. Its tests live in `main.py`'s self-test and stay with it. |
 | `agents/run_preflight.py`, `agents/run_session.py` (`LEAD_TOOLS`) | `main.py --preflight-only` runs this live check of the CLI, models, PATH and framework imports, plus a subagent Write probe. No v2 launcher calls it. It stays until the owner decides whether v2 needs a preflight. |
-| `agents/run_budget.py` | shared: v2 uses the ledger, `charge_session`, `crashed_session_cost`, `RECONCILE_PROMPT` and `writeup_reserve`. Its few v1-only names (`MAX_USD_PER_HOUR`, `TRANSCRIPT_MARGIN`) are small. |
+| `agents/run_budget.py` | shared. v2 uses the ledger, `charge_session`, `RECONCILE_PROMPT` and `writeup_reserve`; its own single, capped read-back is `v2_sdk_tasks` around line 496. `crashed_session_cost` is v1 runtime code (`main.run`), and v2 only names it in a self-test (`v2_sdk_tasks` around line 663), so a cleanup must keep v2's capped read-back. The other v1-only names (`MAX_USD_PER_HOUR`, `TRANSCRIPT_MARGIN`) are small. |
 | `scripts/decision_brief.py`, `scripts/scope_signoff.py`, `scripts/done_when.py`, `scripts/open_problems.py`, `scripts/run_autopsy.py`, `scripts/lessons.py`, `scripts/model_card.py` | used by v2 code (`stage_machine`, `enforcement`), by the shared validator, or by standalone tools (`ask.py`, the lessons ledger) |
-| All 58 skills under `.claude/skills/` | v2 loads `decision-spec`, `tools/run_console` reads `critique-blockers-schema`, and Claude Code sessions in this repository load the rest directly. No skill is deleted. Once γ deletes the attachment matrix, 44 skills lose their pipeline attachment and remain project skills. |
+| All 58 skills under `.claude/skills/` | v2 loads `decision-spec`, `tools/run_console` reads `critique-blockers-schema`, and Claude Code sessions in this repository load the rest directly. No skill is deleted. Once γ deletes the attachment matrix, 41 of the 58 local skills lose their pipeline attachment and remain project skills; the matrix's other 3 names are external MCP skills. |
 | `.claude/orchestration/*.yaml` | read by the shared validator and by `expert_priors` |
 | `cloud/run_health.py` stall check on `status.json` | a generic monitor rule. v2 runs write no `status.json`. Whether v2 needs a heartbeat is a separate decision. |
 | `docs/experiments/launchers/*` | archived launchers, kept as records |
