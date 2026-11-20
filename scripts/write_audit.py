@@ -277,6 +277,9 @@ REVIEWED: dict = {
     "agents/run_preflight.py": {"shutil": (1, "removes the preflight's own temporary work dir")},
     "scripts/assemble_changes.py": {"open-write": (3, _REPO), "os-remove": (1, _REPO)},
     "scripts/cloud_batch.py": {"open-write": (2, "the operator's local batch files")},
+    "scripts/codex_review.py": {"open-write": (2, "a dev tool the operator runs on the repository, never in a run: "
+                                                  "codex's log next to the review's output, and PR.diff in the "
+                                                  "export (" + _TMP_REASON + ")")},
     "scripts/compute.py": {
         "open-write": (10, "worker init markers, chunk inputs, stderr and the worker's sync record (" + _TMP_REASON + ")"),
         "os-remove": (5, "stale bundle members and pid files on a worker (" + _TMP_REASON + "); the worker's TLS files"),

@@ -7,20 +7,47 @@ read-only (an extra argument that changes either is refused). Within 90 s a new 
 ~/.codex/sessions/<YYYY>/<MM>/<DD>/ and grow; if not, codex is killed and started once more, and a second
 failure exits 1 saying what was seen. The last message goes to --out, everything codex prints to <out>.log.
 
+A pull request review (--pr, or --head with --base) does what builders did by hand: the head commit is exported
+with `git archive` to a temporary directory (tracked files only, no .git, nothing from the working tree), the diff
+under review is written there as PR.diff, and codex runs in that directory with --skip-git-repo-check. The export
+is removed afterwards.
+
+  the diff     `git diff <base>...<head>`: the PR's own change, whatever the base did since.
+  --since SHA  narrow the review to the commits after SHA, a commit on the PR's own (first-parent) line that an
+               earlier round reviewed: PR.diff is then `git diff SHA <head>` over the files the PR changes, so a
+               merge of the base in between adds nothing but its changes to those same files.
+  rounds       each review's last message is <out-dir>/round-<n>.md (default out dir: <git dir>/codex_reviews/
+               <pr-N or head>, shared by all worktrees, never tracked). A round past --max-rounds (default 3) is
+               refused before codex starts; a review that hung or wrote no last message is not a round.
+
+    python3 scripts/codex_review.py --pr 190 [--since SHA] [--prompt-file EXTRA.md] [--max-rounds N] [--out-dir D]
+    python3 scripts/codex_review.py --head REF --base REF [...]
     python3 scripts/codex_review.py --prompt-file PROMPT.md --out review.md [--cd DIR] [-- <extra codex exec args>]
     python3 scripts/codex_review.py --self-test
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 SESSIONS = os.path.expanduser("~/.codex/sessions")
 WINDOW_S = 90.0
+MAX_ROUNDS = 3
+PREAMBLE = """You are reviewing a pull request, read-only. The current directory is a clean export of the head \
+commit {head} (tracked files only, no .git). The file PR.diff holds the changes under review: {scope}. Review only \
+those changes; read any other file for context. Do not modify files and do not use the network.
+
+Report each finding as P1 (a wrong result, lost data, a security problem or a broken contract: fix before merge), \
+P2 or P3, with file:line, what fails and a concrete reproduction. Do not report style. End with one line: \
+"P1: <n>  P2: <n>  P3: <n>".
+"""
 REFUSED = ("-s", "--sandbox", "--dangerously-bypass-approvals-and-sandbox", "--full-auto", "--approve-for-me",
            "--ephemeral", "--add-dir")
 
@@ -31,7 +58,7 @@ def codex_argv(codex, prompt, out, cd, extra=()) -> list:
     bad = [x for x in extra if x.split("=")[0] in REFUSED or any(w in x for w in ("sandbox", "approval", "bypass"))]
     if bad:
         raise ValueError(f"refused codex arguments {bad}: the review always runs read-only with a session file")
-    return [codex, "exec", "--sandbox", "read-only", "-C", cd, "-o", out, *extra, prompt]
+    return [codex, "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-C", cd, "-o", out, *extra, prompt]
 
 
 def sessions(root, clock=time.time) -> dict:
@@ -82,17 +109,114 @@ def review(prompt, out, cd=".", extra=(), codex="codex", root=SESSIONS, window_s
     raise SystemExit(f"codex exec hung twice ({why}); nothing reviewed. Log: {log}")
 
 
+def _out(argv, **kw) -> str:
+    """The command's output; a failure exits (SystemExit) with what the command said."""
+    r = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kw)
+    if r.returncode:
+        raise SystemExit(f"{' '.join(argv[:4])} ... exited {r.returncode}: {r.stderr.strip()[-400:]}")
+    return r.stdout
+
+
+def pr_refs(pr, repo, run=_out) -> tuple:
+    """(head commit, base commit) of pull request `pr`, from gh, both fetched from origin."""
+    doc = json.loads(run(["gh", "pr", "view", str(pr), "--json", "headRefOid,baseRefOid"], cwd=repo))
+    head, base = doc["headRefOid"], doc["baseRefOid"]
+    run(["git", "-C", repo, "fetch", "-q", "origin", head, base])
+    return head, base
+
+
+def pr_diff(repo, base, head, since=None) -> tuple:
+    """(diff text, a sentence saying what it covers). `head`, `base` and `since` are commit ids."""
+    def g(*a):
+        return _out(["git", "-C", repo, *a])
+    if not since:
+        return g("diff", f"{base}...{head}"), f"`git diff {base[:12]}...{head[:12]}`, the pull request's own change"
+    if since not in g("rev-list", "--first-parent", head).split():
+        raise SystemExit(f"--since {since[:12]} is not an ancestor of the head on the pull request's own "
+                         "(first-parent) line; name a commit of this branch that an earlier round reviewed")
+    paths = g("diff", "--name-only", "-z", f"{base}...{head}").split("\0")[:-1]
+    if not paths:
+        raise SystemExit(f"{base[:12]}...{head[:12]} changes no file: nothing to review")
+    log = g("log", "--first-parent", "--format=%h %s", f"{since}..{head}").strip()
+    return g("diff", since, head, "--", *paths), (
+        f"`git diff {since[:12]} {head[:12]}` over the files this pull request changes. An earlier round reviewed "
+        f"the pull request up to {since[:12]}; this round covers only the commits after it:\n{log}\n")
+
+
+def export(repo, sha, dest) -> None:
+    """The tracked files of commit `sha`, unpacked into `dest` (git archive: no .git, nothing untracked)."""
+    ar = subprocess.Popen(["git", "-C", repo, "archive", "--format=tar", sha], stdout=subprocess.PIPE)
+    rc = subprocess.call(["tar", "-x", "-f", "-", "-C", dest], stdin=ar.stdout)
+    ar.stdout.close()
+    if ar.wait() or rc:
+        raise SystemExit(f"git archive {sha[:12]} | tar -x failed (git {ar.returncode}, tar {rc})")
+
+
+def next_round(out_dir, cap=MAX_ROUNDS) -> tuple:
+    """(n, <out_dir>/round-<n>.md) for the next review; past the cap it exits (SystemExit). The rounds done are the
+    round-<n>.md files: codex writes one only when a review finished."""
+    done = [int(m.group(1)) for f in (os.listdir(out_dir) if os.path.isdir(out_dir) else ())
+            for m in [re.fullmatch(r"round-(\d+)\.md", f)] if m]
+    n = max(done, default=0) + 1
+    if n > cap:
+        raise SystemExit(f"review round {n} refused: {len(done)} round file(s) in {out_dir} and the cap is {cap} "
+                         "(--max-rounds). Fix what the last round found, or narrow the claim in the PR body.")
+    return n, os.path.join(out_dir, f"round-{n}.md")
+
+
+def review_pr(repo, head, base, out_dir, prompt="", since=None, cap=MAX_ROUNDS, extra=(), codex="codex",
+              root=SESSIONS, window_s=WINDOW_S, poll_s=5.0) -> int:
+    """One review round of `head` against `base` in a clean export; refusals (an unknown commit, a --since outside
+    the PR's line, a round past the cap) come before codex starts."""
+    def sha(x):
+        r = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", x + "^{commit}"],
+                           stdout=subprocess.PIPE, text=True)
+        if r.returncode:
+            raise SystemExit(f"{x!r} is not a commit in {repo}: nothing reviewed")
+        return r.stdout.strip()
+    head, base, since = (sha(x) if x else None for x in (head, base, since))
+    diff, scope = pr_diff(repo, base, head, since)
+    n, out = next_round(out_dir, cap)
+    os.makedirs(out_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="codex_review_") as tmp:
+        export(repo, head, tmp)
+        with open(os.path.join(tmp, "PR.diff"), "w") as f:
+            f.write(diff)
+        print(f"round {n} of at most {cap}: head {head[:12]}, {len(diff.splitlines())} diff lines, export {tmp}",
+              flush=True)
+        return review(PREAMBLE.format(head=head, scope=scope) + (f"\n{prompt}" if prompt else ""), out, tmp, extra,
+                      codex, root, window_s, poll_s)
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["--self-test"]:
         return _self_test()
     own, extra = (argv[:argv.index("--")], argv[argv.index("--") + 1:]) if "--" in argv else (argv, [])
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--prompt-file", required=True)
-    ap.add_argument("--out", required=True, help="the last message; codex's output goes to <out>.log")
-    ap.add_argument("--cd", default=".", help="the directory codex reviews (read-only)")
+    ap.add_argument("--prompt-file", help="the prompt; in a PR review, text added after the standard prompt")
+    ap.add_argument("--out", help="the last message; codex's output goes to <out>.log (not for a PR review)")
+    ap.add_argument("--cd", default=".", help="the directory codex reviews (read-only; not for a PR review)")
+    ap.add_argument("--pr", type=int, help="review this pull request's head against its base (asks gh, fetches)")
+    ap.add_argument("--head", help="review this commit or ref (with --base), without gh")
+    ap.add_argument("--base", help="the base commit or ref for --head")
+    ap.add_argument("--since", help="narrow the review to the commits after this one (already reviewed)")
+    ap.add_argument("--max-rounds", type=int, default=MAX_ROUNDS, help=f"the round cap (default {MAX_ROUNDS})")
+    ap.add_argument("--out-dir", help="where round-<n>.md goes (default <git dir>/codex_reviews/<pr-N or head>)")
+    ap.add_argument("--repo", default=".", help="the repository (default: the current directory)")
     a = ap.parse_args(own)
-    return review(open(a.prompt_file).read(), a.out, a.cd, extra)
+    prompt = open(a.prompt_file).read() if a.prompt_file else ""
+    if a.pr is None and not a.head:
+        if not (a.prompt_file and a.out):
+            ap.error("give --pr N, or --head REF --base REF, or --prompt-file with --out")
+        return review(prompt, a.out, a.cd, extra)
+    if a.out or (a.pr is not None and (a.head or a.base)) or (a.head and not a.base):
+        ap.error("a PR review takes --pr N alone, or --head with --base; its output goes to --out-dir")
+    head, base = pr_refs(a.pr, a.repo) if a.pr is not None else (a.head, a.base)
+    label = f"pr-{a.pr}" if a.pr is not None else re.sub(r"[^A-Za-z0-9._-]+", "_", a.head)
+    common = os.path.join(a.repo, _out(["git", "-C", a.repo, "rev-parse", "--git-common-dir"]).strip())
+    out_dir = a.out_dir or os.path.join(os.path.abspath(common), "codex_reviews", label)
+    return review_pr(a.repo, head, base, out_dir, prompt, a.since, a.max_rounds, extra)
 
 
 _FAKE = r'''
