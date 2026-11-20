@@ -1959,13 +1959,11 @@ def fig_cost_per_outcome(R, t):
                  + (f"; {len(other)} avert none" if other else ""))
     else:
         title = f"No package in the plan averts {olab}"
-    # first, and short: render cuts a caption at CAPTION_MAX, and this count must be inside it (Codex r4)
-    wh = f" {not_drawn} interval{'' if not_drawn == 1 else 's'} not drawn: an end is not a finite number." \
-        if not_drawn else ""
+    wh = ""
     if withheld:
         sh = [w.get("share_draws_nonpositive") for _k, w in withheld if w.get("share_draws_nonpositive") is not None]
-        wh += (f" {len(withheld)} intervals withheld: {withheld[0][1].get('reason')}"
-               + (f" (up to {FS.fmt(max(sh), 'percent')} of draws)" if sh else "") + ".")
+        wh = (f" {len(withheld)} intervals withheld: {withheld[0][1].get('reason')}"
+              + (f" (up to {FS.fmt(max(sh), 'percent')} of draws)" if sh else "") + ".")
     cap = (f"Top: each package's cost over its {olab} averted in the {U} that get it, with the {lvl:.0%} interval over "
            f"the uncertainty draws.{wh} Bottom: each component against the same package without it.")
     rows = [{"package": k, "label": R.labels.package(R.pk[k]), "status": st[k],
@@ -1978,7 +1976,11 @@ def fig_cost_per_outcome(R, t):
         [{"component": c, "label": R.labels.component(c), "usd_per_outcome_added": 1.0 / v["outcome_per_usd"],
           "units": v["units"], "units_without_counterpart": v.get("units_without_counterpart"),
           "units_with_corrections": v.get("units_with_corrections")} for c, v in inc.items()]
-    return fig, title, cap, rows, "cost per outcome averted by package and by component"
+    # a caption note: render adds it after cutting the caption at CAPTION_MAX, so the count is always published and
+    # the caption itself reads as before (Codex r4, r5)
+    extra = {"caption_note": f" {not_drawn} interval{'' if not_drawn == 1 else 's'} not drawn: an end is not a "
+                             "finite number."} if not_drawn else {}
+    return fig, title, cap, rows, "cost per outcome averted by package and by component", extra
 
 
 def fig_sensitivity(R, t):
