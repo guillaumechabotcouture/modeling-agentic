@@ -217,99 +217,6 @@ def job_pipeline(cmd) -> str | None:
         raise SystemExit(f"{e}{hint}: refusing") from None
 
 
-def retired_tree_problem(cmd, code: bytes | None) -> str | None:
-    """Why a command may not ship with this code, or None: it mentions --v1 anywhere (a wrapper or a module run
-    this launcher cannot parse included) and the shipped tree's main.py predates the v1 retirement, so it would
-    still run v1. A tree at or after the retirement refuses --v1 itself, so its jobs keep the checks they had."""
-    if not _has_v1_token(cmd):
-        return None
-    if code is None:          # code already on the VM (no --tree/--dir): which main.py runs cannot be checked here
-        return (f"the command passes --v1 and ships no code, so this launcher cannot check the VM's main.py; "
-                f"{pipeline_id.RETIRED_MESSAGE}: refusing")
-    src = rc._archive_member(code, "scripts/lib/pipeline_id.py") or b""
-    if b"RETIRED_MESSAGE" in src:
-        return None
-    return (f"the command passes --v1 and the shipped tree's main.py predates the v1 retirement (it would still "
-            f"run v1); {pipeline_id.RETIRED_MESSAGE}: refusing")
-
-
-_SHELL_NAMES = ("sh", "bash", "zsh", "dash")
-_PREFIX_NAMES = ("env", "exec", "command", "nohup", "nice", "time", "timeout", "stdbuf", "setsid",
-                 "do", "then", "else", "elif", "if", "while", "until", "!", "{")   # and shell keywords that start a command
-
-
-def _strip_shell_comments(text: str) -> str:
-    """What a shell runs: an unquoted `#` that starts a word ends its line (`issue#42` is a word)."""
-    out, q, prev, i = [], None, " ", 0
-    while i < len(text):
-        c = text[i]
-        if q:
-            if c == "\\" and q == '"' and i + 1 < len(text):
-                out.append(text[i:i + 2])
-                i, prev = i + 2, "x"
-                continue
-            if c == q:
-                q = None
-        elif c == "\\" and i + 1 < len(text):
-            out.append(text[i:i + 2])
-            i, prev = i + 2, "x"
-            continue
-        elif c in "'\"":
-            q = c
-        elif c == "#" and (prev.isspace() or prev in ";&|()"):
-            while i < len(text) and text[i] != "\n":
-                i += 1
-            continue
-        out.append(c)
-        prev = c
-        i += 1
-    return "".join(out)
-
-
-def _has_v1_token(cmd, depth: int = 0) -> bool:
-    """Whether a command passes `--v1` to a Python program (python ... main.py / -m main / any script; an
-    executable main.py), behind env/exec/nohup/timeout prefixes, or inside a shell wrapper's -c script and its
-    positional arguments. `--v1` must be a whole word, and other programs' arguments do not count (a quoted
-    question that mentions --v1, `grep -- --v1 file`)."""
-    try:
-        if isinstance(cmd, (list, tuple)):
-            argvs = [[str(w) for w in cmd]]
-        else:
-            argvs = pipeline_id._split_commands(_strip_shell_comments(str(cmd)))
-    except (pipeline_id.PipelineError, ValueError):
-        return False         # unreadable: the classification job_pipeline gives it stands
-    for argv in argvs:
-        if argv[:1] == ["command"] and argv[1:2] in (["-v"], ["-V"]):
-            continue                 # `command -v name` is a lookup, not a run
-        while argv and (os.path.basename(argv[0]) in _PREFIX_NAMES or ("=" in argv[0] and not argv[0].startswith("-"))):
-            argv = argv[1:]
-            while argv and (argv[0].startswith("-") or argv[0].rstrip("smhd").replace(".", "").isdigit()):
-                argv = argv[2:] if argv[0] in ("-u", "-C", "-S", "-s", "-k", "-o", "-f", "--unset", "--chdir",
-                                               "--signal", "--output", "--format") else argv[1:]
-        if not argv:
-            continue
-        head = os.path.basename(argv[0])
-        if head.startswith("python") or head == "main.py":
-            opts = argv[1:argv.index("--")] if "--" in argv else argv[1:]   # after `--`, --v1 is a question
-            if any(w == "--v1" or w.startswith("--v1=") for w in opts):
-                return True
-        elif head in _SHELL_NAMES and depth < 3:
-            k = 1
-            while k < len(argv) and argv[k][:1] in "-+" and argv[k] not in ("-", "--"):
-                opt = argv[k]
-                if "c" in opt[1:] and not opt.startswith("--"):
-                    script, positional = (argv[k + 1] if k + 1 < len(argv) else ""), argv[k + 3:]
-                    if _has_v1_token(script, depth + 1) or (
-                            any(w == "--v1" for w in positional) and any(v in script for v in ("$@", "$*", "$1", "$2", "$3"))):
-                        return True
-                    break
-                k += 2 if opt in ("-o", "+o") else 1
-            else:                    # bash script.sh --v1 ...: a script file that may forward its arguments
-                if k < len(argv) and any(w == "--v1" for w in argv[k + 1:]):
-                    return True
-    return False
-
-
 def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
     """The job's extra environment: its secrets, and its launcher's name for main.py's metadata.json."""
     return {**(secrets or {}), "MA_LAUNCHER": f"vm_job:{name}/{job_id}"}
@@ -667,9 +574,6 @@ def cmd_start(a, cluster=None):
         checked = _live_vm_types_ok(a.name)     # and the budget must be able to price every VM it runs
         _budget_gate(a, a.name, reserve=False)
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
-    why = retired_tree_problem(cmd if not (isinstance(cmd, (list, tuple)) and len(cmd) == 1) else cmd[0], code)
-    if why:
-        raise SystemExit(why)
     base = getattr(a, "base_name", a.name)
     secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
                       base, a.job_id)
@@ -994,9 +898,6 @@ def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
     job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
-    why = retired_tree_problem(a.command[0] if len(a.command or ()) == 1 else a.command, a._code)
-    if why:                                # a pre-retirement tree with a --v1 job, before anything is created
-        raise SystemExit(why)
     _vm_request(a)                         # so is a request no priced VM type matches (before the reservation)
     base, unique = a.name, run_cluster_name(a.name, a.job_id)
     meter = _budget_gate(a, unique, meter=True)   # before any listing or cluster; reserved for the exact name it creates
@@ -1317,71 +1218,19 @@ def _self_test_pipeline(ok) -> None:
     ok(jp(["python3", "main.py", "Q?", "--v2"]) == "v2" and jp("bash toolkit/x/validate_once.sh 16") is None
        and jp(["python3 main.py 'Q?' --v2"]) == "v2",
        "VP2 an explicit main.py command gives its pipeline (argv, or one shell string); other commands have none")
-    # VP2c (retirement PR, Codex round 4): a --v1 command this launcher cannot parse (a wrapper, a module run) is
-    # refused when the shipped tree predates the retirement; a retired tree's own main.py refuses it.
-    rtp = g.get("retired_tree_problem")
-    with tempfile.TemporaryDirectory() as tdv:
-        trees = {}
-        for kind, src in (("old", b"PIPELINES = ('v1', 'v2')\n"), ("new", b"RETIRED_MESSAGE = 'x'\n")):
-            d = os.path.join(tdv, kind)
-            os.makedirs(os.path.join(d, "scripts", "lib"))
-            open(os.path.join(d, "scripts", "lib", "pipeline_id.py"), "wb").write(src)
-            open(os.path.join(d, "main.py"), "w").write("x\n")
-            trees[kind] = _tarball(None, d)
-        wrapped = ("bash -c 'python3 main.py \"$1\"' _ --v1", "python3 -um main --v1 Q",
-                   "env -u PYTHONPATH python3 -m main --v1 Q", "bash -c 'for q in a b; do python3 main.py --v1 $q; done'")
-        ok(rtp is not None and all(rtp(c, trees["old"]) and pipeline_id.RETIRED_MESSAGE in rtp(c, trees["old"])
-                                   for c in wrapped),
-           "VP2c a --v1 command in any form is refused when the shipped tree predates the retirement")
-        ok(rtp is not None and not any(rtp(c, trees["new"]) for c in wrapped)
-           and not rtp("python3 main.py Q --v2", trees["old"]) and not rtp(["python3", "main.py", "--v2"], trees["old"]),
-           "VP2d a retired tree is not refused (its main.py refuses --v1), nor a v2 command on an older tree")
-        # VP2e (Codex round 5): behavioural; run and start refuse before a cluster, a reservation or a job exists.
-        import argparse as _ap
-
-        def _boom(*a, **k):
-            raise AssertionError("reached a cluster, a VM request or a job submission")
-        saved_e = {k: g[k] for k in ("_client", "_vm_request", "_create", "job_env")}
-        g.update({k: _boom for k in saved_e})
+    # VP2c (coordinator decision, 2026-11-20): vm_job refuses only a literal main.py --v1 (VP2b) and never a v2
+    # command; a wrapped v1 start (a shell -c string, python -m main, a script) keeps the classification it had before
+    # the retirement. On a tree at or after the retirement, main.py refuses --v1 itself; on an older tree such a start
+    # is not caught here (a documented gap).
+    ok("retired_tree_problem" not in g and "_has_v1_token" not in g, "VP2c vm_job has no wrapper-scanning --v1 check")
+    for cmd in (["bash", "-c", 'case "$1" in v1) python3 main.py --v1 "$2" ;; v2) python3 main.py --v2 "$2" ;; esac',
+                 "_", "v2", "Q"], "python3 main.py --v2 Q && grep -F -- --v1 notes.txt", "python3 main.py --v2 -- --v1",
+                "python3 main.py --v2 'Compare the archived --v1 results'"):
         try:
-            for entry in ("start", "run"):
-                ns = _ap.Namespace(name="x", job_id="j", command=["python3 -m main --v1 Q"], tree=None,
-                                   dir=os.path.join(tdv, "old"), anthropic_key=False)
-                try:
-                    if entry == "start":
-                        ns._code = trees["old"]
-                        cmd_start(ns, cluster=object())
-                    else:
-                        _run_locked(ns, os.path.join(tdv, "dest"))
-                    ok(False, f"VP2e {entry} refuses a --v1 job on a pre-retirement tree")
-                except SystemExit as e:
-                    ok(pipeline_id.RETIRED_MESSAGE in str(e), f"VP2e {entry} refuses before anything is created: {e}")
-                except AssertionError as e:
-                    ok(False, f"VP2e {entry} refuses before anything is created: {e}")
-        finally:
-            g.update(saved_e)
-        ok(rtp("python3 main.py --v2 'How do the estimates compare with the archived --v1 results?'", trees["old"])
-           is None, "VP2f (Codex round 5) a question that mentions --v1 is not a --v1 flag")
-        ok(rtp("python3 -m main --v1 --resume runs/R1", None) and not rtp("python3 main.py --v2 Q", None),
-           "VP2g a --v1 command that ships no code (a reused VM checkout) is refused; a v2 one is not")
-        # VP2h (Codex round 6): shell options before -c, a # inside a word, and --v1 given to another program
-        for cmd, want in (("bash -o pipefail -c 'python3 main.py --v1 Q'", True),
-                          ("python3 -m main --launcher issue#42 --v1 Q", True),
-                          ("python3 main.py --v2 Q && grep -F -- --v1 archived-commands.txt", False),
-                          ("python3 main.py --v2 Q # once ran with --v1", False),
-                          ("env A=1 timeout 60 python3 -u main.py --v1", True),
-                          # Codex round 7
-                          ("python3 main.py --v2 -- --v1", False),
-                          ("/usr/bin/time -o timing.txt python3 -m main --v1 Q", True),
-                          ("bash launch.sh --v1 Q", True),
-                          # VP2i (narrow pass): `--` ends main.py's options for --v1= too; a quoted # keeps word
-                          # boundaries; `command -v` is a lookup
-                          ("python3 main.py --v2 -- --v1=baseline", False),
-                          ("""bash -c 'python3 -m main --v2 --launcher "#42" "Compare --v1 results"'""", False),
-                          ("command -v python3 --v1; python3 main.py --v2 Q", False)):
-            got = bool(rtp(cmd, trees["old"]))
-            ok(got == want, f"VP2h {cmd!r}: the retirement check {'refuses it' if want else 'returns no problem'} on a "
-                            f"pre-retirement tree (got {got})")
+            got = jp(cmd)
+            ok(got in (None, "v2"), f"VP2d a v2 command is never refused: {cmd!r} gave {got}")
+        except SystemExit as e:
+            ok(False, f"VP2d a v2 command is never refused: {cmd!r}: {e}")
     for cmd in (["python3 main.py 'Q?' --v1"], ["python3", "main.py", "--v1", "--resume", "runs/R1"]):
         try:
             got = jp(cmd)

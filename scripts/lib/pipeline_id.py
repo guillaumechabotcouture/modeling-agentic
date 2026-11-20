@@ -347,8 +347,8 @@ def _self_test() -> int:
     except PipelineError as e:
         ok(str(e) == RETIRED_MESSAGE, f"PI29b a command with a second main.py --v1 call is refused as retired: {e}")
     # PI39 (retirement PR, Codex rounds 1-4): main.py run directly with --v1 is refused here; a module run or a
-    # shell wrapper keeps the classification it had before (None): shipping a tree whose main.py still accepts
-    # --v1 is refused by cloud/vm_job.py (retired_tree_problem), and a retired tree's main.py refuses --v1 itself.
+    # shell wrapper keeps the classification it had before (None). A retired tree's main.py refuses --v1 itself; on
+    # a tree from before the retirement a wrapped v1 start is not caught (a documented gap).
     for cmd in ("python3 main.py --v1 Q", ["python3", "./main.py", "Q", "--v1"], "cd x && python3 main.py Q --v1 > log"):
         try:
             got = from_command(cmd)
