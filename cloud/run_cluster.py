@@ -4013,11 +4013,14 @@ def _self_test_pipeline(ok, tb) -> None:
             ok(pipeline_id.RETIRED_MESSAGE in str(e), f"RP6 (v1 retired) a v1 config is refused when it is built: {e}")
         v1cfg = RunConfig(name="t1", question_file="/dev/null", out_dir=d, pipeline="v2")
         v1cfg.pipeline = "v1"          # a config changed after it was built: the preflight refuses it too
+        # (Codex P1) shipped code from before the retirement answers v1: the launcher refuses before asking it.
+        old_tree = tb({"main.py": real_main, "scripts/lib/pipeline_id.py": b"import sys\nprint('v1')\n"})
         try:
-            pf(v1cfg, code)
-            ok(False, "RP6b the preflight refuses a v1 config")
+            pf(v1cfg, old_tree)
+            ok(False, "RP6b the preflight refuses a v1 config, even for a tree that would run v1")
         except SystemExit as e:
-            ok(pipeline_id.RETIRED_MESSAGE in str(e), f"RP6b the preflight refuses a v1 config: {e}")
+            ok(pipeline_id.RETIRED_MESSAGE in str(e) and "would run" not in str(e),
+               f"RP6b the preflight refuses a v1 config before asking the shipped code: {e}")
         for why, c2, code2 in (
                 ("a tree with no pipeline_id.py (from before 2026-11-05: defaults to v1)", cfg, tb({"main.py": b"x"})),
                 ("a config that declares no pipeline", RunConfig(name="t2", question_file="/dev/null", out_dir=d), code),

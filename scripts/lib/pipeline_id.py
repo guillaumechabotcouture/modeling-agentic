@@ -129,6 +129,31 @@ def main_py_args(cmd) -> list | None:
     return calls[0] if calls else None
 
 
+_SHELLS = {"sh", "bash", "zsh", "dash"}
+
+
+def _retired_calls(cmd, depth: int = 0) -> bool:
+    """Whether a command runs main.py with --v1 anywhere this module can see: a main.py call, `python -m main`,
+    or a shell wrapper's `-c` string (v1 retirement: a shipped tree from before it still accepts --v1). Used
+    only to refuse; a command that passes keeps the classification it had before the retirement."""
+    try:
+        argvs = _split_commands(cmd)
+    except PipelineError:
+        return False
+    for argv in argvs:
+        for i, t in enumerate(argv):
+            if os.path.basename(t) == "main.py" or (t == "-m" and i + 1 < len(argv) and argv[i + 1] == "main"):
+                rest = argv[i + 1:] if t != "-m" else argv[i + 2:]
+                if _flag_tokens(rest)[0]:
+                    return True
+                break
+        if argv and os.path.basename(argv[0]) in _SHELLS and "-c" in argv[1:] and depth < 3:
+            j = argv.index("-c", 1)
+            if j + 1 < len(argv) and _retired_calls(argv[j + 1], depth + 1):
+                return True
+    return False
+
+
 def from_command(cmd) -> str | None:
     """A job command's main.py pipeline when every main.py call in it states the same one
     explicitly; None when it runs no main.py. Raises PipelineError when a call relies on the
@@ -136,7 +161,9 @@ def from_command(cmd) -> str | None:
     a shell string makes main.py's arguments depend on an expansion (`$(...)`, backquotes)."""
     if isinstance(cmd, str) and "main.py" in cmd and ("`" in cmd or "$(" in cmd):
         raise PipelineError("the command builds main.py's arguments with a command substitution: "
-                            "state the pipeline as a literal --v1 or --v2")
+                            "state the pipeline as a literal --v2")
+    if _retired_calls(cmd):
+        raise PipelineError(RETIRED_MESSAGE)
     calls = main_py_calls(cmd)
     if not calls:
         return None
@@ -226,14 +253,14 @@ def resume_conflict(meta: dict, pipeline: str, run_path: str | None = None, expl
         if rec != pipeline:
             return f"this run was recorded as pipeline {rec}; resume it with --{rec}"
         return None
-    if not explicit_flag:
-        return "this run records no pipeline: resume it with an explicit --v1 or --v2"
-    if run_path is None:
-        return None
-    by_files = "v2" if os.path.exists(os.path.join(run_path, "run_state.json")) else "v1"
+    by_files = None if run_path is None else ("v2" if os.path.exists(os.path.join(run_path, "run_state.json")) else "v1")
     if by_files in RETIRED:
         return (f"this run records no pipeline, and its files are pipeline {by_files}'s (no run_state.json), "
                 f"and {RETIRED_MESSAGE}: refusing to resume it")
+    if not explicit_flag:
+        return "this run records no pipeline: resume it with an explicit --v2"
+    if run_path is None:
+        return None
     if by_files != pipeline:
         return (f"this run records no pipeline, and its files are pipeline {by_files}'s "
                 f"({'has' if by_files == 'v2' else 'no'} run_state.json): it cannot be resumed with --{pipeline}")
@@ -306,25 +333,42 @@ def _self_test() -> int:
     except PipelineError:
         ok(True, "PI14 --v2 in a later command does not count for main.py")
     # PI29-PI31 (Codex r1 P1): shell boundaries the old parser lost, and several main.py calls.
-    for cmd, why in (("python3 main.py Q\necho --v1", "a newline ends main.py's arguments"),
-                     ("python3 main.py Q;echo --v1", "an attached ; ends them"),
-                     ("python3 main.py Q&&echo --v1", "an attached && ends them"),
+    # (Codex on the retirement PR: the trailing flag is --v2, so a parser that reads it as main.py's fails.)
+    for cmd, why in (("python3 main.py Q\necho --v2", "a newline ends main.py's arguments"),
+                     ("python3 main.py Q;echo --v2", "an attached ; ends them"),
+                     ("python3 main.py Q&&echo --v2", "an attached && ends them"),
                      ("python3 main.py Q --v2; python3 main.py R", "a second main.py without a pipeline"),
-                     ("python3 main.py Q --v2 && python3 main.py R --v1", "two main.py calls that disagree"),
                      ("python3 main.py $(echo --v2) Q", "a command substitution main.py's arguments depend on")):
         try:
             got = from_command(cmd)
             ok(False, f"PI29 refused ({why}): got {got}")
-        except PipelineError:
-            ok(True, f"PI29 refused: {why}")
+        except PipelineError as e:
+            ok(RETIRED_MESSAGE not in str(e), f"PI29 refused: {why} ({e})")
+    try:
+        got = from_command("python3 main.py Q --v2 && python3 main.py R --v1")
+        ok(False, f"PI29b a command with a second main.py --v1 call is refused (got {got})")
+    except PipelineError as e:
+        ok(str(e) == RETIRED_MESSAGE, f"PI29b a command with a second main.py --v1 call is refused as retired: {e}")
+    # PI39 (Codex on the retirement PR, P1): main.py run as a module or inside a shell wrapper is seen
+    # for --v1; a wrapper relying on the default keeps working as before (not read as a main.py call).
+    for cmd in (["python3", "-m", "main", "--v1", "Q?"], "python3 -m main --v1 'Q?'",
+                ["bash", "-c", "python3 main.py --v1 'Q?'"], "sh -c 'cd x && python3 main.py Q --v1'"):
+        try:
+            got = from_command(cmd)
+            ok(False, f"PI39 {cmd!r} is refused as retired (got {got})")
+        except PipelineError as e:
+            ok(str(e) == RETIRED_MESSAGE, f"PI39 {cmd!r} is refused as retired: {e}")
+    ok(from_command(["bash", "-c", "python3 main.py 'Q?'"]) is None
+       and from_command("python3 -m main Q --v2") is None,
+       "PI39b wrapped or module commands without --v1 are classified as before")
     ok(from_command("python3 main.py Q --v2\ncp -r runs $JOB_OUT/") == "v2", "PI30 a later line does not hide main.py's flag")
     ok(from_command("python3 main.py A --v2 && python3 main.py B --v2") == "v2", "PI31 several calls that agree")
     # PI36-38 (Codex r2): comments, redirections and continued lines.
     try:
-        got = from_command("python3 main.py Q # --v1")
+        got = from_command("python3 main.py Q # --v2")
         ok(False, f"PI36 a flag inside a shell comment does not count (got {got})")
-    except PipelineError:
-        ok(True, "PI36 a flag inside a shell comment does not count: refused")
+    except PipelineError as e:
+        ok(RETIRED_MESSAGE not in str(e), f"PI36 a flag inside a shell comment does not count: refused ({e})")
     ok(from_command("python3 main.py Q >log --v2") == "v2" and from_command("python3 main.py Q 2>&1 --v2 > out.log") == "v2",
        "PI37 a redirection is not a command boundary")
     ok(from_command("python3 main.py Q \\\n  --v2") == "v2", "PI38 a continued line belongs to the command")
@@ -334,6 +378,11 @@ def _self_test() -> int:
         open(os.path.join(rs, "run_state.json"), "w").write("{}")
         ok(not resume_conflict({}, "v2", rs, explicit_flag=True),
            "PI32 a run with no recorded pipeline but a run_state.json resumes as v2")
+        why = resume_conflict({}, "v2", td, explicit_flag=False)
+        ok(why and RETIRED_MESSAGE in why and "--v1" not in why,
+           f"PI33d (Codex P2) a bare resume of an old run with v1's files gets the retirement message ({why})")
+        why = resume_conflict({}, "v2", rs, explicit_flag=False)
+        ok(why and "--v2" in why and "--v1" not in why, f"PI33e ... and one with v2's files is told --v2 ({why})")
         why = resume_conflict({}, "v2", td, explicit_flag=True)
         ok(why and RETIRED_MESSAGE in why, f"PI33 an old run with no record and no run_state.json is v1's: refused as retired ({why})")
         why = resume_conflict({"pipeline": "v1"}, "v2", td)

@@ -203,7 +203,7 @@ python main.py --v2 "Which districts should receive measles follow-up campaigns 
 |------|:-:|---------|
 | `--max-rounds N` | 5 | Max critique-revision cycles |
 | `--max-sessions N` | 10 | Max top-level sessions (for retry-after-crash / context recovery) |
-| `--resume runs/<dir>` | — | Resume a prior run from its `pipeline_state.yaml` or detected artifacts (v2: from `run_state.json`) |
+| `--resume runs/<dir>` | — | Resume a v2 run from its `run_state.json` (a run recorded as v1 is refused: v1 is retired) |
 | `--v1` | off | Refused: pipeline v1 is retired (owner, 2026-11-20); use v2 |
 | `--v2` | on | The v2 stage machine (the default; the flag is a no-op kept for existing commands) |
 | `--launcher NAME` | `$MA_LAUNCHER` or `direct` | Name of the launcher, recorded in `metadata.json` (the cloud launchers set it) |

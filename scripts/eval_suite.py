@@ -1202,8 +1202,8 @@ def main(argv=None) -> int:
     r.add_argument("--reps", type=int, default=1)
     r.add_argument("--tree", default=None)
     r.add_argument("--execute", action="store_true")
-    r.add_argument("--pipeline", choices=[p for p in pipeline_id.PIPELINES if p not in pipeline_id.RETIRED],
-                   default="v2", help="the pipeline every launch runs (EVAL_PIPELINE; v2: v1 is retired)")
+    r.add_argument("--pipeline", choices=pipeline_id.PIPELINES, default="v2",
+                   help="the pipeline every launch runs (EVAL_PIPELINE; v2: v1 is retired and refused)")
     r.add_argument("--local", action="store_true", help="not supported: eval runs execute only on the cloud")
     r.add_argument("--private-dir", help=hidden_help)
     r.add_argument("questions", nargs="*")
@@ -1318,6 +1318,9 @@ def _run_command(ap, args, private) -> int:
                     print(f"{q}: wrote data/evals/{q}/ and {os.path.join(root, q, '_truth', 'truth.json')}")
         return 1 if bad else 0
     if args.cmd == "run":
+        if args.pipeline in pipeline_id.RETIRED:
+            print(f"refusing: {pipeline_id.RETIRED_MESSAGE}", file=sys.stderr)
+            return 2
         if args.local:   # a local machine can always reach some checkout's history (Codex round 2)
             print("refusing: eval runs execute only on the cloud launcher, whose fresh worker VM holds the launch "
                   "archive and nothing else (no evals/, no repository history). main.py refuses an eval question "
@@ -1651,6 +1654,16 @@ def _self_test_s19_pipeline(ok, td):
         ok(False, "S19p (v1 retired) no launch command is printed for pipeline v1")
     except ValueError as e:
         ok(pipeline_id.RETIRED_MESSAGE in str(e), f"S19p (v1 retired) no launch command is printed for pipeline v1: {e}")
+    import contextlib
+    import io
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            rc = main(["run", "--pipeline", "v1", "toy"])
+    except SystemExit as e:
+        rc = e.code
+    ok(rc not in (0, None) and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
+       f"S19q (Codex P2) `run --pipeline v1` exits with the retirement message ({rc}, {err.getvalue()[-160:]!r})")
 
 
 def _test_s12_repo_tree(ok, td):
