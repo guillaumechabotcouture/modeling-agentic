@@ -4873,6 +4873,7 @@ def _self_test_storage(ok) -> None:
     planted = ("os.makedirs('runs/R_x/models')\nopen('runs/R_x/models/out.csv', 'w').write('result')\n"
                "os.makedirs('result.tar.gz.tmp')\nopen('../outside.bin', 'wb').write(b'y' * 4096)\n"
                "os.symlink(os.path.abspath('../outside.bin'), 'runs/R_x/models/big_link')\n"
+               "os.symlink('gone_checkpoint', 'runs/R_x/models/dangling')\n"
                "os.symlink('runs/R_x/models/out.csv', 'result.tar.gz')\n")
     with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"), \
             mock.patch.object(ws, "MAX_RETURN_FILE", 1024):
@@ -4888,6 +4889,9 @@ def _self_test_storage(ok) -> None:
     ok("runs/R_x/big.bin" in names and "runs/R_x/models/big_link" not in names
        and [p for p, _ in res["skipped_large_files"]] == ["runs/R_x/models/big_link"],
        f"WS2e the store failed: large files are kept, a link to a large file is still left out: {names}")
+    ok("runs/R_x/models/dangling" in names,
+       f"WS2f (Codex pass on round 3) a link whose target is gone is archived as a link; it does not end the task "
+       f"before the hold: {res.get('error')}")
     real_add = tarfile.TarFile.add
 
     def full_disk(self, name, *a, **kw):
