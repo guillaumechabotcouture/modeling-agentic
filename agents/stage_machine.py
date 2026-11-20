@@ -3688,8 +3688,9 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
                  lambda d: _put(d, FL.LEDGER, "not json\n"), None),
                 ("CX2-3 a structural mismatch any reviewer reports is among the reasons",
                  lambda d: yaml.safe_dump({"structural_mismatch": {"detected": True, "description": "no age classes"},
-                                           "blockers": []}, open(os.path.join(d, "critique_methods.yaml"), "w")),
-                 "no age classes")):
+                                           "blockers": [{"id": "M-9", "category": "STRUCTURAL", "claim": "needs ages"}]},
+                                          open(os.path.join(d, "critique_methods.yaml"), "w")),
+                 "M-9: needs ages")):       # round 3 (5): the blocker's own text, whatever the ledger holds
             d, T, st = new_run("a1_" + name[:5].replace("-", ""), {})
             st.state = "GATE"
             save_state(d, st)
@@ -3721,6 +3722,13 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         got = {f["kind"] for f in report_claim_findings(d)}
         ok(got & {"report_claim_unresolved", "report_claim_id_raw"},
            f"CX2-9 a reference broken over two lines is still reported ({got})")
+        # CX3-6 (round 3): an open finding whose test regressed is listed with its regression, as before the key.
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "D-071", "severity": "MEDIUM", "category": "METHODS", "target_stage": "ANALYZE", "claim": "c"}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        got = [o["id"] for o in open_findings(d, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
+            {"kind": "done_when_regressed", "key": "D-071", "severity": "HIGH", "claim": "c"}]})]
+        ok("done_when_regressed:D-071" in got and "D-071" in got, f"CX3-6 a regression is listed beside its finding ({got})")
 
     for name, fn in (("T_PRES_BUDGET", budget), ("T_PW_GATE", post_write), ("F_HARNESS_IDS", ids),
                      ("T_RETHINK", rethink), ("T_CLAIM", claims), ("CX1-3", r1_resume), ("CX1-4", r1_readback),

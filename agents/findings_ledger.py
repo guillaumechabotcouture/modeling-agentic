@@ -614,6 +614,21 @@ def _self_test() -> int:
            f"L_CX2-6 a gate row of a withdrawn test carries no test ({led2['done_when_unmet:R-043'].done_when})")
         ok(tests_of({"file": "x.csv", "where": {2024: "x", "site": "A"}}) is None,
            "L_CX2-7 a test the ledger could not write (mixed key types) is not kept")
+        real_dumps = json.dumps
+
+        def too_deep(*a, **k):
+            raise RecursionError("nested too deep")
+        json.dumps = too_deep                # what the encoder raises for a test nested too deep (YAML aliases)
+        try:
+            td_ = tests_of({"file": "x.csv", "exists": True})
+        except BaseException as e:  # noqa: BLE001
+            td_ = type(e).__name__
+        finally:
+            json.dumps = real_dumps
+        ok(td_ is None, f"L_CX3-4 a test nested too deep to write is not kept, and does not stop the sync ({td_})")
+        import datetime
+        ok(tests_of({"file": "x.csv", "key": "d", "op": "==", "value": datetime.date(2024, 1, 1)}) is None,
+           "L_CX3-3 a test whose value JSON cannot hold as written is not kept")
         open(os.path.join(d, "done_when_registry.json"), "w").write('{"tests": ' + "[" * 200000)
         try:
             ft = frozen_tests(d)
