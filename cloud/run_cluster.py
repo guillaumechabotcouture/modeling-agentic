@@ -2,9 +2,11 @@
 
     python cloud/run_cluster.py <config.py> launch            # cluster, run(s), keeper; then safe to disconnect
     python cloud/run_cluster.py <config.py> status            # running / done per run, cluster and keeper state
-    python cloud/run_cluster.py <config.py> collect [--no-shutdown]
+    python cloud/run_cluster.py <config.py> collect [--no-shutdown] [--accept-partial]
                                                               # fetch finished runs (from storage once stopped);
-                                                              # then shut down, unless --no-shutdown
+                                                              # then shut down, unless --no-shutdown. A run whose
+                                                              # large files exist only on its VM stays pending
+                                                              # until --accept-partial
     python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
     python cloud/run_cluster.py <config.py> health [--loop] [--interval S] [--log PATH] [--thresholds YAML]
                                                               # anomalies of a live run (cloud/run_health.py)
@@ -382,6 +384,16 @@ def attach(name: str):
     if cid is None:
         raise SystemExit(f"cluster {name!r} is not running; refusing to create a new one")
     return ws.attach_existing(name, WORKSPACE, cid)
+
+
+def existing_client(name: str):
+    """A Client on the live cluster `name` through connect_existing, which cannot create a cluster; SystemExit when
+    it is not running. For every path that only reads from or submits to a cluster (status, collect, relaunch, the
+    *_side calls): an attach by name on a cluster that has just stopped creates a new one (1E-ii)."""
+    client = connect_existing(name)
+    if client is None:
+        raise SystemExit(f"cluster {name!r} is not running; refusing to create a new one")
+    return client
 
 
 def _compute(cfg):
@@ -1301,7 +1313,9 @@ def _fresh(name):
         if act == "start":
             return
         if act == "stop":
-            attach(name).shutdown()
+            cid = live_id(name)
+            if cid is not None:
+                _stop_id(name, cid)
             print(f"{name}: an earlier launch's cluster was running; shut it down")
         time.sleep(15)
     raise SystemExit(f"{name} did not stop; start it later (the pool keeps its floor)")
@@ -1474,7 +1488,7 @@ def status(cfg):
           f"overflow: {'running' if ovf else 'stopped'}")
     if keep:
         try:
-            kc = attach(cfg.keeper_name).get_client()
+            kc = existing_client(cfg.keeper_name)
             w = sorted(ws.scheduler_workers(lambda: kc, attempts=3, min_workers=1))[0]
             print("\n".join(keeper_lines(kc.run(ws.keeper_status, workers=[w])[w])))
         except Exception as e:  # noqa: BLE001 — a keeper from before Phase 42 β has no status file
@@ -1482,11 +1496,16 @@ def status(cfg):
     if not run:
         return
     assign = json.load(open(cfg.state_file))
-    client = attach(cfg.name).get_client()
+    client = existing_client(cfg.name)
     for label in cfg.labels:
-        m = _on_worker(client, ws.fetch_meta, label, worker=assign[label]["worker"])
+        try:       # 1E-ii: one label whose VM cannot be read no longer hides every other label from the watch
+            m = _on_worker(client, ws.fetch_meta, label, worker=assign[label]["worker"])
+        except Exception as e:  # noqa: BLE001
+            print(f"{label}: unknown ({type(e).__name__}: {str(e)[:120]})")
+            continue
         if m["state"] != "done":
-            print(f"{label}: {m['state']} (log {m.get('log_bytes', 0)} bytes)")
+            beat = f", phase {m['phase']}, heartbeat {m.get('heartbeat_age_s')} s ago" if m.get("phase") else ""
+            print(f"{label}: {m['state']} (log {m.get('log_bytes', 0)} bytes{beat})")
         else:
             r = m["meta"]
             print(f"{label}: done exit={r['exit_code']} {r['duration_s']}s run_dir={r['run_dir']} "
@@ -1727,12 +1746,16 @@ def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=Non
 def local_is_current(dest: str, launch_id: str) -> bool | None:
     """True: dest holds this launch's collected run; False: an earlier launch's
     (set aside before collecting); None: nothing collected yet."""
-    p = os.path.join(dest, "result.json")
-    if not os.path.exists(p):
-        return None
+    p, part = os.path.join(dest, "result.json"), os.path.join(dest, "result.partial.json")
     try:
+        if not os.path.exists(p):
+            # a partial copy (collect: large files only on the VM) is never "collected": an earlier launch's is
+            # set aside like a full one, this launch's is fetched again over itself
+            if os.path.exists(part) and json.load(open(part)).get("launch_id") != launch_id:
+                return False
+            return None
         return json.load(open(p)).get("launch_id") == launch_id
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         return False
 
 
@@ -1742,8 +1765,10 @@ def relaunch_refusal(vm_state: str, stored: bool) -> str | None:
     VM's work directory, which holds results whose upload failed."""
     if stored:
         return "already stored in this launch; collect it instead"
-    if vm_state == "running":
+    if vm_state in ("running", "preparing"):
         return "still running on its VM"
+    if vm_state == "dead":       # its run dir is the only local trace: `checkpoint`, or a look at the VM, first
+        return "its task died on its VM, whose work dir still holds the run; fetch its checkpoint first"
     if vm_state == "done":
         return "finished on its VM but not stored; collect it first"
     return None
@@ -1772,7 +1797,7 @@ def _download(client, label, worker, dest_file):
     return m["meta"]
 
 
-def collect(cfg, shutdown_after: bool = True):
+def collect(cfg, shutdown_after: bool = True, accept_partial: bool = False):
     sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
     import results_store
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -1797,13 +1822,20 @@ def collect(cfg, shutdown_after: bool = True):
             ck_note = (f"; only a checkpoint exists, of {ck.get('time_utc')} (state {ck.get('run_state')}, "
                        f"{ck.get('cached_batches')} cached batches): fetch it with `checkpoint --label {label}`"
                        if ck else "")
+            part = os.path.join(dest, "result.partial.json")
+            # this launch's partial copy (local_is_current), fetched earlier, and its VM is gone: accepted as it
+            # is. With the VM up, the run is fetched again below and the VM is told (its hold ends).
+            if accept_partial and os.path.exists(part) and not running:
+                os.replace(part, os.path.join(dest, "result.json"))
+                print(f"{label}: the partial copy in {dest} is accepted as collected")
+                continue
             if not running:
                 print(f"{label}: not in storage ({type(e).__name__}) and the cluster has stopped{ck_note}")
                 continue
             if ck_note:
                 print(f"{label}: no final result yet{ck_note}")
         if client is None:
-            client = attach(cfg.name).get_client()
+            client = existing_client(cfg.name)
         w = assign[label]["worker"]
         if _on_worker(client, ws.fetch_meta, label, worker=w)["state"] != "done":
             print(f"{label}: still running")
@@ -1818,6 +1850,18 @@ def collect(cfg, shutdown_after: bool = True):
             t.extractall(dest, filter="data")
         ident = _run_identity_on_disk(dest)
         _identity_note(label, assign[label], ident)
+        # a record from a worker before 1E-ii has no unstored_large_files: every large file it left out counts
+        lost = None if meta.get("run_stored") or accept_partial else \
+            meta.get("unstored_large_files", meta.get("skipped_large_files"))
+        if lost:
+            # 1E-ii: the VM's tarball lacks large files that are in no store. The label stays pending: no result.json
+            # (so a later `collect` fetches it again), not marked collected (the VM keeps holding), no shutdown.
+            json.dump({**meta, **assign[label], "run_identity": ident},
+                      open(os.path.join(dest, "result.partial.json"), "w"), indent=1)
+            print(f"{label}: fetched -> {dest}, but {len(lost)} large file(s) exist only on the VM, e.g. "
+                  f"{[x[0] for x in lost[:3]]}: left pending; copy them from the VM, then `collect --accept-partial`")
+            pending.append(label)
+            continue
         json.dump({**meta, **assign[label], "run_identity": ident}, open(os.path.join(dest, "result.json"), "w"),
                   indent=1)
         _on_worker(client, ws.mark_collected, label, worker=w)
@@ -1831,9 +1875,9 @@ def collect(cfg, shutdown_after: bool = True):
 
 def shutdown(cfg):
     for name in (cfg.name, cfg.overflow_name, cfg.keeper_name):
-        if is_running(name):
-            attach(name).shutdown()
-            print(f"{name}: shutdown requested")
+        cid = live_id(name)
+        if cid is not None:
+            _stop_id(name, cid)          # by id: never an attach by name, which can create a cluster
         else:
             print(f"{name}: not running")
 
@@ -2030,7 +2074,7 @@ def relaunch(cfg, label) -> int:
         launch_id = assign[label]["launch_id"]
         names = {b["name"] for b in results_store.list_blobs(f"outputs/{cfg.storage_prefix}/launch_{launch_id}/",
                                                               cfg.storage_account)}
-        client = attach(cfg.name).get_client()
+        client = existing_client(cfg.name)
         why = relaunch_refusal(_on_worker(client, ws.fetch_meta, label, worker=assign[label]["worker"])["state"],
                                ws.record_blob(cfg.storage_prefix, launch_id, label) in names)
         if why:
@@ -2110,7 +2154,7 @@ def parse_sign_args(rest: list, labels) -> dict:
 def _side(cfg, fn, *args, label=None):
     label = label or cfg.labels[0]
     assign = json.load(open(cfg.state_file))
-    return _on_worker(attach(cfg.name).get_client(), fn, label, *args, worker=assign[label]["worker"])
+    return _on_worker(existing_client(cfg.name), fn, label, *args, worker=assign[label]["worker"])
 
 
 def health_snapshots(cfg, client, assign: dict, now: float | None = None) -> dict:
@@ -3322,7 +3366,7 @@ def _self_test_s18_r1(ok) -> None:
             rs.list_blobs = lambda *a: []
             out = io.StringIO()
             with mock.patch.dict(sys.modules, {"results_store": rs}), \
-                    P(M, "attach", return_value=types.SimpleNamespace(get_client=lambda: client)), \
+                    P(M, "existing_client", return_value=client), \
                     P(M, "_on_worker", return_value={"state": vm}), \
                     P(M, "code_tarball", return_value=(b"", "c0")), P(M, "pipeline_preflight", return_value="v2"), \
                     P(M, "read_keys", return_value={"ANTHROPIC_API_KEY": "k"}), \
@@ -5006,6 +5050,181 @@ def _self_test_storage(ok) -> None:
        f"WS6b a failed checkpoint is counted with its error; the last good time is kept: {s2}")
 
 
+def _self_test_liveness(ok) -> None:
+    """LV1-LV9 (v2 autonomy 1E-ii): the agent VM's heartbeat record from before pip, fetch_meta's preparing and
+    dead, per-label isolation in `status`, no attach by name on the read paths, and a label whose large files
+    exist only on the VM stays pending in `collect`. Fakes only; no cloud."""
+    import types
+    import subprocess
+    import tempfile
+    from unittest import mock
+    root = tempfile.mkdtemp()
+    with mock.patch.object(ws, "WORK", root):
+        ok(ws.fetch_meta("N")["state"] == "missing", "LV1 no state record and no run.log: missing (unchanged)")
+        os.makedirs(os.path.join(root, "OLD"))
+        open(os.path.join(root, "OLD", "run.log"), "w").write("x")
+        ok(ws.fetch_meta("OLD")["state"] == "running", "LV1b a run.log with no state record (an older worker): running")
+        seen = {}
+
+        def fake_run(td, label, code, *a, state=None, **kw):
+            seen["td"], seen["during"] = os.path.isdir(td), ws.fetch_meta(label)
+            state.set("running")
+            os.makedirs(os.path.join(root, label), exist_ok=True)
+            open(os.path.join(root, label, "run.log"), "w").write("log")
+            seen["running"] = ws.fetch_meta(label)
+            t0 = json.load(open(ws.state_path(label)))["updated_at"]
+            time.sleep(0.25)
+            seen["beat"] = json.load(open(ws.state_path(label)))["updated_at"] > t0
+            if kw.get("boom"):
+                raise RuntimeError("pip failed")
+            state.set("done")
+            return {"label": label}
+        with mock.patch.object(ws, "_run_to_disk", fake_run), mock.patch.object(ws, "STATE_BEAT_S", 0.05):
+            ws.run_to_disk("A", b"")
+            a_during, a_running, a_beat = seen["during"], seen["running"], seen["beat"]
+            try:
+                ws.run_to_disk("B", b"", boom=True)
+            except RuntimeError:
+                pass
+        ok(a_during["state"] == "preparing" and a_during.get("phase") == "preparing",
+           f"LV2 before pip and unpacking end, the label reads preparing, not missing: {a_during}")
+        ok(a_running["state"] == "running" and a_beat,
+           f"LV3 main.py started: running; the record is rewritten on a timer: {a_running} beat={a_beat}")
+        # LV4b (Codex round 1): a failure before the task body (no temporary directory) also ends the record
+        import threading
+        with mock.patch.object(tempfile, "mkdtemp", side_effect=OSError("no space")), \
+                mock.patch.object(ws, "STATE_BEAT_S", 0.05):
+            try:
+                ws.run_to_disk("C", b"")
+            except OSError:
+                pass
+        time.sleep(0.2)
+        c = ws.fetch_meta("C")
+        ok(c["state"] == "dead" and c.get("phase") == "failed"
+           and not [t for t in threading.enumerate() if t.name == "ma-state-C"],
+           f"LV4b a task that fails before unpacking reads dead and leaves no heartbeat thread: {c}")
+        b = ws.fetch_meta("B")
+        ok(b["state"] == "dead" and b.get("phase") == "failed",
+           f"LV4 LW_DEAD_PID_DETECTED the task ended without a result (a run.log exists): dead, not running: {b}")
+        # LV5c (Codex round 3): the record is written under a fresh name each time; a link at a predictable name
+        # (an agent's) is never written through, and a link at the record's own name is replaced
+        victim = os.path.join(root, "victim.txt")
+        open(victim, "w").write("keep")
+        os.symlink(victim, ws.state_path("LK"))
+        os.symlink(victim, f"{ws.state_path('LK')}.{os.getpid()}.tmp")
+        ws.RunState("LK").set("running")
+        ok(open(victim).read() == "keep" and not os.path.islink(ws.state_path("LK"))
+           and json.load(open(ws.state_path("LK")))["phase"] == "running",
+           "LV5c the state record is never written through a link")
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        for label, rec in (("STALE", {"phase": "running", "pid": os.getpid(), "updated_at": time.time() - 3600}),
+                           ("NOPID", {"phase": "running", "pid": gone.pid, "updated_at": time.time()}),
+                           ("JUNK", "not a record")):
+            json.dump(rec, open(ws.state_path(label), "w"))
+        ok(ws.fetch_meta("STALE")["state"] == "dead" and ws.fetch_meta("NOPID")["state"] == "dead",
+           "LV5 a heartbeat older than the limit, or one whose process is gone, reads dead")
+        ok(ws.fetch_meta("JUNK")["state"] == "missing", "LV5b an unreadable state record changes nothing")
+    ok(relaunch_refusal("preparing", False) and relaunch_refusal("dead", False)
+       and relaunch_refusal("missing", False) is None,
+       "LV6 a preparing run is never re-fired; a dead one keeps its work dir until someone has looked")
+    # LV7: one label whose VM cannot be read does not hide the others; LV8: nothing on these paths attaches by name
+    tmp = tempfile.mkdtemp()
+    cfg = RunConfig(name="lv", question_file="q", labels=("A", "B"), out_dir=tmp, tree=os.path.dirname(HERE))
+    json.dump({lb: {"launch_id": "L1", "worker": f"w{lb}"} for lb in "AB"}, open(cfg.state_file, "w"))
+    no_attach = lambda *a, **k: (_ for _ in ()).throw(AssertionError("attach by name"))  # noqa: E731
+
+    def on_worker(client, fn, label, *a, worker=None):
+        if label == "A":
+            raise OSError("worker unreachable")
+        return {"state": "running", "log_bytes": 3}
+    out = io.StringIO()
+    with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: n == "lv", "attach": no_attach,
+                                     "connect_existing": lambda n, *a, **k: object(), "_on_worker": on_worker}), \
+            contextlib.redirect_stdout(out):
+        try:
+            status(cfg)
+        except BaseException as e:  # noqa: BLE001
+            print(f"raised {type(e).__name__}: {e}")
+    text = out.getvalue()
+    ok("A: unknown" in text and "OSError" in text and "B: running" in text and "raised" not in text,
+       f"LV7 status isolates a label whose worker cannot be read and never attaches by name: {text!r}")
+    stops = []
+    with mock.patch.dict(globals(), {"live_id": lambda n, lister=None: {"lv": 11}.get(n), "attach": no_attach,
+                                     "_stop_id": lambda n, cid: stops.append((n, cid)),
+                                     "connect_existing": lambda n, *a, **k: None}), \
+            contextlib.redirect_stdout(io.StringIO()):
+        shutdown(cfg)
+        try:
+            existing_client("lv")
+            gone_msg = None
+        except SystemExit as e:
+            gone_msg = str(e)
+    ok(stops == [("lv", 11)] and gone_msg and "not running" in gone_msg,
+       f"LV8 shutdown stops each live cluster by its id; a cluster that is gone is refused, never created: {stops}")
+    # LV9: the tarball on the VM lacks large files that are in no store: collected, but the label stays pending, it
+    # is not marked collected and nothing is shut down
+    marks, downs = [], []
+
+    def on_worker9(client, fn, label, *a, worker=None):
+        if fn is ws.mark_collected:
+            marks.append(label)
+        return {"state": "done"}
+
+    def download9(client, label, w, tgz):
+        with tarfile.open(tgz, mode="w:gz"):
+            pass
+        if label == "A":      # a worker from before this change: no unstored_large_files field (Codex round 1)
+            return {"exit_code": 0, "duration_s": 1, "run_stored": None, "skipped_large_files": [["runs/R/big.bin", 9]]}
+        return {"exit_code": 0, "duration_s": 1, "run_stored": None, "unstored_large_files": [],
+                "skipped_large_files": [["runs/R/a_link", 9]]}
+    rs = types.ModuleType("results_store")
+    out = io.StringIO()
+    with mock.patch.dict(sys.modules, {"results_store": rs}), \
+            mock.patch.dict(globals(), {"is_running": lambda n, lister=None: True, "attach": no_attach,
+                                        "connect_existing": lambda n, *a, **k: object(),
+                                        "collect_from_storage": lambda *a, **k: (_ for _ in ()).throw(KeyError("x")),
+                                        "checkpoint_record": lambda *a, **k: None, "_on_worker": on_worker9,
+                                        "_download": download9, "shutdown": lambda c: downs.append(c.name)}), \
+            contextlib.redirect_stdout(out):
+        collect(cfg)
+    ok(marks == ["B"] and not downs and "A: " in out.getvalue() and "only on the VM" in out.getvalue(),
+       f"LV9 a label whose large files exist only on its VM is fetched but stays pending; no shutdown: {marks} "
+       f"{downs} {out.getvalue()!r}")
+    with mock.patch.dict(sys.modules, {"results_store": rs}), \
+            mock.patch.dict(globals(), {"is_running": lambda n, lister=None: True, "attach": no_attach,
+                                        "connect_existing": lambda n, *a, **k: object(),
+                                        "collect_from_storage": lambda *a, **k: (_ for _ in ()).throw(KeyError("x")),
+                                        "checkpoint_record": lambda *a, **k: None, "_on_worker": on_worker9,
+                                        "_download": download9, "shutdown": lambda c: downs.append(c.name)}), \
+            contextlib.redirect_stdout(io.StringIO()):
+        try:
+            collect(cfg, accept_partial=True)
+        except TypeError as e:
+            downs.append(str(e))
+    # LV9c, LV9d (Codex round 2): a partial copy is this launch's or an earlier one's by its own record; and
+    # --accept-partial finishes a partial copy even when the VM is gone
+    tmp2 = tempfile.mkdtemp()
+    pd = os.path.join(tmp2, "P")
+    os.makedirs(pd)
+    json.dump({"launch_id": "L0"}, open(os.path.join(pd, "result.partial.json"), "w"))
+    ok(local_is_current(pd, "L1") is False and local_is_current(pd, "L0") is None,
+       "LV9c a partial copy of an earlier launch is set aside before a new collect; this launch's is fetched again")
+    cfg2 = RunConfig(name="lv2", question_file="q", labels=("P",), out_dir=tmp2, tree=os.path.dirname(HERE))
+    json.dump({"P": {"launch_id": "L0", "worker": "w"}}, open(cfg2.state_file, "w"))
+    with mock.patch.dict(sys.modules, {"results_store": rs}), \
+            mock.patch.dict(globals(), {"is_running": lambda n, lister=None: False, "attach": no_attach,
+                                        "collect_from_storage": lambda *a, **k: (_ for _ in ()).throw(KeyError("x")),
+                                        "checkpoint_record": lambda *a, **k: None}), \
+            contextlib.redirect_stdout(io.StringIO()):
+        collect(cfg2, accept_partial=True)
+    ok(os.path.exists(os.path.join(pd, "result.json")) and not os.path.exists(os.path.join(pd, "result.partial.json")),
+       "LV9d `collect --accept-partial` after the cluster stopped finishes this launch's partial copy")
+    ok(marks == ["B", "A"] and downs == ["lv"] and os.path.exists(os.path.join(tmp, "A", "result.json")),
+       f"LV9b `collect --accept-partial` on a live VM fetches again and tells the VM (its hold ends): "
+       f"{marks} {downs}")
+
+
 def _self_test_sheet(ok) -> None:
     """2026-11-12: a canary relaunch died in 8 s at SIGN because its spec was amended after its sign-off sheet was
     generated; the pre-launch checks did not look at the sheet. A launch now refuses a resumed run at SIGN whose
@@ -5368,6 +5587,10 @@ def _self_test() -> int:
         _self_test_storage(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"WS: {type(e).__name__}: {e}")
+    try:
+        _self_test_liveness(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"LV: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
@@ -5414,7 +5637,7 @@ def main(argv) -> int:
     elif cmd == "status":
         status(cfg)
     elif cmd == "collect":
-        collect(cfg, shutdown_after="--no-shutdown" not in rest)
+        collect(cfg, shutdown_after="--no-shutdown" not in rest, accept_partial="--accept-partial" in rest)
     elif cmd == "checkpoint":
         sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
         import results_store
@@ -5431,7 +5654,7 @@ def main(argv) -> int:
     elif cmd == "report-cost":
         report_cost(cfg, rest)
     elif cmd == "keeper-log":
-        c = attach(cfg.keeper_name).get_client()
+        c = existing_client(cfg.keeper_name)
         w = sorted(ws.scheduler_workers(lambda: c, attempts=3, min_workers=1))[0]
         print(c.run(ws.keeper_log, workers=[w])[w])
     elif cmd == "brief":
