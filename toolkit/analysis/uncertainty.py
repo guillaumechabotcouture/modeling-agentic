@@ -43,6 +43,7 @@ if ROOT not in sys.path:
 from toolkit.analysis.core import q  # noqa: E402
 PRODUCER = "toolkit/analysis/uncertainty.py"
 ORDER = ("engine_parameters", "calibration", "costs", "emulator")
+POINT_TOL = 1e-6           # v2-posterior-point: a value within the fit file's 6-decimal rounding of the chosen point
 NE_STREAM = 0x6E6566        # the net-effect posterior's row choice: its own stream, the other sources' draws unchanged
 
 
@@ -51,10 +52,11 @@ def posterior_input(spec) -> dict | None:
     the spec, the owner-signed sha256 and the file's bytes, read once per spec and refused unless their sha256 is the
     signed one (Codex r1 P1-1, P2-4). The manifest, the engine artifact's input and the Drawer all use these bytes.
     Optional `margin` (default 0): the share of the sample's hull width each side of its columns' ranges is widened by
-    (net_effect_sample). None without the field."""
-    p = (spec.raw.get("uncertainty") or {}).get("net_effect_posterior")
-    if p is None:
+    (net_effect_sample). None without the field; a field left empty is refused (Codex r1 P1-6, v2-posterior-point)."""
+    u = spec.raw.get("uncertainty") or {}
+    if "net_effect_posterior" not in u:
         return None
+    p = u["net_effect_posterior"]
     if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip() \
             or not isinstance(p.get("sha256"), str) or set(p) - {"path", "sha256", "margin"}:
         raise ValueError("uncertainty.net_effect_posterior: {path: net_effect_fit.py's output file, sha256: its "
@@ -105,8 +107,66 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
     ne = NEF.load_posterior(post["path"], eng, varied, post["sha256"], post["data"])
     ne["margin"] = post["margin"]
     ne["ranges"] = NEF.posterior_ranges(ne, post["margin"], NEF.hard_bounds(eng, ne["names"]))
+    ne["point"] = chosen_point(post, ne["names"])
     spec._net_effect_sample = (key, ne)
     return ne
+
+
+def chosen_point(post: dict, names) -> dict:
+    """{column: value} of the fit's verified chosen point (joint_region.verified.chosen.point in the signed bytes that
+    load_posterior replayed): the point value of every posterior column (v2-posterior-point). Refused (fail closed; no
+    fallback to card or fitted values): a file without one; a point whose coordinates are not exactly the sample's
+    columns, or hold a value that is not a finite number; a point that is not exactly the fit's recorded `parameters`
+    values."""
+    import yaml
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    doc = yaml.safe_load(post["data"])
+    pt = ((((doc.get("joint_region") or {}).get("verified") or {}).get("chosen") or {}).get("point"))
+    if not isinstance(pt, dict) or sorted(pt) != sorted(names) or any(
+            isinstance(pt[k], bool) or not isinstance(pt[k], (int, float)) or not np.isfinite(pt[k]) for k in names):
+        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: no verified chosen point whose coordinates are "
+                                   f"the sample's columns {list(names)}, each a finite number "
+                                   f"(joint_region.verified.chosen.point: {pt!r})")
+    # run() writes the chosen point from its fit's parameter values: they must be the same numbers (Codex r1 P1-4, r2)
+    fp = doc.get("parameters") if isinstance(doc.get("parameters"), dict) else {}
+    off = sorted(set(fp) - set(names)) + [      # a recorded parameter the sample lacks (Codex r3), or another value
+        k for k in names if not isinstance(fp.get(k), dict) or isinstance(fp[k].get("value"), bool)
+        or not isinstance(fp[k].get("value"), (int, float)) or not float(fp[k]["value"]) == float(pt[k])]
+    if off:
+        raise NEF.PosteriorRefused(f"net-effect posterior {post['path']}: the chosen point of {off} is not the fit's "
+                                   f"recorded parameter values (parameters: {[fp.get(k) for k in off]}; chosen point: "
+                                   f"{[pt.get(k) for k in off]})")
+    return {k: float(pt[k]) for k in names}
+
+
+def posterior_point(spec, ne: dict | None, theta: dict) -> dict:
+    """`theta` with every posterior column at the fit's chosen point (core.Analysis.theta0, joint_calibration.theta0).
+    A spec engine_parameters value of a column that differs from it by more than POINT_TOL (the fit file's 6-decimal
+    rounding, whatever the magnitude: Codex r1 P1-5) is refused. So is a likelihood or posterior calibration, whose
+    engine parameters are the calibrated ones over engine defaults, never this point (Codex r1 P1-1). `theta`
+    unchanged without a posterior."""
+    if ne is None:
+        return theta
+    m = (spec.raw.get("calibration") or {}).get("method")
+    if m in ("likelihood", "posterior"):
+        raise ValueError(f"uncertainty.net_effect_posterior with calibration.method {m}: that calibration evaluates the "
+                         "engine at its default values, not at the posterior's chosen point; not supported")
+    from toolkit.spec import engine_parameters as PV
+    sv = PV.values(spec)
+    # the float subtraction's own error (a few ulps at the values' magnitude) is not a difference (Codex r2-r3)
+    bad = {k: (sv[k], v) for k, v in ne["point"].items() if k in sv
+           and abs(sv[k] - v) > POINT_TOL + 4 * float(np.spacing(max(abs(sv[k]), abs(v))))}
+    if bad:
+        raise ValueError("engine_parameters: " + "; ".join(
+            f"{k} is set to {a}, but the net-effect posterior's verified chosen point is {b}; the chosen point is the "
+            f"point value of a posterior column: set the spec value to it or remove the value" for k, (a, b) in
+            sorted(bad.items())))
+    return dict(theta, **ne["point"])
+
+
+def point_source(ne: dict | None) -> dict:
+    """The manifest's record of where each posterior column's point value came from ({} without a posterior)."""
+    return {k: "posterior_chosen_point" for k in (ne or {}).get("point", {})}
 
 
 def with_posterior_ranges(ne: dict | None, fitted: dict, priors: dict | None = None) -> tuple:

@@ -631,10 +631,25 @@ def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, worker
     if ev.problems:                      # S1-2b: sources and fitted values in use, before the spec or any arm
         raise ValueError("benchmark pack: " + "; ".join(ev.problems))
     pe = _check_pack_engine(pack, spec, engine)
-    vals = values(spec)
-    runner = BM.Runner(pack, pe, workers, seeds, base_params=vals, evidence=ev)     # the evidence it validated
-    out = BM.run_pack(pack, pe, runner, dict(fitted or {}))
-    return BM.stamp(dict(out, spec_parameters=vals, arm_engines=_arm_records(pack, runner, vals)), pe)
+    vals, post = values(spec), posterior_point(spec)
+    # v2-posterior-point: with a posterior, the arms run at its chosen point (fitted columns as fit-mode candidates)
+    fk = {q.name for q in pe.parameters() if q.kind == "fitted"}
+    base = {k: v for k, v in dict(vals, **post).items() if k not in fk}
+    runner = BM.Runner(pack, pe, workers, seeds, base_params=base, evidence=ev,      # the evidence it validated
+                       mode="fit" if set(post) & fk else "score")
+    fit = {k: v for k, v in (fitted or {}).items() if k not in post}   # a caller never overrides a column (Codex r4)
+    out = BM.run_pack(pack, pe, runner, dict(fit, **{k: v for k, v in post.items() if k in fk}))
+    return BM.stamp(dict(out, spec_parameters=vals, posterior_point=post, arm_engines=_arm_records(pack, runner, base)),
+                    pe)
+
+
+def posterior_point(spec) -> dict:
+    """A declared net-effect posterior's verified chosen point ({} without one): the arms' point (v2-posterior-point)."""
+    if "net_effect_posterior" not in ((_raw(spec).get("uncertainty") or {})):
+        return {}
+    from toolkit.analysis import uncertainty as UQ
+    ne = UQ.net_effect_sample(spec, spec.engine())
+    return {} if ne is None else UQ.posterior_point(spec, ne, {})
 
 
 def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, workers: int = 1, seeds=None,
@@ -655,6 +670,7 @@ def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, 
     path = os.path.join(run_dir, SPEC_BENCH)
     rec = {"producer": RECORD_PRODUCER, "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
            "file": SPEC_BENCH, "sha256": _sha(path), "spec_sha256": spec.sha256, "spec_parameters": values(spec),
+           "posterior_point": doc["posterior_point"],
            "pack_sha256": __import__("hashlib").sha256(json.dumps(pack, sort_keys=True, default=str).encode()).hexdigest(),
            "engine_identity": engine_identity(spec.engine()), "config_sha256": _config_sha(spec.engine()),
            "benchmarks": doc["arm_engines"]}
@@ -689,6 +705,9 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
     if set(sp) != set(vals) or any(not _isnum(sp[k]) or abs(float(sp[k]) - vals[k]) > 1e-12 * max(1.0, abs(vals[k]))
                                    for k in vals):
         return [], f"the arms were computed at {sp}, not at this spec's values {vals}; {how}"
+    if (rec.get("posterior_point") or {}) != posterior_point(spec):      # exact: the same file's chosen point
+        return [], (f"the arms were computed at {rec.get('posterior_point')}, not at the net-effect posterior's chosen "
+                    f"point {posterior_point(spec)}; {how}")
     if rec.get("engine_identity") != engine_identity(engine):
         return [], f"the arms were computed for another engine identity or code than the run's; {how}"
     if rec.get("config_sha256") is None or rec["config_sha256"] != _config_sha(engine):
@@ -710,6 +729,8 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
     if bench_id is not None and bench_id not in bms:
         return [], f"benchmark {bench_id} has no arm record in {SPEC_BENCH_RECORD}; {how}"
     doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
+    if (doc.get("posterior_point") or {}) != posterior_point(spec):     # the file's own point too (Codex r4)
+        return [], f"{SPEC_BENCH} holds arms at {doc.get('posterior_point')}, not at the chosen point; {how}"
     out = list(doc.get("benchmarks") or [])
     from toolkit.engines.benchmark_sources import load_evidence
     ev = load_evidence(engine, rows=out, partial=True)   # S1-2b: the engine's own pack (a toy may have none)

@@ -634,9 +634,11 @@ def theta0(spec) -> dict:
     from toolkit.analysis.batch import fitted_ranges
     from toolkit.spec import engine_parameters as PV
     from toolkit.spec import priors as PRI
+    from toolkit.analysis import uncertainty as UQ
     eng = spec.engine()
     dr = dict(fitted_ranges(eng), **{k: (p.lo, p.hi, p.value) for k, p in PRI.drawn(spec).items()})
-    return PV.params(spec, {k: v[2] for k, v in dr.items()})
+    # v2-posterior-point: a declared posterior's columns are held at the fit's verified chosen point, as in the analysis
+    return UQ.posterior_point(spec, UQ.net_effect_sample(spec, eng), PV.params(spec, {k: v[2] for k, v in dr.items()}))
 
 
 def _unit_sd(t, row, scale, value):
@@ -1185,7 +1187,8 @@ class Simulator:
         if held:                    # a held-out benchmark never enters a fit (also refused at validation)
             raise HM.CalibrationInputError([f"benchmark targets {held} are held out by the engine's pack"])
         byid = {b["id"]: b for b in pack["benchmarks"]}
-        fitted = {k: v[2] for k, v in fitted_ranges(self.eng).items()}
+        # v2-posterior-point: a fitted posterior column at the point value (the chosen point), not fitted.yaml's
+        fitted = {k: float(self.th0.get(k, v[2])) for k, v in fitted_ranges(self.eng).items()}
         settings = sorted({pack["arms"][a]["setting"] for t in want for a in BM._arms_of(byid[t]["estimand"])})
         cache = {}
         for phase in range(int(self.kw.get("bench_phases", 8))):

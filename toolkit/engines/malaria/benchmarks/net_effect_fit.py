@@ -64,9 +64,18 @@ PROTECTED = ("fitted.yaml", "results.yaml")
 # widen). F6 option A: the PBO boxes are their card priors (priors.yaml: pbo_gain_scale 0.316-1.0 from Gleave 2021's
 # hut-trial mortality RR, pbo_adv_decay 0-1.895 per year from LLINEUP's Table 2), used now that PBO trials are targets.
 # Engine v0.18 (owner, 18 Nov, form P, fitted): net_deter_sat, PBO nets only, over its card prior (its domain 0-1).
+# Refit b, owner option (a), 2026-11-19: pbo_adv_decay's ceiling for this fit is 2.23 per year, the 99% interval of
+# LLINEUP's waning (as-treated, 6 -> 18 m: 0.546 + 2.576 x 0.535 = 1.924) minus the engine's own waning at bioassay
+# mortality x = 0.30 (-0.306 at the fitted net_deter_sat 0.451, vector.engine_adv_decay), the same rule as the card
+# prior's 95% bound (1.895). The 18 Nov fit's choice sat at 1.868 of 1.895. It sets this fit's box and the posterior's
+# hard bound (hard_bounds). The card prior file (priors.yaml, 0-1.895) is not edited: its test sits inside the engine's
+# code fingerprint, and an edit there would forfeit the stored checkpoint (ENGINE_NOTES.md, v0.18, refit b).
+PAD_CEILING = {"param": "pbo_adv_decay", "lo": 0.0, "hi": 2.23, "theta": 0.451,
+               "basis": "99% interval of LLINEUP's waning (as-treated, 6 -> 18 m) minus the engine's own waning at "
+                        "x = 0.30 (owner, 2026-11-19, option (a))"}
 NET_PARAMS = {"net_kill_shift": ({"pyr", "pbo", "dual"}, [-0.618, 0.66]),
               "pbo_gain_scale": ({"pbo"}, [0.316, 1.0]),
-              "pbo_adv_decay": ({"pbo"}, [0.0, 1.895]),
+              "pbo_adv_decay": ({"pbo"}, [PAD_CEILING["lo"], PAD_CEILING["hi"]]),
               "net_deter_sat": ({"pbo"}, [0.0, 1.0])}
 CONFOUNDED = [("pbo_gain_scale", "net_deter_sat")]   # owner, 18 Nov: report their joint posterior in the fit output
 # owner, 13 Nov: cfp_half joins the fit. cfp_half is the half-life, in days of net age, of the chlorfenapyr kill share
@@ -108,9 +117,36 @@ WAVE1_TARGETS = ["B10", "B11", "B12", "B12b", "B12m"]     # the fit targets wave
 # pbo_adv_decay's prior box was derived from LLINEUP (B9d, B9f), now also targets; B9g is B10 / B9c of the same arms, so
 # it adds a same-trial contrast, not independent data. cap_usd is the owner's, set here when the fit is approved:
 # 2026-11-18, one VM of 96 vCPUs (E96s_v5), $250 (about 2.4x the plan's measured-rate upper bound).
-OPTION_A = {"targets": ["B9", "B9b", "B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11", "B12", "B12b", "B12m"],
-            "design_n": 108, "wave2_n": 111, "cap_usd": 250.0,
-            "store": "outputs/_engine/net_effect_fit/option_a", "job": "f6-refit-optiona"}
+# Refit b (owner, 2026-11-19): the 18 Nov fit (f6-refit-optiona, rc 2) found no parameter set reproducing Muleba's
+# durable PBO effect with LLINEUP's waning: B9 and B9b in band together at 6 of 220 design points, all with
+# pbo_adv_decay 0.06-0.27, where B9f is 0.22-0.32 (band 0.72-0.98); B9b with B9f, and B9 with B9f, at 0/220. One
+# global waning rate cannot carry both, so B9 and B9b leave the training targets and are monitored (evaluated at the
+# chosen and verified points, reported, never used to choose). The 18 Nov engine results are reused from its stored
+# checkpoint (cache_sha256), so its tasks must not change: the design box is the box as ran, the wave-2 box is that
+# box (pinned; the 10-target wave-1 hull would otherwise narrow it and every wave-2 task rerun), and the monitored
+# arms still run with Muleba. --margin-loo is off (owner). `extension` (None until the owner sets its ceiling): an LHS
+# of n points with `param` over `range` (past the old card-prior ceiling) and every other parameter over the design box.
+OPTION_A = {"targets": ["B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11", "B12", "B12b", "B12m"],
+            "monitor": ["B9", "B9b"],
+            "departure": "B9 and B9b held out (owner, 2026-11-19): one global PBO waning rate cannot fit Muleba's durable "
+                         "effect with LLINEUP's waning (18 Nov fit: B9b with B9f and B9 with B9f jointly in band at 0/220 "
+                         "design points; B9 with B9b at 6/220, all with pbo_adv_decay 0.06-0.27, where B9f is 0.22-0.32)",
+            "design_n": 108, "wave2_n": 111, "cap_usd": 100.0,
+            "store": "outputs/_engine/net_effect_fit/option_a_b", "job": "f6-refit-optiona-b",
+            "refit_b": {"cache_sha256": "b0c557b808a0b89905ba16b633868957a9794dc72346c9cba2fb363d368cebff",
+                        "resume_dir": "_resume_optiona",
+                        "design_box": {"net_kill_shift": [-0.618, 0.66], "pbo_gain_scale": [0.316, 1.0],
+                                       "pbo_adv_decay": [0.0, 1.895], "net_deter_sat": [0.0, 1.0],
+                                       "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95], "cfp_half": [270.0, 1650.0]},
+                        "extension": {"n": 100, "seed": 37, "param": "pbo_adv_decay", "range": [1.895, 2.23]}},
+            # owner, 2026-11-20: refit b2 (f6-refit-optiona-b2) chose a point in band on all 10 targets, but 1 of its 12
+            # verified sample points missed B9g. One pre-declared verification round on b2's checkpoint (every design,
+            # extension and chosen-point task stored): new candidate and pick seeds, 12 new sample points, the 14 Nov
+            # rule unchanged, --margin-loo on, cap $20; its result is final (a failure is recorded, the owner decides)
+            "verify_v1": {"cache_sha256": "81610240b2f50e0690b1fe4f0d757c912fa2e96176f38812ee5b0edc4fb1dec6",
+                          "candidate_seed": 41, "pick_seed": 43, "resume_dir": "_resume_optiona_b2", "cap_usd": 20.0,
+                          "job": "f6-refit-optiona-v1", "store": "outputs/_engine/net_effect_fit/option_a_v1",
+                          "final": True}}
 # Verification round 2 (owner, 14 Nov): wave 2 (cluster 2377496) ran with candidates over the whole box, so its chosen
 # point and two failed points sat at cfp_half ~1,600 days, past wave 2's design box (extrapolation). This round reads
 # wave 2's engine results from its stored checkpoint (no design point rerun), refits with the candidates and the
@@ -263,6 +299,13 @@ class RecalRunner(BM.Runner):
         return tuple(sorted((s, round(float(c["value"]), 9)) for s, c in self.calibrated.items()))
 
     def prefetch(self, arms, fitted_list):
+        # refit b: a call that runs a monitored target's setting runs its arms too, so a task holds the same arms as
+        # the 18 Nov run's (all 12 targets) and the stored checkpoint matches; sorted, as every caller passes them
+        mon = {a for t in (OPTION_A.get("monitor") or [] if OPTION_A.get("refit_b") else [])   # refit b only
+               for a in BM._arms_of(self._decl[t]["estimand"])}
+        sets = {self._p["arms"][a]["setting"] for a in arms}
+        add = {a for a in mon if self._p["arms"][a]["setting"] in sets}
+        arms = sorted(set(arms) | add) if add - set(arms) else arms
         jobs, need = [], []
         for f in fitted_list:
             if self.cal_grid is not None:
@@ -368,6 +411,15 @@ def fetch_cache(blob: str, digest: str, dest: str, account: str | None = None, s
     return dest
 
 
+V1_POINTS = 12        # the 20 Nov verification round's sample points (owner)
+
+
+def v1_problems(verify: int, n_verified: int) -> list:
+    """The 20 Nov verification round fails when it verifies fewer sample points than declared (Codex review of #290)."""
+    return ([] if n_verified >= verify else
+            [f"the verification round verified {n_verified} sample points, fewer than the {verify} declared"])
+
+
 def no_rerun(runner, what: str) -> None:
     """Refuse (ValueError) once `runner` has run any engine task: a verification round reruns no design point."""
     n = int(getattr(runner, "ran_tasks", 0) or 0)
@@ -458,7 +510,8 @@ WAVE1_POINTS = 46 + VERIFY + 1        # wave 1's engine-evaluated points: design
 
 
 def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPUS, wave2_n: int = OPTION_A["wave2_n"],
-         wave1_n: int = OPTION_A["design_n"] + 2, verify_round: bool = False) -> dict:
+         wave1_n: int = OPTION_A["design_n"] + 2, verify_round: bool = False, refit_b: bool | None = None,
+         verify_v1: bool = False) -> dict:
     """Run counts and the price of the allocated VM (review round 2): vcpus x the wall time of each _map wave
     (calibration: cal_n calls of 42 single-arm tasks, none when wave 1's grid is reused; design: the wave-2 points,
     plus wave 1's when it runs here (a smoke); the chosen point: one call per training setting; the sample: one call),
@@ -471,9 +524,18 @@ def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPU
     if verify_round and list(pack["fit_joint"]["targets"]) != WAVE1_TARGETS:
         raise ValueError(f"a verification round reuses wave 2's points, run on WAVE1_TARGETS {WAVE1_TARGETS}; this "
                          f"pack's targets are {pack['fit_joint']['targets']}")
+    rb = bool(OPTION_A.get("refit_b")) and not verify_round if refit_b is None else bool(refit_b)
+    if rb:      # refit b: calibration, wave 1 and wave 2 come from the stored checkpoint; new: wave 1's re-chosen point,
+        ext = (OPTION_A["refit_b"] or {}).get("extension") or {}       # the extension, the chosen point, the sample
+        cal_n, wave1_n, wave2_n = 0, 1, int(ext.get("n") or 0)
+    if verify_v1:   # the 20 Nov round: everything stored but the (re-chosen) point and the new sample
+        rb, cal_n, wave1_n, wave2_n = True, 0, 0, 0
     fj, byid = pack["fit_joint"], {b["id"]: b for b in pack["benchmarks"]}
     arms = sorted({a for t in fj["targets"] for a in BM._arms_of(byid[t]["estimand"])})
     settings = _fit_settings(pack)
+    if rb:      # the monitored arms run with their setting (RecalRunner.prefetch), so they are priced too
+        arms = sorted(set(arms) | {a for t in OPTION_A.get("monitor") or [] for a in BM._arms_of(byid[t]["estimand"])
+                                   if pack["arms"][a]["setting"] in settings})
     per_set = max(sum(1 for a in arms if pack["arms"][a]["setting"] == s) for s in settings)
     cached = int(WAVE2["n"]) if verify_round else 0    # a verification round reads wave 2's points from its cache
     wave2_n, wave1_n, cal_n = (0, 0, 0) if verify_round else (wave2_n, wave1_n, cal_n)
@@ -504,11 +566,12 @@ def plan(pack: dict, verify: int = VERIFY, cal_n: int = CAL_N, vcpus: int = VCPU
             "vcpus": vcpus, "waves": waves, "wall_hours": [round(w, 2) for w in wall],
             "vm_vcpu_hours": [round(v, 1) for v in vh],
             "usd": [round(vh[0] * USD_PER_VCPU_H[0], 1), round(vh[1] * USD_PER_VCPU_H[1], 1)],
-            "usd_real": [round(v * USD_REAL_PER_VCPU_H, 1) for v in vh],
-            "launch": None if verify_round else shlex.join(launch_command(vcpus, wall[1], verify))}
+            "usd_real": [round(v * USD_REAL_PER_VCPU_H, 1) for v in vh], "refit_b": rb, "verify_v1": verify_v1,
+            "launch": None if verify_round else shlex.join(launch_command(vcpus, wall[1], verify, rb, verify_v1))}
 
 
-def launch_command(vcpus: int = VCPUS, wall_hours: float | None = None, verify: int = VERIFY) -> list:
+def launch_command(vcpus: int = VCPUS, wall_hours: float | None = None, verify: int = VERIFY,
+                   refit_b: bool = False, verify_v1: bool = False) -> list:
     """The option A launch (F6, OA3): one VM through cloud/vm_job.py, whose job meter stops the VM at --cap-usd in USD
     (cloud/budget.py); the fit writes a copy of its output under $JOB_OUT. Until the owner sets OPTION_A["cap_usd"] and
     gives the approval text, the command carries placeholders that vm_job and `run` refuse (fail closed). The
@@ -516,6 +579,26 @@ def launch_command(vcpus: int = VCPUS, wall_hours: float | None = None, verify: 
     --max-hours covers the plan's upper wall time plus an hour (vm_job's default is 24 h; Codex r1 P1-4 on #269)."""
     cap = OPTION_A["cap_usd"]
     hours = "<plan wall hours + 1>" if wall_hours is None else str(int(math.ceil(float(wall_hours) + 1)))
+    if verify_v1:   # the 20 Nov verification round: b2's checkpoint, --margin-loo on, its own job, store and cap
+        v1 = OPTION_A["verify_v1"]
+        rd = v1["resume_dir"]
+        return ["python3", "cloud/vm_job.py", "run", v1["job"], "net-effect-fit",
+                "--dir", f"<git archive of the launch commit, plus {rd}/{CACHE_NAME}>",
+                "--store", v1["store"], "--store-account", "modelingagentic", "--cap-usd", f"{v1['cap_usd']:g}",
+                "--budget-scope", "f6", "--cpu", str(vcpus), "--memory", f"{7 * vcpus} GiB", "--max-hours", hours,
+                "--", "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py", "run",
+                "--approved", "<owner approval: option A verification round, its cap>", "--resume-from", rd,
+                "--margin-loo", "--verify-v1", "--verify", str(int(verify)), "--workers", str(vcpus)]
+    if refit_b:     # the tree plus the stored checkpoint, shipped as one directory; the fit resumes from it
+        rd = OPTION_A["refit_b"]["resume_dir"]
+        return ["python3", "cloud/vm_job.py", "run", OPTION_A["job"], "net-effect-fit",
+                "--dir", f"<git archive of the launch commit, plus {rd}/{CACHE_NAME}>",
+                "--store", OPTION_A["store"], "--store-account", "modelingagentic",
+                "--cap-usd", "<owner cap>" if cap is None else f"{cap:g}",
+                "--budget-scope", "f6", "--cpu", str(vcpus), "--memory", f"{7 * vcpus} GiB", "--max-hours", hours,
+                "--", "python3", "toolkit/engines/malaria/benchmarks/net_effect_fit.py", "run",
+                "--approved", "<owner approval: option A refit b, its cap>", "--resume-from", rd,
+                "--verify", str(int(verify)), "--workers", str(vcpus)]
     return ["python3", "cloud/vm_job.py", "run", OPTION_A["job"], "net-effect-fit", "--tree", ".",
             "--store", OPTION_A["store"], "--store-account", "modelingagentic",
             "--cap-usd", "<owner cap>" if cap is None else f"{cap:g}",
@@ -693,7 +776,8 @@ def _fit_digest(pack: dict) -> str:
 
 
 def fit_waves(pack: dict, runner, wave1: dict, box2: dict, n: int = WAVE2["n"], seed: int = WAVE2["seed"],
-              support: list | None = None, cand_seed: int | None = None, after_design=None) -> dict:
+              support: list | None = None, cand_seed: int | None = None, after_design=None,
+              extra: list | None = None) -> dict:
     """The joint fit on two waves (rule joint-v1-wave2): joint-v1's steps (quadratic surrogate of each target's log
     value, argmin of (n out of band, band-scaled squared log error) on the dense candidates, the range, verification at
     the chosen value) on wave 1's reused points plus `n` new LHS points in `box2`; only the new points and the chosen
@@ -707,10 +791,13 @@ def fit_waves(pack: dict, runner, wave1: dict, box2: dict, n: int = WAVE2["n"], 
     to_theta = lambda x: {k: round(float(box[j, 0] + x[j] * (box[j, 1] - box[j, 0])), 6) for j, k in enumerate(names)}  # noqa: E731
     b2 = np.array([box2[k] for k in names], float)
     new = [{k: round(float(b2[j, 0] + u[j] * (b2[j, 1] - b2[j, 0])), 6) for j, k in enumerate(names)}
-           for u in BM.lhs(int(n), d, int(seed))]
+           for u in BM.lhs(int(n), d, int(seed))] + [dict(x) for x in (extra or [])]     # refit b: the extension
     arms = sorted({a for t in targets for a in BM._arms_of(byid[t]["estimand"])})
     t0 = time.time()
-    runner.prefetch(arms, new)
+    k_ext = len(extra or [])        # refit b: the stored wave-2 batch alone (its tasks as ran), then the extension
+    runner.prefetch(arms, new[:len(new) - k_ext])
+    if k_ext:
+        runner.prefetch(arms, new[len(new) - k_ext:])
     print(f"wave 2: {len(new)} design points x {len(arms)} arms x {len(runner.seeds)} seeds in {time.time() - t0:.0f}s"
           f" (wave 1: {len(wave1['points'])} points reused)", flush=True)
     Y2 = {t: [float(runner.evaluate(byid[t], th)["computed"]) for th in new] for t in targets}
@@ -775,6 +862,35 @@ JOINT_WAVE2 = ("joint-v1's surrogate, choice, range and verification on two wave
                "(reused from its output) plus an LHS of new points in wave 1's accepted hull widened by a stated "
                "margin (to the new box edge where the hull reached the old box edge); every point calibrated by "
                "interpolation on wave 1's calibration grid in net_kill_shift")
+
+
+def extension_points(design_box: dict, ext: dict | None) -> list:
+    """Refit b's extension wave: an LHS of ext["n"] points (seed ext["seed"]) with ext["param"] over ext["range"] and
+    every other parameter over the design box; [] when no extension is set."""
+    if not ext:
+        return []
+    names = list(design_box)
+    bx = {k: (list(ext["range"]) if k == ext["param"] else list(design_box[k])) for k in names}
+    return [{k: round(float(bx[k][0] + u[j] * (bx[k][1] - bx[k][0])), 6) for j, k in enumerate(names)}
+            for u in BM.lhs(int(ext["n"]), len(names), int(ext["seed"]))]
+
+
+def edge_diagnostic(point: dict, verification: dict | None = None) -> dict:
+    """Owner, 19 Nov: whether the chosen pbo_adv_decay sits within 2% of the refit-b ceiling. Within 2% and a LLINEUP
+    target (B9d-B9f) out of band at the chosen point: the engine cannot reproduce LLINEUP's waning inside the widened
+    prior. Within 2% and all three in band: it reproduces it only at the prior's edge (Codex review of #285)."""
+    v, c = float(point[PAD_CEILING["param"]]), float(PAD_CEILING["hi"])
+    near = v >= c * 0.98
+    missed = [t for t in ("B9d", "B9e", "B9f") if not ((verification or {}).get(t) or {}).get("in_band", False)]
+    if not near:
+        line = f"pbo_adv_decay {v:.3f} is below 98% of its ceiling {c:g}"
+    elif missed:
+        line = (f"pbo_adv_decay {v:.3f} is within 2% of its ceiling {c:g} and {', '.join(missed)} miss at the chosen "
+                f"point: the engine cannot reproduce LLINEUP's waning inside the widened prior")
+    else:
+        line = (f"pbo_adv_decay {v:.3f} is within 2% of its ceiling {c:g}: the engine reproduces LLINEUP's waning only "
+                f"at the edge of the widened prior")
+    return {"value": v, "ceiling": c, "within_2pct": near, "llineup_missed": missed, "line": line}
 
 
 def calibration_ok(cal: dict) -> list:
@@ -966,16 +1082,29 @@ def document(eng, reg: dict, q: dict, smoke: bool, **rest) -> dict:
                          confounding=confounding(reg)), eng)
 
 
-def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True) -> None:
-    """A placeholder output in run()'s own format, through finalize() and document() (self-tests only)."""
+def target_digests(base: dict, ids) -> dict:
+    """{id: band_digest} of the fit targets' declarations in the pack the fit ran with (written with its output; the
+    loader trusts a training target's chosen-point verification only for the declaration it was computed under)."""
+    from toolkit.engines.benchmark_sources import band_digest
+    return {b["id"]: band_digest(b, base) for b in base["benchmarks"] if b["id"] in set(ids)}
+
+
+def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True, point=None) -> None:
+    """A placeholder output in run()'s own format, through finalize() and document() (self-tests only). `point`: the
+    chosen point's values (default the first row; False leaves the chosen point without one)."""
     ks = [(-1, 0, 1, 0)[i % 4] for i in range(len(pack_seeds()))]       # one seed value per pack seed
     mid = lambda f: {t: [round(float(np.sqrt(lo * hi)) * f * (1 + 0.01 * k), 4) for k in ks]  # noqa: E731
                      for t, (lo, hi) in pack_bands().items()}            # seed values around each band's middle
     pt = {"point": rows[0], "per_seed": mid(1.0 if gate_ok else 3.0), "calibration_check": {}}
-    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], {"per_seed": mid(1.0), "all_in_band": True,
-                                                                "disproved_by_verification": [], "calibration_check": {}})
+    ch = {"per_seed": mid(1.0), "all_in_band": True, "disproved_by_verification": [], "calibration_check": {}}
+    if point is not False:
+        ch["point"] = dict(rows[0] if point is None else point)
+    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], ch)
+    fit = {"parameters": {k: {"value": v} for k, v in ch.get("point", {}).items()}}     # as run()'s **fit
     yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []},
-                            fit_rule={"seeds": pack_seeds()}), open(path, "w"), sort_keys=False)
+                            fit_rule={"seeds": pack_seeds()},
+                            target_digests=target_digests(yaml.safe_load(open(PACK)), pack_bands()), **fit),
+                   open(path, "w"), sort_keys=False)
 
 
 class PosteriorRefused(ValueError):
@@ -1057,8 +1186,9 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
     if rec != seeds:
         no(f"the run's recorded seeds {rec} are not pack.yaml's {seeds}")
     try:
+        bands = pack_bands()        # the targets the replay checks the chosen point on (finalize's default)
         rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
-                           edge, seeds=seeds)
+                           edge, bands=bands, seeds=seeds)
         why = rr["acceptance"]
     except (KeyError, TypeError, ValueError, AttributeError) as ex:
         code, why = 2, [f"{type(ex).__name__}: {ex}"]
@@ -1074,7 +1204,18 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
             tol = 1e-6 * max(1.0, hi - lo) if math.isfinite(hi - lo) else 1e-6     # the sample is rounded to 6 decimals
             if X[:, j].min() < lo - tol or X[:, j].max() > hi + tol:
                 no(f"{k} spans [{X[:, j].min()}, {X[:, j].max()}], outside its hard bound [{lo}, {hi}] ({what})")
-    return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X}
+    # `trained` {id: declaration digest}: the file's training targets, less any it also lists as held out, that the
+    # replay verified the chosen point in band on, each with the digest of the pack declaration the replay used
+    from toolkit.engines.benchmark_sources import band_digest
+    pl, base = doc.get("plan") or {}, yaml.safe_load(open(PACK))
+    tt, ho = pl.get("targets_train"), pl.get("held_out_untouched") or []
+    decl = {b["id"]: b for b in base["benchmarks"]}
+    # the digest the fit recorded when it ran (target_digests) must be the current declaration's (Codex r2)
+    td = doc.get("target_digests") if isinstance(doc.get("target_digests"), dict) else {}
+    trained = {k: td[k] for k in sorted(set(bands) & set(tt) - set(ho)) if decl[k].get("band") == bands[k]
+               and td.get(k) == band_digest(decl[k], base)} if isinstance(tt, list) and isinstance(ho, list) else {}
+    return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X,
+            "trained": trained}
 
 
 # hard bounds a card's units imply (owner, 14 Nov, f6-posterior-ranges): a value outside them is not physical
@@ -1095,6 +1236,8 @@ def hard_bounds(engine, names, both: bool = False) -> dict:
     out = {}
     for k in names:
         b = ([(*UNIT_BOUNDS[units[k]], f"card units {units[k]}")] if units.get(k) in UNIT_BOUNDS else []) + (
+            [(PAD_CEILING["lo"], PAD_CEILING["hi"], "refit b ceiling: " + PAD_CEILING["basis"])]
+            if k == PAD_CEILING["param"] else
             [(float(card[k].lo), float(card[k].hi), "priors.yaml range")] if k in card else [])
         if b:
             out[k] = b if both else (max(x[0] for x in b), min(x[1] for x in b), "; ".join(x[2] for x in b))
@@ -1147,7 +1290,8 @@ def run_cap(verify_round: bool, smoke: bool, caller: float | None, owner: float 
 
 def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | None, smoke: bool,
         verify: int = VERIFY, cap_usd: float | None = None, vcpus: int | None = None, resume_from: str | None = None,
-        margin_loo: bool = False, verify_round: bool = False, resume_account: str | None = None) -> int:
+        margin_loo: bool = False, verify_round: bool = False, resume_account: str | None = None,
+        verify_v1: bool = False) -> int:
     """Wave 2 of the fit (with `verify_round`, VERIFY_ROUND: wave 2's points read from its stored checkpoint, a new
     joint sample verified): wave 1's points and calibration grid reused (load_wave1), WAVE2's points run, the surrogate
     refitted on both, the joint region (with --margin-loo, inside each band by the local leave-one-out error), the
@@ -1165,12 +1309,36 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
     if not smoke and (approved or "").strip().startswith("<"):
         raise ValueError(f"--approved {approved!r} is the launch command's placeholder text, not the owner's "
                          f"approval")
+    rb = bool(OPTION_A.get("refit_b")) and not verify_round and not smoke
+    v1 = OPTION_A["verify_v1"] if verify_v1 else None
+    if v1 and not rb:
+        raise ValueError("the verification round is refit b's (not a smoke or the old verification round)")
+    if v1 and verify != V1_POINTS:
+        raise ValueError(f"the 20 Nov verification round verifies exactly {V1_POINTS} sample points, not {verify}")
+    if rb:          # refit b: only from the stored 18 Nov checkpoint, under its sha256, and without the margin option
+        import hashlib      # (the 20 Nov verification round: b2's checkpoint, with --margin-loo)
+        if v1 and not margin_loo:
+            raise ValueError("the 20 Nov verification round runs with --margin-loo (owner, 20 Nov)")
+        if margin_loo and not v1:
+            raise ValueError("refit b runs without --margin-loo (owner, 19 Nov)")
+        if not resume_from:
+            raise ValueError(f"refit b resumes from the stored 18 Nov checkpoint: pass --resume-from <dir holding "
+                             f"{CACHE_NAME}>")
+        cp = os.path.join(resume_from, CACHE_NAME)
+        got = hashlib.sha256(open(cp, "rb").read()).hexdigest() if os.path.isfile(cp) else None
+        want = (v1 or OPTION_A["refit_b"])["cache_sha256"]
+        if got != want:
+            raise ValueError(f"refit b: {cp} has sha256 {got}, not the stored checkpoint's {want}")
     nv = vcpus or max(int(workers), 1)
     fresh = smoke or not verify_round          # F6 option A: a fresh fit (smoke: the same steps, small)
-    q = plan(pack, verify, 2, nv, 3, int(pack["fit_joint"]["design"]["n"]) + 2) if smoke else plan(
-        pack, verify, 0, nv, verify_round=True) if verify_round else plan(
-        pack, verify, CAL_N, nv, OPTION_A["wave2_n"], int(pack["fit_joint"]["design"]["n"]) + 2)
-    cap_usd = run_cap(verify_round, smoke, cap_usd, OPTION_A["cap_usd"])
+    q = plan(pack, verify, 2, nv, 3, int(pack["fit_joint"]["design"]["n"]) + 2, refit_b=False) if smoke else plan(
+        pack, verify, 0, nv, verify_round=True) if verify_round else plan(pack, verify, vcpus=nv, refit_b=True,
+                                                                          verify_v1=bool(v1)) if rb \
+        else plan(pack, verify, CAL_N, nv, OPTION_A["wave2_n"], int(pack["fit_joint"]["design"]["n"]) + 2,
+                  refit_b=False)
+    cap_usd = run_cap(verify_round, smoke, cap_usd, v1["cap_usd"] if v1 else OPTION_A["cap_usd"])
+    cseed = VERIFY_ROUND["candidate_seed"] if verify_round else v1["candidate_seed"] if v1 else None
+    pseed = VERIFY_ROUND["pick_seed"] if verify_round else v1["pick_seed"] if v1 else None
     if not smoke and max(q["usd"][1], q["usd_real"][1]) > cap_usd:
         raise ValueError(f"the plan's upper cost ${max(q['usd'][1], q['usd_real'][1])} on {q['vcpus']} vCPUs is above "
                          f"the cap ${cap_usd}")
@@ -1190,30 +1358,44 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
     names = list(pack["fit_joint"]["params"])
     box = np.array([pack["fit_joint"]["params"][k] for k in names], float)
     bands = target_bands(pack)
+    p1, ext, extra = pack, None, []
+    if rb:      # refit b: wave 1 and the calibration grid on the design box as ran (their tasks are in the checkpoint)
+        dbx = OPTION_A["refit_b"]["design_box"]
+        if list(dbx) != names:
+            raise ValueError(f"refit b: the design box's parameters {list(dbx)} are not the fit's {names}")
+        p1 = copy.deepcopy(pack)
+        p1["fit_joint"]["params"] = {k: list(v) for k, v in dbx.items()}
+        ext = OPTION_A["refit_b"].get("extension")
+        extra = extension_points(dbx, ext)
     if fresh:
-        runner.calibrate_grid(_fit_settings(pack), {k: float(box[i].mean()) for i, k in enumerate(names)},
+        b1 = np.array([p1["fit_joint"]["params"][k] for k in names], float)
+        runner.calibrate_grid(_fit_settings(pack), {k: float(b1[i].mean()) for i, k in enumerate(names)},
                               2 if smoke else CAL_N)
         grid_edge = sorted(s for s, rows in runner.cal_grid["rows"].items() if any(r.get("at_grid_edge") for r in rows))
-        f1 = BM.fit_joint(pack, eng, runner)
+        f1 = BM.fit_joint(p1, eng, runner)
         X1 = np.array([[(th[k] - box[i, 0]) / (box[i, 1] - box[i, 0]) for i, k in enumerate(names)]
                        for th in f1["design"]["x"]])
         wave1 = {"path": None, "sha256": None, "hull": joint_region(X1, f1["design"]["computed"], bands, names, box,
                                                                     int(pack["fit_joint"]["design"]["seed"]))["hull"],
                  "points": [{"x": x, "wave": 1, "computed": {t: f1["design"]["computed"][t][i] for t in bands}}
                             for i, x in enumerate(f1["design"]["x"])]}
-        old_box = {k: list(pack["fit_joint"]["params"][k]) for k in names}
+        old_box = {k: list(p1["fit_joint"]["params"][k]) for k in names}
     else:
         runner.use_grid(wave1["calibration_grid"])
         grid_edge = list(wave1["at_grid_edge"])
         old_box = WAVE1_BOX
     new_box = {k: list(pack["fit_joint"]["params"][k]) for k in names}
     box2 = wave2_box(wave1["hull"], old_box, new_box, WAVE2["margin"]) if wave1["hull"] else new_box
+    if rb:      # refit b: the wave-2 box as it ran on 18 Nov (the design box), so wave 2's tasks are the stored ones
+        box2 = dict(old_box)
     support = [old_box, box2]          # the waves' design boxes: candidates and the choice stay inside their union
+    if ext:
+        support.append({k: (list(ext["range"]) if k == ext["param"] else list(old_box[k])) for k in names})
     rv = verify_round and not smoke
     n2 = 3 if smoke else WAVE2["n"] if verify_round else OPTION_A["wave2_n"]
     fit = fit_waves(pack, runner, wave1, box2, n2, WAVE2["seed"], support=support,
-                    cand_seed=VERIFY_ROUND["candidate_seed"] if verify_round else None,
-                    after_design=(lambda: no_rerun(runner, "wave 2's design")) if rv else None)
+                    cand_seed=cseed,
+                    after_design=(lambda: no_rerun(runner, "wave 2's design")) if (rv or v1) else None, extra=extra)
     X = np.array([[(th[k] - box[i, 0]) / (box[i, 1] - box[i, 0]) for i, k in enumerate(names)]
                   for th in fit["design"]["x"]])
     margin = None
@@ -1223,7 +1405,7 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
         margin = local_loo({t: np.log(np.maximum(np.asarray(v, float), 1e-12))
                             for t, v in fit["design"]["computed"].items()}, X, inside)
     reg = joint_region(X, fit["design"]["computed"], bands, names, box, int(
-        VERIFY_ROUND["candidate_seed"] if verify_round else pack["fit_joint"]["design"]["seed"]), margin=margin,
+        cseed if cseed is not None else pack["fit_joint"]["design"]["seed"]), margin=margin,
                        support=support)
     waves = {"wave1": {"file": None if fresh else os.path.basename(WAVE1), "sha256": wave1["sha256"],
                        "points_reused": 0 if fresh else len(wave1["points"]), "calibration_grid_reused": not fresh,
@@ -1246,8 +1428,7 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
               "disproved_by_verification": fit["feasibility"]["disproved_by_verification"],
               "calibration_check": _control_check(runner, pack, ctrl, best)}
     # re-run `verify` joint-sample points, each at its own interpolated calibration, as the design points were
-    rng = np.random.default_rng(int(VERIFY_ROUND["pick_seed"] if verify_round
-                                    else int(pack["fit_joint"]["design"]["seed"]) + 1))
+    rng = np.random.default_rng(int(pseed if pseed is not None else int(pack["fit_joint"]["design"]["seed"]) + 1))
     pick = sorted(rng.choice(len(reg["sample"]), min(verify, len(reg["sample"])), replace=False).tolist()) \
         if reg["sample"] else []
     runner.prefetch(sorted({a for t in pack["fit_joint"]["targets"] for a in BM._arms_of(byid[t]["estimand"])}),
@@ -1260,7 +1441,22 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
                         "per_seed": {t: list(r.get("per_seed") or []) for t, r in rows.items()},
                         "calibration_check": _control_check(runner, pack, ctrl, reg["sample"][i])})
     reg, code = finalize(reg, checked, chosen, grid_edge, bands=bands, seeds=list(runner.seeds))
+    if v1 and v1_problems(verify, len(checked)):        # the round's result: fewer points than declared fail it
+        reg["acceptance"] = list(reg.get("acceptance") or []) + v1_problems(verify, len(checked))
+        reg["sample_status"], code = "invalid", 2
+    waves["verify_v1"] = ({k: v1[k] for k in ("cache_sha256", "candidate_seed", "pick_seed", "cap_usd", "final")}
+                          if v1 else None)      # the 20 Nov round: its result is final, the owner decides on failure
+    # refit b: the monitored (held-out) targets at the chosen point and the verified points, reported only
+    mon = {t: {"at_chosen": round(runner.evaluate(byid[t], best)["computed"], 4),
+               "at_verified": [round(runner.evaluate(byid[t], c["point"])["computed"], 4) for c in checked],
+               "band": byid[t].get("band")} for t in (OPTION_A.get("monitor") or []) if not smoke}
+    waves["refit_b"] = ({"cache_sha256": OPTION_A["refit_b"]["cache_sha256"], "wave2_box": "the design box (pinned)",
+                         "extension": ext, "extension_points": len(extra), "margin_loo": margin_loo,
+                         "departure": OPTION_A.get("departure"), "monitored": mon,
+                         "pad_ceiling": PAD_CEILING, "edge": edge_diagnostic(best, fit["verification"])}
+                        if rb else None)
     doc = document(eng, reg, q, smoke, approved=approved, cap_usd=cap_usd, n_sims=runner.nsims, waves=waves,
+                   target_digests=target_digests(pack, bands),       # the pack it evaluated (Codex r3)
                    wall_s=round(time.time() - t0, 1), fitted_at=time.strftime("%F %T"),
                    calibration_grid={CAL_PARAM: runner.cal_grid["values"], "m0": runner.cal_grid["m0"],
                                      "at_grid_edge": grid_edge}, **fit)
@@ -1357,7 +1553,7 @@ def _self_test() -> int:
        "F3 the box holds every current value; the kill shift's box is its card prior (Churcher 2016 alpha1 CrI)")
 
     def f4():
-        hist = {"cal_n": 0, "wave2_n": WAVE2["n"], "wave1_n": 0}       # wave 2 as it ran (history)
+        hist = {"cal_n": 0, "wave2_n": WAVE2["n"], "wave1_n": 0, "refit_b": False}     # wave 2 as it ran (history)
         q = plan(p_w, **hist)
         w = q["waves"]
         n2 = WAVE2["n"]
@@ -1429,10 +1625,10 @@ def _self_test() -> int:
         rr._map = lambda jobs, chunk=300: (ran.append(len(jobs)), [{"windows": {}} for _ in jobs])[1]
         th = {"net_kill_shift": 0.0, "cfp_kill": 0.4, "irs_kill": 0.4, "cfp_half": 912.5}
         rr.set_calibration({"muleba": 60.0, "misungwi": 11.0, "benin": 10.0, "irs_added": 20.0})
-        rr.prefetch(["mul_pyr"], [th])
-        rr.prefetch(["mul_pyr"], [th])
-        rr.set_calibration({"muleba": 70.0, "misungwi": 11.0, "benin": 10.0, "irs_added": 20.0})
-        rr.prefetch(["mul_pyr"], [th])
+        rr.prefetch(["mis_pyr"], [th])         # (refit b: a Muleba call also runs the monitored arms, FB2)
+        rr.prefetch(["mis_pyr"], [th])
+        rr.set_calibration({"muleba": 60.0, "misungwi": 12.0, "benin": 10.0, "irs_added": 20.0})
+        rr.prefetch(["mis_pyr"], [th])
         ok(ran == [1, 1], f"F10 (review P2) the result cache is keyed on the calibration: the same point is reused "
                           f"under the same calibration and re-run under another (jobs per prefetch {ran})")
     case("F10", f10)
@@ -2099,7 +2295,7 @@ def _self_test() -> int:
     def fa1():
         tr, ho = split(p)
         ok(tr == OPTION_A["targets"] and base["fit_joint"]["targets"] == WAVE1_TARGETS
-           and {"B9", "B9b", "B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11"} <= set(tr)
+           and {"B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11"} <= set(tr) and {"B9", "B9b"} <= set(ho)
            and {"B12", "B12b", "B12m"} <= set(tr) and {"B7", "B8", "B15"} <= set(ho) and not set(tr) & set(ho),
            f"FA1 option A: the net-effect fit's own declaration (fit record (b)) is the net trials at their own "
            f"estimands plus the IRS targets ({tr}); the pack's fit_joint keeps {WAVE1_TARGETS}, so fitted.yaml stays "
@@ -2112,8 +2308,8 @@ def _self_test() -> int:
         ok(sorted(bx) == sorted(["net_kill_shift", "pbo_gain_scale", "pbo_adv_decay", "net_deter_sat", "cfp_kill",
                                  "irs_kill", "cfp_half"])
            and "pbo" in train_nets(p, split(p)[0])
-           and all(bx[k] == [card[k].lo, card[k].hi] for k in ("net_kill_shift", "pbo_gain_scale", "pbo_adv_decay",
-                                                                "net_deter_sat"))
+           and all(bx[k] == [card[k].lo, card[k].hi] for k in ("net_kill_shift", "pbo_gain_scale", "net_deter_sat"))
+           and bx["pbo_adv_decay"] == [PAD_CEILING["lo"], PAD_CEILING["hi"]]       # refit b's ceiling (FB7)
            and calibration_params(p) == {"net_kill_shift"}
            and _fit_settings(p) == ["benin", "irs_added", "llineup", "misungwi", "muleba"],
            f"FA2 option A fits net_kill_shift, pbo_gain_scale, pbo_adv_decay, net_deter_sat (v0.18), cfp_kill, "
@@ -2122,7 +2318,7 @@ def _self_test() -> int:
     case("FA2", fa2)
 
     def fa3():
-        q = plan(p)
+        q = plan(p, refit_b=False)              # the 18 Nov fresh fit's plan (refit b reuses it: FB4)
         nd = OPTION_A["design_n"]
         ns_, nset = len(base["seeds"]), 5
         ok(nd == 3 * (7 + 1) * (7 + 2) // 2 and q["wave1_points_run"] == nd + 2
@@ -2141,8 +2337,9 @@ def _self_test() -> int:
     case("FA3", fa3)
 
     def fa4():
-        got, saved = {}, OPTION_A["cap_usd"]
+        got, saved, rb_saved = {}, OPTION_A["cap_usd"], OPTION_A.get("refit_b")
         OPTION_A["cap_usd"] = None             # Codex r1 P2: the refusal is tested whatever the production cap is
+        OPTION_A["refit_b"] = None             # the fresh fit's refusals (refit b refuses earlier without its cache)
         try:
             for label, kw in (("the old verification round", {"verify_round": True}), ("no owner cap", {})):
                 try:
@@ -2151,7 +2348,7 @@ def _self_test() -> int:
                 except ValueError as ex:
                     got[label] = str(ex)
         finally:
-            OPTION_A["cap_usd"] = saved
+            OPTION_A["cap_usd"], OPTION_A["refit_b"] = saved, rb_saved
         # the old round is refused at its plan (WAVE1_TARGETS, FA6) before load_wave1 (declarations) is reached
         ok(("declarations" in got["the old verification round"] or "WAVE1_TARGETS" in got["the old verification round"])
            and "cap" in got["no owner cap"],
@@ -2260,7 +2457,7 @@ def _self_test() -> int:
             run(p_w, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=True)
         except ValueError as ex:
             got = str(ex)
-        ok("OPTION_A" in got and OPTION_A["job"] == "f6-refit-optiona" and "v0.18" in PURPOSE,
+        ok("OPTION_A" in got and OPTION_A["job"] == "f6-refit-optiona-b" and "v0.18" in PURPOSE,
            f"FA10 a fresh fit (or smoke) on another declaration is refused before any engine set-up ({got[:120]}); the "
            f"launch job is {OPTION_A['job']} (an f6 budget prefix)")
     case("FA10", fa10)
@@ -2268,7 +2465,7 @@ def _self_test() -> int:
     def fa11():
         # owner, 18 Nov (one VM, 96 vCPUs): a chunk barrier of 300 tasks idled up to a third of a large VM at each
         # chunk's tail; a chunk is now max(300, 4 x workers) (still a fresh pool per chunk, for worker memory)
-        q = plan(p, vcpus=96)
+        q = plan(p, vcpus=96, refit_b=False)
         nd, ns_, nset = OPTION_A["design_n"] + 2, len(base["seeds"]), 5
         ok(_chunk(16) == 300 and _chunk(96) == 384 and _chunk(1) == 300
            and q["waves"]["design"] == math.ceil(nd * nset * ns_ / 96) + math.ceil(OPTION_A["wave2_n"] * nset * ns_ / 96)
@@ -2278,8 +2475,8 @@ def _self_test() -> int:
     case("FA11", fa11)
 
     def fa12():
-        ok(shipped_cap == 250.0, f"FA12 the owner's cap for the option A fit (18 Nov, 1 VM of 96 vCPUs) is $250: "
-                                 f"{shipped_cap}")
+        ok(shipped_cap == 100.0, f"FA12 the owner's cap for option A refit b (19 Nov, 1 VM of 96 vCPUs) is $100 (the "
+                                 f"18 Nov fit's was $250): {shipped_cap}")
     case("FA12", fa12)
 
     def fa13():
@@ -2295,6 +2492,189 @@ def _self_test() -> int:
         ok(got == {16: "Standard_E16s_v5", 96: "Standard_E96s_v5"},
            f"FA13 the printed launch resolves to the Esv5 family first ({got})")
     case("FA13", fa13)
+
+    # F6 option A refit b (owner, 19 Nov): Muleba's B9 and B9b leave the training targets (declared departure) and are
+    # monitored; the stored cache of 18 Nov is reused (its tasks must match exactly); the wave-2 box is the box as ran;
+    # --margin-loo off; an optional extension wave past pad's old ceiling
+    rb = OPTION_A.get("refit_b") or {}
+
+    def fb1():
+        ok(OPTION_A["targets"] == ["B9c", "B9d", "B9e", "B9f", "B9g", "B10", "B11", "B12", "B12b", "B12m"]
+           and OPTION_A.get("monitor") == ["B9", "B9b"] and "0/220" in str(OPTION_A.get("departure"))
+           and not set(OPTION_A["monitor"]) & set(OPTION_A["targets"]) and set(OPTION_A["monitor"]) <= set(held),
+           f"FB1 B9 and B9b are held out of the fit and monitored, with the departure stated ({OPTION_A.get('monitor')})")
+    case("FB1", fb1)
+
+    def fb2():
+        # the 18 Nov tasks held every arm of the 12 targets per setting and seed; dropping B9/B9b would leave Muleba's
+        # tasks without mul_pbo and miss the cache: the runner adds a monitored target's arms to a call that runs its
+        # setting, so the tasks are the same
+        rr = RecalRunner(p, e, 1, [11], mode="fit", evidence=BM.load_evidence(e, pack=p))
+        seen = []
+        rr._arm_jobs = lambda a, f: (seen.append(a), [("job", a)])[1]
+        rr._map = lambda jobs, chunk=300: [{"windows": {}} for _ in jobs]
+        rr.set_calibration({"muleba": 60.0, "misungwi": 11.0, "benin": 10.0, "irs_added": 20.0, "llineup": 3.3})
+        arms10 = sorted({a for t in OPTION_A["targets"] for a in BM._arms_of(byid[t]["estimand"])})
+        arms12 = sorted(set(arms10) | {a for t in OPTION_A["monitor"] for a in BM._arms_of(byid[t]["estimand"])})
+        rr.prefetch(arms10, [{"net_kill_shift": 0.0, "cfp_kill": 0.4}])
+        seen2 = list(seen)
+        seen.clear()
+        rr.prefetch(["mis_dual", "mis_pyr"], [{"net_kill_shift": 0.1, "cfp_kill": 0.4}])
+        ok(seen2 == arms12 and seen == ["mis_dual", "mis_pyr"],
+           f"FB2 a call running Muleba gains the monitored arms in the 18 Nov order ({seen2}); one without it does not "
+           f"({seen})")
+    case("FB2", fb2)
+
+    def fb3():
+        got = {}
+        for label, kw in (("no cache", {}), ("margin-loo", {"margin_loo": True, "resume_from": "/nonexistent"}),
+                          ("another cache", {"resume_from": HERE})):
+            try:
+                run(p, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=False, cap_usd=1e9, **kw)
+                got[label] = ""
+            except ValueError as ex:
+                got[label] = str(ex)
+        ok(rb.get("cache_sha256") == "b0c557b808a0b89905ba16b633868957a9794dc72346c9cba2fb363d368cebff"
+           and "resume" in got["no cache"] and "margin" in got["margin-loo"] and "sha256" in got["another cache"],
+           f"FB3 refit b runs only from the stored 18 Nov cache (pinned sha256) and without --margin-loo: {got}")
+    case("FB3", fb3)
+
+    def fb4():
+        q = plan(p, vcpus=96)
+        ext = rb.get("extension") or {}
+        n_ext = int(ext.get("n") or 0)
+        # Codex review of #285: the monitored arm (mul_pbo) runs with Muleba, so the plan counts it
+        ok(q.get("refit_b") is True and "mul_pbo" in q["arms"] and len(q["arms"]) == 12
+           and q["calibration_runs"] == 0 and q["design_points"] == n_ext
+           and q["wave1_points_run"] == 1 and q["arm_runs"] < 30000,
+           f"FB4 refit b prices only new tasks: wave 1's re-chosen point, {n_ext} extension points, the chosen point "
+           f"and {VERIFY} sample points ({q['arm_runs']} arm runs, {q['wall_hours']} h, ${q['usd_real']})")
+    case("FB4", fb4)
+
+    def fb5():
+        import shlex
+        OPTION_A["cap_usd"] = shipped_cap
+        try:
+            cmd = shlex.split(plan(p, vcpus=96)["launch"])
+        finally:
+            OPTION_A["cap_usd"] = None
+        tail = cmd[cmd.index("--") + 1:]
+        ok(cmd[3] == "f6-refit-optiona-b" and "--dir" in cmd and "--tree" not in cmd
+           and tail[tail.index("--resume-from") + 1] == rb.get("resume_dir") and "--margin-loo" not in tail
+           and cmd[cmd.index("--cap-usd") + 1] == "100",
+           f"FB5 the refit-b launch ships the tree and the cache (--dir), resumes from it, no --margin-loo, cap $100: "
+           f"{' '.join(cmd)}")
+    case("FB5", fb5)
+
+    def fb6():
+        # the extension wave (when set): LHS points with pad past the old ceiling and every other parameter over the
+        # design box; the box the surrogate and the choice use then reaches the new ceiling
+        ext = {"n": 7, "seed": 37, "param": "pbo_adv_decay", "range": [1.895, 2.23]}
+        pts = extension_points(rb["design_box"], ext)
+        dbx = rb["design_box"]
+        ok(len(pts) == 7 and all(1.895 <= q["pbo_adv_decay"] <= 2.23 for q in pts)
+           and all(dbx[k][0] <= q[k] <= dbx[k][1] for q in pts for k in dbx if k != "pbo_adv_decay")
+           and extension_points(dbx, None) == [],
+           f"FB6 the extension wave lies past the old ceiling, inside the design box elsewhere ({pts[:1]})")
+    case("FB6", fb6)
+
+    def fb7():
+        # owner, 19 Nov, option (a): pbo_adv_decay's ceiling is 2.23 per year (LLINEUP's 99% waning bound minus the
+        # engine's own waning at x = 0.30); the fit's box and the posterior's hard bound reach it; 100 extension points
+        # lie in 1.895-2.23; the card prior file is not edited (its test sits inside the engine's code fingerprint)
+        from toolkit.engines.malaria import vector as V
+        pt, lo, hi = V.adv_decay_from_prs((0.74, 0.62, 0.87), (0.84, 0.72, 0.98), 1.0, clip=False)
+        s = (hi - pt) / 1.959964
+        k30 = V.engine_adv_decay(0.30, 182.5, 547.5, dict(V.NET_DEFAULTS, cfp_kill=0.0, cfp_half=1.0,
+                                                           net_deter_sat=PAD_CEILING["theta"]))  # at the fitted theta
+        ceil = round(pt + 2.575829 * s - k30, 2)
+        hb = hard_bounds(e, ["pbo_adv_decay"])["pbo_adv_decay"]
+        ext = rb.get("extension") or {}
+        ok(ceil == 2.23 == PAD_CEILING["hi"] and NET_PARAMS["pbo_adv_decay"][1] == [0.0, 2.23]
+           and (hb[0], hb[1]) == (0.0, 2.23) and ext.get("n") == 100 and ext.get("range") == [1.895, 2.23]
+           and ext.get("param") == "pbo_adv_decay" and rb["design_box"]["pbo_adv_decay"] == [0.0, 1.895]
+           and p["fit_joint"]["params"]["pbo_adv_decay"] == [0.0, 2.23],
+           f"FB7 the widened pbo_adv_decay ceiling {ceil} (99% LLINEUP bound {pt + 2.575829 * s:.3f} minus the engine's "
+           f"waning at x 0.30 {k30:.3f}) sets the fit box and the hard bound; 100 extension points ({hb}, {ext})")
+    case("FB7", fb7)
+
+    def fb8():
+        # owner, 19 Nov: a one-line diagnostic: does the chosen pbo_adv_decay sit within 2% of the new ceiling
+        # (Codex review of #285: "cannot reproduce" only when a LLINEUP target also misses at the chosen point)
+        miss = {"B9d": {"in_band": True}, "B9e": {"in_band": False}, "B9f": {"in_band": True}}
+        hit = {t: {"in_band": True} for t in ("B9d", "B9e", "B9f")}
+        near_miss = edge_diagnostic({"pbo_adv_decay": 2.20}, miss)
+        near_hit = edge_diagnostic({"pbo_adv_decay": 2.20}, hit)
+        far = edge_diagnostic({"pbo_adv_decay": 1.60}, miss)
+        ok(near_miss["within_2pct"] is True and far["within_2pct"] is False and near_miss["ceiling"] == 2.23
+           and "cannot reproduce LLINEUP's waning" in near_miss["line"] and "B9e" in near_miss["line"]
+           and "cannot" not in near_hit["line"] and "edge" in near_hit["line"] and "cannot" not in far["line"],
+           f"FB8 the edge diagnostic: {near_miss['line']} | {near_hit['line']} | {far['line']}")
+    case("FB8", fb8)
+
+    # owner, 2026-11-20: one pre-declared verification round on refit b2's checkpoint: new candidate and pick seeds, 12
+    # new sample points, the 14 Nov rule unchanged, --margin-loo on, cap $20, the result final
+    v1 = OPTION_A.get("verify_v1") or {}
+
+    def fv1():
+        ok(v1.get("cache_sha256") == "81610240b2f50e0690b1fe4f0d757c912fa2e96176f38812ee5b0edc4fb1dec6"
+           and v1.get("candidate_seed") not in (None, DESIGN["seed"], VERIFY_ROUND["candidate_seed"])
+           and v1.get("pick_seed") not in (None, DESIGN["seed"] + 1, VERIFY_ROUND["pick_seed"])
+           and v1.get("cap_usd") == 20.0 and v1.get("job") == "f6-refit-optiona-v1" and v1.get("final") is True,
+           f"FV1 the verification round is pinned to b2's checkpoint, with new seeds, cap $20, result final ({v1})")
+    case("FV1", fv1)
+
+    def fv2():
+        got = {}
+        for label, kw in (("margin-loo off", {"resume_from": "/nonexistent"}),
+                          ("no cache", {"margin_loo": True}),
+                          ("refit b's cache", {"margin_loo": True, "resume_from": HERE})):
+            try:
+                run(p, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=False, cap_usd=1e9, verify_v1=True,
+                    **kw)
+                got[label] = ""
+            except ValueError as ex:
+                got[label] = str(ex)
+        ok("margin" in got["margin-loo off"] and "resume" in got["no cache"] and "sha256" in got["refit b's cache"]
+           and v1.get("cache_sha256") in got["refit b's cache"],
+           f"FV2 the round runs only with --margin-loo and from b2's pinned checkpoint: {got}")
+    case("FV2", fv2)
+
+    def fv3():
+        q = plan(p, vcpus=48, verify_v1=True)
+        ok(q["calibration_runs"] == 0 and q["design_points"] == 0 and q["wave1_points_run"] == 0
+           and q["verified_sample_points"] == VERIFY and q["arm_runs"] == (1 + VERIFY) * len(q["arms"]) * 8
+           and q.get("verify_v1") is True,
+           f"FV3 the round prices the chosen point and {VERIFY} new sample points only ({q['arm_runs']} arm runs, "
+           f"{q['wall_hours']} h, ${q['usd_real']})")
+    case("FV3", fv3)
+
+    def fv4():
+        import shlex
+        OPTION_A["cap_usd"] = shipped_cap
+        try:
+            cmd = shlex.split(plan(p, vcpus=48, verify_v1=True)["launch"])
+        finally:
+            OPTION_A["cap_usd"] = None
+        tail = cmd[cmd.index("--") + 1:]
+        ok(cmd[3] == "f6-refit-optiona-v1" and cmd[cmd.index("--cap-usd") + 1] == "20" and "--dir" in cmd
+           and "--margin-loo" in tail and "--verify-v1" in tail
+           and tail[tail.index("--resume-from") + 1] == v1.get("resume_dir"),
+           f"FV4 the round's launch: {' '.join(cmd)}")
+    case("FV4", fv4)
+
+    def fv5():
+        # Codex review of #290 (P1): the round verifies exactly 12 sample points; a smaller --verify is refused before
+        # any engine set-up, and a region with fewer than 12 points fails the round (recorded), whatever the rule says
+        got = ""
+        try:
+            run(p, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=False, cap_usd=1e9, verify=1,
+                verify_v1=True, margin_loo=True, resume_from="/nonexistent")
+        except ValueError as ex:
+            got = str(ex)
+        ok("12" in got and v1_problems(12, 11) and not v1_problems(12, 12) and not v1_problems(12, 400),
+           f"FV5 the round needs 12 verified sample points ({got[:90]}; {v1_problems(12, 11)})")
+    case("FV5", fv5)
     OPTION_A["cap_usd"] = shipped_cap
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
@@ -2318,20 +2698,23 @@ def main(argv=None) -> int:
     ap.add_argument("--verify-round", action="store_true", help="VERIFY_ROUND: wave 2's points from its stored "
                     "checkpoint, a new joint sample verified (owner, 14 Nov)")
     ap.add_argument("--resume-account", default=None, help="storage account of the stored checkpoint")
+    ap.add_argument("--verify-v1", action="store_true", help="OPTION_A verify_v1: the owner's 20 Nov verification "
+                    "round on refit b2's checkpoint (new seeds, --margin-loo, cap $20)")
     ap.add_argument("--margin-loo", action="store_true", help="export only candidates in band by each target's local "
                     "leave-one-out error (owner, 13 Nov; off by default)")
     a = ap.parse_args(argv)
     base = yaml.safe_load(open(PACK))
     pack = build_pack(base, a.smoke)
     if a.action == "plan":
-        print(yaml.safe_dump(plan(pack, a.verify, vcpus=a.vcpus, verify_round=a.verify_round), sort_keys=False))
+        print(yaml.safe_dump(plan(pack, a.verify, vcpus=a.vcpus, verify_round=a.verify_round,
+                                  verify_v1=a.verify_v1), sort_keys=False))
         return 0
     if a.smoke and not a.out:
         print("--smoke needs --out (a scratch file): a smoke is not evidence")
         return 2
     return run(pack, base, a.workers, a.out or OUT, a.approved, a.smoke, 2 if a.smoke else a.verify,
                resume_from=a.resume_from, margin_loo=a.margin_loo, verify_round=a.verify_round,
-               resume_account=a.resume_account)
+               resume_account=a.resume_account, verify_v1=a.verify_v1)
 
 
 if __name__ == "__main__":

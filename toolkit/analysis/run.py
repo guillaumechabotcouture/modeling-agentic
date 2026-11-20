@@ -164,6 +164,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     ne = UQ_.net_effect_sample(spec, eng)   # f6-posterior-ranges: loaded, verified; its hull sets its columns' ranges
     if ne is not None:                      # before any artifact: the manifest and every artifact record where from
         info["net_effect_posterior_ranges"] = UQ_.posterior_range_record(ne)
+        # v2-posterior-point: each posterior column's point value is the fit's verified chosen point
+        info["point_source"], info["posterior_point"] = UQ_.point_source(ne), dict(ne["point"])
     card = eng.describe()
     arts = {}
     # Codex r2 P1-7: the files the engine reads (benchmark results, fitted values) are inputs of what uses them
@@ -1773,7 +1775,7 @@ def _self_test_posterior_ranges(ok, q):
         u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
         rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
         NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(), rows,
-                                 {"eff_a": [0, 1], "eff_b": [0, 1]})
+                                 {"eff_a": [0, 1], "eff_b": [0, 1]}, point={"eff_a": 0.433, "eff_b": 0.288})
         hull = {k: [min(r[k] for r in rows), max(r[k] for r in rows)] for k in ("eff_a", "eff_b")}
         sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
         r = yaml.safe_load(open(p))
@@ -1800,6 +1802,196 @@ def _self_test_posterior_ranges(ok, q):
         s = rep["parameter_samples"]["eff_a"]
         ok(hull["eff_a"][0] <= s["ci_low"] < s["ci_high"] <= hull["eff_a"][1],
            f"RNP2 the draws of a posterior column stay inside its hull: {s}")
+        ok(man["engine"].get("point_source") == {"eff_a": "posterior_chosen_point", "eff_b": "posterior_chosen_point"}
+           and man["engine"].get("posterior_point") == {"eff_a": 0.433, "eff_b": 0.288},
+           f"RNP3 (v2-posterior-point) the manifest records each posterior column's point source and the fit's chosen "
+           f"point: {man['engine'].get('point_source')} {man['engine'].get('posterior_point')}")
+    _self_test_posterior_point(ok)
+
+
+def _self_test_posterior_point(ok):
+    """RPP1-RPP5 (v2-posterior-point): with a declared net-effect posterior, the fit's verified chosen point is the point
+    value of every posterior column, in the analysis (core.Analysis.theta0) and in the joint calibration's held values
+    (joint_calibration.theta0) alike; a spec value that differs from it is refused, and a fit without a chosen point
+    fails closed. Without the field nothing changes. No engine runs: the analysis is only constructed."""
+    import hashlib
+    import tempfile
+    import numpy as np
+    import yaml
+    from toolkit.analysis import joint_calibration as JC
+    from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+    u = [float(v) for v in np.random.default_rng(5).uniform(0, 1, 24)]
+    rows = [{"eff_a": round(0.3 + 0.4 * x, 6), "eff_b": round(0.12 + 0.3 * (1 - x), 6), "synergy": round(0.2 * x, 6)}
+            for x in u]
+    chosen = {"eff_a": 0.41, "eff_b": 0.27, "synergy": 0.05}
+
+    def setup(d, point=None, spec_value=None, posterior=True):
+        """The toy spec; with `spec_value`, synergy is a spec engine parameter drawn over a range and a posterior
+        column too (without, the posterior holds the two fitted columns)."""
+        p = schema.toy_spec(d, n=24)
+        r = yaml.safe_load(open(p))
+        cols = ["eff_a", "eff_b"] + (["synergy"] if spec_value is not None else [])
+        if spec_value is not None:
+            r["engine_parameters"] = {"synergy": {"value": spec_value, "range": [0.0, 0.2], "dist": "uniform",
+                                                  "source": "self-test", "reason": "self-test",
+                                                  "basis": "owner_judgement"}}
+            r["uncertainty"]["excluded"] = [x for x in r["uncertainty"]["excluded"] if x.get("parameter") != "synergy"]
+        if posterior:
+            NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p).engine(),
+                                     [{k: x[k] for k in cols} for x in rows], {k: [0, 1] for k in cols},
+                                     point={k: chosen[k] for k in cols} if point is None else point)
+            sha = hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()
+            r["uncertainty"]["net_effect_posterior"] = {"path": "nef.yaml", "sha256": sha}
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        return schema.load(p)
+
+    def both(spec):
+        out = []
+        for f in (lambda: Analysis(spec, None, log=lambda *a, **k: None).theta0, lambda: JC.theta0(spec)):
+            try:
+                out.append(f())
+            except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+                out.append(f"{type(e).__name__}: {e}")
+        return out
+    with tempfile.TemporaryDirectory() as d:
+        a0, j0 = both(setup(d, posterior=False, spec_value=0.07))
+        ok(isinstance(a0, dict) and a0 == j0 and (a0["eff_a"], a0["eff_b"], a0["synergy"]) == (0.5, 0.3, 0.07),
+           f"RPP1 without a posterior the point values are unchanged (fitted values, the spec value): {a0} {j0}")
+    with tempfile.TemporaryDirectory() as d:
+        a1, j1 = both(setup(d))
+        ok(isinstance(a1, dict) and isinstance(j1, dict) and (a1["eff_a"], a1["eff_b"]) == (0.41, 0.27)
+           and a1 == j1,
+           f"RPP2 with a posterior every posterior column's point value is the fit's chosen point, in the analysis and "
+           f"the joint calibration alike: {a1} {j1}")
+    with tempfile.TemporaryDirectory() as d:
+        a2, j2 = both(setup(d, spec_value=0.12))
+        ok(all(isinstance(x, str) and "synergy" in x and "chosen point" in x for x in (a2, j2)),
+           f"RPP3 a spec engine_parameters value of a posterior column that differs from the chosen point is refused: "
+           f"{str(a2)[:160]} | {str(j2)[:80]}")
+    with tempfile.TemporaryDirectory() as d:
+        a3, _ = both(setup(d, spec_value=chosen["synergy"]))
+        ok(isinstance(a3, dict) and {k: a3[k] for k in chosen} == chosen,
+           f"RPP4 a spec value equal to the chosen point is accepted: {a3}")
+    with tempfile.TemporaryDirectory() as d:
+        a3b, j3b = both(setup(d, spec_value=chosen["synergy"] + 4e-7))     # within the 6-decimal rounding of a fit file
+        ok(isinstance(a3b, dict) and a3b == j3b and a3b["synergy"] == chosen["synergy"],
+           f"RPP4b a spec value equal to the chosen point within rounding is accepted, at the chosen point: {a3b}")
+    with tempfile.TemporaryDirectory() as d:
+        a4, j4 = both(setup(d, point=False))
+        ok(all(isinstance(x, str) and "chosen point" in x for x in (a4, j4)),
+           f"RPP5 a posterior file without a verified chosen point fails closed: {str(a4)[:160]} | {str(j4)[:80]}")
+    with tempfile.TemporaryDirectory() as d:     # the sign-off precondition's pre-run point (decision_tests)
+        s6 = setup(d)
+        p6 = DT.prerun_evidence(s6)["point"]
+        ok((p6["eff_a"], p6["eff_b"]) == (0.41, 0.27) and p6 == JC.theta0(s6),
+           f"RPP6 the pre-run evidence the sign-off checks read has the same point as the analysis: {p6}")
+    # Codex r1 P1-2: an interaction_rescale test reads arm ratios computed at the chosen point by the harness step
+    # (analysis/benchmarks_at_spec_values), and is not run without them or with arms computed at another point
+    from toolkit.spec import engine_parameters as PV
+    with tempfile.TemporaryDirectory() as d:
+        bench = _toy_bench(d)[0]
+        p9 = schema.toy_spec(d, n=12, bench=bench)
+        r9 = yaml.safe_load(open(p9))
+        NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), schema.load(p9).engine(), [
+            {k: x[k] for k in ("eff_a", "eff_b")} for x in rows], {"eff_a": [0, 1], "eff_b": [0, 1]},
+            point={"eff_a": 0.41, "eff_b": 0.27})
+        r9["uncertainty"]["net_effect_posterior"] = {
+            "path": "nef.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()}
+        yaml.safe_dump(r9, open(p9, "w"), sort_keys=False)
+        s9 = schema.load(p9)
+        before = DT.interaction_arms(s9, s9.engine(), "T2")
+        PV.write_spec_benchmarks(d, _toy_pack())
+        rec = json.load(open(os.path.join(d, PV.SPEC_BENCH_RECORD)))
+        after = DT.interaction_arms(s9, s9.engine(), "T2")
+        rec_point = rec.get("posterior_point")
+        rec["posterior_point"] = {"eff_a": 0.5, "eff_b": 0.3}           # arms recorded at another point
+        json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
+        other = DT.interaction_arms(s9, s9.engine(), "T2")
+        # Codex r4: the ratios are the chosen point's (not the defaults'); the file's own point is checked too; a
+        # caller's `fitted` entry never overrides a posterior column
+        dflt = yaml.safe_load(open(bench))["benchmarks"][0]["arm_or"][0]["a10"]
+        rec["posterior_point"] = rec_point
+        json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
+        bp = os.path.join(d, PV.SPEC_BENCH)
+        bd = yaml.safe_load(open(bp))
+        yaml.safe_dump(dict(bd, posterior_point={"eff_a": 0.5, "eff_b": 0.3}), open(bp, "w"), sort_keys=False)
+        rec["sha256"] = hashlib.sha256(open(bp, "rb").read()).hexdigest()
+        json.dump(rec, open(os.path.join(d, PV.SPEC_BENCH_RECORD), "w"))
+        filept = DT.interaction_arms(s9, s9.engine(), "T2")
+        sb = PV.spec_benchmarks(_toy_pack(), s9.engine(), s9, fitted={"eff_a": 0.6})
+        ok("not_run" in before and rec_point == {"eff_a": 0.41, "eff_b": 0.27} and "arm" in after
+           and abs(after["arm"]["a10"] - dflt) > 1e-3 and "chosen point" in filept.get("not_run", "")
+           and abs(sb["benchmarks"][0]["arm_or"][0]["a10"] - after["arm"]["a10"]) < 1e-9
+           and PV.SPEC_BENCH in after["src"] and "chosen point" in other.get("not_run", ""),
+           f"RPP9 with a posterior an interaction test runs on arms the harness step computed at the chosen point, and "
+           f"is not run without them or on arms from another point: {before} | {after.get('src')} | {other}")
+    # Codex r1 P1-5: the conflict tolerance is the fit's 6-decimal rounding, whatever the value's magnitude
+    import types
+    from toolkit.analysis import uncertainty as UQ
+    big = types.SimpleNamespace(raw={"engine_parameters": {"h": {"value": 1000.0004}}})
+    try:
+        UQ.posterior_point(big, {"point": {"h": 1000.0}}, {})
+        w7 = "accepted"
+    except ValueError as e:
+        w7 = str(e)
+    ok("chosen point" in w7, f"RPP7 a spec value 4e-4 from a chosen point of 1000 is refused: {w7[:120]}")
+    # Codex r1 P1-6: a declared but empty net_effect_posterior is refused, never read as no posterior
+    with tempfile.TemporaryDirectory() as d:
+        s8 = setup(d, posterior=False)
+        s8.raw["uncertainty"]["net_effect_posterior"] = None
+        a8, j8 = both(s8)
+        ok(all(isinstance(x, str) and "net_effect_posterior" in x for x in (a8, j8)),
+           f"RPP8 an empty uncertainty.net_effect_posterior is refused: {str(a8)[:120]}")
+    # Codex r1 P1-4, r2 P1-1/P1-2: a chosen point that is not exactly the fit's recorded parameter values (a different
+    # value, a value within 1e-6, NaN), or that holds a coordinate the sample does not, is refused
+    def edited(d, edit):
+        s = setup(d)
+        f = os.path.join(d, "nef.yaml")
+        doc = yaml.safe_load(open(f))
+        edit(doc)
+        yaml.safe_dump(doc, open(f, "w"), sort_keys=False)
+        r = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+        r["uncertainty"]["net_effect_posterior"]["sha256"] = hashlib.sha256(open(f, "rb").read()).hexdigest()
+        yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+        return both(schema.load(os.path.join(d, "decision_spec.yaml")))[0], s
+    got10 = {}
+    for label, val in (("0.45", 0.45), ("0.409999", 0.409999), ("nan", float("nan"))):
+        with tempfile.TemporaryDirectory() as d:
+            got10[label] = edited(d, lambda doc: doc["parameters"]["eff_a"].update(value=val))[0]
+    ok(all(isinstance(x, str) and "parameters" in x and "eff_a" in x for x in got10.values()),
+       f"RPP10 a chosen point that is not exactly the fit's recorded parameter values is refused: "
+       f"{ {k: str(v)[:60] for k, v in got10.items()} }")
+    with tempfile.TemporaryDirectory() as d:
+        def extra(doc):
+            doc["joint_region"]["verified"]["chosen"]["point"]["synergy"] = 0.19
+            doc["parameters"]["synergy"] = {"value": 0.19}
+        a12, _ = edited(d, extra)
+        ok(isinstance(a12, str) and "synergy" in a12,
+           f"RPP12 a chosen point with a coordinate the sample does not hold is refused: {str(a12)[:160]}")
+    with tempfile.TemporaryDirectory() as d:
+        a13, _ = both(setup(d, spec_value=0.049999))           # exactly 1e-6 from the chosen 0.05
+        ok(isinstance(a13, dict) and a13["synergy"] == 0.05,
+           f"RPP13 a spec value exactly 1e-6 from the chosen point is accepted (float subtraction): {str(a13)[:120]}")
+    # Codex r1 P1-1: the likelihood and posterior calibrations build engine parameters without theta0, so they could
+    # not run at the chosen point: refused with a posterior rather than run at engine defaults
+    got11 = {}
+    for meth in ("likelihood", "posterior"):
+        with tempfile.TemporaryDirectory() as d:
+            s11 = setup(d)
+            s11.raw["calibration"]["method"] = meth
+            got11[meth] = both(s11)
+    ok(all(isinstance(x, str) and "calibration.method" in x for v in got11.values() for x in v),
+       f"RPP11 a posterior with a likelihood or posterior calibration is refused: "
+       f"{ {k: str(v[0])[:80] for k, v in got11.items()} }")
+    # Codex r3: a recorded parameter the sample does not hold is refused; the 1e-6 tolerance is not widened
+    with tempfile.TemporaryDirectory() as d:
+        a14, _ = edited(d, lambda doc: doc["parameters"].update(synergy={"value": 0.19}))
+        ok(isinstance(a14, str) and "synergy" in a14,
+           f"RPP14 a fit recording a parameter its sample and chosen point do not hold is refused: {str(a14)[:160]}")
+    with tempfile.TemporaryDirectory() as d:
+        a15, _ = both(setup(d, spec_value=0.0500010000005))
+        ok(isinstance(a15, str) and "chosen point" in a15,
+           f"RPP15 a spec value more than 1e-6 from the chosen point is refused: {str(a15)[:120]}")
 
 
 def _self_test_test_ranges(ok, q):

@@ -59,7 +59,7 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     load_posterior's sha256, finalize() replay, seeds, engine identity and hard bounds), its columns' ranges from
     posterior_ranges, and the run's design box (batch.design_box) must cover them. Without it the owner could sign a
     spec whose posterior the analysis refuses only at its start (f6-posterior-ranges)."""
-    if (spec.raw.get("uncertainty") or {}).get("net_effect_posterior") is None:
+    if "net_effect_posterior" not in (spec.raw.get("uncertainty") or {}):       # empty: refused by posterior_input
         return []
     if getattr(spec, "engine_pending", False):
         return ["net_effect_posterior: engine: auto is still pending; the posterior is bound to one engine's fit and "
@@ -183,7 +183,18 @@ def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | 
 
 
 def _declared_range(spec, eng, p):
-    """The parameter's declared range: its drawn prior's, else the engine's (lo, hi); None when it has none."""
+    """The parameter's declared range: a net-effect posterior column's posterior range (its sample's hull within its
+    hard bounds, uncertainty.net_effect_sample; the card prior may be narrower than the fit's, F6 refit b), else its
+    drawn prior's, else the engine's (lo, hi); None when it has none, or when the spec's posterior cannot be loaded
+    (fail closed)."""
+    from toolkit.analysis import uncertainty as UQ
+    try:
+        ne = UQ.net_effect_sample(spec, eng)
+    except Exception:  # noqa: BLE001 -- a posterior that is refused gives no range to span
+        return None
+    if ne is not None and p in (ne.get("ranges") or {}):
+        lo, hi = ne["ranges"][p][:2]
+        return float(lo), float(hi)
     try:
         from toolkit.spec import priors as PRI
         pr = PRI.drawn(spec).get(p)
@@ -294,10 +305,10 @@ def _self_test_posterior(ok) -> None:
     u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
     rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
 
-    def run_dir(d, eng=None, post=None, sources=None):
+    def run_dir(d, eng=None, post=None, sources=None, point=None):
         p = schema.toy_spec(d)
         NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), eng or schema.load(p).engine(), rows,
-                                 {"eff_a": [0, 1], "eff_b": [0, 1]})
+                                 {"eff_a": [0, 1], "eff_b": [0, 1]}, point=point)
         raw = yaml.safe_load(open(p))
         raw["uncertainty"]["net_effect_posterior"] = post or {
             "path": "nef.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()}
@@ -373,10 +384,48 @@ def _self_test_posterior(ok) -> None:
     rows_hi = rows
     with tempfile.TemporaryDirectory() as d:
         rows[:] = [{"eff_a": round(0.55 + 0.15 * x, 6), "eff_b": r["eff_b"]} for x, r in zip(u, rows_hi)]
-        run_dir(d)                                   # eff_a's hull 0.55-0.70 leaves its point value 0.5 outside
+        # eff_a's hull 0.55-0.70 leaves the fit's chosen point 0.75 (above it; the fitted 0.5 is below), the run's
+        # point value (v2-posterior-point), outside
+        run_dir(d, point={"eff_a": 0.75, "eff_b": rows[0]["eff_b"]})
         got = problems(d, None, None)
-        ok(any("point value" in g and "eff_a" in g for g in got),
+        ok(any("point value" in g and "eff_a, 0.75," in g for g in got),
            f"PC17 a run whose point value of a posterior column is outside its range is refused: {got[:1]}")
+    with tempfile.TemporaryDirectory() as d:
+        run_dir(d, point=False)
+        got = problems(d, None, None)
+        ok(any("net_effect_posterior" in g and "chosen point" in g for g in got),
+           f"PC18 (v2-posterior-point) a posterior without a verified chosen point cannot be signed: {got[:1]}")
+
+
+def _self_test_declared_range(ok) -> None:
+    """PC11 (F6 option A refit b): a posterior column's declared range is the posterior's (its hull within its hard
+    bounds, uncertainty.net_effect_sample), not the card prior the posterior was fitted past; without a posterior the
+    prior or the engine's range as before; a posterior that cannot be loaded gives no range (fail closed)."""
+    from toolkit.analysis import uncertainty as UQ
+
+    class Eng:
+        def parameters(self):
+            from types import SimpleNamespace as N
+            return [N(name="pad", lo=0.0, hi=1.895), N(name="k", lo=1.0, hi=2.0)]
+    orig = UQ.net_effect_sample
+    got = {}
+    try:
+        UQ.net_effect_sample = lambda spec, eng, *a, **k: {"ranges": {"pad": (0.9, 2.2)}}
+        got["posterior column"] = _declared_range(object(), Eng(), "pad")
+        got["other column"] = _declared_range(object(), Eng(), "k")
+        UQ.net_effect_sample = lambda spec, eng, *a, **k: None
+        got["no posterior"] = _declared_range(object(), Eng(), "pad")
+
+        def boom(spec, eng, *a, **k):
+            raise ValueError("refused")
+        UQ.net_effect_sample = boom
+        got["posterior refused"] = _declared_range(object(), Eng(), "pad")
+    finally:
+        UQ.net_effect_sample = orig
+    ok(got == {"posterior column": (0.9, 2.2), "other column": (1.0, 2.0), "no posterior": (0.0, 1.895),
+               "posterior refused": None},
+       f"PC11 a posterior column's declared range is the posterior's; others as before; a refused posterior gives none "
+       f"({got})")
 
 
 def _self_test() -> int:
@@ -540,6 +589,7 @@ def _self_test() -> int:
                                        f"benefit, is effective ({chk['T2']['why']})")
         finally:
             BC.OVERRIDES.pop("toolkit.engines.contract:ToyEngine", None)
+    _self_test_declared_range(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
