@@ -169,8 +169,12 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
             notes.append(f"the complete tarball could not be written ({type(e).__name__}: {e}); large files are "
                          f"left out of it and exist only in the run dir on this VM"[:300])
     os.replace(tmp, tar)
+    # 1E-ii: large files of the run that are neither in main.py's store nor in this tarball (it was too large for
+    # the disk): `collect` keeps the label pending for them. A link to a large file is not the run's own data.
+    unstored = [] if stored else [x for x in skipped if not os.path.islink(os.path.join(work, x[0]))]
     return {"label": label, "exit_code": returncode, "duration_s": round(time.time() - t0),
             "run_dir": os.path.basename(runs[-1]) if runs else None, "skipped_large_files": skipped,
+            "unstored_large_files": unstored,
             "notes": notes, "tarball": tar}
 
 
@@ -694,21 +698,74 @@ def all_stored(store, prefix, account, labels, launch_id):
     return all(record_blob(prefix, launch_id, lb) in have for lb in labels)
 
 
+STATE_BEAT_S, STATE_STALE_S = 30.0, 180.0     # the liveness record's rewrite interval; older than this reads dead
+
+
+def state_path(label):
+    """The agent VM's liveness record for a label, beside its work dir (run_job_impl wipes that dir)."""
+    return f"{WORK}/.state_{label}.json"
+
+
+class RunState:
+    """run_to_disk's liveness record (v2 autonomy 1E-ii): {label, phase, pid, started_at, updated_at}, written when
+    the task starts (before pip and unpacking, when no run.log exists yet) and rewritten every STATE_BEAT_S by a
+    thread. Phases: preparing, running (main.py started), storing, held (waiting for `collect`), done, failed (the
+    task ended without finishing). fetch_meta reads it. Stdlib only: nothing of the tree is unpacked yet."""
+
+    def __init__(self, label):
+        import threading, time
+        self.label, self.phase, self.started = label, "preparing", time.time()
+        self._stop, self._lock, self._thread = threading.Event(), threading.Lock(), None
+
+    def set(self, phase):
+        import json, os, time
+        with self._lock:
+            self.phase = phase
+            try:
+                os.makedirs(WORK, exist_ok=True)
+                tmp = f"{state_path(self.label)}.{os.getpid()}.tmp"
+                with open(tmp, "w") as f:
+                    json.dump({"label": self.label, "phase": phase, "pid": os.getpid(),
+                               "started_at": self.started, "updated_at": time.time()}, f)
+                os.replace(tmp, state_path(self.label))
+            except OSError:      # the record never stops the run; a stale one reads dead
+                pass
+
+    def start(self):
+        import threading
+        self.set("preparing")
+
+        def loop():
+            while not self._stop.wait(STATE_BEAT_S):
+                self.set(self.phase)
+        self._thread = threading.Thread(target=loop, daemon=True, name=f"ma-state-{self.label}")
+        self._thread.start()
+
+    def stop(self, phase):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(5)
+        self.set(phase)
+
+
 def run_to_disk(label, code, *args, **kw):
-    """_run_to_disk with the launch code unpacked to a temporary directory that is removed when the task ends (it
-    used to stay on the VM's disk; the modules imported from it are already loaded)."""
+    """_run_to_disk with the liveness record started first (RunState), and the launch code unpacked to a temporary
+    directory that is removed when the task ends (the modules imported from it are already loaded)."""
     import shutil, sys, tempfile
+    state = RunState(label)
+    state.start()
     td = tempfile.mkdtemp()
     try:
-        return _run_to_disk(td, label, code, *args, **kw)
+        return _run_to_disk(td, label, code, *args, state=state, **kw)
     finally:
+        state.stop("done" if state.phase == "done" else "failed")
         shutil.rmtree(td, ignore_errors=True)
         sys.path[:] = [x for x in sys.path if not x.startswith(td)]
 
 
 def _run_to_disk(td, label, code, question, flags, anthropic_key, openai_key, labels, prefix, account, launch_id,
                  max_rounds=8, max_sessions=5, shutdown_when_stored=True, run_timeout_s=None, hold_s=24 * 3600,
-                 checkpoint_s=None):
+                 checkpoint_s=None, state=None):
     """The agent VM's task: run, store the run, its transcripts and its result
     record, then (last run of the launch) shut the cluster down. If any upload
     failed, hold the results on disk and stay busy until `collect` takes them:
@@ -729,11 +786,18 @@ def _run_to_disk(td, label, code, question, flags, anthropic_key, openai_key, la
     ck = checkpoint_starter(label, prefix, launch_id, account, results_store, checkpoint_s,
                             [anthropic_key, openai_key or ""])
     health = []
+    phase = state.set if state is not None else (lambda p: None)
+
+    def on_start(work):                # main.py is about to start
+        phase("running")
+        if ck is not None:
+            ck(work)
     try:
         res = run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds, max_sessions,
-                           timeout_s=run_timeout_s, on_start=ck)
+                           timeout_s=run_timeout_s, on_start=on_start)
     finally:
         health.append(stop_checkpointer(ck))
+    phase("storing")
     res["checkpoint"] = health[0]
     d = f"{WORK}/{label}"
     try:
@@ -754,11 +818,14 @@ def _run_to_disk(td, label, code, question, flags, anthropic_key, openai_key, la
                 from distributed import get_client
                 print(f"{label}: every run of this launch is in storage; shutting the cluster down", flush=True)
                 get_client().shutdown()
+            phase("done")
             return res
         except Exception as e:  # noqa: BLE001 — hold the results for `collect`
             res["result_store_error"] = f"{type(e).__name__}: {e}"[:300]
             json.dump(res, open(f"{d}/result.json", "w"))
+    phase("held")
     _hold(d, hold_s)
+    phase("done")
     return res
 
 
@@ -1289,12 +1356,35 @@ def keeper_log():
 
 def fetch_meta(label):
     """State plus result record, tarball size and sha256 (no payload)."""
-    import hashlib, json, os
+    import hashlib, json, os, time
     d = f"{WORK}/{label}"
     if not os.path.exists(f"{d}/result.json"):
         running = os.path.exists(f"{d}/run.log")
-        return {"state": "running" if running else "missing",
-                "log_bytes": os.path.getsize(f"{d}/run.log") if running else 0}
+        out = {"state": "running" if running else "missing",
+               "log_bytes": os.path.getsize(f"{d}/run.log") if running else 0}
+        # 1E-ii: with a liveness record (RunState), a VM still installing reads "preparing", not "missing" (which
+        # the watch relaunches), and a task that ended, lost its process or stopped rewriting the record reads
+        # "dead", not "running" for good. No record, or an unreadable one: as before.
+        try:
+            st = json.load(open(state_path(label)))
+            age = time.time() - float(st["updated_at"])
+            try:
+                os.kill(int(st["pid"]), 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            except OSError:
+                alive = True
+            if st["phase"] == "failed" or not alive or age > STATE_STALE_S:
+                out["state"] = "dead"
+            elif st["phase"] == "preparing":
+                out["state"] = "preparing"
+            else:
+                out["state"] = "running"
+            out.update(phase=st["phase"], heartbeat_age_s=round(age))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return out
     h = hashlib.sha256()
     with open(f"{d}/result.tar.gz", "rb") as f:
         for b in iter(lambda: f.read(2**20), b""):

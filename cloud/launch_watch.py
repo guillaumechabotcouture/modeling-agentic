@@ -167,11 +167,13 @@ def is_network_error(text) -> bool:
 
 
 def parse_status(text, labels):
-    """`status` output as {"cluster": "running"|"stopped", "runs": {label: {"state", "stored"}}}; None when it cannot
-    be read (no cluster line, or a running cluster without a line for every label)."""
-    m = re.search(r"^cluster \S+: (running|stopped);", str(text or ""), re.M)
+    """`status` output as {"cluster": "running"|"stopped", "keeper": "running"|"stopped"|None, "runs": {label:
+    {"state", "stored"}}}; None when it cannot be read (no cluster line, or a running cluster without a line for
+    every label)."""
+    m = re.search(r"^cluster \S+: (running|stopped);(.*)$", str(text or ""), re.M)
     if not m:
         return None
+    km = re.search(r"\bkeeper: (running|stopped)", m.group(2))
     runs = {}
     if m.group(1) == "running":
         for lb in labels:
@@ -181,7 +183,26 @@ def parse_status(text, labels):
             sm = re.search(r"\bstored=(\S+)", lm.group(2))
             stored = sm.group(1) if sm and sm.group(1) != "None" else None
             runs[lb] = {"state": lm.group(1), "stored": stored}
-    return {"cluster": m.group(1), "runs": runs}
+    return {"cluster": m.group(1), "keeper": km.group(1) if km else None, "runs": runs}
+
+
+def notices(st, seen, keeper_wanted=True) -> list:
+    """[(kind, message)] for what a running launch's status shows that someone should know, each once (`seen` is
+    updated in place): a run whose task died on its VM, and a keeper that has stopped while the run cluster is up.
+    Reported only; the watch stops and relaunches nothing for either."""
+    out = []
+    if not st or st["cluster"] != "running":
+        return out
+    for lb, r in st["runs"].items():
+        if r["state"] == "dead" and ("run_dead", lb) not in seen:
+            seen.add(("run_dead", lb))
+            out.append(("run_dead", f"{lb}: its task died on its VM without a result (no heartbeat, or its process "
+                                    f"is gone); nothing stopped or relaunched: fetch `checkpoint --label {lb}`"))
+    if keeper_wanted and st.get("keeper") == "stopped" and "keeper_stopped" not in seen:
+        seen.add("keeper_stopped")
+        out.append(("keeper_stopped", "the keeper has stopped while the run cluster is up: the compute pool is no "
+                                      "longer scaled; start it by hand with `keeper` after checking `status`"))
+    return out
 
 
 def decide(st) -> str:
@@ -420,6 +441,7 @@ class Watch:
 
     def watch(self) -> int:
         self.start, missing_since, relaunched, attempts = self.clock(), {}, set(), {}
+        noticed = set()
         while True:
             if self.over_limit():
                 where = self.final_checkpoint(self.record())
@@ -439,6 +461,8 @@ class Watch:
             st = parse_status(out, self.cfg.labels) if code == 0 else None
             act = decide(st)
             self.log(f"status: {act} " + (json.dumps(st) if st else ""))
+            for kind, msg in notices(st, noticed, self.cfg.keeper):
+                self.log(f"NOTICE {kind}: {msg}")
             if act == "collect":
                 return self.finish(rec)
             m = missing_action(st, missing_since, relaunched, self.clock(), self.start_s)
