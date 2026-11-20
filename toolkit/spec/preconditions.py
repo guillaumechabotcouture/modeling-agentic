@@ -63,8 +63,14 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
         return []
     post = (spec.raw.get("uncertainty") or {}).get("net_effect_posterior")
     # a non-owner signer is refused; None is a draft or execution check (signing passes its signer: Codex r2 of #291)
-    if isinstance(post, dict) and post.get("exception") is not None and signer not in (None, "owner"):
-        return [f"net_effect_posterior: an exception to the acceptance rule is the owner's to sign (signer {signer!r})"]
+    if isinstance(post, dict) and post.get("exception") is not None:
+        if signer not in (None, "owner"):
+            return [f"net_effect_posterior: an exception to the acceptance rule is the owner's to sign (signer "
+                    f"{signer!r})"]
+        from toolkit.engines import benchmark_coverage as BC
+        if signer is None and run_dir and BC.signature(run_dir) == "unsigned":     # execution: the recorded sign-off
+            return ["net_effect_posterior: an exception to the acceptance rule counts only under the owner's "
+                    "signature of this spec (the recorded sign-off is a lead's, or the spec changed since)"]
     if getattr(spec, "engine_pending", False):
         return ["net_effect_posterior: engine: auto is still pending; the posterior is bound to one engine's fit and "
                 "is checked once the engine is chosen"]
