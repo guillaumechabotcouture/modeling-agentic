@@ -12,7 +12,9 @@ not `type` or `perturb`, and any field not named here), `detail` (case labels an
 digits, below 1e-9 in size zero; an absolute path keeps its file name. Known limits: a path holding a
 space keeps its tail, and two values either side of a 6th-digit rounding boundary differ.
 
-`digest` reads analysis/decision_tests.yaml and models/decision_tests/<id>.yaml, and fails closed (digest_dir).
+`digest` reads analysis/decision_tests.yaml and models/decision_tests/<id>.yaml, and fails closed (digest_dir): no
+link is followed inside the run dir, and a platform that cannot open without following links is refused. The path
+to the run dir itself is the caller's and is not protected against a parent directory swapped during the call.
 
 Toy golden records: toolkit/analysis/dt_golden.json, checked by toolkit/analysis/run.py's self-test, which captures
 every record decision_tests.run_one returns (start_capture / check_capture), keyed by the calling self-test function,
@@ -123,7 +125,7 @@ def _plain_name(tid: str, pathmod=os.path) -> bool:
     writers accept otherwise, spaces and colons included)."""
     base, name = pathmod.join("base", "dir"), f"{tid}.yaml"
     j = pathmod.join(base, name)
-    return bool(tid) and "/" not in tid and "\\" not in tid and name not in (".", "..") \
+    return bool(tid) and "/" not in tid and "\\" not in tid and "\0" not in tid and name not in (".", "..") \
         and pathmod.dirname(j) == base and pathmod.basename(j) == name
 
 
@@ -134,16 +136,27 @@ def _tid(v):
     return v if isinstance(v, str) else str(v) if isinstance(v, (bool, int, float, datetime.date)) else None
 
 
+def _nofollow() -> int:
+    """The flags of a directory open that follows no link. A platform without O_NOFOLLOW, O_DIRECTORY or dir_fd
+    support cannot give that, and the digest is refused there (Codex r7 P1: it was read with links followed)."""
+    if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd):
+        raise StoredIncomplete("this platform cannot open a path without following links (os.O_NOFOLLOW, "
+                               "os.O_DIRECTORY and dir_fd support are needed): nothing read")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
 class _pinned:
     """One descriptor on the run dir for a whole digest (Codex r6 P1-1): every read is relative to it, so a directory
-    replaced by a link mid-digest cannot mix two runs."""
+    replaced by a link mid-digest cannot mix two runs. The path TO the run dir is the caller's: it is resolved once
+    (realpath) and opened; a parent directory swapped between the two is not detected (Codex r7; the claim is about
+    what a run's agents can write, which is inside the run dir)."""
 
     def __init__(self, run_dir):
         self.path = os.path.realpath(run_dir)
 
     def __enter__(self):
         try:
-            self.fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+            self.fd = os.open(self.path, _nofollow())
         except FileNotFoundError as e:
             raise FileNotFoundError(f"{self.path}: no run dir") from e
         return self.fd
@@ -163,12 +176,12 @@ def _read(dfd: int, rel: str, missing=StoredIncomplete):
     parts_ = rel.split("/")
     if any(c in ("", ".", "..") for c in parts_):
         raise StoredIncomplete(f"{rel}: not a plain path under the run dir")
-    nf, opened, cur = getattr(os, "O_NOFOLLOW", 0), [], dfd
+    dflags, opened, cur = _nofollow(), [], dfd
     try:
         for c in parts_[:-1]:
-            cur = os.open(c, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nf, dir_fd=cur)
+            cur = os.open(c, dflags, dir_fd=cur)
             opened.append(cur)
-        fd = os.open(parts_[-1], os.O_RDONLY | nf | getattr(os, "O_NONBLOCK", 0), dir_fd=cur)
+        fd = os.open(parts_[-1], os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=cur)
     except FileNotFoundError as e:
         raise missing(f"{rel}: missing") from e
     except OSError as e:
