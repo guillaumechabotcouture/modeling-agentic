@@ -1438,6 +1438,19 @@ def _self_test_round2(ok, T) -> None:
         e4 = dict(e3, model_value=[], chosen={"value": [], "rule": "an explicitly empty list"})
         ok(not [p for p in _entry_problems("unit_attribute:x", e4, rx, ua, d, {}) if "blank" in p],
            "ED-V3 an empty collection is a legitimate value (not blank)")
+        # ED-W1 (v2-dt-with, Codex r3): the run calibrates x, so its range needs no test; a test the entry names
+        # anyway must not be a conditional one (companions held with `with`), which the sheet would show as its range test
+        uc = copy.deepcopy(raw)
+        uc["analysis"]["decision_tests"] = [{"id": "DTk", "type": "parameter_value", "parameter": "base",
+                                             "values": [0.3, 0.6], "text": "t", "with": {"eff_a": 0.6}},
+                                            {"id": "DTp", "type": "parameter_value", "parameter": "base",
+                                             "values": [0.3, 0.6], "text": "t"}]
+        e5 = copy.deepcopy(toy_entries())["unit_attribute:x"]
+        e5["chosen"] = {"range": [-1.0, 1.0], "rule": "r"}
+        got5 = {t: [p for p in _entry_problems("unit_attribute:x", dict(e5, decision_test=t), rx, uc, d, {})
+                    if "decision_test" in p or "with" in p] for t in ("DTk", "DTp")}
+        ok(_calibrated_by_run(rx, uc) is not None and got5["DTk"] and "with" in got5["DTk"][0] and not got5["DTp"],
+           f"ED-W1 a calibrated input's entry cannot name a test with companions as its range test: {got5}")
     # ED-R11: compartmental outcome ratios when the configured outcome uses them
     base_cfg = {"groups": ["g1", "g2"], "structure": "age_groups_contact_matrix", "outcomes": ["deaths"],
                 "components": {"camp": {"kind": "campaign", "targets": ["g1"], "reach": 0.8}}}

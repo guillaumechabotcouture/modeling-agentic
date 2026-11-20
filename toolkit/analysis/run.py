@@ -2120,6 +2120,17 @@ def _self_test_test_ranges(ok, q):
            f"RPW11 without `with`, a held spec value's box ignores a quoted value and a value that is not a number is "
            f"an error where a test's values are read, both as before: {PV.tested_boxes(schema.Spec(rq, d))} "
            f"{malformed[:60]}")
+        # Codex r3: a value that is not a number, on a parameter the reader does not use, raises nothing (as before)
+        from toolkit.analysis import batch as BAm
+        ro = copy.deepcopy(r)
+        ro["analysis"]["decision_tests"] = [{"id": "DTo", "type": "parameter_value", "parameter": "base",
+                                             "values": ["oops"], "text": "t"}]
+        try:
+            tvr = BAm.test_value_ranges(schema.Spec(ro, d), {"eff_a", "eff_b", "dw"})
+        except Exception as e:  # noqa: BLE001
+            tvr = f"{type(e).__name__}: {e}"
+        ok(tvr == {}, f"RPW15 a test value that is not a number, on a parameter that is not a design input, does not "
+                      f"stop the design (the test is then not run, as before): {tvr}")
         rec_w = {"status": "run", "perturbation_identity": [False], "package_components": {"k": ["a"]},
                  "benefit_change_by_package": {"k": 1.0}}
         dv = [DT.departure_verdicts([{"benchmark": "B", "decision_test": "T", "engine": "e"}],
