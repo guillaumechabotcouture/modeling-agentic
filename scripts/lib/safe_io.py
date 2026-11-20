@@ -730,6 +730,18 @@ def _self_test() -> int:
             pass
         ok(os.listdir(os.path.join(d, "sub")) == ["big.bin"]
            and os.path.getsize(os.path.join(d, "sub", "big.bin")) == 11, "S12f a failed stream keeps the old file")
+        try:        # S12h (Codex 1E-i round 1): the temporary entry swapped while the stream is open is not published
+            with stream_nofollow(d, "sub/big.bin") as f:
+                f.write(b"streamed")
+                tmp_name = [n for n in os.listdir(os.path.join(d, "sub")) if n.endswith(".tmp")][0]
+                os.unlink(os.path.join(d, "sub", tmp_name))
+                with open(os.path.join(d, "sub", tmp_name), "wb") as g:
+                    g.write(b"planted")
+            ok(False, "S12h a swapped temporary entry is refused")
+        except LinkRefused:
+            pass
+        ok(open(os.path.join(d, "sub", "big.bin"), "rb").read() == b"x" * 10 + b"y"
+           and os.listdir(os.path.join(d, "sub")) == ["big.bin"], "S12h the name keeps its file; nothing is left")
         try:
             with stream_nofollow(d, "../x") as f:
                 pass

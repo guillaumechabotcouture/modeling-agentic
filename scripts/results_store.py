@@ -463,8 +463,27 @@ def _self_test() -> int:
             sk = write_archive(ar, "run", os.path.join(d, "w.tar.gz"), ["sk-ant-SECRETSECRET123"])
         finally:
             globals()["REDACT_MAX_MB"] = _max
-        if "models/big.bin" not in sk or "report.md" not in sk or "_truth/answers.yaml" not in sk:
-            fails.append(f"S9 write_archive leaves out large files holding a secret, and _truth/: {sk}")
+        got = _tf.open(os.path.join(d, "w.tar.gz"), mode="r:gz")
+        body = got.extractfile("run/models/big.bin").read() if "run/models/big.bin" in got.getnames() else None
+        if sk != ["_truth/answers.yaml", ".env.local", "models/tls.key"] and sorted(sk) != sorted(
+                ["_truth/answers.yaml", ".env.local", "models/tls.key"]) or body != b"x" * 100 + b"<redacted>":
+            fails.append(f"S9 (Codex 1E-i round 1) write_archive keeps a large file holding a secret, redacted as it "
+                         f"streams, and leaves out only _truth/ and credential files: {sk} {body!r}")
+        # S25: a secret that straddles two 1 MiB blocks of a large file is still redacted, and nothing else changes
+        strad = os.path.join(ar, "models", "straddle.bin")
+        with open(strad, "wb") as f:
+            f.write(b"a" * (2**20 - 5) + b"sk-ant-SECRETSECRET123" + b"b" * 100 + b"sk-ant-SECRETSECRET123")
+        globals()["REDACT_MAX_MB"] = 0
+        try:
+            sk = write_archive(ar, "run", os.path.join(d, "w.tar.gz"), ["sk-ant-SECRETSECRET123"])
+        finally:
+            globals()["REDACT_MAX_MB"] = _max
+        got = _tf.open(os.path.join(d, "w.tar.gz"), mode="r:gz")
+        body = got.extractfile("run/models/straddle.bin").read() if "run/models/straddle.bin" in got.getnames() else b""
+        if body != b"a" * (2**20 - 5) + b"<redacted>" + b"b" * 100 + b"<redacted>":
+            fails.append(f"S25 a secret across a block boundary of a large file is redacted: {len(body)} bytes, "
+                         f"skipped {sk}")
+        os.remove(strad)
         # Codex round 1 P1-2: each file is opened once, without following links, and what is scanned is what is
         # archived. The hook runs between the listing and the open, as a concurrent writer would.
         os.remove(big)
@@ -492,8 +511,10 @@ def _self_test() -> int:
             sk = write_archive(ar, "run", out, ["sk-ant-SECRETSECRET123"], _hook=race)
         finally:
             globals()["REDACT_MAX_MB"] = _max
-        if "models/late.txt" not in sk:
-            fails.append(f"S12 a large file rewritten with a secret after the listing is left out: {sk}")
+        late = _tf.open(out, mode="r:gz").extractfile("run/models/late.txt").read() if "models/late.txt" not in sk \
+            else b"left out"
+        if b"SECRETSECRET" in late or b"<redacted>" not in late:
+            fails.append(f"S12 a large file rewritten with a secret after the listing is archived redacted: {late!r}")
         # Codex round 2 P1-1: a name is never translated or allowed to climb out; the root itself is no link
         esc = os.path.join(d, "esc")
         os.makedirs(os.path.join(esc, "work", "run"))

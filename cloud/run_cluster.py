@@ -4825,11 +4825,12 @@ def _self_test_storage(ok) -> None:
     sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
     import results_store
 
-    def code(store_error):
+    def code(store_error, tail=""):
         main_py = ("import json, os\nrd = 'runs/R_x'\nos.makedirs(rd)\n"
                    "open(rd + '/big.bin', 'wb').write(b'x' * 4096)\nopen(rd + '/small.txt', 'w').write('s')\n"
-                   f"json.dump({{'stored': 'outputs/t/R_x.tar.gz', 'store_error': {store_error!r}}}, "
-                   "open(rd + '/metadata.json', 'w'))\n")
+                   f"f = open(rd + '/metadata.json', 'w')\n"
+                   f"json.dump({{'stored': 'outputs/t/R_x.tar.gz', 'store_error': {store_error!r}}}, f)\n"
+                   "f.close()\n" + tail)
         b = io.BytesIO()
         with tarfile.open(fileobj=b, mode="w:gz") as t:
             ti = tarfile.TarInfo("main.py")
@@ -4853,6 +4854,37 @@ def _self_test_storage(ok) -> None:
     ok(got["BAD"] == (True, True, [], None),
        f"WS2 WS_FALLBACK_LARGE_FILE main.py's store failed: the tarball held for collect keeps every large file: "
        f"{got['BAD']}")
+
+    # Codex 1E-i round 1. WS2b: a receipt in metadata.json counts only when main.py ended by itself; a run killed
+    # (its time limit, a signal) may carry the receipt of an earlier invocation it resumed. WS2c: a disk too full
+    # for the complete tarball still yields one without the large files, and the task goes on to hold it.
+    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"), \
+            mock.patch.object(ws, "MAX_RETURN_FILE", 1024):
+        res = ws.run_job_impl("KILLED", code(None, "os.kill(os.getpid(), 9)\n"), "q", [], "k", None)
+    names = tarfile.open(res["tarball"], mode="r:gz").getnames()
+    ok(res["exit_code"] == -9 and "runs/R_x/big.bin" in names and res["skipped_large_files"] == []
+       and ws.run_stored(res["tarball"], res["exit_code"]) is None
+       and ws.run_stored(res["tarball"], "timeout") is None and ws.run_stored(res["tarball"], 2) == "outputs/t/R_x.tar.gz",
+       f"WS2b a killed main.py: the receipt in metadata.json is not trusted (large files kept, no stored run "
+       f"recorded): exit {res['exit_code']} {names}")
+    real_add = tarfile.TarFile.add
+
+    def full_disk(self, name, *a, **kw):
+        if str(name).endswith("big.bin"):
+            raise OSError(28, "No space left on device")
+        return real_add(self, name, *a, **kw)
+    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"), \
+            mock.patch.object(ws, "MAX_RETURN_FILE", 1024), mock.patch.object(tarfile.TarFile, "add", full_disk):
+        try:
+            res = ws.run_job_impl("FULL", code("OSError: storage unreachable"), "q", [], "k", None)
+        except OSError as e:
+            res = {"error": str(e), "skipped_large_files": [], "notes": []}
+    names = tarfile.open(res["tarball"], mode="r:gz").getnames() if res.get("tarball") else []
+    ok("runs/R_x/small.txt" in names and "run.log" in names and "runs/R_x/big.bin" not in names
+       and [p for p, _ in res["skipped_large_files"]] == ["runs/R_x/big.bin"]
+       and any("large files" in n for n in res["notes"]) and os.listdir(os.path.join(root, "FULL")).count("result.tar.gz.tmp") == 0,
+       f"WS2c no room for the complete tarball: the task still returns one without the large files and says so: "
+       f"{names} {res.get('error')} {res['notes'][-1:]}")
 
     class Store:
         write_archive, sha256_file = staticmethod(results_store.write_archive), staticmethod(results_store.sha256_file)
