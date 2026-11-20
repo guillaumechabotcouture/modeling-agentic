@@ -221,14 +221,39 @@ def retired_tree_problem(cmd, code: bytes | None) -> str | None:
     """Why a command may not ship with this code, or None: it mentions --v1 anywhere (a wrapper or a module run
     this launcher cannot parse included) and the shipped tree's main.py predates the v1 retirement, so it would
     still run v1. A tree at or after the retirement refuses --v1 itself, so its jobs keep the checks they had."""
-    text = cmd if isinstance(cmd, str) else " ".join(str(t) for t in (cmd or ()))
-    if "--v1" not in text or code is None:
+    if not _has_v1_token(cmd):
         return None
+    if code is None:          # code already on the VM (no --tree/--dir): which main.py runs cannot be checked here
+        return (f"the command passes --v1 and ships no code, so this launcher cannot check the VM's main.py; "
+                f"{pipeline_id.RETIRED_MESSAGE}: refusing")
     src = rc._archive_member(code, "scripts/lib/pipeline_id.py") or b""
     if b"RETIRED_MESSAGE" in src:
         return None
-    return (f"the command mentions --v1 and the shipped tree's main.py predates the v1 retirement (it would still "
+    return (f"the command passes --v1 and the shipped tree's main.py predates the v1 retirement (it would still "
             f"run v1); {pipeline_id.RETIRED_MESSAGE}: refusing")
+
+
+def _has_v1_token(cmd, depth: int = 0) -> bool:
+    """`--v1` as a word of the command, or of the script a shell wrapper runs (`bash -c '... --v1'`), never as
+    part of a longer word: a quoted question that mentions --v1 is one word."""
+    import shlex
+    if isinstance(cmd, (list, tuple)):
+        words = [str(w) for w in cmd]
+    else:
+        try:
+            lex = shlex.shlex(str(cmd), posix=True, punctuation_chars=";&|()<>")
+            lex.whitespace_split = True
+            words = list(lex)
+        except ValueError:
+            words = str(cmd).split()
+    for k, w in enumerate(words):
+        if w == "--v1" or w.startswith("--v1="):
+            return True
+        if (depth < 3 and k + 1 < len(words) and w.startswith("-") and not w.startswith("--") and "c" in w[1:]
+                and k >= 1 and os.path.basename(words[k - 1]) in ("sh", "bash", "zsh", "dash")
+                and _has_v1_token(words[k + 1], depth + 1)):
+            return True
+    return False
 
 
 def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
@@ -1257,10 +1282,34 @@ def _self_test_pipeline(ok) -> None:
         ok(rtp is not None and not any(rtp(c, trees["new"]) for c in wrapped)
            and not rtp("python3 main.py Q --v2", trees["old"]) and not rtp(["python3", "main.py", "--v2"], trees["old"]),
            "VP2d a retired tree is not refused (its main.py refuses --v1), nor a v2 command on an older tree")
-        ok(rtp is not None and "retired_tree_problem(" in inspect.getsource(_run_locked)
-           and "retired_tree_problem(" in inspect.getsource(cmd_start)
-           and inspect.getsource(_run_locked).index("retired_tree_problem(") < inspect.getsource(_run_locked).index("_create("),
-           "VP2e run and start check the shipped tree before anything is created")
+        # VP2e (Codex round 5): behavioural; run and start refuse before a cluster, a reservation or a job exists.
+        import argparse as _ap
+
+        def _boom(*a, **k):
+            raise AssertionError("reached a cluster, a VM request or a job submission")
+        saved_e = {k: g[k] for k in ("_client", "_vm_request", "_create", "job_env")}
+        g.update({k: _boom for k in saved_e})
+        try:
+            for entry in ("start", "run"):
+                ns = _ap.Namespace(name="x", job_id="j", command=["python3 -m main --v1 Q"], tree=None,
+                                   dir=os.path.join(tdv, "old"), anthropic_key=False)
+                try:
+                    if entry == "start":
+                        ns._code = trees["old"]
+                        cmd_start(ns, cluster=object())
+                    else:
+                        _run_locked(ns, os.path.join(tdv, "dest"))
+                    ok(False, f"VP2e {entry} refuses a --v1 job on a pre-retirement tree")
+                except SystemExit as e:
+                    ok(pipeline_id.RETIRED_MESSAGE in str(e), f"VP2e {entry} refuses before anything is created: {e}")
+                except AssertionError as e:
+                    ok(False, f"VP2e {entry} refuses before anything is created: {e}")
+        finally:
+            g.update(saved_e)
+        ok(rtp("python3 main.py --v2 'How do the estimates compare with the archived --v1 results?'", trees["old"])
+           is None, "VP2f (Codex round 5) a question that mentions --v1 is not a --v1 flag")
+        ok(rtp("python3 -m main --v1 --resume runs/R1", None) and not rtp("python3 main.py --v2 Q", None),
+           "VP2g a --v1 command that ships no code (a reused VM checkout) is refused; a v2 one is not")
     for cmd in (["python3 main.py 'Q?' --v1"], ["python3", "main.py", "--v1", "--resume", "runs/R1"]):
         try:
             got = jp(cmd)

@@ -1668,14 +1668,15 @@ def _self_test_s19_pipeline(ok, td):
         rc = e.code
     ok(rc not in (0, None) and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
        f"S19q (Codex P2) `run --pipeline v1` exits with the retirement message ({rc}, {err.getvalue()[-160:]!r})")
-    # S19r (Codex round 2): an inherited EVAL_PIPELINE=v1 does not break the config lookup of a v2 launch.
+    # S19t (Codex rounds 2, 5): an inherited EVAL_PIPELINE=v1 does not break the config lookup of a v2 launch
+    # (a shipped config, so the case runs in a launch tree too).
     old_ep = os.environ.get("EVAL_PIPELINE")
     os.environ["EVAL_PIPELINE"] = "v1"
     try:
-        t = launch_tree(None, suite_questions()[0], pipeline="v2")
-        ok(bool(t), f"S19r the default launch tree is found for --pipeline v2 under EVAL_PIPELINE=v1 ({t})")
+        t = launch_tree(None, "dengue_outbreak", pipeline="v2")
+        ok(bool(t), f"S19t the default launch tree is found for --pipeline v2 under EVAL_PIPELINE=v1 ({t})")
     except Exception as e:  # noqa: BLE001
-        ok(False, f"S19r the default launch tree is found for --pipeline v2 under EVAL_PIPELINE=v1: {type(e).__name__}: {e}")
+        ok(False, f"S19t the default launch tree is found for --pipeline v2 under EVAL_PIPELINE=v1: {type(e).__name__}: {e}")
     finally:
         if old_ep is None:
             os.environ.pop("EVAL_PIPELINE", None)
