@@ -50,8 +50,15 @@ PROMPTS = {
 
 Task: draft decision_spec.yaml for the question, and analysis_settings.yaml with the
 computational settings only ({settings}; not repeated in the spec). Follow {skill} (the schema is the
-docstring of {schema}; a full example is {example}). Write `engine: auto`: the harness chooses the
-engine after sign-off. The harness has copied the question's input files into data/inputs/ (same
+docstring of {schema}; a full example is {example}). Engine: write `engine: auto` when the harness
+can configure an engine from the rest of the spec (its components and outcome, or an estimates spec's
+`dynamics`); it then chooses the engine after sign-off. `auto` cannot configure an engine whose
+structure, run mode or groups are part of what the owner signs: when the question needs one ({skill}
+and the engine's card say which and list the fields), name it with its configuration,
+`engine: {{ref: '<module>:<Class>', config: {{...}}}}`. Name the engine the same way to run it in a
+mode other than its default, or to use an engine that `auto` configures only from an estimates spec
+in a spec that is not one. A named configuration is used as written, and the named engine is then
+the only one considered. The harness has copied the question's input files into data/inputs/ (same
 relative paths; their sha256 in data/inputs_provenance.json): read them. You write code, never
 tables. For each file the spec reads that is not a staged input (the units table, calibration
 targets, cost tables), write one script under data/derive/ and declare it in data/derivations.yaml
@@ -389,6 +396,22 @@ def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
     return f"this task may write only {', '.join(owns + (OUT,))}"
 
 
+def _no_session_when_sole(pick):
+    """v2 autonomy 1B-i: with exactly one eligible engine there is nothing to choose, so the harness returns it and
+    no session is paid for (analysis_backend.sole_pick; engine_choice.json records pick.task). A pick that carries
+    more than the candidate rows (the reasons of a rethink) still runs."""
+    import functools
+
+    @functools.wraps(pick)
+    def pick_engine(self, spec, eligible, *args, **kwargs):
+        from agents import analysis_backend as AB
+        sole = None if args or any(v for v in kwargs.values()) else AB.sole_pick(eligible)
+        if sole:
+            return TaskResult(True, sole, 0.0, AB.SOLE_WHY)
+        return pick(self, spec, eligible, *args, **kwargs)
+    return pick_engine
+
+
 def _settings_text() -> str:
     from agents import analysis_backend as AB
     return ", ".join(getattr(AB.backend(), "settings_paths", AB.SETTINGS_PATHS))
@@ -608,6 +631,9 @@ class SdkTasks:
         t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir)
         t.set_allowance(cap_usd)
         return t.seed_world_model(ctx, feedback)
+
+
+SdkTasks.pick_engine = _no_session_when_sole(SdkTasks.pick_engine)
 
 
 def _self_test() -> int:
