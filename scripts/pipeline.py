@@ -105,6 +105,7 @@ REPORT = os.path.join("models", "pipeline_report.json")
 PROGRESS = "pipeline_progress.json"
 _RUN_ID = None           # the current run()'s id (MA_PIPELINE_RUN in its steps)
 _PROGRESS_DOC: dict = {}  # (run dir, run id) -> PROGRESS as this process last wrote it
+_PROGRESS_LOCK = threading.Lock()   # one check-and-write of PROGRESS at a time (Codex round 4 on #267)
 # The runner's own records: written by the harness run only (protected in
 # agents/enforcement.py SCRIPT_OUTPUTS).
 OWN_FILES = ("models/pipeline_state.json", "models/pipeline_state.json.tmp",
@@ -751,7 +752,9 @@ def _communicate(p, timeout_s, soft_s=None, on_overrun=None):
     nxt, worker = soft_s, None
     while True:
         try:
-            return p.communicate(timeout=max(0.01, min(nxt, timeout_s) - (time.monotonic() - t0)))
+            # Each wait is at most PROGRESS_EVERY_S (Codex round 4 on #267: a 30-day wait overflows the OS poller).
+            el = time.monotonic() - t0
+            return p.communicate(timeout=max(0.01, min(nxt, timeout_s, el + PROGRESS_EVERY_S) - el))
         except subprocess.TimeoutExpired:
             el = time.monotonic() - t0
             if el >= timeout_s:
@@ -761,7 +764,11 @@ def _communicate(p, timeout_s, soft_s=None, on_overrun=None):
                 # report at a time; a report still running when the next is due is skipped.
                 if worker is None or not worker.is_alive():
                     worker = threading.Thread(target=_report, args=(on_overrun, el), daemon=True)
-                    worker.start()
+                    try:
+                        worker.start()
+                    except RuntimeError as e:     # the OS refused a thread (Codex round 4): the step runs on
+                        worker = None
+                        _warn(f"[pipeline] progress report not started: {e}")
                 nxt = el + PROGRESS_EVERY_S
 
 
@@ -783,8 +790,9 @@ def _warn(msg: str) -> None:
 def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None):
     """Own process group; at `timeout_s` the whole group is killed (as derived_rebuild). `soft_s`/`on_overrun`: see
     _communicate (the step's soft deadline: warned about, never killed)."""
+    # errors="replace" (Codex round 4 on #267): output that is not UTF-8 never hides the step's outcome.
     p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                         text=True, env=env, start_new_session=True, shell=shell)
+                         text=True, errors="replace", env=env, start_new_session=True, shell=shell)
     try:
         try:
             _out, err = _communicate(p, timeout_s, soft_s, on_overrun)
@@ -918,12 +926,15 @@ def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_s
              "projected_past_backstop": (proj > hard_s) if proj is not None else None}
     # Kept in memory for this pipeline run and only ever replaced on disk, never read back (Codex on #267: a FIFO at
     # the path would block the deadline loop, and an edited entry would be republished as the harness's).
-    doc = _PROGRESS_DOC.setdefault((run_dir, _RUN_ID), {"pipeline_run": _RUN_ID, "steps": {}})
-    prev = doc["steps"].get(step["id"]) or {}
-    if state == "running" and prev.get("started_at") == entry["started_at"] and prev.get("state") != "running":
-        return                # a late report (its thread) never overwrites the step's final state
-    doc["steps"][step["id"]] = entry
-    _write_json(run_dir, PROGRESS, doc)
+    # Under one lock, the check and the write (Codex round 4 on #267): a 'running' report that passed the check
+    # cannot land on disk after the final state.
+    with _PROGRESS_LOCK:
+        doc = _PROGRESS_DOC.setdefault((run_dir, _RUN_ID), {"pipeline_run": _RUN_ID, "steps": {}})
+        prev = doc["steps"].get(step["id"]) or {}
+        if state == "running" and prev.get("started_at") == entry["started_at"] and prev.get("state") != "running":
+            return                # a late report (its thread) never overwrites the step's final state
+        doc["steps"][step["id"]] = entry
+        _write_json(run_dir, PROGRESS, doc)
     if state == "running":
         _warn(f"[pipeline] WARNING step {step['id']}: running {_dur(el)}, past its soft deadline of {_dur(soft_s)}; "
               f"it runs on, killed only at its backstop of {_dur(hard_s)} ({entry['backstop_at']})"
@@ -1189,7 +1200,8 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
             # The runner's own record, republished (Codex round 3 on #267): a later step that overwrote the file
             # cannot have its bytes certified as harness-written.
             try:
-                produced.append(_write_json(run_dir, PROGRESS, doc))
+                with _PROGRESS_LOCK:
+                    produced.append(_write_json(run_dir, PROGRESS, doc))
             except OSError:
                 pass
         _finish(run_dir, report, t0, integrity, produced, by_id)
@@ -2275,6 +2287,60 @@ def _self_test() -> int:
                f"PL15l the progress record on disk is the runner's own at the end of the run: {str(after)[:160]}")
             w(d, "models/b.py", "v = int(open('models/a.out').read()) + int(open('data/y.csv').read())\n"
                                 "open('models/b.out', 'w').write(str(v))\n")
+            # PL15m-p (Codex round 4 on #267, in-scope P1s):
+            # m: a warning thread the OS refuses to start never kills the step.
+            import contextlib
+            import io
+            from unittest import mock as _mock
+            slow = [sys.executable, "-c", "import time; time.sleep(1.5)"]
+            with _mock.patch.object(threading.Thread, "start",
+                                    lambda self: (_ for _ in ()).throw(RuntimeError("can't start new thread"))):
+                try:
+                    res_m = _run_cmd(slow, d, 20, None, soft_s=0.3, on_overrun=lambda el: None)
+                except BaseException as e:  # noqa: BLE001
+                    res_m = e
+            ok(isinstance(res_m, tuple) and res_m[0] == 0,
+               f"PL15m a warning thread that cannot start never kills the step: {res_m!r}")
+            # n: a 'running' report that serialized before the final state never lands after it.
+            real_wj, gate_n = _write_json, threading.Event()
+
+            def slow_wj(run_dir, rel, obj):
+                snap = json.loads(json.dumps(obj))
+                if (snap.get("steps", {}).get("race") or {}).get("state") == "running":
+                    gate_n.set()
+                    time.sleep(1.0)
+                return real_wj(run_dir, rel, snap)
+            t_n = time.time()
+            with _mock.patch.dict(globals(), {"_write_json": slow_wj}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                th_n = threading.Thread(target=_progress_record, daemon=True,
+                                        args=(d, {"id": "race", "run": "x"}, 1.0, 3.0, t_n, 2.0, None, "running"))
+                th_n.start()
+                gate_n.wait(5)
+                _progress_record(d, {"id": "race", "run": "x"}, 1.0, 3.0, t_n, 2.5, None, "ok")
+                th_n.join(5)
+            try:
+                st_n = (json.load(open(os.path.join(d, PROGRESS))).get("steps") or {}).get("race", {}).get("state")
+            except (OSError, ValueError):
+                st_n = None
+            ok(st_n == "ok", f"PL15n a late 'running' report never replaces the final state on disk: {st_n}")
+            # o: output that is not UTF-8 never hides the resumable kill message.
+            junk = [sys.executable, "-c", "import sys, time; sys.stderr.buffer.write(b'\\xff\\xfe'); "
+                                          "sys.stderr.flush(); time.sleep(30)"]
+            try:
+                res_o = _run_cmd(junk, d, 2, None)
+            except BaseException as e:  # noqa: BLE001
+                res_o = e
+            ok(isinstance(res_o, tuple) and res_o[0] is None and res_o[1].startswith("timed out after "),
+               f"PL15o non-UTF-8 output never hides the resumable kill message: {res_o!r}")
+            # p: an accepted finite timeout far beyond the OS poller's limit (30 days) never kills the step at once.
+            try:
+                res_p = _run_cmd([sys.executable, "-c", "pass"], d, backstop_s(2592000.0), None,
+                                 soft_s=2592000.0, on_overrun=lambda el: None)
+            except BaseException as e:  # noqa: BLE001
+                res_p = e
+            ok(isinstance(res_p, tuple) and res_p[0] == 0,
+               f"PL15p a 30-day soft deadline never kills a step at once: {res_p!r}")
             # PL15: past the backstop it is killed, and reads as a timeout (stage_machine.resumable_failure).
             w(d, "models/a.py", "import time\ntime.sleep(30)\n")
             t1 = time.time()
