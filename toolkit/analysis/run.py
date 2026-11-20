@@ -1998,6 +1998,7 @@ def _self_test_test_ranges(ok, q):
     """A parameter_value decision test on a drawn prior at a value outside its declared range: the emulator design box
     spans the test's values too (the draws stay inside the declared range), so the test is evaluated inside the design
     and the run completes."""
+    import copy
     import tempfile
     import yaml
     from toolkit.spec import priors as PRI
@@ -2011,7 +2012,21 @@ def _self_test_test_ranges(ok, q):
                                         {"parameter": "synergy", "reason": "toy: no interaction assumed"}]
         r["analysis"]["decision_tests"] = [{"id": "DTw", "type": "parameter_value", "parameter": "dw",
                                             "values": [0.002], "text": "weaker weight, below the prior range"}]
+        # v2-dt-with: the same test with a companion engine parameter held at a value beyond its fitted range
+        r["analysis"]["decision_tests"].append(dict(r["analysis"]["decision_tests"][0], id="DTc",
+                                                    **{"with": {"eff_a": 0.75}}))
         yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        bad_with = {}
+        for label, w in (("not an engine parameter", {"nope": 1.0}), ("not a finite number", {"eff_a": "x"}),
+                         ("the test's own parameter", {"dw": 0.01}), ("not a mapping", [1])):
+            rb = copy.deepcopy(r)
+            rb["analysis"]["decision_tests"][1]["with"] = w
+            errs = schema.validate(schema.Spec(rb, d))
+            bad_with[label] = [e for e in errs if "DTc" in e and "with" in e][:1]
+        errs_ok = [e for e in schema.validate(schema.load(p)) if "DTc" in e]
+        ok(all(bad_with.values()) and not errs_ok,
+           f"RPW1 a parameter_value test's `with` holds engine parameters other than its own at finite numbers; "
+           f"anything else is refused: { {k: bool(v) for k, v in bad_with.items()} } {errs_ok[:1]}")
         signoff.sign(d, "lead", note="self-test")
         try:
             R = run(d, log=q, compute_kw={"max_workers": 2})
@@ -2030,6 +2045,36 @@ def _self_test_test_ranges(ok, q):
         ok(t["status"] == "run" and [x["value"] for x in t["results"]] == [0.002]
            and 0.005 <= s["ci_low"] < s["ci_high"] <= 0.02,
            f"RP12 the test runs at 0.002 and the draws stay inside the declared prior range: {t['status']}, {s}")
+        # v2-dt-with: the companion's value is in the design box, the test runs with it held in every case and says so
+        from toolkit.analysis.core import Analysis as _A
+        c = {x["test_id"]: x for x in R["decision_tests"]}["DTc"]
+        rng = design.get("design_ranges", {}).get("eff_a") or [None, None]
+        ok(rng[1] == 0.75 and c["status"] == "run" and c.get("with") == {"eff_a": 0.75} and "eff_a" in c["varied"]
+           and "0.75" in c["varied"] and "with" not in t and "eff_a" not in t["varied"]
+           and t["varied"] == "engine parameter dw set to each tested value",
+           f"RPW2 a companion value widens the design box and the test runs with it held, named in the result; a test "
+           f"without `with` reads as before: {rng} {c['status']} {c.get('varied')} | {t['varied']}")
+        ok(c["results"][0] != t["results"][0],
+           "RPW3 the companion changes the evaluation: the two tests' results at the same value differ")
+        ev = DT.prerun_evidence(schema.load(p))
+        dtc = r["analysis"]["decision_tests"][1]
+        pl = DT.plan_test(schema.load(p), dict(dtc, values=[ev["point"]["dw"]]), ev)
+        pl0 = DT.plan_test(schema.load(p), dict(dtc, values=[ev["point"]["dw"]], **{"with": {"eff_a": ev["point"]["eff_a"]}}), ev)
+        out_box = DT.plan_test(schema.load(p), dict(dtc, **{"with": {"eff_a": 0.99}}), ev)
+        no_input = DT.plan_test(schema.load(p), dict(dtc, **{"with": {"base": 0.5}}), ev)
+        ok(pl["status"] == "runs" and pl["perturbations"][0]["identity"] is False
+           and pl0["perturbations"][0]["identity"] is True
+           and out_box["status"] == "not_run" and "eff_a" in out_box["why"]
+           and no_input["status"] == "not_run" and "base" in no_input["why"],
+           f"RPW4 a case is identity only when every companion is at its point value; a companion outside the design "
+           f"box, or one that is not an emulator input, is not run: {out_box['why'][:80]} | {no_input['why'][:80]}")
+        from toolkit.spec import engine_parameters as PV
+        rh = copy.deepcopy(r)
+        rh["engine_parameters"] = {"synergy": {"value": 0.0, "source": "s", "reason": "r", "basis": "owner_judgement"}}
+        rh["analysis"]["decision_tests"][1]["with"] = {"synergy": 0.1}
+        tb = PV.tested_boxes(schema.Spec(rh, d))
+        ok(tb.get("synergy") == [0.0, 0.1], f"RPW5 a held spec value named as a companion is a design input over the "
+                                            f"box spanning both values: {tb}")
 
 
 def _self_test_cost_structure(ok, A, R):

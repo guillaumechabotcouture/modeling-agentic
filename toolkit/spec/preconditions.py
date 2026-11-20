@@ -381,6 +381,17 @@ def _self_test_posterior(ok) -> None:
             NEF.UNIT_BOUNDS.pop("", None)
         ok(any("DTpa" in g and "hard bound" in g for g in got),
            f"PC16b a parameter_value test that sets a posterior column outside its hard bounds is refused: {got[:1]}")
+        # v2-dt-with: a companion value of a posterior column is checked against the same hard bounds
+        raw["analysis"]["decision_tests"][-1].update(parameter="eff_b", values=[0.2], **{"with": {"eff_a": 1.5}})
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        NEF.UNIT_BOUNDS[""] = (0.0, 1.0)
+        try:
+            got = problems(d, None, None)
+        finally:
+            NEF.UNIT_BOUNDS.pop("", None)
+        ok(any("DTpa" in g and "eff_a" in g and "hard bound" in g for g in got),
+           f"PC16c a parameter_value test whose `with` sets a posterior column outside its hard bounds is refused: "
+           f"{got[:1]}")
     rows_hi = rows
     with tempfile.TemporaryDirectory() as d:
         rows[:] = [{"eff_a": round(0.55 + 0.15 * x, 6), "eff_b": r["eff_b"]} for x, r in zip(u, rows_hi)]
