@@ -632,6 +632,36 @@ def _self_test() -> int:
                        headline=lambda rd: {}, log=lambda *a: None)
         ok(s18.get("owner_amendments") == ["D-004", "D-005"] and s18["rethink"] == "SPEC",
            f"F18c the loop's summary names the findings the owner must amend ({s18})")
+    # F_CHECK_NOOP (v2 autonomy 1A, 4a): a gate finding the harness checks cannot re-evaluate is not passed by its
+    # absence from them; one that carries a runnable test is checked by the test.
+    with tempfile.TemporaryDirectory() as d:
+        ledn = {"critique_presentation_missing": FL.Finding(id="critique_presentation_missing", severity="MEDIUM",
+                                                            kind="critique_presentation_missing", source="rigor-artifacts"),
+                "done_when_unmet:D-1": FL.Finding(id="done_when_unmet:D-1", kind="done_when_unmet", key="D-1",
+                                                  severity="MEDIUM", source="rigor-artifacts",
+                                                  done_when=[{"file": "never.txt", "exists": True}]),
+                "k:x": FL.Finding(id="k:x", kind="k", key="x", severity="HIGH", source="rigor-artifacts")}
+        cn = check_task(d, {"findings": list(ledn)}, ledn, set())
+        ok(cn["critique_presentation_missing"]["passed"] is None and cn["done_when_unmet:D-1"]["passed"] is False
+           and cn["k:x"]["passed"] is True,
+           f"F_CHECK_NOOP after a no-op edit, a gate-only finding is left to the gate and a failing test fails ({cn})")
+        # F_RETHINK_BREAK (5.4): nothing is fixed or rebuilt after a rethink task.
+        FL.save(d, {"k:x": ledn["k:x"], "k:y": FL.Finding(id="k:y", kind="k", key="y", severity="HIGH", source="harness")})
+        ran = []
+
+        class RB:
+            def plan_fixes(self, pk):
+                return NS(ok=True, note="", output={"tasks": [
+                    {"id": "T1", "findings": ["k:x"], "action": "rethink", "owner_state": "ENGINE_CHOICE", "brief": "b"},
+                    {"id": "T2", "findings": ["k:y"], "action": "fix", "owner_state": "ANALYZE", "brief": "b"}]})
+
+            def fix(self, t, run_dir, evidence):
+                ran.append(t["id"])
+                return NS(ok=True, note="", output=None)
+        srb = run_loop(d, 1, 3, None, RB(), rebuild=lambda rd: ran.append("rebuild") or {"ok": True},
+                       harness_ids=lambda rd: set(), headline=lambda rd: {}, log=lambda *a: None)
+        ok(srb["rethink"] == "ENGINE_CHOICE" and ran == [] and srb.get("skipped_rethink") == 1,
+           f"F_RETHINK_BREAK the loop stops at the first rethink task ({ran}, {srb})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

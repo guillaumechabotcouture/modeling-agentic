@@ -933,6 +933,40 @@ def _self_test() -> int:
            and r["scale_problems"][0]["rendered"] == "0.6%",
            f"T18: a proportion cited as a percentage is reported; a real 0.5% is not: {r}")
 
+    # RCL_ISOLATE (v2 autonomy 1A, 6.2): one invalid claim does not make the valid ones unreadable for a caller
+    # that asks for them; the strict reader still refuses the whole ledger.
+    with tempfile.TemporaryDirectory() as d:
+        lp = os.path.join(d, "l.yaml")
+        with open(lp, "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "a.good", "claim_kind": "scalar", "value": 5},
+                {"id": "b.ci", "claim_kind": "scalar", "value": 5, "ci_low": 6, "ci_high": 7},
+                {"id": "c.dup", "claim_kind": "count", "value": 1}, {"id": "c.dup", "claim_kind": "count", "value": 2},
+                "not a mapping"]}, f)
+        try:
+            got, bad = globals()["load_claims_tolerant"](lp)
+        except Exception as e:  # noqa: BLE001 -- before the reader exists this is the failure
+            got, bad = {}, {"raised": f"{type(e).__name__}: {e}"}
+        try:
+            load_claims(lp)
+            strict = "accepted"
+        except ValueError:
+            strict = "refused"
+        ok(set(got) == {"a.good"} and set(bad) == {"b.ci", "c.dup", "claims[4]"} and "claims[1]" in bad.get("b.ci", "")
+           and strict == "refused",
+           f"RCL_ISOLATE the tolerant reader keeps the valid claim and names each invalid one; load_claims still "
+           f"refuses: {sorted(got)}, {bad}, strict {strict}")
+        with open(lp, "w") as f:
+            f.write("claims: 3\n")
+        try:
+            globals()["load_claims_tolerant"](lp)
+            whole = "accepted"
+        except ValueError:
+            whole = "refused"
+        except Exception as e:  # noqa: BLE001
+            whole = type(e).__name__
+        ok(whole == "refused", f"RCL_ISOLATE2 a ledger that is not a list of claims is still refused whole ({whole})")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:

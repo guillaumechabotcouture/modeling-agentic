@@ -542,6 +542,24 @@ def _self_test() -> int:
            and FX_.needs_owner_amendment(led17b["D-031"]),
            f"L17 a recorded owner answer applies to the finding it was given for; a revised one is asked again "
            f"({unverified}, {st17}, {led17b['D-031'].status})")
+    # L_DICT_DW, L_FROZEN_DW, L_GATE_DW (v2 autonomy 1A, 4c and 4a): the ledger's copy of a test is what the fix loop
+    # checks a task against.
+    with tempfile.TemporaryDirectory() as d:
+        frozen, weaker = [{"file": "x.txt", "contains": "draws 32"}], [{"file": "x.txt", "exists": True}]
+        doc = {"reviewer": "critique-redteam", "round": 2, "blockers": [
+            {"id": "R-041", "severity": "HIGH", "target_stage": "MODEL", "claim": "c", "done_when": frozen[0]},
+            {"id": "R-042", "severity": "HIGH", "target_stage": "MODEL", "claim": "c", "done_when": weaker}]}
+        yaml.safe_dump(doc, open(os.path.join(d, "critique_redteam.yaml"), "w"))
+        json.dump({"tests": {"R-042": {"done_when": frozen, "frozen_round": 1}}},
+                  open(os.path.join(d, "done_when_registry.json"), "w"))
+        led, _ = sync(d, None, 2)
+        ok(led["R-041"].done_when == frozen, f"L_DICT_DW a test written as one mapping is kept ({led['R-041'].done_when})")
+        ok(led["R-042"].done_when == frozen,
+           f"L_FROZEN_DW the test the gate froze is kept over a critic's later edit ({led['R-042'].done_when})")
+        rows, _ = from_gate({"rigor_violations": [{"kind": "done_when_unmet", "key": "R-9", "severity": "MEDIUM",
+                                                   "claim": "c", "done_when": frozen}]}, 2)
+        ok(rows[0].id == "done_when_unmet:R-9" and rows[0].done_when == frozen,
+           f"L_GATE_DW a gate row that carries a test keeps it ({rows[0].id}, {rows[0].done_when})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

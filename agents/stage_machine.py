@@ -3008,6 +3008,8 @@ def _self_test() -> int:
             traceback.print_exc()
             ok(False, f"T58-T60 analysis timeout and resume: {type(e).__name__}: {e}")
 
+        _self_test_auto1a(ok, td, spike, new_run)
+
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
         m.st.state = "SPEC"
@@ -3339,6 +3341,164 @@ def main(rd):
 if __name__ == "__main__":         # the local pool's spawned processes import this file again
     sys.exit(main(sys.argv[1]))
 '''
+
+
+def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
+    """v2 autonomy brief, PR 1A (docs/design/v2-autonomy-brief.md §4; item numbers are the re-audit's): the
+    PRESENTATION budget stop, the gate before a rewrite, harness ids, the RETHINK back-edges and claim references."""
+    from types import SimpleNamespace as NS
+    import yaml
+    from v2_tasks import StubTasks
+
+    def mk(d, T, st, backend=spike):
+        return Machine(d, T, st, backend=backend, log=lambda *a: None, cross_engine_check=False)
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- before the fix exists this is the failure
+            ok(False, f"{name}: {type(e).__name__}: {e}")
+
+    def budget():
+        # T_PRES_BUDGET (1.1): the presentation review is part of the write-up, so it may use the write-up reserve.
+        d, T, st = new_run("a1_pres", {}, budget=20.0)
+        st.state, st.spent_usd = "PRESENTATION", 16.5        # past cap less reserve, $3.50 of the reserve left
+        save_state(d, st)
+        mk(d, T, st).step()
+        s = load_state(d)
+        ok(s.state == "GATE" and s.forced_status is None and T.calls == ["critique:critique-presentation:1"],
+           f"T_PRES_BUDGET the presentation review runs on the write-up reserve ({s.state}, {s.forced_status}, {T.calls})")
+        d, T, st = new_run("a1_pres_out", {}, budget=20.0)
+        st.state, st.spent_usd = "PRESENTATION", 20.0
+        save_state(d, st)
+        mk(d, T, st).step()
+        s = load_state(d)
+        ok(s.state == "FINAL" and s.status == "budget_exhausted" and T.calls == [],
+           f"T_PRES_BUDGET2 with the whole cap spent the run still ends budget_exhausted ({s.state}, {s.status})")
+
+        # T_WRITE_RB (1.2): a write-up task's crash read-back has an allowance from the reserve too.
+        class RBT(StubTasks):
+            def set_allowance(self, usd, readback_usd=None):
+                self.rb = readback_usd
+                super().set_allowance(usd)
+        d, T, st = new_run("a1_rb", {}, budget=20.0)
+        st.spent_usd = 16.5
+        save_state(d, st)
+        T = RBT(T.s)
+        m = mk(d, T, st)
+        m._task("k1", "sign_spec", d, writeup=True)
+        ok(T.rb == READBACK_CAP_USD and m._task("k2", "sign_spec", d) is None,
+           f"T_WRITE_RB a write-up task keeps its read-back allowance; other tasks still stop at the reserve ({T.rb})")
+
+    def post_write():
+        # T_PW_GATE (2.1): after a post-write modelling fix the next gate is pre-write, one round on, and the draft is
+        # rewritten and reviewed again after it: that gate reads the last presentation review as of the round it
+        # was written in (its findings stay open and listed), not as a schema error. The post-write gate still
+        # needs the current round's review.
+        d = os.path.join(td, "a1_pw")
+        os.makedirs(d)
+        S = StubTasks({"critics": {1: {"critique-presentation": [
+            {"id": "P-001", "severity": "MEDIUM", "target_stage": "WRITE", "claim": "a caption is unclear",
+             "done_when": [{"file": "manuscript.md", "contains": "Figure 1 shows"}]}]}}})
+        S.critique(d, "critique-presentation", 1)
+        for r in CRITICS:
+            S.critique(d, r, 2)
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
+        g, gp = (v2_gate(d, 2, 3, pw, [], history=False) for pw in (False, True))
+        kinds = {v.get("kind") for v in g.get("rigor_violations") or []}
+        ok(not g.get("schema_errors") and g.get("action") and "P-001" in {o["id"] for o in open_findings(d, g)}
+           and not kinds & {"done_when_dropped", "critique_presentation_missing"} and gp.get("schema_errors"),
+           f"T_PW_GATE a pre-write gate reads the last draft's presentation review as of its own round; the "
+           f"post-write gate needs this round's ({g.get('schema_errors')}, {g.get('action')}, {sorted(kinds)}, "
+           f"post {bool(gp.get('schema_errors'))})")
+        # T_OF_PRES (2.4): before a draft, presentation polish waits, as at the gate (open_problems.after_write_item).
+        d = os.path.join(td, "a1_ofp")
+        os.makedirs(d)
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "D-061", "severity": "MEDIUM", "category": "PRESENTATION", "target_stage": "ANALYZE", "claim": "c"},
+            {"id": "D-062", "severity": "MEDIUM", "category": "METHODS", "target_stage": "ANALYZE", "claim": "c"}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
+        ok(got == ["D-062"], f"T_OF_PRES a PRESENTATION finding waits for the draft ({got})")
+
+    def ids():
+        # F_HARNESS_IDS (4a): the ids a fix task is checked against include the spec and registry checks.
+        class B:
+            def __getattr__(self, n):
+                return getattr(spike, n)
+
+            def gate_findings(self, rd):
+                return []
+
+            def spec_violations(self, rd):
+                return [{"kind": "spec_x", "key": "k1", "severity": "HIGH", "claim": "c"}]
+
+            def registry_violations(self, rd):
+                return [{"kind": "reg_y", "key": "k2", "severity": "HIGH", "claim": "c"}]
+        d, T, st = new_run("a1_ids", {})
+        got = mk(d, T, st, backend=B()).harness_ids(d)
+        ok({"spec_x:k1", "reg_y:k2"} <= got, f"F_HARNESS_IDS spec and registry findings are harness ids ({sorted(got)})")
+
+    def rethink():
+        # T_RETHINK_SPEC_TRIES (5.1, 5.2; unsigned specs only, a signed one pauses for the owner): a rethink redrafts
+        # the spec with the reasons, whatever tries the first draft used.
+        class ST(StubTasks):
+            def draft_spec(self, q, rd, fb):
+                self.fbs = getattr(self, "fbs", []) + [fb]
+                return super().draft_spec(q, rd, fb)
+        sb = {"id": "D-051", "severity": "HIGH", "target_stage": "PLAN", "category": "STRUCTURAL",
+              "claim": "the decision unit is too coarse", "fix_requires": "Redraft the units."}
+        d, T, st = new_run("a1_rspec", {"critics": {1: {"critique-domain": [sb]}}, "structural": {1: "critique-domain"}},
+                           max_rounds=2)
+        st.tries["spec"] = MAX_SPEC_TRIES - 1
+        save_state(d, st)
+        T = ST(T.s)
+        s = mk(d, T, st).run()
+        fbs = T.fbs
+        ok(len(fbs) >= 2 and fbs[0] is None and any("D-051" in x and "Redraft the units." in x for x in fbs[1] or []),
+           f"T_RETHINK_SPEC_TRIES a rethink of an unsigned spec redrafts it with the findings ({s}, {fbs})")
+
+        # T_RETHINK_ENGINE_CONTEXT (5.3): the engine pick after a rethink is told the engine left and why.
+        class ET(StubTasks):
+            def pick_engine(self, spec, eligible, rethink=None):
+                self.rth = getattr(self, "rth", []) + [rethink]
+                return super().pick_engine(spec, eligible)
+        blk = {"id": "D-052", "severity": "HIGH", "target_stage": "MODEL", "claim": "the engine has no age structure"}
+        plan = lambda pk: {"tasks": [{"id": "T1", "findings": [f["id"] for f in pk["findings"]], "action": "rethink",   # noqa: E731
+                                      "owner_state": "ENGINE_CHOICE", "brief": "pick an engine with age structure",
+                                      "files": ["engine_choice.json"]}] if pk["findings"] else []}
+        d, T, st = new_run("a1_reng", {"critics": {1: {"critique-domain": [blk]}}, "plan": plan}, max_rounds=2)
+        T = ET(T.s)
+        s = mk(d, T, st).run()
+        r = T.rth + [None, None]
+        ok(r[0] is None and isinstance(r[1], dict) and str(r[1].get("engine")).endswith("ToyEngine")
+           and any("age structure" in w for w in r[1].get("why") or []),
+           f"T_RETHINK_ENGINE_CONTEXT the second engine pick gets the engine left and the reasons ({s}, {T.rth})")
+
+    def claims():
+        # T_CLAIM_WS (6.1): [CLAIM: id ] is the reference the renderer accepts; it is not an unresolved one.
+        # T_CLAIM_ISOLATE (6.2, 6.3): one invalid claim is its own finding, and the valid claims still render.
+        led = [{"id": "a.good", "claim_kind": "scalar", "value": 5}]
+        bad = {"id": "b.ci", "claim_kind": "scalar", "value": 5, "ci_low": 6, "ci_high": 7}
+        out = {}
+        for name, cl in (("ws", led), ("iso", led + [bad])):
+            d = os.path.join(td, "a1_claims_" + name)
+            os.makedirs(os.path.join(d, "models"))
+            yaml.safe_dump({"claims": cl}, open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+            open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts [CLAIM: a.good ] cases.\n")
+            open(os.path.join(d, AB.SPEC_FILE), "w").write("{}\n")
+            render_report(d, NS(headline=lambda rd: {}))
+            out[name] = ({(f["kind"], f.get("key")) for f in report_claim_findings(d)},
+                         open(os.path.join(d, "report.md")).read())
+        ok(not {k for k, _ in out["ws"][0]} & {"report_claim_unresolved", "report_claim_unrendered", "report_claim_id_raw"},
+           f"T_CLAIM_WS a reference with spaces around its id is resolved ({out['ws'][0]})")
+        ok(("report_claim_invalid", "b.ci") in out["iso"][0] and "[CLAIM" not in out["iso"][1]
+           and not {k for k, _ in out["iso"][0]} & {"report_claims_unreadable", "report_claim_unrendered"},
+           f"T_CLAIM_ISOLATE an invalid claim is one finding; the valid claims render ({out['iso'][0]})")
+
+    for name, fn in (("T_PRES_BUDGET", budget), ("T_PW_GATE", post_write), ("F_HARNESS_IDS", ids),
+                     ("T_RETHINK", rethink), ("T_CLAIM", claims)):
+        case(name, fn)
 
 
 def _self_test_resume(ok, td: str, spike, new_run) -> None:

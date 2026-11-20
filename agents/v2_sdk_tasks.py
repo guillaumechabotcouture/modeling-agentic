@@ -866,6 +866,27 @@ def _self_test() -> int:
         pk = json.load(open(os.path.join(d, "_task_input.json")))
         ok('{"tasks": [{"id": "T1"' in (seen_prompts.get("plan_fixes") or "") and pk["findings"] == [{"id": "R-001"}],
            "PF4 plan_fixes keeps the plan's JSON example and writes the packet the prompt names")
+        # S_PICK_RETHINK, S_FIX_OWNS (v2 autonomy 1A, 5.3 and 3): the engine pick after a rethink is told the engine
+        # the run left and why; a fix task owns the fix files whatever stage its plan names.
+        got = {}
+
+        def rec_session(self_, kind, system, prompt, owns, model=None):
+            got[kind] = (prompt, owns)
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        SdkTasks._session = rec_session
+        try:
+            t3 = SdkTasks(d)
+            try:
+                t3.pick_engine({}, [{"ref": "e1", "eligible": True}],
+                               rethink={"engine": "e1", "why": ["D-001: it has no age structure {x}"]})
+            except TypeError as e:
+                got["pick_engine"] = (f"TypeError: {e}", ())
+            t3.fix({"id": "T1", "brief": "b", "findings": ["R-001"], "owner_state": "WRITE"}, d, None)
+        finally:
+            SdkTasks._session = orig_session
+        ok("e1" in got["pick_engine"][0] and "D-001: it has no age structure {x}" in got["pick_engine"][0],
+           f"S_PICK_RETHINK the engine pick after a rethink names the engine left and the reasons ({got['pick_engine'][0]!r})")
+        ok(got["fix"][1] == OWNS["fix"], f"S_FIX_OWNS a fix task owns the fix files ({got['fix'][1]})")
     # World-model seed task (F6 world-model trials): the world model's own seed documentation in the prompt, no results
     # readable, one owned output outside the harness's analysis/ tree.
     try:

@@ -836,6 +836,20 @@ def _self_test() -> int:
         ok([x["id"] for x in r34["dropped"]] == ["D-011"],
            f"DW34 a registry written before critic_resolved_round does not reopen a judgement; a failing runnable "
            f"test still stays open: {[x['id'] for x in r34['dropped']]}")
+    # DW_KEYS (v2 autonomy 1A, 4b.1): each regressed or unmet finding is its own gate row (a key), with its test.
+    with tempfile.TemporaryDirectory() as dk:
+        blk = [{"id": i, "severity": "MEDIUM", "resolved": True, "claim": "c",
+                "done_when": [{"file": f"{i}.txt", "exists": True}]} for i in ("D-021", "D-022")]
+        rk = run(dk, {"critique-domain": {"blockers": blk}}, 1, record=False)
+        e = lambda i: {"id": i, "severity": "MEDIUM", "reviewer": "critique-domain", "passed_round": 1,   # noqa: E731
+                       "detail": "d", "claim": "c", "target_stage": "MODEL", "done_when": [{"file": "x", "exists": True}]}
+        gk = gate_findings({"regressed": [e("D-1"), e("D-2")], "unmet": rk["unmet"], "dropped": [e("D-5")]})
+        ok(len({(v["kind"], v.get("key")) for v in gk}) == 5 and all(v.get("key") == v["id"] and v.get("done_when")
+                                                                      for v in gk),
+           f"DW_KEYS regressed and unmet rows carry their finding's id as key, and its test: "
+           f"{[(v['kind'], v.get('key'), bool(v.get('done_when'))) for v in gk]}")
+        ok([v["severity"] for v in gk if v["kind"] == "done_when_dropped"] == ["HIGH"],
+           "DW_KEYS2 a dropped finding stays HIGH (set on purpose; Codex r1 P1-3)")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
