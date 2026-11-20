@@ -2747,6 +2747,23 @@ def _self_test_isolation(ok, base):
     ok(e_a is None and e_b is None and hi_a <= 1.0 and hi_b <= 1.0,
        f"FG_HIGH_PREV calibration targets near 1 draw with no invalid value and an axis that ends at 1 ({e_a}, {e_b}, "
        f"{hi_a}, {hi_b})")
+    # Codex r2: with very low proportions the emulator-error band still spans the plotted values
+    from matplotlib.collections import PolyCollection
+    R = RunData(d)
+    for u in R.units:
+        u["tgt"] = "0.00005"
+    R.override["figure_data"] = dict(R.art("figure_data"), calibration={"units": {i: {"modelled": 0.00005}
+                                                                                  for i in R.ids}})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got_l, e_l = attempt(lambda: fig_calibration(R, t))
+    bx = [float(x) for c in (got_l[0].axes[0].collections if got_l else []) if isinstance(c, PolyCollection)
+          for pth in c.get_paths() for x in pth.vertices[:, 0]]
+    hi_l = got_l[0].axes[0].get_xlim()[1] if got_l else None
+    plt.close("all")
+    ok(e_l is None and bx and min(bx) < 0.00005 < max(bx) <= hi_l,
+       f"FG_LOW_PROP_BAND with targets far below 1e-4 the emulator-error band spans the plotted values inside the "
+       f"axis ({e_l}, band {min(bx) if bx else None}-{max(bx) if bx else None}, axis end {hi_l})")
     R = RunData(d)
     R._cache[os.path.join("analysis", "calibration.yaml")] = {"data": {"method": "likelihood", "diagnostics": {
         "fit": [{"unit": i, "observed": 3.0, "expected": 2.5, "variance": None} for i in R.ids]}}}
