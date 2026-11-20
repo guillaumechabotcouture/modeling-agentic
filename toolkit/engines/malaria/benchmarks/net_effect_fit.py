@@ -1883,6 +1883,52 @@ def _self_test() -> int:
            f"another reason or not at all: {wrong or 'none'}); a changed sample has another sha256")
     case("F14", f14)
 
+    def fe1():
+        # owner, 2026-11-20 (F6 option A, refit b2): an invalid sample is accepted ONLY under a spec-declared, owner-
+        # signed exception that matches the file's recorded failures exactly (the same points, the same targets); the
+        # declaration keeps or excludes the failed point(s) from the draws
+        import hashlib
+        import tempfile
+        box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
+               "cfp_half": [547.5, 1277.5]}
+        u = [float(v) for v in np.random.default_rng(6).uniform(0, 1, 30)]
+        rows = [{"net_kill_shift": round(-0.5 + x, 6), "cfp_kill": round(0.3 + 0.2 * x, 6), "irs_kill": 0.5,
+                 "cfp_half": round(700 + 300 * x, 6)} for x in u]
+        rg = {"net_kill_shift": (-0.618, 0.66), "cfp_kill": (0.0, 0.85), "irs_kill": (0.0, 0.95),
+              "cfp_half": (547.5, 1277.5)}
+        dg = lambda q: hashlib.sha256(open(q, "rb").read()).hexdigest()  # noqa: E731
+        tgt = sorted(pack_bands())[0]
+        exc = lambda pts, draws="keep": {"failed_points": pts, "rule": "14 Nov", "evidence": "e", "reason": "r",  # noqa: E731
+                                         "draws": draws}
+        got = {}
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "net_effect_fit.yaml")
+            _fixture_placeholder(f, e, rows, box, fail_target=tgt)
+            good = os.path.join(d, "good.yaml")
+            _fixture_placeholder(good, e, rows, box)
+
+            def try_(label, path, ex):
+                try:
+                    got[label] = load_posterior(path, e, rg, dg(path), exception=ex)
+                except PosteriorRefused as er:
+                    got[label] = str(er)
+            try_("no exception", f, None)
+            try_("matching, keep", f, exc([{"point": rows[1], "targets": [tgt]}]))
+            try_("matching, exclude", f, exc([{"point": rows[1], "targets": [tgt]}], "exclude"))
+            try_("another target", f, exc([{"point": rows[1], "targets": [sorted(pack_bands())[1]]}]))
+            try_("another point", f, exc([{"point": rows[2], "targets": [tgt]}]))
+            try_("an extra point", f, exc([{"point": rows[1], "targets": [tgt]}, {"point": rows[2], "targets": [tgt]}]))
+            try_("a valid sample", good, exc([{"point": rows[1], "targets": [tgt]}]))
+        keep, drop = got["matching, keep"], got["matching, exclude"]
+        refused = [k for k in ("no exception", "another target", "another point", "an extra point", "a valid sample")
+                   if isinstance(got[k], str)]
+        ok(isinstance(keep, dict) and keep["rows"].shape[0] == 30 and isinstance(drop, dict)
+           and drop["rows"].shape[0] == 29 and keep.get("exception", {}).get("draws") == "keep"
+           and keep["exception"].get("failed_points") == [{"point": rows[1], "targets": [tgt]}] and len(refused) == 5,
+           f"FE1 an invalid sample loads only under an exception matching its recorded failures (kept: "
+           f"{getattr(keep, 'get', lambda k: None)('rows') is not None}; refused {refused})")
+    case("FE1", fe1)
+
     def f28():
         """owner, 14 Nov (f6-posterior-ranges): the sample's own hull sets its columns' draw ranges and design box."""
         import hashlib

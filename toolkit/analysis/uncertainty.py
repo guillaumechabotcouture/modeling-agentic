@@ -711,6 +711,10 @@ def _self_test() -> int:
                 ok(True, f"U12 {label} fails closed")
     _self_test_reserve(ok)
     try:
+        _self_test_exception(ok)
+    except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"UE1 the posterior exception ({type(e).__name__}: {e})")
+    try:
         _self_test_posterior(ok)
     except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
         ok(False, f"NP1-NP4 the net-effect posterior in the draws ({type(e).__name__}: {e})")
@@ -719,6 +723,37 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_exception(ok):
+    """UE1 (owner, 2026-11-20): uncertainty.net_effect_posterior.exception is validated with the posterior field, is
+    passed to the loader, recorded with the posterior's ranges (manifest and report) and shown as a HIGH owner-signed
+    departure on the sign-off sheet."""
+    class Sp:
+        def __init__(s, raw):
+            s.raw = raw
+
+        def resolve(s, p):
+            return p
+    exc = {"failed_points": [{"point": {"a": 0.1}, "targets": ["T1"]}], "rule": "the 14 Nov acceptance rule",
+           "evidence": "13 of 14 verified points pass", "reason": "a narrow miss", "draws": "keep"}
+    got = {}
+    for label, e in (("good", exc), ("no reason", {k: v for k, v in exc.items() if k != "reason"}),
+                     ("bad draws", dict(exc, draws="maybe")), ("no points", dict(exc, failed_points=[])),
+                     ("a target not a string", dict(exc, failed_points=[{"point": {"a": 0.1}, "targets": [3]}]))):
+        try:
+            got[label] = posterior_exception(Sp({"uncertainty": {"net_effect_posterior": {
+                "path": "p.yaml", "sha256": "0" * 64, "exception": e}}}))
+        except ValueError as ex:
+            got[label] = str(ex)
+    lines = exception_sheet_lines({"uncertainty": {"net_effect_posterior": {"path": "p.yaml", "sha256": "ab" * 32,
+                                                                             "exception": exc}}})
+    rec = posterior_range_record({"sha256": "s", "margin": 0.0, "ranges": {"a": (0.0, 1.0)}, "exception": exc})
+    ok(got["good"] == exc and all(isinstance(got[k], str) for k in got if k != "good")
+       and any("**HIGH**" in x and "T1" in x and "a narrow miss" in x for x in lines)
+       and exception_sheet_lines({"uncertainty": {}}) == [] and rec.get("exception") == exc,
+       f"UE1 the posterior exception: validated ({sorted(k for k in got if isinstance(got[k], str))} refused), on the "
+       f"sheet as HIGH, in the range record ({lines[:2]})")
 
 
 def _self_test_posterior(ok):
