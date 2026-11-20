@@ -5,6 +5,11 @@
     python dev_vm.py down               # stop it
 
 `run` and `down` never create a cluster (attach guard)."""
+import os as _os  # noqa: E402 -- F6 budget: this archived launcher has no budget check
+if _os.environ.get("MA_ALLOW_EXPERIMENT_LAUNCHERS") != "1":
+    raise SystemExit("docs/experiments/launchers: archived launchers create paid Coiled clusters without the "
+                     "owner-signed budget check (cloud/budget.py); set MA_ALLOW_EXPERIMENT_LAUNCHERS=1 to run one "
+                     "deliberately")
 import json, os, subprocess, sys, time
 import coiled
 

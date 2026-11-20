@@ -25,3 +25,7 @@ keep the two copies identical when changing either.
 Rules these follow: the IDM Coiled default workspace only (not the prod subscription); attach-only
 for anything but `launch` (never `coiled.Cluster(name=...)` on a cluster that may be gone: that
 creates a new one); every cluster shut down after collection; no answer keys (`_truth/`) shipped.
+
+## Budget guard
+
+Each launcher here creates paid Coiled clusters without the owner-signed budget check (`cloud/budget.py`), so each refuses at import unless `MA_ALLOW_EXPERIMENT_LAUNCHERS=1` is set. Use `cloud/run_cluster.py` or `cloud/vm_job.py run` instead; they check the budget.

@@ -52,7 +52,8 @@ SOURCED_TYPES = ("ratio", "odds_ratio", "interaction_or", "cost_per_outcome")
 EXEMPT_TYPES = ("value", "identity", "coverage", "curve_rules")     # oracle and rule checks: no published interval
 TOY_ENGINE_REFS = ("toolkit.engines.contract:ToyEngine", "toolkit.engines.benchmark:SharedStateToy",
                    "toolkit.spec.toy_engines:ToySpecEngine", "toolkit.spec.toy_engines:ToySpecRateEngine",
-                   "toolkit.spec.priors:ToyPriorEngine", "toolkit.engines.hooks:ToyScheduleEngine")
+                   "toolkit.spec.priors:ToyPriorEngine", "toolkit.engines.hooks:ToyScheduleEngine",
+                   "toolkit.spec.toy_engines:ToyDossierEngine")
 ESTIMAND_TYPES = ("odds_ratio", "risk_ratio", "rate_ratio", "hazard_ratio", "cost_per_outcome")
 # engine estimand type -> source estimand types it stands for without a mapping note
 COMPATIBLE = {"odds_ratio": {"odds_ratio"}, "interaction_or": {"odds_ratio"}, "ratio": {"risk_ratio", "rate_ratio"},
@@ -421,8 +422,8 @@ def load_evidence(engine, pack: dict | None = None, rows: list | None = None, pa
     engine's own pack; its absence is permitted only for an engine with no rows to check and no fitted values to back;
     an unreadable pack is always a problem). `rows`: stored result rows to validate (None: fitted values only); they
     must cover every benchmark of the pack unless `partial`. Problems: a pack that cannot be read, is not a non-empty
-    benchmark list or fails the source check; missing rows and rows scored against other declarations ('rerun
-    required'); fitted values without current provenance ('refit required'). Only an exact self-test toy may have
+    benchmark list or fails the source check; rows scored against other declarations ('rerun required'); pack
+    benchmarks with no stored row ('not yet run'); fitted values without current provenance ('refit required'). Only an exact self-test toy may have
     no pack."""
     from toolkit.engines.contract import engine_identity
     ref = f"{type(engine).__module__}:{type(engine).__name__}"
@@ -451,9 +452,12 @@ def load_evidence(engine, pack: dict | None = None, rows: list | None = None, pa
             probs.append("the stored rows are not a list of mappings with ids")
             rows = []
         ids = [b.get("id") for b in (pack or {}).get("benchmarks") or [] if isinstance(b, dict)]
-        stale = stale_ids(pack or {}, rows) + ([] if partial else [i for i in ids if i not in {r["id"] for r in rows}])
+        stale = stale_ids(pack or {}, rows)
+        unrun = [] if partial else [i for i in ids if i not in {r["id"] for r in rows}]
         if stale:
             probs.append(f"rerun required: {', '.join(str(x) for x in stale)}")
+        if unrun:               # a benchmark the stored rows never scored (e.g. added to the pack since): fail closed
+            probs.append(f"not yet run: {', '.join(str(x) for x in unrun)} (in the pack, no stored row; run the pack)")
     fitted, fsha, fprobs, fdoc = _fitted_in_use(engine, pack, toy)
     try:
         ident = engine_identity(engine)
@@ -991,9 +995,15 @@ def _self_test() -> int:
         empty = load_evidence(eng, pack=dict(toy, benchmarks=[])).problems
         missing = load_evidence(eng, pack=toy, rows=[]).problems
         partial = load_evidence(eng, pack=toy, rows=[], partial=True).problems
-        ok(unreadable and empty and any("rerun required: T1" in x for x in missing) and partial == (),
-           f"BS68 an unreadable pack, an empty pack and missing rows are problems; partial rows are explicit: "
-           f"{unreadable} | {empty} | {missing} | {partial}")
+        ok(unreadable and empty and any("not yet run: T1" in x for x in missing)
+           and not any("rerun required" in x for x in missing) and partial == (),
+           f"BS68 an unreadable pack, an empty pack and missing rows are problems (a missing row is 'not yet run', not "
+           f"a stale 'rerun required'); partial rows are explicit: {unreadable} | {empty} | {missing} | {partial}")
+        t2 = dict(toy, benchmarks=list(toy["benchmarks"]) + [dict(toy["benchmarks"][0], id="T9")])
+        both = load_evidence(eng, pack=t2, rows=[{"id": "T1", "band_sha256": "an older declaration"}]).problems
+        ok(any("rerun required: T1" in x for x in both) and any("not yet run: T9" in x for x in both)
+           and not any("rerun required: T1, T9" in x or "rerun required: T9" in x for x in both),
+           f"BS68b a stale row and a benchmark never run are named apart, both refused: {both}")
         with tempfile.TemporaryDirectory() as d:
             rp = os.path.join(d, "results.yaml")
             yaml.safe_dump(BM.stamp({"note": "no rows"}, eng), open(rp, "w"))

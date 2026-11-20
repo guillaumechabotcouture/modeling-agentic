@@ -40,8 +40,9 @@ is used; --timeout-s stops it at a wall-clock limit.
 Phase 35, failures handled by the service (no agent troubleshooting):
 memory is measured per process and concurrency lowered to fit; a process
 death (out of memory) reruns the affected inputs at lower concurrency; a chunk
-lost with its VM is resubmitted up to MA_COMPUTE_INFRA_RETRIES (2) times per
-input, and the autoscaler never retires a worker that is running one
+lost with its VM is resubmitted up to MA_COMPUTE_INFRA_RETRIES (3) times per
+input, each after a doubling backoff (MA_COMPUTE_INFRA_BACKOFF_S, 10 s first; logged), never for a model error, and
+the autoscaler never retires a worker that is running one
 (`BusyWorkerGuard`); a model error repeating on most rows stops the batch early.
 Failed rows carry `kind`: model | infra | stopped. The CLI reuses rows of an
 earlier run of the same command (same function, code, data and params), so
@@ -191,7 +192,12 @@ MEM_HEADROOM = 1.2         # a process may grow 20% past the largest peak seen
 MEM_USABLE = 0.85          # share of the memory available at start that the pool may use
 # 2026-11-02 (Nigeria v2 full run F3): two chunks lost when the autoscaler retired their workers were
 # resubmitted once each, and both resubmissions were lost the same way: 16 rows infra, the analysis failed.
-INFRA_RETRIES = 2          # MA_COMPUTE_INFRA_RETRIES when unset: resubmissions per input after its chunk was lost
+# 2026-11-11 (F6 preview): 1 of 42 benchmark tasks was lost with its worker after its resubmission too, and the
+# 2.5-h run ended; three resubmissions, each after a doubling backoff, ride out a pool that is still settling.
+RETIRED_EVENTS = 500       # scheduler events read for workers removed on purpose (_sched_view)
+SCALEDOWN_RETRIES = 8      # resubmissions per input after a scale-down retired its worker, before they count as losses
+INFRA_RETRIES = 3          # MA_COMPUTE_INFRA_RETRIES when unset: resubmissions per input after its chunk was lost
+INFRA_BACKOFF_S = 10.0     # MA_COMPUTE_INFRA_BACKOFF_S when unset: wait before the first resubmission, doubled after
 NO_WORKER_WAIT_S = 1800    # MA_COMPUTE_NO_WORKER_WAIT_S when unset: how long a call waits with no compute worker
 
 
@@ -340,7 +346,8 @@ STEP_WALL_CEILING_S = 24 * 3600.0
 
 
 def step_wall_s(environ=None) -> float | None:
-    """Wall-clock limit for a pipeline step that runs the run's engine batches: the time the cluster's target pool
+    """Soft deadline for a pipeline step that runs the run's engine batches (scripts/pipeline.py warns past it and
+    kills only at its backstop, BACKSTOP_MULTIPLE x it or BACKSTOP_FLOOR_S): the time the cluster's target pool
     (MA_COMPUTE_TARGET_WORKERS x MA_COMPUTE_PROCS_PER_WORKER or MA_COMPUTE_CORES_PER_WORKER cores) takes to use
     the whole run cap (MA_COMPUTE_MAX_CORE_HOURS), times STEP_WALL_MARGIN, plus STEP_WALL_OWN_S, at most
     STEP_WALL_CEILING_S. The ledger holds every call in the step to the run cap, so this limit is a backstop that
@@ -1154,12 +1161,21 @@ def _demand_marker():
 def _sched_view(res=None, key=None, dask_scheduler=None) -> dict:
     """Runs on the scheduler (Phase 45 δ): {"workers": {address: [carries the
     resource tag, tasks processing there, accepting work]}, "held": whether
-    some worker still holds `key` (the scattered bundle)}."""
+    some worker still holds `key` (the scattered bundle), "retired": the
+    recently removed workers whose removal the scheduler records as expected
+    (a scale-down or retire, not a crash)}."""
     ts = dask_scheduler.tasks.get(key) if key is not None else None
+    retired = set()
+    try:
+        for _t, e in tuple(dask_scheduler.get_events("all"))[-RETIRED_EVENTS:]:
+            if isinstance(e, dict) and e.get("action") == "remove-worker" and e.get("worker"):
+                (retired.add if e.get("expected") else retired.discard)(e["worker"])
+    except Exception:  # noqa: BLE001 — unknown: every departure counts as a loss
+        retired = set()
     return {"workers": {a: [res is None or res in (ws.resources or {}), len(ws.processing),
                             getattr(ws.status, "name", str(ws.status)) == "running"]
                         for a, ws in dask_scheduler.workers.items()},
-            "held": bool(ts is not None and ts.who_has)}
+            "held": bool(ts is not None and ts.who_has), "retired": sorted(retired)}
 
 
 def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadline=None, allowance_s=None,
@@ -1217,6 +1233,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             guard = f"not installed: {type(e).__name__}: {e}"[:200]
             print(f"compute: busy-worker guard {guard}", file=sys.stderr, flush=True)
         retries = int(os.environ.get("MA_COMPUTE_INFRA_RETRIES") or INFRA_RETRIES)
+        backoff0 = float(os.environ.get("MA_COMPUTE_INFRA_BACKOFF_S") or INFRA_BACKOFF_S)
+        not_before = {}                             # id(chunk) -> earliest resubmission time (the backoff)
         no_worker_wait = float(os.environ.get("MA_COMPUTE_NO_WORKER_WAIT_S") or NO_WORKER_WAIT_S)
         winfo = _sched_workers(c)
         # Phase 30: on an autoscaling pool, compute workers carry a resource tag
@@ -1292,14 +1310,19 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             return f
         futs, queue, started, errors = {}, [(ch, 0, None) for ch in chunks], {}, {}
         losses = {}                                 # input -> times its chunk was lost (chunk_lost)
+        scaledowns = {}                             # input -> times a scale-down retired its chunk's worker
 
         def halved(used, worker=None):
             return max(1, int(used or cpus.get(worker) or cores_per_slot) // 2)
 
-        def chunk_lost(f, ch, attempt, used, f_share, msg):
+        def chunk_lost(f, ch, attempt, used, f_share, msg, scaled_down=False):
             """A chunk whose result is lost (its worker died or left, or the task
             failed): charge it, then resubmit it on the remaining or new workers,
-            up to `retries` times per input, the first time with half the processes."""
+            up to `retries` times per input, the first time with half the processes.
+            A worker the scheduler removed on purpose (`scaled_down`: an autoscaler
+            scale-down) says nothing about memory or a failing VM: the chunk goes
+            back with the processes it had, without a backoff, and uses none of its
+            infra retries, up to SCALEDOWN_RETRIES times per input (2026-11-12, P6)."""
             nonlocal lost
             # Its work is unknown: charge the share it was allowed
             # (chunks enforce their share), or estimate it at the end.
@@ -1309,15 +1332,38 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 progress["core_s"] += min(f_share, busy)
             else:
                 lost += 1
+            n_scaled = 1 + max(scaledowns.get(i, 0) for i, _ in ch)
+            if scaled_down and n_scaled <= SCALEDOWN_RETRIES and (deadline is None or time.time() < deadline):
+                scaledowns.update({i: n_scaled for i, _ in ch})
+                progress.setdefault("chunks", []).append(
+                    {"n": len(ch), "attempt": attempt, "losses": max(losses.get(i, 0) for i, _ in ch),
+                     "scaled_down": True, "error": msg[:200], "worker": pinned.get(f), "procs": used,
+                     "retried_with_procs": used, "requeued_attempt": attempt,
+                     "core_s": round(min(f_share, busy), 1) if f_share else None,
+                     "wall_s": round(time.time() - started.get(f, time.time()), 1)})
+                print(f"compute: {len(ch)} input(s) back in the queue: a scale-down retired their worker "
+                      f"({n_scaled} of {SCALEDOWN_RETRIES})", file=sys.stderr, flush=True)
+                # The attempt is kept: a first out-of-memory death after this still reruns with half
+                # the processes (that path needs attempt 0; Codex review of #204).
+                queue.insert(0, (ch, attempt, used))
+                progress["resubmitted"] = progress.get("resubmitted", 0) + 1
+                progress["scaled_down"] = progress.get("scaled_down", 0) + 1
+                return
             n_lost = 1 + max(losses.get(i, 0) for i, _ in ch)
             losses.update({i: n_lost for i, _ in ch})
             progress.setdefault("chunks", []).append(
                 {"n": len(ch), "attempt": attempt, "losses": n_lost, "error": msg[:200], "worker": pinned.get(f),
-                 "core_s": round(min(f_share, busy), 1) if f_share else None,
+                 "procs": used, "core_s": round(min(f_share, busy), 1) if f_share else None,
                  "wall_s": round(time.time() - started.get(f, time.time()), 1)})
             errors.update({i: msg for i, _ in ch})
             if n_lost <= retries and (deadline is None or time.time() < deadline):
-                # A rerun tail stays one (no chunk breaker); a lost VM says nothing more about memory.
+                # A rerun tail stays one (no chunk breaker); a lost VM says nothing more about memory. Each
+                # resubmission waits a doubling backoff (infra only: a model error never comes here).
+                wait_s = round(backoff0 * 2 ** (n_lost - 1), 3)
+                progress["chunks"][-1]["backoff_s"] = wait_s
+                not_before[id(ch)] = time.time() + wait_s
+                print(f"compute: {len(ch)} input(s) lost with their chunk ({msg[:120]}); resubmission {n_lost} of "
+                      f"{retries} in {wait_s:g} s", file=sys.stderr, flush=True)
                 queue.insert(0, (ch, TAIL if attempt == TAIL else 1, halved(used) if n_lost == 1 else used))
                 progress["resubmitted"] = progress.get("resubmitted", 0) + 1
                 return
@@ -1334,7 +1380,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 return None
             ok_w = {a: s for a, s in allw.items()
                     if a not in exclude and (s[0] if res else a in fixed)}
-            return ok_w, allw, v["held"]
+            return ok_w, allw, v["held"], set(v.get("retired") or ())
 
         def demand(n):
             """Keep `n` demand markers queued: the autoscaler counts them as tasks
@@ -1349,13 +1395,15 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                 markers.append(c.submit(_demand_marker, key=f"{funcname(_remote_task)}-{uuid.uuid4().hex}",
                                         resources={res: 1, DEMAND_RESOURCE: 1}, pure=False))
         pending, rows, stop, lost = set(), [], None, 0
+        n_compute = len(workers)                    # compute workers in the last scheduler view
         no_w = None                                 # since when no compute worker has been taking work
         try:
             while queue or pending:
                 _note(progress, inflight(), call_id=call_id)
                 got_v, free = view(), []
                 if got_v is not None:
-                    ok_w, allw, held_b = got_v
+                    ok_w, allw, held_b, retired_w = got_v
+                    n_compute = len(ok_w)
                     for a in [a for a in ok_w if a not in seen_w]:       # joined since the call started
                         seen_w.add(a)
                         try:
@@ -1374,7 +1422,8 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                         ch, attempt, used = futs[f]
                         f.cancel()
                         chunk_lost(f, ch, attempt, used, held.pop(f, None),
-                                   f"chunk failed: its worker {pinned[f]} left the cluster")
+                                   f"chunk failed: its worker {pinned[f]} left the cluster",
+                                   scaled_down=pinned[f] in retired_w)
                     # A chunk that has not started on a worker that has stopped taking
                     # work (closing, paused) or that runs something else (another call
                     # picked the same idle worker from the same snapshot) is revoked
@@ -1431,14 +1480,23 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     break
                 starved = allowance_s is not None and allowance_s - progress["core_s"] - sum(held.values()) <= 0
                 while queue and free and len(pending) < slots and not starved:
-                    f = submit(*queue[0], worker=free.pop(0))
+                    k_q = next((k for k, q in enumerate(queue) if not_before.get(id(q[0]), 0.0) <= time.time()), None)
+                    if k_q is None:                 # every queued chunk is waiting out its backoff
+                        break
+                    f = submit(*queue[k_q], worker=free.pop(0))
                     if f is None:
                         starved = True
                         break
-                    queue.pop(0)
+                    not_before.pop(id(queue[k_q][0]), None)
+                    queue.pop(k_q)
                     pending.add(f)
                 if res:
-                    demand(0 if starved else min(len(queue), max(0, pool - len(pending))))
+                    # One marker stays while chunks wait with the pool full (2026-11-12, P6): with
+                    # none, the autoscaler saw no waiting work and shrank the pool as chunks finished.
+                    # The held marker counts as more work, so it stays only while the pool is at most its
+                    # target: past it, the pool may shrink back (Codex review of #204).
+                    demand(0 if starved or not queue else
+                           min(len(queue), max(1 if n_compute <= pool else 0, pool - len(pending))))
                 left = None if deadline is None else max(0.0, deadline - time.time())
                 if not pending:
                     if starved and queue:
@@ -2284,6 +2342,77 @@ _FP_SKIP_EXT = (".log", ".out", ".err", ".png", ".pdf", ".svg", ".jpg", ".jpeg",
 # no model reads them, and the runner rewrites them when a step fails or its limit changes, which would discard the
 # partial rows of the batch that step was running (Nigeria v2 full run, 2026-11-02).
 _FP_RUNNER_FILES = ("pipeline.yaml", "pipeline_state.json", "pipeline_report.json")
+# 2026-11-12 (owner): the top-level definitions of this module that only place, retry, account for or watch
+# chunks. No row a reuse takes comes from them (only ok rows are reused, and a chunk's rows come from
+# _remote_task / _call, which stay hashed), so code_fingerprint hashes this file with each of them replaced by
+# a placeholder: PR #204 changed only these and still changed the fingerprint of every stored batch. A name
+# not found is hashed whole (never fewer bytes); FPX1 checks every name exists. Add a definition here only if
+# no row value can depend on it.
+FP_DISPATCH_EXEMPT = (
+    # dask dispatch helpers, pool and scheduler plugins. _map_dask itself is hashed (Codex review round 2 of
+    # #205): it decides which params an index stands for and which returned rows reach the reusable journal.
+    # Its scheduling-only parts (lost-chunk handling, demand markers) are nested in it, so they are hashed
+    # too until they are extracted into top-level definitions listed here.
+    "_sched_view", "_demand_marker", "_gone_workers", "_cancel_remote", "_sched_workers",
+    "_claim", "_revoke_chunk", "_same_process", "_stop_chunk", "_cancel_call", "_worker_side", "_security",
+    "register_compute_tags", "_guard_registration", "BusyWorkerGuard", "ComputeTagPlugin",
+    "WORKER_OPTIONS", "ADAPT_OPTIONS", "DEMAND_RESOURCE",
+    "RETIRED_EVENTS", "SCALEDOWN_RETRIES", "INFRA_RETRIES", "INFRA_BACKOFF_S", "NO_WORKER_WAIT_S",
+    # the ledger, progress records and heartbeats (accounting, never a row; _rows_done is not here: it handles
+    # rows on their way to the reusable journal, Codex review of #205)
+    "_LedgerLock", "_note", "_write_note", "_write_note_locked", "_settle_dead",
+    "_live_reservations", "_start_heartbeat", "_progress_path", "_foreign_dead", "_drop_progress",
+    "_known_core_s",
+)
+# Functions nested in an exempt definition that stay hashed (none since _map_dask is hashed; kept as the
+# mechanism for a future exempt definition with a nested part that reaches rows).
+FP_DISPATCH_KEEP_NESTED = {}
+
+
+def _fp_compute_source(text: str) -> bytes:
+    """compute.py's source for the fingerprint: each FP_DISPATCH_EXEMPT top-level definition, with the lines
+    between it and the definition before it (its comments), replaced by `<exempt NAME>`. A source that does
+    not parse is returned whole."""
+    import ast
+    try:
+        body = ast.parse(text).body
+    except SyntaxError:
+        return text.encode()
+    lines = text.splitlines(True)
+    exempt = set(FP_DISPATCH_EXEMPT)
+    rows_of = {}                                   # line -> top-level nodes on it (a `;` puts two on one line)
+    for n in body:
+        for ln in range(n.lineno, n.end_lineno + 1):
+            rows_of.setdefault(ln, []).append(n)
+    spans, prev_end = [], 0
+    for n in body:
+        start = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = n.name if n.name in exempt else None
+        elif isinstance(n, ast.Assign) and all(isinstance(t, ast.Name) for t in n.targets):
+            # Every name it sets is exempt, and no other statement shares its lines (Codex review of #205).
+            ids = {t.id for t in n.targets}
+            alone = all(rows_of[ln] == [n] for ln in range(n.lineno, n.end_lineno + 1))
+            name = sorted(ids)[0] if ids <= exempt and alone else None
+        else:
+            name = None
+        if name:
+            gap = lines[prev_end:start - 1]
+            a = prev_end if all(not g.strip() or g.lstrip().startswith("#") for g in gap) else start - 1
+            kept = []
+            for nested in FP_DISPATCH_KEEP_NESTED.get(name, ()):
+                for sub in ast.walk(n):
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name == nested:
+                        kept += lines[sub.lineno - 1:sub.end_lineno]
+            spans.append((a, n.end_lineno, name, kept))
+        prev_end = n.end_lineno
+    out, at = [], 0
+    for a, b, name, kept in spans:
+        out += lines[at:a] + [f"<exempt {name}>\n"] + kept
+        at = b
+    return "".join(out + lines[at:]).encode()
+
+
 _FP_HASH_MB = 64           # files up to this size are fingerprinted by content, larger ones by size and mtime
 # F6 S1-8: the fingerprint covers code content only. The launch commit stamp changes with every commit (git archive
 # fills it in, .gitattributes export-subst), so with it any launch commit invalidated every stored batch (F5, 2026-11-08).
@@ -2426,7 +2555,10 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
             continue
         rel = os.path.relpath(f, run_dir) if f.startswith(run_dir) else "repo:" + os.path.relpath(f, REPO)
         h.update(rel.encode() + b"\0")
-        if st.st_size <= _FP_HASH_MB * 2**20:
+        if os.path.realpath(f) == os.path.realpath(os.path.join(REPO, "scripts", "compute.py")):
+            with open(f, encoding="utf-8", errors="surrogateescape") as fh:
+                h.update(_fp_compute_source(fh.read()))      # dispatch code is not hashed (FP_DISPATCH_EXEMPT)
+        elif st.st_size <= _FP_HASH_MB * 2**20:
             with open(f, "rb") as fh:
                 for block in iter(lambda: fh.read(2**20), b""):
                     h.update(block)
@@ -2516,8 +2648,16 @@ def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None) -> dict:
     try:
         prev = json.load(open(out + ".summary.json"))
         if _same_fn(prev, fn_spec, fid) and prev.get("code_fp") == fp:
-            got.update({r["key"]: r for r in (json.loads(l) for l in open(out) if l.strip())
-                        if isinstance(r, dict) and r.get("ok") and r.get("key")})
+            body = open(out, "rb").read()
+            rows = [json.loads(l) for l in body.decode().splitlines() if l.strip()]
+            # Codex round 1 P1-1: a results file and a summary from two different writes (a torn snapshot) are
+            # never trusted. A summary from before out_sha256 must at least count the rows it describes.
+            want = prev.get("out_sha256")
+            if (hashlib.sha256(body).hexdigest() != want) if want else (len(rows) != prev.get("n")):
+                print(f"compute: {out}: results file does not match its summary ("
+                      f"{'sha256' if want else 'row count'}): its rows are not reused", file=sys.stderr)
+                rows = []
+            got.update({r["key"]: r for r in rows if isinstance(r, dict) and r.get("ok") and r.get("key")})
     except (OSError, ValueError):
         pass
     try:
@@ -2700,10 +2840,16 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
                "computed": len(todo), "reused": len(rows) - len(todo),
                "fn": fn_spec, "fn_id": fid, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose"),
                "runtime": runtime_versions()}
+    body = "".join(json.dumps(r) + "\n" for r in rows).encode()
+    summary["out_sha256"] = hashlib.sha256(body).hexdigest()     # Codex round 1 P1-1: which results it describes
+    if os.environ.get("MA_PIPELINE_RUN"):        # the pipeline run that computed it (scripts/pipeline.py)
+        summary["pipeline_run"] = os.environ["MA_PIPELINE_RUN"]
+    if os.environ.get("MA_COMPUTE_LAUNCH"):      # the detached launch that computed it (job_status binds to it)
+        summary["launch"] = os.environ["MA_COMPUTE_LAUNCH"]
     from lib.safe_io import remove_nofollow, write_nofollow
     base, name = _out_base(out, run_dir)
     try:
-        write_nofollow(base, name, "".join(json.dumps(r) + "\n" for r in rows).encode(), atomic=True)
+        write_nofollow(base, name, body, atomic=True)
         write_nofollow(base, name + ".summary.json", json.dumps(summary, indent=1).encode(), atomic=True)
         try:
             remove_nofollow(base, name + PARTIAL_EXT)
@@ -3297,6 +3443,7 @@ def _self_test() -> int:
     _self_test_p35(ok)
     _self_test_p37(ok)
     _self_test_p42(ok)
+    _self_test_copied(ok)
     _self_test_p45d(ok)
     _self_test_sched(ok)
     try:
@@ -3319,6 +3466,14 @@ def _self_test() -> int:
         _self_test_signoff_reuse(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"RS: {type(e).__name__}: {e}")
+    try:
+        _self_test_checkpoint_restore(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CP: {type(e).__name__}: {e}")
+    try:
+        _self_test_fp_dispatch(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"FPX: {type(e).__name__}: {e}")
     # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
         os.makedirs(os.path.join(rd, "models"))
@@ -3520,6 +3675,195 @@ def _engine_batch_reads(names, sources=None) -> list[str]:
     return hits
 
 
+def _self_test_checkpoint_restore(ok) -> None:
+    """CP0-CP3 (F6 run checkpoints): a run dir restored from an agent-VM checkpoint tarball (cloud/worker_side.py
+    build_checkpoint, extracted at another path as `run_cluster.py checkpoint` does) reuses its cached engine rows:
+    a finished batch is not recomputed, and an interrupted batch's journal keeps its rows."""
+    import importlib.util as _ilu
+    import tarfile as _tf
+    import tempfile
+    sys.path.insert(0, HERE)
+    import results_store
+    spec = _ilu.spec_from_file_location("_ws_cp", os.path.join(REPO, "cloud", "worker_side.py"))
+    ws = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(ws)
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        rd = os.path.join(td, "vm", "runs", "R_cp")
+        os.makedirs(os.path.join(rd, "models"))
+        os.makedirs(os.path.join(rd, "data"))
+        os.makedirs(os.path.join(rd, "analysis", "batch"))      # where the v2 engine batch keeps its rows
+        open(os.path.join(rd, "models", "fn.py"), "w").write("def f(p):\n    return {'y': 3 * p['x']}\n")
+        open(os.path.join(rd, "data", "u.csv"), "w").write("u\n1\n")
+        inputs = [{"x": i} for i in range(3)]
+        done, cut = (os.path.join(rd, "analysis", "batch", x) for x in ("done.jsonl", "cut.jsonl"))
+        _, s0 = run_map(rd, "models/fn.py::f", inputs, done, backend="local", max_workers=1, ledger=False)
+        ok(s0.get("computed") == 3, f"CP0 setup: the batch computes 3 rows ({s0.get('computed')})")
+        # an interrupted batch (the VM stopped mid-batch): its journal holds 2 of 4 rows
+        fp = code_fingerprint(rd, "models/fn.py::f", exclude=_out_files(cut))
+        keys = input_keys([{"x": i} for i in range(4)])
+        with open(cut + PARTIAL_EXT, "w") as f:
+            f.write(json.dumps({"_partial": {"fn": "models/fn.py::f", "fn_id": fn_id(rd, "models/fn.py::f"),
+                                             "code_fp": fp, "n": 4}}) + "\n")
+            for k in range(2):
+                f.write(json.dumps({"i": k, "ok": True, "result": {"y": 3 * k}, "key": keys[k]}) + "\n")
+        tgz = os.path.join(td, "checkpoint.tar.gz")
+        rec = ws.build_checkpoint(os.path.join(td, "vm"), rd, tgz, results_store)
+        ok(rec.get("cached_batches") == 2 and rec.get("sha256") == results_store.sha256_file(tgz),
+           f"CP1 the checkpoint record counts the cached batches and names the tarball's sha256: {rec}")
+        dest = os.path.join(td, "laptop", "R1", "checkpoint")
+        with _tf.open(tgz, mode="r:gz") as t:
+            t.extractall(dest, filter="data")
+        rd2 = os.path.join(dest, "runs", "R_cp")
+        bd2 = os.path.join(rd2, "analysis", "batch")
+        _, s1 = run_map(rd2, "models/fn.py::f", inputs, os.path.join(bd2, "done.jsonl"), backend="local",
+                        max_workers=1, ledger=False)
+        ok(s1.get("computed") == 0 and s1.get("reused") == 3,
+           f"CP2 a restored run dir reuses every row of its finished batch: {s1.get('computed')} computed, "
+           f"{s1.get('reused')} reused")
+        _, s2 = run_map(rd2, "models/fn.py::f", [{"x": i} for i in range(4)], os.path.join(bd2, "cut.jsonl"),
+                        backend="local", max_workers=1, ledger=False)
+        ok(s2.get("computed") == 2 and s2.get("reused") == 2,
+           f"CP3 an interrupted batch restored from a checkpoint keeps its journal's rows: {s2.get('computed')} "
+           f"computed, {s2.get('reused')} reused")
+        # Codex round 1 P1-1: a torn snapshot (results file of one write, summary of another) is not trusted
+        d2 = os.path.join(bd2, "done.jsonl")
+        summ = json.load(open(d2 + ".summary.json"))
+        ok(summ.get("out_sha256") == results_store.sha256_file(d2),
+           f"CP5 a batch's summary records the sha256 of its results file: {summ.get('out_sha256')}")
+        old_rows = open(d2).read()
+        run_map(rd2, "models/fn.py::f", [{"x": i} for i in range(5)], d2, backend="local", max_workers=1, ledger=False)
+        open(d2, "w").write(old_rows)                  # results A (3 rows) beside summary B (5 rows)
+        import contextlib as _cl
+        import io as _io
+        with _cl.redirect_stderr(_io.StringIO()) as err:
+            _, s5 = run_map(rd2, "models/fn.py::f", inputs, d2, backend="local", max_workers=1, ledger=False)
+        ok(s5.get("computed") == 3 and "sha256" in err.getvalue(),
+           f"CP5b results A with summary B: the rows are not reused, the batch recomputes, logged: "
+           f"{s5.get('computed')} computed {err.getvalue()[-160:]!r}")
+        summ = json.load(open(d2 + ".summary.json"))
+        summ.pop("out_sha256", None)
+        json.dump(summ, open(d2 + ".summary.json", "w"))
+        _, s6 = run_map(rd2, "models/fn.py::f", inputs, d2, backend="local", max_workers=1, ledger=False)
+        ok(s6.get("computed") == 0, f"CP6 a summary from before the sha256 (no torn snapshot possible) still reuses "
+                                    f"when its row count matches: {s6.get('computed')} computed")
+        from unittest import mock as _mock
+        with _mock.patch.dict(os.environ, {"MA_PIPELINE_RUN": "P9"}):
+            run_map(rd2, "models/fn.py::f", [{"x": 9}], os.path.join(bd2, "p.jsonl"), backend="local", max_workers=1,
+                    ledger=False)
+        with _mock.patch.dict(os.environ):
+            os.environ.pop("MA_PIPELINE_RUN", None)
+            run_map(rd2, "models/fn.py::f", [{"x": 9}], os.path.join(bd2, "q.jsonl"), backend="local", max_workers=1,
+                    ledger=False)
+        p9 = json.load(open(os.path.join(bd2, "p.jsonl.summary.json"))).get("pipeline_run")
+        q9 = json.load(open(os.path.join(bd2, "q.jsonl.summary.json"))).get("pipeline_run", "absent")
+        ok(p9 == "P9" and q9 == "absent",
+           f"CP7 (F6) a batch run inside a pipeline step records that pipeline run's id in its summary: {p9} {q9}")
+        # the hop through the launch tree: committed with `add -f`, shipped by archive, extracted on the VM
+        import shutil as _sh
+        import subprocess as _sp
+        vc = _sh.which("git")
+        if vc:
+            tree, ship = os.path.join(td, "tree"), os.path.join(td, "ship")
+            os.makedirs(tree)
+            _sh.copytree(rd2, os.path.join(tree, "runs", "R_cp"))
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+                   "GIT_COMMITTER_EMAIL": "t@x"}
+            for a in (["init", "-q"], ["add", "-f", "runs"], ["commit", "-q", "-m", "r"]):
+                _sp.run([vc, "-C", tree, *a], check=True, env=env, capture_output=True)
+            blob = _sp.run([vc, "-C", tree, "archive", "--format=tar.gz", "HEAD"], check=True,
+                           capture_output=True).stdout
+            with _tf.open(fileobj=_io.BytesIO(blob), mode="r:gz") as t:
+                t.extractall(ship, filter="data")
+            rd3 = os.path.join(ship, "runs", "R_cp")
+            _, s4 = run_map(rd3, "models/fn.py::f", inputs, os.path.join(rd3, "analysis", "batch", "done.jsonl"),
+                            backend="local", max_workers=1, ledger=False)
+            ok(s4.get("computed") == 0 and s4.get("reused") == 3,
+               f"CP4 after the launch-tree hop (committed, archived, extracted) the rows are reused: "
+               f"{s4.get('computed')} computed")
+
+
+def _self_test_fp_dispatch(ok) -> None:
+    """2026-11-12 (owner): dispatch code in this module is not part of the reuse fingerprint. PR #204 changed
+    only how chunks are placed and retried (no row a reuse can take: only ok rows are reused), yet changed the
+    fingerprint of every stored batch, so a run on it would have recomputed every finished batch."""
+    import ast
+    import tempfile
+    src = open(os.path.join(HERE, "compute.py")).read()
+    top = {getattr(n, "name", None) for n in ast.parse(src).body} | {
+        t.id for n in ast.parse(src).body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    missing = sorted(set(FP_DISPATCH_EXEMPT) - top)
+    ok(not missing, f"FPX1 every exempt dispatch name is a top-level definition of compute.py: missing {missing}")
+    base = _fp_compute_source(src)
+
+    def edit(name, line):
+        """`src` with `line` added as the first statement of top-level function `name`."""
+        t = ast.parse(src)
+        node = next(n for n in t.body if getattr(n, "name", None) == name)
+        lines = src.splitlines(True)
+        first = node.body[0]
+        at = (first.end_lineno if isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant)
+              else first.lineno - 1)
+        indent = " " * (node.col_offset + 4)
+        return "".join(lines[:at] + [indent + line + "\n"] + lines[at:])
+    ok(_fp_compute_source(edit("_sched_view", "pass")) == base
+       and _fp_compute_source(edit("BusyWorkerGuard", "pass")) == base
+       and _fp_compute_source(src.replace("INFRA_RETRIES = 3 ", "INFRA_RETRIES = 4 ", 1)) == base,
+       "FPX2 a change inside exempt dispatch code (_sched_view, BusyWorkerGuard, INFRA_RETRIES) leaves the fingerprint")
+    ok(_fp_compute_source(edit("_call", "pass")) != base and _fp_compute_source(edit("_remote_task", "pass")) != base
+       and _fp_compute_source(src.replace("_FP_HASH_MB = 64 ", "_FP_HASH_MB = 65 ", 1)) != base
+       and _fp_compute_source(src + "\n# a comment\n") != base,
+       "FPX3 a change anywhere else (_call, _remote_task, a constant, a comment) changes the fingerprint")
+    ok(_fp_compute_source("def broken(:\n") == b"def broken(:\n",
+       "FPX4 a source that does not parse is hashed whole (fail closed: never fewer bytes)")
+    # FPX5: code_fingerprint uses it for this file, and only for this file.
+    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as rd:
+        os.makedirs(os.path.join(repo, "scripts")); os.makedirs(os.path.join(rd, "models"))
+        open(os.path.join(rd, "models", "m.py"), "w").write("def f(p):\n    return p\n")
+        saved = globals()["REPO"]
+        try:
+            globals()["REPO"] = repo
+            cp = os.path.join(repo, "scripts", "compute.py")
+            fps = []
+            for text in (src, edit("_sched_view", "pass"), edit("_call", "pass")):
+                open(cp, "w").write(text)
+                fps.append(code_fingerprint(rd, "models/m.py::f"))
+            # Codex review of #205 (P3): another file already present, edited between two fingerprints in an
+            # exempt-named function, still changes the fingerprint (a new path alone would have).
+            open(cp, "w").write(src)
+            other = os.path.join(repo, "scripts", "other.py")
+            open(other, "w").write(src)
+            fp_o1 = code_fingerprint(rd, "models/m.py::f")
+            open(other, "w").write(edit("_sched_view", "pass"))
+            fp_o2 = code_fingerprint(rd, "models/m.py::f")
+        finally:
+            globals()["REPO"] = saved
+        ok(fps[0] == fps[1] and fps[0] != fps[2] and fp_o1 != fp_o2,
+           f"FPX5 code_fingerprint applies the exemption to scripts/compute.py only: {fps} {fp_o1} {fp_o2}")
+    # Codex review of #205 (P2): what reaches a worker and what reaches the reusable journal stays hashed:
+    # _map_dask's nested submit (the params sent to _remote_task) and _rows_done (rows before the journal).
+    t_ = ast.parse(src)
+    md = next(n for n in t_.body if getattr(n, "name", None) == "_map_dask")
+    sub = next(n for n in ast.walk(md) if isinstance(n, ast.FunctionDef) and n.name == "submit")
+    lines_ = src.splitlines(True)
+    at_ = sub.body[-1].lineno - 1
+    src_sub = "".join(lines_[:at_] + [" " * (sub.col_offset + 4) + "ch = list(ch)\n"] + lines_[at_:])
+    ok(_fp_compute_source(src_sub) != base and _fp_compute_source(edit("_rows_done", "pass")) != base,
+       "FPX6 a change to _map_dask's nested submit or to _rows_done changes the fingerprint")
+    # Codex review of #205 (P2): an exempt name sharing an assignment or a line with a non-exempt one is hashed.
+    multi = lambda v: src.replace("INFRA_RETRIES = 3 ", f"INFRA_RETRIES = FPX_OTHER = {v} ", 1)
+    semi = lambda v: src.replace("INFRA_RETRIES = 3 ", f"INFRA_RETRIES = 3; FPX_OTHER = {v} ", 1)
+    ok(_fp_compute_source(multi(3)) != _fp_compute_source(multi(4))
+       and _fp_compute_source(semi(3)) != _fp_compute_source(semi(4)),
+       "FPX7 an exempt name in a shared assignment or on a shared line does not hide the other name's change")
+    # Codex review round 2 of #205 (P1): _map_dask decides which params an index stands for and which returned rows
+    # reach the reusable journal, so it stays hashed; a change to its input enumeration changes the fingerprint.
+    ok(src.count("_chunks(list(enumerate(inputs))") >= 1
+       and _fp_compute_source(src.replace("_chunks(list(enumerate(inputs))", "_chunks(list(enumerate(reversed(inputs)))"))
+       != base and "_map_dask" not in FP_DISPATCH_EXEMPT,
+       "FPX8 _map_dask is hashed: a change to how its inputs map to keys changes the fingerprint")
+
+
 def _self_test_signoff_reuse(ok) -> None:
     """RS1-RS5 (F6 Stage 2): a lead-signed preview and the owner-signed final run of one spec differ only in their
     sign-off records; the engine-batch reuse fingerprint ignores exactly those (FP_SIGNOFF_RECORDS) in a v2 run."""
@@ -3612,6 +3956,80 @@ def _self_test_wall(ok) -> None:
         open(os.path.join(d, "models", "helper.py"), "w").write("X = 1\n")
         ok(fp1 == fp0 and code_fingerprint(d, "models/fn.py::f") != fp1,
            "SW5 the pipeline runner's own definition and records are not part of a batch's fingerprint; model code is")
+
+
+def _self_test_copied(ok) -> None:
+    """F6 run 3: a batch's records copied out of a live run (a cp loop, the checkpoint fetch, vm_job's poll sync) are
+    not a batch running here. Its job record names a live pid here (this process), so only the copy can say so."""
+    import tempfile
+    from lib import copied_run as CR
+    me, start = os.getpid(), _pid_start(os.getpid())
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "run_state.json"), "w").write("{}")       # the run root the marker is read at
+        bd = os.path.join(d, "analysis", "batch")
+        os.makedirs(os.path.join(bd, PROGRESS_DIR))
+        out = os.path.join(bd, "results.jsonl")
+        open(out + PARTIAL_EXT, "w").write('{"fn": "f"}\n{"ok": true}\n')
+
+        def job(**kw):
+            open(out + JOB_EXT, "w").write(json.dumps(dict({"pid": me, "started": time.time() - 900, "n": 4,
+                                                             "log": out + ".log"}, **kw)))
+        job(pid_start=start, host=os.uname().nodename)
+        ok(job_status(out)["state"] == RUNNING, "CP1 a job of this host with a live pid is running")
+        job(pid_start=start, host="another-host")
+        st = job_status(out)
+        ok(st["state"] == COPIED and "another-host" in st.get("why", ""),
+           f"CP2 a job record from another host is a copy, not a live batch here ({st['state']})")
+        job()                                       # an older record: no host, no start token
+        old = time.time() - 2 * PROGRESS_STALE_S
+        for f in (out + PARTIAL_EXT, out + JOB_EXT):
+            os.utime(f, (old, old))
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP3 a record with no host or start token and a journal quiet past the stale limit "
+                                  f"is stale ({st['state']})")
+        open(out + PARTIAL_EXT, "a").write('{"ok": true}\n')
+        ok(job_status(out)["state"] == RUNNING, "CP4 the same record with a fresh journal is still read as running")
+        job(pid_start=start, host=os.uname().nodename)
+        CR.mark(d, "test copy", "2026-11-16T00:00:00Z")
+        st = job_status(out)
+        ok(st["state"] == COPIED and st.get("copied", {}).get("source") == "test copy" and _STATUS_EXIT[COPIED] == 4,
+           f"CP5 a job record the copy marker lists, unchanged, is reported copied (exit 4) ({st['state']})")
+        job(pid_start=start, host=os.uname().nodename, n=5)
+        ok(job_status(out)["state"] == RUNNING, "CP6 a job record rewritten after the copy is read as usual")
+        # Codex review of #256 P1-1: a summary from an earlier batch at the same --out (its mtime refreshed by a copy)
+        # does not finish this one; the summary must name this job's launch
+        job(pid_start=start, host=os.uname().nodename, launch="L2")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 2, "launch": "L1"}))
+        st = job_status(out)
+        ok(st["state"] == RUNNING, f"CP7 a summary of another launch does not finish this job ({st['state']})")
+        open(out, "w").write('{"ok": true}\n')
+        dig = hashlib.sha256(open(out, "rb").read()).hexdigest()
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L2", "out_sha256": dig}))
+        ok(job_status(out)["state"] == FINISHED, "CP7b this launch's summary, matching the results, finishes it")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L2", "out_sha256": "0" * 64}))
+        ok(job_status(out)["state"] != FINISHED, "CP7c a summary whose out_sha256 is not the results file's does not")
+        job(pid_start=start, host=os.uname().nodename)          # an older record (no launch), copied
+        open(out + ".summary.json", "w").write(json.dumps({"n": 2}))
+        CR.mark(d, "test copy 2", "2026-11-16T00:00:00Z")
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP8 a copied job with a summary it cannot be bound to reads copied, not finished "
+                                  f"(a copy refreshes mtimes) ({st['state']})")
+        open(out + ".summary.json", "w").write(json.dumps({"n": 2, "out_sha256": dig}))
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP10 a copied legacy job (no launch) is never read finished: its summary may be an "
+                                  f"earlier batch's at the same --out ({st['state']})")
+        job(pid_start=start, host=os.uname().nodename, launch="L3")
+        CR.mark(d, "test copy 3", None)
+        open(out + ".summary.json", "w").write(json.dumps({"n": 4, "launch": "L3"}))
+        st = job_status(out)
+        ok(st["state"] == COPIED, f"CP11 a summary with no out_sha256 does not finish a job ({st['state']})")
+        os.remove(out + ".summary.json")
+        # P1-3: only the run root's marker counts; one planted below it is ignored
+        job(pid_start=start, host=os.uname().nodename, n=6)
+        os.remove(os.path.join(d, CR.MARKER))
+        CR.mark(bd, "planted", None)
+        st = job_status(out)
+        ok(st["state"] == RUNNING, f"CP9 a marker below the run root is ignored ({st['state']})")
 
 
 def _self_test_xhost(ok) -> None:
@@ -4037,9 +4455,26 @@ def _self_test_p45d(ok) -> None:
                 lc.scale(5)                        # 3 tagged workers join mid-batch
                 cc.wait_for_workers(5, timeout=60)
                 st2 = until(lambda: (lambda v: v if sum(1 for n in v["proc"].values() if n == 1) == 4
-                                     and v["unrunnable"] == 0 else None)(cc.run_on_scheduler(state)), 30)
+                                     and v["unrunnable"] == 1 else None)(cc.run_on_scheduler(state)), 30)
                 ok(st2 is not None and not st2["proc"].get(w_run),
-                   f"P45D-2 each joining worker got a chunk at once and the demand markers were withdrawn: {st2}")
+                   f"P45D-2 each joining worker got a chunk at once and the demand markers were withdrawn down to "
+                   f"one: {st2}")
+                # 2026-11-12 (P6): with every slot of the pool busy and chunks still queued, no marker
+                # was left, so the autoscaler saw no waiting work and shrank the pool as chunks finished,
+                # retiring the worker a queued chunk was about to be pinned to. One marker stays while
+                # chunks wait, so the target holds the pool.
+                ok(st2 is not None and st2["target"] >= 5,
+                   f"P45D-2b with the pool full and chunks queued, one demand marker holds the autoscaler's "
+                   f"target at the pool (>= 5 workers): {st2}")
+                # Codex review of #204: the held marker counts as more work, so the target asks for a VM
+                # beyond the pool; once the pool is past its target the marker goes, so the pool never
+                # grows a worker per joined VM.
+                lc.scale(6)                        # a fifth compute worker joins: past the target of 4
+                cc.wait_for_workers(6, timeout=60)
+                st2c = until(lambda: (lambda v: v if v["unrunnable"] == 0 else None)(cc.run_on_scheduler(state)), 30)
+                ok(st2c is not None,
+                   f"P45D-2c with more compute workers than the pool's target, no marker stays: "
+                   f"{cc.run_on_scheduler(state)}")
                 open(os.path.join(rd, "go"), "w").close()
                 th.join(120)
                 rows, s = box.get("r", ([], {}))
@@ -4062,7 +4497,7 @@ def _self_test_p45d(ok) -> None:
                 serial = 8 * s_task
                 ok(len(rows) == 8 and all(r["ok"] for r in rows) and [r["result"] for r in rows] == list(range(8))
                    and w_run not in used and len(used) >= 4 and s.get("workers") == len(used)
-                   and s.get("workers_seen") == 4,
+                   and s.get("workers_seen") == 5,
                    f"P45D-3 every chunk done on {len(used)} compute workers, none on the run worker, "
                    f"and the ledger's worker count is the workers used: {used} {s}")
                 ok(len(spans) == 8 and peak >= 2,
@@ -4365,7 +4800,8 @@ def _self_test_infra(ok) -> None:
         return th
 
     keys = ("MA_COMPUTE_SCHEDULER", "MA_COMPUTE_RESOURCE", "MA_COMPUTE_TARGET_WORKERS", "MA_COMPUTE_PROCS_PER_WORKER",
-            "MA_COMPUTE_EXCLUDE_WORKERS", "MA_COMPUTE_DISPATCH_S", "MA_COMPUTE_NO_WORKER_WAIT_S")
+            "MA_COMPUTE_EXCLUDE_WORKERS", "MA_COMPUTE_DISPATCH_S", "MA_COMPUTE_NO_WORKER_WAIT_S",
+            "MA_COMPUTE_INFRA_BACKOFF_S")
     saved = {k: os.environ.get(k) for k in keys}
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as tmpb, \
             dask.config.set({"distributed.scheduler.active-memory-manager.start": False}):
@@ -4391,7 +4827,7 @@ def _self_test_infra(ok) -> None:
                 cc.register_plugin(ComputeTagPlugin("compute"))
                 os.environ.update(MA_COMPUTE_SCHEDULER=lc.scheduler_address, MA_COMPUTE_RESOURCE="compute",
                                   MA_COMPUTE_TARGET_WORKERS="2", MA_COMPUTE_PROCS_PER_WORKER="1",
-                                  MA_COMPUTE_DISPATCH_S="0.2")
+                                  MA_COMPUTE_DISPATCH_S="0.2", MA_COMPUTE_INFRA_BACKOFF_S="0.1")
                 os.environ.pop("MA_COMPUTE_EXCLUDE_WORKERS", None)
                 w = sorted(cc.run_on_scheduler(nproc))
                 # IR1: the hazard. Asked for fewer workers than are busy (Coiled's adapt passes
@@ -4449,6 +4885,15 @@ def _self_test_infra(ok) -> None:
                    and s3.get("estimated_core_s", 0) > 0 and not s3.get("failed_by_kind"),
                    f"IR3 a chunk whose worker was retired under it is charged and finished on the remaining "
                    f"worker within the call: {r3} {s3}")
+                # 2026-11-12 (P6): a scale-down (the scheduler records the removal as expected) says
+                # nothing about memory or a failing VM: the chunk goes back with the processes it had,
+                # without a backoff, and does not use one of its infra retries.
+                ok(len(lost3) == 1 and lost3[0].get("scaled_down") is True and lost3[0].get("losses") == 0
+                   and lost3[0].get("retried_with_procs") == lost3[0].get("procs") and not lost3[0].get("backoff_s")
+                   and lost3[0].get("requeued_attempt") == lost3[0].get("attempt") == 0,
+                   f"IR3b a chunk lost to a scale-down keeps its processes, its infra retries and its attempt (so "
+                   f"a first out-of-memory death after it still reruns with half the processes: Codex review of "
+                   f"#204): {lost3}")
                 # IR4/IR5: the retries are bounded per input (INFRA_RETRIES = 2): a chunk lost twice
                 # still finishes; one lost three times is an infra row, after exactly three attempts.
                 real_task = _remote_task
@@ -4466,21 +4911,28 @@ def _self_test_infra(ok) -> None:
                     return _remote_task_stub
                 outs = {}
                 try:
-                    for n_loss in (2, 3):
+                    for n_loss in (2, 3, 4):
                         _remote_task = lossy(n_loss, f"b{n_loss}")
                         outs[n_loss] = map_fn(rd, "models/ir.py::f", [{"k": 0, "dir": rd, "tag": f"b{n_loss}"}],
                                               ledger=False)
                 finally:
                     _remote_task = real_task
-                (r4, s4), (r5, s5) = outs.get(2, ([], {})), outs.get(3, ([], {}))
+                (r4, s4), (r5, s5), (r7, s7) = (outs.get(k, ([], {})) for k in (2, 3, 4))
                 lost4 = [c_ for c_ in s4.get("chunks", []) if c_.get("error")]
                 lost5 = [c_ for c_ in s5.get("chunks", []) if c_.get("error")]
-                marks5 = [f_ for f_ in os.listdir(rd) if f_.startswith("loss_b3_")]
+                lost7 = [c_ for c_ in s7.get("chunks", []) if c_.get("error")]
+                marks7 = [f_ for f_ in os.listdir(rd) if f_.startswith("loss_b4_")]
                 ok(len(r4) == 1 and r4[0]["ok"] and len(lost4) == 2 and len(calls(rd, "b2")) == 1,
                    f"IR4 a chunk lost twice is resubmitted twice and finishes: {r4} {lost4}")
-                ok(len(r5) == 1 and not r5[0]["ok"] and r5[0].get("kind") == INFRA and len(lost5) == 3
-                   and len(marks5) == 3 and not calls(rd, "b3") and s5.get("failed_by_kind") == {INFRA: 1},
-                   f"IR5 a chunk lost three times is an infra row after three attempts, no more: {r5} {lost5} {marks5}")
+                ok(INFRA_RETRIES == 3 and len(r5) == 1 and r5[0]["ok"] and len(lost5) == 3 and len(calls(rd, "b3")) == 1,
+                   f"IR5 (F6 preview, 2026-11-11) three resubmissions by default: a chunk lost three times finishes: "
+                   f"{INFRA_RETRIES} {r5} {lost5}")
+                ok(len(r7) == 1 and not r7[0]["ok"] and r7[0].get("kind") == INFRA and len(lost7) == 4
+                   and len(marks7) == 4 and not calls(rd, "b4") and s7.get("failed_by_kind") == {INFRA: 1},
+                   f"IR5b a chunk lost four times is an infra row after four attempts, no more: {r7} {lost7} {marks7}")
+                bo = [c_.get("backoff_s") for c_ in lost5]
+                ok(bo[:3] == [0.1, 0.2, 0.4],
+                   f"IR7 each resubmission waits a doubling backoff (MA_COMPUTE_INFRA_BACKOFF_S) and records it: {bo}")
                 # IR6: no compute worker at all (none carries the resource): the call waits for the
                 # pool within MA_COMPUTE_NO_WORKER_WAIT_S, then gives up with infra rows and no demand left.
                 os.environ.update(MA_COMPUTE_RESOURCE="ma-selftest-none", MA_COMPUTE_NO_WORKER_WAIT_S="1")
@@ -5200,7 +5652,31 @@ def _self_test_p35(ok) -> None:
 
 
 RUNNING, FINISHED, DIED, NO_JOB = "running", "finished", "died", "no detached job"
-_STATUS_EXIT = {FINISHED: 0, RUNNING: 3, DIED: 4, NO_JOB: 4}
+COPIED = "copied"         # F6 run 3: the records were copied from another machine; they describe a process there
+_STATUS_EXIT = {FINISHED: 0, RUNNING: 3, DIED: 4, NO_JOB: 4, COPIED: 4}
+
+
+def _copied_why(out: str, job: dict) -> tuple[str | None, dict | None]:
+    """Why the job record at `out` describes a process on another machine, or (None, None): the copy marker lists it
+    unchanged (scripts/lib/copied_run.py), its host is not this one, or (a record with neither host nor start token)
+    nothing of the batch was written for PROGRESS_STALE_S."""
+    try:
+        from lib import copied_run
+        ce = copied_run.copied_entry(out + JOB_EXT)
+    except Exception:  # noqa: BLE001 -- no marker reading: the other rules still apply
+        ce = None
+    if ce:
+        return f"copied from {ce.get('source')} (captured {ce.get('captured_at') or 'at an unknown time'})", ce
+    host = job.get("host")
+    if host and host != os.uname().nodename:
+        return f"the job record was written on {host}, not on this host", None
+    if not host and not job.get("pid_start"):
+        ts = [os.path.getmtime(p) for p in (out + PARTIAL_EXT, out + JOB_EXT, str(job.get("log") or ""))
+              if p and os.path.exists(p)]
+        if ts and time.time() - max(ts) > PROGRESS_STALE_S:
+            return (f"the record names no host or start token and nothing of the batch was written for "
+                    f"{int(time.time() - max(ts))} s"), None
+    return None, None
 
 
 def job_status(out: str) -> dict:
@@ -5214,6 +5690,46 @@ def job_status(out: str) -> dict:
     except (OSError, ValueError, KeyError, TypeError) as e:
         return {"state": NO_JOB, "out": out, "error": f"{out + JOB_EXT}: {type(e).__name__}"}
     st = {"out": out, "pid": pid, "n": job.get("n"), "elapsed_s": round(time.time() - t0, 1), "log": job.get("log")}
+
+    def summary(trust_mtime: bool):
+        """This job's summary: the one naming its launch when the record has one (Codex review of #256 P1-1: a copy
+        refreshes mtimes, so an earlier batch's summary at the same --out would look fresh); else, for an older record,
+        one written after it started, when mtimes can be trusted (not for a copy)."""
+        try:
+            summ = json.load(open(out + ".summary.json"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(summ, dict):
+            return None
+        if job.get("launch") and summ.get("launch") != job["launch"]:
+            return None                     # another launch's summary (checked before reading any results)
+        if not job.get("launch") and not trust_mtime:
+            return None                     # a copied older record: its summary may be an earlier batch's at this --out
+        if job.get("launch") or summ.get("out_sha256") is not None:
+            from lib import copied_run
+            if not summ.get("out_sha256") or copied_run._sha(out) != summ["out_sha256"]:
+                return None                 # it describes other results, or results not all here (streamed, no link)
+        if job.get("launch"):
+            return summ
+        try:
+            return summ if os.path.getmtime(out + ".summary.json") >= t0 - 1 else None
+        except OSError:
+            return None
+
+    def finished(summ):
+        return {"state": FINISHED, **st, "summary": {k: v for k, v in summ.items() if k not in ("bundle", "chunks")}}
+    why, ce = _copied_why(out, job)
+    if why is not None:
+        summ = summary(trust_mtime=False)
+        if summ is not None:
+            return finished(summ)
+        return {"state": COPIED, **st, "why": why, **({"copied": ce} if ce else {}),
+                "next": "these records describe a batch on the machine the run was copied from; nothing runs here. "
+                        "On a resume, the same map command reuses the finished rows whose fingerprint still matches "
+                        "(compute.py reuse-check <run_dir> shows which)"}
+    summ = summary(trust_mtime=True)
+    if summ is not None and job.get("launch"):
+        return finished(summ)
     if _pid_alive(pid, job.get("pid_start")):
         rows = 0
         try:
@@ -5222,13 +5738,8 @@ def job_status(out: str) -> dict:
         except OSError:
             pass
         return {"state": RUNNING, "rows_done": rows, **st}
-    try:
-        fresh = os.path.getmtime(out + ".summary.json") >= t0 - 1
-        summ = json.load(open(out + ".summary.json")) if fresh else None
-    except (OSError, ValueError):
-        summ = None
-    if isinstance(summ, dict):
-        return {"state": FINISHED, **st, "summary": {k: v for k, v in summ.items() if k not in ("bundle", "chunks")}}
+    if summ is not None:
+        return finished(summ)
     tail = ""
     try:
         tail = open(job.get("log") or "").read()[-1500:]
@@ -5272,9 +5783,13 @@ def _detach_locked(argv, out, n, subprocess, run_dir) -> int:
     finally:
         os.close(base)
     with lf:
+        import secrets
+        launch = secrets.token_hex(8)       # the summary this child writes names it (Codex review of #256 P1-1)
         p = subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
-                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
-    job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "started": t0, "n": n, "log": log, "argv": argv}
+                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
+                             env=dict(os.environ, MA_COMPUTE_LAUNCH=launch))
+    job = {"pid": p.pid, "pid_start": _pid_start(p.pid), "host": os.uname().nodename, "started": t0, "n": n,
+           "log": log, "argv": argv, "launch": launch}
     publish(out + JOB_EXT, json.dumps(job, indent=1), run_dir)
     print(json.dumps({"detached": True, "pid": p.pid, "out": out, "log": log,
                       "next": f"python3 scripts/compute.py wait {out} --timeout-s 540  "
@@ -5326,7 +5841,7 @@ def main() -> int:
             ap.error(f"usage: compute.py {a.cmd} <out.jsonl> [--timeout-s S]")
         end = time.time() + (a.timeout_s if a.timeout_s is not None else 540)
         st = job_status(a.run_dir)
-        while a.cmd == "wait" and st["state"] == RUNNING and time.time() < end:
+        while a.cmd == "wait" and st["state"] == RUNNING and time.time() < end:  # COPIED: nothing to wait for
             time.sleep(min(5.0, max(0.1, end - time.time())))
             st = job_status(a.run_dir)
         print(json.dumps(st))

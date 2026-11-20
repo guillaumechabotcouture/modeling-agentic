@@ -11,6 +11,11 @@ Usage (from the dedicated coiled-env interpreter):
     python ab_coiled.py --only T1  # a single run
 """
 from __future__ import annotations
+import os as _os  # noqa: E402 -- F6 budget: this archived launcher has no budget check
+if _os.environ.get("MA_ALLOW_EXPERIMENT_LAUNCHERS") != "1":
+    raise SystemExit("docs/experiments/launchers: archived launchers create paid Coiled clusters without the "
+                     "owner-signed budget check (cloud/budget.py); set MA_ALLOW_EXPERIMENT_LAUNCHERS=1 to run one "
+                     "deliberately")
 
 import argparse
 import concurrent.futures as cf

@@ -7,6 +7,11 @@ Checks what the attempt-7 launcher relies on: Coiled keeps autoscaling after
 the launcher disconnects; the pool reaches ~24 VMs of the run's VM type (vCPU
 quota); compute tasks never run on the agent VM; and client.run reaches the
 agent VM while its single task thread is busy (status / brief / sign)."""
+import os as _os  # noqa: E402 -- F6 budget: this archived launcher has no budget check
+if _os.environ.get("MA_ALLOW_EXPERIMENT_LAUNCHERS") != "1":
+    raise SystemExit("docs/experiments/launchers: archived launchers create paid Coiled clusters without the "
+                     "owner-signed budget check (cloud/budget.py); set MA_ALLOW_EXPERIMENT_LAUNCHERS=1 to run one "
+                     "deliberately")
 import json, os, subprocess, sys, time
 import coiled
 from distributed import fire_and_forget

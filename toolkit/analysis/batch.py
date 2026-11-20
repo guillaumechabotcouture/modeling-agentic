@@ -65,15 +65,47 @@ def prior_ranges(spec) -> dict:
 def test_value_ranges(spec, names) -> dict:
     """{name: (lo, hi)} of the values the spec's parameter_value decision tests set for design parameters `names`.
     The design box spans them too, so each test is evaluated inside the design (the draws keep the declared ranges)."""
+    from toolkit.spec import engine_parameters as PV
     out = {}
     for dt in (spec["analysis"].get("decision_tests") or []):
-        if dt.get("type") != "parameter_value" or dt.get("parameter") not in names:
-            continue
-        vs = [float(v) for v in dt.get("values") or []]
-        if vs:
-            lo, hi = out.get(dt["parameter"], (min(vs), max(vs)))
-            out[dt["parameter"]] = (min(lo, *vs), max(hi, *vs))
+        for n, vs in PV.test_settings(dt, names=names).items():     # its own values and each companion's (`with`)
+            if n in names:
+                lo, hi = out.get(n, (min(vs), max(vs)))
+                out[n] = (min(lo, *vs), max(hi, *vs))
     return out
+
+
+def design_box(spec, eng) -> tuple:
+    """The emulator design's parameter inputs and their box: (box {name: (lo, hi, value)}, fitted names, prior names,
+    spec-value names, widened {name: [lo, hi]}). Fitted parameters, drawn priors (v2) and held spec values a decision
+    test varies are inputs; the box spans each parameter_value test's values. The batch design and the decision-test
+    planner (toolkit/analysis/decision_tests.py plan_test, before a run) read it here, so they cannot disagree."""
+    from toolkit.spec import engine_parameters as PV
+    fr = fitted_ranges(eng)
+    names = sorted(fr)
+    pr = prior_ranges(spec)                 # v2 priors: drawn parameters enter the design as inputs
+    pnames = list(pr)
+    fr = dict(fr, **pr)
+    sbox = PV.tested_boxes(spec)            # held spec values a decision test varies: design inputs over their box
+    snames = list(sbox)
+    sval = PV.values(spec)
+    fr.update({k: (b[0], b[1], sval[k]) for k, b in sbox.items()})
+    # owner, 14 Nov (f6-posterior-ranges): a declared net-effect posterior's hull is its columns' box (the ranges the
+    # draws use, toolkit/analysis/uncertainty.py net_effect_sample); listed in `ext` so the emulator's domain is it too
+    from toolkit.analysis import uncertainty as UQ
+    ne = UQ.net_effect_sample(spec, eng)
+    fr, _ = UQ.with_posterior_ranges(ne, fr)
+    ext = {k: list(fr[k][:2]) for k in (ne or {}).get("ranges", {}) if k in fr}
+    # owner, 15 Nov ("tests may go wider"): an explicit parameter_value test widens a posterior column's box too (the
+    # union of the hull and its values); the draws stay inside the hull. The sign-off precondition refuses a test value
+    # outside the column's hard bounds (toolkit/spec/preconditions.py net_effect_posterior)
+    tv = test_value_ranges(spec, set(fr))
+    for nm, (tlo, thi) in tv.items():
+        lo_, hi_ = min(fr[nm][0], tlo), max(fr[nm][1], thi)
+        if (lo_, hi_) != (fr[nm][0], fr[nm][1]):
+            ext[nm] = [lo_, hi_]
+            fr[nm] = (lo_, hi_, fr[nm][2])
+    return fr, names, pnames, snames, ext
 
 
 def calibrated_value(spec, z: float) -> float:
@@ -89,6 +121,67 @@ def windows(spec) -> dict:
     return dict(out, **({BV.WINDOW: mw["window"]} if mw else {}))
 
 
+def independent_features(spec) -> tuple[list, dict]:
+    """(features, basis) of the signed spec's `analysis.emulator.independent_features: {features, basis, generator}`:
+    declared unit features of a synthetic units table that its generator draws independently of the table's other
+    columns. A declared fact about the data-generating process, never a statistical claim and never for measured
+    data: the generator (a file beside the spec) is named and fingerprinted. toolkit/analysis/world_model.py reads the
+    design's independent_features to settle conditional claims. A feature that is not a declared design feature, a
+    missing basis or a missing generator is refused (ValueError)."""
+    import hashlib
+    from toolkit.analysis import features as FT
+    dec = (spec["analysis"].get("emulator") or {}).get("independent_features")
+    names = [FT.name(x) for x in FT.declared(spec.raw)]
+    if not isinstance(dec, dict) or not isinstance(dec.get("features"), list) or not dec["features"]:
+        raise ValueError("analysis.emulator.independent_features: {features: [...], basis, generator}")
+    bad = [f for f in dec["features"] if f not in names]
+    if bad:
+        raise ValueError(f"analysis.emulator.independent_features: {bad} are not declared design features {names}")
+    if not str(dec.get("basis") or "").strip():
+        raise ValueError("analysis.emulator.independent_features.basis: how the generator draws them independently")
+    gen = str(dec.get("generator") or "").strip()
+    path = spec.resolve(gen) if gen else None
+    if not path or not os.path.isfile(path):
+        raise ValueError(f"analysis.emulator.independent_features.generator: {gen!r} is not a file beside the spec "
+                         "(the synthetic table's generator)")
+    with open(path, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    # A generator that draws columns independently can still realize a correlated table on a few units (a world-model
+    # trial's 24 units gave rank correlation 0.82 between two separately drawn columns): the declaration holds only
+    # when the realized table's declared features are also uncorrelated with every design feature (|Spearman| <=
+    # INDEPENDENCE_RHO_MAX).
+    rho = realized_rank_correlations(spec, list(dec["features"]))
+    big = {k: v for k, v in rho.items() if abs(v) > INDEPENDENCE_RHO_MAX}
+    if big:
+        raise ValueError(f"analysis.emulator.independent_features: the realized units table correlates declared features "
+                         f"{ {k: round(v, 3) for k, v in big.items()} } (|Spearman| > {INDEPENDENCE_RHO_MAX}): draw a "
+                         "table whose declared columns are uncorrelated, or do not declare them independent")
+    return list(dec["features"]), {"basis": str(dec["basis"]), "generator": gen, "generator_sha256": sha,
+                                   "realized_max_abs_spearman": max((abs(v) for v in rho.values()), default=0.0)}
+
+
+INDEPENDENCE_RHO_MAX = 0.3
+
+
+def realized_rank_correlations(spec, features) -> dict:
+    """{"a|b": Spearman rho} over the units table (as features.vector reads them) between each of `features` (the
+    declared-independent ones) and every other declared design feature, each pair once: a feature drawn independently
+    must be uncorrelated with every other column the design varies, not only with the other declared ones (Codex
+    review of #225: pop declared alone passed with Spearman 1 against seed_share)."""
+    from scipy.stats import spearmanr
+    from toolkit.analysis import features as FT
+    names = [FT.name(x) for x in FT.declared(spec.raw)]
+    rows = [FT.vector(spec, u) for u in spec.units()]
+    col = {f: [r[names.index(f)] for r in rows] for f in names}
+    feats = [f for f in features if f in col]
+    out = {}
+    for i, a in enumerate(feats):
+        for b in feats[i + 1:] + [x for x in names if x not in feats]:
+            if len(set(col[a])) > 1 and len(set(col[b])) > 1:
+                out[f"{a}|{b}"] = float(spearmanr(col[a], col[b])[0])
+    return out
+
+
 def design(spec) -> tuple[dict, list[dict]]:
     """(design, jobs): the spike's design, from the spec."""
     from scipy.stats import qmc
@@ -98,22 +191,8 @@ def design(spec) -> tuple[dict, list[dict]]:
     em = spec["analysis"].get("emulator") or {}
     n = int(em.get("points", 64))
     rng = np.random.default_rng(int(em.get("seed", 7)))
-    fr = fitted_ranges(eng)
-    names = sorted(fr)
-    pr = prior_ranges(spec)                 # v2 priors: drawn parameters enter the design as inputs
-    pnames = list(pr)
-    fr = dict(fr, **pr)
-    sbox = PV.tested_boxes(spec)            # held spec values a decision test varies: design inputs over their box
-    snames = list(sbox)
-    sval = PV.values(spec)
-    fr.update({k: (b[0], b[1], sval[k]) for k, b in sbox.items()})
-    tv = test_value_ranges(spec, set(fr))
-    ext = {}
-    for nm, (tlo, thi) in tv.items():
-        lo_, hi_ = min(fr[nm][0], tlo), max(fr[nm][1], thi)
-        if (lo_, hi_) != (fr[nm][0], fr[nm][1]):
-            ext[nm] = [lo_, hi_]
-            fr[nm] = (lo_, hi_, fr[nm][2])
+    fr, names, pnames, snames, ext = design_box(spec, eng)
+    sbox = PV.tested_boxes(spec)
     sob = qmc.Sobol(d=1 + len(names) + len(pnames) + len(snames), scramble=True, seed=int(em.get("seed", 7))).random(n)
     lo, hi = spec["calibration"]["range"]
     order = list(rng.permutation(len(units)))
@@ -147,7 +226,14 @@ def design(spec) -> tuple[dict, list[dict]]:
     if pnames:
         d["prior_names"] = pnames
     if ext:
-        d["design_ranges"] = ext          # parameters whose design box was widened to span decision-test values
+        d["design_ranges"] = ext          # parameters whose design box is not their declared range (decision-test
+        #                                   values, a net-effect posterior's hull)
+    if em.get("independent_features") is not None:     # only when declared, so other designs stay
+        d["independent_features"], d["independent_features_basis"] = independent_features(spec)
+    from toolkit.analysis import uncertainty as UQ
+    ne = UQ.net_effect_sample(spec, eng)    # cached: the sample design_box read
+    if ne is not None:                      # only with the field, so other designs stay
+        d["posterior_ranges"] = UQ.posterior_range_record(ne)
     if snames:                            # only with spec values a decision test varies, so other designs stay
         d["spec_value_names"], d["spec_value_ranges"] = snames, {k: list(sbox[k]) for k in snames}
     return d,[dict(j, engine=spec["engine"], horizon=d["horizon"], windows=windows(spec)) for j in jobs]
@@ -264,7 +350,8 @@ def run(run_dir: str, jobs: list[dict], engine, out_rel: str = "analysis/batch/r
         summ = dict(summ, tasks=len(groups), n=len(jobs), n_failed=sum(not r["ok"] for r in rows))
     res, problems = verify_rows([dict(r, id=j["id"]) for j, r in zip(jobs, rows) if r.get("ok")], jobs, engine)
     return {"results": res, "problems": problems,
-            "summary": {k: summ.get(k) for k in ("backend", "workers", "n", "n_failed", "wall_s", "tasks")}, "path": out}
+            "summary": {k: summ.get(k) for k in ("backend", "workers", "n", "n_failed", "failed_by_kind", "wall_s",
+                                                 "tasks")}, "path": out}
 
 
 def verify_rows(rows: list[dict], jobs: list[dict], engine) -> tuple[dict, list[str]]:
@@ -828,6 +915,60 @@ def _self_test() -> int:
                     g["_E"][key] = old_e
             ok(seen == [(0.0, 2.0), None], f"BA-D1c run_job hands the engine the delivery period (or none): {seen}")
         case("BA-D1", bd1)
+
+    def bnp():
+        """owner, 14 Nov (f6-posterior-ranges): a net-effect posterior's hull sets its columns' design box."""
+        import hashlib
+        import json
+        import yaml
+        from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
+        from toolkit.spec import schema
+        with tempfile.TemporaryDirectory() as d:
+            s0 = schema.load(schema.toy_spec(d))
+            got0 = hashlib.sha256(json.dumps([design(s0), list(design_box(s0, s0.engine()))], sort_keys=True,
+                                             default=str).encode()).hexdigest()
+            # recorded on origin/v2 at d7b940d, before this change
+            ok(got0 == "6827c1f3a493b5e268c18626a12c59cef49106e2b9cdd9f4b4ab8ca1f4ee90a7",
+               f"BA-NP1 a spec without a net-effect posterior has the same design and design box as before ({got0[:12]})")
+            u = [float(v) for v in np.random.default_rng(4).uniform(0, 1, 24)]
+            rows = [{"eff_a": round(0.25 + 0.5 * x, 6), "eff_b": round(0.15 + 0.3 * (1 - x), 6)} for x in u]
+            NEF._fixture_placeholder(os.path.join(d, "nef.yaml"), s0.engine(), rows, {"eff_a": [0, 1], "eff_b": [0, 1]})
+            hull = {k: (min(r[k] for r in rows), max(r[k] for r in rows)) for k in ("eff_a", "eff_b")}
+            raw = yaml.safe_load(open(os.path.join(d, "decision_spec.yaml")))
+            raw["uncertainty"]["net_effect_posterior"] = {
+                "path": "nef.yaml", "sha256": hashlib.sha256(open(os.path.join(d, "nef.yaml"), "rb").read()).hexdigest()}
+            yaml.safe_dump(raw, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+            s1 = schema.load(os.path.join(d, "decision_spec.yaml"))
+            fr, names, _p, _s, ext = design_box(s1, s1.engine())
+            dd, _jobs = design(s1)
+            th = np.array([[p["theta"][k] for k in ("eff_a", "eff_b")] for p in dd["points"]])
+            ok(all(tuple(fr[k][:2]) == hull[k] and ext[k] == list(hull[k]) for k in hull)
+               and fitted_ranges(s1.engine())["eff_a"][:2] == (0.3, 0.7)
+               and dd["posterior_ranges"]["ranges"] == {k: list(v) for k, v in hull.items()}
+               and dd["posterior_ranges"]["sha256"] == raw["uncertainty"]["net_effect_posterior"]["sha256"]
+               and dd["design_ranges"] == ext,
+               f"BA-NP2 the posterior's hull is its columns' design box ({ {k: fr[k][:2] for k in hull} }; fitted "
+               f"eff_a 0.3-0.7), recorded in the design with the sample's sha256")
+            ok(all(hull[k][0] - 1e-12 <= th[:, j].min() and th[:, j].max() <= hull[k][1] + 1e-12
+                   for j, k in enumerate(("eff_a", "eff_b")))
+               and th[:, 0].min() < 0.3 and th[:, 0].max() > 0.7,
+               f"BA-NP3 the design points cover the posterior's hull (eff_a {th[:, 0].min():.3f}-{th[:, 0].max():.3f}, "
+               f"beyond the fitted 0.3-0.7) and stay inside it")
+            # owner, 15 Nov ("tests may go wider"): an explicit parameter_value test on a posterior column widens its
+            # design box to the union of the hull and the test's values (a DT9-like test at the prior's ends and its
+            # middle); the draws stay inside the hull
+            from toolkit.analysis import uncertainty as UQ
+            raw["analysis"]["decision_tests"] = list(raw["analysis"].get("decision_tests") or []) + [
+                {"id": "DTpa", "type": "parameter_value", "parameter": "eff_a", "values": [0.1, 0.5, 0.9], "text": "t"}]
+            yaml.safe_dump(raw, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+            s2 = schema.load(os.path.join(d, "decision_spec.yaml"))
+            fr2, _n, _p, _s, ext2 = design_box(s2, s2.engine())
+            ok(tuple(fr2["eff_a"][:2]) == (0.1, 0.9) and ext2["eff_a"] == [0.1, 0.9]
+               and tuple(fr2["eff_b"][:2]) == hull["eff_b"]
+               and UQ.net_effect_sample(s2, s2.engine())["ranges"] == hull,
+               f"BA-NP4 a decision test outside the hull widens that column's box to the union ({fr2['eff_a'][:2]}); "
+               f"the draw ranges stay the hull")
+    case("BA-NP", bnp)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1

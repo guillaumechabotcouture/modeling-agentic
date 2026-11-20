@@ -1,0 +1,2107 @@
+producer: toolkit/engines/benchmark.py
+engine_identity:
+  name: malaria-starsim
+  version: '0.17'
+  code_sha256: a1d13a378ef15c780c77c9b591700a3fb9b46c29939b897cca5b513a500f16ff
+  params_sha256: 74405a6e6598728cdeb90ff7e0fd5698accc9aa02cf8f30c30c9b3b62559fc15
+  config_sha256: bbd0fa088b1423689ecc37c9fbd416e68ebb477dbbcf05314c41e0891d432e51
+purpose: trial fit of the v0.17 net-effect parameters on the pack's training targets
+  (ENGINE_NOTES.md, v0.17); not adopted
+smoke: false
+approved: 'owner 2026-11-13: fit approved, hard cap 25 USD; launched under signed
+  prefix f6-refit- per owner'
+cap_usd: 25.0
+plan:
+  params:
+    net_kill_shift:
+    - -0.618
+    - 0.66
+    cfp_kill:
+    - 0.0
+    - 0.8
+    irs_kill:
+    - 0.0
+    - 0.95
+    cfp_half:
+    - 547.5
+    - 1277.5
+  targets_train:
+  - B10
+  - B11
+  - B12
+  - B12b
+  - B12m
+  held_out_untouched:
+  - B7
+  - B8
+  - B9
+  - B9b
+  - B9c
+  - B13
+  - B15
+  - B16c
+  - B17
+  - B18
+  - B19
+  - B20
+  not_fitted:
+  - pbo_adv_decay
+  - pbo_gain_scale
+  calibration_depends_on:
+  - net_kill_shift
+  arms:
+  - ben_dual
+  - ben_pyr
+  - irs_itn
+  - irs_itn_irs
+  - mis_dual
+  - mis_pyr
+  - mul_pyr
+  - mul_pyr_irs
+  settings:
+  - benin
+  - irs_added
+  - misungwi
+  - muleba
+  design_points: 46
+  verified_sample_points: 12
+  seeds: 8
+  calibration_runs: 210
+  arm_runs: 3986
+  burn_in_groups: 2098
+  cpu_work_hours: 49.0
+  vcpus: 16
+  waves:
+    calibration: 15
+    design: 93
+    chosen: 4
+    sample: 25
+  wall_hours:
+  - 6.73
+  - 9.93
+  vm_vcpu_hours:
+  - 107.7
+  - 158.8
+  usd:
+  - 11.7
+  - 24.1
+  launch: 'python3 cloud/vm_job.py run f6-netfit net-effect-fit --tree . --store outputs/_engine/net_effect_fit
+    --cap-usd 25 --budget-scope f6 --cpu 16 --memory 64 GiB -- python3 toolkit/engines/malaria/benchmarks/net_effect_fit.py
+    run --approved owner 2026-11-13: fit approved, hard cap 25 USD --workers 16'
+n_sims: 3986
+wall_s: 27464.3
+fitted_at: '2026-11-14 01:37:31'
+calibration_grid:
+  net_kill_shift:
+  - -0.618
+  - -0.2985
+  - 0.02100000000000002
+  - 0.3405
+  - 0.66
+  m0:
+    benin:
+    - 7.779509823414359
+    - 9.199398852263
+    - 11.49377495564911
+    - 12.446264823368637
+    - 14.498232477144118
+    irs_added:
+    - 21.055208047249483
+    - 22.600134561747666
+    - 23.563572193009808
+    - 22.486894951635197
+    - 19.732459238471414
+    misungwi:
+    - 9.843249468242393
+    - 10.940802427701758
+    - 10.96493006092815
+    - 11.821374161739435
+    - 13.849139011726377
+    muleba:
+    - 46.59050793022952
+    - 55.72670426705036
+    - 66.71746399605117
+    - 82.4417269787311
+    - 113.73625632051728
+  at_grid_edge: []
+joint_region:
+  share_of_box: 0.0054
+  n_accepted: 272
+  hull:
+    net_kill_shift:
+    - -0.593748
+    - 0.658387
+    cfp_kill:
+    - 0.417639
+    - 0.782157
+    irs_kill:
+    - 0.370853
+    - 0.468009
+    cfp_half:
+    - 547.635212
+    - 1274.049612
+  at_box_edge:
+  - cfp_half
+  correlation:
+    names:
+    - net_kill_shift
+    - cfp_kill
+    - irs_kill
+    - cfp_half
+    matrix:
+    - - 1.0
+      - 0.596
+      - 0.586
+      - -0.212
+    - - 0.596
+      - 1.0
+      - 0.298
+      - -0.802
+    - - 0.586
+      - 0.298
+      - 1.0
+      - -0.044
+    - - -0.212
+      - -0.802
+      - -0.044
+      - 1.0
+  sample: []
+  verified:
+    n: 12
+    all_in_band: 8
+    failed:
+    - &id001
+      net_kill_shift: 0.324801
+      cfp_kill: 0.530188
+      irs_kill: 0.419678
+      cfp_half: 1143.446355
+    - &id002
+      net_kill_shift: 0.164781
+      cfp_kill: 0.569626
+      irs_kill: 0.450168
+      cfp_half: 951.400367
+    - &id003
+      net_kill_shift: 0.622251
+      cfp_kill: 0.546081
+      irs_kill: 0.438585
+      cfp_half: 1121.040377
+    - &id004
+      net_kill_shift: 0.189247
+      cfp_kill: 0.471866
+      irs_kill: 0.451839
+      cfp_half: 1061.308377
+    points:
+    - point: &id005
+        net_kill_shift: -0.033247
+        cfp_kill: 0.489258
+        irs_kill: 0.413179
+        cfp_half: 1220.249796
+      all_in_band: true
+      computed:
+        B10: 0.6397
+        B11: 0.4382
+        B12: 0.8427
+        B12b: 0.6461
+        B12m: 0.5258
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.1206
+        irs_added:
+          target: 0.4
+          achieved: 0.412
+        misungwi:
+          target: 0.458
+          achieved: 0.4584
+        muleba:
+          target: 0.55
+          achieved: 0.5516
+    - point: &id006
+        net_kill_shift: -0.034554
+        cfp_kill: 0.493949
+        irs_kill: 0.382527
+        cfp_half: 1019.305972
+      all_in_band: true
+      computed:
+        B10: 0.6528
+        B11: 0.4591
+        B12: 0.8617
+        B12b: 0.6781
+        B12m: 0.5438
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.0727
+        irs_added:
+          target: 0.4
+          achieved: 0.414
+        misungwi:
+          target: 0.458
+          achieved: 0.46
+        muleba:
+          target: 0.55
+          achieved: 0.5597
+    - point: &id007
+        net_kill_shift: -0.015627
+        cfp_kill: 0.585842
+        irs_kill: 0.44018
+        cfp_half: 680.070326
+      all_in_band: true
+      computed:
+        B10: 0.665
+        B11: 0.4512
+        B12: 0.833
+        B12b: 0.6254
+        B12m: 0.4988
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.0601
+        irs_added:
+          target: 0.4
+          achieved: 0.4132
+        misungwi:
+          target: 0.458
+          achieved: 0.4651
+        muleba:
+          target: 0.55
+          achieved: 0.5547
+    - point: &id008
+        net_kill_shift: 0.075713
+        cfp_kill: 0.534953
+        irs_kill: 0.453411
+        cfp_half: 1095.314945
+      all_in_band: true
+      computed:
+        B10: 0.6077
+        B11: 0.4312
+        B12: 0.8376
+        B12b: 0.6201
+        B12m: 0.506
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.0136
+        irs_added:
+          target: 0.4
+          achieved: 0.4077
+        misungwi:
+          target: 0.458
+          achieved: 0.4637
+        muleba:
+          target: 0.55
+          achieved: 0.5572
+    - point: &id009
+        net_kill_shift: -0.107552
+        cfp_kill: 0.606885
+        irs_kill: 0.400866
+        cfp_half: 662.816028
+      all_in_band: true
+      computed:
+        B10: 0.6424
+        B11: 0.4369
+        B12: 0.8428
+        B12b: 0.6502
+        B12m: 0.5209
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.066
+        irs_added:
+          target: 0.4
+          achieved: 0.4155
+        misungwi:
+          target: 0.458
+          achieved: 0.4657
+        muleba:
+          target: 0.55
+          achieved: 0.5585
+    - point: *id001
+      all_in_band: false
+      computed:
+        B10: 0.6391
+        B11: 0.4508
+        B12: 0.859
+        B12b: 0.6389
+        B12m: 0.5511
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 1.9911
+        irs_added:
+          target: 0.4
+          achieved: 0.4057
+        misungwi:
+          target: 0.458
+          achieved: 0.4572
+        muleba:
+          target: 0.55
+          achieved: 0.544
+    - point: &id010
+        net_kill_shift: 0.602392
+        cfp_kill: 0.743371
+        irs_kill: 0.451012
+        cfp_half: 674.284093
+      all_in_band: true
+      computed:
+        B10: 0.6155
+        B11: 0.4322
+        B12: 0.8255
+        B12b: 0.6191
+        B12m: 0.5432
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.0258
+        irs_added:
+          target: 0.4
+          achieved: 0.4053
+        misungwi:
+          target: 0.458
+          achieved: 0.4731
+        muleba:
+          target: 0.55
+          achieved: 0.5493
+    - point: *id002
+      all_in_band: false
+      computed:
+        B10: 0.632
+        B11: 0.4354
+        B12: 0.8222
+        B12b: 0.6071
+        B12m: 0.5219
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 1.9766
+        irs_added:
+          target: 0.4
+          achieved: 0.4106
+        misungwi:
+          target: 0.458
+          achieved: 0.4573
+        muleba:
+          target: 0.55
+          achieved: 0.55
+    - point: *id003
+      all_in_band: false
+      computed:
+        B10: 0.6146
+        B11: 0.4713
+        B12: 0.841
+        B12b: 0.617
+        B12m: 0.557
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 1.9981
+        irs_added:
+          target: 0.4
+          achieved: 0.3986
+        misungwi:
+          target: 0.458
+          achieved: 0.4755
+        muleba:
+          target: 0.55
+          achieved: 0.5463
+    - point: &id011
+        net_kill_shift: -0.1863
+        cfp_kill: 0.464386
+        irs_kill: 0.388057
+        cfp_half: 1118.742997
+      all_in_band: true
+      computed:
+        B10: 0.656
+        B11: 0.468
+        B12: 0.8541
+        B12b: 0.6484
+        B12m: 0.5479
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.021
+        irs_added:
+          target: 0.4
+          achieved: 0.4054
+        misungwi:
+          target: 0.458
+          achieved: 0.4661
+        muleba:
+          target: 0.55
+          achieved: 0.553
+    - point: &id012
+        net_kill_shift: 0.614114
+        cfp_kill: 0.547825
+        irs_kill: 0.441875
+        cfp_half: 1038.313225
+      all_in_band: true
+      computed:
+        B10: 0.6603
+        B11: 0.4764
+        B12: 0.8304
+        B12b: 0.6213
+        B12m: 0.5495
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.0315
+        irs_added:
+          target: 0.4
+          achieved: 0.4027
+        misungwi:
+          target: 0.458
+          achieved: 0.4669
+        muleba:
+          target: 0.55
+          achieved: 0.5488
+    - point: *id004
+      all_in_band: false
+      computed:
+        B10: 0.6523
+        B11: 0.4913
+        B12: 0.8359
+        B12b: 0.6089
+        B12m: 0.5016
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.0527
+        irs_added:
+          target: 0.4
+          achieved: 0.4125
+        misungwi:
+          target: 0.458
+          achieved: 0.4602
+        muleba:
+          target: 0.55
+          achieved: 0.5539
+    chosen:
+      point:
+        net_kill_shift: 0.17841
+        cfp_kill: 0.459477
+        irs_kill: 0.447647
+        cfp_half: 1178.846885
+      all_in_band: true
+      disproved_by_verification: &id014 []
+      calibration_check:
+        benin:
+          target: 2.06
+          achieved: 2.0241
+        irs_added:
+          target: 0.4
+          achieved: 0.412
+        misungwi:
+          target: 0.458
+          achieved: 0.4609
+        muleba:
+          target: 0.55
+          achieved: 0.5537
+    calibration_tolerance: 0.1
+  acceptance:
+  - 'verified point out of band or off calibration: {''net_kill_shift'': 0.324801,
+    ''cfp_kill'': 0.530188, ''irs_kill'': 0.419678, ''cfp_half'': 1143.446355}'
+  - 'verified point out of band or off calibration: {''net_kill_shift'': 0.164781,
+    ''cfp_kill'': 0.569626, ''irs_kill'': 0.450168, ''cfp_half'': 951.400367}'
+  - 'verified point out of band or off calibration: {''net_kill_shift'': 0.622251,
+    ''cfp_kill'': 0.546081, ''irs_kill'': 0.438585, ''cfp_half'': 1121.040377}'
+  - 'verified point out of band or off calibration: {''net_kill_shift'': 0.189247,
+    ''cfp_kill'': 0.471866, ''irs_kill'': 0.451839, ''cfp_half'': 1061.308377}'
+  sample_status: invalid
+  sample_unverified:
+  - net_kill_shift: 0.276571
+    cfp_kill: 0.646003
+    irs_kill: 0.417451
+    cfp_half: 634.863799
+  - net_kill_shift: 0.006462
+    cfp_kill: 0.54182
+    irs_kill: 0.405943
+    cfp_half: 1042.725805
+  - net_kill_shift: 0.06143
+    cfp_kill: 0.586332
+    irs_kill: 0.391139
+    cfp_half: 779.110145
+  - net_kill_shift: -0.250371
+    cfp_kill: 0.463965
+    irs_kill: 0.443515
+    cfp_half: 1220.179006
+  - net_kill_shift: -0.487645
+    cfp_kill: 0.474488
+    irs_kill: 0.422862
+    cfp_half: 981.649468
+  - net_kill_shift: 0.101216
+    cfp_kill: 0.563413
+    irs_kill: 0.425555
+    cfp_half: 702.948416
+  - net_kill_shift: -0.303754
+    cfp_kill: 0.439609
+    irs_kill: 0.406278
+    cfp_half: 1126.769747
+  - net_kill_shift: -0.501318
+    cfp_kill: 0.482283
+    irs_kill: 0.385574
+    cfp_half: 921.812108
+  - net_kill_shift: 0.009523
+    cfp_kill: 0.46284
+    irs_kill: 0.438899
+    cfp_half: 1158.778959
+  - net_kill_shift: 0.170529
+    cfp_kill: 0.503051
+    irs_kill: 0.410757
+    cfp_half: 1180.455558
+  - net_kill_shift: -0.592913
+    cfp_kill: 0.443663
+    irs_kill: 0.44368
+    cfp_half: 1239.576281
+  - net_kill_shift: -0.239593
+    cfp_kill: 0.580272
+    irs_kill: 0.379672
+    cfp_half: 703.708989
+  - net_kill_shift: 0.003473
+    cfp_kill: 0.470291
+    irs_kill: 0.389984
+    cfp_half: 1207.771515
+  - net_kill_shift: 0.563952
+    cfp_kill: 0.592173
+    irs_kill: 0.452764
+    cfp_half: 1045.520579
+  - net_kill_shift: -0.049339
+    cfp_kill: 0.639808
+    irs_kill: 0.406811
+    cfp_half: 600.166185
+  - net_kill_shift: 0.389933
+    cfp_kill: 0.630678
+    irs_kill: 0.46162
+    cfp_half: 698.851786
+  - net_kill_shift: -0.314995
+    cfp_kill: 0.457102
+    irs_kill: 0.432902
+    cfp_half: 1044.963193
+  - net_kill_shift: 0.639985
+    cfp_kill: 0.782157
+    irs_kill: 0.458578
+    cfp_half: 633.10352
+  - net_kill_shift: 0.200742
+    cfp_kill: 0.630077
+    irs_kill: 0.435544
+    cfp_half: 761.301182
+  - net_kill_shift: -0.074583
+    cfp_kill: 0.570742
+    irs_kill: 0.42478
+    cfp_half: 805.005918
+  - net_kill_shift: -0.13294
+    cfp_kill: 0.46008
+    irs_kill: 0.396695
+    cfp_half: 1070.382085
+  - net_kill_shift: 0.031353
+    cfp_kill: 0.55308
+    irs_kill: 0.435774
+    cfp_half: 719.002895
+  - *id005
+  - net_kill_shift: -0.306748
+    cfp_kill: 0.4603
+    irs_kill: 0.433141
+    cfp_half: 1015.845706
+  - net_kill_shift: -0.046418
+    cfp_kill: 0.502199
+    irs_kill: 0.395525
+    cfp_half: 1238.230495
+  - net_kill_shift: -0.250344
+    cfp_kill: 0.573118
+    irs_kill: 0.385783
+    cfp_half: 739.754988
+  - net_kill_shift: 0.514158
+    cfp_kill: 0.60873
+    irs_kill: 0.454342
+    cfp_half: 1012.079344
+  - net_kill_shift: 0.14899
+    cfp_kill: 0.49979
+    irs_kill: 0.438994
+    cfp_half: 1013.110672
+  - net_kill_shift: 0.585778
+    cfp_kill: 0.610841
+    irs_kill: 0.444648
+    cfp_half: 1030.379965
+  - net_kill_shift: 0.000541
+    cfp_kill: 0.479569
+    irs_kill: 0.418283
+    cfp_half: 1053.866612
+  - net_kill_shift: 0.165819
+    cfp_kill: 0.533888
+    irs_kill: 0.429547
+    cfp_half: 1076.022242
+  - net_kill_shift: 0.159664
+    cfp_kill: 0.709529
+    irs_kill: 0.434936
+    cfp_half: 583.497544
+  - net_kill_shift: -0.541271
+    cfp_kill: 0.474865
+    irs_kill: 0.374304
+    cfp_half: 930.701828
+  - net_kill_shift: -0.37613
+    cfp_kill: 0.435062
+    irs_kill: 0.43795
+    cfp_half: 1137.736838
+  - net_kill_shift: 0.397138
+    cfp_kill: 0.613076
+    irs_kill: 0.444604
+    cfp_half: 769.717217
+  - net_kill_shift: 0.381394
+    cfp_kill: 0.595379
+    irs_kill: 0.428569
+    cfp_half: 679.376117
+  - net_kill_shift: 0.615408
+    cfp_kill: 0.581523
+    irs_kill: 0.44575
+    cfp_half: 1078.209523
+  - net_kill_shift: 0.448734
+    cfp_kill: 0.588556
+    irs_kill: 0.421269
+    cfp_half: 863.838416
+  - net_kill_shift: 0.107397
+    cfp_kill: 0.561039
+    irs_kill: 0.423282
+    cfp_half: 917.058808
+  - net_kill_shift: -0.483922
+    cfp_kill: 0.426029
+    irs_kill: 0.378936
+    cfp_half: 1205.736789
+  - net_kill_shift: 0.002699
+    cfp_kill: 0.566034
+    irs_kill: 0.438762
+    cfp_half: 797.051143
+  - net_kill_shift: 0.310391
+    cfp_kill: 0.591941
+    irs_kill: 0.456618
+    cfp_half: 892.94944
+  - net_kill_shift: 0.204564
+    cfp_kill: 0.588132
+    irs_kill: 0.428426
+    cfp_half: 654.481408
+  - net_kill_shift: 0.213943
+    cfp_kill: 0.557528
+    irs_kill: 0.454141
+    cfp_half: 976.926034
+  - net_kill_shift: -0.088872
+    cfp_kill: 0.654737
+    irs_kill: 0.412287
+    cfp_half: 599.08258
+  - net_kill_shift: 0.272847
+    cfp_kill: 0.559712
+    irs_kill: 0.434357
+    cfp_half: 978.63843
+  - net_kill_shift: 0.264103
+    cfp_kill: 0.687744
+    irs_kill: 0.42892
+    cfp_half: 560.537397
+  - net_kill_shift: -0.101683
+    cfp_kill: 0.488546
+    irs_kill: 0.445108
+    cfp_half: 1131.009635
+  - net_kill_shift: -0.229874
+    cfp_kill: 0.506193
+    irs_kill: 0.432199
+    cfp_half: 1040.562219
+  - net_kill_shift: 0.369802
+    cfp_kill: 0.622121
+    irs_kill: 0.426636
+    cfp_half: 643.055271
+  - net_kill_shift: -0.09619
+    cfp_kill: 0.664119
+    irs_kill: 0.408024
+    cfp_half: 577.170827
+  - net_kill_shift: 0.356053
+    cfp_kill: 0.488183
+    irs_kill: 0.442077
+    cfp_half: 1256.212493
+  - net_kill_shift: 0.344333
+    cfp_kill: 0.517293
+    irs_kill: 0.454356
+    cfp_half: 996.142786
+  - net_kill_shift: 0.519686
+    cfp_kill: 0.547413
+    irs_kill: 0.456751
+    cfp_half: 1152.558888
+  - net_kill_shift: 0.260818
+    cfp_kill: 0.496124
+    irs_kill: 0.453511
+    cfp_half: 1243.98918
+  - net_kill_shift: 0.590301
+    cfp_kill: 0.642578
+    irs_kill: 0.447173
+    cfp_half: 824.054161
+  - *id006
+  - net_kill_shift: 0.19127
+    cfp_kill: 0.640702
+    irs_kill: 0.428229
+    cfp_half: 675.173402
+  - net_kill_shift: 0.4771
+    cfp_kill: 0.519682
+    irs_kill: 0.431302
+    cfp_half: 992.858212
+  - net_kill_shift: 0.529496
+    cfp_kill: 0.522766
+    irs_kill: 0.457443
+    cfp_half: 1174.710062
+  - net_kill_shift: 0.162389
+    cfp_kill: 0.538173
+    irs_kill: 0.405957
+    cfp_half: 792.357942
+  - net_kill_shift: -0.341733
+    cfp_kill: 0.475768
+    irs_kill: 0.417587
+    cfp_half: 1108.830851
+  - net_kill_shift: 0.091352
+    cfp_kill: 0.513559
+    irs_kill: 0.45053
+    cfp_half: 885.873597
+  - net_kill_shift: -0.382882
+    cfp_kill: 0.467138
+    irs_kill: 0.382213
+    cfp_half: 1176.429758
+  - net_kill_shift: 0.39706
+    cfp_kill: 0.539871
+    irs_kill: 0.442195
+    cfp_half: 974.764681
+  - net_kill_shift: 0.460029
+    cfp_kill: 0.567561
+    irs_kill: 0.444783
+    cfp_half: 757.463506
+  - net_kill_shift: 0.183749
+    cfp_kill: 0.533712
+    irs_kill: 0.402568
+    cfp_half: 937.799154
+  - net_kill_shift: -0.328061
+    cfp_kill: 0.49497
+    irs_kill: 0.42115
+    cfp_half: 974.403326
+  - net_kill_shift: 0.11144
+    cfp_kill: 0.519014
+    irs_kill: 0.421047
+    cfp_half: 900.104584
+  - net_kill_shift: 0.189747
+    cfp_kill: 0.528042
+    irs_kill: 0.453217
+    cfp_half: 1051.664645
+  - net_kill_shift: -0.045691
+    cfp_kill: 0.51789
+    irs_kill: 0.417606
+    cfp_half: 1027.876626
+  - net_kill_shift: -0.568407
+    cfp_kill: 0.45732
+    irs_kill: 0.436772
+    cfp_half: 998.42394
+  - net_kill_shift: 0.457243
+    cfp_kill: 0.669854
+    irs_kill: 0.453837
+    cfp_half: 746.227044
+  - net_kill_shift: 0.235791
+    cfp_kill: 0.502804
+    irs_kill: 0.460586
+    cfp_half: 1130.555977
+  - *id007
+  - net_kill_shift: -0.270298
+    cfp_kill: 0.539397
+    irs_kill: 0.37936
+    cfp_half: 770.322924
+  - net_kill_shift: -0.221937
+    cfp_kill: 0.47089
+    irs_kill: 0.432202
+    cfp_half: 1243.570269
+  - net_kill_shift: -0.149071
+    cfp_kill: 0.44575
+    irs_kill: 0.423349
+    cfp_half: 1234.319697
+  - net_kill_shift: -0.203845
+    cfp_kill: 0.507014
+    irs_kill: 0.417043
+    cfp_half: 984.815207
+  - net_kill_shift: -0.2407
+    cfp_kill: 0.47818
+    irs_kill: 0.445376
+    cfp_half: 938.188721
+  - net_kill_shift: 0.075491
+    cfp_kill: 0.468188
+    irs_kill: 0.425376
+    cfp_half: 1169.285955
+  - net_kill_shift: 0.436121
+    cfp_kill: 0.544664
+    irs_kill: 0.46493
+    cfp_half: 943.254933
+  - net_kill_shift: 0.48983
+    cfp_kill: 0.503614
+    irs_kill: 0.419963
+    cfp_half: 1050.79203
+  - net_kill_shift: -0.519033
+    cfp_kill: 0.467198
+    irs_kill: 0.394315
+    cfp_half: 1051.503094
+  - net_kill_shift: -0.123198
+    cfp_kill: 0.567547
+    irs_kill: 0.406739
+    cfp_half: 653.931704
+  - net_kill_shift: 0.112952
+    cfp_kill: 0.533466
+    irs_kill: 0.396213
+    cfp_half: 1254.168444
+  - net_kill_shift: 0.48361
+    cfp_kill: 0.667862
+    irs_kill: 0.460879
+    cfp_half: 673.145476
+  - net_kill_shift: -0.22869
+    cfp_kill: 0.501214
+    irs_kill: 0.380209
+    cfp_half: 1100.686765
+  - net_kill_shift: 0.258539
+    cfp_kill: 0.492006
+    irs_kill: 0.442639
+    cfp_half: 1142.082304
+  - net_kill_shift: -0.249103
+    cfp_kill: 0.442654
+    irs_kill: 0.387634
+    cfp_half: 1089.730683
+  - net_kill_shift: -0.194444
+    cfp_kill: 0.564528
+    irs_kill: 0.403907
+    cfp_half: 712.775068
+  - net_kill_shift: 0.17841
+    cfp_kill: 0.459477
+    irs_kill: 0.447647
+    cfp_half: 1178.846885
+  - net_kill_shift: -0.347278
+    cfp_kill: 0.472674
+    irs_kill: 0.391587
+    cfp_half: 1246.355384
+  - net_kill_shift: -0.441321
+    cfp_kill: 0.431084
+    irs_kill: 0.397636
+    cfp_half: 1124.142952
+  - net_kill_shift: 0.116222
+    cfp_kill: 0.535647
+    irs_kill: 0.41599
+    cfp_half: 947.675964
+  - net_kill_shift: -0.075342
+    cfp_kill: 0.588063
+    irs_kill: 0.386461
+    cfp_half: 752.144112
+  - net_kill_shift: 0.141774
+    cfp_kill: 0.45814
+    irs_kill: 0.413724
+    cfp_half: 1223.446035
+  - *id008
+  - net_kill_shift: 0.160119
+    cfp_kill: 0.512914
+    irs_kill: 0.460027
+    cfp_half: 948.305207
+  - net_kill_shift: 0.214417
+    cfp_kill: 0.560517
+    irs_kill: 0.442207
+    cfp_half: 731.302859
+  - net_kill_shift: 0.392663
+    cfp_kill: 0.680368
+    irs_kill: 0.440518
+    cfp_half: 635.769284
+  - net_kill_shift: 0.033799
+    cfp_kill: 0.653814
+    irs_kill: 0.416529
+    cfp_half: 647.472791
+  - net_kill_shift: -0.059452
+    cfp_kill: 0.513518
+    irs_kill: 0.44966
+    cfp_half: 1231.590326
+  - net_kill_shift: 0.350626
+    cfp_kill: 0.610932
+    irs_kill: 0.417079
+    cfp_half: 883.170814
+  - *id009
+  - net_kill_shift: 0.148923
+    cfp_kill: 0.590803
+    irs_kill: 0.455997
+    cfp_half: 884.09826
+  - net_kill_shift: -0.37895
+    cfp_kill: 0.578635
+    irs_kill: 0.397778
+    cfp_half: 646.135729
+  - net_kill_shift: 0.213851
+    cfp_kill: 0.444526
+    irs_kill: 0.409463
+    cfp_half: 1220.675481
+  - net_kill_shift: 0.424407
+    cfp_kill: 0.659423
+    irs_kill: 0.429189
+    cfp_half: 706.114476
+  - net_kill_shift: -0.481858
+    cfp_kill: 0.471608
+    irs_kill: 0.393778
+    cfp_half: 950.556501
+  - net_kill_shift: 0.472945
+    cfp_kill: 0.517807
+    irs_kill: 0.457263
+    cfp_half: 994.075089
+  - net_kill_shift: -0.103385
+    cfp_kill: 0.445778
+    irs_kill: 0.418785
+    cfp_half: 1209.364172
+  - net_kill_shift: 0.465265
+    cfp_kill: 0.604452
+    irs_kill: 0.432895
+    cfp_half: 654.684176
+  - net_kill_shift: 0.374506
+    cfp_kill: 0.548642
+    irs_kill: 0.413657
+    cfp_half: 1137.338758
+  - net_kill_shift: 0.307217
+    cfp_kill: 0.688228
+    irs_kill: 0.440915
+    cfp_half: 567.227859
+  - net_kill_shift: 0.508758
+    cfp_kill: 0.531868
+    irs_kill: 0.462874
+    cfp_half: 1111.536976
+  - net_kill_shift: -0.12899
+    cfp_kill: 0.59497
+    irs_kill: 0.422955
+    cfp_half: 604.261604
+  - net_kill_shift: 0.512354
+    cfp_kill: 0.57173
+    irs_kill: 0.450133
+    cfp_half: 982.343671
+  - net_kill_shift: 0.524232
+    cfp_kill: 0.601262
+    irs_kill: 0.431485
+    cfp_half: 910.243985
+  - net_kill_shift: -0.23601
+    cfp_kill: 0.469367
+    irs_kill: 0.375726
+    cfp_half: 1098.7336
+  - net_kill_shift: 0.480233
+    cfp_kill: 0.547413
+    irs_kill: 0.446252
+    cfp_half: 1144.551287
+  - net_kill_shift: -0.282909
+    cfp_kill: 0.45945
+    irs_kill: 0.407847
+    cfp_half: 1238.701674
+  - net_kill_shift: 0.617529
+    cfp_kill: 0.666688
+    irs_kill: 0.455709
+    cfp_half: 905.447984
+  - net_kill_shift: 0.389546
+    cfp_kill: 0.517144
+    irs_kill: 0.40832
+    cfp_half: 1222.883305
+  - net_kill_shift: 0.614204
+    cfp_kill: 0.620543
+    irs_kill: 0.466145
+    cfp_half: 861.980321
+  - net_kill_shift: 0.016499
+    cfp_kill: 0.619182
+    irs_kill: 0.42462
+    cfp_half: 716.738419
+  - net_kill_shift: -0.381266
+    cfp_kill: 0.513379
+    irs_kill: 0.43224
+    cfp_half: 896.601776
+  - net_kill_shift: -0.157116
+    cfp_kill: 0.600255
+    irs_kill: 0.407598
+    cfp_half: 582.074109
+  - net_kill_shift: -0.09652
+    cfp_kill: 0.613799
+    irs_kill: 0.416914
+    cfp_half: 633.840154
+  - net_kill_shift: 0.608709
+    cfp_kill: 0.524533
+    irs_kill: 0.438758
+    cfp_half: 1173.572352
+  - net_kill_shift: 0.475243
+    cfp_kill: 0.466417
+    irs_kill: 0.438822
+    cfp_half: 1234.242902
+  - net_kill_shift: -0.481028
+    cfp_kill: 0.458271
+    irs_kill: 0.371567
+    cfp_half: 1100.674277
+  - net_kill_shift: 0.050382
+    cfp_kill: 0.603397
+    irs_kill: 0.444473
+    cfp_half: 815.31208
+  - net_kill_shift: -0.077972
+    cfp_kill: 0.505289
+    irs_kill: 0.447256
+    cfp_half: 1048.153634
+  - net_kill_shift: 0.138965
+    cfp_kill: 0.45559
+    irs_kill: 0.413328
+    cfp_half: 1176.925778
+  - net_kill_shift: -0.320094
+    cfp_kill: 0.603566
+    irs_kill: 0.414507
+    cfp_half: 581.258159
+  - net_kill_shift: 0.16503
+    cfp_kill: 0.651354
+    irs_kill: 0.417343
+    cfp_half: 639.751079
+  - net_kill_shift: 0.363118
+    cfp_kill: 0.685422
+    irs_kill: 0.436368
+    cfp_half: 687.254936
+  - net_kill_shift: -0.142959
+    cfp_kill: 0.645406
+    irs_kill: 0.395806
+    cfp_half: 562.159196
+  - net_kill_shift: -0.017239
+    cfp_kill: 0.450167
+    irs_kill: 0.418615
+    cfp_half: 1136.168757
+  - net_kill_shift: 0.195782
+    cfp_kill: 0.56831
+    irs_kill: 0.456656
+    cfp_half: 722.644999
+  - net_kill_shift: -0.256166
+    cfp_kill: 0.45618
+    irs_kill: 0.448329
+    cfp_half: 1050.112524
+  - net_kill_shift: -0.175851
+    cfp_kill: 0.455848
+    irs_kill: 0.405656
+    cfp_half: 1105.185094
+  - net_kill_shift: -0.047327
+    cfp_kill: 0.542182
+    irs_kill: 0.406103
+    cfp_half: 755.208842
+  - net_kill_shift: 0.322455
+    cfp_kill: 0.547426
+    irs_kill: 0.420887
+    cfp_half: 1009.391904
+  - net_kill_shift: -0.169378
+    cfp_kill: 0.533208
+    irs_kill: 0.406971
+    cfp_half: 783.324543
+  - net_kill_shift: 0.053355
+    cfp_kill: 0.466814
+    irs_kill: 0.409839
+    cfp_half: 1037.941493
+  - net_kill_shift: -0.078631
+    cfp_kill: 0.608365
+    irs_kill: 0.42321
+    cfp_half: 574.221993
+  - net_kill_shift: -0.020033
+    cfp_kill: 0.573326
+    irs_kill: 0.422626
+    cfp_half: 886.600644
+  - net_kill_shift: -0.130846
+    cfp_kill: 0.492191
+    irs_kill: 0.392191
+    cfp_half: 1227.796551
+  - net_kill_shift: -0.242197
+    cfp_kill: 0.466206
+    irs_kill: 0.374486
+    cfp_half: 1133.344523
+  - net_kill_shift: -0.303554
+    cfp_kill: 0.503069
+    irs_kill: 0.436039
+    cfp_half: 900.75889
+  - net_kill_shift: 0.072937
+    cfp_kill: 0.478101
+    irs_kill: 0.412972
+    cfp_half: 991.320211
+  - *id001
+  - net_kill_shift: 0.606613
+    cfp_kill: 0.695689
+    irs_kill: 0.459439
+    cfp_half: 571.780533
+  - net_kill_shift: 0.343106
+    cfp_kill: 0.610124
+    irs_kill: 0.414134
+    cfp_half: 786.194684
+  - net_kill_shift: -0.445824
+    cfp_kill: 0.428377
+    irs_kill: 0.371608
+    cfp_half: 1148.522317
+  - net_kill_shift: -0.275733
+    cfp_kill: 0.60057
+    irs_kill: 0.401105
+    cfp_half: 583.201431
+  - net_kill_shift: 0.062271
+    cfp_kill: 0.651128
+    irs_kill: 0.410913
+    cfp_half: 594.18387
+  - net_kill_shift: 0.165849
+    cfp_kill: 0.522589
+    irs_kill: 0.415966
+    cfp_half: 883.56649
+  - net_kill_shift: -0.296848
+    cfp_kill: 0.436207
+    irs_kill: 0.454239
+    cfp_half: 1221.865099
+  - net_kill_shift: 0.126327
+    cfp_kill: 0.55641
+    irs_kill: 0.43107
+    cfp_half: 790.317799
+  - net_kill_shift: 0.476791
+    cfp_kill: 0.669886
+    irs_kill: 0.427641
+    cfp_half: 747.361619
+  - net_kill_shift: 0.615592
+    cfp_kill: 0.620337
+    irs_kill: 0.467335
+    cfp_half: 808.002017
+  - net_kill_shift: 0.514104
+    cfp_kill: 0.594662
+    irs_kill: 0.465046
+    cfp_half: 878.271424
+  - net_kill_shift: 0.583857
+    cfp_kill: 0.538096
+    irs_kill: 0.443988
+    cfp_half: 1204.040151
+  - net_kill_shift: -0.127467
+    cfp_kill: 0.478847
+    irs_kill: 0.449104
+    cfp_half: 1235.386578
+  - net_kill_shift: 0.650997
+    cfp_kill: 0.621095
+    irs_kill: 0.463296
+    cfp_half: 1054.361092
+  - net_kill_shift: 0.146827
+    cfp_kill: 0.70499
+    irs_kill: 0.41041
+    cfp_half: 590.488301
+  - net_kill_shift: 0.001426
+    cfp_kill: 0.475861
+    irs_kill: 0.457395
+    cfp_half: 1267.913246
+  - net_kill_shift: -0.052309
+    cfp_kill: 0.499324
+    irs_kill: 0.398713
+    cfp_half: 1178.852279
+  - net_kill_shift: -0.112141
+    cfp_kill: 0.532785
+    irs_kill: 0.420541
+    cfp_half: 973.151727
+  - net_kill_shift: -0.139784
+    cfp_kill: 0.459223
+    irs_kill: 0.412085
+    cfp_half: 1056.224645
+  - net_kill_shift: -0.046749
+    cfp_kill: 0.56092
+    irs_kill: 0.387247
+    cfp_half: 790.351354
+  - net_kill_shift: 0.33089
+    cfp_kill: 0.589339
+    irs_kill: 0.417446
+    cfp_half: 887.256475
+  - net_kill_shift: -0.528737
+    cfp_kill: 0.441411
+    irs_kill: 0.41588
+    cfp_half: 1062.763844
+  - net_kill_shift: 0.30053
+    cfp_kill: 0.559733
+    irs_kill: 0.462277
+    cfp_half: 1066.568704
+  - net_kill_shift: -0.071733
+    cfp_kill: 0.605873
+    irs_kill: 0.428493
+    cfp_half: 642.683672
+  - net_kill_shift: 0.329983
+    cfp_kill: 0.672246
+    irs_kill: 0.450819
+    cfp_half: 547.635212
+  - net_kill_shift: -0.153184
+    cfp_kill: 0.474497
+    irs_kill: 0.377212
+    cfp_half: 1085.460015
+  - net_kill_shift: 0.212637
+    cfp_kill: 0.645012
+    irs_kill: 0.428369
+    cfp_half: 700.300907
+  - net_kill_shift: 0.508266
+    cfp_kill: 0.615651
+    irs_kill: 0.448235
+    cfp_half: 756.20639
+  - net_kill_shift: -0.142432
+    cfp_kill: 0.490796
+    irs_kill: 0.417404
+    cfp_half: 991.33749
+  - net_kill_shift: 0.2871
+    cfp_kill: 0.522455
+    irs_kill: 0.454283
+    cfp_half: 867.290753
+  - net_kill_shift: 0.122779
+    cfp_kill: 0.521141
+    irs_kill: 0.45796
+    cfp_half: 1220.322218
+  - net_kill_shift: -0.218183
+    cfp_kill: 0.486711
+    irs_kill: 0.38591
+    cfp_half: 998.661164
+  - net_kill_shift: -0.110521
+    cfp_kill: 0.498683
+    irs_kill: 0.434099
+    cfp_half: 1265.578917
+  - net_kill_shift: -0.042363
+    cfp_kill: 0.581944
+    irs_kill: 0.385266
+    cfp_half: 829.360419
+  - *id010
+  - *id002
+  - net_kill_shift: 0.637165
+    cfp_kill: 0.678799
+    irs_kill: 0.456068
+    cfp_half: 742.85874
+  - net_kill_shift: -0.006793
+    cfp_kill: 0.584267
+    irs_kill: 0.417215
+    cfp_half: 709.326813
+  - net_kill_shift: -0.373463
+    cfp_kill: 0.422209
+    irs_kill: 0.440446
+    cfp_half: 1263.206897
+  - net_kill_shift: 0.314088
+    cfp_kill: 0.661866
+    irs_kill: 0.432215
+    cfp_half: 756.349894
+  - net_kill_shift: -0.02959
+    cfp_kill: 0.453755
+    irs_kill: 0.449038
+    cfp_half: 1200.076263
+  - net_kill_shift: 0.60549
+    cfp_kill: 0.623644
+    irs_kill: 0.441439
+    cfp_half: 969.133473
+  - net_kill_shift: -0.481656
+    cfp_kill: 0.430269
+    irs_kill: 0.382189
+    cfp_half: 1247.123971
+  - net_kill_shift: 0.045002
+    cfp_kill: 0.465249
+    irs_kill: 0.421641
+    cfp_half: 1069.548109
+  - net_kill_shift: -0.371629
+    cfp_kill: 0.481895
+    irs_kill: 0.390286
+    cfp_half: 1004.507401
+  - net_kill_shift: 0.658387
+    cfp_kill: 0.688193
+    irs_kill: 0.468009
+    cfp_half: 802.020487
+  - net_kill_shift: 0.303658
+    cfp_kill: 0.597562
+    irs_kill: 0.431935
+    cfp_half: 897.701058
+  - net_kill_shift: 0.427845
+    cfp_kill: 0.53493
+    irs_kill: 0.421714
+    cfp_half: 903.802836
+  - net_kill_shift: -0.421586
+    cfp_kill: 0.491243
+    irs_kill: 0.426905
+    cfp_half: 927.167688
+  - net_kill_shift: 0.033562
+    cfp_kill: 0.634128
+    irs_kill: 0.424043
+    cfp_half: 661.704655
+  - net_kill_shift: -0.052364
+    cfp_kill: 0.540074
+    irs_kill: 0.409128
+    cfp_half: 963.979855
+  - net_kill_shift: -0.566053
+    cfp_kill: 0.446476
+    irs_kill: 0.424378
+    cfp_half: 1070.986993
+  - net_kill_shift: 0.262386
+    cfp_kill: 0.525668
+    irs_kill: 0.457953
+    cfp_half: 942.029016
+  - net_kill_shift: -0.593748
+    cfp_kill: 0.430874
+    irs_kill: 0.370853
+    cfp_half: 1119.790132
+  - net_kill_shift: -0.457514
+    cfp_kill: 0.453487
+    irs_kill: 0.44137
+    cfp_half: 1180.338267
+  - net_kill_shift: -0.022891
+    cfp_kill: 0.6045
+    irs_kill: 0.420817
+    cfp_half: 634.284193
+  - net_kill_shift: 0.131775
+    cfp_kill: 0.567137
+    irs_kill: 0.457991
+    cfp_half: 895.648534
+  - net_kill_shift: 0.231336
+    cfp_kill: 0.626922
+    irs_kill: 0.461213
+    cfp_half: 803.660166
+  - net_kill_shift: 0.429145
+    cfp_kill: 0.6454
+    irs_kill: 0.440394
+    cfp_half: 832.199141
+  - net_kill_shift: 0.149749
+    cfp_kill: 0.54607
+    irs_kill: 0.432714
+    cfp_half: 827.280728
+  - net_kill_shift: 0.259935
+    cfp_kill: 0.542014
+    irs_kill: 0.444757
+    cfp_half: 1258.206808
+  - net_kill_shift: 0.639505
+    cfp_kill: 0.605945
+    irs_kill: 0.45047
+    cfp_half: 689.75139
+  - net_kill_shift: -0.456527
+    cfp_kill: 0.453445
+    irs_kill: 0.400552
+    cfp_half: 1005.634633
+  - net_kill_shift: -0.366686
+    cfp_kill: 0.417639
+    irs_kill: 0.447993
+    cfp_half: 1260.019169
+  - net_kill_shift: 0.407737
+    cfp_kill: 0.593148
+    irs_kill: 0.421701
+    cfp_half: 904.391101
+  - net_kill_shift: 0.116925
+    cfp_kill: 0.528897
+    irs_kill: 0.420492
+    cfp_half: 921.769711
+  - net_kill_shift: -0.18631
+    cfp_kill: 0.467199
+    irs_kill: 0.413503
+    cfp_half: 1160.238659
+  - net_kill_shift: 0.214632
+    cfp_kill: 0.586628
+    irs_kill: 0.441954
+    cfp_half: 755.331306
+  - net_kill_shift: 0.545899
+    cfp_kill: 0.574983
+    irs_kill: 0.432038
+    cfp_half: 865.341098
+  - net_kill_shift: 0.235374
+    cfp_kill: 0.561643
+    irs_kill: 0.417767
+    cfp_half: 796.181514
+  - net_kill_shift: 0.165115
+    cfp_kill: 0.575077
+    irs_kill: 0.431253
+    cfp_half: 825.767843
+  - net_kill_shift: -0.191575
+    cfp_kill: 0.497267
+    irs_kill: 0.426121
+    cfp_half: 1009.052352
+  - net_kill_shift: -0.073892
+    cfp_kill: 0.489771
+    irs_kill: 0.398873
+    cfp_half: 1200.136143
+  - net_kill_shift: -0.353777
+    cfp_kill: 0.472771
+    irs_kill: 0.394898
+    cfp_half: 944.376074
+  - net_kill_shift: 0.018018
+    cfp_kill: 0.66901
+    irs_kill: 0.395391
+    cfp_half: 601.4969
+  - net_kill_shift: 0.38623
+    cfp_kill: 0.587601
+    irs_kill: 0.434715
+    cfp_half: 748.593404
+  - *id003
+  - net_kill_shift: -0.49562
+    cfp_kill: 0.576273
+    irs_kill: 0.409673
+    cfp_half: 618.485957
+  - net_kill_shift: 0.165061
+    cfp_kill: 0.481974
+    irs_kill: 0.44705
+    cfp_half: 1138.361516
+  - *id011
+  - net_kill_shift: -0.5447
+    cfp_kill: 0.443534
+    irs_kill: 0.391746
+    cfp_half: 1192.205549
+  - net_kill_shift: 0.183185
+    cfp_kill: 0.548183
+    irs_kill: 0.456925
+    cfp_half: 774.619387
+  - net_kill_shift: 0.416009
+    cfp_kill: 0.582324
+    irs_kill: 0.439241
+    cfp_half: 973.820553
+  - net_kill_shift: -0.17915
+    cfp_kill: 0.556251
+    irs_kill: 0.399986
+    cfp_half: 716.805187
+  - net_kill_shift: -0.24257
+    cfp_kill: 0.455738
+    irs_kill: 0.430482
+    cfp_half: 1056.828938
+  - net_kill_shift: 0.208556
+    cfp_kill: 0.470464
+    irs_kill: 0.42563
+    cfp_half: 1222.214661
+  - net_kill_shift: -0.040162
+    cfp_kill: 0.557373
+    irs_kill: 0.413003
+    cfp_half: 728.907524
+  - net_kill_shift: 0.089514
+    cfp_kill: 0.549282
+    irs_kill: 0.434807
+    cfp_half: 828.894995
+  - net_kill_shift: -0.322851
+    cfp_kill: 0.453299
+    irs_kill: 0.428319
+    cfp_half: 1131.556403
+  - net_kill_shift: 0.536169
+    cfp_kill: 0.498887
+    irs_kill: 0.446105
+    cfp_half: 1120.689931
+  - net_kill_shift: 0.063646
+    cfp_kill: 0.471718
+    irs_kill: 0.400086
+    cfp_half: 1152.135881
+  - net_kill_shift: 0.250438
+    cfp_kill: 0.541596
+    irs_kill: 0.439972
+    cfp_half: 1008.96469
+  - net_kill_shift: 0.55162
+    cfp_kill: 0.694114
+    irs_kill: 0.456827
+    cfp_half: 755.437044
+  - net_kill_shift: -0.286931
+    cfp_kill: 0.46851
+    irs_kill: 0.445887
+    cfp_half: 1274.049612
+  - net_kill_shift: 0.084017
+    cfp_kill: 0.468162
+    irs_kill: 0.397734
+    cfp_half: 1175.09913
+  - net_kill_shift: 0.083707
+    cfp_kill: 0.566571
+    irs_kill: 0.454419
+    cfp_half: 747.490336
+  - net_kill_shift: 0.055416
+    cfp_kill: 0.539588
+    irs_kill: 0.404916
+    cfp_half: 965.951305
+  - net_kill_shift: -0.143342
+    cfp_kill: 0.595274
+    irs_kill: 0.407137
+    cfp_half: 631.338905
+  - net_kill_shift: -0.382003
+    cfp_kill: 0.443835
+    irs_kill: 0.451069
+    cfp_half: 1109.779075
+  - net_kill_shift: 0.171324
+    cfp_kill: 0.480029
+    irs_kill: 0.405038
+    cfp_half: 1210.426688
+  - net_kill_shift: 0.236973
+    cfp_kill: 0.580475
+    irs_kill: 0.438752
+    cfp_half: 961.973
+  - net_kill_shift: 0.45987
+    cfp_kill: 0.766662
+    irs_kill: 0.450152
+    cfp_half: 574.348205
+  - net_kill_shift: -0.336476
+    cfp_kill: 0.44573
+    irs_kill: 0.430772
+    cfp_half: 1127.122019
+  - net_kill_shift: 0.493875
+    cfp_kill: 0.583636
+    irs_kill: 0.461349
+    cfp_half: 1220.317911
+  - *id012
+  - net_kill_shift: 0.640106
+    cfp_kill: 0.724179
+    irs_kill: 0.457547
+    cfp_half: 663.306257
+  - net_kill_shift: 0.484057
+    cfp_kill: 0.717473
+    irs_kill: 0.460411
+    cfp_half: 695.085047
+  - *id004
+  - net_kill_shift: 0.371003
+    cfp_kill: 0.528219
+    irs_kill: 0.464693
+    cfp_half: 876.433165
+  - net_kill_shift: -0.0497
+    cfp_kill: 0.513618
+    irs_kill: 0.449369
+    cfp_half: 1094.443668
+  - net_kill_shift: -0.293615
+    cfp_kill: 0.427369
+    irs_kill: 0.449174
+    cfp_half: 1228.627001
+  - net_kill_shift: -0.220152
+    cfp_kill: 0.488379
+    irs_kill: 0.421645
+    cfp_half: 927.659963
+  - net_kill_shift: 0.128521
+    cfp_kill: 0.492015
+    irs_kill: 0.398644
+    cfp_half: 1199.148819
+  - net_kill_shift: 0.513259
+    cfp_kill: 0.594568
+    irs_kill: 0.442221
+    cfp_half: 680.663238
+  - net_kill_shift: 0.238652
+    cfp_kill: 0.660403
+    irs_kill: 0.427109
+    cfp_half: 640.929402
+  - net_kill_shift: 0.341058
+    cfp_kill: 0.538624
+    irs_kill: 0.42725
+    cfp_half: 1211.011727
+  - net_kill_shift: 0.573353
+    cfp_kill: 0.488023
+    irs_kill: 0.459692
+    cfp_half: 1134.184099
+  - net_kill_shift: 0.388574
+    cfp_kill: 0.548599
+    irs_kill: 0.454846
+    cfp_half: 1014.016283
+parameters:
+  net_kill_shift:
+    value: 0.17841
+    lo: -0.5937
+    hi: 0.6584
+    box:
+    - -0.618
+    - 0.66
+    benchmarks: &id013
+    - B10
+    - B11
+    - B12
+    - B12b
+    - B12m
+  cfp_kill:
+    value: 0.459477
+    lo: 0.4176
+    hi: 0.7822
+    box:
+    - 0.0
+    - 0.8
+    benchmarks: *id013
+  irs_kill:
+    value: 0.447647
+    lo: 0.3709
+    hi: 0.468
+    box:
+    - 0.0
+    - 0.95
+    benchmarks: *id013
+  cfp_half:
+    value: 1178.846885
+    lo: 547.6352
+    hi: 1274.0496
+    box:
+    - 547.5
+    - 1277.5
+    benchmarks: *id013
+fit_rule:
+  version: joint-v1
+  description: LHS(n)+centre on the pack seeds; calibration at the box centre; quadratic
+    surrogate of each target's log value; infeasible targets dropped; argmin (n out
+    of band, band-scaled squared log error) on a dense grid; range = region with all
+    feasible targets in band; verification re-run with re-calibration at the chosen
+    value
+  seeds:
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  - 18
+  design_points: 46
+  design_seed: 17
+  targets: *id013
+feasibility:
+  feasible_in_box:
+  - B10
+  - B11
+  - B12
+  - B12b
+  - B12m
+  infeasible_in_box: []
+  conflicting_pairs: []
+  all_feasible_in_band_at_value: true
+  surrogate_all_feasible_in_band: true
+  disproved_by_verification: *id014
+  feasibility_verified: true
+surrogate:
+  B10:
+    loo_rmse_log: 0.0262
+  B11:
+    loo_rmse_log: 0.0296
+  B12:
+    loo_rmse_log: 0.0134
+  B12b:
+    loo_rmse_log: 0.0155
+  B12m:
+    loo_rmse_log: 0.0212
+calibration:
+  at_box_centre:
+    benin: 11.4938
+    irs_added: 23.5636
+    misungwi: 10.9649
+    muleba: 66.7175
+  at_fitted_value:
+    benin: 11.9536
+    irs_added: 23.0268
+    misungwi: 11.3788
+    muleba: 74.0492
+verification:
+  B10:
+    computed: 0.6573
+    predicted: 0.6623
+    in_band: true
+    seed_min: 0.5963
+    seed_max: 0.746
+  B11:
+    computed: 0.4872
+    predicted: 0.4894
+    in_band: true
+    seed_min: 0.4641
+    seed_max: 0.5211
+  B12:
+    computed: 0.8277
+    predicted: 0.8324
+    in_band: true
+    seed_min: 0.7877
+    seed_max: 0.8684
+  B12b:
+    computed: 0.6197
+    predicted: 0.6198
+    in_band: true
+    seed_min: 0.5907
+    seed_max: 0.6504
+  B12m:
+    computed: 0.5134
+    predicted: 0.5067
+    in_band: true
+    seed_min: 0.481
+    seed_max: 0.5595
+design:
+  x:
+  - net_kill_shift: 0.136094
+    cfp_kill: 0.237297
+    irs_kill: 0.047585
+    cfp_half: 815.487305
+  - net_kill_shift: 0.218346
+    cfp_kill: 0.7029
+    irs_kill: 0.448595
+    cfp_half: 988.107247
+  - net_kill_shift: 0.05296
+    cfp_kill: 0.492014
+    irs_kill: 0.21367
+    cfp_half: 1068.288565
+  - net_kill_shift: 0.197116
+    cfp_kill: 0.291831
+    irs_kill: 0.61787
+    cfp_half: 1239.804968
+  - net_kill_shift: -0.540287
+    cfp_kill: 0.665808
+    irs_kill: 0.368437
+    cfp_half: 1050.545791
+  - net_kill_shift: -0.006011
+    cfp_kill: 0.20108
+    irs_kill: 0.704918
+    cfp_half: 1114.496532
+  - net_kill_shift: -0.139638
+    cfp_kill: 0.097101
+    irs_kill: 0.32456
+    cfp_half: 1123.280787
+  - net_kill_shift: -0.089951
+    cfp_kill: 0.478653
+    irs_kill: 0.88418
+    cfp_half: 902.836192
+  - net_kill_shift: -0.530422
+    cfp_kill: 0.081944
+    irs_kill: 0.566055
+    cfp_half: 1226.333568
+  - net_kill_shift: -0.191813
+    cfp_kill: 0.602269
+    irs_kill: 0.117526
+    cfp_half: 724.463972
+  - net_kill_shift: 0.49443
+    cfp_kill: 0.223126
+    irs_kill: 0.182795
+    cfp_half: 1205.66008
+  - net_kill_shift: 0.518072
+    cfp_kill: 0.622272
+    irs_kill: 0.587136
+    cfp_half: 573.639566
+  - net_kill_shift: -0.259663
+    cfp_kill: 0.361943
+    irs_kill: 0.544296
+    cfp_half: 778.647521
+  - net_kill_shift: -0.594
+    cfp_kill: 0.72816
+    irs_kill: 0.135136
+    cfp_half: 1137.4228
+  - net_kill_shift: -0.128647
+    cfp_kill: 0.305759
+    irs_kill: 0.683685
+    cfp_half: 766.572015
+  - net_kill_shift: -0.305111
+    cfp_kill: 0.071071
+    irs_kill: 0.774639
+    cfp_half: 836.164118
+  - net_kill_shift: -0.488282
+    cfp_kill: 0.002862
+    irs_kill: 0.821059
+    cfp_half: 635.942083
+  - net_kill_shift: 0.593932
+    cfp_kill: 0.424957
+    irs_kill: 0.592753
+    cfp_half: 687.988119
+  - net_kill_shift: 0.620283
+    cfp_kill: 0.121154
+    irs_kill: 0.268451
+    cfp_half: 801.326249
+  - net_kill_shift: 0.54909
+    cfp_kill: 0.558269
+    irs_kill: 0.297322
+    cfp_half: 1023.868982
+  - net_kill_shift: 0.255637
+    cfp_kill: 0.539418
+    irs_kill: 0.906332
+    cfp_half: 971.450471
+  - net_kill_shift: -0.409024
+    cfp_kill: 0.789578
+    irs_kill: 0.080905
+    cfp_half: 923.166306
+  - net_kill_shift: 0.449386
+    cfp_kill: 0.767083
+    irs_kill: 0.422441
+    cfp_half: 648.129065
+  - net_kill_shift: -0.224901
+    cfp_kill: 0.731232
+    irs_kill: 0.855484
+    cfp_half: 615.294027
+  - net_kill_shift: -0.071462
+    cfp_kill: 0.523446
+    irs_kill: 0.78556
+    cfp_half: 750.106694
+  - net_kill_shift: 0.019247
+    cfp_kill: 0.252942
+    irs_kill: 0.011775
+    cfp_half: 1186.388261
+  - net_kill_shift: 0.320433
+    cfp_kill: 0.507003
+    irs_kill: 0.658091
+    cfp_half: 947.568273
+  - net_kill_shift: -0.583496
+    cfp_kill: 0.395741
+    irs_kill: 0.03015
+    cfp_half: 911.780894
+  - net_kill_shift: -0.421478
+    cfp_kill: 0.146433
+    irs_kill: 0.482657
+    cfp_half: 677.132842
+  - net_kill_shift: -0.471316
+    cfp_kill: 0.686643
+    irs_kill: 0.515498
+    cfp_half: 731.509477
+  - net_kill_shift: 0.116829
+    cfp_kill: 0.443298
+    irs_kill: 0.155142
+    cfp_half: 855.902488
+  - net_kill_shift: 0.283768
+    cfp_kill: 0.374924
+    irs_kill: 0.752421
+    cfp_half: 881.064049
+  - net_kill_shift: -0.374732
+    cfp_kill: 0.646385
+    irs_kill: 0.651464
+    cfp_half: 1248.609987
+  - net_kill_shift: 0.160579
+    cfp_kill: 0.187418
+    irs_kill: 0.286014
+    cfp_half: 960.742348
+  - net_kill_shift: -0.315447
+    cfp_kill: 0.035827
+    irs_kill: 0.203298
+    cfp_half: 1276.013093
+  - net_kill_shift: -0.347785
+    cfp_kill: 0.61466
+    irs_kill: 0.351113
+    cfp_half: 1045.555684
+  - net_kill_shift: 0.463012
+    cfp_kill: 0.271879
+    irs_kill: 0.82882
+    cfp_half: 596.763277
+  - net_kill_shift: 0.394093
+    cfp_kill: 0.164962
+    irs_kill: 0.736023
+    cfp_half: 589.745033
+  - net_kill_shift: -0.041608
+    cfp_kill: 0.759021
+    irs_kill: 0.912622
+    cfp_half: 553.471075
+  - net_kill_shift: 0.083876
+    cfp_kill: 0.13977
+    irs_kill: 0.411955
+    cfp_half: 1096.907835
+  - net_kill_shift: 0.371255
+    cfp_kill: 0.44722
+    irs_kill: 0.084591
+    cfp_half: 1152.918376
+  - net_kill_shift: 0.632839
+    cfp_kill: 0.024637
+    irs_kill: 0.395416
+    cfp_half: 701.27354
+  - net_kill_shift: -0.219774
+    cfp_kill: 0.577168
+    irs_kill: 0.929859
+    cfp_half: 849.578304
+  - net_kill_shift: 0.30236
+    cfp_kill: 0.332432
+    irs_kill: 0.23584
+    cfp_half: 1173.604338
+  - net_kill_shift: 0.426856
+    cfp_kill: 0.34563
+    irs_kill: 0.497061
+    cfp_half: 1010.148971
+  - net_kill_shift: 0.021
+    cfp_kill: 0.4
+    irs_kill: 0.475
+    cfp_half: 912.5
+  computed:
+    B10:
+    - 0.8386
+    - 0.5443
+    - 0.6423
+    - 0.7741
+    - 0.5188
+    - 0.8678
+    - 0.9475
+    - 0.6873
+    - 0.9081
+    - 0.6118
+    - 0.8499
+    - 0.6815
+    - 0.7575
+    - 0.4773
+    - 0.7879
+    - 0.9383
+    - 0.9877
+    - 0.7789
+    - 0.9059
+    - 0.644
+    - 0.6239
+    - 0.4824
+    - 0.5872
+    - 0.5984
+    - 0.6662
+    - 0.8102
+    - 0.6735
+    - 0.7345
+    - 0.8976
+    - 0.5833
+    - 0.7001
+    - 0.7616
+    - 0.5138
+    - 0.8782
+    - 0.9583
+    - 0.5717
+    - 0.848
+    - 0.9019
+    - 0.6269
+    - 0.875
+    - 0.6781
+    - 0.9548
+    - 0.5999
+    - 0.7343
+    - 0.7474
+    - 0.7454
+    B11:
+    - 0.7273
+    - 0.3554
+    - 0.4823
+    - 0.635
+    - 0.2972
+    - 0.7316
+    - 0.8276
+    - 0.4688
+    - 0.8604
+    - 0.4127
+    - 0.7265
+    - 0.5092
+    - 0.5668
+    - 0.2345
+    - 0.6497
+    - 0.8956
+    - 0.989
+    - 0.61
+    - 0.8637
+    - 0.4691
+    - 0.4649
+    - 0.2463
+    - 0.3968
+    - 0.3632
+    - 0.496
+    - 0.6571
+    - 0.481
+    - 0.4931
+    - 0.7925
+    - 0.3349
+    - 0.5391
+    - 0.5942
+    - 0.3154
+    - 0.7649
+    - 0.9359
+    - 0.3217
+    - 0.7423
+    - 0.8457
+    - 0.4082
+    - 0.7885
+    - 0.5067
+    - 0.9817
+    - 0.4143
+    - 0.6185
+    - 0.6443
+    - 0.5477
+    B12:
+    - 0.9898
+    - 0.8275
+    - 0.943
+    - 0.7754
+    - 0.8588
+    - 0.7289
+    - 0.8682
+    - 0.6678
+    - 0.7957
+    - 0.9458
+    - 0.9336
+    - 0.78
+    - 0.8045
+    - 0.9596
+    - 0.734
+    - 0.7193
+    - 0.6903
+    - 0.7773
+    - 0.8995
+    - 0.8994
+    - 0.6709
+    - 0.9717
+    - 0.8547
+    - 0.6864
+    - 0.7141
+    - 0.9949
+    - 0.7608
+    - 0.9828
+    - 0.8073
+    - 0.7873
+    - 0.9512
+    - 0.7139
+    - 0.7414
+    - 0.8883
+    - 0.9074
+    - 0.8621
+    - 0.7038
+    - 0.7372
+    - 0.6598
+    - 0.8426
+    - 0.9746
+    - 0.8457
+    - 0.6518
+    - 0.9197
+    - 0.814
+    - 0.8245
+    B12b:
+    - 0.9563
+    - 0.6242
+    - 0.8223
+    - 0.5119
+    - 0.6624
+    - 0.4707
+    - 0.7037
+    - 0.3799
+    - 0.5338
+    - 0.8785
+    - 0.8266
+    - 0.5363
+    - 0.5511
+    - 0.8787
+    - 0.4655
+    - 0.4234
+    - 0.3959
+    - 0.5247
+    - 0.7621
+    - 0.7319
+    - 0.3711
+    - 0.9033
+    - 0.632
+    - 0.3795
+    - 0.4202
+    - 0.9995
+    - 0.4963
+    - 0.9875
+    - 0.5788
+    - 0.5346
+    - 0.8738
+    - 0.4513
+    - 0.4858
+    - 0.7395
+    - 0.8093
+    - 0.6719
+    - 0.404
+    - 0.4483
+    - 0.3609
+    - 0.6464
+    - 0.9168
+    - 0.6576
+    - 0.3499
+    - 0.771
+    - 0.5851
+    - 0.6015
+    B12m:
+    - 0.9566
+    - 0.5128
+    - 0.7091
+    - 0.3816
+    - 0.5457
+    - 0.3469
+    - 0.601
+    - 0.2571
+    - 0.3888
+    - 0.8485
+    - 0.7937
+    - 0.4432
+    - 0.4297
+    - 0.8281
+    - 0.3474
+    - 0.2911
+    - 0.2705
+    - 0.4484
+    - 0.7047
+    - 0.662
+    - 0.266
+    - 0.8569
+    - 0.5616
+    - 0.2646
+    - 0.2873
+    - 0.9999
+    - 0.3783
+    - 0.9593
+    - 0.4541
+    - 0.4314
+    - 0.7951
+    - 0.3289
+    - 0.358
+    - 0.6672
+    - 0.7306
+    - 0.5626
+    - 0.3142
+    - 0.3551
+    - 0.2528
+    - 0.5403
+    - 0.9006
+    - 0.6079
+    - 0.2357
+    - 0.7004
+    - 0.489
+    - 0.4736

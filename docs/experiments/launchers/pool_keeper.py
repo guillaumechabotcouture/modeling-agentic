@@ -8,6 +8,11 @@ stays at its minimum: slower batches, never lost results.
 
     python pool_keeper.py <cluster-name> <min-workers> <max-workers> [hours]
 """
+import os as _os  # noqa: E402 -- F6 budget: this archived launcher has no budget check
+if _os.environ.get("MA_ALLOW_EXPERIMENT_LAUNCHERS") != "1":
+    raise SystemExit("docs/experiments/launchers: archived launchers create paid Coiled clusters without the "
+                     "owner-signed budget check (cloud/budget.py); set MA_ALLOW_EXPERIMENT_LAUNCHERS=1 to run one "
+                     "deliberately")
 import os, sys, time
 import coiled
 

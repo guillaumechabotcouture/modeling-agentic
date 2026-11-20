@@ -515,18 +515,44 @@ def held(spec) -> dict:
     return {n: v for n, v in vals.items() if n not in dr}
 
 
+def companions(dt) -> dict:
+    """{parameter: value} of a parameter_value decision test's `with`: companion engine parameters held at these
+    values in every case of the test (owner, 20 Nov). {} without the field or for a malformed one (validation
+    reports that)."""
+    w = dt.get("with") if isinstance(dt, dict) and dt.get("type") == "parameter_value" else None
+    return {str(k): float(v) for k, v in w.items() if _isnum(v)} if isinstance(w, dict) else {}
+
+
+def test_settings(dt, numbers_only: bool = False, names=None) -> dict:
+    """{parameter: [values]} a parameter_value decision test sets: its own parameter's values and each companion's
+    value. Every reader of what a test sets (the design box, held spec values, hard bounds) uses this. The test's own
+    values are read as the runner reads them, with float(): a quoted number counts and a value that is not a number
+    raises ValueError (as these readers did before `with`; Codex r1-r2). `numbers_only`: only values written as
+    numbers, nothing raised (tested_boxes' rule before `with`). `names`: the parameters the reader uses; a test's own
+    values are read only when its parameter is one of them, so a value the reader never used raises nothing (Codex
+    r3), and only those parameters are returned."""
+    if not isinstance(dt, dict) or dt.get("type") != "parameter_value":
+        return {}
+    out = {k: [v] for k, v in companions(dt).items() if names is None or k in names}
+    if names is not None and dt.get("parameter") not in names:
+        return out
+    vs = [float(x) for x in dt.get("values") or [] if not numbers_only or _isnum(x)]
+    if vs and isinstance(dt.get("parameter"), str):
+        out[dt["parameter"]] = out.get(dt["parameter"], []) + vs
+    return out
+
+
 def tested_boxes(spec) -> dict:
-    """{parameter: [lo, hi]} for each held spec value that a parameter_value decision test varies: the box spans the
-    spec value and the tested values (the emulator design input; the draws keep the spec value)."""
+    """{parameter: [lo, hi]} for each held spec value that a parameter_value decision test varies or holds as a
+    companion: the box spans the spec value and the tested values (the emulator design input; the draws keep the spec
+    value)."""
     hv = held(spec)
     out = {}
     for dt in ((_raw(spec).get("analysis") or {}).get("decision_tests") or []):
-        if not isinstance(dt, dict) or dt.get("type") != "parameter_value" or dt.get("parameter") not in hv:
-            continue
-        vs = [float(x) for x in dt.get("values") or [] if _isnum(x)]
-        if vs:
-            lo, hi = out.get(dt["parameter"], [hv[dt["parameter"]]] * 2)
-            out[dt["parameter"]] = [min(lo, *vs), max(hi, *vs)]
+        for n, vs in test_settings(dt, numbers_only=True, names=hv).items():
+            if n in hv:
+                lo, hi = out.get(n, [hv[n]] * 2)
+                out[n] = [min(lo, *vs), max(hi, *vs)]
     return {k: v for k, v in sorted(out.items()) if v[0] < v[1]}
 
 
@@ -631,10 +657,25 @@ def spec_benchmarks(pack: dict, engine, spec, fitted: dict | None = None, worker
     if ev.problems:                      # S1-2b: sources and fitted values in use, before the spec or any arm
         raise ValueError("benchmark pack: " + "; ".join(ev.problems))
     pe = _check_pack_engine(pack, spec, engine)
-    vals = values(spec)
-    runner = BM.Runner(pack, pe, workers, seeds, base_params=vals, evidence=ev)     # the evidence it validated
-    out = BM.run_pack(pack, pe, runner, dict(fitted or {}))
-    return BM.stamp(dict(out, spec_parameters=vals, arm_engines=_arm_records(pack, runner, vals)), pe)
+    vals, post = values(spec), posterior_point(spec)
+    # v2-posterior-point: with a posterior, the arms run at its chosen point (fitted columns as fit-mode candidates)
+    fk = {q.name for q in pe.parameters() if q.kind == "fitted"}
+    base = {k: v for k, v in dict(vals, **post).items() if k not in fk}
+    runner = BM.Runner(pack, pe, workers, seeds, base_params=base, evidence=ev,      # the evidence it validated
+                       mode="fit" if set(post) & fk else "score")
+    fit = {k: v for k, v in (fitted or {}).items() if k not in post}   # a caller never overrides a column (Codex r4)
+    out = BM.run_pack(pack, pe, runner, dict(fit, **{k: v for k, v in post.items() if k in fk}))
+    return BM.stamp(dict(out, spec_parameters=vals, posterior_point=post, arm_engines=_arm_records(pack, runner, base)),
+                    pe)
+
+
+def posterior_point(spec) -> dict:
+    """A declared net-effect posterior's verified chosen point ({} without one): the arms' point (v2-posterior-point)."""
+    if "net_effect_posterior" not in ((_raw(spec).get("uncertainty") or {})):
+        return {}
+    from toolkit.analysis import uncertainty as UQ
+    ne = UQ.net_effect_sample(spec, spec.engine())
+    return {} if ne is None else UQ.posterior_point(spec, ne, {})
 
 
 def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, workers: int = 1, seeds=None,
@@ -655,6 +696,7 @@ def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, 
     path = os.path.join(run_dir, SPEC_BENCH)
     rec = {"producer": RECORD_PRODUCER, "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
            "file": SPEC_BENCH, "sha256": _sha(path), "spec_sha256": spec.sha256, "spec_parameters": values(spec),
+           "posterior_point": doc["posterior_point"],
            "pack_sha256": __import__("hashlib").sha256(json.dumps(pack, sort_keys=True, default=str).encode()).hexdigest(),
            "engine_identity": engine_identity(spec.engine()), "config_sha256": _config_sha(spec.engine()),
            "benchmarks": doc["arm_engines"]}
@@ -689,6 +731,9 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
     if set(sp) != set(vals) or any(not _isnum(sp[k]) or abs(float(sp[k]) - vals[k]) > 1e-12 * max(1.0, abs(vals[k]))
                                    for k in vals):
         return [], f"the arms were computed at {sp}, not at this spec's values {vals}; {how}"
+    if (rec.get("posterior_point") or {}) != posterior_point(spec):      # exact: the same file's chosen point
+        return [], (f"the arms were computed at {rec.get('posterior_point')}, not at the net-effect posterior's chosen "
+                    f"point {posterior_point(spec)}; {how}")
     if rec.get("engine_identity") != engine_identity(engine):
         return [], f"the arms were computed for another engine identity or code than the run's; {how}"
     if rec.get("config_sha256") is None or rec["config_sha256"] != _config_sha(engine):
@@ -710,6 +755,8 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
     if bench_id is not None and bench_id not in bms:
         return [], f"benchmark {bench_id} has no arm record in {SPEC_BENCH_RECORD}; {how}"
     doc = yaml.safe_load(open(p, encoding="utf-8")) or {}
+    if (doc.get("posterior_point") or {}) != posterior_point(spec):     # the file's own point too (Codex r4)
+        return [], f"{SPEC_BENCH} holds arms at {doc.get('posterior_point')}, not at the chosen point; {how}"
     out = list(doc.get("benchmarks") or [])
     from toolkit.engines.benchmark_sources import load_evidence
     ev = load_evidence(engine, rows=out, partial=True)   # S1-2b: the engine's own pack (a toy may have none)
@@ -1346,7 +1393,7 @@ def _self_test() -> int:
             md = signoff.sheet(d)
             ok("## Engine parameter values set by the spec" in md and "HIGH" in md and "base" in md
                and "0.4" in md and "0.6" in md and WHY in md and SRC in md
-               and md.count("HIGH") == 1,
+               and md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0].count("HIGH") == 1,
                "EP20 the sign-off sheet lists each spec value with its source and reason, and a HIGH note for the one "
                "outside the card's range")
             R = RUN.run(d, log=q, compute_kw={"max_workers": 2})

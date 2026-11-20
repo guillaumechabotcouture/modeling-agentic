@@ -1,0 +1,181 @@
+# World-model trial template (trachoma_mda_frequency, batch 2): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A trachoma programme
+  has US$1.5 million for azithromycin mass drug administration in 2026-2027 across 24 districts. For each district
+  choose one option: none; ANNUAL (one round a year, US$0.60 per person per round); BIANNUAL (two rounds a year,
+  US$0.60 per person per round). Input file: units.csv (population, prevalence of ocular Chlamydia trachomatis infection
+  in children, TF prevalence in children aged 1-9, household water access). Choose the options that maximise ocular
+  infection person-years averted over 2026-2027 within the budget, report the total with a 95% uncertainty interval
+  and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - annual
+    - biannual
+    outcome: ocular_infection
+    mode: trial_priors
+    outcomes:
+      ocular_infection:
+        baseline_source: synthetic PCR surveys of ocular chlamydia in children, before any MDA
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      annual:
+        ocular_infection:
+          rr: 0.35
+          range:
+          - 0.2
+          - 0.5
+          dist: triangular
+          measure: rate_ratio
+          source: 'community-randomised trials of annual mass azithromycin in hyperendemic trachoma (Gebre T et
+            al. Comparison of annual versus twice-yearly mass azithromycin treatment for hyperendemic trachoma in
+            Ethiopia: a cluster-randomised trial. Lancet 2012;379:143-151)'
+          verified: false
+      biannual:
+        ocular_infection:
+          rr: 0.25
+          range:
+          - 0.12
+          - 0.42
+          dist: triangular
+          measure: rate_ratio
+          source: 'twice-yearly arms of the same trials: lower infection, not significantly so (Gebre T et al. Lancet
+            2012;379:143-151; Melese M et al. Comparison of annual and biannual mass antibiotic administration for
+            elimination of infectious trachoma. JAMA 2008;299:778-784)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        ocular_infection: inc
+options:
+  populations:
+    total: pop
+  components:
+    annual:
+      group: mda
+    biannual:
+      group: mda
+  packages:
+    none: []
+    annual:
+    - annual
+    biannual:
+    - biannual
+  engine_map:
+    annual:
+      annual: 1
+    biannual:
+      biannual: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: annual_cost
+    component: annual
+    value: 1.2
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - annual
+  - id: biannual_cost
+    component: biannual
+    value: 2.4
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - biannual
+objective:
+  outcome: ocular_infection
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 1500000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- ocular_infection
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - pop
+    - tf_prevalence
+    - water_access
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: ocular_infection_averted
+  headline:
+    name: total_ocular_infection_averted
+    outcome: ocular_infection

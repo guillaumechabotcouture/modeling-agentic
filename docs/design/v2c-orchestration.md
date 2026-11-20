@@ -52,7 +52,7 @@ so `--resume` continues from the last completed state.
 | ANALYZE | S1 runner: the stale steps only | ok → CRITIQUE; failed → FINAL `run_failed` |
 | CRITIQUE | tasks: domain and red-team critics write `critique_*.yaml` for the round (presentation is its own state) | → GATE |
 | GATE | today's gate (§2.1), pre-write or post-write | by action, table below |
-| FIX_LOOP | §5 | → CRITIQUE (round + 1) |
+| FIX_LOOP | §5 | → CRITIQUE (round + 1); → OWNER_DECISION when a finding's remedy is an owner amendment; → WRITE when only write-up findings remain and a draft exists (F6 run 3) |
 | OWNER_DECISION | Phase 49 β AWAIT_OWNER: waits for `scope_signoff.json` | answered → GATE; not yet → pause `awaiting_scope_signoff` |
 | WRITE | task `write` → `manuscript.md`; harness renders `report.md` with the numbers from artifacts | → PRESENTATION |
 | PRESENTATION | task: presentation critic on the draft | → GATE (post-write) |
@@ -344,3 +344,119 @@ It goes back up to MEDIUM or HIGH only after both of these:
 - its false-positive classes are exempted structurally (section and figure numbers, citations, pasted artifact text,
   identifiers, threshold levels, data ranges, unit denominators, versions);
 - a new measurement on the stored runs.
+
+## 14. The world model in every run: PREREGISTER and SCORE (2026-11-15)
+
+Owner, 2026-11-15: "we need to be using the world model, that's the whole point of building it". F6 pre-registered
+its beliefs by hand (`scripts/decision_beliefs.py`). Two harness states now do the same for every v2 run, with the
+same functions (`agents/world_model_stage.py`). Nothing in the analysis reads what they write.
+
+**States.** `ENGINE_CHOICE -> PREREGISTER -> CONFIGURE -> ANALYZE -> SCORE -> CRITIQUE`.
+- PREREGISTER comes after the engine choice, because the seed reasons from the signed spec and the engine's card. It
+  comes before CONFIGURE, which runs the engine batch.
+- Only the ENGINE_CHOICE cross-check (two engines, eight units) runs earlier, and the seed cannot read it.
+- The fix loop rebuilds without passing through ANALYZE. So before each CRITIQUE and before WRITE, the harness scores
+  again whenever the scored files have changed.
+- Both states have a FINAL edge (for the resume precondition check) and are in `POST_CHOICE_STATES`. Older runs
+  (`world_model_stages: false`) skip them.
+
+**PREREGISTER.** The topics come from the signed spec:
+- each decision test: does it change the plan;
+- each plan variant: does it give up more than a hundredth of the unconstrained optimum;
+- the departure from the comparator package;
+- value of information, unless the spec switches it off;
+- each component: the share of units whose package includes it, split at a tenth and at a half.
+
+Each topic has fixed claims in words. The seed (`SdkTasks.world_model_seed`, one session in `world_model/seed/`)
+writes one belief per topic with exactly those claims, and sets the weights, basis, `decides` and reasons.
+`belief_table.decision_seed_problems` refuses anything else, with one repair. The harness then writes the outcome map:
+per belief, the output, the field and one rule per claim.
+- The context is `decision_beliefs.decision_context`, now parameterised by the run's topics, help, outputs and claims.
+- Topics beyond 30 are recorded as dropped. An estimates analysis is skipped (declared).
+- Writes: `world_model/seed/`, canonical `world_model_seed.yaml` and `outcome_map.yaml`, and `preregistration.json`
+  (status, topics, binding — spec sha256, engine and code commit — the publish check, the anchor).
+- `run_state.json` gets `world_model` and the journal entry `PREREGISTER:seed`.
+
+**Licensed or local-only inputs.** Every run's local inputs are treated as licensed.
+- *Masking.* After `decision_context`'s masking, `strict_mask` turns every digit-bearing token, in keys and values,
+  into `<value>`, unless it is a run identifier or a calendar year.
+- *Checking the input.* The whole serialised input is checked again (`input_leaks`, `licensed_problems`). If any
+  number is left, no seed runs.
+- *Reading.* The read guard refuses the run the seed belongs to (the nearest ancestor holding `run_state.json`), even
+  when that run sits under the repository's readable `docs/` or `.claude/`.
+- *Publishing.* Before a push, `publish_problems` checks the canonical files. It applies the strict schema, and the
+  digit allowlist, extended only by the run's identifiers from the signed spec. It also scans every number in the
+  run's `data/`, spec and settings. The decision id and spec tag are written in letters, so they never match an
+  input number.
+
+A refusal pushes nothing. Otherwise the files go to `trials/decisions/<decision_id>/` and are published with
+`GitAnchor` on `wm-trials`, with `GIT_TERMINAL_PROMPT=0` so that a credential prompt fails at once. The anchor time
+comes from `reachable_at`.
+
+**No remote.** With no `origin`, or with a failed push, fetch or reflog step, `preregistration.json` records
+`anchor: {kind: local_only, preregistered: false, sha256, at, why}`. The run never blocks, and its section says
+"NOT pre-registered".
+
+**SCORE** is code (`evaluate`).
+- Shares are taken over the units of `analysis/point.yaml`'s plan. A unit gets a component when its `+`-joined
+  package id contains it. The spike backend falls back to `analysis/allocation.csv`.
+- A test that was NOT_RUN, a variant that was not solved, a missing file, or no computed value-of-information input
+  is undecided.
+- Every score starts from the anchored seed.
+
+Writes:
+- `score.json`: per belief, the held claim, outcome, p, surprise (-log2 of the held claim's weight) and the leading
+  claim's binary surprise; also `belief_table.scores`, the categorical log score, `calibration`, the hashes of the
+  analysis files and the standing;
+- `belief_table.yaml`: `update` applied, with `prior_weights` kept;
+- `world_model.md`.
+
+A score is "pre-registered" (`standing`) only when four conditions hold:
+- the anchor is remote;
+- the scored files are the anchored bytes;
+- the anchor precedes every scored output and the engine rows;
+- neither the spec nor the engine has changed. A back-edge keeps the first registration but sets
+  `outside_registration`.
+
+**Where to look.** `world_model.md` lists the decision-relevant beliefs the outputs refuted (most surprising first),
+and those nearest p = 0.5 after the update.
+- Both critics are told to read it first. For each refuted belief, they say whether the engine, an input or the
+  belief is wrong.
+- `render_report` appends it after the writer's span. The report-number checks read only `manuscript.md`, so they
+  are unaffected.
+- The writer may refer to it in words, never by its numbers.
+
+**Cost.** One seed session, plus one repair, each capped at $2 (or half the run's allowance, if smaller). The journal
+is the one accounting owner.
+- An interrupted attempt is charged its allowance, and the next attempt gets a fresh `SpendLedger`.
+- A completed seed is reused only when its sha256 matches.
+- With no allowance left, the stage is skipped.
+
+**Fail soft.** `Machine._world_model` wraps every call, so neither state can raise, end the run or change the
+analysis. Every failure is recorded with its reason. A test compares every analysis file with and without the
+stages, byte for byte, after normalising wall-clock fields and worker row order.
+
+**After the Codex code review.** Ten findings were raised; all ten were fixed.
+- Scoring reads the topics and package definitions frozen in `world_model/registration.json`. Named packages are
+  scored by their components.
+- `standing` re-checks the binding at every score. Any engine rows reused from an earlier batch (`reused`,
+  `already_done`) cannot be dated, so they make a score not pre-registered.
+- A seed that was killed after it was written is kept on resume, and is not bought again. A ledger failure is
+  charged the whole cap.
+- A failed re-score withdraws the earlier section.
+- The read guard refuses every run, not only the seed's own run, and refuses searches that reach one.
+- `world_model/` is reserved from deliverables and from the tasks' write guard.
+
+**After the narrow re-review (1 P1, 5 P2s).**
+- `world_model` itself is reserved, as well as everything under it.
+- The charge and the journal's completion are recorded together, after every read that can fail.
+- A seed killed before promotion is promoted on resume.
+- The registration's hash is carried in the anchored outcome map and checked by `standing`.
+- The refresh key covers engine rows, reuse summaries, their timestamps and the standing.
+- v1 runs, which are marked by `metadata.json`, are unreadable to the seed.
+
+Each fix has a test: W8c, W8d (this one reproduced the $4.25 double charge first), W17, W18, W19 and W20.
+
+**Not computed yet (declared).**
+- The guard (v2-progressive-steps §5) covers sweeps only. As in F6, no decision-run belief is set aside.
+- A seed that types a number, such as a citation volume, is anchored locally rather than repaired.

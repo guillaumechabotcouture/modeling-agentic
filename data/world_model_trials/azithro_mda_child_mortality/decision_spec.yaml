@@ -1,0 +1,180 @@
+# World-model trial template (azithro_mda_child_mortality, batch 3): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A programme considers
+  biannual azithromycin mass distribution in 24 high-mortality districts in 2026-2027, aware that broad distribution
+  selects for macrolide resistance. For each district choose one option: none; ALL (all children aged 1-59 months,
+  US$2.00 per child under five per year); INFANTS (infants aged 1-11 months only, a smaller share of the doses and
+  of the selection pressure, US$0.60 per child under five per year). The budget is US$3 million. Input file: units.csv
+  (children under five, deaths per child-year under five, a synthetic macrolide-resistance surveillance index).
+  Choose the options that maximise child deaths averted within the budget, report the total with a 95% uncertainty
+  interval, and state the rule; say what the resistance index should change in it.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - all
+    - infants
+    outcome: child_deaths
+    mode: trial_priors
+    outcomes:
+      child_deaths:
+        baseline_source: synthetic demographic surveillance of under-five deaths, 2023-2025
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      all:
+        child_deaths:
+          rr: 0.865
+          range:
+          - 0.8
+          - 0.933
+          dist: triangular
+          measure: rate_ratio
+          source: biannual azithromycin distribution to children aged 1-59 months reduced all-cause mortality by
+            13.5% (95% CI 6.7-19.8), most in infants aged 1-5 months (24.9%) (Keenan JD, Bailey RL, West SK et al.
+            Azithromycin to reduce childhood mortality in sub-Saharan Africa. N Engl J Med 2018;378:1583-1592)
+          verified: false
+      infants:
+        child_deaths:
+          rr: 0.9
+          range:
+          - 0.84
+          - 0.95
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: infants account for about half of deaths from 1 to 59 months and their mortality fell
+            by about a quarter: 1 - 0.5 x 0.249 = 0.88 (Keenan JD et al. N Engl J Med 2018;378:1583-1592)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        child_deaths: inc
+options:
+  populations:
+    total: pop
+  components:
+    all:
+      group: target
+    infants:
+      group: target
+  packages:
+    none: []
+    all:
+    - all
+    infants:
+    - infants
+  engine_map:
+    all:
+      all: 1
+    infants:
+      infants: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: all_cost
+    component: all
+    value: 2.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - all
+  - id: infants_cost
+    component: infants
+    value: 0.6
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - infants
+objective:
+  outcome: child_deaths
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 3000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- child_deaths
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - resistance_index
+    - pop
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: child_deaths_averted
+  headline:
+    name: total_child_deaths_averted
+    outcome: child_deaths

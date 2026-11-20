@@ -23,6 +23,12 @@
     python cloud/run_cluster.py <config.py> reuse-check <run_dir> [--expect-all]
                                                               # how many stored engine rows the code this launch
                                                               # would ship reuses (local, no cloud call)
+    python cloud/run_cluster.py <config.py> checkpoint [--label L]
+                                                              # the latest checkpoint of the latest launch, sha256
+                                                              # verified, into <out_dir>/<label>/checkpoint/
+    python cloud/run_cluster.py <config.py> checkpoint-now [--timeout-s 300] [--invocation T] [--launch-id L]
+                                                              # one checkpoint from each running run, awaited in
+                                                              # storage under one deadline (recorded cluster id)
     python cloud/run_cluster.py <config.py> shutdown          # cluster, overflow pool and keeper, by hand
     python cloud/run_cluster.py <config.py> report-cost [--ledger PATH]... [--start ISO] [--end ISO]
                                                               # Coiled credits per useful core-hour (billing API only)
@@ -42,6 +48,42 @@ If an upload fails, the agent VM holds the results on disk and stays busy
 (up to 24 h) until `collect` fetches them, after which `collect` shuts the
 cluster down. Nothing waits on a laptop: E7 attempt 7 sat idle 9.5 h after
 its results were stored because the launcher waited for a manual collect.
+
+Checkpoints (F6, 2026-11-11: a v2 preview stopped at its credit cap after 3 h had stored nothing, because main.py
+stores the run only when it ends). While main.py runs, the agent VM uploads a tarball of the run dir (runs/<RUN>/...
+and run.log; never _truth/, credential files or links; API keys redacted; the run dir reached from the work dir and
+each file opened once, no link followed at any component, and what is scanned is what is archived) every
+`checkpoint_minutes` (default 15, 0 off). Each checkpoint is a
+new generation, written once: outputs/<storage_prefix>/launch_<id>/checkpoint_<label>_g<N>.tar.gz and its record
+checkpoint_<label>_g<N>.json (time, size, sha256, and, read from the archive, run_state state and round and the
+cached engine batches and rows); then the pointer checkpoint_<label>.json names it and its `previous`. Generations
+are numbered after every one already stored for the launch and label (with no pointer, the newest complete one is
+the base, for the uploader and `checkpoint` alike, its sha256 hashed as it streams); a capture during which
+run_state.json changed is discarded and retried once; one whose pointer upload was attempted is never deleted, and
+only those older than both the pointer's
+are deleted, after it is published. One at a time (a checkpoint due while the previous one uploads is skipped); one
+needs free space of 2.2 x (largest file + run dir, run.log counted as a file) + 2 GB; a failure is logged on the VM
+(/tmp/ab/<label>/.checkpoint/checkpoint.log), leaves no local archive, and never stops the run. `collect` says when
+a label has only a checkpoint. `checkpoint-now` files a request on every agent VM at once (each returns at once; a
+request survives a skip or failure and is retried within 30 s) and waits in storage, under one deadline that bounds
+every call, for a generation carrying it or started after it. Resuming from one:
+  1. `run_cluster.py <cfg> checkpoint [--label L]`: <out_dir>/<L>/checkpoint/runs/<RUN>/ and checkpoint.json
+     (the pointer's generation, or the previous one when it does not match its sha256; refused when neither does).
+  2. Put the run dir into the launch tree at runs/<RUN> and commit it there (`git add -f runs/<RUN>`: runs/ is
+     gitignored, and a launch ships `git archive HEAD`); a resume config sets require_main=False and
+     flags=("--resume", "runs/<RUN>").
+  3. `run_cluster.py <resume cfg> reuse-check <out_dir>/<L>/checkpoint/runs/<RUN> --expect-all`: the shipped code
+     reuses every stored engine row (scripts/compute.py reuse path: `<out>.summary.json` rows and the
+     `<out>.partial.jsonl` journal of a batch the stop interrupted; a results file whose sha256 is not the one
+     its summary records, as in a snapshot taken between the two writes, is recomputed); then launch.
+  Engine rows survive the round trip only where the fingerprint does: a file over 64 MB under models/ or data/ is
+  fingerprinted by size and mtime (ns), which neither the tarball (whole seconds) nor git archive keeps, and a
+  symlink there is not archived: either one changes every batch's fingerprint. reuse-check (step 3) shows it.
+Before any paid launch, fresh or resumed, run the resume smoke on the tree the launch ships (`git archive HEAD`
+extracted): `python3 scripts/resume_smoke.py <tree>`. It interrupts toy v2 runs at the two resumable ANALYZE states
+(step timeout, batch killed) and resumes them with that tree's code, and stops a toy batch at its compute allowance and
+reruns it (a cap stop is not resumable by --resume; a relaunch reruns the batch). It exits 1 unless every kept
+engine row is reused, none is recomputed and the lead's sign-off still binds the spec. Local, toy engines only, about a minute.
 
 Exit codes of `launch` (and `relaunch`), for a watchdog. Once a run is submitted the launch is never
 reported as failed, because the run keeps going whatever happens to this process (F5 resume launch,
@@ -153,8 +195,20 @@ class RunConfig:
     # Coiled's cluster_timeout (coiled.Cluster(cluster_timeout=...), "40 minutes"): a cluster is shut down that long
     # after it starts, busy or not. "" for none (a real run's length is not known in advance)
     cluster_timeout: str = ""
+    # F6 Stage 2 (2026-11-11: $106 spent of a $100 budget): the most this launch may spend, required to launch;
+    # `launch` refuses unless the owner-signed budget of `budget_scope` covers the scope's spend plus it
+    # (cloud/budget.py). budget_scope defaults to the scope whose prefix `name` has (cloud/budget_scopes.yaml).
+    cap_usd: float | None = None
+    budget_scope: str = ""     # cloud/launch_watch.py never watches to a higher cap than cap_usd
+    # F6 run checkpoints: while main.py runs, the agent VM uploads its run dir every checkpoint_minutes (0: off)
+    checkpoint_minutes: float = 15.0
 
     def __post_init__(self):
+        if self.cap_usd is not None and (isinstance(self.cap_usd, bool) or not isinstance(self.cap_usd, (int, float))
+                                         or not self.cap_usd > 0 or self.cap_usd == float("inf")):
+            raise ValueError(f"cap_usd must be a positive number of USD, not {self.cap_usd!r}")
+        if not self.budget_scope:
+            self.budget_scope = _default_scope(self.name)
         self.storage_prefix = self.storage_prefix or f"runs/{self.name}"
         self.out_dir = self.out_dir or os.path.expanduser(f"~/modeling-agentic-keep/{self.name}")
         self.labels, self.flags, self.required_files = tuple(self.labels), tuple(self.flags), tuple(self.required_files)
@@ -172,6 +226,8 @@ class RunConfig:
             raise ValueError("set the pipeline with pipeline='v1' or 'v2', not flags: the launcher passes it to main.py")
         for f in ("scale_down_after", "adapt_interval", "overflow_hold") + (("target_duration",) if self.target_duration else ()):
             seconds(getattr(self, f))   # fail at load, not on the keeper VM
+        if not self.checkpoint_minutes >= 0:
+            raise ValueError("checkpoint_minutes must be 0 (off) or positive")
         if seconds(self.adapt_interval) <= 0:
             raise ValueError("adapt_interval must be positive")
         if self.overflow_max and not self.overflow_vm_types:
@@ -222,6 +278,61 @@ def adapt_options(cfg, base: dict) -> dict:
     out = {**base, "interval": f"{iv:g}s", "wait_count": max(1, math.ceil(seconds(cfg.scale_down_after) / iv))}
     if cfg.target_duration:
         out["target_duration"] = cfg.target_duration
+    return out
+
+
+def _default_scope(name) -> str:
+    """The budget scope whose prefix `name` has, or "" (then `launch` refuses)."""
+    try:
+        import budget
+        return budget.scope_for_name(name) or ""
+    except Exception:  # noqa: BLE001 -- an unreadable scopes file: no scope, and the launch refuses
+        return ""
+
+
+def budget_guard(cfg, reserve=True, inv=None) -> None:
+    """Refuse (SystemExit) unless cfg.cap_usd is set and the owner-signed budget of cfg.budget_scope covers the
+    scope's spend plus it (cloud/budget.py); with `reserve`, the cap is reserved until a cluster of the name appears.
+    Called by every path that creates or keeps paid work: launch, keeper (start_helpers), relaunch."""
+    import budget
+    if cfg.cap_usd is None:
+        raise SystemExit(f"{cfg.name}: the config sets no cap_usd: refusing (a launch states the most it may spend)")
+    if not cfg.budget_scope:
+        raise SystemExit(f"{cfg.name} matches no budget scope in cloud/budget_scopes.yaml: refusing")
+    bind = {"invocation": inv, "clusters_file": cfg.clusters_file} if reserve and inv else {}   # binds the reservation
+    # warn_over (owner decision, 2026-11-17): a launch over the budget is admitted with a spend alert, never refused
+    # for dollars; the other refusals (no cap, no scope, an unsigned budget, a name outside its prefixes) stand.
+    ok, why = budget.launch_budget_ok(cfg.budget_scope, cfg.cap_usd, name=cfg.name, reserve=reserve, warn_over=True,
+                                      **bind)
+    if not ok:
+        raise SystemExit(f"{cfg.name}: the budget refuses this launch: {why}")
+    print(f"budget: {why}", flush=True)
+
+
+def vm_request(cfg, compute=None) -> dict:
+    """{role: worker_vm_types and scheduler_vm_types} for each cluster this config can construct ("run" when
+    `compute` is given, "overflow" when it has an overflow pool, "keeper"), every type priced in cloud/vm_prices.yaml.
+    Coiled is given these lists, never cpu/memory, so what the budget prices is what it gets (2026-11-13: a cpu/memory
+    request got Standard_F8s_v2, unpriced, refused only once the cluster existed). A configured type the table lacks
+    (compute.WORKER_VM_TYPES, overflow_vm_types) is pinned as configured with a printed WARNING, never refused (owner,
+    2026-11-13: spend controls fail soft); budget.py counts it at its fallback bound."""
+    import budget
+    try:
+        sched = budget.scheduler_vm_types()
+        out = {"keeper": {"worker_vm_types": budget.vm_types_for(2, "8 GiB"), "scheduler_vm_types": sched}}
+    except budget.BudgetError as e:     # the tracked table has no 2-vCPU, 8 GiB type: a broken table, not a request
+        raise SystemExit(f"{cfg.name}: refusing before any cluster is created: {e}") from None
+    roles = {}
+    if cfg.keeper and cfg.overflow_max:
+        roles["overflow"] = (list(cfg.overflow_vm_types), "overflow_vm_types")
+    if compute is not None:
+        roles["run"] = (list(compute.WORKER_VM_TYPES), "compute.WORKER_VM_TYPES")
+    for role, (types, what) in roles.items():
+        missing = budget.unpriced(types)
+        if missing:
+            print(f"WARNING: {cfg.name}: {what} {missing} not in cloud/vm_prices.yaml: launching with them, counted at "
+                  f"the fallback bound; add them to the table", flush=True)
+        out[role] = {"worker_vm_types": types, "scheduler_vm_types": sched}
     return out
 
 
@@ -322,6 +433,162 @@ def _archive_member(code: bytes, name: str) -> bytes | None:
             return t.extractfile(m).read() if m else None
     except (tarfile.TarError, OSError):
         return None
+
+
+SHEET_SOURCES_MARK = "<!-- signoff-sheet-sources: "   # toolkit/spec/signoff.py SHEET_SOURCES, the sheet's last line
+
+
+def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
+    """For a resumed run (--resume <run dir>) still at SIGN in the archive that ships: the sign-off sheet must
+    record the sha256 of the shipped decision_spec.yaml and data/derivations_record.json ("none" when absent),
+    as toolkit/spec/signoff.py write_sheet wrote them; the signer refuses otherwise, so the run would stop at
+    SIGN after the cluster is paid for (2026-11-12 canary). Fail closed: a missing or unparsable sheet is a
+    problem. A run past SIGN, a launch that resumes no run, or a v1 launch (no run_state.json, no sheet) has
+    nothing to check here. `--resume <dir>` and `--resume=<dir>` are both read, the dir normalised as main.py
+    resolves it (Codex review of #207). F6 evidence dossier: when the spec names one (`evidence.dossier`), the sheet
+    must record the shipped dossier's sha256 too; a run past SIGN must ship the dossier its sign-off record hashed
+    (an edit after signing makes the signature stale)."""
+    import hashlib
+    if pipeline != "v2":
+        return []
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)       # as main.py's parser: abbreviations, the last value wins
+    ap.add_argument("--resume")
+    try:
+        got, _ = ap.parse_known_args([str(f) for f in (flags or ())])
+    except SystemExit:
+        return ["the launch flags' --resume value cannot be read"]
+    runs = [got.resume] if got.resume else []
+    out = []
+    for rel in runs:
+        rel = os.path.normpath(rel).replace(os.sep, "/")
+        raw = _archive_member(code, f"{rel}/run_state.json")
+        try:
+            st = json.loads(raw.decode()) if raw is not None else None
+            state = st.get("state") if isinstance(st, dict) else None
+        except (ValueError, UnicodeDecodeError):
+            state = None
+        if raw is None or state is None:
+            out.append(f"{rel}: run_state.json is missing or unreadable in the code to launch")
+            continue
+        if state in PRE_SIGN_STATES:                        # a draft: nothing is signed yet
+            continue
+        if st.get("signoff") == "none":     # nobody signs: the same rule as the runtime gate (coverage, no record)
+            out += [f"{rel}: {p}" for p in _preconditions(code, rel, "unsigned")]
+            continue
+        if state != "SIGN":
+            out += _signed_run_problems(code, rel)
+            continue
+        spec = _archive_member(code, f"{rel}/decision_spec.yaml")
+        sheet = _archive_member(code, f"{rel}/decision_spec.signoff_sheet.md")
+        rec = _archive_member(code, f"{rel}/data/derivations_record.json")
+        regen = f"regenerate it: python toolkit/spec/signoff.py sheet {rel} --write"
+        src = None
+        for line in reversed((sheet or b"").decode("utf-8", "replace").splitlines()):
+            if line.startswith(SHEET_SOURCES_MARK) and line.endswith(" -->"):
+                try:
+                    src = json.loads(line[len(SHEET_SOURCES_MARK):-4])
+                except ValueError:
+                    src = None
+                break
+        if spec is None:
+            out.append(f"{rel}: decision_spec.yaml is missing in the code to launch")
+        elif not isinstance(src, dict):
+            out.append(f"{rel}: at SIGN with no sign-off sheet recording its sources; {regen}")
+        elif src.get("spec_sha256") != hashlib.sha256(spec).hexdigest():
+            out.append(f"{rel}: the sign-off sheet was generated from another decision_spec.yaml "
+                       f"({str(src.get('spec_sha256'))[:12]}, shipped {hashlib.sha256(spec).hexdigest()[:12]}); {regen}")
+        elif src.get("derivations_sha256") != (hashlib.sha256(rec).hexdigest() if rec is not None else "none"):
+            out.append(f"{rel}: the sign-off sheet was generated from another data/derivations_record.json; {regen}")
+        else:       # F6 (#218): what signing will check (coverage too), so an unsignable run never starts a cluster
+            out += [f"{rel}: {p}" for p in _preconditions(code, rel, "sign")]
+    return out
+
+
+TEST_ENGINE_REFS: tuple = ()      # self-tests only (set in-process, never from the environment): toy engines to enable
+_CHECKER = r"""
+import json, os, sys
+tree, rel, signer, refs = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+sys.path[:0] = [tree, os.path.join(tree, "scripts")]
+if refs:
+    from toolkit import import_guard as G
+    G.allow_test_refs("engine", refs)
+from toolkit.spec import preconditions as PC
+print("PRECONDITIONS " + json.dumps(PC.problems(os.path.join(tree, rel), None, None, mode=signer)))
+"""
+
+
+def _preconditions(code: bytes, rel: str, signer: str) -> list[str]:
+    """The run's registered preconditions (toolkit/spec/preconditions.py) checked with the code the launch ships, not
+    the launcher's checkout (#218 review round 4): the archive is extracted and its own toolkit checks its own run
+    dir, engine declarations, cards, priors and fitted values, in a child process. signer "sign" for a run at SIGN
+    (what the signer will check), "launch" past it (the sign-off record compared), "unsigned" for signoff none.
+    Fail closed: an archive without the checks, or a checker that does not answer, is a problem."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            with tarfile.open(fileobj=io.BytesIO(code), mode="r:gz") as t:
+                t.extractall(tmp, filter="data")
+        except (tarfile.TarError, OSError, ValueError) as e:
+            return [f"the code to launch cannot be unpacked to check its preconditions ({type(e).__name__}: {e})"]
+        if not os.path.isfile(os.path.join(tmp, "toolkit", "spec", "preconditions.py")):
+            return ["the code to launch has no toolkit/spec/preconditions.py: its preconditions cannot be checked"]
+        try:
+            r = subprocess.run([sys.executable, "-I", "-c", _CHECKER, tmp, rel, signer,
+                                json.dumps(list(TEST_ENGINE_REFS))], capture_output=True, text=True, timeout=900,
+                               cwd=tmp, env={k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG",
+                                                                                         "OMP_NUM_THREADS",
+                                                                                         "OPENBLAS_NUM_THREADS")})
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return [f"the preconditions check of the code to launch did not finish ({type(e).__name__})"]
+        line = next((x for x in reversed(r.stdout.splitlines()) if x.startswith("PRECONDITIONS ")), None)
+        if line is None:
+            return [f"the preconditions check of the code to launch failed: {(r.stderr or r.stdout)[-400:]}"]
+        try:
+            got = json.loads(line[len("PRECONDITIONS "):])
+        except ValueError:
+            return ["the preconditions check of the code to launch gave an unreadable answer"]
+        return [str(x) for x in got] if isinstance(got, list) else ["the preconditions check gave no list"]
+
+
+SIGNOFF_RECORDS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # toolkit/spec/signoff.py, decision_brief
+
+
+PRE_SIGN_STATES = ("SPEC",)          # agents/stage_machine.py EDGES: the only state before SIGN (a draft)
+
+
+def _signoff_record(code: bytes, rel: str) -> tuple:
+    """(record, sha256 it holds for decision_spec.yaml) from the shipped sign-off records: the spec-only record
+    (toolkit/spec/signoff.py `sha256`, or the stage machine's `spec_sha256`), else the brief's when it hashed the spec;
+    (None, None) when there is none."""
+    for f in SIGNOFF_RECORDS:
+        try:
+            doc = json.loads((_archive_member(code, f"{rel}/{f}") or b"null").decode())
+        except (ValueError, UnicodeDecodeError):
+            doc = None
+        if not isinstance(doc, dict):
+            continue
+        s = (doc.get("sha256") or {}).get("decision_spec.yaml") if isinstance(doc.get("sha256"), dict) else None
+        s = s or doc.get("spec_sha256")
+        if s:
+            return doc, s
+    return None, None
+
+
+def _signed_run_problems(code: bytes, rel: str) -> list[str]:
+    """A run past SIGN: it ships a sign-off record of the spec it ships, and every registered precondition holds on
+    the archive's bytes (toolkit/spec/preconditions.py: for the evidence dossier, the record's spec and dossier sha256,
+    the sheet's, coverage on the engine chosen, recomputed; an empty or partial evidence binding is refused)."""
+    import hashlib
+    spec = _archive_member(code, f"{rel}/decision_spec.yaml")
+    rec, signed = _signoff_record(code, rel)
+    if spec is None or rec is None:
+        return [f"{rel}: past SIGN with no decision_spec.yaml or no sign-off record of it in the code to launch"]
+    if hashlib.sha256(spec).hexdigest() != signed:
+        return [f"{rel}: decision_spec.yaml is not the one signed (edited after its sign-off): the owner amends and "
+                "re-signs the spec before launch"]
+    return [f"{rel}: {p}" for p in _preconditions(code, rel, "launch")]
 
 
 def archive_commit(code: bytes) -> str | None:
@@ -536,7 +803,8 @@ def _submit(cfg, client, label, worker, code, question, keys, launch_id, key=Non
                         cfg.storage_prefix, cfg.storage_account, launch_id, cfg.max_rounds, cfg.max_sessions,
                         workers=[worker], allow_other_workers=False, pure=False, key=key,
                         run_timeout_s=cfg.run_timeout_hours * 3600 if cfg.run_timeout_hours else None,
-                        hold_s=cfg.hold_hours * 3600)
+                        hold_s=cfg.hold_hours * 3600,
+                        checkpoint_s=cfg.checkpoint_minutes * 60 if cfg.checkpoint_minutes else None)
     fire_and_forget(fut)
     return key, fut
 
@@ -723,16 +991,21 @@ def _launch_locked(cfg, inv) -> int:
     question = open(cfg.question_file).read().strip()
     code, commit = code_tarball(cfg)
     pipeline = pipeline_preflight(cfg, code)      # before anything is created or any key is read
+    stale = stale_sheet_problems(code, cfg.flags, pipeline)   # a run that would stop at SIGN once paid for
+    if stale:
+        raise SystemExit("refusing: " + "; ".join(stale))
     print(f"pipeline {pipeline} (declared by the config, confirmed by the shipped main.py) @ {commit}", flush=True)
-    keys = read_keys()
     compute = _compute(cfg)
+    vm = vm_request(cfg, compute)                 # every VM type priced, before the budget reserves anything
+    budget_guard(cfg, inv=inv)                    # before any key is read or cluster created
+    keys = read_keys()
     n0 = len(cfg.labels) + cfg.compute_start
     cluster = _construct(cfg, cfg.name, inv, lambda: coiled.Cluster(   # this invocation's, or refused unrecorded
-        name=cfg.name, workspace=WORKSPACE, n_workers=n0, worker_vm_types=compute.WORKER_VM_TYPES,
-        worker_disk_size=100, idle_timeout=cfg.idle_timeout, worker_options=compute.WORKER_OPTIONS,
+        name=cfg.name, workspace=WORKSPACE, n_workers=n0, worker_vm_types=vm["run"]["worker_vm_types"],
+        scheduler_vm_types=vm["run"]["scheduler_vm_types"], worker_disk_size=100, idle_timeout=cfg.idle_timeout, worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix,
                  **cfg.compute_env},
-        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, **_lifetime(cfg, inv)))
+        spot_policy="on-demand", shutdown_on_close=False, **_lifetime(cfg, inv)))
     launch_id = time.strftime("%Y%m%d-%H%M%S")
     # S1-8: recorded once the run cluster exists, before any submission or acknowledgement wait; this invocation's
     # record replaces the previous launch's (no cluster of the name was live, and the config lock is held)
@@ -980,6 +1253,9 @@ def keeper_later(cfg) -> int:
                 _stop_id(cfg.keeper_name, keep_k)
                 clusters.pop("keeper", None)
                 keep_k = None
+        if cfg.keeper and ((cfg.overflow_max and keep_o is None) or keep_k is None):
+            vm_request(cfg)                   # every helper VM type priced, before the reservation
+            budget_guard(cfg, inv=clusters.get("invocation"))   # a new overflow pool or keeper is paid: reserved then
         start_helpers(cfg, _compute(cfg), cid, clusters, keep_overflow=keep_o, keep_keeper=keep_k is not None)
         clusters["status"] = "launched"
         write_clusters(cfg, clusters)
@@ -1036,13 +1312,14 @@ def start_overflow(cfg, compute, record=None, inv=None) -> dict:
     here (so it gets this launch's software environment) and scaled by the keeper. Its
     idle timeout outlasts the keeper; the keeper deletes it on exit."""
     import coiled
+    vm = vm_request(cfg)["overflow"]
     _fresh(cfg.overflow_name)
     oc = _construct(cfg, cfg.overflow_name, inv, lambda: coiled.Cluster(
-        name=cfg.overflow_name, workspace=WORKSPACE, n_workers=0, worker_vm_types=list(cfg.overflow_vm_types),
-        worker_disk_size=100, idle_timeout=f"{int(cfg.keeper_hours * 60) + 30} minutes",
+        name=cfg.overflow_name, workspace=WORKSPACE, n_workers=0, worker_vm_types=vm["worker_vm_types"],
+        scheduler_vm_types=vm["scheduler_vm_types"], worker_disk_size=100, idle_timeout=f"{int(cfg.keeper_hours * 60) + 30} minutes",
         worker_options=compute.WORKER_OPTIONS,
         environ={"MA_STORAGE_ACCOUNT": cfg.storage_account, "MA_STORAGE_PREFIX": cfg.storage_prefix, **cfg.compute_env},
-        spot_policy="on-demand", scheduler_cpu=2, shutdown_on_close=False, wait_for_workers=False,
+        spot_policy="on-demand", shutdown_on_close=False, wait_for_workers=False,
         **_lifetime(cfg, inv)))
     if record:
         record("overflow", cfg.overflow_name, oc.cluster_id)     # before the upload, which can fail (Codex P2-5)
@@ -1065,10 +1342,11 @@ def start_keeper(cfg, adapt_opts, cluster_id, overflow=None, record=None, inv=No
     lo, hi = len(cfg.labels) + cfg.compute_start, len(cfg.labels) + cfg.compute_max
     # An earlier launch's keeper (still polling, or stopping) must not be reused:
     # its task would hold the old cluster id and exit, leaving this pool unscaled.
+    vm = vm_request(cfg)["keeper"]
     _fresh(cfg.keeper_name)
     kc = _construct(cfg, cfg.keeper_name, inv, lambda: coiled.Cluster(
-        name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_cpu=2, worker_memory="8 GiB", scheduler_cpu=2,
-        spot_policy="on-demand", idle_timeout="30 minutes", shutdown_on_close=False, **_lifetime(cfg, inv)))
+        name=cfg.keeper_name, workspace=WORKSPACE, n_workers=1, worker_vm_types=vm["worker_vm_types"],
+        scheduler_vm_types=vm["scheduler_vm_types"], spot_policy="on-demand", idle_timeout="30 minutes", shutdown_on_close=False, **_lifetime(cfg, inv)))
     if record:
         record("keeper", cfg.keeper_name, kc.cluster_id)         # before anything that can fail (Codex P2-5)
     c = kc.get_client()
@@ -1261,6 +1539,191 @@ def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = N
     return meta
 
 
+def _download_json(store, blob, account):
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            store.download(blob, os.path.join(td, "r.json"), account)
+            rec = json.load(open(os.path.join(td, "r.json")))
+        except Exception:  # noqa: BLE001 -- none stored (or unreadable)
+            return None
+    return rec if isinstance(rec, dict) else None
+
+
+def checkpoint_record(cfg, store, label, launch_id) -> dict | None:
+    """The pointer of `label`'s checkpoints in launch `launch_id` (the latest complete generation's record), or
+    None."""
+    return _download_json(store, ws.checkpoint_pointer(cfg.storage_prefix, launch_id, label), cfg.storage_account)
+
+
+def fetch_checkpoint(cfg, store, label) -> dict:
+    """`checkpoint`: the latest checkpoint of the latest launch (assignments.json) into <out_dir>/<label>/checkpoint/
+    with its record (checkpoint.json). The pointer names the latest generation; a generation whose tarball does not
+    match its record's sha256 is removed and the previous complete one is tried; none: refused. An earlier copy is
+    moved aside."""
+    launch_id = json.load(open(cfg.state_file))[label]["launch_id"]
+    ptr = checkpoint_record(cfg, store, label, launch_id)
+    if ptr is None:     # Codex round 4: no pointer (lost before the first): the newest complete generation
+        stem = ws.checkpoint_pointer(cfg.storage_prefix, launch_id, label)[:-len(".json")]
+        names = {b["name"] for b in store.list_blobs(stem, cfg.storage_account)}
+        k, _ = ws.newest_complete(store, cfg.storage_prefix, launch_id, label, names, cfg.storage_account,
+                                  lambda b: _download_json(store, b, cfg.storage_account))
+        if k is None:
+            raise SystemExit(f"{label}: no checkpoint stored for launch {launch_id}")
+        print(f"{label}: no pointer; generation {k} is the newest complete one")
+        ptr = {"generation": k, "previous": None}
+    base = os.path.join(cfg.out_dir, label)
+    os.makedirs(base, exist_ok=True)
+    tgz, why = os.path.join(base, "checkpoint.tar.gz"), []
+    for g in [x for x in (ptr.get("generation"), ptr.get("previous")) if x]:
+        tar_b, json_b = ws.checkpoint_blobs(cfg.storage_prefix, launch_id, label, g)
+        rec = _download_json(store, json_b, cfg.storage_account)
+        try:
+            store.download(tar_b, tgz, cfg.storage_account)
+        except Exception as e:  # noqa: BLE001 -- try the previous generation
+            why.append(f"generation {g}: {type(e).__name__}")
+            continue
+        got = ws_sha256(tgz)
+        if rec is None or got != rec.get("sha256"):
+            os.remove(tgz)
+            why.append(f"generation {g}: tarball sha256 {got[:12]} is not its record's "
+                       f"{str((rec or {}).get('sha256'))[:12]}")
+            continue
+        dest = os.path.join(base, "checkpoint")
+        if os.path.exists(dest):
+            os.rename(dest, f"{dest}.before_{int(time.time())}")
+        with tarfile.open(tgz, mode="r:gz") as t:
+            t.extractall(dest, filter="data")
+        json.dump(rec, open(os.path.join(dest, "checkpoint.json"), "w"), indent=1)
+        import copied_run       # F6 run 3: its batch records describe the VM's process, not one running here
+        rroot = _checkpoint_run_root(dest, rec.get("run_dir"))
+        if rroot is not None:
+            copied_run.mark(rroot, f"run_cluster checkpoint {label} generation {g}", rec.get("time_utc"))
+        else:
+            print(f"{label}: WARNING the record's run_dir {rec.get('run_dir')!r} is not one directory of the extraction: "
+                  "its batch records are not marked as copied")
+        note = "" if g == ptr.get("generation") else f" (the previous generation: {'; '.join(why)})"
+        print(f"{label}: checkpoint generation {g} of {rec.get('time_utc')} (state {rec.get('run_state')}, "
+              f"{rec.get('cached_batches')} cached batches, {rec.get('bytes')} bytes, sha256 verified){note} -> "
+              f"{dest}/runs/{rec.get('run_dir')}")
+        return rec
+    raise SystemExit(f"{label}: no checkpoint generation matches its record's sha256 ({'; '.join(why)}); run "
+                     "`checkpoint` again later")
+
+
+def _checkpoint_run_root(dest, name):
+    """The extracted run dir a checkpoint record names: one plain name of a real directory (not a link) directly under
+    <dest>/runs/, or None (Codex review of #256 P1-4: the record is not trusted as a path)."""
+    if not isinstance(name, str) or not name or name in (".", "..") or os.path.basename(name) != name \
+            or os.sep in name or (os.altsep and os.altsep in name):
+        return None
+    p = os.path.join(dest, "runs", name)
+    return p if os.path.isdir(p) and not os.path.islink(p) and not os.path.islink(os.path.join(dest, "runs")) else None
+
+
+def ws_sha256(path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(2**20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _connect_recorded(cfg, cid, lister=None, security_fn=None, client_cls=None):
+    """A plain distributed.Client on the run cluster `cid` (recorded in clusters.json), only while the listing shows
+    that id ready or running; never by name (as ack_probe)."""
+    if lister is None:
+        import coiled
+        lister = lambda: coiled.list_clusters(workspace=WORKSPACE)  # noqa: E731
+    state = next((ws.state_of(c) for c in _items(lister()) if c.get("id") == cid and c.get("name") == cfg.name), None)
+    if state not in ("ready", "running"):
+        raise SystemExit(f"{cfg.name}: the recorded run cluster {cid} is {state or 'not listed'}: refusing")
+    if security_fn is None:
+        def security_fn(cluster_id):
+            from coiled.v2.core import CloudV2
+            with CloudV2() as cloud:
+                return cloud.security(cluster_id, workspace=WORKSPACE)
+    sec, info = security_fn(cid)
+    if client_cls is None:
+        from distributed import Client as client_cls
+    return client_cls(info["address_to_use"], security=sec, timeout="60s")
+
+
+def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=None, store=None, connect=None,
+                   sleep=time.sleep, clock=time.time, poll_s: float = 10.0) -> int:
+    """`checkpoint-now`: one checkpoint of every running label, under one deadline. The run cluster is the id
+    clusters.json records (never by name); a record of another invocation or launch (`invocation`, `launch_id`:
+    launch_watch passes its own) or assignments of another launch are refused. Each label gets a request that
+    returns at once (worker_side.checkpoint_now_side: nothing waits on the worker), then storage is polled for a
+    generation carrying its token or started after it. 0 when every label checkpointed or had finished."""
+    rec, assign = json.load(open(cfg.clusters_file)), json.load(open(cfg.state_file))
+    if invocation and rec.get("invocation") != invocation:
+        raise SystemExit(f"{cfg.name}: clusters.json is invocation {rec.get('invocation')}, not {invocation}: refusing")
+    lid = rec.get("launch_id")
+    if (launch_id and lid != launch_id) or any((assign.get(lb) or {}).get("launch_id") != lid for lb in cfg.labels):
+        raise SystemExit(f"{cfg.name}: clusters.json launch {lid}, asked {launch_id}, assignments "
+                         f"{[(assign.get(lb) or {}).get('launch_id') for lb in cfg.labels]}: refusing")
+    cid = (rec.get("run") or {}).get("id")
+    if cid is None:
+        raise SystemExit(f"{cfg.name}: clusters.json records no run cluster id: refusing")
+    if store is None:
+        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
+        import results_store as store
+    try:   # sent by value: the agent VM's uploaded worker_side may predate this function
+        import cloudpickle
+        cloudpickle.register_pickle_by_value(ws)
+    except ImportError:
+        pass
+    deadline = clock() + timeout_s
+    left = lambda: deadline - clock()  # noqa: E731 -- checked before, and the bound of, every blocking call
+    if left() <= 0:
+        raise SystemExit(f"{cfg.name}: checkpoint-now had no time left (timeout {timeout_s:g} s)")
+    client = _bounded(connect or _connect_recorded, cfg, cid, timeout_s=left())
+    import threading
+    answers, threads, state, reqs = {}, {}, {}, {}
+
+    def ask(label):    # one thread per label, all at once: an unresponsive worker holds up no other label
+        try:
+            answers[label] = _on_worker(client, ws.checkpoint_now_side, label, worker=assign[label]["worker"])
+        except Exception as e:  # noqa: BLE001 -- reported; the caller decides
+            answers[label] = {"state": f"unavailable ({type(e).__name__}: {str(e)[:120]})"}
+    for label in cfg.labels:
+        threads[label] = threading.Thread(target=ask, args=(label,), daemon=True)
+        threads[label].start()
+    for t in threads.values():
+        if left() > 0:
+            t.join(min(0.5, left()))
+    while True:
+        for label in [lb for lb in threads if lb in answers]:
+            threads.pop(label)
+            r = answers[label]
+            state[label] = r.get("state")
+            if r.get("state") == "requested":
+                reqs[label] = r
+        for label in list(reqs):
+            if left() <= 0:
+                break
+            try:
+                p = _bounded(checkpoint_record, cfg, store, label, lid, timeout_s=left()) or {}
+            except TimeoutError:
+                p = {}
+            if reqs[label]["token"] in (p.get("requests") or []) or (p.get("started_epoch") or 0) >= reqs[label]["epoch"]:
+                state[label] = f"checkpointed {ws.checkpoint_pointer(cfg.storage_prefix, lid, label)} " \
+                               f"(generation {p.get('generation')})"
+                del reqs[label]
+        if not (reqs or threads) or deadline - clock() <= 0:
+            break
+        sleep(min(poll_s, deadline - clock()))
+    for label in threads:
+        state[label] = f"unavailable (no answer within {timeout_s:g} s)"
+    for label in reqs:
+        state[label] = "timeout"
+    for label in cfg.labels:
+        print(f"{label}: {state[label]}", flush=True)
+    return 0 if all(state[lb].startswith(("checkpointed", "finished")) for lb in cfg.labels) else 1
+
+
 def local_is_current(dest: str, launch_id: str) -> bool | None:
     """True: dest holds this launch's collected run; False: an earlier launch's
     (set aside before collecting); None: nothing collected yet."""
@@ -1331,9 +1794,15 @@ def collect(cfg, shutdown_after: bool = True):
             print(f"{label}: exit={meta['exit_code']} {meta['duration_s']}s -> {cfg.out_dir}/{label} (from storage)")
             continue
         except Exception as e:  # noqa: BLE001 — not (yet) in storage
+            ck = checkpoint_record(cfg, results_store, label, assign[label]["launch_id"])
+            ck_note = (f"; only a checkpoint exists, of {ck.get('time_utc')} (state {ck.get('run_state')}, "
+                       f"{ck.get('cached_batches')} cached batches): fetch it with `checkpoint --label {label}`"
+                       if ck else "")
             if not running:
-                print(f"{label}: not in storage ({type(e).__name__}) and the cluster has stopped")
+                print(f"{label}: not in storage ({type(e).__name__}) and the cluster has stopped{ck_note}")
                 continue
+            if ck_note:
+                print(f"{label}: no final result yet{ck_note}")
         if client is None:
             client = attach(cfg.name).get_client()
         w = assign[label]["worker"]
@@ -1556,6 +2025,7 @@ def relaunch(cfg, label) -> int:
         assign = json.load(open(cfg.state_file))
         if label not in assign:
             raise SystemExit(f"{label}: no assignment in {cfg.state_file}; not relaunching")
+        budget_guard(cfg, reserve=False)  # more paid work on the live run cluster: the budget must still cover it
         sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
         import results_store
         launch_id = assign[label]["launch_id"]
@@ -1581,6 +2051,9 @@ def relaunch(cfg, label) -> int:
                                  "not relaunching")
         code, commit = code_tarball(cfg)
         pipeline = pipeline_preflight(cfg, code)
+        stale = stale_sheet_problems(code, cfg.flags, pipeline)   # F6 (#218): the launch's checks, on these bytes
+        if stale:
+            raise SystemExit(f"{label}: refusing: " + "; ".join(stale))
         client.upload_file(os.path.join(HERE, "worker_side.py"))
         question, keys = open(cfg.question_file).read().strip(), read_keys()
         assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True, pipeline=pipeline,
@@ -2019,7 +2492,7 @@ def _self_test_52(ok) -> None:
     old_c, new_c = LaunchClient([{}]), LaunchClient([{"workers": {f"tls://a:{i}": {} for i in range(4)}}])
     run_cl = types.SimpleNamespace(cluster_id=12, get_client=lambda: old_c if old_c.status == "running" else new_c)
     used = []
-    comp = types.SimpleNamespace(WORKER_VM_TYPES=[], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+    comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                  register_compute_tags=lambda c, exclude: used.append(c))
     fake_coiled = types.ModuleType("coiled")
     rc52_made = []
@@ -2086,6 +2559,138 @@ def _self_test_52(ok) -> None:
        and st.get("workers") == 2 and "workers=2" in log and KEEPER_TICK.search(log),
        f"RC52g the keeper loop waits out an unpopulated scheduler identity without dropping its adapt(): "
        f"adapts={len(FakeCluster.adapts)} log={log[-300:]!r}")
+
+    # 2026-11-12 (P6): the attached Cluster's own worker view stayed at the 5 workers present when the keeper
+    # started while the pool grew to 41, so dask's Adaptive took the other workers as requested but never
+    # arrived and closed them without asking workers_to_close (BusyWorkerGuard): busy workers were retired.
+    # Each tick the keeper copies the scheduler's worker table into the Cluster's view.
+    class StaleCluster(FakeCluster):
+        last = None
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.client = FakeClient([{"workers": table}] * 6)
+            # One worker the snapshot has, one it lacks (joined after it was taken: Codex review of #203).
+            self.scheduler_info = {"workers": {"tls://10.0.0.5:1": {"name": "a"}, "tls://10.0.0.9:1": {"name": "late"}},
+                                   "id": "s"}
+            StaleCluster.last = self
+
+    ticks = iter([True] * 4)
+    fake.list_clusters = lambda workspace: ([{"name": "x", "id": 7, "current_state": {"state": "running"}}]
+                                            if next(ticks, False) else [])
+    fake.Cluster = StaleCluster
+    with tempfile.TemporaryDirectory() as d:
+        ws.KEEPER_STATUS, ws.KEEPER_LOG = os.path.join(d, "st.json"), os.path.join(d, "keeper.log")
+        sys.modules["coiled"] = fake
+        time.sleep = lambda s: None
+        try:
+            ws._keeper_loop("tok", "x", "ws", 3, 9, 1.0, {}, cluster_id=7, tick_s=0)
+            log = open(ws.KEEPER_LOG).read()
+        finally:
+            time.sleep = real_sleep
+            ws.KEEPER_STATUS, ws.KEEPER_LOG = paths
+            if real_coiled is None:
+                sys.modules.pop("coiled", None)
+            else:
+                sys.modules["coiled"] = real_coiled
+    view = (StaleCluster.last.scheduler_info or {}).get("workers") if StaleCluster.last else None
+    ok(view is not None and set(table) <= set(view) and "tls://10.0.0.9:1" in view
+       and StaleCluster.last.scheduler_info.get("id") == "s" and "keeper error" not in log,
+       f"RC52k each keeper tick adds the scheduler's workers the attached Cluster's view lacks, so Adaptive "
+       f"sees every worker that joined, and keeps a worker that joined after the snapshot: {view} "
+       f"log={log[-300:]!r}")
+    # The Cluster's own status stream still removes what it reports (a `del` on a missing key would end it),
+    # and on a Cluster with an event loop the merge runs there.
+    calls = []
+    lp = types.SimpleNamespace(add_callback=lambda fn: calls.append(fn))
+    cl2 = types.SimpleNamespace(scheduler_info={"workers": {"tls://10.0.0.7:1": {"name": "gone"}}}, loop=lp)
+    ws.sync_observed(cl2, {"tls://10.0.0.8:1": {"name": "new"}})
+    before = dict(cl2.scheduler_info["workers"])
+    for fn in calls:
+        fn()
+    del cl2.scheduler_info["workers"]["tls://10.0.0.7:1"]          # the stream's remove
+    ok(len(calls) == 1 and before == {"tls://10.0.0.7:1": {"name": "gone"}}
+       and cl2.scheduler_info["workers"] == {"tls://10.0.0.8:1": {"name": "new"}},
+       f"RC52l the merge runs on the Cluster's loop, adds only, and leaves every reported worker removable: "
+       f"{len(calls)} {before} {cl2.scheduler_info['workers']}")
+
+    # Codex review round 2 of #203: a per-tick refresh leaves a window (Adaptive decides every 15 s, the
+    # keeper ticks every 60 s) in which a worker that joined after the tick, with close votes from its
+    # boot, is retired as "not yet arrived". The keeper's Adaptive refreshes the view before every
+    # decision and checks every worker it would retire against the scheduler: a worker the scheduler has
+    # goes only if workers_to_close (BusyWorkerGuard) offers it; an unreadable scheduler retires nothing.
+    import asyncio
+
+    class FakeComm:
+        def __init__(self, present, safe, fail=False, sched=None):
+            self.present, self.safe, self.fail = present, safe, fail
+            # The scheduler's state at the retirement check: {name: processing}; default: `present`,
+            # busy unless in `safe`.
+            self.sched = sched if sched is not None else {n: n not in safe for n in present}
+
+        async def run_function(self, function, args, kwargs, wait=True):
+            from distributed.protocol.pickle import loads
+            if self.fail:
+                raise OSError("down")
+            wss = {f"tls://{n}:1": types.SimpleNamespace(name=n, processing={"t"} if busy_ else set(),
+                                                          long_running=set())
+                   for n, busy_ in self.sched.items()}
+            sch = types.SimpleNamespace(workers=wss, plugins={})
+            return {"status": "OK", "result": loads(function)(*loads(args), dask_scheduler=sch, **loads(kwargs))}
+
+        async def identity(self, n_workers=-1):
+            if self.fail:
+                raise OSError("down")
+            return {"workers": {f"tls://{n}:1": {"name": n} for n in self.present}}
+
+        async def workers_to_close(self, target=None, attribute="address"):
+            if self.fail:
+                raise OSError("down")
+            return list(self.safe)
+
+    class Base:                                    # what AdaptiveCore does with a stale view
+        def __init__(self, cluster):
+            self.cluster = cluster
+
+        async def recommendations(self, target):
+            arrived = {w["name"] for w in self.cluster.scheduler_info["workers"].values()}
+            gone = sorted(set(self.cluster.requested) - arrived)
+            return {"status": "down", "workers": gone} if gone else {"status": "same"}
+
+    def decide(present, safe, view, requested, fail=False):
+        cl3 = types.SimpleNamespace(scheduler_info={"workers": {f"tls://{n}:1": {"name": n} for n in view}},
+                                    requested=set(requested), scheduler_comm=FakeComm(present, safe, fail))
+        return asyncio.run(ws.guarded_adaptive(Base)(cl3).recommendations(1)), cl3
+    # "late" joined after the keeper's tick and runs a chunk: the refresh sees it, nothing is retired.
+    r1, c1 = decide(["a", "late"], [], ["a"], ["a", "late"])
+    # Both now look not yet arrived (a stale view): "busy" is on the scheduler and not offered by
+    # workers_to_close, so it stays; "idle" is offered and goes; "boot" is not on the scheduler and goes.
+    class StaleBase(Base):
+        async def recommendations(self, target):
+            return {"status": "down", "workers": ["busy", "idle", "boot"]}
+    cl4 = types.SimpleNamespace(scheduler_info={"workers": {}}, requested={"busy", "idle", "boot"},
+                                scheduler_comm=FakeComm(["busy", "idle"], ["idle"]))
+    r2 = asyncio.run(ws.guarded_adaptive(StaleBase)(cl4).recommendations(1))
+    cl5 = types.SimpleNamespace(scheduler_info={"workers": {}}, requested={"busy"},
+                                scheduler_comm=FakeComm(["busy"], [], fail=True))
+    r3 = asyncio.run(ws.guarded_adaptive(StaleBase)(cl5).recommendations(1))
+    # Codex review round 3 of #203: "boot" was not on the scheduler at the refresh but joined and took a
+    # chunk before the retirement check; the check is one scheduler-side call, so it is kept.
+    cl6 = types.SimpleNamespace(scheduler_info={"workers": {}}, requested={"busy", "idle", "boot"},
+                                scheduler_comm=FakeComm(["busy", "idle"], ["idle"],
+                                                        sched={"busy": True, "idle": False, "boot": True}))
+    r4 = asyncio.run(ws.guarded_adaptive(StaleBase)(cl6).recommendations(1))
+    ok(r1 == {"status": "same"} and "tls://late:1" in c1.scheduler_info["workers"],
+       f"RC52p the keeper's Adaptive refreshes the worker view before each decision: a worker that joined "
+       f"after the tick is observed and not retired: {r1} {sorted(c1.scheduler_info['workers'])}")
+    ok(r2 == {"status": "down", "workers": ["idle", "boot"]},
+       f"RC52q every worker it would retire is checked against the scheduler: a busy one (not offered by "
+       f"workers_to_close) stays; an idle one and one that never joined go: {r2}")
+    ok(r3 == {"status": "same"},
+       f"RC52r with the scheduler unreadable it retires nothing: {r3}")
+    ok(r4 == {"status": "down", "workers": ["idle"]},
+       f"RC52s a worker that joined and took a chunk after the refresh is kept: the retirement check is one "
+       f"scheduler-side call on the scheduler's own state: {r4}")
 
 
 def _self_test_51c(ok) -> None:
@@ -2262,7 +2867,8 @@ def _self_test_attach(ok) -> None:
     sys.modules["coiled"] = fake
     try:
         cl = ws.attach_existing("n", "w", 5)
-        ok(calls == [{"name": "n", "workspace": "w", "shutdown_on_close": False, "wait_for_workers": False}]
+        ok(calls == [{"name": "n", "workspace": "w", "shutdown_on_close": False, "wait_for_workers": False,
+                     "worker_vm_types": ws.ATTACH_VM_TYPES, "scheduler_vm_types": ws.ATTACH_VM_TYPES}]
            and cl.cluster_id == 5, f"RC60a attach_existing attaches by name without waiting for workers: {calls}")
         made = []
         fake.Cluster = lambda **kw: made.append(Cl(**kw)) or made[-1]
@@ -2284,14 +2890,17 @@ def _self_test_attach(ok) -> None:
             ok(not calls and "not running" in str(e), f"RC60c attach never constructs a Cluster for a stopping one: {calls}")
         listed[:] = [{"name": "n", "id": 5, "current_state": {"state": "running"}}]
         cl = attach("n")
-        ok(calls == [{"name": "n", "workspace": WORKSPACE, "shutdown_on_close": False, "wait_for_workers": False}]
+        ok(calls == [{"name": "n", "workspace": WORKSPACE, "shutdown_on_close": False, "wait_for_workers": False,
+                     "worker_vm_types": ws.ATTACH_VM_TYPES, "scheduler_vm_types": ws.ATTACH_VM_TYPES}]
            and cl.cluster_id == 5, f"RC60d attach checks running, then attaches with wait_for_workers=False: {calls}")
         calls.clear()
         ov = ws._Overflow({"name": "n-overflow", "id": 5}, "w")
         ov.cl = None
         Cl.get_client = lambda self: "C"
         ok(ov.attach() == (ov.cl, "C") and calls == [{"name": "n-overflow", "workspace": "w", "shutdown_on_close": False,
-                                                     "wait_for_workers": False}],
+                                                     "wait_for_workers": False,
+                                                     "worker_vm_types": ws.ATTACH_VM_TYPES,
+                                                     "scheduler_vm_types": ws.ATTACH_VM_TYPES}],
            f"RC60e the keeper's overflow handle attaches through the same call: {calls}")
         # Codex round 3 (P2-b): an attach refusal leaves the overflow pool unavailable for the tick; the keeper goes on
         fake.Cluster = lambda **kw: Cl(_id=9, **kw)
@@ -2385,7 +2994,7 @@ def _self_test_s18(ok, tb) -> None:
             def tags(c, exclude):
                 if tags_exc:
                     raise tags_exc
-            comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+            comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                          register_compute_tags=tags)
             fake_coiled = types.ModuleType("coiled")
             made = []
@@ -2488,7 +3097,7 @@ def _self_test_s18(ok, tb) -> None:
                   open(cfg.clusters_file, "w"))
         P = mock.patch.object
         refused = None
-        with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=[])), \
+        with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["Standard_E8s_v5"])), \
                 P(M, "start_keeper", side_effect=fake_helper("keeper", "lt-keeper", 79, types.SimpleNamespace(cluster_id=79))) as sk, \
                 P(M, "confirm_keeper", return_value=["tick"]), P(time, "sleep", lambda s: None), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -2589,7 +3198,7 @@ def _self_test_s18_r1(ok) -> None:
             fake_coiled = types.ModuleType("coiled")
             fake_coiled.Cluster = cluster
             fake_coiled.list_clusters = lambda workspace: list(made)
-            comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+            comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                          register_compute_tags=lambda c, exclude: None)
             pats = [P(M, "is_running", return_value=running),
                     P(M, "live_id", side_effect=live_exc or (lambda n: 77)),
@@ -2791,7 +3400,7 @@ def _self_test_s18_r2(ok) -> None:
                     raise SystemExit("not confirmed")
                 return ["tick"]
             out = io.StringIO()
-            with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["a"])), \
+            with P(M, "_compute", return_value=types.SimpleNamespace(ADAPT_OPTIONS={}, WORKER_VM_TYPES=["Standard_E8s_v5"])), \
                     P(M, "live_id", side_effect=lambda n: live.get(n)), \
                     P(M, "start_overflow", side_effect=so), P(M, "start_keeper", side_effect=sk), \
                     P(M, "confirm_keeper", side_effect=conf), \
@@ -3098,7 +3707,7 @@ def _self_test_s18_r4(ok) -> None:
         open(q, "w").write("question")
         cfg = RunConfig(name="lt", question_file=q, labels=("R1",), out_dir=d, keeper=False, overflow_max=0,
                         pipeline="v2", cluster_timeout="40 minutes")
-        comp = types.SimpleNamespace(WORKER_VM_TYPES=["a"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
+        comp = types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"], WORKER_OPTIONS={}, ADAPT_OPTIONS={},
                                      register_compute_tags=lambda c, exclude: None)
         if ctor_calls is not None:
             real = fake.Cluster
@@ -3471,6 +4080,865 @@ def _self_test_collect_no_shutdown(ok) -> None:
         ok(rc_ == 0 and len(downs) == want, cid)
 
 
+def _self_test_budget(ok) -> None:
+    """BU (F6 Stage 2, 2026-11-11: $106 spent of a $100 budget): `launch` refuses unless the owner-signed budget
+    (cloud/budget.py) covers the scope's spend plus the config's cap_usd, before any key is read or cluster made."""
+    import types
+    from unittest import mock
+    import budget
+    for bad in (dict(cap_usd=-1), dict(cap_usd=float("nan")), dict(cap_usd=True), dict(cap_usd="5")):
+        try:
+            RunConfig(name="t", question_file="/dev/null", **bad)
+            ok(False, f"BU1 a cap_usd that is not a positive number is refused at load: {bad}")
+        except (ValueError, TypeError):
+            ok(True, f"BU1 a cap_usd that is not a positive number is refused at load: {bad}")
+    ok(RunConfig(name="lw-smoke-x", question_file="q").budget_scope == "f6"
+       and RunConfig(name="t", question_file="q").budget_scope == ""
+       and RunConfig(name="t", question_file="q", budget_scope="f6").budget_scope == "f6",
+       "BU2 budget_scope defaults to the scope whose prefix the config's name has (cloud/budget_scopes.yaml)")
+    made, keys, kws = [], [], []
+    calls, wvt = [], [["Standard_E8s_v5", "Standard_E8as_v5"]]
+
+    def try_launch(cfg, verdict):
+        made.clear(), keys.clear(), calls.clear()
+        fake = types.SimpleNamespace(Cluster=lambda **kw: made.append(kw))
+        lbo = lambda scope, cap, name=None, **kw: (calls.append((scope, cap, name)), kws.append(kw), verdict)[2]  # noqa: E731
+        with mock.patch.dict(sys.modules, {"coiled": fake}), mock.patch.object(budget, "launch_budget_ok", lbo), \
+                mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
+                                            "pipeline_preflight": lambda c, code: "v2",
+                                            "_compute": lambda c: types.SimpleNamespace(WORKER_VM_TYPES=wvt[0]),
+                                            "read_keys": lambda: keys.append(1) or 1 / 0}):   # stops past the guard
+            try:
+                _launch_locked(cfg, "inv")
+                return None
+            except SystemExit as e:
+                return str(e)
+            except Exception as e:  # noqa: BLE001 -- past the guard, the fakes stop it
+                return f"past the guard: {type(e).__name__}"
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2"), (True, "ok"))
+    ok(msg and "cap_usd" in msg and not made and not keys and not calls,
+       f"BU3 a config without cap_usd is refused before the budget, any key or any cluster: {msg}")
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (False, "over"))
+    ok(msg and "budget" in msg and "over" in msg and not made and not keys and calls == [("f6", 20, "lw-smoke-t")],
+       f"BU4 a launch the budget refuses creates nothing and reads no key: {msg} {calls}")
+    msg = try_launch(RunConfig(name="zz", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
+    ok(msg and "scope" in msg and not made and not calls, f"BU4b a name in no budget scope is refused: {msg}")
+    msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20), (True, "ok"))
+    ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
+    ok(kws and kws[-1].get("invocation") == "inv" and kws[-1].get("clusters_file", "").endswith("clusters.json"),
+       f"BU4d launch reserves under its invocation token and names its clusters.json: {kws[-1:]}")
+    ok(kws and all(k.get("warn_over") is True for k in kws),
+       f"BU4e every launch check passes warn_over (owner 2026-11-17: no launch refused for dollars): {kws}")
+    # BU7 (2026-11-13; owner: spend controls fail soft): a VM type missing from cloud/vm_prices.yaml never refuses a
+    # launch. It is warned about before the budget is asked (budget.py counts it at the fallback rate)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20,
+                                   overflow_vm_types=("Standard_D8s_v5", "Fake_X9_v9")), (True, "ok"))
+    ok(msg and "past the guard" in msg and calls and "WARNING" in out.getvalue() and "Fake_X9_v9" in out.getvalue(),
+       f"BU7 an unpriced overflow VM type warns and the launch goes on: {msg} {calls} {out.getvalue()[:200]!r}")
+    wvt[0] = ["Standard_E8s_v5", "Fake_F8s_v2"]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        msg = try_launch(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20),
+                         (True, "ok"))
+    wvt[0] = ["Standard_E8s_v5", "Standard_E8as_v5"]
+    ok(msg and "past the guard" in msg and calls and "WARNING" in out.getvalue() and "Fake_F8s_v2" in out.getvalue(),
+       f"BU7b an unpriced run-cluster worker type (compute.WORKER_VM_TYPES) warns the same way: {msg} {calls}")
+    try:
+        req = vm_request(RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20),
+                         types.SimpleNamespace(WORKER_VM_TYPES=["Standard_E8s_v5"]))
+        prices = budget.load_prices(budget.PRICES_FILE)
+        good = (set(req) == {"run", "overflow", "keeper"} and all(
+            r["worker_vm_types"] and r["scheduler_vm_types"] and set(r["worker_vm_types"]) | set(r["scheduler_vm_types"])
+            <= set(prices) for r in req.values()) and req["run"]["worker_vm_types"] == ["Standard_E8s_v5"])
+    except Exception as e:  # noqa: BLE001 -- a missing function is a failing case
+        req, good = f"{type(e).__name__}: {e}", False
+    ok(good, f"BU7c vm_request pins every cluster's worker and scheduler types to priced ones: {req}")
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:     # BU5-BU6 (Codex r1 P1 on #189): the other paths to paid work
+        cfg = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d)
+        json.dump({"run": {"name": cfg.name, "id": 5}}, open(cfg.clusters_file, "w"))
+        json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg.state_file, "w"))
+        seen, started = [], []
+        lbo = lambda scope, cap, name=None, reserve=True, **k: (seen.append(reserve), (False, "over"))[1]  # noqa: E731
+        for label, fn in (("keeper", lambda: keeper_later(cfg)), ("relaunch", lambda: relaunch(cfg, "R1"))):
+            seen.clear(), started.clear()
+            with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                    mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda *a: None,
+                                                "start_helpers": lambda *a, **k: started.append(1),
+                                                "read_keys": lambda: started.append("keys"),
+                                                "_submit": lambda *a, **k: started.append("submit")}):
+                try:
+                    fn()
+                    msg = None
+                except SystemExit as e:
+                    msg = str(e)
+                except Exception as e:  # noqa: BLE001 -- past the guard, the missing fakes stop it
+                    msg = f"past the guard: {type(e).__name__}: {e}"
+            ok(msg and "over" in msg and not started and seen == ([True] if label == "keeper" else [False]),
+               f"BU5 `{label}` is refused before it creates or submits anything when the budget no longer covers "
+               f"cap_usd: {msg} reserve={seen}")
+        seen.clear(), started.clear()
+        ids = {"overflow": 7, "keeper": 8}
+        with mock.patch.object(budget, "launch_budget_ok", lbo), \
+                mock.patch.object(ws, "attach_existing", lambda *a: object()), \
+                mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda c, cl, role, n: ids[role],
+                                            "confirm_keeper": lambda *a, **k: True, "_compute": lambda c: None,
+                                            "start_helpers": lambda *a, **k: started.append(k)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                keeper_later(cfg)
+                msg = None
+            except BaseException as e:  # noqa: BLE001
+                msg = f"{type(e).__name__}: {e}"
+        ok(msg is None and not seen and started == [{"keep_overflow": 7, "keep_keeper": True}],
+           f"BU5b a `keeper` whose helpers are healthy creates nothing and reserves nothing: {msg} {seen} {started}")
+        seen.clear(), started.clear()
+        bad = RunConfig(name="lw-smoke-t", question_file="/dev/null", pipeline="v2", cap_usd=20, out_dir=d,
+                        overflow_vm_types=("Fake_X9_v9",))
+        with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, reserve=True, **k: (
+                    seen.append(reserve), (True, "ok"))[1]), \
+                mock.patch.dict(globals(), {"live_id": lambda n: 5, "_reconcile": lambda *a: None,
+                                            "_compute": lambda c: None,
+                                            "start_helpers": lambda *a, **k: started.append(k)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                keeper_later(bad)
+                msg = None
+            except BaseException as e:  # noqa: BLE001
+                msg = f"{type(e).__name__}: {e}"
+        ok(msg is None and seen == [True] and started,
+           f"BU7d `keeper` with an unpriced overflow VM type warns and goes on (fail soft): {msg} {seen}")
+    import ast                                   # BU6: the archived launchers refuse unless deliberately allowed
+    ld = os.path.join(os.path.dirname(HERE), "docs", "experiments", "launchers")
+    for f in sorted(x for x in os.listdir(ld) if x.endswith(".py")):
+        body = ast.parse(open(os.path.join(ld, f)).read()).body
+        i = 1 if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+            else 0
+        if i < len(body) and isinstance(body[i], ast.ImportFrom) and body[i].module == "__future__":
+            i += 1
+        guard = body[i:i + 2]
+        good = (len(guard) == 2 and isinstance(guard[0], ast.Import) and isinstance(guard[1], ast.If)
+                and "MA_ALLOW_EXPERIMENT_LAUNCHERS" in ast.unparse(guard[1].test)
+                and isinstance(guard[1].body[0], ast.Raise))
+        refused = False
+        if good:
+            mod = ast.Module(body=guard, type_ignores=[])
+            with mock.patch.dict(os.environ, {"MA_ALLOW_EXPERIMENT_LAUNCHERS": ""}):
+                try:
+                    exec(compile(mod, f, "exec"), {})   # noqa: S102 -- only the guard's two statements
+                except SystemExit:
+                    refused = True
+        ok(good and refused, f"BU6 docs/experiments/launchers/{f} refuses at import unless "
+                             f"MA_ALLOW_EXPERIMENT_LAUNCHERS=1 (its first statements are the guard)")
+
+def _self_test_checkpoint(ok) -> None:
+    """CK1-CK20 (F6 run checkpoints, 2026-11-11: a 3-h preview stopped at its cap stored nothing). The agent VM
+    uploads a checkpoint of the run dir every checkpoint_minutes while main.py runs; `checkpoint` fetches it,
+    sha256-verified; `collect` says when only a checkpoint exists. CK13-CK20: Codex round 1 (generations, disk,
+    requests that never block a worker, ownership, one deadline). Fake store, fake main.py, no cloud."""
+    import hashlib
+    import tempfile
+    import threading
+    from unittest import mock
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+    import results_store
+    ok(RunConfig(name="t", question_file="q").checkpoint_minutes == 15, "CK1 checkpoint_minutes defaults to 15")
+    try:
+        RunConfig(name="t", question_file="q", checkpoint_minutes=-1)
+        ok(False, "CK1b a negative checkpoint_minutes is refused")
+    except ValueError:
+        ok(True, "CK1b a negative checkpoint_minutes is refused")
+    import types
+    got = []
+    for minutes in (15, 0):
+        sub = []
+        fc = types.SimpleNamespace(submit=lambda *a, **kw: sub.append(kw) or "fut")
+        with mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}):
+            _submit(RunConfig(name="z", question_file="q", pipeline="v2", checkpoint_minutes=minutes), fc, "R1", "w",
+                    b"", "q", {"ANTHROPIC_API_KEY": "k"}, "L")
+        got.append(sub[0].get("checkpoint_s", "absent"))
+    ok(got == [900.0, None], f"CK2 the interval reaches run_to_disk in seconds; 0 sends None (disabled): {got}")
+    ok(ws.checkpoint_starter("R1", "runs/t", "L1", None, None, None) is None
+       and ws.checkpoint_starter("R1", "runs/t", "L1", None, None, 0) is None
+       and callable(ws.checkpoint_starter("R1", "runs/t", "L1", None, None, 900.0)),
+       "CK2b the agent VM starts no checkpoint thread when the interval is 0 or None")
+
+    class Store:
+        """results_store's archive helpers, uploads into a dict (optionally failing or blocking)."""
+        write_archive, sha256_file = staticmethod(results_store.write_archive), staticmethod(results_store.sha256_file)
+
+        def __init__(self, fail=False, gate=None, fail_on=None, raise_after=None):
+            self.files, self.fail, self.gate, self.uploads, self.downloads = {}, fail, gate, [], []
+            self.fail_on, self.raise_after = fail_on, raise_after
+
+        def upload_file(self, path, blob, account=None):
+            if self.gate is not None:
+                self.gate.wait(10)
+            if self.fail or (self.fail_on and self.fail_on(blob)):
+                raise OSError("storage unreachable")
+            self.files[blob] = open(path, "rb").read()
+            self.uploads.append(blob)
+            if self.raise_after and self.raise_after(blob):     # committed, then the read-back fails
+                raise RuntimeError(f"upload of {blob} did not verify")
+            return {"blob": blob, "bytes": len(self.files[blob])}
+
+        def download(self, blob, path, account=None):
+            self.downloads.append(blob)
+            if blob not in self.files:
+                raise FileNotFoundError(blob)
+            open(path, "wb").write(self.files[blob])
+
+        def delete(self, blob, account=None):
+            self.files.pop(blob, None)
+
+        def list_blobs(self, prefix, account=None):
+            return [{"name": n} for n in sorted(self.files) if n.startswith(prefix)]
+
+        def sha256_blob(self, blob, account=None):
+            self.streamed = getattr(self, "streamed", []) + [blob]
+            if blob not in self.files:
+                raise FileNotFoundError(blob)
+            return hashlib.sha256(self.files[blob]).hexdigest()
+
+    secret = "sk-ant-TESTSECRET12345"
+    main_py = ("import json, os, time\n"
+               "rd = 'runs/R_x'\n"
+               "for d in ('models', '_truth'):\n    os.makedirs(os.path.join(rd, d), exist_ok=True)\n"
+               "open(rd + '/_truth/key.yaml', 'w').write('answer')\n"
+               "json.dump({'state': 'ANALYZE', 'round': 2}, open(rd + '/run_state.json', 'w'))\n"
+               "open(rd + '/models/b.jsonl.partial.jsonl', 'w').write("
+               "json.dumps({'_partial': {'fn': 'f', 'code_fp': 'x'}}) + '\\n' + '{\"ok\": true, \"key\": \"k#0\"}\\n')\n"
+               f"open(rd + '/notes.md', 'w').write('key {secret}')\n"
+               "time.sleep(float(os.environ.get('CK_SLEEP', '1.5')))\n")
+    import io as _io
+    b = _io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w:gz") as t:
+        ti = tarfile.TarInfo("main.py")
+        ti.size = len(main_py.encode())
+        t.addfile(ti, _io.BytesIO(main_py.encode()))
+    code = b.getvalue()
+    pointer = ws.checkpoint_pointer("runs/t", "L1", "R1")
+    gen = lambda n, lb="R1": ws.checkpoint_blobs("runs/t", "L1", lb, n)  # noqa: E731
+    ok(pointer == "outputs/runs/t/launch_L1/checkpoint_R1.json"
+       and gen(2) == ("outputs/runs/t/launch_L1/checkpoint_R1_g2.tar.gz", "outputs/runs/t/launch_L1/checkpoint_R1_g2.json"),
+       f"CK3 the blob names: a pointer, and immutable generations: {pointer} {gen(2)}")
+
+    def run(store, interval_s=0.25):
+        cps = []
+
+        def on_start(work):
+            c = ws.Checkpointer("R1", work, "runs/t", "L1", None, store, interval_s, secrets=[secret], poll_s=0.05,
+                                log=lambda m: None)
+            c.start()
+            cps.append(c)
+        with mock.patch.object(ws, "WORK", work_root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"):
+            res = ws.run_job_impl("R1", code, "q", [], "k", None, on_start=on_start)
+        cps[0].stop()
+        cps[0].wait_idle(10)
+        return res, cps[0]
+    work_root = tempfile.mkdtemp()
+    store = Store()
+    res, c = run(store)
+    rec = json.loads(store.files.get(pointer, b"{}"))
+    n = rec.get("generation") or 0
+    data = store.files.get(gen(n)[0], b"")
+    ok(res["exit_code"] == 0 and c.done >= 2 and store.uploads[:3] == [gen(1)[0], gen(1)[1], pointer],
+       f"CK4 while main.py runs: each interval a new generation (tarball, record), then the pointer: done={c.done} "
+       f"{store.uploads[:3]}")
+    ok(rec.get("sha256") == hashlib.sha256(data).hexdigest() and rec.get("bytes") == len(data)
+       and rec.get("run_state") == {"state": "ANALYZE", "round": 2} and rec.get("cached_batches") == 1
+       and rec.get("cached_rows") == 1 and rec.get("run_dir") == "R_x" and rec.get("time_utc")
+       and json.loads(store.files[gen(n)[1]]).get("sha256") == rec["sha256"],
+       f"CK5 the pointer names the latest generation; its record: time, size, sha256, state and round, batches: {rec}")
+    with tarfile.open(fileobj=_io.BytesIO(data), mode="r:gz") as t:
+        names = t.getnames()
+        body = t.extractfile("runs/R_x/notes.md").read() if "runs/R_x/notes.md" in names else b""
+    ok("runs/R_x/run_state.json" in names and "run.log" in names and not any("_truth" in n for n in names)
+       and secret.encode() not in body and b"<redacted>" in body,
+       f"CK6 the tarball holds the run dir and run.log, never _truth/, secrets redacted: {names}")
+    ckdir = os.path.join(work_root, "R1", ws.CKDIR)
+    ok(n >= 3 and gen(n - 2)[0] not in store.files and gen(n - 2)[1] not in store.files
+       and gen(n - 1)[0] in store.files and rec.get("previous") == n - 1,
+       f"CK13 (Codex P2-4) the last two generations are kept, older ones deleted: n={n} {sorted(store.files)}")
+    ok(not any(f.endswith((".tar.gz", ".tmp")) or f.startswith("copy") for f in os.listdir(ckdir)),
+       f"CK14 (Codex P2-5) the local archive is deleted after a successful upload: {os.listdir(ckdir)}")
+    bad = Store(fail=True)
+    res2, c2 = run(bad)
+    ok(res2["exit_code"] == 0 and c2.failed >= 1 and c2.done == 0
+       and "storage unreachable" in open(os.path.join(ckdir, "checkpoint.log")).read(),
+       f"CK7 an upload failure is logged and never kills the run: exit={res2['exit_code']} failed={c2.failed}")
+    ok(not any(f.endswith((".tar.gz", ".tmp")) for f in os.listdir(ckdir)),
+       f"CK14b (Codex P2-5) a failed checkpoint leaves no partial or local archive: {os.listdir(ckdir)}")
+    wd = os.path.join(work_root, "S")
+    os.makedirs(os.path.join(wd, "runs", "R_y"))
+    open(os.path.join(wd, "runs", "R_y", "a.txt"), "w").write("a")
+    full = Store()
+    c5 = ws.Checkpointer("S", wd, "runs/t", "L1", None, full, 3600, log=lambda m: None, free_bytes=lambda p: 2 * 2**30)
+    c5.trigger("t")
+    c5.wait_idle(10)
+    ok(c5.done == 0 and not full.uploads and "free space" in open(os.path.join(wd, ws.CKDIR, "checkpoint.log")).read()
+       and not any(f.endswith((".tar.gz", ".tmp")) for f in os.listdir(os.path.join(wd, ws.CKDIR))),
+       "CK14c (Codex P2-5) less free space than 1.5 x the run dir + 2 GB: the checkpoint is skipped, logged")
+    gate = threading.Event()
+    slow = Store(gate=gate)
+    c3 = ws.Checkpointer("S", wd, "runs/t", "L1", None, slow, 3600, log=lambda m: None)
+    first, second = c3.trigger("t1"), c3.trigger("t2")
+    gate.set()
+    c3.wait_idle(10)
+    ok(first and not second and c3.skipped == 1 and c3.done == 1,
+       f"CK8 a checkpoint while the previous upload runs is skipped: {first} {second} skipped={c3.skipped}")
+    # checkpoint-now: the side function only files a request and returns; it never sleeps on the worker
+    import time as _time
+
+    def no_sleep(*a):
+        raise AssertionError("checkpoint_now_side slept on the worker")
+    with mock.patch.object(ws, "WORK", work_root), mock.patch.object(_time, "sleep", no_sleep):
+        none = ws.checkpoint_now_side("S")
+        open(os.path.join(wd, ws.CKDIR, "active"), "w").write("1")
+        t0 = _time.time()
+        req = ws.checkpoint_now_side("S")
+        dt_ = _time.time() - t0
+    ok(none.get("state") == "no checkpointer" and req.get("state") == "requested" and req.get("token")
+       and isinstance(req.get("epoch"), float) and dt_ < 0.5
+       and os.path.exists(os.path.join(wd, ws.CKDIR, f"request_{req['token']}")),
+       f"CK15 (Codex P1-3) checkpoint-now's side call files a request and returns at once: {none} {req} {dt_:.3f}s")
+    # a request filed while an upload is busy stays pending; only a checkpoint started after it satisfies it
+    gate2 = threading.Event()
+    busy = Store(gate=gate2)
+    for f in os.listdir(os.path.join(wd, ws.CKDIR)):
+        if f.startswith("request_"):
+            os.remove(os.path.join(wd, ws.CKDIR, f))
+    c6 = ws.Checkpointer("S", wd, "runs/t", "L1", None, busy, 3600, poll_s=0.05, log=lambda m: None)
+    c6.start()
+    try:
+        c6.trigger("interval")
+        with mock.patch.object(ws, "WORK", work_root):
+            req = ws.checkpoint_now_side("S")
+        _time.sleep(0.4)
+        gate2.set()
+        for _ in range(100):
+            if c6.done >= 2:
+                break
+            _time.sleep(0.05)
+    finally:
+        c6.stop()
+        c6.wait_idle(10)
+    g1, g2 = (json.loads(busy.files.get(ws.checkpoint_blobs("runs/t", "L1", "S", k)[1], b"{}")) for k in (1, 2))
+    ok(req["token"] not in (g1.get("requests") or []) and req["token"] in (g2.get("requests") or [])
+       and g2.get("started_epoch", 0) >= req["epoch"],
+       f"CK16 (Codex P2-7) a request made during a busy upload is met only by a checkpoint started after it: "
+       f"{g1.get('requests')} {g2.get('requests')}")
+    # the record's state and counts come from the archived files, not the live run dir
+
+    class Crafted(Store):
+        @staticmethod
+        def write_archive(root, arcname, out_path, secrets=None, extra=(), **kw):
+            with tarfile.open(out_path, mode="w:gz") as t:
+                for name, txt in ((f"{arcname}/run_state.json", '{"state": "WRITE", "round": 3}'),
+                                  (f"{arcname}/analysis/batch/r.jsonl", '{"ok": true}\n{"ok": true}\n'),
+                                  (f"{arcname}/analysis/batch/r.jsonl.summary.json", "{}")):
+                    ti = tarfile.TarInfo(name)
+                    ti.size = len(txt)
+                    t.addfile(ti, _io.BytesIO(txt.encode()))
+            return []
+    # the live run_state equals the archived one (else the capture is torn, CK30); the live dir has no batch
+    open(os.path.join(wd, "runs", "R_y", "run_state.json"), "w").write('{"state": "WRITE", "round": 3}')
+    r17 = ws.build_checkpoint(wd, os.path.join(wd, "runs", "R_y"), os.path.join(wd, "x.tar.gz"), Crafted())
+    os.remove(os.path.join(wd, "runs", "R_y", "run_state.json"))
+    ok(r17.get("run_state") == {"state": "WRITE", "round": 3} and r17.get("cached_batches") == 1
+       and r17.get("cached_rows") == 2,
+       f"CK17 (Codex P1-1) the record's state and counts are read from the archive, not the live dir: {r17}")
+    # fetch on the laptop: through the pointer, sha256 verified, extracted under <out_dir>/<label>/checkpoint/
+    out = tempfile.mkdtemp()
+    cfg = RunConfig(name="t", question_file="q", out_dir=out, labels=("R1",))
+    json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg.state_file, "w"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        got = fetch_checkpoint(cfg, store, "R1")
+    dest = os.path.join(out, "R1", "checkpoint")
+    ok(got.get("sha256") == rec["sha256"] and os.path.exists(os.path.join(dest, "runs", "R_x", "run_state.json"))
+       and json.load(open(os.path.join(dest, "checkpoint.json"))).get("sha256") == rec["sha256"],
+       f"CK10 `checkpoint` reads the pointer, downloads, verifies and extracts the latest generation: {got}")
+    try:
+        mk10 = json.load(open(os.path.join(dest, "runs", "R_x", "copied_run.json")))
+    except (OSError, ValueError):
+        mk10 = {}
+    ok(list(mk10.get("files") or {}) == ["models/b.jsonl.partial.jsonl"] and "checkpoint R1" in str(mk10.get("source"))
+       and mk10.get("captured_at") == got.get("time_utc"),
+       f"CK10b (F6 run 3) the fetched run dir is marked: its batch journal is a copy, not a live batch ({mk10})")
+    ok(_checkpoint_run_root(dest, "R_x") == os.path.join(dest, "runs", "R_x")
+       and all(_checkpoint_run_root(dest, bad) is None for bad in ("../R1", "/tmp", "runs/R_x", "", "..", None, "nope")),
+       "CK10c (Codex review of #256 P1-4) the record's run_dir is one name of a directory in the extraction, or none")
+    store.files[gen(n)[0]] = data + b"tampered"
+    out3 = tempfile.mkdtemp()
+    cfg3 = RunConfig(name="t", question_file="q", out_dir=out3, labels=("R1",))
+    json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg3.state_file, "w"))
+    with contextlib.redirect_stdout(io.StringIO()) as buf3:
+        got3 = fetch_checkpoint(cfg3, store, "R1")
+    ok(got3.get("generation") == n - 1 and "previous" in buf3.getvalue()
+       and os.path.exists(os.path.join(out3, "R1", "checkpoint", "runs", "R_x", "run_state.json")),
+       f"CK18 (Codex P2-4) a latest generation that does not verify: the previous complete one is fetched: {got3}")
+    store.files[gen(n - 1)[0]] = b"tampered too"
+    out2 = tempfile.mkdtemp()
+    cfg2 = RunConfig(name="t", question_file="q", out_dir=out2, labels=("R1",))
+    json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg2.state_file, "w"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fetch_checkpoint(cfg2, store, "R1")
+        ok(False, "CK11 no generation whose tarball matches its record: refused")
+    except SystemExit as e:
+        ok("sha256" in str(e) and not os.path.exists(os.path.join(out2, "R1", "checkpoint")),
+           f"CK11 no generation whose tarball matches its record: refused, nothing extracted: {e}")
+    store.files[gen(n)[0]] = data
+    with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: False,
+                                     "collect_from_storage": lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("x")),
+                                     "checkpoint_record": lambda c, s, lb, lid: rec}), \
+            contextlib.redirect_stdout(io.StringIO()) as buf:
+        collect(cfg2, shutdown_after=False)
+    ok("only a checkpoint" in buf.getvalue() and "checkpoint --label R1" in buf.getvalue(),
+       f"CK12 `collect` reports a run with only a checkpoint (no final result): {buf.getvalue()!r}")
+    ok(checkpoint_record(cfg2, store, "R1", "L1") == rec and checkpoint_record(cfg2, store, "R1", "L9") is None,
+       "CK12b the checkpoint record of a launch (its pointer), None when there is none")
+    # checkpoint-now on the laptop: the recorded run cluster by id, this launch only; all labels, one deadline
+    out4 = tempfile.mkdtemp()
+    cfg4 = RunConfig(name="t", question_file="q", out_dir=out4, labels=("A", "B"))
+    json.dump({lb: {"launch_id": "L1", "worker": f"w{lb}"} for lb in "AB"}, open(cfg4.state_file, "w"))
+    json.dump({"run": {"name": "t", "id": 77}, "launch_id": "L1", "invocation": "tok"}, open(cfg4.clusters_file, "w"))
+    log4, clock = [], [1000.0]
+
+    class Client:
+        def run(self, fn, *a, workers=None, wait=True, on_error="raise"):
+            log4.append(("run", fn.__name__, a[0]))
+            return {workers[0]: {"state": "requested", "token": f"T{a[0]}", "epoch": 500.0}}
+    st4 = Store()
+    st4.files[ws.checkpoint_pointer(cfg4.storage_prefix, "L1", "A")] = json.dumps(
+        {"generation": 4, "requests": ["TA"], "started_epoch": 501.0}).encode()
+    st4.files[ws.checkpoint_pointer(cfg4.storage_prefix, "L1", "B")] = json.dumps(
+        {"generation": 2, "requests": [], "started_epoch": 400.0}).encode()
+
+    def sleep4(s):
+        log4.append(("sleep", s))
+        clock[0] += s
+
+    def cnow(**kw):
+        with mock.patch.dict(globals(), {"attach": lambda *a: (_ for _ in ()).throw(AssertionError("attach by name"))}), \
+                contextlib.redirect_stdout(io.StringIO()) as b4:
+            try:
+                rc_ = checkpoint_now(cfg4, **{"timeout_s": 60, "store": st4, "sleep": sleep4, "clock": lambda: clock[0],
+                                              "connect": lambda c, cid: log4.append(("connect", cid)) or Client(),
+                                              "poll_s": 10, **kw})
+            except SystemExit as e:
+                rc_ = f"refused: {e}"
+        return rc_, b4.getvalue()
+    for kw, why in (({"invocation": "other"}, "another invocation's clusters.json"),
+                    ({"launch_id": "L0"}, "another launch id")):
+        r19, _ = cnow(**kw)
+        ok(isinstance(r19, str) and "refused" in r19 and not any(e[0] == "run" for e in log4),
+           f"CK19 (Codex P2-6) checkpoint-now refuses {why}, sends nothing: {r19}")
+    r20, out20 = cnow(invocation="tok", launch_id="L1")
+    runs_ = [i for i, e in enumerate(log4) if e[0] == "run"]
+    sleeps = [i for i, e in enumerate(log4) if e[0] == "sleep"]
+    ok(("connect", 77) in log4 and len(runs_) == 2 and max(runs_) < min(sleeps) and r20 == 1
+       and clock[0] - 1000.0 <= 60 + 10 and "A: checkpointed" in out20 and "B: timeout" in out20,
+       f"CK20 (Codex P1-3, P2-6, P2-8) by recorded id; every label requested first, then storage polled for the "
+       f"token under one deadline: rc={r20} elapsed={clock[0] - 1000.0} {out20!r}")
+    # Codex round 2 P1-2: a checkpointer recreated on a lost work dir continues the stored generations
+    keep = Store(fail_on=lambda blob: blob.endswith(("_g3.json", "_g4.json")))
+    for k in (1, 2):
+        keep.files[gen(k)[0]], keep.files[gen(k)[1]] = f"tar{k}".encode(), json.dumps({"generation": k}).encode()
+    keep.files[pointer] = json.dumps({"generation": 2, "previous": 1}).encode()
+    before = dict(keep.files)
+    wd2 = os.path.join(tempfile.mkdtemp(), "R1")
+    os.makedirs(os.path.join(wd2, "runs", "R_z"))
+    open(os.path.join(wd2, "runs", "R_z", "a.txt"), "w").write("a")
+    c7 = ws.Checkpointer("R1", wd2, "runs/t", "L1", None, keep, 3600, log=lambda m: None)
+    for _ in range(2):
+        c7.trigger("t")
+        c7.wait_idle(10)
+    ok(c7.failed == 2 and all(keep.files.get(b) == v for b, v in before.items())
+       and not any(b.endswith(("_g1.tar.gz", "_g2.tar.gz")) for b in keep.uploads),
+       f"CK21 (Codex round 2 P1-2) recreated on a lost work dir with g1, g2 stored, two failed record uploads: "
+       f"g1, g2 and the pointer intact: uploads {keep.uploads}")
+    keep.fail_on = None
+    c7.trigger("t")
+    c7.wait_idle(10)
+    p21 = json.loads(keep.files[pointer])
+    ok(p21.get("generation") == 5 and p21.get("previous") == 2 and gen(2)[0] in keep.files
+       and gen(1)[0] not in keep.files and gen(5)[0] in keep.files,
+       f"CK21b the next success is g5 with previous g2; only generations older than both are deleted, after the "
+       f"pointer: {p21} {sorted(keep.files)}")
+    # Codex round 2 P2-3: the disk check covers the archive being written and the copy of the largest file
+    big_dir = os.path.join(tempfile.mkdtemp(), "runs", "R_b")
+    os.makedirs(big_dir)
+    with open(os.path.join(big_dir, "big.bin"), "wb") as f:
+        f.truncate(10 * 2**30)                    # a sparse 10 GiB file: its size, not its disk use
+    open(os.path.join(big_dir, "small.txt"), "w").write("x" * 1000)
+    need = ws.disk_needed(big_dir, None)
+    need_log = ws.disk_needed(big_dir, os.path.join(big_dir, "small.txt"))
+    os.remove(os.path.join(big_dir, "big.bin"))
+    ok(need >= 2.2 * (10 * 2**30 + 10 * 2**30 + 1000) + 2 * 2**30
+       and abs(need_log - (need + 2.2 * 1000)) < 1,
+       f"CK22 (Codex round 2 P2-3) a 10 GiB incompressible file needs 2.2 x (largest + run dir) + 2 GB free, "
+       f"run.log counted as a file: {need / 2**30:.1f} GiB")
+    small_dir = os.path.join(tempfile.mkdtemp(), "R_s")
+    os.makedirs(small_dir)
+    open(os.path.join(small_dir, "a.txt"), "w").write("a")
+    big_log = os.path.join(os.path.dirname(small_dir), "run.log")
+    with open(big_log, "wb") as f:
+        f.truncate(10 * 2**30)
+    need_b = ws.disk_needed(small_dir, big_log)
+    os.remove(big_log)
+    ok(need_b >= 2.2 * (2 * 10 * 2**30) + 2 * 2**30,
+       f"CK22b (Codex round 3 P2-4) a 10 GiB run.log beside a small run dir counts twice (its copy and the archive): "
+       f"{need_b / 2**30:.1f} GiB")
+    # Codex round 2 P2-4: a request whose checkpoint is skipped or fails is retried within retry_s, not at the next
+    # interval
+    wd3 = os.path.join(tempfile.mkdtemp(), "Q")
+    os.makedirs(os.path.join(wd3, "runs", "R_q"))
+    open(os.path.join(wd3, "runs", "R_q", "a.txt"), "w").write("a")
+    frees = iter([0] + [2**50] * 50)
+    flaky = Store(fail_on=lambda blob, n=[0]: blob.endswith(".tar.gz") and n.append(1) is None and len(n) == 2)
+    c8 = ws.Checkpointer("Q", wd3, "runs/t", "L1", None, flaky, 3600, poll_s=0.05, log=lambda m: None,
+                         free_bytes=lambda p: next(frees), retry_s=0.2)
+    c8.start()
+    try:
+        with mock.patch.object(ws, "WORK", os.path.dirname(wd3)):
+            req8 = ws.checkpoint_now_side("Q")
+        for _ in range(100):
+            if c8.done:
+                break
+            _time.sleep(0.05)
+    finally:
+        c8.stop()
+        c8.wait_idle(10)
+    p8 = json.loads(flaky.files.get(ws.checkpoint_pointer("runs/t", "L1", "Q"), b"{}"))
+    ok(req8["token"] in (p8.get("requests") or []) and c8.failed == 1 and c8.done == 1,
+       f"CK23 (Codex round 2 P2-4) a request survives a disk skip and a failed upload, met within seconds: "
+       f"done={c8.done} failed={c8.failed} {p8.get('requests')}")
+    # Codex round 2 P2-5: requests go to every worker at once; an unresponsive one does not hold up the others
+
+    class SlowA:
+        def __init__(self):
+            self.when, self.release = {}, threading.Event()
+
+        def run(self, fn, *a, workers=None, wait=True, on_error="raise"):
+            self.when[a[0]] = _time.time()
+            if a[0] == "A":
+                self.release.wait(10)
+            return {workers[0]: {"state": "requested", "token": f"T{a[0]}", "epoch": 1.0}}
+    sa = SlowA()
+    st5 = Store()
+    st5.files[ws.checkpoint_pointer(cfg4.storage_prefix, "L1", "B")] = json.dumps(
+        {"generation": 1, "requests": ["TB"], "started_epoch": 2.0}).encode()
+    t0 = _time.time()
+    with contextlib.redirect_stdout(io.StringIO()) as b5:
+        r24 = checkpoint_now(cfg4, timeout_s=2, store=st5, connect=lambda c, cid: sa, poll_s=0.1)
+    took = _time.time() - t0
+    sa.release.set()
+    ok(r24 == 1 and sa.when.get("B", 99) - t0 < 1.0 and took < 4 and "B: checkpointed" in b5.getvalue()
+       and "A: unavailable" in b5.getvalue(),
+       f"CK24 (Codex round 2 P2-5) with worker A unresponsive, B is requested at once and the call ends at its "
+       f"deadline: B at {sa.when.get('B', 99) - t0:.2f}s, took {took:.1f}s {b5.getvalue()!r}")
+    # Codex round 3 P1-2: a pointer upload that may have committed protects its generation
+    wd9 = os.path.join(tempfile.mkdtemp(), "P")
+    os.makedirs(os.path.join(wd9, "runs", "R_p"))
+    open(os.path.join(wd9, "runs", "R_p", "a.txt"), "w").write("a")
+    ptr9 = ws.checkpoint_pointer("runs/t", "L1", "P")
+    g9 = lambda k: ws.checkpoint_blobs("runs/t", "L1", "P", k)  # noqa: E731
+    st9 = Store()
+    c9 = ws.Checkpointer("P", wd9, "runs/t", "L1", None, st9, 3600, log=lambda m: None)
+    for k in range(3):
+        st9.raise_after = (lambda blob: blob == ptr9) if k else None
+        c9.trigger("t")
+        c9.wait_idle(10)
+    p9 = json.loads(st9.files[ptr9])
+    out9 = tempfile.mkdtemp()
+    cfg9 = RunConfig(name="t", question_file="q", out_dir=out9, labels=("P",), storage_prefix="runs/t")
+    json.dump({"P": {"launch_id": "L1", "worker": "w"}}, open(cfg9.state_file, "w"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            f9 = fetch_checkpoint(cfg9, st9, "P").get("generation")
+    except SystemExit as e:
+        f9 = f"refused: {e}"
+    ok(c9.failed == 2 and p9.get("generation") == 3 and p9.get("previous") == 2 and g9(3)[0] in st9.files
+       and g9(2)[0] in st9.files and f9 == 3,
+       f"CK25 (Codex round 3 P1-2) two pointer uploads that committed, then failed their read-back: the generations "
+       f"they name are kept and fetchable: pointer {p9.get('generation')}/{p9.get('previous')} fetch {f9} "
+       f"{sorted(st9.files)}")
+    st9.raise_after = None
+    c9.trigger("t")
+    c9.wait_idle(10)
+    p9 = json.loads(st9.files[ptr9])
+    ok(p9.get("generation") == 4 and p9.get("previous") == 3 and g9(3)[0] in st9.files and g9(1)[0] not in st9.files,
+       f"CK25b the next success names g4 and g3; only older generations are retired: {sorted(st9.files)}")
+    # Codex round 3 P2-3: generations without a pointer: the newest complete one is adopted as the base
+    st10 = Store()
+    g10 = lambda k: ws.checkpoint_blobs("runs/t", "L1", "N", k)  # noqa: E731
+    st10.files[g10(1)[0]] = b"tar one"
+    st10.files[g10(1)[1]] = json.dumps({"generation": 1, "sha256": hashlib.sha256(b"tar one").hexdigest()}).encode()
+    st10.files[g10(2)[0]] = b"tar two, its record never written"
+    wd10 = os.path.join(tempfile.mkdtemp(), "N")
+    os.makedirs(os.path.join(wd10, "runs", "R_n"))
+    open(os.path.join(wd10, "runs", "R_n", "a.txt"), "w").write("a")
+    c10 = ws.Checkpointer("N", wd10, "runs/t", "L1", None, st10, 3600, log=lambda m: None)
+    c10.trigger("t")
+    c10.wait_idle(10)
+    p10 = json.loads(st10.files.get(ws.checkpoint_pointer("runs/t", "L1", "N"), b"{}"))
+    ok(c10.done == 1 and p10.get("generation") == 3 and p10.get("previous") == 1 and st10.files[g10(1)[0]] == b"tar one",
+       f"CK26 (Codex round 3 P2-3) generations but no pointer (the VM died before the first): the newest complete one "
+       f"is the base, and checkpoints go on: {p10.get('generation')}/{p10.get('previous')}")
+
+    class Unreadable(Store):
+        def download(self, blob, path, account=None):
+            if blob.endswith("checkpoint_U.json"):
+                raise PermissionError("pointer unreadable")
+            return super().download(blob, path, account)
+    st11 = Unreadable()
+    st11.files[ws.checkpoint_pointer("runs/t", "L1", "U")] = b"{}"
+    st11.files[ws.checkpoint_blobs("runs/t", "L1", "U", 1)[0]] = b"t"
+    before11 = dict(st11.files)
+    c11 = ws.Checkpointer("U", wd10, "runs/t", "L1", None, st11, 3600, log=lambda m: None)
+    c11.trigger("t")
+    c11.wait_idle(10)
+    ok(c11.failed == 1 and st11.files == before11,
+       "CK26b a pointer that exists but cannot be read: no checkpoint, nothing numbered or deleted")
+    ok(not any(b.endswith(".tar.gz") for b in st10.downloads) and g10(1)[0] in getattr(st10, "streamed", []),
+       f"CK32 (Codex round 4 P2) adoption checks a tarball's sha256 by streaming it, never downloading it: "
+       f"downloads {st10.downloads}")
+    # Codex round 4 P2: `checkpoint` without a pointer adopts the newest complete generation, as the uploader does
+    st15 = Store()
+    g15 = lambda k: ws.checkpoint_blobs("runs/t", "L1", "R1", k)  # noqa: E731
+    with open(os.path.join(work_root, "g2.tar.gz"), "wb") as f:
+        with tarfile.open(fileobj=f, mode="w:gz") as t:
+            ti = tarfile.TarInfo("runs/R_x/run_state.json")
+            body15 = b'{"state": "ANALYZE", "round": 1}'
+            ti.size = len(body15)
+            t.addfile(ti, _io.BytesIO(body15))
+    tar15 = open(os.path.join(work_root, "g2.tar.gz"), "rb").read()
+    st15.files[g15(2)[0]] = tar15
+    st15.files[g15(2)[1]] = json.dumps({"generation": 2, "sha256": hashlib.sha256(tar15).hexdigest(),
+                                        "run_dir": "R_x"}).encode()
+    st15.files[g15(3)[0]] = b"g3: its record was never written"
+    out15 = tempfile.mkdtemp()
+    cfg15 = RunConfig(name="t", question_file="q", out_dir=out15, labels=("R1",), storage_prefix="runs/t")
+    json.dump({"R1": {"launch_id": "L1", "worker": "w"}}, open(cfg15.state_file, "w"))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            f15 = fetch_checkpoint(cfg15, st15, "R1").get("generation")
+    except SystemExit as e:
+        f15 = f"refused: {e}"
+    ok(f15 == 2 and os.path.exists(os.path.join(out15, "R1", "checkpoint", "runs", "R_x", "run_state.json")),
+       f"CK31 (Codex round 4 P2) `checkpoint` with generations but no pointer fetches the newest complete one: {f15}")
+    # Codex round 4 P1: a capture during which run_state.json changed (a report quarantined, FINAL written) is
+    # discarded, never uploaded, and retried once on the next tick
+    wd16 = os.path.join(tempfile.mkdtemp(), "F")
+    rd16 = os.path.join(wd16, "runs", "R_f")
+    os.makedirs(rd16)
+    open(os.path.join(rd16, "report.md"), "w").write("# a report the gate will withhold\n")
+    open(os.path.join(rd16, "run_state.json"), "w").write('{"state": "WRITE", "round": 2}')
+    once = []
+
+    def quarantine(rel):
+        if rel == "run_state.json" and not once:     # report.md already copied; main.py then quarantines it
+            once.append(1)
+            os.makedirs(os.path.join(rd16, "quarantine"), exist_ok=True)
+            os.replace(os.path.join(rd16, "report.md"), os.path.join(rd16, "quarantine", "report.md"))
+            open(os.path.join(rd16, "run_state.json"), "w").write(
+                '{"state": "FINAL", "round": 2, "status": "completed_no_report"}')
+
+    class Racing(Store):
+        @staticmethod
+        def write_archive(root, arcname, out_path, secrets=None, extra=(), **kw):
+            return results_store.write_archive(root, arcname, out_path, secrets, extra, _hook=quarantine, **kw)
+    st16 = Racing()
+    c16 = ws.Checkpointer("F", wd16, "runs/t", "L1", None, st16, 3600, poll_s=0.05, log=lambda m: None)
+    c16.start()
+    try:
+        c16.trigger("t")
+        for _ in range(100):
+            if c16.done:
+                break
+            _time.sleep(0.05)
+    finally:
+        c16.stop()
+        c16.wait_idle(10)
+    tars16 = [b for b in st16.uploads if b.endswith(".tar.gz")]
+    names16 = (tarfile.open(fileobj=_io.BytesIO(st16.files[tars16[0]]), mode="r:gz").getnames() if tars16 else [])
+    rs16 = (json.load(tarfile.open(fileobj=_io.BytesIO(st16.files[tars16[0]]), mode="r:gz").extractfile(
+        "runs/R_f/run_state.json")) if tars16 else {})
+    ok(len(tars16) == 1 and "runs/R_f/report.md" not in names16 and rs16.get("state") == "FINAL"
+       and c16.done == 1 and "changed" in open(os.path.join(wd16, ws.CKDIR, "checkpoint.log")).read(),
+       f"CK30 (Codex round 4 P1) report copied, then quarantined and FINAL written: that capture is discarded, the "
+       f"retry on the next tick uploads a consistent one: {tars16} {names16} {rs16}")
+    # Codex round 3 P2-5: each request counts its own tries; exhausting one drops only that one
+    c12 = ws.Checkpointer("Z", wd10, "runs/t", "L1", None, Store(), 3600, log=lambda m: None)
+    c12._requeue({"old": (1.0, ws.MAX_REQUEST_TRIES), "new": (2.0, 0)}, "failed")
+    ok(set(c12.pending) == {"new"} and c12.pending["new"][1] == 1,
+       f"CK27 (Codex round 3 P2-5) an exhausted request is dropped; one that arrived meanwhile keeps its tries: "
+       f"{c12.pending}")
+    # Codex round 3 note: the deadline is checked before every blocking call, with no grace after it
+    labels30 = tuple(f"L{k}" for k in range(30))
+    out13 = tempfile.mkdtemp()
+    cfg13 = RunConfig(name="t", question_file="q", out_dir=out13, labels=labels30)
+    json.dump({lb: {"launch_id": "L1", "worker": f"w{lb}"} for lb in labels30}, open(cfg13.state_file, "w"))
+    json.dump({"run": {"name": "t", "id": 77}, "launch_id": "L1", "invocation": "tok"}, open(cfg13.clusters_file, "w"))
+
+    class Fast:
+        def run(self, fn, *a, workers=None, wait=True, on_error="raise"):
+            return {workers[0]: {"state": "requested", "token": "T", "epoch": 1.0}}
+
+    class Hanging(Store):
+        def download(self, blob, path, account=None):
+            _time.sleep(2)
+            raise FileNotFoundError(blob)
+    t0 = _time.time()
+    with contextlib.redirect_stdout(io.StringIO()):
+        r28 = checkpoint_now(cfg13, timeout_s=0.3, store=Hanging(), connect=lambda c, cid: Fast(), poll_s=0.1)
+    took = _time.time() - t0
+    # Codex round 3 P1-1 through the checkpointer: work/runs linked into _truth/ is never archived
+    tr = tempfile.mkdtemp()
+    os.makedirs(os.path.join(tr, "_truth", "R_t"))
+    open(os.path.join(tr, "_truth", "R_t", "answers.yaml"), "w").write("answer\n")
+    wd14 = os.path.join(tr, "W")
+    os.makedirs(wd14)
+    os.symlink(os.path.join(tr, "_truth"), os.path.join(wd14, "runs"))
+    st14 = Store()
+    c14 = ws.Checkpointer("W", wd14, "runs/t", "L1", None, st14, 3600, log=lambda m: None)
+    c14.trigger("t")
+    c14.wait_idle(10)
+    ok(c14.failed == 1 and not st14.uploads,
+       f"CK29 (Codex round 3 P1-1) a work dir whose runs/ links into _truth/: nothing archived or uploaded "
+       f"({st14.uploads})")
+    ok(r28 == 1 and took < 1.0,
+       f"CK28 (Codex round 3) 30 labels whose storage reads hang: the call ends at its 0.3 s deadline ({took:.2f}s)")
+
+
+def _self_test_sheet(ok) -> None:
+    """2026-11-12: a canary relaunch died in 8 s at SIGN because its spec was amended after its sign-off sheet was
+    generated; the pre-launch checks did not look at the sheet. A launch now refuses a resumed run at SIGN whose
+    sheet does not record the shipped spec's and derivation record's sha256."""
+    import hashlib
+
+    root = os.path.dirname(HERE)        # the launch check runs the archive's own code (#218 r4): ship this tree's
+    names = subprocess.run(["git", "-C", root, "ls-files", "toolkit", "agents", "scripts", "cloud"],
+                           capture_output=True, text=True).stdout.split()
+    code_files = {n: open(os.path.join(root, n), "rb").read() for n in names if os.path.isfile(os.path.join(root, n))}
+
+    def tar_of(files: dict) -> bytes:
+        bio = io.BytesIO()
+        with tarfile.open(fileobj=bio, mode="w:gz") as t:
+            for n, data in {**code_files, **files}.items():
+                ti = tarfile.TarInfo(n)
+                ti.size = len(data)
+                t.addfile(ti, io.BytesIO(data))
+        return bio.getvalue()
+
+    spec, rec = b"spec: 1\n", b'{"r": 1}'
+    def sheet_for(sp, rc):
+        return ("# sheet\n<!-- signoff-sheet-sources: " + json.dumps(
+            {"spec_sha256": hashlib.sha256(sp).hexdigest(), "derivations_sha256": hashlib.sha256(rc).hexdigest()})
+            + " -->\n").encode()
+    R = "runs/r1"
+    flags = ("--resume", R, "--signoff", "lead")
+    st = lambda s_: json.dumps({"state": s_}).encode()      # noqa: E731
+    base = {f"{R}/run_state.json": st("SIGN"), f"{R}/decision_spec.yaml": spec,
+            f"{R}/data/derivations_record.json": rec, f"{R}/decision_spec.signoff_sheet.md": sheet_for(spec, rec)}
+    fresh = stale_sheet_problems(tar_of(base), flags)
+    stale = stale_sheet_problems(tar_of({**base, f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+    stale_rec = stale_sheet_problems(tar_of({**base, f"{R}/data/derivations_record.json": b'{"r": 2}'}), flags)
+    nosheet = stale_sheet_problems(tar_of({k: v for k, v in base.items() if not k.endswith(".md")}), flags)
+    garbled = stale_sheet_problems(tar_of({**base, f"{R}/decision_spec.signoff_sheet.md": b"# no sources\n"}), flags)
+    # #218 review round 1: a run past SIGN ships the spec its sign-off hashed (with that record's evidence binding)
+    def rec_for(sp, ev=None):
+        return json.dumps({"sha256": {"decision_spec.yaml": hashlib.sha256(sp).hexdigest()},
+                           "evidence": ev or {"required": [], "dossier": None, "sha256": None,
+                                                 "declarations": {}, "closure": dict(sorted({   # its input closure
+                                                     "run:decision_spec.yaml": hashlib.sha256(sp).hexdigest(),
+                                                     "run:data/derivations_record.json":
+                                                         hashlib.sha256(rec).hexdigest()}.items()))}}).encode()
+    signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"),
+                                          f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
+    norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
+    ok(fresh == [] and signed == [] and norun == [],
+       f"RC80a a fresh sheet, a run past SIGN and a launch with no resumed run pass: {fresh} {signed} {norun}")
+    ok(len(stale) == 1 and "spec" in stale[0] and "signoff.py sheet" in stale[0] and "--write" in stale[0]
+       and len(stale_rec) == 1
+       and "derivation" in stale_rec[0],
+       f"RC80b a resumed run at SIGN whose spec or derivation record changed after its sheet is refused, with the "
+       f"command that regenerates the sheet: {stale} {stale_rec}")
+    ok(len(nosheet) == 1 and len(garbled) == 1,
+       f"RC80c fail closed: no sheet, or a sheet without recorded sources, is refused: {nosheet} {garbled}")
+    # Codex review of #207 (both reviewers, P2): v2 only; ./ and --resume= forms are checked; an unreadable
+    # run state is refused, not skipped.
+    stale_tar = tar_of({**base, f"{R}/decision_spec.yaml": b"spec: 2\n"})
+    v1 = stale_sheet_problems(stale_tar, flags, pipeline="v1")
+    dot = stale_sheet_problems(stale_tar, ("--resume", "./" + R))
+    eq = stale_sheet_problems(stale_tar, ("--resume=" + R,))
+    bad_state = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": b"{not json"}), flags)
+    ok(v1 == [] and len(dot) == 1 and len(eq) == 1 and len(bad_state) == 1 and "unreadable" in bad_state[0],
+       f"RC80d v1 launches are not checked; ./ and --resume= are; an unreadable run state is refused: "
+       f"{v1} {dot} {eq} {bad_state}")
+    # Codex review round 2 of #207 (P2): a run whose saved sign-off mode is none skips SIGN (not checked); the
+    # resume flag is read as main.py's argparse reads it (an abbreviation, the last value wins).
+    none_mode = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": json.dumps({"state": "SIGN",
+                                     "signoff": "none"}).encode(), f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+    # RC81 (F6 evidence dossier): the sheet and the signature bind the dossier the spec names; a launch refuses a
+    # run whose shipped dossier is not the one its sheet (at SIGN) or its sign-off (past SIGN) recorded
+    dspec, dos = b"spec: 1\nevidence: {dossier: evidence_dossier.yaml}\n", b"inputs: {}\n"
+
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from toolkit.spec import evidence_dossier as ED
+
+    def closure_of(sp, rc, ds):         # the input closure state() computes for these run files (no engine)
+        return dict(sorted({"run:decision_spec.yaml": hashlib.sha256(sp).hexdigest(),
+                            "run:evidence_dossier.yaml": hashlib.sha256(ds).hexdigest(),
+                            "run:data/derivations_record.json": hashlib.sha256(rc).hexdigest()}.items()))
+
+    def sheet_d(sp, rc, ds):
+        return ("# sheet\n<!-- signoff-sheet-sources: " + json.dumps(
+            {"spec_sha256": hashlib.sha256(sp).hexdigest(), "derivations_sha256": hashlib.sha256(rc).hexdigest(),
+             "evidence_dossier_sha256": hashlib.sha256(ds).hexdigest(),
+             "input_closure_sha256": ED.closure_digest(closure_of(sp, rc, ds))}) + " -->\n").encode()
+    dbase = {**base, f"{R}/decision_spec.yaml": dspec, f"{R}/evidence_dossier.yaml": dos,
+             f"{R}/decision_spec.signoff_sheet.md": sheet_d(dspec, rec, dos)}
+    d_fresh = stale_sheet_problems(tar_of(dbase), flags)
+    d_edit = stale_sheet_problems(tar_of({**dbase, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
+    d_gone = stale_sheet_problems(tar_of({k: v for k, v in dbase.items() if not k.endswith("dossier.yaml")}), flags)
+    signed_rec = json.dumps({"sha256": {"evidence_dossier.yaml": hashlib.sha256(dos).hexdigest(),
+                                        "decision_spec.yaml": hashlib.sha256(dspec).hexdigest()},
+                             "evidence": {"required": [], "dossier": "evidence_dossier.yaml",
+                                          "sha256": hashlib.sha256(dos).hexdigest(), "declarations": {},
+                                          "closure": closure_of(dspec, rec, dos)}}).encode()
+    past = {**dbase, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.signoff.json": signed_rec}
+    p_ok = stale_sheet_problems(tar_of(past), flags)
+    p_edit = stale_sheet_problems(tar_of({**past, f"{R}/evidence_dossier.yaml": b"inputs: {x: 1}\n"}), flags)
+    ok(d_fresh == [] and p_ok == [] and any("another evidence dossier" in x for x in d_edit)
+       and any("does not exist" in x for x in d_gone) and any("not the one the sign-off recorded" in x for x in p_edit),
+       f"RC81 a dossier edited after the sheet (at SIGN) or after the sign-off (past SIGN), or missing, refuses the "
+       f"launch; unchanged ones pass: {d_fresh} {d_edit} {d_gone} {p_ok} {p_edit}")
+    # RC82 (#218 review round 1)
+    nspec = (b"options: {components: {n: {}}, engine_map: {n: {net: pyr}}}\n"
+             b"engine: {ref: 'toolkit.engines.malaria.engine:MalariaEngine'}\n")
+    spec_state = stale_sheet_problems(tar_of({**dbase, f"{R}/run_state.json": st("SPEC")}), flags)
+    edited = stale_sheet_problems(tar_of({**past, f"{R}/decision_spec.yaml": b"spec: 1\n"}), flags)
+    legacy = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE"), f"{R}/decision_spec.yaml": nspec,
+                                          f"{R}/decision_spec.signoff.json": json.dumps({"sha256": {
+                                              "decision_spec.yaml": hashlib.sha256(nspec).hexdigest()}}).encode()}),
+                                  flags)
+    unsigned = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("ANALYZE")}), flags)
+    ok(spec_state == [] and any("not the one signed" in x for x in edited)
+       and any("unsigned_evidence" in x for x in legacy) and any("no sign-off record" in x for x in unsigned),
+       f"RC82 a draft at SPEC is not refused; past SIGN, a spec edited after its sign-off (removing `evidence` too), a "
+       f"sign-off made before the dossier requirement of a spec that needs one, and no sign-off at all are refused: "
+       f"{spec_state} {edited} {legacy} {unsigned}")
+    abbrev = stale_sheet_problems(stale_tar, ("--res", R))
+    last = stale_sheet_problems(stale_tar, ("--resume", "runs/old", "--resume=" + R))
+    ok(none_mode == [] and len(abbrev) == 1 and len(last) == 1 and "runs/old" not in last[0],
+       f"RC80e signoff none is not checked; --res is read; only the last --resume counts: {none_mode} {abbrev} {last}")
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -3660,9 +5128,15 @@ def _self_test() -> int:
             ok(False, "RC15 a config without CONFIG is refused")
         except SystemExit:
             ok(True, "RC15 a config without CONFIG is refused")
+    try:
+        _self_test_budget(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"BU: {type(e).__name__}: {e}")
+    globals()["budget_guard"] = lambda cfg, reserve=True, inv=None: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
     _self_test_52(ok)
+    _self_test_sheet(ok)
     _self_test_attach(ok)
     _self_test_sign(ok)
     _self_test_pipeline(ok, tb)
@@ -3694,6 +5168,10 @@ def _self_test() -> int:
         _self_test_collect_no_shutdown(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CN: {type(e).__name__}: {e}")
+    try:
+        _self_test_checkpoint(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CK: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
@@ -3741,6 +5219,15 @@ def main(argv) -> int:
         status(cfg)
     elif cmd == "collect":
         collect(cfg, shutdown_after="--no-shutdown" not in rest)
+    elif cmd == "checkpoint":
+        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
+        import results_store
+        for label in ([rest[rest.index("--label") + 1]] if "--label" in rest else cfg.labels):
+            fetch_checkpoint(cfg, results_store, label)
+    elif cmd == "checkpoint-now":
+        opt = lambda k, d=None: rest[rest.index(k) + 1] if k in rest else d  # noqa: E731
+        return checkpoint_now(cfg, float(opt("--timeout-s", 300.0)), invocation=opt("--invocation"),
+                              launch_id=opt("--launch-id"))
     elif cmd == "shutdown":
         shutdown(cfg)
     elif cmd == "relaunch":

@@ -30,13 +30,20 @@ HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "met
                  "data/derivations_record.json", "decision_spec.signoff_sheet.md",
                  "data/input_checks.json", "data/geometry_signoff.json")
 # data/derived/ (v2-derived-inputs): the tables the spec reads are written only by the harness's derivation runner.
-HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/")
+HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/",
+                    "world_model/")
+
+# The owner's decision design principles (2026-11-12): one file, the source of truth, in every task's system prompt.
+PRINCIPLES_FILE = os.path.join(_REPO, ".claude", "orchestration", "decision_design_principles.md")
+PRINCIPLES = open(PRINCIPLES_FILE).read().strip()
 
 COMMON = """You are one bounded task inside a modeling run driven by code (a state machine). The harness
 computes every number from the decision spec and the engine; you never type a number the report
 uses and never edit harness outputs (analysis/, run_state.json, findings.jsonl, gate files).
 Work only in the run directory, which is your working directory. Finish by writing the output
-file named below, then stop."""
+file named below, then stop.
+
+""" + PRINCIPLES.replace("{", "{{").replace("}", "}}")
 
 PROMPTS = {
     "draft_spec": COMMON + """
@@ -72,14 +79,17 @@ needs, validated benchmarks). Output: {out} = {{"engine": "<ref>", "why": "..."}
 Task: {reviewer} review, round {round}. Review the computed facts: the analysis artifacts in
 analysis/ (manifest.json and the *.yaml artifacts it lists), results.md, uncertainty_report.yaml,
 the deliverable file the spec names, engine_choice.json, decision_spec.yaml, impact_ledger.jsonl
-and the draft (manuscript.md) if it exists. The presentation review also reads findings.jsonl:
+and the draft (manuscript.md) if it exists. Read world_model/world_model.md first when it exists: the beliefs written
+before the analysis, which ones its outputs refuted, and where to look. For each refuted decision-relevant belief,
+say whether the engine, an input or the belief is wrong. The presentation review also reads findings.jsonl:
 its LOW report_number_typed rows (advisory) name numbers the writer typed instead of [CLAIM:id];
 raise one only if it misleads the reader. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
 {file} in the critique-blockers schema: reviewer, round, verdict (PASS | REVISE),
 structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
-first_seen_round, claim, evidence, fix_requires, resolved (true/false), and done_when (required for
+first_seen_round, claim, evidence, fix_requires (when the fix needs the signed decision_spec.yaml changed, start it
+with "Owner amendment:": the owner decides it, no task can), resolved (true/false), and done_when (required for
 HIGH and MEDIUM). Use only those values: the gate refuses any other.
 A blocker with resolved: true also needs resolved_in_round: {round} and resolved_evidence: "<where
 the fix is, file and section>"; keep its done_when (the harness re-runs the test and reopens the
@@ -117,7 +127,8 @@ Output: {out} = {{"ok": true, "changed": "<one line>"}}.""",
 Task: write manuscript.md ({mode}). Read results.md and the analysis artifacts in analysis/
 (manifest.json lists them), engine_choice.json, decision_spec.yaml and scope_declaration.yaml if
 present. Write the narrative, the methods and the
-interpretation. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
+interpretation. The harness appends the world-model section (world_model/world_model.md) to the report: refer to
+it in words where it helps, never copy its numbers. Write every number as a reference [CLAIM:<id>] to models/claims_ledger.yaml
 (the ids are listed there): the harness substitutes the value. Never type a number, and never write
 a bare id such as `mix.itn`: the gate refuses a report that shows one. Mode `not_accepted`: the first section is "Status: not accepted by the final
 gate", listing the open blocking findings from findings.jsonl in plain words. Mode `declared`: a
@@ -125,9 +136,161 @@ Limitations section that repeats each declaration in full with its required reme
 report was not accepted: never call it accepted, validated or conclusive (the terms are listed in
 .claude/orchestration/acceptance_language.yaml; the gate flags them). Output: manuscript.md and {out} = {{"ok": true}}.""",
 }
+from toolkit.analysis import belief_table as _BT  # noqa: E402 -- the decision-run seed format, documented there
+SEED_FILE = "world_model_seed.yaml"       # the harness validates it and copies it to analysis/world_model_seed.yaml
+WORLD_MODEL_PY = os.path.join(_REPO, "toolkit", "analysis", "world_model.py")
+
+
+def seed_prompt_text() -> str:
+    """The world model's own documentation of its seed format and tests, read from toolkit/analysis/world_model.py's
+    docstring (from "Seed (YAML)" up to the paragraph on analysis/point.yaml), so the prompt never restates the
+    format. Missing markers fail closed."""
+    import ast
+    doc = ast.get_docstring(ast.parse(open(WORLD_MODEL_PY).read())) or ""
+    a, b = doc.find("Seed (YAML)"), doc.find("analysis/point.yaml is used only")
+    if a < 0 or b <= a:
+        raise RuntimeError(f"{WORLD_MODEL_PY}: its docstring no longer documents the seed format where expected")
+    common = COMMON.replace("{{", "{").replace("}}", "}")          # COMMON is a .format template: as delivered
+    return (common + """
+
+Task: write the world model's version 0 for this question, before any simulation: the modeller's working
+understanding of how the decision works, meant to be mostly right, not precise. {out_in} holds the question, the
+decision spec's options (each package and its components, the comparator, the primary outcome), the engine's card
+(mechanisms, components, notes) and the sweep the harness runs after you finish: its design features (the only
+names your tests may use), their ranges, the number of design points, which features the design samples
+independently of the others, and whether a shadow price and an optimised plan will exist. No results exist yet,
+and the harness refuses any read of analysis/ or of other runs: nothing you write can depend on a simulation
+output. The spec's values, the engine's effect values and priors and the input data values are withheld on
+purpose: the world model is built from literature and reasoning, then confronted with the simulation, never with its
+own inputs. In the run directory only {out_in} and your own seed file are readable; the repository's code and
+documentation (toolkit/, docs/, .claude/) are readable, its data/ and scripts/ are not.
+
+Write """ + SEED_FILE + """ in the world model's format, documented below by toolkit/analysis/world_model.py itself:
+- beliefs: the mechanisms that drive this decision, each with its direction, a rough magnitude band on a stated
+  scale (a band, never a point value), the conditions or branching points where the answer changes, roughly
+  located, its basis (literature: the citation and its table or page; data: a dataset of the run listed in
+  {out_in}, its file and column, never a file the harness writes such as {out_in}) and your confidence. Mark decision_relevant: true on the beliefs the choice turns on. Cite only
+  sources you know, with authors, journal and year; when unsure of a value or a location say so and set confidence
+  low; never invent a citation or a table.
+- open_questions: what is unknown and would change the choice if known.
+- hypotheses: 5 to 8, each tied to one belief and with a machine-checkable refutation test of one of the kinds
+  below, with explicit thresholds, naming only the packages and features listed in {out_in}. Each states what you
+  expect the sweep to show and what would refute it. Choose each threshold from the belief, never to make the
+  test easy to pass. Give every band as tight as the cited evidence supports: a band wider than the plausible
+  range makes its test lenient (it passes whatever the simulation shows), and a lenient test tests nothing.
+  Every literature citation is looked up after you finish (title, first author and year), so cite the paper's
+  title, first author and year exactly.
+- p: every hypothesis also states p, your probability between 0.02 and 0.98 that its claim holds in this sweep.
+  Be calibrated: of claims you give p 0.7, about 7 in 10 should hold. Each outcome is scored against its p.
+  Each claim competes with its alternatives: an effect_direction claim with the other direction and "no material
+  effect", any other claim with "does not hold". An effect_direction hypothesis may also state weights, e.g.
+  {increases: 0.2, decreases: 0.5, no material effect: 0.3}: all three, summing to 1, its own claim's weight equal
+  to p. Without weights the remainder 1 - p is split equally.
+- A feature the sweep does not sample independently (not in independent_features) needs an adjusted test: an
+  effect_direction test on it states adjust_for (the independent features to adjust for); a flip_in test uses an
+  independent feature. Refused otherwise.
+- When {out_in} carries prior_world_model (earlier questions' belief tables), start from it. Each claim set lists
+  its competing claims, their prior, engine and world weights, and its evidence log: one row per simulation result,
+  with the claim it favours, a likelihood ratio (10 for a decided test, at most 2 for an undecided one leaning toward
+  the sign of its estimate) and the observed rho, interval and p, including inconclusive results. check_items name
+  where our simulations and the literature disagree. Carry forward what held, weigh what leaned, revise what was
+  refuted (never repeat a refuted claim unless this question's setting differs, and then say how), and turn open
+  questions and check items into claims this sweep can test. The harness registers the
+  hypotheses before the sweep runs (you do not write registered_at).
+
+""" + doc[a:b].strip() + """
+
+Then write {out} = {"ok": true, "notes": "<one line: what drives the choice, in your view>"}.
+
+A decision run instead of a sweep: when {out_in} carries decision_run, the harness will not run a sweep; it runs a
+full decision analysis (named in decision_run: its options, comparator, plan variants, decision tests and the
+outputs it writes) and scores your beliefs against those outputs. Then ignore the sweep, the tests and the 5 to 8
+hypotheses above and write """ + SEED_FILE + """ in the belief table's decision-run format (toolkit/analysis/
+belief_table.py), with as many beliefs as decision_run.beliefs states and at least one per topic in
+decision_run.topics. Each belief is your forecast of what that analysis will show, as competing claims with
+weights: be calibrated, reason from the literature and from how the engine works (its card and code are readable),
+and set the weights from that reasoning, never to hedge every belief toward an even split. When
+decision_run.claims lists each topic's claims (a v2 run), write exactly one belief per topic whose claims are exactly
+those sentences, and set their weights: never add, drop or reword a claim (the harness scores them by code).
+
+""" + _BT.DECISION_SEED_FORMAT + """""")
+
+
+# as a .format template: every brace literal except the two fields the task method fills
+PROMPTS["seed_world_model"] = seed_prompt_text().replace("{", "{{").replace("}", "}}") \
+    .replace("{{out_in}}", "{out_in}").replace("{{out}}", "{out}")
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
-        "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",)}
+        "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",),
+        "seed_world_model": (SEED_FILE,)}
+
+
+SEED_RUN_READABLE = ("_task_input.json", SEED_FILE)
+SEED_REPO_READABLE = ("toolkit", "docs", ".claude")
+
+
+def _seed_read_denied(tool: str, ti: dict, run_dir: str) -> str | None:
+    """Why the world-model seed task may not run this Read, Grep or Glob: the seed exists before any result, so
+    nothing under the run's analysis/ (the batch, the world model, the hypotheses) and nothing in another run is
+    readable, and a search that would reach analysis/ is refused. The repository's code and docs are readable (after
+    the evaluation answer-key rules)."""
+    import glob as _glob
+    why = _search_denied(tool, ti, run_dir)
+    if why:
+        return why
+    root = os.path.realpath(run_dir)
+    target = str(ti.get("file_path") or ti.get("path") or "")
+    base = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else root
+    if tool == "Glob" and ti.get("pattern"):
+        pat = str(ti["pattern"]).replace("\\", "/")
+        lit = []
+        for part in pat.split("/"):
+            if _glob.has_magic(part):
+                break
+            lit.append(part)
+        if lit:
+            base = os.path.realpath(os.path.join(base, "/".join(lit)) if not pat.startswith("/") else
+                                    "/" + "/".join(lit).lstrip("/"))
+        if ".." in pat.split("/"):
+            return "the seed task may not search outside its run directory"
+    analysis = os.path.join(root, "analysis")
+    if _within(base, analysis):
+        return "the world-model seed is written before any result: analysis/ is not readable"
+    if not _within(base, root) and _in_or_reaches_run(base, tool):     # v2 runs' seeds sit in world_model/seed/
+        return "the seed task may not read any run directory: runs' inputs and outputs are withheld"
+    repo = os.path.realpath(_REPO)
+    if not _within(base, root) and _within(base, repo) and not _within(root, base):
+        # the repository's code and documentation only: no run, no template, no input data, no driver files
+        rel = os.path.relpath(base, repo).replace(os.sep, "/")
+        if rel.split("/")[0] not in SEED_REPO_READABLE:
+            return (f"the seed task may read the repository's {', '.join(SEED_REPO_READABLE)} only: inputs, "
+                    "templates and runs are withheld")
+        return None
+    if not _within(base, root):
+        return "the seed task may read only its run directory's input and the repository's code"
+    rel = os.path.relpath(base, root).replace(os.sep, "/")
+    if rel not in SEED_RUN_READABLE:
+        return (f"in the run directory the seed task reads only {', '.join(SEED_RUN_READABLE)}: the spec's values and "
+                "the input data are withheld (the world model is confronted with the simulation, never its inputs)")
+    return None
+
+
+def _in_or_reaches_run(base: str, tool: str, limit: int = 20000) -> bool:
+    """Is `base` inside a run (an ancestor holds run_state.json), or does a search from it reach one? Fail closed
+    past `limit` entries (Codex review: another run under the repository's docs/ or .claude/ was readable)."""
+    RUN_MARKERS = _sio().RUN_MARKERS               # v1 runs carry only metadata.json (Codex re-review)
+    marks = ("run_state.json",) + tuple(RUN_MARKERS)
+    up = base
+    while up != os.path.dirname(up):
+        if any(os.path.lexists(os.path.join(up, x)) for x in marks):
+            return True
+        up = os.path.dirname(up)
+    n = 0
+    for _r, dirs, files in (os.walk(base) if tool in ("Grep", "Glob") and os.path.isdir(base) else ()):
+        n += len(dirs) + len(files)
+        if any(x in files for x in marks) or n > limit:
+            return True
+    return False
 
 
 def _answer_key(target: str, run_dir: str) -> bool:
@@ -249,8 +412,11 @@ class SdkTasks:
     Every charge is also written to budget_ledger.json."""
 
     def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int = 30,
-                 query_fn=None):
+                 query_fn=None, io_root: str | None = None):
         self.run_dir = os.path.abspath(run_dir)
+        # lib.safe_io's trusted root: the run dir. A world-model seed session runs in <run>/world_model/seed/, and
+        # safe_io refuses a root inside a run dir (smoke4, 2026-11-16), so its root is the run dir itself.
+        self.io_root = os.path.abspath(io_root or run_dir)
         self.cloud = allow_cloud
         self.cap = task_cap_usd
         self.allowance = task_cap_usd
@@ -283,7 +449,7 @@ class SdkTasks:
         if allowance is None or allowance <= 0:
             return TaskResult(False, None, 0.0, "no allowance: the call was not made")
         out = os.path.join(self.run_dir, OUT)
-        _sio().remove_path(out, self.run_dir)
+        _sio().remove_path(out, self.io_root)
 
         async def pre(input_data, tool_use_id, context):
             name = input_data.get("tool_name")
@@ -296,7 +462,7 @@ class SdkTasks:
                 if why:
                     return enforcement.deny_output(f"{kind}: {why}")
             if name in ("Read", "Grep", "Glob"):
-                why = _search_denied(name, ti, self.run_dir)
+                why = (_seed_read_denied if kind == "seed_world_model" else _search_denied)(name, ti, self.run_dir)
                 if why:
                     return enforcement.deny_output(why)
             return {}
@@ -357,7 +523,7 @@ class SdkTasks:
         except (OSError, ValueError):
             return TaskResult(False, None, usd, f"no valid {OUT}", seen["sid"])
         finally:
-            _sio().remove_path(out, self.run_dir)
+            _sio().remove_path(out, self.io_root)
         return TaskResult(True, output, usd, str(output.get("notes") or output.get("changed") or "")[:300], seen["sid"])
 
     def _input(self, obj) -> str:
@@ -390,12 +556,16 @@ class SdkTasks:
         fb = ("\n\nThis is a repair: the gate refused your file. These are all of its errors; fix every one, "
               "check the whole file against the schema above, and keep the review:\n- "
               + "\n- ".join(feedback)) if feedback else ""
+        from toolkit.analysis import red_flag as RF       # heuristic notes the reviewer judges; never a gate
+        notes = RF.critic_notes(run_dir)
+        msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
+                                            + "\n- ".join(notes) if notes else "")
         return self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
             stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
-                             f"Review round {round_n}.", (f,), model)
+                             msg, (f,), model)
 
     def plan_fixes(self, packet):
         inp = self._input(packet)
@@ -409,12 +579,35 @@ class SdkTasks:
                                                            evidence=json.dumps(evidence)[:2000] if evidence else "none",
                                                            settings=_settings_text(), out=OUT), "Make the fix.", owns)
 
-    def write(self, run_dir, mode, feedback=None):
+    def write(self, run_dir, mode, feedback=None, findings=None):
         fb = ("\n\nThis is a repair: the report was not accepted, and the harness will not deliver it while it "
               "uses acceptance language. Rewrite these passages (say what was tested and what is declared), "
               "keep everything else:\n- " + "\n- ".join(feedback)) if feedback else ""
+        if findings:     # F6 run 3: the fix loop leaves findings in the report text to the writer
+            fb += ("\n\nOpen findings in the report text (no other task edits it): fix each one in manuscript.md.\n- "
+                   + "\n- ".join(f"{f.get('id')}: {f.get('claim')}" + (f" Required: {f['fix_requires']}"
+                                                                         if f.get("fix_requires") else "")
+                                  for f in findings))
         return self._session("write", PROMPTS["write"].format(mode=mode, out=OUT) + fb, "Write the draft.",
                              OWNS["write"])
+
+    def seed_world_model(self, context, feedback=None):
+        """The world model's version 0 (docs/design/v2-progressive-steps.md §4): beliefs and 5-8 pre-registrable
+        hypotheses written before any result exists, to world_model_seed.yaml. `context`: the question, the options,
+        the engine card and the sweep's design features (no results). `feedback`: the harness's refusal, for the one
+        repair."""
+        inp = self._input(context)
+        fb = ("\n\nThis is a repair: the harness refused your " + SEED_FILE + ". These are all of its errors; fix "
+              "every one and keep the rest of your world model:\n- " + "\n- ".join(feedback)) if feedback else ""
+        return self._session("seed_world_model", PROMPTS["seed_world_model"].format(out_in=inp, out=OUT) + fb,
+                             "Write the world-model seed.", OWNS["seed_world_model"])
+
+    def world_model_seed(self, run_dir, ctx, feedback, cap_usd):
+        """The stage machine's PREREGISTER seed (docs/design/v2c-orchestration.md §14): one session in `run_dir`
+        (the run's world_model/seed/), capped at `cap_usd`, through the same adapter the trials use."""
+        t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir)
+        t.set_allowance(cap_usd)
+        return t.seed_world_model(ctx, feedback)
 
 
 def _self_test() -> int:
@@ -435,6 +628,18 @@ def _self_test() -> int:
             if raise_after:
                 raise raise_after
         return q
+    # Owner, 2026-11-12: the decision design principles are the default of every task (one file, the source of truth).
+    try:
+        ptxt = open(PRINCIPLES_FILE).read().strip()
+        # As delivered: the templates hold the file with its braces doubled for .format().
+        every = {k: (ptxt in v.replace("{{", "{").replace("}}", "}")) for k, v in PROMPTS.items()}
+        banned = [w for w in ("malaria", "nigeria", "lga", "pbo", "smc", "itn", "net ", "anopheles")
+                  if w in ptxt.lower()]
+        ok(len(ptxt) > 500 and all(every.values()),
+           f"DP1 every v2 task prompt carries the decision design principles from {PRINCIPLES_FILE}: {every}")
+        ok(not banned, f"DP2 the principles name no disease, place or intervention (disease-agnostic): {banned}")
+    except Exception as e:  # noqa: BLE001 -- before the file and the wiring exist this is the failure
+        ok(False, f"DP1/DP2: {type(e).__name__}: {e}")
     with tempfile.TemporaryDirectory() as d:
         init = NS(subtype="init", data={"session_id": "s1"})
         res = NS(total_cost_usd=0.42, session_id="s1", is_error=False)
@@ -628,11 +833,30 @@ def _self_test() -> int:
                                  d, {"k": "{v}"}),
             "write": lambda: t.write(d, "accepted"),
         }
+        # first, so plan_fixes' packet is the last _task_input.json written (PF4 reads it)
+        calls = dict({"seed_world_model": lambda: t.seed_world_model({"question": "Q?", "packages": {"none": []}},
+                                                                     ["fb {x}"])}, **calls)
         for k, call in calls.items():
             try:
                 call()
             except Exception as e:  # noqa: BLE001 -- the failure is the finding
                 errors[k] = f"{type(e).__name__}: {e}"
+        # PS1 (F6 run 3): the write-up findings reach the writer's prompt
+        where = {}
+        orig_session = SdkTasks._session
+
+        def at_session(self_, kind, system, prompt, owns, model=None):
+            where[kind] = (self_.run_dir, self_.io_root, self_.allowance, system if kind == "write" else "")
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        SdkTasks._session = at_session
+        try:
+            t2 = SdkTasks(d)
+            t2.set_allowance(1.5)
+            t2.write(d, "declared", findings=[{"id": "R-030", "claim": "overstates", "fix_requires": "say tested"}])
+        finally:
+            SdkTasks._session = orig_session
+        ok("R-030: overstates Required: say tested" in where.get("write", ("", "", 0, ""))[3],
+           "PS1 the writer gets the write-up findings with their remedies")
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")
@@ -642,6 +866,48 @@ def _self_test() -> int:
         pk = json.load(open(os.path.join(d, "_task_input.json")))
         ok('{"tasks": [{"id": "T1"' in (seen_prompts.get("plan_fixes") or "") and pk["findings"] == [{"id": "R-001"}],
            "PF4 plan_fixes keeps the plan's JSON example and writes the packet the prompt names")
+    # World-model seed task (F6 world-model trials): the world model's own seed documentation in the prompt, no results
+    # readable, one owned output outside the harness's analysis/ tree.
+    try:
+        import ast
+        wm_doc = ast.get_docstring(ast.parse(open(os.path.join(_REPO, "toolkit", "analysis", "world_model.py")).read()))
+        sp = seed_prompt_text()
+        ok("Seed (YAML)" in sp and "effect_band {package, band, min_share, where?}" in sp
+           and wm_doc[wm_doc.index("Tests (each declares"):wm_doc.index("Statuses:")] in sp and PRINCIPLES in sp,
+           "SW1 the seed prompt carries the world model's own seed and test documentation (read from world_model.py) "
+           "and the decision design principles")
+        ok("results" in sp.lower() and "5 to 8" in sp and SEED_FILE in sp,
+           "SW1b the seed prompt says no results are readable, asks for 5 to 8 hypotheses and names its output file")
+        from toolkit.analysis import belief_table as _BT
+        ok("decision_run" in sp and _BT.DECISION_SEED_FORMAT in sp,
+           "SW1c the seed prompt carries the belief table's decision-run format, for an input that names a decision run "
+           "instead of a sweep")
+        with tempfile.TemporaryDirectory() as d:
+            rd = os.path.join(d, "run")
+            os.makedirs(os.path.join(rd, "analysis", "batch"))
+            got = {
+                "results": _seed_read_denied("Read", {"file_path": "analysis/batch/results.jsonl"}, rd),
+                "analysis glob": _seed_read_denied("Glob", {"pattern": "analysis/**"}, rd),
+                "grep root": _seed_read_denied("Grep", {"pattern": "rho"}, rd) is None,
+                "spec": _seed_read_denied("Read", {"file_path": "decision_spec.yaml"}, rd),
+                "input": _seed_read_denied("Read", {"file_path": "_task_input.json"}, rd) is None,
+                "sibling run": _seed_read_denied("Read", {"file_path": os.path.join(d, "other", "analysis",
+                                                                                     "hypotheses.yaml")}, rd),
+                "climb": _seed_read_denied("Glob", {"pattern": "../**/world_model.yaml"}, rd),
+                "repo world model": _seed_read_denied("Read", {"file_path": os.path.join(
+                    _REPO, "toolkit", "analysis", "world_model.py")}, rd) is None,
+            }
+            want = {"results": True, "analysis glob": True, "grep root": False, "spec": True, "input": True, "sibling run": True,
+                    "climb": True, "repo world model": True}
+            ok({k: bool(v) for k, v in got.items()} == want,
+               f"SW2 the seed task cannot read results (analysis/, other runs, a climb out of the run) or the spec, and "
+               f"can read its input and the repository's code: {got}")
+            # a recursive search at the run root would reach analysis/: refused unless it is confined elsewhere
+            ok(_allowed(SEED_FILE, rd, OWNS["seed_world_model"]) is None
+               and _allowed("analysis/world_model_seed.yaml", rd, OWNS["seed_world_model"]) is not None,
+               "SW3 the seed task writes only its own seed file; analysis/ stays the harness's")
+    except Exception as e:  # noqa: BLE001 -- before the task exists this is the failure
+        ok(False, f"SW1-SW3 seed task: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

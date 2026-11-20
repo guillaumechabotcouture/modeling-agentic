@@ -39,7 +39,8 @@ def _c(cid, kind, art, field, units="", **kw):
             "produced_by": "harness", **kw}
 
 
-def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal: dict, burden=None) -> list[dict]:
+def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal: dict, burden=None,
+               anchor=None) -> list[dict]:
     o = A.primary
     cl = [_c("headline.point", "scalar", arts["point"], f"data.averted.{o}", o),
           _c("headline.median", "scalar", arts["uncertainty"], f"data.fixed_plan.{o}.median", o,
@@ -116,6 +117,19 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
             for k, _g in enumerate((d.get("units_changed_by_group") or [])[:GROUPS_SHOWN]):
                 cl.append(_c(f"dt.{tid}.group{k}", "count", arts["decision_tests"],
                              f"{f}.units_changed_by_group[{k}].changed", "units"))
+            # #248: what an outcome_ratio or burden_scale test set (its record's detail in the artifact)
+            for k, _v in enumerate((d.get("outcome_ratio") or {}).get("values") or []):
+                if _v == "engine":         # #251: the base adjustment removed, a case named in words, not a number
+                    continue
+                cl.append(_c(f"dt.{tid}.ratio{k}", "scalar", arts["decision_tests"],
+                             f"{f}.detail.outcome_ratio.values[{k}]", "ratio"))
+            bsr = d.get("burden_scale") or {}
+            for k, _s in enumerate(bsr.get("shares") or []):
+                cl.append(_c(f"dt.{tid}.share{k}", "scalar", arts["decision_tests"], f"{f}.detail.burden_scale.shares[{k}]",
+                             "share"))
+            for k, rid in enumerate(sorted(bsr.get("references") or {})):
+                cl.append(_c(f"dt.{tid}.factor{k}", "scalar", arts["decision_tests"],
+                             f"{f}.detail.burden_scale.references.{rid}.factor", "ratio"))
     for r in _spec_rows(A, claimable=True):     # spec-declared engine parameter values and the card values they replace
         n, f = r["name"], f"data.spec_values.{r['name']}"
         cl.append(_c(f"spec_value.{n}.value", "scalar", arts["engine"], f"{f}.value", r["units"]))
@@ -130,6 +144,9 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
     if burden:      # F6 S2-5: absolute burden against external estimates
         from toolkit.analysis import burden as BV
         cl += BV.claims(_c, arts["burden_validation"], burden)
+    if anchor:      # F6 S2-5d: absolute burden anchored to external estimates
+        from toolkit.analysis import burden as BV
+        cl += BV.anchor_claims(_c, arts["burden_anchor"], anchor)
     return cl
 
 
@@ -145,10 +162,13 @@ def _spec_rows(A, claimable=False) -> list[dict]:
     return [r for r in PV.rows(A.spec, A.eng) if not claimable or _claimable(r["name"])]
 
 
-def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc, pv=None, burden=None) -> dict:
+def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc, pv=None, burden=None, anchor=None,
+          voi=None) -> dict:
     B, R = _scripts()
+    from toolkit.analysis import value_of_information as VOI
     spec = {"producer": PRODUCER, "produced_by": "harness",
-            "claims": claim_spec(A, arts, point, uq, stab, dts, cal, burden) + variant_claims(A, arts, pv)}
+            "claims": claim_spec(A, arts, point, uq, stab, dts, cal, burden, anchor) + variant_claims(A, arts, pv)
+            + (VOI.claims(_c, arts["value_of_information"], voi) if voi is not None else [])}
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().write_nofollow(run_dir, SPEC_REL.replace(os.sep, "/"),
                               yaml.safe_dump(spec, sort_keys=False, width=120).encode(), atomic=True)
@@ -158,7 +178,8 @@ def write(A, run_dir, arts, point, uq, stab, sens, dts, cal, emu_acc, pv=None, b
     if doc.get("unresolved"):
         raise RuntimeError(f"claims ledger: unresolved harness claims {doc['unresolved'][:3]}")
     claims = R.load_claims(os.path.join(run_dir, "models", "claims_ledger.yaml"))
-    text = results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden) + variants_markdown(A, pv)
+    text = (results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden, anchor) + variants_markdown(A, pv)
+            + ("\n" + "\n".join(VOI.results_lines(voi)) if voi is not None else ""))
     rendered, unresolved = R.render_text(text, claims)
     if unresolved:
         raise RuntimeError(f"results.md: unresolved claims {unresolved}")
@@ -300,7 +321,30 @@ def variants_markdown(A, pv) -> str:
     return "\n".join(L) + "\n"
 
 
-def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -> str:
+def _tested_text(d: dict, t: str) -> str:
+    """#248: what an outcome_ratio or burden_scale test set, in words, its numbers as claims."""
+    orr = d.get("outcome_ratio") or {}
+    if orr.get("values"):
+        pairs = ", ".join(f"{k} → {v}" for k, v in sorted((orr.get("pairs") or {}).items()))
+        held = orr.get("unpaired") or []
+        return (f"Tested ratios of a package's {orr.get('outcome')} with {orr.get('component')} to the same package's "
+                f"with {orr.get('reference')} in its place: "
+                + ", ".join("the engine's own effect (its base adjustment removed)" if v == "engine"
+                            else f"[CLAIM:dt.{t}.ratio{k}]" for k, v in enumerate(orr["values"]))
+                + f" (package pairs: {pairs}"
+                + (f"; held, with no counterpart: {', '.join(held)}" if held else "") + "). ")
+    bsr = d.get("burden_scale") or {}
+    if bsr.get("shares"):
+        refs = bsr.get("references") or {}
+        return ("Shares of each reference's factor (reference / model) applied: "
+                + ", ".join(f"[CLAIM:dt.{t}.share{k}]" for k in range(len(bsr["shares"])))
+                + "; factors: " + "; ".join(f"{rid} ({refs[rid].get('group')}): [CLAIM:dt.{t}.factor{k}]"
+                                            for k, rid in enumerate(sorted(refs)))
+                + ". " + (f"Assumption: {bsr['assumption']}. " if bsr.get("assumption") else ""))
+    return ""
+
+
+def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None, anchor=None) -> str:
     o = A.primary
     s = A.spec
     L = [f"# Results: {s['question'].strip()}", "",
@@ -377,6 +421,8 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -
             L.append(f"| {p} | {_fmt(v['estimate'])} | {_fmt(v['se'])} | {v['status']} |")
         L.append("")
     L += attribute_simplifications(A)
+    from toolkit.engines import benchmark_coverage as BC
+    L += BC.results_lines(A.spec.raw, getattr(A.spec, "base", None))                  # the signed engine departures, as declared limitations
     if emu_acc and not emu_acc.get("direct"):
         acc = {k: v for k, v in emu_acc.items() if k != "boundary_ranking"}
         L += [f"Emulator held-out accuracy: {', '.join(f'{k} {_fmt(v)}' for k, v in acc.items())}.", ""]
@@ -386,9 +432,9 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -
                    f"Ranking near package switches: for {bd['matched']} of {bd['units']} units closest to switching, the "
                    f"emulator orders the plan package and its runner-up as engine runs at the calibrated values do "
                    f"(threshold {bd['threshold']:.0%})."), ""]
-    if burden:
+    if burden or anchor:
         from toolkit.analysis import burden as BV
-        L += BV.results_lines(burden)
+        L += (BV.anchor_results_lines(anchor) if anchor else []) + (BV.results_lines(burden) if burden else [])
     L += ["## Allocation stability", ""]
     if stab.get("folds"):
         L += [f"{stab['method']}, {stab['n_folds']} folds. Objective lost when a group's data are withheld (worst "
@@ -444,5 +490,6 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None) -
                  + ", ".join(f"{g['group']}: [CLAIM:dt.{t}.group{k}]" for k, g in enumerate(grp[:GROUPS_SHOWN]))
                  + ")" if grp else "")
               + ". " + (f"Changes the plan on: {', '.join(d['triggered_by'])}. " if d.get("triggered_by") else "")
+              + _tested_text(d, t)
               + f"Result file: `{d['path']}`.", ""]
     return "\n".join(L) + "\n"

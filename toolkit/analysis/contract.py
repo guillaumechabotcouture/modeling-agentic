@@ -15,6 +15,8 @@ harness wrote, for the spec that was signed:
   analysis_contract_claims     a ledger claim is not harness-produced or cites a file the manifest does not list
   analysis_contract_figure     a figure's sources changed after it was drawn, or are recorded outside the run dir
                                (sources are recorded relative to the run dir, so a moved run dir still checks)
+  analysis_contract_value_of_information  the value-of-information artifact the spec asks for is missing, present
+                               when switched off, or malformed (F6: toolkit/analysis/value_of_information.py)
 All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding).
 """
 from __future__ import annotations
@@ -144,7 +146,7 @@ def _reserve(run_dir: str, point, unc: dict) -> list[dict]:
     return reserve_findings(rule, point or {}, unc or {})
 
 
-def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
+def _burden(run_dir: str, data, signed: bool = False, anchor=None) -> list[dict]:
     """F6 S2-5: the signed spec's validation.burden, judged from the artifact's numbers (toolkit/analysis/burden.py);
     a group outside its tolerance is declarable, every other problem is not (fail closed)."""
     try:
@@ -174,7 +176,8 @@ def _burden(run_dir: str, data, signed: bool = False) -> list[dict]:
     if data is not None and not (isinstance(pv, dict) and pv.get("independent") is True):
         out.append(_f("analysis_contract_burden", "analysis/burden_validation.yaml does not record a reference file "
                       "independent of the calibration inputs", "burden"))
-    return out + BV.findings(raw, data, None if bad else refs) + (BV.block_findings(sp, data) if sp and not bad else [])
+    return (out + BV.findings(raw, data, None if bad else refs) + (BV.block_findings(sp, data) if sp and not bad else [])
+            + BV.anchor_findings(raw, anchor, None if bad else refs, sp))       # F6 S2-5d
 
 
 def _boundary(run_dir: str, data, point) -> list[dict]:
@@ -217,6 +220,103 @@ def _survey_changes(run_dir: str, data) -> list[dict]:
 
 
 def gate_findings(run_dir: str) -> list[dict]:
+    return departure_findings(run_dir) + _gate_findings(run_dir)
+
+
+def departure_findings(run_dir: str) -> list[dict]:
+    """#215: a signed engine departure of the engine the run used whose decision test did not take effect (not run,
+    an identity at the calibrated point, a targeted package skipped, no realised change in a package holding the
+    departed pair or component) is a non-declarable finding that bears on the decision. The verdict is recomputed
+    from the decision-test records the manifest lists with matching hashes (decision_tests.departure_verdicts); a
+    record missing from the manifest, or changed since, counts as not run."""
+    import yaml
+    try:
+        spec = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError):
+        return []                     # the contract checks below report an unreadable spec
+    deps = [d for d in (spec.get("engine_departures") or []) if isinstance(d, dict)] if isinstance(spec, dict) else []
+    if not deps:
+        return []
+
+    def f(claim, key):
+        return dict(_f("departure_test_ineffective", claim, key), decision_bearing=True)
+    e = spec.get("engine")
+    ref = e.get("ref") if isinstance(e, dict) else e
+    cfg = (e.get("config") if isinstance(e, dict) else None) or {}
+    if not (isinstance(ref, str) and ":" in ref):
+        try:
+            ch = (json.load(open(os.path.join(run_dir, ENGINE_CHOICE))) or {}).get("engine") or {}
+            ref, cfg = ch.get("ref"), ch.get("config") or {}
+        except (OSError, ValueError, AttributeError):
+            ref = None
+    try:
+        man = json.load(open(os.path.join(run_dir, MANIFEST)))
+    except (OSError, ValueError):
+        man = {}
+    # r5: the scope is the engine the run used, never the coverage file's own name. Every source of its identity is
+    # read (the manifest, the hashed engine artifact's envelope and card, the engine the spec or engine_choice.json
+    # resolves to); when they disagree the scope is not trusted and the run gets the finding (fail closed)
+    names = {}
+    if isinstance(man, dict):
+        names["the manifest"] = ((man.get("engine") or {}).get("name"))
+        ent = (man.get("artifacts") or {}).get(os.path.join("analysis", "engine.yaml")) or \
+            (man.get("artifacts") or {}).get("analysis/engine.yaml")
+        ap = os.path.join(run_dir, "analysis", "engine.yaml")
+        if ent and os.path.exists(ap) and sha256(ap) == ent.get("sha256"):
+            try:
+                art = yaml.safe_load(open(ap)) or {}
+                names["the engine artifact"] = (art.get("engine") or {}).get("name")
+                names["the engine artifact's card"] = (((art.get("data") or {}).get("card")) or {}).get("name")
+            except (OSError, yaml.YAMLError):
+                pass
+    try:
+        from toolkit.spec import schema
+        names["the spec's engine"] = schema.engine_class(ref)(**cfg).describe().name
+    except Exception:  # noqa: BLE001 -- not resolvable here: the other sources decide
+        pass
+    known = {k: v for k, v in names.items() if isinstance(v, str) and v}
+    if len(set(known.values())) > 1:
+        return [f(f"the engine identity sources disagree ({known}): the departures' scope cannot be trusted",
+                  "departures")]
+    name = next(iter(known.values()), None)
+    if not name:
+        return [f("the spec declares engine departures but the engine the run used cannot be identified", "departures")]
+    mine = [d for d in deps if d.get("engine") == name]
+    if not mine:
+        return []
+    from toolkit.engines import benchmark_coverage as BC
+    try:
+        cov = BC.load(BC.path_for(ref))[0]
+    except Exception:  # noqa: BLE001
+        cov = None
+    if not cov or cov.get("engine") != name:
+        return [f(f"the run's engine {name!r} has departures but no coverage file of its own "
+                  f"({'none' if not cov else 'the file names ' + repr(cov.get('engine'))})", "departures")]
+    records = {}
+    for rel, ent in ((man or {}).get("deliverables") or {}).items():
+        p = os.path.join(run_dir, rel)
+        if ent.get("role") == "decision_test" and os.path.exists(p) and sha256(p) == ent.get("sha256"):
+            try:
+                doc = yaml.safe_load(open(p)) or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            if doc.get("produced_by") == "harness":
+                records[str(doc.get("test_id"))] = doc
+    from toolkit.analysis import decision_tests as DT
+    try:
+        raw = dict(spec, engine={"ref": ref, "config": cfg})
+        targets = BC.departure_targets(raw, ref, run_dir)
+    except Exception as ex:  # noqa: BLE001
+        return [f(f"the departed components cannot be resolved: {type(ex).__name__}: {ex}", "departures")]
+    out = []
+    for v in DT.departure_verdicts(mine, targets, records):
+        if not v["effective"]:
+            note = "" if v["test"] in records else " (its record is not in the manifest, or changed since the run)"
+            out.append(f(f"engine departure {v['departure']} of {v['engine']}: {v['why']}{note}", str(v["departure"])))
+    return out
+
+
+def _gate_findings(run_dir: str) -> list[dict]:
     mp = os.path.join(run_dir, MANIFEST)
     if not os.path.exists(mp):
         return [] if not os.path.exists(os.path.join(run_dir, SPEC)) else [
@@ -227,8 +327,8 @@ def gate_findings(run_dir: str) -> list[dict]:
     except (OSError, ValueError) as e:
         return [_f("analysis_contract_missing", f"{MANIFEST} unreadable: {e}")]
     out = []
-    cal_doc, unc_doc, est_doc, pt_doc, pv_doc, bv_doc = None, None, None, None, None, None
-    bd_doc = None
+    cal_doc, unc_doc, est_doc, pt_doc, pv_doc, bv_doc, ba_doc = None, None, None, None, None, None, None
+    bd_doc = voi_doc = None
     # Codex P1-9: only a manifest the harness published at the end of a complete run certifies anything.
     if man.get("status") == "blocked":
         return [_f("analysis_contract_blocked", f"the analysis stopped before publishing a plan: {man.get('reason')} "
@@ -318,8 +418,12 @@ def gate_findings(run_dir: str) -> list[dict]:
             bd_doc = doc.get("data") or {}
         if kind == "burden_validation":
             bv_doc = doc.get("data") or {}
+        if kind == "burden_anchor":
+            ba_doc = doc.get("data") or {}
         if kind == "plan_variants":
             pv_doc = doc.get("data") or {}
+        if kind == "value_of_information":
+            voi_doc = doc.get("data")
         if kind == "estimates":
             est_doc = (rel, doc.get("data") or {})
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
@@ -340,9 +444,10 @@ def gate_findings(run_dir: str) -> list[dict]:
     out += _reserve(run_dir, pt_doc, unc_doc or {})
     if pt_doc is not None:       # F6 S1-6 (Codex r1 P2-4): the spec, point.yaml and the plan_variants artifact agree
         out += _plan_variants(run_dir, pt_doc, pv_doc)
-    out += _burden(run_dir, bv_doc, man.get("spec_signed") is True)
+    out += _burden(run_dir, bv_doc, man.get("spec_signed") is True, ba_doc)
     if man.get("deliverable_kind") != "estimates":
         out += _boundary(run_dir, bd_doc, pt_doc)
+        out += _value_of_information(run_dir, unc_doc, voi_doc)
     out += _decision_tests(run_dir, man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
@@ -481,6 +586,18 @@ def _plan_variants(run_dir: str, point: dict, pv) -> list[dict]:
     return [_f("analysis_contract_plan_variants", m) for m in V.contract_findings(raw, point, pv)]
 
 
+def _value_of_information(run_dir: str, unc, voi) -> list[dict]:
+    """F6: the artifact the signed spec asks for (on by default from the minimum draws), whatever the manifest
+    expects, and its shape and arithmetic (toolkit/analysis/value_of_information.py contract_findings)."""
+    from toolkit.analysis import value_of_information as VOI
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_value_of_information", f"{SPEC} unreadable: {e}")]
+    return [_f("analysis_contract_value_of_information", m, "value_of_information")
+            for m in VOI.contract_findings(raw, unc, voi)]
+
+
 def _decision_tests(run_dir, man) -> list[dict]:
     out = []
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -587,6 +704,9 @@ def _self_test() -> int:
                "stability": {"method": "m", "folds": [], "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"},
                "sensitivity": {"rows": []}, "decision_tests": {"tests": []}, "figures": {"figures": []},
                "claims": {"n_claims": 0, "unresolved": []}}
+        # F6: on by default; below the minimum draws it records too_few_draws
+        pay["value_of_information"] = {"status": "too_few_draws", "draws": pay["uncertainty"].get("draws"),
+                                       "evpi": None, "inputs": [], "not_drawn": []}
         for k, v in pay.items():
             if k != drop_kind:
                 S.write(k, v, f"toolkit/analysis/{k}.py", ["units.csv"] if k == "calibration" else [])
@@ -780,6 +900,21 @@ def _self_test() -> int:
            f"({len(bad1)}, {len(bad2)}, {len(bad3)} findings)")
     except Exception as e:  # noqa: BLE001
         ok(False, f"K13 posterior provenance in the gate: {type(e).__name__}: {e}")
+    # r5 (Codex on 21b6942): the engine identity comes from every source; an edited manifest name fails closed
+    with tempfile.TemporaryDirectory() as d:
+        dep = {"engine": "t", "benchmark": "B1", "reason": "r", "decision_test": "D"}
+        yaml.safe_dump({"engine_departures": [dep]}, open(os.path.join(d, SPEC), "w"))
+        complete_run(d)
+        before = [x for x in gate_findings(d) if x["kind"] == "departure_test_ineffective"]
+        man = json.load(open(os.path.join(d, MANIFEST)))
+        json.dump(dict(man, engine=dict(man["engine"], name="zz")), open(os.path.join(d, MANIFEST), "w"))
+        after = [x for x in gate_findings(d) if x["kind"] == "departure_test_ineffective"]
+        ok(before and after and any("disagree" in x["claim"] for x in after),
+           f"K-DEP1 editing only the manifest's engine name gives a finding, not an empty scope ({after[:1]})")
+        json.dump(man, open(os.path.join(d, MANIFEST), "w"))
+        yaml.safe_dump({"engine_departures": [dict(dep, engine="other")]}, open(os.path.join(d, SPEC), "w"))
+        out = [x for x in departure_findings(d)]
+        ok(out == [], f"K-DEP2 departures for an engine every source says the run did not use are out of scope ({out[:1]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

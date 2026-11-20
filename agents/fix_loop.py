@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 
@@ -33,6 +34,25 @@ import findings_ledger as FL  # noqa: E402
 IMPACT = "impact_ledger.jsonl"
 ACTIONS = ("fix", "rethink", "decision_test")
 RETHINK_STATES = ("SPEC", "ENGINE_CHOICE")
+# F6 run 3: a write-up finding (report or manuscript text) is the WRITE stage's. A FIX_LOOP task may edit only
+# analysis_settings.yaml and models/ext/, so a task for one can never pass its check; the writer gets it instead.
+WRITE_STATES = ("WRITE", "PRESENTATION")
+# F6 run 3: a finding whose required remedy is an owner amendment of the signed spec is the owner's, not a SPEC
+# rethink's. The critics are told to write "owner amendment" in fix_requires when the fix needs the signed spec changed
+# (agents/v2_sdk_tasks.py, critique prompt).
+_OWNER_AMENDMENT = re.compile(r"^\s*owner amendment\b", re.I)     # the documented prefix only (Codex #258 P2-4)
+
+
+def is_write_up(f) -> bool:
+    """A finding (ledger Finding or packet row) only the writer can fix."""
+    st = f.get("owner_state") if isinstance(f, dict) else getattr(f, "owner_state", None)
+    return st in WRITE_STATES
+
+
+def needs_owner_amendment(f) -> bool:
+    """A finding whose required remedy is an owner amendment and which the owner has not answered yet."""
+    g = f.get if isinstance(f, dict) else (lambda k, _f=f: getattr(_f, k, None))
+    return g("resolution_type") != "owner_decision" and bool(_OWNER_AMENDMENT.search(str(g("fix_requires") or "")))
 # Files the harness writes; never counted as an agent's change.
 _HARNESS_OWNED = ("findings.jsonl", IMPACT, "run_state.json", "trace.jsonl", "validator_history.jsonl",
                   "done_when_registry.json", "open_problems.md", "open_problems.json", "final_gate.json",
@@ -48,6 +68,9 @@ to fix next and how. You receive one JSON packet:
   findings                 the open findings: id, kind, severity, blocking, owner_state (the stage
                            that can change it), resolution_type (fix | decision_test | owner_decision),
                            scope_declarable, claim, done_when, first_seen_round, attempts so far
+  write_up                 findings in the report or manuscript text: the WRITE stage fixes them; never plan them
+  owner_amendments         findings whose remedy is an owner amendment of the signed spec: the owner decides
+                           them; never plan them, and never rethink SPEC for them
   impact_history           one row per earlier fix task: findings, files changed, headline before and
                            after, whether its check passed, findings it opened
   budget                   spent, cap and what is left in USD
@@ -76,6 +99,10 @@ Rules:
   measured effect on the headline is understood.
 - Stay inside the budget: a loop that cannot finish is worse than a shorter one.
 """
+# The owner's decision design principles (2026-11-12): the planner judges and plans by them too (one file, the
+# source of truth for every v2 task's prompt; agents/v2_sdk_tasks.py PRINCIPLES_FILE).
+FIX_PLANNER_PROMPT += "\n" + open(os.path.join(REPO, ".claude", "orchestration",
+                                                 "decision_design_principles.md")).read().strip() + "\n"
 
 
 # ------------------------------------------------------------------ packet and plan
@@ -102,15 +129,24 @@ def impact_rows(run_dir: str) -> list[dict]:
 def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate: dict | None,
                  budget: dict | None, history_rows: int = 30) -> dict:
     att = attempts(run_dir)
-    fs = []
+    fs, write_up, owner = [], [], []
     for f in FL.open_findings(ledger):
-        fs.append({"id": f.id, "kind": f.kind, "severity": f.severity, "blocking": f.blocking,
-                   "owner_state": f.owner_state, "resolution_type": f.resolution_type,
-                   "scope_declarable": f.scope_declarable, "label": FL.short_label(f.claim), "claim": f.claim,
-                   "fix_requires": f.fix_requires, "done_when": f.done_when,
-                   "first_seen_round": f.first_seen_round, "attempts": att.get(f.id, 0)})
+        row = {"id": f.id, "kind": f.kind, "severity": f.severity, "blocking": f.blocking,
+               "owner_state": f.owner_state, "resolution_type": f.resolution_type,
+               "scope_declarable": f.scope_declarable, "label": FL.short_label(f.claim), "claim": f.claim,
+               "fix_requires": f.fix_requires, "done_when": f.done_when,
+               "first_seen_round": f.first_seen_round, "attempts": att.get(f.id, 0)}
+        if needs_owner_amendment(f):           # the owner's decision first, whatever the stage (Codex #258 P2-4)
+            owner.append(row)
+        elif is_write_up(f):
+            write_up.append(row)
+        else:
+            fs.append(row)
     g = gate or {}
+    by_id = lambda rows: sorted(rows, key=lambda r: r["id"])   # noqa: E731
     return {"round": round_n, "max_rounds": max_rounds,
+            # not plannable here: the WRITE stage's findings, and those the owner must amend (OWNER_DECISION)
+            "write_up": by_id(write_up), "owner_amendments": by_id(owner),
             "gate": {"action": g.get("action"), "rule": g.get("rule_matched"), "rationale": g.get("rationale"),
                      "escalation_required": g.get("escalation_required"),
                      "stalled": g.get("stalled_findings") or []},
@@ -122,6 +158,10 @@ def validate_plan(plan, packet: dict) -> list[str]:
     if not isinstance(plan, dict) or not isinstance(plan.get("tasks"), list):
         return ["the plan must be a JSON object with a `tasks` list"]
     by_id = {f["id"]: f for f in packet["findings"]}
+    elsewhere = {f["id"]: "is a write-up finding: the WRITE stage takes it, not a FIX_LOOP task"
+                 for f in packet.get("write_up") or []}
+    elsewhere.update({f["id"]: "needs an owner amendment of the signed spec: the owner decides it (OWNER_DECISION), "
+                               "not a task or a rethink" for f in packet.get("owner_amendments") or []})
     errs, used, tids = [], set(), set()
     for t in plan["tasks"]:
         if not isinstance(t, dict):
@@ -138,7 +178,9 @@ def validate_plan(plan, packet: dict) -> list[str]:
         if t.get("action") not in ACTIONS:
             errs.append(f"{tid}: action {t.get('action')!r} not in {ACTIONS}")
         for fid in fids:
-            if fid not in by_id:
+            if fid in elsewhere:
+                errs.append(f"{tid}: {fid} {elsewhere[fid]}")
+            elif fid not in by_id:
                 errs.append(f"{tid}: unknown finding {fid}")
             elif fid in used:
                 errs.append(f"{tid}: finding {fid} is in two tasks")
@@ -155,7 +197,7 @@ def validate_plan(plan, packet: dict) -> list[str]:
             errs.append(f"{tid}: empty brief")
     deferred = {d.get("finding") for d in plan.get("deferred") or [] if isinstance(d, dict) and str(d.get("reason") or "").strip()}
     for f in packet["findings"]:
-        if f["blocking"] and f["resolution_type"] != "owner_decision" and f["id"] not in used:
+        if f["blocking"] and f["resolution_type"] != "owner_decision" and f["id"] not in used and not is_write_up(f):
             errs.append(f"blocking finding {f['id']} is in no task" + (" (blocking findings cannot be deferred)"
                                                                       if f["id"] in deferred else ""))
     return errs
@@ -166,7 +208,7 @@ def default_plan(packet: dict) -> dict:
     the packet's order (blocking first, then severity), each a fix by its owner state."""
     tasks = []
     for f in packet["findings"]:
-        if f["blocking"] and f["resolution_type"] != "owner_decision":
+        if f["blocking"] and f["resolution_type"] != "owner_decision" and not is_write_up(f):
             tasks.append({"id": f"T{len(tasks) + 1}", "findings": [f["id"]], "action": "fix",
                           "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f.get('label') or FL.short_label(f['claim'])}", "files": []})
     return {"tasks": tasks, "deferred": [], "by": "harness default"}
@@ -277,8 +319,11 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
     if errs:
         log(f"[fix loop] planner output rejected twice ({'; '.join(errs)[:300]}); harness default plan")
         plan = default_plan(packet)
+    write_up = [f["id"] for f in packet["write_up"]]
+    owner = [f["id"] for f in packet["owner_amendments"]]
     _sio().write_nofollow(run_dir, f"fix_plan_r{round_n}.json",
-                          json.dumps({"round": round_n, "plan": plan, "rejected": errs}, indent=1).encode(), atomic=True)
+                          json.dumps({"round": round_n, "plan": plan, "rejected": errs, "write_up": write_up,
+                                      "owner_amendments": owner}, indent=1).encode(), atomic=True)
     done = {r.get("task") for r in impact_rows(run_dir) if r.get("round") == round_n}
     prog_p = os.path.join(run_dir, f"fix_progress_r{round_n}.json")
     try:
@@ -286,7 +331,8 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
     except (OSError, ValueError):
         progress = {}
     summary = {"round": round_n, "tasks": len(plan["tasks"]), "rows": 0, "passed": 0, "rethink": None,
-               "skipped_budget": 0, "rejected": 0, "resumed_done": 0, "plan_by": plan.get("by", "planner")}
+               "skipped_budget": 0, "rejected": 0, "resumed_done": 0, "plan_by": plan.get("by", "planner"),
+               "write_up": write_up, "owner_amendments": owner}
 
     def out_of_budget():
         b = budget() if budget else None
@@ -507,6 +553,85 @@ def _self_test() -> int:
            and "fix_requires" in FL.Finding.__dataclass_fields__
            and len(default_plan({"findings": [f16]})["tasks"][0]["brief"]) <= 200,
            "F16 the planner packet carries the full claim and remedy; labels and briefs stay short")
+    # F17 (F6 run 3): a write-up finding (owner state WRITE or PRESENTATION) is the WRITE stage's: it is not in the
+    # planner's packet, a task naming it is refused, and a blocking one needs no task. A FIX_LOOP task can edit only
+    # analysis_settings.yaml and models/ext/, so such a task could never pass its check.
+    with tempfile.TemporaryDirectory() as d:
+        led17 = {"R-010": FL.Finding(id="R-010", kind="critique_blocker", severity="HIGH", source="critique-redteam",
+                                     owner_state="WRITE", target_stage="WRITE", blocking=True, claim="report wording"),
+                 "P-002": FL.Finding(id="P-002", kind="critique_blocker", severity="MEDIUM", source="critique-presentation",
+                                     owner_state="PRESENTATION", target_stage="PRESENTATION", blocking=True, claim="a figure"),
+                 "R-011": FL.Finding(id="R-011", kind="critique_blocker", severity="HIGH", source="critique-redteam",
+                                     owner_state="ANALYZE", blocking=True, claim="too few draws")}
+        pk17 = build_packet(d, led17, 1, 3, None, None)
+        ids17 = [f["id"] for f in pk17["findings"]]
+        ok(ids17 == ["R-011"] and [f["id"] for f in pk17.get("write_up") or []] == ["P-002", "R-010"],
+           f"F17 write-up findings leave the planner's packet for the WRITE stage ({ids17}, {pk17.get('write_up')})")
+        e17 = validate_plan({"tasks": [{"id": "T1", "findings": ["R-011"], "action": "fix", "brief": "x"},
+                                       {"id": "T2", "findings": ["R-010"], "action": "fix", "owner_state": "ANALYZE",
+                                        "brief": "y"}]}, pk17)
+        ok(any("R-010" in x and "WRITE stage" in x for x in e17)
+           and validate_plan({"tasks": [{"id": "T1", "findings": ["R-011"], "action": "fix", "brief": "x"}]}, pk17) == []
+           and [t["findings"] for t in default_plan(pk17)["tasks"]] == [["R-011"]],
+           f"F17b a task naming a write-up finding is refused; a blocking one needs no task ({e17})")
+        FL.save(d, led17)
+        seen17 = []
+
+        class W:
+            def plan_fixes(self, pk):
+                return NS(ok=True, note="", output={"tasks": [
+                    {"id": "T1", "findings": ["R-011"], "action": "fix", "owner_state": "ANALYZE", "brief": "draws"}]})
+
+            def fix(self, t, run_dir, evidence):
+                seen17.append(t["findings"])
+                return NS(ok=True, note="", output=None)
+        s17 = run_loop(d, 1, 3, None, W(), rebuild=lambda rd: {"ok": True}, harness_ids=lambda rd: set(),
+                       headline=lambda rd: {}, log=lambda *a: None)
+        plan17 = json.load(open(os.path.join(d, "fix_plan_r1.json")))
+        ok(seen17 == [["R-011"]] and s17.get("write_up") == ["P-002", "R-010"]
+           and plan17.get("write_up") == ["P-002", "R-010"],
+           f"F17c the loop runs no task for a write-up finding and records it for the WRITE stage ({s17}, {seen17})")
+    # F18 (F6 run 3): a finding whose required remedy is an owner amendment of the signed spec is the owner's: it is
+    # not planned (no SPEC rethink redrafts what the owner signed), and the loop's summary names it for OWNER_DECISION.
+    with tempfile.TemporaryDirectory() as d:
+        led18 = {"D-004": FL.Finding(id="D-004", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                     owner_state="SPEC", blocking=True, claim="the comparator omits the funded plan",
+                                     fix_requires="Owner amendment: add the funded plan as the comparator."),
+                 "D-005": FL.Finding(id="D-005", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                     owner_state="WRITE", blocking=True, claim="c",
+                                     fix_requires="Owner amendment: the report's comparator follows the spec's."),
+                 "D-008": FL.Finding(id="D-008", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                     owner_state="SPEC", blocking=False, claim="c",
+                                     fix_requires="No owner amendment is needed: restate the year."),
+                 "D-006": FL.Finding(id="D-006", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                     owner_state="SPEC", blocking=True, claim="c", fix_requires="Name the decision year."),
+                 "D-007": FL.Finding(id="D-007", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                     owner_state="SPEC", blocking=True, claim="c", resolution_type="owner_decision",
+                                     fix_requires="owner amendment")}
+        pk18 = build_packet(d, led18, 1, 3, None, None)
+        ok([f["id"] for f in pk18["findings"]] == ["D-006", "D-007", "D-008"]
+           and [f["id"] for f in pk18.get("owner_amendments") or []] == ["D-004", "D-005"],
+           f"F18 findings whose remedy starts 'Owner amendment' leave the packet for the owner, a write-up one too; a "
+           f"remedy that only mentions one does not ({pk18.get('owner_amendments')})")
+        e18 = validate_plan({"tasks": [{"id": "T1", "findings": ["D-006"], "action": "rethink", "owner_state": "SPEC",
+                                        "brief": "x"},
+                                       {"id": "T2", "findings": ["D-004"], "action": "rethink", "owner_state": "SPEC",
+                                        "brief": "x"}]}, pk18)
+        ok(any("D-004" in x and "owner amendment" in x for x in e18),
+           f"F18b a rethink of a finding that needs an owner amendment is refused ({e18})")
+        FL.save(d, led18)
+
+        class R:
+            def plan_fixes(self, pk):
+                return NS(ok=True, note="", output={"tasks": [
+                    {"id": "T1", "findings": ["D-006"], "action": "rethink", "owner_state": "SPEC", "brief": "year"}]})
+
+            def fix(self, t, run_dir, evidence):
+                raise AssertionError("no fix call")
+        s18 = run_loop(d, 1, 3, None, R(), rebuild=lambda rd: {"ok": True}, harness_ids=lambda rd: set(),
+                       headline=lambda rd: {}, log=lambda *a: None)
+        ok(s18.get("owner_amendments") == ["D-004", "D-005"] and s18["rethink"] == "SPEC",
+           f"F18c the loop's summary names the findings the owner must amend ({s18})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

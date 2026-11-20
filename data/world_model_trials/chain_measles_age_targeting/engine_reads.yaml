@@ -1,0 +1,5 @@
+# Declared design features that reach the engine through a derived bound attribute (the susceptible share by
+# group, s0, built from them by the units table's derivation): read by the engine, not engine-blind.
+features_read_via:
+  susc_5_14y: s0_groups
+  susc_9_59m: s0_groups

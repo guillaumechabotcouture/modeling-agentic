@@ -1,0 +1,5 @@
+# Decision inputs of the self-test toy engines in this directory (contract.py ToyEngine, hooks.py ToyScheduleEngine;
+# toolkit/engines/decision_inputs.py). Explicitly none, with the reason: these engines never inform a decision.
+decision_inputs:
+  a: {inputs: [], none_reason: "toy: a closed-form effect for self-tests, never a decision"}
+  b: {inputs: [], none_reason: "toy: a closed-form effect for self-tests, never a decision"}

@@ -37,6 +37,16 @@ should each district get?". Two pipelines share the rigor gates:
 
 v1 stays supported until the owner retires it.
 
+## Decision design principles (owner default)
+
+Every run follows `.claude/orchestration/decision_design_principles.md` unless its spec declares a departure
+and its reason (the report repeats it); a principle the harness cannot yet compute is declared the same way. In short: think from first principles, and keep doing so at every stage; start from the decision, using the reprogramming framing from the decision date, with the
+funded plan as comparator. Anchor baseline burden to external data-driven estimates, relative effects to trials,
+and costs to current procurement prices. When engine and trials disagree, the trial wins unless the engine
+explains why. Prefer measured data over modelled surfaces. Treat decision-moving inputs as ranges with
+decision tests, and decide at the granularity the evidence supports. v2 tasks carry the file in their system
+prompt (`agents/v2_sdk_tasks.py` `PRINCIPLES_FILE`, and the fix planner's prompt).
+
 ## The layers
 
 ```
@@ -142,7 +152,7 @@ the live attachment picture.
 | Exit | Statuses |
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
-| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff` (v2) |
+| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff`, `paused:awaiting_budget`, `paused:awaiting_spec_amendment` (v2) |
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
 
@@ -153,8 +163,12 @@ declined such a declaration and no rounds were left to fix it.
 A v2 run prints `paused:<reason>` when its state machine
 stops for the owner, at SIGN (the decision spec: `python3
 agents/stage_machine.py sign <run_dir> --by owner`) or at OWNER_DECISION
-(scope declarations), and exits 2; `main.py --resume <run_dir>`
-continues from `run_state.json`.
+(scope declarations, or findings whose remedy is an owner amendment: `python3 scripts/scope_signoff.py sign
+<run_dir> --by owner`), or before a paid task whose
+allowance is below the floor (`paused:awaiting_budget`: resume with a higher `--max-budget-usd`), or at SPEC when
+a rethink would change a signed spec (`paused:awaiting_spec_amendment`: read `spec_rethink_request.json`, amend the
+spec and relaunch with reuse), and exits 2;
+`main.py --resume <run_dir>` continues from `run_state.json`.
 
 Every run records which pipeline ran: `metadata.json` holds `pipeline`
 (`v1`|`v2`), `commit` and `launcher` (plus one `invocations` entry per

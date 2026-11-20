@@ -1,0 +1,49 @@
+# Decision inputs of the compartmental engine (toolkit/engines/decision_inputs.py; F6 evidence dossier). Its components
+# are named by the spec's configuration, so one declaration covers every component ("*"); the inputs marked
+# if_on_card resolve against the configured card (transmission r0 or q, s0 per group or per unit, cohort coverage and
+# seroconversion, a campaign's reach). Read off engine.py's parameters(), _unit_attributes() and the component
+# actions (#218 review round 1). Kept beside card.yaml, not in it, so that `engine.py --card` (which rewrites
+# card.yaml) keeps it, and not in code (the code fingerprint).
+decision_inputs:
+  "*":
+    inactive: [0]
+    inputs:
+      - {kind: parameter, name: "efficacy:{component}", why: "the share of reached susceptibles the component
+          protects"}
+      - {kind: unit_attribute, name: "reach:{component}", if_on_card: true, why: "a campaign's share of its targeted
+          groups reached"}
+      - {kind: parameter, name: r0, if_on_card: true, why: "transmissibility (transmission r0): how many infections
+          removing susceptibles prevents"}
+      - {kind: parameter, name: q, if_on_card: true, why: "transmissibility per contact (transmission q)"}
+      - {kind: unit_attribute, name: contact, if_on_card: true, why: "the contact matrix: who infects whom"}
+      - {kind: unit_attribute, name: contact_rate, if_on_card: true, why: "mean daily contacts"}
+      - {kind: parameter, name: forcing_amplitude, if_on_card: true, why: "seasonal forcing: when transmission
+          peaks, against the component's day"}
+      - {kind: parameter, name: forcing_phase, if_on_card: true, why: "seasonal forcing's peak day"}
+      - {kind: unit_attribute, name: s0, if_on_card: true, why: "the susceptible share the component acts on (given
+          initialiser)"}
+      - {kind: parameter, name: "s0:*", if_on_card: true, why: "the susceptible share per group (per_group_parameters
+          s0)"}
+      - {kind: unit_attribute, name: "coverage:*", if_on_card: true, why: "cohort dose coverage: the susceptibles
+          left (cohort_history)"}
+      - {kind: unit_attribute, name: coverage_scale, if_on_card: true, why: "latent over declared coverage
+          (cohort_history)"}
+      - {kind: parameter, name: "seroconversion:*", if_on_card: true, why: "the share of each dose's recipients
+          protected (cohort_history)"}
+      - {kind: unit_attribute, name: always_immune, if_on_card: true, why: "groups declared immune: who cannot be
+          protected further"}
+      - {kind: unit_attribute, name: always_susceptible, if_on_card: true, why: "groups declared susceptible"}
+      - {kind: unit_attribute, name: seed, if_on_card: true, why: "initial infections: the epidemic's timing against
+          the component's day"}
+      - {kind: unit_attribute, name: intro, if_on_card: true, why: "the introduction group"}
+# What every arm uses to turn infections into the decision's outcome (#218 review round 2): the configured outcome's
+# ratio per infection, a unit attribute (ratio:<outcome>, one per group) or, with per_group_parameters
+# [ratio:<outcome>], one parameter per group; required whenever the primary or headline outcome is a ratio outcome.
+outcome_inputs:
+  "*":
+    - {kind: unit_attribute, name: "ratio:{outcome}", if_on_card: true, why: "the outcome per infection, one per group:
+        it converts infections prevented into the outcome"}
+    - {kind: parameter, name: "ratio:{outcome}:*", if_on_card: true, why: "the outcome per infection in each group
+        (per_group_parameters)"}
+not_decision_inputs:
+  "unit_attribute:N": "group sizes: population counts from the units table, the same in every arm"

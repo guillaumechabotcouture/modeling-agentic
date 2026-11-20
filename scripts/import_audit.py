@@ -41,7 +41,8 @@ REVIEWED = {
     "scripts/ask.py": {"__import__": (1, "_sibling(name): sibling script names written in the code")},
     "scripts/benchmark_gate.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/claim_units.py": {"spec_from_file_location": (1, _REPO_FILE)},
-    "scripts/compute.py": {"spec_from_file_location": (2, _RUN_CODE + "; and the repo's worker_side module")},
+    "scripts/compute.py": {"spec_from_file_location": (3, _RUN_CODE + "; and the repo's worker_side module (twice: "
+                                                         "the batch runner and the checkpoint-restore self-test)")},
     "scripts/derived_rebuild.py": {"spec_from_file_location": (2, _REPO_FILE)},
     "scripts/effort_floors_gate.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/eval_suite.py": {"spec_from_file_location": (2, "the eval suite's own generators and hidden tests")},
@@ -68,6 +69,9 @@ REVIEWED = {
         "__import__": (1, "the literal module toolkit.engines.horizon, in its own self-test")},
     "toolkit/engines/malaria/benchmarks/restamp_proof.py": {
         "import_module": (1, "a module under toolkit.engines.malaria.benchmarks named by the shipped proof file")},
+    "toolkit/spec/preconditions.py": {"spec_from_file_location": (1, _REPO_FILE + ": the literal path "
+                                                                 "agents/analysis_backend.py, the engine-choice filter "
+                                                                 "(a script module, not a package import_guard serves)")},
     "toolkit/spec/schema.py": {"import_module": (1, "its self-test's literal (module, class) pairs of shipped engines")},
 }
 

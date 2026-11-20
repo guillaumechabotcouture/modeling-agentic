@@ -800,6 +800,7 @@ parameters:
         # rejected before any pool is created; on success the created
         # pool is deleted; on a mid-run failure it is deleted too.
         cloud_mod = _import_sibling_module("cloud_batch")
+        os.environ["MA_ALLOW_AZURE_BATCH"] = "1"   # the fake Azure below; the real one is refused without it (AB1)
         with open(os.path.join(run_dir, "models", "outcome_fn.py"), "w") as f:
             f.write(outcome_fn_src)
         orig_runner = cloud_mod.BatchRunner

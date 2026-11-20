@@ -1,0 +1,182 @@
+# World-model trial template (hcv_test_treat_targeting, batch 2): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A hepatitis programme
+  has US$5 million for 2026-2027 hepatitis C test-and-treat in 24 population groups (people who inject drugs, people
+  in prison, people attending HIV clinics and the general population of high-prevalence districts). For each group
+  choose one option: none; LAB (antibody screening with laboratory RNA confirmation, then direct-acting antivirals,
+  US$30 per person screened); POC (point-of-care RNA testing with same-day treatment start, US$45 per person screened).
+  Input file: units.csv (people in the group, prevalence of viraemic HCV, group code 0-3, expected linkage to care).
+  Choose the options that maximise viraemic person-years averted over 2026-2027 within the budget, report the total
+  with a 95% uncertainty interval and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - lab
+    - poc
+    outcome: viraemic_py
+    mode: trial_priors
+    outcomes:
+      viraemic_py:
+        baseline_source: synthetic seroprevalence surveys with RNA testing, before any test-and-treat
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      lab:
+        viraemic_py:
+          rr: 0.72
+          range:
+          - 0.6
+          - 0.85
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: share treated and cured within the window about 0.28 (loss between antibody, RNA confirmation
+            and treatment) x sustained virological response about 0.95 with sofosbuvir-velpatasvir (Feld JJ et al.
+            Sofosbuvir and velpatasvir in patients with chronic HCV genotype 1, 2, 4, 5, and 6 infection. N Engl
+            J Med 2015;373:2599-2607)'
+          verified: false
+      poc:
+        viraemic_py:
+          rr: 0.55
+          range:
+          - 0.42
+          - 0.7
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: same-day testing and treatment raises the share cured within the window to about 0.45
+            (Feld JJ et al. N Engl J Med 2015;373:2599-2607 for the cure rate)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        viraemic_py: inc
+options:
+  populations:
+    total: pop
+  components:
+    lab:
+      group: hcv
+    poc:
+      group: hcv
+  packages:
+    none: []
+    lab:
+    - lab
+    poc:
+    - poc
+  engine_map:
+    lab:
+      lab: 1
+    poc:
+      poc: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: lab_cost
+    component: lab
+    value: 30.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - lab
+  - id: poc_cost
+    component: poc
+    value: 45.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - poc
+objective:
+  outcome: viraemic_py
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 5000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- viraemic_py
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - pop
+    - group_code
+    - linkage
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: viraemic_py_averted
+  headline:
+    name: total_viraemic_py_averted
+    outcome: viraemic_py

@@ -102,7 +102,11 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    `prior_range` decision test; do not declare one. A prior targets an engine parameter only
    (`prior_target_not_parameter`). A unit attribute bound to a data column is data: if the
    column is uncertain, declare that where it arises, as the observation of a latent quantity
-   through a source with a sampling frame and a bias model.
+   through a source with a sampling frame and a bias model. When field data dispute a
+   column's values for some units, declare a `unit_attribute` decision test over the disputed
+   values (`unit_attribute: {column, units: [ids] | all, values | scale | set_from}`); the
+   column must feed an engine attribute that has a declared valid range, and on the emulator
+   path an emulator feature.
 10. **Analysis.** `evaluation: emulator` for engines too slow to run per unit and draw (give
     the design: points, hold-out share, features), `direct` otherwise; the stability
     hold-out group; sensitivity; and **decision tests** for each simplification,
@@ -111,6 +115,29 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `finding:` id when it answers a gate finding.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for.
+12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
+    parameters and card tables its effect depends on (`decision_inputs`, read by
+    `toolkit/engines/decision_inputs.py`). When the options use such a component, name the
+    run's dossier (`evidence: {dossier: evidence_dossier.yaml}`) and give one entry per input
+    (`<kind>:<name>`, format in `toolkit/spec/evidence_dossier.py`): the value the model uses
+    and its source; field or trial observations (source, URL or table, year, sites, n,
+    sampling frame, value) and how they compare with the model value on the same estimand,
+    or `no_data` with the borrowing rule; the chosen value or range with its rule; and, for a
+    range, the decision test that varies that input over the range (a `parameter_value` test
+    of the parameter whose values cover the range, or the generated `prior_range_<parameter>`
+    of a drawn prior; a unit attribute or card table takes a value). Sign-off refuses a
+    missing, unparseable or incomplete dossier and a blank field, and lists what is missing,
+    whether or not the spec names a dossier. The sheet shows the table and the signature
+    binds the file, so an edit after sign-off needs a new sign-off.
+    The gate checks coverage and validity only. A range must cite a decision test the run
+    executes that varies the input: the automatic test the runner generates for it
+    (`prior_range_<p>` or `fitted_range_<p>`), or a `parameter_value` test that runs on this
+    run's path and covers the range. An input the run calibrates is varied by the
+    calibration itself. The sheet shows, next to each choice, the value or range execution
+    will use, and lists at its top every input where they differ, for the owner to decide;
+    a difference never blocks signing. Signing binds every file the run reads (the spec, the
+    files it names, the dossier and the engine's files), so any later change makes the run
+    stale. Give observations as a list.
 
 ## Closed-population epidemic questions (the compartmental engine)
 
@@ -204,6 +231,32 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
 - **What the data do and do not determine** is computed, not written. Each undetermined parameter gets an automatic
   test at both ends of its declared range, and each output is classed `determined_by_data` or
   `set_by_declared_ranges`.
+
+## Engine benchmarks that are not in band
+
+An engine is not eligible for a component the options use when a benchmark covering it (the engine's
+`benchmark_coverage.yaml`) is `out_of_band`, `not_assessable` or `band_mis_based` in its verified record, or when
+no benchmark covers the component. A cost-per-outcome benchmark gates only when the spec charges the component
+through the engine cost output it prices; otherwise it is reported. The pre-sign check names each problem.
+Prefer options and an engine the evidence supports. When the decision still needs that engine, declare a
+departure for the owner to sign, never a silent one:
+
+    engine_departures:
+      - {engine: <card name>, benchmark: <id>, reason: "<why the decision may still use it>",
+         decision_test: <an analysis.decision_tests id that varies that effect>}
+      - {engine: <card name>, component: <engine component>, reason: "...", decision_test: <id>}
+
+The decision test must run on this run's path and change the related effect
+(toolkit/spec/preconditions.py `decision_test_runs`): a parameter_value test on an effect parameter the coverage
+file names for it, with at least two values spanning its declared range (or `range_fraction` of it, stated in the
+departure) and, on the emulator path, on an emulator input (a fitted parameter, a drawn prior or a spec value); or,
+for an interaction benchmark only, an interaction_rescale test on that benchmark that rescales one of its two
+components given the other. The run then checks what the test actually did; a departure whose test did not take
+effect is a finding only the owner can resolve. Only components some
+allowed package holds are checked. Only the owner's signature makes a departure
+count; a spec that needs one cannot be signed by the lead. The report declares each signed departure as a
+limitation. A held-out benchmark is validation: its result stands, and no parameter is ever tuned toward it. A
+fit target out of band means the engine's fit failed; it gates the same way.
 
 ## What not to do
 

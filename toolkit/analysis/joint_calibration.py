@@ -33,6 +33,10 @@ The spec field (signed with the spec; without it nothing changes):
              # paired by group (F6 S2-3b, survey_changes in the artifact)
              # bias_by: a units column (e.g. the region); bias_sd is then one offset per survey (bias_source,
              # default the target id) and group, shared by the group's units and the survey's targets (F6 S2-3)
+             # bias_sd_by_group (instead of bias_sd, with bias_by): {csv, filter: {col: value}, key: <csv column
+             # of the group>, ci: [lo_col, hi_col], ci_level, multiplier}: each group's offset sd is the sd of
+             # its own interval on the target's scale (the survey's own error for that group; owner, 2026-11-12).
+             # Every calibrated group needs exactly one row; anything else is an input error
           - {id, kind: group, csv, filter: {col: value}, key: {csv: col, units: col}, value, multiplier,
              ci: [lo_col, hi_col], ci_level, weights: <units column>, window, metric, scale, bias_sd, discrepancy_sd,
              source}
@@ -190,6 +194,7 @@ def spec_problems(spec) -> list[str]:
     else:
         eng, wins = None, None
     bad += _unmatched_problems(j.get("unmatched"), w)
+    bad += _declared_problems(spec, j, w)
     bad += _sensitivity_problems(j.get("sensitivity"), j.get("targets"), w)
     for n, r in enumerate(j.get("record") or []):
         if not (isinstance(r, dict) and _window(r.get("window")) and (wins is None or r.get("metric") in wins)):
@@ -240,18 +245,31 @@ def spec_problems(spec) -> list[str]:
         for q in ("bias_sd", "sd"):
             if q in t and not (_isnum(t[q]) and t[q] >= 0):
                 bad.append(f"{tw}.{q}: a number >= 0")
+        bg = t.get("bias_sd_by_group")
+        if bg is not None:
+            if k != "unit" or "bias_by" not in t:
+                bad.append(f"{tw}.bias_sd_by_group: for a unit target with bias_by")
+            if "bias_sd" in t:
+                bad.append(f"{tw}.bias_sd_by_group: instead of bias_sd, not with it")
+            if not (isinstance(bg, dict) and _text(bg.get("csv")) and _text(bg.get("key"))
+                    and isinstance(bg.get("ci"), list) and len(bg["ci"]) == 2 and all(_text(c) for c in bg["ci"])
+                    and isinstance(bg.get("filter", {}), dict)
+                    and (_isnum(bg.get("ci_level", 0.95)) and 0 < bg.get("ci_level", 0.95) < 1)
+                    and (_isnum(bg.get("multiplier", 1.0)) and bg.get("multiplier", 1.0) > 0)):
+                bad.append(f"{tw}.bias_sd_by_group: {{csv, key, ci: [lo, hi], filter?, ci_level?, multiplier?}}")
         if "bias_by" in t:          # F6 S2-3: one offset per source and group, shared by the group's units
             if k != "unit":
                 bad.append(f"{tw}.bias_by: for unit targets (a group target's bias is its own)")
             elif t["bias_by"] not in cols:
                 bad.append(f"{tw}.bias_by: no units column {t['bias_by']!r}")
-            if not (_isnum(t.get("bias_sd")) and t["bias_sd"] > 0):
-                bad.append(f"{tw}.bias_by: needs bias_sd > 0 (the sd of the shared offset)")
+            if bg is None and not (_isnum(t.get("bias_sd")) and t["bias_sd"] > 0):
+                bad.append(f"{tw}.bias_by: needs bias_sd > 0 (the sd of the shared offset) or bias_sd_by_group")
             src = t.get("bias_source", t.get("id"))      # Codex r1 P2-4: the survey, shared by its targets
             if not _text(src):
                 bad.append(f"{tw}.bias_source: the survey's name (text)")
-            other = surveys.setdefault(src, (t.get("bias_sd"), t["bias_by"]))
-            if other != (t.get("bias_sd"), t["bias_by"]):
+            other = surveys.setdefault(src, (t.get("bias_sd") if bg is None else json.dumps(bg, sort_keys=True, default=str),
+                                             t["bias_by"]))
+            if other != (t.get("bias_sd") if bg is None else json.dumps(bg, sort_keys=True, default=str), t["bias_by"]):
                 bad.append(f"{tw}: survey {src!r} is declared with two bias_sd or bias_by values ({other})")
         elif "bias_source" in t:
             bad.append(f"{tw}.bias_source: needs bias_by")
@@ -305,7 +323,7 @@ def _unmatched_problems(u, w) -> list:
     if not isinstance(u, dict):
         return [f"{ww}: a mapping {{mode: block | flag, default_reason, max_units, reasons}}"]
     bad = []
-    unk = sorted(set(u) - {"mode", "default_reason", "max_units", "reasons"})
+    unk = sorted(set(u) - {"mode", "default_reason", "max_units", "reasons", "declared"})
     if unk:
         bad.append(f"{ww}: unknown keys {unk}")
     if u.get("mode") not in UNMATCHED_MODES:
@@ -326,6 +344,65 @@ def _unmatched_problems(u, w) -> list:
                 and set(r) == {sel[0], "reason"}):
             bad.append(f"{ww}.reasons[{n}]: {{unit: <id>, reason}} or {{region: <name>, reason}}")
     return bad
+
+
+def _declared_problems(spec, j, w) -> list:
+    """calibration.joint.unmatched.declared (owner decision R1, F6 run 1, 2026-11-16): known calibration misses the
+    run proceeds with, each tied to a decision test that must run: [{target: <group target id>:<group>, reason,
+    decision_test}] for a group target the verification fails, or [{offset: <bias_source>|<group>, reason,
+    decision_test}] for a shared offset whose region-sample rows fail. Needs mode flag. Fail closed: exactly one
+    selector, a reason (text), a decision test declared in analysis.decision_tests, and a group or offset the
+    spec's targets define."""
+    u = j.get("unmatched")
+    dl = u.get("declared") if isinstance(u, dict) else None
+    if dl is None:
+        return []
+    ww = f"{w}.unmatched.declared"
+    if not isinstance(dl, list) or not dl:
+        return [f"{ww}: a non-empty list of {{target | offset, reason, decision_test}}"]
+    bad = [] if u.get("mode") == "flag" else [f"{ww}: needs unmatched.mode flag"]
+    dts = {str(t.get("id")) for t in (spec.raw.get("analysis") or {}).get("decision_tests") or [] if isinstance(t, dict)}
+    try:
+        rows = list(spec.units())
+    except Exception:  # noqa: BLE001 — the units table is checked elsewhere; groups are then unknown
+        rows = []
+    col = lambda c: {str(r.get(c)) for r in rows if c and r.get(c) is not None}  # noqa: E731
+    gt = {t["id"]: col((t.get("key") or {}).get("units")) for t in j.get("targets") or []
+          if isinstance(t, dict) and t.get("kind") == "group"}
+    src = {}
+    for t in j.get("targets") or []:
+        if isinstance(t, dict) and t.get("kind") == "unit" and t.get("bias_by"):
+            src.setdefault(str(t.get("bias_source", t.get("id"))), set()).update(col(t["bias_by"]))
+    seen = set()
+    for n, x in enumerate(dl):
+        sel = [k for k in ("target", "offset") if isinstance(x, dict) and k in x]
+        if not (isinstance(x, dict) and len(sel) == 1 and set(x) == {sel[0], "reason", "decision_test"}
+                and _text(x.get(sel[0])) and _text(x.get("reason"))):
+            bad.append(f"{ww}[{n}]: {{target | offset, reason, decision_test}} with a reason (text)")
+            continue
+        if str(x["decision_test"]) not in dts:
+            bad.append(f"{ww}[{n}].decision_test: {x['decision_test']!r} is not in analysis.decision_tests")
+        key = str(x[sel[0]])
+        if key in seen:
+            bad.append(f"{ww}[{n}]: {key} declared twice")
+        seen.add(key)
+        # Codex review of #242 P2-4: matched against the exact identities the targets generate, never parsed
+        ids = ({f"{t}:{g}" for t, gs in gt.items() for g in gs}, [t + ":" for t, gs in gt.items() if not gs]) \
+            if sel[0] == "target" else ({f"{t}|{g}" for t, gs in src.items() for g in gs},
+                                        [t + "|" for t, gs in src.items() if not gs])
+        if not (key in ids[0] or any(key.startswith(pf) and len(key) > len(pf) for pf in ids[1])):
+            bad.append(f"{ww}[{n}].{sel[0]}: {key!r} is not " + ("<group target id>:<group> of a declared group target"
+                       if sel[0] == "target" else "<bias_source>|<group> of a unit target with bias_by"))
+    return bad
+
+
+def declared_test_problems(dec, dts) -> list:
+    """Each declared miss the calibration proceeded with names a decision test that ran (status run); otherwise
+    the analysis blocks (fail closed): a miss without its test is not declared."""
+    ran = {str(t.get("test_id")) for t in dts or [] if isinstance(t, dict) and t.get("status") == "run"}
+    return [f"declared calibration miss {x.get('target') or x.get('offset')}: its decision test "
+            f"{x.get('decision_test')} did not run" for x in (dec or {}).get("declared") or []
+            if str(x.get("decision_test")) not in ran]
 
 
 def _sensitivity_problems(s, targets, w) -> list:
@@ -355,6 +432,10 @@ def _sensitivity_problems(s, targets, w) -> list:
                 bad.append(f"{ww}[{n}].targets.{tid}: a benchmark's sampling error comes from its band; only "
                            "discrepancy_sd can change")
                 continue
+            if tid in ids and isinstance(ov, dict) and "bias_sd" in ov and t0.get("bias_sd_by_group") is not None:
+                bad.append(f"{ww}[{n}].targets.{tid}: bias_sd cannot override a target whose offset sd comes from "
+                           "bias_sd_by_group (Codex review of #206); change sd or discrepancy_sd")
+                continue
             if tid in ids and isinstance(ov, dict) and "sd" in ov and any(
                     k in t0 for k in ("sd_column", "ci_columns", "n_column", "ci")):
                 bad.append(f"{ww}[{n}].targets.{tid}: sd cannot override a target whose sampling error comes from "
@@ -370,16 +451,45 @@ def _sensitivity_problems(s, targets, w) -> list:
 
 def unmatched_decision(spec, rep) -> dict:
     """Whether a blocked joint calibration may proceed under calibration.joint.unmatched (fail closed: without the
-    option, with mode block, with any block that is not a unit's miss, or with more misses than max_units, it may
-    not). {proceed, mode, flagged: [{unit, status, reason, implausibility, direction}]}."""
+    option, with mode block, with any block that is neither a unit's miss nor a declared miss, or with more unit
+    misses than max_units, it may not). Declared misses (owner decision R1, 2026-11-16): a group target the
+    verification fails, or a shared offset whose region-sample rows fail (by_component), proceeds only when
+    `unmatched.declared` names it with its decision test; run.py then blocks unless that test ran.
+    {proceed, mode, flagged: [{unit, status, reason, implausibility, direction}], declared: [...]}."""
     j = declared(spec) or {}
     u = j.get("unmatched") or {"mode": "block"}
     units = rep.get("units") or {}
     missed = [k for k, v in units.items() if v.get("status") != "matched"]
-    unit_codes = {"unmatched_units", "verification_failed"}
+    dl = [x for x in (u.get("declared") or []) if isinstance(x, dict)]
+    dt_ = {str(x["target"]): x for x in dl if "target" in x}
+    do_ = {str(x["offset"]): x for x in dl if "offset" in x}
+    allowed = {"unmatched_units", "verification_failed"} | ({"offset_sampling_low_acceptance"} if do_ else set())
     codes = {b["code"] for b in rep.get("blocks") or []}
     target_fail = [x for b in rep.get("blocks") or [] if b["code"] == "verification_failed"
                    for x in ((b.get("detail") or {}).get("targets") or [])]
+    used, off_ok = [], True
+    for t in target_fail:
+        if t in dt_:
+            used.append(dict(dt_[t], implausibility=((rep.get("verification") or {}).get("targets") or {}).get(
+                t, {}).get("implausibility")))
+    for b in rep.get("blocks") or []:
+        if b["code"] != "offset_sampling_low_acceptance":
+            continue
+        d = b.get("detail") or {}
+        bc, fl, fr = d.get("by_component"), d.get("failed"), d.get("failed_rows")
+        # Codex review of #242: components by their exact block keys (P1), and every failed row covered (P2-1)
+        if not (isinstance(bc, list) and bc and isinstance(fl, int) and fl > 0 and isinstance(fr, list)
+                and len(set(fr)) == fl == len(fr)
+                and all(isinstance(c, dict) and isinstance(c.get("blocks"), list) and c["blocks"]
+                        and isinstance(c.get("rows"), list) and c["rows"] for c in bc)
+                and set(fr) <= {x for c in bc for x in c["rows"]}):
+            off_ok = False
+            continue
+        for c in bc:
+            ks = [str(k) for k in c["blocks"]]
+            if not all(k in do_ for k in ks):
+                off_ok = False
+            used += [dict(do_[k], failed_rows=len(c["rows"])) for k in ks if k in do_]
     reg = spec.raw["decision_units"].get("region")
     rows = {str(r[spec.uid]): r for r in spec.units()}
     by_unit = {str(r["unit"]): r["reason"] for r in u.get("reasons") or [] if r.get("unit")}
@@ -392,18 +502,23 @@ def unmatched_decision(spec, rep) -> dict:
                         "reason": by_unit.get(k) or by_reg.get(region) or u.get("default_reason"),
                         "implausibility": v.get("implausibility_verified", v.get("best_implausibility")),
                         "direction": v.get("direction")})
-    ok = (u.get("mode") == "flag" and codes <= unit_codes and not target_fail and not rep.get("conflicting")
-          and len(flagged) <= int(u.get("max_units", -1)) and _blocks_consistent(rep, missed))
-    return {"proceed": bool(ok) if rep.get("blocked") else True, "mode": u.get("mode", "block"),
-            "flagged": flagged if ok or not rep.get("blocked") else [], "missed": flagged,
-            "why_not": None if ok or not rep.get("blocked") else
+    undeclared = [t for t in target_fail if t not in dt_]
+    ok = (u.get("mode") == "flag" and codes <= allowed and not undeclared and off_ok and not rep.get("conflicting")
+          and len(flagged) <= int(u.get("max_units", -1)) and _blocks_consistent(rep, missed, bool(used)))
+    blocked = bool(rep.get("blocked") or rep.get("blocks"))     # Codex review of #242 P2-3: the blocks decide
+    return {"proceed": bool(ok) if blocked else True, "mode": u.get("mode", "block"),
+            "flagged": flagged if ok or not blocked else [], "missed": flagged,
+            "declared": used if ok and blocked else [],
+            "why_not": None if ok or not blocked else
             ("no flag option" if u.get("mode") != "flag" else f"blocks {sorted(codes)}; {len(flagged)} misses, max "
-             f"{u.get('max_units')}; target failures {target_fail}; conflicting {rep.get('conflicting')}")}
+             f"{u.get('max_units')}; target failures {target_fail} (undeclared {undeclared}); offset components "
+             f"{'declared' if off_ok else 'undeclared or without a breakdown'}; conflicting {rep.get('conflicting')}")}
 
 
-def _blocks_consistent(rep, missed) -> bool:
-    """Codex r6 P1-4: a blocked report may let unit misses proceed only when its blocks are complete and name
-    exactly the units whose status is not matched (fail closed on a partial or malformed report)."""
+def _blocks_consistent(rep, missed, declared_any=False) -> bool:
+    """Codex r6 P1-4: a blocked report may let misses proceed only when its blocks are complete and name exactly
+    the units whose status is not matched (fail closed on a partial or malformed report). A report whose only
+    misses are declared ones (a group target, an offset component) needs no unit named."""
     named = set()
     blocks = rep.get("blocks")
     if not (isinstance(blocks, list) and blocks):
@@ -417,13 +532,19 @@ def _blocks_consistent(rep, missed) -> bool:
                 return False
             named |= {str(x) for x in d["unmatched"]}
         elif b["code"] == "verification_failed":
-            if not (isinstance(d.get("units"), list) and d.get("targets") == []):
+            if not (isinstance(d.get("units"), list) and isinstance(d.get("targets"), list)
+                    and (d["units"] or d["targets"])):
+                return False
+            if d["targets"] and not declared_any:
                 return False
             named |= {str(x) for x in d["units"]}
+        elif b["code"] == "offset_sampling_low_acceptance":
+            if not (declared_any and isinstance(d.get("by_component"), list)):
+                return False
         else:
             return False
     units = rep.get("units") or {}
-    return bool(named) and named == {str(k) for k in missed} and named <= {str(k) for k in units}
+    return (bool(named) or declared_any) and named == {str(k) for k in missed} and named <= {str(k) for k in units}
 
 
 def _with_overrides(raw, overrides) -> dict:
@@ -481,14 +602,43 @@ def _one_sensitivity(spec, rep, run_dir, compute_kw, log, units, j, n, x) -> dic
 
 
 # --------------------------------------------------------------------------- problem
+def _bias_sd_by_group(spec, t, scale, groups) -> dict:
+    """{group: offset sd} for a unit target's bias_sd_by_group: each group's interval in the table, as an sd on
+    the target's scale (HM.sd_from_ci). Fail closed: a calibrated group with no row or two rows, or an interval
+    that is not increasing on the scale, is an input error."""
+    bg = t["bias_sd_by_group"]
+    mult, level = float(bg.get("multiplier", 1.0)), float(bg.get("ci_level", 0.95))
+    with open(spec.resolve(bg["csv"]), newline="", encoding="utf-8") as f:
+        tab = [r for r in csv.DictReader(f) if all(str(r.get(k)) == str(v) for k, v in (bg.get("filter") or {}).items())]
+    by, bad = {}, []
+    for r in tab:
+        by.setdefault(str(r.get(bg["key"])), []).append(r)
+    out = {}
+    for g in sorted(groups):
+        rs = by.get(g, [])
+        if len(rs) != 1:
+            bad.append(f"target {t['id']}: bias_sd_by_group has {len(rs)} rows for group {g!r} in {bg['csv']} "
+                       f"(filter {bg.get('filter')}): exactly one is needed")
+            continue
+        try:
+            out[g] = HM.sd_from_ci(mult * float(rs[0][bg["ci"][0]]), mult * float(rs[0][bg["ci"][1]]), scale, level)
+        except (TypeError, ValueError, KeyError) as e:
+            bad.append(f"target {t['id']}: bias_sd_by_group interval for group {g!r}: {e}")
+    if bad:
+        raise HM.CalibrationInputError(bad)
+    return out
+
+
 def theta0(spec) -> dict:
     """The point parameter values every simulation starts from (as toolkit/analysis/core.py Analysis.theta0)."""
     from toolkit.analysis.batch import fitted_ranges
     from toolkit.spec import engine_parameters as PV
     from toolkit.spec import priors as PRI
+    from toolkit.analysis import uncertainty as UQ
     eng = spec.engine()
     dr = dict(fitted_ranges(eng), **{k: (p.lo, p.hi, p.value) for k, p in PRI.drawn(spec).items()})
-    return PV.params(spec, {k: v[2] for k, v in dr.items()})
+    # v2-posterior-point: a declared posterior's columns are held at the fit's verified chosen point, as in the analysis
+    return UQ.posterior_point(spec, UQ.net_effect_sample(spec, eng), PV.params(spec, {k: v[2] for k, v in dr.items()}))
 
 
 def _unit_sd(t, row, scale, value):
@@ -548,10 +698,14 @@ def build(spec, units=None) -> tuple:
         if t["kind"] == "unit":
             col = t.get("column", cal.get("target_column"))
             sc = t.get("scale", "logit")
+            gsd = _bias_sd_by_group(spec, t, sc, {str(rows[i][t["bias_by"]]) for i in ids}) \
+                if t.get("bias_sd_by_group") else None
             for i in ids:
                 v = float(rows[i][col])
                 targets.append(HM.Target(f"{t['id']}:{i}", "unit", _observable(t, wins), v, sc,
-                                         sd_obs=_unit_sd(t, rows[i], sc, v), sd_bias=float(t.get("bias_sd", 0.0)),
+                                         sd_obs=_unit_sd(t, rows[i], sc, v),
+                                         sd_bias=(gsd[str(rows[i][t["bias_by"]])] if gsd is not None
+                                                  else float(t.get("bias_sd", 0.0))),
                                          sd_md=md, unit=i, source=t["source"],
                                          bias_key=f"{t.get('bias_source', t['id'])}|{rows[i][t['bias_by']]}"
                                          if t.get("bias_by") else None))
@@ -799,6 +953,15 @@ def change_findings(raw, data, expected=None) -> list:
 
 
 # --------------------------------------------------------------------------- simulation
+INFRA_KIND = "infra"      # scripts/compute.py's kind for a row lost with its machine (never a model failure)
+
+
+def _infra_only(rows) -> bool:
+    """Some rows failed, and every failed one was lost to infrastructure (not the model)."""
+    bad = [r for r in rows if not r.get("ok")]
+    return bool(bad) and all(r.get("kind") == INFRA_KIND for r in bad)
+
+
 class _Deferred(Exception):
     """A benchmark runner needs engine jobs that are not in the cache yet (recorded; run them as a batch)."""
 
@@ -836,6 +999,142 @@ def _CachedRunner(*a, **k):
     return _runner_cls()(*a, **k)
 
 
+ADAPTER_FILES = ("toolkit/analysis/batch.py", "toolkit/engines/horizon.py")   # job -> engine call, outside the
+LEGACY_ADAPTER_ENV = "MA_JC_LEGACY_ADAPTER_SHA256"    # engine identity (Codex review of #241, P2-4)
+REUSE_SIDECAR = ".reuse.json"      # a merged results file's digest, adapter and runtime (written by this module)
+
+
+def adapter_digest(root=None) -> str:
+    """sha256 over the code that turns a batch job into an engine call (ADAPTER_FILES, under the repo `root`)."""
+    import hashlib
+    h = hashlib.sha256()
+    for f in ADAPTER_FILES:
+        h.update(f.encode() + b"\0")
+        with open(os.path.join(root or ROOT, f), "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()
+
+
+def _sha_file(path) -> str | None:
+    import hashlib
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _trusted_sources(call_dir) -> list:
+    """[(file, kind, sidecar)] of a call directory's row files whose recorded digest equals the file's (Codex review
+    of #241, P1): compute.py's `<out>.summary.json` (out_sha256) for points.jsonl / results.jsonl, or this module's
+    `<out>.reuse.json` for a merged results file. A file with no matching digest is never a source."""
+    out = []
+    for name, kind in (("points.jsonl", "points"), ("results.jsonl", "results")):
+        f = os.path.join(call_dir, name)
+        if not os.path.isfile(f):
+            continue
+        h = _sha_file(f)
+        for side in (f + ".summary.json", f + REUSE_SIDECAR):
+            try:
+                meta = json.load(open(side))
+            except (OSError, ValueError):
+                continue
+            if isinstance(meta, dict) and h and meta.get("out_sha256") == h:
+                out.append((f, kind, meta))
+                break
+    return out
+
+
+def _source_rows(path, kind) -> list:
+    """The rows {result, provenance} of one trusted file (points: each task's rows; results: one per line)."""
+    rows = []
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        return rows
+    for x in lines:
+        try:
+            r = json.loads(x)
+        except ValueError:
+            continue
+        if not (isinstance(r, dict) and r.get("ok") and isinstance(r.get("result"), dict)):
+            continue
+        for body in (r["result"].get("rows") or []) if kind == "points" else [r["result"]]:
+            sha = ((body or {}).get("provenance") or {}).get("job_sha") if isinstance(body, dict) else None
+            if isinstance(sha, str) and sha and isinstance(body.get("result"), dict):
+                rows.append((sha, body))
+    return rows
+
+
+def stored_rows(run_dir) -> dict:
+    """{job_sha: [(row, adapter digest or None)]} of every unit-batch row stored under the run's
+    analysis/joint_calibration/call*/, from trusted files only (_trusted_sources). F6 run 1 (2026-11-16): compute.py
+    reuses a row only under the same whole-repo code fingerprint, so any harness edit recomputed every stored
+    calibration run (3,088 in F6, about $114). A row is reused (Simulator._units) only when its job_sha equals the
+    job's (every input: engine reference and config, horizon, windows, unit, package, params, seed), its engine
+    identity (code, parameters, configuration) equals the current engine's (batch.verify_rows, the check load_prior
+    applies), and the code between job and engine (adapter_digest) is the current one: recorded with the rows this
+    module wrote (`adapter.json`), or attested for older rows by $MA_JC_LEGACY_ADAPTER_SHA256. Every candidate is
+    kept (Codex P3: an old engine's row never masks a current one)."""
+    import glob
+    out = {}
+    for d in sorted(glob.glob(os.path.join(run_dir, OUT_REL, "call*"))):
+        try:
+            ad = json.load(open(os.path.join(d, "adapter.json"))).get("adapter_sha256")
+        except (OSError, ValueError, AttributeError):
+            ad = None
+        for f, kind, _ in _trusted_sources(d):
+            for sha, body in _source_rows(f, kind):
+                out.setdefault(sha, []).append((body, ad))
+    return out
+
+
+def _admit(pool, jobs, engine, adapter, legacy_ok) -> dict:
+    """{job id: (stored row, legacy)} for jobs a stored row answers (job_sha + engine identity + adapter)."""
+    from toolkit.analysis import batch as B
+    out = {}
+    for j in jobs:
+        for body, ad in pool.get(B.job_sha(j), []):
+            if not (ad == adapter or (ad is None and legacy_ok)):
+                continue
+            if B.verify_rows([{"id": j["id"], "result": body}], [j], engine)[0]:
+                out[j["id"]] = (body, ad is None)
+                break
+    return out
+
+
+def reuse_check(spec, run_dir) -> dict:
+    """Read-only: by call directory, the stored rows from trusted files and those whose engine identity is the
+    current engine's; the current adapter digest, whether older rows are attested, and the runtime each source
+    recorded (reported, not gated, as compute.py's reuse-check). A row is reused only when the calibration asks
+    for its job (same job_sha); this check does not generate the jobs."""
+    import glob
+    from toolkit.engines.contract import engine_identity
+    ident, adapter = engine_identity(spec.engine()), adapter_digest()
+    legacy = os.environ.get(LEGACY_ADAPTER_ENV)
+    calls, seen = {}, set()
+    for d in sorted(glob.glob(os.path.join(run_dir, OUT_REL, "call*"))):
+        try:
+            ad = json.load(open(os.path.join(d, "adapter.json"))).get("adapter_sha256")
+        except (OSError, ValueError, AttributeError):
+            ad = None
+        c = {"trusted_files": [], "stored": 0, "engine_match": 0, "adapter": ad or "legacy (not recorded)",
+             "runtime": None}
+        for f, kind, meta in _trusted_sources(d):
+            c["trusted_files"].append(os.path.basename(f))
+            c["runtime"] = c["runtime"] or meta.get("runtime")
+            for sha, body in _source_rows(f, kind):
+                c["stored"] += 1
+                if sha not in seen and body.get("provenance", {}).get("engine") == ident and (
+                        ad == adapter or (ad is None and legacy == adapter)):
+                    c["engine_match"] += 1
+                    seen.add(sha)
+        calls[os.path.basename(d)] = c
+    return {"calls": calls, "stored": sum(c["stored"] for c in calls.values()),
+            "eligible": sum(c["engine_match"] for c in calls.values()), "adapter_sha256": adapter,
+            "legacy_attested": legacy == adapter, "engine": ident}
+
+
 class Simulator:
     """HistoryMatch's simulate(): unit points through the analysis batch (comparator package), shared points through
     the benchmark runner. Every call writes its own results file under analysis/joint_calibration/."""
@@ -857,6 +1156,8 @@ class Simulator:
         if spec.raw["objective"].get("delivery") is not None:
             self.horizon["delivery"] = [float(x) for x in spec.raw["objective"]["delivery"]]
         self.bench = None
+        self.stored = stored_rows(run_dir)      # read once; no stored file is ever rewritten (_call_dir)
+        self.reused = 0
 
     def job(self, p, k, windows=None, call=None) -> dict:
         """The batch job of unit point p at position k of a call (the batch's job_sha covers every field but id)."""
@@ -886,7 +1187,8 @@ class Simulator:
         if held:                    # a held-out benchmark never enters a fit (also refused at validation)
             raise HM.CalibrationInputError([f"benchmark targets {held} are held out by the engine's pack"])
         byid = {b["id"]: b for b in pack["benchmarks"]}
-        fitted = {k: v[2] for k, v in fitted_ranges(self.eng).items()}
+        # v2-posterior-point: a fitted posterior column at the point value (the chosen point), not fitted.yaml's
+        fitted = {k: float(self.th0.get(k, v[2])) for k, v in fitted_ranges(self.eng).items()}
         settings = sorted({pack["arms"][a]["setting"] for t in want for a in BM._arms_of(byid[t]["estimand"])})
         cache = {}
         for phase in range(int(self.kw.get("bench_phases", 8))):
@@ -932,8 +1234,14 @@ class Simulator:
         tasks = [[list(x) for x in g] for g in groups.values()]
         outp = os.path.join(self.run_dir, OUT_REL, f"bench_call{self.calls}_phase{phase}.jsonl")
         kw = {k: v for k, v in self.kw.items() if k in ("max_workers", "max_core_hours", "timeout_s")}
-        rows, summ = compute.run_map(self.run_dir, os.path.join(ROOT, "toolkit", "engines", "benchmark.py") + "::_job_list",
-                                     tasks, outp, purpose="v2 joint calibration: benchmark settings", **kw)
+        fn = os.path.join(ROOT, "toolkit", "engines", "benchmark.py") + "::_job_list"
+        rows, summ = compute.run_map(self.run_dir, fn, tasks, outp, purpose="v2 joint calibration: benchmark settings",
+                                     **kw)
+        if _infra_only(rows):        # F6 preview 2026-11-11: once more, same file: done rows are reused
+            self.log(f"benchmark batch: {sum(not r.get('ok') for r in rows)} task(s) lost to infra after compute's "
+                     "own retries; running the batch once more (finished tasks are reused)")
+            rows, summ = compute.run_map(self.run_dir, fn, tasks, outp,
+                                         purpose="v2 joint calibration: benchmark settings (infra rerun)", **kw)
         bad = [n for n, r in enumerate(rows) if not r.get("ok")]
         if bad:
             raise HM.CalibrationInputError([f"benchmark batch: {len(bad)} of {len(rows)} tasks failed (e.g. "
@@ -956,22 +1264,104 @@ class Simulator:
         _ = ThreadPoolExecutor
         return out
 
+    def _call_dir(self, after=None) -> tuple:
+        """(call number, out_rel) for this call's files: call<N>, or, when that directory already holds a finished
+        row file (an earlier launch's, or a continuation whose call numbers restart), the first free
+        call<N + 100000 m>, so no stored row file is overwritten (Codex review of #241, P2-2/P2-3). A directory with
+        only a killed batch's journal (compute.py's partial rows, its lock, adapter.json) is resumed in place, so
+        compute's own resume keeps those rows (re-review P2-1). `after`: a number already taken by this call. The
+        number stays an integer for load_prior."""
+        def finished(n):
+            d = os.path.join(self.run_dir, OUT_REL, f"call{n}")
+            return os.path.isdir(d) and any(f in ("results.jsonl", "points.jsonl") or f.endswith(".summary.json")
+                                            or f.endswith(REUSE_SIDECAR) for f in os.listdir(d))
+        n, m = self.calls, 0
+        while finished(n) or n == after:
+            m += 1
+            n = self.calls + 100000 * m
+        return n, f"{OUT_REL}/call{n}/results.jsonl"
+
     def _units(self, pts, uix, out, attr, Bt):
         if uix:
             jobs = [self.job(pts[n], k) for k, n in enumerate(uix)]
-            b = Bt.run(self.run_dir, jobs, self.eng, out_rel=f"{OUT_REL}/call{self.calls}/results.jsonl",
-                       **{k: v for k, v in self.kw.items() if k != "bench_workers"})
+            cn, out_rel = self._call_dir()
+            adapter = adapter_digest()
+            legacy_ok = os.environ.get(LEGACY_ADAPTER_ENV) == adapter
+            pool = getattr(self, "stored", None) or {}
+            hit = _admit(pool, jobs, self.eng, adapter, legacy_ok) if pool else {}
+            todo = [j for j in jobs if j["id"] not in hit]
+
+            def run_once():
+                return Bt.run(self.run_dir, todo, self.eng, out_rel=out_rel,
+                              **{k: v for k, v in self.kw.items() if k != "bench_workers"})
+            b = {"results": {}, "problems": []}
+            if todo:
+                self._write_adapter(out_rel, adapter)      # before any row of this call exists
+                b = run_once()
+                kinds = (b.get("summary") or {}).get("failed_by_kind") or {}
+                if kinds and set(kinds) == {INFRA_KIND}:   # infra only, after compute's retries: once more, rows reused
+                    self.log(f"joint calibration batch: {kinds[INFRA_KIND]} job(s) lost to infra; running it once more")
+                    b = run_once()
+            if hit:
+                self.reused = getattr(self, "reused", 0) + len(hit)
+                self.legacy = getattr(self, "legacy", 0) + sum(1 for _, lg in hit.values() if lg)
+                self.log(f"joint calibration batch: {len(hit)} of {len(jobs)} unit runs reused from stored rows "
+                         f"(job_sha, engine identity and adapter match); {len(todo)} computed")
+                comp_rel = out_rel
+                if todo:            # the merge goes to a directory of its own: the computed file stays as compute
+                    cn, out_rel = self._call_dir(after=cn)     # wrote and authenticated it (re-review P2-2)
+                self._publish(out_rel, jobs, hit, todo, adapter, comp_rel)
             if b["problems"]:
                 raise HM.CalibrationInputError([f"joint calibration batch: {len(b['problems'])} rows lack matching "
                                                 f"provenance (e.g. {b['problems'][:2]})"])
+            res = dict(b["results"], **{k: v[0]["result"] for k, v in hit.items()})
             for k, n in enumerate(uix):
-                r = b["results"].get(jobs[k]["id"])
-                ref = f"call{self.calls}:{k}"
+                r = res.get(jobs[k]["id"])
+                ref = f"call{cn}:{k}"
                 if r is None:
                     raise HM.CalibrationInputError([f"joint calibration batch: job {jobs[k]['id']} (unit "
                                                     f"{pts[n]['unit']}) did not complete"])
                 out[n] = {f"{w}.{m}": v for w, d in (r.get("windows") or {}).items() for m, v in d.items()}
                 out[n]["_ref"] = ref
+
+    def _write_adapter(self, out_rel, adapter):
+        from toolkit.analysis.artifacts import _safe_io
+        path = os.path.join(self.run_dir, os.path.dirname(out_rel), "adapter.json")
+        try:        # unrecorded, the call's rows are only reusable when attested (the safe direction)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _safe_io().publish(path, json.dumps({"adapter_sha256": adapter, "files": list(ADAPTER_FILES)}),
+                               self.run_dir)
+        except OSError as e:
+            self.log(f"joint calibration: adapter record not written ({e}); this call's rows are legacy")
+
+    def _publish(self, out_rel, jobs, hit, todo, adapter, comp_rel=None):
+        """This call's results file in job order (the refs load_prior follows), every row with its provenance: the
+        reused rows as stored, the computed ones as the batch wrote them (matched by job_sha, never a stale row),
+        with its digest, adapter and runtime beside it (REUSE_SIDECAR) so it is itself a trusted source. It is
+        written in this call's own directory: the stored files it read stay untouched."""
+        from toolkit.analysis import batch as B
+        from toolkit.analysis.artifacts import _safe_io
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        path = os.path.join(self.run_dir, out_rel)
+        src = os.path.join(self.run_dir, comp_rel or out_rel)
+        new = {}
+        if todo and os.path.exists(src):
+            for x in open(src):
+                r = json.loads(x) if x.strip() else {}
+                j = todo[r["i"]] if r.get("ok") and isinstance(r.get("i"), int) and 0 <= r["i"] < len(todo) else None
+                pv = ((r.get("result") or {}).get("provenance") or {}) if j is not None else {}
+                if j is not None and pv.get("job_sha") == B.job_sha(j):     # never a stale row of an earlier file
+                    new[j["id"]] = r["result"]
+        text = "".join(json.dumps({"i": n, "ok": True, "result": hit[j["id"]][0] if j["id"] in hit else new[j["id"]]})
+                       + "\n" for n, j in enumerate(jobs) if j["id"] in hit or j["id"] in new)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        import hashlib
+        _safe_io().publish(path, text, self.run_dir)
+        _safe_io().publish(path + REUSE_SIDECAR, json.dumps({
+            "out_sha256": hashlib.sha256(text.encode()).hexdigest(), "rows": text.count("\n"),
+            "reused": len(hit), "computed": len(new), "runtime": compute.runtime_versions()}), self.run_dir)
+        self._write_adapter(out_rel, adapter)
 
 
 # --------------------------------------------------------------------------- the step
@@ -1128,6 +1518,7 @@ def run(spec, run_dir, compute_kw=None, log=print, units=None, prior_dir=None, w
     rep["prior_runs"] = pinfo
     rep["adapter"] = {"windows": meta["windows"], "dropped_targets": meta["dropped"], "units": len(meta["units"]),
                       "shared": list(j["shared"]), "simulator_calls": sim.calls,
+                      "stored_rows_reused": sim.reused, "stored_rows_reused_legacy": getattr(sim, "legacy", 0),
                       "theta_held": {k: v for k, v in sim.th0.items() if k not in j["shared"]}}
     rep["primary"] = {"targets": {t["id"]: {k: t[k] for k in SENS_KEYS if k in t} for t in j["targets"]
                                   if t["kind"] != "benchmark"},
@@ -1176,9 +1567,13 @@ def block_hits(rep) -> list:
 
 
 def inputs(spec) -> list:
-    """The files the joint calibration reads beyond the units table: its group-target tables."""
+    """The files the joint calibration reads beyond the units table: its group-target tables and its unit targets'
+    bias_sd_by_group interval tables (Codex review of #206)."""
     j = declared(spec) or {}
-    return sorted({spec.resolve(t["csv"]) for t in j.get("targets") or [] if t.get("kind") == "group"})
+    ts = [t for t in j.get("targets") or [] if isinstance(t, dict)]
+    return sorted({spec.resolve(t["csv"]) for t in ts if t.get("kind") == "group"}
+                  | {spec.resolve(t["bias_sd_by_group"]["csv"]) for t in ts
+                     if isinstance(t.get("bias_sd_by_group"), dict) and t["bias_sd_by_group"].get("csv")})
 
 
 def block_reason(rep) -> str:
@@ -1241,6 +1636,8 @@ def main(argv=None) -> int:
     ap.add_argument("--then-waves", type=int, default=0, help="new waves of the second setting (default 0)")
     ap.add_argument("--waves", type=int)
     ap.add_argument("--points-per-unit", type=int)
+    ap.add_argument("--reuse-check", action="store_true",
+                    help="read-only: stored unit rows the current engine identity would reuse, by call")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -1251,6 +1648,10 @@ def main(argv=None) -> int:
     from toolkit.spec import schema
     rd = os.path.abspath(a.run_dir)
     spec = schema.load(os.path.join(rd, a.spec))
+    if a.reuse_check:
+        r = reuse_check(spec, rd)
+        print(json.dumps({k: v for k, v in r.items() if k != "engine"}, indent=1, default=str))
+        return 0
     units = [x.strip() for x in open(a.units) if x.strip()] if a.units else None
     kw = {"max_workers": a.workers, "bench_workers": a.bench_workers or a.workers}
     if a.max_core_hours:
@@ -1857,6 +2258,79 @@ def _self_test() -> int:
                f"JA16g the gate rebuilds the expected pair ids from the spec and targets ({sorted(exp)})")
     safe(ja16, "JA16")
 
+    def ja25():          # F6 P6 (owner, 2026-11-12): a shared offset's sd per group, from the survey's own interval
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d, group=False)
+            ci = {"r0": (0.20, 0.30), "r1": (0.04, 0.37), "r2": (0.18, 0.32)}
+            with open(os.path.join(d, "bias_ci.csv"), "w") as f:
+                f.write("region,survey,lo,hi\n" + "".join(f"{g},s,{lo},{hi}\n" for g, (lo, hi) in ci.items())
+                        + "r1,other,0.1,0.2\n")
+            raw = yaml.safe_load(open(p))
+            j = raw["calibration"]["joint"]
+            by = {"csv": "bias_ci.csv", "filter": {"survey": "s"}, "key": "region", "ci": ["lo", "hi"], "ci_level": 0.95}
+            j["targets"][0].update(bias_by="region", bias_source="survey_a", bias_sd_by_group=by)
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            bad0 = spec_problems(schema.load(p))
+            P, _ = build(schema.load(p))
+            units = {r["id"] if "id" in r else r[list(r)[0]]: r for r in csv.DictReader(open(os.path.join(d, "units.csv")))}
+            want = {g: HM.sd_from_ci(lo, hi, "logit", 0.95) for g, (lo, hi) in ci.items()}
+            got = {t.bias_key: t.sd_bias for t in P.targets if t.kind == "unit"}
+            ok(not bad0 and got and all(abs(got[f"survey_a|{g}"] - want[g]) < 1e-12 for g in want if f"survey_a|{g}" in got)
+               and len({round(v, 9) for v in got.values()}) == len(got),
+               f"JA25a bias_sd_by_group: each group's offset sd is its own interval's sd on the target's scale "
+               f"({bad0[:2]}, {got}, {want})")
+            bad_cases = [("bias_sd and bias_sd_by_group together", lambda t: t.update(bias_sd=0.2)),
+                         ("bias_sd_by_group without bias_by", lambda t: t.pop("bias_by")),
+                         ("bias_sd_by_group without ci", lambda t: t["bias_sd_by_group"].pop("ci")),
+                         ("bias_sd_by_group without csv", lambda t: t["bias_sd_by_group"].pop("csv")),
+                         ("bias_sd_by_group on a group target", lambda t: t.update(kind="group"))]
+            for why, mut in bad_cases:
+                r2 = yaml.safe_load(open(p))
+                mut(r2["calibration"]["joint"]["targets"][0])
+                p2 = os.path.join(d, "s2.yaml")
+                yaml.safe_dump(r2, open(p2, "w"), sort_keys=False)
+                bad = spec_problems(schema.load(p2))
+                ok(bool(bad), f"JA25b refused: {why} ({bad[:2]})")
+            # Fail closed: a group of calibrated units with no row (or two rows) in the table is an input error.
+            for why, text in (("a group with no row", "region,survey,lo,hi\nr0,s,0.2,0.3\nr2,s,0.18,0.32\n"),
+                              ("a group with two rows", "region,survey,lo,hi\nr0,s,0.2,0.3\nr0,s,0.2,0.3\n"
+                                                        "r1,s,0.04,0.37\nr2,s,0.18,0.32\n"),
+                              ("an interval that is not increasing", "region,survey,lo,hi\nr0,s,0.3,0.2\n"
+                                                                     "r1,s,0.04,0.37\nr2,s,0.18,0.32\n")):
+                open(os.path.join(d, "bias_ci.csv"), "w").write(text)
+                try:
+                    build(schema.load(p))
+                    raised = None
+                except HM.CalibrationInputError as e:
+                    raised = str(e)[:160]
+                ok(raised is not None, f"JA25c {why} in the interval table is an input error ({raised})")
+            # Codex review of #206 (both reviewers, P2): the interval table is an input the artifact records, and a
+            # sensitivity that sets bias_sd on such a target is refused up front (it could only fail when rebuilt).
+            open(os.path.join(d, "bias_ci.csv"), "w").write(
+                "region,survey,lo,hi\nr0,s,0.2,0.3\nr1,s,0.04,0.37\nr2,s,0.18,0.32\n")
+            ok(os.path.realpath(os.path.join(d, "bias_ci.csv")) in {os.path.realpath(x) for x in inputs(schema.load(p))},
+               f"JA25d the interval table is one of the calibration's recorded inputs ({inputs(schema.load(p))})")
+            r4 = yaml.safe_load(open(p))
+            r4["calibration"]["joint"]["sensitivity"] = [{"id": "b", "label": "b", "targets": {"unit_t": {"bias_sd": 0.3}}}]
+            p4 = os.path.join(d, "s4.yaml")
+            yaml.safe_dump(r4, open(p4, "w"), sort_keys=False)
+            bad4 = spec_problems(schema.load(p4))
+            ok(any("bias_sd_by_group" in x for x in bad4),
+               f"JA25e a bias_sd sensitivity on a target with bias_sd_by_group is refused at validation ({bad4[:2]})")
+            # Codex review round 2 of #206: a YAML date in the filter (loaded as a date) does not crash validation.
+            r5 = yaml.safe_load(open(p))
+            r5["calibration"]["joint"]["targets"][0]["bias_sd_by_group"]["filter"] = {"survey": "s", "when": "2021-11-01"}
+            p5 = os.path.join(d, "s5.yaml")
+            open(p5, "w").write(yaml.safe_dump(r5, sort_keys=False).replace("'2021-11-01'", "2021-11-01"))
+            try:
+                bad5 = spec_problems(schema.load(p5))
+                crash = None
+            except TypeError as e:
+                bad5, crash = None, str(e)[:120]
+            ok(crash is None, f"JA25f a date-valued filter is validated, not a crash ({crash}, {bad5 and bad5[:1]})")
+    safe(ja25, "JA25")
+
     def ja17():          # the gate findings of the change diagnostic
         pair = {"id": "s:a->b:r0", "survey": "s", "group": "r0", "from": "a", "to": "b", "observed": -0.4,
                 "modelled": 0.1, "difference": 0.5, "sd": 0.1, "z": 5.0, "flagged": True,
@@ -2046,6 +2520,288 @@ def _self_test() -> int:
         ok(len(got) == 1 and got[0].get("rho") == 0.0 and "independent" in got[0].get("note", ""),
            f"JA23 a mixed pair combines the rounds' sampling errors as independent and states it ({got})")
     safe(ja23, "JA23")
+
+    def ja24():          # 2026-11-11 F6 preview: 1 of 42 benchmark tasks lost with its worker ended a 2.5-h run
+        from unittest import mock
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        from toolkit.engines import benchmark as BM
+        with tempfile.TemporaryDirectory() as d:
+            sim = Simulator.__new__(Simulator)
+            sim.run_dir, sim.calls, sim.kw, sim.log = d, 1, {}, lambda m: None
+            pending = [("ref", "cfg", {"a": 1}, "u1", "pk", 5, 1), ("ref", "cfg", {"a": 2}, "u1", "pk", 5, 1)]
+
+            def fake(script):
+                seq, outs = list(script), []
+
+                def run_map(run_dir, fn, tasks, out, **kw):
+                    outs.append(out)
+                    bad = seq.pop(0) if seq else None
+                    return [{"ok": False, "kind": bad, "error": f"{bad} failure"} if (n == 0 and bad) else
+                            {"ok": True, "result": [{"v": n}]} for n in range(len(tasks))], {}
+                return run_map, outs
+
+            def go(script):
+                cache = {}
+                rm, outs = fake(script)
+                with mock.patch.object(compute, "run_map", rm), mock.patch.object(BM, "shares_state", lambda e: False), \
+                        mock.patch.object(BM, "_engine_of", lambda j: None):
+                    try:
+                        sim._bench_batch(pending, cache, 0)
+                        return "ok", outs, cache
+                    except HM.CalibrationInputError as e:
+                        return f"raised: {e}", outs, cache
+            r1, o1, c1 = go([INFRA_KIND])
+            ok(r1 == "ok" and len(o1) == 2 and o1[0] == o1[1] and len(c1) == 2,
+               f"JA24 a benchmark batch whose only failures are infra (after compute's own retries) is run once more "
+               f"on the same results file (done rows reused) and completes: {r1} {o1}")
+            r2, o2, _ = go(["model"])
+            ok(r2.startswith("raised") and len(o2) == 1,
+               f"JA24b a model failure is never rerun: it fails closed at once: {r2} {len(o2)} calls")
+            r3, o3, _ = go([INFRA_KIND, INFRA_KIND])
+            ok(r3.startswith("raised") and len(o3) == 2,
+               f"JA24c infra that persists through the rerun fails closed: {r3} {len(o3)} calls")
+
+        class FakeBt:
+            def __init__(self, script):
+                self.script, self.calls = list(script), 0
+
+            def run(self, run_dir, jobs, eng, out_rel=None, **kw):
+                self.calls += 1
+                bad = self.script.pop(0) if self.script else None
+                res = {j["id"]: {"windows": {"w": {"m": 1.0}}} for n, j in enumerate(jobs) if not (n == 0 and bad)}
+                return {"results": res, "problems": [], "summary": {"n_failed": 1 if bad else 0,
+                                                                   "failed_by_kind": {bad: 1} if bad else {}}}
+        sim = Simulator.__new__(Simulator)
+        sim.run_dir, sim.calls, sim.kw, sim.eng, sim.log = "/nonexistent", 1, {}, None, lambda m: None
+        sim.job = lambda p, k: {"id": f"j{k}"}
+        pts = [{"kind": "unit", "unit": "u1"}, {"kind": "unit", "unit": "u2"}]
+        for script, want, calls, cid in (([INFRA_KIND], "ok", 2, "JA24d infra only on the unit batch: rerun once, completes"),
+                                         (["model"], "raised", 1, "JA24e a model failure on the unit batch: no rerun"),
+                                         ([INFRA_KIND, INFRA_KIND], "raised", 2, "JA24f persistent infra: fails closed")):
+            bt, out = FakeBt(script), [None, None]
+            try:
+                sim._units(pts, [0, 1], out, "attr", bt)
+                got = "ok"
+            except HM.CalibrationInputError:
+                got = "raised"
+            ok(got == want and bt.calls == calls, f"{cid}: {got}, {bt.calls} calls")
+    safe(ja24, "JA24")
+
+    def ja26():          # F6 run 1 (2026-11-16): a harness-only change must not recompute the stored calibration rows
+        import glob
+        import hashlib
+        import shutil
+        from unittest import mock
+        from toolkit.analysis import batch as Bt_
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import compute
+        real_run, real_fp = Bt_.run, compute.code_fingerprint
+        sent = []
+
+        def spy(run_dir, jobs, eng, **kw):
+            sent.append(len(jobs))
+            return real_run(run_dir, jobs, eng, **kw)
+
+        def again(spec, d, tag, **extra):      # a harness edit: every stored batch's code fingerprint differs
+            sent.clear()
+            with mock.patch.object(Bt_, "run", spy), \
+                    mock.patch.object(compute, "code_fingerprint", lambda *a, **k: real_fp(*a, **k) + tag):
+                return run(spec, d, {"max_workers": 2}, log=q, **fast, **extra)
+
+        def digests(d):
+            return {f: hashlib.sha256(open(f, "rb").read()).hexdigest()
+                    for f in glob.glob(os.path.join(d, OUT_REL, "call*", "*")) if os.path.isfile(f)}
+        with tempfile.TemporaryDirectory() as d0:
+            spec0 = schema.load(_toy_joint(d0, group=False))
+            rep1 = run(spec0, d0, {"max_workers": 2}, log=q, **fast)
+            n1 = sum(len(v) for v in stored_rows(d0).values())
+            base = os.path.join(os.path.dirname(d0), os.path.basename(d0) + "_base")
+            shutil.copytree(d0, base)
+
+            def fresh():
+                dd = tempfile.mkdtemp()
+                shutil.rmtree(dd)
+                shutil.copytree(base, dd)
+                return dd, schema.load(os.path.join(dd, os.path.basename(spec0.path)))
+            try:
+                d, spec = fresh()
+                before = digests(d)
+                rep2 = again(spec, d, "-edited")
+                ok(n1 > 0 and sum(sent) == 0, f"JA26a after a harness-only change no stored unit run is recomputed: "
+                                              f"{sum(sent)} of {n1} sent to the engine")
+                ok(rep2["adapter"].get("stored_rows_reused") == n1,
+                   f"JA26b the reuse is recorded in the report: {rep2['adapter'].get('stored_rows_reused')} of {n1}")
+                v1 = {u: x["implausibility"] for u, x in (rep1.get("verification") or {}).get("units", {}).items()}
+                v2 = {u: x["implausibility"] for u, x in (rep2.get("verification") or {}).get("units", {}).items()}
+                ok(v1 and v1 == v2 and rep1["status"] == rep2["status"],
+                   "JA26c the calibration from reused rows equals the original")
+                aft = digests(d)
+                ok(all(aft.get(f) == h for f, h in before.items()) and len(aft) > len(before),
+                   "JA26d no stored file is rewritten: the reuse writes its own call directories (Codex P2-2/P2-3)")
+                _, meta = build(spec)
+                pd_ = tempfile.mkdtemp()
+                shutil.copytree(os.path.join(d, OUT_REL), os.path.join(pd_, "jc_rows"))
+                json.dump(rep2["runs"], open(os.path.join(pd_, "runs.json"), "w"))
+                import yaml as _y
+                _y.safe_dump(HM_plain(artifact(rep2)), open(os.path.join(pd_, "joint_calibration.yaml"), "w"))
+                ok(load_prior(spec, pd_, meta, log=q)[1]["reused"] == len(rep2["runs"]["unit"]),
+                   "JA26e the reusing run's own files are a valid --prior source (refs follow its call directories)")
+                rc = reuse_check(spec, d)
+                ok(rc["eligible"] == n1, f"JA26h reuse_check counts the admitted stored rows ({rc['eligible']} of {n1})")
+                d, spec = fresh()        # a result payload altered with its provenance intact (Codex P1)
+                f1 = sorted(glob.glob(os.path.join(d, OUT_REL, "call1", "results.jsonl")))[0]
+                rows = [json.loads(x) for x in open(f1)]
+                w = rows[0]["result"]["result"]["windows"]
+                k0 = next(iter(w))
+                w[k0] = {m: 0.999 for m in w[k0]}
+                open(f1, "w").write("".join(json.dumps(r) + "\n" for r in rows))
+                rep3 = again(spec, d, "-edited2")
+                ok(sum(sent) == len(rows) and rep3["adapter"].get("stored_rows_reused") == n1 - len(rows),
+                   f"JA26f a file whose rows no longer match its recorded digest is no source: its {len(rows)} jobs "
+                   f"are recomputed ({sum(sent)} sent)")
+                d, spec = fresh()        # rows with no recorded adapter: reused only when attested
+                for a in glob.glob(os.path.join(d, OUT_REL, "call*", "adapter.json")):
+                    os.remove(a)
+                again(spec, d, "-edited3")
+                ok(sum(sent) == n1, f"JA26g rows of an unrecorded adapter are not reused unattested ({sum(sent)} sent)")
+                d, spec = fresh()
+                for a in glob.glob(os.path.join(d, OUT_REL, "call*", "adapter.json")):
+                    os.remove(a)
+                with mock.patch.dict(os.environ, {LEGACY_ADAPTER_ENV: adapter_digest()}):
+                    rep4 = again(spec, d, "-edited4")
+                ok(sum(sent) == 0 and rep4["adapter"].get("stored_rows_reused_legacy") == n1,
+                   f"JA26i attested to the current adapter, they are reused and counted as legacy ({sum(sent)} sent)")
+                with mock.patch.dict(os.environ, {LEGACY_ADAPTER_ENV: "0" * 64}):
+                    again(spec, d, "-edited5")
+                ok(sum(sent) == 0, "JA26j once reused under the current adapter, the new files record it themselves")
+                d, spec = fresh()        # another adapter: recorded digest differs
+                with mock.patch.object(sys.modules[__name__] if __name__ in sys.modules else
+                                       sys.modules["toolkit.analysis.joint_calibration"], "adapter_digest",
+                                       lambda root=None: "f" * 64):
+                    again(spec, d, "-edited6")
+                ok(sum(sent) == n1, f"JA26k a changed adapter (job to engine call) recomputes ({sum(sent)} sent)")
+                d, spec = fresh()        # an old engine's row first for a job_sha must not mask the current one (P3)
+                pool = stored_rows(d)
+                sha0, (body0, ad0) = next(iter(pool.items()))[0], next(iter(pool.values()))[0]
+                bad = json.loads(json.dumps(body0))
+                bad["provenance"]["engine"] = dict(bad["provenance"]["engine"], code_sha256="old")
+                pool[sha0].insert(0, (bad, ad0))
+                sim = Simulator(spec, d, build(spec)[1])
+                sim.stored = pool
+                jobs = []
+                for x in rep1["runs"]["unit"]:
+                    jb = sim.job({"unit": x["unit"], "z": x["z"], "theta": x["theta"], "seed": x["seed"]}, 0)
+                    if Bt_.job_sha(jb) == sha0:
+                        jobs.append(jb)
+                got = _admit(pool, jobs, sim.eng, adapter_digest(), False)
+                ok(jobs and len(got) == len(jobs), "JA26l an old engine's duplicate never masks a current row (Codex P3)")
+                d, spec = fresh()        # a call directory holding only a killed batch's journal is resumed in place
+                part = os.path.join(d, OUT_REL, "call1")
+                os.makedirs(os.path.join(d, OUT_REL, "call9"))
+                open(os.path.join(d, OUT_REL, "call9", "points.jsonl.partial.jsonl"), "w").write("")
+                sim = Simulator(spec, d, build(spec)[1])
+                sim.calls = 9
+                ok(sim._call_dir()[0] == 9 and Simulator._call_dir(type("S", (), {"calls": 1, "run_dir": d})())[0]
+                   == 100001 and os.path.isfile(os.path.join(part, "results.jsonl")),
+                   "JA26n a directory with only compute's partial journal is resumed in place; a finished one is not "
+                   "(Codex re-review P2-1)")
+                d, spec = fresh()        # mixed call: the computed rows' own file is never replaced by the merge
+                f1 = os.path.join(d, OUT_REL, "call1", "results.jsonl")
+                txt = "".join(x for x in list(open(f1))[2:])     # a trusted source missing two rows: a mixed call
+                open(f1, "w").write(txt)
+                sm = json.load(open(f1 + ".summary.json"))
+                sm["out_sha256"] = hashlib.sha256(txt.encode()).hexdigest()
+                json.dump(sm, open(f1 + ".summary.json", "w"))
+                before = digests(d)
+                again(spec, d, "-edited7")
+                newd = sorted(set(os.path.dirname(f) for f in digests(d)) - set(os.path.dirname(f) for f in before))
+                comp = [x for x in newd if os.path.exists(os.path.join(x, "results.jsonl.summary.json"))
+                        or os.path.exists(os.path.join(x, "points.jsonl.summary.json"))]
+                ok(comp and all(_trusted_sources(x) for x in comp) and
+                   all(not os.path.exists(os.path.join(x, "results.jsonl" + REUSE_SIDECAR)) for x in comp),
+                   "JA26o the computed rows keep their own trusted file; the merged file is published apart "
+                   "(Codex re-review P2-2)")
+            finally:
+                shutil.rmtree(base, ignore_errors=True)
+        with tempfile.TemporaryDirectory() as d:
+            ok(stored_rows(d) == {}, "JA26m no stored rows: an empty pool")
+    safe(ja26, "JA26")
+
+    def ja27():          # F6 run 1, owner decision R1 (2026-11-16): a declared group-target or offset miss, tied to a test
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d)
+            raw = yaml.safe_load(open(p))
+            raw["calibration"]["joint"]["targets"][0].update(bias_by="region", bias_sd=0.1, bias_source="S")
+            decl = [{"target": "region_t:r1", "reason": "trend misfit", "decision_test": "DT1"},
+                    {"offset": "S|r2", "reason": "nets outside the model", "decision_test": "DT1"}]
+            raw["calibration"]["joint"]["unmatched"] = {"mode": "flag", "max_units": 2, "default_reason": "toy",
+                                                        "declared": decl}
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            spec = schema.load(p)
+            ok(spec_problems(spec) == [], f"JA27a declared misses are accepted ({spec_problems(spec)})")
+            for bad_, why in (({"target": "region_t:r1", "reason": "x", "decision_test": "DT9"}, "an unknown test"),
+                              ({"target": "region_t:r1", "reason": "x"}, "no decision test"),
+                              ({"target": "region_t:r1", "offset": "S|r2", "reason": "x", "decision_test": "DT1"},
+                               "two selectors"),
+                              ({"target": "nope:r1", "reason": "x", "decision_test": "DT1"}, "not a group target"),
+                              ({"offset": "Z|r2", "reason": "x", "decision_test": "DT1"}, "not an offset source"),
+                              ({"target": "region_t:r1", "reason": "", "decision_test": "DT1"}, "no reason")):
+                r2 = yaml.safe_load(open(p))
+                r2["calibration"]["joint"]["unmatched"]["declared"] = [bad_]
+                p2 = os.path.join(d, "bad.yaml")
+                yaml.safe_dump(r2, open(p2, "w"), sort_keys=False)
+                ok(any("declared" in x for x in spec_problems(schema.load(p2))), f"JA27b refused: {why}")
+            units = {"1": {"status": "matched"}, "2": {"status": "matched"}}
+            vf = {"code": "verification_failed", "detail": {"units": [], "targets": ["region_t:r1"]}}
+            off = {"code": "offset_sampling_low_acceptance", "detail": {"rows": 10, "failed": 3, "failed_rows": [0, 1, 2],
+                                                                    "by_component": [{"blocks": ["S|r2"], "rows": [0, 1, 2]}]}}
+            rep = {"blocked": True, "conflicting": [], "units": units, "blocks": [vf, off]}
+            dec = unmatched_decision(spec, rep)
+            ok(dec["proceed"] and {(x.get("target") or x.get("offset")) for x in dec["declared"]} == {"region_t:r1", "S|r2"}
+               and all(x["decision_test"] == "DT1" for x in dec["declared"]),
+               f"JA27c declared target and offset misses proceed, each recorded with its decision test ({dec})")
+            od = lambda comps, failed=(0, 1, 2): dict(off, detail={"rows": 10, "failed": len(failed),  # noqa: E731
+                                                                   "failed_rows": list(failed), "by_component": comps})
+            for blks, why in (([dict(vf, detail={"units": [], "targets": ["region_t:r0"]}), off], "an undeclared target"),
+                              ([vf, od([{"blocks": ["S|r0"], "rows": [0, 1, 2]}])], "an undeclared offset component"),
+                              ([vf, dict(off, detail={"rows": 10, "failed": 3})], "no component breakdown"),
+                              ([vf, od([{"blocks": ["S|r2"], "rows": [0, 1]}])], "a breakdown that misses a failed row"),
+                              ([vf, od([{"blocks": ["S|r2"], "rows": [0, 1, 2]}], failed=(0, 1, 2, 3, 4))],
+                               "overlapping components that leave rows uncovered (Codex P2-1)"),
+                              ([vf, od([{"blocks": ["S|r2"], "rows": [0, 1, 2]}, {"blocks": ["S|r0"], "rows": [3]}],
+                                       failed=(0, 1, 2, 3))], "one undeclared component among declared ones"),
+                              ([vf, off, {"code": "emulator_inadequate", "detail": {}}], "another block")):
+                ok(not unmatched_decision(spec, dict(rep, blocks=blks))["proceed"], f"JA27d never proceeds: {why}")
+            ok(not unmatched_decision(spec, dict(rep, blocked=False, blocks=[
+                dict(vf, detail={"units": [], "targets": ["region_t:r0"]})]))["proceed"]
+               and unmatched_decision(spec, dict(rep, blocked=False))["declared"],
+               "JA27g a report whose blocks contradict blocked=False is judged by its blocks (Codex P2-3)")
+            p3 = os.path.join(d, "sep.yaml")       # identifiers holding the separators (Codex P1, P2-4)
+            r3 = yaml.safe_load(open(p))
+            r3["calibration"]["joint"]["targets"][0]["bias_source"] = "S|v"
+            r3["calibration"]["joint"]["targets"][1]["id"] = "region:t"
+            r3["calibration"]["joint"]["unmatched"] = {"mode": "flag", "max_units": 2, "default_reason": "toy",
+                                                       "declared": [{"target": "region:t:r1", "reason": "x",
+                                                                     "decision_test": "DT1"},
+                                                                    {"offset": "S|v|r2", "reason": "x",
+                                                                     "decision_test": "DT1"}]}
+            yaml.safe_dump(r3, open(p3, "w"), sort_keys=False)
+            s3 = schema.load(p3)
+            ok(spec_problems(s3) == [], f"JA27h exact identifiers holding ':' or '|' are declarable ({spec_problems(s3)})")
+            amb = dict(off, detail={"rows": 10, "failed": 3, "failed_rows": [0, 1, 2],
+                                    "by_component": [{"blocks": ["S|v|r1+S|v|r2"], "rows": [0, 1, 2]}]})
+            ok(not unmatched_decision(s3, dict(rep, blocks=[amb]))["proceed"],
+               "JA27i a component is matched by its exact block keys, never by splitting a string (Codex P1)")
+            raw["calibration"]["joint"]["unmatched"].pop("declared")
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            ok(not unmatched_decision(schema.load(p), rep)["proceed"], "JA27e without declarations the block stands")
+            ok(declared_test_problems({"declared": decl}, [{"test_id": "DT1", "status": "run"}]) == []
+               and declared_test_problems({"declared": decl}, [{"test_id": "DT1", "status": "not_run"}])
+               and declared_test_problems({"declared": decl}, []),
+               "JA27f a declared miss whose decision test did not run blocks the analysis (fail closed)")
+    safe(ja27, "JA27")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

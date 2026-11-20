@@ -1,0 +1,226 @@
+# World-model trial template (rubella_crs_campaign_age, batch 3): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A rubella vaccination
+  campaign is planned in 2026 in 24 districts that have never vaccinated against rubella; an importation is expected
+  in each. For each district choose one option: none; CHILDREN (all children aged 1-14 years, about 85% reached,
+  US$1.10 per child); WIDE (children and women aged 15-39, about 85% reached, US$1.10 per person targeted). The
+  budget is US$12 million. R0 is between 4 and 7 with homogeneous mixing between children, women 15-39 and everyone
+  else. Input file: units.csv (population and susceptible share of each of the three groups). Choose the options
+  that maximise cases of congenital rubella syndrome averted over the outbreak, report the total with a 95% uncertainty
+  interval, and state when vaccinating children alone protects pregnant women enough (through the herd effect) and
+  when women must be vaccinated directly.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.compartmental.engine:CompartmentalEngine
+  config:
+    groups: &id001
+    - c1_14
+    - w15_39
+    - other
+    structure: birth_cohorts
+    mode: to_extinction
+    final_size: true
+    initialiser: given
+    dt: week
+    time_unit: day
+    transmission: q
+    generation_interval:
+      seir:
+        latent_days: 14.0
+        infectious_days: 7.0
+    outcomes:
+    - crs
+    components:
+      children:
+        kind: campaign
+        targets:
+        - c1_14
+        reach: 0.85
+      wide:
+        kind: campaign
+        targets:
+        - c1_14
+        - w15_39
+        reach: 0.85
+    tol: 1.0e-09
+horizon:
+  start: 0
+  stop: 1095
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups: *id001
+  engine_attributes:
+    N:
+      columns:
+      - n_children
+      - n_women
+      - n_other
+    s0:
+      columns:
+      - s0_children
+      - s0_women
+      - s0_other
+    seed:
+      value: 1.0e-06
+      source: one importation per district
+    intro:
+      value: c1_14
+      source: importation into children (assumption)
+    ratio:crs:
+      columns:
+      - crs_ratio_c
+      - crs_ratio_w
+      - crs_ratio_o
+  defaults_accepted:
+    reach:children: the configured reach (question text)
+    reach:wide: the configured reach (question text)
+    always_immune: 'none declared: immunity is in s0'
+    always_susceptible: none declared
+options:
+  populations:
+    total: pop
+    children: pop_children
+    children_women: pop_children_women
+  components:
+    children:
+      group: campaign
+      eligible: children
+    wide:
+      group: campaign
+      eligible: children_women
+  packages:
+    none: []
+    children:
+    - children
+    wide:
+    - wide
+  engine_map:
+    children:
+      children: 1
+    wide:
+      wide: 1
+  prices:
+    base_year: '2026'
+    index:
+      '2026': 1.0
+  cost_items:
+  - id: children_cost
+    component: children
+    value: 1.1
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_eligible
+    includes:
+    - children
+  - id: wide_cost
+    component: wide
+    value: 1.1
+    price_year: '2026'
+    price_rule: as_published
+    basis: per_eligible
+    includes:
+    - wide
+objective:
+  outcome: crs
+  sense: avert
+  horizon:
+  - 0
+  - 1095
+  discounting: none
+constraints:
+  envelope_usd: 12000000
+comparator:
+  package: none
+  text: no campaign
+outcomes_reported:
+- crs
+- infections
+engine_parameters:
+  efficacy:children:
+    value: 0.95
+    range:
+    - 0.9
+    - 0.99
+    dist: triangular
+    basis: literature
+    source: 'a single dose of rubella-containing vaccine seroconverts 95% or more of recipients (Rubella vaccines:
+      WHO position paper. Wkly Epidemiol Rec 2011;86:301-316)'
+    reason: protection of those reached
+  efficacy:wide:
+    value: 0.95
+    range:
+    - 0.9
+    - 0.99
+    dist: triangular
+    basis: literature
+    source: 'a single dose of rubella-containing vaccine seroconverts 95% or more of recipients (Rubella vaccines:
+      WHO position paper. Wkly Epidemiol Rec 2011;86:301-316)'
+    reason: protection of those reached
+calibration:
+  method: emulator_inversion
+  attribute: contact_rate
+  scale: linear
+  range:
+  - 20.0
+  - 35.0
+  target_column: r0_target
+  window:
+  - 0
+  - 1095
+  metric: r0
+  target_uncertainty:
+    region_sd_logit: 0.05
+  note: 'birth cohorts with homogeneous mixing: R0 = q x contact_rate with q at the engine default 0.2, so contact_rate
+    over [20, 35] spans R0 4-7. CRS per infection in women 15-39: per infection in a woman aged 15-39: about 0.1
+    births per woman-year x 16/52 of a year at risk x about 0.5 probability of congenital rubella syndrome after
+    infection in the first 16 weeks (Miller E, Cradock-Watson JE, Pollock TM. Consequences of confirmed maternal
+    rubella at successive stages of pregnancy. Lancet 1982;2:781-784) = about 0.015'
+uncertainty:
+  level: 0.95
+  draws: 8
+  seed: 3
+  sources:
+  - kind: calibration
+  excluded:
+  - kind: engine_parameters
+    reason: the engine has no fitted parameters
+  - kind: costs
+    reason: costs stated by the question
+  - kind: emulator
+    reason: trial sweep only
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 64
+    holdout_share: 0.0
+    seed: 5
+    features: &id002
+    - s0_children
+    - s0_women
+    - s0_other
+    independent_features:
+      features: *id002
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: crs_averted
+  headline:
+    name: total_crs_averted
+    outcome: crs

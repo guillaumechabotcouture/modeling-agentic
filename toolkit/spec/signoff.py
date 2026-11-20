@@ -94,14 +94,38 @@ def burden_changed(run_dir: str, rec: dict) -> list[str]:
     return [] if signed is not None and signed == now else [rel]
 
 
+def preconditions_state(run_dir: str, rec: dict | None = None) -> tuple:
+    """(status, problems) of the run's registered preconditions (toolkit/spec/preconditions.py), recomputed from the
+    files: "ok", or the evidence check's own status (unsigned_evidence | changed | evidence_incomplete), else
+    "preconditions_failed"."""
+    from toolkit.spec import preconditions as PC
+    cap: dict = {}
+    bad = PC.problems(run_dir, None, None, mode="status", record=rec, capture=cap)    # every check: preconditions
+    if not bad:
+        return "ok", []
+    ev = cap.get("evidence_status")
+    return (ev if ev and ev != "ok" else "preconditions_failed"), bad
+
+
+def dossier_changed(run_dir: str, rec: dict) -> list[str]:
+    """F6 evidence dossier: the problems that make the sign-off's evidence binding not hold (empty: it holds)."""
+    return preconditions_state(run_dir, rec)[1]
+
+
 def status(run_dir: str) -> str:
+    """absent | invalid | awaiting | changed | signed, or a precondition's status for a signed run whose
+    preconditions do not hold now: unsigned_evidence (signed without a complete evidence binding where the options
+    need decision inputs), evidence_incomplete (the inputs required now are not covered), preconditions_failed."""
     path = os.path.join(run_dir, SPEC)
     rec = _spec_record(run_dir)
     if not os.path.exists(path):
         return "changed" if rec is not None else "absent"
     if rec is not None:
-        return "signed" if DB._sha(path) == (rec.get("sha256") or {}).get(SPEC) and not derived_changed(run_dir, rec) \
-            and not burden_changed(run_dir, rec) else "changed"
+        if DB._sha(path) != (rec.get("sha256") or {}).get(SPEC) or derived_changed(run_dir, rec) \
+                or burden_changed(run_dir, rec):
+            return "changed"
+        st = preconditions_state(run_dir, rec)[0]
+        return "signed" if st == "ok" else st
     return "invalid" if schema.validate(schema.load(path), pending_ok=True) else "awaiting"
 
 
@@ -152,6 +176,22 @@ def _sha_nofollow(run_dir: str, rel: str) -> str | None:
         return None
     except LinkRefused as e:
         raise ValueError(f"{rel}: {e}") from None
+
+
+def sign_preconditions(run_dir: str, spec_bytes: bytes) -> dict:
+    """What every signer calls (this module, scripts/decision_brief.py, agents/stage_machine.py): every registered
+    precondition on the spec bytes being signed, refused (ValueError) on any problem; returns the evidence binding
+    ({files, record}) to record."""
+    from toolkit.spec import preconditions as PC
+    cap: dict = {}
+    bad = PC.problems(run_dir, spec_bytes, None, mode="sign", only=("evidence_dossier",), capture=cap)
+    if bad:
+        raise ValueError("spec not signable (preconditions): " + "; ".join(bad[:12])
+                         + (f"; and {len(bad) - 12} more" if len(bad) > 12 else ""))
+    b = cap.get("evidence_binding")
+    if not isinstance(b, dict):
+        raise ValueError("spec not signable (preconditions): the evidence check returned no binding")
+    return b
 
 
 def signed_sha(run_dir: str) -> str | None:
@@ -208,8 +248,8 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if sheet_bytes is not None and (
             src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")
             or (brel is not None and src.get("burden_references_sha256") != bsha)):
-        raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is stale): the sheet is "
-                         "regenerated before the owner signs; read the new one")
+        raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is "
+                         "stale): the sheet is regenerated before the owner signs; read the new one")
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
     geo_expect = None
     if src is not None:
@@ -220,15 +260,23 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     sp = schema.load(os.path.join(run_dir, SPEC), data=data)
     sp.burden_bytes = bdata             # validation reads the reference bytes that were hashed
     errs = schema.validate(sp, pending_ok=True)
+    if not errs:              # the preconditions with the signer (a departure needs the owner); engine: auto too
+        from toolkit.spec import preconditions as PC
+        errs = [e + (" (only the owner can sign an engine departure)" if by != "owner" else "")
+                for e in PC.problems(run_dir, data, by, spec=sp)]
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
+    # every registered precondition (toolkit/spec/preconditions.py), recomputed from the files, whoever signs; the
+    # evidence check hands back the binding to record (its dossier read once, the sheet's dossier sha256 compared)
+    evidence = sign_preconditions(run_dir, data)
+    extra.update(evidence["files"])
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
-        # decision_brief.sign freezes the spec's geometry too (#131)
+        # decision_brief.sign freezes the spec's geometry too (#131), and binds this evidence
         return DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed,
-                       expect={SPEC: sha}, extra_sha=extra, expect_geometry=geo_expect)
+                       expect={SPEC: sha}, extra_sha=extra, expect_geometry=geo_expect, evidence=evidence)
     # The geometry part of the unsigned presentation file and its input hashes are frozen with the spec; an owner's
     # sign-off also approves the HIGH geometry exceptions the spec proposes (docs/design/v2-input-geometry.md §2).
     # The spec is the bytes read, validated and hashed above, never read again (#129: SG15).
@@ -240,7 +288,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         raise ValueError(f"{SPEC} does not parse: {e}") from None
     geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=geo_expect)
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
-              "sha256": {SPEC: sha, **extra},
+              "sha256": {SPEC: sha, **extra}, "evidence": evidence["record"],
               "producer": "toolkit/spec/signoff.py",
               "schema_version": schema.SCHEMA_VERSION}
     try:
@@ -316,10 +364,24 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
         bsha = (hashlib.sha256(bbytes).hexdigest() if bbytes is not None else "none") if brel else "none"
     except ValueError:
         bbytes, bsha = None, "unreadable"
+    from toolkit.spec import evidence_dossier as ED
+    erel = ED.dossier_reference(spec_doc)
+    try:                                # F6 evidence dossier: one read, shown and hashed
+        ebytes = ED.read_dossier(run_dir, erel) if erel else None
+        esha = ED.sha(ebytes)
+    except ValueError:
+        ebytes, esha = None, "unreadable"
+    # #218 round 5: the input closure the signature will bind, recorded on the sheet (the files listed, its digest)
+    st_ = ED.state(run_dir, spec_bytes=spec_bytes, signing=True, require_sheet=False)
+    closure = ((st_.get("binding") or {}).get("record") or {}).get("closure") or {}
+    owners = ((st_.get("binding") or {}).get("record") or {}).get("closure_owners") or {}
     text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
-                 burden_bytes=bbytes)
+                 burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
                       "burden_references_sha256": bsha,
+                      "evidence_dossier_sha256": esha,
+                      "input_closure_sha256": ED.closure_digest(closure),
+                      "input_closure": closure, "input_closure_owners": owners,
                       "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
                       "geometry_evidence_sha256": section[1]},
                      sort_keys=True)
@@ -329,7 +391,7 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
 
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
           record_bytes: bytes | None = None, geometry_section: tuple | None = None,
-          burden_bytes: bytes | None = None) -> str:
+          burden_bytes: bytes | None = None, dossier_bytes: bytes | None = None, closure: dict | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; each engine parameter value the spec sets, with the card value
@@ -352,6 +414,14 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
            f"Signing accepts `{SPEC}` (sha256 `{hashlib.sha256(spec_bytes).hexdigest()[:16]}`) and the derived data "
            f"recorded in `{DERIVATIONS_RECORD}` (sha256 `{rsha[:16]}`). "
            "It also accepts what follows.", ""]
+    from toolkit.spec import evidence_dossier as ED
+    if dossier_bytes is None and ED.dossier_reference(raw):
+        try:
+            dossier_bytes = ED.read_dossier(run_dir, ED.dossier_reference(raw))
+        except ValueError:
+            dossier_bytes = None
+    from toolkit.spec import spec_critique as SC     # pre-sign spec critique, on the bytes this sheet shows and binds
+    out += SC.sheet_lines(raw, run_dir, dossier_bytes=dossier_bytes, burden_data=burden_bytes)
     eng = raw.get("engine")
     refs = [eng["ref"]] if isinstance(eng, dict) and eng.get("ref") else \
         (list(eng.get("candidates") or []) if isinstance(eng, dict) else [])
@@ -372,6 +442,18 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
         out.append(f"- **{a}**: " + ("; ".join(means) if means else "the chosen engine's default")
                    + f". Reason: {why}")
     out.append("")
+    oa = (raw.get("analysis") or {}).get("outcome_adjustments")
+    if oa:          # owner R3 (external review point d): what every evaluation will apply, attested at sign-off
+        out.append("## Base outcome adjustments")
+        out.append("Applied in every evaluation (point, draws, sensitivity, decision tests, plan variants, the boundary "
+                   "check): each package holding the component and not the reference has its outcomes set to the value "
+                   "times those of the same package with the reference in its place; a package holding both is left "
+                   "as the engine gives it (toolkit/analysis/outcome_adjust.py).")
+        for a in oa if isinstance(oa, list) else []:
+            if isinstance(a, dict):
+                out.append(f"- **{a.get('id')}**: {a.get('component')} = {a.get('value')} x {a.get('reference')}. "
+                           f"Source: {a.get('source')}")
+        out.append("")
     try:
         import pipeline as P
         ders, ign, errs = P.load_derivations(run_dir)
@@ -393,6 +475,13 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += PV.sheet_lines(raw, candidates, run_dir)     # each spec value, the card value it replaces, HIGH when outside
     from toolkit.analysis import burden as BV
     out += BV.sheet_lines(raw, run_dir, burden_bytes)   # F6 S2-5: reference sources the owner attests are independent
+    out += ED.sheet_lines(raw, run_dir, dossier_bytes, closure)   # F6: each input, execution's vs the chosen value
+    from toolkit.engines import benchmark_coverage as BC
+    out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
+    from toolkit.analysis import uncertainty as UQ
+    out += UQ.exception_sheet_lines(raw)                # owner, 2026-11-20: a net-effect posterior exception, HIGH
+    from toolkit.engines import effect_settings as ES
+    out += ES.sheet_lines(raw, run_dir)                 # units outside the trials' settings, and what covers each
     if candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:
@@ -404,6 +493,7 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
 
 def _self_test() -> int:
     import tempfile
+    from toolkit.spec.spec_critique import SECTION as SC_SECTION
     import yaml
     fails = []
 
@@ -653,6 +743,10 @@ def _self_test() -> int:
             "k": {"value": 0.9, "source": "a toy survey", "reason": "toy setting", "basis": "setting_data"}}
         yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
         md = sheet(d)
+        cr = md.split(SC_SECTION)[-1].split("\n## ")[0] if SC_SECTION in md else ""
+        ok("| headline_comparator |" in cr
+           and md.index(SC_SECTION) < md.index("## Engine defaults accepted by name"),
+           f"SV0 the sheet opens with the pre-sign spec critique (toolkit/spec/spec_critique.py): {cr[:400]!r}")
         sec = md.split("## Engine parameter values set by the spec")[-1].split("\n## ")[0] \
             if "## Engine parameter values set by the spec" in md else ""
         ok(sec and "**HIGH**" in sec and sec.count("HIGH") == 1 and "a toy sweep" in sec and "toy headline" in sec
@@ -832,11 +926,248 @@ def _self_test() -> int:
                f"IG-S4 a sheet without its sources footer is refused: it predates source binding ({why[:90]})")
     except Exception as e:  # noqa: BLE001
         ok(False, f"IG-S4 a sheet without its sources footer is refused: {type(e).__name__}: {e}")
+    # ED1-ED9 (F6 evidence dossier, owner decision 2026-11-12): no sign-off until every input that drives an option's
+    # effect has a checked, sourced entry; the sheet shows the dossier and the signature binds its bytes
+    from toolkit.spec import evidence_dossier as ED
+    _TOYS.enable_for_test()
+
+    def refusal(d):
+        try:
+            sign(d, "owner", note="n")
+            return ""
+        except ValueError as e:
+            return str(e)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d, dossier=False)
+            why = refusal(d)
+            ok("evidence dossier" in why and "parameter:eff_a" in why and status(d) == "awaiting",
+               f"ED1 a spec whose options need decision inputs and that has no dossier is refused, listing them: {why}")
+            raw = yaml.safe_load(open(os.path.join(d, SPEC)))
+            raw["evidence"] = {"dossier": "evidence_dossier.yaml"}
+            yaml.safe_dump(raw, open(os.path.join(d, SPEC), "w"), sort_keys=False)
+            why = refusal(d)
+            ok("evidence_dossier.yaml" in why and "does not exist" in why,
+               f"ED1b a dossier the spec names but that does not exist is refused: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            e = ED.toy_entries()
+            e.pop("unit_attribute:x")
+            ED.toy_dossier_spec(d, entries=e)
+            why = refusal(d)
+            ok("unit_attribute:x" in why and status(d) == "awaiting", f"ED2 an uncovered input is refused by name: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            e = ED.toy_entries()
+            e["unit_attribute:x"] = {"model_value": "", "model_source": "", "chosen": {}}
+            ED.toy_dossier_spec(d, entries=e)
+            why = refusal(d)
+            ok("unit_attribute:x" in why and "model_value" in why, f"ED3 a blank entry is refused: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            open(os.path.join(d, "evidence_dossier.yaml"), "w").write("inputs: [unclosed\n")
+            why = refusal(d)
+            ok("evidence_dossier.yaml" in why and "parse" in why, f"ED9 an unparseable dossier is refused: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            write_sheet(d)
+            md = open(os.path.join(d, SHEET)).read()
+            sec = md.split("## Evidence dossier")[-1].split("\n## ")[0] if "## Evidence dossier" in md else ""
+            ok(sec and "| parameter:eff_a" in sec and "0.42" in sec and "Toy trial 2020" in sec and "0.3, 0.7" in sec
+               and "fitted_range_eff_a" in sec and "no data" in sec and "0.5" in sec,
+               f"ED5 the sheet shows the dossier table (input, model value, field value, source, chosen range, "
+               f"test): {sec[:600]!r}")
+            src = sheet_sources(md) or {}
+            open(os.path.join(d, "evidence_dossier.yaml"), "a").write("# edited after the sheet\n")
+            why = refusal(d)
+            ok(isinstance(src.get("evidence_dossier_sha256"), str) and "stale" in why and status(d) == "awaiting",
+               f"ED7 a sheet generated before a dossier edit cannot authorise the sign-off: {why}")
+            write_sheet(d)
+            rec = sign(d, "owner", note="n")
+            ok(status(d) == "signed" and rec["sha256"].get("evidence_dossier.yaml"),
+               f"ED4 a complete dossier (with a 'no data' entry and its borrowing rule) signs and its hash is recorded: "
+               f"{sorted(rec['sha256'])}")
+            open(os.path.join(d, "evidence_dossier.yaml"), "a").write("# edited after sign-off\n")
+            ok(status(d) == "changed" and bool(dossier_changed(d, _spec_record(d))),
+               f"ED6 a dossier edit after sign-off makes the signature stale: {status(d)}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d, ref="toolkit.engines.contract:ToyEngine", dossier=False)
+            ok(refusal(d) == "" and status(d) == "signed",
+               "ED8 a spec whose options use no component with decision inputs signs with no dossier")
+    except Exception as e:  # noqa: BLE001 -- before the dossier exists (step α) this is the failure
+        ok(False, f"ED1-ED9 evidence dossier sign-off: {type(e).__name__}: {e}")
+    # ED10-ED12 (#218 review round 1): every signing path checks and binds the dossier; the inputs the options need
+    # decide, not whether the spec names a dossier
+    try:
+        def brief(d):
+            yaml.safe_dump(DB.example_brief(), open(os.path.join(d, DB.BRIEF), "w"))
+            yaml.safe_dump({"hard_blockers": [{"id": "HB-001", "text": "t"}]}, open(os.path.join(d, DB.CRITERIA), "w"))
+            write_sheet(d)
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d, dossier=False)
+            brief(d)
+            try:
+                DB.sign(d, "owner", note="n")
+                why = ""
+            except ValueError as e:
+                why = str(e)
+            ok("evidence dossier" in why and "parameter:eff_a" in why and status(d) != "signed",
+               f"ED10a the brief's sign-off refuses a spec whose options need decision inputs and have no dossier: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            brief(d)
+            rec = DB.sign(d, "owner", note="n")
+            ok((rec.get("evidence") or {}).get("dossier") == "evidence_dossier.yaml"
+               and rec["sha256"].get("evidence_dossier.yaml") and status(d) == "signed",
+               f"ED10b the brief's sign-off binds the dossier (hash and evidence record): {sorted(rec)}")
+        from agents import stage_machine as SM
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d, dossier=False)
+            try:
+                SM.sign(d, "owner", "n")
+                why = ""
+            except ValueError as e:
+                why = str(e)
+            ok("evidence dossier" in why and "parameter:eff_a" in why,
+               f"ED11a the stage machine's sign-off refuses it too: {why}")
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            write_sheet(d)                  # the stage machine signer, too, binds what the sheet showed
+            rec = SM.sign(d, "owner", "n")
+            ok((rec.get("evidence") or {}).get("dossier") == "evidence_dossier.yaml"
+               and (rec.get("evidence_sha256") or {}).get("evidence_dossier.yaml"),
+               f"ED11b the stage machine's sign-off binds the dossier: {rec}")
+        with tempfile.TemporaryDirectory() as d:
+            p = ED.toy_dossier_spec(d, dossier=False)
+            json.dump({"signed_by": "owner", "sha256": {SPEC: DB._sha(p)}}, open(os.path.join(d, SPEC_SIGNOFF), "w"))
+            ok(status(d) == "unsigned_evidence",
+               f"ED12 a sign-off made before the dossier requirement, of a spec whose options need decision inputs, is "
+               f"unsigned_evidence (it must be re-signed), not signed: {status(d)}")
+            ED.toy_dossier_spec(d, ref="toolkit.engines.contract:ToyEngine", dossier=False)
+            json.dump({"signed_by": "owner", "sha256": {SPEC: DB._sha(p)}}, open(os.path.join(d, SPEC_SIGNOFF), "w"))
+            ok(status(d) == "signed", f"ED12b ... one whose options need none stays signed: {status(d)}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"ED10-ED12 every signing path: {type(e).__name__}: {e}")
+    # ED13-ED14 (#218 review round 2): the brief's signer checks the dossier against the sheet and never trusts a
+    # binding it is handed
+    try:
+        def brief_refusal(d, **kw):
+            try:
+                DB.sign(d, "owner", note="n", **kw)
+                return ""
+            except ValueError as e:
+                return str(e)
+        with tempfile.TemporaryDirectory() as d:
+            ED.toy_dossier_spec(d)
+            brief(d)
+            open(os.path.join(d, "evidence_dossier.yaml"), "a").write("# edited after the sheet\n")
+            why = brief_refusal(d)
+            ok("stale" in why and "evidence dossier" in why and status(d) != "signed",
+               f"ED13 the brief's sign-off refuses a dossier changed after the sheet was generated: {why}")
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
+            ED.toy_dossier_spec(d, dossier=False)
+            brief(d)
+            empty = {"files": {}, "record": {"required": [], "dossier": None, "sha256": None}}
+            w1 = brief_refusal(d, evidence=empty)
+            ED.toy_dossier_spec(other)
+            write_sheet(other)
+            foreign = sign_preconditions(other, open(os.path.join(other, SPEC), "rb").read())
+            w2 = brief_refusal(d, evidence=foreign)
+            ok("evidence dossier" in w1 and w2 and status(d) != "signed",
+               f"ED14 a caller's binding is never trusted: an empty one and one made for another spec are refused "
+               f"({w1[:120]} | {w2[:120]})")
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
+            ED.toy_dossier_spec(d)
+            brief(d)
+            ED.toy_dossier_spec(other)
+            open(os.path.join(other, "evidence_dossier.yaml"), "a").write("# another dossier\n")
+            write_sheet(other)
+            foreign = sign_preconditions(other, open(os.path.join(other, SPEC), "rb").read())
+            w3 = brief_refusal(d, evidence=foreign)
+            w4 = brief_refusal(d, evidence={"files": {}, "record": {"required": [], "dossier": None, "sha256": None}})
+            ok("binding supplied" in w3 and "binding supplied" in w4 and status(d) != "signed",
+               f"ED14b with a signable spec, a binding made from another dossier, or an empty one, is refused, not "
+               f"recorded: {w3[:100]} | {w4[:100]}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"ED13-ED14 the brief's signer: {type(e).__name__}: {e}")
+    # owner R3 (point d): the sheet shows the base outcome adjustments the analysis will apply
+    import yaml as _y
+    with tempfile.TemporaryDirectory() as d2:
+        raw = _y.safe_load(open(schema.toy_spec(d2)))
+        plain_md = sheet(d2, spec_bytes=_y.safe_dump(raw).encode())
+        raw["analysis"]["outcome_adjustments"] = [{"id": "OA1", "component": "a", "reference": "b", "value": 0.5,
+                                                   "source": "toy trial 2020"}]
+        md = sheet(d2, spec_bytes=_y.safe_dump(raw).encode())
+        sec = md.split("## Base outcome adjustments")[-1].split("\n## ")[0] if "## Base outcome adjustments" in md else ""
+        ok("OA1" in sec and "0.5" in sec and "toy trial 2020" in sec and "every evaluation" in sec
+           and "## Base outcome adjustments" not in plain_md,
+           "SS-OA1 the sheet lists each base outcome adjustment (id, component, reference, value, source), and a spec "
+           "without the field gets no such section (existing sheets unchanged)")
+    _self_test_run_dir_forms(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_run_dir_forms(ok):
+    """SG-RD1-RD2 (v2-closure-paths): a run dir given as a relative or an absolute path names the same run. A spec
+    signed through one form has the status `signed` through the other, and the closure's run keys are relative to the
+    run dir in both."""
+    import tempfile
+    from toolkit.spec import evidence_dossier as ED
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as top:
+        got = {}
+        try:
+            os.chdir(top)
+            for label, sign_as, check_as in (("relative then absolute", "rel", "abs"),
+                                             ("absolute then relative", "abs", "rel")):
+                rel = os.path.join("runs", label.split()[0])
+                os.makedirs(os.path.join(top, rel))
+                schema.toy_spec(os.path.join(top, rel))
+                form = {"rel": rel, "abs": os.path.join(top, rel)}
+                try:
+                    write_sheet(form[sign_as])
+                    sign(form[sign_as], "lead", note="self-test")
+                    st = (status(form[sign_as]), status(form[check_as]))
+                    cl = [((ED.state(form[f]).get("binding") or {}).get("record") or {}).get("closure") or {}
+                          for f in ("rel", "abs")]
+                    import hashlib
+                    want = hashlib.sha256(open(os.path.join(top, rel, "units.csv"), "rb").read()).hexdigest()
+                    keys = (sorted(k for k in cl[0] if k.startswith("run:"))
+                            if cl[0] == cl[1] and cl[0].get("run:units.csv") == want else ["differ"])
+                except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+                    st, keys = (f"{type(e).__name__}: {e}",), []
+                got[label] = (st, keys)
+        finally:
+            os.chdir(cwd)
+    ok(all(v[0] == ("signed", "signed") for v in got.values()),
+       f"SG-RD1 a spec signed through a relative run dir is signed through the absolute one, and the reverse: "
+       f"{ {k: v[0] for k, v in got.items()} }")
+    ok(all(v[1] and v[1] != ["differ"] and not any(k.startswith("run:runs") for k in v[1]) for v in got.values()),
+       f"SG-RD2 the closure's run keys are relative to the run dir whatever form it was given in: "
+       f"{ {k: v[1][:3] for k, v in got.items()} }")
+    # SG-RD3 (lead, 20 Nov): signed in tree A through a relative path, the tree copied to another root B and checked
+    # through B's absolute path (a resume on a cloud worker) is still signed
+    import shutil
+    with tempfile.TemporaryDirectory() as top:
+        a, b = os.path.join(top, "rootA"), os.path.join(top, "elsewhere", "rootB")
+        rel = os.path.join("runs", "R")
+        os.makedirs(os.path.join(a, rel))
+        schema.toy_spec(os.path.join(a, rel))
+        try:
+            os.chdir(a)
+            write_sheet(rel)
+            sign(rel, "lead", note="self-test")
+            os.chdir(cwd)
+            shutil.copytree(a, b)
+            st3 = (status(os.path.join(a, rel)), status(os.path.join(b, rel)))
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            st3 = (f"{type(e).__name__}: {e}",)
+        finally:
+            os.chdir(cwd)
+    ok(st3 == ("signed", "signed"), f"SG-RD3 a spec signed through a relative path in one tree is signed in a copy of "
+                                    f"the tree under another root, checked through its absolute path: {st3}")
 
 
 def main(argv=None) -> int:

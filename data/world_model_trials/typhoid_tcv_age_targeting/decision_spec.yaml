@@ -1,0 +1,222 @@
+# World-model trial template (typhoid_tcv_age_targeting, batch 2): synthetic units from generate_units.py. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every district and number is synthetic. An immunisation
+  programme has US$3 million for a 2026 typhoid conjugate vaccine campaign in 20 districts. For each district choose
+  one option: none; U5 (children aged 9 months to 4 years); WIDE (children aged 9 months to 14 years). The campaign
+  reaches 80% of targeted children. Costs per resident (both targeted and not): U5 US$0.40, WIDE US$1.10. Input
+  file: units.csv (population, blood-culture-confirmed typhoid incidence per resident in children under 5, in children
+  5-14 and in adults, from synthetic surveillance). Choose the options that maximise typhoid cases averted over
+  2026-2028 within the budget, report the total with a 95% uncertainty interval, and state the decision rule.'
+decision_maker: national immunisation programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - u5
+    - wide
+    outcome: cases
+    mode: trial_priors
+    outcomes:
+      c_u5:
+        baseline_source: 'synthetic surveillance: typhoid cases in children under 5 per resident'
+      c_5_14:
+        baseline_source: 'synthetic surveillance: typhoid cases in children 5-14 per resident'
+      c_adult:
+        baseline_source: 'synthetic surveillance: typhoid cases in adults per resident'
+    baseline:
+      measured_under: no_components
+      source: no typhoid vaccination before 2026 (synthetic)
+    effects:
+      u5:
+        c_u5: &id001
+          rr: 0.35
+          range:
+          - 0.27
+          - 0.53
+          dist: triangular
+          measure: risk_ratio
+          source: 'derived: 1 - reach 0.8 x efficacy (Shakya M et al. Phase 3 efficacy analysis of a typhoid conjugate
+            vaccine trial in Nepal. N Engl J Med 2019;381:2209-18 (efficacy 81.6%, 58.8-91.8))'
+          verified: false
+          conversion:
+            method: constant_hazard
+            p0: 0.007
+            source: control-arm typhoid risk over two years below 1% (Shakya 2019)
+        c_5_14:
+          rr: 1.0
+          range:
+          - 0.99
+          - 1.01
+          dist: uniform
+          measure: rate_ratio
+          source: not targeted (no indirect protection assumed)
+          verified: false
+        c_adult:
+          rr: 1.0
+          range:
+          - 0.99
+          - 1.01
+          dist: uniform
+          measure: rate_ratio
+          source: not targeted (no indirect protection assumed)
+          verified: false
+      wide:
+        c_u5: *id001
+        c_5_14: *id001
+        c_adult:
+          rr: 1.0
+          range:
+          - 0.99
+          - 1.01
+          dist: uniform
+          measure: rate_ratio
+          source: not targeted (no indirect protection assumed)
+          verified: false
+    combination:
+      rule: multiplicative
+      source: 'alternatives: one campaign option per district'
+    compose:
+      cases:
+        c_u5:
+          value: 1.0
+          source: cases counted alike at every age
+        c_5_14:
+          value: 1.0
+          source: cases counted alike at every age
+        c_adult:
+          value: 1.0
+          source: cases counted alike at every age
+horizon:
+  start: 2026.0
+  stop: 2029.0
+decision_units:
+  csv: units.csv
+  id: id
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        c_u5: inc_u5
+        c_5_14: inc_5_14
+        c_adult: inc_adult
+  region: region
+options:
+  populations:
+    total: pop
+  components:
+    u5:
+      group: campaign
+    wide:
+      group: campaign
+  packages:
+    none: []
+    u5:
+    - u5
+    wide:
+    - wide
+  engine_map:
+    u5:
+      u5: 1
+    wide:
+      wide: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: u5_cost
+    component: u5
+    value: 0.4
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - u5_delivery
+  - id: wide_cost
+    component: wide
+    value: 1.1
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - wide_delivery
+objective:
+  outcome: cases
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2029.0
+  discounting: none
+constraints:
+  envelope_usd: 3000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- cases
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features:
+    - inc_u5
+    - inc_5_14
+    - inc_adult
+    - pop
+    independent_features:
+      features:
+      - inc_u5
+      - inc_5_14
+      - inc_adult
+      - pop
+      generator: generate_units.py
+      basis: 'synthetic units table: generate_units.py draws each of these columns independently of every other
+        column (seeded)'
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: cases_averted
+  headline:
+    name: total_cases_averted
+    outcome: cases

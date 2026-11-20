@@ -1,0 +1,182 @@
+# World-model trial template (nutrition_sqlns_vs_mnp, batch 2): synthetic units from generate_units.py; see the questions file
+# for its inputs. Test input, not signed by the owner.
+schema_version: 1
+question: 'SYNTHETIC TEST QUESTION (world-model trial): every unit and number is synthetic. A nutrition programme
+  has US$8 million for 2026-2027 preventive supplementation of children aged 6-23 months in 24 districts. For each
+  district choose one option: none; MNP (multiple micronutrient powders, US$6 per child per year); SQLNS (small-quantity
+  lipid-based nutrient supplements, US$40 per child per year). About 70% of children receive and use the product.
+  Input file: units.csv (children aged 6-23 months, wasting prevalence, stunting prevalence, household food insecurity).
+  Choose the options that maximise child-years of wasting averted over 2026-2027 within the budget, report the total
+  with a 95% uncertainty interval and state the decision rule.'
+decision_maker: programme manager (world-model trial; template, not owner-signed)
+decision_date: 2026
+engine:
+  ref: toolkit.engines.empirical.engine:PackageRateEngine
+  config:
+    components:
+    - mnp
+    - sqlns
+    outcome: wasted_child_years
+    mode: trial_priors
+    outcomes:
+      wasted_child_years:
+        baseline_source: synthetic SMART surveys of wasting prevalence (weight-for-height z below -2)
+    baseline:
+      measured_under: no_components
+      source: no component delivered in the units before the decision window (synthetic)
+    effects:
+      mnp:
+        wasted_child_years:
+          rr: 0.99
+          range:
+          - 0.95
+          - 1.03
+          dist: triangular
+          measure: rate_ratio
+          source: 'home fortification with micronutrient powders: no clear effect on wasting (De-Regil LM et al.
+            Home fortification of foods with multiple micronutrient powders for health and nutrition in children
+            under two years of age. Cochrane Database Syst Rev 2011;9:CD008959)'
+          verified: false
+      sqlns:
+        wasted_child_years:
+          rr: 0.9
+          range:
+          - 0.85
+          - 0.95
+          dist: triangular
+          measure: rate_ratio
+          source: 'derived: 1 - use 0.7 x (1 - prevalence ratio for wasting about 0.86) (Dewey KG et al. Preventive
+            small-quantity lipid-based nutrient supplements reduce severe wasting and severe stunting among young
+            children: an individual participant data meta-analysis of randomized controlled trials. Am J Clin Nutr
+            2022;116:1314-1333)'
+          verified: false
+    combination:
+      rule: multiplicative
+      source: independent action of the components that can be combined (assumed; no factorial trial)
+horizon:
+  start: 2026.0
+  stop: 2028.0
+decision_units:
+  csv: units.csv
+  id: id
+  region: region
+  populations:
+    all:
+      column: pop
+      age_groups:
+      - all
+  engine_attributes:
+    baseline_rate:
+      columns:
+        wasted_child_years: inc
+options:
+  populations:
+    total: pop
+  components:
+    mnp:
+      group: supplement
+    sqlns:
+      group: supplement
+  packages:
+    none: []
+    mnp:
+    - mnp
+    sqlns:
+    - sqlns
+  engine_map:
+    mnp:
+      mnp: 1
+    sqlns:
+      sqlns: 1
+  prices:
+    base_year: '2025'
+    index:
+      '2025': 1.0
+  cost_items:
+  - id: mnp_cost
+    component: mnp
+    value: 12.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - mnp
+  - id: sqlns_cost
+    component: sqlns
+    value: 80.0
+    price_year: '2025'
+    price_rule: as_published
+    basis: per_person
+    includes:
+    - sqlns
+objective:
+  outcome: wasted_child_years
+  sense: avert
+  horizon:
+  - 2026.0
+  - 2028.0
+  discounting: none
+constraints:
+  envelope_usd: 8000000
+comparator:
+  package: none
+  text: no package in the decision window
+outcomes_reported:
+- wasted_child_years
+calibration:
+  method: none
+  attribute: inert_design_axis
+  scale: linear
+  range:
+  - 0.0
+  - 1.0
+  window:
+  - 0.0
+  - 0.0
+  note: trial_priors mode calibrates nothing; batch.design needs a calibrated attribute, so the design's first axis
+    is an attribute the engine does not read (inert by construction)
+uncertainty:
+  draws: 16
+  seed: 3
+  sources:
+  - kind: priors
+  excluded:
+  - kind: calibration
+    reason: 'no calibration: external baselines'
+  - kind: engine_parameters
+    reason: no fitted engine parameters
+  - kind: costs
+    reason: unit costs taken as given in this trial
+  - kind: emulator
+    reason: 'world-model trial: the sweep is read directly'
+analysis:
+  evaluation: emulator
+  emulator:
+    points: 100
+    holdout_share: 0.0
+    seed: 7
+    features: &id001
+    - inc
+    - pop
+    - stunting
+    - food_insecurity
+    independent_features:
+      features: *id001
+      generator: generate_units.py
+      basis: generate_units.py draws each of these columns from its own seeded random stream, independently of every
+        other column (synthetic units table)
+  stability:
+    holdout_group: region
+  sensitivity:
+    parameters: fitted
+  decision_tests: []
+deliverable:
+  kind: package_per_unit
+  allocation_file: allocation_optimized.csv
+  columns:
+    unit: unit
+    package: package
+    value: wasted_child_years_averted
+  headline:
+    name: total_wasted_child_years_averted
+    outcome: wasted_child_years

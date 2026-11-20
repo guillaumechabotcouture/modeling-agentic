@@ -1,0 +1,25 @@
+# Decision inputs of the package-rate engine (toolkit/engines/decision_inputs.py; F6 evidence dossier). Its components
+# are named by the spec's configuration, so one declaration covers every component ("*"). Not in code (the code
+# fingerprint covers *.py).
+# By mode (engine.config.mode), resolved against the configured card (if_on_card):
+# - trial_priors (#217): every effect is an external trial prior, combined by a declared rule on external baselines,
+#   so the trial effects of the component (lrr:<component>:<outcome>), the interaction terms (lint:*), the outcome
+#   weights (w:*:*) and the baselines are decision inputs;
+# - calibrated: none of those exist on the card; every effect (one log rate ratio per combination) is calibrated per
+#   run to the run's own unit panel, whose frame is declared with the calibration targets (none_reason).
+decision_inputs:
+  "*":
+    inactive: [0]
+    inputs:
+      - {kind: parameter, name: "lrr:*:*", if_on_card: true, why: "trial_priors: every component's trial effect (log
+          rate ratio) on each outcome: a component's benefit reads its own, those it is relative_to, its interaction
+          partners', and every component's through the baseline coverage term M(baseline_coverage)"}
+      - {kind: parameter, name: "lint:*", if_on_card: true, why: "trial_priors: the interaction terms between
+          components"}
+      - {kind: parameter, name: "w:*:*", if_on_card: true, why: "trial_priors: the weights that combine outcomes"}
+      - {kind: unit_attribute, name: baseline_rate, if_on_card: true, why: "trial_priors: the external baseline rate the
+          effects apply to"}
+      - {kind: unit_attribute, name: baseline_coverage, if_on_card: true, why: "trial_priors: the baseline coverage the
+          effects are relative to"}
+    none_reason: "calibrated mode: each component's effect is calibrated per run to the run's own unit panel; the
+      panel's frame is declared with the calibration targets"

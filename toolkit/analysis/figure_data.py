@@ -142,7 +142,7 @@ def replay(A, plan, uq: dict) -> dict:
     for _ in range(nd):
         D.last_clamped = []
         theta, zs, noise, mult, _s = D.draw()
-        out, _ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult)
+        out, _ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=_s)
         tot.append(sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][plan[i]][A.primary] for i in A.ids))
         per.append(_package_sums(A, plan, out, cost))
     lvl = float((uq.get("interval") or {}).get("level", 0.95))
@@ -413,6 +413,8 @@ def rebuild(run_dir: str, log=print):
             f"(e.g. {by_ulp[0]})")
     model = EmulatorModel(spec, design, res, log=log).fit()
     A = Analysis(spec, model, log=log)
+    from toolkit.analysis import burden as BV
+    BV.restore_anchor(A, run_dir)        # F6 S2-5d review r1 P2-9: the run's anchor, as its evaluations had it
     A.fit_calibration()
     cal0 = A.calibrate(A.theta0)
     z0 = {i: v[0] for i, v in cal0.items()}

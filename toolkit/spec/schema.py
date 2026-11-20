@@ -104,9 +104,23 @@ docs/design/v2-spec-and-analysis.md §1):
       sensitivity: {parameters: fitted | [names], cost_items: {id: [lo, hi]}}
       share_threshold: 0.10                # decision tests: share of units changing package
       decision_tests: [{id, type, text, finding, ...}]     # type cost_items: multipliers {cost_item_id: m}, one
-                                           # price case in which the listed unit costs change together
+                                           # price case in which the listed unit costs change together;
+                                           # type unit_attribute: unit_attribute {column, units: [ids] | all,
+                                           # values | scale | set_from} (a units-table column, F6);
+                                           # type calibration_target: calibration_target {units: [ids], scale}
+                                           # (the listed units' calibration targets scaled, F6 run 1);
+                                           # type outcome_ratio: outcome_ratio {component, reference, values}
+                                           # (a package's burden at a ratio of its counterpart's, F6 run 2);
+                                           # type burden_scale: burden_scale {references: [validation.burden row
+                                           # ids], shares: [s in (0, 1]]} (each row's group's burden scaled by
+                                           # (reference / model)^s, F6 run 3)
     validation:                            # optional (F6 S2-5): external estimates the analysis compares with
       burden: {csv, group, arm, daly_parts, window, window_metrics}   # toolkit/analysis/burden.py (the contract)
+    evidence:                              # F6: required when the options use a component whose engine card declares
+      dossier: evidence_dossier.yaml       # decision inputs: signing refuses until each has a checked, sourced entry
+                                           # (toolkit/spec/evidence_dossier.py); the signature binds the file's sha256
+    principle_departures:                  # optional: a decision design principle the spec departs from, by the
+      - {principle: 2, check: headline_comparator, reason: "..."}   # pre-sign check that finds it (spec_critique.py)
     deliverable:
       kind: package_per_unit
       allocation_file: allocation_optimized.csv
@@ -165,8 +179,12 @@ UNCERTAINTY_KINDS = {
 OPTIONAL_KINDS = {"priors": "engine parameters with published ranges (engine-card priors.yaml or uncertainty.priors), "
                             "drawn from their declared priors"}
 UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "calibration", "costs": "unit costs",
-                     "emulator": "emulator error"}
-DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items")
+                     "emulator": "emulator error", "burden_anchor": "external burden estimates"}
+# F6 S2-5d: declared or excluded only when validation.burden has anchor rows with an interval (burden.py checks it)
+CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
+                                      "each published interval"}
+DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
+                       "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale", "boundary_engine")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
@@ -434,8 +452,10 @@ class Spec:
                     if _isnum(m):
                         lo[it_id] = min(lo.get(it_id, 1.0), float(m))
         comp_cost = {}
-        for u in self.units():
-            uid = str(u[self.uid])
+        from toolkit.analysis import decision_tests as DT     # #228 r1 P2-3: and over every unit_attribute arm's table
+        tables = [self.units()] + DT.arm_tables(self)
+        for n_, u in ((n_, u) for n_, rows in enumerate(tables) for u in rows):
+            uid = f"{n_}:{u[self.uid]}"
             comp_cost[uid] = {}
             for it in items:
                 comp_cost[uid][it["component"]] = (comp_cost[uid].get(it["component"], 0.0)
@@ -561,12 +581,19 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
         spec.derived = derived
     try:
         pres = presentation_refusal(spec.raw)         # every path, sign-off with engine: auto pending included
+        from toolkit.engines import benchmark_coverage as BC      # owner decision 2026-11-12: signed departures
+        pres = pres + BC.departure_problems(spec.raw)
         if spec.engine_pending:
             if not pending_ok:
                 return [f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet (engine-dependent sections "
                         "cannot be checked)"] + pres
-            return pres + _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else [])
-        return pres + _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else [])
+            from toolkit.spec import preconditions as PC       # every candidate the engine choice could pick
+            return pres + _validate_pending(spec) + (_derived_checks(spec, None) if obligations(spec) else []) \
+                + PC.problems(spec.base, None, None, spec=spec)
+        # the signed spec's preconditions at the execution boundary (the analysis validates here; #215, #218)
+        from toolkit.spec import preconditions as PC
+        return pres + _validate(spec) + (_derived_checks(spec, spec.engine()) if obligations(spec) else []) \
+            + PC.problems(spec.base, None, None, spec=spec)
     except Exception as e:  # noqa: BLE001 -- a malformed section must be a finding, not a crash
         return [f"spec could not be checked: {type(e).__name__}: {e}"]
 
@@ -860,6 +887,9 @@ def _validate_pending(s: Spec) -> list[str]:
             bad.append(f"decision test {dt.get('id')}: type {dt.get('type')!r} not in {DECISION_TEST_TYPES}")
         if any(ch.isdigit() for ch in str(dt.get("text") or "")):
             bad.append(f"decision test {dt.get('id')}: text must be descriptive, with no numbers")
+        if "with" in dt and dt.get("type") != "parameter_value":       # as after the engine choice (Codex r2)
+            bad.append(f"decision test {dt.get('id')}: with (companion parameters) is only for a parameter_value "
+                       "test")
     bad += _validate_deliverable(s)
     return bad
 
@@ -1107,6 +1137,9 @@ def parameter_domain(raw: dict, defaults: dict, drawn: dict) -> dict:
     for dt in ((raw or {}).get("analysis") or {}).get("decision_tests") or []:
         if isinstance(dt, dict) and dt.get("type") == "parameter_value" and dt.get("parameter") in dom:
             dom[dt["parameter"]].append((f"decision test {dt.get('id')}", list(dt.get("values") or [])))
+        for n, v in PV.companions(dt).items():        # a companion value (`with`) is a value the run evaluates
+            if n in dom:
+                dom[n].append((f"decision test {dt.get('id')} (with)", [v]))
     return dom
 
 
@@ -1263,8 +1296,14 @@ def _validate_uncertainty(s, pnames) -> list[str]:
     inc = [x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)]
     exc = {x.get("kind"): x.get("reason") for x in u.get("excluded") or [] if isinstance(x, dict) and "parameter" not in x}
     for k in inc + list(exc):
-        if k not in UNCERTAINTY_KINDS and k not in OPTIONAL_KINDS:
-            bad.append(f"uncertainty: unknown source kind {k!r} (known: {', '.join(list(UNCERTAINTY_KINDS) + list(OPTIONAL_KINDS))})")
+        if k not in UNCERTAINTY_KINDS and k not in OPTIONAL_KINDS and k not in CONDITIONAL_KINDS:
+            bad.append(f"uncertainty: unknown source kind {k!r} (known: "
+                       f"{', '.join(list(UNCERTAINTY_KINDS) + list(OPTIONAL_KINDS) + list(CONDITIONAL_KINDS))})")
+    if "burden_anchor" in inc and "burden_anchor" in exc:       # F6 S2-5d review r3
+        bad.append("uncertainty: burden_anchor is both a source and excluded")
+    if "burden_anchor" in inc and not ((s.raw.get("validation") or {}).get("burden") if isinstance(
+            s.raw.get("validation"), dict) else None):
+        bad.append("uncertainty: source burden_anchor needs validation.burden anchor rows")
     for x in u.get("excluded") or []:
         if isinstance(x, dict) and "parameter" in x and "kind" in x:
             bad.append("uncertainty.excluded: an entry names a kind or a parameter, not both")
@@ -1317,9 +1356,16 @@ def _validate_uncertainty(s, pnames) -> list[str]:
     return bad
 
 
+# Owner R3 (external review point a): the analysis keys the code reads; any other is refused, so a misspelt or
+# unsupported signed field cannot silently do nothing
+ANALYSIS_KEYS = {"evaluation", "emulator", "direct", "cost_outputs", "diagnostics", "stability", "sensitivity",
+                 "share_threshold", "regret_threshold", "dollars_threshold", "decision_tests", "plan_variants",
+                 "value_of_information", "workers", "outcome_adjustments"}
+
+
 def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
     an = s.raw["analysis"]
-    bad = []
+    bad = [f"analysis: unknown key {k} (known: {', '.join(sorted(ANALYSIS_KEYS))})" for k in sorted(set(an) - ANALYSIS_KEYS)]
     if an.get("evaluation") not in EVALUATIONS:
         return [f"analysis.evaluation: one of {EVALUATIONS}"]
     if an["evaluation"] == "emulator":
@@ -1330,6 +1376,8 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         bad += FT.problems(s, cols)
     from toolkit.analysis import variants as _V      # F6 S1-6: operational plan variants
     bad += _V.validate(s.raw, cols, s.units(), pk, s.uid)
+    from toolkit.analysis import value_of_information as _VOI      # F6: analysis.value_of_information
+    bad += _VOI.validate(s.raw)
     for name, d in (an.get("diagnostics") or {}).items():
         if (d or {}).get("metric") not in card.outputs.get("windows", []):
             bad.append(f"analysis.diagnostics.{name}: {d!r} is not an engine window metric")
@@ -1343,6 +1391,12 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
     if sp not in (None, "fitted") and not (isinstance(sp, list) and all(p in pnames for p in sp)):
         bad.append("analysis.sensitivity.parameters: `fitted` or a list of engine parameter names")
     comps = set(s.raw["options"]["components"])
+    from toolkit.analysis import outcome_adjust as _OA     # F6 run 4 R3: base outcome adjustments (trial ratios)
+    try:
+        _pk = s.packages()
+    except Exception:  # noqa: BLE001 -- package problems are reported elsewhere
+        _pk = {}
+    bad += _OA.problems(s.raw, _pk, comps, (s.raw.get("comparator") or {}).get("package"))
     seen = set()
     for k in ("share_threshold", "regret_threshold", "dollars_threshold"):     # F6 S1-5: toolkit/analysis/moves.py
         thr = an.get(k, 0.10)
@@ -1354,10 +1408,10 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         i = dt.get("id")
         if not i or i in seen:
             bad.append(f"analysis.decision_tests: id {i!r} missing or duplicated")
-        if str(i or "").startswith(("prior_range_", "fitted_range_", "scenario_excluded_")) or dt.get("type") in (
-                "prior_range", "fitted_range", "scenario_excluded"):
-            bad.append(f"decision test {i}: prior_range, fitted_range and scenario_excluded tests are generated by the "
-                       "harness (toolkit/analysis/decision_tests.py); the spec cannot declare one")
+        if str(i or "").startswith(("prior_range_", "fitted_range_", "scenario_excluded_", "anchor_range_")) or \
+                dt.get("type") in ("prior_range", "fitted_range", "scenario_excluded", "anchor_range"):
+            bad.append(f"decision test {i}: prior_range, fitted_range, scenario_excluded and anchor_range tests are "
+                       "generated by the harness (toolkit/analysis/decision_tests.py); the spec cannot declare one")
             continue
         seen.add(i)
         t = dt.get("type")
@@ -1372,6 +1426,8 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         if "engine_arm_or" in dt:
             bad.append(f"decision test {i}: engine_arm_or cannot be supplied; arm ratios come from the engine's "
                        "verified benchmark results (Codex P1-13)")
+        if "with" in dt and t != "parameter_value":      # never ignored on a test that would not apply it
+            bad.append(f"decision test {i}: with (companion parameters) is only for a parameter_value test")
         if t == "interaction_rescale":
             if not dt.get("benchmark"):
                 bad.append(f"decision test {i}: benchmark (the engine benchmark whose arms set the interaction)")
@@ -1385,12 +1441,83 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                 bad.append(f"decision test {i}: {dt.get('parameter')!r} is not an engine parameter")
             if not dt.get("values"):
                 bad.append(f"decision test {i}: values")
+            if "with" in dt:        # companion engine parameters held in every case of the test (owner, 20 Nov)
+                w = dt["with"]
+                if not isinstance(w, dict) or not w:
+                    bad.append(f"decision test {i}: with must be a mapping {{engine parameter: value}}")
+                else:
+                    bad += [f"decision test {i}: with: {k!r} is not an engine parameter" for k in w if k not in pnames]
+                    bad += [f"decision test {i}: with: {k} must be a finite number" for k, v in w.items()
+                            if not _isnum(v) or not math.isfinite(v)]
+                    if dt.get("parameter") in w:
+                        bad.append(f"decision test {i}: with cannot hold the test's own parameter "
+                                   f"{dt.get('parameter')}")
         elif t == "group_rule":
             if dt.get("rule") not in rules and not dt.get("add"):
                 bad.append(f"decision test {i}: rule {dt.get('rule')!r} is not a constraints.group_rules id (or give add:)")
         elif t == "envelope":
             if not dt.get("values") or not all(_isnum(v) for v in dt["values"]):
                 bad.append(f"decision test {i}: values (envelopes in USD)")
+        elif t == "unit_attribute":      # the runner's own planner (column, units, domain, identity), at sign-off
+            from toolkit.analysis import decision_tests as DT
+            emu = an.get("evaluation") == "emulator"      # #228 r1 P2-5: the design box the pre-run plan reads
+            pl = DT.plan_unit_attribute(s, dt, card, an.get("evaluation"), DT.design_features_box(s) if emu else None)
+            if pl["status"] != "runs":
+                bad.append(f"decision test {i}: {pl['why']}")
+        elif t == "calibration_target":      # F6 run 1, owner decision R1 (toolkit/analysis/decision_tests.py)
+            bad += _calibration_target_problems(s, dt, i)
+        elif t == "outcome_ratio":           # F6 run 2, owner decision DT13 (toolkit/analysis/decision_tests.py)
+            orc = dt.get("outcome_ratio")
+            if not isinstance(orc, dict) or set(orc) != {"component", "reference", "values"}:
+                bad.append(f"decision test {i}: give outcome_ratio {{component, reference, values}}")
+                continue
+            for k in ("component", "reference"):
+                if orc[k] not in comps:
+                    bad.append(f"decision test {i}: outcome_ratio.{k}: unknown component {orc[k]!r}")
+            if orc["component"] == orc["reference"]:
+                bad.append(f"decision test {i}: outcome_ratio component and reference must differ")
+            vs = orc["values"]
+            from toolkit.analysis import outcome_adjust as OAm      # F6 run 4 R3: "engine" removes a base adjustment
+            based = {str(a.get("component")) for a in OAm.config(s.raw) or [] if isinstance(a, dict)}
+            bad += [f"decision test {i}: {e}" for e in OAm.dt_problems(orc, OAm.config(s.raw))]   # #251 review
+            if isinstance(vs, list) and "engine" in vs and orc.get("component") not in based:
+                bad.append(f"decision test {i}: outcome_ratio value \"engine\" needs a base outcome adjustment of "
+                           f"{orc.get('component')} (analysis.outcome_adjustments)")
+            nums = [v for v in vs if v != "engine"] if isinstance(vs, list) else None
+            if not (isinstance(vs, list) and vs and all(_isnum(v) and 0 < v < float("inf") for v in nums)):
+                bad.append(f"decision test {i}: outcome_ratio.values: positive ratios (the package's burden over its "
+                           "counterpart's), or \"engine\"")
+            elif "engine" not in vs and orc.get("component") not in based and all(abs(float(v) - 1.0) <= 1e-12
+                                                                                    for v in vs):
+                bad.append(f"decision test {i}: outcome_ratio values of 1 only change nothing (an identity)")
+            elif orc["component"] in comps and orc["reference"] in comps:
+                cpk = s.packages().get(s.raw["comparator"].get("package"), set())
+                if orc["component"] in set(cpk):       # #248 P2-1 (Codex review of #245): benefits are measured from it
+                    bad.append(f"decision test {i}: the comparator holds {orc['component']}: the test would change "
+                               "the baseline every benefit is measured from")
+                pk = s.packages()
+                if not any(orc["component"] in set(cs) and orc["reference"] not in set(cs)
+                           and any(set(c2) == (set(cs) - {orc["component"]}) | {orc["reference"]}
+                                   for c2 in pk.values()) for cs in pk.values()):
+                    bad.append(f"decision test {i}: no package with {orc['component']} has a counterpart with "
+                               f"{orc['reference']} in its place")
+        elif t == "boundary_engine":         # F6 run 4 R3 (RIG-002): the boundary check's engine tables, re-solved
+            extra_k = sorted(set(dt) - {"id", "type", "text", "finding"})
+            if extra_k:
+                bad.append(f"decision test {i}: boundary_engine takes no parameters (got {extra_k})")
+            if an.get("evaluation") != "emulator":
+                bad.append(f"decision test {i}: boundary_engine needs the emulator path (analysis.evaluation emulator)")
+        elif t == "burden_scale":            # F6 run 3, owner decision D-c (toolkit/analysis/decision_tests.py)
+            bsc = dt.get("burden_scale")
+            if not isinstance(bsc, dict) or set(bsc) != {"references", "shares"}:
+                bad.append(f"decision test {i}: give burden_scale {{references, shares}}")
+                continue
+            sh = bsc["shares"]
+            if not (isinstance(sh, list) and sh and all(_isnum(v) and 0 < v <= 1 for v in sh)):
+                bad.append(f"decision test {i}: burden_scale.shares: numbers in (0, 1] (1 sets each group's burden to "
+                           "its reference)")
+            from toolkit.analysis import decision_tests as DTm
+            bad += [f"decision test {i}: {e}" for e in DTm.burden_scale_refs(s, bsc)[1]]
         elif t == "cost_items":
             m = dt.get("multipliers")
             if not isinstance(m, dict) or not m:
@@ -1402,6 +1529,46 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                     bad.append(f"decision test {i}: unknown cost item {it_id}")
                 elif not (_isnum(v) and 0 < v < float("inf")):
                     bad.append(f"decision test {i}: multipliers.{it_id}: a positive multiplier")
+    return bad
+
+
+def _calibration_target_problems(s, dt, i) -> list[str]:
+    """calibration_target {units: [ids], scale}: the listed units' calibration targets (calibration.target_column)
+    multiplied by scale, their calibrated values redone, the plan re-solved. Fail closed: an emulator-inversion
+    calibration, a non-empty list of known unit ids without repeats, and a positive scale other than 1 that keeps every
+    listed target inside (0, 1)."""
+    bad, ct = [], dt.get("calibration_target")
+    if not isinstance(ct, dict):
+        return [f"decision test {i}: give calibration_target {{units: [ids], scale}}"]
+    cal = s.raw.get("calibration") or {}
+    if cal.get("method") != "emulator_inversion":
+        bad.append(f"decision test {i}: a calibration_target test needs calibration.method emulator_inversion")
+    us, sc = ct.get("units"), ct.get("scale")
+    if set(ct) != {"units", "scale"}:
+        bad.append(f"decision test {i}: calibration_target holds exactly units and scale")
+    if not (isinstance(us, list) and us and len({str(u) for u in us}) == len(us)):
+        return bad + [f"decision test {i}: calibration_target.units: a non-empty list of unit ids, each once"]
+    try:
+        rows = {str(r[s.uid]): r for r in s.units()}
+    except Exception as e:  # noqa: BLE001 — the units table is validated elsewhere; this test cannot be checked
+        return bad + [f"decision test {i}: the units table cannot be read ({e})"]
+    unknown = [str(u) for u in us if str(u) not in rows]
+    if unknown:
+        bad.append(f"decision test {i}: calibration_target.units not in the units table: {unknown[:5]}")
+    if not (_isnum(sc) and sc > 0):
+        return bad + [f"decision test {i}: calibration_target.scale: a positive number"]
+    if abs(float(sc) - 1.0) <= 1e-12:
+        return bad + [f"decision test {i}: a scale of 1 changes no target (an identity)"]
+    tc = cal.get("target_column")
+    for u in us:
+        r = rows.get(str(u))
+        try:
+            v = float(r[tc]) * float(sc) if r is not None else None
+        except (TypeError, ValueError, KeyError):
+            bad.append(f"decision test {i}: unit {u}'s calibration target {tc!r} is not a number")
+            continue
+        if v is not None and not 0.0 < v < 1.0:
+            bad.append(f"decision test {i}: unit {u}'s scaled target {v:g} is not inside (0, 1)")
     return bad
 
 
@@ -1558,6 +1725,141 @@ def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)
     return p
 
 
+def direct_toy(r: dict) -> dict:
+    """The toy spec on direct evaluation with no calibration and the engine attribute x bound to column cov (a unit
+    attribute the units table sets; the unit-attribute decision-test self-tests)."""
+    r["decision_units"]["engine_attributes"] = {"x": {"column": "cov"}}
+    r["calibration"] = {"method": "none"}
+    r["analysis"]["evaluation"] = "direct"
+    r["analysis"].pop("emulator", None)
+    r["analysis"]["decision_tests"] = []
+    r["uncertainty"]["sources"] = [{"kind": "engine_parameters"}]
+    r["uncertainty"]["excluded"] = [{"kind": k, "reason": "toy"} for k in ("costs", "calibration", "emulator")] + [
+        {"parameter": "synergy", "reason": "toy: no interaction assumed"}]
+    return r
+
+
+def _self_test_outcome_adjustments(ok, s, d, bad):
+    """F6 run 4, owner decision R3: base outcome adjustments (analysis.outcome_adjustments): a package's outcomes set to
+    a trial ratio of its counterpart's in every evaluation, checked at sign-off; an outcome_ratio test may take the
+    value "engine" (the base adjustment removed) only for an adjusted component."""
+    good = {"id": "OA1", "component": "a", "reference": "b", "value": 0.5, "source": "toy trial"}
+
+    def oa(*items):
+        return lambda r: r["analysis"].update(outcome_adjustments=[dict(x) for x in items])
+    bad(lambda r: r["analysis"].update(outcome_adjustments={"a": 1}), "outcome_adjustments",
+        "SP-OA1 outcome_adjustments must be a list of adjustments")
+    bad(oa(dict(good, component="zz")), "unknown component", "SP-OA2 an unknown component is refused")
+    bad(oa(dict(good, reference="a")), "differ", "SP-OA3 a component adjusted against itself is refused")
+    bad(oa(dict(good, value=0.0)), "positive", "SP-OA4 a ratio that is not positive is refused")
+    bad(oa(good, dict(good, id="OA2", component="b", reference="a")), "itself adjusted",
+        "SP-OA5 a reference that is itself adjusted is refused (no chains)")
+    bad(oa(good, dict(good, id="OA2")), "more than once", "SP-OA6 a component adjusted twice is refused")
+    bad(oa(dict(good, source="")), "source", "SP-OA7 an adjustment without its source is refused")
+    bad(lambda r: (r["comparator"].update(package="a"), oa(good)(r)), "comparator",
+        "SP-OA8 an adjustment of a component the comparator holds is refused (every benefit is measured from it)")
+    r_g = copy.deepcopy(s.raw)
+    oa(good)(r_g)
+    ok(validate(Spec(r_g, d)) == [], f"SP-OA9 a well-formed outcome adjustment validates: {validate(Spec(r_g, d))[:3]}")
+    dor = {"id": "DTe", "type": "outcome_ratio", "text": "t",
+           "outcome_ratio": {"component": "a", "reference": "b", "values": ["engine", 0.4]}}
+    bad(lambda r: r["analysis"]["decision_tests"].append(copy.deepcopy(dor)), "engine",
+        "SP-OA10 an outcome_ratio value \"engine\" without a base adjustment of its component is refused")
+    r_x = copy.deepcopy(r_g)      # Codex review of #251 P1-4: a test on a base adjustment's reference is refused
+    r_x["analysis"]["decision_tests"].append({"id": "DTr", "type": "outcome_ratio", "text": "t",
+                                              "outcome_ratio": {"component": "b", "reference": "a", "values": [0.5]}})
+    ok(any("base adjustment" in e for e in validate(Spec(r_x, d))),
+       f"SP-OA12 (P1-4) an outcome_ratio test involving a base adjustment's reference is refused: "
+       f"{[e for e in validate(Spec(r_x, d)) if 'DTr' in e][:2]}")
+    r_1 = copy.deepcopy(r_g)      # P2-9: with a base adjustment, a ratio of 1 is a real case
+    r_1["analysis"]["decision_tests"].append({"id": "DT1r", "type": "outcome_ratio", "text": "t",
+                                              "outcome_ratio": {"component": "a", "reference": "b", "values": [1.0]}})
+    ok(validate(Spec(r_1, d)) == [], f"SP-OA13 (P2-9) a ratio of 1 on an adjusted component validates: "
+                                     f"{validate(Spec(r_1, d))[:2]}")
+    r_e = copy.deepcopy(r_g)
+    r_e["analysis"]["decision_tests"].append(copy.deepcopy(dor))
+    ok(validate(Spec(r_e, d)) == [], f"SP-OA11 \"engine\" with a base adjustment validates: {validate(Spec(r_e, d))[:3]}")
+
+
+def _self_test_burden_scale(ok, s, d, bad):
+    """F6 run 3, owner decision D-c: a burden_scale decision test scales every package's outcomes in the units of the
+    listed external references' groups by reference / model (validation.burden), checked at sign-off."""
+    from toolkit.analysis import burden as BV
+    open(os.path.join(d, "bs_refs.csv"), "w").write("\n".join([",".join(BV.COLUMNS),
+        "A,r0,,cases,count,,1,1e6,0,1e15,estimated,synthetic A,overlap,,,REF-A,",
+        "B,r1,,dalys,count,,1,1e12,1e11,1e13,estimated,synthetic B,ratio,,,REF-B,",
+        "C,r2,,cases,count,,1,1,0.5,2,reported,synthetic C,ratio,,,REF-C,",
+        "E,*,,cases,count,,2,1e6,0,1e15,estimated,synthetic E,overlap,,,REF-E,",
+        "F,r2,all,cases,rate,1000,1,1e3,0,1e9,estimated,synthetic F,overlap,,,REF-F,"]) + "\n")
+
+    def bs(burden=True, **kw):
+        def mut(r):
+            if burden:
+                r["validation"] = {"burden": {"csv": "bs_refs.csv"}}
+                r["calibration"]["target_source_id"] = "TOY-TARGETS"
+            r["analysis"]["decision_tests"].append(dict({"id": "DTb", "type": "burden_scale", "text": "t"}, **kw))
+        return mut
+    good = {"references": ["A", "B"], "shares": [0.5, 1.0]}
+    bad(bs(), "give burden_scale", "SP-BS1 a burden_scale test without its mapping is refused")
+    bad(bs(burden=False, burden_scale=good), "validation.burden",
+        "SP-BS2 a burden_scale test without validation.burden references is refused")
+    bad(bs(burden_scale=dict(good, references=["A", "zz"])), "unknown reference",
+        "SP-BS3 a burden_scale test naming a reference the file does not hold is refused")
+    bad(bs(burden_scale=dict(good, references=["C"])), "estimated",
+        "SP-BS4 a reported (not estimated) reference cannot set a scale")
+    bad(bs(burden_scale=dict(good, shares=[0.0])), "shares", "SP-BS5 a share outside (0, 1] is refused")
+    bad(bs(burden_scale=dict(good, references=["A", "E"])), "more than one",
+        "SP-BS6 references whose groups share a unit are refused (a unit takes one factor)")
+    bad(bs(burden_scale=dict(good, references=["F"])), "model window",
+        "SP-BS8 (Codex review of #246 P2-3) an age-banded row with no model window is refused: its value needs a new "
+        "prediction, and the test reads the point outputs only")
+    r_b = copy.deepcopy(s.raw)
+    bs(burden_scale=good)(r_b)
+    ok(validate(Spec(r_b, d)) == [], f"SP-BS7 a well-formed burden_scale test validates: {validate(Spec(r_b, d))[:3]}")
+
+
+def _self_test_unit_attribute(ok, s, d, bad):
+    """F6: a unit_attribute decision test is checked at sign-off by the runner's own planner (decision_tests.py
+    plan_unit_attribute): column, units, values within the column's declared domain, and not an identity."""
+    def ua(**kw):
+        return lambda r: (direct_toy(r), r["analysis"]["decision_tests"].append(
+            dict({"id": "DTu", "type": "unit_attribute", "text": "t"}, **kw)))
+    bad(ua(), "give unit_attribute", "SP-UA1 a unit_attribute test without its unit_attribute mapping is refused")
+    bad(ua(unit_attribute={"column": "nocol", "values": [0.5]}), "not a column of the units table",
+        "SP-UA2 a unit_attribute test on an unknown column is refused")
+    bad(ua(unit_attribute={"column": "cov", "units": ["0", "zz"], "values": [0.5]}), "'zz'",
+        "SP-UA3 a unit_attribute test naming a unit id not in the table is refused")
+    bad(ua(unit_attribute={"column": "cov", "values": [9.0]}), "declared domain",
+        "SP-UA4 a unit_attribute value outside the column's declared domain (the engine card's valid range) is refused")
+    bad(ua(unit_attribute={"column": "cov", "scale": [1.0]}), "identity",
+        "SP-UA5 a unit_attribute test that leaves every unit unchanged is refused")
+    bad(ua(unit_attribute={"column": "pop", "values": [5.0]}), "feeds no engine unit attribute",
+        "SP-UA6 a unit_attribute test on a column bound to no engine attribute is refused")
+    bad(ua(unit_attribute={"column": "cov", "values": [0.5], "scale": [2.0]}), "exactly one of",
+        "SP-UA7 a unit_attribute test with two value modes is refused")
+    bad(ua(unit_attribute={"column": "cov", "set_from": "../elsewhere.csv"}), "inside the run directory",
+        "SP-UA8 a set_from table outside the run directory is refused")
+    r = copy.deepcopy(s.raw)
+    r["decision_units"]["engine_attributes"] = {"x": {"column": "cov"}}
+    r["analysis"]["decision_tests"].append({"id": "DTu", "type": "unit_attribute", "text": "t",
+                                            "unit_attribute": {"column": "cov", "values": [0.5]}})
+    e9 = validate(Spec(r, d))
+    ok(any("calibration sets" in e for e in e9),
+       f"SP-UA9 a column bound to the calibrated attribute is refused (the calibration overrides it): {e9[:2]}")
+    r = copy.deepcopy(s.raw)
+    ua(unit_attribute={"column": "cov", "units": ["0", "1"], "values": [0.5, -0.5]})(r)
+    ok(validate(Spec(r, d)) == [], f"SP-UA10 a well-formed unit_attribute test validates: {validate(Spec(r, d))[:3]}")
+    r = direct_toy(copy.deepcopy(s.raw))         # #228 r1 P2-5: sign-off reads the emulator design box too
+    r["analysis"].update(evaluation="emulator", emulator=copy.deepcopy(s.raw["analysis"]["emulator"]))
+    r["analysis"]["emulator"]["features"] = ["cov"]
+    r["analysis"]["decision_tests"] = [{"id": "DTu", "type": "unit_attribute", "text": "t",
+                                        "unit_attribute": {"column": "cov", "values": [1.9]}}]
+    e11 = validate(Spec(r, d))
+    ok(any("design box" in e for e in e11),
+       f"SP-UA11 at sign-off a value inside the declared domain but outside the emulator's design box is refused: "
+       f"{e11[:2]}")
+
+
 def _self_test() -> int:
     import tempfile
     fails = []
@@ -1694,6 +1996,13 @@ def _self_test() -> int:
         bad(lambda r: r["analysis"]["decision_tests"].append({"id": "prior_range_eff_a", "type": "parameter_value",
                                                                "parameter": "eff_a", "values": [0.3], "text": "t"}),
             "generated by the harness", "SP11b the spec cannot declare (or shadow) an automatic prior_range test")
+        bad(lambda r: r["analysis"]["decision_tests"].append({"id": "anchor_range_N0", "type": "envelope",
+                                                               "values": [9000.0], "text": "t"}),
+            "generated by the harness", "SP11c (F6 S2-5d review r3) the spec cannot shadow an automatic anchor_range test")
+        bad(lambda r: (r["uncertainty"]["sources"].append({"kind": "burden_anchor"}),
+                       r["uncertainty"]["excluded"].append({"kind": "burden_anchor", "reason": "x"})),
+            "burden_anchor is both a source and excluded", "SP9b (F6 S2-5d review r3) burden_anchor cannot be both drawn "
+            "and excluded")
         # F6 cost amendment: a price scenario (several cost items multiplied together) as a decision test
         dtc = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
             dict({"id": "DTc", "type": "cost_items", "text": "t"}, **kw)))
@@ -1705,6 +2014,58 @@ def _self_test() -> int:
         dtc(multipliers={"ca": 0.8, "cb": 1.3})(r_c)
         ok(validate(Spec(r_c, d)) == [], f"SP11j a cost_items decision test on declared cost items validates: "
                                          f"{validate(Spec(r_c, d))[:3]}")
+        _self_test_unit_attribute(ok, s, d, bad)
+        # F6 run 1, owner decision R1: a calibration-target test (the listed units' targets scaled, the calibration redone)
+        dct = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTt", "type": "calibration_target", "text": "t"}, **kw)))
+        bad(dct(), "give calibration_target", "SP-CT1 a calibration_target test without its mapping is refused")
+        bad(dct(calibration_target={"units": ["0", "zz"], "scale": 0.8}), "'zz'",
+            "SP-CT2 a calibration_target test naming an unknown unit is refused")
+        bad(dct(calibration_target={"units": ["5"], "scale": 1.5}), "inside (0, 1)",
+            "SP-CT3 a scale that takes a target outside (0, 1) is refused")
+        bad(dct(calibration_target={"units": ["0"], "scale": 1.0}), "changes no target",
+            "SP-CT4 a scale of 1 (an identity) is refused")
+        bad(dct(calibration_target={"units": [], "scale": 0.8}), "a non-empty list",
+            "SP-CT5 an empty unit list is refused")
+        bad(lambda r: (r["calibration"].update(method="none"),
+                       dct(calibration_target={"units": ["0"], "scale": 0.8})(r)), "emulator_inversion",
+            "SP-CT6 a calibration_target test without an emulator-inversion calibration is refused")
+        # F6 run 2, owner decision (DT13): a package's burden set to a ratio of its counterpart's (one component swapped)
+        dor = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTo", "type": "outcome_ratio", "text": "t"}, **kw)))
+        bad(dor(), "give outcome_ratio", "SP-OR1 an outcome_ratio test without its mapping is refused")
+        bad(dor(outcome_ratio={"component": "zz", "reference": "b", "values": [0.8]}), "unknown component",
+            "SP-OR2 an unknown component is refused")
+        bad(dor(outcome_ratio={"component": "a", "reference": "a", "values": [0.8]}), "differ",
+            "SP-OR3 a component tested against itself is refused")
+        bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.0]}), "positive",
+            "SP-OR4 a ratio that is not positive is refused")
+        bad(dor(outcome_ratio={"component": "a", "reference": "b", "values": [1.0]}), "identity",
+            "SP-OR5 a ratio of 1 only (an identity) is refused")      # #251: allowed only for an adjusted component
+        bad(lambda r: (r["comparator"].update(package="a"),
+                       dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.5]})(r)), "comparator",
+            "SP-OR7 (Codex review of #245 P2-1) a test that changes the comparator's own burden is refused")
+        r_o = copy.deepcopy(s.raw)
+        dor(outcome_ratio={"component": "a", "reference": "b", "values": [0.74, 0.84]})(r_o)
+        ok(validate(Spec(r_o, d)) == [], f"SP-OR6 a well-formed outcome_ratio test validates: {validate(Spec(r_o, d))[:3]}")
+        # F6 run 4 R3 (RIG-002): the boundary check's engine tables in place of the emulator's, re-solved
+        dbe = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTbe", "type": "boundary_engine", "text": "t"}, **kw)))
+        bad(dbe(units=["0"]), "boundary_engine takes no", "SP-BE1 a boundary_engine test takes no parameters")
+        bad(lambda r: (r["analysis"].update(evaluation="direct"), dbe()(r)), "emulator",
+            "SP-BE2 a boundary_engine test needs the emulator path (the boundary check runs only there)")
+        r_be = copy.deepcopy(s.raw)
+        dbe()(r_be)
+        ok(validate(Spec(r_be, d)) == [], f"SP-BE3 a boundary_engine test validates: {validate(Spec(r_be, d))[:3]}")
+        _self_test_burden_scale(ok, s, d, bad)
+        _self_test_outcome_adjustments(ok, s, d, bad)
+        # external review of v2 (owner R3, point a): a signed analysis field the code does not read is refused
+        bad(lambda r: r["analysis"].update(outcome_adjustmnts=[]), "unknown key",
+            "SP-AK1 an unknown analysis key is refused (a misspelt signed field would otherwise be a no-op)")
+        r_t = copy.deepcopy(s.raw)
+        dct(calibration_target={"units": ["0", "3"], "scale": 0.8})(r_t)
+        ok(validate(Spec(r_t, d)) == [], f"SP-CT7 a well-formed calibration_target test validates: "
+                                         f"{validate(Spec(r_t, d))[:3]}")
         bad(lambda r: r["analysis"].update(regret_threshold=2), "analysis.regret_threshold",
             "SP11c F6 S1-5: a regret threshold outside [0, 1] is refused")
         bad(lambda r: r["analysis"].update(dollars_threshold="x"), "analysis.dollars_threshold",

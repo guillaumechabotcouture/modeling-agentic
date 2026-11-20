@@ -81,6 +81,14 @@ def _group(res, o, pm):
     return sum(res["per_capita"][o][g] * sh[g] for g in gs) / w if w > 0 else 0.0
 
 
+def _yll_value(spec, theta):
+    """A years-of-life-lost weight: a number, or an engine parameter at this run's values (else the spec's or the
+    engine card's)."""
+    from toolkit.spec import engine_parameters as PV
+    base = dict({p.name: p.value for p in spec.engine().parameters()}, **PV.values(spec))
+    return lambda x: float(x) if BV._num(x) is not None else float((theta or {}).get(x, base[x]))
+
+
 def group_sizes(res, pops: dict, unit: dict) -> dict:
     """{engine group: people} with the weighting the aggregate outcomes use: within each population band of
     decision_units.populations, the engine's age shares renormalised and multiplied by the band's population column,
@@ -136,6 +144,13 @@ class EmulatorModel:
         self.by_id = {str(u[spec.uid]): u for u in spec.units()}
         self.fv = {i: FT.vector(spec, u) for i, u in self.by_id.items()}
         pts = design["points"]
+        yw = BV.yll_weights(spec)        # F6 S2-5d #220 r3: YLL emulated beside the outcomes, from per-age deaths
+        self.yll = yw
+        if yw:
+            self.outcomes = self.outcomes + [BV.YLL_OUT] + ([BV.YLD_OUT] if yw["dalys"] in self.outcomes else [])
+            th = {str(p["point"]): p["theta"] for p in pts}
+            results = {key: BV.with_yll(r, yw, _yll_value(spec, th.get(key.rsplit("|", 1)[0])))
+                       if isinstance(r, dict) and "per_capita" in r else r for key, r in results.items()}
         missing = [f"{p['point']}|{k}" for p in pts for k in self.packages if f"{p['point']}|{k}" not in results]
         if missing:
             raise ValueError(f"{len(missing)} engine results missing (e.g. {missing[:3]}): the analysis fails closed")
@@ -234,6 +249,20 @@ class EmulatorModel:
         self._accuracy()
         return self
 
+    def _pred(self, key, X):
+        """A GP's prediction for an emulated quantity; DALYs (#220 r4) are the predicted YLL + YLD, never the DALY GP
+        (fitted only because the other outcomes' GPs start from its kernel): the log comparator burden, or the
+        reduction 1 - (YLL_k + YLD_k) / (YLL + YLD) with the parts' reductions clipped as predict() clips them."""
+        o = key[2]
+        if not (self.yll and o == self.yll["dalys"] and BV.YLD_OUT in self.outcomes):
+            return self.gps[key].predict(X)
+        P = key[1]
+        by, bd = (np.exp(self.gps[("base", P, q)].predict(X)) for q in (BV.YLL_OUT, BV.YLD_OUT))
+        if key[0] == "base":
+            return np.log(by + bd)
+        ry, rd = (np.clip(self.gps[("red", P, q, key[3])].predict(X), -0.5, 1.0) for q in (BV.YLL_OUT, BV.YLD_OUT))
+        return 1 - (by * (1 - ry) + bd * (1 - rd)) / (by + bd)
+
     def _accuracy(self):
         ho = self.hold
         if ho.sum() < 2:
@@ -250,11 +279,11 @@ class EmulatorModel:
                 continue
             for P in self.pops:
                 key = ("red", P, self.primary, k)
-                t, p = self.T[key][ho], self.gps[key].predict(Xh)
+                t, p = self.T[key][ho], self._pred(key, Xh)
                 for o in self.outcomes:          # Codex r2 P1: one residual column per outcome
                     ko = ("red", P, o, k)
                     cols.append((P, o, k))
-                    res.append(self.T[ko][ho] - self.gps[ko].predict(Xh))
+                    res.append(self.T[ko][ho] - self._pred(ko, Xh))
                 ss = np.sum((t - t.mean()) ** 2)
                 r2.append(1 - np.sum((t - p) ** 2) / ss if ss > 0 else float("nan"))
                 errs.append(np.mean(np.abs(t - p)))
@@ -263,7 +292,7 @@ class EmulatorModel:
         acc["reduction_r2_p10"] = float(np.nanpercentile(r2, 10))
         acc["reduction_mae_median"] = float(np.median(errs))
         P0 = next(iter(self.pops))
-        tb, pb = self.T[("base", P0, self.primary)][ho], self.gps[("base", P0, self.primary)].predict(Xh)
+        tb, pb = self.T[("base", P0, self.primary)][ho], self._pred(("base", P0, self.primary), Xh)
         acc["base_log_rmse"] = float(np.sqrt(np.mean((tb - pb) ** 2)))
         for o, P, _m in self.bw_keys:     # Codex S2-5b r1 P2: the window values' error, jointly
             cols.append(("emu", "bw", o, P))
@@ -271,7 +300,7 @@ class EmulatorModel:
         for P in self.pops:    # F6 S2-4: the comparator burden and every cost output too, from the same points
             for o in self.outcomes:
                 cols.append(("emu", "base", P, o))    # four parts: never a reduction's or a window's key
-                res.append(self.T[("base", P, o)][ho] - self.gps[("base", P, o)].predict(Xh))
+                res.append(self.T[("base", P, o)][ho] - self._pred(("base", P, o), Xh))
         for name in self.cost_outputs:
             for k in self.packages:
                 cols.append(("emu", "cost", name, k))
@@ -279,6 +308,9 @@ class EmulatorModel:
         if cols and ho.sum() >= EmulatorError.MIN_HOLDOUT:
             self.error = EmulatorError(cols, np.array(res).T)
             acc["error_model"] = self.error.summary()
+        if self.yll and self.yll["dalys"] in self.outcomes and BV.YLD_OUT in self.outcomes:
+            acc["dalys_from"] = ("the predicted YLL + YLD; the DALY GP is fitted only for the kernel the other outcomes' "
+                                 "GPs start from, and its prediction is never used")
         self.accuracy = acc
 
     # ---------------------------------------------------------------- prediction
@@ -317,9 +349,12 @@ class EmulatorModel:
             ev.append({"unit": ids[j], "package": "*", "kind": "extrapolation",
                        "inputs": [self.input_names[c] for c in np.flatnonzero(outside[j])]})
         y = [{"y": {k: {} for k in self.packages}, "cost": {k: {} for k in self.packages}, "diag": {}} for _ in ids]
+        skip = self.yll["dalys"] if self.yll and BV.YLD_OUT in self.outcomes else None
         for P, pm in self.pops.items():
             popv = np.array([float(u[pm["column"]]) for u in rows])
             for o in self.outcomes:
+                if o == skip:       # #220 final: DALYs are YLL + YLD (finish_parts); the DALY GP is never predicted
+                    continue
                 lb = self.gps[("base", P, o)].predict(X)
                 b = np.exp(lb + E[:, self.error.col[("emu", "base", P, o)]] if E is not None else lb)
                 for j in range(n):
@@ -369,6 +404,10 @@ class EmulatorModel:
                     b = y[j].setdefault("burden", {}).setdefault(self.bw["arm"], {})
                     b[o] = b.get(o, 0.0) + v
         self.last_events = ev
+        if self.yll:        # #220 r4: DALYs = YLL + YLD (both emulated non-negative), the window's YLL
+            wts = BV.window_weights(self.spec, self.yll, _yll_value(self.spec, theta))
+            for row in y:
+                BV.finish_parts(row, self.yll, wts)
         return dict(zip(ids, y))
 
 
@@ -459,7 +498,9 @@ class DirectModel:
         self.pk = spec.packages()
         self.comp = spec.comparator
         self.pops = spec["decision_units"]["populations"]
-        self.outcomes = spec.outcomes()
+        self.yll = BV.yll_weights(spec)      # F6 S2-5d #220 r3: YLL from the engine's per-age deaths
+        self.outcomes = spec.outcomes() + ([BV.YLL_OUT] + ([BV.YLD_OUT] if self.yll["dalys"] in spec.outcomes() else [])
+                                           if self.yll else [])
         self.by_id = {str(u[spec.uid]): u for u in spec.units()}
         self.attrs = {i: spec.unit_attributes(u) for i, u in self.by_id.items()}
         self.cal_attr = spec["calibration"].get("attribute")
@@ -514,11 +555,13 @@ class DirectModel:
             for k in self.packages:
                 r = runs[(i, k)]
                 res = {"per_capita": r.per_capita, "meta": r.meta}
+                if self.yll:
+                    res = BV.with_yll(res, self.yll, _yll_value(self.spec, theta))
                 row["y"][k] = {o: sum(_group(res, o, pm) * float(u[pm["column"]]) for pm in self.pops.values())
                                for o in self.outcomes}
                 # per engine group (deliverables by group), weighted as the aggregate is (group_sizes)
                 gsz = group_sizes(res, self.pops, u)
-                row["y_group"][k] = {o: {g: float((r.per_capita.get(o) or {}).get(g, 0.0)) * n
+                row["y_group"][k] = {o: {g: float((res["per_capita"].get(o) or {}).get(g, 0.0)) * n
                                          for g, n in gsz.items()} for o in self.outcomes}
                 row["cost"][k] = {n: _driver({"cost_drivers": r.cost_drivers}, m["cost_driver"], f"unit {i}, {k}") * tot
                                   for n, m in self.cost_outputs.items()}
@@ -531,6 +574,8 @@ class DirectModel:
                 if k == self.comp:
                     for n, d in self.diagnostics.items():
                         row["diag"][n] = float((r.windows.get(d.get("window", "")) or {}).get(d["metric"], math.nan))
+            if self.yll:
+                BV.finish_parts(row, self.yll, BV.window_weights(self.spec, self.yll, _yll_value(self.spec, theta)))
             out[i] = row
         return out
 
@@ -710,6 +755,111 @@ def _self_test() -> int:
     ok(gs == {"a": 100.0, "b": 120.0, "c": 80.0} and abs(sum(res["per_capita"]["o"][g] * n for g, n in gs.items())
                                                         - agg) < 1e-12,
        f"MD3 group sizes follow the population bands, so group counts add up to the aggregate ({gs})")
+    # MD4 (F6 S2-5d #220 r3): YLL derived per engine age group from the engine's own deaths, before aggregation, so
+    # population bands of several ages, or several bands sharing one age, add up exactly
+    try:
+        from toolkit.analysis import burden as BVm
+        r4 = {"meta": {"age_shares": {"c": 0.4, "a": 0.6}}, "per_capita": {"deaths": {"c": 0.01, "a": 0.002}}}
+        d4 = BVm.with_yll(r4, {"deaths": "deaths", "dalys": "dalys", "w": {"c": 70, "a": "le_a"}},
+                          lambda x: {"le_a": 30.0}.get(x, x))
+        b1 = {"one": {"column": "p1", "age_groups": ["c", "a"]}}
+        b2 = {"kids": {"column": "p2", "age_groups": ["c"]}, "ad1": {"column": "p3", "age_groups": ["a"]},
+              "ad2": {"column": "p4", "age_groups": ["a"]}}
+        u4 = {"p1": 1000.0, "p2": 400.0, "p3": 500.0, "p4": 100.0}
+        t1 = sum(_group(d4, BVm.YLL_OUT, pm) * u4[pm["column"]] for pm in b1.values())
+        t2 = sum(_group(d4, BVm.YLL_OUT, pm) * u4[pm["column"]] for pm in b2.values())
+        t2r = sum(_group(d4, BVm.YLL_OUT, pm) * u4[pm["column"]] for pm in reversed(list(b2.values())))
+        ok(abs(t1 - (400 * 0.01 * 70 + 600 * 0.002 * 30)) < 1e-9 and abs(t2 - t1) < 1e-9 and t2 == t2r
+           and d4["per_capita"]["deaths"] == r4["per_capita"]["deaths"],
+           f"MD4 YLL per engine age group from its own deaths: mixed-age and repeated-age bands add up ({t1}, {t2})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"MD4 YLL per engine age group from its own deaths: {type(e).__name__}: {e}")
+    # MD5 (#220 r4): the emulator trains and predicts YLL and YLD (each design point's own weight parameter), its
+    # DALYs are YLL + YLD in every emulator-error draw, and anchored DALYs never fall below the anchored YLL
+    try:
+        import tempfile
+        import yaml as _y
+        from toolkit.spec import schema, priors as PRI, engine_parameters as PV
+        with tempfile.TemporaryDirectory() as d:
+            raw = _y.safe_load(open(schema.toy_spec(d)))
+            raw["outcomes_reported"] = ["dalys", "cases", "deaths"]
+            raw["validation"] = {"burden": {"daly_parts": {"dalys": "dalys", "deaths": "deaths",
+                                                           "yll_per_death_by_age": {"all": "eff_a"}}}}
+            sp = schema.Spec(raw, d)
+            rng = np.random.default_rng(3)
+            ids, pk = sp.unit_ids(), list(sp.packages())
+            pts, res = [], {}
+            for n in range(40):
+                z, th = float(rng.uniform(-2, 2)), {"eff_a": float(rng.uniform(0.3, 0.7)),
+                                                    "eff_b": float(rng.uniform(0.1, 0.5))}
+                pts.append({"point": f"p{n}", "unit_id": ids[n % len(ids)], "z": z, "theta": th, "holdout": n % 5 == 0})
+                for k in pk:
+                    cs = sp.packages()[k]
+                    m = math.exp(z) * (1 - 0.3 * ("a" in cs) - 0.2 * ("b" in cs))
+                    dth = 0.01 * m * (1 + 0.3 * math.sin(4 * z) * ("a" in cs)) * float(rng.uniform(0.8, 1.2))
+                    cas = 0.1 * m * (1 + 0.3 * math.cos(3 * z) * ("b" in cs)) * float(rng.uniform(0.8, 1.2))
+                    res[f"p{n}|{k}"] = {"per_capita": {"deaths": {"all": dth}, "cases": {"all": cas},
+                                                       "dalys": {"all": 0.5 * cas + dth * th["eff_a"]}},
+                                        "meta": {"age_shares": {"all": 1.0}}, "cost_drivers": {"a_doses": 1.0, "b_doses": 1.0},
+                                        "windows": {"cal": {"prev": 1 / (1 + math.exp(-z))}}}
+            design = {"fitted_names": ["eff_a", "eff_b"], "prior_names": list(PRI.drawn(sp)),
+                      "spec_value_names": list(PV.tested_boxes(sp)), "packages": pk, "points": pts}
+            em = EmulatorModel(sp, design, res, log=lambda *a: None).fit()
+            BVm = BV
+            Y, D = BVm.YLL_OUT, BVm.YLD_OUT
+            tw = em.T[("base", "all", Y)] - em.T[("base", "all", "deaths")]
+            want = np.log([p["theta"]["eff_a"] for p in pts])
+            anc = {"rows": {}, "units": {i: {} for i in ids}, "arm": sp.comparator, "cost_scaling": {}, "daly_check": None,
+                   "dalys": {"outcome": "dalys", "deaths": "deaths", "cases": "cases", "yll": Y}}
+            good, n_ok = True, 0
+            for sd in range(4):
+                o = em.predict({i: 0.3 for i in ids}, {"eff_a": 0.5, "eff_b": 0.3}, ids,
+                               noise=np.random.default_rng(sd) if em.error is not None else None)
+                for i in ids:
+                    for k in pk:
+                        v = o[i]["y"][k]
+                        good &= v[Y] >= 0 and v[D] >= 0 and abs(v["dalys"] - v[Y] - v[D]) <= 1e-9 * max(v["dalys"], 1)
+                BVm.apply_anchor(anc, o, ids, unit_factors={i: {"deaths": 2.0, "cases": 0.5} for i in ids})
+                good &= all(o[i]["y"][k]["dalys"] >= o[i]["y"][k][Y] - 1e-12 for i in ids for k in pk)
+                n_ok += 1
+            ho, Xh = em.hold, em.X[em.hold]
+            errs = []
+            for k in pk:
+                if k == em.comp:
+                    continue
+                by, bd = (np.exp(em.gps[("base", "all", q)].predict(Xh)) for q in (Y, D))
+                ry, rd = (np.clip(em.gps[("red", "all", q, k)].predict(Xh), -0.5, 1) for q in (Y, D))
+                pr = 1 - (by * (1 - ry) + bd * (1 - rd)) / (by + bd)
+                errs.append(np.mean(np.abs(em.T[("red", "all", "dalys", k)][ho] - pr)))
+            tb = em.T[("base", "all", "dalys")][ho]
+            pb = np.log(np.exp(em.gps[("base", "all", Y)].predict(Xh)) + np.exp(em.gps[("base", "all", D)].predict(Xh)))
+            gp_mae = np.median([np.mean(np.abs(em.T[("red", "all", "dalys", k)][ho]
+                                               - em.gps[("red", "all", "dalys", k)].predict(Xh))) for k in pk if k != em.comp])
+            ok(abs(em.accuracy["reduction_mae_median"] - float(np.median(errs))) < 1e-12
+               and abs(em.accuracy["base_log_rmse"] - float(np.sqrt(np.mean((tb - pb) ** 2)))) < 1e-12
+               and "YLL + YLD" in em.accuracy.get("dalys_from", "") and em.accuracy["reduction_mae_median"] != gp_mae,
+               f"MD6 (#220 r4) the reported DALY accuracy is the held-out error of DALYs = predicted YLL + YLD "
+               f"({em.accuracy['reduction_mae_median']:.3g}), not the DALY GP's ({gp_mae:.3g})")
+            class _Out:         # the superseded DALY GP, forced far outside its bounds
+                def predict(self, X):
+                    return np.full(len(X), 1.5)
+            saved_g = {k: v for k, v in em.gps.items() if k[0] == "red" and k[2] == "dalys"}
+            try:
+                for k in saved_g:
+                    em.gps[k] = _Out()
+                o7 = em.predict({i: 0.3 for i in ids}, {"eff_a": 0.5, "eff_b": 0.3}, ids)
+                ev7 = [e for e in em.last_events if e.get("outcome") == "dalys"]
+                ok7 = not ev7 and all(abs(o7[i]["y"][k]["dalys"] - o7[i]["y"][k][Y] - o7[i]["y"][k][D]) <= 1e-9
+                                      * max(o7[i]["y"][k]["dalys"], 1) for i in ids for k in pk)
+            finally:
+                em.gps.update(saved_g)
+            ok(ok7, f"MD7 (#220 final P2) the superseded DALY GP is not predicted: forced out of bounds it raises no "
+                    f"correction event, and DALYs stay YLL + YLD ({len(ev7)} events)")
+            ok(np.allclose(tw, want) and good and n_ok == 4 and em.error is not None,
+               "MD5 the emulator learns YLL from each design point's own weight parameter, predicts DALYs = YLL + YLD "
+               "with both parts non-negative in every emulator-error draw, and anchored DALYs stay above anchored YLL")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"MD5 the emulator's YLL and YLD: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
