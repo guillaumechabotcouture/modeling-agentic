@@ -3910,7 +3910,8 @@ def _self_test_durable(ok) -> None:
         keep = ["models/m.py", "models/inputs.jsonl", "models/res.jsonl", "data/notes.log", "data/map.png"]
         drop = ["models/run.log", "models/b.jsonl.partial.jsonl", "models/b.jsonl.job.json",
                 "models/res.jsonl.summary.json", "models/compute_ledger.json", "models/sub/step.log"]
-        unhashed = ["models/fig.png", "models/sub/trace.svg", "models/step.out"]      # shipped, not fingerprinted
+        unhashed = ["models/fig.png", "models/sub/trace.svg", "models/step.out",        # shipped, not fingerprinted
+                    "models/sub/compute_ledger.jsonl"]      # not the run's ledger (review round 3)
         for rel in keep + drop + unhashed:
             os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
             open(os.path.join(d, rel), "w").write("def f(p):\n    return p\n" if rel.endswith(".py") else rel)
