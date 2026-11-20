@@ -138,6 +138,9 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
     skipped, tar = [], os.path.join(work, "result.tar.gz")
     for skip_large in ((True,) if stored else (False, True)):
         del skipped[:]
+        for p in (tar, tar + ".tmp"):       # a link an agent left at either name is removed, never written through
+            if os.path.lexists(p):
+                os.remove(p)
         try:
             with tarfile.open(tar + ".tmp", mode="w:gz") as t:
                 if runs:
@@ -437,8 +440,7 @@ class Checkpointer:
         if not self._busy.acquire(blocking=False):
             self.skipped += 1
             self.log(f"{why}: skipped, the previous checkpoint is still uploading")
-            self._status("skipped: the previous checkpoint is still uploading")
-            return False
+            return False             # the skip is counted in the status the upload in flight writes when it ends
         with self._plock:
             tokens, self.pending = dict(self.pending), {}
         started = self._last = time.time()
@@ -581,7 +583,7 @@ def store_transcripts(d, store, prefix, launch_id, label, account, secrets, home
     home = home or os.path.expanduser("~/.claude/projects")
     os.makedirs(home, exist_ok=True)
     os.makedirs(d, exist_ok=True)
-    store.write_archive(home, "transcripts", f"{d}/transcripts.tar.gz", list(secrets))
+    store.write_archive(home, "transcripts", f"{d}/transcripts.tar.gz", list(secrets), strict=True)
     return store.upload_retry(f"{d}/transcripts.tar.gz",
                               f"outputs/{prefix}/launch_{launch_id}/transcripts_{label}.tar.gz", account)["blob"]
 

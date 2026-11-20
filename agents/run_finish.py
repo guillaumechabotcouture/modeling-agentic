@@ -514,7 +514,7 @@ def store_run_results(run_path: str, service=None) -> str | None:
         secrets = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")]
         with tempfile.TemporaryDirectory() as stage:     # outside the run dir; removed whatever happens
             tmp = os.path.join(stage, f"{name}.tar.gz")
-            results_store.write_archive(run_path, name, tmp, secrets)
+            results_store.write_archive(run_path, name, tmp, secrets, strict=True)
             blob = _store_blob_name(run_path)
             results_store.upload_retry(tmp, blob, account, service=service)
     except Exception as e:  # noqa: BLE001 — the local copy remains; say so loudly

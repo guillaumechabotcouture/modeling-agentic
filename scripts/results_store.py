@@ -202,7 +202,7 @@ def _copy_scan(fd: int, dst, secrets: list[bytes]) -> bool:
 
 
 def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | None = None, extra=(),
-                  _hook=None, base: str | None = None) -> list[str]:
+                  _hook=None, base: str | None = None, strict: bool = False) -> list[str]:
     """archive_dir streamed to `out_path` (F6 run checkpoints): the same exclusions and redaction, with bounded
     memory. The run dir is reached from `base` (the trusted job work dir) one component at a time, no link followed
     (Codex round 3: a parent such as work/runs linked into _truth/ is refused); without `base`, `root` itself must
@@ -211,7 +211,10 @@ def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | N
     is that copy, which is what is archived, so a rewrite or a swap for a link after the listing can neither leak a
     secret nor reach _truth/. A copy up to REDACT_MAX_MB is redacted in memory, a larger one block by block
     (_redact_stream), so no file is left out for its size. `extra`: (path, arcname) pairs (run.log). `_hook(rel)` runs between the listing and each open
-    (self-test). Returns what was left out."""
+    (self-test). Returns what was left out. `strict` (a final store, of a run that has ended): a regular file that
+    is not a sensitive path and still could not be archived (unreadable) raises OSError, so the store is never
+    recorded as complete without it."""
+    import stat
     sec = [x.encode() for x in (secrets or []) if x and len(x) >= 12]
     skipped = []
     items = []
@@ -225,6 +228,10 @@ def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | N
             items += [(root_fd, os.path.normpath(os.path.join(dp, fn)), None) for fn in sorted(files)]
         items += [(os.path.dirname(os.path.abspath(p)), os.path.basename(p), a) for p, a in extra]
         _write_items(items, arcname, out_path, sec, skipped, _hook)
+        bad = [r for r in skipped if strict and not is_sensitive_path(r)
+               and stat.S_ISREG(os.stat(r, dir_fd=root_fd, follow_symlinks=False).st_mode)]
+        if bad:
+            raise OSError(f"{len(bad)} file(s) could not be read for the archive, e.g. {bad[:3]}")
     finally:
         os.close(root_fd)
     return skipped
