@@ -5104,6 +5104,16 @@ def _self_test_liveness(ok) -> None:
         b = ws.fetch_meta("B")
         ok(b["state"] == "dead" and b.get("phase") == "failed",
            f"LV4 LW_DEAD_PID_DETECTED the task ended without a result (a run.log exists): dead, not running: {b}")
+        # LV5c (Codex round 3): the record is written under a fresh name each time; a link at a predictable name
+        # (an agent's) is never written through, and a link at the record's own name is replaced
+        victim = os.path.join(root, "victim.txt")
+        open(victim, "w").write("keep")
+        os.symlink(victim, ws.state_path("LK"))
+        os.symlink(victim, f"{ws.state_path('LK')}.{os.getpid()}.tmp")
+        ws.RunState("LK").set("running")
+        ok(open(victim).read() == "keep" and not os.path.islink(ws.state_path("LK"))
+           and json.load(open(ws.state_path("LK")))["phase"] == "running",
+           "LV5c the state record is never written through a link")
         gone = subprocess.Popen([sys.executable, "-c", "pass"])
         gone.wait()
         for label, rec in (("STALE", {"phase": "running", "pid": os.getpid(), "updated_at": time.time() - 3600}),
@@ -5208,8 +5218,8 @@ def _self_test_liveness(ok) -> None:
         collect(cfg2, accept_partial=True)
     ok(os.path.exists(os.path.join(pd, "result.json")) and not os.path.exists(os.path.join(pd, "result.partial.json")),
        "LV9d `collect --accept-partial` after the cluster stopped finishes this launch's partial copy")
-    ok(marks == ["B"] and downs == ["lv"] and os.path.exists(os.path.join(tmp, "A", "result.json")),
-       f"LV9b `collect --accept-partial` (the files were copied by hand, or are given up) finishes the label: "
+    ok(marks == ["B", "A"] and downs == ["lv"] and os.path.exists(os.path.join(tmp, "A", "result.json")),
+       f"LV9b `collect --accept-partial` on a live VM fetches again and tells the VM (its hold ends): "
        f"{marks} {downs}")
 
 
