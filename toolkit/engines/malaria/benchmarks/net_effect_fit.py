@@ -1089,7 +1089,8 @@ def target_digests(base: dict, ids) -> dict:
     return {b["id"]: band_digest(b, base) for b in base["benchmarks"] if b["id"] in set(ids)}
 
 
-def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True, point=None) -> None:
+def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True, point=None,
+                         fail_target: str | None = None) -> None:
     """A placeholder output in run()'s own format, through finalize() and document() (self-tests only). `point`: the
     chosen point's values (default the first row; False leaves the chosen point without one)."""
     ks = [(-1, 0, 1, 0)[i % 4] for i in range(len(pack_seeds()))]       # one seed value per pack seed
@@ -1099,7 +1100,12 @@ def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = 
     ch = {"per_seed": mid(1.0), "all_in_band": True, "disproved_by_verification": [], "calibration_check": {}}
     if point is not False:
         ch["point"] = dict(rows[0] if point is None else point)
-    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], ch)
+    pts = [pt]
+    if fail_target:     # a second verified point (rows[1]) out of band on one target only
+        per = mid(1.0)
+        per[fail_target] = [v * 3.0 for v in per[fail_target]]
+        pts.append({"point": rows[1], "per_seed": per, "calibration_check": {}})
+    reg, _ = finalize({"sample": [dict(r) for r in rows]}, pts, ch)
     fit = {"parameters": {k: {"value": v} for k, v in ch.get("point", {}).items()}}     # as run()'s **fit
     yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []},
                             fit_rule={"seeds": pack_seeds()},
@@ -1126,7 +1132,15 @@ def read_signed(path: str, digest) -> bytes:
     return data
 
 
-def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None = None) -> dict:
+def _same_point(a, b, tol: float = 1e-6) -> bool:
+    """Two parameter points are the same: the same names, each value within the file's 6-decimal rounding."""
+    return (isinstance(a, dict) and isinstance(b, dict) and sorted(a) == sorted(b)
+            and all(isinstance(a[k], (int, float)) and isinstance(b[k], (int, float)) and abs(a[k] - b[k]) <= tol
+                    for k in a))
+
+
+def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None = None,
+                   exception: dict | None = None) -> dict:
     """The fit's accepted joint sample as whole rows: {path, sha256 (the signed one), names, rows (n x k)}.
     `data`: the bytes already read by read_signed (read once, Codex r1 P2-4); they must match `digest` too.
     `ranges` {name: (lo, hi)}: the parameters the uncertainty draws vary and their ranges. Refused (PosteriorRefused)
@@ -1185,14 +1199,32 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
         no(f"the run's recorded seeds (fit_rule.seeds) are not a valid declaration: {ex}")
     if rec != seeds:
         no(f"the run's recorded seeds {rec} are not pack.yaml's {seeds}")
-    try:
-        bands = pack_bands()        # the targets the replay checks the chosen point on (finalize's default)
+    bands = pack_bands()            # the targets the replay checks the chosen point on (finalize's default)
+    exc = None
+    if exception is not None:       # owner, 20 Nov: a declared exception, matched to the file's recorded failures
+        fails = []
+        for p in pts:
+            if not point_in_band(p, bands, seeds)[0]:
+                per = _per_seed(p)
+                fails.append({"point": p["point"], "targets": sorted(
+                    t for t, b in bands.items() if not ci_in_band(per.get(t) or [], b, len(seeds)))})
+        decl = [{"point": dict(x["point"]), "targets": sorted(x["targets"])} for x in exception["failed_points"]]
+        if not fails or len(fails) != len(decl) or not all(
+                any(_same_point(f["point"], x["point"]) and f["targets"] == x["targets"] for x in decl) for f in fails):
+            no(f"the declared exception {decl} is not the file's recorded failures {fails} (the same points, the same "
+               f"targets)")
+        pts = [p for p in pts if not any(_same_point(p["point"], f["point"]) for f in fails)]
+        if exception.get("draws") == "exclude":
+            rows = [r for r in rows if not any(_same_point(r, f["point"]) for f in fails)]
+            X = [[float(r[k]) for k in names] for r in rows]
+        exc = dict(exception, failed_points=decl)
+    try:            # with an exception: the rest of the evidence must pass the rule as it stands
         rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
                            edge, bands=bands, seeds=seeds)
         why = rr["acceptance"]
     except (KeyError, TypeError, ValueError, AttributeError) as ex:
         code, why = 2, [f"{type(ex).__name__}: {ex}"]
-    if code != 0 or reg.get("sample") != rows:
+    if code != 0 or (exc is None and reg.get("sample") != rows) or not rows:
         no(f"the fit's acceptance gate (finalize, replayed on the file's evidence) does not pass: {why}")
     miss = [k for k in names if k not in ranges]
     if miss:
@@ -1214,8 +1246,8 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
     td = doc.get("target_digests") if isinstance(doc.get("target_digests"), dict) else {}
     trained = {k: td[k] for k in sorted(set(bands) & set(tt) - set(ho)) if decl[k].get("band") == bands[k]
                and td.get(k) == band_digest(decl[k], base)} if isinstance(tt, list) and isinstance(ho, list) else {}
-    return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X,
-            "trained": trained}
+    return dict({"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X,
+                 "trained": trained}, **({"exception": exc} if exc else {}))
 
 
 # hard bounds a card's units imply (owner, 14 Nov, f6-posterior-ranges): a value outside them is not physical

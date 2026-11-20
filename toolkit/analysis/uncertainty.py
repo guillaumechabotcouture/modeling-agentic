@@ -58,9 +58,11 @@ def posterior_input(spec) -> dict | None:
         return None
     p = u["net_effect_posterior"]
     if not isinstance(p, dict) or not isinstance(p.get("path"), str) or not p["path"].strip() \
-            or not isinstance(p.get("sha256"), str) or set(p) - {"path", "sha256", "margin"}:
+            or not isinstance(p.get("sha256"), str) or set(p) - {"path", "sha256", "margin", "exception"}:
         raise ValueError("uncertainty.net_effect_posterior: {path: net_effect_fit.py's output file, sha256: its "
-                         "signed digest, margin (optional): a share of the sample's hull width in [0, 1]}")
+                         "signed digest, margin (optional): a share of the sample's hull width in [0, 1], exception "
+                         "(optional): an owner-signed acceptance of recorded verification failures}")
+    exc = posterior_exception(spec)
     m = p.get("margin", 0.0)
     if isinstance(m, bool) or not isinstance(m, (int, float)) or not np.isfinite(m) or not 0 <= m <= 1:
         raise ValueError(f"uncertainty.net_effect_posterior.margin {m!r}: a share of the sample's hull width in [0, 1]")
@@ -70,7 +72,50 @@ def posterior_input(spec) -> dict | None:
         from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
         got = {"path": path, "sha256": dig, "data": NEF.read_signed(path, dig)}
         spec._net_effect_posterior = got
-    return dict(got, margin=float(m))
+    return dict(got, margin=float(m), exception=exc)
+
+
+EXCEPTION_KEYS = ("failed_points", "rule", "evidence", "reason", "draws")
+
+
+def posterior_exception(spec) -> dict | None:
+    """uncertainty.net_effect_posterior.exception (owner, 2026-11-20): the owner-signed acceptance of a net-effect
+    sample whose verification recorded failures. {failed_points: [{point: {parameter: value}, targets: [id, ...]}],
+    rule: the rule they fail, evidence: what else was verified, reason, draws: keep | exclude (the failed points in or
+    out of the draws)}. The loader accepts the sample only when it matches the file's recorded failures exactly
+    (net_effect_fit.load_posterior). None without it; a malformed one is refused (ValueError)."""
+    e = ((spec.raw.get("uncertainty") or {}).get("net_effect_posterior") or {}).get("exception")
+    if e is None:
+        return None
+    pts = e.get("failed_points") if isinstance(e, dict) else None
+    good = (isinstance(e, dict) and set(e) == set(EXCEPTION_KEYS) and isinstance(pts, list) and pts
+            and all(isinstance(e[k], str) and e[k].strip() for k in ("rule", "evidence", "reason"))
+            and e["draws"] in ("keep", "exclude")
+            and all(isinstance(x, dict) and set(x) == {"point", "targets"} and isinstance(x["point"], dict)
+                    and x["point"] and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                           for v in x["point"].values())
+                    and isinstance(x["targets"], list) and x["targets"]
+                    and all(isinstance(t, str) and t for t in x["targets"]) for x in pts))
+    if not good:
+        raise ValueError(f"uncertainty.net_effect_posterior.exception: {{{', '.join(EXCEPTION_KEYS)}}}; failed_points "
+                         f"a non-empty list of {{point: {{parameter: number}}, targets: [benchmark id, ...]}}, draws "
+                         f"keep or exclude, the rest non-empty text (got {e!r})")
+    return e
+
+
+def exception_sheet_lines(raw: dict) -> list:
+    """The sign-off sheet's HIGH line for a declared net-effect posterior exception (owner-signed departure)."""
+    post = ((raw.get("uncertainty") or {}).get("net_effect_posterior") or {})
+    e = post.get("exception") if isinstance(post, dict) else None
+    if not isinstance(e, dict):
+        return []
+    pts = [f"{', '.join(map(str, x.get('targets') or []))} at {x.get('point')}" for x in e.get("failed_points") or []
+           if isinstance(x, dict)]
+    return ["## Net-effect posterior exception (owner-signed departure)",
+            f"- **HIGH**: the net-effect posterior `{post.get('path')}` (sha256 {str(post.get('sha256'))[:12]}…) is "
+            f"accepted although its verification failed ({e.get('rule')}): {'; '.join(pts)}. Evidence: "
+            f"{e.get('evidence')}. Reason: {e.get('reason')}. The failed point(s) are "
+            f"{'kept in' if e.get('draws') == 'keep' else 'excluded from'} the draws.", ""]
 
 
 def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None = None, held=()) -> dict | None:
@@ -100,11 +145,13 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
         varied.update({k: tuple(v[:2]) for k, v in fitted.items()})
     varied = {k: v for k, v in varied.items() if k not in held}
     from toolkit.engines.contract import engine_identity      # Codex r1 P2-3: the engine is part of what was verified
-    key = (post["sha256"], post["margin"], tuple(sorted(varied)), tuple(sorted(engine_identity(eng).items())))
+    import json as _json
+    key = (post["sha256"], post["margin"], tuple(sorted(varied)), tuple(sorted(engine_identity(eng).items())),
+           _json.dumps(post.get("exception"), sort_keys=True))
     cache = getattr(spec, "_net_effect_sample", None)
     if cache is not None and cache[0] == key:
         return cache[1]
-    ne = NEF.load_posterior(post["path"], eng, varied, post["sha256"], post["data"])
+    ne = NEF.load_posterior(post["path"], eng, varied, post["sha256"], post["data"], exception=post.get("exception"))
     ne["margin"] = post["margin"]
     ne["ranges"] = NEF.posterior_ranges(ne, post["margin"], NEF.hard_bounds(eng, ne["names"]))
     ne["point"] = chosen_point(post, ne["names"])
@@ -187,8 +234,9 @@ def with_posterior_ranges(ne: dict | None, fitted: dict, priors: dict | None = N
 
 def posterior_range_record(ne: dict) -> dict:
     """What the manifest and the uncertainty report record of the ranges the sample set."""
-    return {"sha256": ne["sha256"], "range_source": "posterior_hull", "margin": ne["margin"],
-            "ranges": {k: [float(lo), float(hi)] for k, (lo, hi) in ne["ranges"].items()}}
+    return dict({"sha256": ne["sha256"], "range_source": "posterior_hull", "margin": ne["margin"],
+                 "ranges": {k: [float(lo), float(hi)] for k, (lo, hi) in ne["ranges"].items()}},
+                **({"exception": ne["exception"]} if ne.get("exception") else {}))
 
 
 def _pu():
