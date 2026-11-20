@@ -3665,9 +3665,56 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         ok(("report_claim_invalid", "b.ci") in got and ("report_claim_unresolved", "b.ci") not in got,
            f"CX1-9 a reference to an invalid claim is reported once, as invalid ({got})")
 
+    # Narrow Codex review of #297, round 2 (each failed on b148196a).
+    def r2_machine():
+        d, T, st = new_run("a1_cx21", {})                    # CX2-1: no cap
+        m = mk(d, T, st)
+        m._task("k1", "sign_spec", d, writeup=True)
+        ok(m.st.journal["k1"].get("readback_usd") == READBACK_CAP_USD,
+           f"CX2-1 without a cap a write-up task's read-back allowance is recorded too ({m.st.journal['k1']})")
+        for name, setup, want in (
+                ("CX2-2 an unreadable ledger does not stop a RETHINK back-edge",
+                 lambda d: _put(d, FL.LEDGER, "not json\n"), None),
+                ("CX2-3 a structural mismatch any reviewer reports is among the reasons",
+                 lambda d: yaml.safe_dump({"structural_mismatch": {"detected": True, "description": "no age classes"},
+                                           "blockers": []}, open(os.path.join(d, "critique_methods.yaml"), "w")),
+                 "no age classes")):
+            d, T, st = new_run("a1_" + name[:5].replace("-", ""), {})
+            st.state = "GATE"
+            save_state(d, st)
+            setup(d)
+            try:
+                mk(d, T, st)._rethink("ENGINE_CHOICE", "test")
+            except Exception as e:  # noqa: BLE001
+                ok(False, f"{name}: {type(e).__name__}: {e}")
+                continue
+            s = load_state(d)
+            why = (s.tries.get("rethink_engine") or {}).get("why") or []
+            ok(s.state == "ENGINE_CHOICE" and (want is None or any(want in w for w in why)), f"{name} ({why})")
+
+    def r2_findings():
+        # CX2-4: with report.md alone the presentation review's findings are open findings, as its file is read.
+        d = os.path.join(td, "a1_cx24")
+        os.makedirs(os.path.join(d, "models"))
+        yaml.safe_dump({"reviewer": "critique-presentation", "round": 1, "blockers": [
+            {"id": "P-002", "severity": "MEDIUM", "category": "METHODS", "target_stage": "WRITE", "claim": "c"}]},
+            open(os.path.join(d, "critique_presentation.yaml"), "w"))
+        open(os.path.join(d, "report.md"), "w").write("# Report\n")
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
+        ok(got == ["P-002"], f"CX2-4 with report.md alone the presentation review's findings are read ({got})")
+        # CX2-9: a reference broken over two lines is not one the renderer accepts: still reported.
+        yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5}]},
+                       open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts [CLAIM:\na.good] cases.\n")
+        os.remove(os.path.join(d, "report.md"))
+        got = {f["kind"] for f in report_claim_findings(d)}
+        ok(got & {"report_claim_unresolved", "report_claim_id_raw"},
+           f"CX2-9 a reference broken over two lines is still reported ({got})")
+
     for name, fn in (("T_PRES_BUDGET", budget), ("T_PW_GATE", post_write), ("F_HARNESS_IDS", ids),
                      ("T_RETHINK", rethink), ("T_CLAIM", claims), ("CX1-3", r1_resume), ("CX1-4", r1_readback),
-                     ("CX1-5", r1_open), ("CX1-7", r1_rethink), ("CX1-2", r1_claims)):
+                     ("CX1-5", r1_open), ("CX1-7", r1_rethink), ("CX1-2", r1_claims), ("CX2-1", r2_machine),
+                     ("CX2-4", r2_findings)):
         case(name, fn)
 
 

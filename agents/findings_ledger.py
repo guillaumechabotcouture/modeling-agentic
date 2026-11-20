@@ -589,6 +589,24 @@ def _self_test() -> int:
                                                    "claim": "c", "done_when": frozen}]}, 2)
         ok(rows[0].id == "done_when_unmet:R-9" and rows[0].done_when == frozen,
            f"L_GATE_DW a gate row that carries a test keeps it ({rows[0].id}, {rows[0].done_when})")
+        # Narrow Codex review of #297, round 2 (5-8).
+        yaml.safe_dump({"declarations": [{"blocker_id": "R-042", "why": "declared"}]},
+                       open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        dec2 = {"rigor_violations": [{"kind": k, "key": i, "severity": "HIGH", "claim": "c", "done_when": frozen}
+                                     for k, i in (("done_when_regressed", "R-042"), ("done_when_unmet", "R-043"))]}
+        led2, _ = sync(d, dec2, 2)
+        ok(led2["done_when_regressed:R-042"].status == "open",
+           f"L_CX2-5 a declaration of a finding does not declare its regression ({led2['done_when_regressed:R-042'].status})")
+        ok(led2["done_when_unmet:R-043"].done_when is None,
+           f"L_CX2-6 a gate row of a withdrawn test carries no test ({led2['done_when_unmet:R-043'].done_when})")
+        ok(tests_of({"file": "x.csv", "where": {2024: "x", "site": "A"}}) is None,
+           "L_CX2-7 a test the ledger could not write (mixed key types) is not kept")
+        open(os.path.join(d, "done_when_registry.json"), "w").write('{"tests": ' + "[" * 200000)
+        try:
+            ft = frozen_tests(d)
+        except BaseException as e:  # noqa: BLE001
+            ft = type(e).__name__
+        ok(ft == {}, f"L_CX2-8 a registry that cannot be decoded gives no frozen test and does not stop the sync ({ft})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

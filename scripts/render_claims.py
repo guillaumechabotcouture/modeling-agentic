@@ -1007,6 +1007,26 @@ def _self_test() -> int:
             got, bad = {}, {"raised": f"{type(e).__name__}: {e}"}
         ok(set(got) == {"a.good"} and set(bad) == {"d.kind"},
            f"RCL_ISOLATE3 a claim with an unhashable kind is one invalid claim ({sorted(got)}, {bad})")
+        # RCL_ISOLATE4-5 (round 2, 10-11): rows without a usable id are named by position, never by a name another
+        # row can take; the strict reader raises what it raised before for a ledger that is not a mapping.
+        with open(lp, "w") as f:
+            yaml.safe_dump({"claims": [None, {"id": "claims[0]"}]}, f)
+        try:
+            _, bad = globals()["load_claims_tolerant"](lp)
+        except Exception as e:  # noqa: BLE001
+            bad = {"raised": f"{type(e).__name__}: {e}"}
+        ok(set(bad) == {"claims[0]", "claims[1]"}, f"RCL_ISOLATE4 each invalid row has its own entry ({sorted(bad)})")
+        with open(lp, "w") as f:
+            f.write("- 1\n")
+        raised = []
+        for fn in (load_claims, globals().get("load_claims_tolerant")):
+            try:
+                fn(lp)
+                raised.append(None)
+            except Exception as e:  # noqa: BLE001
+                raised.append(type(e).__name__)
+        ok(raised == ["AttributeError", "ValueError"],
+           f"RCL_ISOLATE5 load_claims is unchanged for a ledger that is a list; the tolerant reader refuses it ({raised})")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
