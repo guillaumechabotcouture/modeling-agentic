@@ -114,7 +114,7 @@ validate_skill_attachments, docs) are what reviewers need to read.
 | `scripts/pipeline.py` `harness_build` | v1-only callers (`hooks.py`, `run_finish._rebuild_derived`). It goes with `integrity.py`. |
 | `agents/enforcement.py` `check_tool_use` | the v1 agents' permission entry point; its only runtime caller is `hooks.py`. Everything it reaches through `bash_reason` is shared: the owner-command and kill policies (`owner_command_reason`, `kill_reason`) and their helpers, because `scripts/pipeline.py` checks every shell step through `_bash_refusal`, which calls `bash_reason`, which calls them. `lock_harness` and `unlock_harness` are v1 runtime code too (the lead's setup in `main.run` and its finalizer in
 `run_finish`), and so are `diff_harness` and `harness_changed` (the lead's baseline in `main.run` and its finalizer); their other callers are self-tests, which stay with them. The rest of the module is shared: v2 uses `deny_output`, `filtered_env`, `MODEL_*`, `REPO_ROOT` and `HARNESS_FILES`, and `pipeline.py` uses `SCRIPT_OUTPUTS` and `OWNED_BY`. Its tests live in `main.py`'s self-test and stay with it. |
-| `agents/run_preflight.py`, `agents/run_session.py` (`LEAD_TOOLS`) | `main.py --preflight-only` runs this live check of the CLI, models, PATH and framework imports, plus a subagent Write probe. No v2 launcher calls it. It stays until the owner decides whether v2 needs a preflight. |
+| `agents/run_preflight.py`, `agents/run_session.py` | **removed in γ** (owner decision, 2026-11-20). `main.py --preflight-only` ran the v1 lead session's live preflight (CLI, models, PATH, imports, a subagent Write probe); the flag is kept in the parser and refuses with a message (PV10, PV11e). `--skip-preflight` is accepted and unused. v2's own checks (the stage machine's preconditions, the launchers' preflights) are not touched. |
 | `agents/run_budget.py` | shared. v2 uses the ledger, `charge_session`, `RECONCILE_PROMPT` and `writeup_reserve`; its own single, capped read-back is `v2_sdk_tasks` around line 496. `crashed_session_cost` is v1 runtime code (`main.run`), and v2 names it only in a docstring (`v2_sdk_tasks` around line 411, which describes the shared read-back loosely) and a self-test (around line 663), so a cleanup must keep v2's capped read-back. The other v1-only names (`MAX_USD_PER_HOUR`, `TRANSCRIPT_MARGIN`) are small. |
 | `scripts/decision_brief.py`, `scripts/scope_signoff.py`, `scripts/done_when.py`, `scripts/open_problems.py`, `scripts/run_autopsy.py`, `scripts/lessons.py`, `scripts/model_card.py` | used by v2 code (`stage_machine`, `enforcement`), by the shared validator, or by standalone tools (`ask.py`, the lessons ledger) |
 | All 58 skills under `.claude/skills/` | v2 loads `decision-spec`, `tools/run_console` cites `critique-blockers-schema` in its glossary tooltips, and Claude Code sessions in this repository load the rest directly. No skill is deleted. Once γ deletes the attachment matrix, 40 local skills lost their pipeline attachment (the registry's 41st, `decision-spec`, is loaded by v2 by path; 17 were never attached; 3 registry names were external MCP skills). All remain project skills. |
@@ -122,9 +122,68 @@ validate_skill_attachments, docs) are what reviewers need to read.
 | `cloud/run_health.py` stall check on `status.json` | a generic monitor rule. v2 runs write no `status.json`. Whether v2 needs a heartbeat is a separate decision. |
 | `docs/experiments/launchers/*` | archived launchers, kept as records |
 
+## Owner decisions (2026-11-20)
+
+1. `--preflight-only` and the v1 lead-session preflight are removed (in γ).
+2. The kept v1-flavoured code is removed in a follow-up PR after the F6 report. The plan is below; it is not built
+   yet.
+
+## Follow-up plan: integrity, harness_build and the enforcement agent policy (after the F6 report)
+
+**What goes.**
+- `agents/integrity.py`: `ArtifactIntegrity`, `harness_scripts_run`, `SCRIPT_PRODUCES` and its self-test.
+- `scripts/pipeline.py` `harness_build`.
+- In `agents/enforcement.py`: `check_tool_use` and the helpers only it reaches (the write/agent path policy,
+  `_OUTPUT_CARVE_OUTS`, `LEAD_PROTECTED`, `_AGENT_TOOLS`), plus `lock_harness`, `unlock_harness`, `diff_harness` and
+  `harness_changed`. `hash_harness` stays: `scripts/eval_suite.py` uses it.
+
+**What replaces the write grants in `scripts/pipeline.py`.** Nothing at run time. Every v2 caller already calls
+`pipeline.run(run_dir)` without an `integrity` argument (`stage_machine` around lines 1279 and 1514,
+`analysis_backend` around line 1221). The grant branches are therefore dead in v2. They are:
+- `integrity.check_now` / `is_open(STATE)` (drop distrusted state);
+- `integrity.harness_pipeline(grant)` around step runs and `_finish_granted`;
+- `suspect=integrity.is_open` in `_run_one`;
+- `integrity.harness_wrote` in `_finish`.
+
+The follow-up:
+1. Removes the `integrity` parameter from `pipeline.run`, `_run_one`, `_finish` and `_finish_granted`, and from
+   `scripts/derived_rebuild.py` (`_commit`, `_write_sidecar`, `_invalidate`, `rebuild`).
+2. Deletes `harness_build`.
+3. Keeps `pipeline.py`'s own refusals of agent writes. These are `_bash_refusal` through `enforcement.bash_reason`,
+   and the protected-output set built from `SCRIPT_OUTPUTS`, `SIGNED_FILES` and `OWNED_BY` (around line 157).
+   v2 protects its run artifacts by other means:
+   - the bounded tasks' own path checks (`v2_sdk_tasks` PreToolUse hook: `TOOLS`, owned paths);
+   - the signed spec's sha256 binding (`spec_signoff_findings`);
+   - the stage machine owning every transition.
+
+   No v2 code reads an integrity record.
+4. Keeps `scripts/validate_critique_yaml.py` `_check_artifact_integrity`: it reads `artifact_integrity.json` from
+   stored v1 runs and returns nothing when the file is absent, which is the case for every v2 run.
+
+**Which tests are rewritten.**
+- `main.py`:
+  - delete IN1-IN12, IC1-IC9, IR1-IR5 (integrity) and HL1 (lock);
+  - keep T1 (hash and diff, restated on `hash_harness` alone);
+  - rewrite E1-E7 and CS1/XM2-3, which test `check_tool_use`'s path policy: drop the agent-type write cases, and
+    move the shell cases to `bash_reason` (as OC1-OC2 already do);
+  - CR1-CR11, KL1-KL3 and BG1-background exercise `bash_reason` through `check_tool_use`: call `bash_reason`
+    directly.
+- `scripts/pipeline.py`:
+  - delete PO0's integrity import and the PO cases that build an `ArtifactIntegrity` (grants, `harness_build`,
+    distrusted state, `_Probe` around line 2825);
+  - keep the staleness and hashing cases with `integrity=None`;
+  - add one case that `run()` has no `integrity` parameter, so a grant cannot be reintroduced unnoticed.
+- `scripts/derived_rebuild.py`: drop the integrity-crediting cases.
+- `scripts/write_audit.py` and `scripts/import_audit.py`: drop the `agents/integrity.py` entries and recount
+  `pipeline.py`.
+
+**Check before building.** Grep for every `integrity=` call site, the `harness_wrote`, `harness_pipeline`,
+`check_now` and `is_open` attribute uses, and every `enforcement.<name>` this plan removes, across `agents/`,
+`scripts/`, `toolkit/`, `cloud/` and `tools/`. Then do the usual: self-tests, `regression_eval`, `gate_fuzz`, and a
+Codex review. It touches `scripts/`, so the fingerprint changes: schedule it outside any run's reuse window.
+
 ## Open questions for the owner
 
-1. Should integrity, `pipeline.harness_build` and the enforcement agent policy go in one follow-up, with
-   `pipeline.py`'s tests re-specified, or stay as dormant shared code?
-2. Should `--preflight-only` keep the v1 live preflight, become a v2 environment check, or be retired?
+1. (Decided 2026-11-20: one follow-up after the F6 report; plan above.)
+2. (Decided 2026-11-20: retired, in γ.)
 3. When should these PRs merge, given the fingerprint change for runs that reuse engine rows?

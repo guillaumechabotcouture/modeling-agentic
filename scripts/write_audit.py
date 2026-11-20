@@ -274,7 +274,6 @@ _FIX = "self-test fixture code in a helper the skip rule does not name"
 # REVIEWED: write sites that cannot write inside a run dir a run's agents can reach.
 REVIEWED: dict = {
     "agents/analysis_backend.py": {"open-write": (1, "write_toy_units (a fixture)")},
-    "agents/run_preflight.py": {"shutil": (1, "removes the preflight's own temporary work dir")},
     "scripts/assemble_changes.py": {"open-write": (3, _REPO), "os-remove": (1, _REPO)},
     "scripts/cloud_batch.py": {"open-write": (2, "the operator's local batch files")},
     "scripts/compute.py": {

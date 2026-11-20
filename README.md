@@ -155,7 +155,8 @@ python main.py --v2 "Which districts should receive measles follow-up campaigns 
 | `--max-budget-usd X` | — | Hard dollar cap for the whole run, including earlier sessions of a resumed run |
 | `--methods-critic`, `--cross-model` | off | Accepted for existing launch configs (they added critics to the retired v1 STAGE 6) |
 | `--cloud` | off | Pass cloud credentials (`AZ_*`, `AZURE_*`) to agents |
-| `--preflight-only` / `--skip-preflight` | — | Run only the ~1-minute live preflight (CLI, models, PATH, imports) and exit; `--skip-preflight` is accepted and unused |
+| `--preflight-only` | — | Refused: it ran the v1 lead session's live preflight, retired with v1 |
+| `--skip-preflight` | — | Accepted for existing launch commands; v2 runs no preflight before a run |
 | `--self-test` | — | Run inline self-tests (no API calls) and exit |
 
 Exit codes: 0 accepted (`completed`, `completed_with_report_restored`); 2 finished without an accepted gate, or paused for the owner (resumable); 1 `harness_tampered`, `artifact_tampered` or error; 130 interrupted. The full status list is in `CLAUDE.md` ("Run outcomes").
@@ -239,7 +240,7 @@ runs/<timestamp>_<question-slug>/      (gitignored; local only)
 modeling-agentic/
 ├── main.py                    CLI entry point: v2 dispatch; refuses --v1 (retired)
 ├── agents/
-│   ├── run_budget.py, run_finish.py, run_preflight.py   Spend ledger, gate command and run upload, live preflight
+│   ├── run_budget.py, run_finish.py   Spend ledger; gate command, exit codes and run upload
 │   ├── enforcement.py         PreToolUse path/agent denies, harness hashing, env filtering
 │   ├── integrity.py           Hash record of protected run artifacts
 │   └── stage_machine.py, findings_ledger.py, fix_loop.py, analysis_backend.py,

@@ -117,7 +117,7 @@ prompt (`agents/v2_sdk_tasks.py` `PRINCIPLES_FILE`, and the fix planner's prompt
 
 | Goal                                  | Read first                                                    |
 |---------------------------------------|---------------------------------------------------------------|
-| Understand the CLI                    | `main.py` (`main()`, `main_v2`); run finishing, budget and preflight in `agents/run_finish.py`, `run_budget.py`, `run_preflight.py` |
+| Understand the CLI                    | `main.py` (`main()`, `main_v2`); run finishing and budget in `agents/run_finish.py`, `run_budget.py` |
 | Understand what agents may touch      | `agents/enforcement.py` (PreToolUse denies, harness hashing, env filtering) and `agents/integrity.py` (hash record of protected run artifacts) |
 | Add or modify a rigor gate            | `scripts/validate_critique_yaml.py` (`_check_*` fns) and any standalone validator under `scripts/`; shared loaders in `scripts/lib/` |
 | Add a new skill                       | Create `.claude/skills/<name>/SKILL.md` with `name`/`description` frontmatter (a v2 task loads it by its SKILL.md path), run `python3 scripts/validate_skill_attachments.py` |

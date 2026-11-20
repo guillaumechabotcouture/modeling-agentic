@@ -29,14 +29,11 @@ from agents.run_budget import (  # noqa: E402,F401  re-exported: the self-test's
     write_budget_ledger,
     remaining_budget,
 )
-from agents.run_preflight import (  # noqa: E402,F401  --preflight-only and its PF/WD6 cases
-    evaluate_preflight,
-    run_preflight,
-    _probe_subagent_write,
-)
 from agents.run_finish import exit_code_for, store_run_results  # noqa: E402
 
 REPO_ROOT = enforcement.REPO_ROOT
+PREFLIGHT_RETIRED = ("--preflight-only ran the v1 lead session's live preflight, retired with pipeline v1 "
+                     "(owner, 2026-11-20); v2 runs its own checks")
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts", "lib"))
 import pipeline_id  # noqa: E402  which pipeline runs (v2 by default) and the identity every run records
 
@@ -96,7 +93,7 @@ def _self_test_pipeline(ok, _outcome) -> None:
     calls: list = []
     # PV7d: the lead session's entry point is gone with v1 (checked before any stub is installed).
     ok("run" not in g, "PV7d main.py has no lead-session entry point (main.run)")
-    saved = {k: g.get(k) for k in ("main_v2", "create_run_dir", "store_run_results", "run_preflight")}
+    saved = {k: g.get(k) for k in ("main_v2", "create_run_dir", "store_run_results")}
     saved_argv = sys.argv
 
     def fake_v2(args, ident=None):
@@ -111,12 +108,8 @@ def _self_test_pipeline(ok, _outcome) -> None:
         except SystemExit as e:
             return ("exit", e.code)
 
-    async def no_preflight(*a, **kw):   # never a live preflight from a self-test
-        calls.append(("preflight", None))
-        return {"ok": False, "problems": ["self-test"], "sdk_version": "-"}
-
     try:
-        g["main_v2"], g["run_preflight"] = fake_v2, no_preflight
+        g["main_v2"] = fake_v2
         rc = drive("--signoff", "lead", "--max-budget-usd", "35", "Q?")   # the eval config's flags that day
         ok(rc == 0 and [c[0] for c in calls] == ["v2"], f"PV1 no pipeline flag runs v2 ({rc}, {calls})")
         ok(calls and calls[0][1] and calls[0][1].get("pipeline") == "v2"
@@ -194,11 +187,17 @@ def _self_test_pipeline(ok, _outcome) -> None:
             ok(rc == 0 and m.get("pipeline") == "v2" and m.get("launcher") == "vm_job:n/j" and m.get("commit")
                and m.get("run_dir") == "runs_v2" and m.get("invocations"),
                f"PV8 a v2 run's metadata.json records pipeline, commit and launcher ({rc}, {m})")
-        # PV10 (Codex r1 P1): --preflight-only runs the preflight and nothing else, whatever the pipeline.
-        rc = drive("--preflight-only")
-        ok(rc == 3 and [c[0] for c in calls] == ["preflight"], f"PV10 --preflight-only never dispatches a run ({rc}, {calls})")
-        rc = drive("--preflight-only", "Q?")
-        ok(rc == 3 and [c[0] for c in calls] == ["preflight"], f"PV10b ... not even with a question ({rc}, {calls})")
+        # PV10 (owner, 2026-11-20): --preflight-only ran the v1 lead session's live preflight, retired with v1. It is
+        # refused with one message before anything runs; v2's own checks are not involved.
+        for argv in (("--preflight-only",), ("--preflight-only", "Q?"), ("--preflight-only", "--cross-model")):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = drive(*argv)
+            ok(rc == 2 and not calls and PREFLIGHT_RETIRED in err.getvalue(),
+               f"PV10 {argv} is refused with the retirement message, nothing runs ({rc}, {calls}, {err.getvalue()[-120:]!r})")
+        import importlib.util as _ilu
+        ok(_ilu.find_spec("agents.run_preflight") is None and _ilu.find_spec("agents.run_session") is None,
+           "PV10c the v1 lead-session preflight modules are gone (agents/run_preflight.py, agents/run_session.py)")
         # PV11 (Codex r1 P1): a run whose metadata.json lost its pipeline is judged by its files (run_state.json
         # is v2's), and a malformed value is refused: a v2 run is never resumed with --v1.
         with tempfile.TemporaryDirectory() as td:
@@ -231,11 +230,10 @@ def _self_test_pipeline(ok, _outcome) -> None:
             ok(rc == 0 and got_run == [("Q?", rp)],
                f"PV11d ... and the real main_v2 resumes it with an explicit --v2: its directory and saved question "
                f"({rc}, {got_run})")
-            # PV11e (Codex round 2): --preflight-only with --resume of an unrecorded v2 run still runs the preflight.
+            # PV11e: --preflight-only with --resume is refused like any --preflight-only, and resumes nothing.
             json.dump({"question": "Q?"}, open(os.path.join(rp, "metadata.json"), "w"))   # unrecorded again
             rc = drive("--preflight-only", "--resume", rp)
-            ok(rc == 3 and [c[0] for c in calls] == ["preflight"],
-               f"PV11e --preflight-only --resume runs the preflight, as before ({rc}, {calls})")
+            ok(rc == 2 and not calls, f"PV11e --preflight-only --resume is refused, nothing resumes ({rc}, {calls})")
             json.dump({"question": "Q?", "pipeline": "V2!"}, open(os.path.join(rp, "metadata.json"), "w"))
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
@@ -1047,73 +1045,6 @@ def _run_self_test() -> int:
     shutil.rmtree(_cr, ignore_errors=True)
     _self_test_pipeline(ok, _outcome)
 
-    # WD6 (Codex, PR #21): the write probe passes only on a SUCCESSFUL Write
-    # issued inside the subagent, never on a refused one plus a lead Write.
-    from claude_agent_sdk import ToolUseBlock as _TU, ToolResultBlock as _TR
-
-    def _fake_query(child_error, lead_writes):
-        async def q(prompt, options):
-            # (γ Codex review) the probe session gets the tools a subagent Write needs, as tools and as allowed_tools
-            for _lst in (getattr(options, "tools", None), getattr(options, "allowed_tools", None)):
-                if not (isinstance(_lst, list) and {"Agent", "Write"} <= set(_lst)):
-                    raise AssertionError(f"WD6 the probe's tool lists lack Agent or Write: {_lst}")
-            path = re.search(r"file path: (\S+?)\. ", prompt).group(1)
-            yield AssistantMessage(content=[_TU("w1", "Write", {"file_path": path, "content": "PREFLIGHT_WRITE"})],
-                                   model="m", parent_tool_use_id="a1")
-            if not child_error:
-                open(path, "w").write("PREFLIGHT_WRITE")
-            yield UserMessage(content=[_TR("w1", "refused" if child_error else "ok", is_error=child_error)],
-                              parent_tool_use_id="a1")
-            if lead_writes:
-                yield AssistantMessage(content=[_TU("w2", "Write", {"file_path": path, "content": "PREFLIGHT_WRITE"})],
-                                       model="m")
-                open(path, "w").write("PREFLIGHT_WRITE")
-                yield UserMessage(content=[_TR("w2", "ok", is_error=False)])
-            yield ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-                                num_turns=1, session_id="s", total_cost_usd=0.0)
-        return q
-    from agents import run_preflight as _preflight_mod   # Phase 48 γ: the probe's module
-    _real_query = _preflight_mod.query
-    try:
-        _preflight_mod.query = _fake_query(child_error=True, lead_writes=True)
-        _w, _log, _ = asyncio.run(_probe_subagent_write(False))
-        ok(not _w, "WD6 a refused subagent Write followed by the lead's Write must fail the probe")
-        _preflight_mod.query = _fake_query(child_error=False, lead_writes=False)
-        _w, _log, _ = asyncio.run(_probe_subagent_write(False))
-        ok(_w, f"WD6 a successful subagent Write must pass the probe: {_log[-200:]}")
-    finally:
-        _preflight_mod.query = _real_query
-
-
-    # OC1-OC2 (γ Codex review): the owner-command restriction is shared: scripts/pipeline.py checks every declared
-    # shell step through enforcement.bash_reason (its SO11-SO13 cases went with the v1 hooks they drove).
-    _oc_run = "runs/x"
-    for _cmd in ("python3 agents/stage_machine.py sign runs/x --by owner",
-                 "python3 toolkit/spec/geometry.py approve runs/x --by owner",
-                 "python3 scripts/decision_brief.py sign runs/x --by lead"):
-        ok(bool(enforcement.bash_reason(_cmd, _oc_run, "modeler")), f"OC1 an owner command is refused: {_cmd}")
-    for _cmd in ("python3 toolkit/spec/geometry.py check runs/x", "python3 toolkit/spec/signoff.py sheet runs/x --write"):
-        ok(enforcement.bash_reason(_cmd, _oc_run, "modeler") is None, f"OC2 an ordinary spec command passes: {_cmd}")
-
-    # PF1 (Phase 21 α): preflight evaluation.
-    exe = sys.executable
-    good = f"PREFLIGHT_OK {exe}\nPREFLIGHT_OK {exe}"
-    ok(evaluate_preflight(good, {enforcement.MODEL_DEEP: {}}, False) == [],
-       "PF1 good preflight flagged")
-    ok(any("4.x" in p or "unexpected models" in p for p in
-           evaluate_preflight(good, {"claude-opus-4-6": {}}, False)),
-       "PF1 old model not flagged")
-    ok(evaluate_preflight(f"PREFLIGHT_OK {exe}", {enforcement.MODEL_DEEP: {}}, False),
-       "PF1 missing subagent probe not flagged")
-    ok(evaluate_preflight("PREFLIGHT_OK /usr/bin/python3\nPREFLIGHT_OK /usr/bin/python3",
-                          {enforcement.MODEL_DEEP: {}}, False),
-       "PF1 system python not flagged")
-    ok(evaluate_preflight(good, {}, False), "PF1 empty model_usage not flagged")
-    ok(evaluate_preflight(good + "\nPREFLIGHT_OK line.", {enforcement.MODEL_DEEP: {}}, False) == [],
-       "PF1 prose 'PREFLIGHT_OK line' wrongly counted as an interpreter")
-    ok(evaluate_preflight(good, {enforcement.MODEL_DEEP: {}, "claude-haiku-5-5": {}}, False) == [],
-       "PF1 CLI-internal haiku wrongly flagged")
-
     if failures:
         print("SELF-TEST FAILURES:", file=sys.stderr)
         for f_ in failures:
@@ -1244,7 +1175,7 @@ def main() -> int:
                              "can run on Azure Batch. Off by default (Phase 21 α).")
     parser.add_argument("--cross-model", action="store_true",
                         help="Accepted for existing launch configs; unused by v2 (it added a cross-model critic to v1's "
-                             "STAGE 6). With --preflight-only, the preflight also checks the Codex login.")
+                             "STAGE 6).")
     parser.add_argument("--max-budget-usd", type=float, default=None,
                         help="Hard dollar cap for the whole run (all sessions, including "
                              "earlier invocations of a resumed run). Stops with status "
@@ -1259,8 +1190,7 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true",
                         help="Run inline self-tests (no API calls) and exit")
     parser.add_argument("--preflight-only", action="store_true",
-                        help="Run the ~1-minute live preflight (real CLI, models, "
-                             "PATH, framework imports) and exit")
+                        help="Refused: it ran the v1 lead session's live preflight, retired with v1 (owner, 2026-11-20).")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Accepted for existing launch commands; v2 runs no preflight before a run")
     parser.add_argument("--v1", action="store_true",
@@ -1283,6 +1213,9 @@ def main() -> int:
     except pipeline_id.PipelineError as e:    # --v1: pipeline v1 is retired (owner, 2026-11-20)
         print(f"REFUSED: {e}", file=sys.stderr)
         return 2
+    if args.preflight_only:      # the v1 lead session's preflight, retired with it (owner, 2026-11-20)
+        print(f"REFUSED: {PREFLIGHT_RETIRED}", file=sys.stderr)
+        return 2
     # Phase 50 α: an eval-suite question runs only on a cloud worker (its work directory is
     # the launch archive: no evals/, no .git), so agents cannot reach answer keys by any
     # route. Checked on the question the run will actually use, including --resume, and
@@ -1298,8 +1231,6 @@ def main() -> int:
     if why:
         print(f"REFUSED: {why}", file=sys.stderr)
         return 1
-    if args.preflight_only:      # the preflight and nothing else, whatever the pipeline (Codex r1)
-        return _preflight_and_report(args)
     ident = pipeline_id.identity(pipeline, REPO_ROOT, args.launcher)
     print(f"Pipeline: {ident['pipeline']} | commit {ident['commit']} | launcher {ident['launcher']}", flush=True)
     if args.resume:   # a run continues under the pipeline it was recorded with
@@ -1312,26 +1243,6 @@ def main() -> int:
         return main_v2(args, ident)
     except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
         return 130
-
-
-def _preflight_and_report(args) -> int:
-    """The live preflight (v1's lead session): 0 when it passed, 3 otherwise."""
-    pf = asyncio.run(run_preflight(allow_cloud=args.cloud))
-    print(f"Preflight: {'OK' if pf['ok'] else 'FAILED'} | models="
-          f"{sorted((pf.get('model_usage') or {}).keys())} | sdk={pf['sdk_version']}"
-          f" | cost=${pf.get('cost_usd') or 0:.3f}", flush=True)
-    for p in pf["problems"]:
-        print(f"  PREFLIGHT PROBLEM: {p}", flush=True)
-    if pf.get("write_probe"):
-        print("  write probe log (last lines):\n    " + pf["write_probe"].replace("\n", "\n    "), flush=True)
-    if args.cross_model:
-        cm = subprocess.run(["codex", "login", "status"], capture_output=True, text=True,
-                            env={**os.environ, **enforcement.filtered_env(dict(os.environ), args.cloud)})
-        cm_ok = cm.returncode == 0 and "logged in" in (cm.stdout + cm.stderr).lower()
-        print(f"  cross-model: codex {'OK' if cm_ok else 'NOT AVAILABLE'}"
-              f" ({(cm.stdout + cm.stderr).strip()[:80]})", flush=True)
-        pf["ok"] = pf["ok"] and cm_ok
-    return 0 if pf["ok"] else 3
 
 
 if __name__ == "__main__":
