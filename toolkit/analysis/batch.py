@@ -969,6 +969,47 @@ def _self_test() -> int:
                f"BA-NP4 a decision test outside the hull widens that column's box to the union ({fr2['eff_a'][:2]}); "
                f"the draw ranges stay the hull")
     case("BA-NP", bnp)
+
+    def bxu():
+        """1C-b 2b (M_UNIT_HULL): with fewer design points than units, a unit whose emulator feature lies outside the
+        design points' range used to stop the analysis as an extrapolation. The design now includes those units; a
+        design that already covers every feature's range is unchanged (so its stored batch is reused)."""
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = schema.toy_spec(d, n=40)
+            raw = yaml.safe_load(open(p))
+            raw["analysis"]["emulator"]["points"] = 8
+
+            def build(features, cov):
+                lines = open(os.path.join(d, "units.csv")).read().splitlines()
+                at = lines[0].split(",").index("cov")
+                rows = [ln.split(",") for ln in lines[1:]]
+                for r in rows:
+                    r[at] = str(cov.get(r[0], 0.0))
+                open(os.path.join(d, "units.csv"), "w").write("\n".join([lines[0]] + [",".join(r) for r in rows]) + "\n")
+                raw["analysis"]["emulator"]["features"] = features
+                yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+                return design(schema.load(p))
+            d0, j0 = build([], {})
+            used = [str(pt["unit_id"]) for pt in d0["points"]]
+            out = [str(i) for i in range(40) if str(i) not in used][:2]
+            cov = {out[0]: -9.0, out[1]: 9.0}
+            d1, j1 = build(["cov"], cov)
+            u1 = [str(pt["unit_id"]) for pt in d1["points"]]
+            moved = [k for k, (a, b) in enumerate(zip(used, u1)) if a != b]
+            ok(set(out) <= set(u1) and len(moved) == 2 and not any(d1["points"][k]["holdout"] for k in moved)
+               and all({**a, "unit_id": 0} == {**b, "unit_id": 0} for a, b in zip(d0["points"], d1["points"])),
+               f"BA-XU1 the units at a feature's minimum and maximum are design points ({out} in {u1}); only "
+               f"{len(moved)} points change unit, none of them held out, and no z, parameter or seed moves")
+            same = sum(job_sha(a) == job_sha(b) for a, b in zip(j0, j1))
+            ok(same >= len(j0) - 2 * len(d0["packages"]),
+               f"BA-XU2 every job of an unchanged design point keeps its hash ({same} of {len(j0)})")
+            d2, j2 = build(["cov"], {used[0]: -9.0, used[-1]: 9.0})
+            ok([pt["unit_id"] for pt in d2["points"]] == [pt["unit_id"] for pt in d0["points"]]
+               and [job_sha(j) for j in j2] == [job_sha(j) for j in j0],
+               "BA-XU3 a design whose points already span every feature's range is unchanged: features alone still "
+               "move no design point and no job hash")
+    case("BA-XU", bxu)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1

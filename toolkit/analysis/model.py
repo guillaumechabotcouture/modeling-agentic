@@ -635,6 +635,30 @@ def _self_test_emulator(ok):
         ok(all(y5[i]["cost"][M.comp]["doses"] == 0.0 for i in ids) and M.error_floors == {"doses": {M.comp: 4}}
            and not [e for e in M.last_events if e["kind"] == "cost_output_floor"],
            f"EM6 a drawn cost error below zero is floored and counted, not a model correction: {M.error_floors}")
+        # 1C-b 2a: the reduction clip is checked on the emulator mean; a drawn error past the bounds is clipped and
+        # counted (error_clips), as the cost floor is, and is not a model correction
+        P0 = next(iter(M.pops))
+        R8 = np.zeros((6, len(M.error.cols)))
+        R8[:, M.error.col[(P0, "dalys", pk)]] = 3.0
+        M.error, M.error_floors, M.error_clips = EmulatorError(M.error.cols, R8), {}, {}
+        M.predict(zs, th, ids)
+        clean = not [e for e in M.last_events if e["kind"] == "reduction_clip"]
+        y8 = M.predict(zs, th, ids, noise=np.random.default_rng(1))
+        ok(clean and not [e for e in M.last_events if e["kind"] == "reduction_clip"]
+           and M.error_clips == {"dalys": {pk: 4}} and all(y8[i]["y"][pk]["dalys"] == 0.0 for i in ids),
+           f"EM8 (M_NOISE_CLIP) a drawn error that pushes a reduction past its bounds is clipped and counted, not a "
+           f"model correction: {M.error_clips}, {len(M.last_events)} events")
+
+        class _Mean:        # an emulator mean outside the bounds: still a model correction, with or without noise
+            def predict(self, X):
+                return np.full(len(X), 2.0)
+        g0 = M.gps[("red", P0, "dalys", pk)]
+        M.gps[("red", P0, "dalys", pk)], M.error_clips = _Mean(), {}
+        M.predict(zs, th, ids, noise=np.random.default_rng(1))
+        ev9 = [e for e in M.last_events if e["kind"] == "reduction_clip"]
+        ok(len(ev9) == 4 and all(e["value"] == 2.0 for e in ev9) and M.error_clips == {},
+           f"EM9 an emulator mean outside the bounds stays a model correction, at the mean's value: {ev9[:1]}")
+        M.gps[("red", P0, "dalys", pk)] = g0
         # Codex r1 P1-1: a population group named like a quantity, with a cost output named like an outcome
         r["decision_units"]["populations"] = {"cost": r["decision_units"]["populations"]["all"]}
         r["options"]["populations"] = {"total": "pop"}
@@ -745,6 +769,20 @@ def _self_test() -> int:
         yg = a["u1"]["y_group"]["none"]["infections"]
         ok(n_batched == 4 and abs(sum(yg.values()) - a["u1"]["y"]["none"]["infections"]) < 1e-6,
            "MD2 the per-group outcomes sum to the unit total (one row per engine group)")
+        # 1C-b 2d-ii: a declared diagnostic the engine does not report fails closed (was NaN in the point artifact)
+        m.diagnostics = {"dx": {"window": "no_such_window", "metric": "prev"}}
+        try:
+            got = m.predict(zs, th, ["u1"])["u1"]["diag"]
+            ok(False, f"MD2b a diagnostic the engine does not report is refused, not written as NaN: {got}")
+        except ValueError as e:
+            ok("no_such_window" in str(e), f"MD2b a diagnostic the engine does not report is refused ({e})")
+        m.diagnostics = {}
+    # 1C-b 2d-i: a non-finite engine outcome is refused where it is aggregated (was passed through as NaN)
+    try:
+        v = _group({"meta": {"age_shares": {"a": 1.0}}, "per_capita": {"o": {"a": math.nan}}}, "o", {"age_groups": ["a"]})
+        ok(False, f"MD2c a non-finite per-capita outcome is refused, not aggregated: {v}")
+    except ValueError as e:
+        ok("not finite" in str(e), f"MD2c a non-finite per-capita outcome is refused ({e})")
     # MD3 (Codex r1 P1-8): per-group counts use the aggregate's weighting when population bands differ from the
     # engine's own shares
     res = {"meta": {"age_shares": {"a": 0.5, "b": 0.3, "c": 0.2}}, "per_capita": {"o": {"a": 0.1, "b": 0.2, "c": 0.4}}}
