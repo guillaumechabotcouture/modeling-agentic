@@ -5181,6 +5181,24 @@ def _self_test_liveness(ok) -> None:
             collect(cfg, accept_partial=True)
         except TypeError as e:
             downs.append(str(e))
+    # LV9c, LV9d (Codex round 2): a partial copy is this launch's or an earlier one's by its own record; and
+    # --accept-partial finishes a partial copy even when the VM is gone
+    tmp2 = tempfile.mkdtemp()
+    pd = os.path.join(tmp2, "P")
+    os.makedirs(pd)
+    json.dump({"launch_id": "L0"}, open(os.path.join(pd, "result.partial.json"), "w"))
+    ok(local_is_current(pd, "L1") is False and local_is_current(pd, "L0") is None,
+       "LV9c a partial copy of an earlier launch is set aside before a new collect; this launch's is fetched again")
+    cfg2 = RunConfig(name="lv2", question_file="q", labels=("P",), out_dir=tmp2, tree=os.path.dirname(HERE))
+    json.dump({"P": {"launch_id": "L0", "worker": "w"}}, open(cfg2.state_file, "w"))
+    with mock.patch.dict(sys.modules, {"results_store": rs}), \
+            mock.patch.dict(globals(), {"is_running": lambda n, lister=None: False, "attach": no_attach,
+                                        "collect_from_storage": lambda *a, **k: (_ for _ in ()).throw(KeyError("x")),
+                                        "checkpoint_record": lambda *a, **k: None}), \
+            contextlib.redirect_stdout(io.StringIO()):
+        collect(cfg2, accept_partial=True)
+    ok(os.path.exists(os.path.join(pd, "result.json")) and not os.path.exists(os.path.join(pd, "result.partial.json")),
+       "LV9d `collect --accept-partial` after the cluster stopped finishes this launch's partial copy")
     ok(marks == ["B", "A"] and downs == ["lv"] and os.path.exists(os.path.join(tmp, "A", "result.json")),
        f"LV9b `collect --accept-partial` (the files were copied by hand, or are given up) finishes the label: "
        f"{marks} {downs}")

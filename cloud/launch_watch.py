@@ -1063,6 +1063,12 @@ def _self_test() -> int:
          lambda: (lambda st: st["runs"]["A"]["state"] == "preparing" and decide(st) == "watch"
                   and missing_action(st, {"A": 0.0}, set(), 9999.0, 300) is None)(
              parse_status(status_text(c, {"A": "preparing", "B": "running"}), ("A", "B"))))
+    case("LW7f", "missing_action: a poll that could not read the label (unknown) keeps its missing timer (Codex "
+         "round 2 of 1E-ii)",
+         lambda: (lambda ms: missing_action(parse_status(status_text(c, {"A": "unknown"}), ("A",)), ms, set(), 200.0,
+                                            300) is None and ms == {"A": 0.0}
+                  and missing_action(parse_status(status_text(c, {"A": "missing"}), ("A",)), ms, set(), 301.0, 300)
+                  == ("relaunch", "A"))({"A": 0.0}))
     case("LW7d", "LW_KEEPER_STOPPED parse_status reads the keeper's state",
          lambda: parse_status(status_text(c, {"A": "running"}), ("A",))["keeper"] == "running"
          and parse_status(status_text(c, {"A": "running"}).replace("keeper: running", "keeper: stopped"),
