@@ -307,19 +307,13 @@ REVIEWED: dict = {
         "open-write": (3, "the scratch copy's manifest (its own file after the link is removed); the derivation's "
                           "column-stripped input and mount points in its temporary work dirs")},
     "scripts/plant_defects.py": {"open-write": (3, _EVAL), "shutil": (4, _EVAL)},
-    "scripts/regression_eval.py": {"open-write": (2, _EVAL), "shutil": (1, _EVAL)},
-    "scripts/replay.py": {"shutil": (2, _EVAL), "os-link": (1, _EVAL), "open-write": (6, _EVAL), "os-remove": (1, _EVAL)},
-    "scripts/replay_coiled.py": {"open-write": (18, _EVAL), "shutil": (3, _EVAL), "os-remove": (4, _EVAL)},
-    "scripts/replay_compare.py": {"open-write": (1, _EVAL)},
+    "scripts/regression_eval.py": {"open-write": (4, _EVAL), "shutil": (1, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/results_store.py": {"open-write": (1, "download() writes where the operator names"),
                                  "tempfile-dir": (1, "write_archive's anonymous TemporaryFile beside the archive it "
                                                      "writes (the checkpoint staging dir on the agent VM, outside any run "
                                                      "dir), deleted on close")},
     "scripts/resume_smoke.py": {"open-write": (3, "the smoke's own temporary work dir (toy runs it creates) and the "
                                                    "--json report the operator names")},
-    "scripts/score_critiques.py": {"open-write": (3, _EVAL)},
-    "scripts/sdk_scenarios.py": {"open-write": (15, _EVAL)},
-    "scripts/telemetry.py": {"open-write": (1, "the operator's --out CSV")},
     "scripts/lib/positive_control.py": {"open-write": (2, "builds the positive-control fixture run in a dir it creates")},
     "scripts/validate_critique_yaml.py": {"os-remove": (1, "its own NamedTemporaryFile in the system temp dir")},
     "toolkit/analysis/figures.py": {"method-write": (2, "savefig / Image.save into an in-memory buffer "
@@ -353,7 +347,6 @@ OPEN_ITEMS: dict = {
                                                               "found when <image>.save became a site)")},
     "agents/integrity.py": {"open-write": (1, _V1)},
     "agents/observability.py": {"open-write": (5, _V1), "os-rename": (1, _V1), "os-remove": (3, _V1)},
-    "agents/output_caps.py": {"open-write": (1, _V1)},
     "agents/run_finish.py": {"open-write": (13, _V1), "shutil": (2, _V1), "os-remove": (1, _V1)},
     "scripts/ask.py": {"open-write": (1, _V1)},
     "scripts/benchmark_match.py": {"open-write": (1, _V1)},

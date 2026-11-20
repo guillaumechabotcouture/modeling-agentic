@@ -31,7 +31,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCOPE_DIRS = ("scripts/", "toolkit/", "cloud/", "tools/")   # tools/: outside compute.code_fingerprint
 AGENT_MODULES = (
     "agents/stage_machine.py", "agents/findings_ledger.py", "agents/fix_loop.py",
-    "agents/analysis_backend.py", "agents/v2_sdk_tasks.py", "agents/output_caps.py", "agents/world_model_stage.py",
+    "agents/analysis_backend.py", "agents/v2_sdk_tasks.py", "agents/world_model_stage.py",
 )
 # agents/integrity.py imports the agents package, so main.py's self-test runs its cases (IN12).
 # Files (or directory prefixes ending in "/") in scope that have no --self-test, and why.
@@ -39,8 +39,6 @@ EXEMPT = {
     "cloud/configs/": "launch configs (settings, no logic), read by cloud/run_cluster.py",
     "cloud/worker_side.py": "runs on the cloud workers; exercised by the cloud/run_cluster.py, "
                             "cloud/vm_job.py and scripts/compute.py self-tests",
-    "scripts/replay_coiled.py": "live Coiled backend for scripts/replay.py; its scheduler reads are "
-                                "tested by scripts/replay.py --self-test (SQ cases)",
     "toolkit/analysis/artifacts.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/analysis/claims.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
     "toolkit/analysis/core.py": "analysis-engine library; exercised by toolkit/analysis/run.py --self-test",
