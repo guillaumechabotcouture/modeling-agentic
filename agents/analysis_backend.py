@@ -1319,6 +1319,27 @@ def _self_test_engine_choice(ok) -> None:
        and engine_choice_record("a.b:C", "kept after a rethink", one).get("pick") == {"eligible": 1, "task": "ran"},
        f"B_SINGLE_NO_LLM2 engine_choice.json records how many engines were eligible and whether the pick task ran "
        f"({rec1.get('pick')}, {rec2.get('pick')})")
+    # Codex round 1: an empty signed configuration is still the signed one; an empty engine list is no engine; the
+    # draft check refuses a signed configuration over a limit before the schema builds the engine
+    r = eligible_engines({"engine": {"ref": TOY, "config": {}}}, [(TOY, None, lambda spec: {"results_path": "derived.yaml"})])[0]
+    ok(r.get("config") == {} and named_engine({"engine": {"ref": TOY}})[1] is None,
+       f"B_EXPLICIT_EMPTY `config: {{}}` in the signed spec is used as written; an omitted one is not ({r.get('config')})")
+    ok(candidate_entries({"engine": "auto"}, []) == [] and eligible_engines({"engine": "auto"}, []) == [],
+       "B_NAMED_ONLY7 an empty engine list is considered as given: no candidate")
+    from types import SimpleNamespace as _NS
+    from toolkit.spec import schema as _schema
+    built, real_validate = [], _schema.validate
+    with tempfile.TemporaryDirectory() as d:
+        write_toy_units(os.path.join(d, "units.csv"))
+        yaml.safe_dump(dict(toy_spec("units.csv"), engine={"ref": EMP, "config": big}), open(os.path.join(d, SPEC_FILE), "w"))
+        _schema.validate = lambda *a, **k: built.append(1) or []
+        try:
+            probs = _ToolkitApi(_NS(headline=None, gate_findings=None)).pre_sign_problems(d)
+        finally:
+            _schema.validate = real_validate
+    ok(not built and any("at most" in p for p in probs),
+       f"B_PRESIGN_LIMIT the draft check refuses a signed configuration over the component limit before the schema "
+       f"builds the engine (validate called: {bool(built)}; {probs[:1]})")
     # B_SPEC_FORMS: what the draft prompt says of `auto` and `{ref, config}` holds for every registered engine
     forms = getattr(me, "spec_forms", lambda: {})()
     ok(set(forms) == set(every) and all(f.get("named") for f in forms.values())
