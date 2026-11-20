@@ -2747,8 +2747,36 @@ def _self_test_isolation(ok, base):
     R = RunData(d)
     R._cache[os.path.join("analysis", "calibration.yaml")] = {"data": {"method": "likelihood", "diagnostics": {
         "fit": [{"unit": i, "observed": 3.0, "expected": 2.5, "variance": None} for i in R.ids]}}}
-    e_v, _ = drawn(R)
-    ok(e_v is None, f"FG_VARIANCE_NONE a fit row whose variance is recorded as null uses its expected value ({e_v})")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got_v, e_v = attempt(lambda: fig_calibration(R, t))
+    res_v = sorted({round(float(x), 6) for c in got_v[0].axes[1].collections for x in c.get_offsets()[:, 0]}) \
+        if got_v else None
+    plt.close("all")
+    ok(e_v is None and res_v == [round(-0.5 / math.sqrt(2.5), 6)],
+       f"FG_VARIANCE_NONE a fit row whose variance is recorded as null uses its expected value: every Pearson "
+       f"residual is (2.5 - 3) / sqrt(2.5) ({e_v}, {res_v})")
+    # Codex r1: a low proportion keeps its own axis (the floor is for a zero range only)
+    lo_p, e_p = attempt(lambda: (_prop_max([0.0001, 0.00005]), _prop_max([0.0, 0.0]), _prop_max([0.5]),
+                                 _prop_max([0.99])))
+    ok(e_p is None and abs(lo_p[0] - 0.000106) < 1e-12 and lo_p[1] > 0 and abs(lo_p[2] - 0.53) < 1e-12
+       and lo_p[3] == 1.0, f"FG_PROP_AXIS a proportion axis ends 6% above its largest value, at 1 at most, and "
+                           f"above 0 when every value is 0 ({e_p}, {lo_p})")
+    # Codex r1: a declared boundary input the loader cannot read at all (any error, not only its own refusals)
+    # still stops the render
+    R = RunData(d)
+    R.pres = dict(R.pres, boundaries={"path": "planted.geojson"})
+
+    def bad_loader(*a, **k):
+        raise AttributeError("planted")
+    g["load_boundaries"], orig_lb = bad_loader, g["load_boundaries"]
+    try:
+        _, e_g = attempt(lambda: R.geo)
+    finally:
+        g["load_boundaries"] = orig_lb
+    ok(str(e_g).startswith("PresentationRefused"),
+       f"FG_BOUNDARY_ANY_ERROR a boundary input that fails to load with any error is a refused presentation input, "
+       f"never one figure's failure ({e_g})")
     R = RunData(d)
     fd = R.art("figure_data")
     R.override["figure_data"] = dict(fd, dollars=dict(fd["dollars"], envelope_usd=0.0))

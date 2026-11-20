@@ -569,6 +569,10 @@ def _self_test() -> int:
             return orig(fig, fmt, **kw)
         AF._fig_bytes = flaky
         plt.close("all")
+        from lib.safe_io import write_nofollow
+        os.makedirs(os.path.join(d, "f6"))
+        for nm in NAMES:        # Codex r1: files of the same name that this renderer never writes are left alone
+            write_nofollow(d, os.path.join("f6", nm + ".svg"), b"<svg/>", atomic=True)
         try:
             res6, err6 = render(fd, os.path.join(d, "f6"), d), None
         except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
@@ -576,6 +580,8 @@ def _self_test() -> int:
         finally:
             AF._fig_bytes = orig
         bad6 = [x for x in res6["not_produced"] if x.get("render_failed")]
+        kept = [nm for nm in NAMES if os.path.exists(os.path.join(d, "f6", nm + ".svg"))]
+        ok(kept == list(NAMES), f"CF7 a failed figure removes only what this renderer writes (PNG, CSV): {kept}")
         ok(err6 is None and len(bad6) == 1 and "OSError" in bad6[0]["reason"]
            and len(res6["figures"]) == len(NAMES) - 1 and plt.get_fignums() == [],
            f"CF6 a figure that fails while it is rendered is not produced, with the error; the others are written and "

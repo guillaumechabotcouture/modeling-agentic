@@ -766,6 +766,12 @@ def _self_test() -> int:
         ok(got == [("figure_render_failed", "f_a", "MEDIUM", True)],
            f"K9b a figure that failed to render is one MEDIUM finding figure_render_failed:<figure>; a figure "
            f"without its inputs is none ({got})")
+        for bad in ({}, False, "x", [1]):       # Codex r1: a value that is not a list of records is never read as none
+            S = complete_run(d)
+            S.write("figures", {"figures": [], "not_produced": bad}, "toolkit/analysis/figures.py")
+            S.finalize("complete")
+            ok(kinds(d) == {"analysis_contract_schema"},
+               f"K9c not_produced {bad!r} is a schema finding, never an empty list ({kinds(d)})")
         complete_run(d)
         open(os.path.join(d, "units.csv"), "a").write("2\n")
         ok("analysis_contract_stale" in kinds(d), "K10 an input changed after the artifact was computed (Codex P1-10)")

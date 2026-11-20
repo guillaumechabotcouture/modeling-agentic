@@ -942,15 +942,39 @@ def _self_test_stop_records(ok, d, q):
     from toolkit.analysis import contract
     from toolkit.analysis.burden import AnchorError
     from toolkit.calibration.history_matching import CalibrationInputError
-    cases = [("calibration", lambda: C.CalibrationRefused("posterior_ess", "planted")),
+    cases = [(None, lambda: KeyError("planted")),
+             ("calibration", lambda: C.CalibrationRefused("posterior_ess", "planted")),
              ("calibration", lambda: CalibrationInputError(["planted"])),
              ("burden_anchor", lambda: AnchorError("planted")),
              ("optimizer", lambda: OptimizerError("planted")),
-             ("batch", lambda: Bt.BatchRefused("batch_stale", "planted")),
-             (None, lambda: KeyError("planted"))]
+             ("batch", lambda: Bt.BatchRefused("batch_stale", "planted"))]
     orig = EmulatorModel.predict
     bp = os.path.join(d, "analysis", "blocked.yaml")
-    for where, make in cases:
+    # Codex r1: a record that cannot be written, with a log that fails too, never replaces the stop the caller sees
+    exc = Bt.BatchRefused("batch_stale", "planted")
+
+    def planted2(self, zs, theta, ids, noise=None):
+        raise exc
+
+    def no_final(self, status, reason=""):
+        raise OSError("planted: no space")
+
+    def bad_log(*a, **k):
+        if "could not be recorded" in " ".join(str(x) for x in a):
+            raise OSError("planted: log")
+    orig_fin = Store.finalize
+    EmulatorModel.predict, Store.finalize = planted2, no_final
+    try:
+        run(d, log=bad_log, compute_kw={"max_workers": 2}, draws=2)
+        got = None
+    except Exception as e:  # noqa: BLE001 -- the planted stop
+        got = e
+    finally:
+        EmulatorModel.predict, Store.finalize = orig, orig_fin
+    ok(got is exc and {x["kind"] for x in contract.gate_findings(d)} == {"analysis_contract_missing"},
+       f"RUN_BLOCKED_UNRECORDED a stop whose record and log both fail is still the error raised, with no manifest "
+       f"({type(got).__name__}: {got})")
+    for where, make in cases:       # the last case is a declared stop: the rerun below starts from its blocked record
         exc = make()
 
         def planted(self, zs, theta, ids, noise=None, _e=exc):
