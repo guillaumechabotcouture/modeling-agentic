@@ -340,11 +340,31 @@ def _prop_max(vals) -> float:
     return min(top * 1.06, 1.0) if top > 0 else 1e-3
 
 
-def _discard(dest: str, name: str, root: str, ends=(".png", ".svg", ".png.provenance.json", ".csv")) -> None:
-    """Remove what a figure that failed part way had already published (no link followed), so no file of a figure
-    the index does not list is left; best effort. `ends`: the files the calling renderer writes for one figure."""
-    from toolkit.analysis.artifacts import _safe_io
+FIG_ENDS = (".png", ".svg", ".png.provenance.json", ".csv")      # what render publishes for one figure
+
+
+def _file_sigs(dest: str, name: str, ends=FIG_ENDS) -> dict:
+    """Each of a figure's files as it is now (inode, mtime, size; None when absent), no link followed: taken before
+    an attempt so that `_discard` can tell what the attempt published."""
+    out = {}
     for end in ends:
+        try:
+            st = os.lstat(os.path.join(dest, name + end))
+            out[end] = (st.st_ino, st.st_mtime_ns, st.st_size)
+        except OSError:
+            out[end] = None
+    return out
+
+
+def _discard(dest: str, name: str, root: str, before: dict) -> None:
+    """Remove what a figure that failed part way published in this attempt (no link followed), so no file of a
+    figure the index does not list is left; best effort. `before`: `_file_sigs` taken before the attempt. A file
+    that was already there and that the attempt did not replace is never removed (Codex r3)."""
+    from toolkit.analysis.artifacts import _safe_io
+    now = _file_sigs(dest, name, tuple(before))
+    for end, sig in now.items():
+        if sig is None or sig == before[end]:
+            continue
         try:
             _safe_io().remove_nofollow(root, os.path.relpath(os.path.join(dest, name + end), root))
         except (OSError, ValueError):
@@ -1855,7 +1875,8 @@ def fig_cost_per_outcome(R, t):
         raise Missing("the plan gives no unit a package")
     rep = fd.get("replay") or {}
     lvl = float(rep.get("level") or (R.opt("uncertainty") or {}).get("interval", {}).get("level") or 0.95)
-    inc = {c: v for c, v in (fd.get("component_increment") or {}).items() if v.get("outcome_per_usd")}
+    inc = {c: v for c, v in (fd.get("component_increment") or {}).items()     # a cost per outcome that is finite
+           if v.get("outcome_per_usd") and _finite(1.0 / v["outcome_per_usd"])}
     nrow = len(shown) + len(other)
     fig = _fig(t, 7.6, 0.3 * max(nrow + len(inc), 4) + 2.2)    # a floor: one package and one component still lay out
     h = fig.get_figheight()
@@ -1864,7 +1885,7 @@ def fig_cost_per_outcome(R, t):
     h1 = avail * (nrow + 0.6) / (nrow + len(inc) + 1.2)
     a1 = fig.add_axes([0.38, top - 0.25 / h - h1, 0.5, h1])
     FS.style(a1, t, grid="x")
-    vals, have_ci, withheld = [1e-9], False, []
+    vals, have_ci, withheld, not_drawn = [1e-9], False, [], 0
     order = shown + other
     for y, k in enumerate(order[::-1]):
         v = allp[k]
@@ -1877,7 +1898,7 @@ def fig_cost_per_outcome(R, t):
                         zorder=2)
                 vals += [ci["ci_low"], ci["ci_high"]]
             elif ci:                                 # an end that is not a finite number: no line (the table has it)
-                withheld.append((k, {"reason": "an interval end is not a finite number"}))
+                not_drawn += 1
             elif v.get("interval_withheld"):
                 withheld.append((k, v["interval_withheld"]))
             a1.scatter([x], [y], s=34, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
@@ -1927,6 +1948,8 @@ def fig_cost_per_outcome(R, t):
         sh = [w.get("share_draws_nonpositive") for _k, w in withheld if w.get("share_draws_nonpositive") is not None]
         wh = (f" {len(withheld)} intervals withheld: {withheld[0][1].get('reason')}"
               + (f" (up to {FS.fmt(max(sh), 'percent')} of draws)" if sh else "") + ".")
+    if not_drawn:
+        wh += f" {not_drawn} interval{'' if not_drawn == 1 else 's'} not drawn: an end is not a finite number."
     cap = (f"Top: each package's cost over its {olab} averted in the {U} that get it, with the {lvl:.0%} interval over "
            f"the uncertainty draws.{wh} Bottom: each component against the same package without it.")
     rows = [{"package": k, "label": R.labels.package(R.pk[k]), "status": st[k],
@@ -2295,7 +2318,7 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
                      "presentation": R.presentation_record()}, **extra)
     for name in [n for n in names if not only or n in only]:
         R.used = []
-        opened = set(plt.get_fignums())
+        opened, before = set(plt.get_fignums()), _file_sigs(dest, name)
         try:
             figs.append(one(name))
         except Missing as e:
@@ -2305,7 +2328,7 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         except Exception as e:  # noqa: BLE001 -- v2 autonomy 1C-a: one figure's failure (its draw, title, save,
             # validation or table) is its own: recorded with the error, a MEDIUM finding (render_findings), and the
             # other figures are still drawn; it never ends the analysis
-            _discard(dest, name, run_dir if harness else dest)
+            _discard(dest, name, run_dir if harness else dest, before)
             notp.append({"figure": name, "reason": f"render failed: {type(e).__name__}: {e}"[:500],
                          "tier": TIER_OF[name], "render_failed": True})
         finally:
@@ -2812,7 +2835,11 @@ def _self_test_isolation(ok, base):
        f"FG_AXIS_FINITE cost per outcome keeps a finite axis when an interval end is not finite ({e_c}, {hi_c})")
     # Codex r3: an interval that is not drawn is told apart from one the analysis withheld; a component whose cost
     # per outcome is not finite has no row
-    k1 = sorted(bp)[1]
+    R = RunData(toy_run(os.path.join(base, "run_iso4"), many_packages=True))     # four components: three rows stay
+    fd = R.art("figure_data")
+    bp = {k: dict(v) for k, v in fd["by_package"].items()}
+    k0, k1 = sorted(bp)[:2]
+    bp[k0]["usd_per_outcome_interval"] = {"ci_low": 0.004, "ci_high": float("inf")}
     bp[k1].pop("usd_per_outcome_interval", None)
     bp[k1]["interval_withheld"] = {"reason": "planted reason", "share_draws_nonpositive": 0.25}
     ci_ = dict(fd["component_increment"])

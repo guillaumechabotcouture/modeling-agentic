@@ -511,14 +511,14 @@ def render(fd, dest: str, root: str, labels=None, theme: str = "light", sources=
         return {"figure": name, "path": rel, "table": trel, "title": title, "caption": cap, "tier": TIER,
                 "group": "diagnostics", "sources": list(sources), "theme": theme}
     for name in NAMES:
-        opened = set(plt.get_fignums())
+        opened, before = set(plt.get_fignums()), AF._file_sigs(dest, name, (".png", ".csv"))
         try:
             figs.append(one(name))
         except NoData as e:
             notp.append({"figure": name, "reason": str(e), "tier": TIER})
         except Exception as e:  # noqa: BLE001 -- Codex r3 P2-12, v2 autonomy 1C-a: one figure's failure (its draw,
             # title, render or write) is its own, recorded
-            AF._discard(dest, name, root, ends=(".png", ".csv"))        # only what this renderer writes
+            AF._discard(dest, name, root, before)        # only what this attempt wrote
             notp.append({"figure": name, "reason": f"render failed: {type(e).__name__}: {e}"[:500], "tier": TIER,
                          "render_failed": True})
         finally:
