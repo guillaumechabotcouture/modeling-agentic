@@ -187,6 +187,25 @@ def parse_attached_skills(agents_init_path: str,
     return attached
 
 
+_SKILL_PATH = re.compile(r"""\.claude["']?\s*[,/]\s*["']?skills["']?\s*[,/]\s*["']?([A-Za-z0-9_-]+)["']?\s*[,/]\s*["']?SKILL\.md""")
+
+
+def parse_task_skill_paths(agents_dir: str) -> set[str]:
+    """Skills a module under agents/ loads by their SKILL.md path, as v2's bounded tasks do
+    (agents/v2_sdk_tasks.py: os.path.join(R, ".claude", "skills", "decision-spec", "SKILL.md")). The v1
+    registry's `skills=[...]` lists went with pipeline v1 (owner, 2026-11-20)."""
+    found: set[str] = set()
+    if not os.path.isdir(agents_dir):
+        return found
+    for fn in sorted(os.listdir(agents_dir)):
+        if fn.endswith(".py"):
+            try:
+                found.update(_SKILL_PATH.findall(open(os.path.join(agents_dir, fn)).read()))
+            except OSError:
+                continue
+    return found
+
+
 def list_existing_skills(skills_root: str) -> set[str]:
     """Return the set of skill directories under .claude/skills/ that
     contain a SKILL.md file (skills without SKILL.md don't count)."""
@@ -256,6 +275,7 @@ def validate(repo_root: str | None = None) -> dict:
         os.path.join(root, "agents", "__init__.py"),
         warnings=warnings,
     )
+    attached |= parse_task_skill_paths(os.path.join(root, "agents"))
     skills_root = os.path.join(root, ".claude", "skills")
     existing = list_existing_skills(skills_root)
     invalid_frontmatter = []
@@ -457,6 +477,22 @@ def _run_self_test() -> int:
         ok(r["phantoms"] == [],
            f"T10-T14: frontmatter failures are not phantoms, got {r['phantoms']}")
 
+    # T15 (v1 retirement): a v2 task loads a skill by its SKILL.md path (agents/v2_sdk_tasks.py); that counts as
+    # an attachment, and a path to a skill that does not exist is a phantom.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "agents"))
+        os.makedirs(os.path.join(d, ".claude", "skills", "spec-x"))
+        open(os.path.join(d, ".claude", "skills", "spec-x", "SKILL.md"), "w").write("# x\n")
+        open(os.path.join(d, "agents", "__init__.py"), "w").write('"""package"""\n')
+        open(os.path.join(d, "agents", "tasks.py"), "w").write(
+            'import os\nA = os.path.join(R, ".claude", "skills", "spec-x", "SKILL.md")\n'
+            'B = ".claude/skills/missing-y/SKILL.md"\n')
+        r15 = validate(d)
+        ok(r15["attached"] == ["missing-y", "spec-x"] and r15["phantoms"] == ["missing-y"],
+           f"T15: skills a task loads by path are attached; a missing one is a phantom: {r15}")
+    real = validate()
+    ok("decision-spec" in real["attached"], f"T16: the v2 decision-spec skill counts as attached: {real['attached']}")
+
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
         for f in failures:
@@ -481,7 +517,7 @@ def main() -> int:
 
     result = validate(args.repo_root)
     print(f"Attached:  {len(result['attached'])} skills "
-          f"in agents/__init__.py", file=sys.stderr)
+          f"loaded by agents/ (skills=[...] lists and SKILL.md paths)", file=sys.stderr)
     print(f"Existing:  {len(result['existing'])} SKILL.md files "
           f"under .claude/skills/", file=sys.stderr)
     print(f"Phantoms:  {len(result['phantoms'])} attached but no "

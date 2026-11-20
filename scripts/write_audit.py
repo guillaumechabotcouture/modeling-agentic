@@ -343,11 +343,10 @@ _V1 = ("v1 pipeline (main.py without --v2, its hooks and gates): writes in its r
 # OPEN_ITEMS: attacker-reachable write sites not yet on lib.safe_io. Counted exactly, so none is added; each migration
 # lowers a count. These are known gaps, not exemptions.
 OPEN_ITEMS: dict = {
-    "agents/hooks.py": {"shutil": (1, _V1), "method-write": (1, _V1 + " (an oversized image resized in place; "
-                                                              "found when <image>.save became a site)")},
     "agents/integrity.py": {"open-write": (1, _V1)},
-    "agents/observability.py": {"open-write": (5, _V1), "os-rename": (1, _V1), "os-remove": (3, _V1)},
-    "agents/run_finish.py": {"open-write": (13, _V1), "shutil": (2, _V1), "os-remove": (1, _V1)},
+    "agents/run_finish.py": {"open-write": (2, "store_run_results (shared with v2): the upload's temporary tarball and "
+                                              "metadata.json's stored/store_error fields, plain opens in the run dir"),
+                             "os-remove": (1, "store_run_results: its own temporary tarball")},
     "scripts/ask.py": {"open-write": (1, _V1)},
     "scripts/benchmark_match.py": {"open-write": (1, _V1)},
     "scripts/coherence_audit.py": {"open-write": (1, _V1)},
