@@ -169,20 +169,25 @@ TIE_RTOL = 1e-6     # tested values whose regret agrees within this share of the
 
 def worst_regret(rows: list, key: str) -> tuple:
     """(the tested value reported as worst on `key` (regret or regret_share), the size of its tied set), or (None, 0)
-    when no row has the key. Rows whose value is within TIE_RTOL of the largest are tied with it, and the first of
-    them in the declared order is reported: a solver's noise (seen below 1e-9 of the objective) must not choose the
-    value a result reports, and with it the top-level numbers taken from that value. `regret_share` is already a
-    share of the objective, so the tolerance is TIE_RTOL itself; for `regret` it is TIE_RTOL times the larger
-    re-optimised objective of the two rows (nothing under a zero objective: only equal regrets tie there)."""
+    when no row has the key. Rows whose value is within the tolerance of the largest are tied, and the first of them
+    in the declared order is reported: a solver's noise (seen below 1e-9 of the objective) must not choose the value a
+    result reports, and with it the top-level numbers taken from that value. The tolerance is one number for all
+    rows, so it does not depend on which row noise makes the largest: TIE_RTOL for `regret_share` (already a share of
+    the objective), and for `regret` TIE_RTOL times the largest re-optimised objective among the rows, in size (zero
+    when every objective is zero: only equal regrets tie then). A row that fires on regret is never tied with one
+    that does not: when any row near the largest fires, the tied set is those that fire, so the reported regret is
+    one behind the verdict. A regret that is not a number is reported as it is (the first such row)."""
     c = [r for r in rows if r.get(key) is not None]
     if not c:
         return None, 0
-    top = max(c, key=lambda r: r[key])
-
-    def scale(r):
-        return 1.0 if key == "regret_share" else max(abs(float(r.get("reoptimised_objective") or 0.0)),
-                                                     abs(float(top.get("reoptimised_objective") or 0.0)))
-    tied = [r for r in c if top[key] - r[key] <= TIE_RTOL * scale(r)]
+    bad = [r for r in c if r[key] != r[key]]
+    if bad:
+        return bad[0], 1
+    top = max(r[key] for r in c)
+    tol = TIE_RTOL * (1.0 if key == "regret_share"
+                      else max(abs(float(r.get("reoptimised_objective") or 0.0)) for r in c))
+    near = [r for r in c if top - r[key] <= tol]
+    tied = [r for r in near if "regret" in (r.get("triggered_by") or [])] or near
     return tied[0], len(tied)
 
 
