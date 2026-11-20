@@ -300,7 +300,10 @@ def budget_guard(cfg, reserve=True, inv=None) -> None:
     if not cfg.budget_scope:
         raise SystemExit(f"{cfg.name} matches no budget scope in cloud/budget_scopes.yaml: refusing")
     bind = {"invocation": inv, "clusters_file": cfg.clusters_file} if reserve and inv else {}   # binds the reservation
-    ok, why = budget.launch_budget_ok(cfg.budget_scope, cfg.cap_usd, name=cfg.name, reserve=reserve, **bind)
+    # warn_over (owner decision, 2026-11-17): a launch over the budget is admitted with a spend alert, never refused
+    # for dollars; the other refusals (no cap, no scope, an unsigned budget, a name outside its prefixes) stand.
+    ok, why = budget.launch_budget_ok(cfg.budget_scope, cfg.cap_usd, name=cfg.name, reserve=reserve, warn_over=True,
+                                      **bind)
     if not ok:
         raise SystemExit(f"{cfg.name}: the budget refuses this launch: {why}")
     print(f"budget: {why}", flush=True)
@@ -4124,6 +4127,8 @@ def _self_test_budget(ok) -> None:
     ok(keys and calls == [("f6", 20, "lw-smoke-t")], f"BU4c a launch the budget covers goes on past the guard: {msg}")
     ok(kws and kws[-1].get("invocation") == "inv" and kws[-1].get("clusters_file", "").endswith("clusters.json"),
        f"BU4d launch reserves under its invocation token and names its clusters.json: {kws[-1:]}")
+    ok(kws and all(k.get("warn_over") is True for k in kws),
+       f"BU4e every launch check passes warn_over (owner 2026-11-17: no launch refused for dollars): {kws}")
     # BU7 (2026-11-13; owner: spend controls fail soft): a VM type missing from cloud/vm_prices.yaml never refuses a
     # launch. It is warned about before the budget is asked (budget.py counts it at the fallback rate)
     out = io.StringIO()
