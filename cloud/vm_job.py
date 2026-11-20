@@ -282,13 +282,14 @@ def _has_v1_token(cmd, depth: int = 0) -> bool:
         while argv and (os.path.basename(argv[0]) in _PREFIX_NAMES or ("=" in argv[0] and not argv[0].startswith("-"))):
             argv = argv[1:]
             while argv and (argv[0].startswith("-") or argv[0].rstrip("smhd").replace(".", "").isdigit()):
-                argv = argv[2:] if argv[0] in ("-u", "-C", "-S", "-s", "-k", "--unset", "--chdir", "--signal") else argv[1:]
+                argv = argv[2:] if argv[0] in ("-u", "-C", "-S", "-s", "-k", "-o", "-f", "--unset", "--chdir",
+                                               "--signal", "--output", "--format") else argv[1:]
         if not argv:
             continue
         head = os.path.basename(argv[0])
         if head.startswith("python") or head == "main.py":
-            if any(w == "--v1" or w.startswith("--v1=") for w in argv[1:]):
-                return True
+            if pipeline_id._flag_tokens(argv[1:])[0] or any(w.startswith("--v1=") for w in argv[1:]):
+                return True          # `--` ends the options: after it, --v1 is a question
         elif head in _SHELL_NAMES and depth < 3:
             k = 1
             while k < len(argv) and argv[k][:1] in "-+" and argv[k] not in ("-", "--"):
@@ -300,6 +301,9 @@ def _has_v1_token(cmd, depth: int = 0) -> bool:
                         return True
                     break
                 k += 2 if opt in ("-o", "+o") else 1
+            else:                    # bash script.sh --v1 ...: a script file that may forward its arguments
+                if k < len(argv) and any(w == "--v1" for w in argv[k + 1:]):
+                    return True
     return False
 
 
@@ -1362,7 +1366,11 @@ def _self_test_pipeline(ok) -> None:
                           ("python3 -m main --launcher issue#42 --v1 Q", True),
                           ("python3 main.py --v2 Q && grep -F -- --v1 archived-commands.txt", False),
                           ("python3 main.py --v2 Q # once ran with --v1", False),
-                          ("env A=1 timeout 60 python3 -u main.py --v1", True)):
+                          ("env A=1 timeout 60 python3 -u main.py --v1", True),
+                          # Codex round 7
+                          ("python3 main.py --v2 -- --v1", False),
+                          ("/usr/bin/time -o timing.txt python3 -m main --v1 Q", True),
+                          ("bash launch.sh --v1 Q", True)):
             got = bool(rtp(cmd, trees["old"]))
             ok(got == want, f"VP2h {cmd!r}: {'refused' if want else 'accepted'} on a pre-retirement tree (got {got})")
     for cmd in (["python3 main.py 'Q?' --v1"], ["python3", "main.py", "--v1", "--resume", "runs/R1"]):
