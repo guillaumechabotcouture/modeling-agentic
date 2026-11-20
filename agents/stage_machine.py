@@ -430,10 +430,11 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                 pass
     # An id with surrounding whitespace is refused: the gate's key strips it (stall_rule.finding_key) and the
     # registry and the ledger do not, so two findings could share a key. The critic repairs its file.
-    for reviewer, doc in critiques.items():
+    # Only for the reviewers this machine can ask to repair (h_CRITIQUE), and with a refused file's other errors.
+    for reviewer, doc in list(critiques.items()) + list(refused.items()):
         schema_errors += [f"{V.FILENAMES[reviewer]}: blocker id {b.get('id')!r} has surrounding whitespace"
-                          for b in doc.get("blockers") or []
-                          if isinstance(b, dict) and isinstance(b.get("id"), str) and b["id"] != b["id"].strip()]
+                          for b in doc.get("blockers") or [] if reviewer in CRITICS + ("critique-presentation",)
+                          and isinstance(b, dict) and isinstance(b.get("id"), str) and b["id"] != b["id"].strip()]
     if strict_done_when:
         # v2blind1: critics wrote done_when as prose, done_when.py counted every test as missing,
         # and the open MEDIUMs were accepted. A HIGH or MEDIUM blocker's test is part of the schema
