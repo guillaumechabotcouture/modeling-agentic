@@ -677,7 +677,8 @@ def _wait_gate(a, name, cid, dest, accepted):
     cluster's reservation with the cap's remaining amount; None when the cluster is no longer live. Raises _CapRefused
     on a refusal. The listing and the budget are read up to three times until the gate accepts or refuses; once it
     accepts (`accepted` is set), the gate never runs again, and only the meter is built, up to three times. Still
-    unreadable, it raises SystemExit and the caller stops the cluster (fail closed)."""
+    unreadable before it accepts, it alerts and raises _CapRefused (the cluster is left as it was); after it accepts,
+    it alerts and returns a meter rebuilt at each reading (never a stop)."""
     import budget
     scope = a.budget_scope or budget.scope_for_name(name)
     if not scope:
@@ -2315,6 +2316,25 @@ def _self_test_run(ok, real_gate=None) -> None:
                 ok(msg is None and [x["kind"] for x in ALERTS] == ["cost_unreadable"] and clean(W),
                    f"RN29b three failed cost readings in a row are alerted, and the job runs on to its end: {msg} "
                    f"{ALERTS}")
+                # RN29d (2026-11-20): the laptop lost DNS and v2's meter stopped a running fit after three
+                # ClientConnectorDNSError readings ("fail closed"). The same error is now a warning: the job runs on.
+                class ClientConnectorDNSError(OSError):
+                    pass
+                dns = [ClientConnectorDNSError("Cannot connect to host cloud.coiled.io:443 ssl:default "
+                                               "[nodename nor servname provided, or not known]")] * 6
+
+                def dns_meter(cid):
+                    if dns:
+                        raise dns.pop(0)
+                    return 1.0
+                ALERTS.clear()
+                W, msg, out, exc = world(d, "r29d", gate=lambda a, name, meter=False, m=dns_meter: m, threaded=True,
+                                         job_sleep=2)
+                ok(msg is None and exc is None and [x["kind"] for x in ALERTS] == ["cost_unreadable"]
+                   and "ClientConnectorDNSError" in ALERTS[0].get("error", "") and "fail closed" not in out
+                   and clean(W),
+                   f"RN29d `run`: a cost that cannot be read because DNS fails (ClientConnectorDNSError) is alerted "
+                   f"once, and the job runs on to its end: {msg} {exc!r} {ALERTS}")
                 ALERTS.clear()
                 W, msg, out, exc = world(d, "r29c", job_rc=3, gate=lambda a, name, meter=False, m=lambda c: 9.0: m,
                                          extra=("--keep-on-failure",))
@@ -2498,7 +2518,8 @@ def _self_test_run(ok, real_gate=None) -> None:
                 # cap. `wait --cap-usd` re-attaches it: the recorded id, metered as `run` does, stopped by id.
                 import budget
 
-                def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True, meter_fails=False, interrupt=1):
+                def rewait(label, readings, cap="5", argv_cap=True, lbo_ok=True, meter_fails=False, interrupt=1,
+                           build_err=None):
                     jid, seen, lbo_calls, built = f"r32{label}", [], [], []
 
                     def meter(cid):
@@ -2519,7 +2540,7 @@ def _self_test_run(ok, real_gate=None) -> None:
                     def lifetime(s_):
                         built.append(s_)           # meter_fails: True always fails, an int n fails the first n builds
                         if meter_fails is True or (meter_fails and len(built) <= meter_fails):
-                            raise RuntimeError("details unavailable")
+                            raise build_err or RuntimeError("details unavailable")
                         return meter
                     wait = ["wait", "vm1", jid, "--out", os.path.join(d, "local"), "--every", "60"]
                     if argv_cap:
@@ -2572,6 +2593,19 @@ def _self_test_run(ok, real_gate=None) -> None:
                        and (label == "g" or "cost_unreadable" in [x["kind"] for x in ALERTS]),
                        f"RN32{label} a cost or meter that cannot be read is alerted, never a stop; the cluster is "
                        f"stopped by id when the job ends: {res!r} {ALERTS} {ev[-4:]}")
+                # RN32m (2026-11-20): `wait --cap-usd` after the gate accepted, with DNS failing for every meter build
+                # and reading (ClientConnectorDNSError): alerted, never a stop; the cluster is stopped only at the end.
+                class ClientConnectorDNSError(OSError):
+                    pass
+                DNS = ClientConnectorDNSError("Cannot connect to host cloud.coiled.io:443 ssl:default "
+                                              "[nodename nor servname provided, or not known]")
+                ALERTS.clear()
+                W, ev, res, seen, lbo_calls, killed = rewait("m", [1.0, DNS], meter_fails=True, build_err=DNS)
+                ok(res is None and ("attach_id", 100) in ev and ("delete", 100) in ev and W["stops"] == 1
+                   and "cost_unreadable" in [x["kind"] for x in ALERTS]
+                   and not any("fail closed" in str(x) for x in ALERTS),
+                   f"RN32m `wait --cap-usd`: a cost that cannot be read because DNS fails is alerted, never a stop; "
+                   f"the cluster is stopped by id only when the job ends: {res!r} {ALERTS} {ev[-4:]}")
                 W, ev, res, seen, lbo_calls, killed = rewait("k", [1.0], interrupt=(1, 2))
                 ok(killed and isinstance(res, KeyboardInterrupt) and ("attach_id", 100) in ev and W["stops"] == 0
                    and W["clusters"][100] == "running",
