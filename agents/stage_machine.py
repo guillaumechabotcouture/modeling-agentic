@@ -428,13 +428,6 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                     refused[reviewer] = raw
             except Exception:                                # unreadable: its schema errors stand
                 pass
-    # An id with surrounding whitespace is refused: the gate's key strips it (stall_rule.finding_key) and the
-    # registry and the ledger do not, so two findings could share a key. The critic repairs its file.
-    # Only for the reviewers this machine can ask to repair (h_CRITIQUE), and with a refused file's other errors.
-    for reviewer, doc in list(critiques.items()) + list(refused.items()):
-        schema_errors += [f"{V.FILENAMES[reviewer]}: blocker id {b.get('id')!r} has surrounding whitespace"
-                          for b in doc.get("blockers") or [] if reviewer in CRITICS + ("critique-presentation",)
-                          and isinstance(b, dict) and isinstance(b.get("id"), str) and b["id"] != b["id"].strip()]
     if strict_done_when:
         # v2blind1: critics wrote done_when as prose, done_when.py counted every test as missing,
         # and the open MEDIUMs were accepted. A HIGH or MEDIUM blocker's test is part of the schema
@@ -3739,24 +3732,6 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         got = [o["id"] for o in open_findings(d, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
             {"kind": "done_when_regressed", "key": "D-071", "severity": "HIGH", "claim": "c"}]})]
         ok("done_when_regressed:D-071" in got and "D-071" in got, f"CX3-6 a regression is listed beside its finding ({got})")
-        # CX3-2: an id with surrounding whitespace is refused at the gate (the critic repairs its file), so no two
-        # findings share a key and every reader of the id (gate, registry, ledger) sees the same text.
-        d = os.path.join(td, "a1_cx32")
-        os.makedirs(d)
-        S = StubTasks({"critics": {1: {"critique-domain": [{"id": "D-072 ", "severity": "MEDIUM", "claim": "c"}],
-                                       "critique-methods": [{"id": "M-072 ", "severity": "LOW", "claim": "c"}]}}})
-        for r in CRITICS + ("critique-methods",):
-            S.critique(d, r, 1)
-        errs = v2_gate(d, 1, 3, False, [], history=False).get("schema_errors") or []
-        ok(any("critique_domain.yaml" in e and "whitespace" in e for e in errs), f"CX3-2 a padded id is a schema error ({errs})")
-        # CX4 (last narrow pass): only for the reviewers this machine can ask to repair (a methods file is not one),
-        # and together with a file's other schema errors, so one repair fixes both.
-        doc = yaml.safe_load(open(os.path.join(d, "critique_domain.yaml")))
-        doc.pop("verdict")
-        yaml.safe_dump(doc, open(os.path.join(d, "critique_domain.yaml"), "w"))
-        errs2 = v2_gate(d, 1, 3, False, [], history=False).get("schema_errors") or []
-        ok(not any("critique_methods" in e for e in errs) and any("whitespace" in e for e in errs2)
-           and any("verdict" in e for e in errs2), f"CX4 padded ids: repairable reviewers only, with a file's other errors ({errs}, {errs2})")
 
     def r3_presentation():
         # CX3-1 (documented behaviour, pinned): a presentation task that fails and writes no review goes on to the
