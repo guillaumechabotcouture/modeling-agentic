@@ -4868,15 +4868,26 @@ def _self_test_storage(ok) -> None:
        f"WS2b a killed main.py: the receipt in metadata.json is not trusted (large files kept, no stored run "
        f"recorded): exit {res['exit_code']} {names}")
     # WS2d (Codex 1E-i round 2): a link an agent left at the tarball's staging name is removed, never written through
+    # WS2e (round 3): a directory at the old staging name does not stop the tarball; a link to a large file outside
+    # the run is left out as before (the collector's extraction refuses such a member), whatever the store did
     planted = ("os.makedirs('runs/R_x/models')\nopen('runs/R_x/models/out.csv', 'w').write('result')\n"
-               "os.symlink('runs/R_x/models/out.csv', 'result.tar.gz.tmp')\n"
+               "os.makedirs('result.tar.gz.tmp')\nopen('../outside.bin', 'wb').write(b'y' * 4096)\n"
+               "os.symlink(os.path.abspath('../outside.bin'), 'runs/R_x/models/big_link')\n"
                "os.symlink('runs/R_x/models/out.csv', 'result.tar.gz')\n")
-    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"):
-        res = ws.run_job_impl("LINK", code("x", planted), "q", [], "k", None)
+    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"), \
+            mock.patch.object(ws, "MAX_RETURN_FILE", 1024):
+        try:
+            res = ws.run_job_impl("LINK", code("x", planted), "q", [], "k", None)
+        except OSError as e:
+            res = {"tarball": None, "skipped_large_files": [], "error": f"{type(e).__name__}: {e}"}
     kept = open(os.path.join(root, "LINK", "runs", "R_x", "models", "out.csv"), "rb").read()[:20]
-    ok(kept == b"result" and not os.path.islink(res["tarball"])
-       and "runs/R_x/models/out.csv" in tarfile.open(res["tarball"], mode="r:gz").getnames(),
-       f"WS2d links planted at result.tar.gz(.tmp) are replaced; the output they point to is intact: {kept!r}")
+    names = tarfile.open(res["tarball"], mode="r:gz").getnames() if res["tarball"] else []
+    ok(kept == b"result" and res["tarball"] and not os.path.islink(res["tarball"]) and "runs/R_x/models/out.csv" in names,
+       f"WS2d a link planted at result.tar.gz is replaced, a directory at the old staging name is no obstacle; the "
+       f"output is intact: {kept!r} {res.get('error')}")
+    ok("runs/R_x/big.bin" in names and "runs/R_x/models/big_link" not in names
+       and [p for p, _ in res["skipped_large_files"]] == ["runs/R_x/models/big_link"],
+       f"WS2e the store failed: large files are kept, a link to a large file is still left out: {names}")
     real_add = tarfile.TarFile.add
 
     def full_disk(self, name, *a, **kw):
@@ -4892,7 +4903,7 @@ def _self_test_storage(ok) -> None:
     names = tarfile.open(res["tarball"], mode="r:gz").getnames() if res.get("tarball") else []
     ok("runs/R_x/small.txt" in names and "run.log" in names and "runs/R_x/big.bin" not in names
        and [p for p, _ in res["skipped_large_files"]] == ["runs/R_x/big.bin"]
-       and any("large files" in n for n in res["notes"]) and os.listdir(os.path.join(root, "FULL")).count("result.tar.gz.tmp") == 0,
+       and any("large files" in n for n in res["notes"]) and not [n for n in os.listdir(os.path.join(root, "FULL")) if n.endswith(".tmp")],
        f"WS2c no room for the complete tarball: the task still returns one without the large files and says so: "
        f"{names} {res.get('error')} {res['notes'][-1:]}")
 
@@ -4928,6 +4939,23 @@ def _self_test_storage(ok) -> None:
     blob = ws.store_transcripts(d, st, "runs/t", "L1", "OK", None, ["sk-ant-TESTSECRET12345"], home=home)
     os.makedirs(os.path.join(home, "s1"))
     open(os.path.join(home, "s1", "t.jsonl"), "w").write("key sk-ant-TESTSECRET12345\n")
+    # WS3b (round 3): a launch tree pinned before this change ships a write_archive without `strict`; and a link an
+    # agent left at transcripts.tar.gz is replaced, never written through (it could point at result.tar.gz)
+    class OldStore(Store):
+        @staticmethod
+        def write_archive(root, arcname, out_path, secrets=None, extra=(), _hook=None, base=None):
+            return results_store.write_archive(root, arcname, out_path, secrets, extra)
+    victim = os.path.join(d, "result.tar.gz")
+    before = open(victim, "rb").read()
+    os.remove(os.path.join(d, "transcripts.tar.gz"))
+    os.symlink(victim, os.path.join(d, "transcripts.tar.gz"))
+    try:
+        old = ws.store_transcripts(d, OldStore(), "runs/t", "L1", "OK", None, [], home=home)
+    except Exception as e:  # noqa: BLE001
+        old = f"{type(e).__name__}: {e}"
+    ok(old == "outputs/runs/t/launch_L1/transcripts_OK.tar.gz" and open(victim, "rb").read() == before
+       and not os.path.islink(os.path.join(d, "transcripts.tar.gz")),
+       f"WS3b transcripts store with an older tree's write_archive, and never through a planted link: {old}")
     blob2 = ws.store_transcripts(d, st, "runs/t", "L1", "OK", None, ["sk-ant-TESTSECRET12345"], home=home)
     body = tarfile.open(fileobj=io.BytesIO(st.files.get(blob2, b"")), mode="r:gz").extractfile("transcripts/s1/t.jsonl").read()
     ok(blob == blob2 == "outputs/runs/t/launch_L1/transcripts_OK.tar.gz" and b"TESTSECRET" not in body,

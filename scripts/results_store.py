@@ -722,6 +722,11 @@ def _self_test_durable(fails) -> None:
         if got != "raised" or left != ["c.bin"] or open(dest, "rb").read() != b"the earlier good copy":
             fails.append(f"S23 a download cut mid-stream raises, keeps the earlier copy and leaves no partial file: "
                          f"{got} {left}")
+        try:        # S27 (Codex 1E-i round 3): a destination name safe_io would split is refused, never misplaced
+            download("outputs/s/big.bin", os.path.join(d, "out", "R1\\summary.json"), service=svc)
+            fails.append("S27 a destination name holding a backslash is refused")
+        except ValueError:
+            pass
         # S24: the end-of-run store (agents/run_finish.py) through the same streaming client: the archive is written
         # to disk and streamed up; the in-memory archive_dir is never called; the staging file is removed.
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
