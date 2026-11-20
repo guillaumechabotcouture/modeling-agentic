@@ -1,0 +1,8 @@
+---
+phase: "F6"
+commit: "decision-test companions α-β"
+---
+
+## Changelog
+
+**A `parameter_value` decision test can hold companion engine parameters fixed with `with: {parameter: value}`.** Owner decision, 20 Nov. The companions are applied in every case of the test: the evaluation's parameters are the point values, then the companions, then the tested value. `schema` validates the field: a non-empty mapping of engine parameters other than the test's own, each a finite number. It also records the companion values in the parameter domain. Two helpers in `engine_parameters`, `companions` and `test_settings`, give every reader of what a test sets one view, so a companion value is treated as a tested value everywhere: `batch.test_value_ranges` widens the emulator design box to span it, `tested_boxes` makes a held spec value named as a companion a design input, and the posterior precondition checks it against the column's hard bounds. In `decision_tests.plan_test`, each companion must be an emulator input inside the design box, or the test is not run and says why; a case is an identity only when every companion is at its point value. `run_one` names the companions in the result's `varied` text and records them as `with`. Under `calibration.method: posterior` a test with companions is not run, with the reason, because that refit would not hold them. A test without `with` behaves as before: same text, no `with` key, and the batch self-test's recorded design hash is reproduced. Tests written first and failing before the change: RPW1 to RPW5 in `run.py` and PC16c in `preconditions.py` (α-β).

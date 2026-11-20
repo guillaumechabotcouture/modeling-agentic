@@ -1134,6 +1134,9 @@ def parameter_domain(raw: dict, defaults: dict, drawn: dict) -> dict:
     for dt in ((raw or {}).get("analysis") or {}).get("decision_tests") or []:
         if isinstance(dt, dict) and dt.get("type") == "parameter_value" and dt.get("parameter") in dom:
             dom[dt["parameter"]].append((f"decision test {dt.get('id')}", list(dt.get("values") or [])))
+        for n, v in PV.companions(dt).items():        # a companion value (`with`) is a value the run evaluates
+            if n in dom:
+                dom[n].append((f"decision test {dt.get('id')} (with)", [v]))
     return dom
 
 
@@ -1433,6 +1436,17 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                 bad.append(f"decision test {i}: {dt.get('parameter')!r} is not an engine parameter")
             if not dt.get("values"):
                 bad.append(f"decision test {i}: values")
+            if "with" in dt:        # companion engine parameters held in every case of the test (owner, 20 Nov)
+                w = dt["with"]
+                if not isinstance(w, dict) or not w:
+                    bad.append(f"decision test {i}: with must be a mapping {{engine parameter: value}}")
+                else:
+                    bad += [f"decision test {i}: with: {k!r} is not an engine parameter" for k in w if k not in pnames]
+                    bad += [f"decision test {i}: with: {k} must be a finite number" for k, v in w.items()
+                            if not _isnum(v) or not math.isfinite(v)]
+                    if dt.get("parameter") in w:
+                        bad.append(f"decision test {i}: with cannot hold the test's own parameter "
+                                   f"{dt.get('parameter')}")
         elif t == "group_rule":
             if dt.get("rule") not in rules and not dt.get("add"):
                 bad.append(f"decision test {i}: rule {dt.get('rule')!r} is not a constraints.group_rules id (or give add:)")

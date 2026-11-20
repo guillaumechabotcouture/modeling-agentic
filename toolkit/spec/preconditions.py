@@ -85,13 +85,15 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     # widens the design box, batch.design_box), but never past the column's hard bounds
     from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
     hb = NEF.hard_bounds(eng, list(ne["ranges"]))
+    from toolkit.spec import engine_parameters as PV
     for t in (spec.raw.get("analysis") or {}).get("decision_tests") or []:
-        if isinstance(t, dict) and t.get("type") == "parameter_value" and t.get("parameter") in hb:
-            lo, hi, what = hb[t["parameter"]]
-            bad = [v for v in t.get("values") or [] if not lo <= float(v) <= hi]
-            if bad:
-                out.append(f"net_effect_posterior: decision test {t.get('id')} sets {t['parameter']} to {bad}, outside "
-                           f"its hard bound [{lo}, {hi}] ({what})")
+        for n, vs in sorted(PV.test_settings(t).items()):       # its own values and each companion's (`with`)
+            if n in hb:
+                lo, hi, what = hb[n]
+                bad = [v for v in vs if not lo <= float(v) <= hi]
+                if bad:
+                    out.append(f"net_effect_posterior: decision test {t.get('id')} sets {n} to {bad}, outside its "
+                               f"hard bound [{lo}, {hi}] ({what})")
     return out
 
 

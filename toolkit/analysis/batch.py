@@ -65,14 +65,13 @@ def prior_ranges(spec) -> dict:
 def test_value_ranges(spec, names) -> dict:
     """{name: (lo, hi)} of the values the spec's parameter_value decision tests set for design parameters `names`.
     The design box spans them too, so each test is evaluated inside the design (the draws keep the declared ranges)."""
+    from toolkit.spec import engine_parameters as PV
     out = {}
     for dt in (spec["analysis"].get("decision_tests") or []):
-        if dt.get("type") != "parameter_value" or dt.get("parameter") not in names:
-            continue
-        vs = [float(v) for v in dt.get("values") or []]
-        if vs:
-            lo, hi = out.get(dt["parameter"], (min(vs), max(vs)))
-            out[dt["parameter"]] = (min(lo, *vs), max(hi, *vs))
+        for n, vs in PV.test_settings(dt).items():       # its own values and each companion's (`with`)
+            if n in names:
+                lo, hi = out.get(n, (min(vs), max(vs)))
+                out[n] = (min(lo, *vs), max(hi, *vs))
     return out
 
 
