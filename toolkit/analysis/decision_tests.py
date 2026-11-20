@@ -312,6 +312,11 @@ def plan_test(spec, dt, evidence) -> dict:
         # owner, 20 Nov: companions (`with`) are held in every case; each is an emulator input inside the design box
         from toolkit.spec import engine_parameters as PV
         comp = PV.companions(dt)
+        cal = (getattr(spec, "raw", spec) or {}).get("calibration") or {}
+        if comp and cal.get("method") == "posterior":       # that calibration refits around the tested parameter only
+            return {"status": "not_run", "why": "a parameter_value test with companion parameters (with: "
+                    f"{', '.join(sorted(comp))}) is not supported under calibration.method posterior: the refit "
+                    "would not hold the companions", "perturbations": [], "rejected": rejected}
         if evidence["kind"] == "emulator":
             for n, v in sorted(comp.items()):
                 if n not in (box or {}):
@@ -1027,9 +1032,6 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         if comp:
             varied += ", with " + ", ".join(f"{k} held at {v:g}" for k, v in sorted(comp.items())) + " in every case"
             extra["_with"] = dict(sorted(comp.items()))
-            if A.method == "posterior":     # that calibration refits around the tested parameter only
-                return _not_run(A, dt, "a parameter_value test with companion parameters (with) is not supported "
-                                "under calibration.method posterior: the refit would not hold the companions")
         cases, lowers = [], []
         vals, rejected = [x["value"] for x in pl["perturbations"]], pl["rejected"]
         extra["_ident"] = [bool(x.get("identity")) for x in pl["perturbations"]]

@@ -181,6 +181,11 @@ def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | 
     if an.get("evaluation") == "emulator" and name not in drawn and name not in eps:
         return False, (f"does not execute on the emulator path: {name} is neither drawn nor set by engine_parameters, "
                        "so it is not an emulator input"), list(t.get("values") or [])
+    from toolkit.spec import engine_parameters as PV
+    off = sorted(n for n in PV.companions(t) if n not in drawn and n not in eps)     # v2-dt-with: its companions too
+    if an.get("evaluation") == "emulator" and off:
+        return False, (f"does not execute on the emulator path: its companion parameter(s) {off} (with) are neither "
+                       "drawn nor set by engine_parameters, so they are not emulator inputs"), list(t.get("values") or [])
     return True, "", list(t.get("values") or [])
 
 
@@ -261,6 +266,10 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
                        "the parameter or benchmark interaction carrying the departed engine effect")
     else:
         return False, f"is a {typ} test, which does not vary a component's effect"
+    from toolkit.spec import engine_parameters as PV
+    if PV.companions(t):        # v2-dt-with (Codex r1): the companions alone could change the benefit the run credits
+        return False, (f"holds companion parameters (with: {', '.join(sorted(PV.companions(t)))}): a test that carries "
+                       "a departure varies only the parameter carrying the effect")
     from toolkit.analysis import decision_tests as DT
     try:
         ev = DT.prerun_evidence(spec)

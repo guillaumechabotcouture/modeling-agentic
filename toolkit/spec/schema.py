@@ -1423,6 +1423,8 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
         if "engine_arm_or" in dt:
             bad.append(f"decision test {i}: engine_arm_or cannot be supplied; arm ratios come from the engine's "
                        "verified benchmark results (Codex P1-13)")
+        if "with" in dt and t != "parameter_value":      # never ignored on a test that would not apply it
+            bad.append(f"decision test {i}: with (companion parameters) is only for a parameter_value test")
         if t == "interaction_rescale":
             if not dt.get("benchmark"):
                 bad.append(f"decision test {i}: benchmark (the engine benchmark whose arms set the interaction)")

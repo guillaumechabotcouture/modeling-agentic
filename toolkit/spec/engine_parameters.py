@@ -529,7 +529,12 @@ def test_settings(dt) -> dict:
     if not isinstance(dt, dict) or dt.get("type") != "parameter_value":
         return {}
     out = {k: [v] for k, v in companions(dt).items()}
-    vs = [float(x) for x in dt.get("values") or [] if _isnum(x)]
+    vs = []
+    for x in dt.get("values") or []:        # as the runner reads them: float(), a quoted number included (Codex r1)
+        try:
+            vs.append(float(x))
+        except (TypeError, ValueError):
+            pass
     if vs and isinstance(dt.get("parameter"), str):
         out[dt["parameter"]] = out.get(dt["parameter"], []) + vs
     return out
