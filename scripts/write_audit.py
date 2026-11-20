@@ -322,9 +322,8 @@ REVIEWED: dict = {
     "scripts/telemetry.py": {"open-write": (1, "the operator's --out CSV")},
     "scripts/lib/positive_control.py": {"open-write": (2, "builds the positive-control fixture run in a dir it creates")},
     "scripts/validate_critique_yaml.py": {"os-remove": (1, "its own NamedTemporaryFile in the system temp dir")},
-    "toolkit/analysis/dt_golden.py": {"open-write": (2, "toolkit/analysis/dt_golden.json in the repo, only under "
-                                                         "MA_DT_GOLDEN_UPDATE=1 from run.py's self-test or by the "
-                                                         "operator's `record <log>` command")},
+    "toolkit/analysis/dt_golden.py": {"open-write": (1, "toolkit/analysis/dt_golden.json in the repo, only under "
+                                                         "MA_DT_GOLDEN_UPDATE=1 from run.py's self-test")},
     "toolkit/analysis/figures.py": {"method-write": (2, "savefig / Image.save into an in-memory buffer "
                                                          "(_fig_bytes, contact_sheets), then lib.safe_io")},
     "toolkit/analysis/run.py": {"open-write": (6, _FIX + " (_resign, _direct_toy, _given_column)"), "os-remove": (1, _FIX),
