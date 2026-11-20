@@ -497,7 +497,19 @@ def _budget_gate(a, name, meter=False, reserve=True):
     if not ok:
         raise SystemExit(f"{name}: the budget refuses this launch: {why}")
     print(f"budget: {why}", flush=True)
-    return budget.job_meter(scope) if meter else None
+    if not meter:
+        return None
+    try:
+        return budget.job_meter(scope)
+    except Exception as e:  # noqa: BLE001
+        # Codex round 4 on #265 (P1): the check accepted (and reserved) this launch; a cost source that cannot be
+        # read now (DNS, a timeout) never refuses it. Alerted; the meter is rebuilt at each reading, and
+        # _cap_reading reports its failures.
+        print(f"WARNING: {name}: the cost meter could not be built ({type(e).__name__}: {str(e)[:120]}); "
+              "the launch goes on, metering as readings allow", flush=True)
+        budget.alert("cost_unreadable", name=name, cap_usd=a.cap_usd, where="launch meter",
+                     error=f"{type(e).__name__}: {str(e)[:120]}")
+        return lambda c: budget.job_meter(scope)(c)
 
 
 def _cap_reading(meter, cid, cap, job_id, misses, track):
@@ -2442,6 +2454,28 @@ def _self_test_run(ok, real_gate=None) -> None:
                 ok(asked == [(5.0, True)],
                    f"RN30e the launch check asks for the cap with warn_over (owner decision, 2026-11-17: no launch is "
                    f"refused for dollars): {asked}")
+                # RN30f (Codex round 4 on #265): the launch check accepted, then building the meter fails because
+                # DNS fails: the launch goes on, alerted, with a meter rebuilt at each reading.
+                class ClientConnectorDNSError(OSError):
+                    pass
+                builds = []
+
+                def flaky_meter(s_):
+                    builds.append(s_)
+                    if len(builds) == 1:
+                        raise ClientConnectorDNSError("Cannot connect to host [nodename nor servname provided]")
+                    return lambda cid: 2.0
+                ALERTS.clear()
+                with mock.patch.object(budget, "launch_budget_ok", lambda s_, c, name=None, **k: (True, "ok")), \
+                        mock.patch.object(budget, "job_meter", flaky_meter), contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        got = real_gate(a, "lw-smoke-x", meter=True)
+                        got_usd = got(100) if callable(got) else None
+                    except BaseException as e:  # noqa: BLE001
+                        got, got_usd = e, None
+                ok(got_usd == 2.0 and [x["kind"] for x in ALERTS] == ["cost_unreadable"],
+                   f"RN30f a meter that cannot be built after the launch check accepted (DNS) never refuses the "
+                   f"launch: it is alerted and rebuilt at each reading: {got!r} {got_usd} {ALERTS}")
                 made = []
                 b = types.SimpleNamespace(name="vm3", cpu=4, memory="16 GiB", idle_timeout="20 minutes", workers=1,
                                           cap_usd=5.0, budget_scope="f6")

@@ -517,7 +517,24 @@ class Watch:
                                          warn_over=True)
             if not ok:
                 return why
-            self.meter = b.job_meter(scope)
+            try:
+                self.meter = b.job_meter(scope)
+            except Exception as e:  # noqa: BLE001
+                # Codex round 4 on #265 (P1): the check accepted; a network error building the meter (DNS, TLS, a
+                # timeout) never refuses the launch. Alerted; the meter is rebuilt at each reading, whose failures
+                # spend() reports. Any other error (the stub, a broken module) still refuses below.
+                if not is_network_error(f"{type(e).__name__}: {e}"):
+                    raise
+                self.log(f"WARNING: the cost meter could not be built ({type(e).__name__}: {str(e)[:120]}); "
+                         "the launch goes on, metering as readings allow")
+                self.meter = lambda cid, b=b, scope=scope: b.job_meter(scope)(cid)
+                fn = getattr(b, "alert", None)
+                try:
+                    if fn is not None:
+                        fn("cost_unreadable", launcher="launch_watch", config=self.cfg.name, where="launch meter",
+                           error=f"{type(e).__name__}: {str(e)[:120]}")
+                except Exception:  # noqa: BLE001 -- an alert never stops the watch
+                    pass
         except Exception as e:  # noqa: BLE001 -- ImportError, NotImplementedError (the stub), anything else
             return f"budget check unavailable ({type(e).__name__}: {str(e)[:160]})"
         self.log(f"budget: {why}; this watch alerts past ${self.cap:.2f} and ${CAP_ALERT_MULTIPLE * self.cap:.2f}; "
@@ -1275,6 +1292,24 @@ def _self_test() -> int:
                      for e in (NotImplementedError("stub"), RuntimeError("x")) for w in ("launch_budget_ok", "job_meter"))
          and refused({"budget_scope": "f6"}, EXIT_BUDGET, budget=_no_module)
          and refused({"budget_scope": ""}, EXIT_BUDGET, budget=_FakeBudget()))
+    def dns_once():
+        import socket
+        b, n = _FakeBudget(), []
+        real = b.job_meter
+
+        def jm(scope):
+            n.append(scope)
+            if len(n) == 1:
+                raise socket.gaierror(8, "nodename nor servname provided, or not known")
+            return real(scope)
+        b.job_meter = jm
+        return b
+    case("LW22d", "(Codex round 4 on #265) the check accepted, then the meter cannot be built because DNS fails: "
+                  "the launch goes on, alerted, and the meter is rebuilt at each reading",
+         lambda: (lambda b: (lambda r: r[0] != EXIT_BUDGET and "cost_unreadable" in [a["kind"] for a in b.alerts]
+                             )(
+             scenario(0, record, done_script, cfg_kw={"budget_scope": "f6"}, cap_usd=650.0, api=_Billed(10.0),
+                      budget=b)))(dns_once()))
     case("LW25a", "two failed spend readings, then one that reads: no stop (the watch goes on to its limit)",
          lambda: (lambda r: r[0] == EXIT_LIMIT and stops(r[1]) == [])(
              scenario(0, record, running, api=_MeterFlaky(2), max_hours=0.5)))
