@@ -328,8 +328,8 @@ def load_claims_tolerant(ledger_path: str) -> tuple[dict[str, dict], dict[str, s
             one = _validate_claims([c], ledger_path, i)
             if name in good or name in bad:
                 raise ValueError(f"{ledger_path}: claims[{i}] duplicate claim id {name!r}")
-        except ValueError as e:
-            bad[name] = str(e)
+        except Exception as e:  # noqa: BLE001 -- whatever one claim's checks raise (a wrong-typed field) is that claim's
+            bad[name] = str(e) if isinstance(e, ValueError) else f"{ledger_path}: claims[{i}] {type(e).__name__}: {e}"
             good.pop(name, None)
             continue
         good.update(one)

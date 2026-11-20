@@ -89,15 +89,17 @@ def tests_of(dw) -> list | None:
     return dw if isinstance(dw, list) else [dw] if isinstance(dw, dict) else None
 
 
-def frozen_tests(run_dir: str) -> dict[str, list]:
+def frozen_tests(run_dir: str) -> dict[str, list | None]:
     """{finding id: the test the gate froze} (done_when_registry.json; scripts/done_when.py α): what a fix is checked
-    against, whatever the critic's YAML says later. A withdrawn test is not one."""
+    against, whatever the critic's YAML says later. A withdrawn test is None: the finding then has no test, and the
+    next critique judges it."""
     _scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
     if _scripts not in sys.path:
         sys.path.insert(0, _scripts)
     import done_when as DW
-    return {str(k): tests_of(t["done_when"]) for k, t in DW.load_registry(run_dir)["tests"].items()
-            if isinstance(t, dict) and not t.get("withdrawn") and tests_of(t.get("done_when"))}
+    return {str(k): None if t.get("withdrawn") else tests_of(t["done_when"])
+            for k, t in DW.load_registry(run_dir)["tests"].items()
+            if isinstance(t, dict) and (t.get("withdrawn") or tests_of(t.get("done_when")))}
 
 
 def remedy(f: dict) -> str | None:

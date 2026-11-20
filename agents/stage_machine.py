@@ -486,6 +486,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     import open_problems as OP
     import validate_critique_yaml as V
     draft = os.path.exists(os.path.join(run_dir, "manuscript.md"))
+    drafted = draft or os.path.exists(os.path.join(run_dir, "report.md"))     # the gate's own test for a draft
     closed = set(map(str, decision.get("resolved_by_test") or [])) | set(map(str, decision.get("outside_brief") or []))
     out = []
     for reviewer, name in V.FILENAMES.items():
@@ -513,7 +514,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
             if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
                     or str(b.get("id")) in closed):
                 continue
-            if not draft and OP.after_write_item(b):       # the gate's own rule (V._defer_write_findings)
+            if not drafted and OP.after_write_item(b):     # the gate's own rule (V._defer_write_findings)
                 continue
             dw = b.get("done_when")
             out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
@@ -737,11 +738,11 @@ def report_claim_findings(run_dir: str) -> list[dict]:
             "scope_declarable": False, "claim": f"The claims ledger's entry {cid} is invalid and cannot be rendered: {why}"}
            for cid, why in sorted(invalid.items())]
     # A reference is read as the renderer reads it (render_claims.render_text strips the id).
-    for cid in sorted({c.strip() for c in re.findall(r"\[CLAIM:([^\]]*)\]", text)} - set(claims)):
+    for cid in sorted({c.strip() for c in re.findall(r"\[CLAIM:([^\]]*)\]", text)} - set(claims) - set(invalid)):
         out.append({"kind": "report_claim_unresolved", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                     "key": cid, "scope_declarable": False,
                     "claim": f"The report has [CLAIM:{cid}], which is not in the claims ledger."})
-    bare = re.sub(r"\[CLAIM:[^\]]*\]", "", text)          # an id inside a reference is not a bare id
+    bare = re.sub(r"\[CLAIM:[^\]]*\]", " ", text)         # an id inside a reference is not a bare id
     for cid in sorted(c for c in claims if "." in c or "_" in c):     # a plain word is not an id
         if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", bare):
             out.append({"kind": "report_claim_id_raw", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
@@ -1104,10 +1105,15 @@ class Machine:
         allowance once (the task cap when it had none) and mark it, before anything else runs."""
         for j in self.st.journal.values():
             if isinstance(j, dict) and j.get("status") == "started":
-                a = j.get("allowance_usd")
-                self.st.spent_usd += float(a if a is not None else self.st.task_cap_usd)
+                self.st.spent_usd += self._interrupted_charge(j)
                 j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
                 j["status"] = "interrupted"
+
+    def _interrupted_charge(self, j: dict) -> float:
+        """What an interrupted task is charged: its allowance (the task cap when it had none) and, for a write-up
+        task, the read-back allowance it was given (0 in an entry written before that was recorded)."""
+        a, rb = j.get("allowance_usd"), j.get("readback_usd")
+        return float(a if a is not None else self.st.task_cap_usd) + float(rb if isinstance(rb, (int, float)) else 0.0)
 
     # -------------------------------------------------- plumbing
     def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None) -> str:
@@ -1151,8 +1157,7 @@ class Machine:
         if j and j.get("status") == "completed":
             return TaskResult(bool(j.get("ok")), j.get("output"), 0.0, j.get("note", ""), j.get("session_id"))
         if j and j.get("status") == "started":
-            a = j.get("allowance_usd")
-            self.st.spent_usd += float(a if a is not None else self.st.task_cap_usd)
+            self.st.spent_usd += self._interrupted_charge(j)
             j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
             j["status"] = "interrupted"
             save_state(self.run_dir, self.st)
@@ -1169,16 +1174,19 @@ class Machine:
                      f"floor (spent ${self.st.spent_usd:.2f} of ${self.st.budget_usd}). Paused for the owner; resume with "
                      f"python3 main.py --v2 --resume {self.run_dir} --max-budget-usd <higher cap>")
             raise AwaitingBudget(name)
-        j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance, writeup=bool(writeup))
+        a = allowance if allowance is not None else self.st.task_cap_usd
+        b = self._budget(writeup)
+        # A crash read-back is a paid call too: a small cap, from what is left after this allowance (for a
+        # write-up task, left of the reserve it may use).
+        rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
+        # A write-up task spends up to the cap itself, so its read-back allowance is part of what an interrupted
+        # one is charged (_interrupted_charge): the cap holds on resume.
+        j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance, writeup=bool(writeup),
+                 readback_usd=rb if writeup and b is not None else 0.0)
         self.st.journal[key] = j
         save_state(self.run_dir, self.st)
         setter = getattr(self.tasks, "set_allowance", None)
         if setter:
-            a = allowance if allowance is not None else self.st.task_cap_usd
-            b = self._budget(writeup)
-            # A crash read-back is a paid call too: a small cap, from what is left after this allowance (for a
-            # write-up task, left of the reserve it may use).
-            rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
             setter(a, readback_usd=rb)
         res = getattr(self.tasks, name)(*args, **kwargs)
         self._charge(res)
@@ -1212,8 +1220,8 @@ class Machine:
         left = cap - (0.0 if writeup else writeup_reserve(cap)) - self.st.spent_usd
         return {"spent": round(self.st.spent_usd, 4), "cap": cap, "left": round(left, 4)}
 
-    def _out_of_budget(self, writeup: bool = False) -> bool:
-        b = self._budget(writeup)
+    def _out_of_budget(self) -> bool:
+        b = self._budget()
         return b is not None and b["left"] <= 0
 
     def _has_draft(self) -> bool:
@@ -1308,22 +1316,38 @@ class Machine:
             vs += list(fn(run_dir) or []) if fn else []
         return {FL.gate_id(v) for v in vs if isinstance(v, dict)}
 
-    def _rethink(self, to: str, why: str):
-        """A RETHINK back-edge to SPEC or ENGINE_CHOICE, which is told why: the gate's rationale for a structural
-        rethink, this round's rethink briefs for that state, and the open findings they name or that state owns,
-        each with its remedy. An unsigned spec is redrafted with them as its feedback and a fresh count of tries (a
-        signed one is the owner's to amend: h_SPEC); the engine pick is told the engine the run left."""
+    def _rethink(self, to: str, why: str, planned: bool = False):
+        """A RETHINK back-edge to SPEC or ENGINE_CHOICE, which is told why. From the gate (a structural mismatch): its
+        rationale, each critic's description of the mismatch and its STRUCTURAL findings. From the fix loop
+        (`planned`): this round's rethink briefs for that state and the findings they name. Either way, the open
+        findings that state owns, each with its remedy. An unsigned spec is redrafted with them as its feedback and a
+        fresh count of tries (a signed one is the owner's to amend: h_SPEC); the engine pick is told the engine the
+        run left. Nothing read here can stop the back-edge: a file that is not what it should be adds no reason."""
+        import yaml
+        import validate_critique_yaml as V
         g, out, named = self.st.last_gate or {}, [], set()
-        if g.get("action") == "RETHINK_STRUCTURAL" and g.get("rationale"):
-            out.append(f"gate: {g['rationale']}")
-        try:
-            plan = json.load(open(os.path.join(self.run_dir, f"fix_plan_r{self.st.round}.json"))).get("plan") or {}
-        except (OSError, ValueError, AttributeError):
-            plan = {}
-        for t in plan.get("tasks") or []:
-            if isinstance(t, dict) and t.get("action") == "rethink" and t.get("owner_state") == to:
-                out.append(f"fix plan: {t.get('brief')}")
-                named |= {str(x) for x in t.get("findings") or []}
+        if not planned:
+            if g.get("action") == "RETHINK_STRUCTURAL" and g.get("rationale"):
+                out.append(f"gate: {g['rationale']}")
+            for reviewer in CRITICS:
+                try:
+                    doc = yaml.safe_load(open(os.path.join(self.run_dir, V.FILENAMES[reviewer])))
+                    sm = doc.get("structural_mismatch") or {}
+                    if sm.get("detected"):
+                        out.append(f"{reviewer}: {sm.get('description')}")
+                    named |= {str(b.get("id")) for b in doc.get("blockers") or []
+                              if isinstance(b, dict) and b.get("category") == "STRUCTURAL" and not b.get("resolved")}
+                except Exception:  # noqa: BLE001 -- the gate already judged the file; here it only adds reasons
+                    continue
+        else:
+            try:
+                plan = json.load(open(os.path.join(self.run_dir, f"fix_plan_r{self.st.round}.json")))["plan"]["tasks"]
+            except Exception:  # noqa: BLE001
+                plan = []
+            for t in plan if isinstance(plan, list) else []:
+                if isinstance(t, dict) and t.get("action") == "rethink" and t.get("owner_state") == to:
+                    out.append(f"fix plan: {t.get('brief')}")
+                    named |= {str(x) for x in (t.get("findings") if isinstance(t.get("findings"), list) else [])}
         out += [f"{f.id}: {f.claim}" + (f" Required: {f.fix_requires}" if f.fix_requires else "")
                 for f in FL.open_findings(FL.load(self.run_dir)) if f.id in named or f.owner_state == to]
         out = [" ".join(str(x).split())[:600] for x in out][:20]
@@ -1354,7 +1378,9 @@ class Machine:
         self.st.paused = None
         if s == "SPEC" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
             return self.h_SPEC()                 # the amendment pause costs no model call (Codex review of #261 P1-3)
-        if s in LLM_STATES and self._out_of_budget(writeup=s == "PRESENTATION"):
+        # PRESENTATION is not checked here: its one task is a write-up task, and _task replays a completed review
+        # before it looks at the budget (h_PRESENTATION takes the budget path when there is no allowance).
+        if s in LLM_STATES and s != "PRESENTATION" and self._out_of_budget():
             return self._budget_out(s)
         try:
             return getattr(self, "h_" + s)()
@@ -1751,7 +1777,7 @@ class Machine:
             return self._go("OWNER_DECISION", f"{len(summ['owner_amendments'])} finding(s) need an owner amendment "
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
-            return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})")
+            return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})", planned=True)
         if not summ["tasks"] and summ.get("write_up") and self._has_draft():
             # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
             if self.st.round_pending:
