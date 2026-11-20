@@ -129,103 +129,20 @@ def main_py_args(cmd) -> list | None:
     return calls[0] if calls else None
 
 
-_SHELLS = {"sh", "bash", "zsh", "dash"}
-
-
-_PREFIXES = {"env", "exec", "command", "nohup", "nice", "time", "timeout", "stdbuf", "setsid"}
-_PY_OPTS_WITH_OPERAND = {"-X", "-W", "-Q"}       # python options whose operand is the next token
-
-
-def _strip_comments(text: str) -> str:
-    """The text bash executes: an unquoted `#` that starts a word ends its line (the retirement scan only)."""
-    out, q, prev = [], None, " "
-    i = 0
-    while i < len(text):
-        c = text[i]
-        if q:
-            if c == "\\" and q == '"' and i + 1 < len(text):
-                out.append(text[i:i + 2]); i += 2; prev = "x"; continue
-            if c == q:
-                q = None
-        elif c == "\\" and i + 1 < len(text):
-            out.append(text[i:i + 2]); i += 2; prev = "x"; continue
-        elif c in "'\"":
-            q = c
-        elif c == "#" and (prev.isspace() or prev in ";&|()"):
-            while i < len(text) and text[i] != "\n":
-                i += 1
-            continue
-        out.append(c)
-        prev = c
-        i += 1
-    return "".join(out)
-
-
-def _retired_calls(cmd, depth: int = 0) -> bool:
-    """Whether a command runs main.py with --v1 where this module can see it: `python [opts] main.py`,
-    `python [opts] -m main` / `-mmain`, an executable `main.py`, behind env/exec/nohup-style prefixes, or
-    inside a shell wrapper's `-c` string (with its positional arguments for "$@"). v1 retirement: a
-    shipped tree from before it still accepts --v1. Used only to refuse; a command that passes keeps
-    the classification it had before the retirement, and only executable positions count (`echo main.py
-    --v1` is text)."""
-    try:
-        argvs = _split_commands(_strip_comments(cmd) if isinstance(cmd, str) else cmd)
-    except (PipelineError, ValueError):        # a string this lexer cannot read keeps its old classification
-        return False
-    for argv in argvs:
-        while argv and (os.path.basename(argv[0]) in _PREFIXES or ("=" in argv[0] and not argv[0].startswith("-"))):
-            argv = argv[1:]          # env VAR=x, exec, nohup, timeout 60 ...: the prefix, its options and numbers
-            while argv and (argv[0].startswith("-") or argv[0].rstrip("smhd").replace(".", "").isdigit()):
-                argv = argv[1:]
-        if not argv:
-            continue
-        head = os.path.basename(argv[0])
-        rest = None
-        if head.startswith("python"):
-            i = 1
-            while i < len(argv):
-                t = argv[i]
-                if t in _PY_OPTS_WITH_OPERAND:
-                    i += 2
-                    continue
-                if t == "-m":
-                    rest = argv[i + 2:] if i + 1 < len(argv) and argv[i + 1] == "main" else None
-                elif t == "-mmain":
-                    rest = argv[i + 1:]
-                elif t.startswith("-") and t not in ("-c", "-"):
-                    i += 1
-                    continue
-                elif os.path.basename(t) == "main.py":
-                    rest = argv[i + 1:]
-                break
-        elif head == "main.py":
-            rest = argv[1:]
-        if rest is not None and _flag_tokens(rest)[0]:
-            return True
-        if head in _SHELLS and depth < 3:      # sh -c '...', bash -lc '...', bash -ec '...'
-            for j, t in enumerate(argv[1:], 1):
-                if t.startswith("-") and not t.startswith("--") and "c" in t[1:]:
-                    if j + 1 < len(argv):
-                        script, positional = argv[j + 1], argv[j + 3:]   # $0 is argv[j + 2]
-                        if ("$@" in script or "$*" in script) and positional:
-                            script = script.replace('"$@"', shlex.join(positional)).replace("$@", shlex.join(positional))
-                            script = script.replace('"$*"', shlex.join(positional)).replace("$*", shlex.join(positional))
-                        if _retired_calls(script, depth + 1):
-                            return True
-                    break
-    return False
-
-
 def from_command(cmd) -> str | None:
     """A job command's main.py pipeline when every main.py call in it states the same one
     explicitly; None when it runs no main.py. Raises PipelineError when a call relies on the
     default (the default changed once and silently, 2026-11-05), when calls disagree, or when
     a shell string makes main.py's arguments depend on an expansion (`$(...)`, backquotes)."""
+    try:
+        literal = main_py_calls(cmd)
+    except PipelineError:
+        literal = []
+    if any(_flag_tokens(args)[0] for args in literal):     # a literal main.py --v1: retired, whatever else
+        raise PipelineError(RETIRED_MESSAGE)
     if isinstance(cmd, str) and "main.py" in cmd and ("`" in cmd or "$(" in cmd):
         raise PipelineError("the command builds main.py's arguments with a command substitution: "
                             "state the pipeline as a literal --v2")
-    if _retired_calls(cmd):
-        raise PipelineError(RETIRED_MESSAGE)
     calls = main_py_calls(cmd)
     if not calls:
         return None
@@ -429,35 +346,31 @@ def _self_test() -> int:
         ok(False, f"PI29b a command with a second main.py --v1 call is refused (got {got})")
     except PipelineError as e:
         ok(str(e) == RETIRED_MESSAGE, f"PI29b a command with a second main.py --v1 call is refused as retired: {e}")
-    # PI39 (Codex on the retirement PR, P1): main.py run as a module or inside a shell wrapper is seen
-    # for --v1; a wrapper relying on the default keeps working as before (not read as a main.py call).
-    for cmd in (["python3", "-m", "main", "--v1", "Q?"], "python3 -m main --v1 'Q?'",
-                ["bash", "-c", "python3 main.py --v1 'Q?'"], "sh -c 'cd x && python3 main.py Q --v1'",
-                "bash -lc 'python3 main.py --v1 Q'", "python3 -mmain --v1 Q", ["/usr/bin/env", "bash", "-ec", "python3 main.py --v1"],
-                # Codex round 3: interpreter options with operands, exec prefixes, a comment in the -c string, "$@"
-                "python3 -X dev -m main --v1 Q", "python3 -W ignore main.py --v1 Q", "bash -c 'exec python3 -m main --v1 Q'",
-                "bash -c 'python3 main.py Q --v1 # baseline run'", ["bash", "-c", 'python3 main.py "$@"', "_", "--v1", "Q"]):
+    # PI39 (retirement PR, Codex rounds 1-4): main.py run directly with --v1 is refused here; a module run or a
+    # shell wrapper keeps the classification it had before (None): shipping a tree whose main.py still accepts
+    # --v1 is refused by cloud/vm_job.py (retired_tree_problem), and a retired tree's main.py refuses --v1 itself.
+    for cmd in ("python3 main.py --v1 Q", ["python3", "./main.py", "Q", "--v1"], "cd x && python3 main.py Q --v1 > log"):
         try:
             got = from_command(cmd)
             ok(False, f"PI39 {cmd!r} is refused as retired (got {got})")
         except PipelineError as e:
             ok(str(e) == RETIRED_MESSAGE, f"PI39 {cmd!r} is refused as retired: {e}")
-    ok(from_command(["bash", "-c", "python3 main.py 'Q?'"]) is None
-       and from_command("python3 -m main Q --v2") is None,
-       "PI39b wrapped or module commands without --v1 are classified as before")
-    # PI39c (Codex round 2): the scan never changes a v2 command's classification.
     for cmd, want in (("python3 main.py Q --v2 && echo -m main --v1", "v2"),
                       ("python3 main.py Q --v2 && bash -c 'echo main.py --v1 is retired'", "v2"),
-                      (["bash", "-c", "echo \"$@\"", "_", "--v1"], None),
                       (["bash", "-c", "python3 main.py --v2 $'What\\'s next?'"], None),
-                      (["bash", "-c", "echo 'unclosed"], None)):
+                      (["bash", "-c", 'case "$1" in v1) python3 main.py --v1 "$2" ;; v2) python3 main.py --v2 "$2" ;; esac',
+                        "_", "v2", "Q?"], None),
+                      ("python3 -m main --v1 Q", None)):
         try:
             got = from_command(cmd)
-            ok(got == want, f"PI39c {cmd!r} classifies as {want} (got {got})")
+            ok(got == want, f"PI39c {cmd!r} keeps its pre-retirement classification {want} (got {got})")
         except PipelineError as e:
-            ok(False, f"PI39c {cmd!r} classifies as {want}, not refused: {e}")
-    ok(from_command("python3 main.py Q --v2\ncp -r runs $JOB_OUT/") == "v2", "PI30 a later line does not hide main.py's flag")
-    ok(from_command("python3 main.py A --v2 && python3 main.py B --v2") == "v2", "PI31 several calls that agree")
+            ok(False, f"PI39c {cmd!r} keeps its pre-retirement classification {want}, not refused: {e}")
+    try:
+        got = from_command('python3 main.py --v1 "$(cat question.txt)"')
+        ok(False, f"PI39d a literal --v1 with a command substitution is refused (got {got})")
+    except PipelineError as e:
+        ok(str(e) == RETIRED_MESSAGE, f"PI39d (Codex P2) a literal --v1 is refused as retired before the substitution check: {e}")
     # PI36-38 (Codex r2): comments, redirections and continued lines.
     try:
         got = from_command("python3 main.py Q # --v2")

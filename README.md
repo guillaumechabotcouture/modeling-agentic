@@ -208,7 +208,7 @@ python main.py --v2 "Which districts should receive measles follow-up campaigns 
 | `--v2` | on | The v2 stage machine (the default; the flag is a no-op kept for existing commands) |
 | `--launcher NAME` | `$MA_LAUNCHER` or `direct` | Name of the launcher, recorded in `metadata.json` (the cloud launchers set it) |
 | `--signoff owner\|lead\|none` | owner | Who signs the decision brief (v1) or the decision spec (v2) before compute; `lead` for unattended test runs |
-| `--signoff-hours H` | 24 | How long a v1 owner sign-off wait lasts before the run pauses (resumable) |
+| `--signoff-hours H` | 24 | Accepted for existing launch configs; it set the retired v1 sign-off wait |
 | `--max-budget-usd X` | — | Hard dollar cap for the whole run, including earlier sessions of a resumed run |
 | `--methods-critic` | off | Add `critique-methods` to every v1 STAGE 6 |
 | `--cross-model` | off | Add the Codex CLI cross-model critic to every v1 STAGE 6 (sends run artifacts to OpenAI) |

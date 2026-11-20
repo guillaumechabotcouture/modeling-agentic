@@ -217,6 +217,20 @@ def job_pipeline(cmd) -> str | None:
         raise SystemExit(f"{e}{hint}: refusing") from None
 
 
+def retired_tree_problem(cmd, code: bytes | None) -> str | None:
+    """Why a command may not ship with this code, or None: it mentions --v1 anywhere (a wrapper or a module run
+    this launcher cannot parse included) and the shipped tree's main.py predates the v1 retirement, so it would
+    still run v1. A tree at or after the retirement refuses --v1 itself, so its jobs keep the checks they had."""
+    text = cmd if isinstance(cmd, str) else " ".join(str(t) for t in (cmd or ()))
+    if "--v1" not in text or code is None:
+        return None
+    src = rc._archive_member(code, "scripts/lib/pipeline_id.py") or b""
+    if b"RETIRED_MESSAGE" in src:
+        return None
+    return (f"the command mentions --v1 and the shipped tree's main.py predates the v1 retirement (it would still "
+            f"run v1); {pipeline_id.RETIRED_MESSAGE}: refusing")
+
+
 def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
     """The job's extra environment: its secrets, and its launcher's name for main.py's metadata.json."""
     return {**(secrets or {}), "MA_LAUNCHER": f"vm_job:{name}/{job_id}"}
@@ -574,6 +588,9 @@ def cmd_start(a, cluster=None):
         checked = _live_vm_types_ok(a.name)     # and the budget must be able to price every VM it runs
         _budget_gate(a, a.name, reserve=False)
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
+    why = retired_tree_problem(cmd if not (isinstance(cmd, (list, tuple)) and len(cmd) == 1) else cmd[0], code)
+    if why:
+        raise SystemExit(why)
     base = getattr(a, "base_name", a.name)
     secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
                       base, a.job_id)
@@ -898,6 +915,9 @@ def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
     job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
+    why = retired_tree_problem(a.command[0] if len(a.command or ()) == 1 else a.command, a._code)
+    if why:                                # a pre-retirement tree with a --v1 job, before anything is created
+        raise SystemExit(why)
     _vm_request(a)                         # so is a request no priced VM type matches (before the reservation)
     base, unique = a.name, run_cluster_name(a.name, a.job_id)
     meter = _budget_gate(a, unique, meter=True)   # before any listing or cluster; reserved for the exact name it creates
@@ -1218,6 +1238,29 @@ def _self_test_pipeline(ok) -> None:
     ok(jp(["python3", "main.py", "Q?", "--v2"]) == "v2" and jp("bash toolkit/x/validate_once.sh 16") is None
        and jp(["python3 main.py 'Q?' --v2"]) == "v2",
        "VP2 an explicit main.py command gives its pipeline (argv, or one shell string); other commands have none")
+    # VP2c (retirement PR, Codex round 4): a --v1 command this launcher cannot parse (a wrapper, a module run) is
+    # refused when the shipped tree predates the retirement; a retired tree's own main.py refuses it.
+    rtp = g.get("retired_tree_problem")
+    with tempfile.TemporaryDirectory() as tdv:
+        trees = {}
+        for kind, src in (("old", b"PIPELINES = ('v1', 'v2')\n"), ("new", b"RETIRED_MESSAGE = 'x'\n")):
+            d = os.path.join(tdv, kind)
+            os.makedirs(os.path.join(d, "scripts", "lib"))
+            open(os.path.join(d, "scripts", "lib", "pipeline_id.py"), "wb").write(src)
+            open(os.path.join(d, "main.py"), "w").write("x\n")
+            trees[kind] = _tarball(None, d)
+        wrapped = ("bash -c 'python3 main.py \"$1\"' _ --v1", "python3 -um main --v1 Q",
+                   "env -u PYTHONPATH python3 -m main --v1 Q", "bash -c 'for q in a b; do python3 main.py --v1 $q; done'")
+        ok(rtp is not None and all(rtp(c, trees["old"]) and pipeline_id.RETIRED_MESSAGE in rtp(c, trees["old"])
+                                   for c in wrapped),
+           "VP2c a --v1 command in any form is refused when the shipped tree predates the retirement")
+        ok(rtp is not None and not any(rtp(c, trees["new"]) for c in wrapped)
+           and not rtp("python3 main.py Q --v2", trees["old"]) and not rtp(["python3", "main.py", "--v2"], trees["old"]),
+           "VP2d a retired tree is not refused (its main.py refuses --v1), nor a v2 command on an older tree")
+        ok(rtp is not None and "retired_tree_problem(" in inspect.getsource(_run_locked)
+           and "retired_tree_problem(" in inspect.getsource(cmd_start)
+           and inspect.getsource(_run_locked).index("retired_tree_problem(") < inspect.getsource(_run_locked).index("_create("),
+           "VP2e run and start check the shipped tree before anything is created")
     for cmd in (["python3 main.py 'Q?' --v1"], ["python3", "main.py", "--v1", "--resume", "runs/R1"]):
         try:
             got = jp(cmd)
