@@ -3742,11 +3742,20 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         # findings share a key and every reader of the id (gate, registry, ledger) sees the same text.
         d = os.path.join(td, "a1_cx32")
         os.makedirs(d)
-        S = StubTasks({"critics": {1: {"critique-domain": [{"id": "D-072 ", "severity": "MEDIUM", "claim": "c"}]}}})
-        for r in CRITICS:
+        S = StubTasks({"critics": {1: {"critique-domain": [{"id": "D-072 ", "severity": "MEDIUM", "claim": "c"}],
+                                       "critique-methods": [{"id": "M-072 ", "severity": "LOW", "claim": "c"}]}}})
+        for r in CRITICS + ("critique-methods",):
             S.critique(d, r, 1)
         errs = v2_gate(d, 1, 3, False, [], history=False).get("schema_errors") or []
         ok(any("critique_domain.yaml" in e and "whitespace" in e for e in errs), f"CX3-2 a padded id is a schema error ({errs})")
+        # CX4 (last narrow pass): only for the reviewers this machine can ask to repair (a methods file is not one),
+        # and together with a file's other schema errors, so one repair fixes both.
+        doc = yaml.safe_load(open(os.path.join(d, "critique_domain.yaml")))
+        doc.pop("verdict")
+        yaml.safe_dump(doc, open(os.path.join(d, "critique_domain.yaml"), "w"))
+        errs2 = v2_gate(d, 1, 3, False, [], history=False).get("schema_errors") or []
+        ok(not any("critique_methods" in e for e in errs) and any("whitespace" in e for e in errs2)
+           and any("verdict" in e for e in errs2), f"CX4 padded ids: repairable reviewers only, with a file's other errors ({errs}, {errs2})")
 
     def r3_presentation():
         # CX3-1 (documented behaviour, pinned): a presentation task that fails and writes no review goes on to the
