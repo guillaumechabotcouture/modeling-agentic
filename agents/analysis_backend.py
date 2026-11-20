@@ -164,14 +164,27 @@ def card_fits(card, needs: dict) -> list[str]:
 
 def named_engine(spec: dict) -> tuple:
     """(ref, config) of a spec that names its engine (`engine: 'module:Class'` or `{ref, config}` without `auto:
-    true`); (None, None) for `engine: auto` or no engine. `config` is None unless it is a mapping with entries."""
+    true`); (None, None) for `engine: auto` or no engine. `config` is the mapping the spec gives (an empty one
+    included: the schema builds the engine from it), or None when the spec gives none."""
     eng = spec.get("engine")
     if isinstance(eng, str) and eng != "auto":
         return eng, None
     if isinstance(eng, dict) and eng.get("auto") is not True and isinstance(eng.get("ref"), str):
         cfg = eng.get("config")
-        return eng["ref"], (cfg if isinstance(cfg, dict) and cfg else None)
+        return eng["ref"], (cfg if isinstance(cfg, dict) else None)
     return None, None
+
+
+def signed_config_problems(spec: dict) -> list[str]:
+    """What SIGNED_CONFIG_CHECKS refuses in the configuration a spec gives its named engine: checked before anything
+    builds the engine from it."""
+    ref, cfg = named_engine(spec)
+    try:
+        if cfg is not None:
+            SIGNED_CONFIG_CHECKS.get(ref, lambda c: None)(cfg)
+    except Exception as e:  # noqa: BLE001 -- a configuration the check cannot read is refused (fail closed)
+        return [f"engine.config: {type(e).__name__}: {e}"]
+    return []
 
 
 def candidate_entries(spec: dict, engines=None) -> list:
@@ -179,7 +192,7 @@ def candidate_entries(spec: dict, engines=None) -> list:
     use no other: the schema reads a named engine from the spec, never from the choice); for `engine: {auto: true,
     candidates: [...]}` the signed candidates. A named engine or candidate that is not registered is considered with
     no card file and no configuration function. An explicit `engines` list is considered as given."""
-    entries = list(engines or ENGINES)
+    entries = list(ENGINES if engines is None else engines)
     eng = spec.get("engine")
     named = named_engine(spec)[0]
     if engines is None and named:
@@ -613,6 +626,9 @@ class _ToolkitApi:
             if derived is not None:
                 s.derived = derived
             if not s.engine_pending:
+                over = signed_config_problems(s.raw)
+                if over:        # before validation builds the engine from the signed configuration
+                    return over
                 bad = list(schema.validate(s))
                 self.candidates = self._named_rows(s)       # the sheet shows the named engine's departures
                 return bad
