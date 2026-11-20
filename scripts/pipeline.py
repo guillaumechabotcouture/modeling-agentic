@@ -212,7 +212,18 @@ def _is_step_log(path: str, run_dir: str) -> bool:
     output or code, whatever a declaration matches. Other files in that directory are ordinary files."""
     logs = os.path.join(os.path.realpath(run_dir), *LOG_DIR.split("/"))
     rp = os.path.realpath(path)
-    return rp.endswith(".log") and os.path.dirname(rp) == logs and os.path.realpath(logs) == logs
+    try:              # by identity, not spelling: a case-insensitive volume has many names for the directory
+        return rp.lower().endswith(".log") and os.path.realpath(logs) == logs \
+            and os.path.samefile(os.path.dirname(rp), logs)
+    except OSError:
+        return False
+
+
+def _names_step_log(pat: str) -> bool:
+    """Whether a declared path or glob names a step log by its spelling (any case): <LOG_DIR>/<...>.log."""
+    import posixpath
+    norm = posixpath.normpath(pat.replace(os.sep, "/")).lower()
+    return posixpath.dirname(norm) == LOG_DIR and norm.endswith(".log")
 
 
 def _matches(run_dir: str, pat: str) -> list[str]:
@@ -370,6 +381,8 @@ def load(run_dir: str) -> tuple[list[dict], list[str]]:
                 st[k] = []
         if not st["outputs"]:
             errs.append(f"{where}: declares no outputs")
+        errs += [f"{where}: output {o} names one of the runner's step logs ({LOG_DIR}/*.log); write it elsewhere"
+                 for o in st["outputs"] if _names_step_log(o)]
         if "timeout_s" in st and (not isinstance(st["timeout_s"], (int, float)) or isinstance(st["timeout_s"], bool)
                                   or not 0 < st["timeout_s"] < float("inf")):    # NaN fails too (Codex on #267)
             errs.append(f"{where}: `timeout_s` must be a positive finite number")
@@ -631,8 +644,8 @@ def code_files(step: dict, run_dir: str) -> list[str]:
     # `--out out.csv` changed the step's code key while it ran. Imports are still followed.
     outs = list(step.get("_all_outputs") or step_outputs(step))
     data = outs + step_inputs(step)
-    return sorted(p for p in named | py
-                  if not (_inside(p, run_dir) and any(path_match(_rel(p, run_dir), pat) for pat in data)))
+    return sorted(p for p in named | py if not _is_step_log(p, run_dir)       # also one reached through an import
+                  and not (_inside(p, run_dir) and any(path_match(_rel(p, run_dir), pat) for pat in data)))
 
 
 def _rel(p: str, run_dir: str) -> str:
@@ -949,6 +962,10 @@ def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None, s
     following a link (the step then runs as before the log existed: stderr's tail only)."""
     rel, sink = step_log(step), None
     try:
+        if os.path.lexists(os.path.join(run_dir, rel + ".summary.json")):
+            # compute.py's code fingerprint hashes a file that has a `.summary.json` beside it as a results file,
+            # whatever its extension: a log there would change the fingerprint each time the runner appends to it.
+            raise ValueError("a results summary sits beside the log path")
         sink = _Sink(run_dir, rel, f"=== step {step['id']} | pipeline run {_RUN_ID} | started {_iso(time.time())} ===\n")
     except (OSError, ValueError) as e:
         _warn(f"[pipeline] step {step['id']}: no log ({rel}: {e}); the step runs without one")
