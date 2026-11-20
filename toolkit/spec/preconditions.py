@@ -61,6 +61,16 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     spec whose posterior the analysis refuses only at its start (f6-posterior-ranges)."""
     if "net_effect_posterior" not in (spec.raw.get("uncertainty") or {}):       # empty: refused by posterior_input
         return []
+    post = (spec.raw.get("uncertainty") or {}).get("net_effect_posterior")
+    # a non-owner signer is refused; None is a draft or execution check (signing passes its signer: Codex r2 of #291)
+    if isinstance(post, dict) and post.get("exception") is not None:
+        if signer not in (None, "owner"):
+            return [f"net_effect_posterior: an exception to the acceptance rule is the owner's to sign (signer "
+                    f"{signer!r})"]
+        from toolkit.engines import benchmark_coverage as BC
+        if signer is None and run_dir and BC.signature(run_dir) == "unsigned":     # execution: the recorded sign-off
+            return ["net_effect_posterior: an exception to the acceptance rule counts only under the owner's "
+                    "signature of this spec (the recorded sign-off is a lead's, or the spec changed since)"]
     if getattr(spec, "engine_pending", False):
         return ["net_effect_posterior: engine: auto is still pending; the posterior is bound to one engine's fit and "
                 "is checked once the engine is chosen"]
@@ -590,6 +600,28 @@ def _self_test() -> int:
         finally:
             BC.OVERRIDES.pop("toolkit.engines.contract:ToyEngine", None)
     _self_test_declared_range(ok)
+    # Codex review of #291 (P1): a net-effect posterior exception is the owner's: any other signer is refused
+    from types import SimpleNamespace as _NS
+    sp = _NS(raw={"uncertainty": {"net_effect_posterior": {"path": "p.yaml", "sha256": "0" * 64, "exception": {
+        "failed_points": [{"point": {"a": 0.1}, "targets": ["T1"]}], "rule": "r", "evidence": "e", "reason": "x",
+        "draws": "keep"}}}}, engine_pending=True)
+    lead = _net_effect_posterior(None, sp, "lead")
+    owner = _net_effect_posterior(None, sp, "owner")
+    # at execution (signer None) the run's recorded sign-off decides, as for engine departures: a lead's record (or a
+    # spec changed since the owner signed) refuses the exception; no record yet (a draft) does not
+    from toolkit.engines import benchmark_coverage as _BC
+    orig_sig = _BC.signature
+    try:
+        _BC.signature = lambda run_dir, by=None: "unsigned"
+        run_lead = _net_effect_posterior("/somewhere", sp, None)
+        _BC.signature = lambda run_dir, by=None: "signed"
+        run_owner = _net_effect_posterior("/somewhere", sp, None)
+    finally:
+        _BC.signature = orig_sig
+    ok(any("owner" in x and "exception" in x for x in run_lead) and not any("exception" in x for x in run_owner),
+       f"PC13 at execution, a run whose recorded sign-off is not the owner's refuses the exception ({run_lead[:1]})")
+    ok(any("owner" in x and "exception" in x for x in lead) and not any("exception" in x for x in owner),
+       f"PC12 a net-effect posterior exception signed by someone other than the owner is refused ({lead[:1]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

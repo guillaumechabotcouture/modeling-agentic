@@ -1089,7 +1089,8 @@ def target_digests(base: dict, ids) -> dict:
     return {b["id"]: band_digest(b, base) for b in base["benchmarks"] if b["id"] in set(ids)}
 
 
-def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True, point=None) -> None:
+def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = True, point=None,
+                         fail_target: str | None = None) -> None:
     """A placeholder output in run()'s own format, through finalize() and document() (self-tests only). `point`: the
     chosen point's values (default the first row; False leaves the chosen point without one)."""
     ks = [(-1, 0, 1, 0)[i % 4] for i in range(len(pack_seeds()))]       # one seed value per pack seed
@@ -1099,9 +1100,15 @@ def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = 
     ch = {"per_seed": mid(1.0), "all_in_band": True, "disproved_by_verification": [], "calibration_check": {}}
     if point is not False:
         ch["point"] = dict(rows[0] if point is None else point)
-    reg, _ = finalize({"sample": [dict(r) for r in rows]}, [pt], ch)
+    pts = [pt]
+    if fail_target:     # a second verified point (rows[1]) out of band on one target only
+        per = mid(1.0)
+        per[fail_target] = [v * 3.0 for v in per[fail_target]]
+        pts.append({"point": rows[1], "per_seed": per, "calibration_check": {"site": {"achieved": 1.0, "target": 1.0}}})
+    reg, _ = finalize({"sample": [dict(r) for r in rows]}, pts, ch)
     fit = {"parameters": {k: {"value": v} for k, v in ch.get("point", {}).items()}}     # as run()'s **fit
-    yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []},
+    yaml.safe_dump(document(eng, reg, {"params": box, "verified_sample_points": len(pts)}, False,
+                            calibration_grid={"at_grid_edge": []},
                             fit_rule={"seeds": pack_seeds()},
                             target_digests=target_digests(yaml.safe_load(open(PACK)), pack_bands()), **fit),
                    open(path, "w"), sort_keys=False)
@@ -1126,7 +1133,15 @@ def read_signed(path: str, digest) -> bytes:
     return data
 
 
-def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None = None) -> dict:
+def _same_point(a, b) -> bool:
+    """Two parameter points are the same: the same names, each value equal after the file's 6-decimal rounding."""
+    return (isinstance(a, dict) and isinstance(b, dict) and sorted(a) == sorted(b)
+            and all(isinstance(a[k], (int, float)) and isinstance(b[k], (int, float))
+                    and round(float(a[k]), 6) == round(float(b[k]), 6) for k in a))
+
+
+def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None = None,
+                   exception: dict | None = None) -> dict:
     """The fit's accepted joint sample as whole rows: {path, sha256 (the signed one), names, rows (n x k)}.
     `data`: the bytes already read by read_signed (read once, Codex r1 P2-4); they must match `digest` too.
     `ranges` {name: (lo, hi)}: the parameters the uncertainty draws vary and their ranges. Refused (PosteriorRefused)
@@ -1185,14 +1200,52 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
         no(f"the run's recorded seeds (fit_rule.seeds) are not a valid declaration: {ex}")
     if rec != seeds:
         no(f"the run's recorded seeds {rec} are not pack.yaml's {seeds}")
-    try:
-        bands = pack_bands()        # the targets the replay checks the chosen point on (finalize's default)
+    bands = pack_bands()            # the targets the replay checks the chosen point on (finalize's default)
+    exc = None
+    if exception is not None:       # owner, 20 Nov: a declared exception, matched to the file's recorded failures
+        if reg.get("sample") != [] or not reg.get("sample_unverified") or reg.get("sample_status") != "invalid":
+            no("an exception applies only to a sample the fit recorded as invalid (sample_unverified)")
+        need = (doc.get("plan") or {}).get("verified_sample_points")
+        distinct = {json.dumps(p.get("point"), sort_keys=True) for p in pts}
+        if isinstance(need, bool) or not isinstance(need, int) or need < 1 or len(distinct) < need:
+            no(f"the fit verified {len(distinct)} distinct sample points against a declared {need!r}: not an "
+               f"exception's case")
+        fails = []
+        for p in pts:               # only target misses are waivable: seed evidence and calibration bind every point
+            per = _per_seed(p)
+            bad_ev = seed_count_errors(p, bands, seeds) or [t for t in bands if
+                                                              seed_interval(per.get(t) or [], len(seeds)) is None]
+            if not point_in_band(p, bands, seeds)[0]:
+                cal = p.get("calibration_check")
+                bad_ev = bad_ev or not isinstance(cal, dict) or not cal or calibration_ok(cal)
+            if bad_ev:
+                no(f"verified point {p.get('point')} fails on its seed evidence or calibration, which no exception "
+                   f"waives")
+            if not point_in_band(p, bands, seeds)[0]:
+                per = _per_seed(p)
+                fails.append({"point": p["point"], "targets": sorted(
+                    t for t, b in bands.items() if not ci_in_band(per.get(t) or [], b, len(seeds)))})
+        decl = [{"point": dict(x["point"]), "targets": sorted(x["targets"])} for x in exception["failed_points"]]
+        pair = [[j for j, x in enumerate(decl) if _same_point(f["point"], x["point"]) and f["targets"] == x["targets"]]
+                for f in fails]          # one to one: each failure matches exactly one declaration, and vice versa
+        if not fails or len(fails) != len(decl) or any(len(m) != 1 for m in pair) \
+                or sorted(m[0] for m in pair) != list(range(len(decl))):
+            no(f"the declared exception {decl} is not the file's recorded failures {fails} (the same points, the same "
+               f"targets, one to one)")
+        failed = [f["point"] for f in fails]       # the file's own coordinates of the matched points
+        pts = [p for p in pts if not any(p["point"] == fp for fp in failed)]
+        rows = list(reg["sample_unverified"])
+        if exception.get("draws") == "exclude":
+            rows = [r for r in rows if not any(r == fp for fp in failed)]
+        X = [[float(r[k]) for k in names] for r in rows]
+        exc = dict(exception, failed_points=decl)
+    try:            # with an exception: the rest of the evidence must pass the rule as it stands
         rr, code = finalize({"sample": _copy.deepcopy(rows)}, _copy.deepcopy(pts), _copy.deepcopy(ver.get("chosen")),
                            edge, bands=bands, seeds=seeds)
         why = rr["acceptance"]
     except (KeyError, TypeError, ValueError, AttributeError) as ex:
         code, why = 2, [f"{type(ex).__name__}: {ex}"]
-    if code != 0 or reg.get("sample") != rows:
+    if code != 0 or (exc is None and reg.get("sample") != rows) or not rows:
         no(f"the fit's acceptance gate (finalize, replayed on the file's evidence) does not pass: {why}")
     miss = [k for k in names if k not in ranges]
     if miss:
@@ -1214,8 +1267,8 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
     td = doc.get("target_digests") if isinstance(doc.get("target_digests"), dict) else {}
     trained = {k: td[k] for k in sorted(set(bands) & set(tt) - set(ho)) if decl[k].get("band") == bands[k]
                and td.get(k) == band_digest(decl[k], base)} if isinstance(tt, list) and isinstance(ho, list) else {}
-    return {"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X,
-            "trained": trained}
+    return dict({"path": os.path.abspath(path), "sha256": str(digest).lower(), "names": names, "rows": X,
+                 "trained": trained}, **({"exception": exc} if exc else {}))
 
 
 # hard bounds a card's units imply (owner, 14 Nov, f6-posterior-ranges): a value outside them is not physical
@@ -1882,6 +1935,97 @@ def _self_test() -> int:
            f"F15 the loader fails closed, each for its own reason, in {len(why)} cases ({sorted(why)}; refused for "
            f"another reason or not at all: {wrong or 'none'}); a changed sample has another sha256")
     case("F14", f14)
+
+    def fe1():
+        # owner, 2026-11-20 (F6 option A, refit b2): an invalid sample is accepted ONLY under a spec-declared, owner-
+        # signed exception that matches the file's recorded failures exactly (the same points, the same targets); the
+        # declaration keeps or excludes the failed point(s) from the draws
+        import hashlib
+        import tempfile
+        box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
+               "cfp_half": [547.5, 1277.5]}
+        u = [float(v) for v in np.random.default_rng(6).uniform(0, 1, 30)]
+        rows = [{"net_kill_shift": round(-0.5 + x, 6), "cfp_kill": round(0.3 + 0.2 * x, 6), "irs_kill": 0.5,
+                 "cfp_half": round(700 + 300 * x, 6)} for x in u]
+        rg = {"net_kill_shift": (-0.618, 0.66), "cfp_kill": (0.0, 0.85), "irs_kill": (0.0, 0.95),
+              "cfp_half": (547.5, 1277.5)}
+        dg = lambda q: hashlib.sha256(open(q, "rb").read()).hexdigest()  # noqa: E731
+        tgt = sorted(pack_bands())[0]
+        exc = lambda pts, draws="keep": {"failed_points": pts, "rule": "14 Nov", "evidence": "e", "reason": "r",  # noqa: E731
+                                         "draws": draws}
+        got = {}
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "net_effect_fit.yaml")
+            _fixture_placeholder(f, e, rows, box, fail_target=tgt)
+            good = os.path.join(d, "good.yaml")
+            _fixture_placeholder(good, e, rows, box)
+
+            def try_(label, path, ex):
+                try:
+                    got[label] = load_posterior(path, e, rg, dg(path), exception=ex)
+                except PosteriorRefused as er:
+                    got[label] = str(er)
+            try_("no exception", f, None)
+            try_("matching, keep", f, exc([{"point": rows[1], "targets": [tgt]}]))
+            try_("matching, exclude", f, exc([{"point": rows[1], "targets": [tgt]}], "exclude"))
+            try_("another target", f, exc([{"point": rows[1], "targets": [sorted(pack_bands())[1]]}]))
+            try_("another point", f, exc([{"point": rows[2], "targets": [tgt]}]))
+            try_("an extra point", f, exc([{"point": rows[1], "targets": [tgt]}, {"point": rows[2], "targets": [tgt]}]))
+            try_("a valid sample", good, exc([{"point": rows[1], "targets": [tgt]}]))
+        keep, drop = got["matching, keep"], got["matching, exclude"]
+        refused = [k for k in ("no exception", "another target", "another point", "an extra point", "a valid sample")
+                   if isinstance(got[k], str)]
+        ok(isinstance(keep, dict) and keep["rows"].shape[0] == 30 and isinstance(drop, dict)
+           and drop["rows"].shape[0] == 29 and keep.get("exception", {}).get("draws") == "keep"
+           and keep["exception"].get("failed_points") == [{"point": rows[1], "targets": [tgt]}] and len(refused) == 5,
+           f"FE1 an invalid sample loads only under an exception matching its recorded failures (kept: "
+           f"{getattr(keep, 'get', lambda k: None)('rows') is not None}; refused {refused})")
+    case("FE1", fe1)
+
+    def fe2():
+        # Codex review of #291 (P1, P2): the exception waives only the declared target misses: the failed point's
+        # calibration and seed evidence must still pass; a declaration matches the failures one to one (no duplicates)
+        import hashlib
+        import tempfile
+        box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
+               "cfp_half": [547.5, 1277.5]}
+        u = [float(v) for v in np.random.default_rng(7).uniform(0, 1, 20)]
+        rows = [{"net_kill_shift": round(-0.5 + x, 6), "cfp_kill": round(0.3 + 0.2 * x, 6), "irs_kill": 0.5,
+                 "cfp_half": round(700 + 300 * x, 6)} for x in u]
+        rg = {"net_kill_shift": (-0.618, 0.66), "cfp_kill": (0.0, 0.85), "irs_kill": (0.0, 0.95),
+              "cfp_half": (547.5, 1277.5)}
+        tgt = sorted(pack_bands())[0]
+        dec = [{"point": rows[1], "targets": [tgt]}]
+        exc = lambda pts: {"failed_points": pts, "rule": "r", "evidence": "e", "reason": "x", "draws": "keep"}  # noqa: E731
+        got = {}
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "f.yaml")
+            _fixture_placeholder(f, e, rows, box, fail_target=tgt)
+            doc = yaml.safe_load(open(f))
+            pt = doc["joint_region"]["verified"]["points"][1]
+            first = sorted(pack_bands())[0]
+            variants = {
+                "the failed point off calibration": lambda x: x["joint_region"]["verified"]["points"][1].update(
+                    calibration_check={"s": {"achieved": 2.0, "target": 1.0}}),
+                "the failed point short of seeds": lambda x: x["joint_region"]["verified"]["points"][1][
+                    "per_seed"].update({first: pt["per_seed"][first][:-1]})}
+            for label, mut in variants.items():
+                dd = copy.deepcopy(doc)
+                mut(dd)
+                q = os.path.join(d, label.replace(" ", "_") + ".yaml")
+                yaml.safe_dump(dd, open(q, "w"), sort_keys=False)
+                try:
+                    load_posterior(q, e, rg, hashlib.sha256(open(q, "rb").read()).hexdigest(), exception=exc(dec))
+                    got[label] = ""
+                except PosteriorRefused as er:
+                    got[label] = str(er)
+            try:
+                load_posterior(f, e, rg, hashlib.sha256(open(f, "rb").read()).hexdigest(), exception=exc(dec + dec))
+                got["a duplicated declaration"] = ""
+            except PosteriorRefused as er:
+                got["a duplicated declaration"] = str(er)
+        ok(all(got.values()), f"FE2 the failed point's calibration and seed evidence still bind; one-to-one: {got}")
+    case("FE2", fe2)
 
     def f28():
         """owner, 14 Nov (f6-posterior-ranges): the sample's own hull sets its columns' draw ranges and design box."""
