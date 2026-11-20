@@ -1145,6 +1145,27 @@ def _self_test_run_dir_forms(ok):
     ok(all(v[1] and v[1] != ["differ"] and not any(k.startswith("run:runs") for k in v[1]) for v in got.values()),
        f"SG-RD2 the closure's run keys are relative to the run dir whatever form it was given in: "
        f"{ {k: v[1][:3] for k, v in got.items()} }")
+    # SG-RD3 (lead, 20 Nov): signed in tree A through a relative path, the tree copied to another root B and checked
+    # through B's absolute path (a resume on a cloud worker) is still signed
+    import shutil
+    with tempfile.TemporaryDirectory() as top:
+        a, b = os.path.join(top, "rootA"), os.path.join(top, "elsewhere", "rootB")
+        rel = os.path.join("runs", "R")
+        os.makedirs(os.path.join(a, rel))
+        schema.toy_spec(os.path.join(a, rel))
+        try:
+            os.chdir(a)
+            write_sheet(rel)
+            sign(rel, "lead", note="self-test")
+            os.chdir(cwd)
+            shutil.copytree(a, b)
+            st3 = (status(os.path.join(a, rel)), status(os.path.join(b, rel)))
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            st3 = (f"{type(e).__name__}: {e}",)
+        finally:
+            os.chdir(cwd)
+    ok(st3 == ("signed", "signed"), f"SG-RD3 a spec signed through a relative path in one tree is signed in a copy of "
+                                    f"the tree under another root, checked through its absolute path: {st3}")
 
 
 def main(argv=None) -> int:
