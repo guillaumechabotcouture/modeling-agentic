@@ -3129,9 +3129,12 @@ def _self_test_durability(ok) -> None:
         ok("before-hang" in txt, f"PD3b the log is appended to, never truncated, across runs: {txt[:200]!r}")
         # PD5: the log is never a step input, and never part of the compute code fingerprint.
         w(d, "models/logs/zz.log", "x\n")
-        fp = fingerprint({"id": "a", "run": "x", "inputs": ["data/x.csv", "models/logs/*"], "outputs": []}, d)
-        ok(not any(k.startswith("models/logs/") for k in fp["inputs"]) and "models/logs/*" in fp["missing_inputs"],
-           f"PD5 a step log is never a step input: {fp['inputs']} {fp['missing_inputs']}")
+        w(d, "models/logs/table.csv", "1\n")
+        fp = fingerprint({"id": "a", "run": f"{py} models/a.py models/logs/a.log",
+                          "inputs": ["data/x.csv", "models/logs/*", "models/logs/*.log"], "outputs": []}, d)
+        ok(sorted(k for k in fp["inputs"] if k.startswith("models/logs/")) == ["models/logs/table.csv"]
+           and fp["missing_inputs"] == ["models/logs/*.log"] and "models/logs/a.log" not in fp["code"],
+           f"PD5 a step log is never a step input or code; another file beside it still is: {fp}")
         import compute as _compute
         w(d, "models/f.py", "def f(p):\n    return p\n")
         f0 = _compute.code_fingerprint(d, "models/f.py::f")
@@ -3146,7 +3149,49 @@ def _self_test_durability(ok) -> None:
         r = one(d, "import sys\nprint('x')\nprint('err-link', file=sys.stderr)\nsys.exit(4)\n")
         ok(r.get("returncode") == 4 and rd(d, "target.txt") == "keep" and "err-link" in (r.get("error") or "")
            and r.get("log_error"), f"PD6 a link at the log path is not followed and the step still runs: {r}")
+        # PD6b (Codex round 1): the fallback keeps the tail on a timeout too.
+        r = one(d, "import sys, time\nprint('err-hang', file=sys.stderr, flush=True)\ntime.sleep(60)\n", timeout_s=1)
+        ok(r.get("returncode") is None and "err-hang" in (r.get("error") or "") and r.get("log_error"),
+           f"PD6b without a log, a timed-out step's stderr tail is still in the error: {r}")
         os.remove(os.path.join(d, log))
+        # PD11 (Codex round 1): a FIFO at the log path never blocks the runner: the step runs without a log.
+        os.mkfifo(os.path.join(d, log))
+        got = []
+        th = threading.Thread(target=lambda: got.append(one(d, "import sys\nsys.exit(5)\n")), daemon=True)
+        th.start()
+        th.join(20)
+        hung = th.is_alive()
+        if hung:                             # unblock the open so the thread ends
+            fd = os.open(os.path.join(d, log), os.O_RDONLY | os.O_NONBLOCK)
+            th.join(10)
+            os.close(fd)
+        ok(not hung and bool(got) and got[0].get("returncode") == 5 and got[0].get("log_error"),
+           f"PD11 a FIFO at the log path never blocks the runner (blocked: {hung}): {got}")
+        os.remove(os.path.join(d, log))
+        # PD12 (Codex round 1): the runner's own log never counts as a step's declared output.
+        r = one(d, "pass\n", outputs=["models/logs/*.log"])
+        ok(r.get("status") == "failed" and "not produced" in (r.get("error") or "")
+           and os.path.isfile(os.path.join(d, log)),
+           f"PD12 a step's log never satisfies a declared output, and a failed step's log is kept: {r}")
+        # PD13 (Codex round 1): an interrupt during the grace still kills the step's group.
+        c = subprocess.Popen([sys.executable, "-c", "import signal, sys, time\n"
+                              "signal.signal(signal.SIGTERM, signal.SIG_IGN)\nprint('up', flush=True)\ntime.sleep(60)"],
+                             stdout=subprocess.PIPE, start_new_session=True)
+        c.stdout.readline()
+        with _mock.patch.object(time, "sleep", side_effect=KeyboardInterrupt):
+            try:
+                _stop_group(c, 5.0)
+                esc = None
+            except KeyboardInterrupt as e:
+                esc = e
+        try:
+            rc13 = c.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            rc13 = "alive"
+            c.kill()
+        c.stdout.close()
+        ok(esc is not None and rc13 == -signal.SIGKILL,
+           f"PD13 an interrupt during the SIGTERM grace still kills the step's group: {esc!r} {rc13}")
         # PD7: the run id is reset when run() ends, so a later step outside run() never exports a past run's id.
         r = one(d, "open('models/a.out', 'w').write('1')\n")
         ok(r.get("status") == "ok" and globals()["_RUN_ID"] is None,
@@ -3157,17 +3202,30 @@ def _self_test_durability(ok) -> None:
             except ValueError:
                 pass
         ok(globals()["_RUN_ID"] is None, f"PD7b run() resets its run id when it raises: {globals()['_RUN_ID']}")
+        # PD7c (Codex round 1): a run that ends never clears an id that is not its own.
+
+        def other(rd_):
+            globals()["_RUN_ID"] = "another-run"
+            raise ValueError("boom")
+        with _mock.patch.dict(globals(), {"load": other}):
+            try:
+                run(d)
+            except ValueError:
+                pass
+        ok(globals()["_RUN_ID"] == "another-run", f"PD7c run() leaves another run's id alone: {globals()['_RUN_ID']}")
+        globals()["_RUN_ID"] = None
     # PD8-PD10: the steps' environment.
     env = script_env({"ANTHROPIC_API_KEY": "k", "ANTHROPIC_AUTH_TOKEN": "t", "CLAUDE_CODE_OAUTH_TOKEN": "o",
-                      "HOME": "/h", "PATH": "/usr/bin"})
+                      "HOME": "/h", "PATH": "/pd-bin::/usr/bin"})
     ok(not {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"} & set(env) and env.get("HOME") == "/h",
        f"PD8 steps run without the model API credentials: {sorted(env)}")
     here = os.path.dirname(os.path.abspath(sys.executable))
-    ok(env.get("PATH", "").split(os.pathsep)[:2] == [here, "/usr/bin"],
+    ok(env.get("PATH", "").split(os.pathsep) == [here, "/pd-bin", "", "/usr/bin"],
        f"PD9 the harness interpreter's directory is first on the steps' PATH: {env.get('PATH')}")
-    env2 = script_env({"PATH": os.pathsep.join([here, "/usr/bin"])})
-    ok(env2["PATH"].split(os.pathsep) == [here, "/usr/bin"] and script_env({"HOME": "/h"}).get("PATH") == here,
-       f"PD10 the PATH entry is added once, and to an empty PATH: {env2['PATH']}")
+    env2 = script_env({"PATH": os.pathsep.join([here, "/pd-bin"])})
+    ok(env2["PATH"].split(os.pathsep) == [here, "/pd-bin"]
+       and script_env({"HOME": "/h"}).get("PATH") == here + os.pathsep + os.defpath,
+       f"PD10 the PATH entry is added once, and before the default path when PATH is unset: {env2['PATH']}")
 
 
 
