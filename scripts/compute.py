@@ -199,6 +199,8 @@ SCALEDOWN_RETRIES = 8      # resubmissions per input after a scale-down retired 
 INFRA_RETRIES = 3          # MA_COMPUTE_INFRA_RETRIES when unset: resubmissions per input after its chunk was lost
 INFRA_BACKOFF_S = 10.0     # MA_COMPUTE_INFRA_BACKOFF_S when unset: wait before the first resubmission, doubled after
 NO_WORKER_WAIT_S = 1800    # MA_COMPUTE_NO_WORKER_WAIT_S when unset: how long a call waits with no compute worker
+COMM_RETRIES = 5           # MA_COMPUTE_COMM_RETRIES when unset: further tries of a scheduler call whose connection dropped
+COMM_WAIT_S = 120.0        # MA_COMPUTE_COMM_WAIT_S when unset: the (doubling) waits before those tries add up to this
 
 
 def _peak_mb() -> float:
@@ -662,9 +664,11 @@ def recycle_every(procs: int) -> int:
 
 def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple[bytes, dict]:
     """tar.gz of the run's models/ and data/ and the repo's scripts/ and toolkit/, with
-    ABSOLUTE member paths so workers recreate the same layout."""
+    ABSOLUTE member paths so workers recreate the same layout. The files code_fingerprint
+    ignores (`_fp_ignored`: logs, figures, summaries, partial rows, the ledger) are left out:
+    no row may depend on them, and a long run's logs and partial rows were shipped to every VM."""
     run_dir = os.path.realpath(run_dir)
-    skipped, n = [], 0
+    skipped, n, n_out = [], 0, 0
     buf = io.BytesIO()
     # dereference: symlinked inputs are stored as files (workers extract with
     # the "data" filter, which rejects absolute links).
@@ -683,8 +687,12 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                 dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "_truth")]
                 for d in dirs:
                     ancestors[os.path.join(dp, d)] = anc | {real}
+                names, in_data = set(files), root == os.path.join(run_dir, "data")
                 for fn in files:
                     p = os.path.join(dp, fn)
+                    if _fp_ignored(fn, names, in_data, dp == os.path.join(run_dir, "models")):
+                        n_out += 1
+                        continue
                     try:
                         size = os.path.getsize(p)
                     except OSError:
@@ -696,6 +704,7 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                     n += 1
     data = buf.getvalue()
     return data, {"files": n, "bundle_mb": round(len(data) / 2**20, 1), "skipped_large": skipped,
+                  "skipped_outputs": n_out,
                   "sha256": hashlib.sha256(data).hexdigest()}
 
 
@@ -1178,6 +1187,43 @@ def _sched_view(res=None, key=None, dask_scheduler=None) -> dict:
             "held": bool(ts is not None and ts.who_has), "retired": sorted(retired)}
 
 
+def _comm_retry(call, what: str, progress: dict | None = None):
+    """`call()`, tried again when the scheduler connection drops under it (an OSError; distributed's
+    CommClosedError is one): up to MA_COMPUTE_COMM_RETRIES more times, after doubling waits that add up to
+    MA_COMPUTE_COMM_WAIT_S, while the dask client reconnects by itself. After that the error is raised, as it
+    was at once before. A TimeoutError is the caller's own time limit and is never retried. No new client is
+    made: one that has closed for good fails each try, and the call ends as it did."""
+    n = max(0, int(os.environ.get("MA_COMPUTE_COMM_RETRIES") or COMM_RETRIES))
+    total = float(os.environ.get("MA_COMPUTE_COMM_WAIT_S") or COMM_WAIT_S)
+    for k in range(n + 1):
+        try:
+            return call()
+        except TimeoutError:
+            raise
+        except OSError as e:
+            if k == n:
+                raise
+            wait_s = total * 2 ** k / (2 ** n - 1)
+            if progress is not None:
+                progress["comm_retries"] = progress.get("comm_retries", 0) + 1
+            print(f"compute: scheduler connection lost under {what} ({type(e).__name__}: {str(e)[:120]}); "
+                  f"try {k + 2} of {n + 1} in {wait_s:.3g} s", file=sys.stderr, flush=True)
+            time.sleep(wait_s)
+
+
+def _retired_on_purpose(exc, worker, read_view, last_retired=()) -> bool:
+    """Whether a chunk whose result raised `exc` lost its worker to a scale-down. dask reports such a loss on
+    the future (KilledWorker, CancelledError), and that can arrive before the dispatch loop's next scheduler
+    view shows the worker gone. A fresh view (`read_view`) must show the worker absent and its removal recorded
+    as expected; with the view unread, the last view's retired set decides. Any other error is a loss."""
+    if not {k.__name__ for k in type(exc).__mro__} & {"KilledWorker", "CancelledError"}:
+        return False
+    got = read_view()
+    if got is None:
+        return worker in last_retired
+    return worker not in got[1] and worker in got[3]
+
+
 def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadline=None, allowance_s=None,
               progress=None, peak_mb=None, prior_ok=0):
     """The allowance is split over the chunks that can run at once; each chunk
@@ -1260,8 +1306,10 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         progress.update(slots=slots, cores_per_slot=cores_per_slot, core_s=0.0)
         # The bundle is scattered once; a worker that runs a chunk fetches it
         # from a peer as a task dependency (no re-scatter per chunk).
-        bfut = (c.scatter(bundle, broadcast=False, hash=False) if res
-                else c.scatter(bundle, workers=workers, broadcast=True))
+        # On a tagged pool it goes to compute workers only, never the run's own VM; with none up yet it is
+        # scattered in the loop below when the first one takes work (no chunk is placed before that).
+        bfut = (c.scatter(bundle, workers=workers, broadcast=True) if not res
+                else c.scatter(bundle, workers=workers, broadcast=False, hash=False) if workers else None)
         # Phase 45 δ: chunks are pinned to one free worker each (submit's `worker`).
         # The resource is still asked for, so a chunk never shares a VM with
         # another call's chunk that dask placed there.
@@ -1299,10 +1347,13 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             # A lost chunk is resubmitted once here (and the lost attempt
             # charged), rather than through dask retries, which would hide it.
             tok_ = uuid.uuid4().hex                 # this submission's start claim
-            f = c.submit(_remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
-                         procs_for(override), share, call_id, REPO, learned["peak"],
-                         prior_ok + sum(1 for r in rows if r.get("ok")), attempt != TAIL, tok_,
-                         pure=False, workers=[worker], allow_other_workers=False, **restrict)
+            # The key is fixed before the first try: a submission tried again after a dropped connection is
+            # the same task for the scheduler, so nothing is placed twice.
+            key_, n_ok = f"{funcname(_remote_task)}-{tok_}", prior_ok + sum(1 for r in rows if r.get("ok"))
+            f = _comm_retry(lambda: c.submit(
+                _remote_task, bfut, binfo["sha256"], run_dir, fn_spec, ch, deadline,
+                procs_for(override), share, call_id, REPO, learned["peak"], n_ok, attempt != TAIL, tok_,
+                key=key_, pure=False, workers=[worker], allow_other_workers=False, **restrict), "submit", progress)
             futs[f] = (ch, attempt, procs_for(override))
             pinned[f], toks[f] = worker, tok_
             held[f] = share or 0.0
@@ -1374,7 +1425,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
             may go to, every worker the scheduler knows, whether the bundle is
             still held), or None if unread."""
             try:
-                v = c.run_on_scheduler(_sched_view, res, bfut.key)
+                v = c.run_on_scheduler(_sched_view, res, bfut.key if bfut is not None else None)
                 allw = v["workers"]
             except Exception:  # noqa: BLE001 — keep going on the last state; nothing is declared lost
                 return None
@@ -1397,10 +1448,11 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
         pending, rows, stop, lost = set(), [], None, 0
         n_compute = len(workers)                    # compute workers in the last scheduler view
         no_w = None                                 # since when no compute worker has been taking work
+        blind, retired_w = None, set()              # since when nothing could be placed (view unread, no bundle)
         try:
             while queue or pending:
                 _note(progress, inflight(), call_id=call_id)
-                got_v, free = view(), []
+                got_v, free, unplaced = view(), [], False
                 if got_v is not None:
                     ok_w, allw, held_b, retired_w = got_v
                     n_compute = len(ok_w)
@@ -1469,10 +1521,26 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                         # scheduler's view is used, not the client's, which may not
                         # have heard of the loss yet.
                         try:
-                            bfut = c.scatter(bundle, workers=list(ok_w), broadcast=not res, hash=False)
-                            progress["bundle_rescatters"] = progress.get("bundle_rescatters", 0) + 1
+                            first = bfut is None    # not scattered yet: no compute worker was up at the start
+                            bfut = c.scatter(bundle, workers=list(free if first else ok_w),
+                                             broadcast=not res, hash=False)
+                            progress["bundle_rescatters"] = progress.get("bundle_rescatters", 0) + (not first)
                         except Exception:  # noqa: BLE001 — chunks then fail and are charged as lost
                             pass
+                    if bfut is None:                # no chunk is placed without the bundle
+                        unplaced, free = bool(free), []
+                # Nothing out and nothing can be placed (the scheduler's view unread, or the bundle on no
+                # worker): waited for within the bound of a pool with no worker, then the queued inputs fail
+                # as infra. Without this the loop spun until the deadline, or for good with none.
+                if (got_v is None or unplaced) and not pending:
+                    blind = blind or time.time()
+                    if time.time() - blind >= no_worker_wait:
+                        stop = f"scheduler not answering for {no_worker_wait:g} s"
+                        errors.update({i: f"{stop}: nothing could be placed" for ch, _, _ in queue
+                                       for i, _ in ch if i not in errors})
+                        break
+                elif got_v is not None:
+                    blind = None
                 # A loss above may have used the rest of the allowance: stop now
                 # rather than wait for a worker with demand still shown.
                 if (queue or pending) and allowance_s is not None and progress["core_s"] >= allowance_s:
@@ -1495,8 +1563,9 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     # none, the autoscaler saw no waiting work and shrank the pool as chunks finished.
                     # The held marker counts as more work, so it stays only while the pool is at most its
                     # target: past it, the pool may shrink back (Codex review of #204).
-                    demand(0 if starved or not queue else
-                           min(len(queue), max(1 if n_compute <= pool else 0, pool - len(pending))))
+                    n_dem = 0 if starved or not queue else min(len(queue), max(1 if n_compute <= pool else 0,
+                                                                               pool - len(pending)))
+                    _comm_retry(lambda: demand(n_dem), "demand markers", progress)
                 left = None if deadline is None else max(0.0, deadline - time.time())
                 if not pending:
                     if starved and queue:
@@ -1510,8 +1579,9 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     time.sleep(poll_s if left is None else min(poll_s, left))
                     continue
                 try:
-                    done, pending = wait(pending, timeout=poll_s if left is None else min(poll_s, left),
-                                         return_when="FIRST_COMPLETED")
+                    done, pending = _comm_retry(lambda: wait(
+                        pending, timeout=poll_s if left is None else min(poll_s, left),
+                        return_when="FIRST_COMPLETED"), "wait", progress)
                 except cf.CancelledError:
                     # dask cancelled a chunk (e.g. its bundle copy was lost): its
                     # result() raises below and it goes through the lost-chunk path.
@@ -1575,7 +1645,10 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                              "chunk_summary": {k: v for k, v in (got.get("summary") or {}).items() if k != "bundle"},
                              "stderr_tail": got.get("stderr_tail") or ""})
                     except Exception as e:  # noqa: BLE001 — a lost worker fails only its chunk
-                        chunk_lost(f, ch, attempt, used, f_share, f"chunk failed: {type(e).__name__}: {e}"[:500])
+                        # A scale-down can show first as this future's failure: then it uses no infra retry
+                        # and keeps its processes, as when the view shows it first.
+                        chunk_lost(f, ch, attempt, used, f_share, f"chunk failed: {type(e).__name__}: {e}"[:500],
+                                   scaled_down=_retired_on_purpose(e, pinned.get(f), view, retired_w))
                 cur[0] = None
                 if (pending or queue) and not stop:
                     stop = _breaker(rows, prior_ok=prior_ok)
@@ -1605,7 +1678,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                     progress["remote_unconfirmed"] = True
                 try:
                     wait(pending, timeout=float(os.environ.get("MA_COMPUTE_SETTLE_S", "120")))
-                except (TimeoutError, cf.CancelledError):
+                except (OSError, cf.CancelledError):     # a time-out, or the connection is down: bounded below
                     pass
                 for f in list(pending):
                     if f.done():
@@ -1661,6 +1734,7 @@ def _map_dask(run_dir, fn_spec, inputs, max_workers, chunks_per_worker=4, deadli
                   "core_s": progress["core_s"], "stopped": stop,
                   "unknown_chunks": lost + len(pending) + len(gone), "bundle": binfo,
                   "bundle_rescatters": progress.get("bundle_rescatters", 0), "moved": progress.get("moved", 0),
+                  "comm_retries": progress.get("comm_retries", 0),
                   "invariant_violation": (f"{len(absent)} inputs returned no row" if absent else None),
                   "chunks": progress.get("chunks", []), "procs_final": learned["procs"],
                   "peak_mb": learned["peak"], "busy_guard": guard, "resubmitted": progress.get("resubmitted", 0)}
@@ -1811,6 +1885,44 @@ PROGRESS_STALE_S = 300.0
 PROGRESS_STALE_LEGACY_S = 24 * 3600.0
 
 
+CAP_OUTLOOK_MIN_TASKS = 8  # finished tasks before a call's own task time is used to project its total
+
+
+def _cap_history(led: dict, fn_spec: str, n: int, allow: float) -> dict | None:
+    """Before launch: the call's projected core-seconds from the ledger's last call of the same function that
+    finished a task (its charge per finished task x `n` inputs), against its allowance; None with no history."""
+    for k in reversed(led.get("calls") or []):
+        try:
+            n_done = int(k.get("n") or 0) - int(k.get("n_failed") or 0)
+            per = float(k["task_core_s"]) / n_done if k.get("fn") == fn_spec and n_done > 0 else 0.0
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        if per > 0:
+            return {"projected_core_s": round(per * n, 1), "allowance_core_s": round(allow, 1),
+                    "over": per * n > allow, "basis": f"ledger: the last call of this function ({n_done} tasks done)"}
+    return None
+
+
+def _cap_outlook(progress: dict, extra_core_s: float = 0.0) -> None:
+    """While the call runs: project its total from its own finished tasks (charged core-seconds per task x its
+    inputs). When that passes the allowance it is recorded (`cap_outlook`, in the summary and the ledger record)
+    and said once on stderr. A notice only: the allowance stops the call exactly where it did. (The ledger's
+    `estimated_core_s` is not a projection: it is the charge estimated for chunks whose work is unknown.)"""
+    n, allow, done = progress.get("_n"), progress.get("_allow"), int(progress.get("done_tasks") or 0)
+    if not n or not allow or done < min(n, CAP_OUTLOOK_MIN_TASKS):
+        return
+    proj = (float(progress.get("core_s") or 0) + extra_core_s) / done * n
+    if proj <= allow:
+        return
+    progress["cap_outlook"] = {"projected_core_s": round(proj, 1), "allowance_core_s": round(allow, 1),
+                               "over": True, "basis": f"this call: {done} of {n} tasks done"}
+    if not progress.get("_cap_warned"):
+        progress["_cap_warned"] = True
+        print(f"[compute] WARNING: this call is projected to need {proj / 3600:.3g} core-hours, over its allowance "
+              f"of {allow / 3600:.3g} ({done} of {n} tasks done): the tasks past the allowance will be stopped. "
+              "Raise the call's allowance or reduce the batch.", file=sys.stderr, flush=True)
+
+
 def _note(progress: dict, out: list, extra_core_s: float = 0.0, **more) -> None:
     """Phase 42 α: persist what a ledgered call has done and what it has in
     flight (`out`: [{"n": tasks, "share": core-s or None, "started": t,
@@ -1820,6 +1932,7 @@ def _note(progress: dict, out: list, extra_core_s: float = 0.0, **more) -> None:
     removed, so settlement falls back to charging the reservation."""
     if progress.get("_beat_err"):
         raise progress["_beat_err"]
+    _cap_outlook(progress, extra_core_s)
     if not progress.get("_file"):
         return
     rec = {"t": time.time(), "core_s": round(float(progress.get("core_s") or 0) + extra_core_s, 1),
@@ -2229,6 +2342,14 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
             per_call = max_core_hours if max_core_hours is not None else \
                 float(os.environ.get("MA_COMPUTE_CALL_CORE_HOURS", "50"))
             allowance_s = min(remaining, per_call * 3600)
+            # No hard limit is added: the ledger's history says before launch whether the call fits.
+            look = _cap_history(led, fn_spec, len(inputs), allowance_s)
+            progress.update(_n=len(inputs), _allow=allowance_s, cap_outlook=look, _cap_warned=bool(look and look["over"]))
+            if look and look["over"]:
+                print(f"[compute] WARNING: {len(inputs)} tasks are projected to need "
+                      f"{look['projected_core_s'] / 3600:.3g} core-hours ({look['basis']}), over this call's "
+                      f"allowance of {allowance_s / 3600:.3g}: the tasks past it will be stopped. Raise the call's "
+                      "allowance or reduce the batch.", file=sys.stderr, flush=True)
             rid = f"{os.uname().nodename}:{os.getpid()}:{time.time():.6f}"
             pfile = os.path.join(run_dir, PROGRESS_DIR, hashlib.sha1(rid.encode()).hexdigest()[:16] + ".json")
             try:
@@ -2314,6 +2435,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
                "n": len(rows), "n_ok": sum(r["ok"] for r in rows),
                "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by, "wall_s": round(wall, 1),
                "task_core_s": round(core_s, 1), "estimated_core_s": round(est, 1),
+               "cap_outlook": progress.get("cap_outlook"),     # projected need against the allowance, if known
                # what the model calls themselves took: a charge far above it points at
                # retried or unconfirmed chunks (see "chunks")
                "model_s": round(_known_core_s(rows), 1)}
@@ -2325,6 +2447,7 @@ def map_fn(run_dir: str, fn_spec: str, inputs: list, backend: str = "auto",
         led["core_seconds"] = round(led["core_seconds"] + core_s, 1)
         led["calls"].append({k: summary.get(k) for k in ("backend", "workers", "n", "n_failed", "failed_by_kind",
                                                          "wall_s", "task_core_s", "estimated_core_s", "model_s",
+                                                         "cap_outlook",
                                                          "stopped", "breaks", "procs_final", "peak_mb")}
                             | {"fn": fn_spec, "purpose": purpose, "out": out, "ts": time.strftime("%FT%T")})
         if summary.get("peak_mb"):
@@ -2348,6 +2471,18 @@ _FP_RUNNER_FILES = ("pipeline.yaml", "pipeline_state.json", "pipeline_report.jso
 # a placeholder: PR #204 changed only these and still changed the fingerprint of every stored batch. A name
 # not found is hashed whole (never fewer bytes); FPX1 checks every name exists. Add a definition here only if
 # no row value can depend on it.
+def _fp_ignored(fn: str, names, in_data: bool, runner: bool) -> bool:
+    """Whether code_fingerprint leaves out file `fn` (`names`: the files of its directory; `in_data`: under the
+    run's data/, where nothing is left out; `runner`: directly in the run's models/): logs, figures, summaries,
+    the ledger, a batch's partial rows or detached-job record, the pipeline runner's own files. Another call's
+    results file (its `.summary.json` is beside it) is never left out, whatever its extension. make_bundle
+    leaves out the same files, so the two cannot drift apart."""
+    if in_data or fn + ".summary.json" in names:
+        return False
+    return (fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json") or fn.endswith((PARTIAL_EXT, JOB_EXT))
+            or fn.startswith("compute_ledger.json") or (runner and fn in _FP_RUNNER_FILES))
+
+
 FP_DISPATCH_EXEMPT = (
     # dask dispatch helpers, pool and scheduler plugins. _map_dask itself is hashed (Codex review round 2 of
     # #205): it decides which params an index stands for and which returned rows reach the reusable journal.
@@ -2358,11 +2493,12 @@ FP_DISPATCH_EXEMPT = (
     "register_compute_tags", "_guard_registration", "BusyWorkerGuard", "ComputeTagPlugin",
     "WORKER_OPTIONS", "ADAPT_OPTIONS", "DEMAND_RESOURCE",
     "RETIRED_EVENTS", "SCALEDOWN_RETRIES", "INFRA_RETRIES", "INFRA_BACKOFF_S", "NO_WORKER_WAIT_S",
+    "COMM_RETRIES", "COMM_WAIT_S", "_comm_retry", "_retired_on_purpose",
     # the ledger, progress records and heartbeats (accounting, never a row; _rows_done is not here: it handles
     # rows on their way to the reusable journal, Codex review of #205)
     "_LedgerLock", "_note", "_write_note", "_write_note_locked", "_settle_dead",
     "_live_reservations", "_start_heartbeat", "_progress_path", "_foreign_dead", "_drop_progress",
-    "_known_core_s",
+    "_known_core_s", "_cap_outlook", "_cap_history", "CAP_OUTLOOK_MIN_TASKS",
 )
 # Functions nested in an exempt definition that stay hashed (none since _map_dask is hashed; kept as the
 # mechanism for a future exempt definition with a nested part that reaches rows).
@@ -2532,11 +2668,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
                 if (_harness_output(run_dir, os.path.relpath(p, run_dir)) if in_run else
                         os.path.relpath(p, REPO).replace(os.sep, "/") in _FP_REPO_SKIP):
                     continue
-                is_output = fn + ".summary.json" in names     # another call's results file, any extension
-                if not in_data and not is_output and (fn.endswith(_FP_SKIP_EXT) or fn.endswith(".summary.json")
-                                                      or fn.endswith((PARTIAL_EXT, JOB_EXT))
-                                                      or fn.startswith("compute_ledger.json")
-                                                      or (runner and fn in _FP_RUNNER_FILES)):
+                if _fp_ignored(fn, names, in_data, runner):
                     continue          # logs, figures, summaries, the ledger (never skipped under data/)
                 files.add(os.path.join(dp, fn))
     files.update(os.path.join(REPO, m) for m in FP_DEP_MANIFESTS)     # missing ones are skipped below
