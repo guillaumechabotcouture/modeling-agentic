@@ -590,6 +590,14 @@ def _self_test() -> int:
         finally:
             BC.OVERRIDES.pop("toolkit.engines.contract:ToyEngine", None)
     _self_test_declared_range(ok)
+    # Codex review of #291 (P1): a net-effect posterior exception is the owner's: any other signer is refused
+    from types import SimpleNamespace as _NS
+    sp = _NS(raw={"uncertainty": {"net_effect_posterior": {"path": "p.yaml", "sha256": "0" * 64, "exception": {
+        "failed_points": [{"point": {"a": 0.1}, "targets": ["T1"]}], "rule": "r", "evidence": "e", "reason": "x",
+        "draws": "keep"}}}}, engine_pending=True)
+    lead = _net_effect_posterior(None, sp, "lead")
+    ok(any("owner" in x and "exception" in x for x in lead),
+       f"PC12 a net-effect posterior exception signed by someone other than the owner is refused ({lead[:1]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

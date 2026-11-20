@@ -1961,6 +1961,51 @@ def _self_test() -> int:
            f"{getattr(keep, 'get', lambda k: None)('rows') is not None}; refused {refused})")
     case("FE1", fe1)
 
+    def fe2():
+        # Codex review of #291 (P1, P2): the exception waives only the declared target misses: the failed point's
+        # calibration and seed evidence must still pass; a declaration matches the failures one to one (no duplicates)
+        import hashlib
+        import tempfile
+        box = {"net_kill_shift": [-0.618, 0.66], "cfp_kill": [0.0, 0.8], "irs_kill": [0.0, 0.95],
+               "cfp_half": [547.5, 1277.5]}
+        u = [float(v) for v in np.random.default_rng(7).uniform(0, 1, 20)]
+        rows = [{"net_kill_shift": round(-0.5 + x, 6), "cfp_kill": round(0.3 + 0.2 * x, 6), "irs_kill": 0.5,
+                 "cfp_half": round(700 + 300 * x, 6)} for x in u]
+        rg = {"net_kill_shift": (-0.618, 0.66), "cfp_kill": (0.0, 0.85), "irs_kill": (0.0, 0.95),
+              "cfp_half": (547.5, 1277.5)}
+        tgt = sorted(pack_bands())[0]
+        dec = [{"point": rows[1], "targets": [tgt]}]
+        exc = lambda pts: {"failed_points": pts, "rule": "r", "evidence": "e", "reason": "x", "draws": "keep"}  # noqa: E731
+        got = {}
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "f.yaml")
+            _fixture_placeholder(f, e, rows, box, fail_target=tgt)
+            doc = yaml.safe_load(open(f))
+            pt = doc["joint_region"]["verified"]["points"][1]
+            first = sorted(pack_bands())[0]
+            variants = {
+                "the failed point off calibration": lambda x: x["joint_region"]["verified"]["points"][1].update(
+                    calibration_check={"s": {"achieved": 2.0, "target": 1.0}}),
+                "the failed point short of seeds": lambda x: x["joint_region"]["verified"]["points"][1][
+                    "per_seed"].update({first: pt["per_seed"][first][:-1]})}
+            for label, mut in variants.items():
+                dd = copy.deepcopy(doc)
+                mut(dd)
+                q = os.path.join(d, label.replace(" ", "_") + ".yaml")
+                yaml.safe_dump(dd, open(q, "w"), sort_keys=False)
+                try:
+                    load_posterior(q, e, rg, hashlib.sha256(open(q, "rb").read()).hexdigest(), exception=exc(dec))
+                    got[label] = ""
+                except PosteriorRefused as er:
+                    got[label] = str(er)
+            try:
+                load_posterior(f, e, rg, hashlib.sha256(open(f, "rb").read()).hexdigest(), exception=exc(dec + dec))
+                got["a duplicated declaration"] = ""
+            except PosteriorRefused as er:
+                got["a duplicated declaration"] = str(er)
+        ok(all(got.values()), f"FE2 the failed point's calibration and seed evidence still bind; one-to-one: {got}")
+    case("FE2", fe2)
+
     def f28():
         """owner, 14 Nov (f6-posterior-ranges): the sample's own hull sets its columns' draw ranges and design box."""
         import hashlib
