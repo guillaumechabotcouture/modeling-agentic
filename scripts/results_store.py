@@ -21,6 +21,8 @@ import hashlib
 import os
 import re
 import sys
+import threading
+import time
 
 DEFAULT_ACCOUNT_ENV = "COILED_STORAGE_ACCOUNT"
 
@@ -29,16 +31,64 @@ def configured_account() -> str | None:
     return os.environ.get("MA_STORAGE_ACCOUNT") or os.environ.get(DEFAULT_ACCOUNT_ENV)
 
 
+# v2 autonomy 1E-i: a stalled socket raises instead of hanging a run's last step, and a store or fetch gives up only
+# after ATTEMPTS tries, about a minute apart in total (waits of 4, 8, 16 and 32 s).
+CONNECT_TIMEOUT_S, READ_TIMEOUT_S, CALL_TIMEOUT_S, ATTEMPTS = 30, 120, 300, 5
+_CLIENTS: dict = {}
+_CLIENTS_LOCK = threading.Lock()
+
+
 def _service(account: str | None = None):
-    from azure.identity import DefaultAzureCredential
-    from azure.storage.blob import BlobServiceClient
+    """The account's client: one per account for the life of the process (a client per call built a new credential
+    and connection pool each time), with connection and read timeouts."""
     # $COILED_STORAGE_ACCOUNT is not set on workers in every workspace; the
     # launcher then passes the account name through $MA_STORAGE_ACCOUNT.
     account = account or configured_account()
     if not account:
         raise RuntimeError(f"no storage account: set ${DEFAULT_ACCOUNT_ENV} / $MA_STORAGE_ACCOUNT or pass --account")
-    return BlobServiceClient(f"https://{account}.blob.core.windows.net",
-                             credential=DefaultAzureCredential(exclude_interactive_browser_credential=True))
+    with _CLIENTS_LOCK:
+        if account not in _CLIENTS:
+            from azure.identity import DefaultAzureCredential
+            from azure.storage.blob import BlobServiceClient
+            _CLIENTS[account] = BlobServiceClient(
+                f"https://{account}.blob.core.windows.net",
+                credential=DefaultAzureCredential(exclude_interactive_browser_credential=True),
+                connection_timeout=CONNECT_TIMEOUT_S, read_timeout=READ_TIMEOUT_S)
+        return _CLIENTS[account]
+
+
+def _accepts(fn, **kw) -> dict:
+    """`kw` cut down to what `fn` takes. Azure's blob calls take a stream's `length` and a per-call `timeout`; a
+    client that takes neither (a whole-bytes test double) is called the plain way."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return kw
+    if any(x.kind is x.VAR_KEYWORD for x in params.values()):
+        return kw
+    return {k: v for k, v in kw.items() if k in params}
+
+
+def _retry(what: str, fn, attempts: int):
+    """fn(), tried `attempts` times with a doubling wait between tries. A blob that does not exist is not retried."""
+    last = None
+    for k in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 -- transient network/auth errors
+            if isinstance(e, (FileNotFoundError, KeyError)) or type(e).__name__ == "ResourceNotFoundError":
+                raise
+            last = e
+            if k + 1 < attempts:
+                time.sleep(4 * 2 ** k)
+    raise RuntimeError(f"{what} failed after {attempts} attempts: {type(last).__name__}: {last}") from last
+
+
+def _blob_chunks(client):
+    """The blob's bytes block by block (one block from a client that can only read whole)."""
+    d = client.download_blob(**_accepts(client.download_blob, timeout=CALL_TIMEOUT_S))
+    return d.chunks() if hasattr(d, "chunks") else iter([d.readall()])
 
 
 _SENSITIVE_NAME = re.compile(r"(?i)^(\.env.*|.*\.(pem|key|p12|pfx)|.*credential.*|.*secret.*|id_rsa.*|\.netrc|\.npmrc|\.pypirc)$")
@@ -215,34 +265,36 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def upload_file(path: str, blob: str, account: str | None = None, service=None, attempts: int = 3) -> dict:
-    """upload_retry with bounded memory: the file is streamed up and the read-back verified chunk by chunk."""
-    import time
-    want, size = sha256_file(path), os.path.getsize(path)
+def upload(path: str, blob: str, account: str | None = None, service=None) -> dict:
+    """Upload a file and read it back (sha256) so success is verified, not assumed. Bounded memory: the file is
+    streamed up and the read-back hashed chunk by chunk."""
     container, name = _split(blob)
-    last = None
-    for k in range(attempts):
-        try:
-            client = (service or _service(account)).get_blob_client(container, name)
-            with open(path, "rb") as f:
-                client.upload_blob(f, overwrite=True, length=size)
-            h = hashlib.sha256()
-            for block in client.download_blob().chunks():
-                h.update(block)
-            if h.hexdigest() != want:
-                raise RuntimeError(f"upload of {blob} did not verify")
-            return {"blob": blob, "bytes": size, "sha256": want}
-        except Exception as e:  # noqa: BLE001 -- transient network/auth errors
-            last = e
-            time.sleep(2 ** k)
-    raise RuntimeError(f"upload of {blob} failed after {attempts} attempts: {type(last).__name__}: {last}")
+    client = (service or _service(account)).get_blob_client(container, name)
+    want, size = sha256_file(path), os.path.getsize(path)
+    kw = _accepts(client.upload_blob, length=size, timeout=CALL_TIMEOUT_S)
+    with open(path, "rb") as f:
+        client.upload_blob(f if "length" in kw else f.read(), overwrite=True, **kw)
+    h = hashlib.sha256()
+    for block in _blob_chunks(client):
+        h.update(block)
+    if h.hexdigest() != want:
+        raise RuntimeError(f"upload of {blob} did not verify")
+    return {"blob": blob, "bytes": size, "sha256": want}
+
+
+def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = ATTEMPTS) -> dict:
+    _split(blob)
+    return _retry(f"upload of {blob}", lambda: upload(path, blob, account, service), attempts)
+
+
+upload_file = upload_retry      # the checkpointer's name for it; both stream
 
 
 def sha256_blob(blob: str, account: str | None = None, service=None) -> str:
     """A blob's sha256, hashed chunk by chunk as it streams: never read whole, never written to disk."""
     container, name = _split(blob)
     h = hashlib.sha256()
-    for block in (service or _service(account)).get_blob_client(container, name).download_blob().chunks():
+    for block in _blob_chunks((service or _service(account)).get_blob_client(container, name)):
         h.update(block)
     return h.hexdigest()
 
@@ -253,38 +305,11 @@ def delete(blob: str, account: str | None = None, service=None) -> None:
     (service or _service(account)).get_blob_client(container, name).delete_blob()
 
 
-def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = 3) -> dict:
-    import time
-    last = None
-    for k in range(attempts):
-        try:
-            return upload(path, blob, account, service=service)
-        except Exception as e:  # noqa: BLE001 — transient network/auth errors
-            last = e
-            time.sleep(2 ** k)
-    raise RuntimeError(f"upload of {blob} failed after {attempts} attempts: {type(last).__name__}: {last}")
-
-
 def _split(blob: str) -> tuple[str, str]:
     container, _, name = blob.partition("/")
     if not container or not name:
         raise ValueError(f"blob must be <container>/<path>, got {blob!r}")
     return container, name
-
-
-def upload(path: str, blob: str, account: str | None = None, service=None) -> dict:
-    """Upload a file and read it back (size + sha256) so success is verified,
-    not assumed."""
-    data = open(path, "rb").read()
-    container, name = _split(blob)
-    svc = service or _service(account)
-    client = svc.get_blob_client(container, name)
-    client.upload_blob(data, overwrite=True)
-    back = client.download_blob().readall()
-    ok = hashlib.sha256(back).hexdigest() == hashlib.sha256(data).hexdigest()
-    if not ok:
-        raise RuntimeError(f"upload of {blob} did not verify (sizes {len(data)} vs {len(back)})")
-    return {"blob": blob, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def list_blobs(prefix: str, account: str | None = None, service=None) -> list[dict]:
@@ -296,14 +321,30 @@ def list_blobs(prefix: str, account: str | None = None, service=None) -> list[di
             for b in cc.list_blobs(name_starts_with=name_prefix)]
 
 
-def download(blob: str, path: str, account: str | None = None, service=None) -> dict:
+def download(blob: str, path: str, account: str | None = None, service=None, attempts: int = ATTEMPTS) -> dict:
+    """The blob streamed to `path` with a chunked sha256, never held whole: written under a temporary name beside
+    `path` and renamed over it only when complete (lib.safe_io: no link followed), so a failed or interrupted fetch
+    leaves what was there. Retried like an upload; a blob that does not exist raises at once."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from lib import safe_io
     container, name = _split(blob)
-    svc = service or _service(account)
-    data = svc.get_blob_client(container, name).download_blob().readall()
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
-    return {"blob": blob, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def once():
+        h, n = hashlib.sha256(), 0
+        with safe_io.stream_nofollow(os.path.dirname(path), os.path.basename(path)) as f:
+            for block in _blob_chunks((service or _service(account)).get_blob_client(container, name)):
+                f.write(block)
+                h.update(block)
+                n += len(block)
+        return {"blob": blob, "bytes": n, "sha256": h.hexdigest()}
+    return _retry(f"download of {blob}", once, attempts)
+
+
+download_file = download
 
 
 def _self_test() -> int:
@@ -406,9 +447,10 @@ def _self_test() -> int:
             def get_blob_client(self, c, n):
                 st = self.store
                 return type("B", (), {
-                    "upload_blob": lambda _s, f, overwrite=False, length=None: st.__setitem__((c, n), f.read(length)),
-                    "download_blob": lambda _s: type("D", (), {"chunks": lambda _d: iter([st[(c, n)][:5],
-                                                                                         st[(c, n)][5:]])})()})()
+                    "upload_blob": lambda _s, f, overwrite=False, length=None, timeout=None: st.__setitem__(
+                        (c, n), f.read(length)),
+                    "download_blob": lambda _s, timeout=None: type("D", (), {
+                        "chunks": lambda _d: iter([st[(c, n)][:5], st[(c, n)][5:]])})()})()
         sv = _Stream()
         r = upload_file(p, "outputs/ck/r.tar.gz", service=sv)
         if sv.store.get(("outputs", "ck/r.tar.gz")) != b"result bytes" or r["sha256"] != sha256_file(p):

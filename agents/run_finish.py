@@ -505,17 +505,18 @@ def store_run_results(run_path: str, service=None) -> str | None:
     account = results_store.configured_account()
     if not account and service is None:
         return None
+    import tempfile
     name = os.path.basename(os.path.normpath(run_path))
     blob, err = None, None
     try:
+        # Bounded memory (v2 autonomy 1E-i): the archive is streamed to disk and streamed up; a large run was
+        # held three times over at this point, and a run killed here for memory stored nothing.
         secrets = [os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")]
-        data, skipped = results_store.archive_dir(run_path, name, secrets)
-        tmp = os.path.join(os.path.dirname(os.path.normpath(run_path)), f".{name}.store.tar.gz")
-        with open(tmp, "wb") as f:
-            f.write(data)
-        blob = _store_blob_name(run_path)
-        results_store.upload_retry(tmp, blob, account, service=service)
-        os.remove(tmp)
+        with tempfile.TemporaryDirectory() as stage:     # outside the run dir; removed whatever happens
+            tmp = os.path.join(stage, f"{name}.tar.gz")
+            results_store.write_archive(run_path, name, tmp, secrets)
+            blob = _store_blob_name(run_path)
+            results_store.upload_retry(tmp, blob, account, service=service)
     except Exception as e:  # noqa: BLE001 — the local copy remains; say so loudly
         blob, err = None, f"{type(e).__name__}: {e}"[:500]
         print(f"[ERROR] RUN RESULTS NOT STORED (only the VM copy exists): {err}", file=sys.stderr, flush=True)

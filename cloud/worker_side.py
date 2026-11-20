@@ -81,7 +81,7 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
                  timeout_s=None, on_start=None):
     """Unpack the code, run main.py (killed past `timeout_s`), return the run directory as a tarball.
     `on_start(work)` is called once the work dir is unpacked, just before main.py starts (the checkpoint thread)."""
-    import glob, io, os, shutil, subprocess, sys, tarfile, time, urllib.request
+    import glob, io, json, os, shutil, subprocess, sys, tarfile, time, urllib.request
     work = f"{WORK}/{label}"
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
@@ -126,20 +126,28 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
         returncode = _run_main([sys.executable, "main.py", question, "--max-rounds", str(max_rounds),
                                 "--max-sessions", str(max_sessions), *flags], work, env, log, timeout_s)
     runs = sorted(glob.glob(os.path.join(work, "runs", "*")), key=os.path.getmtime)
-    buf, skipped = io.BytesIO(), []
-    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+    # v2 autonomy 1E-i: the tarball is written to disk (it was built in memory and returned as bytes), and large
+    # files are left out only when main.py's verified store has them: after a failed store this tarball, held for
+    # `collect`, is the only copy that leaves the VM.
+    try:
+        stored = _meta_stored(json.load(open(os.path.join(runs[-1], "metadata.json")))) if runs else None
+    except (OSError, ValueError, AttributeError):
+        stored = None
+    skipped, tar = [], os.path.join(work, "result.tar.gz")
+    with tarfile.open(tar + ".tmp", mode="w:gz") as t:
         if runs:
             for root, _, files in os.walk(runs[-1]):
                 for fn in files:
                     p = os.path.join(root, fn)
-                    if os.path.getsize(p) > MAX_RETURN_FILE:   # the stored copy has them
+                    if stored and os.path.getsize(p) > MAX_RETURN_FILE:   # the stored copy has them
                         skipped.append((os.path.relpath(p, work), os.path.getsize(p)))
                         continue
                     t.add(p, arcname=os.path.relpath(p, work))
         t.add(log_path, arcname="run.log")
+    os.replace(tar + ".tmp", tar)
     return {"label": label, "exit_code": returncode, "duration_s": round(time.time() - t0),
             "run_dir": os.path.basename(runs[-1]) if runs else None, "skipped_large_files": skipped,
-            "notes": notes, "tarball": buf.getvalue()}
+            "notes": notes, "tarball": tar}
 
 
 # F6 run checkpoints (2026-11-11: a v2 preview stopped at its credit cap after 3 h; main.py stores the run only when
@@ -212,11 +220,19 @@ class TornCapture(RuntimeError):
     """run_state.json changed while the run dir was being archived: the files may come from two stages."""
 
 
-def _sha_or_none(path):
+def _sha_file(path):
+    """A file's sha256, read block by block."""
     import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(2**20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _sha_or_none(path):
     try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
+        return _sha_file(path)
     except OSError:
         return None
 
@@ -295,6 +311,7 @@ class Checkpointer:
         self.done = self.failed = self.skipped = 0
         self.gen, self.pending, self.retry_s, self._retry_at = 0, {}, retry_s, 0.0
         self.torn, self._torn_retry, self._torn_streak = 0, False, 0
+        self._ok_gen = self._ok_at = self._err = None
         self._busy, self._stop, self._thread, self._up = threading.Lock(), threading.Event(), None, None
         self._plock = threading.Lock()
         self._last = time.time()
@@ -309,6 +326,25 @@ class Checkpointer:
             self.print(line)
         except Exception:  # noqa: BLE001 -- logging never stops the run
             pass
+
+    def health(self, outcome):
+        """The counters, the last generation stored and when, and the last failure since then."""
+        import time
+        return {"label": self.label, "launch_id": self.launch_id, "interval_s": self.interval_s,
+                "done": self.done, "failed": self.failed, "skipped": self.skipped, "torn": self.torn,
+                "generation": self._ok_gen, "last_ok_epoch": self._ok_at, "last_error": self._err,
+                "last_outcome": outcome, "updated_epoch": time.time()}
+
+    def _status(self, outcome):
+        """Checkpoint health for run health checks, rewritten after every attempt (<work>/.checkpoint/status.json,
+        atomic)."""
+        import json
+        try:
+            from lib import safe_io          # the shipped tree's scripts/ is on the path (run_to_disk)
+            safe_io.write_nofollow(self.dir, "status.json", json.dumps(self.health(outcome), indent=1).encode(),
+                                   atomic=True)
+        except Exception as e:  # noqa: BLE001 -- the record never stops a checkpoint or the run
+            self.log(f"status.json not written: {type(e).__name__}: {e}"[:200])
 
     def start(self):
         import os, threading
@@ -384,6 +420,7 @@ class Checkpointer:
         if not self._busy.acquire(blocking=False):
             self.skipped += 1
             self.log(f"{why}: skipped, the previous checkpoint is still uploading")
+            self._status("skipped: the previous checkpoint is still uploading")
             return False
         with self._plock:
             tokens, self.pending = dict(self.pending), {}
@@ -427,9 +464,9 @@ class Checkpointer:
                 os.remove(p)
 
     def _upload(self, why, tokens, started):
-        import glob, json, os
+        import glob, json, os, time
         tgz = rp = None
-        blobs = ()
+        blobs, outcome = (), "skipped"
         try:
             runs = sorted(glob.glob(os.path.join(self.work, "runs", "*")), key=os.path.getmtime)
             if not runs:
@@ -461,22 +498,26 @@ class Checkpointer:
                     self._delete(checkpoint_blobs(self.prefix, self.launch_id, self.label, k))
             os.replace(rp, os.path.join(self.dir, "checkpoint.json"))
             self._torn_streak = 0
+            self._ok_gen, self._ok_at, self._err, outcome = g, time.time(), None, "stored"
         except TornCapture as e:   # never uploaded; one retry on the next tick, then the next interval
             self.torn += 1
+            outcome = "torn capture"
             self._torn_streak += 1
             self._torn_retry = self._torn_streak == 1
             self.log(f"{why}: discarded, {e}" + ("; retrying on the next tick" if self._torn_retry else ""))
             self._requeue(tokens, "torn capture")
         except Exception as e:  # noqa: BLE001 -- a failed checkpoint never stops the run
             self.failed += 1
-            self.log(f"{why}: FAILED {type(e).__name__}: {str(e)[:300]}")
+            self._err = outcome = f"{type(e).__name__}: {str(e)[:300]}"
+            self.log(f"{why}: FAILED {self._err}")
             self._delete(blobs)                  # this attempt's own generation (numbered after every stored one)
             self._requeue(tokens, "failed")
         finally:
             for p in (tgz, rp, tgz and tgz + ".tmp"):
                 if p and os.path.exists(p):
                     os.remove(p)
-            self._busy.release()
+            self._busy.release()         # first: a retry due on the next tick must find the checkpointer free
+            self._status(outcome)
 
     def _delete(self, blobs):
         for b in blobs:
@@ -498,6 +539,36 @@ def checkpoint_starter(label, prefix, launch_id, account, store, checkpoint_s, s
     return on_start
 
 
+CHECKPOINT_IDLE_S = 90.0     # teardown waits this long for a checkpoint upload in flight
+
+
+def stop_checkpointer(ck, idle_s=CHECKPOINT_IDLE_S):
+    """run_to_disk's teardown of its checkpoint thread (`ck`: checkpoint_starter's result, or None): stop the timer,
+    then wait up to `idle_s` for an upload in flight, so the cluster is not shut down under it and its staging
+    files are not left half-written beside the final store. Returns the checkpointer's health record (None
+    when checkpoints are off), which run_to_disk puts in the result record."""
+    box = getattr(ck, "box", None)
+    if box is None:
+        return None
+    box.stop()
+    box.wait_idle(idle_s)
+    busy = box._up is not None and box._up.is_alive()
+    box._status("stopped; an upload was still in flight" if busy else "stopped")
+    return box.health("stopped; an upload was still in flight" if busy else "stopped")
+
+
+def store_transcripts(d, store, prefix, launch_id, label, account, secrets, home=None):
+    """The CLI transcripts (per-stage cost and time; they exist only on this VM) archived to <d>/transcripts.tar.gz
+    by the streaming writer and uploaded; returns the blob. A VM with no transcripts stores an empty archive."""
+    import os
+    home = home or os.path.expanduser("~/.claude/projects")
+    os.makedirs(home, exist_ok=True)
+    os.makedirs(d, exist_ok=True)
+    store.write_archive(home, "transcripts", f"{d}/transcripts.tar.gz", list(secrets))
+    return store.upload_retry(f"{d}/transcripts.tar.gz",
+                              f"outputs/{prefix}/launch_{launch_id}/transcripts_{label}.tar.gz", account)["blob"]
+
+
 def checkpoint_now_side(label):
     """client.run on the agent VM (`run_cluster.py <cfg> checkpoint-now`): file one request for the running
     checkpoint thread and return at once with its token; it never waits on the worker (Codex round 1 P1-3). The
@@ -516,16 +587,27 @@ def checkpoint_now_side(label):
     return {"state": "requested", "token": token, "epoch": epoch}
 
 
+def _meta_stored(meta):
+    return meta.get("stored") if not meta.get("store_error") else None
+
+
+def _open_tar(tarball):
+    """The returned tarball for reading: its path on disk (run_to_disk), or its bytes."""
+    import io, tarfile
+    if isinstance(tarball, str):
+        return tarfile.open(tarball, mode="r:gz")
+    return tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz")
+
+
 def run_stored(tarball):
     """The blob main.py recorded in metadata.json after a verified upload, or None."""
-    import io, json, tarfile
+    import json, tarfile
     try:
-        with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as t:
+        with _open_tar(tarball) as t:
             for m in t.getmembers():
                 if m.name.endswith("/metadata.json") and m.name.count("/") == 2:   # runs/<run>/metadata.json
-                    meta = json.load(t.extractfile(m))
-                    return meta.get("stored") if not meta.get("store_error") else None
-    except (tarfile.TarError, ValueError, OSError):
+                    return _meta_stored(json.load(t.extractfile(m)))
+    except (tarfile.TarError, ValueError, OSError, AttributeError):
         return None
     return None
 
@@ -533,10 +615,10 @@ def run_stored(tarball):
 def run_identity(tarball):
     """The run's pipeline, commit and launcher from its metadata.json in the tarball; "unknown"
     for anything missing (scripts/lib/pipeline_id.py label; inlined: this file runs on the VMs)."""
-    import io, json, tarfile
+    import json, tarfile
     out = {"pipeline": "unknown", "commit": "unknown", "launcher": "unknown"}
     try:
-        with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz") as t:
+        with _open_tar(tarball) as t:
             for m in t.getmembers():
                 if m.name.endswith("/metadata.json") and m.name.count("/") == 2:   # runs/<run>/metadata.json
                     meta = json.load(t.extractfile(m))
@@ -564,16 +646,27 @@ def all_stored(store, prefix, account, labels, launch_id):
     return all(record_blob(prefix, launch_id, lb) in have for lb in labels)
 
 
-def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels, prefix, account, launch_id,
-                max_rounds=8, max_sessions=5, shutdown_when_stored=True, run_timeout_s=None, hold_s=24 * 3600,
-                checkpoint_s=None):
+def run_to_disk(label, code, *args, **kw):
+    """_run_to_disk with the launch code unpacked to a temporary directory that is removed when the task ends (it
+    used to stay on the VM's disk; the modules imported from it are already loaded)."""
+    import shutil, sys, tempfile
+    td = tempfile.mkdtemp()
+    try:
+        return _run_to_disk(td, label, code, *args, **kw)
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+        sys.path[:] = [x for x in sys.path if not x.startswith(td)]
+
+
+def _run_to_disk(td, label, code, question, flags, anthropic_key, openai_key, labels, prefix, account, launch_id,
+                 max_rounds=8, max_sessions=5, shutdown_when_stored=True, run_timeout_s=None, hold_s=24 * 3600,
+                 checkpoint_s=None):
     """The agent VM's task: run, store the run, its transcripts and its result
     record, then (last run of the launch) shut the cluster down. If any upload
     failed, hold the results on disk and stay busy until `collect` takes them:
     an idle VM is the one an autoscaling pool retires first. While main.py runs,
     a checkpoint of the run dir goes to storage every `checkpoint_s` (None: off)."""
-    import io, json, os, re, subprocess, sys, tarfile, tempfile, time
-    td = tempfile.mkdtemp()
+    import io, json, os, re, subprocess, sys, tarfile
     tarfile.open(fileobj=io.BytesIO(code), mode="r:gz").extractall(td)
     pins = [ln.split("#")[0].strip() for ln in open(os.path.join(td, "requirements.txt"))
             if re.match(r"\s*claude-agent-sdk==", ln)]
@@ -587,24 +680,20 @@ def run_to_disk(label, code, question, flags, anthropic_key, openai_key, labels,
     os.environ["MA_COMPUTE_EXCLUDE_WORKERS"] = get_worker().address
     ck = checkpoint_starter(label, prefix, launch_id, account, results_store, checkpoint_s,
                             [anthropic_key, openai_key or ""])
+    health = []
     try:
         res = run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds, max_sessions,
                            timeout_s=run_timeout_s, on_start=ck)
     finally:
-        if ck is not None and ck.box is not None:
-            ck.box.stop()
+        health.append(stop_checkpointer(ck))
+    res["checkpoint"] = health[0]
     d = f"{WORK}/{label}"
-    try:   # the CLI transcripts (per-stage cost and time) exist only on this VM
-        blob, _ = results_store.archive_dir(os.path.expanduser("~/.claude/projects"), "transcripts",
-                                            [anthropic_key, openai_key or ""])
-        open(f"{d}/transcripts.tar.gz", "wb").write(blob)
-        res["transcripts_stored"] = results_store.upload_retry(
-            f"{d}/transcripts.tar.gz", f"outputs/{prefix}/launch_{launch_id}/transcripts_{label}.tar.gz",
-            account)["blob"]
+    try:
+        res["transcripts_stored"] = store_transcripts(d, results_store, prefix, launch_id, label, account,
+                                                      [anthropic_key, openai_key or ""])
     except Exception as e:  # noqa: BLE001
         res["transcripts_store_error"] = f"{type(e).__name__}: {e}"[:300]
-    tarball = res.pop("tarball")
-    open(f"{d}/result.tar.gz", "wb").write(tarball)
+    tarball = res.pop("tarball")              # <d>/result.tar.gz, written by run_job_impl
     res["run_stored"] = run_stored(tarball)
     res["run_identity"] = run_identity(tarball)
     res["launch_id"] = launch_id
@@ -1389,8 +1478,8 @@ def store_outputs(out, prefix, account, store, beat=None):
     """Upload every file under `out` (no links; never a sensitive path: store.is_sensitive_path) to
     <prefix>/<rel>, then read each back from storage and compare sha256 with the local file. Returns
     {"prefix", "files": {rel: sha256}, "skipped", "verified", "why"}; any error is recorded, not raised."""
-    import hashlib, os, tempfile
-    sha = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()  # noqa: E731
+    import os, tempfile
+    sha = _sha_file           # block by block: an output file is never read whole (v2 autonomy 1E-i)
     rec = {"prefix": prefix, "files": {}, "skipped": [], "verified": False, "why": ""}
     try:
         rels = []

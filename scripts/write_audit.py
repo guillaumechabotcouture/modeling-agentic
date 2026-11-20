@@ -72,7 +72,7 @@ _SIO_MODS = ("lib.safe_io", "scripts.lib.safe_io", "safe_io")
 _SIO_GETTERS = ("_sio", "_safe_io")
 _SIO_ROOT_ARG = {"publish": 2, "append_text": 2, "remove_path": 1, "anchored": 1}   # index of the run-root argument
 _SIO_BASE_ARG = {**_SIO_ROOT_ARG, "write_nofollow": 0, "open_append_nofollow": 0, "remove_nofollow": 0,
-                 "rename_nofollow": 0, "copy_nofollow": 0, "dir_fd_nofollow": 0}         # ... and of a primitive's base
+                 "rename_nofollow": 0, "copy_nofollow": 0, "dir_fd_nofollow": 0, "stream_nofollow": 0}         # ... and of a primitive's base
 _DERIVED_ROOT = {"os.path.dirname", "os.getcwd", "os.getcwdb", "pathlib.Path.cwd", "Path.cwd"}
 _GETATTR_WRITERS = {"open", "fdopen"} | _OS_WRITE | _SHUTIL | _METHOD_WRITES | _NP_SAVE
 _SUBPROCESS = {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output",
@@ -311,7 +311,9 @@ REVIEWED: dict = {
     "scripts/replay.py": {"shutil": (2, _EVAL), "os-link": (1, _EVAL), "open-write": (6, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/replay_coiled.py": {"open-write": (18, _EVAL), "shutil": (3, _EVAL), "os-remove": (4, _EVAL)},
     "scripts/replay_compare.py": {"open-write": (1, _EVAL)},
-    "scripts/results_store.py": {"open-write": (1, "download() writes where the operator names"),
+    "scripts/results_store.py": {"safeio-derived-root": (1, "download() streams to the path its caller names (the "
+                                                         "launcher's out dir, a VM staging dir): no run root "
+                                                         "exists there; safe_io.stream_nofollow, no link followed"),
                                  "tempfile-dir": (1, "write_archive's anonymous TemporaryFile beside the archive it "
                                                      "writes (the checkpoint staging dir on the agent VM, outside any run "
                                                      "dir), deleted on close")},
@@ -354,7 +356,7 @@ OPEN_ITEMS: dict = {
     "agents/integrity.py": {"open-write": (1, _V1)},
     "agents/observability.py": {"open-write": (5, _V1), "os-rename": (1, _V1), "os-remove": (3, _V1)},
     "agents/output_caps.py": {"open-write": (1, _V1)},
-    "agents/run_finish.py": {"open-write": (13, _V1), "shutil": (2, _V1), "os-remove": (1, _V1)},
+    "agents/run_finish.py": {"open-write": (12, _V1), "shutil": (2, _V1)},
     "scripts/ask.py": {"open-write": (1, _V1)},
     "scripts/benchmark_match.py": {"open-write": (1, _V1)},
     "scripts/coherence_audit.py": {"open-write": (1, _V1)},

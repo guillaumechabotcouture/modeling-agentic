@@ -1751,7 +1751,6 @@ def relaunch_refusal(vm_state: str, stored: bool) -> str | None:
 
 def _download(client, label, worker, dest_file):
     """Chunked, resumable, sha256-verified (one 591 MB message reset the Coiled proxy)."""
-    import hashlib
     m = _on_worker(client, ws.fetch_meta, label, worker=worker)
     have = os.path.getsize(dest_file) if os.path.exists(dest_file) else 0
     with open(dest_file, "ab") as out:
@@ -1766,7 +1765,7 @@ def _download(client, label, worker, dest_file):
                     time.sleep(5)
             out.write(b)
             have += len(b)
-    h = hashlib.sha256(open(dest_file, "rb").read()).hexdigest()
+    h = ws._sha_file(dest_file)            # block by block: the archive is never read whole
     if h != m["sha256"]:
         os.remove(dest_file)
         raise SystemExit(f"{label}: download did not verify; removed, re-run collect")
@@ -4912,10 +4911,13 @@ def _self_test_storage(ok) -> None:
     c.trigger("t")
     threading.Timer(0.4, gate.set).start()
     box = type("B", (), {"box": c})
-    ws.stop_checkpointer(box, idle_s=10)
-    ok(c.done == 1 and ws.checkpoint_pointer("runs/t", "L1", "W") in st5.files,
-       f"WS5 WS_CK_WAIT_IDLE teardown returns only once the checkpoint in flight is stored (done={c.done})")
-    ws.stop_checkpointer(None), ws.stop_checkpointer(type("B", (), {"box": None}))
+    h5 = ws.stop_checkpointer(box, idle_s=10)
+    ok(c.done == 1 and ws.checkpoint_pointer("runs/t", "L1", "W") in st5.files
+       and (h5 or {}).get("done") == 1 and (h5 or {}).get("last_outcome") == "stopped",
+       f"WS5 WS_CK_WAIT_IDLE teardown returns only once the checkpoint in flight is stored, with the health record "
+       f"for the result record (done={c.done}): {h5}")
+    ok(ws.stop_checkpointer(None) is None and ws.stop_checkpointer(type("B", (), {"box": None})) is None,
+       "WS5b no checkpointer (checkpoints off, or main.py never started): nothing to stop")
     sp = os.path.join(work, ws.CKDIR, "status.json")
     s1 = json.load(open(sp)) if os.path.exists(sp) else {}
     st5.fail, before = True, time.time()
