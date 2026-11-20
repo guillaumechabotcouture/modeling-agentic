@@ -3226,6 +3226,14 @@ def _self_test_durability(ok) -> None:
         up = os.path.join(d, "models", "LOGS", "a.log")
         ok(not os.path.exists(up) or _is_step_log(up, d),
            "PD14b a step log under another spelling of its directory (a case-insensitive volume) is still a step log")
+        # PD17 (CI on #302, stage machine T16): as before the log existed, a step is over only when every process
+        # holding its output has ended, also one that left its group (a batch's pool process finishing its writes).
+        late = ("import subprocess, sys\n"
+                "subprocess.Popen([sys.executable, '-c', \"import time; time.sleep(1.2); "
+                "print('late-line', flush=True); open('models/a.out', 'w').write('1')\"], start_new_session=True)\n")
+        r = one(d, late)
+        ok(r.get("status") == "ok" and "late-line" in rd(d, log),
+           f"PD17 a step ends when every holder of its output has ended, and their output is in its log: {r}")
         # PD15 (Codex round 2): a `<log>.summary.json` beside the log would make compute.py's fingerprint hash the
         # log as a results file: the step then runs without a log.
         w(d, log + ".summary.json", "{}")
