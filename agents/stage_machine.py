@@ -3299,6 +3299,7 @@ import time
 def f(p):
     with open(os.environ["MA_TOY_CALLS"], "a") as fh:
         fh.write(f"{p['i']}\\n")
+    time.sleep(float(os.environ.get("MA_TOY_SLEEP_S") or 0))
     if p["i"] >= int(os.environ.get("MA_TOY_SLOW_FROM") or 99):
         parent = os.getppid()
         for _ in range(600):              # until the step is killed (this process is then orphaned)
@@ -3343,6 +3344,8 @@ if __name__ == "__main__":         # the local pool's spawned processes import t
 def _self_test_resume(ok, td: str, spike, new_run) -> None:
     """T58-T60 (Nigeria v2 full run, 2026-11-02: ANALYZE -> FINAL run_failed when the runner's 1-h limit killed the
     engine batch). A toy engine batch through scripts/compute.py, as a pipeline step before the spike's analysis."""
+    import contextlib
+    import io
     import yaml
     from v2_tasks import StubTasks
     quiet = lambda *a: None  # noqa: E731
@@ -3371,19 +3374,47 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
         open(os.path.join(d, "models", "toy_fn.py"), "w").write(_TOY_BATCH_FN)
         return d, T
 
-    # T58: the batch step times out with 3 of 6 rows done: run_failed, recorded as resumable.
+    # T58s (owner decision, 2026-11-17: warn, don't kill): a batch step that runs past its timeout_s (1 s here) is
+    # warned about and recorded while it runs, and the run goes on to finish; nothing is killed at the soft deadline.
+    import pipeline as P_
+    d, T = toy_run("analyze_soft")
+    os.environ.update(MA_TOY_CALLS=os.path.join(td, "toy_calls_soft.txt"), MA_TOY_SLEEP_S="1.5")
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            s0 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(1), cross_engine_check=False)
+    finally:
+        os.environ.pop("MA_TOY_SLEEP_S", None)
+    try:
+        prog = json.load(open(os.path.join(d, P_.PROGRESS)))["steps"]["batch"]
+        row = next(r for r in json.load(open(os.path.join(d, P_.REPORT)))["steps"] if r["id"] == "batch")
+    except (OSError, ValueError, KeyError, StopIteration):
+        prog, row = {}, {}
+    ok(s0 in ("completed", "completed_scope_declared") and prog.get("state") == "ok"
+       and prog.get("soft_deadline_s") == 1 and prog.get("backstop_s") == 24 * 3600 and row.get("over_soft_deadline")
+       and "past its soft deadline" in err.getvalue(),
+       f"T58s a step past its timeout_s warns, records its progress and runs on; the run finishes ({s0}, {prog}, "
+       f"{row})")
+    # T58: past its backstop (made 8 s here: BACKSTOP_MULTIPLE 1, no 24 h floor) the batch step is killed with 3 of
+    # 6 rows done: run_failed, recorded as resumable.
     d, T = toy_run("analyze_timeout")
     calls = os.path.join(td, "toy_calls.txt")
     os.environ.update(MA_TOY_CALLS=calls, MA_TOY_SLOW_FROM="3")
+    saved = (P_.BACKSTOP_MULTIPLE, P_.BACKSTOP_FLOOR_S)
+    P_.BACKSTOP_MULTIPLE, P_.BACKSTOP_FLOOR_S = 1, 0.0
     try:
         s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(8), cross_engine_check=False)
     finally:
         os.environ.pop("MA_TOY_SLOW_FROM", None)
+        P_.BACKSTOP_MULTIPLE, P_.BACKSTOP_FLOOR_S = saved
     st = load_state(d)
     first = open(calls).read().split() if os.path.exists(calls) else []
+    kill = next((r for r in json.load(open(os.path.join(d, P_.REPORT)))["steps"] if r["id"] == "batch"), {})
     ok(s1 == "run_failed" and st.history[-1]["from"] == "ANALYZE" and st.history[-1].get("resumable") == "timeout"
-       and resumable_failure(d, st) == "timeout" and first[:3] == ["0", "1", "2"],
-       f"T58 an analysis step that times out ends run_failed, marked resumable ({s1}, {st.history[-1]}, calls {first})")
+       and resumable_failure(d, st) == "timeout" and first[:3] == ["0", "1", "2"]
+       and "at its backstop" in str(kill.get("error")),
+       f"T58 an analysis step killed at its backstop ends run_failed, marked resumable ({s1}, {st.history[-1]}, "
+       f"calls {first}, {kill.get('error')})")
     # T59: --resume (run_v2 on the same run) continues at ANALYZE with the step limit as the backend gives it now,
     # and the batch computes only the rows the killed attempt had not finished.
     s2 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False)
