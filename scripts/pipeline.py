@@ -3205,9 +3205,17 @@ def _self_test_durability(ok) -> None:
            f"PD12 a step's log never satisfies a declared output, and a failed step's log is kept: {r}")
         # PD14 (Codex round 2): an output declared as a step log is refused when the pipeline loads, so no step
         # (a compute step's `out` is one of its outputs) can replace a log.
-        r = one(d, "pass\n", outputs=["models/LOGS/b.log"])
+        r = one(d, "pass\n", outputs=["models/logs/b.log"])
         ok("step logs" in (r.get("error") or "") and "log" not in r,
            f"PD14 a declared output that names a step log is refused at load: {r}")
+        # (Codex round 3) the whole directory is the runner's for outputs, so no output glob covers a log there; and
+        # another spelling is refused only where it is the same directory (a case-insensitive volume).
+        r = one(d, "pass\n", outputs=["models/logs/table.csv"])
+        ok("step logs" in (r.get("error") or ""), f"PD14c an output inside the log directory is refused at load: {r}")
+        same = os.path.exists(os.path.join(d, "models", "LOGS"))
+        r = one(d, "pass\n", outputs=["models/LOGS/b.log"])
+        ok(("step logs" in (r.get("error") or "")) == same,
+           f"PD14d another spelling is refused only where it is the same directory ({same}): {r}")
         up = os.path.join(d, "models", "LOGS", "a.log")
         ok(not os.path.exists(up) or _is_step_log(up, d),
            "PD14b a step log under another spelling of its directory (a case-insensitive volume) is still a step log")
@@ -3218,11 +3226,18 @@ def _self_test_durability(ok) -> None:
         ok(r.get("returncode") == 6 and r.get("log_error") and "log" not in r,
            f"PD15 a results summary beside the log path: the step runs without a log: {r}")
         os.remove(os.path.join(d, log + ".summary.json"))
-        # PD16 (Codex round 2): a module name that is a link to a step log is never the step's code.
+        # PD16 (Codex rounds 2-3): a module that is a link to a step log stays in the step's code (it is what runs, so
+        # the step fails as changed rather than pass as current); a log named as a plain argument is not code.
         os.symlink(os.path.join(d, log), os.path.join(d, "models", "pdalias.py"))
         w(d, "models/a.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import pdalias\n")
         cf = code_files({"id": "a", "run": f"{py} models/a.py", "inputs": [], "outputs": ["models/a.out"]}, d)
-        ok(not any(_is_step_log(c, d) for c in cf), f"PD16 a link to a step log is never a step's code: {cf}")
+        cf2 = code_files({"id": "a", "run": f"{py} models/a.py {log}", "inputs": [], "outputs": ["models/a.out"]}, d)
+        os.remove(os.path.join(d, "models", "pdalias.py"))
+        cf3 = code_files({"id": "a", "run": f"{py} models/a.py {log}", "inputs": [], "outputs": ["models/a.out"]}, d)
+        os.symlink(os.path.join(d, log), os.path.join(d, "models", "pdalias.py"))
+        ok(any(_is_step_log(c, d) for c in cf) and any(_is_step_log(c, d) for c in cf2)
+           and not any(_is_step_log(c, d) for c in cf3),
+           f"PD16 an imported link to a step log stays in the step's code; a log argument alone does not: {cf} {cf3}")
         os.remove(os.path.join(d, "models", "pdalias.py"))
         # PD13 (Codex round 1): an interrupt during the grace still kills the step's group.
         c = subprocess.Popen([sys.executable, "-c", "import signal, sys, time\n"
