@@ -516,6 +516,7 @@ def _rec(**kw) -> dict:
 
 
 def _self_test() -> int:
+    import contextlib
     import tempfile
     import numpy as np
     import yaml
@@ -901,7 +902,94 @@ def _self_test() -> int:
            and _raises(lambda: from_log("no records here"), ValueError),
            "DG23j a log with another failed case, or without records, is refused as a recording")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19, dg20, dg21, dg22, dg23):
+    def dg24():          # Codex review r8 of #262, on the tolerant check (written first; each failed)
+        import io
+        import numpy as np
+        tp = lambda x: _tolerant({"decision": x})  # noqa: E731
+        ok(tp({"x": [1.0, "\x00number"]}) != tp({"x": ["\x00number", 1.0]}) and tp([1.0, None]) != tp([None, 1.0]),
+           "DG24a (r8 P1) no string or other value can stand in a number's place: a number that moves is a difference")
+        ok(_raises(lambda: tp({1: "removed", "1": "kept"}), ValueError),
+           "DG24b (r8 P1) two keys of a mapping with the same string form are refused, never merged")
+        ok(tp({"x": float("nan")}) != tp({"x": "nan"}) and tp({"x": float("inf")}) != tp({"x": "inf"}),
+           "DG24c (r8 P1) nan and inf are not the strings 'nan' and 'inf'")
+        ok(tp(frozenset({1000000})) != tp(frozenset({1000001})) and tp({1.5, 2}) == tp({2, 1.5})
+           and tp({1.5})["numbers"] == {},
+           "DG24d (r8 P1) the members of a set are exact, whole numbers unrounded; a set has no order, so its "
+           "floating-point members are exact too")
+        big = sys.float_info.max
+        ok(compare_numbers({"A": tp(1.0001010102)["numbers"]}, {"A": tp(1.0)["numbers"]}) != []
+           and tp(big)["numbers"] == {"decision": [big]}
+           and compare_numbers({"A": tp(big)["numbers"]}, {"A": tp(1.0)["numbers"]}) != [],
+           "DG24e (r8 P1) a number is compared as it is, not rounded first")
+        ok(tp({"objective": np.array(1.5)}) == tp({"objective": 1.5}),
+           "DG24f (r8 P2) a zero-dimensional array is its value")
+        t = tolerant(_rec())
+        good = golden_text({"f:DT1#0": t["exact"]}, {"f:DT1#0": t["numbers"]}, {"cpu": "toy"})
+        first = json.dumps(t["numbers"]["decision"][0])
+        for label, bad in (("a number that is not finite", good.replace(first, "1e999", 1)),
+                           ("a boolean where a number goes", good.replace(first, "true", 1)),
+                           ("a string where a number goes", good.replace(first, '"x"', 1)),
+                           ("a fifth exact part", good.replace(t["exact"]["words"], t["exact"]["words"] + ".deadbeefdeadbeef")),
+                           ("no platform line", golden_text({"f:DT1#0": t["exact"]}, {"f:DT1#0": t["numbers"]}))):
+            ok(bad != good and _raises(lambda b=bad: (golden_read(b), golden_numbers(b, strict=True)), ValueError),
+               f"DG24g (r8 P1) a golden file with {label} is refused")
+        from toolkit.analysis import decision_tests as DTm
+        g, saved_run, seen, buf, out = globals(), DTm.run_one, [], io.StringIO(), sys.stdout
+        far = tolerant(_rec(share_units_changed=0.5))
+        _CAP.update(on=True, paused=False, orig=saved_run, counts={}, problems=[], parts={},
+                    recs={"f:DT1#0": far["exact"], "f:DT2#0": far["exact"]},
+                    nums={"f:DT1#0": far["numbers"], "f:DT2#0": far["numbers"]})
+        sys.stdout = buf
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                saved, g["GOLDEN"] = g["GOLDEN"], os.path.join(d, "golden.json")
+                try:
+                    open(g["GOLDEN"], "w").write(good.replace(first, '"x"', 1))
+                    check_capture(lambda c, m: seen.append((bool(c), m)))
+                finally:
+                    g["GOLDEN"] = saved
+        finally:
+            sys.stdout, DTm.run_one = out, saved_run
+            _CAP.update(on=False, orig=None)
+        log = buf.getvalue()
+        ok([c for c, m in seen if "DG-R1" in m] == [False] and log.count("DT_GOLDEN_RECORD ") == 2,
+           "DG24h (r8 P1) a malformed golden file fails the check and the records are still printed")
+        lines = log.splitlines()
+        o2, n2, m2 = from_log(log)
+        ok(set(o2) == {"f:DT1#0", "f:DT2#0"}, f"DG24i the printed lines rebuild both records ({sorted(o2)})")
+        cut = "\n".join(ln for ln in lines if "f:DT2#0" not in ln and "DT_GOLDEN_END" not in ln)
+        cut2 = "\n".join(ln for ln in lines if "f:DT2#0" not in ln)
+        ok(_raises(lambda: from_log(cut), ValueError) and _raises(lambda: from_log(cut2), ValueError),
+           "DG24j (r8 P1) a log cut short (no end line, or fewer records than the end line counts) is refused")
+        ok(_raises(lambda: from_log(log + "\n" + log), ValueError),
+           "DG24k (r8 P1) a log holding two captures is refused, never merged")
+        for extra in ("  FAIL R4 bad plan", "FAIL R4 missing DT_GOLDEN_FILE", "FAILED: 2 case(s)"):
+            ok(_raises(lambda e=extra: from_log(log + "\n" + e), ValueError),
+               f"DG24l (r8 P1) a log with another failed case is refused ({extra.strip()[:20]})")
+        ok(set(from_log(log + '\nDT_GOLDEN_PARTS {"k": {"words": {"question": "DT_GOLDEN_RECORD foo"}}}')[0])
+           == set(o2) and set(from_log(log + "\nFAILED: 1 case(s)")[0]) == set(o2),
+           "DG24m (r8 P2) a marker inside a record's own text is not read as a line; DG-R1's own failure count is "
+           "accepted")
+        with tempfile.TemporaryDirectory() as d:
+            saved, g["GOLDEN"] = g["GOLDEN"], os.path.join(d, "golden.json")
+            try:
+                open(g["GOLDEN"], "w").write(good)
+                bad_log = os.path.join(d, "bad.log")
+                open(bad_log, "w").write('DT_GOLDEN_PLATFORM {}\nDT_GOLDEN_RECORD {"key":"X","exact":{},"numbers":{}}'
+                                         '\nDT_GOLDEN_END 1\n')
+                failed = _raises(lambda: main(["record", bad_log, "--source", "test"]))
+                kept = open(g["GOLDEN"]).read() == good
+                open(bad_log, "w").write(log)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = main(["record", bad_log, "--source", "CI run 1"])
+                new_text = open(g["GOLDEN"]).read()
+            finally:
+                g["GOLDEN"] = saved
+        ok(failed and kept, "DG24n (r8 P1) a log `record` cannot use leaves the golden file as it was")
+        ok(rc == 0 and golden_read(new_text) == o2 and golden_numbers(new_text, strict=True)[1].get("source") == "CI run 1",
+           "DG24o `record` writes the log's records with the platform and the source named")
+
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19, dg20, dg21, dg22, dg23, dg24):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
