@@ -182,6 +182,32 @@ def realized_rank_correlations(spec, features) -> dict:
     return out
 
 
+def cover_features(order: list, hold: set, cols: list) -> list:
+    """The first len(order) design points' units, changed only as far as needed for the points to span every emulator
+    feature's range over the units (1C-b 2b). The emulator's feature domain is the range of its design points
+    (toolkit/analysis/model.py), so a unit beyond it is an extrapolation that stops the analysis. For each feature
+    whose minimum or maximum no design point reaches, the first unit at that value takes the last design point that is
+    not held out and does not itself carry such a value (a held-out one when no other is left). An order that already
+    spans every feature is returned unchanged, so its jobs keep their hashes. `cols`: one list per feature, a value
+    per unit; with more extremes than points, the remaining features stay uncovered (and the extrapolation stops)."""
+    order = list(order)
+    ends = {c.index(pick(c)) for c in cols for pick in (min, max)}      # never replaced once they are design points
+    for _ in range(2 * len(cols) + 1):      # a replaced point may have carried a tied extreme: repeat until none moves
+        moved = False
+        for c in cols:
+            for want in (min(c), max(c)):
+                if any(c[u] == want for u in order):
+                    continue
+                free = [k for k in range(len(order)) if order[k] not in ends]
+                if not free:
+                    return order
+                order[max(free, key=lambda k: (k not in hold, k))] = c.index(want)
+                moved = True
+        if not moved:
+            break
+    return order
+
+
 def design(spec) -> tuple[dict, list[dict]]:
     """(design, jobs): the spike's design, from the spec."""
     from scipy.stats import qmc
@@ -199,6 +225,9 @@ def design(spec) -> tuple[dict, list[dict]]:
     while len(order) < n:
         order += list(rng.permutation(len(units)))
     hold = set(rng.choice(n, size=int(round(n * float(em.get("holdout_share", 0.1)))), replace=False).tolist())
+    from toolkit.analysis import features as FT
+    fcols = [list(c) for c in zip(*(FT.vector(spec, u) for u in units))]    # empty without declared features
+    order = cover_features([int(k) for k in order[:n]], hold, fcols)
     pk = spec.packages()
     uid = spec.uid
     attr = spec["calibration"]["attribute"]

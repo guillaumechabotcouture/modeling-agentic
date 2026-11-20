@@ -78,6 +78,9 @@ def _group(res, o, pm):
     sh = res["meta"]["age_shares"]
     gs = pm["age_groups"]
     w = sum(sh[g] for g in gs)
+    bad = [g for g in gs if not math.isfinite(res["per_capita"][o][g]) or not math.isfinite(sh[g])]
+    if bad:       # 1C-b 2d-i: fail closed, as _driver and _metric do (a NaN here reached the plan's totals)
+        raise ValueError(f"engine outcome {o!r}: the per-capita value or the group share of {bad[:3]} is not finite")
     return sum(res["per_capita"][o][g] * sh[g] for g in gs) / w if w > 0 else 0.0
 
 
@@ -211,7 +214,7 @@ class EmulatorModel:
                 self.train_corrections[f"burden_floor:{o}:{P}"] = int(np.sum(v < 1e-9))
             self.T[("bw", o, P)] = np.log(np.maximum(v, 1e-9))
         self.gps, self.accuracy = {}, {}
-        self.error, self.error_floors = None, {}
+        self.error, self.error_floors, self.error_clips = None, {}, {}
         self.design_points = n
 
     def _x(self, z, theta, u):
@@ -363,11 +366,16 @@ class EmulatorModel:
                     if k == self.comp:
                         continue
                     r = self.gps[("red", P, o, k)].predict(X)
-                    if E is not None:
-                        r = r + E[:, self.error.col[(P, o, k)]]
-                    for j in np.flatnonzero((r < -0.5) | (r > 1.0)):
+                    off = (r < -0.5) | (r > 1.0)      # 1C-b 2a: the correction is judged on the emulator mean
+                    for j in np.flatnonzero(off):
                         ev.append({"unit": ids[j], "package": k, "kind": "reduction_clip", "outcome": o, "group": P,
                                    "value": float(r[j])})
+                    if E is not None:     # a drawn error past the bounds is clipped and counted, as the cost floor is
+                        r = r + E[:, self.error.col[(P, o, k)]]
+                        nc = int(np.sum(((r < -0.5) | (r > 1.0)) & ~off))
+                        if nc:
+                            cl = self.error_clips.setdefault(o, {})
+                            cl[k] = cl.get(k, 0) + nc
                     r = np.clip(r, -0.5, 1.0)
                     for j in range(n):
                         y[j]["y"][k][o] = y[j]["y"][k].get(o, 0.0) + float(b[j] * (1 - r[j])) * popv[j]
@@ -573,7 +581,9 @@ class DirectModel:
                     row["burden"] = {k: {o: sum(g.values()) for o, g in bg.items() if set(g) == set(self.pops)}}
                 if k == self.comp:
                     for n, d in self.diagnostics.items():
-                        row["diag"][n] = float((r.windows.get(d.get("window", "")) or {}).get(d["metric"], math.nan))
+                        # 1C-b 2d-ii: a declared diagnostic the engine does not report fails closed (was NaN)
+                        row["diag"][n] = _metric({"windows": r.windows}, d.get("window", CAL_WINDOW), d["metric"],
+                                                 f"diagnostic {n!r}, unit {i}")
             if self.yll:
                 BV.finish_parts(row, self.yll, BV.window_weights(self.spec, self.yll, _yll_value(self.spec, theta)))
             out[i] = row
