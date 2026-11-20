@@ -2886,11 +2886,16 @@ def _self_test_isolation(ok, base):
         if got_m and len(got_m[0].axes) > 1 else None
     rows_c = sorted(r["component"] for r in got_m[3] if "component" in r) if got_m else None
     plt.close("all")
-    # Codex r4: read as published (render cuts a caption at CAPTION_MAX): the count not drawn is before the cut
-    ok(e_m is None and " 1 intervals withheld: planted reason" in cap_m
-       and "1 interval not drawn" in cap_m[:CAPTION_MAX - 1],
-       f"FG_WITHHELD_MIXED the caption counts a withheld interval and one not drawn for a non-finite end apart, "
-       f"the latter inside the published length ({e_m}, {cap_m!r})")
+    # Codex r4, r5: as published. render cuts a caption at CAPTION_MAX; the count not drawn is a caption note, added
+    # after the cut, and the withheld count stays where it was
+    pub, e_p2 = attempt(lambda: render(R.dir, os.path.join(base, "iso_m"), figure_data=R.override["figure_data"],
+                                       only=["cost_per_outcome"]))
+    cap_p = pub["figures"][0]["caption"] if pub and pub["figures"] else ""
+    ok(e_m is None and e_p2 is None and " 1 intervals withheld: planted reason" in cap_m
+       and "not drawn" not in cap_m and len(cap_m) > CAPTION_MAX
+       and cap_p.endswith("… 1 interval not drawn: an end is not a finite number."),
+       f"FG_WITHHELD_MIXED the caption counts a withheld interval and one not drawn for a non-finite end apart; "
+       f"the latter is in the published caption whatever its length ({e_m}, {e_p2}, {cap_p!r})")
     keep_c = sorted(c for c in ci_ if c != c0)
     ok(e_m is None and rows_c == keep_c and drawn_c == sorted(R.labels.component(c) for c in keep_c),
        f"FG_COMPONENT_FINITE a component whose cost per outcome is not finite has no row in the plot or the table; "
@@ -2901,10 +2906,15 @@ def _self_test_isolation(ok, base):
     ci1 = dict(fd["component_increment"])
     ci1[sorted(ci1)[0]] = dict(ci1[sorted(ci1)[0]], outcome_per_usd=1e-310)
     R.override["figure_data"] = dict(fd, component_increment=ci1)
-    e_1, _ = drawn(R, fig_cost_per_outcome)
-    ok(e_1 is None and len(fd["by_package"]) >= 3 and len(ci1) == 2,
-       f"FG_ONE_COMPONENT cost per outcome draws with one component row beside {len(fd['by_package'])} package "
-       f"rows ({e_1})")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got_1, e_1 = attempt(lambda: fig_cost_per_outcome(R, t))
+    lab_1 = [x.get_text() for x in got_1[0].axes[1].get_yticklabels()] if got_1 and len(got_1[0].axes) > 1 else None
+    h_1 = got_1[0].axes[1].get_position().height if lab_1 else None
+    plt.close("all")
+    ok(e_1 is None and len(fd["by_package"]) >= 3 and lab_1 == [R.labels.component(sorted(ci1)[1])] and h_1 > 0,
+       f"FG_ONE_COMPONENT cost per outcome draws its one component row, in a panel of positive height, beside "
+       f"{len(fd['by_package'])} package rows ({e_1}, {lab_1}, {h_1})")
     # Codex r4: a file whose state before the attempt could not be read is never taken for the attempt's own
     out_u = os.path.join(base, "iso_u")
     os.makedirs(out_u)
@@ -2919,9 +2929,10 @@ def _self_test_isolation(ok, base):
         before_u, e_u = attempt(lambda: _file_sigs(out_u, "x", (".png",)))
     finally:
         os.lstat = orig_lstat
-    attempt(lambda: _discard(out_u, "x", out_u, before_u))
-    ok(e_u is None and os.path.exists(os.path.join(out_u, "x.png")),
-       f"FG_DISCARD_UNREADABLE a file that could not be examined before the attempt is not removed ({e_u})")
+    _, e_u2 = attempt(lambda: _discard(out_u, "x", out_u, before_u))
+    ok(e_u is None and e_u2 is None and os.path.exists(os.path.join(out_u, "x.png")),
+       f"FG_DISCARD_UNREADABLE a file that could not be examined before the attempt is not removed, and the "
+       f"clean-up raises nothing ({e_u}, {e_u2})")
     # Codex r3: a figure that fails removes only what its own attempt published, never a file already there
     out_c = os.path.join(base, "iso_c")
     os.makedirs(out_c)
