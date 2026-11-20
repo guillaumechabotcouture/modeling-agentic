@@ -1597,7 +1597,8 @@ def fig_calibration(R, t):
             x = np.array([tgt[i] for i in R.ids])
             y = np.array([mod[i] for i in R.ids])
             m = _prop_max([x.max(), y.max()])
-            gx = np.linspace(max(m / 400, 1e-4), min(m, 1 - 1e-6), 200)      # the logit is undefined at 1
+            # the logit is undefined at 0 and 1; the lower end is 1e-4, or a quarter of a shorter axis (Codex r2)
+            gx = np.linspace(max(m / 400, min(1e-4, m / 4)), min(m, 1 - 1e-6), 200)
             if e_rmse:
                 a1.fill_between(gx, il(lg(gx) - 1.96 * e_rmse), il(lg(gx) + 1.96 * e_rmse), color=t["band"], lw=0,
                                 zorder=0, label="emulator held-out error (95%)")
