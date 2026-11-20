@@ -2516,7 +2516,7 @@ def _bundle_skips(fn: str, names, in_data: bool, runner: bool) -> bool:
     runner's files) are still shipped: a model that reads one found it on the workers before."""
     return _fp_ignored(fn, names, in_data, runner) and (
         fn.endswith((".log", ".summary.json", PARTIAL_EXT, JOB_EXT))
-        or fn.startswith("compute_ledger.json"))
+        or (runner and fn.startswith("compute_ledger.json")))     # the run's own ledger, where it is kept
 
 
 FP_DISPATCH_EXEMPT = (
