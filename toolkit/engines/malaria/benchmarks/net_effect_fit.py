@@ -411,6 +411,15 @@ def fetch_cache(blob: str, digest: str, dest: str, account: str | None = None, s
     return dest
 
 
+V1_POINTS = 12        # the 20 Nov verification round's sample points (owner)
+
+
+def v1_problems(verify: int, n_verified: int) -> list:
+    """The 20 Nov verification round fails when it verifies fewer sample points than declared (Codex review of #290)."""
+    return ([] if n_verified >= verify else
+            [f"the verification round verified {n_verified} sample points, fewer than the {verify} declared"])
+
+
 def no_rerun(runner, what: str) -> None:
     """Refuse (ValueError) once `runner` has run any engine task: a verification round reruns no design point."""
     n = int(getattr(runner, "ran_tasks", 0) or 0)
@@ -1304,6 +1313,8 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
     v1 = OPTION_A["verify_v1"] if verify_v1 else None
     if v1 and not rb:
         raise ValueError("the verification round is refit b's (not a smoke or the old verification round)")
+    if v1 and verify != V1_POINTS:
+        raise ValueError(f"the 20 Nov verification round verifies exactly {V1_POINTS} sample points, not {verify}")
     if rb:          # refit b: only from the stored 18 Nov checkpoint, under its sha256, and without the margin option
         import hashlib      # (the 20 Nov verification round: b2's checkpoint, with --margin-loo)
         if v1 and not margin_loo:
@@ -1384,7 +1395,7 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
     n2 = 3 if smoke else WAVE2["n"] if verify_round else OPTION_A["wave2_n"]
     fit = fit_waves(pack, runner, wave1, box2, n2, WAVE2["seed"], support=support,
                     cand_seed=cseed,
-                    after_design=(lambda: no_rerun(runner, "wave 2's design")) if rv else None, extra=extra)
+                    after_design=(lambda: no_rerun(runner, "wave 2's design")) if (rv or v1) else None, extra=extra)
     X = np.array([[(th[k] - box[i, 0]) / (box[i, 1] - box[i, 0]) for i, k in enumerate(names)]
                   for th in fit["design"]["x"]])
     margin = None
@@ -1430,6 +1441,9 @@ def run(pack: dict, base: dict, workers: int, out_path: str, approved: str | Non
                         "per_seed": {t: list(r.get("per_seed") or []) for t, r in rows.items()},
                         "calibration_check": _control_check(runner, pack, ctrl, reg["sample"][i])})
     reg, code = finalize(reg, checked, chosen, grid_edge, bands=bands, seeds=list(runner.seeds))
+    if v1 and v1_problems(verify, len(checked)):        # the round's result: fewer points than declared fail it
+        reg["acceptance"] = list(reg.get("acceptance") or []) + v1_problems(verify, len(checked))
+        reg["sample_status"], code = "invalid", 2
     waves["verify_v1"] = ({k: v1[k] for k in ("cache_sha256", "candidate_seed", "pick_seed", "cap_usd", "final")}
                           if v1 else None)      # the 20 Nov round: its result is final, the owner decides on failure
     # refit b: the monitored (held-out) targets at the chosen point and the verified points, reported only
@@ -2648,6 +2662,19 @@ def _self_test() -> int:
            and tail[tail.index("--resume-from") + 1] == v1.get("resume_dir"),
            f"FV4 the round's launch: {' '.join(cmd)}")
     case("FV4", fv4)
+
+    def fv5():
+        # Codex review of #290 (P1): the round verifies exactly 12 sample points; a smaller --verify is refused before
+        # any engine set-up, and a region with fewer than 12 points fails the round (recorded), whatever the rule says
+        got = ""
+        try:
+            run(p, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=False, cap_usd=1e9, verify=1,
+                verify_v1=True, margin_loo=True, resume_from="/nonexistent")
+        except ValueError as ex:
+            got = str(ex)
+        ok("12" in got and v1_problems(12, 11) and not v1_problems(12, 12) and not v1_problems(12, 400),
+           f"FV5 the round needs 12 verified sample points ({got[:90]}; {v1_problems(12, 11)})")
+    case("FV5", fv5)
     OPTION_A["cap_usd"] = shipped_cap
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

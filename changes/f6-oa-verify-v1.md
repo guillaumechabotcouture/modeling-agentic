@@ -1,6 +1,6 @@
 ---
 phase: "F6"
-commit: "OA verify v1 α–β"
+commit: "OA verify v1 α–γ"
 ---
 
 ## Changelog
@@ -11,4 +11,4 @@ commit: "OA verify v1 α–β"
 
 `plan --verify-v1` prices the round at 1,248 arm runs (the re-chosen point plus 12 sample points), about 1.1–1.5 h and $6.6–9 on 48 vCPUs.
 
-New self-tests: FV1–FV4.
+The round verifies exactly 12 sample points: a smaller `--verify` is refused, and fewer than 12 in the region fail the round. It stops if any stored task is missing from the checkpoint before the choice. New self-tests: FV1–FV5.
