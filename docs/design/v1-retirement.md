@@ -83,7 +83,7 @@ Total: 9 files, 3,938 lines. The edits elsewhere are small:
 The experiment write-ups under `docs/experiments/` and `experiments/`, and the archived launchers, keep their
 references: they record what ran. Reproducing E1, E2, E5 or E7 needs a checkout from before the retirement.
 
-### Deleted in the orchestration PR (v1 retirement γ, stacked on #292 and β)
+### Deleted in the orchestration PR (v1 retirement γ, stacked on #292 and β): 14 files and 3,353 more lines, 9,010 lines in all
 
 | File or part | Lines | Why it is v1-only |
 |---|---:|---|
@@ -91,9 +91,9 @@ references: they record what ran. Reproducing E1, E2, E5 or E7 needs a checkout 
 | `agents/lead_prompt.py` | 951 | the lead's prompt; imported by `agents/__init__.py` |
 | `agents/hooks.py` | 742 | the lead session's PreToolUse and SubagentStop hooks; imported by `__init__`, `run_finish`, `run_session` and `main` |
 | `agents/observability.py` | 440 | heartbeat and `status.json` of the lead session; imported only by `main.run` |
-| `agents/__init__.py` registry | ~440 of 457 | `build_agents`, `_registry`, skill selection, the lead prompt and hook re-exports; the package keeps its docstring and the `scripts/` `sys.path` line |
-| `agents/run_finish.py`, v1 part | ~700 of 829 | `finalize_run`, `final_writeup`, `presentation_fix_pass`, `run_final_gate`, `determine_status`, report restore, verdict banner, model card write. Kept: `gate_command`, `VALIDATOR`, `exit_code_for` and its status sets, `store_run_results`, `_store_blob_name`, `detect_current_round` |
-| `main.py`, v1 part | ~2,100 | `run()` and its helpers (resume context, sign-off waits, the lead's brief answers), and the self-test cases of the code above, including PV9 (it tested `_restore_protected_meta`, the v1 finalizer's helper, which goes). Kept: `main()` with every flag, `main_v2`, `run_v2_and_store`, `eval_refusal`, `create_run_dir`, the other PV cases, the EV and ST cases, and the cases that test kept shared modules (enforcement, integrity, run budget) |
+| `agents/__init__.py` registry | 464 deleted; 17 lines left | `build_agents`, `_registry`, skill selection, the lead prompt and hook re-exports; the package keeps its docstring and the `scripts/` `sys.path` line |
+| `agents/run_finish.py`, v1 part | 746 deleted; 99 lines left | `finalize_run`, `final_writeup`, `presentation_fix_pass`, `run_final_gate`, `determine_status`, report restore, verdict banner, model card write. Kept: `gate_command`, `VALIDATOR`, `exit_code_for` and its status sets, `store_run_results`, `_store_blob_name`. (`detect_current_round` also went: `gate_replay.py` has its own copy.) `agents/run_session.py` keeps only `LEAD_TOOLS`, for the preflight. |
+| `main.py`, v1 part | 1,904 deleted (about 640 of runner code, the rest self-test cases) | `run()` and its helpers (resume context, sign-off waits, the lead's brief answers), and the self-test cases of the code above, including PV9 (it tested `_restore_protected_meta`, the v1 finalizer's helper, which goes). Kept: `main()` with every flag, `main_v2`, `run_v2_and_store`, `eval_refusal`, `create_run_dir`, the other PV cases, the EV and ST cases, and the cases that test kept shared modules (enforcement, integrity, run budget) |
 | `scripts/validate_skill_attachments.py` | edit | it parses the attachment matrix in `agents/__init__.py`. With the registry gone it checks frontmatter and the skills v2 loads (`decision-spec`), and every skill becomes unattached |
 | README.md, CLAUDE.md | edit | the v1 description (agents table, STAGE 7 walkthrough, CLI rows) becomes a short historical note |
 
