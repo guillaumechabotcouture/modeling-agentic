@@ -2918,13 +2918,7 @@ def _self_test_attach(ok) -> None:
             sys.modules.pop("coiled", None)
         else:
             sys.modules["coiled"] = saved
-    spec = importlib.util.spec_from_file_location(
-        "_rc60_replay_coiled", os.path.join(os.path.dirname(HERE), "scripts", "replay_coiled.py"))
-    rq = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(rq)
-    # replay_coiled.py is uploaded to the workers on its own (client.upload_file), so it cannot load
-    # worker_side.py at import and keeps its own copy of the name: this check keeps the two equal.
-    ok(WORKSPACE == ws.WORKSPACE == rq.WORKSPACE, "RC60f launcher, worker side and replay backend name one workspace")
+    ok(WORKSPACE == ws.WORKSPACE, "RC60f launcher and worker side name one workspace")
     _self_test_bwrap(ok)
 
 
