@@ -2839,6 +2839,11 @@ def _self_test() -> int:
             ok(rep["errors"] and not ig.open_events,
                f"PO13 (review) an invalid pipeline's report is written inside the harness grant: {ig.open_events}")
     try:
+        _self_test_durability(ok)
+    except Exception as e:  # noqa: BLE001 -- before the fix exists (step α) this is the failure
+        print(f"FAIL PD durability tests: {type(e).__name__}: {e}")
+        ok(False, f"PD durability tests: {type(e).__name__}: {e}")
+    try:
         _self_test_derivations(ok)
     except Exception as e:  # noqa: BLE001 -- before the runner exists (step α) this is the failure
         print(f"FAIL DI derivation tests: {type(e).__name__}: {e}")
@@ -2933,6 +2938,110 @@ def di_fixture(d: str, extra: str = "", uses=("id", "a", "b", "pop"), ignores=No
                                          "inputs": ["data/inputs/raw.csv"], "outputs": ["data/derived/units.csv"],
                                          "columns": cols}]}, f, sort_keys=False)
     return d
+
+
+def _self_test_durability(ok) -> None:
+    """PD1-PD10 (v2 autonomy 1D-i): a graceful stop at the backstop, step logs, and the steps' environment."""
+    from unittest import mock as _mock
+    py = shlex.quote(sys.executable)
+
+    def w(d, rel, txt):
+        os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
+        with open(os.path.join(d, rel), "w") as f:
+            f.write(txt)
+
+    def one(d, body, cmd=None, **kw):
+        import yaml
+        w(d, "data/x.csv", "1\n")
+        w(d, "models/a.py", body)
+        step = dict({"id": "a", "run": cmd or f"{py} models/a.py", "inputs": ["data/x.csv"],
+                     "outputs": ["models/a.out"]}, **kw)
+        w(d, SPEC, yaml.safe_dump({"steps": [step]}, sort_keys=False))
+        rep = run(d)
+        return rep["steps"][0] if rep.get("steps") else {"error": str(rep.get("errors"))}
+
+    def rd(d, rel):
+        try:
+            with open(os.path.join(d, rel), errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    log = "models/logs/a.log"
+    fast = {"BACKSTOP_FLOOR_S": 1.0, "PROGRESS_EVERY_S": 0.5, "TERM_GRACE_S": 6.0}
+    with tempfile.TemporaryDirectory() as d, _mock.patch.dict(globals(), fast):
+        d = os.path.realpath(d)
+        # PD1: at the backstop the step's group gets SIGTERM and time to flush before any SIGKILL. The command is a
+        # compound one, so the shell (the group leader) ends at once while the process that flushes is still running.
+        flush = ("import signal, sys, time\n"
+                 "def bye(*a):\n    time.sleep(1.0)\n    open('models/flushed', 'w').write('rows')\n    sys.exit(0)\n"
+                 "signal.signal(signal.SIGTERM, bye)\nprint('before-hang', flush=True)\ntime.sleep(60)\n")
+        t0 = time.time()
+        r = one(d, flush, cmd=f"{py} models/a.py && true", timeout_s=1)
+        err = r.get("error") or ""
+        ok(r.get("returncode") is None and rd(d, "models/flushed") == "rows" and time.time() - t0 < 12,
+           f"PD1 a step past its backstop gets SIGTERM and a grace period to flush: {r}")
+        ok(err.startswith("timed out after ") and "backstop" in err and "SIGTERM" in err,
+           f"PD1b the timeout still reads as a resumable timeout and says how the step was stopped: {err[:200]}")
+        # PD4: the output before the stop is in the step's log, and its tail is in the error.
+        ok("before-hang" in rd(d, log) and "before-hang" in err and r.get("log") == log,
+           f"PD4 a timed-out step's output is kept in {log} and its tail in the error: {r} {rd(d, log)[:200]!r}")
+        # PD2: a step that ignores SIGTERM is killed once the grace is over, and the runner does not wait longer.
+        with _mock.patch.dict(globals(), {"TERM_GRACE_S": 1.0}):
+            t0 = time.time()
+            r = one(d, "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n",
+                    timeout_s=1)
+            took = time.time() - t0
+        ok(r.get("returncode") is None and 3.5 < took < 3 + 1 + KILL_GRACE_S and "SIGKILL" in (r.get("error") or ""),
+           f"PD2 a step that ignores SIGTERM is killed after the grace ({took:.1f}s): {r.get('error')}")
+        # PD3: a failed step's stdout and stderr are both in its log, with the tail in the error.
+        r = one(d, "import sys\nprint('out-line', flush=True)\nprint('err-line', file=sys.stderr)\nsys.exit(3)\n")
+        txt = rd(d, log)
+        ok(r.get("returncode") == 3 and "out-line" in txt and "err-line" in txt and "err-line" in (r.get("error") or "")
+           and r.get("log") == log, f"PD3 a failed step's stdout and stderr are in {log}: {r} {txt[-200:]!r}")
+        ok("before-hang" in txt, f"PD3b the log is appended to, never truncated, across runs: {txt[:200]!r}")
+        # PD5: the log is never a step input, and never part of the compute code fingerprint.
+        w(d, "models/logs/zz.log", "x\n")
+        fp = fingerprint({"id": "a", "run": "x", "inputs": ["data/x.csv", "models/logs/*"], "outputs": []}, d)
+        ok(not any(k.startswith("models/logs/") for k in fp["inputs"]) and "models/logs/*" in fp["missing_inputs"],
+           f"PD5 a step log is never a step input: {fp['inputs']} {fp['missing_inputs']}")
+        import compute as _compute
+        w(d, "models/f.py", "def f(p):\n    return p\n")
+        f0 = _compute.code_fingerprint(d, "models/f.py::f")
+        w(d, "models/logs/zz.log", "more\n")
+        ok(_compute.code_fingerprint(d, "models/f.py::f") == f0,
+           "PD5b a step log does not change the compute code fingerprint (stored rows stay reusable)")
+        # PD6: a link planted at the log path is never followed; the step still runs, and the row says so.
+        w(d, "target.txt", "keep")
+        if os.path.lexists(os.path.join(d, log)):
+            os.remove(os.path.join(d, log))
+        os.symlink(os.path.join(d, "target.txt"), os.path.join(d, log))
+        r = one(d, "import sys\nprint('x')\nprint('err-link', file=sys.stderr)\nsys.exit(4)\n")
+        ok(r.get("returncode") == 4 and rd(d, "target.txt") == "keep" and "err-link" in (r.get("error") or "")
+           and r.get("log_error"), f"PD6 a link at the log path is not followed and the step still runs: {r}")
+        os.remove(os.path.join(d, log))
+        # PD7: the run id is reset when run() ends, so a later step outside run() never exports a past run's id.
+        r = one(d, "open('models/a.out', 'w').write('1')\n")
+        ok(r.get("status") == "ok" and globals()["_RUN_ID"] is None,
+           f"PD7 run() resets its run id: {globals()['_RUN_ID']} {r}")
+        with _mock.patch.dict(globals(), {"load": lambda rd_: (_ for _ in ()).throw(ValueError("boom"))}):
+            try:
+                run(d)
+            except ValueError:
+                pass
+        ok(globals()["_RUN_ID"] is None, f"PD7b run() resets its run id when it raises: {globals()['_RUN_ID']}")
+    # PD8-PD10: the steps' environment.
+    env = script_env({"ANTHROPIC_API_KEY": "k", "ANTHROPIC_AUTH_TOKEN": "t", "CLAUDE_CODE_OAUTH_TOKEN": "o",
+                      "HOME": "/h", "PATH": "/usr/bin"})
+    ok(not {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"} & set(env) and env.get("HOME") == "/h",
+       f"PD8 steps run without the model API credentials: {sorted(env)}")
+    here = os.path.dirname(os.path.abspath(sys.executable))
+    ok(env.get("PATH", "").split(os.pathsep)[:2] == [here, "/usr/bin"],
+       f"PD9 the harness interpreter's directory is first on the steps' PATH: {env.get('PATH')}")
+    env2 = script_env({"PATH": os.pathsep.join([here, "/usr/bin"])})
+    ok(env2["PATH"].split(os.pathsep) == [here, "/usr/bin"] and script_env({"HOME": "/h"}).get("PATH") == here,
+       f"PD10 the PATH entry is added once, and to an empty PATH: {env2['PATH']}")
+
 
 
 def _self_test_derivations(ok) -> None:
