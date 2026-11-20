@@ -155,7 +155,7 @@ class RunConfig:
     tree: str = os.path.expanduser("~/modeling-agentic-launch")
     labels: tuple = ("R1",)
     flags: tuple = ()                          # extra main.py flags (never --v1/--v2: set `pipeline`)
-    pipeline: str = ""                         # "v1" or "v2", required to launch; passed to main.py explicitly
+    pipeline: str = ""                         # "v2", required to launch; passed to main.py explicitly (v1 is retired)
     max_rounds: int = 8
     max_sessions: int = 5
     cross_model: bool = False                  # pass the OpenAI key for the cross-model critic
@@ -220,10 +220,12 @@ class RunConfig:
             raise ValueError(f"set {bad} through max_rounds / max_sessions, not flags")
         if not self.labels or len(set(self.labels)) != len(self.labels):
             raise ValueError("labels must be non-empty and distinct")
+        if self.pipeline in pipeline_id.RETIRED:
+            raise ValueError(f"{self.name}: {pipeline_id.RETIRED_MESSAGE}")
         if self.pipeline and self.pipeline not in pipeline_id.PIPELINES:
-            raise ValueError(f"pipeline must be one of {pipeline_id.PIPELINES}, not {self.pipeline!r}")
+            raise ValueError(f"pipeline must be 'v2', not {self.pipeline!r}")
         if {"--v1", "--v2"} & set(self.flags):
-            raise ValueError("set the pipeline with pipeline='v1' or 'v2', not flags: the launcher passes it to main.py")
+            raise ValueError("set the pipeline with pipeline='v2', not flags: the launcher passes it to main.py")
         for f in ("scale_down_after", "adapt_interval", "overflow_hold") + (("target_duration",) if self.target_duration else ()):
             seconds(getattr(self, f))   # fail at load, not on the keeper VM
         if not self.checkpoint_minutes >= 0:
@@ -631,8 +633,10 @@ def pipeline_preflight(cfg, code: bytes, python: str = sys.executable) -> str:
     config that declares no pipeline, a tree that cannot state one (from before 2026-11-05, when
     main.py defaulted to v1 and nothing recorded it), and any disagreement with the declaration."""
     import tempfile
+    if cfg.pipeline in pipeline_id.RETIRED:
+        raise SystemExit(f"{cfg.name}: {pipeline_id.RETIRED_MESSAGE}: refusing")
     if cfg.pipeline not in pipeline_id.PIPELINES:
-        raise SystemExit(f"{cfg.name}: the config declares no pipeline (set pipeline='v1' or 'v2'): refusing")
+        raise SystemExit(f"{cfg.name}: the config declares no pipeline (set pipeline='v2'): refusing")
     want = "scripts/lib/pipeline_id.py"
     src = _archive_member(code, want)
     if src is None:
@@ -3982,13 +3986,12 @@ def _self_test_pipeline(ok, tb) -> None:
         except Exception as e:  # noqa: BLE001 -- RC16 reports the load itself
             ok(False, f"RP1 configs/{f} declares its pipeline: {e}")
             continue
-        ok(getattr(c, "pipeline", "") in ("v1", "v2"), f"RP1 configs/{f} declares its pipeline ({getattr(c, 'pipeline', None)})")
-        if f.startswith("eval_"):
-            ok(getattr(c, "pipeline", None) == "v2", f"RP2 configs/{f} runs v2 ({getattr(c, 'pipeline', None)})")
+        ok(getattr(c, "pipeline", None) == "v2", f"RP1 configs/{f} declares pipeline v2 ({getattr(c, 'pipeline', None)})")
         mf = g.get("main_flags")
         ok(mf is not None and f"--{getattr(c, 'pipeline', None)}" in mf(c) and not {"--v1", "--v2"} & set(c.flags),
            f"RP3 configs/{f}: the launcher passes the declared pipeline to main.py, flags never do")
-    for bad in (dict(pipeline="v3"), dict(pipeline="v2", flags=("--v1",)), dict(pipeline="v1", flags=("--v2",))):
+    for bad in (dict(pipeline="v3"), dict(pipeline="v2", flags=("--v1",)), dict(pipeline="v1", flags=("--v2",)),
+                dict(pipeline="v1")):
         try:
             RunConfig(name="t", question_file="/dev/null", **bad)
             ok(False, f"RP4 a config with {bad} is refused")
@@ -4003,13 +4006,23 @@ def _self_test_pipeline(ok, tb) -> None:
                         flags=("--max-budget-usd", "35", "--signoff", "lead"))
         code = tb({"main.py": real_main, "scripts/lib/pipeline_id.py": real})
         ok(pf(cfg, code) == "v2", "RP5 the shipped pipeline_id agrees with the declared v2")
-        ok(pf(RunConfig(name="t1", question_file="/dev/null", out_dir=d, pipeline="v1"), code) == "v1",
-           "RP6 an explicit v1 config passes the preflight")
+        try:
+            RunConfig(name="t1", question_file="/dev/null", out_dir=d, pipeline="v1")
+            ok(False, "RP6 (v1 retired) a v1 config is refused when it is built")
+        except ValueError as e:
+            ok(pipeline_id.RETIRED_MESSAGE in str(e), f"RP6 (v1 retired) a v1 config is refused when it is built: {e}")
+        v1cfg = RunConfig(name="t1", question_file="/dev/null", out_dir=d, pipeline="v2")
+        v1cfg.pipeline = "v1"          # a config changed after it was built: the preflight refuses it too
+        try:
+            pf(v1cfg, code)
+            ok(False, "RP6b the preflight refuses a v1 config")
+        except SystemExit as e:
+            ok(pipeline_id.RETIRED_MESSAGE in str(e), f"RP6b the preflight refuses a v1 config: {e}")
         for why, c2, code2 in (
                 ("a tree with no pipeline_id.py (from before 2026-11-05: defaults to v1)", cfg, tb({"main.py": b"x"})),
                 ("a config that declares no pipeline", RunConfig(name="t2", question_file="/dev/null", out_dir=d), code),
                 ("a main.py that does not dispatch through pipeline_id (Codex r1 P2: old main.py, new helper)",
-                 RunConfig(name="t3", question_file="/dev/null", out_dir=d, pipeline="v1"),
+                 RunConfig(name="t3", question_file="/dev/null", out_dir=d, pipeline="v2"),
                  tb({"main.py": b"parser.add_argument('--v2')\n", "scripts/lib/pipeline_id.py": real})),
                 ("shipped code that would run another pipeline", cfg,
                  tb({"main.py": real_main, "scripts/lib/pipeline_id.py":

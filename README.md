@@ -1,13 +1,13 @@
 # modeling-agentic
 
-A multi-agent system for building publication-quality epidemiological and public-health models, for any disease area (malaria, measles, TB, HIV, polio, NCDs, ...). It has two pipelines:
+A multi-agent system for building publication-quality epidemiological and public-health models, for any disease area (malaria, measles, TB, HIV, polio, NCDs, ...). It has one pipeline, v2; v1 is retired:
 
 - **v2 (the default since 2026-11-05; `main.py --v2` still works)**: code runs the pipeline as a state machine, every number comes from tested harness code (an owner-signed decision spec, a disease engine and the analysis engine), and LLMs do bounded tasks. See [v2: the stage machine](#v2-the-stage-machine).
-- **v1 (`main.py --v1`, only on explicit request)**: a lead agent and eleven specialist agents, described in most of this README.
+- **v1 (retired by the owner on 2026-11-20)**: a lead agent and eleven specialist agents, described in most of this README until its code is removed. `main.py --v1`, a `--resume` of a run recorded as v1, a `cloud/run_cluster.py` config with `pipeline="v1"` and a `cloud/vm_job.py` command with `--v1` all refuse: "pipeline v1 is retired (owner, 2026-11-20); use v2".
 
 Every run records the pipeline it ran, the code commit and its launcher in `metadata.json` (`pipeline`, `commit`, `launcher`); launchers and the eval grader read and check them (see [Pipeline identity](#pipeline-identity)).
 
-v1 stays supported until the owner retires it. In v1, you give it a research question; it researches the topic, pulls data, builds and calibrates models using established frameworks (Starsim, LASER, stisim, scipy/lmfit), runs quantitative rigor checks (uncertainty propagation, multi-structural comparison, identifiability), critiques the result from several angles (methods, domain, presentation, an adversarial red team, a pre-model pre-mortem, and a post-write evidence-sufficiency check), and a **mechanical STAGE 7 gate** then computes the decision (PATCH / RETHINK / ACCEPT / DECLARE_SCOPE / RUN_FAILED) from structured blocker YAMLs so critique agents cannot talk themselves into generous verdicts. Finally a writer assembles the report.
+In v1, you gave it a research question; it researches the topic, pulls data, builds and calibrates models using established frameworks (Starsim, LASER, stisim, scipy/lmfit), runs quantitative rigor checks (uncertainty propagation, multi-structural comparison, identifiability), critiques the result from several angles (methods, domain, presentation, an adversarial red team, a pre-model pre-mortem, and a post-write evidence-sufficiency check), and a **mechanical STAGE 7 gate** then computes the decision (PATCH / RETHINK / ACCEPT / DECLARE_SCOPE / RUN_FAILED) from structured blocker YAMLs so critique agents cannot talk themselves into generous verdicts. Finally a writer assembles the report.
 
 Built on the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview).
 
@@ -150,15 +150,15 @@ The modeler ships these alongside the model code:
 
 ## Cloud compute (optional)
 
-**IDM Coiled (current).** `cloud/run_cluster.py <config.py> launch` starts a whole run (v1 or v2) on Coiled from a config in `cloud/configs/`. Each run gets its own agent VM, keeps running when the launching laptop disconnects, and uploads its directory to the project storage account when it ends; `status`, `collect`, `health`, `sign` and `shutdown` manage it (see the script's docstring). `cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> --cap-usd <USD> -- <command>` runs a detached job on its own VM in one command: it brings the cluster up, submits the job at once, polls until it ends, and stops the cluster whatever the outcome (non-zero exit with the reason unless the job is done with its outputs verified in storage; `--keep-on-failure` keeps the cluster after a failure for debugging). `up`/`start`/`wait`/`down` remain for interactive use. Launches (`run`, `up`, `run_cluster.py launch` with the config's `cap_usd`) are refused unless the owner-signed budget in `cloud/budget.py` covers the scope's spend plus the cap. Inside a run, `scripts/compute.py map` fans batches of model evaluations (calibration grids, uncertainty draws, v2 engine batches) out over the run's Dask workers, or runs them locally. See the `cloud-compute` skill.
+**IDM Coiled (current).** `cloud/run_cluster.py <config.py> launch` starts a whole run (v2) on Coiled from a config in `cloud/configs/`. Each run gets its own agent VM, keeps running when the launching laptop disconnects, and uploads its directory to the project storage account when it ends; `status`, `collect`, `health`, `sign` and `shutdown` manage it (see the script's docstring). `cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> --cap-usd <USD> -- <command>` runs a detached job on its own VM in one command: it brings the cluster up, submits the job at once, polls until it ends, and stops the cluster whatever the outcome (non-zero exit with the reason unless the job is done with its outputs verified in storage; `--keep-on-failure` keeps the cluster after a failure for debugging). `up`/`start`/`wait`/`down` remain for interactive use. Launches (`run`, `up`, `run_cluster.py launch` with the config's `cap_usd`) are refused unless the owner-signed budget in `cloud/budget.py` covers the scope's spend plus the cap. Inside a run, `scripts/compute.py map` fans batches of model evaluations (calibration grids, uncertainty draws, v2 engine batches) out over the run's Dask workers, or runs them locally. See the `cloud-compute` skill.
 
 ### Pipeline identity
 
 On 2026-11-05 an eval re-run meant to test a v2 change ran v1: `main.py` then defaulted to v1, the eval config passed no pipeline flag, and nothing recorded which pipeline ran. Now:
 
-- `scripts/lib/pipeline_id.py` decides the pipeline (v2 unless `--v1`) and writes `pipeline`, `commit` and `launcher` into every run's `metadata.json` before the run starts. The commit of a launch tarball comes from `scripts/lib/code_commit.txt`, which `git archive` fills in (`.gitattributes` export-subst).
-- `cloud/run_cluster.py`: each config declares `pipeline=` (`v1` or `v2`); the launcher passes it to `main.py` explicitly and, before anything is created, asks the shipped code which pipeline those arguments run and refuses any disagreement or a tree that cannot answer. `assignments.json` and each collected `result.json` record the launch's pipeline and commit and the run's own.
-- `cloud/vm_job.py` refuses a `main.py` command without `--v1` or `--v2`, and writes a launch record in the grader's format.
+- `scripts/lib/pipeline_id.py` decides the pipeline (v2; `--v1` is refused as retired) and writes `pipeline`, `commit` and `launcher` into every run's `metadata.json` before the run starts. The commit of a launch tarball comes from `scripts/lib/code_commit.txt`, which `git archive` fills in (`.gitattributes` export-subst).
+- `cloud/run_cluster.py`: each config declares `pipeline="v2"` (`"v1"` is refused as retired); the launcher passes it to `main.py` explicitly and, before anything is created, asks the shipped code which pipeline those arguments run and refuses any disagreement or a tree that cannot answer. `assignments.json` and each collected `result.json` record the launch's pipeline and commit and the run's own.
+- `cloud/vm_job.py` refuses a `main.py` command without `--v2` (and one with `--v1`), and writes a launch record in the grader's format.
 - `scripts/eval_suite.py` prints pipeline and commit with every score, refuses a run whose recorded identity is not its launch's, and `report` refuses to compare score files from different or unknown pipelines unless `--allow-mixed-pipelines` is given. Runs from before the change read `unknown`.
 - `scripts/smoke_check.py <run_dir> --pipeline v2 --commit <sha> --expect <marker>` fails a smoke run that lacks the markers its PR's changed code should produce.
 
@@ -204,8 +204,8 @@ python main.py --v2 "Which districts should receive measles follow-up campaigns 
 | `--max-rounds N` | 5 | Max critique-revision cycles |
 | `--max-sessions N` | 10 | Max top-level sessions (for retry-after-crash / context recovery) |
 | `--resume runs/<dir>` | — | Resume a prior run from its `pipeline_state.yaml` or detected artifacts (v2: from `run_state.json`) |
-| `--v1` | off | Run the v1 lead session instead of the v2 stage machine (only on explicit request) |
-| `--v2` | on | The v2 stage machine (the default; the flag is a no-op kept for existing commands). `--v1 --v2` is refused |
+| `--v1` | off | Refused: pipeline v1 is retired (owner, 2026-11-20); use v2 |
+| `--v2` | on | The v2 stage machine (the default; the flag is a no-op kept for existing commands) |
 | `--launcher NAME` | `$MA_LAUNCHER` or `direct` | Name of the launcher, recorded in `metadata.json` (the cloud launchers set it) |
 | `--signoff owner\|lead\|none` | owner | Who signs the decision brief (v1) or the decision spec (v2) before compute; `lead` for unattended test runs |
 | `--signoff-hours H` | 24 | How long a v1 owner sign-off wait lasts before the run pauses (resumable) |
@@ -303,7 +303,7 @@ Long runs (4–8 hours) occasionally crash mid-pipeline (API overload, OOM, orph
 
 ```
 modeling-agentic/
-├── main.py                    CLI entry point: v2 dispatch (default), retry/resume loop (v1, --v1)
+├── main.py                    CLI entry point: v2 dispatch; refuses --v1 (retired)
 ├── agents/
 │   ├── __init__.py            Agent registry (v1)
 │   ├── lead_prompt.py, hooks.py, run_*.py   Lead prompt, hooks, session/budget/preflight/finish (v1)

@@ -1020,19 +1020,30 @@ def _self_test_pipeline(ok, _outcome) -> None:
         rc = drive("--v2", "--launcher", "run_cluster:x", "Q?")
         ok(rc == 0 and calls[:1] and calls[0][0] == "v2" and calls[0][1]["launcher"] == "run_cluster:x",
            f"PV3 --v2 is a no-op alias; --launcher is recorded ({calls})")
-        rc = drive("--v1", "--skip-preflight", "Q?")
-        ok(rc == 0 and [c[0] for c in calls] == ["v1"] and calls[0][1]["pipeline"] == "v1",
-           f"PV4 --v1 runs the lead pipeline with its identity ({rc}, {calls})")
+        # PV4 (v1 retired, owner 2026-11-20): --v1 is refused before anything runs, preflight included.
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = drive("--v1", "Q?")
+        ok(rc == 2 and not calls and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
+           f"PV4 --v1 is refused with the retirement message ({rc}, {calls}, {err.getvalue()[-120:]!r})")
         rc = drive("--v1", "--v2", "Q?")
-        ok(rc == ("exit", 2) and not calls, f"PV5 --v1 with --v2 is refused before anything runs ({rc})")
+        ok(rc == 2 and not calls, f"PV5 --v1 with --v2 is refused before anything runs ({rc})")
         with tempfile.TemporaryDirectory() as td:
             rp = os.path.join(td, "r1")
             os.makedirs(rp)
             json.dump({"question": "Q?", "pipeline": "v1"}, open(os.path.join(rp, "metadata.json"), "w"))
-            rc = drive("--resume", rp)
-            ok(rc == 1 and not calls, f"PV6 a run recorded as v1 is not resumed under the v2 default ({rc}, {calls})")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = drive("--resume", rp)
+            ok(rc == 1 and not calls and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
+               f"PV6 a run recorded as v1 is refused as retired ({rc}, {calls}, {err.getvalue()[-120:]!r})")
             rc = drive("--v1", "--skip-preflight", "--resume", rp)
-            ok(rc == 0 and [c[0] for c in calls] == ["v1"], f"PV7 ... it resumes with --v1 ({rc})")
+            ok(rc == 2 and not calls, f"PV7 ... and not resumed with --v1 either ({rc})")
+            os.remove(os.path.join(rp, "metadata.json"))
+            rc = drive("--v2", "--resume", rp)
+            ok(rc == 1 and not calls, f"PV7b a run with no record and no run_state.json (v1's files) is refused ({rc})")
             # PV8: a real main_v2 (machine stubbed at run_v2) stamps metadata.json, and the machine's
             # init_run keeps the stamp instead of replacing metadata.json.
             g["main_v2"] = saved["main_v2"]
@@ -1071,7 +1082,7 @@ def _self_test_pipeline(ok, _outcome) -> None:
             json.dump({"question": "Q?"}, open(os.path.join(rp, "metadata.json"), "w"))
             open(os.path.join(rp, "run_state.json"), "w").write("{}")
             rc = drive("--v1", "--skip-preflight", "--resume", rp)
-            ok(rc == 1 and not calls, f"PV11 a v2 run with no recorded pipeline is not resumed with --v1 ({rc}, {calls})")
+            ok(rc == 2 and not calls, f"PV11 a v2 run with no recorded pipeline is not resumed with --v1 ({rc}, {calls})")
             rc = drive("--resume", rp)
             ok(rc == 1 and not calls, f"PV11c (Codex r2) ... nor on the default: a run with no recorded pipeline needs "
                                       f"an explicit flag ({rc}, {calls})")
@@ -2982,7 +2993,7 @@ def main_v2(args, ident: dict | None = None) -> int:
         run_path = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
         st = stage_machine.load_state(run_path)
         if st is None:
-            print(f"Error: {run_path} has no run_state.json (not a v2 run; pass --v1 to resume a v1 run)")
+            print(f"Error: {run_path} has no run_state.json (not a v2 run; {pipeline_id.RETIRED_MESSAGE})")
             return 1
         question = st.question
     else:
@@ -3041,8 +3052,7 @@ def main() -> int:
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the live preflight before a run (not recommended)")
     parser.add_argument("--v1", action="store_true",
-                        help="Run the v1 lead-session pipeline. Only on explicit request: v2 (the stage "
-                             "machine, agents/stage_machine.py) is the default since 2026-11-05.")
+                        help="Refused: pipeline v1 is retired (owner, 2026-11-20); use v2 (the default).")
     parser.add_argument("--v2", action="store_true",
                         help="Run the v2 stage machine (the default; accepted so existing commands work).")
     parser.add_argument("--launcher", default=None,
@@ -3058,8 +3068,9 @@ def main() -> int:
         return _run_self_test()
     try:
         pipeline = pipeline_id.select(args.v1, args.v2)
-    except pipeline_id.PipelineError as e:
-        parser.error(str(e))
+    except pipeline_id.PipelineError as e:    # --v1: pipeline v1 is retired (owner, 2026-11-20)
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 2
     # Phase 50 α: an eval-suite question runs only on a cloud worker (its work directory is
     # the launch archive: no evals/, no .git), so agents cannot reach answer keys by any
     # route. Checked on the question the run will actually use, including --resume, and
@@ -3079,18 +3090,10 @@ def main() -> int:
         if why:
             print(f"Error: {why}", file=sys.stderr)
             return 1
-    if pipeline == "v2":
-        try:
-            return main_v2(args, ident)
-        except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
-            return 130
-    if not args.skip_preflight:
-        rc = _preflight_and_report(args)
-        if rc:
-            return rc
-    if args.max_sessions < 1 or args.max_rounds < 1:
-        parser.error("--max-sessions and --max-rounds must be >= 1")
-    return _run_v1(args, ident)
+    try:
+        return main_v2(args, ident)
+    except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
+        return 130
 
 
 def _preflight_and_report(args) -> int:
@@ -3111,47 +3114,6 @@ def _preflight_and_report(args) -> int:
               f" ({(cm.stdout + cm.stderr).strip()[:80]})", flush=True)
         pf["ok"] = pf["ok"] and cm_ok
     return 0 if pf["ok"] else 3
-
-
-def _run_v1(args, ident: dict) -> int:
-    """The v1 lead-session pipeline (`--v1`)."""
-    if args.resume:
-        run_path = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
-        if not os.path.isdir(run_path):
-            print(f"Error: {run_path} not found")
-            return 1
-
-        meta_path = os.path.join(run_path, "metadata.json")
-        question = args.question
-        if not question and os.path.exists(meta_path):
-            with open(meta_path) as f:
-                meta = json.load(f)
-            question = meta.get("question", "")
-
-        if not question:
-            print("Error: no question found in metadata and none provided")
-            return 1
-
-        run_dir = os.path.basename(run_path)
-        coro = run(question, args.max_rounds, args.max_sessions,
-                   run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud,
-                   cross_model=args.cross_model, methods_critic=args.methods_critic,
-                   max_budget_usd=args.max_budget_usd,
-                   signoff=args.signoff, signoff_hours=args.signoff_hours, identity=ident)
-    else:
-        if not args.question:
-            print("Error: question is required (or use --resume)")
-            return 1
-        coro = run(args.question, args.max_rounds, args.max_sessions,
-                   allow_cloud=args.cloud, cross_model=args.cross_model,
-                   methods_critic=args.methods_critic, max_budget_usd=args.max_budget_usd,
-                   signoff=args.signoff, signoff_hours=args.signoff_hours, identity=ident)
-    try:
-        status = asyncio.run(coro)
-    except KeyboardInterrupt:
-        # metadata was already written by run()'s finally block
-        return 130
-    return exit_code_for(status)
 
 
 if __name__ == "__main__":

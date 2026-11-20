@@ -5,8 +5,9 @@ On 2026-11-05 an eval re-run meant to test a v2 fix ran the v1 pipeline: main.py
 to v1, cloud/configs/_eval.py never passed --v2, and nothing recorded or checked which
 pipeline a run used. This module is the one place that answers "which pipeline":
 
-- `select(v1, v2)`: main.py's dispatch. v2 is the default; `--v1` selects v1; `--v2` is
-  accepted as a no-op alias; both together is an error.
+- `select(v1, v2)`: main.py's dispatch. v2 is the default; `--v2` is accepted as a no-op
+  alias. `--v1` is refused: pipeline v1 is retired (owner, 2026-11-20). Old run records
+  still read as v1 (`label`), and are never resumed (`resume_conflict`).
 - `from_flags(flags)` / `from_command(cmd)`: what main.py would run for these arguments
   (launcher preflights: cloud/run_cluster.py, cloud/vm_job.py).
 - `identity(pipeline, repo, launcher)`: {pipeline, commit, launcher}, written into every
@@ -19,7 +20,7 @@ pipeline a run used. This module is the one place that answers "which pipeline":
 Standard library only: launchers run this file from inside a launch tarball
 (`python3 -I pipeline_id.py which -- <main.py flags>`) to ask the shipped code itself.
 
-    python3 scripts/lib/pipeline_id.py which -- --max-rounds 3 --v1     # prints v1
+    python3 scripts/lib/pipeline_id.py which -- --max-rounds 3 --v2     # prints v2
     python3 scripts/lib/pipeline_id.py --self-test
 """
 from __future__ import annotations
@@ -30,7 +31,9 @@ import shlex
 import subprocess
 import sys
 
-PIPELINES = ("v1", "v2")
+PIPELINES = ("v1", "v2")               # what a run record may say; v1 records are old runs
+RETIRED = ("v1",)                      # never started or resumed again
+RETIRED_MESSAGE = "pipeline v1 is retired (owner, 2026-11-20); use v2"
 DEFAULT = "v2"
 UNKNOWN = "unknown"
 COMMIT_FILE = "code_commit.txt"        # next to this module; .gitattributes: export-subst
@@ -43,9 +46,9 @@ class PipelineError(ValueError):
 
 def select(v1: bool = False, v2: bool = False) -> str:
     """main.py's pipeline for its --v1 / --v2 flags."""
-    if v1 and v2:
-        raise PipelineError("--v1 and --v2 together: pass one")
-    return "v1" if v1 else DEFAULT
+    if v1:
+        raise PipelineError(RETIRED_MESSAGE)
+    return DEFAULT
 
 
 def _flag_tokens(flags) -> tuple[bool, bool]:
@@ -141,7 +144,7 @@ def from_command(cmd) -> str | None:
     for args in calls:
         p = explicit(args)
         if p is None:
-            raise PipelineError("the command runs main.py without --v1 or --v2: state the pipeline explicitly")
+            raise PipelineError("the command runs main.py without --v2: state the pipeline explicitly")
         got.add(p)
     if len(got) != 1:
         raise PipelineError(f"the command runs main.py under several pipelines ({sorted(got)}): run one")
@@ -176,6 +179,8 @@ def launcher_name(arg: str | None = None) -> str:
 
 
 def identity(pipeline: str, repo: str, launcher: str | None = None) -> dict:
+    if pipeline in RETIRED:
+        raise PipelineError(RETIRED_MESSAGE)
     if pipeline not in PIPELINES:
         raise PipelineError(f"unknown pipeline {pipeline!r}")
     return {"pipeline": pipeline, "commit": code_commit(repo), "launcher": launcher_name(launcher)}
@@ -216,6 +221,8 @@ def resume_conflict(meta: dict, pipeline: str, run_path: str | None = None, expl
         rec = meta.get("pipeline")
         if rec not in PIPELINES:
             return f"this run records pipeline {rec!r}, which is not v1 or v2: refusing to resume it"
+        if rec in RETIRED:
+            return f"this run was recorded as pipeline {rec}, and {RETIRED_MESSAGE}: refusing to resume it"
         if rec != pipeline:
             return f"this run was recorded as pipeline {rec}; resume it with --{rec}"
         return None
@@ -224,6 +231,9 @@ def resume_conflict(meta: dict, pipeline: str, run_path: str | None = None, expl
     if run_path is None:
         return None
     by_files = "v2" if os.path.exists(os.path.join(run_path, "run_state.json")) else "v1"
+    if by_files in RETIRED:
+        return (f"this run records no pipeline, and its files are pipeline {by_files}'s (no run_state.json), "
+                f"and {RETIRED_MESSAGE}: refusing to resume it")
     if by_files != pipeline:
         return (f"this run records no pipeline, and its files are pipeline {by_files}'s "
                 f"({'has' if by_files == 'v2' else 'no'} run_state.json): it cannot be resumed with --{pipeline}")
@@ -257,7 +267,16 @@ def _self_test() -> int:
             fails.append(msg)
 
     ok(select() == "v2", "PI1 no flag selects v2 (the default since 2026-11-05)")
-    ok(select(v1=True) == "v1", "PI2 --v1 selects v1")
+    # PI2 (v1 retired, owner 2026-11-20): --v1 is refused with one message, everywhere it is asked.
+    for what, call in (("select(v1=True)", lambda: select(v1=True)), ("from_flags --v1", lambda: from_flags(["--v1"])),
+                       ("from_command --v1", lambda: from_command("python3 main.py Q --v1")),
+                       ("identity v1", lambda: identity("v1", "."))):
+        try:
+            got = call()
+            ok(False, f"PI2 {what} is refused (got {got})")
+        except PipelineError as e:
+            ok(str(e) == RETIRED_MESSAGE, f"PI2 {what} is refused: {e}")
+    ok(RETIRED_MESSAGE == "pipeline v1 is retired (owner, 2026-11-20); use v2", "PI2b the refusal's wording")
     ok(select(v2=True) == "v2", "PI3 --v2 is accepted as a no-op alias")
     try:
         select(True, True)
@@ -268,12 +287,12 @@ def _self_test() -> int:
     ok(from_flags(["--max-budget-usd", "35", "--signoff", "lead"]) == "v2",
        "PI5 the eval config's 2026-11-05 flags now run v2")
     ok(explicit(["--max-budget-usd", "35", "--signoff", "lead"]) is None, "PI6 those flags state no pipeline")
-    ok(explicit(["--v1", "--signoff", "lead"]) == "v1", "PI7 --v1 is explicit")
+    ok(explicit(["--v2", "--signoff", "lead"]) == "v2", "PI7 --v2 is explicit")
     ok(from_flags(["Q?", "--", "--v1"]) == "v2", "PI8 a token after `--` is not a flag")
     ok(main_py_args("python3 main.py 'Q?' --v2 --max-rounds 3") == ["Q?", "--v2", "--max-rounds", "3"],
        "PI9 the arguments of main.py in a shell string")
     ok(main_py_args(["bash", "toolkit/x/validate_once.sh", "16"]) is None, "PI10 a command without main.py")
-    ok(from_command(["python", "main.py", "Q", "--v1"]) == "v1", "PI11 argv command with --v1")
+    ok(from_command(["python", "main.py", "Q", "--v2"]) == "v2", "PI11 argv command with --v2")
     ok(from_command("cd x && python3 ./main.py Q --v2; cp -r runs $JOB_OUT") == "v2",
        "PI12 a compound shell command: only main.py's own arguments count")
     try:
@@ -306,16 +325,19 @@ def _self_test() -> int:
         ok(False, f"PI36 a flag inside a shell comment does not count (got {got})")
     except PipelineError:
         ok(True, "PI36 a flag inside a shell comment does not count: refused")
-    ok(from_command("python3 main.py Q >log --v1") == "v1" and from_command("python3 main.py Q 2>&1 --v2 > out.log") == "v2",
+    ok(from_command("python3 main.py Q >log --v2") == "v2" and from_command("python3 main.py Q 2>&1 --v2 > out.log") == "v2",
        "PI37 a redirection is not a command boundary")
-    ok(from_command("python3 main.py Q \\\n  --v1") == "v1", "PI38 a continued line belongs to the command")
+    ok(from_command("python3 main.py Q \\\n  --v2") == "v2", "PI38 a continued line belongs to the command")
     with tempfile.TemporaryDirectory() as td:
         rs = os.path.join(td, "v2run")
         os.makedirs(rs)
         open(os.path.join(rs, "run_state.json"), "w").write("{}")
-        ok(resume_conflict({}, "v1", rs, explicit_flag=True) and not resume_conflict({}, "v2", rs, explicit_flag=True),
-           "PI32 a run with no recorded pipeline but a run_state.json resumes only as v2")
-        ok(not resume_conflict({}, "v1", td, explicit_flag=True), "PI33 an old run with neither resumes with an explicit --v1")
+        ok(not resume_conflict({}, "v2", rs, explicit_flag=True),
+           "PI32 a run with no recorded pipeline but a run_state.json resumes as v2")
+        why = resume_conflict({}, "v2", td, explicit_flag=True)
+        ok(why and RETIRED_MESSAGE in why, f"PI33 an old run with no record and no run_state.json is v1's: refused as retired ({why})")
+        why = resume_conflict({"pipeline": "v1"}, "v2", td)
+        ok(why and RETIRED_MESSAGE in why, f"PI33c a run recorded as v1 is refused as retired ({why})")
         ok(resume_conflict({}, "v2", rs, explicit_flag=False) and resume_conflict({}, "v1", td, explicit_flag=False),
            "PI33b (Codex r2) a run that records no pipeline is never resumed on the default: the flag must be explicit")
         ok(resume_conflict({"pipeline": "V2!"}, "v2", rs) and resume_conflict({"pipeline": 2}, "v1", td),

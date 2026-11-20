@@ -1062,6 +1062,8 @@ def leak_problems(repo=REPO) -> list[str]:
 
 
 def launch_commands(questions, tag, reps, tree=None, pipeline="v2") -> list[str]:
+    if pipeline in pipeline_id.RETIRED:
+        raise ValueError(pipeline_id.RETIRED_MESSAGE)
     if pipeline not in pipeline_id.PIPELINES:
         raise ValueError(f"pipeline must be one of {pipeline_id.PIPELINES}")
     env = f"EVAL_TAG={tag} EVAL_REPS={reps} EVAL_PIPELINE={pipeline}" + (f" EVAL_TREE={tree}" if tree else "")
@@ -1200,8 +1202,8 @@ def main(argv=None) -> int:
     r.add_argument("--reps", type=int, default=1)
     r.add_argument("--tree", default=None)
     r.add_argument("--execute", action="store_true")
-    r.add_argument("--pipeline", choices=pipeline_id.PIPELINES, default="v2",
-                   help="the pipeline every launch runs (EVAL_PIPELINE; default v2)")
+    r.add_argument("--pipeline", choices=[p for p in pipeline_id.PIPELINES if p not in pipeline_id.RETIRED],
+                   default="v2", help="the pipeline every launch runs (EVAL_PIPELINE; v2: v1 is retired)")
     r.add_argument("--local", action="store_true", help="not supported: eval runs execute only on the cloud")
     r.add_argument("--private-dir", help=hidden_help)
     r.add_argument("questions", nargs="*")
@@ -1644,6 +1646,11 @@ def _self_test_s19_pipeline(ok, td):
     ok(_zero_row("R1", "x").get("pipeline") == "unknown", "S19n a missing run's row reads pipeline unknown")
     cmds = launch_commands(["toy"], "t", 1, None, pipeline="v2")
     ok(all("EVAL_PIPELINE=v2" in c for c in cmds), f"S19o the printed launch commands state the pipeline: {cmds}")
+    try:
+        launch_commands(["toy"], "t", 1, None, pipeline="v1")
+        ok(False, "S19p (v1 retired) no launch command is printed for pipeline v1")
+    except ValueError as e:
+        ok(pipeline_id.RETIRED_MESSAGE in str(e), f"S19p (v1 retired) no launch command is printed for pipeline v1: {e}")
 
 
 def _test_s12_repo_tree(ok, td):
