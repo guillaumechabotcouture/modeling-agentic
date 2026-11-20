@@ -518,7 +518,7 @@ def render(fd, dest: str, root: str, labels=None, theme: str = "light", sources=
             notp.append({"figure": name, "reason": str(e), "tier": TIER})
         except Exception as e:  # noqa: BLE001 -- Codex r3 P2-12, v2 autonomy 1C-a: one figure's failure (its draw,
             # title, render or write) is its own, recorded
-            AF._discard(dest, name, root)
+            AF._discard(dest, name, root, ends=(".png", ".csv"))        # only what this renderer writes
             notp.append({"figure": name, "reason": f"render failed: {type(e).__name__}: {e}"[:500], "tier": TIER,
                          "render_failed": True})
         finally:

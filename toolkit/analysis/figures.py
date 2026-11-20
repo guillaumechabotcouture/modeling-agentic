@@ -155,8 +155,9 @@ class RunData:
         if self._geo is None:
             try:
                 self._geo = load_boundaries(self.pres["boundaries"], self.ids, self.region, self.dir)
-            except ValueError as e:
-                raise PresentationRefused(str(e)) from e
+            except Exception as e:  # noqa: BLE001 -- the loader's own refusals (ValueError) and any other error
+                # reading the declared file: both stop the render (Codex r1)
+                raise PresentationRefused(str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}") from e
         return self._geo
 
     def use(self, rel: str):
@@ -333,15 +334,17 @@ def _axis_max(vals, floor: float = 1e-9) -> float:
 
 
 def _prop_max(vals) -> float:
-    """The upper end of a proportion axis: 6% above the largest value, never above 1 (nor a zero span)."""
-    return min(_axis_max(vals, 1e-3 / 1.06) * 1.06, 1.0)
+    """The upper end of a proportion axis: 6% above the largest value, never above 1; 0.001 when no value is above
+    0 (never a zero span)."""
+    top = _axis_max(vals, 0.0)
+    return min(top * 1.06, 1.0) if top > 0 else 1e-3
 
 
-def _discard(dest: str, name: str, root: str) -> None:
+def _discard(dest: str, name: str, root: str, ends=(".png", ".svg", ".png.provenance.json", ".csv")) -> None:
     """Remove what a figure that failed part way had already published (no link followed), so no file of a figure
-    the index does not list is left; best effort."""
+    the index does not list is left; best effort. `ends`: the files the calling renderer writes for one figure."""
     from toolkit.analysis.artifacts import _safe_io
-    for end in (".png", ".svg", ".png.provenance.json", ".csv"):
+    for end in ends:
         try:
             _safe_io().remove_nofollow(root, os.path.relpath(os.path.join(dest, name + end), root))
         except (OSError, ValueError):

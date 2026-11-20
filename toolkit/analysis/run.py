@@ -122,7 +122,8 @@ def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> 
 
 def _stop_where(e) -> str | None:
     """The step of a stop the toolkit declares besides AnalysisBlocked (a refused calibration, calibration input,
-    burden anchor or engine batch; a solver defect), else None: any other error is a crash and leaves no manifest."""
+    burden anchor or engine batch; a solver defect), else None: any other error is a crash and is not recorded (once
+    the run's store exists, no manifest is left; before that, nothing in the run dir is touched)."""
     from toolkit.alloc.optimize import OptimizerError
     from toolkit.analysis.burden import AnchorError
     from toolkit.calibration.history_matching import CalibrationInputError
@@ -160,7 +161,10 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
                         [holder["calibration"]] if holder.get("calibration") else [])
                 S.finalize("blocked", f"{where}: {type(e).__name__}: {e}"[:2000])
             except Exception as w:  # noqa: BLE001 -- the stop itself is what the caller must see
-                log(f"  the stop could not be recorded ({type(w).__name__}: {w}); no manifest is published")
+                try:
+                    log(f"  the stop could not be recorded ({type(w).__name__}: {w}); no manifest is published")
+                except Exception:  # noqa: BLE001 -- nor does a failing log replace it
+                    pass
         raise
 
 

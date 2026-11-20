@@ -408,8 +408,8 @@ def _gate_findings(run_dir: str) -> list[dict]:
         if kind == "joint_calibration":       # F6 S2-3b: the change between survey rounds by group
             out += _survey_changes(run_dir, doc.get("data") or {})
         if kind == "figures":                 # v2 autonomy 1C-a: a figure that failed to render is a MEDIUM finding
-            npd = (doc["data"].get("not_produced") or []) if isinstance(doc.get("data"), dict) else []
-            if not isinstance(npd, list) or not all(isinstance(x, dict) for x in npd):
+            npd = doc["data"].get("not_produced", []) if isinstance(doc.get("data"), dict) else []
+            if not isinstance(npd, list) or not all(isinstance(x, dict) for x in npd):     # absent: none; else a list
                 out.append(_f("analysis_contract_schema", f"artifact {rel}: not_produced is not a list of records", rel))
             else:
                 out += render_findings(npd)
