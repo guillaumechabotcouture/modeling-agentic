@@ -5075,6 +5075,19 @@ def _self_test_liveness(ok) -> None:
            f"LV2 before pip and unpacking end, the label reads preparing, not missing: {a_during}")
         ok(a_running["state"] == "running" and a_beat,
            f"LV3 main.py started: running; the record is rewritten on a timer: {a_running} beat={a_beat}")
+        # LV4b (Codex round 1): a failure before the task body (no temporary directory) also ends the record
+        import threading
+        with mock.patch.object(tempfile, "mkdtemp", side_effect=OSError("no space")), \
+                mock.patch.object(ws, "STATE_BEAT_S", 0.05):
+            try:
+                ws.run_to_disk("C", b"")
+            except OSError:
+                pass
+        time.sleep(0.2)
+        c = ws.fetch_meta("C")
+        ok(c["state"] == "dead" and c.get("phase") == "failed"
+           and not [t for t in threading.enumerate() if t.name == "ma-state-C"],
+           f"LV4b a task that fails before unpacking reads dead and leaves no heartbeat thread: {c}")
         b = ws.fetch_meta("B")
         ok(b["state"] == "dead" and b.get("phase") == "failed",
            f"LV4 LW_DEAD_PID_DETECTED the task ended without a result (a run.log exists): dead, not running: {b}")
@@ -5136,8 +5149,10 @@ def _self_test_liveness(ok) -> None:
     def download9(client, label, w, tgz):
         with tarfile.open(tgz, mode="w:gz"):
             pass
-        return {"exit_code": 0, "duration_s": 1, "run_stored": None,
-                "unstored_large_files": [["runs/R/big.bin", 9]] if label == "A" else []}
+        if label == "A":      # a worker from before this change: no unstored_large_files field (Codex round 1)
+            return {"exit_code": 0, "duration_s": 1, "run_stored": None, "skipped_large_files": [["runs/R/big.bin", 9]]}
+        return {"exit_code": 0, "duration_s": 1, "run_stored": None, "unstored_large_files": [],
+                "skipped_large_files": [["runs/R/a_link", 9]]}
     rs = types.ModuleType("results_store")
     out = io.StringIO()
     with mock.patch.dict(sys.modules, {"results_store": rs}), \
@@ -5151,6 +5166,20 @@ def _self_test_liveness(ok) -> None:
     ok(marks == ["B"] and not downs and "A: " in out.getvalue() and "only on the VM" in out.getvalue(),
        f"LV9 a label whose large files exist only on its VM is fetched but stays pending; no shutdown: {marks} "
        f"{downs} {out.getvalue()!r}")
+    with mock.patch.dict(sys.modules, {"results_store": rs}), \
+            mock.patch.dict(globals(), {"is_running": lambda n, lister=None: True, "attach": no_attach,
+                                        "connect_existing": lambda n, *a, **k: object(),
+                                        "collect_from_storage": lambda *a, **k: (_ for _ in ()).throw(KeyError("x")),
+                                        "checkpoint_record": lambda *a, **k: None, "_on_worker": on_worker9,
+                                        "_download": download9, "shutdown": lambda c: downs.append(c.name)}), \
+            contextlib.redirect_stdout(io.StringIO()):
+        try:
+            collect(cfg, accept_partial=True)
+        except TypeError as e:
+            downs.append(str(e))
+    ok(marks == ["B", "A"] and downs == ["lv"] and os.path.exists(os.path.join(tmp, "A", "result.json")),
+       f"LV9b `collect --accept-partial` (the files were copied by hand, or are given up) finishes the label: "
+       f"{marks} {downs}")
 
 
 def _self_test_sheet(ok) -> None:
