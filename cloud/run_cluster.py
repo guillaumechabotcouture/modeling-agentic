@@ -2,9 +2,11 @@
 
     python cloud/run_cluster.py <config.py> launch            # cluster, run(s), keeper; then safe to disconnect
     python cloud/run_cluster.py <config.py> status            # running / done per run, cluster and keeper state
-    python cloud/run_cluster.py <config.py> collect [--no-shutdown]
+    python cloud/run_cluster.py <config.py> collect [--no-shutdown] [--accept-partial]
                                                               # fetch finished runs (from storage once stopped);
-                                                              # then shut down, unless --no-shutdown
+                                                              # then shut down, unless --no-shutdown. A run whose
+                                                              # large files exist only on its VM stays pending
+                                                              # until --accept-partial
     python cloud/run_cluster.py <config.py> brief|report      # decision brief / convergence measures of a live run
     python cloud/run_cluster.py <config.py> health [--loop] [--interval S] [--log PATH] [--thresholds YAML]
                                                               # anomalies of a live run (cloud/run_health.py)
@@ -1791,7 +1793,7 @@ def _download(client, label, worker, dest_file):
     return m["meta"]
 
 
-def collect(cfg, shutdown_after: bool = True):
+def collect(cfg, shutdown_after: bool = True, accept_partial: bool = False):
     sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
     import results_store
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -1837,14 +1839,16 @@ def collect(cfg, shutdown_after: bool = True):
             t.extractall(dest, filter="data")
         ident = _run_identity_on_disk(dest)
         _identity_note(label, assign[label], ident)
-        lost = meta.get("unstored_large_files") if not meta.get("run_stored") else None
+        # a record from a worker before 1E-ii has no unstored_large_files: every large file it left out counts
+        lost = None if meta.get("run_stored") or accept_partial else \
+            meta.get("unstored_large_files", meta.get("skipped_large_files"))
         if lost:
             # 1E-ii: the VM's tarball lacks large files that are in no store. The label stays pending: no result.json
             # (so a later `collect` fetches it again), not marked collected (the VM keeps holding), no shutdown.
             json.dump({**meta, **assign[label], "run_identity": ident},
                       open(os.path.join(dest, "result.partial.json"), "w"), indent=1)
             print(f"{label}: fetched -> {dest}, but {len(lost)} large file(s) exist only on the VM, e.g. "
-                  f"{[x[0] for x in lost[:3]]}: left pending; copy them from the VM before any shutdown")
+                  f"{[x[0] for x in lost[:3]]}: left pending; copy them from the VM, then `collect --accept-partial`")
             pending.append(label)
             continue
         json.dump({**meta, **assign[label], "run_identity": ident}, open(os.path.join(dest, "result.json"), "w"),
@@ -5594,7 +5598,7 @@ def main(argv) -> int:
     elif cmd == "status":
         status(cfg)
     elif cmd == "collect":
-        collect(cfg, shutdown_after="--no-shutdown" not in rest)
+        collect(cfg, shutdown_after="--no-shutdown" not in rest, accept_partial="--accept-partial" in rest)
     elif cmd == "checkpoint":
         sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
         import results_store

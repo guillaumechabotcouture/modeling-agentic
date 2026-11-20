@@ -717,10 +717,12 @@ class RunState:
         self.label, self.phase, self.started = label, "preparing", time.time()
         self._stop, self._lock, self._thread = threading.Event(), threading.Lock(), None
 
-    def set(self, phase):
+    def set(self, phase=None):
+        """Write the record, with a new phase or (None: the timer) the current one, read under the lock so a beat
+        never puts an earlier phase back."""
         import json, os, time
         with self._lock:
-            self.phase = phase
+            phase = self.phase = phase or self.phase
             try:
                 os.makedirs(WORK, exist_ok=True)
                 tmp = f"{state_path(self.label)}.{os.getpid()}.tmp"
@@ -737,7 +739,7 @@ class RunState:
 
         def loop():
             while not self._stop.wait(STATE_BEAT_S):
-                self.set(self.phase)
+                self.set()
         self._thread = threading.Thread(target=loop, daemon=True, name=f"ma-state-{self.label}")
         self._thread.start()
 
@@ -752,15 +754,16 @@ def run_to_disk(label, code, *args, **kw):
     """_run_to_disk with the liveness record started first (RunState), and the launch code unpacked to a temporary
     directory that is removed when the task ends (the modules imported from it are already loaded)."""
     import shutil, sys, tempfile
-    state = RunState(label)
+    state, td = RunState(label), None
     state.start()
-    td = tempfile.mkdtemp()
-    try:
+    try:           # everything after the record starts is inside: a failure here must end it as failed
+        td = tempfile.mkdtemp()
         return _run_to_disk(td, label, code, *args, state=state, **kw)
     finally:
         state.stop("done" if state.phase == "done" else "failed")
-        shutil.rmtree(td, ignore_errors=True)
-        sys.path[:] = [x for x in sys.path if not x.startswith(td)]
+        if td:
+            shutil.rmtree(td, ignore_errors=True)
+            sys.path[:] = [x for x in sys.path if not x.startswith(td)]
 
 
 def _run_to_disk(td, label, code, question, flags, anthropic_key, openai_key, labels, prefix, account, launch_id,
