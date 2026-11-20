@@ -1104,10 +1104,11 @@ def _fixture_placeholder(path: str, eng, rows: list, box: dict, gate_ok: bool = 
     if fail_target:     # a second verified point (rows[1]) out of band on one target only
         per = mid(1.0)
         per[fail_target] = [v * 3.0 for v in per[fail_target]]
-        pts.append({"point": rows[1], "per_seed": per, "calibration_check": {}})
+        pts.append({"point": rows[1], "per_seed": per, "calibration_check": {"site": {"achieved": 1.0, "target": 1.0}}})
     reg, _ = finalize({"sample": [dict(r) for r in rows]}, pts, ch)
     fit = {"parameters": {k: {"value": v} for k, v in ch.get("point", {}).items()}}     # as run()'s **fit
-    yaml.safe_dump(document(eng, reg, {"params": box}, False, calibration_grid={"at_grid_edge": []},
+    yaml.safe_dump(document(eng, reg, {"params": box, "verified_sample_points": len(pts)}, False,
+                            calibration_grid={"at_grid_edge": []},
                             fit_rule={"seeds": pack_seeds()},
                             target_digests=target_digests(yaml.safe_load(open(PACK)), pack_bands()), **fit),
                    open(path, "w"), sort_keys=False)
@@ -1132,11 +1133,11 @@ def read_signed(path: str, digest) -> bytes:
     return data
 
 
-def _same_point(a, b, tol: float = 1e-6) -> bool:
-    """Two parameter points are the same: the same names, each value within the file's 6-decimal rounding."""
+def _same_point(a, b) -> bool:
+    """Two parameter points are the same: the same names, each value equal after the file's 6-decimal rounding."""
     return (isinstance(a, dict) and isinstance(b, dict) and sorted(a) == sorted(b)
-            and all(isinstance(a[k], (int, float)) and isinstance(b[k], (int, float)) and abs(a[k] - b[k]) <= tol
-                    for k in a))
+            and all(isinstance(a[k], (int, float)) and isinstance(b[k], (int, float))
+                    and round(float(a[k]), 6) == round(float(b[k]), 6) for k in a))
 
 
 def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None = None,
@@ -1202,14 +1203,22 @@ def load_posterior(path: str, engine, ranges: dict, digest, data: bytes | None =
     bands = pack_bands()            # the targets the replay checks the chosen point on (finalize's default)
     exc = None
     if exception is not None:       # owner, 20 Nov: a declared exception, matched to the file's recorded failures
-        if reg.get("sample") or not reg.get("sample_unverified") or reg.get("sample_status") != "invalid":
+        if reg.get("sample") != [] or not reg.get("sample_unverified") or reg.get("sample_status") != "invalid":
             no("an exception applies only to a sample the fit recorded as invalid (sample_unverified)")
         need = (doc.get("plan") or {}).get("verified_sample_points")
-        if isinstance(need, int) and len(pts) < need:
-            no(f"the fit verified {len(pts)} sample points, fewer than the {need} it declared: not an exception's case")
+        distinct = {json.dumps(p.get("point"), sort_keys=True) for p in pts}
+        if isinstance(need, bool) or not isinstance(need, int) or need < 1 or len(distinct) < need:
+            no(f"the fit verified {len(distinct)} distinct sample points against a declared {need!r}: not an "
+               f"exception's case")
         fails = []
         for p in pts:               # only target misses are waivable: seed evidence and calibration bind every point
-            if seed_count_errors(p, bands, seeds) or calibration_ok(p.get("calibration_check") or {}):
+            per = _per_seed(p)
+            bad_ev = seed_count_errors(p, bands, seeds) or [t for t in bands if
+                                                              seed_interval(per.get(t) or [], len(seeds)) is None]
+            if not point_in_band(p, bands, seeds)[0]:
+                cal = p.get("calibration_check")
+                bad_ev = bad_ev or not isinstance(cal, dict) or not cal or calibration_ok(cal)
+            if bad_ev:
                 no(f"verified point {p.get('point')} fails on its seed evidence or calibration, which no exception "
                    f"waives")
             if not point_in_band(p, bands, seeds)[0]:

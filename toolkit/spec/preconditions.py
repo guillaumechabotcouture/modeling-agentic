@@ -62,7 +62,8 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     if "net_effect_posterior" not in (spec.raw.get("uncertainty") or {}):       # empty: refused by posterior_input
         return []
     post = (spec.raw.get("uncertainty") or {}).get("net_effect_posterior")
-    if isinstance(post, dict) and post.get("exception") is not None and signer != "owner":
+    # a non-owner signer is refused; None is a draft or execution check (signing passes its signer: Codex r2 of #291)
+    if isinstance(post, dict) and post.get("exception") is not None and signer not in (None, "owner"):
         return [f"net_effect_posterior: an exception to the acceptance rule is the owner's to sign (signer {signer!r})"]
     if getattr(spec, "engine_pending", False):
         return ["net_effect_posterior: engine: auto is still pending; the posterior is bound to one engine's fit and "
@@ -599,7 +600,8 @@ def _self_test() -> int:
         "failed_points": [{"point": {"a": 0.1}, "targets": ["T1"]}], "rule": "r", "evidence": "e", "reason": "x",
         "draws": "keep"}}}}, engine_pending=True)
     lead = _net_effect_posterior(None, sp, "lead")
-    ok(any("owner" in x and "exception" in x for x in lead),
+    owner = _net_effect_posterior(None, sp, "owner")
+    ok(any("owner" in x and "exception" in x for x in lead) and not any("exception" in x for x in owner),
        f"PC12 a net-effect posterior exception signed by someone other than the owner is refused ({lead[:1]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
