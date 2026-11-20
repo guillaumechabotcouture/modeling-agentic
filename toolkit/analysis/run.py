@@ -2075,6 +2075,41 @@ def _self_test_test_ranges(ok, q):
         tb = PV.tested_boxes(schema.Spec(rh, d))
         ok(tb.get("synergy") == [0.0, 0.1], f"RPW5 a held spec value named as a companion is a design input over the "
                                             f"box spanning both values: {tb}")
+        # Codex r1 on v2-dt-with
+        from toolkit.spec import preconditions as PCm
+        quoted = {"type": "parameter_value", "parameter": "eff_a", "values": ["0.8"]}
+        rw1 = {}
+        for label, w in (("nan", {"eff_a": float("nan")}), ("inf", {"eff_a": float("inf")}), ("empty", {})):
+            rb = copy.deepcopy(r)
+            rb["analysis"]["decision_tests"][1]["with"] = w
+            rw1[label] = any("DTc" in e and "with" in e for e in schema.validate(schema.Spec(rb, d)))
+        ok(PV.test_settings(quoted) == {"eff_a": [0.8]} and all(rw1.values()),
+           f"RPW6 a quoted number among a test's values still counts (the runner converts it), as before; NaN, "
+           f"infinity and an empty `with` are refused: {PV.test_settings(quoted)} {rw1}")
+        rp = copy.deepcopy(r)
+        rp["calibration"]["method"] = "posterior"
+        plp = DT.plan_test(schema.Spec(rp, d), dtc, ev)
+        ok(plp["status"] == "not_run" and "posterior" in plp["why"] and "eff_a" in plp["why"],
+           f"RPW7 the planner (which the sign-off checks read) refuses a test with companions under a posterior "
+           f"calibration, naming them: {plp['why'][:120]}")
+        re_ = copy.deepcopy(r)
+        re_["analysis"]["decision_tests"].append({"id": "DTe", "type": "envelope", "values": [5.0], "text": "t",
+                                                  "with": {"eff_a": 0.75}})
+        errs_e = [e for e in schema.validate(schema.Spec(re_, d)) if "DTe" in e and "with" in e]
+        ok(bool(errs_e), f"RPW8 `with` on a test that is not a parameter_value test is refused, never ignored: "
+                         f"{errs_e[:1]}")
+        carries = PCm.decision_test_runs(schema.load(p), "DTc", {"parameters": ["dw"], "components": []})
+        rd = copy.deepcopy(r)
+        rd["analysis"]["decision_tests"][1]["with"] = {"base": 0.6}
+        dos = PCm.chosen_range_test_runs(rd, "DTc", "parameter:dw", {"dw": (0.005, 0.02)})
+        dos_ok = PCm.chosen_range_test_runs(r, "DTc", "parameter:dw", {"dw": (0.005, 0.02), "eff_a": (0.3, 0.7)})
+        ok(carries[0] is False and "with" in carries[1] and dos[0] is False and "base" in dos[1] and dos_ok[0] is True,
+           f"RPW9 a test with companions cannot carry a benchmark departure, and the dossier's range test needs every "
+           f"companion to be an emulator input: {carries[1][:90]} | {dos[1][:90]}")
+        summ = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))
+        row = next(x for x in summ["data"]["tests"] if x.get("test_id") == "DTc")
+        ok((row.get("detail") or {}).get("with") == {"eff_a": 0.75},
+           f"RPW10 the decision-test artifact's summary row carries the companions: {row.get('detail')}")
 
 
 def _self_test_cost_structure(ok, A, R):
