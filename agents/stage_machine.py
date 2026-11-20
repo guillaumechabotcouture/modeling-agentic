@@ -3732,10 +3732,15 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         got = [o["id"] for o in open_findings(d, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
             {"kind": "done_when_regressed", "key": "D-071", "severity": "HIGH", "claim": "c"}]})]
         ok("done_when_regressed:D-071" in got and "D-071" in got, f"CX3-6 a regression is listed beside its finding ({got})")
-        yaml.safe_dump({"blockers": [{"id": "D-072 ", "severity": "MEDIUM", "target_stage": "ANALYZE", "claim": "c"}]},
-                       open(os.path.join(d, "critique_domain.yaml"), "w"))
-        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "resolved_by_test": ["D-072"]})]
-        ok("D-072 " not in got and "D-072" not in got, f"CX3-2 a critic id is read stripped: its passed test closes it ({got})")
+        # CX3-2: an id with surrounding whitespace is refused at the gate (the critic repairs its file), so no two
+        # findings share a key and every reader of the id (gate, registry, ledger) sees the same text.
+        d = os.path.join(td, "a1_cx32")
+        os.makedirs(d)
+        S = StubTasks({"critics": {1: {"critique-domain": [{"id": "D-072 ", "severity": "MEDIUM", "claim": "c"}]}}})
+        for r in CRITICS:
+            S.critique(d, r, 1)
+        errs = v2_gate(d, 1, 3, False, [], history=False).get("schema_errors") or []
+        ok(any("critique_domain.yaml" in e and "whitespace" in e for e in errs), f"CX3-2 a padded id is a schema error ({errs})")
 
     def r3_presentation():
         # CX3-1 (documented behaviour, pinned): a presentation task that fails and writes no review goes on to the

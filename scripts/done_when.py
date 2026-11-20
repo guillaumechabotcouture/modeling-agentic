@@ -854,9 +854,6 @@ def _self_test() -> int:
            f"{[(v['kind'], v.get('key'), bool(v.get('done_when'))) for v in gk]}")
         ok([v["severity"] for v in gk if v["kind"] == "done_when_dropped"] == ["HIGH"],
            "DW_KEYS2 a dropped finding stays HIGH (set on purpose; Codex r1 P1-3)")
-        # DW_ID (Codex round 3 on #297, 2): an id is its text without surrounding whitespace, here as in the gate's key.
-        run(dk, {"critique-domain": {"blockers": [dict(blk[0], id="D-023 ")]}}, 1)
-        ok("D-023" in load_registry(dk)["tests"], f"DW_ID a critic id is registered stripped ({list(load_registry(dk)['tests'])})")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:

@@ -629,9 +629,6 @@ def _self_test() -> int:
         import datetime
         ok(tests_of({"file": "x.csv", "key": "d", "op": "==", "value": datetime.date(2024, 1, 1)}) is None,
            "L_CX3-3 a test whose value JSON cannot hold as written is not kept")
-        yaml.safe_dump({"blockers": [{"id": "R-044 ", "severity": "HIGH", "claim": "c"}]},
-                       open(os.path.join(d, "critique_redteam.yaml"), "w"))
-        ok([f.id for f in from_critiques(d)[0]] == ["R-044"], "L_ID a critic id is kept stripped, as its key is")
         open(os.path.join(d, "done_when_registry.json"), "w").write('{"tests": ' + "[" * 200000)
         try:
             ft = frozen_tests(d)
