@@ -2566,6 +2566,57 @@ def _self_test() -> int:
            and "cannot" not in near_hit["line"] and "edge" in near_hit["line"] and "cannot" not in far["line"],
            f"FB8 the edge diagnostic: {near_miss['line']} | {near_hit['line']} | {far['line']}")
     case("FB8", fb8)
+
+    # owner, 2026-11-20: one pre-declared verification round on refit b2's checkpoint: new candidate and pick seeds, 12
+    # new sample points, the 14 Nov rule unchanged, --margin-loo on, cap $20, the result final
+    v1 = OPTION_A.get("verify_v1") or {}
+
+    def fv1():
+        ok(v1.get("cache_sha256") == "81610240b2f50e0690b1fe4f0d757c912fa2e96176f38812ee5b0edc4fb1dec6"
+           and v1.get("candidate_seed") not in (None, DESIGN["seed"], VERIFY_ROUND["candidate_seed"])
+           and v1.get("pick_seed") not in (None, DESIGN["seed"] + 1, VERIFY_ROUND["pick_seed"])
+           and v1.get("cap_usd") == 20.0 and v1.get("job") == "f6-refit-optiona-v1" and v1.get("final") is True,
+           f"FV1 the verification round is pinned to b2's checkpoint, with new seeds, cap $20, result final ({v1})")
+    case("FV1", fv1)
+
+    def fv2():
+        got = {}
+        for label, kw in (("margin-loo off", {"resume_from": "/nonexistent"}),
+                          ("no cache", {"margin_loo": True}),
+                          ("refit b's cache", {"margin_loo": True, "resume_from": HERE})):
+            try:
+                run(p, base, 1, os.path.join(HERE, "x.yaml"), approved="x", smoke=False, cap_usd=1e9, verify_v1=True,
+                    **kw)
+                got[label] = ""
+            except ValueError as ex:
+                got[label] = str(ex)
+        ok("margin" in got["margin-loo off"] and "resume" in got["no cache"] and "sha256" in got["refit b's cache"]
+           and v1.get("cache_sha256") in got["refit b's cache"],
+           f"FV2 the round runs only with --margin-loo and from b2's pinned checkpoint: {got}")
+    case("FV2", fv2)
+
+    def fv3():
+        q = plan(p, vcpus=48, verify_v1=True)
+        ok(q["calibration_runs"] == 0 and q["design_points"] == 0 and q["wave1_points_run"] == 0
+           and q["verified_sample_points"] == VERIFY and q["arm_runs"] == (1 + VERIFY) * len(q["arms"]) * 8
+           and q.get("verify_v1") is True,
+           f"FV3 the round prices the chosen point and {VERIFY} new sample points only ({q['arm_runs']} arm runs, "
+           f"{q['wall_hours']} h, ${q['usd_real']})")
+    case("FV3", fv3)
+
+    def fv4():
+        import shlex
+        OPTION_A["cap_usd"] = shipped_cap
+        try:
+            cmd = shlex.split(plan(p, vcpus=48, verify_v1=True)["launch"])
+        finally:
+            OPTION_A["cap_usd"] = None
+        tail = cmd[cmd.index("--") + 1:]
+        ok(cmd[3] == "f6-refit-optiona-v1" and cmd[cmd.index("--cap-usd") + 1] == "20" and "--dir" in cmd
+           and "--margin-loo" in tail and "--verify-v1" in tail
+           and tail[tail.index("--resume-from") + 1] == v1.get("resume_dir"),
+           f"FV4 the round's launch: {' '.join(cmd)}")
+    case("FV4", fv4)
     OPTION_A["cap_usd"] = shipped_cap
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
