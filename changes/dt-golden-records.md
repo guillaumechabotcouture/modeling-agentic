@@ -12,9 +12,10 @@ commit: "S1"
 - `plans`: each case's allocation digest.
 
 Each case's allocation digest is the new `plan_sha256` field that `decision_tests.py` adds to each result. Numbers are rounded to 6 significant digits, values below 1e-9 count as zero, and absolute paths keep only their file name. `toolkit/analysis/run.py`'s self-test captures every record `decision_tests.run_one` returns and compares it with `toolkit/analysis/dt_golden.json`, which holds one line per self-test function (DG-R1). `MA_DT_GOLDEN_UPDATE=1` rewrites that file, except after a failed case or an empty capture. `dt_golden.py digest <run_dir>` digests a finished run and fails closed:
-- links;
+- links inside the run directory (the path to the run directory is the caller's and is not protected against a parent directory swapped during the call);
+- a platform that cannot open a path without following links;
 - paths outside `models/decision_tests/<id>.yaml`;
 - ids with path parts;
 - results whose id, status or verdict contradicts their summary entry.
 
-Tests: DG1–DG16. No decision changes. The retro on stored rows follows in its own PR.
+Tests: DG1–DG22. No decision changes. The retro on stored rows follows in its own PR.
