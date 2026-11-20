@@ -657,7 +657,34 @@ def _self_test() -> int:
         ok("_pinned" in src and "with _pinned(" in src,
            "DG21b (r6 P1-1) one directory descriptor is pinned for the whole digest")
 
-    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19, dg20, dg21):
+    def dg22():          # Codex review r7 of #262 (written first; each failed)
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            ok_rec = _rec()
+            fixture(d, [{"test_id": "T1", "status": "run", "path": "models/decision_tests/T1.yaml"}],
+                    {"T1.yaml": dict(ok_rec, test_id="T1")})
+            ok("T1" in digest_dir(d), "DG22 (setup) the fixture digests on this platform")
+            for name in ("O_NOFOLLOW", "O_DIRECTORY"):
+                saved = getattr(os, name)
+                delattr(os, name)
+                try:
+                    ok(_raises(lambda: digest_dir(d), StoredIncomplete),
+                       f"DG22a (r7 P1) without os.{name} the digest is refused, never read with links followed")
+                finally:
+                    setattr(os, name, saved)
+            saved = os.supports_dir_fd
+            os.supports_dir_fd = set()
+            try:
+                ok(_raises(lambda: digest_dir(d), StoredIncomplete),
+                   "DG22b (r7 P1) without dir_fd support the digest is refused")
+            finally:
+                os.supports_dir_fd = saved
+            bad = "X\0Y"
+            fixture(d, [{"test_id": bad, "status": "run", "path": f"models/decision_tests/{bad}.yaml"}], {})
+            ok(not _plain_name(bad) and _raises(lambda: digest_dir(d), StoredIncomplete),
+               "DG22c (r7 P1) a test id holding a NUL is not a plain file name: StoredIncomplete, not a bare ValueError")
+
+    for fn in (dg1, dg2, dg3, dg5, dg6, dg11, dg13, dg14, dg15, dg16, dg17, dg19, dg20, dg21, dg22):
         case(fn.__name__.upper(), fn)
     print(f"\n{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)} case(s)'}")
     return 1 if fails else 0
