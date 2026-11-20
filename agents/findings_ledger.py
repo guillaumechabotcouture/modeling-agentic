@@ -569,11 +569,17 @@ def _self_test() -> int:
         frozen, weaker = [{"file": "x.txt", "contains": "draws 32"}], [{"file": "x.txt", "exists": True}]
         doc = {"reviewer": "critique-redteam", "round": 2, "blockers": [
             {"id": "R-041", "severity": "HIGH", "target_stage": "MODEL", "claim": "c", "done_when": frozen[0]},
-            {"id": "R-042", "severity": "HIGH", "target_stage": "MODEL", "claim": "c", "done_when": weaker}]}
+            {"id": "R-042", "severity": "HIGH", "target_stage": "MODEL", "claim": "c", "done_when": weaker},
+            {"id": "R-043", "severity": "HIGH", "target_stage": "MODEL", "claim": "c", "done_when": weaker,
+             "done_when_withdrawn": "the output it read no longer exists"}]}
         yaml.safe_dump(doc, open(os.path.join(d, "critique_redteam.yaml"), "w"))
-        json.dump({"tests": {"R-042": {"done_when": frozen, "frozen_round": 1}}},
+        json.dump({"tests": {"R-042": {"done_when": frozen, "frozen_round": 1},
+                             "R-043": {"done_when": frozen, "frozen_round": 1, "withdrawn": {"round": 2, "reason": "x"}}}},
                   open(os.path.join(d, "done_when_registry.json"), "w"))
         led, _ = sync(d, None, 2)
+        ok(led["R-043"].done_when is None,
+           f"L_WITHDRAWN_DW a withdrawn test is no test for a fix's check, whatever the critique then lists "
+           f"(narrow Codex review of #297, 6) ({led['R-043'].done_when})")
         ok(led["R-041"].done_when == frozen, f"L_DICT_DW a test written as one mapping is kept ({led['R-041'].done_when})")
         ok(led["R-042"].done_when == frozen,
            f"L_FROZEN_DW the test the gate froze is kept over a critic's later edit ({led['R-042'].done_when})")

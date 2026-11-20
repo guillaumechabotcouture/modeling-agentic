@@ -3530,6 +3530,8 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         fbs = T.fbs
         ok(len(fbs) >= 2 and fbs[0] is None and any("D-051" in x and "Redraft the units." in x for x in fbs[1] or []),
            f"T_RETHINK_SPEC_TRIES a rethink of an unsigned spec redrafts it with the findings ({s}, {fbs})")
+        ok(any("cannot represent the question" in x for x in (fbs + [None, None])[1] or []),
+           "CX1-8 a structural rethink's reasons carry the critic's description of the mismatch")
 
         # T_RETHINK_ENGINE_CONTEXT (5.3): the engine pick after a rethink is told the engine left and why.
         class ET(StubTasks):
@@ -3569,8 +3571,77 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
            and not {k for k, _ in out["iso"][0]} & {"report_claims_unreadable", "report_claim_unrendered"},
            f"T_CLAIM_ISOLATE an invalid claim is one finding; the valid claims render ({out['iso'][0]})")
 
+    # Narrow Codex review of #297, round 1 (each failed on 650b2417).
+    def r1_resume():
+        # CX1-3: a presentation review that spent the last of the cap, then a crash before the transition: the resume
+        # replays the journal and reaches the gate, as the uninterrupted run does.
+        d, T, st = new_run("a1_cx3", {}, budget=20.0)
+        st.state, st.spent_usd = "PRESENTATION", 20.0
+        st.journal["PRESENTATION#0:r1"] = {"task": "critique", "status": "completed", "ok": True}
+        save_state(d, st)
+        mk(d, T, st).step()
+        s = load_state(d)
+        ok(s.state == "GATE" and s.forced_status is None and T.calls == [],
+           f"CX1-3 a completed presentation review is replayed on resume with the cap spent ({s.state}, {s.status})")
+
+    def r1_readback():
+        # CX1-4: a write-up task interrupted in its read-back is charged its allowance and its read-back allowance,
+        # so the cap holds on resume.
+        d, T, st = new_run("a1_cx4", {}, budget=20.0)
+        st.spent_usd = 16.5
+        st.journal["k1"] = {"task": "sign_spec", "status": "started", "allowance_usd": 3.0, "readback_usd": 0.25,
+                            "writeup": True}
+        save_state(d, st)
+        m = mk(d, T, st)
+        ok(abs(m.st.spent_usd - 19.75) < 1e-9, f"CX1-4 an interrupted write-up task is charged its read-back too "
+                                                f"({m.st.spent_usd})")
+        d, T, st = new_run("a1_cx4b", {}, budget=20.0)
+        st.spent_usd = 16.5
+        save_state(d, st)
+        m = mk(d, T, st)
+        m._task("k1", "sign_spec", d, writeup=True)
+        ok(m.st.journal["k1"].get("readback_usd") == READBACK_CAP_USD,
+           f"CX1-4b a write-up task's journal entry records its read-back allowance ({m.st.journal['k1']})")
+
+    def r1_open():
+        # CX1-5: a rendered report without its manuscript is a draft too (the gate's predicate): nothing is deferred.
+        d = os.path.join(td, "a1_cx5")
+        os.makedirs(d)
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "D-061", "severity": "MEDIUM", "category": "PRESENTATION", "target_stage": "ANALYZE", "claim": "c"}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        open(os.path.join(d, "report.md"), "w").write("# Report\n")
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
+        ok(got == ["D-061"], f"CX1-5 with report.md and no manuscript.md a PRESENTATION finding is not deferred ({got})")
+
+    def r1_rethink():
+        # CX1-7: a fix plan file that is not a plan does not stop a back-edge; a gate's own back-edge reads none.
+        d, T, st = new_run("a1_cx7", {})
+        st.state = "GATE"
+        save_state(d, st)
+        open(os.path.join(d, "fix_plan_r1.json"), "w").write('{"plan": ["stale"]}')
+        m = mk(d, T, st)
+        m._rethink("ENGINE_CHOICE", "test", planned=True)
+        ok(load_state(d).state == "ENGINE_CHOICE", "CX1-7 a malformed fix plan does not stop a RETHINK back-edge")
+
+    def r1_claims():
+        # CX1-2: a reference next to a bare id does not hide the bare id. CX1-9: a reference to an invalid claim is
+        # reported as invalid, not as missing from the ledger.
+        d = os.path.join(td, "a1_cx2")
+        os.makedirs(os.path.join(d, "models"))
+        yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5},
+                                   {"id": "b.unit", "claim_kind": "label", "value": "case"},
+                                   {"id": "b.ci", "claim_kind": "scalar", "value": 5, "ci_low": 6, "ci_high": 7}]},
+                       open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\na.good[CLAIM:b.unit]s and [CLAIM:b.ci].\n")
+        got = {(f["kind"], f.get("key")) for f in report_claim_findings(d)}
+        ok(("report_claim_id_raw", "a.good") in got, f"CX1-2 a bare id beside a reference is still reported ({got})")
+        ok(("report_claim_invalid", "b.ci") in got and ("report_claim_unresolved", "b.ci") not in got,
+           f"CX1-9 a reference to an invalid claim is reported once, as invalid ({got})")
+
     for name, fn in (("T_PRES_BUDGET", budget), ("T_PW_GATE", post_write), ("F_HARNESS_IDS", ids),
-                     ("T_RETHINK", rethink), ("T_CLAIM", claims)):
+                     ("T_RETHINK", rethink), ("T_CLAIM", claims), ("CX1-3", r1_resume), ("CX1-4", r1_readback),
+                     ("CX1-5", r1_open), ("CX1-7", r1_rethink), ("CX1-2", r1_claims)):
         case(name, fn)
 
 

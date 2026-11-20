@@ -997,6 +997,16 @@ def _self_test() -> int:
         except Exception as e:  # noqa: BLE001
             whole = type(e).__name__
         ok(whole == "refused", f"RCL_ISOLATE2 a ledger that is not a list of claims is still refused whole ({whole})")
+        # RCL_ISOLATE3 (narrow Codex review of #297, 1): a claim whose fields have the wrong type costs that claim.
+        with open(lp, "w") as f:
+            yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5},
+                                       {"id": "d.kind", "claim_kind": []}]}, f)
+        try:
+            got, bad = globals()["load_claims_tolerant"](lp)
+        except Exception as e:  # noqa: BLE001
+            got, bad = {}, {"raised": f"{type(e).__name__}: {e}"}
+        ok(set(got) == {"a.good"} and set(bad) == {"d.kind"},
+           f"RCL_ISOLATE3 a claim with an unhashable kind is one invalid claim ({sorted(got)}, {bad})")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
