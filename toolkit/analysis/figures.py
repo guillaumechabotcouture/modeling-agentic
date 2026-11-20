@@ -344,26 +344,29 @@ FIG_ENDS = (".png", ".svg", ".png.provenance.json", ".csv")      # what render p
 
 
 def _file_sigs(dest: str, name: str, ends=FIG_ENDS) -> dict:
-    """Each of a figure's files as it is now (inode, mtime, size; None when absent), no link followed: taken before
-    an attempt so that `_discard` can tell what the attempt published."""
+    """Each of a figure's files as it is now (inode, mtime, size; None when absent; "unknown" when it cannot be
+    examined), no link followed: taken before an attempt so that `_discard` can tell what the attempt published."""
     out = {}
     for end in ends:
         try:
             st = os.lstat(os.path.join(dest, name + end))
             out[end] = (st.st_ino, st.st_mtime_ns, st.st_size)
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             out[end] = None
+        except OSError:
+            out[end] = "unknown"
     return out
 
 
 def _discard(dest: str, name: str, root: str, before: dict) -> None:
     """Remove what a figure that failed part way published in this attempt (no link followed), so no file of a
     figure the index does not list is left; best effort. `before`: `_file_sigs` taken before the attempt. A file
-    that was already there and that the attempt did not replace is never removed (Codex r3)."""
+    that was already there and that the attempt did not replace is never removed (Codex r3), nor one whose state
+    before or after the attempt could not be examined (Codex r4)."""
     from toolkit.analysis.artifacts import _safe_io
     now = _file_sigs(dest, name, tuple(before))
     for end, sig in now.items():
-        if sig is None or sig == before[end]:
+        if sig is None or sig == before[end] or "unknown" in (sig, before[end]):
             continue
         try:
             _safe_io().remove_nofollow(root, os.path.relpath(os.path.join(dest, name + end), root))
@@ -1888,11 +1891,14 @@ def fig_cost_per_outcome(R, t):
     inc = {c: v for c, v in (fd.get("component_increment") or {}).items()     # a cost per outcome that is finite
            if v.get("outcome_per_usd") and _finite(1.0 / v["outcome_per_usd"])}
     nrow = len(shown) + len(other)
-    fig = _fig(t, 7.6, 0.3 * max(nrow + len(inc), 4) + 2.2)    # a floor: one package and one component still lay out
+    # the component panel is given the room of two rows at least: with one row beside three or more package rows its
+    # height came out negative (Codex r4). Unchanged with no component row, or with two or more.
+    n2 = max(len(inc), 2) if inc else 0
+    fig = _fig(t, 7.6, 0.3 * max(nrow + n2, 4) + 2.2)    # a floor: one package and one component still lay out
     h = fig.get_figheight()
     top = _top(fig, 0.6)
     avail = top - 0.55 / h - 0.75 / h
-    h1 = avail * (nrow + 0.6) / (nrow + len(inc) + 1.2)
+    h1 = avail * (nrow + 0.6) / (nrow + n2 + 1.2)
     a1 = fig.add_axes([0.38, top - 0.25 / h - h1, 0.5, h1])
     FS.style(a1, t, grid="x")
     vals, have_ci, withheld, not_drawn = [1e-9], False, [], 0
@@ -1953,13 +1959,13 @@ def fig_cost_per_outcome(R, t):
                  + (f"; {len(other)} avert none" if other else ""))
     else:
         title = f"No package in the plan averts {olab}"
-    wh = ""
+    # first, and short: render cuts a caption at CAPTION_MAX, and this count must be inside it (Codex r4)
+    wh = f" {not_drawn} interval{'' if not_drawn == 1 else 's'} not drawn: an end is not a finite number." \
+        if not_drawn else ""
     if withheld:
         sh = [w.get("share_draws_nonpositive") for _k, w in withheld if w.get("share_draws_nonpositive") is not None]
-        wh = (f" {len(withheld)} intervals withheld: {withheld[0][1].get('reason')}"
-              + (f" (up to {FS.fmt(max(sh), 'percent')} of draws)" if sh else "") + ".")
-    if not_drawn:
-        wh += f" {not_drawn} interval{'' if not_drawn == 1 else 's'} not drawn: an end is not a finite number."
+        wh += (f" {len(withheld)} intervals withheld: {withheld[0][1].get('reason')}"
+               + (f" (up to {FS.fmt(max(sh), 'percent')} of draws)" if sh else "") + ".")
     cap = (f"Top: each package's cost over its {olab} averted in the {U} that get it, with the {lvl:.0%} interval over "
            f"the uncertainty draws.{wh} Bottom: each component against the same package without it.")
     rows = [{"package": k, "label": R.labels.package(R.pk[k]), "status": st[k],
