@@ -125,7 +125,21 @@ def archive_dir(root: str, arcname: str, secrets: list[str] | None = None) -> tu
     return buf.getvalue(), skipped
 
 
-REDACT_MAX_MB = 64      # larger files are streamed, not read whole: kept only when they hold no secret
+REDACT_MAX_MB = 64      # larger files are never read whole: one that holds a secret is redacted block by block
+
+
+def _redact_stream(src, dst, secrets: list[bytes]) -> None:
+    """`src` copied to `dst` with every secret replaced, in 1 MiB blocks; the last bytes of each block (the longest
+    secret, less one) are held back so a secret across two blocks is still replaced."""
+    keep, carry = max(len(x) for x in secrets) - 1, b""
+    for block in iter(lambda: src.read(2**20), b""):
+        buf = carry + block
+        for x in secrets:
+            buf = buf.replace(x, b"<redacted>")
+        cut = max(0, len(buf) - keep)
+        dst.write(buf[:cut])
+        carry = buf[cut:]
+    dst.write(carry)
 
 
 def _plain(rel: str) -> list[str]:
@@ -195,8 +209,8 @@ def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | N
     not be a link. Files are listed and opened through that directory fd. Each file is opened once, no link followed
     at any component, regular files only; its bytes are copied to a temporary file, and what is scanned and redacted
     is that copy, which is what is archived, so a rewrite or a swap for a link after the listing can neither leak a
-    secret nor reach _truth/. A copy up to REDACT_MAX_MB is redacted; a larger one is left out (listed) if it holds
-    a secret. `extra`: (path, arcname) pairs (run.log). `_hook(rel)` runs between the listing and each open
+    secret nor reach _truth/. A copy up to REDACT_MAX_MB is redacted in memory, a larger one block by block
+    (_redact_stream), so no file is left out for its size. `extra`: (path, arcname) pairs (run.log). `_hook(rel)` runs between the listing and each open
     (self-test). Returns what was left out."""
     sec = [x.encode() for x in (secrets or []) if x and len(x) >= 12]
     skipped = []
@@ -247,8 +261,12 @@ def _write_items(items, arcname, out_path, sec, skipped, _hook):
                             data = data.replace(x, b"<redacted>")
                         ti.size = len(data)
                         t.addfile(ti, io.BytesIO(data))
-                    elif found:
-                        skipped.append(listed)
+                    elif found:       # Codex 1E-i round 1: redacted as it streams, not left out
+                        with tempfile.TemporaryFile(dir=os.path.dirname(os.path.abspath(out_path))) as red:
+                            _redact_stream(tmp, red, sec)
+                            ti.size = red.tell()
+                            red.seek(0)
+                            t.addfile(ti, red)
                     else:
                         ti.size = size
                         t.addfile(ti, tmp)
@@ -465,8 +483,8 @@ def _self_test() -> int:
             globals()["REDACT_MAX_MB"] = _max
         got = _tf.open(os.path.join(d, "w.tar.gz"), mode="r:gz")
         body = got.extractfile("run/models/big.bin").read() if "run/models/big.bin" in got.getnames() else None
-        if sk != ["_truth/answers.yaml", ".env.local", "models/tls.key"] and sorted(sk) != sorted(
-                ["_truth/answers.yaml", ".env.local", "models/tls.key"]) or body != b"x" * 100 + b"<redacted>":
+        if sorted(sk) != sorted(["_truth/answers.yaml", ".env.local", "models/tls.key"]) \
+                or body != b"x" * 100 + b"<redacted>":
             fails.append(f"S9 (Codex 1E-i round 1) write_archive keeps a large file holding a secret, redacted as it "
                          f"streams, and leaves out only _truth/ and credential files: {sk} {body!r}")
         # S25: a secret that straddles two 1 MiB blocks of a large file is still redacted, and nothing else changes
@@ -734,7 +752,7 @@ def main() -> int:
     if args.self_test:
         return _self_test()
     if args.cmd == "upload" and args.a and args.blob:
-        print(upload(args.a, args.blob, args.account))
+        print(upload_retry(args.a, args.blob, args.account))
         return 0
     if args.cmd == "download" and args.a and args.b:
         print(download(args.a, args.b, args.account))

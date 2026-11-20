@@ -129,21 +129,36 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
     # v2 autonomy 1E-i: the tarball is written to disk (it was built in memory and returned as bytes), and large
     # files are left out only when main.py's verified store has them: after a failed store this tarball, held for
     # `collect`, is the only copy that leaves the VM.
+    stored = None
     try:
-        stored = _meta_stored(json.load(open(os.path.join(runs[-1], "metadata.json")))) if runs else None
+        if runs and _receipt_ok(returncode):
+            stored = _meta_stored(json.load(open(os.path.join(runs[-1], "metadata.json"))))
     except (OSError, ValueError, AttributeError):
         stored = None
     skipped, tar = [], os.path.join(work, "result.tar.gz")
-    with tarfile.open(tar + ".tmp", mode="w:gz") as t:
-        if runs:
-            for root, _, files in os.walk(runs[-1]):
-                for fn in files:
-                    p = os.path.join(root, fn)
-                    if stored and os.path.getsize(p) > MAX_RETURN_FILE:   # the stored copy has them
-                        skipped.append((os.path.relpath(p, work), os.path.getsize(p)))
-                        continue
-                    t.add(p, arcname=os.path.relpath(p, work))
-        t.add(log_path, arcname="run.log")
+    for skip_large in ((True,) if stored else (False, True)):
+        del skipped[:]
+        try:
+            with tarfile.open(tar + ".tmp", mode="w:gz") as t:
+                if runs:
+                    for root, _, files in os.walk(runs[-1]):
+                        for fn in files:
+                            p = os.path.join(root, fn)
+                            if skip_large and os.path.getsize(p) > MAX_RETURN_FILE:   # stored, or no room for them
+                                skipped.append((os.path.relpath(p, work), os.path.getsize(p)))
+                                continue
+                            t.add(p, arcname=os.path.relpath(p, work))
+                t.add(log_path, arcname="run.log")
+            break
+        except OSError as e:
+            # Codex 1E-i round 1: no room for the complete tarball must not end the task before result.json and
+            # the hold: a tarball without the large files is written instead (the run dir stays on this VM).
+            if skip_large:
+                if os.path.exists(tar + ".tmp"):
+                    os.remove(tar + ".tmp")
+                raise
+            notes.append(f"the complete tarball could not be written ({type(e).__name__}: {e}); large files are "
+                         f"left out of it and exist only in the run dir on this VM"[:300])
     os.replace(tar + ".tmp", tar)
     return {"label": label, "exit_code": returncode, "duration_s": round(time.time() - t0),
             "run_dir": os.path.basename(runs[-1]) if runs else None, "skipped_large_files": skipped,
@@ -312,6 +327,7 @@ class Checkpointer:
         self.gen, self.pending, self.retry_s, self._retry_at = 0, {}, retry_s, 0.0
         self.torn, self._torn_retry, self._torn_streak = 0, False, 0
         self._ok_gen = self._ok_at = self._err = None
+        self._slock = threading.Lock()       # one status snapshot written at a time, so an older one never lands last
         self._busy, self._stop, self._thread, self._up = threading.Lock(), threading.Event(), None, None
         self._plock = threading.Lock()
         self._last = time.time()
@@ -341,8 +357,9 @@ class Checkpointer:
         import json
         try:
             from lib import safe_io          # the shipped tree's scripts/ is on the path (run_to_disk)
-            safe_io.write_nofollow(self.dir, "status.json", json.dumps(self.health(outcome), indent=1).encode(),
-                                   atomic=True)
+            with self._slock:
+                safe_io.write_nofollow(self.dir, "status.json", json.dumps(self.health(outcome), indent=1).encode(),
+                                       atomic=True)
         except Exception as e:  # noqa: BLE001 -- the record never stops a checkpoint or the run
             self.log(f"status.json not written: {type(e).__name__}: {e}"[:200])
 
@@ -591,6 +608,13 @@ def _meta_stored(meta):
     return meta.get("stored") if not meta.get("store_error") else None
 
 
+def _receipt_ok(exit_code):
+    """Whether metadata.json's store outcome is this invocation's: main.py ended by itself (any exit code it
+    chose), so it recorded its own store. A run killed at its time limit ("timeout") or by a signal (negative) may
+    still carry the receipt of an earlier invocation it resumed (Codex 1E-i round 1)."""
+    return isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code >= 0
+
+
 def _open_tar(tarball):
     """The returned tarball for reading: its path on disk (run_to_disk), or its bytes."""
     import io, tarfile
@@ -599,9 +623,12 @@ def _open_tar(tarball):
     return tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz")
 
 
-def run_stored(tarball):
-    """The blob main.py recorded in metadata.json after a verified upload, or None."""
+def run_stored(tarball, exit_code=0):
+    """The blob main.py recorded in metadata.json after a verified upload, or None; None too when `exit_code`
+    says main.py was killed (_receipt_ok)."""
     import json, tarfile
+    if not _receipt_ok(exit_code):
+        return None
     try:
         with _open_tar(tarball) as t:
             for m in t.getmembers():
@@ -694,7 +721,7 @@ def _run_to_disk(td, label, code, question, flags, anthropic_key, openai_key, la
     except Exception as e:  # noqa: BLE001
         res["transcripts_store_error"] = f"{type(e).__name__}: {e}"[:300]
     tarball = res.pop("tarball")              # <d>/result.tar.gz, written by run_job_impl
-    res["run_stored"] = run_stored(tarball)
+    res["run_stored"] = run_stored(tarball, res.get("exit_code"))
     res["run_identity"] = run_identity(tarball)
     res["launch_id"] = launch_id
     json.dump(res, open(f"{d}/result.json", "w"))

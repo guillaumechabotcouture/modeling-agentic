@@ -530,8 +530,9 @@ def remove_nofollow(base: str, rel: str, missing_ok: bool = True) -> bool:
 def stream_nofollow(base: str, rel: str):
     """write_nofollow(atomic=True) for data that must not be held whole (a large download): yields a binary file
     object on a random temporary name in base/rel's directory (O_EXCL, no link followed at any component); when the
-    block ends cleanly it is fsynced and renamed over the name (a link there is replaced, never followed); when the
-    block raises, the temporary file is removed and the name keeps what it held."""
+    block ends cleanly it is fsynced and, if the temporary entry is still the file that was written, renamed over
+    the name (a link there is replaced, never followed); when the block raises, the temporary file is removed and
+    the name keeps what it held."""
     import secrets as _secrets
     parts = _parts(rel)
     dfd = dir_fd_nofollow(base, parts[:-1], create=True)
@@ -543,6 +544,10 @@ def stream_nofollow(base: str, rel: str):
                 yield f
                 f.flush()
                 os.fsync(f.fileno())
+                mine = os.fstat(f.fileno())
+            now = os.stat(tmp, dir_fd=dfd, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != (mine.st_dev, mine.st_ino):     # the entry is no longer the file written
+                raise LinkRefused(f"{rel}: its temporary file was replaced while it was written; not published")
             os.replace(tmp, parts[-1], src_dir_fd=dfd, dst_dir_fd=dfd)
         except BaseException:
             with contextlib.suppress(FileNotFoundError):

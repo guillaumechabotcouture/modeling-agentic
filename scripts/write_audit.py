@@ -314,9 +314,9 @@ REVIEWED: dict = {
     "scripts/results_store.py": {"safeio-derived-root": (1, "download() streams to the path its caller names (the "
                                                          "launcher's out dir, a VM staging dir): no run root "
                                                          "exists there; safe_io.stream_nofollow, no link followed"),
-                                 "tempfile-dir": (1, "write_archive's anonymous TemporaryFile beside the archive it "
-                                                     "writes (the checkpoint staging dir on the agent VM, outside any run "
-                                                     "dir), deleted on close")},
+                                 "tempfile-dir": (2, "write_archive's anonymous TemporaryFiles (a file's copy, and its "
+                                                     "redacted copy) beside the archive it writes (a staging dir "
+                                                     "outside any run dir), deleted on close")},
     "scripts/resume_smoke.py": {"open-write": (3, "the smoke's own temporary work dir (toy runs it creates) and the "
                                                    "--json report the operator names")},
     "scripts/score_critiques.py": {"open-write": (3, _EVAL)},
