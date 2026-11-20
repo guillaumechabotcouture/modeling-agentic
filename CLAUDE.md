@@ -154,9 +154,10 @@ local SKILL.md), allowed via `_MCP_SKILLS`.
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
 
-`awaiting_signoff`, `awaiting_scope_signoff` and `completed_scope_declined`
-are statuses of the retired v1 pipeline: old run records may hold them, and
-those runs are never resumed.
+`awaiting_signoff` and `awaiting_scope_signoff` (unprefixed) are statuses of
+the retired v1 pipeline: old run records may hold them, and those runs are never
+resumed. `completed_scope_declined` is still a v2 outcome: the owner declined a
+finding's declaration and no rounds were left to fix it.
 A v2 run prints `paused:<reason>` when its state machine
 stops for the owner, at SIGN (the decision spec: `python3
 agents/stage_machine.py sign <run_dir> --by owner`) or at OWNER_DECISION
