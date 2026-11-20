@@ -3891,22 +3891,25 @@ def _self_test_durable(ok) -> None:
     rows, info, prog, err = run(fk)
     ok(err is None and all_ok(rows) and fk.lost and fk.stale == 0 and len(fk.bundles) == 2,
        f"CD5d no chunk is placed on a lost bundle: err={err} stale={fk.stale} scatters={len(fk.scatters)}")
-    # CD6 the bundle leaves out what the fingerprint ignores (logs, figures, partial rows, job records, the
-    # ledger), and nothing else: inputs, earlier results and everything under data/ stay.
+    # CD6 the bundle leaves out the logs and what this module and the runner write beside a batch (partial
+    # rows, job records, summaries, the ledger), and nothing else: inputs, earlier results and everything under
+    # data/ stay, and so do other files the fingerprint ignores (figures, a step's `.out`: a model that reads
+    # one found it on the workers before, review round 2). Nothing the fingerprint covers is left out.
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as repo, \
             mock.patch.dict(globals(), {"REPO": repo}):
         d = os.path.realpath(d)
         keep = ["models/m.py", "models/inputs.jsonl", "models/res.jsonl", "data/notes.log", "data/map.png"]
-        drop = ["models/run.log", "models/fig.png", "models/b.jsonl.partial.jsonl", "models/b.jsonl.job.json",
-                "models/res.jsonl.summary.json", "models/compute_ledger.json", "models/sub/trace.svg"]
-        for rel in keep + drop:
+        drop = ["models/run.log", "models/b.jsonl.partial.jsonl", "models/b.jsonl.job.json",
+                "models/res.jsonl.summary.json", "models/compute_ledger.json", "models/sub/step.log"]
+        unhashed = ["models/fig.png", "models/sub/trace.svg", "models/step.out"]      # shipped, not fingerprinted
+        for rel in keep + drop + unhashed:
             os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
             open(os.path.join(d, rel), "w").write("def f(p):\n    return p\n" if rel.endswith(".py") else rel)
         data, binfo = make_bundle(d)
         with tarfile.open(fileobj=io.BytesIO(data)) as t:
             got = sorted(os.path.relpath("/" + m, d) for m in t.getnames())
         fp0 = code_fingerprint(d, "models/m.py::f")
-        for rel in drop:
+        for rel in drop + unhashed:
             os.remove(os.path.join(d, rel))
         fp1 = code_fingerprint(d, "models/m.py::f")
         # res.jsonl is another call's results file only while its summary is beside it: restore that first
@@ -3915,8 +3918,9 @@ def _self_test_durable(ok) -> None:
         for rel in keep:
             open(os.path.join(d, rel), "a").write("#\n")
             changed.append(code_fingerprint(d, "models/m.py::f") != fp0)
-        ok(got == sorted(keep) and binfo.get("skipped_outputs") == len(drop) and fp0 == fp1 and all(changed),
-           f"CD6 the bundle holds exactly the files the fingerprint covers: bundled={got} "
+        ok(got == sorted(keep + unhashed) and binfo.get("skipped_outputs") == len(drop) and fp0 == fp1
+           and all(changed),
+           f"CD6 the bundle leaves out only logs and batch records, none of them fingerprinted: bundled={got} "
            f"skipped={binfo.get('skipped_outputs')} fingerprint kept={fp0 == fp1} changed={changed}")
     # CD7 a dead caller on another host: each chunk it had out is bounded by its cores x the time from its
     # start to the caller's last heartbeat (plus one interval and the stop grace), never above its share.
