@@ -300,15 +300,46 @@ def load_claims(ledger_path: str) -> dict[str, dict]:
     scalar/percentage claims that declare CIs. Raises ValueError on
     schema violations.
     """
+    return _validate_claims(_read_claims(ledger_path), ledger_path)
+
+
+def _read_claims(ledger_path: str) -> list:
     if not os.path.exists(ledger_path):
         raise FileNotFoundError(f"claims_ledger not found: {ledger_path}")
     with open(ledger_path) as f:
         doc = yaml.safe_load(f) or {}
-    raw = doc.get("claims") or []
+    raw = (doc.get("claims") or []) if isinstance(doc, dict) else None
     if not isinstance(raw, list):
         raise ValueError(f"{ledger_path}: top-level `claims:` must be a list")
+    return raw
+
+
+def load_claims_tolerant(ledger_path: str) -> tuple[dict[str, dict], dict[str, str]]:
+    """({id: claim} for the claims load_claims accepts, {id, or claims[i] without one: why} for the others).
+    For a caller that reports each invalid claim itself (the v2 report, agents/stage_machine.py): one bad
+    claim then costs that claim, not every reference in the report. A ledger that is not a list of claims is
+    refused whole, as by load_claims; an id given twice is invalid both times."""
+    good: dict[str, dict] = {}
+    bad: dict[str, str] = {}
+    for i, c in enumerate(_read_claims(ledger_path)):
+        cid = c.get("id") if isinstance(c, dict) else None
+        name = cid if isinstance(cid, str) and cid else f"claims[{i}]"
+        try:
+            one = _validate_claims([c], ledger_path, i)
+            if name in good or name in bad:
+                raise ValueError(f"{ledger_path}: claims[{i}] duplicate claim id {name!r}")
+        except ValueError as e:
+            bad[name] = str(e)
+            good.pop(name, None)
+            continue
+        good.update(one)
+    return good, bad
+
+
+def _validate_claims(raw: list, ledger_path: str, start: int = 0) -> dict[str, dict]:
+    """load_claims' checks on a list of claims, the first of which is claims[start]."""
     out: dict[str, dict] = {}
-    for i, c in enumerate(raw):
+    for i, c in enumerate(raw, start):
         if not isinstance(c, dict):
             raise ValueError(f"{ledger_path}: claims[{i}] is not a mapping")
         cid = c.get("id")

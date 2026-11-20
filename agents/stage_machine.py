@@ -372,6 +372,18 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto")
     return []
 
 
+def _earlier_round(path: str, round_n: int) -> int:
+    """The round a critique file states when it is an earlier one than `round_n`; else `round_n` (a file that
+    cannot be read, or states no earlier round, is validated against the gate's round as usual)."""
+    import yaml
+    try:
+        with open(path) as fh:
+            r = (yaml.safe_load(fh) or {}).get("round")
+    except Exception:  # noqa: BLE001 -- validate_critique reports it
+        return round_n
+    return r if isinstance(r, int) and not isinstance(r, bool) and 1 <= r < round_n else round_n
+
+
 def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
             history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None,
             strict_done_when: bool = False, append_history: bool | None = None) -> dict:
@@ -395,8 +407,15 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                 continue
             schema_errors.append(f"{V.FILENAMES[reviewer]} is missing")
             continue
+        rn = round_n
+        if reviewer == "critique-presentation" and not post_write:
+            # A pre-write gate with a draft follows a post-write modelling fix, one round on: PRESENTATION has not
+            # run since, and it reviews the rewritten draft before the next post-write gate. The last review is
+            # read as of the round it was written in (its findings stay open and listed), not refused for that
+            # round, which cost a schema repair and a paid review of a draft about to be replaced.
+            rn = _earlier_round(path, round_n)
         try:
-            critiques[reviewer] = V.validate_critique(path, reviewer, round_n)
+            critiques[reviewer] = V.validate_critique(path, reviewer, rn)
         except V.SchemaError as e:
             # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
             # blockers still have their done_when tests checked below, for the same reason.
@@ -464,6 +483,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     itself). `tested`: the finding has a test the fix loop can work to. A write-up finding waits
     for the draft."""
     import done_when as DW
+    import open_problems as OP
     import validate_critique_yaml as V
     draft = os.path.exists(os.path.join(run_dir, "manuscript.md"))
     closed = set(map(str, decision.get("resolved_by_test") or [])) | set(map(str, decision.get("outside_brief") or []))
@@ -493,7 +513,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
             if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
                     or str(b.get("id")) in closed):
                 continue
-            if b.get("target_stage") == "WRITE" and not draft:
+            if not draft and OP.after_write_item(b):       # the gate's own rule (V._defer_write_findings)
                 continue
             dw = b.get("done_when")
             out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
@@ -704,20 +724,26 @@ def report_claim_findings(run_dir: str) -> list[dict]:
         return []
     try:
         import render_claims as RCL
-        claims = RCL.load_claims(lp)
+        claims, invalid = RCL.load_claims_tolerant(lp)
     except Exception as e:  # noqa: BLE001 -- fail closed
         return [{"kind": "report_claims_unreadable", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                  "key": "claims", "scope_declarable": False, "claim": f"claims ledger unreadable: {e}"}]
     # The writer's own text, all of it: what the harness appends is not in manuscript.md, so no
     # marker the writer could copy can hide anything.
     text = open(rp).read()
-    out = []
-    for cid in sorted(set(re.findall(r"\[CLAIM:([^\]]*)\]", text)) - set(claims)):
+    # One invalid claim is its own finding (the valid ones still render: render_report); still HIGH and not
+    # declarable, as the whole-ledger refusal it replaces was.
+    out = [{"kind": "report_claim_invalid", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE", "key": cid,
+            "scope_declarable": False, "claim": f"The claims ledger's entry {cid} is invalid and cannot be rendered: {why}"}
+           for cid, why in sorted(invalid.items())]
+    # A reference is read as the renderer reads it (render_claims.render_text strips the id).
+    for cid in sorted({c.strip() for c in re.findall(r"\[CLAIM:([^\]]*)\]", text)} - set(claims)):
         out.append({"kind": "report_claim_unresolved", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                     "key": cid, "scope_declarable": False,
                     "claim": f"The report has [CLAIM:{cid}], which is not in the claims ledger."})
+    bare = re.sub(r"\[CLAIM:[^\]]*\]", "", text)          # an id inside a reference is not a bare id
     for cid in sorted(c for c in claims if "." in c or "_" in c):     # a plain word is not an id
-        if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", text):
+        if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", bare):
             out.append({"kind": "report_claim_id_raw", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                         "key": cid, "scope_declarable": False,
                         "claim": f"The report shows the claim id {cid} instead of its value: write [CLAIM:{cid}]."})
@@ -1143,14 +1169,15 @@ class Machine:
                      f"floor (spent ${self.st.spent_usd:.2f} of ${self.st.budget_usd}). Paused for the owner; resume with "
                      f"python3 main.py --v2 --resume {self.run_dir} --max-budget-usd <higher cap>")
             raise AwaitingBudget(name)
-        j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance)
+        j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance, writeup=bool(writeup))
         self.st.journal[key] = j
         save_state(self.run_dir, self.st)
         setter = getattr(self.tasks, "set_allowance", None)
         if setter:
             a = allowance if allowance is not None else self.st.task_cap_usd
-            b = self._budget()
-            # A crash read-back is a paid call too: a small cap, from what is left after this allowance.
+            b = self._budget(writeup)
+            # A crash read-back is a paid call too: a small cap, from what is left after this allowance (for a
+            # write-up task, left of the reserve it may use).
             rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
             setter(a, readback_usd=rb)
         res = getattr(self.tasks, name)(*args, **kwargs)
@@ -1175,16 +1202,18 @@ class Machine:
             return self._go("FINAL", "budget used")
         return self._go("FINAL", "budget used before the model was built", "budget_exhausted")
 
-    def _budget(self) -> dict | None:
+    def _budget(self, writeup: bool = False) -> dict | None:
+        """What is left under the cap: less the write-up reserve, except for the write-up's own tasks (WRITE and
+        the PRESENTATION review of its draft), which the reserve is held for."""
         cap = self.st.budget_usd
         if not cap:
             return None
         from agents.run_budget import writeup_reserve
-        left = cap - writeup_reserve(cap) - self.st.spent_usd
+        left = cap - (0.0 if writeup else writeup_reserve(cap)) - self.st.spent_usd
         return {"spent": round(self.st.spent_usd, 4), "cap": cap, "left": round(left, 4)}
 
-    def _out_of_budget(self) -> bool:
-        b = self._budget()
+    def _out_of_budget(self, writeup: bool = False) -> bool:
+        b = self._budget(writeup)
         return b is not None and b["left"] <= 0
 
     def _has_draft(self) -> bool:
@@ -1270,7 +1299,41 @@ class Machine:
         return probs
 
     def harness_ids(self, run_dir: str) -> set[str]:
-        return {FL.gate_id(v) for v in self.harness_findings()}
+        """The ledger ids the harness can re-check between gates: its own findings and, as h_GATE reads them, the
+        backend's spec and registry checks. A fix task's finding absent from them passes its check; the gate's other
+        findings (fix_loop.GATE_ONLY) are never among them and are left to the next gate."""
+        vs = self.harness_findings()
+        for name in ("spec_violations", "registry_violations"):
+            fn = getattr(self.backend, name, None)
+            vs += list(fn(run_dir) or []) if fn else []
+        return {FL.gate_id(v) for v in vs if isinstance(v, dict)}
+
+    def _rethink(self, to: str, why: str):
+        """A RETHINK back-edge to SPEC or ENGINE_CHOICE, which is told why: the gate's rationale for a structural
+        rethink, this round's rethink briefs for that state, and the open findings they name or that state owns,
+        each with its remedy. An unsigned spec is redrafted with them as its feedback and a fresh count of tries (a
+        signed one is the owner's to amend: h_SPEC); the engine pick is told the engine the run left."""
+        g, out, named = self.st.last_gate or {}, [], set()
+        if g.get("action") == "RETHINK_STRUCTURAL" and g.get("rationale"):
+            out.append(f"gate: {g['rationale']}")
+        try:
+            plan = json.load(open(os.path.join(self.run_dir, f"fix_plan_r{self.st.round}.json"))).get("plan") or {}
+        except (OSError, ValueError, AttributeError):
+            plan = {}
+        for t in plan.get("tasks") or []:
+            if isinstance(t, dict) and t.get("action") == "rethink" and t.get("owner_state") == to:
+                out.append(f"fix plan: {t.get('brief')}")
+                named |= {str(x) for x in t.get("findings") or []}
+        out += [f"{f.id}: {f.claim}" + (f" Required: {f.fix_requires}" if f.fix_requires else "")
+                for f in FL.open_findings(FL.load(self.run_dir)) if f.id in named or f.owner_state == to]
+        out = [" ".join(str(x).split())[:600] for x in out][:20]
+        if to == "SPEC" and not (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
+            self.st.tries["spec"] = 0
+            if out:
+                self.st.tries["spec_feedback"] = [f"rethink after review round {self.st.round}: {x}" for x in out]
+        elif to == "ENGINE_CHOICE":
+            self.st.tries["rethink_engine"] = {"engine": self.st.engine, "round": self.st.round, "why": out}
+        return self._go(to, why)
 
     def rebuild(self, run_dir: str) -> dict:
         """The S1 pipeline, then the report again when a draft exists (a write-up fix edits
@@ -1291,7 +1354,7 @@ class Machine:
         self.st.paused = None
         if s == "SPEC" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
             return self.h_SPEC()                 # the amendment pause costs no model call (Codex review of #261 P1-3)
-        if s in LLM_STATES and self._out_of_budget():
+        if s in LLM_STATES and self._out_of_budget(writeup=s == "PRESENTATION"):
             return self._budget_out(s)
         try:
             return getattr(self, "h_" + s)()
@@ -1439,9 +1502,14 @@ class Machine:
         if not eligible:
             _write_json(self.run_dir, "engine_choice.json", rec)
             return self._go("FINAL", "no registered engine fits the spec", "run_failed")
-        res = self._task(f"ENGINE_CHOICE#{self._visit()}:pick_engine", "pick_engine", spec, rows)
+        rt = self.st.tries.get("rethink_engine")         # set by a RETHINK back-edge (_rethink): the engine left, and why
+        res = self._task(f"ENGINE_CHOICE#{self._visit()}:pick_engine", "pick_engine", spec, rows,
+                         **({"rethink": rt} if rt else {}))
         if res is None:
             return self._budget_out("ENGINE_CHOICE")
+        if rt:
+            rec["rethink"] = rt
+            self.st.tries.pop("rethink_engine", None)
         pick = (res.output or {}).get("engine") if res.ok else None
         if pick not in {r["ref"] for r in eligible}:
             pick, why = eligible[0]["ref"], f"harness: the pick {pick!r} is not eligible; first eligible engine"
@@ -1655,6 +1723,8 @@ class Machine:
             self.st.post_write = False
         if nxt == "WRITE":
             self.st.write_mode = mode
+        if nxt in ("SPEC", "ENGINE_CHOICE"):
+            return self._rethink(nxt, why)
         return self._go(nxt, why, status)
 
     def _language_check(self, status: str) -> dict:
@@ -1681,7 +1751,7 @@ class Machine:
             return self._go("OWNER_DECISION", f"{len(summ['owner_amendments'])} finding(s) need an owner amendment "
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
-            return self._go(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})")
+            return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})")
         if not summ["tasks"] and summ.get("write_up") and self._has_draft():
             # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
             if self.st.round_pending:
@@ -1753,8 +1823,10 @@ class Machine:
         return self._go("PRESENTATION", f"draft written ({mode})")
 
     def h_PRESENTATION(self):
+        # The review of the draft is part of the write-up: like WRITE, it may use the write-up reserve (an accepted
+        # run whose WRITE spent into the reserve ended budget_exhausted here, with most of the reserve unspent).
         res = self._task(f"PRESENTATION#{self._visit()}:r{self.st.round}", "critique", self.run_dir,
-                         "critique-presentation", self.st.round)
+                         "critique-presentation", self.st.round, writeup=True)
         if res is None:
             return self._budget_out("PRESENTATION")
         return self._go("GATE", "presentation review of the draft")
@@ -1970,7 +2042,8 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         # The writer writes [CLAIM:id]; the harness substitutes the value (no number is typed).
         import render_claims as RCL
         try:
-            draft, _unresolved = RCL.render_text(draft, RCL.load_claims(lp))
+            # the valid claims; an invalid one stays a reference, reported by report_claim_findings
+            draft, _unresolved = RCL.render_text(draft, RCL.load_claims_tolerant(lp)[0])
         except Exception:  # noqa: BLE001 -- left unrendered; report_claim_findings flags it
             pass
     h = backend.headline(run_dir)

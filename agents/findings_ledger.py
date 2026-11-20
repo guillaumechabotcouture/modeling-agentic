@@ -83,6 +83,23 @@ class Finding:
         return asdict(self)
 
 
+def tests_of(dw) -> list | None:
+    """A finding's done_when as the ledger keeps it: a list of checks (one mapping is a list of one, as
+    scripts/done_when.py reads it), or None."""
+    return dw if isinstance(dw, list) else [dw] if isinstance(dw, dict) else None
+
+
+def frozen_tests(run_dir: str) -> dict[str, list]:
+    """{finding id: the test the gate froze} (done_when_registry.json; scripts/done_when.py α): what a fix is checked
+    against, whatever the critic's YAML says later. A withdrawn test is not one."""
+    _scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    import done_when as DW
+    return {str(k): tests_of(t["done_when"]) for k, t in DW.load_registry(run_dir)["tests"].items()
+            if isinstance(t, dict) and not t.get("withdrawn") and tests_of(t.get("done_when"))}
+
+
 def remedy(f: dict) -> str | None:
     """A finding's required remedy, in full (critics write `fix_requires`)."""
     r = f.get("fix_requires") or f.get("required_remedy") or f.get("remedy")
@@ -186,7 +203,7 @@ def from_critiques(run_dir: str) -> tuple[list[Finding], list[str]]:
                 source=reviewer, owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                 status="fixed" if b.get("resolved") else "open", first_seen_round=b.get("first_seen_round"),
                 last_seen_round=doc.get("round"), claim=str(b.get("claim") or ""), fix_requires=remedy(b),
-                done_when=b.get("done_when") if isinstance(b.get("done_when"), list) else None))
+                done_when=tests_of(b.get("done_when"))))
     return found, problems
 
 
@@ -228,7 +245,8 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                 owner_state_known=known, target_stage=str(stage or ""),
                 scope_declarable=v.get("scope_declarable") is not False,
                 first_seen_round=v.get("first_seen_round", round_n), last_seen_round=round_n,
-                claim=str(v.get("claim") or v.get("evidence") or ""), fix_requires=remedy(v))
+                claim=str(v.get("claim") or v.get("evidence") or ""), fix_requires=remedy(v),
+                done_when=tests_of(v.get("done_when")))       # a done_when row carries its finding's test
             if v.get("owner_signoff"):
                 rows[fid].resolution_type = "owner_decision"
     # Blocking gate entries whose kind no violation list carries (e.g. a required artifact).
@@ -373,7 +391,10 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             if f.id not in seen and not f.source.startswith("critique") and f.status in ("open", "declared"):
                 f.status, f.blocking = "fixed", False
                 _event(f, round_n, "fixed", "gate", "absent at this gate")
+    frozen = frozen_tests(run_dir)
     for f in led.values():
+        if f.source.startswith("critique") and f.id in frozen:
+            f.done_when = frozen[f.id]       # the frozen test, never a critic's later edit of it
         names = {f.id, f.kind, f.key, f"{f.kind}:{f.key}" if f.key else f.kind}
         hit = next((decl[n] for n in names if n and n in decl), None)
         if hit is not None and f.status == "open":

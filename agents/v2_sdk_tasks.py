@@ -544,10 +544,16 @@ class SdkTasks:
             {"by": "lead", "note": "lead mode: the harness accepts the drafted spec"}).encode(), atomic=True)
         return TaskResult(True, None, 0.0, "lead mode")
 
-    def pick_engine(self, spec, eligible):
+    def pick_engine(self, spec, eligible, rethink=None):
         inp = self._input(eligible)
+        msg = "Choose the engine."
+        if rethink:      # a RETHINK back-edge: the engine the run left, and why (stage_machine.Machine._rethink)
+            msg += (f"\n\nThis is a rethink: the run chose {rethink.get('engine')} and came back to this choice, for "
+                    "these reasons:\n- " + "\n- ".join(map(str, rethink.get("why") or ["none recorded"]))
+                    + "\nPick another eligible engine if one answers them. If you keep the same engine, say in `why` "
+                      "which of the reasons it cannot answer.")
         return self._session("pick_engine", PROMPTS["pick_engine"].format(out_in=inp, out=OUT),
-                             "Choose the engine.", OWNS["pick_engine"], enforcement.MODEL_FAST)
+                             msg, OWNS["pick_engine"], enforcement.MODEL_FAST)
 
     def critique(self, run_dir, reviewer, round_n, feedback=None):
         import validate_critique_yaml as V
@@ -573,11 +579,13 @@ class SdkTasks:
                              "Plan the fixes.", OWNS["plan_fixes"])
 
     def fix(self, task, run_dir, evidence):
-        owns = OWNS["fix"] if task.get("owner_state") not in ("WRITE", "PRESENTATION") else ("manuscript.md",)
+        # A write-up finding is never a fix task (fix_loop.validate_plan; the writer gets it), so a fix task owns
+        # the files its prompt names, whatever stage its plan gives.
         return self._session("fix", PROMPTS["fix"].format(tid=task["id"], brief=task.get("brief", ""),
                                                            findings=task["findings"],
                                                            evidence=json.dumps(evidence)[:2000] if evidence else "none",
-                                                           settings=_settings_text(), out=OUT), "Make the fix.", owns)
+                                                           settings=_settings_text(), out=OUT), "Make the fix.",
+                             OWNS["fix"])
 
     def write(self, run_dir, mode, feedback=None, findings=None):
         fb = ("\n\nThis is a repair: the report was not accepted, and the harness will not deliver it while it "

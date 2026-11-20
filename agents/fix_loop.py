@@ -240,10 +240,17 @@ def changed_files(before: dict, after: dict) -> list[str]:
     return sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
 
 
+# Gate findings made from the critiques and the done_when registry (scripts/done_when.py gate_findings; the
+# gate's missing-presentation-review finding): only a gate re-evaluates them.
+GATE_ONLY = ("done_when_", "critique_")
+
+
 def check_task(run_dir: str, task: dict, ledger: dict, gate_ids: set[str]) -> dict:
     """The task's own checks: a finding with a runnable done_when test passes when the test
     passes; a harness-check finding passes when the harness no longer reports it; anything
-    else is left to the next critique (None)."""
+    else is left to the next critique or gate (None). `gate_ids` holds what the harness can
+    re-check between gates (stage_machine.Machine.harness_ids); a GATE_ONLY finding is never
+    among them, so its absence there is not a pass."""
     import done_when as DW
     res = {}
     for fid in task["findings"]:
@@ -253,11 +260,13 @@ def check_task(run_dir: str, task: dict, ledger: dict, gate_ids: set[str]) -> di
         elif f.done_when and DW.mechanical(f.done_when):
             ok_, why = DW.evaluate(f.done_when, run_dir)
             res[fid] = {"passed": bool(ok_), "why": why}
-        elif not f.source.startswith("critique"):
+        elif f.source.startswith("critique"):
+            res[fid] = {"passed": None, "why": "judgement: the next critique decides"}
+        elif str(f.kind).startswith(GATE_ONLY):
+            res[fid] = {"passed": None, "why": "only the next gate can re-check it"}
+        else:
             res[fid] = {"passed": fid not in gate_ids, "why": "absent from the harness checks" if fid not in gate_ids
                         else "still reported by the harness checks"}
-        else:
-            res[fid] = {"passed": None, "why": "judgement: the next critique decides"}
     return res
 
 
@@ -331,23 +340,27 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
     except (OSError, ValueError):
         progress = {}
     summary = {"round": round_n, "tasks": len(plan["tasks"]), "rows": 0, "passed": 0, "rethink": None,
-               "skipped_budget": 0, "rejected": 0, "resumed_done": 0, "plan_by": plan.get("by", "planner"),
+               "skipped_budget": 0, "skipped_rethink": 0, "rejected": 0, "resumed_done": 0, "plan_by": plan.get("by", "planner"),
                "write_up": write_up, "owner_amendments": owner}
 
     def out_of_budget():
         b = budget() if budget else None
         return bool(b and b.get("left") is not None and b["left"] <= 0)
 
-    for t in plan["tasks"]:
+    for n, t in enumerate(plan["tasks"]):
+        if t["action"] == "rethink":
+            # The run goes back to that state, which redoes what any later task would fix or rebuild: the loop
+            # stops here (the tasks after it are counted, not run).
+            summary["rethink"], summary["skipped_rethink"] = t["owner_state"], len(plan["tasks"]) - n - 1
+            if t["id"] in done:
+                summary["resumed_done"] += 1
+            else:
+                append_impact(run_dir, {"round": round_n, "task": t["id"], "findings": t["findings"],
+                                        "action": "rethink", "owner_state": t["owner_state"], "passed": None,
+                                        "note": "routed to " + t["owner_state"]})
+            break
         if t["id"] in done:
             summary["resumed_done"] += 1
-            if t["action"] == "rethink":
-                summary["rethink"] = summary["rethink"] or t["owner_state"]
-            continue
-        if t["action"] == "rethink":
-            summary["rethink"] = summary["rethink"] or t["owner_state"]
-            append_impact(run_dir, {"round": round_n, "task": t["id"], "findings": t["findings"], "action": "rethink",
-                                    "owner_state": t["owner_state"], "passed": None, "note": "routed to " + t["owner_state"]})
             continue
         if out_of_budget():
             summary["skipped_budget"] += 1
