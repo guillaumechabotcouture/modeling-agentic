@@ -356,6 +356,8 @@ def download(blob: str, path: str, account: str | None = None, service=None, att
     from lib import safe_io
     container, name = _split(blob)
     path = os.path.abspath(path)
+    if "\\" in os.path.basename(path):      # safe_io reads a backslash as a separator: refused, never misplaced
+        raise ValueError(f"download destination name holds a backslash: {path!r}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     def once():

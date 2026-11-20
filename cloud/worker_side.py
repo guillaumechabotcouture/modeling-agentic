@@ -81,7 +81,7 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
                  timeout_s=None, on_start=None):
     """Unpack the code, run main.py (killed past `timeout_s`), return the run directory as a tarball.
     `on_start(work)` is called once the work dir is unpacked, just before main.py starts (the checkpoint thread)."""
-    import glob, io, json, os, shutil, subprocess, sys, tarfile, time, urllib.request
+    import glob, io, json, os, shutil, subprocess, sys, tarfile, time, urllib.request, uuid
     work = f"{WORK}/{label}"
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
@@ -136,18 +136,20 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
     except (OSError, ValueError, AttributeError):
         stored = None
     skipped, tar = [], os.path.join(work, "result.tar.gz")
+    # a fresh staging name (nothing an agent left in the work dir is written through); the final rename replaces
+    # a link at result.tar.gz itself
+    tmp = os.path.join(work, f".result.{uuid.uuid4().hex}.tmp")
     for skip_large in ((True,) if stored else (False, True)):
         del skipped[:]
-        for p in (tar, tar + ".tmp"):       # a link an agent left at either name is removed, never written through
-            if os.path.lexists(p):
-                os.remove(p)
         try:
-            with tarfile.open(tar + ".tmp", mode="w:gz") as t:
+            with tarfile.open(tmp, mode="w:gz") as t:
                 if runs:
                     for root, _, files in os.walk(runs[-1]):
                         for fn in files:
                             p = os.path.join(root, fn)
-                            if skip_large and os.path.getsize(p) > MAX_RETURN_FILE:   # stored, or no room for them
+                            # left out: stored, or no room for them; a link to a large file always (as before:
+                            # the collector's extraction refuses a link that leaves the run)
+                            if (skip_large or os.path.islink(p)) and os.path.getsize(p) > MAX_RETURN_FILE:
                                 skipped.append((os.path.relpath(p, work), os.path.getsize(p)))
                                 continue
                             t.add(p, arcname=os.path.relpath(p, work))
@@ -157,12 +159,12 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
             # Codex 1E-i round 1: no room for the complete tarball must not end the task before result.json and
             # the hold: a tarball without the large files is written instead (the run dir stays on this VM).
             if skip_large:
-                if os.path.exists(tar + ".tmp"):
-                    os.remove(tar + ".tmp")
+                if os.path.exists(tmp):
+                    os.remove(tmp)
                 raise
             notes.append(f"the complete tarball could not be written ({type(e).__name__}: {e}); large files are "
                          f"left out of it and exist only in the run dir on this VM"[:300])
-    os.replace(tar + ".tmp", tar)
+    os.replace(tmp, tar)
     return {"label": label, "exit_code": returncode, "duration_s": round(time.time() - t0),
             "run_dir": os.path.basename(runs[-1]) if runs else None, "skipped_large_files": skipped,
             "notes": notes, "tarball": tar}
@@ -579,11 +581,20 @@ def stop_checkpointer(ck, idle_s=CHECKPOINT_IDLE_S):
 def store_transcripts(d, store, prefix, launch_id, label, account, secrets, home=None):
     """The CLI transcripts (per-stage cost and time; they exist only on this VM) archived to <d>/transcripts.tar.gz
     by the streaming writer and uploaded; returns the blob. A VM with no transcripts stores an empty archive."""
-    import os
+    import inspect, os, uuid
     home = home or os.path.expanduser("~/.claude/projects")
     os.makedirs(home, exist_ok=True)
     os.makedirs(d, exist_ok=True)
-    store.write_archive(home, "transcripts", f"{d}/transcripts.tar.gz", list(secrets), strict=True)
+    # `store` is the launched tree's results_store, which may be older than this file (a pinned tree): `strict`
+    # only where it exists. A fresh staging name, then a rename: a link left at transcripts.tar.gz is replaced.
+    kw = {"strict": True} if "strict" in inspect.signature(store.write_archive).parameters else {}
+    tmp = f"{d}/.transcripts.{uuid.uuid4().hex}.tmp"
+    try:
+        store.write_archive(home, "transcripts", tmp, list(secrets), **kw)
+        os.replace(tmp, f"{d}/transcripts.tar.gz")
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return store.upload_retry(f"{d}/transcripts.tar.gz",
                               f"outputs/{prefix}/launch_{launch_id}/transcripts_{label}.tar.gz", account)["blob"]
 
