@@ -1099,11 +1099,49 @@ def _self_test() -> int:
            and "## Base outcome adjustments" not in plain_md,
            "SS-OA1 the sheet lists each base outcome adjustment (id, component, reference, value, source), and a spec "
            "without the field gets no such section (existing sheets unchanged)")
+    _self_test_run_dir_forms(ok)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_run_dir_forms(ok):
+    """SG-RD1-RD2 (v2-closure-paths): a run dir given as a relative or an absolute path names the same run. A spec
+    signed through one form has the status `signed` through the other, and the closure's run keys are relative to the
+    run dir in both."""
+    import tempfile
+    from toolkit.spec import evidence_dossier as ED
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as top:
+        got = {}
+        try:
+            os.chdir(top)
+            for label, sign_as, check_as in (("relative then absolute", "rel", "abs"),
+                                             ("absolute then relative", "abs", "rel")):
+                rel = os.path.join("runs", label.split()[0])
+                os.makedirs(os.path.join(top, rel))
+                schema.toy_spec(os.path.join(top, rel))
+                form = {"rel": rel, "abs": os.path.join(top, rel)}
+                try:
+                    write_sheet(form[sign_as])
+                    sign(form[sign_as], "lead", note="self-test")
+                    st = (status(form[sign_as]), status(form[check_as]))
+                    cl = [((ED.state(form[f]).get("binding") or {}).get("record") or {}).get("closure") or {}
+                          for f in ("rel", "abs")]
+                    keys = sorted(k for k in cl[0] if k.startswith("run:")) if cl[0] == cl[1] else ["differ"]
+                except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+                    st, keys = (f"{type(e).__name__}: {e}",), []
+                got[label] = (st, keys)
+        finally:
+            os.chdir(cwd)
+    ok(all(v[0] == ("signed", "signed") for v in got.values()),
+       f"SG-RD1 a spec signed through a relative run dir is signed through the absolute one, and the reverse: "
+       f"{ {k: v[0] for k, v in got.items()} }")
+    ok(all(v[1] and v[1] != ["differ"] and not any(k.startswith("run:runs") for k in v[1]) for v in got.values()),
+       f"SG-RD2 the closure's run keys are relative to the run dir whatever form it was given in: "
+       f"{ {k: v[1][:3] for k, v in got.items()} }")
 
 
 def main(argv=None) -> int:
