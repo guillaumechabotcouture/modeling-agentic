@@ -3473,7 +3473,6 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
             ok(False, f"{name}: {type(e).__name__}: {e}")
 
     def budget():
-        # T_PRES_BUDGET (1.1): the presentation review is part of the write-up, so it may use the write-up reserve.
         d, T, st = new_run("a1_pres", {}, budget=20.0)
         st.state, st.spent_usd = "PRESENTATION", 16.5        # past cap less reserve, $3.50 of the reserve left
         save_state(d, st)
@@ -3489,7 +3488,6 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         ok(s.state == "FINAL" and s.status == "budget_exhausted" and T.calls == [],
            f"T_PRES_BUDGET2 with the whole cap spent the run still ends budget_exhausted ({s.state}, {s.status})")
 
-        # T_WRITE_RB (1.2): a write-up task's crash read-back has an allowance from the reserve too.
         class RBT(StubTasks):
             def set_allowance(self, usd, readback_usd=None):
                 self.rb = readback_usd
@@ -3504,10 +3502,7 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
            f"T_WRITE_RB a write-up task keeps its read-back allowance; other tasks still stop at the reserve ({T.rb})")
 
     def post_write():
-        # T_PW_GATE (2.1): after a post-write modelling fix the next gate is pre-write, one round on, and the draft is
-        # rewritten and reviewed again after it: that gate reads the last presentation review as of the round it
-        # was written in (its findings stay open and listed), not as a schema error. The post-write gate still
-        # needs the current round's review.
+        # T_PW_GATE (2.1): the pre-write gate after a post-write modelling fix, one round on.
         d = os.path.join(td, "a1_pw")
         os.makedirs(d)
         S = StubTasks({"critics": {1: {"critique-presentation": [
@@ -3524,7 +3519,6 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
            f"T_PW_GATE a pre-write gate reads the last draft's presentation review as of its own round; the "
            f"post-write gate needs this round's ({g.get('schema_errors')}, {g.get('action')}, {sorted(kinds)}, "
            f"post {bool(gp.get('schema_errors'))})")
-        # T_OF_PRES (2.4): before a draft, presentation polish waits, as at the gate (open_problems.after_write_item).
         d = os.path.join(td, "a1_ofp")
         os.makedirs(d)
         yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
@@ -3535,7 +3529,6 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         ok(got == ["D-062"], f"T_OF_PRES a PRESENTATION finding waits for the draft ({got})")
 
     def ids():
-        # F_HARNESS_IDS (4a): the ids a fix task is checked against include the spec and registry checks.
         class B:
             def __getattr__(self, n):
                 return getattr(spike, n)
@@ -3553,8 +3546,7 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         ok({"spec_x:k1", "reg_y:k2"} <= got, f"F_HARNESS_IDS spec and registry findings are harness ids ({sorted(got)})")
 
     def rethink():
-        # T_RETHINK_SPEC_TRIES (5.1, 5.2; unsigned specs only, a signed one pauses for the owner): a rethink redrafts
-        # the spec with the reasons, whatever tries the first draft used.
+        # T_RETHINK_SPEC_TRIES (5.1, 5.2): unsigned specs only; a signed one pauses for the owner.
         class ST(StubTasks):
             def draft_spec(self, q, rd, fb):
                 self.fbs = getattr(self, "fbs", []) + [fb]
@@ -3613,8 +3605,7 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
 
     # Narrow Codex review of #297, round 1 (each failed on 650b2417).
     def r1_resume():
-        # CX1-3: a presentation review that spent the last of the cap, then a crash before the transition: the resume
-        # replays the journal and reaches the gate, as the uninterrupted run does.
+        # CX1-3: a presentation review that spent the last of the cap, then a crash before the transition.
         d, T, st = new_run("a1_cx3", {}, budget=20.0)
         st.state, st.spent_usd = "PRESENTATION", 20.0
         st.journal["PRESENTATION#0:r1"] = {"task": "critique", "status": "completed", "ok": True}
@@ -3625,8 +3616,6 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
            f"CX1-3 a completed presentation review is replayed on resume with the cap spent ({s.state}, {s.status})")
 
     def r1_readback():
-        # CX1-4: a write-up task interrupted in its read-back is charged its allowance and its read-back allowance,
-        # so the cap holds on resume.
         d, T, st = new_run("a1_cx4", {}, budget=20.0)
         st.spent_usd = 16.5
         st.journal["k1"] = {"task": "sign_spec", "status": "started", "allowance_usd": 3.0, "readback_usd": 0.25,
@@ -3665,8 +3654,6 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         ok(load_state(d).state == "ENGINE_CHOICE", "CX1-7 a malformed fix plan does not stop a RETHINK back-edge")
 
     def r1_claims():
-        # CX1-2: a reference next to a bare id does not hide the bare id. CX1-9: a reference to an invalid claim is
-        # reported as invalid, not as missing from the ledger.
         d = os.path.join(td, "a1_cx2")
         os.makedirs(os.path.join(d, "models"))
         yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5},
@@ -3734,9 +3721,7 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         ok("done_when_regressed:D-071" in got and "D-071" in got, f"CX3-6 a regression is listed beside its finding ({got})")
 
     def r3_presentation():
-        # CX3-1 (documented behaviour, pinned): a presentation task that fails and writes no review goes on to the
-        # gate, where the missing review is a MEDIUM finding; a resume that replays that failed task from the journal
-        # does the same, whatever is left of the cap.
+        # CX3-1: documented behaviour, pinned (the base does this in an uninterrupted run).
         class NoReview(StubTasks):
             def critique(self, run_dir, reviewer, round_n, feedback=None):
                 return self._r(f"critique:{reviewer}:{round_n}", False, note="no review written")

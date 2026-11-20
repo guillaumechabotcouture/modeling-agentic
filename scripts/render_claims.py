@@ -969,8 +969,7 @@ def _self_test() -> int:
            and r["scale_problems"][0]["rendered"] == "0.6%",
            f"T18: a proportion cited as a percentage is reported; a real 0.5% is not: {r}")
 
-    # RCL_ISOLATE (v2 autonomy 1A, 6.2): one invalid claim does not make the valid ones unreadable for a caller
-    # that asks for them; the strict reader still refuses the whole ledger.
+    # RCL_ISOLATE (v2 autonomy 1A, 6.2).
     with tempfile.TemporaryDirectory() as d:
         lp = os.path.join(d, "l.yaml")
         with open(lp, "w") as f:
@@ -1012,8 +1011,7 @@ def _self_test() -> int:
             got, bad = {}, {"raised": f"{type(e).__name__}: {e}"}
         ok(set(got) == {"a.good"} and set(bad) == {"d.kind"},
            f"RCL_ISOLATE3 a claim with an unhashable kind is one invalid claim ({sorted(got)}, {bad})")
-        # RCL_ISOLATE4-5 (round 2, 10-11): rows without a usable id are named by position, never by a name another
-        # row can take; the strict reader raises what it raised before for a ledger that is not a mapping.
+        # RCL_ISOLATE4-5 (round 2, 10-11).
         with open(lp, "w") as f:
             yaml.safe_dump({"claims": [None, {"id": "claims[0]"}]}, f)
         try:

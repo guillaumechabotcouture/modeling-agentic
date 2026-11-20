@@ -645,8 +645,7 @@ def _self_test() -> int:
                        headline=lambda rd: {}, log=lambda *a: None)
         ok(s18.get("owner_amendments") == ["D-004", "D-005"] and s18["rethink"] == "SPEC",
            f"F18c the loop's summary names the findings the owner must amend ({s18})")
-    # F_CHECK_NOOP (v2 autonomy 1A, 4a): a gate finding the harness checks cannot re-evaluate is not passed by its
-    # absence from them; one that carries a runnable test is checked by the test.
+    # F_CHECK_NOOP (v2 autonomy 1A, 4a).
     with tempfile.TemporaryDirectory() as d:
         ledn = {"critique_presentation_missing": FL.Finding(id="critique_presentation_missing", severity="MEDIUM",
                                                             kind="critique_presentation_missing", source="rigor-artifacts"),

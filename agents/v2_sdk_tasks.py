@@ -874,8 +874,7 @@ def _self_test() -> int:
         pk = json.load(open(os.path.join(d, "_task_input.json")))
         ok('{"tasks": [{"id": "T1"' in (seen_prompts.get("plan_fixes") or "") and pk["findings"] == [{"id": "R-001"}],
            "PF4 plan_fixes keeps the plan's JSON example and writes the packet the prompt names")
-        # S_PICK_RETHINK, S_FIX_OWNS (v2 autonomy 1A, 5.3 and 3): the engine pick after a rethink is told the engine
-        # the run left and why; a fix task owns the fix files whatever stage its plan names.
+        # S_PICK_RETHINK, S_FIX_OWNS (v2 autonomy 1A, 5.3 and 3).
         got = {}
 
         def rec_session(self_, kind, system, prompt, owns, model=None):

@@ -578,8 +578,7 @@ def _self_test() -> int:
            and FX_.needs_owner_amendment(led17b["D-031"]),
            f"L17 a recorded owner answer applies to the finding it was given for; a revised one is asked again "
            f"({unverified}, {st17}, {led17b['D-031'].status})")
-    # L_DICT_DW, L_FROZEN_DW, L_GATE_DW (v2 autonomy 1A, 4c and 4a): the ledger's copy of a test is what the fix loop
-    # checks a task against.
+    # L_DICT_DW, L_FROZEN_DW, L_GATE_DW (v2 autonomy 1A, 4c and 4a): the test a fix task is checked against.
     with tempfile.TemporaryDirectory() as d:
         frozen, weaker = [{"file": "x.txt", "contains": "draws 32"}], [{"file": "x.txt", "exists": True}]
         doc = {"reviewer": "critique-redteam", "round": 2, "blockers": [
