@@ -2849,7 +2849,7 @@ def _self_test_51c(ok) -> None:
 
 def _self_test_attach(ok) -> None:
     """RC60: one attach call (worker_side.attach_existing) for the launcher, the keeper and the
-    overflow pool; one workspace name for the launcher and the VM jobs, equal to the replay backend's."""
+    overflow pool; one workspace name for the launcher and the VM jobs (worker_side.WORKSPACE)."""
     import importlib.util
     import types
     calls = []
