@@ -95,13 +95,15 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     # widens the design box, batch.design_box), but never past the column's hard bounds
     from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
     hb = NEF.hard_bounds(eng, list(ne["ranges"]))
+    from toolkit.spec import engine_parameters as PV
     for t in (spec.raw.get("analysis") or {}).get("decision_tests") or []:
-        if isinstance(t, dict) and t.get("type") == "parameter_value" and t.get("parameter") in hb:
-            lo, hi, what = hb[t["parameter"]]
-            bad = [v for v in t.get("values") or [] if not lo <= float(v) <= hi]
-            if bad:
-                out.append(f"net_effect_posterior: decision test {t.get('id')} sets {t['parameter']} to {bad}, outside "
-                           f"its hard bound [{lo}, {hi}] ({what})")
+        for n, vs in sorted(PV.test_settings(t, names=hb).items()):     # its own values and each companion's
+            if n in hb:
+                lo, hi, what = hb[n]
+                bad = [v for v in vs if not lo <= float(v) <= hi]
+                if bad:
+                    out.append(f"net_effect_posterior: decision test {t.get('id')} sets {n} to {bad}, outside its "
+                               f"hard bound [{lo}, {hi}] ({what})")
     return out
 
 
@@ -189,6 +191,10 @@ def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | 
     if an.get("evaluation") == "emulator" and name not in drawn and name not in eps:
         return False, (f"does not execute on the emulator path: {name} is neither drawn nor set by engine_parameters, "
                        "so it is not an emulator input"), list(t.get("values") or [])
+    from toolkit.spec import engine_parameters as PV
+    if PV.companions(t) or "with" in t:     # v2-dt-with (Codex r1-r2): a range test varies only its own parameter
+        return False, ("holds companion parameters (with): the dossier's range test varies only its own parameter, at "
+                       "the run's point values of the others"), list(t.get("values") or [])
     return True, "", list(t.get("values") or [])
 
 
@@ -269,6 +275,10 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
                        "the parameter or benchmark interaction carrying the departed engine effect")
     else:
         return False, f"is a {typ} test, which does not vary a component's effect"
+    from toolkit.spec import engine_parameters as PV
+    if PV.companions(t):        # v2-dt-with (Codex r1): the companions alone could change the benefit the run credits
+        return False, (f"holds companion parameters (with: {', '.join(sorted(PV.companions(t)))}): a test that carries "
+                       "a departure varies only the parameter carrying the effect")
     from toolkit.analysis import decision_tests as DT
     try:
         ev = DT.prerun_evidence(spec)
@@ -391,6 +401,17 @@ def _self_test_posterior(ok) -> None:
             NEF.UNIT_BOUNDS.pop("", None)
         ok(any("DTpa" in g and "hard bound" in g for g in got),
            f"PC16b a parameter_value test that sets a posterior column outside its hard bounds is refused: {got[:1]}")
+        # v2-dt-with: a companion value of a posterior column is checked against the same hard bounds
+        raw["analysis"]["decision_tests"][-1].update(parameter="eff_b", values=[0.2], **{"with": {"eff_a": 1.5}})
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        NEF.UNIT_BOUNDS[""] = (0.0, 1.0)
+        try:
+            got = problems(d, None, None)
+        finally:
+            NEF.UNIT_BOUNDS.pop("", None)
+        ok(any("DTpa" in g and "eff_a" in g and "hard bound" in g for g in got),
+           f"PC16c a parameter_value test whose `with` sets a posterior column outside its hard bounds is refused: "
+           f"{got[:1]}")
     rows_hi = rows
     with tempfile.TemporaryDirectory() as d:
         rows[:] = [{"eff_a": round(0.55 + 0.15 * x, 6), "eff_b": r["eff_b"]} for x, r in zip(u, rows_hi)]
