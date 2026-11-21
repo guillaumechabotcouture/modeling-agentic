@@ -6,6 +6,20 @@ stability:
   # spike's worst fold lost 0.73%.
   value_loss_pct_robust: 1.0
   value_loss_pct_fragile: 5.0
+optimizer:
+  # v2 autonomy brief, decision D3 (owner default; proposals for the owner's review). The plan is solved to a relative
+  # gap, on the gain over each unit's least-benefit package: a solve reported "optimal" is proven within it.
+  gap_rel: 1.0e-4
+  # CBC threads when the problem has at least `threads_min_units` units (never more than the machine's cores).
+  threads: 4
+  threads_min_units: 50
+  time_limit_s: 120
+  # Auxiliary solves only (uncertainty draws, stability folds, sensitivity ends, decision tests, plan variants, the
+  # frontier): a solve that stopped at the time limit is used when its proven gap is at most this; it is counted.
+  aux_gap_max: 0.01
+  # An auxiliary solve with no usable plan is recorded as not run or not solved where its step can; above this share
+  # of all auxiliary solves it is a gate finding (analysis_solver_degraded).
+  aux_not_solved_share_max: 0.05
 decision_tests:
   # Phase 49 result files: the plan changes when more than this share of units change package
   # (the spec's analysis.share_threshold overrides it).
