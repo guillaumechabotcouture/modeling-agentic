@@ -91,7 +91,12 @@ def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
         raise ValueError(f"decision tests: ids {dup} are used twice (a declared test shadows an automatic one); "
                          "rename the declared test")
     for dt in dts:
-        rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0)
+        try:
+            rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0)
+        except Exception as e:  # noqa: BLE001 -- W0-F: an automatic conflict test that fails goes to the owner
+            if not dt.get("conflict"):
+                raise
+            rec = _not_run(A, dt, f"the test failed: {type(e).__name__}: {e}")
         if dt.get("automatic"):
             rec["automatic"] = True
         p = os.path.join(run_dir, DIR, f"{dt['id']}.yaml")

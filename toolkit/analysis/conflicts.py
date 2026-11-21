@@ -76,7 +76,7 @@ def spec_problems(raw: dict) -> list:
     an = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else {}
     taken = [t.get("id") for t in an.get("decision_tests") or [] if isinstance(t, dict)
              and str(t.get("id")).startswith(TEST_PREFIX)]
-    if taken:
+    if taken and c.get("policy") == "declare_and_test":
         bad.append(f"analysis.decision_tests: ids {taken[:3]} start with {TEST_PREFIX!r}, which the conflict rule's "
                    "automatic tests use")
     ts = c.get("test_scales", DEFAULTS["test_scales"])
@@ -122,8 +122,11 @@ def _identities(spec) -> dict:
     j = JC.declared(spec) or {}
     rows = list(spec.units())
     uid = spec.uid
-    out = {"group_target": {}, "offset": {}, "unit_targets": [str(t["id"]) for t in j.get("targets") or []
-                                                               if isinstance(t, dict) and t.get("kind") == "unit"]}
+    ut = [t for t in j.get("targets") or [] if isinstance(t, dict) and t.get("kind") == "unit"]
+    out = {"group_target": {}, "offset": {}, "unit_targets": [str(t["id"]) for t in ut],
+           # Codex r2 P1-1: a unit miss and an offset are protected by the unit targets' ids and their sources alike
+           "unit_names": {str(t["id"]) for t in ut} | {str(t.get("bias_source")) for t in ut if t.get("bias_source")},
+           "source_targets": {str(t.get("bias_source", t["id"])): str(t["id"]) for t in ut if t.get("bias_by")}}
     for t in j.get("targets") or []:
         if not isinstance(t, dict):
             continue
@@ -210,15 +213,19 @@ def declare(spec, rep: dict, dec: dict) -> dict:
     def protected(c):       # Codex r1 P1-3: the key, its target or source, and for a unit every unit target on it
         names = {c["key"], c["target"]}
         if c["kind"] == "unit":
-            names |= set(ids["unit_targets"]) | {f"{t}:{c['key']}" for t in ids["unit_targets"]}
+            names |= ids["unit_names"] | {f"{t}:{c['key']}" for t in ids["unit_targets"]}
+        if c["kind"] == "offset":
+            names |= {ids["source_targets"].get(c["target"], c["target"])}
         return bool(names & nd)
     hard = [c["key"] for c in found if protected(c)]
     if hard:
         out["conflicts"]["refused"] = f"never_declare targets cannot be declared: {hard[:5]}"
         return out
     totals = {"group_target": len(ids["group_target"]), "offset": len(ids["offset"]), "unit": len(units)}
+    prior = {"group_target": sum(1 for x in u.get("declared") or [] if isinstance(x, dict) and "target" in x),
+             "offset": sum(1 for x in u.get("declared") or [] if isinstance(x, dict) and "offset" in x), "unit": 0}
     for kind, tot in totals.items():
-        n = sum(c["kind"] == kind for c in found)
+        n = sum(c["kind"] == kind for c in found) + prior[kind]     # Codex r2 P1-2: the signed declarations count
         cap = max(1, math.floor(pol["max_share_declared"] * tot + 1e-9))
         if n > cap:
             out["conflicts"]["refused"] = (f"{n} {kind} conflicts exceed max_share_declared "
@@ -226,7 +233,7 @@ def declare(spec, rep: dict, dec: dict) -> dict:
             return out
     lo, hi = pol["test_scales"]
     for n, c in enumerate(found, 1):
-        base = f"{TEST_PREFIX}{_slug(c['key'])}"
+        base = f"{TEST_PREFIX}{_slug(c['kind'] + ':' + c['key'])}"
         c.update(n=n, tests=[f"{base}_lo", f"{base}_hi"], scales=[lo, hi])
     raw2 = copy.deepcopy(spec.raw)
     j2 = raw2["calibration"]["joint"]
@@ -294,13 +301,32 @@ def load(run_dir: str) -> dict | None:
     return d
 
 
+def _complete_joint_run(run_dir: str) -> bool:
+    """A complete analysis (its manifest) that ran the joint calibration: it always writes the conflict record."""
+    import json
+    try:
+        m = json.load(open(os.path.join(run_dir, "analysis", "manifest.json"), encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    arts = m.get("artifacts") if isinstance(m, dict) else None
+    return bool(isinstance(m, dict) and m.get("status") == "complete" and isinstance(arts, dict)
+                and any(str(k).replace(os.sep, "/") == "analysis/joint_calibration.yaml" for k in arts))
+
+
 def findings(run_dir: str) -> tuple:
     """([finding rows for agents/findings_ledger.py], [problems]): one HIGH `evidence_conflict_declared` per declared
     conflict; open (the owner decides) when its test changes the plan or did not run, else declared (a limitation)."""
+    def to_owner(why):
+        return [{"id": f"{FINDING_KIND}:record", "kind": FINDING_KIND, "key": "record", "status": "open",
+                 "resolution_type": "owner_decision", "claim": f"The conflict record cannot be relied on: {why}.",
+                 "fix_requires": "Owner decision: whether any calibration target was held out cannot be read from "
+                                 f"{ARTIFACT}; rebuild the analysis, or accept or decline"}]
     try:
         d = load(run_dir)
     except ValueError as e:
-        return [], [str(e)]
+        return to_owner(str(e)), [str(e)]
+    if d is None and _complete_joint_run(run_dir):
+        return to_owner(f"a complete joint-calibration analysis has no {ARTIFACT}"), []
     rows = []
     for c in (d or {}).get("declared") or []:
         if not isinstance(c, dict) or not c.get("key"):
@@ -422,7 +448,20 @@ def _self_test() -> int:
            f"({got['conflicts']['refused']})")
         um = dict(rep_vf, blocks=[{"code": "unmatched_units", "detail": {"unmatched": ["5"], "conflicting": []}}],
                   units=dict(units, **{"5": {"status": "unmatched"}}))
-        for nd in (["unit_t"], ["unit_t:5"], ["5"]):
+        sp_ = spec_with(never_declare=["unit_t"])
+        ok(not declare(sp_, rep_off, JC.unmatched_decision(sp_, rep_off))["proceed"],
+           "CF_NEVER_DECLARE_OFFSET an offset is protected by its unit target's id (Codex r2)")
+        r_ = copy.deepcopy(raw)
+        r_["calibration"]["joint"]["unmatched"] = {"mode": "flag", "max_units": 0, "default_reason": "r", "declared": [
+            {"target": "region_t:r0", "reason": "signed", "decision_test": "DT1"}]}
+        r_["conflicts"] = {"policy": "declare_and_test", "max_share_declared": 0.4}
+        yaml.safe_dump(r_, open(p, "w"), sort_keys=False)
+        sp2 = schema.load(p)
+        two = dict(rep_vf, blocks=[{"code": "verification_failed", "detail": {"units": [],
+                                                                              "targets": ["region_t:r0", "region_t:r1"]}}])
+        ok(not declare(sp2, two, JC.unmatched_decision(sp2, two))["proceed"],
+           "CF_SHARE_COUNTS_SIGNED signed declarations count toward the share (Codex r2)")
+        for nd in (["unit_t"], ["unit_t:5"], ["5"], ["S"]):
             sp_ = spec_with(never_declare=nd)
             ok(not declare(sp_, um, JC.unmatched_decision(sp_, um))["proceed"],
                f"CF_NEVER_DECLARE_UNIT a unit miss is protected by its unit target, target:unit or unit id ({nd})")
@@ -459,6 +498,13 @@ def _self_test() -> int:
             seen.append(FLG.load(d)[fid].status)
         ok(seen == ["declared", "open", "declared"], f"CF_LEDGER_FOLLOWS_TEST a rebuilt conflict whose test now changes "
                                                      f"the plan is open again for the owner ({seen})")
+        os.remove(os.path.join(d, ARTIFACT))
+        import json
+        json.dump({"status": "complete", "artifacts": {"analysis/joint_calibration.yaml": {}}},
+                  open(os.path.join(d, "analysis", "manifest.json"), "w"))
+        fs, _ = findings(d)
+        ok([(f["key"], f["status"]) for f in fs] == [("record", "open")],
+           "CF_RECORD_MISSING_TO_OWNER a complete joint run without its conflict record goes to the owner (Codex r2)")
         open(os.path.join(d, ARTIFACT), "w").write("data: [: bad")
         ok(findings(d)[1] and "Could not be read" in "\n".join(report_lines(d)),
            "CF_ARTIFACT_UNREADABLE_FAILS_CLOSED an unreadable conflicts record is a problem, and the report says so")
