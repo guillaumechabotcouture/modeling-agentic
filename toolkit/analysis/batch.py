@@ -186,25 +186,22 @@ def cover_features(order: list, hold: set, cols: list) -> list:
     """The first len(order) design points' units, changed only as far as needed for the points to span every emulator
     feature's range over the units (1C-b 2b). The emulator's feature domain is the range of its design points
     (toolkit/analysis/model.py), so a unit beyond it is an extrapolation that stops the analysis. For each feature
-    whose minimum or maximum no design point reaches, the first unit at that value takes the last design point that is
-    not held out and does not itself carry such a value (a held-out one when no other is left). An order that already
-    spans every feature is returned unchanged, so its jobs keep their hashes. `cols`: one list per feature, a value
-    per unit; with more extremes than points, the remaining features stay uncovered (and the extrapolation stops)."""
+    minimum or maximum no design point reaches, the first unit at that value takes a design point whose replacement
+    leaves every extreme already reached still reached (Codex r1 P1-1): the last such point that is not held out, a
+    held-out one only when no training point qualifies (P1-2). An order that already spans every feature is returned
+    unchanged, so its jobs keep their hashes. `cols`: one list per feature, a value per unit. An extreme no swap can
+    add (more extremes than points) stays uncovered, and the extrapolation stops the analysis as before."""
     order = list(order)
-    ends = {c.index(pick(c)) for c in cols for pick in (min, max)}      # never replaced once they are design points
-    for _ in range(2 * len(cols) + 1):      # a replaced point may have carried a tied extreme: repeat until none moves
-        moved = False
-        for c in cols:
-            for want in (min(c), max(c)):
-                if any(c[u] == want for u in order):
-                    continue
-                free = [k for k in range(len(order)) if order[k] not in ends]
-                if not free:
-                    return order
-                order[max(free, key=lambda k: (k not in hold, k))] = c.index(want)
-                moved = True
-        if not moved:
-            break
+    ext = [(c, w) for c in cols for w in (min(c), max(c))]        # every (feature, extreme value)
+    for c, want in ext:
+        cnt = [sum(d[u] == w for u in order) for d, w in ext]     # design points at each extreme
+        if any(c[u] == want for u in order):
+            continue
+        new = c.index(want)
+        free = [k for k in range(len(order))
+                if all(n > 1 or d[new] == w or d[order[k]] != w for (d, w), n in zip(ext, cnt))]
+        if free:
+            order[max(free, key=lambda k: (k not in hold, k))] = new
     return order
 
 
