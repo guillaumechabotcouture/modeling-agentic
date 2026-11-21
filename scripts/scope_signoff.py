@@ -632,6 +632,9 @@ def render_md(run_dir: str) -> str:
             vs = conf.get("verdicts") if isinstance(conf.get("verdicts"), dict) else {}
             lines += [f"Evidence-conflict decision tests: {', '.join(f'{k}: {v}' for k, v in vs.items()) or 'none'}; "
                       f"changes the plan: {ch}.", ""]
+        elif it.get("kind") == "evidence_conflict_declared":    # a request written before the verdict was carried
+            lines += ["Evidence-conflict decision tests: see analysis/conflicts.yaml (this request predates their "
+                      "verdicts in it); the owner is asked only when a test changes the plan or could not run.", ""]
         elif not it.get("declarations"):
             lines += ["Not declared in scope_declaration.yaml, and **untested**.", ""]
         for dcl in it.get("declarations") or []:

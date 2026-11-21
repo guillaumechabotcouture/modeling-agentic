@@ -380,23 +380,35 @@ def options(run_dir: str, key: str) -> list:
 
 
 def verdict(run_dir: str, key: str) -> dict:
-    """One declared conflict's structured verdict, for the owner's request item (1F, Codex r4 of #316):
-    {status, changes_plan, tests, verdicts}. status: CHANGES_PLAN (a test changes the plan), NOT_RUN (a test did not
-    run: its effect on the plan is unknown), NO_CHANGE, or UNREADABLE (no readable record for the key: fail closed,
-    counted as changing the plan, as W0-F's record does for a test that did not run)."""
+    """The structured verdict of the declared conflicts with one key, for the owner's request item (1F, Codex r4-r5
+    of #316): {status, changes_plan, tests, verdicts}. Every row with the key counts (the ledger holds one finding per
+    key). status: CHANGES_PLAN (a test changes the plan); NOT_RUN (a listed test has no result or did not run: its
+    effect is unknown); NO_CHANGE (every listed test ran and changes nothing); UNREADABLE (no readable record for the
+    key, a malformed row or an unknown verdict: fail closed). Every status but NO_CHANGE counts as changing the plan,
+    as W0-F's own record does for a test that did not run."""
+    bad = {"status": "UNREADABLE", "changes_plan": True, "tests": [], "verdicts": {}}
     try:
         d = load(run_dir) or {}
     except ValueError:
-        d = {}
-    c = next((c for c in d.get("declared") or [] if isinstance(c, dict) and str(c.get("key")) == str(key)), None)
-    if c is None:
-        return {"status": "UNREADABLE", "changes_plan": True, "tests": [], "verdicts": {}}
-    vs = c.get("verdicts") if isinstance(c.get("verdicts"), dict) else {}
-    vals = set(map(str, vs.values()))
-    status = ("CHANGES_PLAN" if "CHANGES_PLAN" in vals else "NOT_RUN" if "NOT_RUN" in vals or not vals
-              else "NO_CHANGE" if vals == {"NO_CHANGE"} else "UNREADABLE")
-    return {"status": status, "changes_plan": status != "NO_CHANGE", "tests": list(c.get("tests") or []),
-            "verdicts": dict(vs)}
+        return bad
+    rows = [c for c in d.get("declared") or [] if isinstance(c, dict) and str(c.get("key")) == str(key)]
+    if not rows:
+        return bad
+    tests, vs, flags = [], {}, set()
+    for c in rows:
+        t, v = c.get("tests"), c.get("verdicts")
+        if not isinstance(t, list) or not t or not isinstance(v, dict):
+            flags.add("UNREADABLE")
+            continue
+        for x in t:
+            tests.append(str(x))
+            r = v.get(x, v.get(str(x)))
+            vs[str(x)] = "NOT_RUN" if r is None else str(r)
+            flags.add(vs[str(x)] if vs[str(x)] in ("CHANGES_PLAN", "NOT_RUN", "NO_CHANGE") else "UNREADABLE")
+        if c.get("changes_plan") is True and not flags - {"NO_CHANGE"}:
+            flags.add("UNREADABLE")         # the record says the plan changes; its verdicts do not show how
+    status = next(st for st in ("CHANGES_PLAN", "UNREADABLE", "NOT_RUN", "NO_CHANGE") if st in flags or st == "NO_CHANGE")
+    return {"status": status, "changes_plan": status != "NO_CHANGE", "tests": tests, "verdicts": vs}
 
 
 def report_lines(run_dir: str) -> list:

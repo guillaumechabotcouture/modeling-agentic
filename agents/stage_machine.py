@@ -2243,6 +2243,8 @@ def _plan_changing(item: dict) -> bool:
     test changes the decision, or a W0-F evidence conflict whose verdict changes the plan (or whose test did not run:
     W0-F counts that as changing it; Codex r4 of #316)."""
     conf = item.get("conflict")
+    if item.get("kind") == "evidence_conflict_declared" and not isinstance(conf, dict):
+        return True     # a request saved before the verdict was carried: it holds only plan-changing or untested ones
     return item.get("kind") in DECISION_BEARING_KINDS or (isinstance(conf, dict) and conf.get("changes_plan") is True) \
         or any((d.get("test") or {}).get("decision_changes") is True
                for d in item.get("declarations") or [] if isinstance(d, dict))
