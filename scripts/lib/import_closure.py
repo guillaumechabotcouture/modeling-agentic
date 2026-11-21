@@ -450,7 +450,5 @@ if __name__ == "__main__":
     import json
     if sys.argv[1:2] == ["--self-test"]:
         sys.exit(_self_test())
-    a = sys.argv[1:]
-    rd = a[a.index("--run-dir") + 1] if "--run-dir" in a else None
-    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    print(json.dumps(closure(a[0], here, rd), indent=1))
+    a, here = sys.argv[1:], os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    print(json.dumps(closure(a[0], here, a[a.index("--run-dir") + 1] if "--run-dir" in a else None), indent=1))

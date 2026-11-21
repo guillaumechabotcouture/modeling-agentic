@@ -2513,9 +2513,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
 FP_KEY_VERSION = 2
 # compute.py's own code a row passes through (W0-A): the closure walks from these; FP_DISPATCH_EXEMPT is not followed.
 FP_ROW_ROOTS = ("run_map", "_remote_task", "_local_init", "_local_chunk", "_read_inputs")
-# W0-A (scripts/lib/import_closure.py): load_fn's dynamic import loads only the batch function, the closure's root.
-# The other dynamic imports in this file are in FP_DISPATCH_EXEMPT definitions or self-tests, which the walk skips.
-FP_DYNAMIC_IMPORTS = ()
+FP_DYNAMIC_IMPORTS = ()     # W0-A: load_fn loads only the closure's root; the rest are exempt or self-tests
 
 
 def _digest(x) -> str:
@@ -4094,8 +4092,7 @@ def _self_test_fp_dispatch(ok) -> None:
     # FPX5: code_fingerprint uses it for this file, and only for this file.
     with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as rd:
         os.makedirs(os.path.join(repo, "scripts")); os.makedirs(os.path.join(rd, "models"))
-        # W0-A: the function imports scripts/other.py, so other.py is in its closure once it exists
-        open(os.path.join(rd, "models", "m.py"), "w").write("import other\n\n\ndef f(p):\n    return p\n")
+        open(os.path.join(rd, "models", "m.py"), "w").write("import other\n\n\ndef f(p):\n    return p\n")  # W0-A
         saved = globals()["REPO"]
         try:
             globals()["REPO"] = repo
