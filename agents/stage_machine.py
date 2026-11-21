@@ -372,6 +372,18 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto")
     return []
 
 
+def _earlier_round(path: str, round_n: int) -> int:
+    """The round a critique file states when it is an earlier one than `round_n`; else `round_n` (a file that
+    cannot be read, or states no earlier round, is validated against the gate's round as usual)."""
+    import yaml
+    try:
+        with open(path) as fh:
+            r = (yaml.safe_load(fh) or {}).get("round")
+    except Exception:  # noqa: BLE001 -- validate_critique reports it
+        return round_n
+    return r if isinstance(r, int) and not isinstance(r, bool) and 1 <= r < round_n else round_n
+
+
 def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
             history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None,
             strict_done_when: bool = False, append_history: bool | None = None) -> dict:
@@ -395,8 +407,15 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                 continue
             schema_errors.append(f"{V.FILENAMES[reviewer]} is missing")
             continue
+        rn = round_n
+        if reviewer == "critique-presentation" and not post_write:
+            # A pre-write gate with a draft follows a post-write modelling fix, one round on: PRESENTATION has not
+            # run since, and it reviews the rewritten draft before the next post-write gate. The last review is
+            # read as of the round it was written in (its findings stay open and listed), not refused for that
+            # round, which cost a schema repair and a paid review of a draft about to be replaced.
+            rn = _earlier_round(path, round_n)
         try:
-            critiques[reviewer] = V.validate_critique(path, reviewer, round_n)
+            critiques[reviewer] = V.validate_critique(path, reviewer, rn)
         except V.SchemaError as e:
             # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
             # blockers still have their done_when tests checked below, for the same reason.
@@ -464,13 +483,15 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     itself). `tested`: the finding has a test the fix loop can work to. A write-up finding waits
     for the draft."""
     import done_when as DW
+    import open_problems as OP
     import validate_critique_yaml as V
     draft = os.path.exists(os.path.join(run_dir, "manuscript.md"))
+    drafted = draft or os.path.exists(os.path.join(run_dir, "report.md"))     # the gate's own test for a draft
     closed = set(map(str, decision.get("resolved_by_test") or [])) | set(map(str, decision.get("outside_brief") or []))
     out = []
     for reviewer, name in V.FILENAMES.items():
         p = os.path.join(run_dir, name)
-        if not os.path.exists(p) or (reviewer == "critique-presentation" and not draft):
+        if not os.path.exists(p) or (reviewer == "critique-presentation" and not drafted):
             continue
         try:
             import yaml
@@ -493,7 +514,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
             if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
                     or str(b.get("id")) in closed):
                 continue
-            if b.get("target_stage") == "WRITE" and not draft:
+            if not drafted and OP.after_write_item(b):     # the gate's own rule (V._defer_write_findings)
                 continue
             dw = b.get("done_when")
             out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
@@ -508,7 +529,8 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
         # Every gate finding counts (a resolved blocker whose test fails is done_when_unmet; a missing
         # presentation review is critique_presentation_missing); only one that restates an open
         # critic blocker (same id as its key) is a duplicate.
-        if str(v.get("key") or "") in critic_open or fid in seen:
+        # (a regression is its own HIGH finding beside the open one it is keyed by)
+        if (str(v.get("key") or "") in critic_open and v.get("kind") != "done_when_regressed") or fid in seen:
             continue
         seen.add(fid)
         out.append({"id": fid, "source": "harness", "severity": v.get("severity"),
@@ -704,20 +726,27 @@ def report_claim_findings(run_dir: str) -> list[dict]:
         return []
     try:
         import render_claims as RCL
-        claims = RCL.load_claims(lp)
+        claims, invalid = RCL.load_claims_tolerant(lp)
     except Exception as e:  # noqa: BLE001 -- fail closed
         return [{"kind": "report_claims_unreadable", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                  "key": "claims", "scope_declarable": False, "claim": f"claims ledger unreadable: {e}"}]
     # The writer's own text, all of it: what the harness appends is not in manuscript.md, so no
     # marker the writer could copy can hide anything.
     text = open(rp).read()
-    out = []
-    for cid in sorted(set(re.findall(r"\[CLAIM:([^\]]*)\]", text)) - set(claims)):
+    # One invalid claim is its own finding (the valid ones still render: render_report); still HIGH and not
+    # declarable, as the whole-ledger refusal it replaces was.
+    out = [{"kind": "report_claim_invalid", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE", "key": cid,
+            "scope_declarable": False, "claim": f"The claims ledger's entry {cid} is invalid and cannot be rendered: {why}"}
+           for cid, why in sorted(invalid.items())]
+    # A reference is read as the renderer reads it (render_claims.render_text strips the id).
+    refs = {c if "\n" in c else c.strip() for c in re.findall(r"\[CLAIM:([^\]]*)\]", text)}   # no id spans lines
+    for cid in sorted(refs - set(claims) - set(invalid)):
         out.append({"kind": "report_claim_unresolved", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                     "key": cid, "scope_declarable": False,
                     "claim": f"The report has [CLAIM:{cid}], which is not in the claims ledger."})
+    bare = re.sub(r"\[CLAIM:[^\]\n]*\]", " ", text)       # an id inside a reference is not a bare id
     for cid in sorted(c for c in claims if "." in c or "_" in c):     # a plain word is not an id
-        if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", text):
+        if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", bare):
             out.append({"kind": "report_claim_id_raw", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                         "key": cid, "scope_declarable": False,
                         "claim": f"The report shows the claim id {cid} instead of its value: write [CLAIM:{cid}]."})
@@ -1088,10 +1117,15 @@ class Machine:
         allowance once (the task cap when it had none) and mark it, before anything else runs."""
         for j in self.st.journal.values():
             if isinstance(j, dict) and j.get("status") == "started":
-                a = j.get("allowance_usd")
-                self.st.spent_usd += float(a if a is not None else self.st.task_cap_usd)
+                self.st.spent_usd += self._interrupted_charge(j)
                 j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
                 j["status"] = "interrupted"
+
+    def _interrupted_charge(self, j: dict) -> float:
+        """What an interrupted task is charged: its allowance (the task cap when it had none) and, for a write-up
+        task, the read-back allowance it was given (0 in an entry written before that was recorded)."""
+        a, rb = j.get("allowance_usd"), j.get("readback_usd")
+        return float(a if a is not None else self.st.task_cap_usd) + float(rb if isinstance(rb, (int, float)) else 0.0)
 
     # -------------------------------------------------- plumbing
     def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None) -> str:
@@ -1135,8 +1169,7 @@ class Machine:
         if j and j.get("status") == "completed":
             return TaskResult(bool(j.get("ok")), j.get("output"), 0.0, j.get("note", ""), j.get("session_id"))
         if j and j.get("status") == "started":
-            a = j.get("allowance_usd")
-            self.st.spent_usd += float(a if a is not None else self.st.task_cap_usd)
+            self.st.spent_usd += self._interrupted_charge(j)
             j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
             j["status"] = "interrupted"
             save_state(self.run_dir, self.st)
@@ -1153,15 +1186,19 @@ class Machine:
                      f"floor (spent ${self.st.spent_usd:.2f} of ${self.st.budget_usd}). Paused for the owner; resume with "
                      f"python3 main.py --v2 --resume {self.run_dir} --max-budget-usd <higher cap>")
             raise AwaitingBudget(name)
-        j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance)
+        a = allowance if allowance is not None else self.st.task_cap_usd
+        b = self._budget(writeup)
+        # A crash read-back is a paid call too: a small cap, from what is left after this allowance (for a
+        # write-up task, left of the reserve it may use).
+        rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
+        # A write-up task spends up to the cap itself, so its read-back allowance is part of what an interrupted
+        # one is charged (_interrupted_charge): the cap holds on resume.
+        j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance, writeup=bool(writeup),
+                 readback_usd=rb if writeup else 0.0)
         self.st.journal[key] = j
         save_state(self.run_dir, self.st)
         setter = getattr(self.tasks, "set_allowance", None)
         if setter:
-            a = allowance if allowance is not None else self.st.task_cap_usd
-            b = self._budget()
-            # A crash read-back is a paid call too: a small cap, from what is left after this allowance.
-            rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
             setter(a, readback_usd=rb)
         res = getattr(self.tasks, name)(*args, **kwargs)
         self._charge(res)
@@ -1185,12 +1222,14 @@ class Machine:
             return self._go("FINAL", "budget used")
         return self._go("FINAL", "budget used before the model was built", "budget_exhausted")
 
-    def _budget(self) -> dict | None:
+    def _budget(self, writeup: bool = False) -> dict | None:
+        """What is left under the cap: less the write-up reserve, except for the write-up's own tasks (WRITE and
+        the PRESENTATION review of its draft), which the reserve is held for."""
         cap = self.st.budget_usd
         if not cap:
             return None
         from agents.run_budget import writeup_reserve
-        left = cap - writeup_reserve(cap) - self.st.spent_usd
+        left = cap - (0.0 if writeup else writeup_reserve(cap)) - self.st.spent_usd
         return {"spent": round(self.st.spent_usd, 4), "cap": cap, "left": round(left, 4)}
 
     def _out_of_budget(self) -> bool:
@@ -1280,7 +1319,69 @@ class Machine:
         return probs
 
     def harness_ids(self, run_dir: str) -> set[str]:
-        return {FL.gate_id(v) for v in self.harness_findings()}
+        """The ledger ids the harness can re-check between gates: its own findings and, as h_GATE reads them, the
+        backend's spec and registry checks. A fix task's finding absent from them passes its check; the gate's other
+        findings (fix_loop.GATE_ONLY) are never among them and are left to the next gate."""
+        vs = self.harness_findings()
+        for name in ("spec_violations", "registry_violations"):
+            fn = getattr(self.backend, name, None)
+            vs += list(fn(run_dir) or []) if fn else []
+        return {FL.gate_id(v) for v in vs if isinstance(v, dict)}
+
+    def _rethink(self, to: str, why: str, planned: bool = False):
+        """A RETHINK back-edge to SPEC or ENGINE_CHOICE, which is told why. From the gate (a structural mismatch): its
+        rationale, each critic's description of the mismatch and its STRUCTURAL findings. From the fix loop
+        (`planned`): this round's rethink briefs for that state and the findings they name. Either way, the open
+        findings that state owns, each with its remedy. An unsigned spec is redrafted with them as its feedback and a
+        fresh count of tries (a signed one is the owner's to amend: h_SPEC); the engine pick is told the engine the
+        run left. Nothing read here can stop the back-edge: a file that is not what it should be adds no reason."""
+        try:
+            out = self._rethink_reasons(to, planned)
+        except Exception as e:  # noqa: BLE001 -- advisory text: the back-edge is taken without it
+            out = [f"the reasons could not be read ({type(e).__name__})"]
+        if to == "SPEC" and not (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
+            self.st.tries["spec"] = 0
+            if out:
+                self.st.tries["spec_feedback"] = [f"rethink after review round {self.st.round}: {x}" for x in out]
+        elif to == "ENGINE_CHOICE":
+            self.st.tries["rethink_engine"] = {"engine": self.st.engine, "round": self.st.round, "why": out}
+        return self._go(to, why)
+
+    def _rethink_reasons(self, to: str, planned: bool) -> list[str]:
+        import yaml
+        import validate_critique_yaml as V
+        g, out, named, seen = self.st.last_gate or {}, [], set(), set()
+        if not planned:
+            if g.get("action") == "RETHINK_STRUCTURAL" and g.get("rationale"):
+                out.append(f"gate: {g['rationale']}")
+            for reviewer in V.FILENAMES:           # every reviewer the gate may have read
+                try:
+                    doc = yaml.safe_load(open(os.path.join(self.run_dir, V.FILENAMES[reviewer])))
+                    sm = doc.get("structural_mismatch") or {}
+                    if sm.get("detected"):
+                        out.append(f"{reviewer}: {sm.get('description')}")
+                    for b in doc.get("blockers") or []:       # its own text: not every reviewer's is in the ledger
+                        if isinstance(b, dict) and b.get("category") == "STRUCTURAL" and not b.get("resolved"):
+                            out.append(f"{b.get('id')}: {b.get('claim')}" + (f" Required: {_remedy(b)}" if _remedy(b) else ""))
+                            seen.add(str(b.get("id")))
+                except Exception:  # noqa: BLE001 -- the gate already judged the file; here it only adds reasons
+                    continue
+        else:
+            try:
+                plan = json.load(open(os.path.join(self.run_dir, f"fix_plan_r{self.st.round}.json")))["plan"]["tasks"]
+            except Exception:  # noqa: BLE001
+                plan = []
+            for t in plan if isinstance(plan, list) else []:
+                if isinstance(t, dict) and t.get("action") == "rethink" and t.get("owner_state") == to:
+                    out.append(f"fix plan: {t.get('brief')}")
+                    named |= {str(x) for x in (t.get("findings") if isinstance(t.get("findings"), list) else [])}
+        try:
+            led = FL.open_findings(FL.load(self.run_dir))
+        except Exception as e:  # noqa: BLE001 -- the reasons read so far are kept
+            led, out = [], out + [f"the findings ledger could not be read ({type(e).__name__})"]
+        out += [f"{f.id}: {f.claim}" + (f" Required: {f.fix_requires}" if f.fix_requires else "")
+                for f in led if (f.id in named or f.owner_state == to) and f.id not in seen]
+        return [" ".join(str(x).split())[:600] for x in out][:20]
 
     def rebuild(self, run_dir: str) -> dict:
         """The S1 pipeline, then the report again when a draft exists (a write-up fix edits
@@ -1301,7 +1402,9 @@ class Machine:
         self.st.paused = None
         if s == "SPEC" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
             return self.h_SPEC()                 # the amendment pause costs no model call (Codex review of #261 P1-3)
-        if s in LLM_STATES and self._out_of_budget():
+        # PRESENTATION is not checked here: its one task is a write-up task, and _task replays a completed review
+        # before it looks at the budget (h_PRESENTATION takes the budget path when there is no allowance).
+        if s in LLM_STATES and s != "PRESENTATION" and self._out_of_budget():
             return self._budget_out(s)
         try:
             return getattr(self, "h_" + s)()
@@ -1452,9 +1555,14 @@ class Machine:
         if not eligible:
             _write_json(self.run_dir, "engine_choice.json", rec)
             return self._go("FINAL", "no registered engine fits the spec", "run_failed")
-        res = self._task(f"ENGINE_CHOICE#{self._visit()}:pick_engine", "pick_engine", spec, rows)
+        rt = self.st.tries.get("rethink_engine")         # set by a RETHINK back-edge (_rethink): the engine left, and why
+        res = self._task(f"ENGINE_CHOICE#{self._visit()}:pick_engine", "pick_engine", spec, rows,
+                         **({"rethink": rt} if rt else {}))
         if res is None:
             return self._budget_out("ENGINE_CHOICE")
+        if rt:
+            rec["rethink"] = rt
+            self.st.tries.pop("rethink_engine", None)
         pick = (res.output or {}).get("engine") if res.ok else None
         if pick not in {r["ref"] for r in eligible}:
             pick, why = eligible[0]["ref"], f"harness: the pick {pick!r} is not eligible; first eligible engine"
@@ -1668,6 +1776,8 @@ class Machine:
             self.st.post_write = False
         if nxt == "WRITE":
             self.st.write_mode = mode
+        if nxt in ("SPEC", "ENGINE_CHOICE"):
+            return self._rethink(nxt, why)
         return self._go(nxt, why, status)
 
     def _language_check(self, status: str) -> dict:
@@ -1694,7 +1804,7 @@ class Machine:
             return self._go("OWNER_DECISION", f"{len(summ['owner_amendments'])} finding(s) need an owner amendment "
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
-            return self._go(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})")
+            return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})", planned=True)
         if not summ["tasks"] and summ.get("write_up") and self._has_draft():
             # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
             if self.st.round_pending:
@@ -1766,8 +1876,10 @@ class Machine:
         return self._go("PRESENTATION", f"draft written ({mode})")
 
     def h_PRESENTATION(self):
+        # The review of the draft is part of the write-up: like WRITE, it may use the write-up reserve (an accepted
+        # run whose WRITE spent into the reserve ended budget_exhausted here, with most of the reserve unspent).
         res = self._task(f"PRESENTATION#{self._visit()}:r{self.st.round}", "critique", self.run_dir,
-                         "critique-presentation", self.st.round)
+                         "critique-presentation", self.st.round, writeup=True)
         if res is None:
             return self._budget_out("PRESENTATION")
         return self._go("GATE", "presentation review of the draft")
@@ -1983,7 +2095,8 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         # The writer writes [CLAIM:id]; the harness substitutes the value (no number is typed).
         import render_claims as RCL
         try:
-            draft, _unresolved = RCL.render_text(draft, RCL.load_claims(lp))
+            # the valid claims; an invalid one stays a reference, reported by report_claim_findings
+            draft, _unresolved = RCL.render_text(draft, RCL.load_claims_tolerant(lp)[0])
         except Exception:  # noqa: BLE001 -- left unrendered; report_claim_findings flags it
             pass
     h = backend.headline(run_dir)
@@ -3063,6 +3176,8 @@ def _self_test() -> int:
             traceback.print_exc()
             ok(False, f"T58-T60 analysis timeout and resume: {type(e).__name__}: {e}")
 
+        _self_test_auto1a(ok, td, spike, new_run)
+
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
         m.st.state = "SPEC"
@@ -3394,6 +3509,299 @@ def main(rd):
 if __name__ == "__main__":         # the local pool's spawned processes import this file again
     sys.exit(main(sys.argv[1]))
 '''
+
+
+def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
+    """v2 autonomy brief, PR 1A (docs/design/v2-autonomy-brief.md §4; item numbers are the re-audit's): the
+    PRESENTATION budget stop, the gate before a rewrite, harness ids, the RETHINK back-edges and claim references."""
+    from types import SimpleNamespace as NS
+    import yaml
+    from v2_tasks import StubTasks
+
+    def mk(d, T, st, backend=spike):
+        return Machine(d, T, st, backend=backend, log=lambda *a: None, cross_engine_check=False)
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- before the fix exists this is the failure
+            ok(False, f"{name}: {type(e).__name__}: {e}")
+
+    def budget():
+        d, T, st = new_run("a1_pres", {}, budget=20.0)
+        st.state, st.spent_usd = "PRESENTATION", 16.5        # past cap less reserve, $3.50 of the reserve left
+        save_state(d, st)
+        mk(d, T, st).step()
+        s = load_state(d)
+        ok(s.state == "GATE" and s.forced_status is None and T.calls == ["critique:critique-presentation:1"],
+           f"T_PRES_BUDGET the presentation review runs on the write-up reserve ({s.state}, {s.forced_status}, {T.calls})")
+        d, T, st = new_run("a1_pres_out", {}, budget=20.0)
+        st.state, st.spent_usd = "PRESENTATION", 20.0
+        save_state(d, st)
+        mk(d, T, st).step()
+        s = load_state(d)
+        ok(s.state == "FINAL" and s.status == "budget_exhausted" and T.calls == [],
+           f"T_PRES_BUDGET2 with the whole cap spent the run still ends budget_exhausted ({s.state}, {s.status})")
+
+        class RBT(StubTasks):
+            def set_allowance(self, usd, readback_usd=None):
+                self.rb = readback_usd
+                super().set_allowance(usd)
+        d, T, st = new_run("a1_rb", {}, budget=20.0)
+        st.spent_usd = 16.5
+        save_state(d, st)
+        T = RBT(T.s)
+        m = mk(d, T, st)
+        m._task("k1", "sign_spec", d, writeup=True)
+        ok(T.rb == READBACK_CAP_USD and m._task("k2", "sign_spec", d) is None,
+           f"T_WRITE_RB a write-up task keeps its read-back allowance; other tasks still stop at the reserve ({T.rb})")
+
+    def post_write():
+        # T_PW_GATE (2.1): the pre-write gate after a post-write modelling fix, one round on.
+        d = os.path.join(td, "a1_pw")
+        os.makedirs(d)
+        S = StubTasks({"critics": {1: {"critique-presentation": [
+            {"id": "P-001", "severity": "MEDIUM", "target_stage": "WRITE", "claim": "a caption is unclear",
+             "done_when": [{"file": "manuscript.md", "contains": "Figure 1 shows"}]}]}}})
+        S.critique(d, "critique-presentation", 1)
+        for r in CRITICS:
+            S.critique(d, r, 2)
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
+        g, gp = (v2_gate(d, 2, 3, pw, [], history=False) for pw in (False, True))
+        kinds = {v.get("kind") for v in g.get("rigor_violations") or []}
+        ok(not g.get("schema_errors") and g.get("action") and "P-001" in {o["id"] for o in open_findings(d, g)}
+           and not kinds & {"done_when_dropped", "critique_presentation_missing"} and gp.get("schema_errors"),
+           f"T_PW_GATE a pre-write gate reads the last draft's presentation review as of its own round; the "
+           f"post-write gate needs this round's ({g.get('schema_errors')}, {g.get('action')}, {sorted(kinds)}, "
+           f"post {bool(gp.get('schema_errors'))})")
+        d = os.path.join(td, "a1_ofp")
+        os.makedirs(d)
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "D-061", "severity": "MEDIUM", "category": "PRESENTATION", "target_stage": "ANALYZE", "claim": "c"},
+            {"id": "D-062", "severity": "MEDIUM", "category": "METHODS", "target_stage": "ANALYZE", "claim": "c"}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
+        ok(got == ["D-062"], f"T_OF_PRES a PRESENTATION finding waits for the draft ({got})")
+
+    def ids():
+        class B:
+            def __getattr__(self, n):
+                return getattr(spike, n)
+
+            def gate_findings(self, rd):
+                return []
+
+            def spec_violations(self, rd):
+                return [{"kind": "spec_x", "key": "k1", "severity": "HIGH", "claim": "c"}]
+
+            def registry_violations(self, rd):
+                return [{"kind": "reg_y", "key": "k2", "severity": "HIGH", "claim": "c"}]
+        d, T, st = new_run("a1_ids", {})
+        got = mk(d, T, st, backend=B()).harness_ids(d)
+        ok({"spec_x:k1", "reg_y:k2"} <= got, f"F_HARNESS_IDS spec and registry findings are harness ids ({sorted(got)})")
+
+    def rethink():
+        # T_RETHINK_SPEC_TRIES (5.1, 5.2): unsigned specs only; a signed one pauses for the owner.
+        class ST(StubTasks):
+            def draft_spec(self, q, rd, fb):
+                self.fbs = getattr(self, "fbs", []) + [fb]
+                return super().draft_spec(q, rd, fb)
+        sb = {"id": "D-051", "severity": "HIGH", "target_stage": "PLAN", "category": "STRUCTURAL",
+              "claim": "the decision unit is too coarse", "fix_requires": "Redraft the units."}
+        d, T, st = new_run("a1_rspec", {"critics": {1: {"critique-domain": [sb]}}, "structural": {1: "critique-domain"}},
+                           max_rounds=2)
+        st.tries["spec"] = MAX_SPEC_TRIES - 1
+        save_state(d, st)
+        T = ST(T.s)
+        s = mk(d, T, st).run()
+        fbs = T.fbs
+        ok(len(fbs) >= 2 and fbs[0] is None and any("D-051" in x and "Redraft the units." in x for x in fbs[1] or []),
+           f"T_RETHINK_SPEC_TRIES a rethink of an unsigned spec redrafts it with the findings ({s}, {fbs})")
+        ok(any("cannot represent the question" in x for x in (fbs + [None, None])[1] or []),
+           "CX1-8 a structural rethink's reasons carry the critic's description of the mismatch")
+
+        # T_RETHINK_ENGINE_CONTEXT (5.3): the engine pick after a rethink is told the engine left and why.
+        class ET(StubTasks):
+            def pick_engine(self, spec, eligible, rethink=None):
+                self.rth = getattr(self, "rth", []) + [rethink]
+                return super().pick_engine(spec, eligible)
+        blk = {"id": "D-052", "severity": "HIGH", "target_stage": "MODEL", "claim": "the engine has no age structure"}
+        plan = lambda pk: {"tasks": [{"id": "T1", "findings": [f["id"] for f in pk["findings"]], "action": "rethink",   # noqa: E731
+                                      "owner_state": "ENGINE_CHOICE", "brief": "pick an engine with age structure",
+                                      "files": ["engine_choice.json"]}] if pk["findings"] else []}
+        d, T, st = new_run("a1_reng", {"critics": {1: {"critique-domain": [blk]}}, "plan": plan}, max_rounds=2)
+        T = ET(T.s)
+        s = mk(d, T, st).run()
+        r = T.rth + [None, None]
+        ok(r[0] is None and isinstance(r[1], dict) and str(r[1].get("engine")).endswith("ToyEngine")
+           and any("age structure" in w for w in r[1].get("why") or []),
+           f"T_RETHINK_ENGINE_CONTEXT the second engine pick gets the engine left and the reasons ({s}, {T.rth})")
+
+    def claims():
+        # T_CLAIM_WS (6.1): [CLAIM: id ] is the reference the renderer accepts; it is not an unresolved one.
+        # T_CLAIM_ISOLATE (6.2, 6.3): one invalid claim is its own finding, and the valid claims still render.
+        led = [{"id": "a.good", "claim_kind": "scalar", "value": 5}]
+        bad = {"id": "b.ci", "claim_kind": "scalar", "value": 5, "ci_low": 6, "ci_high": 7}
+        out = {}
+        for name, cl in (("ws", led), ("iso", led + [bad])):
+            d = os.path.join(td, "a1_claims_" + name)
+            os.makedirs(os.path.join(d, "models"))
+            yaml.safe_dump({"claims": cl}, open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+            open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts [CLAIM: a.good ] cases.\n")
+            open(os.path.join(d, AB.SPEC_FILE), "w").write("{}\n")
+            render_report(d, NS(headline=lambda rd: {}))
+            out[name] = ({(f["kind"], f.get("key")) for f in report_claim_findings(d)},
+                         open(os.path.join(d, "report.md")).read())
+        ok(not {k for k, _ in out["ws"][0]} & {"report_claim_unresolved", "report_claim_unrendered", "report_claim_id_raw"},
+           f"T_CLAIM_WS a reference with spaces around its id is resolved ({out['ws'][0]})")
+        ok(("report_claim_invalid", "b.ci") in out["iso"][0] and "[CLAIM" not in out["iso"][1]
+           and not {k for k, _ in out["iso"][0]} & {"report_claims_unreadable", "report_claim_unrendered"},
+           f"T_CLAIM_ISOLATE an invalid claim is one finding; the valid claims render ({out['iso'][0]})")
+
+    # Narrow Codex review of #297, round 1 (each failed on 650b2417).
+    def r1_resume():
+        # CX1-3: a presentation review that spent the last of the cap, then a crash before the transition.
+        d, T, st = new_run("a1_cx3", {}, budget=20.0)
+        st.state, st.spent_usd = "PRESENTATION", 20.0
+        st.journal["PRESENTATION#0:r1"] = {"task": "critique", "status": "completed", "ok": True}
+        save_state(d, st)
+        mk(d, T, st).step()
+        s = load_state(d)
+        ok(s.state == "GATE" and s.forced_status is None and T.calls == [],
+           f"CX1-3 a completed presentation review is replayed on resume with the cap spent ({s.state}, {s.status})")
+
+    def r1_readback():
+        d, T, st = new_run("a1_cx4", {}, budget=20.0)
+        st.spent_usd = 16.5
+        st.journal["k1"] = {"task": "sign_spec", "status": "started", "allowance_usd": 3.0, "readback_usd": 0.25,
+                            "writeup": True}
+        save_state(d, st)
+        m = mk(d, T, st)
+        ok(abs(m.st.spent_usd - 19.75) < 1e-9, f"CX1-4 an interrupted write-up task is charged its read-back too "
+                                                f"({m.st.spent_usd})")
+        d, T, st = new_run("a1_cx4b", {}, budget=20.0)
+        st.spent_usd = 16.5
+        save_state(d, st)
+        m = mk(d, T, st)
+        m._task("k1", "sign_spec", d, writeup=True)
+        ok(m.st.journal["k1"].get("readback_usd") == READBACK_CAP_USD,
+           f"CX1-4b a write-up task's journal entry records its read-back allowance ({m.st.journal['k1']})")
+
+    def r1_open():
+        # CX1-5: a rendered report without its manuscript is a draft too (the gate's predicate): nothing is deferred.
+        d = os.path.join(td, "a1_cx5")
+        os.makedirs(d)
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "D-061", "severity": "MEDIUM", "category": "PRESENTATION", "target_stage": "ANALYZE", "claim": "c"}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        open(os.path.join(d, "report.md"), "w").write("# Report\n")
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
+        ok(got == ["D-061"], f"CX1-5 with report.md and no manuscript.md a PRESENTATION finding is not deferred ({got})")
+
+    def r1_rethink():
+        # CX1-7: a fix plan file that is not a plan does not stop a back-edge; a gate's own back-edge reads none.
+        d, T, st = new_run("a1_cx7", {})
+        st.state = "GATE"
+        save_state(d, st)
+        open(os.path.join(d, "fix_plan_r1.json"), "w").write('{"plan": ["stale"]}')
+        m = mk(d, T, st)
+        m._rethink("ENGINE_CHOICE", "test", planned=True)
+        ok(load_state(d).state == "ENGINE_CHOICE", "CX1-7 a malformed fix plan does not stop a RETHINK back-edge")
+
+    def r1_claims():
+        d = os.path.join(td, "a1_cx2")
+        os.makedirs(os.path.join(d, "models"))
+        yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5},
+                                   {"id": "b.unit", "claim_kind": "label", "value": "case"},
+                                   {"id": "b.ci", "claim_kind": "scalar", "value": 5, "ci_low": 6, "ci_high": 7}]},
+                       open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\na.good[CLAIM:b.unit]s and [CLAIM:b.ci].\n")
+        got = {(f["kind"], f.get("key")) for f in report_claim_findings(d)}
+        ok(("report_claim_id_raw", "a.good") in got, f"CX1-2 a bare id beside a reference is still reported ({got})")
+        ok(("report_claim_invalid", "b.ci") in got and ("report_claim_unresolved", "b.ci") not in got,
+           f"CX1-9 a reference to an invalid claim is reported once, as invalid ({got})")
+
+    # Narrow Codex review of #297, round 2 (each failed on b148196a).
+    def r2_machine():
+        d, T, st = new_run("a1_cx21", {})                    # CX2-1: no cap
+        m = mk(d, T, st)
+        m._task("k1", "sign_spec", d, writeup=True)
+        ok(m.st.journal["k1"].get("readback_usd") == READBACK_CAP_USD,
+           f"CX2-1 without a cap a write-up task's read-back allowance is recorded too ({m.st.journal['k1']})")
+        for name, setup, want in (
+                ("CX2-2 an unreadable ledger does not stop a RETHINK back-edge",
+                 lambda d: _put(d, FL.LEDGER, "not json\n"), None),
+                ("CX2-3 a structural mismatch any reviewer reports is among the reasons",
+                 lambda d: yaml.safe_dump({"structural_mismatch": {"detected": True, "description": "no age classes"},
+                                           "blockers": [{"id": "M-9", "category": "STRUCTURAL", "claim": "needs ages"}]},
+                                          open(os.path.join(d, "critique_methods.yaml"), "w")),
+                 "M-9: needs ages")):       # round 3 (5): the blocker's own text, whatever the ledger holds
+            d, T, st = new_run("a1_" + name[:5].replace("-", ""), {})
+            st.state = "GATE"
+            save_state(d, st)
+            setup(d)
+            try:
+                mk(d, T, st)._rethink("ENGINE_CHOICE", "test")
+            except Exception as e:  # noqa: BLE001
+                ok(False, f"{name}: {type(e).__name__}: {e}")
+                continue
+            s = load_state(d)
+            why = (s.tries.get("rethink_engine") or {}).get("why") or []
+            ok(s.state == "ENGINE_CHOICE" and (want is None or any(want in w for w in why)), f"{name} ({why})")
+
+    def r2_findings():
+        # CX2-4: with report.md alone the presentation review's findings are open findings, as its file is read.
+        d = os.path.join(td, "a1_cx24")
+        os.makedirs(os.path.join(d, "models"))
+        yaml.safe_dump({"reviewer": "critique-presentation", "round": 1, "blockers": [
+            {"id": "P-002", "severity": "MEDIUM", "category": "METHODS", "target_stage": "WRITE", "claim": "c"}]},
+            open(os.path.join(d, "critique_presentation.yaml"), "w"))
+        open(os.path.join(d, "report.md"), "w").write("# Report\n")
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
+        ok(got == ["P-002"], f"CX2-4 with report.md alone the presentation review's findings are read ({got})")
+        # CX2-9: a reference broken over two lines is not one the renderer accepts: still reported.
+        yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5}]},
+                       open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts [CLAIM:\na.good] cases.\n")
+        os.remove(os.path.join(d, "report.md"))
+        got = {f["kind"] for f in report_claim_findings(d)}
+        ok(got & {"report_claim_unresolved", "report_claim_id_raw"},
+           f"CX2-9 a reference broken over two lines is still reported ({got})")
+        # CX3-6 (round 3): an open finding whose test regressed is listed with its regression, as before the key.
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "D-071", "severity": "MEDIUM", "category": "METHODS", "target_stage": "ANALYZE", "claim": "c"}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        got = [o["id"] for o in open_findings(d, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
+            {"kind": "done_when_regressed", "key": "D-071", "severity": "HIGH", "claim": "c"}]})]
+        ok("done_when_regressed:D-071" in got and "D-071" in got, f"CX3-6 a regression is listed beside its finding ({got})")
+
+    def r3_presentation():
+        # CX3-1: documented behaviour, pinned (the base does this in an uninterrupted run).
+        class NoReview(StubTasks):
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                return self._r(f"critique:{reviewer}:{round_n}", False, note="no review written")
+        states = []
+        for name, journal in (("live", None), ("replay", {"task": "critique", "status": "completed", "ok": False})):
+            d, T, st = new_run("a1_cx31" + name, {}, budget=20.0)
+            st.state, st.spent_usd = "PRESENTATION", 20.0 if journal else 16.5
+            if journal:
+                st.journal["PRESENTATION#0:r1"] = journal
+            save_state(d, st)
+            mk(d, NoReview(T.s), st).step()
+            states.append(load_state(d).state)
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
+        for r in CRITICS:
+            StubTasks({}).critique(d, r, 1)
+        kinds = [(v.get("kind"), v.get("severity")) for v in v2_gate(d, 1, 3, True, [], history=False).get("rigor_violations") or []]
+        ok(states == ["GATE", "GATE"] and ("critique_presentation_missing", "MEDIUM") in kinds,
+           f"CX3-1 a failed presentation task goes to the gate, live and replayed alike; the gate reports the missing "
+           f"review ({states}, {kinds})")
+
+    for name, fn in (("T_PRES_BUDGET", budget), ("T_PW_GATE", post_write), ("F_HARNESS_IDS", ids),
+                     ("T_RETHINK", rethink), ("T_CLAIM", claims), ("CX1-3", r1_resume), ("CX1-4", r1_readback),
+                     ("CX1-5", r1_open), ("CX1-7", r1_rethink), ("CX1-2", r1_claims), ("CX2-1", r2_machine),
+                     ("CX2-4", r2_findings), ("CX3-1", r3_presentation)):
+        case(name, fn)
 
 
 def _self_test_resume(ok, td: str, spike, new_run) -> None:
