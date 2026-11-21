@@ -859,11 +859,10 @@ def _self_test_benchmark_gate(ok) -> None:
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             e = schema.validate(schema.load(p), pending_ok=True)
             ok(e == [], f"G4 the spec with a proposed departure validates before sign-off ({e[:2]})")
-            try:
-                signoff.sign(run, "lead")
-                ok(False, "G5e a lead cannot sign a spec whose engine needs a departure")
-            except ValueError as ex:
-                ok("owner" in str(ex), f"G5e a lead cannot sign a spec whose engine needs a departure ({str(ex)[:100]})")
+            from toolkit.spec import preconditions as PC
+            le = [x for x in PC.problems(run, open(p, "rb").read(), "lead", spec=schema.load(p)) if "benchmark" in x]
+            ok(le == [], f"G5e (D2) a lead may sign a spec whose engine needs a departure: it counts as provisional "
+                         f"({le[:1]})")
             signoff.sign(run, "owner")
             r = eligible_engines(dict(spec_ab, _run_dir=run), entry)[0]
             ok(r["eligible"] and r["departures"] == [dict(dep, status="signed", benchmark_status="out_of_band",
@@ -882,9 +881,9 @@ def _self_test_benchmark_gate(ok) -> None:
             json.dump(dict(rec0, signed_by="lead"), open(so, "w"))
             r = eligible_engines(dict(spec_ab, _run_dir=run), entry)[0]
             e = schema.validate(schema.load(p))
-            ok(not r["eligible"] and any("engine benchmarks" in x for x in e),
-               f"G5f a spec signed by the lead: its departure counts neither at the engine choice nor at the "
-               f"analysis's validation ({e[:1]})")
+            ok(r["eligible"] and [x.get("status") for x in r["departures"]] == ["provisional_lead"] and e == [],
+               f"G5f (D2) a spec signed by the lead: its departure counts at the engine choice and at the analysis's "
+               f"validation, as provisional_lead ({r.get('why_not', [])[:1]}, {e[:1]})")
             json.dump(rec0, open(so, "w"))
             with open(p, "a") as f:
                 f.write("\n# edited after sign-off\n")

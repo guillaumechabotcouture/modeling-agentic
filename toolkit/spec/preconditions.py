@@ -637,10 +637,14 @@ def _self_test() -> int:
         run_lead = _net_effect_posterior("/somewhere", sp, None)
         _BC.signature = lambda run_dir, by=None: "signed"
         run_owner = _net_effect_posterior("/somewhere", sp, None)
+        _BC.signature = lambda run_dir, by=None: "provisional_lead"
+        run_prov = _net_effect_posterior("/somewhere", sp, None)
     finally:
         _BC.signature = orig_sig
     ok(any("owner" in x and "exception" in x for x in run_lead) and not any("exception" in x for x in run_owner),
        f"PC13 at execution, a run whose recorded sign-off is not the owner's refuses the exception ({run_lead[:1]})")
+    ok(any("owner" in x and "exception" in x for x in run_prov),
+       f"PC14 (D2) a lead's provisional signature credits departures, never a posterior exception ({run_prov[:1]})")
     ok(any("owner" in x and "exception" in x for x in lead) and not any("exception" in x for x in owner),
        f"PC12 a net-effect posterior exception signed by someone other than the owner is refused ({lead[:1]})")
     if fails:

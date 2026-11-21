@@ -646,6 +646,15 @@ def _self_test() -> int:
        and any("unknown field" in p for p in departure_problems({"engine_departures": [
            dict(dep, no_decision_test_because="none")], "analysis": {"decision_tests": [{"id": "DT"}]}})),
        "BC9 a departure must name an existing decision test; no reason-for-none escape")
+    # D2 (owner default, autonomy 1B-iii): under --signoff lead a departure counts, as provisional_lead
+    yes = lambda *a: (True, "")  # noqa: E731
+    gp = gate(cov, [], "e", both, rec, [dep], "provisional_lead", runs=yes)
+    gu = gate(cov, [], "e", both, rec, [dep], "unsigned", runs=yes)
+    ok(gp["why_not"] == [] and [d.get("status") for d in gp["departures"]] == ["provisional_lead"]
+       and any("not signed" in w for w in gu["why_not"]),
+       f"G_LEAD_PROV_DEP a lead-signed spec's departure counts as provisional_lead; an unsigned one still does not "
+       f"({gp['why_not'][:1]}, {gu['why_not'][:1]})")
+    _self_test_lead(ok, dep)
     # review round 2: every declared effect parameter exists in the engine version its record is for
     from toolkit.engines.malaria.engine import MalariaEngine
     me = MalariaEngine()
@@ -661,6 +670,34 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_lead(ok, dep):
+    """G_LEAD_SIG, G_LEAD_RESULTS (D2): a lead's signature of the unchanged spec is "provisional_lead"; results.md
+    names such departures as provisional, the lead's, not reviewed by the owner."""
+    import json
+    import tempfile
+    from toolkit.spec import signoff
+    with tempfile.TemporaryDirectory() as d:
+        sp = os.path.join(d, signoff.SPEC)
+        open(sp, "w").write("question: q\n")
+        sha = hashlib.sha256(open(sp, "rb").read()).hexdigest()
+        rec = lambda by: json.dump({"signed_by": by, "sha256": {signoff.SPEC: sha}},  # noqa: E731
+                                   open(os.path.join(d, signoff.SPEC_SIGNOFF), "w"))
+        rec("lead")
+        lead, lead_md = signature(d), "\n".join(results_lines({"engine_departures": [dep]}, d))
+        rec("owner")
+        owner, owner_md = signature(d), "\n".join(results_lines({"engine_departures": [dep]}, d))
+        rec("lead")
+        open(sp, "a").write("# edited\n")
+        edited = signature(d)
+    ok(lead == "provisional_lead" and owner == "signed" and edited == "unsigned"
+       and signature(None, by="lead") == "provisional_lead" and signature(None, by="owner") == "proposed",
+       f"G_LEAD_SIG a lead's signature of the unchanged spec is provisional_lead; the owner's is signed; an edited "
+       f"spec counts none ({lead}, {owner}, {edited})")
+    ok("Provisional engine departures" in lead_md and "not reviewed" in lead_md and "owner" in lead_md
+       and "Provisional" not in owner_md and "signed by the owner" in owner_md,
+       "G_LEAD_RESULTS results.md names a lead's departures as provisional, not reviewed by the owner")
 
 
 def _self_test_posterior(ok, cov, both):
