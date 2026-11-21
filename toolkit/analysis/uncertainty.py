@@ -549,7 +549,9 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
             row[f"{o}_averted"] = v
         row[headline_name] = row[f"{hl_outcome}_averted"]
         fixed_cost.append(sum(cost[i][plan[i]] for i in A.ids))
-        sol = A.solve(ben, cost)
+        from toolkit.analysis.core import auxiliary, best_known
+        with auxiliary(A, "uncertainty_draws"):      # 1C-c: a feasible plan within the stated gap is used and counted
+            sol = best_known(A, A.solve(ben, cost), plan, ben, cost)      # never below a feasible point plan
         A.guard(f"uncertainty draw {d}", [plan, sol["choice"]], r["events"])
         if on_solve is not None:
             on_solve(d, sampled, ben, cost, sol, r["events"])
