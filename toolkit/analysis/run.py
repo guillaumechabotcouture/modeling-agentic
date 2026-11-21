@@ -2449,6 +2449,32 @@ def _self_test_solver(ok, A, R):
            and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, True) is None,
            "SG8 (Codex r2 P1) nothing is kept for a table value or budget that is not a number, so the allocator's "
            "own input check is never skipped")
+        # 1C-c follow-up: the better of an accepted incumbent and the point plan, with the gap as a bound
+        plan0 = dict(R["point"]["plan"])
+        obj0 = sum(ben0[i][plan0[i]] for i in A.ids)
+        worse = dict(a1, status="feasible", gap=0.005, objective=obj0 - 1.0, choice={i: A.comp for i in A.ids})
+        b1 = CO.best_known(A, worse, plan0, ben0, cost0)
+        b2 = CO.best_known(A, dict(a1, status="feasible", gap=0.005), plan0, ben0, cost0)
+        ok(b1["choice"] == plan0 and b1["objective"] == obj0 and b1["solver_gap"]["kept"] == "point_plan"
+           and 0 <= b1["solver_gap"]["bound"] < b2["solver_gap"]["bound"] + 1.0 and b2["solver_gap"]["kept"] == "incumbent"
+           and b2["solver_gap"]["gap"] == 0.005 and b2["solver_gap"]["bound"] > 0
+           and "solver_gap" not in CO.best_known(A, a1, plan0, ben0, cost0),
+           f"SG9 an accepted incumbent below the point plan gives way to it; the bound to the optimum is recorded; a "
+           f"proven solve is returned as it is ({b1.get('solver_gap')}, {b2.get('solver_gap')})")
+        from toolkit.analysis import decision_tests as DTg
+        CO.aopt.solve, A.solve_memo, lg1 = fake(0.001), {}, {k: dict(v) for k, v in A.solver_log.items()}
+        tg = DTg.run_one(A, {"id": "DTg", "type": "envelope", "text": "t",
+                             "values": [float(A.spec["constraints"]["envelope_usd"])]},
+                         z0, ben0, cost0, plan0, R["uncertainty"])
+        CO.aopt.solve, A.solve_memo, A.solver_log = real, {}, lg1
+        rg = (tg.get("results") or [{}])[0].get("regret_solver_gap") or {}
+        ok(tg["status"] == "run" and rg.get("gap") == 0.001 and rg.get("bound", 0) > 0 and tg["results"][0]["regret"] >= 0
+           and DTg.verdict(tg) == ("WITHIN_SOLVER_GAP" if tg.get("within_solver_gap") else "NO_CHANGE")
+           and DTg.verdict(dict(tg, within_solver_gap=True, decision_changes=True)) == "WITHIN_SOLVER_GAP"
+           and DTg.verdict(dict(tg, within_solver_gap=False, decision_changes=True)) == "CHANGES_PLAN"
+           and DTg.verdict({"status": "not_run"}) == "NOT_RUN",
+           f"SG10 a decision test solved to an accepted incumbent records the gap beside its regret, and a verdict "
+           f"inside it reads WITHIN_SOLVER_GAP ({rg}, {tg.get('within_solver_gap')})")
         rep = A.solver_report()
         ok(rep["gap_rel"] == st["gap_rel"] and rep["headline"]["solves"] >= 1
            and rep["auxiliary_total"] == {"solves": 3, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 2},

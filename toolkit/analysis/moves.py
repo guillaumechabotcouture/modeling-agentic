@@ -400,6 +400,33 @@ def _self_test() -> int:
     ok(e14 is None and ag12["regret_share"] == 0.5 and ag12["regret"] == 100.0 and w12["regret"]["value"] == "B"
        and w12.get("regret_abs", {}).get("value") == "A",
        f"MV23 the percentage and the absolute regret maxima come from their own values ({e14!r}, {list(w12)})")
+    # 1C-c follow-up: regret against a plan the solver accepted without proving it carries the accepted gap as a bound
+    sg_fn = globals().get("solver_gap")
+    thr_ = {"share": 0.1, "regret": 0.01, "dollars": 0.05}
+    base = {"regret": 0.5, "regret_share": 0.005, "reoptimised_objective": 100.0, "share_units_changed": 0.0,
+            "dollars_share": 0.0, "decision_changes": False, "triggered_by": []}
+    sg = {"gap": 0.008, "bound": 1.0, "kept": "incumbent"}
+    r1, e15 = attempt(sg_fn, dict(base), sg, thr_)
+    ok(e15 is None and r1["within_solver_gap"] is True and r1["decision_changes"] is False and r1["regret"] == 0.5
+       and r1["regret_solver_gap"]["bound"] == 1.0 and r1["regret_solver_gap"]["gap"] == 0.008
+       and r1["regret_solver_gap"]["clipped"] is False,
+       f"MV24 a regret that crosses its threshold inside the accepted gap is marked within_solver_gap, with the bound "
+       f"beside it; the computed verdict is left as it is ({e15!r}, {r1})")
+    r2, e16 = attempt(sg_fn, dict(base, regret=-0.2, regret_share=-0.002), dict(sg, bound=0.1), thr_)
+    ok(e16 is None and r2["regret"] == 0.0 and r2["regret_share"] == 0.0 and r2["regret_solver_gap"]["clipped"] is True
+       and r2["within_solver_gap"] is False,
+       f"MV25 a regret below zero against an unproven plan is clipped at zero and noted ({e16!r}, {r2})")
+    r3, e17 = attempt(sg_fn, dict(base, regret=0.3, regret_share=0.003, share_units_changed=0.5, decision_changes=True,
+                                  triggered_by=["share"]), sg, thr_)
+    r4, _ = attempt(sg_fn, dict(base, regret=5.0, regret_share=0.05, decision_changes=True, triggered_by=["regret"]),
+                    sg, thr_)
+    r5, _ = attempt(sg_fn, dict(base), None, thr_)
+    r6, _ = attempt(sg_fn, dict(base, regret=None, regret_share=None, decision_changes=True,
+                                triggered_by=["infeasible"]), sg, thr_)
+    ok(e17 is None and r3["within_solver_gap"] is True and r4["within_solver_gap"] is False and r5 == base
+       and r6["within_solver_gap"] is False and r6["regret"] is None,
+       "MV26 a change whose advantage over the point plan is inside the bound is within the gap; a regret well above "
+       "it, a proven solve, and a point plan the test makes infeasible are not")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

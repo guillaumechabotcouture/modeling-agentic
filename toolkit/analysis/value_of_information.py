@@ -1311,6 +1311,31 @@ def _self_test() -> int:
                       ("E5", e5), ("F1", f1), ("F2", f2), ("F3", f3), ("F4", f4), ("F5", f5), ("F6", f6),
                       ("G1", g1), ("G2", g2), ("G3", g3), ("VG gate", gate)):
         run_case(label, fn)
+    # 1C-c follow-up (Codex r2 P1): both solves of a draw's clean plan are auxiliary solves, counted the same way
+    from toolkit.analysis.core import AnalysisBlocked as _AB
+
+    class _Cl:
+        aux, comp, feas = None, "none", {"feasible": {"u": {"none": True, "a": True, "b": True}}}
+
+        def __init__(self):
+            self.seen, self.guards = [], 0
+
+        def solve(self, ben, cost, budget=None, feas=None):
+            self.seen.append((self.aux, None if feas is None else feas["feasible"]["u"]["a"]))
+            return {"choice": {"u": "a" if feas is None else "b"}, "objective": 1.0}
+
+        def guard(self, where, plans, events=None):
+            self.guards += 1
+            if self.guards == 1:
+                raise _AB(where, [{"unit": "u", "package": "a", "kind": "clip"}])
+    cl = _Cl()
+    try:
+        got = clean_solve(cl, {"u": {}}, {"u": {}}, 1.0, [{"unit": "u", "package": "a", "kind": "clip"}], 0)
+        ok(cl.seen == [("value_of_information", None), ("value_of_information", False)] and got["choice"] == {"u": "b"}
+           and cl.aux is None,
+           f"VC1 the retry without the corrected package is an auxiliary solve too: {cl.seen}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"VC1 the retry without the corrected package is an auxiliary solve too ({type(e).__name__}: {e})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
