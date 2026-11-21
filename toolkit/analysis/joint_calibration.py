@@ -402,7 +402,8 @@ def declared_test_problems(dec, dts) -> list:
     ran = {str(t.get("test_id")) for t in dts or [] if isinstance(t, dict) and t.get("status") == "run"}
     return [f"declared calibration miss {x.get('target') or x.get('offset')}: its decision test "
             f"{x.get('decision_test')} did not run" for x in (dec or {}).get("declared") or []
-            if str(x.get("decision_test")) not in ran]
+            if str(x.get("decision_test")) not in ran and not x.get("auto")]     # W0-F: an automatic one goes to the
+    # owner when its test did not run (toolkit/analysis/conflicts.py record), never a block
 
 
 def _sensitivity_problems(s, targets, w) -> list:
@@ -1524,7 +1525,8 @@ def run(spec, run_dir, compute_kw=None, log=print, units=None, prior_dir=None, w
                                   if t["kind"] != "benchmark"},
                       "discrepancy_sd": j.get("discrepancy_sd"),
                       "note": "the primary setting; declared sensitivities are reported beside it, never as a block"}
-    rep["unmatched_decision"] = unmatched_decision(spec, rep)
+    from toolkit.analysis import conflicts as CF       # W0-F: conflicts.policy declare_and_test
+    rep["unmatched_decision"] = CF.declare(spec, rep, unmatched_decision(spec, rep))
     if j.get("sensitivity"):
         rep["sensitivity"] = run_sensitivities(spec, rep, run_dir, compute_kw, log, units)
     return rep

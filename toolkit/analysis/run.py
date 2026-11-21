@@ -120,10 +120,25 @@ def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> 
     return {"solution": sol, "reserve": reserve, "pre": pre}
 
 
+def _stop_where(e) -> str | None:
+    """The step of a stop the toolkit declares besides AnalysisBlocked (a refused calibration, calibration input,
+    burden anchor or engine batch; a solver defect), else None: any other error is a crash and is not recorded (once
+    the run's store exists, no manifest is left; before that, nothing in the run dir is touched)."""
+    from toolkit.alloc.optimize import OptimizerError
+    from toolkit.analysis.burden import AnchorError
+    from toolkit.calibration.history_matching import CalibrationInputError
+    for cls, where in ((C.CalibrationRefused, "calibration"), (CalibrationInputError, "calibration"),
+                       (AnchorError, "burden_anchor"), (OptimizerError, "optimizer"), (Bt.BatchRefused, "batch")):
+        if isinstance(e, cls):
+            return where
+    return None
+
+
 def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None = None, draws=None,
         unsigned: bool = False, log=print, compute_kw: dict | None = None) -> dict:
     """The analysis. A step whose model corrections bear on a plan stops it: analysis/blocked.yaml records where and
-    which, and the manifest is published with status blocked (never complete)."""
+    which, and the manifest is published with status blocked (never complete). A stop the toolkit declares by its
+    own exception (`_stop_where`) is recorded the same way, with the exception's name and code, and raised again."""
     holder = {}
     try:
         return _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder)
@@ -136,6 +151,20 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
                     [holder["calibration"]] if holder.get("calibration") else [])
             S.finalize("blocked", f"{e.where}: {e.reason}" if e.reason else
                        f"{e.where}: {len(e.hits)} model corrections bear on the plan")
+        raise
+    except Exception as e:  # noqa: BLE001 -- recorded when it is a declared stop, and always raised again
+        S, where = holder.get("S"), _stop_where(e)
+        if S is not None and where is not None:
+            try:
+                S.write("blocked", {"reason": str(e)[:4000], "where": where, "corrections": [], "n_on_plan": 0,
+                                    "exception": type(e).__name__, "code": getattr(e, "code", None)}, PRODUCER,
+                        [holder["calibration"]] if holder.get("calibration") else [])
+                S.finalize("blocked", f"{where}: {type(e).__name__}: {e}"[:2000])
+            except Exception as w:  # noqa: BLE001 -- the stop itself is what the caller must see
+                try:
+                    log(f"  the stop could not be recorded ({type(w).__name__}: {w}); no manifest is published")
+                except Exception:  # noqa: BLE001 -- nor does a failing log replace it
+                    pass
         raise
 
 
@@ -270,6 +299,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if jc is not None:
         A.set_joint(jc)
         A.flagged = {f["unit"]: f for f in jc["unmatched_decision"]["flagged"]}
+        from toolkit.analysis import conflicts as CF
+        A.conflict_tests = CF.tests(jc["unmatched_decision"].get("conflicts"))
     from toolkit.analysis import variants as V
     V.apply_headline(A)     # F6 S1-6: `headline: <variant>`: every solve from here carries the variant's rule
     # ---- calibration
@@ -332,7 +363,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # Codex r3: the analysis's full engine identity (code, params, config), on both evaluation paths, so later steps
     # (the trajectory step) can be checked against it without batch rows
     point.update(engine_identity=engine_identity(eng))
-    point.update(plan=plan, n_units=len(A.ids), solver={k: sol[k] for k in ("status", "method", "objective", "cost")},
+    point.update(plan=plan, n_units=len(A.ids),
+                 # 1C-c (D3): the status and the relative gap it was proven within, with the threads and time limit
+                 solver={**{k: sol[k] for k in ("status", "method", "objective", "cost")},
+                         **{k: sol.get(k) for k in ("gap_rel", "threads", "time_limit_s", "solver_status")}},
                  interactions=interactions(A, out0), rule=decision_rule(A, out0, plan),
                  model_corrections={"n": len(events0), "on_plan": on_plan, "kinds": sorted({e["kind"] for e in events0}),
                                     "examples": events0[:20]},
@@ -418,6 +452,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     arts["decision_tests"] = S.write("decision_tests", {"tests": [
         {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
+         # 1C-c follow-up: the verdict words are unchanged (tools/workbench and tools/run_console read exactly these
+         # three); a verdict that cannot be settled within the solver's accepted gap is marked beside it
+         "within_solver_gap": bool(x.get("within_solver_gap")),
          "can_move_plan": x["can_move_plan"], "threshold_pct": 100.0 * x["share_threshold"],
          "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
          # F6 S1-5: what moves beside the share, and which criterion changed the plan
@@ -431,7 +468,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   "units_changed_by_group", "dollars_by_component")},
          "statement": x["statement"], "detail": {k: x[k] for k in ("engine_arm_or", "engine_interaction",
                                                     "rejected_values", "reachable_interaction", "unit_attribute",
-                                                    "burden_scale", "outcome_ratio")
+                                                    "burden_scale", "outcome_ratio", "with")
                                     if k in x}} for x in dts]}, DT.PRODUCER,
         [arts["point"], arts["uncertainty"]] + eng_files
         + sorted({os.path.join(run_dir, f) for x in dts for f in (x.get("arm_inputs") or {})})
@@ -440,6 +477,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
+    conf = (jc or {}).get("unmatched_decision", {}).get("conflicts") if jc is not None else None
+    if conf is not None:      # W0-F: each held-out target, why, its tests' verdicts; who decides (empty: none)
+        from toolkit.analysis import conflicts as CF
+        crec = CF.record(conf, dts, refit=CF.refit_estimate(jc))
+        arts["conflicts"] = S.write("conflicts", crec, CF.PRODUCER, [arts["joint_calibration"], arts["decision_tests"]])
+        log(f"conflicts: {len(crec['declared'])} target(s) held out and tested; {len(crec['needs_owner'])} need the owner")
     # ---- deliverable CSV
     d = spec["deliverable"]
     cols = d["columns"]
@@ -494,6 +537,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
+    S.manifest["solver"] = A.solver_report()       # 1C-c: settings, and the counts contract.py's gate check reads
     S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS)
                               + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
                               + (["burden_validation"] if bvd else []) + (["burden_anchor"] if anc else [])
@@ -706,6 +750,11 @@ def _self_test() -> int:
            "R10 uncertainty_report.yaml carries the headline output and the structured interval")
         txt = open(os.path.join(d, "results.md")).read()
         ok("[CLAIM:" not in txt and R["uncertainty"]["label"] in txt, "R11 results.md is fully rendered from the ledger")
+        sv_ = (json.load(open(os.path.join(d, "analysis", "manifest.json"))).get("solver") or {})
+        ok((sv_.get("headline") or {}).get("solves", 0) >= 1 and (sv_.get("auxiliary_total") or {}).get("solves", 0) > 0
+           and sv_["auxiliary_total"]["not_solved"] == 0 and "relative gap" in txt,
+           f"R11b (1C-c) the manifest records the solver settings and counts, and results.md states the gap the plan "
+           f"is proven within: {sv_.get('auxiliary_total')}")
         dsec = txt[txt.index("## Decision tests"):]
         ok(all(not ch.isdigit() for ch in dt["statement"]) and "[CLAIM" not in dsec,
            "R11b decision-test statements are words; their numbers are claims (Codex P1-4)")
@@ -846,6 +895,7 @@ def _self_test() -> int:
         finally:
             del ToyEngine.fitted_path
             EPm.benchmark_pack = orig_bp
+        _self_test_stop_records(ok, d, q)
         _self_test_round2(ok, d, q)
         _self_test_reserve_e2e(ok, d, q)
         _self_test_floors_e2e(ok, d, q)
@@ -905,6 +955,76 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_stop_records(ok, d, q):
+    """v2 autonomy 1C-a (item 4.7): every stop the toolkit declares (a refused calibration, calibration input, anchor,
+    batch, or a solver defect) leaves analysis/blocked.yaml and a manifest with status blocked, then raises as before;
+    any other error leaves no manifest."""
+    import yaml
+    from toolkit.alloc.optimize import OptimizerError
+    from toolkit.analysis import contract
+    from toolkit.analysis.burden import AnchorError
+    from toolkit.calibration.history_matching import CalibrationInputError
+    cases = [(None, lambda: KeyError("planted")),
+             ("calibration", lambda: C.CalibrationRefused("posterior_ess", "planted")),
+             ("calibration", lambda: CalibrationInputError(["planted"])),
+             ("burden_anchor", lambda: AnchorError("planted")),
+             ("optimizer", lambda: OptimizerError("planted")),
+             ("batch", lambda: Bt.BatchRefused("batch_stale", "planted"))]
+    orig = EmulatorModel.predict
+    bp = os.path.join(d, "analysis", "blocked.yaml")
+    # Codex r1: a record that cannot be written, with a log that fails too, never replaces the stop the caller sees
+    exc = Bt.BatchRefused("batch_stale", "planted")
+
+    def planted2(self, zs, theta, ids, noise=None):
+        raise exc
+
+    def no_final(self, status, reason=""):
+        raise OSError("planted: no space")
+
+    def bad_log(*a, **k):
+        if "could not be recorded" in " ".join(str(x) for x in a):
+            raise OSError("planted: log")
+    orig_fin = Store.finalize
+    EmulatorModel.predict, Store.finalize = planted2, no_final
+    try:
+        run(d, log=bad_log, compute_kw={"max_workers": 2}, draws=2)
+        got = None
+    except Exception as e:  # noqa: BLE001 -- the planted stop
+        got = e
+    finally:
+        EmulatorModel.predict, Store.finalize = orig, orig_fin
+    ok(got is exc and {x["kind"] for x in contract.gate_findings(d)} == {"analysis_contract_missing"},
+       f"RUN_BLOCKED_UNRECORDED a stop whose record and log both fail is still the error raised, with no manifest "
+       f"({type(got).__name__}: {got})")
+    for where, make in cases:       # the last case is a declared stop: the rerun below starts from its blocked record
+        exc = make()
+
+        def planted(self, zs, theta, ids, noise=None, _e=exc):
+            raise _e
+        EmulatorModel.predict = planted
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+            got = None
+        except Exception as e:  # noqa: BLE001 -- the planted stop, raised again by run()
+            got = e
+        finally:
+            EmulatorModel.predict = orig
+        name = type(exc).__name__
+        kinds = {x["kind"] for x in contract.gate_findings(d)}
+        blk = (yaml.safe_load(open(bp))["data"] if os.path.exists(bp) else {})
+        if where is None:
+            ok(got is exc and kinds == {"analysis_contract_missing"} and blk.get("exception") != name,
+               f"RUN_BLOCKED_OTHER an error that is not a declared stop ({name}) leaves no manifest and no blocked "
+               f"record of its own ({kinds})")
+            continue
+        ok(got is exc and kinds == {"analysis_contract_blocked"} and blk.get("exception") == name
+           and blk.get("where") == where and "planted" in str(blk.get("reason")),
+           f"RUN_BLOCKED_CAL {name} is raised again after analysis/blocked.yaml and a blocked manifest record it "
+           f"({kinds}, {({k: blk.get(k) for k in ('where', 'exception', 'reason')})})")
+    run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+    ok(contract.gate_findings(d) == [], "RUN_BLOCKED_RERUN a rerun after a recorded stop publishes a complete manifest")
 
 
 def _self_test_moves(ok, d, R):
@@ -1313,6 +1433,32 @@ def _self_test_joint(ok, q):
                "low-confidence with its reason in the allocation file, the point, the uncertainty report and label")
         except AnalysisBlocked as e:
             ok(False, f"JR8 flag mode proceeds (blocked: {e})")
+    with tempfile.TemporaryDirectory() as d:     # W0-F: an unpredicted miss under conflicts.policy declare_and_test
+        sp = JC._toy_joint(d, unreachable="5", group=False)
+        raw = yaml.safe_load(open(sp))
+        raw["conflicts"] = {"policy": "declare_and_test"}
+        raw["uncertainty"]["priors"]["base"]["range"] = [0.45, 0.55]       # as JR8 (a toy property)
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            cf = yaml.safe_load(open(os.path.join(d, "analysis", "conflicts.yaml")))["data"]
+            dtx = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"]["tests"]
+            ids = [t["test_id"] for t in dtx if t["test_id"].startswith("conflict_")]
+            ok([c["key"] for c in cf["declared"]] == ["5"] and len(ids) == 2 and cf["needs_owner"] == ["5"],
+               f"JR-CF1 an undeclared unit miss is held out, tested twice, the run completes, and a test that cannot run "
+               f"puts it to the owner ({[(c['key'], c['verdicts']) for c in cf['declared']]}, {ids})")
+        except AnalysisBlocked as e:
+            ok(False, f"JR-CF1 the policy declares the miss and the run continues (blocked: {e})")
+        raw["conflicts"] = {"policy": "stop"}
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        os.remove(os.path.join(d, signoff.SPEC_SIGNOFF))
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR-CF2 conflicts.policy stop keeps today's behaviour (the miss blocks)")
+        except AnalysisBlocked:
+            ok(True, "JR-CF2 conflicts.policy stop keeps today's behaviour (the miss blocks)")
     with tempfile.TemporaryDirectory() as d:
         JC._toy_joint(d)
         signoff.sign(d, "lead", note="self-test")
@@ -1630,7 +1776,7 @@ def _self_test_stability_flagged(ok):
             self.ids = list(ids)
             self.by_id = {i: {"g": f"g{n % 3}", "x": xs[i], "pop": 1.0} for n, i in enumerate(ids)}
             self.spec = {"analysis": {"stability": {"holdout_group": "g", "covariates": ["x"]}},
-                         "options": {"components": {"c": {}}}}
+                         "options": {"components": {"c": {}}}, "calibration": {"range": [-1e6, 1e6]}}
             self.flagged, self.seen = flagged, {}
 
         def evaluate(self, theta, zh, hid):
@@ -1666,6 +1812,71 @@ def _self_test_stability_flagged(ok):
            f"JR9b folds without unflagged training units are not_run and the metrics skip them ({r['verdict']})")
     except Exception as e:  # noqa: BLE001
         ok(False, f"JR9b folds without unflagged training units are not_run ({type(e).__name__}: {e})")
+    # 1C-b 2c-i (STAB_CLAMP): a held-out prediction outside calibration.range is clamped to it and counted
+    far = _A(ids, dict(xs, u11=1000.0), {})
+    far.spec["calibration"] = {"range": [0.0, 1.5]}
+    try:
+        r = SB.run(far, z0, plan, ben, cost, plan)
+        ok(max(far.seen.values()) <= 1.5 and min(far.seen.values()) >= 0.0 and r.get("predictions_clamped", 0) >= 1
+           and sum(f.get("predictions_clamped", 0) for f in r["folds"]) == r.get("predictions_clamped"),
+           f"JR9c a held-out prediction outside calibration.range is clamped and counted "
+           f"({r.get('predictions_clamped')} clamped; largest evaluated {max(far.seen.values()):.3g})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9c a held-out prediction outside calibration.range is clamped ({type(e).__name__}: {e})")
+    # 1C-b 2c-ii: a fold whose refit is refused is not_run with the refusal's code; the other folds still run
+    lik = _A(ids, xs, {})
+    lik.method, lik.lik = "likelihood", {"x": {}, "params": [], "z": {}}
+    lik.evaluate = lambda theta, zh, hid=None: ({}, {i: [1.0, 0.5] for i in ids}, ct(ids))
+    saved = SB.C.read_targets, SB.C.fit_likelihood
+
+    def fit(spec, model, rows=None, fixed_z=None, **kw):
+        if "u0" in fixed_z:
+            raise SB.C.CalibrationRefused("calibration_ridge", "toy: the fold's fit is refused")
+        return {"theta": {}, "z": {i: z0[i] for i in ids if i not in fixed_z}}
+    lik.model = None
+    try:
+        SB.C.read_targets, SB.C.fit_likelihood = (lambda spec: [{"unit": i} for i in ids]), fit
+        r = SB.run(lik, z0, plan, ben, cost, plan)
+        nr = r["folds_not_run"]
+        ok(r["n_folds"] == 2 and len(nr) == 1 and nr[0]["group"] == "g0" and "calibration_ridge" in nr[0]["reason"],
+           f"JR9d a fold whose calibration is refused is not_run with the reason; the other folds run ({nr})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9d a fold whose calibration is refused is not_run ({type(e).__name__}: {e})")
+    finally:
+        SB.C.read_targets, SB.C.fit_likelihood = saved
+    # 1C-c (D3): a fold whose re-solve fails is not_run with the solver's status; the other folds run
+    from toolkit.analysis import core as CO
+    flaky, n_ = _A(ids, xs, {}), {"k": 0}
+
+    def solve1(ben_, cost_):
+        n_["k"] += 1
+        if n_["k"] == 1:
+            raise CO.SolveFailed("feasible", 0.5)
+        return {"choice": {i: 0 for i in ids}, "objective": sum(ben_[i][0] for i in ids)}
+    try:
+        flaky.solve = solve1
+        r = SB.run(flaky, z0, plan, ben, cost, plan)
+        nr = r["folds_not_run"]
+        ok(r["n_folds"] == 2 and len(nr) == 1 and "optimizer status feasible" in nr[0]["reason"],
+           f"JR9f a fold whose re-solve is not proven within the gap is not_run with the solver's status ({nr})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9f a fold whose re-solve fails is not_run ({type(e).__name__}: {e})")
+    # Codex r1 P1-2: a fold the solver proves infeasible still stops the step, as before
+    def none_fits(ben_, cost_):
+        raise CO.SolveFailed("infeasible")
+    try:
+        flaky.solve = none_fits
+        SB.run(flaky, z0, plan, ben, cost, plan)
+        ok(False, "JR9g a fold the solver proves infeasible still stops the stability step")
+    except RuntimeError as e:
+        ok(str(e) == "optimizer status infeasible", f"JR9g a fold the solver proves infeasible still stops the step ({e})")
+    # 1C-b 2d-iii: quantiles of a sample with a non-finite value are refused (were all NaN)
+    from toolkit.analysis.core import q as _q
+    try:
+        ok(False, f"JR9e quantiles of a sample with a non-finite value are refused: {_q([1.0, float('nan'), 3.0])}")
+    except ValueError as e:
+        ok("not finite" in str(e) and _q([1.0, 2.0, 3.0])["median"] == 2.0 and _q([]) is None,
+           f"JR9e quantiles of a sample with a non-finite value are refused ({e})")
 
 
 def _self_test_priors(ok, q):
@@ -1742,7 +1953,7 @@ def _self_test_priors(ok, q):
            f"(Codex r2 P1), and the comparator burden and cost outputs have theirs (F6 S2-4): {err and len(err.cols)} "
            "columns")
         ok(em["columns_by_quantity"].get("comparator") == len(M.pops) * len(M.outcomes)
-           and "emulator_error_floors" in u,
+           and "emulator_error_floors" in u and "counts" in (u.get("emulator_error_clips") or {}),
            f"RP9b the report counts the error columns by quantity and the uncertainty records cost floors (F6 S2-4): "
            f"{em['columns_by_quantity']}")
         design.pop("prior_names")
@@ -1998,6 +2209,7 @@ def _self_test_test_ranges(ok, q):
     """A parameter_value decision test on a drawn prior at a value outside its declared range: the emulator design box
     spans the test's values too (the draws stay inside the declared range), so the test is evaluated inside the design
     and the run completes."""
+    import copy
     import tempfile
     import yaml
     from toolkit.spec import priors as PRI
@@ -2011,7 +2223,21 @@ def _self_test_test_ranges(ok, q):
                                         {"parameter": "synergy", "reason": "toy: no interaction assumed"}]
         r["analysis"]["decision_tests"] = [{"id": "DTw", "type": "parameter_value", "parameter": "dw",
                                             "values": [0.002], "text": "weaker weight, below the prior range"}]
+        # v2-dt-with: the same test with a companion engine parameter held at a value beyond its fitted range
+        r["analysis"]["decision_tests"].append(dict(r["analysis"]["decision_tests"][0], id="DTc",
+                                                    **{"with": {"eff_a": 0.75}}))
         yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        bad_with = {}
+        for label, w in (("not an engine parameter", {"nope": 1.0}), ("not a finite number", {"eff_a": "x"}),
+                         ("the test's own parameter", {"dw": 0.01}), ("not a mapping", [1])):
+            rb = copy.deepcopy(r)
+            rb["analysis"]["decision_tests"][1]["with"] = w
+            errs = schema.validate(schema.Spec(rb, d))
+            bad_with[label] = [e for e in errs if "DTc" in e and "with" in e][:1]
+        errs_ok = [e for e in schema.validate(schema.load(p)) if "DTc" in e]
+        ok(all(bad_with.values()) and not errs_ok,
+           f"RPW1 a parameter_value test's `with` holds engine parameters other than its own at finite numbers; "
+           f"anything else is refused: { {k: bool(v) for k, v in bad_with.items()} } {errs_ok[:1]}")
         signoff.sign(d, "lead", note="self-test")
         try:
             R = run(d, log=q, compute_kw={"max_workers": 2})
@@ -2030,6 +2256,120 @@ def _self_test_test_ranges(ok, q):
         ok(t["status"] == "run" and [x["value"] for x in t["results"]] == [0.002]
            and 0.005 <= s["ci_low"] < s["ci_high"] <= 0.02,
            f"RP12 the test runs at 0.002 and the draws stay inside the declared prior range: {t['status']}, {s}")
+        # v2-dt-with: the companion's value is in the design box, the test runs with it held in every case and says so
+        from toolkit.analysis.core import Analysis as _A
+        c = {x["test_id"]: x for x in R["decision_tests"]}["DTc"]
+        rng = design.get("design_ranges", {}).get("eff_a") or [None, None]
+        ok(rng[1] == 0.75 and c["status"] == "run" and c.get("with") == {"eff_a": 0.75} and "eff_a" in c["varied"]
+           and "0.75" in c["varied"] and "with" not in t and "eff_a" not in t["varied"]
+           and t["varied"] == "engine parameter dw set to each tested value",
+           f"RPW2 a companion value widens the design box and the test runs with it held, named in the result; a test "
+           f"without `with` reads as before: {rng} {c['status']} {c.get('varied')} | {t['varied']}")
+        ok(c["results"][0] != t["results"][0],
+           "RPW3 the companion changes the evaluation: the two tests' results at the same value differ")
+        ev = DT.prerun_evidence(schema.load(p))
+        dtc = r["analysis"]["decision_tests"][1]
+        pl = DT.plan_test(schema.load(p), dict(dtc, values=[ev["point"]["dw"]]), ev)
+        pl0 = DT.plan_test(schema.load(p), dict(dtc, values=[ev["point"]["dw"]], **{"with": {"eff_a": ev["point"]["eff_a"]}}), ev)
+        out_box = DT.plan_test(schema.load(p), dict(dtc, **{"with": {"eff_a": 0.99}}), ev)
+        no_input = DT.plan_test(schema.load(p), dict(dtc, **{"with": {"base": 0.5}}), ev)
+        ok(pl["status"] == "runs" and pl["perturbations"][0]["identity"] is False
+           and pl0["perturbations"][0]["identity"] is True
+           and out_box["status"] == "not_run" and "eff_a" in out_box["why"]
+           and no_input["status"] == "not_run" and "base" in no_input["why"],
+           f"RPW4 a case is identity only when every companion is at its point value; a companion outside the design "
+           f"box, or one that is not an emulator input, is not run: {out_box['why'][:80]} | {no_input['why'][:80]}")
+        from toolkit.spec import engine_parameters as PV
+        rh = copy.deepcopy(r)
+        rh["engine_parameters"] = {"synergy": {"value": 0.0, "source": "s", "reason": "r", "basis": "owner_judgement"}}
+        rh["analysis"]["decision_tests"][1]["with"] = {"synergy": 0.1}
+        tb = PV.tested_boxes(schema.Spec(rh, d))
+        ok(tb.get("synergy") == [0.0, 0.1], f"RPW5 a held spec value named as a companion is a design input over the "
+                                            f"box spanning both values: {tb}")
+        # Codex r1 on v2-dt-with
+        from toolkit.spec import preconditions as PCm
+        quoted = {"type": "parameter_value", "parameter": "eff_a", "values": ["0.8"]}
+        rw1 = {}
+        for label, w in (("nan", {"eff_a": float("nan")}), ("inf", {"eff_a": float("inf")}), ("empty", {})):
+            rb = copy.deepcopy(r)
+            rb["analysis"]["decision_tests"][1]["with"] = w
+            rw1[label] = any("DTc" in e and "with" in e for e in schema.validate(schema.Spec(rb, d)))
+        ok(PV.test_settings(quoted) == {"eff_a": [0.8]} and all(rw1.values()),
+           f"RPW6 a quoted number among a test's values still counts (the runner converts it), as before; NaN, "
+           f"infinity and an empty `with` are refused: {PV.test_settings(quoted)} {rw1}")
+        rp = copy.deepcopy(r)
+        rp["calibration"]["method"] = "posterior"
+        plp = DT.plan_test(schema.Spec(rp, d), dtc, ev)
+        ok(plp["status"] == "not_run" and "posterior" in plp["why"] and "eff_a" in plp["why"],
+           f"RPW7 the planner (which the sign-off checks read) refuses a test with companions under a posterior "
+           f"calibration, naming them: {plp['why'][:120]}")
+        re_ = copy.deepcopy(r)
+        re_["analysis"]["decision_tests"].append({"id": "DTe", "type": "envelope", "values": [5.0], "text": "t",
+                                                  "with": {"eff_a": 0.75}})
+        errs_e = [e for e in schema.validate(schema.Spec(re_, d)) if "DTe" in e and "with" in e]
+        ok(bool(errs_e), f"RPW8 `with` on a test that is not a parameter_value test is refused, never ignored: "
+                         f"{errs_e[:1]}")
+        carries = PCm.decision_test_runs(schema.load(p), "DTc", {"parameters": ["dw"], "components": []})
+        rd = copy.deepcopy(r)
+        rd["analysis"]["decision_tests"][1]["with"] = {"base": 0.6}
+        dos = PCm.chosen_range_test_runs(rd, "DTc", "parameter:dw", {"dw": (0.005, 0.02)})
+        dos_ok = PCm.chosen_range_test_runs(r, "DTc", "parameter:dw", {"dw": (0.005, 0.02), "eff_a": (0.3, 0.7)})
+        ok(carries[0] is False and "with" in carries[1] and dos[0] is False and "with" in dos[1]
+           and dos_ok[0] is False and "with" in dos_ok[1],
+           f"RPW9 a test with companions cannot carry a benchmark departure or be the dossier's range test (Codex r1, "
+           f"r2): {carries[1][:90]} | {dos[1][:90]}")
+        # Codex r2 on v2-dt-with
+        rq = copy.deepcopy(rh)
+        rq["analysis"]["decision_tests"] = [{"id": "DTq", "type": "parameter_value", "parameter": "synergy",
+                                             "values": ["0.1"], "text": "t"}]
+        try:
+            PV.test_settings({"type": "parameter_value", "parameter": "eff_a", "values": [0.5, "oops"]})
+            malformed = "accepted"
+        except ValueError as e:
+            malformed = f"ValueError: {e}"
+        ok(PV.tested_boxes(schema.Spec(rq, d)) == {} and malformed.startswith("ValueError"),
+           f"RPW11 without `with`, a held spec value's box ignores a quoted value and a value that is not a number is "
+           f"an error where a test's values are read, both as before: {PV.tested_boxes(schema.Spec(rq, d))} "
+           f"{malformed[:60]}")
+        # Codex r3: a value that is not a number, on a parameter the reader does not use, raises nothing (as before)
+        from toolkit.analysis import batch as BAm
+        ro = copy.deepcopy(r)
+        ro["analysis"]["decision_tests"] = [{"id": "DTo", "type": "parameter_value", "parameter": "base",
+                                             "values": ["oops"], "text": "t"}]
+        try:
+            tvr = BAm.test_value_ranges(schema.Spec(ro, d), {"eff_a", "eff_b", "dw"})
+        except Exception as e:  # noqa: BLE001
+            tvr = f"{type(e).__name__}: {e}"
+        ok(tvr == {}, f"RPW15 a test value that is not a number, on a parameter that is not a design input, does not "
+                      f"stop the design (the test is then not run, as before): {tvr}")
+        rec_w = {"status": "run", "perturbation_identity": [False], "package_components": {"k": ["a"]},
+                 "benefit_change_by_package": {"k": 1.0}}
+        dv = [DT.departure_verdicts([{"benchmark": "B", "decision_test": "T", "engine": "e"}],
+                                    {"B": {"components": ["a"]}}, {"T": dict(rec_w, **x)})[0]
+              for x in ({}, {"with": {"eff_a": 1.0}})]
+        ok(dv[0]["effective"] is True and dv[1]["effective"] is False and "with" in dv[1]["why"],
+           f"RPW12 the run's departure verdict never credits a test that held companions: {dv[1]['why'][:100]}")
+        ra = copy.deepcopy(re_)
+        ra["engine"] = "auto"
+        try:
+            pend = [e for e in schema.validate(schema.Spec(ra, d), pending_ok=True) if "DTe" in e and "with" in e]
+        except Exception as e:  # noqa: BLE001
+            pend = [f"{type(e).__name__}: {e}"] if "with" in str(e) and "DTe" in str(e) else []
+        ok(bool(pend), f"RPW13 `with` on another test type is refused while the engine is still pending too: "
+                       f"{pend[:1]}")
+        from toolkit.spec import spec_critique as SCm
+        rv = copy.deepcopy(r)
+        rv["analysis"]["decision_tests"] = [{"id": "DTv", "type": "parameter_value", "parameter": "base",
+                                             "values": [0.3, 0.6], "text": "t", "with": {"eff_a": 0.6}}]
+        v_with = SCm._varied(rv, d)[0]
+        rv["analysis"]["decision_tests"][0].pop("with")
+        ok("base" not in v_with and "base" in SCm._varied(rv, d)[0],
+           f"RPW14 the pre-sign critique does not count a test with companions as varying its parameter: "
+           f"{sorted(map(str, v_with))[:4]}")
+        summ = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))
+        row = next(x for x in summ["data"]["tests"] if x.get("test_id") == "DTc")
+        ok((row.get("detail") or {}).get("with") == {"eff_a": 0.75},
+           f"RPW10 the decision-test artifact's summary row carries the companions: {row.get('detail')}")
 
 
 def _self_test_cost_structure(ok, A, R):
@@ -2075,7 +2415,8 @@ def _self_test_cost_structure(ok, A, R):
         raise RuntimeError("optimizer status infeasible")
 
     def broken(ben, cost, budget=None, feas=None):
-        raise RuntimeError("optimizer status time_limit")
+        from toolkit.analysis import core as CO
+        raise CO.SolveFailed("no_feasible_found")
     saved_items = copy.deepcopy(A.alloc["cost_items"])
     try:
         A.solve = spy
@@ -2105,12 +2446,12 @@ def _self_test_cost_structure(ok, A, R):
            f"R5n5 a price case no allocation can afford is a not-run record that keeps its prices: {t5.get('status')}, "
            f"{t5.get('reason')}")
         A.solve = broken
-        try:
-            DT.run_one(A, {"id": "DTc6", "type": "cost_items", "multipliers": {its["a"]: 6.0}},
-                       z0, _b, cost0, plan, R["uncertainty"])
-            ok(False, "R5n6 a solver failure other than a proven infeasibility still stops the analysis")
-        except RuntimeError as e:
-            ok("time_limit" in str(e), f"R5n6 a solver failure other than a proven infeasibility still stops the analysis: {e}")
+        # 1C-c (D3) reverses the earlier R5n6 (such a failure stopped the analysis): the test is a not-run record
+        t6 = DT.run_one(A, {"id": "DTc6", "type": "cost_items", "text": "t", "multipliers": {its["a"]: 6.0}},
+                        z0, _b, cost0, plan, R["uncertainty"])
+        ok(t6["status"] == "not_run" and "no_feasible_found" in t6["reason"] and "infeasible" not in t6["reason"],
+           f"R5n6 a solver failure other than a proven infeasibility is a not-run record that names the solver's "
+           f"status, never a proven infeasibility: {t6.get('status')}, {t6.get('reason')}")
     except Exception as e:  # noqa: BLE001
         ok(False, f"R5n3 the cost_items checks run: {type(e).__name__}: {e}")
     finally:
@@ -2147,6 +2488,7 @@ def _self_test_cost_structure(ok, A, R):
     finally:
         A.alloc, A.spec.raw["options"], A.spec.raw["uncertainty"] = saved
     _self_test_draw_floors(ok, A, R)
+    _self_test_solver(ok, A, R)
     fl = R["point"].get("cost_floors") or {}
     ok(fl.get("n_unit_packages") == 0 and fl.get("items") == [] and "statement" in fl,
        f"R5q the point records floored per-outcome increments (none in this toy): {fl}")
@@ -2167,6 +2509,115 @@ def _floor_q(theta, theta0, at_point):
     the point if `at_point`, else only away from the point values: a draw), so b's increment in a+b is then -10."""
     floored = at_point or dict(theta) != dict(theta0)
     return lambda p: 10.0 * ("b" in p.split("+")) - (20.0 if floored and {"a", "b"} <= set(p.split("+")) else 0.0)
+
+
+def _self_test_solver(ok, A, R):
+    """1C-c (decision D3): the headline solve must be proven within optimizer.gap_rel; inside `auxiliary()` a feasible
+    solution within optimizer.aux_gap_max is accepted and counted, and anything else is SolveFailed with the status."""
+    from toolkit.analysis import core as CO
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    _o, ben0, cost0 = A.evaluate(A.theta0, z0)
+    st = getattr(CO, "solver_settings", dict)()
+    sv = R["point"]["solver"]
+    ok(0 < st.get("gap_rel", 0) <= 1e-3 and sv.get("gap_rel") == st.get("gap_rel") and sv["status"] == "optimal"
+       and sv.get("threads") in (1, st.get("threads")) and sv.get("time_limit_s") == st.get("time_limit_s"),
+       f"SG1 the point plan is proven within the gap of thresholds.yaml, and point.yaml records the gap, the threads "
+       f"and the time limit: { {k: sv.get(k) for k in ('status', 'gap_rel', 'threads', 'time_limit_s')} }")
+    real, saved = CO.aopt.solve, dict(getattr(A, "solver_log", {}))
+
+    def fake(gap):
+        return lambda *a, **k: dict(real(*a, **k), status="feasible", gap=gap)
+    try:
+        CO.aopt.solve, A.solve_memo, A.solver_log = fake(0.001), {}, {}
+        try:
+            A.solve(ben0, cost0)
+            strict = False
+        except RuntimeError as e:
+            strict = str(e) == "optimizer status feasible"
+        with CO.auxiliary(A, "self-test"):
+            r = A.solve(ben0, cost0)
+        lg = dict(A.solver_log.get("self-test") or {})
+        ok(strict and r["status"] == "feasible"
+           and lg == {"solves": 1, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 0},
+           f"SG2 a feasible solution stops a headline solve; an auxiliary solve accepts it within the stated gap and "
+           f"counts it ({strict}, {lg})")
+        refused = []
+        for g in (2 * st["aux_gap_max"], None):
+            CO.aopt.solve, A.solve_memo = fake(g), {}       # without the plan SG2 accepted for this problem
+            with CO.auxiliary(A, "self-test"):
+                try:
+                    A.solve(ben0, cost0)
+                    refused.append(False)
+                except CO.SolveFailed as e:
+                    refused.append(e.status == "feasible")
+        ok(refused == [True, True] and A.solver_log["self-test"]["not_solved"] == 2 and getattr(A, "aux", 0) is None,
+           f"SG3 above the gap, or with no proven gap, an auxiliary solve fails with the status and is counted "
+           f"({refused}, {A.solver_log.get('self-test')})")
+        CO.aopt.solve = real
+        a1, a2 = A.solve(ben0, cost0), A.solve(ben0, cost0)
+        ok(a1["status"] == "optimal" and a2["choice"] == a1["choice"] and len(A.solve_memo) == 1,
+           "SG4 one problem solved twice in a run returns one plan (the proven result is kept), whatever the threads")
+        # Codex r1 P1-3: a feasible plan an auxiliary solve accepted is kept for auxiliary solves, never for a headline
+        calls = {"n": 0}
+
+        def counted(*a, **k):
+            calls["n"] += 1
+            return dict(real(*a, **k), status="feasible", gap=0.001)
+        CO.aopt.solve, A.solve_memo, lg0 = counted, {}, {k: dict(v) for k, v in A.solver_log.items()}
+        with CO.auxiliary(A, "self-test"):
+            f1, f2 = A.solve(ben0, cost0), A.solve(ben0, cost0)
+        try:
+            A.solve(ben0, cost0)
+            head = False
+        except CO.SolveFailed:
+            head = True
+        ok(calls["n"] == 2 and f1["choice"] == f2["choice"] and f2["status"] == "feasible" and head,
+           f"SG6 an accepted feasible plan is returned again to an auxiliary solve of the same problem, and a headline "
+           f"solve of it is still refused ({calls['n']} solver calls, headline refused: {head})")
+        CO.aopt.solve, A.solver_log = real, lg0
+        # Codex r1 P1-6: nothing is kept for ids that are not text (1 and "1" would share a key)
+        kb = {"u": {"1": 1.0}}
+        ok(CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, 1.0) is not None
+           and CO._problem_key({"u": {1: 1.0}}, kb, {"feasible": {"u": {1: True}}}, 1.0) is None
+           and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, 1.0)
+           != CO._problem_key(kb, kb, {"feasible": {"u": {"1": False}}}, 1.0),
+           "SG7 the kept-result key needs text ids and separates problems that differ only in feasibility")
+        ok(CO._problem_key({"u": {"1": "1"}}, kb, {"feasible": {"u": {"1": True}}}, 1.0) is None
+           and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, True) is None,
+           "SG8 (Codex r2 P1) nothing is kept for a table value or budget that is not a number, so the allocator's "
+           "own input check is never skipped")
+        # 1C-c follow-up: the better of an accepted incumbent and the point plan, with the gap as a bound
+        plan0 = dict(R["point"]["plan"])
+        obj0 = sum(ben0[i][plan0[i]] for i in A.ids)
+        worse = dict(a1, status="feasible", gap=0.005, objective=obj0 - 1.0, choice={i: A.comp for i in A.ids})
+        b1 = CO.best_known(A, worse, plan0, ben0, cost0)
+        b2 = CO.best_known(A, dict(a1, status="feasible", gap=0.005), plan0, ben0, cost0)
+        ok(b1["choice"] == plan0 and b1["objective"] == obj0 and b1["solver_gap"]["kept"] == "point_plan"
+           and 0 <= b1["solver_gap"]["bound"] < b2["solver_gap"]["bound"] + 1.0 and b2["solver_gap"]["kept"] == "incumbent"
+           and b2["solver_gap"]["gap"] == 0.005 and b2["solver_gap"]["bound"] > 0
+           and "solver_gap" not in CO.best_known(A, a1, plan0, ben0, cost0),
+           f"SG9 an accepted incumbent below the point plan gives way to it; the bound to the optimum is recorded; a "
+           f"proven solve is returned as it is ({b1.get('solver_gap')}, {b2.get('solver_gap')})")
+        from toolkit.analysis import decision_tests as DTg
+        CO.aopt.solve, A.solve_memo, lg1 = fake(0.001), {}, {k: dict(v) for k, v in A.solver_log.items()}
+        tg = DTg.run_one(A, {"id": "DTg", "type": "envelope", "text": "t",
+                             "values": [float(A.spec["constraints"]["envelope_usd"])]},
+                         z0, ben0, cost0, plan0, R["uncertainty"])
+        CO.aopt.solve, A.solve_memo, A.solver_log = real, {}, lg1
+        rg = (tg.get("results") or [{}])[0].get("regret_solver_gap") or {}
+        ok(tg["status"] == "run" and rg.get("gap") == 0.001 and rg.get("bound", 0) > 0 and tg["results"][0]["regret"] >= 0
+           and isinstance(tg["results"][0].get("within_solver_gap"), bool)
+           and bool(tg.get("within_solver_gap")) == (tg["results"][0]["within_solver_gap"] is True),
+           f"SG10 a decision test solved to an accepted incumbent records the gap beside its regret, and whether its "
+           f"verdict can be settled within it ({rg}, {tg.get('within_solver_gap')})")
+        rep = A.solver_report()
+        ok(rep["gap_rel"] == st["gap_rel"] and rep["headline"]["solves"] >= 1
+           and rep["auxiliary_total"] == {"solves": 3, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 2},
+           f"SG5 the solver record totals the auxiliary solves: {rep.get('auxiliary_total')}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"SG2-SG5 the solver contract ({type(e).__name__}: {e})")
+    finally:
+        CO.aopt.solve, A.solver_log = real, saved
 
 
 def _self_test_draw_floors(ok, A, R):

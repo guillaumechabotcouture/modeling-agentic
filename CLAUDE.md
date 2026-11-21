@@ -2,10 +2,9 @@
 
 **Purpose**: this file orients a fresh agent (or contributor) before
 they touch the codebase. Read this first; then jump to the layer
-you're working on. It is also loaded into every v1 pipeline agent's
-context (`setting_sources=["project"]`; v2's bounded tasks load no
-settings), so it describes the system
-without documenting how the gates can be satisfied on paper.
+you're working on. v2's bounded tasks load no settings, so pipeline
+agents do not read it. It still describes the system without documenting
+how the gates can be satisfied on paper.
 
 ## What this project is
 
@@ -15,12 +14,17 @@ optimization, decision rules, sensitivity analyses) for public-health
 questions in any disease area: for example "How should a national
 program allocate its malaria budget across districts?", "Where should
 measles campaigns run next year?", or "Which TB case-finding package
-should each district get?". Two pipelines share the rigor gates:
+should each district get?". One pipeline runs; the other is retired and
+its code removed:
 
-- **v1 (`python3 main.py --v1 "<question>"`, only on explicit request)**:
-  a **lead** agent chains the stages PLAN → DATA → MODEL → ANALYZE →
-  CRITIQUE → GATE → WRITE, spawning specialist sub-agents and running
-  mechanical rigor checks between rounds.
+- **v1 (retired by the owner on 2026-11-20)**: a **lead** agent chained
+  the stages PLAN → DATA → MODEL → ANALYZE → CRITIQUE → GATE → WRITE,
+  spawning specialist sub-agents. Its code (agent registry, prompts, lead
+  prompt, hooks, `main.run`, replay lane) has been removed; the inventory is
+  `docs/design/v1-retirement.md`. `main.py --v1`, a `--resume` of a run
+  recorded as v1, a `cloud/run_cluster.py` config with `pipeline="v1"` and a
+  `cloud/vm_job.py` command with `--v1` all refuse: "pipeline v1 is
+  retired (owner, 2026-11-20); use v2".
 - **v2 (default since 2026-11-05, `python3 main.py "<question>"`; `--v2`
   is accepted as a no-op alias)**: code owns the flow.
   `agents/stage_machine.py` steps through the states SPEC → SIGN →
@@ -35,7 +39,8 @@ should each district get?". Two pipelines share the rigor gates:
   Design: `docs/architecture-v2.md`, `docs/design/v2c-orchestration.md`,
   `docs/design/v2-spec-and-analysis.md`.
 
-v1 stays supported until the owner retires it.
+Old v1 run directories stay readable (their `metadata.json` says
+`pipeline: v1`); they are never resumed.
 
 ## Decision design principles (owner default)
 
@@ -52,11 +57,10 @@ prompt (`agents/v2_sdk_tasks.py` `PRINCIPLES_FILE`, and the fix planner's prompt
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │  ORCHESTRATION  main.py + agents/                              │
-│  v1: lead loop, agent registry, prompt definitions, skill      │
-│  attachments, tool/path enforcement (agents/enforcement.py).   │
-│  Runs the STAGE 7 validator after the session → final_gate.json│
 │  v2: stage machine (agents/stage_machine.py), findings ledger, │
-│  fix loop, bounded SDK tasks (agents/v2_sdk_tasks.py).         │
+│  fix loop, bounded SDK tasks (agents/v2_sdk_tasks.py); shared: │
+│  tool/path enforcement (agents/enforcement.py), integrity,     │
+│  run budget, run finish (gate command, run upload), preflight. │
 └────────────┬───────────────────────────────────────────────────┘
              │
              ▼
@@ -94,7 +98,8 @@ prompt (`agents/v2_sdk_tasks.py` `PRINCIPLES_FILE`, and the fix planner's prompt
 │  58 SKILL.md files: process/rigor contracts (disease-agnostic),│
 │  epi fundamentals, frameworks (Starsim, LASER, stisim), and    │
 │  disease-specific skills (e.g. malaria-modeling).              │
-│  Attached to agents in agents/__init__.py.                     │
+│  v2's spec task loads decision-spec; the rest are project      │
+│  skills for Claude Code sessions in this repository.           │
 └────────────┬───────────────────────────────────────────────────┘
              │
              ▼
@@ -112,11 +117,10 @@ prompt (`agents/v2_sdk_tasks.py` `PRINCIPLES_FILE`, and the fix planner's prompt
 
 | Goal                                  | Read first                                                    |
 |---------------------------------------|---------------------------------------------------------------|
-| Understand the lead loop              | `main.py` (CLI, `run()` session loop) + `agents/__init__.py` (`_registry()`), `agents/lead_prompt.py` (`build_lead_prompt()`), `agents/hooks.py` (`create_hooks()`); run finishing, budget and preflight in `agents/run_finish.py`, `run_budget.py`, `run_preflight.py` |
+| Understand the CLI                    | `main.py` (`main()`, `main_v2`); run finishing and budget in `agents/run_finish.py`, `run_budget.py` |
 | Understand what agents may touch      | `agents/enforcement.py` (PreToolUse denies, harness hashing, env filtering) and `agents/integrity.py` (hash record of protected run artifacts) |
 | Add or modify a rigor gate            | `scripts/validate_critique_yaml.py` (`_check_*` fns) and any standalone validator under `scripts/`; shared loaders in `scripts/lib/` |
-| Tweak the modeler agent's behavior    | `agents/modeler.py` SYSTEM_PROMPT (~950 lines rendered; § 4 rigor contracts, timeline rendered from the manifest) |
-| Add a new skill                       | Create `.claude/skills/<name>/SKILL.md` with `name`/`description` frontmatter, attach in `agents/__init__.py`, run `python3 scripts/validate_skill_attachments.py` |
+| Add a new skill                       | Create `.claude/skills/<name>/SKILL.md` with `name`/`description` frontmatter (a v2 task loads it by its SKILL.md path), run `python3 scripts/validate_skill_attachments.py` |
 | Trace a phase change                  | `CHANGELOG.md` (phase commit ledger and gate internals); `changes/` for merged phases not yet folded in |
 | See what artifacts a run produces     | Any local `runs/<timestamp>_*/` directory. `runs/` is gitignored, so there is no checked-in example; run the pipeline or ask a maintainer for one. |
 | Understand the v2 run                 | `agents/stage_machine.py` (states, `EDGES`, `route_gate`), `agents/findings_ledger.py`, `agents/fix_loop.py`, `agents/analysis_backend.py`; design in `docs/design/v2c-orchestration.md` |
@@ -126,24 +130,18 @@ prompt (`agents/v2_sdk_tasks.py` `PRINCIPLES_FILE`, and the fix planner's prompt
 
 ## Agents
 
-The registry in `agents/__init__.py` (`_registry()`) is the source of
-truth for v1 agents, models, tools, `maxTurns`, and skills. Current
-agents: `planner`, `data-agent`, `modeler`, `analyst`,
-`critique-methods` (opt-in, `--methods-critic`), `critique-domain`, `critique-premortem`,
-`critique-presentation`, `critique-redteam`, `critique-sufficiency`,
-`writer`. The lead may only spawn these registered types; built-in
-types such as `general-purpose` are denied. v2 does not spawn these
-agents: each of its LLM tasks is one bounded SDK session with a
-task-specific prompt and file tools only (`agents/v2_sdk_tasks.py`).
+v2 spawns no agents: each of its LLM tasks is one bounded SDK session
+with a task-specific prompt and file tools only (`agents/v2_sdk_tasks.py`).
+The v1 agent registry (`planner`, `data-agent`, `modeler`, `analyst`, five
+critics, `writer`) was removed with v1. `agents/enforcement.py` still holds
+the agent-name permission policy it enforced, pending a follow-up
+(`docs/design/v1-retirement.md`).
 
-Skills: process/rigor skills attach unconditionally; domain skills
-(`malaria-modeling`, `vectors`, Starsim/stisim sub-skills, …) attach
-only when the question matches their trigger words
-(`select_skills()`). `asta-literature-search`, `pdf-text-extraction`,
-and `semantic-scholar-lookup` are MCP-provided (no local SKILL.md) and
-allowed via `_MCP_SKILLS` in `scripts/validate_skill_attachments.py`.
-Run `python3 scripts/validate_skill_attachments.py --show-orphans` for
-the live attachment picture.
+Skills: `scripts/validate_skill_attachments.py` checks every SKILL.md's
+frontmatter and that each skill a module under `agents/` loads by path
+exists (`--show-orphans` lists the rest). `asta-literature-search`,
+`pdf-text-extraction` and `semantic-scholar-lookup` are MCP-provided (no
+local SKILL.md), allowed via `_MCP_SKILLS`.
 
 ## Run outcomes
 
@@ -156,10 +154,10 @@ the live attachment picture.
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
 
-`awaiting_signoff` (the decision brief) and `awaiting_scope_signoff` (Phase 49
-β: declarations of findings that bear on the primary decision) are resumable
-with `--resume` once signed; `completed_scope_declined` means the owner
-declined such a declaration and no rounds were left to fix it.
+`awaiting_signoff` and `awaiting_scope_signoff` (unprefixed) are statuses of
+the retired v1 pipeline: old run records may hold them, and those runs are never
+resumed. `completed_scope_declined` is still a v2 outcome: the owner declined a
+finding's declaration and no rounds were left to fix it.
 A v2 run prints `paused:<reason>` when its state machine
 stops for the owner, at SIGN (the decision spec: `python3
 agents/stage_machine.py sign <run_dir> --by owner`) or at OWNER_DECISION
@@ -173,11 +171,12 @@ spec and relaunch with reuse), and exits 2;
 Every run records which pipeline ran: `metadata.json` holds `pipeline`
 (`v1`|`v2`), `commit` and `launcher` (plus one `invocations` entry per
 start or resume), written by `scripts/lib/pipeline_id.py` before the run
-starts. A run recorded under one pipeline is not resumed under the other.
+starts. A run recorded under one pipeline is not resumed under the other,
+and a run recorded as v1 is not resumed at all.
 Launchers state the pipeline explicitly and never rely on the default:
 `cloud/run_cluster.py` configs set `pipeline=` and the launch refuses a
 config whose declaration the shipped code does not confirm;
-`cloud/vm_job.py` refuses a `main.py` command without `--v1` or `--v2`.
+`cloud/vm_job.py` refuses a `main.py` command without `--v2`.
 Readers treat a missing field as `unknown`, never as a pipeline.
 
 Cloud and third-party credentials (`AZ_*`, `AZURE_*`, `OPENAI_*`,
@@ -226,8 +225,7 @@ fragments (see Conventions).
 - **Rigor-artifact manifest**: the source of truth for artifact paths
   and stages is `.claude/orchestration/rigor_artifacts.yaml`
   (Phase 16 α); effort minimums are in
-  `.claude/orchestration/effort_floors.yaml`. `agents/modeler.py`
-  renders the manifest into its prompt at module load and
+  `.claude/orchestration/effort_floors.yaml`.
   `scripts/validate_critique_yaml.py` resolves paths via
   `lib.rigor_artifacts.artifact_path()`. Skills must defer to these
   manifests for thresholds rather than restating numbers.
@@ -254,8 +252,8 @@ storage and the legacy Azure Batch path).
 Live verification (a real run, on the cloud: `cloud/run_cluster.py
 <config> launch`, or `cloud/vm_job.py run` for one job). Prefer
 alternating the disease area between retros so gates are not tuned to
-one domain. The pipeline is v2 unless `--v1` is passed; state it anyway
-in any command you write down:
+one domain. The pipeline is v2 (v1 is retired); state `--v2` anyway in any
+command you write down:
 
 ```bash
 python3 main.py --v2 "<research question>" --max-rounds 4 --signoff owner
@@ -264,9 +262,7 @@ python3 main.py --v2 "<research question>" --max-rounds 4 --signoff owner
 A v2 run produces `runs/<timestamp>_<question>/` with `run_state.json`,
 the gate records and the report. It pauses at SIGN until the owner signs
 the decision spec (`python3 agents/stage_machine.py sign <run_dir> --by
-owner`); use `--signoff lead` for unattended test runs. A v1 run
-(`--v1 --max-sessions 5`) waits for the decision brief instead
-(`python3 scripts/decision_brief.py show|sign <run_dir>`).
+owner`); use `--signoff lead` for unattended test runs.
 
 **A smoke must show that the changed code ran.** A run that finishes is
 not evidence: on 2026-11-05 a re-run meant to test a v2 fix ran v1 and
@@ -288,7 +284,6 @@ The command exits 1 and lists each missing marker. Marker forms: `PATH`,
 
 - `README.md` — high-level project description (audience: human reader)
 - `CHANGELOG.md` — phase ledger and gate internals
-- `agents/modeler.py` SYSTEM_PROMPT — modeler contract (the longest
-  prompt in the repo)
+- `docs/design/v1-retirement.md` — what pipeline v1 left behind and why
 - `.claude/skills/README.md` — skill index
 - `.claude/skills/<name>/SKILL.md` — domain or process knowledge

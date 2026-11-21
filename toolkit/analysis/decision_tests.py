@@ -83,14 +83,20 @@ def _lowers_only_unchosen(ben0, ben, plan) -> bool:
 def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
     os.makedirs(os.path.join(run_dir, DIR), exist_ok=True)
     out = []
-    dts = list(A.spec["analysis"].get("decision_tests") or []) + prior_range_tests(A)
+    dts = list(A.spec["analysis"].get("decision_tests") or []) + prior_range_tests(A) \
+        + list(getattr(A, "conflict_tests", None) or [])        # W0-F: one pair per declared evidence conflict
     ids = [str(dt.get("id")) for dt in dts]
     dup = sorted({i for i in ids if ids.count(i) > 1})
     if dup:     # F6 S2-5d review r3: declared and automatic tests share one result path per id
         raise ValueError(f"decision tests: ids {dup} are used twice (a declared test shadows an automatic one); "
                          "rename the declared test")
     for dt in dts:
-        rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0)
+        try:
+            rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0)
+        except Exception as e:  # noqa: BLE001 -- W0-F: an automatic conflict test that fails goes to the owner
+            if not dt.get("conflict"):
+                raise
+            rec = _not_run(A, dt, f"the test failed: {type(e).__name__}: {e}")
         if dt.get("automatic"):
             rec["automatic"] = True
         p = os.path.join(run_dir, DIR, f"{dt['id']}.yaml")
@@ -130,6 +136,9 @@ def departure_verdicts(departures, targets, records) -> list[dict]:
         why = None
         if rec is None or rec.get("status") != "run":
             why = f"its decision test {tid} was not run ({(rec or {}).get('reason', 'no harness record')})"
+        elif rec.get("with"):        # v2-dt-with: the companions alone could produce the change (Codex r1-r2)
+            why = (f"{tid} held companion parameters (with: {', '.join(sorted(map(str, rec['with'])))}); a test that "
+                   "carries a departure varies only the parameter carrying the effect")
         elif not any(x is False for x in rec.get("perturbation_identity") or []):
             why = f"every perturbation of {tid} is an identity at the calibrated point"
         elif set(rec.get("missing_subtraction") or []) & target:
@@ -301,11 +310,37 @@ def plan_test(spec, dt, evidence) -> dict:
                 return {"status": "not_run", "why": f"every value of {p} is outside the emulator design box "
                         f"{[lo, hi]} (an emulator answer there would be an extrapolation); rebuild the batch so the "
                         "design spans the test's values", "perturbations": [], "rejected": rejected}
-        pt = evidence["point"].get(p)
-        if pt is None and not p.startswith("z:"):
-            pt = next((float(x.value) for x in evidence["engine"].parameters() if x.name == p), None)
-        perts = [{"parameter": p, "value": v, "identity": pt is not None and abs(float(v) - float(pt)) <= 1e-12 *
-                  max(1.0, abs(float(pt)))} for v in vals]
+        def point(n):
+            v = evidence["point"].get(n)
+            if v is None and not n.startswith("z:"):
+                v = next((float(x.value) for x in evidence["engine"].parameters() if x.name == n), None)
+            return v
+
+        def same(v, at):
+            return at is not None and abs(float(v) - float(at)) <= 1e-12 * max(1.0, abs(float(at)))
+        # owner, 20 Nov: companions (`with`) are held in every case; each is an emulator input inside the design box
+        from toolkit.spec import engine_parameters as PV
+        comp = PV.companions(dt)
+        cal = (getattr(spec, "raw", spec) or {}).get("calibration") or {}
+        if comp and cal.get("method") == "posterior":       # that calibration refits around the tested parameter only
+            return {"status": "not_run", "why": "a parameter_value test with companion parameters (with: "
+                    f"{', '.join(sorted(comp))}) is not supported under calibration.method posterior: the refit "
+                    "would not hold the companions", "perturbations": [], "rejected": rejected}
+        if evidence["kind"] == "emulator":
+            for n, v in sorted(comp.items()):
+                if n not in (box or {}):
+                    return {"status": "not_run", "why": f"companion {n} (with) is not an emulator input; it needs "
+                            "engine runs (direct evaluation), or a published prior or spec range so it enters the "
+                            "emulator design", "perturbations": [], "rejected": rejected}
+                lo, hi = box[n]
+                tol = 1e-9 * max(hi - lo, 1.0)
+                if not lo - tol <= v <= hi + tol:
+                    return {"status": "not_run", "why": f"companion {n} = {v} (with) is outside the emulator design "
+                            f"box {[lo, hi]}; rebuild the batch so the design spans it", "perturbations": [],
+                            "rejected": rejected}
+        at_point = all(same(v, point(n)) for n, v in comp.items())
+        pt = point(p)
+        perts = [{"parameter": p, "value": v, "identity": at_point and same(v, pt)} for v in vals]
         return {"status": "runs", "why": "", "perturbations": perts, "rejected": rejected}
     if t == "interaction_rescale":
         ia = interaction_arms(spec, evidence["engine"], dt.get("benchmark"))
@@ -1001,10 +1036,14 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                   if t == "prior_range" else
                   f"fitted engine parameter {p} set to each end of its {'jointly calibrated' if dt.get('joint') else 'fitted'}"
                   " range" if t == "fitted_range" else f"engine parameter {p} set to each tested value")
+        from toolkit.spec import engine_parameters as PV
+        comp = PV.companions(dt)       # owner, 20 Nov: companion engine parameters held in every case of the test
+        if comp:
+            varied += ", with " + ", ".join(f"{k} held at {v:g}" for k, v in sorted(comp.items())) + " in every case"
+            extra["_with"] = dict(sorted(comp.items()))
         cases, lowers = [], []
         vals, rejected = [x["value"] for x in pl["perturbations"]], pl["rejected"]
         extra["_ident"] = [bool(x.get("identity")) for x in pl["perturbations"]]
-        from toolkit.spec import engine_parameters as PV
         if t == "parameter_value" and p in PV.values(A.spec):   # the headline runs at the spec value: record the card
             # value it replaces
             cv = float(next(x.value for x in A.eng.parameters() if x.name == p))
@@ -1013,7 +1052,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         # an emulator answer outside its design box is an extrapolation: plan_test() refused such values, with the box;
         # toolkit/analysis/batch.py widens the box to span the spec's own parameter_value test values
         for v in vals:
-            theta = dict(A.theta0, **{p: float(v)})
+            theta = dict(A.theta0, **comp, **{p: float(v)})
             if A.method == "emulator_inversion":
                 cz = A.calibrate(theta)
                 zs = {i: x[0] for i, x in cz.items()}
@@ -1088,9 +1127,15 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     A_ = A
     for n_, ((v, ben, cost, budget, feas), low) in enumerate(zip(cases, lowers)):
         A = arms[n_] if t == "unit_attribute" else A_
+        from toolkit.analysis.core import auxiliary, best_known
         try:
-            sol = A.solve(ben, cost, budget=budget, feas=feas)
+            with auxiliary(A, "decision_tests"):
+                sol = best_known(A, A.solve(ben, cost, budget=budget, feas=feas), plan, ben, cost, budget, feas)
         except RuntimeError as e:
+            if getattr(e, "status", "infeasible") != "infeasible":      # 1C-c (D3): not a stop, and not a proof
+                return _not_run(A, dt, f"at {v} the solver returned no plan it could prove within the stated gap "
+                                       f"(status {e.status}); nothing is proven about that case",
+                                {"cost_multipliers": dict(mult)} if t == "cost_items" else None)
             if t == "boundary_engine" and str(e).strip() == "optimizer status infeasible":     # #252 review P2-5
                 return _not_run(A, dt, "with the engine's costs at the boundary units no allocation that meets the "
                                        "constraints fits the budget the plan is solved within (the solver proves it infeasible)")
@@ -1106,7 +1151,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         # (the point plan judged under the test's costs, feasibility and planning budget: Codex r1 P2-1)
         bchg = {c: max((abs(float(ben[i][k]) - float(ben0[i][k])) for i in A.ids for k in A.pk if c in A.pk[k]),
                        default=0.0) for c in (A.spec["options"].get("components") or {})}
-        results.append({"value": v, **MV.summarise(A, plan, ch, ben, cost, sol["objective"], budget=budget, feas=feas),
+        results.append({"value": v, **MV.summarise(A, plan, ch, ben, cost, sol["objective"], budget=budget, feas=feas,
+                                                   gap=sol.get("solver_gap")),
                         "benefit_change": bchg,
                         "objective": sol["objective"], "recommendation": A.mix_text(ch),
                         "provably_unchanged": bool(low), **(extra.get(v) or {})})
@@ -1151,9 +1197,17 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                               for c in (A.spec["options"].get("components") or {})},
            "missing_subtraction": list(extra.get("_missing") or []),
            "perturbation_identity": list(extra.get("_ident") or []),
+           **({"with": dict(extra["_with"])} if extra.get("_with") else {}),     # companions held in every case
            "benefit_change_by_package": {k: max(max((abs(float(c_[1][i][k]) - float(ben0[i][k])) for i in A.ids),
                                                     default=0.0) for c_ in cases) for k in A.pk},
            "package_components": {k: sorted(v) for k, v in A.pk.items()}}
+    soft = [r for r in results if r.get("within_solver_gap")]
+    if soft and not any(r["decision_changes"] for r in results if not r.get("within_solver_gap")):
+        # 1C-c follow-up: no value settles the verdict outside the solver's accepted gap; marked beside the verdict
+        rec["within_solver_gap"] = True
+        rec["statement"] += (f" At {len(soft)} of {len(results)} tested values the solver stopped before proving its "
+                             "plan, and the verdict there cannot be settled within the recorded bound "
+                             "(regret_solver_gap).")
     if sv:
         rec["spec_value"] = sv
     if t == "cost_items":
