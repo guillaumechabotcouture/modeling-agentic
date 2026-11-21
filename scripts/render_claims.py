@@ -300,6 +300,10 @@ def load_claims(ledger_path: str) -> dict[str, dict]:
     scalar/percentage claims that declare CIs. Raises ValueError on
     schema violations.
     """
+    return _validate_claims(_read_claims(ledger_path), ledger_path)
+
+
+def _read_claims(ledger_path: str) -> list:
     if not os.path.exists(ledger_path):
         raise FileNotFoundError(f"claims_ledger not found: {ledger_path}")
     with open(ledger_path) as f:
@@ -307,8 +311,40 @@ def load_claims(ledger_path: str) -> dict[str, dict]:
     raw = doc.get("claims") or []
     if not isinstance(raw, list):
         raise ValueError(f"{ledger_path}: top-level `claims:` must be a list")
-    out: dict[str, dict] = {}
+    return raw
+
+
+def load_claims_tolerant(ledger_path: str) -> tuple[dict[str, dict], dict[str, str]]:
+    """({id: claim} for the claims load_claims accepts, {id, or claims[i] without one: why} for the others).
+    For a caller that reports each invalid claim itself (the v2 report, agents/stage_machine.py): one bad
+    claim then costs that claim, not every reference in the report. A ledger that is not a list of claims is
+    refused whole, as by load_claims; an id given twice is invalid both times."""
+    good: dict[str, dict] = {}
+    bad: dict[str, str] = {}
+    try:
+        raw = _read_claims(ledger_path)
+    except AttributeError as e:          # a ledger that is not a mapping (load_claims raises this as it always did)
+        raise ValueError(f"{ledger_path}: the ledger is not a mapping with a `claims:` list") from e
     for i, c in enumerate(raw):
+        cid = c.get("id") if isinstance(c, dict) else None
+        # a row without an id the reference syntax can express is named by position (no id can be `claims[i]`)
+        name = cid if isinstance(cid, str) and _CLAIM_ID_RE.fullmatch(cid) else f"claims[{i}]"
+        try:
+            one = _validate_claims([c], ledger_path, i)
+            if name in good or name in bad:
+                raise ValueError(f"{ledger_path}: claims[{i}] duplicate claim id {name!r}")
+        except Exception as e:  # noqa: BLE001 -- whatever one claim's checks raise (a wrong-typed field) is that claim's
+            bad[name] = str(e) if isinstance(e, ValueError) else f"{ledger_path}: claims[{i}] {type(e).__name__}: {e}"
+            good.pop(name, None)
+            continue
+        good.update(one)
+    return good, bad
+
+
+def _validate_claims(raw: list, ledger_path: str, start: int = 0) -> dict[str, dict]:
+    """load_claims' checks on a list of claims, the first of which is claims[start]."""
+    out: dict[str, dict] = {}
+    for i, c in enumerate(raw, start):
         if not isinstance(c, dict):
             raise ValueError(f"{ledger_path}: claims[{i}] is not a mapping")
         cid = c.get("id")
@@ -932,6 +968,68 @@ def _self_test() -> int:
         ok(r["ok"] and [p["id"] for p in r.get("scale_problems", [])] == ["p"]
            and r["scale_problems"][0]["rendered"] == "0.6%",
            f"T18: a proportion cited as a percentage is reported; a real 0.5% is not: {r}")
+
+    # RCL_ISOLATE (v2 autonomy 1A, 6.2).
+    with tempfile.TemporaryDirectory() as d:
+        lp = os.path.join(d, "l.yaml")
+        with open(lp, "w") as f:
+            yaml.safe_dump({"claims": [
+                {"id": "a.good", "claim_kind": "scalar", "value": 5},
+                {"id": "b.ci", "claim_kind": "scalar", "value": 5, "ci_low": 6, "ci_high": 7},
+                {"id": "c.dup", "claim_kind": "count", "value": 1}, {"id": "c.dup", "claim_kind": "count", "value": 2},
+                "not a mapping"]}, f)
+        try:
+            got, bad = globals()["load_claims_tolerant"](lp)
+        except Exception as e:  # noqa: BLE001 -- before the reader exists this is the failure
+            got, bad = {}, {"raised": f"{type(e).__name__}: {e}"}
+        try:
+            load_claims(lp)
+            strict = "accepted"
+        except ValueError:
+            strict = "refused"
+        ok(set(got) == {"a.good"} and set(bad) == {"b.ci", "c.dup", "claims[4]"} and "claims[1]" in bad.get("b.ci", "")
+           and strict == "refused",
+           f"RCL_ISOLATE the tolerant reader keeps the valid claim and names each invalid one; load_claims still "
+           f"refuses: {sorted(got)}, {bad}, strict {strict}")
+        with open(lp, "w") as f:
+            f.write("claims: 3\n")
+        try:
+            globals()["load_claims_tolerant"](lp)
+            whole = "accepted"
+        except ValueError:
+            whole = "refused"
+        except Exception as e:  # noqa: BLE001
+            whole = type(e).__name__
+        ok(whole == "refused", f"RCL_ISOLATE2 a ledger that is not a list of claims is still refused whole ({whole})")
+        # RCL_ISOLATE3 (narrow Codex review of #297, 1): a claim whose fields have the wrong type costs that claim.
+        with open(lp, "w") as f:
+            yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5},
+                                       {"id": "d.kind", "claim_kind": []}]}, f)
+        try:
+            got, bad = globals()["load_claims_tolerant"](lp)
+        except Exception as e:  # noqa: BLE001
+            got, bad = {}, {"raised": f"{type(e).__name__}: {e}"}
+        ok(set(got) == {"a.good"} and set(bad) == {"d.kind"},
+           f"RCL_ISOLATE3 a claim with an unhashable kind is one invalid claim ({sorted(got)}, {bad})")
+        # RCL_ISOLATE4-5 (round 2, 10-11).
+        with open(lp, "w") as f:
+            yaml.safe_dump({"claims": [None, {"id": "claims[0]"}]}, f)
+        try:
+            _, bad = globals()["load_claims_tolerant"](lp)
+        except Exception as e:  # noqa: BLE001
+            bad = {"raised": f"{type(e).__name__}: {e}"}
+        ok(set(bad) == {"claims[0]", "claims[1]"}, f"RCL_ISOLATE4 each invalid row has its own entry ({sorted(bad)})")
+        with open(lp, "w") as f:
+            f.write("- 1\n")
+        raised = []
+        for fn in (load_claims, globals().get("load_claims_tolerant")):
+            try:
+                fn(lp)
+                raised.append(None)
+            except Exception as e:  # noqa: BLE001
+                raised.append(type(e).__name__)
+        ok(raised == ["AttributeError", "ValueError"],
+           f"RCL_ISOLATE5 load_claims is unchanged for a ledger that is a list; the tolerant reader refuses it ({raised})")
 
     if failures:
         print(f"FAIL: {len(failures)} case(s)", file=sys.stderr)
