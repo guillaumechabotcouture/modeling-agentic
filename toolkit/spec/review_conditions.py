@@ -156,6 +156,9 @@ def row_problems(r: dict, raw: dict, owner: bool | None) -> list:
                 f"reason (the owner), or defer it with an owner and a due date"]
     if d not in DISPOSITIONS:
         return [f"{rid}: disposition {d!r} is not one of {list(DISPOSITIONS)}"]
+    if owner is False and not (d == "deferred" and r.get("owner") == "owner"):
+        return [f"{rid}: a lead may only defer a review condition to the owner (deferred, owner: owner; owner "
+                f"decision 2026-11-21, D2); adopting or declining it is the owner's"]
     if d == "adopted":
         sp, dt = r.get("spec_path"), r.get("decision_test")
         if not _text(sp) and not _text(dt):
@@ -169,7 +172,7 @@ def row_problems(r: dict, raw: dict, owner: bool | None) -> list:
     if d == "declined":
         if not _text(r.get("reason")):
             return [f"{rid}: declined without a reason"]
-        return [f"{rid}: only the owner can decline a review condition"] if owner is False else []
+        return []
     out = [] if _text(r.get("owner")) else [f"{rid}: deferred without an owner"]
     return out + ([] if _date(r.get("due")) else [f"{rid}: deferred without a due date (ISO, e.g. 2026-12-01)"])
 
@@ -330,6 +333,49 @@ def sheet_lines(run_dir: str, data: bytes | None = None, raw: dict | None = None
     return out + [""]
 
 
+LEAD_DEFER_DAYS = 7
+PROVISIONAL = "D2: deferred to the owner by the lead at an unattended sign-off; the owner disposes of it"
+REPORT_HEADING = "## Review conditions deferred to the owner (provisional, unattended sign-off)"
+
+
+def import_critique(run_dir: str) -> int:
+    """Owner decision 2026-11-21: before signing, the spec critique's undeclared HIGH findings become rows (the stage
+    machine calls this at SIGN). The count added; a row already there keeps its disposition."""
+    import yaml
+    raw = yaml.safe_load(read_nofollow(run_dir, "decision_spec.yaml")[0].decode("utf-8"))
+    return add(run_dir, from_critique(raw if isinstance(raw, dict) else {}, run_dir))
+
+
+def lead_defer(run_dir: str, today: datetime.date | None = None) -> int:
+    """Under --signoff lead: every open row is deferred to the owner, provisionally (D2), and the run proceeds; the
+    report lists them at its top. Rows already disposed are left as they are. The count deferred."""
+    import yaml
+    rows = parse(read_bytes(run_dir))
+    due = ((today or datetime.date.today()) + datetime.timedelta(days=LEAD_DEFER_DAYS)).isoformat()
+    n = 0
+    for r in rows:
+        if r.get("disposition") in (None, ""):
+            r.update(disposition="deferred", owner="owner", due=due, provisional=PROVISIONAL)
+            n += 1
+    if n:
+        write_nofollow(run_dir, FILE, yaml.safe_dump({"conditions": rows}, sort_keys=False, allow_unicode=True).encode(),
+                       atomic=True)
+    return n
+
+
+def report_lines(run_dir: str) -> list:
+    """The report's top block: the rows the lead deferred to the owner provisionally (D2), each with its text."""
+    try:
+        rows = [r for r in parse(read_bytes(run_dir)) if r.get("provisional")]
+    except ValueError as e:
+        return [REPORT_HEADING, "", f"{FILE} could not be read: {e}", ""]
+    if not rows:
+        return []
+    return [REPORT_HEADING, "", f"{len(rows)} condition(s) raised before signing were deferred to the owner by the "
+            "lead's unattended sign-off. The owner disposes of each one.", ""] + [
+        f"- **{r['id']}** ({r['source']}, due {r.get('due')}): {' '.join(r['text'].split())}" for r in rows] + [""]
+
+
 def _register():
     from toolkit.spec import preconditions as PC
     PC.register("review_conditions", problems, context=True)       # context: the signed spec's own bytes
@@ -389,7 +435,7 @@ def _self_test() -> int:
         ok(any("spec_path" in g for g in PC.problems(d, None, "owner")), "RC_SPEC_PATH_MISSING a missing path is refused")
         put(d, [dict(row, disposition="declined", reason="out of scope for this decision")] + cr)
         lead, owner = PC.problems(d, None, "lead"), PC.problems(d, None, "owner")
-        ok(any("only the owner" in g for g in lead) and not any("only the owner" in g for g in owner),
+        ok(any("a lead may only defer" in g for g in lead) and not any("a lead may" in g for g in owner),
            f"RC_REJECTED_LEAD_REFUSED a declined row needs the owner: lead {lead[:1]}, owner {owner[:1]}")
         for label, r in (("declined, no reason", dict(row, disposition="declined")),
                          ("declined, reason not text", dict(row, disposition="declined", reason=True)),
@@ -401,17 +447,19 @@ def _self_test() -> int:
         ok(any("spec critique's HIGH finding" in g for g in PC.problems(d, None, "owner")),
            "RC_CRITIQUE_COVERED while the file exists, an undeclared spec-critique HIGH finding must be a row")
         put(d, [dict(row, **DEF), dict(row, id="RC2", disposition="adopted", spec_path="objective")] + cr)
+        lead = PC.problems(d, None, "lead")
+        ok(any("RC2" in g and "a lead may only defer" in g for g in lead),
+           f"RC_LEAD_ONLY_DEFERS a lead may not adopt a condition (D2): {lead[:1]}")
+        put(d, [dict(row, **DEF), dict(row, id="RC2", **DEF)] + cr)
         got = PC.problems(d, None, "lead")
         st = sign(d, "lead")
         rec = SO._spec_record(d)
         ok(got == [] and st == "signed" and SO.status(d) == "signed" and recorded(rec)[1] == sha(d),
            f"RC_RESOLVED_SIGNS resolved rows sign and the record binds the file: {got} {st[:120]}")
-        put(d, [dict(row, **DEF), dict(row, id="RC2", disposition="adopted", spec_path="objective"), dict(row, id="RC3")]
-            + cr)
+        put(d, [dict(row, **DEF), dict(row, id="RC2", **DEF), dict(row, id="RC3")] + cr)
         ok(SO.status(d) == "preconditions_failed", f"RC_ADDED_AFTER_SIGN a condition added after signing stops the "
                                                    f"launch: {SO.status(d)}")
-        put(d, [dict(row, disposition="declined", reason="r"), dict(row, id="RC2", disposition="adopted",
-                                                                     spec_path="objective")] + cr)
+        put(d, [dict(row, disposition="declined", reason="r"), dict(row, id="RC2", **DEF)] + cr)
         ok(SO.status(d) == "preconditions_failed", "RC_DECLINE_AFTER_SIGN a disposition changed after signing is not "
                                                    "covered by the signature")
     with tempfile.TemporaryDirectory() as d:        # Codex r2: the bytes a signer binds are the bytes validated
@@ -483,6 +531,21 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         schema.toy_spec(d)
         ok(PC.problems(d, None, "owner") == [] and sha(d) == "none", "RC_NO_FILE no file, no condition")
+        n = import_critique(d)
+        ok(n == len(crit_rows(d)) and n > 0 and import_critique(d) == 0 and PC.problems(d, None, "owner"),
+           f"RC_AUTO_IMPORT the critique's undeclared HIGH findings become open rows before signing, once ({n})")
+        put(d, parse(read_bytes(d)) + [dict(row, disposition="adopted", spec_path="objective")])
+        k = lead_defer(d, datetime.date(2026, 11, 21))
+        rows_ = parse(read_bytes(d))
+        st = sign(d, "lead")
+        ok(k == n and all(r["disposition"] == "deferred" and r["owner"] == "owner" and r["due"] == "2026-11-28"
+                          for r in rows_ if r["source"] == "spec_critique")
+           and next(r for r in rows_ if r["id"] == "RC1")["disposition"] == "adopted" and "a lead may only defer" in st,
+           f"RC_LEAD_DEFER the lead defers only the open rows, to the owner; it never re-disposes the owner's ({st[:90]})")
+        put(d, [r for r in rows_ if r["id"] != "RC1"])
+        st = sign(d, "lead")
+        ok(st == "signed" and REPORT_HEADING in report_lines(d) and len(report_lines(d)) == n + 5,
+           f"RC_LEAD_SIGNS_REPORTED rows deferred by the lead sign, and are listed for the report's top ({st[:200]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
