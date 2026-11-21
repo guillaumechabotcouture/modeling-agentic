@@ -584,6 +584,38 @@ def _self_test() -> int:
         yaml.safe_dump(r, open(p, "w"), sort_keys=False)
         ok(SO.status(d) == "changed", "SG_POLICY_IN_SIGNED_CLOSURE the policy is signed with the spec: changing it "
                                       "after signing is a changed spec")
+    # CF_VERDICT (Codex r5 of #316): the owner request's verdict for one key: every row with that key counts; a test
+    # without a verdict is NOT_RUN; a malformed row, an unknown verdict or no record is UNREADABLE (changes_plan)
+    import yaml as _yv
+    with tempfile.TemporaryDirectory() as d:
+        def put(rows):
+            os.makedirs(os.path.join(d, "analysis"), exist_ok=True)
+            _yv.safe_dump({"data": {"policy": "declare_and_test", "declared": rows}},
+                          open(os.path.join(d, ARTIFACT), "w"))
+        row = lambda kind, tests, vs, ch: {"key": "g|1", "kind": kind, "tests": tests, "verdicts": vs,  # noqa: E731
+                                           "changes_plan": ch}
+        try:
+            put([row("offset", ["a"], {"a": "NO_CHANGE"}, False), row("unit", ["b"], {"b": "CHANGES_PLAN"}, True)])
+            v_multi = verdict(d, "g|1")
+            put([row("offset", ["lo", "hi"], {"lo": "NO_CHANGE"}, True)])
+            v_part = verdict(d, "g|1")
+            put([row("offset", 1, {"lo": "NO_CHANGE"}, True)])
+            v_bad = verdict(d, "g|1")
+            put([row("offset", ["lo"], {"lo": "MAYBE"}, False)])
+            v_unk = verdict(d, "g|1")
+            put([row("offset", ["lo"], {"lo": "NO_CHANGE"}, False)])
+            v_no = verdict(d, "g|1")
+            v_missing = verdict(d, "h|2")
+        except Exception as e:  # noqa: BLE001
+            v_multi = v_part = v_bad = v_unk = v_no = v_missing = {"error": f"{type(e).__name__}: {e}"}
+        ok(v_multi.get("status") == "CHANGES_PLAN" and v_multi.get("changes_plan") is True
+           and v_part.get("status") == "NOT_RUN" and v_part.get("changes_plan") is True
+           and v_bad.get("status") == "UNREADABLE" and v_bad.get("changes_plan") is True
+           and v_unk.get("status") == "UNREADABLE" and v_unk.get("changes_plan") is True
+           and v_no.get("status") == "NO_CHANGE" and v_no.get("changes_plan") is False
+           and v_missing.get("status") == "UNREADABLE" and v_missing.get("changes_plan") is True,
+           f"CF_VERDICT every row of a key counts, a missing test result is NOT_RUN, a malformed row is UNREADABLE "
+           f"({v_multi}, {v_part}, {v_bad}, {v_unk}, {v_no}, {v_missing})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

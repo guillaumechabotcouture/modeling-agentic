@@ -2846,6 +2846,12 @@ def _self_test() -> int:
            and "**evidence_conflict_declared:g|1**: accepted provisionally; plan changes: yes" in rep_cl[span_cl[1]:],
            f"T_CONFLICT_LEAD_FLAGGED a lead run flags a plan-changing conflict above the draft, with its verdict in the "
            f"request ({sl}, {it_l.get('conflict')}, top has it: {'evidence_conflict_declared' in top_cl})")
+        # T_CONFLICT_OLD_REQUEST (Codex r5 of #316): a conflict item saved before the verdict was carried (a run resumed
+        # across this change) is plan-changing: the owner request holds only conflicts that change the plan or could
+        # not be tested
+        ok(_plan_changing({"finding": "evidence_conflict_declared:g|1", "kind": "evidence_conflict_declared"}) is True
+           and _plan_changing({"kind": "evidence_conflict_declared", "conflict": {"changes_plan": False}}) is False,
+           "T_CONFLICT_OLD_REQUEST a conflict item without its verdict counts as changing the plan")
         dn, Tn, sn = conflict_run("conflict_nochange", False)
         ok(sn in ACCEPTED_STATUSES and not os.path.exists(os.path.join(dn, "scope_signoff_request.json"))
            and FL.load(dn)["evidence_conflict_declared:g|1"].status == "declared"

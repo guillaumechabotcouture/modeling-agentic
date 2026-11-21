@@ -1224,6 +1224,15 @@ def _self_test() -> int:
         ok("untested" not in md and "conflict_1_g_1_lo: CHANGES_PLAN" in sec1 and "changes the plan: **yes**" in sec1
            and "unknown (a test did not run)" in sec2,
            f"SO41 an evidence-conflict item shows its tests' verdicts, not 'untested' ({md[:600]!r})")
+    # SO42 (Codex r5 of #316): a conflict item from a request written before the verdict was carried (a resumed run)
+    # is not called "untested": the page points to the conflict record
+    with tempfile.TemporaryDirectory() as d:
+        json.dump({"pending": True, "round": 2, "items": [
+            {"finding": "evidence_conflict_declared:g|1", "kind": "evidence_conflict_declared", "fingerprint": "fpc",
+             "claim": "c", "reason": "r", "declarations": [], "declared": False}]}, open(os.path.join(d, REQUEST), "w"))
+        md = render_md(d)
+        ok("untested" not in md and "analysis/conflicts.yaml" in md,
+           f"SO42 an older conflict item without its verdict points to the conflict record, not 'untested' ({md[-700:]!r})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
