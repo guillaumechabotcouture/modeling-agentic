@@ -3,87 +3,30 @@
 A multi-agent system for building publication-quality epidemiological and public-health models, for any disease area (malaria, measles, TB, HIV, polio, NCDs, ...). It has one pipeline, v2; v1 is retired:
 
 - **v2 (the default since 2026-11-05; `main.py --v2` still works)**: code runs the pipeline as a state machine, every number comes from tested harness code (an owner-signed decision spec, a disease engine and the analysis engine), and LLMs do bounded tasks. See [v2: the stage machine](#v2-the-stage-machine).
-- **v1 (retired by the owner on 2026-11-20)**: a lead agent and eleven specialist agents, described in most of this README until its code is removed. `main.py --v1`, a `--resume` of a run recorded as v1, a `cloud/run_cluster.py` config with `pipeline="v1"` and a `cloud/vm_job.py` command with `--v1` all refuse: "pipeline v1 is retired (owner, 2026-11-20); use v2".
+- **v1 (retired by the owner on 2026-11-20, code removed)**: a lead agent and eleven specialist agents. See [Pipeline v1 (retired)](#pipeline-v1-retired). `main.py --v1`, a `--resume` of a run recorded as v1, a `cloud/run_cluster.py` config with `pipeline="v1"` and a `cloud/vm_job.py` command with `--v1` all refuse: "pipeline v1 is retired (owner, 2026-11-20); use v2".
 
 Every run records the pipeline it ran, the code commit and its launcher in `metadata.json` (`pipeline`, `commit`, `launcher`); launchers and the eval grader read and check them (see [Pipeline identity](#pipeline-identity)).
-
-In v1, you gave it a research question; it researches the topic, pulls data, builds and calibrates models using established frameworks (Starsim, LASER, stisim, scipy/lmfit), runs quantitative rigor checks (uncertainty propagation, multi-structural comparison, identifiability), critiques the result from several angles (methods, domain, presentation, an adversarial red team, a pre-model pre-mortem, and a post-write evidence-sufficiency check), and a **mechanical STAGE 7 gate** then computes the decision (PATCH / RETHINK / ACCEPT / DECLARE_SCOPE / RUN_FAILED) from structured blocker YAMLs so critique agents cannot talk themselves into generous verdicts. Finally a writer assembles the report.
 
 Built on the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview).
 
 > **Working in this codebase?** Read [`CLAUDE.md`](./CLAUDE.md) first — it lays out the layers (orchestration / rigor gates / toolkit / cloud / skills / runs), the agent registry, run exit statuses, conventions, and how to run every self-test. The phase-by-phase history is in [`CHANGELOG.md`](./CHANGELOG.md).
 
-## Architecture (v1)
+## Pipeline v1 (retired)
 
-A single **lead agent** orchestrates eleven specialist subagents through a staged pipeline. The lead delegates via the `Agent` tool (registered agent types only), invokes the mechanical validator, makes PATCH/RETHINK decisions, and tracks state in `pipeline_state.yaml` for crash-safe resume. A PreToolUse hook (`agents/enforcement.py`) stops agents from editing harness code or files they don't own: the lead cannot write critique YAMLs or `models/**`, and script outputs can only be written by their scripts. The harness is hashed at start and end of a run, and any change marks the run `harness_tampered`.
+From 2026-04 to 2026-11, a single lead agent orchestrated eleven specialist subagents (planner, data agent,
+modeler, analyst, five critics, a red team, a writer) through PLAN → DATA → MODEL → ANALYZE → CRITIQUE → GATE →
+WRITE. The owner retired it on 2026-11-20, and its code (the agent registry and prompts, the lead prompt and hooks,
+`main.run`, the replay lane) has been removed. `docs/design/v1-retirement.md` lists what was removed and what v2
+shares with it. These shared parts remain:
+- the mechanical STAGE 7 gate (`scripts/validate_critique_yaml.py`, run by v2's legacy gate mode);
+- the rigor scripts it runs, described below;
+- the skills.
 
-| Agent | Role | Model | Tools |
-|-------|------|:---:|------|
-| **lead** | Orchestration, STAGE 7 mechanical gate, PATCH/RETHINK decisions | opus | Agent, Bash, Read, Write, Glob, Grep, Skill |
-| **planner** | Literature review, benchmarks, hypotheses, modeling strategy, threads | opus | WebSearch, WebFetch, Read, Glob, Grep, Bash, Skill |
-| **data-agent** | Download datasets, validate quality, run exploratory analysis | sonnet | WebSearch, WebFetch, Bash, Write, Read, Glob |
-| **modeler** | Build, run, and compare models; generate rigor artifacts + figures | opus | Bash, Write, Edit, Read, Glob, Grep |
-| **analyst** | Interpret results, test hypotheses, assign causal labels; claims ledger | opus | Read, Bash, Write, Glob, Grep |
-| **critique-premortem** | Pre-model, clean-slate adversarial critique of the plan (`pre_mortem.yaml`) | opus | Read, Write, Glob, Grep, WebSearch, WebFetch |
-| **critique-methods** | Statistical validation, parameter provenance | opus | Read, Write, Glob, Grep, WebSearch |
-| **critique-domain** | Scientific reasoning, citation verification, fit-for-purpose | opus | Read, Write, Glob, Grep, WebSearch, WebFetch |
-| **critique-presentation** | Figure and writing quality | sonnet | Read, Write, Glob, Grep |
-| **critique-redteam** | Adversarial: ledger consistency, external sanity, vintage drift, hidden assumptions | opus | Read, Write, Bash, Glob, Grep, WebSearch, WebFetch |
-| **critique-sufficiency** | Post-write check that each claim's strength matches its evidence | opus | Read, Write, Glob, Grep |
-| **writer** | Assemble final publication-quality report; embed decision rule verbatim | opus | Read, Write, Glob |
-
-`agents/__init__.py` (`_registry()`) is the source of truth for this table.
-
-## Pipeline (v1)
-
-```
-Question
-   │
-   ▼
- STAGE 1   PLAN                planner         → plan.md, threads.yaml, citations.md,
-                                                  metadata.json{decision_year}
- STAGE 2   DATA                data-agent      → data/, data_quality.md (with **Vintage** lines),
-                                                  data_provenance.md, eda.py, figures/eda_*.png
- STAGE 3   PRE-MODEL CHECK     lead + premortem → identifiability_a_priori.yaml, pre_mortem.yaml
- STAGE 4   MODEL               modeler         → models/, modeling_strategy.md (with
-                                                  **Within-archetype error** when aggregating),
-                                                  eligibility_manifest.yaml (targeted interventions),
-                                                  model_comparison.yaml, figures/fig_*.png,
-                                                  citations.md (Parameter Registry), outcome_fn.py,
-                                                  identifiability.yaml, decision_rule.md (if allocation)
- STAGE 5   ANALYZE             analyst         → results.md (CAUSAL/ASSOCIATIONAL/PROXY labels)
- STAGE 5b  RIGOR (Bash, 3 scripts, no subagent):
-             multi-structural  compare_models.py      → model_comparison_formal.yaml
-             uncertainty       propagate_uncertainty.py (local or Azure Batch cloud)
-                                                       → uncertainty_report.yaml
-             identifiability   identifiability.py     → identifiability.yaml
- STAGE 6   CRITIQUE (║)        methods + domain + presentation + redteam (parallel)
-                                                → critique_*.md + critique_*.yaml (blocker manifests)
- STAGE 7   MECHANICAL GATE     lead runs validate_critique_yaml.py with ALL THREE flags:
-             --spec-compliance        framework / approach / budget / archetype / data vintage /
-                                       methodology vintage against the research question
-             --parameter-registry     effect-size priors (OR/RR conflation), code-vs-CSV cost
-                                       crosscheck, tagging coverage (catches R-022 class)
-             --rigor-artifacts        UQ / MSC / identifiability / decision_rule presence + validity
-          │
-          ├── RETHINK_STRUCTURAL  → back to STAGE 4 with architectural instructions
-          ├── PATCH_OR_RETHINK    → HIGH blockers remain, choose PATCH or RETHINK
-          ├── DECLARE_SCOPE       → document what the model does/doesn't answer, proceed
-          ├── ACCEPT              → proceed to STAGE 8
-          └── RUN_FAILED          → structural mismatch with no rounds left; end, no writer
-          │
-          ▼
- STAGE 8   WRITE                writer          → report.md (embeds decision_rule.md verbatim;
-                                                  numbers via [CLAIM:id] from claims_ledger.yaml)
-          then writer-QA, coherence audit, sufficiency critic
- POST-RUN  main.py re-runs the validator → final_gate.json; terminal status + exit code
-```
-
-Stages 4–7 loop up to `--max-rounds` times. STAGE 7 is not a judgment call — the lead runs the validator and executes whatever action the exit code prescribes. The multi-line `STAGE 7 decision (round N/M)` stderr block is pasted verbatim into `progress.md` as an audit trail.
+Old v1 run directories stay readable and are never resumed. Their `metadata.json` says `pipeline: v1`; runs from before 2026-11-05 carry no `pipeline` field and are recognised by having no `run_state.json`.
 
 ## v2: the stage machine
 
-`python3 main.py "<question>"` (or with `--v2`) runs `agents/stage_machine.py` instead of the lead session. Code owns the state, every transition and every number; the state is saved to `run_state.json` after each transition, so `main.py --resume <run_dir>` continues where a run stopped.
+`python3 main.py "<question>"` (or with `--v2`) runs `agents/stage_machine.py`. Code owns the state, every transition and every number; the state is saved to `run_state.json` after each transition, so `main.py --resume <run_dir>` continues where a run stopped.
 
 ```
 SPEC → SIGN → EVIDENCE → ENGINE_CHOICE → CONFIGURE → ANALYZE → CRITIQUE → GATE
@@ -166,7 +109,7 @@ On 2026-11-05 an eval re-run meant to test a v2 change ran v1: `main.py` then de
 
 ## Skills ecosystem
 
-58 skills under `.claude/skills/`, attached per-agent in `agents/__init__.py`. Domain skills attach only when the question matches their trigger words. See `.claude/skills/README.md` for the indexed list; broad groups:
+58 skills under `.claude/skills/`. v2's spec task loads `decision-spec`. The others were attached to the retired v1 agents; Claude Code sessions in this repository still load them as project skills. See `.claude/skills/README.md` for the indexed list; broad groups:
 
 - **Pipeline rigor** — `adversarial-redteam`, `critique-blockers-schema`, `spec-compliance-rules`, `effect-size-priors`, `uncertainty-quantification`, `multi-structural-comparison`, `identifiability-analysis`, `pre-model-identifiability-arithmetic`, `decision-rule-extraction`, `benchmark-locked-acceptance`, `evidence-sufficiency`, `pre-mortem-domain`, `sanity-schema`, `sensitivity-analysis-remediation`
 - **Allocation and decisions** — `decision-spec` (v2), `allocation-toolkit`, `allocation-cross-validation`, `optimizer-method-selection`, `daly-weighted-analysis`, `eligible-population-consistency`, `ecological-fallacy-quantification`, `mechanistic-vs-hybrid-architecture`
@@ -176,7 +119,7 @@ On 2026-11-05 an eval re-run meant to test a v2 change ran v1: `main.py` then de
 - **Frameworks** — `laser-spatial-disease-modeling`; `starsim-dev` + 16 starsim-dev-* topic skills; `stisim-modeling`
 - **Infrastructure** — `modelops-calabaria` (calibration/scaling), `cloud-compute` (Azure Batch), `sciris-utilities`, `epi-model-parametrization`
 
-## Core principles embedded in the agents
+## Core principles
 
 - **Mechanical gates beat argument** — critique agents produce blocker YAMLs; the lead does not override the validator.
 - **Clone-first, build-second** — modelers check for existing published code before reimplementing.
@@ -202,25 +145,25 @@ python main.py --v2 "Which districts should receive measles follow-up campaigns 
 | Flag | Default | Purpose |
 |------|:-:|---------|
 | `--max-rounds N` | 5 | Max critique-revision cycles |
-| `--max-sessions N` | 10 | Max top-level sessions (for retry-after-crash / context recovery) |
+| `--max-sessions N` | 10 | Accepted for existing launch configs (it capped the retired v1 lead's sessions) |
 | `--resume runs/<dir>` | — | Resume a v2 run from its `run_state.json` (a run recorded as v1 is refused: v1 is retired) |
 | `--v1` | off | Refused: pipeline v1 is retired (owner, 2026-11-20); use v2 |
 | `--v2` | on | The v2 stage machine (the default; the flag is a no-op kept for existing commands) |
 | `--launcher NAME` | `$MA_LAUNCHER` or `direct` | Name of the launcher, recorded in `metadata.json` (the cloud launchers set it) |
-| `--signoff owner\|lead\|none` | owner | Who signs the decision brief (v1) or the decision spec (v2) before compute; `lead` for unattended test runs |
+| `--signoff owner\|lead\|none` | owner | Who signs the decision spec before compute; `lead` for unattended test runs |
 | `--signoff-hours H` | 24 | Accepted for existing launch configs; it set the retired v1 sign-off wait |
 | `--max-budget-usd X` | — | Hard dollar cap for the whole run, including earlier sessions of a resumed run |
-| `--methods-critic` | off | Add `critique-methods` to every v1 STAGE 6 |
-| `--cross-model` | off | Add the Codex CLI cross-model critic to every v1 STAGE 6 (sends run artifacts to OpenAI) |
+| `--methods-critic`, `--cross-model` | off | Accepted for existing launch configs (they added critics to the retired v1 STAGE 6) |
 | `--cloud` | off | Pass cloud credentials (`AZ_*`, `AZURE_*`) to agents |
-| `--preflight-only` / `--skip-preflight` | — | Run only the ~1-minute live preflight, or skip it (v1) |
+| `--preflight-only` | — | Refused: it ran the v1 lead session's live preflight, retired with v1 |
+| `--skip-preflight` | — | Accepted for existing launch commands; v2 runs no preflight before a run |
 | `--self-test` | — | Run inline self-tests (no API calls) and exit |
 
 Exit codes: 0 accepted (`completed`, `completed_with_report_restored`); 2 finished without an accepted gate, or paused for the owner (resumable); 1 `harness_tampered`, `artifact_tampered` or error; 130 interrupted. The full status list is in `CLAUDE.md` ("Run outcomes").
 
 ## Run outputs
 
-Each v1 run writes to `runs/<timestamp>_<slug>/` (a v2 run adds `run_state.json`, `decision_spec.yaml` and its signoff, `engine_choice.json`, `findings.jsonl`, `impact_ledger.jsonl` and `analysis/`):
+A run writes to `runs/<timestamp>_<slug>/`. The tree below is a v1 run's (old runs keep it); a v2 run adds `run_state.json`, `decision_spec.yaml` and its signoff, `engine_choice.json`, `findings.jsonl`, `impact_ledger.jsonl` and `analysis/`):
 
 ```
 runs/<timestamp>_<question-slug>/      (gitignored; local only)
@@ -267,7 +210,7 @@ runs/<timestamp>_<question-slug>/      (gitignored; local only)
 └── report.md                      Final report; decision_rule embedded in §Policy Recommendations
 ```
 
-## Scripts (invoked by the lead via Bash)
+## Scripts (rigor gates and tools)
 
 | Script | Purpose |
 |---|---|
@@ -284,14 +227,6 @@ runs/<timestamp>_<question-slug>/      (gitignored; local only)
 | `scripts/cloud_batch.py` | Azure Batch SDK wrapper (legacy; pool mgmt, task submit, teardown) |
 | `scripts/self_tests.py` | Finds and runs every module's `--self-test` (as CI does) |
 
-## Crash recovery and resume (v1)
-
-Long runs (4–8 hours) occasionally crash mid-pipeline (API overload, OOM, orphaned processes). Handled in two places:
-
-- **Within a run** — the lead writes `pipeline_state.yaml` after every completed stage. If a session dies, the next session reads that file and restarts from the next stage.
-- **Across sessions** — `main.py` retries up to `--max-sessions` times with exponential backoff, resuming the lead conversation by `session_id` when one was captured and rebuilding resume context from artifacts otherwise.
-- **Orphaned-process cleanup** — `cleanup_orphaned_claude_processes()` kills stale CLI processes from prior crashes to prevent accumulating 400–600 MB zombies.
-
 ## Requirements
 
 - Python 3.14 (the version the pins in `requirements.txt` were validated on; 3.10+ likely works but is untested)
@@ -305,14 +240,9 @@ Long runs (4–8 hours) occasionally crash mid-pipeline (API overload, OOM, orph
 modeling-agentic/
 ├── main.py                    CLI entry point: v2 dispatch; refuses --v1 (retired)
 ├── agents/
-│   ├── __init__.py            Agent registry (v1)
-│   ├── lead_prompt.py, hooks.py, run_*.py   Lead prompt, hooks, session/budget/preflight/finish (v1)
+│   ├── run_budget.py, run_finish.py   Spend ledger; gate command, exit codes and run upload
 │   ├── enforcement.py         PreToolUse path/agent denies, harness hashing, env filtering
 │   ├── integrity.py           Hash record of protected run artifacts
-│   ├── planner.py, data.py, modeler.py, analyst.py
-│   ├── critique_{methods,domain,presentation,premortem,sufficiency}.py
-│   ├── red_team.py
-│   ├── writer.py
 │   └── stage_machine.py, findings_ledger.py, fix_loop.py, analysis_backend.py,
 │       v2_tasks.py, v2_sdk_tasks.py   v2 state machine and its bounded LLM tasks
 ├── toolkit/                   v2 harness code: spec/, engines/, analysis/, alloc/
@@ -321,7 +251,7 @@ modeling-agentic/
 ├── evals/                     Eval-suite questions (public half; scripts/eval_suite.py)
 ├── docs/                      Architecture and design notes (docs/design/)
 ├── changes/                   One change fragment per PR, folded into CHANGELOG.md at release
-├── .claude/skills/            58 skills attached to agents by role
+├── .claude/skills/            58 project skills (v2 loads decision-spec)
 ├── .claude/orchestration/     rigor_artifacts.yaml, effort_floors.yaml, expert_priors.yaml
 ├── CHANGELOG.md               Phase ledger
 ├── runs/                      Timestamped run outputs (gitignored)

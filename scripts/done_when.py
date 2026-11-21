@@ -461,7 +461,7 @@ def run(run_dir: str, critiques: dict, round_n: int, record: bool = True, exclud
                        "open": bid in open_ids or left_out, "severity": t.get("severity")}
         entry = {"id": bid, "severity": t.get("severity") or "HIGH", "reviewer": t.get("reviewer"),
                  "passed_round": t.get("passed_round"), "detail": detail, "claim": t.get("claim") or "",
-                 "target_stage": t.get("target_stage") or "MODEL"}
+                 "target_stage": t.get("target_stage") or "MODEL", "done_when": t["done_when"]}
         if passes is True:
             if bid in open_ids:
                 resolved.append(bid)
@@ -517,14 +517,18 @@ def gate_findings(result: dict) -> list[dict]:
                     "target_stage": "CRITIQUE", "scope_declarable": True,
                     "claim": f"The done_when tests could not be evaluated ({result['error'][:200]}); "
                              "no finding can be closed or checked for regressions by its test."})
+    # Each regressed or unmet finding is its own row (`key`: without it they all share one ledger id and one stall
+    # key), with the frozen test a fix is checked against (agents/fix_loop.py check_task).
     for r in result.get("regressed") or []:
-        out.append({"kind": "done_when_regressed", "severity": "HIGH", "id": r["id"],
+        out.append({"kind": "done_when_regressed", "severity": "HIGH", "id": r["id"], "key": r["id"],
+                    "done_when": r.get("done_when"),
                     "target_stage": r["target_stage"], "stage": r["target_stage"], "scope_declarable": True,
                     "claim": (f"{r['id']} ({r['reviewer']}) passed its done_when test in round {r['passed_round']} "
                               f"and fails now: {r['detail'][:300]}. Something changed since; restore the fix. "
                               f"Finding: {r['claim']}")})
     for r in result.get("unmet") or []:
-        out.append({"kind": "done_when_unmet", "severity": r["severity"], "id": r["id"],
+        out.append({"kind": "done_when_unmet", "severity": r["severity"], "id": r["id"], "key": r["id"],
+                    "done_when": r.get("done_when"),
                     "target_stage": r["target_stage"], "stage": r["target_stage"], "scope_declarable": True,
                     "claim": (f"{r['id']} ({r['reviewer']}) is marked resolved but its done_when test fails: "
                               f"{r['detail'][:300]}. Fix it so the test passes, or the critic withdraws the test "
@@ -836,6 +840,20 @@ def _self_test() -> int:
         ok([x["id"] for x in r34["dropped"]] == ["D-011"],
            f"DW34 a registry written before critic_resolved_round does not reopen a judgement; a failing runnable "
            f"test still stays open: {[x['id'] for x in r34['dropped']]}")
+    # DW_KEYS (v2 autonomy 1A, 4b.1): each regressed or unmet finding is its own gate row (a key), with its test.
+    with tempfile.TemporaryDirectory() as dk:
+        blk = [{"id": i, "severity": "MEDIUM", "resolved": True, "claim": "c",
+                "done_when": [{"file": f"{i}.txt", "exists": True}]} for i in ("D-021", "D-022")]
+        rk = run(dk, {"critique-domain": {"blockers": blk}}, 1, record=False)
+        e = lambda i: {"id": i, "severity": "MEDIUM", "reviewer": "critique-domain", "passed_round": 1,   # noqa: E731
+                       "detail": "d", "claim": "c", "target_stage": "MODEL", "done_when": [{"file": "x", "exists": True}]}
+        gk = gate_findings({"regressed": [e("D-1"), e("D-2")], "unmet": rk["unmet"], "dropped": [e("D-5")]})
+        ok(len({(v["kind"], v.get("key")) for v in gk}) == 5 and all(v.get("key") == v["id"] and v.get("done_when")
+                                                                      for v in gk),
+           f"DW_KEYS regressed and unmet rows carry their finding's id as key, and its test: "
+           f"{[(v['kind'], v.get('key'), bool(v.get('done_when'))) for v in gk]}")
+        ok([v["severity"] for v in gk if v["kind"] == "done_when_dropped"] == ["HIGH"],
+           "DW_KEYS2 a dropped finding stays HIGH (set on purpose; Codex r1 P1-3)")
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
