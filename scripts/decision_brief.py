@@ -504,7 +504,8 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
         "answer_source": {q["id"]: "given" if q["id"] in answers else "proposed accepted" for q in qs},
-        "sha256": {**shas, **(extra_sha or {}), **((evidence or {}).get("files") or {})},
+        "sha256": {**shas, **_review_conditions_sha(run_dir, captured), **(extra_sha or {}),
+                   **((evidence or {}).get("files") or {})},
         **({"evidence": evidence["record"]} if evidence else {}),
         "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
@@ -518,6 +519,18 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     except (LinkRefused, OSError) as e:
         raise ValueError(f"sign-off not written: {e}") from None
     return record
+
+
+def _review_conditions_sha(run_dir: str, captured: dict) -> dict:
+    """W0-G: a sign-off of the decision spec binds the run's review_conditions.yaml (toolkit/spec/review_conditions.py)."""
+    if captured.get(DECISION_SPEC) is None:
+        return {}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from toolkit.spec import review_conditions as RC
+    h = RC.sha_of(RC.read_bytes(run_dir))
+    return {RC.FILE: h} if h != "none" else {}
 
 
 def _amendments_ok_ids(ids) -> bool:

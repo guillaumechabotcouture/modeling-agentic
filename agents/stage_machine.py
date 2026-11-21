@@ -894,6 +894,8 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     from toolkit.spec import signoff as SO      # F6 (#218): every registered precondition, recomputed, whoever signs
     ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
     rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
+    from toolkit.spec import review_conditions as RC     # W0-G: the conditions the preconditions checked are bound
+    rec[RC.RECORD_KEY] = RC.sha_of(RC.read_bytes(run_dir))
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
     GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})

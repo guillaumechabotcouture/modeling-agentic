@@ -251,9 +251,9 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is "
                          "stale): the sheet is regenerated before the owner signs; read the new one")
     from toolkit.spec import review_conditions as RC
-    if src is not None and src.get("review_conditions_sha256", "none") != RC.sha(run_dir):
-        raise ValueError(f"{SHEET} shows other review conditions than {RC.FILE} now holds (it is stale): the sheet is "
-                         "regenerated before the owner signs; read the new one")
+    rc_sha = RC.sha_of(RC.read_bytes(run_dir))     # W0-G: bound in the record; the precondition compares the sheet
+    if rc_sha != "none":
+        extra[RC.FILE] = rc_sha
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
     geo_expect = None
     if src is not None:
@@ -275,6 +275,8 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     # evidence check hands back the binding to record (its dossier read once, the sheet's dossier sha256 compared)
     evidence = sign_preconditions(run_dir, data)
     extra.update(evidence["files"])
+    if RC.sha_of(RC.read_bytes(run_dir)) != rc_sha:     # the conditions checked are the ones the record binds
+        raise ValueError(f"{RC.FILE} changed while the spec was being signed: read the sheet again")
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
@@ -382,7 +384,7 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
     from toolkit.spec import review_conditions as RC
     try:                                # W0-G: one read, shown and hashed
         rbytes = RC.read_bytes(run_dir)
-        rsha = hashlib.sha256(rbytes).hexdigest() if rbytes is not None else "none"
+        rsha = RC.sha_of(rbytes)
     except ValueError:
         rbytes, rsha = None, "unreadable"
     text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
