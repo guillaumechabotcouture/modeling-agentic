@@ -1915,9 +1915,15 @@ def _self_test_run(ok, real_gate=None) -> None:
             ev.append(("attach", name))
             raise SystemExit("rc.attach called")
 
+        launcher_sleeps = [0]
+
         def sleep(s):
             ev.append(("sleep", s))
-            if sum(1 for e in ev if isinstance(e, tuple) and e[0] == "sleep") > 400:
+            # Only `run`'s own sleeps count (Codex on #322): the threaded job sleeps here while it polls its child,
+            # and a job that waits on the meter must not exhaust `run`'s runaway-poll guard.
+            if not threaded or threading.current_thread() is threading.main_thread():
+                launcher_sleeps[0] += 1
+            if launcher_sleeps[0] > 400:
                 raise RuntimeError("test: `run` is still polling after 400 sleeps (it would wait to its deadline)")
             real_sleep(s / 600 if threaded else min(s, 0.01))
 
