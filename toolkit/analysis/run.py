@@ -1724,6 +1724,15 @@ def _self_test_stability_flagged(ok):
            f"JR9f a fold whose re-solve is not proven within the gap is not_run with the solver's status ({nr})")
     except Exception as e:  # noqa: BLE001
         ok(False, f"JR9f a fold whose re-solve fails is not_run ({type(e).__name__}: {e})")
+    # Codex r1 P1-2: a fold the solver proves infeasible still stops the step, as before
+    def none_fits(ben_, cost_):
+        raise CO.SolveFailed("infeasible")
+    try:
+        flaky.solve = none_fits
+        SB.run(flaky, z0, plan, ben, cost, plan)
+        ok(False, "JR9g a fold the solver proves infeasible still stops the stability step")
+    except RuntimeError as e:
+        ok(str(e) == "optimizer status infeasible", f"JR9g a fold the solver proves infeasible still stops the step ({e})")
     # 1C-b 2d-iii: quantiles of a sample with a non-finite value are refused (were all NaN)
     from toolkit.analysis.core import q as _q
     try:
@@ -2411,6 +2420,31 @@ def _self_test_solver(ok, A, R):
         a1, a2 = A.solve(ben0, cost0), A.solve(ben0, cost0)
         ok(a1["status"] == "optimal" and a2["choice"] == a1["choice"] and len(A.solve_memo) == 1,
            "SG4 one problem solved twice in a run returns one plan (the proven result is kept), whatever the threads")
+        # Codex r1 P1-3: a feasible plan an auxiliary solve accepted is kept for auxiliary solves, never for a headline
+        calls = {"n": 0}
+
+        def counted(*a, **k):
+            calls["n"] += 1
+            return dict(real(*a, **k), status="feasible", gap=0.001)
+        CO.aopt.solve, A.solve_memo, lg0 = counted, {}, {k: dict(v) for k, v in A.solver_log.items()}
+        with CO.auxiliary(A, "self-test"):
+            f1, f2 = A.solve(ben0, cost0), A.solve(ben0, cost0)
+        try:
+            A.solve(ben0, cost0)
+            head = False
+        except CO.SolveFailed:
+            head = True
+        ok(calls["n"] == 2 and f1["choice"] == f2["choice"] and f2["status"] == "feasible" and head,
+           f"SG6 an accepted feasible plan is returned again to an auxiliary solve of the same problem, and a headline "
+           f"solve of it is still refused ({calls['n']} solver calls, headline refused: {head})")
+        CO.aopt.solve, A.solver_log = real, lg0
+        # Codex r1 P1-6: nothing is kept for ids that are not text (1 and "1" would share a key)
+        kb = {"u": {"1": 1.0}}
+        ok(CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, 1.0) is not None
+           and CO._problem_key({"u": {1: 1.0}}, kb, {"feasible": {"u": {1: True}}}, 1.0) is None
+           and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, 1.0)
+           != CO._problem_key(kb, kb, {"feasible": {"u": {"1": False}}}, 1.0),
+           "SG7 the kept-result key needs text ids and separates problems that differ only in feasibility")
         rep = A.solver_report()
         ok(rep["gap_rel"] == st["gap_rel"] and rep["headline"]["solves"] >= 1
            and rep["auxiliary_total"] == {"solves": 3, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 2},

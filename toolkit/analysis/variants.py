@@ -741,7 +741,8 @@ def _self_test_fixed(ok, attempt):
        f"PV31 a solved variant's cost is counted against the budget in each draw and judged against the spec's rule; "
        f"a given plan is reported, not judged ({e8!r}, {e9!r}, {e10!r}, {a8.get('draws_over_budget')} of "
        f"{a8.get('draws')} over, rule_met {a8.get('rule_met')!r})")
-    # 1C-c (D3): the same-spend optimum is an auxiliary solve; one the solver cannot give is recorded, not raised
+    # Codex r1 P1-4, P1-5: the same-spend optimum stays a strict solve. "Not solved" there means the plan breaks the
+    # signed constraints, and a feasible incumbent could sit below the given plan itself
     from toolkit.analysis import core as CO
     orig_s, p8 = A.solve, A.solve(ben, cost)["choice"]
 
@@ -752,9 +753,9 @@ def _self_test_fixed(ok, attempt):
     try:
         A.solve = no_spend
         r36, e36 = attempt(run, A, ben, cost, p8, [], D2, {"level": 0.9})
-        ss = ({x["id"]: x for x in (r36 or {}).get("variants", [])}.get("given") or {}).get("same_spend") or {}
-        ok(e36 is None and ss.get("status") == "not_solved" and "no_feasible_found" in str(ss.get("reason")),
-           f"PV35 a same-spend optimum the solver cannot give is not solved, with the solver's status ({e36!r}, {ss})")
+        ok(isinstance(e36, CO.SolveFailed) and e36.status == "no_feasible_found" and getattr(A, "aux", None) is None,
+           f"PV35 a same-spend optimum the solver cannot prove still stops the step, outside any auxiliary context "
+           f"({e36!r}, {r36 is None})")
     finally:
         A.solve = orig_s
     A.budget = 1.0

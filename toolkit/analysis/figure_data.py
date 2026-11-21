@@ -636,6 +636,13 @@ def _self_test() -> int:
            and pwg(A, sol_, dict(plan, **{u_: A.comp}), ben0, cost0) is False and pwg(A, sol_, rich, ben0, cost0) is False,
            "FD10b a stored plan tied with the rebuilt optimum is within the gap; a worse one, or one over the budget, "
            "is not")
+        # Codex r1 P1-7, P1-8: the allowance scales with the gain, and a plan the allocator's own check rejects (an
+        # unknown package) is not within the gap, without an exception
+        tiny = {i: {k: (1e-13 if k == plan[i] and i == u_ else 0.0) for k in ben0[i]} for i in A.ids}
+        sol_t = dict(sol_, objective=1e-13, baseline=0.0)
+        ok(pwg(A, sol_t, dict(plan, **{u_: A.comp}), tiny, cost0) is False
+           and pwg(A, sol_, dict(plan, **{u_: "no_such_package"}), ben0, cost0) is False,
+           "FD10c a plan that loses a tiny gain entirely is not within the gap; an unknown package is refused, not raised")
         # ---- Codex r1 P2-8: the frontier reports outcome averted, not the (possibly discounted) objective
         half = {i: {k: 0.5 * v for k, v in ben0[i].items()} for i in A.ids}
         fr_h = frontier(A, half, cost0, out0)

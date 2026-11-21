@@ -980,16 +980,23 @@ def _self_test() -> int:
            f"TG1 the ILP takes a relative gap and a thread count and records both; the default stays exact: {rg}")
     except (TypeError, KeyError) as e:
         ok(False, f"TG1 the ILP takes a relative gap and a thread count and records both ({type(e).__name__}: {e})")
-    import types
-    real = _pulp()
-    fake = types.SimpleNamespace(**{k: getattr(real, k) for k in dir(real) if not k.startswith("__")})
-    fake.LpSolutionOptimal, fake.LpSolutionIntegerFeasible = -99, real.LpSolutionOptimal    # reads as stopped early
-    keep = globals()["_pulp"]
-    globals()["_pulp"] = lambda: fake
+    keep, seen = globals().get("_proven"), []
+
+    def stopped(first_only):      # the ILP reads as stopped early; the relaxation as proven, or (Codex r1 P1-1) not
+        def f(pulp, prob):
+            seen.append(1)
+            return keep(pulp, prob) if first_only and len(seen) > 1 else False
+        return f
     try:
+        globals()["_proven"] = stopped(True)
         rf = solve(benefit, cost, feas, 0.93 * B, method="ilp")
+        seen.clear()
+        globals()["_proven"] = stopped(False)
+        ru = solve(benefit, cost, feas, 0.93 * B, method="ilp")
     finally:
-        globals()["_pulp"] = keep
+        globals()["_proven"] = keep
+    ok(keep is not None and ru["status"] == "feasible" and ru["gap"] is None,
+       f"TG3 a relaxation that is not itself proven optimal states no gap: {ru.get('gap')}")
     ex = solve(benefit, cost, feas, 0.93 * B, method="ilp")
     ok(rf["status"] == "feasible" and rf.get("gap") is not None and 0.0 <= rf["gap"] < 0.5
        and ex.get("gap", "absent") is None and rf["objective"] == ex["objective"],

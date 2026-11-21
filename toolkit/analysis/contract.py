@@ -766,6 +766,13 @@ def _self_test() -> int:
         S.manifest["solver"] = {"auxiliary_total": "x"}
         S.finalize("complete")
         ok(kinds(d) == {"analysis_solver_degraded"}, f"KS3 a solver record that cannot be read fails closed: {kinds(d)}")
+        got = []      # Codex r1 P1-9: only an absent record is exempt; counts are whole numbers
+        for rec in (None, {"aux_not_solved_share_max": 0.05,
+                           "auxiliary_total": {"solves": 10, "feasible_accepted": 0, "max_gap": 0.0, "not_solved": 0.9}}):
+            S.manifest["solver"] = rec
+            S.finalize("complete")
+            got.append(kinds(d))
+        ok(got == [{"analysis_solver_degraded"}] * 2, f"KS4 a null record or fractional counts fail closed: {got}")
         S = complete_run(d)
         rel = "analysis/sensitivity.yaml"
         doc = yaml.safe_load(open(os.path.join(d, rel)))
