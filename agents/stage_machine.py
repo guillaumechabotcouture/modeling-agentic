@@ -1144,7 +1144,8 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
         opts = {}
         if conflict:            # owner decision 2026-11-21: a refit is listed, with its estimated cost, never run
             from toolkit.analysis import conflicts as CF
-            opts = {"options": CF.options(run_dir, getattr(f, "key", ""))}
+            opts = {"options": CF.options(run_dir, getattr(f, "key", "")),
+                    "conflict": CF.verdict(run_dir, getattr(f, "key", ""))}     # Codex r4 of #316: the structured verdict
         items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix, **opts,
                       "reason": ("a held-out calibration target's automatic decision test changes the plan or could "
                                  "not run (conflicts.policy declare_and_test)") if conflict else
@@ -2238,10 +2239,13 @@ def _status_line(run_dir: str, status: str | None) -> str:
 
 
 def _plan_changing(item: dict) -> bool:
-    """An owner item whose evidence shows the plan changes: a decision-bearing kind, or a declaration whose decision
-    test changes the decision."""
-    return item.get("kind") in DECISION_BEARING_KINDS or any(
-        (d.get("test") or {}).get("decision_changes") is True for d in item.get("declarations") or [] if isinstance(d, dict))
+    """An owner item whose evidence shows the plan changes: a decision-bearing kind, a declaration whose decision
+    test changes the decision, or a W0-F evidence conflict whose verdict changes the plan (or whose test did not run:
+    W0-F counts that as changing it; Codex r4 of #316)."""
+    conf = item.get("conflict")
+    return item.get("kind") in DECISION_BEARING_KINDS or (isinstance(conf, dict) and conf.get("changes_plan") is True) \
+        or any((d.get("test") or {}).get("decision_changes") is True
+               for d in item.get("declarations") or [] if isinstance(d, dict))
 
 
 def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:

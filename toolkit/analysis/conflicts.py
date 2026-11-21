@@ -379,6 +379,26 @@ def options(run_dir: str, key: str) -> list:
     return out + [refit_option(est)]
 
 
+def verdict(run_dir: str, key: str) -> dict:
+    """One declared conflict's structured verdict, for the owner's request item (1F, Codex r4 of #316):
+    {status, changes_plan, tests, verdicts}. status: CHANGES_PLAN (a test changes the plan), NOT_RUN (a test did not
+    run: its effect on the plan is unknown), NO_CHANGE, or UNREADABLE (no readable record for the key: fail closed,
+    counted as changing the plan, as W0-F's record does for a test that did not run)."""
+    try:
+        d = load(run_dir) or {}
+    except ValueError:
+        d = {}
+    c = next((c for c in d.get("declared") or [] if isinstance(c, dict) and str(c.get("key")) == str(key)), None)
+    if c is None:
+        return {"status": "UNREADABLE", "changes_plan": True, "tests": [], "verdicts": {}}
+    vs = c.get("verdicts") if isinstance(c.get("verdicts"), dict) else {}
+    vals = set(map(str, vs.values()))
+    status = ("CHANGES_PLAN" if "CHANGES_PLAN" in vals else "NOT_RUN" if "NOT_RUN" in vals or not vals
+              else "NO_CHANGE" if vals == {"NO_CHANGE"} else "UNREADABLE")
+    return {"status": status, "changes_plan": status != "NO_CHANGE", "tests": list(c.get("tests") or []),
+            "verdicts": dict(vs)}
+
+
 def report_lines(run_dir: str) -> list:
     """The report's block: every held-out target, its kind, why and its tests' verdicts."""
     try:

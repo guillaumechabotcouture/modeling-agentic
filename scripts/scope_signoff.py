@@ -623,7 +623,16 @@ def render_md(run_dir: str) -> str:
             lines += [f"Required remedy: {it['fix_requires']}", ""]
         if it.get("options"):            # W0-F: a held-out target's options, a refit with its estimated cost
             lines += ["Options:", ""] + [f"- {o}" for o in it["options"]] + [""]
-        if not it.get("declarations"):
+        conf = it.get("conflict") if isinstance(it.get("conflict"), dict) else None
+        if conf is not None:             # W0-F (Codex r4 of #316): the held-out target's tests and their verdicts
+            st_ = conf.get("status")
+            ch = {"CHANGES_PLAN": "**yes**", "NO_CHANGE": "no"}.get(st_, "**unknown (a test did not run)**"
+                                                                    if st_ == "NOT_RUN" else "**unknown (no readable "
+                                                                    "conflict record)**")
+            vs = conf.get("verdicts") if isinstance(conf.get("verdicts"), dict) else {}
+            lines += [f"Evidence-conflict decision tests: {', '.join(f'{k}: {v}' for k, v in vs.items()) or 'none'}; "
+                      f"changes the plan: {ch}.", ""]
+        elif not it.get("declarations"):
             lines += ["Not declared in scope_declaration.yaml, and **untested**.", ""]
         for dcl in it.get("declarations") or []:
             lines += [f"- Declaration {dcl.get('id')}: {_test_md(dcl.get('test') or {})}"]
