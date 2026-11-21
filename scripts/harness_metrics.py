@@ -572,8 +572,8 @@ def main(argv=None) -> int:
     rs = rows(list(a.run_dirs), explicit, a.cutoff, json.load(open(a.ledger)) if a.ledger else None)
     print(table(rs))
     if a.json:
-        with open(a.json, "w") as f:
-            json.dump({"rows": rs, "summary": wave_summary(rs)}, f, indent=1, default=str)
+        safe_io.publish(a.json, json.dumps({"rows": rs, "summary": wave_summary(rs)}, indent=1, default=str),
+                        os.path.dirname(os.path.abspath(a.json)))
     return 0
 
 
