@@ -275,16 +275,19 @@ def refit_estimate(jc: dict | None) -> dict:
     """What a refit without the held-out target would cost, estimated from the joint calibration this run made: one
     more calibration of the same design (its simulator calls; stored rows may cut it). Not run by the harness."""
     ad = (jc or {}).get("adapter") or {}
-    calls = ad.get("simulator_calls")
-    return {"simulator_calls": calls if _num(calls) else None, "stored_rows_reused": ad.get("stored_rows_reused"),
-            "basis": "one joint calibration without the target, of the design this run calibrated: about the "
-                     "simulator calls its own calibration made (stored rows of this run may be reused)"}
+    runs = (jc or {}).get("runs")          # every engine run the calibration made (unit and benchmark rows)
+    n = sum(len(v) for v in runs.values() if isinstance(v, list)) if isinstance(runs, dict) else None
+    reused = ad.get("stored_rows_reused")
+    return {"engine_runs": n if n else None, "stored_rows_reused": reused if _num(reused) else None,
+            "basis": "one joint calibration without the target, of the design this run calibrated: about the engine "
+                     "runs its own calibration made (stored rows of this run may be reused)"}
 
 
 def refit_option(est: dict | None) -> str:
-    calls = (est or {}).get("simulator_calls")
+    n = (est or {}).get("engine_runs") if isinstance(est, dict) else None
+    ok_ = isinstance(n, int) and not isinstance(n, bool) and n > 0
     return ("refit without the target: amend the spec to drop it and relaunch with reuse; not run by the harness; "
-            "estimated cost " + (f"about {int(calls)} simulator calls (the joint calibration's own)" if calls is not None
+            "estimated cost " + (f"about {n} engine runs (the joint calibration's own)" if ok_
                                  else "one more joint calibration (its size was not recorded)"))
 
 
@@ -361,6 +364,19 @@ def findings(run_dir: str) -> tuple:
                      "Owner decision: the held-out target's test changes the plan (or could not run). Options: accept "
                      "the plan with the target declared; decline; or " + refit_option(d.get("refit_estimate"))})
     return rows, []
+
+
+def options(run_dir: str, key: str) -> list:
+    """The owner's options for one open conflict: accept, decline and, for a held-out target, a refit without it
+    with its estimated cost (owner decision 2026-11-21; never run by the harness)."""
+    out = ["accept: the plan stands with the target declared", "decline: the run is not accepted without the target"]
+    if key == "record":         # no target identified: nothing to refit without
+        return out
+    try:
+        est = (load(run_dir) or {}).get("refit_estimate")
+    except ValueError:
+        est = None
+    return out + [refit_option(est)]
 
 
 def report_lines(run_dir: str) -> list:
@@ -499,9 +515,10 @@ def _self_test() -> int:
                                        {"test_id": tt[1]["id"], "status": "run", "decision_changes": True}])
         rec2 = record(d2["conflicts"], [{"test_id": tt[0]["id"], "status": "run", "decision_changes": False}])
         rec3 = record(d2["conflicts"], [{"test_id": t["id"], "status": "run", "decision_changes": False} for t in tt])
-        est = refit_estimate({"adapter": {"simulator_calls": 240, "stored_rows_reused": 0}})
+        est = refit_estimate({"runs": {"unit": [{}] * 200, "benchmark": [{}] * 40}, "adapter": {}})
         rec = dict(rec, refit_estimate=est)
-        ok("about 240 simulator calls" in refit_option(est) and "was not recorded" in refit_option(refit_estimate(None)),
+        ok("about 240 engine runs" in refit_option(est) and "was not recorded" in refit_option(refit_estimate(None))
+           and all("was not recorded" in refit_option({"engine_runs": x}) for x in (0.5, -3, "unknown", True)),
            "CF_REFIT_OPTION the owner's options name a refit without the target, with its estimated cost")
         ok(rec["needs_owner"] == ["S|r2"] and rec2["needs_owner"] == ["S|r2"] and rec3["needs_owner"] == [],
            "T_CONFLICT_VERDICT a conflict needs the owner when a test changes the plan or did not run, never otherwise")

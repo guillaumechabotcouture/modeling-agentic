@@ -1077,12 +1077,7 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
         opts = {}
         if conflict:            # owner decision 2026-11-21: a refit is listed, with its estimated cost, never run
             from toolkit.analysis import conflicts as CF
-            try:
-                est = (CF.load(run_dir) or {}).get("refit_estimate")
-            except ValueError:
-                est = None
-            opts = {"options": ["accept: the plan stands with the target declared",
-                                "decline: the run is not accepted without the target", CF.refit_option(est)]}
+            opts = {"options": CF.options(run_dir, getattr(f, "key", ""))}
         items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix, **opts,
                       "reason": ("a held-out calibration target's automatic decision test changes the plan or could "
                                  "not run (conflicts.policy declare_and_test)") if conflict else
