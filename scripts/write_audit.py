@@ -286,6 +286,8 @@ REVIEWED: dict = {
         "os-link": (1, "the claim file in the worker's call dir (atomic claim)"),
         "os.open-write": (1, "the worker's TLS files (O_EXCL, private dir)")},
     "scripts/eval_private.py": {"shutil": (4, _EVAL), "open-write": (5, _EVAL)},
+    "toolkit/spec/amend.py": {"shutil": (2, "its own .partial child (on refusal), the dry-sign scratch copy"),
+                              "os-rename": (1, "its own .partial child to the new child name it checked")},
     "scripts/eval_suite.py": {"open-write": (9, _EVAL), "os-symlink": (1, _EVAL), "os-remove": (1, _EVAL),
                               "shell-command": (1, _EVAL + " (--execute runs the cloud launch commands it printed)")},
     "scripts/fixtures.py": {"shutil": (5, _EVAL), "open-write": (7, _EVAL), "os-remove": (1, _EVAL)},
@@ -319,6 +321,9 @@ REVIEWED: dict = {
                                                    "--json report the operator names")},
     "scripts/lib/positive_control.py": {"open-write": (2, "builds the positive-control fixture run in a dir it creates")},
     "scripts/validate_critique_yaml.py": {"os-remove": (1, "its own NamedTemporaryFile in the system temp dir")},
+    "toolkit/analysis/dt_golden.py": {"open-write": (2, "toolkit/analysis/dt_golden.json in the repo, only under "
+                                                         "MA_DT_GOLDEN_UPDATE=1 from run.py's self-test or by the "
+                                                         "operator's `record <log>` command")},
     "toolkit/analysis/figures.py": {"method-write": (2, "savefig / Image.save into an in-memory buffer "
                                                          "(_fig_bytes, contact_sheets), then lib.safe_io")},
     "toolkit/analysis/run.py": {"open-write": (6, _FIX + " (_resign, _direct_toy, _given_column)"), "os-remove": (1, _FIX),

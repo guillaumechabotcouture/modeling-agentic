@@ -363,7 +363,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # Codex r3: the analysis's full engine identity (code, params, config), on both evaluation paths, so later steps
     # (the trajectory step) can be checked against it without batch rows
     point.update(engine_identity=engine_identity(eng))
-    point.update(plan=plan, n_units=len(A.ids), solver={k: sol[k] for k in ("status", "method", "objective", "cost")},
+    point.update(plan=plan, n_units=len(A.ids),
+                 # 1C-c (D3): the status and the relative gap it was proven within, with the threads and time limit
+                 solver={**{k: sol[k] for k in ("status", "method", "objective", "cost")},
+                         **{k: sol.get(k) for k in ("gap_rel", "threads", "time_limit_s", "solver_status")}},
                  interactions=interactions(A, out0), rule=decision_rule(A, out0, plan),
                  model_corrections={"n": len(events0), "on_plan": on_plan, "kinds": sorted({e["kind"] for e in events0}),
                                     "examples": events0[:20]},
@@ -449,6 +452,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     arts["decision_tests"] = S.write("decision_tests", {"tests": [
         {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
+         # 1C-c follow-up: the verdict words are unchanged (tools/workbench and tools/run_console read exactly these
+         # three); a verdict that cannot be settled within the solver's accepted gap is marked beside it
+         "within_solver_gap": bool(x.get("within_solver_gap")),
          "can_move_plan": x["can_move_plan"], "threshold_pct": 100.0 * x["share_threshold"],
          "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
          # F6 S1-5: what moves beside the share, and which criterion changed the plan
@@ -531,6 +537,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
+    S.manifest["solver"] = A.solver_report()       # 1C-c: settings, and the counts contract.py's gate check reads
     S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS)
                               + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
                               + (["burden_validation"] if bvd else []) + (["burden_anchor"] if anc else [])
@@ -591,6 +598,8 @@ def _self_test() -> int:
             fails.append(msg)
 
     q = lambda *a, **k: None  # noqa: E731
+    from toolkit.analysis import dt_golden as DG      # S1: every decision-test record below is a golden record
+    DG.start_capture()
     with tempfile.TemporaryDirectory() as d:
         # ---------------- emulator path, emulator-inversion calibration (the spike's chain)
         bench, v_ok, v_bad = _toy_bench(d)
@@ -743,6 +752,11 @@ def _self_test() -> int:
            "R10 uncertainty_report.yaml carries the headline output and the structured interval")
         txt = open(os.path.join(d, "results.md")).read()
         ok("[CLAIM:" not in txt and R["uncertainty"]["label"] in txt, "R11 results.md is fully rendered from the ledger")
+        sv_ = (json.load(open(os.path.join(d, "analysis", "manifest.json"))).get("solver") or {})
+        ok((sv_.get("headline") or {}).get("solves", 0) >= 1 and (sv_.get("auxiliary_total") or {}).get("solves", 0) > 0
+           and sv_["auxiliary_total"]["not_solved"] == 0 and "relative gap" in txt,
+           f"R11b (1C-c) the manifest records the solver settings and counts, and results.md states the gap the plan "
+           f"is proven within: {sv_.get('auxiliary_total')}")
         dsec = txt[txt.index("## Decision tests"):]
         ok(all(not ch.isdigit() for ch in dt["statement"]) and "[CLAIM" not in dsec,
            "R11b decision-test statements are words; their numbers are claims (Codex P1-4)")
@@ -938,6 +952,7 @@ def _self_test() -> int:
                 pass
         ok(open(os.path.join(out, "v")).read() == "untouched",
            "AR-RW1 an analysis artifact and the manifest are not written through a link or a planted .tmp")
+    DG.check_capture(ok, failed=fails)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1832,6 +1847,32 @@ def _self_test_stability_flagged(ok):
         ok(False, f"JR9d a fold whose calibration is refused is not_run ({type(e).__name__}: {e})")
     finally:
         SB.C.read_targets, SB.C.fit_likelihood = saved
+    # 1C-c (D3): a fold whose re-solve fails is not_run with the solver's status; the other folds run
+    from toolkit.analysis import core as CO
+    flaky, n_ = _A(ids, xs, {}), {"k": 0}
+
+    def solve1(ben_, cost_):
+        n_["k"] += 1
+        if n_["k"] == 1:
+            raise CO.SolveFailed("feasible", 0.5)
+        return {"choice": {i: 0 for i in ids}, "objective": sum(ben_[i][0] for i in ids)}
+    try:
+        flaky.solve = solve1
+        r = SB.run(flaky, z0, plan, ben, cost, plan)
+        nr = r["folds_not_run"]
+        ok(r["n_folds"] == 2 and len(nr) == 1 and "optimizer status feasible" in nr[0]["reason"],
+           f"JR9f a fold whose re-solve is not proven within the gap is not_run with the solver's status ({nr})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9f a fold whose re-solve fails is not_run ({type(e).__name__}: {e})")
+    # Codex r1 P1-2: a fold the solver proves infeasible still stops the step, as before
+    def none_fits(ben_, cost_):
+        raise CO.SolveFailed("infeasible")
+    try:
+        flaky.solve = none_fits
+        SB.run(flaky, z0, plan, ben, cost, plan)
+        ok(False, "JR9g a fold the solver proves infeasible still stops the stability step")
+    except RuntimeError as e:
+        ok(str(e) == "optimizer status infeasible", f"JR9g a fold the solver proves infeasible still stops the step ({e})")
     # 1C-b 2d-iii: quantiles of a sample with a non-finite value are refused (were all NaN)
     from toolkit.analysis.core import q as _q
     try:
@@ -2377,7 +2418,8 @@ def _self_test_cost_structure(ok, A, R):
         raise RuntimeError("optimizer status infeasible")
 
     def broken(ben, cost, budget=None, feas=None):
-        raise RuntimeError("optimizer status time_limit")
+        from toolkit.analysis import core as CO
+        raise CO.SolveFailed("no_feasible_found")
     saved_items = copy.deepcopy(A.alloc["cost_items"])
     try:
         A.solve = spy
@@ -2407,12 +2449,12 @@ def _self_test_cost_structure(ok, A, R):
            f"R5n5 a price case no allocation can afford is a not-run record that keeps its prices: {t5.get('status')}, "
            f"{t5.get('reason')}")
         A.solve = broken
-        try:
-            DT.run_one(A, {"id": "DTc6", "type": "cost_items", "multipliers": {its["a"]: 6.0}},
-                       z0, _b, cost0, plan, R["uncertainty"])
-            ok(False, "R5n6 a solver failure other than a proven infeasibility still stops the analysis")
-        except RuntimeError as e:
-            ok("time_limit" in str(e), f"R5n6 a solver failure other than a proven infeasibility still stops the analysis: {e}")
+        # 1C-c (D3) reverses the earlier R5n6 (such a failure stopped the analysis): the test is a not-run record
+        t6 = DT.run_one(A, {"id": "DTc6", "type": "cost_items", "text": "t", "multipliers": {its["a"]: 6.0}},
+                        z0, _b, cost0, plan, R["uncertainty"])
+        ok(t6["status"] == "not_run" and "no_feasible_found" in t6["reason"] and "infeasible" not in t6["reason"],
+           f"R5n6 a solver failure other than a proven infeasibility is a not-run record that names the solver's "
+           f"status, never a proven infeasibility: {t6.get('status')}, {t6.get('reason')}")
     except Exception as e:  # noqa: BLE001
         ok(False, f"R5n3 the cost_items checks run: {type(e).__name__}: {e}")
     finally:
@@ -2449,6 +2491,7 @@ def _self_test_cost_structure(ok, A, R):
     finally:
         A.alloc, A.spec.raw["options"], A.spec.raw["uncertainty"] = saved
     _self_test_draw_floors(ok, A, R)
+    _self_test_solver(ok, A, R)
     fl = R["point"].get("cost_floors") or {}
     ok(fl.get("n_unit_packages") == 0 and fl.get("items") == [] and "statement" in fl,
        f"R5q the point records floored per-outcome increments (none in this toy): {fl}")
@@ -2469,6 +2512,115 @@ def _floor_q(theta, theta0, at_point):
     the point if `at_point`, else only away from the point values: a draw), so b's increment in a+b is then -10."""
     floored = at_point or dict(theta) != dict(theta0)
     return lambda p: 10.0 * ("b" in p.split("+")) - (20.0 if floored and {"a", "b"} <= set(p.split("+")) else 0.0)
+
+
+def _self_test_solver(ok, A, R):
+    """1C-c (decision D3): the headline solve must be proven within optimizer.gap_rel; inside `auxiliary()` a feasible
+    solution within optimizer.aux_gap_max is accepted and counted, and anything else is SolveFailed with the status."""
+    from toolkit.analysis import core as CO
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    _o, ben0, cost0 = A.evaluate(A.theta0, z0)
+    st = getattr(CO, "solver_settings", dict)()
+    sv = R["point"]["solver"]
+    ok(0 < st.get("gap_rel", 0) <= 1e-3 and sv.get("gap_rel") == st.get("gap_rel") and sv["status"] == "optimal"
+       and sv.get("threads") in (1, st.get("threads")) and sv.get("time_limit_s") == st.get("time_limit_s"),
+       f"SG1 the point plan is proven within the gap of thresholds.yaml, and point.yaml records the gap, the threads "
+       f"and the time limit: { {k: sv.get(k) for k in ('status', 'gap_rel', 'threads', 'time_limit_s')} }")
+    real, saved = CO.aopt.solve, dict(getattr(A, "solver_log", {}))
+
+    def fake(gap):
+        return lambda *a, **k: dict(real(*a, **k), status="feasible", gap=gap)
+    try:
+        CO.aopt.solve, A.solve_memo, A.solver_log = fake(0.001), {}, {}
+        try:
+            A.solve(ben0, cost0)
+            strict = False
+        except RuntimeError as e:
+            strict = str(e) == "optimizer status feasible"
+        with CO.auxiliary(A, "self-test"):
+            r = A.solve(ben0, cost0)
+        lg = dict(A.solver_log.get("self-test") or {})
+        ok(strict and r["status"] == "feasible"
+           and lg == {"solves": 1, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 0},
+           f"SG2 a feasible solution stops a headline solve; an auxiliary solve accepts it within the stated gap and "
+           f"counts it ({strict}, {lg})")
+        refused = []
+        for g in (2 * st["aux_gap_max"], None):
+            CO.aopt.solve, A.solve_memo = fake(g), {}       # without the plan SG2 accepted for this problem
+            with CO.auxiliary(A, "self-test"):
+                try:
+                    A.solve(ben0, cost0)
+                    refused.append(False)
+                except CO.SolveFailed as e:
+                    refused.append(e.status == "feasible")
+        ok(refused == [True, True] and A.solver_log["self-test"]["not_solved"] == 2 and getattr(A, "aux", 0) is None,
+           f"SG3 above the gap, or with no proven gap, an auxiliary solve fails with the status and is counted "
+           f"({refused}, {A.solver_log.get('self-test')})")
+        CO.aopt.solve = real
+        a1, a2 = A.solve(ben0, cost0), A.solve(ben0, cost0)
+        ok(a1["status"] == "optimal" and a2["choice"] == a1["choice"] and len(A.solve_memo) == 1,
+           "SG4 one problem solved twice in a run returns one plan (the proven result is kept), whatever the threads")
+        # Codex r1 P1-3: a feasible plan an auxiliary solve accepted is kept for auxiliary solves, never for a headline
+        calls = {"n": 0}
+
+        def counted(*a, **k):
+            calls["n"] += 1
+            return dict(real(*a, **k), status="feasible", gap=0.001)
+        CO.aopt.solve, A.solve_memo, lg0 = counted, {}, {k: dict(v) for k, v in A.solver_log.items()}
+        with CO.auxiliary(A, "self-test"):
+            f1, f2 = A.solve(ben0, cost0), A.solve(ben0, cost0)
+        try:
+            A.solve(ben0, cost0)
+            head = False
+        except CO.SolveFailed:
+            head = True
+        ok(calls["n"] == 2 and f1["choice"] == f2["choice"] and f2["status"] == "feasible" and head,
+           f"SG6 an accepted feasible plan is returned again to an auxiliary solve of the same problem, and a headline "
+           f"solve of it is still refused ({calls['n']} solver calls, headline refused: {head})")
+        CO.aopt.solve, A.solver_log = real, lg0
+        # Codex r1 P1-6: nothing is kept for ids that are not text (1 and "1" would share a key)
+        kb = {"u": {"1": 1.0}}
+        ok(CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, 1.0) is not None
+           and CO._problem_key({"u": {1: 1.0}}, kb, {"feasible": {"u": {1: True}}}, 1.0) is None
+           and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, 1.0)
+           != CO._problem_key(kb, kb, {"feasible": {"u": {"1": False}}}, 1.0),
+           "SG7 the kept-result key needs text ids and separates problems that differ only in feasibility")
+        ok(CO._problem_key({"u": {"1": "1"}}, kb, {"feasible": {"u": {"1": True}}}, 1.0) is None
+           and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, True) is None,
+           "SG8 (Codex r2 P1) nothing is kept for a table value or budget that is not a number, so the allocator's "
+           "own input check is never skipped")
+        # 1C-c follow-up: the better of an accepted incumbent and the point plan, with the gap as a bound
+        plan0 = dict(R["point"]["plan"])
+        obj0 = sum(ben0[i][plan0[i]] for i in A.ids)
+        worse = dict(a1, status="feasible", gap=0.005, objective=obj0 - 1.0, choice={i: A.comp for i in A.ids})
+        b1 = CO.best_known(A, worse, plan0, ben0, cost0)
+        b2 = CO.best_known(A, dict(a1, status="feasible", gap=0.005), plan0, ben0, cost0)
+        ok(b1["choice"] == plan0 and b1["objective"] == obj0 and b1["solver_gap"]["kept"] == "point_plan"
+           and 0 <= b1["solver_gap"]["bound"] < b2["solver_gap"]["bound"] + 1.0 and b2["solver_gap"]["kept"] == "incumbent"
+           and b2["solver_gap"]["gap"] == 0.005 and b2["solver_gap"]["bound"] > 0
+           and "solver_gap" not in CO.best_known(A, a1, plan0, ben0, cost0),
+           f"SG9 an accepted incumbent below the point plan gives way to it; the bound to the optimum is recorded; a "
+           f"proven solve is returned as it is ({b1.get('solver_gap')}, {b2.get('solver_gap')})")
+        from toolkit.analysis import decision_tests as DTg
+        CO.aopt.solve, A.solve_memo, lg1 = fake(0.001), {}, {k: dict(v) for k, v in A.solver_log.items()}
+        tg = DTg.run_one(A, {"id": "DTg", "type": "envelope", "text": "t",
+                             "values": [float(A.spec["constraints"]["envelope_usd"])]},
+                         z0, ben0, cost0, plan0, R["uncertainty"])
+        CO.aopt.solve, A.solve_memo, A.solver_log = real, {}, lg1
+        rg = (tg.get("results") or [{}])[0].get("regret_solver_gap") or {}
+        ok(tg["status"] == "run" and rg.get("gap") == 0.001 and rg.get("bound", 0) > 0 and tg["results"][0]["regret"] >= 0
+           and isinstance(tg["results"][0].get("within_solver_gap"), bool)
+           and bool(tg.get("within_solver_gap")) == (tg["results"][0]["within_solver_gap"] is True),
+           f"SG10 a decision test solved to an accepted incumbent records the gap beside its regret, and whether its "
+           f"verdict can be settled within it ({rg}, {tg.get('within_solver_gap')})")
+        rep = A.solver_report()
+        ok(rep["gap_rel"] == st["gap_rel"] and rep["headline"]["solves"] >= 1
+           and rep["auxiliary_total"] == {"solves": 3, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 2},
+           f"SG5 the solver record totals the auxiliary solves: {rep.get('auxiliary_total')}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"SG2-SG5 the solver contract ({type(e).__name__}: {e})")
+    finally:
+        CO.aopt.solve, A.solver_log = real, saved
 
 
 def _self_test_draw_floors(ok, A, R):

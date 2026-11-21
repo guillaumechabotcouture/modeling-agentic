@@ -1127,9 +1127,15 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     A_ = A
     for n_, ((v, ben, cost, budget, feas), low) in enumerate(zip(cases, lowers)):
         A = arms[n_] if t == "unit_attribute" else A_
+        from toolkit.analysis.core import auxiliary, best_known
         try:
-            sol = A.solve(ben, cost, budget=budget, feas=feas)
+            with auxiliary(A, "decision_tests"):
+                sol = best_known(A, A.solve(ben, cost, budget=budget, feas=feas), plan, ben, cost, budget, feas)
         except RuntimeError as e:
+            if getattr(e, "status", "infeasible") != "infeasible":      # 1C-c (D3): not a stop, and not a proof
+                return _not_run(A, dt, f"at {v} the solver returned no plan it could prove within the stated gap "
+                                       f"(status {e.status}); nothing is proven about that case",
+                                {"cost_multipliers": dict(mult)} if t == "cost_items" else None)
             if t == "boundary_engine" and str(e).strip() == "optimizer status infeasible":     # #252 review P2-5
                 return _not_run(A, dt, "with the engine's costs at the boundary units no allocation that meets the "
                                        "constraints fits the budget the plan is solved within (the solver proves it infeasible)")
@@ -1145,9 +1151,11 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         # (the point plan judged under the test's costs, feasibility and planning budget: Codex r1 P2-1)
         bchg = {c: max((abs(float(ben[i][k]) - float(ben0[i][k])) for i in A.ids for k in A.pk if c in A.pk[k]),
                        default=0.0) for c in (A.spec["options"].get("components") or {})}
-        results.append({"value": v, **MV.summarise(A, plan, ch, ben, cost, sol["objective"], budget=budget, feas=feas),
+        results.append({"value": v, **MV.summarise(A, plan, ch, ben, cost, sol["objective"], budget=budget, feas=feas,
+                                                   gap=sol.get("solver_gap")),
                         "benefit_change": bchg,
                         "objective": sol["objective"], "recommendation": A.mix_text(ch),
+                        "plan_sha256": plan_sha256(ch),      # S1: which unit gets which package (dt_golden plans)
                         "provably_unchanged": bool(low), **(extra.get(v) or {})})
     A = A_
     worst = max(results, key=lambda r: r["share_units_changed"])
@@ -1194,6 +1202,13 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
            "benefit_change_by_package": {k: max(max((abs(float(c_[1][i][k]) - float(ben0[i][k])) for i in A.ids),
                                                     default=0.0) for c_ in cases) for k in A.pk},
            "package_components": {k: sorted(v) for k, v in A.pk.items()}}
+    soft = [r for r in results if r.get("within_solver_gap")]
+    if soft and not any(r["decision_changes"] for r in results if not r.get("within_solver_gap")):
+        # 1C-c follow-up: no value settles the verdict outside the solver's accepted gap; marked beside the verdict
+        rec["within_solver_gap"] = True
+        rec["statement"] += (f" At {len(soft)} of {len(results)} tested values the solver stopped before proving its "
+                             "plan, and the verdict there cannot be settled within the recorded bound "
+                             "(regret_solver_gap).")
     if sv:
         rec["spec_value"] = sv
     if t == "cost_items":
@@ -1217,6 +1232,14 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         if extra.get("_inputs"):
             rec["arm_inputs"] = extra["_inputs"]
     return rec
+
+
+def plan_sha256(choice) -> str:
+    """sha256 of a plan {unit: package}: which unit gets which package (the shares and moves do not show it)."""
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps({str(k): str(v) for k, v in dict(choice).items()}, sort_keys=True).encode()
+                          ).hexdigest()
 
 
 def _rescale(ratio: float, g: float) -> float:
