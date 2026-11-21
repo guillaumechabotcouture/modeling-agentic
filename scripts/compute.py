@@ -4055,7 +4055,8 @@ def _self_test_fp_dispatch(ok) -> None:
     # FPX5: code_fingerprint uses it for this file, and only for this file.
     with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as rd:
         os.makedirs(os.path.join(repo, "scripts")); os.makedirs(os.path.join(rd, "models"))
-        open(os.path.join(rd, "models", "m.py"), "w").write("def f(p):\n    return p\n")
+        # W0-A: the function imports scripts/other.py, so other.py is in its closure once it exists
+        open(os.path.join(rd, "models", "m.py"), "w").write("import other\n\n\ndef f(p):\n    return p\n")
         saved = globals()["REPO"]
         try:
             globals()["REPO"] = repo
