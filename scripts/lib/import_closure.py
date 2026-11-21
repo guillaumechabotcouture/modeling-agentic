@@ -442,6 +442,34 @@ def _self_test() -> int:
         put("toolkit/c/alias.py", "from importlib import import_module as load\n\ndef run(p):\n    return load(p)\n")
         al = closure(os.path.join(td, "toolkit/c/alias.py") + "::run", td)
         ok(any("dynamic import" in u for u in al["unresolved"]), f"IC10 an aliased dynamic import fails closed: {al}")
+        # Codex r2 (η): what the walk cannot follow statically fails closed instead of being guessed
+        put("toolkit/s/__init__.py", "")
+        put("toolkit/s/impl.py", "def score(p):\n    from toolkit.b import far\n    return far.x\n")
+        put("toolkit/s/api.py", "from toolkit.s.impl import score\n")
+        put("toolkit/s/plain.py", "import os\n\ndef score(p):\n    return 1\n")
+        put("toolkit/c/star.py", "from toolkit.s.api import *\n\ndef run(p):\n    return score(p)\n")
+        put("toolkit/c/star2.py", "from toolkit.s.plain import *\n\ndef run(p):\n    return score(p)\n")
+        st, st2 = (closure(os.path.join(td, f"toolkit/c/{n}.py") + "::run", td) for n in ("star", "star2"))
+        ok(any("re-exports" in u for u in st["unresolved"]) and not st2["unresolved"],
+           f"IC11 a star import of a module that re-exports fails closed; of one that does not, it does not: {st} {st2}")
+        put("toolkit/g/__init__.py", "")
+        put("toolkit/g/guard.py", "import importlib\nFP_DYNAMIC_IMPORTS = {'engine': ('toolkit/b',), 'oracle': ('toolkit/b',)}\n"
+            "FP_LOADERS = {'resolve': ('engine',), 'attr': (), 'module': ()}\n\n"
+            "def resolve(kind, ref):\n    return importlib.import_module(ref)\n\n"
+            "def attr(kind, mod, name):\n    return getattr(importlib.import_module(mod), name)\n")
+        put("toolkit/c/gattr.py", "from toolkit.g import guard as G\n\ndef run(p):\n"
+            "    return G.attr('oracle', p['m'], 'gen_' + p['n'])()\n")
+        put("toolkit/c/gres.py", "from toolkit.g import guard as G\n\ndef run(p):\n    return G.resolve('engine', p['r'])\n")
+        ga, gr = (closure(os.path.join(td, f"toolkit/c/{n}.py") + "::run", td) for n in ("gattr", "gres"))
+        ok(any("attr" in u and "loader" in u for u in ga["unresolved"]) and not gr["unresolved"]
+           and "toolkit/b/far.py" in gr["files"],
+           f"IC12 a function loaded through a guard loader fails closed; a checked class load does not: {ga} {gr}")
+        rd = os.path.join(td, "run")
+        put("run/models/job.py", "import importlib\nFP_DYNAMIC_IMPORTS = ()\n\ndef run(p):\n"
+            "    return importlib.import_module(p['m']).X\n")
+        rj = closure(os.path.join(rd, "models/job.py") + "::run", td, rd)
+        ok(any("dynamic import" in u for u in rj["unresolved"]),
+           f"IC13 run code cannot declare its own dynamic imports: a non-literal import in it fails closed: {rj}")
     print(f"{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)}'}")
     return 1 if fails else 0
 

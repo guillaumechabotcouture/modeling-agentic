@@ -4026,6 +4026,17 @@ def _self_test_w0a(ok) -> None:
             d1 = god()
             ok(d1.get("computed") == 2 and d1.get("reused") == 0,
                f"FP_UNRESOLVED_NO_REUSE across an unrelated change nothing is reused ({d1.get('computed')} computed)")
+            # Codex r2: run code imports a run-root module named by its input; the fallback covers the run's code too
+            w("models/dynjob.py", "import importlib\n\n\ndef f(p):\n    return {'y': importlib.import_module(p['m']).X}\n",
+              rd)
+            w("plugin.py", "X = 1\n", rd)
+            pout, pins = os.path.join(rd, "analysis", "p.jsonl"), [{"m": "plugin", "i": i} for i in range(2)]
+            p0 = run_map(rd, "models/dynjob.py::f", pins, pout, backend="local", max_workers=1, ledger=False)[1]
+            w("plugin.py", "X = 2\n", rd)
+            p1 = run_map(rd, "models/dynjob.py::f", pins, pout, backend="local", max_workers=1, ledger=False)[1]
+            ok(p0.get("computed") == 2 and p1.get("computed") == 2 and "run_code" in (p1.get("key_parts") or {}),
+               f"FP_UNRESOLVED_RUN_ROOT a run-root module loaded by name from run code: editing it recomputes "
+               f"({p1.get('computed')} computed, parts {sorted(p1.get('key_parts') or {})})")
             # large files: content, never mtime
             with mock.patch.dict(g, {"_FP_HASH_MB": 0}):
                 k0 = code_fingerprint(rd, os.path.join(repo, "job.py::f"))
