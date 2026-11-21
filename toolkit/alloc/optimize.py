@@ -946,6 +946,30 @@ def _self_test() -> int:
            f"TC36 imported as toolkit.alloc beside a run's costs.py, neither shadows the other: "
            f"{pr.stdout.strip()} {pr.stderr.strip()[-300:]}")
     _self_test_links(ok, raises)
+    # 1C-c (D3): a stated relative gap and threads; a "feasible" result carries a proven gap (LP relaxation bound)
+    try:
+        rg = solve(benefit, cost, feas, B, method="ilp", gap_rel=1e-4, threads=2)
+        r0 = solve(benefit, cost, feas, B, method="ilp")
+        ok(rg["status"] == "optimal" and rg["gap_rel"] == 1e-4 and rg["threads"] == 2 and r0["gap_rel"] == 0.0
+           and r0["threads"] == 1 and rg["objective"] >= want_obj * (1 - 1e-4) and r0["choice"] == want,
+           f"TG1 the ILP takes a relative gap and a thread count and records both; the default stays exact: {rg}")
+    except (TypeError, KeyError) as e:
+        ok(False, f"TG1 the ILP takes a relative gap and a thread count and records both ({type(e).__name__}: {e})")
+    import types
+    real = _pulp()
+    fake = types.SimpleNamespace(**{k: getattr(real, k) for k in dir(real) if not k.startswith("__")})
+    fake.LpSolutionOptimal, fake.LpSolutionIntegerFeasible = -99, real.LpSolutionOptimal    # reads as stopped early
+    keep = globals()["_pulp"]
+    globals()["_pulp"] = lambda: fake
+    try:
+        rf = solve(benefit, cost, feas, 0.93 * B, method="ilp")
+    finally:
+        globals()["_pulp"] = keep
+    ex = solve(benefit, cost, feas, 0.93 * B, method="ilp")
+    ok(rf["status"] == "feasible" and rf.get("gap") is not None and 0.0 <= rf["gap"] < 0.5
+       and ex.get("gap", "absent") is None and rf["objective"] == ex["objective"],
+       f"TG2 a solve that stopped early reports its gap to the LP relaxation bound; a proven one reports none: "
+       f"{rf.get('gap')}, {ex.get('gap', 'absent')}")
     if fails:
         print("SELF-TEST FAILURES:")
         for m in fails:

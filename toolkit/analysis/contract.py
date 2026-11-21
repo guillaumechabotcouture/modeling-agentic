@@ -731,6 +731,19 @@ def _self_test() -> int:
         ok(kinds(d) == {"analysis_contract_missing"}, "K3 an unreadable manifest fails closed")
         S = complete_run(d)
         ok(gate_findings(d) == [], f"K4 a completed harness run for the current signed spec passes: {gate_findings(d)}")
+        # 1C-c (D3): auxiliary solves that could not be used are a finding only above the stated share
+        tot = {"solves": 100, "feasible_accepted": 3, "max_gap": 0.002, "not_solved": 5}
+        S.manifest["solver"] = {"aux_not_solved_share_max": 0.05, "auxiliary_total": tot}
+        S.finalize("complete")
+        ok(gate_findings(d) == [], f"KS1 auxiliary solves not solved at the stated share: recorded, no finding: "
+                                   f"{gate_findings(d)}")
+        tot["not_solved"] = 6
+        S.finalize("complete")
+        ok(kinds(d) == {"analysis_solver_degraded"}, f"KS2 above the share it is a gate finding: {kinds(d)}")
+        S.manifest["solver"] = {"auxiliary_total": "x"}
+        S.finalize("complete")
+        ok(kinds(d) == {"analysis_solver_degraded"}, f"KS3 a solver record that cannot be read fails closed: {kinds(d)}")
+        S = complete_run(d)
         rel = "analysis/sensitivity.yaml"
         doc = yaml.safe_load(open(os.path.join(d, rel)))
         doc["produced_by"] = "agent"

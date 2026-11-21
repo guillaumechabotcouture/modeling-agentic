@@ -583,14 +583,34 @@ def _self_test() -> int:
            f"FD16 infeasible exploratory envelopes are recorded separately: {fr_i.get('infeasible')}")
 
         def broken(ben, cost, budget=None, feas=None):
-            raise RuntimeError("optimizer status time_limit")
+            from toolkit.analysis import core as CO
+            raise CO.SolveFailed("no_feasible_found")
         A.solve = broken
+        # 1C-c (D3) reverses the earlier FD16b (such a failure propagated, Codex r1 P1-4): the frontier is exploratory,
+        # so the envelope is recorded as not solved with the solver's status, apart from the proven-infeasible ones
         try:
-            frontier(A, ben0, cost0, out0)
-            ok(False, "FD16b a solver failure other than infeasibility propagates")
-        except RuntimeError:
-            ok(True, "FD16b a solver failure other than infeasibility propagates")
+            fr_b = frontier(A, ben0, cost0, out0)
+            ns = fr_b.get("not_solved") or []
+            ok(fr_b["points"] == [] and fr_b["infeasible"] == [] and len(ns) > 0
+               and all(x["status"] == "no_feasible_found" for x in ns),
+               f"FD16b a solver failure other than infeasibility is recorded per envelope as not solved: {ns[:1]}")
+        except RuntimeError as e:
+            ok(False, f"FD16b a solver failure other than infeasibility is recorded, not raised ({e})")
         A.solve = orig
+        # 1C-c: a rebuilt plan that differs from the stored one is accepted only when the stored plan is feasible and
+        # within the solver's stated gap of the re-solved optimum
+        pwg = globals().get("plan_within_gap")
+        sol_ = A.solve(ben0, cost0)
+        u_ = next(i for i in A.ids if plan[i] != A.comp)
+        alt = next(k for k in A.pk if k not in (plan[u_], A.comp) and A.feas["feasible"][u_][k])
+        ben_t = {i: dict(v) for i, v in ben0.items()}
+        cost_t = {i: dict(v) for i, v in cost0.items()}
+        ben_t[u_][alt], cost_t[u_][alt] = ben0[u_][plan[u_]], cost0[u_][plan[u_]]      # a tie: either is optimal
+        rich = {i: max(cost0[i], key=cost0[i].get) for i in A.ids}
+        ok(pwg is not None and pwg(A, sol_, dict(plan, **{u_: alt}), ben_t, cost_t) is True
+           and pwg(A, sol_, dict(plan, **{u_: A.comp}), ben0, cost0) is False and pwg(A, sol_, rich, ben0, cost0) is False,
+           "FD10b a stored plan tied with the rebuilt optimum is within the gap; a worse one, or one over the budget, "
+           "is not")
         # ---- Codex r1 P2-8: the frontier reports outcome averted, not the (possibly discounted) objective
         half = {i: {k: 0.5 * v for k, v in ben0[i].items()} for i in A.ids}
         fr_h = frontier(A, half, cost0, out0)
