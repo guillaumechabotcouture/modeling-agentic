@@ -1,11 +1,12 @@
 # Skills Index
 
-58 skills live here; agents attach them in `agents/__init__.py`
-(`_registry()`). Each skill is a directory with a `SKILL.md` that opens
+58 skills live here. v2's spec task loads `decision-spec` by path; the rest were
+attached to the retired v1 agents and remain project skills for Claude Code
+sessions in this repository. Each skill is a directory with a `SKILL.md` that opens
 with YAML frontmatter (`name` matching the directory, `description`)
 followed by the guidance body. `python3 scripts/validate_skill_attachments.py`
 fails on phantom attachments and on missing or malformed frontmatter;
-add `--show-orphans` to list skills no agent attaches.
+add `--show-orphans` to list skills no module under `agents/` loads.
 
 Process and rigor skills must stay disease-agnostic: domain specifics
 belong in the disease skills (e.g. `malaria-modeling/`) and in
