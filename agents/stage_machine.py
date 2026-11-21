@@ -2909,7 +2909,19 @@ def _self_test() -> int:
         # T_OWNER_LEAD_PROVISIONAL (1F, D2): under --signoff lead the same finding never waits: the lead answers it
         # provisionally, the answer is recorded and listed, and, as the plan changes, flagged above the report's draft
         d, T, st = new_run("dt_lead", {}, signoff="lead", max_rounds=1)
-        s_l = mk(d, T, st).run()
+        held, real_hr = [], _SS.harness_record
+
+        def _hr(rd):     # T_OWNER_LEAD_LOCK (Codex r4 of #316): the lock is held while the answers are recorded
+            held.append(("record", getattr(_SS, "lock_held", lambda _r: "no lock_held")(rd)))
+            return real_hr(rd)
+        _SS.harness_record = _hr
+        try:
+            s_l = mk(d, T, st).run()
+        finally:
+            _SS.harness_record = real_hr
+        ok(held and all(h == ("record", True) for h in held),
+           f"T_OWNER_LEAD_LOCK the harness records the lead's provisional answers holding the sign-off lock, so an "
+           f"owner sign that waited on it sees the request closed ({held})")
         prov = _SS.provisional(d)
         rep_l = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
         span = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep_l else [0, 0]

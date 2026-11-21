@@ -1078,26 +1078,80 @@ def _self_test() -> int:
        and raced_nl and a_nl.get("by") == "lead",
        f"SO37 an owner answer signed after the provisional writer's last read is kept ({a.get('by')}, "
        f"{a.get('decision')}); without the lock it is lost ({a_nl.get('by')})")
-    # SO38 (Codex r3 of #316, P1-6): a sign waiting on the lock re-checks the request once it holds it: a request
-    # closed meanwhile is refused (the CLI exits non-zero) and no answer is written
+    # SO38 (Codex r3 of #316, P1-6; tightened after Codex r4): a sign waiting on the lock re-checks the request once
+    # it holds it: a request closed meanwhile is refused (the CLI exits non-zero) and no answer is written. The request
+    # is closed only after the signer has read it pending (signalled), so the refusal comes from the locked re-read.
     with tempfile.TemporaryDirectory() as d:
         items = [{"finding": "f1", "fingerprint": "fp1", "kind": "k"}]
         json.dump({"pending": True, "round": 2, "items": items}, open(os.path.join(d, REQUEST), "w"))
         rc, env_mode = [], os.environ.pop("MA_SIGNOFF_MODE", None)
+        read_pending = threading.Event()
+        real_req, me = globals()["_load_request"], threading.get_ident()
+
+        def signalling_req(rd):
+            out = real_req(rd)
+            if threading.get_ident() != me and (out or {}).get("pending"):
+                read_pending.set()
+            return out
+        globals()["_load_request"] = signalling_req
         try:
             with _Locked(d):
                 t = threading.Thread(target=lambda: rc.append(main(["sign", d, "--by", "owner", "--decline-all"])))
                 t.start()
-                _time.sleep(0.5)
+                signalled = read_pending.wait(10)
                 json.dump({"pending": False, "round": 2, "items": items, "superseded_by": "ACCEPT"},
                           open(os.path.join(d, REQUEST), "w"))
             t.join(10)
         finally:
+            globals()["_load_request"] = real_req
             if env_mode is not None:
                 os.environ["MA_SIGNOFF_MODE"] = env_mode
-        ok(rc == [1] and not os.path.exists(os.path.join(d, SIGNOFF)),
-           f"SO38 a sign that waited on the lock refuses a request closed meanwhile, exit non-zero ({rc}, "
+        ok(signalled and rc == [1] and not os.path.exists(os.path.join(d, SIGNOFF)),
+           f"SO38 a sign that waited on the lock refuses a request closed meanwhile, exit non-zero ({signalled}, {rc}, "
            f"written: {os.path.exists(os.path.join(d, SIGNOFF))})")
+    # SO39 (Codex r4 of #316): the lock nests within one thread (the harness holds it across its provisional answers,
+    # their record and the request's close), and blocks another holder meanwhile
+    def _bounded(fn, secs=10):
+        """Run fn in a daemon thread; a deadlock reports as a failure instead of hanging the self-test."""
+        out = []
+
+        def run():
+            try:
+                out.append(fn())
+            except Exception as e:  # noqa: BLE001
+                out.append(f"{type(e).__name__}: {e}")
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(secs)
+        return out[0] if out else "timed out (deadlock)"
+
+    with tempfile.TemporaryDirectory() as d:
+        def nest():
+            with _Locked(d):
+                with _Locked(d):
+                    inner = lock_held(d)
+                still = lock_held(d)
+            return inner, still, lock_held(d)
+        got = _bounded(nest)
+        ok(got == (True, True, False),
+           f"SO39 the sign-off lock nests in one thread and is held until the outer release ({got})")
+    # SO40 (Codex r4 of #316, P1-2): a delayed record for an earlier round never closes a newer pending request
+    with tempfile.TemporaryDirectory() as d:
+        it_a = {"finding": "fa", "fingerprint": "fpa", "kind": "k"}
+        it_b = {"finding": "fb", "fingerprint": "fpb", "kind": "k"}
+        json.dump({"pending": True, "round": 1, "items": [it_a]}, open(os.path.join(d, REQUEST), "w"))
+        def delayed():
+            with _Locked(d):
+                t = threading.Thread(target=lambda: record(d, {"action": "ACCEPT"}, 1), daemon=True)
+                t.start()
+                _time.sleep(0.3)
+                record(d, {"action": ACTION, "unresolved_high": [{"owner_signoff": True, "owner_item": it_b}]}, 2)
+            t.join(10)
+            return json.load(open(os.path.join(d, REQUEST)))
+        req_ = _bounded(delayed)
+        req_ = req_ if isinstance(req_, dict) else {"error": req_}
+        ok(req_.get("pending") is True and [i.get("fingerprint") for i in req_.get("items") or []] == ["fpb"],
+           f"SO40 a delayed record for round 1 leaves round 2's pending request in place ({req_})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
