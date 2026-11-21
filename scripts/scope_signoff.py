@@ -1017,34 +1017,72 @@ def _self_test() -> int:
         ok(bool(fp) and c_v1[0].get("owner_signed") and not c_v2[0].get("owner_signed")
            and c_v2[0].get("owner_signoff"),
            f"SO36 a non-provisional lead answer releases nothing where only provisional ones count ({c_v2[0]})")
-    # SO37 (Codex r2 of #316, P1-4): an owner's answer signed while the harness writes provisional answers is never
-    # lost: the record is read and written under one lock
+    # SO37 (Codex r2 of #316, P1-4; tightened after Codex r3): an owner's answer signed while the harness writes
+    # provisional answers is never lost: the record is read and written under one lock. The owner signs in the window
+    # after the provisional writer's last read (_raw_doc) and before it publishes; the same race with the lock replaced
+    # by a no-op loses the answer, so the test detects a missing lock.
     import threading
     import time as _time
+
+    class _NoLock:
+        def __init__(self, rd):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *e):
+            return False
+
+    def _race(lock_cls):
+        with tempfile.TemporaryDirectory() as d:
+            items = [{"finding": "f1", "fingerprint": "fp1", "kind": "k"}]
+            json.dump({"pending": True, "round": 2, "items": items}, open(os.path.join(d, REQUEST), "w"))
+            real_raw, real_lock = globals()["_raw_doc"], globals()["_Locked"]
+            th, me = [], threading.get_ident()
+
+            def racing_raw(rd):
+                out = real_raw(rd)
+                if not th and threading.get_ident() == me:      # the provisional writer's last read
+                    t = threading.Thread(target=lambda: sign(d, "owner", {"f1": "decline"}, note="owner, concurrently"))
+                    th.append(t)
+                    t.start()
+                    _time.sleep(0.5)
+                return out
+            globals()["_raw_doc"], globals()["_Locked"] = racing_raw, lock_cls
+            try:
+                provisional_answers(d, items, 2)
+            finally:
+                globals()["_raw_doc"], globals()["_Locked"] = real_raw, real_lock
+            for t in th:
+                t.join(10)
+            return bool(th), (json.load(open(os.path.join(d, SIGNOFF))).get("answers") or {}).get("fp1") or {}
+    raced, a = _race(_Locked)
+    raced_nl, a_nl = _race(_NoLock)
+    ok(raced and a.get("by") == "owner" and a.get("decision") == "decline"
+       and raced_nl and a_nl.get("by") == "lead",
+       f"SO37 an owner answer signed after the provisional writer's last read is kept ({a.get('by')}, "
+       f"{a.get('decision')}); without the lock it is lost ({a_nl.get('by')})")
+    # SO38 (Codex r3 of #316, P1-6): a sign waiting on the lock re-checks the request once it holds it: a request
+    # closed meanwhile is refused (the CLI exits non-zero) and no answer is written
     with tempfile.TemporaryDirectory() as d:
         items = [{"finding": "f1", "fingerprint": "fp1", "kind": "k"}]
         json.dump({"pending": True, "round": 2, "items": items}, open(os.path.join(d, REQUEST), "w"))
-        real_load = globals()["load_answers"]
-        th = []
-
-        def racing_load(rd):
-            out = real_load(rd)
-            if not th:
-                t = threading.Thread(target=lambda: sign(d, "owner", {"f1": "decline"}, note="owner, concurrently"))
-                th.append(t)
+        rc, env_mode = [], os.environ.pop("MA_SIGNOFF_MODE", None)
+        try:
+            with _Locked(d):
+                t = threading.Thread(target=lambda: rc.append(main(["sign", d, "--by", "owner", "--decline-all"])))
                 t.start()
                 _time.sleep(0.5)
-            return out
-        globals()["load_answers"] = racing_load
-        try:
-            provisional_answers(d, items, 2)
-        finally:
-            globals()["load_answers"] = real_load
-        for t in th:
+                json.dump({"pending": False, "round": 2, "items": items, "superseded_by": "ACCEPT"},
+                          open(os.path.join(d, REQUEST), "w"))
             t.join(10)
-        a = (json.load(open(os.path.join(d, SIGNOFF))).get("answers") or {}).get("fp1") or {}
-        ok(a.get("by") == "owner" and a.get("decision") == "decline",
-           f"SO37 an owner answer signed during the provisional write is kept ({a.get('by')}, {a.get('decision')})")
+        finally:
+            if env_mode is not None:
+                os.environ["MA_SIGNOFF_MODE"] = env_mode
+        ok(rc == [1] and not os.path.exists(os.path.join(d, SIGNOFF)),
+           f"SO38 a sign that waited on the lock refuses a request closed meanwhile, exit non-zero ({rc}, "
+           f"written: {os.path.exists(os.path.join(d, SIGNOFF))})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
