@@ -4544,6 +4544,21 @@ def _self_test_w0a2(ok) -> None:
             b11, _ = decide(launch_tree=launch)
             ok(b11.get("decision") == "refused" and "run-root module" in b11.get("reason", ""),
                f"FP_RESTAMP_RUN_MODULE a run-root module in the closure, which the old key never held: refused ({b11})")
+            # Codex A2 r2: an unresolved closure with a run module the old key never held; a self-test assignment
+            for root in (repo, launch):
+                w(root, "job.py", "import importlib\nfrom toolkit.eng import m\n\n\ndef f(p):\n"
+                  "    return {'y': m.g(p) + 0 * len(importlib.import_module(p.get('m', 'toolkit.eng.m')).__name__)}\n")
+            store()
+            b12, _ = decide(launch_tree=launch)
+            os.remove(os.path.join(rd, "helper.py"))
+            open(lc, "w").write(src + "\n_self_test_setting = 1\n")
+            store()
+            b13, _ = decide(launch_tree=launch)
+            open(lc, "w").write(src)
+            ok(b12.get("decision") == "refused" and "outside models/" in b12.get("reason", "")
+               and b13.get("decision") == "refused",
+               f"FP_RESTAMP_UNRESOLVED an unresolved closure with a run-root module is refused, and a self-test-named "
+               f"assignment is compared, not masked: {b12} {b13}")
     forms = {k: _def_sha(os.path.join(REPO, k.partition("::")[0]), k.partition("::")[2]) for k in FP_RESTAMP_FORMS}
     ok(all(forms[k] == v[1] for k, v in FP_RESTAMP_FORMS.items()),
        f"FP_RESTAMP_FORMS each form recorded for this tree is this tree's source (update it with the code): {forms}")
