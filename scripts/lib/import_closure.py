@@ -151,6 +151,9 @@ def _dynamic(node, binds=None) -> int | None:
         if isinstance(n, ast.Attribute) and n.attr == "__dict__" and isinstance(n.value, ast.Name) \
                 and n.value.id in binds:
             return n.lineno                                     # an imported name's namespace, read by key
+        if isinstance(n, ast.Attribute) and n.attr == "modules" and isinstance(n.value, ast.Name) \
+                and n.value.id == "sys":
+            return n.lineno                                     # every loaded module, read by key (Codex r5)
         if id(n) in literal:
             continue
         # any reference, called or not (`load = importlib.import_module`, Codex r2), or an alias bound to one
@@ -573,6 +576,11 @@ def _self_test() -> int:
            f"IC17 a guard re-exported as a module, a loader taken as a value, a star import of a package that only sets "
            f"__all__ and a declaration with an unusable path all fail closed (a checked engine load still does not): "
            f"{gm['unresolved']} {gl['unresolved']} {s4['unresolved']} {d2['unresolved']}")
+        # Codex r5 (κ): sys.modules reached from code is a namespace read by key
+        put("toolkit/c/sysm.py", "import sys\nfrom toolkit.s import impl\n\ndef run(p):\n"
+            "    return sys.modules['toolkit.s.impl'].score(p)\n")
+        sm = closure(os.path.join(td, "toolkit/c/sysm.py") + "::run", td)
+        ok(any("dynamic import" in u for u in sm["unresolved"]), f"IC18 code reading sys.modules fails closed: {sm}")
     print(f"{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)}'}")
     return 1 if fails else 0
 

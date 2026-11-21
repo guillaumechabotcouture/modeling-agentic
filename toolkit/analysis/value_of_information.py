@@ -411,6 +411,39 @@ def too_few(draws: int, report: dict, A) -> dict:
             "inputs": [], "not_drawn": not_drawn(report, A), "outcome": A.primary}
 
 
+def clean_solve(A, ben, cost, budget, ev, d):
+    """One draw's best plan at `budget` on which no model correction `ev` bears (run()'s clean()). Both solves are
+    auxiliary solves of the same kind, so each is counted and may use a feasible plan within the stated gap (1C-c
+    follow-up, Codex r2 P1). None when the first solve has no usable plan, a correction bears on every plan, or the
+    solve without the corrected packages fails; a proven infeasibility of the first solve is raised, as before."""
+    from toolkit.analysis.core import AnalysisBlocked, SolveFailed, auxiliary
+    try:
+        with auxiliary(A, "value_of_information"):
+            sol = A.solve(ben, cost, budget=budget)
+    except SolveFailed as e:
+        if e.status == "infeasible":
+            raise
+        return None
+    try:
+        A.guard(f"uncertainty draw {d}", [sol["choice"]], ev)
+        return sol
+    except AnalysisBlocked:
+        pass
+    if any(e.get("package") in ("*", getattr(A, "comp", None)) for e in ev):
+        return None
+    f = dict(A.feas, feasible={u: dict(v) for u, v in A.feas["feasible"].items()})
+    for e in ev:
+        if str(e.get("unit")) in f["feasible"] and e.get("package") in f["feasible"][str(e.get("unit"))]:
+            f["feasible"][str(e["unit"])][e["package"]] = False
+    try:
+        with auxiliary(A, "value_of_information"):
+            sol = A.solve(ben, cost, budget=budget, feas=f)
+        A.guard(f"uncertainty draw {d}", [sol["choice"]], ev)
+        return sol
+    except (AnalysisBlocked, RuntimeError, ValueError):
+        return None
+
+
 def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, level: float = 0.95, seed: int = 0,
         thr=None) -> dict:
     """The value_of_information artifact from the uncertainty step's draws (`col`), the headline plan and the declared
@@ -512,25 +545,7 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
         """The draw's best plan at `budget` on which no model correction bears: when the optimum carries one, the
         corrected packages are taken out in that draw and it is solved again (None when a correction bears on every
         plan, on the comparator or a whole unit)."""
-        sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=budget)
-        try:
-            A.guard(f"uncertainty draw {d}", [sol["choice"]], rows[d]["events"])
-            return sol
-        except AnalysisBlocked:
-            pass
-        ev = rows[d]["events"]
-        if any(e.get("package") in ("*", getattr(A, "comp", None)) for e in ev):
-            return None
-        f = dict(A.feas, feasible={u: dict(v) for u, v in A.feas["feasible"].items()})
-        for e in ev:
-            if str(e.get("unit")) in f["feasible"] and e.get("package") in f["feasible"][str(e.get("unit"))]:
-                f["feasible"][str(e["unit"])][e["package"]] = False
-        try:
-            sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=budget, feas=f)
-            A.guard(f"uncertainty draw {d}", [sol["choice"]], ev)
-            return sol
-        except (AnalysisBlocked, RuntimeError, ValueError):
-            return None
+        return clean_solve(A, tab(Bn[d]), tab(Cs[d]), budget, rows[d]["events"], d)
     pi = obj.copy()
     if getattr(A, "plan_budget", None) is not None and abs(float(A.plan_budget) - B) > 1e-9 * max(1.0, B):
         # the draws were re-optimised within a reserve; with perfect information costs are known: the full budget
@@ -1304,6 +1319,31 @@ def _self_test() -> int:
                       ("E5", e5), ("F1", f1), ("F2", f2), ("F3", f3), ("F4", f4), ("F5", f5), ("F6", f6),
                       ("G1", g1), ("G2", g2), ("G3", g3), ("VG gate", gate)):
         run_case(label, fn)
+    # 1C-c follow-up (Codex r2 P1): both solves of a draw's clean plan are auxiliary solves, counted the same way
+    from toolkit.analysis.core import AnalysisBlocked as _AB
+
+    class _Cl:
+        aux, comp, feas = None, "none", {"feasible": {"u": {"none": True, "a": True, "b": True}}}
+
+        def __init__(self):
+            self.seen, self.guards = [], 0
+
+        def solve(self, ben, cost, budget=None, feas=None):
+            self.seen.append((self.aux, None if feas is None else feas["feasible"]["u"]["a"]))
+            return {"choice": {"u": "a" if feas is None else "b"}, "objective": 1.0}
+
+        def guard(self, where, plans, events=None):
+            self.guards += 1
+            if self.guards == 1:
+                raise _AB(where, [{"unit": "u", "package": "a", "kind": "clip"}])
+    cl = _Cl()
+    try:
+        got = clean_solve(cl, {"u": {}}, {"u": {}}, 1.0, [{"unit": "u", "package": "a", "kind": "clip"}], 0)
+        ok(cl.seen == [("value_of_information", None), ("value_of_information", False)] and got["choice"] == {"u": "b"}
+           and cl.aux is None,
+           f"VC1 the retry without the corrected package is an auxiliary solve too: {cl.seen}")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"VC1 the retry without the corrected package is an auxiliary solve too ({type(e).__name__}: {e})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
