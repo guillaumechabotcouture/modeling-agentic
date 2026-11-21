@@ -7,7 +7,13 @@ spend is capped by main.py (--max-budget-usd 35). The launch's cap_usd, which th
 reserves against the owner-signed `ev` scope (cloud/budget.py, cloud/budget_scopes.yaml), is
 US$35 per run times the replicates on the cluster. Every cluster a launch makes is named
 `ev-<question>-<tag>-gcc` (plus -keeper / -overflow), all under the scope's `ev-` prefix; the
-tag is refused unless it keeps the name to a-z, 0-9 and -.
+tag is refused unless it keeps the name to a-z, 0-9 and -. Neither amount is a hard stop: the
+budget guard admits a launch over the scope with an alert (owner 2026-11-17), and the scope
+counts Coiled spend only, not model spend.
+
+Limits (so cloud/launch_watch.py watches these configs unattended): main.py is stopped after
+RUN_TIMEOUT_HOURS, the protocol's 24 h cut-off, and every cluster of the launch is shut down
+by Coiled after CLUSTER_TIMEOUT, busy or not.
 
 Environment:
     EVAL_TAG   the arm being measured (default "main"), e.g. "s3" for a stage-machine
@@ -37,6 +43,8 @@ BUDGET_USD = 35
 CAP_USD_PER_RUN = 35
 MAX_ROUNDS = 3
 BUDGET_SCOPE = "ev"
+RUN_TIMEOUT_HOURS = 24
+CLUSTER_TIMEOUT = "26 hours"
 NAME_PREFIX = "ev-"
 
 
@@ -60,6 +68,8 @@ def eval_config(question: str) -> RunConfig:
         out_dir=os.path.expanduser(f"~/modeling-agentic-keep/evals/{tag}/{question}"),
         pipeline=pipeline,
         cap_usd=CAP_USD_PER_RUN * reps,
+        run_timeout_hours=RUN_TIMEOUT_HOURS,
+        cluster_timeout=CLUSTER_TIMEOUT,
         budget_scope=BUDGET_SCOPE,
         flags=("--max-budget-usd", str(BUDGET_USD), "--signoff", "lead"),
         max_rounds=MAX_ROUNDS,
