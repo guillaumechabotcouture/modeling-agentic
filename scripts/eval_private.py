@@ -18,8 +18,9 @@ Storage (results_store: account from $COILED_STORAGE_ACCOUNT, DefaultAzureCreden
     outputs/evals_private/v<N>/bundle.enc       the ciphertext
     outputs/evals_private/v<N>/manifest.json    sha256 of the ciphertext and each
                                                 question's input hashes (not secret)
-Pin: evals/private.yaml in the repository names the version and the ciphertext sha256,
-so a replaced bundle is refused.
+Pin: evals/private.yaml in the repository names the version and the ciphertext sha256 (and,
+from the next publish, the manifest's sha256), so a replaced bundle is refused. `verify_public`
+checks these digests without the key: the run and launch path uses it and never decrypts.
 Key: keychain service `modeling-agentic-evals`, account `evals`.
 
 Every failure (no pin, no storage account, missing blob, hash mismatch, wrong key,
@@ -36,6 +37,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -223,7 +225,10 @@ def publish(src, version, key, store) -> dict:
             json.dump(man, f, indent=1, sort_keys=True)
         store.upload(bp, f"{prefix}/bundle.enc")
         store.upload(mp, f"{prefix}/manifest.json")
-    return {"version": int(version), "prefix": prefix, "bundle_sha256": man["bundle_sha256"]}
+        with open(mp, "rb") as f:
+            man_sha = _sha(f.read())
+    return {"version": int(version), "prefix": prefix, "bundle_sha256": man["bundle_sha256"],
+            "manifest_sha256": man_sha}
 
 
 def read_pin(path=PIN_PATH) -> dict | None:
@@ -236,19 +241,40 @@ def read_pin(path=PIN_PATH) -> dict | None:
     return pin if isinstance(pin, dict) else None
 
 
+def _pin_problem(pin) -> str | None:
+    """Why a pin cannot name a bundle, or None. `manifest_sha256` may be absent (a pin from before it was written),
+    but when present it must be a sha256."""
+    if not isinstance(pin, dict) or not pin.get("prefix") or not pin.get("bundle_sha256") or "version" not in pin:
+        return "no evals/private.yaml naming the bundle (run publish)"
+    v = pin["version"]
+    if (isinstance(v, bool) or not isinstance(v, int) or v < 1 or pin["prefix"] != f"{BLOB_ROOT}/v{v}"
+            or not (isinstance(pin["bundle_sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", pin["bundle_sha256"]))):
+        return f"evals/private.yaml: version, prefix or bundle_sha256 malformed ({v!r}, {pin['prefix']!r})"
+    if "manifest_sha256" in pin and not (isinstance(pin["manifest_sha256"], str)
+                                         and re.fullmatch(r"[0-9a-f]{64}", pin["manifest_sha256"])):
+        return f"evals/private.yaml: manifest_sha256 {pin['manifest_sha256']!r} is not a sha256"
+    return None
+
+
 def write_pin(pin: dict, path=PIN_PATH) -> None:
     import yaml
+    prob = _pin_problem(pin)
+    if prob:
+        raise BundleError("bundle_not_pinned", f"refusing to write the pin: {prob}")
     with open(path, "w") as f:
         f.write("# Phase 50 α: where the eval suite's encrypted hidden half lives (evals/README.md).\n"
                 "# Written by `scripts/eval_suite.py publish`; nothing here is secret.\n")
-        yaml.safe_dump({k: pin[k] for k in ("version", "prefix", "bundle_sha256")}, f, sort_keys=False)
+        yaml.safe_dump({k: pin[k] for k in ("version", "prefix", "bundle_sha256", "manifest_sha256") if k in pin}, f,
+                       sort_keys=False)
 
 
-def fetch(dest, key, store, pin) -> dict:
-    """Download, verify and decrypt the pinned bundle into dest; return its manifest.
-    `key` None reads the keychain, after the downloads verify."""
-    if not isinstance(pin, dict) or not pin.get("prefix") or not pin.get("bundle_sha256"):
-        raise BundleError("bundle_not_pinned", "no evals/private.yaml naming the bundle (run publish)")
+def _download_verified(store, pin) -> tuple[dict, bytes]:
+    """(manifest, ciphertext) of the pinned bundle, every check that needs no key done: the ciphertext hashes to
+    the manifest and the pin, the manifest's other fields match them, and, when the pin records it, the manifest
+    hashes to `manifest_sha256`. Neither decrypts nor reads the keychain."""
+    prob = _pin_problem(pin)
+    if prob:
+        raise BundleError("bundle_not_pinned", prob)
     got = {}
     with tempfile.TemporaryDirectory() as td:
         for name in ("manifest.json", "bundle.enc"):
@@ -259,6 +285,9 @@ def fetch(dest, key, store, pin) -> dict:
                 raise BundleError("bundle_missing", f"{pin['prefix']}/{name} is not in storage") from e
             with open(p, "rb") as f:
                 got[name] = f.read()
+    if "manifest_sha256" in pin and _sha(got["manifest.json"]) != pin["manifest_sha256"]:
+        raise BundleError("bundle_hash_mismatch", f"manifest {_sha(got['manifest.json'])[:12]}, "
+                                                  f"pin {str(pin['manifest_sha256'])[:12]}")
     try:
         man = json.loads(got["manifest.json"])
     except ValueError as e:
@@ -278,7 +307,23 @@ def fetch(dest, key, store, pin) -> dict:
     bad += [k for k in ("questions", "legacy") if not isinstance(man.get(k), dict)]
     if bad:
         raise BundleError("bundle_hash_mismatch", f"manifest fields disagree with the pin or the ciphertext: {bad}")
-    plain = decrypt(got["bundle.enc"], key if key is not None else keychain_key())
+    return man, got["bundle.enc"]
+
+
+def verify_public(store, pin) -> dict:
+    """The run and launch path's check of the hidden half (owner 2026-11-21): the pinned ciphertext and the public
+    manifest verify by digest, and the manifest (each question's input hashes, nothing secret) is returned. It never
+    decrypts and never reads the keychain; only `fetch` (grade and the maintainer commands) does. A manifest that a
+    pin without `manifest_sha256` cannot authenticate is still bound to the pinned ciphertext, and `fetch` checks its
+    input hashes against the decrypted answer keys, so a forged one makes a run ungradable, never mis-graded."""
+    return _download_verified(store, pin)[0]
+
+
+def fetch(dest, key, store, pin) -> dict:
+    """Download, verify and decrypt the pinned bundle into dest; return its manifest.
+    `key` None reads the keychain, after the downloads verify."""
+    man, cipher = _download_verified(store, pin)
+    plain = decrypt(cipher, key if key is not None else keychain_key())
     try:
         unpack(plain, dest)
         if truths(dest) != (man.get("questions"), man.get("legacy")):
@@ -387,6 +432,37 @@ def _self_test() -> int:
             ok(before["quality"] == after["quality"] == 1.0
                and [c["score"] for c in before["checks"]] == [c["score"] for c in after["checks"]],
                f"E1e pack, encrypt, upload, download, decrypt, grade: same scores {before['quality']} {after['quality']}")
+            # E10 (owner 2026-11-21: the run path is decoupled from the answer key): verify_public checks the
+            # pinned ciphertext and the public manifest without the key; it never decrypts or reads the keychain
+            g = globals()
+            real = {n: g[n] for n in ("decrypt", "keychain_key")}
+            touched = []
+            for n in real:
+                g[n] = (lambda name: lambda *a, **k: touched.append(name) or (_ for _ in ()).throw(
+                    AssertionError(f"{name} called by verify_public")))(n)
+            try:
+                pub = verify_public(store, pin)
+                ok(pub.get("questions", {}).get("toy") == {"a.csv": "x"} and not touched,
+                   f"E10 verify_public returns the public manifest without decrypting: {touched} {pub}")
+                expect_error("bundle_hash_mismatch", lambda: verify_public(store, dict(pin, bundle_sha256="0" * 64)),
+                             "E10b a wrong bundle digest in the pin fails closed")
+                expect_error("bundle_not_pinned", lambda: verify_public(store, None), "E10c no pin fails closed")
+                expect_error("bundle_hash_mismatch", lambda: verify_public(store, dict(pin, manifest_sha256="0" * 64)),
+                             "E10d a manifest that does not hash to the pin's manifest_sha256 fails closed")
+                for bad_digest in (None, "", "zz"):   # Codex r1: present but not a digest is not "absent"
+                    expect_error("bundle_not_pinned", lambda: verify_public(store, dict(pin, manifest_sha256=bad_digest)),
+                                 f"E10g a manifest_sha256 of {bad_digest!r} fails closed")
+                expect_error("bundle_not_pinned", lambda: write_pin({"version": 1}, os.path.join(td, "pin.yaml")),
+                             "E10h write_pin refuses a pin without its required fields")
+                for bad_pin in (dict(pin, version=None), dict(pin, bundle_sha256="x"), dict(pin, prefix="elsewhere")):
+                    expect_error("bundle_not_pinned", lambda: write_pin(bad_pin, os.path.join(td, "pin.yaml")),
+                                 f"E10i (Codex r2) write_pin refuses a malformed pin: {bad_pin}")
+                ok(not os.path.exists(os.path.join(td, "pin.yaml")), "E10h nothing written")
+                ok(not touched, f"E10e no case decrypted or read the keychain: {touched}")
+            finally:
+                g.update(real)
+            ok(pin.get("manifest_sha256") and verify_public(store, pin)["version"] == 1,
+               f"E10f publish pins the manifest's digest too, and it verifies: {pin}")
             expect_error("bundle_key_invalid", lambda: fetch(os.path.join(td, "d2"), new_key(), store, pin),
                          "E2 a wrong key fails closed")
             expect_error("bundle_key_invalid", lambda: fetch(os.path.join(td, "d2b"), b"not a key", store, pin),
@@ -447,8 +523,8 @@ def _self_test() -> int:
                 with open(mpath, "w") as f:
                     json.dump(m if edit else [1, 2], f)
                 d = os.path.join(td, f"d7_{name.replace(' ', '_')}")
-                try:
-                    fetch(d, key, store, pin)
+                try:   # a pin from before manifest_sha256: the field checks themselves must refuse
+                    fetch(d, key, store, {k: v for k, v in pin.items() if k != "manifest_sha256"})
                     ok(False, f"E7 a manifest with a changed {name} is accepted")
                 except BundleError as e:
                     ok(e.code in ("bundle_hash_mismatch", "bundle_unreadable"), f"E7 {name}: {e.code}")

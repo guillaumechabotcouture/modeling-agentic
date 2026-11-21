@@ -299,6 +299,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if jc is not None:
         A.set_joint(jc)
         A.flagged = {f["unit"]: f for f in jc["unmatched_decision"]["flagged"]}
+        from toolkit.analysis import conflicts as CF
+        A.conflict_tests = CF.tests(jc["unmatched_decision"].get("conflicts"))
     from toolkit.analysis import variants as V
     V.apply_headline(A)     # F6 S1-6: `headline: <variant>`: every solve from here carries the variant's rule
     # ---- calibration
@@ -469,6 +471,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
+    conf = (jc or {}).get("unmatched_decision", {}).get("conflicts") if jc is not None else None
+    if conf is not None:      # W0-F: each held-out target, why, its tests' verdicts; who decides (empty: none)
+        from toolkit.analysis import conflicts as CF
+        crec = CF.record(conf, dts, refit=CF.refit_estimate(jc))
+        arts["conflicts"] = S.write("conflicts", crec, CF.PRODUCER, [arts["joint_calibration"], arts["decision_tests"]])
+        log(f"conflicts: {len(crec['declared'])} target(s) held out and tested; {len(crec['needs_owner'])} need the owner")
     # ---- deliverable CSV
     d = spec["deliverable"]
     cols = d["columns"]
@@ -1416,6 +1424,32 @@ def _self_test_joint(ok, q):
                "low-confidence with its reason in the allocation file, the point, the uncertainty report and label")
         except AnalysisBlocked as e:
             ok(False, f"JR8 flag mode proceeds (blocked: {e})")
+    with tempfile.TemporaryDirectory() as d:     # W0-F: an unpredicted miss under conflicts.policy declare_and_test
+        sp = JC._toy_joint(d, unreachable="5", group=False)
+        raw = yaml.safe_load(open(sp))
+        raw["conflicts"] = {"policy": "declare_and_test"}
+        raw["uncertainty"]["priors"]["base"]["range"] = [0.45, 0.55]       # as JR8 (a toy property)
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            cf = yaml.safe_load(open(os.path.join(d, "analysis", "conflicts.yaml")))["data"]
+            dtx = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"]["tests"]
+            ids = [t["test_id"] for t in dtx if t["test_id"].startswith("conflict_")]
+            ok([c["key"] for c in cf["declared"]] == ["5"] and len(ids) == 2 and cf["needs_owner"] == ["5"],
+               f"JR-CF1 an undeclared unit miss is held out, tested twice, the run completes, and a test that cannot run "
+               f"puts it to the owner ({[(c['key'], c['verdicts']) for c in cf['declared']]}, {ids})")
+        except AnalysisBlocked as e:
+            ok(False, f"JR-CF1 the policy declares the miss and the run continues (blocked: {e})")
+        raw["conflicts"] = {"policy": "stop"}
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        os.remove(os.path.join(d, signoff.SPEC_SIGNOFF))
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR-CF2 conflicts.policy stop keeps today's behaviour (the miss blocks)")
+        except AnalysisBlocked:
+            ok(True, "JR-CF2 conflicts.policy stop keeps today's behaviour (the miss blocks)")
     with tempfile.TemporaryDirectory() as d:
         JC._toy_joint(d)
         signoff.sign(d, "lead", note="self-test")
@@ -1733,7 +1767,7 @@ def _self_test_stability_flagged(ok):
             self.ids = list(ids)
             self.by_id = {i: {"g": f"g{n % 3}", "x": xs[i], "pop": 1.0} for n, i in enumerate(ids)}
             self.spec = {"analysis": {"stability": {"holdout_group": "g", "covariates": ["x"]}},
-                         "options": {"components": {"c": {}}}}
+                         "options": {"components": {"c": {}}}, "calibration": {"range": [-1e6, 1e6]}}
             self.flagged, self.seen = flagged, {}
 
         def evaluate(self, theta, zh, hid):
@@ -1769,6 +1803,45 @@ def _self_test_stability_flagged(ok):
            f"JR9b folds without unflagged training units are not_run and the metrics skip them ({r['verdict']})")
     except Exception as e:  # noqa: BLE001
         ok(False, f"JR9b folds without unflagged training units are not_run ({type(e).__name__}: {e})")
+    # 1C-b 2c-i (STAB_CLAMP): a held-out prediction outside calibration.range is clamped to it and counted
+    far = _A(ids, dict(xs, u11=1000.0), {})
+    far.spec["calibration"] = {"range": [0.0, 1.5]}
+    try:
+        r = SB.run(far, z0, plan, ben, cost, plan)
+        ok(max(far.seen.values()) <= 1.5 and min(far.seen.values()) >= 0.0 and r.get("predictions_clamped", 0) >= 1
+           and sum(f.get("predictions_clamped", 0) for f in r["folds"]) == r.get("predictions_clamped"),
+           f"JR9c a held-out prediction outside calibration.range is clamped and counted "
+           f"({r.get('predictions_clamped')} clamped; largest evaluated {max(far.seen.values()):.3g})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9c a held-out prediction outside calibration.range is clamped ({type(e).__name__}: {e})")
+    # 1C-b 2c-ii: a fold whose refit is refused is not_run with the refusal's code; the other folds still run
+    lik = _A(ids, xs, {})
+    lik.method, lik.lik = "likelihood", {"x": {}, "params": [], "z": {}}
+    lik.evaluate = lambda theta, zh, hid=None: ({}, {i: [1.0, 0.5] for i in ids}, ct(ids))
+    saved = SB.C.read_targets, SB.C.fit_likelihood
+
+    def fit(spec, model, rows=None, fixed_z=None, **kw):
+        if "u0" in fixed_z:
+            raise SB.C.CalibrationRefused("calibration_ridge", "toy: the fold's fit is refused")
+        return {"theta": {}, "z": {i: z0[i] for i in ids if i not in fixed_z}}
+    lik.model = None
+    try:
+        SB.C.read_targets, SB.C.fit_likelihood = (lambda spec: [{"unit": i} for i in ids]), fit
+        r = SB.run(lik, z0, plan, ben, cost, plan)
+        nr = r["folds_not_run"]
+        ok(r["n_folds"] == 2 and len(nr) == 1 and nr[0]["group"] == "g0" and "calibration_ridge" in nr[0]["reason"],
+           f"JR9d a fold whose calibration is refused is not_run with the reason; the other folds run ({nr})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9d a fold whose calibration is refused is not_run ({type(e).__name__}: {e})")
+    finally:
+        SB.C.read_targets, SB.C.fit_likelihood = saved
+    # 1C-b 2d-iii: quantiles of a sample with a non-finite value are refused (were all NaN)
+    from toolkit.analysis.core import q as _q
+    try:
+        ok(False, f"JR9e quantiles of a sample with a non-finite value are refused: {_q([1.0, float('nan'), 3.0])}")
+    except ValueError as e:
+        ok("not finite" in str(e) and _q([1.0, 2.0, 3.0])["median"] == 2.0 and _q([]) is None,
+           f"JR9e quantiles of a sample with a non-finite value are refused ({e})")
 
 
 def _self_test_priors(ok, q):
@@ -1845,7 +1918,7 @@ def _self_test_priors(ok, q):
            f"(Codex r2 P1), and the comparator burden and cost outputs have theirs (F6 S2-4): {err and len(err.cols)} "
            "columns")
         ok(em["columns_by_quantity"].get("comparator") == len(M.pops) * len(M.outcomes)
-           and "emulator_error_floors" in u,
+           and "emulator_error_floors" in u and "counts" in (u.get("emulator_error_clips") or {}),
            f"RP9b the report counts the error columns by quantity and the uncertainty records cost floors (F6 S2-4): "
            f"{em['columns_by_quantity']}")
         design.pop("prior_names")

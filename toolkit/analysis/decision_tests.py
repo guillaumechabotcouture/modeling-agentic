@@ -83,14 +83,20 @@ def _lowers_only_unchosen(ben0, ben, plan) -> bool:
 def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
     os.makedirs(os.path.join(run_dir, DIR), exist_ok=True)
     out = []
-    dts = list(A.spec["analysis"].get("decision_tests") or []) + prior_range_tests(A)
+    dts = list(A.spec["analysis"].get("decision_tests") or []) + prior_range_tests(A) \
+        + list(getattr(A, "conflict_tests", None) or [])        # W0-F: one pair per declared evidence conflict
     ids = [str(dt.get("id")) for dt in dts]
     dup = sorted({i for i in ids if ids.count(i) > 1})
     if dup:     # F6 S2-5d review r3: declared and automatic tests share one result path per id
         raise ValueError(f"decision tests: ids {dup} are used twice (a declared test shadows an automatic one); "
                          "rename the declared test")
     for dt in dts:
-        rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0)
+        try:
+            rec = run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0)
+        except Exception as e:  # noqa: BLE001 -- W0-F: an automatic conflict test that fails goes to the owner
+            if not dt.get("conflict"):
+                raise
+            rec = _not_run(A, dt, f"the test failed: {type(e).__name__}: {e}")
         if dt.get("automatic"):
             rec["automatic"] = True
         p = os.path.join(run_dir, DIR, f"{dt['id']}.yaml")
