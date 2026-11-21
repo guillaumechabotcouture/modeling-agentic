@@ -1992,11 +1992,12 @@ def batch_reuse(run_dir: str) -> list:
         try:     # confined: no link followed under models/ or data/, nothing outside the run dir read (round 3)
             ex = (o, o + ".tmp", o + ".summary.json", o + ".summary.json.tmp", o + C.PARTIAL_EXT, o + C.JOB_EXT,
                   o + ".log")
-            kp = doc.get("key_parts") if isinstance(doc.get("key_parts"), dict) else None
-            # W0-A: a batch stored before key_parts has the old whole-tree key; a recorded engine identity
+            kp = doc.get("key_parts") if isinstance(doc.get("key_parts"), dict) else {}
+            # W0-A: a key without the "k2-" prefix is the old whole-tree key; a recorded engine identity
             # (key_parts.extra) is compared when the batch runs, not here
             fp = (C.code_fingerprint(run_dir, doc["fn"], exclude=ex, confined=True, extra_digest=kp.get("extra"))
-                  if kp else C._legacy_fingerprint(run_dir, doc["fn"], exclude=ex, confined=True))
+                  if str(doc["code_fp"]).startswith("k2-") else
+                  C._legacy_fingerprint(run_dir, doc["fn"], exclude=ex, confined=True))
         except ValueError as e:
             out.append({"out": rel, "fn": doc["fn"], "reused": False, "why": f"not checked: {e}"})
             continue

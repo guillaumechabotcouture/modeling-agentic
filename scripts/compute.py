@@ -2564,7 +2564,8 @@ def fn_closure(run_dir: str, fn_spec: str, confined: bool = False) -> dict:
         except OSError as e:
             bad.append(f"{rel}: not read ({type(e).__name__})")
     for rel in c.get("run", ()):            # Codex r1 P1-5: a helper at the run root is not in run_files
-        if rel.split(os.sep)[0] in ("models", "data") or os.path.join(run_dir, rel) == fn_file:
+        if rel.split(os.sep)[0] in ("models", "data") or os.path.join(run_dir, rel) == fn_file \
+                or not rel.endswith(".py"):     # modules only: a run's data and outputs are not code (Codex r2)
             continue
         if confined:
             bad.append(f"run:{rel}: a run module outside models/ and data/ (confined)")
@@ -2740,7 +2741,7 @@ def _same_key(rec: dict, fp: str, legacy) -> bool:
     legacy fingerprint here (`legacy`, a callable computed at most once by the caller) still equals it."""
     if rec.get("code_fp") == fp:
         return True
-    return bool(legacy) and not rec.get("key_parts") and rec.get("code_fp") == legacy()
+    return bool(legacy) and not str(rec.get("code_fp")).startswith("k2-") and rec.get("code_fp") == legacy()
 
 
 def _once(f):
@@ -2756,6 +2757,8 @@ def _carries(result, ident) -> bool:
         if isinstance(x, dict) and depth < 4:
             if isinstance(x.get("provenance"), dict):
                 found.append(x["provenance"].get("engine") == ident)
+            if isinstance(x.get("rows"), list):          # a grouped result: every member must carry it (Codex r2)
+                found += [False for r in x["rows"] if not (isinstance(r, dict) and isinstance(r.get("provenance"), dict))]
             for v in x.values():
                 walk(v, depth + 1)
         elif isinstance(x, list) and depth < 4:

@@ -43,9 +43,11 @@ class _Mod:
         for n in self.tree.body:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not n.decorator_list:
                 self.defs.setdefault(n.name, []).append(n)
-                if isinstance(n, ast.ClassDef):      # its bases and class-level statements run on import
-                    self.always.append(ast.Module(body=[*n.bases, *n.keywords, *[
-                        s for s in n.body if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))]],
+                if isinstance(n, ast.ClassDef):      # its header, class-level statements, and its methods'
+                    fns = [s for s in n.body if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                    self.always.append(ast.Module(body=[*n.bases, *n.keywords, *[    # decorators and defaults
+                        s for s in n.body if s not in fns], *[x for f in fns for x in (
+                            *f.decorator_list, *f.args.defaults, *[d for d in f.args.kw_defaults if d])]],
                         type_ignores=[]))
                 else:                                # so do a function's default values (Codex r1 P1-4)
                     self.always.append(ast.Module(body=[*n.args.defaults, *[d for d in n.args.kw_defaults if d]],
@@ -143,18 +145,20 @@ def _dynamic(node, binds=None) -> int | None:
     """The line of a dynamic import or exec site: by its name, by an alias bound to one (`from importlib import
     import_module as load`), or a module's `__dict__` / `vars()` (Codex r1 P1-3)."""
     binds = binds or {}
+    literal = {id(n.func) for n in ast.walk(node) if isinstance(n, ast.Call) and _literal_import(n)}
     for n in ast.walk(node):
         if isinstance(n, ast.Attribute) and n.attr == "__dict__" and isinstance(n.value, ast.Name) \
                 and n.value.id in binds:
             return n.lineno                                     # an imported name's namespace, read by key
-        if isinstance(n, ast.Call) and _literal_import(n) is None:
-            f = n.func
-            alias = isinstance(f, ast.Name) and any(a in DYNAMIC_ATTRS | DYNAMIC_NAMES for _, a in binds.get(f.id, ()))
-            mod_vars = isinstance(f, ast.Name) and f.id == "vars" and n.args and isinstance(n.args[0], ast.Name) \
-                and n.args[0].id in binds
-            if (isinstance(f, ast.Attribute) and f.attr in DYNAMIC_ATTRS) or alias or mod_vars or (
-                    isinstance(f, ast.Name) and f.id in DYNAMIC_NAMES):
-                return n.lineno
+        if id(n) in literal:
+            continue
+        # any reference, called or not (`load = importlib.import_module`, Codex r2), or an alias bound to one
+        if (isinstance(n, ast.Attribute) and n.attr in DYNAMIC_ATTRS) or (isinstance(n, ast.Name) and (
+                n.id in DYNAMIC_NAMES or any(a in DYNAMIC_ATTRS | DYNAMIC_NAMES for _, a in binds.get(n.id, ())))):
+            return n.lineno
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "vars" and n.args \
+                and isinstance(n.args[0], ast.Name) and n.args[0].id in binds:
+            return n.lineno
     return None
 
 
@@ -183,13 +187,15 @@ class Walk:
         return os.path.relpath(p, self.repo).replace(os.sep, "/")
 
     def find(self, name: str) -> str | None:
-        parts = name.split(".")
+        """The module file (a package before a same-named module, as Python does). A name two roots resolve to
+        different files fails closed: which one runs depends on sys.path at run time (Codex r2)."""
+        parts, hits = name.split("."), []
         for r in self.roots:
             p = os.path.join(r, *parts)
-            for c in (p + ".py", os.path.join(p, "__init__.py")):
-                if os.path.isfile(c):
-                    return os.path.realpath(c)
-        return None
+            hits += [os.path.realpath(c) for c in (os.path.join(p, "__init__.py"), p + ".py") if os.path.isfile(c)][:1]
+        if len(set(hits)) > 1:
+            self.unresolved.add(f"import {name}: found in more than one search root ({len(set(hits))} files)")
+        return hits[0] if hits else None
 
     def is_repo_top(self, top: str) -> bool:
         return any(os.path.isfile(os.path.join(r, top + ".py")) or os.path.isdir(os.path.join(r, top))
