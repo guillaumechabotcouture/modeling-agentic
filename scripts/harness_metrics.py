@@ -205,7 +205,7 @@ def pauses(run) -> list[dict]:
         for r in resumes:
             if r in used:
                 start = max(start, r)                      # the end of a recorded pause: the next one starts after
-            elif r >= t_in and (t_out is None or r <= t_out) and (lim is None or r < lim):
+            elif r > t_in and (t_out is None or r <= t_out) and (lim is None or r <= lim):   # whole seconds
                 j = _sign_journal_done(st, start, r) if to == "SIGN" else None
                 out.append({"reason": PAUSE_STATES[to], "state": to, "at": max(start, j) if j else start,
                             "resume": r, "from": INF})
@@ -791,6 +791,12 @@ def _self_test() -> int:
            "HM40 an older build's unrecorded pause before a recorded one in the same SIGN visit is still inferred")
         b3 = mk("s_c", fa, {"parent_run": {"run_dir": "r_ok", "run_state_sha256": None}})
         ok(len(chains([os.path.join(root, "r_ok"), b3])) == 2, "HM41 a parent_run with no hash is never linked")
+        h = [{"at": at(1), "from": "SPEC", "to": "SIGN"}, {"at": at(2), "paused": "awaiting_signoff", "state": "SIGN"}]
+        r = summarise([mk("r_sec2", {"state": "SIGN", "paused": "awaiting_signoff", "history": h}, inv=(0, 2))], A)
+        h = [{"at": at(2), "from": "SPEC", "to": "SIGN"}, {"at": at(2.5), "paused": "awaiting_signoff", "state": "SIGN"}]
+        r2 = summarise([mk("r_sec3", {"state": "SIGN", "paused": "awaiting_signoff", "history": h}, inv=(0, 2))], A)
+        ok(iv(r, "I1_pauses") == 1 and iv(r2, "I1_pauses") == 0, "HM42 same-second edges: a resume in the second "
+           "the new build re-pauses ends the old pause; a resume in the second SIGN is entered ends none")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
