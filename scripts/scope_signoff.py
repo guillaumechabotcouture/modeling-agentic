@@ -513,7 +513,8 @@ def record(run_dir: str, decision: dict, round_n: Optional[int] = None,
             return None
         doc = dict(old, pending=False, superseded_at=now, superseded_by=decision.get("action"))
     from lib.safe_io import write_nofollow    # atomic, no link followed (review round 4, P1-2)
-    write_nofollow(run_dir, REQUEST, json.dumps(doc, indent=1).encode(), atomic=True)
+    with _Locked(run_dir):                    # Codex r3 of #316 (P1-6): a sign in progress finishes first
+        write_nofollow(run_dir, REQUEST, json.dumps(doc, indent=1).encode(), atomic=True)
     return p
 
 
@@ -593,7 +594,17 @@ def sign(run_dir: str, by: str, answers: Optional[dict] = None, all_decision: Op
     if not req or not req.get("pending") or not req.get("items"):
         raise ValueError("no scope declaration is waiting for sign-off")
     with _Locked(run_dir):
-        return _sign_locked(run_dir, req, by, answers, all_decision, note)
+        # Codex r3 of #316 (P1-6): the request is read again once the lock is held. One closed or replaced while this
+        # call waited (record holds the same lock) is refused: an answer to it would be reported signed and never applied
+        now_req = _load_request(run_dir)
+        if not now_req or not now_req.get("pending") or not now_req.get("items"):
+            raise ValueError("the scope declaration request closed while this sign-off waited; nothing was signed "
+                             "(scripts/scope_signoff.py status shows the current state)")
+        if [i.get("fingerprint") for i in now_req["items"]] != [i.get("fingerprint") for i in req["items"]] \
+                or now_req.get("round") != req.get("round"):
+            raise ValueError("the scope declaration request changed while this sign-off waited; nothing was signed: "
+                             "read it again (scripts/scope_signoff.py show) and sign the new request")
+        return _sign_locked(run_dir, now_req, by, answers, all_decision, note)
 
 
 def _sign_locked(run_dir: str, req: dict, by: str, answers: Optional[dict], all_decision: Optional[str],
