@@ -192,23 +192,62 @@ SUMMARY = ("units_changed", "share_units_changed", "point_plan_feasible", "point
            "units_changed_by_group", "triggered_by", "decision_changes")
 
 
+TIE_RTOL = 1e-6     # tested values whose regret agrees within this share of the re-optimised objective are tied
+
+
+def worst_regret(rows: list, key: str) -> tuple:
+    """(the tested value reported as worst on `key` (regret or regret_share), the size of its tied set), or (None, 0)
+    when no row has the key. Rows whose value is within the tolerance of the largest are tied, and the first of them
+    in the declared order is reported: a solver's noise (seen below 1e-9 of the objective) must not choose the value a
+    result reports, and with it the top-level numbers taken from that value. The tolerance is one number for all
+    rows, so it does not depend on which row noise makes the largest: TIE_RTOL for `regret_share` (already a share of
+    the objective), and for `regret` TIE_RTOL times the largest re-optimised objective among the rows, in size (zero
+    when every objective is zero: only equal regrets tie then). A row that fires on regret is never tied with one
+    that does not: when any row near the largest fires, the tied set is those that fire, so the reported regret is
+    one behind the verdict. A regret that is not a number is reported as it is (the first such row)."""
+    c = [r for r in rows if r.get(key) is not None]
+    if not c:
+        return None, 0
+    bad = [r for r in c if r[key] != r[key]]
+    if bad:
+        return bad[0], 1
+    top = max(r[key] for r in c)
+    tol = TIE_RTOL * (1.0 if key == "regret_share"
+                      else max(abs(float(r.get("reoptimised_objective") or 0.0)) for r in c))
+    near = [r for r in c if top - r[key] <= tol]
+    tied = [r for r in near if "regret" in (r.get("triggered_by") or [])] or near
+    return tied[0], len(tied)
+
+
 def aggregate(rows: list) -> dict:
     """A test's summary over its tested values (compare() rows with `value`): `worst_by_criterion` gives, for the
     share, regret, dollars and population, the worst value with its own coherent summary (Codex r1 P2-3); the
-    top-level numbers are each criterion's worst, the breakdowns those of the value they come from."""
+    top-level numbers are each criterion's worst, the breakdowns those of the value they come from. On regret, values
+    within TIE_RTOL are tied and the first tested value is reported, with `tie: true` and `tied: <how many>` in its
+    worst_by_criterion entry (worst_regret); verdicts and each value's own row do not depend on it."""
     def worst(key):
         c = [r for r in rows if r.get(key) is not None]
         return max(c, key=lambda r: r[key]) if c else None
     rg = [r for r in rows if "regret" in (r.get("triggered_by") or []) and r.get("regret_share") is None]
+    ties = {}
+
+    def wr(name, *keys):
+        for key in keys:
+            r, n = worst_regret(rows, key)
+            if r is not None:
+                ties[name] = n
+                return r
+        return rows[0]
     w = {"share": worst("share_units_changed"),
-         "regret": worst("regret_share") or worst("regret") or rows[0],        # the percentage maximum (Codex r3 P2-3)
-         "regret_abs": worst("regret") or rows[0],                            # the absolute maximum
+         "regret": wr("regret", "regret_share", "regret"),                    # the percentage maximum (Codex r3 P2-3)
+         "regret_abs": wr("regret_abs", "regret"),                            # the absolute maximum
          "dollars": worst("dollars_share") or rows[0],                        # the dollars criterion
          "dollars_reallocated": worst("dollars_reallocated") or rows[0], "dollars_moved": worst("dollars_moved") or rows[0],
          "population": worst("population_changed")}
     if rg:      # a value that fires on regret under a non-positive optimum (no share): its own witness
-        w["regret_nonpositive_optimum"] = max(rg, key=lambda r: r["regret"])
-    wb = {k: dict({f: r.get(f) for f in SUMMARY}, value=r.get("value")) for k, r in w.items()}
+        w["regret_nonpositive_optimum"], ties["regret_nonpositive_optimum"] = worst_regret(rg, "regret")
+    wb = {k: dict({f: r.get(f) for f in SUMMARY}, value=r.get("value"),
+                  **({"tie": True, "tied": ties[k]} if ties.get(k, 0) > 1 else {})) for k, r in w.items()}
     trig = [k for k in ("infeasible",) + CRITERIA if any(k in (r.get("triggered_by") or []) for r in rows)]
     return {"decision_changes": bool(trig), "triggered_by": trig,
             "point_plan_feasible": all(r.get("point_plan_feasible", True) for r in rows),
@@ -431,6 +470,82 @@ def _self_test() -> int:
     ok(e14 is None and ag12["regret_share"] == 0.5 and ag12["regret"] == 100.0 and w12["regret"]["value"] == "B"
        and w12.get("regret_abs", {}).get("value") == "A",
        f"MV23 the percentage and the absolute regret maxima come from their own values ({e14!r}, {list(w12)})")
+    # MV24-MV29 (owner decision, 2026-11-20): tested values whose regret agrees within TIE_RTOL of the re-optimised
+    # objective are tied, and the first in declared order is the one reported. Two CI runners reported different
+    # worst values for tests whose every value had zero regret: noise below 1e-9 chose between them.
+    import random
+
+    def row(value, objective, regret):
+        return dict(m, value=value, reoptimised_objective=objective, point_plan_objective_under_test=objective - regret,
+                    objective_gap=regret, regret=regret, regret_share=regret / objective if objective > 0 else None,
+                    share_units_changed=0.0, units_changed=0, dollars_share=0.0, dollars_moved=0.0,
+                    dollars_reallocated=0.0, triggered_by=[], decision_changes=False)
+
+    def witness(rows_, crit="regret"):
+        a, err = attempt(aggregate, rows_)
+        w_ = ((a or {}).get("worst_by_criterion") or {}).get(crit) or {}
+        return w_.get("value"), w_.get("tie"), w_.get("tied"), a or {}, err
+    tol = globals().get("TIE_RTOL", 0.0)
+    got = [witness([row("A", 88.0, na), row("B", 352.0, nb)], c)[:3]
+           for na, nb in ((0.0, 3e-12), (3e-12, 0.0), (-2e-13, 1e-13), (0.0, 0.0)) for c in ("regret", "regret_abs")]
+    ok(tol > 0 and set(got) == {("A", True, 2)},
+       f"MV24 values whose regret differs by noise are tied: the first tested value is reported, with tie: true and "
+       f"the size of the tied set, for the share and the absolute regret alike ({sorted(set(got), key=str)})")
+    rnd, seen = random.Random(7), set()
+    for _ in range(200):
+        noise = [rnd.uniform(-1, 1) * 0.5 * tol * 100.0 for _ in range(3)]
+        v, t, n, a, _e = witness([row(k, 100.0 * (i + 1), 2.0 + noise[i] * (i + 1)) for i, k in enumerate("ABC")], "regret_abs")
+        seen.add((v, t, n, a.get("reoptimised_objective"), a.get("decision_changes"), tuple(a.get("triggered_by") or ())))
+    ok(tol > 0 and seen == {("A", True, 3, 100.0, False, ())},
+       f"MV25 200 shuffles of noise below the tolerance give one witness, one top-level objective and one verdict "
+       f"({len(seen)} distinct outcomes)")
+    v1 = witness([row("A", 100.0, 0.0), row("B", 100.0, 0.5), row("C", 100.0, 0.5 - 1e-9)])
+    v2 = witness([row("A", 100.0, 0.0), row("B", 100.0, 0.5)])
+    ok(v1[:3] == ("B", True, 2) and v2[:3] == ("B", None, None) and "tie" not in v2[3]["worst_by_criterion"]["regret"],
+       f"MV26 a larger regret still wins; among the tied the first in declared order is reported; without a tie no "
+       f"tie field is written ({v1[:3]}, {v2[:3]})")
+    big = witness([row("A", 1e6, 10.0), row("B", 1e6, 10.0 + 0.5 * tol * 1e6)], "regret_abs")
+    small = witness([row("A", 1.0, 0.1), row("B", 1.0, 0.1 + 0.5 * tol * 1e6)], "regret_abs")
+    zero = witness([dict(row("A", 1.0, 0.0), reoptimised_objective=0.0, regret=0.0, regret_share=None),
+                    dict(row("B", 1.0, 0.0), reoptimised_objective=0.0, regret=1e-12, regret_share=None)], "regret_abs")
+    ok(tol > 0 and big[:3] == ("A", True, 2) and small[:3] == ("B", None, None) and zero[:3] == ("B", None, None),
+       f"MV27 the tolerance is a share of the re-optimised objective: the same absolute difference ties under a large "
+       f"objective and not under a small one; under a zero objective only equal regrets tie ({big[:3]}, {small[:3]}, "
+       f"{zero[:3]})")
+    rows_n = [row("A", 88.0, 3e-12), row("B", 352.0, 0.0)]
+    a_n, _e = attempt(aggregate, rows_n)
+    a_n = a_n or {}
+    ok(a_n.get("results") == [dict({f: r.get(f) for f in SUMMARY}, value=r["value"]) for r in rows_n]
+       and a_n.get("decision_changes") is False and a_n.get("triggered_by") == []
+       and {k: (v.get("value"), v.get("tie")) for k, v in (a_n.get("worst_by_criterion") or {}).items()
+            if k not in ("regret", "regret_abs")} == {k: ("A", None) for k in ("share", "dollars", "dollars_moved",
+                                                                              "dollars_reallocated", "population")},
+       "MV28 the verdict, the criteria that fired, every tested value's row and the other criteria's worst values are "
+       "as before")
+    doc_t = dict(a_n, varied="v", criterion="c", share_threshold=thr["share"], regret_threshold=thr["regret"],
+                 dollars_threshold=thr["dollars"])
+    ok(bool(a_n) and MM._result_conflicts("t.yaml", doc_t, "x", None) == [],
+       "MV29 the loader accepts a result with a tie recorded")
+    # MV30-MV32: Codex review of the tie rule (written first; each failed)
+    fire = dict(row("B", 1e9, 500.0), triggered_by=["regret"], decision_changes=True)
+    v30 = witness([row("A", 1e9, 0.0), fire])
+    ok(v30[:3] == ("B", None, None) and v30[3].get("regret") == 500.0 and v30[3].get("decision_changes") is True
+       and witness([row("A", 1e9, 0.0), fire], "regret_abs")[0] == "B",
+       f"MV30 (P1) a value that fires on regret is never tied with one that does not: the reported regret is the one "
+       f"behind the verdict ({v30[:3]}, {v30[3].get('regret')})")
+    v31 = [witness([row("A", 50.0, 1.9995), row("B", 100.0, 2.0), row("C", 1000.0, 2.0 + n_)], "regret_abs")
+           for n_ in (-1e-12, 1e-12, 0.0)]
+    ok(len({(v[0], v[1], v[2], v[3].get("reoptimised_objective")) for v in v31}) == 1,
+       f"MV31 (P1) the tolerance does not depend on which value noise makes the largest: one witness, one tied set "
+       f"({[v[:3] for v in v31]})")
+    nan = float("nan")
+    v32 = [witness([dict(row("A", 100.0, 1.0), regret=a_, regret_share=a_), dict(row("B", 100.0, 1.0), regret=b_,
+                                                                                regret_share=b_)], "regret_abs")
+           for a_, b_ in ((nan, 1.0), (1.0, nan))]
+    ok([v[4] for v in v32] == [None, None] and [v[0] for v in v32] == ["A", "B"]
+       and all(v[3].get("regret") != v[3].get("regret") for v in v32),
+       f"MV32 (P1) a regret that is not a number is reported as it is, whatever its place (no exception, never hidden "
+       f"behind a finite value) ({[(v[0], repr(v[4])) for v in v32]})")
     # 1C-c follow-up: regret against a plan the solver accepted without proving it carries the accepted gap as a bound
     sg_fn = globals().get("solver_gap")
     thr_ = {"share": 0.1, "regret": 0.01, "dollars": 0.05}
@@ -441,12 +556,12 @@ def _self_test() -> int:
     ok(e15 is None and r1["within_solver_gap"] is True and r1["decision_changes"] is False and r1["regret"] == 0.5
        and r1["regret_solver_gap"]["bound"] == 1.0 and r1["regret_solver_gap"]["gap"] == 0.008
        and r1["regret_solver_gap"]["clipped"] is False,
-       f"MV24 a regret that crosses its threshold inside the accepted gap is marked within_solver_gap, with the bound "
+       f"MV40 a regret that crosses its threshold inside the accepted gap is marked within_solver_gap, with the bound "
        f"beside it; the computed verdict is left as it is ({e15!r}, {r1})")
     r2, e16 = attempt(sg_fn, dict(base, regret=-0.2, regret_share=-0.002), dict(sg, bound=0.1), thr_)
     ok(e16 is None and r2["regret"] == 0.0 and r2["regret_share"] == 0.0 and r2["regret_solver_gap"]["clipped"] is True
        and r2["within_solver_gap"] is False,
-       f"MV25 a regret below zero against an unproven plan is clipped at zero and noted ({e16!r}, {r2})")
+       f"MV41 a regret below zero against an unproven plan is clipped at zero and noted ({e16!r}, {r2})")
     r3, e17 = attempt(sg_fn, dict(base, regret=0.3, regret_share=0.003, share_units_changed=0.5, decision_changes=True,
                                   triggered_by=["share"]), sg, thr_)
     r4, _ = attempt(sg_fn, dict(base, regret=5.0, regret_share=0.05, decision_changes=True, triggered_by=["regret"]),
@@ -456,7 +571,7 @@ def _self_test() -> int:
                                 triggered_by=["infeasible"]), sg, thr_)
     ok(e17 is None and r3["within_solver_gap"] is True and r4["within_solver_gap"] is False and r5 == base
        and r6["within_solver_gap"] is False and r6["regret"] is None,
-       "MV26 a change whose advantage over the point plan is inside the bound is within the gap; a regret well above "
+       "MV42 a change whose advantage over the point plan is inside the bound is within the gap; a regret well above "
        "it, a proven solve, and a point plan the test makes infeasible are not")
     # Codex narrow round (2 P1) on core.best_known: the point plan is promoted only when it is feasible by the rule
     # this module's rows use and within the solver's own budget tolerance; the bound is computed on gains
@@ -476,14 +591,14 @@ def _self_test() -> int:
     k2, _ = attempt(CO.best_known, Bk, dict(inc), both, bb, cb)
     ok(e18 is None and k1["solver_gap"]["kept"] == "incumbent" and k1["choice"] == inc["choice"]
        and k2["solver_gap"]["kept"] == "point_plan" and k2["objective"] == 10.0,
-       f"MV27 a point plan over the budget the solver enforces is not promoted over the incumbent; one within it is "
+       f"MV43 a point plan over the budget the solver enforces is not promoted over the incumbent; one within it is "
        f"({e18!r}, {(k1 or {}).get('solver_gap')}, {(k2 or {}).get('solver_gap')})")
     big = {"u1": {"none": 2.0 ** 54, "a": 2.0 ** 54}, "u2": {"none": 0.0, "a": 128.0}}
     inc2 = {"status": "feasible", "gap": 1.0 / 129, "gain": 128.0, "objective": 2.0 ** 54 + 128.0,
             "choice": {"u1": "none", "u2": "a"}}
     k3, e19 = attempt(CO.best_known, Bk, inc2, dict(inc2["choice"]), big, cb)
     ok(e19 is None and abs(k3["solver_gap"]["bound"] - 1.0) < 1e-9,
-       f"MV28 the bound is computed on gains, so a large benefit every plan gets cannot round it away "
+       f"MV44 the bound is computed on gains, so a large benefit every plan gets cannot round it away "
        f"({e19!r}, {(k3 or {}).get('solver_gap')})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
