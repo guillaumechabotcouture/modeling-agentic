@@ -55,14 +55,17 @@ def plan_within_gap(A, sol, plan, ben, cost) -> bool:
     budget the plan is solved within and its objective is within the solver's stated gap of the re-solved optimum.
     Both are proven within gap g of the optimum's gain G over the solver's baseline, so they differ by at most
     g / (1 - g) of the re-solved gain."""
-    from toolkit.analysis import moves as MV
+    from toolkit.alloc import optimize as aopt
     budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
-    if MV.infeasible_reasons(A.ids, plan, cost, A.feas, budget):
+    try:      # the allocator's own check (Codex r1 P1-8); a plan it cannot read is not within the gap
+        if aopt.check(plan, ben, cost, A.feas, budget):
+            return False
+        short = float(sol["objective"]) - sum(float(ben[i][plan[i]]) for i in A.ids)
+    except (KeyError, TypeError, ValueError):
         return False
     g = float(sol.get("gap_rel") or 0.0)
-    gain = float(sol["objective"]) - float(sol.get("baseline") or 0.0)
-    short = float(sol["objective"]) - sum(float(ben[i][plan[i]]) for i in A.ids)
-    return short <= g / (1.0 - g) * abs(gain) + 1e-12 * max(1.0, abs(float(sol["objective"])))
+    gain = abs(float(sol["objective"]) - float(sol.get("baseline") or 0.0))
+    return short <= (g / (1.0 - g) + 1e-9) * gain      # the rounding allowance scales with the gain (P1-7)
 
 
 def frontier(A, ben0, cost0, out0, fractions=FRACTIONS, events=None) -> dict:

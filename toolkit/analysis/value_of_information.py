@@ -516,7 +516,9 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
         try:      # 1C-c: a draw with no usable plan at this budget keeps its value within the reserve (None)
             with auxiliary(A, "value_of_information"):
                 sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=budget)
-        except SolveFailed:
+        except SolveFailed as e:
+            if e.status == "infeasible":      # a proven infeasibility is raised, as before
+                raise
             return None
         try:
             A.guard(f"uncertainty draw {d}", [sol["choice"]], rows[d]["events"])

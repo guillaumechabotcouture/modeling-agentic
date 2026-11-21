@@ -322,6 +322,12 @@ def _result(method, us, opts, choice, status, t0, names, **extra):
     return r
 
 
+def _proven(pulp, prob) -> bool:
+    """CBC proved this solve's solution optimal (within its gap). PuLP can report the problem status as optimal for
+    a solve that stopped at the time limit with a solution; the solution status is the one that says proven."""
+    return prob.sol_status == pulp.LpSolutionOptimal
+
+
 def _relaxation_gap(pulp, prob, time_limit):
     """(bound - objective) / bound for an ILP that stopped before proving its gap, on the solver's own objective (each
     unit's gain over its least-benefit option). The bound is the LP relaxation's optimum, which is never below the
@@ -332,8 +338,8 @@ def _relaxation_gap(pulp, prob, time_limit):
         v.cat = pulp.LpContinuous
     prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit))
     bound = pulp.value(prob.objective)
-    if prob.status != pulp.LpStatusOptimal or inc is None or bound is None:
-        return None
+    if not _proven(pulp, prob) or prob.status != pulp.LpStatusOptimal or inc is None or bound is None:
+        return None       # Codex r1 P1-1: an unfinished relaxation's objective is not a bound
     if bound <= inc:
         return 0.0
     return float((bound - inc) / bound) if bound > 0 else None
@@ -379,7 +385,7 @@ def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None, gap_rel=0.0,
     nt = max(1, int(threads or 1))
     prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit, gapRel=float(gap_rel), gapAbs=0.0,
                                  **({"threads": nt} if nt > 1 else {})))
-    sol = prob.sol_status
+    sol, proven = prob.sol_status, _proven(pulp, prob)
     # 1C-c: the tolerance the status was proven within, and (set below) a stopped solve's own proven gap
     rec = {"solver_status": pulp.LpStatus[prob.status], "gap_rel": float(gap_rel), "threads": nt, "gap": None}
     if sol == pulp.LpSolutionInfeasible or prob.status == pulp.LpStatusInfeasible:
@@ -392,10 +398,9 @@ def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None, gap_rel=0.0,
         if len(on) != 1:
             raise OptimizerError(f"ilp: unit {u} has {len(on)} packages selected in the solver's solution")
         choice[u] = opts[u][on[0]][0]
-    if sol != pulp.LpSolutionOptimal:
+    if not proven:
         rec["gap"] = _relaxation_gap(pulp, prob, time_limit)
-    return _result("ilp", us, opts, choice, "optimal" if sol == pulp.LpSolutionOptimal else "feasible", t0, names,
-                   **rec)
+    return _result("ilp", us, opts, choice, "optimal" if proven else "feasible", t0, names, **rec)
 
 
 def _hull(o, start):

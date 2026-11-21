@@ -353,10 +353,9 @@ def same_spend(A, vid, fp, fo, spend, ben0, cost0, feas, events, out=None) -> di
     error raises."""
     from toolkit.analysis import moves as MV
     try:
-        with auxiliary(A, "plan_variants"):
-            s = A.solve(ben0, cost0, budget=spend, feas=feas)
+        s = A.solve(ben0, cost0, budget=spend, feas=feas)      # a strict solve (1C-c leaves it so; Codex r1 P1-4, P1-5)
     except RuntimeError as e:
-        if "infeasible" not in str(e) and getattr(e, "status", None) is None:      # 1C-c: SolveFailed is recorded
+        if "infeasible" not in str(e):
             raise
         return {"status": "not_solved", "budget": spend, "reason": str(e)}
     sp, so = dict(s["choice"]), float(s["objective"])

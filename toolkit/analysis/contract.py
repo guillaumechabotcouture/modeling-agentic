@@ -209,13 +209,15 @@ def _solver(man: dict) -> list[dict]:
     no usable plan are recorded where they occur (a fold or test not run, a variant or envelope not solved); above
     `aux_not_solved_share_max` of all auxiliary solves they are a finding. A record that cannot be read is one too;
     a manifest without the record (a run from before it existed) is not."""
-    sv = man.get("solver")
-    if sv is None:
+    if "solver" not in man:
         return []
     try:
+        sv = man["solver"]
         tot = sv["auxiliary_total"]
-        n, bad, lim = int(tot["solves"]), int(tot["not_solved"]), float(sv["aux_not_solved_share_max"])
-        if not (0 <= bad <= n and 0 <= lim <= 1):       # also a NaN share: fail closed
+        n, bad, lim = tot["solves"], tot["not_solved"], float(sv["aux_not_solved_share_max"])
+        # Codex r1 P1-9: whole-number counts; a NaN share or a null record fails closed
+        if not (all(isinstance(x, int) and not isinstance(x, bool) for x in (n, bad)) and 0 <= bad <= n
+                and 0 <= lim <= 1):
             raise ValueError("counts or share out of range")
     except (KeyError, TypeError, ValueError, OverflowError):
         return [_f("analysis_solver_degraded", f"{MANIFEST}: the solver record cannot be read", "solver")]

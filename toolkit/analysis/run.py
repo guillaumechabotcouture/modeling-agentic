@@ -2406,7 +2406,7 @@ def _self_test_solver(ok, A, R):
            f"counts it ({strict}, {lg})")
         refused = []
         for g in (2 * st["aux_gap_max"], None):
-            CO.aopt.solve = fake(g)
+            CO.aopt.solve, A.solve_memo = fake(g), {}       # without the plan SG2 accepted for this problem
             with CO.auxiliary(A, "self-test"):
                 try:
                     A.solve(ben0, cost0)

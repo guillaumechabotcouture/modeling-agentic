@@ -123,6 +123,8 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
             with auxiliary(A, "stability_folds"):
                 sol = A.solve(ben_f, cost_f)
         except SolveFailed as e:      # 1C-c: the fold has no plan to compare; the other folds run
+            if e.status == "infeasible":      # a proven infeasibility stops the step, as before (Codex r1 P1-2)
+                raise
             folds.append({"group": gv, "status": "not_run", "n_units": len(hid),
                           "reason": f"the fold's plan was not solved ({e})"})
             continue

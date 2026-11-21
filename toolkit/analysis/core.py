@@ -97,7 +97,10 @@ def auxiliary(A, kind: str):
 
 
 def _problem_key(ben, cost, feas, budget):
-    """A hash of one solve's inputs, or None when they cannot be serialised (then nothing is kept)."""
+    """A hash of one solve's inputs, or None (then nothing is kept) when they cannot be serialised or a unit or
+    package id is not text: the encoding writes ids as text, so 1 and "1" would share a key (Codex r1 P1-6)."""
+    if not all(isinstance(u, str) and all(isinstance(k, str) for k in r) for t in (ben, cost) for u, r in t.items()):
+        return None
     try:
         tabs = [sorted((str(u), sorted((str(k), float(x)) for k, x in r.items())) for u, r in t.items())
                 for t in (ben, cost)]
@@ -271,8 +274,9 @@ class Analysis:
         """One plan from toolkit/alloc at the settings of thresholds.yaml `optimizer` (decision D3). A headline solve
         (the point plan, the reserve search, a rebuild) must be proven optimal within `gap_rel`. Inside
         `auxiliary(A, kind)` a solve that stopped early is also used when its proven gap is at most `aux_gap_max`, and
-        counted. Anything else raises SolveFailed with the solver's status. Every solve is counted in `solver_log`;
-        a proven result is kept, so the same problem solved again in this run returns the same plan."""
+        counted. Anything else raises SolveFailed with the solver's status. Every solve is counted in `solver_log`.
+        A result is kept, so the same problem solved again in this run returns the same plan: a proven one for any
+        solve, an accepted feasible one for auxiliary solves only (Codex r1 P1-3)."""
         st = solver_settings()
         if budget is None:
             budget = self.budget if self.plan_budget is None else self.plan_budget
@@ -281,7 +285,7 @@ class Analysis:
         log = self.__dict__.setdefault("solver_log", {}).setdefault(
             kind or "headline", {"solves": 0, "feasible_accepted": 0, "max_gap": 0.0, "not_solved": 0})
         memo, key = self.__dict__.setdefault("solve_memo", {}), _problem_key(ben, cost, f, budget)
-        if key in memo:
+        if key in memo and (kind or memo[key][1]["status"] == "optimal"):
             ch, meta = memo[key]
             return dict(meta, choice=dict(zip(self.ids, ch)))
         nt = min(int(st["threads"]), os.cpu_count() or 1) if len(ben) >= int(st["threads_min_units"]) else 1
@@ -289,14 +293,14 @@ class Analysis:
                        gap_rel=float(st["gap_rel"]), threads=nt)
         r["time_limit_s"] = float(st["time_limit_s"])
         log["solves"] += 1
-        if r["status"] == "optimal":
+        gap = r.get("gap")
+        used = kind and r["status"] == "feasible" and gap is not None and gap <= float(st["aux_gap_max"])
+        if r["status"] == "optimal" or used:
             if key is not None and set(r["choice"]) == set(self.ids):
                 memo[key] = (tuple(r["choice"][i] for i in self.ids), {k: v for k, v in r.items() if k != "choice"})
-            return r
-        gap = r.get("gap")
-        if kind and r["status"] == "feasible" and gap is not None and gap <= float(st["aux_gap_max"]):
-            log["feasible_accepted"] += 1
-            log["max_gap"] = max(log["max_gap"], float(gap))
+            if used:
+                log["feasible_accepted"] += 1
+                log["max_gap"] = max(log["max_gap"], float(gap))
             return r
         if r["status"] != "infeasible":       # a proven infeasibility is a result, not a solve that failed
             log["not_solved"] += 1
