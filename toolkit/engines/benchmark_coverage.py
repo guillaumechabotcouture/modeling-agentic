@@ -233,8 +233,9 @@ def signature(run_dir: str | None, by: str | None = None) -> str:
     "proposed" when it has no sign-off yet (or `by` is the owner about to sign; "provisional_lead" for the lead about
     to sign), else "unsigned" (another signer, a lead's record in a run that is not a lead run, or a spec changed
     since)."""
-    if by is not None:
-        return {"owner": "proposed", "lead": "provisional_lead"}.get(by, "unsigned")
+    if by is not None:          # Codex r2 of #313: the lead about to sign counts only in a lead run
+        return "proposed" if by == "owner" else \
+            "provisional_lead" if by == "lead" and run_dir and lead_run(run_dir) else "unsigned"
     if not run_dir:
         return "unsigned"
     from toolkit.spec import signoff
@@ -733,9 +734,11 @@ def _self_test_lead(ok, dep):
         rec("lead")
         open(sp, "a").write("# edited\n")
         edited, edited_md = signature(d), "\n".join(results_lines({"engine_departures": [dep]}, d))
+        lead_by = signature(d, by="lead")
     ok(owner_run, "G_LEAD_OWNER_RUN a lead's record in a run that is not a --signoff lead run credits nothing")
     ok(lead == "provisional_lead" and owner == "signed" and edited == "unsigned"
-       and signature(None, by="lead") == "provisional_lead" and signature(None, by="owner") == "proposed",
+       and lead_by == "provisional_lead" and signature(None, by="lead") == "unsigned"
+       and signature(None, by="owner") == "proposed",
        f"G_LEAD_SIG a lead's signature of the unchanged spec is provisional_lead; the owner's is signed; an edited "
        f"spec counts none ({lead}, {owner}, {edited})")
     ok("Provisional engine departures" in lead_md and "not reviewed" in lead_md and "owner" in lead_md

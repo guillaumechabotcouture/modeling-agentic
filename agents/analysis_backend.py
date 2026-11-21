@@ -861,6 +861,9 @@ def _self_test_benchmark_gate(ok) -> None:
             e = schema.validate(schema.load(p), pending_ok=True)
             ok(e == [], f"G4 the spec with a proposed departure validates before sign-off ({e[:2]})")
             from toolkit.spec import preconditions as PC
+            lo = [x for x in PC.problems(run, open(p, "rb").read(), "lead", spec=schema.load(p)) if "benchmark" in x]
+            ok(lo != [], "G5h (Codex r2 of #313) in a run that is not a lead run, a lead cannot sign the departure")
+            json.dump({"signoff": "lead"}, open(os.path.join(run, "run_state.json"), "w"))     # a --signoff lead run
             le = [x for x in PC.problems(run, open(p, "rb").read(), "lead", spec=schema.load(p)) if "benchmark" in x]
             ok(le == [], f"G5e (D2) a lead may sign a spec whose engine needs a departure: it counts as provisional "
                          f"({le[:1]})")

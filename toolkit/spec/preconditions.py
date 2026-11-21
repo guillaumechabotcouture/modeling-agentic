@@ -44,9 +44,9 @@ def _benchmark_eligibility(run_dir, spec, signer) -> list:
     AB = importlib.util.module_from_spec(m)
     m.loader.exec_module(AB)
     mode = "proposed" if (signer is None and BC.signature(run_dir) == "proposed") or signer == "owner" else \
-        "provisional_lead" if signer == "lead" else "signed"       # D2: a lead's departures count, provisionally
+        "provisional_lead" if signer == "lead" and run_dir and BC.lead_run(run_dir) else "signed"   # D2, lead runs only
     raw = dict(spec.raw, _run_dir=run_dir)
-    if signer is not None and signer not in ("owner", "lead"):
+    if signer is not None and mode == "signed":
         raw.pop("engine_departures", None)          # no other signer makes a departure count
     rows = AB.eligible_engines(raw, departures=mode)
     if any(r.get("eligible") for r in rows):
