@@ -120,10 +120,25 @@ def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> 
     return {"solution": sol, "reserve": reserve, "pre": pre}
 
 
+def _stop_where(e) -> str | None:
+    """The step of a stop the toolkit declares besides AnalysisBlocked (a refused calibration, calibration input,
+    burden anchor or engine batch; a solver defect), else None: any other error is a crash and is not recorded (once
+    the run's store exists, no manifest is left; before that, nothing in the run dir is touched)."""
+    from toolkit.alloc.optimize import OptimizerError
+    from toolkit.analysis.burden import AnchorError
+    from toolkit.calibration.history_matching import CalibrationInputError
+    for cls, where in ((C.CalibrationRefused, "calibration"), (CalibrationInputError, "calibration"),
+                       (AnchorError, "burden_anchor"), (OptimizerError, "optimizer"), (Bt.BatchRefused, "batch")):
+        if isinstance(e, cls):
+            return where
+    return None
+
+
 def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None = None, draws=None,
         unsigned: bool = False, log=print, compute_kw: dict | None = None) -> dict:
     """The analysis. A step whose model corrections bear on a plan stops it: analysis/blocked.yaml records where and
-    which, and the manifest is published with status blocked (never complete)."""
+    which, and the manifest is published with status blocked (never complete). A stop the toolkit declares by its
+    own exception (`_stop_where`) is recorded the same way, with the exception's name and code, and raised again."""
     holder = {}
     try:
         return _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder)
@@ -136,6 +151,20 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
                     [holder["calibration"]] if holder.get("calibration") else [])
             S.finalize("blocked", f"{e.where}: {e.reason}" if e.reason else
                        f"{e.where}: {len(e.hits)} model corrections bear on the plan")
+        raise
+    except Exception as e:  # noqa: BLE001 -- recorded when it is a declared stop, and always raised again
+        S, where = holder.get("S"), _stop_where(e)
+        if S is not None and where is not None:
+            try:
+                S.write("blocked", {"reason": str(e)[:4000], "where": where, "corrections": [], "n_on_plan": 0,
+                                    "exception": type(e).__name__, "code": getattr(e, "code", None)}, PRODUCER,
+                        [holder["calibration"]] if holder.get("calibration") else [])
+                S.finalize("blocked", f"{where}: {type(e).__name__}: {e}"[:2000])
+            except Exception as w:  # noqa: BLE001 -- the stop itself is what the caller must see
+                try:
+                    log(f"  the stop could not be recorded ({type(w).__name__}: {w}); no manifest is published")
+                except Exception:  # noqa: BLE001 -- nor does a failing log replace it
+                    pass
         raise
 
 
@@ -270,6 +299,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if jc is not None:
         A.set_joint(jc)
         A.flagged = {f["unit"]: f for f in jc["unmatched_decision"]["flagged"]}
+        from toolkit.analysis import conflicts as CF
+        A.conflict_tests = CF.tests(jc["unmatched_decision"].get("conflicts"))
     from toolkit.analysis import variants as V
     V.apply_headline(A)     # F6 S1-6: `headline: <variant>`: every solve from here carries the variant's rule
     # ---- calibration
@@ -440,6 +471,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
+    conf = (jc or {}).get("unmatched_decision", {}).get("conflicts") if jc is not None else None
+    if conf is not None:      # W0-F: each held-out target, why, its tests' verdicts; who decides (empty: none)
+        from toolkit.analysis import conflicts as CF
+        crec = CF.record(conf, dts, refit=CF.refit_estimate(jc))
+        arts["conflicts"] = S.write("conflicts", crec, CF.PRODUCER, [arts["joint_calibration"], arts["decision_tests"]])
+        log(f"conflicts: {len(crec['declared'])} target(s) held out and tested; {len(crec['needs_owner'])} need the owner")
     # ---- deliverable CSV
     d = spec["deliverable"]
     cols = d["columns"]
@@ -846,6 +883,7 @@ def _self_test() -> int:
         finally:
             del ToyEngine.fitted_path
             EPm.benchmark_pack = orig_bp
+        _self_test_stop_records(ok, d, q)
         _self_test_round2(ok, d, q)
         _self_test_reserve_e2e(ok, d, q)
         _self_test_floors_e2e(ok, d, q)
@@ -905,6 +943,76 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_stop_records(ok, d, q):
+    """v2 autonomy 1C-a (item 4.7): every stop the toolkit declares (a refused calibration, calibration input, anchor,
+    batch, or a solver defect) leaves analysis/blocked.yaml and a manifest with status blocked, then raises as before;
+    any other error leaves no manifest."""
+    import yaml
+    from toolkit.alloc.optimize import OptimizerError
+    from toolkit.analysis import contract
+    from toolkit.analysis.burden import AnchorError
+    from toolkit.calibration.history_matching import CalibrationInputError
+    cases = [(None, lambda: KeyError("planted")),
+             ("calibration", lambda: C.CalibrationRefused("posterior_ess", "planted")),
+             ("calibration", lambda: CalibrationInputError(["planted"])),
+             ("burden_anchor", lambda: AnchorError("planted")),
+             ("optimizer", lambda: OptimizerError("planted")),
+             ("batch", lambda: Bt.BatchRefused("batch_stale", "planted"))]
+    orig = EmulatorModel.predict
+    bp = os.path.join(d, "analysis", "blocked.yaml")
+    # Codex r1: a record that cannot be written, with a log that fails too, never replaces the stop the caller sees
+    exc = Bt.BatchRefused("batch_stale", "planted")
+
+    def planted2(self, zs, theta, ids, noise=None):
+        raise exc
+
+    def no_final(self, status, reason=""):
+        raise OSError("planted: no space")
+
+    def bad_log(*a, **k):
+        if "could not be recorded" in " ".join(str(x) for x in a):
+            raise OSError("planted: log")
+    orig_fin = Store.finalize
+    EmulatorModel.predict, Store.finalize = planted2, no_final
+    try:
+        run(d, log=bad_log, compute_kw={"max_workers": 2}, draws=2)
+        got = None
+    except Exception as e:  # noqa: BLE001 -- the planted stop
+        got = e
+    finally:
+        EmulatorModel.predict, Store.finalize = orig, orig_fin
+    ok(got is exc and {x["kind"] for x in contract.gate_findings(d)} == {"analysis_contract_missing"},
+       f"RUN_BLOCKED_UNRECORDED a stop whose record and log both fail is still the error raised, with no manifest "
+       f"({type(got).__name__}: {got})")
+    for where, make in cases:       # the last case is a declared stop: the rerun below starts from its blocked record
+        exc = make()
+
+        def planted(self, zs, theta, ids, noise=None, _e=exc):
+            raise _e
+        EmulatorModel.predict = planted
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+            got = None
+        except Exception as e:  # noqa: BLE001 -- the planted stop, raised again by run()
+            got = e
+        finally:
+            EmulatorModel.predict = orig
+        name = type(exc).__name__
+        kinds = {x["kind"] for x in contract.gate_findings(d)}
+        blk = (yaml.safe_load(open(bp))["data"] if os.path.exists(bp) else {})
+        if where is None:
+            ok(got is exc and kinds == {"analysis_contract_missing"} and blk.get("exception") != name,
+               f"RUN_BLOCKED_OTHER an error that is not a declared stop ({name}) leaves no manifest and no blocked "
+               f"record of its own ({kinds})")
+            continue
+        ok(got is exc and kinds == {"analysis_contract_blocked"} and blk.get("exception") == name
+           and blk.get("where") == where and "planted" in str(blk.get("reason")),
+           f"RUN_BLOCKED_CAL {name} is raised again after analysis/blocked.yaml and a blocked manifest record it "
+           f"({kinds}, {({k: blk.get(k) for k in ('where', 'exception', 'reason')})})")
+    run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+    ok(contract.gate_findings(d) == [], "RUN_BLOCKED_RERUN a rerun after a recorded stop publishes a complete manifest")
 
 
 def _self_test_moves(ok, d, R):
@@ -1313,6 +1421,32 @@ def _self_test_joint(ok, q):
                "low-confidence with its reason in the allocation file, the point, the uncertainty report and label")
         except AnalysisBlocked as e:
             ok(False, f"JR8 flag mode proceeds (blocked: {e})")
+    with tempfile.TemporaryDirectory() as d:     # W0-F: an unpredicted miss under conflicts.policy declare_and_test
+        sp = JC._toy_joint(d, unreachable="5", group=False)
+        raw = yaml.safe_load(open(sp))
+        raw["conflicts"] = {"policy": "declare_and_test"}
+        raw["uncertainty"]["priors"]["base"]["range"] = [0.45, 0.55]       # as JR8 (a toy property)
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            cf = yaml.safe_load(open(os.path.join(d, "analysis", "conflicts.yaml")))["data"]
+            dtx = yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"]["tests"]
+            ids = [t["test_id"] for t in dtx if t["test_id"].startswith("conflict_")]
+            ok([c["key"] for c in cf["declared"]] == ["5"] and len(ids) == 2 and cf["needs_owner"] == ["5"],
+               f"JR-CF1 an undeclared unit miss is held out, tested twice, the run completes, and a test that cannot run "
+               f"puts it to the owner ({[(c['key'], c['verdicts']) for c in cf['declared']]}, {ids})")
+        except AnalysisBlocked as e:
+            ok(False, f"JR-CF1 the policy declares the miss and the run continues (blocked: {e})")
+        raw["conflicts"] = {"policy": "stop"}
+        yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+        os.remove(os.path.join(d, signoff.SPEC_SIGNOFF))
+        signoff.sign(d, "lead", note="self-test")
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2})
+            ok(False, "JR-CF2 conflicts.policy stop keeps today's behaviour (the miss blocks)")
+        except AnalysisBlocked:
+            ok(True, "JR-CF2 conflicts.policy stop keeps today's behaviour (the miss blocks)")
     with tempfile.TemporaryDirectory() as d:
         JC._toy_joint(d)
         signoff.sign(d, "lead", note="self-test")
@@ -1630,7 +1764,7 @@ def _self_test_stability_flagged(ok):
             self.ids = list(ids)
             self.by_id = {i: {"g": f"g{n % 3}", "x": xs[i], "pop": 1.0} for n, i in enumerate(ids)}
             self.spec = {"analysis": {"stability": {"holdout_group": "g", "covariates": ["x"]}},
-                         "options": {"components": {"c": {}}}}
+                         "options": {"components": {"c": {}}}, "calibration": {"range": [-1e6, 1e6]}}
             self.flagged, self.seen = flagged, {}
 
         def evaluate(self, theta, zh, hid):
@@ -1666,6 +1800,45 @@ def _self_test_stability_flagged(ok):
            f"JR9b folds without unflagged training units are not_run and the metrics skip them ({r['verdict']})")
     except Exception as e:  # noqa: BLE001
         ok(False, f"JR9b folds without unflagged training units are not_run ({type(e).__name__}: {e})")
+    # 1C-b 2c-i (STAB_CLAMP): a held-out prediction outside calibration.range is clamped to it and counted
+    far = _A(ids, dict(xs, u11=1000.0), {})
+    far.spec["calibration"] = {"range": [0.0, 1.5]}
+    try:
+        r = SB.run(far, z0, plan, ben, cost, plan)
+        ok(max(far.seen.values()) <= 1.5 and min(far.seen.values()) >= 0.0 and r.get("predictions_clamped", 0) >= 1
+           and sum(f.get("predictions_clamped", 0) for f in r["folds"]) == r.get("predictions_clamped"),
+           f"JR9c a held-out prediction outside calibration.range is clamped and counted "
+           f"({r.get('predictions_clamped')} clamped; largest evaluated {max(far.seen.values()):.3g})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9c a held-out prediction outside calibration.range is clamped ({type(e).__name__}: {e})")
+    # 1C-b 2c-ii: a fold whose refit is refused is not_run with the refusal's code; the other folds still run
+    lik = _A(ids, xs, {})
+    lik.method, lik.lik = "likelihood", {"x": {}, "params": [], "z": {}}
+    lik.evaluate = lambda theta, zh, hid=None: ({}, {i: [1.0, 0.5] for i in ids}, ct(ids))
+    saved = SB.C.read_targets, SB.C.fit_likelihood
+
+    def fit(spec, model, rows=None, fixed_z=None, **kw):
+        if "u0" in fixed_z:
+            raise SB.C.CalibrationRefused("calibration_ridge", "toy: the fold's fit is refused")
+        return {"theta": {}, "z": {i: z0[i] for i in ids if i not in fixed_z}}
+    lik.model = None
+    try:
+        SB.C.read_targets, SB.C.fit_likelihood = (lambda spec: [{"unit": i} for i in ids]), fit
+        r = SB.run(lik, z0, plan, ben, cost, plan)
+        nr = r["folds_not_run"]
+        ok(r["n_folds"] == 2 and len(nr) == 1 and nr[0]["group"] == "g0" and "calibration_ridge" in nr[0]["reason"],
+           f"JR9d a fold whose calibration is refused is not_run with the reason; the other folds run ({nr})")
+    except Exception as e:  # noqa: BLE001
+        ok(False, f"JR9d a fold whose calibration is refused is not_run ({type(e).__name__}: {e})")
+    finally:
+        SB.C.read_targets, SB.C.fit_likelihood = saved
+    # 1C-b 2d-iii: quantiles of a sample with a non-finite value are refused (were all NaN)
+    from toolkit.analysis.core import q as _q
+    try:
+        ok(False, f"JR9e quantiles of a sample with a non-finite value are refused: {_q([1.0, float('nan'), 3.0])}")
+    except ValueError as e:
+        ok("not finite" in str(e) and _q([1.0, 2.0, 3.0])["median"] == 2.0 and _q([]) is None,
+           f"JR9e quantiles of a sample with a non-finite value are refused ({e})")
 
 
 def _self_test_priors(ok, q):
@@ -1742,7 +1915,7 @@ def _self_test_priors(ok, q):
            f"(Codex r2 P1), and the comparator burden and cost outputs have theirs (F6 S2-4): {err and len(err.cols)} "
            "columns")
         ok(em["columns_by_quantity"].get("comparator") == len(M.pops) * len(M.outcomes)
-           and "emulator_error_floors" in u,
+           and "emulator_error_floors" in u and "counts" in (u.get("emulator_error_clips") or {}),
            f"RP9b the report counts the error columns by quantity and the uncertainty records cost floors (F6 S2-4): "
            f"{em['columns_by_quantity']}")
         design.pop("prior_names")
