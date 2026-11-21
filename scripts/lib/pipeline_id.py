@@ -179,6 +179,29 @@ def code_commit(repo: str) -> str:
     return UNKNOWN
 
 
+def code_pin(repo: str) -> dict:
+    """The code a relaunch needs (W0-H1): {commit, clean (tracked files unedited), on_remote (a remote branch holds
+    it), remote_branches}; clean and on_remote are None when git cannot tell (an archive has no .git)."""
+    sha = (commit := code_commit(repo)).removesuffix("-dirty")
+    pin = {"commit": commit, "clean": None, "on_remote": None, "remote_branches": []}
+    try:
+        g = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+        top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                             timeout=30).stdout.strip()
+        if g.returncode == 0 and top and os.path.realpath(top) == os.path.realpath(repo):   # else: an export, None
+            d = subprocess.run(["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, timeout=30)
+            pin["clean"] = None if d.returncode else (not d.stdout.strip() and sha == g.stdout.strip())
+        r = subprocess.run(["git", "-C", repo, "branch", "-r", "--contains", sha], capture_output=True, text=True,
+                           timeout=60)
+        if r.returncode == 0:
+            pin["remote_branches"] = [b.strip() for b in r.stdout.splitlines() if b.strip()][:5]
+            pin["on_remote"] = bool(pin["remote_branches"])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return pin
+
+
 def launcher_name(arg: str | None = None) -> str:
     """The launcher that started this run: main.py --launcher, else $MA_LAUNCHER, else "direct"."""
     return (arg or os.environ.get("MA_LAUNCHER") or "direct").strip()[:200] or "direct"
@@ -413,6 +436,9 @@ def _self_test() -> int:
         ok(code_commit(td) == UNKNOWN, "PI15 an unfilled commit file outside git reads unknown")
         open(cf, "w").write("0123456789abcdef0123456789abcdef01234567\n")
         ok(code_commit(td) == "0123456789abcdef0123456789abcdef01234567", "PI16 the archived commit file is read")
+        pin = code_pin(td)
+        ok(pin["commit"] == "0123456789abcdef0123456789abcdef01234567" and pin["clean"] is None
+           and pin["on_remote"] is None, f"PI16b code_pin outside git: the commit; clean and remote unknown ({pin})")
         ident = identity("v2", td, "run_cluster:ev-dengue-x")
         ok(ident == {"pipeline": "v2", "commit": "0123456789abcdef0123456789abcdef01234567",
                      "launcher": "run_cluster:ev-dengue-x"}, f"PI17 identity {ident}")
