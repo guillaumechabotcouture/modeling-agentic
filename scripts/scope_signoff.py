@@ -954,6 +954,53 @@ def _self_test() -> int:
         ok([(r["finding"], (r["review"] or {}).get("decision")) for r in rows] == [("f1", "confirm"), ("f2", None)]
            and doc["answers"]["fp2"]["by"] == "owner" and doc["reviews"]["fp1"]["decision"] == "confirm",
            f"SO33 the owner's review is recorded; a later owner answer replaces the lead's and keeps the reviews ({rows})")
+    # SO36 (Codex r2 of #316, P1-3): where only provisional lead answers count (v2), a recorded lead answer that is
+    # not provisional does not release an owner item, even in a lead run
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "decision_rule.md"), "w").write("rule\n")
+        c = [cur()[0]]
+        gate_findings(d, 6, c, mode="lead")
+        fp = (c[0].get("owner_item") or {}).get("fingerprint")
+        json.dump({"answers": {fp: {"finding": c[0]["owner_item"]["finding"], "decision": "accept", "by": "lead"}}},
+                  open(os.path.join(d, SIGNOFF), "w"))
+        harness_record(d)
+        c_v1, c_v2 = [cur()[0]], [cur()[0]]
+        gate_findings(d, 6, c_v1, mode="lead")
+        try:
+            gate_findings(d, 6, c_v2, mode="lead", provisional_only=True)
+        except TypeError as e:
+            c_v2 = [{"error": str(e)}]
+        ok(bool(fp) and c_v1[0].get("owner_signed") and not c_v2[0].get("owner_signed")
+           and c_v2[0].get("owner_signoff"),
+           f"SO36 a non-provisional lead answer releases nothing where only provisional ones count ({c_v2[0]})")
+    # SO37 (Codex r2 of #316, P1-4): an owner's answer signed while the harness writes provisional answers is never
+    # lost: the record is read and written under one lock
+    import threading
+    import time as _time
+    with tempfile.TemporaryDirectory() as d:
+        items = [{"finding": "f1", "fingerprint": "fp1", "kind": "k"}]
+        json.dump({"pending": True, "round": 2, "items": items}, open(os.path.join(d, REQUEST), "w"))
+        real_load = globals()["load_answers"]
+        th = []
+
+        def racing_load(rd):
+            out = real_load(rd)
+            if not th:
+                t = threading.Thread(target=lambda: sign(d, "owner", {"f1": "decline"}, note="owner, concurrently"))
+                th.append(t)
+                t.start()
+                _time.sleep(0.5)
+            return out
+        globals()["load_answers"] = racing_load
+        try:
+            provisional_answers(d, items, 2)
+        finally:
+            globals()["load_answers"] = real_load
+        for t in th:
+            t.join(10)
+        a = (json.load(open(os.path.join(d, SIGNOFF))).get("answers") or {}).get("fp1") or {}
+        ok(a.get("by") == "owner" and a.get("decision") == "decline",
+           f"SO37 an owner answer signed during the provisional write is kept ({a.get('by')}, {a.get('decision')})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

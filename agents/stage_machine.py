@@ -2786,6 +2786,17 @@ def _self_test() -> int:
            and not _SS.provisional(d)[0]["plan_changing"],
            f"T_OWNER_LEAD_AMEND an amendment finding under --signoff lead is accepted provisionally, not waited on "
            f"({s_a}, {led_a['D-041'].status})")
+        # T_OWNER_LEAD_AMEND_STRUCT (Codex r2 of #316, P1-1): a structural PLAN blocker whose remedy is an owner
+        # amendment, accepted provisionally with rounds left, does not take the next gate to SPEC and the amendment pause
+        amend5l = dict(amend, id="D-036", category="STRUCTURAL")
+        d, T, st = new_run("amend5_lead", {"critics": {1: {"critique-domain": [amend5l]}},
+                                           "structural": {1: "critique-domain"}}, signoff="lead", max_rounds=3)
+        s_s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        p_s = [h["to"] for h in load_state(d).history if "to" in h]
+        ok("OWNER_DECISION" in p_s and not s_s.startswith("paused")
+           and "SPEC" not in p_s[p_s.index("OWNER_DECISION"):],
+           f"T_OWNER_LEAD_AMEND_STRUCT a provisionally accepted structural amendment does not pause the lead run for a "
+           f"spec amendment ({s_s}, {p_s[-6:]})")
 
         # R3-4 (F6 run 3): a paid task whose allowance is below the floor is not started: the run pauses for the owner
         # (resumable), and a resume with a higher cap continues.
@@ -2891,6 +2902,39 @@ def _self_test() -> int:
                    for u in g_od.get("unresolved_high") or []),
            f"T_OWNER_ANSWERED a lead's accept counts only under --signoff lead; the owner's decline holds the gate "
            f"({g_lo['action']}, {g_ll['action']}, {g_od['action']})")
+        # T_OWNER_DECLINE_HOLDS and T_OWNER_LEAD_NONPROV (Codex r2 of #316, P1-2 and P1-3): with a policy-mapped
+        # finding beside the decision test, the owner's decline on it keeps holding the gate once the decision-test
+        # finding clears; and a lead answer that is not provisional never releases it, even in a lead run
+        for f_ in (_ss.SIGNOFF, _ss.LEDGER, _ss.REQUEST, "trace.jsonl"):
+            if os.path.exists(os.path.join(dd, f_)):
+                os.remove(os.path.join(dd, f_))
+        open(os.path.join(dd, "decision_rule.md"), "w").write("rule\n")          # the run allocates
+        alloc = {"kind": "allocation_unstable", "severity": "HIGH", "stage": "OPTIMIZATION",
+                 "key": "allocation_robustness", "claim": "UNSTABLE", "scope_declarable": True}
+        g2 = v2_gate(dd, 2, 2, False, [dict(dtf), dict(alloc)], history=False)
+        _ss.record(dd, g2, 2)
+        its = {i["kind"]: i for i in json.load(open(os.path.join(dd, _ss.REQUEST)))["items"]}
+        both = "decision_test_changes_plan" in its and "allocation_unstable" in its
+        if both:
+            _ss.sign(dd, "owner", {its["decision_test_changes_plan"]["fingerprint"]: "accept",
+                                   its["allocation_unstable"]["fingerprint"]: "decline"}, note="t")
+            _ss.harness_record(dd)
+        g_both = v2_gate(dd, 2, 2, False, [dict(dtf), dict(alloc)], history=False)
+        g_alone = v2_gate(dd, 2, 2, False, [dict(alloc)], history=False)
+        ok(both and g2["action"] == "AWAIT_OWNER" and g_both["action"] == "RUN_FAILED"
+           and g_alone["action"] == "RUN_FAILED",
+           f"T_OWNER_DECLINE_HOLDS the owner's decline of a policy-mapped finding holds the gate when the decision-test "
+           f"finding clears ({g2['action']}, {g_both['action']}, {g_alone['action']}, {sorted(its)})")
+        if both:
+            doc_ = json.load(open(os.path.join(dd, _ss.SIGNOFF)))
+            doc_["answers"][its["allocation_unstable"]["fingerprint"]].update(decision="accept", by="lead")
+            json.dump(doc_, open(os.path.join(dd, _ss.SIGNOFF), "w"))
+            _ss.harness_record(dd)
+        g_np = v2_gate(dd, 2, 2, False, [dict(dtf), dict(alloc)], history=False, signoff="lead")
+        ok(both and g_np["action"] != "DECLARE_SCOPE" and _ss.provisional(dd) == [],
+           f"T_OWNER_LEAD_NONPROV a lead answer that is not provisional does not release a policy-mapped item, even "
+           f"under --signoff lead ({g_np['action']})")
+        os.remove(os.path.join(dd, "decision_rule.md"))
         for f_ in (_ss.SIGNOFF, _ss.LEDGER, _ss.REQUEST, "trace.jsonl"):
             if os.path.exists(os.path.join(dd, f_)):
                 os.remove(os.path.join(dd, f_))
@@ -2898,7 +2942,7 @@ def _self_test() -> int:
 
         class Rule:
             @staticmethod
-            def gate_findings(rd, rn, viols, non_declarable=None, mode=None):
+            def gate_findings(rd, rn, viols, non_declarable=None, mode=None, **k):
                 seen["marked"] = [v.get("owner_signoff") for v in viols if v.get("kind") == "decision_test_changes_plan"]
                 return []
         vs = [dict(dtf)]
