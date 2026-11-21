@@ -286,6 +286,8 @@ REVIEWED: dict = {
         "os-link": (1, "the claim file in the worker's call dir (atomic claim)"),
         "os.open-write": (1, "the worker's TLS files (O_EXCL, private dir)")},
     "scripts/eval_private.py": {"shutil": (4, _EVAL), "open-write": (5, _EVAL)},
+    "toolkit/spec/amend.py": {"shutil": (2, "its own .partial child (on refusal), the dry-sign scratch copy"),
+                              "os-rename": (1, "its own .partial child to the new child name it checked")},
     "scripts/eval_suite.py": {"open-write": (9, _EVAL), "os-symlink": (1, _EVAL), "os-remove": (1, _EVAL),
                               "shell-command": (1, _EVAL + " (--execute runs the cloud launch commands it printed)")},
     "scripts/fixtures.py": {"shutil": (5, _EVAL), "open-write": (7, _EVAL), "os-remove": (1, _EVAL)},
