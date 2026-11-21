@@ -119,6 +119,34 @@ def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, comp
     return rec
 
 
+def solver_gap(rec: dict, sg, thr: dict) -> dict:
+    """A compare() row whose re-solved plan the solver accepted without proving it (`sg`: core.best_known's
+    solver_gap; None for a proven solve, and the row is returned as it is). The true regret lies between `regret` and
+    `regret + bound`, recorded as `regret_solver_gap`; a regret below zero is clipped at zero and noted.
+    `within_solver_gap` is True when the verdict cannot be settled inside that bound: the regret criterion fires at
+    one end and not at the other, or the row changes the plan while the re-solved plan's advantage over the point
+    plan is no larger than the bound. `decision_changes` and `triggered_by` stay as computed."""
+    if not sg:
+        return rec
+    rec, b = dict(rec), float(sg["bound"])
+    clipped = rec.get("regret") is not None and rec["regret"] < 0
+    if clipped:
+        rec["regret"] = 0.0
+        rec["regret_share"] = None if rec.get("regret_share") is None else 0.0
+    soft = False
+    if rec.get("regret") is not None:
+        top = float(rec["reoptimised_objective"]) + b
+        hi = dict(rec, regret=rec["regret"] + b, reoptimised_objective=top,
+                  regret_share=(rec["regret"] + b) / top if top > 0 else None)
+        soft = (fires(rec, "regret", thr["regret"]) != fires(hi, "regret", thr["regret"])
+                or (bool(rec.get("decision_changes")) and rec["regret"] <= b))
+    rec["regret_solver_gap"] = {"gap": float(sg["gap"]), "bound": b, "kept": sg.get("kept"), "clipped": bool(clipped),
+                                "note": "the re-solved plan was accepted without a proof of optimality: the regret "
+                                        "against the true optimum lies between regret and regret + bound"}
+    rec["within_solver_gap"] = bool(soft)
+    return rec
+
+
 REGRET_TOL = 1e-9      # relative to max(1, |objective|); scripts/mechanism_manifest.py holds the same rule
 
 
@@ -237,15 +265,18 @@ def aggregate(rows: list) -> dict:
             "population_changed_share": w["population"]["population_changed_share"], "worst_by_criterion": wb}
 
 
-def summarise(A, plan, ch, ben, cost, objective, budget=None, feas=None) -> dict:
+def summarise(A, plan, ch, ben, cost, objective, budget=None, feas=None, gap=None) -> dict:
     """compare() for the analysis state: its population, region, allocatable budget, thresholds and components; the
-    point plan is checked against `budget` (default: the budget plans are solved at) and `feas` (default A.feas)."""
+    point plan is checked against `budget` (default: the budget plans are solved at) and `feas` (default A.feas).
+    `gap`: the solve's solver_gap (core.best_known) when its plan was accepted unproven; see solver_gap()."""
     reg = {i: A.by_id[i].get(A.region) for i in A.ids} if A.region else None
     if budget is None:
         budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
-    return compare(A.ids, plan, ch, ben, getattr(cost, "by_component", None), objective, population(A), reg,
-                   A.budget, thresholds(A.spec["analysis"]), list(A.spec["options"]["components"]),
-                   plan_budget=budget, feas=feas if feas is not None else getattr(A, "feas", None))
+    thr = thresholds(A.spec["analysis"])
+    return solver_gap(compare(A.ids, plan, ch, ben, getattr(cost, "by_component", None), objective, population(A), reg,
+                              A.budget, thr, list(A.spec["options"]["components"]),
+                              plan_budget=budget, feas=feas if feas is not None else getattr(A, "feas", None)),
+                      gap, thr)
 
 
 # --------------------------------------------------------------------------- self-test
@@ -515,6 +546,60 @@ def _self_test() -> int:
        and all(v[3].get("regret") != v[3].get("regret") for v in v32),
        f"MV32 (P1) a regret that is not a number is reported as it is, whatever its place (no exception, never hidden "
        f"behind a finite value) ({[(v[0], repr(v[4])) for v in v32]})")
+    # 1C-c follow-up: regret against a plan the solver accepted without proving it carries the accepted gap as a bound
+    sg_fn = globals().get("solver_gap")
+    thr_ = {"share": 0.1, "regret": 0.01, "dollars": 0.05}
+    base = {"regret": 0.5, "regret_share": 0.005, "reoptimised_objective": 100.0, "share_units_changed": 0.0,
+            "dollars_share": 0.0, "decision_changes": False, "triggered_by": []}
+    sg = {"gap": 0.008, "bound": 1.0, "kept": "incumbent"}
+    r1, e15 = attempt(sg_fn, dict(base), sg, thr_)
+    ok(e15 is None and r1["within_solver_gap"] is True and r1["decision_changes"] is False and r1["regret"] == 0.5
+       and r1["regret_solver_gap"]["bound"] == 1.0 and r1["regret_solver_gap"]["gap"] == 0.008
+       and r1["regret_solver_gap"]["clipped"] is False,
+       f"MV40 a regret that crosses its threshold inside the accepted gap is marked within_solver_gap, with the bound "
+       f"beside it; the computed verdict is left as it is ({e15!r}, {r1})")
+    r2, e16 = attempt(sg_fn, dict(base, regret=-0.2, regret_share=-0.002), dict(sg, bound=0.1), thr_)
+    ok(e16 is None and r2["regret"] == 0.0 and r2["regret_share"] == 0.0 and r2["regret_solver_gap"]["clipped"] is True
+       and r2["within_solver_gap"] is False,
+       f"MV41 a regret below zero against an unproven plan is clipped at zero and noted ({e16!r}, {r2})")
+    r3, e17 = attempt(sg_fn, dict(base, regret=0.3, regret_share=0.003, share_units_changed=0.5, decision_changes=True,
+                                  triggered_by=["share"]), sg, thr_)
+    r4, _ = attempt(sg_fn, dict(base, regret=5.0, regret_share=0.05, decision_changes=True, triggered_by=["regret"]),
+                    sg, thr_)
+    r5, _ = attempt(sg_fn, dict(base), None, thr_)
+    r6, _ = attempt(sg_fn, dict(base, regret=None, regret_share=None, decision_changes=True,
+                                triggered_by=["infeasible"]), sg, thr_)
+    ok(e17 is None and r3["within_solver_gap"] is True and r4["within_solver_gap"] is False and r5 == base
+       and r6["within_solver_gap"] is False and r6["regret"] is None,
+       "MV42 a change whose advantage over the point plan is inside the bound is within the gap; a regret well above "
+       "it, a proven solve, and a point plan the test makes infeasible are not")
+    # Codex narrow round (2 P1) on core.best_known: the point plan is promoted only when it is feasible by the rule
+    # this module's rows use and within the solver's own budget tolerance; the bound is computed on gains
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from toolkit.analysis import core as CO
+
+    class _B:
+        ids, plan_budget = ["u1", "u2"], None
+        feas = {"feasible": {u: {"none": True, "a": True} for u in ("u1", "u2")}, "caps": []}
+    Bk = _B()
+    bb, cb = {u: {"none": 0.0, "a": 5.0} for u in Bk.ids}, {u: {"none": 0.0, "a": 10.0} for u in Bk.ids}
+    inc = {"status": "feasible", "gap": 0.01, "gain": 5.0, "objective": 5.0, "choice": {"u1": "a", "u2": "none"}}
+    both = {"u1": "a", "u2": "a"}
+    Bk.budget = 20.0 / (1 + 5e-8)          # the point plan costs 5e-8 over: inside check()'s rounding, outside the solver's
+    k1, e18 = attempt(CO.best_known, Bk, dict(inc), both, bb, cb)
+    Bk.budget = 20.0
+    k2, _ = attempt(CO.best_known, Bk, dict(inc), both, bb, cb)
+    ok(e18 is None and k1["solver_gap"]["kept"] == "incumbent" and k1["choice"] == inc["choice"]
+       and k2["solver_gap"]["kept"] == "point_plan" and k2["objective"] == 10.0,
+       f"MV43 a point plan over the budget the solver enforces is not promoted over the incumbent; one within it is "
+       f"({e18!r}, {(k1 or {}).get('solver_gap')}, {(k2 or {}).get('solver_gap')})")
+    big = {"u1": {"none": 2.0 ** 54, "a": 2.0 ** 54}, "u2": {"none": 0.0, "a": 128.0}}
+    inc2 = {"status": "feasible", "gap": 1.0 / 129, "gain": 128.0, "objective": 2.0 ** 54 + 128.0,
+            "choice": {"u1": "none", "u2": "a"}}
+    k3, e19 = attempt(CO.best_known, Bk, inc2, dict(inc2["choice"]), big, cb)
+    ok(e19 is None and abs(k3["solver_gap"]["bound"] - 1.0) < 1e-9,
+       f"MV44 the bound is computed on gains, so a large benefit every plan gets cannot round it away "
+       f"({e19!r}, {(k3 or {}).get('solver_gap')})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
