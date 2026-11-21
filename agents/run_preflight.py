@@ -1,7 +1,7 @@
 """Preflight: a short real lead + subagent session checked before a paid run.
 
 Phase 48 γ moved this code out of main.py unchanged; main.py imports every
-name back, so `main.<name>` (the self-tests, scripts/sdk_scenarios.py) still
+name back, so `main.<name>` (the self-tests) still
 works. Tested by `python3 main.py --self-test`.
 """
 
