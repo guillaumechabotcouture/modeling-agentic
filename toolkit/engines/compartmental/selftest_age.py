@@ -264,8 +264,9 @@ def _self_test() -> int:
     hb = Horizon(2026.0, 2046.0, (2026.0, 2046.0), {"all": [2026.0, 2046.0]})
     bat = efs_s.run_batch(ps, _unit(), Package("0", {}), hb, 1)
     one = efs_s.run(ps[1], _unit(), Package("0", {}), hb, 1)
-    ok(bat[1].windows["all"]["reff_end"] == one.windows["all"]["reff_end"]
-       and bat[1].windows["all"]["s_end"] == one.windows["all"]["s_end"],
+    # to rounding (v0.3: Starsim v4 splits the population across a batch's members, as K3 allows)
+    ok(math.isclose(bat[1].windows["all"]["reff_end"], one.windows["all"]["reff_end"], rel_tol=1e-12)
+       and math.isclose(bat[1].windows["all"]["s_end"], one.windows["all"]["s_end"], rel_tol=1e-12),
        f"A35 (r2 P1-4) a seasonal final-size member's endpoint diagnostics do not depend on its batch companions "
        f"({bat[1].windows['all']['reff_end']} vs {one.windows['all']['reff_end']})")
     o36 = efs.run(P, _unit(), Package("0", {}), short, 1)

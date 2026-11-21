@@ -1,6 +1,21 @@
-# Compartmental engine v0.2: notes
+# Compartmental engine v0.3: notes
 
-Engine `compartmental-starsim` v0.2. Design note: `docs/design/v2d-compartmental-engines.md` (§1.1, §5).
+Engine `compartmental-starsim` v0.3. Design note: `docs/design/v2d-compartmental-engines.md` (§1.1, §5).
+
+## v0.3: a declared Starsim v4 disease
+
+v0.3 runs the same model as a declared Starsim v4 disease (plan: `docs/design/v2-ssv4.md`), where v0.2 was one Starsim 3 `ss.Module` holding numpy arrays (described below as it was).
+
+- **States.** `S`, `I1..IL` and `R`: `I_l` holds the people infected `l` steps ago and leaves after exactly one step (`ss.constant` dwells, `dwells='exact'`), so the force of infection is `sum_l w_l I_l` and infection is `S >> I1 @ beta * force`.
+- **Batch and groups.** The disease is stratified by `member` (the batch's members, as independent places) and `group` (the engine's groups, with each member's own sizes as fractions). The groups mix through `ss.contacts(group=C)`, which gives `beta sum_j C_ij I_j / N_j`. Members with different contact matrices run in separate sims; `beta` is `q f(t)` per member, an `ss.timeseries` over the sim's steps (or a number, without forcing).
+- **The discrete map.** The ODE solver's map integrator (`ss.solvers.ode(integrator='map', dwells='exact')`) takes each step's infections once, at its start, as `S (1 - exp(-lambda))`, as v0.2 did.
+- **Engine logic between sims.** Each sim runs whole, in one compiled call. A component acting during the epidemic ends one sim and starts the next, moving people from `S` to `R` in the carried state at the start of its step. The stop rule is applied to each step's results after the sim (the infections of each step, and `S`), and the steps after every member has stopped are dropped. A to_extinction run continues in a new sim, from the last state, in segments as before.
+- **Outputs.** Unchanged code (`_outcomes`, `run_series`, `p_major` from the extinction equations, still derived, not simulated).
+- **Same numbers.** Every benchmark keeps its v0.2 status (`benchmarks/results.yaml`). Batched and single runs agree to 1e-12 (K3, A35), as v0.2's K3 already allowed; v4 splits the population across a batch's members, so they differ by about 1e-16. A finished member is frozen in the outputs (its later infections are not counted), as v0.2 froze it in the module.
+- **Gaps met.** G2 (no compiled discrete map: added to Starsim as `integrator='map'`), G4 (the live state after a run is one step past its last result: the carried state is read from the results) and G5 (`init=` places people in a one-step state's slots inconsistently: moved after `init()`), in `_V4Run`.
+- **Speed.** `engine.py --self-test` takes 2.6 s (v0.2: 12 s); `selftest_age.py --self-test` 13.5 s (v0.2: 36 s), of which 6 s is the extinction equations (numpy, as in v0.2). Each sim is made with `copy_inputs=False`, since its modules are made for it.
+- **Coverage pack.** `benchmarks/coverage_results.yaml` is still stamped for v0.2; `compat_proof.py` shows byte identity, which v4 doesn't give (decisions file, item 6).
+
 v0.2 adds what age-structured allocation questions need. Each addition acts only when a configuration or a
 component asks for it, so every v0.1 configuration gives byte-identical outputs.
 

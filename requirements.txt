@@ -29,7 +29,7 @@ pandas==3.0.2           # toolkit/engines/malaria/engine.py, cloud/nigeria_gf13_
 matplotlib==3.10.8      # toolkit/analysis/figures.py
 scikit-learn==1.8.0     # toolkit/analysis/model.py (emulator)
 PuLP==3.3.0             # toolkit/alloc/optimize.py (ILP)
-starsim==3.3.2          # toolkit/engines/malaria/, toolkit/engines/compartmental/
+starsim==4.0.0rc6       # toolkit/engines/malaria/, compartmental/ (Starsim v4; rc6 has the ODE map integrator)
 
 # --- Agent-written model code and skill scripts ---
 -r requirements-agent.txt

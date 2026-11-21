@@ -1,0 +1,9 @@
+toolkit/engines/malaria/vector.py rc=0 0s
+toolkit/engines/malaria/selftest_late.py rc=0 563s
+toolkit/engines/malaria/benchmarks/net_checks.py rc=0 1s
+toolkit/engines/malaria/benchmarks/guess_sensitivity.py rc=0 2s
+toolkit/engines/malaria/benchmarks/render_notes.py rc=0 0s
+toolkit/engines/malaria/benchmarks/restamp_proof.py rc=0 1s
+toolkit/engines/malaria/benchmarks/net_effect_fit.py rc=0 17s
+toolkit/engines/malaria/benchmarks/equilibration.py rc=0 1s
+toolkit/engines/malaria/benchmarks/pack_trials.py rc=1 1s

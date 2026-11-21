@@ -138,6 +138,11 @@ mortality near its ceiling (0.93) and Equation 8's entry falls to 0.1-0.2, so th
 and its benefit over a pyrethroid net vanishes; no pack trial tests that deterrence. Default 1 gives the v0.17 net
 outcomes bit for bit (vector.py V38); the evidence is re-stamped after benchmarks/restamp_proof.py proves the
 outputs identical. Self-tests V38-V39 (vector.py) and NE4 (selftest_late.py).
+
+v0.19: the same model on Starsim 4 (4.0.0rc5) in place of Starsim 3.3.2 (ENGINE_NOTES.md, v0.19). Births and deaths
+keep their meaning, 37 and 11 per 1,000 per year (rate_per=1000; Starsim 4 reads a bare rate per person); the burn-in
+floor moves from 1900 to 1800 (MIN_START_YEAR); finished members are freed by gc.collect() alone. Starsim 4's random
+streams differ, so outputs are not v0.18's to the digit; a v3/v4 comparison found them within seed noise.
 """
 from __future__ import annotations
 
@@ -166,7 +171,7 @@ RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
 AGES = ["u5", "5_14", "15p"]
 GRIFFIN = "Griffin et al. 2010 PLoS Med 10.1371/journal.pmed.1000324; 2014 Nat Commun; 2015 Lancet Infect Dis"
 A8 = "E7 attempt 8 value (models/malaria_abm.py VC), kept"
-VERSION = "0.18"
+VERSION = "0.19"
 # v0.12: case-management sources (ENGINE_NOTES.md, v0.12)
 ORESANYA = "Oresanya et al. 2019 J Glob Health (PMC6594663), Niger State RAcE, Tables 5-6"
 ISIGUZO = "Isiguzo et al. 2019 J Glob Health Rep (joghr.org article 12008), Abia State RAcE, Table 7"
@@ -300,9 +305,11 @@ _PARAMS = [
 # horizon.start. Births 37 and deaths 11 per 1,000 per year (_demog); 0.0269 per year is the growth measured in the
 # pre-v0.5 burn-in diagnostic (ENGINE_NOTES.md, v0.5) and checked by self-test V2.
 POP_GROWTH = 0.0269
-# Starsim 3.3.2's Births and Deaths add and remove no one in a sim that starts before 1900 (measured: 500 agents from
-# 1890 or 1899 stay 500 for 5 years; from 1900, 73 births). A burn-in that would start earlier fails closed (V2c).
-MIN_START_YEAR = 1900.0
+# v0.19 (Starsim 4): a bare start is a calendar year only from 1800 on; Starsim 4 reads an earlier one as a time in
+# days from 0 (measured: start 1750.0, stop 1752.0, daily steps gives 3 steps), so a burn-in that would start earlier
+# fails closed (V2c). v0.5-v0.18 (Starsim 3.3.2) had the floor at 1900, before which that version's Births and Deaths
+# added and removed no one. Starsim 4's work at any start (spike/ssv4/pre1900_check.py, port worktree).
+MIN_START_YEAR = 1800.0
 # Parameters read only by package components (after the fork) or by the outcome accounting in the decision window:
 # param sets that differ only in these share one burn-in (checked by V5). cfp_kill and cfp_half act through dual-AI
 # nets, so they join the burn-in key when past campaigns used dual-AI nets (hist_net: dual).
@@ -339,8 +346,9 @@ def _people(n):
 
 
 def _demog():
+    """Births 37 and deaths 11 per 1,000 per year (v0.19: rate_per=1000, which Starsim 3.3.2 assumed)."""
     import starsim as ss
-    return [ss.Births(birth_rate=ss.peryear(37)), ss.Deaths(death_rate=ss.peryear(11))]
+    return [ss.Births(birth_rate=ss.peryear(37), rate_per=1000), ss.Deaths(death_rate=ss.peryear(11), rate_per=1000)]
 
 
 def access_for_use(use: float, at_years: float, P: dict) -> tuple:
@@ -855,8 +863,8 @@ class MalariaEngine:
         B = int(round(B))
         if float(horizon.start) - B < MIN_START_YEAR:
             raise ValueError(f"the sim would start in {float(horizon.start) - B:g} (horizon.start {horizon.start:g} - "
-                             f"burnin_years {B}); Starsim 3.3.2 births and deaths do nothing before {MIN_START_YEAR:g}, "
-                             "so the population would not grow: shorten the burn-in or move the horizon")
+                             f"burnin_years {B}); Starsim reads a start before {MIN_START_YEAR:g} as days from 0, not a "
+                             "calendar year: shorten the burn-in or move the horizon")
         M.smc_check(P)                               # v0.11: SMC parameters outside their domain fail closed
         V.net_check(P)                               # v0.17: and the net-effect parameters
         M.cm_check(P)                                # v0.12: and the case-management options
@@ -1081,13 +1089,11 @@ class MalariaEngine:
                     ser[i] = self._series(s, horizon, series, pkgs[i].id)
                 if n == len(idx) - 2:
                     snap = None                # the last member continues the original sim
-                try:
-                    dz.daily, dz.mos, dz.wdaily = {}, [], {}
-                    s.shrink(size_limit=None, die=False)   # Starsim keeps finished sims alive: drop their people and loop
-                except Exception:  # noqa: BLE001 -- best effort; the outcomes are already computed
-                    pass
                 del s, dz
-                gc.collect()                   # Starsim sims hold reference cycles: free each member before the next
+                # Starsim sims hold reference cycles: free each member before the next. v0.19: Starsim 4 frees a
+                # finished sim at gc.collect(), so the v0.5-v0.18 emptying of each member (shrink, for Starsim 3.3.2,
+                # which kept finished sims alive even then) is gone
+                gc.collect()
             del sim
             gc.collect()
         return out, ser
@@ -1379,10 +1385,10 @@ def _self_test_v05(ok, e, unit) -> None:
         s0 = e.initial_state({"n_agents": n, "burnin_years": 0}, u, horizon=hz, seed=1)
         ok(s0["N"] == n and s0["N0"] == n, "V2b without a burn-in the population at horizon.start is n_agents exactly")
         try:
-            e.initial_state({"n_agents": n, "burnin_years": 140}, u, horizon=hz, seed=1)
-            ok(False, "V2c a burn-in starting before 1900 (Starsim demography inactive) fails closed")
+            e.initial_state({"n_agents": n, "burnin_years": 250}, u, horizon=hz, seed=1)
+            ok(False, "V2c a burn-in starting before 1800 (not a calendar year to Starsim 4) fails closed")
         except ValueError as ex:
-            ok("1900" in str(ex), "V2c a burn-in starting before 1900 (Starsim demography inactive) fails closed")
+            ok("1800" in str(ex), "V2c a burn-in starting before 1800 (not a calendar year to Starsim 4) fails closed")
     case("V2", v2)
 
     def v3():

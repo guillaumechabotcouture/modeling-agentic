@@ -1,6 +1,7 @@
 """Starsim malaria model: Griffin-lite humans, species-aware vectors, ITN / IRS / SMC / CM.
 
-Promoted from E7 attempt 8 (`models/malaria_abm.py`, Starsim 3.3). Human module unchanged:
+Promoted from E7 attempt 8 (`models/malaria_abm.py`, Starsim 3.3); on Starsim 4 from v0.19 (the same model; the
+zeta default is ss.lognormal, Starsim 3's ss.lognorm_ex). Human module unchanged:
 S / D (clinical untreated) / T (treated) / A (patent asymptomatic) / U (sub-patent),
 superinfection of A/U, exposure-driven immunity (IB, IC, ID, IV) with maternal IC/IV,
 lognormal biting heterogeneity and age-dependent biting; immunity and natural-history
@@ -146,7 +147,7 @@ class Malaria(ss.Disease):
         self.update_pars(pars, **kwargs)
         sd = np.sqrt((np.exp(G['sigma2']) - 1))
         self.define_states(
-            ss.FloatArr('st', default=0.0), ss.FloatArr('zeta', default=ss.lognorm_ex(mean=1.0, std=sd)),
+            ss.FloatArr('st', default=0.0), ss.FloatArr('zeta', default=ss.lognormal(mean=1.0, std=sd)),
             ss.FloatArr('IB', default=0.0), ss.FloatArr('IC', default=0.0), ss.FloatArr('ID', default=0.0),
             ss.FloatArr('IV', default=0.0), ss.FloatArr('lb', default=-1e9), ss.FloatArr('lc', default=-1e9),
             ss.FloatArr('ld', default=-1e9), ss.FloatArr('lv', default=-1e9),
