@@ -36,6 +36,12 @@ POLICIES = {
     "calibrator": {"prefixes": ("toolkit.engines.",), "modules": ("toolkit.analysis.calibration",), "refs": (),
                    "suffix": None},
 }
+# W0-A (scripts/lib/import_closure.py): what each kind can import, for the reuse key's code closure. A call into this
+# module with a literal kind takes that kind's paths, any other call all of them. Every module a policy above (or a
+# test-only ref) allows must lie inside its kind's paths; the self-test (IG-FP) checks it.
+FP_DYNAMIC_IMPORTS = {"engine": ("toolkit/engines", "toolkit/spec/priors.py", "toolkit/spec/toy_engines.py"),
+                      "oracle": ("toolkit/engines",),
+                      "calibrator": ("toolkit/engines", "toolkit/analysis/calibration.py")}
 _TEST_MODULES: dict = {k: set() for k in POLICIES}
 # Self-test toy engines that are never allowed in production (ToySpecEngine appends to a call log). Only these
 # references can be enabled, and only by code in a self-test process (allow_test_refs); no file and no environment
@@ -269,6 +275,17 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- reported in the case
         ig6 = (f"{type(e).__name__}: {e}"[:200], None)
     ok(ig6 == ("allowed", "refused"), f"IG6 a worker allows a test reference only with the pool initializer ({ig6})")
+    # IG-FP (W0-A): every module a kind can import lies inside that kind's FP_DYNAMIC_IMPORTS paths
+    def inside(kind, mod):
+        rel = mod.replace(".", "/")
+        return any(rel == p[:-3] or rel.startswith(p.rstrip("/") + "/") or rel == p
+                   for p in FP_DYNAMIC_IMPORTS.get(kind, ()))
+    named = [(k, x) for k, p in POLICIES.items() for x in (*p["modules"], *(r.split(":")[0] for r in p["refs"]))]
+    named += [(k, r.split(":")[0]) for k, rs in TEST_ONLY_REFS.items() for r in rs]
+    named += [(k, x.rstrip(".")) for k, p in POLICIES.items() for x in p["prefixes"]]
+    out = [(k, x) for k, x in named if not inside(k, x)]
+    ok(set(FP_DYNAMIC_IMPORTS) == set(POLICIES) and not out,
+       f"IG-FP every policy's modules are inside its FP_DYNAMIC_IMPORTS paths (outside: {out})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
