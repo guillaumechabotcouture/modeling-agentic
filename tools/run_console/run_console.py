@@ -1898,7 +1898,7 @@ def projects(runs: list) -> list:
     for r in runs:
         twins = sorted(by_sha.get((r.get("state_sha"), r.get("spec_sha"))) or [], key=lambda x: x["label"])
         r["draft"] = None
-        if r.get("state") in ("SPEC", "SIGN") and not r.get("has_engine_choice"):
+        if r.get("state") in ("SPEC", "EVIDENCE", "SIGN") and not r.get("has_engine_choice"):
             r["draft"] = "never got past sign-off"
         elif r.get("state_sha") and len(twins) > 1 and twins[0] is not r:
             r["draft"] = f"a copy of {twins[0]['label']}"
