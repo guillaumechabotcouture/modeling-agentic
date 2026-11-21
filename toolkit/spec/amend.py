@@ -533,14 +533,12 @@ def _print(rec: dict, log) -> None:
     log(f"Reuse: {r.get('reusable')} of {r.get('stored')} stored rows reusable {r.get('error') or ''}")
     for b in r.get("batches", []):
         log(f"  {b['out']}: {b['reusable']} reusable, {b['to_compute']} to compute; {b['rule']}: {b['why']}")
-    pin = rec["code_pin"]
+    pin, ds = rec["code_pin"], rec["dry_sign"]
     log(f"Code pin: {pin.get('commit')} (clean: {pin.get('clean')}, on a remote: {pin.get('on_remote')})")
-    ds = rec["dry_sign"]
     if not ds["ok"]:
-        log(f"Dry-sign as {ds['by']} FAILED on a scratch copy: {ds.get('error') or ds.get('status')}")
-        log("No sign command is given. Open review conditions: dispose of them in review_conditions.yaml, then "
-            f"python3 toolkit/spec/signoff.py sheet {rec['child']} --write, read it, and sign with its hashes. "
-            "Otherwise fix the patch and amend again.")
+        log(f"Dry-sign as {ds['by']} FAILED on a scratch copy: {ds.get('error') or ds.get('status')}\nNo sign command. "
+            f"Open review conditions: dispose of them, run python3 toolkit/spec/signoff.py sheet {rec['child']} "
+            "--write, read it and sign with its hashes. Otherwise fix the patch and amend again.")
         return
     log(f"Dry-sign as {ds['by']}: a scratch copy signed and verified.")
     log(("Owner sign command" if rec["signoff"] == "owner" else "Lead mode: the lead signs at SIGN on resume; "
