@@ -2757,10 +2757,15 @@ def _same_fn(rec: dict, fn_spec: str, fid: str | None) -> bool:
     return rec.get("fn") == fn_spec or bool(fid and rec.get("fn_id") == fid)
 
 
-def _same_key(rec: dict, fp: str, legacy) -> bool:
+def _same_key(rec: dict, fp: str, legacy, parts=None) -> bool:
     """The record's key is this one. W0-A: a record written before key_parts (the whole-tree key) matches when the
-    legacy fingerprint here (`legacy`, a callable computed at most once by the caller) still equals it."""
+    legacy fingerprint here (`legacy`, a callable computed at most once by the caller) still equals it, or (W0-A2) when
+    it was restamped with the parts of the key here (`parts`; the engine part is checked by the caller)."""
     if rec.get("code_fp") == fp:
+        return True
+    rs = rec.get("restamp") if isinstance(rec.get("restamp"), dict) else {}
+    if parts and rs.get("decision") == "accepted" and rs.get("old_code_fp") == rec.get("code_fp") \
+            and rs.get("parts") == {k: v for k, v in parts.items() if k != "extra"}:
         return True
     return bool(legacy) and not str(rec.get("code_fp")).startswith("k2-") and rec.get("code_fp") == legacy()
 
@@ -2789,7 +2794,7 @@ def _carries(result, ident) -> bool:
     return bool(found) and all(found)
 
 
-def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None, legacy=None, extra=None) -> dict:
+def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None, legacy=None, extra=None, parts=None) -> dict:
     """key -> ok row from an earlier --out of the same function and code, and
     (Phase 42 α) from the rows an interrupted or killed run of it had written
     to `<out>.partial.jsonl` (its first line names the function and code). W0-A (Codex r1 P1-9): a row admitted
@@ -2805,7 +2810,7 @@ def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None, legacy=No
         return {k: r for k, r in rows.items() if _carries(r.get("result"), ident)}
     try:
         prev = json.load(open(out + ".summary.json"))
-        if _same_fn(prev, fn_spec, fid) and _same_key(prev, fp, legacy):
+        if _same_fn(prev, fn_spec, fid) and _same_key(prev, fp, legacy, parts):
             body = open(out, "rb").read()
             rows = [json.loads(l) for l in body.decode().splitlines() if l.strip()]
             # Codex round 1 P1-1: a results file and a summary from two different writes (a torn snapshot) are
@@ -2897,7 +2902,7 @@ def reuse_report(run_dir: str) -> dict:
             # the caller's part (an engine identity) is taken as recorded: it is compared when the batch runs
             fp = code_fingerprint(run_dir, spec, exclude=_out_files(out), record=rec, extra_digest=kp.get("extra"))
             here = rec["key_parts"]
-            n = len(_reusable(out, spec, fp, fn_id(run_dir, spec),
+            n = len(_reusable(out, spec, fp, fn_id(run_dir, spec), parts=here,
                               legacy=lambda: _legacy_fingerprint(run_dir, spec, exclude=_out_files(out))))
             differs = sorted(k for k in set(here) | set(kp) if here.get(k) != kp.get(k)) if kp else [
                 "whole-tree key (stored before W0-A)"]
@@ -2940,6 +2945,155 @@ def _out_base(out: str, run_dir: str) -> tuple[int, str]:
     return anchored(out, run_dir)
 
 
+# W0-A2: a one-time restamp of batches stored under the whole-tree key (before W0-A). A batch is accepted only when (A)
+# its stored old key equals the old key of the code at its launch tree, and (B) every file the new key holds (the
+# closure, or the whole tree when the closure is not computed, and the dependency manifests) is the same at that launch
+# tree as here. Key code (definitions that compute or check a key and never a row) differs across W0-A by construction,
+# so (B) leaves it out; an FP_RESTAMP_FORMS definition only in its recorded forms (sha256 of its source): at the launch
+# tree the last one before W0-A or this one, here this one.
+FP_KEY_CODE = {"scripts/compute.py": ("code_fingerprint", "fn_closure", "_legacy_fingerprint", "_hash_confined",
+                                      "_digest", "_is_compute", "_file_digest", "_run_code_digest", "_same_key",
+                                      "_once", "_carries", "_reusable", "reuse_report", "REUSE_NOTE", "FP_KEY_VERSION",
+                                      "FP_ROW_ROOTS", "FP_DYNAMIC_IMPORTS", "FP_KEY_CODE", "FP_RESTAMP_FORMS",
+                                      "_def_sha", "_restamp_view", "_launch_tree", "restamp", "main"),
+               "toolkit/import_guard.py": ("FP_DYNAMIC_IMPORTS", "FP_LOADERS"),
+               "scripts/lib/import_closure.py": None}          # None: the whole file is key code
+FP_RESTAMP_FORMS = {
+    "scripts/compute.py::_run_map": ("52ce5e7dfc6c4aa03e06954c319083c187688f971b80b82aeaeaa03f62461bad",
+                                     "4a401dccd2e07d4bd687a0871a6096d2946b07a4038a61614e3cb150580a47db"),
+    "toolkit/analysis/batch.py::run": ("c18e4e95b6e5604aa8b0019396c8a2096f17687d5dd1326c3297c95c3af81328",
+                                       "88f19edf16fd7c7ef05831cf33382cd0c2ad570c28959f968bb4d7290738a1de")}
+
+
+def _def_sha(path: str, name: str) -> str | None:
+    """sha256 of a top-level definition's source (decorators included), or None."""
+    import ast
+    try:
+        text = open(path, encoding="utf-8", errors="surrogateescape").read()
+        lines = text.splitlines(True)
+        for n in ast.parse(text).body:
+            if getattr(n, "name", None) == name:
+                start = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
+                return hashlib.sha256("".join(lines[start - 1:n.end_lineno]).encode()).hexdigest()
+    except (OSError, SyntaxError, ValueError):
+        pass
+    return None
+
+
+def _restamp_view(repo: str, rel: str, here: bool):
+    """What (B) compares of one file: its content, or for Python its top-level definitions less key code, self-tests
+    and dispatch code; a form not recorded for this side is a reason."""
+    import ast
+    if FP_KEY_CODE.get(rel, ()) is None:
+        return "key code"
+    path = os.path.join(repo, rel)
+    if not os.path.isfile(path):
+        return None
+    if not rel.endswith(".py"):
+        return _file_digest(path) if not _is_compute(path) else None
+    text = open(path, encoding="utf-8", errors="surrogateescape").read()
+    try:
+        body = ast.parse(text).body
+    except SyntaxError:
+        return hashlib.sha256(text.encode()).hexdigest()
+    skip = set(FP_KEY_CODE.get(rel, ())) | (set(FP_DISPATCH_EXEMPT) if rel == "scripts/compute.py" else set())
+    kept = []
+    for n in body:
+        names = [n.name] if hasattr(n, "name") else [t.id for t in getattr(n, "targets", []) if isinstance(t, ast.Name)]
+        form = FP_RESTAMP_FORMS.get(f"{rel}::{names[0]}") if len(names) == 1 else None
+        if form:
+            if _def_sha(path, names[0]) not in (form[1:] if here else form):
+                return f"{rel}::{names[0]} is not a recorded form"
+            continue
+        if not (names and all(x in skip or x.startswith("_self_test") for x in names)):
+            kept.append(ast.dump(n))
+    return hashlib.sha256("\n".join(kept).encode()).hexdigest()
+
+
+def _launch_tree(run_dir: str, given: str | None):
+    """(tree, how) of the run's launch code, or (None, why not): a tree given (proved by check A), else the launch
+    commit recorded in metadata.json when this repository has it (git archive)."""
+    if given:
+        return os.path.realpath(given), "tree given"
+    try:
+        commit = str(json.load(open(os.path.join(run_dir, "metadata.json"))).get("commit") or "")
+    except (OSError, ValueError, AttributeError):
+        commit = ""
+    import subprocess
+    if commit and subprocess.run(["git", "-C", REPO, "cat-file", "-e", commit + "^{commit}"],
+                                 capture_output=True).returncode == 0:
+        import tarfile
+        import tempfile
+        d = tempfile.mkdtemp(prefix="restamp_")
+        tar = subprocess.run(["git", "-C", REPO, "archive", commit], capture_output=True, check=True).stdout
+        tarfile.open(fileobj=io.BytesIO(tar)).extractall(d, filter="data")
+        return d, f"commit {commit[:12]}"
+    return None, (f"launch code not provable: commit {commit[:12] or 'unknown'} is not in this repository and the run "
+                  "stores no code archive (give --launch-tree)")
+
+
+def restamp(run_dir: str, launch_tree: str | None = None, write: bool = True) -> dict:
+    """W0-A2: decide, for every batch summary under `run_dir` stored under the whole-tree key, whether its rows are
+    reused under the new key (above), and record the decision in the summary (`restamp`; with `write`). An accepted
+    batch records the new key's parts here; run_map reuses it while they are unchanged (engine provenance still
+    checked). Partial journals are not restamped."""
+    run_dir = os.path.realpath(run_dir)
+    tree, how = _launch_tree(run_dir, launch_tree)
+    out_all = []
+    for dp, dirs, fns in os.walk(run_dir):
+        dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git", "_truth"))
+        out_all += [os.path.join(dp, f[:-len(".summary.json")]) for f in sorted(fns) if f.endswith(".summary.json")]
+    batches = []
+    for out in out_all:
+        try:
+            summ = json.load(open(out + ".summary.json"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(summ, dict) or not summ.get("fn") or str(summ.get("code_fp", "k2-")).startswith("k2-"):
+            continue
+        d = {"out": os.path.relpath(out, run_dir), "old_code_fp": summ["code_fp"], "launch": how,
+             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        spec = _here_spec(summ)
+        try:
+            if tree is None:
+                raise ValueError(how)
+            g = globals()
+            saved = g["REPO"]
+            try:
+                g["REPO"] = tree
+                old = _legacy_fingerprint(run_dir, _here_spec(summ), exclude=_out_files(out))
+            finally:
+                g["REPO"] = saved
+            if old != summ["code_fp"]:
+                raise ValueError("the stored old key does not match the old key of the code at the launch tree")
+            rec = {}
+            code_fingerprint(run_dir, spec, exclude=_out_files(out), record=rec)
+            files = [f for f in rec["closure"]["files"] if not f.startswith("run:")] + list(FP_DEP_MANIFESTS)
+            if rec["closure"]["unresolved"]:       # the key holds the whole tree: so does the comparison
+                files += [os.path.relpath(os.path.join(dp, f), r).replace(os.sep, "/") for r in (REPO, tree)
+                          for c in REPO_CODE_DIRS for dp, ds, fs in os.walk(os.path.join(r, c))
+                          if "__pycache__" not in dp.split(os.sep) for f in fs]
+            differ = sorted({f for f in files if f not in _FP_REPO_SKIP
+                             and _restamp_view(tree, f, False) != _restamp_view(REPO, f, True)})
+            if differ:
+                raise ValueError(f"the code differs from the launch tree: {', '.join(differ[:6])}"
+                                 + (f" and {len(differ) - 6} more" if len(differ) > 6 else ""))
+            d.update(decision="accepted", parts={k: v for k, v in rec["key_parts"].items() if k != "extra"})
+        except (ValueError, OSError, KeyError) as e:
+            d.update(decision="refused", reason=str(e)[:400])
+        if write:
+            from lib.safe_io import write_nofollow
+            base, name = _out_base(out, run_dir)
+            try:
+                write_nofollow(base, name + ".summary.json", json.dumps({**summ, "restamp": d}, indent=1).encode(),
+                               atomic=True)
+            finally:
+                os.close(base)
+        batches.append(d)
+    return {"run_dir": run_dir, "launch": how, "accepted": sum(b["decision"] == "accepted" for b in batches),
+            "refused": sum(b["decision"] == "refused" for b in batches), "batches": batches}
+
+
 def _out_lock(out: str, block: bool = False, suffix: str = ".lock", run_dir: str | None = None):
     """An exclusive lock on `out` (an open file; closing releases it), or None if another process holds it. The lock
     file is opened for append with no link followed (never truncated)."""
@@ -2966,7 +3120,7 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
     fp = code_fingerprint(run_dir, fn_spec, exclude=_out_files(out), extra=extra, record=rec)
     fid = fn_id(run_dir, fn_spec)
     keys = input_keys(inputs)
-    old = {} if fresh else _reusable(out, fn_spec, fp, fid, extra=extra,
+    old = {} if fresh else _reusable(out, fn_spec, fp, fid, extra=extra, parts=rec.get("key_parts"),
                                      legacy=lambda: _legacy_fingerprint(run_dir, fn_spec, exclude=_out_files(out)))
     todo = [k for k, key in enumerate(keys) if key not in old]
     if todo:
@@ -6199,10 +6353,12 @@ def _detach_locked(argv, out, n, subprocess, run_dir) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run a model function over many parameter sets")
-    ap.add_argument("cmd", nargs="?", choices=["map", "status", "wait", "reuse-check"])
+    ap.add_argument("cmd", nargs="?", choices=["map", "status", "wait", "reuse-check", "restamp"])
     ap.add_argument("run_dir", nargs="?", help="map, reuse-check: the run directory; status/wait: the batch's --out file")
     ap.add_argument("--expect-all", action="store_true",
                     help="reuse-check: exit 1 unless every stored row would be reused")
+    ap.add_argument("--launch-tree", help="restamp: a checkout of the run's launch code (proved by its old key)")
+    ap.add_argument("--dry-run", action="store_true", help="restamp: decide and print, write nothing")
     ap.add_argument("--detach", action="store_true",
                     help="run the batch in its own session and return at once; follow it with "
                          "`compute.py wait <out>` (an agent tool timeout cannot kill it)")
@@ -6226,6 +6382,14 @@ def main() -> int:
     a = ap.parse_args()
     if a.self_test:
         return _self_test()
+    if a.cmd == "restamp":            # W0-A2, once per run: restamp <run_dir> [--launch-tree D] [--dry-run]
+        if not a.run_dir:
+            ap.error("usage: compute.py restamp <run_dir> [--launch-tree DIR] [--dry-run]")
+        r = restamp(a.run_dir, a.launch_tree, write=not a.dry_run)
+        for b in r["batches"]:
+            print(f"{b['out']}: {b['decision']}" + (f" ({b['reason']})" if b.get("reason") else ""), file=sys.stderr)
+        print(json.dumps(r))
+        return 0
     if a.cmd == "reuse-check":
         if not a.run_dir:
             ap.error("usage: compute.py reuse-check <run_dir> [--expect-all]")
