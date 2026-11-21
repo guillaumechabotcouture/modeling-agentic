@@ -262,8 +262,8 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     errs = schema.validate(sp, pending_ok=True)
     if not errs:              # the preconditions with the signer (a departure needs the owner); engine: auto too
         from toolkit.spec import preconditions as PC
-        errs = [e + (" (only the owner can sign an engine departure)" if by != "owner" else "")
-                for e in PC.problems(run_dir, data, by, spec=sp)]
+        errs = [e + (" (only the owner or, provisionally, the lead can sign an engine departure)"
+                     if by not in ("owner", "lead") else "") for e in PC.problems(run_dir, data, by, spec=sp)]
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs

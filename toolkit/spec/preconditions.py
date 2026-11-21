@@ -43,10 +43,11 @@ def _benchmark_eligibility(run_dir, spec, signer) -> list:
     m = importlib.util.spec_from_file_location("_ab_preconditions", path)
     AB = importlib.util.module_from_spec(m)
     m.loader.exec_module(AB)
-    mode = "proposed" if (signer is None and BC.signature(run_dir) == "proposed") or signer == "owner" else "signed"
+    mode = "proposed" if (signer is None and BC.signature(run_dir) == "proposed") or signer == "owner" else \
+        "provisional_lead" if signer == "lead" else "signed"       # D2: a lead's departures count, provisionally
     raw = dict(spec.raw, _run_dir=run_dir)
-    if signer is not None and signer != "owner":
-        raw.pop("engine_departures", None)          # a lead's signature makes no departure count
+    if signer is not None and signer not in ("owner", "lead"):
+        raw.pop("engine_departures", None)          # no other signer makes a departure count
     rows = AB.eligible_engines(raw, departures=mode)
     if any(r.get("eligible") for r in rows):
         return out
@@ -68,7 +69,7 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
             return [f"net_effect_posterior: an exception to the acceptance rule is the owner's to sign (signer "
                     f"{signer!r})"]
         from toolkit.engines import benchmark_coverage as BC
-        if signer is None and run_dir and BC.signature(run_dir) == "unsigned":     # execution: the recorded sign-off
+        if signer is None and run_dir and BC.signature(run_dir) in ("unsigned", "provisional_lead"):   # execution: the record
             return ["net_effect_posterior: an exception to the acceptance rule counts only under the owner's "
                     "signature of this spec (the recorded sign-off is a lead's, or the spec changed since)"]
     if getattr(spec, "engine_pending", False):

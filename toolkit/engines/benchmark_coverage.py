@@ -5,8 +5,9 @@
 
 An engine is not eligible for a spec when a benchmark covering a component value the spec uses is not `in_band`
 in the engine's verified benchmark record, or when a used component has no covering benchmark, unless the
-owner-signed spec declares a departure for it (`engine_departures`). The check runs at the engine choice, when
-the spec is signed and when the analysis validates the spec (`assess`, `spec_problems`).
+signed spec declares a departure for it (`engine_departures`; signed by the owner, or provisionally by the lead).
+The check runs at the engine choice, when the spec is signed and when the analysis validates the spec (`assess`,
+`spec_problems`).
 
 Each engine with a benchmark pack keeps `benchmark_coverage.yaml` beside its module (yaml: it does not change the
 engine's code fingerprint):
@@ -30,8 +31,10 @@ reported. The record is the engine's verified record for the configuration in us
 the card's copied rows are never read. An engine with a pack and no coverage file is refused; only the exact
 self-test toys are exempt.
 
-A departure: {engine, benchmark | component, reason, decision_test}. It counts only when the spec is signed by
-the owner (the sign-off record's signed_by), and only when its decision test varies the related effect: a
+A departure: {engine, benchmark | component, reason, decision_test}. It counts when the spec is signed by the owner
+(the sign-off record's signed_by), or, as `provisional_lead` (owner default D2, 2026-11-20), by the lead of a
+`--signoff lead` run: results.md lists those as provisional, the lead's, not reviewed by the owner. Either way it
+counts only when its decision test varies the related effect: a
 parameter_value test on one of the entry's effect_parameters, or an interaction_rescale test naming a spec
 component that delivers the covered engine component. Nothing here names a disease.
 """
@@ -55,6 +58,8 @@ ROLE_MEANING = {"held_out": "held-out validation; the result stands, no paramete
                 "unknown": "role not recorded"}
 DEPARTURE_FIELDS = ("engine", "benchmark", "component", "reason", "decision_test", "range_fraction")
 OVERRIDES: dict = {}          # self-tests only: engine ref -> coverage file
+# The signature states under which a departure counts: the owner's, the owner's about to sign, a lead's (D2)
+COUNTING = ("signed", "proposed", "provisional_lead")
 
 
 def canonical(ref: str) -> tuple[str, str]:
@@ -223,10 +228,12 @@ def departure_problems(raw: dict) -> list[str]:
 
 
 def signature(run_dir: str | None, by: str | None = None) -> str:
-    """"signed" when the run's spec is signed by the owner and unchanged, "proposed" when it has no sign-off yet
-    (or `by` is the owner about to sign), else "unsigned" (a lead's signature, or a spec changed since)."""
+    """"signed" when the run's spec is signed by the owner and unchanged, "provisional_lead" when it is signed by the
+    lead and unchanged (D2: an unattended run; its departures count as provisional), "proposed" when it has no
+    sign-off yet (or `by` is the owner about to sign; "provisional_lead" for the lead about to sign), else "unsigned"
+    (another signer, or a spec changed since)."""
     if by is not None:
-        return "proposed" if by == "owner" else "unsigned"
+        return {"owner": "proposed", "lead": "provisional_lead"}.get(by, "unsigned")
     if not run_dir:
         return "unsigned"
     from toolkit.spec import signoff
@@ -237,8 +244,9 @@ def signature(run_dir: str | None, by: str | None = None) -> str:
         sha = hashlib.sha256(open(os.path.join(run_dir, signoff.SPEC), "rb").read()).hexdigest()
     except OSError:
         return "unsigned"
-    return "signed" if rec.get("signed_by") == "owner" and (rec.get("sha256") or {}).get(signoff.SPEC) == sha \
-        else "unsigned"
+    if (rec.get("sha256") or {}).get(signoff.SPEC) != sha:
+        return "unsigned"
+    return {"owner": "signed", "lead": "provisional_lead"}.get(rec.get("signed_by"), "unsigned")
 
 
 # ------------------------------------------------------------------ the check
@@ -356,7 +364,7 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
                             {"benchmark": i, "estimand": entries[i].get("estimand"), "rescaled": entries[i].get("rescaled"),
                              "maps": {s_: {c_ for c_, _v in prs} for s_, prs in smap.items()},
                              "pair": {c: {s for s, cc, _v in hits if cc == c} for c in (entries[i].get("covers") or {})}}))
-    counts = departures_status in ("signed", "proposed")
+    counts = departures_status in COUNTING
     for key, kind, params, comps, failing, ctx in pending:
         d = deps.get(key)
         if d is not None and counts:
@@ -368,7 +376,7 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
                 continue
             kind += f"; its departure does not count: decision test {d.get('decision_test')!r} {why}"
         elif d is not None:
-            kind += "; its departure does not count: the spec is not signed by the owner (or changed since)"
+            kind += "; its departure does not count: the spec is not signed by the owner or the lead (or changed since)"
         out["why_not"].append(kind)
         if failing["role"] != "none":
             out["blocking"].append({"id": key, "role": failing["role"], "status": failing["benchmark_status"]})
@@ -520,7 +528,8 @@ def sheet_lines(raw: dict, candidates: list | None) -> list[str]:
     if deps:
         out += ["## Engine departures from benchmark evidence",
                 "Signing as the owner accepts that the engine is used for each component below although its "
-                "benchmark against the trial is not in band, or no benchmark covers it; a lead's signature does not."]
+                "benchmark against the trial is not in band, or no benchmark covers it; a lead's signature (an "
+                "unattended run) accepts it provisionally, listed as such in the run's results for the owner's review."]
         for d in deps:
             key = d.get("benchmark") or d.get("component")
             seen = rows.get((d.get("engine"), key))
@@ -548,7 +557,13 @@ def results_lines(raw: dict, run_dir: str | None = None) -> list[str]:
     except (OSError, ValueError, AttributeError):
         pass
     out = []
-    if deps:
+    if deps and signature(run_dir) == "provisional_lead":
+        out += ["## Provisional engine departures (signed by the lead; not reviewed by the owner)", "",
+                "This run was signed by its lead (`--signoff lead`), so each departure below is provisional: the owner "
+                "has not accepted it. The engine was used for components whose benchmark against the trial is not in "
+                "band, or that no benchmark covers. The owner confirms a departure by signing the spec in a new run, "
+                "or overturns it by removing the entry:", ""]
+    elif deps:
         out += ["## Declared engine departures (signed by the owner in the spec)", "",
                 "The engine was used for components whose benchmark against the trial is not in band, or that no "
                 "benchmark covers. A held-out benchmark's result stands as validation (no parameter was tuned toward "

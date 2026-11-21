@@ -166,19 +166,20 @@ def candidate_entries(spec: dict, engines=None) -> list:
 
 
 def _departures(spec: dict, departures: str) -> tuple[dict, str]:
-    """(the spec whose departures may count, their status). "proposed": the pre-sign check, the spec's own. Otherwise
-    only those of the run's spec file as the owner signed it (benchmark_coverage.signature: signed_by owner, bytes
-    unchanged); a lead's signature or a changed spec counts none."""
-    if departures == "proposed":
-        return spec, "proposed"
+    """(the spec whose departures may count, their status). "proposed": the pre-sign check, the spec's own
+    ("provisional_lead": the lead's pre-sign check, D2). Otherwise only those of the run's spec file as it was signed
+    (benchmark_coverage.signature, bytes unchanged): the owner's ("signed") or, provisionally, the lead's
+    ("provisional_lead"); a changed spec counts none."""
+    if departures in ("proposed", "provisional_lead"):
+        return spec, departures
     from toolkit.engines import benchmark_coverage as BC
     rd = spec.get("_run_dir")
     try:
         st = BC.signature(rd) if rd else "unsigned"
-        if st == "signed":
+        if st in ("signed", "provisional_lead"):
             import yaml
             signed = (yaml.safe_load(open(os.path.join(rd, SPEC_FILE))) or {}).get("engine_departures") or []
-            return dict(spec, engine_departures=signed), "signed"
+            return dict(spec, engine_departures=signed), st
     except Exception:  # noqa: BLE001 -- unreadable sign-off: no departure counts (fail closed)
         pass
     return spec, "unsigned"
