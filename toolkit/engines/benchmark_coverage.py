@@ -5,8 +5,9 @@
 
 An engine is not eligible for a spec when a benchmark covering a component value the spec uses is not `in_band`
 in the engine's verified benchmark record, or when a used component has no covering benchmark, unless the
-owner-signed spec declares a departure for it (`engine_departures`). The check runs at the engine choice, when
-the spec is signed and when the analysis validates the spec (`assess`, `spec_problems`).
+signed spec declares a departure for it (`engine_departures`; signed by the owner, or provisionally by the lead).
+The check runs at the engine choice, when the spec is signed and when the analysis validates the spec (`assess`,
+`spec_problems`).
 
 Each engine with a benchmark pack keeps `benchmark_coverage.yaml` beside its module (yaml: it does not change the
 engine's code fingerprint):
@@ -30,8 +31,10 @@ reported. The record is the engine's verified record for the configuration in us
 the card's copied rows are never read. An engine with a pack and no coverage file is refused; only the exact
 self-test toys are exempt.
 
-A departure: {engine, benchmark | component, reason, decision_test}. It counts only when the spec is signed by
-the owner (the sign-off record's signed_by), and only when its decision test varies the related effect: a
+A departure: {engine, benchmark | component, reason, decision_test}. It counts when the spec is signed by the owner
+(the sign-off record's signed_by), or, as `provisional_lead` (owner default D2, 2026-11-20), by the lead of a
+`--signoff lead` run: results.md lists those as provisional, the lead's, not reviewed by the owner. Either way it
+counts only when its decision test varies the related effect: a
 parameter_value test on one of the entry's effect_parameters, or an interaction_rescale test naming a spec
 component that delivers the covered engine component. Nothing here names a disease.
 """
@@ -55,6 +58,8 @@ ROLE_MEANING = {"held_out": "held-out validation; the result stands, no paramete
                 "unknown": "role not recorded"}
 DEPARTURE_FIELDS = ("engine", "benchmark", "component", "reason", "decision_test", "range_fraction")
 OVERRIDES: dict = {}          # self-tests only: engine ref -> coverage file
+# The signature states under which a departure counts: the owner's, the owner's about to sign, a lead's (D2)
+COUNTING = ("signed", "proposed", "provisional_lead")
 
 
 def canonical(ref: str) -> tuple[str, str]:
@@ -223,10 +228,14 @@ def departure_problems(raw: dict) -> list[str]:
 
 
 def signature(run_dir: str | None, by: str | None = None) -> str:
-    """"signed" when the run's spec is signed by the owner and unchanged, "proposed" when it has no sign-off yet
-    (or `by` is the owner about to sign), else "unsigned" (a lead's signature, or a spec changed since)."""
-    if by is not None:
-        return "proposed" if by == "owner" else "unsigned"
+    """"signed" when the run's spec is signed by the owner and unchanged, "provisional_lead" when it is signed by the
+    lead and unchanged in a `--signoff lead` run (D2: an unattended run; its departures count as provisional),
+    "proposed" when it has no sign-off yet (or `by` is the owner about to sign; "provisional_lead" for the lead about
+    to sign), else "unsigned" (another signer, a lead's record in a run that is not a lead run, or a spec changed
+    since)."""
+    if by is not None:          # Codex r2 of #313: the lead about to sign counts only in a lead run
+        return "proposed" if by == "owner" else \
+            "provisional_lead" if by == "lead" and run_dir and lead_run(run_dir) else "unsigned"
     if not run_dir:
         return "unsigned"
     from toolkit.spec import signoff
@@ -237,8 +246,24 @@ def signature(run_dir: str | None, by: str | None = None) -> str:
         sha = hashlib.sha256(open(os.path.join(run_dir, signoff.SPEC), "rb").read()).hexdigest()
     except OSError:
         return "unsigned"
-    return "signed" if rec.get("signed_by") == "owner" and (rec.get("sha256") or {}).get(signoff.SPEC) == sha \
-        else "unsigned"
+    if (rec.get("sha256") or {}).get(signoff.SPEC) != sha:
+        return "unsigned"
+    if rec.get("signed_by") == "owner":
+        return "signed"
+    return "provisional_lead" if rec.get("signed_by") == "lead" and lead_run(run_dir) else "unsigned"
+
+
+def lead_run(run_dir: str) -> bool:
+    """Is this a `--signoff lead` run (the harness's run_state.json says so)? Codex r1 of #313 (P1): a lead's record in
+    an owner run (written outside the run's own SIGN, which waits for the owner there) never credits a departure. An
+    unreadable or missing state is not a lead run (fail closed)."""
+    import json
+    try:
+        with open(os.path.join(run_dir, "run_state.json"), encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(st, dict) and st.get("signoff") == "lead"
 
 
 # ------------------------------------------------------------------ the check
@@ -356,7 +381,7 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
                             {"benchmark": i, "estimand": entries[i].get("estimand"), "rescaled": entries[i].get("rescaled"),
                              "maps": {s_: {c_ for c_, _v in prs} for s_, prs in smap.items()},
                              "pair": {c: {s for s, cc, _v in hits if cc == c} for c in (entries[i].get("covers") or {})}}))
-    counts = departures_status in ("signed", "proposed")
+    counts = departures_status in COUNTING
     for key, kind, params, comps, failing, ctx in pending:
         d = deps.get(key)
         if d is not None and counts:
@@ -368,7 +393,7 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
                 continue
             kind += f"; its departure does not count: decision test {d.get('decision_test')!r} {why}"
         elif d is not None:
-            kind += "; its departure does not count: the spec is not signed by the owner (or changed since)"
+            kind += "; its departure does not count: the spec is not signed by the owner or the lead (or changed since)"
         out["why_not"].append(kind)
         if failing["role"] != "none":
             out["blocking"].append({"id": key, "role": failing["role"], "status": failing["benchmark_status"]})
@@ -520,7 +545,8 @@ def sheet_lines(raw: dict, candidates: list | None) -> list[str]:
     if deps:
         out += ["## Engine departures from benchmark evidence",
                 "Signing as the owner accepts that the engine is used for each component below although its "
-                "benchmark against the trial is not in band, or no benchmark covers it; a lead's signature does not."]
+                "benchmark against the trial is not in band, or no benchmark covers it; a lead's signature (an "
+                "unattended run) accepts it provisionally, listed as such in the run's results for the owner's review."]
         for d in deps:
             key = d.get("benchmark") or d.get("component")
             seen = rows.get((d.get("engine"), key))
@@ -548,11 +574,23 @@ def results_lines(raw: dict, run_dir: str | None = None) -> list[str]:
     except (OSError, ValueError, AttributeError):
         pass
     out = []
-    if deps:
+    sig = signature(run_dir) if deps else None
+    if sig == "provisional_lead":
+        out += ["## Provisional engine departures (signed by the lead; not reviewed by the owner)", "",
+                "This run was signed by its lead (`--signoff lead`), so each departure below is provisional: the owner "
+                "has not accepted it. The engine was used for components whose benchmark against the trial is not in "
+                "band, or that no benchmark covers. The owner confirms a departure by signing the spec in a new run, "
+                "or overturns it by removing the entry:", ""]
+    elif sig == "signed":
         out += ["## Declared engine departures (signed by the owner in the spec)", "",
                 "The engine was used for components whose benchmark against the trial is not in band, or that no "
                 "benchmark covers. A held-out benchmark's result stands as validation (no parameter was tuned toward "
                 "it); a fit target out of band means the engine's fit missed it:", ""]
+    elif deps:          # Codex r1 of #313 (P2): never attributed to the owner without the owner's signature
+        out += ["## Engine departures declared in the spec (no current sign-off counts them)", "",
+                "The spec declares these departures, but neither the owner's nor a lead run's signature of the spec as "
+                "it now stands covers them:", ""]
+    if deps:            # Codex r1 of #313 (P1): every heading lists its departures
         out += [f"- {d.get('benchmark') or d.get('component')} (engine {d.get('engine')}): {d.get('reason')} "
                 f"(decision test {d.get('decision_test')})." for d in deps] + [""]
     if rep:
@@ -639,13 +677,23 @@ def _self_test() -> int:
        "BC7d coverage ids must equal the pack's")
     dep = {"engine": "e", "benchmark": "I", "reason": "why", "decision_test": "DT"}
     md = "\n".join(results_lines({"engine_departures": [dep]}))
-    ok("Declared engine departures" in md and "decision test DT" in md and results_lines({}) == []
-       and sheet_lines({}, None) == [], "BC8 results.md declares each signed departure; nothing when there is none")
+    ok("Engine departures declared in the spec" in md and "decision test DT" in md and results_lines({}) == []
+       and sheet_lines({}, None) == [], "BC8 results.md lists each declared departure (without a sign-off, not as the "
+                                        "owner's); nothing when there is none")
     ok(any("decision_test" in p for p in departure_problems({"engine_departures": [dict(dep, decision_test="X")],
                                                              "analysis": {"decision_tests": [{"id": "DT"}]}}))
        and any("unknown field" in p for p in departure_problems({"engine_departures": [
            dict(dep, no_decision_test_because="none")], "analysis": {"decision_tests": [{"id": "DT"}]}})),
        "BC9 a departure must name an existing decision test; no reason-for-none escape")
+    # D2 (owner default, autonomy 1B-iii): under --signoff lead a departure counts, as provisional_lead
+    yes = lambda *a: (True, "")  # noqa: E731
+    gp = gate(cov, [], "e", both, rec, [dep], "provisional_lead", runs=yes)
+    gu = gate(cov, [], "e", both, rec, [dep], "unsigned", runs=yes)
+    ok(gp["why_not"] == [] and [d.get("status") for d in gp["departures"]] == ["provisional_lead"]
+       and any("not signed" in w for w in gu["why_not"]),
+       f"G_LEAD_PROV_DEP a lead-signed spec's departure counts as provisional_lead; an unsigned one still does not "
+       f"({gp['why_not'][:1]}, {gu['why_not'][:1]})")
+    _self_test_lead(ok, dep)
     # review round 2: every declared effect parameter exists in the engine version its record is for
     from toolkit.engines.malaria.engine import MalariaEngine
     me = MalariaEngine()
@@ -661,6 +709,43 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_lead(ok, dep):
+    """G_LEAD_SIG, G_LEAD_RESULTS (D2): a lead's signature of the unchanged spec is "provisional_lead"; results.md
+    names such departures as provisional, the lead's, not reviewed by the owner."""
+    import json
+    import tempfile
+    from toolkit.spec import signoff
+    with tempfile.TemporaryDirectory() as d:
+        sp = os.path.join(d, signoff.SPEC)
+        open(sp, "w").write("question: q\n")
+        sha = hashlib.sha256(open(sp, "rb").read()).hexdigest()
+        rec = lambda by: json.dump({"signed_by": by, "sha256": {signoff.SPEC: sha}},  # noqa: E731
+                                   open(os.path.join(d, signoff.SPEC_SIGNOFF), "w"))
+        rec("lead")
+        owner_run = signature(d)                  # no run_state.json: not a lead run (Codex r1 of #313, P1)
+        json.dump({"signoff": "owner"}, open(os.path.join(d, "run_state.json"), "w"))
+        owner_run = owner_run == "unsigned" and signature(d) == "unsigned"
+        json.dump({"signoff": "lead"}, open(os.path.join(d, "run_state.json"), "w"))
+        lead, lead_md = signature(d), "\n".join(results_lines({"engine_departures": [dep]}, d))
+        rec("owner")
+        owner, owner_md = signature(d), "\n".join(results_lines({"engine_departures": [dep]}, d))
+        rec("lead")
+        open(sp, "a").write("# edited\n")
+        edited, edited_md = signature(d), "\n".join(results_lines({"engine_departures": [dep]}, d))
+        lead_by = signature(d, by="lead")
+    ok(owner_run, "G_LEAD_OWNER_RUN a lead's record in a run that is not a --signoff lead run credits nothing")
+    ok(lead == "provisional_lead" and owner == "signed" and edited == "unsigned"
+       and lead_by == "provisional_lead" and signature(None, by="lead") == "unsigned"
+       and signature(None, by="owner") == "proposed",
+       f"G_LEAD_SIG a lead's signature of the unchanged spec is provisional_lead; the owner's is signed; an edited "
+       f"spec counts none ({lead}, {owner}, {edited})")
+    ok("Provisional engine departures" in lead_md and "not reviewed" in lead_md and "owner" in lead_md
+       and "decision test DT" in lead_md and "Provisional" not in owner_md and "signed by the owner" in owner_md
+       and "signed by the owner" not in edited_md and "decision test DT" in edited_md,
+       "G_LEAD_RESULTS results.md lists a lead's departures as provisional, not reviewed by the owner; an unsigned "
+       "spec's are never attributed to the owner")
 
 
 def _self_test_posterior(ok, cov, both):

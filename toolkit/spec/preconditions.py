@@ -44,10 +44,11 @@ def _benchmark_eligibility(run_dir, spec, signer) -> list:
     m = importlib.util.spec_from_file_location("_ab_preconditions", path)
     AB = importlib.util.module_from_spec(m)
     m.loader.exec_module(AB)
-    mode = "proposed" if (signer is None and BC.signature(run_dir) == "proposed") or signer == "owner" else "signed"
+    mode = "proposed" if (signer is None and BC.signature(run_dir) == "proposed") or signer == "owner" else \
+        "provisional_lead" if signer == "lead" and run_dir and BC.lead_run(run_dir) else "signed"   # D2, lead runs only
     raw = dict(spec.raw, _run_dir=run_dir)
-    if signer is not None and signer != "owner":
-        raw.pop("engine_departures", None)          # a lead's signature makes no departure count
+    if signer is not None and mode == "signed":
+        raw.pop("engine_departures", None)          # no other signer makes a departure count
     rows = AB.eligible_engines(raw, departures=mode)
     if any(r.get("eligible") for r in rows):
         return out
@@ -69,7 +70,7 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
             return [f"net_effect_posterior: an exception to the acceptance rule is the owner's to sign (signer "
                     f"{signer!r})"]
         from toolkit.engines import benchmark_coverage as BC
-        if signer is None and run_dir and BC.signature(run_dir) == "unsigned":     # execution: the recorded sign-off
+        if signer is None and run_dir and BC.signature(run_dir) in ("unsigned", "provisional_lead"):   # execution: the record
             return ["net_effect_posterior: an exception to the acceptance rule counts only under the owner's "
                     "signature of this spec (the recorded sign-off is a lead's, or the spec changed since)"]
     if getattr(spec, "engine_pending", False):
@@ -639,10 +640,14 @@ def _self_test() -> int:
         run_lead = _net_effect_posterior("/somewhere", sp, None)
         _BC.signature = lambda run_dir, by=None: "signed"
         run_owner = _net_effect_posterior("/somewhere", sp, None)
+        _BC.signature = lambda run_dir, by=None: "provisional_lead"
+        run_prov = _net_effect_posterior("/somewhere", sp, None)
     finally:
         _BC.signature = orig_sig
     ok(any("owner" in x and "exception" in x for x in run_lead) and not any("exception" in x for x in run_owner),
        f"PC13 at execution, a run whose recorded sign-off is not the owner's refuses the exception ({run_lead[:1]})")
+    ok(any("owner" in x and "exception" in x for x in run_prov),
+       f"PC14 (D2) a lead's provisional signature credits departures, never a posterior exception ({run_prov[:1]})")
     ok(any("owner" in x and "exception" in x for x in lead) and not any("exception" in x for x in owner),
        f"PC12 a net-effect posterior exception signed by someone other than the owner is refused ({lead[:1]})")
     if fails:
