@@ -253,9 +253,10 @@ departure) and, on the emulator path, on an emulator input (a fitted parameter, 
 for an interaction benchmark only, an interaction_rescale test on that benchmark that rescales one of its two
 components given the other. The run then checks what the test actually did; a departure whose test did not take
 effect is a finding only the owner can resolve. Only components some
-allowed package holds are checked. Only the owner's signature makes a departure
-count; a spec that needs one cannot be signed by the lead. The report declares each signed departure as a
-limitation. A held-out benchmark is validation: its result stands, and no parameter is ever tuned toward it. A
+allowed package holds are checked. The owner's signature makes a departure
+count; under `--signoff lead` (unattended runs, owner default D2) the lead's signature makes it count as
+provisional (`provisional_lead`), and the results list it as not reviewed by the owner. The report declares each
+departure as a limitation. A held-out benchmark is validation: its result stands, and no parameter is ever tuned toward it. A
 fit target out of band means the engine's fit failed; it gates the same way.
 
 ## Calibration targets the run cannot meet (the conflict rule)
