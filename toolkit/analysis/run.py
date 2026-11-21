@@ -591,6 +591,8 @@ def _self_test() -> int:
             fails.append(msg)
 
     q = lambda *a, **k: None  # noqa: E731
+    from toolkit.analysis import dt_golden as DG      # S1: every decision-test record below is a golden record
+    DG.start_capture()
     with tempfile.TemporaryDirectory() as d:
         # ---------------- emulator path, emulator-inversion calibration (the spike's chain)
         bench, v_ok, v_bad = _toy_bench(d)
@@ -938,6 +940,7 @@ def _self_test() -> int:
                 pass
         ok(open(os.path.join(out, "v")).read() == "untouched",
            "AR-RW1 an analysis artifact and the manifest are not written through a link or a planted .tmp")
+    DG.check_capture(ok, failed=fails)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
