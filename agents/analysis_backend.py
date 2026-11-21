@@ -880,6 +880,7 @@ def _self_test_benchmark_gate(ok) -> None:
             so = os.path.join(run, signoff.SPEC_SIGNOFF)
             rec0 = json.load(open(so))
             json.dump(dict(rec0, signed_by="lead"), open(so, "w"))
+            json.dump({"signoff": "lead"}, open(os.path.join(run, "run_state.json"), "w"))    # a --signoff lead run
             r = eligible_engines(dict(spec_ab, _run_dir=run), entry)[0]
             e = schema.validate(schema.load(p))
             ok(r["eligible"] and [x.get("status") for x in r["departures"]] == ["provisional_lead"] and e == [],

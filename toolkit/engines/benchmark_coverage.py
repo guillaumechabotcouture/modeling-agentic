@@ -229,9 +229,10 @@ def departure_problems(raw: dict) -> list[str]:
 
 def signature(run_dir: str | None, by: str | None = None) -> str:
     """"signed" when the run's spec is signed by the owner and unchanged, "provisional_lead" when it is signed by the
-    lead and unchanged (D2: an unattended run; its departures count as provisional), "proposed" when it has no
-    sign-off yet (or `by` is the owner about to sign; "provisional_lead" for the lead about to sign), else "unsigned"
-    (another signer, or a spec changed since)."""
+    lead and unchanged in a `--signoff lead` run (D2: an unattended run; its departures count as provisional),
+    "proposed" when it has no sign-off yet (or `by` is the owner about to sign; "provisional_lead" for the lead about
+    to sign), else "unsigned" (another signer, a lead's record in a run that is not a lead run, or a spec changed
+    since)."""
     if by is not None:
         return {"owner": "proposed", "lead": "provisional_lead"}.get(by, "unsigned")
     if not run_dir:
@@ -246,7 +247,22 @@ def signature(run_dir: str | None, by: str | None = None) -> str:
         return "unsigned"
     if (rec.get("sha256") or {}).get(signoff.SPEC) != sha:
         return "unsigned"
-    return {"owner": "signed", "lead": "provisional_lead"}.get(rec.get("signed_by"), "unsigned")
+    if rec.get("signed_by") == "owner":
+        return "signed"
+    return "provisional_lead" if rec.get("signed_by") == "lead" and lead_run(run_dir) else "unsigned"
+
+
+def lead_run(run_dir: str) -> bool:
+    """Is this a `--signoff lead` run (the harness's run_state.json says so)? Codex r1 of #313 (P1): a lead's record in
+    an owner run (written outside the run's own SIGN, which waits for the owner there) never credits a departure. An
+    unreadable or missing state is not a lead run (fail closed)."""
+    import json
+    try:
+        with open(os.path.join(run_dir, "run_state.json"), encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(st, dict) and st.get("signoff") == "lead"
 
 
 # ------------------------------------------------------------------ the check
@@ -557,17 +573,23 @@ def results_lines(raw: dict, run_dir: str | None = None) -> list[str]:
     except (OSError, ValueError, AttributeError):
         pass
     out = []
-    if deps and signature(run_dir) == "provisional_lead":
+    sig = signature(run_dir) if deps else None
+    if sig == "provisional_lead":
         out += ["## Provisional engine departures (signed by the lead; not reviewed by the owner)", "",
                 "This run was signed by its lead (`--signoff lead`), so each departure below is provisional: the owner "
                 "has not accepted it. The engine was used for components whose benchmark against the trial is not in "
                 "band, or that no benchmark covers. The owner confirms a departure by signing the spec in a new run, "
                 "or overturns it by removing the entry:", ""]
-    elif deps:
+    elif sig == "signed":
         out += ["## Declared engine departures (signed by the owner in the spec)", "",
                 "The engine was used for components whose benchmark against the trial is not in band, or that no "
                 "benchmark covers. A held-out benchmark's result stands as validation (no parameter was tuned toward "
                 "it); a fit target out of band means the engine's fit missed it:", ""]
+    elif deps:          # Codex r1 of #313 (P2): never attributed to the owner without the owner's signature
+        out += ["## Engine departures declared in the spec (no current sign-off counts them)", "",
+                "The spec declares these departures, but neither the owner's nor a lead run's signature of the spec as "
+                "it now stands covers them:", ""]
+    if deps:            # Codex r1 of #313 (P1): every heading lists its departures
         out += [f"- {d.get('benchmark') or d.get('component')} (engine {d.get('engine')}): {d.get('reason')} "
                 f"(decision test {d.get('decision_test')})." for d in deps] + [""]
     if rep:
@@ -654,8 +676,9 @@ def _self_test() -> int:
        "BC7d coverage ids must equal the pack's")
     dep = {"engine": "e", "benchmark": "I", "reason": "why", "decision_test": "DT"}
     md = "\n".join(results_lines({"engine_departures": [dep]}))
-    ok("Declared engine departures" in md and "decision test DT" in md and results_lines({}) == []
-       and sheet_lines({}, None) == [], "BC8 results.md declares each signed departure; nothing when there is none")
+    ok("Engine departures declared in the spec" in md and "decision test DT" in md and results_lines({}) == []
+       and sheet_lines({}, None) == [], "BC8 results.md lists each declared departure (without a sign-off, not as the "
+                                        "owner's); nothing when there is none")
     ok(any("decision_test" in p for p in departure_problems({"engine_departures": [dict(dep, decision_test="X")],
                                                              "analysis": {"decision_tests": [{"id": "DT"}]}}))
        and any("unknown field" in p for p in departure_problems({"engine_departures": [
@@ -700,19 +723,26 @@ def _self_test_lead(ok, dep):
         rec = lambda by: json.dump({"signed_by": by, "sha256": {signoff.SPEC: sha}},  # noqa: E731
                                    open(os.path.join(d, signoff.SPEC_SIGNOFF), "w"))
         rec("lead")
+        owner_run = signature(d)                  # no run_state.json: not a lead run (Codex r1 of #313, P1)
+        json.dump({"signoff": "owner"}, open(os.path.join(d, "run_state.json"), "w"))
+        owner_run = owner_run == "unsigned" and signature(d) == "unsigned"
+        json.dump({"signoff": "lead"}, open(os.path.join(d, "run_state.json"), "w"))
         lead, lead_md = signature(d), "\n".join(results_lines({"engine_departures": [dep]}, d))
         rec("owner")
         owner, owner_md = signature(d), "\n".join(results_lines({"engine_departures": [dep]}, d))
         rec("lead")
         open(sp, "a").write("# edited\n")
-        edited = signature(d)
+        edited, edited_md = signature(d), "\n".join(results_lines({"engine_departures": [dep]}, d))
+    ok(owner_run, "G_LEAD_OWNER_RUN a lead's record in a run that is not a --signoff lead run credits nothing")
     ok(lead == "provisional_lead" and owner == "signed" and edited == "unsigned"
        and signature(None, by="lead") == "provisional_lead" and signature(None, by="owner") == "proposed",
        f"G_LEAD_SIG a lead's signature of the unchanged spec is provisional_lead; the owner's is signed; an edited "
        f"spec counts none ({lead}, {owner}, {edited})")
     ok("Provisional engine departures" in lead_md and "not reviewed" in lead_md and "owner" in lead_md
-       and "Provisional" not in owner_md and "signed by the owner" in owner_md,
-       "G_LEAD_RESULTS results.md names a lead's departures as provisional, not reviewed by the owner")
+       and "decision test DT" in lead_md and "Provisional" not in owner_md and "signed by the owner" in owner_md
+       and "signed by the owner" not in edited_md and "decision test DT" in edited_md,
+       "G_LEAD_RESULTS results.md lists a lead's departures as provisional, not reviewed by the owner; an unsigned "
+       "spec's are never attributed to the owner")
 
 
 def _self_test_posterior(ok, cov, both):
