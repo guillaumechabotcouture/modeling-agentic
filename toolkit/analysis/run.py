@@ -120,10 +120,25 @@ def affordable_plan(A, ben0, cost0, sol0, draws=None, seed=None, floor=None) -> 
     return {"solution": sol, "reserve": reserve, "pre": pre}
 
 
+def _stop_where(e) -> str | None:
+    """The step of a stop the toolkit declares besides AnalysisBlocked (a refused calibration, calibration input,
+    burden anchor or engine batch; a solver defect), else None: any other error is a crash and is not recorded (once
+    the run's store exists, no manifest is left; before that, nothing in the run dir is touched)."""
+    from toolkit.alloc.optimize import OptimizerError
+    from toolkit.analysis.burden import AnchorError
+    from toolkit.calibration.history_matching import CalibrationInputError
+    for cls, where in ((C.CalibrationRefused, "calibration"), (CalibrationInputError, "calibration"),
+                       (AnchorError, "burden_anchor"), (OptimizerError, "optimizer"), (Bt.BatchRefused, "batch")):
+        if isinstance(e, cls):
+            return where
+    return None
+
+
 def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None = None, draws=None,
         unsigned: bool = False, log=print, compute_kw: dict | None = None) -> dict:
     """The analysis. A step whose model corrections bear on a plan stops it: analysis/blocked.yaml records where and
-    which, and the manifest is published with status blocked (never complete)."""
+    which, and the manifest is published with status blocked (never complete). A stop the toolkit declares by its
+    own exception (`_stop_where`) is recorded the same way, with the exception's name and code, and raised again."""
     holder = {}
     try:
         return _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder)
@@ -136,6 +151,20 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
                     [holder["calibration"]] if holder.get("calibration") else [])
             S.finalize("blocked", f"{e.where}: {e.reason}" if e.reason else
                        f"{e.where}: {len(e.hits)} model corrections bear on the plan")
+        raise
+    except Exception as e:  # noqa: BLE001 -- recorded when it is a declared stop, and always raised again
+        S, where = holder.get("S"), _stop_where(e)
+        if S is not None and where is not None:
+            try:
+                S.write("blocked", {"reason": str(e)[:4000], "where": where, "corrections": [], "n_on_plan": 0,
+                                    "exception": type(e).__name__, "code": getattr(e, "code", None)}, PRODUCER,
+                        [holder["calibration"]] if holder.get("calibration") else [])
+                S.finalize("blocked", f"{where}: {type(e).__name__}: {e}"[:2000])
+            except Exception as w:  # noqa: BLE001 -- the stop itself is what the caller must see
+                try:
+                    log(f"  the stop could not be recorded ({type(w).__name__}: {w}); no manifest is published")
+                except Exception:  # noqa: BLE001 -- nor does a failing log replace it
+                    pass
         raise
 
 
@@ -848,6 +877,7 @@ def _self_test() -> int:
         finally:
             del ToyEngine.fitted_path
             EPm.benchmark_pack = orig_bp
+        _self_test_stop_records(ok, d, q)
         _self_test_round2(ok, d, q)
         _self_test_reserve_e2e(ok, d, q)
         _self_test_floors_e2e(ok, d, q)
@@ -908,6 +938,76 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_stop_records(ok, d, q):
+    """v2 autonomy 1C-a (item 4.7): every stop the toolkit declares (a refused calibration, calibration input, anchor,
+    batch, or a solver defect) leaves analysis/blocked.yaml and a manifest with status blocked, then raises as before;
+    any other error leaves no manifest."""
+    import yaml
+    from toolkit.alloc.optimize import OptimizerError
+    from toolkit.analysis import contract
+    from toolkit.analysis.burden import AnchorError
+    from toolkit.calibration.history_matching import CalibrationInputError
+    cases = [(None, lambda: KeyError("planted")),
+             ("calibration", lambda: C.CalibrationRefused("posterior_ess", "planted")),
+             ("calibration", lambda: CalibrationInputError(["planted"])),
+             ("burden_anchor", lambda: AnchorError("planted")),
+             ("optimizer", lambda: OptimizerError("planted")),
+             ("batch", lambda: Bt.BatchRefused("batch_stale", "planted"))]
+    orig = EmulatorModel.predict
+    bp = os.path.join(d, "analysis", "blocked.yaml")
+    # Codex r1: a record that cannot be written, with a log that fails too, never replaces the stop the caller sees
+    exc = Bt.BatchRefused("batch_stale", "planted")
+
+    def planted2(self, zs, theta, ids, noise=None):
+        raise exc
+
+    def no_final(self, status, reason=""):
+        raise OSError("planted: no space")
+
+    def bad_log(*a, **k):
+        if "could not be recorded" in " ".join(str(x) for x in a):
+            raise OSError("planted: log")
+    orig_fin = Store.finalize
+    EmulatorModel.predict, Store.finalize = planted2, no_final
+    try:
+        run(d, log=bad_log, compute_kw={"max_workers": 2}, draws=2)
+        got = None
+    except Exception as e:  # noqa: BLE001 -- the planted stop
+        got = e
+    finally:
+        EmulatorModel.predict, Store.finalize = orig, orig_fin
+    ok(got is exc and {x["kind"] for x in contract.gate_findings(d)} == {"analysis_contract_missing"},
+       f"RUN_BLOCKED_UNRECORDED a stop whose record and log both fail is still the error raised, with no manifest "
+       f"({type(got).__name__}: {got})")
+    for where, make in cases:       # the last case is a declared stop: the rerun below starts from its blocked record
+        exc = make()
+
+        def planted(self, zs, theta, ids, noise=None, _e=exc):
+            raise _e
+        EmulatorModel.predict = planted
+        try:
+            run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+            got = None
+        except Exception as e:  # noqa: BLE001 -- the planted stop, raised again by run()
+            got = e
+        finally:
+            EmulatorModel.predict = orig
+        name = type(exc).__name__
+        kinds = {x["kind"] for x in contract.gate_findings(d)}
+        blk = (yaml.safe_load(open(bp))["data"] if os.path.exists(bp) else {})
+        if where is None:
+            ok(got is exc and kinds == {"analysis_contract_missing"} and blk.get("exception") != name,
+               f"RUN_BLOCKED_OTHER an error that is not a declared stop ({name}) leaves no manifest and no blocked "
+               f"record of its own ({kinds})")
+            continue
+        ok(got is exc and kinds == {"analysis_contract_blocked"} and blk.get("exception") == name
+           and blk.get("where") == where and "planted" in str(blk.get("reason")),
+           f"RUN_BLOCKED_CAL {name} is raised again after analysis/blocked.yaml and a blocked manifest record it "
+           f"({kinds}, {({k: blk.get(k) for k in ('where', 'exception', 'reason')})})")
+    run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
+    ok(contract.gate_findings(d) == [], "RUN_BLOCKED_RERUN a rerun after a recorded stop publishes a complete manifest")
 
 
 def _self_test_moves(ok, d, R):

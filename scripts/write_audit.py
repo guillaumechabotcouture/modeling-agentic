@@ -274,9 +274,11 @@ _FIX = "self-test fixture code in a helper the skip rule does not name"
 # REVIEWED: write sites that cannot write inside a run dir a run's agents can reach.
 REVIEWED: dict = {
     "agents/analysis_backend.py": {"open-write": (1, "write_toy_units (a fixture)")},
-    "agents/run_preflight.py": {"shutil": (1, "removes the preflight's own temporary work dir")},
     "scripts/assemble_changes.py": {"open-write": (3, _REPO), "os-remove": (1, _REPO)},
     "scripts/cloud_batch.py": {"open-write": (2, "the operator's local batch files")},
+    "scripts/codex_review.py": {"open-write": (2, "a dev tool the operator runs on the repository, never in a run: "
+                                                  "codex's log next to the review's output, and PR.diff in the "
+                                                  "export (" + _TMP_REASON + ")")},
     "scripts/compute.py": {
         "open-write": (10, "worker init markers, chunk inputs, stderr and the worker's sync record (" + _TMP_REASON + ")"),
         "os-remove": (5, "stale bundle members and pid files on a worker (" + _TMP_REASON + "); the worker's TLS files"),
@@ -307,19 +309,13 @@ REVIEWED: dict = {
         "open-write": (3, "the scratch copy's manifest (its own file after the link is removed); the derivation's "
                           "column-stripped input and mount points in its temporary work dirs")},
     "scripts/plant_defects.py": {"open-write": (3, _EVAL), "shutil": (4, _EVAL)},
-    "scripts/regression_eval.py": {"open-write": (2, _EVAL), "shutil": (1, _EVAL)},
-    "scripts/replay.py": {"shutil": (2, _EVAL), "os-link": (1, _EVAL), "open-write": (6, _EVAL), "os-remove": (1, _EVAL)},
-    "scripts/replay_coiled.py": {"open-write": (18, _EVAL), "shutil": (3, _EVAL), "os-remove": (4, _EVAL)},
-    "scripts/replay_compare.py": {"open-write": (1, _EVAL)},
+    "scripts/regression_eval.py": {"open-write": (4, _EVAL), "shutil": (1, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/results_store.py": {"open-write": (1, "download() writes where the operator names"),
                                  "tempfile-dir": (1, "write_archive's anonymous TemporaryFile beside the archive it "
                                                      "writes (the checkpoint staging dir on the agent VM, outside any run "
                                                      "dir), deleted on close")},
     "scripts/resume_smoke.py": {"open-write": (3, "the smoke's own temporary work dir (toy runs it creates) and the "
                                                    "--json report the operator names")},
-    "scripts/score_critiques.py": {"open-write": (3, _EVAL)},
-    "scripts/sdk_scenarios.py": {"open-write": (15, _EVAL)},
-    "scripts/telemetry.py": {"open-write": (1, "the operator's --out CSV")},
     "scripts/lib/positive_control.py": {"open-write": (2, "builds the positive-control fixture run in a dir it creates")},
     "scripts/validate_critique_yaml.py": {"os-remove": (1, "its own NamedTemporaryFile in the system temp dir")},
     "toolkit/analysis/dt_golden.py": {"open-write": (1, "toolkit/analysis/dt_golden.json in the repo, only under "
@@ -351,12 +347,10 @@ _V1 = ("v1 pipeline (main.py without --v2, its hooks and gates): writes in its r
 # OPEN_ITEMS: attacker-reachable write sites not yet on lib.safe_io. Counted exactly, so none is added; each migration
 # lowers a count. These are known gaps, not exemptions.
 OPEN_ITEMS: dict = {
-    "agents/hooks.py": {"shutil": (1, _V1), "method-write": (1, _V1 + " (an oversized image resized in place; "
-                                                              "found when <image>.save became a site)")},
     "agents/integrity.py": {"open-write": (1, _V1)},
-    "agents/observability.py": {"open-write": (5, _V1), "os-rename": (1, _V1), "os-remove": (3, _V1)},
-    "agents/output_caps.py": {"open-write": (1, _V1)},
-    "agents/run_finish.py": {"open-write": (13, _V1), "shutil": (2, _V1), "os-remove": (1, _V1)},
+    "agents/run_finish.py": {"open-write": (2, "store_run_results (shared with v2): the upload's temporary tarball and "
+                                              "metadata.json's stored/store_error fields, plain opens in the run dir"),
+                             "os-remove": (1, "store_run_results: its own temporary tarball")},
     "scripts/ask.py": {"open-write": (1, _V1)},
     "scripts/benchmark_match.py": {"open-write": (1, _V1)},
     "scripts/coherence_audit.py": {"open-write": (1, _V1)},
