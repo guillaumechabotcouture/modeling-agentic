@@ -2521,17 +2521,25 @@ def _run_code_digest(run_dir: str, confined: bool = False) -> str:
     """Every Python file under the run dir outside models/ and data/ (those are run_files): what a module named by
     data could load from the run root, which is on the worker's sys.path. Links are not followed; when `confined`,
     files are read through no-follow fds (a link raises ValueError, as for run_files)."""
-    h, found = hashlib.sha256(), []
-    for dp, dirs, fns in os.walk(run_dir):
+    h, found, anc = hashlib.sha256(), [], {run_dir: {os.path.realpath(run_dir)}}
+    for dp, dirs, fns in os.walk(run_dir, followlinks=not confined):     # a linked package is importable (Codex r3)
         rel_dp = os.path.relpath(dp, run_dir)
         dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git") and not (
-            rel_dp == "." and d in ("models", "data")))
+            rel_dp == "." and d in ("models", "data"))
+            and os.path.realpath(os.path.join(dp, d)) not in anc[dp])       # only a loop stops the walk
+        for d in dirs:
+            anc[os.path.join(dp, d)] = anc[dp] | {os.path.realpath(os.path.join(dp, d))}
+        if confined and any(os.path.islink(os.path.join(dp, d)) for d in dirs):
+            raise ValueError(f"a directory link under the run dir: {rel_dp} (confined)")
         found += [os.path.normpath(os.path.join(rel_dp, f)) for f in fns if f.endswith(".py")]
     for rel in sorted(found):
         if confined:
             _hash_confined(h, run_dir, rel, mtime=False)
             continue
         h.update(rel.encode() + b"\0")
+        if not os.path.isfile(os.path.join(run_dir, rel)):
+            h.update(b"missing\0")                     # a dangling link: nothing Python can import (Codex r3 P2)
+            continue
         with open(os.path.join(run_dir, rel), "rb") as fh:
             for block in iter(lambda: fh.read(2**20), b""):
                 h.update(block)
@@ -4218,6 +4226,20 @@ def _self_test_w0a(ok) -> None:
             ok(p0.get("computed") == 2 and p1.get("computed") == 2 and "run_code" in (p1.get("key_parts") or {}),
                f"FP_UNRESOLVED_RUN_ROOT a run-root module loaded by name from run code: editing it recomputes "
                f"({p1.get('computed')} computed, parts {sorted(p1.get('key_parts') or {})})")
+            # Codex r3: a run-root package reached through a directory link; a dangling link is not an error
+            w("v1/__init__.py", "", rd)
+            w("v1/score.py", "X = 1\n", rd)
+            w("v2/__init__.py", "", rd)
+            w("v2/score.py", "X = 2\n", rd)
+            os.symlink("v1", os.path.join(rd, "plugins"))
+            os.symlink("gone.py", os.path.join(rd, "obsolete.py"))
+            k1 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "plugins"))
+            os.symlink("v2", os.path.join(rd, "plugins"))
+            ok(k1 != _run_code_digest(rd), "FP_RUN_CODE_LINKS retargeting a linked run-root package changes run_code "
+                                           "(a dangling link is hashed as missing, not raised)")
+            for x in ("plugins", "obsolete.py"):
+                os.remove(os.path.join(rd, x))
             # large files: content, never mtime
             with mock.patch.dict(g, {"_FP_HASH_MB": 0}):
                 k0 = code_fingerprint(rd, os.path.join(repo, "job.py::f"))

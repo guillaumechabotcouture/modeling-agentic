@@ -206,16 +206,17 @@ class Walk:
         return _declared(m.tree, name) if code and not (self.run_root and m.path.startswith(self.run_root)) else None
 
     def reexports(self, m: _Mod) -> bool:
-        """`from m import *` would bind a name m imports from repo code (a re-export the walk does not follow)."""
-        alls = _declared(m.tree, "__all__")
+        """`from m import *` could bind a name m imports from repo code (any top-level repo import: `__all__` can name
+        a private one, or be extended at run time), or m is an import guard (its loaders, called by bare name, are
+        then not recognised): the walk follows neither."""
+        if isinstance(self.decl(m), dict):
+            return True
         for n in m.top:
             mod = m._absolute(n) if isinstance(n, ast.ImportFrom) else None
             for a in n.names:
                 src = mod if isinstance(n, ast.ImportFrom) else a.name
-                name = a.asname or a.name.split(".")[0]
                 if src is None or (src and self.is_repo_top(src.split(".")[0])):
-                    if a.name == "*" or (not name.startswith("_") and (alls is None or name in alls)):
-                        return True
+                    return True
         return False
 
     def is_repo_top(self, top: str) -> bool:
@@ -318,6 +319,10 @@ class Walk:
             decl = self.decl(m)
             if decl is None:
                 self.unresolved.add(f"{self.rel(m.path)}:{line}: dynamic import without FP_DYNAMIC_IMPORTS")
+                own = _declared(m.tree)               # outside repo code: not believed, its paths still hashed
+                if own is not None:
+                    self.declared(m, own if not isinstance(own, dict) else tuple(p for ps in own.values() for p in ps),
+                                  todo)
             elif not isinstance(decl, dict):
                 self.declared(m, decl, todo)           # a {kind: paths} declaration is taken at its call sites
         for call in (n for n in ast.walk(node) if isinstance(n, ast.Call)):
@@ -326,14 +331,24 @@ class Walk:
                 self.import_target(m, lit, None, todo, whole=True)     # the module object is used as a value
             target = self.callee(m, call.func)
             tm = self.mod(target) if target else None
+            f = call.func
+            fname = f.attr if isinstance(f, ast.Attribute) else next(
+                (a for _, a in m.binds.get(getattr(f, "id", None), ()) if a), getattr(f, "id", None))
+            for _ in range(8):                 # a name another module re-exports: follow it to its defining module
+                if tm is None or isinstance(self.decl(tm), dict) or fname in tm.defs:
+                    break
+                hop = [(md, at) for md, at in tm.binds.get(fname, ()) if md and self.is_repo_top(md.split(".")[0])]
+                if not hop:
+                    break
+                nxt = self.find(hop[0][0])
+                tm, fname = (self.mod(nxt) if nxt else None), hop[0][1] or fname
             decl = self.decl(tm) if tm else None
             if isinstance(decl, dict):
                 a0 = call.args[0] if call.args else None
                 kind = a0.value if isinstance(a0, ast.Constant) and isinstance(a0.value, str) else None
-                f = call.func
-                fname = f.attr if isinstance(f, ast.Attribute) else next(
-                    (a for _, a in m.binds.get(getattr(f, "id", None), ()) if a), getattr(f, "id", None))
                 loaders = self.decl(tm, "FP_LOADERS") or {}
+                if loaders and fname not in loaders:
+                    continue                                       # not a loader: it imports nothing (Codex r3 P2)
                 if fname in loaders and kind not in loaders[fname]:    # Codex r2: a function, not walked
                     self.unresolved.add(f"{self.rel(m.path)}:{call.lineno}: {fname}() loads by a data-supplied name "
                                         f"(a loader with no class check for kind {kind!r}): not followed")
@@ -501,6 +516,28 @@ def _self_test() -> int:
         rj = closure(os.path.join(rd, "models/job.py") + "::run", td, rd)
         ok(any("dynamic import" in u for u in rj["unresolved"]),
            f"IC13 run code cannot declare its own dynamic imports: a non-literal import in it fails closed: {rj}")
+        # Codex r3 (θ)
+        put("toolkit/s/priv.py", "from toolkit.s.impl import score as _score\n__all__ = ['_score']\n")
+        put("toolkit/c/star3.py", "from toolkit.s.priv import *\n\ndef run(p):\n    return _score(p)\n")
+        put("toolkit/c/gstar.py", "from toolkit.g.guard import *\n\ndef run(p):\n    return resolve('calibrator', p['r'])\n")
+        put("toolkit/g/reexp.py", "from toolkit.g.guard import attr as fetch\n")
+        put("toolkit/c/gvia.py", "from toolkit.g.reexp import fetch\n\ndef run(p):\n    return fetch('oracle', p['m'], p['n'])\n")
+        s3, gs, gv = (closure(os.path.join(td, f"toolkit/c/{n}.py") + "::run", td) for n in ("star3", "gstar", "gvia"))
+        ok(any("re-exports" in u for u in s3["unresolved"]) and gs["unresolved"]
+           and any("loader" in u for u in gv["unresolved"]),
+           f"IC14 a private name in __all__, a star import of a loader's module and a loader re-exported under another "
+           f"name all fail closed: {s3['unresolved']} {gs['unresolved']} {gv['unresolved']}")
+        put("tools/weights.py", "W = 1\n")
+        put("run/models/job2.py", "import importlib\nFP_DYNAMIC_IMPORTS = ('tools/weights.py',)\n\ndef run(p):\n"
+            "    return importlib.import_module(p['m']).W\n")
+        r2 = closure(os.path.join(rd, "models/job2.py") + "::run", td, rd)
+        ok(r2["unresolved"] and "tools/weights.py" in r2["files"],
+           f"IC15 run code's own declaration is not believed, but the files it names stay in the closure: {r2}")
+        put("toolkit/c/gnon.py", "from toolkit.g import guard as G\n\ndef run(p):\n    G.init(p)\n    return 1\n")
+        open(os.path.join(td, "toolkit/g/guard.py"), "a").write("\ndef init(x):\n    return None\n")
+        gn = closure(os.path.join(td, "toolkit/c/gnon.py") + "::run", td)
+        ok(not gn["unresolved"] and "toolkit/b/far.py" not in gn["files"],
+           f"IC16 a call into a guard that is not one of its loaders loads nothing: {gn}")
     print(f"{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)}'}")
     return 1 if fails else 0
 
