@@ -276,7 +276,8 @@ def as_of(run_list, cut):
         off = meta.get("utc_offset_s")
         keep = (lambda t: t is None or t <= cut)
         st["history"] = [h for h in _l(st.get("history")) if keep(utc(_d(h).get("at")))]
-        meta["invocations"] = [i for i in _l(meta.get("invocations")) if keep(utc(_d(i).get("at"), off))]
+        if isinstance(meta.get("invocations"), list):     # a run that records none keeps none: I5 unavailable
+            meta["invocations"] = [i for i in meta["invocations"] if keep(utc(_d(i).get("at"), off))]
         fin, live = _finished(r), [x for x in _ends(run_list[k:k + 2]) if x[0] is r]
         last = next((h.get("to") for h in reversed(st["history"]) if h.get("to")), None)
         pend = next((p for p in pauses(r) if p["resume"] is None), None)
@@ -362,7 +363,7 @@ def interventions(run_list, ledger=None, linked=False) -> dict:
     if any(not isinstance(_d(r.get("meta")).get("invocations"), list) for r in run_list):
         i5 = F(None, NA, "a run records no invocations")
     else:
-        i5 = F(sum(len(r["meta"]["invocations"]) - 1 for r in run_list), REC)
+        i5 = F(sum(max(0, len(r["meta"]["invocations"]) - 1) for r in run_list), REC)
     if any(started(r) is None for r in run_list[1:]):
         i6 = F(None, NA, "a relaunch has no computable start time")
     else:
@@ -775,6 +776,9 @@ def _self_test() -> int:
         ok(chains([], [[a], [a]]) == [[a]] and chains([], [[a, a]]) == [[a]], "HM35 a repeated --chain dir counts once")
         d = mk("r_slow", {"history": [{"at": at(27), "from": "GATE", "to": "FINAL"}], "status": "completed"}, None, R)
         ok(not summarise([d])["completes"]["value"], "HM37 no finished time: FINAL after the 24 h cut-off is not done")
+        r = summarise([mk("r_noinv", done, {"invocations": None, "finished": at(1)}, R)])
+        ok(r["interventions"]["I5_resumes"]["from"] == NA and r["interventions"]["headline"]["from"] == NA,
+           "HM38 a run that records no invocations (before 2026-11-05): I5 and the headline are unavailable")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
