@@ -251,7 +251,8 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is "
                          "stale): the sheet is regenerated before the owner signs; read the new one")
     from toolkit.spec import review_conditions as RC
-    rc_sha = RC.sha_of(RC.read_bytes(run_dir))     # W0-G: bound in the record; the precondition compares the sheet
+    rc_bytes = RC.read_bytes(run_dir)       # W0-G: read once, validated by the precondition and bound in the record
+    rc_sha = RC.sha_of(rc_bytes)
     if rc_sha != "none":
         extra[RC.FILE] = rc_sha
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
@@ -267,7 +268,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if not errs:              # the preconditions with the signer (a departure needs the owner); engine: auto too
         from toolkit.spec import preconditions as PC
         errs = [e + (" (only the owner can sign an engine departure)" if by != "owner" else "")
-                for e in PC.problems(run_dir, data, by, spec=sp)]
+                for e in PC.problems(run_dir, data, by, spec=sp, review_bytes=rc_bytes)]
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
@@ -275,8 +276,6 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     # evidence check hands back the binding to record (its dossier read once, the sheet's dossier sha256 compared)
     evidence = sign_preconditions(run_dir, data)
     extra.update(evidence["files"])
-    if RC.sha_of(RC.read_bytes(run_dir)) != rc_sha:     # the conditions checked are the ones the record binds
-        raise ValueError(f"{RC.FILE} changed while the spec was being signed: read the sheet again")
     if _spec_record(run_dir) is not None:
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):

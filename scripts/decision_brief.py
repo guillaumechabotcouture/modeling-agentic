@@ -334,6 +334,13 @@ def status(run_dir: str) -> str:
         return "absent"   # (a brief deleted after sign-off is "changed", Gemini review)
     if so is not None:
         changed = [f for f in FROZEN_AT_SIGNOFF if _sha(os.path.join(run_dir, f)) != so.get("sha256", {}).get(f)]
+        if (so.get("sha256") or {}).get(DECISION_SPEC) is not None:     # W0-G (Codex r2 P1-5): the bound conditions
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            from toolkit.spec import review_conditions as RC
+            if RC.sha(run_dir) != ((so.get("sha256") or {}).get(RC.FILE) or "none"):
+                changed.append(RC.FILE)
         return "changed" if changed else "signed"
     return "invalid" if errors else "awaiting"
 
@@ -479,7 +486,9 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         from toolkit.spec import signoff as SO
         SO._refuse_held_out(captured[DECISION_SPEC], run_dir)
         from toolkit.spec import preconditions as PC      # every signing path checks the spec's preconditions (#215)
-        pre = PC.problems(run_dir, captured[DECISION_SPEC], by)
+        from toolkit.spec import review_conditions as RC   # W0-G: read once, validated here and bound in the record
+        rc_bytes = RC.read_bytes(run_dir)
+        pre = PC.problems(run_dir, captured[DECISION_SPEC], by, review_bytes=rc_bytes)
         if pre:
             raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
         # F6 (#218): every registered precondition, recomputed from the files (toolkit/spec/preconditions.py), whoever
@@ -504,8 +513,9 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
         "answer_source": {q["id"]: "given" if q["id"] in answers else "proposed accepted" for q in qs},
-        "sha256": {**shas, **_review_conditions_sha(run_dir, captured), **(extra_sha or {}),
-                   **((evidence or {}).get("files") or {})},
+        # W0-G (Codex r2 P1-3): the digest of the bytes validated above, after anything a caller supplies
+        "sha256": {**shas, **(extra_sha or {}), **((evidence or {}).get("files") or {}),
+                   **_review_conditions_sha(rc_bytes if captured.get(DECISION_SPEC) is not None else None)},
         **({"evidence": evidence["record"]} if evidence else {}),
         "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
@@ -521,16 +531,12 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     return record
 
 
-def _review_conditions_sha(run_dir: str, captured: dict) -> dict:
-    """W0-G: a sign-off of the decision spec binds the run's review_conditions.yaml (toolkit/spec/review_conditions.py)."""
-    if captured.get(DECISION_SPEC) is None:
+def _review_conditions_sha(data) -> dict:
+    """W0-G: a sign-off of the decision spec binds the bytes of review_conditions.yaml it validated."""
+    if data is None:
         return {}
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if root not in sys.path:
-        sys.path.insert(0, root)
     from toolkit.spec import review_conditions as RC
-    h = RC.sha_of(RC.read_bytes(run_dir))
-    return {RC.FILE: h} if h != "none" else {}
+    return {RC.FILE: RC.sha_of(data)}
 
 
 def _amendments_ok_ids(ids) -> bool:

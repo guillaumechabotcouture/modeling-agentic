@@ -161,7 +161,7 @@ def row_problems(r: dict, raw: dict, owner: bool | None) -> list:
         if not _text(sp) and not _text(dt):
             return [f"{rid}: adopted names neither a spec_path nor a decision_test"]
         an = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else {}
-        tests = {str(t.get("id")) for t in an.get("decision_tests") or [] if isinstance(t, dict)}
+        tests = {t["id"] for t in an.get("decision_tests") or [] if isinstance(t, dict) and _text(t.get("id"))}
         out = [f"{rid}: adopted at spec_path {sp!r}, which the signed spec does not have"] \
             if _text(sp) and not _has_path(raw, sp) else []
         return out + ([f"{rid}: adopted as decision_test {dt!r}, which is not an analysis.decision_tests id"]
@@ -189,8 +189,8 @@ def problems(run_dir: str, spec, signer: str | None, spec_bytes: bytes | None = 
     rec = SO._spec_record(run_dir) if run_dir and signer is None else None
     if signer is None and rec is None:
         return []
-    try:
-        data = read_bytes(run_dir)
+    try:            # a signer passes the bytes it binds in its record, read once (Codex r2 P1-1/2)
+        data = _ctx["review_bytes"] if "review_bytes" in _ctx else read_bytes(run_dir)
         rows = parse(data)
     except ValueError as e:
         return [f"review conditions: {e}"]
@@ -225,9 +225,10 @@ def problems(run_dir: str, spec, signer: str | None, spec_bytes: bytes | None = 
             crit = from_critique(raw, run_dir)
         except Exception as e:  # noqa: BLE001 -- a critique that cannot run cannot be shown covered (fail closed)
             return out + [f"review conditions: the spec critique could not run: {type(e).__name__}: {e}"]
-        have = {r["id"] for r in rows}
-        out += [f"review conditions: the spec critique's HIGH finding {c['id']} is not a row of {FILE} (python3 "
-                "toolkit/spec/review_conditions.py import <run_dir> --critique)" for c in crit if c["id"] not in have]
+        have = {(r["id"], r["source"], " ".join(r["text"].split())) for r in rows}
+        out += [f"review conditions: the spec critique's HIGH finding {c['id']} is not a row of {FILE} with its text "
+                "(python3 toolkit/spec/review_conditions.py import <run_dir> --critique)" for c in crit
+                if (c["id"], c["source"], " ".join(c["text"].split())) not in have]
     return out + [f"review conditions: {p}" for r in rows for p in row_problems(r, raw, owner)]
 
 
@@ -248,7 +249,7 @@ def from_review(path: str, source: str = "outside_review") -> list:
     import yaml
     try:
         with open(path, encoding="utf-8") as f:
-            doc = yaml.safe_load(f)
+            doc = yaml.load(f, Loader=_loader())  # noqa: S506 -- a SafeLoader subclass refusing duplicate keys
     except (OSError, yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"review file {path} cannot be read: {type(e).__name__}") from None
     items = doc.get("conditions") if isinstance(doc, dict) else doc
@@ -413,6 +414,19 @@ def _self_test() -> int:
                                                                      spec_path="objective")] + cr)
         ok(SO.status(d) == "preconditions_failed", "RC_DECLINE_AFTER_SIGN a disposition changed after signing is not "
                                                    "covered by the signature")
+    with tempfile.TemporaryDirectory() as d:        # Codex r2: the bytes a signer binds are the bytes validated
+        schema.toy_spec(d)
+        cr = crit_rows(d, **DEF)
+        put(d, [dict(row, **DEF)] + cr)
+        SO.write_sheet(d)
+        opened = yaml.safe_dump({"conditions": [dict(row)] + cr}).encode()
+        got = PC.problems(d, None, "owner", review_bytes=opened)
+        ok(any("no disposition" in g for g in got), f"RC_BYTES_VALIDATED a signer's own bytes are what is validated: "
+                                                    f"{got[:1]}")
+        put(d, [dict(row, **DEF)] + [dict(c, text="an unrelated note", source="owner_note") for c in cr])
+        SO.write_sheet(d)
+        ok(any("spec critique's HIGH finding" in g for g in PC.problems(d, None, "owner")),
+           "RC_COVERAGE_BY_TEXT a critique finding is covered by its id, source and text, never by its id alone")
     with tempfile.TemporaryDirectory() as d:
         schema.toy_spec(d)
         for label, body in (("not yaml", "conditions: [: bad"), ("not a list", "conditions: 3"),
@@ -500,8 +514,13 @@ def main(argv=None) -> int:
             rows += from_parent(a.parent)
         print(f"{add(a.run_dir, rows)} condition(s) added to {FILE}")
         return 0
-    from toolkit.spec import schema
-    bad = problems(a.run_dir, schema.load(os.path.join(a.run_dir, "decision_spec.yaml")), None)
+    try:            # every row, signed or not (Codex r2 P2): as a signer would see it, the owner's rule aside
+        rows = parse(read_bytes(a.run_dir))
+        raw = yaml.safe_load(read_nofollow(a.run_dir, "decision_spec.yaml")[0].decode("utf-8")) or {}
+        bad = [p for r in rows for p in row_problems(r, raw if isinstance(raw, dict) else {}, None)]
+    except (ValueError, OSError, LinkRefused, yaml.YAMLError) as e:
+        bad = [str(e)]
+    bad += problems(a.run_dir, None, None)
     print("\n".join(bad) or "every review condition has a disposition")
     return 1 if bad else 0
 

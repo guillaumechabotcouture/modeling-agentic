@@ -256,6 +256,12 @@ def spec_signoff_findings(run_dir: str, signoff: str, backend=None) -> list[dict
                  "key": "spec", "scope_declarable": False,
                  "claim": "decision_spec.yaml changed after sign-off. It is the owner's; restore it or ask for a "
                           "new sign-off. Computational settings belong in analysis_settings.yaml."}]
+    from toolkit.spec import review_conditions as RC     # W0-G (Codex r2 P1-5): the conditions the signature bound
+    bad = RC.problems(run_dir, None, None)
+    if bad:
+        return [{"kind": "review_conditions_changed_after_signoff", "severity": "HIGH", "stage": "PLAN",
+                 "target_stage": "PLAN", "key": "review_conditions", "scope_declarable": False,
+                 "claim": "; ".join(bad)[:600]}]
     return []
 
 
@@ -882,7 +888,9 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"{AB.SPEC_FILE} does not parse: {e}") from None
     from toolkit.spec import preconditions as PC          # every signing path checks the preconditions (#215)
-    pre = PC.problems(run_dir, data, by)
+    from toolkit.spec import review_conditions as RC     # W0-G: read once, validated here and bound in the record
+    rc_bytes = RC.read_bytes(run_dir)
+    pre = PC.problems(run_dir, data, by, review_bytes=rc_bytes)
     if pre:
         raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
     # engine parameter values without a basis, or chosen with a held-out benchmark, are refused whoever signs (as in
@@ -894,8 +902,7 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     from toolkit.spec import signoff as SO      # F6 (#218): every registered precondition, recomputed, whoever signs
     ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
     rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
-    from toolkit.spec import review_conditions as RC     # W0-G: the conditions the preconditions checked are bound
-    rec[RC.RECORD_KEY] = RC.sha_of(RC.read_bytes(run_dir))
+    rec[RC.RECORD_KEY] = RC.sha_of(rc_bytes)
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
     GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
