@@ -420,7 +420,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   reason="; ".join(dp))
     arts["decision_tests"] = S.write("decision_tests", {"tests": [
         {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
-         "verdict": DT.verdict(x), "within_solver_gap": bool(x.get("within_solver_gap")),
+         "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
+         # 1C-c follow-up: the verdict words are unchanged (tools/workbench and tools/run_console read exactly these
+         # three); a verdict that cannot be settled within the solver's accepted gap is marked beside it
+         "within_solver_gap": bool(x.get("within_solver_gap")),
          "can_move_plan": x["can_move_plan"], "threshold_pct": 100.0 * x["share_threshold"],
          "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
          # F6 S1-5: what moves beside the share, and which criterion changed the plan
@@ -2469,12 +2472,10 @@ def _self_test_solver(ok, A, R):
         CO.aopt.solve, A.solve_memo, A.solver_log = real, {}, lg1
         rg = (tg.get("results") or [{}])[0].get("regret_solver_gap") or {}
         ok(tg["status"] == "run" and rg.get("gap") == 0.001 and rg.get("bound", 0) > 0 and tg["results"][0]["regret"] >= 0
-           and DTg.verdict(tg) == ("WITHIN_SOLVER_GAP" if tg.get("within_solver_gap") else "NO_CHANGE")
-           and DTg.verdict(dict(tg, within_solver_gap=True, decision_changes=True)) == "WITHIN_SOLVER_GAP"
-           and DTg.verdict(dict(tg, within_solver_gap=False, decision_changes=True)) == "CHANGES_PLAN"
-           and DTg.verdict({"status": "not_run"}) == "NOT_RUN",
-           f"SG10 a decision test solved to an accepted incumbent records the gap beside its regret, and a verdict "
-           f"inside it reads WITHIN_SOLVER_GAP ({rg}, {tg.get('within_solver_gap')})")
+           and isinstance(tg["results"][0].get("within_solver_gap"), bool)
+           and bool(tg.get("within_solver_gap")) == (tg["results"][0]["within_solver_gap"] is True),
+           f"SG10 a decision test solved to an accepted incumbent records the gap beside its regret, and whether its "
+           f"verdict can be settled within it ({rg}, {tg.get('within_solver_gap')})")
         rep = A.solver_report()
         ok(rep["gap_rel"] == st["gap_rel"] and rep["headline"]["solves"] >= 1
            and rep["auxiliary_total"] == {"solves": 3, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 2},

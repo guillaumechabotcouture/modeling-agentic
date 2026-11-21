@@ -80,17 +80,6 @@ def _lowers_only_unchosen(ben0, ben, plan) -> bool:
     return True
 
 
-def verdict(x: dict) -> str:
-    """The decision-tests artifact's verdict for one test record. WITHIN_SOLVER_GAP: the test ran, but whether it
-    changes the plan cannot be settled within the gap the solver accepted (moves.solver_gap); it is neither a change
-    nor a confirmation."""
-    if x["status"] == "not_run":
-        return "NOT_RUN"
-    if x.get("within_solver_gap"):
-        return "WITHIN_SOLVER_GAP"
-    return "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"
-
-
 def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
     os.makedirs(os.path.join(run_dir, DIR), exist_ok=True)
     out = []
@@ -1208,7 +1197,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
            "package_components": {k: sorted(v) for k, v in A.pk.items()}}
     soft = [r for r in results if r.get("within_solver_gap")]
     if soft and not any(r["decision_changes"] for r in results if not r.get("within_solver_gap")):
-        # 1C-c follow-up: no value settles the verdict outside the solver's accepted gap (verdict())
+        # 1C-c follow-up: no value settles the verdict outside the solver's accepted gap; marked beside the verdict
         rec["within_solver_gap"] = True
         rec["statement"] += (f" At {len(soft)} of {len(results)} tested values the solver stopped before proving its "
                              "plan, and the verdict there cannot be settled within the recorded bound "
