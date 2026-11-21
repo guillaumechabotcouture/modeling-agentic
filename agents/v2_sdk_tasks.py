@@ -50,8 +50,15 @@ PROMPTS = {
 
 Task: draft decision_spec.yaml for the question, and analysis_settings.yaml with the
 computational settings only ({settings}; not repeated in the spec). Follow {skill} (the schema is the
-docstring of {schema}; a full example is {example}). Write `engine: auto`: the harness chooses the
-engine after sign-off. The harness has copied the question's input files into data/inputs/ (same
+docstring of {schema}; a full example is {example}). Engine: write `engine: auto` when the harness
+can configure an engine from the rest of the spec (its components and outcome, or an estimates spec's
+`dynamics`); it then chooses the engine after sign-off. `auto` cannot configure an engine whose
+structure, run mode or groups are part of what the owner signs: when the question needs one ({skill}
+and the engine's card say which and list the fields), name it with its configuration,
+`engine: {{ref: '<module>:<Class>', config: {{...}}}}`. Name the engine the same way to run it in a
+mode other than its default, or to use an engine that `auto` configures only from an estimates spec
+in a spec that is not one. A named configuration is used as written, and the named engine is then
+the only one considered. The harness has copied the question's input files into data/inputs/ (same
 relative paths; their sha256 in data/inputs_provenance.json): read them. You write code, never
 tables. For each file the spec reads that is not a staged input (the units table, calibration
 targets, cost tables), write one script under data/derive/ and declare it in data/derivations.yaml
@@ -389,6 +396,22 @@ def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
     return f"this task may write only {', '.join(owns + (OUT,))}"
 
 
+def _no_session_when_sole(pick):
+    """v2 autonomy 1B-i: with exactly one eligible engine there is nothing to choose, so the harness returns it and
+    no session is paid for (analysis_backend.sole_pick; engine_choice.json records pick.task). A pick that carries
+    more than the candidate rows (the reasons of a rethink) still runs."""
+    import functools
+
+    @functools.wraps(pick)
+    def pick_engine(self, spec, eligible, *args, **kwargs):
+        from agents import analysis_backend as AB
+        sole = None if args or any(v for v in kwargs.values()) else AB.sole_pick(eligible)
+        if sole:
+            return TaskResult(True, sole, 0.0, AB.SOLE_WHY)
+        return pick(self, spec, eligible, *args, **kwargs)
+    return pick_engine
+
+
 def _settings_text() -> str:
     from agents import analysis_backend as AB
     return ", ".join(getattr(AB.backend(), "settings_paths", AB.SETTINGS_PATHS))
@@ -544,10 +567,16 @@ class SdkTasks:
             {"by": "lead", "note": "lead mode: the harness accepts the drafted spec"}).encode(), atomic=True)
         return TaskResult(True, None, 0.0, "lead mode")
 
-    def pick_engine(self, spec, eligible):
+    def pick_engine(self, spec, eligible, rethink=None):
         inp = self._input(eligible)
+        msg = "Choose the engine."
+        if rethink:      # a RETHINK back-edge: the engine the run left, and why (stage_machine.Machine._rethink)
+            msg += (f"\n\nThis is a rethink: the run chose {rethink.get('engine')} and came back to this choice, for "
+                    "these reasons:\n- " + "\n- ".join(map(str, rethink.get("why") or ["none recorded"]))
+                    + "\nPick another eligible engine if one answers them. If you keep the same engine, say in `why` "
+                      "which of the reasons it cannot answer.")
         return self._session("pick_engine", PROMPTS["pick_engine"].format(out_in=inp, out=OUT),
-                             "Choose the engine.", OWNS["pick_engine"], enforcement.MODEL_FAST)
+                             msg, OWNS["pick_engine"], enforcement.MODEL_FAST)
 
     def critique(self, run_dir, reviewer, round_n, feedback=None):
         import validate_critique_yaml as V
@@ -573,11 +602,13 @@ class SdkTasks:
                              "Plan the fixes.", OWNS["plan_fixes"])
 
     def fix(self, task, run_dir, evidence):
-        owns = OWNS["fix"] if task.get("owner_state") not in ("WRITE", "PRESENTATION") else ("manuscript.md",)
+        # A write-up finding is never a fix task (fix_loop.validate_plan; the writer gets it), so a fix task owns
+        # the files its prompt names, whatever stage its plan gives.
         return self._session("fix", PROMPTS["fix"].format(tid=task["id"], brief=task.get("brief", ""),
                                                            findings=task["findings"],
                                                            evidence=json.dumps(evidence)[:2000] if evidence else "none",
-                                                           settings=_settings_text(), out=OUT), "Make the fix.", owns)
+                                                           settings=_settings_text(), out=OUT), "Make the fix.",
+                             OWNS["fix"])
 
     def write(self, run_dir, mode, feedback=None, findings=None):
         fb = ("\n\nThis is a repair: the report was not accepted, and the harness will not deliver it while it "
@@ -608,6 +639,9 @@ class SdkTasks:
         t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir)
         t.set_allowance(cap_usd)
         return t.seed_world_model(ctx, feedback)
+
+
+SdkTasks.pick_engine = _no_session_when_sole(SdkTasks.pick_engine)
 
 
 def _self_test() -> int:
@@ -866,6 +900,59 @@ def _self_test() -> int:
         pk = json.load(open(os.path.join(d, "_task_input.json")))
         ok('{"tasks": [{"id": "T1"' in (seen_prompts.get("plan_fixes") or "") and pk["findings"] == [{"id": "R-001"}],
            "PF4 plan_fixes keeps the plan's JSON example and writes the packet the prompt names")
+        # S_SINGLE_NO_LLM, S_ENGINE_FORMS (v2 autonomy 1B-i): one eligible engine is chosen with no session; the draft
+        # prompt gives both engine forms, and what it says holds for every registered engine.
+        sessions = []
+
+        def count_session(self_, kind, system, prompt, owns, model=None):
+            sessions.append(kind)
+            return TaskResult(True, {"engine": "e2", "why": "picked"}, 0.4, "fake")
+        SdkTasks._session = count_session
+        try:
+            t4 = SdkTasks(d)
+            r1 = t4.pick_engine({}, [{"ref": "e1", "eligible": True}, {"ref": "e2", "eligible": False}])
+            n1 = len(sessions)
+            r2 = t4.pick_engine({}, [{"ref": "e1", "eligible": True}, {"ref": "e2", "eligible": True}])
+        finally:
+            SdkTasks._session = orig_session
+        ok(n1 == 0 and r1.ok and r1.usd == 0.0 and (r1.output or {}).get("engine") == "e1"
+           and "no pick task" in str((r1.output or {}).get("why")),
+           f"S_SINGLE_NO_LLM one eligible engine: chosen by the harness, no session, no cost ({n1} session(s), {r1})")
+        ok(sessions == ["pick_engine"] and (r2.output or {}).get("engine") == "e2",
+           f"S_SINGLE_NO_LLM2 two eligible engines: the pick task runs ({sessions})")
+        dp = " ".join(PROMPTS["draft_spec"].split())
+        ok(all(k in dp for k in ("engine: auto", "engine: {{ref:", "config:", "as written", "estimates spec"))
+           and "Write `engine: auto`: the harness chooses" not in dp,
+           "S_ENGINE_FORMS the draft prompt says when to write `engine: auto` and when to name the engine with its "
+           "configuration")
+        from agents import analysis_backend as _AB
+        forms = getattr(_AB, "spec_forms", lambda: {})()
+        ok(bool(forms) and {f["auto"] for f in forms.values()} <= {True, False, "estimates"}
+           and (all(f["auto"] is True for f in forms.values()) or "cannot configure" in dp)
+           and (not any(f["auto"] == "estimates" for f in forms.values()) or "`dynamics`" in dp),
+           f"S_ENGINE_FORMS2 each case among the registered engines (auto, an estimates spec's dynamics, named only) is "
+           f"one the prompt covers ({sorted({str(f['auto']) for f in forms.values()})})")
+
+        # S_PICK_RETHINK, S_FIX_OWNS (v2 autonomy 1A, 5.3 and 3).
+        got = {}
+
+        def rec_session(self_, kind, system, prompt, owns, model=None):
+            got[kind] = (prompt, owns)
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        SdkTasks._session = rec_session
+        try:
+            t3 = SdkTasks(d)
+            try:
+                t3.pick_engine({}, [{"ref": "e1", "eligible": True}],
+                               rethink={"engine": "e1", "why": ["D-001: it has no age structure {x}"]})
+            except TypeError as e:
+                got["pick_engine"] = (f"TypeError: {e}", ())
+            t3.fix({"id": "T1", "brief": "b", "findings": ["R-001"], "owner_state": "WRITE"}, d, None)
+        finally:
+            SdkTasks._session = orig_session
+        ok("e1" in got["pick_engine"][0] and "D-001: it has no age structure {x}" in got["pick_engine"][0],
+           f"S_PICK_RETHINK the engine pick after a rethink names the engine left and the reasons ({got['pick_engine'][0]!r})")
+        ok(got["fix"][1] == OWNS["fix"], f"S_FIX_OWNS a fix task owns the fix files ({got['fix'][1]})")
     # World-model seed task (F6 world-model trials): the world model's own seed documentation in the prompt, no results
     # readable, one owned output outside the harness's analysis/ tree.
     try:
