@@ -2445,6 +2445,10 @@ def _self_test_solver(ok, A, R):
            and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, 1.0)
            != CO._problem_key(kb, kb, {"feasible": {"u": {"1": False}}}, 1.0),
            "SG7 the kept-result key needs text ids and separates problems that differ only in feasibility")
+        ok(CO._problem_key({"u": {"1": "1"}}, kb, {"feasible": {"u": {"1": True}}}, 1.0) is None
+           and CO._problem_key(kb, kb, {"feasible": {"u": {"1": True}}}, True) is None,
+           "SG8 (Codex r2 P1) nothing is kept for a table value or budget that is not a number, so the allocator's "
+           "own input check is never skipped")
         rep = A.solver_report()
         ok(rep["gap_rel"] == st["gap_rel"] and rep["headline"]["solves"] >= 1
            and rep["auxiliary_total"] == {"solves": 3, "feasible_accepted": 1, "max_gap": 0.001, "not_solved": 2},

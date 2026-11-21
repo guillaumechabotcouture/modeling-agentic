@@ -775,6 +775,14 @@ def _self_test() -> int:
             S.finalize("complete")
             got.append(kinds(d))
         ok(got == [{"analysis_solver_degraded"}] * 2, f"KS4 a null record or fractional counts fail closed: {got}")
+        got = []      # Codex r2 P1: the share is a number, not a boolean; accepted counts are whole and consistent
+        for share, acc in ((True, 0), (0.05, 0.5), (0.05, 11)):
+            S.manifest["solver"] = {"aux_not_solved_share_max": share, "auxiliary_total": {
+                "solves": 10, "feasible_accepted": acc, "max_gap": 0.0, "not_solved": 10 if share is True else 0}}
+            S.finalize("complete")
+            got.append(kinds(d))
+        ok(got == [{"analysis_solver_degraded"}] * 3, f"KS5 a boolean share or an inconsistent accepted count fails "
+                                                      f"closed: {got}")
         S = complete_run(d)
         rel = "analysis/sensitivity.yaml"
         doc = yaml.safe_load(open(os.path.join(d, rel)))

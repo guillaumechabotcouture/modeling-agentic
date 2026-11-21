@@ -646,6 +646,15 @@ def _self_test() -> int:
         ok(pwg(A, sol_t, dict(plan, **{u_: A.comp}), tiny, cost0) is False
            and pwg(A, sol_, dict(plan, **{u_: "no_such_package"}), ben0, cost0) is False,
            "FD10c a plan that loses a tiny gain entirely is not within the gap; an unknown package is refused, not raised")
+        # Codex r2 P1: the allowance is on the gain the solver optimised, not on the objective above the pre-pruning
+        # baseline (a large benefit every plan gets must not widen it)
+        u0 = next(i for i in A.ids if i != u_)
+        big = {i: {k: (1e6 if i == u0 else 1.0 if (i == u_ and k == plan[u_]) else 0.0) for k in ben0[i]} for i in A.ids}
+        sol_b = dict(sol_, objective=1e6 + 1.0, baseline=0.0, gain=1.0)
+        ok(pwg(A, sol_b, dict(plan, **{u_: A.comp}), big, cost0) is False and pwg(A, sol_b, dict(plan), big, cost0) is True
+           and pwg(A, {k: v for k, v in sol_b.items() if k != "gain"}, dict(plan, **{u_: A.comp}), big, cost0) is False,
+           "FD10d a plan that gives up the whole optimised gain is not within the gap, whatever every plan gets anyway; "
+           "without the solver's gain no difference is allowed")
         # ---- Codex r1 P2-8: the frontier reports outcome averted, not the (possibly discounted) objective
         half = {i: {k: 0.5 * v for k, v in ben0[i].items()} for i in A.ids}
         fr_h = frontier(A, half, cost0, out0)

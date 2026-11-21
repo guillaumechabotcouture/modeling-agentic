@@ -1003,6 +1003,9 @@ def _self_test() -> int:
     ok(keep is not None and ru["status"] == "feasible" and ru["gap"] is None,
        f"TG3 a relaxation that is not itself proven optimal states no gap: {ru.get('gap')}")
     ex = solve(benefit, cost, feas, 0.93 * B, method="ilp")
+    # Codex r2 P1: the gain the gap is relative to (over each unit's least-benefit option after pruning) is returned
+    ok(ex.get("gain") is not None and 0 < ex["gain"] <= ex["objective"] - ex["baseline"] + 1e-9,
+       f"TG4 the ILP returns the gain its relative gap is measured on: {ex.get('gain')}")
     ok(rf["status"] == "feasible" and rf.get("gap") is not None and 0.0 <= rf["gap"] < 0.5
        and ex.get("gap", "absent") is None and rf["objective"] == ex["objective"],
        f"TG2 a solve that stopped early reports its gap to the LP relaxation bound; a proven one reports none: "
