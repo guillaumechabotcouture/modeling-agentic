@@ -4082,6 +4082,35 @@ def _self_test_w0a(ok) -> None:
                                            "(a dangling link is hashed as missing, not raised)")
             for x in ("plugins", "obsolete.py"):
                 os.remove(os.path.join(rd, x))
+            # Codex r4: a link retargeted between two places the walk does not enter, a dangling link against a file
+            # whose bytes spell the marker, and repo code outside scripts/ and toolkit/ under an unresolved key
+            os.symlink(".", os.path.join(rd, "v1", "alias"))
+            k2 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "v1", "alias"))
+            os.symlink("..", os.path.join(rd, "v1", "alias"))
+            k3 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "v1", "alias"))
+            os.symlink("gone.py", os.path.join(rd, "optional.py"))
+            k4 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "optional.py"))
+            w("optional.py", "missing", rd)
+            k5 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "optional.py"))
+            w("tools/wt.py", "W = 1\n")
+            u0 = code_fingerprint(rd, os.path.join(repo, "dyn.py::f"))
+            w("tools/wt.py", "W = 2\n")
+            u1 = code_fingerprint(rd, os.path.join(repo, "dyn.py::f"))
+            ok(k2 != k3 and k4 != k5 and u0 != u1,
+               f"FP_RUN_CODE_LINKS2 a retargeted link, a dangling link and repo code outside scripts/ and toolkit/ all "
+               f"change an unresolved key ({k2 != k3}, {k4 != k5}, {u0 != u1})")
+            ident = {"name": "e", "version": "1"}
+            try:
+                c1 = _carries({"provenance": {"engine": ident}}, ident)
+                c2 = _carries({"rows": [{"provenance": {"engine": ident}}, {"x": 1}]}, ident)
+            except Exception as e:  # noqa: BLE001 -- reported in the case
+                c1 = c2 = f"{type(e).__name__}: {e}"
+            ok(c1 is True and c2 is False, f"FP_CARRIES a row with provenance is checked without error, and a group "
+                                           f"with a member without it is refused ({c1}, {c2})")
             # large files: content, never mtime
             with mock.patch.dict(g, {"_FP_HASH_MB": 0}):
                 k0 = code_fingerprint(rd, os.path.join(repo, "job.py::f"))

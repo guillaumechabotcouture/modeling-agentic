@@ -538,6 +538,23 @@ def _self_test() -> int:
         gn = closure(os.path.join(td, "toolkit/c/gnon.py") + "::run", td)
         ok(not gn["unresolved"] and "toolkit/b/far.py" not in gn["files"],
            f"IC16 a call into a guard that is not one of its loaders loads nothing: {gn}")
+        # Codex r4 (ι)
+        put("toolkit/g/api.py", "from toolkit.g import guard as G\n")
+        put("toolkit/c/gmod.py", "from toolkit.g.api import G\n\ndef run(p):\n    return G.resolve('calibrator', p['r'])\n")
+        put("toolkit/c/galias.py", "from toolkit.g import guard as G\n\ndef run(p):\n    load = G.attr\n"
+            "    return load('oracle', p['m'], p['n'])\n")
+        put("toolkit/p2/__init__.py", "__all__ = ['_score']\n")
+        put("toolkit/p2/_score.py", "def _score(p):\n    return 1\n")
+        put("toolkit/c/star4.py", "from toolkit.p2 import *\n\ndef run(p):\n    return _score._score(p)\n")
+        put("toolkit/c/decl2.py", "import importlib\nFP_DYNAMIC_IMPORTS = ('toolkit/b', 'bad\\x00path')\n\n"
+            "def run(p):\n    return importlib.import_module(p)\n")
+        gm, gl, s4, d2 = (closure(os.path.join(td, f"toolkit/c/{n}.py") + "::run", td)
+                          for n in ("gmod", "galias", "star4", "decl2"))
+        ok(gm["unresolved"] and gl["unresolved"] and s4["unresolved"] and d2["unresolved"]
+           and "toolkit/b/far.py" in d2["files"] and not gr["unresolved"],
+           f"IC17 a guard re-exported as a module, a loader taken as a value, a star import of a package that only sets "
+           f"__all__ and a declaration with an unusable path all fail closed (a checked engine load still does not): "
+           f"{gm['unresolved']} {gl['unresolved']} {s4['unresolved']} {d2['unresolved']}")
     print(f"{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)}'}")
     return 1 if fails else 0
 
