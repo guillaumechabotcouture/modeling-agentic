@@ -1050,6 +1050,9 @@ def _self_test() -> int:
         o3 = cover_features([0, 1, 2], {2}, [[0.0, 0.0, 5.0, 9.0]])       # units 0 and 1 tie at the minimum
         ok(sorted(o3) == [0, 2, 3] or sorted(o3) == [1, 2, 3],
            f"BA-XU6 a point tied at a covered extreme can give way while the other carrier stays: {o3}")
+        # Codex r2 P1: every unit tied at the missing extreme is a candidate, so a training point is found when one is
+        o4 = cover_features([0, 1], {1}, [[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]])
+        ok(o4 == [3, 1], f"BA-XU7 of the units tied at a missing extreme, one that can take a training point is used: {o4}")
     case("BA-XU2", bxu2)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
