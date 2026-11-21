@@ -239,6 +239,15 @@ def report_block(run_dir: str, signed_by: str | None) -> list[str]:
     lines = ["## Evidence dossier (rendered by the harness from evidence/dossier_draft.json)", ""]
     if rec.get("status") == "unreadable":
         return lines + ["The evidence-stage record could not be read.", ""]
+    try:            # Codex r1 P2-10: the record describes the dossier it hashed, or nothing
+        now = ED.sha(ED.read_dossier(run_dir, rec["dossier"])) if rec.get("dossier") else None
+    except (ValueError, OSError):
+        now = "unreadable"
+    if now != rec.get("dossier_sha256"):
+        return lines + [f"The dossier changed after the evidence stage (for example, edited before sign-off); the "
+                        f"stage's record of its gaps no longer describes it, and the signed dossier "
+                        f"({rec.get('dossier')}) is the reference. Signed by "
+                        f"{('the ' + signed_by) if signed_by else 'nobody (--signoff none)'}.", ""]
     who = "drafted by a run task" if rec.get("drafted_by_task") else "supplied with the run"
     lines.append(f"- {len(rec.get('required') or [])} decision input(s); the dossier was {who} and signed by "
                  f"{('the ' + signed_by) if signed_by else 'nobody (--signoff none)'}.")
@@ -346,6 +355,12 @@ def _self_test() -> int:
            f"signed:\n{blk}")
         ok(json.load(open(os.path.join(d, RECORD)))["dossier_sha256"] == ED.sha(
             open(os.path.join(d, ED.DOSSIER_FILE), "rb").read()), "EDR9 the record binds the dossier it describes")
+        keep = open(os.path.join(d, ED.DOSSIER_FILE), "rb").read()
+        open(os.path.join(d, ED.DOSSIER_FILE), "ab").write(b"# edited by the owner\n")
+        blk2 = "\n".join(report_block(d, "owner"))
+        ok("changed after the evidence stage" in blk2 and "parameter:k" not in blk2,
+           f"EDR9b a dossier edited after the stage: the record's gaps are not reported as its gaps:\n{blk2}")
+        open(os.path.join(d, ED.DOSSIER_FILE), "wb").write(keep)
         # EDR10: fail closed on an unreadable record; a link in place of the dossier is refused, never followed
         open(os.path.join(d, RECORD), "w").write("{not json")
         ok(read_record(d) == {"status": "unreadable"} and "could not be read" in "\n".join(report_block(d, "lead")),

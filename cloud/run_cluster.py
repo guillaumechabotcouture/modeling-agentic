@@ -473,7 +473,10 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
         if raw is None or state is None:
             out.append(f"{rel}: run_state.json is missing or unreadable in the code to launch")
             continue
-        if state in PRE_SIGN_STATES or (state == "EVIDENCE" and not any(       # a draft: nothing is signed yet
+        hist = st.get("history") if isinstance(st.get("history"), list) else []
+        signed_in_history = any(isinstance(h, dict) and h.get("from") == "SIGN"         # Codex r1 P1-3: a lost
+                                and str(h.get("why", "")).startswith("spec signed by") for h in hist)   # record
+        if state in PRE_SIGN_STATES or (state == "EVIDENCE" and not signed_in_history and not any(   # a draft
                 _archive_member(code, f"{rel}/{f}") is not None for f in SIGNOFF_RECORDS)):
             continue
         if st.get("signoff") == "none":     # nobody signs: the same rule as the runtime gate (coverage, no record)
@@ -4886,9 +4889,12 @@ def _self_test_sheet(ok) -> None:
     ev_signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("EVIDENCE"),
                                              f"{R}/decision_spec.yaml": b"spec: 2\n",
                                              f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
-    ok(ev_draft == [] and ev_signed,
-       f"RC80f a run at EVIDENCE with no sign-off is a draft; one signed under the earlier order is checked "
-       f"({ev_draft}; {ev_signed})")
+    ev_lost = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": json.dumps({"state": "EVIDENCE", "history": [
+        {"from": "SIGN", "to": "EVIDENCE", "why": "spec signed by the lead"}]}).encode()}), flags)
+    ok(ev_draft == [] and ev_signed and ev_lost,
+       f"RC80f a run at EVIDENCE with no sign-off is a draft; one signed under the earlier order (a record, or a "
+       f"signature in its history) is checked "
+       f"({ev_draft}; {ev_signed}; {ev_lost})")
     ok(len(stale) == 1 and "spec" in stale[0] and "signoff.py sheet" in stale[0] and "--write" in stale[0]
        and len(stale_rec) == 1
        and "derivation" in stale_rec[0],

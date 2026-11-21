@@ -52,11 +52,11 @@ STATES = ("SPEC", "EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE
 # The state table: every transition the machine may take. A transition outside it is a bug
 # (raised, never taken).
 EDGES = {
-    # v2 autonomy 1B-ii (D1): EVIDENCE drafts the evidence dossier before SIGN, so the signer sees it. EVIDENCE ->
-    # ENGINE_CHOICE is a run signed under the earlier order (SIGN before EVIDENCE) resumed; SIGN -> EVIDENCE | SPEC is
-    # the lead's repair of a refused sign-off (at most MAX_SIGN_REPAIRS), before any signature exists.
+    # v2 autonomy 1B-ii (D1): EVIDENCE drafts the evidence dossier before SIGN, so the signer sees it (a run signed
+    # under the earlier order, SIGN before EVIDENCE, goes back to SIGN, which checks its signature); SIGN -> EVIDENCE
+    # | SPEC is the lead's repair of a refused sign-off (at most MAX_SIGN_REPAIRS), only before any signature.
     "SPEC": {"EVIDENCE", "SPEC", "FINAL"},
-    "EVIDENCE": {"SIGN", "SPEC", "ENGINE_CHOICE", "FINAL"},
+    "EVIDENCE": {"SIGN", "SPEC", "FINAL"},
     "SIGN": {"ENGINE_CHOICE", "EVIDENCE", "SPEC", "SIGN"},
     "ENGINE_CHOICE": {"PREREGISTER", "CONFIGURE", "FINAL"},
     # The world model (docs/design/v2c-orchestration.md §14): beliefs anchored before the engine batch, scored after
@@ -293,7 +293,11 @@ def deliverable_problems(run_dir: str) -> list[str]:
     owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, "spec_rethink_request.json", FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
-        "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*")
+        "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*",
+        # v2 autonomy 1B-ii: the signed evidence dossier (the default name and the one the spec names) and the sheet
+        "evidence_dossier.yaml", SIGNOFF_SHEET) + tuple(
+        [spec["evidence"]["dossier"]] if isinstance(spec.get("evidence"), dict)
+        and isinstance(spec["evidence"].get("dossier"), str) else [])
     if owned_path(root, norm, owned):
         return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
     return []
@@ -1499,6 +1503,10 @@ class Machine:
 
     def h_SIGN(self):
         mode = self.st.signoff
+        from toolkit.spec import evidence_draft as EDR
+        if not self._signed_before() and EDR.read_record(self.run_dir) is None:
+            # Codex r1 P2-6: an unsigned run saved at SIGN under the earlier order has had no evidence stage
+            return self._go("EVIDENCE", "earlier order: the evidence stage runs before sign-off")
         if mode == "none":
             return self._go("ENGINE_CHOICE", "sign-off not required (--signoff none)")
         by = self._signed_by()
@@ -1511,6 +1519,10 @@ class Machine:
             how = ("python3 toolkit/spec/geometry.py approve" if by else "python3 agents/stage_machine.py sign")
             self.log(f"[machine] {len(pend)} HIGH geometry exception(s) wait for the owner ({', '.join(pend[:4])}): "
                      f"{how} {self.run_dir} --by owner")
+        elif mode == "lead" and self._signed_before():
+            # Codex r1 P1-1: a signature that no longer holds (the dossier or an input changed since) is never replaced
+            # by a lead's: the record stays, and the owner re-signs
+            self.log("[machine] the spec's sign-off no longer holds; only the owner signs it again")
         elif mode == "lead":
             res = self._task(f"SIGN#{self._visit()}:sign_spec", "sign_spec", self.run_dir)
             note = (_signoff(self.run_dir) or {}).get("note", "")
@@ -1531,6 +1543,12 @@ class Machine:
         save_state(self.run_dir, self.st)
         self.log(f"[machine] waiting for the owner: python3 agents/stage_machine.py sign {self.run_dir} --by owner")
         return "SIGN"
+
+    def _signed_before(self) -> bool:
+        """The run's spec was signed: a sign-off record binds it (current or not), or the history records a signature
+        (a record lost since does not make the run a draft again: Codex r1 P1-3)."""
+        return spec_signed_once(self.run_dir) or any(
+            h.get("from") == "SIGN" and str(h.get("why", "")).startswith("spec signed by") for h in self.st.history)
 
     def _sign_repair(self, why: str) -> str | None:
         """v2 autonomy 1B-ii: a refused lead sign-off goes back with the refusal as feedback, to EVIDENCE when the
@@ -1553,6 +1571,8 @@ class Machine:
         rec = EDR.read_record(self.run_dir) or {}
         if rec.get("status") in (None, "not_required"):
             return ""
+        if rec.get("status") == "unreadable":
+            return f"Evidence dossier: provisional, not reviewed by the owner; {EDR.RECORD} could not be read."
         g = rec.get("gaps") if isinstance(rec.get("gaps"), dict) else {}
         parts = ", ".join(f"{len(g[k])} {k}" for k, _ in EDR.GAP_TEXT if g.get(k))
         return (f"Evidence dossier {'drafted by a run task' if rec.get('drafted_by_task') else 'supplied'}: "
@@ -1570,9 +1590,9 @@ class Machine:
         # the evidence service's registry (workstream V5), still a stub: the run console reads it
         _put(rd, "evidence/registry.yaml", "# evidence service stub (v2 C): no parameter has been fetched or "
              "matched yet\nstatus: stub\nentries: []\n")
-        if spec_signed_once(rd):
-            return self._go("ENGINE_CHOICE", "evidence: the spec was signed before this stage (earlier order); the "
-                                             "dossier stays as signed")
+        if self._signed_before():       # Codex r1 P1-2/3: SIGN checks the signature, its signer and the approvals
+            return self._go("SIGN", "evidence: the spec was signed before this stage (earlier order); the dossier "
+                                    "stays as signed")
 
         def spec_back(probs):
             self.st.tries["spec_feedback"] = probs
@@ -1586,16 +1606,19 @@ class Machine:
         except Exception as e:  # noqa: BLE001 -- fail closed: back to the draft, whose tries are bounded
             return spec_back([f"the evidence stage could not read the spec or the dossier: {type(e).__name__}: {e}"])
         notes = []
-        fb = self.st.tries.pop("evidence_feedback", None) or []
+        fb = list(self.st.tries.get("evidence_feedback") or [])
+
+        def drafts():       # Codex r1 P2-7: the drafts the journal completed (charged), whatever a lost counter says
+            return sum(1 for k, j in self.st.journal.items() if k.startswith("EVIDENCE#") and j.get("status") == "completed")
         if a["needed"]:
             a = EDR.assess(rd, raw)
             if a["problems"] and not a.get("draftable"):
                 notes.append(f"the spec names {a['rel']}: only {EDR.ED.DOSSIER_FILE} is drafted in the run")
-            while a["problems"] and a.get("draftable") and self.st.tries.get("evidence", 0) < EDR.MAX_TRIES:
-                n = self.st.tries.get("evidence", 0)
+            while a["problems"] and a.get("draftable") and drafts() < EDR.MAX_TRIES:
+                n = drafts()
                 res = self._task(f"EVIDENCE#{self._visit()}:try{n + 1}", "draft_evidence", rd, a["rel"],
                                  EDR.packet(a), fb + a["problems"])
-                self.st.tries["evidence"] = n + 1
+                self.st.tries["evidence"] = drafts()
                 if res is None:
                     return self._budget_out("EVIDENCE")
                 notes.append(f"try {n + 1}: " + (res.note if res.ok else f"failed: {res.note}")[:200])
@@ -1605,9 +1628,13 @@ class Machine:
                     a = EDR.assess(rd, raw)
                 except Exception as e:  # noqa: BLE001 -- the task left a dossier the harness cannot read
                     a = dict(a, problems=[f"the dossier cannot be read: {type(e).__name__}: {e}"])
-        rec = EDR.finish(rd, a, sc, self.st.tries.get("evidence", 0), raw, notes)
+        self.st.tries.pop("evidence_feedback", None)
+        rec = EDR.finish(rd, a, sc, drafts(), raw, notes)
         if a["needed"]:
             try:
+                if getattr(self.backend, "candidates", None) is None and hasattr(self.backend, "pre_sign_problems"):
+                    # Codex r1 P2-12: a resumed process has no candidate rows from SPEC; the sheet would lose them
+                    self.backend.pre_sign_problems(rd, derived=bool(self.st.derived_inputs))
                 self._write_sheet(rd)        # the sheet records the dossier's sha256: written after the dossier
             except Exception as e:  # noqa: BLE001 -- SIGN refuses without a current sheet, and says so
                 self.log(f"[machine] the sign-off sheet could not be written: {type(e).__name__}: {e}")
@@ -2211,7 +2238,15 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
                   f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
     try:            # v2 autonomy 1B-ii: who drafted and signed the evidence dossier, and its declared gaps
         from toolkit.spec import evidence_draft as EDR
-        so = _signoff(run_dir) or {}
+        so = {}
+        for f in (SIGNOFF_FILE, "decision_brief.signoff.json"):     # Codex r1 P2-11: the record that binds the spec
+            try:
+                d_ = json.load(open(os.path.join(run_dir, f)))
+            except (OSError, ValueError):
+                continue
+            if isinstance(d_, dict) and (d_.get("signed_by") or d_.get("by")):
+                so = d_
+                break
         eb = EDR.report_block(run_dir, so.get("signed_by") or so.get("by"))
     except Exception as e:  # noqa: BLE001 -- fail closed: the report says the block could not be rendered
         eb = ["## Evidence dossier", "", f"Could not be rendered from the evidence record: {type(e).__name__}.", ""]
@@ -4415,8 +4450,65 @@ def _self_test_evidence(ok, td: str) -> None:
     m = Machine(d, T, RunState(question="q", state="EVIDENCE", signoff="owner"), backend=toolkit, log=lambda *a: None,
                 cross_engine_check=False)
     m.step()
-    ok(m.st.state == "ENGINE_CHOICE" and T.calls == [] and open(os.path.join(d, ED.DOSSIER_FILE), "rb").read() == before,
-       f"T_EVIDENCE_RESUME a spec already signed is left as signed ({m.st.state}, {T.calls})")
+    m.step()
+    ok(m.st.state == "ENGINE_CHOICE" and T.calls == [] and open(os.path.join(d, ED.DOSSIER_FILE), "rb").read() == before
+       and [h.get("to") for h in m.st.history] == ["SIGN", "ENGINE_CHOICE"],
+       f"T_EVIDENCE_RESUME a spec already signed is left as signed and SIGN checks it ({m.st.state}, {T.calls})")
+    # T_EVIDENCE_OWNER_MODE (Codex r1 P1-2): an owner-mode run whose spec the lead signed does not pass SIGN
+    d = os.path.join(td, "ev_leadsigned")
+    os.makedirs(d)
+    ED.toy_dossier_spec(d)
+    SO.write_sheet(d)
+    toolkit.sign(d, "lead")
+    m = Machine(d, StubTasks({}), RunState(question="q", state="EVIDENCE", signoff="owner"), backend=toolkit,
+                log=lambda *a: None, cross_engine_check=False)
+    until(m, n=4)
+    ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff",
+       f"T_EVIDENCE_OWNER_MODE a lead's signature does not satisfy --signoff owner ({m.st.state}, {m.st.paused})")
+    # T_STALE_NO_LEAD (Codex r1 P1-1): a signature made stale by a dossier edit is never replaced by the lead's
+    d = os.path.join(td, "ev_stale")
+    os.makedirs(d)
+    ED.toy_dossier_spec(d)
+    SO.write_sheet(d)
+    toolkit.sign(d, "owner")
+    rec0 = open(os.path.join(d, SIGNOFF_FILE), "rb").read()
+    open(os.path.join(d, ED.DOSSIER_FILE), "a").write("# edited after signing\n")
+    T = StubTasks({})
+    m = Machine(d, T, RunState(question="q", state="SIGN", signoff="lead"), backend=toolkit, log=lambda *a: None,
+                cross_engine_check=False)
+    until(m, n=6)
+    ok(m.st.paused == "awaiting_signoff" and "sign_spec" not in T.calls
+       and open(os.path.join(d, SIGNOFF_FILE), "rb").read() == rec0,
+       f"T_STALE_NO_LEAD the owner's stale record stays and the run waits for the owner ({m.st.state}, {T.calls})")
+    # T_LOST_RECORD (Codex r1 P1-3): a run whose history records a signature is not a draft when the record is lost
+    os.remove(os.path.join(d, SIGNOFF_FILE))
+    st = RunState(question="q", state="EVIDENCE", signoff="lead",
+                  history=[{"from": "SIGN", "to": "EVIDENCE", "why": "spec signed by the lead"}])
+    T = StubTasks({})
+    m = Machine(d, T, st, backend=toolkit, log=lambda *a: None, cross_engine_check=False)
+    until(m, n=6)
+    ok(m.st.paused == "awaiting_signoff" and T.calls == [],
+       f"T_LOST_RECORD a lost sign-off record waits for the owner; nothing is redrafted or re-signed ({T.calls})")
+    # T_LEGACY_SIGN (Codex r1 P2-6): an unsigned run saved at SIGN under the earlier order runs the evidence stage
+    m, T = setup("ev_legacy", "owner", {"evidence": fill})
+    m.st.state = "SIGN"
+    m.step()
+    ok(m.st.state == "EVIDENCE", f"T_LEGACY_SIGN an unsigned run at SIGN with no evidence record goes to EVIDENCE "
+                                 f"({m.st.state})")
+    # T_EVIDENCE_JOURNAL (Codex r1 P2-7): the drafts are counted from the journal, not a counter a crash can lose
+    m, T = setup("ev_journal", "lead", {})
+    m.step()                                    # SPEC -> EVIDENCE: the spec is drafted
+    m.st.journal.update({f"EVIDENCE#0:try{i}": {"status": "completed", "ok": True} for i in (1, 2, 3)})
+    m.step()
+    ok("draft_evidence" not in T.calls and (EDR.read_record(m.run_dir) or {}).get("tries") == 3,
+       f"T_EVIDENCE_JOURNAL three completed drafts in the journal: no fourth ({T.calls})")
+    # T_DELIVERABLE_DOSSIER (Codex r1 P1-5): the deliverable may not be the dossier or the sheet
+    raw = yaml.safe_load(open(os.path.join(d, AB.SPEC_FILE)))
+    for name in (ED.DOSSIER_FILE, SIGNOFF_SHEET):
+        raw["deliverable_file"] = {"path": name, "columns": {"unit": "id"}}
+        yaml.safe_dump(raw, open(os.path.join(d, AB.SPEC_FILE), "w"))
+        ok(any("owns" in p for p in deliverable_problems(d)),
+           f"T_DELIVERABLE_DOSSIER a deliverable named {name} is refused ({deliverable_problems(d)})")
 
 
 def main(argv=None) -> int:
