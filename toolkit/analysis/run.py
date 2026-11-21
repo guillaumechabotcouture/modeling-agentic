@@ -443,7 +443,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
     conf = (jc or {}).get("unmatched_decision", {}).get("conflicts") if jc is not None else None
-    if conf and conf.get("declared"):      # W0-F: each held-out target, why, its tests' verdicts; who decides
+    if conf is not None:      # W0-F: each held-out target, why, its tests' verdicts; who decides (empty: none)
         from toolkit.analysis import conflicts as CF
         crec = CF.record(conf, dts)
         arts["conflicts"] = S.write("conflicts", crec, CF.PRODUCER, [arts["joint_calibration"], arts["decision_tests"]])

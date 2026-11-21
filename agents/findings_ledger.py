@@ -54,6 +54,7 @@ OWNER_STATE = {
     "WRITE": "WRITE", "PRESENTATION": "PRESENTATION",
 }
 _SEV_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+CONFLICT_KIND = "evidence_conflict_declared"      # W0-F: toolkit/analysis/conflicts.py FINDING_KIND
 
 
 @dataclass
@@ -399,6 +400,12 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             old.resolution_type = "owner_decision"
         if old.first_seen_round is None:
             old.first_seen_round = new.first_seen_round
+        if new.kind == CONFLICT_KIND and old.status not in ("owner_accepted", "owner_declined"):
+            old.resolution_type, old.blocking = new.resolution_type, new.blocking     # W0-F: the current test decides
+            if new.status != old.status:
+                old.status = new.status
+                _event(old, round_n, new.status, new.source)
+            continue
         if new.status != old.status and not (old.status == "declared" and new.status == "open"):
             old.status = new.status
             _event(old, round_n, new.status, new.source)
@@ -423,7 +430,7 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         # a regressed or unmet row is keyed by its finding's id: a declaration of that finding does not declare it
         names = {f.id, f.kind, None if f.kind in _DW_ROWS[:2] else f.key, f"{f.kind}:{f.key}" if f.key else f.kind}
         hit = next((decl[n] for n in names if n and n in decl), None)
-        if hit is not None and f.status == "open":
+        if hit is not None and f.status == "open" and f.kind != CONFLICT_KIND:   # W0-F: only the owner closes one
             f.status = "declared"
             _event(f, round_n, "declared", "scope_declaration")
             if f.resolution_type == "fix":

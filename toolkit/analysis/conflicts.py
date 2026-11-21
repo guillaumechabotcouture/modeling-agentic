@@ -23,6 +23,10 @@ declared, its tests and their verdicts; a conflict whose test changes the plan, 
 The findings ledger carries each as a HIGH `evidence_conflict_declared` finding; the stage machine pauses once at
 OWNER_DECISION for every conflict that needs the owner, batched. The report lists every held-out target.
 
+Open (needs the owner's word, W0-F review r1): a declared miss is not refitted away. The calibration's region sample
+and best point are the ones the blocked fit produced (for an offset miss, its failed rows redrawn from the rows that
+met it), as for an owner-declared miss today; the automatic tests bound how far the miss can move the plan.
+
 Limits that stay hard (the run stops as today): a conflict on a never_declare target; more conflicts of a kind than
 its share; any other block (no accepted region, an emulator check, an offset block without its row breakdown).
 Nothing here names a disease.
@@ -69,6 +73,12 @@ def spec_problems(raw: dict) -> list:
     nd = c.get("never_declare", [])
     if not (isinstance(nd, list) and all(isinstance(x, str) and x.strip() for x in nd)):
         bad.append("conflicts.never_declare: a list of target, source or unit ids (text)")
+    an = raw.get("analysis") if isinstance(raw.get("analysis"), dict) else {}
+    taken = [t.get("id") for t in an.get("decision_tests") or [] if isinstance(t, dict)
+             and str(t.get("id")).startswith(TEST_PREFIX)]
+    if taken:
+        bad.append(f"analysis.decision_tests: ids {taken[:3]} start with {TEST_PREFIX!r}, which the conflict rule's "
+                   "automatic tests use")
     ts = c.get("test_scales", DEFAULTS["test_scales"])
     if not (isinstance(ts, list) and len(ts) == 2 and all(_num(x) and x > 0 and x != 1 for x in ts) and ts[0] < ts[1]):
         bad.append("conflicts.test_scales: [low, high], positive, increasing, neither 1")
@@ -96,6 +106,12 @@ def ensure_default(run_dir: str, rel: str = "decision_spec.yaml") -> bool:
         return False
     text = data.decode("utf-8").rstrip("\n") + "\n# owner default D5 (2026-11-21): declare, test and continue\n" \
         "conflicts:\n  policy: declare_and_test\n"
+    try:
+        ok_ = (yaml.safe_load(text) or {}).get("conflicts", {}).get("policy") == "declare_and_test"
+    except (yaml.YAMLError, AttributeError):
+        ok_ = False
+    if not ok_:             # a draft the appended block does not extend (flow style, an end marker): left as written
+        return False
     write_nofollow(run_dir, rel, text.encode("utf-8"), atomic=True)
     return True
 
@@ -106,14 +122,19 @@ def _identities(spec) -> dict:
     j = JC.declared(spec) or {}
     rows = list(spec.units())
     uid = spec.uid
-    out = {"group_target": {}, "offset": {}}
+    out = {"group_target": {}, "offset": {}, "unit_targets": [str(t["id"]) for t in j.get("targets") or []
+                                                               if isinstance(t, dict) and t.get("kind") == "unit"]}
     for t in j.get("targets") or []:
         if not isinstance(t, dict):
             continue
         if t.get("kind") == "group":
+            import csv
             col = (t.get("key") or {}).get("units")
+            with open(spec.resolve(t["csv"]), newline="", encoding="utf-8") as f:     # the groups it observes
+                obs = {str(r.get((t.get("key") or {}).get("csv"))) for r in csv.DictReader(f)
+                       if all(str(r.get(k)) == str(v) for k, v in (t.get("filter") or {}).items())}
             for r in rows:
-                if col and r.get(col) is not None:
+                if col and r.get(col) is not None and str(r[col]) in obs:
                     out["group_target"].setdefault(f"{t['id']}:{r[col]}", (t["id"], []))[1].append(str(r[uid]))
         if t.get("kind") == "unit" and t.get("bias_by"):
             src = str(t.get("bias_source", t.get("id")))
@@ -127,7 +148,9 @@ def _identities(spec) -> dict:
 
 
 def _slug(key: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_")[:40] or "x"
+    import hashlib            # stable across rebuilds (an owner's answer binds the claim, which names the tests)
+    return (re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_")[:32] or "x") + "_" + \
+        hashlib.sha256(key.encode()).hexdigest()[:6]
 
 
 def declare(spec, rep: dict, dec: dict) -> dict:
@@ -171,12 +194,25 @@ def declare(spec, rep: dict, dec: dict) -> dict:
                                               "failed_share": round(nf / n_rows, 4) if _num(n_rows) and n_rows else None,
                                               "component_blocks": [str(x) for x in c.get("blocks") or []]}})
     units = rep.get("units") or {}
-    for k in sorted((k for k, v in units.items() if isinstance(v, dict) and v.get("status") != "matched"), key=str):
+    signed_flag = u.get("mode") == "flag"       # the signed option already lets its unit misses proceed, flagged
+    for k in sorted((k for k, v in units.items() if isinstance(v, dict) and v.get("status") != "matched"
+                     and not signed_flag), key=str):
         found.append({"kind": "unit", "key": str(k), "target": str(k), "units": [str(k)],
                       "why": {"status": units[k].get("status"), "direction": units[k].get("direction"),
                               "implausibility": units[k].get("implausibility_verified",
                                                              units[k].get("best_implausibility"))}})
-    hard = [c["key"] for c in found if c["key"] in pol["never_declare"] or c["target"] in pol["never_declare"]]
+    unknown = [c["key"] for c in found if not c["target"] or not c["units"]]
+    if unknown:             # Codex r1 P1-2: only an identity the spec's targets generate, with its units, is declared
+        out["conflicts"]["refused"] = f"misses that are not a declarable target of this spec: {unknown[:5]}"
+        return out
+    nd = set(pol["never_declare"])
+
+    def protected(c):       # Codex r1 P1-3: the key, its target or source, and for a unit every unit target on it
+        names = {c["key"], c["target"]}
+        if c["kind"] == "unit":
+            names |= set(ids["unit_targets"]) | {f"{t}:{c['key']}" for t in ids["unit_targets"]}
+        return bool(names & nd)
+    hard = [c["key"] for c in found if protected(c)]
     if hard:
         out["conflicts"]["refused"] = f"never_declare targets cannot be declared: {hard[:5]}"
         return out
@@ -190,7 +226,7 @@ def declare(spec, rep: dict, dec: dict) -> dict:
             return out
     lo, hi = pol["test_scales"]
     for n, c in enumerate(found, 1):
-        base = f"{TEST_PREFIX}{n}_{_slug(c['key'])}"
+        base = f"{TEST_PREFIX}{_slug(c['key'])}"
         c.update(n=n, tests=[f"{base}_lo", f"{base}_hi"], scales=[lo, hi])
     raw2 = copy.deepcopy(spec.raw)
     j2 = raw2["calibration"]["joint"]
@@ -294,8 +330,11 @@ def report_lines(run_dir: str) -> list:
            "plan without it.", "", "| target | kind | units | tests | changes the plan |", "|---|---|---|---|---|"]
     for c in d["declared"]:
         vs = c.get("verdicts") or {}
-        out.append(f"| {c.get('key')} | {c.get('kind')} | {len(c.get('units') or [])} | "
-                   f"{', '.join(f'{k}: {v}' for k, v in vs.items())} | {'yes' if c.get('changes_plan') else 'no'} |")
+        esc = lambda x: str(x).replace("|", "\\|")      # noqa: E731
+        ch = "no" if not c.get("changes_plan") else ("unknown (a test did not run)" if "NOT_RUN" in vs.values()
+                                                     else "yes")
+        out.append(f"| {esc(c.get('key'))} | {c.get('kind')} | {len(c.get('units') or [])} | "
+                   f"{esc(', '.join(f'{k}: {v}' for k, v in vs.items()))} | {ch} |")
     return out + [""]
 
 
@@ -375,6 +414,28 @@ def _self_test() -> int:
                            "a breakdown that misses failed rows")):
             got = declare(s1, dict(rep_off, blocks=blks), JC.unmatched_decision(s1, dict(rep_off, blocks=blks)))
             ok(not got["proceed"] and got["conflicts"]["refused"], f"CF_HARD_LIMITS never declared: {why}")
+        # Codex r1: only identities the spec's targets generate; protected unit targets; groups the table observes
+        bm = dict(rep_vf, blocks=[{"code": "verification_failed", "detail": {"units": [], "targets": ["T2"]}}])
+        got = declare(s1, bm, JC.unmatched_decision(s1, bm))
+        ok(not got["proceed"] and "not a declarable target" in (got["conflicts"]["refused"] or ""),
+           f"CF_UNKNOWN_IDENTITY_REFUSED a failed target that is no group or offset identity is never declared "
+           f"({got['conflicts']['refused']})")
+        um = dict(rep_vf, blocks=[{"code": "unmatched_units", "detail": {"unmatched": ["5"], "conflicting": []}}],
+                  units=dict(units, **{"5": {"status": "unmatched"}}))
+        for nd in (["unit_t"], ["unit_t:5"], ["5"]):
+            sp_ = spec_with(never_declare=nd)
+            ok(not declare(sp_, um, JC.unmatched_decision(sp_, um))["proceed"],
+               f"CF_NEVER_DECLARE_UNIT a unit miss is protected by its unit target, target:unit or unit id ({nd})")
+        sp_ = spec_with()
+        ok(declare(sp_, um, JC.unmatched_decision(sp_, um))["proceed"], "CF_UNIT_MISS_DECLARED otherwise it is declared")
+        tab = open(os.path.join(d, "region_targets.csv")).read().splitlines()
+        open(os.path.join(d, "region_targets.csv"), "w").write("\n".join(tab[:2]) + "\n")      # one observed group
+        ok(list(_identities(spec_with()).get("group_target")) == ["region_t:" + tab[1].split(",")[0]],
+           "CF_SHARE_DENOMINATOR a group target's identities are only the groups its own table observes")
+        open(os.path.join(d, "region_targets.csv"), "w").write("\n".join(tab) + "\n")
+        ok(any("conflict_" in b for b in spec_problems(dict(raw, conflicts={"policy": "declare_and_test"}, analysis=dict(
+            raw["analysis"], decision_tests=[{"id": "conflict_x_lo"}])))),
+           "CF_RESERVED_IDS a declared decision test may not take an automatic test's id")
         rec = record(d2["conflicts"], [{"test_id": tt[0]["id"], "status": "run", "decision_changes": False},
                                        {"test_id": tt[1]["id"], "status": "run", "decision_changes": True}])
         rec2 = record(d2["conflicts"], [{"test_id": tt[0]["id"], "status": "run", "decision_changes": False}])
@@ -386,8 +447,18 @@ def _self_test() -> int:
             yaml.safe_dump({"data": r_}, open(os.path.join(d, ARTIFACT), "w"))
             fs, pr = findings(d)
             ok(pr == [] and [(f["status"], f["resolution_type"]) for f in fs] == [want]
-               and fs[0]["kind"] == FINDING_KIND and "S|r2" in "\n".join(report_lines(d)),
+               and fs[0]["kind"] == FINDING_KIND and "| S\\|r2 |" in "\n".join(report_lines(d)),
                f"CF_FINDING_AND_REPORT the finding is {want} and the report lists the held-out target")
+        sys.path.insert(0, os.path.join(ROOT, "agents"))
+        import findings_ledger as FLG
+        fid = f"{FINDING_KIND}:S|r2"
+        seen = []
+        for r_ in (rec3, rec, rec3):        # Codex r1 P1-5: the current test decides, until the owner answers
+            yaml.safe_dump({"data": r_}, open(os.path.join(d, ARTIFACT), "w"))
+            FLG.sync(d, None, 1)
+            seen.append(FLG.load(d)[fid].status)
+        ok(seen == ["declared", "open", "declared"], f"CF_LEDGER_FOLLOWS_TEST a rebuilt conflict whose test now changes "
+                                                     f"the plan is open again for the owner ({seen})")
         open(os.path.join(d, ARTIFACT), "w").write("data: [: bad")
         ok(findings(d)[1] and "Could not be read" in "\n".join(report_lines(d)),
            "CF_ARTIFACT_UNREADABLE_FAILS_CLOSED an unreadable conflicts record is a problem, and the report says so")
