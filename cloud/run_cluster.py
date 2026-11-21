@@ -4879,7 +4879,7 @@ def _self_test_sheet(ok) -> None:
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
     ok(fresh == [] and signed == [] and norun == [],
        f"RC80a a fresh sheet, a run past SIGN and a launch with no resumed run pass: {fresh} {signed} {norun}")
-    # RC80e (v2 autonomy 1B-ii): EVIDENCE now runs before SIGN, so a run there with no sign-off record is a draft;
+    # RC80f (v2 autonomy 1B-ii): EVIDENCE now runs before SIGN, so a run there with no sign-off record is a draft;
     # one with a record (signed under the earlier order) is checked as signed
     ev_draft = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("EVIDENCE"),
                                             f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
@@ -4887,7 +4887,7 @@ def _self_test_sheet(ok) -> None:
                                              f"{R}/decision_spec.yaml": b"spec: 2\n",
                                              f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
     ok(ev_draft == [] and ev_signed,
-       f"RC80e a run at EVIDENCE with no sign-off is a draft; one signed under the earlier order is checked "
+       f"RC80f a run at EVIDENCE with no sign-off is a draft; one signed under the earlier order is checked "
        f"({ev_draft}; {ev_signed})")
     ok(len(stale) == 1 and "spec" in stale[0] and "signoff.py sheet" in stale[0] and "--write" in stale[0]
        and len(stale_rec) == 1
