@@ -3651,6 +3651,10 @@ def _self_test() -> int:
         _self_test_w0a(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"FP_CLOSURE: {type(e).__name__}: {e}")
+    try:
+        _self_test_w0a2(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"FP_RESTAMP: {type(e).__name__}: {e}")
     # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
         os.makedirs(os.path.join(rd, "models"))
@@ -4088,6 +4092,95 @@ def _self_test_w0a(ok) -> None:
             s8 = go(extra={"engine": {"version": "3"}})
             ok(s8.get("computed") == 3, f"FP_OLD_ROWS_ENGINE (Codex r1 P1-9) under an engine identity, a pre-W0-A row "
                                         f"without that identity in its provenance is recomputed ({s8.get('computed')})")
+
+
+def _self_test_w0a2(ok) -> None:
+    """W0-A2: a batch stored under the whole-tree key is restamped only when its old key matches the code at its launch
+    tree and the code its rows depend on is the same there as here (key code left out); each decision is recorded."""
+    import shutil
+    import tempfile
+    from unittest import mock
+    g = globals()
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        repo, launch, rd = (os.path.join(td, x) for x in ("repo", "launch", "run"))
+        shutil.copytree(HERE, os.path.join(repo, "scripts"), ignore=shutil.ignore_patterns("__pycache__"))
+
+        def w(root, rel, txt):
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            open(os.path.join(root, rel), "w").write(txt)
+        for rel, txt in (("toolkit/__init__.py", ""), ("toolkit/eng/__init__.py", ""),
+                         ("toolkit/eng/m.py", "def g(p):\n    return 2 * p['x']\n"),
+                         ("job.py", "from toolkit.eng import m\n\n\ndef f(p):\n    return {'y': m.g(p)}\n")):
+            w(repo, rel, txt)
+        w(rd, "data/units.csv", "u\n1\n")
+        w(rd, "metadata.json", json.dumps({"commit": "0" * 40}))
+        out = os.path.join(rd, "analysis", "b.jsonl")
+        os.makedirs(os.path.dirname(out))
+        ins = [{"x": i} for i in range(3)]
+        with mock.patch.dict(g, {"REPO": repo}):
+            def go():
+                return run_map(rd, os.path.join(repo, "job.py::f"), ins, out, backend="local", max_workers=1,
+                               ledger=False)[1]
+
+            def store(old=None):
+                """The batch as a pre-W0-A run left it: its key is the old key of the launch tree's code."""
+                go()
+                summ = {k: v for k, v in json.load(open(out + ".summary.json")).items()
+                        if k not in ("key_parts", "closure", "restamp")}
+                with mock.patch.dict(g, {"REPO": launch}):
+                    summ["code_fp"] = old or _legacy_fingerprint(rd, os.path.join(launch, "job.py::f"),
+                                                                 exclude=_out_files(out))
+                open(out + ".summary.json", "w").write(json.dumps(summ))
+
+            def decide(**kw):
+                r = restamp(rd, **kw)
+                return (r.get("batches") or [{}])[0], json.load(open(out + ".summary.json")).get("restamp") or {}
+            go()
+            shutil.copytree(repo, launch)
+            w(repo, "toolkit/eng/x.py", "Z = 1\n")             # here, a file outside the closure
+            store()
+            b0, rec0 = decide(launch_tree=launch, write=False)
+            ok(b0.get("decision") == "accepted" and not rec0,
+               f"FP_RESTAMP_DRY_RUN a dry run decides and writes nothing: {b0} {rec0}")
+            b1, rec1 = decide(launch_tree=launch)
+            s1 = go()
+            ok(rec1.get("decision") == "accepted" and s1.get("reused") == 3 and s1.get("computed") == 0,
+               f"FP_RESTAMP_ACCEPTED same code at the launch tree: restamped, recorded and reused "
+               f"({s1.get('computed')} computed, {rec1})")
+            lc = os.path.join(launch, "scripts", "compute.py")
+            src = open(lc).read()
+            open(lc, "w").write(src.replace("FP_KEY_VERSION = 2", "FP_KEY_VERSION = 1", 1))
+            store()
+            b2, _ = decide(launch_tree=launch)
+            open(lc, "w").write(src + "\nX_RESTAMP_TEST = 1\n")
+            store()
+            b3, _ = decide(launch_tree=launch)
+            ok(b2.get("decision") == "accepted" and b3.get("decision") == "refused"
+               and "scripts/compute.py" in b3.get("reason", ""),
+               f"FP_RESTAMP_KEY_CODE key code may differ at the launch tree, other compute.py code may not: {b2} {b3}")
+            open(lc, "w").write(src)
+            store()
+            w(repo, "toolkit/eng/m.py", "def g(p):\n    return 3 * p['x']\n")
+            b4, rec4 = decide(launch_tree=launch)
+            s4 = go()
+            ok(b4.get("decision") == "refused" and "toolkit/eng/m.py" in b4.get("reason", "")
+               and rec4.get("decision") == "refused" and s4.get("computed") == 3,
+               f"FP_RESTAMP_CLOSURE_DIFFERS a closure file changed since launch: refused with the reason, recomputed "
+               f"({b4}, {s4.get('computed')} computed)")
+            w(repo, "toolkit/eng/m.py", "def g(p):\n    return 2 * p['x']\n")
+            store(old="0" * 20)
+            b5, _ = decide(launch_tree=launch)
+            ok(b5.get("decision") == "refused" and "old key" in b5.get("reason", ""),
+               f"FP_RESTAMP_OLD_KEY the stored old key does not match the launch tree's code: refused ({b5})")
+            store()
+            b6, rec6 = decide()
+            ok(b6.get("decision") == "refused" and "not provable" in b6.get("reason", "")
+               and rec6.get("decision") == "refused",
+               f"FP_RESTAMP_NO_LAUNCH_CODE a launch commit not in the repo and no tree given: refused ({b6})")
+    forms = {k: _def_sha(os.path.join(REPO, k.partition("::")[0]), k.partition("::")[2]) for k in FP_RESTAMP_FORMS}
+    ok(all(forms[k] == v[1] for k, v in FP_RESTAMP_FORMS.items()),
+       f"FP_RESTAMP_FORMS each form recorded for this tree is this tree's source (update it with the code): {forms}")
 
 
 def _self_test_fp_dispatch(ok) -> None:
