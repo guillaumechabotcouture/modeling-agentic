@@ -151,6 +151,9 @@ def _dynamic(node, binds=None) -> int | None:
         if isinstance(n, ast.Attribute) and n.attr == "__dict__" and isinstance(n.value, ast.Name) \
                 and n.value.id in binds:
             return n.lineno                                     # an imported name's namespace, read by key
+        if isinstance(n, ast.Attribute) and n.attr == "modules" and isinstance(n.value, ast.Name) \
+                and n.value.id == "sys":
+            return n.lineno                                     # every loaded module, read by key (Codex r5)
         if id(n) in literal:
             continue
         # any reference, called or not (`load = importlib.import_module`, Codex r2), or an alias bound to one

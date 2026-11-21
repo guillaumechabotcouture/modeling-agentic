@@ -2542,16 +2542,21 @@ def _run_code_digest(run_dir: str, confined: bool = False) -> str:
         found += [(os.path.normpath(os.path.join(rel_dp, f)), "L" if os.path.islink(os.path.join(dp, f)) else "F")
                   for f in fns if f.endswith(".py")]
     for real, rel in sorted(outside.items()):
-        found += [(os.path.join(rel, os.path.relpath(os.path.join(dp, f), real)), "X") for dp, ds, fs in os.walk(real)
-                  if "__pycache__" not in dp.split(os.sep) for f in fs if f.endswith(".py")]
+        anc = {real: {real}}
+        for dp, ds, fs in os.walk(real, followlinks=True):           # nested links too, only a loop stops it
+            ds[:] = sorted(x for x in ds if x != "__pycache__" and os.path.realpath(os.path.join(dp, x)) not in anc[dp])
+            for x in ds:
+                anc[os.path.join(dp, x)] = anc[dp] | {os.path.realpath(os.path.join(dp, x))}
+            found += [(os.path.join(rel, os.path.relpath(os.path.join(dp, f), real)), "X") for f in fs
+                      if f.endswith(".py")]
     for rel, kind in sorted(set(found)):
         p = os.path.join(run_dir, rel)
         if confined:
             _hash_confined(h, run_dir, rel, mtime=False)
             continue
-        h.update(b"\0" + kind.encode() + rel.encode() + b"\0")
+        h.update(b"\0" + kind.encode() + os.fsencode(rel) + b"\0")
         if kind == "L":
-            h.update(os.readlink(p).encode(errors="surrogateescape"))
+            h.update(os.fsencode(os.readlink(p)) + (b"\0file\0" if os.path.isfile(p) else b"\0dangling\0"))
             if not os.path.isfile(p):
                 continue
         if os.path.isfile(p):
@@ -2564,17 +2569,19 @@ def _run_code_digest(run_dir: str, confined: bool = False) -> str:
 def _repo_code_digest() -> str:
     """Under an unresolved key: every Python file of the repo outside scripts/ and toolkit/ (those are `tree`), as the
     repo root is on sys.path (Codex r4). Hidden directories, __pycache__ and runs/ are left out."""
-    h, found = hashlib.sha256(), []
-    for dp, dirs, fns in os.walk(REPO):
+    h, found, anc = hashlib.sha256(), [], {REPO: {os.path.realpath(REPO)}}
+    for dp, dirs, fns in os.walk(REPO, followlinks=True):           # linked directories too (Codex r5)
         rel_dp = os.path.relpath(dp, REPO)
         dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != "__pycache__" and not (
-            rel_dp == "." and d in REPO_CODE_DIRS + ("runs",)))
+            rel_dp == "." and d in REPO_CODE_DIRS + ("runs",)) and os.path.realpath(os.path.join(dp, d)) not in anc[dp])
+        for d in dirs:
+            anc[os.path.join(dp, d)] = anc[dp] | {os.path.realpath(os.path.join(dp, d))}
         found += [os.path.normpath(os.path.join(rel_dp, f)) for f in fns if f.endswith(".py")]
     for rel in sorted(found):
         try:
-            h.update(rel.encode() + b"\0" + _file_digest(os.path.join(REPO, rel)).encode())
-        except OSError:
-            h.update(rel.encode() + b"\0missing")
+            h.update(os.fsencode(rel) + b"\0" + _file_digest(os.path.join(REPO, rel)).encode())
+        except (OSError, ValueError):
+            h.update(os.fsencode(rel) + b"\0missing")
     return h.hexdigest()
 
 
@@ -2814,6 +2821,9 @@ def _carries(result, ident) -> bool:
     found = []
 
     def walk(x, depth=0):
+        if isinstance(x, (dict, list)) and depth >= 4:
+            found.append(False)                          # deeper than the check reads: not proven (Codex r5)
+            return
         if isinstance(x, dict) and depth < 4:
             if isinstance(x.get("provenance"), dict):
                 found.append(x["provenance"].get("engine") == ident)
