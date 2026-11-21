@@ -3,7 +3,9 @@
 
 The definitions are the harness benchmark protocol's (section 2): a chain is a first run directory plus every
 relaunch made from it; "completes" is decided by the chain's last directory; the nine intervention types I1-I9;
-owner-wait split into owner response and operator latency, censored at the cut-off. Read-only: it reads
+owner-wait split into owner response and operator latency, censored at the cut-off. Everything is counted on the
+chain as it stood at the cut-off: by default the strict arm's (24 h after the first launch, or the first time every
+chain is FINAL or paused); pass --cutoff for an assisted arm (a harvest at run exit passes "now"). Read-only: it reads
 metadata.json, run_state.json, the sign-off records, findings.jsonl and whether report.md / report_withheld.md
 exist, through lib.safe_io (no link followed). It refuses any path under `_truth` or `evals_private`.
 
@@ -18,7 +20,7 @@ any wait that needs it.
     python3 scripts/harness_metrics.py <run_dir>... [--chain a,b ...] [--cutoff ISO] [--ledger L] [--json out.json]
     python3 scripts/harness_metrics.py --self-test
 
-Importable (PR 4B run_harvest / feedback_store): `load_run`, `chains`, `summarise`, `rows`, `wave_summary`.
+Importable (PR 4B run_harvest / feedback_store): `load_run`, `as_of`, `chains`, `summarise`, `rows`, `wave_summary`.
 """
 from __future__ import annotations
 
@@ -146,8 +148,9 @@ def _invocations(run) -> tuple[list, bool]:
 
 
 # ------------------------------------------------------------------ completion
-def completion(run, cutoff=None) -> dict:
-    """The protocol's class for one (last) run directory: completes / not_accepted / not_completed."""
+def completion(run) -> dict:
+    """The protocol's class for one (last) run directory, as of the cut-off (as_of): completes / not_accepted /
+    not_completed."""
     def no(status, note):
         return {"status": F(status, REC, note), "completes": F(False, REC), "class": "not_completed"}
     if run["errors"]:
@@ -155,55 +158,47 @@ def completion(run, cutoff=None) -> dict:
     st, meta = run["st"], run["meta"]
     status = st.get("status") or (f"paused:{st['paused']}" if st.get("paused") else None)
     if not status:
-        return no("no_status", "run_state.json records no terminal status or pause")
+        return no("no_status", "no terminal status or pause recorded by the cut-off")
     if st.get("status") and meta.get("status") != st["status"]:
         return no("status_mismatch", f"run_state.json {st['status']}, metadata.json {meta.get('status')}")
-    fin = utc(meta.get("finished"))
-    late = cutoff is not None and fin is not None and fin > cutoff
-    ok = status in COMPLETES and run["report"] and not run["withheld"] and not late
-    cls = "completes" if ok else ("not_accepted" if status in NOT_ACCEPTED and not late else "not_completed")
-    why = (None if ok or status not in COMPLETES and not late else "finished after the cut-off" if late
-           else "report withheld" if run["withheld"] else "no regular report.md")
+    ok = status in COMPLETES and run["report"] and not run["withheld"]
+    cls = "completes" if ok else ("not_accepted" if status in NOT_ACCEPTED else "not_completed")
+    why = None if ok or status not in COMPLETES else "report withheld" if run["withheld"] else "no regular report.md"
     return {"status": F(status, REC), "completes": F(ok, REC, why), "class": cls}
 
 
 # ------------------------------------------------------------------ pauses
 def _sign_journal_done(st, t0, t1):
     """The latest completed lead sign_spec journal time in [t0, t1]: the lead SIGN paused only after it."""
-    best = None
-    for k, j in _d(st.get("journal")).items():
-        if "SIGN#" in k and k.endswith(":sign_spec"):
-            t = utc(_d(j).get("completed"))
-            if t and t0 and t >= t0 and (t1 is None or t <= t1) and (best is None or t > best):
-                best = t
-    return best
+    ts = [utc(_d(j).get("completed")) for k, j in _d(st.get("journal")).items()
+          if "SIGN#" in k and k.endswith(":sign_spec")]
+    ts = [t for t in ts if t and t0 and t >= t0 and (t1 is None or t <= t1)]
+    return max(ts) if ts else None
 
 
 def pauses(run) -> list[dict]:
-    """Every pause of one run. Explicit `{"paused": reason}` history entries are the record. Without one, a pause is
-    inferred from a transition into SIGN or OWNER_DECISION (or SPEC, once a signed spec's amendment was requested)
-    followed by a resume (a later invocation) at or before the transition out; each further resume in that visit is
-    one more pause. A pause still in force (run_state.paused) has resume None. Times are UTC or None."""
+    """Every pause of one run. Explicit `{"paused": reason}` history entries are the record; each is ended by the
+    first later resume (an invocation after the first) not already ending another. Without one, a pause is inferred
+    from a transition into SIGN or OWNER_DECISION (or into SPEC after the spec was signed: the amendment pause)
+    followed by a resume at or before the transition out; each further resume in that visit is one more pause. A
+    pause still in force (run_state.paused) has resume None. Times are UTC or None."""
     st = _d(run.get("st"))
     hist = [h for h in _l(st.get("history")) if isinstance(h, dict)]
     resumes = sorted(t for t in _invocations(run)[0][1:] if t)
     out, used = [], set()
-    for h in hist:
-        if h.get("paused"):
-            t = utc(h.get("at"))
-            nxt = next((r for r in resumes if t and r >= t), None)
-            used.add(nxt)
-            out.append({"reason": h["paused"], "state": h.get("state"), "at": t, "resume": nxt, "from": REC})
-    states = dict(PAUSE_STATES)
-    if not _d(st.get("tries")).get("spec_amendment"):
-        states.pop("SPEC")
+    for h in sorted((h for h in hist if h.get("paused")), key=lambda h: utc(h.get("at")) or datetime.max.replace(
+            tzinfo=timezone.utc)):
+        t = utc(h.get("at"))
+        nxt = next((r for r in resumes if t and r >= t and r not in used), None)
+        used.add(nxt)
+        out.append({"reason": h["paused"], "state": h.get("state"), "at": t, "resume": nxt, "from": REC})
+    signed = next((utc(h.get("at")) for h in hist if h.get("from") == "SIGN" and h.get("to") == "EVIDENCE"), None)
     for i, h in enumerate(hist):
-        to = h.get("to")
-        t_in = utc(h.get("at"))
-        if to not in states or t_in is None:
+        to, t_in = h.get("to"), utc(h.get("at"))
+        if to not in PAUSE_STATES or t_in is None or (to == "SPEC" and not (signed and t_in >= signed)):
             continue
         t_out = next((utc(x.get("at")) for x in hist[i + 1:] if x.get("from") == to), None)
-        if any(p["reason"] == states[to] and p["at"] and p["at"] >= t_in and (t_out is None or p["at"] <= t_out)
+        if any(p["reason"] == PAUSE_STATES[to] and p["at"] and p["at"] >= t_in and (t_out is None or p["at"] <= t_out)
                for p in out if p["from"] == REC):
             continue                                       # the visit's pauses are recorded
         start = t_in
@@ -212,7 +207,7 @@ def pauses(run) -> list[dict]:
                 start = max(start, r)                      # the end of a recorded pause: the next one starts after
             elif r >= t_in and (t_out is None or r <= t_out):
                 j = _sign_journal_done(st, start, r) if to == "SIGN" else None
-                out.append({"reason": states[to], "state": to, "at": max(start, j) if j else start,
+                out.append({"reason": PAUSE_STATES[to], "state": to, "at": max(start, j) if j else start,
                             "resume": r, "from": INF})
                 used.add(r)
                 start = r
@@ -230,11 +225,9 @@ def _answer(run, p, end):
     """When the owner answered pause p (UTC): the owner's spec sign-off or geometry approval for a SIGN pause, the
     owner's scope answers (else the request's answered_at) for a scope pause; None when no record says."""
     t0 = p["at"]
-    if t0 is None:
-        return None
 
     def inside(t):
-        return t and t >= t0 and (end is None or t <= end)
+        return t and t0 and t >= t0 and (end is None or t <= end)
     ts = []
     if p["reason"] == "awaiting_signoff":
         so = _d(run.get("signoff"))
@@ -262,17 +255,60 @@ def _ends(run_list):
     return out
 
 
+def _finished(run):
+    """When the run reached FINAL: metadata.finished, else its history's transition into FINAL."""
+    hist = _l(_d(run.get("st")).get("history"))
+    return utc(_d(run.get("meta")).get("finished")) or next(
+        (utc(h.get("at")) for h in reversed(hist) if _d(h).get("to") == "FINAL"), None)
+
+
+def as_of(run_list, cut):
+    """The chain as it stood at `cut`: runs launched later, and history entries, invocations and owner records
+    dated later, are dropped; a run not FINAL by then has no status; a pause in force then is run_state.paused.
+    Every count and wait is computed on this view, so nothing after the cut-off counts."""
+    if cut is None:
+        return run_list
+    out = []
+    for k, r in enumerate(run_list):
+        if k and started(r) and started(r) > cut:
+            break
+        st, meta = dict(r["st"]), dict(r["meta"])
+        off = meta.get("utc_offset_s")
+        keep = (lambda t: t is None or t <= cut)
+        st["history"] = [h for h in _l(st.get("history")) if keep(utc(_d(h).get("at")))]
+        meta["invocations"] = [i for i in _l(meta.get("invocations")) if keep(utc(_d(i).get("at"), off))]
+        fin, live = _finished(r), [x for x in _ends(run_list[k:k + 2]) if x[0] is r]
+        last = next((h.get("to") for h in reversed(st["history"]) if h.get("to")), None)
+        pend = next((p for p in pauses(r) if p["resume"] is None), None)
+        if fin and fin > cut:                              # still working at the cut-off
+            st.update(status=None, paused=None, state=last)
+            meta["status"] = None
+        elif not fin and pend and pend["at"] and pend["at"] > cut:
+            st.update(paused=None, state=last)            # its last pause came after the cut-off
+        for _, p, e, _ in live:
+            if (p["at"] is None or p["at"] <= cut) and (e is None or e > cut):     # no time: kept (fail closed)
+                st.update(paused=p["reason"], status=None, state=p["state"] or st.get("state"))
+        so = _d(r.get("signoff"))
+        so = so if keep(utc(so.get("signed_at") or so.get("at"))) else {}
+        sc = {"answers": {f: a for f, a in _d(_d(r.get("scope")).get("answers")).items()
+                          if keep(utc(_d(a).get("at")))}}
+        geo = {"approvals": {g: a for g, a in _d(_d(r.get("geometry")).get("approvals")).items()
+                             if keep(utc(_d(a).get("at")))}}
+        req = _d(r.get("scope_req"))
+        req = req if keep(utc(req.get("answered_at"))) else {}
+        out.append(dict(r, st=st, meta=meta, signoff=so, scope=sc, geometry=geo, scope_req=req))
+    return out
+
+
 def owner_wait(run_list, cutoff) -> dict:
-    """Owner-wait over a chain (ordered run dicts): Σ(resume − pause), split into owner response (answer − pause)
-    and operator latency (resume − answer), each pause censored at `cutoff`. For a budget pause the resume (with
-    the higher cap) is the owner's answer: all of its wait is owner response."""
+    """Owner-wait over a chain (ordered run dicts, as_of the cut-off): Σ(resume − pause), split into owner response
+    (answer − pause) and operator latency (resume − answer), each pause censored at `cutoff`. For a budget pause the
+    resume (with the higher cap) is the owner's answer: all of its wait is owner response."""
     items, computable = [], all(_invocations(r)[1] for r in run_list)
     for run, p, end, relaunch in _ends(run_list):
         if p["at"] is None or (relaunch and end is None):
             computable = False
             continue
-        if p["at"] > cutoff:
-            continue                                       # after the cut-off: outside this arm
         ans = _answer(run, p, end)
         censored = end is None or end > cutoff
         e = min(end, cutoff) if end else cutoff
@@ -301,22 +337,24 @@ def owner_wait(run_list, cutoff) -> dict:
 
 
 # ------------------------------------------------------------------ interventions
-def _owner_signed(run) -> int:
-    hist = _l(_d(run.get("st")).get("history"))
-    n = sum(1 for h in hist if _d(h).get("why") == SIGNED_BY_OWNER)
+def _owner_decisions(run) -> tuple[int, int, int, int]:
+    """(I2 spec signatures, I3 geometry approvals, I4 scope answers, answered items) by the owner in one run."""
+    hist = [h for h in _l(_d(run.get("st")).get("history")) if isinstance(h, dict)]
     so = _d(run.get("signoff"))
-    return n or int((so.get("signed_by") or so.get("by")) == "owner")
+    i2 = sum(1 for h in hist if h.get("why") == SIGNED_BY_OWNER) or int((so.get("signed_by") or so.get("by")) == "owner")
+    i3 = sum(1 for a in _d(_d(run.get("geometry")).get("approvals")).values() if _d(a).get("approved_by") == "owner")
+    ans = [_d(a) for a in _d(_d(run.get("scope")).get("answers")).values() if _d(a).get("by") == "owner"]
+    i4 = max(sum(1 for h in hist if h.get("why") == SCOPE_ANSWERED), int(bool(ans)))
+    return i2, i3, i4, len(ans)
 
 
-def interventions(run_list, cutoff=None, ledger=None, linked=False) -> dict:
-    """I1-I9 for a chain, counting what happened by `cutoff`. `linked`: every relaunch link is a parent_run record
-    (else it came from the operator's --chain). A pause still in force is not an intervention (nobody acted on it):
-    it is `pending_pauses`, and its wait is censored."""
-    def by_cut(t):
-        return cutoff is None or (t is not None and t <= cutoff)
+def interventions(run_list, ledger=None, linked=False) -> dict:
+    """I1-I9 for a chain (as_of the cut-off). `linked`: every relaunch link is a parent_run record (else it came
+    from the operator's --chain). A pause still in force is not an intervention (nobody acted on it): it is
+    `pending_pauses`, and its wait is censored."""
     hist = [h for r in run_list for h in _l(_d(r.get("st")).get("history")) if isinstance(h, dict)]
     ends = _ends(run_list)
-    left = [p for _, p, e, _ in ends if e is not None and by_cut(e)]
+    left = [p for _, p, e, _ in ends if e is not None]
     if not all(_invocations(r)[1] for r in run_list):
         i1 = F(None, NA, "a resume time is naive with no utc_offset_s")
     else:
@@ -324,22 +362,16 @@ def interventions(run_list, cutoff=None, ledger=None, linked=False) -> dict:
     if any(not isinstance(_d(r.get("meta")).get("invocations"), list) for r in run_list):
         i5 = F(None, NA, "a run records no invocations")
     else:
-        ts = [t for r in run_list for t in _invocations(r)[0][1:]]
-        i5 = F(sum(1 for t in ts if t is None or by_cut(t)), REC)
-    kids = [started(r) for r in run_list[1:]]
-    i6 = F(sum(1 for t in kids if t is None or by_cut(t)), REC if linked or len(run_list) == 1 else INF,
-           None if linked or len(run_list) == 1 else "chain from --chain")
-    signs = sum(_owner_signed(r) for r in run_list)
-    i3 = sum(1 for r in run_list for a in _d(_d(r.get("geometry")).get("approvals")).values()
-             if _d(a).get("approved_by") == "owner")
-    owner_items = [sum(1 for a in _d(_d(r.get("scope")).get("answers")).values() if _d(a).get("by") == "owner")
-                   for r in run_list]
-    i4 = sum(max(sum(1 for h in _l(_d(r.get("st")).get("history")) if _d(h).get("why") == SCOPE_ANSWERED),
-                 int(n > 0)) for r, n in zip(run_list, owner_items))
+        i5 = F(sum(len(r["meta"]["invocations"]) - 1 for r in run_list), REC)
+    if any(started(r) is None for r in run_list[1:]):
+        i6 = F(None, NA, "a relaunch has no computable start time")
+    else:
+        i6 = F(len(run_list) - 1, REC if linked or len(run_list) == 1 else INF,
+               None if linked or len(run_list) == 1 else "chain from --chain")
+    dec = [sum(x) for x in zip(*[_owner_decisions(r) for r in run_list])]
     raises = sum(1 for h in hist if "budget_raised" in h)
-    hashed = all(os.path.lexists(os.path.join(r["dir"], "run_files.sha256.json")) for r in run_list)
-    if hashed:
-        i8 = F(len({p for h in hist for p in _l(h.get("hand_edits"))}), REC)
+    if all(os.path.lexists(os.path.join(r["dir"], "run_files.sha256.json")) for r in run_list):
+        i8 = F(sum(len(set(_l(h.get("hand_edits")))) for h in hist), REC)
     else:
         spec = sum(1 for r in run_list if any(_d(f).get("kind") == "spec_changed_after_signoff"
                                               for f in _l(r.get("findings"))))
@@ -349,13 +381,13 @@ def interventions(run_list, cutoff=None, ledger=None, linked=False) -> dict:
     i9 = (F(sum(int(x.get("i9", 0)) for x in led), REC, "operator ledger") if ledger and any(led)
           else F(None, NA, "outside the run directory: the operator ledger"))
     head = [x["value"] for x in (i1, i5, i6, i8)]
-    return {"I1_pauses": i1, "I2_spec_signatures": F(signs, REC), "I3_geometry_approvals": F(i3, REC),
-            "I4_scope_answers": F(i4, REC, f"{sum(owner_items)} item(s) answered"), "I5_resumes": i5,
+    return {"I1_pauses": i1, "I2_spec_signatures": F(dec[0], REC), "I3_geometry_approvals": F(dec[1], REC),
+            "I4_scope_answers": F(dec[2], REC, f"{dec[3]} item(s) answered"), "I5_resumes": i5,
             "I6_relaunches": i6, "I7_budget_raises": F(raises, REC), "I8_hand_edits": i8,
             "I9_operator_actions": i9, "pending_pauses": sum(1 for _, _, e, _ in ends if e is None),
             "headline": F(None if None in head else sum(head), NA if None in head else
                           (INF if INF in (i1["from"], i6["from"], i8["from"]) else REC)),
-            "owner_decisions": F(signs + i3 + i4 + raises, REC)}
+            "owner_decisions": F(dec[0] + dec[1] + dec[2] + raises, REC)}
 
 
 # ------------------------------------------------------------------ chains and rows
@@ -364,9 +396,10 @@ def chains(dirs, explicit=None) -> list[list[str]]:
     holds only when the parent's name is unique among the dirs given and, when recorded, its run_state.json sha256
     matches; a parent with several children ends its chain there (each child starts its own). Every dir given is in
     exactly one chain."""
-    explicit = [list(c) for c in explicit or []]
-    seen = {os.path.normpath(d) for c in explicit for d in c}
-    rest = []
+    seen, ex, rest = set(), [], []
+    for c in explicit or []:
+        c = [d for d in c if os.path.normpath(d) not in seen and not seen.add(os.path.normpath(d))]
+        ex += [c] if c else []
     for d in dirs:
         if os.path.normpath(d) not in seen:
             seen.add(os.path.normpath(d))
@@ -396,7 +429,7 @@ def chains(dirs, explicit=None) -> list[list[str]]:
         out.append(c)
         placed.update(c)
     out += [[d] for d in rest if d not in placed]          # a parent cycle: each dir alone, never dropped
-    return explicit + out
+    return ex + out
 
 
 def question_key(question) -> str | None:
@@ -414,47 +447,40 @@ def _cut(cutoff):
     return cutoff if isinstance(cutoff, datetime) else utc(cutoff) if cutoff else None
 
 
-def settled(chain_dirs):
-    """(first launch, when the chain's last run reached FINAL or its pause) in UTC; either may be None."""
-    first, last = load_run(chain_dirs[0]), load_run(chain_dirs[-1])
-    st = _d(last.get("st"))
-    if st.get("state") == "FINAL":
-        end = utc(_d(last.get("meta")).get("finished"))
-    elif st.get("paused"):
-        end = next((p["at"] for p in pauses(last) if p["resume"] is None), None)
-    else:
-        end = None
-    return started(first), end
-
-
 def wave_cutoff(chain_list):
-    """The protocol's strict-arm cut-off: 24 h after the first launch, or when every chain is FINAL or paused,
-    whichever comes first. None when no launch time is computable."""
-    s = [settled(c) for c in chain_list]
-    t0 = [a for a, _ in s if a]
+    """The protocol's strict-arm cut-off: 24 h after the first launch, or the first time every chain is FINAL or
+    paused, whichever comes first. An unreadable chain never settles. None when no launch time is computable."""
+    loaded = [[load_run(d) for d in c] for c in chain_list]
+    t0 = [started(c[0]) for c in loaded if not c[0]["errors"] and started(c[0])]
     if not t0:
         return None
-    cut = min(t0) + timedelta(hours=CENSOR_H)
-    ends = [b for _, b in s]
-    return min(cut, max(ends)) if ends and all(ends) else cut
+    cap = min(t0) + timedelta(hours=CENSOR_H)
+    if any(r["errors"] for c in loaded for r in c):
+        return cap
+    cands = sorted({t for c in loaded for t in [_finished(r) for r in c] + [p["at"] for _, p, _, _ in _ends(c)]
+                    if t and t <= cap})
+    for t in cands:
+        if all((lambda v: v[-1]["st"].get("status") or v[-1]["st"].get("paused"))(as_of(c, t)) for c in loaded):
+            return t
+    return cap
 
 
 def summarise(chain_dirs, cutoff=None, ledger=None, linked=None) -> dict:
-    """One row for one chain (ordered run dirs, first launch first). `cutoff` (ISO or datetime) defaults to the
-    chain's own strict-arm cut-off (wave_cutoff of this chain alone)."""
-    runs = [load_run(d) for d in chain_dirs]
-    last, first = runs[-1], runs[0]
-    if linked is None:
-        linked = all(_d(_d(b.get("meta")).get("parent_run")).get("run_dir") == a["name"]
-                     for a, b in zip(runs, runs[1:]))
-    if any(r["errors"] for r in runs):
-        return {"chain": [r["name"] for r in runs], "label": last["name"], "class": "not_completed",
-                "status": F("unreadable", REC, "; ".join(f"{r['name']}: {e}" for r in runs for e in r["errors"])),
+    """One row for one chain (ordered run dirs, first launch first), as it stood at `cutoff` (ISO or datetime;
+    default: wave_cutoff of this chain alone)."""
+    full = [load_run(d) for d in chain_dirs]
+    if any(r["errors"] for r in full):
+        return {"chain": [r["name"] for r in full], "label": full[-1]["name"], "class": "not_completed",
+                "status": F("unreadable", REC, "; ".join(f"{r['name']}: {e}" for r in full for e in r["errors"])),
                 "completes": F(False, REC)}
+    if linked is None:
+        linked = all(_d(b["meta"].get("parent_run")).get("run_dir") == a["name"] for a, b in zip(full, full[1:]))
     now = datetime.now(timezone.utc)
     cut = _cut(cutoff) if cutoff else wave_cutoff([chain_dirs])
     cut = min(cut, now) if cut else None
-    row = {"chain": [r["name"] for r in runs], "label": last["name"], **completion(last, cut)}
+    runs = as_of(full, cut)
+    last, first = runs[-1], runs[0]
+    row = {"chain": [r["name"] for r in full], "label": full[-1]["name"], **completion(last)}
     t0 = started(first)
     meta, st = last["meta"], last["st"]
     commits = {c for r in runs for c in [r["meta"].get("commit")] +
@@ -464,34 +490,31 @@ def summarise(chain_dirs, cutoff=None, ledger=None, linked=None) -> dict:
                             "commits differ across invocations" if len(commits) > 1 else None),
                 "stop_state": F(st.get("state"), REC), "rounds": F(st.get("round"), REC),
                 "model_usd": F(round(sum(float(r["meta"].get("model_spend_usd", r["st"].get("spent_usd")) or 0)
-                                         for r in runs), 4), REC),
+                                         for r in full), 4), REC),
                 "models": F(meta.get("models"), REC if meta.get("models") else NA),
                 "sdk_version": F(meta.get("sdk_version"), REC if meta.get("sdk_version") else NA),
-                "interventions": interventions(runs, cut, ledger, linked), "cutoff": _iso(cut)})
+                "interventions": interventions(runs, ledger, linked), "cutoff": _iso(cut)})
     if cut is None:
         row["owner_wait"] = {"total_h": F(None, NA, "no computable launch time or cut-off"), "censored": False,
                              "pauses": []}
     else:
         row["owner_wait"] = owner_wait(runs, cut)
-    end = utc(meta.get("finished")) or max([utc(h.get("at")) for h in _l(st.get("history")) if isinstance(h, dict)
-                                            and utc(h.get("at"))] or [None], key=lambda t: t or now)
-    if st.get("paused"):
-        end = cut                     # a pause in force at the cut-off: the run's time runs to the cut-off
-    w = row["owner_wait"]["total_h"]["value"]
+    end = _finished(last) if st.get("status") else cut           # paused or still working: to the cut-off
     if t0 and cut and t0 > cut:
         row["cutoff_note"] = "launched after the cut-off: pass one wave's runs, or --cutoff"
+    w = row["owner_wait"]["total_h"]["value"]
     wall = _h(t0, min(end, cut) if end and cut else end)
-    wall = max(0.0, wall) if wall is not None else None
-    row["autonomous_wall_h"] = (F(round(wall - w, 4), row["owner_wait"]["total_h"]["from"]) if wall is not None
-                                and w is not None else F(None, NA, "start, end or wait not computable"))
+    row["autonomous_wall_h"] = (F(round(max(0.0, wall) - w, 4), row["owner_wait"]["total_h"]["from"])
+                                if wall is not None and w is not None else F(None, NA, "start, end or wait unknown"))
     return row
 
 
 def rows(dirs, explicit=None, cutoff=None, ledger=None) -> list[dict]:
     """One row per chain. With no `cutoff`, the wave's strict-arm cut-off (wave_cutoff) applies to every chain."""
     cs = chains(dirs, explicit)
-    cut = _cut(cutoff) if cutoff else wave_cutoff([c for c in cs if all(not load_run(d)["errors"] for d in c)])
+    cut = _cut(cutoff) if cutoff else wave_cutoff(cs)
     return [summarise(c, cut, ledger, linked=False if c in (explicit or []) else None) for c in cs]
+
 
 
 def wave_summary(rs) -> dict:
