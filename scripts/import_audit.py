@@ -42,7 +42,11 @@ REVIEWED = {
     "scripts/benchmark_gate.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/claim_units.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/compute.py": {"spec_from_file_location": (3, _RUN_CODE + "; and the repo's worker_side module (twice: "
-                                                         "the batch runner and the checkpoint-restore self-test)")},
+                                                         "the batch runner and the checkpoint-restore self-test)"),
+                           "import_module": (2, "strings inside its own W0-A self-test fixtures (undeclared "
+                                                "dynamic imports the code closure must refuse)")},
+    "scripts/lib/import_closure.py": {"import_module": (6, "strings inside its own self-test fixtures (dynamic "
+                                                           "imports the code closure must refuse or take as declared)")},
     "scripts/derived_rebuild.py": {"spec_from_file_location": (2, _REPO_FILE)},
     "scripts/effort_floors_gate.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/eval_suite.py": {"spec_from_file_location": (2, "the eval suite's own generators and hidden tests")},
