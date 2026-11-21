@@ -368,6 +368,41 @@ def _answer_counts(a: dict, mode: str) -> bool:
     return a.get("by") == "owner" or (a.get("by") == "lead" and mode == "lead" and a.get("provisional") is True)
 
 
+def apply_owner_accepts(decision: dict, ledger: dict) -> dict:
+    """Codex r2 of #316 (P1-1): an accepted owner amendment means the run goes on without the amendment, declared
+    (request_owner_amendments). A structural PLAN blocker the ledger records as accepted therefore no longer takes the
+    gate back to SPEC, where a signed spec would pause for the amendment the answer just waived. The accepted blockers
+    leave the rethink's list; what remains decides the route (another structural blocker: a rethink; another HIGH:
+    the fix loop; none: they are declared)."""
+    if decision.get("action") != "RETHINK_STRUCTURAL" or rethink_target(decision) != "SPEC":
+        return decision
+    accepted = {fid for fid, f in ledger.items() if getattr(f, "status", None) == "owner_accepted"
+                and FX._OWNER_AMENDMENT.search(str(getattr(f, "fix_requires", None) or ""))}   # answered: remedy text
+    uh = list(decision.get("unresolved_high") or [])
+    waived = [b for b in uh if isinstance(b, dict) and b.get("category") == "STRUCTURAL"
+              and b.get("target_stage") == "PLAN" and str(b.get("id")) in accepted]
+    if not waived:
+        return decision
+    rest = [b for b in uh if b not in waived]
+    ids = [str(b.get("id")) for b in waived]
+    d = dict(decision, unresolved_high=rest, owner_accepted_amendments=ids)
+    if rethink_target(d) == "SPEC":
+        return decision                       # another structural PLAN blocker the owner did not waive
+    if any(isinstance(b, dict) and b.get("category") == "STRUCTURAL" for b in rest):
+        d.update(rationale=f"{decision.get('rationale') or ''} The owner's accepted amendment(s) {', '.join(ids)} are "
+                           "declared; the remaining structural blocker(s) go to the engine choice.")
+        return d
+    if rest:
+        d.update(action="PATCH_OR_RETHINK", rule_matched="owner_accepted_amendment",
+                 rationale=f"the owner accepted going on without the amendment(s) {', '.join(ids)}, which are declared; "
+                           f"{len(rest)} other HIGH finding(s) go to the fix loop")
+        return d
+    d.update(action="DECLARE_SCOPE", rule_matched="owner_accepted_amendment", declared_open=ids,
+             rationale=f"the owner accepted going on without the amendment(s) {', '.join(ids)}: they are declared in "
+                       "the write-up (declared_findings.yaml)")
+    return d
+
+
 def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto", mode: str = "owner") -> list[dict]:
     """Decision-bearing findings (a measured decision test that changes the plan) go through
     Phase 49 β's owner rule before they can be declared: marked for the owner (an item the
@@ -385,7 +420,8 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
         marked = {id(v) for v in viols if v.get("owner_signoff")}
         try:
             out = [f for f in rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
-                                                 mode=mode) or [] if f.get("kind") == "scope_declaration_declined"]
+                                                 mode=mode, provisional_only=True) or []
+                   if f.get("kind") == "scope_declaration_declined"]
         except Exception:  # noqa: BLE001 -- as before this rule: nothing marked, nothing declined
             out = []
         for v in viols:
@@ -413,7 +449,7 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
                     continue
                 v["owner_signoff"], v["owner_item"] = True, item
             return out + list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
-                                                 mode=mode) or [])
+                                                 mode=mode, provisional_only=True) or [])
         except Exception as e:  # noqa: BLE001 -- fail closed below
             reason = f"the owner rule failed ({type(e).__name__}: {e})"
     elif rule is not None:
@@ -1744,8 +1780,9 @@ class Machine:
                 d = require_judged(d, opened)
                 # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
                 # (synced with this decision, so a gate finding is read as this gate states it: Codex round 3 of #258)
-                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw,
-                                                    lead_ok=self.st.signoff == "lead")[0])
+                led_now = FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")[0]
+                d = apply_owner_declines(d, led_now)
+                d = apply_owner_accepts(d, led_now)
                 if d.get("rule_matched") == "owner_declined":
                     drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
                                                  if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
@@ -2959,7 +2996,7 @@ def _self_test() -> int:
 
         class Declines:
             @staticmethod
-            def gate_findings(rd, rn, viols, non_declarable=None, mode=None):
+            def gate_findings(rd, rn, viols, non_declarable=None, mode=None, **k):
                 for v in viols:
                     v["owner_signoff"] = True
                 return [{"kind": "scope_declaration_declined", "key": "allocation_unstable"}, dict(viols[0])]
