@@ -2891,6 +2891,7 @@ def _self_test() -> int:
                                             cross_engine_check=False)
         d, T, st = new_run("dt_owner", {}, signoff="owner", max_rounds=1)
         mk(d, T, st).run()
+        _t_owner_disposes(d)        # W0-G (from v2): the owner disposes the spec critique's conditions before signing
         sign(d, "owner", "ok")
         s_o = mk(d, StubTasks(T.s), None).run()
         st_o = load_state(d)
