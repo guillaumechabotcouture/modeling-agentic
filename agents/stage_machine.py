@@ -92,6 +92,7 @@ class AwaitingBudget(Exception):
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
+MAX_SIGN_REPAIRS = 2
 
 
 @dataclass
@@ -2270,9 +2271,12 @@ def _self_test() -> int:
         status = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         hist = [h["to"] for h in load_state(d).history if "to" in h]
         ok(status == "completed", f"T10 toy run completes: {status} via {hist}")
-        ok(hist[:8] == ["SIGN", "EVIDENCE", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
+        ok(hist[:8] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
            and "FIX_LOOP" in hist
            and hist[-3:] == ["PRESENTATION", "GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
+        from toolkit.spec import evidence_draft as EDR_
+        ok("draft_evidence" not in T.calls and (EDR_.read_record(d) or {}).get("status") == "not_required",
+           f"T11b a spec whose options need no decision input passes EVIDENCE with no task ({EDR_.read_record(d)})")
         rows = FX.impact_rows(d)
         ok(rows and rows[0]["files_changed"] == ["analysis_settings.yaml"] and "analyze" in rows[0]["steps_rebuilt"]
            and rows[0]["headline_before"] != rows[0]["headline_after"] and rows[0]["passed"],
@@ -3150,6 +3154,12 @@ def _self_test() -> int:
             import traceback
             traceback.print_exc()
             ok(False, f"IG machine tests: {type(e).__name__}: {e}")
+        try:
+            _self_test_evidence(ok, td)
+        except Exception as e:  # noqa: BLE001 -- before the evidence stage exists (step α) this is the failure
+            import traceback
+            traceback.print_exc()
+            ok(False, f"EV machine tests: {type(e).__name__}: {e}")
         # T70 (run console review, finding 6): `sign --expect-sha256` refuses a spec other than the one shown.
         from toolkit.spec import schema as _S, signoff as _SO
         d70 = os.path.join(td, "t61")
@@ -4025,7 +4035,7 @@ def _self_test_geometry(ok, td: str) -> None:
        f"still carries the swap ({m2.st.state}, {m2.st.paused}, {still})")
     toolkit.sign(d2, "owner")
     m2.step()
-    ok(m2.st.state == "EVIDENCE" and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
+    ok(m2.st.state == "ENGINE_CHOICE" and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
        f"IG-M2b the owner's sign-off approves the proposed exception: the run goes on and the gate no longer carries "
        f"it ({m2.st.state})")
     # IG-M4 (review P1): under --signoff lead a proposed HIGH exception pauses for the owner, as a spec sign-off does
@@ -4040,7 +4050,7 @@ def _self_test_geometry(ok, td: str) -> None:
        f"({m4.st.state}, {m4.st.paused}, {SO.status(m4.run_dir)})")
     toolkit.sign(m4.run_dir, "owner")
     m4.step()
-    ok(m4.st.state == "EVIDENCE" and "reciprocal_swap" not in {f["kind"] for f in m4.harness_findings()},
+    ok(m4.st.state == "ENGINE_CHOICE" and "reciprocal_swap" not in {f["kind"] for f in m4.harness_findings()},
        f"IG-M4b once the owner signs, the run goes on with the exception approved ({m4.st.state})")
     import v2_sdk_tasks as SDK
     ok({GEO.ARTIFACT, GEO.SIGNOFF_FILE} <= set(SDK.HARNESS_FILES),
@@ -4194,6 +4204,127 @@ def _self_test_derived(ok, td: str) -> None:
     finally:
         REPO = old_repo
         sys.path.remove(mods)
+
+
+def _self_test_evidence(ok, td: str) -> None:
+    """v2 autonomy 1B-ii (D1): the EVIDENCE stage before SIGN, on the toy engine whose component declares decision
+    inputs (toolkit/spec/toy_engines.py ToyDossierEngine)."""
+    import yaml
+    from v2_tasks import StubTasks
+    from toolkit.spec import evidence_dossier as ED, evidence_draft as EDR, toy_engines as TE
+    TE.enable_for_test()
+    toolkit = AB.backend("toolkit")
+    full = ED.toy_entries()
+
+    def setup(name, signoff, script, dossier=True):
+        d = os.path.join(td, name)
+        os.makedirs(d)
+        raw = yaml.safe_load(open(ED.toy_dossier_spec(d, dossier=dossier)))
+        for f in (AB.SPEC_FILE, ED.DOSSIER_FILE):
+            if os.path.exists(os.path.join(d, f)):
+                os.remove(os.path.join(d, f))
+        st = init_run(d, "toy question", 3, signoff, "v2", None, derived_inputs=False)
+        T = StubTasks(dict({"spec": raw}, **script))
+        return Machine(d, T, st, backend=toolkit, log=lambda *a: None, cross_engine_check=False), T
+
+    def until(m, stop=("ENGINE_CHOICE",), n=14):
+        for _ in range(n):
+            if m.st.state in stop or m.st.state == "FINAL" or m.st.paused:
+                break
+            m.step()
+        return [h.get("to") for h in m.st.history if "to" in h]
+
+    def fill(run_dir, feedback):        # the evidence task: two inputs observed or calibrated, one with no data
+        doc = yaml.safe_load(open(os.path.join(run_dir, ED.DOSSIER_FILE)))["inputs"]
+        k = dict(doc["parameter:k"], no_data={"reason": "no field measurement", "borrowing_rule": "the card's value"})
+        return {"parameter:eff_a": full["parameter:eff_a"], "unit_attribute:x": full["unit_attribute:x"],
+                "parameter:k": k}
+
+    # T_DOSSIER_AUTO: lead sign-off, the spec names the dossier and no one wrote it: scaffold, one task, signed
+    m, T = setup("ev_lead", "lead", {"evidence": fill})
+    hist = until(m)
+    rec = EDR.read_record(m.run_dir) or {}
+    so = _signoff(m.run_dir) or {}
+    ok(hist[:3] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE"] and T.calls.count("draft_evidence") == 1
+       and rec.get("status") == "complete" and so.get("signed_by") == "lead"
+       and so.get("evidence", {}).get("dossier") == ED.DOSSIER_FILE,
+       f"T_DOSSIER_AUTO under --signoff lead the run drafts the dossier before SIGN and the lead signs it ({hist}; "
+       f"{T.calls}; {rec.get('status')}; {rec.get('problems')})")
+    g = rec.get("gaps") or {}
+    ok(g.get("no_data") == ["parameter:k", "unit_attribute:x"] and g.get("default_kept") == ["parameter:k"]
+       and g.get("sources_unchecked") == ["parameter:eff_a"]
+       and "provisional" in so.get("note", "") and EDR.RECORD in so.get("note", ""),
+       f"T_DOSSIER_GAPS the gaps are declared in the record and the lead's note ({rec.get('gaps')}; {so.get('note')})")
+    # T_SIGN_REPAIR: the sheet goes stale between EVIDENCE and SIGN; the refusal sends the run back, then it signs
+    class Stale(StubTasks):
+        def sign_spec(self, run_dir):
+            if self.calls.count("sign_spec") == 0:
+                os.remove(os.path.join(run_dir, SIGNOFF_SHEET))
+            return super().sign_spec(run_dir)
+    d = os.path.join(td, "ev_repair")
+    os.makedirs(d)
+    raw = yaml.safe_load(open(ED.toy_dossier_spec(d, dossier=False)))
+    raw["evidence"] = {"dossier": ED.DOSSIER_FILE}
+    os.remove(os.path.join(d, AB.SPEC_FILE))
+    T = Stale({"spec": raw, "evidence": fill})
+    m = Machine(d, T, init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False), backend=toolkit,
+                log=lambda *a: None, cross_engine_check=False)
+    hist = until(m)
+    ok(hist[:5] == ["EVIDENCE", "SIGN", "EVIDENCE", "SIGN", "ENGINE_CHOICE"] and m.st.tries.get("sign_repair") == 1
+       and T.calls.count("draft_evidence") == 1 and (_signoff(d) or {}).get("signed_by") == "lead",
+       f"T_SIGN_REPAIR a refused lead sign-off goes back to EVIDENCE once, which rewrites the sheet, then signs ({hist}; "
+       f"{T.calls})")
+    # T_EVIDENCE_EXHAUSTED: a task that never supplies the evidence: three drafts, two repairs, then the owner
+    m, T = setup("ev_none", "lead", {})
+    hist = until(m)
+    rec = EDR.read_record(m.run_dir) or {}
+    ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and T.calls.count("draft_evidence") == EDR.MAX_TRIES
+       and m.st.tries.get("sign_repair") == MAX_SIGN_REPAIRS and rec.get("status") == "incomplete"
+       and not os.path.exists(os.path.join(m.run_dir, SIGNOFF_FILE)),
+       f"T_EVIDENCE_EXHAUSTED the check is never loosened: after {EDR.MAX_TRIES} drafts and {MAX_SIGN_REPAIRS} repairs "
+       f"the run waits for the owner, unsigned ({hist}; {T.calls})")
+    # T_EVIDENCE_OWNER: under --signoff owner the drafted dossier is on the sheet the owner signs
+    m, T = setup("ev_owner", "owner", {"evidence": fill})
+    until(m)
+    sheet = open(os.path.join(m.run_dir, SIGNOFF_SHEET)).read() if os.path.exists(
+        os.path.join(m.run_dir, SIGNOFF_SHEET)) else ""
+    ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and ED.SECTION in sheet, f"T_EVIDENCE_OWNER the "
+       f"owner is shown the drafted dossier on the sheet ({m.st.state}, {m.st.paused})")
+    toolkit.sign(m.run_dir, "owner")
+    m.step()
+    ok(m.st.state == "ENGINE_CHOICE", f"T_EVIDENCE_OWNER_SIGNED once the owner signs, the run goes on ({m.st.state})")
+    # T_EVIDENCE_NONE: --signoff none: the drafted dossier covers the engine at ENGINE_CHOICE (it failed there before)
+    m, T = setup("ev_unsigned", "none", {"evidence": fill})
+    hist = until(m, stop=("PREREGISTER", "CONFIGURE"))
+    ok(hist[:4] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", hist[3] if len(hist) > 3 else None]
+       and m.st.state in ("PREREGISTER", "CONFIGURE"),
+       f"T_EVIDENCE_NONE --signoff none passes ENGINE_CHOICE's coverage check with the drafted dossier ({hist})")
+    # T_EVIDENCE_NAME: the options need inputs and the spec names no dossier: back to the draft, nothing written
+    d = os.path.join(td, "ev_name")
+    os.makedirs(d)
+    raw = yaml.safe_load(open(ED.toy_dossier_spec(d, dossier=False)))
+    os.remove(os.path.join(d, AB.SPEC_FILE))
+    m = Machine(d, StubTasks({"spec": raw}), init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False),
+                backend=toolkit, log=lambda *a: None, cross_engine_check=False)
+    until(m, n=4)
+    ok(m.st.state == "SPEC" and any("name the evidence dossier" in x for x in m.st.tries.get("spec_feedback") or [])
+       and not os.path.exists(os.path.join(d, ED.DOSSIER_FILE)),
+       f"T_EVIDENCE_NAME a spec that needs a dossier and names none is redrafted with the reason "
+       f"({m.st.state}; {m.st.tries.get('spec_feedback')})")
+    # T_EVIDENCE_RESUME: a run signed under the earlier order (SIGN, then EVIDENCE) resumes past EVIDENCE untouched
+    d = os.path.join(td, "ev_resume")
+    os.makedirs(d)
+    ED.toy_dossier_spec(d)
+    from toolkit.spec import signoff as SO
+    SO.write_sheet(d)
+    toolkit.sign(d, "owner")
+    before = open(os.path.join(d, ED.DOSSIER_FILE), "rb").read()
+    T = StubTasks({})
+    m = Machine(d, T, RunState(question="q", state="EVIDENCE", signoff="owner"), backend=toolkit, log=lambda *a: None,
+                cross_engine_check=False)
+    m.step()
+    ok(m.st.state == "ENGINE_CHOICE" and T.calls == [] and open(os.path.join(d, ED.DOSSIER_FILE), "rb").read() == before,
+       f"T_EVIDENCE_RESUME a spec already signed is left as signed ({m.st.state}, {T.calls})")
 
 
 def main(argv=None) -> int:

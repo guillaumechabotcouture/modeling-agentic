@@ -222,7 +222,7 @@ PROMPTS["seed_world_model"] = seed_prompt_text().replace("{", "{{").replace("}",
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
         "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",),
-        "seed_world_model": (SEED_FILE,)}
+        "seed_world_model": (SEED_FILE,), "draft_evidence": ()}
 
 
 SEED_RUN_READABLE = ("_task_input.json", SEED_FILE)
@@ -843,7 +843,9 @@ def _self_test() -> int:
         }
         # first, so plan_fixes' packet is the last _task_input.json written (PF4 reads it)
         calls = dict({"seed_world_model": lambda: t.seed_world_model({"question": "Q?", "packages": {"none": []}},
-                                                                     ["fb {x}"])}, **calls)
+                                                                     ["fb {x}"]),
+                      "draft_evidence": lambda: t.draft_evidence(d, "evidence_dossier.yaml", {"required": {}},
+                                                                 ["entry parameter:p {x}"])}, **calls)
         for k, call in calls.items():
             try:
                 call()
@@ -894,6 +896,22 @@ def _self_test() -> int:
         ok("e1" in got["pick_engine"][0] and "D-001: it has no age structure {x}" in got["pick_engine"][0],
            f"S_PICK_RETHINK the engine pick after a rethink names the engine left and the reasons ({got['pick_engine'][0]!r})")
         ok(got["fix"][1] == OWNS["fix"], f"S_FIX_OWNS a fix task owns the fix files ({got['fix'][1]})")
+        # S_EVIDENCE_OWNS (v2 autonomy 1B-ii): the evidence task owns the default dossier only, never another file a
+        # spec names, and gets the check's problems; the spec task may not write the dossier
+        SdkTasks._session = rec_session
+        try:
+            t3.draft_evidence(d, "evidence_dossier.yaml", {"required": {}}, ["entry parameter:p: no_data.reason"])
+            p1, own1 = got["draft_evidence"]
+            t3.draft_evidence(d, "analysis_settings.yaml", {"required": {}}, [])
+            own2 = got["draft_evidence"][1]
+        finally:
+            SdkTasks._session = orig_session
+        ok(own1 == ("evidence_dossier.yaml",) and own2 == () and "no_data.reason" in p1,
+           f"S_EVIDENCE_OWNS the evidence task owns evidence_dossier.yaml only ({own1}, {own2})")
+        ok(_allowed("evidence_dossier.yaml", d, OWNS["draft_spec"]) is not None
+           and _allowed("evidence_dossier.yaml", d, OWNS["draft_evidence"]) is None
+           and _allowed("decision_spec.yaml", d, OWNS["draft_evidence"]) is not None,
+           "S_EVIDENCE_WRITE the spec task cannot write the dossier; the evidence task can write nothing else")
     # World-model seed task (F6 world-model trials): the world model's own seed documentation in the prompt, no results
     # readable, one owned output outside the harness's analysis/ tree.
     try:
