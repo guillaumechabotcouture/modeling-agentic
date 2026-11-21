@@ -387,6 +387,28 @@ def _self_test() -> int:
             ok(before["quality"] == after["quality"] == 1.0
                and [c["score"] for c in before["checks"]] == [c["score"] for c in after["checks"]],
                f"E1e pack, encrypt, upload, download, decrypt, grade: same scores {before['quality']} {after['quality']}")
+            # E10 (owner 2026-11-21: the run path is decoupled from the answer key): verify_public checks the
+            # pinned ciphertext and the public manifest without the key; it never decrypts or reads the keychain
+            g = globals()
+            real = {n: g[n] for n in ("decrypt", "keychain_key")}
+            touched = []
+            for n in real:
+                g[n] = (lambda name: lambda *a, **k: touched.append(name) or (_ for _ in ()).throw(
+                    AssertionError(f"{name} called by verify_public")))(n)
+            try:
+                pub = verify_public(store, pin)
+                ok(pub.get("questions", {}).get("toy") == {"a.csv": "x"} and not touched,
+                   f"E10 verify_public returns the public manifest without decrypting: {touched} {pub}")
+                expect_error("bundle_hash_mismatch", lambda: verify_public(store, dict(pin, bundle_sha256="0" * 64)),
+                             "E10b a wrong bundle digest in the pin fails closed")
+                expect_error("bundle_not_pinned", lambda: verify_public(store, None), "E10c no pin fails closed")
+                expect_error("bundle_hash_mismatch", lambda: verify_public(store, dict(pin, manifest_sha256="0" * 64)),
+                             "E10d a manifest that does not hash to the pin's manifest_sha256 fails closed")
+                ok(not touched, f"E10e no case decrypted or read the keychain: {touched}")
+            finally:
+                g.update(real)
+            ok(pin.get("manifest_sha256") and verify_public(store, pin)["version"] == 1,
+               f"E10f publish pins the manifest's digest too, and it verifies: {pin}")
             expect_error("bundle_key_invalid", lambda: fetch(os.path.join(td, "d2"), new_key(), store, pin),
                          "E2 a wrong key fails closed")
             expect_error("bundle_key_invalid", lambda: fetch(os.path.join(td, "d2b"), b"not a key", store, pin),

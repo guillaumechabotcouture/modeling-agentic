@@ -1557,7 +1557,8 @@ def _self_test(with_private=False, private_dir=None) -> int:
         for name, fn in (("S12", _test_s12_repo_tree), ("S13", _test_s13_truth_by_hashes),
                          ("S14", _test_s14_grade_fails_closed), ("S15", _test_s15_no_truth_in_details),
                          ("S16", _test_s16_conflicting_copies), ("S17", _test_s17_plaintext_not_in_checkout),
-                         ("S18", _test_s18_incomplete_bundle), ("S19", _self_test_s19_pipeline)):
+                         ("S18", _test_s18_incomplete_bundle), ("S19", _self_test_s19_pipeline),
+                         ("S20", _test_s20_run_never_decrypts)):
             try:
                 fn(ok, os.path.join(td, name))
             except (Exception, SystemExit) as e:  # noqa: BLE001 — a missing piece is a failed case
@@ -1849,6 +1850,78 @@ def _test_s18_incomplete_bundle(ok, td):
     finally:
         eval_private.default_store = saved
     ok(rc != 0 and not called, f"S18c publish refuses an incomplete tree before touching storage: {rc} {called}")
+
+
+def _test_s20_run_never_decrypts(ok, td):
+    """Owner 2026-11-21: `run` (the launch preflight) verifies the hidden half only by its published digest and
+    the public manifest. It never calls the decrypt function, never opens the hidden tree and never reads the
+    keychain, so an agent can run it; a wrong bundle digest fails closed. Decryption stays in grade (the owner's)."""
+    import contextlib
+    import io
+    import eval_private as ep
+    rubric, truth = _toy()
+    tree = os.path.join(td, "tree")
+    csv_path = os.path.join(tree, "data", "evals", "toy", "a.csv")
+    os.makedirs(os.path.dirname(csv_path))
+    with open(csv_path, "w") as f:
+        f.write("u,v\n1,2\n")
+    git = ["git", "-C", tree, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q", tree], check=True)
+    subprocess.run(git + ["add", "-A"], check=True)
+    subprocess.run(git + ["commit", "-qm", "t"], check=True)
+    sha = hashlib.sha256(b"u,v\n1,2\n").hexdigest()
+    priv = os.path.join(td, "priv")
+    ep._write_private(priv, "toy", rubric, dict(truth, question="toy", inputs_sha256={"a.csv": sha}))
+    store = ep.LocalStore(os.path.join(td, "blob"))
+    pin = ep.publish(priv, 1, ep.new_key(), store)   # a key made for this case; the keychain is never read
+    calls = []
+
+    def refuse(name):
+        def f(*a, **k):
+            calls.append(name)
+            raise AssertionError(f"{name} called on the run path")
+        return f
+    names = ("decrypt", "keychain_key", "fetch", "opened", "default_store", "read_pin")
+    saved, saved_leak = {n: getattr(ep, n) for n in names}, globals()["leak_problems"]
+
+    def run(p, *extra):
+        ep.default_store, ep.read_pin = (lambda: store), (lambda path=None: p)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = main(["run", "--tree", tree, *extra, "toy"])
+        return rc, out.getvalue()
+    try:
+        for n in ("decrypt", "keychain_key", "fetch", "opened"):
+            setattr(ep, n, refuse(n))
+        globals()["leak_problems"] = lambda t: []   # this case is about the bundle; S12 covers the tarball scan
+        rc, out = run(pin)
+        ok(rc == 0 and "eval_toy.py launch" in out and not calls,
+           f"S20 run verifies the bundle by digest and prints the launch line without decrypting: {rc} {calls} "
+           f"{out[-300:]!r}")
+        rc, out = run(dict(pin, bundle_sha256="0" * 64))
+        ok(rc != 0 and "eval_toy.py launch" not in out and "bundle_hash_mismatch" in out and not calls,
+           f"S20b a wrong bundle digest fails closed, before any launch line: {rc} {calls} {out[-300:]!r}")
+        rc, out = run(dict(pin, prefix="outputs/evals_private/v9", version=9))
+        ok(rc != 0 and "eval_toy.py launch" not in out and not calls,
+           f"S20c a pin naming a missing bundle fails closed: {rc} {calls} {out[-300:]!r}")
+        rc, out = run(pin, "--private-dir", os.path.join(td, "elsewhere"))
+        ok(rc != 0 and "eval_toy.py launch" not in out and not calls,
+           f"S20d run takes no hidden tree (no --private-dir): {rc} {calls} {out[-300:]!r}")
+        with open(csv_path, "w") as f:
+            f.write("u,v\n1,3\n")
+        subprocess.run(git + ["commit", "-qam", "changed"], check=True)
+        rc, out = run(pin)
+        ok(rc != 0 and "eval_toy.py launch" not in out and "a.csv" in out and not calls,
+           f"S20e shipped inputs that differ from the published input digest fail closed: {rc} {out[-300:]!r}")
+    finally:
+        for n, v in saved.items():
+            setattr(ep, n, v)
+        globals()["leak_problems"] = saved_leak
+    for rel in ("cloud/run_cluster.py", "cloud/configs/_eval.py", "cloud/launch_watch.py"):
+        with open(os.path.join(REPO, rel)) as f:
+            src = f.read()
+        ok(not re.search(r"eval_private|decrypt|keychain_key|use_private", src),
+           f"S20f the launcher ({rel}) never reaches the bundle's key or plaintext")
 
 
 def _archive_of(repo) -> bytes:
