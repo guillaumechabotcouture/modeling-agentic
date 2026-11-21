@@ -338,21 +338,24 @@ def answer_fingerprint(fid: str, claim, fix_requires) -> str:
                                      sort_keys=True).encode()).hexdigest()[:16]
 
 
-def owner_answers(run_dir: str) -> dict[str, dict]:
+def owner_answers(run_dir: str, lead_ok: bool = False) -> dict[str, dict]:
     """The owner's answers (fingerprint -> {finding, decision, ...}) that the harness recorded (scripts/scope_signoff.py
     verified_answers: the answer's hash under a nonce trace.jsonl also holds), signed by the owner. Nothing else counts
-    (Codex review of #258 P1-8): not a lead's answer, not one written to scope_signoff.json without the harness."""
+    (Codex review of #258 P1-8): not a lead's answer, not one written to scope_signoff.json without the harness.
+    `lead_ok` (the run is a --signoff lead run, D2): the lead's recorded answers count too, as provisional ones."""
     try:
         import scope_signoff as SS
         verified, _bad = SS.verified_answers(run_dir)
     except Exception:  # noqa: BLE001 -- unreadable: no answer counts (fail closed)
         return {}
-    return {fp: a for fp, a in verified.items() if isinstance(a, dict) and a.get("by") == "owner"
+    return {fp: a for fp, a in verified.items() if isinstance(a, dict)
+            and (a.get("by") == "owner" or (lead_ok and a.get("by") == "lead" and a.get("provisional") is True))
             and a.get("finding") and a.get("decision") in ("accept", "decline")}
 
 
 # ------------------------------------------------------------------ sync
-def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: bool = False) -> tuple[dict[str, Finding], list[str]]:
+def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: bool = False,
+         lead_ok: bool = False) -> tuple[dict[str, Finding], list[str]]:
     """Bring the ledger up to date with the run's files and (optionally) a fresh gate decision.
 
     A gate finding open before and absent from this gate is `fixed` (pre-write
@@ -366,7 +369,7 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
     problems += p2
     decl, p3 = declarations(run_dir)
     problems += p3
-    answers = owner_answers(run_dir)
+    answers = owner_answers(run_dir, lead_ok)
     seen = set()
     for new in crit + gate_rows:
         seen.add(new.id)
@@ -424,12 +427,12 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         a = answers.get(answer_fingerprint(f.id, f.claim, f.fix_requires))    # bound to this claim and remedy
         ans = a.get("decision") if a and str(a.get("finding")) == f.id else None
         if ans is None and f.resolution_type == "owner_decision" and f.status in ("open", "declared") \
-                and any(isinstance(e, dict) and e.get("by") == "owner" for e in f.events):
+                and any(isinstance(e, dict) and e.get("by") in ("owner", "lead") for e in f.events):
             f.resolution_type = "fix"        # answered as it was before; revised since, so it is asked again
         if ans and f.status in ("open", "declared"):
             f.status = "owner_accepted" if ans == "accept" else "owner_declined"
             f.resolution_type = "owner_decision"
-            _event(f, round_n, f.status, "owner")
+            _event(f, round_n, f.status, "lead" if a.get("by") == "lead" else "owner")
     save(run_dir, led)
     return led, problems
 
@@ -578,6 +581,21 @@ def _self_test() -> int:
            and FX_.needs_owner_amendment(led17b["D-031"]),
            f"L17 a recorded owner answer applies to the finding it was given for; a revised one is asked again "
            f"({unverified}, {st17}, {led17b['D-031'].status})")
+    # L_OWNER_LEAD (1F, D2): a lead's recorded answer counts only when the run is a --signoff lead run
+    with tempfile.TemporaryDirectory() as d:
+        import scope_signoff as SS
+        claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
+        fp = answer_fingerprint("D-032", claim, fix)
+        json.dump({"answers": {fp: {"finding": "D-032", "decision": "accept", "by": "lead", "provisional": True}}},
+                  open(os.path.join(d, "scope_signoff.json"), "w"))
+        SS.harness_record(d)
+        save(d, {"D-032": Finding(id="D-032", kind="critique_blocker", severity="HIGH", source="harness", claim=claim,
+                                  fix_requires=fix)})
+        st_o = sync(d, None, 2)[0]["D-032"].status
+        led_l = sync(d, None, 2, lead_ok=True)[0]
+        ok(owner_answers(d) == {} and list(owner_answers(d, lead_ok=True)) == [fp] and st_o == "open"
+           and led_l["D-032"].status == "owner_accepted" and led_l["D-032"].events[-1].get("by") == "lead",
+           f"L_OWNER_LEAD a lead's answer counts only with lead_ok, and the ledger says it was the lead's ({st_o})")
     # L_DICT_DW, L_FROZEN_DW, L_GATE_DW (v2 autonomy 1A, 4c and 4a): the test a fix task is checked against.
     with tempfile.TemporaryDirectory() as d:
         frozen, weaker = [{"file": "x.txt", "contains": "draws 32"}], [{"file": "x.txt", "exists": True}]
