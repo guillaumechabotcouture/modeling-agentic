@@ -123,7 +123,18 @@ DEFAULT_TIMEOUT_S = 3600
 BACKSTOP_MULTIPLE = 3
 BACKSTOP_FLOOR_S = 24 * 3600.0
 PROGRESS_EVERY_S = 900.0
-KILL_GRACE_S = 10           # after a timeout kill: how long to wait for the step's pipes to close
+KILL_GRACE_S = 10           # after SIGKILL: the bounded wait for the step to be reaped
+# At a step's backstop (v2 autonomy 1D-i): SIGTERM to its process group first, and this long for every process in it
+# to end (compute.py flushes its rows and stops its batch on SIGTERM), then SIGKILL for whatever is left.
+TERM_GRACE_S = 25.0
+# A step's stdout and stderr: <LOG_DIR>/<step id>.log, appended to on every execution (lib.safe_io, no link followed).
+# A diagnostic record, not a harness-certified one. A `.log` under models/ is outside compute.py's code fingerprint
+# (_FP_SKIP_EXT; self-test PD5b), so a log that grows while a batch runs never discards the batch's rows.
+LOG_DIR = "models/logs"
+LOG_TAIL = 800              # characters of a step's output kept in its report row's `error`
+# The model API's credentials: no step calls the model (the harness's LLM tasks run outside the pipeline).
+SECRET_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+_CURRENT = object()         # _progress_record's default run id: the run() in progress
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _GLOB = re.compile(r"[*?\[]")
 
@@ -166,7 +177,14 @@ def script_env(environ=None) -> dict:
         pre = tuple(_enforcement().CLOUD_ENV_PREFIXES)
     except Exception:  # noqa: BLE001 — fail closed: strip the known families
         pre = ("AZ_", "AZURE_", "OPENAI_", "AWS_", "GOOGLE_")
-    return {k: v for k, v in env.items() if not k.startswith(pre)}
+    out = {k: v for k, v in env.items() if not k.startswith(pre) and k not in SECRET_ENV}
+    # A bare `python3` or console script in a step's command is the harness interpreter's (its venv), not whatever
+    # is first on the caller's PATH.
+    if sys.executable:
+        here = os.path.dirname(os.path.abspath(sys.executable))
+        path = (out["PATH"] if out.get("PATH") else os.defpath).split(os.pathsep)
+        out["PATH"] = os.pathsep.join(path if path[:1] == [here] else [here] + path)
+    return out
 
 
 def _sha(path: str) -> str | None:
@@ -188,11 +206,38 @@ def _inside(path: str, root: str) -> bool:
         return False
 
 
+def _is_step_log(path: str, run_dir: str) -> bool:
+    """A step log, under any name: a `.log` file directly in the run's LOG_DIR (a real directory; behind a link the
+    runner writes no log). The runner appends to these while steps run, so they are reserved: never a step's input,
+    output or code, whatever a declaration matches. Other files in that directory are ordinary files."""
+    logs = os.path.join(os.path.realpath(run_dir), *LOG_DIR.split("/"))
+    rp = os.path.realpath(path)
+    try:              # by identity, not spelling: a case-insensitive volume has many names for the directory
+        return rp.lower().endswith(".log") and os.path.realpath(logs) == logs \
+            and os.path.samefile(os.path.dirname(rp), logs)
+    except OSError:
+        return False
+
+
+def _names_step_log(pat: str, run_dir: str) -> bool:
+    """Whether a declared output path or glob sits directly in the step logs' directory: LOG_DIR as spelled, or
+    another spelling of the same existing directory (a case-insensitive volume). The directory is the runner's for
+    outputs, so no declared output (nor the integrity watch on it) covers a log by naming that directory."""
+    import posixpath
+    d = posixpath.dirname(posixpath.normpath(pat.replace(os.sep, "/")))
+    if d == LOG_DIR:
+        return True
+    try:
+        return os.path.samefile(os.path.join(run_dir, d), os.path.join(run_dir, LOG_DIR))
+    except (OSError, ValueError):
+        return False
+
+
 def _matches(run_dir: str, pat: str) -> list[str]:
-    """Run-relative files matching a declared path or glob (inside the run dir only)."""
+    """Run-relative files matching a declared path or glob (inside the run dir only; never a step log)."""
     out = []
     for p in glob.glob(os.path.join(run_dir, pat), recursive=True):
-        if os.path.isfile(p) and _inside(p, run_dir):
+        if os.path.isfile(p) and _inside(p, run_dir) and not _is_step_log(p, run_dir):
             out.append(os.path.relpath(p, run_dir).replace(os.sep, "/"))
     return sorted(out)
 
@@ -343,6 +388,8 @@ def load(run_dir: str) -> tuple[list[dict], list[str]]:
                 st[k] = []
         if not st["outputs"]:
             errs.append(f"{where}: declares no outputs")
+        errs += [f"{where}: output {o} is in {LOG_DIR}/, which holds the runner's step logs; write it elsewhere"
+                 for o in st["outputs"] if _names_step_log(o, run_dir)]
         if "timeout_s" in st and (not isinstance(st["timeout_s"], (int, float)) or isinstance(st["timeout_s"], bool)
                                   or not 0 < st["timeout_s"] < float("inf")):    # NaN fails too (Codex on #267)
             errs.append(f"{where}: `timeout_s` must be a positive finite number")
@@ -593,8 +640,8 @@ def code_files(step: dict, run_dir: str) -> list[str]:
             continue
         t = t.split("=", 1)[1] if re.match(r"^\w+=", t) else t
         p = os.path.realpath(os.path.join(run_dir, os.path.expanduser(t)))
-        if not os.path.isfile(p):
-            continue
+        if not os.path.isfile(p) or (_is_step_log(p, run_dir) and not t.endswith(".py")):
+            continue                              # a log named as an argument is not code (a `.py` name for it is)
         if _inside(p, run_dir) or p.endswith(".py"):
             named.add(p)
             if p.endswith(".py") and _inside(p, run_dir):
@@ -787,54 +834,205 @@ def _warn(msg: str) -> None:
         pass
 
 
-def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None):
-    """Own process group; at `timeout_s` the whole group is killed (as derived_rebuild). `soft_s`/`on_overrun`: see
-    _communicate (the step's soft deadline: warned about, never killed)."""
-    # errors="replace" (Codex round 4 on #267): output that is not UTF-8 never hides the step's outcome.
-    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                         text=True, errors="replace", env=env, start_new_session=True, shell=shell)
-    try:
+class _Sink:
+    """Where a command's output goes: the step's log, run_dir/rel, opened for append with no link followed
+    (lib.safe_io), or nowhere (no `rel`). The runner reads the command's pipes and writes here itself (_pump), so
+    the command never holds the log; `tail` keeps the last bytes for the report row."""
+
+    def __init__(self, run_dir: str | None = None, rel: str | None = None, header: str = ""):
+        self.rel, self.fh, self.lock, self.buf = rel, None, threading.Lock(), bytearray()
+        if rel is not None:
+            from lib.safe_io import open_append_nofollow
+            self.fh = open_append_nofollow(run_dir, rel)
+            self.note(header)
+
+    def note(self, text: str) -> None:
+        """A line of the runner's own in a step log."""
+        self.write(text.encode("utf-8", "replace"), keep=False)
+
+    def write(self, data: bytes, keep: bool = True) -> None:
+        """Append to the log (never fatal: a full disk does not stop the step) and to the kept tail."""
+        with self.lock:
+            if keep:
+                self.buf += data
+                del self.buf[:-4 * LOG_TAIL]
+            if self.fh is not None:
+                try:
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(self.fh.fileno(), view):]
+                except (OSError, ValueError):
+                    pass
+
+    def tail(self, n: int = LOG_TAIL) -> str:
+        with self.lock:
+            return bytes(self.buf).decode("utf-8", "replace")[-n:]
+
+    def close(self) -> None:
+        with self.lock:               # a reader still running (a holder that outlived the wait) writes nowhere after
+            fh, self.fh = self.fh, None
         try:
-            _out, err = _communicate(p, timeout_s, soft_s, on_overrun)
+            if fh is not None:
+                fh.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _pump(pipe, sink) -> None:
+    """Read a command's pipe to its end, into `sink` (None: read and dropped). Its own thread, so the pipe is always
+    drained: a step that is flushing after SIGTERM never blocks on a full pipe."""
+    try:
+        while True:
+            data = os.read(pipe.fileno(), 65536)
+            if not data:
+                return
+            if sink is not None:
+                sink.write(data)
+    except (OSError, ValueError):
+        return
+
+
+class _Piped:
+    """A Popen whose one output pipe a reader thread drains into `sink`. communicate(timeout) is over, as Popen's
+    is, when the process has exited AND the pipe is at end-of-file: every process that inherited it has ended, also
+    one that left the step's group (a batch's pool process finishing its writes; CI on #302, self-test PD17). When
+    the OS refuses a thread, Popen's own communicate() reads the pipe and the sink gets the output at the end."""
+
+    def __init__(self, proc, pipe, sink):
+        self.proc, self.sink, self.pid = proc, sink, proc.pid
+        self.reader = threading.Thread(target=_pump, args=(pipe, sink), daemon=True)
+        try:
+            self.reader.start()
+        except RuntimeError as e:
+            self.reader = None
+            _warn(f"[pipeline] output reader not started ({e}); the step's output is kept when it ends")
+
+    def _whole(self, timeout) -> None:
+        self.sink.write(next((x for x in self.proc.communicate(timeout=timeout) if x), b""))
+
+    def communicate(self, timeout=None):
+        if self.reader is None:
+            self._whole(timeout)
+            return None, None
+        end = None if timeout is None else time.monotonic() + timeout
+        self.proc.wait(timeout=timeout)
+        self.reader.join(None if end is None else min(max(0.0, end - time.monotonic()), threading.TIMEOUT_MAX))
+        if self.reader.is_alive():
+            raise subprocess.TimeoutExpired(self.proc.args, timeout)
+        return None, None
+
+    def drain(self, timeout: float) -> None:
+        """After a kill: a bounded wait for the pipe's end. A holder outside the group may keep it open; the reader
+        is a daemon thread that ends with it, and writes nowhere once the sink is closed."""
+        if self.reader is not None:
+            self.reader.join(timeout)
+            return
+        try:
+            self._whole(timeout)
         except subprocess.TimeoutExpired:
-            raise
-        except BaseException:
-            try:                    # anything else escaping the wait: the step's group never outlives it
+            pass
+
+
+def _stop_group(p, grace_s: float) -> str:
+    """Stop a step's process group at its limit; returns how, for the error text. With a grace: SIGTERM, then up to
+    `grace_s` for every process in the group to end, not only its leader (a shell that leads the group ends at once
+    while the process it started is still flushing). Then SIGKILL for whatever is left, and a bounded wait."""
+    how, gone = "process group killed", False
+    try:
+        if grace_s > 0:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            how, end = f"SIGTERM, then SIGKILL after the {grace_s:.0f}s grace", time.monotonic() + grace_s
+            while time.monotonic() < end:
+                p.poll()                              # reap the leader, so an ended group reads as gone
+                try:
+                    os.killpg(p.pid, 0)
+                except (ProcessLookupError, PermissionError):     # no process left (or only ones already dead)
+                    how, gone = f"SIGTERM, ended within the {grace_s:.0f}s grace", True
+                    break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+    finally:
+        # Also when the grace is interrupted (Codex round 1): the group never outlives the runner's wait. A group
+        # already seen gone gets no signal (its id may have been given to another group).
+        if not gone:
+            try:
                 os.killpg(p.pid, signal.SIGKILL)
             except OSError:
                 pass
-            raise
+    try:
+        p.wait(timeout=KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        how += f"; not reaped within {KILL_GRACE_S}s"
+    return how
+
+
+def _run_cmd(cmd, cwd, timeout_s, env, shell=False, soft_s=None, on_overrun=None, log=None, grace_s=0.0):
+    """Own process group; at `timeout_s` the whole group is stopped (_stop_group: SIGTERM and `grace_s` first when a
+    grace is given, then SIGKILL). `soft_s`/`on_overrun`: see _communicate (the step's soft deadline: warned about,
+    never killed). `log`: the step's _Sink, which receives stdout and stderr; without one stdout is dropped and
+    stderr is read for the returned tail only. Returns (returncode or None at the limit, the tail of the output or
+    the reason)."""
+    sink = log if log is not None else _Sink()
+    # One pipe either way: stdout and stderr together (a log), or stderr alone.
+    out, err = (subprocess.PIPE, subprocess.STDOUT) if log is not None else (subprocess.DEVNULL, subprocess.PIPE)
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=env,
+                            start_new_session=True, shell=shell)
+    try:
+        p = _Piped(proc, proc.stdout if log is not None else proc.stderr, sink)
+        try:
+            _communicate(p, timeout_s, soft_s, on_overrun)
+        except subprocess.TimeoutExpired:
+            how = _stop_group(proc, grace_s)
+            # A process that left the group (a compute pool process makes its own) can keep the step's pipes open:
+            # their end is not waited for past a short grace (a plain wait hung the runner for good).
+            p.drain(KILL_GRACE_S)
+            past = f" at its backstop (soft deadline {soft_s:.0f}s)" if soft_s is not None else ""
+            tail = sink.tail().strip()
+            return None, f"timed out after {timeout_s:.0f}s{past} ({how})" + (f"; last output: {tail}" if tail else "")
         # Review #4: a process the step left in the background (`cmd &`) would keep
         # writing declared outputs after the step is recorded and its grant ends.
         try:
-            os.killpg(p.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
-        return p.returncode, (err or "")[-800:]
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
+        return proc.returncode, sink.tail()
+    except BaseException:
+        try:                    # anything else escaping the wait: the step's group never outlives it
+            os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
-        # A process that left the group (a compute pool process makes its own) can keep the step's pipes open:
-        # do not wait for their end-of-file past a short grace (a plain communicate() hung the runner for good).
-        try:
-            p.communicate(timeout=KILL_GRACE_S)
-        except subprocess.TimeoutExpired:
-            for fh in (p.stdout, p.stderr):
-                try:
-                    fh.close()
-                except OSError:
-                    pass
-            p.wait()
-        past = f" at its backstop (soft deadline {soft_s:.0f}s)" if soft_s is not None else ""
-        return None, f"timed out after {timeout_s:.0f}s{past} (process group killed)"
+        raise
+    finally:
+        if log is None:
+            sink.close()
+
+
+def step_log(step: dict) -> str:
+    """The run-relative path of a step's log (a step id holds no path separator)."""
+    return f"{LOG_DIR}/{step['id']}.log"
 
 
 def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None, soft_s: float | None = None,
-               on_overrun=None) -> tuple[int | None, str]:
+               on_overrun=None, info: dict | None = None) -> tuple[int | None, str]:
     """Run one step to `timeout_s` (its backstop); `soft_s`/`on_overrun` as _communicate. A compute step's batch
-    gets the backstop as its own wall limit, so the batch is not stopped at the soft deadline either."""
+    gets the backstop as its own wall limit, so the batch is not stopped at the soft deadline either. The step's
+    output goes to its log (step_log); `info` receives `log`, or `log_error` when the log cannot be opened without
+    following a link (the step then runs as before the log existed: stderr's tail only)."""
+    rel, sink = step_log(step), None
+    try:
+        if os.path.lexists(os.path.join(run_dir, rel + ".summary.json")):
+            # compute.py's code fingerprint hashes a file that has a `.summary.json` beside it as a results file,
+            # whatever its extension: a log there would change the fingerprint each time the runner appends to it.
+            raise ValueError("a results summary sits beside the log path")
+        sink = _Sink(run_dir, rel, f"=== step {step['id']} | pipeline run {_RUN_ID} | started {_iso(time.time())} ===\n")
+    except (OSError, ValueError) as e:
+        _warn(f"[pipeline] step {step['id']}: no log ({rel}: {e}); the step runs without one")
+    if info is not None:
+        info.update({"log": rel} if sink is not None else {"log_error": f"{rel} could not be opened; no log kept"})
     env = script_env()
     env["MA_PIPELINE_RUN_DIR"] = run_dir     # the trusted root a harness step writes under (the dir it runs in)
     if _RUN_ID:
@@ -850,9 +1048,18 @@ def _exec_step(step: dict, run_dir: str, timeout_s: float, python: str | None, s
             cmd = [python or sys.executable, os.path.join(HERE, "compute.py"), "map", run_dir, "--fn", fn,
                    "--inputs", os.path.join(run_dir, step["inputs_jsonl"]), "--out", os.path.join(run_dir, step["out"]),
                    "--purpose", step["purpose"].strip(), "--timeout-s", str(max(1.0, timeout_s))]
-            return _run_cmd(cmd, run_dir, timeout_s + 60, env, soft_s=soft_s, on_overrun=on_overrun)
-        return _run_cmd(step["run"], run_dir, timeout_s, env, shell=True, soft_s=soft_s, on_overrun=on_overrun)
+            res = _run_cmd(cmd, run_dir, timeout_s + 60, env, soft_s=soft_s, on_overrun=on_overrun, log=sink,
+                           grace_s=TERM_GRACE_S)
+        else:
+            res = _run_cmd(step["run"], run_dir, timeout_s, env, shell=True, soft_s=soft_s, on_overrun=on_overrun,
+                           log=sink, grace_s=TERM_GRACE_S)
+        if sink is not None:
+            sink.note(f"=== ended {_iso(time.time())} | " + (f"returncode {res[0]}" if res[0] is not None
+                                                             else res[1].split("; last output:")[0]) + " ===\n")
+        return res
     finally:
+        if sink is not None:
+            sink.close()
         shutil.rmtree(cache, ignore_errors=True)
 
 
@@ -901,10 +1108,11 @@ def _trusted_outputs(rec) -> dict:
 
 
 def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_start: float, elapsed: float | None,
-                     last_s, state: str) -> None:
+                     last_s, state: str, rid=_CURRENT) -> None:
     """PROGRESS, this step's entry: where it stands against its soft deadline and its backstop, and a projection of
     when it ends (a compute step: from the rows its batch has written; otherwise its last recorded runtime)."""
     now = time.time()
+    rid = _RUN_ID if rid is _CURRENT else rid     # the step's own run: a late report outlives run()'s reset of the id
     el = (now - t_start) if elapsed is None else elapsed
     proj, basis = None, None
     fn = _compute_fn(step)
@@ -918,7 +1126,7 @@ def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_s
             pass
     if proj is None and isinstance(last_s, (int, float)) and last_s > el:
         proj, basis = float(last_s), "the step's last recorded runtime"
-    entry = {"state": state, "pipeline_run": _RUN_ID, "started_at": _iso(t_start), "at": _iso(now),
+    entry = {"state": state, "pipeline_run": rid, "started_at": _iso(t_start), "at": _iso(now),
              "elapsed_s": round(el, 1), "soft_deadline_s": soft_s, "backstop_s": hard_s,
              "backstop_at": _iso(t_start + hard_s), "backstop_rule": f"max({BACKSTOP_MULTIPLE} x soft deadline, "
              f"{BACKSTOP_FLOOR_S / 3600:g} h), within any pipeline budget",
@@ -929,7 +1137,7 @@ def _progress_record(run_dir: str, step: dict, soft_s: float, hard_s: float, t_s
     # Under one lock, the check and the write (Codex round 4 on #267): a 'running' report that passed the check
     # cannot land on disk after the final state.
     with _PROGRESS_LOCK:
-        doc = _PROGRESS_DOC.setdefault((run_dir, _RUN_ID), {"pipeline_run": _RUN_ID, "steps": {}})
+        doc = _PROGRESS_DOC.setdefault((run_dir, rid), {"pipeline_run": rid, "steps": {}})
         prev = doc["steps"].get(step["id"]) or {}
         if state == "running" and prev.get("started_at") == entry["started_at"] and prev.get("state") != "running":
             return                # a late report (its thread) never overwrites the step's final state
@@ -1028,16 +1236,17 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
                 return row
         s0 = time.time()
         last = rec.get("seconds") if isinstance(rec, dict) else None
-        over = []
+        over, rid, info = [], _RUN_ID, {}
 
         def on_overrun(el):
             over.append(el)
-            _progress_record(run_dir, step, soft_s, timeout_s, s0, el, last, "running")
+            _progress_record(run_dir, step, soft_s, timeout_s, s0, el, last, "running", rid)
         try:
-            rc, err = _exec_step(step, run_dir, timeout_s, python, soft_s, on_overrun if soft_s is not None else None)
+            rc, err = _exec_step(step, run_dir, timeout_s, python, soft_s, on_overrun if soft_s is not None else None,
+                                 info=info)
         except OSError as e:
             rc, err = None, f"{type(e).__name__}: {e}"
-        row.update(returncode=rc, seconds=round(time.time() - s0, 1), ok=rc == 0)
+        row.update(info, returncode=rc, seconds=round(time.time() - s0, 1), ok=rc == 0)
         if over:
             row["over_soft_deadline"] = True
             row["soft_deadline_s"], row["backstop_s"] = soft_s, timeout_s
@@ -1065,7 +1274,7 @@ def _run_one(step: dict, run_dir: str, timeout_s: float, python: str | None, rec
         if over:              # the final state once its outputs are checked (Codex on #267: never `ok` for a rollback)
             try:
                 _progress_record(run_dir, step, soft_s, timeout_s, s0, row["seconds"], last,
-                                 "ok" if row["ok"] else "failed")
+                                 "ok" if row["ok"] else "failed", rid)
             except Exception:  # noqa: BLE001 -- the record is a report, never the step's outcome
                 pass
         return row
@@ -1083,12 +1292,22 @@ def run(run_dir: str, budget_s: float | None = None, integrity=None, python: str
     steps it runs, and marks each file those steps wrote as harness-written.
     `only` + `force` run one step regardless of staleness (scratch mode)."""
     global _RUN_ID
+    # F6: an id for this run of the pipeline, in its report and in its steps' environment, so a reader knows which
+    # batch summaries this run wrote without trusting mtimes (a run dir copied or restored from a checkpoint)
+    rid = _RUN_ID = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.urandom(4).hex()}"
+    try:
+        return _run(run_dir, budget_s, integrity, python, only, force)
+    finally:
+        # A step run outside this run() never exports this run's id (MA_PIPELINE_RUN). Only this run's own id is
+        # reset: one process runs one pipeline at a time, and an id another run() set is left alone.
+        if _RUN_ID == rid:
+            _RUN_ID = None
+
+
+def _run(run_dir, budget_s, integrity, python, only, force) -> dict:
     run_dir = os.path.realpath(run_dir)
     t0 = time.time()
     steps, errs = load(run_dir)
-    # F6: an id for this run of the pipeline, in its report and in its steps' environment, so a reader knows which
-    # batch summaries this run wrote without trusting mtimes (a run dir copied or restored from a checkpoint)
-    _RUN_ID = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.urandom(4).hex()}"
     report = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "errors": errs, "plan": [], "steps": [], "ok": not errs,
               "pipeline_run": _RUN_ID}
     if errs:
@@ -2839,6 +3058,11 @@ def _self_test() -> int:
             ok(rep["errors"] and not ig.open_events,
                f"PO13 (review) an invalid pipeline's report is written inside the harness grant: {ig.open_events}")
     try:
+        _self_test_durability(ok)
+    except Exception as e:  # noqa: BLE001 -- before the fix exists (step α) this is the failure
+        print(f"FAIL PD durability tests: {type(e).__name__}: {e}")
+        ok(False, f"PD durability tests: {type(e).__name__}: {e}")
+    try:
         _self_test_derivations(ok)
     except Exception as e:  # noqa: BLE001 -- before the runner exists (step α) this is the failure
         print(f"FAIL DI derivation tests: {type(e).__name__}: {e}")
@@ -2933,6 +3157,212 @@ def di_fixture(d: str, extra: str = "", uses=("id", "a", "b", "pop"), ignores=No
                                          "inputs": ["data/inputs/raw.csv"], "outputs": ["data/derived/units.csv"],
                                          "columns": cols}]}, f, sort_keys=False)
     return d
+
+
+def _self_test_durability(ok) -> None:
+    """PD1-PD10 (v2 autonomy 1D-i): a graceful stop at the backstop, step logs, and the steps' environment."""
+    from unittest import mock as _mock
+    py = shlex.quote(sys.executable)
+
+    def w(d, rel, txt):
+        os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
+        with open(os.path.join(d, rel), "w") as f:
+            f.write(txt)
+
+    def one(d, body, cmd=None, **kw):
+        import yaml
+        w(d, "data/x.csv", "1\n")
+        w(d, "models/a.py", body)
+        step = dict({"id": "a", "run": cmd or f"{py} models/a.py", "inputs": ["data/x.csv"],
+                     "outputs": ["models/a.out"]}, **kw)
+        w(d, SPEC, yaml.safe_dump({"steps": [step]}, sort_keys=False))
+        rep = run(d)
+        return rep["steps"][0] if rep.get("steps") else {"error": str(rep.get("errors"))}
+
+    def rd(d, rel):
+        try:
+            with open(os.path.join(d, rel), errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    log = "models/logs/a.log"
+    fast = {"BACKSTOP_FLOOR_S": 1.0, "PROGRESS_EVERY_S": 0.5, "TERM_GRACE_S": 6.0}
+    with tempfile.TemporaryDirectory() as d, _mock.patch.dict(globals(), fast):
+        d = os.path.realpath(d)
+        # PD1: at the backstop the step's group gets SIGTERM and time to flush before any SIGKILL. The command is a
+        # compound one, so the shell (the group leader) ends at once while the process that flushes is still running.
+        flush = ("import signal, sys, time\n"
+                 "def bye(*a):\n    time.sleep(1.0)\n    open('models/flushed', 'w').write('rows')\n    sys.exit(0)\n"
+                 "signal.signal(signal.SIGTERM, bye)\nprint('before-hang', flush=True)\ntime.sleep(60)\n")
+        t0 = time.time()
+        r = one(d, flush, cmd=f"{py} models/a.py && true", timeout_s=1)
+        err = r.get("error") or ""
+        ok(r.get("returncode") is None and rd(d, "models/flushed") == "rows" and time.time() - t0 < 12,
+           f"PD1 a step past its backstop gets SIGTERM and a grace period to flush: {r}")
+        ok(err.startswith("timed out after ") and "backstop" in err and "SIGTERM" in err,
+           f"PD1b the timeout still reads as a resumable timeout and says how the step was stopped: {err[:200]}")
+        # PD4: the output before the stop is in the step's log, and its tail is in the error.
+        ok("before-hang" in rd(d, log) and "before-hang" in err and r.get("log") == log,
+           f"PD4 a timed-out step's output is kept in {log} and its tail in the error: {r} {rd(d, log)[:200]!r}")
+        # PD2: a step that ignores SIGTERM is killed once the grace is over, and the runner does not wait longer.
+        with _mock.patch.dict(globals(), {"TERM_GRACE_S": 1.0}):
+            t0 = time.time()
+            r = one(d, "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(60)\n",
+                    timeout_s=1)
+            took = time.time() - t0
+        ok(r.get("returncode") is None and 3.5 < took < 3 + 1 + KILL_GRACE_S and "SIGKILL" in (r.get("error") or ""),
+           f"PD2 a step that ignores SIGTERM is killed after the grace ({took:.1f}s): {r.get('error')}")
+        # PD3: a failed step's stdout and stderr are both in its log, with the tail in the error.
+        r = one(d, "import sys\nprint('out-line', flush=True)\nprint('err-line', file=sys.stderr)\nsys.exit(3)\n")
+        txt = rd(d, log)
+        ok(r.get("returncode") == 3 and "out-line" in txt and "err-line" in txt and "err-line" in (r.get("error") or "")
+           and r.get("log") == log, f"PD3 a failed step's stdout and stderr are in {log}: {r} {txt[-200:]!r}")
+        ok("before-hang" in txt, f"PD3b the log is appended to, never truncated, across runs: {txt[:200]!r}")
+        # PD5: the log is never a step input, and never part of the compute code fingerprint.
+        w(d, "models/logs/zz.log", "x\n")
+        w(d, "models/logs/table.csv", "1\n")
+        fp = fingerprint({"id": "a", "run": f"{py} models/a.py models/logs/a.log",
+                          "inputs": ["data/x.csv", "models/logs/*", "models/logs/*.log"], "outputs": []}, d)
+        ok(sorted(k for k in fp["inputs"] if k.startswith("models/logs/")) == ["models/logs/table.csv"]
+           and fp["missing_inputs"] == ["models/logs/*.log"] and "models/logs/a.log" not in fp["code"],
+           f"PD5 a step log is never a step input or code; another file beside it still is: {fp}")
+        import compute as _compute
+        w(d, "models/f.py", "def f(p):\n    return p\n")
+        f0 = _compute.code_fingerprint(d, "models/f.py::f")
+        w(d, "models/logs/zz.log", "more\n")
+        ok(_compute.code_fingerprint(d, "models/f.py::f") == f0,
+           "PD5b a step log does not change the compute code fingerprint (stored rows stay reusable)")
+        # PD6: a link planted at the log path is never followed; the step still runs, and the row says so.
+        w(d, "target.txt", "keep")
+        if os.path.lexists(os.path.join(d, log)):
+            os.remove(os.path.join(d, log))
+        os.symlink(os.path.join(d, "target.txt"), os.path.join(d, log))
+        r = one(d, "import sys\nprint('x')\nprint('err-link', file=sys.stderr)\nsys.exit(4)\n")
+        ok(r.get("returncode") == 4 and rd(d, "target.txt") == "keep" and "err-link" in (r.get("error") or "")
+           and r.get("log_error"), f"PD6 a link at the log path is not followed and the step still runs: {r}")
+        # PD6b (Codex round 1): the fallback keeps the tail on a timeout too.
+        r = one(d, "import sys, time\nprint('err-hang', file=sys.stderr, flush=True)\ntime.sleep(60)\n", timeout_s=1)
+        ok(r.get("returncode") is None and "err-hang" in (r.get("error") or "") and r.get("log_error"),
+           f"PD6b without a log, a timed-out step's stderr tail is still in the error: {r}")
+        os.remove(os.path.join(d, log))
+        # PD11 (Codex round 1): a FIFO at the log path never blocks the runner: the step runs without a log.
+        os.mkfifo(os.path.join(d, log))
+        got = []
+        th = threading.Thread(target=lambda: got.append(one(d, "import sys\nsys.exit(5)\n")), daemon=True)
+        th.start()
+        th.join(20)
+        hung = th.is_alive()
+        if hung:                             # unblock the open so the thread ends
+            fd = os.open(os.path.join(d, log), os.O_RDONLY | os.O_NONBLOCK)
+            th.join(10)
+            os.close(fd)
+        ok(not hung and bool(got) and got[0].get("returncode") == 5 and got[0].get("log_error"),
+           f"PD11 a FIFO at the log path never blocks the runner (blocked: {hung}): {got}")
+        os.remove(os.path.join(d, log))
+        # PD12 (Codex round 1): the runner's own log never counts as a step's declared output.
+        r = one(d, "pass\n", outputs=["models/*/a.log"])
+        ok(r.get("status") == "failed" and "not produced" in (r.get("error") or "")
+           and os.path.isfile(os.path.join(d, log)),
+           f"PD12 a step's log never satisfies a declared output, and a failed step's log is kept: {r}")
+        # PD14 (Codex round 2): an output declared as a step log is refused when the pipeline loads, so no step
+        # (a compute step's `out` is one of its outputs) can replace a log.
+        r = one(d, "pass\n", outputs=["models/logs/b.log"])
+        ok("step logs" in (r.get("error") or "") and "log" not in r,
+           f"PD14 a declared output that names a step log is refused at load: {r}")
+        # (Codex round 3) the whole directory is the runner's for outputs, so no output glob covers a log there; and
+        # another spelling is refused only where it is the same directory (a case-insensitive volume).
+        r = one(d, "pass\n", outputs=["models/logs/table.csv"])
+        ok("step logs" in (r.get("error") or ""), f"PD14c an output inside the log directory is refused at load: {r}")
+        same = os.path.exists(os.path.join(d, "models", "LOGS"))
+        r = one(d, "pass\n", outputs=["models/LOGS/b.log"])
+        ok(("step logs" in (r.get("error") or "")) == same,
+           f"PD14d another spelling is refused only where it is the same directory ({same}): {r}")
+        up = os.path.join(d, "models", "LOGS", "a.log")
+        ok(not os.path.exists(up) or _is_step_log(up, d),
+           "PD14b a step log under another spelling of its directory (a case-insensitive volume) is still a step log")
+        # PD17 (CI on #302, stage machine T16): as before the log existed, a step is over only when every process
+        # holding its output has ended, also one that left its group (a batch's pool process finishing its writes).
+        late = ("import subprocess, sys\n"
+                "subprocess.Popen([sys.executable, '-c', \"import time; time.sleep(1.2); "
+                "print('late-line', flush=True); open('models/a.out', 'w').write('1')\"], start_new_session=True)\n")
+        r = one(d, late)
+        ok(r.get("status") == "ok" and "late-line" in rd(d, log),
+           f"PD17 a step ends when every holder of its output has ended, and their output is in its log: {r}")
+        # PD15 (Codex round 2): a `<log>.summary.json` beside the log would make compute.py's fingerprint hash the
+        # log as a results file: the step then runs without a log.
+        w(d, log + ".summary.json", "{}")
+        r = one(d, "import sys\nsys.exit(6)\n")
+        ok(r.get("returncode") == 6 and r.get("log_error") and "log" not in r,
+           f"PD15 a results summary beside the log path: the step runs without a log: {r}")
+        os.remove(os.path.join(d, log + ".summary.json"))
+        # PD16 (Codex rounds 2-3): a module that is a link to a step log stays in the step's code (it is what runs, so
+        # the step fails as changed rather than pass as current); a log named as a plain argument is not code.
+        os.symlink(os.path.join(d, log), os.path.join(d, "models", "pdalias.py"))
+        w(d, "models/a.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import pdalias\n")
+        cf = code_files({"id": "a", "run": f"{py} models/a.py", "inputs": [], "outputs": ["models/a.out"]}, d)
+        cf2 = code_files({"id": "a", "run": f"{py} models/a.py {log}", "inputs": [], "outputs": ["models/a.out"]}, d)
+        os.remove(os.path.join(d, "models", "pdalias.py"))
+        cf3 = code_files({"id": "a", "run": f"{py} models/a.py {log}", "inputs": [], "outputs": ["models/a.out"]}, d)
+        os.symlink(os.path.join(d, log), os.path.join(d, "models", "pdalias.py"))
+        ok(any(_is_step_log(c, d) for c in cf) and any(_is_step_log(c, d) for c in cf2)
+           and not any(_is_step_log(c, d) for c in cf3),
+           f"PD16 an imported link to a step log stays in the step's code; a log argument alone does not: {cf} {cf3}")
+        os.remove(os.path.join(d, "models", "pdalias.py"))
+        # PD13 (Codex round 1): an interrupt during the grace still kills the step's group.
+        c = subprocess.Popen([sys.executable, "-c", "import signal, sys, time\n"
+                              "signal.signal(signal.SIGTERM, signal.SIG_IGN)\nprint('up', flush=True)\ntime.sleep(60)"],
+                             stdout=subprocess.PIPE, start_new_session=True)
+        c.stdout.readline()
+        with _mock.patch.object(time, "sleep", side_effect=KeyboardInterrupt):
+            try:
+                _stop_group(c, 5.0)
+                esc = None
+            except KeyboardInterrupt as e:
+                esc = e
+        try:
+            rc13 = c.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            rc13 = "alive"
+            c.kill()
+        c.stdout.close()
+        ok(esc is not None and rc13 == -signal.SIGKILL,
+           f"PD13 an interrupt during the SIGTERM grace still kills the step's group: {esc!r} {rc13}")
+        # PD7: the run id is reset when run() ends, so a later step outside run() never exports a past run's id.
+        r = one(d, "open('models/a.out', 'w').write('1')\n")
+        ok(r.get("status") == "ok" and globals()["_RUN_ID"] is None,
+           f"PD7 run() resets its run id: {globals()['_RUN_ID']} {r}")
+        with _mock.patch.dict(globals(), {"load": lambda rd_: (_ for _ in ()).throw(ValueError("boom"))}):
+            try:
+                run(d)
+            except ValueError:
+                pass
+        ok(globals()["_RUN_ID"] is None, f"PD7b run() resets its run id when it raises: {globals()['_RUN_ID']}")
+        # PD7c (Codex round 1): a run that ends never clears an id that is not its own.
+
+        def other(rd_):
+            globals()["_RUN_ID"] = "another-run"
+            raise ValueError("boom")
+        with _mock.patch.dict(globals(), {"load": other}):
+            try:
+                run(d)
+            except ValueError:
+                pass
+            seen = globals()["_RUN_ID"]          # read here: patch.dict puts the globals back on exit
+        ok(seen == "another-run", f"PD7c run() leaves another run's id alone: {seen}")
+    # PD8-PD10: the steps' environment.
+    env = script_env({"ANTHROPIC_API_KEY": "k", "ANTHROPIC_AUTH_TOKEN": "t", "CLAUDE_CODE_OAUTH_TOKEN": "o",
+                      "HOME": "/h", "PATH": "/pd-bin::/usr/bin"})
+    ok(not {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"} & set(env) and env.get("HOME") == "/h",
+       f"PD8 steps run without the model API credentials: {sorted(env)}")
+    here = os.path.dirname(os.path.abspath(sys.executable))
+    ok(env.get("PATH", "").split(os.pathsep) == [here, "/pd-bin", "", "/usr/bin"],
+       f"PD9 the harness interpreter's directory is first on the steps' PATH: {env.get('PATH')}")
+    env2 = script_env({"PATH": os.pathsep.join([here, "/pd-bin"])})
+    ok(env2["PATH"].split(os.pathsep) == [here, "/pd-bin"]
+       and script_env({"HOME": "/h"}).get("PATH") == here + os.pathsep + os.defpath,
+       f"PD10 the PATH entry is added once, and before the default path when PATH is unset: {env2['PATH']}")
+
 
 
 def _self_test_derivations(ok) -> None:
