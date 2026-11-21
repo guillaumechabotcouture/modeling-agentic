@@ -2482,7 +2482,7 @@ def fn_id(run_dir: str, fn_spec: str) -> str:
 
 
 def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = False, extra=None,
-                     record: dict | None = None) -> str:
+                     record: dict | None = None, extra_digest: str | None = None) -> str:
     """The reuse key of a batch's rows besides their params (W0-A, v2 autonomy brief addendum): a hash of its parts,
     each recorded with the batch (`key_parts`, and the closure's files with their hashes, in `record` when given):
       closure    the repo code the batch function can reach (scripts/lib/import_closure.py: the function file, the
@@ -2493,25 +2493,26 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
       deps       the dependency manifests (FP_DEP_MANIFESTS): installed packages are outside the closure;
       extra      what the caller adds (toolkit/analysis/batch.py: the engine identity), hashed as given.
     Files are hashed by content at any size (no mtime). Fail closed: when the closure cannot be computed (an
-    unresolvable import, an undeclared dynamic import, a file outside the repo and the run dir) the closure part is
-    replaced by `tree`, the whole scripts/ + toolkit/ hash, and the reasons are recorded and printed. The spec is not
+    unresolvable import, an undeclared dynamic import, a file outside the repo and the run dir) `tree`, the whole
+    scripts/ + toolkit/ hash, is added to the files the walk did hash, and the reasons are recorded and printed. The spec is not
     in the key: what a spec sets reaches a job through its params, which are the row's own key (input_key).
-    `confined`: as in _legacy_fingerprint."""
+    `confined`: as in _legacy_fingerprint. `extra_digest`: a recorded extra part, for a check that cannot compute
+    it (reuse_report, the run console: the engine identity is compared when the batch runs)."""
     run_dir = os.path.realpath(run_dir)
-    clo = fn_closure(run_dir, fn_spec)
+    if confined:
+        _confined_check(run_dir, fn_spec.partition("::")[0])     # before the walk reads any file (Codex r1 P2)
+    clo = fn_closure(run_dir, fn_spec, confined)
     parts = {"version": FP_KEY_VERSION,
              "run_files": _legacy_fingerprint(run_dir, fn_spec, exclude, confined, repo_dirs=(), mtime=False),
              "deps": _digest({m: _file_digest(os.path.join(REPO, m)) for m in FP_DEP_MANIFESTS
-                              if os.path.isfile(os.path.join(REPO, m))})}
-    if clo["unresolved"]:
+                              if os.path.isfile(os.path.join(REPO, m))}),
+             "closure": _digest(clo["files"])}
+    if clo["unresolved"]:       # the reasons are recorded, not hashed: they name paths (Codex r1 P1-10)
         print(f"compute: {fn_spec}: code closure not computed ({'; '.join(clo['unresolved'][:3])}): the key "
-              "hashes all of scripts/ and toolkit/", file=sys.stderr)
+              "hashes all of scripts/ and toolkit/ too", file=sys.stderr)
         parts["tree"] = _legacy_fingerprint(run_dir, fn_spec, exclude, confined, mtime=False)
-        parts["closure_unresolved"] = clo["unresolved"]
-    else:
-        parts["closure"] = _digest(clo["files"])
-    if extra is not None:
-        parts["extra"] = _digest(extra)
+    if extra is not None or extra_digest:
+        parts["extra"] = extra_digest or _digest(extra)
     if record is not None:
         record.update({"key_parts": parts, "closure": clo})
     return "k2-" + _digest(parts)[:20]
@@ -2519,7 +2520,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
 
 FP_KEY_VERSION = 2
 # compute.py's own code a row passes through (W0-A): the closure walks from these; FP_DISPATCH_EXEMPT is not followed.
-FP_ROW_ROOTS = ("run_map", "_remote_task", "_local_init", "_local_chunk")
+FP_ROW_ROOTS = ("run_map", "_remote_task", "_local_init", "_local_chunk", "_read_inputs")
 # W0-A (scripts/lib/import_closure.py): load_fn's dynamic import loads only the batch function, the closure's root.
 # The other dynamic imports in this file are in FP_DISPATCH_EXEMPT definitions or self-tests, which the walk skips.
 FP_DYNAMIC_IMPORTS = ()
@@ -2546,9 +2547,10 @@ def _file_digest(f: str) -> str:
     return h.hexdigest()
 
 
-def fn_closure(run_dir: str, fn_spec: str) -> dict:
-    """{"files": {repo-relative path: sha256}, "unresolved": [reason, ...]}: the batch function's code closure with
-    compute.py's row path (FP_ROW_ROOTS), less the launch stamp (_FP_REPO_SKIP). Never raises: an error is a reason."""
+def fn_closure(run_dir: str, fn_spec: str, confined: bool = False) -> dict:
+    """{"files": {repo-relative path (or "run:<path>"): sha256}, "unresolved": [reason, ...]}: the batch function's
+    code closure with compute.py's row path (FP_ROW_ROOTS), less the launch stamp (_FP_REPO_SKIP). A run-dir module
+    outside models/ and data/ is hashed here (`run:`), refused when `confined`. Never raises: an error is a reason."""
     if HERE not in sys.path:
         sys.path.insert(0, HERE)
     try:
@@ -2569,6 +2571,13 @@ def fn_closure(run_dir: str, fn_spec: str) -> dict:
             files[rel] = _file_digest(os.path.join(REPO, rel))
         except OSError as e:
             bad.append(f"{rel}: not read ({type(e).__name__})")
+    for rel in c.get("run", ()):            # Codex r1 P1-5: a helper at the run root is not in run_files
+        if rel.split(os.sep)[0] in ("models", "data") or os.path.join(run_dir, rel) == fn_file:
+            continue
+        if confined:
+            bad.append(f"run:{rel}: a run module outside models/ and data/ (confined)")
+            continue
+        files["run:" + rel.replace(os.sep, "/")] = _file_digest(os.path.join(run_dir, rel))
     return {"files": files, "unresolved": sorted(bad)}
 
 
@@ -2747,12 +2756,37 @@ def _once(f):
     return (lambda: memo[0] if memo else memo.append(f()) or memo[0]) if f else None
 
 
-def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None, legacy=None) -> dict:
+def _carries(result, ident) -> bool:
+    """Every harness provenance in a row's result names engine `ident`, and there is one (batch.py rows)."""
+    found = []
+
+    def walk(x, depth=0):
+        if isinstance(x, dict) and depth < 4:
+            if isinstance(x.get("provenance"), dict):
+                found.append(x["provenance"].get("engine") == ident)
+            for v in x.values():
+                walk(v, depth + 1)
+        elif isinstance(x, list) and depth < 4:
+            for v in x:
+                walk(v, depth + 1)
+    walk(result)
+    return bool(found) and all(found)
+
+
+def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None, legacy=None, extra=None) -> dict:
     """key -> ok row from an earlier --out of the same function and code, and
     (Phase 42 α) from the rows an interrupted or killed run of it had written
-    to `<out>.partial.jsonl` (its first line names the function and code)."""
+    to `<out>.partial.jsonl` (its first line names the function and code). W0-A (Codex r1 P1-9): a row admitted
+    under the legacy key while the caller gives an engine identity (`extra["engine"]`) must carry that identity in
+    its provenance, since the legacy key never held it."""
     got = {}
     legacy = _once(legacy)
+    ident = (extra or {}).get("engine") if isinstance(extra, dict) else None
+
+    def admit(rec, rows):
+        if ident is None or rec.get("code_fp") == fp:
+            return rows
+        return {k: r for k, r in rows.items() if _carries(r.get("result"), ident)}
     try:
         prev = json.load(open(out + ".summary.json"))
         if _same_fn(prev, fn_spec, fid) and _same_key(prev, fp, legacy):
@@ -2765,20 +2799,23 @@ def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None, legacy=No
                 print(f"compute: {out}: results file does not match its summary ("
                       f"{'sha256' if want else 'row count'}): its rows are not reused", file=sys.stderr)
                 rows = []
-            got.update({r["key"]: r for r in rows if isinstance(r, dict) and r.get("ok") and r.get("key")})
+            got.update(admit(prev, {r["key"]: r for r in rows if isinstance(r, dict) and r.get("ok") and r.get("key")}))
     except (OSError, ValueError):
         pass
     try:
         with open(out + PARTIAL_EXT) as f:
             head = json.loads(f.readline() or "{}").get("_partial") or {}
             if _same_fn(head, fn_spec, fid) and _same_key(head, fp, legacy):
+                part = {}
                 for line in f:
                     try:
                         r = json.loads(line)
                     except ValueError:
                         continue                  # a line torn by a kill mid-write
                     if isinstance(r, dict) and r.get("ok") and r.get("key"):
-                        got.setdefault(r["key"], r)
+                        part.setdefault(r["key"], r)
+                for k, r in admit(head, part).items():
+                    got.setdefault(k, r)
     except (OSError, ValueError, AttributeError):
         pass
     return got
@@ -2840,19 +2877,18 @@ def reuse_report(run_dir: str) -> dict:
         if not os.path.exists(path if os.path.isabs(path) else os.path.join(run_dir, path)):
             n, why = 0, f"function file not found here: {spec}"
         else:
-            rec = {}
-            fp = code_fingerprint(run_dir, spec, exclude=_out_files(out), record=rec)
-            here, kp = rec["key_parts"], (heads[0].get("key_parts") or {})
-            if "extra" in kp:            # the caller's part (an engine identity) is compared when the batch runs
-                fp = "k2-" + _digest({**here, "extra": kp["extra"]})[:20]
-            legacy = (lambda: _legacy_fingerprint(run_dir, spec, exclude=_out_files(out))) if not kp else None
-            n = len(_reusable(out, spec, fp, fn_id(run_dir, spec), legacy=legacy))
-            differs = sorted(k for k in set(here) | set(kp) if k not in ("extra", "closure_unresolved")
-                             and here.get(k) != kp.get(k)) if kp else ["whole-tree key (stored before W0-A)"]
+            rec, kp = {}, next((h["key_parts"] for h in heads if h.get("key_parts")), {})
+            # the caller's part (an engine identity) is taken as recorded: it is compared when the batch runs
+            fp = code_fingerprint(run_dir, spec, exclude=_out_files(out), record=rec, extra_digest=kp.get("extra"))
+            here = rec["key_parts"]
+            n = len(_reusable(out, spec, fp, fn_id(run_dir, spec),
+                              legacy=lambda: _legacy_fingerprint(run_dir, spec, exclude=_out_files(out))))
+            differs = sorted(k for k in set(here) | set(kp) if here.get(k) != kp.get(k)) if kp else [
+                "whole-tree key (stored before W0-A)"]
             why = "" if n >= len(stored) else (
                 f"key differs: {', '.join(differs)}" if differs else "recorded under another function")
-            if n < len(stored) and here.get("closure_unresolved"):
-                why += f" (code closure not computed: {here['closure_unresolved'][0]})"
+            if n < len(stored) and rec["closure"]["unresolved"]:
+                why += f" (code closure not computed: {rec['closure']['unresolved'][0]})"
         rt = heads[0].get("runtime")
         batches.append({"out": os.path.relpath(out, run_dir), "fn": heads[0].get("fn_id") or heads[0]["fn"],
                         "stored": len(stored), "eligible": n, "why": why,
@@ -2914,7 +2950,7 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
     fp = code_fingerprint(run_dir, fn_spec, exclude=_out_files(out), extra=extra, record=rec)
     fid = fn_id(run_dir, fn_spec)
     keys = input_keys(inputs)
-    old = {} if fresh else _reusable(out, fn_spec, fp, fid,
+    old = {} if fresh else _reusable(out, fn_spec, fp, fid, extra=extra,
                                      legacy=lambda: _legacy_fingerprint(run_dir, fn_spec, exclude=_out_files(out)))
     todo = [k for k, key in enumerate(keys) if key not in old]
     if todo:
@@ -3990,9 +4026,9 @@ def _self_test_w0a(ok) -> None:
                                max_workers=1, ledger=False)[1]
             d0 = god()
             kp = d0.get("key_parts") or {}
-            ok(d0.get("computed") == 2 and "tree" in kp and "closure" not in kp
-               and any("dynamic import" in x for x in kp.get("closure_unresolved") or []),
-               f"FP_UNRESOLVED_IMPORT_FALLS_BACK the key holds the whole tree and the reason: {kp.get('closure_unresolved')}")
+            why = (d0.get("closure") or {}).get("unresolved") or []
+            ok(d0.get("computed") == 2 and "tree" in kp and any("dynamic import" in x for x in why),
+               f"FP_UNRESOLVED_IMPORT_FALLS_BACK the key holds the whole tree and the batch records why: {why}")
             w("toolkit/analysis/figures.py", "def draw():\n    return 2\n")
             d1 = god()
             ok(d1.get("computed") == 2 and d1.get("reused") == 0,
@@ -4017,6 +4053,14 @@ def _self_test_w0a(ok) -> None:
             s7 = go()
             ok(s7.get("reused") == 3 and s7.get("computed") == 0 and s7.get("key_parts"),
                f"FP_OLD_ROWS_STILL_REUSED a pre-W0-A batch is reused and restamped ({s7.get('computed')} computed)")
+            summ = {k: v for k, v in json.load(open(out + ".summary.json")).items() if k not in ("key_parts", "closure")}
+            open(out + ".summary.json", "w").write(json.dumps({**summ, "code_fp": _legacy_fingerprint(
+                rd, os.path.join(repo, "job.py::f"), exclude=_out_files(out))}))      # the pre-W0-A record again
+            ok(len(_reusable(out, os.path.join(repo, "job.py::f"), "x", legacy=lambda: _legacy_fingerprint(
+                rd, os.path.join(repo, "job.py::f"), exclude=_out_files(out)))) == 3, "FP_OLD_ROWS_ENGINE setup")
+            s8 = go(extra={"engine": {"version": "3"}})
+            ok(s8.get("computed") == 3, f"FP_OLD_ROWS_ENGINE (Codex r1 P1-9) under an engine identity, a pre-W0-A row "
+                                        f"without that identity in its provenance is recomputed ({s8.get('computed')})")
 
 
 def _self_test_fp_dispatch(ok) -> None:

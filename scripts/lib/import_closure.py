@@ -56,6 +56,9 @@ class _Mod:
                     self.always.append(ast.Module(body=[*n.bases, *n.keywords, *[
                         s for s in n.body if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))]],
                         type_ignores=[]))
+                else:                                # so do a function's default values (Codex r1 P1-4)
+                    self.always.append(ast.Module(body=[*n.args.defaults, *[d for d in n.args.kw_defaults if d]],
+                                                  type_ignores=[]))
                 continue
             if _is_main_guard(n):
                 continue                                   # the CLI block never runs on import
@@ -88,9 +91,27 @@ class _Mod:
         return ".".join(base + ([n.module] if n.module else []))
 
 
+def _data_files(d: str) -> list[str]:
+    """A module directory's data: its other files, and every file of a subdirectory holding no Python (data only)."""
+    out = []
+    for x in sorted(os.listdir(d)):
+        p = os.path.join(d, x)
+        if os.path.isfile(p) and not x.endswith((".py",) + SKIP_EXT):
+            out.append(p)
+        elif os.path.isdir(p) and x not in SKIP_DIRS:
+            sub = [os.path.join(dp, f) for dp, ds, fs in os.walk(p) for f in fs
+                   if not any(s in dp.split(os.sep) for s in SKIP_DIRS)]
+            if not any(f.endswith(".py") for f in sub):
+                out += [f for f in sub if not f.endswith(SKIP_EXT)]
+    return out
+
+
 def _is_main_guard(n) -> bool:
-    return (isinstance(n, ast.If) and isinstance(n.test, ast.Compare) and isinstance(n.test.left, ast.Name)
-            and n.test.left.id == "__name__")
+    """Exactly `if __name__ == "__main__":` with no else (any other test may run on import: Codex r1 P1-4)."""
+    t = n.test if isinstance(n, ast.If) else None
+    return (t is not None and not n.orelse and isinstance(t, ast.Compare) and isinstance(t.left, ast.Name)
+            and t.left.id == "__name__" and len(t.ops) == 1 and isinstance(t.ops[0], ast.Eq)
+            and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value == "__main__")
 
 
 def _bound(n) -> list[str]:
@@ -127,11 +148,20 @@ def _literal_import(call) -> str | None:
     return None
 
 
-def _dynamic(node) -> int | None:
+def _dynamic(node, binds=None) -> int | None:
+    """The line of a dynamic import or exec site: by its name, by an alias bound to one (`from importlib import
+    import_module as load`), or a module's `__dict__` / `vars()` (Codex r1 P1-3)."""
+    binds = binds or {}
     for n in ast.walk(node):
+        if isinstance(n, ast.Attribute) and n.attr == "__dict__" and isinstance(n.value, ast.Name) \
+                and n.value.id in binds:
+            return n.lineno                                     # an imported name's namespace, read by key
         if isinstance(n, ast.Call) and _literal_import(n) is None:
             f = n.func
-            if (isinstance(f, ast.Attribute) and f.attr in DYNAMIC_ATTRS) or (
+            alias = isinstance(f, ast.Name) and any(a in DYNAMIC_ATTRS | DYNAMIC_NAMES for _, a in binds.get(f.id, ()))
+            mod_vars = isinstance(f, ast.Name) and f.id == "vars" and n.args and isinstance(n.args[0], ast.Name) \
+                and n.args[0].id in binds
+            if (isinstance(f, ast.Attribute) and f.attr in DYNAMIC_ATTRS) or alias or mod_vars or (
                     isinstance(f, ast.Name) and f.id in DYNAMIC_NAMES):
                 return n.lineno
     return None
@@ -211,10 +241,7 @@ class Walk:
                 continue
             if name == MODULE:
                 self.files.add(path)
-                d = os.path.dirname(path)
-                self.files.update(os.path.join(d, x) for x in os.listdir(d)
-                                  if os.path.isfile(os.path.join(d, x)) and not x.endswith(".py")
-                                  and not x.endswith(SKIP_EXT))
+                self.files.update(_data_files(os.path.dirname(path)))
                 pkg = m.pkg.split(".") if m.pkg else []
                 for k in range(1, len(pkg) + 1):
                     init = self.find(".".join(pkg[:k]))
@@ -226,6 +253,11 @@ class Walk:
             else:
                 todo.append((path, MODULE))
                 nodes = None if name in self.opaque.get(path, ()) else m.defs.get(name)
+                if nodes is None and name not in self.opaque.get(path, ()):
+                    for mod, attr in m.binds.get(name, ()):         # a re-export (Codex r1 P1-2)
+                        self.import_target(m, mod, attr, todo)
+                    for s in m.star:
+                        self.import_target(m, s, name, todo)
                 if nodes is None:
                     continue                    # a name read through a module that it does not define (a local)
             for node in nodes:
@@ -263,7 +295,7 @@ class Walk:
         return None
 
     def node(self, m: _Mod, node, todo: list) -> None:
-        line = _dynamic(node)
+        line = _dynamic(node, m.binds)
         if line is not None:
             decl = _declared(m.tree)
             if decl is None:
@@ -314,8 +346,8 @@ class Walk:
         nxt = names[used:]
         if module_only:
             todo.append((best, MODULE))
-        elif whole or not nxt:
-            todo.append((best, "*"))                    # a module used as a value: all of it
+        elif whole or not nxt or nxt[0].startswith("__"):
+            todo.append((best, "*"))                    # a module used as a value (or its dunders): all of it
         else:
             todo.append((best, nxt[0]))
 
@@ -324,14 +356,14 @@ def closure(fn_spec: str, repo: str, run_dir: str | None = None, roots_in: tuple
     """{"files": sorted repo-relative paths, "outside": files outside the repo and the run dir, "unresolved": [...]}
     for `<path.py>::<function>` (path relative to run_dir unless absolute). `roots_in`: (file, names) pairs walked
     besides the function (compute.py's own code that runs it); `opaque`: {file: names} never followed (their file
-    is still in the closure). Files inside the run dir are left out: the key hashes the run's models/ and data/
-    whole. Search roots are those load_fn puts on sys.path: the run dir, the function file's directory, the repo's
-    scripts/, and the repo root."""
+    is still in the closure). Files inside the run dir go to "run" (run-relative): the caller hashes those outside
+    the run's models/ and data/. Search roots in load_fn's sys.path order (Codex r1 P1-5): the repo's scripts/, the
+    function file's directory, the run dir, then the repo root."""
     repo = os.path.realpath(repo)
     path, _, name = fn_spec.partition("::")
     fn_file = os.path.realpath(path if os.path.isabs(path) or not run_dir else os.path.join(run_dir, path))
-    roots = ([os.path.realpath(run_dir)] if run_dir else []) + [os.path.dirname(fn_file),
-                                                                os.path.join(repo, "scripts"), repo]
+    roots = [os.path.join(repo, "scripts"), os.path.dirname(fn_file)] + (
+        [os.path.realpath(run_dir)] if run_dir else []) + [repo]
     w = Walk(repo, roots, opaque)
     for f, n in [(fn_file, name)] + [(os.path.realpath(f), n) for f, ns in roots_in for n in ns]:
         m = w.mod(f) if os.path.isfile(f) else None
@@ -344,7 +376,7 @@ def closure(fn_spec: str, repo: str, run_dir: str | None = None, roots_in: tuple
     inside = {f for f in files if run and f.startswith(run)}
     return {"files": sorted(w.rel(f) for f in files - inside if f.startswith(repo + os.sep)),
             "outside": sorted(f for f in files - inside if not f.startswith(repo + os.sep)),
-            "unresolved": sorted(w.unresolved)}
+            "run": sorted(os.path.relpath(f, run) for f in inside), "unresolved": sorted(w.unresolved)}
 
 
 def _self_test() -> int:
@@ -401,6 +433,21 @@ def _self_test() -> int:
         put("toolkit/a/mod.py", "def g():\n    return 3\n\ndef g2():\n    from toolkit.b import far\n")
         v = closure(os.path.join(td, "toolkit/c/val.py") + "::run", td)
         ok("toolkit/b/far.py" in v["files"], f"IC7 a module used as a value is taken whole: {v}")
+        # Codex r1: a package re-export, a default value run on import, an aliased dynamic import, a data subdir
+        put("toolkit/r/__init__.py", "from toolkit.r.impl import score\n")
+        put("toolkit/r/impl.py", "def score(p):\n    from toolkit.b import far\n    return far.x\n")
+        put("toolkit/r/data/t.csv", "a\n")
+        put("toolkit/c/re.py", "from toolkit.r import score\n\ndef run(p):\n    return score(p)\n")
+        r = closure(os.path.join(td, "toolkit/c/re.py") + "::run", td)
+        ok({"toolkit/r/impl.py", "toolkit/b/far.py", "toolkit/r/data/t.csv"} <= set(r["files"]),
+           f"IC8 a re-exported function's body and a data-only subdirectory are in the closure: {r}")
+        put("toolkit/c/dflt.py", "from toolkit.b import far\nX = {}\n\ndef unused(x=far.init()):\n    pass\n\n"
+            "def run(p):\n    return X\n")
+        dd = closure(os.path.join(td, "toolkit/c/dflt.py") + "::run", td)
+        ok("toolkit/b/far.py" in dd["files"], f"IC9 a default value runs on import: its code is in the closure: {dd}")
+        put("toolkit/c/alias.py", "from importlib import import_module as load\n\ndef run(p):\n    return load(p)\n")
+        al = closure(os.path.join(td, "toolkit/c/alias.py") + "::run", td)
+        ok(any("dynamic import" in u for u in al["unresolved"]), f"IC10 an aliased dynamic import fails closed: {al}")
     print(f"{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)}'}")
     return 1 if fails else 0
 

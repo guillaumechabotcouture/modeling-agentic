@@ -1990,15 +1990,19 @@ def batch_reuse(run_dir: str) -> list:
             continue
         o = s[:-len(".summary.json")]
         try:     # confined: no link followed under models/ or data/, nothing outside the run dir read (round 3)
-            fp = C.code_fingerprint(run_dir, doc["fn"], exclude=(o, o + ".tmp", o + ".summary.json",
-                                                                 o + ".summary.json.tmp", o + C.PARTIAL_EXT,
-                                                                 o + C.JOB_EXT, o + ".log"), confined=True)
+            ex = (o, o + ".tmp", o + ".summary.json", o + ".summary.json.tmp", o + C.PARTIAL_EXT, o + C.JOB_EXT,
+                  o + ".log")
+            kp = doc.get("key_parts") if isinstance(doc.get("key_parts"), dict) else None
+            # W0-A: a batch stored before key_parts has the old whole-tree key; a recorded engine identity
+            # (key_parts.extra) is compared when the batch runs, not here
+            fp = (C.code_fingerprint(run_dir, doc["fn"], exclude=ex, confined=True, extra_digest=kp.get("extra"))
+                  if kp else C._legacy_fingerprint(run_dir, doc["fn"], exclude=ex, confined=True))
         except ValueError as e:
             out.append({"out": rel, "fn": doc["fn"], "reused": False, "why": f"not checked: {e}"})
             continue
         out.append({"out": rel, "fn": doc["fn"], "n": doc.get("n"), "reused": fp == doc["code_fp"],
                     "why": "code fingerprint matches" if fp == doc["code_fp"] else
-                    "code fingerprint differs (model code, data or the repo's scripts/ or toolkit/ changed)"})
+                    "code fingerprint differs (model code, data, or repo code the batch function reaches changed)"})
     return out
 
 
