@@ -2504,6 +2504,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
               "hashes all of scripts/ and toolkit/ too", file=sys.stderr)
         parts["tree"] = _legacy_fingerprint(run_dir, fn_spec, exclude, confined, mtime=False)
         parts["run_code"] = _run_code_digest(run_dir, confined)     # Codex r2: a run-root module loaded by name
+        parts["repo_code"] = _repo_code_digest()                     # Codex r4: repo code outside scripts/, toolkit/
     if extra is not None or extra_digest:
         parts["extra"] = extra_digest or _digest(extra)
     if record is not None:
@@ -2519,31 +2520,61 @@ FP_DYNAMIC_IMPORTS = ()     # W0-A: load_fn loads only the closure's root; the r
 
 def _run_code_digest(run_dir: str, confined: bool = False) -> str:
     """Every Python file under the run dir outside models/ and data/ (those are run_files): what a module named by
-    data could load from the run root, which is on the worker's sys.path. Links are not followed; when `confined`,
-    files are read through no-follow fds (a link raises ValueError, as for run_files)."""
-    h, found, anc = hashlib.sha256(), [], {run_dir: {os.path.realpath(run_dir)}}
-    for dp, dirs, fns in os.walk(run_dir, followlinks=not confined):     # a linked package is importable (Codex r3)
+    data could load from the run root, which is on the worker's sys.path. A link is hashed by its target text (a
+    retarget changes the key) and never followed inside the run dir, whose real files are walked anyway; a directory
+    link out of the run dir has its target's Python files hashed once. Each entry is tagged (file, link, missing).
+    When `confined`, files are read through no-follow fds and any link raises ValueError, as for run_files."""
+    h, found, outside = hashlib.sha256(), [], {}
+    root = os.path.realpath(run_dir)
+    for dp, dirs, fns in os.walk(run_dir):
         rel_dp = os.path.relpath(dp, run_dir)
         dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git") and not (
-            rel_dp == "." and d in ("models", "data"))
-            and os.path.realpath(os.path.join(dp, d)) not in anc[dp])       # only a loop stops the walk
+            rel_dp == "." and d in ("models", "data")))
         for d in dirs:
-            anc[os.path.join(dp, d)] = anc[dp] | {os.path.realpath(os.path.join(dp, d))}
-        if confined and any(os.path.islink(os.path.join(dp, d)) for d in dirs):
-            raise ValueError(f"a directory link under the run dir: {rel_dp} (confined)")
-        found += [os.path.normpath(os.path.join(rel_dp, f)) for f in fns if f.endswith(".py")]
-    for rel in sorted(found):
+            p = os.path.join(dp, d)
+            if os.path.islink(p):
+                if confined:
+                    raise ValueError(f"a directory link under the run dir: {os.path.relpath(p, run_dir)} (confined)")
+                found.append((os.path.relpath(p, run_dir), "L"))
+                real = os.path.realpath(p)
+                if not (real + os.sep).startswith(root + os.sep) and os.path.isdir(real):
+                    outside.setdefault(real, os.path.relpath(p, run_dir))
+        found += [(os.path.normpath(os.path.join(rel_dp, f)), "L" if os.path.islink(os.path.join(dp, f)) else "F")
+                  for f in fns if f.endswith(".py")]
+    for real, rel in sorted(outside.items()):
+        found += [(os.path.join(rel, os.path.relpath(os.path.join(dp, f), real)), "X") for dp, ds, fs in os.walk(real)
+                  if "__pycache__" not in dp.split(os.sep) for f in fs if f.endswith(".py")]
+    for rel, kind in sorted(set(found)):
+        p = os.path.join(run_dir, rel)
         if confined:
             _hash_confined(h, run_dir, rel, mtime=False)
             continue
-        h.update(rel.encode() + b"\0")
-        if not os.path.isfile(os.path.join(run_dir, rel)):
-            h.update(b"missing\0")                     # a dangling link: nothing Python can import (Codex r3 P2)
-            continue
-        with open(os.path.join(run_dir, rel), "rb") as fh:
-            for block in iter(lambda: fh.read(2**20), b""):
-                h.update(block)
-        h.update(b"\0")
+        h.update(b"\0" + kind.encode() + rel.encode() + b"\0")
+        if kind == "L":
+            h.update(os.readlink(p).encode(errors="surrogateescape"))
+            if not os.path.isfile(p):
+                continue
+        if os.path.isfile(p):
+            with open(p, "rb") as fh:
+                for block in iter(lambda: fh.read(2**20), b""):
+                    h.update(block)
+    return h.hexdigest()
+
+
+def _repo_code_digest() -> str:
+    """Under an unresolved key: every Python file of the repo outside scripts/ and toolkit/ (those are `tree`), as the
+    repo root is on sys.path (Codex r4). Hidden directories, __pycache__ and runs/ are left out."""
+    h, found = hashlib.sha256(), []
+    for dp, dirs, fns in os.walk(REPO):
+        rel_dp = os.path.relpath(dp, REPO)
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != "__pycache__" and not (
+            rel_dp == "." and d in REPO_CODE_DIRS + ("runs",)))
+        found += [os.path.normpath(os.path.join(rel_dp, f)) for f in fns if f.endswith(".py")]
+    for rel in sorted(found):
+        try:
+            h.update(rel.encode() + b"\0" + _file_digest(os.path.join(REPO, rel)).encode())
+        except OSError:
+            h.update(rel.encode() + b"\0missing")
     return h.hexdigest()
 
 
@@ -2792,7 +2823,7 @@ def _carries(result, ident) -> bool:
             if isinstance(x.get("provenance"), dict):
                 found.append(x["provenance"].get("engine") == ident)
             if isinstance(x.get("rows"), list):          # a grouped result: every member must carry it (Codex r2)
-                found += [False for r in x["rows"] if not (isinstance(r, dict) and isinstance(r.get("provenance"), dict))]
+                found.extend(False for r in x["rows"] if not (isinstance(r, dict) and isinstance(r.get("provenance"), dict)))
             for v in x.values():
                 walk(v, depth + 1)
         elif isinstance(x, list) and depth < 4:
@@ -4240,6 +4271,35 @@ def _self_test_w0a(ok) -> None:
                                            "(a dangling link is hashed as missing, not raised)")
             for x in ("plugins", "obsolete.py"):
                 os.remove(os.path.join(rd, x))
+            # Codex r4: a link retargeted between two places the walk does not enter, a dangling link against a file
+            # whose bytes spell the marker, and repo code outside scripts/ and toolkit/ under an unresolved key
+            os.symlink(".", os.path.join(rd, "v1", "alias"))
+            k2 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "v1", "alias"))
+            os.symlink("..", os.path.join(rd, "v1", "alias"))
+            k3 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "v1", "alias"))
+            os.symlink("gone.py", os.path.join(rd, "optional.py"))
+            k4 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "optional.py"))
+            w("optional.py", "missing", rd)
+            k5 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "optional.py"))
+            w("tools/wt.py", "W = 1\n")
+            u0 = code_fingerprint(rd, os.path.join(repo, "dyn.py::f"))
+            w("tools/wt.py", "W = 2\n")
+            u1 = code_fingerprint(rd, os.path.join(repo, "dyn.py::f"))
+            ok(k2 != k3 and k4 != k5 and u0 != u1,
+               f"FP_RUN_CODE_LINKS2 a retargeted link, a dangling link and repo code outside scripts/ and toolkit/ all "
+               f"change an unresolved key ({k2 != k3}, {k4 != k5}, {u0 != u1})")
+            ident = {"name": "e", "version": "1"}
+            try:
+                c1 = _carries({"provenance": {"engine": ident}}, ident)
+                c2 = _carries({"rows": [{"provenance": {"engine": ident}}, {"x": 1}]}, ident)
+            except Exception as e:  # noqa: BLE001 -- reported in the case
+                c1 = c2 = f"{type(e).__name__}: {e}"
+            ok(c1 is True and c2 is False, f"FP_CARRIES a row with provenance is checked without error, and a group "
+                                           f"with a member without it is refused ({c1}, {c2})")
             # large files: content, never mtime
             with mock.patch.dict(g, {"_FP_HASH_MB": 0}):
                 k0 = code_fingerprint(rd, os.path.join(repo, "job.py::f"))

@@ -176,7 +176,7 @@ def _chains(node):
             while isinstance(parents.get(cur), ast.Attribute) and parents[cur].value is cur:
                 cur = parents[cur]
                 chain.append(cur.attr)
-            yield chain
+            yield chain, n
 
 
 class Walk:
@@ -209,7 +209,7 @@ class Walk:
         """`from m import *` could bind a name m imports from repo code (any top-level repo import: `__all__` can name
         a private one, or be extended at run time), or m is an import guard (its loaders, called by bare name, are
         then not recognised): the walk follows neither."""
-        if isinstance(self.decl(m), dict):
+        if isinstance(self.decl(m), dict) or "__all__" in m.defs:    # __all__ can name a submodule (Codex r4)
             return True
         for n in m.top:
             mod = m._absolute(n) if isinstance(n, ast.ImportFrom) else None
@@ -286,11 +286,16 @@ class Walk:
         """Every file under the declared paths joins the closure; its modules are reached for their classes."""
         for d in paths:
             p = os.path.join(self.repo, d)
-            if not os.path.exists(p):
-                self.unresolved.add(f"{self.rel(m.path)}: FP_DYNAMIC_IMPORTS names {d}, which does not exist")
-            for x in ([p] if os.path.isfile(p) else
-                      [os.path.join(dp, f) for dp, ds, fs in os.walk(p) for f in fs
-                       if not any(s in dp.split(os.sep) for s in SKIP_DIRS) and not f.endswith(SKIP_EXT)]):
+            try:
+                found = [p] if os.path.isfile(p) else [
+                    os.path.join(dp, f) for dp, ds, fs in os.walk(p) for f in fs
+                    if not any(s in dp.split(os.sep) for s in SKIP_DIRS) and not f.endswith(SKIP_EXT)]
+                if not os.path.exists(p):
+                    raise ValueError("does not exist")
+            except (ValueError, OSError) as e:          # Codex r4: a reason, not a lost closure
+                self.unresolved.add(f"{self.rel(m.path)}: FP_DYNAMIC_IMPORTS names {d!r}: {str(e)[:60]}")
+                continue
+            for x in found:
                 x = os.path.realpath(x)
                 self.files.add(x)
                 if x.endswith(".py"):
@@ -325,6 +330,7 @@ class Walk:
                                   todo)
             elif not isinstance(decl, dict):
                 self.declared(m, decl, todo)           # a {kind: paths} declaration is taken at its call sites
+        checked = set()                     # head Names of loader calls (each checked or reported at its call)
         for call in (n for n in ast.walk(node) if isinstance(n, ast.Call)):
             lit = _literal_import(call)
             if lit:
@@ -352,6 +358,11 @@ class Walk:
                 if fname in loaders and kind not in loaders[fname]:    # Codex r2: a function, not walked
                     self.unresolved.add(f"{self.rel(m.path)}:{call.lineno}: {fname}() loads by a data-supplied name "
                                         f"(a loader with no class check for kind {kind!r}): not followed")
+                if fname in loaders:                       # reported above or checked: the call is its use
+                    head = call.func
+                    while isinstance(head, ast.Attribute):
+                        head = head.value
+                    checked.add(id(head))
                 self.declared(tm, decl[kind] if kind in decl else tuple(p for ps in decl.values() for p in ps), todo)
         for n in ast.walk(node):                       # an import runs its module's import-time code
             if isinstance(n, ast.Import):
@@ -361,14 +372,15 @@ class Walk:
                 for a in n.names:
                     self.import_target(m, m._absolute(n), None if a.name == "*" else a.name, todo,
                                        whole=a.name == "*", module_only=a.name != "*", star=a.name == "*")
-        for chain in _chains(node):
+        for chain, nm in _chains(node):
             head = chain[0]
             if head in m.defs:
                 todo.append((m.path, head))
             for mod, attr in m.binds.get(head, ()):
-                self.import_target(m, mod, attr, todo, rest=chain[1:])
+                self.import_target(m, mod, attr, todo, rest=chain[1:], checked=id(nm) in checked, line=nm.lineno)
 
-    def import_target(self, m: _Mod, mod, attr, todo, rest=(), whole=False, module_only=False, star=False) -> None:
+    def import_target(self, m: _Mod, mod, attr, todo, rest=(), whole=False, module_only=False, star=False,
+                      checked=False, line=None) -> None:
         if mod is None:
             self.unresolved.add(f"{self.rel(m.path)}: relative import outside a package")
             return
@@ -384,6 +396,12 @@ class Walk:
             self.unresolved.add(f"{self.rel(m.path)}: import {mod} not found in the repo")
             return
         nxt = names[used:]
+        loaders = (self.decl(self.mod(best), "FP_LOADERS") or {}) if self.mod(best) else {}
+        if loaders and not checked and not module_only and (not nxt or nxt[0] in loaders or nxt[0].startswith("__")
+                                                            or whole):
+            # a loader reached other than as a checked call (a value, an alias, a re-export): Codex r4
+            self.unresolved.add(f"{self.rel(m.path)}:{line or 0}: a loader of {self.rel(best)} used other than as "
+                                "a call with a class-checked kind: not followed")
         tm = self.mod(best) if star else None
         if tm is not None and self.reexports(tm):        # Codex r2: not followed, so not guessed
             self.unresolved.add(f"{self.rel(m.path)}: from {mod} import *: {mod} re-exports names it imports")
@@ -538,6 +556,23 @@ def _self_test() -> int:
         gn = closure(os.path.join(td, "toolkit/c/gnon.py") + "::run", td)
         ok(not gn["unresolved"] and "toolkit/b/far.py" not in gn["files"],
            f"IC16 a call into a guard that is not one of its loaders loads nothing: {gn}")
+        # Codex r4 (ι)
+        put("toolkit/g/api.py", "from toolkit.g import guard as G\n")
+        put("toolkit/c/gmod.py", "from toolkit.g.api import G\n\ndef run(p):\n    return G.resolve('calibrator', p['r'])\n")
+        put("toolkit/c/galias.py", "from toolkit.g import guard as G\n\ndef run(p):\n    load = G.attr\n"
+            "    return load('oracle', p['m'], p['n'])\n")
+        put("toolkit/p2/__init__.py", "__all__ = ['_score']\n")
+        put("toolkit/p2/_score.py", "def _score(p):\n    return 1\n")
+        put("toolkit/c/star4.py", "from toolkit.p2 import *\n\ndef run(p):\n    return _score._score(p)\n")
+        put("toolkit/c/decl2.py", "import importlib\nFP_DYNAMIC_IMPORTS = ('toolkit/b', 'bad\\x00path')\n\n"
+            "def run(p):\n    return importlib.import_module(p)\n")
+        gm, gl, s4, d2 = (closure(os.path.join(td, f"toolkit/c/{n}.py") + "::run", td)
+                          for n in ("gmod", "galias", "star4", "decl2"))
+        ok(gm["unresolved"] and gl["unresolved"] and s4["unresolved"] and d2["unresolved"]
+           and "toolkit/b/far.py" in d2["files"] and not gr["unresolved"],
+           f"IC17 a guard re-exported as a module, a loader taken as a value, a star import of a package that only sets "
+           f"__all__ and a declaration with an unusable path all fail closed (a checked engine load still does not): "
+           f"{gm['unresolved']} {gl['unresolved']} {s4['unresolved']} {d2['unresolved']}")
     print(f"{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)}'}")
     return 1 if fails else 0
 
