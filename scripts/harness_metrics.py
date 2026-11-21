@@ -189,7 +189,7 @@ def pauses(run) -> list[dict]:
     for h in sorted((h for h in hist if h.get("paused")), key=lambda h: utc(h.get("at")) or datetime.max.replace(
             tzinfo=timezone.utc)):
         t = utc(h.get("at"))
-        nxt = next((r for r in resumes if t and r >= t and r not in used), None)
+        nxt = next((r for r in resumes if t and r > t and r not in used), None)   # not the resume it began in
         used.add(nxt)
         out.append({"reason": h["paused"], "state": h.get("state"), "at": t, "resume": nxt, "from": REC})
     signed = next((utc(h.get("at")) for h in hist if h.get("from") == "SIGN" and h.get("to") == "EVIDENCE"), None)
@@ -198,14 +198,14 @@ def pauses(run) -> list[dict]:
         if to not in PAUSE_STATES or t_in is None or (to == "SPEC" and not (signed and t_in >= signed)):
             continue
         t_out = next((utc(x.get("at")) for x in hist[i + 1:] if x.get("from") == to), None)
-        if any(p["reason"] == PAUSE_STATES[to] and p["at"] and p["at"] >= t_in and (t_out is None or p["at"] <= t_out)
-               for p in out if p["from"] == REC):
-            continue                                       # the visit's pauses are recorded
+        rec = [p["at"] for p in out if p["from"] == REC and p["reason"] == PAUSE_STATES[to] and p["at"]
+               and p["at"] >= t_in and (t_out is None or p["at"] <= t_out)]
+        lim = min(rec) if rec else None                    # from here on the visit's pauses are recorded
         start = t_in
         for r in resumes:
             if r in used:
                 start = max(start, r)                      # the end of a recorded pause: the next one starts after
-            elif r >= t_in and (t_out is None or r <= t_out):
+            elif r > t_in and (t_out is None or r <= t_out) and (lim is None or r <= lim):   # whole seconds
                 j = _sign_journal_done(st, start, r) if to == "SIGN" else None
                 out.append({"reason": PAUSE_STATES[to], "state": to, "at": max(start, j) if j else start,
                             "resume": r, "from": INF})
@@ -413,8 +413,9 @@ def chains(dirs, explicit=None) -> list[list[str]]:
         obj, _ = _read(d, "metadata.json") if os.path.isdir(d) else (None, None)
         pr = _d(_d(obj).get("parent_run"))
         cand = names.get(pr.get("run_dir"), [])
-        if len(cand) == 1 and cand[0] != d and (not pr.get("run_state_sha256")
-                                                or pr["run_state_sha256"] == _sha(cand[0], "run_state.json")):
+        if len(cand) == 1 and cand[0] != d and ("run_state_sha256" not in pr     # a hash recorded but null: no link
+                                                or pr["run_state_sha256"] is not None
+                                                and pr["run_state_sha256"] == _sha(cand[0], "run_state.json")):
             parent[d] = cand[0]
     kids = {}
     for c, p in parent.items():
@@ -779,6 +780,23 @@ def _self_test() -> int:
         r = summarise([mk("r_noinv", done, {"invocations": None, "finished": at(1)}, R)])
         ok(r["interventions"]["I5_resumes"]["from"] == NA and r["interventions"]["headline"]["from"] == NA,
            "HM38 a run that records no invocations (before 2026-11-05): I5 and the headline are unavailable")
+        # ---- records PR (Codex round on harness-run-records)
+        h = [{"at": at(3), "from": "SPEC", "to": "SIGN"}, {"at": at(3), "paused": "awaiting_signoff", "state": "SIGN"}]
+        r = summarise([mk("r_sec", {"state": "SIGN", "paused": "awaiting_signoff", "history": h}, inv=(0, 3))], A)
+        ok(iv(r, "I1_pauses") == 0 and r["interventions"]["pending_pauses"] == 1,
+           "HM39 a pause recorded in the same second as the resume that started the session is pending, not ended")
+        h = [{"at": at(1), "from": "SPEC", "to": "SIGN"}, {"at": at(2.5), "paused": "awaiting_signoff", "state": "SIGN"}]
+        r = summarise([mk("r_old", {"state": "SIGN", "paused": "awaiting_signoff", "history": h}, inv=(0, 2))], A)
+        ok(iv(r, "I1_pauses") == 1 and r["interventions"]["pending_pauses"] == 1,
+           "HM40 an older build's unrecorded pause before a recorded one in the same SIGN visit is still inferred")
+        b3 = mk("s_c", fa, {"parent_run": {"run_dir": "r_ok", "run_state_sha256": None}})
+        ok(len(chains([os.path.join(root, "r_ok"), b3])) == 2, "HM41 a parent_run with no hash is never linked")
+        h = [{"at": at(1), "from": "SPEC", "to": "SIGN"}, {"at": at(2), "paused": "awaiting_signoff", "state": "SIGN"}]
+        r = summarise([mk("r_sec2", {"state": "SIGN", "paused": "awaiting_signoff", "history": h}, inv=(0, 2))], A)
+        h = [{"at": at(2), "from": "SPEC", "to": "SIGN"}, {"at": at(2.5), "paused": "awaiting_signoff", "state": "SIGN"}]
+        r2 = summarise([mk("r_sec3", {"state": "SIGN", "paused": "awaiting_signoff", "history": h}, inv=(0, 2))], A)
+        ok(iv(r, "I1_pauses") == 1 and iv(r2, "I1_pauses") == 0, "HM42 same-second edges: a resume in the second "
+           "the new build re-pauses ends the old pause; a resume in the second SIGN is entered ends none")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
