@@ -246,6 +246,10 @@ def _pin_problem(pin) -> str | None:
     but when present it must be a sha256."""
     if not isinstance(pin, dict) or not pin.get("prefix") or not pin.get("bundle_sha256") or "version" not in pin:
         return "no evals/private.yaml naming the bundle (run publish)"
+    v = pin["version"]
+    if (isinstance(v, bool) or not isinstance(v, int) or v < 1 or pin["prefix"] != f"{BLOB_ROOT}/v{v}"
+            or not (isinstance(pin["bundle_sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", pin["bundle_sha256"]))):
+        return f"evals/private.yaml: version, prefix or bundle_sha256 malformed ({v!r}, {pin['prefix']!r})"
     if "manifest_sha256" in pin and not (isinstance(pin["manifest_sha256"], str)
                                          and re.fullmatch(r"[0-9a-f]{64}", pin["manifest_sha256"])):
         return f"evals/private.yaml: manifest_sha256 {pin['manifest_sha256']!r} is not a sha256"

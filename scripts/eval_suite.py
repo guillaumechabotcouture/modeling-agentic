@@ -1088,7 +1088,7 @@ def launch_commands(questions, tag, reps, tree=None, pipeline="v2") -> list[str]
     if not re.fullmatch(TAG_RE, str(tag)) or not isinstance(reps, int) or reps < 1:
         raise ValueError(f"tag {tag!r} must be 1-20 of a-z, 0-9 and -, and reps a positive integer")
     env = (f"EVAL_TAG={tag} EVAL_REPS={reps} EVAL_PIPELINE={pipeline}"
-           + (f" EVAL_TREE={shlex.quote(tree)}" if tree else ""))
+           + f" EVAL_TREE={shlex.quote(tree or '')}")   # '' keeps the default tree and its origin/main check
     return [f"{env} python3 cloud/run_cluster.py cloud/configs/eval_{q}.py launch" for q in questions]
 
 
@@ -1331,6 +1331,10 @@ def _run_command(ap, args, private) -> int:
         new = eval_private.publish(src, version, key, store)
         with tempfile.TemporaryDirectory() as td:   # a download-and-decrypt round trip before the pin is written
             eval_private.fetch(os.path.join(td, "check"), None, store, new)
+            lost = private_problems(os.path.join(td, "check"), suite_questions())   # Codex r2: pack skips symlinks
+            if lost:
+                print(f"refusing to pin: the uploaded bundle is incomplete: {lost[:5]}")
+                return 1
         eval_private.write_pin(new)
         print(f"published {new['prefix']}/bundle.enc (sha256 {new['bundle_sha256']}); round trip verified; "
               f"wrote evals/private.yaml (commit it)")

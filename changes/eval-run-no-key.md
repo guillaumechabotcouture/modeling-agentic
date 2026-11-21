@@ -1,6 +1,6 @@
 ---
 phase: "harness benchmark"
-commit: "eval-run-no-key α-δ"
+commit: "eval-run-no-key α-ζ"
 ---
 
 ## Changelog
@@ -17,7 +17,7 @@ re-checks the manifest's input hashes against the decrypted answer keys, while a
 Since `run` now trusts the manifest's hashes, `publish` also refuses a stored answer key whose input hashes differ
 from the committed inputs (`stale_answer_keys`). `run` also refuses an inherited `EVAL_TREE` without `--tree` (the
 printed command would launch a tree the preflight never checked) and a tag outside a-z, 0-9 and - (it reaches a
-shell under `--execute`); `write_pin` refuses a pin without its required fields; `--self-test` takes no command.
+shell under `--execute`); `write_pin` refuses a pin without its required fields or with a malformed version, prefix or digest; `publish` refuses to pin a bundle whose decrypted round trip is incomplete (`pack` skips symlinks); a default-tree launch line sets `EVAL_TREE=''` so a shell export cannot swap the tree; `--self-test` takes no command.
 Self-tests: E10 (`verify_public` never decrypts or reads the
 keychain; wrong bundle digest, wrong manifest digest and a missing pin fail closed), S20 (`run` prints its launch
 lines with the decrypt, keychain, fetch and open functions all refusing; a wrong bundle digest, a missing bundle, a
