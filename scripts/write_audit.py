@@ -291,6 +291,7 @@ REVIEWED: dict = {
     "scripts/gate_replay.py": {"shutil": (3, _EVAL), "open-write": (1, _EVAL)},
     "scripts/golden_traces.py": {"shutil": (6, _EVAL), "os-remove": (2, _EVAL), "tempfile-dir": (2, _EVAL),
                                  "open-write": (1, _EVAL)},
+    "scripts/harness_metrics.py": {"safeio-derived-root": (1, "--json: the operator's report file, named on the CLI")},
     "scripts/pipeline.py": {
         "shell-command": (1, "_run_cmd runs a step's declared `run` command (shell=True for a non-compute step): the "
                              "agent's own command, run in the run dir with the agent's reach; the harness writes "
