@@ -1,0 +1,20 @@
+---
+phase: "F6"
+commit: "OA posterior exception α–ε"
+---
+
+## Changelog
+
+**An owner-signed exception for a net-effect posterior whose verification recorded failures (owner, 2026-11-20).** A spec can now declare `uncertainty.net_effect_posterior.exception` with these fields:
+
+- `failed_points`: each failed verified point, as `{point, targets}`;
+- `rule`: the rule those points fail;
+- `evidence`: what else was verified;
+- `reason`;
+- `draws`: `keep` or `exclude`, whether the failed points stay in the draws.
+
+`net_effect_fit.load_posterior` accepts an invalid sample only under such an exception, and only when the exception exactly matches the file's recorded failures: the same points (to the file's 6-decimal rounding) failing on the same targets. The rest of the evidence must still pass the 14 Nov rule as it stands. The chosen point, the other verified points, calibration and the grid edge are all replayed.
+
+The exception travels with the posterior's range record, which the manifest and the uncertainty report carry. The sign-off sheet shows it as a HIGH owner-signed departure.
+
+Checked against refit b2's stored output, with no engine run: refused without the exception; 55 rows loaded with `keep`, 54 with `exclude`. Only target misses are waived: the failed point's seed evidence and calibration still bind, the declaration matches the failures one to one, the file must record the sample as invalid with its declared count of verified points, and the exception counts only under the owner's signature: a non-owner signer is refused at signing, and at execution a run whose recorded sign-off is not the owner's refuses it (as for engine departures). Self-tests FE1, FE2 (net_effect_fit.py), UE1 (uncertainty.py), PC12, PC13 (preconditions.py).

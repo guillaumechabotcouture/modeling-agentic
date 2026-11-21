@@ -15,12 +15,15 @@ optimization, decision rules, sensitivity analyses) for public-health
 questions in any disease area: for example "How should a national
 program allocate its malaria budget across districts?", "Where should
 measles campaigns run next year?", or "Which TB case-finding package
-should each district get?". Two pipelines share the rigor gates:
+should each district get?". One pipeline runs; a retired one remains in
+the tree until it is deleted:
 
-- **v1 (`python3 main.py --v1 "<question>"`, only on explicit request)**:
-  a **lead** agent chains the stages PLAN → DATA → MODEL → ANALYZE →
-  CRITIQUE → GATE → WRITE, spawning specialist sub-agents and running
-  mechanical rigor checks between rounds.
+- **v1 (retired by the owner on 2026-11-20)**: a **lead** agent chained
+  the stages PLAN → DATA → MODEL → ANALYZE → CRITIQUE → GATE → WRITE,
+  spawning specialist sub-agents. `main.py --v1`, a `--resume` of a run
+  recorded as v1, a `cloud/run_cluster.py` config with `pipeline="v1"` and a
+  `cloud/vm_job.py` command with `--v1` all refuse: "pipeline v1 is
+  retired (owner, 2026-11-20); use v2". Its code is removed in a later PR.
 - **v2 (default since 2026-11-05, `python3 main.py "<question>"`; `--v2`
   is accepted as a no-op alias)**: code owns the flow.
   `agents/stage_machine.py` steps through the states SPEC → SIGN →
@@ -35,7 +38,8 @@ should each district get?". Two pipelines share the rigor gates:
   Design: `docs/architecture-v2.md`, `docs/design/v2c-orchestration.md`,
   `docs/design/v2-spec-and-analysis.md`.
 
-v1 stays supported until the owner retires it.
+Old v1 run directories stay readable (their `metadata.json` says
+`pipeline: v1`); they are never resumed.
 
 ## Decision design principles (owner default)
 
@@ -173,11 +177,12 @@ spec and relaunch with reuse), and exits 2;
 Every run records which pipeline ran: `metadata.json` holds `pipeline`
 (`v1`|`v2`), `commit` and `launcher` (plus one `invocations` entry per
 start or resume), written by `scripts/lib/pipeline_id.py` before the run
-starts. A run recorded under one pipeline is not resumed under the other.
+starts. A run recorded under one pipeline is not resumed under the other,
+and a run recorded as v1 is not resumed at all.
 Launchers state the pipeline explicitly and never rely on the default:
 `cloud/run_cluster.py` configs set `pipeline=` and the launch refuses a
 config whose declaration the shipped code does not confirm;
-`cloud/vm_job.py` refuses a `main.py` command without `--v1` or `--v2`.
+`cloud/vm_job.py` refuses a `main.py` command without `--v2`.
 Readers treat a missing field as `unknown`, never as a pipeline.
 
 Cloud and third-party credentials (`AZ_*`, `AZURE_*`, `OPENAI_*`,
@@ -254,8 +259,8 @@ storage and the legacy Azure Batch path).
 Live verification (a real run, on the cloud: `cloud/run_cluster.py
 <config> launch`, or `cloud/vm_job.py run` for one job). Prefer
 alternating the disease area between retros so gates are not tuned to
-one domain. The pipeline is v2 unless `--v1` is passed; state it anyway
-in any command you write down:
+one domain. The pipeline is v2 (v1 is retired); state `--v2` anyway in any
+command you write down:
 
 ```bash
 python3 main.py --v2 "<research question>" --max-rounds 4 --signoff owner
@@ -264,9 +269,7 @@ python3 main.py --v2 "<research question>" --max-rounds 4 --signoff owner
 A v2 run produces `runs/<timestamp>_<question>/` with `run_state.json`,
 the gate records and the report. It pauses at SIGN until the owner signs
 the decision spec (`python3 agents/stage_machine.py sign <run_dir> --by
-owner`); use `--signoff lead` for unattended test runs. A v1 run
-(`--v1 --max-sessions 5`) waits for the decision brief instead
-(`python3 scripts/decision_brief.py show|sign <run_dir>`).
+owner`); use `--signoff lead` for unattended test runs.
 
 **A smoke must show that the changed code ran.** A run that finishes is
 not evidence: on 2026-11-05 a re-run meant to test a v2 fix ran v1 and

@@ -347,10 +347,9 @@ async def run(question: str, max_rounds: int, max_sessions: int,
               allow_cloud: bool = False, cross_model: bool = False,
               methods_critic: bool = False, max_budget_usd: float | None = None,
               signoff: str = "owner", signoff_hours: float = 24.0, identity: dict | None = None) -> str:
-    """Run the modeling pipeline as a single lead agent session (pipeline v1, `--v1`).
-
-    Returns the terminal status written to metadata.json.
-    """
+    """The v1 lead session: retired (owner, 2026-11-20). Refuses before it creates or reads anything,
+    whatever `identity` a caller passes (its code goes in the delete PR)."""
+    raise pipeline_id.PipelineError(pipeline_id.RETIRED_MESSAGE)
 
     # Create or reuse run directory
     if run_dir is None:
@@ -1020,19 +1019,64 @@ def _self_test_pipeline(ok, _outcome) -> None:
         rc = drive("--v2", "--launcher", "run_cluster:x", "Q?")
         ok(rc == 0 and calls[:1] and calls[0][0] == "v2" and calls[0][1]["launcher"] == "run_cluster:x",
            f"PV3 --v2 is a no-op alias; --launcher is recorded ({calls})")
-        rc = drive("--v1", "--skip-preflight", "Q?")
-        ok(rc == 0 and [c[0] for c in calls] == ["v1"] and calls[0][1]["pipeline"] == "v1",
-           f"PV4 --v1 runs the lead pipeline with its identity ({rc}, {calls})")
+        # PV4 (v1 retired, owner 2026-11-20): --v1 is refused before anything runs, preflight included.
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = drive("--v1", "Q?")
+        ok(rc == 2 and not calls and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
+           f"PV4 --v1 is refused with the retirement message ({rc}, {calls}, {err.getvalue()[-120:]!r})")
         rc = drive("--v1", "--v2", "Q?")
-        ok(rc == ("exit", 2) and not calls, f"PV5 --v1 with --v2 is refused before anything runs ({rc})")
+        ok(rc == 2 and not calls, f"PV5 --v1 with --v2 is refused before anything runs ({rc})")
         with tempfile.TemporaryDirectory() as td:
             rp = os.path.join(td, "r1")
             os.makedirs(rp)
             json.dump({"question": "Q?", "pipeline": "v1"}, open(os.path.join(rp, "metadata.json"), "w"))
-            rc = drive("--resume", rp)
-            ok(rc == 1 and not calls, f"PV6 a run recorded as v1 is not resumed under the v2 default ({rc}, {calls})")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = drive("--resume", rp)
+            ok(rc == 1 and not calls and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
+               f"PV6 a run recorded as v1 is refused as retired ({rc}, {calls}, {err.getvalue()[-120:]!r})")
             rc = drive("--v1", "--skip-preflight", "--resume", rp)
-            ok(rc == 0 and [c[0] for c in calls] == ["v1"], f"PV7 ... it resumes with --v1 ({rc})")
+            ok(rc == 2 and not calls, f"PV7 ... and not resumed with --v1 either ({rc})")
+            os.remove(os.path.join(rp, "metadata.json"))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = drive("--v2", "--resume", rp)
+            ok(rc == 1 and not calls and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
+               f"PV7b a run with no record and no run_state.json (v1's files) is refused as retired ({rc}, "
+               f"{err.getvalue()[-160:]!r})")
+            # PV7c (Codex P2): a retired run is refused as retired before the eval isolation check.
+            json.dump({"question": "Q?", "pipeline": "v1", "eval_question": True}, open(os.path.join(rp, "metadata.json"), "w"))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = drive("--resume", rp)
+            ok(rc == 1 and not calls and pipeline_id.RETIRED_MESSAGE in err.getvalue(),
+               f"PV7c a v1 eval run is refused as retired ({rc}, {err.getvalue()[-160:]!r})")
+            # PV7d (Codex P1): the lead pipeline's entry refuses whatever identity a caller passes, or none.
+            def _no_dir(q):
+                raise AssertionError("main.run created a run dir")
+            g["create_run_dir"] = _no_dir
+            for ident in ({"pipeline": "v1", "commit": "abc1234", "launcher": "direct"},
+                          {"pipeline": "v2", "commit": "abc1234", "launcher": "direct"}, None):
+                try:
+                    asyncio.run(saved["run"]("Q?", 1, 1, identity=ident))
+                    ok(False, f"PV7d main.run refuses to start the lead pipeline (identity {ident})")
+                except pipeline_id.PipelineError as e:
+                    ok(str(e) == pipeline_id.RETIRED_MESSAGE, f"PV7d main.run refuses before creating a run dir: {e}")
+                except AssertionError as e:
+                    ok(False, f"PV7d main.run refuses before creating a run dir (identity {ident}): {e}")
+            g["create_run_dir"] = saved["create_run_dir"]
+            # PV7e (Codex round 2): main_v2 called directly does not resume (or restamp) a run recorded as v1.
+            from agents import stage_machine as _sm3
+            _sm3.init_run(rp, "Q?")
+            json.dump({"question": "Q?", "pipeline": "v1"}, open(os.path.join(rp, "metadata.json"), "w"))
+            import argparse as _ap
+            rc = saved["main_v2"](_ap.Namespace(resume=rp, question=None, cloud=False, max_rounds=1, signoff="lead",
+                                                max_budget_usd=None, dev_unsandboxed_derivations=False))
+            ok(rc == 1 and json.load(open(os.path.join(rp, "metadata.json"))).get("pipeline") == "v1",
+               f"PV7e main_v2 refuses a run recorded as v1 and leaves its record alone ({rc})")
             # PV8: a real main_v2 (machine stubbed at run_v2) stamps metadata.json, and the machine's
             # init_run keeps the stamp instead of replacing metadata.json.
             g["main_v2"] = saved["main_v2"]
@@ -1069,15 +1113,43 @@ def _self_test_pipeline(ok, _outcome) -> None:
             rp = os.path.join(td, "r2")
             os.makedirs(rp)
             json.dump({"question": "Q?"}, open(os.path.join(rp, "metadata.json"), "w"))
-            open(os.path.join(rp, "run_state.json"), "w").write("{}")
+            from agents import stage_machine as _sm2
+            _sm2.init_run(rp, "Q?")            # a readable run state (Codex on the retirement PR: {} is unreadable)
+            g["main_v2"] = fake_v2              # PV8 restored the real one
+            json.dump({"question": "Q?"}, open(os.path.join(rp, "metadata.json"), "w"))
             rc = drive("--v1", "--skip-preflight", "--resume", rp)
-            ok(rc == 1 and not calls, f"PV11 a v2 run with no recorded pipeline is not resumed with --v1 ({rc}, {calls})")
-            rc = drive("--resume", rp)
-            ok(rc == 1 and not calls, f"PV11c (Codex r2) ... nor on the default: a run with no recorded pipeline needs "
-                                      f"an explicit flag ({rc}, {calls})")
+            ok(rc == 2 and not calls, f"PV11 a v2 run with no recorded pipeline is not resumed with --v1 ({rc}, {calls})")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = drive("--resume", rp)
+            ok(rc == 1 and not calls and "records no pipeline" in err.getvalue() and "--v2" in err.getvalue(),
+               f"PV11c (Codex r2) ... nor on the default: a run with no recorded pipeline needs "
+               f"an explicit flag ({rc}, {calls}, {err.getvalue()[-160:]!r})")
+            from agents import stage_machine as _sm4, v2_sdk_tasks as _vt4
+            got_run: list = []
+            sm4, vt4 = _sm4.run_v2, _vt4.SdkTasks
+            _sm4.run_v2 = lambda question, run_dir, tasks, **kw: got_run.append((question, run_dir)) or "completed"
+            _vt4.SdkTasks = lambda *a, **k: None
+            g["main_v2"] = saved["main_v2"]
+            try:
+                rc = drive("--v2", "--resume", rp)
+            finally:
+                _sm4.run_v2, _vt4.SdkTasks = sm4, vt4
+                g["main_v2"] = fake_v2
+            ok(rc == 0 and got_run == [("Q?", rp)],
+               f"PV11d ... and the real main_v2 resumes it with an explicit --v2: its directory and saved question "
+               f"({rc}, {got_run})")
+            # PV11e (Codex round 2): --preflight-only with --resume of an unrecorded v2 run still runs the preflight.
+            json.dump({"question": "Q?"}, open(os.path.join(rp, "metadata.json"), "w"))   # unrecorded again
+            rc = drive("--preflight-only", "--resume", rp)
+            ok(rc == 3 and [c[0] for c in calls] == ["preflight"],
+               f"PV11e --preflight-only --resume runs the preflight, as before ({rc}, {calls})")
             json.dump({"question": "Q?", "pipeline": "V2!"}, open(os.path.join(rp, "metadata.json"), "w"))
-            rc = drive("--resume", rp)
-            ok(rc == 1 and not calls, f"PV11b a malformed recorded pipeline is refused ({rc}, {calls})")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = drive("--resume", rp)
+            ok(rc == 1 and not calls and "is not v1 or v2" in err.getvalue(),
+               f"PV11b a malformed recorded pipeline is refused ({rc}, {calls}, {err.getvalue()[-160:]!r})")
         # PV9: the lead pipeline's end-of-run restore puts the identity back if a run tool changed it.
         with tempfile.TemporaryDirectory() as td:
             mp = os.path.join(td, "metadata.json")
@@ -2980,9 +3052,13 @@ def main_v2(args, ident: dict | None = None) -> int:
     ident = ident or pipeline_id.identity("v2", REPO_ROOT)
     if args.resume:
         run_path = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
+        why = pipeline_id.retired_resume(_metadata_dict(os.path.join(run_path, "metadata.json")), run_path)
+        if why:                        # a run recorded as v1 is never resumed or restamped (retired)
+            print(f"Error: {why}", file=sys.stderr)
+            return 1
         st = stage_machine.load_state(run_path)
         if st is None:
-            print(f"Error: {run_path} has no run_state.json (not a v2 run; pass --v1 to resume a v1 run)")
+            print(f"Error: {run_path} has no run_state.json: no v2 run state to resume")
             return 1
         question = st.question
     else:
@@ -3041,8 +3117,7 @@ def main() -> int:
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip the live preflight before a run (not recommended)")
     parser.add_argument("--v1", action="store_true",
-                        help="Run the v1 lead-session pipeline. Only on explicit request: v2 (the stage "
-                             "machine, agents/stage_machine.py) is the default since 2026-11-05.")
+                        help="Refused: pipeline v1 is retired (owner, 2026-11-20); use v2 (the default).")
     parser.add_argument("--v2", action="store_true",
                         help="Run the v2 stage machine (the default; accepted so existing commands work).")
     parser.add_argument("--launcher", default=None,
@@ -3058,12 +3133,20 @@ def main() -> int:
         return _run_self_test()
     try:
         pipeline = pipeline_id.select(args.v1, args.v2)
-    except pipeline_id.PipelineError as e:
-        parser.error(str(e))
+    except pipeline_id.PipelineError as e:    # --v1: pipeline v1 is retired (owner, 2026-11-20)
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 2
     # Phase 50 α: an eval-suite question runs only on a cloud worker (its work directory is
     # the launch archive: no evals/, no .git), so agents cannot reach answer keys by any
     # route. Checked on the question the run will actually use, including --resume, and
     # before the v2 dispatch so --v2 runs get the same refusal.
+    _rp = None
+    if args.resume:   # a run recorded as v1 is never resumed (retired): said before any other refusal
+        _rp = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
+        why = pipeline_id.retired_resume(_metadata_dict(os.path.join(_rp, "metadata.json")), _rp)
+        if why:
+            print(f"Error: {why}", file=sys.stderr)
+            return 1
     why = eval_refusal(args, os.path.dirname(os.path.abspath(__file__)))
     if why:
         print(f"REFUSED: {why}", file=sys.stderr)
@@ -3073,24 +3156,15 @@ def main() -> int:
     ident = pipeline_id.identity(pipeline, REPO_ROOT, args.launcher)
     print(f"Pipeline: {ident['pipeline']} | commit {ident['commit']} | launcher {ident['launcher']}", flush=True)
     if args.resume:   # a run continues under the pipeline it was recorded with
-        _rp = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
         why = pipeline_id.resume_conflict(_metadata_dict(os.path.join(_rp, "metadata.json")), pipeline, _rp,
                                           explicit_flag=bool(args.v1 or args.v2))
         if why:
             print(f"Error: {why}", file=sys.stderr)
             return 1
-    if pipeline == "v2":
-        try:
-            return main_v2(args, ident)
-        except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
-            return 130
-    if not args.skip_preflight:
-        rc = _preflight_and_report(args)
-        if rc:
-            return rc
-    if args.max_sessions < 1 or args.max_rounds < 1:
-        parser.error("--max-sessions and --max-rounds must be >= 1")
-    return _run_v1(args, ident)
+    try:
+        return main_v2(args, ident)
+    except KeyboardInterrupt:      # ST5c: as the lead pipeline, an interrupt exits 130
+        return 130
 
 
 def _preflight_and_report(args) -> int:
@@ -3111,47 +3185,6 @@ def _preflight_and_report(args) -> int:
               f" ({(cm.stdout + cm.stderr).strip()[:80]})", flush=True)
         pf["ok"] = pf["ok"] and cm_ok
     return 0 if pf["ok"] else 3
-
-
-def _run_v1(args, ident: dict) -> int:
-    """The v1 lead-session pipeline (`--v1`)."""
-    if args.resume:
-        run_path = args.resume if os.path.isabs(args.resume) else os.path.join(os.getcwd(), args.resume)
-        if not os.path.isdir(run_path):
-            print(f"Error: {run_path} not found")
-            return 1
-
-        meta_path = os.path.join(run_path, "metadata.json")
-        question = args.question
-        if not question and os.path.exists(meta_path):
-            with open(meta_path) as f:
-                meta = json.load(f)
-            question = meta.get("question", "")
-
-        if not question:
-            print("Error: no question found in metadata and none provided")
-            return 1
-
-        run_dir = os.path.basename(run_path)
-        coro = run(question, args.max_rounds, args.max_sessions,
-                   run_dir=run_dir, run_path=run_path, allow_cloud=args.cloud,
-                   cross_model=args.cross_model, methods_critic=args.methods_critic,
-                   max_budget_usd=args.max_budget_usd,
-                   signoff=args.signoff, signoff_hours=args.signoff_hours, identity=ident)
-    else:
-        if not args.question:
-            print("Error: question is required (or use --resume)")
-            return 1
-        coro = run(args.question, args.max_rounds, args.max_sessions,
-                   allow_cloud=args.cloud, cross_model=args.cross_model,
-                   methods_critic=args.methods_critic, max_budget_usd=args.max_budget_usd,
-                   signoff=args.signoff, signoff_hours=args.signoff_hours, identity=ident)
-    try:
-        status = asyncio.run(coro)
-    except KeyboardInterrupt:
-        # metadata was already written by run()'s finally block
-        return 130
-    return exit_code_for(status)
 
 
 if __name__ == "__main__":
