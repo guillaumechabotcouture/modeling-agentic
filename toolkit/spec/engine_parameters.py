@@ -515,18 +515,44 @@ def held(spec) -> dict:
     return {n: v for n, v in vals.items() if n not in dr}
 
 
+def companions(dt) -> dict:
+    """{parameter: value} of a parameter_value decision test's `with`: companion engine parameters held at these
+    values in every case of the test (owner, 20 Nov). {} without the field or for a malformed one (validation
+    reports that)."""
+    w = dt.get("with") if isinstance(dt, dict) and dt.get("type") == "parameter_value" else None
+    return {str(k): float(v) for k, v in w.items() if _isnum(v)} if isinstance(w, dict) else {}
+
+
+def test_settings(dt, numbers_only: bool = False, names=None) -> dict:
+    """{parameter: [values]} a parameter_value decision test sets: its own parameter's values and each companion's
+    value. Every reader of what a test sets (the design box, held spec values, hard bounds) uses this. The test's own
+    values are read as the runner reads them, with float(): a quoted number counts and a value that is not a number
+    raises ValueError (as these readers did before `with`; Codex r1-r2). `numbers_only`: only values written as
+    numbers, nothing raised (tested_boxes' rule before `with`). `names`: the parameters the reader uses; a test's own
+    values are read only when its parameter is one of them, so a value the reader never used raises nothing (Codex
+    r3), and only those parameters are returned."""
+    if not isinstance(dt, dict) or dt.get("type") != "parameter_value":
+        return {}
+    out = {k: [v] for k, v in companions(dt).items() if names is None or k in names}
+    if names is not None and dt.get("parameter") not in names:
+        return out
+    vs = [float(x) for x in dt.get("values") or [] if not numbers_only or _isnum(x)]
+    if vs and isinstance(dt.get("parameter"), str):
+        out[dt["parameter"]] = out.get(dt["parameter"], []) + vs
+    return out
+
+
 def tested_boxes(spec) -> dict:
-    """{parameter: [lo, hi]} for each held spec value that a parameter_value decision test varies: the box spans the
-    spec value and the tested values (the emulator design input; the draws keep the spec value)."""
+    """{parameter: [lo, hi]} for each held spec value that a parameter_value decision test varies or holds as a
+    companion: the box spans the spec value and the tested values (the emulator design input; the draws keep the spec
+    value)."""
     hv = held(spec)
     out = {}
     for dt in ((_raw(spec).get("analysis") or {}).get("decision_tests") or []):
-        if not isinstance(dt, dict) or dt.get("type") != "parameter_value" or dt.get("parameter") not in hv:
-            continue
-        vs = [float(x) for x in dt.get("values") or [] if _isnum(x)]
-        if vs:
-            lo, hi = out.get(dt["parameter"], [hv[dt["parameter"]]] * 2)
-            out[dt["parameter"]] = [min(lo, *vs), max(hi, *vs)]
+        for n, vs in test_settings(dt, numbers_only=True, names=hv).items():
+            if n in hv:
+                lo, hi = out.get(n, [hv[n]] * 2)
+                out[n] = [min(lo, *vs), max(hi, *vs)]
     return {k: v for k, v in sorted(out.items()) if v[0] < v[1]}
 
 
