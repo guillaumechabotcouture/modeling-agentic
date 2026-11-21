@@ -205,19 +205,20 @@ def candidate_entries(spec: dict, engines=None) -> list:
 
 
 def _departures(spec: dict, departures: str) -> tuple[dict, str]:
-    """(the spec whose departures may count, their status). "proposed": the pre-sign check, the spec's own. Otherwise
-    only those of the run's spec file as the owner signed it (benchmark_coverage.signature: signed_by owner, bytes
-    unchanged); a lead's signature or a changed spec counts none."""
-    if departures == "proposed":
-        return spec, "proposed"
+    """(the spec whose departures may count, their status). "proposed": the pre-sign check, the spec's own
+    ("provisional_lead": the lead's pre-sign check, D2). Otherwise only those of the run's spec file as it was signed
+    (benchmark_coverage.signature, bytes unchanged): the owner's ("signed") or, provisionally, the lead's
+    ("provisional_lead"); a changed spec counts none."""
+    if departures in ("proposed", "provisional_lead"):
+        return spec, departures
     from toolkit.engines import benchmark_coverage as BC
     rd = spec.get("_run_dir")
     try:
         st = BC.signature(rd) if rd else "unsigned"
-        if st == "signed":
+        if st in ("signed", "provisional_lead"):
             import yaml
             signed = (yaml.safe_load(open(os.path.join(rd, SPEC_FILE))) or {}).get("engine_departures") or []
-            return dict(spec, engine_departures=signed), "signed"
+            return dict(spec, engine_departures=signed), st
     except Exception:  # noqa: BLE001 -- unreadable sign-off: no departure counts (fail closed)
         pass
     return spec, "unsigned"
@@ -948,11 +949,13 @@ def _self_test_benchmark_gate(ok) -> None:
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             e = schema.validate(schema.load(p), pending_ok=True)
             ok(e == [], f"G4 the spec with a proposed departure validates before sign-off ({e[:2]})")
-            try:
-                signoff.sign(run, "lead")
-                ok(False, "G5e a lead cannot sign a spec whose engine needs a departure")
-            except ValueError as ex:
-                ok("owner" in str(ex), f"G5e a lead cannot sign a spec whose engine needs a departure ({str(ex)[:100]})")
+            from toolkit.spec import preconditions as PC
+            lo = [x for x in PC.problems(run, open(p, "rb").read(), "lead", spec=schema.load(p)) if "benchmark" in x]
+            ok(lo != [], "G5h (Codex r2 of #313) in a run that is not a lead run, a lead cannot sign the departure")
+            json.dump({"signoff": "lead"}, open(os.path.join(run, "run_state.json"), "w"))     # a --signoff lead run
+            le = [x for x in PC.problems(run, open(p, "rb").read(), "lead", spec=schema.load(p)) if "benchmark" in x]
+            ok(le == [], f"G5e (D2) a lead may sign a spec whose engine needs a departure: it counts as provisional "
+                         f"({le[:1]})")
             signoff.sign(run, "owner")
             r = eligible_engines(dict(spec_ab, _run_dir=run), entry)[0]
             ok(r["eligible"] and r["departures"] == [dict(dep, status="signed", benchmark_status="out_of_band",
@@ -969,11 +972,12 @@ def _self_test_benchmark_gate(ok) -> None:
             so = os.path.join(run, signoff.SPEC_SIGNOFF)
             rec0 = json.load(open(so))
             json.dump(dict(rec0, signed_by="lead"), open(so, "w"))
+            json.dump({"signoff": "lead"}, open(os.path.join(run, "run_state.json"), "w"))    # a --signoff lead run
             r = eligible_engines(dict(spec_ab, _run_dir=run), entry)[0]
             e = schema.validate(schema.load(p))
-            ok(not r["eligible"] and any("engine benchmarks" in x for x in e),
-               f"G5f a spec signed by the lead: its departure counts neither at the engine choice nor at the "
-               f"analysis's validation ({e[:1]})")
+            ok(r["eligible"] and [x.get("status") for x in r["departures"]] == ["provisional_lead"] and e == [],
+               f"G5f (D2) a spec signed by the lead: its departure counts at the engine choice and at the analysis's "
+               f"validation, as provisional_lead ({r.get('why_not', [])[:1]}, {e[:1]})")
             json.dump(rec0, open(so, "w"))
             with open(p, "a") as f:
                 f.write("\n# edited after sign-off\n")
