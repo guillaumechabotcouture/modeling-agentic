@@ -420,7 +420,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                   reason="; ".join(dp))
     arts["decision_tests"] = S.write("decision_tests", {"tests": [
         {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
-         "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
+         "verdict": DT.verdict(x), "within_solver_gap": bool(x.get("within_solver_gap")),
          "can_move_plan": x["can_move_plan"], "threshold_pct": 100.0 * x["share_threshold"],
          "share_pct": None if x["share_units_changed"] is None else 100.0 * x["share_units_changed"],
          # F6 S1-5: what moves beside the share, and which criterion changed the plan

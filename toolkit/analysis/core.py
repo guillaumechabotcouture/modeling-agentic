@@ -96,6 +96,30 @@ def auxiliary(A, kind: str):
         A.aux = prev
 
 
+def best_known(A, sol, plan, ben, cost, budget=None, feas=None) -> dict:
+    """For a solve that accepted a plan it could not prove optimal (status "feasible", gap g): the better of that
+    incumbent and the point plan `plan`, when the point plan meets this problem's constraints (the allocator's own
+    check), so a comparison with the point plan never shows the point plan beating the "optimum". Adds
+    `solver_gap` = {gap, bound, kept}: the true optimum is at most `bound` above the returned objective (g / (1 - g)
+    of the incumbent's gain, less what the point plan recovers). A proven solve is returned as it is."""
+    if sol.get("status") != "feasible" or sol.get("gap") is None:
+        return sol
+    if budget is None:
+        budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
+    g, out, kept = float(sol["gap"]), dict(sol), "incumbent"
+    top = float(sol["objective"]) + g / (1.0 - g) * abs(float(sol.get("gain") or 0.0))
+    try:
+        pobj = float(sum(ben[i][plan[i]] for i in A.ids))
+        fits = not aopt.check(plan, ben, cost, feas or A.feas, budget)
+    except (KeyError, TypeError, ValueError):
+        fits = False
+    if fits and pobj > float(sol["objective"]):
+        out.update(choice=dict(plan), objective=pobj)
+        kept = "point_plan"
+    out["solver_gap"] = {"gap": g, "bound": max(0.0, top - float(out["objective"])), "kept": kept}
+    return out
+
+
 def _problem_key(ben, cost, feas, budget):
     """A hash of one solve's inputs, or None (then nothing is kept) when they cannot be serialised or a unit or
     package id is not text (the encoding writes ids as text, so 1 and "1" would share a key: Codex r1 P1-6) or a table
@@ -298,7 +322,9 @@ class Analysis:
         r["time_limit_s"] = float(st["time_limit_s"])
         log["solves"] += 1
         gap = r.get("gap")
-        used = kind and r["status"] == "feasible" and gap is not None and gap <= float(st["aux_gap_max"])
+        # used only with its gain too: best_known() states the bound to the optimum from the gap and that gain
+        used = (kind and r["status"] == "feasible" and gap is not None and r.get("gain") is not None
+                and gap <= float(st["aux_gap_max"]))
         if r["status"] == "optimal" or used:
             if key is not None and set(r["choice"]) == set(self.ids):
                 memo[key] = (tuple(r["choice"][i] for i in self.ids), {k: v for k, v in r.items() if k != "choice"})

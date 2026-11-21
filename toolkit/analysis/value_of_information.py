@@ -411,6 +411,39 @@ def too_few(draws: int, report: dict, A) -> dict:
             "inputs": [], "not_drawn": not_drawn(report, A), "outcome": A.primary}
 
 
+def clean_solve(A, ben, cost, budget, ev, d):
+    """One draw's best plan at `budget` on which no model correction `ev` bears (run()'s clean()). Both solves are
+    auxiliary solves of the same kind, so each is counted and may use a feasible plan within the stated gap (1C-c
+    follow-up, Codex r2 P1). None when the first solve has no usable plan, a correction bears on every plan, or the
+    solve without the corrected packages fails; a proven infeasibility of the first solve is raised, as before."""
+    from toolkit.analysis.core import AnalysisBlocked, SolveFailed, auxiliary
+    try:
+        with auxiliary(A, "value_of_information"):
+            sol = A.solve(ben, cost, budget=budget)
+    except SolveFailed as e:
+        if e.status == "infeasible":
+            raise
+        return None
+    try:
+        A.guard(f"uncertainty draw {d}", [sol["choice"]], ev)
+        return sol
+    except AnalysisBlocked:
+        pass
+    if any(e.get("package") in ("*", getattr(A, "comp", None)) for e in ev):
+        return None
+    f = dict(A.feas, feasible={u: dict(v) for u, v in A.feas["feasible"].items()})
+    for e in ev:
+        if str(e.get("unit")) in f["feasible"] and e.get("package") in f["feasible"][str(e.get("unit"))]:
+            f["feasible"][str(e["unit"])][e["package"]] = False
+    try:
+        with auxiliary(A, "value_of_information"):
+            sol = A.solve(ben, cost, budget=budget, feas=f)
+        A.guard(f"uncertainty draw {d}", [sol["choice"]], ev)
+        return sol
+    except (AnalysisBlocked, RuntimeError, ValueError):
+        return None
+
+
 def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, level: float = 0.95, seed: int = 0,
         thr=None) -> dict:
     """The value_of_information artifact from the uncertainty step's draws (`col`), the headline plan and the declared
@@ -512,32 +545,7 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
         """The draw's best plan at `budget` on which no model correction bears: when the optimum carries one, the
         corrected packages are taken out in that draw and it is solved again (None when a correction bears on every
         plan, on the comparator or a whole unit)."""
-        from toolkit.analysis.core import SolveFailed, auxiliary
-        try:      # 1C-c: a draw with no usable plan at this budget keeps its value within the reserve (None)
-            with auxiliary(A, "value_of_information"):
-                sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=budget)
-        except SolveFailed as e:
-            if e.status == "infeasible":      # a proven infeasibility is raised, as before
-                raise
-            return None
-        try:
-            A.guard(f"uncertainty draw {d}", [sol["choice"]], rows[d]["events"])
-            return sol
-        except AnalysisBlocked:
-            pass
-        ev = rows[d]["events"]
-        if any(e.get("package") in ("*", getattr(A, "comp", None)) for e in ev):
-            return None
-        f = dict(A.feas, feasible={u: dict(v) for u, v in A.feas["feasible"].items()})
-        for e in ev:
-            if str(e.get("unit")) in f["feasible"] and e.get("package") in f["feasible"][str(e.get("unit"))]:
-                f["feasible"][str(e["unit"])][e["package"]] = False
-        try:
-            sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=budget, feas=f)
-            A.guard(f"uncertainty draw {d}", [sol["choice"]], ev)
-            return sol
-        except (AnalysisBlocked, RuntimeError, ValueError):
-            return None
+        return clean_solve(A, tab(Bn[d]), tab(Cs[d]), budget, rows[d]["events"], d)
     pi = obj.copy()
     if getattr(A, "plan_budget", None) is not None and abs(float(A.plan_budget) - B) > 1e-9 * max(1.0, B):
         # the draws were re-optimised within a reserve; with perfect information costs are known: the full budget

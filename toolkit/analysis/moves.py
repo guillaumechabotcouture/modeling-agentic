@@ -119,6 +119,34 @@ def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, comp
     return rec
 
 
+def solver_gap(rec: dict, sg, thr: dict) -> dict:
+    """A compare() row whose re-solved plan the solver accepted without proving it (`sg`: core.best_known's
+    solver_gap; None for a proven solve, and the row is returned as it is). The true regret lies between `regret` and
+    `regret + bound`, recorded as `regret_solver_gap`; a regret below zero is clipped at zero and noted.
+    `within_solver_gap` is True when the verdict cannot be settled inside that bound: the regret criterion fires at
+    one end and not at the other, or the row changes the plan while the re-solved plan's advantage over the point
+    plan is no larger than the bound. `decision_changes` and `triggered_by` stay as computed."""
+    if not sg:
+        return rec
+    rec, b = dict(rec), float(sg["bound"])
+    clipped = rec.get("regret") is not None and rec["regret"] < 0
+    if clipped:
+        rec["regret"] = 0.0
+        rec["regret_share"] = None if rec.get("regret_share") is None else 0.0
+    soft = False
+    if rec.get("regret") is not None:
+        top = float(rec["reoptimised_objective"]) + b
+        hi = dict(rec, regret=rec["regret"] + b, reoptimised_objective=top,
+                  regret_share=(rec["regret"] + b) / top if top > 0 else None)
+        soft = (fires(rec, "regret", thr["regret"]) != fires(hi, "regret", thr["regret"])
+                or (bool(rec.get("decision_changes")) and rec["regret"] <= b))
+    rec["regret_solver_gap"] = {"gap": float(sg["gap"]), "bound": b, "kept": sg.get("kept"), "clipped": bool(clipped),
+                                "note": "the re-solved plan was accepted without a proof of optimality: the regret "
+                                        "against the true optimum lies between regret and regret + bound"}
+    rec["within_solver_gap"] = bool(soft)
+    return rec
+
+
 REGRET_TOL = 1e-9      # relative to max(1, |objective|); scripts/mechanism_manifest.py holds the same rule
 
 
@@ -198,15 +226,18 @@ def aggregate(rows: list) -> dict:
             "population_changed_share": w["population"]["population_changed_share"], "worst_by_criterion": wb}
 
 
-def summarise(A, plan, ch, ben, cost, objective, budget=None, feas=None) -> dict:
+def summarise(A, plan, ch, ben, cost, objective, budget=None, feas=None, gap=None) -> dict:
     """compare() for the analysis state: its population, region, allocatable budget, thresholds and components; the
-    point plan is checked against `budget` (default: the budget plans are solved at) and `feas` (default A.feas)."""
+    point plan is checked against `budget` (default: the budget plans are solved at) and `feas` (default A.feas).
+    `gap`: the solve's solver_gap (core.best_known) when its plan was accepted unproven; see solver_gap()."""
     reg = {i: A.by_id[i].get(A.region) for i in A.ids} if A.region else None
     if budget is None:
         budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
-    return compare(A.ids, plan, ch, ben, getattr(cost, "by_component", None), objective, population(A), reg,
-                   A.budget, thresholds(A.spec["analysis"]), list(A.spec["options"]["components"]),
-                   plan_budget=budget, feas=feas if feas is not None else getattr(A, "feas", None))
+    thr = thresholds(A.spec["analysis"])
+    return solver_gap(compare(A.ids, plan, ch, ben, getattr(cost, "by_component", None), objective, population(A), reg,
+                              A.budget, thr, list(A.spec["options"]["components"]),
+                              plan_budget=budget, feas=feas if feas is not None else getattr(A, "feas", None)),
+                      gap, thr)
 
 
 # --------------------------------------------------------------------------- self-test

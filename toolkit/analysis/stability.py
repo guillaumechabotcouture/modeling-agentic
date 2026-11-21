@@ -26,7 +26,7 @@ import numpy as np
 import yaml
 
 from toolkit.analysis import calibration as C, moves as MV
-from toolkit.analysis.core import SolveFailed, auxiliary, merge_costs
+from toolkit.analysis.core import SolveFailed, auxiliary, best_known, merge_costs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRODUCER = "toolkit/analysis/stability.py"
@@ -128,6 +128,7 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
             folds.append({"group": gv, "status": "not_run", "n_units": len(hid),
                           "reason": f"the fold's plan was not solved ({e})"})
             continue
+        sol = best_known(A, sol, plan, ben_f, cost_f)      # an unproven incumbent never loses to the point plan
         A.guard(f"stability fold {gv}", [plan, sol["choice"]])
         pf = sol["choice"]
         c_full = [cost0[i][plan[i]] for i in hid]
@@ -139,7 +140,7 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
         b_fold = sum(ben0[i][pf[i]] for i in hid)
         pairs += [(plan[i], pf[i]) for i in hid]
         # F6 S1-5: what moves under the fold (regret: the fold's re-optimised objective minus the point plan's there)
-        folds.append({**MV.summarise(A, plan, pf, ben_f, cost_f, sol["objective"]),
+        folds.append({**MV.summarise(A, plan, pf, ben_f, cost_f, sol["objective"], gap=sol.get("solver_gap")),
                       "group": gv, "n_units": len(hid), "rank_corr": rho, "predictions_clamped": int(nclamp),
                       "package_concordance_pct": 100.0 * np.mean([plan[i] == pf[i] for i in hid]),
                       "benefit_gap_pct": 100.0 * (b_full - b_fold) / b_full if b_full > 0 else 0.0,
