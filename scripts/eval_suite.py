@@ -15,9 +15,11 @@ disease-agnostic: every question-specific fact is in the rubric and the truth fi
         <dir>/<q>/<label>/runs/<run>/ as `collect` writes it (~/modeling-agentic-keep/evals/<tag>);
         the answer key is the one whose input hashes match the run's
     python3 scripts/eval_suite.py run [--tag T] [--reps N] [--pipeline v2] [--execute] [q ...]   (v1 is retired)
-        preflight (inputs current, nothing hidden in the launch tarball), then print the
-        launch commands, each stating its pipeline (EVAL_PIPELINE, default v2); --execute runs
-        them (each launch costs up to the US$35 cap)
+        preflight (the pinned bundle verifies by digest, the shipped inputs hash to its public
+        manifest, nothing hidden in the launch tarball), then print the launch commands, each
+        stating its pipeline (EVAL_PIPELINE, default v2); --execute runs them (each launch costs
+        up to the US$35 cap). It never decrypts the bundle or reads the keychain (owner
+        2026-11-21), so it needs storage access but not the key
     python3 scripts/eval_suite.py report <suite_scores.json> [<other suite_scores.json>] [--allow-mixed-pipelines]
         a table; with two files, B against A per question. Every score names the pipeline and
         commit its run recorded ("unknown" for runs from before 2026-11-05); two files whose
@@ -1070,16 +1072,22 @@ def launch_commands(questions, tag, reps, tree=None, pipeline="v2") -> list[str]
     return [f"{env} python3 cloud/run_cluster.py cloud/configs/eval_{q}.py launch" for q in questions]
 
 
-def input_problems(tree, questions, private_dir=None, data_dir=DATA) -> list[str]:
-    """Preflight on the tree that will be shipped, not on this checkout: the inputs in
-    its archive of HEAD must hash to what each question's current answer key was generated from."""
+def input_problems(tree, questions, manifest) -> list[str]:
+    """Preflight on the tree that will be shipped, not on this checkout: the inputs in its archive of HEAD must
+    hash to what each question's current answer key was generated from, as the pinned bundle's public manifest
+    records it (eval_private.verify_public; owner 2026-11-21: the run path never decrypts). `publish` refuses a
+    hidden tree whose generators do not reproduce the committed inputs, so the manifest's hashes stand for them."""
     blob = _archive_of(tree)
     if not blob:
         return [f"{tree}: not a git checkout, cannot build the launch archive"]
     shipped = eval_paths.archive_sha256(blob)
     probs = []
     for q in questions:
-        prob = input_hash_problem(q, ensure_truth(q, private_dir, data_dir), {"eval_inputs_sha256": shipped})
+        want = (manifest.get("questions") or {}).get(q)
+        if not isinstance(want, dict) or not want:
+            probs.append(f"{q}: the pinned bundle's manifest records no input hashes for it")
+            continue
+        prob = input_hash_problem(q, {"inputs_sha256": want}, {"eval_inputs_sha256": shipped})
         if prob:
             probs.append(f"{q}: {tree}: {prob[1]}")
     return probs
@@ -1209,7 +1217,7 @@ def main(argv=None) -> int:
     r.add_argument("--pipeline", choices=pipeline_id.PIPELINES, default="v2",
                    help="the pipeline every launch runs (EVAL_PIPELINE; v2: v1 is retired and refused)")
     r.add_argument("--local", action="store_true", help="not supported: eval runs execute only on the cloud")
-    r.add_argument("--private-dir", help=hidden_help)
+    r.add_argument("--private-dir", help="refused: run checks the pinned bundle by digest and never opens it")
     r.add_argument("questions", nargs="*")
     gr = sub.add_parser("grade")
     gr.add_argument("question", nargs="?")
@@ -1330,13 +1338,15 @@ def _run_command(ap, args, private) -> int:
                   "archive and nothing else (no evals/, no repository history). main.py refuses an eval question "
                   "anywhere else. Run `python3 scripts/eval_suite.py run` without --local.")
             return 2
+        if private:
+            print("refusing: run never opens the hidden half (owner 2026-11-21); it checks the pinned bundle by "
+                  "digest only, so it takes no --private-dir")
+            return 2
         qs = args.questions or suite_questions()
         tree = launch_tree(args.tree, qs[0], args.pipeline)
-        with use_private(private):
-            stale = {q: check_inputs(q) for q in qs}
-            probs = [f"{q}: inputs differ from the generator: {d}" for q, d in stale.items() if d]
-            probs += leak_problems(tree)
-            probs += input_problems(tree, qs)   # the shipped tree's archived inputs, not this checkout's
+        manifest = eval_private.verify_public(eval_private.default_store(), eval_private.read_pin())   # no key
+        probs = leak_problems(tree)
+        probs += input_problems(tree, qs, manifest)   # the shipped tree's archived inputs, not this checkout's
         if probs:
             print("refusing to launch:\n  " + "\n  ".join(probs))
             return 1
