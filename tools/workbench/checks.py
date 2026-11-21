@@ -348,6 +348,206 @@ def verified_spec(run):
             "signed_by": so.get("signed_by") if ok else None, "signed_at": so.get("signed_at") if ok else None}
 
 
+# ---- the sign-off sheet, the sign-off history and the evidence dossier (§5.3): one loader each, for every view
+SHEET = "decision_spec.signoff_sheet.md"                               # toolkit/spec/signoff.py SHEET
+ARCHIVE_DIR, ARCHIVE_PREFIX = "evidence_planner", "superseded_signoff_"     # tools/run_console/dossier.py, the same names
+# The sections the sign-off code writes for every spec, in its order. toolkit/spec/signoff.py sheet() appends, outside
+# any condition: `out += SC.sheet_lines(raw, run_dir, ...)` (toolkit/spec/spec_critique.py: `out = [SECTION, "", ...`
+# with SECTION the first heading below), `out.append("## Engine defaults accepted by name")`, `out.append("## Staged
+# inputs and columns not used")`, `out += ["", "## Derivations"] + [...]`, `out += geometry_section[0]`
+# (toolkit/spec/geometry.py sheet_section: `out = ["## Input geometry check"]`), `out += PV.sheet_lines(raw, candidates,
+# run_dir)` (toolkit/spec/engine_parameters.py: `out = ["## Engine parameter values set by the spec"]`) and `out +=
+# ED.sheet_lines(raw, run_dir, dossier_bytes, closure)` (toolkit/spec/evidence_dossier.py: `out = [SECTION]`). The
+# sections it writes only for a spec that has the thing (`if oa:`, `if candidates:`, a burden reference file,
+# departures, effect settings) are not on this list.
+SHEET_ALWAYS = ("Spec critique (decision design principles, before signing)", "Engine defaults accepted by name",
+                "Staged inputs and columns not used", "Derivations", "Input geometry check",
+                "Engine parameter values set by the spec", "Evidence dossier (inputs that drive an option's effect)")
+SHEET_SEVERITIES = ("HIGH", "MEDIUM", "DECLARED", "INFO")              # toolkit/spec/spec_critique.py sheet_lines: `order`
+SHEET_SOURCES = "<!-- signoff-sheet-sources: "                         # toolkit/spec/signoff.py SHEET_SOURCES
+# toolkit/spec/engine_parameters.py: `- **HIGH**: ...` and `- **REFUSED**: ...`; toolkit/spec/evidence_dossier.py:
+# `- **REFUSED at sign-off**: ...`. A line that only holds the word marks nothing.
+_SHEET_MARK = re.compile(r"\s*[-*]\s+\*\*(HIGH|REFUSED)(?: at sign-off)?\*\*:\s*(.+?)\s*$")
+_TEXT = 4000         # characters of a sentence of the run kept in a row
+
+
+def signoff_sheet(run, rel=SHEET):
+    """({sections, rows, bad, spec_sha}, None) from the sign-off sheet, or (None, why). The file is read to its end and
+    never cut at a size. `sections`: its `## ` headings without the marks, in its order. `rows`: what the sheet marks
+    with a severity, each {section, severity, text, line}: a row of the spec critique's table (severity its first cell,
+    one of SHEET_SEVERITIES; text its Finding cell), and a line that marks a finding `- **HIGH**: ` or `- **REFUSED`
+    (severity HIGH or REFUSED; text what follows the mark). `bad`: sentences, one per critique row that is malformed or
+    has a severity the producer does not write (§3: named, never dropped). `spec_sha`: the hash of the spec the sheet
+    was written from, from its last sources line (toolkit/spec/signoff.py sheet_sources), or None."""
+    def read(n, raw):
+        line = raw.decode("utf-8", "replace").rstrip("\r")
+        if line.startswith("## "):
+            return "section", n, line[3:].strip()
+        if line.startswith(SHEET_SOURCES) and line.endswith(" -->"):
+            return "sources", n, line[len(SHEET_SOURCES):-4]
+        m = _SHEET_MARK.match(line)
+        if m:
+            return "mark", n, m.group(1), m.group(2)
+        return ("row", n, line.strip()) if line.lstrip().startswith("|") else None
+    got, why = run.lines(rel, read)
+    if got is None:
+        return None, why
+    import json as _json
+    out, section = {"sections": [], "rows": [], "bad": [], "spec_sha": None}, None
+    for kind, n, *rest in got:
+        if kind == "section":
+            section = rest[0]
+            out["sections"].append(section)
+        elif kind == "sources":
+            try:
+                held = _json.loads(rest[0])
+            except ValueError:
+                held = None
+            out["spec_sha"] = digest(held.get("spec_sha256")) if isinstance(held, dict) else None
+        elif kind == "mark":
+            out["rows"].append({"section": section, "severity": rest[0], "text": rest[1][:_TEXT], "line": n})
+        elif section == SHEET_ALWAYS[0]:
+            cells = [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", rest[0])[1:-1]]
+            if not cells or all(c and set(c) <= set("-: ") for c in cells) or cells[0] == "Severity":
+                continue
+            if len(cells) != 5:
+                out["bad"].append(f"line {n} of {rel} is a row of the spec critique with {len(cells)} cells, not the five the producer writes")
+            elif cells[0] not in SHEET_SEVERITIES:
+                out["bad"].append(f"line {n} of {rel} has the severity {cells[0]!r}, which is not one the producer writes ({', '.join(SHEET_SEVERITIES)})")
+            else:
+                out["rows"].append({"section": section, "severity": cells[0], "text": cells[3][:_TEXT], "line": n})
+    return out, None
+
+
+def _archived_spec(run, folder, want):
+    """(the parsed spec under an archive folder whose sha256 is `want`, its file), or (None, why). As the run console
+    finds it (tools/run_console/dossier.py _archived_spec): a file named decision_spec*.yaml in the folder or one
+    folder below it; the hash and the parsed spec come from one read."""
+    if digest(want) is None:
+        return None, "the archived record holds no valid sha256 for the spec"
+    for sub in ["", *run.names(folder)]:            # a name that is no folder lists nothing
+        at = f"{folder}/{sub}" if sub else folder
+        for name in run.names(at):
+            if name.startswith("decision_spec") and name.endswith((".yaml", ".yml")):
+                sha, doc, why = run.hashed(f"{at}/{name}")
+                if sha == want:
+                    return (doc, f"{at}/{name}") if isinstance(doc, dict) else (None, why or f"{at}/{name} is not a mapping")
+    return None, f"no spec copy in {folder} has the recorded hash {want[:8]}"
+
+
+def signoff_history(run, spec=None):
+    """({rows, bare}, None): every sign-off record of the run, oldest first, the archived ones
+    (evidence_planner/superseded_signoff_*/decision_spec.signoff.json, by their signed_at) and then the current record
+    (signoff_record). A row: {at, by, note, spec_hash, file, current, spec_file, sections_changed, why}.
+    `sections_changed`: the top-level keys of the parsed spec that differ from the spec of the sign-off before it
+    (sorted), or None with `why` when it is the first, or when either spec cannot be read with the hash its record
+    holds; the current row's spec is the verified signed copy (`spec`, verified_spec's result). A change in comments
+    alone is not seen. `bare`: [(folder, why)] for an archive folder with no readable sign-off record: not a sign-off,
+    and a gap in the history."""
+    spec = spec or verified_spec(run)
+    rows, bare = [], []
+    for name in run.names(ARCHIVE_DIR):
+        if not name.startswith(ARCHIVE_PREFIX):
+            continue
+        folder = f"{ARCHIVE_DIR}/{name}"
+        rel = f"{folder}/{SPEC_SIGNOFF}"
+        rec, why = run.json(rel)
+        if rec is None:
+            held = run.names(folder)
+            bare.append((folder, f"it holds {', '.join(held) or 'nothing'} and no sign-off record" if SPEC_SIGNOFF not in held else why))
+            continue
+        sha = rec["sha256"].get(SPEC) if isinstance(rec.get("sha256"), dict) else None
+        doc, where = _archived_spec(run, folder, sha)
+        rows.append({"rec": rec, "file": rel, "current": False, "doc": doc, "spec_file": where if doc is not None else None,
+                     "no_doc": None if doc is not None else where, "spec_hash": digest(sha)})
+    rows.sort(key=lambda r: (str(r["rec"].get("signed_at") or ""), r["file"]))
+    cur, cur_rel, _ = signoff_record(run)
+    if isinstance(cur, dict):
+        sha = cur["sha256"].get(SPEC) if isinstance(cur.get("sha256"), dict) else None
+        rows.append({"rec": cur, "file": cur_rel, "current": True, "doc": spec["doc"] if spec["verified"] else None,
+                     "spec_file": SIGNED_COPY if spec["verified"] else None, "spec_hash": digest(sha),
+                     "no_doc": None if spec["verified"] else f"no signed spec could be verified ({spec['why']})"})
+    out, before = [], None
+    for r in rows:
+        if before is None:
+            changed, why = None, "it is the first sign-off: there is none before it to compare with"
+        elif r["doc"] is None or before["doc"] is None:
+            changed, why = None, (r["no_doc"] if r["doc"] is None else f"the spec of the sign-off before it cannot be read ({before['no_doc']})")
+        else:
+            a, b = before["doc"], r["doc"]
+            changed, why = sorted(str(k) for k in set(a) | set(b) if a.get(k, _ABSENT) != b.get(k, _ABSENT)), None
+        rec = r["rec"]
+        out.append({"at": str(rec.get("signed_at") or ""), "by": rec.get("signed_by") if isinstance(rec.get("signed_by"), str) else None,
+                    "note": rec.get("note") if isinstance(rec.get("note"), str) else None, "spec_hash": r["spec_hash"], "file": r["file"],
+                    "current": r["current"], "spec_file": r["spec_file"], "sections_changed": changed, "why": why})
+        before = r
+    return {"rows": out, "bare": bare}, None
+
+
+_ABSENT = object()
+DOSSIER_KEYS = ("observations", "no_data")        # toolkit/spec/evidence_dossier.py: "give exactly one of observations and no_data"
+CHECKED = "checked"                               # §5.3: the mark gap H2 asks for on an observation; no producer writes it yet
+
+
+def dossier_reference(spec):
+    """The run-relative path of the evidence dossier the verified signed spec names (`evidence.dossier`, as
+    toolkit/spec/evidence_dossier.py dossier_reference reads it), or None."""
+    ev = spec["doc"].get("evidence") if spec["verified"] else None
+    rel = ev.get("dossier") if isinstance(ev, dict) else None
+    return rel if isinstance(rel, str) and rel.strip() else None
+
+
+def evidence_dossier(run, spec=None):
+    """({file, state, entries, bad}, None) from the evidence dossier the verified signed spec names, or (None, why).
+    `state`: the file against the hash the sign-off record holds for it (hash_state's words), hashed and parsed from
+    one read. `entries`: one per input, in the file's order: {key, kind (the key's part before its first colon),
+    model_value (as recorded), observations (a list of mappings), n_observations, n_unchecked (observations without
+    the `checked` mark), marked (observations with it), chosen, low, high (chosen.value; chosen.range), decision_test
+    (the structured key only), no_data (the entry holds a no_data mapping), clash (why the entry contradicts the
+    producer's rule that an entry gives exactly one of observations and no_data, or None)}. `bad`: one sentence per
+    entry that is no mapping, or whose observations are no list of mappings. Only structured fields are read: no text
+    is parsed for a duration, a mark or who decided."""
+    spec = spec or verified_spec(run)
+    if not spec["verified"]:
+        return None, f"no signed spec could be verified ({spec['why']}), so no dossier is named by one"
+    rel = dossier_reference(spec)
+    if rel is None:
+        there = not str(run.read("evidence_dossier.yaml", 1)[1]).endswith("is not in the run folder")
+        return None, ("the verified signed spec names no evidence dossier (it has no evidence.dossier key)"
+                      + (", though the run folder holds a file evidence_dossier.yaml, which nothing ties to the spec" if there else ""))
+    sha, doc, why = run.hashed(rel)
+    if sha is None or not isinstance(doc, dict):
+        return None, why or f"{rel} is not a mapping"
+    inputs = doc.get("inputs")
+    if not isinstance(inputs, dict):
+        return None, f"{rel} holds no mapping of inputs (inputs)"
+    record, _, _ = signoff_record(run)
+    out = {"file": rel, "state": bound(record, rel, sha), "entries": [], "bad": []}
+    for key, e in inputs.items():
+        obs, nd = (e.get("observations"), e.get("no_data")) if isinstance(e, dict) else (None, None)
+        if not isinstance(e, dict):
+            out["bad"].append(f"entry {key} of {rel} is not a mapping")
+            continue
+        if obs is not None and not (isinstance(obs, list) and all(isinstance(o, dict) for o in obs)):
+            out["bad"].append(f"the observations of entry {key} of {rel} are not a list of mappings")
+            continue
+        obs = obs or []
+        chosen = e.get("chosen") if isinstance(e.get("chosen"), dict) else {}
+        rng = chosen.get("range") if isinstance(chosen.get("range"), (list, tuple)) and len(chosen["range"]) == 2 else (None, None)
+        marked = sum(1 for o in obs if o.get(CHECKED) not in (None, False, ""))
+        test = e.get("decision_test")
+        out["entries"].append({
+            "key": str(key), "kind": str(key).split(":", 1)[0] if ":" in str(key) else None, "model_value": e.get("model_value"),
+            "observations": obs, "n_observations": len(obs), "marked": marked, "n_unchecked": len(obs) - marked,
+            "chosen": chosen.get("value"), "low": rng[0], "high": rng[1],
+            "decision_test": str(test) if isinstance(test, (str, int)) and not isinstance(test, bool) and str(test).strip() else None,
+            "no_data": isinstance(nd, dict),
+            "clash": ("it gives both observations and no_data" if obs and nd is not None else
+                      "it gives neither observations nor no_data" if not obs and nd is None else
+                      "its no_data is not a mapping" if not obs and not isinstance(nd, dict) else None)})
+    return out, None
+
+
 def pipeline(run):
     meta, why = run.json("metadata.json")
     if meta is None:
@@ -443,7 +643,13 @@ def artifact_spec(run):
 
     def state(a):
         if digest(a.get("spec_sha256")) is None:
-            return "no valid spec hash recorded"
+            # A file outside the manifest whose header has no spec hash can still record the spec among its inputs
+            # (analysis/trajectories.yaml: toolkit/analysis/trajectories.py write()). That recorded hash is compared
+            # as any other: equal to the signed one it ties the file to the signed spec, another one is another spec.
+            held = [digest(i.get("sha256")) for i in a.get("inputs") or [] if i.get("path") == SPEC]
+            if a.get("in_manifest") or not held or held[0] is None:
+                return "no valid spec hash recorded"
+            return "signed spec" if held[0] == signed else "other spec"
         if a["spec_sha256"] != signed:
             return "other spec"
         return "spec not signed when computed" if a.get("spec_signed") is False else "signed spec"
@@ -687,6 +893,19 @@ def _self_test():
            clean["status"] == "ok" and [c["status"] for c in (null, short, extra)] == ["problem", "problem", "look"]
            and "analysis/claims.yaml" in str(null["rows"]) and "analysis/extra.yaml" in str(extra["rows"])
            and "no valid spec hash" in null["says"], str([(c["status"], c["says"]) for c in (clean, null, short, extra)]))
+        def unlisted(spec_sha):       # a file outside the manifest with no spec hash in its header and the spec among its inputs
+            def edit(d):
+                import hashlib
+                now = hashlib.sha256(open(os.path.join(d, SPEC), "rb").read()).hexdigest()
+                open(os.path.join(d, "analysis", "extra.yaml"), "w").write(
+                    f"producer: toolkit/x.py\ninputs:\n  {SPEC}: {now if spec_sha is True else spec_sha}\ndata: {{a: 1}}\n")
+            return edit
+        tied, other, bad = (spec_check(f"s5b{n}", unlisted(v)) for n, v in enumerate((True, "f" * 64, "abc")))
+        ok("S5b a file outside the manifest that records the spec among its inputs is held to that hash: the signed one ties "
+           "it to the signed spec, another one is another spec (problem), a malformed one is no hash (for the reader)",
+           [c["status"] for c in (tied, other, bad)] == ["ok", "problem", "look"] and "analysis/extra.yaml" in str(tied["rows"]),
+           str([(c["status"], c["says"]) for c in (tied, other, bad)]))
+
         def record(name, edit):
             d = os.path.join(tmp, name)
             os.makedirs(d)
@@ -812,8 +1031,70 @@ def _self_test():
            and [t["state"] for t in (no_ends, all_rejected, no_rule)] == ["unknown"] * 3
            and [t["state"] for t in (other_end, said_changes)] == ["contradiction"] * 2 and other_end["clash"] and not other_end["counts"],
            str([(t["state"], t["verdict"], t.get("clash")) for t in (clean, no_ends, all_rejected, other_end, said_changes, changes, rejected, no_rule)]))
+        _self_test_spec_sources(tmp, ok)
     print("OK: all self-test cases passed." if not fails else f"FAILED: {fails}")
     return 1 if fails else 0
+
+
+def _self_test_spec_sources(tmp, ok):
+    """The loaders of the sign-off sheet, the sign-off history and the evidence dossier, on fixture runs."""
+    import json
+    import os
+
+    import workbench
+    from lib.safe_io import read_nofollow, write_nofollow
+    from views.fit_bench import fixture_builder
+    fx = fixture_builder()
+
+    def built(name, defect=None):
+        d = os.path.join(tmp, name)
+        fx.build(d, defect=defect)
+        return d
+
+    def retext(d, rel, change):
+        write_nofollow(d, rel, change(read_nofollow(d, rel)[0].decode("utf-8")).encode("utf-8"))
+        return d
+    clean = built("t-clean")
+    sheet, _ = signoff_sheet(workbench.Run(clean))
+    ok("T1 the sections the sign-off code writes for every spec are the producers' own headings (fixtures.py X53 holds them to "
+       "the source), and the clean sheet has each; its rows are the critique's, under their section; its last line gives the spec",
+       tuple("## " + h for h in SHEET_ALWAYS) == fx.SHEET_ALWAYS and all(h in sheet["sections"] for h in SHEET_ALWAYS)
+       and [(r["section"], r["severity"]) for r in sheet["rows"]] == [(SHEET_ALWAYS[0], "MEDIUM")] * 2 + [(SHEET_ALWAYS[0], "INFO")] * 2
+       and not sheet["bad"] and sheet["spec_sha"] == verified_spec(workbench.Run(clean))["sha"], str(sheet))
+    high, _ = signoff_sheet(workbench.Run(built("t-high", "sheet_high")))
+    escaped = retext(built("t-escaped"), fx.SHEET, lambda t: t.replace("| INFO | 2 | headline_comparator | ", "| INFO | 2 | headline_comparator | a \\| b ", 1)
+                     + "\n" + "".join(f"- line {i} of a long sheet\n" for i in range(200000)) + "- **REFUSED at sign-off**: entry q9 has no source\n")
+    long, _ = signoff_sheet(workbench.Run(escaped))
+    ok("T2 a line that marks a finding HIGH is a row under its section and the bare word is none; an escaped bar stays in its "
+       "cell; a REFUSED line far down a long sheet is read (the file is never cut at a size); no sheet says why",
+       [(r["section"], r["severity"]) for r in high["rows"] if r["severity"] == "HIGH"] == [(SHEET_ALWAYS[5], "HIGH")]
+       and any(r["text"].startswith("a | b ") for r in long["rows"]) and long["rows"][-1]["severity"] == "REFUSED"
+       and long["rows"][-1]["text"] == "entry q9 has no source" and signoff_sheet(workbench.Run(tmp))[0] is None
+       and "not in the run folder" in signoff_sheet(workbench.Run(tmp))[1], str(long["rows"][-2:]))
+    h, _ = signoff_history(workbench.Run(clean))
+    bare, _ = signoff_history(workbench.Run(built("t-bare", "archive_no_record")))
+    lost = built("t-lost")
+    os.remove(os.path.join(lost, fx.SECOND + fx.SPEC_FILES[1]))
+    gone, _ = signoff_history(workbench.Run(lost))
+    ok("T3 the sign-off history: archived records by their time and then the current one; the sections each changed by "
+       "top-level key; a folder with no record is listed and is no sign-off; a sign-off whose signed copy is gone has no "
+       "count, and neither has the one after it",
+       [r["at"][:10] for r in h["rows"]] == [*fx.EARLIER, "2026-01-01"] and [r["current"] for r in h["rows"]] == [False, False, True]
+       and [r["sections_changed"] for r in h["rows"]] == [None, ["decision_maker"], ["uncertainty"]] and not h["bare"]
+       and len(bare["rows"]) == 3 and [f for f, _ in bare["bare"]] == [f"{ARCHIVE_DIR}/{ARCHIVE_PREFIX}{fx.EARLIER[1]}b"]
+       and [r["sections_changed"] for r in gone["rows"]] == [None, None, None] and "recorded hash" in gone["rows"][1]["why"]
+       and signoff_history(workbench.Run(tmp))[0]["rows"] == [], str((h, bare["bare"], gone)))
+    d, _ = evidence_dossier(workbench.Run(clean))
+    moved = retext(built("t-moved"), fx.DOSSIER, lambda t: t + "\n")
+    spec = verified_spec(workbench.Run(clean))
+    ok("T4 the evidence dossier is the file the verified signed spec names, held to the hash the sign-off record has for it; "
+       "an entry's marks and test come from structured keys only; with no verified spec, or none named, there is none",
+       d["state"] == "same" and [(e["key"], e["no_data"], e["n_observations"], e["n_unchecked"], e["decision_test"]) for e in d["entries"]][:2]
+       == [("parameter:p1", False, 2, 0, "DT3"), ("parameter:b_add", False, 1, 0, "DT5")] and not d["bad"] and not any(e["clash"] for e in d["entries"])
+       and evidence_dossier(workbench.Run(moved))[0]["state"] == "changed"
+       and evidence_dossier(workbench.Run(clean), {**spec, "verified": False, "why": "x"})[0] is None
+       and "names no evidence dossier" in evidence_dossier(workbench.Run(clean), {**spec, "doc": {}})[1]
+       and "which nothing ties" in evidence_dossier(workbench.Run(clean), {**spec, "doc": {}})[1], str(d)[:600])
 
 
 if __name__ == "__main__":
