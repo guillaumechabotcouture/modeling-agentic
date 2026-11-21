@@ -308,7 +308,7 @@ POP_GROWTH = 0.0269
 # v0.19 (Starsim 4): a bare start is a calendar year only from 1800 on; Starsim 4 reads an earlier one as a time in
 # days from 0 (measured: start 1750.0, stop 1752.0, daily steps gives 3 steps), so a burn-in that would start earlier
 # fails closed (V2c). v0.5-v0.18 (Starsim 3.3.2) had the floor at 1900, before which that version's Births and Deaths
-# added and removed no one. Starsim 4's work at any start (spike/ssv4/pre1900_check.py, port worktree).
+# added and removed no one. Starsim 4's work at any start.
 MIN_START_YEAR = 1800.0
 # Parameters read only by package components (after the fork) or by the outcome accounting in the decision window:
 # param sets that differ only in these share one burn-in (checked by V5). cfp_kill and cfp_half act through dual-AI

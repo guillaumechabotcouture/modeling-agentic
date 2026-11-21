@@ -4,7 +4,7 @@ Plan: [v2-ssv4.md](v2-ssv4.md). Each item: the question, the options, what I did
 
 ## 1. The discrete map: now `ss.solvers.ode(integrator='map')` (done, in Starsim)
 
-Both engines took each step's infections once, at its start (`S (1 - exp(-lambda))`), by overriding `transmit()`, which also turned off the compiled path. Starsim now has the map as an ODE integrator, compiled (Numba, Rust, JAX); the compartmental engine and the renewal engine's v4 check use it with no override, and their outputs are unchanged to rounding (gaps G2). It is the expected value of the chain binomial in whole steps, and the form of any model written in discrete time, so it is not specific to these engines. Its default is one substep; with `substeps=n` each substep is taken as the map (the exponential Euler method), which approaches the ODE as n grows (Cliff, 2026-11-20). It is new in Starsim 4.0.0rc6 (item 5).
+Both engines took each step's infections once, at its start (`S (1 - exp(-lambda))`), by overriding `transmit()`, which also turned off the compiled path. Starsim now has the map as an ODE integrator, compiled (Numba, Rust, JAX); the compartmental engine and the renewal engine's v4 check use it with no override, and their outputs are unchanged to rounding. It is the expected value of the chain binomial in whole steps, and the form of any model written in discrete time, so it is not specific to these engines. Its default is one substep; with `substeps=n` each substep is taken as the map (the exponential Euler method), which approaches the ODE as n grows (Cliff, 2026-11-20). It is new in Starsim 4.0.0rc6 (item 5).
 
 [CK: ]
 
@@ -20,7 +20,7 @@ Measured 2026-11-20 on this machine (4 cores, interleaved, min of runs), Starsim
 | Renewal, one run (300 steps) | 1.2 ms | 94 ms | 7.5 ms |
 | Renewal, a batch of 1,000 (300 steps) | 6.5 ms | 308 ms | 160 ms |
 
-The renewal engine was still slower per call on v4: a sim costs about 6 ms to build and initialize whatever its size (gaps G13), and 1,000 places cost more than the numpy loop's vectors. **Resolved:** the renewal engine stays numpy (Cliff, 2026-11-20: v4 "just for things that make sense, not a goal unto itself"), so its speed is v0.1's; the v4 version is kept as a check (`toolkit/engines/renewal/benchmarks/starsim_v4.py`).
+The renewal engine was still slower per call on v4: a sim costs about 6 ms to build and initialize whatever its size, and 1,000 places cost more than the numpy loop's vectors. **Resolved:** the renewal engine stays numpy (Cliff, 2026-11-20: v4 "just for things that make sense, not a goal unto itself"), so its speed is v0.1's; the v4 version is kept as a check (`toolkit/engines/renewal/benchmarks/starsim_v4.py`).
 
 [CK: ]
 
@@ -73,6 +73,6 @@ The malaria engine (v0.19) runs on v4 as the same model: on 3 units, 5 packages 
 
 ## 10. The malaria engine's start floor
 
-Starsim 3's births and deaths did nothing before 1900, so the engine refused a burn-in starting before then. On v4 they work, but a bare start before 1800 is read as days (gaps G8), so the floor is now 1800. Keep it (recommended until G8 is fixed), or remove it?
+Starsim 3's births and deaths did nothing before 1900, so the engine refused a burn-in starting before then. On v4 they work, but a bare start before 1800 is read as days, not a year, so the floor is now 1800. Keep it (recommended until G8 is fixed), or remove it?
 
 [CK: ]

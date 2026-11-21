@@ -44,7 +44,7 @@ def simulate(r0, cmat, s0, seed, w):
                  solver=ss.solvers.ode(integrator="map", dwells="exact"), copy_inputs=False)
     sim.run()
     res = sim.results.renewal
-    # (B, time); a stratification with one level leaves the results unstratified (gaps G3)
+    # (B, time); a stratification with one level leaves the results unstratified
     per = lambda r: np.asarray(r.by("member").values if B > 1 else r.values, float).reshape(len(r), B).T  # noqa: E731
     Sall = per(res.S)                               # before step 0, then after each step
     return per(res.infection)[:, :n], Sall[:, 1:n + 1], Sall[:, 0].copy(), beta * Sall[:, :n]

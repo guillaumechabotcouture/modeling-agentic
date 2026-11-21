@@ -367,8 +367,8 @@ class _V4Run:
         force = sum(float(w) * I for w, I in zip(c["w"], Is))
         N = c["N"]
         Nm = N.sum(axis=1)
-        # Starsim drops a stratification with one level (and then reads a starting share of exactly 1 as one person:
-        # gaps G3), so only dimensions with more than one level are made; with one group, its contact rate C_11
+        # Starsim drops a stratification with one level (and then reads a starting share of exactly 1 as one person),
+        # so only dimensions with more than one level are made; with one group, its contact rate C_11
         # multiplies beta, since an unstratified disease mixes homogeneously
         dims = [d for d, n in (("member", B), ("group", G)) if n > 1]
         c11 = float(c["C"][0][0, 0]) if G == 1 else 1.0
@@ -382,7 +382,7 @@ class _V4Run:
         trans = [S >> Is[0] @ rate * force]
         trans += [a >> b @ ss.constant(ss.days(1)) for a, b in zip(Is, list(Is[1:]) + [R])]
 
-        def share(x):  # a starting share per (member, group); a carried share can pass 1 by rounding (gaps G7)
+        def share(x):  # a starting share per (member, group); a carried share can pass 1 by rounding
             v = np.clip(np.asarray(x, float) / N, 0.0, 1.0)
             return float(v[0, 0]) if not dims else ss.by(v.reshape([n for n in (B, G) if n > 1]), dims=dims)
         init = {"S": share(self.carry["S"]), "R": share(self.carry["R"])}
@@ -415,7 +415,7 @@ class _V4Run:
         dis = sim.diseases.epi
         for k in range(self.L):
             # each I_k leaves after one step. A run keeps the people in such a state in its last slot (rows), but
-            # init= puts some states' starting people in the first, which would hold them a step longer (gaps G5)
+            # init= puts some states' starting people in the first, which would hold them a step longer
             rows = getattr(dis, f"I{k + 1}").rows
             tot = dis.y[rows].sum(axis=0)
             dis.y[rows] = 0.0
@@ -431,7 +431,7 @@ class _V4Run:
             if done:
                 break
         # the state the next segment starts from: from the results, since Starsim v4 also steps the sim at its last
-        # time point, after which the compartments (dis.y) are one step past the run's last result (gaps G4)
+        # time point, after which the compartments (dis.y) are one step past the run's last result
         self.carry = {"S": S[j + 1], "R": self._cells(res.R)[j + 1], "I": hist[j + 1:j + 1 + self.L][::-1].copy()}
         self.offset = self.n_steps
         return done
