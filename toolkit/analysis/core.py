@@ -3,7 +3,11 @@ the toolkit/alloc solve (design §2). Steps (uncertainty, stability, sensitivity
 `evaluate()` and `solve()` here, so a step cannot compute a benefit or a cost another way."""
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import json
 import math
+import os
 
 import numpy as np
 
@@ -64,7 +68,87 @@ class AnalysisBlocked(RuntimeError):
                          f"(e.g. {hits[:2]})")
 
 
+class SolveFailed(RuntimeError):
+    """The solver gave no plan this solve may use. `status`: infeasible (proven), feasible (stopped early; `gap` is
+    its proven gap, or None), no_feasible_found. The message is the one earlier handlers match."""
+
+    def __init__(self, status: str, gap=None):
+        self.status, self.gap = status, gap
+        super().__init__(f"optimizer status {status}")
+
+
+def solver_settings() -> dict:
+    """toolkit/analysis/thresholds.yaml `optimizer` (decision D3)."""
+    import yaml
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.yaml")) as f:
+        return yaml.safe_load(f)["optimizer"]
+
+
+@contextlib.contextmanager
+def auxiliary(A, kind: str):
+    """Solves inside are auxiliary ones of `kind` (uncertainty draws, folds, tests, variants, the frontier): see
+    Analysis.solve. Outside, a solve is a headline solve."""
+    prev = getattr(A, "aux", None)
+    A.aux = kind
+    try:
+        yield A
+    finally:
+        A.aux = prev
+
+
+def best_known(A, sol, plan, ben, cost, budget=None, feas=None) -> dict:
+    """For a solve that accepted a plan it could not prove optimal (status "feasible", gap g): the better of that
+    incumbent and the point plan `plan`, when the point plan meets this problem's constraints (the allocator's own
+    check), so a comparison with the point plan never shows the point plan beating the "optimum". Adds
+    `solver_gap` = {gap, bound, kept}: the true optimum is at most `bound` above the returned objective (g / (1 - g)
+    of the incumbent's gain, less what the point plan recovers, both computed on gains). A proven solve is returned
+    as it is."""
+    if sol.get("status") != "feasible" or sol.get("gap") is None:
+        return sol
+    if budget is None:
+        budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
+    from toolkit.analysis import moves as MV
+    g, out, kept, f = float(sol["gap"]), dict(sol), "incumbent", feas or A.feas
+    room = g / (1.0 - g) * abs(float(sol.get("gain") or 0.0))      # the optimum's gain above the incumbent's, at most
+    try:
+        # what the point plan adds, from per-unit differences: sums of two large objectives would round it away
+        more = float(sum(ben[i][plan[i]] - ben[i][sol["choice"][i]] for i in A.ids))
+        spent = float(sum(cost[i][plan[i]] for i in A.ids))
+        # feasible by the allocator's check, by the rule compare() rows report, and within the solver's own budget
+        # tolerance (the check allows more rounding than the solver does: Codex narrow round P1-1)
+        fits = (not aopt.check(plan, ben, cost, f, budget) and not MV.infeasible_reasons(A.ids, plan, cost, f, budget)
+                and spent <= float(budget) * (1 + aopt.BUDGET_RTOL))
+    except (KeyError, TypeError, ValueError):
+        more, fits = 0.0, False
+    if fits and more > 0:
+        out.update(choice=dict(plan), objective=float(sum(ben[i][plan[i]] for i in A.ids)))
+        kept, room = "point_plan", room - more
+    out["solver_gap"] = {"gap": g, "bound": max(0.0, room), "kept": kept}
+    return out
+
+
+def _problem_key(ben, cost, feas, budget):
+    """A hash of one solve's inputs, or None (then nothing is kept) when they cannot be serialised or a unit or
+    package id is not text (the encoding writes ids as text, so 1 and "1" would share a key: Codex r1 P1-6) or a table
+    value or the budget is not a number."""
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731 -- else the allocator's
+    #                                               own input check would be skipped on a hit (Codex r2 P1)
+    if not (num(budget) and all(isinstance(u, str) and all(isinstance(k, str) and num(x) for k, x in r.items())
+                                for t in (ben, cost) for u, r in t.items())):
+        return None
+    try:
+        tabs = [sorted((str(u), sorted((str(k), float(x)) for k, x in r.items())) for u, r in t.items())
+                for t in (ben, cost)]
+        rest = json.dumps([float(budget), feas], sort_keys=True,
+                          default=lambda o: sorted(map(str, o)) if isinstance(o, (set, frozenset)) else str(o))
+        return hashlib.sha256((json.dumps(tabs) + rest).encode()).hexdigest()
+    except (TypeError, ValueError):
+        return None
+
+
 class Analysis:
+    aux = None
+
     def __init__(self, spec, model, log=print):
         self.spec, self.model, self.log = spec, model, log
         self.eng = spec.engine()
@@ -222,13 +306,53 @@ class Analysis:
             raise AnalysisBlocked(where, hits)
 
     def solve(self, ben, cost, budget=None, feas=None):
+        """One plan from toolkit/alloc at the settings of thresholds.yaml `optimizer` (decision D3). A headline solve
+        (the point plan, the reserve search, a rebuild) must be proven optimal within `gap_rel`. Inside
+        `auxiliary(A, kind)` a solve that stopped early is also used when its proven gap is at most `aux_gap_max`, and
+        counted. Anything else raises SolveFailed with the solver's status. Every solve is counted in `solver_log`.
+        A result is kept, so the same problem solved again in this run returns the same plan: a proven one for any
+        solve, an accepted feasible one for auxiliary solves only (Codex r1 P1-3)."""
+        st = solver_settings()
         if budget is None:
             budget = self.budget if self.plan_budget is None else self.plan_budget
-        r = aopt.solve(ben, cost, feas or self.feas, budget, method="ilp",
-                       time_limit=120)
-        if r["status"] != "optimal":
-            raise RuntimeError(f"optimizer status {r['status']}")
-        return r
+        f = feas or self.feas
+        kind = getattr(self, "aux", None)
+        log = self.__dict__.setdefault("solver_log", {}).setdefault(
+            kind or "headline", {"solves": 0, "feasible_accepted": 0, "max_gap": 0.0, "not_solved": 0})
+        memo, key = self.__dict__.setdefault("solve_memo", {}), _problem_key(ben, cost, f, budget)
+        if key in memo and (kind or memo[key][1]["status"] == "optimal"):
+            ch, meta = memo[key]
+            return dict(meta, choice=dict(zip(self.ids, ch)))
+        nt = min(int(st["threads"]), os.cpu_count() or 1) if len(ben) >= int(st["threads_min_units"]) else 1
+        r = aopt.solve(ben, cost, f, budget, method="ilp", time_limit=float(st["time_limit_s"]),
+                       gap_rel=float(st["gap_rel"]), threads=nt)
+        r["time_limit_s"] = float(st["time_limit_s"])
+        log["solves"] += 1
+        gap = r.get("gap")
+        # used only with its gain too: best_known() states the bound to the optimum from the gap and that gain
+        used = (kind and r["status"] == "feasible" and gap is not None and r.get("gain") is not None
+                and gap <= float(st["aux_gap_max"]))
+        if r["status"] == "optimal" or used:
+            if key is not None and set(r["choice"]) == set(self.ids):
+                memo[key] = (tuple(r["choice"][i] for i in self.ids), {k: v for k, v in r.items() if k != "choice"})
+            if used:
+                log["feasible_accepted"] += 1
+                log["max_gap"] = max(log["max_gap"], float(gap))
+            return r
+        if r["status"] != "infeasible":       # a proven infeasibility is a result, not a solve that failed
+            log["not_solved"] += 1
+        raise SolveFailed(r["status"], gap)
+
+    def solver_report(self) -> dict:
+        """The settings and the counts of this run's solves (the manifest's `solver`; contract.py reads the totals)."""
+        lg = getattr(self, "solver_log", {})
+        aux = {k: dict(v) for k, v in lg.items() if k != "headline"}
+        tot = {"solves": sum(v["solves"] for v in aux.values()),
+               "feasible_accepted": sum(v["feasible_accepted"] for v in aux.values()),
+               "max_gap": max((v["max_gap"] for v in aux.values()), default=0.0),
+               "not_solved": sum(v["not_solved"] for v in aux.values())}
+        return {**solver_settings(), "headline": dict(lg.get("headline") or {"solves": 0}), "auxiliary": aux,
+                "auxiliary_total": tot}
 
     def summary(self, plan, out, cost) -> dict:
         averted = {o: sum(out[i]["y"][self.comp][o] - out[i]["y"][plan[i]][o] for i in self.ids) for o in self.outcomes}
