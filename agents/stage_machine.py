@@ -2582,6 +2582,62 @@ def _self_test() -> int:
         ok(s == "paused:awaiting_scope_signoff" and "SPEC" not in p and p[-1] == "OWNER_DECISION",
            f"R3-5 a structural blocker that needs an owner amendment goes to the owner, not to SPEC ({s}, {p[-3:]})")
 
+        # T_OWNER_DECISION_E2E (1F): a decision test that changes the plan, at the last round, goes to OWNER_DECISION
+        # with a request the machine recorded; the owner's accept resumes the run, which ends scope-declared
+        import scope_signoff as _SS
+        dtf_e = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT9",
+                 "claim": "Decision test DT9 changes the plan: a lower effect", "scope_declarable": True,
+                 "decision_bearing": True}
+
+        class _DTMachine(Machine):
+            def harness_findings(self):
+                return super().harness_findings() + [dict(dtf_e)]
+        mk = lambda d_, T_, st_: _DTMachine(d_, T_, st_, backend=spike, log=lambda *a: None,  # noqa: E731
+                                            cross_engine_check=False)
+        d, T, st = new_run("dt_owner", {}, signoff="owner", max_rounds=1)
+        mk(d, T, st).run()
+        sign(d, "owner", "ok")
+        s_o = mk(d, StubTasks(T.s), None).run()
+        st_o = load_state(d)
+        req_o = json.load(open(os.path.join(d, OWNER_REQUEST))) if os.path.exists(os.path.join(d, OWNER_REQUEST)) else {}
+        fps_o = [i.get("fingerprint") for i in req_o.get("items") or []]
+        ok(s_o == "paused:awaiting_scope_signoff" and st_o.state == "OWNER_DECISION" and req_o.get("pending")
+           and fps_o and st_o.tries.get("owner_request") == fps_o
+           and [i.get("finding") for i in req_o["items"]] == ["decision_test_changes_plan:DT9"],
+           f"T_OWNER_DECISION_E2E the AWAIT_OWNER route records a fingerprinted request and pauses ({s_o}, {fps_o})")
+        _SS.sign(d, "owner", all_decision="accept", note="the plan stands with this caveat")
+        s_o2 = mk(d, StubTasks(T.s), None).run()
+        rep_o = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        ok(s_o2 == "completed_scope_declared" and "DT9" in rep_o and "Provisional decisions" not in rep_o,
+           f"T_OWNER_DECISION_E2E2 the owner's accept resumes the run, which ends scope-declared ({s_o2})")
+        # T_OWNER_LEAD_PROVISIONAL (1F, D2): under --signoff lead the same finding never waits: the lead answers it
+        # provisionally, the answer is recorded and listed, and, as the plan changes, flagged above the report's draft
+        d, T, st = new_run("dt_lead", {}, signoff="lead", max_rounds=1)
+        s_l = mk(d, T, st).run()
+        prov = _SS.provisional(d)
+        rep_l = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        span = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep_l else [0, 0]
+        ok(s_l == "completed_scope_declared" and not any(h.get("paused") for h in load_state(d).history)
+           and [(r["finding"], r["decision"], r["plan_changing"], r["review"]) for r in prov]
+           == [("decision_test_changes_plan:DT9", "accept", True, None)]
+           and "Provisional decisions that change the plan" in rep_l[:span[0]]
+           and "## Provisional decisions" in rep_l[span[1]:],
+           f"T_OWNER_LEAD_PROVISIONAL a lead run answers the owner decision provisionally and never blocks; the "
+           f"plan-changing answer heads the report ({s_l}, {prov})")
+        _SS.review(d, "decision_test_changes_plan:DT9", "overturn", note="fix the effect first")
+        ok([r["review"]["decision"] for r in _SS.provisional(d)] == ["overturn"],
+           "T_OWNER_LEAD_REVIEW the owner later overturns (or confirms) a provisional answer; it is recorded")
+        # T_OWNER_LEAD_AMEND (1F, D2): an owner-amendment finding under --signoff lead is answered provisionally too
+        d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041")]}}},
+                           signoff="lead", max_rounds=2)
+        s_a = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        led_a = FL.load(d)
+        ok(not s_a.startswith("paused") and led_a["D-041"].status == "owner_accepted"
+           and [r["finding"] for r in _SS.provisional(d)] == ["D-041"]
+           and not _SS.provisional(d)[0]["plan_changing"],
+           f"T_OWNER_LEAD_AMEND an amendment finding under --signoff lead is accepted provisionally, not waited on "
+           f"({s_a}, {led_a['D-041'].status})")
+
         # R3-4 (F6 run 3): a paid task whose allowance is below the floor is not started: the run pauses for the owner
         # (resumable), and a resume with a higher cap continues.
         d, T, st = new_run("floor", {}, budget=20.0)
@@ -2658,20 +2714,38 @@ def _self_test() -> int:
         dtf = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT1",
                "claim": "DT1 changes the plan", "scope_declarable": True, "decision_bearing": True}
         g = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        ok(_owner_rule() is None and g["action"] == "RUN_FAILED",
-           f"T30 without the owner rule the finding is not declarable: RUN_FAILED, not DECLARE_SCOPE ({g['action']})")
-        # T30b (Codex round 1 on #98): main #85's rule is now in the checkout, but v2 does not yet
-        # write a fingerprinted request (scope_signoff.record) or take answers through the harness
-        # (harness_record), so AWAIT_OWNER would wait for an answer nobody can give. v2 stays fail
-        # closed until that lifecycle is wired.
+        own = [b for b in list(g.get("unresolved_high") or []) + list(g.get("accept_blockers") or [])
+               if isinstance(b, dict) and b.get("owner_signoff")]
+        ok(OWNER_LIFECYCLE_WIRED and _owner_rule() is not None and g["action"] == "AWAIT_OWNER" and own
+           and (own[0].get("owner_item") or {}).get("fingerprint"),
+           f"T30 (1F) a measured decision test that changes the plan goes to the owner: AWAIT_OWNER with a "
+           f"fingerprinted item ({g['action']})")
+        gn = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="none")
+        ok(gn["action"] == "RUN_FAILED", f"T30b under --signoff none nobody can accept it: not declarable ({gn['action']})")
+        # T_OWNER_ANSWERED (1F): the harness-recorded answer to that item releases it; whose answer counts follows the
+        # run's sign-off mode (a lead's only under --signoff lead, D2)
         import scope_signoff as _ss
-        ok(hasattr(_ss, "gate_findings") and not OWNER_LIFECYCLE_WIRED,
-           "T30b the owner rule is merged, and v2 does not use it until its sign-off lifecycle is wired")
+        _ss.record(dd, g, 2)
+        _ss.sign(dd, "lead", all_decision="accept", note="t")
+        _ss.harness_record(dd)
+        g_lo = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        g_ll = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="lead")
+        _ss.sign(dd, "owner", all_decision="decline", note="t")
+        _ss.harness_record(dd)
+        g_od = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        ok(g_lo["action"] == "AWAIT_OWNER" and g_ll["action"] == "DECLARE_SCOPE" and g_od["action"] == "RUN_FAILED"
+           and any(isinstance(u, dict) and u.get("kind") == "scope_declaration_declined"
+                   for u in g_od.get("unresolved_high") or []),
+           f"T_OWNER_ANSWERED a lead's accept counts only under --signoff lead; the owner's decline holds the gate "
+           f"({g_lo['action']}, {g_ll['action']}, {g_od['action']})")
+        for f_ in (_ss.SIGNOFF, _ss.LEDGER, _ss.REQUEST, "trace.jsonl"):
+            if os.path.exists(os.path.join(dd, f_)):
+                os.remove(os.path.join(dd, f_))
         seen = {}
 
         class Rule:
             @staticmethod
-            def gate_findings(rd, rn, viols, non_declarable=None):
+            def gate_findings(rd, rn, viols, non_declarable=None, mode=None):
                 seen["marked"] = [v.get("owner_signoff") for v in viols if v.get("kind") == "decision_test_changes_plan"]
                 return []
         vs = [dict(dtf)]

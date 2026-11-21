@@ -825,6 +825,29 @@ def _self_test() -> int:
         except (ValueError, OSError):
             pass
         ok(open(victim).read() == "untouched", "SO23 scope_signoff.json is not written through a link")
+    # SO31-SO33 (1F, D2): under --signoff lead the harness records the lead's provisional answers; the owner later
+    # confirms or overturns each; an owner's later sign-off keeps those reviews
+    with tempfile.TemporaryDirectory() as d:
+        items = [{"finding": "f1", "fingerprint": "fp1", "kind": "k"}, {"finding": "f2", "fingerprint": "fp2"}]
+        json.dump({"pending": True, "round": 2, "items": items}, open(os.path.join(d, REQUEST), "w"))
+        provisional_answers(d, items, 2, plan_changing={"fp1": True})
+        before = provisional(d)
+        harness_record(d)
+        rows = provisional(d)
+        ok(before == [] and [(r["finding"], r["decision"], r["by"], r["plan_changing"]) for r in rows]
+           == [("f1", "accept", "lead", True), ("f2", "accept", "lead", False)],
+           f"SO31 provisional answers are the lead's accepts, listed once the harness recorded them ({rows})")
+        review(d, "f1", "confirm", note="ok")
+        try:
+            review(d, "f9", "overturn")
+            ok(False, "SO32 a review of a finding with no provisional answer is refused")
+        except ValueError:
+            ok(True, "SO32 a review of a finding with no provisional answer is refused")
+        sign(d, "owner", {"f2": "decline"})
+        rows = provisional(d)
+        ok([(r["finding"], (r["review"] or {}).get("decision")) for r in rows] == [("f1", "confirm")]
+           and json.load(open(os.path.join(d, SIGNOFF)))["answers"]["fp2"]["by"] == "owner",
+           f"SO33 the owner's review is recorded; a later owner answer replaces the lead's and keeps the reviews ({rows})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

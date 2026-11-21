@@ -578,6 +578,21 @@ def _self_test() -> int:
            and FX_.needs_owner_amendment(led17b["D-031"]),
            f"L17 a recorded owner answer applies to the finding it was given for; a revised one is asked again "
            f"({unverified}, {st17}, {led17b['D-031'].status})")
+    # L_OWNER_LEAD (1F, D2): a lead's recorded answer counts only when the run is a --signoff lead run
+    with tempfile.TemporaryDirectory() as d:
+        import scope_signoff as SS
+        claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
+        fp = answer_fingerprint("D-032", claim, fix)
+        json.dump({"answers": {fp: {"finding": "D-032", "decision": "accept", "by": "lead", "provisional": True}}},
+                  open(os.path.join(d, "scope_signoff.json"), "w"))
+        SS.harness_record(d)
+        save(d, {"D-032": Finding(id="D-032", kind="critique_blocker", severity="HIGH", source="harness", claim=claim,
+                                  fix_requires=fix)})
+        st_o = sync(d, None, 2)[0]["D-032"].status
+        led_l = sync(d, None, 2, lead_ok=True)[0]
+        ok(owner_answers(d) == {} and list(owner_answers(d, lead_ok=True)) == [fp] and st_o == "open"
+           and led_l["D-032"].status == "owner_accepted" and led_l["D-032"].events[-1].get("by") == "lead",
+           f"L_OWNER_LEAD a lead's answer counts only with lead_ok, and the ledger says it was the lead's ({st_o})")
     # L_DICT_DW, L_FROZEN_DW, L_GATE_DW (v2 autonomy 1A, 4c and 4a): the test a fix task is checked against.
     with tempfile.TemporaryDirectory() as d:
         frozen, weaker = [{"file": "x.txt", "contains": "draws 32"}], [{"file": "x.txt", "exists": True}]
