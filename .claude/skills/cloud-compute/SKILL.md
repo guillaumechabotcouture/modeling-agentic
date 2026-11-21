@@ -84,8 +84,8 @@ python cloud/vm_job.py run <name> <job_id> --tree . --store outputs/<prefix> --c
   stops the cluster when its cost reaches the cap. Only the owner can set or
   raise a budget.
 
-- A command that runs `main.py` must name its pipeline (`--v2` or `--v1`);
-  `vm_job.py` refuses it otherwise, before anything is created. The job
+- A command that runs `main.py` must name its pipeline as `--v2` (`--v1` is
+  refused: v1 is retired); `vm_job.py` refuses it otherwise, before anything is created. The job
   writes a launch record (`<out>/<name>/<job_id>/assignments.json`) that the eval
   grader reads.
 - `--store` is required: success means every output is verified in

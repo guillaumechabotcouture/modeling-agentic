@@ -21,9 +21,9 @@ YAML round-trips that would reformat the file), and returns a manifest entry:
 
 `specific` terms are strings only this defect produces (the changed value, the
 column, the claim id); `generic` terms are the vocabulary a correct critique
-would use. scripts/score_critiques.py matches a blocker to a defect when the
-blocker cites the defect's file or location AND contains >=1 specific term or
->=2 generic terms.
+would use. E5's lexical matcher (scripts/score_critiques.py, removed with v1) matched a
+blocker to a defect when the blocker cited the defect's file or location AND contained >=1
+specific term or >=2 generic terms; CI's regression_eval.py matches on finding kinds instead.
 """
 from __future__ import annotations
 

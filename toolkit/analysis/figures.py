@@ -69,6 +69,11 @@ class Missing(Exception):
     """A figure's input is absent; the message is its not-produced reason."""
 
 
+class PresentationRefused(ValueError):
+    """A declared presentation input (boundaries, crosswalk) that is refused: it stops the render (fail closed) and
+    is never recorded as one figure's own failure."""
+
+
 def _fv():
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import figure_validator
@@ -148,7 +153,11 @@ class RunData:
         if self.pres.get("boundaries") is None:
             return None
         if self._geo is None:
-            self._geo = load_boundaries(self.pres["boundaries"], self.ids, self.region, self.dir)
+            try:
+                self._geo = load_boundaries(self.pres["boundaries"], self.ids, self.region, self.dir)
+            except Exception as e:  # noqa: BLE001 -- the loader's own refusals (ValueError) and any other error
+                # reading the declared file: both stop the render (Codex r1)
+                raise PresentationRefused(str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}") from e
         return self._geo
 
     def use(self, rel: str):
@@ -312,6 +321,80 @@ def _publish(path: str, data, root: str) -> None:
     followed (lib.safe_io)."""
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().publish(path, data, root)
+
+
+def _finite(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _axis_max(vals, floor: float = 1e-9) -> float:
+    """An axis's upper end from its values: the largest finite one, never below `floor` (no NaN, infinite or
+    zero-span limit)."""
+    return max([float(v) for v in vals if v is not None and math.isfinite(float(v))] + [floor])
+
+
+def _prop_max(vals) -> float:
+    """The upper end of a proportion axis: 6% above the largest value, never above 1; 0.001 when no value is above
+    0 (never a zero span)."""
+    top = _axis_max(vals, 0.0)
+    return min(top * 1.06, 1.0) if top > 0 else 1e-3
+
+
+FIG_ENDS = (".png", ".svg", ".png.provenance.json", ".csv")      # what render publishes for one figure
+
+
+def _file_sigs(dest: str, name: str, ends=FIG_ENDS) -> dict:
+    """Each of a figure's files as it is now (inode, mtime, size; None when absent; "unknown" when it cannot be
+    examined), no link followed: taken before an attempt so that `_discard` can tell what the attempt published."""
+    out = {}
+    for end in ends:
+        try:
+            st = os.lstat(os.path.join(dest, name + end))
+            out[end] = (st.st_ino, st.st_mtime_ns, st.st_size)
+        except (FileNotFoundError, NotADirectoryError):
+            out[end] = None
+        except OSError:
+            out[end] = "unknown"
+    return out
+
+
+def _discard(dest: str, name: str, root: str, before: dict) -> None:
+    """Remove what a figure that failed part way published in this attempt (no link followed), so no file of a
+    figure the index does not list is left; best effort. `before`: `_file_sigs` taken before the attempt. A file
+    that was already there and that the attempt did not replace is never removed (Codex r3), nor one whose state
+    before or after the attempt could not be examined (Codex r4)."""
+    from toolkit.analysis.artifacts import _safe_io
+    now = _file_sigs(dest, name, tuple(before))
+    for end, sig in now.items():
+        if sig is None or sig == before[end] or "unknown" in (sig, before[end]):
+            continue
+        try:
+            _safe_io().remove_nofollow(root, os.path.relpath(os.path.join(dest, name + end), root))
+        except (OSError, ValueError):
+            pass
+
+
+RENDER_FAILED = "figure_render_failed"
+
+
+def render_findings(not_produced) -> list[dict]:
+    """One finding per figure that failed while it was drawn or saved (`render_failed` in its not-produced record):
+    figure_render_failed:<figure>. By the tier its record carries (TIER_OF; owner decision on #293, 2026-11-20): a
+    decision figure is HIGH and not declarable, so it blocks acceptance; a diagnostic or trace figure (the other
+    tiers of TIERS) is MEDIUM and declarable; a record with no tier, or one this module does not know, is treated
+    as a decision figure (fail closed). A figure without its inputs is not a finding. The contract check
+    (toolkit/analysis/contract.py) reads these from the manifest-hashed analysis/figures.yaml."""
+    out = []
+    for x in not_produced or []:
+        if not (isinstance(x, dict) and x.get("render_failed")):
+            continue
+        tier = x.get("tier")
+        minor = isinstance(tier, str) and tier in TIERS        # TIERS holds the non-decision tiers only
+        out.append({"kind": RENDER_FAILED, "severity": "MEDIUM" if minor else "HIGH", "stage": "ANALYZE",
+                    "key": str(x.get("figure")),
+                    "claim": f"figure {x.get('figure')} ({tier} tier) was not produced: {x.get('reason')}",
+                    "scope_declarable": minor, "source": PRODUCER})
+    return out
 
 
 def _fig_bytes(fig, fmt: str, **kw) -> bytes:
@@ -1518,7 +1601,7 @@ def fig_calibration(R, t):
         sd = float((cs.get("target_uncertainty") or {}).get("region_sd_logit") or 0.0)
         e_rmse = ((R.opt("emulator") or {}).get("accuracy") or {}).get("cal_logit_rmse")
         metric = R.labels.metric(cs.get("metric", "metric"))
-        m = max(tgt.values()) * 1.06
+        m = _prop_max(tgt.values())
 
         def targets_panel(ax):
             for yv, r in enumerate(regs[::-1]):
@@ -1546,8 +1629,9 @@ def fig_calibration(R, t):
             FS.style(a2, t, grid="x")
             x = np.array([tgt[i] for i in R.ids])
             y = np.array([mod[i] for i in R.ids])
-            m = float(max(x.max(), y.max())) * 1.06
-            gx = np.linspace(max(m / 400, 1e-4), m, 200)
+            m = _prop_max([x.max(), y.max()])
+            # the logit is undefined at 0 and 1; the lower end is 1e-4, or a quarter of a shorter axis (Codex r2)
+            gx = np.linspace(max(m / 400, min(1e-4, m / 4)), min(m, 1 - 1e-6), 200)
             if e_rmse:
                 a1.fill_between(gx, il(lg(gx) - 1.96 * e_rmse), il(lg(gx) + 1.96 * e_rmse), color=t["band"], lw=0,
                                 zorder=0, label="emulator held-out error (95%)")
@@ -1618,7 +1702,9 @@ def fig_calibration(R, t):
         a1.set_ylabel("model expected", fontsize=8)
         pr = []
         for yv, r in enumerate(regs[::-1]):
-            v = [(float(f["expected"]) - float(f["observed"])) / math.sqrt(max(float(f.get("variance", f["expected"])), 1e-9))
+            # a variance recorded as null (not only an absent one) falls back to the expected value
+            v = [(float(f["expected"]) - float(f["observed"]))
+                 / math.sqrt(max(float(f["expected"] if f.get("variance") is None else f["variance"]), 1e-9))
                  for f in fit if str(f.get("unit")) in R.by_id and R.region(str(f["unit"])) == r]
             pr += v
             a2.scatter(v, [yv] * len(v), s=10, color=t["cat"][0], zorder=3)
@@ -1736,7 +1822,7 @@ def fig_dollars(R, t):
     a1.set_yticks([0])
     a1.set_yticklabels(["whole plan"], fontsize=8)
     a1.set_ylim(-0.5, 1.4)
-    a1.set_xlim(0, max(env, left) * 1.01)
+    a1.set_xlim(0, _axis_max([env, left]) * 1.01)
     FS.set_axis_format(a1, "x", "money")
     import matplotlib.patches as mp
     if comps:
@@ -1765,8 +1851,9 @@ def fig_dollars(R, t):
             ax.locator_params(axis="x", nbins=2)
             ax.tick_params(labelsize=6.5)
         topc = max(comps, key=lambda c: bc[c])
-        title = (f"The plan uses {FS.fmt((tot + fixed) / env, 'percent')} of the {FS.fmt(env, 'money')} envelope; "
-                 f"{R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars")
+        used = (f"The plan uses {FS.fmt((tot + fixed) / env, 'percent')} of the {FS.fmt(env, 'money')} envelope"
+                if env > 0 else f"The plan costs {FS.fmt(tot + fixed, 'money')} against a zero envelope")
+        title = f"{used}; {R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars"
         if unspent > 0.005 * env:
             title = (f"{FS.fmt(unspent, 'money')} of the {FS.fmt(env, 'money')} envelope is unspent; "
                      f"{R.labels.component(topc)} take {FS.fmt(bc[topc] / tot, 'percent')} of allocated dollars")
@@ -1801,27 +1888,33 @@ def fig_cost_per_outcome(R, t):
         raise Missing("the plan gives no unit a package")
     rep = fd.get("replay") or {}
     lvl = float(rep.get("level") or (R.opt("uncertainty") or {}).get("interval", {}).get("level") or 0.95)
-    inc = {c: v for c, v in (fd.get("component_increment") or {}).items() if v.get("outcome_per_usd")}
+    inc = {c: v for c, v in (fd.get("component_increment") or {}).items()     # a cost per outcome that is finite
+           if v.get("outcome_per_usd") and _finite(1.0 / v["outcome_per_usd"])}
     nrow = len(shown) + len(other)
-    fig = _fig(t, 7.6, 0.3 * max(nrow + len(inc), 4) + 2.2)    # a floor: one package and one component still lay out
+    # the component panel is given the room of two rows at least: with one row beside three or more package rows its
+    # height came out negative (Codex r4). Unchanged with no component row, or with two or more.
+    n2 = max(len(inc), 2) if inc else 0
+    fig = _fig(t, 7.6, 0.3 * max(nrow + n2, 4) + 2.2)    # a floor: one package and one component still lay out
     h = fig.get_figheight()
     top = _top(fig, 0.6)
     avail = top - 0.55 / h - 0.75 / h
-    h1 = avail * (nrow + 0.6) / (nrow + len(inc) + 1.2)
+    h1 = avail * (nrow + 0.6) / (nrow + n2 + 1.2)
     a1 = fig.add_axes([0.38, top - 0.25 / h - h1, 0.5, h1])
     FS.style(a1, t, grid="x")
-    vals, have_ci, withheld = [1e-9], False, []
+    vals, have_ci, withheld, not_drawn = [1e-9], False, [], 0
     order = shown + other
     for y, k in enumerate(order[::-1]):
         v = allp[k]
         if st[k] in ("cost", "free"):
             x = v["cost"] / v["averted"]
             ci = v.get("usd_per_outcome_interval")
-            if ci:
+            if ci and all(_finite(ci.get(e)) for e in ("ci_low", "ci_high")):
                 have_ci = True
                 a1.plot([ci["ci_low"], ci["ci_high"]], [y, y], color=t["cat"][0], lw=2, solid_capstyle="round",
                         zorder=2)
                 vals += [ci["ci_low"], ci["ci_high"]]
+            elif ci:                                 # an end that is not a finite number: no line (the table has it)
+                not_drawn += 1
             elif v.get("interval_withheld"):
                 withheld.append((k, v["interval_withheld"]))
             a1.scatter([x], [y], s=34, color=t["cat"][0], edgecolors=t["surface"], linewidths=1.2, zorder=3)
@@ -1836,7 +1929,7 @@ def fig_cost_per_outcome(R, t):
     a1.text(1.02, nrow - 0.3, U, transform=a1.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
     a1.set_yticks(range(nrow))
     a1.set_yticklabels([R.labels.package(R.pk[k]) for k in order[::-1]], fontsize=7.5)
-    a1.set_xlim(0, max(vals) * 1.08)
+    a1.set_xlim(0, _axis_max(vals) * 1.08)
     a1.set_ylim(-0.6, nrow - 0.4)
     FS.set_axis_format(a1, "x", "money")
     a1.set_title(f"$ per {_sing(olab)} averted, by package" + (f" (line: {lvl:.0%} UI)" if have_ci else ""),
@@ -1854,7 +1947,7 @@ def fig_cost_per_outcome(R, t):
         a2.text(1.02, len(cs) - 0.3, U, transform=a2.get_yaxis_transform(), fontsize=7.5, color=t["ink2"])
         a2.set_yticks(range(len(cs))[::-1])
         a2.set_yticklabels([R.labels.component(c) for c in cs], fontsize=7.5)
-        a2.set_xlim(0, max(vals + usd) * 1.08)
+        a2.set_xlim(0, _axis_max(vals + usd) * 1.08)
         a2.set_ylim(-0.6, len(cs) - 0.4)
         FS.set_axis_format(a2, "x", "money")
         a2.set_title(f"$ per {_sing(olab)} averted by adding each component (point estimate)", fontsize=8.5,
@@ -1883,7 +1976,11 @@ def fig_cost_per_outcome(R, t):
         [{"component": c, "label": R.labels.component(c), "usd_per_outcome_added": 1.0 / v["outcome_per_usd"],
           "units": v["units"], "units_without_counterpart": v.get("units_without_counterpart"),
           "units_with_corrections": v.get("units_with_corrections")} for c, v in inc.items()]
-    return fig, title, cap, rows, "cost per outcome averted by package and by component"
+    # a caption note: render adds it after cutting the caption at CAPTION_MAX, so the count is always published and
+    # the caption itself reads as before (Codex r4, r5)
+    extra = {"caption_note": f" {not_drawn} interval{'' if not_drawn == 1 else 's'} not drawn: an end is not a "
+                             "finite number."} if not_drawn else {}
+    return fig, title, cap, rows, "cost per outcome averted by package and by component", extra
 
 
 def fig_sensitivity(R, t):
@@ -2212,13 +2309,10 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
                      "reason": (f"no decision figure set declared for kind {kind} (toolkit/analysis/figures.py "
                                 f"DECISION_SETS)" if kind else "the spec declares no deliverable.kind; decision "
                                 "figures are chosen by it (DECISION_SETS), with no default")})
-    for name in [n for n in names if not only or n in only]:
-        R.used = []
-        try:
-            got = FUNCS[name](R, t)
-        except Missing as e:
-            notp.append({"figure": name, "reason": str(e), "tier": TIER_OF[name]})
-            continue
+    import matplotlib.pyplot as plt
+
+    def one(name):
+        got = FUNCS[name](R, t)
         fig, title, cap, rows, shows = got[:5]
         extra = got[5] if len(got) > 5 else {}
         if len(title) > TITLE_MAX:
@@ -2235,11 +2329,29 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
         cap = cap if len(cap) <= CAPTION_MAX else cap[:CAPTION_MAX - 1].rsplit(" ", 1)[0] + "…"
         cap += extra.pop("caption_note", "")
         rel = (lambda p: os.path.relpath(p, run_dir)) if harness else (lambda p: p)
-        figs.append(dict({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
-                          "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
-                          "theme": theme, "tier": TIER_OF[name],
-                          "group": "decision" if TIER_OF[name] == "decision" else "diagnostics",
-                          "presentation": R.presentation_record()}, **extra))
+        return dict({"figure": name, "path": rel(files["png"]), "svg": rel(files["svg"]), "table": rel(table),
+                     "title": title, "caption": cap, "shows": shows, "sources": sources, "offset_free": clean,
+                     "theme": theme, "tier": TIER_OF[name],
+                     "group": "decision" if TIER_OF[name] == "decision" else "diagnostics",
+                     "presentation": R.presentation_record()}, **extra)
+    for name in [n for n in names if not only or n in only]:
+        R.used = []
+        opened, before = set(plt.get_fignums()), _file_sigs(dest, name)
+        try:
+            figs.append(one(name))
+        except Missing as e:
+            notp.append({"figure": name, "reason": str(e), "tier": TIER_OF[name]})
+        except PresentationRefused:
+            raise                       # a refused declared input is not one figure's failure: fail closed, as before
+        except Exception as e:  # noqa: BLE001 -- v2 autonomy 1C-a: one figure's failure (its draw, title, save,
+            # validation or table) is its own: recorded with the error, a finding by its tier (render_findings), and
+            # the other figures are still drawn; it never ends the analysis
+            _discard(dest, name, run_dir if harness else dest, before)
+            notp.append({"figure": name, "reason": f"render failed: {type(e).__name__}: {e}"[:500],
+                         "tier": TIER_OF[name], "render_failed": True})
+        finally:
+            for num in set(plt.get_fignums()) - opened:      # whatever this figure opened, drawn or not, is closed
+                plt.close(num)
     res = {"figures": figs, "not_produced": notp, "tiers": {k: list(v) for k, v in tiers_for(R.spec).items()},
            "groups": {"decision": list(tiers_for(R.spec)["decision"]),
                       "diagnostics": [n for k in ("data_model", "simulation") for n in tiers_for(R.spec)[k]]}}
@@ -2599,6 +2711,253 @@ def toy_run(d: str, n: int = 24, regions: int = 3, coords: bool = False, labels:
                                                  "ignores": {"data/inputs/a.csv": {"area": "not used"}}}}]},
                    open(os.path.join(d, "data", "derivations.yaml"), "w"), sort_keys=False)
     return d
+
+
+def _self_test_isolation(ok, base):
+    """v2 autonomy 1C-a (items 4.1-4.5): one figure's failure is its own (not produced, a MEDIUM finding, its figure
+    closed); the calibration, dollars and cost-per-outcome figures draw at the edge values that stopped them."""
+    import warnings
+    import matplotlib.pyplot as plt
+    d = toy_run(os.path.join(base, "run_iso"))
+    t = FS.setup("light")
+
+    def attempt(f):
+        try:
+            return f(), None
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            return None, f"{type(e).__name__}: {e}"
+
+    def boom(R, t_):
+        _fig(t_, 4, 3)                  # a figure left open by a draw that then fails
+        raise ZeroDivisionError("planted")
+    orig = FUNCS["dollars"]
+    plt.close("all")
+    FUNCS["dollars"] = boom
+    try:
+        res, err = attempt(lambda: render(d, os.path.join(base, "iso_a")))
+    finally:
+        FUNCS["dollars"] = orig
+    notp = {x["figure"]: x for x in (res or {}).get("not_produced", [])}
+    made = {f["figure"] for f in (res or {}).get("figures", [])}
+    ok(err is None and notp.get("dollars", {}).get("render_failed") is True
+       and "ZeroDivisionError" in notp["dollars"]["reason"] and {"headline", "frontier", "cost_per_outcome"} <= made
+       and not notp.get("trajectories", {}).get("render_failed"),
+       f"FG_ISOLATE a figure whose draw fails is not produced, with the error; the others are drawn ({err}, "
+       f"{sorted(made)})")
+    ok(err is None and plt.get_fignums() == [], f"FG_ISOLATE_b no figure stays open after a failed draw "
+                                                 f"({plt.get_fignums()})")
+    plt.close("all")
+    fnd, e2 = attempt(lambda: render_findings((res or {}).get("not_produced", [])))
+    ok(e2 is None and [(x["kind"], x["key"], x["severity"], x["scope_declarable"]) for x in fnd]
+       == [("figure_render_failed", "dollars", "HIGH", False)] and TIER_OF["dollars"] == "decision",
+       f"FG_ISOLATE_c a failed decision figure is one HIGH, non-declarable finding figure_render_failed:<figure>; "
+       f"a figure without its inputs is none ({e2}, {fnd})")
+    # owner decision on #293 (2026-11-20): by the figure's tier. Decision tier: HIGH, not declarable (it blocks
+    # acceptance); the diagnostic and trace tiers: MEDIUM, declarable; a tier that is absent or unknown: as decision
+    recs = [{"figure": n, "tier": TIER_OF[n], "reason": "x", "render_failed": True} for n in ORDER]
+    fnd, e3 = attempt(lambda: {x["key"]: (x["severity"], x["scope_declarable"]) for x in render_findings(recs)})
+    want = {n: (("HIGH", False) if TIER_OF[n] == "decision" else ("MEDIUM", True)) for n in ORDER}
+    ok(e3 is None and fnd == want and len(set(want.values())) == 2,
+       f"FG_TIER every figure's failure is HIGH and non-declarable in the decision tier, MEDIUM and declarable in "
+       f"the others ({e3}, {sorted((k, v) for k, v in (fnd or {}).items() if v != want.get(k))})")
+    odd = [{"figure": "a", "reason": "x", "render_failed": True},
+           {"figure": "b", "tier": "no_such_tier", "reason": "x", "render_failed": True},
+           {"figure": "c", "tier": None, "reason": "x", "render_failed": True}]
+    fnd, e4 = attempt(lambda: [(x["severity"], x["scope_declarable"]) for x in render_findings(odd)])
+    ok(e4 is None and fnd == [("HIGH", False)] * 3,
+       f"FG_TIER_UNKNOWN a failed figure whose record names no tier, or one this module does not know, is HIGH and "
+       f"non-declarable (fail closed) ({e4}, {fnd})")
+    g = globals()
+    orig_csv = g["_write_csv"]
+
+    def bad_csv(path, rows, root):
+        if os.path.basename(path) == "frontier.csv":
+            raise OSError("planted")
+        return orig_csv(path, rows, root)
+    g["_write_csv"] = bad_csv
+    out_b = os.path.join(base, "iso_b")
+    try:
+        res, err = attempt(lambda: render(d, out_b))
+    finally:
+        g["_write_csv"] = orig_csv
+    notp = {x["figure"]: x for x in (res or {}).get("not_produced", [])}
+    left = sorted(f for f in os.listdir(out_b) if f.startswith("frontier.")) if os.path.isdir(out_b) else None
+    ok(err is None and notp.get("frontier", {}).get("render_failed") is True
+       and "frontier" not in {f["figure"] for f in res["figures"]} and plt.get_fignums() == [] and left == [],
+       f"FG_ISOLATE_d a failure while saving is the figure's own: not listed, no file of it left ({err}, {left})")
+    plt.close("all")
+
+    def drawn(R, f=fig_calibration):
+        """(error, the first axis's upper x limit): the draw with every warning an error."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            got, err_ = attempt(lambda: f(R, t))
+        hi = got[0].axes[0].get_xlim()[1] if got else None
+        plt.close("all")
+        return err_, hi
+    R = RunData(d)
+    for u in R.units:
+        u["tgt"] = "0.97"
+    e_a, hi_a = drawn(R)
+    R.override["figure_data"] = dict(R.art("figure_data"), calibration={"units": {i: {"modelled": 0.96} for i in R.ids}})
+    e_b, hi_b = drawn(R)
+    ok(e_a is None and e_b is None and hi_a <= 1.0 and hi_b <= 1.0,
+       f"FG_HIGH_PREV calibration targets near 1 draw with no invalid value and an axis that ends at 1 ({e_a}, {e_b}, "
+       f"{hi_a}, {hi_b})")
+    # Codex r2: with very low proportions the emulator-error band still spans the plotted values
+    from matplotlib.collections import PolyCollection
+    R = RunData(d)
+    for u in R.units:
+        u["tgt"] = "0.00005"
+    R.override["figure_data"] = dict(R.art("figure_data"), calibration={"units": {i: {"modelled": 0.00005}
+                                                                                  for i in R.ids}})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got_l, e_l = attempt(lambda: fig_calibration(R, t))
+    bx = [float(x) for c in (got_l[0].axes[0].collections if got_l else []) if isinstance(c, PolyCollection)
+          for pth in c.get_paths() for x in pth.vertices[:, 0]]
+    hi_l = got_l[0].axes[0].get_xlim()[1] if got_l else None
+    plt.close("all")
+    ok(e_l is None and bx and min(bx) < 0.00005 < max(bx) <= hi_l,
+       f"FG_LOW_PROP_BAND with targets far below 1e-4 the emulator-error band spans the plotted values inside the "
+       f"axis ({e_l}, band {min(bx) if bx else None}-{max(bx) if bx else None}, axis end {hi_l})")
+    R = RunData(d)
+    R._cache[os.path.join("analysis", "calibration.yaml")] = {"data": {"method": "likelihood", "diagnostics": {
+        "fit": [{"unit": i, "observed": 3.0, "expected": 2.5, "variance": None} for i in R.ids]}}}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got_v, e_v = attempt(lambda: fig_calibration(R, t))
+    res_v = sorted({round(float(x), 6) for c in got_v[0].axes[1].collections for x in c.get_offsets()[:, 0]}) \
+        if got_v else None
+    plt.close("all")
+    ok(e_v is None and res_v == [round(-0.5 / math.sqrt(2.5), 6)],
+       f"FG_VARIANCE_NONE a fit row whose variance is recorded as null uses its expected value: every Pearson "
+       f"residual is (2.5 - 3) / sqrt(2.5) ({e_v}, {res_v})")
+    # Codex r1: a low proportion keeps its own axis (the floor is for a zero range only)
+    lo_p, e_p = attempt(lambda: (_prop_max([0.0001, 0.00005]), _prop_max([0.0, 0.0]), _prop_max([0.5]),
+                                 _prop_max([0.99])))
+    ok(e_p is None and abs(lo_p[0] - 0.000106) < 1e-12 and lo_p[1] > 0 and abs(lo_p[2] - 0.53) < 1e-12
+       and lo_p[3] == 1.0, f"FG_PROP_AXIS a proportion axis ends 6% above its largest value, at 1 at most, and "
+                           f"above 0 when every value is 0 ({e_p}, {lo_p})")
+    # Codex r1: a declared boundary input the loader cannot read at all (any error, not only its own refusals)
+    # still stops the render
+    R = RunData(d)
+    R.pres = dict(R.pres, boundaries={"path": "planted.geojson"})
+
+    def bad_loader(*a, **k):
+        raise AttributeError("planted")
+    g["load_boundaries"], orig_lb = bad_loader, g["load_boundaries"]
+    try:
+        _, e_g = attempt(lambda: R.geo)
+    finally:
+        g["load_boundaries"] = orig_lb
+    ok(str(e_g).startswith("PresentationRefused"),
+       f"FG_BOUNDARY_ANY_ERROR a boundary input that fails to load with any error is a refused presentation input, "
+       f"never one figure's failure ({e_g})")
+    R = RunData(d)
+    fd = R.art("figure_data")
+    R.override["figure_data"] = dict(fd, dollars=dict(fd["dollars"], envelope_usd=0.0))
+    e_d, _ = drawn(R, fig_dollars)
+    ok(e_d is None, f"FG_ZERO_ENVELOPE the dollars figure draws with a zero envelope ({e_d})")
+    bp = {k: dict(v) for k, v in fd["by_package"].items()}
+    k0 = sorted(bp)[0]
+    bp[k0]["usd_per_outcome_interval"] = {"ci_low": 0.004, "ci_high": float("inf")}
+    R.override["figure_data"] = dict(fd, by_package=bp)
+    e_c, hi_c = drawn(R, fig_cost_per_outcome)
+    ok(e_c is None and hi_c is not None and math.isfinite(hi_c),
+       f"FG_AXIS_FINITE cost per outcome keeps a finite axis when an interval end is not finite ({e_c}, {hi_c})")
+    # Codex r3: an interval that is not drawn is told apart from one the analysis withheld; a component whose cost
+    # per outcome is not finite has no row
+    R = RunData(toy_run(os.path.join(base, "run_iso4"), many_packages=True))     # four components: three rows stay
+    fd = R.art("figure_data")
+    bp = {k: dict(v) for k, v in fd["by_package"].items()}
+    k0, k1 = sorted(bp)[:2]
+    bp[k0]["usd_per_outcome_interval"] = {"ci_low": 0.004, "ci_high": float("inf")}
+    bp[k1].pop("usd_per_outcome_interval", None)
+    long_reason = "planted reason " + "that runs on " * 8
+    bp[k1]["interval_withheld"] = {"reason": long_reason, "share_draws_nonpositive": 0.25}
+    ci_ = dict(fd["component_increment"])
+    c0 = sorted(ci_)[0]
+    ci_[c0] = dict(ci_[c0], outcome_per_usd=1e-310)
+    R.override["figure_data"] = dict(fd, by_package=bp, component_increment=ci_)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got_m, e_m = attempt(lambda: fig_cost_per_outcome(R, t))
+    cap_m = got_m[2] if got_m else ""
+    drawn_c = sorted(x.get_text() for x in got_m[0].axes[1].get_yticklabels()) \
+        if got_m and len(got_m[0].axes) > 1 else None
+    rows_c = sorted(r["component"] for r in got_m[3] if "component" in r) if got_m else None
+    plt.close("all")
+    # Codex r4, r5: as published. render cuts a caption at CAPTION_MAX; the count not drawn is a caption note, added
+    # after the cut, and the withheld count stays where it was
+    pub, e_p2 = attempt(lambda: render(R.dir, os.path.join(base, "iso_m"), figure_data=R.override["figure_data"],
+                                       only=["cost_per_outcome"]))
+    cap_p = pub["figures"][0]["caption"] if pub and pub["figures"] else ""
+    ok(e_m is None and e_p2 is None and " 1 intervals withheld: planted reason" in cap_m
+       and "not drawn" not in cap_m and len(cap_m) > CAPTION_MAX
+       and cap_p.endswith("… 1 interval not drawn: an end is not a finite number."),
+       f"FG_WITHHELD_MIXED the caption counts a withheld interval and one not drawn for a non-finite end apart; "
+       f"the latter is in the published caption whatever its length ({e_m}, {e_p2}, {cap_p!r})")
+    keep_c = sorted(c for c in ci_ if c != c0)
+    ok(e_m is None and rows_c == keep_c and drawn_c == sorted(R.labels.component(c) for c in keep_c),
+       f"FG_COMPONENT_FINITE a component whose cost per outcome is not finite has no row in the plot or the table; "
+       f"the others keep theirs ({e_m}, plot {drawn_c}, table {rows_c}, planted {c0})")
+    # Codex r4: one component row beside three or more package rows still lays out (a decision figure)
+    R = RunData(d)
+    fd = R.art("figure_data")
+    ci1 = dict(fd["component_increment"])
+    ci1[sorted(ci1)[0]] = dict(ci1[sorted(ci1)[0]], outcome_per_usd=1e-310)
+    R.override["figure_data"] = dict(fd, component_increment=ci1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got_1, e_1 = attempt(lambda: fig_cost_per_outcome(R, t))
+    lab_1 = [x.get_text() for x in got_1[0].axes[1].get_yticklabels()] if got_1 and len(got_1[0].axes) > 1 else None
+    h_1 = got_1[0].axes[1].get_position().height if lab_1 else None
+    plt.close("all")
+    ok(e_1 is None and len(fd["by_package"]) >= 3 and lab_1 == [R.labels.component(sorted(ci1)[1])] and h_1 > 0,
+       f"FG_ONE_COMPONENT cost per outcome draws its one component row, in a panel of positive height, beside "
+       f"{len(fd['by_package'])} package rows ({e_1}, {lab_1}, {h_1})")
+    # Codex r4: a file whose state before the attempt could not be read is never taken for the attempt's own
+    out_u = os.path.join(base, "iso_u")
+    os.makedirs(out_u)
+    with open(os.path.join(out_u, "x.png"), "w") as fh:
+        fh.write("kept\n")
+    orig_lstat = os.lstat
+
+    def no_lstat(*a, **k):
+        raise PermissionError("planted")
+    os.lstat = no_lstat
+    try:
+        before_u, e_u = attempt(lambda: _file_sigs(out_u, "x", (".png",)))
+    finally:
+        os.lstat = orig_lstat
+    _, e_u2 = attempt(lambda: _discard(out_u, "x", out_u, before_u))
+    ok(e_u is None and e_u2 is None and os.path.exists(os.path.join(out_u, "x.png")),
+       f"FG_DISCARD_UNREADABLE a file that could not be examined before the attempt is not removed, and the "
+       f"clean-up raises nothing ({e_u}, {e_u2})")
+    # Codex r3: a figure that fails removes only what its own attempt published, never a file already there
+    out_c = os.path.join(base, "iso_c")
+    os.makedirs(out_c)
+    for end in (".png", ".svg", ".csv", ".png.provenance.json"):
+        with open(os.path.join(out_c, "frontier" + end), "w") as fh:
+            fh.write("kept\n")
+    orig_save = g["_save"]
+
+    def bad_save(fig, out_dir, name, *a, **k):
+        if name == "frontier":
+            raise OSError("planted: refused before any write")
+        return orig_save(fig, out_dir, name, *a, **k)
+    g["_save"] = bad_save
+    try:
+        res, err = attempt(lambda: render(d, out_c, only=["frontier", "dollars"]))
+    finally:
+        g["_save"] = orig_save
+    kept = sorted(f for f in os.listdir(out_c) if f.startswith("frontier.")
+                  and open(os.path.join(out_c, f)).read() == "kept\n")
+    ok(err is None and [x["figure"] for x in res["not_produced"] if x.get("render_failed")] == ["frontier"]
+       and len(kept) == 4,
+       f"FG_DISCARD_OWN a figure that fails before it writes leaves the files already at its paths ({err}, {kept})")
+    plt.close("all")
 
 
 def _self_test() -> int:
@@ -3159,6 +3518,7 @@ def _self_test() -> int:
            and set(grp.get("diagnostics", [])) >= {"calibration_fit", "sensitivity", "trajectories"}
            and all(f.get("group") in ("decision", "diagnostics") for f in idx["figures"]),
            f"F27 figures.yaml separates decision figures from modeller diagnostics: {grp}")
+        _self_test_isolation(ok, base)
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
