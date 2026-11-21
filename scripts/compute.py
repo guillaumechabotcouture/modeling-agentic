@@ -2521,17 +2521,25 @@ def _run_code_digest(run_dir: str, confined: bool = False) -> str:
     """Every Python file under the run dir outside models/ and data/ (those are run_files): what a module named by
     data could load from the run root, which is on the worker's sys.path. Links are not followed; when `confined`,
     files are read through no-follow fds (a link raises ValueError, as for run_files)."""
-    h, found = hashlib.sha256(), []
-    for dp, dirs, fns in os.walk(run_dir):
+    h, found, anc = hashlib.sha256(), [], {run_dir: {os.path.realpath(run_dir)}}
+    for dp, dirs, fns in os.walk(run_dir, followlinks=not confined):     # a linked package is importable (Codex r3)
         rel_dp = os.path.relpath(dp, run_dir)
         dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git") and not (
-            rel_dp == "." and d in ("models", "data")))
+            rel_dp == "." and d in ("models", "data"))
+            and os.path.realpath(os.path.join(dp, d)) not in anc[dp])       # only a loop stops the walk
+        for d in dirs:
+            anc[os.path.join(dp, d)] = anc[dp] | {os.path.realpath(os.path.join(dp, d))}
+        if confined and any(os.path.islink(os.path.join(dp, d)) for d in dirs):
+            raise ValueError(f"a directory link under the run dir: {rel_dp} (confined)")
         found += [os.path.normpath(os.path.join(rel_dp, f)) for f in fns if f.endswith(".py")]
     for rel in sorted(found):
         if confined:
             _hash_confined(h, run_dir, rel, mtime=False)
             continue
         h.update(rel.encode() + b"\0")
+        if not os.path.isfile(os.path.join(run_dir, rel)):
+            h.update(b"missing\0")                     # a dangling link: nothing Python can import (Codex r3 P2)
+            continue
         with open(os.path.join(run_dir, rel), "rb") as fh:
             for block in iter(lambda: fh.read(2**20), b""):
                 h.update(block)

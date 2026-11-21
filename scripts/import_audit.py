@@ -45,7 +45,7 @@ REVIEWED = {
                                                          "the batch runner and the checkpoint-restore self-test)"),
                            "import_module": (2, "strings inside its own W0-A self-test fixtures (undeclared "
                                                 "dynamic imports the code closure must refuse)")},
-    "scripts/lib/import_closure.py": {"import_module": (5, "strings inside its own self-test fixtures (dynamic "
+    "scripts/lib/import_closure.py": {"import_module": (6, "strings inside its own self-test fixtures (dynamic "
                                                            "imports the code closure must refuse or take as declared)")},
     "scripts/derived_rebuild.py": {"spec_from_file_location": (2, _REPO_FILE)},
     "scripts/effort_floors_gate.py": {"spec_from_file_location": (1, _REPO_FILE)},
