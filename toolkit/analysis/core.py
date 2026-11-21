@@ -101,22 +101,29 @@ def best_known(A, sol, plan, ben, cost, budget=None, feas=None) -> dict:
     incumbent and the point plan `plan`, when the point plan meets this problem's constraints (the allocator's own
     check), so a comparison with the point plan never shows the point plan beating the "optimum". Adds
     `solver_gap` = {gap, bound, kept}: the true optimum is at most `bound` above the returned objective (g / (1 - g)
-    of the incumbent's gain, less what the point plan recovers). A proven solve is returned as it is."""
+    of the incumbent's gain, less what the point plan recovers, both computed on gains). A proven solve is returned
+    as it is."""
     if sol.get("status") != "feasible" or sol.get("gap") is None:
         return sol
     if budget is None:
         budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
-    g, out, kept = float(sol["gap"]), dict(sol), "incumbent"
-    top = float(sol["objective"]) + g / (1.0 - g) * abs(float(sol.get("gain") or 0.0))
+    from toolkit.analysis import moves as MV
+    g, out, kept, f = float(sol["gap"]), dict(sol), "incumbent", feas or A.feas
+    room = g / (1.0 - g) * abs(float(sol.get("gain") or 0.0))      # the optimum's gain above the incumbent's, at most
     try:
-        pobj = float(sum(ben[i][plan[i]] for i in A.ids))
-        fits = not aopt.check(plan, ben, cost, feas or A.feas, budget)
+        # what the point plan adds, from per-unit differences: sums of two large objectives would round it away
+        more = float(sum(ben[i][plan[i]] - ben[i][sol["choice"][i]] for i in A.ids))
+        spent = float(sum(cost[i][plan[i]] for i in A.ids))
+        # feasible by the allocator's check, by the rule compare() rows report, and within the solver's own budget
+        # tolerance (the check allows more rounding than the solver does: Codex narrow round P1-1)
+        fits = (not aopt.check(plan, ben, cost, f, budget) and not MV.infeasible_reasons(A.ids, plan, cost, f, budget)
+                and spent <= float(budget) * (1 + aopt.BUDGET_RTOL))
     except (KeyError, TypeError, ValueError):
-        fits = False
-    if fits and pobj > float(sol["objective"]):
-        out.update(choice=dict(plan), objective=pobj)
-        kept = "point_plan"
-    out["solver_gap"] = {"gap": g, "bound": max(0.0, top - float(out["objective"])), "kept": kept}
+        more, fits = 0.0, False
+    if fits and more > 0:
+        out.update(choice=dict(plan), objective=float(sum(ben[i][plan[i]] for i in A.ids)))
+        kept, room = "point_plan", room - more
+    out["solver_gap"] = {"gap": g, "bound": max(0.0, room), "kept": kept}
     return out
 
 
