@@ -276,6 +276,9 @@ REVIEWED: dict = {
     "agents/analysis_backend.py": {"open-write": (1, "write_toy_units (a fixture)")},
     "scripts/assemble_changes.py": {"open-write": (3, _REPO), "os-remove": (1, _REPO)},
     "scripts/cloud_batch.py": {"open-write": (2, "the operator's local batch files")},
+    "scripts/codex_review.py": {"open-write": (2, "a dev tool the operator runs on the repository, never in a run: "
+                                                  "codex's log next to the review's output, and PR.diff in the "
+                                                  "export (" + _TMP_REASON + ")")},
     "scripts/compute.py": {
         "open-write": (10, "worker init markers, chunk inputs, stderr and the worker's sync record (" + _TMP_REASON + ")"),
         "os-remove": (5, "stale bundle members and pid files on a worker (" + _TMP_REASON + "); the worker's TLS files"),
@@ -283,7 +286,7 @@ REVIEWED: dict = {
         "os-link": (1, "the claim file in the worker's call dir (atomic claim)"),
         "os.open-write": (1, "the worker's TLS files (O_EXCL, private dir)")},
     "scripts/eval_private.py": {"shutil": (4, _EVAL), "open-write": (5, _EVAL)},
-    "scripts/eval_suite.py": {"open-write": (7, _EVAL), "os-symlink": (1, _EVAL), "os-remove": (1, _EVAL),
+    "scripts/eval_suite.py": {"open-write": (9, _EVAL), "os-symlink": (1, _EVAL), "os-remove": (1, _EVAL),
                               "shell-command": (1, _EVAL + " (--execute runs the cloud launch commands it printed)")},
     "scripts/fixtures.py": {"shutil": (5, _EVAL), "open-write": (7, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/gate_fuzz.py": {"shutil": (6, _EVAL), "open-write": (7, _EVAL), "os-remove": (2, _EVAL), "os-symlink": (1, _EVAL)},

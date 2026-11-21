@@ -622,6 +622,11 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
         data["emulator_error_floors"] = {"note": "{cost output: {package: n}}, unit values floored at zero after the "
                                                  "drawn emulator error, over every evaluation with that error",
                                          "counts": {k: dict(v) for k, v in A.model.error_floors.items()}}
+    if "emulator" in D.src and getattr(A.model, "error_clips", None) is not None:    # 1C-b 2a
+        data["emulator_error_clips"] = {"note": "{outcome: {package: n}}, unit reductions clipped to the emulator's "
+                                                "bounds after the drawn emulator error (the mean was inside them), "
+                                                "over every evaluation with that error",
+                                        "counts": {k: dict(v) for k, v in A.model.error_clips.items()}}
     if getattr(A, "plan_budget", None) is not None:      # F6 S1-1b: the draws re-optimised within the reserve
         data["budget_planned"] = float(A.plan_budget)
     if prov is not None:

@@ -258,6 +258,19 @@ count; a spec that needs one cannot be signed by the lead. The report declares e
 limitation. A held-out benchmark is validation: its result stands, and no parameter is ever tuned toward it. A
 fit target out of band means the engine's fit failed; it gates the same way.
 
+## Calibration targets the run cannot meet (the conflict rule)
+
+State the owner's default (D5) in every new spec; the harness adds it to a draft that has none:
+
+    conflicts:
+      policy: declare_and_test      # "stop" keeps a miss as a block
+      never_declare: [<target, source or unit id>]    # optional: targets that must be met
+
+Under it, a calibration miss nobody declared is held out, declared and tested automatically (its units' calibration
+targets moved to each end of `test_scales`, the plan re-solved), and the run continues; it pauses for the owner only
+when that test changes the plan (toolkit/analysis/conflicts.py). Declare known misses in
+`calibration.joint.unmatched.declared` as before: they keep their own decision tests.
+
 ## What not to do
 
 - Do not type a result, an effect size from the data, or an interval into the spec: the
