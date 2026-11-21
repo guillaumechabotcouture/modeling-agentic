@@ -346,6 +346,16 @@ def import_critique(run_dir: str) -> int:
     return add(run_dir, from_critique(raw if isinstance(raw, dict) else {}, run_dir))
 
 
+def missing_critique(run_dir: str) -> list:
+    """The spec critique's undeclared HIGH findings that are not rows of the file (with their text): a signature
+    made without them did not see them."""
+    import yaml
+    raw = yaml.safe_load(read_nofollow(run_dir, "decision_spec.yaml")[0].decode("utf-8"))
+    have = {(r["id"], r["source"], " ".join(r["text"].split())) for r in parse(read_bytes(run_dir))}
+    return [c["id"] for c in from_critique(raw if isinstance(raw, dict) else {}, run_dir)
+            if (c["id"], c["source"], " ".join(c["text"].split())) not in have]
+
+
 def lead_defer(run_dir: str, today: datetime.date | None = None) -> int:
     """Under --signoff lead: every open row is deferred to the owner, provisionally (D2), and the run proceeds; the
     report lists them at its top. Rows already disposed are left as they are. The count deferred."""
@@ -365,8 +375,11 @@ def lead_defer(run_dir: str, today: datetime.date | None = None) -> int:
 
 def report_lines(run_dir: str) -> list:
     """The report's top block: the rows the lead deferred to the owner provisionally (D2), each with its text."""
-    try:
-        rows = [r for r in parse(read_bytes(run_dir)) if r.get("provisional")]
+    from toolkit.spec import signoff as SO
+    lead = (recorded(SO._spec_record(run_dir) or {})[0] or "") not in ("", "owner")
+    try:        # still deferred to the owner: provisional, or under a signature that is not the owner's (Codex)
+        rows = [r for r in parse(read_bytes(run_dir)) if r.get("disposition") == "deferred" and r.get("owner") == "owner"
+                and (r.get("provisional") or lead)]
     except ValueError as e:
         return [REPORT_HEADING, "", f"{FILE} could not be read: {e}", ""]
     if not rows:
@@ -584,6 +597,10 @@ def main(argv=None) -> int:
     except (ValueError, OSError, LinkRefused, yaml.YAMLError) as e:
         bad = [str(e)]
     bad += problems(a.run_dir, None, None)
+    try:
+        bad += [f"the spec critique's HIGH finding {i} is not a row" for i in missing_critique(a.run_dir)]
+    except (ValueError, OSError, LinkRefused, yaml.YAMLError) as e:
+        bad.append(str(e))
     print("\n".join(bad) or "every review condition has a disposition")
     return 1 if bad else 0
 

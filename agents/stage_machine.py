@@ -1486,6 +1486,10 @@ class Machine:
             self.st.tries["spec_feedback"] = errs
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
+        if not self._review_conditions(self.st.signoff, defer=False):
+            # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
+            self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
+            return self._go("SPEC", "review conditions could not be prepared for signing")
         return self._go("SIGN", "spec drafted and valid")
 
     def _derive(self, rd: str | None = None) -> list[str]:
@@ -1538,7 +1542,7 @@ class Machine:
         self.log(f"[machine] waiting for the owner: python3 agents/stage_machine.py sign {self.run_dir} --by owner")
         return "SIGN"
 
-    def _review_conditions(self, mode: str) -> bool:
+    def _review_conditions(self, mode: str, defer: bool = True) -> bool:
         """Owner decision 2026-11-21 (W0-G): before signing, the spec critique's undeclared HIGH findings become rows of
         review_conditions.yaml; under --signoff lead each open row is deferred to the owner, provisionally (D2), and
         the run proceeds. The sheet is regenerated so it shows them. False (the run waits for the owner) when the
@@ -1546,9 +1550,13 @@ class Machine:
         from toolkit.spec import review_conditions as RC
         try:
             n = RC.import_critique(self.run_dir)
-            d = RC.lead_defer(self.run_dir) if mode == "lead" else 0
-            if (n or d) and os.path.exists(os.path.join(self.run_dir, SIGNOFF_SHEET)):
-                self._write_sheet()
+            d = RC.lead_defer(self.run_dir) if mode == "lead" and defer else 0
+            sp_ = os.path.join(self.run_dir, SIGNOFF_SHEET)
+            if os.path.exists(sp_):     # whenever the sheet does not show the file as it now is (Codex narrow round)
+                from toolkit.spec import signoff as SO
+                src = SO.sheet_sources(open(sp_, encoding="utf-8", errors="replace").read()) or {}
+                if src.get(RC.SHEET_KEY, "none") != RC.sha(self.run_dir):
+                    self._write_sheet()
         except Exception as e:  # noqa: BLE001 -- fail closed: the owner is asked
             self.log(f"[machine] review conditions could not be prepared for signing: {type(e).__name__}: {e}")
             return False
@@ -2248,7 +2256,8 @@ def _t_owner_disposes(run_dir: str) -> None:
         if not r.get("disposition"):
             r.update(disposition="deferred", owner="owner", due="2026-12-31")
     if rows:
-        open(os.path.join(run_dir, RC.FILE), "w").write(yaml.safe_dump({"conditions": rows}, sort_keys=False))
+        from lib.safe_io import write_nofollow
+        write_nofollow(run_dir, RC.FILE, yaml.safe_dump({"conditions": rows}, sort_keys=False).encode(), atomic=True)
         if os.path.exists(os.path.join(run_dir, SIGNOFF_SHEET)):
             from toolkit.spec import signoff as SO
             SO.write_sheet(run_dir)
