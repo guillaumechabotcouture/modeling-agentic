@@ -450,6 +450,9 @@ def _self_test() -> int:
                                  f"E10g a manifest_sha256 of {bad_digest!r} fails closed")
                 expect_error("bundle_not_pinned", lambda: write_pin({"version": 1}, os.path.join(td, "pin.yaml")),
                              "E10h write_pin refuses a pin without its required fields")
+                for bad_pin in (dict(pin, version=None), dict(pin, bundle_sha256="x"), dict(pin, prefix="elsewhere")):
+                    expect_error("bundle_not_pinned", lambda: write_pin(bad_pin, os.path.join(td, "pin.yaml")),
+                                 f"E10i (Codex r2) write_pin refuses a malformed pin: {bad_pin}")
                 ok(not os.path.exists(os.path.join(td, "pin.yaml")), "E10h nothing written")
                 ok(not touched, f"E10e no case decrypted or read the keychain: {touched}")
             finally:

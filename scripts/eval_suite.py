@@ -1977,6 +1977,8 @@ def _test_s20_run_never_decrypts(ok, td):
         ok(any("no input hashes" in p for p in input_problems(tree, ["toy"], missing))
            and any("no input hashes" in p for p in input_problems(tree, ["toy"], {"questions": {"toy": {}}})),
            "S20j a question the manifest lacks, or lists with no inputs, refuses")
+        ok(all("EVAL_TREE='' " in c for c in launch_commands(["toy"], "hb0", 1)),
+           "S20l (Codex r2) a default-tree launch line clears EVAL_TREE, so a shell's export cannot swap the tree")
         ok(stale_answer_keys(priv, ["toy"], os.path.dirname(os.path.dirname(csv_path))) == []
            and stale_answer_keys(priv, ["toy"], os.path.join(td, "nodata")) != [],
            "S20k publish's check: each stored answer key's input hashes must equal the committed inputs")
