@@ -1155,6 +1155,7 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
                                                    gap=sol.get("solver_gap")),
                         "benefit_change": bchg,
                         "objective": sol["objective"], "recommendation": A.mix_text(ch),
+                        "plan_sha256": plan_sha256(ch),      # S1: which unit gets which package (dt_golden plans)
                         "provably_unchanged": bool(low), **(extra.get(v) or {})})
     A = A_
     worst = max(results, key=lambda r: r["share_units_changed"])
@@ -1231,6 +1232,14 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
         if extra.get("_inputs"):
             rec["arm_inputs"] = extra["_inputs"]
     return rec
+
+
+def plan_sha256(choice) -> str:
+    """sha256 of a plan {unit: package}: which unit gets which package (the shares and moves do not show it)."""
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps({str(k): str(v) for k, v in dict(choice).items()}, sort_keys=True).encode()
+                          ).hexdigest()
 
 
 def _rescale(ratio: float, g: float) -> float:

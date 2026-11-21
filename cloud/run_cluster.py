@@ -4100,6 +4100,57 @@ def _self_test_collect_no_shutdown(ok) -> None:
         ok(rc_ == 0 and len(downs) == want, cid)
 
 
+def _self_test_eval_configs(ok) -> None:
+    """EV (harness benchmark protocol, owner 2026-11-21: an `ev` budget scope of $450): every eval config states
+    its cap (US$35 per run, times its replicates), runs v2 with lead sign-off, 3 rounds and a US$35 model cap, and
+    every cluster it makes (run, keeper, overflow) falls under the one scope `ev` of the tracked scopes file, so
+    `budget_guard` can admit it once the owner signs that scope."""
+    import glob as _glob
+    import budget
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = sorted(_glob.glob(os.path.join(here, "configs", "eval_*.py")))
+    ok(len(paths) == 5, f"EV0 five eval configs: {[os.path.basename(p) for p in paths]}")
+    ok(budget.load_scopes()["scopes"].get("ev") == ["ev-"],
+       f"EV1 the tracked scopes file has scope ev with prefix ev-: {budget.load_scopes()['scopes']}")
+    saved = {k: os.environ.pop(k, None) for k in ("EVAL_TAG", "EVAL_REPS", "EVAL_TREE", "EVAL_PIPELINE")}
+    try:
+        for reps in (1, 2):
+            os.environ.update(EVAL_TAG="hb0", EVAL_REPS=str(reps))
+            for p in paths:
+                q = os.path.basename(p)[len("eval_"):-3]
+                cfg = load_config(p)
+                fl = list(cfg.flags)
+                names = (cfg.name, cfg.keeper_name, cfg.overflow_name)
+                ok(cfg.cap_usd == 35 * reps and cfg.budget_scope == "ev"
+                   and all(budget.scope_for_name(n) == "ev" for n in names),
+                   f"EV2 {q} (reps {reps}): cap_usd {cfg.cap_usd} = US$35 x {reps}, scope {cfg.budget_scope!r}, "
+                   f"every cluster under ev: {[(n, budget.scope_for_name(n)) for n in names]}")
+                ok(cfg.pipeline == "v2" and cfg.max_rounds == 3 and fl[fl.index("--max-budget-usd") + 1] == "35"
+                   and fl[fl.index("--signoff") + 1] == "lead" and len(cfg.labels) == reps,
+                   f"EV3 {q}: pipeline {cfg.pipeline}, rounds {cfg.max_rounds}, flags {fl}, labels {cfg.labels}")
+                # Codex r1: each wrapper names its own question, and the unattended watcher (launch_watch) accepts
+                # the config without --allow-no-cloud-limits: main.py stops at the protocol's 24 h cut-off
+                import launch_watch
+                ok(cfg.name == f"ev-{q.split('_')[0]}-hb0-gcc" and cfg.question_file.endswith(f"/{q}/question.txt")
+                   and cfg.storage_prefix == f"runs/evals/hb0/{q}",
+                   f"EV3b {q}: the config is its own question's ({cfg.name}, {cfg.question_file})")
+                ok(cfg.run_timeout_hours == 24 and seconds(cfg.cluster_timeout) > 24 * 3600
+                   and launch_watch.refuse_reason(cfg) is None,
+                   f"EV3c {q}: cloud-side limits {cfg.run_timeout_hours} h / {cfg.cluster_timeout!r}, "
+                   f"watch refusal {launch_watch.refuse_reason(cfg)!r}")
+        os.environ.update(EVAL_TAG="Bad_Tag", EVAL_REPS="1")
+        try:
+            load_config(paths[0])
+            ok(False, "EV4 a tag that would put the cluster name outside a-z, 0-9 and - is refused at load")
+        except ValueError:
+            ok(True, "EV4 a tag that would put the cluster name outside a-z, 0-9 and - is refused at load")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
 def _self_test_budget(ok) -> None:
     """BU (F6 Stage 2, 2026-11-11: $106 spent of a $100 budget): `launch` refuses unless the owner-signed budget
     (cloud/budget.py) covers the scope's spend plus the config's cap_usd, before any key is read or cluster made."""
@@ -5165,6 +5216,10 @@ def _self_test() -> int:
         _self_test_budget(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"BU: {type(e).__name__}: {e}")
+    try:
+        _self_test_eval_configs(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"EV: {type(e).__name__}: {e}")
     globals()["budget_guard"] = lambda cfg, reserve=True, inv=None: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
