@@ -256,6 +256,12 @@ def spec_signoff_findings(run_dir: str, signoff: str, backend=None) -> list[dict
                  "key": "spec", "scope_declarable": False,
                  "claim": "decision_spec.yaml changed after sign-off. It is the owner's; restore it or ask for a "
                           "new sign-off. Computational settings belong in analysis_settings.yaml."}]
+    from toolkit.spec import review_conditions as RC     # W0-G (Codex r2 P1-5): the conditions the signature bound
+    bad = RC.problems(run_dir, None, None)
+    if bad:
+        return [{"kind": "review_conditions_changed_after_signoff", "severity": "HIGH", "stage": "PLAN",
+                 "target_stage": "PLAN", "key": "review_conditions", "scope_declarable": False,
+                 "claim": "; ".join(bad)[:600]}]
     return []
 
 
@@ -911,7 +917,9 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"{AB.SPEC_FILE} does not parse: {e}") from None
     from toolkit.spec import preconditions as PC          # every signing path checks the preconditions (#215)
-    pre = PC.problems(run_dir, data, by)
+    from toolkit.spec import review_conditions as RC     # W0-G: read once, validated here and bound in the record
+    rc_bytes = RC.read_bytes(run_dir)
+    pre = PC.problems(run_dir, data, by, review_bytes=rc_bytes)
     if pre:
         raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
     # engine parameter values without a basis, or chosen with a held-out benchmark, are refused whoever signs (as in
@@ -923,6 +931,7 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     from toolkit.spec import signoff as SO      # F6 (#218): every registered precondition, recomputed, whoever signs
     ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
     rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
+    rec[RC.RECORD_KEY] = RC.sha_of(rc_bytes)
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
     GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
@@ -1494,6 +1503,10 @@ class Machine:
             self.st.tries["spec_feedback"] = errs
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
+        if not self._review_conditions(self.st.signoff, defer=False):
+            # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
+            self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
+            return self._go("SPEC", "review conditions could not be prepared for signing")
         return self._go("SIGN", "spec drafted and valid")
 
     def _derive(self, rd: str | None = None) -> list[str]:
@@ -1515,6 +1528,10 @@ class Machine:
         if mode == "none":
             return self._go("EVIDENCE", "sign-off not required (--signoff none)")
         by = self._signed_by()
+        if not by and not self._review_conditions(mode):
+            self.st.paused, self.st.status = "awaiting_signoff", None
+            save_state(self.run_dir, self.st)
+            return "SIGN"
         # A HIGH geometry finding the spec proposes as an exception is the owner's to approve (review of #131, P1):
         # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
         pend = self._geometry_owner_pending()
@@ -1541,6 +1558,29 @@ class Machine:
         save_state(self.run_dir, self.st)
         self.log(f"[machine] waiting for the owner: python3 agents/stage_machine.py sign {self.run_dir} --by owner")
         return "SIGN"
+
+    def _review_conditions(self, mode: str, defer: bool = True) -> bool:
+        """Owner decision 2026-11-21 (W0-G): before signing, the spec critique's undeclared HIGH findings become rows of
+        review_conditions.yaml; under --signoff lead each open row is deferred to the owner, provisionally (D2), and
+        the run proceeds. The sheet is regenerated so it shows them. False (the run waits for the owner) when the
+        import cannot run: a signature never goes ahead without it."""
+        from toolkit.spec import review_conditions as RC
+        try:
+            n = RC.import_critique(self.run_dir)
+            d = RC.lead_defer(self.run_dir) if mode == "lead" and defer else 0
+            sp_ = os.path.join(self.run_dir, SIGNOFF_SHEET)
+            if os.path.exists(sp_):     # whenever the sheet does not show the file as it now is (Codex narrow round)
+                from toolkit.spec import signoff as SO
+                src = SO.sheet_sources(open(sp_, encoding="utf-8", errors="replace").read()) or {}
+                if src.get(RC.SHEET_KEY, "none") != RC.sha(self.run_dir):
+                    self._write_sheet()
+        except Exception as e:  # noqa: BLE001 -- fail closed: the owner is asked
+            self.log(f"[machine] review conditions could not be prepared for signing: {type(e).__name__}: {e}")
+            return False
+        if n or d:
+            self.log(f"[machine] review conditions: {n} spec-critique finding(s) added"
+                     + (f", {d} deferred to the owner by the lead (D2)" if d else ""))
+        return True
 
     def h_EVIDENCE(self):
         # Stub (workstream V5): every parameter is an assumption until the evidence service checks it.
@@ -2152,6 +2192,10 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     except (OSError, ValueError) as e:      # fail soft: the report is rendered without it, and says so
         lines += ["", f"## World model\n\nThe world-model section could not be read: {type(e).__name__}."]
     head, body = _status_line(run_dir, status), draft.rstrip() + "\n"
+    from toolkit.spec import review_conditions as RCN       # W0-G: conditions the lead deferred, at the top
+    rcl = RCN.report_lines(run_dir)
+    if rcl:
+        head = head + "\n".join(rcl) + "\n"
     full = head + body + "\n".join(lines) + "\n"
     _put(run_dir, "report.md", full)
     # What the harness added, authenticated by the report's hash: writer_qa checks only the writer's span.
@@ -2223,6 +2267,23 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
 
 
 # ------------------------------------------------------------------ self-test
+def _t_owner_disposes(run_dir: str) -> None:
+    """Self-tests: the owner disposes of each open review condition (deferred to the owner) and the sheet is
+    regenerated, as an owner does before signing (W0-G, owner decision 2026-11-21)."""
+    import yaml
+    from toolkit.spec import review_conditions as RC
+    rows = RC.parse(RC.read_bytes(run_dir))
+    for r in rows:
+        if not r.get("disposition"):
+            r.update(disposition="deferred", owner="owner", due="2026-12-31")
+    if rows:
+        from lib.safe_io import write_nofollow
+        write_nofollow(run_dir, RC.FILE, yaml.safe_dump({"conditions": rows}, sort_keys=False).encode(), atomic=True)
+        if os.path.exists(os.path.join(run_dir, SIGNOFF_SHEET)):
+            from toolkit.spec import signoff as SO
+            SO.write_sheet(run_dir)
+
+
 def _self_test() -> int:
     import tempfile
     import shutil
@@ -2333,18 +2394,41 @@ def _self_test() -> int:
         m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
         s = m.run()
         ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
+        from toolkit.spec import review_conditions as _RC
+        _rows = _RC.parse(_RC.read_bytes(d))
+        try:
+            sign(d, "owner", "early")
+            _early = "signed"
+        except ValueError as e:
+            _early = str(e)
+        ok(_rows and all(r["source"] == "spec_critique" and not r.get("disposition") for r in _rows)
+           and "review conditions" in _early,
+           f"T17rc (W0-G, owner 2026-11-21) at SIGN the spec critique's HIGH findings are imported as open conditions; "
+           f"the owner's signature waits for their dispositions ({len(_rows)} row(s); {_early[:80]})")
         from toolkit.spec import preconditions as _PC      # #215: this signing path runs the shared preconditions
         _PC.CHECKS["_t17"] = lambda r, sp, by: [f"refused for {by}"]
         try:
+            _t_owner_disposes(d)
             sign(d, "owner", "ok")
             ok(False, "T17p the spike sign-off refuses a spec failing a registered precondition")
         except ValueError as e:
             ok("refused for owner" in str(e), f"T17p the spike sign-off refuses a spec failing a registered precondition")
         finally:
             _PC.CHECKS.pop("_t17", None)
+        _t_owner_disposes(d)
         sign(d, "owner", "ok")
         ok(_SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")
+
+        d, T, st = new_run("lead_rc", {}, signoff="lead")
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        _rows = _RC.parse(_RC.read_bytes(d)) if os.path.exists(os.path.join(d, _RC.FILE)) else []
+        _rep = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        ok(s == "completed" and _rows and all(r["disposition"] == "deferred" and r["owner"] == "owner"
+                                              and r.get("provisional") for r in _rows)
+           and _RC.REPORT_HEADING in _rep and _rep.index(_RC.REPORT_HEADING) < _rep.index("## Numbers"),
+           f"T18rc (W0-G, D2) under --signoff lead each condition is deferred to the owner provisionally, listed at the "
+           f"top of the report, and the run proceeds ({s}, {len(_rows)} row(s))")
 
         # T19: a fix that edits the signed spec, or puts a decision leaf in the settings file, is
         # undone before anything is rebuilt; the spec stays as signed.
@@ -2443,6 +2527,7 @@ def _self_test() -> int:
         d, T, st = new_run("rethink_signed", {"critics": {1: {"critique-domain": [rk]}}, "plan": plan40},
                            signoff="owner", max_rounds=3)
         _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        _t_owner_disposes(d)
         sign(d, "owner", "first")
         signed_bytes = open(os.path.join(d, AB.SPEC_FILE), "rb").read()
         T2 = StubTasks(T.s)
@@ -4083,6 +4168,7 @@ def _self_test_geometry(ok, td: str) -> None:
        and [f.get("proposed") for f in rep["findings"]] == [why] and still,
        f"IG-M2a proposed by name with a reason, the spec reaches SIGN, where the owner decides; until then the gate "
        f"still carries the swap ({m2.st.state}, {m2.st.paused}, {still})")
+    _t_owner_disposes(d2)
     toolkit.sign(d2, "owner")
     m2.step()
     ok(m2.st.state == "EVIDENCE" and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
@@ -4125,6 +4211,7 @@ def _self_test_geometry(ok, td: str) -> None:
             return real_osopen(f, *a, **k)
         builtins.open, os.open = bopen, oopen
         try:
+            _t_owner_disposes(d6)
             rec6 = sign(d6, "owner", "n")
         finally:
             builtins.open, os.open = real_open, real_osopen
@@ -4151,6 +4238,7 @@ def _self_test_geometry(ok, td: str) -> None:
             sp["engine"] = {"ref": ref}
             sp["engine_parameters"] = {"p": entry}
             _y.safe_dump(sp, open(os.path.join(d7, AB.SPEC_FILE), "w"))
+            _t_owner_disposes(d7)
             sign(d7, "owner", "n")
             why = ""
         except ValueError as e:
@@ -4233,6 +4321,7 @@ def _self_test_derived(ok, td: str) -> None:
            and "engine_attribute_unbound" in sheet and "group" in sheet,
            f"DI8a engine auto: the full checks run per candidate in SPEC, before SIGN; the candidate that needs an "
            f"unbound attribute is shown ineligible with the reason ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+        _t_owner_disposes(d)
         toolkit.sign(d, "owner")
         for _ in range(6):
             if m.st.state in ("CONFIGURE", "FINAL"):

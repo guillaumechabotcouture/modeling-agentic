@@ -250,6 +250,11 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
             or (brel is not None and src.get("burden_references_sha256") != bsha)):
         raise ValueError(f"{SHEET} was generated from another spec, derivation record or reference file (it is "
                          "stale): the sheet is regenerated before the owner signs; read the new one")
+    from toolkit.spec import review_conditions as RC
+    rc_bytes = RC.read_bytes(run_dir)       # W0-G: read once, validated by the precondition and bound in the record
+    rc_sha = RC.sha_of(rc_bytes)
+    if rc_sha != "none":
+        extra[RC.FILE] = rc_sha
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
     geo_expect = None
     if src is not None:
@@ -263,7 +268,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     if not errs:              # the preconditions with the signer (a departure needs the owner); engine: auto too
         from toolkit.spec import preconditions as PC
         errs = [e + (" (only the owner can sign an engine departure)" if by != "owner" else "")
-                for e in PC.problems(run_dir, data, by, spec=sp)]
+                for e in PC.problems(run_dir, data, by, spec=sp, review_bytes=rc_bytes)]
     if errs:
         raise ValueError("spec not ready: " + "; ".join(errs[:10]))
     _refuse_held_out(data, run_dir)     # also in decision_brief.sign: every entry point, whoever signs
@@ -375,14 +380,21 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
     st_ = ED.state(run_dir, spec_bytes=spec_bytes, signing=True, require_sheet=False)
     closure = ((st_.get("binding") or {}).get("record") or {}).get("closure") or {}
     owners = ((st_.get("binding") or {}).get("record") or {}).get("closure_owners") or {}
+    from toolkit.spec import review_conditions as RC
+    try:                                # W0-G: one read, shown and hashed
+        rbytes = RC.read_bytes(run_dir)
+        rsha = RC.sha_of(rbytes)
+    except ValueError:
+        rbytes, rsha = None, "unreadable"
     text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
-                 burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure)
+                 burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure, review_bytes=rbytes)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
                       "burden_references_sha256": bsha,
                       "evidence_dossier_sha256": esha,
                       "input_closure_sha256": ED.closure_digest(closure),
                       "input_closure": closure, "input_closure_owners": owners,
                       "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
+                      "review_conditions_sha256": rsha,
                       "geometry_evidence_sha256": section[1]},
                      sort_keys=True)
     write_nofollow(run_dir, SHEET, (text.rstrip("\n") + f"\n\n{SHEET_SOURCES}{src} -->\n").encode(), atomic=True)
@@ -391,7 +403,8 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
 
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
           record_bytes: bytes | None = None, geometry_section: tuple | None = None,
-          burden_bytes: bytes | None = None, dossier_bytes: bytes | None = None, closure: dict | None = None) -> str:
+          burden_bytes: bytes | None = None, dossier_bytes: bytes | None = None, closure: dict | None = None,
+          review_bytes: bytes | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; each engine parameter value the spec sets, with the card value
@@ -422,6 +435,8 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
             dossier_bytes = None
     from toolkit.spec import spec_critique as SC     # pre-sign spec critique, on the bytes this sheet shows and binds
     out += SC.sheet_lines(raw, run_dir, dossier_bytes=dossier_bytes, burden_data=burden_bytes)
+    from toolkit.spec import review_conditions as RC     # W0-G: each condition raised and its disposition
+    out += RC.sheet_lines(run_dir, data=review_bytes, raw=raw if isinstance(raw, dict) else {})
     eng = raw.get("engine")
     refs = [eng["ref"]] if isinstance(eng, dict) and eng.get("ref") else \
         (list(eng.get("candidates") or []) if isinstance(eng, dict) else [])
