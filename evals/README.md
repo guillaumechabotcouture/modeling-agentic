@@ -27,9 +27,14 @@ into a temporary directory, and delete that directory when they finish:
 
     python3 scripts/eval_suite.py grade <q> <run_dir> [--unverified-inputs]
     python3 scripts/eval_suite.py grade --root ~/modeling-agentic-keep/evals/<tag>
-    python3 scripts/eval_suite.py run [--tag T] [q ...]
     python3 scripts/eval_suite.py generate --check
     python3 scripts/eval_suite.py --self-test --with-private
+
+The launch preflight needs storage access but not the key: it checks the pinned bundle by
+its digests (`evals/private.yaml`) and the shipped inputs against the public manifest's
+input hashes, and never decrypts anything (owner decision, 2026-11-21):
+
+    python3 scripts/eval_suite.py run [--tag T] [q ...]
 
 The grader picks the answer key whose input hashes match the run's. That lets a run
 made on earlier inputs keep its legacy key (`legacy/<name>` in the bundle).
