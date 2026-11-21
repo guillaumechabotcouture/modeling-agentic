@@ -214,10 +214,12 @@ def _solver(man: dict) -> list[dict]:
     try:
         sv = man["solver"]
         tot = sv["auxiliary_total"]
-        n, bad, lim = tot["solves"], tot["not_solved"], float(sv["aux_not_solved_share_max"])
-        # Codex r1 P1-9: whole-number counts; a NaN share or a null record fails closed
-        if not (all(isinstance(x, int) and not isinstance(x, bool) for x in (n, bad)) and 0 <= bad <= n
-                and 0 <= lim <= 1):
+        n, bad, acc, lim = tot["solves"], tot["not_solved"], tot["feasible_accepted"], sv["aux_not_solved_share_max"]
+        # Codex r1 P1-9, r2 P1: whole-number, consistent counts and a numeric share (not a boolean, not NaN); a null
+        # record fails closed
+        if not (all(isinstance(x, int) and not isinstance(x, bool) for x in (n, bad, acc))
+                and isinstance(lim, (int, float)) and not isinstance(lim, bool)
+                and 0 <= bad <= n and 0 <= acc <= n - bad and 0 <= lim <= 1):
             raise ValueError("counts or share out of range")
     except (KeyError, TypeError, ValueError, OverflowError):
         return [_f("analysis_solver_degraded", f"{MANIFEST}: the solver record cannot be read", "solver")]

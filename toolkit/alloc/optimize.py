@@ -398,6 +398,8 @@ def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None, gap_rel=0.0,
         if len(on) != 1:
             raise OptimizerError(f"ilp: unit {u} has {len(on)} packages selected in the solver's solution")
         choice[u] = opts[u][on[0]][0]
+    # the gain the gap is relative to: over each unit's least-benefit option after pruning (Codex r2 P1)
+    rec["gain"] = sum(next(y[1] for y in opts[u] if y[0] == choice[u]) - base[u] for u in us)
     if not proven:
         rec["gap"] = _relaxation_gap(pulp, prob, time_limit)
     return _result("ilp", us, opts, choice, "optimal" if proven else "feasible", t0, names, **rec)

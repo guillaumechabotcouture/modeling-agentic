@@ -98,8 +98,12 @@ def auxiliary(A, kind: str):
 
 def _problem_key(ben, cost, feas, budget):
     """A hash of one solve's inputs, or None (then nothing is kept) when they cannot be serialised or a unit or
-    package id is not text: the encoding writes ids as text, so 1 and "1" would share a key (Codex r1 P1-6)."""
-    if not all(isinstance(u, str) and all(isinstance(k, str) for k in r) for t in (ben, cost) for u, r in t.items()):
+    package id is not text (the encoding writes ids as text, so 1 and "1" would share a key: Codex r1 P1-6) or a table
+    value or the budget is not a number."""
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731 -- else the allocator's
+    #                                               own input check would be skipped on a hit (Codex r2 P1)
+    if not (num(budget) and all(isinstance(u, str) and all(isinstance(k, str) and num(x) for k, x in r.items())
+                                for t in (ben, cost) for u, r in t.items())):
         return None
     try:
         tabs = [sorted((str(u), sorted((str(k), float(x)) for k, x in r.items())) for u, r in t.items())

@@ -53,8 +53,9 @@ def _fixed(spec) -> dict:
 def plan_within_gap(A, sol, plan, ben, cost) -> bool:
     """1C-c: a stored plan that differs from the re-solved one is the same result when it meets the constraints at the
     budget the plan is solved within and its objective is within the solver's stated gap of the re-solved optimum.
-    Both are proven within gap g of the optimum's gain G over the solver's baseline, so they differ by at most
-    g / (1 - g) of the re-solved gain."""
+    Both are proven within gap g of the optimum's gain G (over each unit's least-benefit option after pruning: the
+    solver's `gain`), so they differ by at most g / (1 - g) of the re-solved gain. Without that gain in `sol`, no
+    difference is allowed (Codex r2 P1)."""
     from toolkit.alloc import optimize as aopt
     budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
     try:      # the allocator's own check (Codex r1 P1-8); a plan it cannot read is not within the gap
@@ -63,8 +64,7 @@ def plan_within_gap(A, sol, plan, ben, cost) -> bool:
         short = float(sol["objective"]) - sum(float(ben[i][plan[i]]) for i in A.ids)
     except (KeyError, TypeError, ValueError):
         return False
-    g = float(sol.get("gap_rel") or 0.0)
-    gain = abs(float(sol["objective"]) - float(sol.get("baseline") or 0.0))
+    g, gain = float(sol.get("gap_rel") or 0.0), abs(float(sol.get("gain") or 0.0))
     return short <= (g / (1.0 - g) + 1e-9) * gain      # the rounding allowance scales with the gain (P1-7)
 
 
@@ -642,7 +642,7 @@ def _self_test() -> int:
         # Codex r1 P1-7, P1-8: the allowance scales with the gain, and a plan the allocator's own check rejects (an
         # unknown package) is not within the gap, without an exception
         tiny = {i: {k: (1e-13 if k == plan[i] and i == u_ else 0.0) for k in ben0[i]} for i in A.ids}
-        sol_t = dict(sol_, objective=1e-13, baseline=0.0)
+        sol_t = dict(sol_, objective=1e-13, baseline=0.0, gain=1e-13)
         ok(pwg(A, sol_t, dict(plan, **{u_: A.comp}), tiny, cost0) is False
            and pwg(A, sol_, dict(plan, **{u_: "no_such_package"}), ben0, cost0) is False,
            "FD10c a plan that loses a tiny gain entirely is not within the gap; an unknown package is refused, not raised")
