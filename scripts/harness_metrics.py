@@ -555,6 +555,8 @@ def main(argv=None) -> int:
 
 # ------------------------------------------------------------------ self-test (synthetic run dirs only)
 def _self_test() -> int:
+    import contextlib
+    import io
     import tempfile
     fails = []
 
@@ -569,215 +571,188 @@ def _self_test() -> int:
     def local(h, off=3600):          # naive local time, as main.py writes it
         return (T0 + timedelta(hours=h, seconds=off or 0)).replace(tzinfo=None).isoformat(timespec="seconds")
 
-    def mk(root, name, st=None, meta=None, files=None, off=3600, inv=(0,)):
-        d = os.path.join(root, name)
+    def mk(name, st=None, meta=None, files=None, off=3600, inv=(0,), under=""):
+        d = os.path.join(root, under, name)
         os.makedirs(os.path.join(d, "data"), exist_ok=True)
         m = {"started": local(0, off), "commit": "abc1234", "status": (st or {}).get("status"),
-             "invocations": [{"at": local(h, off), "commit": "abc1234"} for h in inv]}
-        if off is not None:
-            m["utc_offset_s"] = off
-        m.update(meta or {})
-        files = dict(files or {})
-        files.setdefault("metadata.json", json.dumps(m))
-        if st is not None:
-            files.setdefault("run_state.json", json.dumps({"state": "FINAL", "round": 1, "history": [], **st}))
+             "invocations": [{"at": local(h, off), "commit": "abc1234"} for h in inv],
+             **({"utc_offset_s": off} if off is not None else {}), **(meta or {})}
+        files = {"metadata.json": json.dumps(m), **({"run_state.json": json.dumps(
+            {"state": "FINAL", "round": 1, "history": [], **st})} if st is not None else {}), **(files or {})}
         for rel, txt in files.items():
             open(os.path.join(d, rel), "w").write(txt)
         return d
 
+    def iv(r, k):
+        return r["interventions"][k]["value"]
+
+    def wait(r, k="total_h"):
+        return r["owner_wait"][k]["value"]
+    A, R = at(30), {"report.md": "x"}          # A: an assisted-arm cut-off, after every owner action below
     with tempfile.TemporaryDirectory() as root:
         fin = {"history": [{"at": at(1), "from": "GATE", "to": "FINAL", "why": "accepted"}]}
-        d = mk(root, "r_ok", {**fin, "status": "completed"}, {"finished": at(1)}, {"report.md": "x"})
-        r = summarise([d])
-        ok(r["completes"] == F(True, REC) and r["interventions"]["headline"]["value"] == 0
-           and r["owner_wait"]["total_h"]["value"] == 0 and r["autonomous_wall_h"]["value"] == 1.0,
-           f"HM1 a completed run with report.md completes, 0 interventions, 1 h autonomous ({r['autonomous_wall_h']})")
-        ok(summarise([mk(root, "r_wh", {**fin, "status": "completed"}, None, {"report_withheld.md": "x"})])[
-            "completes"]["value"] is False, "HM2 a withheld report does not complete")
-        d = mk(root, "r_sd", {**fin, "status": "completed_scope_declared"}, None, {"report.md": "x"})
-        r = summarise([d])
+        done = {**fin, "status": "completed"}
+        r = summarise([mk("r_ok", done, {"finished": at(1)}, R)])
+        ok(r["completes"] == F(True, REC) and iv(r, "headline") == 0 and wait(r) == 0
+           and r["autonomous_wall_h"]["value"] == 1.0, "HM1 a completed run with report.md: 0 interventions, 1 h")
+        ok(not summarise([mk("r_wh", done, None, {"report_withheld.md": "x"})])["completes"]["value"],
+           "HM2 a withheld report does not complete")
+        r = summarise([mk("r_sd", {**fin, "status": "completed_scope_declared"}, None, R)])
         ok(r["completes"]["value"] and wave_summary([r])["scope_declared"] == 1, "HM3 scope declared completes, apart")
-        r = summarise([mk(root, "r_none", {"state": "ANALYZE"})])
-        ok(r["status"]["value"] == "no_status" and not r["completes"]["value"],
-           "HM4a a run that stopped with no status recorded is not completed (fail closed)")
-        d = mk(root, "r_bad", None, None, {"run_state.json": "{not json"})
-        r = rows([d, os.path.join(root, "missing")])
+        r = summarise([mk("r_none", {"state": "ANALYZE"})])
+        ok(r["status"]["value"] == "no_status" and not r["completes"]["value"], "HM4a no status recorded: not done")
+        r = rows([mk("r_bad", None, None, {"run_state.json": "{not json"}), os.path.join(root, "missing")])
         ok(len(r) == 2 and all(x["status"]["value"] == "unreadable" and not x["completes"]["value"] for x in r),
            "HM4 an unparseable run_state.json and a missing dir are unreadable rows, not skipped")
-        os.makedirs(os.path.join(root, "_truth"))
-        d = mk(os.path.join(root, "_truth"), "r_t", {**fin, "status": "completed"}, None, {"report.md": "x"})
-        ok("refused" in summarise([d])["status"].get("note", ""), "HM5 a path under _truth is refused, unread")
-        # HM6 explicit awaiting_budget pause, raised and resumed 2 h later
+        ok("refused" in summarise([mk("r_t", done, None, R, under="_truth")])["status"].get("note", ""),
+           "HM5 a path under _truth is refused, unread")
         h = [{"at": at(1), "paused": "awaiting_budget", "state": "CRITIQUE"},
              {"at": at(3), "budget_raised": {"from": 5, "to": 9}}, {"at": at(4), "from": "GATE", "to": "FINAL"}]
-        d = mk(root, "r_bud", {"history": h, "status": "completed"}, None, {"report.md": "x"}, inv=(0, 3))
-        r = summarise([d])
-        iv, ow = r["interventions"], r["owner_wait"]
-        ok(iv["I1_pauses"] == F(1, REC) and iv["I5_resumes"]["value"] == 1 and iv["I7_budget_raises"]["value"] == 1
-           and iv["headline"]["value"] == 2 and ow["total_h"] == F(2.0, REC) and ow["owner_response_h"]["value"] == 2.0,
-           f"HM6 an explicit budget pause: I1 record, I5, I7, wait 2 h all owner response ({iv['headline']}, {ow['total_h']})")
-        # HM7 inferred owner SIGN pause; owner signs at +1 h; resume at +3 h (naive local, offset 1 h)
-        h = [{"at": at(0.5), "from": "SPEC", "to": "SIGN"}, {"at": at(3.2), "from": "SIGN", "to": "EVIDENCE",
-                                                               "why": SIGNED_BY_OWNER}]
+        d = mk("r_bud", {"history": h, "status": "completed"}, None, R, inv=(0, 3))
+        r0, r = summarise([d]), summarise([d], A)
+        ok(r0["cutoff"] == at(1) and not r0["completes"]["value"] and iv(r0, "headline") == 0,
+           "HM30 strict arm by default: the wave stops at the first pause, nothing after counts")
+        ok(r["interventions"]["I1_pauses"] == F(1, REC) and iv(r, "I5_resumes") == 1 and iv(r, "I7_budget_raises") == 1
+           and iv(r, "headline") == 2 and r["owner_wait"]["total_h"] == F(2.0, REC)
+           and wait(r, "owner_response_h") == 2.0, "HM6 an explicit budget pause: I1 record, I5, I7, 2 h owner response")
+        h = [{"at": at(0.5), "from": "SPEC", "to": "SIGN"},
+             {"at": at(3.2), "from": "SIGN", "to": "EVIDENCE", "why": SIGNED_BY_OWNER}]
         so = json.dumps({"signed_by": "owner", "signed_at": at(1.5)})
-        d = mk(root, "r_sign", {"history": h, "status": "completed"}, None,
-               {"report.md": "x", "decision_spec.signoff.json": so}, inv=(0, 3))
-        r = summarise([d])
-        iv, ow = r["interventions"], r["owner_wait"]
-        ok(iv["I1_pauses"] == F(1, INF) and iv["I2_spec_signatures"]["value"] == 1 and iv["headline"]["from"] == INF
-           and ow["total_h"]["value"] == 2.5 and ow["owner_response_h"]["value"] == 1.0
-           and ow["operator_latency_h"]["value"] == 1.5,
-           f"HM7 a SIGN pause is inferred; naive local times are converted (wait {ow['total_h']}, "
-           f"response {ow['owner_response_h']}, latency {ow['operator_latency_h']})")
-        # HM8 the time-zone trap: no utc_offset_s, naive invocation times
-        d = mk(root, "r_tz", {"history": h, "status": "completed"}, None, {"report.md": "x"}, off=None, inv=(0, 3))
-        r = summarise([d], cutoff=at(30))
+        r = summarise([mk("r_sign", {"history": h, "status": "completed"}, None,
+                          {**R, "decision_spec.signoff.json": so}, inv=(0, 3))], A)
+        ok(r["interventions"]["I1_pauses"] == F(1, INF) and iv(r, "I2_spec_signatures") == 1
+           and r["interventions"]["headline"]["from"] == INF and wait(r) == 2.5 and wait(r, "owner_response_h") == 1.0
+           and wait(r, "operator_latency_h") == 1.5, "HM7 an inferred SIGN pause; naive local times converted; split")
+        r = summarise([mk("r_tz", {"history": h, "status": "completed"}, None, R, off=None, inv=(0, 3))], A)
         ok(r["owner_wait"]["total_h"]["from"] == NA and r["autonomous_wall_h"]["from"] == NA,
-           f"HM8 naive times with no offset: wait not computable ({r['owner_wait']['total_h']})")
-        # HM9 a pending lead SIGN pause: starts at the sign_spec journal time; censored at launch + 24 h
-        st = {"state": "SIGN", "paused": "awaiting_signoff", "status": None,
-              "history": [{"at": at(1), "from": "SPEC", "to": "SIGN"}],
-              "journal": {"SIGN#1:sign_spec": {"status": "completed", "completed": at(2)}}}
-        d = mk(root, "r_pend", st)
-        run_on = mk(root, "r_running", {"state": "ANALYZE"})
-        r = rows([d, run_on])[0]
-        iv, ow = r["interventions"], r["owner_wait"]
+           "HM8 naive times with no offset: wait not computable")
+        d = mk("r_pend", {"state": "SIGN", "paused": "awaiting_signoff", "status": None,
+                          "history": [{"at": at(1), "from": "SPEC", "to": "SIGN"}],
+                          "journal": {"SIGN#1:sign_spec": {"status": "completed", "completed": at(2)}}})
+        r = rows([d, mk("r_running", {"state": "ANALYZE"})])[0]
         ok(r["status"]["value"] == "paused:awaiting_signoff" and not r["completes"]["value"]
-           and iv["I1_pauses"]["value"] == 0 and iv["pending_pauses"] == 1 and ow["censored"]
-           and ow["total_h"]["value"] == 22.0 and ow["pauses"][0]["pause_at"] == at(2)
-           and r["autonomous_wall_h"]["value"] == 2.0,
-           f"HM9 a pending pause while another run still runs: censored at launch + 24 h, not an intervention "
-           f"({ow['total_h']}, {iv['I1_pauses']}, autonomous {r['autonomous_wall_h']})")
+           and iv(r, "I1_pauses") == 0 and r["interventions"]["pending_pauses"] == 1 and r["owner_wait"]["censored"]
+           and wait(r) == 22.0 and r["owner_wait"]["pauses"][0]["pause_at"] == at(2)
+           and r["autonomous_wall_h"]["value"] == 2.0, "HM9 a pending lead SIGN pause while another run runs: from "
+           "the sign_spec time, censored at launch + 24 h, not an intervention")
         r = summarise([d])
-        ok(r["cutoff"] == at(2) and r["owner_wait"]["total_h"]["value"] == 0.0 and r["owner_wait"]["censored"],
-           f"HM9b every run paused or FINAL: the cut-off is when the last one settled ({r['cutoff']})")
-        r = summarise([d], cutoff=at(5))
-        ok(r["owner_wait"]["total_h"]["value"] == 3.0, "HM10 an explicit cut-off censors there")
-        # HM11 a relaunch chain through parent_run, and the same chain from --chain
-        st = {"state": "SPEC", "paused": "awaiting_spec_amendment", "status": None,
-              "history": [{"at": at(1), "from": "GATE", "to": "SPEC"}]}
-        p = mk(root, "r_par", st)
-        c = mk(root, "r_child", {**fin, "status": "completed"},
-               {"parent_run": {"run_dir": "r_par"}, "started": local(4)}, {"report.md": "x"})
-        r = rows([p, c])
+        ok(r["cutoff"] == at(2) and wait(r) == 0.0 and r["owner_wait"]["censored"],
+           "HM9b every run paused or FINAL: the cut-off is when the last one settled")
+        ok(wait(summarise([d], cutoff=at(5))) == 3.0, "HM10 an explicit cut-off censors there")
+        p = mk("r_par", {"state": "SPEC", "paused": "awaiting_spec_amendment", "status": None,
+                         "history": [{"at": at(1), "from": "GATE", "to": "SPEC"}]})
+        c = mk("r_child", done, {"parent_run": {"run_dir": "r_par"}, "started": local(4)}, R)
+        r = rows([p, c], cutoff=A)
         ok(len(r) == 1 and r[0]["chain"] == ["r_par", "r_child"] and r[0]["interventions"]["I6_relaunches"] == F(1, REC)
-           and r[0]["interventions"]["I1_pauses"]["value"] == 1 and r[0]["owner_wait"]["total_h"]["value"] == 3.0
-           and r[0]["completes"]["value"], f"HM11 parent_run links a relaunch: I6 record, the pause ends at the "
-           f"child's start ({r[0]['interventions']['I6_relaunches']}, {r[0]['owner_wait']['total_h']})")
-        c2 = mk(root, "r_child2", {**fin, "status": "completed"}, {"started": local(4)}, {"report.md": "x"})
-        r = rows([], explicit=[[p, c2]])
+           and iv(r[0], "I1_pauses") == 1 and wait(r[0]) == 3.0 and r[0]["completes"]["value"],
+           "HM11 parent_run links a relaunch: I6 record, the pause ends at the child's start")
+        r = rows([], explicit=[[p, mk("r_child2", done, {"started": local(4)}, R)]], cutoff=A)
         ok(r[0]["interventions"]["I6_relaunches"]["from"] == INF, "HM12 an operator --chain makes I6 inferred")
-        # HM13 an OWNER_DECISION pause answered through the scope records
         h = [{"at": at(1), "from": "GATE", "to": "OWNER_DECISION"},
              {"at": at(6), "from": "OWNER_DECISION", "to": "GATE", "why": SCOPE_ANSWERED}]
         sc = json.dumps({"answers": {"f1": {"by": "owner", "at": at(2)}, "f2": {"by": "owner", "at": at(4)}}})
-        d = mk(root, "r_scope", {"history": h, "status": "completed"}, None,
-               {"report.md": "x", "scope_signoff.json": sc}, inv=(0, 5))
-        r = summarise([d])
-        iv, ow = r["interventions"], r["owner_wait"]
-        ok(iv["I4_scope_answers"]["value"] == 1 and "2 item" in iv["I4_scope_answers"]["note"]
-           and ow["owner_response_h"]["value"] == 3.0 and ow["operator_latency_h"]["value"] == 1.0,
-           f"HM13 a scope answer: I4 1 (2 items), response to the last answer ({ow['owner_response_h']})")
-        # HM14 an explicit pause entry suppresses the inference (no double count)
+        r = summarise([mk("r_scope", {"history": h, "status": "completed"}, None, {**R, "scope_signoff.json": sc},
+                          inv=(0, 5))], A)
+        ok(iv(r, "I4_scope_answers") == 1 and "2 item" in r["interventions"]["I4_scope_answers"]["note"]
+           and wait(r, "owner_response_h") == 3.0 and wait(r, "operator_latency_h") == 1.0,
+           "HM13 a scope answer: I4 1 (2 items), owner response to the last answer")
         h = [{"at": at(1), "from": "SPEC", "to": "SIGN"}, {"at": at(1), "paused": "awaiting_signoff", "state": "SIGN"},
              {"at": at(3), "from": "SIGN", "to": "EVIDENCE", "why": SIGNED_BY_OWNER}]
-        d = mk(root, "r_both", {"history": h, "status": "completed"}, None, {"report.md": "x"}, inv=(0, 2))
-        r = summarise([d])
+        r = summarise([mk("r_both", {"history": h, "status": "completed"}, None, R, inv=(0, 2))], A)
         ok(r["interventions"]["I1_pauses"] == F(1, REC) and len(r["owner_wait"]["pauses"]) == 1,
-           f"HM14 an explicit pause entry is the record; no inferred copy ({r['interventions']['I1_pauses']})")
-        # HM15 geometry approvals, a ledger, the JSON and the table
+           "HM14 an explicit pause entry is the record; no inferred copy")
         g = json.dumps({"approvals": {"G1": {"approved_by": "owner"}, "G2": {"approved_by": "lead"}}})
-        d = mk(root, "r_geo", {**fin, "status": "run_failed"}, None, {"data/geometry_signoff.json": g})
-        r = rows([d], ledger={"r_geo": {"i9": 2}})
-        iv = r[0]["interventions"]
-        out = os.path.join(root, "o.json")
-        import contextlib, io  # noqa: E401
+        d = mk("r_geo", {**fin, "status": "run_failed"}, None, {"data/geometry_signoff.json": g})
+        r, out = rows([d], ledger={"r_geo": {"i9": 2}}), os.path.join(root, "o.json")
         with contextlib.redirect_stdout(io.StringIO()):
             main([d, "--json", out])
         js = json.load(open(out))
-        ok(iv["I3_geometry_approvals"]["value"] == 1 and iv["I9_operator_actions"] == F(2, REC, "operator ledger")
-           and r[0]["class"] == "not_completed" and js["summary"]["chains"] == 1
-           and all("from" in v for v in js["rows"][0]["interventions"].values() if isinstance(v, dict))
-           and "r_geo" in table(r),
-           "HM15 geometry approvals by the owner, the operator ledger, JSON fields carry their derivation")
-        r = summarise([mk(root, "r_raw", {**fin, "status": "completed"}, {"models": {"deep": "m"}}, {"report.md": "x"})])
+        ok(iv(r[0], "I3_geometry_approvals") == 1 and r[0]["interventions"]["I9_operator_actions"]["value"] == 2
+           and r[0]["class"] == "not_completed" and js["summary"]["chains"] == 1 and "r_geo" in table(r)
+           and all("from" in v for v in js["rows"][0]["interventions"].values() if isinstance(v, dict)),
+           "HM15 owner geometry approvals, the operator ledger; every JSON field carries its derivation")
+        r = summarise([mk("r_raw", done, {"models": {"deep": "m"}}, R)])
         ok(r["models"] == F({"deep": "m"}, REC) and r["sdk_version"]["from"] == NA,
            "HM16 model ids are read from metadata when recorded, else unavailable")
         ok(utc(local(0)[:-3] + "xx") is None and utc("2020-01-01T01:00:00", 3600) == T0
            and utc("2020-01-01T00:00:00+00:00") == T0, "HM17 utc(): naive local with offset, aware, garbage")
         # ---- Codex round 1
-        d = mk(root, "r_mis", {**fin, "status": "completed"}, {"status": "run_failed"}, {"report.md": "x"})
-        r = summarise([d])
+        r = summarise([mk("r_mis", done, {"status": "run_failed"}, R)])
         ok(r["status"]["value"] == "status_mismatch" and not r["completes"]["value"],
            "HM18 run_state.json and metadata.json disagree on the status: not completed")
-        d = mk(root, "r_dir", {**fin, "status": "completed"})
+        d, d2 = mk("r_dir", done), mk("r_dangle", done)
         os.makedirs(os.path.join(d, "report.md"))
-        d2 = mk(root, "r_dangle", {**fin, "status": "completed"})
         os.symlink(os.path.join(root, "nowhere"), os.path.join(d2, "report.md"))
         ok(not summarise([d])["completes"]["value"] and not summarise([d2])["completes"]["value"],
            "HM19 a directory or a dangling link named report.md is no report")
         h = [{"at": at(1), "paused": "awaiting_budget", "state": "CRITIQUE"}, {"at": at(4), "from": "GATE", "to": "FINAL"}]
-        d = mk(root, "r_late", {"history": h, "status": "completed"}, {"finished": at(4)}, {"report.md": "x"},
-               inv=(0, 3))
-        r = summarise([d], cutoff=at(2))
-        iv = r["interventions"]
-        ok(not r["completes"]["value"] and iv["I1_pauses"]["value"] == 0 and iv["I5_resumes"]["value"] == 0
-           and r["owner_wait"]["total_h"]["value"] == 1.0 and r["owner_wait"]["censored"],
-           f"HM20 events after the cut-off do not count ({iv['I1_pauses']}, {iv['I5_resumes']})")
-        st = {"state": "SPEC", "paused": "awaiting_spec_amendment", "status": None, "tries": {"spec_amendment": True},
-              "history": [{"at": at(1), "from": "GATE", "to": "SPEC"}]}
-        p = mk(root, "r_amend", st, None, None, inv=(0, 3))
-        c = mk(root, "r_amend_c", {**fin, "status": "completed"}, {"parent_run": {"run_dir": "r_amend"},
-                                                                  "started": local(5)}, {"report.md": "x"})
-        r = rows([p, c])[0]
-        ok(r["interventions"]["I1_pauses"]["value"] == 2 and r["owner_wait"]["total_h"]["value"] == 4.0,
-           f"HM21 a resumed amendment pause re-pauses: two pauses, 4 h ({r['interventions']['I1_pauses']}, "
-           f"{r['owner_wait']['total_h']})")
+        r = summarise([mk("r_late", {"history": h, "status": "completed"}, {"finished": at(4)}, R, inv=(0, 3))], at(2))
+        ok(not r["completes"]["value"] and iv(r, "I1_pauses") == 0 and iv(r, "I5_resumes") == 0 and wait(r) == 1.0
+           and r["owner_wait"]["censored"], "HM20 events after the cut-off do not count")
+        p = mk("r_amend", {"state": "SPEC", "paused": "awaiting_spec_amendment", "status": None, "history": [
+            {"at": at(0.5), "from": "SIGN", "to": "EVIDENCE"}, {"at": at(1), "from": "GATE", "to": "SPEC"}]}, inv=(0, 3))
+        c = mk("r_amend_c", done, {"parent_run": {"run_dir": "r_amend"}, "started": local(5)}, R)
+        r = rows([p, c], cutoff=A)[0]
+        ok(iv(r, "I1_pauses") == 2 and wait(r) == 4.0, "HM21 a resumed amendment pause re-pauses: two pauses, 4 h")
         h = [{"at": at(0), "from": "SPEC", "to": "SIGN"}, {"at": at(3), "from": "SIGN", "to": "EVIDENCE"}]
-        ok(summarise([mk(root, "r_same", {"history": h, "status": "completed"}, None, {"report.md": "x"},
-                         inv=(0, 3))])["interventions"]["I1_pauses"]["value"] == 1,
-           "HM22 a resume in the same second as the transition out is still a resume")
+        ok(iv(summarise([mk("r_same", {"history": h, "status": "completed"}, None, R, inv=(0, 3))], A),
+              "I1_pauses") == 1, "HM22 a resume in the same second as the transition out is still a resume")
         h = [{"at": at(0), "from": "SPEC", "to": "SIGN"}, {"at": at(0.5), "paused": "awaiting_budget", "state": "SIGN"},
              {"at": at(3.5), "from": "SIGN", "to": "EVIDENCE"}]
-        d = mk(root, "r_mix", {"history": h, "status": "completed"}, None, {"report.md": "x"}, inv=(0, 1, 3))
-        r = summarise([d])
-        ok(r["interventions"]["I1_pauses"]["value"] == 2 and len(r["owner_wait"]["pauses"]) == 2,
-           f"HM23 a budget pause in a SIGN visit does not hide the later sign-off pause ({r['interventions']['I1_pauses']})")
+        r = summarise([mk("r_mix", {"history": h, "status": "completed"}, None, R, inv=(0, 1, 3))], A)
+        ok(iv(r, "I1_pauses") == 2 and len(r["owner_wait"]["pauses"]) == 2,
+           "HM23 a budget pause in a SIGN visit does not hide the later sign-off pause")
         h = [{"at": at(0.5), "from": "SPEC", "to": "SIGN"}, {"at": at(3.2), "from": "SIGN", "to": "EVIDENCE"}]
-        d = mk(root, "r_tz2", {"history": h, "status": "completed"}, {"started": at(0)}, {"report.md": "x"},
-               off=None, inv=(0, 3))
-        r = summarise([d])
+        r = summarise([mk("r_tz2", {"history": h, "status": "completed"}, {"started": at(0)}, R, off=None, inv=(0, 3))])
         ok(r["interventions"]["I1_pauses"]["from"] == NA and r["interventions"]["headline"]["from"] == NA,
            "HM24 a naive resume time with no offset: I1 and the headline are unavailable, not 0")
-        a = mk(root, "f_a", {**fin, "status": "run_failed"})
-        b = mk(root, "f_b", {**fin, "status": "run_failed"}, {"parent_run": {"run_dir": "f_a"}})
-        c = mk(root, "f_c", {**fin, "status": "completed"}, {"parent_run": {"run_dir": "f_a"}}, {"report.md": "x"})
-        x = mk(root, "y_x", {**fin, "status": "run_failed"}, {"parent_run": {"run_dir": "y_y"}})
-        y = mk(root, "y_y", {**fin, "status": "run_failed"}, {"parent_run": {"run_dir": "y_x"}})
-        cs = chains([a, b, c, x, y, a])
-        flat = sorted(os.path.basename(d) for ch in cs for d in ch)
-        ok(flat == ["f_a", "f_b", "f_c", "y_x", "y_y"], f"HM25 a fork, a cycle and a repeated dir: every dir in "
-           f"exactly one chain ({[[os.path.basename(d) for d in ch] for ch in cs]})")
-        b2 = mk(root, "s_b", {**fin, "status": "run_failed"},
-                {"parent_run": {"run_dir": "r_ok", "run_state_sha256": "0" * 64}})
-        ok(len(chains([os.path.join(root, "r_ok"), b2])) == 2, "HM26 a parent whose run_state.json hash differs is "
-           "not linked")
-        d = mk(root, "r_link", None)
+        fa, ra = {**fin, "status": "run_failed"}, {"parent_run": {"run_dir": "f_a"}}
+        a, b, c = mk("f_a", fa), mk("f_b", fa, ra), mk("f_c", done, ra, R)
+        x, y = mk("y_x", fa, {"parent_run": {"run_dir": "y_y"}}), mk("y_y", fa, {"parent_run": {"run_dir": "y_x"}})
+        flat = sorted(os.path.basename(d) for ch in chains([a, b, c, x, y, a]) for d in ch)
+        ok(flat == ["f_a", "f_b", "f_c", "y_x", "y_y"], "HM25 a fork, a cycle and a repeated dir: each in one chain")
+        b2 = mk("s_b", fa, {"parent_run": {"run_dir": "r_ok", "run_state_sha256": "0" * 64}})
+        ok(len(chains([os.path.join(root, "r_ok"), b2])) == 2, "HM26 a parent with another run_state hash: no link")
+        d = mk("r_link", None)
         os.symlink(os.path.join(root, "r_ok", "run_state.json"), os.path.join(d, "run_state.json"))
         r = rows([d])
         ok(len(r) == 1 and r[0]["status"]["value"] == "unreadable", "HM27 a linked run_state.json is an unreadable row")
-        h = [{"at": at(1), "from": "SIGN", "to": "EVIDENCE", "why": SIGNED_BY_OWNER}]
-        a = mk(root, "o_a", {"state": "SPEC", "paused": "awaiting_spec_amendment", "history": h})
+        a = mk("o_a", {"state": "SPEC", "paused": "awaiting_spec_amendment",
+                       "history": [{"at": at(1), "from": "SIGN", "to": "EVIDENCE", "why": SIGNED_BY_OWNER}]})
         sc = json.dumps({"answers": {"f1": {"by": "owner", "at": at(2)}}})
-        b = mk(root, "o_b", {**fin, "status": "completed"}, {"parent_run": {"run_dir": "o_a"}},
-               {"report.md": "x", "decision_spec.signoff.json": so, "scope_signoff.json": sc})
-        iv = rows([a, b])[0]["interventions"]
-        ok(iv["I2_spec_signatures"]["value"] == 2 and iv["I4_scope_answers"]["value"] == 1,
-           f"HM28 owner decisions count per run across a chain ({iv['I2_spec_signatures']}, {iv['I4_scope_answers']})")
+        b = mk("o_b", done, {"parent_run": {"run_dir": "o_a"}}, {**R, "decision_spec.signoff.json": so,
+                                                                "scope_signoff.json": sc})
+        r = rows([a, b], cutoff=A)[0]
+        ok(iv(r, "I2_spec_signatures") == 2 and iv(r, "I4_scope_answers") == 1,
+           "HM28 owner decisions count per run across a chain")
         prov = json.dumps({"inputs": {"data/a.csv": {"sha256": hashlib.sha256(b"orig").hexdigest()}}})
-        d = mk(root, "r_edit", {**fin, "status": "completed"}, None,
-               {"report.md": "x", "data/inputs_provenance.json": prov, "data/a.csv": "changed"})
-        ok(summarise([d])["interventions"]["I8_hand_edits"]["value"] == 1, "HM29 a staged input edited by hand is I8")
+        d = mk("r_edit", done, None, {**R, "data/inputs_provenance.json": prov, "data/a.csv": "changed"})
+        ok(iv(summarise([d]), "I8_hand_edits") == 1, "HM29 a staged input edited by hand is I8")
+        # ---- Codex round 2
+        so3 = json.dumps({"signed_by": "owner", "signed_at": at(3.5)})
+        p = mk("c_par", {"state": "SIGN", "paused": "awaiting_signoff",
+                         "history": [{"at": at(1), "from": "SPEC", "to": "SIGN"}]})
+        c = mk("c_kid", done, {"parent_run": {"run_dir": "c_par"}, "started": local(3)},
+               {**R, "decision_spec.signoff.json": so3, "data/inputs_provenance.json": prov})
+        r = rows([p, c], cutoff=at(2))[0]
+        ok(iv(r, "headline") == 0 and iv(r, "owner_decisions") == 0 and r["interventions"]["pending_pauses"] == 1,
+           "HM31 a relaunch after the cut-off, its edits and signature do not count; the pause is pending")
+        h = [{"at": at(t), "paused": "awaiting_budget", "state": "SPEC"} for t in (1, 3)]
+        r = summarise([mk("r_2bud", {"state": "SPEC", "paused": "awaiting_budget", "history": h}, inv=(0, 3))], A)
+        ok(iv(r, "I1_pauses") == 1 and r["interventions"]["pending_pauses"] == 1, "HM32 one resume ends one pause")
+        h = [{"at": at(1), "from": "SPEC", "to": "SPEC"}, {"at": at(4), "from": "SIGN", "to": "EVIDENCE"},
+             {"at": at(8), "from": "GATE", "to": "SPEC"}]
+        r = summarise([mk("r_retry", {"state": "SPEC", "paused": "awaiting_spec_amendment", "history": h,
+                                      "tries": {"spec_amendment": True}}, inv=(0, 2))], A)
+        ok(iv(r, "I1_pauses") == 0 and r["interventions"]["pending_pauses"] == 1,
+           "HM33 a SPEC retry before signing is no pause")
+        r = rows([os.path.join(root, "r_pend"), os.path.join(root, "r_bad")])[0]
+        ok(wait(r) == 22.0, "HM34 an unreadable chain keeps the wave open to 24 h")
+        a = os.path.join(root, "r_ok")
+        ok(chains([], [[a], [a]]) == [[a]] and chains([], [[a, a]]) == [[a]], "HM35 a repeated --chain dir counts once")
+        d = mk("r_slow", {"history": [{"at": at(27), "from": "GATE", "to": "FINAL"}], "status": "completed"}, None, R)
+        ok(not summarise([d])["completes"]["value"], "HM37 no finished time: FINAL after the 24 h cut-off is not done")
+
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
