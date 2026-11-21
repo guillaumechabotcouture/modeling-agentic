@@ -4140,6 +4140,25 @@ def _self_test_w0a(ok) -> None:
                 c2 = _carries({"rows": [{"provenance": {"engine": ident}}, {"x": 1}]}, ident)
             except Exception as e:  # noqa: BLE001 -- reported in the case
                 c1 = c2 = f"{type(e).__name__}: {e}"
+            c3 = _carries({"rows": [{"provenance": {"engine": ident},
+                                     "rows": [{"rows": [{"rows": [{"provenance": {"engine": {"name": "b"}}}]}]}]}]}, ident)
+            ext = os.path.join(td, "ext")
+            w("ext/plugins/__init__.py", "")
+            w("ext/vendor/score.py", "S = 1\n")
+            os.symlink(os.path.join(ext, "ext", "vendor") if False else os.path.join(repo, "ext", "vendor"),
+                       os.path.join(repo, "ext", "plugins", "vendor"))
+            os.symlink(os.path.join(repo, "ext", "plugins"), os.path.join(rd, "plugins"))
+            os.symlink(os.path.join(repo, "ext", "opt.py"), os.path.join(rd, "optional.py"))
+            k6 = _run_code_digest(rd)
+            w("ext/vendor/score.py", "S = 2\n")
+            k7 = _run_code_digest(rd)
+            w("ext/opt.py", "")
+            k8 = _run_code_digest(rd)
+            for x in ("plugins", "optional.py"):
+                os.remove(os.path.join(rd, x))
+            ok(c3 is False and k6 != k7 and k7 != k8,
+               f"FP_RUN_CODE_LINKS3 a nested link out of the run dir is followed, a dangling link differs from an empty "
+               f"target, and a deep mixed-engine group is refused ({k6 != k7}, {k7 != k8}, {c3})")
             ok(c1 is True and c2 is False, f"FP_CARRIES a row with provenance is checked without error, and a group "
                                            f"with a member without it is refused ({c1}, {c2})")
             # large files: content, never mtime

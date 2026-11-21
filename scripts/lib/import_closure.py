@@ -573,6 +573,11 @@ def _self_test() -> int:
            f"IC17 a guard re-exported as a module, a loader taken as a value, a star import of a package that only sets "
            f"__all__ and a declaration with an unusable path all fail closed (a checked engine load still does not): "
            f"{gm['unresolved']} {gl['unresolved']} {s4['unresolved']} {d2['unresolved']}")
+        # Codex r5 (κ): sys.modules reached from code is a namespace read by key
+        put("toolkit/c/sysm.py", "import sys\nfrom toolkit.s import impl\n\ndef run(p):\n"
+            "    return sys.modules['toolkit.s.impl'].score(p)\n")
+        sm = closure(os.path.join(td, "toolkit/c/sysm.py") + "::run", td)
+        ok(any("dynamic import" in u for u in sm["unresolved"]), f"IC18 code reading sys.modules fails closed: {sm}")
     print(f"{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)}'}")
     return 1 if fails else 0
 
