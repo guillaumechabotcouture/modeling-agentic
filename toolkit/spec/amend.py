@@ -97,8 +97,6 @@ def _steps(path) -> list:
         m = _SEL.match(seg)
         if m:
             out += ([m.group(1)] if m.group(1) else []) + [(m.group(2), m.group(3))]
-        elif seg.isdigit():
-            out.append(int(seg))
         elif seg and "[" not in seg and "]" not in seg:
             out.append(seg)
         else:
@@ -117,16 +115,16 @@ def _locate(doc, path):
                 raise AmendError(f"{path}: [{s[0]}={s[1]}] matches {'no list' if hits is None else len(hits)} "
                                  "element(s), not one")
             k, exists = hits[0], True
-        elif isinstance(s, int) and isinstance(node, list):
-            k, exists = s, 0 <= s < len(node)
+        elif isinstance(node, list) and s.isdigit():
+            k, exists = int(s), 0 <= int(s) < len(node)
             if not exists:
                 raise AmendError(f"{path}: index {s} is outside the list ({len(node)} elements)")
         elif isinstance(node, dict):
-            if isinstance(s, int) and str(s) in node:
-                if s in node:
-                    raise AmendError(f"{path}: {s} names both a number key and a text key")
-                s = str(s)
-            k, exists = s, s in node
+            num = int(s) if s.isdigit() and str(int(s)) == s else None      # "1" may be the YAML integer key 1
+            if num is not None and num in node and s in node:
+                raise AmendError(f"{path}: {s} names both a number key and a text key")
+            k = num if num is not None and num in node else s
+            exists = k in node
         else:
             raise AmendError(f"{path}: {s!r} steps into a {type(node).__name__}")
         if j == len(steps) - 1:
@@ -153,14 +151,14 @@ def apply_ops(doc, ops, what: str) -> tuple:
         if kind == "set":
             if not exists:
                 raise AmendError(f"{path}: not found (set replaces a value that exists; add creates one)")
-            node[k] = op["value"]
+            node[k] = copy.deepcopy(op["value"])
         elif kind == "add":
             if exists and isinstance(node[k], list):
-                node[k].append(op["value"])
+                node[k].append(copy.deepcopy(op["value"]))
             elif exists:
                 raise AmendError(f"{path}: exists and is not a list (use set)")
             else:
-                node[k] = op["value"]
+                node[k] = copy.deepcopy(op["value"])
         else:
             if not exists:
                 raise AmendError(f"{path}: not found, nothing to remove")
@@ -235,6 +233,9 @@ def _parent(parent: str) -> tuple:
             signed = json.loads(read_nofollow(parent, "decision_spec.signoff.json")[0]).get("spec_sha256")
         except (OSError, ValueError, LinkRefused, AttributeError):
             signed = None
+    if signed is None and any(os.path.lexists(os.path.join(parent, f)) for f in (SO.SPEC_SIGNOFF,
+                                                                                  "decision_brief.signoff.json")):
+        raise AmendError(f"{parent}: a sign-off record is present but binds no readable spec digest")
     if signed and _sha(spec) != signed:
         raise AmendError(f"{parent}: {SPEC} changed after it was signed; amend from the signed spec")
     return st, _sha(sb), spec, signed
@@ -254,14 +255,19 @@ def _request(parent: str, signed) -> dict:
 def _copy_tree(parent: str, stage: str) -> int:
     """Copy what the child inherits (lib.safe_io; a link refused; mode and mtime kept: large files hash by mtime)."""
     from lib.safe_io import read_nofollow, write_nofollow
-    derived, n = _derived_paths(), 0
+    derived, n, modes = _derived_paths(), 0, []
+
     def unreadable(e):
         raise AmendError(f"the parent cannot be read in full: {e}")
-    for dp, dirs, fns in os.walk(parent, onerror=unreadable):
+    for dp, dirs, fns in os.walk(parent, onerror=unreadable):      # every entry, before anything is left out
         for x in dirs + fns:
             if os.path.islink(os.path.join(dp, x)):
                 raise AmendError(f"{os.path.relpath(os.path.join(dp, x), parent)}: a link in the parent run, refused")
+    for dp, dirs, fns in os.walk(parent, onerror=unreadable):
         rel_dir = os.path.relpath(dp, parent)
+        if rel_dir != ".":
+            os.makedirs(os.path.join(stage, rel_dir), mode=0o700, exist_ok=True)
+            modes.append((os.path.join(stage, rel_dir), os.stat(dp).st_mode & 0o777))
         dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git")
                          and not _skip(os.path.normpath(os.path.join(rel_dir, d)).replace(os.sep, "/"), derived))
         for f in sorted(fns):
@@ -273,6 +279,8 @@ def _copy_tree(parent: str, stage: str) -> int:
             os.chmod(os.path.join(stage, rel), st.st_mode & 0o777)     # a private input stays private
             os.utime(os.path.join(stage, rel), ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
             n += 1
+    for d, m in reversed(modes):   # after the files: a read-only parent directory still receives its copies
+        os.chmod(d, m)
     return n
 
 
@@ -289,7 +297,7 @@ def _job_keyed(child: str, spec_path: str) -> dict:
         ident = None
     adapter = JC.adapter_digest()
     legacy = os.environ.get(JC.LEGACY_ADAPTER_ENV) == adapter
-    got, seen = {}, set()
+    got, files = {}, []
     for dp, dirs, _ in os.walk(os.path.join(child, "analysis")):
         dirs[:] = [d for d in dirs if d != RR.ARCHIVE]        # an archive is read with its directory (RR._sources)
         jc = os.path.dirname(dp) == os.path.join(child, JC.OUT_REL)
@@ -300,12 +308,15 @@ def _job_keyed(child: str, spec_path: str) -> dict:
         for f, kind, fad in ([(f, k, ad) for f, k, _ in JC._trusted_sources(dp)] if jc else RR._sources(dp)):
             rows = JC._source_rows(f, kind)
             if rows:
-                n = None
-                if ident is not None:      # a job counted once, whichever file or archive holds it
-                    new = {sha for sha, b in rows if sha not in seen and b.get("provenance", {}).get("engine") == ident
-                           and (fad == adapter or (fad is None and legacy))}
-                    n, seen = len(new), seen | new
-                got[os.path.relpath(f, child)] = (len(rows), n, "joint calibration" if jc else "row_reuse")
+                files.append((os.path.relpath(f, child), rows, fad, "joint calibration" if jc else "row_reuse"))
+    good = {sha for _, rows, fad, _ in files for sha, b in rows if ident is not None
+            and b.get("provenance", {}).get("engine") == ident and (fad == adapter or (fad is None and legacy))}
+    seen, todo = set(), set()
+    for rel, rows, fad, rule in files:          # a job counted once, whichever file or archive holds it
+        shas = {sha for sha, _ in rows}
+        new_ok, new_todo = (shas & good) - seen, (shas - good) - todo
+        seen, todo = seen | new_ok, todo | new_todo
+        got[rel] = (len(rows), None if ident is None else len(new_ok), rule, len(new_todo))
     return got
 
 
@@ -324,22 +335,22 @@ def reuse(child: str, spec_path: str) -> dict:
         for b in r["batches"]:
             row = {"out": b["out"], "fn": b["fn"], "stored": b["stored"], "reusable": b["eligible"],
                    "rule": "compute fingerprint", "why": b["why"] or "same function and code fingerprint"}
-            if b["out"] not in jk and b["out"].startswith("analysis/joint_calibration/"):
+            if b["out"] not in jk and re.fullmatch(r"analysis/joint_calibration/call\d+/(points|results)\.jsonl", b["out"]):
                 row.update(reusable=0, rule="job-keyed (joint calibration)",
                            why="no trusted digest: the calibration does not read this file")
             elif b["out"] in jk:
-                n, ok_, rule = jk[b["out"]]
-                row.update(stored=n, reusable=ok_ or 0, rule=f"job-keyed ({rule})",
+                n, ok_, rule, todo = jk[b["out"]]
+                row.update(stored=n, reusable=ok_ or 0, rule=f"job-keyed ({rule})", to_compute=todo,
                            why="engine identity and adapter digest current" if ok_ == n else (
                                "engine chosen after SIGN: not counted" if ok_ is None
                                else "engine identity or adapter digest changed for some rows"))
-            row["to_compute"] = row["stored"] - row["reusable"]
+            row.setdefault("to_compute", row["stored"] - row["reusable"])
             out["batches"].append(row)
         listed = {b["out"] for b in out["batches"]}
-        for f, (n, ok_, rule) in sorted(jk.items()):       # e.g. a merged results file with its reuse sidecar
+        for f, (n, ok_, rule, todo) in sorted(jk.items()):       # e.g. a merged results file with its sidecar
             if f not in listed:
                 out["batches"].append({"out": f, "fn": None, "stored": n, "reusable": ok_ or 0,
-                                       "to_compute": n - (ok_ or 0), "rule": f"job-keyed ({rule})",
+                                       "to_compute": todo, "rule": f"job-keyed ({rule})",
                                        "why": "trusted by its reuse sidecar"})
         out["stored"] = sum(b["stored"] for b in out["batches"])
         out["reusable"] = sum(b["reusable"] for b in out["batches"])
@@ -381,8 +392,9 @@ def _pre_sign(rd: str, derived) -> tuple:
     import analysis_backend as AB
     from toolkit.spec import geometry as GEO
     b = AB.backend()
-    errs = list(b.pre_sign_problems(rd, derived=bool(derived)) if hasattr(b, "candidate_rows")
-                else b.pre_sign_problems(rd))
+    import stage_machine as SM
+    errs = list(SM.record_cited_inputs(rd))
+    errs += list(b.pre_sign_problems(rd, derived=True) if derived else b.pre_sign_problems(rd))
     errs += [f"{x['code']}: {x['claim']}" for x in GEO.problems(GEO.run(rd))]
     return errs, getattr(b, "candidates", None)
 
@@ -428,6 +440,8 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     parent = os.path.realpath(parent)
     st, st_sha, spec_bytes, signed = _parent(parent)
     request = _request(parent, signed) if from_request else None
+    if request and request.get("findings") and not os.path.isfile(os.path.join(parent, "findings.jsonl")):
+        raise AmendError("the request names findings but the parent has no findings.jsonl to carry them")
     p = load_patch(patch, request)
     _no_aliases(spec_bytes, SPEC)
     spec0 = yaml.safe_load(spec_bytes.decode("utf-8")) or {}
@@ -453,8 +467,15 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     child = os.path.realpath(out) if out else _next_child(parent)
     if os.path.lexists(child):
         raise AmendError(f"{child} exists")
-    if os.path.commonpath([child, parent]) == parent:
-        raise AmendError("the child cannot be inside the parent run")
+    pst, up = os.stat(parent), os.path.dirname(child)
+    while not os.path.exists(up):
+        up = os.path.dirname(up)
+    while True:                    # by inode: a case-insensitive spelling of the parent is the parent
+        if os.path.samestat(os.stat(up), pst):
+            raise AmendError("the child cannot be inside the parent run")
+        if os.path.dirname(up) == up:
+            break
+        up = os.path.dirname(up)
     mode = signoff or st.get("signoff")
     if mode not in ("owner", "lead"):
         mode = "owner"             # a parent run with --signoff none: its child is signed, by the owner by default
@@ -462,9 +483,10 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     os.mkdir(stage, os.stat(parent).st_mode & 0o777)
     try:
         n = _copy_tree(parent, stage)
-        write_nofollow(stage, SPEC, new_spec, atomic=True)
-        if dossier is not None:
-            write_nofollow(stage, drel, dossier, atomic=True)
+        for rel, data in ((SPEC, new_spec), *(((drel, dossier),) if dossier is not None else ())):
+            mode0 = os.stat(os.path.join(stage, rel)).st_mode & 0o777
+            write_nofollow(stage, rel, data, atomic=True)
+            os.chmod(os.path.join(stage, rel), mode0)
         sp = schema.load(os.path.join(stage, SPEC), data=new_spec)
         errs = list(schema.validate(sp, pending_ok=True))
         if not errs:               # what h_SPEC checks before SIGN (backend pre-sign checks, geometry)
@@ -481,9 +503,10 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
             "parent_spec_signed": bool(signed), "code_pin": pin, "amendment": label,
             "producer": PRODUCER, "created": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
     write_nofollow(child, "metadata.json", json.dumps(meta, indent=2).encode(), atomic=True)
-    keep = ("question", "max_rounds", "gate_mode", "budget_usd", "task_cap_usd", "v2_rules", "derived_inputs",
+    rounds = st.get("max_rounds") if type(st.get("max_rounds")) is int and st["max_rounds"] > 0 else 3
+    keep = ("question", "gate_mode", "budget_usd", "task_cap_usd", "v2_rules", "derived_inputs",
             "derive_unsandboxed", "world_model_stages")
-    cst = {**{k: st[k] for k in keep if k in st}, "state": "SIGN", "round": 1, "signoff": mode, "spent_usd": 0.0,
+    cst = {**{k: st[k] for k in keep if k in st}, "max_rounds": rounds, "state": "SIGN", "round": 1, "signoff": mode, "spent_usd": 0.0,
            "paused": "awaiting_signoff", "status": None, "tries": {}, "journal": {},
            "history": [{"at": meta["created"], "from": None, "to": "SIGN",
                         "why": f"amendment {label} of {parent} ({len(changes)} change(s)): {reason1}"[:500]}]}
@@ -496,7 +519,6 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     commit = pin.get("commit", "unknown").removesuffix("-dirty")
     budget = (f" --max-budget-usd {float(st['budget_usd']):g}" if isinstance(st.get("budget_usd"), (int, float))
               and not isinstance(st.get("budget_usd"), bool) else "")
-    rounds = st.get("max_rounds") if isinstance(st.get("max_rounds"), int) and st["max_rounds"] > 0 else 3
     commands = {
         "owner_sign": f"python3 agents/stage_machine.py sign {q} --by owner --expect-sha256 {expect['expect_sha256']} "
                       f"--expect-sheet-sha256 {expect['expect_sheet_sha256']} "
@@ -515,9 +537,43 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
            "derivations_sha256": expect["expect_derivations_sha256"], "spec_critique": _critique(child, spec1),
            "review_conditions": rc, "dry_sign": _ready(dry_sign(child, mode, expect), rc, child, mode),
            "reuse": reuse(child, os.path.join(child, SPEC)), "code_pin": pin, "signoff": mode, "commands": commands}
+    rec["run_state"] = cst
     write_nofollow(child, RECORD, json.dumps(rec, indent=1, default=str).encode(), atomic=True)
-    # last: a child that stopped part way has no run state, so nothing resumes it (it is not a run yet)
-    write_nofollow(child, STATE, json.dumps(cst, indent=1).encode(), atomic=True)
+    if rec["dry_sign"]["ok"]:      # last, and only when it would sign: otherwise nothing can resume the child
+        write_nofollow(child, STATE, json.dumps(cst, indent=1).encode(), atomic=True)
+    _print(rec, log)
+    return rec
+
+
+def finish(child: str, log=print) -> dict:
+    """A kept child whose dry-sign failed (open review conditions, say): the sheet regenerated with the candidates,
+    the dry-sign and commands redone, and the run state written once it would sign."""
+    from lib.safe_io import read_nofollow, write_nofollow
+    from toolkit.spec import signoff as SO
+    child = os.path.realpath(child)
+    try:
+        rec = json.loads(read_nofollow(child, RECORD)[0])
+        cst = rec["run_state"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise AmendError(f"{child}: no amendment record to finish ({e})") from None
+    if os.path.lexists(os.path.join(child, STATE)):
+        raise AmendError(f"{child} already has its run state")
+    rc = _review_conditions(child, rec["parent_run"]["run_dir"])
+    errs, cands = _pre_sign(child, cst.get("derived_inputs"))
+    if errs:
+        raise AmendError("the child fails the pre-sign checks: " + "; ".join(errs[:10]))
+    SO.write_sheet(child, cands)
+    expect = {"expect_sha256": _file_sha(child, SPEC), "expect_sheet_sha256": _file_sha(child, SO.SHEET),
+              "expect_derivations_sha256": _file_sha(child, SO.DERIVATIONS_RECORD)}
+    rec.update(review_conditions=rc, dry_sign=_ready(dry_sign(child, rec["signoff"], expect), rc, child,
+                                                     rec["signoff"]),
+               spec_sha256=expect["expect_sha256"], sheet_sha256=expect["expect_sheet_sha256"],
+               derivations_sha256=expect["expect_derivations_sha256"])
+    rec["commands"]["owner_sign"] = (f"python3 agents/stage_machine.py sign {shlex.quote(child)} --by owner "
+                                     + " ".join(f"--{k.replace('_', '-')} {v}" for k, v in expect.items()))
+    write_nofollow(child, RECORD, json.dumps(rec, indent=1, default=str).encode(), atomic=True)
+    if rec["dry_sign"]["ok"]:
+        write_nofollow(child, STATE, json.dumps(cst, indent=1).encode(), atomic=True)
     _print(rec, log)
     return rec
 
@@ -536,9 +592,9 @@ def _print(rec: dict, log) -> None:
     pin, ds = rec["code_pin"], rec["dry_sign"]
     log(f"Code pin: {pin.get('commit')} (clean: {pin.get('clean')}, on a remote: {pin.get('on_remote')})")
     if not ds["ok"]:
-        log(f"Dry-sign as {ds['by']} FAILED on a scratch copy: {ds.get('error') or ds.get('status')}\nNo sign command. "
-            f"Open review conditions: dispose of them, run python3 toolkit/spec/signoff.py sheet {rec['child']} "
-            "--write, read it and sign with its hashes. Otherwise fix the patch and amend again.")
+        log(f"Dry-sign as {ds['by']} FAILED on a scratch copy: {ds.get('error') or ds.get('status')}\nNo sign command "
+            "and no run state. Open review conditions: dispose of them, then python3 -m toolkit.spec.amend --finish "
+            f"{shlex.quote(rec['child'])}. Otherwise fix the patch and amend again.")
         return
     log(f"Dry-sign as {ds['by']}: a scratch copy signed and verified.")
     log(("Owner sign command" if rec["signoff"] == "owner" else "Lead mode: the lead signs at SIGN on resume; "
@@ -588,6 +644,7 @@ def _self_test() -> int:
         raw["principle_departures"] = [{"principle": 2, "check": "headline_comparator", "reason": "toy"},
                                        {"principle": 3, "check": "baseline_burden", "reason": "toy"}]
         yaml.safe_dump(raw, open(tsp, "w"), sort_keys=False)
+        _pre_sign(par, False)              # what h_SPEC records before SIGN (data/inputs_provenance.json)
         SO.write_sheet(par)
         SO.sign(par, "owner")
         psig = SO.signed_sha(par)
@@ -733,6 +790,43 @@ def _self_test() -> int:
            "AM_NONE_PARENT_OWNER_CHILD a parent run without sign-off gives a child the owner signs")
         w(par, "run_state.json", json.dumps(st))
         shutil.rmtree(rec3["child"])
+        # Codex round 2
+        d_, _ = apply_ops({"r": {"01": 2, "1": 3}, "n": {1: 4}}, [{"set": "r.01", "value": 9}, {"set": "n.1", "value": 5}], "x")
+        ok(d_ == {"r": {"01": 9, "1": 3}, "n": {1: 5}}, f"AM_NUMERIC_KEY a text key keeps its spelling ({d_})")
+        v_ = {"cost": 1}
+        d_, _ = apply_ops({"a": [], "b": []}, [{"add": "a", "value": v_}, {"add": "b", "value": v_},
+                                              {"set": "b.0.cost", "value": 2}], "x")
+        ok(d_["a"][0]["cost"] == 1, f"AM_PATCH_ALIAS_COPIED one patch value inserted twice is two values ({d_})")
+        so_ = os.path.join(par, SO.SPEC_SIGNOFF)
+        keep_so = open(so_, "rb").read()
+        open(so_, "wb").write(keep_so[:10])
+        refused(lambda: amend(par, pf, log=lambda *a: None), "AM_UNREADABLE_SIGNOFF_REFUSED a truncated sign-off record")
+        open(so_, "wb").write(keep_so)
+        os.makedirs(os.path.join(par, "figures", "sub"), exist_ok=True)
+        os.symlink(pf, os.path.join(par, "figures", "sub", "l"))
+        refused(lambda: amend(par, pf, log=lambda *a: None), "AM_PRUNED_LINK_REFUSED a link in a directory left out")
+        shutil.rmtree(os.path.join(par, "figures", "sub"))
+        os.makedirs(os.path.join(par, "data", "private"))
+        w(par, "data/private/x.csv", "a\n")
+        os.chmod(os.path.join(par, "data", "private"), 0o700)
+        # a patch that withdraws a declaration: an open review condition, no run state, then --finish
+        yaml.safe_dump({"reason": "r", "spec": [{"remove": "principle_departures[check=baseline_burden]"}]}, open(pf, "w"))
+        rec4 = amend(par, pf, log=lambda *a: None)
+        c4 = rec4["child"]
+        ok(os.stat(os.path.join(c4, "data", "private")).st_mode & 0o777 == 0o700,
+           "AM_DIR_MODE_KEPT a private directory stays private")
+        ok(rec4["dry_sign"]["ok"] is False and not os.path.exists(os.path.join(c4, "run_state.json")),
+           f"AM_FAILED_DRY_SIGN_NO_STATE an open condition: no run state, nothing resumes ({rec4['dry_sign']})")
+        rcf = os.path.join(c4, "review_conditions.yaml")
+        rows = yaml.safe_load(open(rcf))
+        for r_ in rows["conditions"]:
+            r_.update(disposition="deferred", owner="owner", due="2099-01-01")
+        yaml.safe_dump(rows, open(rcf, "w"))
+        rec5 = finish(c4, log=lambda *a: None)
+        ok(rec5["dry_sign"]["ok"] is True and json.load(open(os.path.join(c4, "run_state.json")))["state"] == "SIGN"
+           and f"--expect-sheet-sha256 {sha(os.path.join(c4, SO.SHEET))}" in rec5["commands"]["owner_sign"],
+           f"AM_FINISH after the dispositions the child gets its sheet, sign command and run state ({rec5['dry_sign']})")
+        shutil.rmtree(c4)
         shutil.rmtree(c2)
     if fails:
         print(f"FAIL: {len(fails)} self-test case(s) failed")
@@ -748,14 +842,15 @@ def main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
-    ap.add_argument("parent_run")
+    ap.add_argument("parent_run", help="the parent run (with --finish: the kept child)")
+    ap.add_argument("--finish", action="store_true", help="re-check a kept child whose dry-sign failed")
     ap.add_argument("--patch", default=None, help="the amendment (YAML: id, reason, spec, dossier)")
     ap.add_argument("--from-request", action="store_true", help=f"take the why (and a patch) from {REQUEST}")
     ap.add_argument("--out", default=None, help="the child run directory (default <parent>.amend<k>)")
     ap.add_argument("--signoff", choices=["owner", "lead"], default=None, help="default: the parent's mode")
     a = ap.parse_args(argv)
     try:
-        rec = amend(a.parent_run, a.patch, a.from_request, a.out, a.signoff)
+        rec = finish(a.parent_run) if a.finish else amend(a.parent_run, a.patch, a.from_request, a.out, a.signoff)
     except AmendError as e:
         print(f"Refused: {e}", file=sys.stderr)
         return 1

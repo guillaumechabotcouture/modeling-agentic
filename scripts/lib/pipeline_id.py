@@ -186,7 +186,9 @@ def code_pin(repo: str) -> dict:
     pin = {"commit": commit, "clean": None, "on_remote": None, "remote_branches": []}
     try:
         g = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
-        if g.returncode == 0:      # outside git (an archive) nothing says the files are unedited: None
+        top = subprocess.run(["git", "-C", repo, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                             timeout=30).stdout.strip()
+        if g.returncode == 0 and top and os.path.realpath(top) == os.path.realpath(repo):   # else: an export, None
             d = subprocess.run(["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"],
                                capture_output=True, text=True, timeout=30)
             pin["clean"] = None if d.returncode else (not d.stdout.strip() and sha == g.stdout.strip())
