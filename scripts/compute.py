@@ -3036,6 +3036,9 @@ def _restamp_view(repo: str, rel: str, here: bool):
     self-tests. A form not recorded for this side, or a tracked definition given twice, is a reason of its own."""
     import ast
     side = "here" if here else "launch"
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    from lib import import_closure as IC
     if FP_KEY_CODE.get(rel, ()) is None:
         return "key code", set(), set()
     path = os.path.join(repo, rel)
@@ -3053,7 +3056,7 @@ def _restamp_view(repo: str, rel: str, here: bool):
     kept, masked, reads, seen = [x for x in lines[:2] if "coding" in x], set(), set(), set()
     for n in body:
         names = [n.name] if hasattr(n, "name") else [t.id for t in getattr(n, "targets", []) if isinstance(t, ast.Name)]
-        src = "".join(lines[min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])]) - 1:n.end_lineno])
+        src = "".join((ast.get_source_segment(text, x) or "") + "\n" for x in (*getattr(n, "decorator_list", []), n))
         form = FP_RESTAMP_FORMS.get(f"{rel}::{names[0]}") if len(names) == 1 else None
         if form:
             if names[0] in seen or hashlib.sha256(src.encode(errors="surrogateescape")).hexdigest() not in (
@@ -3063,11 +3066,11 @@ def _restamp_view(repo: str, rel: str, here: bool):
             continue
         if names and all(x in skip for x in names):
             continue
-        if names and all(x.startswith("_self_test") for x in names):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("_self_test"):
             masked.update(names)
             continue
         kept.append(src)
-        if isinstance(n, ast.If) and isinstance(n.test, ast.Compare) and isinstance(n.test.left, ast.Name)                 and n.test.left.id == "__name__":
+        if IC._is_main_guard(n):
             continue                                  # the CLI block: never run where rows are computed
         reads |= {x.id for x in ast.walk(n) if isinstance(x, ast.Name)} | {
             x.attr for x in ast.walk(n) if isinstance(x, ast.Attribute)}
@@ -3088,9 +3091,14 @@ def _launch_tree(run_dir: str, given: str | None):
                                  capture_output=True).returncode == 0:
         import tarfile
         import tempfile
+        import shutil
         d = tempfile.mkdtemp(prefix="restamp_")
-        tar = subprocess.run(["git", "-C", REPO, "archive", commit], capture_output=True, check=True).stdout
-        tarfile.open(fileobj=io.BytesIO(tar)).extractall(d, filter="data")
+        try:
+            tar = subprocess.run(["git", "-C", REPO, "archive", commit], capture_output=True, check=True).stdout
+            tarfile.open(fileobj=io.BytesIO(tar)).extractall(d, filter="data")
+        except (OSError, subprocess.CalledProcessError, tarfile.TarError) as e:
+            shutil.rmtree(d, ignore_errors=True)
+            return None, f"launch code not extracted from commit {commit[:12]}: {type(e).__name__}"
         return d, f"commit {commit[:12]} (archive)"
     return None, (f"launch code not provable: commit {commit[:12] or 'unknown'} is not in this repository and the run "
                   "stores no code archive (give --launch-tree)")
@@ -3118,6 +3126,14 @@ def restamp(run_dir: str, launch_tree: str | None = None, write: bool = True) ->
             d.pop("parts", None)
             continue
         try:
+            try:
+                same = json.load(open(out + ".summary.json")) == summ
+            except (OSError, ValueError):
+                same = False
+            if not same:
+                d.update(decision="refused", reason="the batch summary changed during the restamp")
+                d.pop("parts", None)
+                continue
             base, name = _out_base(out, run_dir)
             try:
                 write_nofollow(base, name + ".summary.json", json.dumps({**summ, "restamp": d}, indent=1).encode(),
@@ -3162,8 +3178,15 @@ def _restamp_check(run_dir: str, out: str, summ: dict, tree: str | None, how: st
     """The new key's parts (less `extra`) when checks A and B pass; otherwise ValueError with the reason."""
     if tree is None:
         raise ValueError(how)
+    fn_file = _here_spec(summ).partition("::")[0]
+    fn_file = fn_file if os.path.isabs(fn_file) else os.path.join(run_dir, fn_file)
+    if os.path.isfile(fn_file) and fn_file.startswith(run_dir + os.sep) \
+            and os.path.getsize(fn_file) > _FP_HASH_MB * 2**20:
+        big = big + [os.path.relpath(fn_file, run_dir)]
     if big:          # the old key holds only the size and mtime of a large file: A cannot prove its content
         raise ValueError(f"the old key cannot prove {len(big)} run file(s) over {_FP_HASH_MB} MB: {big[0]}")
+    first = {}
+    code_fingerprint(run_dir, _here_spec(summ), exclude=_out_files(out), record=first)
     g, saved = globals(), REPO
     layout = lambda f: ("runs/" + os.path.basename(run_dir) + "/" + os.path.relpath(f, run_dir)  # noqa: E731
                         if f.startswith(run_dir + os.sep) else os.path.relpath(f, tree))
@@ -3182,17 +3205,30 @@ def _restamp_check(run_dir: str, out: str, summ: dict, tree: str | None, how: st
         raise ValueError(f"a run-root module is in the closure and the old key never held it: {run_mods[0]}")
     files = set(rec["closure"]["files"]) | set(FP_DEP_MANIFESTS)
     if rec["closure"]["unresolved"]:       # the key holds the whole tree: so does the comparison (links followed)
+        mods = [os.path.relpath(os.path.join(dp, f), run_dir) for dp, ds, fs in os.walk(run_dir) for f in fs
+                if f.endswith(".py") and os.path.relpath(dp, run_dir).split(os.sep)[0] not in ("models", "data")]
+        if mods:
+            raise ValueError(f"the closure is not computed and the run has {len(mods)} module(s) outside models/ "
+                             f"and data/ that the old key never held: {mods[0]}")
         for r in (REPO, tree):
+            for dp, ds, fs in os.walk(r):
+                rel_dp = os.path.relpath(dp, r)
+                ds[:] = [x for x in ds if not x.startswith(".") and x != "__pycache__" and not (
+                    rel_dp == "." and x in REPO_CODE_DIRS + ("runs",))]
+                files |= {os.path.normpath(os.path.join(rel_dp, f)).replace(os.sep, "/") for f in fs
+                          if f.endswith(".py")}          # repo_code: the repo's other Python
             for c in REPO_CODE_DIRS:
                 anc = {os.path.join(r, c): {os.path.realpath(os.path.join(r, c))}}
                 for dp, ds, fs in os.walk(os.path.join(r, c), followlinks=True):
-                    ds[:] = [x for x in ds if x != "__pycache__" and os.path.realpath(os.path.join(dp, x)) not in anc[dp]]
+                    ds[:] = [x for x in ds if x != "__pycache__"
+                             and os.path.realpath(os.path.join(dp, x)) not in anc[dp]]
                     for x in ds:
                         anc[os.path.join(dp, x)] = anc[dp] | {os.path.realpath(os.path.join(dp, x))}
                     files |= {os.path.relpath(os.path.join(dp, f), r).replace(os.sep, "/") for f in fs}
     dirs = {os.path.dirname(f) for f in files if f.split("/")[0] in REPO_CODE_DIRS}   # a module shadowed or added
-    listing = lambda r, x: sorted(e for e in (os.listdir(os.path.join(r, x)) if os.path.isdir(os.path.join(r, x))  # noqa: E731
-                                              else ()) if e != "__pycache__")
+    def listing(r, x):
+        return sorted(e for e in (os.listdir(os.path.join(r, x)) if os.path.isdir(os.path.join(r, x)) else ())
+                      if e != "__pycache__")
     differ = sorted(f"{x}/ (its entries)" for x in dirs if listing(tree, x) != listing(REPO, x))
     masked, reads = set(), set()
     for f in sorted(files - set(_FP_REPO_SKIP)):
@@ -3202,6 +3238,8 @@ def _restamp_check(run_dir: str, out: str, summ: dict, tree: str | None, how: st
         if a != b:
             differ.append(f + "".join(f" ({x})" for x in (a, b) if "form" in str(x)))
     differ += sorted(f"{x} (a self-test read by compared code)" for x in masked & reads)
+    if first.get("key_parts") != rec.get("key_parts"):
+        differ.append("the run's inputs or code changed while the restamp read them")
     if differ:
         raise ValueError(f"the code differs from the launch tree: {', '.join(differ[:6])}"
                          + (f" and {len(differ) - 6} more" if len(differ) > 6 else ""))
