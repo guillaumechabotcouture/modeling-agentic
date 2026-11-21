@@ -567,10 +567,16 @@ class SdkTasks:
             {"by": "lead", "note": "lead mode: the harness accepts the drafted spec"}).encode(), atomic=True)
         return TaskResult(True, None, 0.0, "lead mode")
 
-    def pick_engine(self, spec, eligible):
+    def pick_engine(self, spec, eligible, rethink=None):
         inp = self._input(eligible)
+        msg = "Choose the engine."
+        if rethink:      # a RETHINK back-edge: the engine the run left, and why (stage_machine.Machine._rethink)
+            msg += (f"\n\nThis is a rethink: the run chose {rethink.get('engine')} and came back to this choice, for "
+                    "these reasons:\n- " + "\n- ".join(map(str, rethink.get("why") or ["none recorded"]))
+                    + "\nPick another eligible engine if one answers them. If you keep the same engine, say in `why` "
+                      "which of the reasons it cannot answer.")
         return self._session("pick_engine", PROMPTS["pick_engine"].format(out_in=inp, out=OUT),
-                             "Choose the engine.", OWNS["pick_engine"], enforcement.MODEL_FAST)
+                             msg, OWNS["pick_engine"], enforcement.MODEL_FAST)
 
     def critique(self, run_dir, reviewer, round_n, feedback=None):
         import validate_critique_yaml as V
@@ -596,11 +602,13 @@ class SdkTasks:
                              "Plan the fixes.", OWNS["plan_fixes"])
 
     def fix(self, task, run_dir, evidence):
-        owns = OWNS["fix"] if task.get("owner_state") not in ("WRITE", "PRESENTATION") else ("manuscript.md",)
+        # A write-up finding is never a fix task (fix_loop.validate_plan; the writer gets it), so a fix task owns
+        # the files its prompt names, whatever stage its plan gives.
         return self._session("fix", PROMPTS["fix"].format(tid=task["id"], brief=task.get("brief", ""),
                                                            findings=task["findings"],
                                                            evidence=json.dumps(evidence)[:2000] if evidence else "none",
-                                                           settings=_settings_text(), out=OUT), "Make the fix.", owns)
+                                                           settings=_settings_text(), out=OUT), "Make the fix.",
+                             OWNS["fix"])
 
     def write(self, run_dir, mode, feedback=None, findings=None):
         fb = ("\n\nThis is a repair: the report was not accepted, and the harness will not deliver it while it "
@@ -924,6 +932,27 @@ def _self_test() -> int:
            and (not any(f["auto"] == "estimates" for f in forms.values()) or "`dynamics`" in dp),
            f"S_ENGINE_FORMS2 each case among the registered engines (auto, an estimates spec's dynamics, named only) is "
            f"one the prompt covers ({sorted({str(f['auto']) for f in forms.values()})})")
+
+        # S_PICK_RETHINK, S_FIX_OWNS (v2 autonomy 1A, 5.3 and 3).
+        got = {}
+
+        def rec_session(self_, kind, system, prompt, owns, model=None):
+            got[kind] = (prompt, owns)
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        SdkTasks._session = rec_session
+        try:
+            t3 = SdkTasks(d)
+            try:
+                t3.pick_engine({}, [{"ref": "e1", "eligible": True}],
+                               rethink={"engine": "e1", "why": ["D-001: it has no age structure {x}"]})
+            except TypeError as e:
+                got["pick_engine"] = (f"TypeError: {e}", ())
+            t3.fix({"id": "T1", "brief": "b", "findings": ["R-001"], "owner_state": "WRITE"}, d, None)
+        finally:
+            SdkTasks._session = orig_session
+        ok("e1" in got["pick_engine"][0] and "D-001: it has no age structure {x}" in got["pick_engine"][0],
+           f"S_PICK_RETHINK the engine pick after a rethink names the engine left and the reasons ({got['pick_engine'][0]!r})")
+        ok(got["fix"][1] == OWNS["fix"], f"S_FIX_OWNS a fix task owns the fix files ({got['fix'][1]})")
     # World-model seed task (F6 world-model trials): the world model's own seed documentation in the prompt, no results
     # readable, one owned output outside the harness's analysis/ tree.
     try:
