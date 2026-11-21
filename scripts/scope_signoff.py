@@ -374,6 +374,7 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
     """Mark each decision-bearing HIGH finding of `current` for the owner (in
     place), and report declined ones. Nothing under --signoff none. `mode`: the run's
     sign-off mode (v2 passes it; else MA_SIGNOFF_MODE)."""
+    v2 = mode is not None          # v2 passes its mode; a lead's answer then counts only when provisional (D2)
     mode = os.environ.get("MA_SIGNOFF_MODE") if mode is None else mode
     if mode == "none":
         return []
@@ -404,7 +405,8 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
             continue
         seen.add(item["finding"])
         ans = answers.get(item["fingerprint"])
-        if ans and _signer_ok(ans.get("by"), mode):
+        if ans and _signer_ok(ans.get("by"), mode) and not (v2 and ans.get("by") == "lead"
+                                                            and ans.get("provisional") is not True):
             if ans["decision"] == "accept":
                 v["owner_signed"] = {"by": ans.get("by"), "at": ans.get("at"), "fingerprint": item["fingerprint"]}
                 continue
@@ -619,7 +621,10 @@ def provisional_answers(run_dir: str, items: list[dict], round_n: Optional[int] 
                    "plan_changing": bool((plan_changing or {}).get(fp)), "kind": it.get("kind"), "at": now,
                    "round": round_n, "note": "provisional lead answer (--signoff lead, owner default D2): the run "
                                              "continues with the finding declared; the owner confirms or overturns it"}
-    doc = {**_raw_doc(run_dir), "answers": {**prior, **new}, "last_signed_by": "lead", "last_signed_at": now,
+    raw = _raw_doc(run_dir)           # Codex r2 of #316: an owner answer that arrived since `prior` is kept
+    cur = raw.get("answers") if isinstance(raw.get("answers"), dict) else {}
+    new = {fp: a for fp, a in new.items() if (cur.get(fp) or {}).get("by") != "owner"}
+    doc = {**raw, "answers": {**prior, **cur, **new}, "last_signed_by": "lead", "last_signed_at": now,
            "producer": "agents/stage_machine.py OWNER_DECISION (provisional lead answers)"}
     from lib.safe_io import write_nofollow
     write_nofollow(run_dir, SIGNOFF, json.dumps(doc, indent=1).encode(), atomic=True)
@@ -629,7 +634,9 @@ def provisional_answers(run_dir: str, items: list[dict], round_n: Optional[int] 
 def provisional(run_dir: str) -> list[dict]:
     """The lead's provisional answers the harness recorded (verified_answers), each with the owner's review (None:
     not reviewed yet), in the order given."""
-    answers, _bad = verified_answers(run_dir)
+    answers, bad = verified_answers(run_dir)
+    if bad:                 # Codex r2 of #316: an unreadable record is reported, never an empty list
+        raise ValueError(bad[0]["claim"])
     reviews = _raw_doc(run_dir).get("reviews")
     reviews = reviews if isinstance(reviews, dict) else {}
     rows = [dict(a, fingerprint=fp, review=reviews.get(fp) if isinstance(reviews.get(fp), dict) else None)

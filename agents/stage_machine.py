@@ -378,7 +378,21 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
     rule = _owner_rule() if rule == "auto" else rule
     bearing = [v for v in viols if v.get("decision_bearing") or v.get("kind") in DECISION_BEARING_KINDS]
     if not bearing:
-        return []
+        if rule is None or mode == "none":
+            return []
+        # Codex r2 of #316 (P1): an owner's recorded decline holds the gate whatever else is present; nothing new is
+        # put to the owner here (the policy kinds go to the owner only beside a decision-bearing finding, as before)
+        marked = {id(v) for v in viols if v.get("owner_signoff")}
+        try:
+            out = [f for f in rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
+                                                 mode=mode) or [] if f.get("kind") == "scope_declaration_declined"]
+        except Exception:  # noqa: BLE001 -- as before this rule: nothing marked, nothing declined
+            out = []
+        for v in viols:
+            if v.get("owner_signoff") and id(v) not in marked:
+                v.pop("owner_signoff", None)
+                v.pop("owner_item", None)
+        return out
     if rule is not None and mode != "none":
         out = []
         try:
@@ -2898,6 +2912,19 @@ def _self_test() -> int:
         vs = [dict(dtf)]
         apply_owner_rule(dd, 2, vs, rule=Broken)
         ok(vs[0]["scope_declarable"] is False and not vs[0].get("owner_signoff"), "T32 an owner rule that fails is fail-closed")
+
+        class Declines:
+            @staticmethod
+            def gate_findings(rd, rn, viols, non_declarable=None, mode=None):
+                for v in viols:
+                    v["owner_signoff"] = True
+                return [{"kind": "scope_declaration_declined", "key": "allocation_unstable"}, dict(viols[0])]
+        vs = [{"kind": "allocation_unstable", "severity": "HIGH", "claim": "c"}]
+        got = apply_owner_rule(dd, 2, vs, rule=Declines)
+        ok([f["kind"] for f in got] == ["scope_declaration_declined"] and not vs[0].get("owner_signoff")
+           and apply_owner_rule(dd, 2, [dict(vs[0])], rule=Declines, mode="none") == [],
+           "T32b (Codex r2 of #316) a recorded decline holds the gate without a decision-bearing finding; nothing new "
+           "is put to the owner there")
 
         # T33 (Codex R2-1): the first spec draft is interrupted. On resume the started-but-uncompleted
         # entry is charged its allowance once and the draft runs again under the same key.
