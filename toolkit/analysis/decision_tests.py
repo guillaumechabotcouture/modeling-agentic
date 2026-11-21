@@ -83,7 +83,8 @@ def _lowers_only_unchosen(ben0, ben, plan) -> bool:
 def run_all(A, z0, out0, ben0, cost0, plan, uq_data, run_dir) -> list[dict]:
     os.makedirs(os.path.join(run_dir, DIR), exist_ok=True)
     out = []
-    dts = list(A.spec["analysis"].get("decision_tests") or []) + prior_range_tests(A)
+    dts = list(A.spec["analysis"].get("decision_tests") or []) + prior_range_tests(A) \
+        + list(getattr(A, "conflict_tests", None) or [])        # W0-F: one pair per declared evidence conflict
     ids = [str(dt.get("id")) for dt in dts]
     dup = sorted({i for i in ids if ids.count(i) > 1})
     if dup:     # F6 S2-5d review r3: declared and automatic tests share one result path per id

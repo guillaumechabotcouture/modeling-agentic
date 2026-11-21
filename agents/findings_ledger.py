@@ -190,6 +190,15 @@ def from_critiques(run_dir: str) -> tuple[list[Finding], list[str]]:
     return found, problems
 
 
+def from_conflicts(run_dir: str) -> tuple[list[Finding], list[str]]:
+    """W0-F: one HIGH evidence_conflict_declared finding per target the analysis held out (toolkit/analysis/
+    conflicts.py findings): open, for the owner, when its test changes the plan or did not run; else declared."""
+    from toolkit.analysis import conflicts as CF
+    rows, probs = CF.findings(run_dir)
+    return [Finding(severity="HIGH", source="harness-conflicts", owner_state="ANALYZE", target_stage="ANALYZE",
+                    blocking=r["status"] == "open", **r) for r in rows], probs
+
+
 def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[str]]:
     """Every finding in a gate decision (validate_critique_yaml --json output)."""
     problems = []
@@ -336,8 +345,10 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
     decl, p3 = declarations(run_dir)
     problems += p3
     answers = owner_answers(run_dir)
+    conf, p4 = from_conflicts(run_dir)          # W0-F: declared evidence conflicts (analysis/conflicts.yaml)
+    problems += p4
     seen = set()
-    for new in crit + gate_rows:
+    for new in crit + gate_rows + conf:
         seen.add(new.id)
         old = led.get(new.id)
         if old is None:

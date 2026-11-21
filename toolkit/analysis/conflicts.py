@@ -354,7 +354,7 @@ def _self_test() -> int:
         ok(d2["proceed"] and [c["key"] for c in c2] == ["S|r2"] and c2[0]["why"]["failed_share"] == 0.83
            and set(c2[0]["units"]) == {str(i) for i in range(12) if i % 3 == 2}
            and [x.get("offset") for x in d2["declared"]] == ["S|r2"],
-           f"JC_ONE_TARGET_83PCT_ROWS one offset in one group failing 83% of the region-sample rows is held out, its "
+           f"JC_ONE_TARGET_MOST_ROWS one offset in one group failing most of the region-sample rows is held out, its "
            f"units tested, and the run continues ({c2})")
         tt = tests(d2["conflicts"])
         ok([t["calibration_target"]["scale"] for t in tt] == [0.8, 1.25] and all(t["type"] == "calibration_target"

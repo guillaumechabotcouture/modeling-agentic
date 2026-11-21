@@ -997,6 +997,13 @@ def pending_amendments(ledger: dict, resolved=()) -> list[str]:
                   and FX.needs_owner_amendment(f))
 
 
+def pending_conflicts(ledger: dict) -> list[str]:
+    """W0-F: held-out calibration targets whose automatic test changes the plan (or did not run), not yet answered by
+    the owner; asked together with the owner amendments, once (an answer closes them)."""
+    from toolkit.analysis import conflicts as CF
+    return sorted(f.id for f in ledger.values() if f.kind == CF.FINDING_KIND and f.status == "open")
+
+
 def drop_declined(run_dir: str, ids) -> None:
     """A finding the owner declined is not a declared limitation: it leaves declared_findings.yaml (Codex #258)."""
     import yaml
@@ -1037,8 +1044,11 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
         f = ledger.get(fid)
         claim, fix = (f.claim, f.fix_requires) if f is not None else ("", None)
         fp = FL.answer_fingerprint(fid, claim, fix)       # the ledger binds the owner's answer to it
+        conflict = getattr(f, "kind", None) == "evidence_conflict_declared"
         items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix,
-                      "reason": "its required remedy is an owner amendment of the signed decision spec",
+                      "reason": ("a held-out calibration target's automatic decision test changes the plan or could "
+                                 "not run (conflicts.policy declare_and_test)") if conflict else
+                      "its required remedy is an owner amendment of the signed decision spec",
                       "declarations": [], "declared": False, "fingerprint": fp})
     doc = {"pending": True, "round": round_n, "requested_at": _now(), "items": items, "producer": OWNER_REQUEST_PRODUCER,
            "decision_rationale": "the fix loop does not change the owner-signed spec: amend and re-sign it, or answer "
@@ -1352,6 +1362,9 @@ class Machine:
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         if res.ok:
             try:
+                from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
+                if CF.ensure_default(rd):
+                    self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
                 errs = self._derive(rd) if self.st.derived_inputs else []
                 errs = errs or record_cited_inputs(rd)       # before anything reads a cited file
                 if self.st.derived_inputs:
@@ -1613,7 +1626,7 @@ class Machine:
                 led = FL.load(self.run_dir)
                 # Codex review of #258 P1-10: a finding whose remedy is an owner amendment goes to the owner on every
                 # route, not only from the fix loop
-                amend = pending_amendments(led, d.get("resolved_by_test"))
+                amend = sorted(set(pending_amendments(led, d.get("resolved_by_test")) + pending_conflicts(led)))
                 if amend:
                     self._request_owner(led, amend)
                     return self._go("OWNER_DECISION", f"{len(amend)} finding(s) need an owner amendment "
@@ -2011,6 +2024,10 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
                   f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
+    from toolkit.analysis import conflicts as CF       # W0-F: every held-out calibration target
+    cl = CF.report_lines(run_dir)
+    if cl:
+        lines += [""] + cl[:-1]
     wmp = os.path.join(run_dir, "world_model", "world_model.md")    # §14: rendered by the harness from score.json
     try:
         if os.path.isfile(wmp) and not os.path.islink(wmp):
@@ -2412,6 +2429,44 @@ def _self_test() -> int:
                and "`completed_scope_declined`" in open(os.path.join(d, "report.md")).read(),
                f"R3-3b the owner's decline resumes the run, is not redrafted, and constrains the gate: the run is not "
                f"declared or accepted (Codex review of #258 P1-11) ({s2}, {p2[-5:]})")
+        # W0-F: a held-out target whose automatic test changes the plan pauses the run once at OWNER_DECISION; one
+        # whose test changes nothing is a declared limitation, and the run is not interrupted
+        def conflict_run(name, changes):
+            d_, T_, st_ = new_run(name, {}, max_rounds=2)
+            os.makedirs(os.path.join(d_, "analysis"), exist_ok=True)
+            import yaml as _y
+            _y.safe_dump({"data": {"policy": "declare_and_test", "refused": None, "needs_owner": ["g|1"] if changes
+                                   else [], "declared": [{"n": 1, "kind": "offset", "key": "g|1", "target": "g",
+                                                          "units": ["1"], "why": {}, "tests": ["conflict_1_g_1_lo"],
+                                                          "scales": [0.8], "verdicts": {"conflict_1_g_1_lo":
+                                                                                        "CHANGES_PLAN" if changes
+                                                                                        else "NO_CHANGE"},
+                                                          "changes_plan": changes}]}},
+                         open(os.path.join(d_, "analysis", "conflicts.yaml"), "w"))
+            s_ = _SpikeMachine(d_, T_, st_, log=lambda *a: None, cross_engine_check=False).run()
+            return d_, T_, s_
+        dq, Tq, sq = conflict_run("conflict_change", True)
+        try:
+            rq = json.load(open(os.path.join(dq, "scope_signoff_request.json")))
+        except (OSError, ValueError):
+            rq = {}
+        ok(sq == "paused:awaiting_scope_signoff" and [i.get("finding") for i in rq.get("items") or []]
+           == ["evidence_conflict_declared:g|1"] and "held-out" in rq["items"][0]["reason"],
+           f"T_CONFLICT_PLAN_CHANGE_PAUSES_ONCE a conflict whose test changes the plan pauses at OWNER_DECISION ({sq})")
+        if rq.get("pending"):
+            import scope_signoff as _SS
+            _SS.sign(dq, "owner", all_decision="accept", note="W0-F")
+            sq2 = _SpikeMachine(dq, StubTasks(Tq.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            nq = sum(1 for h in load_state(dq).history if h.get("to") == "OWNER_DECISION")
+            ok(sq2 in ACCEPTED_STATUSES and nq == 1
+               and "Held-out calibration targets" in open(os.path.join(dq, "report.md")).read(),
+               f"T_CONFLICT_PLAN_CHANGE_PAUSES_ONCE the owner's accept resumes the run, which is not paused again, and "
+               f"the report lists the held-out target ({sq2}, {nq} pause(s))")
+        dn, Tn, sn = conflict_run("conflict_nochange", False)
+        ok(sn in ACCEPTED_STATUSES and not os.path.exists(os.path.join(dn, "scope_signoff_request.json"))
+           and FL.load(dn)["evidence_conflict_declared:g|1"].status == "declared"
+           and "Held-out calibration targets" in open(os.path.join(dn, "report.md")).read(),
+           f"T_CONFLICT_NO_CHANGE_NO_PAUSE a conflict whose test changes nothing is declared, listed, never paused ({sn})")
         # R3-6 (Codex re-review of #258): a declared finding still needs the owner's answer (P1-10), and a decline of a
         # finding its test has since resolved does not hold the gate (new P1-2)
         f6d = FL.Finding(id="D-036", kind="critique_blocker", severity="HIGH", source="critique-domain", status="declared",
