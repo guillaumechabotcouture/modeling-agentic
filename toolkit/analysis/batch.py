@@ -1039,6 +1039,21 @@ def _self_test() -> int:
                "BA-XU3 a design whose points already span every feature's range is unchanged: features alone still "
                "move no design point and no job hash")
     case("BA-XU", bxu)
+
+    def bxu2():
+        """Codex r1 P1-1, P1-2: a swap is judged by the coverage it leaves, not by which unit first carries an extreme;
+        a held-out point is taken only when no training point can be."""
+        ind = lambda u: [1.0 if k == u else 0.0 for k in range(9)]  # noqa: E731 -- one indicator feature per unit
+        o1 = cover_features(list(range(8)), set(), [ind(u) for u in range(1, 9)])
+        ok(sorted(o1) == list(range(1, 9)),
+           f"BA-XU4 the one design point that carries no extreme of its own gives way (unit 0 for unit 8): {o1}")
+        o2 = cover_features(list(range(8)), {7}, [ind(u) for u in (1, 2, 3, 4, 5, 6, 8)])
+        ok(o2.index(8) != 7 and 7 in o2 and 0 not in o2,
+           f"BA-XU5 a training point is replaced before a held-out one when both keep every range covered: {o2}")
+        o3 = cover_features([0, 1, 2], {2}, [[0.0, 0.0, 5.0, 9.0]])       # units 0 and 1 tie at the minimum
+        ok(sorted(o3) == [0, 2, 3] or sorted(o3) == [1, 2, 3],
+           f"BA-XU6 a point tied at a covered extreme can give way while the other carrier stays: {o3}")
+    case("BA-XU2", bxu2)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1
