@@ -15,9 +15,11 @@ disease-agnostic: every question-specific fact is in the rubric and the truth fi
         <dir>/<q>/<label>/runs/<run>/ as `collect` writes it (~/modeling-agentic-keep/evals/<tag>);
         the answer key is the one whose input hashes match the run's
     python3 scripts/eval_suite.py run [--tag T] [--reps N] [--pipeline v2] [--execute] [q ...]   (v1 is retired)
-        preflight (inputs current, nothing hidden in the launch tarball), then print the
-        launch commands, each stating its pipeline (EVAL_PIPELINE, default v2); --execute runs
-        them (each launch costs up to the US$35 cap)
+        preflight (the pinned bundle verifies by digest, the shipped inputs hash to its public
+        manifest, nothing hidden in the launch tarball), then print the launch commands, each
+        stating its pipeline (EVAL_PIPELINE, default v2); --execute runs them (each launch costs
+        up to the US$35 cap). It never decrypts the bundle or reads the keychain (owner
+        2026-11-21), so it needs storage access but not the key
     python3 scripts/eval_suite.py report <suite_scores.json> [<other suite_scores.json>] [--allow-mixed-pipelines]
         a table; with two files, B against A per question. Every score names the pipeline and
         commit its run recorded ("unknown" for runs from before 2026-11-05); two files whose
@@ -191,6 +193,19 @@ def check_inputs(q, private_dir=None, data_dir=DATA) -> list[str]:
     committed_dir = os.path.join(data_dir, q)
     committed = digest_dir(committed_dir) if os.path.isdir(committed_dir) else {}
     return sorted(n for n in set(fresh) | set(committed) if fresh.get(n) != committed.get(n))
+
+
+def stale_answer_keys(root, questions, data_dir=DATA) -> list[str]:
+    """Questions whose stored answer key was not generated from the committed inputs. `publish` refuses them: the
+    manifest it writes carries these hashes, and `run` checks a launch against the manifest alone (Codex r1)."""
+    out = []
+    for q in questions:
+        t = _read_json(os.path.join(root, q, "_truth", "truth.json"))
+        d = os.path.join(data_dir, q)
+        current = digest_dir(d) if os.path.isdir(d) else {}
+        if not isinstance(t, dict) or not current or t.get("inputs_sha256") != current:
+            out.append(f"{q}: the stored answer key's input hashes differ from data/evals/{q}/ (run generate)")
+    return out
 
 
 def ensure_truth(q, private_dir=None, data_dir=DATA) -> dict:
@@ -1061,25 +1076,38 @@ def leak_problems(repo=REPO) -> list[str]:
     return probs
 
 
+TAG_RE = r"[a-z0-9][a-z0-9-]{0,19}"   # it names the cluster (cloud/configs/_eval.py checks the same)
+
+
 def launch_commands(questions, tag, reps, tree=None, pipeline="v2") -> list[str]:
+    import shlex
     if pipeline in pipeline_id.RETIRED:
         raise ValueError(pipeline_id.RETIRED_MESSAGE)
     if pipeline not in pipeline_id.PIPELINES:
         raise ValueError(f"pipeline must be one of {pipeline_id.PIPELINES}")
-    env = f"EVAL_TAG={tag} EVAL_REPS={reps} EVAL_PIPELINE={pipeline}" + (f" EVAL_TREE={tree}" if tree else "")
+    if not re.fullmatch(TAG_RE, str(tag)) or not isinstance(reps, int) or reps < 1:
+        raise ValueError(f"tag {tag!r} must be 1-20 of a-z, 0-9 and -, and reps a positive integer")
+    env = (f"EVAL_TAG={tag} EVAL_REPS={reps} EVAL_PIPELINE={pipeline}"
+           + f" EVAL_TREE={shlex.quote(tree or '')}")   # '' keeps the default tree and its origin/main check
     return [f"{env} python3 cloud/run_cluster.py cloud/configs/eval_{q}.py launch" for q in questions]
 
 
-def input_problems(tree, questions, private_dir=None, data_dir=DATA) -> list[str]:
-    """Preflight on the tree that will be shipped, not on this checkout: the inputs in
-    its archive of HEAD must hash to what each question's current answer key was generated from."""
+def input_problems(tree, questions, manifest) -> list[str]:
+    """Preflight on the tree that will be shipped, not on this checkout: the inputs in its archive of HEAD must
+    hash to what each question's current answer key was generated from, as the pinned bundle's public manifest
+    records it (eval_private.verify_public; owner 2026-11-21: the run path never decrypts). `publish` refuses a
+    hidden tree whose generators do not reproduce the committed inputs, so the manifest's hashes stand for them."""
     blob = _archive_of(tree)
     if not blob:
         return [f"{tree}: not a git checkout, cannot build the launch archive"]
     shipped = eval_paths.archive_sha256(blob)
     probs = []
     for q in questions:
-        prob = input_hash_problem(q, ensure_truth(q, private_dir, data_dir), {"eval_inputs_sha256": shipped})
+        want = (manifest.get("questions") or {}).get(q)
+        if not isinstance(want, dict) or not want:
+            probs.append(f"{q}: the pinned bundle's manifest records no input hashes for it")
+            continue
+        prob = input_hash_problem(q, {"inputs_sha256": want}, {"eval_inputs_sha256": shipped})
         if prob:
             probs.append(f"{q}: {tree}: {prob[1]}")
     return probs
@@ -1209,7 +1237,7 @@ def main(argv=None) -> int:
     r.add_argument("--pipeline", choices=pipeline_id.PIPELINES, default="v2",
                    help="the pipeline every launch runs (EVAL_PIPELINE; v2: v1 is retired and refused)")
     r.add_argument("--local", action="store_true", help="not supported: eval runs execute only on the cloud")
-    r.add_argument("--private-dir", help=hidden_help)
+    r.add_argument("--private-dir", help="refused: run checks the pinned bundle by digest and never opens it")
     r.add_argument("questions", nargs="*")
     gr = sub.add_parser("grade")
     gr.add_argument("question", nargs="?")
@@ -1233,6 +1261,8 @@ def main(argv=None) -> int:
     pu.add_argument("--new-key", action="store_true", help="generate a new key and store it in the keychain")
     args = ap.parse_args(argv)
     private = getattr(args, "private_dir", None) or args.private_dir_top
+    if args.self_test and args.cmd:
+        ap.error("--self-test takes no command")
     if args.self_test:
         return _self_test(args.with_private, private)
     try:
@@ -1286,10 +1316,11 @@ def _run_command(ap, args, private) -> int:
         src = os.path.abspath(args.private_dir)
         pin = eval_private.read_pin() or {}
         version = args.version or int(pin.get("version", 0)) + 1
-        with use_private(src):   # every current answer key must match the committed inputs
+        with use_private(src) as root:   # every current answer key must match the committed inputs
             stale = {q: check_inputs(q) for q in suite_questions()}
-        if any(stale.values()):
-            print(f"refusing: committed inputs differ from the generators: {stale}")
+            keys = stale_answer_keys(root, suite_questions())
+        if any(stale.values()) or keys:
+            print(f"refusing: committed inputs differ from the generators: {stale}; {keys}")
             return 1
         if args.new_key:
             key = eval_private.new_key()
@@ -1300,6 +1331,10 @@ def _run_command(ap, args, private) -> int:
         new = eval_private.publish(src, version, key, store)
         with tempfile.TemporaryDirectory() as td:   # a download-and-decrypt round trip before the pin is written
             eval_private.fetch(os.path.join(td, "check"), None, store, new)
+            lost = private_problems(os.path.join(td, "check"), suite_questions())   # Codex r2: pack skips symlinks
+            if lost:
+                print(f"refusing to pin: the uploaded bundle is incomplete: {lost[:5]}")
+                return 1
         eval_private.write_pin(new)
         print(f"published {new['prefix']}/bundle.enc (sha256 {new['bundle_sha256']}); round trip verified; "
               f"wrote evals/private.yaml (commit it)")
@@ -1330,13 +1365,28 @@ def _run_command(ap, args, private) -> int:
                   "archive and nothing else (no evals/, no repository history). main.py refuses an eval question "
                   "anywhere else. Run `python3 scripts/eval_suite.py run` without --local.")
             return 2
+        if private:
+            print("refusing: run never opens the hidden half (owner 2026-11-21); it checks the pinned bundle by "
+                  "digest only, so it takes no --private-dir")
+            return 2
+        if not args.tree and os.environ.get("EVAL_TREE"):   # the printed command would launch that tree, unchecked
+            print("refusing: EVAL_TREE is set in this shell; pass the tree as --tree so the preflight checks the "
+                  "tree the launch ships")
+            return 2
+        if not re.fullmatch(TAG_RE, args.tag) or args.reps < 1:
+            print(f"refusing: --tag {args.tag!r} must be 1-20 of a-z, 0-9 and - (it names the cluster), "
+                  f"--reps at least 1")
+            return 2
         qs = args.questions or suite_questions()
         tree = launch_tree(args.tree, qs[0], args.pipeline)
-        with use_private(private):
-            stale = {q: check_inputs(q) for q in qs}
-            probs = [f"{q}: inputs differ from the generator: {d}" for q, d in stale.items() if d]
-            probs += leak_problems(tree)
-            probs += input_problems(tree, qs)   # the shipped tree's archived inputs, not this checkout's
+        pin = eval_private.read_pin()
+        manifest = eval_private.verify_public(eval_private.default_store(), pin)   # by digest; no key
+        if isinstance(pin, dict) and "manifest_sha256" not in pin:
+            print("note: evals/private.yaml predates manifest_sha256, so the manifest's input hashes are bound to the "
+                  "pinned ciphertext's digest, size and version only; grading re-checks them against the decrypted "
+                  "answer keys (the next publish pins the manifest too)")
+        probs = leak_problems(tree)
+        probs += input_problems(tree, qs, manifest)   # the shipped tree's archived inputs, not this checkout's
         if probs:
             print("refusing to launch:\n  " + "\n  ".join(probs))
             return 1
@@ -1557,7 +1607,8 @@ def _self_test(with_private=False, private_dir=None) -> int:
         for name, fn in (("S12", _test_s12_repo_tree), ("S13", _test_s13_truth_by_hashes),
                          ("S14", _test_s14_grade_fails_closed), ("S15", _test_s15_no_truth_in_details),
                          ("S16", _test_s16_conflicting_copies), ("S17", _test_s17_plaintext_not_in_checkout),
-                         ("S18", _test_s18_incomplete_bundle), ("S19", _self_test_s19_pipeline)):
+                         ("S18", _test_s18_incomplete_bundle), ("S19", _self_test_s19_pipeline),
+                         ("S20", _test_s20_run_never_decrypts)):
             try:
                 fn(ok, os.path.join(td, name))
             except (Exception, SystemExit) as e:  # noqa: BLE001 — a missing piece is a failed case
@@ -1849,6 +1900,107 @@ def _test_s18_incomplete_bundle(ok, td):
     finally:
         eval_private.default_store = saved
     ok(rc != 0 and not called, f"S18c publish refuses an incomplete tree before touching storage: {rc} {called}")
+
+
+def _test_s20_run_never_decrypts(ok, td):
+    """Owner 2026-11-21: `run` (the launch preflight) verifies the hidden half only by its published digest and
+    the public manifest. It never calls the decrypt function, never opens the hidden tree and never reads the
+    keychain, so an agent can run it; a wrong bundle digest fails closed. Decryption stays in grade (the owner's)."""
+    import contextlib
+    import io
+    import eval_private as ep
+    rubric, truth = _toy()
+    tree = os.path.join(td, "tree")
+    csv_path = os.path.join(tree, "data", "evals", "toy", "a.csv")
+    os.makedirs(os.path.dirname(csv_path))
+    with open(csv_path, "w") as f:
+        f.write("u,v\n1,2\n")
+    git = ["git", "-C", tree, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q", tree], check=True)
+    subprocess.run(git + ["add", "-A"], check=True)
+    subprocess.run(git + ["commit", "-qm", "t"], check=True)
+    sha = hashlib.sha256(b"u,v\n1,2\n").hexdigest()
+    priv = os.path.join(td, "priv")
+    ep._write_private(priv, "toy", rubric, dict(truth, question="toy", inputs_sha256={"a.csv": sha}))
+    store = ep.LocalStore(os.path.join(td, "blob"))
+    pin = ep.publish(priv, 1, ep.new_key(), store)   # a key made for this case; the keychain is never read
+    calls = []
+
+    def refuse(name):
+        def f(*a, **k):
+            calls.append(name)
+            raise AssertionError(f"{name} called on the run path")
+        return f
+    names = ("decrypt", "keychain_key", "fetch", "opened", "default_store", "read_pin")
+    saved, saved_leak = {n: getattr(ep, n) for n in names}, globals()["leak_problems"]
+
+    def run(p, *extra):
+        ep.default_store, ep.read_pin = (lambda: store), (lambda path=None: p)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = main(["run", "--tree", tree, *extra, "toy"])
+        return rc, out.getvalue()
+    try:
+        for n in ("decrypt", "keychain_key", "fetch", "opened"):
+            setattr(ep, n, refuse(n))
+        globals()["leak_problems"] = lambda t: []   # this case is about the bundle; S12 covers the tarball scan
+        rc, out = run(pin)
+        ok(rc == 0 and "eval_toy.py launch" in out and not calls,
+           f"S20 run verifies the bundle by digest and prints the launch line without decrypting: {rc} {calls} "
+           f"{out[-300:]!r}")
+        rc, out = run(dict(pin, bundle_sha256="0" * 64))
+        ok(rc != 0 and "eval_toy.py launch" not in out and "bundle_hash_mismatch" in out and not calls,
+           f"S20b a wrong bundle digest fails closed, before any launch line: {rc} {calls} {out[-300:]!r}")
+        rc, out = run(dict(pin, prefix="outputs/evals_private/v9", version=9))
+        ok(rc != 0 and "eval_toy.py launch" not in out and not calls,
+           f"S20c a pin naming a missing bundle fails closed: {rc} {calls} {out[-300:]!r}")
+        rc, out = run(pin, "--private-dir", os.path.join(td, "elsewhere"))
+        ok(rc != 0 and "eval_toy.py launch" not in out and not calls,
+           f"S20d run takes no hidden tree (no --private-dir): {rc} {calls} {out[-300:]!r}")
+        # Codex r1: an explicit but empty manifest digest is not "absent"; a question the manifest lacks refuses;
+        # an inherited EVAL_TREE (which the printed command would launch) must not differ from the checked tree;
+        # a tag that is not a plain name never reaches the shell
+        rc, out = run(dict(pin, manifest_sha256=None))
+        ok(rc != 0 and "eval_toy.py launch" not in out, f"S20g a null manifest_sha256 fails closed: {rc} {out[-200:]!r}")
+        ev_old = os.environ.get("EVAL_TREE")
+        os.environ["EVAL_TREE"] = os.path.join(td, "other")
+        try:
+            ep.default_store, ep.read_pin = (lambda: store), (lambda path=None: pin)
+            out_ = io.StringIO()
+            with contextlib.redirect_stdout(out_):
+                rc = main(["run", "toy"])
+            ok(rc != 0 and "eval_toy.py launch" not in out_.getvalue() and "EVAL_TREE" in out_.getvalue(),
+               f"S20h an inherited EVAL_TREE without --tree refuses: {rc} {out_.getvalue()[-200:]!r}")
+        finally:
+            os.environ.pop("EVAL_TREE", None)
+            if ev_old is not None:
+                os.environ["EVAL_TREE"] = ev_old
+        rc, out = run(pin, "--tag", "x;rm -rf ~")
+        ok(rc != 0 and "eval_toy.py launch" not in out, f"S20i a tag that is not a plain name refuses: {rc}")
+        missing = {"questions": {}, "legacy": {}}
+        ok(any("no input hashes" in p for p in input_problems(tree, ["toy"], missing))
+           and any("no input hashes" in p for p in input_problems(tree, ["toy"], {"questions": {"toy": {}}})),
+           "S20j a question the manifest lacks, or lists with no inputs, refuses")
+        ok(all("EVAL_TREE='' " in c for c in launch_commands(["toy"], "hb0", 1)),
+           "S20l (Codex r2) a default-tree launch line clears EVAL_TREE, so a shell's export cannot swap the tree")
+        ok(stale_answer_keys(priv, ["toy"], os.path.dirname(os.path.dirname(csv_path))) == []
+           and stale_answer_keys(priv, ["toy"], os.path.join(td, "nodata")) != [],
+           "S20k publish's check: each stored answer key's input hashes must equal the committed inputs")
+        with open(csv_path, "w") as f:
+            f.write("u,v\n1,3\n")
+        subprocess.run(git + ["commit", "-qam", "changed"], check=True)
+        rc, out = run(pin)
+        ok(rc != 0 and "eval_toy.py launch" not in out and "a.csv" in out and not calls,
+           f"S20e shipped inputs that differ from the published input digest fail closed: {rc} {out[-300:]!r}")
+    finally:
+        for n, v in saved.items():
+            setattr(ep, n, v)
+        globals()["leak_problems"] = saved_leak
+    for rel in ("cloud/run_cluster.py", "cloud/configs/_eval.py", "cloud/launch_watch.py"):
+        with open(os.path.join(REPO, rel)) as f:
+            src = f.read()
+        ok(not re.search(r"eval_private|decrypt|keychain_key|use_private", src),
+           f"S20f the launcher ({rel}) never reaches the bundle's key or plaintext")
 
 
 def _archive_of(repo) -> bytes:

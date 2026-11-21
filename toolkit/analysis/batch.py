@@ -182,6 +182,30 @@ def realized_rank_correlations(spec, features) -> dict:
     return out
 
 
+def cover_features(order: list, hold: set, cols: list) -> list:
+    """The first len(order) design points' units, changed only as far as needed for the points to span every emulator
+    feature's range over the units (1C-b 2b). The emulator's feature domain is the range of its design points
+    (toolkit/analysis/model.py), so a unit beyond it is an extrapolation that stops the analysis. For each feature
+    minimum or maximum no design point reaches, a unit at that value takes a design point whose replacement leaves
+    every extreme already reached still reached (Codex r1 P1-1): the last such point that is not held out, a held-out
+    one only when no unit at that value can take a training point (P1-2, r2 P1; ties: the first such unit). An order that already spans every feature is returned
+    unchanged, so its jobs keep their hashes. `cols`: one list per feature, a value per unit. An extreme no swap can
+    add (more extremes than points) stays uncovered, and the extrapolation stops the analysis as before."""
+    order = list(order)
+    ext = [(c, w) for c in cols for w in (min(c), max(c))]        # every (feature, extreme value)
+    for c, want in ext:
+        cnt = [sum(d[u] == w for u in order) for d, w in ext]     # design points at each extreme
+        if any(c[u] == want for u in order):
+            continue
+        # every unit tied at the missing extreme is a candidate (Codex r2 P1): (training point?, point, -unit)
+        free = [(k not in hold, k, -new) for new in range(len(c)) if c[new] == want for k in range(len(order))
+                if all(n > 1 or d[new] == w or d[order[k]] != w for (d, w), n in zip(ext, cnt))]
+        if free:
+            _, k, new = max(free)
+            order[k] = -new
+    return order
+
+
 def design(spec) -> tuple[dict, list[dict]]:
     """(design, jobs): the spike's design, from the spec."""
     from scipy.stats import qmc
@@ -199,6 +223,9 @@ def design(spec) -> tuple[dict, list[dict]]:
     while len(order) < n:
         order += list(rng.permutation(len(units)))
     hold = set(rng.choice(n, size=int(round(n * float(em.get("holdout_share", 0.1)))), replace=False).tolist())
+    from toolkit.analysis import features as FT
+    fcols = [list(c) for c in zip(*(FT.vector(spec, u) for u in units))]    # empty without declared features
+    order = cover_features([int(k) for k in order[:n]], hold, fcols)
     pk = spec.packages()
     uid = spec.uid
     attr = spec["calibration"]["attribute"]
@@ -969,6 +996,65 @@ def _self_test() -> int:
                f"BA-NP4 a decision test outside the hull widens that column's box to the union ({fr2['eff_a'][:2]}); "
                f"the draw ranges stay the hull")
     case("BA-NP", bnp)
+
+    def bxu():
+        """1C-b 2b (M_UNIT_HULL): with fewer design points than units, a unit whose emulator feature lies outside the
+        design points' range used to stop the analysis as an extrapolation. The design now includes those units; a
+        design that already covers every feature's range is unchanged (so its stored batch is reused)."""
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = schema.toy_spec(d, n=40)
+            raw = yaml.safe_load(open(p))
+            raw["analysis"]["emulator"]["points"] = 8
+
+            def build(features, cov):
+                lines = open(os.path.join(d, "units.csv")).read().splitlines()
+                at = lines[0].split(",").index("cov")
+                rows = [ln.split(",") for ln in lines[1:]]
+                for r in rows:
+                    r[at] = str(cov.get(r[0], 0.0))
+                open(os.path.join(d, "units.csv"), "w").write("\n".join([lines[0]] + [",".join(r) for r in rows]) + "\n")
+                raw["analysis"]["emulator"]["features"] = features
+                yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+                return design(schema.load(p))
+            d0, j0 = build([], {})
+            used = [str(pt["unit_id"]) for pt in d0["points"]]
+            out = [str(i) for i in range(40) if str(i) not in used][:2]
+            cov = {out[0]: -9.0, out[1]: 9.0}
+            d1, j1 = build(["cov"], cov)
+            u1 = [str(pt["unit_id"]) for pt in d1["points"]]
+            moved = [k for k, (a, b) in enumerate(zip(used, u1)) if a != b]
+            ok(set(out) <= set(u1) and len(moved) == 2 and not any(d1["points"][k]["holdout"] for k in moved)
+               and all({**a, "unit_id": 0} == {**b, "unit_id": 0} for a, b in zip(d0["points"], d1["points"])),
+               f"BA-XU1 the units at a feature's minimum and maximum are design points ({out} in {u1}); only "
+               f"{len(moved)} points change unit, none of them held out, and no z, parameter or seed moves")
+            same = sum(job_sha(a) == job_sha(b) for a, b in zip(j0, j1))
+            ok(same >= len(j0) - 2 * len(d0["packages"]),
+               f"BA-XU2 every job of an unchanged design point keeps its hash ({same} of {len(j0)})")
+            d2, j2 = build(["cov"], {used[0]: -9.0, used[-1]: 9.0})
+            ok([pt["unit_id"] for pt in d2["points"]] == [pt["unit_id"] for pt in d0["points"]]
+               and [job_sha(j) for j in j2] == [job_sha(j) for j in j0],
+               "BA-XU3 a design whose points already span every feature's range is unchanged: features alone still "
+               "move no design point and no job hash")
+    case("BA-XU", bxu)
+
+    def bxu2():
+        """Codex r1 P1-1, P1-2: a swap is judged by the coverage it leaves, not by which unit first carries an extreme;
+        a held-out point is taken only when no training point can be."""
+        ind = lambda u: [1.0 if k == u else 0.0 for k in range(9)]  # noqa: E731 -- one indicator feature per unit
+        o1 = cover_features(list(range(8)), set(), [ind(u) for u in range(1, 9)])
+        ok(sorted(o1) == list(range(1, 9)),
+           f"BA-XU4 the one design point that carries no extreme of its own gives way (unit 0 for unit 8): {o1}")
+        o2 = cover_features(list(range(8)), {7}, [ind(u) for u in (1, 2, 3, 4, 5, 6, 8)])
+        ok(o2.index(8) != 7 and 7 in o2 and 0 not in o2,
+           f"BA-XU5 a training point is replaced before a held-out one when both keep every range covered: {o2}")
+        o3 = cover_features([0, 1, 2], {2}, [[0.0, 0.0, 5.0, 9.0]])       # units 0 and 1 tie at the minimum
+        ok(sorted(o3) == [0, 2, 3] or sorted(o3) == [1, 2, 3],
+           f"BA-XU6 a point tied at a covered extreme can give way while the other carrier stays: {o3}")
+        # Codex r2 P1: every unit tied at the missing extreme is a candidate, so a training point is found when one is
+        o4 = cover_features([0, 1], {1}, [[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]])
+        ok(o4 == [3, 1], f"BA-XU7 of the units tied at a missing extreme, one that can take a training point is used: {o4}")
+    case("BA-XU2", bxu2)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1

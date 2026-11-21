@@ -7,6 +7,7 @@
 none). Callers: toolkit/spec/signoff.py sign, scripts/decision_brief.py sign, agents/stage_machine.py sign (with the
 signer), and toolkit/spec/schema.py validate, which the analysis calls before a run (signer None: the run's
 recorded sign-off decides). A check is registered by name in CHECKS: fn(run_dir, spec, signer) -> [str].
+`review_conditions` (W0-G, toolkit/spec/review_conditions.py): every row of review_conditions.yaml has a disposition.
 `net_effect_posterior` (f6-posterior-ranges): a declared uncertainty.net_effect_posterior loads through the run's own
 path (toolkit/analysis/uncertainty.py net_effect_sample) and the run's design box covers its columns' ranges; signing,
 the signed status that launch and resume read, and the analysis's validation all run it.
@@ -119,8 +120,9 @@ def register(name: str, fn, context: bool = False) -> None:
 
 
 def _load_builtin() -> None:
-    from toolkit.spec import evidence_dossier as ED
+    from toolkit.spec import evidence_dossier as ED, review_conditions as RC
     ED._register()
+    RC._register()          # W0-G: every review condition has a disposition before the spec is signed
 
 
 def problems(run_dir: str, spec_bytes: bytes | None, signer: str | None, spec=None, mode: str | None = None,
