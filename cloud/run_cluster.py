@@ -4123,6 +4123,16 @@ def _self_test_eval_configs(ok) -> None:
                 ok(cfg.pipeline == "v2" and cfg.max_rounds == 3 and fl[fl.index("--max-budget-usd") + 1] == "35"
                    and fl[fl.index("--signoff") + 1] == "lead" and len(cfg.labels) == reps,
                    f"EV3 {q}: pipeline {cfg.pipeline}, rounds {cfg.max_rounds}, flags {fl}, labels {cfg.labels}")
+                # Codex r1: each wrapper names its own question, and the unattended watcher (launch_watch) accepts
+                # the config without --allow-no-cloud-limits: main.py stops at the protocol's 24 h cut-off
+                import launch_watch
+                ok(cfg.name == f"ev-{q.split('_')[0]}-hb0-gcc" and cfg.question_file.endswith(f"/{q}/question.txt")
+                   and cfg.storage_prefix == f"runs/evals/hb0/{q}",
+                   f"EV3b {q}: the config is its own question's ({cfg.name}, {cfg.question_file})")
+                ok(cfg.run_timeout_hours == 24 and seconds(cfg.cluster_timeout) > 24 * 3600
+                   and launch_watch.refuse_reason(cfg) is None,
+                   f"EV3c {q}: cloud-side limits {cfg.run_timeout_hours} h / {cfg.cluster_timeout!r}, "
+                   f"watch refusal {launch_watch.refuse_reason(cfg)!r}")
         os.environ.update(EVAL_TAG="Bad_Tag", EVAL_REPS="1")
         try:
             load_config(paths[0])
