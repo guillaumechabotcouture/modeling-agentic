@@ -458,6 +458,33 @@ def _self_test() -> int:
        and r6["within_solver_gap"] is False and r6["regret"] is None,
        "MV26 a change whose advantage over the point plan is inside the bound is within the gap; a regret well above "
        "it, a proven solve, and a point plan the test makes infeasible are not")
+    # Codex narrow round (2 P1) on core.best_known: the point plan is promoted only when it is feasible by the rule
+    # this module's rows use and within the solver's own budget tolerance; the bound is computed on gains
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from toolkit.analysis import core as CO
+
+    class _B:
+        ids, plan_budget = ["u1", "u2"], None
+        feas = {"feasible": {u: {"none": True, "a": True} for u in ("u1", "u2")}, "caps": []}
+    Bk = _B()
+    bb, cb = {u: {"none": 0.0, "a": 5.0} for u in Bk.ids}, {u: {"none": 0.0, "a": 10.0} for u in Bk.ids}
+    inc = {"status": "feasible", "gap": 0.01, "gain": 5.0, "objective": 5.0, "choice": {"u1": "a", "u2": "none"}}
+    both = {"u1": "a", "u2": "a"}
+    Bk.budget = 20.0 / (1 + 5e-8)          # the point plan costs 5e-8 over: inside check()'s rounding, outside the solver's
+    k1, e18 = attempt(CO.best_known, Bk, dict(inc), both, bb, cb)
+    Bk.budget = 20.0
+    k2, _ = attempt(CO.best_known, Bk, dict(inc), both, bb, cb)
+    ok(e18 is None and k1["solver_gap"]["kept"] == "incumbent" and k1["choice"] == inc["choice"]
+       and k2["solver_gap"]["kept"] == "point_plan" and k2["objective"] == 10.0,
+       f"MV27 a point plan over the budget the solver enforces is not promoted over the incumbent; one within it is "
+       f"({e18!r}, {(k1 or {}).get('solver_gap')}, {(k2 or {}).get('solver_gap')})")
+    big = {"u1": {"none": 2.0 ** 54, "a": 2.0 ** 54}, "u2": {"none": 0.0, "a": 128.0}}
+    inc2 = {"status": "feasible", "gap": 1.0 / 129, "gain": 128.0, "objective": 2.0 ** 54 + 128.0,
+            "choice": {"u1": "none", "u2": "a"}}
+    k3, e19 = attempt(CO.best_known, Bk, inc2, dict(inc2["choice"]), big, cb)
+    ok(e19 is None and abs(k3["solver_gap"]["bound"] - 1.0) < 1e-9,
+       f"MV28 the bound is computed on gains, so a large benefit every plan gets cannot round it away "
+       f"({e19!r}, {(k3 or {}).get('solver_gap')})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
