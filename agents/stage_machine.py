@@ -1074,7 +1074,16 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
         claim, fix = (f.claim, f.fix_requires) if f is not None else ("", None)
         fp = FL.answer_fingerprint(fid, claim, fix)       # the ledger binds the owner's answer to it
         conflict = getattr(f, "kind", None) == "evidence_conflict_declared"
-        items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix,
+        opts = {}
+        if conflict:            # owner decision 2026-11-21: a refit is listed, with its estimated cost, never run
+            from toolkit.analysis import conflicts as CF
+            try:
+                est = (CF.load(run_dir) or {}).get("refit_estimate")
+            except ValueError:
+                est = None
+            opts = {"options": ["accept: the plan stands with the target declared",
+                                "decline: the run is not accepted without the target", CF.refit_option(est)]}
+        items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix, **opts,
                       "reason": ("a held-out calibration target's automatic decision test changes the plan or could "
                                  "not run (conflicts.policy declare_and_test)") if conflict else
                       "its required remedy is an owner amendment of the signed decision spec",
@@ -2564,7 +2573,8 @@ def _self_test() -> int:
         except (OSError, ValueError):
             rq = {}
         ok(sq == "paused:awaiting_scope_signoff" and [i.get("finding") for i in rq.get("items") or []]
-           == ["evidence_conflict_declared:g|1"] and "held-out" in rq["items"][0]["reason"],
+           == ["evidence_conflict_declared:g|1"] and "held-out" in rq["items"][0]["reason"]
+           and any("refit without the target" in o for o in rq["items"][0].get("options") or []),
            f"T_CONFLICT_PLAN_CHANGE_PAUSES_ONCE a conflict whose test changes the plan pauses at OWNER_DECISION ({sq})")
         if rq.get("pending"):
             import scope_signoff as _SS

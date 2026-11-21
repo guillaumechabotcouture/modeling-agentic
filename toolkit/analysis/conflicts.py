@@ -23,9 +23,12 @@ declared, its tests and their verdicts; a conflict whose test changes the plan, 
 The findings ledger carries each as a HIGH `evidence_conflict_declared` finding; the stage machine pauses once at
 OWNER_DECISION for every conflict that needs the owner, batched. The report lists every held-out target.
 
-Open (needs the owner's word, W0-F review r1): a declared miss is not refitted away. The calibration's region sample
+Owner decision 2026-11-21 (W0-F review r1): no refit by default; the tests bound the miss. A declared miss is not
+refitted away. The calibration's region sample
 and best point are the ones the blocked fit produced (for an offset miss, its failed rows redrawn from the rows that
-met it), as for an owner-declared miss today; the automatic tests bound how far the miss can move the plan.
+met it), as for an owner-declared miss today; the automatic tests bound how far the miss can move the plan. When a
+test changes the plan, the owner's request lists "refit without the target" as an option, with its estimated cost
+(refit_estimate: the joint calibration's own simulator calls); the harness does not run it.
 
 Limits that stay hard (the run stops as today): a conflict on a never_declare target; more conflicts of a kind than
 its share; any other block (no accepted region, an emulator check, an offset block without its row breakdown).
@@ -268,7 +271,24 @@ def tests(conf: dict | None) -> list:
     return out
 
 
-def record(conf: dict | None, dt_records: list) -> dict:
+def refit_estimate(jc: dict | None) -> dict:
+    """What a refit without the held-out target would cost, estimated from the joint calibration this run made: one
+    more calibration of the same design (its simulator calls; stored rows may cut it). Not run by the harness."""
+    ad = (jc or {}).get("adapter") or {}
+    calls = ad.get("simulator_calls")
+    return {"simulator_calls": calls if _num(calls) else None, "stored_rows_reused": ad.get("stored_rows_reused"),
+            "basis": "one joint calibration without the target, of the design this run calibrated: about the "
+                     "simulator calls its own calibration made (stored rows of this run may be reused)"}
+
+
+def refit_option(est: dict | None) -> str:
+    calls = (est or {}).get("simulator_calls")
+    return ("refit without the target: amend the spec to drop it and relaunch with reuse; not run by the harness; "
+            "estimated cost " + (f"about {int(calls)} simulator calls (the joint calibration's own)" if calls is not None
+                                 else "one more joint calibration (its size was not recorded)"))
+
+
+def record(conf: dict | None, dt_records: list, refit: dict | None = None) -> dict:
     """analysis/conflicts.yaml: each declared conflict with its tests' verdicts; `needs_owner` when a test changes the
     plan or did not run (its effect on the plan is then unknown)."""
     by = {str(r.get("test_id")): r for r in dt_records or [] if isinstance(r, dict)}
@@ -282,7 +302,7 @@ def record(conf: dict | None, dt_records: list) -> dict:
         rows.append(dict({k: c[k] for k in ("n", "kind", "key", "target", "units", "why", "tests", "scales")},
                          verdicts=vs, changes_plan=any(v != "NO_CHANGE" for v in vs.values())))
     return {"policy": (conf or {}).get("policy", "stop"), "declared": rows, "refused": (conf or {}).get("refused"),
-            "needs_owner": [r["key"] for r in rows if r["changes_plan"]]}
+            "needs_owner": [r["key"] for r in rows if r["changes_plan"]], "refit_estimate": refit}
 
 
 def load(run_dir: str) -> dict | None:
@@ -338,8 +358,8 @@ def findings(run_dir: str) -> tuple:
                               f"under conflicts.policy declare_and_test; its decision tests {c.get('tests')} gave "
                               f"{c.get('verdicts')}.",
                      "fix_requires": None if not c.get("changes_plan", True) else
-                     "Owner decision: the held-out target's test changes the plan (or could not run): accept the plan "
-                     "with the target declared, or decline"})
+                     "Owner decision: the held-out target's test changes the plan (or could not run). Options: accept "
+                     "the plan with the target declared; decline; or " + refit_option(d.get("refit_estimate"))})
     return rows, []
 
 
@@ -479,6 +499,10 @@ def _self_test() -> int:
                                        {"test_id": tt[1]["id"], "status": "run", "decision_changes": True}])
         rec2 = record(d2["conflicts"], [{"test_id": tt[0]["id"], "status": "run", "decision_changes": False}])
         rec3 = record(d2["conflicts"], [{"test_id": t["id"], "status": "run", "decision_changes": False} for t in tt])
+        est = refit_estimate({"adapter": {"simulator_calls": 240, "stored_rows_reused": 0}})
+        rec = dict(rec, refit_estimate=est)
+        ok("about 240 simulator calls" in refit_option(est) and "was not recorded" in refit_option(refit_estimate(None)),
+           "CF_REFIT_OPTION the owner's options name a refit without the target, with its estimated cost")
         ok(rec["needs_owner"] == ["S|r2"] and rec2["needs_owner"] == ["S|r2"] and rec3["needs_owner"] == [],
            "T_CONFLICT_VERDICT a conflict needs the owner when a test changes the plan or did not run, never otherwise")
         os.makedirs(os.path.join(d, "analysis"), exist_ok=True)
@@ -486,6 +510,7 @@ def _self_test() -> int:
             yaml.safe_dump({"data": r_}, open(os.path.join(d, ARTIFACT), "w"))
             fs, pr = findings(d)
             ok(pr == [] and [(f["status"], f["resolution_type"]) for f in fs] == [want]
+               and (want[0] != "open" or "refit without the target" in fs[0]["fix_requires"])
                and fs[0]["kind"] == FINDING_KIND and "| S\\|r2 |" in "\n".join(report_lines(d)),
                f"CF_FINDING_AND_REPORT the finding is {want} and the report lists the held-out target")
         sys.path.insert(0, os.path.join(ROOT, "agents"))

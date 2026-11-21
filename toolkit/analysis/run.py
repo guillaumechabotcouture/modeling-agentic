@@ -445,7 +445,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     conf = (jc or {}).get("unmatched_decision", {}).get("conflicts") if jc is not None else None
     if conf is not None:      # W0-F: each held-out target, why, its tests' verdicts; who decides (empty: none)
         from toolkit.analysis import conflicts as CF
-        crec = CF.record(conf, dts)
+        crec = CF.record(conf, dts, refit=CF.refit_estimate(jc))
         arts["conflicts"] = S.write("conflicts", crec, CF.PRODUCER, [arts["joint_calibration"], arts["decision_tests"]])
         log(f"conflicts: {len(crec['declared'])} target(s) held out and tested; {len(crec['needs_owner'])} need the owner")
     # ---- deliverable CSV
