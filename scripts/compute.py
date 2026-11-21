@@ -4374,7 +4374,7 @@ def _self_test_w0a2(ok) -> None:
                 return (r.get("batches") or [{}])[0], json.load(open(out + ".summary.json")).get("restamp") or {}
             go()
             shutil.copytree(repo, launch)
-            w(repo, "toolkit/eng/x.py", "Z = 1\n")             # here, a file outside the closure
+            w(repo, "tools/x.py", "Z = 1\n")                   # here, a file outside the closure
             store()
             b0, rec0 = decide(launch_tree=launch, write=False)
             ok(b0.get("decision") == "accepted" and not rec0,
@@ -4414,6 +4414,42 @@ def _self_test_w0a2(ok) -> None:
             ok(b6.get("decision") == "refused" and "not provable" in b6.get("reason", "")
                and rec6.get("decision") == "refused",
                f"FP_RESTAMP_NO_LAUNCH_CODE a launch commit not in the repo and no tree given: refused ({b6})")
+            # Codex A2 r1
+            open(lc, "w").write(src + "\n\n" + src[src.index("def _run_map("):src.index("\ndef ", src.index(
+                "def _run_map(") + 5)])
+            store()
+            b7, _ = decide(launch_tree=launch)
+            open(lc, "w").write(src)
+            with mock.patch.dict(g, {"_FP_HASH_MB": 0}):
+                store()
+                b8, _ = decide(launch_tree=launch)
+            go()
+            summ = {k: v for k, v in json.load(open(out + ".summary.json")).items()
+                    if k not in ("key_parts", "closure", "restamp")}
+            with mock.patch.dict(g, {"REPO": launch}):
+                summ["code_fp"] = _legacy_fingerprint(rd, os.path.join(launch, "job.py::f"), exclude=_out_files(out),
+                                                      sort_key=lambda f: f[::-1])
+            open(out + ".summary.json", "w").write(json.dumps(summ))
+            b9, _ = decide(launch_tree=launch)
+            store()
+            lock = _out_lock(out, run_dir=rd)
+            try:
+                b10, rec10 = decide(launch_tree=launch)
+            finally:
+                lock.close()
+            ok(b7.get("decision") == "refused" and "form" in b7.get("reason", "")
+               and b8.get("decision") == "refused" and "cannot prove" in b8.get("reason", "")
+               and b9.get("decision") == "refused" and b10.get("decision") == "refused"
+               and "running" in b10.get("reason", "") and not rec10,
+               f"FP_RESTAMP_GUARDS a tracked definition given twice, a large run file, an old key in an unknown file "
+               f"order and a running batch are refused: {b7} {b8} {b9} {b10}")
+            w(rd, "helper.py", "K = 1\n")
+            w(repo, "job.py", "import helper\nfrom toolkit.eng import m\n\n\ndef f(p):\n    return {'y': m.g(p)}\n")
+            w(launch, "job.py", "import helper\nfrom toolkit.eng import m\n\n\ndef f(p):\n    return {'y': m.g(p)}\n")
+            store()
+            b11, _ = decide(launch_tree=launch)
+            ok(b11.get("decision") == "refused" and "run-root module" in b11.get("reason", ""),
+               f"FP_RESTAMP_RUN_MODULE a run-root module in the closure, which the old key never held: refused ({b11})")
     forms = {k: _def_sha(os.path.join(REPO, k.partition("::")[0]), k.partition("::")[2]) for k in FP_RESTAMP_FORMS}
     ok(all(forms[k] == v[1] for k, v in FP_RESTAMP_FORMS.items()),
        f"FP_RESTAMP_FORMS each form recorded for this tree is this tree's source (update it with the code): {forms}")
