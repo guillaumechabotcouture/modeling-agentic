@@ -41,13 +41,11 @@ COMPLETES = ("completed", "completed_scope_declared")
 NOT_ACCEPTED = ("completed_gate_not_accepted", "completed_scope_declined", "completed_no_report")
 SIGNED_BY_OWNER = "spec signed by owner"
 SCOPE_ANSWERED = "the owner answered the scope declarations"
-PAUSE_STATES = {"SIGN": "awaiting_signoff", "OWNER_DECISION": "awaiting_scope_signoff",
-                "SPEC": "awaiting_spec_amendment"}
+PAUSE_STATES = {"SIGN": "awaiting_signoff", "OWNER_DECISION": "awaiting_scope_signoff", "SPEC": "awaiting_spec_amendment"}
 REC, INF, NA = "record", "inferred", "unavailable"
 
 
-def F(value, source, note=None) -> dict:
-    """One derived field."""
+def F(value, source, note=None) -> dict:      # one derived field
     return {"value": value, "from": source, **({"note": note} if note else {})}
 
 
@@ -68,8 +66,11 @@ def _read(run_dir: str, rel: str):
         return None, f"{rel}: {type(e).__name__}"
 
 
-def _exists(run_dir: str, rel: str) -> bool:
-    return os.path.lexists(os.path.join(run_dir, rel))
+def _sha(run_dir, rel):
+    try:
+        return hashlib.sha256(safe_io.read_nofollow(run_dir, rel)[0]).hexdigest()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _regular(run_dir: str, rel: str) -> bool:
@@ -82,16 +83,8 @@ def _regular(run_dir: str, rel: str) -> bool:
 
 def _edited_inputs(run_dir: str, prov) -> list[str]:
     """Staged inputs whose bytes no longer match data/inputs_provenance.json (a hand edit, or a removal)."""
-    out = []
-    for dest, e in sorted(_d(_d(prov).get("inputs")).items()):
-        try:
-            data, _ = safe_io.read_nofollow(run_dir, dest)
-            same = hashlib.sha256(data).hexdigest() == _d(e).get("sha256")
-        except Exception:  # noqa: BLE001
-            same = False
-        if not same:
-            out.append(dest)
-    return out
+    return [dest for dest, e in sorted(_d(_d(prov).get("inputs")).items())
+            if _sha(run_dir, dest) != _d(e).get("sha256")]
 
 
 def load_run(run_dir: str) -> dict:
@@ -116,17 +109,16 @@ def load_run(run_dir: str) -> dict:
         if not isinstance(run.get(key), dict):
             run["errors"].append(f"{key}: missing or not a mapping")
     run["report"] = _regular(run_dir, "report.md")
-    run["withheld"] = _exists(run_dir, "report_withheld.md")
+    run["withheld"] = os.path.lexists(os.path.join(run_dir, "report_withheld.md"))
     run["edited_inputs"] = _edited_inputs(run_dir, run.get("prov"))
     return run
 
 
-def _d(x) -> dict:
-    return x if isinstance(x, dict) else {}
-
-
-def _l(x) -> list:
-    return x if isinstance(x, list) else []
+_d = lambda x: x if isinstance(x, dict) else {}       # noqa: E731
+_l = lambda x: x if isinstance(x, list) else []       # noqa: E731
+_iso = lambda t: t.isoformat(timespec="seconds") if t else None                   # noqa: E731
+started = lambda run: utc(_d(run.get("meta")).get("started"), _d(run.get("meta")).get("utc_offset_s"))  # noqa: E731
+_h = lambda a, b: round((b - a).total_seconds() / 3600.0, 4) if a and b else None  # noqa: E731
 
 
 # ------------------------------------------------------------------ time
@@ -145,14 +137,6 @@ def utc(s, offset_s=None):
     return (t - timedelta(seconds=offset_s)).replace(tzinfo=timezone.utc)
 
 
-def _iso(t):
-    return t.isoformat(timespec="seconds") if t else None
-
-
-def _h(a, b):
-    return round((b - a).total_seconds() / 3600.0, 4) if a and b else None
-
-
 def _invocations(run) -> tuple[list, bool]:
     """(UTC times of every invocation, every resume's time computable). The launch itself ends no pause."""
     meta = _d(run.get("meta"))
@@ -161,25 +145,19 @@ def _invocations(run) -> tuple[list, bool]:
     return ts, all(ts[1:])
 
 
-def started(run):
-    meta = _d(run.get("meta"))
-    return utc(meta.get("started"), meta.get("utc_offset_s"))
-
-
 # ------------------------------------------------------------------ completion
 def completion(run, cutoff=None) -> dict:
     """The protocol's class for one (last) run directory: completes / not_accepted / not_completed."""
+    def no(status, note):
+        return {"status": F(status, REC, note), "completes": F(False, REC), "class": "not_completed"}
     if run["errors"]:
-        return {"status": F("unreadable", REC, "; ".join(run["errors"])), "completes": F(False, REC),
-                "class": "not_completed"}
+        return no("unreadable", "; ".join(run["errors"]))
     st, meta = run["st"], run["meta"]
     status = st.get("status") or (f"paused:{st['paused']}" if st.get("paused") else None)
     if not status:
-        return {"status": F("no_status", REC, "run_state.json records no terminal status or pause"),
-                "completes": F(False, REC), "class": "not_completed"}
+        return no("no_status", "run_state.json records no terminal status or pause")
     if st.get("status") and meta.get("status") != st["status"]:
-        return {"status": F("status_mismatch", REC, f"run_state.json {st['status']}, metadata.json "
-                            f"{meta.get('status')}"), "completes": F(False, REC), "class": "not_completed"}
+        return no("status_mismatch", f"run_state.json {st['status']}, metadata.json {meta.get('status')}")
     fin = utc(meta.get("finished"))
     late = cutoff is not None and fin is not None and fin > cutoff
     ok = status in COMPLETES and run["report"] and not run["withheld"] and not late
@@ -359,7 +337,7 @@ def interventions(run_list, cutoff=None, ledger=None, linked=False) -> dict:
     i4 = sum(max(sum(1 for h in _l(_d(r.get("st")).get("history")) if _d(h).get("why") == SCOPE_ANSWERED),
                  int(n > 0)) for r, n in zip(run_list, owner_items))
     raises = sum(1 for h in hist if "budget_raised" in h)
-    hashed = all(_exists(r["dir"], "run_files.sha256.json") for r in run_list)
+    hashed = all(os.path.lexists(os.path.join(r["dir"], "run_files.sha256.json")) for r in run_list)
     if hashed:
         i8 = F(len({p for h in hist for p in _l(h.get("hand_edits"))}), REC)
     else:
@@ -381,13 +359,6 @@ def interventions(run_list, cutoff=None, ledger=None, linked=False) -> dict:
 
 
 # ------------------------------------------------------------------ chains and rows
-def _sha(run_dir, rel):
-    try:
-        return hashlib.sha256(safe_io.read_nofollow(run_dir, rel)[0]).hexdigest()
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def chains(dirs, explicit=None) -> list[list[str]]:
     """Group run dirs into chains: the operator's `explicit` lists first, then metadata.parent_run links. A link
     holds only when the parent's name is unique among the dirs given and, when recorded, its run_state.json sha256
@@ -430,13 +401,11 @@ def chains(dirs, explicit=None) -> list[list[str]]:
 
 def question_key(question) -> str | None:
     """The eval question this run answers, matched on the public evals/<q>/question.txt; None for any other."""
-    q = " ".join(str(question or "").split())
-    for k in sorted(os.listdir(os.path.join(REPO, "evals"))) if os.path.isdir(os.path.join(REPO, "evals")) else []:
-        try:
-            t = " ".join(open(os.path.join(REPO, "evals", k, "question.txt")).read().split())
-        except OSError:
-            continue
-        if q and t and (q == t or q.startswith(t) or t.startswith(q)):
+    q, ev = " ".join(str(question or "").split()), os.path.join(REPO, "evals")
+    for k in sorted(os.listdir(ev)) if os.path.isdir(ev) and q else []:
+        t = " ".join(open(os.path.join(ev, k, "question.txt")).read().split()) if os.path.isfile(
+            os.path.join(ev, k, "question.txt")) else ""
+        if t and (q == t or q.startswith(t) or t.startswith(q)):
             return k
     return None
 
@@ -526,26 +495,20 @@ def rows(dirs, explicit=None, cutoff=None, ledger=None) -> list[dict]:
 
 
 def wave_summary(rs) -> dict:
-    n = len(rs)
+    """Per wave: completed k/n (scope declared apart), median headline interventions, total owner-wait."""
     heads = [r.get("interventions", {}).get("headline", {}).get("value") for r in rs]
     waits = [r.get("owner_wait", {}).get("total_h", {}).get("value") for r in rs]
-    return {"chains": n, "completed": sum(1 for r in rs if r["completes"]["value"]),
-            "scope_declared": sum(1 for r in rs if r["completes"]["value"]
-                                  and r["status"]["value"] == "completed_scope_declared"),
-            "median_interventions": statistics.median([h for h in heads if h is not None]) if any(
-                h is not None for h in heads) else None,
-            "interventions_unavailable": sum(1 for h in heads if h is None),
-            "total_owner_wait_h": round(sum(w for w in waits if w is not None), 4),
-            "owner_wait_unavailable": sum(1 for w in waits if w is None)}
+    hs, done = [h for h in heads if h is not None], [r for r in rs if r["completes"]["value"]]
+    return {"chains": len(rs), "completed": len(done), "median_interventions": statistics.median(hs) if hs else None,
+            "scope_declared": sum(1 for r in done if r["status"]["value"] == "completed_scope_declared"),
+            "interventions_unavailable": len(heads) - len(hs), "owner_wait_unavailable": waits.count(None),
+            "total_owner_wait_h": round(sum(w for w in waits if w is not None), 4)}
 
 
-def _cell(f, fmt=str):
-    if not isinstance(f, dict):
-        return str(f)
-    if f.get("from") == NA:
+def _cell(f):
+    if not isinstance(f, dict) or f.get("from") == NA:
         return "n/a"
-    v = f.get("value")
-    return (fmt(v) if v is not None else "-") + ("~" if f.get("from") == INF else "")
+    return ("-" if f.get("value") is None else str(f["value"])) + ("~" if f.get("from") == INF else "")
 
 
 def table(rs) -> str:
@@ -554,12 +517,11 @@ def table(rs) -> str:
     lines = []
     for r in rs:
         iv, ow = r.get("interventions", {}), r.get("owner_wait", {})
-        wait = _cell(ow.get("total_h", F(None, NA))) + ("*" if ow.get("censored") else "")
-        lines.append([r["label"][:40], _cell(r.get("question", F(None, NA))), _cell(r["status"]),
-                      "Y" if r["completes"]["value"] else "N", _cell(r.get("stop_state", F(None, NA))),
-                      _cell(iv.get("headline", F(None, NA))), _cell(iv.get("owner_decisions", F(None, NA))), wait,
-                      _cell(r.get("autonomous_wall_h", F(None, NA))), _cell(r.get("model_usd", F(None, NA))),
-                      _cell(r.get("rounds", F(None, NA)))])
+        g = [r.get(k) for k in ("question", "status", "stop_state")] + [iv.get("headline"), iv.get("owner_decisions"),
+                                                                       ow.get("total_h")]
+        g = [_cell(x) for x in g] + [_cell(r.get(k)) for k in ("autonomous_wall_h", "model_usd", "rounds")]
+        g[5] += "*" if ow.get("censored") else ""
+        lines.append([r["label"][:40]] + g[:2] + ["Y" if r["completes"]["value"] else "N"] + g[2:])
     w = [max(len(c), *(len(x[i]) for x in lines)) if lines else len(c) for i, c in enumerate(cols)]
     fmt = "  ".join("{:<%d}" % n for n in w)
     s = wave_summary(rs)
@@ -581,11 +543,9 @@ def main(argv=None) -> int:
     if a.self_test:
         return _self_test()
     explicit = [[x for x in c.split(",") if x] for c in a.chain]
-    dirs = list(a.run_dirs) + [d for c in explicit for d in c]
-    if not dirs:
+    if not a.run_dirs and not explicit:
         ap.error("no run directory")
-    ledger = json.load(open(a.ledger)) if a.ledger else None
-    rs = rows(dirs, explicit, a.cutoff, ledger)
+    rs = rows(list(a.run_dirs), explicit, a.cutoff, json.load(open(a.ledger)) if a.ledger else None)
     print(table(rs))
     if a.json:
         with open(a.json, "w") as f:
@@ -600,8 +560,7 @@ def _self_test() -> int:
 
     def ok(c, m):
         print(("PASS " if c else "FAIL ") + m)
-        if not c:
-            fails.append(m)
+        fails.extend([] if c else [m])
     T0 = datetime(2020, 1, 1, 0, 0, tzinfo=timezone.utc)
 
     def at(h):
@@ -633,13 +592,13 @@ def _self_test() -> int:
         ok(r["completes"] == F(True, REC) and r["interventions"]["headline"]["value"] == 0
            and r["owner_wait"]["total_h"]["value"] == 0 and r["autonomous_wall_h"]["value"] == 1.0,
            f"HM1 a completed run with report.md completes, 0 interventions, 1 h autonomous ({r['autonomous_wall_h']})")
-        d = mk(root, "r_wh", {**fin, "status": "completed"}, None, {"report_withheld.md": "x"})
-        ok(summarise([d])["completes"]["value"] is False, "HM2 a withheld report does not complete")
+        ok(summarise([mk(root, "r_wh", {**fin, "status": "completed"}, None, {"report_withheld.md": "x"})])[
+            "completes"]["value"] is False, "HM2 a withheld report does not complete")
         d = mk(root, "r_sd", {**fin, "status": "completed_scope_declared"}, None, {"report.md": "x"})
         r = summarise([d])
         ok(r["completes"]["value"] and wave_summary([r])["scope_declared"] == 1, "HM3 scope declared completes, apart")
-        d = mk(root, "r_none", {"state": "ANALYZE"})
-        ok(summarise([d])["status"]["value"] == "no_status" and not summarise([d])["completes"]["value"],
+        r = summarise([mk(root, "r_none", {"state": "ANALYZE"})])
+        ok(r["status"]["value"] == "no_status" and not r["completes"]["value"],
            "HM4a a run that stopped with no status recorded is not completed (fail closed)")
         d = mk(root, "r_bad", None, None, {"run_state.json": "{not json"})
         r = rows([d, os.path.join(root, "missing")])
@@ -732,8 +691,7 @@ def _self_test() -> int:
         r = rows([d], ledger={"r_geo": {"i9": 2}})
         iv = r[0]["interventions"]
         out = os.path.join(root, "o.json")
-        import contextlib
-        import io
+        import contextlib, io  # noqa: E401
         with contextlib.redirect_stdout(io.StringIO()):
             main([d, "--json", out])
         js = json.load(open(out))
@@ -742,8 +700,7 @@ def _self_test() -> int:
            and all("from" in v for v in js["rows"][0]["interventions"].values() if isinstance(v, dict))
            and "r_geo" in table(r),
            "HM15 geometry approvals by the owner, the operator ledger, JSON fields carry their derivation")
-        d = mk(root, "r_raw", {**fin, "status": "completed"}, {"models": {"deep": "m"}}, {"report.md": "x"})
-        r = summarise([d])
+        r = summarise([mk(root, "r_raw", {**fin, "status": "completed"}, {"models": {"deep": "m"}}, {"report.md": "x"})])
         ok(r["models"] == F({"deep": "m"}, REC) and r["sdk_version"]["from"] == NA,
            "HM16 model ids are read from metadata when recorded, else unavailable")
         ok(utc(local(0)[:-3] + "xx") is None and utc("2020-01-01T01:00:00", 3600) == T0
@@ -777,8 +734,8 @@ def _self_test() -> int:
            f"HM21 a resumed amendment pause re-pauses: two pauses, 4 h ({r['interventions']['I1_pauses']}, "
            f"{r['owner_wait']['total_h']})")
         h = [{"at": at(0), "from": "SPEC", "to": "SIGN"}, {"at": at(3), "from": "SIGN", "to": "EVIDENCE"}]
-        d = mk(root, "r_same", {"history": h, "status": "completed"}, None, {"report.md": "x"}, inv=(0, 3))
-        ok(summarise([d])["interventions"]["I1_pauses"]["value"] == 1,
+        ok(summarise([mk(root, "r_same", {"history": h, "status": "completed"}, None, {"report.md": "x"},
+                         inv=(0, 3))])["interventions"]["I1_pauses"]["value"] == 1,
            "HM22 a resume in the same second as the transition out is still a resume")
         h = [{"at": at(0), "from": "SPEC", "to": "SIGN"}, {"at": at(0.5), "paused": "awaiting_budget", "state": "SIGN"},
              {"at": at(3.5), "from": "SIGN", "to": "EVIDENCE"}]
