@@ -42,6 +42,10 @@ POLICIES = {
 FP_DYNAMIC_IMPORTS = {"engine": ("toolkit/engines", "toolkit/spec/priors.py", "toolkit/spec/toy_engines.py"),
                       "oracle": ("toolkit/engines",),
                       "calibrator": ("toolkit/engines", "toolkit/analysis/calibration.py")}
+# The loaders among this module's functions, each with the kinds for which what it returns is checked to be a class
+# (resolve: the Engine contract). Any other load returns a function or a module the walk does not follow, so the
+# closure is marked not computed (fails closed).
+FP_LOADERS = {"resolve": ("engine",), "attr": (), "module": ()}
 _TEST_MODULES: dict = {k: set() for k in POLICIES}
 # Self-test toy engines that are never allowed in production (ToySpecEngine appends to a call log). Only these
 # references can be enabled, and only by code in a self-test process (allow_test_refs); no file and no environment
@@ -284,7 +288,7 @@ def _self_test() -> int:
     named += [(k, r.split(":")[0]) for k, rs in TEST_ONLY_REFS.items() for r in rs]
     named += [(k, x.rstrip(".")) for k, p in POLICIES.items() for x in p["prefixes"]]
     out = [(k, x) for k, x in named if not inside(k, x)]
-    ok(set(FP_DYNAMIC_IMPORTS) == set(POLICIES) and not out,
+    ok(set(FP_DYNAMIC_IMPORTS) == set(POLICIES) and not out and all(callable(globals().get(f)) for f in FP_LOADERS),
        f"IG-FP every policy's modules are inside its FP_DYNAMIC_IMPORTS paths (outside: {out})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

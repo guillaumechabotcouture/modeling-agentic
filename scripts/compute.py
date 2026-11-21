@@ -2503,6 +2503,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
         print(f"compute: {fn_spec}: code closure not computed ({'; '.join(clo['unresolved'][:3])}): the key "
               "hashes all of scripts/ and toolkit/ too", file=sys.stderr)
         parts["tree"] = _legacy_fingerprint(run_dir, fn_spec, exclude, confined, mtime=False)
+        parts["run_code"] = _run_code_digest(run_dir, confined)     # Codex r2: a run-root module loaded by name
     if extra is not None or extra_digest:
         parts["extra"] = extra_digest or _digest(extra)
     if record is not None:
@@ -2514,6 +2515,28 @@ FP_KEY_VERSION = 2
 # compute.py's own code a row passes through (W0-A): the closure walks from these; FP_DISPATCH_EXEMPT is not followed.
 FP_ROW_ROOTS = ("run_map", "_remote_task", "_local_init", "_local_chunk", "_read_inputs")
 FP_DYNAMIC_IMPORTS = ()     # W0-A: load_fn loads only the closure's root; the rest are exempt or self-tests
+
+
+def _run_code_digest(run_dir: str, confined: bool = False) -> str:
+    """Every Python file under the run dir outside models/ and data/ (those are run_files): what a module named by
+    data could load from the run root, which is on the worker's sys.path. Links are not followed; when `confined`,
+    files are read through no-follow fds (a link raises ValueError, as for run_files)."""
+    h, found = hashlib.sha256(), []
+    for dp, dirs, fns in os.walk(run_dir):
+        rel_dp = os.path.relpath(dp, run_dir)
+        dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git") and not (
+            rel_dp == "." and d in ("models", "data")))
+        found += [os.path.normpath(os.path.join(rel_dp, f)) for f in fns if f.endswith(".py")]
+    for rel in sorted(found):
+        if confined:
+            _hash_confined(h, run_dir, rel, mtime=False)
+            continue
+        h.update(rel.encode() + b"\0")
+        with open(os.path.join(run_dir, rel), "rb") as fh:
+            for block in iter(lambda: fh.read(2**20), b""):
+                h.update(block)
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def _digest(x) -> str:

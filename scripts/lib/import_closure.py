@@ -39,7 +39,7 @@ class _Mod:
         with open(path, encoding="utf-8", errors="surrogateescape") as fh:
             self.tree = ast.parse(fh.read())
         self.path, self.pkg = path, pkg
-        self.defs, self.always, self.binds, self.star = {}, [], {}, []
+        self.defs, self.always, self.binds, self.star, self.top = {}, [], {}, [], []
         for n in self.tree.body:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not n.decorator_list:
                 self.defs.setdefault(n.name, []).append(n)
@@ -56,6 +56,7 @@ class _Mod:
             if _is_main_guard(n):
                 continue                                   # the CLI block never runs on import
             self.always.append(n)
+            self.top += [x for x in ast.walk(n) if isinstance(x, (ast.Import, ast.ImportFrom))]
             for t in ast.walk(n) if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else [n]:
                 for name in _bound(t):
                     self.defs.setdefault(name, []).append(n)
@@ -115,11 +116,11 @@ def _bound(n) -> list[str]:
     return []
 
 
-def _declared(tree):
-    """The file's FP_DYNAMIC_IMPORTS literal, or None when it declares none (or not as a literal of strings)."""
+def _declared(tree, name="FP_DYNAMIC_IMPORTS"):
+    """The file's FP_DYNAMIC_IMPORTS (or `name`) literal, or None when it declares none (or not as a literal of
+    strings). FP_LOADERS ({loader: kinds whose load the loader checks is a class}) has the same {str: paths} form."""
     for n in tree.body:
-        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "FP_DYNAMIC_IMPORTS"
-                                             for t in n.targets):
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in n.targets):
             try:
                 v = ast.literal_eval(n.value)
             except ValueError:
@@ -179,8 +180,9 @@ def _chains(node):
 
 
 class Walk:
-    def __init__(self, repo: str, roots: list[str], opaque: dict | None = None):
+    def __init__(self, repo: str, roots: list[str], opaque: dict | None = None, run_dir: str | None = None):
         self.repo, self.roots, self.opaque = os.path.realpath(repo), roots, opaque or {}
+        self.run_root = os.path.join(os.path.realpath(run_dir), "") if run_dir else None
         self.mods, self.seen, self.files, self.unresolved = {}, set(), set(), set()
 
     def rel(self, p: str) -> str:
@@ -196,6 +198,25 @@ class Walk:
         if len(set(hits)) > 1:
             self.unresolved.add(f"import {name}: found in more than one search root ({len(set(hits))} files)")
         return hits[0] if hits else None
+
+    def decl(self, m: _Mod, name: str = "FP_DYNAMIC_IMPORTS"):
+        """A file's declaration, honoured only in repo code (scripts/, toolkit/) outside the run dir: run code that
+        declares its own dynamic imports is not believed (Codex r2)."""
+        code = any(m.path.startswith(os.path.join(self.repo, d, "")) for d in ("scripts", "toolkit"))
+        return _declared(m.tree, name) if code and not (self.run_root and m.path.startswith(self.run_root)) else None
+
+    def reexports(self, m: _Mod) -> bool:
+        """`from m import *` would bind a name m imports from repo code (a re-export the walk does not follow)."""
+        alls = _declared(m.tree, "__all__")
+        for n in m.top:
+            mod = m._absolute(n) if isinstance(n, ast.ImportFrom) else None
+            for a in n.names:
+                src = mod if isinstance(n, ast.ImportFrom) else a.name
+                name = a.asname or a.name.split(".")[0]
+                if src is None or (src and self.is_repo_top(src.split(".")[0])):
+                    if a.name == "*" or (not name.startswith("_") and (alls is None or name in alls)):
+                        return True
+        return False
 
     def is_repo_top(self, top: str) -> bool:
         return any(os.path.isfile(os.path.join(r, top + ".py")) or os.path.isdir(os.path.join(r, top))
@@ -245,7 +266,7 @@ class Walk:
                     if init:
                         todo.append((init, MODULE))
                 for s in m.star:
-                    self.import_target(m, s, None, todo, whole=True)
+                    self.import_target(m, s, None, todo, whole=True, star=True)
                 nodes = m.always
             else:
                 todo.append((path, MODULE))
@@ -294,7 +315,7 @@ class Walk:
     def node(self, m: _Mod, node, todo: list) -> None:
         line = _dynamic(node, m.binds)
         if line is not None:
-            decl = _declared(m.tree)
+            decl = self.decl(m)
             if decl is None:
                 self.unresolved.add(f"{self.rel(m.path)}:{line}: dynamic import without FP_DYNAMIC_IMPORTS")
             elif not isinstance(decl, dict):
@@ -305,10 +326,17 @@ class Walk:
                 self.import_target(m, lit, None, todo, whole=True)     # the module object is used as a value
             target = self.callee(m, call.func)
             tm = self.mod(target) if target else None
-            decl = _declared(tm.tree) if tm else None
+            decl = self.decl(tm) if tm else None
             if isinstance(decl, dict):
                 a0 = call.args[0] if call.args else None
                 kind = a0.value if isinstance(a0, ast.Constant) and isinstance(a0.value, str) else None
+                f = call.func
+                fname = f.attr if isinstance(f, ast.Attribute) else next(
+                    (a for _, a in m.binds.get(getattr(f, "id", None), ()) if a), getattr(f, "id", None))
+                loaders = self.decl(tm, "FP_LOADERS") or {}
+                if fname in loaders and kind not in loaders[fname]:    # Codex r2: a function, not walked
+                    self.unresolved.add(f"{self.rel(m.path)}:{call.lineno}: {fname}() loads by a data-supplied name "
+                                        f"(a loader with no class check for kind {kind!r}): not followed")
                 self.declared(tm, decl[kind] if kind in decl else tuple(p for ps in decl.values() for p in ps), todo)
         for n in ast.walk(node):                       # an import runs its module's import-time code
             if isinstance(n, ast.Import):
@@ -317,7 +345,7 @@ class Walk:
             elif isinstance(n, ast.ImportFrom):
                 for a in n.names:
                     self.import_target(m, m._absolute(n), None if a.name == "*" else a.name, todo,
-                                       whole=a.name == "*", module_only=a.name != "*")
+                                       whole=a.name == "*", module_only=a.name != "*", star=a.name == "*")
         for chain in _chains(node):
             head = chain[0]
             if head in m.defs:
@@ -325,7 +353,7 @@ class Walk:
             for mod, attr in m.binds.get(head, ()):
                 self.import_target(m, mod, attr, todo, rest=chain[1:])
 
-    def import_target(self, m: _Mod, mod, attr, todo, rest=(), whole=False, module_only=False) -> None:
+    def import_target(self, m: _Mod, mod, attr, todo, rest=(), whole=False, module_only=False, star=False) -> None:
         if mod is None:
             self.unresolved.add(f"{self.rel(m.path)}: relative import outside a package")
             return
@@ -341,6 +369,9 @@ class Walk:
             self.unresolved.add(f"{self.rel(m.path)}: import {mod} not found in the repo")
             return
         nxt = names[used:]
+        tm = self.mod(best) if star else None
+        if tm is not None and self.reexports(tm):        # Codex r2: not followed, so not guessed
+            self.unresolved.add(f"{self.rel(m.path)}: from {mod} import *: {mod} re-exports names it imports")
         if module_only:
             todo.append((best, MODULE))
         elif whole or not nxt or nxt[0].startswith("__"):
@@ -361,7 +392,7 @@ def closure(fn_spec: str, repo: str, run_dir: str | None = None, roots_in: tuple
     fn_file = os.path.realpath(path if os.path.isabs(path) or not run_dir else os.path.join(run_dir, path))
     roots = [os.path.join(repo, "scripts"), os.path.dirname(fn_file)] + (
         [os.path.realpath(run_dir)] if run_dir else []) + [repo]
-    w = Walk(repo, roots, opaque)
+    w = Walk(repo, roots, opaque, run_dir)
     for f, n in [(fn_file, name)] + [(os.path.realpath(f), n) for f, ns in roots_in for n in ns]:
         m = w.mod(f) if os.path.isfile(f) else None
         if m is None or n not in m.defs:
