@@ -35,7 +35,7 @@ _RUN_CODE = ("the run's own model code, loaded by path to execute it (the v1 pip
 # artifact. Counts are exact, so a new site in a reviewed file fails too.
 REVIEWED = {
     "agents/integrity.py": {"spec_from_file_location": (1, _REPO_FILE)},
-    "cloud/run_cluster.py": {"spec_from_file_location": (2, "the operator's cloud config file, and a repo module")},
+    "cloud/run_cluster.py": {"spec_from_file_location": (1, "the operator's cloud config file")},
     "cloud/worker_side.py": {"spec_from_file_location": (1, "a module uploaded by run_cluster.py (repo code)")},
     "scripts/alloc_toolkit_use.py": {"spec_from_file_location": (1, "a string inside its own self-test fixture")},
     "scripts/ask.py": {"__import__": (1, "_sibling(name): sibling script names written in the code")},
@@ -60,7 +60,6 @@ REVIEWED = {
     "scripts/propagate_uncertainty.py": {"__import__": (1, "_sibling(name): sibling script names written in the code"),
                                          "spec_from_file_location": (1, _RUN_CODE)},
     "scripts/render_claims.py": {"spec_from_file_location": (2, _REPO_FILE)},
-    "scripts/replay_coiled.py": {"spec_from_file_location": (3, _REPO_FILE)},
     "scripts/sanity_gate.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/stall_rule.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/validate_critique_yaml.py": {"spec_from_file_location": (8, _REPO_FILE)},
