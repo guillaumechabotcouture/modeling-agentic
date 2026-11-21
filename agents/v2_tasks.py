@@ -45,6 +45,7 @@ class TaskResult:
 class Tasks(Protocol):
     def draft_spec(self, question: str, run_dir: str, feedback: list[str] | None) -> TaskResult: ...
     def sign_spec(self, run_dir: str) -> TaskResult: ...
+    def draft_evidence(self, run_dir: str, rel: str, required: dict, feedback: list) -> TaskResult: ...
     def pick_engine(self, spec: dict, eligible: list[dict], rethink: dict | None = None) -> TaskResult: ...
     def critique(self, run_dir: str, reviewer: str, round_n: int, feedback: list | None = None) -> TaskResult: ...
     def plan_fixes(self, packet: dict) -> TaskResult: ...
@@ -127,6 +128,19 @@ class StubTasks:
         _sio().write_nofollow(run_dir, "decision_spec.signoff.json", json.dumps(
             {"by": "lead", "note": "stub: the spec matches the question"}).encode(), atomic=True)
         return self._r("sign_spec")
+
+    def draft_evidence(self, run_dir, rel, required, feedback):
+        """script["evidence"]: {input key: entry} merged over the scaffolded dossier, or callable(run_dir,
+        feedback) -> that mapping; absent: the task does nothing (the dossier stays as scaffolded)."""
+        ev = self.s.get("evidence")
+        if callable(ev):
+            ev = ev(run_dir, feedback)
+        if isinstance(ev, dict):
+            import yaml
+            doc = yaml.safe_load(_sio().read_nofollow(run_dir, rel)[0]) or {}
+            doc.setdefault("inputs", {}).update(ev)
+            _sio().write_nofollow(run_dir, rel, yaml.safe_dump(doc, sort_keys=False).encode(), atomic=True)
+        return self._r("draft_evidence", note=f"feedback={len(feedback or [])}")
 
     def pick_engine(self, spec, eligible, rethink=None):
         refs = [e["ref"] for e in eligible if e.get("eligible")]
