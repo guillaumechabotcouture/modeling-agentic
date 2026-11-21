@@ -285,6 +285,14 @@ def _self_test() -> int:
         sheet = open(os.path.join(d, SO.SHEET)).read()
         ok("Review conditions" in sheet and "| RC1 |" in sheet and "OPEN" in sheet,
            "RC_SHEET the sign-off sheet lists the row and its open disposition")
+        SO.write_sheet(d)
+        put(d, [dict(row, disposition="deferred", owner="owner", due="2026-12-01")])
+        try:
+            SO.sign(d, "owner", note="n")
+            st = "signed"
+        except ValueError as e:
+            st = f"refused: {e}"
+        ok("stale" in st, f"RC_SHEET_STALE a sheet showing other conditions than the file holds is refused: {st[:120]}")
     with tempfile.TemporaryDirectory() as d:
         schema.toy_spec(d)
         put(d, [dict(row, disposition="adopted", decision_test="DT_missing")])
