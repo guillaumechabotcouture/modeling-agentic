@@ -1951,6 +1951,12 @@ class Machine:
         (harness_record), so the ledger counts them (Codex review of #258 P1-8). No recorded request: it fails closed.
         Under --signoff owner a lead's answer does not count: it waits."""
         import scope_signoff as SS
+        # Codex r4 of #316: the request is read, answered, recorded and closed under the sign-off lock, so an owner's
+        # sign that waited on it finds the request closed (and refuses) instead of reporting an answer never applied
+        with SS.locked(self.run_dir):
+            return self._owner_decision(SS)
+
+    def _owner_decision(self, SS):
         try:
             req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
         except (OSError, ValueError):

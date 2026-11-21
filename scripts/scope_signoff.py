@@ -65,6 +65,7 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import threading
 import os
 import re
 import sys
@@ -272,28 +273,70 @@ def _signer_ok(by, mode: Optional[str], ans: Optional[dict] = None, provisional_
 LOCK = "scope_signoff.lock"
 
 
+_HELD = threading.local()      # {lock path: depth} held by this thread (the lock nests within one thread)
+
+
 class _Locked:
     """An exclusive lock on the run's scope sign-off record, held while it is read and rewritten (Codex r2 of #316,
     P1-4): an owner's answer signed while the harness writes provisional ones is never lost. The lock file is opened
-    with no link followed (lib.safe_io)."""
+    with no link followed (lib.safe_io). It nests within one thread (Codex r4 of #316): the harness holds it across
+    its provisional answers, their record and the request's close, and the calls inside take it again."""
 
     def __init__(self, run_dir: str):
         self.run_dir = run_dir
+        self.key = os.path.realpath(os.path.join(run_dir, LOCK))
+        self.f = None
 
     def __enter__(self):
+        held = _HELD.__dict__.setdefault("depth", {})
+        if held.get(self.key):
+            held[self.key] += 1
+            return self
         import fcntl
         from lib.safe_io import open_append_nofollow
-        self.f = open_append_nofollow(self.run_dir, LOCK)
-        fcntl.flock(self.f, fcntl.LOCK_EX)
+        f = open_append_nofollow(self.run_dir, LOCK)
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except BaseException:
+            f.close()
+            raise
+        self.f = f
+        held[self.key] = 1
         return self
 
     def __exit__(self, *exc):
+        held = _HELD.__dict__.setdefault("depth", {})
+        held[self.key] -= 1
+        if held[self.key]:
+            return False
+        del held[self.key]
         import fcntl
         try:
             fcntl.flock(self.f, fcntl.LOCK_UN)
         finally:
             self.f.close()
         return False
+
+
+def locked(run_dir: str) -> _Locked:
+    """The sign-off lock, for the harness (agents/stage_machine.py OWNER_DECISION)."""
+    return _Locked(run_dir)
+
+
+def lock_held(run_dir: str) -> bool:
+    """Whether some holder has the sign-off lock now (a non-blocking probe from a fresh descriptor)."""
+    import fcntl
+    from lib.safe_io import open_append_nofollow
+    f = open_append_nofollow(run_dir, LOCK)
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    finally:
+        f.close()
 
 
 def load_answers(run_dir: str) -> tuple[dict, list[dict]]:
@@ -504,16 +547,21 @@ def record(run_dir: str, decision: dict, round_n: Optional[int] = None,
             seen.add(it.get("fingerprint"))
             items.append(it)
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    if decision.get("action") == ACTION and items:
-        doc = {"pending": True, "round": round_n, "requested_at": now, "items": items,
-               "decision_rationale": decision.get("rationale"), "producer": producer}
-    else:
-        old = _load_request(run_dir)
-        if not old or not old.get("pending"):
-            return None
-        doc = dict(old, pending=False, superseded_at=now, superseded_by=decision.get("action"))
     from lib.safe_io import write_nofollow    # atomic, no link followed (review round 4, P1-2)
-    with _Locked(run_dir):                    # Codex r3 of #316 (P1-6): a sign in progress finishes first
+    # Codex r3/r4 of #316: the request is read and written under the sign-off lock, so a sign in progress finishes
+    # first, and a close supersedes the request that is current then; a record for an earlier round than the pending
+    # request's (a delayed call) never closes it
+    with _Locked(run_dir):
+        if decision.get("action") == ACTION and items:
+            doc = {"pending": True, "round": round_n, "requested_at": now, "items": items,
+                   "decision_rationale": decision.get("rationale"), "producer": producer}
+        else:
+            old = _load_request(run_dir)
+            if not old or not old.get("pending"):
+                return None
+            if isinstance(round_n, int) and isinstance(old.get("round"), int) and old["round"] > round_n:
+                return None
+            doc = dict(old, pending=False, superseded_at=now, superseded_by=decision.get("action"))
         write_nofollow(run_dir, REQUEST, json.dumps(doc, indent=1).encode(), atomic=True)
     return p
 
