@@ -356,15 +356,18 @@ def run(run_dir: str, jobs: list[dict], engine, out_rel: str = "analysis/batch/r
     import compute
     out = os.path.join(run_dir, out_rel)
     os.makedirs(os.path.dirname(out), exist_ok=True)
+    from toolkit.engines.contract import engine_identity
+    key = {"engine": engine_identity(engine)}      # W0-A: the engine identity is a part of the rows' reuse key
     if not shares_state(engine):
         inputs = [{k: v for k, v in j.items() if k != "id"} for j in jobs]
         rows, summ = compute.run_map(run_dir, os.path.join(ROOT, "toolkit", "analysis", "batch.py") + "::run_job",
-                                     inputs, out, purpose="v2 analysis: engine batch", **kw)
+                                     inputs, out, purpose="v2 analysis: engine batch", key_extra=key, **kw)
     else:
         groups = point_groups([{k: v for k, v in j.items()} for j in jobs])
         pout = os.path.join(os.path.dirname(out), "points.jsonl")
         prow, summ = compute.run_map(run_dir, os.path.join(ROOT, "toolkit", "analysis", "batch.py") + "::run_point",
-                                     groups, pout, purpose="v2 analysis: engine batch (one task per design point)", **kw)
+                                     groups, pout, purpose="v2 analysis: engine batch (one task per design point)",
+                                     key_extra=key, **kw)
         byid = {}
         for g, r in zip(groups, prow):
             if r.get("ok"):
