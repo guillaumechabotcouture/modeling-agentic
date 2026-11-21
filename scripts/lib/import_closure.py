@@ -501,6 +501,23 @@ def _self_test() -> int:
         rj = closure(os.path.join(rd, "models/job.py") + "::run", td, rd)
         ok(any("dynamic import" in u for u in rj["unresolved"]),
            f"IC13 run code cannot declare its own dynamic imports: a non-literal import in it fails closed: {rj}")
+        # Codex r3 (θ)
+        put("toolkit/s/priv.py", "from toolkit.s.impl import score as _score\n__all__ = ['_score']\n")
+        put("toolkit/c/star3.py", "from toolkit.s.priv import *\n\ndef run(p):\n    return _score(p)\n")
+        put("toolkit/c/gstar.py", "from toolkit.g.guard import *\n\ndef run(p):\n    return resolve('calibrator', p['r'])\n")
+        put("toolkit/g/reexp.py", "from toolkit.g.guard import attr as fetch\n")
+        put("toolkit/c/gvia.py", "from toolkit.g.reexp import fetch\n\ndef run(p):\n    return fetch('oracle', p['m'], p['n'])\n")
+        s3, gs, gv = (closure(os.path.join(td, f"toolkit/c/{n}.py") + "::run", td) for n in ("star3", "gstar", "gvia"))
+        ok(any("re-exports" in u for u in s3["unresolved"]) and gs["unresolved"]
+           and any("loader" in u for u in gv["unresolved"]),
+           f"IC14 a private name in __all__, a star import of a loader's module and a loader re-exported under another "
+           f"name all fail closed: {s3['unresolved']} {gs['unresolved']} {gv['unresolved']}")
+        put("tools/weights.py", "W = 1\n")
+        put("run/models/job2.py", "import importlib\nFP_DYNAMIC_IMPORTS = ('tools/weights.py',)\n\ndef run(p):\n"
+            "    return importlib.import_module(p['m']).W\n")
+        r2 = closure(os.path.join(rd, "models/job2.py") + "::run", td, rd)
+        ok(r2["unresolved"] and "tools/weights.py" in r2["files"],
+           f"IC15 run code's own declaration is not believed, but the files it names stay in the closure: {r2}")
     print(f"{'OK: all self-test cases passed.' if not fails else f'FAILED: {len(fails)}'}")
     return 1 if fails else 0
 

@@ -4060,6 +4060,20 @@ def _self_test_w0a(ok) -> None:
             ok(p0.get("computed") == 2 and p1.get("computed") == 2 and "run_code" in (p1.get("key_parts") or {}),
                f"FP_UNRESOLVED_RUN_ROOT a run-root module loaded by name from run code: editing it recomputes "
                f"({p1.get('computed')} computed, parts {sorted(p1.get('key_parts') or {})})")
+            # Codex r3: a run-root package reached through a directory link; a dangling link is not an error
+            w("v1/__init__.py", "", rd)
+            w("v1/score.py", "X = 1\n", rd)
+            w("v2/__init__.py", "", rd)
+            w("v2/score.py", "X = 2\n", rd)
+            os.symlink("v1", os.path.join(rd, "plugins"))
+            os.symlink("gone.py", os.path.join(rd, "obsolete.py"))
+            k1 = _run_code_digest(rd)
+            os.remove(os.path.join(rd, "plugins"))
+            os.symlink("v2", os.path.join(rd, "plugins"))
+            ok(k1 != _run_code_digest(rd), "FP_RUN_CODE_LINKS retargeting a linked run-root package changes run_code "
+                                           "(a dangling link is hashed as missing, not raised)")
+            for x in ("plugins", "obsolete.py"):
+                os.remove(os.path.join(rd, x))
             # large files: content, never mtime
             with mock.patch.dict(g, {"_FP_HASH_MB": 0}):
                 k0 = code_fingerprint(rd, os.path.join(repo, "job.py::f"))
