@@ -473,7 +473,8 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
         if raw is None or state is None:
             out.append(f"{rel}: run_state.json is missing or unreadable in the code to launch")
             continue
-        if state in PRE_SIGN_STATES:                        # a draft: nothing is signed yet
+        if state in PRE_SIGN_STATES or (state == "EVIDENCE" and not any(       # a draft: nothing is signed yet
+                _archive_member(code, f"{rel}/{f}") is not None for f in SIGNOFF_RECORDS)):
             continue
         if st.get("signoff") == "none":     # nobody signs: the same rule as the runtime gate (coverage, no record)
             out += [f"{rel}: {p}" for p in _preconditions(code, rel, "unsigned")]
@@ -557,7 +558,8 @@ def _preconditions(code: bytes, rel: str, signer: str) -> list[str]:
 SIGNOFF_RECORDS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # toolkit/spec/signoff.py, decision_brief
 
 
-PRE_SIGN_STATES = ("SPEC",)          # agents/stage_machine.py EDGES: the only state before SIGN (a draft)
+PRE_SIGN_STATES = ("SPEC",)          # agents/stage_machine.py EDGES: always before SIGN (a draft); EVIDENCE is before SIGN
+# too (v2 autonomy 1B-ii) unless a sign-off record exists: a run signed under the earlier order (SIGN, then EVIDENCE)
 
 
 def _signoff_record(code: bytes, rel: str) -> tuple:
@@ -4877,6 +4879,16 @@ def _self_test_sheet(ok) -> None:
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
     ok(fresh == [] and signed == [] and norun == [],
        f"RC80a a fresh sheet, a run past SIGN and a launch with no resumed run pass: {fresh} {signed} {norun}")
+    # RC80e (v2 autonomy 1B-ii): EVIDENCE now runs before SIGN, so a run there with no sign-off record is a draft;
+    # one with a record (signed under the earlier order) is checked as signed
+    ev_draft = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("EVIDENCE"),
+                                            f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+    ev_signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("EVIDENCE"),
+                                             f"{R}/decision_spec.yaml": b"spec: 2\n",
+                                             f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
+    ok(ev_draft == [] and ev_signed,
+       f"RC80e a run at EVIDENCE with no sign-off is a draft; one signed under the earlier order is checked "
+       f"({ev_draft}; {ev_signed})")
     ok(len(stale) == 1 and "spec" in stale[0] and "signoff.py sheet" in stale[0] and "--write" in stale[0]
        and len(stale_rec) == 1
        and "derivation" in stale_rec[0],

@@ -67,8 +67,30 @@ defaults). Declare the calibration target's frame (the population band it measur
 differs from the engine output it is compared with, the mapping. A prior goes on an engine
 parameter, never on a unit attribute bound to data. Note what each derivation does in
 data/README.md. Every file the spec cites is a staged input or a derived output; paths are relative
-to the run directory. Output: decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml,
-the scripts, and {out} = {{"ok": true, "notes": "..."}}.""",
+to the run directory. When the options use a component whose effect depends on decision inputs
+(each engine's decision_inputs.yaml), name the evidence dossier: `evidence: {{dossier:
+evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Output:
+decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
+{{"ok": true, "notes": "..."}}.""",
+    "draft_evidence": COMMON + """
+
+Task: complete the evidence dossier {dossier} for decision_spec.yaml (the owner or the lead signs both next). {out_in} lists the
+decision inputs the spec's options need (what each one drives, the options that use it, and each
+engine's directory: read its card.yaml, priors.yaml, decision_inputs.yaml and notes). The schema is
+the docstring of {schema}; the check that the sign-off runs is its check(). The harness has already
+written, for each input, what execution uses (model_value, model_source) and the engine's value as
+`chosen` (with the generated range test for a drawn parameter), each text starting "harness
+scaffold". Keep model_value and model_source. For each input write the evidence: `observations`,
+each from a source you have read in this session (a staged input under data/inputs/, the engine's
+card or priors and the studies they cite), with `where` naming the file you read it in and the table
+or page ("<path>: <table>"), or a web address the source itself gives; or `no_data` with the reason
+and the borrowing rule when you have no measurement. Never cite a source you have not read, and never
+guess a year, a sample size or a value: when you do not have them, write no_data. Write
+`comparison` (how the observations compare with model_value on the same estimand). Keep `chosen`
+unless the evidence says otherwise; a changed range needs a decision_test the spec runs that covers
+it. The harness checks the file and declares in the report every input with no data, every chosen
+value that differs from what execution uses, every value left at the engine's, and every source it
+cannot locate. Output: {dossier} and {out} = {{"ok": true, "notes": "..."}}.""",
     "pick_engine": COMMON + """
 
 Task: choose the engine. {out_in} lists the registered engines, which are eligible, and why the
@@ -222,7 +244,9 @@ PROMPTS["seed_world_model"] = seed_prompt_text().replace("{", "{{").replace("}",
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
         "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",),
-        "seed_world_model": (SEED_FILE,), "draft_evidence": ()}
+        "seed_world_model": (SEED_FILE,),
+        # v2 autonomy 1B-ii: the dossier the spec names (draft_evidence(rel=...)); this is the default name
+        "draft_evidence": ("evidence_dossier.yaml",)}
 
 
 SEED_RUN_READABLE = ("_task_input.json", SEED_FILE)
@@ -538,6 +562,17 @@ class SdkTasks:
             settings=_settings_text(), skill=os.path.join(R, ".claude", "skills", "decision-spec", "SKILL.md"),
             schema=os.path.join(R, "toolkit", "spec", "schema.py"), example=os.path.join(R, "spike", "decision_spec.v2.yaml"),
             repo=R, out=OUT), p, OWNS["draft_spec"])
+
+    def draft_evidence(self, run_dir, rel, required, feedback):
+        """v2 autonomy 1B-ii (D1): fill the evidence of the dossier the harness scaffolded. The task owns that one
+        file (the spec names it; a harness file is refused by _allowed whatever the spec says)."""
+        inp = self._input(required)
+        p = ("Complete the evidence dossier." + ("\n\nThe harness's check of the dossier as it is now (fix every one):"
+                                                 "\n- " + "\n- ".join(map(str, feedback[:40])) if feedback else ""))
+        return self._session("draft_evidence", PROMPTS["draft_evidence"].format(
+            dossier=rel, out_in=inp, out=OUT,
+            schema=os.path.join(enforcement.REPO_ROOT, "toolkit", "spec", "evidence_dossier.py")), p,
+            OWNS["draft_evidence"] if rel == OWNS["draft_evidence"][0] else ())    # never another file the spec names
 
     def sign_spec(self, run_dir):
         _sio().write_nofollow(run_dir, "decision_spec.signoff.json", json.dumps(

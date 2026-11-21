@@ -47,14 +47,17 @@ STATE_FILE = "run_state.json"
 SIGNOFF_FILE = "decision_spec.signoff.json"
 SCOPE_SIGNOFF = "scope_signoff.json"      # Phase 49 β (PR #85)
 SIGNOFF_SHEET = "decision_spec.signoff_sheet.md"   # v2-derived-inputs: what signing accepts beyond the spec's text
-STATES = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE",
+STATES = ("SPEC", "EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE",
           "GATE", "FIX_LOOP", "OWNER_DECISION", "WRITE", "PRESENTATION", "FINAL")
 # The state table: every transition the machine may take. A transition outside it is a bug
 # (raised, never taken).
 EDGES = {
-    "SPEC": {"SIGN", "SPEC", "FINAL"},
-    "SIGN": {"EVIDENCE", "SIGN"},
-    "EVIDENCE": {"ENGINE_CHOICE"},
+    # v2 autonomy 1B-ii (D1): EVIDENCE drafts the evidence dossier before SIGN, so the signer sees it. EVIDENCE ->
+    # ENGINE_CHOICE is a run signed under the earlier order (SIGN before EVIDENCE) resumed; SIGN -> EVIDENCE | SPEC is
+    # the lead's repair of a refused sign-off (at most MAX_SIGN_REPAIRS), before any signature exists.
+    "SPEC": {"EVIDENCE", "SPEC", "FINAL"},
+    "EVIDENCE": {"SIGN", "SPEC", "ENGINE_CHOICE", "FINAL"},
+    "SIGN": {"ENGINE_CHOICE", "EVIDENCE", "SPEC", "SIGN"},
     "ENGINE_CHOICE": {"PREREGISTER", "CONFIGURE", "FINAL"},
     # The world model (docs/design/v2c-orchestration.md §14): beliefs anchored before the engine batch, scored after
     # the analysis. Fail soft: neither state can end the run or change what the analysis computes.
@@ -92,7 +95,7 @@ class AwaitingBudget(Exception):
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
-MAX_SIGN_REPAIRS = 2
+MAX_SIGN_REPAIRS = 2          # a refused lead sign-off goes back to EVIDENCE or SPEC at most this often, then waits
 
 
 @dataclass
@@ -1478,7 +1481,7 @@ class Machine:
             self.st.tries["spec_feedback"] = errs
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
-        return self._go("SIGN", "spec drafted and valid")
+        return self._go("EVIDENCE", "spec drafted and valid")
 
     def _derive(self, rd: str | None = None) -> list[str]:
         """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
@@ -1497,13 +1500,13 @@ class Machine:
     def h_SIGN(self):
         mode = self.st.signoff
         if mode == "none":
-            return self._go("EVIDENCE", "sign-off not required (--signoff none)")
+            return self._go("ENGINE_CHOICE", "sign-off not required (--signoff none)")
         by = self._signed_by()
         # A HIGH geometry finding the spec proposes as an exception is the owner's to approve (review of #131, P1):
         # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
         pend = self._geometry_owner_pending()
         if by and (mode == "lead" or by == "owner") and not pend:
-            return self._go("EVIDENCE", f"spec signed by {by}")
+            return self._go("ENGINE_CHOICE", f"spec signed by {by}")
         if pend:
             how = ("python3 toolkit/spec/geometry.py approve" if by else "python3 agents/stage_machine.py sign")
             self.log(f"[machine] {len(pend)} HIGH geometry exception(s) wait for the owner ({', '.join(pend[:4])}): "
@@ -1516,21 +1519,102 @@ class Machine:
                     from lib.safe_io import remove_nofollow
                     remove_nofollow(self.run_dir, SIGNOFF_FILE)   # the lead's note; B writes its own record
                 try:
-                    self._sign("lead", note)              # the harness records the hash
-                    return self._go("EVIDENCE", "spec signed by the lead")
+                    self._sign("lead", (note + " " + self._evidence_note()).strip())   # the harness records the hash
+                    return self._go("ENGINE_CHOICE", "spec signed by the lead")
                 except ValueError as e:
                     self.log(f"[machine] the spec could not be signed: {e}")
+                    back = self._sign_repair(str(e))
+                    if back:
+                        return back
         self.st.paused = "awaiting_signoff"
         self.st.status = None
         save_state(self.run_dir, self.st)
         self.log(f"[machine] waiting for the owner: python3 agents/stage_machine.py sign {self.run_dir} --by owner")
         return "SIGN"
 
+    def _sign_repair(self, why: str) -> str | None:
+        """v2 autonomy 1B-ii: a refused lead sign-off goes back with the refusal as feedback, to EVIDENCE when the
+        evidence dossier is what was refused, else to SPEC (one more draft allowed), at most MAX_SIGN_REPAIRS times;
+        then the run waits for the owner. The check is not loosened: the next SIGN runs it again on the files."""
+        n = self.st.tries.get("sign_repair", 0)
+        if n >= MAX_SIGN_REPAIRS:
+            return None
+        self.st.tries["sign_repair"] = n + 1
+        if "evidence dossier" in why:
+            self.st.tries["evidence_feedback"] = [why[:2000]]
+            return self._go("EVIDENCE", f"sign-off refused (evidence dossier): repair {n + 1} of {MAX_SIGN_REPAIRS}")
+        self.st.tries["spec_feedback"] = [why[:2000]]
+        self.st.tries["spec"] = min(self.st.tries.get("spec", 0), MAX_SPEC_TRIES - 1)
+        return self._go("SPEC", f"sign-off refused: repair {n + 1} of {MAX_SIGN_REPAIRS}")
+
+    def _evidence_note(self) -> str:
+        """The evidence stage's declared gaps, for the lead's sign-off note (counts; the record holds the inputs)."""
+        from toolkit.spec import evidence_draft as EDR
+        rec = EDR.read_record(self.run_dir) or {}
+        if rec.get("status") in (None, "not_required"):
+            return ""
+        g = rec.get("gaps") if isinstance(rec.get("gaps"), dict) else {}
+        parts = ", ".join(f"{len(g[k])} {k}" for k, _ in EDR.GAP_TEXT if g.get(k))
+        return (f"Evidence dossier {'drafted by a run task' if rec.get('drafted_by_task') else 'supplied'}: "
+                f"{len(rec.get('required') or [])} input(s); provisional, not reviewed by the owner; gaps declared in "
+                f"{EDR.RECORD}" + (f" ({parts})." if parts else "."))
+
     def h_EVIDENCE(self):
-        # Stub (workstream V5): every parameter is an assumption until the evidence service checks it.
-        _put(self.run_dir, "evidence/registry.yaml", "# evidence service stub (v2 C): no parameter has been fetched or "
+        """v2 autonomy 1B-ii (D1): the evidence dossier, before SIGN. No decision inputs needed: a pass with no task.
+        Otherwise the harness scaffolds each missing entry with what execution uses (toolkit/spec/evidence_draft.py)
+        and the bounded draft_evidence task fills the evidence, at most EDR.MAX_TRIES times in the run, each time with
+        the signer's check's problems; then the record (evidence/dossier_draft.json) and the sign-off sheet, which
+        binds the dossier's sha256. A spec signed under the earlier order (SIGN before EVIDENCE) is left as signed."""
+        from toolkit.spec import evidence_draft as EDR
+        rd = self.run_dir
+        # the evidence service's registry (workstream V5), still a stub: the run console reads it
+        _put(rd, "evidence/registry.yaml", "# evidence service stub (v2 C): no parameter has been fetched or "
              "matched yet\nstatus: stub\nentries: []\n")
-        return self._go("ENGINE_CHOICE", "evidence stub")
+        if spec_signed_once(rd):
+            return self._go("ENGINE_CHOICE", "evidence: the spec was signed before this stage (earlier order); the "
+                                             "dossier stays as signed")
+
+        def spec_back(probs):
+            self.st.tries["spec_feedback"] = probs
+            return self._go("SPEC", "evidence: " + "; ".join(probs)[:200])
+        try:
+            raw = EDR._spec(rd)
+            a = EDR.assess(rd, raw)
+            if a["spec_problems"]:
+                return spec_back(a["spec_problems"])
+            sc = EDR.scaffold(rd, a, raw)["scaffold"] if a["needed"] else {}
+        except Exception as e:  # noqa: BLE001 -- fail closed: back to the draft, whose tries are bounded
+            return spec_back([f"the evidence stage could not read the spec or the dossier: {type(e).__name__}: {e}"])
+        notes = []
+        fb = self.st.tries.pop("evidence_feedback", None) or []
+        if a["needed"]:
+            a = EDR.assess(rd, raw)
+            if a["problems"] and not a.get("draftable"):
+                notes.append(f"the spec names {a['rel']}: only {EDR.ED.DOSSIER_FILE} is drafted in the run")
+            while a["problems"] and a.get("draftable") and self.st.tries.get("evidence", 0) < EDR.MAX_TRIES:
+                n = self.st.tries.get("evidence", 0)
+                res = self._task(f"EVIDENCE#{self._visit()}:try{n + 1}", "draft_evidence", rd, a["rel"],
+                                 EDR.packet(a), fb + a["problems"])
+                self.st.tries["evidence"] = n + 1
+                if res is None:
+                    return self._budget_out("EVIDENCE")
+                notes.append(f"try {n + 1}: " + (res.note if res.ok else f"failed: {res.note}")[:200])
+                fb = []
+                try:
+                    EDR.scaffold(rd, a, raw)            # an entry the task dropped is scaffolded again
+                    a = EDR.assess(rd, raw)
+                except Exception as e:  # noqa: BLE001 -- the task left a dossier the harness cannot read
+                    a = dict(a, problems=[f"the dossier cannot be read: {type(e).__name__}: {e}"])
+        rec = EDR.finish(rd, a, sc, self.st.tries.get("evidence", 0), raw, notes)
+        if a["needed"]:
+            try:
+                self._write_sheet(rd)        # the sheet records the dossier's sha256: written after the dossier
+            except Exception as e:  # noqa: BLE001 -- SIGN refuses without a current sheet, and says so
+                self.log(f"[machine] the sign-off sheet could not be written: {type(e).__name__}: {e}")
+        if rec["status"] == "incomplete":
+            self.log(f"[machine] the evidence dossier still has {len(a['problems'])} problem(s) after "
+                     f"{rec['tries']} draft(s): see {EDR.RECORD}")
+        return self._go("SIGN", f"evidence: {rec['status']} ({len(rec['required'])} input(s))")
 
     def h_ENGINE_CHOICE(self):
         try:
@@ -2125,6 +2209,14 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
                   f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
+    try:            # v2 autonomy 1B-ii: who drafted and signed the evidence dossier, and its declared gaps
+        from toolkit.spec import evidence_draft as EDR
+        so = _signoff(run_dir) or {}
+        eb = EDR.report_block(run_dir, so.get("signed_by") or so.get("by"))
+    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the block could not be rendered
+        eb = ["## Evidence dossier", "", f"Could not be rendered from the evidence record: {type(e).__name__}.", ""]
+    if eb:
+        lines += [""] + eb[:-1]
     wmp = os.path.join(run_dir, "world_model", "world_model.md")    # §14: rendered by the harness from score.json
     try:
         if os.path.isfile(wmp) and not os.path.islink(wmp):

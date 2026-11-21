@@ -42,63 +42,184 @@ SPEC = "decision_spec.yaml"
 
 
 def _spec(run_dir: str) -> dict:
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    import yaml
+    from lib.safe_io import read_nofollow
+    raw = yaml.safe_load(read_nofollow(run_dir, SPEC)[0].decode("utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{SPEC} is not a mapping")
+    return raw
 
 
 def _doc(data: bytes | None) -> dict:
     """The dossier's `inputs` mapping, or {} for an absent or malformed file (the check names the fault)."""
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    import yaml
+    try:
+        d = yaml.safe_load(data.decode("utf-8")) if data is not None else None
+    except (ValueError, UnicodeDecodeError, yaml.YAMLError):
+        return {}
+    ins = d.get("inputs") if isinstance(d, dict) else None
+    return ins if isinstance(ins, dict) else {}
 
 
 def assess(run_dir: str, raw: dict | None = None) -> dict:
     """{needed, rel, required, spec_problems, problems}: spec_problems go back to the spec draft (a component the
     engines cannot resolve, or a spec that needs a dossier and names none); problems are the dossier's own (coverage
     and validity, the signer's check). Reads the files every call."""
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    raw = _spec(run_dir) if raw is None else raw
+    req, probs = ED.required_inputs(raw, run_dir)
+    rel = ED.dossier_reference(raw)
+    if "evidence" in raw and rel is None:
+        probs = probs + ["evidence: name the dossier file ({dossier: evidence_dossier.yaml})"]
+    if req and rel is None:
+        probs = probs + [f"the options need {len(req)} decision input(s) ({', '.join(sorted(req)[:8])}): name the "
+                         f"evidence dossier in the spec (evidence: {{dossier: {ED.DOSSIER_FILE}}}); the harness "
+                         "drafts it after the spec"]
+    # only the default file at the run root is drafted in the run: a spec (an agent's draft) naming another path,
+    # e.g. a file another task owns, never has it written by the scaffold or the evidence task
+    out = {"needed": bool(req) or rel is not None, "rel": rel, "required": req, "spec_problems": probs,
+           "problems": [], "draftable": rel == ED.DOSSIER_FILE}
+    if rel and not probs:
+        out["data"] = ED.read_dossier(run_dir, rel)
+        out["problems"] = ED.check(raw, out["data"], req, rel, run_dir)
+    return out
 
 
 def packet(a: dict) -> dict:
     """The draft_evidence task's input: each required input (kind, name, why, used by, the engines and their
     directories, whose card, priors and declarations it reads) and the dossier's path."""
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    req = {}
+    for k, r in sorted(a["required"].items()):
+        refs = sorted({e[0] for e in r.get("engines") or []})
+        req[k] = {"kind": r.get("kind"), "name": r.get("name"), "why": r.get("why"), "used_by": r.get("used_by"),
+                  "engines": {ref: ED._engine_dir(ref) for ref in refs}}
+    return {"dossier": a["rel"], "required": req}
 
 
 def _range(x) -> bool:
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    return isinstance(x, list) and len(x) == 2 and all(ED._num(v) for v in x)
 
 
 def scaffold_entry(r: dict, raw: dict, run_dir: str, memo: dict) -> dict:
     """What execution uses for one required input, as a dossier entry without its evidence: model_value and
     model_source, and the card default as `chosen` (a range only with a test the runner generates for it, or one the
     run calibrates). Empty when execution's value cannot be computed: the task writes the whole entry."""
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    x, how = ED._execution_view(r, raw, run_dir, memo)
+    if x is None:
+        return {}
+    ref, cfg = (r.get("engines") or [(None, {})])[0]
+    e = {"model_value": x, "model_source": f"{SCAFFOLD}: {how} ({ref})"}
+    rule = f"{SCAFFOLD}: the engine's value as execution uses it ({how}); replace it when the evidence says otherwise"
+    if _range(x):
+        gen = None
+        if ED._calibrated_by_run(r, raw) is None and r["kind"] == "parameter":
+            gen = ED._exec_context(ref, cfg, memo, raw, run_dir)["generated"].get(r["name"])
+            gen = gen if isinstance(gen, str) and gen.startswith(("prior_range_", "fitted_range_")) else None
+        if gen or ED._calibrated_by_run(r, raw) is not None:
+            e["chosen"] = {"range": list(x), "rule": rule}
+            if gen:
+                e["decision_test"] = gen
+    elif not (isinstance(x, dict) and set(x) == {"min", "median", "max"}):
+        e["chosen"] = {"value": x, "rule": rule}
+    return e
 
 
 def scaffold(run_dir: str, a: dict, raw: dict | None = None) -> dict:
     """Add a scaffolded entry for every required input the dossier lacks; entries already there (the task's or the
     owner's) are kept as they are. Writes the dossier (atomic, no link followed) only when an entry was added.
     Returns {"added": [keys], "scaffold": {key: entry}} (the scaffold of every required input, for finish())."""
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    import yaml
+    from lib.safe_io import write_nofollow
+    raw = _spec(run_dir) if raw is None else raw
+    memo: dict = {}
+    sc = {}
+    for k in sorted(a["required"]):
+        try:
+            sc[k] = scaffold_entry(a["required"][k], raw, run_dir, memo)
+        except Exception:  # noqa: BLE001 -- not computed: the task writes the entry, the check still refuses a blank
+            sc[k] = {}
+    if not a.get("draftable"):
+        return {"added": [], "scaffold": sc}
+    data = ED.read_dossier(run_dir, a["rel"])
+    try:
+        doc = yaml.safe_load(data.decode("utf-8")) if data is not None else None
+    except (ValueError, UnicodeDecodeError, yaml.YAMLError):
+        doc = None
+    if data is not None and not (isinstance(doc, dict) and isinstance(doc.get("inputs", {}), dict)):
+        return {"added": [], "scaffold": sc}          # a file the task broke: left for it to repair, with the error
+    doc = doc if isinstance(doc, dict) else {}
+    ins = doc.setdefault("inputs", {}) or {}
+    doc["inputs"] = ins
+    added = [k for k in sorted(a["required"]) if k not in ins]
+    for k in added:
+        ins[k] = sc[k]
+    if added:
+        write_nofollow(run_dir, a["rel"], yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode(),
+                       atomic=True)
+    return {"added": added, "scaffold": sc}
 
 
 def _where_found(where, run_dir: str) -> str:
     """found | url | unchecked: whether an observation's `where` names a file the harness can see (run-relative, or in
     the repository), a web address it does not open, or anything else (a table name, a citation)."""
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    if not isinstance(where, str) or not where.strip():
+        return "unchecked"
+    w = where.strip()
+    if w.lower().startswith(("http://", "https://", "doi:")):
+        return "url"
+    head = w.split("#")[0].split(": ")[0].split(" ")[0].strip()
+    for base in (run_dir, ROOT):
+        p = os.path.realpath(os.path.join(base, head))
+        if head and ".." not in head.split("/") and p.startswith(os.path.realpath(base) + os.sep) and os.path.isfile(p):
+            return "found"
+    return "unchecked"
 
 
 def gaps(raw: dict, run_dir: str, data: bytes | None, req: dict, sc: dict) -> dict:
     """The declared gaps: {no_data, differs, default_kept, sources_unchecked}, each a sorted list of input keys."""
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    ins = _doc(data)
+    adv = ED.advise(raw, run_dir, data)
+    out = {"no_data": [], "differs": sorted(k for k, v in adv.items() if v.get("differs") is True),
+           "default_kept": [], "sources_unchecked": []}
+    for k in sorted(req):
+        e = ins.get(k) if isinstance(ins.get(k), dict) else {}
+        if e.get("no_data") not in (None, {}):
+            out["no_data"].append(k)
+        ch = e.get("chosen")
+        if isinstance(ch, dict) and str(ch.get("rule", "")).startswith(SCAFFOLD) and ch == (sc.get(k) or {}).get("chosen"):
+            out["default_kept"].append(k)
+        obs = e.get("observations") if isinstance(e.get("observations"), list) else []
+        if any(_where_found(o.get("where") if isinstance(o, dict) else None, run_dir) != "found" for o in obs):
+            out["sources_unchecked"].append(k)
+    return out
 
 
 def finish(run_dir: str, a: dict, sc: dict, tries: int, raw: dict | None = None, notes: list | None = None) -> dict:
     """Write evidence/dossier_draft.json from the files as they are now and return it."""
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    from lib.safe_io import write_nofollow
+    raw = _spec(run_dir) if raw is None else raw
+    rec = {"status": "not_required" if not a["needed"] else ("complete" if not a["problems"] else "incomplete"),
+           "dossier": a["rel"], "required": sorted(a["required"]), "tries": tries,
+           "drafted_by_task": tries > 0, "problems": list(a["problems"])[:40], "notes": list(notes or [])[:10]}
+    if a["needed"] and a["rel"]:
+        data = ED.read_dossier(run_dir, a["rel"])
+        rec["dossier_sha256"] = ED.sha(data)
+        try:
+            rec["gaps"] = gaps(raw, run_dir, data, a["required"], sc)
+        except Exception as e:  # noqa: BLE001 -- recorded, never a silent pass: the record says it could not
+            rec["gaps"] = {"error": f"{type(e).__name__}: {e}"[:300]}
+    write_nofollow(run_dir, RECORD, json.dumps(rec, indent=1, default=str).encode(), atomic=True)
+    return rec
 
 
 def read_record(run_dir: str) -> dict | None:
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    from lib.safe_io import read_nofollow
+    try:
+        d = json.loads(read_nofollow(run_dir, RECORD)[0].decode("utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {"status": "unreadable"}
+    return d if isinstance(d, dict) else {"status": "unreadable"}
 
 
 GAP_TEXT = (("no_data", "No field or trial data; a value borrowed by the entry's stated rule"),
@@ -112,7 +233,27 @@ GAP_TEXT = (("no_data", "No field or trial data; a value borrowed by the entry's
 def report_block(run_dir: str, signed_by: str | None) -> list[str]:
     """The report's evidence section, from the record: who drafted and who signed the dossier and every declared gap.
     Empty when the run needed no dossier."""
-    raise NotImplementedError("v2 autonomy 1B-ii β")
+    rec = read_record(run_dir)
+    if rec is None or rec.get("status") == "not_required":
+        return []
+    lines = ["## Evidence dossier (rendered by the harness from evidence/dossier_draft.json)", ""]
+    if rec.get("status") == "unreadable":
+        return lines + ["The evidence-stage record could not be read.", ""]
+    who = "drafted by a run task" if rec.get("drafted_by_task") else "supplied with the run"
+    lines.append(f"- {len(rec.get('required') or [])} decision input(s); the dossier was {who} and signed by "
+                 f"{('the ' + signed_by) if signed_by else 'nobody (--signoff none)'}.")
+    if signed_by != "owner":
+        lines.append("- **Provisional:** no one outside the run reviewed this evidence; the owner's review and "
+                     "sign-off are still to come.")
+    g = rec.get("gaps") if isinstance(rec.get("gaps"), dict) else {}
+    if "error" in g:
+        lines.append(f"- The gaps could not be computed: {g['error']}")
+    for k, text in GAP_TEXT:
+        if g.get(k):
+            lines.append(f"- {text}: {', '.join(map(str, g[k]))}.")
+    if rec.get("problems"):
+        lines.append(f"- Problems left when the stage ended: {len(rec['problems'])} (see the record).")
+    return lines + [""]
 
 
 # ----------------------------------------------------------------------------------------------- self-test

@@ -138,6 +138,12 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     a difference never blocks signing. Signing binds every file the run reads (the spec, the
     files it names, the dossier and the engine's files), so any later change makes the run
     stale. Give observations as a list.
+    In a v2 run the spec only names the dossier: the EVIDENCE stage, after the spec and
+    before sign-off, scaffolds each entry with what execution uses and a bounded task fills
+    the evidence (`toolkit/spec/evidence_draft.py`); the record
+    `evidence/dossier_draft.json` and the report declare every input with no data, every
+    chosen value that differs from execution, every value left at the engine's and every
+    source the harness could not locate.
 
 ## Closed-population epidemic questions (the compartmental engine)
 
