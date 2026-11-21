@@ -68,6 +68,7 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
         if not cov:
             raise ValueError("analysis.stability.covariates: emulator inversion needs covariates to predict held-out units")
         Xall = np.array([[float(A.by_id[i][c]) for c in cov] for i in A.ids])
+        zlo, zhi = A.spec["calibration"]["range"]
         y = np.array([z0[i] for i in A.ids])
     folds, pairs = [], []
     for gv in groups:
@@ -75,7 +76,7 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
         if m.all():
             continue
         hid = [i for i, k in zip(A.ids, m) if k]
-        theta = A.theta0
+        theta, nclamp = A.theta0, 0
         if A.method == "emulator_inversion":
             # units flagged by the joint calibration (calibration.joint.unmatched: flag) carry no calibrated value:
             # they never inform the prediction of a held-out unit, nor the covariate scaling (Codex r6 P1-3)
@@ -91,24 +92,27 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
             beta = np.linalg.solve(Xs[tr].T @ Xs[tr] + lam, Xs[tr].T @ y[tr])
             zh = dict(z0)
             for i, k in zip(A.ids, m):
-                if k:
-                    zh[i] = float(Xs[A.ids.index(i)] @ beta)
+                if k:      # 1C-b 2c-i: kept inside calibration.range (the emulator's design box) and counted
+                    raw = float(Xs[A.ids.index(i)] @ beta)
+                    zh[i] = min(max(raw, float(zlo)), float(zhi))
+                    nclamp += zh[i] != raw
             oh, bh, ch = A.evaluate(theta, zh, hid)
             ben_f = dict(ben0)
             ben_f.update(bh)
             cost_f = merge_costs(cost0, ch)
-        elif A.method == "likelihood":
+        elif A.method in ("likelihood", "posterior"):
             rows = [r for r in C.read_targets(A.spec) if r["unit"] not in set(hid)]
-            fit = C.fit_likelihood(A.spec, A.model, rows=rows, fixed_z={i: z0[i] for i in hid},
-                                   start={**{p: A.lik["x"][p] for p in A.lik["params"]},
-                                          **{f"z:{u}": A.lik["z"][u] for u in A.lik["z"] if u not in hid}},
-                                   identifiability=False)
-            theta = dict(A.theta0, **fit["theta"])
-            zh = dict(fit["z"], **{i: z0[i] for i in hid})
-            _, ben_f, cost_f = A.evaluate(theta, zh)
-        elif A.method == "posterior":
-            rows = [r for r in C.read_targets(A.spec) if r["unit"] not in set(hid)]
-            fit = C.fit_posterior_panel(A.spec, A.model, rows=rows, fixed_z={i: z0[i] for i in hid}, sample_it=False)
+            try:
+                fit = (C.fit_likelihood(A.spec, A.model, rows=rows, fixed_z={i: z0[i] for i in hid},
+                                        start={**{p: A.lik["x"][p] for p in A.lik["params"]},
+                                               **{f"z:{u}": A.lik["z"][u] for u in A.lik["z"] if u not in hid}},
+                                        identifiability=False) if A.method == "likelihood" else
+                       C.fit_posterior_panel(A.spec, A.model, rows=rows, fixed_z={i: z0[i] for i in hid},
+                                             sample_it=False))
+            except C.CalibrationRefused as e:     # 1C-b 2c-ii: one refused refit is that fold's result, not a crash
+                folds.append({"group": gv, "status": "not_run", "n_units": len(hid),
+                              "reason": f"the calibration without the held-out units was refused ({e})"})
+                continue
             theta = dict(A.theta0, **fit["theta"])
             zh = dict(fit["z"], **{i: z0[i] for i in hid})
             _, ben_f, cost_f = A.evaluate(theta, zh)
@@ -128,7 +132,7 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
         pairs += [(plan[i], pf[i]) for i in hid]
         # F6 S1-5: what moves under the fold (regret: the fold's re-optimised objective minus the point plan's there)
         folds.append({**MV.summarise(A, plan, pf, ben_f, cost_f, sol["objective"]),
-                      "group": gv, "n_units": len(hid), "rank_corr": rho,
+                      "group": gv, "n_units": len(hid), "rank_corr": rho, "predictions_clamped": int(nclamp),
                       "package_concordance_pct": 100.0 * np.mean([plan[i] == pf[i] for i in hid]),
                       "benefit_gap_pct": 100.0 * (b_full - b_fold) / b_full if b_full > 0 else 0.0,
                       "total_benefit_loss_pct": 100.0 * (tot_full - tot_fold) / tot_full if tot_full > 0 else 0.0,
@@ -163,7 +167,10 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
     vv = ("NOT_RUN" if w is None else "ROBUST" if w <= th["value_loss_pct_robust"] else
           "FRAGILE" if w <= th["value_loss_pct_fragile"] else "UNSTABLE")
     return {"method": f"leave-one-{g}-out", "holdout_group": g, "calibration_method": A.method,
-            "n_folds": len(folds), "folds": folds, "folds_not_run": skipped, "metrics": met, "verdict": verdict, "value_verdict": vv,
+            "n_folds": len(folds), "folds": folds, "folds_not_run": skipped, "metrics": met, "verdict": verdict,
+            "value_verdict": vv,
+            # 1C-b 2c-i: held-out predictions moved to the nearer end of calibration.range, over the folds that ran
+            "predictions_clamped": sum(f["predictions_clamped"] for f in folds),
             # each held-out unit's package in its own fold against the point plan, per component (F6 S1-5)
             "components": MV.component_stability(A.pk, pairs, list(A.spec["options"]["components"])) if pairs else None,
             "value_thresholds_pct": th, "headline_metric": "total_benefit_loss_pct_worst_fold"}

@@ -571,6 +571,10 @@ def render_md(run_dir: str) -> str:
     for i, it in enumerate(req.get("items") or [], 1):
         lines += [f"## {i}. `{it.get('finding')}`", "", f"Why it bears on the decision: {it.get('reason')}", "",
                   f"Gate finding: {it.get('claim')}", ""]
+        if it.get("fix_requires"):
+            lines += [f"Required remedy: {it['fix_requires']}", ""]
+        if it.get("options"):            # W0-F: a held-out target's options, a refit with its estimated cost
+            lines += ["Options:", ""] + [f"- {o}" for o in it["options"]] + [""]
         if not it.get("declarations"):
             lines += ["Not declared in scope_declaration.yaml, and **untested**.", ""]
         for dcl in it.get("declarations") or []:
