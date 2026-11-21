@@ -195,6 +195,19 @@ def check_inputs(q, private_dir=None, data_dir=DATA) -> list[str]:
     return sorted(n for n in set(fresh) | set(committed) if fresh.get(n) != committed.get(n))
 
 
+def stale_answer_keys(root, questions, data_dir=DATA) -> list[str]:
+    """Questions whose stored answer key was not generated from the committed inputs. `publish` refuses them: the
+    manifest it writes carries these hashes, and `run` checks a launch against the manifest alone (Codex r1)."""
+    out = []
+    for q in questions:
+        t = _read_json(os.path.join(root, q, "_truth", "truth.json"))
+        d = os.path.join(data_dir, q)
+        current = digest_dir(d) if os.path.isdir(d) else {}
+        if not isinstance(t, dict) or not current or t.get("inputs_sha256") != current:
+            out.append(f"{q}: the stored answer key's input hashes differ from data/evals/{q}/ (run generate)")
+    return out
+
+
 def ensure_truth(q, private_dir=None, data_dir=DATA) -> dict:
     """The answer key for the committed inputs; regenerated (inside the hidden tree) when
     missing or stale. Refuses when the generator no longer reproduces the committed
@@ -1063,12 +1076,19 @@ def leak_problems(repo=REPO) -> list[str]:
     return probs
 
 
+TAG_RE = r"[a-z0-9][a-z0-9-]{0,19}"   # it names the cluster (cloud/configs/_eval.py checks the same)
+
+
 def launch_commands(questions, tag, reps, tree=None, pipeline="v2") -> list[str]:
+    import shlex
     if pipeline in pipeline_id.RETIRED:
         raise ValueError(pipeline_id.RETIRED_MESSAGE)
     if pipeline not in pipeline_id.PIPELINES:
         raise ValueError(f"pipeline must be one of {pipeline_id.PIPELINES}")
-    env = f"EVAL_TAG={tag} EVAL_REPS={reps} EVAL_PIPELINE={pipeline}" + (f" EVAL_TREE={tree}" if tree else "")
+    if not re.fullmatch(TAG_RE, str(tag)) or not isinstance(reps, int) or reps < 1:
+        raise ValueError(f"tag {tag!r} must be 1-20 of a-z, 0-9 and -, and reps a positive integer")
+    env = (f"EVAL_TAG={tag} EVAL_REPS={reps} EVAL_PIPELINE={pipeline}"
+           + (f" EVAL_TREE={shlex.quote(tree)}" if tree else ""))
     return [f"{env} python3 cloud/run_cluster.py cloud/configs/eval_{q}.py launch" for q in questions]
 
 
@@ -1241,6 +1261,8 @@ def main(argv=None) -> int:
     pu.add_argument("--new-key", action="store_true", help="generate a new key and store it in the keychain")
     args = ap.parse_args(argv)
     private = getattr(args, "private_dir", None) or args.private_dir_top
+    if args.self_test and args.cmd:
+        ap.error("--self-test takes no command")
     if args.self_test:
         return _self_test(args.with_private, private)
     try:
@@ -1294,10 +1316,11 @@ def _run_command(ap, args, private) -> int:
         src = os.path.abspath(args.private_dir)
         pin = eval_private.read_pin() or {}
         version = args.version or int(pin.get("version", 0)) + 1
-        with use_private(src):   # every current answer key must match the committed inputs
+        with use_private(src) as root:   # every current answer key must match the committed inputs
             stale = {q: check_inputs(q) for q in suite_questions()}
-        if any(stale.values()):
-            print(f"refusing: committed inputs differ from the generators: {stale}")
+            keys = stale_answer_keys(root, suite_questions())
+        if any(stale.values()) or keys:
+            print(f"refusing: committed inputs differ from the generators: {stale}; {keys}")
             return 1
         if args.new_key:
             key = eval_private.new_key()
@@ -1342,9 +1365,22 @@ def _run_command(ap, args, private) -> int:
             print("refusing: run never opens the hidden half (owner 2026-11-21); it checks the pinned bundle by "
                   "digest only, so it takes no --private-dir")
             return 2
+        if not args.tree and os.environ.get("EVAL_TREE"):   # the printed command would launch that tree, unchecked
+            print("refusing: EVAL_TREE is set in this shell; pass the tree as --tree so the preflight checks the "
+                  "tree the launch ships")
+            return 2
+        if not re.fullmatch(TAG_RE, args.tag) or args.reps < 1:
+            print(f"refusing: --tag {args.tag!r} must be 1-20 of a-z, 0-9 and - (it names the cluster), "
+                  f"--reps at least 1")
+            return 2
         qs = args.questions or suite_questions()
         tree = launch_tree(args.tree, qs[0], args.pipeline)
-        manifest = eval_private.verify_public(eval_private.default_store(), eval_private.read_pin())   # no key
+        pin = eval_private.read_pin()
+        manifest = eval_private.verify_public(eval_private.default_store(), pin)   # by digest; no key
+        if isinstance(pin, dict) and "manifest_sha256" not in pin:
+            print("note: evals/private.yaml predates manifest_sha256, so the manifest's input hashes are bound to the "
+                  "pinned ciphertext's digest, size and version only; grading re-checks them against the decrypted "
+                  "answer keys (the next publish pins the manifest too)")
         probs = leak_problems(tree)
         probs += input_problems(tree, qs, manifest)   # the shipped tree's archived inputs, not this checkout's
         if probs:

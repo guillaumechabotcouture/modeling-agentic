@@ -37,6 +37,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -240,8 +241,22 @@ def read_pin(path=PIN_PATH) -> dict | None:
     return pin if isinstance(pin, dict) else None
 
 
+def _pin_problem(pin) -> str | None:
+    """Why a pin cannot name a bundle, or None. `manifest_sha256` may be absent (a pin from before it was written),
+    but when present it must be a sha256."""
+    if not isinstance(pin, dict) or not pin.get("prefix") or not pin.get("bundle_sha256") or "version" not in pin:
+        return "no evals/private.yaml naming the bundle (run publish)"
+    if "manifest_sha256" in pin and not (isinstance(pin["manifest_sha256"], str)
+                                         and re.fullmatch(r"[0-9a-f]{64}", pin["manifest_sha256"])):
+        return f"evals/private.yaml: manifest_sha256 {pin['manifest_sha256']!r} is not a sha256"
+    return None
+
+
 def write_pin(pin: dict, path=PIN_PATH) -> None:
     import yaml
+    prob = _pin_problem(pin)
+    if prob:
+        raise BundleError("bundle_not_pinned", f"refusing to write the pin: {prob}")
     with open(path, "w") as f:
         f.write("# Phase 50 α: where the eval suite's encrypted hidden half lives (evals/README.md).\n"
                 "# Written by `scripts/eval_suite.py publish`; nothing here is secret.\n")
@@ -253,8 +268,9 @@ def _download_verified(store, pin) -> tuple[dict, bytes]:
     """(manifest, ciphertext) of the pinned bundle, every check that needs no key done: the ciphertext hashes to
     the manifest and the pin, the manifest's other fields match them, and, when the pin records it, the manifest
     hashes to `manifest_sha256`. Neither decrypts nor reads the keychain."""
-    if not isinstance(pin, dict) or not pin.get("prefix") or not pin.get("bundle_sha256"):
-        raise BundleError("bundle_not_pinned", "no evals/private.yaml naming the bundle (run publish)")
+    prob = _pin_problem(pin)
+    if prob:
+        raise BundleError("bundle_not_pinned", prob)
     got = {}
     with tempfile.TemporaryDirectory() as td:
         for name in ("manifest.json", "bundle.enc"):
@@ -265,7 +281,7 @@ def _download_verified(store, pin) -> tuple[dict, bytes]:
                 raise BundleError("bundle_missing", f"{pin['prefix']}/{name} is not in storage") from e
             with open(p, "rb") as f:
                 got[name] = f.read()
-    if pin.get("manifest_sha256") and _sha(got["manifest.json"]) != pin["manifest_sha256"]:
+    if "manifest_sha256" in pin and _sha(got["manifest.json"]) != pin["manifest_sha256"]:
         raise BundleError("bundle_hash_mismatch", f"manifest {_sha(got['manifest.json'])[:12]}, "
                                                   f"pin {str(pin['manifest_sha256'])[:12]}")
     try:
