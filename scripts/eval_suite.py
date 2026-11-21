@@ -1917,6 +1917,33 @@ def _test_s20_run_never_decrypts(ok, td):
         rc, out = run(pin, "--private-dir", os.path.join(td, "elsewhere"))
         ok(rc != 0 and "eval_toy.py launch" not in out and not calls,
            f"S20d run takes no hidden tree (no --private-dir): {rc} {calls} {out[-300:]!r}")
+        # Codex r1: an explicit but empty manifest digest is not "absent"; a question the manifest lacks refuses;
+        # an inherited EVAL_TREE (which the printed command would launch) must not differ from the checked tree;
+        # a tag that is not a plain name never reaches the shell
+        rc, out = run(dict(pin, manifest_sha256=None))
+        ok(rc != 0 and "eval_toy.py launch" not in out, f"S20g a null manifest_sha256 fails closed: {rc} {out[-200:]!r}")
+        ev_old = os.environ.get("EVAL_TREE")
+        os.environ["EVAL_TREE"] = os.path.join(td, "other")
+        try:
+            ep.default_store, ep.read_pin = (lambda: store), (lambda path=None: pin)
+            out_ = io.StringIO()
+            with contextlib.redirect_stdout(out_):
+                rc = main(["run", "toy"])
+            ok(rc != 0 and "eval_toy.py launch" not in out_.getvalue() and "EVAL_TREE" in out_.getvalue(),
+               f"S20h an inherited EVAL_TREE without --tree refuses: {rc} {out_.getvalue()[-200:]!r}")
+        finally:
+            os.environ.pop("EVAL_TREE", None)
+            if ev_old is not None:
+                os.environ["EVAL_TREE"] = ev_old
+        rc, out = run(pin, "--tag", "x;rm -rf ~")
+        ok(rc != 0 and "eval_toy.py launch" not in out, f"S20i a tag that is not a plain name refuses: {rc}")
+        missing = {"questions": {}, "legacy": {}}
+        ok(any("no input hashes" in p for p in input_problems(tree, ["toy"], missing))
+           and any("no input hashes" in p for p in input_problems(tree, ["toy"], {"questions": {"toy": {}}})),
+           "S20j a question the manifest lacks, or lists with no inputs, refuses")
+        ok(stale_answer_keys(priv, ["toy"], os.path.dirname(os.path.dirname(csv_path))) == []
+           and stale_answer_keys(priv, ["toy"], os.path.join(td, "nodata")) != [],
+           "S20k publish's check: each stored answer key's input hashes must equal the committed inputs")
         with open(csv_path, "w") as f:
             f.write("u,v\n1,3\n")
         subprocess.run(git + ["commit", "-qam", "changed"], check=True)

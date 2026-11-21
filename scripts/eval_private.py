@@ -429,6 +429,12 @@ def _self_test() -> int:
                 expect_error("bundle_not_pinned", lambda: verify_public(store, None), "E10c no pin fails closed")
                 expect_error("bundle_hash_mismatch", lambda: verify_public(store, dict(pin, manifest_sha256="0" * 64)),
                              "E10d a manifest that does not hash to the pin's manifest_sha256 fails closed")
+                for bad_digest in (None, "", "zz"):   # Codex r1: present but not a digest is not "absent"
+                    expect_error("bundle_not_pinned", lambda: verify_public(store, dict(pin, manifest_sha256=bad_digest)),
+                                 f"E10g a manifest_sha256 of {bad_digest!r} fails closed")
+                expect_error("bundle_not_pinned", lambda: write_pin({"version": 1}, os.path.join(td, "pin.yaml")),
+                             "E10h write_pin refuses a pin without its required fields")
+                ok(not os.path.exists(os.path.join(td, "pin.yaml")), "E10h nothing written")
                 ok(not touched, f"E10e no case decrypted or read the keychain: {touched}")
             finally:
                 g.update(real)
