@@ -45,6 +45,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from toolkit.alloc import packages as apackages  # noqa: E402
+from toolkit.analysis.core import auxiliary  # noqa: E402
 
 PRODUCER = "toolkit/analysis/variants.py"
 TYPES = ("minimum_service", "group_rule", "fixed_plan")
@@ -336,7 +337,8 @@ def solved_plans(A, ben0, cost0) -> dict:
         if v["type"] == "fixed_plan":
             continue
         try:
-            out[v["id"]] = dict(A.solve(ben0, cost0, feas=feasibility(A, v)[1])["choice"])
+            with auxiliary(A, "plan_variants"):
+                out[v["id"]] = dict(A.solve(ben0, cost0, feas=feasibility(A, v)[1])["choice"])
         except (ValueError, RuntimeError):
             continue
     return out
@@ -351,7 +353,7 @@ def same_spend(A, vid, fp, fo, spend, ben0, cost0, feas, events, out=None) -> di
     error raises."""
     from toolkit.analysis import moves as MV
     try:
-        s = A.solve(ben0, cost0, budget=spend, feas=feas)
+        s = A.solve(ben0, cost0, budget=spend, feas=feas)      # a strict solve (1C-c leaves it so; Codex r1 P1-4, P1-5)
     except RuntimeError as e:
         if "infeasible" not in str(e):
             raise
@@ -496,7 +498,8 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None, outcomes=N
             continue
         try:
             _a, feas = feasibility(A, v)
-            sol = A.solve(ben0, cost0, feas=feas)
+            with auxiliary(A, "plan_variants"):      # the same problem solved_plans() solved: its kept result
+                sol = A.solve(ben0, cost0, feas=feas)
         except (ValueError, RuntimeError) as e:      # the rule or the budget leaves no feasible plan
             out["variants"].append(dict(rec, status="not_solved", reason=str(e)))
             continue
@@ -737,6 +740,23 @@ def _self_test_fixed(ok, attempt):
        f"PV31 a solved variant's cost is counted against the budget in each draw and judged against the spec's rule; "
        f"a given plan is reported, not judged ({e8!r}, {e9!r}, {e10!r}, {a8.get('draws_over_budget')} of "
        f"{a8.get('draws')} over, rule_met {a8.get('rule_met')!r})")
+    # Codex r1 P1-4, P1-5: the same-spend optimum stays a strict solve. "Not solved" there means the plan breaks the
+    # signed constraints, and a feasible incumbent could sit below the given plan itself
+    from toolkit.analysis import core as CO
+    orig_s, p8 = A.solve, A.solve(ben, cost)["choice"]
+
+    def no_spend(ben_, cost_, budget=None, feas=None):
+        if budget is not None:
+            raise CO.SolveFailed("no_feasible_found")
+        return orig_s(ben_, cost_, budget=budget, feas=feas)
+    try:
+        A.solve = no_spend
+        r36, e36 = attempt(run, A, ben, cost, p8, [], D2, {"level": 0.9})
+        ok(isinstance(e36, CO.SolveFailed) and e36.status == "no_feasible_found" and getattr(A, "aux", None) is None,
+           f"PV35 a same-spend optimum the solver cannot prove still stops the step, outside any auxiliary context "
+           f"({e36!r}, {r36 is None})")
+    finally:
+        A.solve = orig_s
     A.budget = 1.0
     sp9, e11 = attempt(g_("solved_plans"), A, ben, cost)
     A.budget = 2.0
