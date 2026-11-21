@@ -204,6 +204,28 @@ def _boundary(run_dir: str, data, point) -> list[dict]:
     return BD.findings(data, point, expect)
 
 
+def _solver(man: dict) -> list[dict]:
+    """1C-c (decision D3): the manifest's solver record (core.Analysis.solver_report). Auxiliary solves that returned
+    no usable plan are recorded where they occur (a fold or test not run, a variant or envelope not solved); above
+    `aux_not_solved_share_max` of all auxiliary solves they are a finding. A record that cannot be read is one too;
+    a manifest without the record (a run from before it existed) is not."""
+    sv = man.get("solver")
+    if sv is None:
+        return []
+    try:
+        tot = sv["auxiliary_total"]
+        n, bad, lim = int(tot["solves"]), int(tot["not_solved"]), float(sv["aux_not_solved_share_max"])
+        if not (0 <= bad <= n and 0 <= lim <= 1):       # also a NaN share: fail closed
+            raise ValueError("counts or share out of range")
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return [_f("analysis_solver_degraded", f"{MANIFEST}: the solver record cannot be read", "solver")]
+    if n > 0 and bad / n > lim:
+        return [_f("analysis_solver_degraded", f"{bad} of {n} auxiliary solves (uncertainty draws, folds, tests, "
+                   f"variants, frontier) returned no plan proven within the stated gap, above the share {lim:g}: the "
+                   "items they belong to are recorded as not run or not solved", "solver")]
+    return []
+
+
 def _survey_changes(run_dir: str, data) -> list[dict]:
     try:
         raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
@@ -449,6 +471,7 @@ def _gate_findings(run_dir: str) -> list[dict]:
         out += _boundary(run_dir, bd_doc, pt_doc)
         out += _value_of_information(run_dir, unc_doc, voi_doc)
     out += _decision_tests(run_dir, man)
+    out += _solver(man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
     return out

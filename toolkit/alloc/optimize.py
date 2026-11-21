@@ -39,7 +39,8 @@ API:
         refuses them (no bound holds).
         Returns {"choice": {unit: package}, "objective", "cost", "status",
         "method", "seconds", "cap_use": {name: use}, ...}; status is
-        "optimal" (proven), "feasible" (ILP stopped early), "heuristic",
+        "optimal" (proven, within `gap_rel` when one is given), "feasible" (ILP stopped
+        early; `gap` then holds its proven distance from the LP relaxation's bound), "heuristic",
         "infeasible" (exact methods: no allocation satisfies the constraints)
         or "no_feasible_found" (greedy).
     benchmark(..., primary="ilp", run_dir=None | out=None, sweep_budgets=None)
@@ -51,8 +52,9 @@ API:
 
 Methods:
 - ilp: PuLP + CBC (PuLP is pinned in requirements.txt), binary x[unit,package],
-  one package per unit, budget and caps, relative gap 0, time limit; status
-  "optimal" only when CBC proves it.
+  one package per unit, budget and caps, relative gap 0 unless the caller states
+  `gap_rel` (recorded in the result with `threads`), time limit; status "optimal"
+  only when CBC proves it within that gap. The benchmark always runs at gap 0.
 - greedy: the multiple-choice knapsack heuristic: start each unit at its
   cheapest feasible package, take steps along each unit's upper convex hull
   of (cost, benefit) in order of incremental benefit per incremental cost
@@ -320,7 +322,24 @@ def _result(method, us, opts, choice, status, t0, names, **extra):
     return r
 
 
-def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None):
+def _relaxation_gap(pulp, prob, time_limit):
+    """(bound - objective) / bound for an ILP that stopped before proving its gap, on the solver's own objective (each
+    unit's gain over its least-benefit option). The bound is the LP relaxation's optimum, which is never below the
+    integer optimum, so the plan's true gap is no larger. None when the relaxation is not solved to optimality or
+    its bound is not positive (no gap can be stated)."""
+    inc = pulp.value(prob.objective)
+    for v in prob.variables():
+        v.cat = pulp.LpContinuous
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit))
+    bound = pulp.value(prob.objective)
+    if prob.status != pulp.LpStatusOptimal or inc is None or bound is None:
+        return None
+    if bound <= inc:
+        return 0.0
+    return float((bound - inc) / bound) if bound > 0 else None
+
+
+def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None, gap_rel=0.0, threads=None):
     pulp = _pulp()
     if pulp is None:
         raise ImportError("method ilp needs PuLP (requirements.txt pins PuLP==3.3.0)")
@@ -357,20 +376,26 @@ def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None):
                 for lab, yv in y.items():
                     prob += pulp.lpSum(x[i, j] for j in range(len(opts[u]))
                                        if L["class"][u][opts[u][j][0]] == lab) == yv
-    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit, gapRel=0.0, gapAbs=0.0))
+    nt = max(1, int(threads or 1))
+    prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit, gapRel=float(gap_rel), gapAbs=0.0,
+                                 **({"threads": nt} if nt > 1 else {})))
     sol = prob.sol_status
+    # 1C-c: the tolerance the status was proven within, and (set below) a stopped solve's own proven gap
+    rec = {"solver_status": pulp.LpStatus[prob.status], "gap_rel": float(gap_rel), "threads": nt, "gap": None}
     if sol == pulp.LpSolutionInfeasible or prob.status == pulp.LpStatusInfeasible:
-        return _result("ilp", us, opts, None, "infeasible", t0, names, solver_status=pulp.LpStatus[prob.status])
+        return _result("ilp", us, opts, None, "infeasible", t0, names, **rec)
     if sol not in (pulp.LpSolutionOptimal, pulp.LpSolutionIntegerFeasible):
-        return _result("ilp", us, opts, None, "no_feasible_found", t0, names, solver_status=pulp.LpStatus[prob.status])
+        return _result("ilp", us, opts, None, "no_feasible_found", t0, names, **rec)
     choice = {}
     for i, u in enumerate(us):
         on = [j for j in range(len(opts[u])) if (x[i, j].value() or 0) > 0.5]
         if len(on) != 1:
             raise OptimizerError(f"ilp: unit {u} has {len(on)} packages selected in the solver's solution")
         choice[u] = opts[u][on[0]][0]
+    if sol != pulp.LpSolutionOptimal:
+        rec["gap"] = _relaxation_gap(pulp, prob, time_limit)
     return _result("ilp", us, opts, choice, "optimal" if sol == pulp.LpSolutionOptimal else "feasible", t0, names,
-                   solver_status=pulp.LpStatus[prob.status])
+                   **rec)
 
 
 def _hull(o, start):
@@ -497,7 +522,7 @@ def _brute(us, opts, caps, names, blim, cmax, limit, links=None):
 
 
 def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=300, brute_limit=2_000_000,
-          links=None):
+          links=None, gap_rel=0.0, threads=None):
     if method not in METHOD_NAMES:
         raise ValueError(f"method must be one of {', '.join(METHOD_NAMES)}")
     lk = _links(feasible, links)
@@ -513,7 +538,7 @@ def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=3
         r = _result(method, us, opts, None, "infeasible" if method in EXACT else "no_feasible_found", time.time(),
                     names, bound=None)
     elif method == "ilp":
-        r = _ilp(us, opts, caps, names, blim, cmax, time_limit, lk)
+        r = _ilp(us, opts, caps, names, blim, cmax, time_limit, lk, gap_rel, threads)
     elif method == "greedy":
         r = _greedy(us, opts, caps, names, blim, cmax)
     else:

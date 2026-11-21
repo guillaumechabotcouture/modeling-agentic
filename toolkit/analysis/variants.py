@@ -45,6 +45,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from toolkit.alloc import packages as apackages  # noqa: E402
+from toolkit.analysis.core import auxiliary  # noqa: E402
 
 PRODUCER = "toolkit/analysis/variants.py"
 TYPES = ("minimum_service", "group_rule", "fixed_plan")
@@ -336,7 +337,8 @@ def solved_plans(A, ben0, cost0) -> dict:
         if v["type"] == "fixed_plan":
             continue
         try:
-            out[v["id"]] = dict(A.solve(ben0, cost0, feas=feasibility(A, v)[1])["choice"])
+            with auxiliary(A, "plan_variants"):
+                out[v["id"]] = dict(A.solve(ben0, cost0, feas=feasibility(A, v)[1])["choice"])
         except (ValueError, RuntimeError):
             continue
     return out
@@ -351,9 +353,10 @@ def same_spend(A, vid, fp, fo, spend, ben0, cost0, feas, events, out=None) -> di
     error raises."""
     from toolkit.analysis import moves as MV
     try:
-        s = A.solve(ben0, cost0, budget=spend, feas=feas)
+        with auxiliary(A, "plan_variants"):
+            s = A.solve(ben0, cost0, budget=spend, feas=feas)
     except RuntimeError as e:
-        if "infeasible" not in str(e):
+        if "infeasible" not in str(e) and getattr(e, "status", None) is None:      # 1C-c: SolveFailed is recorded
             raise
         return {"status": "not_solved", "budget": spend, "reason": str(e)}
     sp, so = dict(s["choice"]), float(s["objective"])
@@ -496,7 +499,8 @@ def run(A, ben0, cost0, plan, events=None, draws=None, interval=None, outcomes=N
             continue
         try:
             _a, feas = feasibility(A, v)
-            sol = A.solve(ben0, cost0, feas=feas)
+            with auxiliary(A, "plan_variants"):      # the same problem solved_plans() solved: its kept result
+                sol = A.solve(ben0, cost0, feas=feas)
         except (ValueError, RuntimeError) as e:      # the rule or the budget leaves no feasible plan
             out["variants"].append(dict(rec, status="not_solved", reason=str(e)))
             continue

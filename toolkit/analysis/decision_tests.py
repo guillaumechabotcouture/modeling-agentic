@@ -1121,9 +1121,15 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     A_ = A
     for n_, ((v, ben, cost, budget, feas), low) in enumerate(zip(cases, lowers)):
         A = arms[n_] if t == "unit_attribute" else A_
+        from toolkit.analysis.core import auxiliary
         try:
-            sol = A.solve(ben, cost, budget=budget, feas=feas)
+            with auxiliary(A, "decision_tests"):
+                sol = A.solve(ben, cost, budget=budget, feas=feas)
         except RuntimeError as e:
+            if getattr(e, "status", "infeasible") != "infeasible":      # 1C-c (D3): not a stop, and not a proof
+                return _not_run(A, dt, f"at {v} the solver returned no plan it could prove within the stated gap "
+                                       f"(status {e.status}); nothing is proven about that case",
+                                {"cost_multipliers": dict(mult)} if t == "cost_items" else None)
             if t == "boundary_engine" and str(e).strip() == "optimizer status infeasible":     # #252 review P2-5
                 return _not_run(A, dt, "with the engine's costs at the boundary units no allocation that meets the "
                                        "constraints fits the budget the plan is solved within (the solver proves it infeasible)")

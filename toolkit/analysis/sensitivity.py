@@ -95,7 +95,9 @@ def run(A, z0, ben0, cost0, plan, obj0) -> dict:
 
 
 def _end(A, v, ben, cost, plan) -> dict:
-    sol = A.solve(ben, cost)
+    from toolkit.analysis.core import auxiliary
+    with auxiliary(A, "sensitivity"):      # 1C-c: a feasible plan within the stated gap is used and counted
+        sol = A.solve(ben, cost)
     A.guard(f"sensitivity at {v}", [plan, sol["choice"]])
     spent = sum(cost[i][plan[i]] for i in A.ids)
     from toolkit.analysis import moves as MV      # F6 S1-5: what moves, and which criterion changes the plan

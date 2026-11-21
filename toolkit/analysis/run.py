@@ -332,7 +332,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # Codex r3: the analysis's full engine identity (code, params, config), on both evaluation paths, so later steps
     # (the trajectory step) can be checked against it without batch rows
     point.update(engine_identity=engine_identity(eng))
-    point.update(plan=plan, n_units=len(A.ids), solver={k: sol[k] for k in ("status", "method", "objective", "cost")},
+    point.update(plan=plan, n_units=len(A.ids),
+                 # 1C-c (D3): the status and the relative gap it was proven within, with the threads and time limit
+                 solver={**{k: sol[k] for k in ("status", "method", "objective", "cost")},
+                         **{k: sol.get(k) for k in ("gap_rel", "threads", "time_limit_s", "solver_status")}},
                  interactions=interactions(A, out0), rule=decision_rule(A, out0, plan),
                  model_corrections={"n": len(events0), "on_plan": on_plan, "kinds": sorted({e["kind"] for e in events0}),
                                     "examples": events0[:20]},
@@ -494,6 +497,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
         S.deliverable(os.path.join(run_dir, rel), CL.PRODUCER, role)
     S.manifest["wall_s"] = round(time.time() - t0, 1)
+    S.manifest["solver"] = A.solver_report()       # 1C-c: settings, and the counts contract.py's gate check reads
     S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS)
                               + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
                               + (["burden_validation"] if bvd else []) + (["burden_anchor"] if anc else [])

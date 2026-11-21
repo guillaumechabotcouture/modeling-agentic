@@ -26,7 +26,7 @@ import numpy as np
 import yaml
 
 from toolkit.analysis import calibration as C, moves as MV
-from toolkit.analysis.core import merge_costs
+from toolkit.analysis.core import SolveFailed, auxiliary, merge_costs
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRODUCER = "toolkit/analysis/stability.py"
@@ -119,7 +119,13 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
         else:
             return {"method": "skipped", "reason": "calibration.method none: nothing is calibrated, nothing to hold out",
                     "folds": [], "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"}
-        sol = A.solve(ben_f, cost_f)
+        try:
+            with auxiliary(A, "stability_folds"):
+                sol = A.solve(ben_f, cost_f)
+        except SolveFailed as e:      # 1C-c: the fold has no plan to compare; the other folds run
+            folds.append({"group": gv, "status": "not_run", "n_units": len(hid),
+                          "reason": f"the fold's plan was not solved ({e})"})
+            continue
         A.guard(f"stability fold {gv}", [plan, sol["choice"]])
         pf = sol["choice"]
         c_full = [cost0[i][plan[i]] for i in hid]

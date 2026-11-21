@@ -50,14 +50,31 @@ def _fixed(spec) -> dict:
     return {k: float(v) for k, v in ((spec["constraints"].get("fixed_costs_usd") or {}).items())}
 
 
+def plan_within_gap(A, sol, plan, ben, cost) -> bool:
+    """1C-c: a stored plan that differs from the re-solved one is the same result when it meets the constraints at the
+    budget the plan is solved within and its objective is within the solver's stated gap of the re-solved optimum.
+    Both are proven within gap g of the optimum's gain G over the solver's baseline, so they differ by at most
+    g / (1 - g) of the re-solved gain."""
+    from toolkit.analysis import moves as MV
+    budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
+    if MV.infeasible_reasons(A.ids, plan, cost, A.feas, budget):
+        return False
+    g = float(sol.get("gap_rel") or 0.0)
+    gain = float(sol["objective"]) - float(sol.get("baseline") or 0.0)
+    short = float(sol["objective"]) - sum(float(ben[i][plan[i]]) for i in A.ids)
+    return short <= g / (1.0 - g) * abs(gain) + 1e-12 * max(1.0, abs(float(sol["objective"])))
+
+
 def frontier(A, ben0, cost0, out0, fractions=FRACTIONS, events=None) -> dict:
     """The plan re-solved at fractions of the envelope (fixed costs held). A plan that model corrections bear on is
     excluded with the reason (the analysis guard, applied to every frontier plan); an envelope the solver proves
-    infeasible is recorded separately; any other solver failure propagates. The marginal is on outcome averted (the
+    infeasible is recorded separately, and one the solver could not solve within the stated gap is recorded as not
+    solved with its status (1C-c, decision D3: the frontier is exploratory). The marginal is on outcome averted (the
     primary outcome, undiscounted); `objective` is the solver's (discounted) objective."""
     env = float(A.spec["constraints"]["envelope_usd"])
     fixed = sum(_fixed(A.spec).values())
-    rows, skipped, infeasible, excluded = [], [], [], []
+    rows, skipped, infeasible, excluded, not_solved = [], [], [], [], []
+    from toolkit.analysis.core import auxiliary
     A.spec.packages()
     bound = getattr(A.spec, "prune_budget", None)      # packages dropped above this budget (within_envelope)
     for f in fractions:
@@ -70,13 +87,18 @@ def frontier(A, ben0, cost0, out0, fractions=FRACTIONS, events=None) -> dict:
                             "within it (options.packages.within_envelope): a plan there could use a dropped package"})
             continue
         try:
-            sol = A.solve(ben0, cost0, budget=A.planned(b))      # F6 S1-1b: the same reserve fraction
+            with auxiliary(A, "frontier"):
+                sol = A.solve(ben0, cost0, budget=A.planned(b))      # F6 S1-1b: the same reserve fraction
         except RuntimeError as e:
             if str(e).strip() == "optimizer status infeasible":
                 infeasible.append({"fraction": f, "envelope_usd": f * env, "reason": "the solver proves no "
                                    "allocation feasible at this envelope"})
                 continue
-            raise
+            if getattr(e, "status", None) is None:
+                raise
+            not_solved.append({"fraction": f, "envelope_usd": f * env, "status": e.status, "reason": "the solver "
+                               "returned no plan proven within the stated gap at this envelope"})
+            continue
         hits = A.plan_corrections(list(events or []), sol["choice"])
         if hits:
             excluded.append({"fraction": f, "envelope_usd": f * env, "reason": f"{len(hits)} model corrections "
@@ -96,7 +118,8 @@ def frontier(A, ben0, cost0, out0, fractions=FRACTIONS, events=None) -> dict:
                 "outcome_per_usd": d_out / d_usd if d_usd > 0 else None,
                 "usd_per_outcome": d_usd / d_out if d_out > 0 else None}
     return {"envelope_usd": env, "fixed_costs_usd": fixed, "points": rows, "skipped": skipped,
-            "infeasible": infeasible, "excluded": excluded, "marginal": marg, "discount_factor": A.dfac}
+            "infeasible": infeasible, "excluded": excluded, "not_solved": not_solved, "marginal": marg,
+            "discount_factor": A.dfac}
 
 
 def dollars(A, plan, out0) -> dict:
@@ -437,10 +460,12 @@ def rebuild(run_dir: str, log=print):
     sol = A.solve(ben0, cost0)
     plan = {str(k): v for k, v in point["plan"].items()}
     diff = [i for i in A.ids if sol["choice"][i] != plan.get(i)]
-    if diff:
-        raise RebuildRefused(f"the rebuilt plan differs from the stored plan in {len(diff)} units")
+    if diff and not (set(plan) == set(A.ids) and plan_within_gap(A, sol, plan, ben0, cost0)):
+        raise RebuildRefused(f"the rebuilt plan differs from the stored plan in {len(diff)} units, by more than the "
+                             "solver's stated gap")
     A.rebuild_info = {"rows": len(res), "by_ulp": by_ulp, "ulp_bound": ULP_BOUND,
-                      "fields": sorted({x["field"] for x in by_ulp}), "plan_reproduced": True}
+                      "fields": sorted({x["field"] for x in by_ulp}), "plan_reproduced": True,
+                      "units_differing_within_gap": len(diff)}
     return A, plan, out0, ben0, cost0, z0
 
 

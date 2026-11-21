@@ -512,7 +512,12 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
         """The draw's best plan at `budget` on which no model correction bears: when the optimum carries one, the
         corrected packages are taken out in that draw and it is solved again (None when a correction bears on every
         plan, on the comparator or a whole unit)."""
-        sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=budget)
+        from toolkit.analysis.core import SolveFailed, auxiliary
+        try:      # 1C-c: a draw with no usable plan at this budget keeps its value within the reserve (None)
+            with auxiliary(A, "value_of_information"):
+                sol = A.solve(tab(Bn[d]), tab(Cs[d]), budget=budget)
+        except SolveFailed:
+            return None
         try:
             A.guard(f"uncertainty draw {d}", [sol["choice"]], rows[d]["events"])
             return sol
