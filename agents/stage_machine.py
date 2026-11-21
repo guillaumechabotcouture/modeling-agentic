@@ -368,41 +368,6 @@ def _answer_counts(a: dict, mode: str) -> bool:
     return a.get("by") == "owner" or (a.get("by") == "lead" and mode == "lead" and a.get("provisional") is True)
 
 
-def apply_owner_accepts(decision: dict, ledger: dict) -> dict:
-    """Codex r2 of #316 (P1-1): an accepted owner amendment means the run goes on without the amendment, declared
-    (request_owner_amendments). A structural PLAN blocker the ledger records as accepted therefore no longer takes the
-    gate back to SPEC, where a signed spec would pause for the amendment the answer just waived. The accepted blockers
-    leave the rethink's list; what remains decides the route (another structural blocker: a rethink; another HIGH:
-    the fix loop; none: they are declared)."""
-    if decision.get("action") != "RETHINK_STRUCTURAL" or rethink_target(decision) != "SPEC":
-        return decision
-    accepted = {fid for fid, f in ledger.items() if getattr(f, "status", None) == "owner_accepted"
-                and FX._OWNER_AMENDMENT.search(str(getattr(f, "fix_requires", None) or ""))}   # answered: remedy text
-    uh = list(decision.get("unresolved_high") or [])
-    waived = [b for b in uh if isinstance(b, dict) and b.get("category") == "STRUCTURAL"
-              and b.get("target_stage") == "PLAN" and str(b.get("id")) in accepted]
-    if not waived:
-        return decision
-    rest = [b for b in uh if b not in waived]
-    ids = [str(b.get("id")) for b in waived]
-    d = dict(decision, unresolved_high=rest, owner_accepted_amendments=ids)
-    if rethink_target(d) == "SPEC":
-        return decision                       # another structural PLAN blocker the owner did not waive
-    if any(isinstance(b, dict) and b.get("category") == "STRUCTURAL" for b in rest):
-        d.update(rationale=f"{decision.get('rationale') or ''} The owner's accepted amendment(s) {', '.join(ids)} are "
-                           "declared; the remaining structural blocker(s) go to the engine choice.")
-        return d
-    if rest:
-        d.update(action="PATCH_OR_RETHINK", rule_matched="owner_accepted_amendment",
-                 rationale=f"the owner accepted going on without the amendment(s) {', '.join(ids)}, which are declared; "
-                           f"{len(rest)} other HIGH finding(s) go to the fix loop")
-        return d
-    d.update(action="DECLARE_SCOPE", rule_matched="owner_accepted_amendment", declared_open=ids,
-             rationale=f"the owner accepted going on without the amendment(s) {', '.join(ids)}: they are declared in "
-                       "the write-up (declared_findings.yaml)")
-    return d
-
-
 def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto", mode: str = "owner") -> list[dict]:
     """Decision-bearing findings (a measured decision test that changes the plan) go through
     Phase 49 β's owner rule before they can be declared: marked for the owner (an item the
@@ -1780,9 +1745,8 @@ class Machine:
                 d = require_judged(d, opened)
                 # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
                 # (synced with this decision, so a gate finding is read as this gate states it: Codex round 3 of #258)
-                led_now = FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")[0]
-                d = apply_owner_declines(d, led_now)
-                d = apply_owner_accepts(d, led_now)
+                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw,
+                                                    lead_ok=self.st.signoff == "lead")[0])
                 if d.get("rule_matched") == "owner_declined":
                     drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
                                                  if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
@@ -2823,17 +2787,6 @@ def _self_test() -> int:
            and not _SS.provisional(d)[0]["plan_changing"],
            f"T_OWNER_LEAD_AMEND an amendment finding under --signoff lead is accepted provisionally, not waited on "
            f"({s_a}, {led_a['D-041'].status})")
-        # T_OWNER_LEAD_AMEND_STRUCT (Codex r2 of #316, P1-1): a structural PLAN blocker whose remedy is an owner
-        # amendment, accepted provisionally with rounds left, does not take the next gate to SPEC and the amendment pause
-        amend5l = dict(amend, id="D-036", category="STRUCTURAL")
-        d, T, st = new_run("amend5_lead", {"critics": {1: {"critique-domain": [amend5l]}},
-                                           "structural": {1: "critique-domain"}}, signoff="lead", max_rounds=3)
-        s_s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        p_s = [h["to"] for h in load_state(d).history if "to" in h]
-        ok("OWNER_DECISION" in p_s and not s_s.startswith("paused")
-           and "SPEC" not in p_s[p_s.index("OWNER_DECISION"):],
-           f"T_OWNER_LEAD_AMEND_STRUCT a provisionally accepted structural amendment does not pause the lead run for a "
-           f"spec amendment ({s_s}, {p_s[-6:]})")
 
         # R3-4 (F6 run 3): a paid task whose allowance is below the floor is not started: the run pauses for the owner
         # (resumable), and a resume with a higher cap continues.
