@@ -779,6 +779,17 @@ def _self_test() -> int:
         r = summarise([mk("r_noinv", done, {"invocations": None, "finished": at(1)}, R)])
         ok(r["interventions"]["I5_resumes"]["from"] == NA and r["interventions"]["headline"]["from"] == NA,
            "HM38 a run that records no invocations (before 2026-11-05): I5 and the headline are unavailable")
+        # ---- records PR (Codex round on harness-run-records)
+        h = [{"at": at(3), "from": "SPEC", "to": "SIGN"}, {"at": at(3), "paused": "awaiting_signoff", "state": "SIGN"}]
+        r = summarise([mk("r_sec", {"state": "SIGN", "paused": "awaiting_signoff", "history": h}, inv=(0, 3))], A)
+        ok(iv(r, "I1_pauses") == 0 and r["interventions"]["pending_pauses"] == 1,
+           "HM39 a pause recorded in the same second as the resume that started the session is pending, not ended")
+        h = [{"at": at(1), "from": "SPEC", "to": "SIGN"}, {"at": at(2.5), "paused": "awaiting_signoff", "state": "SIGN"}]
+        r = summarise([mk("r_old", {"state": "SIGN", "paused": "awaiting_signoff", "history": h}, inv=(0, 2))], A)
+        ok(iv(r, "I1_pauses") == 1 and r["interventions"]["pending_pauses"] == 1,
+           "HM40 an older build's unrecorded pause before a recorded one in the same SIGN visit is still inferred")
+        b3 = mk("s_c", fa, {"parent_run": {"run_dir": "r_ok", "run_state_sha256": None}})
+        ok(len(chains([os.path.join(root, "r_ok"), b3])) == 2, "HM41 a parent_run with no hash is never linked")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

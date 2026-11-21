@@ -2566,6 +2566,28 @@ def _self_test() -> int:
         ok(pr.get("run_dir") == os.path.basename(d) and pr.get("run_state_sha256") == hashlib.sha256(
             open(os.path.join(d, STATE_FILE), "rb").read()).hexdigest(),
            f"RR5 a run launched with MA_PARENT_RUN records its parent and the parent's run_state hash ({pr})")
+        cwd6 = os.getcwd()
+        prs = []
+        for k6, par in enumerate((os.path.join(td, "no_such_run"), ".")):
+            os.chdir(d)
+            os.environ["MA_PARENT_RUN"] = par
+            try:
+                init_run(os.path.join(td, f"rr6_child{k6}"), "toy question", derived_inputs=False)
+            finally:
+                os.environ.pop("MA_PARENT_RUN", None)
+                os.chdir(cwd6)
+            prs.append(json.load(open(os.path.join(td, f"rr6_child{k6}", "metadata.json"))).get("parent_run") or {})
+        ok(prs[0].get("run_state_sha256") is None and prs[0].get("error") and prs[1].get("run_dir") == os.path.basename(d),
+           f"RR6 an unreadable parent records no hash (never linked); a relative parent path records its dir name ({prs})")
+        st7 = load_state(d)
+        if st7.state == "FINAL":
+            st7.paused = "awaiting_scope_signoff"            # a stale flag a terminal run can carry
+            save_state(d, st7)
+            n7 = len(load_state(d).history)
+            _SpikeMachine(d, StubTasks(T.s), st7, log=lambda *a: None, cross_engine_check=False).run()
+            ok(len(load_state(d).history) == n7, "RR7 a FINAL run carrying a stale paused flag writes no pause entry")
+        else:
+            ok(False, f"RR7 fixture: the resumed run should be FINAL ({st7.state})")
         ok(not s2.startswith("paused") and "draft_spec" in T2.calls
            and load_state(d).budget_usd == 60.0
            and any(h.get("budget_raised") for h in load_state(d).history),
