@@ -5,38 +5,23 @@
                                   [--signoff owner|lead]
     python3 -m toolkit.spec.amend --self-test
 
-The parent is never written. The child is a new directory beside it (`<parent>.amend<k>`, or --out), holding:
-  1. `metadata.json` with `parent_run` ({run_dir, run_state_sha256}, the form #311 records from MA_PARENT_RUN),
-     `parent_spec_sha256` and `code_pin` (scripts/lib/pipeline_id.py code_pin: the commit, clean, on a remote);
-  2. the parent's spec and evidence dossier with the patch applied, and its inputs and stored engine batches; never
-     its run state, sign-off records, sheet, findings, critiques, report, figures or typed analysis outputs;
-  3. a spec that validates (schema), the spec critique's counts, and review conditions imported when
-     toolkit/spec/review_conditions.py (W0-G) is on this branch;
-  4. a regenerated sign-off sheet, and the result of signing a scratch copy (proof the signature would verify);
-  5. the reuse report: per stored batch, rows reusable under the current fingerprint rules and rows to compute, and
-     why (scripts/compute.py reuse_report; the joint calibration's reuse_check when it has stored calls);
-  6. `run_state.json` at SIGN, paused awaiting_signoff, with the parent's question, rounds, budget and sign-off mode;
-  7. `amendment_record.json`: all of the above, the changes by path (before and after), and the commands: the one
-     owner sign command (spec, sheet and derivation sha256 in full) and the launch command with smoke markers.
-Under --signoff lead the child resumes under the lead's signature where the signer allows it (a departure still
-needs the owner); the dry-sign is done as that signer.
+The parent is never written. The child (`<parent>.amend<k>`, or --out, outside the parent) holds: metadata.json
+with `parent_run` ({run_dir, run_state_sha256}, #311's form), `parent_spec_sha256` and `code_pin`; the patched
+spec and dossier, the parent's inputs and stored batches (never its state, sign-off records, sheet, findings,
+dispositions, critiques, report, figures or analysis outputs); review conditions (W0-G) imported; a regenerated
+sheet; amendment_record.json (changes by path, spec critique, dry-sign of a scratch copy, reuse report per batch,
+code pin, the owner sign command with the sha256 values in full, the launch and smoke commands); and, written last,
+run_state.json at SIGN, awaiting_signoff. Refused, with no child: a patch that does not apply or changes nothing,
+a parent running or edited since signing, a link or unreadable directory in it, or a spec failing the checks the
+SPEC stage runs before SIGN. A failed dry-sign keeps the child and prints no sign command.
 
-Patch file:
-    id: A1                                    # optional label
-    reason: why, in words                     # required
-    spec:                                     # operations on decision_spec.yaml, in order
-      - {set: objective.horizon, value: [0, 5]}            # replace a value that exists
-      - {add: analysis.decision_tests, value: {...}}       # append to a list, or add a key a mapping lacks
-      - {remove: "analysis.decision_tests[id=DT3]"}        # delete a key or a list element that exists
-    dossier: [...]                            # the same operations on the evidence dossier the spec names
-Paths are dotted keys; a list element by index (`.0`) or by `[key=value]` (exactly one match). A path that does
-not resolve, an operation on the wrong kind of node, a patch that changes nothing or a spec that no longer
-validates is refused, and no child is made.
-
---from-request: the parent's spec_rethink_request.json (the stage machine's pause for a rethink of a signed spec)
-must name the parent's signed spec. Its briefs and findings are recorded as the amendment's why; its `patch` (same
-format) is applied when present, else --patch is required: the fix planner writes prose briefs, not a patch.
-Nothing here names a disease, a place or an intervention.
+Patch file: `id` (optional), `reason` (required), and `spec` / `dossier` lists of operations, in order:
+    - {set: objective.horizon, value: [0, 5]}            # replace a value that exists
+    - {add: analysis.decision_tests, value: {...}}       # append to a list, or add a key a mapping lacks
+    - {remove: "analysis.decision_tests[id=DT3]"}        # delete a key or a list element that exists
+Paths are dotted keys; a list element by index (`.0`) or `[key=value]` (exactly one element with that key).
+--from-request: the parent's spec_rethink_request.json must name its signed spec; its briefs and findings are the
+why, and its `patch` is applied when present, else --patch is required. Nothing here names a disease or a place.
 """
 from __future__ import annotations
 
@@ -69,8 +54,10 @@ NOT_COPIED = {STATE, "metadata.json", RECORD, REQUEST, "decision_spec.signoff.js
               "decision_brief.signed", "decision_spec.signoff_sheet.md", "scope_signoff.json",
               "scope_signoff_request.json", "report.md", "report_withheld.md", "manuscript.md", "final_gate.json",
               "findings.jsonl", "declared_findings.yaml", "engine_choice.json", "figures", "trace.jsonl",
-              "budget_ledger.json", "progress.md", "copied_run.json", "_task_input.json"}
-NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact")
+              "budget_ledger.json", "progress.md", "copied_run.json", "_task_input.json", "done_when_registry.json",
+              "scope_declaration.yaml"}
+NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact", "fix_progress")
+NOT_COPIED_DIRS = ("models/decision_tests",)     # the parent's decision-test results: the child tests again
 OPS = ("set", "add", "remove")
 
 
@@ -83,9 +70,7 @@ def _sha(b: bytes) -> str:
 
 
 def _derived_paths() -> set:
-    """Run-relative files the harness writes after SIGN: typed analysis artifacts (toolkit/analysis/artifacts.py
-    KINDS, carrying the parent's spec sha256), the manifest, the geometry sign-off record and the harness outputs
-    under models/ that the reuse fingerprint already ignores."""
+    """Files the harness writes after SIGN: typed analysis artifacts, the manifest, geometry sign-off, models/ outputs."""
     from toolkit.analysis import artifacts as A
     from toolkit.spec import geometry as G
     import compute
@@ -96,7 +81,8 @@ def _derived_paths() -> set:
 def _skip(rel: str, derived: set) -> bool:
     parts = rel.split("/")
     return (parts[0] in NOT_COPIED or (len(parts) == 1 and parts[0].startswith(NOT_COPIED_PREFIX))
-            or parts[-1].endswith(".lock") or ".before_" in parts[-1] or rel in derived)
+            or parts[-1].endswith(".lock") or ".before_" in parts[-1] or rel in derived
+            or any(rel == d or rel.startswith(d + "/") for d in NOT_COPIED_DIRS))
 
 
 # ------------------------------------------------------------------ the patch
@@ -125,7 +111,7 @@ def _locate(doc, path):
     steps, node = _steps(path), doc
     for j, s in enumerate(steps):
         if isinstance(s, tuple):
-            hits = [i for i, x in enumerate(node) if isinstance(x, dict) and str(x.get(s[0])) == s[1]] \
+            hits = [i for i, x in enumerate(node) if isinstance(x, dict) and s[0] in x and str(x[s[0]]) == s[1]] \
                 if isinstance(node, list) else None
             if hits is None or len(hits) != 1:
                 raise AmendError(f"{path}: [{s[0]}={s[1]}] matches {'no list' if hits is None else len(hits)} "
@@ -136,6 +122,10 @@ def _locate(doc, path):
             if not exists:
                 raise AmendError(f"{path}: index {s} is outside the list ({len(node)} elements)")
         elif isinstance(node, dict):
+            if isinstance(s, int) and str(s) in node:
+                if s in node:
+                    raise AmendError(f"{path}: {s} names both a number key and a text key")
+                s = str(s)
             k, exists = s, s in node
         else:
             raise AmendError(f"{path}: {s!r} steps into a {type(node).__name__}")
@@ -192,6 +182,16 @@ def _dump(doc, original: bytes, note: str) -> bytes:
             ).encode("utf-8")
 
 
+def _no_aliases(data: bytes, what: str) -> None:
+    """A YAML alias shares one node between paths, so an edit by one path would move another: refused."""
+    import yaml
+    try:
+        if any(isinstance(e, yaml.AliasEvent) for e in yaml.parse(data.decode("utf-8"))):
+            raise AmendError(f"{what} uses YAML aliases; write the shared values out before amending")
+    except (yaml.YAMLError, UnicodeDecodeError) as e:
+        raise AmendError(f"{what} does not parse: {e}") from None
+
+
 def load_patch(path, request) -> dict:
     import yaml
     src = (request or {}).get("patch") if request is not None else None
@@ -207,6 +207,8 @@ def load_patch(path, request) -> dict:
         raise AmendError("the request carries a patch: pass --patch or --from-request's patch, not both")
     if not isinstance(src, dict) or set(src) - {"id", "reason", "spec", "dossier"}:
         raise AmendError("a patch is a mapping of id, reason, spec and dossier")
+    if src.get("id") is not None and not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", str(src["id"])):
+        raise AmendError("a patch id is 1 to 40 letters, digits, '_', '.' or '-'")
     if not isinstance(src.get("reason"), str) or not src["reason"].strip():
         raise AmendError("a patch needs a reason, in words")
     if not src.get("spec") and not src.get("dossier"):
@@ -233,6 +235,8 @@ def _parent(parent: str) -> tuple:
             signed = json.loads(read_nofollow(parent, "decision_spec.signoff.json")[0]).get("spec_sha256")
         except (OSError, ValueError, LinkRefused, AttributeError):
             signed = None
+    if signed and _sha(spec) != signed:
+        raise AmendError(f"{parent}: {SPEC} changed after it was signed; amend from the signed spec")
     return st, _sha(sb), spec, signed
 
 
@@ -248,11 +252,12 @@ def _request(parent: str, signed) -> dict:
 
 
 def _copy_tree(parent: str, stage: str) -> int:
-    """Copy what the child inherits, through lib.safe_io; a link anywhere in the parent is refused. Modification
-    times are kept (the reuse fingerprint hashes large files by size and mtime)."""
+    """Copy what the child inherits (lib.safe_io; a link refused; mode and mtime kept: large files hash by mtime)."""
     from lib.safe_io import read_nofollow, write_nofollow
     derived, n = _derived_paths(), 0
-    for dp, dirs, fns in os.walk(parent):
+    def unreadable(e):
+        raise AmendError(f"the parent cannot be read in full: {e}")
+    for dp, dirs, fns in os.walk(parent, onerror=unreadable):
         for x in dirs + fns:
             if os.path.islink(os.path.join(dp, x)):
                 raise AmendError(f"{os.path.relpath(os.path.join(dp, x), parent)}: a link in the parent run, refused")
@@ -265,6 +270,7 @@ def _copy_tree(parent: str, stage: str) -> int:
                 continue
             data, st = read_nofollow(parent, rel)
             write_nofollow(stage, rel, data, exclusive=True)
+            os.chmod(os.path.join(stage, rel), st.st_mode & 0o777)     # a private input stays private
             os.utime(os.path.join(stage, rel), ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
             n += 1
     return n
@@ -272,10 +278,8 @@ def _copy_tree(parent: str, stage: str) -> int:
 
 # ------------------------------------------------------------------ the checks
 def _job_keyed(child: str, spec_path: str) -> dict:
-    """{batch file: (rows, reusable or None, rule)} for the trusted row files whose rows are reused by job, whatever
-    compute.py's fingerprint says: the joint calibration's calls and the batches of toolkit/analysis/row_reuse.py. A
-    row qualifies with the current engine identity and adapter digest (its job_sha is matched when the run builds its
-    jobs). A file with no job-keyed rows is left to compute.py's rule."""
+    """{file: (rows, reusable or None, rule)}: trusted row files reused by job (joint calibration, row_reuse), each
+    job counted once when its engine identity and adapter digest are current; other files: compute.py's rule."""
     from toolkit.analysis import joint_calibration as JC, row_reuse as RR
     try:
         from toolkit.engines.contract import engine_identity
@@ -285,7 +289,7 @@ def _job_keyed(child: str, spec_path: str) -> dict:
         ident = None
     adapter = JC.adapter_digest()
     legacy = os.environ.get(JC.LEGACY_ADAPTER_ENV) == adapter
-    got = {}
+    got, seen = {}, set()
     for dp, dirs, _ in os.walk(os.path.join(child, "analysis")):
         dirs[:] = [d for d in dirs if d != RR.ARCHIVE]        # an archive is read with its directory (RR._sources)
         jc = os.path.dirname(dp) == os.path.join(child, JC.OUT_REL)
@@ -296,19 +300,19 @@ def _job_keyed(child: str, spec_path: str) -> dict:
         for f, kind, fad in ([(f, k, ad) for f, k, _ in JC._trusted_sources(dp)] if jc else RR._sources(dp)):
             rows = JC._source_rows(f, kind)
             if rows:
-                n = None if ident is None else sum(
-                    b.get("provenance", {}).get("engine") == ident and (fad == adapter or (fad is None and legacy))
-                    for _, b in rows)
+                n = None
+                if ident is not None:      # a job counted once, whichever file or archive holds it
+                    new = {sha for sha, b in rows if sha not in seen and b.get("provenance", {}).get("engine") == ident
+                           and (fad == adapter or (fad is None and legacy))}
+                    n, seen = len(new), seen | new
                 got[os.path.relpath(f, child)] = (len(rows), n, "joint calibration" if jc else "row_reuse")
     return got
 
 
 def reuse(child: str, spec_path: str) -> dict:
     """Per stored batch: rows reusable under the current rules, rows to compute, which rule decides, and why."""
-    out = {"rule": "job-keyed batches (joint calibration, row_reuse): a row whose engine identity and adapter digest "
-                   "are the current ones; other batches: scripts/compute.py's code fingerprint (function file, repo "
-                   "scripts/ and toolkit/, the run's models/ and data/). Either way a row answers only the same job, "
-                   "known when the run builds its jobs: reusable rows are eligible, not promised"}
+    out = {"rule": "job-keyed batches: current engine identity and adapter digest; others: compute.py's code "
+                   "fingerprint. A row answers only the same job: reusable rows are eligible, not promised"}
     try:
         import compute
         r = compute.reuse_report(child)
@@ -320,7 +324,10 @@ def reuse(child: str, spec_path: str) -> dict:
         for b in r["batches"]:
             row = {"out": b["out"], "fn": b["fn"], "stored": b["stored"], "reusable": b["eligible"],
                    "rule": "compute fingerprint", "why": b["why"] or "same function and code fingerprint"}
-            if b["out"] in jk:
+            if b["out"] not in jk and b["out"].startswith("analysis/joint_calibration/"):
+                row.update(reusable=0, rule="job-keyed (joint calibration)",
+                           why="no trusted digest: the calibration does not read this file")
+            elif b["out"] in jk:
                 n, ok_, rule = jk[b["out"]]
                 row.update(stored=n, reusable=ok_ or 0, rule=f"job-keyed ({rule})",
                            why="engine identity and adapter digest current" if ok_ == n else (
@@ -328,6 +335,12 @@ def reuse(child: str, spec_path: str) -> dict:
                                else "engine identity or adapter digest changed for some rows"))
             row["to_compute"] = row["stored"] - row["reusable"]
             out["batches"].append(row)
+        listed = {b["out"] for b in out["batches"]}
+        for f, (n, ok_, rule) in sorted(jk.items()):       # e.g. a merged results file with its reuse sidecar
+            if f not in listed:
+                out["batches"].append({"out": f, "fn": None, "stored": n, "reusable": ok_ or 0,
+                                       "to_compute": n - (ok_ or 0), "rule": f"job-keyed ({rule})",
+                                       "why": "trusted by its reuse sidecar"})
         out["stored"] = sum(b["stored"] for b in out["batches"])
         out["reusable"] = sum(b["reusable"] for b in out["batches"])
     except Exception as e:  # noqa: BLE001 -- fail closed: no counts, the reason recorded
@@ -340,7 +353,8 @@ def _review_conditions(child: str, parent: str) -> dict:
     mod = os.path.join(ROOT, "toolkit", "spec", "review_conditions.py")
     if not os.path.isfile(mod):
         return {"status": "not on this branch (W0-G)"}
-    r = subprocess.run([sys.executable, mod, "import", child, "--critique", "--parent", parent],
+    led = os.path.lexists(os.path.join(parent, "findings.jsonl"))     # a parent stopped before CRITIQUE has none
+    r = subprocess.run([sys.executable, mod, "import", child, "--critique", *(["--parent", parent] if led else [])],
                        capture_output=True, text=True, timeout=600)
     return {"status": "imported" if r.returncode == 0 else "failed", "rc": r.returncode,
             "output": (r.stdout + r.stderr)[-1500:]}
@@ -358,6 +372,28 @@ def dry_sign(child: str, by: str, expect: dict) -> dict:
             return {"ok": st == "signed", "by": by, "status": st}
         except ValueError as e:
             return {"ok": False, "by": by, "error": str(e)[:3000]}
+
+
+def _pre_sign(rd: str, derived) -> tuple:
+    """(problems, candidate rows): the backend's pre-sign checks and the geometry check, as h_SPEC runs them."""
+    if os.path.join(ROOT, "agents") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "agents"))
+    import analysis_backend as AB
+    from toolkit.spec import geometry as GEO
+    b = AB.backend()
+    errs = list(b.pre_sign_problems(rd, derived=bool(derived)) if hasattr(b, "candidate_rows")
+                else b.pre_sign_problems(rd))
+    errs += [f"{x['code']}: {x['claim']}" for x in GEO.problems(GEO.run(rd))]
+    return errs, getattr(b, "candidates", None)
+
+
+def _ready(ds: dict, rc: dict, child: str, mode: str) -> dict:
+    """The dry-sign, failed when the condition import failed or a lead would wait for the owner at SIGN."""
+    from toolkit.spec import geometry as GEO
+    if rc.get("status") == "failed":
+        return dict(ds, ok=False, error=f"review conditions not imported: {rc.get('output', '')[-500:]}")
+    pend = GEO.owner_pending(GEO.run(child)) if mode == "lead" else []
+    return dict(ds, ok=False, error=f"geometry exceptions wait for the owner: {pend[:5]}") if pend else ds
 
 
 def _critique(child: str, spec_doc) -> dict:
@@ -380,8 +416,7 @@ def _next_child(parent: str) -> str:
 
 
 def _file_sha(d: str, rel: str) -> str:
-    p = os.path.join(d, rel)
-    return _sha(open(p, "rb").read()) if os.path.isfile(p) else "none"
+    return _sha(open(os.path.join(d, rel), "rb").read()) if os.path.isfile(os.path.join(d, rel)) else "none"
 
 
 def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=ROOT, log=print) -> dict:
@@ -394,6 +429,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     st, st_sha, spec_bytes, signed = _parent(parent)
     request = _request(parent, signed) if from_request else None
     p = load_patch(patch, request)
+    _no_aliases(spec_bytes, SPEC)
     spec0 = yaml.safe_load(spec_bytes.decode("utf-8")) or {}
     spec1, changes = apply_ops(spec0, p["spec"], SPEC) if p.get("spec") else (spec0, [])
     drel = ED.dossier_reference(spec1)
@@ -402,6 +438,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
         if not drel or not os.path.isfile(os.path.join(parent, drel)):
             raise AmendError("dossier operations, but the spec names no evidence dossier in the parent")
         dbytes = ED.read_dossier(parent, drel)
+        _no_aliases(dbytes, drel)
         d0 = yaml.safe_load(dbytes.decode("utf-8")) or {}
         d1, dch = apply_ops(d0, p["dossier"], drel)
         if d1 != d0:
@@ -416,22 +453,28 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     child = os.path.realpath(out) if out else _next_child(parent)
     if os.path.lexists(child):
         raise AmendError(f"{child} exists")
+    if os.path.commonpath([child, parent]) == parent:
+        raise AmendError("the child cannot be inside the parent run")
+    mode = signoff or st.get("signoff")
+    if mode not in ("owner", "lead"):
+        mode = "owner"             # a parent run with --signoff none: its child is signed, by the owner by default
     stage = child + ".partial"
-    os.mkdir(stage)
+    os.mkdir(stage, os.stat(parent).st_mode & 0o777)
     try:
         n = _copy_tree(parent, stage)
         write_nofollow(stage, SPEC, new_spec, atomic=True)
         if dossier is not None:
             write_nofollow(stage, drel, dossier, atomic=True)
         sp = schema.load(os.path.join(stage, SPEC), data=new_spec)
-        errs = schema.validate(sp, pending_ok=True)
+        errs = list(schema.validate(sp, pending_ok=True))
+        if not errs:               # what h_SPEC checks before SIGN (backend pre-sign checks, geometry)
+            errs, cands = _pre_sign(stage, st.get("derived_inputs"))
         if errs:
             raise AmendError("the amended spec does not validate: " + "; ".join(map(str, errs[:10])))
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)
         raise
     os.rename(stage, child)
-    mode = signoff or st.get("signoff") or "owner"
     pin = pipeline_id.code_pin(repo)
     meta = {"pipeline": "v2", "question": st.get("question"), "signoff": mode, "max_rounds": st.get("max_rounds"),
             "parent_run": {"run_dir": parent, "run_state_sha256": st_sha}, "parent_spec_sha256": signed,
@@ -444,21 +487,23 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
            "paused": "awaiting_signoff", "status": None, "tries": {}, "journal": {},
            "history": [{"at": meta["created"], "from": None, "to": "SIGN",
                         "why": f"amendment {label} of {parent} ({len(changes)} change(s)): {reason1}"[:500]}]}
-    write_nofollow(child, STATE, json.dumps(cst, indent=1).encode(), atomic=True)
     rc = _review_conditions(child, parent)
-    SO.write_sheet(child)
+    _, cands = _pre_sign(child, st.get("derived_inputs"))   # the geometry record and candidates, at the final path
+    SO.write_sheet(child, cands)
     expect = {"expect_sha256": _file_sha(child, SPEC), "expect_sheet_sha256": _file_sha(child, SO.SHEET),
               "expect_derivations_sha256": _file_sha(child, SO.DERIVATIONS_RECORD)}
     q = shlex.quote(child)
     commit = pin.get("commit", "unknown").removesuffix("-dirty")
-    budget = f" --max-budget-usd {st['budget_usd']:g}" if isinstance(st.get("budget_usd"), (int, float)) else ""
+    budget = (f" --max-budget-usd {float(st['budget_usd']):g}" if isinstance(st.get("budget_usd"), (int, float))
+              and not isinstance(st.get("budget_usd"), bool) else "")
+    rounds = st.get("max_rounds") if isinstance(st.get("max_rounds"), int) and st["max_rounds"] > 0 else 3
     commands = {
         "owner_sign": f"python3 agents/stage_machine.py sign {q} --by owner --expect-sha256 {expect['expect_sha256']} "
                       f"--expect-sheet-sha256 {expect['expect_sheet_sha256']} "
                       f"--expect-derivations-sha256 {expect['expect_derivations_sha256']}",
         "launch": f"python3 main.py --v2 --resume {q} --signoff {mode} "
-                  f"--max-rounds {st.get('max_rounds') or 3}{budget}",
-        "smoke": f"python3 scripts/smoke_check.py {q} --pipeline v2 --commit {commit} "
+                  f"--max-rounds {rounds}{budget}",
+        "smoke": f"python3 scripts/smoke_check.py {q} --pipeline v2 --commit {shlex.quote(commit)} "
                  "--expect 'metadata.json:parent_run' --expect 'metadata.json:code_pin' "
                  "--expect 'amendment_record.json:reuse' --expect 'run_state.json~spec signed by' "
                  "--expect 'run_state.json~\"to\": \"EVIDENCE\"'"}
@@ -468,26 +513,24 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
                        if request is not None else None),
            "changes": changes, "spec_sha256": expect["expect_sha256"], "sheet_sha256": expect["expect_sheet_sha256"],
            "derivations_sha256": expect["expect_derivations_sha256"], "spec_critique": _critique(child, spec1),
-           "review_conditions": rc, "dry_sign": dry_sign(child, mode, expect),
+           "review_conditions": rc, "dry_sign": _ready(dry_sign(child, mode, expect), rc, child, mode),
            "reuse": reuse(child, os.path.join(child, SPEC)), "code_pin": pin, "signoff": mode, "commands": commands}
     write_nofollow(child, RECORD, json.dumps(rec, indent=1, default=str).encode(), atomic=True)
+    # last: a child that stopped part way has no run state, so nothing resumes it (it is not a run yet)
+    write_nofollow(child, STATE, json.dumps(cst, indent=1).encode(), atomic=True)
     _print(rec, log)
     return rec
 
 
 def _print(rec: dict, log) -> None:
     short = lambda v: (json.dumps(v, default=str)[:160] if v is not None else "(absent)")  # noqa: E731
-    log(f"Child run: {rec['child']} (amendment {rec['id']}; parent spec {rec['parent_spec_sha256']})")
-    log("Changes:")
+    log(f"Child run: {rec['child']} (amendment {rec['id']}; parent spec {rec['parent_spec_sha256']}). Changes:")
     for c in rec["changes"]:
         log(f"  {c['op']} {c['file']}:{c['path']}: {short(c['before'])} -> {short(c['after'])}")
-    sc = rec["spec_critique"]
-    log(f"Spec critique: {sc.get('high')} HIGH, {sc.get('medium')} MEDIUM, {sc.get('declared')} declared"
-        + (f" ({sc['error']})" if sc.get("error") else ""))
-    log(f"Review conditions: {rec['review_conditions']['status']}")
-    r = rec["reuse"]
-    log(f"Reuse: {r.get('reusable')} of {r.get('stored')} stored rows reusable" + (f" ({r['error']})" if "error" in r
-                                                                                    else ""))
+    sc, r = rec["spec_critique"], rec["reuse"]
+    log(f"Spec critique: {sc.get('high')} HIGH, {sc.get('medium')} MEDIUM, {sc.get('declared')} declared "
+        f"{sc.get('error') or ''}; review conditions: {rec['review_conditions']['status']}")
+    log(f"Reuse: {r.get('reusable')} of {r.get('stored')} stored rows reusable {r.get('error') or ''}")
     for b in r.get("batches", []):
         log(f"  {b['out']}: {b['reusable']} reusable, {b['to_compute']} to compute; {b['rule']}: {b['why']}")
     pin = rec["code_pin"]
@@ -495,45 +538,34 @@ def _print(rec: dict, log) -> None:
     ds = rec["dry_sign"]
     if not ds["ok"]:
         log(f"Dry-sign as {ds['by']} FAILED on a scratch copy: {ds.get('error') or ds.get('status')}")
-        log("Fix the patch and amend again; no sign command is given.")
+        log("No sign command is given. Open review conditions: dispose of them in review_conditions.yaml, then "
+            f"python3 toolkit/spec/signoff.py sheet {rec['child']} --write, read it, and sign with its hashes. "
+            "Otherwise fix the patch and amend again.")
         return
     log(f"Dry-sign as {ds['by']}: a scratch copy signed and verified.")
-    if rec["signoff"] == "owner":
-        log("Owner sign command:\n  " + rec["commands"]["owner_sign"])
-    else:
-        log("Lead mode: the lead signs at SIGN when the run resumes (an owner may sign first with:\n  "
-            + rec["commands"]["owner_sign"] + " )")
+    log(("Owner sign command" if rec["signoff"] == "owner" else "Lead mode: the lead signs at SIGN on resume; "
+         "the owner may sign first") + ":\n  " + rec["commands"]["owner_sign"])
     log(f"Launch, after signing, from a checkout at {pin.get('commit')}:\n  " + rec["commands"]["launch"])
     log("Smoke markers:\n  " + rec["commands"]["smoke"])
 
 
 def _self_test() -> int:
-    import hashlib
-    import json
-    import shutil
-    import tempfile
     import yaml
-    from toolkit.spec import schema, signoff as SO
     import compute
     from lib import pipeline_id
+    from toolkit.spec import schema, signoff as SO
     fails = []
 
     def ok(c, m):
         print(("PASS " if c else "FAIL ") + m)
-        if not c:
-            fails.append(m)
+        fails.extend([] if c else [m])
 
     def tree(d):
-        h = hashlib.sha256()
-        for dp, dirs, fns in os.walk(d):
-            dirs.sort()
-            for f in sorted(fns):
-                p = os.path.join(dp, f)
-                h.update(os.path.relpath(p, d).encode() + b"\0" + open(p, "rb").read())
-        return h.hexdigest()
+        return _sha(json.dumps(sorted((os.path.relpath(os.path.join(dp, f), d), sha(os.path.join(dp, f)))
+                                      for dp, _, fns in os.walk(d) for f in fns)).encode())
 
     def sha(p):
-        return hashlib.sha256(open(p, "rb").read()).hexdigest()
+        return _sha(open(p, "rb").read())
 
     def refused(fn, m):
         try:
@@ -553,17 +585,24 @@ def _self_test() -> int:
         par = os.path.join(td, "parent")
         os.makedirs(par)
         w(par, "metadata.json", json.dumps({"pipeline": "v2", "commit": "0" * 40}))
-        schema.toy_spec(par)
+        tsp = schema.toy_spec(par)
+        raw = yaml.safe_load(open(tsp))     # the toy's two critique findings declared: no open review condition
+        raw["principle_departures"] = [{"principle": 2, "check": "headline_comparator", "reason": "toy"},
+                                       {"principle": 3, "check": "baseline_burden", "reason": "toy"}]
+        yaml.safe_dump(raw, open(tsp, "w"), sort_keys=False)
         SO.write_sheet(par)
         SO.sign(par, "owner")
         psig = SO.signed_sha(par)
         w(par, "run_state.json", json.dumps({"question": "q", "state": "FINAL", "status": "completed_gate_not_accepted",
                                              "signoff": "owner", "max_rounds": 2, "budget_usd": 5.0, "spent_usd": 3.0,
-                                             "derived_inputs": True, "history": [{"to": "FINAL"}]}))
+                                             "derived_inputs": False, "history": [{"to": "FINAL"}]}))
         for rel in ("report.md", "critique_domain.yaml", "findings.jsonl", "analysis/manifest.json",
                     "analysis/point.yaml", "figures/a.png", "engine_choice.json"):
             w(par, rel, "stale\n")
+        w(par, "findings.jsonl", "")       # a readable ledger with no open finding (review_conditions --parent)
         w(par, "data/derived.csv", "u,v\n1,2\n")
+        os.chmod(os.path.join(par, "data", "derived.csv"), 0o600)
+
         w(par, "analysis/benchmarks_at_spec_values.record.json", "{}\n")
         w(par, "models/fn.py", "def f(p):\n    return {'y': p['x']}\n")
         w(par, "gone.py", "def f(p):\n    return {'y': 2 * p['x']}\n")
@@ -572,6 +611,9 @@ def _self_test() -> int:
                             max_workers=1, ledger=False)
         os.remove(os.path.join(par, "gone.py"))
         p_rows = compute.reuse_report(par)
+        for rel in ("done_when_registry.json", "fix_progress_r1.json", "scope_declaration.yaml",
+                    "models/decision_tests/DT1.json"):      # written by the run after its batches
+            w(par, rel, "{}\n")
         before = tree(par)
         pf = os.path.join(td, "a1.yaml")
         yaml.safe_dump({"id": "A1", "reason": "raise the envelope", "spec": [
@@ -594,12 +636,16 @@ def _self_test() -> int:
            and rec["changes"][0]["before"] == 9000, f"AM_PATCH_APPLIED set by path and by [id=...] ({rec['changes']})")
         gone = [x for x in ("report.md", "critique_domain.yaml", "findings.jsonl", "analysis/manifest.json",
                             "analysis/point.yaml", "figures", "engine_choice.json", "decision_spec.signoff.json",
-                            "decision_brief.signed", "data/geometry_signoff.json") if os.path.lexists(os.path.join(child, x))]
+                            "decision_brief.signed", "data/geometry_signoff.json", "done_when_registry.json",
+                            "fix_progress_r1.json", "scope_declaration.yaml", "models/decision_tests")
+                if os.path.lexists(os.path.join(child, x))]
         kept = [x for x in ("data/derived.csv", "analysis/benchmarks_at_spec_values.record.json", "models/fn.py",
                             "analysis/batch/points.jsonl.summary.json", "units.csv")
                 if not os.path.exists(os.path.join(child, x))]
         ok(not gone and not kept, f"AM_CHILD_CONTENT run outputs and sign-off records left out ({gone}); inputs and "
                                   f"stored rows kept ({kept})")
+        ok(os.stat(os.path.join(child, "data", "derived.csv")).st_mode & 0o777 == 0o600,
+           "AM_MODE_KEPT a private input stays private in the child")
         ok(cst.get("state") == "SIGN" and cst.get("paused") == "awaiting_signoff" and cst.get("signoff") == "owner"
            and cst.get("spent_usd") == 0 and cst.get("budget_usd") == 5.0 and cst.get("max_rounds") == 2,
            f"AM_STATE the child waits at SIGN for the owner ({cst})")
@@ -609,7 +655,8 @@ def _self_test() -> int:
         ok(src.get("spec_sha256") == ssha and rec.get("dry_sign", {}).get("ok") is True
            and f"--expect-sha256 {ssha}" in cmd and f"--expect-sheet-sha256 {shsha}" in cmd
            and SO.status(child) == "awaiting",
-           f"AM_SHEET_MATCHES_SPEC the sheet shows the child spec; a copy dry-signs; the child stays unsigned ({cmd})")
+           f"AM_SHEET_MATCHES_SPEC the sheet shows the child spec; a copy dry-signs; the child stays unsigned ({cmd}, "
+           f"{rec.get('dry_sign')})")
         r = rec.get("reuse", {})
         bys = {b["out"]: b for b in r.get("batches", [])}
         ok(r.get("stored") == 6 and r.get("reusable") == 3 and bys.get("analysis/batch/points.jsonl", {}).get(
@@ -657,7 +704,10 @@ def _self_test() -> int:
                "add existing": {"reason": "r", "spec": [{"add": "constraints.envelope_usd", "value": 1}]},
                "ambiguous selector": {"reason": "r", "spec": [{"remove": "analysis.decision_tests[id=DT9]"}]},
                "invalid spec": {"reason": "r", "spec": [{"set": "comparator.package", "value": "nope"}]},
-               "not a mapping": ["x"]}
+               "not a mapping": ["x"],
+               "multiline id": {"id": "A\nextra: 1\n#", "reason": "r", "spec": [{"set": "constraints.envelope_usd",
+                                                                                 "value": 1}]},
+               "selector on a missing key": {"reason": "r", "spec": [{"remove": "options.cost_items[unit=None]"}]}}
         for name, p in bad.items():
             yaml.safe_dump(p, open(pf, "w"))
             refused(lambda: amend(par, pf, log=lambda *a: None), f"AM_BAD_PATCH_REFUSED {name}")
@@ -671,6 +721,20 @@ def _self_test() -> int:
         os.symlink(os.path.join(td, "a1.yaml"), os.path.join(par, "data", "link.yaml"))
         refused(lambda: amend(par, pf, log=lambda *a: None), "AM_LINK_REFUSED a parent holding a link")
         os.remove(os.path.join(par, "data", "link.yaml"))
+        refused(lambda: amend(par, pf, out=os.path.join(par, "figures", "c"), log=lambda *a: None),
+                "AM_OUT_INSIDE_PARENT_REFUSED a child inside the parent")
+        refused(lambda: _no_aliases(b"a: &v {x: 1}\nb: *v\n", "spec"), "AM_ALIAS_REFUSED a spec with YAML aliases")
+        sp_ = os.path.join(par, "decision_spec.yaml")
+        keep_ = open(sp_, "rb").read()
+        open(sp_, "ab").write(b"# edited after signing\n")
+        refused(lambda: amend(par, pf, log=lambda *a: None), "AM_CHANGED_AFTER_SIGN_REFUSED the working spec is not the signed one")
+        open(sp_, "wb").write(keep_)
+        w(par, "run_state.json", json.dumps(dict(st, signoff="none")))
+        rec3 = amend(par, pf, log=lambda *a: None)
+        ok(json.load(open(os.path.join(rec3["child"], "run_state.json")))["signoff"] == "owner",
+           "AM_NONE_PARENT_OWNER_CHILD a parent run without sign-off gives a child the owner signs")
+        w(par, "run_state.json", json.dumps(st))
+        shutil.rmtree(rec3["child"])
         shutil.rmtree(c2)
     if fails:
         print(f"FAIL: {len(fails)} self-test case(s) failed")
