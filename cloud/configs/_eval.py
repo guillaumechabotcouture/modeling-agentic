@@ -10,8 +10,8 @@ Environment:
     EVAL_TREE  a committed checkout to ship instead of ~/modeling-agentic-launch
                (a branch is allowed then; without it the tree must be origin/main)
     EVAL_REPS  replicates per question (default 1; labels R1..Rn on one cluster)
-    EVAL_PIPELINE  "v2" (default) or "v1": the pipeline main.py runs, passed to it explicitly and
-               checked against the shipped code before launch (cloud/run_cluster.py
+    EVAL_PIPELINE  "v2" (default; "v1" is refused: pipeline v1 is retired, owner 2026-11-20):
+               the pipeline main.py runs, passed to it explicitly and checked against the shipped code before launch (cloud/run_cluster.py
                pipeline_preflight). Until 2026-11-05 this file passed no pipeline flag, so every
                eval launch ran main.py's default, which was v1.
 

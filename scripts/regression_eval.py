@@ -5,14 +5,14 @@ Planted-defect regression eval for the deterministic gates (runs in CI).
 E5 measured which defects the gates catch by planting known defects in real
 run fixtures. Those fixtures are 100-400 MB of gitignored run output, so
 they can't run on every pull request. This eval uses the same planter
-(scripts/plant_defects.py) and matcher (scripts/score_critiques.py) on the
+(scripts/plant_defects.py; E5's lexical matcher, scripts/score_critiques.py, was removed with v1) on the
 synthetic positive-control run (scripts/lib/positive_control.py), which is
 built from code in seconds:
 
   1. build the honest positive-control run;
   2. plant one defect per variant, every applicable class, for each seed;
   3. run the validator alone on every variant (the E5 deterministic arm,
-     scripts/replay.py::deterministic_critic);
+     `deterministic_critic` below);
   4. compare with `tests/regression_baseline.yaml`.
 
 A defect counts as caught when the validator emits a finding of a kind
@@ -35,11 +35,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import asyncio
+import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 
 import yaml
 
@@ -88,10 +89,68 @@ def _kind_hit(cls: str, kinds: set[str]) -> bool:
     return False
 
 
+
+
+_STUB_REVIEWERS = ("critique-methods", "critique-domain", "critique-presentation", "critique-redteam")
+
+
+def deterministic_critic(run_dir: str, wall_timeout_s: float = 900) -> dict:
+    """E5 arm: the mechanical gate alone (no LLM). Writes empty PASS stubs for
+    the four critics so the validator runs, collects every finding it raises
+    (unresolved HIGHs, accept blockers, rigor violations of any severity),
+    removes the stubs, and records the findings as critique_deterministic.yaml. (Moved here from
+    scripts/replay.py, the v1 stage-replay lane, when v1 was retired.)"""
+    import subprocess
+    stubs = []
+    for r in _STUB_REVIEWERS:
+        p = os.path.join(run_dir, f"critique_{r.split('-', 1)[1]}.yaml")
+        yaml.safe_dump({"reviewer": r, "round": 1, "verdict": "PASS",
+                        "structural_mismatch": {"detected": False}, "blockers": [], "carried_forward": []},
+                       open(p, "w"), sort_keys=False)
+        stubs.append(p)
+    t0 = time.time()
+    cmd = [sys.executable, os.path.join(HERE, "validate_critique_yaml.py"), run_dir, "--max-rounds", "8",
+           "--current-round", "1", "--spec-compliance", "--parameter-registry", "--rigor-artifacts",
+           "--json", "--no-history"]
+    proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=float(wall_timeout_s))
+    for p in stubs:
+        os.remove(p)
+    out = proc.stdout.strip()
+    try:
+        dec = json.loads(out[out.index("{"):])
+    except (ValueError, json.JSONDecodeError):
+        dec = {"error": (proc.stderr or out)[-500:]}
+    # A schema error (exit 3), VALIDATOR_ERROR (exit 4) or a missing action
+    # is a failed evaluation, not an empty review (Codex review of PR #14).
+    failed = ("error" in dec or bool(dec.get("schema_errors"))
+              or dec.get("action") in (None, "VALIDATOR_ERROR")
+              or proc.returncode not in (0, 1))
+    if failed and "error" not in dec:
+        dec["error"] = (f"validator exit {proc.returncode}, action {dec.get('action')!r}, "
+                        f"schema_errors {dec.get('schema_errors')!r}")[:500]
+    findings = [("HIGH", b) for b in dec.get("unresolved_high") or []] + \
+               [("HIGH", b) for b in dec.get("accept_blockers") or []] + \
+               [(str(v.get("severity", "MEDIUM")).upper(), v) for v in dec.get("rigor_violations") or []]
+    seen, blockers = set(), []
+    for sev, f in findings:
+        key = (f.get("kind"), f.get("claim"))
+        if key in seen:
+            continue
+        seen.add(key)
+        blockers.append({"id": f"DET-{len(blockers) + 1:03d}", "severity": sev if sev in ("HIGH", "MEDIUM", "LOW") else "MEDIUM",
+                         "kind": f.get("kind"), "claim": str(f.get("claim") or f.get("kind") or ""),
+                         "evidence": json.dumps({k: v for k, v in f.items() if k not in ("claim",)}, default=str)[:2000]})
+    yaml.safe_dump({"reviewer": "deterministic", "round": 1, "action": dec.get("action"),
+                    "validator_exit": proc.returncode, "blockers": blockers,
+                    **({"error": dec["error"]} if "error" in dec else {})},
+                   open(os.path.join(run_dir, "critique_deterministic.yaml"), "w"), sort_keys=False)
+    return {"session_id": None, "subtype": "deterministic", "is_error": failed, "cost_usd": 0.0,
+            "num_turns": 0, "duration_s": round(time.time() - t0, 1)}
+
+
 def run_eval(seeds=SEEDS) -> dict:
     from lib import positive_control as pc
     import plant_defects as plant
-    import replay
 
     out = {"detected": {}, "planted": {}, "clean_high": [], "spurious": []}
     with tempfile.TemporaryDirectory() as root:
@@ -115,7 +174,7 @@ def run_eval(seeds=SEEDS) -> dict:
             truth = yaml.safe_load(open(os.path.join(vroot, "_truth", f"{vid}.yaml")))
             run = os.path.join(root, "runs", f"s{seed}_{vid}")
             shutil.copytree(os.path.join(vroot, vid, "inputs"), run)
-            asyncio.run(replay.deterministic_critic(run, {"wall_timeout_s": 600}))
+            deterministic_critic(run, wall_timeout_s=600)
             doc = yaml.safe_load(open(os.path.join(run, "critique_deterministic.yaml"))) or {}
             blockers = doc.get("blockers") or []
             kinds = {str(b.get("kind")) for b in blockers}
@@ -174,6 +233,11 @@ def _self_test() -> int:
        "R4 new clean HIGH fails")
     ok(any("SPURIOUS" in p for p in compare({"detected": {"a": True}, "clean_high": [], "spurious": ["k"]}, base)),
        "R5 spurious fails")
+    # R6 (v1 retirement): the deterministic arm lives here; the v1 stage-replay lane (scripts/replay.py) is gone.
+    import inspect
+    src = inspect.getsource(sys.modules[__name__])
+    ok(callable(globals().get("deterministic_critic")) and "import " + "replay" not in src,
+       "R6 the deterministic critic is this module's own; nothing imports scripts/replay.py")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
