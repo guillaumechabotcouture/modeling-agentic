@@ -282,7 +282,8 @@ REVIEWED: dict = {
     "scripts/compute.py": {
         "open-write": (10, "worker init markers, chunk inputs, stderr and the worker's sync record (" + _TMP_REASON + ")"),
         "os-remove": (5, "stale bundle members and pid files on a worker (" + _TMP_REASON + "); the worker's TLS files"),
-        "shutil": (1, "the worker's own __pycache__"), "os-rename": (1, "a pid file in the worker's call dir"),
+        "shutil": (3, "the worker's own __pycache__; restamp's own extracted launch tree (a mkdtemp dir, " + _TMP_REASON + ")"),
+        "os-rename": (1, "a pid file in the worker's call dir"),
         "os-link": (1, "the claim file in the worker's call dir (atomic claim)"),
         "os.open-write": (1, "the worker's TLS files (O_EXCL, private dir)")},
     "scripts/eval_private.py": {"shutil": (4, _EVAL), "open-write": (5, _EVAL)},

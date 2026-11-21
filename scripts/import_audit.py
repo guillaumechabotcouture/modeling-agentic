@@ -43,7 +43,7 @@ REVIEWED = {
     "scripts/claim_units.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/compute.py": {"spec_from_file_location": (3, _RUN_CODE + "; and the repo's worker_side module (twice: "
                                                          "the batch runner and the checkpoint-restore self-test)"),
-                           "import_module": (2, "strings inside its own W0-A self-test fixtures (undeclared "
+                           "import_module": (3, "strings inside its own W0-A and W0-A2 self-test fixtures (undeclared "
                                                 "dynamic imports the code closure must refuse)")},
     "scripts/lib/import_closure.py": {"import_module": (7, "strings inside its own self-test fixtures (dynamic "
                                                            "imports the code closure must refuse or take as declared)")},
