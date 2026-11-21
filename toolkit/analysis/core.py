@@ -260,6 +260,8 @@ def q(v, level=0.95) -> dict | None:
     v = np.asarray(v, float)
     if not len(v):
         return None
+    if not np.all(np.isfinite(v)):      # 1C-b 2d-iii: fail closed (one NaN made every quantile NaN)
+        raise ValueError(f"quantiles: {int(np.sum(~np.isfinite(v)))} of {len(v)} values are not finite")
     a = 100 * (1 - level) / 2
     return {"median": float(np.median(v)), "ci_low": float(np.percentile(v, a)),
             "ci_high": float(np.percentile(v, 100 - a)), "mean": float(v.mean()), "level": level}
