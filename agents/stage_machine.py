@@ -319,11 +319,11 @@ def owned_path(root: str, rel: str, owned) -> bool:
     return False
 
 
-# Phase 49 β's sign-off lifecycle in v2: a fingerprinted request (scope_signoff.record) written at
-# AWAIT_OWNER and the owner's answers taken through the harness (harness_record), honouring the
-# run's signoff mode. Not wired yet (Codex round 1 on #98): until it is, decision-bearing findings
-# stay non-declarable rather than waiting in OWNER_DECISION for an answer nobody can give.
-OWNER_LIFECYCLE_WIRED = False
+# Phase 49 β's sign-off lifecycle in v2 (autonomy 1F): a fingerprinted request (scope_signoff.record) written on the
+# AWAIT_OWNER route, kept in run_state.json, and the answers taken through the harness (harness_record), honouring the
+# run's signoff mode: the owner's under --signoff owner; under --signoff lead the lead's, provisionally (D2), so the run
+# never waits; under --signoff none decision-bearing findings stay non-declarable.
+OWNER_LIFECYCLE_WIRED = True
 
 
 def _owner_rule():
@@ -345,29 +345,70 @@ def _owner_rule():
     return scope_signoff
 
 
-def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto") -> list[dict]:
+def _bearing_item(run_dir: str, v: dict) -> dict:
+    """What the owner is asked about a decision-bearing finding: its claim and the analysis's record of the decision
+    test, fingerprinted (an answer binds to both: a changed result is asked again)."""
+    ev = None
+    try:
+        with open(os.path.join(run_dir, AB.ANALYSIS_JSON)) as fh:
+            tests = (json.load(fh) or {}).get("decision_tests") or []
+        ev = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(v.get("key"))), None)
+    except (OSError, ValueError, AttributeError, TypeError):
+        ev = None
+    gid = FL.gate_id(v)
+    fp = hashlib.sha256(json.dumps({"finding": gid, "claim": v.get("claim", ""), "evidence": ev}, sort_keys=True,
+                                   default=str).encode()).hexdigest()[:16]
+    return {"finding": gid, "kind": v.get("kind"), "reason": "a measured decision test changes the plan",
+            "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp}
+
+
+def _answer_counts(by, mode: str) -> bool:
+    """Whose answer releases an owner item: the owner's; the lead's only in a --signoff lead run (D2)."""
+    return by == "owner" or (by == "lead" and mode == "lead")
+
+
+def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto", mode: str = "owner") -> list[dict]:
     """Decision-bearing findings (a measured decision test that changes the plan) go through
-    Phase 49 β's owner rule before they can be declared. Without the rule they are not
-    scope-declarable, so the run can neither declare them away nor finish around them."""
+    Phase 49 β's owner rule before they can be declared: marked for the owner (an item the
+    AWAIT_OWNER route requests) until a recorded answer counts (`mode`: the run's sign-off).
+    Without the rule, or under --signoff none, they are not scope-declarable, so the run can
+    neither declare them away nor finish around them."""
     import validate_critique_yaml as V
     rule = _owner_rule() if rule == "auto" else rule
     bearing = [v for v in viols if v.get("decision_bearing") or v.get("kind") in DECISION_BEARING_KINDS]
     if not bearing:
         return []
-    if rule is not None:
-        for v in bearing:
-            v["owner_signoff"] = True
-            v.setdefault("owner_item", {"finding": FL.gate_id(v), "reason": "a measured decision test changes the plan",
-                                        "claim": v.get("claim", "")})
+    if rule is not None and mode != "none":
+        out = []
         try:
-            return list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable) or [])
+            answers = (getattr(rule, "verified_answers", None) or (lambda rd: ({}, [])))(run_dir)[0]
+            for v in bearing:
+                item = _bearing_item(run_dir, v)
+                a = answers.get(item["fingerprint"]) or {}
+                if str(a.get("finding")) == item["finding"] and _answer_counts(a.get("by"), mode):
+                    if a.get("decision") == "accept":
+                        v["owner_signed"] = {"by": a.get("by"), "at": a.get("at"), "fingerprint": item["fingerprint"],
+                                             **({"provisional": True} if a.get("provisional") else {})}
+                        continue
+                    v["scope_declarable"], v["owner_declined"] = False, True
+                    out.append({"kind": "scope_declaration_declined", "severity": "HIGH", "stage": "GATE",
+                                "target_stage": "MODEL", "scope_declarable": False, "key": item["finding"],
+                                "claim": f"The {a.get('by')} declined the declaration of `{item['finding']}` "
+                                         f"({a.get('at')}): {str(a.get('note') or 'no note')[:300]}."})
+                    continue
+                v["owner_signoff"], v["owner_item"] = True, item
+            return out + list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
+                                                 mode=mode) or [])
         except Exception as e:  # noqa: BLE001 -- fail closed below
             reason = f"the owner rule failed ({type(e).__name__}: {e})"
+    elif rule is not None:
+        reason = "under --signoff none nobody can accept a finding that bears on the decision"
     else:
         reason = "the owner rule (Phase 49 β, scripts/scope_signoff.py) is not available"
     for v in bearing:
         v["scope_declarable"] = False
         v.pop("owner_signoff", None)
+        v.pop("owner_signed", None)
         v["claim"] = f"{v.get('claim', '')} Not declarable: {reason}."
     return []
 
@@ -386,9 +427,10 @@ def _earlier_round(path: str, round_n: int) -> int:
 
 def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
             history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None,
-            strict_done_when: bool = False, append_history: bool | None = None) -> dict:
+            strict_done_when: bool = False, append_history: bool | None = None, signoff: str = "owner") -> dict:
     """Today's rule functions, in today's order, on the v2 findings: the critic YAMLs, the
-    harness's checks (`extra`), and optionally spec-compliance and registry findings."""
+    harness's checks (`extra`), and optionally spec-compliance and registry findings. `signoff`:
+    the run's mode, for whose answers to owner items count (apply_owner_rule)."""
     import done_when
     import validate_critique_yaml as V
     critiques, schema_errors, refused = {}, [], {}
@@ -461,7 +503,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     if spec_violations is not None:
         d = V.incorporate_spec_violations(d, list(spec_violations), max_rounds, round_n)
     viols = extra + done_when.gate_findings(dw or {})
-    viols += apply_owner_rule(run_dir, round_n, viols)
+    viols += apply_owner_rule(run_dir, round_n, viols, mode=signoff)
     for v in viols:
         k = FL.gate_key(v)
         if k:
@@ -1679,7 +1721,7 @@ class Machine:
                         spec_violations=sv(self.run_dir) if sv else None,
                         registry_violations=rv(self.run_dir) if rv else None,
                         strict_done_when=self.st.v2_rules and self.st.tries.get("schema", 0) < MAX_SCHEMA_REPAIRS,
-                        append_history=False)
+                        append_history=False, signoff=self.st.signoff)
             opened = []
             if d.get("action") and self.st.v2_rules:
                 opened = open_findings(self.run_dir, d)
@@ -1687,7 +1729,8 @@ class Machine:
                 d = require_judged(d, opened)
                 # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
                 # (synced with this decision, so a gate finding is read as this gate states it: Codex round 3 of #258)
-                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw)[0])
+                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw,
+                                                    lead_ok=self.st.signoff == "lead")[0])
                 if d.get("rule_matched") == "owner_declined":
                     drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
                                                  if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
@@ -1710,7 +1753,7 @@ class Machine:
         self.st.last_gate = {k: (d or {}).get(k) for k in ("action", "rule_matched", "rounds_remaining", "rationale")}
         self.st.last_gate.update(round=self.st.round, post_write=pw)
         if (d or {}).get("action"):
-            FL.sync(self.run_dir, d, self.st.round, post_write=pw)
+            FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")
             if d.get("rule_matched") == "4m":           # these are why the loop runs: plan them
                 led = FL.load(self.run_dir)
                 for fid in d.get("open_tested") or []:
@@ -1727,6 +1770,8 @@ class Machine:
                     return self._go("OWNER_DECISION", f"{len(amend)} finding(s) need an owner amendment "
                                                       f"({', '.join(amend)[:120]})")
         nxt, status, mode = route_gate(d, pw)
+        if nxt == "OWNER_DECISION":
+            self._request_scope(d)
         lang = (d or {}).get("report_acceptance_language") or {}
         if nxt == "FINAL" and lang.get("remaining"):
             # Not delivered with acceptance language in place (F6 S1-7): the writer repairs the draft, which then
@@ -1808,10 +1853,30 @@ class Machine:
         self.st.tries["owner_request"] = [i["fingerprint"] for i in doc["items"]]
         save_state(self.run_dir, self.st)
 
+    def _request_scope(self, d: dict) -> None:
+        """1F: the AWAIT_OWNER route's request (the decision-bearing items the gate marked), written with
+        scope_signoff.record and its fingerprints kept in run_state.json, as _request_owner does. No item: none is
+        kept, and OWNER_DECISION fails closed."""
+        import scope_signoff as SS
+        SS.record(self.run_dir, d, self.st.round, producer="agents/stage_machine.py GATE (decision-bearing findings)")
+        try:
+            req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
+        except (OSError, ValueError):
+            req = {}
+        fps = [i.get("fingerprint") for i in req.get("items") or [] if isinstance(i, dict)] \
+            if isinstance(req, dict) and req.get("pending") else []
+        if fps and all(fps):
+            self.st.tries["owner_request"] = fps
+        else:
+            self.st.tries.pop("owner_request", None)
+        save_state(self.run_dir, self.st)
+
     def h_OWNER_DECISION(self):
-        """Released only by the owner's own answers to every item of the pending request (scripts/scope_signoff.py sign
-        --by owner, from the owner's shell); the machine, the harness here, then records them (harness_record), so the
-        ledger counts them (Codex review of #258 P1-8). No pending request, an empty one or a lead's answer: it waits."""
+        """Released by the answers to every item of the pending request: the owner's (scripts/scope_signoff.py sign
+        --by owner, from the owner's shell) or, under --signoff lead (D2), the lead's provisional ones, which the harness
+        writes here so the run never waits (scope_signoff.provisional_answers); the machine then records them
+        (harness_record), so the ledger counts them (Codex review of #258 P1-8). No recorded request: it fails closed.
+        Under --signoff owner a lead's answer does not count: it waits."""
         import scope_signoff as SS
         try:
             req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
@@ -1826,13 +1891,31 @@ class Machine:
             return self._go("FINAL", "OWNER_DECISION has no recorded owner request: relaunch with reuse (a new run dir "
                                      "from this one's spec and stored rows)", "run_failed")
         answers, bad = SS.load_answers(self.run_dir)
-        answered = bool(want) and not bad and all(
-            isinstance(answers.get(fp), dict) and answers[fp].get("by") == "owner"
-            and answers[fp].get("decision") in SS.DECISIONS for fp in want)
+        lead = self.st.signoff == "lead"
+
+        def done(fp):
+            a = answers.get(fp)
+            return isinstance(a, dict) and _answer_counts(a.get("by"), self.st.signoff) and a.get("decision") in SS.DECISIONS
+        if lead and (bad or not all(done(fp) for fp in want)):
+            items = {i.get("fingerprint"): i for i in (req or {}).get("items") or [] if isinstance(i, dict)} \
+                if isinstance(req, dict) else {}
+            if any(fp not in items for fp in want):
+                _withhold_report(self.run_dir)
+                return self._go("FINAL", "the owner request cannot be read, so the lead cannot answer it: relaunch with "
+                                         "reuse", "run_failed")
+            todo = [items[fp] for fp in want if bad or not done(fp)]
+            SS.provisional_answers(self.run_dir, todo, self.st.round,
+                                   plan_changing={i["fingerprint"]: _plan_changing(i) for i in todo})
+            self.st.history.append({"at": _now(), "provisional": [i.get("finding") for i in todo], "by": "lead",
+                                    "state": "OWNER_DECISION"})
+            answers, bad = SS.load_answers(self.run_dir)
+        answered = bool(want) and not bad and all(done(fp) for fp in want)
         if answered:
             SS.harness_record(self.run_dir)
             self.st.tries.pop("owner_request", None)
-            nxt = self._go("GATE", "the owner answered the scope declarations")    # persisted before the request closes
+            who = "the lead answered provisionally" if lead and any(answers[fp].get("by") == "lead" for fp in want) \
+                else "the owner answered"
+            nxt = self._go("GATE", f"{who} the scope declarations")    # persisted before the request closes
             if isinstance(req, dict):
                 from lib.safe_io import write_nofollow
                 write_nofollow(self.run_dir, OWNER_REQUEST, json.dumps(dict(req, pending=False, answered_at=_now()),
@@ -2071,6 +2154,51 @@ def _status_line(run_dir: str, status: str | None) -> str:
     return f"{STATUS_MARK}\n**Run status: {text}.** (`{status}`; rendered by the harness)\n\n"
 
 
+def _plan_changing(item: dict) -> bool:
+    """An owner item whose evidence shows the plan changes: a decision-bearing kind, or a declaration whose decision
+    test changes the decision."""
+    return item.get("kind") in DECISION_BEARING_KINDS or any(
+        (d.get("test") or {}).get("decision_changes") is True for d in item.get("declarations") or [] if isinstance(d, dict))
+
+
+def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:
+    """(lines above the draft, a section after it): the lead's provisional decisions of a --signoff lead run (D2),
+    the owner items answered (scripts/scope_signoff.py provisional) and the engine departures credited
+    (`provisional_lead` in engine_choice.json). Those whose decision test changes the plan head the report."""
+    import scope_signoff as SS
+    try:
+        rows = [(r.get("finding"), bool(r.get("plan_changing")), (r.get("review") or {}).get("decision"))
+                for r in SS.provisional(run_dir)]
+    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the list could not be read
+        return ([f"**Provisional decisions: the list could not be read ({type(e).__name__}).**\n\n"],
+                ["", "## Provisional decisions (the lead's)", "", f"Could not be read: {type(e).__name__}: {e}"])
+    try:
+        ch = json.load(open(os.path.join(run_dir, AB.ENGINE_CHOICE)))
+        deps = [d for d in ch.get("engine_departures") or [] if isinstance(d, dict) and d.get("status") == "provisional_lead"]
+    except (OSError, ValueError, AttributeError):
+        deps = []
+    try:
+        changes = {str(t.get("id")) for t in (json.load(open(os.path.join(run_dir, AB.ANALYSIS_JSON))) or {}).get(
+            "decision_tests") or [] if isinstance(t, dict) and t.get("plan_changes")}
+    except (OSError, ValueError, AttributeError, TypeError):
+        changes = set()
+    rows += [(f"engine departure {d.get('benchmark') or d.get('component')}", str(d.get("decision_test")) in changes,
+              None) for d in deps]
+    if not rows:
+        return [], []
+    flagged = [f for f, pc, _r in rows if pc]
+    how = (f"`python3 scripts/scope_signoff.py review {run_dir} --finding <id> --confirm|--overturn`; an engine departure "
+           "is confirmed by the owner's signature of the spec in a relaunch")
+    top = [f"**Provisional decisions that change the plan.** This run was unattended (`--signoff lead`); the lead "
+           f"answered, provisionally, {len(flagged)} decision(s) that are the owner's and whose decision test changes the "
+           f"plan: {', '.join(map(str, flagged))}. The owner confirms or overturns each ({how}).\n\n"] if flagged else []
+    sec = ["", "## Provisional decisions (the lead's, under --signoff lead; for the owner's review)", "",
+           f"Each decision below is the owner's; the lead made it provisionally so the run could finish. Review: {how}.", ""]
+    sec += [f"- **{f}**: accepted provisionally; plan changes: {'yes' if pc else 'no'}; owner review: "
+            f"{r or 'not yet'}." for f, pc, r in rows]
+    return top, sec
+
+
 def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     """report.md = the run status line, the writer's draft, and the blocks the harness renders from
     artifacts: the headline numbers, the declared limits and open findings (in full, with their
@@ -2130,7 +2258,9 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
             lines += ["", open(wmp, encoding="utf-8").read().rstrip()]
     except (OSError, ValueError) as e:      # fail soft: the report is rendered without it, and says so
         lines += ["", f"## World model\n\nThe world-model section could not be read: {type(e).__name__}."]
-    head, body = _status_line(run_dir, status), draft.rstrip() + "\n"
+    top, prov = provisional_lines(run_dir)
+    lines += prov
+    head, body = _status_line(run_dir, status) + "".join(top), draft.rstrip() + "\n"
     full = head + body + "\n".join(lines) + "\n"
     _put(run_dir, "report.md", full)
     # What the harness added, authenticated by the report's hash: writer_qa checks only the writer's span.

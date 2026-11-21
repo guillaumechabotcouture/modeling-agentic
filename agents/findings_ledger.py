@@ -338,21 +338,24 @@ def answer_fingerprint(fid: str, claim, fix_requires) -> str:
                                      sort_keys=True).encode()).hexdigest()[:16]
 
 
-def owner_answers(run_dir: str) -> dict[str, dict]:
+def owner_answers(run_dir: str, lead_ok: bool = False) -> dict[str, dict]:
     """The owner's answers (fingerprint -> {finding, decision, ...}) that the harness recorded (scripts/scope_signoff.py
     verified_answers: the answer's hash under a nonce trace.jsonl also holds), signed by the owner. Nothing else counts
-    (Codex review of #258 P1-8): not a lead's answer, not one written to scope_signoff.json without the harness."""
+    (Codex review of #258 P1-8): not a lead's answer, not one written to scope_signoff.json without the harness.
+    `lead_ok` (the run is a --signoff lead run, D2): the lead's recorded answers count too, as provisional ones."""
     try:
         import scope_signoff as SS
         verified, _bad = SS.verified_answers(run_dir)
     except Exception:  # noqa: BLE001 -- unreadable: no answer counts (fail closed)
         return {}
-    return {fp: a for fp, a in verified.items() if isinstance(a, dict) and a.get("by") == "owner"
+    by = ("owner", "lead") if lead_ok else ("owner",)
+    return {fp: a for fp, a in verified.items() if isinstance(a, dict) and a.get("by") in by
             and a.get("finding") and a.get("decision") in ("accept", "decline")}
 
 
 # ------------------------------------------------------------------ sync
-def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: bool = False) -> tuple[dict[str, Finding], list[str]]:
+def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: bool = False,
+         lead_ok: bool = False) -> tuple[dict[str, Finding], list[str]]:
     """Bring the ledger up to date with the run's files and (optionally) a fresh gate decision.
 
     A gate finding open before and absent from this gate is `fixed` (pre-write
@@ -366,7 +369,7 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
     problems += p2
     decl, p3 = declarations(run_dir)
     problems += p3
-    answers = owner_answers(run_dir)
+    answers = owner_answers(run_dir, lead_ok)
     seen = set()
     for new in crit + gate_rows:
         seen.add(new.id)
@@ -424,12 +427,12 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         a = answers.get(answer_fingerprint(f.id, f.claim, f.fix_requires))    # bound to this claim and remedy
         ans = a.get("decision") if a and str(a.get("finding")) == f.id else None
         if ans is None and f.resolution_type == "owner_decision" and f.status in ("open", "declared") \
-                and any(isinstance(e, dict) and e.get("by") == "owner" for e in f.events):
+                and any(isinstance(e, dict) and e.get("by") in ("owner", "lead") for e in f.events):
             f.resolution_type = "fix"        # answered as it was before; revised since, so it is asked again
         if ans and f.status in ("open", "declared"):
             f.status = "owner_accepted" if ans == "accept" else "owner_declined"
             f.resolution_type = "owner_decision"
-            _event(f, round_n, f.status, "owner")
+            _event(f, round_n, f.status, "lead" if a.get("by") == "lead" else "owner")
     save(run_dir, led)
     return led, problems
 

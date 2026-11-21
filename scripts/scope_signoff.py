@@ -5,6 +5,8 @@
     python3 scripts/scope_signoff.py status <run_dir>     # none | awaiting | answered
     python3 scripts/scope_signoff.py sign <run_dir> --answers answers.yaml [--note "..."]
     python3 scripts/scope_signoff.py sign <run_dir> --accept-all | --decline-all [--note "..."]
+    python3 scripts/scope_signoff.py provisional <run_dir>   # a lead run's provisional answers and their review
+    python3 scripts/scope_signoff.py review <run_dir> --finding <id> --confirm | --overturn [--note "..."]
     python3 scripts/scope_signoff.py --self-test
 
 E7 attempt 8 scope-declared, by the lead alone, the two findings that most
@@ -39,6 +41,11 @@ How it runs
   under a nonce the harness also writes to trace.jsonl. An answer without that
   record does not count, so a signature an agent wrote is not an approval; no
   script an agent runs is credited with writing it (agents/integrity.py).
+* v2 `--signoff lead` (owner default D2, autonomy 1F): the run never waits for the owner. The
+  harness answers each pending item `accept` as the lead, marked `provisional`
+  (`provisional_answers`), records it like any answer, and the report lists it (heading the report
+  when a decision test shows the plan changes). The owner later confirms or overturns each one
+  (`review`); the lead's answer stays in the record beside the owner's review.
 * `--signoff none`: no sign-off is asked for; the findings are declarable as
   before (the decision test of Phase 49 α still applies).
 * An accepted finding is declarable again (its α decision test is replaced by
@@ -358,10 +365,12 @@ def lead_answers(run_dir: str) -> Optional[dict]:
 
 
 def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional[list] = None,
-                  non_declarable: Callable[[str, object], bool] = lambda k, e: e is False) -> list[dict]:
+                  non_declarable: Callable[[str, object], bool] = lambda k, e: e is False,
+                  mode: Optional[str] = None) -> list[dict]:
     """Mark each decision-bearing HIGH finding of `current` for the owner (in
-    place), and report declined ones. Nothing under --signoff none."""
-    mode = os.environ.get("MA_SIGNOFF_MODE")
+    place), and report declined ones. Nothing under --signoff none. `mode`: the run's
+    sign-off mode (v2 passes it; else MA_SIGNOFF_MODE)."""
+    mode = os.environ.get("MA_SIGNOFF_MODE") if mode is None else mode
     if mode == "none":
         return []
     cfg = load_map()
@@ -446,7 +455,8 @@ def _not_applicable_analyses(run_dir: str, entries: list[dict], cfg: dict, ctx: 
     return out
 
 
-def record(run_dir: str, decision: dict, round_n: Optional[int] = None) -> Optional[str]:
+def record(run_dir: str, decision: dict, round_n: Optional[int] = None,
+           producer: str = "scripts/validate_critique_yaml.py") -> Optional[str]:
     """Write the request when the decision waits for the owner; mark an older
     pending request superseded otherwise. Returns the path written, if any."""
     p = os.path.join(run_dir, REQUEST)
@@ -460,7 +470,7 @@ def record(run_dir: str, decision: dict, round_n: Optional[int] = None) -> Optio
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     if decision.get("action") == ACTION and items:
         doc = {"pending": True, "round": round_n, "requested_at": now, "items": items,
-               "decision_rationale": decision.get("rationale"), "producer": "scripts/validate_critique_yaml.py"}
+               "decision_rationale": decision.get("rationale"), "producer": producer}
     else:
         old = _load_request(run_dir)
         if not old or not old.get("pending"):
@@ -565,14 +575,79 @@ def sign(run_dir: str, by: str, answers: Optional[dict] = None, all_decision: Op
                                   "round": req.get("round")}
     if missing:
         raise ValueError("no accept/decline answer for " + ", ".join(missing))
-    doc = {"answers": {**prior, **new}, "last_signed_by": by, "last_signed_at": now,
-           "producer": "scripts/scope_signoff.py"}
+    doc = {**_raw_doc(run_dir), "answers": {**prior, **new}, "last_signed_by": by, "last_signed_at": now,
+           "producer": "scripts/scope_signoff.py"}      # the owner's reviews of provisional answers are kept
     from lib.safe_io import LinkRefused, write_nofollow
     try:          # never through a link; published atomically (run console review round 2, P1-2)
         write_nofollow(run_dir, SIGNOFF, json.dumps(doc, indent=1).encode(), atomic=True)
     except (LinkRefused, OSError) as e:
         raise ValueError(f"{SIGNOFF} not written: {e}") from None
     return {"signed_by": by, "signed_at": now, "answers": new}
+
+
+def _raw_doc(run_dir: str) -> dict:
+    """scope_signoff.json as a mapping, {} when absent or unreadable (its answers are checked by load_answers)."""
+    try:
+        with open(os.path.join(run_dir, SIGNOFF), encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def provisional_answers(run_dir: str, items: list[dict], round_n: Optional[int] = None,
+                        plan_changing: Optional[dict] = None) -> dict:
+    """D2 (v2 `--signoff lead`): the harness answers each item `accept` as the lead, provisionally: the run goes on
+    with the finding declared, and the owner confirms or overturns the answer later (`review`). Only the harness calls
+    it, at OWNER_DECISION, and records the answers as it records the owner's (harness_record). An owner's answer
+    already given is kept. `plan_changing` {fingerprint: bool}: a decision test shows the plan changes."""
+    prior, bad = load_answers(run_dir)
+    prior = {} if bad else prior
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    new = {}
+    for it in items:
+        fp = it.get("fingerprint")
+        if not fp or (prior.get(fp) or {}).get("by") == "owner":
+            continue
+        new[fp] = {"finding": it.get("finding"), "decision": "accept", "by": "lead", "provisional": True,
+                   "plan_changing": bool((plan_changing or {}).get(fp)), "kind": it.get("kind"), "at": now,
+                   "round": round_n, "note": "provisional lead answer (--signoff lead, owner default D2): the run "
+                                             "continues with the finding declared; the owner confirms or overturns it"}
+    doc = {**_raw_doc(run_dir), "answers": {**prior, **new}, "last_signed_by": "lead", "last_signed_at": now,
+           "producer": "agents/stage_machine.py OWNER_DECISION (provisional lead answers)"}
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, SIGNOFF, json.dumps(doc, indent=1).encode(), atomic=True)
+    return new
+
+
+def provisional(run_dir: str) -> list[dict]:
+    """The lead's provisional answers the harness recorded (verified_answers), each with the owner's review (None:
+    not reviewed yet), in the order given."""
+    answers, _bad = verified_answers(run_dir)
+    reviews = _raw_doc(run_dir).get("reviews")
+    reviews = reviews if isinstance(reviews, dict) else {}
+    rows = [dict(a, fingerprint=fp, review=reviews.get(fp) if isinstance(reviews.get(fp), dict) else None)
+            for fp, a in answers.items() if a.get("by") == "lead" and a.get("provisional") is True]
+    return sorted(rows, key=lambda r: (str(r.get("at")), str(r.get("finding"))))
+
+
+def review(run_dir: str, finding: str, decision: str, note: str = "") -> dict:
+    """The owner's review of a provisional lead answer: `confirm` or `overturn`, recorded beside it (the lead's answer
+    stays as it was given). The run that made it may have finished; an overturned answer takes effect in a relaunch
+    with reuse, where the owner answers the item themselves."""
+    if decision not in ("confirm", "overturn"):
+        raise ValueError("review needs confirm or overturn")
+    rows = [r for r in provisional(run_dir) if str(r.get("finding")) == str(finding)]
+    if not rows:
+        raise ValueError(f"no provisional lead answer for {finding!r} (scripts/scope_signoff.py provisional lists them)")
+    doc = _raw_doc(run_dir)
+    rev = doc.get("reviews") if isinstance(doc.get("reviews"), dict) else {}
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    for r in rows:
+        rev[r["fingerprint"]] = {"decision": decision, "by": "owner", "at": now, "note": note}
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, SIGNOFF, json.dumps(dict(doc, reviews=rev), indent=1).encode(), atomic=True)
+    return rev
 
 
 def answer_text(run_dir: str) -> str:
@@ -843,10 +918,11 @@ def _self_test() -> int:
             ok(False, "SO32 a review of a finding with no provisional answer is refused")
         except ValueError:
             ok(True, "SO32 a review of a finding with no provisional answer is refused")
-        sign(d, "owner", {"f2": "decline"})
         rows = provisional(d)
-        ok([(r["finding"], (r["review"] or {}).get("decision")) for r in rows] == [("f1", "confirm")]
-           and json.load(open(os.path.join(d, SIGNOFF)))["answers"]["fp2"]["by"] == "owner",
+        sign(d, "owner", {"f1": "accept", "f2": "decline"})
+        doc = json.load(open(os.path.join(d, SIGNOFF)))
+        ok([(r["finding"], (r["review"] or {}).get("decision")) for r in rows] == [("f1", "confirm"), ("f2", None)]
+           and doc["answers"]["fp2"]["by"] == "owner" and doc["reviews"]["fp1"]["decision"] == "confirm",
            f"SO33 the owner's review is recorded; a later owner answer replaces the lead's and keeps the reviews ({rows})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
@@ -858,13 +934,16 @@ def _self_test() -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
-    ap.add_argument("cmd", nargs="?", choices=["show", "status", "sign"])
+    ap.add_argument("cmd", nargs="?", choices=["show", "status", "sign", "provisional", "review"])
     ap.add_argument("run_dir", nargs="?")
     ap.add_argument("--by", default=None, choices=["owner"])
     ap.add_argument("--answers", help="YAML mapping finding -> accept|decline (or {decision, note})")
     ap.add_argument("--accept-all", action="store_true")
     ap.add_argument("--decline-all", action="store_true")
     ap.add_argument("--note", default="")
+    ap.add_argument("--finding", help="review: the provisional answer's finding")
+    ap.add_argument("--confirm", action="store_true")
+    ap.add_argument("--overturn", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -878,12 +957,28 @@ def main(argv=None) -> int:
     if a.cmd == "status":
         print(status(a.run_dir))
         return 0
+    if a.cmd == "provisional":
+        for r in provisional(a.run_dir) or [{}]:
+            print(f"{r['finding']}: {r['decision']} by the lead, provisional; plan changes: {r.get('plan_changing')}; "
+                  f"owner review: {(r.get('review') or {}).get('decision', 'not yet')}" if r else "none")
+        return 0
     if os.environ.get("MA_SIGNOFF_MODE"):
         # Set only in the agents' environment (main.py): the owner signs from a shell of their own.
         # Under --signoff lead the lead writes scope_signoff_answers.yaml and the harness signs.
         print("Agents cannot sign scope declarations. Owner: sign from your own shell. Lead (--signoff lead): "
               f"write {LEAD_ANSWERS} and end your turn with AWAITING_SIGNOFF.", file=sys.stderr)
         return 1
+    if a.cmd == "review":
+        if not a.finding or a.confirm == a.overturn:
+            ap.error("review needs --finding and one of --confirm / --overturn")
+        try:
+            review(a.run_dir, a.finding, "confirm" if a.confirm else "overturn", a.note)
+        except (ValueError, OSError) as e:
+            print(f"Not recorded: {e}", file=sys.stderr)
+            return 1
+        print(f"Recorded the owner's {'confirmation' if a.confirm else 'overturn'} of {a.finding}."
+              + ("" if a.confirm else " It takes effect in a relaunch with reuse, where you answer the item yourself."))
+        return 0
     if a.by is None:
         ap.error("sign needs --by owner")
     try:
