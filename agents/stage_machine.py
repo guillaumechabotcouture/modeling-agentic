@@ -2789,8 +2789,8 @@ def _self_test() -> int:
                f"declared or accepted (Codex review of #258 P1-11) ({s2}, {p2[-5:]})")
         # W0-F: a held-out target whose automatic test changes the plan pauses the run once at OWNER_DECISION; one
         # whose test changes nothing is a declared limitation, and the run is not interrupted
-        def conflict_run(name, changes):
-            d_, T_, st_ = new_run(name, {}, max_rounds=2)
+        def conflict_run(name, changes, **kw):
+            d_, T_, st_ = new_run(name, {}, max_rounds=2, **kw)
             os.makedirs(os.path.join(d_, "analysis"), exist_ok=True)
             import yaml as _y
             _y.safe_dump({"data": {"policy": "declare_and_test", "refused": None, "needs_owner": ["g|1"] if changes
@@ -2821,6 +2821,27 @@ def _self_test() -> int:
                and "Held-out calibration targets" in open(os.path.join(dq, "report.md")).read(),
                f"T_CONFLICT_PLAN_CHANGE_PAUSES_ONCE the owner's accept resumes the run, which is not paused again, and "
                f"the report lists the held-out target ({sq2}, {nq} pause(s))")
+        # T_CONFLICT_LEAD_FLAGGED (Codex r4 of #316): under --signoff lead a conflict whose test changes the plan is
+        # answered provisionally and flagged as plan-changing: the request item carries the conflict's structured
+        # verdict, and the report names it above the draft and labels it "plan changes: yes"
+        dl, Tl, sl = conflict_run("conflict_change_lead", True, signoff="lead")
+        try:
+            rl = json.load(open(os.path.join(dl, "scope_signoff_request.json")))
+        except (OSError, ValueError):
+            rl = {}
+        it_l = next((i for i in rl.get("items") or [] if i.get("finding") == "evidence_conflict_declared:g|1"), {})
+        rep_cl = open(os.path.join(dl, "report.md")).read() if os.path.exists(os.path.join(dl, "report.md")) else ""
+        try:
+            span_cl = json.load(open(os.path.join(dl, "report_render.json")))["writer_span"]
+        except (OSError, ValueError, KeyError):
+            span_cl = [0, 0]
+        top_cl = rep_cl[:span_cl[0]]
+        ok(not sl.startswith("paused") and (it_l.get("conflict") or {}).get("status") == "CHANGES_PLAN"
+           and (it_l.get("conflict") or {}).get("verdicts") == {"conflict_1_g_1_lo": "CHANGES_PLAN"}
+           and "Provisional decisions that change the plan" in top_cl and "evidence_conflict_declared:g|1" in top_cl
+           and "**evidence_conflict_declared:g|1**: accepted provisionally; plan changes: yes" in rep_cl[span_cl[1]:],
+           f"T_CONFLICT_LEAD_FLAGGED a lead run flags a plan-changing conflict above the draft, with its verdict in the "
+           f"request ({sl}, {it_l.get('conflict')}, top has it: {'evidence_conflict_declared' in top_cl})")
         dn, Tn, sn = conflict_run("conflict_nochange", False)
         ok(sn in ACCEPTED_STATUSES and not os.path.exists(os.path.join(dn, "scope_signoff_request.json"))
            and FL.load(dn)["evidence_conflict_declared:g|1"].status == "declared"

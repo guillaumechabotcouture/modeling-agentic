@@ -1200,6 +1200,21 @@ def _self_test() -> int:
         req_ = req_ if isinstance(req_, dict) else {"error": req_}
         ok(req_.get("pending") is True and [i.get("fingerprint") for i in req_.get("items") or []] == ["fpb"],
            f"SO40 a delayed record for round 1 leaves round 2's pending request in place ({req_})")
+    # SO41 (Codex r4 of #316): an evidence-conflict item shows the owner its tests' verdicts, not "untested"
+    with tempfile.TemporaryDirectory() as d:
+        conf = {"status": "CHANGES_PLAN", "changes_plan": True, "tests": ["conflict_1_g_1_lo"],
+                "verdicts": {"conflict_1_g_1_lo": "CHANGES_PLAN"}}
+        json.dump({"pending": True, "round": 2, "items": [
+            {"finding": "evidence_conflict_declared:g|1", "kind": "evidence_conflict_declared", "fingerprint": "fpc",
+             "claim": "c", "reason": "r", "declarations": [], "declared": False, "conflict": conf},
+            {"finding": "evidence_conflict_declared:h|2", "kind": "evidence_conflict_declared", "fingerprint": "fpn",
+             "claim": "c", "reason": "r", "declarations": [], "declared": False,
+             "conflict": dict(conf, status="NOT_RUN", verdicts={"t2": "NOT_RUN"})}]}, open(os.path.join(d, REQUEST), "w"))
+        md = render_md(d)
+        sec1, sec2 = md.split("## 2.")[0], md.split("## 2.")[1] if "## 2." in md else ""
+        ok("untested" not in md and "conflict_1_g_1_lo: CHANGES_PLAN" in sec1 and "changes the plan: **yes**" in sec1
+           and "unknown (a test did not run)" in sec2,
+           f"SO41 an evidence-conflict item shows its tests' verdicts, not 'untested' ({md[:600]!r})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
