@@ -2199,6 +2199,8 @@ def _self_test() -> int:
         m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
         s = m.run()
         ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
+        pz = [(h.get("paused"), h.get("state")) for h in load_state(d).history if "paused" in h]
+        ok(pz == [("awaiting_signoff", "SIGN")], f"RR1 a SIGN pause writes one history entry ({pz})")
         from toolkit.spec import preconditions as _PC      # #215: this signing path runs the shared preconditions
         _PC.CHECKS["_t17"] = lambda r, sp, by: [f"refused for {by}"]
         try:
@@ -2322,6 +2324,8 @@ def _self_test() -> int:
            and "D-040" in json.dumps(rq.get("findings")) and "redraft the envelope" in json.dumps(rq.get("briefs"))
            and rq.get("signed_spec_sha256") == hashlib.sha256(signed_bytes).hexdigest(),
            f"R3-2 a rethink of a signed spec writes the request and pauses; nothing is redrafted ({s}, {T2.calls[-3:]})")
+        pz = [(h.get("paused"), h.get("state")) for h in load_state(d).history if "paused" in h]
+        ok(pz[-1:] == [("awaiting_spec_amendment", "SPEC")], f"RR2 an amendment pause writes a history entry ({pz})")
         T3 = StubTasks(T.s)
         s2 = _SpikeMachine(d, T3, None, log=lambda *a: None, cross_engine_check=False).run()
         ok(s2 == "paused:awaiting_spec_amendment" and "draft_spec" not in T3.calls
@@ -2389,6 +2393,11 @@ def _self_test() -> int:
            and "SPEC" not in p and not any(c.startswith("fix:") for c in T.calls)
            and req.get("pending") and [i.get("finding") for i in req.get("items") or []] == ["D-031"],
            f"R3-3 an owner-amendment finding pauses at OWNER_DECISION with a request, no redraft ({s}, {p[-4:]})")
+        import harness_metrics as _HM
+        pz = _HM.pauses(_HM.load_run(d))
+        ok([(x["reason"], x["state"], x["from"]) for x in pz][-1:] == [("awaiting_scope_signoff", "OWNER_DECISION",
+                                                                        "record")],
+           f"RR3 a scope pause writes a history entry; harness_metrics reads it as a record ({pz[-1:]})")
         if req.get("pending"):
             import scope_signoff as _SS
             # Codex re-review of #258 P1-8: the request the machine made is what must be answered, not whatever request
@@ -2479,8 +2488,28 @@ def _self_test() -> int:
            and load_state(d).status is None,
            f"R3-4 a $0.13 allowance starts no task; the run pauses awaiting budget ({s}, {T.calls}, {T.allowances})")
         T2 = StubTasks(T.s)
+        mp4 = os.path.join(d, "metadata.json")
+        json.dump(dict(json.load(open(mp4)), invocations=[{"at": "2020-01-01T00:00:00"}, {"at": "2020-01-01T01:00:00"}]),
+                  open(mp4, "w"))
         s2 = run_v2("toy question", d, T2, signoff="none", budget_usd=60.0, log=lambda *a: None,
                     backend=spike, cross_engine_check=False)
+        m4, h4 = json.load(open(mp4)), load_state(d).history
+        ok(m4["invocations"][-1].get("budget_usd") == 60.0 and m4["invocations"][-1].get("cap_usd") == 60.0
+           and "budget_usd" not in m4["invocations"][0] and set(m4.get("models") or {}) == {"deep", "fast"}
+           and m4.get("sdk_version") and m4["invocations"][-1].get("models") == m4["models"]
+           and sum(1 for h in h4 if h.get("paused") == AWAITING_BUDGET) == 1,
+           f"RR4 each invocation records its budget, the cap in force, the model ids and the SDK version; the budget "
+           f"pause has one entry ({m4['invocations'][-1]}, {m4.get('sdk_version')})")
+        dp = os.path.join(td, "rr5_child")
+        os.environ["MA_PARENT_RUN"] = d
+        try:
+            init_run(dp, "toy question", derived_inputs=False)
+        finally:
+            os.environ.pop("MA_PARENT_RUN", None)
+        pr = json.load(open(os.path.join(dp, "metadata.json"))).get("parent_run") or {}
+        ok(pr.get("run_dir") == os.path.basename(d) and pr.get("run_state_sha256") == hashlib.sha256(
+            open(os.path.join(d, STATE_FILE), "rb").read()).hexdigest(),
+           f"RR5 a run launched with MA_PARENT_RUN records its parent and the parent's run_state hash ({pr})")
         ok(not s2.startswith("paused") and "draft_spec" in T2.calls
            and load_state(d).budget_usd == 60.0
            and any(h.get("budget_raised") for h in load_state(d).history),
