@@ -2003,7 +2003,8 @@ def batch_reuse(run_dir: str) -> list:
             out.append({"out": rel, "fn": doc["fn"], "reused": False, "why": f"not checked: {e}"})
             continue
         out.append({"out": rel, "fn": doc["fn"], "n": doc.get("n"), "reused": not why,
-                    "why": why or "key and observed closure match"})
+                    "why": why or "key and observed closure match" + (
+                        "; the engine identity is checked when the batch runs" if kp.get("extra") else "")})
     return out
 
 

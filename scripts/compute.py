@@ -311,8 +311,12 @@ def _local_init(run_dir: str, fn_spec: str, init_dir: str | None = None, guard_r
         os.setpgrp()
     os.chdir(run_dir)
     _OBSERVED.update(run=run_dir, repo=repo or REPO)      # the caller's tree: what observed paths are relative to
+    if not _OBSERVED["hooked"]:
+        sys.addaudithook(_audit)                           # W0-A: files read and children started, from here on
+        _OBSERVED["hooked"] = True
     try:
         _LOCAL_FN = load_fn(run_dir, fn_spec)
+        _observed_files()          # hash what the load read now, near when it was read (an edit mid-batch is caught)
     except BaseException as e:
         if init_dir:
             open(os.path.join(init_dir, f"{os.getpid()}.err"), "w").write(f"{type(e).__name__}: {e}"[:500])
@@ -332,38 +336,61 @@ def _local_chunk(chunk):
     return out
 
 
-# W0-A: the observed closure. After each job returns, the repo and run files this process has imported (its
-# sys.modules entries' __file__) are recorded with their sha256. A row carries the id of that set (`observed_id`, a
-# digest of it) and, when the set changed since this process last sent it, the set itself (`observed`). A stored row
-# is reused only while every file of its set re-hashes the same here (_observed_check). `observed_child`: the process
-# had a child process (it may have read files it did not import), so the key also holds the whole tree.
-_OBSERVED = {"run": None, "repo": None, "digests": {}, "sent": None}
+# W0-A: the observed closure. After each job returns, the repo and run files this process has used are recorded with
+# their sha256: its sys.modules entries' __file__, and the files it opened for reading (an audit hook, installed before
+# the model loads: imports, runpy, data read by path); run files only when Python (run_files covers models/ and
+# data/). A row carries the id of that set (`observed_id`, a digest of it) and, when the set changed since this
+# process last sent it, the set itself (`observed`). A stored row is reused only while every file of its set
+# re-hashes the same here (_observed_check). `observed_child`: the process started a child process (it may have
+# read files it did not record), so the key also holds the whole tree.
+_OBSERVED = {"run": None, "repo": None, "digests": {}, "sent": None, "opened": set(), "child": False, "hooked": False}
+_CHILD_EVENTS = ("subprocess.Popen", "os.system", "os.posix_spawn", "os.spawn", "os.exec", "os.fork", "os.forkpty",
+                 "pty.spawn")
+
+
+def _audit(event: str, args) -> None:
+    if event == "open":
+        path, mode = args[0], args[1] if len(args) > 1 else None
+        flags = args[2] if len(args) > 2 and isinstance(args[2], int) else 0
+        if isinstance(path, (str, bytes)) and not any(c in str(mode or "") for c in "wax+") \
+                and not flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
+            _OBSERVED["opened"].add(os.path.abspath(os.fsdecode(path)))
+    elif event in _CHILD_EVENTS:
+        _OBSERVED["child"] = True
 
 
 def _observed_files() -> dict:
-    """{path: sha256} of this process's imported repo files (relative to REPO) and run files ("run:<rel>")."""
-    run = os.path.realpath(_OBSERVED["run"] or os.getcwd())
-    roots = ((run + os.sep, "run:"), (os.path.realpath(_OBSERVED["repo"] or REPO) + os.sep, ""))  # run may be in repo
+    """{path: sha256} of the repo files (relative to REPO) and run Python files ("run:<rel>") this process used. The
+    path is kept as used (a linked module is re-checked through its link), else as resolved."""
+    run, repo = _OBSERVED["run"] or os.getcwd(), _OBSERVED["repo"] or REPO
+    roots = [(base + os.sep, tag) for d, tag in ((run, "run:"), (repo, ""))       # a run dir may lie in the repo
+             for base in dict.fromkeys((os.path.abspath(d), os.path.realpath(d)))]
     got, cache = {}, _OBSERVED["digests"]
-    for m in list(sys.modules.values()):
-        f = getattr(m, "__file__", None)
-        if not isinstance(f, str):
+    used = [getattr(m, "__file__", None) for m in list(sys.modules.values())] + sorted(_OBSERVED["opened"])
+    for f in used:
+        if not isinstance(f, str) or "__pycache__" in f or f.endswith(".pyc"):
             continue
-        real = os.path.realpath(f)
-        for base, tag in roots:
-            if real.startswith(base):
-                if real not in cache:
-                    try:
-                        cache[real] = _file_digest(real)
-                    except (OSError, ValueError):
-                        cache[real] = "unreadable"            # never matches: no reuse
-                got[tag + os.path.relpath(real, base[:-1]).replace(os.sep, "/")] = cache[real]
+        for path in (os.path.abspath(f), os.path.realpath(f)):
+            hit = next(((b, t) for b, t in roots if path.startswith(b)), None)
+            if hit is None:
+                continue
+            rel = hit[1] + os.path.relpath(path, hit[0][:-1]).replace(os.sep, "/")
+            if (hit[1] and not rel.endswith(".py")) or rel in _FP_REPO_SKIP or os.path.isdir(path):
                 break
+            if path not in cache:
+                try:
+                    cache[path] = _file_digest(path)
+                except (OSError, ValueError):
+                    cache[path] = "unreadable"            # never matches: no reuse
+            got[rel] = cache[path]
+            break
     return got
 
 
 def _had_child() -> bool:
-    """This process started a child (finished and reaped, or still alive). Cheap, best effort."""
+    """This process started a child (seen by the audit hook, reaped, or still alive). Cheap, best effort."""
+    if _OBSERVED["child"]:
+        return True
     import resource
     ru = resource.getrusage(resource.RUSAGE_CHILDREN)
     if ru.ru_utime + ru.ru_stime > 0:
@@ -2548,7 +2575,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
     parts = {"version": FP_KEY_VERSION, "run_files": _run_files_digest(run_dir, fn_spec, exclude, confined),
              "deps": _digest({m: _file_digest(os.path.join(REPO, m)) for m in FP_DEP_MANIFESTS
                               if os.path.isfile(os.path.join(REPO, m))}),
-             "data_set": _files_digest(FP_DATA_SET)}
+             "data_set": _files_digest(FP_DATA_SET, skip=run_dir)}
     if extra is not None or extra_digest:
         parts["extra"] = extra_digest or _digest(extra)
     if record is not None:
@@ -2563,16 +2590,18 @@ FP_DATA_SET = {".claude/orchestration": "all", "data": "all", "scripts": "data",
 _FP_CODE_EXT = (".py", ".pyc", ".md")
 
 
-def _files_digest(spec: dict) -> str:
+def _files_digest(spec: dict, skip: str | None = None) -> str:
     """sha256 over {repo-relative path: sha256} of the files `spec` names ({dir: "all" | "data"}); __pycache__, .git
-    and _truth left out, linked directories followed (a loop stops), the launch stamp (_FP_REPO_SKIP) skipped."""
+    and _truth left out, linked directories followed (a loop stops), the launch stamp (_FP_REPO_SKIP) and the
+    directory `skip` (the run dir, when it lies under one of them) skipped."""
     got = {}
     for root, kind in sorted(spec.items()):
         top = os.path.join(REPO, root)
         anc = {top: {os.path.realpath(top)}}
         for dp, dirs, fns in os.walk(top, followlinks=True):
             dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git", "_truth")
-                             and os.path.realpath(os.path.join(dp, d)) not in anc[dp])
+                             and os.path.realpath(os.path.join(dp, d)) not in anc[dp]
+                             and os.path.realpath(os.path.join(dp, d)) != (skip and os.path.realpath(skip)))
             for d in dirs:
                 anc[os.path.join(dp, d)] = anc[dp] | {os.path.realpath(os.path.join(dp, d))}
             for f in fns:
@@ -4160,10 +4189,30 @@ def _self_test_w0a(ok) -> None:
                f"FP_CHILD_PROCESS a job with a child process is keyed on the whole tree: reused while it holds, "
                f"recomputed after any edit under toolkit/ ({k1.get('reused')}, {k2.get('computed')}, "
                f"{k2.get('reuse_refused')})")
+            saved_m = open(os.path.join(repo, "toolkit/eng/m.py")).read()
             os.remove(os.path.join(repo, "toolkit/eng/m.py"))
             b3 = next((b for b in reuse_report(rd)["batches"] if b["out"] == "analysis/b.jsonl"), {})
             ok(b3.get("eligible") == 0 and "missing or unreadable: toolkit/eng/m.py" in b3.get("why", ""),
                f"FP_OBSERVED_MISSING a recorded file that is gone gives no reuse ({b3})")
+            w("toolkit/eng/m.py", saved_m)
+            # Codex r1 (λ): a repo file read by path (a table in a .md) is recorded too, through the audit hook
+            w("toolkit/eng/notes.md", "| k | 2 |\n")
+            w("reader.py", "import os\n\n\ndef f(p):\n    t = open(os.path.join(os.path.dirname(__file__), 'toolkit', "
+                           "'eng', 'notes.md')).read()\n    return {'y': len(t) * p['x']}\n")
+            nout = os.path.join(rd, "analysis", "n.jsonl")
+            n0 = go(fn="reader.py::f", inputs=ins[:2], o=nout)
+            w("toolkit/eng/notes.md", "| k | 3 |\n")
+            n1 = go(fn="reader.py::f", inputs=ins[:2], o=nout)
+            ok("toolkit/eng/notes.md" in ((n0.get("key_parts") or {}).get("observed") or {}) and n1.get("computed") == 2,
+               f"FP_OBSERVED_READ_BY_PATH a repo file the job opened is recorded, and editing it recomputes "
+               f"({n1.get('computed')}, {n1.get('reuse_refused')})")
+            # Codex r1 (λ): a run dir under the repo's data/ keeps its key when its own outputs change
+            rd_in = os.path.join(repo, "data", "trial_run")
+            w("models/fn.py", "def f(p):\n    return p\n", rd_in)
+            q0 = code_fingerprint(rd_in, "models/fn.py::f")
+            w("analysis/out.jsonl.summary.json", "{}", rd_in)
+            ok(q0 == code_fingerprint(rd_in, "models/fn.py::f"),
+               "FP_RUN_UNDER_REPO_DATA a run dir under the repo's data/ is not part of the data set")
 
 
 def _self_test_fp_dispatch(ok) -> None:
