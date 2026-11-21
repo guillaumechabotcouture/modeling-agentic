@@ -1313,6 +1313,10 @@ class Machine:
                 break
             if (self.st.state, len(self.st.history)) == before:
                 raise RuntimeError(f"state {self.st.state} made no progress")
+        if self.st.paused and self.st.paused != AWAITING_BUDGET:   # _task writes the budget pause's own entry
+            # the harness benchmark protocol (I1, owner-wait) reads every pause from history, not only the budget one
+            self.st.history.append({"at": _now(), "paused": self.st.paused, "state": self.st.state,
+                                    "round": self.st.round, "spent_usd": round(self.st.spent_usd, 4)})
         save_state(self.run_dir, self.st)
         return self.st.status or (f"paused:{self.st.paused}" if self.st.paused else self.st.state)
 
@@ -2049,6 +2053,55 @@ def _write_deliverable(run_dir: str) -> None:
     _put(run_dir, str(df["path"]), buf.getvalue())
 
 
+# A relaunch with reuse (a new run dir from another one's spec and stored rows) names its parent here; the launcher
+# sets it. main.py gains a --parent-run flag after v1 retirement, without changing the record.
+PARENT_ENV = "MA_PARENT_RUN"
+
+
+def _parent_record(path: str) -> dict:
+    """metadata.json parent_run: the parent's dir name and its run_state.json sha256 (None, with the error, when it
+    cannot be read: the link is then never trusted by scripts/harness_metrics.py)."""
+    from lib.safe_io import read_nofollow
+    rec = {"run_dir": os.path.basename(os.path.normpath(path)), "recorded_from": PARENT_ENV}
+    try:
+        rec["run_state_sha256"] = hashlib.sha256(read_nofollow(path, STATE_FILE)[0]).hexdigest()
+    except Exception as e:  # noqa: BLE001 -- recorded, never raised: the run itself is not the parent's
+        rec.update(run_state_sha256=None, error=type(e).__name__)
+    return rec
+
+
+def _runtime_ids() -> dict:
+    """The model ids and the Agent SDK version this process runs with ("unknown" when they cannot be read)."""
+    try:
+        from agents.enforcement import MODEL_DEEP, MODEL_FAST
+        models = {"deep": MODEL_DEEP, "fast": MODEL_FAST}
+    except Exception:  # noqa: BLE001
+        models = {"deep": "unknown", "fast": "unknown"}
+    try:
+        from importlib.metadata import version
+        sdk = version("claude-agent-sdk")
+    except Exception:  # noqa: BLE001
+        sdk = "unknown"
+    return {"models": models, "sdk_version": sdk}
+
+
+def _record_invocation(run_dir: str, budget_usd, cap_usd) -> None:
+    """This invocation's record in metadata.json: the latest model ids and SDK version at the top level, and on the
+    invocation entry main.py appended (scripts/lib/pipeline_id.py stamp) the budget asked for, the cap in force, the
+    model ids and the SDK version. No entry is invented when main.py wrote none."""
+    try:
+        meta = json.load(open(os.path.join(run_dir, "metadata.json")))
+    except (OSError, ValueError):
+        meta = {}
+    meta = meta if isinstance(meta, dict) else {}
+    ids = _runtime_ids()
+    meta.update(ids)
+    inv = meta.get("invocations")
+    if isinstance(inv, list) and inv and isinstance(inv[-1], dict) and "budget_usd" not in inv[-1]:
+        inv[-1].update(budget_usd=budget_usd, cap_usd=cap_usd, **ids)
+    _write_json(run_dir, "metadata.json", meta)
+
+
 def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "owner", gate_mode: str = "v2",
              budget_usd: float | None = None, derived_inputs: bool = True, derive_unsandboxed: bool = False,
              world_model: bool = True) -> RunState:
@@ -2065,6 +2118,8 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
     meta = meta if isinstance(meta, dict) else {}
     meta.update({"question": question, "started": meta.get("started") or _now(), "pipeline": "v2",
                  "max_rounds": max_rounds, "signoff": signoff})
+    if os.environ.get(PARENT_ENV):
+        meta["parent_run"] = _parent_record(os.environ[PARENT_ENV])
     _write_json(run_dir, "metadata.json", meta)
     save_state(run_dir, st)
     return st
@@ -2083,6 +2138,7 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
                            "spent_usd": round(st.spent_usd, 4)})
         st.budget_usd = budget_usd
         save_state(run_dir, st)
+    _record_invocation(run_dir, budget_usd, st.budget_usd)
     m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
     m.reopen_interrupted_analysis()
     return m.run()
