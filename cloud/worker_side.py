@@ -14,8 +14,7 @@ CODEX_VERSION = "0.163.0"
 WORK = "/tmp/ab"
 LIVE_STATES = ("running", "ready", "pending", "starting", "scaling")
 # The IDM Coiled default workspace (non-sensitive; never the prod subscription). The launcher and
-# the VM jobs read it from here; scripts/replay_coiled.py keeps a copy (it is uploaded to the
-# workers on its own), held equal by cloud/run_cluster.py self-test RC60f.
+# the VM jobs read it from here (cloud/run_cluster.py self-test RC60f).
 WORKSPACE = "idm-coiled-idmad-r2"
 
 

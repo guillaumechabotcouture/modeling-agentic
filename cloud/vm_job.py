@@ -65,8 +65,9 @@ stops for any other reason loses at most one poll interval of outputs.
 The job's command runs in the shipped tree (`--tree`: git archive of HEAD; `--dir`: a
 plain directory, less .git, .venv and __pycache__), with secrets (`--anthropic-key`) in its environment only.
 
-A command that runs main.py must state its pipeline (`--v2` or `--v1`; refused otherwise, before
-anything is created: main.py's default changed once, 2026-11-05). The job's environment names
+A command that runs main.py must state its pipeline as `--v2` (refused otherwise, before
+anything is created: main.py's default changed once, 2026-11-05). `--v1` is refused: pipeline v1
+is retired (owner, 2026-11-20). The job's environment names
 its launcher (MA_LAUNCHER=vm_job:<name>/<job_id>, recorded in the run's metadata.json), and
 `start`/`run` write a launch record in the eval grader's format (launch_id, pipeline, commit as
 stamped in the archive, eval_inputs_sha256): <out>/<name>/<job_id>/assignments.json and
@@ -212,7 +213,8 @@ def job_pipeline(cmd) -> str | None:
     try:
         return pipeline_id.from_command(cmd)
     except pipeline_id.PipelineError as e:
-        raise SystemExit(f"{e} (add --v2 or --v1 to main.py's arguments): refusing") from None
+        hint = "" if str(e) == pipeline_id.RETIRED_MESSAGE else " (add --v2 to main.py's arguments)"
+        raise SystemExit(f"{e}{hint}: refusing") from None
 
 
 def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
@@ -1211,10 +1213,31 @@ def _self_test_pipeline(ok) -> None:
             jp(cmd)
             ok(False, f"VP1 a main.py command relying on the default pipeline is refused: {cmd}")
         except SystemExit as e:
-            ok("--v1 or --v2" in str(e), f"VP1 a main.py command relying on the default pipeline is refused: {e}")
+            ok("--v2" in str(e) and "--v1" not in str(e),
+               f"VP1 a main.py command relying on the default pipeline is refused: {e}")
     ok(jp(["python3", "main.py", "Q?", "--v2"]) == "v2" and jp("bash toolkit/x/validate_once.sh 16") is None
-       and jp(["python3 main.py 'Q?' --v1"]) == "v1",
+       and jp(["python3 main.py 'Q?' --v2"]) == "v2",
        "VP2 an explicit main.py command gives its pipeline (argv, or one shell string); other commands have none")
+    # VP2c (coordinator decision, 2026-11-20): vm_job refuses only a literal main.py --v1 (VP2b) and never a v2
+    # command; a wrapped v1 start (a shell -c string, python -m main, a script) keeps the classification it had before
+    # the retirement. On a tree at or after the retirement, main.py refuses --v1 itself; on an older tree such a start
+    # is not caught here (a documented gap).
+    ok("retired_tree_problem" not in g and "_has_v1_token" not in g, "VP2c vm_job has no wrapper-scanning --v1 check")
+    for cmd in (["bash", "-c", 'case "$1" in v1) python3 main.py --v1 "$2" ;; v2) python3 main.py --v2 "$2" ;; esac',
+                 "_", "v2", "Q"], "python3 main.py --v2 Q && grep -F -- --v1 notes.txt", "python3 main.py --v2 -- --v1",
+                "python3 main.py --v2 'Compare the archived --v1 results'"):
+        try:
+            got = jp(cmd)
+            ok(got in (None, "v2"), f"VP2d a v2 command is never refused: {cmd!r} gave {got}")
+        except SystemExit as e:
+            ok(False, f"VP2d a v2 command is never refused: {cmd!r}: {e}")
+    for cmd in (["python3 main.py 'Q?' --v1"], ["python3", "main.py", "--v1", "--resume", "runs/R1"]):
+        try:
+            got = jp(cmd)
+            ok(False, f"VP2b (v1 retired) a main.py --v1 command is refused: {cmd} gave {got}")
+        except SystemExit as e:
+            ok(pipeline_id.RETIRED_MESSAGE in str(e) and "--v1" not in str(e),
+               f"VP2b (v1 retired) a main.py --v1 command is refused: {e}")
     src = inspect.getsource(_run_locked)
     ok("job_pipeline(" in src and src.index("job_pipeline(") < src.index("_create("),
        "VP3 run refuses an undeclared pipeline before it creates a cluster")
