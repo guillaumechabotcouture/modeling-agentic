@@ -4,27 +4,18 @@
     python3 scripts/lib/import_closure.py --self-test
     python3 scripts/lib/import_closure.py <path.py>::<function> [--run-dir DIR]      # the closure as JSON
 
-W0-A (v2 autonomy brief addendum): the reuse key of a stored row hashes this closure instead of all of scripts/ and
-toolkit/. Nothing is imported: each file is parsed (ast) and the walk follows names. From the function it reaches
-every top-level definition its code names, in its own module or through an import (`from X import f`, `X.f` on an
-imported module), and so on; a class named is taken whole. A module reached at all contributes its import-time code:
-every top-level statement that is not a plain function or class definition (assignments, imports, decorated
-definitions: a decorator can register a function no code names), each class's bases and class-level statements, its packages' `__init__.py`, and the other files in its directory (data such as a card).
-A module used as a value (passed, or read with getattr) is taken whole. Files are the unit hashed: a reached file is
-hashed whole.
+W0-A: the reuse key of a stored row hashes this closure, not all of scripts/ and toolkit/. Nothing is imported
+(ast). From the function the walk reaches every top-level definition its code names, directly or through an import;
+a class named is taken whole, a module used as a value (passed, getattr, a dunder) too. A module reached contributes
+its import-time code (non-function statements, decorators, defaults, class headers), its packages' __init__.py, the
+other files in its directory and its data-only subdirectories. Reached files are hashed whole.
 
-It fails closed: `unresolved` lists why the closure is not known, and a caller then must not narrow the key.
-  - an import whose top-level name is a repo package or module (on the paths load_fn puts on sys.path) but whose
-    file is not found;
-  - a dynamic import or exec site (importlib.import_module, __import__, spec_from_file_location, exec_module,
-    runpy, exec, eval, globals) in reached code of a file that does not declare what it can load. A file declares it
-    with a module-level literal `FP_DYNAMIC_IMPORTS = ("<repo-relative dir or file>", ...)`: every file under each
-    named path joins the closure, and each module there is reached with its import-time code and every top-level
-    class (what a `module:Class` reference loads; repo dynamic imports load classes through toolkit/import_guard). An empty tuple declares that the file's dynamic imports load
-    only the function the closure starts from;
-  - a file that cannot be read or parsed, or a root function that is not defined in its file.
-Names that are not repo modules (the standard library, installed packages) are outside the closure: the dependency
-manifests stay in the key for them.
+Fails closed (`unresolved`; the caller then must not narrow the key): a repo import whose file is not found; a
+dynamic import or exec site in reached code (by name or alias) of a file without a module-level literal
+`FP_DYNAMIC_IMPORTS`: a tuple of repo paths (every file joins the closure, each module reached for its import-time
+code and classes; `()` = loads only the closure's root), or {kind: paths} taken at each call with a literal kind
+(toolkit/import_guard.py); a file not parsed; a root not defined. Non-repo names (stdlib, installed packages) are
+outside: the dependency manifests stay in the key.
 """
 from __future__ import annotations
 
@@ -400,14 +391,11 @@ def _self_test() -> int:
             "    return used(p) + helper.h() + M.g() + lazy.z() + os.getpid()\n\n"
             "def unrelated():\n    from toolkit.a import figs\n    return figs.draw()\n")
         put("toolkit/a/lib.py", "def used(p):\n    return 1\n\ndef other():\n    from toolkit.b import far\n")
-        put("toolkit/a/helper.py", "def h():\n    return 2\n")
-        put("toolkit/a/mod.py", "def g():\n    return 3\n")
-        put("toolkit/a/lazy.py", "def z():\n    return 4\n")
-        put("toolkit/a/figs.py", "def draw():\n    return 0\n")
-        put("toolkit/a/card.yaml", "version: 1\n")
-        put("toolkit/b/__init__.py", "")
-        put("toolkit/b/far.py", "x = 1\n")
-        put("toolkit/c/__init__.py", "")
+        for rel, fn in (("a/helper", "h"), ("a/mod", "g"), ("a/lazy", "z"), ("a/figs", "draw")):
+            put(f"toolkit/{rel}.py", f"def {fn}():\n    return 2\n")
+        for rel, text in (("a/card.yaml", "version: 1\n"), ("b/__init__.py", ""), ("b/far.py", "x = 1\n"),
+                          ("c/__init__.py", "")):
+            put(f"toolkit/{rel}", text)
         put("toolkit/c/dyn.py", "import importlib\n\ndef run(p):\n    return importlib.import_module(p)\n")
         put("toolkit/c/decl.py", "import importlib\nFP_DYNAMIC_IMPORTS = ('toolkit/b',)\n\n"
             "def run(p):\n    return importlib.import_module(p)\n")

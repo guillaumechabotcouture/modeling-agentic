@@ -2483,21 +2483,13 @@ def fn_id(run_dir: str, fn_spec: str) -> str:
 
 def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = False, extra=None,
                      record: dict | None = None, extra_digest: str | None = None) -> str:
-    """The reuse key of a batch's rows besides their params (W0-A, v2 autonomy brief addendum): a hash of its parts,
-    each recorded with the batch (`key_parts`, and the closure's files with their hashes, in `record` when given):
-      closure    the repo code the batch function can reach (scripts/lib/import_closure.py: the function file, the
-                 repo modules it reaches by name, their data files) and compute.py's row path (FP_ROW_ROOTS, with
-                 FP_DISPATCH_EXEMPT not followed and not hashed). A file the function cannot reach is not in it;
-      run_files  the run's models/ and data/ (and the function file when it lies in the run dir), with the skips
-                 listed in _legacy_fingerprint;
-      deps       the dependency manifests (FP_DEP_MANIFESTS): installed packages are outside the closure;
-      extra      what the caller adds (toolkit/analysis/batch.py: the engine identity), hashed as given.
-    Files are hashed by content at any size (no mtime). Fail closed: when the closure cannot be computed (an
-    unresolvable import, an undeclared dynamic import, a file outside the repo and the run dir) `tree`, the whole
-    scripts/ + toolkit/ hash, is added to the files the walk did hash, and the reasons are recorded and printed. The spec is not
-    in the key: what a spec sets reaches a job through its params, which are the row's own key (input_key).
-    `confined`: as in _legacy_fingerprint. `extra_digest`: a recorded extra part, for a check that cannot compute
-    it (reuse_report, the run console: the engine identity is compared when the batch runs)."""
+    """The reuse key of a batch's rows besides their params (W0-A): a hash of parts recorded with the batch
+    (`record`: key_parts and the closure's files with their sha256). closure: the repo code the function reaches
+    (scripts/lib/import_closure.py) plus compute.py's row path (FP_ROW_ROOTS; FP_DISPATCH_EXEMPT not followed or
+    hashed); run_files: the run's models/ and data/ as in _legacy_fingerprint; deps: FP_DEP_MANIFESTS; extra: the
+    caller's part (batch.py: the engine identity), or `extra_digest` as recorded (reuse_report, the run console).
+    Content hashes at any size, no mtime. Fail closed: an unresolved closure adds `tree`, the whole scripts/ and
+    toolkit/ hash, and records the reasons. The spec reaches a job through its params, the row's own key."""
     run_dir = os.path.realpath(run_dir)
     if confined:
         _confined_check(run_dir, fn_spec.partition("::")[0])     # before the walk reads any file (Codex r1 P2)
