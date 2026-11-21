@@ -345,13 +345,17 @@ def harness_record(run_dir: str) -> str:
         led = {}
     nonce = secrets.token_hex(16)
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    seen = _trace_nonces(run_dir)
     for fp, a in answers.items():
-        if not (isinstance(led.get(fp), dict) and led[fp].get("sha256") == _answer_sha(a)):
+        # Codex r1 of #316 (P1): an entry whose nonce trace.jsonl lacks (a record interrupted between its two writes)
+        # is recorded again, so a retry never leaves an answer the gate cannot verify
+        if not (isinstance(led.get(fp), dict) and led[fp].get("sha256") == _answer_sha(a)
+                and led[fp].get("nonce") in seen):
             led[fp] = {"sha256": _answer_sha(a), "nonce": nonce, "by": a.get("by"), "recorded_at": now}
     from lib.safe_io import open_append_nofollow, write_nofollow    # no link followed (review round 4, P1-2)
-    write_nofollow(run_dir, LEDGER, json.dumps({"entries": led, "producer": "main.py"}, indent=1).encode(), atomic=True)
-    with open_append_nofollow(run_dir, TRACE) as f:
+    with open_append_nofollow(run_dir, TRACE) as f:          # the nonce first: a ledger entry never names a lost one
         f.write(json.dumps({"ts": now, "type": "scope_signoff_recorded", "nonce": nonce}) + "\n")
+    write_nofollow(run_dir, LEDGER, json.dumps({"entries": led, "producer": "main.py"}, indent=1).encode(), atomic=True)
     return nonce
 
 
@@ -600,9 +604,11 @@ def provisional_answers(run_dir: str, items: list[dict], round_n: Optional[int] 
     """D2 (v2 `--signoff lead`): the harness answers each item `accept` as the lead, provisionally: the run goes on
     with the finding declared, and the owner confirms or overturns the answer later (`review`). Only the harness calls
     it, at OWNER_DECISION, and records the answers as it records the owner's (harness_record). An owner's answer
-    already given is kept. `plan_changing` {fingerprint: bool}: a decision test shows the plan changes."""
+    already given is kept. `plan_changing` {fingerprint: bool}: a decision test shows the plan changes. An unreadable
+    record raises ValueError (Codex r1 of #316, P1): it is never overwritten, so no owner answer in it is lost."""
     prior, bad = load_answers(run_dir)
-    prior = {} if bad else prior
+    if bad:
+        raise ValueError(bad[0]["claim"])
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     new = {}
     for it in items:
@@ -643,8 +649,8 @@ def review(run_dir: str, finding: str, decision: str, note: str = "") -> dict:
     doc = _raw_doc(run_dir)
     rev = doc.get("reviews") if isinstance(doc.get("reviews"), dict) else {}
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    for r in rows:
-        rev[r["fingerprint"]] = {"decision": decision, "by": "owner", "at": now, "note": note}
+    # the latest answer for the finding (Codex r1 of #316): a review never rewrites one given to an earlier revision
+    rev[rows[-1]["fingerprint"]] = {"decision": decision, "by": "owner", "at": now, "note": note}
     from lib.safe_io import write_nofollow
     write_nofollow(run_dir, SIGNOFF, json.dumps(dict(doc, reviews=rev), indent=1).encode(), atomic=True)
     return rev
@@ -912,6 +918,23 @@ def _self_test() -> int:
         ok(before == [] and [(r["finding"], r["decision"], r["by"], r["plan_changing"]) for r in rows]
            == [("f1", "accept", "lead", True), ("f2", "accept", "lead", False)],
            f"SO31 provisional answers are the lead's accepts, listed once the harness recorded them ({rows})")
+        import secrets as _sec
+        led0 = json.load(open(os.path.join(d, LEDGER)))
+        for e in led0["entries"].values():
+            e["nonce"] = _sec.token_hex(16)              # recorded, but its trace line was lost
+        json.dump(led0, open(os.path.join(d, LEDGER), "w"))
+        lost = provisional(d)
+        harness_record(d)
+        ok(lost == [] and len(provisional(d)) == 2,
+           "SO34 an answer whose trace line was lost is recorded again on retry (Codex r1 of #316)")
+        open(os.path.join(d, SIGNOFF), "a").write("garbage")
+        try:
+            provisional_answers(d, items, 2)
+            ok(False, "SO35 an unreadable record is never overwritten by provisional answers")
+        except ValueError:
+            ok(True, "SO35 an unreadable record is never overwritten by provisional answers")
+        doc0 = open(os.path.join(d, SIGNOFF)).read()
+        open(os.path.join(d, SIGNOFF), "w").write(doc0[:-len("garbage")])
         review(d, "f1", "confirm", note="ok")
         try:
             review(d, "f9", "overturn")

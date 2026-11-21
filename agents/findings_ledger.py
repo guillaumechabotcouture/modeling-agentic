@@ -348,8 +348,8 @@ def owner_answers(run_dir: str, lead_ok: bool = False) -> dict[str, dict]:
         verified, _bad = SS.verified_answers(run_dir)
     except Exception:  # noqa: BLE001 -- unreadable: no answer counts (fail closed)
         return {}
-    by = ("owner", "lead") if lead_ok else ("owner",)
-    return {fp: a for fp, a in verified.items() if isinstance(a, dict) and a.get("by") in by
+    return {fp: a for fp, a in verified.items() if isinstance(a, dict)
+            and (a.get("by") == "owner" or (lead_ok and a.get("by") == "lead" and a.get("provisional") is True))
             and a.get("finding") and a.get("decision") in ("accept", "decline")}
 
 

@@ -362,9 +362,10 @@ def _bearing_item(run_dir: str, v: dict) -> dict:
             "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp}
 
 
-def _answer_counts(by, mode: str) -> bool:
-    """Whose answer releases an owner item: the owner's; the lead's only in a --signoff lead run (D2)."""
-    return by == "owner" or (by == "lead" and mode == "lead")
+def _answer_counts(a: dict, mode: str) -> bool:
+    """Whose answer releases an owner item: the owner's; the lead's only in a --signoff lead run (D2), and only a
+    provisional one (the harness's, listed in the report: Codex r1 of #316)."""
+    return a.get("by") == "owner" or (a.get("by") == "lead" and mode == "lead" and a.get("provisional") is True)
 
 
 def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto", mode: str = "owner") -> list[dict]:
@@ -385,7 +386,7 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
             for v in bearing:
                 item = _bearing_item(run_dir, v)
                 a = answers.get(item["fingerprint"]) or {}
-                if str(a.get("finding")) == item["finding"] and _answer_counts(a.get("by"), mode):
+                if str(a.get("finding")) == item["finding"] and _answer_counts(a, mode):
                     if a.get("decision") == "accept":
                         v["owner_signed"] = {"by": a.get("by"), "at": a.get("at"), "fingerprint": item["fingerprint"],
                                              **({"provisional": True} if a.get("provisional") else {})}
@@ -1895,15 +1896,19 @@ class Machine:
 
         def done(fp):
             a = answers.get(fp)
-            return isinstance(a, dict) and _answer_counts(a.get("by"), self.st.signoff) and a.get("decision") in SS.DECISIONS
-        if lead and (bad or not all(done(fp) for fp in want)):
+            return isinstance(a, dict) and _answer_counts(a, self.st.signoff) and a.get("decision") in SS.DECISIONS
+        if lead and bad:        # never overwritten (Codex r1 of #316): an owner answer in it would be lost
+            _withhold_report(self.run_dir)
+            return self._go("FINAL", f"{SS.SIGNOFF} cannot be read, so the lead cannot answer: restore it and resume",
+                            "run_failed")
+        if lead and not all(done(fp) for fp in want):
             items = {i.get("fingerprint"): i for i in (req or {}).get("items") or [] if isinstance(i, dict)} \
                 if isinstance(req, dict) else {}
             if any(fp not in items for fp in want):
                 _withhold_report(self.run_dir)
                 return self._go("FINAL", "the owner request cannot be read, so the lead cannot answer it: relaunch with "
                                          "reuse", "run_failed")
-            todo = [items[fp] for fp in want if bad or not done(fp)]
+            todo = [items[fp] for fp in want if not done(fp)]
             SS.provisional_answers(self.run_dir, todo, self.st.round,
                                    plan_changing={i["fingerprint"]: _plan_changing(i) for i in todo})
             self.st.history.append({"at": _now(), "provisional": [i.get("finding") for i in todo], "by": "lead",
@@ -2856,14 +2861,18 @@ def _self_test() -> int:
         # run's sign-off mode (a lead's only under --signoff lead, D2)
         import scope_signoff as _ss
         _ss.record(dd, g, 2)
-        _ss.sign(dd, "lead", all_decision="accept", note="t")
+        _ss.sign(dd, "lead", all_decision="accept", note="t")          # not provisional: counts nowhere
+        _ss.harness_record(dd)
+        g_ln = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="lead")
+        _ss.provisional_answers(dd, json.load(open(os.path.join(dd, _ss.REQUEST)))["items"], 2)
         _ss.harness_record(dd)
         g_lo = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
         g_ll = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="lead")
         _ss.sign(dd, "owner", all_decision="decline", note="t")
         _ss.harness_record(dd)
         g_od = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        ok(g_lo["action"] == "AWAIT_OWNER" and g_ll["action"] == "DECLARE_SCOPE" and g_od["action"] == "RUN_FAILED"
+        ok(g_ln["action"] == "AWAIT_OWNER" and g_lo["action"] == "AWAIT_OWNER" and g_ll["action"] == "DECLARE_SCOPE"
+           and g_od["action"] == "RUN_FAILED"
            and any(isinstance(u, dict) and u.get("kind") == "scope_declaration_declined"
                    for u in g_od.get("unresolved_high") or []),
            f"T_OWNER_ANSWERED a lead's accept counts only under --signoff lead; the owner's decline holds the gate "
