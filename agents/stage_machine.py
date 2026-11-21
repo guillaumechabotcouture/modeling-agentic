@@ -1313,7 +1313,7 @@ class Machine:
                 break
             if (self.st.state, len(self.st.history)) == before:
                 raise RuntimeError(f"state {self.st.state} made no progress")
-        if self.st.paused and self.st.paused != AWAITING_BUDGET:   # _task writes the budget pause's own entry
+        if self.st.paused and self.st.paused != AWAITING_BUDGET and self.st.state != "FINAL":   # _task: budget's own
             # the harness benchmark protocol (I1, owner-wait) reads every pause from history, not only the budget one
             self.st.history.append({"at": _now(), "paused": self.st.paused, "state": self.st.state,
                                     "round": self.st.round, "spent_usd": round(self.st.spent_usd, 4)})
@@ -2062,7 +2062,7 @@ def _parent_record(path: str) -> dict:
     """metadata.json parent_run: the parent's dir name and its run_state.json sha256 (None, with the error, when it
     cannot be read: the link is then never trusted by scripts/harness_metrics.py)."""
     from lib.safe_io import read_nofollow
-    rec = {"run_dir": os.path.basename(os.path.normpath(path)), "recorded_from": PARENT_ENV}
+    rec = {"run_dir": os.path.basename(os.path.abspath(path)), "recorded_from": PARENT_ENV}
     try:
         rec["run_state_sha256"] = hashlib.sha256(read_nofollow(path, STATE_FILE)[0]).hexdigest()
     except Exception as e:  # noqa: BLE001 -- recorded, never raised: the run itself is not the parent's
@@ -2088,12 +2088,15 @@ def _runtime_ids() -> dict:
 def _record_invocation(run_dir: str, budget_usd, cap_usd) -> None:
     """This invocation's record in metadata.json: the latest model ids and SDK version at the top level, and on the
     invocation entry main.py appended (scripts/lib/pipeline_id.py stamp) the budget asked for, the cap in force, the
-    model ids and the SDK version. No entry is invented when main.py wrote none."""
+    model ids and the SDK version. No entry is invented when main.py wrote none. Read with no link followed; a
+    metadata.json that cannot be read is left as it is (never replaced by a partial record)."""
+    from lib.safe_io import read_nofollow
     try:
-        meta = json.load(open(os.path.join(run_dir, "metadata.json")))
-    except (OSError, ValueError):
-        meta = {}
-    meta = meta if isinstance(meta, dict) else {}
+        meta = json.loads(read_nofollow(run_dir, "metadata.json")[0].decode())
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(meta, dict):
+        return
     ids = _runtime_ids()
     meta.update(ids)
     inv = meta.get("invocations")
