@@ -267,9 +267,10 @@ def _self_test() -> int:
        "PR10 the VOI robust solve (mean_plan with the point corrections) is the delivered plan")
     # Codex r1 P1-10: the completion gate checks the plan rule the signed spec asks for
     ev_raw = {"deliverable": {"plan": "expected_value", "headline": {"outcome": "cases"}}}
-    good_pt = {"plan": {"u1": "none", "u2": "a"},
+    good_pt = {"plan": {"u1": "none", "u2": "a"}, "cost_allocated": 1.0, "budget_allocatable": 1.0,
                "plan_rule": {"rule": "expected_value", "draws": 2, "point_plan": {"u1": "a", "u2": "none"},
-                             "units_differ": ["u1", "u2"], "n_units_differ": 2},
+                             "units_differ": ["u1", "u2"], "n_units_differ": 2, "point_cost": 1.0,
+                             "point_cost_over_budget": False},
                "per_unit": {"u1": {"averted_mean": {"cases": 0.0}}, "u2": {"averted_mean": {"cases": 8.0}}}}
     no_pp = dict(good_pt, plan_rule={k: v for k, v in good_pt["plan_rule"].items() if k != "point_plan"})
     bad_diff = dict(good_pt, plan_rule=dict(good_pt["plan_rule"], units_differ=["u1"]))
@@ -282,9 +283,34 @@ def _self_test() -> int:
              "point rule, no record": ({}, {"per_unit": {}}, unc, 0),
              "point rule, a record": ({}, good_pt, unc, 1), "unreadable point": (ev_raw, None, unc, 1),
              "no point_plan": (ev_raw, no_pp, unc, 1), "units_differ off": (ev_raw, bad_diff, unc, 1),
-             "a NaN mean": (ev_raw, nan_pt, unc, 1), "per_unit a list": (ev_raw, dict(good_pt, per_unit=[1]), unc, 1)}
-    got = {k: len(contract_findings(r_, p_, u_)) for k, (r_, p_, u_, _n) in cases.items()}
+             "a NaN mean": (ev_raw, nan_pt, unc, 1), "per_unit a list": (ev_raw, dict(good_pt, per_unit=[1]), unc, 1),
+             "no point_cost (an earlier rule)": (ev_raw, dict(good_pt, plan_rule={
+                 k: v for k, v in good_pt["plan_rule"].items() if k != "point_cost"}), unc, 1),
+             "point_cost off": (ev_raw, dict(good_pt, cost_allocated=0.5), unc, 1),
+             "over flag off": (ev_raw, dict(good_pt, plan_rule=dict(good_pt["plan_rule"], point_cost_over_budget=True)),
+                               unc, 1),
+             "units_differ an integer": (ev_raw, dict(good_pt, plan_rule=dict(good_pt["plan_rule"], units_differ=1)),
+                                         unc, 1),
+             "means near the largest float": (ev_raw, dict(good_pt, per_unit={
+                 "u1": {"averted_mean": {"cases": 1e308}}, "u2": {"averted_mean": {"cases": 1e308}}}), unc, 1)}
+    got = {}
+    for k, (r_, p_, u_, _n) in cases.items():
+        try:
+            got[k] = len(contract_findings(r_, p_, u_))
+        except Exception as e:  # noqa: BLE001 -- a crash is a failing case (Codex r3 P2-5)
+            got[k] = f"{type(e).__name__}"
     ok(got == {k: v[3] for k, v in cases.items()}, f"PR11 contract findings for the plan rule ({got})")
+    # Codex r3 P1-4: the decision tests' reference plan agrees with the run's plan rule
+    ref = {"ev, point_plan": (good_pt, {"reference_plan": "point_plan", "tests": [{}]}, 0),
+           "ev, no reference": (good_pt, {"tests": [{}]}, 1),
+           "point, a reference": ({"plan": {}}, {"reference_plan": "point_plan", "tests": []}, 1),
+           "point, none": ({"plan": {}}, {"tests": [{}]}, 0), "no artifact": (good_pt, None, 0)}
+    try:
+        gr = {k: len(reference_findings(p_, d_)) for k, (p_, d_, _n) in ref.items()}
+    except Exception as e:  # noqa: BLE001 -- before the check exists
+        gr = {"error": f"{type(e).__name__}: {e}"}
+    ok(gr == {k: v[2] for k, v in ref.items()}, f"PR12 the decision tests' reference plan agrees with the plan rule "
+                                                f"({gr})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -1389,6 +1389,8 @@ def _self_test_plan_rule_runs(ok, q):
            and "plan_rule" not in R0["point"] and "plan_rule" not in R1["point"],
            "EV-R1 deliverable.plan: point is the default: the plan, the CSV and both uncertainty files are unchanged")
         _resign(d, lambda x: x["deliverable"].update(plan="expected_value"))
+        keep_p = os.path.join(d, "figures", "comparison.csv")      # a file no earlier render published
+        open(keep_p, "w").write("kept\n")
         try:
             R = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
         except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
@@ -1441,9 +1443,9 @@ def _self_test_plan_rule_runs(ok, q):
         fr_np = [x for x in figs.get("not_produced") or [] if x.get("figure") == "frontier"]
         stale = [e for e in (".png", ".svg", ".csv") if os.path.exists(os.path.join(d, "figures", "frontier" + e))]
         ok(rb is True and fr_np and "expected-value" in str(fr_np[0].get("reason")) and not fr_np[0].get("render_failed")
-           and not stale and R0_frontier,
+           and not stale and R0_frontier and os.path.exists(keep_p),
            f"EV-R9 a rebuild from the point tables is refused (it cannot verify the plan; r2 P1-4); the frontier is not "
-           f"drawn, with the reason, and no earlier run's frontier file is left (P1-8, r2 P1-5) ({rb}, {fr_np}, {stale})")
+           f"drawn, with the reason, and no earlier run's frontier file is left, while a file no render published is kept (P1-8, r2 P1-5, r3 P1-1) ({rb}, {fr_np}, {stale})")
         pp = os.path.join(d, "analysis", "point.yaml")
         keep = open(pp).read()
         try:
