@@ -35,7 +35,6 @@ The cluster name needs a budget scope (cloud/budget_scopes.yaml); the default na
 GitHub token. The loop merges only when $GH_TOKEN is in its environment. `start` passes it (vm_job --secret-env, the
 job's environment only, never a file) when the owner's login keychain holds it under the service
 "modeling-agentic-supervisor-github". Without it the merge queue is held and status says so.
-
 Resuming paused v2 runs is not automated here: status lists collected runs whose metadata says they are paused.
 """
 from __future__ import annotations
@@ -119,7 +118,10 @@ class Blob:
 
 def enqueue(blob, name: str, kind: str, payload: dict, now: float | None = None) -> str:
     """One write-once request blob; only the loop reads them, so the laptop never races the loop on a shared file."""
-    raise NotImplementedError
+    t = time.time() if now is None else now
+    rid = f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime(t))}-{secrets.token_hex(4)}"
+    blob.put_json(f"{paths(name)['requests']}{rid}.json", {"id": rid, "kind": kind, "payload": payload, "at": utc(t)})
+    return rid
 
 
 # ---- GitHub (the merge train) -------------------------------------------------------------------------------------
@@ -146,24 +148,74 @@ class GitHub:
             return e.code, {}
 
     def pr(self, n):
-        raise NotImplementedError
+        code, j = self._call("GET", f"pulls/{int(n)}")
+        if code != 200:
+            raise RuntimeError(f"GET pull {n}: HTTP {code}")
+        return {"state": j["state"], "merged": bool(j.get("merged")), "head": j["head"]["sha"],
+                "base": j["base"]["ref"]}
 
     def behind(self, base, head):
-        raise NotImplementedError
+        code, j = self._call("GET", f"compare/{base}...{head}")
+        if code != 200:
+            raise RuntimeError(f"compare {base}...{head[:7]}: HTTP {code}")
+        return int(j.get("behind_by") or 0) > 0
 
     def checks(self, sha):
-        raise NotImplementedError
+        """One word per check run and commit status: success | pending | failure (as `gh pr checks` buckets them)."""
+        code, j = self._call("GET", f"commits/{sha}/check-runs?per_page=100")
+        if code != 200:
+            raise RuntimeError(f"check-runs of {sha[:7]}: HTTP {code}")
+        out = ["pending" if r.get("status") != "completed" else
+               "success" if r.get("conclusion") in ("success", "neutral", "skipped") else "failure"
+               for r in j.get("check_runs") or []]
+        code, j = self._call("GET", f"commits/{sha}/status")
+        if code == 200:
+            out += [{"success": "success", "pending": "pending"}.get(x.get("state"), "failure")
+                    for x in j.get("statuses") or []]
+        return out
 
     def update_branch(self, n, sha):
-        raise NotImplementedError
+        return self._call("PUT", f"pulls/{int(n)}/update-branch", {"expected_head_sha": sha})[0] in (200, 202)
 
     def merge(self, n, sha):
-        raise NotImplementedError
+        code, j = self._call("PUT", f"pulls/{int(n)}/merge", {"merge_method": "merge", "sha": sha})
+        return code == 200 and bool(j.get("merged", True))
 
 
 def merge_step(gh, item: dict, now: float) -> dict:
     """One step of one PR: item {pr, state queued|waiting|merged|already_merged|skipped, note, ...}, updated in place."""
-    raise NotImplementedError
+    item.setdefault("since", now)
+    item["last_step"] = utc(now)
+
+    def end(state, note):
+        item.update(state=state, note=note, ended=utc(now))
+        return item
+    pr = gh.pr(item["pr"])
+    if pr["merged"]:
+        return end("already_merged", "already merged")
+    if pr["state"] != "open":
+        return end("skipped", f"PR is {pr['state']}")
+    if now - item["since"] > GIVE_UP_S:
+        return end("skipped", f"gave up after {GIVE_UP_S // 3600} h waiting")
+    head = pr["head"]
+    item["state"] = "waiting"
+    if gh.behind(pr["base"], head):
+        if item.get("updated_for") == head and now - item.get("updated_at", 0) < UPDATE_WAIT_S:
+            item["note"] = "behind its base: update requested, waiting for the new head"
+            return item
+        if not gh.update_branch(item["pr"], head):
+            return end("skipped", "update-branch failed (conflict?)")
+        item.update(updated_for=head, updated_at=now, note=f"behind {pr['base']}: update-branch requested")
+        return item
+    checks = gh.checks(head)
+    if "failure" in checks:
+        return end("skipped", f"CI failed on {head[:9]}")
+    if not checks or "pending" in checks:
+        item["note"] = f"waiting for CI on {head[:9]} ({checks.count('pending')} pending of {len(checks)})"
+        return item
+    if gh.merge(item["pr"], head):
+        return end("merged", f"merged at {head[:9]}")
+    return end("skipped", f"merge refused at {head[:9]}")
 
 
 # ---- collection ---------------------------------------------------------------------------------------------------
@@ -180,10 +232,10 @@ def fetch_from_storage(entry, label, work):
     return rc.collect_from_storage(cfg, results_store, label, a["launch_id"], a)
 
 
-def run_metrics(run_dirs, out_json):
-    if not run_dirs:
+def run_metrics(dirs, out_json):
+    if not dirs:
         return None
-    r = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "harness_metrics.py"), *run_dirs,
+    r = subprocess.run([sys.executable, os.path.join(REPO_ROOT, "scripts", "harness_metrics.py"), *dirs,
                         "--json", out_json], capture_output=True, text=True, timeout=900)
     if r.returncode != 0:
         raise RuntimeError(f"harness_metrics exit {r.returncode}: {r.stderr[-300:]}")
@@ -192,12 +244,50 @@ def run_metrics(run_dirs, out_json):
 
 def run_dirs(work: str) -> list:
     """Every collected run directory: <work>/<launch>/<label>/runs/<run>/ holding run_state.json or metadata.json."""
-    raise NotImplementedError
+    out = []
+    for dp, dirs, files in os.walk(work):
+        dirs.sort()
+        if os.path.basename(os.path.dirname(dp)) == "runs" and ({"run_state.json", "metadata.json"} & set(files)):
+            out.append(dp)
+            dirs[:] = []
+    return sorted(out)
 
 
 def collect_step(blob, name, state, now, work, fetch=fetch_from_storage, metrics=run_metrics) -> list:
     """Try every enqueued label not yet collected (at most every COLLECT_EVERY_S); archive each new one to blob."""
-    raise NotImplementedError
+    import results_store
+    new = []
+    for lname, ent in sorted((state.get("collect") or {}).items()):
+        for label, a in sorted(ent["entry"]["assignments"].items()):
+            lab = ent["labels"].setdefault(label, {})
+            if lab.get("launch_id") != a.get("launch_id"):
+                lab.clear()
+                lab.update(state="waiting", launch_id=a.get("launch_id"))
+            if lab.get("state") == "collected" or now - lab.get("tried", -1e18) < COLLECT_EVERY_S:
+                continue
+            lab["tried"] = now
+            try:
+                meta = fetch(ent["entry"], label, work)
+            except (Exception, SystemExit) as e:  # noqa: BLE001 -- not stored yet, or unreadable: tried again later
+                lab["note"] = f"{type(e).__name__}: {str(e)[:160]}"
+                continue
+            src = os.path.join(work, lname, label)
+            with tempfile.TemporaryDirectory() as td:
+                tgz = os.path.join(td, f"{label}.tar.gz")
+                skipped = results_store.write_archive(src, label, tgz)
+                sha = results_store.sha256_file(tgz)
+                dst = f"{paths(name)['collected']}{lname}/{label}.tar.gz"
+                blob.put_file(tgz, dst)
+            lab.update(state="collected", blob=dst, sha256=sha, at=utc(now), note="",
+                       exit_code=(meta or {}).get("exit_code"), left_out=len(skipped))
+            new.append(f"{lname}/{label}")
+    if new:
+        with tempfile.TemporaryDirectory() as td:
+            out = metrics(run_dirs(work), os.path.join(td, "metrics.json"))
+            if out:
+                blob.put_file(out, paths(name)["metrics"])
+                state["metrics_at"] = utc(now)
+    return new
 
 
 # ---- the loop -----------------------------------------------------------------------------------------------------
@@ -205,7 +295,64 @@ def collect_step(blob, name, state, now, work, fetch=fetch_from_storage, metrics
 def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metrics=run_metrics, host="") -> dict:
     """One pass: ingest new requests, one merge step, collection, then state.json and status.json. A failing part is
     recorded in errors and the rest still runs; status is always written."""
-    raise NotImplementedError
+    p = paths(name)
+    state = dict(state or {})
+    for k, v in (("seen", []), ("merge", []), ("merge_done", []), ("collect", {}), ("acks", []), ("errors", [])):
+        state.setdefault(k, v)
+
+    def err(where, e):
+        state["errors"] = (state["errors"] + [{"at": utc(now), "where": where,
+                                                "error": f"{type(e).__name__}: {str(e)[:200]}"}])[-KEEP:]
+    try:
+        for b in blob.names(p["requests"]):
+            rid = b[len(p["requests"]):-len(".json")]
+            if rid in state["seen"]:
+                continue
+            req = blob.get_json(b) or {}
+            kind, pl = req.get("kind"), req.get("payload") or {}
+            state["seen"].append(rid)        # a bad request is recorded once, never retried every loop
+            if kind == "merge":
+                queued = {i["pr"] for i in state["merge"]}
+                state["merge"] += [{"pr": int(n), "state": "queued", "request": rid} for n in pl.get("prs", [])
+                                   if int(n) not in queued]
+            elif kind == "collect":
+                state["collect"].setdefault(pl["name"], {"labels": {}})["entry"] = pl
+            elif kind != "noop":
+                raise ValueError(f"request {rid}: unknown kind {kind!r}")
+            state["acks"] = (state["acks"] + [{"request": rid, "kind": kind, "at": utc(now)}])[-KEEP:]
+    except Exception as e:  # noqa: BLE001
+        err("requests", e)
+    if gh is not None and state["merge"]:
+        try:
+            item = merge_step(gh, state["merge"][0], now)
+            if item["state"] not in ("queued", "waiting"):
+                state["merge_done"] = (state["merge_done"] + [state["merge"].pop(0)])[-KEEP:]
+        except Exception as e:  # noqa: BLE001
+            err("merge", e)
+    try:
+        collect_step(blob, name, state, now, work, fetch=fetch, metrics=metrics)
+    except Exception as e:  # noqa: BLE001
+        err("collect", e)
+    state["loops"] = int(state.get("loops", 0)) + 1
+    paused = []
+    for d in run_dirs(work):
+        try:
+            st = str((json.load(open(os.path.join(d, "metadata.json"))) or {}).get("status", ""))
+        except (OSError, ValueError, AttributeError):
+            continue
+        if st.startswith(("paused", "awaiting")):
+            paused.append({"run": os.path.relpath(d, work), "status": st})
+    status = {"name": name, "host": host, "heartbeat_utc": utc(now), "loops": state["loops"],
+              "merge": {"enabled": gh is not None,
+                        "why": "" if gh is not None else "no GitHub token ($GH_TOKEN) on the VM: merges are held",
+                        "queue": state["merge"], "done": state["merge_done"][-10:]},
+              "collect": {k: {"labels": v["labels"]} for k, v in state["collect"].items()},
+              "metrics_at": state.get("metrics_at"), "paused": paused,
+              "acks": state["acks"][-10:], "errors": state["errors"][-10:]}
+    state["seen"] = state["seen"][-1000:]
+    blob.put_json(p["state"], state)
+    blob.put_json(p["status"], status)
+    return state
 
 
 def loop(a):
@@ -229,13 +376,59 @@ def loop(a):
 
 def status_lines(st: dict | None, now: float) -> tuple[list, int]:
     """Readable status and an exit code: 0 live, 3 stale or absent."""
-    raise NotImplementedError
+    if not st:
+        return ["no status.json: the supervisor has never run under this name"], 3
+    import calendar
+    age = now - calendar.timegm(time.strptime(st["heartbeat_utc"], "%Y-%m-%dT%H:%M:%SZ"))
+    live = age <= STALE_S
+    out = [f"{st.get('name', '?')} on {st.get('host', '?')}: last loop {st['heartbeat_utc']} ({age / 60:.1f} min ago,"
+           f" loop {st.get('loops')})" + ("" if live else " STALE: the loop is not running")]
+    m = st.get("merge") or {}
+    out.append(f"merge train: {'enabled' if m.get('enabled') else 'disabled (' + m.get('why', '') + ')'}")
+    out += [f"  PR {i['pr']:<6} {i['state']:<15} {i.get('note', '')}" for i in m.get("queue") or []]
+    out += [f"  PR {i['pr']:<6} {i['state']:<15} {i.get('note', '')} (done)" for i in m.get("done") or []]
+    for lname, ent in sorted((st.get("collect") or {}).items()):
+        for label, lab in sorted(ent.get("labels", {}).items()):
+            out.append(f"collect {lname}/{label}: {lab.get('state')} {lab.get('note', '')}".rstrip())
+    out.append(f"metrics.json: {st.get('metrics_at') or 'not yet'}")
+    out += [f"paused run: {x['run']} ({x['status']}); resume is not automated" for x in st.get("paused") or []]
+    out += [f"ack {x['kind']} request {x['request']} at {x['at']}" for x in st.get("acks") or []]
+    out += [f"error {x['at']} {x['where']}: {x['error']}" for x in st.get("errors") or []]
+    return out, 0 if live else 3
 
 
 def pull(blob, name, dest, now=None) -> list:
     """Every collected tarball not already here (or changed), sha256-checked, extracted with the data filter into
     <dest>/<launch>/<label>/; metrics.json too. Returns what was fetched."""
-    raise NotImplementedError
+    import results_store
+    os.makedirs(dest, exist_ok=True)
+    ip = os.path.join(dest, ".pulled.json")
+    index = json.load(open(ip)) if os.path.exists(ip) else {}
+    st = blob.get_json(paths(name)["status"]) or {}
+    got = []
+    for lname, ent in sorted((st.get("collect") or {}).items()):
+        for label, lab in sorted(ent.get("labels", {}).items()):
+            if lab.get("state") != "collected" or index.get(lab["blob"]) == lab["sha256"]:
+                continue
+            target = os.path.join(dest, lname)
+            os.makedirs(target, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=target) as td:
+                tgz = os.path.join(td, "x.tar.gz")
+                blob.get_file(lab["blob"], tgz)
+                if results_store.sha256_file(tgz) != lab["sha256"]:
+                    print(f"{lab['blob']}: sha256 does not match the record: not extracted")
+                    continue
+                with tarfile.open(tgz, mode="r:gz") as t:
+                    t.extractall(td, filter="data")
+                if os.path.exists(os.path.join(target, label)):
+                    os.rename(os.path.join(target, label), os.path.join(target, f"{label}.before_{int(time.time())}"))
+                os.rename(os.path.join(td, label), os.path.join(target, label))
+            index[lab["blob"]] = lab["sha256"]
+            got.append(lab["blob"])
+    json.dump(index, open(ip, "w"), indent=1)
+    if got and st.get("metrics_at"):
+        blob.get_file(paths(name)["metrics"], os.path.join(dest, "metrics.json"))
+    return got
 
 
 def keychain_token(service=KEYCHAIN_SERVICE, runner=subprocess.run):
@@ -245,7 +438,15 @@ def keychain_token(service=KEYCHAIN_SERVICE, runner=subprocess.run):
 
 def start_commands(a, job_id, token_present) -> list:
     """The two vm_job commands `start` runs: up (2-vCPU worker) and start (the loop as a job)."""
-    raise NotImplementedError
+    vm = [sys.executable, "cloud/vm_job.py"]
+    budget = ["--cap-usd", str(a.cap_usd)] + (["--budget-scope", a.budget_scope] if a.budget_scope else [])
+    acct = ["--store-account", a.account] if a.account else []
+    up = vm + ["up", a.name, "--cpu", "2", "--memory", "8 GiB", "--idle-timeout", "20 minutes"] + budget
+    start = (vm + ["start", a.name, job_id, "--tree", ".", "--max-hours", str(a.max_hours + 0.25)] + acct + budget
+             + (["--secret-env", "GH_TOKEN"] if token_present else [])
+             + ["--", "python3", "cloud/supervisor.py", "loop", "--name", a.name, "--every", str(int(a.every)),
+                "--max-hours", str(a.max_hours)])
+    return [up, start]
 
 
 def cmd_start(a):
@@ -264,7 +465,11 @@ def cmd_start(a):
 
 def stop_own(name, live_id=None, stop=None):
     """Stop this supervisor's cluster: the live cluster with exactly this name, by its id."""
-    raise NotImplementedError
+    cid = live_id(name)
+    if cid is None:
+        return f"{name}: no live cluster of this name"
+    stop(name, cid, f"supervisor stop {name}")
+    return f"{name}: stop requested for cluster {cid}"
 
 
 def _assignments(config_path):

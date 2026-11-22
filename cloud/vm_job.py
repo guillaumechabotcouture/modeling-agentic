@@ -225,6 +225,22 @@ def job_env(secrets: dict | None, name: str, job_id: str, account: str | None = 
             **({"MA_STORAGE_ACCOUNT": account} if account else {})}
 
 
+SECRET_ENV_ALLOWED = ("GH_TOKEN",)     # cloud/supervisor.py's merge train (W0-J)
+
+
+def secret_env(names) -> dict:
+    """--secret-env NAME: the launcher's $NAME, for the job's environment only (never job.json or state.json, like
+    --anthropic-key). Only names in SECRET_ENV_ALLOWED; an unset one is refused. Values are never printed."""
+    out = {}
+    for n in names or ():
+        if n not in SECRET_ENV_ALLOWED:
+            raise SystemExit(f"--secret-env {n}: not in the allow-list {SECRET_ENV_ALLOWED}: refusing")
+        if not os.environ.get(n):
+            raise SystemExit(f"--secret-env {n}: ${n} is not set in the launcher's environment: refusing")
+        out[n] = os.environ[n]
+    return out
+
+
 _ACCOUNT_NAME = re.compile(r"[a-z0-9]{3,24}")     # Azure storage account names: 3-24 lowercase letters and digits
 
 
@@ -587,6 +603,7 @@ def cmd_start(a, cluster=None):
     cmd = a.command
     if not cmd:
         raise SystemExit("no command given (put it after --)")
+    secret_env(getattr(a, "secret_env", None))      # refused before the budget check or any cluster call
     pipeline = job_pipeline(cmd)        # a main.py job states its pipeline, or nothing starts
     if cluster is None:                 # interactive start keeps a paid cluster busy: the budget must still cover it
         checked = _live_vm_types_ok(a.name)     # and the budget must be able to price every VM it runs
@@ -594,8 +611,9 @@ def cmd_start(a, cluster=None):
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
     base = getattr(a, "base_name", a.name)
     account = storage_account(getattr(a, "store_account", None))
-    secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
-                      base, a.job_id, account)
+    extra = secret_env(getattr(a, "secret_env", None))
+    secrets = job_env({**({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else {}),
+                       **extra} or None, base, a.job_id, account)
     c, w = _client(a.name, cluster, cid=None if cluster is not None else checked)
     token = _runner(c, w)(ws.job_queue, a.job_id)
     if not token:
@@ -2900,6 +2918,8 @@ def main(argv=None) -> int:
         p.add_argument("--max-hours", type=float, default=24.0)
         p.add_argument("--setup-sdk", action="store_true")
         p.add_argument("--anthropic-key", action="store_true")
+        p.add_argument("--secret-env", action="append", default=[], metavar="NAME",
+                       help=f"pass the launcher's $NAME to the job's environment only (allowed: {SECRET_ENV_ALLOWED})")
         p.add_argument("--cluster-compute", action="store_true",
                        help="the job's compute.py run_map uses every worker of this cluster")
         p.add_argument("--store", metavar="PREFIX", default=None,
