@@ -2,6 +2,8 @@
 
 Version 0.1 (2026-11-05). Our own numpy code behind `toolkit/engines/contract.py`; no external simulator, no R.
 
+The engine stays in numpy on Starsim v4 (2026-11-20). The same model as a declared v4 disease (a chain of one-step infection-age states run by `ss.solvers.ode(integrator='map', dwells='exact')`) gives the same numbers to 3e-15, but a sim costs about 6 ms to build and run against about 1 ms for the loop, and 25 times as much for a batch of 1,000, for no gain in what the engine can do. That version is kept as a check: `benchmarks/starsim_v4.py --self-test` runs both and compares them. It lives outside the engine's own directory, so the code fingerprint and the pack's stamps are unchanged.
+
 ## Model
 
 One closed population. Time runs on the generation interval's grid (one week or one day). With infections `I_t`

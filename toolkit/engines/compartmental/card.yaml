@@ -1,10 +1,11 @@
 name: compartmental-starsim
-version: '0.2'
+version: '0.3'
 mechanisms:
 - closed population of groups (age bands with a contact matrix, or birth cohorts with homogeneous mixing C_ij =
   c N_j / N); no births, deaths, waning or migration within the horizon
 - discrete-time transmission with susceptible depletion in the exponential-survival form, a declared generation
-  interval on the dt grid, optional cosine seasonal forcing
+  interval on the dt grid, optional cosine seasonal forcing; run as a declared Starsim v4 disease (a chain of one-step
+  infection-age states, stratified by group)
 - R0 = q rho(C) from the next-generation matrix; Reff = q f rho(diag(s) C)
 - 'susceptibility initialisers: given (calibrated latent share) or cohort_history (latent true dose coverage by
   birth year, seroconversion, declared dose dependence)'
@@ -61,16 +62,17 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
-  computed: 0.5828116449805854
+  band_sha256: 939ef567a0b9a73f0509bcfb8e2c7547e5e35b2f2314b0a44f7918e356a7a5ed
+  computed: 0.5828116449805856
   reference: 0.58281164498064
-  error_abs: 5.46229728115577e-14
-  error_rel: 9.372320076647093e-14
+  error_abs: 5.440092820663267e-14
+  error_rel: 9.334221214546902e-14
   tolerance:
     abs: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 5.46229728115577e-14
-  - 5.46229728115577e-14
+  - 5.440092820663267e-14
+  - 5.440092820663267e-14
   in_band: true
   status: in_band
 - id: FS1b
@@ -79,16 +81,17 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
-  computed: 0.7968121303622717
+  band_sha256: 61d4cb3e666b62b4fef297089b3aa404fdeb9c764e1fda5481d828ab6107e3d0
+  computed: 0.7968121303622712
   reference: 0.7968121303623036
-  error_abs: 3.186340080674199e-14
-  error_rel: 3.998859905942192e-14
+  error_abs: 3.241851231905457e-14
+  error_rel: 4.068526454826203e-14
   tolerance:
     abs: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 3.186340080674199e-14
-  - 3.186340080674199e-14
+  - 3.241851231905457e-14
+  - 3.241851231905457e-14
   in_band: true
   status: in_band
 - id: FS1c
@@ -97,6 +100,7 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
+  band_sha256: 35081d926b7f89ef0173a1fd035eb56f46b584b9d98a2da1e2ebc324f1a10cd0
   computed: 0.9801725987397542
   reference: 0.9801725987397569
   error_abs: 2.7755575615628914e-15
@@ -115,16 +119,17 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
-  computed: 0.9999938553345866
+  band_sha256: 906d86e32d0175110bc77ed9f9f2cd67e2dba61dd5a7fc386f037c3da03a6bcb
+  computed: 0.9999938553345867
   reference: 0.9999938553345865
-  error_abs: 1.1102230246251565e-16
-  error_rel: 1.1102298466160962e-16
+  error_abs: 2.220446049250313e-16
+  error_rel: 2.2204596932321923e-16
   tolerance:
     abs: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 1.1102230246251565e-16
-  - 1.1102230246251565e-16
+  - 2.220446049250313e-16
+  - 2.220446049250313e-16
   in_band: true
   status: in_band
 - id: FS1e
@@ -133,6 +138,7 @@ benchmarks:
   target: null
   band: null
   source: Kermack-McKendrick (1927); Lambert W closed form
+  band_sha256: 70a3c93668f0f5c89e801ce465f8826f858d0eeb8e23ad2513a8bb2ef022380a
   computed: 0.9999999847700162
   reference: 0.9999999847700161
   error_abs: 1.1102230246251565e-16
@@ -151,16 +157,17 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem
-  computed: 1.999999043325724e-09
+  band_sha256: dc635015f5c909eea659f6548a32827f73f1c8ed41dee9c842b32a3420e9c460
+  computed: 1.9999990433257247e-09
   reference: 2.0e-09
-  error_abs: 9.56674276233652e-16
-  error_rel: 4.78337138116826e-07
+  error_abs: 9.566742754064715e-16
+  error_rel: 4.783371377032357e-07
   tolerance:
     abs: 1.0e-15
   compare: le
   per_seed_error_abs:
-  - 9.56674276233652e-16
-  - 9.56674276233652e-16
+  - 9.566742754064715e-16
+  - 9.566742754064715e-16
   in_band: true
   status: in_band
 - id: FS2b
@@ -169,16 +176,17 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem; Lambert W
-  computed: 0.019736509118963255
+  band_sha256: 15922f4712ce5e19729d8fc07fff8520e895b4426a3d916bd75d9a5f28dfe5d2
+  computed: 0.01973650911896175
   reference: 0.01973650911894509
-  error_abs: 1.8166024240429124e-14
-  error_rel: 9.204274236618442e-13
+  error_abs: 1.6660284263281255e-14
+  error_rel: 8.441353110053813e-13
   tolerance:
     abs: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 1.8166024240429124e-14
-  - 1.8166024240429124e-14
+  - 1.6660284263281255e-14
+  - 1.6660284263281255e-14
   in_band: true
   status: in_band
 - id: FS2c
@@ -187,16 +195,17 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem
-  computed: 0.019736509118963255
+  band_sha256: f282a20fa0b057101fe914511cbcb51952e8e4f833a1672c668aedec6d1e28ea
+  computed: 0.01973650911896175
   reference: 0.02
-  error_abs: 0.0002634908810367452
-  error_rel: 0.01317454405183726
+  error_abs: 0.00026349088103825094
+  error_rel: 0.013174544051912547
   tolerance:
     rel: 0.02
   compare: eq
   per_seed_error_abs:
-  - 0.0002634908810367452
-  - 0.0002634908810367452
+  - 0.00026349088103825094
+  - 0.00026349088103825094
   in_band: true
   status: in_band
 - id: FS3
@@ -205,13 +214,14 @@ benchmarks:
   target: null
   band: null
   source: Ma & Earn (2006) Bull Math Biol; Andreasen (2011)
+  band_sha256: 7144a2013212e103e250b1a39025256a4377fc17cc557cef7b69d7e96e196029
   computed: 5.10702591327572e-15
   reference:
   - 0.4638279198514076
   - 0.7125194993192094
   - 0.26776227820404075
   error_abs: 5.10702591327572e-15
-  error_rel: 1.1402327983602831e-14
+  error_rel: 1.1609643037850157e-14
   tolerance:
     rel: 1.0e-06
   compare: eq
@@ -219,9 +229,9 @@ benchmarks:
   - 5.10702591327572e-15
   - 5.10702591327572e-15
   computed_vector:
-  - 0.46382791985140287
+  - 0.4638279198514031
   - 0.7125194993192043
-  - 0.2677622782040377
+  - 0.26776227820403764
   in_band: true
   status: in_band
 - id: FS4a
@@ -230,16 +240,17 @@ benchmarks:
   target: null
   band: null
   source: herd-immunity identity
-  computed: 0.29140582193402026
+  band_sha256: 843712a1da985aa3429d00a5806cdb73fe35899aa83080a6a25f9f95e453ccb5
+  computed: 0.2914058219340199
   reference: 0.29140582193290576
-  error_abs: 1.1144973832699634e-12
-  error_rel: 3.824554279243498e-12
+  error_abs: 1.1141643163625758e-12
+  error_rel: 3.8234113133783056e-12
   tolerance:
     rel: 1.0e-08
   compare: eq
   per_seed_error_abs:
-  - 1.1144973832699634e-12
-  - 1.1144973832699634e-12
+  - 1.1141643163625758e-12
+  - 1.1141643163625758e-12
   in_band: true
   status: in_band
 - id: FS4b
@@ -248,16 +259,17 @@ benchmarks:
   target: null
   band: null
   source: herd-immunity identity
-  computed: 0.5828116438680405
+  band_sha256: d653655b6d9627b8baf845bdabe5e1b823516cf8a2edf7680955b7b4080387c2
+  computed: 0.5828116438680399
   reference: 0.5828116438658115
-  error_abs: 2.2289947665399268e-12
-  error_rel: 3.824554279243498e-12
+  error_abs: 2.2283286327251517e-12
+  error_rel: 3.8234113133783056e-12
   tolerance:
     rel: 1.0e-08
   compare: eq
   per_seed_error_abs:
-  - 2.2289947665399268e-12
-  - 2.2289947665399268e-12
+  - 2.2283286327251517e-12
+  - 2.2283286327251517e-12
   in_band: true
   status: in_band
 - id: FS4c
@@ -266,16 +278,17 @@ benchmarks:
   target: null
   band: null
   source: herd-immunity identity
-  computed: 9.999406755745053e-12
+  band_sha256: 8c393377995007ebdc1372bd09e4612623a2c224e887b0500fd415d65851f82e
+  computed: 9.999406755745042e-12
   reference: 0.0
-  error_abs: 9.999406755745053e-12
-  error_rel: 9.999406755745052e+288
+  error_abs: 9.999406755745042e-12
+  error_rel: 9.999406755745041e+288
   tolerance:
     abs: 1.0e-10
   compare: eq
   per_seed_error_abs:
-  - 9.999406755745053e-12
-  - 9.999406755745053e-12
+  - 9.999406755745042e-12
+  - 9.999406755745042e-12
   in_band: true
   status: in_band
 - id: FS5
@@ -285,16 +298,17 @@ benchmarks:
   target: null
   band: null
   source: Diekmann, Heesterbeek & Metz (1990)
-  computed: 3.2204801174856823
-  reference: 3.22048005763425
-  error_abs: 5.985143225473166e-08
-  error_rel: 1.858463060898388e-08
+  band_sha256: ecf02848a169b8910fe3a8bf54f896468b6c2d9bc2ab0fed15ae05bcab29b334
+  computed: 3.220480117485683
+  reference: 3.2204800576342505
+  error_abs: 5.985143269882087e-08
+  error_rel: 1.8584630746879224e-08
   tolerance:
     rel: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 5.985143225473166e-08
-  - 5.985143225473166e-08
+  - 5.985143269882087e-08
+  - 5.985143269882087e-08
   in_band: true
   status: in_band
 - id: FS6a
@@ -303,21 +317,22 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE (solve_ivp DOP853, rtol 1e-10)
-  computed: 2.6900703886667543e-13
+  band_sha256: f280fbd24c627e6a0cd561877f73253994b3ebabbc945ff8ada123019bf3d9be
+  computed: 2.681188604469753e-13
   reference:
-  - 0.7968128145862968
+  - 0.7968128145862962
   - 0.0
   - 0.0
-  error_abs: 2.6900703886667543e-13
-  error_rel: 3.376038059909255e-13
+  error_abs: 2.681188604469753e-13
+  error_rel: 3.364891421659454e-13
   tolerance:
     abs: 1.0e-05
   compare: eq
   per_seed_error_abs:
-  - 2.6900703886667543e-13
-  - 2.6900703886667543e-13
+  - 2.681188604469753e-13
+  - 2.681188604469753e-13
   computed_vector:
-  - 0.7968128145860278
+  - 0.796812814586028
   - 0.0
   - 0.0
   in_band: true
@@ -328,23 +343,24 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE
-  computed: 6.772360450213455e-15
+  band_sha256: 13fcf8c8e4e2b79b5c412a0a8ef5ddbfe5d9ac9940e7a124d2248f4f1ece98fc
+  computed: 6.439293542825908e-15
   reference:
-  - 0.33869912292631776
-  - 0.4501435205607459
-  - 0.1681155953709316
-  error_abs: 6.772360450213455e-15
-  error_rel: 1.865609218256006e-14
+  - 0.3386991229263174
+  - 0.4501435205607454
+  - 0.16811559537093124
+  error_abs: 6.439293542825908e-15
+  error_rel: 1.7005110573483985e-14
   tolerance:
     abs: 1.0e-05
   compare: eq
   per_seed_error_abs:
-  - 6.772360450213455e-15
-  - 6.772360450213455e-15
+  - 6.439293542825908e-15
+  - 6.439293542825908e-15
   computed_vector:
-  - 0.338699122926312
-  - 0.45014352056073914
-  - 0.16811559537092846
+  - 0.33869912292631205
+  - 0.450143520560739
+  - 0.16811559537092838
   in_band: true
   status: in_band
 - id: FS6c
@@ -353,26 +369,27 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE
-  computed: 1.0802470029602773e-13
+  band_sha256: 86eefdd75f4cf9089d0033c0890511d0dfc448ae70a3b0568a10e09085b7ab69
+  computed: 1.084687895058778e-13
   reference:
-  - 0.9192900487786672
-  - 0.8631882864871628
-  - 0.6178062746082034
-  - 0.6582465122853505
-  - 0.67386809545775
-  error_abs: 1.0802470029602773e-13
-  error_rel: 1.2514616102547663e-13
+  - 0.9192900487786665
+  - 0.8631882864871632
+  - 0.617806274608203
+  - 0.6582465122853504
+  - 0.6738680954577491
+  error_abs: 1.084687895058778e-13
+  error_rel: 1.256606365075957e-13
   tolerance:
     abs: 1.0e-05
   compare: eq
   per_seed_error_abs:
-  - 1.0802470029602773e-13
-  - 1.0802470029602773e-13
+  - 1.084687895058778e-13
+  - 1.084687895058778e-13
   computed_vector:
-  - 0.9192900487786215
-  - 0.8631882864870548
-  - 0.6178062746081979
-  - 0.6582465122853587
+  - 0.9192900487786217
+  - 0.8631882864870547
+  - 0.6178062746081983
+  - 0.6582465122853588
   - 0.6738680954577423
   in_band: true
   status: in_band
@@ -382,16 +399,17 @@ benchmarks:
   target: null
   band: null
   source: "exponential-survival identity (\xA71.1)"
-  computed: 0.7968121303622778
-  reference: 0.7968121303622717
-  error_abs: 6.106226635438361e-15
-  error_rel: 7.663320377241441e-15
+  band_sha256: 20054bd5c1a9b4bf77bb53eba5e7e9069712cbc14af50b7e4cb882fa91ad6c80
+  computed: 0.7968121303622777
+  reference: 0.7968121303622712
+  error_abs: 6.5503158452884236e-15
+  error_rel: 8.220652768313552e-15
   tolerance:
     rel: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 6.106226635438361e-15
-  - 6.106226635438361e-15
+  - 6.5503158452884236e-15
+  - 6.5503158452884236e-15
   in_band: true
   status: in_band
 - id: FS8b
@@ -400,6 +418,7 @@ benchmarks:
   target: null
   band: null
   source: engine stop rule
+  band_sha256: 81527656a063ce1d6237b9e33a3b6ff2e80e8e1e4a0012587214d8acc1092c29
   computed: 1.0
   reference: 1.0
   error_abs: 0.0
@@ -418,6 +437,7 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
+  band_sha256: 4123516e901d764653081ae4a615ab728fac3a9afedbf5b3f426c79defe87c14
   computed: 0.7968121300200206
   reference: 0.79681213002002
   error_abs: 5.551115123125783e-16
@@ -436,6 +456,7 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
+  band_sha256: 9766eb338166c87ada9bc94405784143e424c5b40c88ed968a63696a2a448284
   computed: 0.5000000000000009
   reference: 0.5
   error_abs: 8.881784197001252e-16
@@ -454,6 +475,7 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
+  band_sha256: 0ddd346c15d780e55f78b1dbbc1274a4b387df6977414e3c47ad5c74a11194ad
   computed: 1.2212453270876722e-15
   reference: 0.0
   error_abs: 1.2212453270876722e-15
@@ -472,6 +494,7 @@ benchmarks:
   target: null
   band: null
   source: branching-process identities
+  band_sha256: 5a962a9298179da4bcc6099b14c9e5299d6e9e5b98b4f5fc88ac9c58530a5925
   computed: 0.8926447536092091
   reference: 0.8926447536092056
   error_abs: 3.552713678800501e-15
@@ -490,16 +513,17 @@ benchmarks:
   target: null
   band: null
   source: "design note \xA71.1 (importation: branching)"
-  computed: 0.634909570819514
+  band_sha256: 3991657f32c2ff220b32150f1870c00a1f587c6c2279c540ffaa7b9ae357c7e8
+  computed: 0.6349095708195143
   reference: 0.6349095708197771
-  error_abs: 2.630118345336996e-13
-  error_rel: 4.142508581089843e-13
+  error_abs: 2.6278978992877455e-13
+  error_rel: 4.1390113176191043e-13
   tolerance:
     abs: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 2.630118345336996e-13
-  - 2.630118345336996e-13
+  - 2.6278978992877455e-13
+  - 2.6278978992877455e-13
   in_band: true
   status: in_band
 - id: RN1
@@ -508,6 +532,7 @@ benchmarks:
   target: null
   band: null
   source: Wallinga & Lipsitch (2007) Proc R Soc B
+  band_sha256: a7eab13a7dd9f94baf782c76d56ce2e6411e54550f750dd0288c6178fd0e6f8b
   computed: 2.0
   reference: 1.9999994730362805
   error_abs: 5.269637195493004e-07
@@ -526,16 +551,17 @@ benchmarks:
   target: null
   band: null
   source: Diekmann, Heesterbeek & Britton (2013), ch. 1
-  computed: 0.7968121303623035
+  band_sha256: fe1de35671ab071ace143ce66cbe2b22e5c271640e133479188c7523ed9bd98d
+  computed: 0.7968121303623036
   reference: 0.7968121303623036
-  error_abs: 1.1102230246251565e-16
-  error_rel: 1.3933309776802064e-16
+  error_abs: 0.0
+  error_rel: 0.0
   tolerance:
     abs: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 1.1102230246251565e-16
-  - 1.1102230246251565e-16
+  - 0.0
+  - 0.0
   in_band: true
   status: in_band
 - id: RN2b
@@ -544,16 +570,17 @@ benchmarks:
   target: null
   band: null
   source: Diekmann, Heesterbeek & Britton (2013), ch. 1
-  computed: 0.7968121303623035
+  band_sha256: 8797f886e623e1b35ba6b9aacd4e344925e8d97d25bdcca51b388c4e8199623e
+  computed: 0.7968121303623036
   reference: 0.7968121303623036
-  error_abs: 1.1102230246251565e-16
-  error_rel: 1.3933309776802064e-16
+  error_abs: 0.0
+  error_rel: 0.0
   tolerance:
     abs: 1.0e-06
   compare: eq
   per_seed_error_abs:
-  - 1.1102230246251565e-16
-  - 1.1102230246251565e-16
+  - 0.0
+  - 0.0
   in_band: true
   status: in_band
 - id: RN2c
@@ -562,6 +589,7 @@ benchmarks:
   target: null
   band: null
   source: Codex review finding 2 (design note)
+  band_sha256: 83b53806283794f6817e207af02e2cfe5513b239af1c4c85cefd16a71de6fe33
   computed: 0.8687075605459232
   reference: 0.7968121303623036
   error_abs: 0.07189543018361966
@@ -579,6 +607,7 @@ benchmarks:
   target: null
   band: null
   source: Codex review finding 2 (design note)
+  band_sha256: 4e70afcf1d4f4dc0c3b37a3af89493dffca0e7f881813bcee97971bffa9ca318
   computed: 0.8687075605459232
   reference: 0.8687
   error_abs: 7.560545923213091e-06
@@ -596,8 +625,9 @@ benchmarks:
   target: null
   band: null
   source: identity
-  computed: 0.40637573927539355
-  reference: 0.40637573927539355
+  band_sha256: b8850f095e28ecbb312564812942488055d39d230e11c6244bdbe68144b58e54
+  computed: 0.40637573927539283
+  reference: 0.40637573927539283
   error_abs: 0.0
   error_rel: 0.0
   tolerance:
@@ -614,16 +644,17 @@ benchmarks:
   target: null
   band: null
   source: identity
-  computed: 0.40637573927539355
+  band_sha256: 5ab1b61f6d0fdac608b1922a779ebcdfb5848a1e725e889118a2bd0109b3593b
+  computed: 0.40637573927539283
   reference: 1.0
-  error_abs: 0.5936242607246065
-  error_rel: 0.5936242607246065
+  error_abs: 0.5936242607246072
+  error_rel: 0.5936242607246072
   tolerance:
     abs: 0.0
   compare: le
   per_seed_error_abs:
-  - 0.5936242607246065
-  - 0.5936242607246065
+  - 0.5936242607246072
+  - 0.5936242607246072
   in_band: true
   status: in_band
 - id: RN3c
@@ -632,16 +663,17 @@ benchmarks:
   target: null
   band: null
   source: identity
-  computed: 0.7957646538280179
-  reference: 0.795764653828018
-  error_abs: 1.1102230246251565e-16
-  error_rel: 1.3951650394176717e-16
+  band_sha256: 5fd35e1a9fcd36f18b252faa7fc3556c75d421e9be60d9d6d88211701c1ff0bd
+  computed: 0.7957646538280181
+  reference: 0.7957646538280181
+  error_abs: 0.0
+  error_rel: 0.0
   tolerance:
     rel: 1.0e-09
   compare: eq
   per_seed_error_abs:
-  - 1.1102230246251565e-16
-  - 1.1102230246251565e-16
+  - 0.0
+  - 0.0
   in_band: true
   status: in_band
 - id: RN3d
@@ -650,8 +682,9 @@ benchmarks:
   target: null
   band: null
   source: identity
-  computed: 0.18088388276987707
-  reference: 0.18088388276987707
+  band_sha256: 7dd1fbfec4473861608eba447ed73afe8fc3603113521892883cc9afc8d78ca9
+  computed: 0.18088388276987677
+  reference: 0.18088388276987677
   error_abs: 0.0
   error_rel: 0.0
   tolerance:
@@ -668,8 +701,9 @@ benchmarks:
   target: null
   band: null
   source: identity
-  computed: 0.2999505999572497
-  reference: 0.2999505999572497
+  band_sha256: f06b711e5d733741fbf0814a90e78cf9173aa3e6a38a78fb3d49dd0c5249e2ff
+  computed: 0.2999505999572492
+  reference: 0.2999505999572492
   error_abs: 0.0
   error_rel: 0.0
   tolerance:
@@ -686,15 +720,16 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE
-  computed: 1.8184719730900294
+  band_sha256: 898b2a0bfa5b305c99777105c54f0ed15764d0cf69d1904ccdede3a5c1397a5b
+  computed: 1.818471972049806
   reference: 1.8
-  error_abs: 0.018471973090029348
-  error_rel: 0.010262207272238526
+  error_abs: 0.018471972049805885
+  error_rel: 0.010262206694336603
   tolerance:
     rel: 0.05
   compare: eq
   per_seed_error_abs:
-  - 0.018471973090029348
+  - 0.018471972049805885
   in_band: true
   status: in_band
 - id: CI1a
@@ -703,6 +738,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: 1b059a57c8d74b66c8b73c704bbdfd713fbddef3d74a74eb1b16b57ad11af0d8
   computed: 0.10105
   reference: 0.10105
   error_abs: 0.0
@@ -720,6 +756,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: 5e3931ac54fd9495df3918748fae82f5ab90da87b06abba0b7d497a1d73dc82c
   computed: 0.31999999999999995
   reference: 0.32
   error_abs: 5.551115123125783e-17
@@ -737,6 +774,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: 5c1a27d39023e7acf3d789333e8cd6bbf56b00295fc0285fe38a1568e2b4129f
   computed: 0.1495
   reference: 0.1495
   error_abs: 0.0
@@ -754,6 +792,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: bba7e5e208e0e67d714affee7d1bcb59e17e7fa489878ee5d66879c433218b2a
   computed: 0.33375000000000005
   reference: 0.33375
   error_abs: 5.551115123125783e-17
@@ -771,6 +810,7 @@ benchmarks:
   target: null
   band: null
   source: spec declaration
+  band_sha256: cc0676fd98ae09647cac0301ca2dbe3811dff56aea7cfcda52101e7a22d7cc20
   computed: 0.0
   reference: 0.0
   error_abs: 0.0
@@ -788,6 +828,7 @@ benchmarks:
   target: null
   band: null
   source: structural
+  band_sha256: 152b3bacd6e1a18195a07f82fba90325ceb1b9cb026f27e80939c57961988da4
   computed: 0.0
   reference: 0.0
   error_abs: 0.0
@@ -805,6 +846,7 @@ benchmarks:
   target: null
   band: null
   source: identity
+  band_sha256: dc08bc64102c3d35f7e7435e7ba072225b41f69947e1bd3ca91bcd0eb0e6f138
   computed: 0.6333333333333333
   reference: 0.6333333333333333
   error_abs: 0.0
@@ -822,6 +864,7 @@ benchmarks:
   target: null
   band: null
   source: identity
+  band_sha256: 80028dfa631062c753152b29e22a26ef616f09e190f5e22230f2bdd5aff3c669
   computed: 0.0
   reference: 0.0
   error_abs: 0.0
@@ -839,6 +882,7 @@ benchmarks:
   target: null
   band: null
   source: identity
+  band_sha256: 0205efcd7a397df7590c76d941f1ce94e3d08ea73a8b6be458fb2b9d113b6081
   computed: 0.0
   reference: 0.0
   error_abs: 0.0
@@ -856,6 +900,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: 93e9a6d9553c548e929df106f890a44fd458349e6a519111605f39b22b9ef303
   computed: 0.8380952380952381
   reference: 0.8380952380952381
   error_abs: 0.0
@@ -873,6 +918,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: 0b5f75f402e1738b200bf760e1db2b71f14d0434273c8454b6c9e4fc2beee180
   computed: 0.6709999999999999
   reference: 0.671
   error_abs: 1.1102230246251565e-16
@@ -890,6 +936,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: e9575f3c6c8a9ab432203a72f7538139fd82f6b717c925e2e73748f1f18b75a9
   computed: 0.7600000000000001
   reference: 0.76
   error_abs: 1.1102230246251565e-16
@@ -907,6 +954,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: 920a8fd7ea2fa5fd4d44e3c9f26d6cad4aecff1aecc6f1e7695d5f4e39dad159
   computed: 0.7368576777701836
   reference: 0.7368576777701836
   error_abs: 0.0
@@ -924,6 +972,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: 764607653e66ac5eec74281228f50b754ffc78284d4f4d70e5eecbc36e5b2864
   computed: 100.0
   reference: 100.0
   error_abs: 0.0
@@ -941,6 +990,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: abd85ea45206dde8d4baee3a8f2e6d267359ffe98feed058f7738a3994980aaa
   computed: 0.6719999999999999
   reference: 0.672
   error_abs: 1.1102230246251565e-16
@@ -958,6 +1008,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: 976f18cf6e8aaf93a152dc6f91fe3d9d2017ec60e1930cfabd84eac17d7e58bc
   computed: 1.14
   reference: 1.14
   error_abs: 0.0
@@ -975,6 +1026,7 @@ benchmarks:
   target: null
   band: null
   source: hand-computed
+  band_sha256: c080f75b4778528e23c490a17b381a5b9f4c14010286f95d5c132db916c45bf2
   computed: 0.8
   reference: 0.8
   error_abs: 0.0
@@ -993,26 +1045,27 @@ benchmarks:
   target: null
   band: null
   source: the pack's ODE; Ma & Earn (2006) Bull Math Biol (final size independent of the latent period)
-  computed: 1.0835776720341528e-13
+  band_sha256: e58af9370ee484d45f088e0895be2e355e924e9b90d1db66e6d941f6edae843b
+  computed: 1.0857981180834031e-13
   reference:
-  - 0.9192900487786672
-  - 0.8631882864871628
-  - 0.6178062746082034
-  - 0.6582465122853505
-  - 0.67386809545775
-  error_abs: 1.0835776720341528e-13
-  error_rel: 1.2553201763706597e-13
+  - 0.9192900487786665
+  - 0.8631882864871632
+  - 0.617806274608203
+  - 0.6582465122853504
+  - 0.6738680954577491
+  error_abs: 1.0857981180834031e-13
+  error_rel: 1.257892553781255e-13
   tolerance:
     abs: 1.0e-05
   compare: eq
   per_seed_error_abs:
-  - 1.0835776720341528e-13
-  - 1.0835776720341528e-13
+  - 1.0857981180834031e-13
+  - 1.0857981180834031e-13
   computed_vector:
   - 0.9192900487786224
-  - 0.8631882864870545
-  - 0.6178062746081974
-  - 0.6582465122853601
+  - 0.8631882864870546
+  - 0.6178062746081976
+  - 0.6582465122853604
   - 0.6738680954577478
   in_band: true
   status: in_band
@@ -1022,12 +1075,13 @@ benchmarks:
   target: null
   band: null
   source: identity (v0.2)
+  band_sha256: 8d332cca135b3e82cb3195b99b25ee8b044cf01080adadf8d7fcd9f5b6ca5d07
   computed: 0.0
   reference:
   - 0.9192900487786224
-  - 0.8631882864870545
-  - 0.6178062746081974
-  - 0.6582465122853601
+  - 0.8631882864870546
+  - 0.6178062746081976
+  - 0.6582465122853604
   - 0.6738680954577478
   error_abs: 0.0
   error_rel: 0.0
@@ -1039,9 +1093,9 @@ benchmarks:
   - 0.0
   computed_vector:
   - 0.9192900487786224
-  - 0.8631882864870545
-  - 0.6178062746081974
-  - 0.6582465122853601
+  - 0.8631882864870546
+  - 0.6178062746081976
+  - 0.6582465122853604
   - 0.6738680954577478
   in_band: true
   status: in_band
@@ -1052,16 +1106,17 @@ benchmarks:
   target: null
   band: null
   source: Wallinga & Lipsitch (2007) Proc R Soc B, eq. for SEIR with exponential periods
-  computed: 1.7902707711849164
+  band_sha256: fd0433dc435d39be11e44910fec02e389595eedca653d76f6d1775e0b5810745
+  computed: 1.790270771184916
   reference: 1.8
-  error_abs: 0.009729228815083646
-  error_rel: 0.005405127119490915
+  error_abs: 0.00972922881508409
+  error_rel: 0.005405127119491161
   tolerance:
     rel: 0.01
   compare: eq
   per_seed_error_abs:
-  - 0.009729228815083646
-  - 0.009729228815083646
+  - 0.00972922881508409
+  - 0.00972922881508409
   in_band: true
   status: in_band
 - id: AS3a
@@ -1071,16 +1126,17 @@ benchmarks:
   target: null
   band: null
   source: 'multigroup herd-immunity threshold: rho(diag(s) K) < 1 (Diekmann, Heesterbeek & Metz 1990)'
-  computed: 0.9673873676413498
+  band_sha256: 16d68dd1748ad515adb721bb88ac93297731d277d7e165c99edce095ec4aa4fc
+  computed: 0.9673873676413502
   reference: 0.97
-  error_abs: 0.0026126323586501687
-  error_rel: 0.0026934354212888338
+  error_abs: 0.0026126323586497247
+  error_rel: 0.002693435421288376
   tolerance:
     abs: 0.0
   compare: le
   per_seed_error_abs:
-  - 0.0026126323586501687
-  - 0.0026126323586501687
+  - 0.0026126323586497247
+  - 0.0026126323586497247
   in_band: true
   status: in_band
 - id: AS3b
@@ -1089,16 +1145,17 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem
-  computed: 3.0351514495426206e-08
+  band_sha256: 49778ee0d779c286d1b5597ef91e8b17f182f6629b24534c14efa5a50f86193c
+  computed: 3.035151449542592e-08
   reference: 1.0e-07
-  error_abs: 6.96484855045738e-08
-  error_rel: 0.696484855045738
+  error_abs: 6.964848550457407e-08
+  error_rel: 0.6964848550457408
   tolerance:
     abs: 0.0
   compare: le
   per_seed_error_abs:
-  - 6.96484855045738e-08
-  - 6.96484855045738e-08
+  - 6.964848550457407e-08
+  - 6.964848550457407e-08
   in_band: true
   status: in_band
 - id: AS3c
@@ -1108,16 +1165,17 @@ benchmarks:
   target: null
   band: null
   source: threshold theorem
+  band_sha256: ed5ccc1d28bbdfc96912aa91738a981e1af9fe66d86d35f4af50793baf2ddca8
   computed: 0.01
-  reference: 0.08799592746032008
-  error_abs: 0.07799592746032008
-  error_rel: 0.8863583771588829
+  reference: 0.08799592746031813
+  error_abs: 0.07799592746031814
+  error_rel: 0.8863583771588803
   tolerance:
     abs: 0.0
   compare: le
   per_seed_error_abs:
-  - 0.07799592746032008
-  - 0.07799592746032008
+  - 0.07799592746031814
+  - 0.07799592746031814
   in_band: true
   status: in_band
 - id: AS4
@@ -1126,7 +1184,8 @@ benchmarks:
   target: null
   band: null
   source: identity (v0.2 component timing)
-  computed: 0.7968121334428566
+  band_sha256: de80dc5ebdc5ea3cddb21fbb27a052634d1e3f718245da7212aa045657834d09
+  computed: 0.7968121334428568
   reference: 0.7968121334428567
   error_abs: 1.1102230246251565e-16
   error_rel: 1.3933309722934535e-16
@@ -1145,6 +1204,7 @@ benchmarks:
   target: null
   band: null
   source: Ma & Earn (2006); Andreasen (2011)
+  band_sha256: e957c6384af1497e0c723244267b1de2fb55f3726111de11d776472c4a821948
   computed: 3.3306690738754696e-15
   reference:
   - 0.0
@@ -1154,7 +1214,7 @@ benchmarks:
   - 0.3185063193079236
   - 0.7962658005335224
   error_abs: 3.3306690738754696e-15
-  error_rel: 4.182860888466916e-15
+  error_rel: 1.1110724266577052e-14
   tolerance:
     rel: 1.0e-06
   compare: eq
@@ -1163,10 +1223,10 @@ benchmarks:
   - 3.3306690738754696e-15
   computed_vector:
   - 0.0
-  - 0.06370126386158456
-  - 0.09555189579237691
-  - 0.19906644956745198
-  - 0.31850631930792356
+  - 0.06370126386158402
+  - 0.09555189579237677
+  - 0.1990664495674525
+  - 0.31850631930792367
   - 0.796265800533519
   in_band: true
   status: in_band
@@ -1176,6 +1236,7 @@ benchmarks:
   target: null
   band: null
   source: Ma & Earn (2006); Andreasen (2011)
+  band_sha256: ccee0598095ee47f8f63546bc2f37049ee55185a9d611c5a56239b33bfc03d44
   computed: 2.3314683517128287e-15
   reference:
   - 0.0
@@ -1185,7 +1246,7 @@ benchmarks:
   - 0.37610998807847523
   - 0.9402749708597995
   error_abs: 2.3314683517128287e-15
-  error_rel: 3.1978454391900774e-15
+  error_rel: 5.903714656966297e-15
   tolerance:
     rel: 1.0e-06
   compare: eq
@@ -1194,10 +1255,10 @@ benchmarks:
   - 2.3314683517128287e-15
   computed_vector:
   - 0.0
-  - 0.07522199761569487
-  - 0.11283299642354219
-  - 0.23506874254904675
-  - 0.3761099880784746
+  - 0.07522199761569462
+  - 0.11283299642354189
+  - 0.23506874254904694
+  - 0.376109988078475
   - 0.9402749708597972
   in_band: true
   status: in_band
@@ -1209,27 +1270,28 @@ benchmarks:
   band: null
   source: "exponential-survival identity: the final size does not depend on the generation interval (design note\
     \ \xA71.1)"
-  computed: 9.631184738623233e-15
+  band_sha256: 9e0dc4de8c7dd7a5ba4be2d9a2bb104ba3b6ff005aa86becf5a7322517741b6a
+  computed: 1.479372180313021e-14
   reference:
-  - 0.05892676388821895
-  - 0.07545198554963957
-  - 0.030245134553902132
-  - 0.023417861801857644
-  - 0.016848627122231397
-  error_abs: 9.631184738623233e-15
-  error_rel: 1.4743777042350472e-13
+  - 0.058926763888221836
+  - 0.07545198554964352
+  - 0.030245134553903687
+  - 0.023417861801858827
+  - 0.016848627122232177
+  error_abs: 1.479372180313021e-14
+  error_rel: 2.0838969786114508e-13
   tolerance:
     rel: 1.0e-07
   compare: eq
   per_seed_error_abs:
-  - 9.631184738623233e-15
-  - 9.631184738623233e-15
+  - 1.479372180313021e-14
+  - 1.479372180313021e-14
   computed_vector:
-  - 0.05892676388821129
-  - 0.07545198554962994
-  - 0.030245134553897976
-  - 0.0234178618018543
-  - 0.016848627122228912
+  - 0.05892676388821033
+  - 0.07545198554962873
+  - 0.03024513455389748
+  - 0.023417861801853953
+  - 0.016848627122228666
   in_band: true
   status: in_band
 - id: AS6
@@ -1239,6 +1301,7 @@ benchmarks:
   target: null
   band: null
   source: identity (figures-hooks/1)
+  band_sha256: 2cad051a8542013daae9cbf039827b2cdba813248e6866d00683082161cad371
   computed: 2.220446049250313e-16
   reference: 0.0
   error_abs: 2.220446049250313e-16
@@ -1256,6 +1319,7 @@ benchmarks:
   target: null
   band: null
   source: 'candidates: Mossong et al. (2008); Wallinga, Teunis & Kretzschmar (2006) AJE'
+  band_sha256: 3f122ace0808af1a4220ec1f08bfd126e64112f67ae0d1b1ba812629e22c6bab
   computed: null
   in_band: false
   status: not_assessable
@@ -1267,6 +1331,7 @@ benchmarks:
   target: null
   band: null
   source: Cori et al. (2013) AJE worked examples
+  band_sha256: 3c1f53941086b6ce474b1d0d9e32b7e83cd818e2d833e18ae98190e880b516a5
   computed: null
   in_band: false
   status: not_assessable
@@ -1276,7 +1341,7 @@ notes:
 - p_major is derived (multitype extinction equations), not simulated
 - 'out of range: births, deaths, waning and migration within the horizon; timing within a season for interventions
   (all act before the epidemic); leaky protection'
-- 'deterministic: the module draws no random numbers; the seed is recorded only'
+- 'deterministic: nothing is drawn at random; the seed is recorded only'
 - validated against analytic identities and simulation-based coverage; published benchmarks FS7 and RN5 not yet
   assessed
 - 'configuration: {"components": {}, "dose_dependence": "independent", "doses": [], "dt": "day", "forcing": "none",
@@ -1380,5 +1445,5 @@ parameters:
   verified: unverified
 validation_label: validated against analytic identities and simulation-based coverage; published benchmarks FS7
   and RN5 not yet assessed
-results_sha256: 6e3460e49bf2bd349e67be6cf840fc85b1bd4e9a78cc4afae44dbaaf55a9b40f
+results_sha256: ebf913b65d2b568e1b17c5916863012e8189211c4f53555d1cdb769ce24239f8
 benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'

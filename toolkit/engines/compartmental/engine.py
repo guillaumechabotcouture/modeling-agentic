@@ -4,11 +4,10 @@
     python3 toolkit/engines/compartmental/engine.py --self-test
     python3 toolkit/engines/compartmental/engine.py --card [path]   # writes card.yaml (after the pack is run)
 
-Our own Starsim code: one `ss.Module` subclass, `GroupEpidemic`, holds group-level state as numpy
-arrays with a leading batch axis (batch x groups) instead of per-agent arrays, inside an `ss.Sim`
-with no network and no demographics (the sim's People object is a one-agent placeholder; group
-sizes come from the unit). Interventions are `ss.Intervention` subclasses that act at the start of
-the sim. The module draws no random numbers.
+v0.3: a declared Starsim v4 disease (states S, I1..IL, R), stratified by batch member and group, mixing through
+ss.contacts(group=C), run by the ODE solver as a discrete map (see "Starsim v4 model" below and ENGINE_NOTES.md).
+v0.2 was one Starsim 3 `ss.Module` holding numpy arrays with a batch axis; the outputs are the same to rounding.
+Components before the epidemic set the starting state; those during it act inside the sim. Nothing is random.
 
 One unit is a closed population of G groups of size N_i: age bands with a contact matrix C_ij
 (mean daily contacts of a person in i with people in j), or birth cohorts with homogeneous mixing
@@ -85,7 +84,7 @@ from toolkit.engines.contract import (EngineCard, Horizon, Outcomes, Package, Pa
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.join(HERE, "benchmarks", "pack.yaml")
 RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
-NAME, VERSION = "compartmental-starsim", "0.2"
+NAME, VERSION = "compartmental-starsim", "0.3"
 TIME_UNITS = ("day", "year")
 YEAR_DAYS = 365.0                 # time_unit year: one model year is 365 days (the forcing period's default)
 PER_GROUP = ("s0", "ratio")       # per_group_parameters: s0 and ratio:<outcome>
@@ -309,195 +308,201 @@ def extinction_probability(K: np.ndarray, offspring: str, iters: int = 200000) -
     return x
 
 
-# ------------------------------------------------------------------------------- Starsim module
+# ------------------------------------------------------------------------------- Starsim v4 model
+# v0.3: the recursion is a declared Starsim v4 disease. States S, I1..IL and R: I_l holds the people infected l steps
+# ago and leaves after exactly one step, so the force of infection is sum_l w_l I_l. The disease is stratified by
+# `member` (the batch's members, independent places) and `group` (the engine's groups, with the member's own sizes),
+# and the groups mix through ss.contacts(group=C). The ODE solver's map integrator takes each step's infections once,
+# at its start, as S (1 - exp(-lambda)): the engine's discrete map. One sim step is one engine step, so the sim's
+# unit is a day of one step whatever dt. The sim's step j is the engine's step k = offset + j + 1; the engine's step 0
+# is the initial state and the seeds. Each sim runs whole, in one compiled call: a component acting during the
+# epidemic ends one sim and starts the next, and the stop rule is applied to its results afterwards.
+
 def _ss():
     import starsim as ss
     return ss
 
 
-@functools.lru_cache(maxsize=None)
-def _module_class():
-    ss = _ss()
+class _V4Run:
+    """One run of a batch whose members share a contact matrix: declared sims, segment by segment (a to_extinction
+    run continues in a new sim from the last state, so no sim holds a near-critical run's whole length), and the module
+    state the outputs read (inc, s_first, active, stopped, doses, removed, cum, n_steps; as v0.2's GroupEpidemic)."""
 
-    class GroupEpidemic(ss.Module):
-        """Group-level discrete-time epidemic with susceptible depletion, batch axis B x G (design note §1.1).
+    def __init__(self, engine, ctx):
+        self.e, self.c = engine, ctx
+        c = ctx
+        B, G = c["N"].shape
+        self.B, self.G, self.L = B, G, len(c["w"])
+        S = c["s_init"] * c["N"]
+        self.doses = {cn: np.zeros(B) for cn in c["components"]}
+        for cn, cfg in c["components"].items():           # components acting before the epidemic (the sim's start)
+            if not cfg.get("day"):
+                s, d = apply_component(S / c["N"], c["N"], cfg, c["levels"][cn], c["eff"][cn], c["reach"][cn],
+                                       c["groups"], c["targets_susceptible"])
+                S, self.doses[cn] = s * c["N"], d
+        self.s_first = S / c["N"]
+        seed = np.minimum(c["seed"], S)
+        self.carry = {"S": S - seed, "I": np.zeros((self.L, B, G)), "R": c["N"] - S}
+        self.carry["I"][0] = seed
+        self.inc = [seed.copy()]
+        self.cum = np.zeros((B, G))
+        self.removed = {}
+        self.active = np.ones(B, bool)
+        self.stopped = np.full(B, -1)
+        self.n_steps = 0
+        self.offset = 0
 
-        State: S (B, G) susceptible counts, the incidence history over one generation interval (L, B, G),
-        cumulative infections, and the per-step incidence. A member that has converged (to_extinction) is
-        frozen. At the first step of the first segment it records the state the interventions left and
-        places the seeds; transmission starts at the next step."""
+    def state(self) -> dict:
+        return {"inc": self.inc, "s_first": self.s_first, "active": self.active, "stopped": self.stopped,
+                "doses": self.doses, "removed": self.removed, "cum": self.cum, "n_steps": self.n_steps}
 
-        def __init__(self, ctx: dict, state: dict | None, offset: int):
-            super().__init__(name="groupepidemic")
-            self.ctx, self._carry, self.offset = ctx, state, int(offset)
+    # -------------------------------------------------------------------------------------------------- the sim
+    def sim(self, steps: int):
+        """A declared sim of `steps` engine steps from the carried state."""
+        ss = _ss()
+        c, B, G = self.c, self.B, self.G
+        names = ["S"] + [f"I{k + 1}" for k in range(self.L)] + ["R"]
+        st = ss.states(" ".join(names))
+        S, Is, R = st[0], st[1:-1], st[-1]
+        force = sum(float(w) * I for w, I in zip(c["w"], Is))
+        N = c["N"]
+        Nm = N.sum(axis=1)
+        # Starsim drops a stratification with one level (and then reads a starting share of exactly 1 as one person),
+        # so only dimensions with more than one level are made; with one group, its contact rate C_11
+        # multiplies beta, since an unstratified disease mixes homogeneously
+        dims = [d for d, n in (("member", B), ("group", G)) if n > 1]
+        c11 = float(c["C"][0][0, 0]) if G == 1 else 1.0
+        # beta per member and step (the sim's unit is the step): q times the forcing at the engine's step
+        beta = c11 * np.stack([c["q"] * c["forcing"]((self.offset + j + 1) * c["dt_days"]) for j in range(steps)], axis=1)
+        if np.all(beta == beta[:, :1]):
+            per = [float(b) for b in beta[:, 0]]
+        else:
+            per = [ss.timeseries(np.arange(steps), b) for b in beta]
+        rate = ss.by(member=per) if B > 1 else per[0]
+        trans = [S >> Is[0] @ rate * force]
+        trans += [a >> b @ ss.constant(ss.days(1)) for a, b in zip(Is, list(Is[1:]) + [R])]
 
-        def init_post(self):
-            super().init_post()
-            c = self.ctx
-            if self._carry is None:
-                self.S = c["s_init"] * c["N"]
-                self.hist = np.zeros((len(c["w"]),) + self.S.shape)
-                self.inc = []
-                # v0.2 generation grid (final_size): no per-step history, only the running total per group, so memory
-                # does not grow with the number of generations (a near-critical batch ran to ~77 GB otherwise)
-                self.cum = np.zeros_like(self.S)
-                self.n_steps = 0
-                self.active = np.ones(self.S.shape[0], bool)
-                self.stopped = np.full(self.S.shape[0], -1)
-                self.s_first = None
-                self.doses = {cn: np.zeros(self.S.shape[0]) for cn in c["components"]}
-                self.removed = {}                              # v0.2: step -> susceptibles a later component protected
-            else:
-                for k, v in self._carry.items():
-                    setattr(self, k, v)
-            self._last = np.zeros(self.S.shape[0])
+        def share(x):  # a starting share per (member, group); a carried share can pass 1 by rounding
+            v = np.clip(np.asarray(x, float) / N, 0.0, 1.0)
+            return float(v[0, 0]) if not dims else ss.by(v.reshape([n for n in (B, G) if n > 1]), dims=dims)
+        init = {"S": share(self.carry["S"]), "R": share(self.carry["R"])}
+        init.update({f"I{k + 1}": share(self.carry["I"][k]) for k in range(self.L)})
+        dis = ss.Disease(*trans, init=init, name="epi")
+        strata = {}
+        if B > 1:
+            strata["member"] = ss.levels({f"m{b}": float(Nm[b] / Nm.sum()) for b in range(B)}, kind="space")
+        if G > 1:
+            frac = N / Nm[:, None]
+            strata["group"] = ss.levels(list(c["groups"]), kind="plain", fractions=(
+                ss.by(frac, dims=["member", "group"]) if B > 1 else ss.by(group=[float(x) for x in frac[0]])))
+        if strata:
+            dis.stratify(**strata)
+        nets = ss.contacts(group=c["C"][0]) if G > 1 else None
+        return ss.Sim(dis, networks=nets, total_pop=float(Nm.sum()), unit="day", dt=ss.days(1),
+                      stop=ss.days(int(steps)), verbose=0, group_results=["S", "R", "infection"],
+                      solver=ss.solvers.ode(integrator="map", dwells="exact"),
+                      copy_inputs=False)   # its modules are made for it, so need no copy (nor does sim.new())
 
-        def init_results(self):
-            super().init_results()
-            self.define_results(
-                ss.Result("new_infections", label="New infections (batch member 0, all groups)"),
-                ss.Result("susceptible", label="Susceptible (batch member 0, all groups)"),
-                ss.Result("n_active", label="Batch members still running"))
+    def _cells(self, res) -> np.ndarray:
+        """A result per time point and (member, group): (time points, B, G)."""
+        v = res.strata if res.strata is not None else np.asarray(res.values)[:, None]
+        return np.asarray(v, float).reshape(len(v), self.B, self.G)
 
-        def export(self) -> dict:
-            return {k: getattr(self, k) for k in ("S", "hist", "inc", "active", "stopped", "s_first", "doses",
-                                                  "removed", "cum", "n_steps")}
+    def _run(self, steps: int) -> bool:
+        """Run `steps` engine steps in one sim from the carried state, then apply the stop rule to each step. Returns
+        True once every member has stopped (a to_extinction run then ends), with the steps after that left out."""
+        sim = self.sim(steps).init()
+        dis = sim.diseases.epi
+        for k in range(self.L):
+            # each I_k leaves after one step. A run keeps the people in such a state in its last slot (rows), but
+            # init= puts some states' starting people in the first, which would hold them a step longer
+            rows = getattr(dis, f"I{k + 1}").rows
+            tot = dis.y[rows].sum(axis=0)
+            dis.y[rows] = 0.0
+            dis.y[rows[-1]] = tot
+        sim.run()
+        res = sim.results.epi
+        S = self._cells(res.S)                          # before step 0, then after each
+        new = self._cells(res.infection)[:steps]        # the infections of each step
+        # I_l after step j holds the infections of step j - l + 1 (the carried I_l before this sim's first step)
+        hist = np.concatenate([self.carry["I"][::-1], new])
+        for j in range(steps):
+            done = self._after(self.offset + j + 1, new[j], hist[j + 1:j + 1 + self.L], S[j + 1])
+            if done:
+                break
+        # the state the next segment starts from: from the results, since Starsim v4 also steps the sim at its last
+        # time point, after which the compartments (dis.y) are one step past the run's last result
+        self.carry = {"S": S[j + 1], "R": self._cells(res.R)[j + 1], "I": hist[j + 1:j + 1 + self.L][::-1].copy()}
+        self.offset = self.n_steps
+        return done
 
-        @property
-        def k(self) -> int:
-            return self.offset + int(self.ti)
+    def _late(self, k):
+        """The components acting at engine step k (v0.2: at the start of the step, before its transmission), on the
+        carried state."""
+        c = self.c
+        for cn, kc in c["late"]:
+            if k != kc:
+                continue
+            Sb = self.carry["S"]
+            s, d = apply_component(Sb / c["N"], c["N"], c["components"][cn], c["levels"][cn], c["eff"][cn],
+                                   c["reach"][cn], c["groups"], c["targets_susceptible"])
+            after = s * c["N"]
+            moved = np.where(Sb > 0, Sb - after, 0.0)
+            self.carry["S"] = Sb - moved
+            self.carry["R"] = self.carry["R"] + moved
+            self.doses[cn] = d
+            self.removed[k] = self.removed.get(k, 0.0) + moved
 
-        def step(self):
-            c = self.ctx
-            k = self.k
-            if k == 0:                                          # interventions have acted: record, then seed
-                self.s_first = self.S / c["N"]
-                seed = np.minimum(c["seed"], self.S)
-                self.S = self.S - seed
-                self.hist[0] = seed
-                self.inc.append(seed.copy())
-                self._last = seed.sum(axis=1)
+    def _after(self, k, new, hist, S) -> bool:
+        """After engine step k: its infections and the stop rule (as v0.2's GroupEpidemic.step), from the step's new
+        infections (B, G), the infections over one generation interval (L, B, G) and S (B, G). True once every
+        member has stopped."""
+        c = self.c
+        new = np.where(self.active[:, None], new, 0.0)        # a stopped member is frozen: nothing after its stop
+        if c.get("generations"):
+            self.cum += new
+        else:
+            self.inc.append(new)
+        self.n_steps = k
+        act = self.active & (k >= c["k_late_b"])
+        if c["mode"] != "to_extinction" or not act.any():
+            return False
+        idx = np.nonzero(act)[0]
+        v = hist[:, act].sum(axis=0)                          # (n_act, G) counts over one generation interval
+        Ntot = c["N"][act].sum(axis=1)
+        dead = idx[v.sum(axis=1) == 0.0]
+        cand = idx[(v.sum(axis=1) / Ntot < c["tol"]) & (v.sum(axis=1) > 0.0)]
+        done = list(dead)
+        if len(cand):
+            sel = np.searchsorted(idx, cand)
+            N = c["N"][cand]
+            m = c["reach_mask"][cand]
+            s = S[cand] / N
+            K = ((c["q"][cand] * c["fmax"][cand])[:, None, None] * (s * m)[:, :, None] * c["C"][cand]
+                 * m[:, None, :] * N[:, :, None] / N[:, None, :])
+            r = spectral_radius(K)
+            ok_r = r < 1.0
+            if ok_r.any():
+                Kc, vc = K[ok_r], v[sel][ok_r]
+                Gc = Kc.shape[-1]
+                fut = np.linalg.solve(np.eye(Gc)[None] - Kc, np.einsum("bij,bj->bi", Kc, vc)[:, :, None])[:, :, 0]
+                rest = np.maximum(fut, 0.0).sum(axis=1) / Ntot[sel][ok_r]
+                done += list(cand[ok_r][rest < c["tol"]])
+        if done:
+            done = np.asarray(done, int)
+            self.active[done] = False
+            self.stopped[done] = k
+        return c["mode"] == "to_extinction" and not self.active.any()
+
+    def segment(self, steps: int, seed: int = 0):
+        """Run `steps` engine steps from the carried state, a sim at a time between the components acting during the
+        epidemic; a to_extinction run stops early once every member has stopped. Carries the last state on."""
+        end = self.offset + int(steps)
+        while self.offset < end:
+            self._late(self.offset + 1)
+            nxt = min([kc for _, kc in self.c["late"] if self.offset + 1 < kc <= end], default=end + 1)
+            if self._run(nxt - 1 - self.offset):
                 return
-            for cn, kc in c["late"]:                            # v0.2: a component acting during the epidemic
-                if k == kc:
-                    before = self.S.copy()
-                    s, d = apply_component(self.S / c["N"], c["N"], c["components"][cn], c["levels"][cn],
-                                           c["eff"][cn], c["reach"][cn], c["groups"], c["targets_susceptible"])
-                    self.S = s * c["N"]
-                    self.doses[cn] = d
-                    self.removed[k] = self.removed.get(k, 0.0) + (before - self.S)
-            act = self.active
-            new = np.zeros_like(self.S)
-            if act.any():
-                force = np.einsum("l,lbg->bg", c["w"], self.hist[:, act]) / c["N"][act]
-                f = c["forcing"](k * c["dt_days"], act)
-                lam = (c["q"][act] * f)[:, None] * np.einsum("bij,bj->bi", c["C"][act], force)
-                new[act] = self.S[act] * -np.expm1(-lam)
-                self.S[act] = self.S[act] - new[act]
-            self.hist = np.roll(self.hist, 1, axis=0)
-            self.hist[0] = new
-            if c.get("generations"):
-                self.cum += new
-            else:
-                self.inc.append(new)
-            self.n_steps = k
-            self._last = new.sum(axis=1)
-            # a member may stop only after its own package's components acting during the epidemic have acted
-            # (Codex r1 P2-14: per member, from the components its package sets)
-            act = act & (k >= c["k_late_b"])
-            if c["mode"] == "to_extinction" and act.any():
-                # Stop rule. A member whose whole infectious history is zero can never infect again. Otherwise,
-                # with v the incidence over one generation interval per group (an upper bound on the infection
-                # pressure still to act) and K the next-generation matrix at the forcing's maximum and the
-                # current susceptibility, on the groups the seeds can reach (K_ij = q f_max s_i C_ij N_i / N_j),
-                # the infections still to come are at most sum((I - K)^-1 K v) when rho(K) < 1. The member stops
-                # when that bound is below tol x N. Near-critical epidemics run on, and fail closed at the cap.
-                idx = np.nonzero(act)[0]
-                v = self.hist[:, act].sum(axis=0)                        # (n_act, G) counts
-                Ntot = c["N"][act].sum(axis=1)
-                dead = idx[v.sum(axis=1) == 0.0]
-                cand = idx[(v.sum(axis=1) / Ntot < c["tol"]) & (v.sum(axis=1) > 0.0)]
-                done = list(dead)
-                if len(cand):
-                    sel = np.searchsorted(idx, cand)
-                    N = c["N"][cand]
-                    m = c["reach_mask"][cand]                    # only groups the seeds can reach
-                    s = self.S[cand] / N
-                    K = ((c["q"][cand] * c["fmax"][cand])[:, None, None] * (s * m)[:, :, None] * c["C"][cand]
-                         * m[:, None, :] * N[:, :, None] / N[:, None, :])
-                    r = spectral_radius(K)
-                    ok_r = r < 1.0
-                    if ok_r.any():
-                        Kc, vc = K[ok_r], v[sel][ok_r]
-                        G = Kc.shape[-1]
-                        fut = np.linalg.solve(np.eye(G)[None] - Kc, np.einsum("bij,bj->bi", Kc, vc)[:, :, None])[:, :, 0]
-                        rest = np.maximum(fut, 0.0).sum(axis=1) / Ntot[sel][ok_r]
-                        done += list(cand[ok_r][rest < c["tol"]])
-                if done:
-                    done = np.asarray(done, int)
-                    self.active[done] = False
-                    self.stopped[done] = k
-
-        def update_results(self):
-            super().update_results()
-            self.results["new_infections"][self.ti] = float(self._last[0])
-            self.results["susceptible"][self.ti] = float(self.S[0].sum())
-            self.results["n_active"][self.ti] = float(self.active.sum())
-
-    return GroupEpidemic
-
-
-@functools.lru_cache(maxsize=None)
-def _component_class():
-    ss = _ss()
-
-    class AllOrNothingComponent(ss.Intervention):
-        """One package component, acting once at the start of the sim: it reaches a share of the targeted
-        groups and protects a share `e` of the susceptibles it reaches (all-or-nothing)."""
-
-        def __init__(self, cname: str, ctx: dict):
-            super().__init__(name=f"component_{cname}")
-            self.cname, self.ctx = cname, ctx
-            self.doses = None
-
-        def step(self):
-            if self.ti != 0:
-                return
-            mod = self.sim.diseases.groupepidemic
-            c = self.ctx
-            s, self.doses = apply_component(mod.S / c["N"], c["N"], c["components"][self.cname],
-                                            c["levels"][self.cname], c["eff"][self.cname], c["reach"][self.cname],
-                                            c["groups"], c["targets_susceptible"])
-            mod.S = s * c["N"]
-            mod.doses[self.cname] = self.doses
-
-    return AllOrNothingComponent
-
-
-def _release(sim) -> None:
-    """Empty a finished Starsim sim. Starsim 3.3 keeps every Sim object alive after it is dropped (measured: a
-    plain ss.Sim of 20,000 daily steps run 30 times grew the process by ~1 GB; 30 runs with the finished sims
-    emptied stayed flat), and here each sim also holds the run's context and its incidence history. A
-    calibration of 10^4 evaluations therefore exhausted a 32 GB VM (flu run 4). The module state was exported
-    before, so emptying the sim, its modules and its other members changes no output."""
-    kids = []
-    for k in ("diseases", "interventions", "people", "loop", "dists", "results", "t", "networks", "demographics",
-              "connectors", "analyzers", "pars"):
-        v = getattr(sim, k, None)
-        if v is None:
-            continue
-        kids.append(v)
-        if isinstance(v, dict):
-            kids += [x for x in v.values() if hasattr(x, "__dict__")]
-    for v in kids:
-        try:
-            vars(v).clear()
-        except TypeError:
-            pass
-    try:
-        vars(sim).clear()
-    except TypeError:
-        pass
 
 
 # ------------------------------------------------------------------------------------ engine
@@ -704,7 +709,8 @@ class CompartmentalEngine:
                 "closed population of groups (age bands with a contact matrix, or birth cohorts with homogeneous "
                 "mixing C_ij = c N_j / N); no births, deaths, waning or migration within the horizon",
                 "discrete-time transmission with susceptible depletion in the exponential-survival form, a declared "
-                "generation interval on the dt grid, optional cosine seasonal forcing",
+                "generation interval on the dt grid, optional cosine seasonal forcing; run as a declared Starsim v4 "
+                "disease (a chain of one-step infection-age states, stratified by group)",
                 "R0 = q rho(C) from the next-generation matrix; Reff = q f rho(diag(s) C)",
                 "susceptibility initialisers: given (calibrated latent share) or cohort_history (latent true dose "
                 "coverage by birth year, seroconversion, declared dose dependence)",
@@ -727,7 +733,7 @@ class CompartmentalEngine:
             notes=["p_major is derived (multitype extinction equations), not simulated",
                    "out of range: births, deaths, waning and migration within the horizon; timing within a season "
                    "for interventions (all act before the epidemic); leaky protection",
-                   "deterministic: the module draws no random numbers; the seed is recorded only",
+                   "deterministic: nothing is drawn at random; the seed is recorded only",
                    PUBLISHED_LABEL,
                    "configuration: " + json.dumps(self.config(), sort_keys=True)])
 
@@ -896,24 +902,11 @@ class CompartmentalEngine:
                 "s_start": [float(x) for x in s[0]], "doses": doses}
 
     # ------------------------------------------------------------------------------ the sim
-    def _sim(self, ctx, state, steps: int, offset: int, seed: int):
-        ss = _ss()
-        GroupEpidemic = _module_class()
-        mod = GroupEpidemic(ctx, state, offset)
-        itv = []
-        if state is None:
-            Comp = _component_class()
-            itv = [Comp(c, ctx) for c in self.components if not self.components[c].get("day")]
-        dt = ss.days(1) if self.dt == "day" else ss.weeks(1)
-        sim = ss.Sim(n_agents=1, start=0, stop=int(steps), dt=dt, diseases=mod, interventions=itv,
-                     rand_seed=int(seed), verbose=0)
-        return sim
-
     def build_sim(self, params, unit: UnitSpec, package: Package, horizon: Horizon, seed: int):
         """The Starsim sim of one run's first segment (not yet run), and its context."""
         ctx = self._context([params], unit, [package])
-        steps = self._first_steps(horizon)
-        return self._sim(ctx, None, steps, 0, seed), ctx
+        run = _V4Run(self, ctx)
+        return run.sim(self._first_steps(horizon)), ctx
 
     def days(self, t, horizon: Horizon) -> float:
         """A horizon time in the engine's days since the importation (time_unit year: (t - start) x 365)."""
@@ -954,43 +947,69 @@ class CompartmentalEngine:
             return n
         return min(self.segment, self.step_cap)
 
+    @staticmethod
+    def _sub_context(ctx, idx) -> dict:
+        """The context of some of a batch's members (idx), for a sim of members that share a contact matrix."""
+        sub = dict(ctx)
+        for k in ("N", "C", "q", "s_init", "pi", "seed_share", "seed", "fmax", "reach_mask", "k_late_b"):
+            sub[k] = ctx[k][idx]
+        for k in ("levels", "eff", "reach"):
+            sub[k] = {c: v[idx] for c, v in ctx[k].items()}
+        sub["members"] = [ctx["members"][i] for i in idx]
+        sub["B"] = len(idx)
+        f = ctx["forcing"]
+        sub["forcing"] = lambda t, sel=slice(None): f(t)[idx][sel]
+        return sub
+
     def _simulate(self, ctx, horizon, seed):
-        """Run the sim (segments of doubling length in to_extinction mode); returns the module state."""
+        """Run the batch: one declared sim per contact matrix in it (the members sharing one), segments of doubling
+        length in to_extinction mode. Returns (the module state, None)."""
+        B = ctx["B"]
+        keys = {}
+        for b in range(B):
+            keys.setdefault(ctx["C"][b].tobytes(), []).append(b)
+        parts = []
+        for idx in keys.values():
+            idx = np.asarray(idx)
+            sub = ctx if len(idx) == B else self._sub_context(ctx, idx)
+            parts.append((idx, self._simulate_one(sub, horizon, seed)))
+        if len(parts) == 1:
+            return parts[0][1], None
+        return self._merge(ctx, parts), None
+
+    def _simulate_one(self, ctx, horizon, seed) -> dict:
+        run = _V4Run(self, ctx)
         steps = self._first_steps(horizon)
-        sim = self._sim(ctx, None, steps, 0, seed)
-        state, done = self._run_until_done(sim, steps), steps
-        while self.mode == "to_extinction" and state["active"].any():
+        run.segment(steps)
+        done = steps
+        while self.mode == "to_extinction" and run.active.any():
             if done >= self.step_cap:
-                bad = [int(b) for b in np.nonzero(state["active"])[0]]
+                bad = [int(b) for b in np.nonzero(run.active)[0]]
                 raise RuntimeError(f"step cap {self.step_cap} reached with the epidemic still running "
                                    f"(converged: false; batch members {bad[:10]})")
-            # v0.2: segments double up to MAX_SEGMENT steps, so one Starsim sim never holds a near-critical run's whole
-            # length (a 5 x 10^5-step segment held ~1.4 GB and its timeline; the run's steps and outputs are unchanged)
+            # segments double up to MAX_SEGMENT steps, so one sim never holds a near-critical run's whole length
             n = min(2 * steps, MAX_SEGMENT, self.step_cap - done)
-            sim = self._sim(ctx, state, n - 1, done + 1, seed)
-            state, done, steps = self._run_until_done(sim, n - 1), done + n, n
-        return state, sim
+            run.segment(n)
+            done, steps = done + n, n
+        return run.state()
 
-    def _run_until_done(self, sim, steps) -> dict:
-        """Run one segment; in to_extinction mode stop early once every member has converged. Returns the
-        module state (the sim holds its own copy of the module, so it is read from the sim). The finished sim is
-        then emptied (_release)."""
-        if self.mode != "to_extinction":
-            sim.run()
-            st = sim.diseases.groupepidemic.export()
-            _release(sim)
-            return st
-        sim.init()
-        mod = sim.diseases.groupepidemic
-        chunk = 32
-        t = chunk - 1
-        while True:
-            sim.run(until=min(t, steps))
-            if not mod.active.any() or t >= steps or sim.complete:
-                st = mod.export()
-                _release(sim)
-                return st
-            t += chunk
+    def _merge(self, ctx, parts) -> dict:
+        """One state for the batch from the states of its sims (a member that stopped earlier is frozen: zeros)."""
+        B, G = ctx["B"], ctx["G"]
+        T = max(len(st["inc"]) for _, st in parts)
+        out = {"inc": [np.zeros((B, G)) for _ in range(T)], "s_first": np.zeros((B, G)), "active": np.zeros(B, bool),
+               "stopped": np.full(B, -1), "doses": {c: np.zeros(B) for c in ctx["components"]}, "removed": {},
+               "cum": np.zeros((B, G)), "n_steps": max(st["n_steps"] for _, st in parts)}
+        for idx, st in parts:
+            for t, x in enumerate(st["inc"]):
+                out["inc"][t][idx] = x
+            for k in ("s_first", "active", "stopped", "cum"):
+                out[k][idx] = st[k]
+            for c, d in st["doses"].items():
+                out["doses"][c][idx] = d
+            for k, v in st["removed"].items():
+                out["removed"].setdefault(k, np.zeros((B, G)))[idx] = v
+        return out
 
     def run(self, params, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> Outcomes:
         return self.run_batch([params], unit, [package], horizon, seed)[0]
@@ -1442,14 +1461,15 @@ def _self_test() -> int:
        and abs(ec.run({"r0": 3.0}, uc, Package("0", {}), hx, 1).windows["all"]["r0"] - 3.0) < 1e-12,
        "K7 birth cohorts mix with C_ij = c N_j / N; R0 = q rho(C)")
 
-    # K8: Starsim structure
+    # K8: Starsim structure (v0.3: a declared Starsim v4 disease, run as compartments)
     import starsim as ss
-    sim = e.build_sim({"r0": 2.0}, u1, Package("v", {"vax": 1}), hx, 3)[0]
-    mods = [m for m in sim.pars.diseases] if isinstance(sim.pars.diseases, list) else [sim.pars.diseases]
-    itvs = sim.pars.interventions if isinstance(sim.pars.interventions, list) else [sim.pars.interventions]
-    ok(isinstance(sim, ss.Sim) and any(isinstance(m, ss.Module) and type(m).__name__ == "GroupEpidemic" for m in mods)
-       and all(isinstance(i, ss.Intervention) for i in itvs) and len(itvs) == 1,
-       "K8 run() builds an ss.Sim with the GroupEpidemic module and start-of-sim ss.Intervention components")
+    sim = em.build_sim({"q": 1.0}, um, Package("b", {"blk": 3}), hx, 3)[0].init()
+    dis = sim.diseases.epi
+    ok(isinstance(sim, ss.Sim) and isinstance(dis, ss.Disease) and set(dis.strats) == {"group"}
+       and isinstance(sim.solver, ss.solvers.ode) and sim.solver.integrator == "map" and list(dis.states)[:2] == ["S", "I1"]
+       and sim._compiled_reason() is None,
+       "K8 run() builds an ss.Sim of a declared disease (S, I1..IL, R) stratified by group (and by member in a batch), "
+       "run whole by the ODE solver's map, in one compiled call")
     o = e.run({"r0": 3.0}, u1, Package("v", {"vax": 1}), hx, 1)       # Reff 1.5 (R0 2 with reach 0.5 is critical)
     ok(o.meta.get("p_major_derived") is True and any("p_major" in str(x) and "derived" in str(x)
                                                      for x in e.describe().notes + e.describe().mechanisms),

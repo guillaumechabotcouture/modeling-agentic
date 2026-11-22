@@ -1,0 +1,42 @@
+32 calls in 589 s wall; versions [('v3', '3.3.2', '0.18'), ('v4', '4.0.0rc5', '0.18')]
+
+=== unit m0_28 (16 v3 seeds, 16 v4 seeds)
+outcome                               v3 mean     v3 sd    v4 mean     v4 sd   v4/v3      z
+none: cases_all                        2.8585    0.0896     2.8579    0.1176   1.000  -0.02
+none: cases_u5                         7.7567    0.3727     7.7539    0.3577   1.000  -0.02
+none: severe_all                       0.0252    0.0010     0.0251    0.0012   0.996  -0.22
+none: deaths_all                       0.0048    0.0002     0.0048    0.0002   0.996  -0.22
+none: dalys_all                        0.4115    0.0173     0.4100    0.0203   0.996  -0.22
+none: pfpr_u5_pre                      0.4320    0.0202     0.4336    0.0194   1.004  +0.24
+none: pfpr_2_10_pre                    0.5092    0.0141     0.5115    0.0117   1.005  +0.52
+none: pfpr_all_pre                     0.3488    0.0073     0.3492    0.0063   1.001  +0.17
+none: pfpr_u5_win                      0.4675    0.0122     0.4714    0.0147   1.008  +0.82
+none: pfpr_all_win                     0.3698    0.0057     0.3707    0.0074   1.002  +0.37
+none: eir_win                         45.6128    1.0909    45.8355    1.9312   1.005  +0.40
+none: n_start                       2000.1250   17.4007  1999.4375   16.1986   1.000  -0.12
+none: share_u5                         0.1694    0.0057     0.1695    0.0070   1.001  +0.05
+pyr: cases_all reduction               0.1816    0.0109     0.1834    0.0225   1.010  +0.28
+pyr: cases_u5 reduction                0.1747    0.0292     0.1741    0.0466   0.996  -0.05
+pyr: deaths_all reduction              0.0748    0.0232     0.0751    0.0290   1.005  +0.04
+pyr: dalys_all reduction               0.0735    0.0235     0.0739    0.0295   1.004  +0.03
+pyr: pfpr_u5_win                       0.4091    0.0137     0.4081    0.0157   0.998  -0.19
+dual_smc: cases_all reduction          0.4677    0.0188     0.4670    0.0158   0.999  -0.10
+dual_smc: cases_u5 reduction           0.5923    0.0260     0.5926    0.0208   1.001  +0.04
+dual_smc: deaths_all reduction         0.3692    0.0290     0.3772    0.0245   1.022  +0.84
+dual_smc: dalys_all reduction          0.3705    0.0293     0.3786    0.0246   1.022  +0.84
+dual_smc: pfpr_u5_win                  0.2075    0.0102     0.2036    0.0079   0.981  -1.21
+irs: cases_all reduction               0.5894    0.0192     0.5911    0.0245   1.003  +0.22
+irs: cases_u5 reduction                0.5659    0.0199     0.5634    0.0310   0.995  -0.28
+irs: deaths_all reduction              0.4448    0.0165     0.4449    0.0334   1.000  +0.01
+irs: dalys_all reduction               0.4427    0.0166     0.4428    0.0337   1.000  +0.01
+irs: pfpr_u5_win                       0.3407    0.0084     0.3403    0.0149   0.999  -0.09
+cm: cases_all reduction                0.0363    0.0144     0.0451    0.0193   1.242  +1.46
+cm: cases_u5 reduction                 0.0485    0.0205     0.0601    0.0333   1.240  +1.19
+cm: deaths_all reduction               0.1774    0.0138     0.1877    0.0195   1.058  +1.72
+cm: dalys_all reduction                0.1767    0.0139     0.1872    0.0197   1.059  +1.74
+cm: pfpr_u5_win                        0.4107    0.0093     0.4139    0.0107   1.008  +0.90
+
+(seeds are shared across units, so the units' initial populations are the same draws within a version)
+
+CPU s per run_batch call (5 packages): v3 80.8, v4 58.7 (v4/v3 0.73)
+flagged (|z| > 2.5): none
