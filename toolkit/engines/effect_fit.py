@@ -3,7 +3,7 @@
 simulated at its trial's own estimand (decision design principle 3: relative effects come from trials, and a
 parameter is anchored where the trial measured it, never by multiplying decision outputs by a trial ratio).
 
-    python3 toolkit/engines/effect_fit.py check <pack.yaml> <effect_fit.yaml>   # the declaration's problems
+    python3 toolkit/engines/effect_fit.py check <pack.yaml> <effect_fit.yaml>   # the declaration problems
     python3 toolkit/engines/effect_fit.py --self-test
 
 An engine pack declares the fit in data (`effect_fit.yaml` beside its `pack.yaml`); nothing here names a disease,
@@ -27,20 +27,22 @@ scale its estimand type, and the window the one its outcome is read over (and a 
 
 Method. Each design wave is a Latin hypercube in its box (the first adds the box centre). Each target's log value
 (geometric mean over the pack's seeds) gets a quadratic surrogate with its leave-one-out error (LOO). On dense
-candidates restricted to the waves' boxes (never extrapolated past engine-evaluated points), a candidate's
+candidates drawn inside each wave's box (never extrapolated past engine-evaluated points), a candidate's
 implausibility for a target is its surrogate's signed distance outside the target's band in units of that LOO:
 max(log lo - m, m - log hi) / LOO, negative inside the band. A candidate is not implausible when every target's
 implausibility is at most `cutoff` (0: surrogate in band; -1: inside by one LOO; 3: the usual history-matching
-allowance for emulator error). The chosen point has the fewest targets out, then the least band-scaled squared log
-error. `verify_n` points drawn from the not-implausible region and the chosen point are re-run on the engine and
-judged by the declared acceptance rule: a target is met when the 95% (`level`) interval of the seed geometric mean,
-exp(mean(log v) +- z sd(log v) / sqrt(n)), overlaps its band, with exactly one finite positive value per declared
-seed; control arms (when the evaluator reports them) must be within `control_tolerance` of their calibration target.
+allowance for emulator error). The chosen point is the region's least band-scaled squared log error (CHOICE).
+Every engine row holds exactly one finite positive value per declared seed, or the fit stops (fail closed).
+`verify_n` points drawn from the not-implausible region and the chosen point are re-run on the engine and judged by
+the declared acceptance rule: a target is met when the `level` interval of the seed geometric mean,
+exp(mean(log v) +- z sd(log v) / sqrt(n)), overlaps its band; control arms the evaluator reports must be within
+`control_tolerance` of the pack's own calibration target for their setting.
 
 Conflicts (the rule on v2, #312: declare and test, not a stop). A target no candidate in the support can meet is
 recorded under `conflicts` with its least implausibility; the fit continues on the other targets and the record's
 status is `accepted_with_conflicts`, for the conflict rule to declare and test. A conflict on a `must_meet` target,
-two meetable targets with no joint candidate, or any verified point failing the rule makes it `rejected`.
+two meetable targets with no joint candidate, fewer verified points than declared, or any verified point failing
+the rule makes it `rejected`, and its sample is withdrawn (`sample_status` invalid).
 
 The record (`write_record`) holds the chosen point, the joint region (hull, box-edge flags, correlation, sample and
 `sample_status`), per-target implausibility and verified intervals, monitor values, failures, conflicts, the
@@ -77,7 +79,8 @@ RULES = {"seed_interval_overlaps_band": (
     "sqrt(n)) with sd on n - 1, overlaps the target's band; exactly one finite, positive value per declared seed, "
     "else the point fails; control arms within `control_tolerance` (relative) of their calibration target")}
 ACCEPTANCE_KEYS = ("rule", "level", "verify_n", "pick_seed", "sample_n", "control_tolerance")
-CHOICE = "fewest targets out of band (surrogate), then least band-scaled squared log error"
+CHOICE = ("least band-scaled squared log error inside the not-implausible region; when it is empty, fewest targets "
+          "past the cutoff, then least error")
 
 
 def _sha(x) -> str:
@@ -138,13 +141,19 @@ def estimand_problems(tid: str, est, bench: dict | None, pack: dict) -> list:
         elif [c["treatment"], c["comparator"]] != [e.get("num"), e.get("den")]:
             out.append(f"{tid}: contrast {c['treatment']} vs {c['comparator']} is not the pack's {e.get('num')} vs "
                        f"{e.get('den')}")
+    arms = [a for k in ("num", "den") for a in (e.get(k) if isinstance(e.get(k), list) else [e.get(k)])]
+    gone = sorted(str(a) for a in arms if (pack.get("arms") or {}).get(a, {}).get("setting") not in
+                  (pack.get("settings") or {}))
+    if gone:
+        out.append(f"{tid}: arms {gone} are not arms of the pack with a declared setting")
+    if e.get("value") and e.get("values"):
+        out.append(f"{tid}: the pack's estimand gives both value and values (ambiguous outcome)")
     w = est.get("window")
-    if _txt(w):
+    if _txt(w) and not gone:
         paths = [e["value"]] if e.get("value") else [v.get("path") for v in e.get("values") or [] if isinstance(v, dict)]
         used = {_window_of(p) for p in paths}
         if used != {w}:
             out.append(f"{tid}: window {w!r} is not the window its outcome is read over {sorted(map(str, used))}")
-        arms = [a for k in ("num", "den") for a in (e.get(k) if isinstance(e.get(k), list) else [e.get(k)])]
         lost = sorted(str(a) for a in arms if w not in _setting_windows(pack, a))
         if lost:
             out.append(f"{tid}: window {w!r} is not a horizon window of arms {lost}")
@@ -212,8 +221,9 @@ def declaration_problems(decl, pack: dict) -> list:
             out.append(f"acceptance.rule: one of {sorted(RULES)}")
         if not (_num(a["level"]) and 0 < a["level"] < 1):
             out.append("acceptance.level: in (0, 1)")
-        if not all(_int(a[k]) and a[k] >= 1 for k in ("verify_n", "sample_n")) or not _int(a["pick_seed"]):
-            out.append("acceptance: verify_n and sample_n integers >= 1, pick_seed an integer")
+        if not (all(_int(a[k]) and a[k] >= 1 for k in ("verify_n", "sample_n")) and _int(a["pick_seed"])
+                and a["sample_n"] >= a["verify_n"]):
+            out.append("acceptance: verify_n and sample_n integers, 1 <= verify_n <= sample_n; pick_seed an integer")
         if not (_num(a["control_tolerance"]) and a["control_tolerance"] > 0):
             out.append("acceptance.control_tolerance: a positive number")
         if any(m not in T for m in a.get("must_meet") or []):
@@ -233,7 +243,8 @@ def target_digests(decl: dict, pack: dict) -> dict:
     """{id: sha256 of the pack's benchmark declaration and the fit's estimand fields} for targets and monitors."""
     byid = {b["id"]: b for b in pack["benchmarks"]}
     ids = list(decl["targets"]) + list(decl.get("monitor") or [])
-    return {t: _sha({"benchmark": byid[t], "estimand": decl["targets"].get(t)}) for t in ids}
+    from toolkit.engines.benchmark_sources import band_digest     # its arms, settings, horizon, seeds and engine too
+    return {t: _sha({"benchmark": band_digest(byid[t], pack), "estimand": decl["targets"].get(t)}) for t in ids}
 
 
 # ------------------------------------------------------------------------------------------- statistics
@@ -262,8 +273,18 @@ def ci_in_band(values, band, n_seeds: int, level: float) -> bool:
     return iv is not None and iv[0] <= float(band[1]) and iv[1] >= float(band[0])
 
 
-def judge(row: dict, bands: dict, seeds: list, acc: dict) -> dict:
-    """One engine-evaluated point under the declared acceptance rule (targets in `bands` only)."""
+def seed_values_problem(v, n_seeds: int) -> str | None:
+    """Why `v` is not exactly one finite, positive number per declared seed (booleans are not numbers)."""
+    if not isinstance(v, list) or len(v) != n_seeds:
+        return f"{len(v) if isinstance(v, list) else 'no'} values for {n_seeds} declared seeds"
+    if not all(_num(x) and x > 0 for x in v):
+        return f"a value that is not a finite positive number ({v})"
+    return None
+
+
+def judge(row: dict, bands: dict, seeds: list, acc: dict, calib: dict | None = None) -> dict:
+    """One engine-evaluated point under the declared acceptance rule (targets in `bands` only). A control arm is
+    judged against the pack's calibration target `calib[setting]`, never a target the evaluator reports."""
     per = row.get("per_seed") or {}
     by = {}
     for t, b in bands.items():
@@ -272,7 +293,7 @@ def judge(row: dict, bands: dict, seeds: list, acc: dict) -> dict:
                  "in_band": ci_in_band(per.get(t), b, len(seeds), acc["level"])}
     off = []
     for s, c in sorted((row.get("controls") or {}).items()):
-        a, tg = c.get("achieved"), c.get("target")
+        a, tg = c.get("achieved"), (calib or {}).get(s)
         if not (_num(a) and _num(tg) and tg != 0 and abs(a / tg - 1) <= acc["control_tolerance"]) or c.get("at_grid_edge"):
             off.append(s)
     return {"point": row["theta"], "by_target": by, "controls_off": off,
@@ -334,7 +355,7 @@ class Cache:
         return _sha(sorted(self.rows))
 
 
-def evaluate(points: list, evaluator, ids: list, cache: Cache, scope: str) -> tuple:
+def evaluate(points: list, evaluator, ids: list, cache: Cache, scope: str, n_seeds: int) -> tuple:
     """(rows, engine calls): each point's per-seed values for every id, from the cache or `evaluator(theta, ids)`,
     which returns {per_seed: {id: [value per seed]}, controls: {setting: {target, achieved, at_grid_edge}}}."""
     rows, calls = [], 0
@@ -343,9 +364,10 @@ def evaluate(points: list, evaluator, ids: list, cache: Cache, scope: str) -> tu
         if r is None:
             res = evaluator(dict(th), list(ids))
             calls += 1
-            miss = [t for t in ids if not isinstance((res.get("per_seed") or {}).get(t), list)]
-            if miss:
-                raise ValueError(f"evaluator returned no per-seed values for {miss} at {th}")
+            bad = {t: seed_values_problem((res.get("per_seed") or {}).get(t), n_seeds) for t in ids}
+            bad = {t: w for t, w in bad.items() if w}
+            if bad:      # fail closed: a design or verified row is one finite positive value per declared seed
+                raise ValueError(f"evaluator rows at {th}: {bad}")
             cache.put(scope, th, res)
             r = cache.get(scope, th)
         rows.append({"theta": dict(th), "per_seed": r["per_seed"], "controls": r.get("controls") or {}})
@@ -353,20 +375,20 @@ def evaluate(points: list, evaluator, ids: list, cache: Cache, scope: str) -> tu
 
 
 def _geo_log(v) -> float:
-    v = [float(x) for x in v]
-    if not v or not all(math.isfinite(x) and x > 0 for x in v):
-        raise ValueError(f"a design point has a non-positive or missing value ({v})")
-    return float(np.mean(np.log(v)))
+    return float(np.mean(np.log([float(x) for x in v])))
 
 
-def in_support(cand: np.ndarray, support: list, names: list, box: np.ndarray) -> np.ndarray:
-    theta = box[:, 0] + cand * (box[:, 1] - box[:, 0])
-    m = np.zeros(len(cand), bool)
+def candidates(decl: dict, support: list, rows: list) -> np.ndarray:
+    """Dense candidates (parameter units) inside each wave's box, each wave covered on its own, plus every
+    engine-evaluated point; rounded to 9 decimals and clipped to their wave's box, so no candidate leaves the
+    support."""
+    names, _box = _names_box(decl)
+    seed = int(decl["history_matching"]["candidate_seed"])
+    out = [np.array([[r["theta"][k] for k in names] for r in rows], float)]
     for bx in support:
-        lo = np.array([bx[k][0] for k in names]) - 1e-9
-        hi = np.array([bx[k][1] for k in names]) + 1e-9
-        m |= np.all((theta >= lo) & (theta <= hi), axis=1)
-    return m
+        lo, hi = np.array([bx[k][0] for k in names]), np.array([bx[k][1] for k in names])
+        out.append(np.clip(np.round(lo + BM._candidates(len(names), seed) * (hi - lo), 9), lo, hi))
+    return np.vstack(out)
 
 
 # ------------------------------------------------------------------------------------- history matching
@@ -374,10 +396,10 @@ def history_match(rows: list, decl: dict, pack: dict, support: list) -> dict:
     names, box = _names_box(decl)
     byid = {b["id"]: b for b in pack["benchmarks"]}
     targets, cut, hm = list(decl["targets"]), float(decl["history_matching"]["cutoff"]), decl["history_matching"]
-    X = np.array([[(r["theta"][k] - box[j, 0]) / (box[j, 1] - box[j, 0]) for j, k in enumerate(names)] for r in rows])
-    cand = BM._candidates(len(names), int(hm["candidate_seed"]))
-    cand = cand[in_support(cand, support, names, box)]
-    Fc = BM._quad_features(cand)
+    norm = lambda th: (th - box[:, 0]) / (box[:, 1] - box[:, 0])  # noqa: E731
+    X = norm(np.array([[r["theta"][k] for k in names] for r in rows], float))
+    cth = candidates(decl, support, rows)
+    Fc = BM._quad_features(norm(cth))
     imp, err, surr = {}, {}, {}
     for t in targets:
         coef, loo = BM._quad_fit(X, np.array([_geo_log(r["per_seed"][t]) for r in rows]))
@@ -387,18 +409,17 @@ def history_match(rows: list, decl: dict, pack: dict, support: list) -> dict:
         err[t] = ((lv - math.log(byid[t]["target"])) / ((hi - lo) / 2)) ** 2
         surr[t] = {"loo_rmse_log": round(loo, 6), "n_points": len(rows)}
     feasible = [t for t in targets if (imp[t] <= cut).any()]
-    ok = np.ones(len(cand), bool)
+    ok = np.ones(len(cth), bool)
     for t in feasible:
         ok &= imp[t] <= cut
     pairs = [[a, b] for a, b in itertools.combinations(feasible, 2) if not ((imp[a] <= cut) & (imp[b] <= cut)).any()]
-    n_out = sum(((imp[t] > cut).astype(int) for t in feasible), np.zeros(len(cand), int))
-    L = sum((err[t] for t in feasible), np.zeros(len(cand)))
-    j = int(np.argmin(n_out * 1e6 + L))
-    to = lambda c: {k: round(float(box[i, 0] + c[i] * (box[i, 1] - box[i, 0])), 6) for i, k in enumerate(names)}  # noqa
-    acc = cand[ok]
-    hull = ({k: [round(float(box[i, 0] + acc[:, i].min() * (box[i, 1] - box[i, 0])), 6),
-                 round(float(box[i, 0] + acc[:, i].max() * (box[i, 1] - box[i, 0])), 6)] for i, k in enumerate(names)}
-            if len(acc) else None)
+    n_out = sum(((imp[t] > cut).astype(int) for t in feasible), np.zeros(len(cth), int))
+    L = sum((err[t] for t in feasible), np.zeros(len(cth)))
+    # lexicographic: inside the region when it is not empty, else fewest targets past the cutoff; then least error
+    j = int(np.flatnonzero(ok)[np.argmin(L[ok])]) if ok.any() else int(np.lexsort((L, n_out))[0])
+    to = lambda i: {k: float(cth[i, m]) for m, k in enumerate(names)}  # noqa: E731
+    acc = cth[ok]
+    hull = ({k: [float(acc[:, m].min()), float(acc[:, m].max())] for m, k in enumerate(names)} if len(acc) else None)
     sup_lo = {k: min(b[k][0] for b in support) for k in names}
     sup_hi = {k: max(b[k][1] for b in support) for k in names}
     tol = {k: 1e-3 * (sup_hi[k] - sup_lo[k]) for k in names}
@@ -407,17 +428,17 @@ def history_match(rows: list, decl: dict, pack: dict, support: list) -> dict:
     n_s = int(decl["acceptance"]["sample_n"])
     if len(idx) > n_s:
         idx = np.sort(np.random.default_rng(int(hm["candidate_seed"])).choice(idx, n_s, replace=False))
-    return {"chosen": to(cand[j]), "n_out_at_chosen": int(n_out[j]),
+    return {"chosen": to(j), "chosen_in_region": bool(ok[j]), "n_out_at_chosen": int(n_out[j]),
             "implausibility_at_chosen": {t: round(float(imp[t][j]), 4) for t in targets},
             "least_implausibility": {t: round(float(imp[t].min()), 4) for t in targets},
             "feasible": feasible, "infeasible": [t for t in targets if t not in feasible], "conflicting_pairs": pairs,
             "surrogate": surr,
-            "region": {"n_candidates": len(cand), "n_accepted": int(ok.sum()),
-                       "share_of_support": round(float(ok.mean()), 6) if len(cand) else 0.0, "hull": hull,
+            "region": {"n_candidates": len(cth), "n_accepted": int(ok.sum()),
+                       "share_of_support": round(float(ok.mean()), 6), "hull": hull,
                        "at_support_edge": edge, "support": support,
                        "correlation": {"names": names, "matrix": np.corrcoef(acc.T).round(3).tolist()
                                        if len(acc) > 2 else None},
-                       "sample": [to(cand[i]) for i in idx]}}
+                       "sample": [to(i) for i in idx]}}
 
 
 # ----------------------------------------------------------------------------------------------- the fit
@@ -436,8 +457,11 @@ def edge_diagnostics(decl: dict, point: dict, chosen: dict | None) -> list:
 
 def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, cache: Cache | None = None,
         cost: dict | None = None) -> dict:
-    """The effect fit (module docstring). Raises ValueError on a declaration problem; returns the record."""
+    """The effect fit (module docstring). Raises ValueError on a declaration problem, a missing engine identity (the
+    cache scope needs it) or a malformed engine row; returns the record."""
     bad = declaration_problems(decl, pack)
+    if not (isinstance(engine_identity, dict) and engine_identity):
+        bad.append("engine_identity: required (it scopes the engine-row cache)")
     if bad:
         raise ValueError("effect fit declaration refused: " + "; ".join(bad))
     acc, seeds = decl["acceptance"], list(pack["seeds"])
@@ -448,15 +472,16 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
     scope = _sha({"targets": tdig, "engine": engine_identity, "seeds": seeds})
     cache = cache if cache is not None else Cache()
     pts, support = design_points(decl)
-    rows, calls = evaluate(pts, evaluator, ids, cache, scope)
+    rows, calls = evaluate(pts, evaluator, ids, cache, scope, len(seeds))
     hm = history_match(rows, decl, pack, support)
     sample = hm["region"]["sample"]
     k = min(int(acc["verify_n"]), len(sample))
     pick = sorted(np.random.default_rng(int(acc["pick_seed"])).choice(len(sample), k, replace=False).tolist()) if k else []
-    vrows, vcalls = evaluate([sample[i] for i in pick] + [hm["chosen"]], evaluator, ids, cache, scope)
+    vrows, vcalls = evaluate([sample[i] for i in pick] + [hm["chosen"]], evaluator, ids, cache, scope, len(seeds))
     bands = {t: byid[t]["band"] for t in hm["feasible"]}
-    checked = [judge(r, bands, seeds, acc) for r in vrows[:-1]]
-    chosen = judge(vrows[-1], bands, seeds, acc)
+    calib = {s: (v.get("calibrate") or {}).get("target") for s, v in (pack.get("settings") or {}).items()}
+    checked = [judge(r, bands, seeds, acc, calib) for r in vrows[:-1]]
+    chosen = judge(vrows[-1], bands, seeds, acc, calib)
     for j, r in zip(checked + [chosen], vrows):
         j["monitor"] = {m: judge(r, {m: byid[m]["band"]}, seeds, acc)["by_target"][m] for m in monitor}
     must = set(acc.get("must_meet") or [])
@@ -469,11 +494,17 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
         if bad_t or j["controls_off"]:
             failures.append({"kind": "verification", "point": j["point"], "chosen": j is chosen, "targets": bad_t,
                              "controls_off": j["controls_off"]})
+    if not hm["feasible"]:
+        failures.append({"kind": "no_meetable_target", "reason": "no target can be met anywhere in the support"})
     if not checked:
         failures.append({"kind": "no_region", "reason": "no candidate is not implausible on every meetable target"})
+    elif len(checked) < int(acc["verify_n"]):
+        failures.append({"kind": "too_few_verified", "reason": f"{len(checked)} verified points for the declared "
+                         f"{acc['verify_n']}: the region holds fewer candidates"})
+    if not hm["chosen_in_region"]:
+        failures.append({"kind": "chosen_outside_region", "point": hm["chosen"]})
     region = dict(hm["region"])
-    region["sample_status"] = ("verified" if checked and all(j["met"] for j in checked + [chosen])
-                               else "unverified" if not checked else "invalid")
+    region["sample_status"] = ("unverified" if not checked else "verified" if not failures else "invalid")
     if region["sample_status"] != "verified":
         region["sample_unverified"], region["sample"] = region["sample"], []
     conflicts = [{"target": t, "least_implausibility": hm["least_implausibility"][t],
@@ -520,40 +551,12 @@ def read_record(path: str, digest: str) -> dict:
     return rec
 
 
-def runner_evaluator(runner):
-    """An evaluator over a benchmark.Runner in fit mode: each point recalibrates the target arms' settings (their
-    `calibrate` rule), reads every id's per-seed values and each calibrated setting's control arm (the arm of that
-    setting whose package is the rule's arm_package) against its target."""
-    pack = runner.pack
-    byid = {b["id"]: b for b in pack["benchmarks"]}
-
-    def ev(theta: dict, ids: list) -> dict:
-        arms = sorted({a for t in ids for a in BM._arms_of(byid[t]["estimand"])})
-        cal = sorted({pack["arms"][a]["setting"] for a in arms} & {s for s, v in pack["settings"].items()
-                                                                   if v.get("calibrate")})
-        runner.calibrate_settings(theta, cal)
-        per = {t: list(runner.evaluate(byid[t], theta)["per_seed"]) for t in ids}
-        controls = {}
-        for s in cal:
-            c = pack["settings"][s]["calibrate"]
-            ctrl = sorted(a for a, v in pack["arms"].items()
-                          if v["setting"] == s and (v.get("package") or {}) == (c.get("arm_package") or {}))
-            got = None
-            if ctrl:
-                res = runner.arm_results([ctrl[0]], theta)[ctrl[0]]
-                got = float(np.mean([BM.get(r, c["value_path"]) for r in res]))
-            controls[s] = {"target": c["target"], "achieved": got,
-                           "at_grid_edge": bool(runner.calibrated.get(s, {}).get("at_grid_edge"))}
-        return {"per_seed": per, "controls": controls}
-    return ev
-
-
 # ------------------------------------------------------------------------------------------- self-test
 def _toy_pack(extra: list | None = None) -> dict:
     """Two arms of one site; targets are ratios at two follow-up windows (a waning effect)."""
     est = lambda w: {"type": "ratio", "num": "trt", "den": "ctl", "value": f"windows.{w}.prev"}  # noqa: E731
     return {"seeds": [1, 2, 3, 4], "horizon": {"windows": {"m6": [0.0, 0.5], "m18": [1.0, 1.5]}},
-            "settings": {"site": {}}, "arms": {"trt": {"setting": "site", "package": {"x": 1}},
+            "settings": {"site": {"calibrate": {"target": 0.4}}}, "arms": {"trt": {"setting": "site", "package": {"x": 1}},
                                                "ctl": {"setting": "site", "package": {}}},
             "benchmarks": [{"id": "T6", "target": 0.5526, "band": [0.52, 0.59], "estimand": est("m6")},
                            {"id": "T18", "target": 0.7224, "band": [0.69, 0.76], "estimand": est("m18")}]
@@ -626,7 +629,7 @@ def _self_test() -> int:
     try:
         d = copy.deepcopy(decl)
         del d["targets"]["T18"]["window"]
-        fit(d, pack, _toy_engine([]))
+        fit(d, pack, _toy_engine([]), {"name": "toy"})
         ok(False, "EF_ESTIMAND_REQUIRED: fit refuses a declaration without a window")
     except ValueError:
         ok(True, "EF_ESTIMAND_REQUIRED: fit refuses a declaration without a window")
@@ -641,7 +644,7 @@ def _self_test() -> int:
 
     # EF_SUPPORT_ONLY: a wave box narrower than the parameter box keeps every candidate inside it
     d = _toy_decl(design={"waves": [{"n": 30, "seed": 1, "box": {"eff": [0.6, 1.0], "wane": [0.3, 0.9]}}]})
-    r2 = fit(d, pack, _toy_engine([]))
+    r2 = fit(d, pack, _toy_engine([]), {"name": "toy"})
     pts = (r2["joint_region"]["sample"] or r2["joint_region"]["sample_unverified"]) + [r2["point"]]
     ok(pts and all(0.6 - 1e-9 <= p["eff"] <= 1.0 + 1e-9 and 0.3 - 1e-9 <= p["wane"] <= 0.9 + 1e-9 for p in pts),
        f"EF_SUPPORT_ONLY: no candidate outside the design support ({len(pts)} points)")
@@ -665,17 +668,18 @@ def _self_test() -> int:
     pk = _toy_pack([tx])
     d = copy.deepcopy(decl)
     d["targets"]["TX"] = dict(decl["targets"]["T6"])
-    r3 = fit(d, pk, _toy_engine([]))
+    r3 = fit(d, pk, _toy_engine([]), {"name": "toy"})
     ok(r3["status"] == "accepted_with_conflicts" and [c["target"] for c in r3["conflicts"]] == ["TX"]
        and r3["joint_region"]["sample_status"] == "verified",
        f"EF_CONFLICT: an unmeetable target is declared, the rest verified ({r3['status']}, {r3['conflicts']})")
     d["acceptance"]["must_meet"] = ["TX"]
-    r4 = fit(d, pk, _toy_engine([]))
-    ok(r4["status"] == "rejected" and r4["failures"][0]["kind"] == "conflict_must_meet",
-       "EF_CONFLICT: a must_meet target that cannot be met rejects the fit")
+    r4 = fit(d, pk, _toy_engine([]), {"name": "toy"})
+    ok(r4["status"] == "rejected" and r4["failures"][0]["kind"] == "conflict_must_meet"
+       and r4["joint_region"]["sample"] == [] and r4["joint_region"]["sample_status"] == "invalid",
+       "EF_CONFLICT: a must_meet target that cannot be met rejects the fit and withdraws the sample (Codex r1)")
     d = copy.deepcopy(decl)
     d["monitor"] = ["TX"]
-    r5 = fit(d, pk, _toy_engine([]))
+    r5 = fit(d, pk, _toy_engine([]), {"name": "toy"})
     ok(r5["status"] == "accepted" and r5["monitor"]["TX"]["in_band"] is False and "TX" not in r5["targets"],
        "EF_MONITOR: a monitored benchmark is reported at the chosen point and never chooses")
 
@@ -690,6 +694,16 @@ def _self_test() -> int:
         n2 = []
         fit(decl, pack, _toy_engine(n2), engine_identity={"name": "toy2"}, cache=Cache(p))
         ok(len(n2) == len(c1), "EF_CACHE: another engine identity reuses no row")
+        n3, pk3 = [], _toy_pack()
+        pk3["settings"]["site"]["calibrate"]["target"] = 0.8
+        r6 = fit(decl, pk3, _toy_engine(n3), engine_identity={"name": "toy"}, cache=Cache(p))
+        ok(len(n3) == len(c1) and r6["status"] == "rejected",
+           "EF_CACHE: a changed calibration target of a target's setting reuses no row, and its control fails (Codex r1)")
+        try:
+            fit(decl, pack, _toy_engine([]), cache=Cache(p))
+            ok(False, "EF_CACHE: a fit without an engine identity is refused (Codex r1)")
+        except ValueError:
+            ok(True, "EF_CACHE: a fit without an engine identity is refused (Codex r1)")
         try:
             Cache(p, digest="0" * 64)
             ok(False, "EF_CACHE: a cache whose digest differs is refused")
@@ -706,26 +720,39 @@ def _self_test() -> int:
         except ValueError:
             ok(True, "EF_RECORD_DIGEST: an edited record is refused")
 
-    # EF_RUNNER: the Runner adapter recalibrates each point and reports the control arm
-    class FakeRunner:
-        def __init__(self):
-            self.calibrated, self.log = {}, []
-            self.pack = dict(_toy_pack(), settings={"site": {"calibrate": {"target": 0.4, "value_path": "windows.m6.prev",
-                                                                            "arm_package": {}}}})
-
-        def calibrate_settings(self, theta, names):
-            self.log.append(("cal", tuple(names)))
-            self.calibrated = {n: {"at_grid_edge": False} for n in names}
-
-        def evaluate(self, b, theta):
-            return {"per_seed": [0.5, 0.51, 0.52, 0.5]}
-
-        def arm_results(self, arms, theta):
-            return {a: [{"windows": {"m6": {"prev": 0.4}}}] * 4 for a in arms}
-    fr = FakeRunner()
-    out = runner_evaluator(fr)({"eff": 1.0, "wane": 1.0}, ["T6", "T18"])
-    ok(fr.log == [("cal", ("site",))] and out["controls"]["site"]["achieved"] == 0.4 and len(out["per_seed"]["T6"]) == 4,
-       f"EF_RUNNER: the adapter recalibrates and reads the control arm ({out['controls']})")
+    # Codex r1: malformed engine rows, controls judged on the pack's target, declared counts, estimand ambiguity
+    def rows_of(per):
+        def ev(theta, ids):
+            return {"per_seed": {t: per for t in ids}, "controls": {}}
+        return ev
+    for label, per in (("one seed value", [0.55]), ("booleans", [True] * 4), ("no values", [])):
+        try:
+            fit(decl, pack, rows_of(per), {"name": "toy"})
+            ok(False, f"EF_SEED_ROWS: a design row with {label} is refused")
+        except ValueError:
+            ok(True, f"EF_SEED_ROWS: a design row with {label} is refused")
+    j = judge({"theta": {}, "per_seed": {"T": [0.55] * 4}, "controls": {"site": {"target": 0.8, "achieved": 0.8}}},
+              {"T": [0.5, 0.6]}, [1, 2, 3, 4], decl["acceptance"], {"site": 0.4})
+    ok(j["controls_off"] == ["site"], "EF_CONTROLS: a control is judged against the pack's target, not the evaluator's")
+    d = copy.deepcopy(decl)
+    d["acceptance"]["sample_n"] = 1
+    ok(any("verify_n" in x for x in declaration_problems(d, pack)), "EF_VERIFY_N: sample_n below verify_n is refused")
+    pk = _toy_pack()
+    pk["benchmarks"][0]["estimand"]["values"] = [{"path": "windows.m18.prev", "weight": 1}]
+    ok(any("ambiguous" in x for x in declaration_problems(decl, pk)), "EF_ESTIMAND_MATCH: value and values refused")
+    pk = _toy_pack()
+    del pk["arms"]["trt"]
+    ok(any("not arms of the pack" in x for x in declaration_problems(decl, pk)),
+       "EF_ESTIMAND_MATCH: a contrast arm the pack does not have is refused")
+    nar = _toy_decl(design={"waves": [{"n": 30, "seed": 1}, {"n": 3, "seed": 2, "box": {"eff": [0.8, 0.8000001]}}]})
+    pts_, sup_ = design_points(nar)
+    cth = candidates(nar, sup_, [{"theta": x} for x in pts_])
+    in_narrow = (cth[:, 0] >= 0.8) & (cth[:, 0] <= 0.8000001)
+    ok(int(in_narrow.sum()) > 3 and np.all((cth >= np.array([0.4, 0.2])) & (cth <= np.array([1.2, 1.2]))),
+       "EF_SUPPORT_ONLY: every wave, however narrow, gets its own candidates, none outside the box (Codex r1)")
+    ok(rec["verification"]["chosen"]["met"] and r2["status"] in ("accepted", "rejected")
+       and not any(f["kind"] == "chosen_outside_region" for f in rec["failures"]),
+       "EF_CHOICE: the chosen point is inside the region when the region is not empty")
 
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
