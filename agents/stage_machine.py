@@ -322,7 +322,7 @@ def harness_owned() -> tuple:
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*",
         "evidence_dossier.yaml", SIGNOFF_SHEET,    # v2 autonomy 1B-ii: the default dossier and the sign-off sheet
-        AMENDMENT_RECORD, AMEND_LOCK)              # lead-gaps β (Codex r1): amend.py's record, the amendment lock
+        AMENDMENT_RECORD)                          # lead-gaps β (Codex r1): toolkit/spec/amend.py's record
 
 
 def owned_path(root: str, rel: str, owned) -> bool:
@@ -1044,7 +1044,9 @@ SPEC_RETHINK_REQUEST = "spec_rethink_request.json"
 # amend.py), signed provisionally by the lead; the parent ends with this status and the run continues in the child.
 AMENDED_PROVISIONAL = "amended_provisional"
 AMENDMENT_RECORD = "amendment_record.json"           # toolkit/spec/amend.py RECORD
-AMEND_LOCK = "spec_amendment.lock"                   # held across a lead amendment and its hand-off (not copied: .lock)
+# held by a --signoff lead run across its amendment and hand-off; under analysis/ (reserved for every run, so no
+# owner-mode deliverable path changes: Codex r3) and never copied into a child (.lock)
+AMEND_LOCK = "analysis/spec_amendment.lock"
 LEGACY_BRIEF_SIGNOFF = ("decision_brief.signoff.json",)      # scripts/decision_brief.py SIGNOFF (the v1 brief)
 
 
@@ -1053,15 +1055,23 @@ class AmendmentLocked(RuntimeError):
     stops with nothing written (owner decision on #330)."""
 
 
+_LOCK_HELD = __import__("threading").local()
+
+
 class _amend_lock:
-    """An exclusive, non-blocking lock on <run>/spec_amendment.lock (lib.safe_io, no link followed; flock is per open
-    file, so two processes, or two machines in one process, exclude each other). Held across the amendment and the
-    hand-off; a second holder raises AmendmentLocked."""
+    """An exclusive, non-blocking lock on <run>/analysis/spec_amendment.lock (lib.safe_io, no link followed; flock is
+    per open file, so two processes, or two machines in two threads, exclude each other). Nests within one thread (a
+    lead run holds it from run_v2 through its amendment and hand-off). A second holder raises AmendmentLocked."""
 
     def __init__(self, run_dir: str):
         self.run_dir, self.f = run_dir, None
+        self.key = os.path.realpath(os.path.join(run_dir, AMEND_LOCK))
 
     def __enter__(self):
+        held = _LOCK_HELD.__dict__.setdefault("depth", {})
+        if held.get(self.key):
+            held[self.key] += 1
+            return self
         import fcntl
         from lib.safe_io import open_append_nofollow
         f = open_append_nofollow(self.run_dir, AMEND_LOCK)
@@ -1075,9 +1085,15 @@ class _amend_lock:
             f.close()
             raise
         self.f = f
+        held[self.key] = 1
         return self
 
     def __exit__(self, *exc):
+        held = _LOCK_HELD.__dict__.setdefault("depth", {})
+        held[self.key] -= 1
+        if held[self.key]:
+            return False
+        del held[self.key]
         import fcntl
         try:
             fcntl.flock(self.f, fcntl.LOCK_UN)
@@ -1578,6 +1594,16 @@ class Machine:
 
     # -------------------------------------------------- handlers
     def h_SPEC(self):
+        if self.st.signoff == "lead" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)) \
+                and not getattr(self, "_in_amend_lock", False):
+            # owner decision on #330 (Codex r3): the request is written only under the amendment lock, so a resumer that
+            # loses the lock writes nothing
+            with _amend_lock(self.run_dir):
+                self._in_amend_lock = True
+                try:
+                    return self.h_SPEC()
+                finally:
+                    self._in_amend_lock = False
         if self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir):
             # F6 run 3 (gap 2): a rethink of a signed spec is the owner's amendment, never a redraft in this run (an
             # amended spec cannot be re-signed in a signed run dir): the request, then a pause; the owner amends and
@@ -1677,7 +1703,11 @@ class Machine:
             child = _child_of(self.run_dir, child) or child
         if la.get("status") == "refused":
             return None                   # the first refusal stands, with its reason and any kept child
-        if la.get("status") in ("started", "signed_provisionally"):
+        if any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
+            # owner decision on #330: in v2 a legacy decision-brief signature (which may bind other files than the spec)
+            # never satisfies the lead's check, also when recovering an interrupted hand-off (Codex r3); the owner decides
+            why = "the parent carries a legacy decision brief signature, which a lead amendment never relies on in v2"
+        elif la.get("status") in ("started", "signed_provisionally"):
             # an interrupted handoff: finished when the child is signed by the lead, else refused (the owner decides)
             if not (child and os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
                     and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
@@ -1691,10 +1721,6 @@ class Machine:
             why = "the rethink wrote no machine-readable patch"
         elif self._provisional_amendment():
             why = "this run continues a provisional amendment; a second one waits for the owner"
-        elif any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
-            # owner decision on #330: in v2 a legacy decision-brief signature (which may bind other files than the spec)
-            # never satisfies the lead's check; the owner decides
-            why = "the parent carries a legacy decision brief signature, which a lead amendment never relies on in v2"
         elif not callable(getattr(self.tasks, "for_run_dir", None)):
             why = "the run's tasks cannot continue in a child run"
         elif self._signed_by() is None:
@@ -2852,10 +2878,50 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
 
 def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str = "owner",
            budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False, backend=None,
-           cross_engine_check: bool = True, _depth: int = 0) -> str:
+           cross_engine_check: bool = True, _depth: int = 0, _stamp: dict | None = None) -> str:
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
-    (Machine.reopen_interrupted_analysis)."""
+    (Machine.reopen_interrupted_analysis). A --signoff lead run holds its amendment lock from before its state is read
+    to its hand-off (owner decision on #330, Codex r3): a second process resuming it fails with AmendmentLocked before
+    writing anything, also to the child it was handed to."""
+    try:
+        prev = load_state(run_dir)
+    except (OSError, ValueError):
+        prev = None
+    if signoff != "lead" and (prev is None or prev.signoff != "lead"):
+        child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
+                                     derive_unsandboxed, backend, cross_engine_check, _stamp)
+    else:
+        os.makedirs(run_dir, exist_ok=True)
+        with _amend_lock(run_dir):
+            child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
+                                         derive_unsandboxed, backend, cross_engine_check, _stamp)
+    if child is None or _depth >= 8:          # a bounded chain (a restored cycle cannot recurse: Codex r2)
+        return status
+    # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher);
+    # the child is stamped only once its own lock is held
+    try:
+        meta = json.load(open(os.path.join(run_dir, "metadata.json")))
+        ident = {k: meta.get(k) for k in ("pipeline", "commit", "launcher")}
+    except (OSError, ValueError, AttributeError) as e:
+        log(f"[machine] the child run's identity was not read: {type(e).__name__}: {e}")
+        ident = None
+    cst = load_state(child)
+    log(f"[machine] continuing in {child} (provisional amendment)")
+    return run_v2(cst.question, child, tasks.for_run_dir(child), max_rounds=cst.max_rounds, signoff="lead",
+                  budget_usd=cst.budget_usd, log=log, derive_unsandboxed=derive_unsandboxed, backend=backend,
+                  cross_engine_check=cross_engine_check, _depth=_depth + 1, _stamp=ident)
+
+
+def _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
+                 cross_engine_check, stamp) -> tuple:
+    """(the child to continue in or None, the status) of one run dir."""
+    if stamp:
+        try:
+            from lib import pipeline_id
+            pipeline_id.stamp(run_dir, stamp)
+        except Exception as e:  # noqa: BLE001 -- the identity stamp only; the run records its own invocation below
+            log(f"[machine] the child run's identity was not stamped: {type(e).__name__}: {e}")
     st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed)
     if st.paused == AWAITING_BUDGET and budget_usd and budget_usd > (st.budget_usd or 0):
         # the owner resumes a run paused below the allowance floor with a higher cap: recorded, never lowered
@@ -2867,21 +2933,7 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
     m.reopen_interrupted_analysis()
     status = m.run()
-    child = handoff_child(run_dir)
-    if child is None or _depth >= 8:          # a bounded chain (a restored cycle cannot recurse: Codex r2)
-        return status
-    # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher)
-    try:
-        from lib import pipeline_id
-        meta = json.load(open(os.path.join(run_dir, "metadata.json")))
-        pipeline_id.stamp(child, {k: meta.get(k) for k in ("pipeline", "commit", "launcher")})
-    except Exception as e:  # noqa: BLE001 -- the identity stamp only; the child records its own invocation below
-        log(f"[machine] the child run's identity was not stamped: {type(e).__name__}: {e}")
-    cst = load_state(child)
-    log(f"[machine] continuing in {child} (provisional amendment)")
-    return run_v2(cst.question, child, tasks.for_run_dir(child), max_rounds=cst.max_rounds, signoff="lead",
-                  budget_usd=cst.budget_usd, log=log, derive_unsandboxed=derive_unsandboxed, backend=backend,
-                  cross_engine_check=cross_engine_check, _depth=_depth + 1)
+    return handoff_child(run_dir), status
 
 
 def _child_of(run_dir: str, recorded, strict: bool = False) -> str | None:
@@ -3108,19 +3160,26 @@ def _self_test_lead_amend(ok, td: str) -> None:
     d, _ = parent("lead_locked", "lead", good)
     rq0 = open(os.path.join(d, SPEC_RETHINK_REQUEST), "rb").read() if os.path.exists(
         os.path.join(d, SPEC_RETHINK_REQUEST)) else None
-    with _amend_lock(d):
+    import threading
+    errs = []
+
+    def _second():                 # another holder: a thread of its own (the lock nests within one thread)
         try:
             Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).step()
-            err = None
+            errs.append(None)
         except AmendmentLocked as e:
-            err = str(e)
+            errs.append(str(e))
+    with _amend_lock(d):
+        t1 = threading.Thread(target=_second)
+        t1.start()
+        t1.join(60)
+    err = errs[0] if errs else None
     rq1 = open(os.path.join(d, SPEC_RETHINK_REQUEST), "rb").read() if os.path.exists(
         os.path.join(d, SPEC_RETHINK_REQUEST)) else None
-    ok(err and "another process" in err and not os.path.lexists(d + ".amend1")
-       and "lead_amendment" not in json.loads(rq1 or b"{}") and load_state(d).status is None,
+    ok(err and "another process" in err and not os.path.lexists(d + ".amend1") and rq1 == rq0
+       and load_state(d).status is None,
        f"T_LEAD_AMEND_LOCKED a second resumer fails clearly while the lock is held and amends nothing ({err}; "
        f"{rq0 is None})")
-    import threading
     d, _ = parent("lead_race", "lead", good)
     real_amend, gate = AM.amend, threading.Barrier(2)
 
@@ -3147,6 +3206,40 @@ def _self_test_lead_amend(ok, td: str) -> None:
     ok(sorted(g[:6] for g in got) == ["locked", "ok"] and handoff_child(d) == d + ".amend1"
        and not os.path.lexists(d + ".amend2") and load_state(d).status == AMENDED_PROVISIONAL,
        f"T_LEAD_AMEND_RACE two racing resumers: one amends and hands off, the other fails clearly ({got})")
+    # Codex r3: run_v2 holds the lock from before it reads the state to the hand-off, so a second process resuming a
+    # handed-off parent fails before writing to the parent or its child
+    child = handoff_child(d)
+    snap = {f: open(f, "rb").read() for f in (os.path.join(d, STATE_FILE), os.path.join(child, "metadata.json"),
+                                               os.path.join(child, STATE_FILE))}
+    with _amend_lock(d):
+        def other():
+            try:
+                run_v2("q", d, StubTasks({}), signoff="lead", log=lambda *a: None, cross_engine_check=False)
+                got2.append("ran")
+            except AmendmentLocked:
+                got2.append("locked")
+        got2 = []
+        t2 = threading.Thread(target=other)
+        t2.start()
+        t2.join(60)
+    ok(got2 == ["locked"] and all(open(f, "rb").read() == b for f, b in snap.items()),
+       f"T_LEAD_AMEND_RUNV2_LOCK a second run_v2 on a held lead run fails clearly, parent and child untouched ({got2})")
+    # Codex r3: recovering an interrupted hand-off still refuses a legacy decision-brief signature (the child is kept)
+    d, _ = parent("lead_interrupt_brief", "lead", good)
+    mi = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
+    mi._go = _boom
+    try:
+        mi.step()
+    except KeyboardInterrupt:
+        pass
+    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    s = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
+    la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and "decision brief" in la.get("why", "")
+       and la.get("child") == d + ".amend1" and handoff_child(d) is None,
+       f"T_LEAD_AMEND_BRIEF_RESUME an interrupted hand-off with a legacy brief signature is refused, the child kept ({la})")
+    ok(AMEND_LOCK.startswith("analysis/") and "analysis/*" in harness_owned(),
+       "T_LEAD_AMEND_LOCK_PATH the lock lives under a path reserved for every run (no owner-mode deliverable changes)")
 
 
 def _self_test() -> int:
