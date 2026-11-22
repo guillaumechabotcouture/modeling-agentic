@@ -545,8 +545,16 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
         """The draw's best plan at `budget` on which no model correction bears: when the optimum carries one, the
         corrected packages are taken out in that draw and it is solved again (None when a correction bears on every
         plan, on the comparator or a whole unit)."""
-        return clean_solve(A, tab(Bn[d]), tab(Cs[d]), budget, rows[d]["events"], d)
+        return clean_solve(A, tab(Bn[d]), tab(Cs[d]), budget, list(rows[d]["events"]) + pev, d)
     pi = obj.copy()
+    if pev:      # hb1 fix 11 (Codex r3 of #343 P1-2): a draw's optimum on a point-corrected package earns no credit
+        for d, r in enumerate(rows):
+            if A.plan_corrections(pev, {i: pk[int(r["choice"][u])] for u, i in enumerate(ids_u)}):
+                sol = clean(d, float(A.plan_budget) if getattr(A, "plan_budget", None) is not None else B)
+                if sol is None:
+                    raise ValueError(f"value of information: draw {d}'s best plan without the point-corrected "
+                                     "packages could not be solved")
+                pi[d] = float(sol["objective"])
     if getattr(A, "plan_budget", None) is not None and abs(float(A.plan_budget) - B) > 1e-9 * max(1.0, B):
         # the draws were re-optimised within a reserve; with perfect information costs are known: the full budget
         for d in range(n):

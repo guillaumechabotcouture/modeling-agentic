@@ -627,7 +627,9 @@ def _plan_rule(run_dir: str, point, unc) -> list[dict]:
         raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
     except (OSError, yaml.YAMLError) as e:
         return [_f("analysis_contract_plan_rule", f"{SPEC} unreadable: {e}")]
-    return [_f("analysis_contract_plan_rule", m, "plan_rule") for m in PR.contract_findings(raw, point, unc)]
+    _rows, _man, problem, payload = _verified_doc(run_dir)
+    return [_f("analysis_contract_plan_rule", m, "plan_rule") for m in PR.contract_findings(raw, point, unc)
+            + (PR.reference_findings(point, payload) if not problem and payload else [])]
 
 
 def _value_of_information(run_dir: str, unc, voi) -> list[dict]:

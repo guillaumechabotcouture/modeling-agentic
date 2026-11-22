@@ -451,6 +451,9 @@ def rebuild(run_dir: str, log=print):
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
     A.point_events = list(A.last_events)
     point = yaml.safe_load(open(os.path.join(run_dir, "analysis", "point.yaml")))["data"]
+    if point.get("plan_rule"):       # hb1 fix 11 (Codex r3 P2-6): the stored plan's rule, whatever the spec says now
+        raise RebuildRefused("point.yaml records a plan solved over the uncertainty draws (plan_rule); a rebuild from "
+                             "the point tables cannot reproduce it")
     if ((spec["uncertainty"].get("affordability") or {}).get("enforce")):
         # F6 S1-1b: an enforced run's plan was solved within its reserve; restore it before solving
         rv = point.get("reserve")

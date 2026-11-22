@@ -108,7 +108,30 @@ def expected_value_plan(A, rows, point_plan: dict, cost0, point_events=()) -> di
 
 
 def contract_findings(raw: dict, point, unc) -> list[str]:
-    """The completed run carries the plan rule its signed spec asks for, and its arithmetic (fail closed)."""
+    """The completed run carries the plan rule its signed spec asks for, and its arithmetic (fail closed: a malformed
+    record is a finding, never a crash)."""
+    try:
+        return _contract_findings(raw, point, unc)
+    except Exception as e:  # noqa: BLE001 -- Codex r3 P2-5
+        return [f"point.yaml's plan rule record is malformed ({type(e).__name__}: {e})"]
+
+
+def reference_findings(point, dt_payload) -> list[str]:
+    """The decision tests' reference plan (analysis/decision_tests.yaml `reference_plan`) agrees with the run's plan
+    rule (point.yaml `plan_rule`): under expected_value they name the point-value plan, under point nothing (Codex r3
+    P1-4). No artifact: nothing to check here (its absence is the contract's own finding)."""
+    if not isinstance(dt_payload, dict):
+        return []
+    ev = isinstance(point, dict) and isinstance(point.get("plan_rule"), dict)
+    got = dt_payload.get("reference_plan")
+    if ev and got != "point_plan":
+        return ["the decision tests do not name their reference plan (point_plan) in an expected-value run"]
+    if not ev and got is not None:
+        return [f"the decision tests name a reference plan ({got!r}) in a point-plan run"]
+    return []
+
+
+def _contract_findings(raw: dict, point, unc) -> list[str]:
     want = rule(raw)
     if want not in RULES:
         return [f"deliverable.plan {want!r} is not one of {RULES}"]
@@ -128,15 +151,25 @@ def contract_findings(raw: dict, point, unc) -> list[str]:
     try:
         vals = [float(v["averted_mean"][hl]) for v in pu.values()]
         mean = float(fp["mean"])
+        n_ = max(1, len(vals))
         if not vals or not all(math.isfinite(x) for x in vals + [mean]) \
-                or abs(math.fsum(vals) - mean) > 1e-6 * max(1.0, abs(mean)):
+                or abs(math.fsum(x / n_ for x in vals) - mean / n_) > 1e-6 * max(1.0, abs(mean)) / n_:
             bad.append(f"the per-unit means of {hl} are not finite or do not add up to the fixed plan's mean over the "
                        "draws")
-    except (KeyError, TypeError, ValueError, AttributeError):
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
         bad.append(f"point.yaml has no per-unit mean of {hl}, or uncertainty.yaml no fixed-plan mean")
+    pc, over = pr.get("point_cost"), pr.get("point_cost_over_budget")
+    try:
+        ca, ba = float(point["cost_allocated"]), float(point["budget_allocatable"])
+        if not (isinstance(pc, (int, float)) and not isinstance(pc, bool) and isinstance(over, bool)
+                and abs(float(pc) - ca) <= 1e-6 * max(1.0, abs(ca)) and over == (ca > ba * (1 + 1e-9))):
+            bad.append("plan_rule.point_cost and point_cost_over_budget are missing or disagree with the plan's cost "
+                       "at the point values (a record from another rule?)")
+    except (KeyError, TypeError, ValueError):
+        bad.append("point.yaml has no cost_allocated or budget_allocatable to check the plan rule's point cost")
     if not (isinstance(plan, dict) and isinstance(pp, dict) and set(pp) == set(plan)):
         bad.append("plan_rule.point_plan does not name the delivered plan's units (the decision tests' reference plan)")
-    elif sorted(map(str, pr.get("units_differ") or [])) != sorted(str(i) for i in plan if plan[i] != pp[i]) \
+    elif not isinstance(pr.get("units_differ"), list) or sorted(map(str, pr["units_differ"])) != sorted(str(i) for i in plan if plan[i] != pp[i]) \
             or pr.get("n_units_differ") != sum(plan[i] != pp[i] for i in plan):
         bad.append("plan_rule.units_differ does not match the delivered and point-value plans")
     if isinstance(unc, dict) and pr.get("draws") != unc.get("draws"):

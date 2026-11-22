@@ -374,6 +374,18 @@ def _discard(dest: str, name: str, root: str, before: dict) -> None:
             pass
 
 
+def _previous_figures(run_dir: str) -> set:
+    """The figures the run's previous harness render published (analysis/figures.yaml, each with its files at
+    figures/<name>.*): only their files are retired when that figure is not drawn now, so no other file is touched."""
+    import yaml
+    try:
+        doc = yaml.safe_load(open(os.path.join(run_dir, "analysis", "figures.yaml"))) or {}
+        return {str(f["figure"]) for f in (doc.get("data") or {}).get("figures") or []
+                if isinstance(f, dict) and f.get("figure") and f.get("path") == os.path.join("figures", f"{f['figure']}.png")}
+    except (OSError, yaml.YAMLError, AttributeError, TypeError, KeyError):
+        return set()
+
+
 RENDER_FAILED = "figure_render_failed"
 
 
@@ -2337,6 +2349,7 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
                      "theme": theme, "tier": TIER_OF[name],
                      "group": "decision" if TIER_OF[name] == "decision" else "diagnostics",
                      "presentation": R.presentation_record()}, **extra)
+    prev_drawn = _previous_figures(run_dir) if harness else set()
     for name in [n for n in names if not only or n in only]:
         R.used = []
         opened, before = set(plt.get_fignums()), _file_sigs(dest, name)
@@ -2344,8 +2357,8 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
             figs.append(one(name))
         except Missing as e:
             notp.append({"figure": name, "reason": str(e), "tier": TIER_OF[name]})
-            if harness:     # hb1 fix 11 (Codex r2 of #343 P1-5): an earlier run's files of a figure not drawn now
-                _discard(dest, name, run_dir, {end: None for end in FIG_ENDS})      # never stand for this run
+            if harness and name in prev_drawn:    # hb1 fix 11 (Codex r2/r3 of #343): an earlier render's files of
+                _discard(dest, name, run_dir, {end: None for end in FIG_ENDS})   # a figure not drawn now are retired
         except PresentationRefused:
             raise                       # a refused declared input is not one figure's failure: fail closed, as before
         except Exception as e:  # noqa: BLE001 -- v2 autonomy 1C-a: one figure's failure (its draw, title, save,
