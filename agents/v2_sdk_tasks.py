@@ -82,8 +82,9 @@ to the run directory. When the options use a component whose effect depends on d
 evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Two
 rules the check refuses often: a decision test's `text` has no digits (it says in words what the
 test asks; the values tested are rendered from computed claims); and `engine_parameters` gives no
-value for a parameter the engine card lists as calibrated or fitted (calibrate it under
-`calibration`, or leave it to the engine). Output:
+value for a parameter the engine card lists as calibrated or fitted (calibrate a calibrated one
+under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
+it out). Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """
@@ -465,7 +466,7 @@ class SdkTasks:
     (crashed_session_cost); when it cannot be, the whole allowance. Never $0 for a call that ran.
     Every charge is also written to budget_ledger.json."""
 
-    def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int = 30,
+    def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int | None = None,
                  query_fn=None, io_root: str | None = None):
         self.run_dir = os.path.abspath(run_dir)
         # lib.safe_io's trusted root: the run dir. A world-model seed session runs in <run>/world_model/seed/, and
@@ -475,13 +476,15 @@ class SdkTasks:
         self.cap = task_cap_usd
         self.allowance = task_cap_usd
         self.readback = 0.0          # no read-back unless the machine grants a budget for it
-        self.turns = max_turns
+        self.turns = 30 if max_turns is None else int(max_turns)
+        self.turns_explicit = max_turns is not None      # a caller's cap holds for every task (Codex r1 P1-5)
         self.query_fn = query_fn
         self.n = 0
 
     def turns_for(self, kind: str) -> int:
-        """The turn cap of one session: SPEC_MAX_TURNS for the spec draft (never below the default), else the default."""
-        return max(self.turns, SPEC_MAX_TURNS) if kind == "draft_spec" else self.turns
+        """The turn cap of one session: the caller's cap when it gave one; else SPEC_MAX_TURNS for the spec draft and
+        the default of 30 for the others."""
+        return SPEC_MAX_TURNS if kind == "draft_spec" and not self.turns_explicit else self.turns
 
     def set_allowance(self, usd: float, readback_usd: float | None = None) -> None:
         """The call's dollar cap, and the cap of one crash read-back (0: none; the whole allowance

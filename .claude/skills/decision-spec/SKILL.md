@@ -293,5 +293,6 @@ when that test changes the plan (toolkit/analysis/conflicts.py). Declare known m
   ("does the plan change if the effect is at the low end of its range?"). The values tested
   and the results are rendered from computed claims, and a text with a number is refused.
 - Do not give a value in `engine_parameters` for a parameter the engine card lists as
-  `calibrated` or `fitted`: fitting sets it, and the entry is refused. Calibrate it under
-  `calibration`, or leave it to the engine.
+  `calibrated` or `fitted`: fitting sets it, and the entry is refused. Calibrate a `calibrated`
+  one under `calibration`, or leave it to the engine; a `fitted` one is set by the engine's own
+  fit (`calibration` accepts kind `calibrated` only): leave it out.
