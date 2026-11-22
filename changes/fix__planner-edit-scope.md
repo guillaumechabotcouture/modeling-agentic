@@ -1,0 +1,8 @@
+---
+phase: "v2"
+commit: "planner-edit-scope"
+---
+
+## Changelog
+
+**The fix planner is told what a fix task may edit, and a fix that needs harness code is declared a harness gap.** In harness baseline hb1 every fix task planned a change outside what a fix task may edit (analysis outputs, the claims files, `data/README.md`, or harness code under `toolkit/analysis/`), and none of them changed a file. `agents/fix_loop.py` now holds the edit scope (`FIX_EDITABLE`: `analysis_settings.yaml` and `models/ext/`). The fix task's write scope (`agents/v2_sdk_tasks.py` `OWNS["fix"]`) is that same tuple. The planner's packet carries `edit_scope` (the files and the settings leaves from `toolkit/spec/schema.py`) and `no_op_findings`. Plan validation now refuses three things: a fix or decision_test task that names no files, a file outside the scope (an absolute path or a `..` part counts as outside), and a fix for a finding whose earlier fix task changed no file. A finding whose fix needs anything else goes in the plan's new `harness_gaps` list with its `reason` and what it `needs`. That entry covers a blocking finding. The loop records it in `fix_plan_r<N>.json`, in its summary (`run_state.json` history) and as a `harness_gap` event on the finding, which stays open. It is never a fix row. The next packet shows the reason. A fix task that changes no file is recorded `no_op` and failed, and it is not sent back for a second try. `budget_ledger.json` and the task input and output files no longer count as changes the task made. The harness default plan names the whole scope. Self-tests F19-F21c (built from the hb1 dengue, measles and tb R2 plans and impact rows) failed before the fix.

@@ -19,7 +19,7 @@ for _p in (_REPO, os.path.join(_REPO, "scripts")):
         sys.path.insert(0, _p)
 from agents import enforcement  # noqa: E402
 from agents.v2_tasks import CRITIQUE_FILE, PREFIX, TaskResult
-from agents.fix_loop import FIX_PLANNER_PROMPT
+from agents.fix_loop import FIX_EDITABLE, FIX_PLANNER_PROMPT
 
 TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"]
 OUT = "_task_output.json"
@@ -250,7 +250,7 @@ PROMPTS["seed_world_model"] = seed_prompt_text().replace("{", "{{").replace("}",
     .replace("{{out_in}}", "{out_in}").replace("{{out}}", "{out}")
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
-        "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",),
+        "critique": (), "fix": FIX_EDITABLE, "write": ("manuscript.md",),
         "seed_world_model": (SEED_FILE,),
         # v2 autonomy 1B-ii: the dossier the spec names (draft_evidence(rel=...)); this is the default name
         "draft_evidence": ("evidence_dossier.yaml",)}

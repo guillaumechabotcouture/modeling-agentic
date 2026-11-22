@@ -32,7 +32,13 @@ for _p in (REPO, os.path.join(REPO, "scripts"), HERE):
 import findings_ledger as FL  # noqa: E402
 
 IMPACT = "impact_ledger.jsonl"
+# What a fix (or decision_test) task may edit: a file, or a folder when the entry ends in "/". The fix task's write
+# scope (agents/v2_sdk_tasks.py OWNS["fix"]) is this tuple, so the planner, plan validation and the tools agree.
+# Harness baseline hb1: every planned fix named files outside it (analysis outputs, data/README.md, harness code), and
+# every one changed nothing.
+FIX_EDITABLE = ("analysis_settings.yaml", "models/ext/")
 ACTIONS = ("fix", "rethink", "decision_test")
+HARNESS_GAP = "harness_gap"          # the ledger event a declared harness gap leaves on its finding
 RETHINK_STATES = ("SPEC", "ENGINE_CHOICE")
 # F6 run 3: a write-up finding (report or manuscript text) is the WRITE stage's. A FIX_LOOP task may edit only
 # analysis_settings.yaml and models/ext/, so a task for one can never pass its check; the writer gets it instead.
@@ -54,7 +60,7 @@ def needs_owner_amendment(f) -> bool:
     g = f.get if isinstance(f, dict) else (lambda k, _f=f: getattr(_f, k, None))
     return g("resolution_type") != "owner_decision" and bool(_OWNER_AMENDMENT.search(str(g("fix_requires") or "")))
 # Files the harness writes; never counted as an agent's change.
-_HARNESS_OWNED = ("findings.jsonl", IMPACT, "run_state.json", "trace.jsonl", "validator_history.jsonl",
+_HARNESS_OWNED = ("findings.jsonl", IMPACT, "budget_ledger.json", "_task_input.json", "_task_output.json", "run_state.json", "trace.jsonl", "validator_history.jsonl",
                   "done_when_registry.json", "open_problems.md", "open_problems.json", "final_gate.json",
                   "gate_r", "fix_plan_r", "fix_progress_r", "models/pipeline_state.json", "models/pipeline_report.json", "analysis/")
 
@@ -74,18 +80,31 @@ to fix next and how. You receive one JSON packet:
   impact_history           one row per earlier fix task: findings, files changed, headline before and
                            after, whether its check passed, findings it opened
   budget                   spent, cap and what is left in USD
+  edit_scope               what a fix or decision_test task may edit: `files` (a file, or a folder when it ends
+                           in "/") and `settings` (the only leaves analysis_settings.yaml may hold)
 
 Return only JSON:
 
   {"tasks": [{"id": "T1", "findings": ["R-005"], "action": "fix" | "rethink" | "decision_test",
               "owner_state": "<state>", "brief": "<what to change and why, citing the evidence>",
               "files": ["<files the change touches>"]}],
-   "deferred": [{"finding": "<id>", "reason": "<why not in this loop>"}]}
+   "deferred": [{"finding": "<id>", "reason": "<why not in this loop>"}],
+   "harness_gaps": [{"finding": "<id>", "reason": "<why no file in edit_scope can fix it>",
+                     "needs": ["<the harness file or capability the fix needs>"]}]}
 
 Rules:
+- A fix or decision_test task lists in `files` every file it changes, and each is inside edit_scope.
+  Nothing else is: not the signed decision_spec.yaml, the data, the outputs the harness writes (analysis/,
+  results.md, the claims files, the allocation and uncertainty tables) or the harness code (toolkit/,
+  scripts/, agents/). The harness rebuilds every output from the spec, the settings and the engine.
+- A finding whose fix needs a change outside edit_scope is a harness gap, not a task: list it in
+  `harness_gaps` with the reason and what it needs. It counts as covered, and the harness records it
+  for the owner. Do not plan a task that cannot change anything.
+- A finding whose earlier fix task changed no file (an impact_history row with `no_op` true that did not
+  pass) is not planned as a fix again: declare it a harness gap, a decision test or a rethink, or defer it.
 - One finding per task. Group findings in one task only when the same change fixes them and
   they share files; then list those files.
-- Every blocking finding is in a task. A non-blocking finding may be deferred with a reason.
+- Every blocking finding is in a task or in harness_gaps. A non-blocking finding may be deferred with a reason.
 - Order: what unblocks most first; a finding that other findings depend on before them.
 - Rethink, not patch, when the finding is structural, when the impact history shows the same
   finding patched twice without its check passing, or when several blocking findings point at one
@@ -136,6 +155,9 @@ def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate
                "scope_declarable": f.scope_declarable, "label": FL.short_label(f.claim), "claim": f.claim,
                "fix_requires": f.fix_requires, "done_when": f.done_when,
                "first_seen_round": f.first_seen_round, "attempts": att.get(f.id, 0)}
+        gaps = [e for e in f.events or [] if isinstance(e, dict) and e.get("status") == HARNESS_GAP]
+        if gaps:                                   # declared in an earlier round: the planner sees why
+            row["harness_gap"] = gaps[-1].get("note") or "declared"
         if needs_owner_amendment(f):           # the owner's decision first, whatever the stage (Codex #258 P2-4)
             owner.append(row)
         elif is_write_up(f):
@@ -150,7 +172,31 @@ def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate
             "gate": {"action": g.get("action"), "rule": g.get("rule_matched"), "rationale": g.get("rationale"),
                      "escalation_required": g.get("escalation_required"),
                      "stalled": g.get("stalled_findings") or []},
-            "findings": fs, "impact_history": impact_rows(run_dir)[-history_rows:], "budget": budget or {}}
+            "findings": fs, "impact_history": impact_rows(run_dir)[-history_rows:], "budget": budget or {},
+            "edit_scope": edit_scope(),
+            # findings whose fix task changed no file and did not pass (validate_plan refuses a fix for them again)
+            "no_op_findings": sorted({fid for r in impact_rows(run_dir) if r.get("no_op") and r.get("passed") is not True
+                                      for fid in r.get("findings") or []})}
+
+
+def edit_scope() -> dict:
+    """What a fix task may edit, as the planner's packet gives it: FIX_EDITABLE and the computational leaves of
+    analysis_settings.yaml (toolkit/spec/schema.py SETTINGS_PATHS, the analysis engine's own list)."""
+    from toolkit.spec import schema
+    return {"files": list(FIX_EDITABLE), "settings": sorted(".".join(p) for p in schema.SETTINGS_PATHS)}
+
+
+def in_edit_scope(path) -> bool:
+    """True when `path` (relative to the run) is a file a fix task may edit. An absolute path, a `..` part or a
+    non-string is outside; `./` prefixes are ignored."""
+    if not isinstance(path, str) or not path.strip():
+        return False
+    p = path.strip().replace("\\", "/")
+    if p.startswith("/") or ".." in p.split("/"):
+        return False
+    import posixpath
+    n = posixpath.normpath(p)
+    return any(n == e.rstrip("/") or n.startswith(e) if e.endswith("/") else n == e for e in FIX_EDITABLE)
 
 
 def validate_plan(plan, packet: dict) -> list[str]:
@@ -195,9 +241,53 @@ def validate_plan(plan, packet: dict) -> list[str]:
             errs.append(f"{tid}: a rethink names owner_state SPEC or ENGINE_CHOICE")
         if not str(t.get("brief") or "").strip():
             errs.append(f"{tid}: empty brief")
+        if t.get("action") != "rethink":
+            # hb1 (ranked fix 8): what the task changes must be something a fix task can edit (FIX_EDITABLE)
+            files = t.get("files")
+            if not isinstance(files, list) or not files:
+                errs.append(f"{tid}: a {t.get('action')} task must name the files it changes (edit_scope)")
+            else:
+                out = [str(p) for p in files if not in_edit_scope(p)]
+                if out:
+                    errs.append(f"{tid}: {', '.join(out)[:200]} outside what a fix task may edit "
+                                f"({', '.join(FIX_EDITABLE)}); a finding that needs another change is a harness gap: "
+                                "list it in `harness_gaps` with the reason and what it needs")
+            if t.get("action") == "fix":
+                for fid in fids:
+                    if fid in (packet.get("no_op_findings") or ()):
+                        errs.append(f"{tid}: an earlier fix task for {fid} changed no file; declare it in "
+                                    "`harness_gaps`, test it, rethink or defer it, not a fix again")
+    gaps = plan.get("harness_gaps")
+    if gaps is not None and not isinstance(gaps, list):
+        errs.append("`harness_gaps` must be a list")
+        gaps = []
+    declared = set()
+    for g in gaps or []:
+        fid = g.get("finding") if isinstance(g, dict) else None
+        if not isinstance(fid, str):
+            errs.append("a harness gap must name its `finding`")
+            continue
+        if fid in elsewhere:
+            errs.append(f"harness gap {fid} {elsewhere[fid]}")
+        elif fid not in by_id:
+            errs.append(f"harness gap: unknown finding {fid}")
+        elif by_id[fid]["resolution_type"] == "owner_decision":
+            errs.append(f"harness gap {fid} is the owner's decision")
+        elif fid in used:
+            errs.append(f"{fid} is both in a task and a harness gap")
+        elif not str(g.get("reason") or "").strip():
+            errs.append(f"harness gap {fid} needs its reason")
+        elif not (isinstance(g.get("needs"), list) and g["needs"]
+                  and all(isinstance(x, str) and x.strip() for x in g["needs"])):
+            errs.append(f"harness gap {fid}: `needs` must list the harness files or capability its fix needs")
+        elif fid in declared:
+            errs.append(f"harness gap {fid} is listed twice")
+        else:
+            declared.add(fid)
     deferred = {d.get("finding") for d in plan.get("deferred") or [] if isinstance(d, dict) and str(d.get("reason") or "").strip()}
     for f in packet["findings"]:
-        if f["blocking"] and f["resolution_type"] != "owner_decision" and f["id"] not in used and not is_write_up(f):
+        if f["blocking"] and f["resolution_type"] != "owner_decision" and f["id"] not in used | declared \
+                and not is_write_up(f):
             errs.append(f"blocking finding {f['id']} is in no task" + (" (blocking findings cannot be deferred)"
                                                                       if f["id"] in deferred else ""))
     return errs
@@ -210,7 +300,8 @@ def default_plan(packet: dict) -> dict:
     for f in packet["findings"]:
         if f["blocking"] and f["resolution_type"] != "owner_decision" and not is_write_up(f):
             tasks.append({"id": f"T{len(tasks) + 1}", "findings": [f["id"]], "action": "fix",
-                          "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f.get('label') or FL.short_label(f['claim'])}", "files": []})
+                          "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f.get('label') or FL.short_label(f['claim'])}",
+                          "files": list(FIX_EDITABLE)})        # all it may edit: the planner did not narrow it
     return {"tasks": tasks, "deferred": [], "by": "harness default"}
 
 
@@ -330,9 +421,23 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
         plan = default_plan(packet)
     write_up = [f["id"] for f in packet["write_up"]]
     owner = [f["id"] for f in packet["owner_amendments"]]
+    gaps = [g for g in plan.get("harness_gaps") or [] if isinstance(g, dict)]
+    gap_ids = sorted({str(g.get("finding")) for g in gaps})
     _sio().write_nofollow(run_dir, f"fix_plan_r{round_n}.json",
                           json.dumps({"round": round_n, "plan": plan, "rejected": errs, "write_up": write_up,
-                                      "owner_amendments": owner}, indent=1).encode(), atomic=True)
+                                      "owner_amendments": owner, "harness_gaps": gap_ids}, indent=1).encode(),
+                          atomic=True)
+    if gaps:
+        # hb1 (ranked fix 8): a finding only a harness change can fix is declared with its reason on the finding
+        # itself (it stays open: the gate, the report and the owner see it), never as a fix row.
+        led = FL.load(run_dir)
+        for g in gaps:
+            f = led.get(str(g.get("finding")))
+            if f is not None:
+                FL._event(f, round_n, HARNESS_GAP, "fix_planner",
+                          f"{str(g.get('reason')).strip()} Needs: {', '.join(map(str, g.get('needs') or []))}"[:600])
+        FL.save(run_dir, led)
+        log(f"[fix loop] harness gap(s), not fix tasks: {', '.join(gap_ids)}")
     done = {r.get("task") for r in impact_rows(run_dir) if r.get("round") == round_n}
     prog_p = os.path.join(run_dir, f"fix_progress_r{round_n}.json")
     try:
@@ -341,7 +446,7 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
         progress = {}
     summary = {"round": round_n, "tasks": len(plan["tasks"]), "rows": 0, "passed": 0, "rethink": None,
                "skipped_budget": 0, "skipped_rethink": 0, "rejected": 0, "resumed_done": 0, "plan_by": plan.get("by", "planner"),
-               "write_up": write_up, "owner_amendments": owner}
+               "write_up": write_up, "owner_amendments": owner, "harness_gaps": gap_ids}
 
     def out_of_budget():
         b = budget() if budget else None
@@ -377,7 +482,7 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
             _sio().publish(prog_p, json.dumps(progress, default=str), run_dir)
         evidence, rebuilt, attempts_, rejected, rep, r = None, [], 0, [], {}, None
         agent_changed: set = set()
-        check, passed, now_ids = {}, False, set(pend["before_ids"])
+        check, passed, now_ids, no_op = {}, False, set(pend["before_ids"]), False
         while True:
             attempts_ += 1
             if attempts_ > 1 and out_of_budget():
@@ -396,9 +501,14 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
             ledger = FL.load(run_dir)
             now_ids = harness_ids(run_dir)
             check = check_task(run_dir, t, ledger, now_ids)
+            no_op = not agent_changed
+            if no_op:
+                # hb1 (ranked fix 8): nothing changed, so there is nothing for a later critique or gate to judge
+                check = {fid: (c if c["passed"] is not None else
+                               {"passed": False, "why": "the task changed no file"}) for fid, c in check.items()}
             passed = all(c["passed"] is not False for c in check.values()) and rep.get("ok", True)
-            if passed or attempts_ >= 2:
-                break
+            if passed or attempts_ >= 2 or no_op:
+                break                                   # a no-op is not sent back: the second try changed nothing in hb1
             evidence = {"check": check, "rebuild_errors": [s.get("error") for s in rep.get("steps") or [] if s.get("error")]
                         + list(rep.get("errors") or [])}
             log(f"[fix loop] {t['id']} check failed; back to its agent once")
@@ -418,6 +528,9 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
         if rejected:
             row["rejected"] = rejected
             summary["rejected"] += 1
+        if no_op and not rejected:
+            row["no_op"] = True                         # the planner may not plan it as a fix again (validate_plan)
+            summary["no_op"] = summary.get("no_op", 0) + 1
         append_impact(run_dir, row)
         summary["rows"] += 1
         summary["passed"] += bool(row["passed"])
@@ -435,13 +548,14 @@ def _self_test() -> int:
         if not c:
             fails.append(m)
 
+    S = ["analysis_settings.yaml"]                     # a file a fix task may edit (FIX_EDITABLE)
     packet = {"findings": [
         {"id": "R-001", "blocking": True, "resolution_type": "fix", "scope_declarable": True, "owner_state": "ANALYZE", "claim": "a"},
         {"id": "k:x", "blocking": True, "resolution_type": "fix", "scope_declarable": False, "owner_state": "CONFIGURE", "claim": "b"},
         {"id": "M", "blocking": False, "resolution_type": "fix", "scope_declarable": True, "owner_state": "WRITE", "claim": "c"},
         {"id": "O", "blocking": True, "resolution_type": "owner_decision", "scope_declarable": True, "owner_state": "ANALYZE", "claim": "d"}]}
-    good = {"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE", "brief": "x"},
-                      {"id": "T2", "findings": ["k:x"], "action": "fix", "owner_state": "CONFIGURE", "brief": "y"}],
+    good = {"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE", "brief": "x", "files": S},
+                      {"id": "T2", "findings": ["k:x"], "action": "fix", "owner_state": "CONFIGURE", "brief": "y", "files": S}],
             "deferred": [{"finding": "M", "reason": "after the write-up"}]}
     ok(validate_plan(good, packet) == [], f"F1 a plan covering every blocking finding validates {validate_plan(good, packet)}")
     e = validate_plan({"tasks": [{"id": "T1", "findings": ["R-001", "k:x"], "action": "fix", "brief": "x"}]}, packet)
@@ -470,16 +584,17 @@ def _self_test() -> int:
         class T:
             def plan_fixes(self, pk):
                 return NS(ok=True, note="", output={"tasks": [
-                    {"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE", "brief": "raise draws"},
-                    {"id": "T2", "findings": ["k:x"], "action": "fix", "owner_state": "CONFIGURE", "brief": "fix x"}]})
+                    {"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE", "brief": "raise draws", "files": S},
+                    {"id": "T2", "findings": ["k:x"], "action": "fix", "owner_state": "CONFIGURE", "brief": "fix x", "files": S}]})
 
             def fix(self, t, run_dir, evidence):
                 state["calls"] += 1
                 if t["id"] == "T1":
                     open(os.path.join(run_dir, "spec.txt"), "w").write("draws 32\n")
                     open(os.path.join(run_dir, "analysis", "out.json"), "w").write("{}")   # harness-owned: not counted
-                elif evidence is not None:
-                    state["fixed"] = True
+                else:                                   # an edit that does not fix k:x until the second try
+                    open(os.path.join(run_dir, "analysis_settings.yaml"), "w").write(f"try: {state['calls']}\n")
+                    state["fixed"] = evidence is not None
                 return NS(ok=True, note="done", output=None)
 
         heads = iter([{"h": 1.0}, {"h": 1.1}, {"h": 1.1}, {"h": 1.1}])
@@ -512,7 +627,7 @@ def _self_test() -> int:
         class Edit:
             def plan_fixes(self, pk):
                 return NS(ok=True, note="", output={"tasks": [
-                    {"id": "T1", "findings": ["k:x"], "action": "fix", "owner_state": "CONFIGURE", "brief": "b"}]})
+                    {"id": "T1", "findings": ["k:x"], "action": "fix", "owner_state": "CONFIGURE", "brief": "b", "files": S}]})
 
             def fix(self, t, run_dir, evidence):
                 calls["fix"] += 1
@@ -584,7 +699,7 @@ def _self_test() -> int:
                                        {"id": "T2", "findings": ["R-010"], "action": "fix", "owner_state": "ANALYZE",
                                         "brief": "y"}]}, pk17)
         ok(any("R-010" in x and "WRITE stage" in x for x in e17)
-           and validate_plan({"tasks": [{"id": "T1", "findings": ["R-011"], "action": "fix", "brief": "x"}]}, pk17) == []
+           and validate_plan({"tasks": [{"id": "T1", "findings": ["R-011"], "action": "fix", "brief": "x", "files": S}]}, pk17) == []
            and [t["findings"] for t in default_plan(pk17)["tasks"]] == [["R-011"]],
            f"F17b a task naming a write-up finding is refused; a blocking one needs no task ({e17})")
         FL.save(d, led17)
@@ -593,7 +708,7 @@ def _self_test() -> int:
         class W:
             def plan_fixes(self, pk):
                 return NS(ok=True, note="", output={"tasks": [
-                    {"id": "T1", "findings": ["R-011"], "action": "fix", "owner_state": "ANALYZE", "brief": "draws"}]})
+                    {"id": "T1", "findings": ["R-011"], "action": "fix", "owner_state": "ANALYZE", "brief": "draws", "files": S}]})
 
             def fix(self, t, run_dir, evidence):
                 seen17.append(t["findings"])
@@ -665,7 +780,7 @@ def _self_test() -> int:
             def plan_fixes(self, pk):
                 return NS(ok=True, note="", output={"tasks": [
                     {"id": "T1", "findings": ["k:x"], "action": "rethink", "owner_state": "ENGINE_CHOICE", "brief": "b"},
-                    {"id": "T2", "findings": ["k:y"], "action": "fix", "owner_state": "ANALYZE", "brief": "b"}]})
+                    {"id": "T2", "findings": ["k:y"], "action": "fix", "owner_state": "ANALYZE", "brief": "b", "files": S}]})
 
             def fix(self, t, run_dir, evidence):
                 ran.append(t["id"])
@@ -674,6 +789,101 @@ def _self_test() -> int:
                        harness_ids=lambda rd: set(), headline=lambda rd: {}, log=lambda *a: None)
         ok(srb["rethink"] == "ENGINE_CHOICE" and ran == [] and srb.get("skipped_rethink") == 1,
            f"F_RETHINK_BREAK the loop stops at the first rethink task ({ran}, {srb})")
+    # F19-F21 (harness baseline hb1, ranked fix 8): every fix task in hb1 planned a change outside what a fix task may
+    # edit (the files of the dengue, measles and tb R2 plans below), and each changed nothing. The planner is told the
+    # edit scope, plan validation refuses a file outside it, and a finding that needs harness code is a declared
+    # harness gap with its reason, not a fix row.
+    with tempfile.TemporaryDirectory() as d:
+        led19 = {"R-001": FL.Finding(id="R-001", kind="critique_blocker", severity="HIGH", source="critique-redteam",
+                                     owner_state="ANALYZE", blocking=True, claim="the span the data allow is unreported"),
+                 "R-004": FL.Finding(id="R-004", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                                     owner_state="CONFIGURE", blocking=False, claim="a source path is unchecked")}
+        pk19 = build_packet(d, led19, 1, 3, None, None)
+        ok(pk19.get("edit_scope", {}).get("files") == list(FIX_EDITABLE)
+           and "uncertainty.draws" in (pk19.get("edit_scope") or {}).get("settings", []),
+           f"F19 the planner's packet names what a fix task may edit ({pk19.get('edit_scope')})")
+        hb1 = {"dengue R2 T1": ["analysis/estimates.yaml", "analysis/claims.yaml", "models/claims_spec.yaml",
+                                "models/claims_ledger.yaml", "results.md"],
+               "measles R2 T1": ["allocation_optimized.csv", "analysis/uncertainty.yaml", "uncertainty_report.yaml",
+                                 "analysis/voi.yaml", "claims.yaml", "results.md"],
+               "tb R2 T1": ["data/README.md"], "harness code": ["toolkit/analysis/run.py"],
+               "escape": ["models/ext/../../toolkit/analysis/run.py"], "absolute": ["/tmp/x/analysis_settings.yaml"]}
+        bad = {k: validate_plan({"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE",
+                                            "brief": "x", "files": v}]}, pk19) for k, v in hb1.items()}
+        ok(all(any("outside what a fix task may edit" in x and "harness_gaps" in x for x in e) for e in bad.values()),
+           f"F19b each hb1 plan's files are refused, pointing at harness_gaps ({bad})")
+        e19c = validate_plan({"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE",
+                                         "brief": "x"}]}, pk19)
+        ok(any("must name the files" in x for x in e19c),
+           f"F19c a fix task that names no file is refused: the scope check needs them ({e19c})")
+        good19 = {"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE", "brief": "x",
+                             "files": ["analysis_settings.yaml", "./models/ext/span.py"]}]}
+        ok(validate_plan(good19, pk19) == [] and validate_plan(default_plan(pk19), pk19) == [],
+           f"F19d files inside the scope validate, and the harness default plan does too "
+           f"({validate_plan(good19, pk19)}, {validate_plan(default_plan(pk19), pk19)})")
+        gap = {"tasks": [], "harness_gaps": [{"finding": "R-001", "reason": "the claims are fixed in harness code",
+                                              "needs": ["toolkit/analysis/estimates.py"]}]}
+        ok(validate_plan(gap, pk19) == [], f"F20 a blocking finding declared a harness gap is covered ({validate_plan(gap, pk19)})")
+        e20b = validate_plan({"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix", "brief": "x",
+                                         "files": ["analysis_settings.yaml"]}],
+                              "harness_gaps": [{"finding": "R-001", "reason": "r", "needs": ["x"]},
+                                               {"finding": "R-004", "reason": " ", "needs": ["x"]},
+                                               {"finding": "R-009", "reason": "r", "needs": ["x"]},
+                                               {"finding": "R-004", "reason": "r", "needs": []}]}, pk19)
+        ok(any("R-001" in x and "both" in x for x in e20b) and any("R-004" in x and "reason" in x for x in e20b)
+           and any("unknown finding R-009" in x for x in e20b) and any("R-004" in x and "needs" in x for x in e20b),
+           f"F20b a harness gap needs a known finding not in a task, a reason and what it needs ({e20b})")
+        FL.save(d, led19)
+
+        class G:
+            def plan_fixes(self, pk):
+                return NS(ok=True, note="", output=gap)
+
+            def fix(self, t, run_dir, evidence):
+                raise AssertionError("no fix call for a harness gap")
+        s20 = run_loop(d, 1, 3, None, G(), rebuild=lambda rd: {"ok": True}, harness_ids=lambda rd: set(),
+                       headline=lambda rd: {}, log=lambda *a: None)
+        plan20 = json.load(open(os.path.join(d, "fix_plan_r1.json")))
+        ev20 = [e for e in FL.load(d)["R-001"].events if e.get("status") == "harness_gap"]
+        ok(s20.get("harness_gaps") == ["R-001"] and s20["rows"] == 0 and impact_rows(d) == []
+           and plan20.get("harness_gaps") == ["R-001"] and ev20 and "harness code" in ev20[-1].get("note", "")
+           and FL.load(d)["R-001"].status == "open"
+           and build_packet(d, FL.load(d), 2, 3, None, None)["findings"][0].get("harness_gap"),
+           f"F20c a harness gap is recorded with its reason (plan, summary, ledger event, next packet), not as a fix "
+           f"row ({s20}, {ev20})")
+    # F21: a fix task that changes no file is a no-op. hb1 dengue R2 and measles R2 each sent one back for a second
+    # attempt, and the harness's own budget_ledger.json write made it look like a change.
+    with tempfile.TemporaryDirectory() as d:
+        FL.save(d, {"R-001": FL.Finding(id="R-001", kind="critique_blocker", severity="HIGH", source="critique-redteam",
+                                        owner_state="ANALYZE", blocking=True, claim="c",
+                                        done_when=[{"file": "never.txt", "exists": True}])})
+        calls21 = []
+
+        class N:
+            def plan_fixes(self, pk):
+                return NS(ok=True, note="", output={"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix",
+                                                               "owner_state": "ANALYZE", "brief": "x",
+                                                               "files": ["analysis_settings.yaml"]}]})
+
+            def fix(self, t, run_dir, evidence):
+                calls21.append(evidence)
+                open(os.path.join(run_dir, "budget_ledger.json"), "w").write(json.dumps({"n": len(calls21)}))
+                return NS(ok=True, note="Nothing changed: needs harness code", output=None)
+        s21 = run_loop(d, 1, 3, None, N(), rebuild=lambda rd: {"ok": True}, harness_ids=lambda rd: set(),
+                       headline=lambda rd: {}, log=lambda *a: None)
+        row21 = impact_rows(d)[-1]
+        ok(len(calls21) == 1 and row21.get("no_op") is True and row21["files_changed"] == [] and row21["passed"] is False
+           and row21["attempts"] == 1,
+           f"F21 a fix task that changes no file is a no-op: not sent back, recorded as failed ({calls21}, {row21})")
+        pk21 = build_packet(d, FL.load(d), 2, 3, None, None)
+        e21 = validate_plan({"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE",
+                                        "brief": "x", "files": ["analysis_settings.yaml"]}]}, pk21)
+        ok(any("R-001" in x and "changed no file" in x for x in e21)
+           and validate_plan({"tasks": [], "harness_gaps": [{"finding": "R-001", "reason": "r", "needs": ["x"]}]},
+                             pk21) == [],
+           f"F21b a finding whose fix task was a no-op is not planned as a fix again; a harness gap is accepted ({e21})")
+    ok(all(s in FIX_PLANNER_PROMPT for s in ("edit_scope", "harness_gaps", "no_op")),
+       "F21c the planner prompt explains the edit scope, harness gaps and no-op rows")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
