@@ -1674,7 +1674,15 @@ class Machine:
         fb = self.st.tries.get("spec_feedback")
         # The key is fixed before the call and the try is counted only once the call returns, so an
         # interrupted draft resumes under the same key (charged once by _settle_interrupted).
-        res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, rd, fb)
+        # baseline hb1, fix 10: the draft checks itself during its try with these same checks (validate_spec)
+        offer = getattr(self.tasks, "set_spec_check", None)
+        if offer:
+            offer(lambda: self._spec_checks(rd))
+        try:
+            res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, rd, fb)
+        finally:
+            if offer:
+                offer(None)
         self.st.tries["spec"] = n + 1
         if res is None:
             return self._budget_out("SPEC")

@@ -26,6 +26,12 @@ OUT = "_task_output.json"
 # baseline hb1: 4 of 10 runs lost a SPEC try to the 30-turn cap (the draft reads inputs, writes derivations and
 # iterates); the spec draft gets its own cap, still bounded by the call's dollar allowance.
 SPEC_MAX_TURNS = 60
+# baseline hb1, ranked fix 10: the spec draft checks its own draft in process (validate_spec, no shell), so problems
+# cost a tool call, not a try; each check takes turns, so a draft holding the tool has a higher cap.
+SPEC_TOOL_SERVER = "harness"
+VALIDATE_SPEC_TOOL = f"mcp__{SPEC_TOOL_SERVER}__validate_spec"
+SPEC_MAX_TURNS_VALIDATING = 80
+MAX_VALIDATE_CALLS = 12
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
@@ -84,7 +90,9 @@ rules the check refuses often: a decision test's `text` has no digits (it says i
 test asks; the values tested are rendered from computed claims); and `engine_parameters` gives no
 value for a parameter the engine card lists as calibrated or fitted (calibrate a calibrated one
 under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
-it out). Output:
+it out). When you hold the validate_spec tool, call it after writing the draft and after each fix:
+it runs the same checks the harness runs when your try ends, so finish only once it finds no
+problem (or say in notes what you could not fix). Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """
@@ -480,11 +488,19 @@ class SdkTasks:
         self.turns_explicit = max_turns is not None      # a caller's cap holds for every task (Codex r1 P1-5)
         self.query_fn = query_fn
         self.n = 0
+        self.spec_check = None
+
+    def set_spec_check(self, fn) -> None:
+        """The machine's pre-sign checks on the current draft (a callable returning the problems), offered to the next
+        spec draft as its validate_spec tool; None withdraws it."""
+        self.spec_check = fn
 
     def turns_for(self, kind: str) -> int:
-        """The turn cap of one session: the caller's cap when it gave one; else SPEC_MAX_TURNS for the spec draft and
-        the default of 30 for the others."""
-        return SPEC_MAX_TURNS if kind == "draft_spec" and not self.turns_explicit else self.turns
+        """The turn cap of one session: the caller's cap when it gave one; else for the spec draft SPEC_MAX_TURNS, or
+        SPEC_MAX_TURNS_VALIDATING when it holds the validate_spec tool (its checks take turns); else the default of 30."""
+        if kind != "draft_spec" or self.turns_explicit:
+            return self.turns
+        return SPEC_MAX_TURNS_VALIDATING if self.spec_check else SPEC_MAX_TURNS
 
     def for_run_dir(self, run_dir: str) -> "SdkTasks":
         """The same tasks for another run dir (lead-gaps β: the child run a provisional lead amendment continues in),
@@ -517,13 +533,20 @@ class SdkTasks:
             return TaskResult(False, None, 0.0, "no allowance: the call was not made")
         out = os.path.join(self.run_dir, OUT)
         _sio().remove_path(out, self.io_root)
+        servers, extra = {}, []
+        if kind == "draft_spec" and self.spec_check:
+            from claude_agent_sdk import create_sdk_mcp_server
+            servers = {SPEC_TOOL_SERVER: create_sdk_mcp_server(SPEC_TOOL_SERVER, tools=[
+                validate_spec_tool(self.spec_check)])}
+            extra = [VALIDATE_SPEC_TOOL]
+        mine = TOOLS + extra
 
         async def pre(input_data, tool_use_id, context):
             name = input_data.get("tool_name")
             ti = input_data.get("tool_input") or {}
-            if name not in TOOLS:
+            if name not in mine:
                 # Fail closed (main #97): no shell, so no full pipeline build and no background call.
-                return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(TOOLS)})")
+                return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(mine)})")
             if name in ("Write", "Edit"):
                 why = _allowed(ti.get("file_path", ""), self.run_dir, owns)
                 if why:
@@ -535,8 +558,8 @@ class SdkTasks:
             return {}
 
         opts = ClaudeAgentOptions(system_prompt=system, model=model or enforcement.MODEL_DEEP, tools=TOOLS,
-                                  allowed_tools=TOOLS, permission_mode="bypassPermissions", cwd=self.run_dir,
-                                  max_turns=self.turns_for(kind), max_budget_usd=allowance, setting_sources=[],
+                                  allowed_tools=mine, mcp_servers=servers, permission_mode="bypassPermissions",
+                                  cwd=self.run_dir, max_turns=self.turns_for(kind), max_budget_usd=allowance, setting_sources=[],
                                   env=enforcement.filtered_env(dict(os.environ), self.cloud),
                                   hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[pre])]})
 
@@ -564,7 +587,7 @@ class SdkTasks:
             # One read-back, capped at its own small budget (never the SDK's unbounded default).
             import dataclasses
             probe = dataclasses.replace(opts, resume=seen["sid"], max_turns=1, tools=[], allowed_tools=[],
-                                        hooks=None, max_budget_usd=self.readback)
+                                        mcp_servers={}, hooks=None, max_budget_usd=self.readback)
             charge_cap = allowance + self.readback
 
             async def readback():
@@ -698,6 +721,41 @@ class SdkTasks:
 
 
 SdkTasks.pick_engine = _no_session_when_sole(SdkTasks.pick_engine)
+
+
+def validate_spec_tool(check, limit: int = MAX_VALIDATE_CALLS):
+    """The spec draft's in-process validate_spec tool (baseline hb1, ranked fix 10): `check()` is the machine's own
+    pre-sign check chain on the current files (Machine._spec_checks), so a pass here is what the harness finds after
+    the try. No arguments, no shell. A check that raises is an error result, never a pass; past `limit` calls in one
+    try the tool says so (the turn and dollar caps bound the rest). One check at a time."""
+    import threading
+    from claude_agent_sdk import tool
+    state = {"calls": 0}
+    lock = threading.Lock()
+
+    def run():
+        with lock:
+            return list(check() or [])
+
+    @tool("validate_spec", "Run the harness's pre-sign checks on the current decision_spec.yaml, its settings, "
+          "derivations and cited inputs: the same checks the harness runs when your try ends. Takes no arguments. "
+          "Returns every problem found, or that none was found.", {})
+    async def validate_spec(args):
+        state["calls"] += 1
+        if state["calls"] > limit:
+            return {"is_error": True, "content": [{"type": "text", "text": (
+                f"validate_spec: the limit of {limit} checks in one try is reached; fix what the last check "
+                "reported, then finish (the harness checks the draft when the try ends)")}]}
+        try:
+            probs = await asyncio.to_thread(run)
+        except Exception as e:  # noqa: BLE001 -- fail closed: never a pass
+            return {"is_error": True, "content": [{"type": "text", "text": (
+                f"validate_spec: the checks could not run: {type(e).__name__}: {e}"[:2000])}]}
+        if not probs:
+            return {"content": [{"type": "text", "text": "validate_spec: no problems found by the pre-sign checks"}]}
+        return {"content": [{"type": "text", "text": f"validate_spec: {len(probs)} problem(s), fix every one:\n- "
+                             + "\n- ".join(str(p) for p in probs[:40])}]}
+    return validate_spec
 
 
 def _self_test_validate_spec(ok) -> None:
