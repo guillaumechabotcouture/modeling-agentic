@@ -2881,7 +2881,7 @@ def _t_owner_disposes(run_dir: str) -> None:
             SO.write_sheet(run_dir)
 
 
-def _t_lead_amend(ok, td: str) -> None:
+def _self_test_lead_amend(ok, td: str) -> None:
     """lead-gaps β self-tests: S7 (a rethink of a signed spec) under --signoff lead with the fix plan's patch becomes a
     child run signed provisionally by the lead; under owner sign-off, or without a valid patch, the run pauses."""
     import yaml
@@ -3311,7 +3311,7 @@ def _self_test() -> int:
         rq6 = json.load(open(os.path.join(d, "spec_rethink_request.json")))
         ok(rq6.get("signing_evidence") == "missing" and "requested_at" in rq6,
            f"R3-2f the amendment request notes missing signing evidence ({rq6.get('signing_evidence')})")
-        _t_lead_amend(ok, td)
+        _self_test_lead_amend(ok, td)
 
         # R3-1 (F6 run 3): a write-up finding is never a FIX_LOOP task; the writer gets it with the draft.
         wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}
