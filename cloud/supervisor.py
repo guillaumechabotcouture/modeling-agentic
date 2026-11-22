@@ -678,6 +678,9 @@ def _self_test() -> int:
        f"SV16 start runs vm_job up + start with the loop ({flat})")
     cmds = guard(start_commands, a, "sv-1", False)
     ok(isinstance(cmds, list) and "--secret-env" not in " ".join(cmds[1]), "SV16b no token: no --secret-env")
+    import budget
+    ok(DEFAULT_NAME.startswith("sv-") and budget.scope_for_name(DEFAULT_NAME) == "sv",
+       "SV16c the default name is in the supervisor's own budget scope, sv (owner 2026-11-22)")
     # SV17 stop: only this name's live cluster, by id
     stopped, rec = [], lambda n, cid, why: stopped.append((n, cid))
     guard(stop_own, DEFAULT_NAME, live_id=lambda n: 123 if n == DEFAULT_NAME else 999, stop=rec)
