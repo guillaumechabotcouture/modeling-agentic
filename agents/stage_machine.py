@@ -1595,22 +1595,15 @@ class Machine:
         fb = self.st.tries.get("spec_feedback")
         # The key is fixed before the call and the try is counted only once the call returns, so an
         # interrupted draft resumes under the same key (charged once by _settle_interrupted).
-        key = f"SPEC#{self._visit()}:try{n + 1}"
-        # The draft's files as they were before this try, kept in the run state under the try's key, so a resume
-        # after the task completed compares with the same files (Codex r1 P1-3); _task saves it with the journal.
-        sig = self.st.tries.get("spec_draft_sig")
-        if not (isinstance(sig, dict) and sig.get("key") == key):
-            sig = self.st.tries["spec_draft_sig"] = {"key": key, "before": _draft_sig(rd)}
-        res = self._task(key, "draft_spec", self.st.question, rd, fb)
+        res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, rd, fb)
         self.st.tries["spec"] = n + 1
         if res is None:
             return self._budget_out("SPEC")
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
-        # baseline hb1: a try cut off (the turn cap) after writing or repairing any of the draft's files (the spec,
-        # its settings, derivations: Codex r1 P1-4) still has the draft checked
-        after = _draft_sig(rd)
-        drafted = res.ok or (after is not None and after != sig.get("before"))
-        self.st.tries.pop("spec_draft_sig", None)
+        # baseline hb1: a try cut off (the turn cap) is checked on whatever draft is on disk, written or repaired in
+        # this try or left by an earlier one: the checks say what holds now, with no before/after comparison to get
+        # wrong on a resume or a rewrite (Codex r1 P1-3/P1-4, r2 P1-5/P1-7/P2-8)
+        drafted = res.ok or os.path.lexists(os.path.join(rd, AB.SPEC_FILE))
         if drafted:
             try:
                 from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
@@ -1654,8 +1647,10 @@ class Machine:
         if self.st.derived_inputs:
             run("derivation", lambda: self._derive(rd))
         run("cited-input", lambda: record_cited_inputs(rd))      # records the hashes before a check reads a cited file
-        if self._cites_outside(rd):
-            return out          # Codex r1 P1-1: no later check opens a file the cited-input check refused
+        outside = self._cites_outside(rd)
+        if outside:             # Codex r1 P1-1: no later check opens a file the cited-input check refused
+            out.extend(x for x in outside if x not in out)       # r2 P1-2: never empty, so never a pass
+            return out
         if self.st.derived_inputs:
             # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the spike adapter
             # does not know them, so the harness runs them for it.
@@ -1667,23 +1662,34 @@ class Machine:
         else:
             signable = run("pre-sign", lambda: self.backend.pre_sign_problems(rd))
         run("geometry", lambda: self._geometry_problems(rd))
-        if signable:        # Codex r1 P1-2: the assessment builds the engine, after the pre-sign guards have passed
+        if signable and not self._config_refused(rd):
+            # Codex r1 P1-2, r2 P1-3: the assessment builds the engine, only after the pre-sign guards have passed
             run("evidence", lambda: self._evidence_assess(rd)[1]["spec_problems"])   # tb R2: heard one stage late
         return out
 
     @staticmethod
-    def _cites_outside(rd: str) -> bool:
-        """The spec cites a path that resolves outside the run directory (record_cited_inputs refuses it). Fail
-        closed: a spec whose citations cannot be listed counts as citing outside."""
+    def _config_refused(rd: str) -> bool:
+        """The signed engine configuration's guard (analysis_backend.signed_config_problems) refuses the draft, whatever
+        the backend: no engine is built from it. Fail closed."""
+        import yaml
+        try:
+            return bool(AB.signed_config_problems(yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}))
+        except Exception:  # noqa: BLE001
+            return True
+
+    @staticmethod
+    def _cites_outside(rd: str) -> list[str]:
+        """The spec's citations that resolve outside the run directory (record_cited_inputs refuses them), as problems.
+        Fail closed: when the citations cannot be listed, that is the problem."""
         import yaml
         import pipeline as P
         try:
             spec = yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}
             root = os.path.realpath(rd)
-            return any(not os.path.realpath(os.path.join(rd, r)).startswith(root + os.sep)
-                       for r in P.cited_paths(spec, rd))
-        except Exception:  # noqa: BLE001
-            return True
+            return [f"the spec cites {r}, outside the run directory: copy it into data/" for r in P.cited_paths(spec, rd)
+                    if not os.path.realpath(os.path.join(rd, r)).startswith(root + os.sep)]
+        except Exception as e:  # noqa: BLE001
+            return [f"the spec's cited paths could not be listed, so no check reads them: {type(e).__name__}: {e}"]
 
     def _evidence_assess(self, rd: str) -> tuple[dict, dict]:
         """The spec and the evidence stage's assessment of it (toolkit/spec/evidence_draft.py assess), with a dossier
@@ -2570,42 +2576,12 @@ ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
 STATUS_MARK = "<!-- harness: run status -->"
 
 
-DRAFT_FILES = ("decision_spec.yaml", "analysis_settings.yaml", "data/derivations.yaml", "data/README.md")
-DRAFT_DIRS = ("data/derive",)
-
-
-def _draft_sig(run_dir: str) -> str | None:
-    """sha256 over the spec draft's own files (the spec, its settings, the derivation declaration, scripts and note),
-    None when there is none: whether a SPEC try wrote or repaired any of them. A link is hashed by its target text,
-    never followed."""
-    import hashlib
-    rels = [r for r in DRAFT_FILES if os.path.lexists(os.path.join(run_dir, r))]
-    for d in DRAFT_DIRS:
-        top = os.path.join(run_dir, d)
-        if os.path.isdir(top) and not os.path.islink(top):
-            for base, dirs, files in os.walk(top):
-                dirs[:] = sorted(x for x in dirs if not os.path.islink(os.path.join(base, x)))
-                rels += [os.path.relpath(os.path.join(base, f), run_dir).replace(os.sep, "/") for f in files]
-    if not rels:
-        return None
-    h = hashlib.sha256()
-    for r in sorted(rels):
-        p = os.path.join(run_dir, r)
-        h.update(r.encode() + b"\0")
-        try:
-            h.update(b"L" + os.readlink(p).encode() if os.path.islink(p) else open(p, "rb").read())
-        except OSError as e:
-            h.update(f"unreadable {type(e).__name__}".encode())
-        h.update(b"\0")
-    return h.hexdigest()
-
-
 CARRIED = "from an earlier try, still unresolved: "
 
 
 def _carry_feedback(errs: list, earlier: list | None, cap: int = 40) -> list:
-    """The SPEC feedback for the next try: this try's problems, then the earlier try's when this try produced no
-    draft to check (baseline hb1: a try lost to the turn cap replaced the validation errors with "max turns", so
+    """The SPEC feedback for the next try: this try's problems, then the earlier try's when there is no draft on
+    disk to check (baseline hb1: a try lost to the turn cap replaced the validation errors with "max turns", so
     the next try repeated them). Earlier items are marked once and never repeated."""
     out = list(errs)
     seen = {x[len(CARRIED):] if x.startswith(CARRIED) else x for x in out}

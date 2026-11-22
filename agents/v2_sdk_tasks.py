@@ -685,7 +685,8 @@ class SdkTasks:
     def world_model_seed(self, run_dir, ctx, feedback, cap_usd):
         """The stage machine's PREREGISTER seed (docs/design/v2c-orchestration.md §14): one session in `run_dir`
         (the run's world_model/seed/), capped at `cap_usd`, through the same adapter the trials use."""
-        t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir)
+        t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir,
+                     max_turns=self.turns if self.turns_explicit else None)     # a caller's cap holds (Codex r2 P1-6)
         t.set_allowance(cap_usd)
         return t.seed_world_model(ctx, feedback)
 
