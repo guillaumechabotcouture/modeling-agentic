@@ -121,4 +121,4 @@ acceptance:            # owner, 14 Nov (ACCEPTANCE_RULE), unchanged by the 20 No
   must_meet: []
 edge_checks:           # owner, 19 Nov: a chosen pbo_adv_decay near its ceiling, with LLINEUP's targets at that point
   - {param: pbo_adv_decay, side: hi, within: 0.02, targets: [B9d, B9e, B9f],
-     basis: "99% interval of LLINEUP's waning minus the engine's own waning at x = 0.30 (owner, 2026-11-19, option (a))"}
+     basis: "99% interval of LLINEUP's waning (as-treated, 6 -> 18 m) minus the engine's own waning at x = 0.30 (owner, 2026-11-19, option (a))"}

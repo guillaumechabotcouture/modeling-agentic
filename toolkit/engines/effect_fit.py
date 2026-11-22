@@ -501,9 +501,12 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
     targets, monitor = list(decl["targets"]), list(decl.get("monitor") or [])
     ids = targets + monitor
     tdig = target_digests(decl, pack)
-    ev_scope = getattr(evaluator, "scope", None)
-    if isinstance(ev_scope, dict) and "seeds" in ev_scope and list(ev_scope["seeds"]) != seeds:
-        raise ValueError(f"the evaluator runs seeds {ev_scope['seeds']}, the pack declares {seeds}")
+    # an evaluator's live state (runner seeds, pack, base and stored fitted values) joins the cache scope, read
+    # before any cached row is used; its seeds and pack must be this fit's
+    ev_scope = evaluator.scope() if callable(getattr(evaluator, "scope", None)) else None
+    if isinstance(ev_scope, dict) and (list(ev_scope.get("seeds", seeds)) != seeds
+                                       or ev_scope.get("pack", _sha(pack)) != _sha(pack)):
+        raise ValueError("the evaluator runs other seeds or another pack than this fit's")
     scope = _sha({"targets": tdig, "engine": engine_identity, "seeds": seeds, "evaluator": ev_scope})
     cache = cache if cache is not None else Cache()
     pts, support = design_points(decl)
@@ -529,7 +532,8 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
         if bad_t or j["controls_off"]:
             failures.append({"kind": "verification", "point": j["point"], "chosen": j is chosen, "targets": bad_t,
                              "controls_off": j["controls_off"]})
-    clamped = sorted({s for r in rows for s, c in (r.get("controls") or {}).items() if c.get("at_grid_edge")})
+    clamped = sorted({s for r in rows for s, c in (r.get("controls") or {}).items()
+                      if c.get("at_grid_edge") is not False})       # a missing clamp result is not a pass
     if clamped:
         failures.append({"kind": "calibration_grid_edge", "settings": clamped,
                          "reason": "a design point's calibration clamps at its grid edge"})
@@ -597,22 +601,23 @@ def runner_evaluator(runner):
     setting whose package is the rule's arm_package) against its target."""
     pack = runner.pack
     byid = {b["id"]: b for b in pack["benchmarks"]}
-    scope = {"seeds": list(runner.seeds), "base_params": dict(getattr(runner, "base_params", {}) or {}),
-             "pack": _sha(pack)}
+    state = lambda: {"seeds": list(runner.seeds), "pack": _sha(runner.pack), "fitted": runner.fitted_for({}),  # noqa
+                     "base_params": dict(getattr(runner, "base_params", {}) or {})}
+    built = state()
+    runner.cache = {}                       # no arm row computed before this adapter (another state) is reused
 
     def ev(theta: dict, ids: list) -> dict:
-        now = {"seeds": list(runner.seeds), "base_params": dict(getattr(runner, "base_params", {}) or {}),
-               "pack": _sha(runner.pack)}
-        if now != scope or scope["seeds"] != list(pack["seeds"]):
-            raise ValueError("the runner's seeds, base parameters or pack are not those the evaluator was built on, "
-                             "or its seeds are not the pack's")
+        if state() != built:
+            raise ValueError("the runner's seeds, pack, base or stored fitted values changed since the evaluator "
+                             "was built")
         full = runner.fitted_for(theta)     # the values every run of this point uses, stored fitted values included
         arms = sorted({a for t in ids for a in BM._arms_of(byid[t]["estimand"])})
         cal = sorted({pack["arms"][a]["setting"] for a in arms} & {s for s, v in pack["settings"].items()
                                                                    if v.get("calibrate")})
         runner.calibrate_settings(full, cal)
         key = tuple(sorted(full.items()))   # arm rows of this point run under an earlier calibration are not reused
-        runner.cache = {k: v for k, v in runner.cache.items() if k[1] != key}
+        runner.cache = {k: v for k, v in runner.cache.items()
+                        if k[1] != key and not (isinstance(k[1], tuple) and k[1] and k[1][0] == key)}
         prev, runner.full_precision = getattr(runner, "full_precision", False), True
         try:
             per = {t: runner.evaluate(byid[t], theta).get("per_seed_full") for t in ids}
@@ -629,10 +634,12 @@ def runner_evaluator(runner):
             if ctrl:
                 res = runner.arm_results([ctrl[0]], full)[ctrl[0]]
                 got = float(np.mean([BM.get(r, c["value_path"]) for r in res]))
-            controls[s] = {"target": c["target"], "achieved": got,
-                           "at_grid_edge": bool(runner.calibrated.get(s, {}).get("at_grid_edge"))}
+            cv, g = runner.calibrated.get(s, {}), [float(x) for x in c.get("grid") or []]
+            v = cv.get("value")      # the calibrated value at or past a grid end is a clamp, whatever the flag says
+            edge = bool(cv.get("at_grid_edge")) or not _num(v) or (bool(g) and not min(g) < v < max(g))
+            controls[s] = {"target": c["target"], "achieved": got, "at_grid_edge": edge}
         return {"per_seed": {t: list(v) for t, v in per.items()}, "controls": controls}
-    ev.scope = scope
+    ev.scope = state
     return ev
 
 
@@ -828,16 +835,17 @@ def _self_test() -> int:
     class FakeRunner:
         def __init__(self):
             self.calibrated, self.log, self.seeds, self.base_params = {}, [], [1, 2, 3, 4], {"b": 1}
+            self.cal_value = 1.0
             self.cache, self.full_precision = {("ctl", (("background", 2.0), ("eff", 1.0), ("wane", 1.0))): "stale"}, False
             self.pack = dict(_toy_pack(), settings={"site": {"calibrate": {"target": 0.4, "value_path": "windows.m6.prev",
-                                                                            "arm_package": {}}}})
+                                                                            "arm_package": {}, "grid": [0.5, 2.0]}}})
 
         def fitted_for(self, theta):
             return dict({"background": 2.0}, **theta)
 
         def calibrate_settings(self, theta, names):
             self.log.append(("cal", tuple(names), theta.get("background")))
-            self.calibrated = {n: {"at_grid_edge": False} for n in names}
+            self.calibrated = {n: {"at_grid_edge": False, "value": self.cal_value} for n in names}
 
         def evaluate(self, b, theta):
             assert self.full_precision and not self.cache, "unrounded values from fresh arm rows"
@@ -849,12 +857,22 @@ def _self_test() -> int:
     ev = runner_evaluator(fr)
     out = ev({"eff": 1.0, "wane": 1.0}, ["T6", "T18"])
     ok(fr.log == [("cal", ("site",), 2.0)] and out["controls"]["site"]["achieved"] == 0.4
-       and out["per_seed"]["T6"][0] == 0.50004 and not fr.full_precision and ev.scope["base_params"] == {"b": 1},
+       and out["per_seed"]["T6"][0] == 0.50004 and not fr.full_precision and ev.scope()["base_params"] == {"b": 1},
        f"EF_RUNNER: calibration and control at the full values, stale arm rows of the point dropped, unrounded values "
        f"only during the call, base parameters in the cache scope (Codex r1 on #329) ({out['controls']})")
     fr.seeds = [5, 6, 7, 8]
     ok(refused(lambda: ev({"eff": 1.0, "wane": 1.0}, ["T6"])), "EF_RUNNER: seeds changed after construction refused")
     ok(refused(lambda: fit(decl, pack, ev, {"name": "toy"})), "EF_RUNNER: an evaluator on other seeds is refused by fit")
+    fr = FakeRunner()
+    fr.cal_value = 2.0
+    ev = runner_evaluator(fr)
+    edge_ = ev({"eff": 1.0, "wane": 1.0}, ["T6"])["controls"]["site"]["at_grid_edge"]
+    fr.base_params["b"] = 2
+    ok(edge_ and refused(lambda: ev({"eff": 1.0, "wane": 0.5}, ["T6"])),
+       "EF_RUNNER: a calibration at its grid end is a clamp whatever the flag; changed base values refused (Codex r2)")
+    fr = FakeRunner()
+    ok(refused(lambda: fit(decl, _toy_pack(), runner_evaluator(fr), {"name": "toy"})),
+       "EF_RUNNER: an evaluator built on another pack is refused by fit (Codex r2)")
     clamp = lambda th, ids: dict(_toy_engine([])(th, ids), controls={"site": {"achieved": 0.4, "at_grid_edge":  # noqa
                                                                                th == design_points(decl)[0][3]}})
     r7 = fit(decl, pack, clamp, {"name": "toy"})

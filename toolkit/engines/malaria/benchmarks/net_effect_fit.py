@@ -2859,7 +2859,7 @@ def _self_test_declaration(ok, p: dict) -> None:
        and abs(EF.z_of(a["level"]) - Z95) < 1e-3
        and decl["history_matching"]["cutoff"] == -1.0       # the 20 Nov round's --margin-loo (FV4 checks its launch)
        and decl["edge_checks"] == [{"param": PAD_CEILING["param"], "side": "hi", "within": 0.02,   # edge_diagnostic
-                                    "targets": ["B9d", "B9e", "B9f"], "basis": decl["edge_checks"][0]["basis"]}]
+                                    "targets": ["B9d", "B9e", "B9f"], "basis": PAD_CEILING["basis"]}]
        and decl["edge_checks"][0]["param"] == PAD_CEILING["param"]
        and decl["parameters"][PAD_CEILING["param"]]["box"] == [PAD_CEILING["lo"], PAD_CEILING["hi"]],
        f"NE_DECL effect_fit.yaml states option A's targets, monitors, boxes, waves, seeds and acceptance {probs}")
