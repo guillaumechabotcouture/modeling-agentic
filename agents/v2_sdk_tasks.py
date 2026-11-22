@@ -700,6 +700,63 @@ class SdkTasks:
 SdkTasks.pick_engine = _no_session_when_sole(SdkTasks.pick_engine)
 
 
+def _self_test_validate_spec(ok) -> None:
+    """VS1-VS5 (baseline hb1, ranked fix 10): the spec draft had no way to learn whether its draft passed before its try
+    ended, so each problem cost a whole try (MAX_SPEC_TRIES is small). The harness hands it an in-process
+    validate_spec tool that runs the pre-sign checks the machine runs after the try; no shell."""
+    import tempfile
+    from types import SimpleNamespace as NS
+    calls = []
+
+    def check():
+        calls.append(1)
+        return ["missing section objective"] if len(calls) == 1 else []
+    with tempfile.TemporaryDirectory() as d:
+        seen = {}
+
+        async def probe(prompt=None, options=None):
+            pre = options.hooks["PreToolUse"][0].hooks[0]
+            out = await pre({"tool_name": VALIDATE_SPEC_TOOL, "tool_input": {}}, "v1", None)
+            seen.setdefault("deny", []).append((out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny")
+            seen.setdefault("servers", []).append(dict(options.mcp_servers or {}))
+            seen.setdefault("allowed", []).append(list(options.allowed_tools))
+            seen.setdefault("turns", []).append(options.max_turns)
+            yield NS(total_cost_usd=0.01, session_id="vs", is_error=False)
+        t = SdkTasks(d, query_fn=probe)
+        t.set_allowance(1.0)
+        t.set_spec_check(check)
+        t._session("draft_spec", "x", "y", OWNS["draft_spec"])
+        t._session("pick_engine", "x", "y", ())
+        t.set_spec_check(None)
+        t._session("draft_spec", "x", "y", OWNS["draft_spec"])
+        ok(seen["deny"] == [False, True, True] and VALIDATE_SPEC_TOOL in seen["allowed"][0]
+           and SPEC_TOOL_SERVER in seen["servers"][0] and not seen["servers"][1] and not seen["servers"][2]
+           and VALIDATE_SPEC_TOOL not in seen["allowed"][1],
+           f"VS1 the spec draft (and no other task, nor a draft with no check) gets the in-process validate_spec tool "
+           f"({seen['deny']}, {[list(s) for s in seen['servers']]})")
+        ok(seen["turns"][0] == SPEC_MAX_TURNS_VALIDATING > SPEC_MAX_TURNS and seen["turns"][2] == SPEC_MAX_TURNS,
+           f"VS4 a draft with the tool has a higher turn cap, for its checks ({seen['turns']})")
+
+        def text(r):
+            return " ".join(c.get("text", "") for c in r.get("content") or [])
+        tl = validate_spec_tool(check, limit=3)
+        r1 = asyncio.run(tl.handler({}))
+        r2 = asyncio.run(tl.handler({}))
+        ok("missing section objective" in text(r1) and "no problem" in text(r2).lower() and len(calls) == 2,
+           f"VS2 validate_spec returns the checks' problems, then that none was found ({text(r1)!r}, {text(r2)!r})")
+
+        def boom():
+            raise RuntimeError("check boom")
+        tb = validate_spec_tool(boom, limit=1)
+        rb, rl = asyncio.run(tb.handler({})), asyncio.run(tb.handler({}))
+        ok("check boom" in text(rb) and "could not run" in text(rb) and rb.get("is_error")
+           and "limit" in text(rl) and rl.get("is_error"),
+           f"VS3 a check that raises is reported as an error, never as a pass; past its limit the tool says so "
+           f"({text(rb)!r}, {text(rl)!r})")
+    ok("validate_spec" in PROMPTS["draft_spec"],
+       "VS5 the draft_spec prompt tells the drafter to check its draft with validate_spec before it finishes")
+
+
 def _self_test() -> int:
     """Charging without the API: fake query streams."""
     import tempfile
@@ -1075,6 +1132,10 @@ def _self_test() -> int:
                "SW3 the seed task writes only its own seed file; analysis/ stays the harness's")
     except Exception as e:  # noqa: BLE001 -- before the task exists this is the failure
         ok(False, f"SW1-SW3 seed task: {type(e).__name__}: {e}")
+    try:
+        _self_test_validate_spec(ok)
+    except Exception as e:  # noqa: BLE001 -- before the tool exists this is the failure
+        ok(False, f"VS1-VS5 validate_spec tool: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

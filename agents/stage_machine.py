@@ -4803,6 +4803,10 @@ def _self_test() -> int:
             _self_test_hb2_spec(ok, td, spike, new_run)
         except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
             ok(False, f"HS: {type(e).__name__}: {e}")
+        try:
+            _self_test_hb2_validate(ok, td, new_run)
+        except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
+            ok(False, f"VS6: {type(e).__name__}: {e}")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
@@ -6367,6 +6371,33 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     os.makedirs(hw)
     t5.world_model_seed(hw, {"question": "q"}, None, 1.0)
     ok(got == [5], f"HS13b the explicit turn cap holds for the world-model seed's own session ({got})")
+
+
+def _self_test_hb2_validate(ok, td: str, new_run) -> None:
+    """VS6 (baseline hb1, ranked fix 10): during a SPEC try the draft task holds a check that runs the machine's own
+    pre-sign checks on its current draft (the validate_spec tool), and it is withdrawn when the try ends."""
+    from v2_tasks import StubTasks
+    spike = AB.backend("spike")
+
+    class Checking(StubTasks):
+        def set_spec_check(self, fn):
+            self.check = fn
+
+        def draft_spec(self, q, rd, fb):
+            spec = dict(self.s["spec"])
+            spec.pop("objective", None)
+            r = StubTasks(dict(self.s, spec=spec)).draft_spec(q, rd, fb)
+            self.mid = self.check() if getattr(self, "check", None) else None
+            return r
+    d, T, st = new_run("vs6", {})
+    T = Checking(T.s)
+    m = Machine(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m.step()
+    fb = m.st.tries.get("spec_feedback") or []
+    ok(getattr(T, "mid", None) is not None and any("missing section objective" in x for x in T.mid)
+       and set(T.mid) <= set(fb) and getattr(T, "check", 1) is None,
+       f"VS6 the draft task's check runs the machine's own pre-sign checks on its draft, and is withdrawn after the "
+       f"try ({getattr(T, 'mid', None)}, {fb})")
 
 
 def main(argv=None) -> int:
