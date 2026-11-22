@@ -1037,8 +1037,10 @@ GLOSSARY = {   # term -> (definition, where it is defined). The page marks only 
     "defaults accepted": ("Engine defaults the spec accepts by name, each with a reason, for attributes the staged "
                           "inputs do not give.", "decision_spec.yaml decision_units.defaults_accepted"),
     "code fingerprint": ("A hash of what a stored engine batch depends on besides its parameters: the run's models/ "
-                         "and data/ files and the repo's scripts/ and toolkit/. Stored results are reused only under "
-                         "the same fingerprint.", "scripts/compute.py (code_fingerprint)"),
+                         "and data/ files, the engine identity, the dependency manifests and the repo's declared data "
+                         "files. Stored results are reused only under the same fingerprint, and only while every repo "
+                         "file the batch's jobs imported (recorded when they ran) is unchanged.",
+                         "scripts/compute.py (code_fingerprint, record_check)"),
 }
 GATE_ACTIONS = ("ACCEPT", "PATCH_OR_RETHINK", "DECLARE_SCOPE", "RETHINK_STRUCTURAL", "RUN_FAILED", "AWAIT_OWNER")
 
@@ -1896,7 +1898,7 @@ def projects(runs: list) -> list:
     for r in runs:
         twins = sorted(by_sha.get((r.get("state_sha"), r.get("spec_sha"))) or [], key=lambda x: x["label"])
         r["draft"] = None
-        if r.get("state") in ("SPEC", "SIGN") and not r.get("has_engine_choice"):
+        if r.get("state") in ("SPEC", "EVIDENCE", "SIGN") and not r.get("has_engine_choice"):
             r["draft"] = "never got past sign-off"
         elif r.get("state_sha") and len(twins) > 1 and twins[0] is not r:
             r["draft"] = f"a copy of {twins[0]['label']}"
@@ -1989,16 +1991,20 @@ def batch_reuse(run_dir: str) -> list:
             out.append({"out": rel, "fn": doc["fn"], "reused": False, "why": why})
             continue
         o = s[:-len(".summary.json")]
+        kp = doc.get("key_parts") if isinstance(doc.get("key_parts"), dict) else {}
         try:     # confined: no link followed under models/ or data/, nothing outside the run dir read (round 3)
+            rec = {}     # W0-A: a recorded engine identity (key_parts.extra) is compared when the batch runs
             fp = C.code_fingerprint(run_dir, doc["fn"], exclude=(o, o + ".tmp", o + ".summary.json",
                                                                  o + ".summary.json.tmp", o + C.PARTIAL_EXT,
-                                                                 o + C.JOB_EXT, o + ".log"), confined=True)
+                                                                 o + C.JOB_EXT, o + ".log"), confined=True,
+                                    record=rec, extra_digest=kp.get("extra"))
+            why, _ = C.record_check(doc, fp, run_dir, rec.get("key_parts"), confined=True)
         except ValueError as e:
             out.append({"out": rel, "fn": doc["fn"], "reused": False, "why": f"not checked: {e}"})
             continue
-        out.append({"out": rel, "fn": doc["fn"], "n": doc.get("n"), "reused": fp == doc["code_fp"],
-                    "why": "code fingerprint matches" if fp == doc["code_fp"] else
-                    "code fingerprint differs (model code, data or the repo's scripts/ or toolkit/ changed)"})
+        out.append({"out": rel, "fn": doc["fn"], "n": doc.get("n"), "reused": not why,
+                    "why": why or "key and observed closure match" + (
+                        "; the engine identity is checked when the batch runs" if kp.get("extra") else "")})
     return out
 
 
@@ -2707,10 +2713,13 @@ def _self_test() -> int:
         json.dump({"fn": "models/f.py::f", "code_fp": "0" * 16, "n": 3}, open(o2 + ".summary.json", "w"))
         o = os.path.join(rd, "models", "batch", "rows.jsonl")   # another call's results file is part of a
         open(o, "w").write("")                                   # fingerprint: written before it is taken
+        rec = {}
         fp = C.code_fingerprint(rd, "models/f.py::f", exclude=(o, o + ".tmp", o + ".summary.json",
                                                                o + ".summary.json.tmp", o + C.PARTIAL_EXT,
-                                                               o + C.JOB_EXT, o + ".log"))
-        json.dump({"fn": "models/f.py::f", "code_fp": fp, "n": 3}, open(o + ".summary.json", "w"))
+                                                               o + C.JOB_EXT, o + ".log"), record=rec)
+        obs = {"run:models/f.py": C._file_digest(os.path.join(rd, "models", "f.py"))}    # W0-A: observed closure
+        json.dump({"fn": "models/f.py::f", "code_fp": fp, "n": 3, "key_parts": {
+            **rec["key_parts"], "observed": obs, "observed_sets": [C._digest(obs)]}}, open(o + ".summary.json", "w"))
         b = build_on(rd, drafts)
         reuse = {x["out"]: x["reused"] for x in b["batches"]}
         ok(os.path.exists(os.path.join(b["draft_dir"], "decision_spec.yaml"))

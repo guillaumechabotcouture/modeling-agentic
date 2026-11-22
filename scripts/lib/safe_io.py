@@ -489,7 +489,9 @@ def open_append_nofollow(base: str, rel: str):
     dfd = dir_fd_nofollow(base, parts[:-1], create=True)
     try:
         try:
-            fd = _openat_create(dfd, parts[-1], os.O_WRONLY | os.O_APPEND)
+            # O_NONBLOCK: a FIFO planted at the name never blocks the open (no reader: ENXIO; a reader: refused
+            # below as not a plain file). It has no effect on a plain file and is cleared before the fd is used.
+            fd = _openat_create(dfd, parts[-1], os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK)
         except OSError as e:
             raise LinkRefused(f"{rel}: cannot be opened without following a link ({e.strerror})") from None
     finally:
@@ -498,6 +500,8 @@ def open_append_nofollow(base: str, rel: str):
     if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
         os.close(fd)
         raise LinkRefused(f"{rel}: not a plain file with one link")
+    import fcntl
+    fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
     return os.fdopen(fd, "a", encoding="utf-8")
 
 

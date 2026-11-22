@@ -7,6 +7,7 @@
 none). Callers: toolkit/spec/signoff.py sign, scripts/decision_brief.py sign, agents/stage_machine.py sign (with the
 signer), and toolkit/spec/schema.py validate, which the analysis calls before a run (signer None: the run's
 recorded sign-off decides). A check is registered by name in CHECKS: fn(run_dir, spec, signer) -> [str].
+`review_conditions` (W0-G, toolkit/spec/review_conditions.py): every row of review_conditions.yaml has a disposition.
 `net_effect_posterior` (f6-posterior-ranges): a declared uncertainty.net_effect_posterior loads through the run's own
 path (toolkit/analysis/uncertainty.py net_effect_sample) and the run's design box covers its columns' ranges; signing,
 the signed status that launch and resume read, and the analysis's validation all run it.
@@ -43,10 +44,11 @@ def _benchmark_eligibility(run_dir, spec, signer) -> list:
     m = importlib.util.spec_from_file_location("_ab_preconditions", path)
     AB = importlib.util.module_from_spec(m)
     m.loader.exec_module(AB)
-    mode = "proposed" if (signer is None and BC.signature(run_dir) == "proposed") or signer == "owner" else "signed"
+    mode = "proposed" if (signer is None and BC.signature(run_dir) == "proposed") or signer == "owner" else \
+        "provisional_lead" if signer == "lead" and run_dir and BC.lead_run(run_dir) else "signed"   # D2, lead runs only
     raw = dict(spec.raw, _run_dir=run_dir)
-    if signer is not None and signer != "owner":
-        raw.pop("engine_departures", None)          # a lead's signature makes no departure count
+    if signer is not None and mode == "signed":
+        raw.pop("engine_departures", None)          # no other signer makes a departure count
     rows = AB.eligible_engines(raw, departures=mode)
     if any(r.get("eligible") for r in rows):
         return out
@@ -61,6 +63,16 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     spec whose posterior the analysis refuses only at its start (f6-posterior-ranges)."""
     if "net_effect_posterior" not in (spec.raw.get("uncertainty") or {}):       # empty: refused by posterior_input
         return []
+    post = (spec.raw.get("uncertainty") or {}).get("net_effect_posterior")
+    # a non-owner signer is refused; None is a draft or execution check (signing passes its signer: Codex r2 of #291)
+    if isinstance(post, dict) and post.get("exception") is not None:
+        if signer not in (None, "owner"):
+            return [f"net_effect_posterior: an exception to the acceptance rule is the owner's to sign (signer "
+                    f"{signer!r})"]
+        from toolkit.engines import benchmark_coverage as BC
+        if signer is None and run_dir and BC.signature(run_dir) in ("unsigned", "provisional_lead"):   # execution: the record
+            return ["net_effect_posterior: an exception to the acceptance rule counts only under the owner's "
+                    "signature of this spec (the recorded sign-off is a lead's, or the spec changed since)"]
     if getattr(spec, "engine_pending", False):
         return ["net_effect_posterior: engine: auto is still pending; the posterior is bound to one engine's fit and "
                 "is checked once the engine is chosen"]
@@ -85,13 +97,15 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     # widens the design box, batch.design_box), but never past the column's hard bounds
     from toolkit.engines.malaria.benchmarks import net_effect_fit as NEF
     hb = NEF.hard_bounds(eng, list(ne["ranges"]))
+    from toolkit.spec import engine_parameters as PV
     for t in (spec.raw.get("analysis") or {}).get("decision_tests") or []:
-        if isinstance(t, dict) and t.get("type") == "parameter_value" and t.get("parameter") in hb:
-            lo, hi, what = hb[t["parameter"]]
-            bad = [v for v in t.get("values") or [] if not lo <= float(v) <= hi]
-            if bad:
-                out.append(f"net_effect_posterior: decision test {t.get('id')} sets {t['parameter']} to {bad}, outside "
-                           f"its hard bound [{lo}, {hi}] ({what})")
+        for n, vs in sorted(PV.test_settings(t, names=hb).items()):     # its own values and each companion's
+            if n in hb:
+                lo, hi, what = hb[n]
+                bad = [v for v in vs if not lo <= float(v) <= hi]
+                if bad:
+                    out.append(f"net_effect_posterior: decision test {t.get('id')} sets {n} to {bad}, outside its "
+                               f"hard bound [{lo}, {hi}] ({what})")
     return out
 
 
@@ -106,8 +120,9 @@ def register(name: str, fn, context: bool = False) -> None:
 
 
 def _load_builtin() -> None:
-    from toolkit.spec import evidence_dossier as ED
+    from toolkit.spec import evidence_dossier as ED, review_conditions as RC
     ED._register()
+    RC._register()          # W0-G: every review condition has a disposition before the spec is signed
 
 
 def problems(run_dir: str, spec_bytes: bytes | None, signer: str | None, spec=None, mode: str | None = None,
@@ -179,6 +194,10 @@ def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | 
     if an.get("evaluation") == "emulator" and name not in drawn and name not in eps:
         return False, (f"does not execute on the emulator path: {name} is neither drawn nor set by engine_parameters, "
                        "so it is not an emulator input"), list(t.get("values") or [])
+    from toolkit.spec import engine_parameters as PV
+    if PV.companions(t) or "with" in t:     # v2-dt-with (Codex r1-r2): a range test varies only its own parameter
+        return False, ("holds companion parameters (with): the dossier's range test varies only its own parameter, at "
+                       "the run's point values of the others"), list(t.get("values") or [])
     return True, "", list(t.get("values") or [])
 
 
@@ -259,6 +278,10 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
                        "the parameter or benchmark interaction carrying the departed engine effect")
     else:
         return False, f"is a {typ} test, which does not vary a component's effect"
+    from toolkit.spec import engine_parameters as PV
+    if PV.companions(t):        # v2-dt-with (Codex r1): the companions alone could change the benefit the run credits
+        return False, (f"holds companion parameters (with: {', '.join(sorted(PV.companions(t)))}): a test that carries "
+                       "a departure varies only the parameter carrying the effect")
     from toolkit.analysis import decision_tests as DT
     try:
         ev = DT.prerun_evidence(spec)
@@ -381,6 +404,17 @@ def _self_test_posterior(ok) -> None:
             NEF.UNIT_BOUNDS.pop("", None)
         ok(any("DTpa" in g and "hard bound" in g for g in got),
            f"PC16b a parameter_value test that sets a posterior column outside its hard bounds is refused: {got[:1]}")
+        # v2-dt-with: a companion value of a posterior column is checked against the same hard bounds
+        raw["analysis"]["decision_tests"][-1].update(parameter="eff_b", values=[0.2], **{"with": {"eff_a": 1.5}})
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        NEF.UNIT_BOUNDS[""] = (0.0, 1.0)
+        try:
+            got = problems(d, None, None)
+        finally:
+            NEF.UNIT_BOUNDS.pop("", None)
+        ok(any("DTpa" in g and "eff_a" in g and "hard bound" in g for g in got),
+           f"PC16c a parameter_value test whose `with` sets a posterior column outside its hard bounds is refused: "
+           f"{got[:1]}")
     rows_hi = rows
     with tempfile.TemporaryDirectory() as d:
         rows[:] = [{"eff_a": round(0.55 + 0.15 * x, 6), "eff_b": r["eff_b"]} for x, r in zip(u, rows_hi)]
@@ -590,6 +624,32 @@ def _self_test() -> int:
         finally:
             BC.OVERRIDES.pop("toolkit.engines.contract:ToyEngine", None)
     _self_test_declared_range(ok)
+    # Codex review of #291 (P1): a net-effect posterior exception is the owner's: any other signer is refused
+    from types import SimpleNamespace as _NS
+    sp = _NS(raw={"uncertainty": {"net_effect_posterior": {"path": "p.yaml", "sha256": "0" * 64, "exception": {
+        "failed_points": [{"point": {"a": 0.1}, "targets": ["T1"]}], "rule": "r", "evidence": "e", "reason": "x",
+        "draws": "keep"}}}}, engine_pending=True)
+    lead = _net_effect_posterior(None, sp, "lead")
+    owner = _net_effect_posterior(None, sp, "owner")
+    # at execution (signer None) the run's recorded sign-off decides, as for engine departures: a lead's record (or a
+    # spec changed since the owner signed) refuses the exception; no record yet (a draft) does not
+    from toolkit.engines import benchmark_coverage as _BC
+    orig_sig = _BC.signature
+    try:
+        _BC.signature = lambda run_dir, by=None: "unsigned"
+        run_lead = _net_effect_posterior("/somewhere", sp, None)
+        _BC.signature = lambda run_dir, by=None: "signed"
+        run_owner = _net_effect_posterior("/somewhere", sp, None)
+        _BC.signature = lambda run_dir, by=None: "provisional_lead"
+        run_prov = _net_effect_posterior("/somewhere", sp, None)
+    finally:
+        _BC.signature = orig_sig
+    ok(any("owner" in x and "exception" in x for x in run_lead) and not any("exception" in x for x in run_owner),
+       f"PC13 at execution, a run whose recorded sign-off is not the owner's refuses the exception ({run_lead[:1]})")
+    ok(any("owner" in x and "exception" in x for x in run_prov),
+       f"PC14 (D2) a lead's provisional signature credits departures, never a posterior exception ({run_prov[:1]})")
+    ok(any("owner" in x and "exception" in x for x in lead) and not any("exception" in x for x in owner),
+       f"PC12 a net-effect posterior exception signed by someone other than the owner is refused ({lead[:1]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
