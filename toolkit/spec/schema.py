@@ -1695,6 +1695,39 @@ def _self_test_joint_packages(ok):
            f"SPJ5 a malformed by_group deliverable is refused: {errs}")
 
 
+def _self_test_plan_rule(ok):
+    """SPEV (hb1 fix 11, J): deliverable.plan picks the plan the deliverable carries; absent is the point plan."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        raw = yaml.safe_load(open(toy_spec(d)))
+        ok(_validate_deliverable(Spec(raw, d)) == [] and "plan" not in raw["deliverable"],
+           "SPEV1 a spec without deliverable.plan validates as before (the point plan)")
+        good = []
+        for v in PLAN_RULES:
+            r = copy.deepcopy(raw)
+            r["deliverable"]["plan"] = v
+            good.append(_validate_deliverable(Spec(r, d)))
+        ok(good == [[] for _ in PLAN_RULES], f"SPEV2 each declared plan rule {PLAN_RULES} validates: {good}")
+        r = copy.deepcopy(raw)
+        r["deliverable"]["plan"] = "mean"
+        errs = _validate_deliverable(Spec(r, d))
+        ok(any("deliverable.plan" in e for e in errs), f"SPEV3 an unknown plan rule is refused: {errs}")
+        bad = {"no uncertainty source": lambda x: x["uncertainty"].update(sources=[]),
+               "affordability enforce": lambda x: x["uncertainty"].update(
+                   affordability={"enforce": True, "max_share_over_budget": 0.05}),
+               "by_group": lambda x: x["deliverable"].update(by_group={"columns": {"group": "g", "quantity": "q",
+                                                                                   "value": "v"}, "quantity": {}})}
+        miss = []
+        for k, mut in bad.items():
+            r = copy.deepcopy(raw)
+            r["deliverable"]["plan"] = "expected_value"
+            mut(r)
+            if not any("deliverable.plan" in e for e in _validate_deliverable(Spec(r, d))):
+                miss.append(k)
+        ok(not miss, f"SPEV4 expected_value is refused without an uncertainty source, with a reserve "
+                     f"(affordability enforce) and with a by-group table (not refused: {miss})")
+
+
 def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)) -> str:
     """A valid toy spec and units table in directory d (used by the analysis self-tests too). `bench`: a benchmark
     results file for the toy engine (its interaction benchmark T2 drives decision test DT1)."""
@@ -2272,6 +2305,10 @@ def _self_test() -> int:
         ok(False, f"DI spec checks: {type(e).__name__}: {e}")
     _self_test_engine_refs(ok)
     _self_test_joint_packages(ok)
+    try:
+        _self_test_plan_rule(ok)
+    except Exception as e:  # noqa: BLE001 -- before the rule exists (step α) this is the failure
+        ok(False, f"SPEV deliverable.plan checks: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -935,6 +935,7 @@ def _self_test() -> int:
     _self_test_stability_flagged(ok)
     _self_test_variants(ok, q)
     _self_test_voi(ok, q)
+    _self_test_plan_rule(ok, q)
     _self_test_unit_attr(ok, q)
     # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
     import tempfile as _tf
@@ -1329,6 +1330,62 @@ def _fixed_refusals(ok, d, r):
     rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
     e3 = errs(lambda x: None, [dict(rows[0], given="zz")] + rows[1:])
     ok(any("zz" in e for e in e3), f"PV-R12 the spec refuses a unit given an unknown package ({e3[:2]})")
+
+
+def _self_test_plan_rule(ok, q):
+    """EV-R (hb1 fix 11, J): deliverable.plan: expected_value delivers the plan with the best mean over the
+    uncertainty draws, per-unit means in the CSV and a fixed-plan mean claim; absent or `point`, nothing changes."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=12)
+        r = yaml.safe_load(open(p))
+        r["analysis"]["decision_tests"] = []
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        csvp = os.path.join(d, "allocation_optimized.csv")
+        unc = lambda: yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]  # noqa: E731
+        R0 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        csv0, unc0, rep0 = open(csvp).read(), unc(), open(os.path.join(d, "uncertainty_report.yaml")).read()
+        _resign(d, lambda x: x["deliverable"].update(plan="point"))
+        R1 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        ok(open(csvp).read() == csv0 and unc() == unc0 and R1["point"]["plan"] == R0["point"]["plan"]
+           and open(os.path.join(d, "uncertainty_report.yaml")).read() == rep0
+           and "plan_rule" not in R0["point"] and "plan_rule" not in R1["point"],
+           "EV-R1 deliverable.plan: point is the default: the plan, the CSV and both uncertainty files are unchanged")
+        _resign(d, lambda x: x["deliverable"].update(plan="expected_value"))
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"EV-R2 a run with deliverable.plan: expected_value completes ({type(e).__name__}: {str(e)[:200]})")
+            return
+        pr = R["point"].get("plan_rule") or {}
+        voi = yaml.safe_load(open(os.path.join(d, "analysis", "value_of_information.yaml")))["data"]
+        cand = {c["id"]: c["expected_value"] for c in voi["candidates"]["list"]}
+        ok(pr.get("rule") == "expected_value" and pr.get("draws") == 32 and pr.get("point_plan") == R0["point"]["plan"]
+           and cand["point"] >= max(cand.values()) - 1e-9 * max(1.0, abs(max(cand.values()))),
+           f"EV-R2 the delivered plan has the best mean over the draws of every candidate; the point-value plan is "
+           f"recorded beside it ({pr.get('rule')}, {cand.get('point')} vs {max(cand.values()) if cand else None})")
+        u = R["uncertainty"]["fixed_plan"]
+        pu = R["point"]["per_unit"]
+        sums = {o: sum((pu[i].get("averted_mean") or {}).get(o, float("nan")) for i in pu) for o in u}
+        ok(all(abs(sums[o] - u[o]["mean"]) <= 1e-9 * max(1.0, abs(u[o]["mean"])) for o in u),
+           f"EV-R3 the per-unit means add up to the fixed plan's mean over the draws ({sums} vs "
+           f"{ {o: u[o]['mean'] for o in u} })")
+        hl = r["deliverable"]["headline"]["outcome"]
+        rows = list(csv.DictReader(open(csvp)))
+        vc = r["deliverable"]["columns"]["value"]
+        ok(all(abs(float(x[vc]) - round((pu[x["unit"]].get("averted_mean") or {}).get(hl, float("nan")), 4)) < 1e-9 for x in rows)
+           and [x["package"] for x in rows] == [R["point"]["plan"][x["unit"]] for x in rows],
+           "EV-R4 the CSV carries the delivered plan and each unit's mean over the draws")
+        cs = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+        txt = open(os.path.join(d, "results.md")).read()
+        ok((cs.get("headline.mean") or {}).get("source_field") == f"data.fixed_plan.{R['_A'].primary}.mean"
+           and "plan_rule.units_differ" in cs and "[CLAIM:" not in txt and "expected" in txt.split("## ")[1],
+           f"EV-R5 a fixed-plan mean claim and the plan rule in the results' recommendation "
+           f"({sorted(k for k in cs if k.startswith(('headline', 'plan_rule')))})")
+        ok(contract.gate_findings(d) == [], f"EV-R6 the contract checks pass: {contract.gate_findings(d)}")
 
 
 def _self_test_posterior(ok, q):
