@@ -390,8 +390,9 @@ def _results_store():
     """This repo's scripts/results_store, imported as eval_paths and pipeline_id are (from the repo this file is in),
     not from cfg.tree or $PYTHONPATH: `collect` died with ModuleNotFoundError when neither held it (CI1-CI2)."""
     d = os.path.join(os.path.dirname(HERE), "scripts")
-    if d not in sys.path:
-        sys.path.insert(0, d)
+    while d in sys.path:            # first, even when $PYTHONPATH also names another checkout's scripts/ (Codex r1)
+        sys.path.remove(d)
+    sys.path.insert(0, d)
     import results_store
     return results_store
 
@@ -4107,7 +4108,7 @@ def _self_test_collect_no_shutdown(ok) -> None:
 
 
 def _self_test_collect_import(ok) -> None:
-    """CI1-CI2 (2026-11-21: `collect` died with ModuleNotFoundError: results_store unless PYTHONPATH=scripts):
+    """CI1-CI3 (2026-11-21: `collect` died with ModuleNotFoundError: results_store unless PYTHONPATH=scripts):
     collect and the other storage commands import results_store from this repo's scripts/, as eval_paths and
     pipeline_id are imported, whatever cfg.tree holds and wherever the command runs from. A fresh interpreter
     (no PYTHONPATH, cwd outside the repo, a config whose tree does not exist), so no earlier import hides it."""
@@ -4124,20 +4125,30 @@ def _self_test_collect_import(ok) -> None:
             "from unittest import mock\n"
             "got = {}\n"
             "def fake(cfg, store, *a, **k):\n"
-            "    got['store'] = store.__name__; got['has_list_blobs'] = hasattr(store, 'list_blobs')\n"
+            "    import os; got['file'] = os.path.realpath(store.__file__)\n"
             "    return {'exit_code': 0, 'duration_s': 1}\n"
             "with mock.patch.object(rc, 'is_running', lambda n, lister=None: True), "
             "mock.patch.object(rc, 'collect_from_storage', fake), mock.patch.object(rc, 'shutdown', lambda c: None):\n"
             f"    rc.main(['run_cluster.py', {path!r}, 'collect'])\n"
             "print('RESULT ' + json.dumps(got))\n")
-    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    p = subprocess.run([sys.executable, "-c", code], cwd=tmp, env=env, capture_output=True, text=True, timeout=120)
-    line = next((ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")), None)
-    got = json.loads(line[len("RESULT "):]) if line else {}
-    ok(p.returncode == 0 and "ModuleNotFoundError" not in p.stderr,
-       f"CI1 `collect` runs with no PYTHONPATH and a missing cfg.tree (rc={p.returncode}: {p.stderr[-300:]!r})")
-    ok(got == {"store": "results_store", "has_list_blobs": True},
-       f"CI2 `collect` hands collect_from_storage this repo's results_store ({got})")
+    mine = os.path.realpath(os.path.join(os.path.dirname(HERE), "scripts", "results_store.py"))
+    decoy = os.path.join(tmp, "old_checkout", "scripts")         # CI3 (Codex r1): another checkout on $PYTHONPATH
+    os.makedirs(decoy)
+    open(os.path.join(decoy, "results_store.py"), "w").write("def list_blobs(*a, **k):\n    return []\n")
+    for pp, cid in ((None, "CI1-CI2 no PYTHONPATH"),
+                    (os.pathsep.join([decoy, os.path.join(os.path.dirname(HERE), "scripts")]),
+                     "CI3 PYTHONPATH naming another checkout's scripts/ first")):
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        if pp:
+            env["PYTHONPATH"] = pp
+        p = subprocess.run([sys.executable, "-c", code], cwd=tmp, env=env, capture_output=True, text=True,
+                           timeout=120)
+        line = next((ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")), None)
+        got = json.loads(line[len("RESULT "):]) if line else {}
+        ok(p.returncode == 0 and "ModuleNotFoundError" not in p.stderr,
+           f"{cid}: `collect` runs with a missing cfg.tree (rc={p.returncode}: {p.stderr[-300:]!r})")
+        ok(got.get("file") == mine,
+           f"{cid}: `collect` hands collect_from_storage this repo's scripts/results_store.py ({got})")
 
 
 def _self_test_eval_configs(ok) -> None:
