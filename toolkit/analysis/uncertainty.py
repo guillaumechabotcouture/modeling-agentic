@@ -639,7 +639,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
     flagged = sorted((getattr(A, "flagged", None) or {}).values(), key=lambda f: str(f["unit"]))
     if flagged:        # calibration.joint.unmatched: flag: these units' values carry no calibrated match
         data["low_confidence_units"] = flagged
-    agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"])   # the signed level (Codex P1-11)
+    from toolkit.analysis.core import q as _q     # hb1 fix 11 (L): one estimator for this report and uncertainty.yaml
+    agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"], summary=_q)   # signed level (Codex P1-11)
     report = {"producer": PRODUCER, "produced_by": "harness", "n_draws": nd, "n_draws_requested": nd,
               "n_successful": nd - len(agg["errors"]), "n_failed": len(agg["errors"]), "seed": data["seed"],
               "interval_label": scope["label"], "interval": scope["interval"], "covers": scope["covers"],
