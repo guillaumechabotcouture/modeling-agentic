@@ -5562,9 +5562,16 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
             spec = dict(self.s["spec"])
             if kind in ("bad", "bad2"):
                 spec["decision_units"] = dict(spec["decision_units"], csv="missing_units_table.csv")
-            if kind == "bad2":
+            if kind in ("bad2", "noobj"):
                 spec.pop("objective", None)
-            r = StubTasks(dict(self.s, spec=spec)).draft_spec(q, rd, fb)
+            if kind == "outside":
+                spec["decision_units"] = dict(spec["decision_units"], csv="../outside_units.csv")
+            if kind == "settings_capped":       # repairs only the settings, then hits the cap
+                from v2_tasks import _yaml_dump
+                _yaml_dump(self.s["settings"], os.path.join(rd, "analysis_settings.yaml"), rd)
+                return self._r("draft_spec", False, note="max turns")
+            settings = dict(self.s["settings"], bogus_key=1) if kind == "bad_settings" else self.s["settings"]
+            r = StubTasks(dict(self.s, spec=spec, settings=settings)).draft_spec(q, rd, fb)
             return self._r("draft_spec", False, note="max turns") if kind == "capped_good" else r
 
     def go(name, tries, cls=None):
@@ -5615,12 +5622,68 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     ok(len(T.fbs) >= 2 and any("7 decision input" in x for x in T.fbs[1]) and m.st.tries.get("spec") >= 2,
        f"HS6 the evidence stage's spec problems come back from the SPEC try ({T.fbs[1:2]}, {m.st.state})")
 
-    # HS7: the drafter's prompt states the two rules that cost SPEC retries
+    # HS7: the drafter's prompt states the two rules that cost SPEC retries; a fitted parameter is never moved under
+    # calibration (Codex r1 P2-7: calibration accepts kind calibrated only)
     from v2_sdk_tasks import PROMPTS
     pr = PROMPTS["draft_spec"]
-    ok("no digits" in pr and "decision test" in pr and "engine_parameters" in pr and "calibrated" in pr,
+    ok("no digits" in pr and "decision test" in pr and "engine_parameters" in pr and "calibrated" in pr
+       and "a fitted one" in pr,
        "HS7 the draft_spec prompt says: no digits in a decision test's text; no engine_parameters value for a "
-       "calibrated or fitted parameter")
+       "calibrated or fitted parameter (a fitted one is left to the engine)")
+
+    class Calls(Machine):
+        """Records which reading checks ran."""
+        def _geometry_problems(self, rd=None):
+            self.ran = getattr(self, "ran", []) + ["geometry"]
+            return super()._geometry_problems(rd)
+
+        def _evidence_assess(self, rd):
+            self.ran = getattr(self, "ran", []) + ["evidence"]
+            return super()._evidence_assess(rd)
+    # HS8 (Codex r1 P1-1): a cited file outside the run is refused, and no check reads it
+    AB.write_toy_units(os.path.join(td, "outside_units.csv"), n=12)
+    m, T = go("hs8", ["outside"], Calls)
+    fb8 = m.st.tries.get("spec_feedback") or []
+    ok(any("outside the run directory" in x for x in fb8) and not getattr(m, "ran", []),
+       f"HS8 a cited file outside the run is refused and no later check reads it ({getattr(m, 'ran', [])}, {fb8})")
+    # HS9 (Codex r1 P1-2): the evidence assessment (it builds the engine) runs only on a spec the pre-sign checks pass
+    m, T = go("hs9", ["noobj"], Calls)
+    ok("evidence" not in getattr(m, "ran", []) and any("objective" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"HS9 a spec the pre-sign checks refuse is not given to the evidence assessment ({getattr(m, 'ran', [])})")
+
+    # HS10 (Codex r1 P1-3): interrupted after the task's journal entry completed, a resume reaches the same decision
+    class Crash(Exception):
+        pass
+
+    class CrashOnce(Machine):
+        def _task(self, *a, **k):
+            r = super()._task(*a, **k)
+            if not getattr(self, "crashed", False):
+                self.crashed = True
+                save_state(self.run_dir, self.st)
+                raise Crash()
+            return r
+    d10, T10, st10 = new_run("hs10", {})
+    T10 = Scripted(dict(T10.s, tries=["capped_good"]))
+    m = CrashOnce(d10, T10, st10, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    try:
+        m.step()
+    except Crash:
+        pass
+    m2 = Machine(d10, T10, load_state(d10), backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m2.step()
+    ok(m2.st.state == "EVIDENCE" and len(T10.fbs) == 1,
+       f"HS10 a resume after the completed task replays it and still checks the draft it wrote ({m2.st.state}, "
+       f"{m2.st.tries.get('spec_feedback')})")
+    # HS11 (Codex r1 P1-4): a capped try that repaired only the settings has its draft checked again
+    m, T = go("hs11", ["bad_settings", "settings_capped"])
+    ok(any("bogus_key" in x for x in T.fbs[1]) and m.st.state == "EVIDENCE",
+       f"HS11 a capped try that changed only the settings is checked, and goes on ({m.st.state}, "
+       f"{m.st.tries.get('spec_feedback')})")
+    # HS12 (Codex r1 P2-6): the cap on the feedback never drops this try's own problems
+    many = [f"problem {i}" for i in range(45)]
+    got12 = _carry_feedback(many, ["old one"])
+    ok(all(x in got12 for x in many), f"HS12 every current problem reaches the next try ({len(got12)})")
 
     from types import SimpleNamespace as NS
     from v2_sdk_tasks import SPEC_MAX_TURNS, SdkTasks
@@ -5639,6 +5702,12 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     t._session("pick_engine", "x", "y", ())
     ok(got == [SPEC_MAX_TURNS, 30] and SPEC_MAX_TURNS > 30,
        f"HS3 the spec draft has its own turn cap, above the 30 of the other tasks ({got})")
+    # HS13 (Codex r1 P1-5): an explicit cap is honoured by every task, the spec draft included
+    got.clear()
+    t5 = SdkTasks(hd, max_turns=5, query_fn=q)
+    t5.set_allowance(1.0)
+    t5._session("draft_spec", "x", "y", ())
+    ok(got == [5], f"HS13 a caller's explicit turn cap holds for the spec draft ({got})")
 
 
 def main(argv=None) -> int:
