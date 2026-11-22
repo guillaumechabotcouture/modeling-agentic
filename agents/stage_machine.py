@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -320,7 +321,8 @@ def harness_owned() -> tuple:
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, "spec_rethink_request.json", FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*",
-        "evidence_dossier.yaml", SIGNOFF_SHEET)    # v2 autonomy 1B-ii: the default dossier and the sign-off sheet
+        "evidence_dossier.yaml", SIGNOFF_SHEET,    # v2 autonomy 1B-ii: the default dossier and the sign-off sheet
+        AMENDMENT_RECORD)                          # lead-gaps β (Codex r1): toolkit/spec/amend.py's record
 
 
 def owned_path(root: str, rel: str, owned) -> bool:
@@ -1038,6 +1040,10 @@ def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None
 
 AWAITING_SPEC_AMENDMENT = "awaiting_spec_amendment"
 SPEC_RETHINK_REQUEST = "spec_rethink_request.json"
+# lead-gaps β: under --signoff lead a rethink of the signed spec with a valid patch becomes a child run (toolkit/spec/
+# amend.py), signed provisionally by the lead; the parent ends with this status and the run continues in the child.
+AMENDED_PROVISIONAL = "amended_provisional"
+AMENDMENT_RECORD = "amendment_record.json"           # toolkit/spec/amend.py RECORD
 
 
 def _spec_signed_sha(run_dir: str) -> str | None:
@@ -1076,7 +1082,7 @@ def spec_signed_once(run_dir: str) -> bool:
     return _spec_signed_sha(run_dir) is not None
 
 
-def rethink_request(run_dir: str, round_n: int) -> dict:
+def rethink_request(run_dir: str, round_n: int, signoff: str = "owner") -> dict:
     """spec_rethink_request.json: why the run asks for a spec amendment (the latest fix plan's rethink briefs, the
     open findings the spec owns, with their remedies) and the signed spec it would amend (its sha256)."""
     briefs = []
@@ -1096,8 +1102,11 @@ def rethink_request(run_dir: str, round_n: int) -> dict:
         prev = None
     if isinstance(prev, dict) and prev.get("round") == round_n:
         return prev                  # a resume returns the request it made (Codex review of #261 P1-2)
+    # lead-gaps β: the rethink's machine-readable amendment, under --signoff lead only (an owner keeps `amend --from-request
+    # --patch` for their own patch: amend refuses a request patch beside --patch; Codex r1)
+    patch = FX.spec_patch(plan) if signoff == "lead" else None
     doc = {"round": round_n, "requested_at": _now(), "signed_spec_sha256": _spec_signed_sha(run_dir),
-           "working_spec_sha256": signed_hash(run_dir), "briefs": briefs,
+           "working_spec_sha256": signed_hash(run_dir), "briefs": briefs, **({"patch": patch} if patch else {}),
            "findings": fs, "next": "amend decision_spec.yaml and relaunch with reuse (a new run dir from this one's "
                                     "spec and stored rows); this run does not redraft or re-sign its spec"}
     _write_json(run_dir, SPEC_RETHINK_REQUEST, doc)
@@ -1533,7 +1542,7 @@ class Machine:
             # F6 run 3 (gap 2): a rethink of a signed spec is the owner's amendment, never a redraft in this run (an
             # amended spec cannot be re-signed in a signed run dir): the request, then a pause; the owner amends and
             # relaunches with reuse
-            req = rethink_request(self.run_dir, self.st.round)
+            req = rethink_request(self.run_dir, self.st.round, self.st.signoff)
             sha = _spec_signed_sha(self.run_dir)
             ev = "present" if sha not in (None, "unreadable") else ("unreadable" if sha else "missing")
             if req.get("signing_evidence") != ev:        # a warning on the request, never a block (lead follow-up)
@@ -1542,6 +1551,10 @@ class Machine:
             if ev != "present":
                 self.log(f"[machine] WARNING: the spec's sign-off record is {ev}; the amendment pause holds, but the "
                          "relaunch must start from a signed spec")
+            if self.st.signoff == "lead" and ev == "present":
+                done = self._lead_amend(req)
+                if done:
+                    return done
             self.st.tries["spec_amendment"] = True     # honoured on resume, whatever a restored copy lost (#261 P1-2)
             self.st.paused, self.st.status = AWAITING_SPEC_AMENDMENT, None
             save_state(self.run_dir, self.st)
@@ -1593,6 +1606,100 @@ class Machine:
             self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
             return self._go("SPEC", "review conditions could not be prepared for signing")
         return self._go("EVIDENCE", "spec drafted and valid")
+
+    def _lead_amend(self, req: dict) -> str | None:
+        """lead-gaps β (S7 under --signoff lead only): the rethink's machine-readable patch is applied by toolkit/spec/
+        amend.py (--from-request) to a child run, the child's spec is signed by the lead, provisionally, and this run
+        ends `amended_provisional`; run_v2 continues in the child, whose report heads with the amendment. None (the
+        run pauses for the owner, as before) when there is no patch, it does not apply or validate, the amended spec
+        would not sign, the parent's signature no longer holds, no budget is left, this run already continues a
+        provisional amendment, or an earlier attempt was refused. The child's path is recorded before it is made, so
+        an interrupted handoff is finished on resume, never repeated (Codex r1)."""
+        from toolkit.spec import amend as AM, signoff as SO
+        la, why, rec = req.get("lead_amendment") or {}, None, None
+        child = la.get("child")
+        if la.get("status") == "refused":
+            return None                   # the first refusal stands, with its reason and any kept child
+        if la.get("status") in ("started", "signed_provisionally"):
+            # an interrupted handoff: finished when the child is signed by the lead, else refused (the owner decides)
+            if not (child and os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
+                    and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
+                why = "an interrupted amendment left no lead-signed child"
+            else:
+                try:
+                    rec = json.load(open(os.path.join(child, AMENDMENT_RECORD)))
+                except (OSError, ValueError) as e:
+                    why = f"the interrupted amendment's record cannot be read ({type(e).__name__})"
+        elif not isinstance(req.get("patch"), dict):
+            why = "the rethink wrote no machine-readable patch"
+        elif self._provisional_amendment():
+            why = "this run continues a provisional amendment; a second one waits for the owner"
+        elif not callable(getattr(self.tasks, "for_run_dir", None)):
+            why = "the run's tasks cannot continue in a child run"
+        elif self._signed_by() is None:
+            why = "the parent's sign-off no longer holds (a signed input changed since): the owner decides"
+        elif isinstance(self.st.budget_usd, (int, float)) and self.st.budget_usd - self.st.spent_usd <= 0:
+            why = "no budget is left for a child run"
+        else:
+            child = AM._next_child(self.run_dir)
+            _write_json(self.run_dir, SPEC_RETHINK_REQUEST, dict(req, lead_amendment={"at": _now(), "status": "started",
+                                                                                      "child": child}))
+            self.st.tries["spec_amendment"] = True
+            self.st.paused, self.st.status = AWAITING_SPEC_AMENDMENT, None     # amend amends a paused or finished run
+            save_state(self.run_dir, self.st)
+            try:
+                rec = AM.amend(self.run_dir, from_request=True, out=child, signoff="lead", log=lambda *a: None)
+                if not (rec.get("dry_sign") or {}).get("ok"):
+                    why = f"the amended spec would not sign: {(rec.get('dry_sign') or {}).get('error')}"
+                else:
+                    SO.sign(child, "lead", f"Provisional (--signoff lead): amendment {rec['id']} of "
+                            f"{self.run_dir}, made from its rethink request (round {req.get('round')}); the owner has "
+                            f"not reviewed it. Reason: {' '.join(str(rec.get('reason')).split())[:500]}",
+                            expect_sha256=rec["spec_sha256"], expect_sheet_sha256=rec["sheet_sha256"],
+                            expect_derivations_sha256=rec["derivations_sha256"])
+            except Exception as e:  # noqa: BLE001 -- AmendError (refused, no child) or a signing refusal: owner pause
+                why = f"{type(e).__name__}: {e}"
+        if why is None:
+            cst = load_state(child)
+            if not any(isinstance(h, dict) and h.get("provisional_amendment") for h in cst.history):
+                cst.paused = None
+                if isinstance(self.st.budget_usd, (int, float)):    # one cap: the child gets what is left (> 0)
+                    cst.budget_usd = round(self.st.budget_usd - self.st.spent_usd, 4)
+                cst.history.append({"at": _now(), "provisional_amendment": rec.get("id"), "by": "lead",
+                                    "parent_run": self.run_dir})
+                save_state(child, cst)
+        kept = child if child and os.path.isdir(child) else None
+        req = dict(req, lead_amendment={"at": _now(), "status": "refused" if why else "signed_provisionally",
+                                        **({"why": why[:2000]} if why else {"id": rec.get("id")}),
+                                        **({"child": kept} if kept else {})})
+        _write_json(self.run_dir, SPEC_RETHINK_REQUEST, req)
+        if why:
+            self.log(f"[machine] the lead does not amend the signed spec ({why[:300]}): the run waits for the owner")
+            return None
+        self.st.paused = None
+        to = self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
+                      AMENDED_PROVISIONAL, extra={"amended_to": child})
+        self._relink(child)
+        return to
+
+    def _provisional_amendment(self) -> bool:
+        """This run was made by a lead's provisional amendment: its amendment record not signed by the owner, or the
+        handoff event in its history (kept when the record is lost: Codex r1)."""
+        return (os.path.lexists(os.path.join(self.run_dir, AMENDMENT_RECORD)) and self._signed_by() != "owner") or \
+            any(isinstance(h, dict) and h.get("provisional_amendment") for h in self.st.history)
+
+    def _relink(self, child: str) -> None:
+        """The child's parent_run binds the parent's final run_state.json (amend recorded it while paused), so the
+        chain still links (scripts/harness_metrics.py chains)."""
+        try:
+            sha = hashlib.sha256(open(os.path.join(self.run_dir, STATE_FILE), "rb").read()).hexdigest()
+            for rel in ("metadata.json", AMENDMENT_RECORD):
+                doc = json.load(open(os.path.join(child, rel)))
+                if isinstance(doc.get("parent_run"), dict):
+                    doc["parent_run"]["run_state_sha256"] = sha
+                    _write_json(child, rel, doc)
+        except (OSError, ValueError, AttributeError) as e:     # the lineage link only: the run goes on
+            self.log(f"[machine] the child's parent link was not refreshed: {type(e).__name__}")
 
     def _derive(self, rd: str | None = None) -> list[str]:
         """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
@@ -2435,6 +2542,49 @@ def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:
     return top, sec
 
 
+def amendment_lines(run_dir: str) -> list[str]:
+    """lead-gaps β: a run made by an amendment its owner has not signed (the lead's, provisional) heads its report with
+    the amendment: its id, reason and changes, from toolkit/spec/amend.py's record. Nothing once the owner signs. The
+    S7 handoff event in run_state.json keeps the heading when the record is lost (Codex r1) and selects the wording."""
+    p = os.path.join(run_dir, AMENDMENT_RECORD)
+    try:
+        st = load_state(run_dir)
+    except (OSError, ValueError):
+        st = None
+    s7 = next((h for h in (st.history if st else []) if isinstance(h, dict) and h.get("provisional_amendment")), None)
+    if not os.path.lexists(p) and s7 is None:
+        return []
+    try:
+        from toolkit.spec import signoff as SO
+        so = SO._spec_record(run_dir) if SO.status(run_dir) == "signed" else None
+        by = (so or {}).get("signed_by") or (so or {}).get("by")
+    except Exception:  # noqa: BLE001 -- unknown signer: listed as provisional
+        by = None
+    if by == "owner":
+        return []
+    try:
+        rec = json.load(open(p))
+        ch = "; ".join(f"{c.get('op')} `{c.get('path')}`" + ("" if c.get("op") == "remove" else
+                                                             f" to {json.dumps(c.get('after'), default=str)[:160]}")
+                       for c in rec.get("changes") or [] if isinstance(c, dict))
+        parent = (rec.get("parent_run") or {}).get("run_dir")
+    except (OSError, ValueError, AttributeError, TypeError) as e:
+        return [f"**Provisional amendment of the signed spec ({(s7 or {}).get('provisional_amendment') or 'unnamed'}): "
+                f"its record could not be read ({type(e).__name__}); the owner has not reviewed it.**\n\n"]
+    if s7 is not None:
+        how = "which the lead made from that run's rethink request and signed provisionally"
+        cmd = (f"the owner confirms it by amending the parent with the same patch and signing that child "
+               f"(`python3 -m toolkit.spec.amend {shlex.quote(str(parent))} --from-request --signoff owner`), or "
+               "overturns it by amending the parent differently or not at all")
+    else:          # a manual amendment (amend --patch) the lead signed
+        how = "made with toolkit/spec/amend.py and not signed by the owner"
+        cmd = "the owner confirms it by amending the parent with the same patch file and signing that child"
+    return [f"**Provisional amendment of the signed spec.** This run continues `{parent}` under amendment "
+            f"`{rec.get('id')}`, {how} (signed by {by or 'nobody yet'}); the owner has not reviewed it. Reason: "
+            f"{' '.join(str(rec.get('reason')).split())[:500]} Changes: {ch or 'none recorded'}. {cmd[0].upper() + cmd[1:]}."
+            "\n\n"]
+
+
 def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     """report.md = the run status line, the writer's draft, and the blocks the harness renders from
     artifacts: the headline numbers, the declared limits and open findings (in full, with their
@@ -2518,7 +2668,8 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         lines += ["", f"## World model\n\nThe world-model section could not be read: {type(e).__name__}."]
     top, prov = provisional_lines(run_dir)
     lines += prov
-    head, body = _status_line(run_dir, status) + "".join(top), draft.rstrip() + "\n"
+    head = _status_line(run_dir, status) + "".join(amendment_lines(run_dir)) + "".join(top)
+    body = draft.rstrip() + "\n"
     from toolkit.spec import review_conditions as RCN       # W0-G: conditions the lead deferred, at the top
     rcl = RCN.report_lines(run_dir)
     if rcl:
@@ -2645,7 +2796,71 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     _record_invocation(run_dir, budget_usd, st.budget_usd)
     m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
     m.reopen_interrupted_analysis()
-    return m.run()
+    status = m.run()
+    child = handoff_child(run_dir)
+    if child is None:
+        return status
+    # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher)
+    try:
+        from lib import pipeline_id
+        meta = json.load(open(os.path.join(run_dir, "metadata.json")))
+        pipeline_id.stamp(child, {k: meta.get(k) for k in ("pipeline", "commit", "launcher")})
+    except Exception as e:  # noqa: BLE001 -- the identity stamp only; the child records its own invocation below
+        log(f"[machine] the child run's identity was not stamped: {type(e).__name__}: {e}")
+    cst = load_state(child)
+    log(f"[machine] continuing in {child} (provisional amendment)")
+    return run_v2(cst.question, child, tasks.for_run_dir(child), max_rounds=cst.max_rounds, signoff="lead",
+                  budget_usd=cst.budget_usd, log=log, derive_unsandboxed=derive_unsandboxed, backend=backend,
+                  cross_engine_check=cross_engine_check)
+
+
+def _child_of(run_dir: str, recorded) -> str | None:
+    """The child dir a parent recorded, resolved beside the parent as it is now (a restored copy moves both: Codex r1),
+    and only when the child's metadata names this parent (by directory name)."""
+    if not isinstance(recorded, str) or not recorded:
+        return None
+    here = os.path.join(os.path.dirname(os.path.abspath(run_dir)), os.path.basename(recorded.rstrip(os.sep)))
+    try:
+        pr = (json.load(open(os.path.join(here, "metadata.json"))) or {}).get("parent_run") or {}
+    except (OSError, ValueError, AttributeError):
+        return None
+    ok_ = os.path.basename(str(pr.get("run_dir") or "").rstrip(os.sep)) == os.path.basename(os.path.abspath(run_dir))
+    return here if ok_ else None
+
+
+def handoff_child(run_dir: str) -> str | None:
+    """The child run a provisional lead amendment handed this run to (`amended_provisional`), when it has a state."""
+    try:
+        st = load_state(run_dir)
+    except (OSError, ValueError):
+        return None
+    if st is None or st.status != AMENDED_PROVISIONAL:
+        return None
+    child = _child_of(run_dir, next((h.get("amended_to") for h in reversed(st.history)
+                                     if isinstance(h, dict) and h.get("amended_to")), None))
+    return child if child and os.path.isfile(os.path.join(child, STATE_FILE)) else None
+
+
+def handoff_chain(run_dir: str, limit: int = 8, kept: bool = False) -> list[str]:
+    """Every child run this run continued in, in order; with `kept`, also a child an amendment refused at signing
+    left for the owner (main.py stores each with the run: Codex r1)."""
+    out, cur = [], run_dir
+    while len(out) < limit:
+        nxt = handoff_child(cur)
+        if nxt is None and kept:
+            try:
+                la = json.load(open(os.path.join(cur, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+            except (OSError, ValueError, AttributeError):
+                la = {}
+            nxt = _child_of(cur, la.get("child"))
+            if nxt is not None and nxt not in out:
+                out.append(nxt)
+            break
+        if nxt is None or nxt in out:
+            break
+        out.append(nxt)
+        cur = nxt
+    return out
 
 
 # ------------------------------------------------------------------ self-test
@@ -2664,6 +2879,135 @@ def _t_owner_disposes(run_dir: str) -> None:
         if os.path.exists(os.path.join(run_dir, SIGNOFF_SHEET)):
             from toolkit.spec import signoff as SO
             SO.write_sheet(run_dir)
+
+
+def _t_lead_amend(ok, td: str) -> None:
+    """lead-gaps β self-tests: S7 (a rethink of a signed spec) under --signoff lead with the fix plan's patch becomes a
+    child run signed provisionally by the lead; under owner sign-off, or without a valid patch, the run pauses."""
+    import yaml
+    from v2_tasks import StubTasks
+    from toolkit.spec import amend as AM, schema, signoff as SO
+
+    def parent(name, mode, patch, spent=3.0):
+        d = os.path.join(os.path.realpath(td), name)
+        os.makedirs(d)
+        _write_json(d, "metadata.json", {"pipeline": "v2", "commit": "0" * 40, "launcher": "t"})
+        raw = yaml.safe_load(open(schema.toy_spec(d)))      # the toy's critique findings declared, as in amend's tests
+        raw["principle_departures"] = [{"principle": 2, "check": "headline_comparator", "reason": "toy"},
+                                       {"principle": 3, "check": "baseline_burden", "reason": "toy"}]
+        yaml.safe_dump(raw, open(os.path.join(d, AB.SPEC_FILE), "w"), sort_keys=False)
+        AM._pre_sign(d, False)
+        SO.write_sheet(d)
+        SO.sign(d, mode)
+        open(os.path.join(d, FL.LEDGER), "w").write("")
+        task = {"id": "T1", "findings": [], "action": "rethink", "owner_state": "SPEC", "brief": "raise the envelope"}
+        _write_json(d, "fix_plan_r2.json", {"round": 2, "plan": {"tasks": [dict(task, **({"patch": patch} if patch
+                                                                                     else {}))]}})
+        st = RunState(question="q", state="SPEC", round=2, max_rounds=3, signoff=mode, budget_usd=5.0, spent_usd=spent)
+        save_state(d, st)
+        return d, open(os.path.join(d, AB.SPEC_FILE), "rb").read()
+
+    good = {"id": "A1", "reason": "the envelope is the decision year's", "spec": [
+        {"set": "constraints.envelope_usd", "value": 9500}]}
+    d, spec0 = parent("lead_amend", "lead", good)
+    m = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
+    m.step()
+    st, child = load_state(d), handoff_child(d)
+    rq = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
+    cst = load_state(child) if child else None
+    ok(st.state == "FINAL" and st.status == AMENDED_PROVISIONAL and child == d + ".amend1" and rq.get("patch") == good
+       and (rq.get("lead_amendment") or {}).get("status") == "signed_provisionally"
+       and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == spec0 and not any(h.get("paused") for h in st.history),
+       f"T_LEAD_AMEND under --signoff lead the rethink's patch makes a child run and the parent ends "
+       f"amended_provisional, unchanged and never paused ({st.state}, {st.status}, {child}, {rq.get('lead_amendment')})")
+    ok(cst is not None and SO.status(child) == "signed" and (SO._spec_record(child) or {}).get("signed_by") == "lead"
+       and "Provisional" in (SO._spec_record(child) or {}).get("note", "") and cst.state == "SIGN" and not cst.paused
+       and cst.signoff == "lead" and cst.budget_usd == 2.0
+       and yaml.safe_load(open(os.path.join(child, AB.SPEC_FILE)))["constraints"]["envelope_usd"] == 9500
+       and Machine(child, StubTasks({}), log=lambda *a: None)._signed_by() == "lead",
+       f"T_LEAD_AMEND_CHILD the child's spec carries the patch, signed by the lead provisionally; it resumes at SIGN with "
+       f"what is left of the cap ({cst and (cst.state, cst.paused, cst.budget_usd)})")
+    meta_c = json.load(open(os.path.join(child, "metadata.json"))) if child else {}
+    ok((meta_c.get("parent_run") or {}).get("run_state_sha256")
+       == hashlib.sha256(open(os.path.join(d, STATE_FILE), "rb").read()).hexdigest() and handoff_chain(d) == [child],
+       "T_LEAD_AMEND_LINK the child's parent link binds the parent's final state; the chain lists the child")
+    al = amendment_lines(child) if child else []
+    rec_sha = hashlib.sha256(open(os.path.join(child, AB.SPEC_FILE), "rb").read()).hexdigest() if child else None
+    ok(al and "Provisional amendment" in al[0] and "`A1`" in al[0] and "constraints.envelope_usd" in al[0]
+       and "9500" in al[0] and amendment_lines(d) == [],
+       f"T_LEAD_AMEND_REPORT the child's report heads with the amendment, as provisional ({al[:1]})")
+    if child:            # run_v2 continues in the child (stopped here at FINAL to keep the test small)
+        cst.state, cst.status = "FINAL", "completed"
+        save_state(child, cst)
+        seen = []
+        s = run_v2("q", d, StubTasks({}), signoff="lead", log=seen.append, cross_engine_check=False)
+        inv = json.load(open(os.path.join(child, "metadata.json"))).get("invocations") or []
+        ok(s == "completed" and any("continuing in" in str(x) for x in seen) and inv and inv[-1].get("commit") == "0" * 40,
+           f"T_LEAD_AMEND_HANDOFF run_v2 continues in the child and returns its status, stamped with the parent's "
+           f"identity ({s}, {inv[-1:]})")
+        rec2 = AM.amend(d, from_request=True, signoff="owner", log=lambda *a: None)     # the owner's confirmation
+        SO.sign(rec2["child"], "owner", expect_sha256=rec2["spec_sha256"], expect_sheet_sha256=rec2["sheet_sha256"],
+                expect_derivations_sha256=rec2["derivations_sha256"])
+        ok("--from-request --signoff owner" in al[0] and amendment_lines(rec2["child"]) == []
+           and rec2["spec_sha256"] == rec_sha,
+           "T_LEAD_AMEND_OWNER the owner confirms by amending the parent with the same patch (the same spec) and "
+           "signing; an owner-signed amendment is not provisional")
+    for name, mode, patch, why in (("owner_amend", "owner", good, None),
+                                   ("lead_nopatch", "lead", None, "no machine-readable patch"),
+                                   ("lead_badpatch", "lead", {"id": "A2", "reason": "r", "spec": [
+                                       {"set": "constraints.no_such_leaf", "value": 1}]}, "not found")):
+        d, spec0 = parent(name, mode, patch)
+        m = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
+        s = m.run()
+        rq = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
+        la = rq.get("lead_amendment")
+        ok(s == "paused:awaiting_spec_amendment" and not os.path.lexists(d + ".amend1")
+           and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == spec0
+           and (la is None if why is None else (la.get("status") == "refused" and why in la.get("why", "")))
+           and (mode == "lead" or "patch" not in rq),
+           f"T_LEAD_AMEND_PAUSE {name}: the run pauses for the owner as before, nothing amended; an owner run's "
+           f"request carries no generated patch, so `amend --from-request --patch` stays the owner's ({s}, {la})")
+        if name == "lead_badpatch":
+            s2 = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
+            la2 = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment")
+            ok(s2 == s and la2 == la and handoff_chain(d, kept=True) == [],
+               "T_LEAD_AMEND_REPLAY a resume keeps the first refusal (its reason) and amends nothing")
+    # Codex r1: no budget left pauses (a zero cap is not an unlimited one)
+    d, _ = parent("lead_nobudget", "lead", good, spent=5.0)
+    s = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
+    la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+    ok(s == "paused:awaiting_spec_amendment" and "no budget" in la.get("why", "") and not os.path.lexists(d + ".amend1"),
+       f"T_LEAD_AMEND_BUDGET with no budget left the lead does not amend ({s}, {la})")
+    # Codex r1: an interruption after the child is signed is finished on resume, never repeated
+    d, _ = parent("lead_interrupt", "lead", good)
+    mi = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
+
+    def _boom(*a, **k):
+        raise KeyboardInterrupt("stopped")
+    mi._go = _boom
+    try:
+        mi.step()
+    except KeyboardInterrupt:
+        pass
+    Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).step()
+    sti = load_state(d)
+    ok(sti.status == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1" and not os.path.lexists(d + ".amend2"),
+       f"T_LEAD_AMEND_RESUME an interrupted handoff is finished with the same child ({sti.status})")
+    # Codex r1: a restored copy (parent and child moved together) resumes its own child; a lost record keeps the flag
+    import shutil as _sh
+    mv = os.path.join(os.path.realpath(td), "moved")
+    os.makedirs(mv)
+    _sh.copytree(d, os.path.join(mv, "lead_interrupt"))
+    _sh.copytree(d + ".amend1", os.path.join(mv, "lead_interrupt.amend1"))
+    ok(handoff_child(os.path.join(mv, "lead_interrupt")) == os.path.join(mv, "lead_interrupt.amend1"),
+       "T_LEAD_AMEND_MOVED a moved parent resolves its child beside it, not at the recorded absolute path")
+    lost = os.path.join(mv, "lead_interrupt.amend1")
+    os.remove(os.path.join(lost, AMENDMENT_RECORD))
+    al2 = amendment_lines(lost)
+    ok(al2 and "could not be read" in al2[0] and Machine(lost, StubTasks({}), log=lambda *a: None)._provisional_amendment()
+       and AMENDMENT_RECORD in harness_owned(),
+       f"T_LEAD_AMEND_LOST without its record the child still heads its report as provisional and refuses a second lead "
+       f"amendment; no deliverable may overwrite the record ({al2[:1]})")
 
 
 def _self_test() -> int:
@@ -2967,6 +3311,7 @@ def _self_test() -> int:
         rq6 = json.load(open(os.path.join(d, "spec_rethink_request.json")))
         ok(rq6.get("signing_evidence") == "missing" and "requested_at" in rq6,
            f"R3-2f the amendment request notes missing signing evidence ({rq6.get('signing_evidence')})")
+        _t_lead_amend(ok, td)
 
         # R3-1 (F6 run 3): a write-up finding is never a FIX_LOOP task; the writer gets it with the draft.
         wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}

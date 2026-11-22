@@ -106,6 +106,10 @@ class StubTasks:
     def set_allowance(self, usd, readback_usd=None):
         self.allowances.append(usd)
 
+    def for_run_dir(self, run_dir):
+        """The scripted tasks take the run dir on each call: the same object serves a child run (lead-gaps β)."""
+        return self
+
     def _r(self, name, ok=True, output=None, note=""):
         self.calls.append(name)
         if self._crashes.get(name, 0) > 0:
