@@ -1,0 +1,8 @@
+---
+phase: "v2"
+commit: "hb2-spec-feedback"
+---
+
+## Changelog
+
+**A SPEC try hears every problem, and a try lost to the turn cap no longer erases the feedback.** Baseline hb1: a SPEC retry happened in 9 of 10 runs. Four runs lost a try to the 30-turn cap, and `h_SPEC` then replaced `spec_feedback` with "draft_spec failed: max turns", so the next try never saw the validation error and repeated it (tb R1 ended run_failed at `MAX_SPEC_TRIES`). The checks also stopped at the first class that failed, and the evidence stage's spec problems came one stage later (tb R2). Now (`agents/stage_machine.py`): a try that returns no draft keeps the earlier try's problems, each marked once as "from an earlier try, still unresolved" (`_carry_feedback`), after its own note; a try cut off after writing its draft (the spec file changed during the call, `_file_sig`) has that draft checked like any other, and goes on if it validates; `Machine._spec_checks` runs every check class (derivations, cited inputs, derived inputs, pre-sign, geometry, and the evidence stage's spec problems through `_evidence_assess`, now shared with `h_EVIDENCE`) whatever the others found, and names a class that raises without dropping the others. `agents/v2_sdk_tasks.py`: the spec draft gets its own turn cap, `SPEC_MAX_TURNS` = 60 (`SdkTasks.turns_for`; other tasks keep 30; the dollar allowance still bounds the call), and the draft_spec prompt states the two rules that cost retries in hb1: no digits in a decision test's text, and no `engine_parameters` value for a calibrated or fitted parameter (also in the decision-spec skill's "What not to do"). Self-tests HS1-HS7 (all failed before the change).

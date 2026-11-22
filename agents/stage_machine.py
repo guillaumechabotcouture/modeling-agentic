@@ -1595,36 +1595,28 @@ class Machine:
         fb = self.st.tries.get("spec_feedback")
         # The key is fixed before the call and the try is counted only once the call returns, so an
         # interrupted draft resumes under the same key (charged once by _settle_interrupted).
+        before = _file_sig(os.path.join(rd, AB.SPEC_FILE))
         res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, rd, fb)
         self.st.tries["spec"] = n + 1
         if res is None:
             return self._budget_out("SPEC")
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
-        if res.ok:
+        # baseline hb1: a try cut off (the turn cap) after writing its draft still has that draft checked
+        drafted = res.ok or _file_sig(os.path.join(rd, AB.SPEC_FILE)) not in (None, before)
+        if drafted:
             try:
                 from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
                 if CF.ensure_default(rd):
                     self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
-                errs = self._derive(rd) if self.st.derived_inputs else []
-                errs = errs or record_cited_inputs(rd)       # before anything reads a cited file
-                if self.st.derived_inputs:
-                    # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the
-                    # spike adapter does not know them, so the harness runs them for it.
-                    if not errs and not hasattr(self.backend, "candidate_rows"):
-                        import pipeline as P
-                        errs = [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
-                            rd, self._spec(rd), required=True)]
-                    errs = errs or self.backend.pre_sign_problems(rd, derived=True)
-                    errs = errs or self._geometry_problems(rd)
-                    if not errs:
-                        self._write_sheet(rd)
-                else:
-                    errs = errs or self.backend.pre_sign_problems(rd)
-                    errs = errs or self._geometry_problems(rd)
+                errs = self._spec_checks(rd)
+                if not errs and self.st.derived_inputs:
+                    self._write_sheet(rd)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
+            if errs and not res.ok:
+                errs = [f"draft_spec failed: {res.note} (its draft was checked)"] + errs
         if errs:
-            self.st.tries["spec_feedback"] = errs
+            self.st.tries["spec_feedback"] = _carry_feedback(errs, fb if not drafted else None)
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
         if not self._review_conditions(self.st.signoff, defer=False):
@@ -1632,6 +1624,54 @@ class Machine:
             self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
             return self._go("SPEC", "review conditions could not be prepared for signing")
         return self._go("EVIDENCE", "spec drafted and valid")
+
+    def _spec_checks(self, rd: str) -> list[str]:
+        """Every pre-sign check class on the draft, each run whatever the others found, so one try hears every problem
+        (baseline hb1: the chain stopped at the first class that failed, and MAX_SPEC_TRIES is small). A class that
+        raises is named in the problems and the others still run. A spec that does not parse is the one problem."""
+        import yaml
+        try:
+            yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
+        except Exception as e:  # noqa: BLE001
+            return [f"spec unreadable: {type(e).__name__}: {e}"]
+        out: list[str] = []
+
+        def run(name, fn):
+            try:
+                got = list(fn() or [])
+            except Exception as e:  # noqa: BLE001 -- fail closed, and the other classes still run
+                got = [f"the {name} check could not run: {type(e).__name__}: {e}"]
+            out.extend(x for x in got if x not in out)
+        if self.st.derived_inputs:
+            run("derivation", lambda: self._derive(rd))
+        run("cited-input", lambda: record_cited_inputs(rd))      # records the hashes before a check reads a cited file
+        if self.st.derived_inputs:
+            # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the spike adapter
+            # does not know them, so the harness runs them for it.
+            if not hasattr(self.backend, "candidate_rows"):
+                import pipeline as P
+                run("derived-input", lambda: [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
+                    rd, self._spec(rd), required=True)])
+            run("pre-sign", lambda: self.backend.pre_sign_problems(rd, derived=True))
+        else:
+            run("pre-sign", lambda: self.backend.pre_sign_problems(rd))
+        run("geometry", lambda: self._geometry_problems(rd))
+        run("evidence", lambda: self._evidence_assess(rd)[1]["spec_problems"])   # tb R2: heard one stage late
+        return out
+
+    def _evidence_assess(self, rd: str) -> tuple[dict, dict]:
+        """The spec and the evidence stage's assessment of it (toolkit/spec/evidence_draft.py assess), with a dossier
+        path that the harness, the gate or a task writes added to its spec problems. SPEC and EVIDENCE share it."""
+        from toolkit.spec import evidence_draft as EDR
+        raw = EDR._spec(rd)
+        a = EDR.assess(rd, raw)
+        rel = a.get("rel")
+        if rel and not a.get("draftable") and owned_path(rd, os.path.normpath(rel).replace(os.sep, "/"), tuple(
+                p for p in harness_owned() if p not in ("data/*", EDR.ED.DOSSIER_FILE))):
+            a["spec_problems"] = a["spec_problems"] + [   # Codex r2 P1-5: a file the harness or a task writes
+                f"evidence.dossier {rel!r} is a file the harness, the gate or a task writes: name "
+                f"{EDR.ED.DOSSIER_FILE}"]
+        return raw, a
 
     def _derive(self, rd: str | None = None) -> list[str]:
         """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
@@ -1779,14 +1819,7 @@ class Machine:
             self.st.tries["spec_feedback"] = probs
             return self._go("SPEC", "evidence: " + "; ".join(probs)[:200])
         try:
-            raw = EDR._spec(rd)
-            a = EDR.assess(rd, raw)
-            rel = a.get("rel")
-            if rel and not a.get("draftable") and owned_path(rd, os.path.normpath(rel).replace(os.sep, "/"), tuple(
-                    p for p in harness_owned() if p not in ("data/*", EDR.ED.DOSSIER_FILE))):
-                a["spec_problems"] = a["spec_problems"] + [   # Codex r2 P1-5: a file the harness or a task writes
-                    f"evidence.dossier {rel!r} is a file the harness, the gate or a task writes: name "
-                    f"{EDR.ED.DOSSIER_FILE}"]
+            raw, a = self._evidence_assess(rd)
             if a["spec_problems"]:
                 return spec_back(a["spec_problems"])
             sc = EDR.scaffold(rd, a, raw)["scaffold"] if a["needed"] else {}
@@ -2509,6 +2542,32 @@ def _pre_engine_check(spec: dict) -> list[str]:
 
 ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
 STATUS_MARK = "<!-- harness: run status -->"
+
+
+def _file_sig(path: str):
+    """(mtime_ns, size) of a file, None when absent: whether a task wrote it during its call."""
+    try:
+        s = os.stat(path)
+        return (s.st_mtime_ns, s.st_size)
+    except OSError:
+        return None
+
+
+CARRIED = "from an earlier try, still unresolved: "
+
+
+def _carry_feedback(errs: list, earlier: list | None, cap: int = 40) -> list:
+    """The SPEC feedback for the next try: this try's problems, then the earlier try's when this try produced no
+    draft to check (baseline hb1: a try lost to the turn cap replaced the validation errors with "max turns", so
+    the next try repeated them). Earlier items are marked once and never repeated."""
+    out = list(errs)
+    seen = {x[len(CARRIED):] if x.startswith(CARRIED) else x for x in out}
+    for x in earlier or []:
+        core = x[len(CARRIED):] if x.startswith(CARRIED) else x
+        if core not in seen and not core.startswith("draft_spec failed:"):
+            seen.add(core)
+            out.append(CARRIED + core)
+    return out[:cap]
 
 
 def _status_line(run_dir: str, status: str | None) -> str:
@@ -5389,8 +5448,9 @@ def _self_test_evidence(ok, td: str) -> None:
     os.remove(os.path.join(d, AB.SPEC_FILE))
     m = Machine(d, StubTasks({"spec": raw}), init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False),
                 backend=toolkit, log=lambda *a: None, cross_engine_check=False)
-    until(m, n=4)
-    ok(m.st.state == "SPEC" and any("name the evidence dossier" in x for x in m.st.tries.get("spec_feedback") or [])
+    m.step()        # hb2 (HS6): the SPEC try itself hears it, before the evidence stage
+    ok(m.st.state == "SPEC" and m.st.tries.get("spec") == 1
+       and any("name the evidence dossier" in x for x in m.st.tries.get("spec_feedback") or [])
        and not os.path.exists(os.path.join(d, ED.DOSSIER_FILE)),
        f"T_EVIDENCE_NAME a spec that needs a dossier and names none is redrafted with the reason "
        f"({m.st.state}; {m.st.tries.get('spec_feedback')})")

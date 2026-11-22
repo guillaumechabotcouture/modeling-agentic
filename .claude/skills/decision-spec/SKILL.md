@@ -289,3 +289,9 @@ when that test changes the plan (toolkit/analysis/conflicts.py). Declare known m
   sign-off.
 - Do not mark a parameter `calibrated` that the engine card fixes or fits from its
   benchmark pack.
+- Do not put digits in a decision test's `text`: it says in words what the test asks
+  ("does the plan change if the effect is at the low end of its range?"). The values tested
+  and the results are rendered from computed claims, and a text with a number is refused.
+- Do not give a value in `engine_parameters` for a parameter the engine card lists as
+  `calibrated` or `fitted`: fitting sets it, and the entry is refused. Calibrate it under
+  `calibration`, or leave it to the engine.

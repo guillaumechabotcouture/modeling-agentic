@@ -23,6 +23,9 @@ from agents.fix_loop import FIX_PLANNER_PROMPT
 
 TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"]
 OUT = "_task_output.json"
+# baseline hb1: 4 of 10 runs lost a SPEC try to the 30-turn cap (the draft reads inputs, writes derivations and
+# iterates); the spec draft gets its own cap, still bounded by the call's dollar allowance.
+SPEC_MAX_TURNS = 60
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
@@ -76,7 +79,11 @@ parameter, never on a unit attribute bound to data. Note what each derivation do
 data/README.md. Every file the spec cites is a staged input or a derived output; paths are relative
 to the run directory. When the options use a component whose effect depends on decision inputs
 (each engine's decision_inputs.yaml), name the evidence dossier: `evidence: {{dossier:
-evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Output:
+evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Two
+rules the check refuses often: a decision test's `text` has no digits (it says in words what the
+test asks; the values tested are rendered from computed claims); and `engine_parameters` gives no
+value for a parameter the engine card lists as calibrated or fitted (calibrate it under
+`calibration`, or leave it to the engine). Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """
@@ -472,6 +479,10 @@ class SdkTasks:
         self.query_fn = query_fn
         self.n = 0
 
+    def turns_for(self, kind: str) -> int:
+        """The turn cap of one session: SPEC_MAX_TURNS for the spec draft (never below the default), else the default."""
+        return max(self.turns, SPEC_MAX_TURNS) if kind == "draft_spec" else self.turns
+
     def set_allowance(self, usd: float, readback_usd: float | None = None) -> None:
         """The call's dollar cap, and the cap of one crash read-back (0: none; the whole allowance
         is then charged when a crashed session's cost is unknown)."""
@@ -516,7 +527,7 @@ class SdkTasks:
 
         opts = ClaudeAgentOptions(system_prompt=system, model=model or enforcement.MODEL_DEEP, tools=TOOLS,
                                   allowed_tools=TOOLS, permission_mode="bypassPermissions", cwd=self.run_dir,
-                                  max_turns=self.turns, max_budget_usd=allowance, setting_sources=[],
+                                  max_turns=self.turns_for(kind), max_budget_usd=allowance, setting_sources=[],
                                   env=enforcement.filtered_env(dict(os.environ), self.cloud),
                                   hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[pre])]})
 
