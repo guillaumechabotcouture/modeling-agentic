@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -2135,9 +2136,28 @@ def _write_json(run_dir: str, rel: str, obj) -> None:
 
 
 def _rep_error(rep: dict) -> str:
-    errs = list(rep.get("errors") or []) + [f"{s.get('id')}: {s.get('error')}" for s in rep.get("steps") or []
-                                            if s.get("status") != "ok"]
+    errs = list(rep.get("errors") or []) + [f"{s.get('id')}: {_step_error(s.get('error'))}"
+                                            for s in rep.get("steps") or [] if s.get("status") != "ok"]
     return "; ".join(str(e) for e in errs)[:300]
+
+
+_TB_FRAME = re.compile(r'File "([^"]+)", line (\d+), in (\S+)')
+
+
+def _step_error(err) -> str:
+    """A failed step's error, short enough for the history line: a Python traceback (the step's log tail) becomes its
+    exception and the frame that raised it. Its first 300 characters were only the outer frames, so T16's CI
+    flakes recorded a reason that named no exception (T9b); any other error is kept as it is."""
+    text = str(err)
+    if "Traceback (most recent call last):" not in text:
+        return text
+    tb = text[text.rindex("Traceback (most recent call last):"):]
+    lines = [ln for ln in tb.splitlines() if ln.strip()]
+    frames = _TB_FRAME.findall(tb)
+    exc = next((ln.strip() for ln in reversed(lines) if not ln.startswith(" ") and not ln.startswith("Traceback")),
+               lines[-1].strip())
+    at = f" (at {os.path.basename(frames[-1][0])}:{frames[-1][1]} in {frames[-1][2]})" if frames else ""
+    return exc + at
 
 
 # Machine.reopen_interrupted_analysis's history line, per resumable cause.
@@ -2547,6 +2567,26 @@ def _self_test() -> int:
             if nxt not in EDGES["GATE"]:
                 ok(False, f"T9 {a} routes outside the state table")
     ok(True, "T9 every route is an edge of the state table")
+    # T9b (T16's CI flakes, 2026-11-20/21): a failed step's error is its log tail, a traceback whose first 300
+    # characters are only its outer frames; the reason a run ended must keep the exception and where it was raised.
+    root = "/home/runner/work/modeling-agentic/modeling-agentic"
+    tb = ("Traceback (most recent call last):\n"
+          f'  File "{root}/agents/analysis_backend.py", line 1556, in <module>\n    sys.exit(main())\n'
+          "             ~~~~^^\n"
+          f'  File "{root}/agents/analysis_backend.py", line 776, in main\n    A = _analyze(spec, out)\n'
+          f'  File "{root}/agents/analysis_backend.py", line 515, in _analyze\n'
+          "    return Analysis(spec, out, log=lambda *a: None).run()\n"
+          f'  File "{root}/spike/analysis/run.py", line 120, in solve\n'
+          "    raise RuntimeError(f\"optimizer status {r['status']}\")\n"
+          "RuntimeError: optimizer status feasible\n")
+    why = _rep_error({"ok": False, "steps": [{"id": "configure", "status": "ok"},
+                                             {"id": "analyze", "status": "failed", "error": tb}]})
+    ok("RuntimeError: optimizer status feasible" in why and "run.py:120 in solve" in why and len(why) <= 300,
+       f"T9b a failed step's reason keeps its exception and the frame that raised it: {why!r}")
+    why2 = _rep_error({"ok": False, "errors": ["upstream step not rebuilt: configure"],
+                       "steps": [{"id": "batch", "status": "failed", "error": "timed out after 8s at its backstop"}]})
+    ok(why2 == "upstream step not rebuilt: configure; batch: timed out after 8s at its backstop",
+       f"T9c an error that is not a traceback is kept as it was: {why2!r}")
 
     with tempfile.TemporaryDirectory() as td:
         def new_run(name, script, signoff="none", max_rounds=3, budget=None):
