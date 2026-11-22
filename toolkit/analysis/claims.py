@@ -52,7 +52,8 @@ def claim_spec(A, arts: dict, point: dict, uq: dict, stab: dict, dts: list, cal:
           _c("uq.draws", "count", arts["uncertainty"], "data.draws", "draws"),
           _c("uq.units_stable_90", "count", arts["uncertainty"], "data.units_same_package_in_90pct_of_draws", "units")]
     if point.get("plan_rule"):      # hb1 fix 11 (deliverable.plan: expected_value): the fixed plan's mean over the draws
-        cl += [_c(f"{'headline' if oc == o else 'averted.' + oc}.mean", "scalar", arts["uncertainty"],
+        ho = A.spec["deliverable"]["headline"]["outcome"]      # the signed headline outcome (Codex r1 P1-5)
+        cl += [_c(f"{'headline' if oc == ho else 'averted.' + oc}.mean", "scalar", arts["uncertainty"],
                   f"data.fixed_plan.{oc}.mean", oc, interval=uq["interval"]) for oc in A.outcomes]
         cl.append(_c("plan_rule.units_differ", "count", arts["point"], "data.plan_rule.n_units_differ", "units"))
     if (uq.get("affordability") or {}).get("draws"):     # F6 S1-1: the fixed plan's cost across the draws
@@ -360,12 +361,14 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None, a
             f"[CLAIM:headline.median]. Units with no package: [CLAIM:units.no_package]." if not point.get("plan_rule")
             else f"[CLAIM:cost.allocatable] (allocated at the point values: [CLAIM:cost.allocated]). It is the plan with "
             f"the best expected {o} averted over the [CLAIM:uq.draws] uncertainty draws, within the budget in every "
-            f"draw (deliverable.plan: expected_value). Over those draws it averts [CLAIM:headline.mean] {o} on "
-            f"average against the comparator ({s['comparator'].get('text', s.comparator)}); median "
-            f"[CLAIM:headline.median]; at the point values [CLAIM:headline.point]. The per-unit values in the "
-            f"allocation file are means over the same draws. [CLAIM:plan_rule.units_differ] units differ from the plan "
-            f"solved at the point values; stability, sensitivity and the decision tests below re-solve at the point "
-            f"values and compare with that plan. Units with no package: [CLAIM:units.no_package]."), ""]
+            f"draw and at the point costs (deliverable.plan: expected_value). Over those draws it averts "
+            f"[CLAIM:headline.mean] {s['deliverable']['headline']['outcome']} on average against the comparator "
+            f"({s['comparator'].get('text', s.comparator)}). Median {o} averted over the draws: "
+            f"[CLAIM:headline.median]; {o} averted at the point values: [CLAIM:headline.point]. The per-unit values in "
+            f"the allocation file are means over the same draws. [CLAIM:plan_rule.units_differ] units differ from the "
+            f"plan solved at the point values; stability, sensitivity and the decision tests below re-solve at the point "
+            f"values and compare with that plan, and the budget frontier is not drawn. Units with no package: "
+            f"[CLAIM:units.no_package]."), ""]
     sv = point.get("solver") or {}
     if sv.get("gap_rel") is not None:      # 1C-c (D3): what "optimal" was proven to
         L += [f"Solver: status {sv.get('status')}. The plan is proven optimal within a relative gap of "
@@ -422,7 +425,9 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None, a
     elif cal.get("method") == "posterior":
         d, idf = cal["diagnostics"], cal.get("identifiability") or {}
         L += [f"Posterior over {d['n_targets']} targets and {d['n_parameters']} parameters (declared priors, "
-              f"{d.get('observation')} observations, sampler {d.get('sampler')}); the plan uses the posterior mode.",
+              f"{d.get('observation')} observations, sampler {d.get('sampler')}); "
+              + ("the point values are the posterior mode, and the plan is solved over the posterior draws "
+                 "(deliverable.plan: expected_value)." if point.get("plan_rule") else "the plan uses the posterior mode."),
               "", "| Parameter | Class | Contraction |", "|---|---|---|"]
         for p in cal.get("names") or []:
             if not p.startswith("z:"):

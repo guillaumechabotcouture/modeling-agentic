@@ -60,25 +60,41 @@ def mean_plan(A, Bn, Cs, events, mask=None, budget=None, caps=(), cap_name="voi_
     return A.solve(tab(Bn[mask].mean(0)), tab(Cs[mask].mean(0)), budget=B, feas=f)
 
 
+def plan_caps(A) -> list:
+    """The budget rows the delivered plan was solved under beside the draws' (the point costs under expected_value);
+    the value-of-information step applies them to its `robust` solve and to every candidate (Codex r1 P1-1)."""
+    return list(getattr(A, "plan_caps", None) or [])
+
+
+def breaks_plan_caps(A, plan: dict) -> list[str]:
+    """The plan caps (plan_caps) a plan breaks, by name: a plan the delivered rule forbids is never chosen."""
+    return [c["name"] for c in plan_caps(A)
+            if sum(float(c["weights"][i][plan[i]]) for i in A.ids) > float(c["max"]) * (1 + 1e-9)]
+
+
 def expected_value_plan(A, rows, point_plan: dict, cost0, point_events=()) -> dict:
     """The plan with the best mean benefit over the uncertainty draws `rows` (UQ.evaluate_draws' rows), within the
     budget in every draw and at the point costs `cost0`, leaving out the packages a model correction bears on in a draw
-    or at the point values (`point_events`). Returns {"solution", "record"}; the record (point.plan_rule)
-    holds the point-value plan, the units where the two differ, both plans' mean benefit and each unit's mean outcome
-    averted under the delivered plan. Fails closed (ValueError) when no plan can be solved."""
+    or at the point values (`point_events`). Sets A.plan_caps (the point-cost row). Returns {"solution", "record"}; the
+    record (point.plan_rule) holds the point-value plan, the units where the two differ, both plans' mean benefit (the
+    point-value plan's is None, with the reason, when a model correction bears on it in a draw) and each unit's mean
+    outcome averted under the delivered plan. A correction on the comparator or a whole unit raises AnalysisBlocked
+    (the run publishes analysis/blocked.yaml); a failed solve raises ValueError."""
+    from toolkit.analysis.core import AnalysisBlocked
     if not rows:
         raise ValueError("deliverable.plan expected_value: no uncertainty draws to average over")
     Bn, Cs = tables(A, rows)
-    pc = [{"name": "point_values", "max": float(A.budget),
-           "weights": {i: {k: float(cost0[i][k]) for k in A.pk} for i in A.ids}}]
+    A.plan_caps = [{"name": "point_values", "max": float(A.budget),
+                    "weights": {i: {k: float(cost0[i][k]) for k in A.pk} for i in A.ids}}]
+    evs = [r["events"] for r in rows]
+    hard = [dict(e, draw=d) for d, ev in enumerate(evs) for e in ev if e.get("package") in ("*", A.comp)]
+    hard += [dict(e, draw="point") for e in point_events if e.get("package") in ("*", A.comp)]
+    if hard:
+        raise AnalysisBlocked("expected-value plan", hard)
     try:
-        sol = mean_plan(A, Bn, Cs, [r["events"] for r in rows], caps=pc, cap_name="draw",
-                        extra_events=point_events)
+        sol = mean_plan(A, Bn, Cs, evs, caps=plan_caps(A), cap_name="draw", extra_events=point_events)
     except (RuntimeError, ValueError) as e:
         raise ValueError(f"deliverable.plan expected_value: the plan over the draws could not be solved ({e})") from e
-    if sol is None:
-        raise ValueError("deliverable.plan expected_value: a model correction bears on the comparator or a whole unit "
-                         "in a draw, so no plan over the draws can be guarded")
     plan = dict(sol["choice"])
     at = {k: j for j, k in enumerate(A.pk)}
     ar = np.arange(len(A.ids))
@@ -86,15 +102,49 @@ def expected_value_plan(A, rows, point_plan: dict, cost0, point_events=()) -> di
     per_unit = {i: {o: float(np.mean([r["out"][i]["y"][A.comp][o] - r["out"][i]["y"][plan[i]][o] for r in rows]))
                     for o in A.outcomes} for i in A.ids}
     differ = [i for i in A.ids if plan[i] != point_plan[i]]
+    pp_hits = [d for d, ev in enumerate(evs) if A.plan_corrections(ev, point_plan)]
     rec = {"rule": "expected_value", "draws": len(rows), "point_plan": dict(point_plan),
            "units_differ": differ, "n_units_differ": len(differ),
-           "mean_benefit": mean_of(plan), "point_plan_mean_benefit": mean_of(point_plan),
+           "mean_benefit": mean_of(plan),
+           "point_plan_mean_benefit": None if pp_hits else mean_of(point_plan),
            "per_unit_mean": per_unit,
            "note": "The plan with the best mean benefit over the uncertainty draws, within the budget in every draw and "
                    "at the point values (deliverable.plan: expected_value). Per-unit values are means over the same "
                    "draws. Stability, sensitivity and the decision tests re-solve at the point values, so they compare "
-                   "with the point-value plan (point_plan)."}
+                   "with the point-value plan (point_plan); the budget frontier figure is not drawn."}
+    if pp_hits:
+        rec["point_plan_mean_benefit_not_computed"] = (f"model corrections bear on the point-value plan in {len(pp_hits)} "
+                                                       f"draws (e.g. draw {pp_hits[0]})")
     return {"solution": sol, "record": rec}
+
+
+def contract_findings(raw: dict, point, unc) -> list[str]:
+    """The completed run carries the plan rule its signed spec asks for, and its arithmetic (fail closed)."""
+    want = rule(raw)
+    if want not in RULES:
+        return [f"deliverable.plan {want!r} is not one of {RULES}"]
+    if not isinstance(point, dict):
+        return ["point.yaml is unreadable, so the plan rule cannot be checked"]
+    pr = point.get("plan_rule")
+    if want == "point":
+        return [] if pr is None else ["point.yaml records a plan rule the spec does not ask for"]
+    if not isinstance(pr, dict) or pr.get("rule") != "expected_value":
+        return ["the spec asks for deliverable.plan: expected_value and point.yaml records no expected-value plan "
+                "(a run by code that ignores the key?)"]
+    bad = []
+    hl = ((raw.get("deliverable") or {}).get("headline") or {}).get("outcome")
+    pu = point.get("per_unit") or {}
+    fp = ((unc or {}).get("fixed_plan") or {}).get(hl) if isinstance(unc, dict) else None
+    try:
+        tot = sum(float(v["averted_mean"][hl]) for v in pu.values())
+        mean = float(fp["mean"])
+        if not pu or abs(tot - mean) > 1e-6 * max(1.0, abs(mean)):
+            bad.append(f"the per-unit means of {hl} do not add up to the fixed plan's mean over the draws")
+    except (KeyError, TypeError, ValueError):
+        bad.append(f"point.yaml has no per-unit mean of {hl}, or uncertainty.yaml no fixed-plan mean")
+    if isinstance(unc, dict) and pr.get("draws") != unc.get("draws"):
+        bad.append("the expected-value plan was solved over a different number of draws than the uncertainty step's")
+    return bad
 
 
 # --------------------------------------------------------------------------- self-test
@@ -104,6 +154,9 @@ class _FakeA:
     def __init__(self, budget=1.0):
         self.ids, self.pk, self.comp, self.outcomes = ["u1", "u2"], {"none": [], "a": ["a"]}, "none", ["cases"]
         self.budget, self.feas, self.solves = budget, {"caps": [], "feasible": {u: {"none": True, "a": True} for u in self.ids}}, []
+
+    def plan_corrections(self, events, plan):
+        return [e for e in events if e["package"] in ("*", self.comp) or plan.get(e["unit"]) == e["package"]]
 
     def solve(self, ben, cost, budget=None, feas=None):
         import itertools
@@ -180,17 +233,51 @@ def _self_test() -> int:
     r4b = expected_value_plan(_FakeA(), rows, point, cost0, point_events=[{"unit": "u2", "package": "a"}])
     ok(r4b["solution"]["choice"]["u2"] == "none", f"PR6b a package a point-value correction bears on is left out "
                                                    f"({r4b['solution']['choice']})")
-    for ev, why in (([{"unit": "u1", "package": "none"}], "comparator"), ([], "no draws")):
+    from toolkit.analysis.core import AnalysisBlocked
+    for ev, pe, why in (([{"unit": "u1", "package": "none"}], (), "comparator in a draw"),
+                        ([{"unit": "u2", "package": "*"}], (), "whole unit in a draw"),
+                        ([], [{"unit": "u1", "package": "none"}], "comparator at the point values")):
         try:
-            expected_value_plan(_FakeA(), [] if why == "no draws" else [_row(1.0, 1.0, events=ev)], point, cost0)
-            ok(False, f"PR7 fails closed: {why}")
-        except ValueError as e:
-            ok("deliverable.plan expected_value" in str(e), f"PR7 fails closed: {why} ({e})")
+            expected_value_plan(_FakeA(), [_row(1.0, 1.0, events=ev)], point, cost0, point_events=pe)
+            ok(False, f"PR7 a correction on the comparator or a whole unit blocks the run: {why}")
+        except AnalysisBlocked as e:
+            ok(e.where == "expected-value plan" and len(e.hits) == 1,
+               f"PR7 a correction on the comparator or a whole unit blocks the run (analysis/blocked.yaml, Codex r1 "
+               f"P1-9): {why} ({e.hits})")
+    try:
+        expected_value_plan(_FakeA(), [], point, cost0)
+        ok(False, "PR7b no draws fails closed")
+    except ValueError as e:
+        ok("deliverable.plan expected_value" in str(e), f"PR7b no draws fails closed ({e})")
     try:
         expected_value_plan(_FakeA(budget=-1.0), rows, point, cost0)
         ok(False, "PR8 an unsolvable plan fails closed")
     except ValueError as e:
         ok("could not be solved" in str(e), f"PR8 an unsolvable plan fails closed ({e})")
+    # Codex r1 P1-6: a correction on the point-value plan in a draw: its mean is not published
+    r9 = expected_value_plan(_FakeA(), [_row(10.0, 8.0), _row(0.0, 8.0, events=[{"unit": "u1", "package": "a"}])],
+                             point, cost0)["record"]
+    ok(r9["point_plan_mean_benefit"] is None and "draw 1" in r9.get("point_plan_mean_benefit_not_computed", "")
+       and r9["mean_benefit"] == 8.0,
+       f"PR9 the point-value plan's mean is not published when a correction bears on it in a draw ({r9})")
+    # Codex r1 P1-1: the point-cost row is recorded for the value-of-information step's solve and candidates
+    A10 = _FakeA()
+    expected_value_plan(A10, rows, point, hi)
+    ok([c["name"] for c in plan_caps(A10)] == ["point_values"] and breaks_plan_caps(A10, {"u1": "none", "u2": "a"})
+       == ["point_values"] and breaks_plan_caps(A10, {"u1": "a", "u2": "none"}) == [] and plan_caps(_FakeA()) == [],
+       "PR10 the point-cost row is A.plan_caps; a plan over it is named, so the VOI step never chooses it")
+    # Codex r1 P1-10: the completion gate checks the plan rule the signed spec asks for
+    ev_raw = {"deliverable": {"plan": "expected_value", "headline": {"outcome": "cases"}}}
+    good_pt = {"plan_rule": {"rule": "expected_value", "draws": 2},
+               "per_unit": {"u1": {"averted_mean": {"cases": 0.0}}, "u2": {"averted_mean": {"cases": 8.0}}}}
+    unc = {"draws": 2, "fixed_plan": {"cases": {"mean": 8.0}}}
+    cases = {"good": (ev_raw, good_pt, unc, 0), "old runner": (ev_raw, {"per_unit": {}}, unc, 1),
+             "sum off": (ev_raw, dict(good_pt, per_unit={"u1": {"averted_mean": {"cases": 1.0}}}), unc, 1),
+             "draws off": (ev_raw, good_pt, dict(unc, draws=3), 1),
+             "point rule, no record": ({}, {"per_unit": {}}, unc, 0),
+             "point rule, a record": ({}, good_pt, unc, 1), "unreadable point": (ev_raw, None, unc, 1)}
+    got = {k: len(contract_findings(r_, p_, u_)) for k, (r_, p_, u_, _n) in cases.items()}
+    ok(got == {k: v[3] for k, v in cases.items()}, f"PR11 contract findings for the plan rule ({got})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

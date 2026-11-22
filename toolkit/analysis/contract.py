@@ -480,6 +480,7 @@ def _gate_findings(run_dir: str) -> list[dict]:
     if man.get("deliverable_kind") != "estimates":
         out += _boundary(run_dir, bd_doc, pt_doc)
         out += _value_of_information(run_dir, unc_doc, voi_doc)
+        out += _plan_rule(run_dir, pt_doc, unc_doc)
     out += _decision_tests(run_dir, man)
     out += _solver(man)
     out += _claims(run_dir, man)
@@ -619,6 +620,16 @@ def _plan_variants(run_dir: str, point: dict, pv) -> list[dict]:
     return [_f("analysis_contract_plan_variants", m) for m in V.contract_findings(raw, point, pv)]
 
 
+def _plan_rule(run_dir: str, point, unc) -> list[dict]:
+    """hb1 fix 11: the completed run carries the plan rule its signed spec asks for (toolkit/analysis/plan_rule.py)."""
+    from toolkit.analysis import plan_rule as PR
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_plan_rule", f"{SPEC} unreadable: {e}")]
+    return [_f("analysis_contract_plan_rule", m, "plan_rule") for m in PR.contract_findings(raw, point, unc)]
+
+
 def _value_of_information(run_dir: str, unc, voi) -> list[dict]:
     """F6: the artifact the signed spec asks for (on by default from the minimum draws), whatever the manifest
     expects, and its shape and arithmetic (toolkit/analysis/value_of_information.py contract_findings)."""
@@ -731,6 +742,11 @@ def decision_test_findings(run_dir: str) -> list[dict]:
         return [_f("analysis_contract_decision_test", f"{DECISION_TESTS_ARTIFACT} {problem}: the decision tests that "
                                                       "change the plan cannot be read", DECISION_TESTS_ARTIFACT)]
     out = []
+    try:          # hb1 fix 11: under deliverable.plan: expected_value the tests compare with the point-value plan
+        from toolkit.analysis import plan_rule as PR
+        ev = PR.rule(yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}) == "expected_value"
+    except (OSError, yaml.YAMLError, AttributeError):
+        ev = False
     for t in rows:
         if isinstance(t, dict) and t.get("verdict") == "CHANGES_PLAN":
             tid = str(t.get("test_id"))
@@ -742,7 +758,10 @@ def decision_test_findings(run_dir: str) -> list[dict]:
             if not why and isinstance(trig, list) and trig:
                 why = "see its result file"
             out.append({"kind": DECISION_TEST_KIND, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE",
-                        "claim": f"Decision test {tid} changes the plan: {' '.join(str(t.get('statement') or '').split())[:600]}"
+                        "claim": f"Decision test {tid} changes the plan"
+                                 + (" solved at the point values (the delivered plan is the expected-value plan over the "
+                                    "uncertainty draws, which the test does not re-solve; deliverable.plan)" if ev else "")
+                                 + f": {' '.join(str(t.get('statement') or '').split())[:600]}"
                                  + (f" ({why}" + (f"; triggered by {', '.join(map(str, trig))}" if isinstance(trig, list)
                                                   and trig else "") + ")" if why else ""),
                         "key": tid, "scope_declarable": True, "decision_bearing": True,

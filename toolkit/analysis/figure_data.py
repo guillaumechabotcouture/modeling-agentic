@@ -462,8 +462,17 @@ def rebuild(run_dir: str, log=print):
     V.apply_headline(A)          # F6 S1-6: a variant headline's rule, as the run solved it
     sol = A.solve(ben0, cost0)
     plan = {str(k): v for k, v in point["plan"].items()}
-    diff = [i for i in A.ids if sol["choice"][i] != plan.get(i)]
-    if diff and not (set(plan) == set(A.ids) and plan_within_gap(A, sol, plan, ben0, cost0)):
+    ref = plan
+    from toolkit.analysis import plan_rule as PR
+    if PR.rule(spec.raw) == "expected_value":
+        # hb1 fix 11: the stored plan was solved over the draws; the point solve reproduces the point-value plan
+        pp = (point.get("plan_rule") or {}).get("point_plan")
+        if not isinstance(pp, dict):
+            raise RebuildRefused("the spec asks for deliverable.plan: expected_value and point.yaml records no "
+                                 "point-value plan (plan_rule.point_plan)")
+        ref = {str(k): v for k, v in pp.items()}
+    diff = [i for i in A.ids if sol["choice"][i] != ref.get(i)]
+    if diff and not (set(ref) == set(A.ids) and plan_within_gap(A, sol, ref, ben0, cost0)):
         raise RebuildRefused(f"the rebuilt plan differs from the stored plan in {len(diff)} units, by more than the "
                              "solver's stated gap")
     A.rebuild_info = {"rows": len(res), "by_ulp": by_ulp, "ulp_bound": ULP_BOUND,

@@ -1626,6 +1626,9 @@ def _validate_deliverable(s) -> list[str]:
         if (un.get("affordability") or {}).get("enforce"):
             bad.append("deliverable.plan: expected_value is not combined with uncertainty.affordability.enforce (a "
                        "plan solved within a reserve); the expected-value plan already fits the budget in every draw")
+        if ((s.raw.get("analysis") or {}).get("plan_variants") or {}).get("headline") is not None:
+            bad.append("deliverable.plan: expected_value is not combined with analysis.plan_variants.headline (the "
+                       "variant's plan is solved at the point values)")
         if d.get("kind") != "package_per_unit":
             bad.append("deliverable.plan: expected_value applies to a package_per_unit deliverable")
         if d.get("by_group") is not None:
@@ -1735,6 +1738,7 @@ def _self_test_plan_rule(ok):
                "affordability enforce": lambda x: x["uncertainty"].update(
                    affordability={"enforce": True, "max_share_over_budget": 0.05}),
                "estimates kind": lambda x: x["deliverable"].update(kind="estimates"),
+               "headline variant": lambda x: x["analysis"].update(plan_variants={"headline": "v", "variants": []}),
                "by_group": lambda x: x["deliverable"].update(by_group={"columns": {"group": "g", "quantity": "q",
                                                                                    "value": "v"}, "quantity": {}})}
         miss = []
@@ -1744,8 +1748,21 @@ def _self_test_plan_rule(ok):
             mut(r)
             if not any("deliverable.plan" in e for e in _validate_deliverable(Spec(r, d))):
                 miss.append(k)
+        from toolkit.spec import estimates as ES
+        es_bad = {}
+        with tempfile.TemporaryDirectory() as de:
+            ep = ES.toy_dir(de)
+            es_bad["(none)"] = validate(load(ep))
+            for v in ("expected_value", "bogus", "point"):
+                re_ = yaml.safe_load(open(ep))
+                re_["deliverable"]["plan"] = v
+                yaml.safe_dump(re_, open(ep, "w"), sort_keys=False)
+                es_bad[v] = [e for e in validate(load(ep)) if "deliverable.plan" in e]
+        es_bad["(none)"] = not es_bad["(none)"]       # the plain estimates spec validates
+        ok(all(es_bad.values()), f"SPEV5 the public validate() refuses deliverable.plan on an estimates spec, whatever "
+                                 f"its value (Codex r1 P1-4): {es_bad}")
         ok(not miss, f"SPEV4 expected_value is refused without an uncertainty source, with a reserve "
-                     f"(affordability enforce), on an estimates deliverable and with a by-group table (not refused: {miss})")
+                     f"(affordability enforce), with a headline plan variant, on an estimates deliverable and with a by-group table (not refused: {miss})")
 
 
 def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)) -> str:

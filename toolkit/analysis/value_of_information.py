@@ -480,7 +480,7 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
             return None
         notes["solves"] += 1
         try:
-            return PR.mean_plan(A, Bn, Cs, ev, mask=mask, budget=B, cap_name="voi_draw")["choice"]
+            return PR.mean_plan(A, Bn, Cs, ev, mask=mask, budget=B, caps=PR.plan_caps(A), cap_name="voi_draw")["choice"]
         except (RuntimeError, ValueError) as e:
             notes.setdefault("not_solved", []).append(str(e))
             return None
@@ -558,6 +558,11 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
         bad = aopt.check(p, ben0, cost0, A.feas, 1e300)
         if bad:
             excluded[cid] = f"breaks the signed feasibility: {'; '.join(bad[:3])}"
+            continue
+        from toolkit.analysis import plan_rule as PR
+        over = PR.breaks_plan_caps(A, p)      # hb1 fix 11 (Codex r1 P1-1): the delivered rule's own budget rows
+        if over:
+            excluded[cid] = f"over the budget the delivered plan is held to ({', '.join(over)}; deliverable.plan)"
             continue
         for d, r in enumerate(rows):
             try:

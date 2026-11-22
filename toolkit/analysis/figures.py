@@ -1730,6 +1730,9 @@ def fig_frontier(R, t):
     if len(xs) < 2:
         raise Missing("the frontier has fewer than two solved envelopes")
     pt = R.art("point")
+    if pt.get("plan_rule"):      # hb1 fix 11 (Codex r1 P1-8): the curve is the point-value policy, not this plan's
+        raise Missing("the frontier re-solves the plan at the point values; the delivered plan is the expected-value "
+                      "plan over the uncertainty draws (deliverable.plan), so the curve would describe another decision")
     olab = R.labels.outcome(R.primary)
     fig = _fig(t, 7.2, 4.2)
     h = fig.get_figheight()

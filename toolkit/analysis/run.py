@@ -461,7 +461,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         if dp:
             raise AnalysisBlocked("calibration", [{"unit": "*", "package": "*", "kind": "declared_miss_untested"}],
                                   reason="; ".join(dp))
-    arts["decision_tests"] = S.write("decision_tests", {"tests": [
+    # hb1 fix 11: under deliverable.plan: expected_value each test re-solves at the point values and compares with
+    # the point-value plan, which the artifact names (the owner finding says so: contract.decision_test_findings)
+    arts["decision_tests"] = S.write("decision_tests", {**({"reference_plan": "point_plan"} if evp is not None else {}),
+                                                        "tests": [
         {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
          # 1C-c follow-up: the verdict words are unchanged (tools/workbench and tools/run_console read exactly these
@@ -1411,7 +1414,7 @@ def _self_test_plan_rule_runs(ok, q):
            "EV-R4 the CSV carries the delivered plan and each unit's mean over the draws")
         cs = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
         txt = open(os.path.join(d, "results.md")).read()
-        ok((cs.get("headline.mean") or {}).get("source_field") == f"data.fixed_plan.{R['_A'].primary}.mean"
+        ok((cs.get("headline.mean") or {}).get("source_field") == f"data.fixed_plan.{hl}.mean"
            and "plan_rule.units_differ" in cs and "[CLAIM:" not in txt and "expected" in txt.split("## ")[1],
            f"EV-R5 a fixed-plan mean claim and the plan rule in the results' recommendation "
            f"({sorted(k for k in cs if k.startswith(('headline', 'plan_rule')))})")
@@ -1421,6 +1424,35 @@ def _self_test_plan_rule_runs(ok, q):
         ok(R["decision_tests"] and vk(R) == vk(R0) and R["stability"].get("verdict") == R0["stability"].get("verdict"),
            f"EV-R7 the decision tests and stability re-solve at the point values and compare with the point-value "
            f"plan: the same records as the default run ({len(R['decision_tests'])} tests)")
+        # Codex r1 of #343: what reads the delivered plan elsewhere
+        dtf = contract.decision_test_findings(d)
+        ok(all("solved at the point values" in f["claim"] for f in dtf)
+           and yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"].get("reference_plan")
+           == "point_plan", f"EV-R8 the decision tests name their reference plan, and each owner finding says it is "
+                            f"the point-value plan ({len(dtf)} findings; P1-3)")
+        from toolkit.analysis import figure_data as FDm
+        try:
+            _A8, plan8 = FDm.rebuild(d, log=q)[:2]
+            rb = plan8 == R["point"]["plan"]
+        except Exception as e:  # noqa: BLE001 -- a failing case
+            rb = f"{type(e).__name__}: {e}"
+        figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]
+        fr_np = [x for x in figs.get("not_produced") or [] if x.get("figure") == "frontier"]
+        ok(rb is True and fr_np and "expected-value" in str(fr_np[0].get("reason")) and not fr_np[0].get("render_failed"),
+           f"EV-R9 a rebuild reproduces the point-value plan and returns the delivered one (P1-7); the frontier is not "
+           f"drawn, with the reason (P1-8) ({rb}, {fr_np})")
+        pp = os.path.join(d, "analysis", "point.yaml")
+        keep = open(pp).read()
+        try:
+            doc = yaml.safe_load(keep)
+            doc["data"].pop("plan_rule")
+            from toolkit.analysis import plan_rule as PRm
+            miss = PRm.contract_findings(r_ev := yaml.safe_load(open(os.path.join(d, "decision_spec.yaml"))),
+                                         doc["data"], R["uncertainty"])
+        finally:
+            open(pp, "w").write(keep)
+        ok(r_ev["deliverable"]["plan"] == "expected_value" and len(miss) == 1 and "no expected-value plan" in miss[0],
+           f"EV-R10 a completed run without the plan rule its spec asks for is a finding (P1-10): {miss}")
 
 
 def _self_test_posterior(ok, q):
