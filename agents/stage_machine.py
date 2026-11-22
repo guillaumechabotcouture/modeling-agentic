@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -2254,9 +2255,35 @@ def _write_json(run_dir: str, rel: str, obj) -> None:
 
 
 def _rep_error(rep: dict) -> str:
-    errs = list(rep.get("errors") or []) + [f"{s.get('id')}: {s.get('error')}" for s in rep.get("steps") or []
-                                            if s.get("status") != "ok"]
+    errs = list(rep.get("errors") or []) + [f"{s.get('id')}: {_step_error(s.get('error'))}"
+                                            for s in rep.get("steps") or [] if s.get("status") != "ok"]
     return "; ".join(str(e) for e in errs)[:300]
+
+
+_TB_FRAME = re.compile(r'^[ |+]*File "([^"]+)", line (\d+)(?:, in (\S+))?\s*$')
+_TB_EXC = re.compile(r"^[A-Za-z_][\w.]*(?::|$)")
+_TB_HEAD = re.compile(r"[ |+]*(?:Exception Group )?Traceback \(most recent call last\):")
+
+
+def _step_error(err) -> str:
+    """A failed step's error, short enough for the history line. A Python traceback in it (the step's log tail; its
+    header may have fallen outside the tail) is reduced to the frame that raised and the exception's first line,
+    after whatever preceded the traceback (a timeout's own text); "Traceback at" keeps it read as a crash. The first
+    300 characters had held only the outer frames, so T16's CI flakes recorded no exception (T9b). Any other error is
+    kept as it is (T9c)."""
+    text = str(err)
+    lines = text.splitlines()
+    fr = [(k, m) for k, m in ((k, _TB_FRAME.match(ln)) for k, ln in enumerate(lines)) if m]
+    if not fr:
+        return text
+    k, m = fr[-1]
+    depth = lambda ln: len(ln) - len(ln.lstrip(" |+-"))  # noqa: E731 -- indent, ExceptionGroup borders included
+    exc = next((ln.lstrip(" |+-") for ln in lines[k + 1:] if depth(ln) < depth(lines[k])
+                and _TB_EXC.match(ln.lstrip(" |+-"))), "no exception line in the log tail")
+    hdr = _TB_HEAD.search(text)
+    head = text[:hdr.start()] if hdr else ""      # a timeout's own text, before the traceback it shows
+    where = f"{os.path.basename(m.group(1))}:{m.group(2)}" + (f" in {m.group(3)}" if m.group(3) else "")
+    return f"{head.strip()[:120]} Traceback at {where}: {exc[:150]}".strip()
 
 
 # Machine.reopen_interrupted_analysis's history line, per resumable cause.
@@ -2718,6 +2745,55 @@ def _self_test() -> int:
             if nxt not in EDGES["GATE"]:
                 ok(False, f"T9 {a} routes outside the state table")
     ok(True, "T9 every route is an edge of the state table")
+    # T9b (T16's CI flakes, 2026-11-20/21): a failed step's error is its log tail, a traceback whose first 300
+    # characters are only its outer frames; the reason a run ended must keep the exception and where it was raised.
+    root = "/home/runner/work/modeling-agentic/modeling-agentic"
+    tb = ("Traceback (most recent call last):\n"
+          f'  File "{root}/agents/analysis_backend.py", line 1556, in <module>\n    sys.exit(main())\n'
+          "             ~~~~^^\n"
+          f'  File "{root}/agents/analysis_backend.py", line 776, in main\n    A = _analyze(spec, out)\n'
+          f'  File "{root}/agents/analysis_backend.py", line 515, in _analyze\n'
+          "    return Analysis(spec, out, log=lambda *a: None).run()\n"
+          f'  File "{root}/spike/analysis/run.py", line 120, in solve\n'
+          "    raise RuntimeError(f\"optimizer status {r['status']}\")\n"
+          "RuntimeError: optimizer status feasible\n")
+    why = _rep_error({"ok": False, "steps": [{"id": "configure", "status": "ok"},
+                                             {"id": "analyze", "status": "failed", "error": tb}]})
+    ok("RuntimeError: optimizer status feasible" in why and "run.py:120 in solve" in why and len(why) <= 300,
+       f"T9b a failed step's reason keeps its exception and the frame that raised it: {why!r}")
+    why2 = _rep_error({"ok": False, "errors": ["upstream step not rebuilt: configure"],
+                       "steps": [{"id": "batch", "status": "failed", "error": "timed out after 8s at its backstop"}]})
+    ok(why2 == "upstream step not rebuilt: configure; batch: timed out after 8s at its backstop",
+       f"T9c an error that is not a traceback is kept as it was: {why2!r}")
+    # T9d (Codex r1 on the T9b fix): real interpreter output, as an 800-character log tail holds it.
+    def tail_of(code, n=800):
+        r = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           timeout=60)
+        return r.stdout[-n:]
+    cases = {
+        "trailing output": ("import atexit; atexit.register(print, 'cleanup complete')\n"
+                            "def solve():\n    raise RuntimeError('boom')\nsolve()", "RuntimeError: boom", "in solve"),
+        "multi-line message": ("def f():\n    raise ValueError('invalid row\\ncolumn 7')\nf()",
+                               "ValueError: invalid row", "in f"),
+        "syntax error": ("compile('x =', 'broken.py', 'exec')", "SyntaxError", "broken.py:1"),
+        "frame text in message": ("def g():\n    raise ValueError('see File \"other.py\", line 97, in other')\ng()",
+                                  "ValueError: see", "in g"),
+        "exception group": ("raise ExceptionGroup('workers', [ValueError('bad row')])", "ExceptionGroup: workers",
+                            "<string>:1"),
+        "long message": ("def h():\n    raise ValueError('x' * 320)\nh()", "ValueError: xxx", "in h"),
+        "header cut": ("".join(f"def f{i}():\n    f{i + 1}()\n" for i in range(40))
+                       + "def f40():\n    raise RuntimeError('deep')\nf0()", "RuntimeError: deep", "in f40"),
+    }
+    for name, (code, want_exc, want_at) in cases.items():
+        why_ = _rep_error({"ok": False, "steps": [{"id": "analyze", "status": "failed", "error": tail_of(code)}]})
+        ok(want_exc in why_ and want_at in why_ and "Traceback at" in why_ and "at other.py" not in why_
+           and "Exception Group Traceback" not in why_,
+           f"T9d a traceback with {name} keeps its exception and raising frame: {why_!r}")
+    to = "timed out after 8s at its backstop (process group killed); last output: " + tail_of(
+        "def s():\n    raise RuntimeError('boom')\ns()", 300)
+    why3 = _rep_error({"ok": False, "steps": [{"id": "analyze", "status": "failed", "error": to}]})
+    ok(why3.startswith("analyze: timed out after 8s") and "RuntimeError: boom" in why3,
+       f"T9e a timeout whose last output is a traceback still reads as the timeout first: {why3!r}")
 
     with tempfile.TemporaryDirectory() as td:
         def new_run(name, script, signoff="none", max_rounds=3, budget=None):
@@ -2767,6 +2843,10 @@ def _self_test() -> int:
                                       "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
         ref_status = _SpikeMachine(d0, T0, st0, log=lambda *a: None, cross_engine_check=False).run()
         ref_path = [h["to"] for h in load_state(d0).history if "to" in h]
+
+        def _final_why(d_):     # the reason a run reached FINAL (a step's error carries its log tail): CI flakes of
+            return [h.get("why") for h in load_state(d_).history if h.get("to") == "FINAL"][-1:]   # T16 named none
+        ref_why = _final_why(d0) if ref_status != "completed" else []
         bad = []
         for k in range(1, len(ref_path)):
             dk, Tk, stk = new_run(f"resume{k}", {"critics": {1: {"critique-domain": [blocker]}},
@@ -2779,9 +2859,10 @@ def _self_test() -> int:
             s2 = m2.run()
             p2 = [h["to"] for h in load_state(dk).history if "to" in h]
             if s2 != ref_status or p2 != ref_path:
-                bad.append((k, s2, p2))
+                bad.append((k, s2, p2, _final_why(dk)))
             shutil.rmtree(dk)
-        ok(not bad, f"T16 a run stopped after any of {len(ref_path) - 1} transitions resumes to the same path and status {bad[:1]}")
+        ok(not bad, f"T16 a run stopped after any of {len(ref_path) - 1} transitions resumes to the same path and status {bad[:1]}"
+           + (f" (reference run {ref_status}: {ref_why})" if ref_why else ""))
 
         # T17: owner sign-off pauses, persists, resumes.
         d, T, st = new_run("owner", {}, signoff="owner")
