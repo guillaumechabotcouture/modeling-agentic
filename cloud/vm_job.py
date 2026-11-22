@@ -916,6 +916,7 @@ def cmd_run(a):
 def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
     job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
+    storage_account(getattr(a, "store_account", None))   # so is a storage account value that is not a name
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
     _vm_request(a)                         # so is a request no priced VM type matches (before the reservation)
     base, unique = a.name, run_cluster_name(a.name, a.job_id)
@@ -1356,11 +1357,11 @@ def _self_test_storage_account(ok) -> None:
             sent.append((args, kw))
             return None
 
-    def start(env, store_account=None, store="outputs/t/sa"):
+    def start(env, store_account=None, store="outputs/t/sa", code=None, command=("true",), full=False):
         sent.clear()
-        a = types.SimpleNamespace(name="sa", job_id="sa1", command=["true"], tree=None, dir=None, anthropic_key=False,
-                                  store=store, store_account=store_account, max_hours=1.0, setup_sdk=False,
-                                  cluster_compute=False, shutdown_when_stored=False, _code=None,
+        a = types.SimpleNamespace(name="sa", job_id="sa1", command=list(command), tree=None, dir=None,
+                                  anthropic_key=False, store=store, store_account=store_account, max_hours=1.0, setup_sdk=False,
+                                  cluster_compute=False, shutdown_when_stored=False, _code=code,
                                   dest=os.path.join(td, "dest"))
         keep = {k: v for k, v in os.environ.items() if k not in ("MA_STORAGE_ACCOUNT", "COILED_STORAGE_ACCOUNT")}
         with mock.patch.dict(os.environ, {**keep, **env}, clear=True), \
@@ -1370,7 +1371,7 @@ def _self_test_storage_account(ok) -> None:
                 contextlib.redirect_stdout(io.StringIO()):
             cmd_start(a, cluster=object())
         args, kw = sent[0]
-        return (args[3] or {}), (kw.get("store") or {})
+        return (args, kw) if full else ((args[3] or {}), (kw.get("store") or {}))
 
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -1397,6 +1398,48 @@ def _self_test_storage_account(ok) -> None:
             except SystemExit as e:
                 ok(bool(sent) is False and "storage account" in str(e) and bad not in str(e),
                    f"SA6 a value that is not a storage account name is refused before submit, unechoed: {bad[:20]!r}")
+    import inspect
+    src = inspect.getsource(_run_locked)
+    ok("storage_account(" in src and src.index("storage_account(") < src.index("_create("),
+       "SA7 (Codex r1) `run` refuses a bad storage account value before it creates a cluster")
+
+    # SA8 (Codex r1): the submitted task, run as the worker runs it with no storage variable of its own, gives the
+    # job's process $MA_STORAGE_ACCOUNT and uploads and reads back with the launcher's account.
+    class _Rec(_FakeStore):
+        def __init__(self, root):
+            super().__init__(root)
+            self.accounts = []
+
+        def upload_retry(self, path, blob, account=None):
+            self.accounts.append(("up", account))
+            return super().upload_retry(path, blob, account)
+
+        def download(self, blob, path, account=None):
+            self.accounts.append(("down", account))
+            return super().download(blob, path, account)
+    job = (b"import os\nopen(os.path.join(os.environ['JOB_OUT'], 'acct.txt'), 'w')"
+           b".write(os.environ.get('MA_STORAGE_ACCOUNT', ''))\n")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        ti = tarfile.TarInfo("job.py")
+        ti.size = len(job)
+        t.addfile(ti, io.BytesIO(job))
+    with tempfile.TemporaryDirectory() as td:
+        args, kw = start({"COILED_STORAGE_ACCOUNT": "launcheracct"}, code=buf.getvalue(),
+                         command=(sys.executable, "job.py"), full=True)
+        old, ws.JOBS = ws.JOBS, os.path.join(td, "vm")
+        fs = _Rec(os.path.join(td, "blob"))
+        clean = {k: v for k, v in os.environ.items() if k not in ("MA_STORAGE_ACCOUNT", "COILED_STORAGE_ACCOUNT")}
+        try:
+            with mock.patch.dict(os.environ, clean, clear=True):
+                st = ws.job_task(*args, store=kw["store"], store_mod=fs)
+            got = open(os.path.join(td, "blob", "outputs", "t", "sa", "acct.txt")).read()
+        finally:
+            ws.JOBS = old
+        ok(st["state"] == "done" and (st.get("stored") or {}).get("verified") is True and got == "launcheracct"
+           and fs.accounts and set(fs.accounts) == {("up", "launcheracct"), ("down", "launcheracct")},
+           f"SA8 the job's process sees $MA_STORAGE_ACCOUNT and its outputs upload and read back with that account "
+           f"({st['state']}, {got!r}, {fs.accounts})")
 
 
 def _self_test_sched(ok) -> None:
@@ -2808,7 +2851,9 @@ def main(argv=None) -> int:
                        help="the job's compute.py run_map uses every worker of this cluster")
         p.add_argument("--store", metavar="PREFIX", default=None,
                        help="when the job ends, upload $JOB_OUT to <PREFIX>/ and verify each file read back (sha256)")
-        p.add_argument("--store-account", default=None, help="storage account (default: the worker's configured one)")
+        p.add_argument("--store-account", default=None,
+                       help="storage account name (default: the launcher's $MA_STORAGE_ACCOUNT, then "
+                       "$COILED_STORAGE_ACCOUNT, then the worker's configured one)")
         p.add_argument("--shutdown-when-stored", action="store_true",
                        help="the job stops its cluster once it is done and every output is verified in storage")
 
