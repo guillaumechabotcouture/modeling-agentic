@@ -317,7 +317,7 @@ REVIEWED: dict = {
                                  "tempfile-dir": (1, "write_archive's anonymous TemporaryFile beside the archive it "
                                                      "writes (the checkpoint staging dir on the agent VM, outside any run "
                                                      "dir), deleted on close")},
-    "scripts/resume_smoke.py": {"open-write": (3, "the smoke's own temporary work dir (toy runs it creates) and the "
+    "scripts/resume_smoke.py": {"open-write": (4, "the smoke's own temporary work dir (toy runs it creates) and the "
                                                    "--json report the operator names")},
     "scripts/lib/positive_control.py": {"open-write": (2, "builds the positive-control fixture run in a dir it creates")},
     "scripts/validate_critique_yaml.py": {"os-remove": (1, "its own NamedTemporaryFile in the system temp dir")},
