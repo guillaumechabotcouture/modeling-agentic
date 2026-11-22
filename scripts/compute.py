@@ -743,10 +743,15 @@ def recycle_every(procs: int) -> int:
 # --------------------------------------------------------------------------- #
 
 def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple[bytes, dict]:
-    """tar.gz of the run's models/ and data/ and the repo's scripts/ and toolkit/, with
-    ABSOLUTE member paths so workers recreate the same layout."""
+    """tar.gz of the run's models/ and data/, the repo's scripts/ and toolkit/, and the declared data set
+    (FP_DATA_SET: repo data/, .claude/orchestration/, and the non-Python files of scripts/ and toolkit/), with
+    ABSOLUTE member paths so workers recreate the same layout. The data set is exactly the files the reuse key's
+    data_set part hashes (_data_set_files), shipped whatever their size: a worker that reads one computes with
+    the launcher's copy, the one the key names (BD1-BD4)."""
     run_dir = os.path.realpath(run_dir)
     skipped, n = [], 0
+    data_set = {os.path.join(REPO, r) for r in _data_set_files(FP_DATA_SET, skip=run_dir)}
+    added, unreadable = set(), []
     buf = io.BytesIO()
     # dereference: symlinked inputs are stored as files (workers extract with
     # the "data" filter, which rejects absolute links).
@@ -762,7 +767,7 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                 if real in anc:
                     dirs[:] = []
                     continue
-                dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "_truth")]
+                dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git") and not d.startswith("_truth")]
                 for d in dirs:
                     ancestors[os.path.join(dp, d)] = anc | {real}
                 for fn in files:
@@ -771,13 +776,25 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                         size = os.path.getsize(p)
                     except OSError:
                         continue
-                    if size > max_file_mb * 2**20:
+                    if size > max_file_mb * 2**20 and p not in data_set:
                         skipped.append((os.path.relpath(p, run_dir), round(size / 2**20, 1)))
                         continue
+                    if p in added:
+                        continue
                     t.add(p, arcname=p.lstrip("/"))
+                    added.add(p)
                     n += 1
+        for p in sorted(data_set - added):     # repo data/ and .claude/orchestration/ (scripts/, toolkit/ are above)
+            try:
+                t.add(p, arcname=p.lstrip("/"))
+            except OSError:                    # a dangling link: the key hashes it as unreadable; no worker has it
+                unreadable.append(os.path.relpath(p, REPO))
+                continue
+            added.add(p)
+            n += 1
     data = buf.getvalue()
     return data, {"files": n, "bundle_mb": round(len(data) / 2**20, 1), "skipped_large": skipped,
+                  "data_set_files": len(data_set & added), "data_set_unreadable": unreadable,
                   "sha256": hashlib.sha256(data).hexdigest()}
 
 
@@ -2591,28 +2608,43 @@ _FP_CODE_EXT = (".py", ".pyc", ".md")
 
 
 def _files_digest(spec: dict, skip: str | None = None) -> str:
-    """sha256 over {repo-relative path: sha256} of the files `spec` names ({dir: "all" | "data"}); __pycache__, .git
-    and _truth left out, linked directories followed (a loop stops), the launch stamp (_FP_REPO_SKIP) and the
-    directory `skip` (the run dir, when it lies under one of them) skipped."""
+    """sha256 over {repo-relative path: sha256} of the files `spec` names (_data_set_files)."""
     got = {}
+    for rel in _data_set_files(spec, skip):
+        try:
+            got[rel] = _file_digest(os.path.join(REPO, rel))
+        except OSError:
+            got[rel] = "unreadable"
+    return _digest(got)
+
+
+def _data_set_files(spec: dict, skip: str | None = None) -> list[str]:
+    """The repo-relative paths of the files `spec` names ({dir: "all" | "data"}), sorted; __pycache__, .git and any
+    `_truth*` component (eval_paths' hidden-material rule, also where a link leads) left out, linked directories
+    followed (a loop stops), the launch stamp (_FP_REPO_SKIP) and the directory `skip` (the run dir, when it lies
+    under one of them) skipped. The key hashes these files and make_bundle ships them."""
+    got = []
     for root, kind in sorted(spec.items()):
         top = os.path.join(REPO, root)
         anc = {top: {os.path.realpath(top)}}
         for dp, dirs, fns in os.walk(top, followlinks=True):
-            dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git", "_truth")
+            dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git") and not _hidden_path(os.path.join(dp, d))
                              and os.path.realpath(os.path.join(dp, d)) not in anc[dp]
                              and os.path.realpath(os.path.join(dp, d)) != (skip and os.path.realpath(skip)))
             for d in dirs:
                 anc[os.path.join(dp, d)] = anc[dp] | {os.path.realpath(os.path.join(dp, d))}
             for f in fns:
                 rel = os.path.relpath(os.path.join(dp, f), REPO).replace(os.sep, "/")
-                if rel in _FP_REPO_SKIP or (kind == "data" and f.endswith(_FP_CODE_EXT)):
+                if rel in _FP_REPO_SKIP or (kind == "data" and f.endswith(_FP_CODE_EXT)) \
+                        or _hidden_path(os.path.join(dp, f)):
                     continue
-                try:
-                    got[rel] = _file_digest(os.path.join(REPO, rel))
-                except OSError:
-                    got[rel] = "unreadable"
-    return _digest(got)
+                got.append(rel)
+    return sorted(set(got))
+
+
+def _hidden_path(path: str) -> bool:
+    """A `_truth*` component in the path or in where it leads (eval_paths: hidden eval-suite material)."""
+    return any(c.startswith("_truth") for p in (path, os.path.realpath(path)) for c in p.split(os.sep))
 
 
 def _digest(x) -> str:
@@ -3760,6 +3792,10 @@ def _self_test() -> int:
         _self_test_w0a(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"FP_OBSERVED: {type(e).__name__}: {e}")
+    try:
+        _self_test_bundle_data_set(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"BD: {type(e).__name__}: {e}")
     # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
         os.makedirs(os.path.join(rd, "models"))
@@ -4213,6 +4249,57 @@ def _self_test_w0a(ok) -> None:
             w("analysis/out.jsonl.summary.json", "{}", rd_in)
             ok(q0 == code_fingerprint(rd_in, "models/fn.py::f"),
                "FP_RUN_UNDER_REPO_DATA a run dir under the repo's data/ is not part of the data set")
+
+
+def _self_test_bundle_data_set(ok) -> None:
+    """BD0-BD5 (2026-11-21: make_bundle shipped the run's models/ and data/ and the repo's scripts/ and toolkit/, but
+    not repo data/ or .claude/orchestration/, though FP_DATA_SET puts them in every reuse key: a worker reading them
+    computed without them while the key hashed the launcher's copies). The bundle ships exactly the files the key's
+    data_set part hashes, whatever their size, and nothing under _truth. A toy repo; no network."""
+    import tempfile
+    from unittest import mock
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        repo, rd = os.path.join(td, "repo"), os.path.join(td, "repo", "runs", "r1")
+
+        def w(rel, txt="x", root=None):
+            f = os.path.join(root or repo, rel)
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            open(f, "w").write(txt)
+        for rel in ("data/pop.csv", "data/sub/costs.yaml", "data/_truth/key.csv", ".claude/orchestration/priors.yaml",
+                    "scripts/compute.py", "scripts/table.json", "scripts/README.md", "toolkit/eng/card.yaml",
+                    "toolkit/eng/model.py", "scripts/lib/code_commit.txt", "docs/notes.md"):
+            w(rel)
+        w("data/big.csv", "y" * (2 * 2**20))
+        w("data/_truth_copy/key.csv")
+        os.symlink(os.path.join(repo, "data", "_truth", "key.csv"), os.path.join(repo, "data", "alias.csv"))
+        os.symlink(os.path.join(repo, "data", "nowhere.csv"), os.path.join(repo, "data", "dangling.csv"))
+        w("models/fn.py", "def f(p):\n    return p\n", rd)
+        with mock.patch.dict(globals(), {"REPO": repo}):
+            want = set(_data_set_files(FP_DATA_SET, skip=rd))
+            b, info = make_bundle(rd, max_file_mb=1)
+        listed = ["/" + n for n in tarfile.open(fileobj=io.BytesIO(b)).getnames()]
+        names = set(listed)
+        manifest = {"data/pop.csv", "data/sub/costs.yaml", "data/big.csv", "data/dangling.csv",
+                    ".claude/orchestration/priors.yaml", "scripts/table.json", "toolkit/eng/card.yaml"}
+        ok(want == manifest, f"BD0 the declared data set is these files, no hidden ones ({sorted(want ^ manifest)})")
+        ok(len(listed) == len(names) and not any("_truth" in n or n.endswith("alias.csv") for n in names)
+           and info.get("data_set_unreadable") == ["data/dangling.csv"],
+           f"BD5 (Codex r1) no member twice; no _truth* path or link into one; a dangling link is recorded, not fatal "
+           f"({info.get('data_set_unreadable')})")
+        want.discard("data/dangling.csv")
+        data_like = {n for n in names if os.path.relpath(n, repo).split("/")[0] in ("data", ".claude")}
+        need = {os.path.join(repo, r) for r in want}
+        ok(os.path.join(repo, "data/pop.csv") in need and os.path.join(repo, ".claude/orchestration/priors.yaml") in need
+           and os.path.join(repo, "scripts/table.json") in need and need <= names,
+           f"BD1 the bundle ships every file of the declared data set ({sorted(need - names)})")
+        ok(data_like == {os.path.join(repo, r) for r in want if r.split("/")[0] in ("data", ".claude")},
+           f"BD2 the bundle's repo data/ and .claude/ are exactly the data set ({sorted(data_like)})")
+        ok(os.path.join(repo, "data/big.csv") in names and not any("/_truth/" in n for n in names)
+           and os.path.join(repo, "docs/notes.md") not in names,
+           f"BD3 a large data-set file ships (the key hashes it), _truth and undeclared dirs do not ({info})")
+        ok(info.get("data_set_files") == len(want) == 6,
+           f"BD4 the bundle reports the data-set files it ships ({info})")
 
 
 def _self_test_fp_dispatch(ok) -> None:

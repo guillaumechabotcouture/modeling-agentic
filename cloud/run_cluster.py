@@ -386,6 +386,17 @@ def attach(name: str):
     return ws.attach_existing(name, WORKSPACE, cid)
 
 
+def _results_store():
+    """This repo's scripts/results_store, imported as eval_paths and pipeline_id are (from the repo this file is in),
+    not from cfg.tree or $PYTHONPATH: `collect` died with ModuleNotFoundError when neither held it (CI1-CI2)."""
+    d = os.path.join(os.path.dirname(HERE), "scripts")
+    while d in sys.path:            # first, even when $PYTHONPATH also names another checkout's scripts/ (Codex r1)
+        sys.path.remove(d)
+    sys.path.insert(0, d)
+    import results_store
+    return results_store
+
+
 def _compute(cfg):
     sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
     import compute
@@ -1476,6 +1487,22 @@ def keeper_lines(st: dict | None, now: float | None = None) -> list[str]:
     return out
 
 
+def recorded_labels(cfg, assign: dict) -> list:
+    """The labels `collect` and `status` act on: every label the launch recorded in assignments.json, merged with
+    cfg.labels (2026-11-22 baseline hb1: cfg.labels comes from EVAL_REPS at collect time, and with it unset R2 was
+    skipped without a message). A difference between the two is named; a cfg label with no launch record is
+    skipped, since there is nothing to collect for it."""
+    extra = sorted(k for k in assign if k not in cfg.labels)
+    unlaunched = [k for k in cfg.labels if k not in assign]
+    if extra:
+        print(f"WARNING: {os.path.basename(cfg.state_file)} records label(s) {extra} that this config's labels "
+              f"{list(cfg.labels)} do not name (EVAL_REPS?); they are included")
+    if unlaunched:
+        print(f"WARNING: label(s) {unlaunched} of this config have no launch record in "
+              f"{os.path.basename(cfg.state_file)}; skipped")
+    return [k for k in cfg.labels if k in assign] + extra
+
+
 def status(cfg):
     run, keep = is_running(cfg.name), is_running(cfg.keeper_name)
     ovf = is_running(cfg.overflow_name)
@@ -1492,7 +1519,7 @@ def status(cfg):
         return
     assign = json.load(open(cfg.state_file))
     client = attach(cfg.name).get_client()
-    for label in cfg.labels:
+    for label in recorded_labels(cfg, assign):
         m = _on_worker(client, ws.fetch_meta, label, worker=assign[label]["worker"])
         if m["state"] != "done":
             print(f"{label}: {m['state']} (log {m.get('log_bytes', 0)} bytes)")
@@ -1677,8 +1704,7 @@ def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=Non
     if cid is None:
         raise SystemExit(f"{cfg.name}: clusters.json records no run cluster id: refusing")
     if store is None:
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-        import results_store as store
+        store = _results_store()
     try:   # sent by value: the agent VM's uploaded worker_side may predate this function
         import cloudpickle
         cloudpickle.register_pickle_by_value(ws)
@@ -1760,7 +1786,6 @@ def relaunch_refusal(vm_state: str, stored: bool) -> str | None:
 
 def _download(client, label, worker, dest_file):
     """Chunked, resumable, sha256-verified (one 591 MB message reset the Coiled proxy)."""
-    import hashlib
     m = _on_worker(client, ws.fetch_meta, label, worker=worker)
     have = os.path.getsize(dest_file) if os.path.exists(dest_file) else 0
     with open(dest_file, "ab") as out:
@@ -1775,7 +1800,7 @@ def _download(client, label, worker, dest_file):
                     time.sleep(5)
             out.write(b)
             have += len(b)
-    h = hashlib.sha256(open(dest_file, "rb").read()).hexdigest()
+    h = ws._sha_file(dest_file)            # block by block: the archive is never read whole
     if h != m["sha256"]:
         os.remove(dest_file)
         raise SystemExit(f"{label}: download did not verify; removed, re-run collect")
@@ -1783,14 +1808,13 @@ def _download(client, label, worker, dest_file):
 
 
 def collect(cfg, shutdown_after: bool = True):
-    sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-    import results_store
+    results_store = _results_store()
     os.makedirs(cfg.out_dir, exist_ok=True)
     running = is_running(cfg.name)
     if not os.path.exists(cfg.state_file):
         raise SystemExit(f"no {cfg.state_file}: this machine did not launch {cfg.name}")
     assign, client, pending = json.load(open(cfg.state_file)), None, []
-    for label in cfg.labels:
+    for label in recorded_labels(cfg, assign):
         dest = os.path.join(cfg.out_dir, label)
         cur = local_is_current(dest, assign[label]["launch_id"])
         if cur:
@@ -1832,6 +1856,9 @@ def collect(cfg, shutdown_after: bool = True):
                   indent=1)
         _on_worker(client, ws.mark_collected, label, worker=w)
         print(f"{label}: collected from the VM -> {dest}")
+    if running and pending and shutdown_after:
+        print(f"not shutting down: {', '.join(pending)} {'has' if len(pending) == 1 else 'have'} no final result "
+              f"yet (still running); collect again once status shows every label done")
     if running and not pending and shutdown_after:
         print("every run is collected: shutting down")
         shutdown(cfg)
@@ -2006,9 +2033,8 @@ def report_cost(cfg, args):
     elif os.path.exists(cfg.state_file):
         clusters["run"]["id"] = next(iter(json.load(open(cfg.state_file)).values())).get("cluster_id")
     if not ledgers:
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
         try:
-            import results_store
+            results_store = _results_store()
         except ImportError:
             results_store = None
         ledgers = _find_ledgers(cfg, results_store)
@@ -2035,8 +2061,7 @@ def relaunch(cfg, label) -> int:
         if label not in assign:
             raise SystemExit(f"{label}: no assignment in {cfg.state_file}; not relaunching")
         budget_guard(cfg, reserve=False)  # more paid work on the live run cluster: the budget must still cover it
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-        import results_store
+        results_store = _results_store()
         launch_id = assign[label]["launch_id"]
         names = {b["name"] for b in results_store.list_blobs(f"outputs/{cfg.storage_prefix}/launch_{launch_id}/",
                                                               cfg.storage_account)}
@@ -4100,6 +4125,112 @@ def _self_test_collect_no_shutdown(ok) -> None:
         ok(rc_ == 0 and len(downs) == want, cid)
 
 
+def _self_test_collect_import(ok) -> None:
+    """CI1-CI3 (2026-11-21: `collect` died with ModuleNotFoundError: results_store unless PYTHONPATH=scripts):
+    collect and the other storage commands import results_store from this repo's scripts/, as eval_paths and
+    pipeline_id are imported, whatever cfg.tree holds and wherever the command runs from. A fresh interpreter
+    (no PYTHONPATH, cwd outside the repo, a config whose tree does not exist), so no earlier import hides it."""
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "cfg.py")
+    open(path, "w").write("from run_cluster import RunConfig\n"
+                          f"CONFIG = RunConfig(name='ci', question_file='q', labels=('A',), out_dir={tmp!r}, "
+                          f"tree={os.path.join(tmp, 'no-such-tree')!r})\n")
+    json.dump({"A": {"launch_id": "L1", "worker": "w"}}, open(os.path.join(tmp, "assignments.json"), "w"))
+    code = ("import sys, json\n"
+            f"sys.path.insert(0, {HERE!r})\n"
+            "import run_cluster as rc\n"
+            "from unittest import mock\n"
+            "got = {}\n"
+            "def fake(cfg, store, *a, **k):\n"
+            "    import os; got['file'] = os.path.realpath(store.__file__)\n"
+            "    return {'exit_code': 0, 'duration_s': 1}\n"
+            "with mock.patch.object(rc, 'is_running', lambda n, lister=None: True), "
+            "mock.patch.object(rc, 'collect_from_storage', fake), mock.patch.object(rc, 'shutdown', lambda c: None):\n"
+            f"    rc.main(['run_cluster.py', {path!r}, 'collect'])\n"
+            "print('RESULT ' + json.dumps(got))\n")
+    mine = os.path.realpath(os.path.join(os.path.dirname(HERE), "scripts", "results_store.py"))
+    decoy = os.path.join(tmp, "old_checkout", "scripts")         # CI3 (Codex r1): another checkout on $PYTHONPATH
+    os.makedirs(decoy)
+    open(os.path.join(decoy, "results_store.py"), "w").write("def list_blobs(*a, **k):\n    return []\n")
+    for pp, cid in ((None, "CI1-CI2 no PYTHONPATH"),
+                    (os.pathsep.join([decoy, os.path.join(os.path.dirname(HERE), "scripts")]),
+                     "CI3 PYTHONPATH naming another checkout's scripts/ first")):
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        if pp:
+            env["PYTHONPATH"] = pp
+        p = subprocess.run([sys.executable, "-c", code], cwd=tmp, env=env, capture_output=True, text=True,
+                           timeout=120)
+        line = next((ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")), None)
+        got = json.loads(line[len("RESULT "):]) if line else {}
+        ok(p.returncode == 0 and "ModuleNotFoundError" not in p.stderr,
+           f"{cid}: `collect` runs with a missing cfg.tree (rc={p.returncode}: {p.stderr[-300:]!r})")
+        ok(got.get("file") == mine,
+           f"{cid}: `collect` hands collect_from_storage this repo's scripts/results_store.py ({got})")
+
+
+def _self_test_collect_labels(ok) -> None:
+    """RL1-RL5 (2026-11-22 baseline hb1: collect and status looped over cfg.labels, which EVAL_REPS sets at
+    collect time; with it unset R2 was skipped without a message, and a plain `collect` could have shut down a
+    cluster still running R2). The labels come from the launch record (assignments.json), merged with cfg.labels,
+    and the default shutdown is refused while any recorded label has no final result."""
+    import tempfile
+    from unittest import mock
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "cfg.py")
+    open(path, "w").write("from run_cluster import RunConfig\n"
+                          f"CONFIG = RunConfig(name='rl', question_file='q', labels=('R1',), out_dir={tmp!r}, "
+                          f"tree={os.path.dirname(HERE)!r})\n")
+    json.dump({"R1": {"launch_id": "L1", "worker": "w1"}, "R2": {"launch_id": "L1", "worker": "w2"}},
+              open(os.path.join(tmp, "assignments.json"), "w"))
+
+    class _Cl:
+        def get_client(self):
+            return object()
+
+    def run(stored, worker_state, extra=()):
+        got, downs, out = [], [], io.StringIO()
+
+        def from_storage(cfg, store, label, *a, **k):
+            if label not in stored:
+                raise FileNotFoundError(label)
+            got.append(label)
+            return {"exit_code": 0, "duration_s": 1}
+        with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: True,
+                                         "_results_store": lambda: None,
+                                         "collect_from_storage": from_storage,
+                                         "checkpoint_record": lambda *a, **k: None,
+                                         "local_is_current": lambda *a, **k: None,
+                                         "attach": lambda n: _Cl(),
+                                         "_on_worker": lambda c, fn, label, worker: {"state": worker_state},
+                                         "shutdown": lambda c: downs.append(c.name)}), \
+                contextlib.redirect_stdout(out):
+            rc_ = main(["run_cluster.py", path, "collect", *extra])
+        return rc_, got, downs, out.getvalue()
+
+    rc_, got, downs, out = run({"R1", "R2"}, "done")
+    ok(got == ["R1", "R2"] and len(downs) == 1,
+       f"RL1 collect takes R2 from assignments.json although cfg.labels is ('R1',) (got {got}, downs {downs})")
+    ok("R2" in out and "WARNING" in out, f"RL2 collect says the recorded labels differ from cfg.labels ({out!r})")
+    rc_, got, downs, out = run({"R1"}, "running")
+    ok(got == ["R1"] and downs == [] and "R2" in out and "not shutting down" in out,
+       f"RL3 the default shutdown is refused while R2 has no final result, naming R2 (downs {downs}, {out!r})")
+    json.dump({"R2": {"launch_id": "L1", "worker": "w2"}}, open(os.path.join(tmp, "assignments.json"), "w"))
+    rc_, got, downs, out = run({"R2"}, "done")
+    ok(got == ["R2"] and "R1" in out and "no launch record" in out,
+       f"RL4 a cfg label with no launch record is named and skipped, not a KeyError (got {got}, {out!r})")
+    json.dump({"R1": {"launch_id": "L1", "worker": "w1"}, "R2": {"launch_id": "L1", "worker": "w2"}},
+              open(os.path.join(tmp, "assignments.json"), "w"))
+    seen, out = [], io.StringIO()
+    with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: n == "rl", "attach": lambda n: _Cl(),
+                                     "_on_worker": lambda c, fn, label, worker: (seen.append(label)
+                                                                                 or {"state": "running"})}), \
+            contextlib.redirect_stdout(out):
+        main(["run_cluster.py", path, "status"])
+    ok(seen == ["R1", "R2"] and "R2: running" in out.getvalue(),
+       f"RL5 status reports every recorded label, R2 included ({seen}, {out.getvalue()!r})")
+
+
 def _self_test_eval_configs(ok) -> None:
     """EV (harness benchmark protocol, owner 2026-11-21: an `ev` budget scope of $450): every eval config states
     its cap (US$35 per run, times its replicates), runs v2 with lead sign-off, 3 rounds and a US$35 model cap, and
@@ -4885,6 +5016,199 @@ def _self_test_checkpoint(ok) -> None:
        f"CK28 (Codex round 3) 30 labels whose storage reads hang: the call ends at its 0.3 s deadline ({took:.2f}s)")
 
 
+def _self_test_storage(ok) -> None:
+    """WS1-WS6 (v2 autonomy 1E-i): the agent VM's end-of-run paths never hold an archive whole, the returned
+    tarball keeps large files when main.py's own store failed, teardown waits for a checkpoint upload in flight,
+    and the checkpointer records its health. Fake store, fake main.py, no cloud."""
+    import hashlib
+    import io
+    import tempfile
+    import threading
+    from unittest import mock
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
+    import results_store
+
+    def code(store_error, tail=""):
+        main_py = ("import json, os\nrd = 'runs/R_x'\nos.makedirs(rd)\n"
+                   "open(rd + '/big.bin', 'wb').write(b'x' * 4096)\nopen(rd + '/small.txt', 'w').write('s')\n"
+                   f"f = open(rd + '/metadata.json', 'w')\n"
+                   f"json.dump({{'stored': 'outputs/t/R_x.tar.gz', 'store_error': {store_error!r}}}, f)\n"
+                   "f.close()\n" + tail)
+        b = io.BytesIO()
+        with tarfile.open(fileobj=b, mode="w:gz") as t:
+            ti = tarfile.TarInfo("main.py")
+            ti.size = len(main_py.encode())
+            t.addfile(ti, io.BytesIO(main_py.encode()))
+        return b.getvalue()
+    root = tempfile.mkdtemp()
+    got = {}
+    for label, err in (("OK", None), ("BAD", "OSError: storage unreachable")):
+        with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"), \
+                mock.patch.object(ws, "MAX_RETURN_FILE", 1024):
+            res = ws.run_job_impl(label, code(err), "q", [], "k", None)
+        tar = res.get("tarball")
+        on_disk = isinstance(tar, str) and os.path.dirname(tar) == os.path.join(root, label) and os.path.exists(tar)
+        names = tarfile.open(tar, mode="r:gz").getnames() if on_disk else []
+        got[label] = (on_disk, "runs/R_x/big.bin" in names, [p for p, _ in res["skipped_large_files"]],
+                      ws.run_stored(tar) if on_disk else "?")
+    ok(got["OK"] == (True, False, ["runs/R_x/big.bin"], "outputs/t/R_x.tar.gz"),
+       f"WS1 the returned tarball is written to disk, never returned as bytes; a stored run's large files stay in "
+       f"storage only: {got['OK']}")
+    ok(got["BAD"] == (True, True, [], None),
+       f"WS2 WS_FALLBACK_LARGE_FILE main.py's store failed: the tarball held for collect keeps every large file: "
+       f"{got['BAD']}")
+
+    # Codex 1E-i round 1. WS2b: a receipt in metadata.json counts only when main.py ended by itself; a run killed
+    # (its time limit, a signal) may carry the receipt of an earlier invocation it resumed. WS2c: a disk too full
+    # for the complete tarball still yields one without the large files, and the task goes on to hold it.
+    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"), \
+            mock.patch.object(ws, "MAX_RETURN_FILE", 1024):
+        res = ws.run_job_impl("KILLED", code(None, "os.kill(os.getpid(), 9)\n"), "q", [], "k", None)
+    names = tarfile.open(res["tarball"], mode="r:gz").getnames()
+    ok(res["exit_code"] == -9 and "runs/R_x/big.bin" in names and res["skipped_large_files"] == []
+       and ws.run_stored(res["tarball"], res["exit_code"]) is None
+       and ws.run_stored(res["tarball"], "timeout") is None and ws.run_stored(res["tarball"], 2) == "outputs/t/R_x.tar.gz",
+       f"WS2b a killed main.py: the receipt in metadata.json is not trusted (large files kept, no stored run "
+       f"recorded): exit {res['exit_code']} {names}")
+    # WS2d (Codex 1E-i round 2): a link an agent left at the tarball's staging name is removed, never written through
+    # WS2e (round 3): a directory at the old staging name does not stop the tarball; a link to a large file outside
+    # the run is left out as before (the collector's extraction refuses such a member), whatever the store did
+    planted = ("os.makedirs('runs/R_x/models')\nopen('runs/R_x/models/out.csv', 'w').write('result')\n"
+               "os.makedirs('result.tar.gz.tmp')\nopen('../outside.bin', 'wb').write(b'y' * 4096)\n"
+               "os.symlink(os.path.abspath('../outside.bin'), 'runs/R_x/models/big_link')\n"
+               "os.symlink('gone_checkpoint', 'runs/R_x/models/dangling')\n"
+               "os.symlink('runs/R_x/models/out.csv', 'result.tar.gz')\n")
+    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"), \
+            mock.patch.object(ws, "MAX_RETURN_FILE", 1024):
+        try:
+            res = ws.run_job_impl("LINK", code("x", planted), "q", [], "k", None)
+        except OSError as e:
+            res = {"tarball": None, "skipped_large_files": [], "error": f"{type(e).__name__}: {e}"}
+    kept = open(os.path.join(root, "LINK", "runs", "R_x", "models", "out.csv"), "rb").read()[:20]
+    names = tarfile.open(res["tarball"], mode="r:gz").getnames() if res["tarball"] else []
+    ok(kept == b"result" and res["tarball"] and not os.path.islink(res["tarball"]) and "runs/R_x/models/out.csv" in names,
+       f"WS2d a link planted at result.tar.gz is replaced, a directory at the old staging name is no obstacle; the "
+       f"output is intact: {kept!r} {res.get('error')}")
+    ok("runs/R_x/big.bin" in names and "runs/R_x/models/big_link" not in names
+       and [p for p, _ in res["skipped_large_files"]] == ["runs/R_x/models/big_link"],
+       f"WS2e the store failed: large files are kept, a link to a large file is still left out: {names}")
+    ok("runs/R_x/models/dangling" in names,
+       f"WS2f (Codex pass on round 3) a link whose target is gone is archived as a link; it does not end the task "
+       f"before the hold: {res.get('error')}")
+    real_add = tarfile.TarFile.add
+
+    def full_disk(self, name, *a, **kw):
+        if str(name).endswith("big.bin"):
+            raise OSError(28, "No space left on device")
+        return real_add(self, name, *a, **kw)
+    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"), \
+            mock.patch.object(ws, "MAX_RETURN_FILE", 1024), mock.patch.object(tarfile.TarFile, "add", full_disk):
+        try:
+            res = ws.run_job_impl("FULL", code("OSError: storage unreachable"), "q", [], "k", None)
+        except OSError as e:
+            res = {"error": str(e), "skipped_large_files": [], "notes": []}
+    names = tarfile.open(res["tarball"], mode="r:gz").getnames() if res.get("tarball") else []
+    ok("runs/R_x/small.txt" in names and "run.log" in names and "runs/R_x/big.bin" not in names
+       and [p for p, _ in res["skipped_large_files"]] == ["runs/R_x/big.bin"]
+       and any("large files" in n for n in res["notes"]) and not [n for n in os.listdir(os.path.join(root, "FULL")) if n.endswith(".tmp")],
+       f"WS2c no room for the complete tarball: the task still returns one without the large files and says so: "
+       f"{names} {res.get('error')} {res['notes'][-1:]}")
+
+    class Store:
+        write_archive, sha256_file = staticmethod(results_store.write_archive), staticmethod(results_store.sha256_file)
+        is_sensitive_path = staticmethod(results_store.is_sensitive_path)
+
+        def __init__(self, gate=None, fail=False):
+            self.files, self.gate, self.fail = {}, gate, fail
+
+        def archive_dir(self, *a, **kw):
+            raise AssertionError("archive_dir: the archive would be built in memory")
+
+        def upload_file(self, path, blob, account=None):
+            if self.gate is not None:
+                self.gate.wait(10)
+            if self.fail:
+                raise OSError("storage unreachable")
+            self.files[blob] = open(path, "rb").read()
+            return {"blob": blob}
+        upload_retry = upload_file
+
+        def download(self, blob, path, account=None):
+            open(path, "wb").write(self.files[blob])
+
+        def list_blobs(self, prefix, account=None):
+            return [{"name": n} for n in sorted(self.files) if n.startswith(prefix)]
+
+        def delete(self, blob, account=None):
+            self.files.pop(blob, None)
+    home, d = os.path.join(root, "home"), os.path.join(root, "OK")
+    st = Store()
+    blob = ws.store_transcripts(d, st, "runs/t", "L1", "OK", None, ["sk-ant-TESTSECRET12345"], home=home)
+    os.makedirs(os.path.join(home, "s1"))
+    open(os.path.join(home, "s1", "t.jsonl"), "w").write("key sk-ant-TESTSECRET12345\n")
+    # WS3b (round 3): a launch tree pinned before this change ships a write_archive without `strict`; and a link an
+    # agent left at transcripts.tar.gz is replaced, never written through (it could point at result.tar.gz)
+    class OldStore(Store):
+        @staticmethod
+        def write_archive(root, arcname, out_path, secrets=None, extra=(), _hook=None, base=None):
+            return results_store.write_archive(root, arcname, out_path, secrets, extra)
+    victim = os.path.join(d, "result.tar.gz")
+    before = open(victim, "rb").read()
+    os.remove(os.path.join(d, "transcripts.tar.gz"))
+    os.symlink(victim, os.path.join(d, "transcripts.tar.gz"))
+    try:
+        old = ws.store_transcripts(d, OldStore(), "runs/t", "L1", "OK", None, [], home=home)
+    except Exception as e:  # noqa: BLE001
+        old = f"{type(e).__name__}: {e}"
+    ok(old == "outputs/runs/t/launch_L1/transcripts_OK.tar.gz" and open(victim, "rb").read() == before
+       and not os.path.islink(os.path.join(d, "transcripts.tar.gz")),
+       f"WS3b transcripts store with an older tree's write_archive, and never through a planted link: {old}")
+    blob2 = ws.store_transcripts(d, st, "runs/t", "L1", "OK", None, ["sk-ant-TESTSECRET12345"], home=home)
+    body = tarfile.open(fileobj=io.BytesIO(st.files.get(blob2, b"")), mode="r:gz").extractfile("transcripts/s1/t.jsonl").read()
+    ok(blob == blob2 == "outputs/runs/t/launch_L1/transcripts_OK.tar.gz" and b"TESTSECRET" not in body,
+       f"WS3 the transcripts are archived by the streaming writer, redacted; a VM with no transcripts yet still "
+       f"stores an (empty) archive: {blob} {body!r}")
+    out = os.path.join(root, "out")
+    os.makedirs(out)
+    open(os.path.join(out, "a.bin"), "wb").write(b"a" * 3000)
+    with mock.patch.object(ws, "_sha_file", mock.Mock(wraps=getattr(ws, "_sha_file", None)), create=True) as spy:
+        rec = ws.store_outputs(out, "outputs/j", None, st)
+    ok(rec["verified"] and rec["files"] == {"a.bin": hashlib.sha256(b"a" * 3000).hexdigest()} and spy.call_count == 2,
+       f"WS4 store_outputs hashes each file and its read-back block by block (ws._sha_file), never with one "
+       f"whole-file read: {rec['why']} calls={spy.call_count}")
+    # WS5 WS_CK_WAIT_IDLE: teardown stops the timer, then waits for the upload in flight (the cluster may shut down
+    # right after). WS6: the counters reach .checkpoint/status.json after every checkpoint, stored or failed.
+    work = os.path.join(root, "W")
+    os.makedirs(os.path.join(work, "runs", "R_x"))
+    json.dump({"state": "ANALYZE", "round": 1}, open(os.path.join(work, "runs", "R_x", "run_state.json"), "w"))
+    gate = threading.Event()
+    st5 = Store(gate=gate)
+    c = ws.Checkpointer("W", work, "runs/t", "L1", None, st5, 3600, log=lambda m: None)
+    c.start()
+    c.trigger("t")
+    threading.Timer(0.4, gate.set).start()
+    box = type("B", (), {"box": c})
+    h5 = ws.stop_checkpointer(box, idle_s=10)
+    ok(c.done == 1 and ws.checkpoint_pointer("runs/t", "L1", "W") in st5.files
+       and (h5 or {}).get("done") == 1 and (h5 or {}).get("last_outcome") == "stopped",
+       f"WS5 WS_CK_WAIT_IDLE teardown returns only once the checkpoint in flight is stored, with the health record "
+       f"for the result record (done={c.done}): {h5}")
+    ok(ws.stop_checkpointer(None) is None and ws.stop_checkpointer(type("B", (), {"box": None})) is None,
+       "WS5b no checkpointer (checkpoints off, or main.py never started): nothing to stop")
+    sp = os.path.join(work, ws.CKDIR, "status.json")
+    s1 = json.load(open(sp)) if os.path.exists(sp) else {}
+    st5.fail, before = True, time.time()
+    c.trigger("t2")
+    c.wait_idle(10)
+    s2 = json.load(open(sp)) if os.path.exists(sp) else {}
+    ok((s1.get("done"), s1.get("failed"), s1.get("generation"), s1.get("last_error")) == (1, 0, 1, None)
+       and s1.get("last_ok_epoch") and s1.get("label") == "W",
+       f"WS6 a stored checkpoint is recorded in .checkpoint/status.json: {s1}")
+    ok((s2.get("done"), s2.get("failed")) == (1, 1) and "storage unreachable" in str(s2.get("last_error"))
+       and s2.get("last_ok_epoch") == s1.get("last_ok_epoch") and (s2.get("updated_epoch") or 0) >= before,
+       f"WS6b a failed checkpoint is counted with its error; the last good time is kept: {s2}")
+
+
 def _self_test_sheet(ok) -> None:
     """2026-11-12: a canary relaunch died in 8 s at SIGN because its spec was amended after its sign-off sheet was
     generated; the pre-launch checks did not look at the sheet. A launch now refuses a resumed run at SIGN whose
@@ -5257,9 +5581,21 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CN: {type(e).__name__}: {e}")
     try:
+        _self_test_collect_import(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CI: {type(e).__name__}: {e}")
+    try:
+        _self_test_collect_labels(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"RL: {type(e).__name__}: {e}")
+    try:
         _self_test_checkpoint(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CK: {type(e).__name__}: {e}")
+    try:
+        _self_test_storage(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"WS: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
@@ -5308,8 +5644,7 @@ def main(argv) -> int:
     elif cmd == "collect":
         collect(cfg, shutdown_after="--no-shutdown" not in rest)
     elif cmd == "checkpoint":
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-        import results_store
+        results_store = _results_store()
         for label in ([rest[rest.index("--label") + 1]] if "--label" in rest else cfg.labels):
             fetch_checkpoint(cfg, results_store, label)
     elif cmd == "checkpoint-now":
