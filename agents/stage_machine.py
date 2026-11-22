@@ -376,14 +376,23 @@ def _owner_rule():
 
 def _bearing_item(run_dir: str, v: dict) -> dict:
     """What the owner is asked about a decision-bearing finding: its claim and the analysis's record of the decision
-    test, fingerprinted (an answer binds to both: a changed result is asked again)."""
+    test, fingerprinted (an answer binds to both: a changed result is asked again). The record is the producer's: the
+    toolkit's verified row (with its result file's hash) for a toolkit finding, the spike's analysis.json otherwise, so
+    a stale file of the other backend never stands in for it (Codex r1 of #327)."""
     ev = None
-    try:
-        with open(os.path.join(run_dir, AB.ANALYSIS_JSON)) as fh:
-            tests = (json.load(fh) or {}).get("decision_tests") or []
-        ev = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(v.get("key"))), None)
-    except (OSError, ValueError, AttributeError, TypeError):
-        ev = None
+    if v.get("source") == "toolkit/analysis/contract.py":      # lead-gaps α: analysis/decision_tests.yaml, verified
+        try:
+            from toolkit.analysis import contract as _CT
+            ev = _CT.decision_test_record(run_dir, v.get("key"))
+        except Exception:  # noqa: BLE001 -- no evidence: the item binds the claim alone, as before
+            ev = None
+    else:
+        try:
+            with open(os.path.join(run_dir, AB.ANALYSIS_JSON)) as fh:
+                tests = (json.load(fh) or {}).get("decision_tests") or []
+            ev = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(v.get("key"))), None)
+        except (OSError, ValueError, AttributeError, TypeError):
+            ev = None
     gid = FL.gate_id(v)
     fp = hashlib.sha256(json.dumps({"finding": gid, "claim": v.get("claim", ""), "evidence": ev}, sort_keys=True,
                                    default=str).encode()).hexdigest()[:16]
@@ -3313,6 +3322,32 @@ def _self_test() -> int:
         _SS.review(d, "decision_test_changes_plan:DT9", "overturn", note="fix the effect first")
         ok([r["review"]["decision"] for r in _SS.provisional(d)] == ["overturn"],
            "T_OWNER_LEAD_REVIEW the owner later overturns (or confirms) a provisional answer; it is recorded")
+        # T_DT_TOOLKIT_FP (lead-gaps α): a toolkit finding's owner item binds the verified row of
+        # analysis/decision_tests.yaml, so a changed result is asked again; a stale spike analysis.json in the run dir
+        # never stands in for it, and a spike finding still binds analysis.json (Codex r1 of #327)
+        from toolkit.analysis import contract as _CTk
+        _rec = _CTk.decision_test_record
+        dtf_t = dict(dtf_e, source="toolkit/analysis/contract.py")
+        try:
+            with tempfile.TemporaryDirectory() as dk:
+                os.makedirs(os.path.join(dk, os.path.dirname(AB.ANALYSIS_JSON)), exist_ok=True)
+                json.dump({"decision_tests": [{"id": "DT9", "plan_changes": True, "text": "stale"}]},
+                          open(os.path.join(dk, AB.ANALYSIS_JSON), "w"))
+                _CTk.decision_test_record = lambda rd, k: {"test_id": k, "verdict": "CHANGES_PLAN", "share_pct": 40.0}
+                fa = _bearing_item(dk, dtf_t)["fingerprint"]
+                _CTk.decision_test_record = lambda rd, k: {"test_id": k, "verdict": "CHANGES_PLAN", "share_pct": 60.0}
+                fb = _bearing_item(dk, dtf_t)["fingerprint"]
+                _CTk.decision_test_record = lambda rd, k: None
+                fc = _bearing_item(dk, dtf_t)["fingerprint"]
+                fs1 = _bearing_item(dk, dtf_e)["fingerprint"]
+                json.dump({"decision_tests": [{"id": "DT9", "plan_changes": True, "text": "new"}]},
+                          open(os.path.join(dk, AB.ANALYSIS_JSON), "w"))
+                fs2 = _bearing_item(dk, dtf_e)["fingerprint"]
+                fc2 = _bearing_item(dk, dtf_t)["fingerprint"]
+        finally:
+            _CTk.decision_test_record = _rec
+        ok(len({fa, fb, fc}) == 3 and fc2 == fc and fs1 != fs2,
+           f"T_DT_TOOLKIT_FP each backend's finding binds its own decision-test record ({fa}, {fb}, {fc}, {fs1}, {fs2})")
         # T_OWNER_LEAD_AMEND (1F, D2): an owner-amendment finding under --signoff lead is answered provisionally too
         d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041")]}}},
                            signoff="lead", max_rounds=2)
@@ -3606,10 +3641,25 @@ def _self_test() -> int:
             s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
             rows = FX.impact_rows(d)
             man = os.path.exists(os.path.join(d, "analysis", "manifest.json"))
-            ok(s == "completed" and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
-               and FL.load(d)["D-001"].status == "fixed",
-               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto ({s}"
-               + ("" if s == "completed" else   # why it ended: CI showed only the status (flaky once on #156 and #160)
+            # lead-gaps α: the toy's automatic decision tests change the plan, so the toolkit backend now emits
+            # decision_test_changes_plan for each; this --signoff lead run answers them provisionally (never pausing) and
+            # is declared, not accepted, with each flagged above the draft. Everything else T36 checked is unchanged.
+            # the expected ids are read from the artifact itself, not through the reader under test (Codex r1 of #327)
+            _dt36 = (yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml"))) or {}).get("data") or {}
+            want = sorted(f"decision_test_changes_plan:{t.get('test_id')}" for t in _dt36.get("tests") or []
+                          if t.get("verdict") == "CHANGES_PLAN")
+            import scope_signoff as _SS36
+            prov36 = sorted(r["finding"] for r in _SS36.provisional(d) if r.get("plan_changing"))
+            rep36 = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+            sp36 = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep36 else [0, 0]
+            exp36 = "completed_scope_declared"
+            ok(want and s == exp36 and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
+               and FL.load(d)["D-001"].status == "fixed" and prov36 == want
+               and not any(h.get("paused") for h in load_state(d).history)
+               and all(w in rep36[:sp36[0]] for w in want),
+               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto; each decision "
+               f"test that changes the plan is answered provisionally and flagged above the draft ({s}, {want}, {prov36}"
+               + ("" if s == exp36 else   # why it ended: CI showed only the status (flaky once on #156 and #160)
                   f"; path {[h.get('to') for h in load_state(d).history if 'to' in h]}; "
                   f"final {[h.get('why') for h in load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
         else:
