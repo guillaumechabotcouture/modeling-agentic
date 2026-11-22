@@ -1,5 +1,9 @@
 """Decision tests (spike lesson 8): does the plan change when a quantity is varied?
 
+W0-B: a spec declares one generic type, `perturb` (what is moved, how, to what: toolkit/spec/perturb.py). Every type
+below is an alias that compiles to it; run_one executes each test in its per-target form (perturb.view), the branches
+below, and records the compiled test with the layer it acts on (`perturb`).
+
 Types (spec `analysis.decision_tests`):
   interaction_rescale  the spike's DT1: the increment of `components` on top of any of `with_any`
                        is rescaled so the engine's interaction odds ratio in the benchmark setting
@@ -157,7 +161,8 @@ def check_departures(A, recs) -> list[dict]:
     from toolkit.engines import benchmark_coverage as BC
     name = A.eng.describe().name
     ref = f"{type(A.eng).__module__}:{type(A.eng).__name__}"
-    tests = {str(t.get("id")): t for t in A.spec["analysis"].get("decision_tests") or []}
+    from toolkit.spec import perturb as PT
+    tests = {str(t.get("id")): t for t in PT.tests(A.spec["analysis"])}
     recs2 = {}
     for r in recs:
         tid = str(r.get("test_id"))
@@ -453,20 +458,22 @@ def unit_attribute_cases(spec, dt) -> dict:
         chosen = [str(x) for x in sel]
     else:
         return {"why": "units: `all` or a non-empty list of unit ids"}
-    modes = [k for k in ("values", "scale", "set_from") if k in ua]
+    modes = [k for k in ("values", "scale", "shift", "set_from") if k in ua]
     if len(modes) != 1:
-        return {"why": f"give exactly one of values, scale or set_from (got {modes or 'none'})"}
+        return {"why": f"give exactly one of values, scale, shift or set_from (got {modes or 'none'})"}
     mode = modes[0]
     old = {i: _num_or_none(u[col]) for i, u in zip(ids, base)}
     if any(old[i] is None for i in chosen):
         return {"why": f"column {col} is not a finite number in every selected unit"}
     cases, inputs = [], {}
-    if mode in ("values", "scale"):
+    if mode in ("values", "scale", "shift"):     # W0-B: shift adds the value to each listed unit's cell
         xs = ua[mode]
         if not isinstance(xs, list) or not xs or any(_num_or_none(x) is None for x in xs):
             return {"why": f"{mode}: a non-empty list of numbers"}
         for x in xs:
-            cases.append((float(x), {i: float(x) if mode == "values" else old[i] * float(x) for i in chosen}))
+            cases.append((float(x), {i: float(x) if mode == "values" else old[i] * float(x) if mode == "scale"
+                                     else old[i] + float(x) for i in chosen}))
+
     else:
         import csv
         import hashlib
@@ -565,9 +572,10 @@ def constraints_of(A) -> tuple:
 def arm_tables(spec) -> list[list[dict]]:
     """Every units table a unit_attribute test of the spec evaluates (Spec.packages prunes over these too, so the
     headline and every arm share one package set)."""
+    from toolkit.spec import perturb as PT
     out = []
-    for dt in (spec.raw.get("analysis") or {}).get("decision_tests") or []:
-        if isinstance(dt, dict) and dt.get("type") == "unit_attribute":
+    for dt in PT.tests(spec.raw.get("analysis")):
+        if dt.get("type") == "unit_attribute":
             c = unit_attribute_cases(spec, dt)
             out += [] if "why" in c else [_arm_rows(c, new) for _lbl, new in c["cases"]]
     return out
@@ -953,6 +961,19 @@ def _calibration_target(A, dt, z0) -> dict:
 
 
 def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
+    """W0-B: every test runs as a `perturb` test (toolkit/spec/perturb.py). An older type is an alias compiled to one;
+    the executor below takes the per-target form (perturb.view). The record keeps the test's own type ("perturb" for a
+    native one), and `perturb` holds the compiled test with the layer it acts on and its engine rows."""
+    from toolkit.spec import perturb as PT
+    p = PT.compile(dt)
+    rec = _run_one(A, PT.view(p), z0, ben0, cost0, plan, uq_data, out0)
+    if dt.get("type") == PT.TYPE:
+        rec["type"] = PT.TYPE
+    rec["perturb"] = dict(p, layer=PT.layer(p, getattr(A.model, "kind", None), len(A.ids), len(A.pk)))
+    return rec
+
+
+def _run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     t = dt["type"]
     thr = _threshold(A)
     sv = None                      # a parameter_value test on a spec-declared engine parameter value

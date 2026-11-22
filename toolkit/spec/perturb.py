@@ -72,29 +72,199 @@ META = ("type", "set", "alias", "conditional", "layer")
 TOP = ("id", "type", "text", "finding", "set", "conditional")     # a spec's perturb test, at its top level
 
 
-
-def compile(dt):  # noqa: A001 -- alpha: not yet implemented
-    return dt
-
-
-def view(p):
-    return p
+def _isnum(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))
 
 
-def conditional(p):
-    return False
+def compile(dt: dict) -> dict:  # noqa: A001 -- the alias compiler
+    """A decision test as a `perturb` test. A native one is returned as a copy; an alias is translated (its type kept
+    as `alias`); a field the translation does not take stays at the top level, so nothing is lost. ValueError for a
+    type that is neither."""
+    if not isinstance(dt, dict):
+        raise ValueError(f"a decision test is a mapping, not {type(dt).__name__}")
+    t = dt.get("type")
+    if t == TYPE:
+        return copy.deepcopy(dt)
+    if t not in ALIASES:
+        raise ValueError(f"decision test {dt.get('id')}: unknown type {t!r}")
+    kind, rest = ALIASES[t], {k: v for k, v in dt.items() if k != "type"}
+    tgt = {"target": kind}
+    targets = [tgt]
+    if kind == "parameter":
+        for k_from, k_to in (("parameter", "name"), ("values", "values")):
+            if k_from in rest:
+                tgt[k_to] = rest.pop(k_from)
+        if t in ("prior_range", "fitted_range") and "values" in tgt:
+            tgt["range_end"] = tgt.pop("values")     # the harness's range-end tests carry their resolved ends
+        w = rest.get("with")
+        if isinstance(w, dict) and w:
+            targets += [{"target": "parameter", "name": k, "value": v} for k, v in rest.pop("with").items()]
+    elif kind == "cost_item":
+        m, targets = rest.get("multipliers"), []        # a multipliers field it cannot read stays as given
+        if isinstance(m, dict) and m:
+            targets = [{"target": "cost_item", "name": k, "scale": v} for k, v in rest.pop("multipliers").items()]
+    elif kind == "group_rule":
+        for k_from, k_to in (("rule", "remove"), ("add", "add")):
+            if k_from in rest:
+                tgt[k_to] = rest.pop(k_from)
+    elif t in NESTED:
+        b = rest.get(NESTED[t])
+        if isinstance(b, dict) and "target" not in b and "name" not in b:
+            rest.pop(NESTED[t])
+            tgt.update({("name" if (k == "column" and kind == "unit_column") else k): v for k, v in b.items()})
+    else:                                   # interaction, envelope, boundary_engine, anchor: flat fields
+        for k in ({"interaction": ("benchmark", "components", "with_any", "values"), "envelope": ("values",),
+                   "anchor": ("anchors", "ends", "values")}.get(kind) or ()):
+            if k in rest:
+                tgt[k] = rest.pop(k)
+    return {"type": TYPE, "alias": t, "set": targets, **rest}
 
 
-def problems(p):
-    return []
+def view(p: dict) -> dict:
+    """The per-target form a `perturb` test executes as (its alias's fields), for the executor and every reader. A test
+    of another type is returned as it is; a `perturb` test whose targets cannot be read is too (validation reports
+    it: problems)."""
+    if not isinstance(p, dict) or p.get("type") != TYPE:
+        return p
+    try:
+        return _view(p)
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError):
+        return p
 
 
-def tests(analysis):
-    return []
+def _view(p: dict) -> dict:
+    targets = p["set"]
+    kinds = {t["target"] for t in targets}
+    alias = p.get("alias")
+    kind = ALIASES[alias] if alias else next(iter(kinds))
+    if kinds - {kind} or (not targets and kind != "cost_item"):
+        raise ValueError("mixed targets")
+    out = {k: v for k, v in p.items() if k not in META}
+    out["type"] = alias or EXEC[kind]
+    first = targets[0] if targets else {}
+    if kind == "parameter":
+        for k_from, k_to in (("name", "parameter"), ("values", "values"), ("range_end", "values")):
+            if k_from in first:
+                out[k_to] = first[k_from]
+        if len(targets) > 1:
+            out["with"] = {t["name"]: t["value"] for t in targets[1:]}
+    elif kind == "cost_item":
+        if targets:
+            out["multipliers"] = {t["name"]: t["scale"] for t in targets}
+    elif kind == "group_rule":
+        for k_from, k_to in (("remove", "rule"), ("add", "add")):
+            if k_from in first:
+                out[k_to] = first[k_from]
+    elif out["type"] in NESTED and NESTED[out["type"]] not in out:     # a block compile could not read stays as given
+        out[NESTED[out["type"]]] = {("column" if (k == "name" and kind == "unit_column") else k): v
+                                    for k, v in first.items() if k != "target"}
+    else:
+        out.update({k: v for k, v in first.items() if k != "target"})
+    if len(targets) > 1 and kind not in ("parameter", "cost_item"):
+        raise ValueError("several targets")
+    return out
 
 
-def layer(p, evaluation, n_units, n_packages):
-    return {}
+def conditional(p: dict) -> bool:
+    """A test that holds a second parameter in every case is conditional on it (#294): it carries no benchmark
+    departure and is no dossier range test."""
+    ts = p.get("set") if isinstance(p, dict) else None
+    return isinstance(ts, list) and sum(isinstance(t, dict) and t.get("target") == "parameter" for t in ts) > 1
+
+
+def problems(p: dict) -> list[str]:
+    """Structural problems of a spec-declared `perturb` test (the per-target checks then run on view(p), as for its
+    alias): the set, each target's kind, fields and operation, the combinations allowed, `conditional`."""
+    i = p.get("id")
+    bad = []
+    if "alias" in p:
+        bad.append(f"decision test {i}: alias is set by the harness when it translates an older type; a spec does not "
+                   "declare it")
+    top = sorted(set(map(str, p)) - set(TOP))
+    if top:
+        bad.append(f"decision test {i}: a perturb test takes {', '.join(TOP)} at its top level, not {top} (what it "
+                   "moves goes in its targets)")
+    ts = p.get("set")
+    if not (isinstance(ts, list) and ts and all(isinstance(t, dict) for t in ts)):
+        return bad + [f"decision test {i}: set is a non-empty list of targets ({{target: <kind>, ..}})"]
+    kinds = [t.get("target") for t in ts]
+    for n, t in enumerate(ts):
+        k = t.get("target")
+        if k in AUTOMATIC:
+            bad.append(f"decision test {i}: target {k} is generated by the harness only")
+            continue
+        if k not in FIELDS:
+            bad.append(f"decision test {i}: unknown target {k!r} (known: {', '.join(sorted(FIELDS))})")
+            continue
+        extra = sorted(set(t) - FIELDS[k] - {"target"})
+        if "range_end" in t:
+            bad.append(f"decision test {i}: range_end tests are generated by the harness (prior_range_, "
+                       "fitted_range_); a spec sets values")
+        elif extra:
+            bad.append(f"decision test {i}: target {k} does not take {extra} (it takes {sorted(FIELDS[k])})")
+        if k == "parameter":
+            op = "values" if n == 0 else "value"
+            if set(t) & {"values", "value"} != {op}:
+                bad.append(f"decision test {i}: the {'first' if n == 0 else 'held'} parameter target sets {op}"
+                           + (" (the values swept)" if n == 0 else " (one number, held in every case)"))
+            elif n and not _isnum(t["value"]):
+                bad.append(f"decision test {i}: held parameter {t.get('name')!r}: value is a finite number")
+            if not isinstance(t.get("name"), str) or not t.get("name"):
+                bad.append(f"decision test {i}: a parameter target names its engine parameter (name)")
+        elif k == "unit_column" and len(set(t) & set(UNIT_OPS)) != 1:
+            bad.append(f"decision test {i}: a unit_column target takes exactly one of {', '.join(UNIT_OPS)}")
+        elif k == "cost_item" and not (_isnum(t.get("scale")) and t["scale"] > 0):
+            bad.append(f"decision test {i}: cost item {t.get('name')!r}: scale is a positive number")
+        elif k == "group_rule" and len(set(t) & {"remove", "add"}) != 1:
+            bad.append(f"decision test {i}: a group_rule target takes remove or add")
+    ks = set(kinds)
+    if len(ts) > 1 and not (ks == {"parameter"} or ks == {"cost_item"}):
+        bad.append(f"decision test {i}: targets {sorted(map(str, ks))} cannot be applied together (several targets: "
+                   "parameters, the first swept and the others held, or cost items, one price case)")
+    names = [str(t.get("name")) for t in ts if t.get("target") in ("parameter", "cost_item")]
+    if len(set(names)) != len(names):
+        bad.append(f"decision test {i}: a target is named twice ({sorted({x for x in names if names.count(x) > 1})})")
+    if "conditional" in p and p["conditional"] is not conditional(p):
+        bad.append(f"decision test {i}: conditional is {conditional(p)} for this set (true exactly when a second "
+                   "parameter is held); it is derived, so leave it out or state it as derived")
+    return bad
+
+
+def tests(analysis) -> list:
+    """Every declared decision test of an `analysis` block in its per-target form (view), for the readers."""
+    an = analysis if isinstance(analysis, dict) else {}
+    return [view(t) for t in an.get("decision_tests") or [] if isinstance(t, dict)]
+
+
+def cases(p: dict) -> int:
+    """How many cases a test evaluates (its first target's sweep)."""
+    x = view(p) if p.get("type") == TYPE else p
+    t = x.get("type")
+    if t in ("cost_items", "calibration_target", "boundary_engine", "group_rule"):
+        return 1
+    if t == "unit_attribute":
+        ua = x.get("unit_attribute") or {}
+        return 1 if "set_from" in ua else len(next((ua[k] for k in UNIT_OPS if k in ua), None) or [])
+    if t == "outcome_ratio":
+        return len((x.get("outcome_ratio") or {}).get("values") or [])
+    if t == "burden_scale":
+        return len((x.get("burden_scale") or {}).get("shares") or [])
+    return len(x.get("values") or [])
+
+
+def layer(p: dict, evaluation: str, n_units: int, n_packages: int) -> dict:
+    """Where a test acts and what it costs: {layer, cases, engine_rows}. post_emulator: re-solved on the point
+    outputs; emulator_design: the emulator evaluated inside its design box; engine: each case evaluates every unit and
+    package on the engine (direct evaluation)."""
+    q = compile(p)
+    kind = (q.get("set") or [{}])[0].get("target") if q.get("set") else ALIASES.get(q.get("alias"), "cost_item")
+    try:
+        n = cases(q)
+    except (TypeError, AttributeError, ValueError):      # a malformed test is refused by its own branch, not here
+        n = None
+    lay = "post_emulator" if kind not in EVALUATED else "emulator_design" if evaluation == "emulator" else "engine"
+    rows = 0 if lay != "engine" else None if n is None else int(n) * int(n_units) * int(n_packages)
+    return {"layer": lay, "cases": n, "engine_rows": rows}
 
 
 # ------------------------------------------------------------------ self-test
@@ -135,7 +305,7 @@ def _self_test() -> int:
         {"id": "anchor_range_N", "type": "anchor_range", "anchors": ["N0"], "values": [0.025, 0.975],
          "ends": {0.025: {"anchor:N0": 1.0}, 0.975: {"anchor:N0": 2.0}}, "automatic": True},
     ]
-    seen = set()
+    seen, by_id = set(), {dt["id"]: dt for dt in shapes}
     for dt in shapes:
         p = compile(dt)
         seen.add(dt["type"])
@@ -208,8 +378,8 @@ def _self_test() -> int:
     # DT_PERTURB_LAYER_COST: the layer each test acts on and its engine rows
     ok(layer(nat, "emulator", 10, 4) == {"layer": "emulator_design", "cases": 2, "engine_rows": 0}
        and layer(nat, "direct", 10, 4) == {"layer": "engine", "cases": 2, "engine_rows": 80}
-       and layer(shapes[9], "direct", 10, 4)["layer"] == "post_emulator"
-       and layer(shapes[15], "emulator", 10, 4) == {"layer": "post_emulator", "cases": 2, "engine_rows": 0}
+       and layer(by_id["env"], "direct", 10, 4)["layer"] == "post_emulator"
+       and layer(by_id["DTo"], "emulator", 10, 4) == {"layer": "post_emulator", "cases": 2, "engine_rows": 0}
        and layer(nu, "direct", 5, 3)["engine_rows"] == 15 and layer(nc, "direct", 5, 3)["engine_rows"] == 15,
        "PT21 DT_PERTURB_LAYER_COST: post_emulator, emulator_design or engine, with the engine row count")
 
