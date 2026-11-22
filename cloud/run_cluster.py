@@ -1487,6 +1487,22 @@ def keeper_lines(st: dict | None, now: float | None = None) -> list[str]:
     return out
 
 
+def recorded_labels(cfg, assign: dict) -> list:
+    """The labels `collect` and `status` act on: every label the launch recorded in assignments.json, merged with
+    cfg.labels (2026-11-22 baseline hb1: cfg.labels comes from EVAL_REPS at collect time, and with it unset R2 was
+    skipped without a message). A difference between the two is named; a cfg label with no launch record is
+    skipped, since there is nothing to collect for it."""
+    extra = sorted(k for k in assign if k not in cfg.labels)
+    unlaunched = [k for k in cfg.labels if k not in assign]
+    if extra:
+        print(f"WARNING: {os.path.basename(cfg.state_file)} records label(s) {extra} that this config's labels "
+              f"{list(cfg.labels)} do not name (EVAL_REPS?); they are included")
+    if unlaunched:
+        print(f"WARNING: label(s) {unlaunched} of this config have no launch record in "
+              f"{os.path.basename(cfg.state_file)}; skipped")
+    return [k for k in cfg.labels if k in assign] + extra
+
+
 def status(cfg):
     run, keep = is_running(cfg.name), is_running(cfg.keeper_name)
     ovf = is_running(cfg.overflow_name)
@@ -1503,7 +1519,7 @@ def status(cfg):
         return
     assign = json.load(open(cfg.state_file))
     client = attach(cfg.name).get_client()
-    for label in cfg.labels:
+    for label in recorded_labels(cfg, assign):
         m = _on_worker(client, ws.fetch_meta, label, worker=assign[label]["worker"])
         if m["state"] != "done":
             print(f"{label}: {m['state']} (log {m.get('log_bytes', 0)} bytes)")
@@ -1799,7 +1815,7 @@ def collect(cfg, shutdown_after: bool = True):
     if not os.path.exists(cfg.state_file):
         raise SystemExit(f"no {cfg.state_file}: this machine did not launch {cfg.name}")
     assign, client, pending = json.load(open(cfg.state_file)), None, []
-    for label in cfg.labels:
+    for label in recorded_labels(cfg, assign):
         dest = os.path.join(cfg.out_dir, label)
         cur = local_is_current(dest, assign[label]["launch_id"])
         if cur:
@@ -1841,6 +1857,9 @@ def collect(cfg, shutdown_after: bool = True):
                   indent=1)
         _on_worker(client, ws.mark_collected, label, worker=w)
         print(f"{label}: collected from the VM -> {dest}")
+    if running and pending and shutdown_after:
+        print(f"not shutting down: {', '.join(pending)} {'has' if len(pending) == 1 else 'have'} no final result "
+              f"yet (still running); collect again once status shows every label done")
     if running and not pending and shutdown_after:
         print("every run is collected: shutting down")
         shutdown(cfg)
@@ -4151,6 +4170,68 @@ def _self_test_collect_import(ok) -> None:
            f"{cid}: `collect` hands collect_from_storage this repo's scripts/results_store.py ({got})")
 
 
+def _self_test_collect_labels(ok) -> None:
+    """RL1-RL5 (2026-11-22 baseline hb1: collect and status looped over cfg.labels, which EVAL_REPS sets at
+    collect time; with it unset R2 was skipped without a message, and a plain `collect` could have shut down a
+    cluster still running R2). The labels come from the launch record (assignments.json), merged with cfg.labels,
+    and the default shutdown is refused while any recorded label has no final result."""
+    import tempfile
+    from unittest import mock
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "cfg.py")
+    open(path, "w").write("from run_cluster import RunConfig\n"
+                          f"CONFIG = RunConfig(name='rl', question_file='q', labels=('R1',), out_dir={tmp!r}, "
+                          f"tree={os.path.dirname(HERE)!r})\n")
+    json.dump({"R1": {"launch_id": "L1", "worker": "w1"}, "R2": {"launch_id": "L1", "worker": "w2"}},
+              open(os.path.join(tmp, "assignments.json"), "w"))
+
+    class _Cl:
+        def get_client(self):
+            return object()
+
+    def run(stored, worker_state, extra=()):
+        got, downs, out = [], [], io.StringIO()
+
+        def from_storage(cfg, store, label, *a, **k):
+            if label not in stored:
+                raise FileNotFoundError(label)
+            got.append(label)
+            return {"exit_code": 0, "duration_s": 1}
+        with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: True,
+                                         "_results_store": lambda: None,
+                                         "collect_from_storage": from_storage,
+                                         "checkpoint_record": lambda *a, **k: None,
+                                         "local_is_current": lambda *a, **k: None,
+                                         "attach": lambda n: _Cl(),
+                                         "_on_worker": lambda c, fn, label, worker: {"state": worker_state},
+                                         "shutdown": lambda c: downs.append(c.name)}), \
+                contextlib.redirect_stdout(out):
+            rc_ = main(["run_cluster.py", path, "collect", *extra])
+        return rc_, got, downs, out.getvalue()
+
+    rc_, got, downs, out = run({"R1", "R2"}, "done")
+    ok(got == ["R1", "R2"] and len(downs) == 1,
+       f"RL1 collect takes R2 from assignments.json although cfg.labels is ('R1',) (got {got}, downs {downs})")
+    ok("R2" in out and "WARNING" in out, f"RL2 collect says the recorded labels differ from cfg.labels ({out!r})")
+    rc_, got, downs, out = run({"R1"}, "running")
+    ok(got == ["R1"] and downs == [] and "R2" in out and "not shutting down" in out,
+       f"RL3 the default shutdown is refused while R2 has no final result, naming R2 (downs {downs}, {out!r})")
+    json.dump({"R2": {"launch_id": "L1", "worker": "w2"}}, open(os.path.join(tmp, "assignments.json"), "w"))
+    rc_, got, downs, out = run({"R2"}, "done")
+    ok(got == ["R2"] and "R1" in out and "no launch record" in out,
+       f"RL4 a cfg label with no launch record is named and skipped, not a KeyError (got {got}, {out!r})")
+    json.dump({"R1": {"launch_id": "L1", "worker": "w1"}, "R2": {"launch_id": "L1", "worker": "w2"}},
+              open(os.path.join(tmp, "assignments.json"), "w"))
+    seen, out = [], io.StringIO()
+    with mock.patch.dict(globals(), {"is_running": lambda n, lister=None: n == "rl", "attach": lambda n: _Cl(),
+                                     "_on_worker": lambda c, fn, label, worker: (seen.append(label)
+                                                                                 or {"state": "running"})}), \
+            contextlib.redirect_stdout(out):
+        main(["run_cluster.py", path, "status"])
+    ok(seen == ["R1", "R2"] and "R2: running" in out.getvalue(),
+       f"RL5 status reports every recorded label, R2 included ({seen}, {out.getvalue()!r})")
+
+
 def _self_test_eval_configs(ok) -> None:
     """EV (harness benchmark protocol, owner 2026-11-21: an `ev` budget scope of $450): every eval config states
     its cap (US$35 per run, times its replicates), runs v2 with lead sign-off, 3 rounds and a US$35 model cap, and
@@ -5311,6 +5392,10 @@ def _self_test() -> int:
         _self_test_collect_import(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CI: {type(e).__name__}: {e}")
+    try:
+        _self_test_collect_labels(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"RL: {type(e).__name__}: {e}")
     try:
         _self_test_checkpoint(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
