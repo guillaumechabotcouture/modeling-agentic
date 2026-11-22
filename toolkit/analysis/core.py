@@ -387,5 +387,19 @@ def q(v, level=0.95) -> dict | None:
     if not np.all(np.isfinite(v)):      # 1C-b 2d-iii: fail closed (one NaN made every quantile NaN)
         raise ValueError(f"quantiles: {int(np.sum(~np.isfinite(v)))} of {len(v)} values are not finite")
     a = 100 * (1 - level) / 2
-    return {"median": float(np.median(v)), "ci_low": float(np.percentile(v, a)),
-            "ci_high": float(np.percentile(v, 100 - a)), "mean": float(v.mean()), "level": level}
+    n = len(v)
+    try:      # hb1 fix 11 (L): the one estimator of both uncertainty files; an exactly rounded sum, no cancellation
+        mean = math.fsum(v) / n
+    except OverflowError:
+        mean = math.fsum(v / n)
+    med, lo, hi = float(np.median(v)), float(np.percentile(v, a)), float(np.percentile(v, 100 - a))
+    if not all(math.isfinite(x) for x in (med, lo, hi)):      # numpy's interpolation overflowed near the largest float
+        s = np.sort(v)
+
+        def lerp(p):
+            h = (n - 1) * p / 100.0
+            k = int(math.floor(h))
+            t = h - k
+            return float(s[k]) if k + 1 >= n else float(s[k] * (1 - t) + s[k + 1] * t)
+        med, lo, hi = lerp(50.0), lerp(a), lerp(100 - a)
+    return {"median": med, "ci_low": lo, "ci_high": hi, "mean": float(mean), "level": level}
