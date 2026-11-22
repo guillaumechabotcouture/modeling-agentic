@@ -1062,6 +1062,34 @@ def _self_test() -> int:
         o4 = cover_features([0, 1], {1}, [[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]])
         ok(o4 == [3, 1], f"BA-XU7 of the units tied at a missing extreme, one that can take a training point is used: {o4}")
     case("BA-XU2", bxu2)
+
+    def ba_sc1():
+        # eval baseline: a log-named attribute on [-8, 2] with no declared scale was read on the log scale (exp(z) > 0),
+        # so the likelihood fit ran into the bound and was refused. Undeclared now follows the engine card (a range
+        # going below 0: linear), and the same toy panel calibrates with no parameter at a bound.
+        import yaml
+        from toolkit.analysis import run as R
+        from toolkit.analysis.calibration import CalibrationRefused, fit_likelihood
+        from toolkit.analysis.model import DirectModel
+        from toolkit.spec.schema import load
+        with tempfile.TemporaryDirectory() as d:
+            R._direct_toy(d)
+            sp = os.path.join(d, "decision_spec.yaml")
+            raw = yaml.safe_load(open(sp))
+            raw["calibration"].pop("scale", None)
+            yaml.safe_dump(raw, open(sp, "w"))
+            spec = load(sp)
+            m = DirectModel(spec, log=lambda *a: None)
+            m.fit()
+            try:
+                fit = fit_likelihood(spec, m, identifiability=False)
+                good, why = fit["cov"] is not None and not fit["diagnostics"]["at_bound"], fit["diagnostics"]["at_bound"]
+            except CalibrationRefused as e:
+                good, why = False, str(e)[:200]
+            ok(spec.calibration_scale() == "linear" and calibrated_value(spec, -1.0) == -1.0 and good,
+               f"BA-SC1 an undeclared scale for an attribute whose card range goes below 0 is linear, and the toy panel "
+               f"calibrates ({spec.calibration_scale()}, {why})")
+    case("BA-SC1", ba_sc1)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1
