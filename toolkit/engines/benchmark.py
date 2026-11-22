@@ -818,6 +818,8 @@ class Runner:
         out.update(computed=float(np.exp(np.mean(np.log(per)))),
                    se_log=float(np.std(np.log(per), ddof=1) / math.sqrt(len(per))) if len(per) > 1 else None)
         out.update(_spread(per))
+        if getattr(self, "full_precision", False):      # W0-C effect fit: its acceptance rule reads unrounded values
+            out["per_seed_full"] = [float(x) for x in per]
         return self._verdict(b, out)
 
     # -------------------------------------------------------------- v2d δ: value / identity / coverage

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Trial fit of the net-effect parameters (design: ENGINE_NOTES.md, v0.17; option A and v0.18's net_deter_sat below).
+
+W0-C: the method now lives in toolkit/engines/effect_fit.py (disease-agnostic), and this pack's fit is declared in
+data in effect_fit.yaml beside this file (targets with their estimand fields, boxes, waves, cutoff, acceptance).
+This script stays as the record of F6's runs and their stored checkpoints; new fits use the core. NE_DECL checks that
+effect_fit.yaml states the constants below.
 Wave 1 ran on cluster 2375765 (net_effect_fit_wave1.yaml: sample invalid, 8/12 verified points in band); `run` is
 now wave 2, which reuses wave 1's engine results (load_wave1) and runs only new points (fit_waves). Wave 2 ran on
 cluster 2377496 (invalid, 9/12; its choice extrapolated past the design); `run --verify-round` reads wave 2's stored
@@ -2819,12 +2824,55 @@ def _self_test() -> int:
         ok("12" in got and v1_problems(12, 11) and not v1_problems(12, 12) and not v1_problems(12, 400),
            f"FV5 the round needs 12 verified sample points ({got[:90]}; {v1_problems(12, 11)})")
     case("FV5", fv5)
+    case("NE_DECL", lambda: _self_test_declaration(ok, p))
     OPTION_A["cap_usd"] = shipped_cap
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_declaration(ok, p: dict) -> None:
+    """NE_DECL (W0-C): effect_fit.yaml, the pack's declaration for the generic core, states this module's option A
+    constants; the core's acceptance statistic and verdicts agree with ACCEPTANCE_RULE's here on the same values (no
+    engine run). A declared difference: this script's runner rows carry per-seed values rounded to 4 decimals, the
+    core's adapter reads them unrounded, so a value within 5e-5 of a band edge can be judged differently on a new run
+    (a replay from a stored cache reads the stored values)."""
+    from toolkit.engines import effect_fit as EF
+    decl, pk, cov, ver = EF.pack_files(os.path.join(HERE, "effect_fit.yaml"))
+    probs = EF.declaration_problems(decl, pk) + EF.coverage_problems(decl, cov, ver)
+    rb, v1 = OPTION_A["refit_b"], OPTION_A["verify_v1"]
+    ext, w = rb["extension"], decl["design"]["waves"]
+    dbox = lambda wv: {k: wv.get("box", {}).get(k, v["box"]) for k, v in decl["parameters"].items()}  # noqa: E731
+    a = decl["acceptance"]
+    ok(not probs and list(decl["targets"]) == OPTION_A["targets"] and decl["monitor"] == OPTION_A["monitor"]
+       and {k: v["box"] for k, v in decl["parameters"].items()} == p["fit_joint"]["params"]
+       and list(decl["parameters"]) == list(p["fit_joint"]["params"])
+       and decl["confounded"] == [list(c) for c in CONFOUNDED]
+       and [x["n"] for x in w] == [OPTION_A["design_n"], OPTION_A["wave2_n"], ext["n"]]
+       and [x["seed"] for x in w] == [DESIGN["seed"], WAVE2["seed"], ext["seed"]]
+       and dbox(w[0]) == rb["design_box"] == dbox(w[1])
+       and dbox(w[2]) == dict(rb["design_box"], **{ext["param"]: ext["range"]})
+       and decl["history_matching"]["candidate_seed"] == v1["candidate_seed"] and a["pick_seed"] == v1["pick_seed"]
+       and a["verify_n"] == VERIFY and a["sample_n"] == SAMPLE and a["control_tolerance"] == CAL_TOL
+       and abs(EF.z_of(a["level"]) - Z95) < 1e-3
+       and decl["history_matching"]["cutoff"] == -1.0       # the 20 Nov round's --margin-loo (FV4 checks its launch)
+       and decl["edge_checks"] == [{"param": PAD_CEILING["param"], "side": "hi", "within": 0.02,   # edge_diagnostic
+                                    "targets": ["B9d", "B9e", "B9f"], "basis": PAD_CEILING["basis"]}]
+       and decl["edge_checks"][0]["param"] == PAD_CEILING["param"]
+       and decl["parameters"][PAD_CEILING["param"]]["box"] == [PAD_CEILING["lo"], PAD_CEILING["hi"]],
+       f"NE_DECL effect_fit.yaml states option A's targets, monitors, boxes, waves, seeds and acceptance {probs}")
+    rng = np.random.default_rng(5)
+    seeds, same, agree = list(pk["seeds"]), True, True
+    for _ in range(300):
+        v = np.exp(rng.normal(np.log(0.5), 0.15, len(seeds))).tolist()
+        band = sorted(np.exp(rng.normal(np.log(0.5), 0.2, 2)).tolist())
+        old, new = seed_interval(v, len(seeds)), EF.seed_interval(v, len(seeds), a["level"])
+        same &= all(abs(x / y - 1) < 1e-3 for x, y in zip(old, new))
+        j = EF.judge({"theta": {}, "per_seed": {"T": v}}, {"T": band}, seeds, a)
+        agree &= point_in_band({"per_seed": {"T": v}}, {"T": band}, seeds)[0] == j["met"]
+    ok(same and agree, "NE_DECL the core's seed interval and verdict agree with ACCEPTANCE_RULE's on 300 cases")
 
 
 def main(argv=None) -> int:
