@@ -54,6 +54,7 @@ TOPICS = ("net_type", "smc_vs_cm", "irs", "resistance_field_values", "price_brac
 GUARD_REASONS = ("effect_vs_own_parameter", "input_determined", "input_determined_pair", "engine_blind",
                  "confounded_independence")
 from toolkit.analysis import belief_table as _BT  # noqa: E402
+from toolkit.spec import perturb as _PT  # noqa: E402
 
 SEED_REL = "world_model_seed.yaml"
 MAP_REL = "outcome_map.yaml"
@@ -480,7 +481,8 @@ def decision_context(spec, card, public, beliefs=(15, 30), topics=TOPICS, topic_
         "decision_tests": [{"id": t.get("id"), "type": t.get("type"), "text": m(t.get("text")),
                             **({"parameter": t["parameter"]} if t.get("parameter") else {}),
                             **({"components": t["components"]} if t.get("components") else {})}
-                           for t in an.get("decision_tests") or spec.get("decision_tests") or []],
+                           for t in (_PT.tests(an) if an.get("decision_tests")       # W0-B: per-target form
+                                     else _PT.tests({"decision_tests": spec.get("decision_tests")}))],
         "decision_thresholds": "a test changes the plan when more than a tenth of units change package, regret "
                                "exceeds a hundredth of the objective, or more than a twentieth of the budget moves",
         "engine_departures": [m(d.get("reason")) for d in spec.get("engine_departures") or []],
