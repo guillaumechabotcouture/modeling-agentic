@@ -121,6 +121,8 @@ def spec_problems(spec) -> list[str]:
                    "per-unit parameter)")
     if (raw.get("analysis") or {}).get("evaluation") != "emulator":
         bad.append(f"{w}: needs analysis.evaluation emulator")
+    from toolkit.spec import schema as _schema       # the spec's one scale check (Codex r2 of #334, P1-2)
+    bad += _schema.spec_scale_problems(spec)
     unk = sorted(set(j) - {"shared", "features", "discrepancy_sd", "seed", "waves", "points_per_unit",
                            "shared_points", "targets", "independent", "record", "unmatched", "sensitivity",
                            "best_point_weighting", "changes"})
@@ -1985,7 +1987,8 @@ def _self_test() -> int:
             pr3, info3 = load_prior(spec2, o1, meta2, log=q)
             ok(info3["reused"] == 0, f"JA9c earlier values of another window are never read as this window's ({info3})")
             raw["calibration"]["joint"]["targets"][0]["window"] = [1, 2]
-            raw["calibration"]["scale"] = "log" if raw["calibration"].get("scale") == "linear" else "linear"
+            # (the toy's attribute goes below 0, so only its linear scale resolves: the horizon is what changes)
+            raw["horizon"]["stop"] = raw["horizon"]["stop"] + 1
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             try:
                 check_same_simulator(spec, schema.load(p))

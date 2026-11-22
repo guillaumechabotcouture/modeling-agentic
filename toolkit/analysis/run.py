@@ -158,7 +158,9 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
             try:
                 S.write("blocked", {"reason": str(e)[:4000], "where": where, "corrections": [], "n_on_plan": 0,
                                     "exception": type(e).__name__, "code": getattr(e, "code", None),
-                                    "at_bound": list(getattr(e, "at_bound", None) or [])}, PRODUCER,
+                                    # only when the exception assessed it: absent is not "none at a bound"
+                                    **({"at_bound": list(e.at_bound)} if getattr(e, "at_bound", None) is not None
+                                       else {})}, PRODUCER,
                         [holder["calibration"]] if holder.get("calibration") else [])
                 S.finalize("blocked", f"{where}: {type(e).__name__}: {e}"[:2000])
             except Exception as w:  # noqa: BLE001 -- the stop itself is what the caller must see

@@ -562,8 +562,14 @@ def _self_test() -> int:
            "FD19 the ulp tolerance covers only the declared derived fields")
         lg = copy.deepcopy(A.spec.raw)
         lg["calibration"]["scale"] = "log"
-        ok(derived_fields(lg) == ["unit.x"] and derived_fields(A.spec.raw) == [],
-           f"FD19b the derived field is the calibrated attribute on the log scale only: {derived_fields(lg)}")
+        try:
+            refused = f"resolved {derived_fields(lg)}"
+        except Exception as e:  # noqa: BLE001 -- the scale check's refusal expected
+            refused = f"refused: {type(e).__name__}"
+        ok(derived_fields(A.spec.raw, "log") == ["unit.x"] and derived_fields(A.spec.raw) == []
+           and refused == "refused: CalibrationScaleError",
+           f"FD19b the derived field is the calibrated attribute on the log scale only, and a log scale the engine "
+           f"card refuses is refused here too ({refused})")
         rewrite(lambda n, r: r["result"]["provenance"].update(job_sha="0" * 64) if n == 5 else None)
         try:
             rebuild(d, log=q)
