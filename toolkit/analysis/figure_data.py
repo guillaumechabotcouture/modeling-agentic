@@ -12,7 +12,11 @@ solver through `Analysis.solve`); it runs no engine and has no optimiser of its 
   dollars              the plan's dollars by component and by region, the fixed costs and the envelope
   by_package           per package in the plan: units, cost, outcome averted, cost per outcome averted, and its
                        interval over the uncertainty draws, replayed with uncertainty.Drawer and the spec's seed (the
-                       replay must reproduce the stored fixed-plan interval, else the interval is withheld)
+                       replay must reproduce the stored fixed-plan interval, else the interval is withheld). On direct
+                       evaluation the uncertainty step's own per-draw sums (STORED_REL) are read instead of re-running
+                       the engine for every draw; the first REPLAY_CHECK_DRAWS draws are re-evaluated and must give
+                       the stored values, every draw's package sums must add up to its total, and the totals must
+                       give the stored interval, else the interval is withheld as before
   component_increment  per component: outcome averted and cost added in the units that get it (each unit's package
                        against the same package without the component, where that package exists)
   burden               per unit: the comparator's primary outcome per person, and the population
@@ -40,6 +44,9 @@ if ROOT not in sys.path:
 PRODUCER = "toolkit/analysis/figure_data.py"
 FRACTIONS = (0.25, 0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5)
 REPLAY_RTOL = 1e-6
+STORED_REL = "analysis/uncertainty_draws.json"      # direct evaluation: the uncertainty step's per-draw plan sums
+STORED_SCHEMA = "analysis.uncertainty_draws/1"
+REPLAY_CHECK_DRAWS = 2      # stored draws re-evaluated by the figure step (the first ones: the draws are sequential)
 
 
 class RebuildRefused(RuntimeError):
@@ -156,21 +163,82 @@ def _package_sums(A, plan, out, cost) -> dict:
     return s
 
 
-def replay(A, plan, uq: dict) -> dict:
+def _close(a, b) -> bool:
+    return abs(float(a) - float(b)) <= REPLAY_RTOL * max(abs(float(b)), 1.0)
+
+
+def _same_sums(a: dict, b: dict) -> bool:
+    return set(a) == set(b) and all(a[k]["units"] == b[k]["units"] and _close(a[k]["cost"], b[k]["cost"])
+                                    and _close(a[k]["averted"], b[k]["averted"]) for k in a)
+
+
+def stored_record(plan_draws: dict) -> dict:
+    """The sidecar (STORED_REL) from uncertainty.run()'s `plan_draws`."""
+    return dict({"schema": STORED_SCHEMA, "producer": "toolkit/analysis/uncertainty.py"}, **plan_draws)
+
+
+def _replay_stored(A, plan, uq, stored, log=None) -> dict:
+    """replay() from the uncertainty step's stored per-draw sums, checked three ways (any failure: not reproduced, with
+    the reason): every draw's package sums add up to its total; the first REPLAY_CHECK_DRAWS draws, re-evaluated with
+    the same Drawer and seed, give the stored values; the stored totals give the stored fixed-plan interval."""
+    from toolkit.analysis import uncertainty as UQ
+    from toolkit.analysis.core import q
+    nd, seed = int(uq["draws"]), int(uq["seed"])
+    lvl = float((uq.get("interval") or {}).get("level", 0.95))
+    want = (uq.get("fixed_plan") or {}).get(A.primary) or {}
+    tot, per = list(stored.get("primary_averted") or []), list(stored.get("per_draw") or [])
+    k = min(REPLAY_CHECK_DRAWS, nd)
+    why = None
+    if stored.get("schema") != STORED_SCHEMA or stored.get("draws") != nd or stored.get("seed") != seed \
+            or len(tot) != nd or len(per) != nd:
+        why = "the stored draws are not this uncertainty step's (schema, number of draws or seed differ)"
+    elif stored.get("primary") != A.primary or {str(i): v for i, v in (stored.get("plan") or {}).items()} \
+            != {i: plan[i] for i in A.ids}:
+        why = "the stored draws are for another plan or primary outcome"
+    else:
+        bad = [d for d in range(nd) if not _close(sum(e["averted"] for e in per[d].values()), tot[d])]
+        if bad:
+            why = f"{len(bad)} stored draws' package sums do not add up to their total (e.g. draw {bad[0]})"
+    if why is None:
+        D = UQ.Drawer(A, seed)
+        D.prepare(nd)
+        P = UQ.Progress(log, "figure data: re-evaluating stored draws", k)
+        for d in range(k):
+            D.last_clamped = []
+            theta, zs, noise, mult, _s = D.draw()
+            out, _ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=_s)
+            t = sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][plan[i]][A.primary] for i in A.ids)
+            if not (_close(t, tot[d]) and _same_sums(_package_sums(A, plan, out, cost), per[d])):
+                why = f"draw {d}, re-evaluated, does not give the stored values"
+                break
+            P.step()
+    got = q(tot, lvl) if why is None else {}
+    if why is None and not (want and all(_close(got[x], want[x]) for x in ("median", "ci_low", "ci_high"))):
+        why = "the stored draws do not give the stored fixed-plan interval"
+    return {"draws": nd, "seed": seed, "level": lvl, "reproduced": why is None, "replayed": got, "stored": want,
+            "per_draw": per, "method": "stored_draws", "checked_draws": k, **({"reason": why} if why else {})}
+
+
+def replay(A, plan, uq: dict, stored: dict | None = None, log=None) -> dict:
     """Per-package sums over the uncertainty step's draws (same Drawer, seed and call order); `reproduced` says
-    whether the replay gives the stored fixed-plan interval of the primary outcome."""
+    whether the replay gives the stored fixed-plan interval of the primary outcome. With `stored` (the uncertainty
+    step's per-draw sums, STORED_REL) they are read and checked instead (_replay_stored)."""
+    if stored is not None:
+        return _replay_stored(A, plan, uq, stored, log=log)
     from toolkit.analysis import uncertainty as UQ
     from toolkit.analysis.core import q
     nd, seed = int(uq["draws"]), int(uq["seed"])
     D = UQ.Drawer(A, seed)
     D.prepare(nd)
     tot, per = [], []
+    P = UQ.Progress(log, "figure data: replaying draws", nd)
     for _ in range(nd):
         D.last_clamped = []
         theta, zs, noise, mult, _s = D.draw()
         out, _ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=_s)
         tot.append(sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][plan[i]][A.primary] for i in A.ids))
         per.append(_package_sums(A, plan, out, cost))
+        P.step()
     lvl = float((uq.get("interval") or {}).get("level", 0.95))
     got, want = q(tot, lvl), (uq.get("fixed_plan") or {}).get(A.primary) or {}
     same = bool(want) and all(abs(got[k] - float(want[k])) <= REPLAY_RTOL * max(abs(float(want[k])), 1.0)
@@ -295,16 +363,18 @@ def schedule(A, plan, z0) -> dict:
             "start": float(h.start), "regions": out}
 
 
-def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None, log=print, events=None) -> dict:
+def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None, log=print, events=None,
+            stored: dict | None = None) -> dict:
     """`events`: the model corrections of the point evaluation (out0); every plan the figures show is guarded with
-    them. With events=None the rebuild's own (A.point_events) are used."""
+    them. With events=None the rebuild's own (A.point_events) are used. `stored`: the uncertainty step's per-draw sums
+    (STORED_REL), read and checked instead of replaying every draw (direct evaluation)."""
     ev = list(events if events is not None else (getattr(A, "point_events", None) or []))
     rep = None
     if uq and uq.get("draws"):
-        rep = replay(A, plan, uq)
+        rep = replay(A, plan, uq, stored=stored, log=log)
         if not rep["reproduced"]:
-            log(f"figure_data: the draw replay did not reproduce the stored interval ({rep['replayed']} vs "
-                f"{rep['stored']}); package intervals withheld")
+            log(f"figure_data: the draw replay did not reproduce the stored interval ({rep.get('reason') or ''} "
+                f"{rep['replayed']} vs {rep['stored']}); package intervals withheld")
     try:
         sch = schedule(A, plan, z0 or {})
     except Exception as e:  # noqa: BLE001 - a malformed schedule is recorded, not fatal for the other figures
@@ -312,7 +382,8 @@ def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None,
     out = {"primary": A.primary, "comparator": A.comp, "region": A.region,
            "frontier": frontier(A, ben0, cost0, out0, events=ev), "dollars": dollars(A, plan, out0),
            "by_package": by_package(A, plan, out0, cost0, rep),
-           "replay": {k: rep[k] for k in ("draws", "seed", "level", "reproduced", "replayed", "stored")} if rep
+           "replay": {k: rep[k] for k in ("draws", "seed", "level", "reproduced", "replayed", "stored", "method",
+                                          "checked_draws", "reason") if k in rep} if rep
            else {"reproduced": False, "reason": "no uncertainty draws"},
            "component_increment": component_increment(A, plan, ben0, cost0, events=ev), "burden": burden(A, out0),
            "calibration": calibration_modelled(A, z0 or {}), "schedule": sch}
@@ -512,6 +583,8 @@ def _self_test() -> int:
         ok(fd["replay"]["reproduced"] is True and all(v.get("usd_per_outcome_interval") for v in bp.values()
                                                       if v["averted"] > 0 and v["units"] > 0),
            f"FD6 the draw replay reproduces the stored interval, so package intervals are given: {fd['replay']}")
+        ok("method" not in fd["replay"] and not os.path.exists(os.path.join(d, STORED_REL)),
+           "FD19 an emulator run keeps the full replay: no stored-draws sidecar, figure_data's replay record unchanged")
         ok(all(v["per_person"] is not None and v["per_person"] >= 0 for v in fd["burden"].values()),
            "FD7 burden per person for every unit")
         ok(fd["schedule"]["status"] == "not_offered" and "schedule()" in fd["schedule"]["reason"],
@@ -690,8 +763,75 @@ def _self_test() -> int:
         n_dec = sum(e["units"] for r in sch["regions"].values() for e in r["events"] if e["kind"] == "decision")
         ok(sch["status"] == "ok" and n_dec == sum(len(A.pk[plan[i]]) for i in A.ids),
            f"FD13 with the hook, decision events are counted per region for the units whose package has them ({n_dec})")
+    try:
+        _self_test_stored_draws(ok, q)
+    except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"FD20-FD26 the figure step reads the stored draws on direct evaluation ({type(e).__name__}: {e})")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
+
+
+def _self_test_stored_draws(ok, q):
+    """hb1 flu R2: on direct evaluation the figure step re-ran every uncertainty draw's engine evaluations (200 draws,
+    killed at the 24 h backstop) after the uncertainty step had computed them. The uncertainty step now stores the
+    per-draw package sums of the plan (STORED_REL) and the figure step reads them, re-evaluating only the first
+    REPLAY_CHECK_DRAWS draws to check them; `reproduced` stays a check."""
+    import copy
+    import tempfile
+    import yaml
+    from toolkit.analysis import run as RUN
+    from toolkit.spec import signoff
+    with tempfile.TemporaryDirectory() as d:
+        RUN._direct_toy(d)
+        signoff.sign(d, "lead")
+        R = RUN.run(d, log=q)
+        doc = yaml.safe_load(open(os.path.join(d, "analysis", "figure_data.yaml")))
+        rp = doc["data"]["replay"]
+        uq = R["uncertainty"]
+        nd = int(uq["draws"])
+        k = min(REPLAY_CHECK_DRAWS, nd)
+        ok(rp.get("method") == "stored_draws" and rp.get("checked_draws") == k and rp.get("reproduced") is True,
+           f"FD20 a direct run's figure step reads the stored draws and checks {k} of them: {rp}")
+        side = os.path.join(d, STORED_REL)
+        st = json.load(open(side)) if os.path.exists(side) else {}
+        ok(st.get("draws") == nd and len(st.get("per_draw") or []) == nd and len(st.get("primary_averted") or []) == nd
+           and STORED_REL in (doc.get("inputs") or {}),
+           f"FD21 the uncertainty step stores every draw's plan sums in {STORED_REL}, an input of figure_data")
+        ukeys = set(yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"])
+        ok(not ukeys & {"per_draw", "primary_averted", "plan_draws"},
+           f"FD22 analysis/uncertainty.yaml is unchanged: the per-draw sums live in the sidecar ({sorted(ukeys)})")
+        A, model = R["_A"], R["_model"]
+        plan = {str(i): v for i, v in R["point"]["plan"].items()}
+        z0 = {i: (R["calibration"].get("units") or {}).get(i, {}).get("z") for i in A.ids}
+        n0 = model.runs
+        out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+        per_eval = model.runs - n0
+        n1 = model.runs
+        fd = compute(A, plan, out0, ben0, cost0, uq, z0, log=q, stored=st)
+        ok(model.runs - n1 == k * per_eval and fd["replay"]["reproduced"] is True,
+           f"FD23 the figure step runs the engine for the {k} checked draws only ({model.runs - n1} runs, "
+           f"{per_eval} per draw)")
+        bad = copy.deepcopy(st)
+        bad["primary_averted"][0] *= 1.01
+        for e in bad["per_draw"][0].values():
+            e["averted"] *= 1.01
+        r1 = replay(A, plan, uq, stored=bad)
+        ok(r1["reproduced"] is False and r1.get("reason"),
+           f"FD24 a stored draw a fresh evaluation does not give is caught: not reproduced ({r1.get('reason')})")
+        r2 = replay(A, plan, dict(uq, seed=int(uq["seed"]) + 1), stored=st)
+        r3 = replay(A, {i: A.comp for i in A.ids}, uq, stored=st)
+        ok(r2["reproduced"] is False and r3["reproduced"] is False,
+           f"FD25 stored draws of another seed or another plan are not used ({r2.get('reason')}; {r3.get('reason')})")
+        bad = copy.deepcopy(st)
+        bad["primary_averted"][-1] += 1e6
+        r4 = replay(A, plan, uq, stored=bad)
+        bad = copy.deepcopy(st)
+        e = next(iter(bad["per_draw"][-1].values()))
+        e["averted"] += 1.0
+        r5 = replay(A, plan, uq, stored=bad)
+        ok(nd > k and r4["reproduced"] is False and r5["reproduced"] is False,
+           f"FD26 an unchecked draw is still checked: its total against the stored interval, its package sums against "
+           f"its total ({r4.get('reason')}; {r5.get('reason')})")
 
 
 if __name__ == "__main__":
