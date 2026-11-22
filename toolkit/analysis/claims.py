@@ -361,7 +361,10 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None, a
             f"[CLAIM:headline.median]. Units with no package: [CLAIM:units.no_package]." if not point.get("plan_rule")
             else f"[CLAIM:cost.allocatable] (allocated at the point values: [CLAIM:cost.allocated]). It is the plan with "
             f"the best expected {o} averted over the [CLAIM:uq.draws] uncertainty draws, within the budget in every "
-            f"draw and at the point costs (deliverable.plan: expected_value). Over those draws it averts "
+            f"draw (deliverable.plan: expected_value)"
+            + ("; at the point costs it costs more than the budget (the point costs are not a draw)"
+               if (point.get("plan_rule") or {}).get("point_cost_over_budget") else "")
+            + f". Over those draws it averts "
             f"[CLAIM:headline.mean] {s['deliverable']['headline']['outcome']} on average against the comparator "
             f"({s['comparator'].get('text', s.comparator)}). Median {o} averted over the draws: "
             f"[CLAIM:headline.median]; {o} averted at the point values: [CLAIM:headline.point]. The per-unit values in "
@@ -426,8 +429,10 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None, a
         d, idf = cal["diagnostics"], cal.get("identifiability") or {}
         L += [f"Posterior over {d['n_targets']} targets and {d['n_parameters']} parameters (declared priors, "
               f"{d.get('observation')} observations, sampler {d.get('sampler')}); "
-              + ("the point values are the posterior mode, and the plan is solved over the posterior draws "
-                 "(deliverable.plan: expected_value)." if point.get("plan_rule") else "the plan uses the posterior mode."),
+              + (("the point values are the posterior mode, and the plan is solved over the uncertainty draws, which "
+                  + ("include the posterior draws" if "calibration" in (uq.get("covers") or []) else
+                     "hold the calibration at the mode") + " (deliverable.plan: expected_value).")
+                 if point.get("plan_rule") else "the plan uses the posterior mode."),
               "", "| Parameter | Class | Contraction |", "|---|---|---|"]
         for p in cal.get("names") or []:
             if not p.startswith("z:"):

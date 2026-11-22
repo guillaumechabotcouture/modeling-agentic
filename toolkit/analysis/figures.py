@@ -2344,6 +2344,8 @@ def render(run_dir: str, out_dir: str | None = None, labels_overlay: dict | None
             figs.append(one(name))
         except Missing as e:
             notp.append({"figure": name, "reason": str(e), "tier": TIER_OF[name]})
+            if harness:     # hb1 fix 11 (Codex r2 of #343 P1-5): an earlier run's files of a figure not drawn now
+                _discard(dest, name, run_dir, {end: None for end in FIG_ENDS})      # never stand for this run
         except PresentationRefused:
             raise                       # a refused declared input is not one figure's failure: fail closed, as before
         except Exception as e:  # noqa: BLE001 -- v2 autonomy 1C-a: one figure's failure (its draw, title, save,

@@ -682,6 +682,11 @@ NO_MANIFEST = "has no completed analysis manifest to be read from"    # api.gate
 
 
 def _verified(run_dir: str) -> tuple:
+    rows, man, problem, _data = _verified_doc(run_dir)
+    return rows, man, problem
+
+
+def _verified_doc(run_dir: str) -> tuple:
     """(rows, manifest, problem) of analysis/decision_tests.yaml: read once with no link followed, the hash taken on
     the bytes parsed (Codex r1 of #327). problem is None when there is nothing to read (no spec, or a completed manifest
     that lists no such artifact) or the rows verified; else why they cannot be trusted. A spec without a completed
@@ -690,27 +695,28 @@ def _verified(run_dir: str) -> tuple:
     try:
         man = json.load(open(os.path.join(run_dir, MANIFEST)))
     except (OSError, ValueError):
-        return [], {}, None if no_spec else NO_MANIFEST
+        return [], {}, None if no_spec else NO_MANIFEST, {}
     if not isinstance(man, dict) or man.get("status") != "complete" or man.get("complete") is not True:
-        return [], man if isinstance(man, dict) else {}, None if no_spec else NO_MANIFEST
+        return [], man if isinstance(man, dict) else {}, None if no_spec else NO_MANIFEST, {}
     ent = (man.get("artifacts") or {}).get(DECISION_TESTS_ARTIFACT)
     if not isinstance(ent, dict):
-        return [], man, None
+        return [], man, None, {}
     from toolkit.analysis.artifacts import _safe_io
     try:
         data = _safe_io().read_nofollow(run_dir, DECISION_TESTS_ARTIFACT)[0]
     except Exception as e:  # noqa: BLE001 -- a link, a missing or unreadable file: not trusted
-        return [], man, f"cannot be read with no link followed ({type(e).__name__})"
+        return [], man, f"cannot be read with no link followed ({type(e).__name__})", {}
     import hashlib
     if hashlib.sha256(data).hexdigest() != ent.get("sha256"):
-        return [], man, "changed after the harness wrote it"
+        return [], man, "changed after the harness wrote it", {}
     try:
-        tests = ((yaml.safe_load(data.decode("utf-8")) or {}).get("data") or {}).get("tests")
+        payload = (yaml.safe_load(data.decode("utf-8")) or {}).get("data") or {}
+        tests = payload.get("tests")
     except (yaml.YAMLError, UnicodeDecodeError, AttributeError) as e:
-        return [], man, f"does not parse ({type(e).__name__})"
+        return [], man, f"does not parse ({type(e).__name__})", {}
     if not isinstance(tests, list):
-        return [], man, "has no list of tests"
-    return tests, man, None
+        return [], man, "has no list of tests", {}
+    return tests, man, None, payload
 
 
 def verified_decision_tests(run_dir: str) -> list:
@@ -737,16 +743,14 @@ def decision_test_findings(run_dir: str) -> list[dict]:
     #316): HIGH, scope-declarable only through the owner's (or, under --signoff lead, the lead's provisional) answer.
     Not a contract finding: gate_findings is unchanged. A completed manifest whose artifact cannot be read and verified
     gives one non-declarable HIGH instead (fail closed: a plan-changing test is never dropped silently)."""
-    rows, _man, problem = _verified(run_dir)
+    rows, _man, problem, payload = _verified_doc(run_dir)
     if problem:
         return [_f("analysis_contract_decision_test", f"{DECISION_TESTS_ARTIFACT} {problem}: the decision tests that "
                                                       "change the plan cannot be read", DECISION_TESTS_ARTIFACT)]
     out = []
-    try:          # hb1 fix 11: under deliverable.plan: expected_value the tests compare with the point-value plan
-        from toolkit.analysis import plan_rule as PR
-        ev = PR.rule(yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}) == "expected_value"
-    except (OSError, yaml.YAMLError, AttributeError):
-        ev = False
+    # hb1 fix 11: under deliverable.plan: expected_value the tests compare with the point-value plan, which the
+    # verified artifact names (not the spec, which may have changed since: Codex r2 of #343 P2-8)
+    ev = isinstance(payload, dict) and payload.get("reference_plan") == "point_plan"
     for t in rows:
         if isinstance(t, dict) and t.get("verdict") == "CHANGES_PLAN":
             tid = str(t.get("test_id"))

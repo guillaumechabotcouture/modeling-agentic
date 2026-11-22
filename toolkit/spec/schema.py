@@ -1626,9 +1626,9 @@ def _validate_deliverable(s) -> list[str]:
         if (un.get("affordability") or {}).get("enforce"):
             bad.append("deliverable.plan: expected_value is not combined with uncertainty.affordability.enforce (a "
                        "plan solved within a reserve); the expected-value plan already fits the budget in every draw")
-        if ((s.raw.get("analysis") or {}).get("plan_variants") or {}).get("headline") is not None:
-            bad.append("deliverable.plan: expected_value is not combined with analysis.plan_variants.headline (the "
-                       "variant's plan is solved at the point values)")
+        if (s.raw.get("analysis") or {}).get("plan_variants"):
+            bad.append("deliverable.plan: expected_value is not combined with analysis.plan_variants (the variants are "
+                       "solved and compared at the point values)")
         if d.get("kind") != "package_per_unit":
             bad.append("deliverable.plan: expected_value applies to a package_per_unit deliverable")
         if d.get("by_group") is not None:
@@ -1739,6 +1739,8 @@ def _self_test_plan_rule(ok):
                    affordability={"enforce": True, "max_share_over_budget": 0.05}),
                "estimates kind": lambda x: x["deliverable"].update(kind="estimates"),
                "headline variant": lambda x: x["analysis"].update(plan_variants={"headline": "v", "variants": []}),
+               "variants, no headline": lambda x: x["analysis"].update(plan_variants={"variants": [
+                   {"id": "given", "type": "fixed_plan", "column": "given", "text": "t"}]}),
                "by_group": lambda x: x["deliverable"].update(by_group={"columns": {"group": "g", "quantity": "q",
                                                                                    "value": "v"}, "quantity": {}})}
         miss = []
@@ -1762,7 +1764,7 @@ def _self_test_plan_rule(ok):
         ok(all(es_bad.values()), f"SPEV5 the public validate() refuses deliverable.plan on an estimates spec, whatever "
                                  f"its value (Codex r1 P1-4): {es_bad}")
         ok(not miss, f"SPEV4 expected_value is refused without an uncertainty source, with a reserve "
-                     f"(affordability enforce), with a headline plan variant, on an estimates deliverable and with a by-group table (not refused: {miss})")
+                     f"(affordability enforce), with plan variants, on an estimates deliverable and with a by-group table (not refused: {miss})")
 
 
 def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)) -> str:

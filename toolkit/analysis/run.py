@@ -1380,6 +1380,7 @@ def _self_test_plan_rule_runs(ok, q):
         csvp = os.path.join(d, "allocation_optimized.csv")
         unc = lambda: yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]  # noqa: E731
         R0 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        R0_frontier = os.path.exists(os.path.join(d, "figures", "frontier.png"))
         csv0, unc0, rep0 = open(csvp).read(), unc(), open(os.path.join(d, "uncertainty_report.yaml")).read()
         _resign(d, lambda x: x["deliverable"].update(plan="point"))
         R1 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
@@ -1432,15 +1433,17 @@ def _self_test_plan_rule_runs(ok, q):
                             f"the point-value plan ({len(dtf)} findings; P1-3)")
         from toolkit.analysis import figure_data as FDm
         try:
-            _A8, plan8 = FDm.rebuild(d, log=q)[:2]
-            rb = plan8 == R["point"]["plan"]
-        except Exception as e:  # noqa: BLE001 -- a failing case
-            rb = f"{type(e).__name__}: {e}"
+            FDm.rebuild(d, log=q)
+            rb = "rebuilt"
+        except FDm.RebuildRefused as e:
+            rb = "expected_value" in str(e)
         figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]
         fr_np = [x for x in figs.get("not_produced") or [] if x.get("figure") == "frontier"]
-        ok(rb is True and fr_np and "expected-value" in str(fr_np[0].get("reason")) and not fr_np[0].get("render_failed"),
-           f"EV-R9 a rebuild reproduces the point-value plan and returns the delivered one (P1-7); the frontier is not "
-           f"drawn, with the reason (P1-8) ({rb}, {fr_np})")
+        stale = [e for e in (".png", ".svg", ".csv") if os.path.exists(os.path.join(d, "figures", "frontier" + e))]
+        ok(rb is True and fr_np and "expected-value" in str(fr_np[0].get("reason")) and not fr_np[0].get("render_failed")
+           and not stale and R0_frontier,
+           f"EV-R9 a rebuild from the point tables is refused (it cannot verify the plan; r2 P1-4); the frontier is not "
+           f"drawn, with the reason, and no earlier run's frontier file is left (P1-8, r2 P1-5) ({rb}, {fr_np}, {stale})")
         pp = os.path.join(d, "analysis", "point.yaml")
         keep = open(pp).read()
         try:

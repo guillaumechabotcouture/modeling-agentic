@@ -470,17 +470,21 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
         cand.append((cid, np.asarray(idx)))
         return cid
 
+    from toolkit.analysis import plan_rule as PR
+    # hb1 fix 11 (Codex r2 of #343 P1-2): under deliverable.plan: expected_value the point evaluation's model
+    # corrections bear on the robust solve and the candidates as they do on the delivered plan
+    pev = list(getattr(A, "point_events", None) or []) if PR.rule(A.spec.raw) == "expected_value" else []
+
     def robust(mask):
         """The plan with the best mean benefit over the masked draws within the allocatable budget in each of them
         (one budget row per draw, beside the signed caps); None when no plan is proven optimal. The solve is
         plan_rule.mean_plan, the one deliverable.plan: expected_value delivers (hb1 fix 11)."""
-        from toolkit.analysis import plan_rule as PR
         ev = [r["events"] for r in rows]
         if any(e.get("package") in ("*", getattr(A, "comp", None)) for d in np.flatnonzero(mask) for e in ev[d]):
             return None
         notes["solves"] += 1
         try:
-            return PR.mean_plan(A, Bn, Cs, ev, mask=mask, budget=B, caps=PR.plan_caps(A), cap_name="voi_draw")["choice"]
+            return PR.mean_plan(A, Bn, Cs, ev, mask=mask, budget=B, cap_name="voi_draw", extra_events=pev)["choice"]
         except (RuntimeError, ValueError) as e:
             notes.setdefault("not_solved", []).append(str(e))
             return None
@@ -559,10 +563,8 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
         if bad:
             excluded[cid] = f"breaks the signed feasibility: {'; '.join(bad[:3])}"
             continue
-        from toolkit.analysis import plan_rule as PR
-        over = PR.breaks_plan_caps(A, p)      # hb1 fix 11 (Codex r1 P1-1): the delivered rule's own budget rows
-        if over:
-            excluded[cid] = f"over the budget the delivered plan is held to ({', '.join(over)}; deliverable.plan)"
+        if pev and A.plan_corrections(pev, p):
+            excluded[cid] = "model corrections bear on it at the point values (deliverable.plan: expected_value)"
             continue
         for d, r in enumerate(rows):
             try:
