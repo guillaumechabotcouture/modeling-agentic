@@ -1890,8 +1890,10 @@ def _self_test_run(ok, real_gate=None) -> None:
               term_at=None):
         """Run `vm_job.py run` against a fake Coiled; returns (W, exit message or None, stdout, exception).
         `threaded`: the job runs in its own thread from submission, concurrently with `run`'s polls, and its own
-        stop is real (time scaled down 600x). `appear`: (n, id) another launcher's cluster of the same name
-        appears after n cluster listings."""
+        stop is real (time scaled down 600x). Its grace (two poll intervals plus a minute, RN3) ends once `run` has
+        stopped the cluster (at most 15 s): scaled down, the grace was 0.3 s, which a loaded machine can overrun
+        between `run`'s read of the final state and its stop, so the job's stop came first (flaky RN20, RN29).
+        `appear`: (n, id) another launcher's cluster of the same name appears after n cluster listings."""
         W = {"clusters": dict(pre or {}), "next": 100, "events": [], "ctor": [], "pending": None, "submit_kw": None,
              "deferred": [], "polls": 0, "list_fail": 0, "stops": 0, "list_calls": 0, "thread": None,
              "table": ["tls://w1"], "job_worker": None, "polled": [], "names": dict(pre_names or {}), "then": []}
@@ -1903,6 +1905,8 @@ def _self_test_run(ok, real_gate=None) -> None:
             "open(os.path.join(os.environ['JOB_OUT'], 'result.txt'), 'w').write('42')\n"
             f"print('job ran', flush=True)\nraise SystemExit({job_rc})\n"))
         fs = _FakeStore(os.path.join(d, f"blob_{jid}"), corrupt=corrupt)
+        import threading
+        run_stopped = threading.Event()     # `run` has asked for the cluster's stop (threaded: the job's grace ends)
 
         def stop(cid, who):
             if W["clusters"].get(cid) in LIVE:
@@ -1911,6 +1915,8 @@ def _self_test_run(ok, real_gate=None) -> None:
                 ev.append((who, cid))
             else:
                 ev.append((who + "_noop", cid))
+            if who != "job_shutdown":
+                run_stopped.set()
 
         def list_clusters(workspace=None):
             W["list_calls"] += 1
@@ -1982,7 +1988,6 @@ def _self_test_run(ok, real_gate=None) -> None:
                 jkw = {k: v for k, v in kw.items() if k not in ("workers", "allow_other_workers", "pure", "key")}
                 task = lambda: fn(*args, store_mod=fs, **jkw)  # noqa: E731
                 if threaded:
-                    import threading
                     W["thread"] = threading.Thread(target=task, daemon=True)
                     W["thread"].start()
                 else:
@@ -2023,7 +2028,10 @@ def _self_test_run(ok, real_gate=None) -> None:
         def job_down():
             ev.append("job_shutdown_request")
             cid = max(W["clusters"])
-            if job_stop == "now" or threaded:     # the job stops the cluster now (its grace has run)
+            if threaded:      # its grace has run once `run` has stopped the cluster (bounded: see the docstring)
+                run_stopped.wait(15)
+                stop(cid, "job_shutdown")
+            elif job_stop == "now":     # the job stops the cluster now (its grace has run)
                 stop(cid, "job_shutdown")
             else:
                 W["deferred"].append(lambda: stop(cid, "job_shutdown"))
@@ -2032,9 +2040,15 @@ def _self_test_run(ok, real_gate=None) -> None:
             ev.append(("attach", name))
             raise SystemExit("rc.attach called")
 
+        launcher_sleeps = [0]
+
         def sleep(s):
             ev.append(("sleep", s))
-            if sum(1 for e in ev if isinstance(e, tuple) and e[0] == "sleep") > 400:
+            # Only `run`'s own sleeps count (Codex on #322): the threaded job sleeps here while it polls its child,
+            # and a job that waits on the meter must not exhaust `run`'s runaway-poll guard.
+            if not threaded or threading.current_thread() is threading.main_thread():
+                launcher_sleeps[0] += 1
+            if launcher_sleeps[0] > 400:
                 raise RuntimeError("test: `run` is still polling after 400 sleeps (it would wait to its deadline)")
             real_sleep(s / 600 if threaded else min(s, 0.01))
 
@@ -2440,8 +2454,13 @@ def _self_test_run(ok, real_gate=None) -> None:
                 # RN29 (owner decision, 2026-11-17: no hard dollar ceilings). Each reading is of the job's own
                 # cluster; past the cap and past 1.5 x it the job runs on, each crossing alerted once, every reading
                 # in cap_projection.json; the cluster is stopped when the job ends, as without a cap.
+                # The job writes 'b' only once a reading has seen 'a' (a file the meter writes, waited for up to
+                # 30 s), not after a fixed 0.6 s that a slow first poll could overrun: one reading is always over the
+                # cap and under 1.5 x it before the reading past 1.5 x it.
                 prog = ("import os, time\nout = os.environ['JOB_OUT']\n"
-                        "open(os.path.join(out, 'progress.txt'), 'w').write('a')\ntime.sleep(0.6)\n"
+                        "open(os.path.join(out, 'progress.txt'), 'w').write('a')\n"
+                        "go, t0 = os.path.join(os.path.dirname(out), 'metered_a'), time.time()\n"
+                        "while not os.path.exists(go) and time.time() - t0 < 30:\n    time.sleep(0.01)\n"
                         "open(os.path.join(out, 'progress.txt'), 'w').write('b')\ntime.sleep(1)\n")
                 seen = []
 
@@ -2450,7 +2469,10 @@ def _self_test_run(ok, real_gate=None) -> None:
                     if cid != 100:
                         return 1000.0
                     p = os.path.join(ws.JOBS, jid, "out", "progress.txt")
-                    return 8.0 if os.path.exists(p) and open(p).read() == "b" else 6.0
+                    now = open(p).read() if os.path.exists(p) else ""
+                    if now == "a":
+                        open(os.path.join(ws.JOBS, jid, "metered_a"), "w").close()
+                    return 8.0 if now == "b" else 6.0
                 ALERTS.clear()
                 W, msg, out, exc = world(d, "r29a", gate=lambda a, name, meter=False, m=meter: m, threaded=True,
                                          extra=("--keep-on-failure",), job_src=prog)

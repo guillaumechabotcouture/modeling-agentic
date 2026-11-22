@@ -2758,6 +2758,10 @@ def _self_test() -> int:
                                       "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
         ref_status = _SpikeMachine(d0, T0, st0, log=lambda *a: None, cross_engine_check=False).run()
         ref_path = [h["to"] for h in load_state(d0).history if "to" in h]
+
+        def _final_why(d_):     # the reason a run reached FINAL (a step's error carries its log tail): CI flakes of
+            return [h.get("why") for h in load_state(d_).history if h.get("to") == "FINAL"][-1:]   # T16 named none
+        ref_why = _final_why(d0) if ref_status != "completed" else []
         bad = []
         for k in range(1, len(ref_path)):
             dk, Tk, stk = new_run(f"resume{k}", {"critics": {1: {"critique-domain": [blocker]}},
@@ -2770,9 +2774,10 @@ def _self_test() -> int:
             s2 = m2.run()
             p2 = [h["to"] for h in load_state(dk).history if "to" in h]
             if s2 != ref_status or p2 != ref_path:
-                bad.append((k, s2, p2))
+                bad.append((k, s2, p2, _final_why(dk)))
             shutil.rmtree(dk)
-        ok(not bad, f"T16 a run stopped after any of {len(ref_path) - 1} transitions resumes to the same path and status {bad[:1]}")
+        ok(not bad, f"T16 a run stopped after any of {len(ref_path) - 1} transitions resumes to the same path and status {bad[:1]}"
+           + (f" (reference run {ref_status}: {ref_why})" if ref_why else ""))
 
         # T17: owner sign-off pauses, persists, resumes.
         d, T, st = new_run("owner", {}, signoff="owner")
