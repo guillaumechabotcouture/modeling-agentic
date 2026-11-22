@@ -1618,6 +1618,8 @@ class Machine:
         from toolkit.spec import amend as AM, signoff as SO
         la, why, rec = req.get("lead_amendment") or {}, None, None
         child = la.get("child")
+        if la.get("status") in ("started", "signed_provisionally"):     # resolved beside this run (a moved copy: r2)
+            child = _child_of(self.run_dir, child) or child
         if la.get("status") == "refused":
             return None                   # the first refusal stands, with its reason and any kept child
         if la.get("status") in ("started", "signed_provisionally"):
@@ -1638,7 +1640,7 @@ class Machine:
             why = "the run's tasks cannot continue in a child run"
         elif self._signed_by() is None:
             why = "the parent's sign-off no longer holds (a signed input changed since): the owner decides"
-        elif isinstance(self.st.budget_usd, (int, float)) and self.st.budget_usd - self.st.spent_usd <= 0:
+        elif isinstance(self.st.budget_usd, (int, float)) and round(self.st.budget_usd - self.st.spent_usd, 4) <= 0:
             why = "no budget is left for a child run"
         else:
             child = AM._next_child(self.run_dir)
@@ -1652,6 +1654,7 @@ class Machine:
                 if not (rec.get("dry_sign") or {}).get("ok"):
                     why = f"the amended spec would not sign: {(rec.get('dry_sign') or {}).get('error')}"
                 else:
+                    self._mark_child(child, rec.get("id"))     # before the signature: a signed child always says so (r2)
                     SO.sign(child, "lead", f"Provisional (--signoff lead): amendment {rec['id']} of "
                             f"{self.run_dir}, made from its rethink request (round {req.get('round')}); the owner has "
                             f"not reviewed it. Reason: {' '.join(str(rec.get('reason')).split())[:500]}",
@@ -1660,14 +1663,10 @@ class Machine:
             except Exception as e:  # noqa: BLE001 -- AmendError (refused, no child) or a signing refusal: owner pause
                 why = f"{type(e).__name__}: {e}"
         if why is None:
-            cst = load_state(child)
-            if not any(isinstance(h, dict) and h.get("provisional_amendment") for h in cst.history):
-                cst.paused = None
-                if isinstance(self.st.budget_usd, (int, float)):    # one cap: the child gets what is left (> 0)
-                    cst.budget_usd = round(self.st.budget_usd - self.st.spent_usd, 4)
-                cst.history.append({"at": _now(), "provisional_amendment": rec.get("id"), "by": "lead",
-                                    "parent_run": self.run_dir})
-                save_state(child, cst)
+            try:
+                self._mark_child(child, rec.get("id"))
+            except Exception as e:  # noqa: BLE001 -- an unreadable child state: refused, the owner decides (r2)
+                why = f"the child's run state cannot be read ({type(e).__name__})"
         kept = child if child and os.path.isdir(child) else None
         req = dict(req, lead_amendment={"at": _now(), "status": "refused" if why else "signed_provisionally",
                                         **({"why": why[:2000]} if why else {"id": rec.get("id")}),
@@ -1681,6 +1680,18 @@ class Machine:
                       AMENDED_PROVISIONAL, extra={"amended_to": child})
         self._relink(child)
         return to
+
+    def _mark_child(self, child: str, rid) -> None:
+        """The child's state, once: not paused, what is left of the cap (always > 0 here), the handoff event."""
+        cst = load_state(child)
+        if cst is None:
+            raise ValueError("no run state")
+        if not any(isinstance(h, dict) and h.get("provisional_amendment") for h in cst.history):
+            cst.paused = None
+            if isinstance(self.st.budget_usd, (int, float)):    # one cap: the child gets what is left
+                cst.budget_usd = round(self.st.budget_usd - self.st.spent_usd, 4)
+            cst.history.append({"at": _now(), "provisional_amendment": rid, "by": "lead", "parent_run": self.run_dir})
+            save_state(child, cst)
 
     def _provisional_amendment(self) -> bool:
         """This run was made by a lead's provisional amendment: its amendment record not signed by the owner, or the
@@ -2782,7 +2793,7 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
 
 def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str = "owner",
            budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False, backend=None,
-           cross_engine_check: bool = True) -> str:
+           cross_engine_check: bool = True, _depth: int = 0) -> str:
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
     (Machine.reopen_interrupted_analysis)."""
@@ -2798,7 +2809,7 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     m.reopen_interrupted_analysis()
     status = m.run()
     child = handoff_child(run_dir)
-    if child is None:
+    if child is None or _depth >= 8:          # a bounded chain (a restored cycle cannot recurse: Codex r2)
         return status
     # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher)
     try:
@@ -2811,10 +2822,10 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     log(f"[machine] continuing in {child} (provisional amendment)")
     return run_v2(cst.question, child, tasks.for_run_dir(child), max_rounds=cst.max_rounds, signoff="lead",
                   budget_usd=cst.budget_usd, log=log, derive_unsandboxed=derive_unsandboxed, backend=backend,
-                  cross_engine_check=cross_engine_check)
+                  cross_engine_check=cross_engine_check, _depth=_depth + 1)
 
 
-def _child_of(run_dir: str, recorded) -> str | None:
+def _child_of(run_dir: str, recorded, strict: bool = False) -> str | None:
     """The child dir a parent recorded, resolved beside the parent as it is now (a restored copy moves both: Codex r1),
     and only when the child's metadata names this parent (by directory name)."""
     if not isinstance(recorded, str) or not recorded:
@@ -2825,7 +2836,12 @@ def _child_of(run_dir: str, recorded) -> str | None:
     except (OSError, ValueError, AttributeError):
         return None
     ok_ = os.path.basename(str(pr.get("run_dir") or "").rstrip(os.sep)) == os.path.basename(os.path.abspath(run_dir))
-    return here if ok_ else None
+    if ok_ and strict and pr.get("run_state_sha256"):   # a finished parent: the child binds its final state (r2)
+        try:
+            ok_ = hashlib.sha256(open(os.path.join(run_dir, STATE_FILE), "rb").read()).hexdigest() == pr["run_state_sha256"]
+        except OSError:
+            ok_ = False
+    return here if ok_ and os.path.realpath(here) != os.path.realpath(run_dir) else None
 
 
 def handoff_child(run_dir: str) -> str | None:
@@ -2837,7 +2853,7 @@ def handoff_child(run_dir: str) -> str | None:
     if st is None or st.status != AMENDED_PROVISIONAL:
         return None
     child = _child_of(run_dir, next((h.get("amended_to") for h in reversed(st.history)
-                                     if isinstance(h, dict) and h.get("amended_to")), None))
+                                     if isinstance(h, dict) and h.get("amended_to")), None), strict=True)
     return child if child and os.path.isfile(os.path.join(child, STATE_FILE)) else None
 
 
@@ -2973,7 +2989,7 @@ def _self_test_lead_amend(ok, td: str) -> None:
             ok(s2 == s and la2 == la and handoff_chain(d, kept=True) == [],
                "T_LEAD_AMEND_REPLAY a resume keeps the first refusal (its reason) and amends nothing")
     # Codex r1: no budget left pauses (a zero cap is not an unlimited one)
-    d, _ = parent("lead_nobudget", "lead", good, spent=5.0)
+    d, _ = parent("lead_nobudget", "lead", good, spent=4.99999)      # rounds to nothing left (Codex r2)
     s = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
     la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
     ok(s == "paused:awaiting_spec_amendment" and "no budget" in la.get("why", "") and not os.path.lexists(d + ".amend1"),
@@ -3001,6 +3017,17 @@ def _self_test_lead_amend(ok, td: str) -> None:
     _sh.copytree(d + ".amend1", os.path.join(mv, "lead_interrupt.amend1"))
     ok(handoff_child(os.path.join(mv, "lead_interrupt")) == os.path.join(mv, "lead_interrupt.amend1"),
        "T_LEAD_AMEND_MOVED a moved parent resolves its child beside it, not at the recorded absolute path")
+    mc = os.path.join(mv, "lead_interrupt.amend1", "metadata.json")
+    meta_m = json.load(open(mc))
+    json.dump(dict(meta_m, parent_run=dict(meta_m["parent_run"], run_state_sha256="0" * 64)), open(mc, "w"))
+    cyc = os.path.join(mv, "cyc")
+    os.makedirs(cyc)
+    save_state(cyc, RunState(question="q", state="FINAL", status=AMENDED_PROVISIONAL, history=[{"amended_to": cyc}]))
+    _write_json(cyc, "metadata.json", {"parent_run": {"run_dir": cyc}})
+    ok(handoff_child(os.path.join(mv, "lead_interrupt")) is None and handoff_child(cyc) is None
+       and handoff_chain(cyc, kept=True) == [],
+       "T_LEAD_AMEND_STRICT a sibling bound to another parent state, or the run itself, is never resumed (Codex r2)")
+    json.dump(meta_m, open(mc, "w"))
     lost = os.path.join(mv, "lead_interrupt.amend1")
     os.remove(os.path.join(lost, AMENDMENT_RECORD))
     al2 = amendment_lines(lost)
