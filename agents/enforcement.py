@@ -97,6 +97,7 @@ SCRIPT_OUTPUTS = (
     "scope_signoff_request.json",    # Phase 49 β: written by the gate
     "scope_signoff_request.json.tmp",
     "scope_signoff_ledger.json",     # Phase 49 β: the harness's record of the answers (main.py)
+    "scope_signoff.lock",            # 1F (Codex r2 of #316): held while scope_signoff.json is read and rewritten
     "decision_brief.signed/*",       # the signed copies, for restoring a changed file
     # v2 input geometry (toolkit/spec/geometry.py; Codex round 2 on #131): the spec's own sign-off, the check's
     # record and the owner's geometry sign-off (frozen declaration, input hashes, approvals of HIGH exceptions).

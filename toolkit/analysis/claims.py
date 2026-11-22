@@ -354,6 +354,11 @@ def results_template(A, point, uq, stab, sens, dts, cal, emu_acc, burden=None, a
          f"[CLAIM:cost.allocatable] (allocated: [CLAIM:cost.allocated]). It averts [CLAIM:headline.point] {o} "
          f"against the comparator ({s['comparator'].get('text', s.comparator)}); median over the uncertainty draws "
          f"[CLAIM:headline.median]. Units with no package: [CLAIM:units.no_package].", ""]
+    sv = point.get("solver") or {}
+    if sv.get("gap_rel") is not None:      # 1C-c (D3): what "optimal" was proven to
+        L += [f"Solver: status {sv.get('status')}. The plan is proven optimal within a relative gap of "
+              f"{float(sv['gap_rel']):g} of the gain over each unit's least-benefit package (optimizer.gap_rel in "
+              "toolkit/analysis/thresholds.yaml).", ""]
     L += ["| Component | Units |", "|---|---|"]
     L += [f"| {c} | [CLAIM:mix.{c}] |" for c in s["options"]["components"]]
     L += ["", "| Package | Units |", "|---|---|"]
