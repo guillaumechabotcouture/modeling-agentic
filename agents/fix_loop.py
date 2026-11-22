@@ -223,10 +223,11 @@ def task_scope(task: dict) -> tuple:
 
 def in_edit_scope(path) -> bool:
     """True when `path` (relative to the run) is a file a fix task may edit. An absolute path, a `..` part or a
-    non-string is outside; `./` prefixes are ignored."""
-    if not isinstance(path, str) or not path.strip():
+    non-string is outside; `./` prefixes are ignored. Taken as written, as the fix task's write hook takes it: a
+    backslash or surrounding space is outside too (Codex round 2 P3)."""
+    if not isinstance(path, str) or not path.strip() or path != path.strip() or "\\" in path:
         return False
-    p = path.strip().replace("\\", "/")
+    p = path
     if p.startswith("/") or ".." in p.split("/"):
         return False
     import posixpath
@@ -873,7 +874,9 @@ def _self_test() -> int:
                "measles R2 T1": ["allocation_optimized.csv", "analysis/uncertainty.yaml", "uncertainty_report.yaml",
                                  "analysis/voi.yaml", "claims.yaml", "results.md"],
                "tb R2 T1": ["data/README.md"], "harness code": ["toolkit/analysis/run.py"],
-               "escape": ["models/ext/../../toolkit/analysis/run.py"], "absolute": ["/tmp/x/analysis_settings.yaml"]}
+               "escape": ["models/ext/../../toolkit/analysis/run.py"], "absolute": ["/tmp/x/analysis_settings.yaml"],
+               # Codex round 2 P3: the write hook takes the path as written, so the validator does too
+               "backslash": ["models\\ext\\a.py"], "padded": [" analysis_settings.yaml"]}
         bad = {k: validate_plan({"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE",
                                             "brief": "x", "files": v}]}, pk19) for k, v in hb1.items()}
         ok(all(any("outside what a fix task may edit" in x and "harness_gaps" in x for x in e) for e in bad.values()),
