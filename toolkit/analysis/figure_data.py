@@ -283,18 +283,14 @@ def _replay_stored(A, plan, uq, stored, log=None) -> dict:
     if why is None:
         D = UQ.Drawer(A, seed)
         D.prepare(nd)
-        P = UQ.Progress(log, "figure data: re-evaluating stored draws", k)
-        for d in range(k):
-            D.last_clamped = []
-            theta, zs, noise, mult, _s = D.draw()
-            out, _ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=_s)
+        for d, r in enumerate(UQ._draw_rows(A, D, k, label="figure data: re-evaluating stored draws")):
+            out, cost = r["out"], r["cost"]
             t = sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][plan[i]][A.primary] for i in A.ids)
             if not (_close(t, tot[d]) and _same_sums(_package_sums(A, plan, out, cost), per[d])):
                 why = f"draw {d}, re-evaluated, does not give the stored values"
                 checked += 1
                 break
             checked += 1
-            P.step()
     got = {}
     if why is None:
         got, why = _interval(tot, lvl)

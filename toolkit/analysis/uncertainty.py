@@ -516,10 +516,30 @@ def _n_seed(A, draws=None, seed=None):
     return int(draws if draws is not None else sp.get("draws", 32)), seed if seed is not None else sp.get("seed", 42)
 
 
-def _draw_rows(A, D, nd):
+def _draw_rows(A, D, nd, label="uncertainty draws"):
     """Each draw's sampled values and evaluation, in draw order (lazily: the emulator error is drawn from the shared
-    stream inside evaluate)."""
-    P = Progress(getattr(A, "log", None), "uncertainty draws", nd)
+    stream inside evaluate). On direct evaluation with compute workers (draw_fanout.config) the engine runs of a wave
+    of draws fan out first; every draw is then evaluated in order on its own runs, with the same results."""
+    from toolkit.analysis import draw_fanout as DF
+    P = Progress(getattr(A, "log", None), label, nd)
+    kw = DF.config(A)
+    if kw is not None:
+        for a in range(0, nd, DF.WAVE):
+            wave = []
+            for _ in range(a, min(nd, a + DF.WAVE)):
+                D.last_clamped = []
+                theta, zs, noise, mult, sampled = D.draw()
+                if noise is not None:       # direct evaluation draws no emulator error (Drawer refuses it)
+                    raise ValueError("draw fan-out: a draw carries an emulator error stream on direct evaluation")
+                wave.append((theta, zs, mult, sampled, list(D.last_clamped)))
+            runs = DF.prefetch(A, [(w[0], w[1]) for w in wave], kw)
+            for (theta, zs, mult, sampled, clamped), r in zip(wave, runs):
+                A.model.use_runs(theta, zs, r)
+                out, ben, cost = A.evaluate(theta, zs, noise=None, cost_mult=mult, sampled=sampled)
+                yield {"sampled": sampled, "clamped": clamped, "out": out, "ben": ben, "cost": cost,
+                       "events": list(A.last_events), "floors": list(getattr(A, "last_cost_floors", None) or [])}
+                P.step()
+        return
     for _ in range(nd):
         D.last_clamped = []
         theta, zs, noise, mult, sampled = D.draw()
