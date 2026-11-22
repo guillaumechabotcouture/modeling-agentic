@@ -667,43 +667,75 @@ def _decision_tests(run_dir, man) -> list[dict]:
 
 DECISION_TEST_KIND = "decision_test_changes_plan"    # agents/stage_machine.py DECISION_BEARING_KINDS
 DECISION_TESTS_ARTIFACT = "analysis/decision_tests.yaml"
+# what decided each verdict and its threshold (toolkit/analysis/run.py decision_tests artifact; moves.py criteria)
+_CRITERIA = (("share", "share_pct", "threshold_pct"), ("regret", "regret_pct", "regret_threshold_pct"),
+             ("dollars", "dollars_share_pct", "dollars_threshold_pct"))
+
+
+def _verified(run_dir: str) -> tuple:
+    """(rows, manifest, problem) of analysis/decision_tests.yaml: read once with no link followed, the hash taken on
+    the bytes parsed (Codex r1 of #327). problem is None when there is nothing to read (no completed manifest, or the
+    manifest lists no such artifact) or the rows verified; else why they cannot be trusted."""
+    try:
+        man = json.load(open(os.path.join(run_dir, MANIFEST)))
+    except (OSError, ValueError):
+        return [], {}, None
+    if not isinstance(man, dict) or man.get("status") != "complete" or man.get("complete") is not True:
+        return [], man if isinstance(man, dict) else {}, None
+    ent = (man.get("artifacts") or {}).get(DECISION_TESTS_ARTIFACT)
+    if not isinstance(ent, dict):
+        return [], man, None
+    from toolkit.analysis.artifacts import _safe_io
+    try:
+        data = _safe_io().read_nofollow(run_dir, DECISION_TESTS_ARTIFACT)[0]
+    except Exception as e:  # noqa: BLE001 -- a link, a missing or unreadable file: not trusted
+        return [], man, f"cannot be read with no link followed ({type(e).__name__})"
+    import hashlib
+    if hashlib.sha256(data).hexdigest() != ent.get("sha256"):
+        return [], man, "changed after the harness wrote it"
+    try:
+        tests = ((yaml.safe_load(data.decode("utf-8")) or {}).get("data") or {}).get("tests")
+    except (yaml.YAMLError, UnicodeDecodeError, AttributeError) as e:
+        return [], man, f"does not parse ({type(e).__name__})"
+    if not isinstance(tests, list):
+        return [], man, "has no list of tests"
+    return tests, man, None
 
 
 def verified_decision_tests(run_dir: str) -> list:
-    """The rows of analysis/decision_tests.yaml when a completed manifest lists it with a matching hash; else []."""
-    rel = DECISION_TESTS_ARTIFACT
-    try:
-        man = json.load(open(os.path.join(run_dir, MANIFEST)))
-        ent = (man.get("artifacts") or {}).get(rel) if man.get("status") == "complete" else None
-        p = os.path.join(run_dir, rel)
-        if not ent or os.path.islink(p) or sha256(p) != ent.get("sha256"):
-            return []
-        tests = ((yaml.safe_load(open(p)) or {}).get("data") or {}).get("tests") or []
-    except (OSError, ValueError, AttributeError, TypeError, yaml.YAMLError):
-        return []
-    return tests if isinstance(tests, list) else []
+    """The rows of analysis/decision_tests.yaml when a completed manifest lists it and they verify; else []."""
+    return _verified(run_dir)[0]
 
 
 def decision_test_record(run_dir: str, test_id) -> dict | None:
-    """One verified row by its test id (the owner item's evidence: agents/stage_machine.py _bearing_item)."""
-    return next((t for t in verified_decision_tests(run_dir)
-                 if isinstance(t, dict) and str(t.get("test_id")) == str(test_id)), None)
+    """One verified row by its test id, with the manifest's hash of its result file (models/decision_tests/<id>.yaml,
+    which holds the per-value plan hashes): the owner item's evidence (agents/stage_machine.py _bearing_item), so a
+    different plan with the same summary is asked again (Codex r1 of #327)."""
+    rows, man, _ = _verified(run_dir)
+    row = next((t for t in rows if isinstance(t, dict) and str(t.get("test_id")) == str(test_id)), None)
+    if row is None:
+        return None
+    ent = (man.get("deliverables") or {}).get(str(row.get("path"))) if row.get("path") else None
+    return dict(row, result_sha256=(ent or {}).get("sha256"))
 
 
 def decision_test_findings(run_dir: str) -> list[dict]:
     """lead-gaps α: one decision-bearing finding per decision test whose verdict changes the plan (CHANGES_PLAN in
     analysis/decision_tests.yaml), in the shape the owner lifecycle consumes (agents/stage_machine.py apply_owner_rule,
     #316): HIGH, scope-declarable only through the owner's (or, under --signoff lead, the lead's provisional) answer.
-    Not a contract finding: gate_findings is unchanged. Read only from the completed manifest's artifact with a
-    matching hash; a missing, changed or unreadable artifact gives nothing here, since gate_findings already reports
-    it as a non-declarable HIGH."""
+    Not a contract finding: gate_findings is unchanged. A completed manifest whose artifact cannot be read and verified
+    gives one non-declarable HIGH instead (fail closed: a plan-changing test is never dropped silently)."""
+    rows, _man, problem = _verified(run_dir)
+    if problem:
+        return [_f("analysis_contract_decision_test", f"{DECISION_TESTS_ARTIFACT} {problem}: the decision tests that "
+                                                      "change the plan cannot be read", DECISION_TESTS_ARTIFACT)]
     out = []
-    for t in verified_decision_tests(run_dir):
+    for t in rows:
         if isinstance(t, dict) and t.get("verdict") == "CHANGES_PLAN":
             tid = str(t.get("test_id"))
-            why = ", ".join(f"{k.replace('_pct', '').replace('_', ' ')} {t[k]:.3g}%" for k in
-                            ("share_pct", "regret_pct", "dollars_moved_pct")
-                            if isinstance(t.get(k), (int, float)) and not isinstance(t.get(k), bool))
+            num = lambda k: isinstance(t.get(k), (int, float)) and not isinstance(t.get(k), bool)  # noqa: E731
+            why = ", ".join(f"{name} {t[v]:.3g}%" + (f" (threshold {t[th]:.3g}%)" if num(th) else "")
+                            for name, v, th in _CRITERIA if num(v))
             trig = t.get("triggered_by")
             out.append({"kind": DECISION_TEST_KIND, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE",
                         "claim": f"Decision test {tid} changes the plan: {' '.join(str(t.get('statement') or '').split())[:600]}"
@@ -1051,8 +1083,13 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         open(os.path.join(d, SPEC), "w").write("x: 1\n")
         S = complete_run(d, drop_kind="decision_tests", finalize=False)
+        os.makedirs(os.path.join(d, "models", "decision_tests"), exist_ok=True)
+        open(os.path.join(d, "models", "decision_tests", "DT1.yaml"), "w").write("plan_sha256: a\n")
+        S.deliverable(os.path.join(d, "models", "decision_tests", "DT1.yaml"), "toolkit/analysis/decision_tests.py",
+                      "test_result")     # the hash is what matters here, not the Phase 49 loader
         rows = [{"test_id": "DT1", "verdict": "CHANGES_PLAN", "statement": "The plan changes at the low value.",
-                 "share_pct": 40.0, "triggered_by": ["share"]},
+                 "path": "models/decision_tests/DT1.yaml", "share_pct": 40.0, "threshold_pct": 10.0,
+                 "dollars_share_pct": 20.0, "dollars_threshold_pct": 15.0, "triggered_by": ["share", "dollars"]},
                 {"test_id": "DT2", "verdict": "NO_CHANGE", "statement": "no"},
                 {"test_id": "DT3", "verdict": "NOT_RUN", "statement": "not run"},
                 {"test_id": "DT4", "verdict": "CHANGES_PLAN", "statement": "s", "within_solver_gap": True}]
@@ -1063,16 +1100,32 @@ def _self_test() -> int:
             for x in fs] == [("decision_test_changes_plan", "DT1", "HIGH", "ANALYZE", True, True),
                              ("decision_test_changes_plan", "DT4", "HIGH", "ANALYZE", True, True)]
            and "The plan changes at the low value." in fs[0]["claim"] and fs[0]["target_stage"] == "ANALYZE"
-           and "(share 40%; triggered by share)" in fs[0]["claim"] and "(" not in fs[1]["claim"],
-           f"K-DTP1 each test whose verdict changes the plan is a decision-bearing HIGH, keyed by its id: {fs}")
-        ok((decision_test_record(d, "DT1") or {}).get("statement") == rows[0]["statement"]
-           and decision_test_record(d, "DT9") is None, "K-DTP5 the owner item's evidence: one verified row by its id")
+           and "(share 40% (threshold 10%), dollars 20% (threshold 15%); triggered by share, dollars)" in fs[0]["claim"]
+           and "(" not in fs[1]["claim"],
+           f"K-DTP1 each test whose verdict changes the plan is a decision-bearing HIGH, keyed by its id, with the "
+           f"criteria that decided it: {fs}")
+        r1 = decision_test_record(d, "DT1") or {}
+        ok(r1.get("statement") == rows[0]["statement"] and decision_test_record(d, "DT9") is None
+           and r1.get("result_sha256") == sha256(os.path.join(d, "models", "decision_tests", "DT1.yaml")),
+           "K-DTP5 the owner item's evidence: one verified row by its id, with its result file's hash (per-value plans)")
         ok(gate_findings(d) == [], f"K-DTP2 the contract checks themselves are unchanged (not a contract finding): "
                                    f"{gate_findings(d)}")
         rel = "analysis/decision_tests.yaml"
-        open(os.path.join(d, rel), "a").write("# edited\n")
-        ok(decision_test_findings(d) == [] and "analysis_contract_tampered" in kinds(d),
-           "K-DTP3 a changed artifact is not read (the contract reports it as tampered, non-declarable)")
+        good = open(os.path.join(d, rel), "rb").read()
+        man = json.load(open(os.path.join(d, MANIFEST)))
+        json.dump(dict(man, complete=False), open(os.path.join(d, MANIFEST), "w"))
+        ok(decision_test_findings(d) == [], "K-DTP6 a manifest not recording a completed run: nothing read (Codex r1)")
+        json.dump(man, open(os.path.join(d, MANIFEST), "w"))
+        os.rename(os.path.join(d, rel), os.path.join(d, "analysis", "dt_copy.yaml"))
+        os.symlink(os.path.join(d, "analysis", "dt_copy.yaml"), os.path.join(d, rel))
+        fl = decision_test_findings(d)
+        ok([(x["kind"], x["scope_declarable"]) for x in fl] == [("analysis_contract_decision_test", False)],
+           f"K-DTP7 a link to identical bytes is refused as a non-declarable HIGH, never an empty list (Codex r1): {fl}")
+        os.remove(os.path.join(d, rel))
+        open(os.path.join(d, rel), "wb").write(good + b"# edited\n")
+        fl = decision_test_findings(d)
+        ok([x["kind"] for x in fl] == ["analysis_contract_decision_test"] and "analysis_contract_tampered" in kinds(d),
+           "K-DTP3 a changed artifact is not read: a non-declarable HIGH (and the contract reports it tampered)")
         os.remove(os.path.join(d, MANIFEST))
         ok(decision_test_findings(d) == [], "K-DTP4 no manifest: nothing read (the contract reports it missing)")
     if fails:
