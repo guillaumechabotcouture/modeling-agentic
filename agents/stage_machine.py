@@ -2141,23 +2141,30 @@ def _rep_error(rep: dict) -> str:
     return "; ".join(str(e) for e in errs)[:300]
 
 
-_TB_FRAME = re.compile(r'File "([^"]+)", line (\d+), in (\S+)')
+_TB_FRAME = re.compile(r'^[ |+]*File "([^"]+)", line (\d+)(?:, in (\S+))?\s*$')
+_TB_EXC = re.compile(r"^[A-Za-z_][\w.]*(?::|$)")
+_TB_HEAD = re.compile(r"[ |+]*(?:Exception Group )?Traceback \(most recent call last\):")
 
 
 def _step_error(err) -> str:
-    """A failed step's error, short enough for the history line: a Python traceback (the step's log tail) becomes its
-    exception and the frame that raised it. Its first 300 characters were only the outer frames, so T16's CI
-    flakes recorded a reason that named no exception (T9b); any other error is kept as it is."""
+    """A failed step's error, short enough for the history line. A Python traceback in it (the step's log tail; its
+    header may have fallen outside the tail) is reduced to the frame that raised and the exception's first line,
+    after whatever preceded the traceback (a timeout's own text); "Traceback at" keeps it read as a crash. The first
+    300 characters had held only the outer frames, so T16's CI flakes recorded no exception (T9b). Any other error is
+    kept as it is (T9c)."""
     text = str(err)
-    if "Traceback (most recent call last):" not in text:
+    lines = text.splitlines()
+    fr = [(k, m) for k, m in ((k, _TB_FRAME.match(ln)) for k, ln in enumerate(lines)) if m]
+    if not fr:
         return text
-    tb = text[text.rindex("Traceback (most recent call last):"):]
-    lines = [ln for ln in tb.splitlines() if ln.strip()]
-    frames = _TB_FRAME.findall(tb)
-    exc = next((ln.strip() for ln in reversed(lines) if not ln.startswith(" ") and not ln.startswith("Traceback")),
-               lines[-1].strip())
-    at = f" (at {os.path.basename(frames[-1][0])}:{frames[-1][1]} in {frames[-1][2]})" if frames else ""
-    return exc + at
+    k, m = fr[-1]
+    depth = lambda ln: len(ln) - len(ln.lstrip(" |+-"))  # noqa: E731 -- indent, ExceptionGroup borders included
+    exc = next((ln.lstrip(" |+-") for ln in lines[k + 1:] if depth(ln) < depth(lines[k])
+                and _TB_EXC.match(ln.lstrip(" |+-"))), "no exception line in the log tail")
+    hdr = _TB_HEAD.search(text)
+    head = text[:hdr.start()] if hdr else ""      # a timeout's own text, before the traceback it shows
+    where = f"{os.path.basename(m.group(1))}:{m.group(2)}" + (f" in {m.group(3)}" if m.group(3) else "")
+    return f"{head.strip()[:120]} Traceback at {where}: {exc[:150]}".strip()
 
 
 # Machine.reopen_interrupted_analysis's history line, per resumable cause.
@@ -2587,6 +2594,35 @@ def _self_test() -> int:
                        "steps": [{"id": "batch", "status": "failed", "error": "timed out after 8s at its backstop"}]})
     ok(why2 == "upstream step not rebuilt: configure; batch: timed out after 8s at its backstop",
        f"T9c an error that is not a traceback is kept as it was: {why2!r}")
+    # T9d (Codex r1 on the T9b fix): real interpreter output, as an 800-character log tail holds it.
+    def tail_of(code, n=800):
+        r = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           timeout=60)
+        return r.stdout[-n:]
+    cases = {
+        "trailing output": ("import atexit; atexit.register(print, 'cleanup complete')\n"
+                            "def solve():\n    raise RuntimeError('boom')\nsolve()", "RuntimeError: boom", "in solve"),
+        "multi-line message": ("def f():\n    raise ValueError('invalid row\\ncolumn 7')\nf()",
+                               "ValueError: invalid row", "in f"),
+        "syntax error": ("compile('x =', 'broken.py', 'exec')", "SyntaxError", "broken.py:1"),
+        "frame text in message": ("def g():\n    raise ValueError('see File \"other.py\", line 97, in other')\ng()",
+                                  "ValueError: see", "in g"),
+        "exception group": ("raise ExceptionGroup('workers', [ValueError('bad row')])", "ExceptionGroup: workers",
+                            "<string>:1"),
+        "long message": ("def h():\n    raise ValueError('x' * 320)\nh()", "ValueError: xxx", "in h"),
+        "header cut": ("".join(f"def f{i}():\n    f{i + 1}()\n" for i in range(40))
+                       + "def f40():\n    raise RuntimeError('deep')\nf0()", "RuntimeError: deep", "in f40"),
+    }
+    for name, (code, want_exc, want_at) in cases.items():
+        why_ = _rep_error({"ok": False, "steps": [{"id": "analyze", "status": "failed", "error": tail_of(code)}]})
+        ok(want_exc in why_ and want_at in why_ and "Traceback at" in why_ and "at other.py" not in why_
+           and "Exception Group Traceback" not in why_,
+           f"T9d a traceback with {name} keeps its exception and raising frame: {why_!r}")
+    to = "timed out after 8s at its backstop (process group killed); last output: " + tail_of(
+        "def s():\n    raise RuntimeError('boom')\ns()", 300)
+    why3 = _rep_error({"ok": False, "steps": [{"id": "analyze", "status": "failed", "error": to}]})
+    ok(why3.startswith("analyze: timed out after 8s") and "RuntimeError: boom" in why3,
+       f"T9e a timeout whose last output is a traceback still reads as the timeout first: {why3!r}")
 
     with tempfile.TemporaryDirectory() as td:
         def new_run(name, script, signoff="none", max_rounds=3, budget=None):
