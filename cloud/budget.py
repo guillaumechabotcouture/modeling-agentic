@@ -1677,6 +1677,28 @@ def _self_test() -> int:
                and scope_for_name("ev-dengue-hb0-gcc-keeper") == "ev",
                f"BR15b scope ev ($450, prefix ev-) signs from the tracked scopes file and admits eval clusters only: "
                f"{rec['prefixes']} {why} | {why2}")
+            # BR15c (owner 2026-11-22: a separate scope for the off-laptop supervisor, cloud/supervisor.py): the
+            # tracked file accepts `set --scope sv --usd 150 --days 14`, the record carries sv-, its check admits the
+            # supervisor's cluster and refuses an eval one, and no prefix of one scope is a prefix of another's
+            rsv = root("sv_scope")
+            stores[rsv] = _FakeKeys()
+            sv_env = _Env(budget_dir=rsv, pub_file=os.path.join(rsv, "owner.pub"), store=stores[rsv], clock=lambda: clock[0],
+                          source=_FakeSource([], {}), scopes=SCOPES_FILE, prices=pr, confirm=lambda rec: True)
+            init_key(sv_env)
+            try:
+                set_budget("sv", 150.0, "off-laptop supervisor (owner 2026-11-22)", None, 14, sv_env)
+                rec = load_budget("sv", sv_env)
+                with_env(sv_env)
+                okay, why = launch_budget_ok("sv", 15, "sv-supervisor-gcc", reserve=False)
+                bad, why2 = launch_budget_ok("sv", 1, "ev-dengue-hb0-gcc", reserve=False)
+            except BudgetError as e:
+                rec, okay, bad, why, why2 = {}, False, True, str(e), ""
+            allp = [(sc_, x) for sc_, ps in load_scopes(SCOPES_FILE)["scopes"].items() for x in ps]
+            overlap = [(a, b) for a in allp for b in allp if a[0] != b[0] and b[1].startswith(a[1])]
+            ok(rec.get("usd") == 150.0 and rec.get("prefixes") == ["sv-"] and okay and not bad and not overlap
+               and scope_for_name("sv-supervisor-gcc") == "sv",
+               f"BR15c scope sv ($150, prefix sv-) signs and admits the supervisor's cluster only; no prefix overlaps "
+               f"another scope's: {rec.get('prefixes')} {why} | {why2} | {overlap}")
             with_env(env(os.path.join(d, "none"), source=_FakeSource(items, dets)))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
