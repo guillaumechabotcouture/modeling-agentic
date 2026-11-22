@@ -6,3 +6,4 @@ scopes:
   f6: [v2-nigeria-gf13-, f6-refit-, f6-prep-, lw-smoke-]
   wmt: [wmt-]   # world-model trials (owner 2026-11-13: $1000 cap for the whole testing effort, LLM + compute)
   ev: [ev-]     # the five eval questions (cloud/configs/eval_*.py; owner 2026-11-21: $450 for the harness benchmark)
+  sv: [sv-]     # the off-laptop supervisor, cloud/supervisor.py (owner 2026-11-22: its own scope)
