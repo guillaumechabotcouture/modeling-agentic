@@ -4134,6 +4134,10 @@ def _self_test() -> int:
             ok(False, f"T58-T60 analysis timeout and resume: {type(e).__name__}: {e}")
 
         _self_test_auto1a(ok, td, spike, new_run)
+        try:
+            _self_test_hb2_spec(ok, td, spike, new_run)
+        except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
+            ok(False, f"HS: {type(e).__name__}: {e}")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
@@ -5478,6 +5482,103 @@ def _self_test_evidence(ok, td: str) -> None:
         yaml.safe_dump(raw, open(os.path.join(d, AB.SPEC_FILE), "w"))
         ok(any("owns" in p or "evidence dossier" in p for p in deliverable_problems(d)),
            f"T_DELIVERABLE_DOSSIER a deliverable named {name} is refused ({deliverable_problems(d)})")
+
+
+def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
+    """HS1-HS7 (baseline hb1, 2026-11-22): a SPEC try that returns no draft (the 30-turn cap) replaced the
+    validation feedback, so the next try never saw the error and repeated it (tb R1, run_failed at the try cap); the
+    checks stopped at the first class that failed, so each try heard one class of problem (HS4-HS6); the drafter's
+    prompt did not state the two rules that cost retries in measles and dengue (HS7)."""
+    from v2_tasks import StubTasks
+
+    class Scripted(StubTasks):
+        """script["tries"]: per try, "bad" (an invalid draft), "good" (a valid one), "capped" (no draft written,
+        the call fails) or "capped_good" (a valid draft written, then the call fails, as at the turn cap)."""
+        def draft_spec(self, q, rd, fb):
+            self.fbs = getattr(self, "fbs", []) + [list(fb or [])]
+            kind = (self.s["tries"] + ["capped"] * 9)[len(self.fbs) - 1]
+            if kind == "capped":
+                return self._r("draft_spec", False, note="max turns")
+            spec = dict(self.s["spec"])
+            if kind in ("bad", "bad2"):
+                spec["decision_units"] = dict(spec["decision_units"], csv="missing_units_table.csv")
+            if kind == "bad2":
+                spec.pop("objective", None)
+            r = StubTasks(dict(self.s, spec=spec)).draft_spec(q, rd, fb)
+            return self._r("draft_spec", False, note="max turns") if kind == "capped_good" else r
+
+    def go(name, tries, cls=None):
+        d, T, st = new_run(name, {})
+        T = Scripted(dict(T.s, tries=tries))
+        m = (cls or Machine)(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        for _ in range(len(tries) + 1):
+            if m.st.state != "SPEC" or m.st.paused or m.st.status:
+                break
+            m.step()
+        return m, T
+
+    m, T = go("hs1", ["bad", "capped", "bad"])
+    first = [x for x in T.fbs[1] if "missing_units_table" in x]
+    ok(len(T.fbs) == 3 and first and any("missing_units_table" in x for x in T.fbs[2])
+       and any("max turns" in x for x in T.fbs[2]),
+       f"HS1 a try that returns no draft keeps the earlier validation feedback, and adds its own note ({T.fbs})")
+    ok(sum("missing_units_table" in x for x in T.fbs[2]) == len(first),
+       f"HS1b feedback carried from an earlier try is not repeated ({T.fbs[2]})")
+    m, T = go("hs2", ["capped_good"])
+    ok(m.st.state != "SPEC" and m.st.tries.get("spec") == 1,
+       f"HS2 a valid draft written before the call failed (the turn cap) is validated and used ({m.st.state}, "
+       f"{m.st.tries.get('spec_feedback')})")
+    # HS4: one try hears every check class (a missing cited file and a missing section), not only the first
+    m, T = go("hs4", ["bad2", "good"])
+    ok(len(T.fbs) >= 2 and any("missing_units_table" in x for x in T.fbs[1])
+       and any("missing section objective" in x for x in T.fbs[1]),
+       f"HS4 one SPEC try reports the cited-input and the pre-sign problems together ({T.fbs[1:2]})")
+
+    # HS5: a check class that raises is reported by name, and the other classes' problems are kept
+    class GeoBoom(Machine):
+        def _geometry_problems(self, rd=None):
+            raise RuntimeError("geometry boom")
+    m, T = go("hs5", ["bad", "good"], GeoBoom)
+    ok(len(T.fbs) >= 2 and any("missing_units_table" in x for x in T.fbs[1])
+       and any("geometry boom" in x for x in T.fbs[1]),
+       f"HS5 a check that raises is named and does not hide the others' problems ({T.fbs[1:2]})")
+
+    # HS6: the evidence stage's spec problems (decision inputs with no dossier named) are heard at SPEC, in the same
+    # try, not one stage later (tb R2: EVIDENCE sent the spec back for 7 missing decision inputs)
+    from toolkit.spec import evidence_draft as EDR
+    real = EDR.assess
+    try:
+        EDR.assess = lambda rd, raw=None: dict(real(rd, raw), spec_problems=["the options need 7 decision input(s)"])
+        m, T = go("hs6", ["good", "good"])
+    finally:
+        EDR.assess = real
+    ok(len(T.fbs) >= 2 and any("7 decision input" in x for x in T.fbs[1]) and m.st.tries.get("spec") >= 2,
+       f"HS6 the evidence stage's spec problems come back from the SPEC try ({T.fbs[1:2]}, {m.st.state})")
+
+    # HS7: the drafter's prompt states the two rules that cost SPEC retries
+    from v2_sdk_tasks import PROMPTS
+    pr = PROMPTS["draft_spec"]
+    ok("no digits" in pr and "decision test" in pr and "engine_parameters" in pr and "calibrated" in pr,
+       "HS7 the draft_spec prompt says: no digits in a decision test's text; no engine_parameters value for a "
+       "calibrated or fitted parameter")
+
+    from types import SimpleNamespace as NS
+    from v2_sdk_tasks import SPEC_MAX_TURNS, SdkTasks
+    got = []
+
+    def q(prompt=None, options=None):
+        async def gen():
+            got.append(options.max_turns)
+            yield NS(total_cost_usd=0.0, session_id="hs3", is_error=False)
+        return gen()
+    hd = os.path.join(td, "hs3")
+    os.makedirs(hd)
+    t = SdkTasks(hd, query_fn=q)
+    t.set_allowance(1.0)
+    t._session("draft_spec", "x", "y", ())
+    t._session("pick_engine", "x", "y", ())
+    ok(got == [SPEC_MAX_TURNS, 30] and SPEC_MAX_TURNS > 30,
+       f"HS3 the spec draft has its own turn cap, above the 30 of the other tasks ({got})")
 
 
 def main(argv=None) -> int:
