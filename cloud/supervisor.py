@@ -13,13 +13,13 @@ work for about 8 hours). One loop on a small Coiled VM, all its state in blob st
       status.json (the loop's only), collected/<launch>/<label>.tar.gz, metrics.json. The storage account comes from
       $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT or --account, never the code.
 
-    python3 cloud/supervisor.py start [--name ev-supervisor-gcc] [--cap-usd 15] [--max-hours 24]
+    python3 cloud/supervisor.py start [--name sv-supervisor-gcc] [--cap-usd 15] [--max-hours 24]
     python3 cloud/supervisor.py enqueue-merge <pr>... | enqueue-collect <config.py>... | enqueue-noop
     python3 cloud/supervisor.py status | pull [--dest ~/modeling-agentic-keep/supervisor] | stop
     python3 cloud/supervisor.py loop --name <name>      # on the VM; `start` runs it as a vm_job job
     python3 cloud/supervisor.py --self-test
 
-`start` is vm_job `up` (2-vCPU worker, 2-vCPU scheduler; the name needs a budget scope, the default is in `ev`) then
+`start` is vm_job `up` (2-vCPU worker, 2-vCPU scheduler; the name needs a budget scope, the default is in `sv`) then
 `start` with the loop as the job, a dask task that holds the cluster for --max-hours. `stop` stops this name's live
 cluster by id. GitHub token: `start` passes $GH_TOKEN (vm_job --secret-env: the job's environment only) when the login
 keychain holds it under the service "modeling-agentic-supervisor-github"; without it merges stay held.
@@ -43,7 +43,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
 ROOT = "outputs/supervisor"
-DEFAULT_NAME = "ev-supervisor-gcc"
+DEFAULT_NAME = "sv-supervisor-gcc"
 GH_REPO = "guillaumechabotcouture/modeling-agentic"
 KEYCHAIN_SERVICE = "modeling-agentic-supervisor-github"
 STALE_S = 600            # status older than this: the loop is not running
@@ -678,6 +678,9 @@ def _self_test() -> int:
        f"SV16 start runs vm_job up + start with the loop ({flat})")
     cmds = guard(start_commands, a, "sv-1", False)
     ok(isinstance(cmds, list) and "--secret-env" not in " ".join(cmds[1]), "SV16b no token: no --secret-env")
+    import budget
+    ok(DEFAULT_NAME.startswith("sv-") and budget.scope_for_name(DEFAULT_NAME) == "sv",
+       "SV16c the default name is in the supervisor's own budget scope, sv (owner 2026-11-22)")
     # SV17 stop: only this name's live cluster, by id
     stopped, rec = [], lambda n, cid, why: stopped.append((n, cid))
     guard(stop_own, DEFAULT_NAME, live_id=lambda n: 123 if n == DEFAULT_NAME else 999, stop=rec)
