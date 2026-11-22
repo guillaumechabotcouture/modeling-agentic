@@ -369,7 +369,7 @@ def _recomputed(run, spec):
     rec, rec_why = run.json(BSV_REC)
     held = checks.digest((rec or {}).get("spec_sha256"))
     names = {}
-    for t in _dicts((((spec["doc"] or {}).get("analysis") or {}).get("decision_tests")) if isinstance((spec["doc"] or {}).get("analysis"), dict) else None):
+    for t in checks.spec_tests(spec["doc"] or {}):      # W0-B: a perturb test in its per-target form
         if t.get("benchmark") is not None and t.get("id") is not None:
             names.setdefault(str(t["benchmark"]), str(t["id"]))
     rows = [{"id": _text(b.get("id"), 200), "computed": num(b.get("computed")), "status": b.get("status") if isinstance(b.get("status"), str) else None,
