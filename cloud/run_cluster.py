@@ -386,6 +386,16 @@ def attach(name: str):
     return ws.attach_existing(name, WORKSPACE, cid)
 
 
+def _results_store():
+    """This repo's scripts/results_store, imported as eval_paths and pipeline_id are (from the repo this file is in),
+    not from cfg.tree or $PYTHONPATH: `collect` died with ModuleNotFoundError when neither held it (CI1-CI2)."""
+    d = os.path.join(os.path.dirname(HERE), "scripts")
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    import results_store
+    return results_store
+
+
 def _compute(cfg):
     sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
     import compute
@@ -1677,8 +1687,7 @@ def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=Non
     if cid is None:
         raise SystemExit(f"{cfg.name}: clusters.json records no run cluster id: refusing")
     if store is None:
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-        import results_store as store
+        store = _results_store()
     try:   # sent by value: the agent VM's uploaded worker_side may predate this function
         import cloudpickle
         cloudpickle.register_pickle_by_value(ws)
@@ -1783,8 +1792,7 @@ def _download(client, label, worker, dest_file):
 
 
 def collect(cfg, shutdown_after: bool = True):
-    sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-    import results_store
+    results_store = _results_store()
     os.makedirs(cfg.out_dir, exist_ok=True)
     running = is_running(cfg.name)
     if not os.path.exists(cfg.state_file):
@@ -2006,9 +2014,8 @@ def report_cost(cfg, args):
     elif os.path.exists(cfg.state_file):
         clusters["run"]["id"] = next(iter(json.load(open(cfg.state_file)).values())).get("cluster_id")
     if not ledgers:
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
         try:
-            import results_store
+            results_store = _results_store()
         except ImportError:
             results_store = None
         ledgers = _find_ledgers(cfg, results_store)
@@ -2035,8 +2042,7 @@ def relaunch(cfg, label) -> int:
         if label not in assign:
             raise SystemExit(f"{label}: no assignment in {cfg.state_file}; not relaunching")
         budget_guard(cfg, reserve=False)  # more paid work on the live run cluster: the budget must still cover it
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-        import results_store
+        results_store = _results_store()
         launch_id = assign[label]["launch_id"]
         names = {b["name"] for b in results_store.list_blobs(f"outputs/{cfg.storage_prefix}/launch_{launch_id}/",
                                                               cfg.storage_account)}
@@ -4100,6 +4106,40 @@ def _self_test_collect_no_shutdown(ok) -> None:
         ok(rc_ == 0 and len(downs) == want, cid)
 
 
+def _self_test_collect_import(ok) -> None:
+    """CI1-CI2 (2026-11-21: `collect` died with ModuleNotFoundError: results_store unless PYTHONPATH=scripts):
+    collect and the other storage commands import results_store from this repo's scripts/, as eval_paths and
+    pipeline_id are imported, whatever cfg.tree holds and wherever the command runs from. A fresh interpreter
+    (no PYTHONPATH, cwd outside the repo, a config whose tree does not exist), so no earlier import hides it."""
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "cfg.py")
+    open(path, "w").write("from run_cluster import RunConfig\n"
+                          f"CONFIG = RunConfig(name='ci', question_file='q', labels=('A',), out_dir={tmp!r}, "
+                          f"tree={os.path.join(tmp, 'no-such-tree')!r})\n")
+    json.dump({"A": {"launch_id": "L1", "worker": "w"}}, open(os.path.join(tmp, "assignments.json"), "w"))
+    code = ("import sys, json\n"
+            f"sys.path.insert(0, {HERE!r})\n"
+            "import run_cluster as rc\n"
+            "from unittest import mock\n"
+            "got = {}\n"
+            "def fake(cfg, store, *a, **k):\n"
+            "    got['store'] = store.__name__; got['has_list_blobs'] = hasattr(store, 'list_blobs')\n"
+            "    return {'exit_code': 0, 'duration_s': 1}\n"
+            "with mock.patch.object(rc, 'is_running', lambda n, lister=None: True), "
+            "mock.patch.object(rc, 'collect_from_storage', fake), mock.patch.object(rc, 'shutdown', lambda c: None):\n"
+            f"    rc.main(['run_cluster.py', {path!r}, 'collect'])\n"
+            "print('RESULT ' + json.dumps(got))\n")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    p = subprocess.run([sys.executable, "-c", code], cwd=tmp, env=env, capture_output=True, text=True, timeout=120)
+    line = next((ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")), None)
+    got = json.loads(line[len("RESULT "):]) if line else {}
+    ok(p.returncode == 0 and "ModuleNotFoundError" not in p.stderr,
+       f"CI1 `collect` runs with no PYTHONPATH and a missing cfg.tree (rc={p.returncode}: {p.stderr[-300:]!r})")
+    ok(got == {"store": "results_store", "has_list_blobs": True},
+       f"CI2 `collect` hands collect_from_storage this repo's results_store ({got})")
+
+
 def _self_test_eval_configs(ok) -> None:
     """EV (harness benchmark protocol, owner 2026-11-21: an `ev` budget scope of $450): every eval config states
     its cap (US$35 per run, times its replicates), runs v2 with lead sign-off, 3 rounds and a US$35 model cap, and
@@ -5257,6 +5297,10 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CN: {type(e).__name__}: {e}")
     try:
+        _self_test_collect_import(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CI: {type(e).__name__}: {e}")
+    try:
         _self_test_checkpoint(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CK: {type(e).__name__}: {e}")
@@ -5308,8 +5352,7 @@ def main(argv) -> int:
     elif cmd == "collect":
         collect(cfg, shutdown_after="--no-shutdown" not in rest)
     elif cmd == "checkpoint":
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-        import results_store
+        results_store = _results_store()
         for label in ([rest[rest.index("--label") + 1]] if "--label" in rest else cfg.labels):
             fetch_checkpoint(cfg, results_store, label)
     elif cmd == "checkpoint-now":
