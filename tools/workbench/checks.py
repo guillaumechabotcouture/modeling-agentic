@@ -272,16 +272,15 @@ DEPARTURE_TESTS = ("parameter_value", "interaction_rescale")
 
 def spec_tests(doc) -> list:
     """The signed spec's analysis.decision_tests in their per-target form (W0-B: a `perturb` test read as the older
-    type it executes as, toolkit/spec/perturb.py tests). perturb.py imports nothing from the repo, so it is loaded by
-    path; [] for a spec without the list."""
-    import importlib.util
+    type it executes as, toolkit/spec/perturb.py tests; that module imports nothing else from the repo); [] for a spec
+    without the list."""
     import os
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                        "toolkit", "spec", "perturb.py")
-    sp = importlib.util.spec_from_file_location("_wb_perturb", path)
-    mod = importlib.util.module_from_spec(sp)
-    sp.loader.exec_module(mod)
-    return mod.tests(doc.get("analysis") if isinstance(doc, dict) else None)
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if root not in sys.path:
+        sys.path.append(root)
+    from toolkit.spec import perturb
+    return perturb.tests(doc.get("analysis") if isinstance(doc, dict) else None)
 
 
 def departure_refused(spec, kind, subject, test):
