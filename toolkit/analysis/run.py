@@ -715,6 +715,7 @@ def _self_test() -> int:
                 A5.set_reserve(None)
             A5.plan_budget = None
         _self_test_cost_structure(ok, A5, R)
+        _self_test_perturb(ok, A5, R)
         stb = R["stability"]
         ok(stb["n_folds"] == 4 and stb["value_verdict"] in ("ROBUST", "FRAGILE", "UNSTABLE")
            and "total_benefit_loss_pct_worst_fold" in stb["metrics"],
@@ -2506,6 +2507,54 @@ def _self_test_cost_structure(ok, A, R):
     ok("[CLAIM:cost.floored_unit_packages.point]" in txt and "S1-3 floor statement" in txt
        and "cost.floored_unit_packages.point" in ids,
        "R5r the results state the floored increments, with the count as a claim")
+
+
+def _self_test_perturb(ok, A, R):
+    """W0-B: a native perturb test runs through the same machinery as the older type it replaces and gives the same
+    record (every golden part: decision, detail, words, plans); a joint test holds its companions and carries no
+    departure. These records are kept out of the golden capture (they repeat records already in it)."""
+    from toolkit.analysis import dt_golden as DG
+    plan = R["point"]["plan"]
+    z0 = {i: v["z"] for i, v in R["point"]["per_unit"].items()}
+    out0, ben0, cost0 = A.evaluate(A.theta0, z0)
+    its = {it["component"]: it["id"] for it in A.alloc["cost_items"]}
+    box = DT.runtime_evidence(A)["box"] or {}
+    nm = sorted(box)
+    mid = {n: 0.5 * (box[n][0] + box[n][1]) for n in nm}
+    pairs = [({"id": "DTk", "type": "cost_items", "text": "t", "multipliers": {its["a"]: 1e9, its["b"]: 0.5}},
+              {"id": "DTk", "type": "perturb", "text": "t", "set": [
+                  {"target": "cost_item", "name": its["a"], "scale": 1e9},
+                  {"target": "cost_item", "name": its["b"], "scale": 0.5}]}),
+             ({"id": "DTe", "type": "envelope", "text": "t", "values": [0.5 * A.budget, A.budget]},
+              {"id": "DTe", "type": "perturb", "text": "t", "set": [{"target": "envelope",
+                                                                       "values": [0.5 * A.budget, A.budget]}]})]
+    if len(nm) >= 2:
+        pairs.append(({"id": "DTj", "type": "parameter_value", "text": "t", "parameter": nm[0],
+                       "values": [box[nm[0]][0], mid[nm[0]]], "with": {nm[1]: box[nm[1]][1]}},
+                      {"id": "DTj", "type": "perturb", "text": "t", "set": [
+                          {"target": "parameter", "name": nm[0], "values": [box[nm[0]][0], mid[nm[0]]]},
+                          {"target": "parameter", "name": nm[1], "value": box[nm[1]][1]}]}))
+    ok(len(pairs) == 3, f"RPT0 the toy emulator has two parameter inputs for the joint test: {nm}")
+    DG._CAP["paused"] = True
+    try:
+        for old, new in pairs:
+            r_old = DT.run_one(A, old, z0, ben0, cost0, plan, R["uncertainty"], out0)
+            r_new = DT.run_one(A, new, z0, ben0, cost0, plan, R["uncertainty"], out0)
+            ok(r_new["status"] == "run" and DG.digest(r_new) == DG.digest(r_old) and r_new["type"] == "perturb"
+               and r_old["type"] == old["type"] and r_old["perturb"]["alias"] == old["type"],
+               f"RPT1 a perturb test gives the record of its alias {old['type']} ({old['id']}): "
+               f"{DG.digest(r_new)} vs {DG.digest(r_old)}")
+            lay = r_new["perturb"]["layer"]
+            ok(lay["layer"] == ("post_emulator" if old["type"] == "envelope" else "emulator_design")
+               and lay["engine_rows"] == 0, f"RPT2 the record names the layer the test acts on: {lay}")
+        if len(pairs) == 3:
+            dv = DT.departure_verdicts([{"engine": "e", "benchmark": "B", "decision_test": "DTj"}],
+                                       {"B": {"components": ["a"]}}, {"DTj": r_new})
+            ok(r_new.get("with") == {nm[1]: box[nm[1]][1]} and not dv[0]["effective"] and "companion" in dv[0]["why"],
+               f"RPT3 DT_CONDITIONAL_NO_DEPARTURE: a joint perturb test holds its companion and carries no departure: "
+               f"{dv}")
+    finally:
+        DG._CAP["paused"] = False
 
 
 def _floor_q(theta, theta0, at_point):

@@ -21,6 +21,8 @@ import hashlib
 import os
 import re
 import sys
+import threading
+import time
 
 DEFAULT_ACCOUNT_ENV = "COILED_STORAGE_ACCOUNT"
 
@@ -29,16 +31,64 @@ def configured_account() -> str | None:
     return os.environ.get("MA_STORAGE_ACCOUNT") or os.environ.get(DEFAULT_ACCOUNT_ENV)
 
 
+# v2 autonomy 1E-i: a stalled socket raises instead of hanging a run's last step, and a store or fetch gives up only
+# after ATTEMPTS tries, about a minute apart in total (waits of 4, 8, 16 and 32 s).
+CONNECT_TIMEOUT_S, READ_TIMEOUT_S, CALL_TIMEOUT_S, ATTEMPTS = 30, 120, 300, 5
+_CLIENTS: dict = {}
+_CLIENTS_LOCK = threading.Lock()
+
+
 def _service(account: str | None = None):
-    from azure.identity import DefaultAzureCredential
-    from azure.storage.blob import BlobServiceClient
+    """The account's client: one per account for the life of the process (a client per call built a new credential
+    and connection pool each time), with connection and read timeouts."""
     # $COILED_STORAGE_ACCOUNT is not set on workers in every workspace; the
     # launcher then passes the account name through $MA_STORAGE_ACCOUNT.
     account = account or configured_account()
     if not account:
         raise RuntimeError(f"no storage account: set ${DEFAULT_ACCOUNT_ENV} / $MA_STORAGE_ACCOUNT or pass --account")
-    return BlobServiceClient(f"https://{account}.blob.core.windows.net",
-                             credential=DefaultAzureCredential(exclude_interactive_browser_credential=True))
+    with _CLIENTS_LOCK:
+        if account not in _CLIENTS:
+            from azure.identity import DefaultAzureCredential
+            from azure.storage.blob import BlobServiceClient
+            _CLIENTS[account] = BlobServiceClient(
+                f"https://{account}.blob.core.windows.net",
+                credential=DefaultAzureCredential(exclude_interactive_browser_credential=True),
+                connection_timeout=CONNECT_TIMEOUT_S, read_timeout=READ_TIMEOUT_S)
+        return _CLIENTS[account]
+
+
+def _accepts(fn, **kw) -> dict:
+    """`kw` cut down to what `fn` takes. Azure's blob calls take a stream's `length` and a per-call `timeout`; a
+    client that takes neither (a whole-bytes test double) is called the plain way."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return kw
+    if any(x.kind is x.VAR_KEYWORD for x in params.values()):
+        return kw
+    return {k: v for k, v in kw.items() if k in params}
+
+
+def _retry(what: str, fn, attempts: int):
+    """fn(), tried `attempts` times with a doubling wait between tries. A blob that does not exist is not retried."""
+    last = None
+    for k in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 -- transient network/auth errors
+            if isinstance(e, (FileNotFoundError, KeyError)) or type(e).__name__ == "ResourceNotFoundError":
+                raise
+            last = e
+            if k + 1 < attempts:
+                time.sleep(4 * 2 ** k)
+    raise RuntimeError(f"{what} failed after {attempts} attempts: {type(last).__name__}: {last}") from last
+
+
+def _blob_chunks(client):
+    """The blob's bytes block by block (one block from a client that can only read whole)."""
+    d = client.download_blob(**_accepts(client.download_blob, timeout=CALL_TIMEOUT_S))
+    return d.chunks() if hasattr(d, "chunks") else iter([d.readall()])
 
 
 _SENSITIVE_NAME = re.compile(r"(?i)^(\.env.*|.*\.(pem|key|p12|pfx)|.*credential.*|.*secret.*|id_rsa.*|\.netrc|\.npmrc|\.pypirc)$")
@@ -75,7 +125,21 @@ def archive_dir(root: str, arcname: str, secrets: list[str] | None = None) -> tu
     return buf.getvalue(), skipped
 
 
-REDACT_MAX_MB = 64      # larger files are streamed, not read whole: kept only when they hold no secret
+REDACT_MAX_MB = 64      # larger files are never read whole: one that holds a secret is redacted block by block
+
+
+def _redact_stream(src, dst, secrets: list[bytes]) -> None:
+    """`src` copied to `dst` with every secret replaced, in 1 MiB blocks; the last bytes of each block (the longest
+    secret, less one) are held back so a secret across two blocks is still replaced."""
+    keep, carry = max(len(x) for x in secrets) - 1, b""
+    for block in iter(lambda: src.read(2**20), b""):
+        buf = carry + block
+        for x in secrets:
+            buf = buf.replace(x, b"<redacted>")
+        cut = max(0, len(buf) - keep)
+        dst.write(buf[:cut])
+        carry = buf[cut:]
+    dst.write(carry)
 
 
 def _plain(rel: str) -> list[str]:
@@ -138,16 +202,19 @@ def _copy_scan(fd: int, dst, secrets: list[bytes]) -> bool:
 
 
 def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | None = None, extra=(),
-                  _hook=None, base: str | None = None) -> list[str]:
+                  _hook=None, base: str | None = None, strict: bool = False) -> list[str]:
     """archive_dir streamed to `out_path` (F6 run checkpoints): the same exclusions and redaction, with bounded
     memory. The run dir is reached from `base` (the trusted job work dir) one component at a time, no link followed
     (Codex round 3: a parent such as work/runs linked into _truth/ is refused); without `base`, `root` itself must
     not be a link. Files are listed and opened through that directory fd. Each file is opened once, no link followed
     at any component, regular files only; its bytes are copied to a temporary file, and what is scanned and redacted
     is that copy, which is what is archived, so a rewrite or a swap for a link after the listing can neither leak a
-    secret nor reach _truth/. A copy up to REDACT_MAX_MB is redacted; a larger one is left out (listed) if it holds
-    a secret. `extra`: (path, arcname) pairs (run.log). `_hook(rel)` runs between the listing and each open
-    (self-test). Returns what was left out."""
+    secret nor reach _truth/. A copy up to REDACT_MAX_MB is redacted in memory, a larger one block by block
+    (_redact_stream), so no file is left out for its size. `extra`: (path, arcname) pairs (run.log). `_hook(rel)` runs between the listing and each open
+    (self-test). Returns what was left out. `strict` (a final store, of a run that has ended): a regular file that
+    is not a sensitive path and still could not be archived (unreadable) raises OSError, so the store is never
+    recorded as complete without it."""
+    import stat
     sec = [x.encode() for x in (secrets or []) if x and len(x) >= 12]
     skipped = []
     items = []
@@ -161,6 +228,10 @@ def write_archive(root: str, arcname: str, out_path: str, secrets: list[str] | N
             items += [(root_fd, os.path.normpath(os.path.join(dp, fn)), None) for fn in sorted(files)]
         items += [(os.path.dirname(os.path.abspath(p)), os.path.basename(p), a) for p, a in extra]
         _write_items(items, arcname, out_path, sec, skipped, _hook)
+        bad = [r for r in skipped if strict and not is_sensitive_path(r)
+               and stat.S_ISREG(os.stat(r, dir_fd=root_fd, follow_symlinks=False).st_mode)]
+        if bad:
+            raise OSError(f"{len(bad)} file(s) could not be read for the archive, e.g. {bad[:3]}")
     finally:
         os.close(root_fd)
     return skipped
@@ -197,8 +268,12 @@ def _write_items(items, arcname, out_path, sec, skipped, _hook):
                             data = data.replace(x, b"<redacted>")
                         ti.size = len(data)
                         t.addfile(ti, io.BytesIO(data))
-                    elif found:
-                        skipped.append(listed)
+                    elif found:       # Codex 1E-i round 1: redacted as it streams, not left out
+                        with tempfile.TemporaryFile(dir=os.path.dirname(os.path.abspath(out_path))) as red:
+                            _redact_stream(tmp, red, sec)
+                            ti.size = red.tell()
+                            red.seek(0)
+                            t.addfile(ti, red)
                     else:
                         ti.size = size
                         t.addfile(ti, tmp)
@@ -215,34 +290,36 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def upload_file(path: str, blob: str, account: str | None = None, service=None, attempts: int = 3) -> dict:
-    """upload_retry with bounded memory: the file is streamed up and the read-back verified chunk by chunk."""
-    import time
-    want, size = sha256_file(path), os.path.getsize(path)
+def upload(path: str, blob: str, account: str | None = None, service=None) -> dict:
+    """Upload a file and read it back (sha256) so success is verified, not assumed. Bounded memory: the file is
+    streamed up and the read-back hashed chunk by chunk."""
     container, name = _split(blob)
-    last = None
-    for k in range(attempts):
-        try:
-            client = (service or _service(account)).get_blob_client(container, name)
-            with open(path, "rb") as f:
-                client.upload_blob(f, overwrite=True, length=size)
-            h = hashlib.sha256()
-            for block in client.download_blob().chunks():
-                h.update(block)
-            if h.hexdigest() != want:
-                raise RuntimeError(f"upload of {blob} did not verify")
-            return {"blob": blob, "bytes": size, "sha256": want}
-        except Exception as e:  # noqa: BLE001 -- transient network/auth errors
-            last = e
-            time.sleep(2 ** k)
-    raise RuntimeError(f"upload of {blob} failed after {attempts} attempts: {type(last).__name__}: {last}")
+    client = (service or _service(account)).get_blob_client(container, name)
+    want, size = sha256_file(path), os.path.getsize(path)
+    kw = _accepts(client.upload_blob, length=size, timeout=CALL_TIMEOUT_S)
+    with open(path, "rb") as f:
+        client.upload_blob(f if "length" in kw else f.read(), overwrite=True, **kw)
+    h = hashlib.sha256()
+    for block in _blob_chunks(client):
+        h.update(block)
+    if h.hexdigest() != want:
+        raise RuntimeError(f"upload of {blob} did not verify")
+    return {"blob": blob, "bytes": size, "sha256": want}
+
+
+def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = ATTEMPTS) -> dict:
+    _split(blob)
+    return _retry(f"upload of {blob}", lambda: upload(path, blob, account, service), attempts)
+
+
+upload_file = upload_retry      # the checkpointer's name for it; both stream
 
 
 def sha256_blob(blob: str, account: str | None = None, service=None) -> str:
     """A blob's sha256, hashed chunk by chunk as it streams: never read whole, never written to disk."""
     container, name = _split(blob)
     h = hashlib.sha256()
-    for block in (service or _service(account)).get_blob_client(container, name).download_blob().chunks():
+    for block in _blob_chunks((service or _service(account)).get_blob_client(container, name)):
         h.update(block)
     return h.hexdigest()
 
@@ -253,38 +330,11 @@ def delete(blob: str, account: str | None = None, service=None) -> None:
     (service or _service(account)).get_blob_client(container, name).delete_blob()
 
 
-def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = 3) -> dict:
-    import time
-    last = None
-    for k in range(attempts):
-        try:
-            return upload(path, blob, account, service=service)
-        except Exception as e:  # noqa: BLE001 — transient network/auth errors
-            last = e
-            time.sleep(2 ** k)
-    raise RuntimeError(f"upload of {blob} failed after {attempts} attempts: {type(last).__name__}: {last}")
-
-
 def _split(blob: str) -> tuple[str, str]:
     container, _, name = blob.partition("/")
     if not container or not name:
         raise ValueError(f"blob must be <container>/<path>, got {blob!r}")
     return container, name
-
-
-def upload(path: str, blob: str, account: str | None = None, service=None) -> dict:
-    """Upload a file and read it back (size + sha256) so success is verified,
-    not assumed."""
-    data = open(path, "rb").read()
-    container, name = _split(blob)
-    svc = service or _service(account)
-    client = svc.get_blob_client(container, name)
-    client.upload_blob(data, overwrite=True)
-    back = client.download_blob().readall()
-    ok = hashlib.sha256(back).hexdigest() == hashlib.sha256(data).hexdigest()
-    if not ok:
-        raise RuntimeError(f"upload of {blob} did not verify (sizes {len(data)} vs {len(back)})")
-    return {"blob": blob, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def list_blobs(prefix: str, account: str | None = None, service=None) -> list[dict]:
@@ -296,14 +346,32 @@ def list_blobs(prefix: str, account: str | None = None, service=None) -> list[di
             for b in cc.list_blobs(name_starts_with=name_prefix)]
 
 
-def download(blob: str, path: str, account: str | None = None, service=None) -> dict:
+def download(blob: str, path: str, account: str | None = None, service=None, attempts: int = ATTEMPTS) -> dict:
+    """The blob streamed to `path` with a chunked sha256, never held whole: written under a temporary name beside
+    `path` and renamed over it only when complete (lib.safe_io: no link followed), so a failed or interrupted fetch
+    leaves what was there. Retried like an upload; a blob that does not exist raises at once."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from lib import safe_io
     container, name = _split(blob)
-    svc = service or _service(account)
-    data = svc.get_blob_client(container, name).download_blob().readall()
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
-    return {"blob": blob, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    path = os.path.abspath(path)
+    if "\\" in os.path.basename(path):      # safe_io reads a backslash as a separator: refused, never misplaced
+        raise ValueError(f"download destination name holds a backslash: {path!r}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def once():
+        h, n = hashlib.sha256(), 0
+        with safe_io.stream_nofollow(os.path.dirname(path), os.path.basename(path)) as f:
+            for block in _blob_chunks((service or _service(account)).get_blob_client(container, name)):
+                f.write(block)
+                h.update(block)
+                n += len(block)
+        return {"blob": blob, "bytes": n, "sha256": h.hexdigest()}
+    return _retry(f"download of {blob}", once, attempts)
+
+
+download_file = download
 
 
 def _self_test() -> int:
@@ -406,9 +474,10 @@ def _self_test() -> int:
             def get_blob_client(self, c, n):
                 st = self.store
                 return type("B", (), {
-                    "upload_blob": lambda _s, f, overwrite=False, length=None: st.__setitem__((c, n), f.read(length)),
-                    "download_blob": lambda _s: type("D", (), {"chunks": lambda _d: iter([st[(c, n)][:5],
-                                                                                         st[(c, n)][5:]])})()})()
+                    "upload_blob": lambda _s, f, overwrite=False, length=None, timeout=None: st.__setitem__(
+                        (c, n), f.read(length)),
+                    "download_blob": lambda _s, timeout=None: type("D", (), {
+                        "chunks": lambda _d: iter([st[(c, n)][:5], st[(c, n)][5:]])})()})()
         sv = _Stream()
         r = upload_file(p, "outputs/ck/r.tar.gz", service=sv)
         if sv.store.get(("outputs", "ck/r.tar.gz")) != b"result bytes" or r["sha256"] != sha256_file(p):
@@ -421,8 +490,27 @@ def _self_test() -> int:
             sk = write_archive(ar, "run", os.path.join(d, "w.tar.gz"), ["sk-ant-SECRETSECRET123"])
         finally:
             globals()["REDACT_MAX_MB"] = _max
-        if "models/big.bin" not in sk or "report.md" not in sk or "_truth/answers.yaml" not in sk:
-            fails.append(f"S9 write_archive leaves out large files holding a secret, and _truth/: {sk}")
+        got = _tf.open(os.path.join(d, "w.tar.gz"), mode="r:gz")
+        body = got.extractfile("run/models/big.bin").read() if "run/models/big.bin" in got.getnames() else None
+        if sorted(sk) != sorted(["_truth/answers.yaml", ".env.local", "models/tls.key"]) \
+                or body != b"x" * 100 + b"<redacted>":
+            fails.append(f"S9 (Codex 1E-i round 1) write_archive keeps a large file holding a secret, redacted as it "
+                         f"streams, and leaves out only _truth/ and credential files: {sk} {body!r}")
+        # S25: a secret that straddles two 1 MiB blocks of a large file is still redacted, and nothing else changes
+        strad = os.path.join(ar, "models", "straddle.bin")
+        with open(strad, "wb") as f:
+            f.write(b"a" * (2**20 - 5) + b"sk-ant-SECRETSECRET123" + b"b" * 100 + b"sk-ant-SECRETSECRET123")
+        globals()["REDACT_MAX_MB"] = 0
+        try:
+            sk = write_archive(ar, "run", os.path.join(d, "w.tar.gz"), ["sk-ant-SECRETSECRET123"])
+        finally:
+            globals()["REDACT_MAX_MB"] = _max
+        got = _tf.open(os.path.join(d, "w.tar.gz"), mode="r:gz")
+        body = got.extractfile("run/models/straddle.bin").read() if "run/models/straddle.bin" in got.getnames() else b""
+        if body != b"a" * (2**20 - 5) + b"<redacted>" + b"b" * 100 + b"<redacted>":
+            fails.append(f"S25 a secret across a block boundary of a large file is redacted: {len(body)} bytes, "
+                         f"skipped {sk}")
+        os.remove(strad)
         # Codex round 1 P1-2: each file is opened once, without following links, and what is scanned is what is
         # archived. The hook runs between the listing and the open, as a concurrent writer would.
         os.remove(big)
@@ -450,8 +538,10 @@ def _self_test() -> int:
             sk = write_archive(ar, "run", out, ["sk-ant-SECRETSECRET123"], _hook=race)
         finally:
             globals()["REDACT_MAX_MB"] = _max
-        if "models/late.txt" not in sk:
-            fails.append(f"S12 a large file rewritten with a secret after the listing is left out: {sk}")
+        late = _tf.open(out, mode="r:gz").extractfile("run/models/late.txt").read() if "models/late.txt" not in sk \
+            else b"left out"
+        if b"SECRETSECRET" in late or b"<redacted>" not in late:
+            fails.append(f"S12 a large file rewritten with a secret after the listing is archived redacted: {late!r}")
         # Codex round 2 P1-1: a name is never translated or allowed to climb out; the root itself is no link
         esc = os.path.join(d, "esc")
         os.makedirs(os.path.join(esc, "work", "run"))
@@ -519,11 +609,170 @@ def _self_test() -> int:
         delete("outputs/ck/x", service=sv)
         if ("outputs", "ck/x") in sv.store:
             fails.append("S13 delete removes a blob")
+    try:
+        _self_test_durable(fails)
+    except Exception as e:  # noqa: BLE001
+        fails.append(f"S18-S24 raised {type(e).__name__}: {e}")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_durable(fails) -> None:
+    """S18-S24 (v2 autonomy 1E-i): one reused client with timeouts, retries with backoff, and uploads and downloads
+    that never hold a file whole. Fake blob clients; no network."""
+    import json
+    import tempfile
+    import time
+    import types
+    from unittest import mock
+    block = b"q" * 2**20
+
+    class _Client:        # Azure's streaming call shapes; whole-file reads and byte uploads are refused
+        def __init__(self, st, key, calls, fail):
+            self.st, self.key, self.calls, self.fail = st, key, calls, fail
+
+        def upload_blob(self, data, overwrite=False, length=None, timeout=None):
+            self.calls.append(("up", timeout))
+            if isinstance(data, (bytes, bytearray)):
+                raise AssertionError("upload_blob was given the whole file as bytes")
+            if self.fail and self.fail("up", len(self.calls)):
+                raise OSError("transient")
+            self.st[self.key] = b"".join(iter(lambda: data.read(2**16), b""))
+
+        def download_blob(self, timeout=None):
+            self.calls.append(("down", timeout))
+            if self.fail and self.fail("down", len(self.calls)):
+                raise OSError("transient")
+            v, cut = self.st[self.key], self.fail and self.fail("cut", len(self.calls))
+
+            def chunks(_d):
+                for i in range(0, len(v), 2**20):
+                    if cut and i:
+                        raise OSError("connection reset mid-stream")
+                    yield v[i:i + 2**20]
+
+            def readall(_d):
+                raise AssertionError("readall: the blob would be held whole")
+            return type("D", (), {"chunks": chunks, "readall": readall})()
+
+    class _Svc:
+        def __init__(self, fail=None):
+            self.st, self.calls, self.fail = {}, [], fail
+
+        def get_blob_client(self, c, n):
+            return _Client(self.st, (c, n), self.calls, self.fail)
+
+    made = []
+    blob_mod = types.SimpleNamespace(BlobServiceClient=lambda url, **kw: made.append((url, kw)) or object())
+    ident = types.SimpleNamespace(DefaultAzureCredential=lambda **kw: "cred")
+    with mock.patch.dict(sys.modules, {"azure": types.SimpleNamespace(), "azure.identity": ident,
+                                       "azure.storage": types.SimpleNamespace(), "azure.storage.blob": blob_mod}):
+        same = _service("acct18") is _service("acct18") and _service("other18") is not _service("acct18")
+    kw = made[0][1] if made else {}
+    if not same or len(made) != 2 or (kw.get("connection_timeout"), kw.get("read_timeout")) != (30, 120):
+        fails.append(f"S18 RS_STREAM_TIMEOUT one client per account, reused, with connection and read timeouts: "
+                     f"{len(made)} built, {sorted(kw)}")
+    slept = []
+    with tempfile.TemporaryDirectory() as d, mock.patch.object(time, "sleep", slept.append):
+        src = os.path.join(d, "big.bin")
+        with open(src, "wb") as f:
+            for _ in range(3):
+                f.write(block)
+        svc, got = _Svc(), {}
+        try:
+            r = upload_retry(src, "outputs/s/big.bin", service=svc)
+            got = download("outputs/s/big.bin", os.path.join(d, "out", "big.bin"), service=svc)
+            same = sha256_file(os.path.join(d, "out", "big.bin")) == sha256_file(src) == got["sha256"] == r["sha256"]
+        except Exception as e:  # noqa: BLE001
+            same = f"{type(e).__name__}: {e}"
+        if same is not True or got.get("bytes") != 3 * 2**20:
+            fails.append(f"S19 upload_retry and download stream chunk by chunk, with a chunked sha256: {same}")
+        if not svc.calls or {t for _, t in svc.calls} != {300}:
+            fails.append(f"S20 RS_STREAM_TIMEOUT every storage call carries the per-call timeout: {svc.calls[:4]}")
+        slept.clear()
+        flaky = _Svc(fail=lambda what, n: what == "down" and n <= 4)
+        flaky.st[("outputs", "s/f.bin")] = block
+        try:
+            got = download("outputs/s/f.bin", os.path.join(d, "f.bin"), service=flaky)["bytes"]
+        except Exception as e:  # noqa: BLE001
+            got = f"{type(e).__name__}: {e}"
+        if got != 2**20 or len(slept) != 4 or slept != sorted(slept) or not 30 <= sum(slept) <= 62:
+            fails.append(f"S21 a download is retried: five attempts with a growing wait: {got}, waits {slept}")
+        dead = _Svc(fail=lambda what, n: what == "up")
+        try:
+            upload_retry(src, "outputs/s/dead.bin", service=dead)
+            got = "no error"
+        except RuntimeError as e:
+            got = str(e)
+        if "5 attempts" not in got or len(dead.calls) != 5:
+            fails.append(f"S22 an upload that keeps failing raises after five attempts: {got} ({len(dead.calls)} calls)")
+        cut = _Svc(fail=lambda what, n: what == "cut")
+        cut.st[("outputs", "s/c.bin")] = block * 2
+        dest = os.path.join(d, "keep", "c.bin")
+        os.makedirs(os.path.dirname(dest))
+        with open(dest, "wb") as f:
+            f.write(b"the earlier good copy")
+        try:
+            download("outputs/s/c.bin", dest, service=cut)
+            got = "no error"
+        except RuntimeError:
+            got = "raised"
+        left = sorted(os.listdir(os.path.dirname(dest)))
+        if got != "raised" or left != ["c.bin"] or open(dest, "rb").read() != b"the earlier good copy":
+            fails.append(f"S23 a download cut mid-stream raises, keeps the earlier copy and leaves no partial file: "
+                         f"{got} {left}")
+        try:        # S27 (Codex 1E-i round 3): a destination name safe_io would split is refused, never misplaced
+            download("outputs/s/big.bin", os.path.join(d, "out", "R1\\summary.json"), service=svc)
+            fails.append("S27 a destination name holding a backslash is refused")
+        except ValueError:
+            pass
+        # S24: the end-of-run store (agents/run_finish.py) through the same streaming client: the archive is written
+        # to disk and streamed up; the in-memory archive_dir is never called; the staging file is removed.
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from agents import run_finish
+        import results_store as rs
+        run = os.path.join(d, "runs", "2026-01-01_000000_q")
+        os.makedirs(os.path.join(run, "models"))
+        with open(os.path.join(run, "report.md"), "w") as f:
+            f.write("report\n")
+        with open(os.path.join(run, "models", "big.bin"), "wb") as f:
+            f.write(block)
+        boom = mock.Mock(side_effect=AssertionError("archive_dir: the run archive would be built in memory"))
+        for svc, want in ((_Svc(), True), (_Svc(fail=lambda what, n: what == "up"), False)):
+            with mock.patch.object(rs, "archive_dir", boom), mock.patch.dict(os.environ, {"MA_STORAGE_PREFIX": "t"}):
+                blob = run_finish.store_run_results(run, service=svc)
+            meta = json.load(open(os.path.join(run, "metadata.json")))
+            left = sorted(os.listdir(os.path.dirname(run)))
+            good = (blob == "outputs/t/2026-01-01_000000_q.tar.gz" and meta.get("stored") == blob
+                    and ("outputs", "t/2026-01-01_000000_q.tar.gz") in svc.st) if want else \
+                (blob is None and "5 attempts" in str(meta.get("store_error")))
+            if not good or left != ["2026-01-01_000000_q"]:
+                fails.append(f"S24 store_run_results streams the run archive (stored={want}) and removes its "
+                             f"staging file: {blob} {meta} {left}")
+        # S26 (Codex 1E-i round 2): a regular file that cannot be read is never silently absent from a store that
+        # is then recorded as complete: the store fails and says so. Links and _truth/ stay intentional exclusions.
+        locked = os.path.join(run, "models", "locked.bin")
+        with open(locked, "wb") as f:
+            f.write(b"data")
+        os.symlink(locked, os.path.join(run, "models", "a_link"))
+        os.chmod(locked, 0)
+        try:
+            readable = os.access(locked, os.R_OK)      # root reads anything: the case cannot be made there
+            with mock.patch.dict(os.environ, {"MA_STORAGE_PREFIX": "t"}):
+                blob = run_finish.store_run_results(run, service=_Svc())
+            err = str(json.load(open(os.path.join(run, "metadata.json"))).get("store_error"))
+        finally:
+            os.chmod(locked, 0o644)
+        if not readable and (blob is not None or "models/locked.bin" not in err):
+            fails.append(f"S26 an unreadable file fails the end-of-run store, named in store_error: {blob} {err}")
+        os.remove(locked)
+        with mock.patch.dict(os.environ, {"MA_STORAGE_PREFIX": "t"}):
+            blob = run_finish.store_run_results(run, service=_Svc())
+        if blob is None:
+            fails.append("S26b a link in the run dir (left out on purpose) does not fail the store")
 
 
 def main() -> int:
@@ -538,7 +787,7 @@ def main() -> int:
     if args.self_test:
         return _self_test()
     if args.cmd == "upload" and args.a and args.blob:
-        print(upload(args.a, args.blob, args.account))
+        print(upload_retry(args.a, args.blob, args.account))
         return 0
     if args.cmd == "download" and args.a and args.b:
         print(download(args.a, args.b, args.account))
