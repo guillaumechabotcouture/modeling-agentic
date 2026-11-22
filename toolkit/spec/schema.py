@@ -2044,6 +2044,81 @@ def _self_test() -> int:
         ok(scale_problems({"attribute": "a", "scale": "log"}, cneg) and not scale_problems({"attribute": "a"}, cneg)
            and not scale_problems({"attribute": "a", "scale": "log"}, cpos),
            "SP4u only a declared log scale on a card range going below 0 is refused")
+        # Codex r2 of #334: one resolution that fails closed, reached by every path that consumes the scale
+        import types as _ty
+        from types import MappingProxyType as _MP
+
+        class _Flaky:          # a card read that fails once, then answers [0, 0.1] (a log range)
+            n = 0
+
+            def describe(self):
+                _Flaky.n += 1
+                if _Flaky.n == 1:
+                    raise OSError("planted: card unreadable")
+                return _ty.SimpleNamespace(valid_ranges={"seed": [0, 0.1]})
+        rf = copy.deepcopy(s.raw)
+        rf["calibration"].pop("scale", None)
+        rf["calibration"]["attribute"] = "seed"
+        sf = Spec(rf, d)
+        sf._engine = _Flaky()
+        try:
+            got1 = sf.calibration_scale()
+        except SpecError as e:
+            got1 = f"refused: {e}"
+        ok(str(got1).startswith("refused") and "card" in str(got1),
+           f"SP4y (r2 P1-1) a failed card read refuses the scale instead of falling back to linear ({got1})")
+        rb = copy.deepcopy(rf)
+        rb["engine"] = {"ref": "toolkit.engines.contract:NoSuchEngine"}
+        try:
+            got2 = resolved_scale(rb)
+        except SpecError as e:
+            got2 = f"refused: {e}"
+        ok(str(got2).startswith("refused"),
+           f"SP4y2 (r2 P1-1) a raw mapping whose engine card cannot be read refuses too ({got2})")
+        r_pl = copy.deepcopy(s.raw)
+        r_pl["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}
+        r_pl["calibration"]["scale"] = "log"
+        e_log = validate(Spec(r_pl, d), pending_ok=True)
+        r_pl["calibration"]["scale"] = None
+        e_nul = validate(Spec(r_pl, d), pending_ok=True)
+        ok(any("below 0" in e for e in e_log) and any("calibration.scale" in e for e in e_nul),
+           f"SP4z (r2 P1-3) sign-off with the engine pending checks the scale against every candidate's card "
+           f"({e_log[-2:]}, {e_nul[-2:]})")
+        r_pu = copy.deepcopy(s.raw)
+        r_pu["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine",
+                                                       "toolkit.engines.compartmental.engine:CompartmentalEngine"]}
+        r_pu["calibration"].pop("scale", None)
+        r_pu["calibration"]["attribute"] = "seed"
+        e_und = validate(Spec(r_pu, d), pending_ok=True)
+        ok(any("calibration.scale" in e for e in e_und),
+           f"SP4z2 (r2 P1-3) an undeclared scale is refused at sign-off when the candidates' cards cannot settle it "
+           f"({e_und[-2:]})")
+
+        def _none(r, sc):
+            r["calibration"]["method"] = "none"
+            r["calibration"]["scale"] = sc
+            r["uncertainty"]["sources"] = [x for x in r["uncertainty"]["sources"] if x.get("kind") != "calibration"]
+            r["uncertainty"]["excluded"] = r["uncertainty"]["excluded"] + [{"kind": "calibration", "reason": "toy"}]
+        bad(lambda r: _none(r, "log"), "below 0",
+            "SP4aa (r2 P1-4) method none still has its scale checked (the emulator design consumes the attribute)")
+        bad(lambda r: _none(r, None), "calibration.scale",
+            "SP4aa2 (r2 P1-4) method none refuses an explicit null scale too")
+        r_ch = copy.deepcopy(s.raw)
+        r_ch["calibration"].pop("scale", None)
+        s_ch = Spec(r_ch, d)
+        first = s_ch.calibration_scale()
+        r_ch["engine"] = {"ref": "toolkit.engines.renewal.engine:RenewalEngine",
+                          "config": {"generation_interval": [1.0]}}
+        r_ch["calibration"]["attribute"] = "seed"
+        got_s, got_r = s_ch.calibration_scale(), resolved_scale(copy.deepcopy(r_ch))
+        ok(first == "linear" and got_s == got_r == "log" and type(s_ch.engine()).__name__ == "RenewalEngine",
+           f"SP4ab (r2 P1-5) a Spec whose engine changed reads the new engine's card ({first}, {got_s}, {got_r}, "
+           f"{type(s_ch.engine()).__name__})")
+        mp = _MP({"calibration": {"attribute": "seed", "scale": "log"}})
+        ok(resolved_scale(mp) == "log", "SP4ac (r2 P1-6) a read-only mapping keeps its declared scale")
+        cinf = _ty.SimpleNamespace(valid_ranges={"x": [-math.inf, 0]})
+        ok(scale_problems({"attribute": "x", "scale": "log"}, cinf) != [] and card_scale(cinf, "x") == "linear",
+           "SP4ad (r2 P1-7) a card range from -inf is a range going below 0: a log scale is refused")
         bad(lambda r: r["comparator"].update(package="x"), "comparator", "SP5 an unknown comparator is refused")
         bad(lambda r: r["options"]["cost_items"].pop(), "no cost item",
             "SP6 a packaged component without a cost item is refused (toolkit/alloc)")

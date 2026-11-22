@@ -1083,7 +1083,9 @@ def _self_test() -> int:
             m.fit()
             try:
                 fit = fit_likelihood(spec, m, identifiability=False)
-                good, why = fit["cov"] is not None and not fit["diagnostics"]["at_bound"], fit["diagnostics"]["at_bound"]
+                dg = fit["diagnostics"]
+                good = fit["cov"] is not None and not dg["at_bound"] and dg.get("converged") is True
+                why = {"at_bound": dg["at_bound"], "converged": dg.get("converged")}
             except CalibrationRefused as e:
                 good, why = False, str(e)[:200]
             ok(spec.calibration_scale() == "linear" and calibrated_value(spec, -1.0) == -1.0 and good,

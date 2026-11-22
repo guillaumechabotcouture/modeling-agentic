@@ -1780,6 +1780,27 @@ def _self_test() -> int:
                "JA1 a shared parameter without a sourced prior is refused")
     safe(ja1, "JA1")
 
+    def ja_sc():
+        # Codex r2 of #334 P1-2: the standalone joint calibration goes through the spec's one scale check
+        import yaml
+        for sc, needle in (("log", "below 0"), (None, "calibration.scale")):
+            with tempfile.TemporaryDirectory() as d:
+                p = _toy_joint(d)
+                raw = yaml.safe_load(open(p))
+                raw["calibration"]["scale"] = sc
+                yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+                sp = schema.load(p)
+                bad = spec_problems(sp)
+                try:
+                    _, _meta = build(sp)
+                    built = "built"
+                except Exception as e:  # noqa: BLE001 -- the refusal expected
+                    built = f"refused: {e}"
+                ok(any(needle in b for b in bad) and built.startswith("refused"),
+                   f"JA-SC (r2 P1-2) scale {sc!r} on the toy's [-2, 2] attribute is refused by spec_problems and build "
+                   f"({bad[-1:]}, {built[:160]})")
+    safe(ja_sc, "JA-SC")
+
     def ja2():
         with tempfile.TemporaryDirectory() as d:
             from toolkit.spec import toy_engines as TE

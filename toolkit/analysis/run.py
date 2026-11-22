@@ -976,6 +976,8 @@ def _self_test_stop_records(ok, d, q):
              ("calibration", lambda: CalibrationInputError(["planted"])),
              ("burden_anchor", lambda: AnchorError("planted")),
              ("optimizer", lambda: OptimizerError("planted")),
+             ("calibration", lambda: setattr(e_ab := C.CalibrationRefused("calibration_ridge", "planted"), "at_bound",
+                                             ["x"]) or e_ab),
              ("batch", lambda: Bt.BatchRefused("batch_stale", "planted"))]
     orig = EmulatorModel.predict
     bp = os.path.join(d, "analysis", "blocked.yaml")
@@ -1028,6 +1030,10 @@ def _self_test_stop_records(ok, d, q):
            and blk.get("where") == where and "planted" in str(blk.get("reason")),
            f"RUN_BLOCKED_CAL {name} is raised again after analysis/blocked.yaml and a blocked manifest record it "
            f"({kinds}, {({k: blk.get(k) for k in ('where', 'exception', 'reason')})})")
+        # Codex r2 of #334 P1-8: at_bound only when the exception carries the diagnostic (absent is not "none at a bound")
+        ok(("at_bound" in blk) == hasattr(exc, "at_bound") and blk.get("at_bound") == getattr(exc, "at_bound", None),
+           f"RUN_BLOCKED_AB {name}: at_bound is recorded only when the exception assessed it "
+           f"({blk.get('at_bound', '<absent>')}, {getattr(exc, 'at_bound', '<none>')})")
     run(d, log=q, compute_kw={"max_workers": 2}, draws=2)
     ok(contract.gate_findings(d) == [], "RUN_BLOCKED_RERUN a rerun after a recorded stop publishes a complete manifest")
 
