@@ -113,9 +113,7 @@ def calibrated_value(spec, z: float) -> float:
     the spec's one resolution (toolkit/spec/schema.py calibration_scale: declared, else from the engine card, else
     linear)."""
     from toolkit.spec import schema as _schema
-    sc = spec.calibration_scale() if hasattr(spec, "calibration_scale") else _schema.calibration_scale(
-        spec["calibration"])
-    return float(math.exp(z)) if sc == "log" else float(z)
+    return float(math.exp(z)) if _schema.resolved_scale(spec) == "log" else float(z)
 
 
 def windows(spec) -> dict:

@@ -196,7 +196,7 @@ def ridge_refusal(fa: dict, at_bound=None, n_params: int | None = None) -> str |
         why += f"; {len(ab)}" + (f" of {n_params}" if n_params else "") + f" parameter(s) sit at a bound: {shown}"
         if n_params and len(ab) > n_params / 2:
             why += (" (most parameters sit at a bound: check the calibrated attribute's scale or range, e.g. a log "
-                    "scale for an attribute that takes values <= 0, before reparameterising)")
+                    "scale for an attribute that takes negative values, before reparameterising)")
     return why
 
 
@@ -230,9 +230,9 @@ def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiabi
         cov = np.linalg.inv(np.asarray(H))
         cov = (cov + cov.T) / 2
         if np.linalg.eigvalsh(cov).min() <= 0:
-            raise CalibrationRefused("calibration_ridge", "the covariance is not positive definite")
+            raise CalibrationRefused("calibration_ridge", "the covariance is not positive definite", at_bound=at_bound)
     except np.linalg.LinAlgError:
-        raise CalibrationRefused("calibration_ridge", "the Hessian is singular") from None
+        raise CalibrationRefused("calibration_ridge", "the Hessian is singular", at_bound=at_bound) from None
     ident = {}
     if identifiability:
         for p in L.params:
