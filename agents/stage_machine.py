@@ -64,7 +64,8 @@ EDGES = {
     # the analysis. Fail soft: neither state can end the run or change what the analysis computes.
     "PREREGISTER": {"CONFIGURE", "FINAL"},
     "CONFIGURE": {"ANALYZE", "FINAL"},
-    "ANALYZE": {"SCORE", "CRITIQUE", "FINAL"},
+    # A refused calibration goes back to SPEC (its revision), at most MAX_CALIBRATION_REFUSALS times
+    "ANALYZE": {"SCORE", "CRITIQUE", "SPEC", "FINAL"},
     "SCORE": {"CRITIQUE", "FINAL"},
     "CRITIQUE": {"GATE", "WRITE", "FINAL"},
     "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "FINAL"},
@@ -97,6 +98,8 @@ DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
 MAX_SIGN_REPAIRS = 2          # a refused lead sign-off goes back to EVIDENCE or SPEC at most this often, then waits
+MAX_CALIBRATION_REFUSALS = 2  # a refused calibration goes back to SPEC at most this often, then the run ends run_failed
+CALIBRATION_REFUSED = "calibration_refused"      # its findings-ledger kind and id
 
 
 @dataclass
@@ -1928,6 +1931,19 @@ class Machine:
         if not rep.get("ok"):
             cause = analysis_failure_cause(rep, self.run_dir)
             why = f"analysis failed: {_rep_error(rep)}" + ("; resumable with --resume" if cause else "")
+            ref = None if cause else calibration_refusal(rep, self.run_dir)
+            if ref is not None and not conflicts_policy_stop(self.run_dir):
+                # eval baseline: a refused calibration (a ridge, a fit pinned at its bounds) is a finding about the
+                # spec's calibration, not the end of the run: it goes to the spec revision with the refusal reason and
+                # the parameters at a bound, at most MAX_CALIBRATION_REFUSALS times (an unsigned spec is redrafted
+                # with it; a signed one is the owner's to amend: h_SPEC). conflicts.policy: stop keeps the old stop.
+                n = int(self.st.tries.get(CALIBRATION_REFUSED, 0) or 0)
+                if n < MAX_CALIBRATION_REFUSALS:
+                    self.st.tries[CALIBRATION_REFUSED] = n + 1
+                    record_calibration_refusal(self.run_dir, ref, self.st.round)
+                    return self._rethink("SPEC", f"calibration refused ({ref['code']}; try {n + 1} of "
+                                                 f"{MAX_CALIBRATION_REFUSALS}): {ref['reason']}"[:300])
+                why += f"; the calibration was refused {n} time(s) before (cap {MAX_CALIBRATION_REFUSALS})"
             return self._go("FINAL", why, "run_failed", extra={"resumable": cause} if cause else None)
         return self._go("SCORE" if self.st.world_model_stages else "CRITIQUE", "analysis built")
 
@@ -2318,6 +2334,73 @@ _RESUME_WHY = {"timeout": "the analysis step had timed out", "killed": "the anal
 
 # A step killed by these signals was stopped from outside (out of memory, a stop); a crash (SIGSEGV...) is not.
 _KILL_SIGNALS = (9, 15, 2, 1)     # SIGKILL, SIGTERM, SIGINT, SIGHUP
+
+
+def calibration_refusal(rep: dict, run_dir: str) -> dict | None:
+    """{code, reason, at_bound} when the pipeline's failure is a refused calibration
+    (toolkit/analysis/calibration.py CalibrationRefused), else None. A failed step's output names the exception; the
+    analysis's own record (analysis/blocked.yaml, listed in this run's blocked manifest) adds its reason and the
+    parameters at a bound when it is there. Anything else (another error, a stopped or skipped step) is not one."""
+    import re
+    if not isinstance(rep, dict) or rep.get("errors"):
+        return None
+    failed = [s for s in rep.get("steps") or [] if isinstance(s, dict) and s.get("status") == "failed"]
+    hit = next((s for s in failed if "CalibrationRefused" in str(s.get("error") or "")), None)
+    if hit is None:
+        return None
+    err = str(hit.get("error") or "")
+    m = re.search(r"CalibrationRefused:\s*([a-z_]+):\s*(.*)", err)
+    out = {"code": m.group(1) if m else "calibration_refused", "reason": " ".join((m.group(2) if m else err).split()),
+           "at_bound": []}
+    try:
+        from toolkit.analysis import artifacts as AR
+        man = json.load(open(os.path.join(run_dir, AR.MANIFEST)))
+        rel = os.path.join("analysis", "blocked.yaml")
+        ent = (man.get("artifacts") or {}).get(rel) or {}
+        if man.get("status") == "blocked" and ent.get("sha256") == _sha256(os.path.join(run_dir, rel)):
+            data = (AR.read(run_dir, rel) or {}).get("data") or {}
+            if data.get("where") == "calibration" and data.get("exception") == "CalibrationRefused":
+                out["code"] = str(data.get("code") or out["code"])
+                out["reason"] = " ".join(str(data.get("reason") or out["reason"]).split())
+                out["at_bound"] = [str(x) for x in data.get("at_bound") or []]
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass                       # the step's own output still says what was refused
+    if out["reason"].startswith(f"{out['code']}:"):       # the exception's text repeats its code
+        out["reason"] = out["reason"][len(out["code"]) + 1:].strip()
+    return out
+
+
+def conflicts_policy_stop(run_dir: str) -> bool:
+    """The spec's conflicts.policy is stop (toolkit/analysis/conflicts.py; its default when undeclared): a refused
+    calibration then ends the run as before. An unreadable spec is read as stop (fail closed: the old behaviour)."""
+    import yaml
+    from toolkit.analysis import conflicts as CF
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, AB.SPEC_FILE))) or {}
+        return CF.policy(raw)["policy"] == "stop"
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def record_calibration_refusal(run_dir: str, ref: dict, round_n) -> None:
+    """The refusal as an open HIGH finding the spec owns (findings ledger), so the spec revision reads it: the
+    redraft's feedback (Machine._rethink) or the owner's amendment request (rethink_request). It names the parameters
+    at a bound and the remedy."""
+    ab = list(ref.get("at_bound") or [])
+    claim = (f"the calibration was refused ({ref.get('code')}): {ref.get('reason')}"
+             + (f". Parameters at a bound: {', '.join(ab[:20])}" + (f" and {len(ab) - 20} more" if len(ab) > 20 else "")
+                if ab else ""))
+    led = FL.load(run_dir)
+    f = led.get(CALIBRATION_REFUSED) or FL.Finding(id=CALIBRATION_REFUSED, kind=CALIBRATION_REFUSED, severity="HIGH",
+                                                    source="harness-calibration", first_seen_round=round_n)
+    f.severity, f.owner_state, f.target_stage, f.status, f.blocking = "HIGH", "SPEC", "PLAN", "open", True
+    f.scope_declarable, f.last_seen_round, f.claim = False, round_n, claim[:2000]
+    f.fix_requires = ("revise the spec's calibration: check calibration.scale and calibration.range against the "
+                      "attribute's values (a log scale cannot reach negative values), then the parameterisation (a "
+                      "reference package) or declared priors with method posterior")
+    FL._event(f, round_n, "open", "harness-calibration", "calibration refused at ANALYZE")
+    led[CALIBRATION_REFUSED] = f
+    FL.save(run_dir, led)
 
 
 def analysis_failure_cause(rep: dict, run_dir: str | None = None) -> str | None:
@@ -4785,6 +4868,7 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
        and "resumable" not in st.history[-1]
        and resumable_failure(d, st) is None,
        f"T60 an analysis step that fails on its own stays run_failed on resume ({s1}, {s2}, {st.history[-1]})")
+    _self_test_calibration_refused(ok, td, toy_run, Batch, quiet)
     rep = {"ok": False, "errors": [], "steps": [{"id": "analyze", "status": "failed", "returncode": 1, "error": ""}]}
     causes = [analysis_failure_cause(dict(rep, steps=[dict(rep["steps"][0], returncode=rc, error=e)]))
               for rc, e in ((-9, ""), (-15, ""), (-11, ""), (1, "boom"), (None, "OSError: no such file"))]
@@ -4906,6 +4990,71 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
        f"T62 a restored run dir whose joint-calibration bench batch lost one task to infra is resumable 'infra' "
        f"(summaries matched by pipeline run id, not mtimes; an earlier run's model failure is ignored; a model "
        f"failure in this run is not resumable), so --resume reopens it at ANALYZE: {got2}")
+
+
+_TOY_REFUSAL = """import json, hashlib, os, sys
+rd = sys.argv[1]
+os.makedirs(os.path.join(rd, "analysis"), exist_ok=True)
+blocked = ("schema: analysis.blocked/1\\ndata:\\n  reason: 'calibration_ridge: the likelihood has 1 flat direction(s); 3 of "
+           "4 parameter(s) sit at a bound: z:u0, z:u1, z:u2'\\n  where: calibration\\n  exception: CalibrationRefused\\n"
+           "  code: calibration_ridge\\n  at_bound: [z:u0, z:u1, z:u2]\\n")
+p = os.path.join(rd, "analysis", "blocked.yaml")
+open(p, "w").write(blocked)
+sha = hashlib.sha256(open(p, "rb").read()).hexdigest()
+json.dump({"status": "blocked", "artifacts": {"analysis/blocked.yaml": {"kind": "blocked", "sha256": sha}}},
+          open(os.path.join(rd, "analysis", "manifest.json"), "w"))
+sys.stderr.write("toolkit.analysis.calibration.CalibrationRefused: calibration_ridge: the likelihood has 1 flat "
+                 "direction(s)\\n")
+sys.exit(1)
+"""
+
+
+def _self_test_calibration_refused(ok, td: str, toy_run, Batch, quiet) -> None:
+    """CRF1-4 (eval baseline: a refused calibration ended the run at ANALYZE): it goes to the spec revision with the
+    refusal and the parameters at a bound as a finding, at most MAX_CALIBRATION_REFUSALS times, then ends run_failed
+    as before; conflicts.policy: stop keeps the old stop; another failure is not one."""
+    drv = os.path.join(td, "toy_refusal.py")
+    open(drv, "w").write(_TOY_REFUSAL)
+
+    class Refuse(Batch):
+        """The toy batch step replaced by one that refuses the calibration as the analysis does."""
+        def pipeline_steps(self, spec_path, run_dir):
+            steps = super().pipeline_steps(spec_path, run_dir)
+            steps[0] = dict(steps[0], run=f"{sys.executable} {drv} {run_dir}")
+            return steps
+    refuse = Refuse(60)
+    d, T = toy_run("calibration_refused")
+    s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=refuse, cross_engine_check=False)
+    st = load_state(d)
+    back = [h for h in st.history if h.get("from") == "ANALYZE"]
+    led = FL.load(d)
+    f = led.get(CALIBRATION_REFUSED)
+    ok(s1 == "run_failed" and [h.get("to") for h in back] == ["SPEC"] * MAX_CALIBRATION_REFUSALS + ["FINAL"]
+       and all("calibration refused (calibration_ridge" in h.get("why", "") for h in back[:-1])
+       and "cap 2" in back[-1].get("why", "") and st.tries.get(CALIBRATION_REFUSED) == MAX_CALIBRATION_REFUSALS,
+       f"CRF1 a refused calibration goes back to SPEC {MAX_CALIBRATION_REFUSALS} times, then ends run_failed "
+       f"({s1}, {[(h.get('to'), h.get('why', '')[:60]) for h in back]})")
+    ok(f is not None and f.owner_state == "SPEC" and f.severity == "HIGH" and not f.scope_declarable
+       and "z:u0, z:u1, z:u2" in f.claim and "calibration.scale" in (f.fix_requires or "")
+       and "calibration_ridge): calibration_ridge" not in f.claim,
+       f"CRF2 the finding names the refusal, the parameters at a bound and the remedy ({f and f.claim[:160]})")
+    req = rethink_request(d, st.round + 99)
+    ok(any(x.get("id") == CALIBRATION_REFUSED for x in req.get("findings") or []),
+       "CRF3 a signed spec's amendment request carries the refusal (the spec owns it)")
+    # CRF4: conflicts.policy stop keeps today's behaviour: the first refusal ends the run
+    d2, T2 = toy_run("calibration_refused_stop")
+    g = globals()
+    orig = g["conflicts_policy_stop"]
+    g["conflicts_policy_stop"] = lambda run_dir: True
+    try:
+        s2 = run_v2("toy question", d2, T2, signoff="none", log=quiet, backend=refuse, cross_engine_check=False)
+    finally:
+        g["conflicts_policy_stop"] = orig
+    back2 = [h.get("to") for h in load_state(d2).history if h.get("from") == "ANALYZE"]
+    rep_other = {"ok": False, "errors": [], "steps": [{"id": "analyze", "status": "failed", "returncode": 1,
+                                                       "error": "ValueError: boom"}]}
+    ok(s2 == "run_failed" and back2 == ["FINAL"] and calibration_refusal(rep_other, d2) is None,
+       f"CRF4 under conflicts.policy stop the first refusal ends the run; another failure is no refusal ({back2})")
 
 
 def _self_test_geometry(ok, td: str) -> None:

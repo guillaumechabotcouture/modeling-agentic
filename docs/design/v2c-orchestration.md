@@ -49,7 +49,7 @@ so `--resume` continues from the last completed state.
 | EVIDENCE | stub: lists the engine parameters as `unverified` in `evidence/registry.yaml` | → ENGINE_CHOICE |
 | ENGINE_CHOICE | harness filters EngineCards against the spec; task `pick_engine` chooses and says why; optional cross-engine check when several are eligible | one chosen → CONFIGURE; none eligible → FINAL `run_failed` (the fallback, an agent-written engine, is outside this workstream) |
 | CONFIGURE | harness writes `models/pipeline.yaml` (configure + analyze steps) and runs `configure` through `scripts/pipeline.py` (S1) | ok → ANALYZE; failed → FINAL `run_failed` |
-| ANALYZE | S1 runner: the stale steps only | ok → CRITIQUE; failed → FINAL `run_failed` |
+| ANALYZE | S1 runner: the stale steps only | ok → CRITIQUE; a refused calibration → SPEC (its revision, with the refusal as a finding; at most `MAX_CALIBRATION_REFUSALS` times, not under `conflicts.policy: stop`); otherwise failed → FINAL `run_failed` |
 | CRITIQUE | tasks: domain and red-team critics write `critique_*.yaml` for the round (presentation is its own state) | → GATE |
 | GATE | today's gate (§2.1), pre-write or post-write | by action, table below |
 | FIX_LOOP | §5 | → CRITIQUE (round + 1); → OWNER_DECISION when a finding's remedy is an owner amendment; → WRITE when only write-up findings remain and a draft exists (F6 run 3) |
