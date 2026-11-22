@@ -183,7 +183,8 @@ def chosen_range_test_runs(spec: dict, test_id: str, effect: str, drawn: dict | 
                            "or excluded by uncertainty.excluded)"), []
         return True, "", list(drawn[name])
     an = spec.get("analysis") if isinstance(spec, dict) and isinstance(spec.get("analysis"), dict) else {}
-    tests = {str(t.get("id")): t for t in (an.get("decision_tests") or []) if isinstance(t, dict)}
+    from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
+    tests = {str(t.get("id")): t for t in PT.tests(an)}
     t = tests.get(str(test_id))
     if t is None:
         return False, "is not an analysis.decision_tests id", []
@@ -236,8 +237,9 @@ def decision_test_runs(spec, test_id, effect: dict) -> tuple[bool, str]:
     benchmark's component pair given the other. `effect`: {parameters, components, benchmark, estimand, pair,
     range_fraction}."""
     raw = spec.raw
-    t = next((x for x in (raw.get("analysis") or {}).get("decision_tests") or []
-              if isinstance(x, dict) and str(x.get("id")) == str(test_id)), None)
+    from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
+    t = next((x for x in PT.tests(raw.get("analysis")) if str(x.get("id")) == str(test_id)), None)
+
     if t is None:
         return False, "is not an analysis.decision_tests id"
     comps = set(effect.get("components") or [])

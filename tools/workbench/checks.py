@@ -270,6 +270,19 @@ def estimates_tests(run, spec=None):
 DEPARTURE_TESTS = ("parameter_value", "interaction_rescale")
 
 
+def spec_tests(doc) -> list:
+    """The signed spec's analysis.decision_tests in their per-target form (W0-B: a `perturb` test read as the older
+    type it executes as, toolkit/spec/perturb.py tests; that module imports nothing else from the repo); [] for a spec
+    without the list."""
+    import os
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if root not in sys.path:
+        sys.path.append(root)
+    from toolkit.spec import perturb
+    return perturb.tests(doc.get("analysis") if isinstance(doc, dict) else None)
+
+
 def departure_refused(spec, kind, subject, test):
     """Why the signed spec `spec` (verified_spec's shape: verified, why, signed_by, doc) does not grant its own engine
     departure for the `kind` (benchmark or component) `subject` with the decision test `test`: (word, sentence), or
@@ -284,14 +297,14 @@ def departure_refused(spec, kind, subject, test):
                              "under the owner's signature, so it grants nothing")
     if not test:
         return "no_test", "it names no decision test"
-    held = spec["doc"].get("analysis")
-    held = held.get("decision_tests") if isinstance(held, dict) else None
-    dt = next((t for t in held if isinstance(t, dict) and str(t.get("id")) == str(test)), None) if isinstance(held, list) else None
+    dt = next((t for t in spec_tests(spec["doc"]) if str(t.get("id")) == str(test)), None)
     if dt is None:
         return "bad_test", f"the verified signed spec declares no decision test {test} (analysis.decision_tests)"
     if dt.get("type") not in DEPARTURE_TESTS:
         return "bad_test", (f"its test {test} is a {dt.get('type')} test, and a departure is carried only by a test that varies the "
                             f"effect ({' or '.join(DEPARTURE_TESTS)})")
+    if dt.get("with"):      # #294: a test holding companion parameters is conditional and carries no departure
+        return "bad_test", f"its test {test} holds companion parameters, so it cannot carry a departure"
     if dt["type"] == "interaction_rescale" and (kind != "benchmark" or str(dt.get("benchmark")) != str(subject)):
         return "bad_test", (f"its test {test} rescales the interaction of benchmark {dt.get('benchmark')}, which is not the departed "
                             f"{kind} {subject}")
