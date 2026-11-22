@@ -698,6 +698,8 @@ def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
 
 # ---- provenance of inputs
 _INPUT_EXT = (".csv", ".tsv", ".json", ".yaml", ".yml", ".txt", ".xlsx", ".parquet")
+_TRAILING_PUNCT = ".,;:!?)]}>\"'`"
+_LEADING_PUNCT = "([{<\"'`"
 PROVENANCE = "data/inputs_provenance.json"
 
 
@@ -720,12 +722,36 @@ def answer_key_path(rel: str) -> bool:
     return bool(parts) and (parts[0] == "evals" or "_truth" in parts)
 
 
+def _path_candidate(tok: str) -> str | None:
+    """A question token as a data file name, or None. A token that ends in a data extension is kept as written (a
+    quoted "[draft] x.csv" keeps its bracket); otherwise its sentence punctuation comes off first ("... yields.csv."
+    ends a sentence), unless a repository file has the exact name (never substituted by another). Only a leading
+    "./" is dropped: "../x.csv" and "/x.csv" stay as written, so stage_inputs refuses them as outside the
+    repository."""
+    t = tok.strip()
+    if not t.lower().endswith(_INPUT_EXT):
+        if os.path.isfile(os.path.join(REPO, t)):
+            return None
+        t = t.rstrip(_TRAILING_PUNCT).lstrip(_LEADING_PUNCT).strip()
+    while t.startswith("./"):
+        t = t[2:]
+    return t if t.lower().endswith(_INPUT_EXT) else None
+
+
 def _question_paths(question: str) -> list[str]:
-    """File names in the question: bare tokens, and quoted or backticked ones (which may hold spaces)."""
+    """File names in the question, each once: quoted or backticked ones (which may hold spaces), and bare tokens. The
+    text of a quoted name is not scanned again for bare tokens (a quoted evals/x y.csv never stages a repo-root
+    y.csv); a quoted span that names no file (between two apostrophes) still is."""
     import re
     q = question or ""
-    toks = re.findall(r"[`\"']([^`\"'\n]+)[`\"']", q) + re.findall(r"[A-Za-z0-9_./-]+", q)
-    return [t.strip().strip("./") for t in toks if t.strip().lower().endswith(_INPUT_EXT)]
+    out, bare = [], list(q)
+    for m in re.finditer(r"[`\"']([^`\"'\n]+)[`\"']", q):
+        c = _path_candidate(m.group(1))
+        if c is not None:
+            out.append(c)
+            bare[m.start():m.end()] = " " * (m.end() - m.start())
+    out += [c for c in map(_path_candidate, re.findall(r"[A-Za-z0-9_./-]+", "".join(bare))) if c is not None]
+    return list(dict.fromkeys(out))
 
 
 def _safe_dest(run_dir: str, rel: str) -> str:
@@ -3815,6 +3841,33 @@ def _self_test() -> int:
         prov = json.load(open(os.path.join(fp, "data", "inputs_provenance.json")))
         ok(any("../outside/targets.csv" in x and "outside the run" in x for x in probs) and "data/inputs/requirements.txt" in prov["cited"],
            f"T41b cited inputs are recorded with their sha256; one outside the run is refused ({probs})")
+
+        # T41c: a path at the end of a sentence or clause keeps its input (trailing punctuation is
+        # stripped before the extension test, for bare, quoted and parenthesised paths).
+        qp = _question_paths('Use data/a/one.csv. Also data/b/two.csv, data/c/three.json; '
+                             '(data/d/four.yaml) "data/e/five.tsv." \'data/f/six.txt,\' `data/g/seven.csv;` '
+                             'and "./data/h/eight.csv").')
+        ok(sorted(qp) == ["data/a/one.csv", "data/b/two.csv", "data/c/three.json", "data/d/four.yaml",
+                          "data/e/five.tsv", "data/f/six.txt", "data/g/seven.csv", "data/h/eight.csv"],
+           f"T41c paths ending in . , ; ) or quotes are kept once each, punctuation stripped ({qp})")
+        # T41d (Codex r1 of #332): a quoted name that ends in its extension is kept as written; "../" and "/" are kept
+        # (stage_inputs refuses them as outside the repository); a quoted name is not re-scanned for a bare suffix;
+        # an apostrophe span naming no file still is
+        q2 = _question_paths('Use "[draft] t.csv" and ../requirements.txt. and /requirements.txt; also '
+                             '"evals/private requirements.txt." and the program\'s file data/k/nine.csv in the '
+                             'district\'s table.')
+        ok(q2 == ["[draft] t.csv", "evals/private requirements.txt", "../requirements.txt", "/requirements.txt",
+                  "data/k/nine.csv"],
+           f"T41d brackets in a quoted name kept; ../ and / kept; no bare suffix from a quoted name; apostrophes "
+           f"do not hide a path ({q2})")
+        fpq = os.path.join(td, "prov_outside")
+        os.makedirs(fpq)
+        staged = stage_inputs(fpq, 'Inputs: ../requirements.txt. and "evals/private requirements.txt."')
+        ok(staged == [], f"T41d a path outside the repo or into the evaluation tree stages nothing ({staged})")
+        fpp = os.path.join(td, "prov_punct")
+        os.makedirs(fpp)
+        staged = stage_inputs(fpp, "The pins are in requirements.txt.")
+        ok(staged == ["data/inputs/requirements.txt"], f"T41c a file named at the end of a sentence is staged ({staged})")
 
         # T42: through the machine. A MEDIUM with a runnable test goes to the fix loop (rule 4m) and
         # is fixed before ACCEPT; one that cannot be fixed, with no rounds left, is declared (3m) and
