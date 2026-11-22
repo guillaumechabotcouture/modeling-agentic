@@ -665,6 +665,49 @@ def _decision_tests(run_dir, man) -> list[dict]:
     return out
 
 
+DECISION_TEST_KIND = "decision_test_changes_plan"    # agents/stage_machine.py DECISION_BEARING_KINDS
+DECISION_TESTS_ARTIFACT = "analysis/decision_tests.yaml"
+
+
+def verified_decision_tests(run_dir: str) -> list:
+    """The rows of analysis/decision_tests.yaml when a completed manifest lists it with a matching hash; else []."""
+    rel = DECISION_TESTS_ARTIFACT
+    try:
+        man = json.load(open(os.path.join(run_dir, MANIFEST)))
+        ent = (man.get("artifacts") or {}).get(rel) if man.get("status") == "complete" else None
+        p = os.path.join(run_dir, rel)
+        if not ent or os.path.islink(p) or sha256(p) != ent.get("sha256"):
+            return []
+        tests = ((yaml.safe_load(open(p)) or {}).get("data") or {}).get("tests") or []
+    except (OSError, ValueError, AttributeError, TypeError, yaml.YAMLError):
+        return []
+    return tests if isinstance(tests, list) else []
+
+
+def decision_test_record(run_dir: str, test_id) -> dict | None:
+    """One verified row by its test id (the owner item's evidence: agents/stage_machine.py _bearing_item)."""
+    return next((t for t in verified_decision_tests(run_dir)
+                 if isinstance(t, dict) and str(t.get("test_id")) == str(test_id)), None)
+
+
+def decision_test_findings(run_dir: str) -> list[dict]:
+    """lead-gaps α: one decision-bearing finding per decision test whose verdict changes the plan (CHANGES_PLAN in
+    analysis/decision_tests.yaml), in the shape the owner lifecycle consumes (agents/stage_machine.py apply_owner_rule,
+    #316): HIGH, scope-declarable only through the owner's (or, under --signoff lead, the lead's provisional) answer.
+    Not a contract finding: gate_findings is unchanged. Read only from the completed manifest's artifact with a
+    matching hash; a missing, changed or unreadable artifact gives nothing here, since gate_findings already reports
+    it as a non-declarable HIGH."""
+    out = []
+    for t in verified_decision_tests(run_dir):
+        if isinstance(t, dict) and t.get("verdict") == "CHANGES_PLAN":
+            tid = str(t.get("test_id"))
+            out.append({"kind": DECISION_TEST_KIND, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE",
+                        "claim": f"Decision test {tid} changes the plan: {' '.join(str(t.get('statement') or '').split())[:600]}",
+                        "key": tid, "scope_declarable": True, "decision_bearing": True,
+                        "source": "toolkit/analysis/contract.py"})
+    return out
+
+
 def _claims(run_dir, man) -> list[dict]:
     lp = os.path.join(run_dir, "models", "claims_ledger.yaml")
     if not any(e.get("role") == "claims_ledger" for e in (man.get("deliverables") or {}).values()):
@@ -997,6 +1040,33 @@ def _self_test() -> int:
         yaml.safe_dump({"engine_departures": [dict(dep, engine="other")]}, open(os.path.join(d, SPEC), "w"))
         out = [x for x in departure_findings(d)]
         ok(out == [], f"K-DEP2 departures for an engine every source says the run did not use are out of scope ({out[:1]})")
+    # K-DTP (lead-gaps α): every decision test whose verdict changes the plan is a decision-bearing finding, in the
+    # shape the owner lifecycle (#316) consumes; read only from the artifact the manifest lists with a matching hash
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, SPEC), "w").write("x: 1\n")
+        S = complete_run(d, drop_kind="decision_tests", finalize=False)
+        rows = [{"test_id": "DT1", "verdict": "CHANGES_PLAN", "statement": "The plan changes at the low value."},
+                {"test_id": "DT2", "verdict": "NO_CHANGE", "statement": "no"},
+                {"test_id": "DT3", "verdict": "NOT_RUN", "statement": "not run"},
+                {"test_id": "DT4", "verdict": "CHANGES_PLAN", "statement": "s", "within_solver_gap": True}]
+        S.write("decision_tests", {"tests": rows}, "toolkit/analysis/decision_tests.py", [])
+        S.finalize("complete")
+        fs = decision_test_findings(d)
+        ok([(x["kind"], x["key"], x["severity"], x["stage"], x["scope_declarable"], x["decision_bearing"])
+            for x in fs] == [("decision_test_changes_plan", "DT1", "HIGH", "ANALYZE", True, True),
+                             ("decision_test_changes_plan", "DT4", "HIGH", "ANALYZE", True, True)]
+           and "The plan changes at the low value." in fs[0]["claim"] and fs[0]["target_stage"] == "ANALYZE",
+           f"K-DTP1 each test whose verdict changes the plan is a decision-bearing HIGH, keyed by its id: {fs}")
+        ok((decision_test_record(d, "DT1") or {}).get("statement") == rows[0]["statement"]
+           and decision_test_record(d, "DT9") is None, "K-DTP5 the owner item's evidence: one verified row by its id")
+        ok(gate_findings(d) == [], f"K-DTP2 the contract checks themselves are unchanged (not a contract finding): "
+                                   f"{gate_findings(d)}")
+        rel = "analysis/decision_tests.yaml"
+        open(os.path.join(d, rel), "a").write("# edited\n")
+        ok(decision_test_findings(d) == [] and "analysis_contract_tampered" in kinds(d),
+           "K-DTP3 a changed artifact is not read (the contract reports it as tampered, non-declarable)")
+        os.remove(os.path.join(d, MANIFEST))
+        ok(decision_test_findings(d) == [], "K-DTP4 no manifest: nothing read (the contract reports it missing)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

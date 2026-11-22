@@ -1,0 +1,8 @@
+---
+phase: "v2 autonomy"
+commit: "lead-gaps α"
+---
+
+## Changelog
+
+**The default toolkit backend emits `decision_test_changes_plan` (closes the first known limit of 1F, #316).** The toolkit backend recorded each decision test's verdict in `analysis/decision_tests.yaml` but emitted no finding, so the 1F owner lifecycle (owner request at OWNER_DECISION; under `--signoff lead` a provisional answer flagged above the draft) fired only on the spike backend. `toolkit/analysis/api.py gate_findings` now returns, after the contract checks, one finding per test whose verdict is `CHANGES_PLAN` (`contract.decision_test_findings`): kind `decision_test_changes_plan`, HIGH, stage ANALYZE, keyed by the test id, `decision_bearing: true`, scope-declarable only through the owner rule, the same shape the spike backend emits and `apply_owner_rule` consumes. A test settled only within the solver's gap still carries the verdict, so it is included. The rows are read only from the artifact a completed manifest lists with a matching hash; a missing, changed or unreadable artifact gives nothing here because `contract.gate_findings` already reports it as a non-declarable HIGH. `contract.gate_findings` itself is unchanged: a plan-changing test is not a contract failure, and every existing "the contract checks pass" assertion stands. The owner item's fingerprint (`stage_machine._bearing_item`) now binds the verified toolkit row (`contract.decision_test_record`) when the spike's `analysis.json` has none, so a changed result is asked again. Self-tests K-DTP1-K-DTP5 (`toolkit/analysis/contract.py`), AP9 (`toolkit/analysis/api.py`), T_DT_TOOLKIT_FP (`agents/stage_machine.py`).

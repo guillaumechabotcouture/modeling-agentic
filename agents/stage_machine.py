@@ -383,6 +383,12 @@ def _bearing_item(run_dir: str, v: dict) -> dict:
         ev = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(v.get("key"))), None)
     except (OSError, ValueError, AttributeError, TypeError):
         ev = None
+    if ev is None:      # lead-gaps α: the toolkit backend's record (analysis/decision_tests.yaml, hash-verified)
+        try:
+            from toolkit.analysis import contract as _CT
+            ev = _CT.decision_test_record(run_dir, v.get("key"))
+        except Exception:  # noqa: BLE001 -- no evidence: the item binds the claim alone, as before
+            ev = None
     gid = FL.gate_id(v)
     fp = hashlib.sha256(json.dumps({"finding": gid, "claim": v.get("claim", ""), "evidence": ev}, sort_keys=True,
                                    default=str).encode()).hexdigest()[:16]
@@ -3206,6 +3212,22 @@ def _self_test() -> int:
         _SS.review(d, "decision_test_changes_plan:DT9", "overturn", note="fix the effect first")
         ok([r["review"]["decision"] for r in _SS.provisional(d)] == ["overturn"],
            "T_OWNER_LEAD_REVIEW the owner later overturns (or confirms) a provisional answer; it is recorded")
+        # T_DT_TOOLKIT_FP (lead-gaps α): with the toolkit backend (no analysis.json) the owner item binds the verified
+        # row of analysis/decision_tests.yaml, so a changed result is asked again
+        from toolkit.analysis import contract as _CTk
+        _rec = _CTk.decision_test_record
+        try:
+            with tempfile.TemporaryDirectory() as dk:
+                _CTk.decision_test_record = lambda rd, k: {"test_id": k, "verdict": "CHANGES_PLAN", "share_pct": 40.0}
+                fa = _bearing_item(dk, dtf_e)["fingerprint"]
+                _CTk.decision_test_record = lambda rd, k: {"test_id": k, "verdict": "CHANGES_PLAN", "share_pct": 60.0}
+                fb = _bearing_item(dk, dtf_e)["fingerprint"]
+                _CTk.decision_test_record = lambda rd, k: None
+                fc = _bearing_item(dk, dtf_e)["fingerprint"]
+        finally:
+            _CTk.decision_test_record = _rec
+        ok(len({fa, fb, fc}) == 3, f"T_DT_TOOLKIT_FP the toolkit's decision-test record is the owner item's evidence "
+                                   f"({fa}, {fb}, {fc})")
         # T_OWNER_LEAD_AMEND (1F, D2): an owner-amendment finding under --signoff lead is answered provisionally too
         d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041")]}}},
                            signoff="lead", max_rounds=2)
