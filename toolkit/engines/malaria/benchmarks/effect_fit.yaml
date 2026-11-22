@@ -1,0 +1,120 @@
+# Effect-fit declaration of the malaria-starsim pack (W0-C; read by toolkit/engines/effect_fit.py, checked against
+# pack.yaml beside it and ../benchmark_coverage.yaml: python3 toolkit/engines/effect_fit.py check
+# toolkit/engines/malaria/benchmarks/effect_fit.yaml). It states in data what net_effect_fit.py held as module
+# constants for F6 option A, refit b and its 20 Nov verification round (OPTION_A, NET_PARAMS, FIT_EXTRA, PAD_CEILING,
+# CONFOUNDED, DESIGN, WAVE2, VERIFY, SAMPLE, CAL_TOL, ACCEPTANCE_RULE); net_effect_fit.py's self-test NE_DECL checks
+# that the two agree. Each target's estimand fields restate the trial's own estimand (contrast, outcome, scale, time
+# window, population, measurement); where the engine's observable differs from the trial's, `mapping` says how, as
+# the pack's estimand_mapping does. Bands and targets are the pack's (never restated here).
+schema: effect_fit/v1
+targets:
+  B9c:
+    contrast: {treatment: mis_pbo, comparator: mis_pyr}
+    outcome: P. falciparum prevalence
+    scale: odds_ratio
+    window: m24
+    population: 6 months to 14 years
+    measurement: RDT (engine reads microscopy)
+  B9d:
+    contrast: {treatment: ug_pbo, comparator: ug_pyr}
+    outcome: P. falciparum prevalence (as-treated)
+    scale: ratio
+    window: m6
+    population: 2-10 years inclusive (engine 2 <= age < 10)
+    measurement: microscopy
+    mapping: ten-year-olds are left out of both arms and of the site's calibration (pack.yaml estimand_mapping)
+  B9e:
+    contrast: {treatment: ug_pbo, comparator: ug_pyr}
+    outcome: P. falciparum prevalence (as-treated)
+    scale: ratio
+    window: m12
+    population: 2-10 years inclusive (engine 2 <= age < 10)
+    measurement: microscopy
+    mapping: ten-year-olds are left out of both arms and of the site's calibration (pack.yaml estimand_mapping)
+  B9f:
+    contrast: {treatment: ug_pbo, comparator: ug_pyr}
+    outcome: P. falciparum prevalence (as-treated)
+    scale: ratio
+    window: m18
+    population: 2-10 years inclusive (engine 2 <= age < 10)
+    measurement: microscopy
+    mapping: ten-year-olds are left out of both arms and of the site's calibration (pack.yaml estimand_mapping)
+  B9g:
+    contrast: {treatment: mis_dual, comparator: mis_pbo}
+    outcome: P. falciparum prevalence
+    scale: odds_ratio
+    window: m24
+    population: 6 months to 14 years
+    measurement: RDT (engine reads microscopy)
+    mapping: derived from B10 and B9c (one shared control); study-net use differed between the trial's arms and the
+      two simulated arms share one use (pack.yaml estimand_mapping)
+  B10:
+    contrast: {treatment: mis_dual, comparator: mis_pyr}
+    outcome: P. falciparum prevalence
+    scale: odds_ratio
+    window: m24
+    population: 6 months to 14 years
+    measurement: RDT (engine reads microscopy)
+  B11:
+    contrast: {treatment: ben_dual, comparator: ben_pyr}
+    outcome: clinical malaria incidence
+    scale: ratio
+    window: m0_24
+    population: trial cohort of children about 6 months to 10 years; engine under 5
+    measurement: not reported in the abstract
+    mapping: the trial's hazard ratio over 2 years of cohort follow-up is compared with the engine's under-5 rate
+      ratio over the same 24 months (pack.yaml estimand_mapping); the age ranges differ
+  B12:
+    contrast: {treatment: irs_itn_irs, comparator: irs_itn}
+    outcome: P. falciparum prevalence
+    scale: ratio
+    window: m12
+    population: not reported for the pooled analysis; engine 6 months to 14 years
+    measurement: blood smear or RDT
+  B12b:
+    contrast: {treatment: irs_itn_irs, comparator: irs_itn}
+    outcome: clinical malaria incidence
+    scale: ratio
+    window: m0_24
+    population: mixed (all ages in 2 trials, under 6 years, 1 to 10 years); engine under 5
+    measurement: blood smear microscopy or RDT
+  B12m:
+    contrast: {treatment: mul_pyr_irs, comparator: mul_pyr}
+    outcome: P. falciparum prevalence
+    scale: odds_ratio
+    window: m9
+    population: 6 months to 14 years
+    measurement: RDT
+# owner, 2026-11-19 (refit b): one global PBO waning rate cannot carry Muleba's durable effect with LLINEUP's waning,
+# so B9 and B9b are monitored, never used to choose (OPTION_A["departure"])
+monitor: [B9, B9b]
+parameters:            # order as net_effect_fit.build_pack: net-effect parameters, the pack's fit_joint, cfp_half
+  net_kill_shift: {box: [-0.618, 0.66], source: "Churcher 2016's 95% CrI of alpha1 (0.012-1.29) re-centred on the card prior 0.63"}
+  pbo_gain_scale: {box: [0.316, 1.0], source: "card prior (priors.yaml): Gleave 2021 hut-trial mortality RR"}
+  pbo_adv_decay: {box: [0.0, 2.23], source: "owner, 2026-11-19, option (a): 99% interval of LLINEUP's waning (as-treated, 6 -> 18 m) minus the engine's own waning at bioassay mortality 0.30; the card prior (priors.yaml) is 0-1.895"}
+  net_deter_sat: {box: [0.0, 1.0], source: "card prior (engine v0.18, form P): its domain"}
+  cfp_kill: {box: [0.0, 0.8], source: "pack.yaml fit_joint"}
+  irs_kill: {box: [0.0, 0.95], source: "pack.yaml fit_joint"}
+  cfp_half: {box: [270.0, 1650.0], source: "design box from Interceptor G2 field durability (Ngufor 2024 Tables 7-8; Fagbohoun 2026), net_effect_fit.py FIT_EXTRA; no published half-life"}
+confounded: [[pbo_gain_scale, net_deter_sat]]   # owner, 18 Nov: report their joint posterior
+design:
+  waves:               # option A wave 1 and wave 2 in the design box as ran, then refit b's extension past 1.895
+    - {n: 108, seed: 17, box: {pbo_adv_decay: [0.0, 1.895]}}
+    - {n: 111, seed: 23, box: {pbo_adv_decay: [0.0, 1.895]}}
+    - {n: 100, seed: 37, box: {pbo_adv_decay: [1.895, 2.23]}}
+history_matching:
+  cutoff: -1.0
+  candidate_seed: 41
+  basis: "owner, 2026-11-20 verification round (--margin-loo on): a candidate's surrogate is inside each band by its
+    leave-one-out error. net_effect_fit.py used each target's local leave-one-out error near the region; this core
+    uses the global one, so the region can differ (a difference to settle in the replay proof)"
+acceptance:            # owner, 14 Nov (ACCEPTANCE_RULE), unchanged by the 20 Nov round
+  rule: seed_interval_overlaps_band
+  level: 0.95
+  verify_n: 12
+  pick_seed: 43
+  sample_n: 2000
+  control_tolerance: 0.10
+edge_checks:           # owner, 19 Nov: a chosen pbo_adv_decay near its ceiling, with LLINEUP's targets at that point
+  - {param: pbo_adv_decay, side: hi, within: 0.02, targets: [B9d, B9e, B9f],
+     basis: "99% interval of LLINEUP's waning minus the engine's own waning at x = 0.30 (owner, 2026-11-19, option (a))"}

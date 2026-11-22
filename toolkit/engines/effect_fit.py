@@ -3,7 +3,7 @@
 simulated at its trial's own estimand (decision design principle 3: relative effects come from trials, and a
 parameter is anchored where the trial measured it, never by multiplying decision outputs by a trial ratio).
 
-    python3 toolkit/engines/effect_fit.py check <pack.yaml> <effect_fit.yaml>   # the declaration's problems
+    python3 toolkit/engines/effect_fit.py check <engine>/benchmarks/effect_fit.yaml   # problems vs pack, coverage
     python3 toolkit/engines/effect_fit.py --self-test
 
 An engine pack declares the fit in data (`effect_fit.yaml` beside its `pack.yaml`); nothing here names a disease,
@@ -227,6 +227,34 @@ def declaration_problems(decl, pack: dict) -> list:
     if not (isinstance(seeds, list) and len(seeds) >= 2 and all(_int(s) for s in seeds) and len(set(seeds)) == len(seeds)):
         out.append("pack seeds: at least two distinct integers (the acceptance rule needs a seed interval)")
     return out
+
+
+def coverage_problems(decl: dict, coverage: dict | None, version: str) -> list:
+    """The engine's benchmark_coverage.yaml must name, for every training target, effect parameters among the fitted
+    ones (for this engine version), and every fitted parameter must be named by some target (else no target can
+    identify it)."""
+    from toolkit.engines.benchmark_coverage import effect_parameters
+    ents = (coverage or {}).get("benchmarks") or {}
+    out, named = [], set()
+    for t in decl.get("targets") or {}:
+        hit = set(effect_parameters(ents.get(t), version)) & set(decl.get("parameters") or {})
+        if not hit:
+            out.append(f"{t}: benchmark_coverage names no fitted effect parameter for it (engine version {version}); "
+                       "required for a training target")
+        named |= hit
+    return out + [f"parameter {k}: no training target's effect_parameters name it, so no target can identify it"
+                  for k in decl.get("parameters") or {} if k not in named]
+
+
+def pack_files(decl_path: str) -> tuple:
+    """(declaration, pack, coverage, engine version) for a pack's effect_fit.yaml: pack.yaml beside it, and the
+    engine's benchmark_coverage.yaml and card.yaml one level up."""
+    here = os.path.dirname(os.path.abspath(decl_path))
+    eng = os.path.dirname(here)
+    rd = lambda p: yaml.safe_load(open(p)) if os.path.exists(p) else None  # noqa: E731
+    card = rd(os.path.join(eng, "card.yaml")) or {}
+    return (rd(decl_path), rd(os.path.join(here, "pack.yaml")) or {}, rd(os.path.join(eng, "benchmark_coverage.yaml")),
+            str(card.get("version", "")))
 
 
 def target_digests(decl: dict, pack: dict) -> dict:
@@ -727,6 +755,23 @@ def _self_test() -> int:
     ok(fr.log == [("cal", ("site",))] and out["controls"]["site"]["achieved"] == 0.4 and len(out["per_seed"]["T6"]) == 4,
        f"EF_RUNNER: the adapter recalibrates and reads the control arm ({out['controls']})")
 
+    # EF_COVERAGE: a training target needs effect parameters in benchmark_coverage; a parameter no target names fails
+    cov = {"benchmarks": {"T6": {"effect_parameters": ["eff", "wane"]}, "T18": {"effect_parameters": ["wane"]}}}
+    ok(coverage_problems(decl, cov, "1") == [], "EF_COVERAGE: the toy coverage names every fitted parameter")
+    cov["benchmarks"]["T6"]["effect_parameters"] = []
+    cp = coverage_problems(decl, cov, "1")
+    ok(any(p.startswith("T6:") for p in cp) and any("parameter eff" in p for p in cp),
+       f"EF_COVERAGE: a target without effect parameters, and a parameter no target names, are refused {cp}")
+
+    # EF_PACKS: every engine pack that declares an effect fit declares one this core accepts (no engine run)
+    import glob
+    found = sorted(glob.glob(os.path.join(ROOT, "toolkit", "engines", "*", "benchmarks", "effect_fit.yaml")))
+    for f in found:
+        dcl, pk_, cv, ver = pack_files(f)
+        probs = declaration_problems(dcl, pk_) or coverage_problems(dcl, cv, ver)
+        ok(not probs, f"EF_PACKS: {os.path.relpath(f, ROOT)} is valid against its pack and coverage {probs}")
+    ok(bool(found), f"EF_PACKS: at least one pack declares an effect fit ({len(found)})")
+
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
@@ -735,8 +780,9 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    if len(argv) == 3 and argv[0] == "check":
-        probs = declaration_problems(yaml.safe_load(open(argv[2])), yaml.safe_load(open(argv[1])))
+    if len(argv) == 2 and argv[0] == "check":
+        dcl, pk, cv, ver = pack_files(argv[1])
+        probs = declaration_problems(dcl, pk) or coverage_problems(dcl, cv, ver)
         for p in probs:
             print(f"PROBLEM {p}")
         print("OK: the declaration can drive a fit" if not probs else f"{len(probs)} problem(s)")
