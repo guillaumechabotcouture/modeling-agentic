@@ -893,7 +893,6 @@ def _validate_pending(s: Spec) -> list[str]:
         if str(dt.get("id") or "").startswith(("prior_range_", "fitted_range_", "scenario_excluded_",
                                                 "anchor_range_")):       # W0-B review r1: also before the engine
             bad.append(f"decision test {dt.get('id')}: that id is one the harness generates; the spec cannot use it")
-        bad += [f"decision test {dt.get('id')}: {PT.clash(dt)}"] if PT.clash(dt) else []
         if dt.get("type") == PT.TYPE:          # W0-B: its structure here, the rest on its per-target form
             bad += PT.problems(dt)
             dt = PT.view(dt)
@@ -1439,9 +1438,6 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             if dt.get("type") in (PT.TYPE, "prior_range", "fitted_range", "scenario_excluded", "anchor_range"):
                 bad.append(f"decision test {i}: its targets cannot be read as one test the runner executes")
                 continue
-        elif PT.clash(dt):
-            bad.append(f"decision test {i}: {PT.clash(dt)}")
-            continue
         t = dt.get("type")
         if t not in DECISION_TEST_TYPES:
             bad.append(f"decision test {i}: type {t!r} not in {DECISION_TEST_TYPES}")

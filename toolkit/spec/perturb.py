@@ -69,6 +69,7 @@ NESTED = {"unit_attribute": "unit_attribute", "calibration_target": "calibration
           "outcome_ratio": "outcome_ratio", "burden_scale": "burden_scale"}   # alias -> its block's key
 EVALUATED = ("parameter", "unit_column", "cost_item", "calibration_target", "anchor")   # kinds that evaluate the model
 META = ("type", "set", "alias", "conditional", "layer")
+STASH = "as_given"            # an older test's fields named like META, kept apart by compile (W0-B review r2)
 TOP = ("id", "type", "text", "finding", "set", "conditional")     # a spec's perturb test, at its top level
 
 
@@ -87,9 +88,11 @@ def compile(dt: dict) -> dict:  # noqa: A001 -- the alias compiler
         return copy.deepcopy(dt)
     if t not in ALIASES:
         raise ValueError(f"decision test {dt.get('id')}: unknown type {t!r}")
-    if clash(dt):
-        raise ValueError(f"decision test {dt.get('id')}: {clash(dt)}")
-    kind, rest = ALIASES[t], {k: v for k, v in dt.items() if k != "type"}
+    own = META[1:] + (STASH,)
+    kind, rest = ALIASES[t], {k: v for k, v in dt.items() if k != "type" and k not in own}
+    stash = {k: dt[k] for k in own if k in dt}                     # an older test's own field that the perturb
+    if stash:                                                      # form also uses: kept apart, restored by view
+        rest[STASH] = stash
     tgt = {"target": kind}
     targets = [tgt]
     if kind == "parameter":
@@ -122,14 +125,6 @@ def compile(dt: dict) -> dict:  # noqa: A001 -- the alias compiler
     return {"type": TYPE, "alias": t, "set": targets, **rest}
 
 
-def clash(dt) -> str:
-    """Why a test of an older type cannot be compiled: it holds a field the `perturb` form itself uses ('' if none)."""
-    if not isinstance(dt, dict) or dt.get("type") == TYPE:
-        return ""
-    got = sorted(k for k in META if k != "type" and k in dt)
-    return f"fields {got} belong to a perturb test (type: perturb), not to a {dt.get('type')} test" if got else ""
-
-
 def view(p: dict) -> dict:
     """The per-target form a `perturb` test executes as (its alias's fields), for the executor and every reader. A test
     of another type is returned as it is; a `perturb` test whose targets cannot be read is too (validation reports
@@ -151,7 +146,9 @@ def _view(p: dict) -> dict:
     kind = ALIASES[alias] if alias else next(iter(kinds))
     if kinds - {kind} or (not targets and kind != "cost_item"):
         raise ValueError("mixed targets")
-    out = {k: v for k, v in p.items() if k not in META}
+    out = {k: v for k, v in p.items() if k not in META and k != STASH}
+    if alias and isinstance(p.get(STASH), dict):
+        out.update(p[STASH])
     out["type"] = alias or EXEC[kind]
     first = targets[0] if targets else {}
     if kind == "parameter":
@@ -246,6 +243,8 @@ def _field_problems(k, t, n) -> list:
     bad = []
     if k in ("parameter", "cost_item", "unit_column") and not _isname(t.get("name")):
         bad.append("name: the engine parameter, cost item or column it moves")
+    elif k in ("parameter", "unit_column") and not isinstance(t.get("name"), str):
+        bad.append("name: a string (an engine parameter or a column)")
     if k == "parameter":
         op = "values" if n == 0 else "value"
         if set(t) & {"values", "value"} != {op}:
@@ -270,8 +269,9 @@ def _field_problems(k, t, n) -> list:
             bad.append("remove or add")
         elif "remove" in t and not _isname(t["remove"]):
             bad.append("remove: a constraints.group_rules id")
-        elif "add" in t and not (isinstance(t["add"], dict) and t["add"]):
-            bad.append("add: the rule to add (a mapping)")
+        elif "add" in t and not (isinstance(t["add"], dict) and _isname(t["add"].get("by"))
+                                 and isinstance(t["add"].get("components"), list) and t["add"]["components"]):
+            bad.append("add: the rule to add, a mapping with by (a column) and components (a non-empty list)")
     elif k == "envelope" and not _nums(t.get("values"), lo=0):
         bad.append("values: a non-empty list of positive envelopes")
     elif k == "interaction":
@@ -303,7 +303,8 @@ def _field_problems(k, t, n) -> list:
 def tests(analysis) -> list:
     """Every declared decision test of an `analysis` block in its per-target form (view), for the readers."""
     an = analysis if isinstance(analysis, dict) else {}
-    return [view(t) for t in an.get("decision_tests") or [] if isinstance(t, dict)]
+    ts = an.get("decision_tests")
+    return [view(t) for t in ts if isinstance(t, dict)] if isinstance(ts, list) else []
 
 
 def cases(p: dict) -> int:
@@ -469,11 +470,10 @@ def _self_test() -> int:
     refused({"id": "a", "type": "perturb", "set": [{"target": "cost_item", "name": 1, "scale": 2},
                                                    {"target": "cost_item", "name": "1", "scale": 3}]},
             "named twice", "PT23 cost items 1 and \"1\" are one key, refused as named twice")
-    try:
-        compile({"id": "e", "type": "envelope", "values": [6e6], "set": [{"target": "envelope", "values": [10]}]})
-        ok(False, "PT24 an older type holding a perturb field (set) is refused, not overwritten")
-    except ValueError as e:
-        ok("belong to a perturb test" in str(e), f"PT24 an older type holding a perturb field is refused: {e}")
+    for odd in ({"id": "e", "type": "envelope", "values": [6e6], "set": [{"target": "envelope", "values": [10]}]},
+                {"id": "b", "type": "envelope", "values": [100], "conditional": False, "as_given": 1, "layer": "x"}):
+        ok(view(compile(odd)) == odd and view(compile(odd))["values"] == odd["values"],
+           f"PT24 an older test's fields named like the perturb form's are kept apart and restored: {compile(odd)}")
     neng = {"id": "o", "type": "perturb", "set": [{"target": "outcome", "component": "a", "reference": "b",
                                                     "values": [0.5, "engine"]}]}
     ok(layer(neng, "direct", 6, 2) == {"layer": "engine", "cases": 2, "engine_rows": 12}

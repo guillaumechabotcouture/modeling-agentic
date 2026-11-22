@@ -969,8 +969,12 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     rec = _run_one(A, PT.view(p), z0, ben0, cost0, plan, uq_data, out0)
     if dt.get("type") == PT.TYPE:
         rec["type"] = PT.TYPE
-    n = len(rec.get("results") or []) if rec.get("status") == "run" else 0     # the cases evaluated, not requested
-    rec["perturb"] = dict(p, layer=PT.layer(p, getattr(A.model, "kind", None), len(A.ids), len(A.pk), n_cases=n))
+    # the cases evaluated, not requested; a test not run may have evaluated some before stopping: unknown (None)
+    n = len(rec.get("results") or []) if rec.get("status") == "run" else None
+    lay = PT.layer(p, getattr(A.model, "kind", None), len(A.ids), len(A.pk), n_cases=n)
+    if n is None:
+        lay.update(cases=None, engine_rows=None if lay["layer"] == "engine" else 0)
+    rec["perturb"] = dict(p, layer=lay)
     return rec
 
 

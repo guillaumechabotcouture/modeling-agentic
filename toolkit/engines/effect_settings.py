@@ -168,7 +168,8 @@ def tested_by(raw, row) -> list:
         ua = t.get("unit_attribute") if t.get("type") == "unit_attribute" else None
         if not isinstance(ua, dict) or str(ua.get("column")) != row["column"]:
             continue
-        us = ua.get("units", "all")      # the runner's default: every unit (W0-B review r1)
+        # the runner's default is every unit, except for set_from, which changes only the table's rows (W0-B review)
+        us = ua.get("units", None if "set_from" in ua else "all")
         if us == "all" or (isinstance(us, list) and set(map(str, us)) & set(row["outside_units"])):
             out.append(str(t.get("id")))
     return out
