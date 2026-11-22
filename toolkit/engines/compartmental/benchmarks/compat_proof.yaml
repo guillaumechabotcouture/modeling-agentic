@@ -1,7 +1,7 @@
 producer: toolkit/engines/compartmental/benchmarks/compat_proof.py
 scope: every pack setting of a configuration the old pack declared, and one representative unit per coverage-pack
   configuration (all arms in one run_batch, each arm's run(), and initial_state()), seed 1
-old_ref: origin/v2
+old_ref: b24d147819aee932049c404bd33d97784a0fbfcf
 old_commit: b24d147819aee932049c404bd33d97784a0fbfcf
 old_configs:
 - single_day
@@ -24,8 +24,8 @@ new_identity:
   name: compartmental-starsim
   version: '0.2'
   code_sha256: 339ef0a7ce81e9b9514a8a914e0fcb017eb4c69925c596cd5b491a283b8891e2
-  params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
-  config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
+  params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
+  config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
 old_coverage_identity:
   name: compartmental-starsim
   version: '0.1'
@@ -36,14 +36,22 @@ calibrator_code:
   files:
     toolkit/analysis/calibration.py:
       changed:
+      - _self_test
+      - fit_likelihood
       - fit_posterior_panel
       - read_targets
+      - ridge_refusal
       removed: []
-      added: []
+      added:
+      - at_bounds
+      - refused_at_bound
       module_statements_same: true
       allowed_changes:
+      - _self_test
+      - fit_likelihood
       - fit_posterior_panel
       - read_targets
+      - ridge_refusal
       ok: true
     toolkit/analysis/observation.py:
       changed: []
@@ -74,7 +82,7 @@ old_row_code_sha256:
   SB3c: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
   SB5: 68e556bd544278563334cb69848d96150d9a56d0cafaf66255f64b1951f3c6b3
 new_calibrator_file_sha256:
-  toolkit/analysis/calibration.py: edb3dd13f38aee21b1e29e70a355faaea2d560b5cedbc783a4fc6a51b703a131
+  toolkit/analysis/calibration.py: 78daf6b828d15660bb57af078f21fe6573ccc2422b5696c572e26db5dfc4e129
   toolkit/analysis/observation.py: ae53f8fbe4056987d6e018b957b58cb79da2879ec09f22557d20b94d95cc1cb3
   toolkit/engines/compartmental/benchmarks/oracles.py: db73e3264b4f4126e606d5ae8b0a92f05bc8b7aa6cb6f3daf4c85148cf1f2c26
 digests:

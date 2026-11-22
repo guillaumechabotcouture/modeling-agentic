@@ -224,15 +224,15 @@ def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiabi
     at_bound = at_bounds(xh, b)
     why = ridge_refusal(fa, at_bound, len(names))
     if why:
-        raise CalibrationRefused("calibration_ridge", f"{why}: reparameterise (a reference package) or declare priors "
-                                                      "and use method posterior", at_bound=at_bound)
+        raise refused_at_bound("calibration_ridge", f"{why}: reparameterise (a reference package) or declare priors "
+                                                    "and use method posterior", at_bound)
     try:
         cov = np.linalg.inv(np.asarray(H))
         cov = (cov + cov.T) / 2
         if np.linalg.eigvalsh(cov).min() <= 0:
-            raise CalibrationRefused("calibration_ridge", "the covariance is not positive definite", at_bound=at_bound)
+            raise refused_at_bound("calibration_ridge", "the covariance is not positive definite", at_bound)
     except np.linalg.LinAlgError:
-        raise CalibrationRefused("calibration_ridge", "the Hessian is singular", at_bound=at_bound) from None
+        raise refused_at_bound("calibration_ridge", "the Hessian is singular", at_bound) from None
     ident = {}
     if identifiability:
         for p in L.params:
@@ -268,10 +268,17 @@ def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiabi
 class CalibrationRefused(ValueError):
     """A calibration that fails closed, with a finding code (calibration_ridge, posterior_ess, posterior_mcmc, ...)."""
 
-    def __init__(self, code: str, msg: str, at_bound=None):
+    def __init__(self, code: str, msg: str):
         self.code = code
-        self.at_bound = list(at_bound or [])        # the fitted parameters at a bound of their box, when known
         super().__init__(f"{code}: {msg}")
+
+
+def refused_at_bound(code: str, msg: str, at_bound) -> CalibrationRefused:
+    """A refusal carrying the fitted parameters at a bound of their box (`at_bound`). Kept apart from the class: the
+    coverage pack's calibrator raises CalibrationRefused, and its rows are bound to that code (compat_proof)."""
+    e = CalibrationRefused(code, msg)
+    e.at_bound = list(at_bound or [])
+    return e
 
 
 def thresholds() -> dict:
@@ -1698,8 +1705,8 @@ def _self_test() -> int:
            and "z:u0" in w1 and "scale or range" not in w1,
            f"CR12 the refusal names the bound parameters, and the scale/range hint only when most are bound "
            f"({w3[-160:]} | {w1[-80:]})")
-        e = CalibrationRefused("calibration_ridge", "x", at_bound=["z:u0"])
-        ok(e.at_bound == ["z:u0"] and e.code == "calibration_ridge", "CR12b a refusal carries its bound parameters")
+        e = refused_at_bound("calibration_ridge", "x", ["z:u0"])
+        ok(isinstance(e, CalibrationRefused) and e.at_bound == ["z:u0"] and e.code == "calibration_ridge", "CR12b a refusal carries its bound parameters")
     safe(cr11, "CR11-12 scale default and bound parameters")
 
     def cr7():

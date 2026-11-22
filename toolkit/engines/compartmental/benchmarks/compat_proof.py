@@ -141,7 +141,11 @@ def compare(old: dict, new: dict) -> dict:
 # (benchmark.calibrator_code_digest). Those files may change only where the coverage path does not go: these
 # top-level definitions may change, and definitions may be added; nothing else may differ.
 CALIBRATOR_FILES = {
-    "toolkit/analysis/calibration.py": {"read_targets", "fit_posterior_panel"},   # dispatch to observed_targets
+    # read_targets, fit_posterior_panel: dispatch to observed_targets. fit_likelihood, ridge_refusal: the likelihood
+    # fit's refusal reason; _self_test: the module's inline tests. None is reachable from `posterior`, the coverage
+    # pack's calibrator (static call closure within calibration.py; CP11 checks it).
+    "toolkit/analysis/calibration.py": {"read_targets", "fit_posterior_panel", "fit_likelihood", "ridge_refusal",
+                                        "_self_test"},
     "toolkit/analysis/observation.py": set(),
     "toolkit/engines/compartmental/benchmarks/oracles.py": set(),
 }
@@ -169,6 +173,28 @@ def definitions(src: str) -> dict:
     import ast
     return {n.name: ast.dump(n) for n in ast.parse(src).body
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+
+
+def coverage_calibrators() -> set:
+    """The calibration.py functions the coverage pack names as its calibrators."""
+    pk = yaml.safe_load(open(COVERAGE_PACK))
+    fns = {b["estimand"]["calibrator"]["fn"] for b in pk["benchmarks"]
+           if (b.get("estimand") or {}).get("type") == "coverage"}
+    return {f.split(":")[1] for f in fns if f.split(":")[0] == "toolkit.analysis.calibration"}
+
+
+def reachable(src: str, roots: set) -> set:
+    """Top-level definitions of a module reachable from `roots` by name (a static closure within the module)."""
+    import ast
+    defs = {n.name: n for n in ast.parse(src).body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    seen, todo = set(), [r for r in roots if r in defs]
+    while todo:
+        f = todo.pop()
+        if f not in seen:
+            seen.add(f)
+            todo += [x.id for x in ast.walk(defs[f]) if isinstance(x, ast.Name) and x.id in defs and x.id not in seen]
+    return seen
 
 
 def code_changes(old_root: str, new_root: str = ROOT) -> dict:
@@ -210,7 +236,7 @@ def prove(old_ref: str, python: str = sys.executable) -> dict:
         sys.path.insert(0, d)
         old_commit = subprocess.run(["git", "-C", ROOT, "rev-parse", old_ref], capture_output=True, text=True,
                                     check=True).stdout.strip()
-    pk = yaml.safe_load(open(PACK))
+    pk = yaml.safe_load(open(COVERAGE_PACK))
     eng = B.load_engine(pk["engine"], pk["configs"][pk["default_config"]])
     rec = {"producer": "toolkit/engines/compartmental/benchmarks/compat_proof.py",
            "scope": "every pack setting of a configuration the old pack declared, and one representative unit per "
@@ -233,7 +259,7 @@ def restamp() -> dict:
     from toolkit.engines import benchmark as B
     from toolkit.engines.contract import engine_identity
     proof = yaml.safe_load(open(OUT))
-    pk = yaml.safe_load(open(PACK))
+    pk = yaml.safe_load(open(COVERAGE_PACK))
     eng = B.load_engine(pk["engine"], pk["configs"][pk["default_config"]])
     if not proof.get("identical"):
         raise SystemExit("refused: the stored proof does not say identical")
@@ -365,6 +391,11 @@ def _self_test() -> int:
                 ok("changed after the proof" in str(e), f"CP10 calibrator files changed after the proof refuse "
                                                         f"the restamp: {e}")
         OUT, COVERAGE = saved
+        # CP11: the calibration.py definitions allowed to change are not reachable from the coverage calibrator
+        reach = reachable(open(os.path.join(ROOT, "toolkit/analysis/calibration.py")).read(), coverage_calibrators())
+        hit = sorted(CALIBRATOR_FILES["toolkit/analysis/calibration.py"] & reach)
+        ok(bool(reach) and not hit, f"CP11 no allowed calibration.py change is reachable from the coverage calibrator "
+                                    f"({len(reach)} definitions reachable; allowed and reachable: {hit})")
         ok(rec.get("identical") is True and rec.get("cases", 0) > 0,
            f"CP5 the committed proof says identical ({rec.get('identical_cases')}/{rec.get('cases')} cases)")
         cov = yaml.safe_load(open(COVERAGE))
