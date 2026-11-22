@@ -632,7 +632,7 @@ def _self_test() -> int:
                                           "owner_state": st, "brief": "b"}, **({"patch": p} if p is not None else {}))
     ok(all(w in FIX_PLANNER_PROMPT for w in ('"patch"', '"set"', '"add"', '"remove"', "[key=value]"))
        and validate_plan({"tasks": [rt("SPEC", pa), {"id": "T2", "findings": ["k:x"], "action": "fix",
-                                                     "owner_state": "CONFIGURE", "brief": "y"}]}, packet) == [],
+                                                     "owner_state": "CONFIGURE", "brief": "y", "files": S}]}, packet) == [],
        "F_PATCH1 the prompt asks a SPEC rethink for a patch (set, add, remove by dotted path); a plan with one validates")
     ok(spec_patch({"tasks": [rt("SPEC", pa)]}) == pa and spec_patch({"tasks": [rt("ENGINE_CHOICE", pa)]}) is None
        and spec_patch({"tasks": [rt("SPEC")]}) is None and spec_patch({"tasks": [rt("SPEC", "set x")]}) is None

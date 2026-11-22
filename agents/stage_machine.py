@@ -2313,7 +2313,7 @@ class Machine:
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
             return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})", planned=True)
-        if not summ["tasks"] and summ.get("write_up") and self._has_draft():
+        if not summ["tasks"] and summ.get("write_up") and not summ.get("harness_gaps") and self._has_draft():
             # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
             if self.st.round_pending:
                 self.st.round += 1
@@ -3753,6 +3753,19 @@ def _self_test() -> int:
         ok("FIX_LOOP" in p and not any(c.startswith("fix:") for c in T.calls)
            and any(f.get("id") == "R-030" for f in got),
            f"R3-1 a write-up finding goes to the writer, not to a FIX_LOOP task ({s}, {T.calls}, {got})")
+        # HG1 (Codex review of #341): a declared harness gap is an open finding that is not the write-up's, so a loop
+        # with no task, write-up findings and a draft goes to CRITIQUE, not the "every finding is the write-up's" WRITE.
+        d, T, st = new_run("harness_gap_route", {}, max_rounds=3)
+        mh = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
+        mh.st.state, mh._has_draft = "FIX_LOOP", (lambda: True)
+        _rl = FX.run_loop
+        try:
+            FX.run_loop = lambda *a, **k: {"round": 1, "tasks": 0, "rows": 0, "passed": 0, "rethink": None,
+                                           "write_up": ["R-030"], "owner_amendments": [], "harness_gaps": ["D-001"]}
+            to_hg = mh.h_FIX_LOOP()
+        finally:
+            FX.run_loop = _rl
+        ok(to_hg == "CRITIQUE", f"HG1 a harness gap keeps the loop off the write-up-only WRITE route ({to_hg})")
 
         # R3-3 (F6 run 3): a finding whose remedy is an owner amendment goes to OWNER_DECISION, never a SPEC rethink.
         amend = {"id": "D-031", "severity": "HIGH", "target_stage": "PLAN", "claim": "the comparator omits the funded plan",
