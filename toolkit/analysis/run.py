@@ -355,8 +355,17 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         A.set_reserve(reserve["fraction"])
         log(f"affordability: plan within {reserve['fraction']:.4f} of the budget ({reserve['reserve_usd']:,.0f} held "
             f"back), {reserve['value_given_up_pct'] or 0:.2f}% of the objective given up")
-    plan = sol["choice"]
+    plan = plan_pt = sol["choice"]
     A.guard("point plan", [plan] + ([reserve["unconstrained"]["plan"]] if reserve else []), events0)  # Codex P1-6
+    from toolkit.analysis import plan_rule as PR
+    evp = None
+    if PR.rule(spec.raw) == "expected_value":
+        # hb1 fix 11: the plan with the best mean over the uncertainty draws, which the uncertainty step then reuses
+        pre = UQ.evaluate_draws(A, draws)
+        evp = PR.expected_value_plan(A, pre["rows"], plan_pt, cost0, point_events=events0)
+        plan = evp["solution"]["choice"]
+        A.guard("expected-value plan", [plan], events0)
+        log(f"expected-value plan: {evp['record']['n_units_differ']} of {len(A.ids)} units differ from the point plan")
     on_plan = []
     point = A.summary(plan, out0, cost0)
     from toolkit.engines.contract import engine_identity
@@ -365,8 +374,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     point.update(engine_identity=engine_identity(eng))
     point.update(plan=plan, n_units=len(A.ids),
                  # 1C-c (D3): the status and the relative gap it was proven within, with the threads and time limit
-                 solver={**{k: sol[k] for k in ("status", "method", "objective", "cost")},
-                         **{k: sol.get(k) for k in ("gap_rel", "threads", "time_limit_s", "solver_status")}},
+                 solver=_solver_record(evp["solution"] if evp else sol),
                  interactions=interactions(A, out0), rule=decision_rule(A, out0, plan),
                  model_corrections={"n": len(events0), "on_plan": on_plan, "kinds": sorted({e["kind"] for e in events0}),
                                     "examples": events0[:20]},
@@ -379,6 +387,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                                "calibration_status": A.flagged[i]["status"]}
                                               if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
     point["cost_floors"] = floors0
+    if evp is not None:      # hb1 fix 11: the rule, the point-value plan and its solve, and each unit's mean
+        point["plan_rule"] = dict(evp["record"], point_solver=_solver_record(sol))
+        for i in A.ids:
+            point["per_unit"][i]["averted_mean"] = evp["record"]["per_unit_mean"][i]
     if getattr(A, "adjust", None):    # F6 run 4 R3: the base outcome adjustments every evaluation applied
         from toolkit.analysis import outcome_adjust as OA
         point["outcome_adjustments"] = OA.record(A.adjust)
@@ -425,7 +437,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                             [arts["point"], arts["uncertainty"], BV.csv_path(spec)])
         log(f"burden validation: {bvd['summary']}")
     # ---- stability
-    stab = ST.run(A, z0, out0, ben0, cost0, plan)
+    stab = ST.run(A, z0, out0, ben0, cost0, plan_pt)    # re-solved at the point values: the point-value plan
     arts["stability"] = S.write("stability", stab, ST.PRODUCER, [arts["point"], arts["calibration"]])
     if stab.get("folds"):
         import yaml
@@ -439,10 +451,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if pv is not None:
         arts["plan_variants"] = S.write("plan_variants", pv, V.PRODUCER, [arts["point"]])
     # ---- sensitivity
-    sens = SE.run(A, z0, ben0, cost0, plan, sol["objective"])
+    sens = SE.run(A, z0, ben0, cost0, plan_pt, sol["objective"])
     arts["sensitivity"] = S.write("sensitivity", sens, SE.PRODUCER, [arts["point"]])
     # ---- decision tests
-    dts = DT.run_all(A, z0, out0, ben0, cost0, plan, u["data"], run_dir)
+    dts = DT.run_all(A, z0, out0, ben0, cost0, plan_pt, u["data"], run_dir)
     if jc is not None:      # owner decision R1 (F6 run 1): a declared calibration miss stands only with its test run
         from toolkit.analysis import joint_calibration as JC
         dp = JC.declared_test_problems(jc["unmatched_decision"], dts)
@@ -508,7 +520,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         w.writerow([cols["unit"], cols["package"], cols["value"], "cost_usd", "region"]
                    + (["calibration_flag"] if fl else []))
         for i in A.ids:
-            w.writerow([i, plan[i], round(point["per_unit"][i]["averted"][hl_o], 4), round(cost0[i][plan[i]], 2),
+            val = point["per_unit"][i]["averted_mean" if evp is not None else "averted"][hl_o]   # hb1 fix 11
+            w.writerow([i, plan[i], round(val, 4), round(cost0[i][plan[i]], 2),
                         A.by_id[i].get(reg, "") if reg else ""] + ([fl[i]["reason"] if i in fl else ""] if fl else []))
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().publish(dp, buf.getvalue(), run_dir)
@@ -548,6 +561,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     return {"artifacts": arts, "point": point, "uncertainty": u["data"], "stability": stab, "sensitivity": sens,
             "decision_tests": dts, "calibration": cal, "emulator_accuracy": model.accuracy, "wall_s": S.manifest["wall_s"],
             "_A": A, "_model": model}
+
+
+def _solver_record(sol: dict) -> dict:
+    """point.solver: the status and the relative gap it was proven within, with the threads and time limit (1C-c)."""
+    return {**{k: sol[k] for k in ("status", "method", "objective", "cost")},
+            **{k: sol.get(k) for k in ("gap_rel", "threads", "time_limit_s", "solver_status")}}
 
 
 # --------------------------------------------------------------------------- self-test
