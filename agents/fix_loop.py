@@ -110,6 +110,12 @@ Rules:
   finding patched twice without its check passing, or when several blocking findings point at one
   mechanism. A rethink names owner_state SPEC (the decision spec is wrong) or ENGINE_CHOICE
   (the engine or its configuration cannot represent what the question needs).
+- A SPEC rethink also carries "patch": the amendment it asks for, in machine-readable form:
+  {"id": "<short id>", "reason": "<why, in words>", "spec": [{"set": "<path>", "value": <new value>},
+  {"add": "<path>", "value": <value>}, {"remove": "<path>"}]}. A path is a dotted key of
+  decision_spec.yaml; a list element by index (".0") or by "[key=value]". "set" replaces a value that
+  exists, "add" appends to a list or adds a key a mapping lacks, "remove" deletes one. Change only what
+  the brief names. The amendment goes to a new run, never this one, and the owner reviews it.
 - decision_test instead of fix when the finding cannot be fixed with the data and engines
   available: the brief says which quantity to vary and what would change the decision. Never
   for a finding with scope_declarable false.
@@ -320,6 +326,15 @@ def validate_plan(plan, packet: dict) -> list[str]:
             errs.append(f"blocking finding {f['id']} is in no task" + (" (blocking findings cannot be deferred)"
                                                                       if f["id"] in deferred else ""))
     return errs
+
+
+def spec_patch(plan) -> dict | None:
+    """lead-gaps β: the machine-readable amendment of the rethink the loop routes (its first rethink task) when that
+    rethink is the spec's (toolkit/spec/amend.py's patch format; amend validates it), else None."""
+    tasks = plan.get("tasks") if isinstance(plan, dict) else None
+    t = next((t for t in tasks or [] if isinstance(t, dict) and t.get("action") == "rethink"), None)
+    p = t.get("patch") if t is not None and t.get("owner_state") == "SPEC" else None
+    return p if isinstance(p, dict) else None
 
 
 def default_plan(packet: dict) -> dict:
@@ -610,6 +625,19 @@ def _self_test() -> int:
        f"F4 non-declarable decision test, owner item, unknown id and a bad rethink target are rejected {e}")
     ok([t["findings"] for t in default_plan(packet)["tasks"]] == [["R-001"], ["k:x"]],
        "F5 the default plan is one task per blocking finding, owner items left to the owner")
+    # F_PATCH (lead-gaps β): the planner writes a SPEC rethink's amendment in amend.py's format; the loop reads the
+    # patch of the rethink it routes (the first), and only a spec rethink's
+    pa = {"id": "A1", "reason": "r", "spec": [{"set": "objective.horizon", "value": 5}]}
+    rt = lambda st, p=None, i="T1": dict({"id": i, "findings": ["R-001"], "action": "rethink",  # noqa: E731
+                                          "owner_state": st, "brief": "b"}, **({"patch": p} if p is not None else {}))
+    ok(all(w in FIX_PLANNER_PROMPT for w in ('"patch"', '"set"', '"add"', '"remove"', "[key=value]"))
+       and validate_plan({"tasks": [rt("SPEC", pa), {"id": "T2", "findings": ["k:x"], "action": "fix",
+                                                     "owner_state": "CONFIGURE", "brief": "y"}]}, packet) == [],
+       "F_PATCH1 the prompt asks a SPEC rethink for a patch (set, add, remove by dotted path); a plan with one validates")
+    ok(spec_patch({"tasks": [rt("SPEC", pa)]}) == pa and spec_patch({"tasks": [rt("ENGINE_CHOICE", pa)]}) is None
+       and spec_patch({"tasks": [rt("SPEC")]}) is None and spec_patch({"tasks": [rt("SPEC", "set x")]}) is None
+       and spec_patch({"tasks": [rt("ENGINE_CHOICE"), rt("SPEC", pa, "T2")]}) is None and spec_patch(None) is None,
+       "F_PATCH2 the routed rethink's patch is read when it is a spec rethink's mapping, else None")
     with tempfile.TemporaryDirectory() as d:
         open(os.path.join(d, "spec.txt"), "w").write("draws 6\n")
         os.makedirs(os.path.join(d, "analysis"))

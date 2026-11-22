@@ -150,7 +150,7 @@ local SKILL.md), allowed via `_MCP_SKILLS`.
 | Exit | Statuses |
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
-| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff`, `paused:awaiting_budget`, `paused:awaiting_spec_amendment` (v2) |
+| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`, `amended_provisional`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff`, `paused:awaiting_budget`, `paused:awaiting_spec_amendment` (v2) |
 | 1    | `harness_tampered`, `artifact_tampered`, errors |
 | 130  | `interrupted` |
 
@@ -167,6 +167,10 @@ allowance is below the floor (`paused:awaiting_budget`: resume with a higher `--
 a rethink would change a signed spec (`paused:awaiting_spec_amendment`: read `spec_rethink_request.json`, amend the
 spec and relaunch with reuse), and exits 2;
 `main.py --resume <run_dir>` continues from `run_state.json`.
+Under `--signoff lead` only, a rethink of a signed spec whose fix plan wrote a valid `patch` does not pause: the
+machine runs `toolkit/spec/amend.py --from-request`, the lead signs the child run's spec provisionally, the parent
+ends `amended_provisional` and the run continues in the child, whose report lists the amendment first, as
+provisional. Without a patch, or when it does not apply, validate or sign, the run pauses as above.
 
 Every run records which pipeline ran: `metadata.json` holds `pipeline`
 (`v1`|`v2`), `commit` and `launcher` (plus one `invocations` entry per

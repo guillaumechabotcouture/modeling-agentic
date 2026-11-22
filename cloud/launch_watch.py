@@ -167,11 +167,13 @@ def is_network_error(text) -> bool:
 
 
 def parse_status(text, labels):
-    """`status` output as {"cluster": "running"|"stopped", "runs": {label: {"state", "stored"}}}; None when it cannot
-    be read (no cluster line, or a running cluster without a line for every label)."""
-    m = re.search(r"^cluster \S+: (running|stopped);", str(text or ""), re.M)
+    """`status` output as {"cluster": "running"|"stopped", "keeper": "running"|"stopped"|None, "runs": {label:
+    {"state", "stored"}}}; None when it cannot be read (no cluster line, or a running cluster without a line for
+    every label)."""
+    m = re.search(r"^cluster \S+: (running|stopped);(.*)$", str(text or ""), re.M)
     if not m:
         return None
+    km = re.search(r"\bkeeper: (running|stopped)", m.group(2))
     runs = {}
     if m.group(1) == "running":
         for lb in labels:
@@ -181,7 +183,26 @@ def parse_status(text, labels):
             sm = re.search(r"\bstored=(\S+)", lm.group(2))
             stored = sm.group(1) if sm and sm.group(1) != "None" else None
             runs[lb] = {"state": lm.group(1), "stored": stored}
-    return {"cluster": m.group(1), "runs": runs}
+    return {"cluster": m.group(1), "keeper": km.group(1) if km else None, "runs": runs}
+
+
+def notices(st, seen, keeper_wanted=True) -> list:
+    """[(kind, message)] for what a running launch's status shows that someone should know, each once (`seen` is
+    updated in place): a run whose task died on its VM, and a keeper that has stopped while the run cluster is up.
+    Reported only; the watch stops and relaunches nothing for either."""
+    out = []
+    if not st or st["cluster"] != "running":
+        return out
+    for lb, r in st["runs"].items():
+        if r["state"] == "dead" and ("run_dead", lb) not in seen:
+            seen.add(("run_dead", lb))
+            out.append(("run_dead", f"{lb}: its task died on its VM without a result (no heartbeat, or its process "
+                                    f"is gone); nothing stopped or relaunched: fetch `checkpoint --label {lb}`"))
+    if keeper_wanted and st.get("keeper") == "stopped" and "keeper_stopped" not in seen:
+        seen.add("keeper_stopped")
+        out.append(("keeper_stopped", "the keeper has stopped while the run cluster is up: the compute pool is no "
+                                      "longer scaled; start it by hand with `keeper` after checking `status`"))
+    return out
 
 
 def decide(st) -> str:
@@ -199,6 +220,8 @@ def missing_action(st, missing_since, relaunched, now, window_s):
     if not st or st["cluster"] != "running":
         return None
     for lb, r in st["runs"].items():
+        if r["state"] == "unknown":       # this poll could not read the label: its timer neither starts nor resets
+            continue
         if r["state"] != "missing":
             missing_since.pop(lb, None)
             continue
@@ -420,6 +443,7 @@ class Watch:
 
     def watch(self) -> int:
         self.start, missing_since, relaunched, attempts = self.clock(), {}, set(), {}
+        noticed = set()
         while True:
             if self.over_limit():
                 where = self.final_checkpoint(self.record())
@@ -439,6 +463,8 @@ class Watch:
             st = parse_status(out, self.cfg.labels) if code == 0 else None
             act = decide(st)
             self.log(f"status: {act} " + (json.dumps(st) if st else ""))
+            for kind, msg in notices(st, noticed, self.cfg.keeper):
+                self.log(f"NOTICE {kind}: {msg}")
             if act == "collect":
                 return self.finish(rec)
             m = missing_action(st, missing_since, relaunched, self.clock(), self.start_s)
@@ -1033,6 +1059,35 @@ def _self_test() -> int:
                   and missing_action(st, ms, set(), 301.0, 300) == ("relaunch", "A")
                   and missing_action(st, {"A": 0.0}, {"A"}, 301.0, 300) == ("never_ran", "A"))(
              parse_status(status_text(c, {"A": "missing", "B": "running"}), ("A", "B")), {}))
+    # v2 autonomy 1E-ii: a VM still installing is "preparing", never relaunched; a dead run and a stopped keeper
+    # are each said once; neither stops anything
+    case("LW7c", "LW_PREPARING_NO_RELAUNCH missing_action: a run preparing past the window is not relaunched",
+         lambda: (lambda st: st["runs"]["A"]["state"] == "preparing" and decide(st) == "watch"
+                  and missing_action(st, {"A": 0.0}, set(), 9999.0, 300) is None)(
+             parse_status(status_text(c, {"A": "preparing", "B": "running"}), ("A", "B"))))
+    case("LW7f", "missing_action: a poll that could not read the label (unknown) keeps its missing timer (Codex "
+         "round 2 of 1E-ii)",
+         lambda: (lambda ms: missing_action(parse_status(status_text(c, {"A": "unknown"}), ("A",)), ms, set(), 200.0,
+                                            300) is None and ms == {"A": 0.0}
+                  and missing_action(parse_status(status_text(c, {"A": "missing"}), ("A",)), ms, set(), 301.0, 300)
+                  == ("relaunch", "A"))({"A": 0.0}))
+    case("LW7d", "LW_KEEPER_STOPPED parse_status reads the keeper's state",
+         lambda: parse_status(status_text(c, {"A": "running"}), ("A",))["keeper"] == "running"
+         and parse_status(status_text(c, {"A": "running"}).replace("keeper: running", "keeper: stopped"),
+                          ("A",))["keeper"] == "stopped")
+
+    def notice_case():
+        seen = set()
+        st = parse_status(status_text(c, {"A": "dead", "B": "running", "C": "unknown"}).replace(
+            "keeper: running", "keeper: stopped"), ("A", "B", "C"))
+        first, again = notices(st, seen, keeper_wanted=True), notices(st, seen, keeper_wanted=True)
+        ok_st = parse_status(status_text(c, {"A": "running", "B": "running"}), ("A", "B"))
+        return (len(first) == 2 and any(k == "run_dead" and "A" in m for k, m in first)
+                and any(k == "keeper_stopped" for k, m in first) and again == []
+                and notices(ok_st, set(), keeper_wanted=True) == [] and notices(None, set(), keeper_wanted=True) == []
+                and [k for k, _ in notices(st, set(), keeper_wanted=False)] == ["run_dead"] and decide(st) == "watch")
+    case("LW7e", "LW_DEAD_PID_DETECTED notices: a dead run and a stopped keeper are each reported once; the watch "
+         "goes on", notice_case)
     case("LW7b", "end to end: missing, relaunch, still missing: exit 2, nothing stopped",
          lambda: (lambda r: r[0] == EXIT_NEVER_RAN and "relaunch" in runs(r[1]) and stops(r[1]) == [])(
              scenario(0, record, lambda cfg: {"status": [(0, status_text(cfg, {"A": "missing", "B": "running"}))]})))

@@ -29,7 +29,9 @@ PARTIAL_STATUSES = {"completed_scope_declared", "completed_gate_not_accepted",
                     "awaiting_signoff",   # Phase 33: resumable with --resume once signed
                     # Phase 49 β: waiting for the owner on decision-bearing declarations
                     # (resumable), and the owner declined one with no rounds left.
-                    "awaiting_scope_signoff", "completed_scope_declined"}
+                    "awaiting_scope_signoff", "completed_scope_declined",
+                    # lead-gaps β: a --signoff lead run that continued in the child run its provisional amendment made
+                    "amended_provisional"}
 
 
 def gate_command(run_path: str, max_rounds: int, current_round: int, post_write: bool,

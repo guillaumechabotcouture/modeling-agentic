@@ -472,6 +472,12 @@ class SdkTasks:
         self.query_fn = query_fn
         self.n = 0
 
+    def for_run_dir(self, run_dir: str) -> "SdkTasks":
+        """The same tasks for another run dir (lead-gaps β: the child run a provisional lead amendment continues in),
+        with this one's settings; its own budget ledger is the child's."""
+        return SdkTasks(run_dir, allow_cloud=self.cloud, task_cap_usd=self.cap, max_turns=self.turns,
+                        query_fn=self.query_fn)
+
     def set_allowance(self, usd: float, readback_usd: float | None = None) -> None:
         """The call's dollar cap, and the cap of one crash read-back (0: none; the whole allowance
         is then charged when a crashed session's cost is unknown)."""
@@ -998,6 +1004,12 @@ def _self_test() -> int:
         # Codex review of #341 (P1-6): the worker writes only the in-scope files its validated plan names
         ok(got["fix"][1] == ("analysis_settings.yaml",) and "edit only analysis_settings.yaml" in got["fix:system"],
            f"S_FIX_TASK_FILES a fix task owns the files its plan names, and its prompt says so ({got['fix']})")
+        # S_FOR_RUN_DIR (lead-gaps β): the tasks move to a child run with the same settings, rooted in the child
+        t5 = SdkTasks(d, allow_cloud=True, task_cap_usd=2.5, max_turns=7, query_fn=rec_session)
+        c5 = t5.for_run_dir(os.path.join(d, "child"))
+        ok(c5.run_dir == os.path.join(os.path.abspath(d), "child") and c5.io_root == c5.run_dir
+           and (c5.cloud, c5.cap, c5.turns, c5.query_fn) == (True, 2.5, 7, rec_session),
+           "S_FOR_RUN_DIR the tasks for a child run keep the settings and are rooted in the child")
         # S_EVIDENCE_OWNS (v2 autonomy 1B-ii): the evidence task owns the default dossier only, never another file a
         # spec names, and gets the check's problems; the spec task may not write the dossier
         SdkTasks._session = rec_session
