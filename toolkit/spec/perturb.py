@@ -87,6 +87,8 @@ def compile(dt: dict) -> dict:  # noqa: A001 -- the alias compiler
         return copy.deepcopy(dt)
     if t not in ALIASES:
         raise ValueError(f"decision test {dt.get('id')}: unknown type {t!r}")
+    if clash(dt):
+        raise ValueError(f"decision test {dt.get('id')}: {clash(dt)}")
     kind, rest = ALIASES[t], {k: v for k, v in dt.items() if k != "type"}
     tgt = {"target": kind}
     targets = [tgt]
@@ -109,7 +111,7 @@ def compile(dt: dict) -> dict:  # noqa: A001 -- the alias compiler
                 tgt[k_to] = rest.pop(k_from)
     elif t in NESTED:
         b = rest.get(NESTED[t])
-        if isinstance(b, dict) and "target" not in b and "name" not in b:
+        if isinstance(b, dict) and b and "target" not in b and "name" not in b:     # absent or {} stays as given
             rest.pop(NESTED[t])
             tgt.update({("name" if (k == "column" and kind == "unit_column") else k): v for k, v in b.items()})
     else:                                   # interaction, envelope, boundary_engine, anchor: flat fields
@@ -118,6 +120,14 @@ def compile(dt: dict) -> dict:  # noqa: A001 -- the alias compiler
             if k in rest:
                 tgt[k] = rest.pop(k)
     return {"type": TYPE, "alias": t, "set": targets, **rest}
+
+
+def clash(dt) -> str:
+    """Why a test of an older type cannot be compiled: it holds a field the `perturb` form itself uses ('' if none)."""
+    if not isinstance(dt, dict) or dt.get("type") == TYPE:
+        return ""
+    got = sorted(k for k in META if k != "type" and k in dt)
+    return f"fields {got} belong to a perturb test (type: perturb), not to a {dt.get('type')} test" if got else ""
 
 
 def view(p: dict) -> dict:
@@ -136,6 +146,8 @@ def _view(p: dict) -> dict:
     targets = p["set"]
     kinds = {t["target"] for t in targets}
     alias = p.get("alias")
+    if not alias and len(kinds) != 1:
+        raise ValueError("no target, or mixed targets")
     kind = ALIASES[alias] if alias else next(iter(kinds))
     if kinds - {kind} or (not targets and kind != "cost_item"):
         raise ValueError("mixed targets")
@@ -155,9 +167,10 @@ def _view(p: dict) -> dict:
         for k_from, k_to in (("remove", "rule"), ("add", "add")):
             if k_from in first:
                 out[k_to] = first[k_from]
-    elif out["type"] in NESTED and NESTED[out["type"]] not in out:     # a block compile could not read stays as given
-        out[NESTED[out["type"]]] = {("column" if (k == "name" and kind == "unit_column") else k): v
-                                    for k, v in first.items() if k != "target"}
+    elif out["type"] in NESTED:
+        if NESTED[out["type"]] not in out and len(first) > 1:    # a block compile left as given (or none) stays so
+            out[NESTED[out["type"]]] = {("column" if (k == "name" and kind == "unit_column") else k): v
+                                        for k, v in first.items() if k != "target"}
     else:
         out.update({k: v for k, v in first.items() if k != "target"})
     if len(targets) > 1 and kind not in ("parameter", "cost_item"):
@@ -202,31 +215,88 @@ def problems(p: dict) -> list[str]:
                        "fitted_range_); a spec sets values")
         elif extra:
             bad.append(f"decision test {i}: target {k} does not take {extra} (it takes {sorted(FIELDS[k])})")
-        if k == "parameter":
-            op = "values" if n == 0 else "value"
-            if set(t) & {"values", "value"} != {op}:
-                bad.append(f"decision test {i}: the {'first' if n == 0 else 'held'} parameter target sets {op}"
-                           + (" (the values swept)" if n == 0 else " (one number, held in every case)"))
-            elif n and not _isnum(t["value"]):
-                bad.append(f"decision test {i}: held parameter {t.get('name')!r}: value is a finite number")
-            if not isinstance(t.get("name"), str) or not t.get("name"):
-                bad.append(f"decision test {i}: a parameter target names its engine parameter (name)")
-        elif k == "unit_column" and len(set(t) & set(UNIT_OPS)) != 1:
-            bad.append(f"decision test {i}: a unit_column target takes exactly one of {', '.join(UNIT_OPS)}")
-        elif k == "cost_item" and not (_isnum(t.get("scale")) and t["scale"] > 0):
-            bad.append(f"decision test {i}: cost item {t.get('name')!r}: scale is a positive number")
-        elif k == "group_rule" and len(set(t) & {"remove", "add"}) != 1:
-            bad.append(f"decision test {i}: a group_rule target takes remove or add")
+        bad += [f"decision test {i}: target {k}: {e}" for e in _field_problems(k, t, n)]
     ks = set(kinds)
     if len(ts) > 1 and not (ks == {"parameter"} or ks == {"cost_item"}):
         bad.append(f"decision test {i}: targets {sorted(map(str, ks))} cannot be applied together (several targets: "
                    "parameters, the first swept and the others held, or cost items, one price case)")
-    names = [str(t.get("name")) for t in ts if t.get("target") in ("parameter", "cost_item")]
-    if len(set(names)) != len(names):
-        bad.append(f"decision test {i}: a target is named twice ({sorted({x for x in names if names.count(x) > 1})})")
+    names = [t.get("name") for t in ts if t.get("target") in ("parameter", "cost_item") and _isname(t.get("name"))]
+    if len(set(names)) != len(names) or len({str(x) for x in names}) != len(names):    # 1 and 1.0 are one key
+        bad.append(f"decision test {i}: a target is named twice ({names})")
     if "conditional" in p and p["conditional"] is not conditional(p):
         bad.append(f"decision test {i}: conditional is {conditional(p)} for this set (true exactly when a second "
                    "parameter is held); it is derived, so leave it out or state it as derived")
+    return bad
+
+
+def _isname(x) -> bool:
+    return (isinstance(x, str) and bool(x.strip())) or (isinstance(x, int) and not isinstance(x, bool))
+
+
+def _nums(x, lo=None, hi=None, strict_lo=True, extra=()) -> bool:
+    """A non-empty list of finite numbers within (lo, hi] (or [lo, hi] when not strict_lo), or of the `extra` words."""
+    return isinstance(x, list) and bool(x) and all(
+        v in extra if isinstance(v, str) else _isnum(v) and (lo is None or (v > lo if strict_lo else v >= lo))
+        and (hi is None or v <= hi) for v in x)
+
+
+def _field_problems(k, t, n) -> list:
+    """What a target of kind k (the n-th of its set) must hold, so a test that validates runs as written (W0-B review
+    r1): names, lists of numbers where the runner sweeps, mappings where it reads one."""
+    bad = []
+    if k in ("parameter", "cost_item", "unit_column") and not _isname(t.get("name")):
+        bad.append("name: the engine parameter, cost item or column it moves")
+    if k == "parameter":
+        op = "values" if n == 0 else "value"
+        if set(t) & {"values", "value"} != {op}:
+            bad.append(f"the {'first' if n == 0 else 'held'} parameter target sets {op}"
+                       + (" (the values swept)" if n == 0 else " (one number, held in every case)"))
+        elif not (_nums(t["values"]) if n == 0 else _isnum(t["value"])):
+            bad.append("values: a non-empty list of finite numbers" if n == 0 else "value: a finite number")
+    elif k == "unit_column":
+        ops = set(t) & set(UNIT_OPS)
+        if len(ops) != 1:
+            bad.append(f"exactly one of {', '.join(UNIT_OPS)}")
+        elif "set_from" in ops and not _isname(t["set_from"]):
+            bad.append("set_from: a table in the run directory")
+        elif "set_from" not in ops and not _nums(t[next(iter(ops))]):
+            bad.append(f"{next(iter(ops))}: a non-empty list of finite numbers")
+        if "units" in t and t["units"] != "all" and not (isinstance(t["units"], list) and t["units"]):
+            bad.append("units: all or a non-empty list of unit ids")
+    elif k == "cost_item" and not (_isnum(t.get("scale")) and t["scale"] > 0):
+        bad.append("scale: a positive number")
+    elif k == "group_rule":
+        if len(set(t) & {"remove", "add"}) != 1:
+            bad.append("remove or add")
+        elif "remove" in t and not _isname(t["remove"]):
+            bad.append("remove: a constraints.group_rules id")
+        elif "add" in t and not (isinstance(t["add"], dict) and t["add"]):
+            bad.append("add: the rule to add (a mapping)")
+    elif k == "envelope" and not _nums(t.get("values"), lo=0):
+        bad.append("values: a non-empty list of positive envelopes")
+    elif k == "interaction":
+        if not _isname(t.get("benchmark")):
+            bad.append("benchmark: the engine benchmark whose arms set the interaction")
+        for f in ("components", "with_any"):
+            if not (isinstance(t.get(f), list) and t[f] and all(_isname(c) for c in t[f])):
+                bad.append(f"{f}: a non-empty list of components")
+        if not _nums(t.get("values"), lo=0):
+            bad.append("values: a non-empty list of positive interaction odds ratios")
+    elif k == "outcome":
+        if not (_isname(t.get("component")) and _isname(t.get("reference"))):
+            bad.append("component and reference: two components")
+        if not _nums(t.get("values"), lo=0, extra=("engine",)):
+            bad.append("values: positive ratios, or \"engine\"")
+    elif k == "burden":
+        if not (isinstance(t.get("references"), list) and t["references"]):
+            bad.append("references: a non-empty list of validation.burden row ids")
+        if not _nums(t.get("shares"), lo=0, hi=1):
+            bad.append("shares: numbers in (0, 1]")
+    elif k == "calibration_target":
+        if not (isinstance(t.get("units"), list) and t["units"]):
+            bad.append("units: a non-empty list of unit ids")
+        if not (_isnum(t.get("scale")) and t["scale"] > 0):
+            bad.append("scale: a positive number")
     return bad
 
 
@@ -252,18 +322,26 @@ def cases(p: dict) -> int:
     return len(x.get("values") or [])
 
 
-def layer(p: dict, evaluation: str, n_units: int, n_packages: int) -> dict:
+def layer(p: dict, evaluation: str, n_units: int, n_packages: int, n_cases: int | None = None) -> dict:
     """Where a test acts and what it costs: {layer, cases, engine_rows}. post_emulator: re-solved on the point
     outputs; emulator_design: the emulator evaluated inside its design box; engine: each case evaluates every unit and
-    package on the engine (direct evaluation)."""
+    package on the engine (direct evaluation). `n_cases`: the cases a run evaluated (rejected ones excluded); without
+    it, the cases requested. An outcome value "engine" re-evaluates the model (the base adjustment removed)."""
     q = compile(p)
-    kind = (q.get("set") or [{}])[0].get("target") if q.get("set") else ALIASES.get(q.get("alias"), "cost_item")
+    first = (q.get("set") or [{}])[0]
+    kind = first.get("target") if q.get("set") else ALIASES.get(q.get("alias"), "cost_item")
     try:
-        n = cases(q)
+        n = cases(q) if n_cases is None else int(n_cases)
     except (TypeError, AttributeError, ValueError):      # a malformed test is refused by its own branch, not here
         n = None
-    lay = "post_emulator" if kind not in EVALUATED else "emulator_design" if evaluation == "emulator" else "engine"
-    rows = 0 if lay != "engine" else None if n is None else int(n) * int(n_units) * int(n_packages)
+    ev = n
+    if kind == "outcome":
+        vals = first.get("values") if isinstance(first.get("values"), list) else []
+        ev = sum(v == "engine" for v in vals)
+        ev = min(ev, n) if (ev and n is not None) else ev
+    evaluated = kind in EVALUATED or (kind == "outcome" and ev)
+    lay = "post_emulator" if not evaluated else "emulator_design" if evaluation == "emulator" else "engine"
+    rows = 0 if lay != "engine" else None if ev is None else int(ev) * int(n_units) * int(n_packages)
     return {"layer": lay, "cases": n, "engine_rows": rows}
 
 
@@ -302,6 +380,7 @@ def _self_test() -> int:
                                                                  "values": [0.5, "engine"]}},
         {"id": "DTb", "type": "burden_scale", "burden_scale": {"references": ["r1"], "shares": [0.5, 1.0]}},
         {"id": "DTbe", "type": "boundary_engine", "text": "t"},
+        {"id": "BS", "type": "burden_scale"}, {"id": "BS0", "type": "burden_scale", "burden_scale": {}},
         {"id": "anchor_range_N", "type": "anchor_range", "anchors": ["N0"], "values": [0.025, 0.975],
          "ends": {0.025: {"anchor:N0": 1.0}, 0.975: {"anchor:N0": 2.0}}, "automatic": True},
     ]
@@ -373,13 +452,40 @@ def _self_test() -> int:
     refused(dict(nat, conditional=False), "conditional is True", "PT19 a joint test cannot declare conditional: false")
     ok(not problems(dict(nat, conditional=True)), "PT19b conditional: true on a joint test is accepted")
     bad_view = {"id": "a", "type": "perturb", "set": "junk"}
-    ok(view(bad_view) is bad_view, "PT20 an unreadable perturb test is left to validation (view returns it)")
+    empty = {"id": "a", "type": "perturb", "set": []}
+    ok(view(bad_view) is bad_view and view(empty) is empty,
+       "PT20 an unreadable or empty perturb test is left to validation (view returns it, never raises)")
+    # review r1: a test that validates runs as written
+    for label, tg in (("a cost item without a name", {"target": "cost_item", "scale": 2}),
+                      ("a sweep that is a string", {"target": "parameter", "name": "p", "values": "12"}),
+                      ("a sweep holding a word", {"target": "parameter", "name": "p", "values": ["bad"]}),
+                      ("an envelope mapping", {"target": "envelope", "values": {9000: "low"}}),
+                      ("an interaction without its components", {"target": "interaction", "benchmark": "T2",
+                                                                 "values": [1]}),
+                      ("a zero interaction", {"target": "interaction", "benchmark": "T2", "components": ["b"],
+                                              "with_any": ["a"], "values": [0]}),
+                      ("a group rule add that is not a mapping", {"target": "group_rule", "add": True})):
+        ok(problems({"id": "a", "type": "perturb", "set": [tg]}) != [], f"PT22 refused: {label}")
+    refused({"id": "a", "type": "perturb", "set": [{"target": "cost_item", "name": 1, "scale": 2},
+                                                   {"target": "cost_item", "name": "1", "scale": 3}]},
+            "named twice", "PT23 cost items 1 and \"1\" are one key, refused as named twice")
+    try:
+        compile({"id": "e", "type": "envelope", "values": [6e6], "set": [{"target": "envelope", "values": [10]}]})
+        ok(False, "PT24 an older type holding a perturb field (set) is refused, not overwritten")
+    except ValueError as e:
+        ok("belong to a perturb test" in str(e), f"PT24 an older type holding a perturb field is refused: {e}")
+    neng = {"id": "o", "type": "perturb", "set": [{"target": "outcome", "component": "a", "reference": "b",
+                                                    "values": [0.5, "engine"]}]}
+    ok(layer(neng, "direct", 6, 2) == {"layer": "engine", "cases": 2, "engine_rows": 12}
+       and layer(nat, "direct", 10, 4, n_cases=1)["engine_rows"] == 40,
+       f"PT25 an outcome value engine evaluates the model; a run's rows count only the cases it evaluated: "
+       f"{layer(neng, 'direct', 6, 2)}")
 
     # DT_PERTURB_LAYER_COST: the layer each test acts on and its engine rows
     ok(layer(nat, "emulator", 10, 4) == {"layer": "emulator_design", "cases": 2, "engine_rows": 0}
        and layer(nat, "direct", 10, 4) == {"layer": "engine", "cases": 2, "engine_rows": 80}
        and layer(by_id["env"], "direct", 10, 4)["layer"] == "post_emulator"
-       and layer(by_id["DTo"], "emulator", 10, 4) == {"layer": "post_emulator", "cases": 2, "engine_rows": 0}
+       and layer(by_id["DTb"], "emulator", 10, 4) == {"layer": "post_emulator", "cases": 2, "engine_rows": 0}
        and layer(nu, "direct", 5, 3)["engine_rows"] == 15 and layer(nc, "direct", 5, 3)["engine_rows"] == 15,
        "PT21 DT_PERTURB_LAYER_COST: post_emulator, emulator_design or engine, with the engine row count")
 

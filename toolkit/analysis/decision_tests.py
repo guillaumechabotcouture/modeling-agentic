@@ -734,7 +734,7 @@ def _unit_attribute(A, dt, z0, ben0, cost0, plan) -> dict:
         cases.append((v, ben, cost, None, None))
         arms.append(A2)
     how = {"values": "set to each tested value", "scale": "multiplied by each tested factor",
-           "set_from": "set per unit from the table named"}[info["mode"]]
+           "shift": "shifted by each tested amount", "set_from": "set per unit from the table named"}[info["mode"]]
     varied = (f"units-table column {info['column']} (engine unit attribute {', '.join(info['attributes'])}) {how} in "
               f"{'every unit' if info['units'] == 'all' else 'the listed units'}; the calibration "
               + ("redone on the modified table" if recal else "held at the headline values"))
@@ -969,7 +969,8 @@ def run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
     rec = _run_one(A, PT.view(p), z0, ben0, cost0, plan, uq_data, out0)
     if dt.get("type") == PT.TYPE:
         rec["type"] = PT.TYPE
-    rec["perturb"] = dict(p, layer=PT.layer(p, getattr(A.model, "kind", None), len(A.ids), len(A.pk)))
+    n = len(rec.get("results") or []) if rec.get("status") == "run" else 0     # the cases evaluated, not requested
+    rec["perturb"] = dict(p, layer=PT.layer(p, getattr(A.model, "kind", None), len(A.ids), len(A.pk), n_cases=n))
     return rec
 
 

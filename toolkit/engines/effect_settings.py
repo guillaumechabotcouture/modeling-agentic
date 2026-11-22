@@ -166,10 +166,9 @@ def tested_by(raw, row) -> list:
     out = []
     for t in PT.tests(raw.get("analysis")):
         ua = t.get("unit_attribute") if t.get("type") == "unit_attribute" else None
-
         if not isinstance(ua, dict) or str(ua.get("column")) != row["column"]:
             continue
-        us = ua.get("units")
+        us = ua.get("units", "all")      # the runner's default: every unit (W0-B review r1)
         if us == "all" or (isinstance(us, list) and set(map(str, us)) & set(row["outside_units"])):
             out.append(str(t.get("id")))
     return out
