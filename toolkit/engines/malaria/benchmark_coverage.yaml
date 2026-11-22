@@ -29,7 +29,11 @@ benchmarks:
        note: "PBO vs pyrethroid nets, prevalence at 9 months (Protopopoff 2018)"}
   B9b: {covers: {net: [pbo]}, estimand: durability, versus: {net: pyr},
         note: "PBO vs pyrethroid nets at 21 months (Protopopoff 2018)"}
+  # W0-C: every training target of the effect fit (benchmarks/effect_fit.yaml) names the parameters carrying its
+  # effect (effect_fit.coverage_problems): B9c, B10, B11 and B12-B12m gained theirs
   B9c: {covers: {net: [pbo]}, estimand: durability, versus: {net: pyr},
+        effect_parameters: [{name: pbo_gain_scale, from_version: "0.17"}, {name: pbo_adv_decay, from_version: "0.17"},
+                            {name: net_kill_shift, from_version: "0.17"}, {name: net_deter_sat, from_version: "0.18"}],
         note: "PBO vs pyrethroid nets at 24 months (Mosha 2022, Misungwi)"}
   # F6 option A: the new rows name the engine parameters carrying their effect, so an owner-signed departure's
   # parameter_value test can address a miss (Codex r1 on #266)
@@ -51,14 +55,16 @@ benchmarks:
                             {name: net_deter_sat, from_version: "0.18"}],
         note: "Dual-AI vs PBO nets, prevalence OR at 24 months (Mosha 2022, Misungwi; derived from B10 and B9c)"}
   B10: {covers: {net: [dual]}, estimand: effect_vs_component, versus: {net: pyr},
+        effect_parameters: [cfp_kill, cfp_half, {name: net_kill_shift, from_version: "0.17"}],
         note: "Dual-AI vs pyrethroid nets, prevalence at 24 months (Mosha 2022)"}
   B11: {covers: {net: [dual]}, estimand: effect_vs_component, versus: {net: pyr},
+        effect_parameters: [cfp_kill, cfp_half, {name: net_kill_shift, from_version: "0.17"}],
         note: "Dual-AI vs pyrethroid nets, incidence 0-24 months (Accrombessi 2023)"}
-  B12: {covers: {irs: [1]}, estimand: effect_vs_none,
+  B12: {covers: {irs: [1]}, estimand: effect_vs_none, effect_parameters: [irs_kill],
         note: "Non-pyrethroid IRS added to pyrethroid nets vs nets alone, prevalence (Pryce 2022 Cochrane)"}
-  B12b: {covers: {irs: [1]}, estimand: effect_vs_none,
+  B12b: {covers: {irs: [1]}, estimand: effect_vs_none, effect_parameters: [irs_kill],
          note: "Non-pyrethroid IRS added to nets, incidence (Pryce 2022)"}
-  B12m: {covers: {irs: [1]}, estimand: effect_vs_none,
+  B12m: {covers: {irs: [1]}, estimand: effect_vs_none, effect_parameters: [irs_kill],
          note: "Pirimiphos-methyl IRS added to pyrethroid nets, prevalence at 9 months (Protopopoff 2018)"}
   B13: {covers: {smc: [1]}, estimand: effect_vs_none,
         note: "SMC vs none, in-season clinical incidence 3-59 months (Thwing 2024)"}
