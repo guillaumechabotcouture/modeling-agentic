@@ -84,7 +84,7 @@ targets:
     scale: odds_ratio
     window: m9
     population: 6 months to 14 years
-    measurement: RDT
+    measurement: RDT (engine reads microscopy)
 # owner, 2026-11-19 (refit b): one global PBO waning rate cannot carry Muleba's durable effect with LLINEUP's waning,
 # so B9 and B9b are monitored, never used to choose (OPTION_A["departure"])
 monitor: [B9, B9b]
@@ -115,6 +115,10 @@ acceptance:            # owner, 14 Nov (ACCEPTANCE_RULE), unchanged by the 20 No
   pick_seed: 43
   sample_n: 2000
   control_tolerance: 0.10
+  # must_meet is empty: under the conflict rule (owner default D5, #312) a target no candidate can meet is declared
+  # and tested (status accepted_with_conflicts), where net_effect_fit.finalize rejected the whole sample. Listing the
+  # ten targets here restores the 14 Nov all-targets rule; that choice is the owner's (open in W0-C (ii))
+  must_meet: []
 edge_checks:           # owner, 19 Nov: a chosen pbo_adv_decay near its ceiling, with LLINEUP's targets at that point
   - {param: pbo_adv_decay, side: hi, within: 0.02, targets: [B9d, B9e, B9f],
      basis: "99% interval of LLINEUP's waning minus the engine's own waning at x = 0.30 (owner, 2026-11-19, option (a))"}

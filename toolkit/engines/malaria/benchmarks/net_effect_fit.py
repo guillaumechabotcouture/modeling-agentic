@@ -2835,7 +2835,10 @@ def _self_test() -> int:
 
 def _self_test_declaration(ok, p: dict) -> None:
     """NE_DECL (W0-C): effect_fit.yaml, the pack's declaration for the generic core, states this module's option A
-    constants; the core's acceptance statistic and verdicts agree with ACCEPTANCE_RULE's here (no engine run)."""
+    constants; the core's acceptance statistic and verdicts agree with ACCEPTANCE_RULE's here on the same values (no
+    engine run). A declared difference: this script's runner rows carry per-seed values rounded to 4 decimals, the
+    core's adapter reads them unrounded, so a value within 5e-5 of a band edge can be judged differently on a new run
+    (a replay from a stored cache reads the stored values)."""
     from toolkit.engines import effect_fit as EF
     decl, pk, cov, ver = EF.pack_files(os.path.join(HERE, "effect_fit.yaml"))
     probs = EF.declaration_problems(decl, pk) + EF.coverage_problems(decl, cov, ver)
@@ -2854,6 +2857,9 @@ def _self_test_declaration(ok, p: dict) -> None:
        and decl["history_matching"]["candidate_seed"] == v1["candidate_seed"] and a["pick_seed"] == v1["pick_seed"]
        and a["verify_n"] == VERIFY and a["sample_n"] == SAMPLE and a["control_tolerance"] == CAL_TOL
        and abs(EF.z_of(a["level"]) - Z95) < 1e-3
+       and decl["history_matching"]["cutoff"] == -1.0       # the 20 Nov round's --margin-loo (FV4 checks its launch)
+       and decl["edge_checks"] == [{"param": PAD_CEILING["param"], "side": "hi", "within": 0.02,   # edge_diagnostic
+                                    "targets": ["B9d", "B9e", "B9f"], "basis": decl["edge_checks"][0]["basis"]}]
        and decl["edge_checks"][0]["param"] == PAD_CEILING["param"]
        and decl["parameters"][PAD_CEILING["param"]]["box"] == [PAD_CEILING["lo"], PAD_CEILING["hi"]],
        f"NE_DECL effect_fit.yaml states option A's targets, monitors, boxes, waves, seeds and acceptance {probs}")

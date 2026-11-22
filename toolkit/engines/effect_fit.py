@@ -44,11 +44,10 @@ status is `accepted_with_conflicts`, for the conflict rule to declare and test. 
 two meetable targets with no joint candidate, fewer verified points than declared, or any verified point failing
 the rule makes it `rejected`, and its sample is withdrawn (`sample_status` invalid).
 
-The record (`write_record`) holds the chosen point, the joint region (hull, box-edge flags, correlation, sample and
-`sample_status`), per-target implausibility and verified intervals, monitor values, failures, conflicts, the
-declaration and target digests, the engine identity and the engine-row cache digest. The spec references it by the
-file's sha256 (`read_record` refuses any other bytes). Engine rows are cached under a scope digest of the targets'
-declarations, the engine identity and the seeds, so a changed estimand or engine never reuses a row.
+The record (`write_record`; the spec references it by sha256, `read_record` refuses other bytes) holds the point,
+`joint_region` (hull, edge flags, correlation, sample, `sample_status`), per-target implausibility and verified
+intervals, monitors, failures, conflicts, target digests, engine identity and cache digest. Engine rows are keyed by
+the targets' resolved declarations, the engine identity and the seeds: a changed estimand or engine reuses none.
 """
 from __future__ import annotations
 
@@ -142,15 +141,17 @@ def estimand_problems(tid: str, est, bench: dict | None, pack: dict) -> list:
             out.append(f"{tid}: contrast {c['treatment']} vs {c['comparator']} is not the pack's {e.get('num')} vs "
                        f"{e.get('den')}")
     arms = [a for k in ("num", "den") for a in (e.get(k) if isinstance(e.get(k), list) else [e.get(k)])]
-    gone = sorted(str(a) for a in arms if (pack.get("arms") or {}).get(a, {}).get("setting") not in
-                  (pack.get("settings") or {}))
+    A, S = pack.get("arms") or {}, pack.get("settings") or {}
+    gone = sorted(str(a) for a in arms if not (isinstance(a, str) and isinstance(A.get(a), dict)
+                                                 and isinstance(A[a].get("setting"), str) and A[a]["setting"] in S))
     if gone:
         out.append(f"{tid}: arms {gone} are not arms of the pack with a declared setting")
-    if e.get("value") and e.get("values"):
+    if "value" in e and "values" in e:
         out.append(f"{tid}: the pack's estimand gives both value and values (ambiguous outcome)")
     w = est.get("window")
     if _txt(w) and not gone:
-        paths = [e["value"]] if e.get("value") else [v.get("path") for v in e.get("values") or [] if isinstance(v, dict)]
+        paths = [e.get("value")] if "values" not in e else [v.get("path") if isinstance(v, dict) else None
+                                                            for v in e.get("values") or [None]]
         used = {_window_of(p) for p in paths}
         if used != {w}:
             out.append(f"{tid}: window {w!r} is not the window its outcome is read over {sorted(map(str, used))}")
@@ -344,7 +345,8 @@ def design_points(decl: dict) -> tuple:
         U = BM.lhs(int(w["n"]), len(names), int(w["seed"]))
         if i == 0:
             U = np.vstack([U, np.full((1, len(names)), 0.5)])
-        pts += [{k: round(float(wb[j, 0] + u[j] * (wb[j, 1] - wb[j, 0])), 9) for j, k in enumerate(names)} for u in U]
+        th = np.clip(wb[:, 0] + U * (wb[:, 1] - wb[:, 0]), wb[:, 0], wb[:, 1])
+        pts += [{k: float(x[j]) for j, k in enumerate(names)} for x in th]
         support.append({k: [float(wb[j, 0]), float(wb[j, 1])] for j, k in enumerate(names)})
     return pts, support
 
@@ -366,7 +368,7 @@ class Cache:
 
     @staticmethod
     def key(scope: str, theta: dict) -> str:
-        return _sha({"scope": scope, "theta": {k: round(float(v), 9) for k, v in sorted(theta.items())}})
+        return _sha({"scope": scope, "theta": {k: repr(float(v)) for k, v in sorted(theta.items())}})   # exact
 
     def get(self, scope: str, theta: dict):
         return self.rows.get(self.key(scope, theta))
@@ -390,14 +392,14 @@ def evaluate(points: list, evaluator, ids: list, cache: Cache, scope: str, n_see
     for th in points:
         r = cache.get(scope, th)
         if r is None:
-            res = evaluator(dict(th), list(ids))
+            r = evaluator(dict(th), list(ids))
             calls += 1
-            bad = {t: seed_values_problem((res.get("per_seed") or {}).get(t), n_seeds) for t in ids}
-            bad = {t: w for t, w in bad.items() if w}
-            if bad:      # fail closed: a design or verified row is one finite positive value per declared seed
-                raise ValueError(f"evaluator rows at {th}: {bad}")
-            cache.put(scope, th, res)
-            r = cache.get(scope, th)
+        bad = {t: seed_values_problem((r.get("per_seed") or {}).get(t), n_seeds) for t in ids}
+        bad = {t: w for t, w in bad.items() if w}
+        if bad:      # fail closed, cached or not: a row is one finite positive value per declared seed
+            raise ValueError(f"engine rows at {th}: {bad}")
+        if cache.get(scope, th) is None:
+            cache.put(scope, th, r)
         rows.append({"theta": dict(th), "per_seed": r["per_seed"], "controls": r.get("controls") or {}})
     return rows, calls
 
@@ -408,15 +410,14 @@ def _geo_log(v) -> float:
 
 def candidates(decl: dict, support: list, rows: list) -> np.ndarray:
     """Dense candidates (parameter units) inside each wave's box, each wave covered on its own, plus every
-    engine-evaluated point; rounded to 9 decimals and clipped to their wave's box, so no candidate leaves the
-    support."""
+    engine-evaluated point; clipped to their wave's box (no candidate leaves the support) and distinct."""
     names, _box = _names_box(decl)
     seed = int(decl["history_matching"]["candidate_seed"])
     out = [np.array([[r["theta"][k] for k in names] for r in rows], float)]
-    for bx in support:
+    for i, bx in enumerate(support):       # each wave its own draw, so equal boxes do not repeat one draw
         lo, hi = np.array([bx[k][0] for k in names]), np.array([bx[k][1] for k in names])
-        out.append(np.clip(np.round(lo + BM._candidates(len(names), seed) * (hi - lo), 9), lo, hi))
-    return np.vstack(out)
+        out.append(np.clip(lo + BM._candidates(len(names), seed + i) * (hi - lo), lo, hi))
+    return np.unique(np.vstack(out), axis=0)
 
 
 # ------------------------------------------------------------------------------------- history matching
@@ -470,14 +471,16 @@ def history_match(rows: list, decl: dict, pack: dict, support: list) -> dict:
 
 
 # ----------------------------------------------------------------------------------------------- the fit
-def edge_diagnostics(decl: dict, point: dict, chosen: dict | None) -> list:
+def edge_diagnostics(decl: dict, point: dict, row: dict, bands: dict) -> list:
+    """Each edge check at the chosen point; a target is missed when the chosen row's seed geometric mean (its point
+    estimate, not the acceptance interval) is outside its band."""
     out = []
     for c in decl.get("edge_checks") or []:
         lo, hi = decl["parameters"][c["param"]]["box"]
         v = float(point[c["param"]])
         near = v >= hi - c["within"] * (hi - lo) if c["side"] == "hi" else v <= lo + c["within"] * (hi - lo)
-        by = (chosen or {}).get("by_target") or {}
-        missed = [t for t in c.get("targets") or [] if not (by.get(t) or {}).get("in_band", False)]
+        gm = {t: math.exp(_geo_log(row["per_seed"][t])) for t in c.get("targets") or []}
+        missed = [t for t in gm if not bands[t][0] <= gm[t] <= bands[t][1]]
         out.append({"param": c["param"], "value": v, "side": c["side"], "bound": hi if c["side"] == "hi" else lo,
                     "near_bound": bool(near), "targets_missed_at_chosen": missed if near else [], "basis": c["basis"]})
     return out
@@ -488,7 +491,8 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
     """The effect fit (module docstring). Raises ValueError on a declaration problem, a missing engine identity (the
     cache scope needs it) or a malformed engine row; returns the record."""
     bad = declaration_problems(decl, pack)
-    if not (isinstance(engine_identity, dict) and engine_identity):
+    if not (isinstance(engine_identity, dict) and engine_identity and all(
+            (_txt(v) or _num(v)) for v in engine_identity.values())):
         bad.append("engine_identity: required (it scopes the engine-row cache)")
     if bad:
         raise ValueError("effect fit declaration refused: " + "; ".join(bad))
@@ -497,7 +501,10 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
     targets, monitor = list(decl["targets"]), list(decl.get("monitor") or [])
     ids = targets + monitor
     tdig = target_digests(decl, pack)
-    scope = _sha({"targets": tdig, "engine": engine_identity, "seeds": seeds})
+    ev_scope = getattr(evaluator, "scope", None)
+    if isinstance(ev_scope, dict) and "seeds" in ev_scope and list(ev_scope["seeds"]) != seeds:
+        raise ValueError(f"the evaluator runs seeds {ev_scope['seeds']}, the pack declares {seeds}")
+    scope = _sha({"targets": tdig, "engine": engine_identity, "seeds": seeds, "evaluator": ev_scope})
     cache = cache if cache is not None else Cache()
     pts, support = design_points(decl)
     rows, calls = evaluate(pts, evaluator, ids, cache, scope, len(seeds))
@@ -522,6 +529,10 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
         if bad_t or j["controls_off"]:
             failures.append({"kind": "verification", "point": j["point"], "chosen": j is chosen, "targets": bad_t,
                              "controls_off": j["controls_off"]})
+    clamped = sorted({s for r in rows for s, c in (r.get("controls") or {}).items() if c.get("at_grid_edge")})
+    if clamped:
+        failures.append({"kind": "calibration_grid_edge", "settings": clamped,
+                         "reason": "a design point's calibration clamps at its grid edge"})
     if not hm["feasible"]:
         failures.append({"kind": "no_meetable_target", "reason": "no target can be met anywhere in the support"})
     if not checked:
@@ -555,7 +566,8 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
                         for t in targets},
             "monitor": chosen["monitor"], "joint_region": region, "surrogate": hm["surrogate"],
             "verification": {"points": checked, "chosen": chosen}, "failures": failures, "conflicts": conflicts,
-            "confounded": conf, "edge": edge_diagnostics(decl, hm["chosen"], chosen),
+            "confounded": conf,
+            "edge": edge_diagnostics(decl, hm["chosen"], vrows[-1], {t: byid[t]["band"] for t in ids}),
             "design": {"n_points": len(rows), "support": support},
             "engine_rows": {"calls": calls + vcalls, "cache_digest": cache.digest()}, "cost": cost}
 
@@ -585,22 +597,29 @@ def runner_evaluator(runner):
     setting whose package is the rule's arm_package) against its target."""
     pack = runner.pack
     byid = {b["id"]: b for b in pack["benchmarks"]}
-    if list(runner.seeds) != list(pack["seeds"]):
-        raise ValueError(f"runner seeds {list(runner.seeds)} are not the pack's {pack['seeds']}")
-    runner.full_precision = True            # per-seed values unrounded (benchmark.Runner.evaluate_at)
+    scope = {"seeds": list(runner.seeds), "base_params": dict(getattr(runner, "base_params", {}) or {}),
+             "pack": _sha(pack)}
 
     def ev(theta: dict, ids: list) -> dict:
+        now = {"seeds": list(runner.seeds), "base_params": dict(getattr(runner, "base_params", {}) or {}),
+               "pack": _sha(runner.pack)}
+        if now != scope or scope["seeds"] != list(pack["seeds"]):
+            raise ValueError("the runner's seeds, base parameters or pack are not those the evaluator was built on, "
+                             "or its seeds are not the pack's")
         full = runner.fitted_for(theta)     # the values every run of this point uses, stored fitted values included
         arms = sorted({a for t in ids for a in BM._arms_of(byid[t]["estimand"])})
         cal = sorted({pack["arms"][a]["setting"] for a in arms} & {s for s, v in pack["settings"].items()
                                                                    if v.get("calibrate")})
         runner.calibrate_settings(full, cal)
-        per = {}
-        for t in ids:
-            r = runner.evaluate(byid[t], theta)
-            if "per_seed_full" not in r:
-                raise ValueError(f"{t}: the runner reports no unrounded per-seed values")
-            per[t] = list(r["per_seed_full"])
+        key = tuple(sorted(full.items()))   # arm rows of this point run under an earlier calibration are not reused
+        runner.cache = {k: v for k, v in runner.cache.items() if k[1] != key}
+        prev, runner.full_precision = getattr(runner, "full_precision", False), True
+        try:
+            per = {t: runner.evaluate(byid[t], theta).get("per_seed_full") for t in ids}
+        finally:
+            runner.full_precision = prev
+        if any(v is None for v in per.values()):
+            raise ValueError("the runner reports no unrounded per-seed values")
         controls = {}
         for s in cal:
             c = pack["settings"][s]["calibrate"]
@@ -612,7 +631,8 @@ def runner_evaluator(runner):
                 got = float(np.mean([BM.get(r, c["value_path"]) for r in res]))
             controls[s] = {"target": c["target"], "achieved": got,
                            "at_grid_edge": bool(runner.calibrated.get(s, {}).get("at_grid_edge"))}
-        return {"per_seed": per, "controls": controls}
+        return {"per_seed": {t: list(v) for t, v in per.items()}, "controls": controls}
+    ev.scope = scope
     return ev
 
 
@@ -663,6 +683,13 @@ def _self_test() -> int:
         if not cond:
             fails.append(msg)
 
+    def refused(fn) -> bool:
+        try:
+            fn()
+        except ValueError:
+            return True
+        return False
+
     pack, decl = _toy_pack(), _toy_decl()
     ok(declaration_problems(decl, pack) == [], f"EF_DECL_OK: the toy declaration is valid {declaration_problems(decl, pack)}")
     calls = []
@@ -691,13 +718,9 @@ def _self_test() -> int:
         d["targets"]["T6"][f] = v
         ok(any(word in p for p in declaration_problems(d, pack)),
            f"EF_ESTIMAND_MATCH: a {f} that is not the pack's estimand is refused")
-    try:
-        d = copy.deepcopy(decl)
-        del d["targets"]["T18"]["window"]
-        fit(d, pack, _toy_engine([]), {"name": "toy"})
-        ok(False, "EF_ESTIMAND_REQUIRED: fit refuses a declaration without a window")
-    except ValueError:
-        ok(True, "EF_ESTIMAND_REQUIRED: fit refuses a declaration without a window")
+    d = copy.deepcopy(decl)
+    del d["targets"]["T18"]["window"]
+    ok(refused(lambda: fit(d, pack, _toy_engine([]), {"name": "toy"})), "EF_ESTIMAND_REQUIRED: fit refuses no window")
     for k in ACCEPTANCE_KEYS:
         d = copy.deepcopy(decl)
         del d["acceptance"][k]
@@ -764,38 +787,21 @@ def _self_test() -> int:
         r6 = fit(decl, pk3, _toy_engine(n3), engine_identity={"name": "toy"}, cache=Cache(p))
         ok(len(n3) == len(c1) and r6["status"] == "rejected",
            "EF_CACHE: a changed calibration target of a target's setting reuses no row, and its control fails (Codex r1)")
-        try:
-            fit(decl, pack, _toy_engine([]), cache=Cache(p))
-            ok(False, "EF_CACHE: a fit without an engine identity is refused (Codex r1)")
-        except ValueError:
-            ok(True, "EF_CACHE: a fit without an engine identity is refused (Codex r1)")
-        try:
-            Cache(p, digest="0" * 64)
-            ok(False, "EF_CACHE: a cache whose digest differs is refused")
-        except ValueError:
-            ok(True, "EF_CACHE: a cache whose digest differs is refused")
+        ok(refused(lambda: fit(decl, pack, _toy_engine([]), cache=Cache(p))),
+           "EF_CACHE: a fit without an engine identity is refused (Codex r1)")
+        ok(refused(lambda: Cache(p, digest="0" * 64)), "EF_CACHE: a cache whose digest differs is refused")
         rp = os.path.join(td, "effect_fit.yaml")
         dg = write_record(rp, rec)
         ok(read_record(rp, dg)["point"] == rec["point"], "EF_RECORD_DIGEST: the record reads back by its digest")
         with open(rp, "a") as f:
             f.write("# edited\n")
-        try:
-            read_record(rp, dg)
-            ok(False, "EF_RECORD_DIGEST: an edited record is refused")
-        except ValueError:
-            ok(True, "EF_RECORD_DIGEST: an edited record is refused")
+        ok(refused(lambda: read_record(rp, dg)), "EF_RECORD_DIGEST: an edited record is refused")
 
     # Codex r1: malformed engine rows, controls judged on the pack's target, declared counts, estimand ambiguity
-    def rows_of(per):
-        def ev(theta, ids):
-            return {"per_seed": {t: per for t in ids}, "controls": {}}
-        return ev
+    rows_of = lambda per: (lambda th, ids: {"per_seed": {t: per for t in ids}, "controls": {}})  # noqa: E731
     for label, per in (("one seed value", [0.55]), ("booleans", [True] * 4), ("no values", [])):
-        try:
-            fit(decl, pack, rows_of(per), {"name": "toy"})
-            ok(False, f"EF_SEED_ROWS: a design row with {label} is refused")
-        except ValueError:
-            ok(True, f"EF_SEED_ROWS: a design row with {label} is refused")
+        ok(refused(lambda: fit(decl, pack, rows_of(per), {"name": "toy"})),
+           f"EF_SEED_ROWS: a design row with {label} is refused")
     j = judge({"theta": {}, "per_seed": {"T": [0.55] * 4}, "controls": {"site": {"target": 0.8, "achieved": 0.8}}},
               {"T": [0.5, 0.6]}, [1, 2, 3, 4], decl["acceptance"], {"site": 0.4})
     ok(j["controls_off"] == ["site"], "EF_CONTROLS: a control is judged against the pack's target, not the evaluator's")
@@ -812,8 +818,7 @@ def _self_test() -> int:
     nar = _toy_decl(design={"waves": [{"n": 30, "seed": 1}, {"n": 3, "seed": 2, "box": {"eff": [0.8, 0.8000001]}}]})
     pts_, sup_ = design_points(nar)
     cth = candidates(nar, sup_, [{"theta": x} for x in pts_])
-    in_narrow = (cth[:, 0] >= 0.8) & (cth[:, 0] <= 0.8000001)
-    ok(int(in_narrow.sum()) > 3 and np.all((cth >= np.array([0.4, 0.2])) & (cth <= np.array([1.2, 1.2]))),
+    ok(int(((cth[:, 0] >= 0.8) & (cth[:, 0] <= 0.8000001)).sum()) > 3 and np.all((cth >= np.array([0.4, 0.2])) & (cth <= np.array([1.2, 1.2]))),
        "EF_SUPPORT_ONLY: every wave, however narrow, gets its own candidates, none outside the box (Codex r1)")
     ok(rec["verification"]["chosen"]["met"] and r2["status"] in ("accepted", "rejected")
        and not any(f["kind"] == "chosen_outside_region" for f in rec["failures"]),
@@ -821,10 +826,9 @@ def _self_test() -> int:
 
     # EF_RUNNER: the Runner adapter recalibrates each point at its full values and reports the control arm
     class FakeRunner:
-        seeds = [1, 2, 3, 4]
-
         def __init__(self):
-            self.calibrated, self.log = {}, []
+            self.calibrated, self.log, self.seeds, self.base_params = {}, [], [1, 2, 3, 4], {"b": 1}
+            self.cache, self.full_precision = {("ctl", (("background", 2.0), ("eff", 1.0), ("wane", 1.0))): "stale"}, False
             self.pack = dict(_toy_pack(), settings={"site": {"calibrate": {"target": 0.4, "value_path": "windows.m6.prev",
                                                                             "arm_package": {}}}})
 
@@ -836,22 +840,31 @@ def _self_test() -> int:
             self.calibrated = {n: {"at_grid_edge": False} for n in names}
 
         def evaluate(self, b, theta):
+            assert self.full_precision and not self.cache, "unrounded values from fresh arm rows"
             return {"per_seed": [0.5, 0.51, 0.52, 0.5], "per_seed_full": [0.50004, 0.51, 0.52, 0.5]}
 
         def arm_results(self, arms, theta):
             return {a: [{"windows": {"m6": {"prev": 0.2 * theta["background"]}}}] * 4 for a in arms}
     fr = FakeRunner()
-    out = runner_evaluator(fr)({"eff": 1.0, "wane": 1.0}, ["T6", "T18"])
+    ev = runner_evaluator(fr)
+    out = ev({"eff": 1.0, "wane": 1.0}, ["T6", "T18"])
     ok(fr.log == [("cal", ("site",), 2.0)] and out["controls"]["site"]["achieved"] == 0.4
-       and out["per_seed"]["T6"][0] == 0.50004 and fr.full_precision,
-       f"EF_RUNNER: the adapter calibrates and reads the control at the full values, unrounded ({out['controls']})")
+       and out["per_seed"]["T6"][0] == 0.50004 and not fr.full_precision and ev.scope["base_params"] == {"b": 1},
+       f"EF_RUNNER: calibration and control at the full values, stale arm rows of the point dropped, unrounded values "
+       f"only during the call, base parameters in the cache scope (Codex r1 on #329) ({out['controls']})")
     fr.seeds = [5, 6, 7, 8]
-    try:
-        runner_evaluator(fr)
-        ok(False, "EF_RUNNER: a runner whose seeds are not the pack's is refused")
-    except ValueError:
-        ok(True, "EF_RUNNER: a runner whose seeds are not the pack's is refused")
-
+    ok(refused(lambda: ev({"eff": 1.0, "wane": 1.0}, ["T6"])), "EF_RUNNER: seeds changed after construction refused")
+    ok(refused(lambda: fit(decl, pack, ev, {"name": "toy"})), "EF_RUNNER: an evaluator on other seeds is refused by fit")
+    clamp = lambda th, ids: dict(_toy_engine([])(th, ids), controls={"site": {"achieved": 0.4, "at_grid_edge":  # noqa
+                                                                               th == design_points(decl)[0][3]}})
+    r7 = fit(decl, pack, clamp, {"name": "toy"})
+    ok(r7["status"] == "rejected" and any(f["kind"] == "calibration_grid_edge" for f in r7["failures"]),
+       "EF_CONTROLS: a calibration grid clamp at one design point rejects the fit (Codex r1 on #329)")
+    de = edge_diagnostics({"parameters": {"x": {"box": [0, 1]}}, "edge_checks": [
+        {"param": "x", "side": "hi", "within": 0.02, "targets": ["T"], "basis": "b"}]}, {"x": 0.99},
+        {"per_seed": {"T": [0.6, 0.8] * 4}}, {"T": [0.72, 0.98]})
+    ok(de[0]["near_bound"] and de[0]["targets_missed_at_chosen"] == ["T"],
+       "EF_EDGE: a target is missed at the edge when its point estimate is outside its band")
 
     # EF_COVERAGE: a training target needs effect parameters in benchmark_coverage; a parameter no target names fails
     cov = {"benchmarks": {"T6": {"effect_parameters": ["eff", "wane"]}, "T18": {"effect_parameters": ["wane"]}}}
@@ -869,6 +882,29 @@ def _self_test() -> int:
         probs = declaration_problems(dcl, pk_) or coverage_problems(dcl, cv, ver)
         ok(not probs, f"EF_PACKS: {os.path.relpath(f, ROOT)} is valid against its pack and coverage {probs}")
     ok(bool(found), f"EF_PACKS: at least one pack declares an effect fit ({len(found)})")
+    # Codex r2: cached rows are checked too; exact keys; distinct candidates; key presence; identity values
+    cc = Cache()
+    fit(decl, pack, _toy_engine([]), {"name": "toy"}, cache=cc)
+    next(iter(cc.rows.values()))["per_seed"]["T6"].pop()
+    ok(refused(lambda: fit(decl, pack, _toy_engine([]), {"name": "toy"}, cache=cc)),
+       "EF_SEED_ROWS: a cached row with a missing seed value is refused")
+    ok(Cache.key("s", {"x": 0.5}) != Cache.key("s", {"x": 0.5000000001}), "EF_CACHE: keys are exact, not rounded")
+    tiny = _toy_decl(parameters={"eff": {"box": [0.5000000001, 0.5000000002], "source": "toy"},
+                                 "wane": {"box": [0.2, 1.2], "source": "toy"}})
+    tp, ts_ = design_points(tiny)
+    ct = candidates(tiny, ts_, [{"theta": x} for x in tp])
+    ok(ct[:, 0].min() >= 0.5000000001 and len(np.unique(ct, axis=0)) == len(ct),
+       "EF_SUPPORT_ONLY: design points and candidates stay inside a tiny box and are distinct")
+    pk = _toy_pack()
+    pk["benchmarks"][0]["estimand"]["values"] = []
+    ok(any("ambiguous" in x for x in declaration_problems(decl, pk)), "EF_ESTIMAND_MATCH: an empty values key counts")
+    pk = _toy_pack()
+    del pk["arms"]["trt"]
+    pk["settings"][None] = {}
+    ok(any("not arms of the pack" in x for x in declaration_problems(decl, pk)),
+       "EF_ESTIMAND_MATCH: a missing arm does not resolve to a null setting")
+    ok(refused(lambda: fit(decl, pack, _toy_engine([]), {"name": None})),
+       "EF_CACHE: an engine identity with an empty value is refused")
 
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
