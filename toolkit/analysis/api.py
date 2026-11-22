@@ -132,7 +132,12 @@ def gate_findings(run_dir: str) -> list[dict]:
     """The contract checks, then `decision_test_changes_plan` for every decision test whose verdict changes the plan
     (lead-gaps α): the stage machine's owner rule (#316) takes them to the owner, or under --signoff lead answers them
     provisionally and flags them above the report's draft."""
-    return contract.gate_findings(run_dir) + contract.decision_test_findings(run_dir)
+    base = contract.gate_findings(run_dir)
+    dt = contract.decision_test_findings(run_dir)
+    if any(f.get("kind") in ("analysis_contract_missing", "analysis_contract_incomplete", "analysis_contract_blocked")
+           for f in base):      # the contract already says there is no completed analysis: not said twice
+        dt = [f for f in dt if contract.NO_MANIFEST not in str(f.get("claim"))]
+    return base + dt
 
 
 def _self_test() -> int:
@@ -161,6 +166,9 @@ def _self_test() -> int:
             contract.decision_test_findings = _dtf
         ok(got[0] == "analysis_contract_missing" and got[-1] == "decision_test_changes_plan",
            f"AP9 gate_findings adds every plan-changing decision test after the contract checks: {got}")
+        got = [f["kind"] for f in gate_findings(d)]
+        ok(got.count("analysis_contract_missing") == 1 and "analysis_contract_decision_test" not in got,
+           f"AP10 before the analysis ran the missing manifest is reported once, by the contract checks: {got}")
         try:
             need = engine_needs(schema.load(p).raw)
             ok(need["components"] == {"a": [1], "b": [1]} and "dalys" in need["outputs"] and "cases" in need["outputs"]
