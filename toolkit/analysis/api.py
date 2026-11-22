@@ -4,7 +4,9 @@
     validate(spec, base=None) -> list[str]           fail closed (toolkit/spec/schema.py)
     pipeline_steps(spec_path, run_dir) -> list[dict] steps for models/pipeline.yaml (S1 runner)
     headline(run_dir) -> dict[str, float]            numbers the impact ledger records before/after a fix
-    gate_findings(run_dir) -> list[dict]             contract checks, common finding shape
+    gate_findings(run_dir) -> list[dict]             contract checks, common finding shape, then one
+                                                     decision-bearing finding per decision test whose
+                                                     verdict changes the plan
 
     python3 toolkit/analysis/api.py --self-test
 """
@@ -127,7 +129,15 @@ def headline(run_dir: str) -> dict:
 
 
 def gate_findings(run_dir: str) -> list[dict]:
-    return contract.gate_findings(run_dir)
+    """The contract checks, then `decision_test_changes_plan` for every decision test whose verdict changes the plan
+    (lead-gaps α): the stage machine's owner rule (#316) takes them to the owner, or under --signoff lead answers them
+    provisionally and flags them above the report's draft."""
+    base = contract.gate_findings(run_dir)
+    dt = contract.decision_test_findings(run_dir)
+    if any(f.get("kind") in ("analysis_contract_missing", "analysis_contract_incomplete", "analysis_contract_blocked")
+           for f in base):      # the contract already says there is no completed analysis: not said twice
+        dt = [f for f in dt if contract.NO_MANIFEST not in str(f.get("claim"))]
+    return base + dt
 
 
 def _self_test() -> int:
@@ -147,6 +157,18 @@ def _self_test() -> int:
         ok(st[0]["cmd"].startswith(sys.executable + " "), f"AP7 the step runs with the harness interpreter: {st[0]['cmd'][:60]}")
         ok(gate_findings(d) and gate_findings(d)[0]["kind"] == "analysis_contract_missing",
            "AP3 gate_findings before the analysis ran: missing (fail closed)")
+        # AP9 (lead-gaps α): the backend's findings carry the decision-bearing ones the contract module reads
+        _dtf = contract.decision_test_findings
+        try:
+            contract.decision_test_findings = lambda rd: [{"kind": "decision_test_changes_plan", "key": "DT1"}]
+            got = [f["kind"] for f in gate_findings(d)]
+        finally:
+            contract.decision_test_findings = _dtf
+        ok(got[0] == "analysis_contract_missing" and got[-1] == "decision_test_changes_plan",
+           f"AP9 gate_findings adds every plan-changing decision test after the contract checks: {got}")
+        got = [f["kind"] for f in gate_findings(d)]
+        ok(got.count("analysis_contract_missing") == 1 and "analysis_contract_decision_test" not in got,
+           f"AP10 before the analysis ran the missing manifest is reported once, by the contract checks: {got}")
         try:
             need = engine_needs(schema.load(p).raw)
             ok(need["components"] == {"a": [1], "b": [1]} and "dalys" in need["outputs"] and "cases" in need["outputs"]

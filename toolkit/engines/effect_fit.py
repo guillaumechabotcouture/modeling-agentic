@@ -3,7 +3,7 @@
 simulated at its trial's own estimand (decision design principle 3: relative effects come from trials, and a
 parameter is anchored where the trial measured it, never by multiplying decision outputs by a trial ratio).
 
-    python3 toolkit/engines/effect_fit.py check <pack.yaml> <effect_fit.yaml>   # the declaration problems
+    python3 toolkit/engines/effect_fit.py check <engine>/benchmarks/effect_fit.yaml   # problems vs pack, coverage
     python3 toolkit/engines/effect_fit.py --self-test
 
 An engine pack declares the fit in data (`effect_fit.yaml` beside its `pack.yaml`); nothing here names a disease,
@@ -240,6 +240,34 @@ def declaration_problems(decl, pack: dict) -> list:
     return out
 
 
+def coverage_problems(decl: dict, coverage: dict | None, version: str) -> list:
+    """The engine's benchmark_coverage.yaml must name, for every training target, effect parameters among the fitted
+    ones (for this engine version), and every fitted parameter must be named by some target (else no target can
+    identify it)."""
+    from toolkit.engines.benchmark_coverage import effect_parameters
+    ents = (coverage or {}).get("benchmarks") or {}
+    out, named = [], set()
+    for t in decl.get("targets") or {}:
+        hit = set(effect_parameters(ents.get(t), version)) & set(decl.get("parameters") or {})
+        if not hit:
+            out.append(f"{t}: benchmark_coverage names no fitted effect parameter for it (engine version {version}); "
+                       "required for a training target")
+        named |= hit
+    return out + [f"parameter {k}: no training target's effect_parameters name it, so no target can identify it"
+                  for k in decl.get("parameters") or {} if k not in named]
+
+
+def pack_files(decl_path: str) -> tuple:
+    """(declaration, pack, coverage, engine version) for a pack's effect_fit.yaml: pack.yaml beside it, and the
+    engine's benchmark_coverage.yaml and card.yaml one level up."""
+    here = os.path.dirname(os.path.abspath(decl_path))
+    eng = os.path.dirname(here)
+    rd = lambda p: yaml.safe_load(open(p)) if os.path.exists(p) else None  # noqa: E731
+    card = rd(os.path.join(eng, "card.yaml")) or {}
+    return (rd(decl_path), rd(os.path.join(here, "pack.yaml")) or {}, rd(os.path.join(eng, "benchmark_coverage.yaml")),
+            str(card.get("version", "")))
+
+
 def target_digests(decl: dict, pack: dict) -> dict:
     """{id: sha256 of the pack's benchmark declaration and the fit's estimand fields} for targets and monitors."""
     byid = {b["id"]: b for b in pack["benchmarks"]}
@@ -386,9 +414,9 @@ def candidates(decl: dict, support: list, rows: list) -> np.ndarray:
     names, _box = _names_box(decl)
     seed = int(decl["history_matching"]["candidate_seed"])
     out = [np.array([[r["theta"][k] for k in names] for r in rows], float)]
-    for bx in support:
+    for i, bx in enumerate(support):       # each wave its own draw, so equal boxes do not repeat one draw
         lo, hi = np.array([bx[k][0] for k in names]), np.array([bx[k][1] for k in names])
-        out.append(np.clip(lo + BM._candidates(len(names), seed) * (hi - lo), lo, hi))
+        out.append(np.clip(lo + BM._candidates(len(names), seed + i) * (hi - lo), lo, hi))
     return np.unique(np.vstack(out), axis=0)
 
 
@@ -443,14 +471,16 @@ def history_match(rows: list, decl: dict, pack: dict, support: list) -> dict:
 
 
 # ----------------------------------------------------------------------------------------------- the fit
-def edge_diagnostics(decl: dict, point: dict, chosen: dict | None) -> list:
+def edge_diagnostics(decl: dict, point: dict, row: dict, bands: dict) -> list:
+    """Each edge check at the chosen point; a target is missed when the chosen row's seed geometric mean (its point
+    estimate, not the acceptance interval) is outside its band."""
     out = []
     for c in decl.get("edge_checks") or []:
         lo, hi = decl["parameters"][c["param"]]["box"]
         v = float(point[c["param"]])
         near = v >= hi - c["within"] * (hi - lo) if c["side"] == "hi" else v <= lo + c["within"] * (hi - lo)
-        by = (chosen or {}).get("by_target") or {}
-        missed = [t for t in c.get("targets") or [] if not (by.get(t) or {}).get("in_band", False)]
+        gm = {t: math.exp(_geo_log(row["per_seed"][t])) for t in c.get("targets") or []}
+        missed = [t for t in gm if not bands[t][0] <= gm[t] <= bands[t][1]]
         out.append({"param": c["param"], "value": v, "side": c["side"], "bound": hi if c["side"] == "hi" else lo,
                     "near_bound": bool(near), "targets_missed_at_chosen": missed if near else [], "basis": c["basis"]})
     return out
@@ -471,7 +501,13 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
     targets, monitor = list(decl["targets"]), list(decl.get("monitor") or [])
     ids = targets + monitor
     tdig = target_digests(decl, pack)
-    scope = _sha({"targets": tdig, "engine": engine_identity, "seeds": seeds})
+    # an evaluator's live state (runner seeds, pack, base and stored fitted values) joins the cache scope, read
+    # before any cached row is used; its seeds and pack must be this fit's
+    ev_scope = evaluator.scope() if callable(getattr(evaluator, "scope", None)) else None
+    if isinstance(ev_scope, dict) and (list(ev_scope.get("seeds", seeds)) != seeds
+                                       or ev_scope.get("pack", _sha(pack)) != _sha(pack)):
+        raise ValueError("the evaluator runs other seeds or another pack than this fit's")
+    scope = _sha({"targets": tdig, "engine": engine_identity, "seeds": seeds, "evaluator": ev_scope})
     cache = cache if cache is not None else Cache()
     pts, support = design_points(decl)
     rows, calls = evaluate(pts, evaluator, ids, cache, scope, len(seeds))
@@ -496,6 +532,11 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
         if bad_t or j["controls_off"]:
             failures.append({"kind": "verification", "point": j["point"], "chosen": j is chosen, "targets": bad_t,
                              "controls_off": j["controls_off"]})
+    clamped = sorted({s for r in rows for s, c in (r.get("controls") or {}).items()
+                      if c.get("at_grid_edge") is not False})       # a missing clamp result is not a pass
+    if clamped:
+        failures.append({"kind": "calibration_grid_edge", "settings": clamped,
+                         "reason": "a design point's calibration clamps at its grid edge"})
     if not hm["feasible"]:
         failures.append({"kind": "no_meetable_target", "reason": "no target can be met anywhere in the support"})
     if not checked:
@@ -529,7 +570,8 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
                         for t in targets},
             "monitor": chosen["monitor"], "joint_region": region, "surrogate": hm["surrogate"],
             "verification": {"points": checked, "chosen": chosen}, "failures": failures, "conflicts": conflicts,
-            "confounded": conf, "edge": edge_diagnostics(decl, hm["chosen"], chosen),
+            "confounded": conf,
+            "edge": edge_diagnostics(decl, hm["chosen"], vrows[-1], {t: byid[t]["band"] for t in ids}),
             "design": {"n_points": len(rows), "support": support},
             "engine_rows": {"calls": calls + vcalls, "cache_digest": cache.digest()}, "cost": cost}
 
@@ -551,6 +593,54 @@ def read_record(path: str, digest: str) -> dict:
     if not isinstance(rec, dict) or rec.get("schema") != SCHEMA or rec.get("producer") != PRODUCER:
         raise ValueError(f"effect fit record {path}: not a {SCHEMA} record of {PRODUCER}")
     return rec
+
+
+def runner_evaluator(runner):
+    """An evaluator over a benchmark.Runner in fit mode: each point recalibrates the target arms' settings (their
+    `calibrate` rule), reads every id's per-seed values and each calibrated setting's control arm (the arm of that
+    setting whose package is the rule's arm_package) against its target."""
+    pack = runner.pack
+    byid = {b["id"]: b for b in pack["benchmarks"]}
+    state = lambda: {"seeds": list(runner.seeds), "pack": _sha(runner.pack), "fitted": runner.fitted_for({}),  # noqa
+                     "base_params": dict(getattr(runner, "base_params", {}) or {})}
+    built = state()
+    runner.cache = {}                       # no arm row computed before this adapter (another state) is reused
+
+    def ev(theta: dict, ids: list) -> dict:
+        if state() != built:
+            raise ValueError("the runner's seeds, pack, base or stored fitted values changed since the evaluator "
+                             "was built")
+        full = runner.fitted_for(theta)     # the values every run of this point uses, stored fitted values included
+        arms = sorted({a for t in ids for a in BM._arms_of(byid[t]["estimand"])})
+        cal = sorted({pack["arms"][a]["setting"] for a in arms} & {s for s, v in pack["settings"].items()
+                                                                   if v.get("calibrate")})
+        runner.calibrate_settings(full, cal)
+        key = tuple(sorted(full.items()))   # arm rows of this point run under an earlier calibration are not reused
+        runner.cache = {k: v for k, v in runner.cache.items()
+                        if k[1] != key and not (isinstance(k[1], tuple) and k[1] and k[1][0] == key)}
+        prev, runner.full_precision = getattr(runner, "full_precision", False), True
+        try:
+            per = {t: runner.evaluate(byid[t], theta).get("per_seed_full") for t in ids}
+        finally:
+            runner.full_precision = prev
+        if any(v is None for v in per.values()):
+            raise ValueError("the runner reports no unrounded per-seed values")
+        controls = {}
+        for s in cal:
+            c = pack["settings"][s]["calibrate"]
+            ctrl = sorted(a for a, v in pack["arms"].items()
+                          if v["setting"] == s and (v.get("package") or {}) == (c.get("arm_package") or {}))
+            got = None
+            if ctrl:
+                res = runner.arm_results([ctrl[0]], full)[ctrl[0]]
+                got = float(np.mean([BM.get(r, c["value_path"]) for r in res]))
+            cv, g = runner.calibrated.get(s, {}), [float(x) for x in c.get("grid") or []]
+            v = cv.get("value")      # the calibrated value at or past a grid end is a clamp, whatever the flag says
+            edge = bool(cv.get("at_grid_edge")) or not _num(v) or (bool(g) and not min(g) < v < max(g))
+            controls[s] = {"target": c["target"], "achieved": got, "at_grid_edge": edge}
+        return {"per_seed": {t: list(v) for t, v in per.items()}, "controls": controls}
+    ev.scope = state
+    return ev
 
 
 # ------------------------------------------------------------------------------------------- self-test
@@ -741,6 +831,75 @@ def _self_test() -> int:
        and not any(f["kind"] == "chosen_outside_region" for f in rec["failures"]),
        "EF_CHOICE: the chosen point is inside the region when the region is not empty")
 
+    # EF_RUNNER: the Runner adapter recalibrates each point at its full values and reports the control arm
+    class FakeRunner:
+        def __init__(self):
+            self.calibrated, self.log, self.seeds, self.base_params = {}, [], [1, 2, 3, 4], {"b": 1}
+            self.cal_value = 1.0
+            self.cache, self.full_precision = {("ctl", (("background", 2.0), ("eff", 1.0), ("wane", 1.0))): "stale"}, False
+            self.pack = dict(_toy_pack(), settings={"site": {"calibrate": {"target": 0.4, "value_path": "windows.m6.prev",
+                                                                            "arm_package": {}, "grid": [0.5, 2.0]}}})
+
+        def fitted_for(self, theta):
+            return dict({"background": 2.0}, **theta)
+
+        def calibrate_settings(self, theta, names):
+            self.log.append(("cal", tuple(names), theta.get("background")))
+            self.calibrated = {n: {"at_grid_edge": False, "value": self.cal_value} for n in names}
+
+        def evaluate(self, b, theta):
+            assert self.full_precision and not self.cache, "unrounded values from fresh arm rows"
+            return {"per_seed": [0.5, 0.51, 0.52, 0.5], "per_seed_full": [0.50004, 0.51, 0.52, 0.5]}
+
+        def arm_results(self, arms, theta):
+            return {a: [{"windows": {"m6": {"prev": 0.2 * theta["background"]}}}] * 4 for a in arms}
+    fr = FakeRunner()
+    ev = runner_evaluator(fr)
+    out = ev({"eff": 1.0, "wane": 1.0}, ["T6", "T18"])
+    ok(fr.log == [("cal", ("site",), 2.0)] and out["controls"]["site"]["achieved"] == 0.4
+       and out["per_seed"]["T6"][0] == 0.50004 and not fr.full_precision and ev.scope()["base_params"] == {"b": 1},
+       f"EF_RUNNER: calibration and control at the full values, stale arm rows of the point dropped, unrounded values "
+       f"only during the call, base parameters in the cache scope (Codex r1 on #329) ({out['controls']})")
+    fr.seeds = [5, 6, 7, 8]
+    ok(refused(lambda: ev({"eff": 1.0, "wane": 1.0}, ["T6"])), "EF_RUNNER: seeds changed after construction refused")
+    ok(refused(lambda: fit(decl, pack, ev, {"name": "toy"})), "EF_RUNNER: an evaluator on other seeds is refused by fit")
+    fr = FakeRunner()
+    fr.cal_value = 2.0
+    ev = runner_evaluator(fr)
+    edge_ = ev({"eff": 1.0, "wane": 1.0}, ["T6"])["controls"]["site"]["at_grid_edge"]
+    fr.base_params["b"] = 2
+    ok(edge_ and refused(lambda: ev({"eff": 1.0, "wane": 0.5}, ["T6"])),
+       "EF_RUNNER: a calibration at its grid end is a clamp whatever the flag; changed base values refused (Codex r2)")
+    fr = FakeRunner()
+    ok(refused(lambda: fit(decl, _toy_pack(), runner_evaluator(fr), {"name": "toy"})),
+       "EF_RUNNER: an evaluator built on another pack is refused by fit (Codex r2)")
+    clamp = lambda th, ids: dict(_toy_engine([])(th, ids), controls={"site": {"achieved": 0.4, "at_grid_edge":  # noqa
+                                                                               th == design_points(decl)[0][3]}})
+    r7 = fit(decl, pack, clamp, {"name": "toy"})
+    ok(r7["status"] == "rejected" and any(f["kind"] == "calibration_grid_edge" for f in r7["failures"]),
+       "EF_CONTROLS: a calibration grid clamp at one design point rejects the fit (Codex r1 on #329)")
+    de = edge_diagnostics({"parameters": {"x": {"box": [0, 1]}}, "edge_checks": [
+        {"param": "x", "side": "hi", "within": 0.02, "targets": ["T"], "basis": "b"}]}, {"x": 0.99},
+        {"per_seed": {"T": [0.6, 0.8] * 4}}, {"T": [0.72, 0.98]})
+    ok(de[0]["near_bound"] and de[0]["targets_missed_at_chosen"] == ["T"],
+       "EF_EDGE: a target is missed at the edge when its point estimate is outside its band")
+
+    # EF_COVERAGE: a training target needs effect parameters in benchmark_coverage; a parameter no target names fails
+    cov = {"benchmarks": {"T6": {"effect_parameters": ["eff", "wane"]}, "T18": {"effect_parameters": ["wane"]}}}
+    ok(coverage_problems(decl, cov, "1") == [], "EF_COVERAGE: the toy coverage names every fitted parameter")
+    cov["benchmarks"]["T6"]["effect_parameters"] = []
+    cp = coverage_problems(decl, cov, "1")
+    ok(any(p.startswith("T6:") for p in cp) and any("parameter eff" in p for p in cp),
+       f"EF_COVERAGE: a target without effect parameters, and a parameter no target names, are refused {cp}")
+
+    # EF_PACKS: every engine pack that declares an effect fit declares one this core accepts (no engine run)
+    import glob
+    found = sorted(glob.glob(os.path.join(ROOT, "toolkit", "engines", "*", "benchmarks", "effect_fit.yaml")))
+    for f in found:
+        dcl, pk_, cv, ver = pack_files(f)
+        probs = declaration_problems(dcl, pk_) or coverage_problems(dcl, cv, ver)
+        ok(not probs, f"EF_PACKS: {os.path.relpath(f, ROOT)} is valid against its pack and coverage {probs}")
+    ok(bool(found), f"EF_PACKS: at least one pack declares an effect fit ({len(found)})")
     # Codex r2: cached rows are checked too; exact keys; distinct candidates; key presence; identity values
     cc = Cache()
     fit(decl, pack, _toy_engine([]), {"name": "toy"}, cache=cc)
@@ -773,8 +932,9 @@ def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["--self-test"]:
         return _self_test()
-    if len(argv) == 3 and argv[0] == "check":
-        probs = declaration_problems(yaml.safe_load(open(argv[2])), yaml.safe_load(open(argv[1])))
+    if len(argv) == 2 and argv[0] == "check":
+        dcl, pk, cv, ver = pack_files(argv[1])
+        probs = declaration_problems(dcl, pk) or coverage_problems(dcl, cv, ver)
         for p in probs:
             print(f"PROBLEM {p}")
         print("OK: the declaration can drive a fit" if not probs else f"{len(probs)} problem(s)")
