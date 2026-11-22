@@ -175,15 +175,44 @@ def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate
             "findings": fs, "impact_history": impact_rows(run_dir)[-history_rows:], "budget": budget or {},
             "edit_scope": edit_scope(),
             # findings whose fix task changed no file and did not pass (validate_plan refuses a fix for them again)
-            "no_op_findings": sorted({fid for r in impact_rows(run_dir) if r.get("no_op") and r.get("passed") is not True
+            "no_op_findings": sorted({fid for r in impact_rows(run_dir) if is_no_op_row(r, round_n)
                                       for fid in r.get("findings") or []})}
+
+
+def is_no_op_row(r: dict, round_n: int) -> bool:
+    """An impact row of an earlier round (this round's would change the packet a resumed round replays) for a fix
+    task that ran, changed no file it may edit and did not pass. A row from before `no_op` was recorded (hb1, where
+    the harness's budget_ledger.json write counted as a change) is read from its files_changed. A failed task call
+    (`task_failed`) or a task never run (no files_changed) is not a no-op."""
+    if not isinstance(r, dict) or r.get("action") != "fix" or r.get("task_failed") or r.get("rejected"):
+        return False
+    rnd = r.get("round")
+    if not isinstance(rnd, int) or rnd >= round_n or r.get("passed") is True:
+        return False
+    chk = r.get("check")
+    if isinstance(chk, dict) and chk and all(isinstance(c, dict) and c.get("passed") is True for c in chk.values()):
+        return False                                    # its check held (another change met it): nothing to bar
+    if r.get("no_op"):
+        return True
+    fc = r.get("files_changed")
+    return isinstance(fc, list) and not [x for x in fc if not _owned(str(x))]
 
 
 def edit_scope() -> dict:
     """What a fix task may edit, as the planner's packet gives it: FIX_EDITABLE and the computational leaves of
-    analysis_settings.yaml (toolkit/spec/schema.py SETTINGS_PATHS, the analysis engine's own list)."""
-    from toolkit.spec import schema
-    return {"files": list(FIX_EDITABLE), "settings": sorted(".".join(p) for p in schema.SETTINGS_PATHS)}
+    analysis_settings.yaml the analysis backend accepts (the list the fix worker's prompt is given)."""
+    from agents import analysis_backend as AB
+    return {"files": list(FIX_EDITABLE),
+            "settings": sorted(getattr(AB.backend(), "settings_paths", AB.SETTINGS_PATHS))}
+
+
+def task_scope(task: dict) -> tuple:
+    """What the fix worker for `task` may write: the in-scope files its plan names (normalised), or the whole
+    FIX_EDITABLE when it names none (only the harness default plan's form validates that way)."""
+    import posixpath
+    named = [posixpath.normpath(str(p).strip().replace("\\", "/")) for p in task.get("files") or [] if in_edit_scope(p)]
+    named = [p + "/" if p + "/" in FIX_EDITABLE else p for p in named]
+    return tuple(dict.fromkeys(named)) or FIX_EDITABLE
 
 
 def in_edit_scope(path) -> bool:
@@ -296,13 +325,17 @@ def validate_plan(plan, packet: dict) -> list[str]:
 def default_plan(packet: dict) -> dict:
     """The harness's own plan when the planner fails twice: one task per blocking finding, in
     the packet's order (blocking first, then severity), each a fix by its owner state."""
-    tasks = []
+    tasks, gaps = [], []
     for f in packet["findings"]:
         if f["blocking"] and f["resolution_type"] != "owner_decision" and not is_write_up(f):
+            if f["id"] in (packet.get("no_op_findings") or ()):     # a fix that changed nothing is not tried again
+                gaps.append({"finding": f["id"], "reason": "an earlier fix task changed no file it may edit, and the "
+                             "planner did not plan it", "needs": ["a change outside the fix scope (not named)"]})
+                continue
             tasks.append({"id": f"T{len(tasks) + 1}", "findings": [f["id"]], "action": "fix",
                           "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f.get('label') or FL.short_label(f['claim'])}",
                           "files": list(FIX_EDITABLE)})        # all it may edit: the planner did not narrow it
-    return {"tasks": tasks, "deferred": [], "by": "harness default"}
+    return {"tasks": tasks, "deferred": [], "by": "harness default", **({"harness_gaps": gaps} if gaps else {})}
 
 
 # ------------------------------------------------------------------ measurement
@@ -482,7 +515,7 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
             _sio().publish(prog_p, json.dumps(progress, default=str), run_dir)
         evidence, rebuilt, attempts_, rejected, rep, r = None, [], 0, [], {}, None
         agent_changed: set = set()
-        check, passed, now_ids, no_op = {}, False, set(pend["before_ids"]), False
+        check, passed, now_ids, no_op, task_failed = {}, False, set(pend["before_ids"]), False, False
         while True:
             attempts_ += 1
             if attempts_ > 1 and out_of_budget():
@@ -501,7 +534,8 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
             ledger = FL.load(run_dir)
             now_ids = harness_ids(run_dir)
             check = check_task(run_dir, t, ledger, now_ids)
-            no_op = not agent_changed
+            task_failed = r is not None and not getattr(r, "ok", True)    # a failed call: retryable, not a no-op
+            no_op = not agent_changed and not task_failed
             if no_op:
                 # hb1 (ranked fix 8): nothing changed, so there is nothing for a later critique or gate to judge
                 check = {fid: (c if c["passed"] is not None else
@@ -531,6 +565,10 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
         if no_op and not rejected:
             row["no_op"] = True                         # the planner may not plan it as a fix again (validate_plan)
             summary["no_op"] = summary.get("no_op", 0) + 1
+            if row["passed"]:
+                row["passed"] = None                    # the check holds, but not by this task's change: no credit
+        if task_failed and not rejected:
+            row["task_failed"] = True
         append_impact(run_dir, row)
         summary["rows"] += 1
         summary["passed"] += bool(row["passed"])
@@ -882,6 +920,63 @@ def _self_test() -> int:
            and validate_plan({"tasks": [], "harness_gaps": [{"finding": "R-001", "reason": "r", "needs": ["x"]}]},
                              pk21) == [],
            f"F21b a finding whose fix task was a no-op is not planned as a fix again; a harness gap is accepted ({e21})")
+    # F22 (Codex review of #341): which rows count as a no-op, and what the default plan does with one.
+    with tempfile.TemporaryDirectory() as d:
+        FL.save(d, {x: FL.Finding(id=x, kind="critique_blocker", severity="HIGH", source="critique-redteam",
+                                  owner_state="ANALYZE", blocking=True, claim="c") for x in ("A", "B", "C", "D", "E", "G")})
+        rows22 = [
+            {"round": 1, "task": "T1", "findings": ["A"], "action": "fix", "files_changed": ["budget_ledger.json"],
+             "passed": False, "attempts": 2},                                    # an hb1 row: before `no_op` existed
+            {"round": 1, "task": "T2", "findings": ["B"], "action": "decision_test", "files_changed": [], "passed": False,
+             "no_op": True},                                                     # not a fix
+            {"round": 1, "task": "T3", "findings": ["C"], "action": "fix", "files_changed": [], "passed": False,
+             "task_failed": True},                                               # the task call failed: retryable
+            {"round": 1, "task": "T4", "findings": ["D"], "action": "fix", "passed": None,
+             "note": "skipped: loop budget used"},                               # never ran
+            {"round": 2, "task": "T1", "findings": ["E"], "action": "fix", "files_changed": [], "passed": False,
+             "no_op": True}]                                                     # this round's: not until next round
+        for r in rows22:
+            append_impact(d, r)
+        pk22 = build_packet(d, FL.load(d), 2, 3, None, None)
+        ok(pk22["no_op_findings"] == ["A"],
+           f"F22 a no-op is a failed fix row of an earlier round that changed no file it may edit, an hb1 row included; "
+           f"not a decision test, a failed task call, a skipped task or this round's row ({pk22['no_op_findings']})")
+        dp22 = default_plan(dict(pk22, no_op_findings=["A"]))
+        ok(validate_plan(dp22, dict(pk22, no_op_findings=["A"])) == []
+           and "A" not in [f for t in dp22["tasks"] for f in t["findings"]]
+           and [g["finding"] for g in dp22.get("harness_gaps") or []] == ["A"],
+           f"F22b the default plan declares a no-op finding a harness gap instead of fixing it again ({dp22})")
+    with tempfile.TemporaryDirectory() as d:
+        FL.save(d, {"A": FL.Finding(id="A", kind="critique_blocker", severity="HIGH", source="critique-redteam",
+                                    owner_state="ANALYZE", blocking=True, claim="c",
+                                    done_when=[{"file": "never.txt", "exists": True}]),
+                    "B": FL.Finding(id="B", kind="critique_blocker", severity="HIGH", source="critique-redteam",
+                                    owner_state="ANALYZE", blocking=True, claim="c",
+                                    done_when=[{"file": "there.txt", "exists": True}])})
+        open(os.path.join(d, "there.txt"), "w").write("x")
+        calls22 = []
+
+        class F:
+            def plan_fixes(self, pk):
+                return NS(ok=True, note="", output={"tasks": [
+                    {"id": "T1", "findings": ["A"], "action": "fix", "owner_state": "ANALYZE", "brief": "x", "files": S},
+                    {"id": "T2", "findings": ["B"], "action": "fix", "owner_state": "ANALYZE", "brief": "x", "files": S}]})
+
+            def fix(self, t, run_dir, evidence):
+                calls22.append((t["id"], evidence is not None))
+                return NS(ok=t["id"] != "T1", note="service unavailable" if t["id"] == "T1" else "", output=None)
+        s22 = run_loop(d, 1, 3, None, F(), rebuild=lambda rd: {"ok": True}, harness_ids=lambda rd: set(),
+                       headline=lambda rd: {}, log=lambda *a: None)
+        r22 = {r["task"]: r for r in impact_rows(d)}
+        ok(calls22.count(("T1", True)) == 1 and r22["T1"].get("task_failed") and not r22["T1"].get("no_op"),
+           f"F22c a failed task call is not a no-op: it goes back once, as before ({calls22}, {r22['T1']})")
+        ok(r22["T2"].get("no_op") and r22["T2"]["passed"] is None and s22["passed"] == 0
+           and r22["T2"]["check"]["B"]["passed"] is True,
+           f"F22d a no-op whose check already holds keeps the check but gets no credit ({r22['T2']}, {s22})")
+    ok(task_scope({"files": ["analysis_settings.yaml"]}) == ("analysis_settings.yaml",)
+       and task_scope({"files": ["./models/ext/a.py", "toolkit/x.py"]}) == ("models/ext/a.py",)
+       and task_scope({"files": []}) == FIX_EDITABLE,
+       "F22e the fix worker may write only the in-scope files its task names (the whole scope when it names none)")
     ok(all(s in FIX_PLANNER_PROMPT for s in ("edit_scope", "harness_gaps", "no_op")),
        "F21c the planner prompt explains the edit scope, harness gaps and no-op rows")
     if fails:
