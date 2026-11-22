@@ -322,7 +322,7 @@ def harness_owned() -> tuple:
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*",
         "evidence_dossier.yaml", SIGNOFF_SHEET,    # v2 autonomy 1B-ii: the default dossier and the sign-off sheet
-        AMENDMENT_RECORD)                          # lead-gaps β (Codex r1): toolkit/spec/amend.py's record
+        AMENDMENT_RECORD, AMEND_LOCK)              # lead-gaps β (Codex r1): amend.py's record, the amendment lock
 
 
 def owned_path(root: str, rel: str, owned) -> bool:
@@ -1044,6 +1044,46 @@ SPEC_RETHINK_REQUEST = "spec_rethink_request.json"
 # amend.py), signed provisionally by the lead; the parent ends with this status and the run continues in the child.
 AMENDED_PROVISIONAL = "amended_provisional"
 AMENDMENT_RECORD = "amendment_record.json"           # toolkit/spec/amend.py RECORD
+AMEND_LOCK = "spec_amendment.lock"                   # held across a lead amendment and its hand-off (not copied: .lock)
+LEGACY_BRIEF_SIGNOFF = ("decision_brief.signoff.json",)      # scripts/decision_brief.py SIGNOFF (the v1 brief)
+
+
+class AmendmentLocked(RuntimeError):
+    """Another process holds the parent's amendment lock, or has already handed the run to its child: this resume
+    stops with nothing written (owner decision on #330)."""
+
+
+class _amend_lock:
+    """An exclusive, non-blocking lock on <run>/spec_amendment.lock (lib.safe_io, no link followed; flock is per open
+    file, so two processes, or two machines in one process, exclude each other). Held across the amendment and the
+    hand-off; a second holder raises AmendmentLocked."""
+
+    def __init__(self, run_dir: str):
+        self.run_dir, self.f = run_dir, None
+
+    def __enter__(self):
+        import fcntl
+        from lib.safe_io import open_append_nofollow
+        f = open_append_nofollow(self.run_dir, AMEND_LOCK)
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            f.close()
+            raise AmendmentLocked(f"another process is amending {self.run_dir} ({AMEND_LOCK} is held): this resume "
+                                  "stops with nothing written; resume again once that process has ended") from None
+        except BaseException:
+            f.close()
+            raise
+        self.f = f
+        return self
+
+    def __exit__(self, *exc):
+        import fcntl
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_UN)
+        finally:
+            self.f.close()
+        return False
 
 
 def _spec_signed_sha(run_dir: str) -> str | None:
@@ -1608,6 +1648,21 @@ class Machine:
         return self._go("EVIDENCE", "spec drafted and valid")
 
     def _lead_amend(self, req: dict) -> str | None:
+        """The lead amendment under the parent's amendment lock (owner decision on #330): the request and the parent's
+        state are read again once the lock is held, so a run another process already handed to its child, or is
+        amending now, stops with AmendmentLocked and nothing written."""
+        with _amend_lock(self.run_dir):
+            disk = load_state(self.run_dir)
+            if disk is not None and disk.status == AMENDED_PROVISIONAL:
+                raise AmendmentLocked(f"{self.run_dir} was already handed to its child by another process: this "
+                                      "resume stops with nothing written")
+            try:
+                cur = json.load(open(os.path.join(self.run_dir, SPEC_RETHINK_REQUEST)))
+            except (OSError, ValueError):
+                cur = None
+            return self._lead_amend_locked(cur if isinstance(cur, dict) else req)
+
+    def _lead_amend_locked(self, req: dict) -> str | None:
         """lead-gaps β (S7 under --signoff lead only): the rethink's machine-readable patch is applied by toolkit/spec/
         amend.py (--from-request) to a child run, the child's spec is signed by the lead, provisionally, and this run
         ends `amended_provisional`; run_v2 continues in the child, whose report heads with the amendment. None (the
@@ -1636,6 +1691,10 @@ class Machine:
             why = "the rethink wrote no machine-readable patch"
         elif self._provisional_amendment():
             why = "this run continues a provisional amendment; a second one waits for the owner"
+        elif any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
+            # owner decision on #330: in v2 a legacy decision-brief signature (which may bind other files than the spec)
+            # never satisfies the lead's check; the owner decides
+            why = "the parent carries a legacy decision brief signature, which a lead amendment never relies on in v2"
         elif not callable(getattr(self.tasks, "for_run_dir", None)):
             why = "the run's tasks cannot continue in a child run"
         elif self._signed_by() is None:
@@ -3035,6 +3094,59 @@ def _self_test_lead_amend(ok, td: str) -> None:
        and AMENDMENT_RECORD in harness_owned(),
        f"T_LEAD_AMEND_LOST without its record the child still heads its report as provisional and refuses a second lead "
        f"amendment; no deliverable may overwrite the record ({al2[:1]})")
+    # Owner decision (#330 review): a legacy decision-brief signature never satisfies the lead's check in v2
+    d, spec0 = parent("lead_brief", "lead", good)
+    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    s = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
+    la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and "decision brief" in la.get("why", "")
+       and not os.path.lexists(d + ".amend1") and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == spec0,
+       f"T_LEAD_AMEND_BRIEF a legacy decision-brief signature is refused for a lead amendment, with the reason recorded "
+       f"({s}, {la})")
+    # Owner decision (#330 review): two processes resuming the same parent never both amend it. A held lock stops the
+    # second resumer with a clear error and nothing written; a real race leaves one child and one clear failure.
+    d, _ = parent("lead_locked", "lead", good)
+    rq0 = open(os.path.join(d, SPEC_RETHINK_REQUEST), "rb").read() if os.path.exists(
+        os.path.join(d, SPEC_RETHINK_REQUEST)) else None
+    with _amend_lock(d):
+        try:
+            Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).step()
+            err = None
+        except AmendmentLocked as e:
+            err = str(e)
+    rq1 = open(os.path.join(d, SPEC_RETHINK_REQUEST), "rb").read() if os.path.exists(
+        os.path.join(d, SPEC_RETHINK_REQUEST)) else None
+    ok(err and "another process" in err and not os.path.lexists(d + ".amend1")
+       and "lead_amendment" not in json.loads(rq1 or b"{}") and load_state(d).status is None,
+       f"T_LEAD_AMEND_LOCKED a second resumer fails clearly while the lock is held and amends nothing ({err}; "
+       f"{rq0 is None})")
+    import threading
+    d, _ = parent("lead_race", "lead", good)
+    real_amend, gate = AM.amend, threading.Barrier(2)
+
+    def slow_amend(*a, **k):
+        import time as _t
+        _t.sleep(1.0)                 # both resumers overlap inside the amendment
+        return real_amend(*a, **k)
+    got = []
+
+    def resume():
+        try:
+            gate.wait()
+            Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).step()
+            got.append("ok")
+        except AmendmentLocked as e:
+            got.append(f"locked: {e}")
+    AM.amend = slow_amend
+    try:
+        th = [threading.Thread(target=resume) for _ in range(2)]
+        [t.start() for t in th]
+        [t.join(60) for t in th]
+    finally:
+        AM.amend = real_amend
+    ok(sorted(g[:6] for g in got) == ["locked", "ok"] and handoff_child(d) == d + ".amend1"
+       and not os.path.lexists(d + ".amend2") and load_state(d).status == AMENDED_PROVISIONAL,
+       f"T_LEAD_AMEND_RACE two racing resumers: one amends and hands off, the other fails clearly ({got})")
 
 
 def _self_test() -> int:
