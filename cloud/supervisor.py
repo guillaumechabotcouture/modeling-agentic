@@ -131,6 +131,8 @@ class GitHub:
     """The REST calls merge_train.sh made through `gh`. The token is sent as a header and never stored or printed."""
 
     def __init__(self, token: str, repo: str = GH_REPO):
+        if not re.fullmatch(r"[A-Za-z0-9_]{20,255}", token or ""):
+            raise ValueError("the GitHub token is not a bare token (letters, digits, _): merges stay disabled")
         self._token, self.repo = token, repo
 
     def _call(self, method, path, body=None):
@@ -150,6 +152,8 @@ class GitHub:
 
     def pr(self, n):
         code, j = self._call("GET", f"pulls/{int(n)}")
+        if code == 404:
+            raise LookupError(f"PR {n} not found")
         if code != 200:
             raise RuntimeError(f"GET pull {n}: HTTP {code}")
         return {"state": j["state"], "merged": bool(j.get("merged")), "head": j["head"]["sha"],
@@ -162,18 +166,31 @@ class GitHub:
         return int(j.get("behind_by") or 0) > 0
 
     def checks(self, sha):
-        """One word per check run and commit status: success | pending | failure (as `gh pr checks` buckets them)."""
-        code, j = self._call("GET", f"commits/{sha}/check-runs?per_page=100")
-        if code != 200:
-            raise RuntimeError(f"check-runs of {sha[:7]}: HTTP {code}")
-        out = ["pending" if r.get("status") != "completed" else
-               "success" if r.get("conclusion") in ("success", "neutral", "skipped") else "failure"
-               for r in j.get("check_runs") or []]
+        """One word per check run (every page), commit status and CI_WORKFLOW run: success | pending | failure. No
+        CI_WORKFLOW run on the head yet is pending (its jobs may not have registered); an unreadable answer raises."""
+        word = lambda st, c: ("pending" if st != "completed" else  # noqa: E731
+                              "success" if c in ("success", "neutral", "skipped") else "failure")
+        out, page = [], 1
+        while True:
+            code, j = self._call("GET", f"commits/{sha}/check-runs?per_page=100&page={page}")
+            if code != 200:
+                raise RuntimeError(f"check-runs of {sha[:7]}: HTTP {code}")
+            runs = j.get("check_runs") or []
+            out += [word(r.get("status"), r.get("conclusion")) for r in runs]
+            if len(runs) < 100:
+                break
+            page += 1
         code, j = self._call("GET", f"commits/{sha}/status")
-        if code == 200:
-            out += [{"success": "success", "pending": "pending"}.get(x.get("state"), "failure")
-                    for x in j.get("statuses") or []]
-        return out
+        if code != 200:
+            raise RuntimeError(f"status of {sha[:7]}: HTTP {code}")
+        out += [{"success": "success", "pending": "pending"}.get(x.get("state"), "failure")
+                for x in j.get("statuses") or []]
+        code, j = self._call("GET", f"actions/runs?head_sha={sha}&per_page=100")
+        if code != 200:
+            raise RuntimeError(f"workflow runs of {sha[:7]}: HTTP {code}")
+        wf = [word(r.get("status"), r.get("conclusion")) for r in j.get("workflow_runs") or []
+              if r.get("path") == CI_WORKFLOW]
+        return out + (wf or ["pending"])
 
     def update_branch(self, n, sha):
         return self._call("PUT", f"pulls/{int(n)}/update-branch", {"expected_head_sha": sha})[0] in (200, 202)
@@ -191,13 +208,16 @@ def merge_step(gh, item: dict, now: float) -> dict:
     def end(state, note):
         item.update(state=state, note=note, ended=utc(now))
         return item
-    pr = gh.pr(item["pr"])
+    if now - item["since"] > GIVE_UP_S:       # first: a PR GitHub keeps failing on never blocks the queue
+        return end("skipped", f"gave up after {GIVE_UP_S // 3600} h waiting")
+    try:
+        pr = gh.pr(item["pr"])
+    except LookupError as e:
+        return end("skipped", str(e))
     if pr["merged"]:
         return end("already_merged", "already merged")
     if pr["state"] != "open":
         return end("skipped", f"PR is {pr['state']}")
-    if now - item["since"] > GIVE_UP_S:
-        return end("skipped", f"gave up after {GIVE_UP_S // 3600} h waiting")
     head = pr["head"]
     item["state"] = "waiting"
     if gh.behind(pr["base"], head):
@@ -257,11 +277,13 @@ def run_dirs(work: str) -> list:
 def collect_step(blob, name, state, now, work, fetch=fetch_from_storage, metrics=run_metrics) -> list:
     """Try every enqueued label not yet collected (at most every COLLECT_EVERY_S); archive each new one to blob."""
     import results_store
+    import shutil
     new = []
     for lname, ent in sorted((state.get("collect") or {}).items()):
         for label, a in sorted(ent["entry"]["assignments"].items()):
             lab = ent["labels"].setdefault(label, {})
-            if lab.get("launch_id") != a.get("launch_id"):
+            if lab.get("launch_id") != a.get("launch_id"):   # a relaunch: the earlier launch's copy must not mix in
+                shutil.rmtree(os.path.join(work, lname, label), ignore_errors=True)
                 lab.clear()
                 lab.update(state="waiting", launch_id=a.get("launch_id"))
             if lab.get("state") == "collected" or now - lab.get("tried", -1e18) < COLLECT_EVERY_S:
@@ -282,18 +304,35 @@ def collect_step(blob, name, state, now, work, fetch=fetch_from_storage, metrics
             lab.update(state="collected", blob=dst, sha256=sha, at=utc(now), note="",
                        exit_code=(meta or {}).get("exit_code"), left_out=len(skipped))
             new.append(f"{lname}/{label}")
-    if new:
+            state["metrics_due"] = True
+    if state.get("metrics_due"):              # kept until metrics.json is stored, so a failed run is retried
         with tempfile.TemporaryDirectory() as td:
             out = metrics(run_dirs(work), os.path.join(td, "metrics.json"))
             if out:
                 blob.put_file(out, paths(name)["metrics"])
                 state["metrics_at"] = utc(now)
+        state["metrics_due"] = False
     return new
 
 
 # ---- the loop -----------------------------------------------------------------------------------------------------
 
-def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metrics=run_metrics, host="") -> dict:
+_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
+_LABEL = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}")
+
+
+def valid_entry(pl) -> dict:
+    """A collect request's payload, or ValueError: names that stay inside their directory, a launch id per label."""
+    a = pl.get("assignments") if isinstance(pl, dict) else None
+    if not (_NAME.fullmatch(str(pl.get("name", ""))) and isinstance(pl.get("storage_prefix"), str) and
+            isinstance(a, dict) and a and all(_LABEL.fullmatch(str(k)) and isinstance(v, dict) and v.get("launch_id")
+                                               for k, v in a.items())):
+        raise ValueError("collect request: needs a plain name, storage_prefix and a launch_id per plain label")
+    return pl
+
+
+def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metrics=run_metrics, host="",
+         merge_why="no GitHub token ($GH_TOKEN) on the VM: merges are held") -> dict:
     """One pass: ingest new requests, one merge step, collection, then state.json and status.json. A failing part is
     recorded in errors and the rest still runs; status is always written."""
     p = paths(name)
@@ -305,24 +344,30 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
         state["errors"] = (state["errors"] + [{"at": utc(now), "where": where,
                                                 "error": f"{type(e).__name__}: {str(e)[:200]}"}])[-KEEP:]
     try:
-        for b in blob.names(p["requests"]):
-            rid = b[len(p["requests"]):-len(".json")]
-            if rid in state["seen"]:
-                continue
+        names = blob.names(p["requests"])
+    except Exception as e:  # noqa: BLE001
+        names = []
+        err("requests", e)
+    seen = set(state["seen"])
+    for b in names:
+        rid = b[len(p["requests"]):-len(".json")]
+        if rid in seen:
+            continue
+        state["seen"].append(rid)            # a bad request is recorded once, never retried every loop
+        try:
             req = blob.get_json(b) or {}
             kind, pl = req.get("kind"), req.get("payload") or {}
-            state["seen"].append(rid)        # a bad request is recorded once, never retried every loop
             if kind == "merge":
                 queued = {i["pr"] for i in state["merge"]}
                 state["merge"] += [{"pr": int(n), "state": "queued", "request": rid} for n in pl.get("prs", [])
                                    if int(n) not in queued]
             elif kind == "collect":
-                state["collect"].setdefault(pl["name"], {"labels": {}})["entry"] = pl
+                state["collect"].setdefault(valid_entry(pl)["name"], {"labels": {}})["entry"] = pl
             elif kind != "noop":
-                raise ValueError(f"request {rid}: unknown kind {kind!r}")
+                raise ValueError(f"unknown kind {kind!r}")
             state["acks"] = (state["acks"] + [{"request": rid, "kind": kind, "at": utc(now)}])[-KEEP:]
-    except Exception as e:  # noqa: BLE001
-        err("requests", e)
+        except Exception as e:  # noqa: BLE001
+            err(f"request {rid}", e)
     if gh is not None and state["merge"]:
         try:
             item = merge_step(gh, state["merge"][0], now)
@@ -345,12 +390,11 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
             paused.append({"run": os.path.relpath(d, work), "status": st})
     status = {"name": name, "host": host, "heartbeat_utc": utc(now), "loops": state["loops"],
               "merge": {"enabled": gh is not None,
-                        "why": "" if gh is not None else "no GitHub token ($GH_TOKEN) on the VM: merges are held",
+                        "why": "" if gh is not None else merge_why,
                         "queue": state["merge"], "done": state["merge_done"][-10:]},
               "collect": {k: {"labels": v["labels"]} for k, v in state["collect"].items()},
               "metrics_at": state.get("metrics_at"), "paused": paused,
               "acks": state["acks"][-10:], "errors": state["errors"][-10:]}
-    state["seen"] = state["seen"][-1000:]
     blob.put_json(p["state"], state)
     blob.put_json(p["status"], status)
     return state
@@ -359,14 +403,26 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
 def loop(a):
     blob, p = Blob(a.account), paths(a.name)
     work = os.path.abspath(a.work)
-    token = os.environ.get("GH_TOKEN") or None
-    gh = GitHub(token) if token else None
-    state = blob.get_json(p["state"]) or {}
+    gh, why = None, "no GitHub token ($GH_TOKEN) on the VM: merges are held"
+    if os.environ.get("GH_TOKEN"):
+        try:
+            gh = GitHub(os.environ["GH_TOKEN"].strip())
+        except ValueError as e:
+            why = str(e)
+    for i in range(20):                       # a storage blip at start-up must not end the supervisor
+        try:
+            state = blob.get_json(p["state"]) or {}
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"state.json unreadable ({type(e).__name__}); retrying", flush=True)
+            time.sleep(30)
+    else:
+        return 1
     host = f"{os.uname().nodename}:{os.getpid()}"
     deadline = time.time() + a.max_hours * 3600
     while time.time() < deadline:
         try:
-            state = tick(blob, a.name, state, time.time(), work, gh=gh, host=host)
+            state = tick(blob, a.name, state, time.time(), work, gh=gh, host=host, merge_why=why)
         except Exception as e:  # noqa: BLE001 -- the loop outlives one bad pass (storage blip, DNS)
             print(f"tick failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
         time.sleep(a.every)
@@ -409,7 +465,8 @@ def pull(blob, name, dest, now=None) -> list:
     got = []
     for lname, ent in sorted((st.get("collect") or {}).items()):
         for label, lab in sorted(ent.get("labels", {}).items()):
-            if lab.get("state") != "collected" or index.get(lab["blob"]) == lab["sha256"]:
+            if (lab.get("state") != "collected" or index.get(lab["blob"]) == lab["sha256"]
+                    or not (_NAME.fullmatch(lname) and _LABEL.fullmatch(label))):
                 continue
             target = os.path.join(dest, lname)
             os.makedirs(target, exist_ok=True)

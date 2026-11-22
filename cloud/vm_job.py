@@ -935,6 +935,7 @@ def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
     job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
     storage_account(getattr(a, "store_account", None))   # so is a storage account value that is not a name
+    secret_env(getattr(a, "secret_env", None))           # and a --secret-env name that is not allowed or not set
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
     _vm_request(a)                         # so is a request no priced VM type matches (before the reservation)
     base, unique = a.name, run_cluster_name(a.name, a.job_id)
