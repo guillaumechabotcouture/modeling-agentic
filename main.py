@@ -1152,7 +1152,9 @@ def main_v2(args, ident: dict | None = None) -> int:
     status = run_v2_and_store(lambda: stage_machine.run_v2(
         question, run_path, tasks, max_rounds=args.max_rounds, signoff=args.signoff,
         budget_usd=args.max_budget_usd, derive_unsandboxed=getattr(args, "dev_unsandboxed_derivations", False)),
-        run_path)
+        run_path,
+        # lead-gaps β: a provisional lead amendment continues the run in a child run dir; it is stored too
+        store=lambda p: [store_run_results(x) for x in [p] + stage_machine.handoff_chain(p, kept=True)])
     print(f"v2 status: {status}", flush=True)
     if status.startswith("paused:"):
         return 2
