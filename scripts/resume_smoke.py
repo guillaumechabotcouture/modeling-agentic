@@ -33,7 +33,14 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CALLS, SLOW, KILL, KILLED, SLEEP = "MA_RS_CALLS", "MA_RS_SLOW_FROM", "MA_RS_KILL_AT", "MA_RS_KILLED", "MA_RS_SLEEP"
+CALLS, SLOW, KILL, KILLED = "MA_RS_CALLS", "MA_RS_SLOW_FROM", "MA_RS_KILL_AT", "MA_RS_KILLED"
+LOAD = "MA_RS_LOAD_S"         # seconds the toy model takes to load (cap_stop: startup longer than the old allowance)
+# cap_stop's allowance. The cap is wall-clock seconds x pool slots, counted from before the pool starts, so it pays
+# for process start and model load too (compute._map_local). Rows from 1 on never finish (they hold until the stop
+# kills them), so this only has to outlast the pool's start and row 0, never fit a count of rows: 2026-11-22, the
+# old 1.5 s allowance with 0.6 s rows kept 0 rows whenever a busy CI runner took over 0.9 s to start the pool.
+CAP_STOP_ALLOWANCE_S = 12.0
+CAP_STOP_LOAD_S = 1.5         # the old allowance: the scenario now holds with a start that alone used all of it
 SID = "MA_RS_SMOKE_SID"       # the smoke's own session: the toy never signals a process group in it
 SCENARIOS = ("analyze_timeout", "killed_batch", "cap_stop")
 N = 6
@@ -43,12 +50,13 @@ TOY_FN = f'''import os
 import signal
 import time
 
+if os.environ.get("{LOAD}"):                       # a slow model load: what a busy runner's pool start costs
+    time.sleep(float(os.environ["{LOAD}"]))
+
 
 def f(p):
     with open(os.environ["{CALLS}"], "a") as fh:
         fh.write(f"{{p['i']}}\\n")
-    if os.environ.get("{SLEEP}"):
-        time.sleep(float(os.environ["{SLEEP}"]))
     if p["i"] >= int(os.environ.get("{KILL}") or 99) and not os.path.exists(os.environ["{KILLED}"]):
         open(os.environ["{KILLED}"], "w").write("x")
         pid = int(open(os.environ["{KILLED}"] + ".driver").read())
@@ -288,20 +296,29 @@ def scenarios(work: str) -> list:
     calls = os.path.join(work, "cap_stop.calls")
     outp = os.path.join(d, "analysis", "batch", "rows.jsonl")
     os.makedirs(os.path.dirname(outp))
-    os.environ.update({CALLS: calls, KILLED: os.path.join(work, "cap.killed"), SLEEP: "0.6"})
+    # Row 0 finishes; rows from 1 on hold (the SLOW toy, watching this process) until the allowance stops the batch,
+    # so exactly row 0 is kept however long the pool takes to start, as long as it starts within the allowance.
+    killed = os.path.join(work, "cap.killed")
+    open(killed + ".driver", "w").write(str(os.getpid()))
+    cap_env = {CALLS: calls, KILLED: killed, SLOW: "1", LOAD: str(CAP_STOP_LOAD_S)}
+    os.environ.update(cap_env)
     try:
         _rows, s0 = compute.run_map(d, os.path.join(d, "models", "toy_fn.py") + "::f", [{"i": i} for i in range(N)],
-                                    outp, backend="local", max_workers=1, max_core_hours=1.5 / 3600, ledger=False)
+                                    outp, backend="local", max_workers=1, max_core_hours=CAP_STOP_ALLOWANCE_S / 3600,
+                                    ledger=False)
         stopped = (s0.get("failed_by_kind") or {}).get(compute.STOPPED, 0)
         why_stopped = str(s0.get("stopped") or "")
         before, kept = _calls(calls), _kept(d)
         returned = sorted(r["i"] for r in _rows if r.get("ok"))
-        os.environ.pop(SLEEP, None)
+        for k in (SLOW, LOAD):
+            os.environ.pop(k, None)
         _rows, s1 = compute.run_map(d, os.path.join(d, "models", "toy_fn.py") + "::f", [{"i": i} for i in range(N)],
                                     outp, backend="local", max_workers=1, ledger=False)
     finally:
-        os.environ.pop(SLEEP, None)
-    row = judge("cap_stop", before, _calls(calls)[len(before):], dict(s1, _kept=kept), rows=rows_of(d))
+        for k in cap_env:
+            os.environ.pop(k, None)
+    row = judge("cap_stop", before, _calls(calls)[len(before):], dict(s1, _kept=kept), expect_kept=[0],
+                rows=rows_of(d))
     if not stopped or not why_stopped.startswith(compute.CAP_STOP):
         row["ok"], row["problems"] = False, row["problems"] + [f"the allowance did not stop the batch ({why_stopped})"]
     if sorted(kept) != returned:
