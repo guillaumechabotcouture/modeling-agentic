@@ -549,7 +549,9 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
             row[f"{o}_averted"] = v
         row[headline_name] = row[f"{hl_outcome}_averted"]
         fixed_cost.append(sum(cost[i][plan[i]] for i in A.ids))
-        sol = A.solve(ben, cost)
+        from toolkit.analysis.core import auxiliary, best_known
+        with auxiliary(A, "uncertainty_draws"):      # 1C-c: a feasible plan within the stated gap is used and counted
+            sol = best_known(A, A.solve(ben, cost), plan, ben, cost)      # never below a feasible point plan
         A.guard(f"uncertainty draw {d}", [plan, sol["choice"]], r["events"])
         if on_solve is not None:
             on_solve(d, sampled, ben, cost, sol, r["events"])
@@ -622,6 +624,11 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
         data["emulator_error_floors"] = {"note": "{cost output: {package: n}}, unit values floored at zero after the "
                                                  "drawn emulator error, over every evaluation with that error",
                                          "counts": {k: dict(v) for k, v in A.model.error_floors.items()}}
+    if "emulator" in D.src and getattr(A.model, "error_clips", None) is not None:    # 1C-b 2a
+        data["emulator_error_clips"] = {"note": "{outcome: {package: n}}, unit reductions clipped to the emulator's "
+                                                "bounds after the drawn emulator error (the mean was inside them), "
+                                                "over every evaluation with that error",
+                                        "counts": {k: dict(v) for k, v in A.model.error_clips.items()}}
     if getattr(A, "plan_budget", None) is not None:      # F6 S1-1b: the draws re-optimised within the reserve
         data["budget_planned"] = float(A.plan_budget)
     if prov is not None:

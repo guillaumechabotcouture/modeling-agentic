@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -47,14 +48,17 @@ STATE_FILE = "run_state.json"
 SIGNOFF_FILE = "decision_spec.signoff.json"
 SCOPE_SIGNOFF = "scope_signoff.json"      # Phase 49 β (PR #85)
 SIGNOFF_SHEET = "decision_spec.signoff_sheet.md"   # v2-derived-inputs: what signing accepts beyond the spec's text
-STATES = ("SPEC", "SIGN", "EVIDENCE", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE",
+STATES = ("SPEC", "EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE",
           "GATE", "FIX_LOOP", "OWNER_DECISION", "WRITE", "PRESENTATION", "FINAL")
 # The state table: every transition the machine may take. A transition outside it is a bug
 # (raised, never taken).
 EDGES = {
-    "SPEC": {"SIGN", "SPEC", "FINAL"},
-    "SIGN": {"EVIDENCE", "SIGN"},
-    "EVIDENCE": {"ENGINE_CHOICE"},
+    # v2 autonomy 1B-ii (D1): EVIDENCE drafts the evidence dossier before SIGN, so the signer sees it (a run signed
+    # under the earlier order, SIGN before EVIDENCE, goes back to SIGN, which checks its signature); SIGN -> EVIDENCE
+    # | SPEC is the lead's repair of a refused sign-off (at most MAX_SIGN_REPAIRS), only before any signature.
+    "SPEC": {"EVIDENCE", "SPEC", "FINAL"},
+    "EVIDENCE": {"SIGN", "SPEC", "FINAL"},
+    "SIGN": {"ENGINE_CHOICE", "EVIDENCE", "SPEC", "SIGN", "FINAL"},
     "ENGINE_CHOICE": {"PREREGISTER", "CONFIGURE", "FINAL"},
     # The world model (docs/design/v2c-orchestration.md §14): beliefs anchored before the engine batch, scored after
     # the analysis. Fail soft: neither state can end the run or change what the analysis computes.
@@ -92,6 +96,7 @@ class AwaitingBudget(Exception):
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
+MAX_SIGN_REPAIRS = 2          # a refused lead sign-off goes back to EVIDENCE or SPEC at most this often, then waits
 
 
 @dataclass
@@ -256,6 +261,12 @@ def spec_signoff_findings(run_dir: str, signoff: str, backend=None) -> list[dict
                  "key": "spec", "scope_declarable": False,
                  "claim": "decision_spec.yaml changed after sign-off. It is the owner's; restore it or ask for a "
                           "new sign-off. Computational settings belong in analysis_settings.yaml."}]
+    from toolkit.spec import review_conditions as RC     # W0-G (Codex r2 P1-5): the conditions the signature bound
+    bad = RC.problems(run_dir, None, None)
+    if bad:
+        return [{"kind": "review_conditions_changed_after_signoff", "severity": "HIGH", "stage": "PLAN",
+                 "target_stage": "PLAN", "key": "review_conditions", "scope_declarable": False,
+                 "claim": "; ".join(bad)[:600]}]
     return []
 
 
@@ -285,14 +296,32 @@ def deliverable_problems(run_dir: str) -> list[str]:
         if os.path.islink(cur):
             return [f"deliverable path {rel!r} goes through a symlink ({os.path.relpath(cur, root)})"]
     norm = os.path.relpath(target, root).replace(os.sep, "/")
-    import pipeline as P
-    owned = tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
-        STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, "spec_rethink_request.json", FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
-        "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
-        "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*")
-    if owned_path(root, norm, owned):
+    # v2 autonomy 1B-ii: the signed evidence dossier the spec names, compared as a literal path (Codex r2 P1-1: a
+    # name such as x[1].yaml is not its own glob) and by identity
+    drel = spec["evidence"].get("dossier") if isinstance(spec.get("evidence"), dict) else None
+    if isinstance(drel, str) and drel.strip():
+        dn = os.path.normpath(drel).replace(os.sep, "/").lower()
+        dp = os.path.join(root, drel)
+        try:
+            same = os.path.exists(dp) and os.path.exists(target) and os.path.samefile(dp, target)
+        except OSError:
+            same = True
+        if dn == norm.lower() or same:
+            return [f"deliverable path {rel!r} is the evidence dossier the spec names"]
+    if owned_path(root, norm, harness_owned()):
         return [f"deliverable path {rel!r} is a file the harness, the gate or a critic owns"]
     return []
+
+
+def harness_owned() -> tuple:
+    """The run files the harness, the gate or a critic owns (glob patterns): no deliverable and no supplied evidence
+    dossier may be one of them."""
+    import pipeline as P
+    return tuple(P._reserved_patterns()) + PROTECTED_BY_FIX + (
+        STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, "spec_rethink_request.json", FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
+        "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
+        "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*",
+        "evidence_dossier.yaml", SIGNOFF_SHEET)    # v2 autonomy 1B-ii: the default dossier and the sign-off sheet
 
 
 def owned_path(root: str, rel: str, owned) -> bool:
@@ -319,11 +348,11 @@ def owned_path(root: str, rel: str, owned) -> bool:
     return False
 
 
-# Phase 49 β's sign-off lifecycle in v2: a fingerprinted request (scope_signoff.record) written at
-# AWAIT_OWNER and the owner's answers taken through the harness (harness_record), honouring the
-# run's signoff mode. Not wired yet (Codex round 1 on #98): until it is, decision-bearing findings
-# stay non-declarable rather than waiting in OWNER_DECISION for an answer nobody can give.
-OWNER_LIFECYCLE_WIRED = False
+# Phase 49 β's sign-off lifecycle in v2 (autonomy 1F): a fingerprinted request (scope_signoff.record) written on the
+# AWAIT_OWNER route, kept in run_state.json, and the answers taken through the harness (harness_record), honouring the
+# run's signoff mode: the owner's under --signoff owner; under --signoff lead the lead's, provisionally (D2), so the run
+# never waits; under --signoff none decision-bearing findings stay non-declarable.
+OWNER_LIFECYCLE_WIRED = True
 
 
 def _owner_rule():
@@ -345,38 +374,108 @@ def _owner_rule():
     return scope_signoff
 
 
-def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto") -> list[dict]:
+def _bearing_item(run_dir: str, v: dict) -> dict:
+    """What the owner is asked about a decision-bearing finding: its claim and the analysis's record of the decision
+    test, fingerprinted (an answer binds to both: a changed result is asked again)."""
+    ev = None
+    try:
+        with open(os.path.join(run_dir, AB.ANALYSIS_JSON)) as fh:
+            tests = (json.load(fh) or {}).get("decision_tests") or []
+        ev = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(v.get("key"))), None)
+    except (OSError, ValueError, AttributeError, TypeError):
+        ev = None
+    gid = FL.gate_id(v)
+    fp = hashlib.sha256(json.dumps({"finding": gid, "claim": v.get("claim", ""), "evidence": ev}, sort_keys=True,
+                                   default=str).encode()).hexdigest()[:16]
+    return {"finding": gid, "kind": v.get("kind"), "reason": "a measured decision test changes the plan",
+            "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp}
+
+
+def _answer_counts(a: dict, mode: str) -> bool:
+    """Whose answer releases an owner item: the owner's; the lead's only in a --signoff lead run (D2), and only a
+    provisional one (the harness's, listed in the report: Codex r1 of #316)."""
+    return a.get("by") == "owner" or (a.get("by") == "lead" and mode == "lead" and a.get("provisional") is True)
+
+
+def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto", mode: str = "owner") -> list[dict]:
     """Decision-bearing findings (a measured decision test that changes the plan) go through
-    Phase 49 β's owner rule before they can be declared. Without the rule they are not
-    scope-declarable, so the run can neither declare them away nor finish around them."""
+    Phase 49 β's owner rule before they can be declared: marked for the owner (an item the
+    AWAIT_OWNER route requests) until a recorded answer counts (`mode`: the run's sign-off).
+    Without the rule, or under --signoff none, they are not scope-declarable, so the run can
+    neither declare them away nor finish around them."""
     import validate_critique_yaml as V
     rule = _owner_rule() if rule == "auto" else rule
     bearing = [v for v in viols if v.get("decision_bearing") or v.get("kind") in DECISION_BEARING_KINDS]
     if not bearing:
-        return []
-    if rule is not None:
-        for v in bearing:
-            v["owner_signoff"] = True
-            v.setdefault("owner_item", {"finding": FL.gate_id(v), "reason": "a measured decision test changes the plan",
-                                        "claim": v.get("claim", "")})
+        if rule is None or mode == "none":
+            return []
+        # Codex r2 of #316 (P1): an owner's recorded decline holds the gate whatever else is present; nothing new is
+        # put to the owner here (the policy kinds go to the owner only beside a decision-bearing finding, as before)
+        marked = {id(v) for v in viols if v.get("owner_signoff")}
         try:
-            return list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable) or [])
+            out = [f for f in rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
+                                                 mode=mode, provisional_only=True) or []
+                   if f.get("kind") == "scope_declaration_declined"]
+        except Exception:  # noqa: BLE001 -- as before this rule: nothing marked, nothing declined
+            out = []
+        for v in viols:
+            if v.get("owner_signoff") and id(v) not in marked:
+                v.pop("owner_signoff", None)
+                v.pop("owner_item", None)
+        return out
+    if rule is not None and mode != "none":
+        out = []
+        try:
+            answers = (getattr(rule, "verified_answers", None) or (lambda rd: ({}, [])))(run_dir)[0]
+            for v in bearing:
+                item = _bearing_item(run_dir, v)
+                a = answers.get(item["fingerprint"]) or {}
+                if str(a.get("finding")) == item["finding"] and _answer_counts(a, mode):
+                    if a.get("decision") == "accept":
+                        v["owner_signed"] = {"by": a.get("by"), "at": a.get("at"), "fingerprint": item["fingerprint"],
+                                             **({"provisional": True} if a.get("provisional") else {})}
+                        continue
+                    v["scope_declarable"], v["owner_declined"] = False, True
+                    out.append({"kind": "scope_declaration_declined", "severity": "HIGH", "stage": "GATE",
+                                "target_stage": "MODEL", "scope_declarable": False, "key": item["finding"],
+                                "claim": f"The {a.get('by')} declined the declaration of `{item['finding']}` "
+                                         f"({a.get('at')}): {str(a.get('note') or 'no note')[:300]}."})
+                    continue
+                v["owner_signoff"], v["owner_item"] = True, item
+            return out + list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
+                                                 mode=mode, provisional_only=True) or [])
         except Exception as e:  # noqa: BLE001 -- fail closed below
             reason = f"the owner rule failed ({type(e).__name__}: {e})"
+    elif rule is not None:
+        reason = "under --signoff none nobody can accept a finding that bears on the decision"
     else:
         reason = "the owner rule (Phase 49 β, scripts/scope_signoff.py) is not available"
     for v in bearing:
         v["scope_declarable"] = False
         v.pop("owner_signoff", None)
+        v.pop("owner_signed", None)
         v["claim"] = f"{v.get('claim', '')} Not declarable: {reason}."
     return []
 
 
+def _earlier_round(path: str, round_n: int) -> int:
+    """The round a critique file states when it is an earlier one than `round_n`; else `round_n` (a file that
+    cannot be read, or states no earlier round, is validated against the gate's round as usual)."""
+    import yaml
+    try:
+        with open(path) as fh:
+            r = (yaml.safe_load(fh) or {}).get("round")
+    except Exception:  # noqa: BLE001 -- validate_critique reports it
+        return round_n
+    return r if isinstance(r, int) and not isinstance(r, bool) and 1 <= r < round_n else round_n
+
+
 def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
             history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None,
-            strict_done_when: bool = False, append_history: bool | None = None) -> dict:
+            strict_done_when: bool = False, append_history: bool | None = None, signoff: str = "owner") -> dict:
     """Today's rule functions, in today's order, on the v2 findings: the critic YAMLs, the
-    harness's checks (`extra`), and optionally spec-compliance and registry findings."""
+    harness's checks (`extra`), and optionally spec-compliance and registry findings. `signoff`:
+    the run's mode, for whose answers to owner items count (apply_owner_rule)."""
     import done_when
     import validate_critique_yaml as V
     critiques, schema_errors, refused = {}, [], {}
@@ -395,8 +494,15 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                 continue
             schema_errors.append(f"{V.FILENAMES[reviewer]} is missing")
             continue
+        rn = round_n
+        if reviewer == "critique-presentation" and not post_write:
+            # A pre-write gate with a draft follows a post-write modelling fix, one round on: PRESENTATION has not
+            # run since, and it reviews the rewritten draft before the next post-write gate. The last review is
+            # read as of the round it was written in (its findings stay open and listed), not refused for that
+            # round, which cost a schema repair and a paid review of a draft about to be replaced.
+            rn = _earlier_round(path, round_n)
         try:
-            critiques[reviewer] = V.validate_critique(path, reviewer, round_n)
+            critiques[reviewer] = V.validate_critique(path, reviewer, rn)
         except V.SchemaError as e:
             # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
             # blockers still have their done_when tests checked below, for the same reason.
@@ -442,7 +548,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     if spec_violations is not None:
         d = V.incorporate_spec_violations(d, list(spec_violations), max_rounds, round_n)
     viols = extra + done_when.gate_findings(dw or {})
-    viols += apply_owner_rule(run_dir, round_n, viols)
+    viols += apply_owner_rule(run_dir, round_n, viols, mode=signoff)
     for v in viols:
         k = FL.gate_key(v)
         if k:
@@ -464,13 +570,15 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     itself). `tested`: the finding has a test the fix loop can work to. A write-up finding waits
     for the draft."""
     import done_when as DW
+    import open_problems as OP
     import validate_critique_yaml as V
     draft = os.path.exists(os.path.join(run_dir, "manuscript.md"))
+    drafted = draft or os.path.exists(os.path.join(run_dir, "report.md"))     # the gate's own test for a draft
     closed = set(map(str, decision.get("resolved_by_test") or [])) | set(map(str, decision.get("outside_brief") or []))
     out = []
     for reviewer, name in V.FILENAMES.items():
         p = os.path.join(run_dir, name)
-        if not os.path.exists(p) or (reviewer == "critique-presentation" and not draft):
+        if not os.path.exists(p) or (reviewer == "critique-presentation" and not drafted):
             continue
         try:
             import yaml
@@ -493,7 +601,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
             if (not isinstance(b, dict) or b.get("resolved") or str(b.get("severity")) not in ("HIGH", "MEDIUM")
                     or str(b.get("id")) in closed):
                 continue
-            if b.get("target_stage") == "WRITE" and not draft:
+            if not drafted and OP.after_write_item(b):     # the gate's own rule (V._defer_write_findings)
                 continue
             dw = b.get("done_when")
             out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
@@ -508,7 +616,8 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
         # Every gate finding counts (a resolved blocker whose test fails is done_when_unmet; a missing
         # presentation review is critique_presentation_missing); only one that restates an open
         # critic blocker (same id as its key) is a duplicate.
-        if str(v.get("key") or "") in critic_open or fid in seen:
+        # (a regression is its own HIGH finding beside the open one it is keyed by)
+        if (str(v.get("key") or "") in critic_open and v.get("kind") != "done_when_regressed") or fid in seen:
             continue
         seen.add(fid)
         out.append({"id": fid, "source": "harness", "severity": v.get("severity"),
@@ -704,20 +813,27 @@ def report_claim_findings(run_dir: str) -> list[dict]:
         return []
     try:
         import render_claims as RCL
-        claims = RCL.load_claims(lp)
+        claims, invalid = RCL.load_claims_tolerant(lp)
     except Exception as e:  # noqa: BLE001 -- fail closed
         return [{"kind": "report_claims_unreadable", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                  "key": "claims", "scope_declarable": False, "claim": f"claims ledger unreadable: {e}"}]
     # The writer's own text, all of it: what the harness appends is not in manuscript.md, so no
     # marker the writer could copy can hide anything.
     text = open(rp).read()
-    out = []
-    for cid in sorted(set(re.findall(r"\[CLAIM:([^\]]*)\]", text)) - set(claims)):
+    # One invalid claim is its own finding (the valid ones still render: render_report); still HIGH and not
+    # declarable, as the whole-ledger refusal it replaces was.
+    out = [{"kind": "report_claim_invalid", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE", "key": cid,
+            "scope_declarable": False, "claim": f"The claims ledger's entry {cid} is invalid and cannot be rendered: {why}"}
+           for cid, why in sorted(invalid.items())]
+    # A reference is read as the renderer reads it (render_claims.render_text strips the id).
+    refs = {c if "\n" in c else c.strip() for c in re.findall(r"\[CLAIM:([^\]]*)\]", text)}   # no id spans lines
+    for cid in sorted(refs - set(claims) - set(invalid)):
         out.append({"kind": "report_claim_unresolved", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                     "key": cid, "scope_declarable": False,
                     "claim": f"The report has [CLAIM:{cid}], which is not in the claims ledger."})
+    bare = re.sub(r"\[CLAIM:[^\]\n]*\]", " ", text)       # an id inside a reference is not a bare id
     for cid in sorted(c for c in claims if "." in c or "_" in c):     # a plain word is not an id
-        if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", text):
+        if re.search(r"(?<![A-Za-z0-9_.:\-])" + re.escape(cid) + r"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])", bare):
             out.append({"kind": "report_claim_id_raw", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                         "key": cid, "scope_declarable": False,
                         "claim": f"The report shows the claim id {cid} instead of its value: write [CLAIM:{cid}]."})
@@ -882,7 +998,9 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ValueError(f"{AB.SPEC_FILE} does not parse: {e}") from None
     from toolkit.spec import preconditions as PC          # every signing path checks the preconditions (#215)
-    pre = PC.problems(run_dir, data, by)
+    from toolkit.spec import review_conditions as RC     # W0-G: read once, validated here and bound in the record
+    rc_bytes = RC.read_bytes(run_dir)
+    pre = PC.problems(run_dir, data, by, review_bytes=rc_bytes)
     if pre:
         raise ValueError("spec preconditions not met: " + "; ".join(pre[:10]))
     # engine parameter values without a basis, or chosen with a held-out benchmark, are refused whoever signs (as in
@@ -894,6 +1012,7 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     from toolkit.spec import signoff as SO      # F6 (#218): every registered precondition, recomputed, whoever signs
     ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
     rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
+    rec[RC.RECORD_KEY] = RC.sha_of(rc_bytes)
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
     GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
@@ -997,6 +1116,13 @@ def pending_amendments(ledger: dict, resolved=()) -> list[str]:
                   and FX.needs_owner_amendment(f))
 
 
+def pending_conflicts(ledger: dict) -> list[str]:
+    """W0-F: held-out calibration targets whose automatic test changes the plan (or did not run), not yet answered by
+    the owner; asked together with the owner amendments, once (an answer closes them)."""
+    from toolkit.analysis import conflicts as CF
+    return sorted(f.id for f in ledger.values() if f.kind == CF.FINDING_KIND and f.status == "open")
+
+
 def drop_declined(run_dir: str, ids) -> None:
     """A finding the owner declined is not a declared limitation: it leaves declared_findings.yaml (Codex #258)."""
     import yaml
@@ -1037,8 +1163,16 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
         f = ledger.get(fid)
         claim, fix = (f.claim, f.fix_requires) if f is not None else ("", None)
         fp = FL.answer_fingerprint(fid, claim, fix)       # the ledger binds the owner's answer to it
-        items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix,
-                      "reason": "its required remedy is an owner amendment of the signed decision spec",
+        conflict = getattr(f, "kind", None) == "evidence_conflict_declared"
+        opts = {}
+        if conflict:            # owner decision 2026-11-21: a refit is listed, with its estimated cost, never run
+            from toolkit.analysis import conflicts as CF
+            opts = {"options": CF.options(run_dir, getattr(f, "key", "")),
+                    "conflict": CF.verdict(run_dir, getattr(f, "key", ""))}     # Codex r4 of #316: the structured verdict
+        items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix, **opts,
+                      "reason": ("a held-out calibration target's automatic decision test changes the plan or could "
+                                 "not run (conflicts.policy declare_and_test)") if conflict else
+                      "its required remedy is an owner amendment of the signed decision spec",
                       "declarations": [], "declared": False, "fingerprint": fp})
     doc = {"pending": True, "round": round_n, "requested_at": _now(), "items": items, "producer": OWNER_REQUEST_PRODUCER,
            "decision_rationale": "the fix loop does not change the owner-signed spec: amend and re-sign it, or answer "
@@ -1078,10 +1212,15 @@ class Machine:
         allowance once (the task cap when it had none) and mark it, before anything else runs."""
         for j in self.st.journal.values():
             if isinstance(j, dict) and j.get("status") == "started":
-                a = j.get("allowance_usd")
-                self.st.spent_usd += float(a if a is not None else self.st.task_cap_usd)
+                self.st.spent_usd += self._interrupted_charge(j)
                 j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
                 j["status"] = "interrupted"
+
+    def _interrupted_charge(self, j: dict) -> float:
+        """What an interrupted task is charged: its allowance (the task cap when it had none) and, for a write-up
+        task, the read-back allowance it was given (0 in an entry written before that was recorded)."""
+        a, rb = j.get("allowance_usd"), j.get("readback_usd")
+        return float(a if a is not None else self.st.task_cap_usd) + float(rb if isinstance(rb, (int, float)) else 0.0)
 
     # -------------------------------------------------- plumbing
     def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None) -> str:
@@ -1125,8 +1264,7 @@ class Machine:
         if j and j.get("status") == "completed":
             return TaskResult(bool(j.get("ok")), j.get("output"), 0.0, j.get("note", ""), j.get("session_id"))
         if j and j.get("status") == "started":
-            a = j.get("allowance_usd")
-            self.st.spent_usd += float(a if a is not None else self.st.task_cap_usd)
+            self.st.spent_usd += self._interrupted_charge(j)
             j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
             j["status"] = "interrupted"
             save_state(self.run_dir, self.st)
@@ -1143,15 +1281,19 @@ class Machine:
                      f"floor (spent ${self.st.spent_usd:.2f} of ${self.st.budget_usd}). Paused for the owner; resume with "
                      f"python3 main.py --v2 --resume {self.run_dir} --max-budget-usd <higher cap>")
             raise AwaitingBudget(name)
-        j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance)
+        a = allowance if allowance is not None else self.st.task_cap_usd
+        b = self._budget(writeup)
+        # A crash read-back is a paid call too: a small cap, from what is left after this allowance (for a
+        # write-up task, left of the reserve it may use).
+        rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
+        # A write-up task spends up to the cap itself, so its read-back allowance is part of what an interrupted
+        # one is charged (_interrupted_charge): the cap holds on resume.
+        j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance, writeup=bool(writeup),
+                 readback_usd=rb if writeup else 0.0)
         self.st.journal[key] = j
         save_state(self.run_dir, self.st)
         setter = getattr(self.tasks, "set_allowance", None)
         if setter:
-            a = allowance if allowance is not None else self.st.task_cap_usd
-            b = self._budget()
-            # A crash read-back is a paid call too: a small cap, from what is left after this allowance.
-            rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
             setter(a, readback_usd=rb)
         res = getattr(self.tasks, name)(*args, **kwargs)
         self._charge(res)
@@ -1175,12 +1317,14 @@ class Machine:
             return self._go("FINAL", "budget used")
         return self._go("FINAL", "budget used before the model was built", "budget_exhausted")
 
-    def _budget(self) -> dict | None:
+    def _budget(self, writeup: bool = False) -> dict | None:
+        """What is left under the cap: less the write-up reserve, except for the write-up's own tasks (WRITE and
+        the PRESENTATION review of its draft), which the reserve is held for."""
         cap = self.st.budget_usd
         if not cap:
             return None
         from agents.run_budget import writeup_reserve
-        left = cap - writeup_reserve(cap) - self.st.spent_usd
+        left = cap - (0.0 if writeup else writeup_reserve(cap)) - self.st.spent_usd
         return {"spent": round(self.st.spent_usd, 4), "cap": cap, "left": round(left, 4)}
 
     def _out_of_budget(self) -> bool:
@@ -1270,7 +1414,69 @@ class Machine:
         return probs
 
     def harness_ids(self, run_dir: str) -> set[str]:
-        return {FL.gate_id(v) for v in self.harness_findings()}
+        """The ledger ids the harness can re-check between gates: its own findings and, as h_GATE reads them, the
+        backend's spec and registry checks. A fix task's finding absent from them passes its check; the gate's other
+        findings (fix_loop.GATE_ONLY) are never among them and are left to the next gate."""
+        vs = self.harness_findings()
+        for name in ("spec_violations", "registry_violations"):
+            fn = getattr(self.backend, name, None)
+            vs += list(fn(run_dir) or []) if fn else []
+        return {FL.gate_id(v) for v in vs if isinstance(v, dict)}
+
+    def _rethink(self, to: str, why: str, planned: bool = False):
+        """A RETHINK back-edge to SPEC or ENGINE_CHOICE, which is told why. From the gate (a structural mismatch): its
+        rationale, each critic's description of the mismatch and its STRUCTURAL findings. From the fix loop
+        (`planned`): this round's rethink briefs for that state and the findings they name. Either way, the open
+        findings that state owns, each with its remedy. An unsigned spec is redrafted with them as its feedback and a
+        fresh count of tries (a signed one is the owner's to amend: h_SPEC); the engine pick is told the engine the
+        run left. Nothing read here can stop the back-edge: a file that is not what it should be adds no reason."""
+        try:
+            out = self._rethink_reasons(to, planned)
+        except Exception as e:  # noqa: BLE001 -- advisory text: the back-edge is taken without it
+            out = [f"the reasons could not be read ({type(e).__name__})"]
+        if to == "SPEC" and not (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
+            self.st.tries["spec"] = 0
+            if out:
+                self.st.tries["spec_feedback"] = [f"rethink after review round {self.st.round}: {x}" for x in out]
+        elif to == "ENGINE_CHOICE":
+            self.st.tries["rethink_engine"] = {"engine": self.st.engine, "round": self.st.round, "why": out}
+        return self._go(to, why)
+
+    def _rethink_reasons(self, to: str, planned: bool) -> list[str]:
+        import yaml
+        import validate_critique_yaml as V
+        g, out, named, seen = self.st.last_gate or {}, [], set(), set()
+        if not planned:
+            if g.get("action") == "RETHINK_STRUCTURAL" and g.get("rationale"):
+                out.append(f"gate: {g['rationale']}")
+            for reviewer in V.FILENAMES:           # every reviewer the gate may have read
+                try:
+                    doc = yaml.safe_load(open(os.path.join(self.run_dir, V.FILENAMES[reviewer])))
+                    sm = doc.get("structural_mismatch") or {}
+                    if sm.get("detected"):
+                        out.append(f"{reviewer}: {sm.get('description')}")
+                    for b in doc.get("blockers") or []:       # its own text: not every reviewer's is in the ledger
+                        if isinstance(b, dict) and b.get("category") == "STRUCTURAL" and not b.get("resolved"):
+                            out.append(f"{b.get('id')}: {b.get('claim')}" + (f" Required: {_remedy(b)}" if _remedy(b) else ""))
+                            seen.add(str(b.get("id")))
+                except Exception:  # noqa: BLE001 -- the gate already judged the file; here it only adds reasons
+                    continue
+        else:
+            try:
+                plan = json.load(open(os.path.join(self.run_dir, f"fix_plan_r{self.st.round}.json")))["plan"]["tasks"]
+            except Exception:  # noqa: BLE001
+                plan = []
+            for t in plan if isinstance(plan, list) else []:
+                if isinstance(t, dict) and t.get("action") == "rethink" and t.get("owner_state") == to:
+                    out.append(f"fix plan: {t.get('brief')}")
+                    named |= {str(x) for x in (t.get("findings") if isinstance(t.get("findings"), list) else [])}
+        try:
+            led = FL.open_findings(FL.load(self.run_dir))
+        except Exception as e:  # noqa: BLE001 -- the reasons read so far are kept
+            led, out = [], out + [f"the findings ledger could not be read ({type(e).__name__})"]
+        out += [f"{f.id}: {f.claim}" + (f" Required: {f.fix_requires}" if f.fix_requires else "")
+                for f in led if (f.id in named or f.owner_state == to) and f.id not in seen]
+        return [" ".join(str(x).split())[:600] for x in out][:20]
 
     def rebuild(self, run_dir: str) -> dict:
         """The S1 pipeline, then the report again when a draft exists (a write-up fix edits
@@ -1291,7 +1497,9 @@ class Machine:
         self.st.paused = None
         if s == "SPEC" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)):
             return self.h_SPEC()                 # the amendment pause costs no model call (Codex review of #261 P1-3)
-        if s in LLM_STATES and self._out_of_budget():
+        # PRESENTATION is not checked here: its one task is a write-up task, and _task replays a completed review
+        # before it looks at the budget (h_PRESENTATION takes the budget path when there is no allowance).
+        if s in LLM_STATES and s != "PRESENTATION" and self._out_of_budget():
             return self._budget_out(s)
         try:
             return getattr(self, "h_" + s)()
@@ -1313,6 +1521,10 @@ class Machine:
                 break
             if (self.st.state, len(self.st.history)) == before:
                 raise RuntimeError(f"state {self.st.state} made no progress")
+        if self.st.paused and self.st.paused != AWAITING_BUDGET and self.st.state != "FINAL":   # _task: budget's own
+            # the harness benchmark protocol (I1, owner-wait) reads every pause from history, not only the budget one
+            self.st.history.append({"at": _now(), "paused": self.st.paused, "state": self.st.state,
+                                    "round": self.st.round, "spent_usd": round(self.st.spent_usd, 4)})
         save_state(self.run_dir, self.st)
         return self.st.status or (f"paused:{self.st.paused}" if self.st.paused else self.st.state)
 
@@ -1352,6 +1564,9 @@ class Machine:
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         if res.ok:
             try:
+                from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
+                if CF.ensure_default(rd):
+                    self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
                 errs = self._derive(rd) if self.st.derived_inputs else []
                 errs = errs or record_cited_inputs(rd)       # before anything reads a cited file
                 if self.st.derived_inputs:
@@ -1374,7 +1589,11 @@ class Machine:
             self.st.tries["spec_feedback"] = errs
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
-        return self._go("SIGN", "spec drafted and valid")
+        if not self._review_conditions(self.st.signoff, defer=False):
+            # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
+            self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
+            return self._go("SPEC", "review conditions could not be prepared for signing")
+        return self._go("EVIDENCE", "spec drafted and valid")
 
     def _derive(self, rd: str | None = None) -> list[str]:
         """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
@@ -1392,41 +1611,189 @@ class Machine:
 
     def h_SIGN(self):
         mode = self.st.signoff
+        from toolkit.spec import evidence_draft as EDR
+        if not self._signed_before() and EDR.read_record(self.run_dir) is None:
+            # Codex r1 P2-6: an unsigned run saved at SIGN under the earlier order has had no evidence stage
+            return self._go("EVIDENCE", "earlier order: the evidence stage runs before sign-off")
         if mode == "none":
-            return self._go("EVIDENCE", "sign-off not required (--signoff none)")
+            return self._go("ENGINE_CHOICE", "sign-off not required (--signoff none)")
         by = self._signed_by()
+        if not by and not self._review_conditions(mode):
+            self.st.paused, self.st.status = "awaiting_signoff", None
+            save_state(self.run_dir, self.st)
+            return "SIGN"
         # A HIGH geometry finding the spec proposes as an exception is the owner's to approve (review of #131, P1):
         # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
         pend = self._geometry_owner_pending()
         if by and (mode == "lead" or by == "owner") and not pend:
-            return self._go("EVIDENCE", f"spec signed by {by}")
+            return self._go("ENGINE_CHOICE", f"spec signed by {by}")
         if pend:
             how = ("python3 toolkit/spec/geometry.py approve" if by else "python3 agents/stage_machine.py sign")
             self.log(f"[machine] {len(pend)} HIGH geometry exception(s) wait for the owner ({', '.join(pend[:4])}): "
                      f"{how} {self.run_dir} --by owner")
+        elif mode == "lead" and self._signed_before():
+            # Codex r1 P1-1: a signature that no longer holds (the dossier or an input changed since) is never replaced
+            # by a lead's: the record stays, and the owner re-signs
+            self.st.paused, self.st.status = "awaiting_signoff", None
+            save_state(self.run_dir, self.st)
+            self.log("[machine] the spec's sign-off no longer holds (an input changed since, or the record is lost); "
+                     "the record stays: restore the signed inputs, or amend the spec and relaunch (the owner signs)")
+            return "SIGN"
         elif mode == "lead":
             res = self._task(f"SIGN#{self._visit()}:sign_spec", "sign_spec", self.run_dir)
             note = (_signoff(self.run_dir) or {}).get("note", "")
-            if res is not None and res.ok:
+            if res is None:                 # Codex r2 P2-3: no allowance is the budget path, not an owner pause
+                return self._budget_out("SIGN")
+            if res.ok:
                 if os.path.exists(os.path.join(self.run_dir, SIGNOFF_FILE)) and getattr(self.backend, "sign", None):
                     from lib.safe_io import remove_nofollow
                     remove_nofollow(self.run_dir, SIGNOFF_FILE)   # the lead's note; B writes its own record
                 try:
-                    self._sign("lead", note)              # the harness records the hash
-                    return self._go("EVIDENCE", "spec signed by the lead")
+                    self._sign("lead", (note + " " + self._evidence_note()).strip())   # the harness records the hash
+                    return self._go("ENGINE_CHOICE", "spec signed by the lead")
                 except ValueError as e:
                     self.log(f"[machine] the spec could not be signed: {e}")
+                    back = self._sign_repair(str(e))
+                    if back:
+                        return back
         self.st.paused = "awaiting_signoff"
         self.st.status = None
         save_state(self.run_dir, self.st)
         self.log(f"[machine] waiting for the owner: python3 agents/stage_machine.py sign {self.run_dir} --by owner")
         return "SIGN"
 
+    def _signed_before(self) -> bool:
+        """The run's spec was signed: a sign-off record binds it (current or not), or the history records a signature
+        (a record lost since does not make the run a draft again: Codex r1 P1-3)."""
+        return spec_signed_once(self.run_dir) or any(
+            h.get("from") == "SIGN" and str(h.get("why", "")).startswith("spec signed by") for h in self.st.history
+        ) or os.path.lexists(os.path.join(self.run_dir, "decision_brief.signed", AB.SPEC_FILE))   # a frozen copy (r2)
+
+    def _sign_repair(self, why: str) -> str | None:
+        """v2 autonomy 1B-ii: a refused lead sign-off goes back with the refusal as feedback, to EVIDENCE when the
+        evidence dossier is what was refused, else to SPEC (one more draft allowed), at most MAX_SIGN_REPAIRS times;
+        then the run waits for the owner. The check is not loosened: the next SIGN runs it again on the files."""
+        n = self.st.tries.get("sign_repair", 0)
+        if n >= MAX_SIGN_REPAIRS:
+            return None
+        self.st.tries["sign_repair"] = n + 1
+        if "evidence dossier" in why:
+            self.st.tries["evidence_feedback"] = [why[:2000]]
+            return self._go("EVIDENCE", f"sign-off refused (evidence dossier): repair {n + 1} of {MAX_SIGN_REPAIRS}")
+        self.st.tries["spec_feedback"] = [why[:2000]]
+        self.st.tries["spec"] = min(self.st.tries.get("spec", 0), MAX_SPEC_TRIES - 1)
+        return self._go("SPEC", f"sign-off refused: repair {n + 1} of {MAX_SIGN_REPAIRS}")
+
+    def _evidence_note(self) -> str:
+        """The evidence stage's declared gaps, for the lead's sign-off note (counts; the record holds the inputs)."""
+        from toolkit.spec import evidence_draft as EDR
+        rec = EDR.read_record(self.run_dir) or {}
+        if rec.get("status") in (None, "not_required"):
+            return ""
+        if rec.get("status") == "unreadable" or not EDR.record_current(self.run_dir, rec):
+            return (f"Evidence dossier: provisional, not reviewed by the owner; {EDR.RECORD} could not be read or no "
+                    "longer describes the dossier.")
+        g = rec.get("gaps") if isinstance(rec.get("gaps"), dict) else {}
+        parts = ", ".join(f"{len(g[k])} {k}" for k, _ in EDR.GAP_TEXT if g.get(k))
+        return (f"Evidence dossier {'drafted by a run task' if rec.get('drafted_by_task') else 'supplied'}: "
+                f"{len(rec.get('required') or [])} input(s); provisional, not reviewed by the owner; gaps declared in "
+                f"{EDR.RECORD}" + (f" ({parts})." if parts else "."))
+
+    def _review_conditions(self, mode: str, defer: bool = True) -> bool:
+        """Owner decision 2026-11-21 (W0-G): before signing, the spec critique's undeclared HIGH findings become rows of
+        review_conditions.yaml; under --signoff lead each open row is deferred to the owner, provisionally (D2), and
+        the run proceeds. The sheet is regenerated so it shows them. False (the run waits for the owner) when the
+        import cannot run: a signature never goes ahead without it."""
+        from toolkit.spec import review_conditions as RC
+        try:
+            n = RC.import_critique(self.run_dir)
+            d = RC.lead_defer(self.run_dir) if mode == "lead" and defer else 0
+            sp_ = os.path.join(self.run_dir, SIGNOFF_SHEET)
+            if os.path.exists(sp_):     # whenever the sheet does not show the file as it now is (Codex narrow round)
+                from toolkit.spec import signoff as SO
+                src = SO.sheet_sources(open(sp_, encoding="utf-8", errors="replace").read()) or {}
+                if src.get(RC.SHEET_KEY, "none") != RC.sha(self.run_dir):
+                    self._write_sheet()
+        except Exception as e:  # noqa: BLE001 -- fail closed: the owner is asked
+            self.log(f"[machine] review conditions could not be prepared for signing: {type(e).__name__}: {e}")
+            return False
+        if n or d:
+            self.log(f"[machine] review conditions: {n} spec-critique finding(s) added"
+                     + (f", {d} deferred to the owner by the lead (D2)" if d else ""))
+        return True
+
     def h_EVIDENCE(self):
-        # Stub (workstream V5): every parameter is an assumption until the evidence service checks it.
-        _put(self.run_dir, "evidence/registry.yaml", "# evidence service stub (v2 C): no parameter has been fetched or "
+        """v2 autonomy 1B-ii (D1): the evidence dossier, before SIGN. No decision inputs needed: a pass with no task.
+        Otherwise the harness scaffolds each missing entry with what execution uses (toolkit/spec/evidence_draft.py)
+        and the bounded draft_evidence task fills the evidence, at most EDR.MAX_TRIES times in the run, each time with
+        the signer's check's problems; then the record (evidence/dossier_draft.json) and the sign-off sheet, which
+        binds the dossier's sha256. A spec signed under the earlier order (SIGN before EVIDENCE) is left as signed."""
+        from toolkit.spec import evidence_draft as EDR
+        rd = self.run_dir
+        if self._signed_before():       # Codex r1 P1-2/3: SIGN checks the signature, its signer and the approvals
+            return self._go("SIGN", "evidence: the spec was signed before this stage (earlier order); the dossier "
+                                    "stays as signed")
+        # the evidence service's registry (workstream V5), still a stub: the run console reads it
+        _put(rd, "evidence/registry.yaml", "# evidence service stub (v2 C): no parameter has been fetched or "
              "matched yet\nstatus: stub\nentries: []\n")
-        return self._go("ENGINE_CHOICE", "evidence stub")
+
+        def spec_back(probs):
+            self.st.tries["spec_feedback"] = probs
+            return self._go("SPEC", "evidence: " + "; ".join(probs)[:200])
+        try:
+            raw = EDR._spec(rd)
+            a = EDR.assess(rd, raw)
+            rel = a.get("rel")
+            if rel and not a.get("draftable") and owned_path(rd, os.path.normpath(rel).replace(os.sep, "/"), tuple(
+                    p for p in harness_owned() if p not in ("data/*", EDR.ED.DOSSIER_FILE))):
+                a["spec_problems"] = a["spec_problems"] + [   # Codex r2 P1-5: a file the harness or a task writes
+                    f"evidence.dossier {rel!r} is a file the harness, the gate or a task writes: name "
+                    f"{EDR.ED.DOSSIER_FILE}"]
+            if a["spec_problems"]:
+                return spec_back(a["spec_problems"])
+            sc = EDR.scaffold(rd, a, raw)["scaffold"] if a["needed"] else {}
+        except Exception as e:  # noqa: BLE001 -- fail closed: back to the draft, whose tries are bounded
+            return spec_back([f"the evidence stage could not read the spec or the dossier: {type(e).__name__}: {e}"])
+        notes = []
+        fb = list(self.st.tries.get("evidence_feedback") or [])
+
+        def drafts():       # Codex r1 P2-7, r2 P2-2: the drafts the journal charged (completed or interrupted)
+            return sum(1 for k, j in self.st.journal.items() if k.startswith("EVIDENCE#")
+                       and j.get("status") in ("completed", "interrupted"))
+        if a["needed"]:
+            a = EDR.assess(rd, raw)
+            if a["problems"] and not a.get("draftable"):
+                notes.append(f"the spec names {a['rel']}: only {EDR.ED.DOSSIER_FILE} is drafted in the run")
+            while a["problems"] and a.get("draftable") and drafts() < EDR.MAX_TRIES:
+                n = drafts()
+                res = self._task(f"EVIDENCE#{self._visit()}:try{n + 1}", "draft_evidence", rd, a["rel"],
+                                 EDR.packet(a), fb + a["problems"])
+                self.st.tries["evidence"] = drafts()
+                if res is None:
+                    return self._budget_out("EVIDENCE")
+                notes.append(f"try {n + 1}: " + (res.note if res.ok else f"failed: {res.note}")[:200])
+                fb = []
+                try:
+                    EDR.scaffold(rd, a, raw)            # an entry the task dropped is scaffolded again
+                    a = EDR.assess(rd, raw)
+                except Exception as e:  # noqa: BLE001 -- the task left a dossier the harness cannot read
+                    a = dict(a, problems=[f"the dossier cannot be read: {type(e).__name__}: {e}"])
+        self.st.tries.pop("evidence_feedback", None)
+        rec = EDR.finish(rd, a, sc, drafts(), raw, notes)
+        if a["needed"]:
+            try:
+                if getattr(self.backend, "candidates", None) is None and hasattr(self.backend, "pre_sign_problems"):
+                    # Codex r1 P2-12: a resumed process has no candidate rows from SPEC; the sheet would lose them
+                    # (r2 P2-7: with h_SPEC's own arguments)
+                    (self.backend.pre_sign_problems(rd, derived=True) if self.st.derived_inputs
+                     else self.backend.pre_sign_problems(rd))
+                self._write_sheet(rd)        # the sheet records the dossier's sha256: written after the dossier
+            except Exception as e:  # noqa: BLE001 -- SIGN refuses without a current sheet, and says so
+                self.log(f"[machine] the sign-off sheet could not be written: {type(e).__name__}: {e}")
+        if rec["status"] == "incomplete":
+            self.log(f"[machine] the evidence dossier still has {len(a['problems'])} problem(s) after "
+                     f"{rec['tries']} draft(s): see {EDR.RECORD}")
+        return self._go("SIGN", f"evidence: {rec['status']} ({len(rec['required'])} input(s))")
 
     def h_ENGINE_CHOICE(self):
         try:
@@ -1439,9 +1806,14 @@ class Machine:
         if not eligible:
             _write_json(self.run_dir, "engine_choice.json", rec)
             return self._go("FINAL", "no registered engine fits the spec", "run_failed")
-        res = self._task(f"ENGINE_CHOICE#{self._visit()}:pick_engine", "pick_engine", spec, rows)
+        rt = self.st.tries.get("rethink_engine")         # set by a RETHINK back-edge (_rethink): the engine left, and why
+        res = self._task(f"ENGINE_CHOICE#{self._visit()}:pick_engine", "pick_engine", spec, rows,
+                         **({"rethink": rt} if rt else {}))
         if res is None:
             return self._budget_out("ENGINE_CHOICE")
+        if rt:
+            rec["rethink"] = rt
+            self.st.tries.pop("rethink_engine", None)
         pick = (res.output or {}).get("engine") if res.ok else None
         if pick not in {r["ref"] for r in eligible}:
             pick, why = eligible[0]["ref"], f"harness: the pick {pick!r} is not eligible; first eligible engine"
@@ -1571,7 +1943,7 @@ class Machine:
                         spec_violations=sv(self.run_dir) if sv else None,
                         registry_violations=rv(self.run_dir) if rv else None,
                         strict_done_when=self.st.v2_rules and self.st.tries.get("schema", 0) < MAX_SCHEMA_REPAIRS,
-                        append_history=False)
+                        append_history=False, signoff=self.st.signoff)
             opened = []
             if d.get("action") and self.st.v2_rules:
                 opened = open_findings(self.run_dir, d)
@@ -1579,7 +1951,8 @@ class Machine:
                 d = require_judged(d, opened)
                 # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
                 # (synced with this decision, so a gate finding is read as this gate states it: Codex round 3 of #258)
-                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw)[0])
+                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw,
+                                                    lead_ok=self.st.signoff == "lead")[0])
                 if d.get("rule_matched") == "owner_declined":
                     drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
                                                  if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
@@ -1602,7 +1975,7 @@ class Machine:
         self.st.last_gate = {k: (d or {}).get(k) for k in ("action", "rule_matched", "rounds_remaining", "rationale")}
         self.st.last_gate.update(round=self.st.round, post_write=pw)
         if (d or {}).get("action"):
-            FL.sync(self.run_dir, d, self.st.round, post_write=pw)
+            FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")
             if d.get("rule_matched") == "4m":           # these are why the loop runs: plan them
                 led = FL.load(self.run_dir)
                 for fid in d.get("open_tested") or []:
@@ -1613,12 +1986,14 @@ class Machine:
                 led = FL.load(self.run_dir)
                 # Codex review of #258 P1-10: a finding whose remedy is an owner amendment goes to the owner on every
                 # route, not only from the fix loop
-                amend = pending_amendments(led, d.get("resolved_by_test"))
+                amend = sorted(set(pending_amendments(led, d.get("resolved_by_test")) + pending_conflicts(led)))
                 if amend:
                     self._request_owner(led, amend)
                     return self._go("OWNER_DECISION", f"{len(amend)} finding(s) need an owner amendment "
                                                       f"({', '.join(amend)[:120]})")
         nxt, status, mode = route_gate(d, pw)
+        if nxt == "OWNER_DECISION":
+            self._request_scope(d)
         lang = (d or {}).get("report_acceptance_language") or {}
         if nxt == "FINAL" and lang.get("remaining"):
             # Not delivered with acceptance language in place (F6 S1-7): the writer repairs the draft, which then
@@ -1655,6 +2030,8 @@ class Machine:
             self.st.post_write = False
         if nxt == "WRITE":
             self.st.write_mode = mode
+        if nxt in ("SPEC", "ENGINE_CHOICE"):
+            return self._rethink(nxt, why)
         return self._go(nxt, why, status)
 
     def _language_check(self, status: str) -> dict:
@@ -1681,7 +2058,7 @@ class Machine:
             return self._go("OWNER_DECISION", f"{len(summ['owner_amendments'])} finding(s) need an owner amendment "
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
-            return self._go(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})")
+            return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})", planned=True)
         if not summ["tasks"] and summ.get("write_up") and self._has_draft():
             # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
             if self.st.round_pending:
@@ -1698,11 +2075,37 @@ class Machine:
         self.st.tries["owner_request"] = [i["fingerprint"] for i in doc["items"]]
         save_state(self.run_dir, self.st)
 
-    def h_OWNER_DECISION(self):
-        """Released only by the owner's own answers to every item of the pending request (scripts/scope_signoff.py sign
-        --by owner, from the owner's shell); the machine, the harness here, then records them (harness_record), so the
-        ledger counts them (Codex review of #258 P1-8). No pending request, an empty one or a lead's answer: it waits."""
+    def _request_scope(self, d: dict) -> None:
+        """1F: the AWAIT_OWNER route's request (the decision-bearing items the gate marked), written with
+        scope_signoff.record and its fingerprints kept in run_state.json, as _request_owner does. No item: none is
+        kept, and OWNER_DECISION fails closed."""
         import scope_signoff as SS
+        SS.record(self.run_dir, d, self.st.round, producer="agents/stage_machine.py GATE (decision-bearing findings)")
+        try:
+            req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
+        except (OSError, ValueError):
+            req = {}
+        fps = [i.get("fingerprint") for i in req.get("items") or [] if isinstance(i, dict)] \
+            if isinstance(req, dict) and req.get("pending") else []
+        if fps and all(fps):
+            self.st.tries["owner_request"] = fps
+        else:
+            self.st.tries.pop("owner_request", None)
+        save_state(self.run_dir, self.st)
+
+    def h_OWNER_DECISION(self):
+        """Released by the answers to every item of the pending request: the owner's (scripts/scope_signoff.py sign
+        --by owner, from the owner's shell) or, under --signoff lead (D2), the lead's provisional ones, which the harness
+        writes here so the run never waits (scope_signoff.provisional_answers); the machine then records them
+        (harness_record), so the ledger counts them (Codex review of #258 P1-8). No recorded request: it fails closed.
+        Under --signoff owner a lead's answer does not count: it waits."""
+        import scope_signoff as SS
+        # Codex r4 of #316: the request is read, answered, recorded and closed under the sign-off lock, so an owner's
+        # sign that waited on it finds the request closed (and refuses) instead of reporting an answer never applied
+        with SS.locked(self.run_dir):
+            return self._owner_decision(SS)
+
+    def _owner_decision(self, SS):
         try:
             req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
         except (OSError, ValueError):
@@ -1716,13 +2119,35 @@ class Machine:
             return self._go("FINAL", "OWNER_DECISION has no recorded owner request: relaunch with reuse (a new run dir "
                                      "from this one's spec and stored rows)", "run_failed")
         answers, bad = SS.load_answers(self.run_dir)
-        answered = bool(want) and not bad and all(
-            isinstance(answers.get(fp), dict) and answers[fp].get("by") == "owner"
-            and answers[fp].get("decision") in SS.DECISIONS for fp in want)
+        lead = self.st.signoff == "lead"
+
+        def done(fp):
+            a = answers.get(fp)
+            return isinstance(a, dict) and _answer_counts(a, self.st.signoff) and a.get("decision") in SS.DECISIONS
+        if lead and bad:        # never overwritten (Codex r1 of #316): an owner answer in it would be lost
+            _withhold_report(self.run_dir)
+            return self._go("FINAL", f"{SS.SIGNOFF} cannot be read, so the lead cannot answer: restore it and resume",
+                            "run_failed")
+        if lead and not all(done(fp) for fp in want):
+            items = {i.get("fingerprint"): i for i in (req or {}).get("items") or [] if isinstance(i, dict)} \
+                if isinstance(req, dict) else {}
+            if any(fp not in items for fp in want):
+                _withhold_report(self.run_dir)
+                return self._go("FINAL", "the owner request cannot be read, so the lead cannot answer it: relaunch with "
+                                         "reuse", "run_failed")
+            todo = [items[fp] for fp in want if not done(fp)]
+            SS.provisional_answers(self.run_dir, todo, self.st.round,
+                                   plan_changing={i["fingerprint"]: _plan_changing(i) for i in todo})
+            self.st.history.append({"at": _now(), "provisional": [i.get("finding") for i in todo], "by": "lead",
+                                    "state": "OWNER_DECISION"})
+            answers, bad = SS.load_answers(self.run_dir)
+        answered = bool(want) and not bad and all(done(fp) for fp in want)
         if answered:
             SS.harness_record(self.run_dir)
             self.st.tries.pop("owner_request", None)
-            nxt = self._go("GATE", "the owner answered the scope declarations")    # persisted before the request closes
+            who = "the lead answered provisionally" if lead and any(answers[fp].get("by") == "lead" for fp in want) \
+                else "the owner answered"
+            nxt = self._go("GATE", f"{who} the scope declarations")    # persisted before the request closes
             if isinstance(req, dict):
                 from lib.safe_io import write_nofollow
                 write_nofollow(self.run_dir, OWNER_REQUEST, json.dumps(dict(req, pending=False, answered_at=_now()),
@@ -1753,8 +2178,10 @@ class Machine:
         return self._go("PRESENTATION", f"draft written ({mode})")
 
     def h_PRESENTATION(self):
+        # The review of the draft is part of the write-up: like WRITE, it may use the write-up reserve (an accepted
+        # run whose WRITE spent into the reserve ended budget_exhausted here, with most of the reserve unspent).
         res = self._task(f"PRESENTATION#{self._visit()}:r{self.st.round}", "critique", self.run_dir,
-                         "critique-presentation", self.st.round)
+                         "critique-presentation", self.st.round, writeup=True)
         if res is None:
             return self._budget_out("PRESENTATION")
         return self._go("GATE", "presentation review of the draft")
@@ -1819,9 +2246,35 @@ def _write_json(run_dir: str, rel: str, obj) -> None:
 
 
 def _rep_error(rep: dict) -> str:
-    errs = list(rep.get("errors") or []) + [f"{s.get('id')}: {s.get('error')}" for s in rep.get("steps") or []
-                                            if s.get("status") != "ok"]
+    errs = list(rep.get("errors") or []) + [f"{s.get('id')}: {_step_error(s.get('error'))}"
+                                            for s in rep.get("steps") or [] if s.get("status") != "ok"]
     return "; ".join(str(e) for e in errs)[:300]
+
+
+_TB_FRAME = re.compile(r'^[ |+]*File "([^"]+)", line (\d+)(?:, in (\S+))?\s*$')
+_TB_EXC = re.compile(r"^[A-Za-z_][\w.]*(?::|$)")
+_TB_HEAD = re.compile(r"[ |+]*(?:Exception Group )?Traceback \(most recent call last\):")
+
+
+def _step_error(err) -> str:
+    """A failed step's error, short enough for the history line. A Python traceback in it (the step's log tail; its
+    header may have fallen outside the tail) is reduced to the frame that raised and the exception's first line,
+    after whatever preceded the traceback (a timeout's own text); "Traceback at" keeps it read as a crash. The first
+    300 characters had held only the outer frames, so T16's CI flakes recorded no exception (T9b). Any other error is
+    kept as it is (T9c)."""
+    text = str(err)
+    lines = text.splitlines()
+    fr = [(k, m) for k, m in ((k, _TB_FRAME.match(ln)) for k, ln in enumerate(lines)) if m]
+    if not fr:
+        return text
+    k, m = fr[-1]
+    depth = lambda ln: len(ln) - len(ln.lstrip(" |+-"))  # noqa: E731 -- indent, ExceptionGroup borders included
+    exc = next((ln.lstrip(" |+-") for ln in lines[k + 1:] if depth(ln) < depth(lines[k])
+                and _TB_EXC.match(ln.lstrip(" |+-"))), "no exception line in the log tail")
+    hdr = _TB_HEAD.search(text)
+    head = text[:hdr.start()] if hdr else ""      # a timeout's own text, before the traceback it shows
+    where = f"{os.path.basename(m.group(1))}:{m.group(2)}" + (f" in {m.group(3)}" if m.group(3) else "")
+    return f"{head.strip()[:120]} Traceback at {where}: {exc[:150]}".strip()
 
 
 # Machine.reopen_interrupted_analysis's history line, per resumable cause.
@@ -1959,6 +2412,56 @@ def _status_line(run_dir: str, status: str | None) -> str:
     return f"{STATUS_MARK}\n**Run status: {text}.** (`{status}`; rendered by the harness)\n\n"
 
 
+def _plan_changing(item: dict) -> bool:
+    """An owner item whose evidence shows the plan changes: a decision-bearing kind, a declaration whose decision
+    test changes the decision, or a W0-F evidence conflict whose verdict changes the plan (or whose test did not run:
+    W0-F counts that as changing it; Codex r4 of #316)."""
+    conf = item.get("conflict")
+    if item.get("kind") == "evidence_conflict_declared" and not isinstance(conf, dict):
+        return True     # a request saved before the verdict was carried: it holds only plan-changing or untested ones
+    return item.get("kind") in DECISION_BEARING_KINDS or (isinstance(conf, dict) and conf.get("changes_plan") is True) \
+        or any((d.get("test") or {}).get("decision_changes") is True
+               for d in item.get("declarations") or [] if isinstance(d, dict))
+
+
+def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:
+    """(lines above the draft, a section after it): the lead's provisional decisions of a --signoff lead run (D2),
+    the owner items answered (scripts/scope_signoff.py provisional) and the engine departures credited
+    (`provisional_lead` in engine_choice.json). Those whose decision test changes the plan head the report."""
+    import scope_signoff as SS
+    try:
+        rows = [(r.get("finding"), bool(r.get("plan_changing")), (r.get("review") or {}).get("decision"))
+                for r in SS.provisional(run_dir)]
+    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the list could not be read
+        return ([f"**Provisional decisions: the list could not be read ({type(e).__name__}).**\n\n"],
+                ["", "## Provisional decisions (the lead's)", "", f"Could not be read: {type(e).__name__}: {e}"])
+    try:
+        ch = json.load(open(os.path.join(run_dir, AB.ENGINE_CHOICE)))
+        deps = [d for d in ch.get("engine_departures") or [] if isinstance(d, dict) and d.get("status") == "provisional_lead"]
+    except (OSError, ValueError, AttributeError):
+        deps = []
+    try:
+        changes = {str(t.get("id")) for t in (json.load(open(os.path.join(run_dir, AB.ANALYSIS_JSON))) or {}).get(
+            "decision_tests") or [] if isinstance(t, dict) and t.get("plan_changes")}
+    except (OSError, ValueError, AttributeError, TypeError):
+        changes = set()
+    rows += [(f"engine departure {d.get('benchmark') or d.get('component')}", str(d.get("decision_test")) in changes,
+              None) for d in deps]
+    if not rows:
+        return [], []
+    flagged = [f for f, pc, _r in rows if pc]
+    how = (f"`python3 scripts/scope_signoff.py review {run_dir} --finding <id> --confirm|--overturn`; an engine departure "
+           "is confirmed by the owner's signature of the spec in a relaunch")
+    top = [f"**Provisional decisions that change the plan.** This run was unattended (`--signoff lead`); the lead "
+           f"answered, provisionally, {len(flagged)} decision(s) that are the owner's and whose decision test changes the "
+           f"plan: {', '.join(map(str, flagged))}. The owner confirms or overturns each ({how}).\n\n"] if flagged else []
+    sec = ["", "## Provisional decisions (the lead's, under --signoff lead; for the owner's review)", "",
+           f"Each decision below is the owner's; the lead made it provisionally so the run could finish. Review: {how}.", ""]
+    sec += [f"- **{f}**: accepted provisionally; plan changes: {'yes' if pc else 'no'}; owner review: "
+            f"{r or 'not yet'}." for f, pc, r in rows]
+    return top, sec
+
+
 def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     """report.md = the run status line, the writer's draft, and the blocks the harness renders from
     artifacts: the headline numbers, the declared limits and open findings (in full, with their
@@ -1970,7 +2473,8 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         # The writer writes [CLAIM:id]; the harness substitutes the value (no number is typed).
         import render_claims as RCL
         try:
-            draft, _unresolved = RCL.render_text(draft, RCL.load_claims(lp))
+            # the valid claims; an invalid one stays a reference, reported by report_claim_findings
+            draft, _unresolved = RCL.render_text(draft, RCL.load_claims_tolerant(lp)[0])
         except Exception:  # noqa: BLE001 -- left unrendered; report_claim_findings flags it
             pass
     h = backend.headline(run_dir)
@@ -2011,13 +2515,41 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
                   f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
+    try:            # v2 autonomy 1B-ii: who drafted and signed the evidence dossier, and its declared gaps
+        from toolkit.spec import evidence_draft as EDR
+        so = {}
+        for f in (SIGNOFF_FILE, "decision_brief.signoff.json"):     # Codex r1 P2-11: the record that binds the spec
+            try:
+                d_ = json.load(open(os.path.join(run_dir, f)))
+            except (OSError, ValueError):
+                continue
+            binds = isinstance(d_, dict) and ((d_.get("sha256") or {}).get(AB.SPEC_FILE) if isinstance(
+                d_.get("sha256"), dict) else None) or (isinstance(d_, dict) and d_.get("spec_sha256"))
+            if binds and (d_.get("signed_by") or d_.get("by")):     # r2 P2-5: a brief that never bound the spec
+                so = d_
+                break
+        eb = EDR.report_block(run_dir, so.get("signed_by") or so.get("by"))
+    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the block could not be rendered
+        eb = ["## Evidence dossier", "", f"Could not be rendered from the evidence record: {type(e).__name__}.", ""]
+    if eb:
+        lines += [""] + eb[:-1]
+    from toolkit.analysis import conflicts as CF       # W0-F: every held-out calibration target
+    cl = CF.report_lines(run_dir)
+    if cl:
+        lines += [""] + cl[:-1]
     wmp = os.path.join(run_dir, "world_model", "world_model.md")    # §14: rendered by the harness from score.json
     try:
         if os.path.isfile(wmp) and not os.path.islink(wmp):
             lines += ["", open(wmp, encoding="utf-8").read().rstrip()]
     except (OSError, ValueError) as e:      # fail soft: the report is rendered without it, and says so
         lines += ["", f"## World model\n\nThe world-model section could not be read: {type(e).__name__}."]
-    head, body = _status_line(run_dir, status), draft.rstrip() + "\n"
+    top, prov = provisional_lines(run_dir)
+    lines += prov
+    head, body = _status_line(run_dir, status) + "".join(top), draft.rstrip() + "\n"
+    from toolkit.spec import review_conditions as RCN       # W0-G: conditions the lead deferred, at the top
+    rcl = RCN.report_lines(run_dir)
+    if rcl:
+        head = head + "\n".join(rcl) + "\n"
     full = head + body + "\n".join(lines) + "\n"
     _put(run_dir, "report.md", full)
     # What the harness added, authenticated by the report's hash: writer_qa checks only the writer's span.
@@ -2049,6 +2581,58 @@ def _write_deliverable(run_dir: str) -> None:
     _put(run_dir, str(df["path"]), buf.getvalue())
 
 
+# A relaunch with reuse (a new run dir from another one's spec and stored rows) names its parent here; the launcher
+# sets it. main.py gains a --parent-run flag after v1 retirement, without changing the record.
+PARENT_ENV = "MA_PARENT_RUN"
+
+
+def _parent_record(path: str) -> dict:
+    """metadata.json parent_run: the parent's dir name and its run_state.json sha256 (None, with the error, when it
+    cannot be read: the link is then never trusted by scripts/harness_metrics.py)."""
+    from lib.safe_io import read_nofollow
+    rec = {"run_dir": os.path.basename(os.path.abspath(path)), "recorded_from": PARENT_ENV}
+    try:
+        rec["run_state_sha256"] = hashlib.sha256(read_nofollow(path, STATE_FILE)[0]).hexdigest()
+    except Exception as e:  # noqa: BLE001 -- recorded, never raised: the run itself is not the parent's
+        rec.update(run_state_sha256=None, error=type(e).__name__)
+    return rec
+
+
+def _runtime_ids() -> dict:
+    """The model ids and the Agent SDK version this process runs with ("unknown" when they cannot be read)."""
+    try:
+        from agents.enforcement import MODEL_DEEP, MODEL_FAST
+        models = {"deep": MODEL_DEEP, "fast": MODEL_FAST}
+    except Exception:  # noqa: BLE001
+        models = {"deep": "unknown", "fast": "unknown"}
+    try:
+        from importlib.metadata import version
+        sdk = version("claude-agent-sdk")
+    except Exception:  # noqa: BLE001
+        sdk = "unknown"
+    return {"models": models, "sdk_version": sdk}
+
+
+def _record_invocation(run_dir: str, budget_usd, cap_usd) -> None:
+    """This invocation's record in metadata.json: the latest model ids and SDK version at the top level, and on the
+    invocation entry main.py appended (scripts/lib/pipeline_id.py stamp) the budget asked for, the cap in force, the
+    model ids and the SDK version. No entry is invented when main.py wrote none. Read with no link followed; a
+    metadata.json that cannot be read is left as it is (never replaced by a partial record)."""
+    from lib.safe_io import read_nofollow
+    try:
+        meta = json.loads(read_nofollow(run_dir, "metadata.json")[0].decode())
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(meta, dict):
+        return
+    ids = _runtime_ids()
+    meta.update(ids)
+    inv = meta.get("invocations")
+    if isinstance(inv, list) and inv and isinstance(inv[-1], dict) and "budget_usd" not in inv[-1]:
+        inv[-1].update(budget_usd=budget_usd, cap_usd=cap_usd, **ids)
+    _write_json(run_dir, "metadata.json", meta)
+
+
 def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "owner", gate_mode: str = "v2",
              budget_usd: float | None = None, derived_inputs: bool = True, derive_unsandboxed: bool = False,
              world_model: bool = True) -> RunState:
@@ -2065,6 +2649,8 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
     meta = meta if isinstance(meta, dict) else {}
     meta.update({"question": question, "started": meta.get("started") or _now(), "pipeline": "v2",
                  "max_rounds": max_rounds, "signoff": signoff})
+    if os.environ.get(PARENT_ENV):
+        meta["parent_run"] = _parent_record(os.environ[PARENT_ENV])
     _write_json(run_dir, "metadata.json", meta)
     save_state(run_dir, st)
     return st
@@ -2083,12 +2669,30 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
                            "spent_usd": round(st.spent_usd, 4)})
         st.budget_usd = budget_usd
         save_state(run_dir, st)
+    _record_invocation(run_dir, budget_usd, st.budget_usd)
     m = Machine(run_dir, tasks, st, backend=backend, log=log, cross_engine_check=cross_engine_check)
     m.reopen_interrupted_analysis()
     return m.run()
 
 
 # ------------------------------------------------------------------ self-test
+def _t_owner_disposes(run_dir: str) -> None:
+    """Self-tests: the owner disposes of each open review condition (deferred to the owner) and the sheet is
+    regenerated, as an owner does before signing (W0-G, owner decision 2026-11-21)."""
+    import yaml
+    from toolkit.spec import review_conditions as RC
+    rows = RC.parse(RC.read_bytes(run_dir))
+    for r in rows:
+        if not r.get("disposition"):
+            r.update(disposition="deferred", owner="owner", due="2026-12-31")
+    if rows:
+        from lib.safe_io import write_nofollow
+        write_nofollow(run_dir, RC.FILE, yaml.safe_dump({"conditions": rows}, sort_keys=False).encode(), atomic=True)
+        if os.path.exists(os.path.join(run_dir, SIGNOFF_SHEET)):
+            from toolkit.spec import signoff as SO
+            SO.write_sheet(run_dir)
+
+
 def _self_test() -> int:
     import tempfile
     import shutil
@@ -2132,6 +2736,55 @@ def _self_test() -> int:
             if nxt not in EDGES["GATE"]:
                 ok(False, f"T9 {a} routes outside the state table")
     ok(True, "T9 every route is an edge of the state table")
+    # T9b (T16's CI flakes, 2026-11-20/21): a failed step's error is its log tail, a traceback whose first 300
+    # characters are only its outer frames; the reason a run ended must keep the exception and where it was raised.
+    root = "/home/runner/work/modeling-agentic/modeling-agentic"
+    tb = ("Traceback (most recent call last):\n"
+          f'  File "{root}/agents/analysis_backend.py", line 1556, in <module>\n    sys.exit(main())\n'
+          "             ~~~~^^\n"
+          f'  File "{root}/agents/analysis_backend.py", line 776, in main\n    A = _analyze(spec, out)\n'
+          f'  File "{root}/agents/analysis_backend.py", line 515, in _analyze\n'
+          "    return Analysis(spec, out, log=lambda *a: None).run()\n"
+          f'  File "{root}/spike/analysis/run.py", line 120, in solve\n'
+          "    raise RuntimeError(f\"optimizer status {r['status']}\")\n"
+          "RuntimeError: optimizer status feasible\n")
+    why = _rep_error({"ok": False, "steps": [{"id": "configure", "status": "ok"},
+                                             {"id": "analyze", "status": "failed", "error": tb}]})
+    ok("RuntimeError: optimizer status feasible" in why and "run.py:120 in solve" in why and len(why) <= 300,
+       f"T9b a failed step's reason keeps its exception and the frame that raised it: {why!r}")
+    why2 = _rep_error({"ok": False, "errors": ["upstream step not rebuilt: configure"],
+                       "steps": [{"id": "batch", "status": "failed", "error": "timed out after 8s at its backstop"}]})
+    ok(why2 == "upstream step not rebuilt: configure; batch: timed out after 8s at its backstop",
+       f"T9c an error that is not a traceback is kept as it was: {why2!r}")
+    # T9d (Codex r1 on the T9b fix): real interpreter output, as an 800-character log tail holds it.
+    def tail_of(code, n=800):
+        r = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           timeout=60)
+        return r.stdout[-n:]
+    cases = {
+        "trailing output": ("import atexit; atexit.register(print, 'cleanup complete')\n"
+                            "def solve():\n    raise RuntimeError('boom')\nsolve()", "RuntimeError: boom", "in solve"),
+        "multi-line message": ("def f():\n    raise ValueError('invalid row\\ncolumn 7')\nf()",
+                               "ValueError: invalid row", "in f"),
+        "syntax error": ("compile('x =', 'broken.py', 'exec')", "SyntaxError", "broken.py:1"),
+        "frame text in message": ("def g():\n    raise ValueError('see File \"other.py\", line 97, in other')\ng()",
+                                  "ValueError: see", "in g"),
+        "exception group": ("raise ExceptionGroup('workers', [ValueError('bad row')])", "ExceptionGroup: workers",
+                            "<string>:1"),
+        "long message": ("def h():\n    raise ValueError('x' * 320)\nh()", "ValueError: xxx", "in h"),
+        "header cut": ("".join(f"def f{i}():\n    f{i + 1}()\n" for i in range(40))
+                       + "def f40():\n    raise RuntimeError('deep')\nf0()", "RuntimeError: deep", "in f40"),
+    }
+    for name, (code, want_exc, want_at) in cases.items():
+        why_ = _rep_error({"ok": False, "steps": [{"id": "analyze", "status": "failed", "error": tail_of(code)}]})
+        ok(want_exc in why_ and want_at in why_ and "Traceback at" in why_ and "at other.py" not in why_
+           and "Exception Group Traceback" not in why_,
+           f"T9d a traceback with {name} keeps its exception and raising frame: {why_!r}")
+    to = "timed out after 8s at its backstop (process group killed); last output: " + tail_of(
+        "def s():\n    raise RuntimeError('boom')\ns()", 300)
+    why3 = _rep_error({"ok": False, "steps": [{"id": "analyze", "status": "failed", "error": to}]})
+    ok(why3.startswith("analyze: timed out after 8s") and "RuntimeError: boom" in why3,
+       f"T9e a timeout whose last output is a traceback still reads as the timeout first: {why3!r}")
 
     with tempfile.TemporaryDirectory() as td:
         def new_run(name, script, signoff="none", max_rounds=3, budget=None):
@@ -2157,9 +2810,12 @@ def _self_test() -> int:
         status = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         hist = [h["to"] for h in load_state(d).history if "to" in h]
         ok(status == "completed", f"T10 toy run completes: {status} via {hist}")
-        ok(hist[:8] == ["SIGN", "EVIDENCE", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
+        ok(hist[:8] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
            and "FIX_LOOP" in hist
            and hist[-3:] == ["PRESENTATION", "GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
+        from toolkit.spec import evidence_draft as EDR_
+        ok("draft_evidence" not in T.calls and (EDR_.read_record(d) or {}).get("status") == "not_required",
+           f"T11b a spec whose options need no decision input passes EVIDENCE with no task ({EDR_.read_record(d)})")
         rows = FX.impact_rows(d)
         ok(rows and rows[0]["files_changed"] == ["analysis_settings.yaml"] and "analyze" in rows[0]["steps_rebuilt"]
            and rows[0]["headline_before"] != rows[0]["headline_after"] and rows[0]["passed"],
@@ -2178,6 +2834,10 @@ def _self_test() -> int:
                                       "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
         ref_status = _SpikeMachine(d0, T0, st0, log=lambda *a: None, cross_engine_check=False).run()
         ref_path = [h["to"] for h in load_state(d0).history if "to" in h]
+
+        def _final_why(d_):     # the reason a run reached FINAL (a step's error carries its log tail): CI flakes of
+            return [h.get("why") for h in load_state(d_).history if h.get("to") == "FINAL"][-1:]   # T16 named none
+        ref_why = _final_why(d0) if ref_status != "completed" else []
         bad = []
         for k in range(1, len(ref_path)):
             dk, Tk, stk = new_run(f"resume{k}", {"critics": {1: {"critique-domain": [blocker]}},
@@ -2190,27 +2850,53 @@ def _self_test() -> int:
             s2 = m2.run()
             p2 = [h["to"] for h in load_state(dk).history if "to" in h]
             if s2 != ref_status or p2 != ref_path:
-                bad.append((k, s2, p2))
+                bad.append((k, s2, p2, _final_why(dk)))
             shutil.rmtree(dk)
-        ok(not bad, f"T16 a run stopped after any of {len(ref_path) - 1} transitions resumes to the same path and status {bad[:1]}")
+        ok(not bad, f"T16 a run stopped after any of {len(ref_path) - 1} transitions resumes to the same path and status {bad[:1]}"
+           + (f" (reference run {ref_status}: {ref_why})" if ref_why else ""))
 
         # T17: owner sign-off pauses, persists, resumes.
         d, T, st = new_run("owner", {}, signoff="owner")
         m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
         s = m.run()
         ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
+        pz = [(h.get("paused"), h.get("state")) for h in load_state(d).history if "paused" in h]
+        ok(pz == [("awaiting_signoff", "SIGN")], f"RR1 a SIGN pause writes one history entry ({pz})")
+        from toolkit.spec import review_conditions as _RC
+        _rows = _RC.parse(_RC.read_bytes(d))
+        try:
+            sign(d, "owner", "early")
+            _early = "signed"
+        except ValueError as e:
+            _early = str(e)
+        ok(_rows and all(r["source"] == "spec_critique" and not r.get("disposition") for r in _rows)
+           and "review conditions" in _early,
+           f"T17rc (W0-G, owner 2026-11-21) at SIGN the spec critique's HIGH findings are imported as open conditions; "
+           f"the owner's signature waits for their dispositions ({len(_rows)} row(s); {_early[:80]})")
         from toolkit.spec import preconditions as _PC      # #215: this signing path runs the shared preconditions
         _PC.CHECKS["_t17"] = lambda r, sp, by: [f"refused for {by}"]
         try:
+            _t_owner_disposes(d)
             sign(d, "owner", "ok")
             ok(False, "T17p the spike sign-off refuses a spec failing a registered precondition")
         except ValueError as e:
             ok("refused for owner" in str(e), f"T17p the spike sign-off refuses a spec failing a registered precondition")
         finally:
             _PC.CHECKS.pop("_t17", None)
+        _t_owner_disposes(d)
         sign(d, "owner", "ok")
         ok(_SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")
+
+        d, T, st = new_run("lead_rc", {}, signoff="lead")
+        s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        _rows = _RC.parse(_RC.read_bytes(d)) if os.path.exists(os.path.join(d, _RC.FILE)) else []
+        _rep = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        ok(s == "completed" and _rows and all(r["disposition"] == "deferred" and r["owner"] == "owner"
+                                              and r.get("provisional") for r in _rows)
+           and _RC.REPORT_HEADING in _rep and _rep.index(_RC.REPORT_HEADING) < _rep.index("## Numbers"),
+           f"T18rc (W0-G, D2) under --signoff lead each condition is deferred to the owner provisionally, listed at the "
+           f"top of the report, and the run proceeds ({s}, {len(_rows)} row(s))")
 
         # T19: a fix that edits the signed spec, or puts a decision leaf in the settings file, is
         # undone before anything is rebuilt; the spec stays as signed.
@@ -2309,6 +2995,7 @@ def _self_test() -> int:
         d, T, st = new_run("rethink_signed", {"critics": {1: {"critique-domain": [rk]}}, "plan": plan40},
                            signoff="owner", max_rounds=3)
         _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        _t_owner_disposes(d)
         sign(d, "owner", "first")
         signed_bytes = open(os.path.join(d, AB.SPEC_FILE), "rb").read()
         T2 = StubTasks(T.s)
@@ -2322,6 +3009,8 @@ def _self_test() -> int:
            and "D-040" in json.dumps(rq.get("findings")) and "redraft the envelope" in json.dumps(rq.get("briefs"))
            and rq.get("signed_spec_sha256") == hashlib.sha256(signed_bytes).hexdigest(),
            f"R3-2 a rethink of a signed spec writes the request and pauses; nothing is redrafted ({s}, {T2.calls[-3:]})")
+        pz = [(h.get("paused"), h.get("state")) for h in load_state(d).history if "paused" in h]
+        ok(pz[-1:] == [("awaiting_spec_amendment", "SPEC")], f"RR2 an amendment pause writes a history entry ({pz})")
         T3 = StubTasks(T.s)
         s2 = _SpikeMachine(d, T3, None, log=lambda *a: None, cross_engine_check=False).run()
         ok(s2 == "paused:awaiting_spec_amendment" and "draft_spec" not in T3.calls
@@ -2389,6 +3078,11 @@ def _self_test() -> int:
            and "SPEC" not in p and not any(c.startswith("fix:") for c in T.calls)
            and req.get("pending") and [i.get("finding") for i in req.get("items") or []] == ["D-031"],
            f"R3-3 an owner-amendment finding pauses at OWNER_DECISION with a request, no redraft ({s}, {p[-4:]})")
+        import harness_metrics as _HM
+        pz = _HM.pauses(_HM.load_run(d))
+        ok([(x["reason"], x["state"], x["from"]) for x in pz][-1:] == [("awaiting_scope_signoff", "OWNER_DECISION",
+                                                                        "record")],
+           f"RR3 a scope pause writes a history entry; harness_metrics reads it as a record ({pz[-1:]})")
         if req.get("pending"):
             import scope_signoff as _SS
             # Codex re-review of #258 P1-8: the request the machine made is what must be answered, not whatever request
@@ -2412,6 +3106,72 @@ def _self_test() -> int:
                and "`completed_scope_declined`" in open(os.path.join(d, "report.md")).read(),
                f"R3-3b the owner's decline resumes the run, is not redrafted, and constrains the gate: the run is not "
                f"declared or accepted (Codex review of #258 P1-11) ({s2}, {p2[-5:]})")
+        # W0-F: a held-out target whose automatic test changes the plan pauses the run once at OWNER_DECISION; one
+        # whose test changes nothing is a declared limitation, and the run is not interrupted
+        def conflict_run(name, changes, **kw):
+            d_, T_, st_ = new_run(name, {}, max_rounds=2, **kw)
+            os.makedirs(os.path.join(d_, "analysis"), exist_ok=True)
+            import yaml as _y
+            _y.safe_dump({"data": {"policy": "declare_and_test", "refused": None, "needs_owner": ["g|1"] if changes
+                                   else [], "declared": [{"n": 1, "kind": "offset", "key": "g|1", "target": "g",
+                                                          "units": ["1"], "why": {}, "tests": ["conflict_1_g_1_lo"],
+                                                          "scales": [0.8], "verdicts": {"conflict_1_g_1_lo":
+                                                                                        "CHANGES_PLAN" if changes
+                                                                                        else "NO_CHANGE"},
+                                                          "changes_plan": changes}]}},
+                         open(os.path.join(d_, "analysis", "conflicts.yaml"), "w"))
+            s_ = _SpikeMachine(d_, T_, st_, log=lambda *a: None, cross_engine_check=False).run()
+            return d_, T_, s_
+        dq, Tq, sq = conflict_run("conflict_change", True)
+        try:
+            rq = json.load(open(os.path.join(dq, "scope_signoff_request.json")))
+        except (OSError, ValueError):
+            rq = {}
+        ok(sq == "paused:awaiting_scope_signoff" and [i.get("finding") for i in rq.get("items") or []]
+           == ["evidence_conflict_declared:g|1"] and "held-out" in rq["items"][0]["reason"]
+           and any("refit without the target" in o for o in rq["items"][0].get("options") or []),
+           f"T_CONFLICT_PLAN_CHANGE_PAUSES_ONCE a conflict whose test changes the plan pauses at OWNER_DECISION ({sq})")
+        if rq.get("pending"):
+            import scope_signoff as _SS
+            _SS.sign(dq, "owner", all_decision="accept", note="W0-F")
+            sq2 = _SpikeMachine(dq, StubTasks(Tq.s), None, log=lambda *a: None, cross_engine_check=False).run()
+            nq = sum(1 for h in load_state(dq).history if h.get("to") == "OWNER_DECISION")
+            ok(sq2 in ACCEPTED_STATUSES and nq == 1
+               and "Held-out calibration targets" in open(os.path.join(dq, "report.md")).read(),
+               f"T_CONFLICT_PLAN_CHANGE_PAUSES_ONCE the owner's accept resumes the run, which is not paused again, and "
+               f"the report lists the held-out target ({sq2}, {nq} pause(s))")
+        # T_CONFLICT_LEAD_FLAGGED (Codex r4 of #316): under --signoff lead a conflict whose test changes the plan is
+        # answered provisionally and flagged as plan-changing: the request item carries the conflict's structured
+        # verdict, and the report names it above the draft and labels it "plan changes: yes"
+        dl, Tl, sl = conflict_run("conflict_change_lead", True, signoff="lead")
+        try:
+            rl = json.load(open(os.path.join(dl, "scope_signoff_request.json")))
+        except (OSError, ValueError):
+            rl = {}
+        it_l = next((i for i in rl.get("items") or [] if i.get("finding") == "evidence_conflict_declared:g|1"), {})
+        rep_cl = open(os.path.join(dl, "report.md")).read() if os.path.exists(os.path.join(dl, "report.md")) else ""
+        try:
+            span_cl = json.load(open(os.path.join(dl, "report_render.json")))["writer_span"]
+        except (OSError, ValueError, KeyError):
+            span_cl = [0, 0]
+        top_cl = rep_cl[:span_cl[0]]
+        ok(not sl.startswith("paused") and (it_l.get("conflict") or {}).get("status") == "CHANGES_PLAN"
+           and (it_l.get("conflict") or {}).get("verdicts") == {"conflict_1_g_1_lo": "CHANGES_PLAN"}
+           and "Provisional decisions that change the plan" in top_cl and "evidence_conflict_declared:g|1" in top_cl
+           and "**evidence_conflict_declared:g|1**: accepted provisionally; plan changes: yes" in rep_cl[span_cl[1]:],
+           f"T_CONFLICT_LEAD_FLAGGED a lead run flags a plan-changing conflict above the draft, with its verdict in the "
+           f"request ({sl}, {it_l.get('conflict')}, top has it: {'evidence_conflict_declared' in top_cl})")
+        # T_CONFLICT_OLD_REQUEST (Codex r5 of #316): a conflict item saved before the verdict was carried (a run resumed
+        # across this change) is plan-changing: the owner request holds only conflicts that change the plan or could
+        # not be tested
+        ok(_plan_changing({"finding": "evidence_conflict_declared:g|1", "kind": "evidence_conflict_declared"}) is True
+           and _plan_changing({"kind": "evidence_conflict_declared", "conflict": {"changes_plan": False}}) is False,
+           "T_CONFLICT_OLD_REQUEST a conflict item without its verdict counts as changing the plan")
+        dn, Tn, sn = conflict_run("conflict_nochange", False)
+        ok(sn in ACCEPTED_STATUSES and not os.path.exists(os.path.join(dn, "scope_signoff_request.json"))
+           and FL.load(dn)["evidence_conflict_declared:g|1"].status == "declared"
+           and "Held-out calibration targets" in open(os.path.join(dn, "report.md")).read(),
+           f"T_CONFLICT_NO_CHANGE_NO_PAUSE a conflict whose test changes nothing is declared, listed, never paused ({sn})")
         # R3-6 (Codex re-review of #258): a declared finding still needs the owner's answer (P1-10), and a decline of a
         # finding its test has since resolved does not hold the gate (new P1-2)
         f6d = FL.Finding(id="D-036", kind="critique_blocker", severity="HIGH", source="critique-domain", status="declared",
@@ -2469,6 +3229,75 @@ def _self_test() -> int:
         ok(s == "paused:awaiting_scope_signoff" and "SPEC" not in p and p[-1] == "OWNER_DECISION",
            f"R3-5 a structural blocker that needs an owner amendment goes to the owner, not to SPEC ({s}, {p[-3:]})")
 
+        # T_OWNER_DECISION_E2E (1F): a decision test that changes the plan, at the last round, goes to OWNER_DECISION
+        # with a request the machine recorded; the owner's accept resumes the run, which ends scope-declared
+        import scope_signoff as _SS
+        dtf_e = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT9",
+                 "claim": "Decision test DT9 changes the plan: a lower effect", "scope_declarable": True,
+                 "decision_bearing": True}
+
+        class _DTMachine(Machine):
+            def harness_findings(self):
+                return super().harness_findings() + [dict(dtf_e)]
+        mk = lambda d_, T_, st_: _DTMachine(d_, T_, st_, backend=spike, log=lambda *a: None,  # noqa: E731
+                                            cross_engine_check=False)
+        d, T, st = new_run("dt_owner", {}, signoff="owner", max_rounds=1)
+        mk(d, T, st).run()
+        _t_owner_disposes(d)        # W0-G (from v2): the owner disposes the spec critique's conditions before signing
+        sign(d, "owner", "ok")
+        s_o = mk(d, StubTasks(T.s), None).run()
+        st_o = load_state(d)
+        req_o = json.load(open(os.path.join(d, OWNER_REQUEST))) if os.path.exists(os.path.join(d, OWNER_REQUEST)) else {}
+        fps_o = [i.get("fingerprint") for i in req_o.get("items") or []]
+        ok(s_o == "paused:awaiting_scope_signoff" and st_o.state == "OWNER_DECISION" and req_o.get("pending")
+           and fps_o and st_o.tries.get("owner_request") == fps_o
+           and [i.get("finding") for i in req_o["items"]] == ["decision_test_changes_plan:DT9"],
+           f"T_OWNER_DECISION_E2E the AWAIT_OWNER route records a fingerprinted request and pauses ({s_o}, {fps_o})")
+        _SS.sign(d, "owner", all_decision="accept", note="the plan stands with this caveat")
+        s_o2 = mk(d, StubTasks(T.s), None).run()
+        rep_o = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        ok(s_o2 == "completed_scope_declared" and "DT9" in rep_o and "Provisional decisions" not in rep_o,
+           f"T_OWNER_DECISION_E2E2 the owner's accept resumes the run, which ends scope-declared ({s_o2})")
+        # T_OWNER_LEAD_PROVISIONAL (1F, D2): under --signoff lead the same finding never waits: the lead answers it
+        # provisionally, the answer is recorded and listed, and, as the plan changes, flagged above the report's draft
+        d, T, st = new_run("dt_lead", {}, signoff="lead", max_rounds=1)
+        held, real_hr = [], _SS.harness_record
+
+        def _hr(rd):     # T_OWNER_LEAD_LOCK (Codex r4 of #316): the lock is held while the answers are recorded
+            held.append(("record", getattr(_SS, "lock_held", lambda _r: "no lock_held")(rd)))
+            return real_hr(rd)
+        _SS.harness_record = _hr
+        try:
+            s_l = mk(d, T, st).run()
+        finally:
+            _SS.harness_record = real_hr
+        ok(held and all(h == ("record", True) for h in held),
+           f"T_OWNER_LEAD_LOCK the harness records the lead's provisional answers holding the sign-off lock, so an "
+           f"owner sign that waited on it sees the request closed ({held})")
+        prov = _SS.provisional(d)
+        rep_l = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        span = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep_l else [0, 0]
+        ok(s_l == "completed_scope_declared" and not any(h.get("paused") for h in load_state(d).history)
+           and [(r["finding"], r["decision"], r["plan_changing"], r["review"]) for r in prov]
+           == [("decision_test_changes_plan:DT9", "accept", True, None)]
+           and "Provisional decisions that change the plan" in rep_l[:span[0]]
+           and "## Provisional decisions" in rep_l[span[1]:],
+           f"T_OWNER_LEAD_PROVISIONAL a lead run answers the owner decision provisionally and never blocks; the "
+           f"plan-changing answer heads the report ({s_l}, {prov})")
+        _SS.review(d, "decision_test_changes_plan:DT9", "overturn", note="fix the effect first")
+        ok([r["review"]["decision"] for r in _SS.provisional(d)] == ["overturn"],
+           "T_OWNER_LEAD_REVIEW the owner later overturns (or confirms) a provisional answer; it is recorded")
+        # T_OWNER_LEAD_AMEND (1F, D2): an owner-amendment finding under --signoff lead is answered provisionally too
+        d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041")]}}},
+                           signoff="lead", max_rounds=2)
+        s_a = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        led_a = FL.load(d)
+        ok(not s_a.startswith("paused") and led_a["D-041"].status == "owner_accepted"
+           and [r["finding"] for r in _SS.provisional(d)] == ["D-041"]
+           and not _SS.provisional(d)[0]["plan_changing"],
+           f"T_OWNER_LEAD_AMEND an amendment finding under --signoff lead is accepted provisionally, not waited on "
+           f"({s_a}, {led_a['D-041'].status})")
+
         # R3-4 (F6 run 3): a paid task whose allowance is below the floor is not started: the run pauses for the owner
         # (resumable), and a resume with a higher cap continues.
         d, T, st = new_run("floor", {}, budget=20.0)
@@ -2479,8 +3308,50 @@ def _self_test() -> int:
            and load_state(d).status is None,
            f"R3-4 a $0.13 allowance starts no task; the run pauses awaiting budget ({s}, {T.calls}, {T.allowances})")
         T2 = StubTasks(T.s)
+        mp4 = os.path.join(d, "metadata.json")
+        json.dump(dict(json.load(open(mp4)), invocations=[{"at": "2020-01-01T00:00:00"}, {"at": "2020-01-01T01:00:00"}]),
+                  open(mp4, "w"))
         s2 = run_v2("toy question", d, T2, signoff="none", budget_usd=60.0, log=lambda *a: None,
                     backend=spike, cross_engine_check=False)
+        m4, h4 = json.load(open(mp4)), load_state(d).history
+        ok(m4["invocations"][-1].get("budget_usd") == 60.0 and m4["invocations"][-1].get("cap_usd") == 60.0
+           and "budget_usd" not in m4["invocations"][0] and set(m4.get("models") or {}) == {"deep", "fast"}
+           and m4.get("sdk_version") and m4["invocations"][-1].get("models") == m4["models"]
+           and sum(1 for h in h4 if h.get("paused") == AWAITING_BUDGET) == 1,
+           f"RR4 each invocation records its budget, the cap in force, the model ids and the SDK version; the budget "
+           f"pause has one entry ({m4['invocations'][-1]}, {m4.get('sdk_version')})")
+        dp = os.path.join(td, "rr5_child")
+        os.environ["MA_PARENT_RUN"] = d
+        try:
+            init_run(dp, "toy question", derived_inputs=False)
+        finally:
+            os.environ.pop("MA_PARENT_RUN", None)
+        pr = json.load(open(os.path.join(dp, "metadata.json"))).get("parent_run") or {}
+        ok(pr.get("run_dir") == os.path.basename(d) and pr.get("run_state_sha256") == hashlib.sha256(
+            open(os.path.join(d, STATE_FILE), "rb").read()).hexdigest(),
+           f"RR5 a run launched with MA_PARENT_RUN records its parent and the parent's run_state hash ({pr})")
+        cwd6 = os.getcwd()
+        prs = []
+        for k6, par in enumerate((os.path.join(td, "no_such_run"), ".")):
+            os.chdir(d)
+            os.environ["MA_PARENT_RUN"] = par
+            try:
+                init_run(os.path.join(td, f"rr6_child{k6}"), "toy question", derived_inputs=False)
+            finally:
+                os.environ.pop("MA_PARENT_RUN", None)
+                os.chdir(cwd6)
+            prs.append(json.load(open(os.path.join(td, f"rr6_child{k6}", "metadata.json"))).get("parent_run") or {})
+        ok(prs[0].get("run_state_sha256") is None and prs[0].get("error") and prs[1].get("run_dir") == os.path.basename(d),
+           f"RR6 an unreadable parent records no hash (never linked); a relative parent path records its dir name ({prs})")
+        st7 = load_state(d)
+        if st7.state == "FINAL":
+            st7.paused = "awaiting_scope_signoff"            # a stale flag a terminal run can carry
+            save_state(d, st7)
+            n7 = len(load_state(d).history)
+            _SpikeMachine(d, StubTasks(T.s), st7, log=lambda *a: None, cross_engine_check=False).run()
+            ok(len(load_state(d).history) == n7, "RR7 a FINAL run carrying a stale paused flag writes no pause entry")
+        else:
+            ok(False, f"RR7 fixture: the resumed run should be FINAL ({st7.state})")
         ok(not s2.startswith("paused") and "draft_spec" in T2.calls
            and load_state(d).budget_usd == 60.0
            and any(h.get("budget_raised") for h in load_state(d).history),
@@ -2545,20 +3416,75 @@ def _self_test() -> int:
         dtf = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT1",
                "claim": "DT1 changes the plan", "scope_declarable": True, "decision_bearing": True}
         g = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        ok(_owner_rule() is None and g["action"] == "RUN_FAILED",
-           f"T30 without the owner rule the finding is not declarable: RUN_FAILED, not DECLARE_SCOPE ({g['action']})")
-        # T30b (Codex round 1 on #98): main #85's rule is now in the checkout, but v2 does not yet
-        # write a fingerprinted request (scope_signoff.record) or take answers through the harness
-        # (harness_record), so AWAIT_OWNER would wait for an answer nobody can give. v2 stays fail
-        # closed until that lifecycle is wired.
+        own = [b for b in list(g.get("unresolved_high") or []) + list(g.get("accept_blockers") or [])
+               if isinstance(b, dict) and b.get("owner_signoff")]
+        ok(OWNER_LIFECYCLE_WIRED and _owner_rule() is not None and g["action"] == "AWAIT_OWNER" and own
+           and (own[0].get("owner_item") or {}).get("fingerprint"),
+           f"T30 (1F) a measured decision test that changes the plan goes to the owner: AWAIT_OWNER with a "
+           f"fingerprinted item ({g['action']})")
+        gn = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="none")
+        ok(gn["action"] == "RUN_FAILED", f"T30b under --signoff none nobody can accept it: not declarable ({gn['action']})")
+        # T_OWNER_ANSWERED (1F): the harness-recorded answer to that item releases it; whose answer counts follows the
+        # run's sign-off mode (a lead's only under --signoff lead, D2)
         import scope_signoff as _ss
-        ok(hasattr(_ss, "gate_findings") and not OWNER_LIFECYCLE_WIRED,
-           "T30b the owner rule is merged, and v2 does not use it until its sign-off lifecycle is wired")
+        _ss.record(dd, g, 2)
+        _ss.sign(dd, "lead", all_decision="accept", note="t")          # not provisional: counts nowhere
+        _ss.harness_record(dd)
+        g_ln = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="lead")
+        _ss.provisional_answers(dd, json.load(open(os.path.join(dd, _ss.REQUEST)))["items"], 2)
+        _ss.harness_record(dd)
+        g_lo = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        g_ll = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="lead")
+        _ss.sign(dd, "owner", all_decision="decline", note="t")
+        _ss.harness_record(dd)
+        g_od = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        ok(g_ln["action"] == "AWAIT_OWNER" and g_lo["action"] == "AWAIT_OWNER" and g_ll["action"] == "DECLARE_SCOPE"
+           and g_od["action"] == "RUN_FAILED"
+           and any(isinstance(u, dict) and u.get("kind") == "scope_declaration_declined"
+                   for u in g_od.get("unresolved_high") or []),
+           f"T_OWNER_ANSWERED a lead's accept counts only under --signoff lead; the owner's decline holds the gate "
+           f"({g_lo['action']}, {g_ll['action']}, {g_od['action']})")
+        # T_OWNER_DECLINE_HOLDS and T_OWNER_LEAD_NONPROV (Codex r2 of #316, P1-2 and P1-3): with a policy-mapped
+        # finding beside the decision test, the owner's decline on it keeps holding the gate once the decision-test
+        # finding clears; and a lead answer that is not provisional never releases it, even in a lead run
+        for f_ in (_ss.SIGNOFF, _ss.LEDGER, _ss.REQUEST, "trace.jsonl"):
+            if os.path.exists(os.path.join(dd, f_)):
+                os.remove(os.path.join(dd, f_))
+        open(os.path.join(dd, "decision_rule.md"), "w").write("rule\n")          # the run allocates
+        alloc = {"kind": "allocation_unstable", "severity": "HIGH", "stage": "OPTIMIZATION",
+                 "key": "allocation_robustness", "claim": "UNSTABLE", "scope_declarable": True}
+        g2 = v2_gate(dd, 2, 2, False, [dict(dtf), dict(alloc)], history=False)
+        _ss.record(dd, g2, 2)
+        its = {i["kind"]: i for i in json.load(open(os.path.join(dd, _ss.REQUEST)))["items"]}
+        both = "decision_test_changes_plan" in its and "allocation_unstable" in its
+        if both:
+            _ss.sign(dd, "owner", {its["decision_test_changes_plan"]["fingerprint"]: "accept",
+                                   its["allocation_unstable"]["fingerprint"]: "decline"}, note="t")
+            _ss.harness_record(dd)
+        g_both = v2_gate(dd, 2, 2, False, [dict(dtf), dict(alloc)], history=False)
+        g_alone = v2_gate(dd, 2, 2, False, [dict(alloc)], history=False)
+        ok(both and g2["action"] == "AWAIT_OWNER" and g_both["action"] == "RUN_FAILED"
+           and g_alone["action"] == "RUN_FAILED",
+           f"T_OWNER_DECLINE_HOLDS the owner's decline of a policy-mapped finding holds the gate when the decision-test "
+           f"finding clears ({g2['action']}, {g_both['action']}, {g_alone['action']}, {sorted(its)})")
+        if both:
+            doc_ = json.load(open(os.path.join(dd, _ss.SIGNOFF)))
+            doc_["answers"][its["allocation_unstable"]["fingerprint"]].update(decision="accept", by="lead")
+            json.dump(doc_, open(os.path.join(dd, _ss.SIGNOFF), "w"))
+            _ss.harness_record(dd)
+        g_np = v2_gate(dd, 2, 2, False, [dict(dtf), dict(alloc)], history=False, signoff="lead")
+        ok(both and g_np["action"] != "DECLARE_SCOPE" and _ss.provisional(dd) == [],
+           f"T_OWNER_LEAD_NONPROV a lead answer that is not provisional does not release a policy-mapped item, even "
+           f"under --signoff lead ({g_np['action']})")
+        os.remove(os.path.join(dd, "decision_rule.md"))
+        for f_ in (_ss.SIGNOFF, _ss.LEDGER, _ss.REQUEST, "trace.jsonl"):
+            if os.path.exists(os.path.join(dd, f_)):
+                os.remove(os.path.join(dd, f_))
         seen = {}
 
         class Rule:
             @staticmethod
-            def gate_findings(rd, rn, viols, non_declarable=None):
+            def gate_findings(rd, rn, viols, non_declarable=None, mode=None, **k):
                 seen["marked"] = [v.get("owner_signoff") for v in viols if v.get("kind") == "decision_test_changes_plan"]
                 return []
         vs = [dict(dtf)]
@@ -2572,6 +3498,19 @@ def _self_test() -> int:
         vs = [dict(dtf)]
         apply_owner_rule(dd, 2, vs, rule=Broken)
         ok(vs[0]["scope_declarable"] is False and not vs[0].get("owner_signoff"), "T32 an owner rule that fails is fail-closed")
+
+        class Declines:
+            @staticmethod
+            def gate_findings(rd, rn, viols, non_declarable=None, mode=None, **k):
+                for v in viols:
+                    v["owner_signoff"] = True
+                return [{"kind": "scope_declaration_declined", "key": "allocation_unstable"}, dict(viols[0])]
+        vs = [{"kind": "allocation_unstable", "severity": "HIGH", "claim": "c"}]
+        got = apply_owner_rule(dd, 2, vs, rule=Declines)
+        ok([f["kind"] for f in got] == ["scope_declaration_declined"] and not vs[0].get("owner_signoff")
+           and apply_owner_rule(dd, 2, [dict(vs[0])], rule=Declines, mode="none") == [],
+           "T32b (Codex r2 of #316) a recorded decline holds the gate without a decision-bearing finding; nothing new "
+           "is put to the owner there")
 
         # T33 (Codex R2-1): the first spec draft is interrupted. On resume the started-but-uncompleted
         # entry is charged its allowance once and the draft runs again under the same key.
@@ -3008,6 +3947,8 @@ def _self_test() -> int:
             traceback.print_exc()
             ok(False, f"T58-T60 analysis timeout and resume: {type(e).__name__}: {e}")
 
+        _self_test_auto1a(ok, td, spike, new_run)
+
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
         m.st.state = "SPEC"
@@ -3035,6 +3976,12 @@ def _self_test() -> int:
             import traceback
             traceback.print_exc()
             ok(False, f"IG machine tests: {type(e).__name__}: {e}")
+        try:
+            _self_test_evidence(ok, td)
+        except Exception as e:  # noqa: BLE001 -- before the evidence stage exists (step α) this is the failure
+            import traceback
+            traceback.print_exc()
+            ok(False, f"EV machine tests: {type(e).__name__}: {e}")
         # T70 (run console review, finding 6): `sign --expect-sha256` refuses a spec other than the one shown.
         from toolkit.spec import schema as _S, signoff as _SO
         d70 = os.path.join(td, "t61")
@@ -3341,6 +4288,299 @@ if __name__ == "__main__":         # the local pool's spawned processes import t
 '''
 
 
+def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
+    """v2 autonomy brief, PR 1A (docs/design/v2-autonomy-brief.md §4; item numbers are the re-audit's): the
+    PRESENTATION budget stop, the gate before a rewrite, harness ids, the RETHINK back-edges and claim references."""
+    from types import SimpleNamespace as NS
+    import yaml
+    from v2_tasks import StubTasks
+
+    def mk(d, T, st, backend=spike):
+        return Machine(d, T, st, backend=backend, log=lambda *a: None, cross_engine_check=False)
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- before the fix exists this is the failure
+            ok(False, f"{name}: {type(e).__name__}: {e}")
+
+    def budget():
+        d, T, st = new_run("a1_pres", {}, budget=20.0)
+        st.state, st.spent_usd = "PRESENTATION", 16.5        # past cap less reserve, $3.50 of the reserve left
+        save_state(d, st)
+        mk(d, T, st).step()
+        s = load_state(d)
+        ok(s.state == "GATE" and s.forced_status is None and T.calls == ["critique:critique-presentation:1"],
+           f"T_PRES_BUDGET the presentation review runs on the write-up reserve ({s.state}, {s.forced_status}, {T.calls})")
+        d, T, st = new_run("a1_pres_out", {}, budget=20.0)
+        st.state, st.spent_usd = "PRESENTATION", 20.0
+        save_state(d, st)
+        mk(d, T, st).step()
+        s = load_state(d)
+        ok(s.state == "FINAL" and s.status == "budget_exhausted" and T.calls == [],
+           f"T_PRES_BUDGET2 with the whole cap spent the run still ends budget_exhausted ({s.state}, {s.status})")
+
+        class RBT(StubTasks):
+            def set_allowance(self, usd, readback_usd=None):
+                self.rb = readback_usd
+                super().set_allowance(usd)
+        d, T, st = new_run("a1_rb", {}, budget=20.0)
+        st.spent_usd = 16.5
+        save_state(d, st)
+        T = RBT(T.s)
+        m = mk(d, T, st)
+        m._task("k1", "sign_spec", d, writeup=True)
+        ok(T.rb == READBACK_CAP_USD and m._task("k2", "sign_spec", d) is None,
+           f"T_WRITE_RB a write-up task keeps its read-back allowance; other tasks still stop at the reserve ({T.rb})")
+
+    def post_write():
+        # T_PW_GATE (2.1): the pre-write gate after a post-write modelling fix, one round on.
+        d = os.path.join(td, "a1_pw")
+        os.makedirs(d)
+        S = StubTasks({"critics": {1: {"critique-presentation": [
+            {"id": "P-001", "severity": "MEDIUM", "target_stage": "WRITE", "claim": "a caption is unclear",
+             "done_when": [{"file": "manuscript.md", "contains": "Figure 1 shows"}]}]}}})
+        S.critique(d, "critique-presentation", 1)
+        for r in CRITICS:
+            S.critique(d, r, 2)
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
+        g, gp = (v2_gate(d, 2, 3, pw, [], history=False) for pw in (False, True))
+        kinds = {v.get("kind") for v in g.get("rigor_violations") or []}
+        ok(not g.get("schema_errors") and g.get("action") and "P-001" in {o["id"] for o in open_findings(d, g)}
+           and not kinds & {"done_when_dropped", "critique_presentation_missing"} and gp.get("schema_errors"),
+           f"T_PW_GATE a pre-write gate reads the last draft's presentation review as of its own round; the "
+           f"post-write gate needs this round's ({g.get('schema_errors')}, {g.get('action')}, {sorted(kinds)}, "
+           f"post {bool(gp.get('schema_errors'))})")
+        d = os.path.join(td, "a1_ofp")
+        os.makedirs(d)
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "D-061", "severity": "MEDIUM", "category": "PRESENTATION", "target_stage": "ANALYZE", "claim": "c"},
+            {"id": "D-062", "severity": "MEDIUM", "category": "METHODS", "target_stage": "ANALYZE", "claim": "c"}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
+        ok(got == ["D-062"], f"T_OF_PRES a PRESENTATION finding waits for the draft ({got})")
+
+    def ids():
+        class B:
+            def __getattr__(self, n):
+                return getattr(spike, n)
+
+            def gate_findings(self, rd):
+                return []
+
+            def spec_violations(self, rd):
+                return [{"kind": "spec_x", "key": "k1", "severity": "HIGH", "claim": "c"}]
+
+            def registry_violations(self, rd):
+                return [{"kind": "reg_y", "key": "k2", "severity": "HIGH", "claim": "c"}]
+        d, T, st = new_run("a1_ids", {})
+        got = mk(d, T, st, backend=B()).harness_ids(d)
+        ok({"spec_x:k1", "reg_y:k2"} <= got, f"F_HARNESS_IDS spec and registry findings are harness ids ({sorted(got)})")
+
+    def rethink():
+        # T_RETHINK_SPEC_TRIES (5.1, 5.2): unsigned specs only; a signed one pauses for the owner.
+        class ST(StubTasks):
+            def draft_spec(self, q, rd, fb):
+                self.fbs = getattr(self, "fbs", []) + [fb]
+                return super().draft_spec(q, rd, fb)
+        sb = {"id": "D-051", "severity": "HIGH", "target_stage": "PLAN", "category": "STRUCTURAL",
+              "claim": "the decision unit is too coarse", "fix_requires": "Redraft the units."}
+        d, T, st = new_run("a1_rspec", {"critics": {1: {"critique-domain": [sb]}}, "structural": {1: "critique-domain"}},
+                           max_rounds=2)
+        st.tries["spec"] = MAX_SPEC_TRIES - 1
+        save_state(d, st)
+        T = ST(T.s)
+        s = mk(d, T, st).run()
+        fbs = T.fbs
+        ok(len(fbs) >= 2 and fbs[0] is None and any("D-051" in x and "Redraft the units." in x for x in fbs[1] or []),
+           f"T_RETHINK_SPEC_TRIES a rethink of an unsigned spec redrafts it with the findings ({s}, {fbs})")
+        ok(any("cannot represent the question" in x for x in (fbs + [None, None])[1] or []),
+           "CX1-8 a structural rethink's reasons carry the critic's description of the mismatch")
+
+        # T_RETHINK_ENGINE_CONTEXT (5.3): the engine pick after a rethink is told the engine left and why.
+        class ET(StubTasks):
+            def pick_engine(self, spec, eligible, rethink=None):
+                self.rth = getattr(self, "rth", []) + [rethink]
+                return super().pick_engine(spec, eligible)
+        blk = {"id": "D-052", "severity": "HIGH", "target_stage": "MODEL", "claim": "the engine has no age structure"}
+        plan = lambda pk: {"tasks": [{"id": "T1", "findings": [f["id"] for f in pk["findings"]], "action": "rethink",   # noqa: E731
+                                      "owner_state": "ENGINE_CHOICE", "brief": "pick an engine with age structure",
+                                      "files": ["engine_choice.json"]}] if pk["findings"] else []}
+        d, T, st = new_run("a1_reng", {"critics": {1: {"critique-domain": [blk]}}, "plan": plan}, max_rounds=2)
+        T = ET(T.s)
+        s = mk(d, T, st).run()
+        r = T.rth + [None, None]
+        ok(r[0] is None and isinstance(r[1], dict) and str(r[1].get("engine")).endswith("ToyEngine")
+           and any("age structure" in w for w in r[1].get("why") or []),
+           f"T_RETHINK_ENGINE_CONTEXT the second engine pick gets the engine left and the reasons ({s}, {T.rth})")
+
+    def claims():
+        # T_CLAIM_WS (6.1): [CLAIM: id ] is the reference the renderer accepts; it is not an unresolved one.
+        # T_CLAIM_ISOLATE (6.2, 6.3): one invalid claim is its own finding, and the valid claims still render.
+        led = [{"id": "a.good", "claim_kind": "scalar", "value": 5}]
+        bad = {"id": "b.ci", "claim_kind": "scalar", "value": 5, "ci_low": 6, "ci_high": 7}
+        out = {}
+        for name, cl in (("ws", led), ("iso", led + [bad])):
+            d = os.path.join(td, "a1_claims_" + name)
+            os.makedirs(os.path.join(d, "models"))
+            yaml.safe_dump({"claims": cl}, open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+            open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts [CLAIM: a.good ] cases.\n")
+            open(os.path.join(d, AB.SPEC_FILE), "w").write("{}\n")
+            render_report(d, NS(headline=lambda rd: {}))
+            out[name] = ({(f["kind"], f.get("key")) for f in report_claim_findings(d)},
+                         open(os.path.join(d, "report.md")).read())
+        ok(not {k for k, _ in out["ws"][0]} & {"report_claim_unresolved", "report_claim_unrendered", "report_claim_id_raw"},
+           f"T_CLAIM_WS a reference with spaces around its id is resolved ({out['ws'][0]})")
+        ok(("report_claim_invalid", "b.ci") in out["iso"][0] and "[CLAIM" not in out["iso"][1]
+           and not {k for k, _ in out["iso"][0]} & {"report_claims_unreadable", "report_claim_unrendered"},
+           f"T_CLAIM_ISOLATE an invalid claim is one finding; the valid claims render ({out['iso'][0]})")
+
+    # Narrow Codex review of #297, round 1 (each failed on 650b2417).
+    def r1_resume():
+        # CX1-3: a presentation review that spent the last of the cap, then a crash before the transition.
+        d, T, st = new_run("a1_cx3", {}, budget=20.0)
+        st.state, st.spent_usd = "PRESENTATION", 20.0
+        st.journal["PRESENTATION#0:r1"] = {"task": "critique", "status": "completed", "ok": True}
+        save_state(d, st)
+        mk(d, T, st).step()
+        s = load_state(d)
+        ok(s.state == "GATE" and s.forced_status is None and T.calls == [],
+           f"CX1-3 a completed presentation review is replayed on resume with the cap spent ({s.state}, {s.status})")
+
+    def r1_readback():
+        d, T, st = new_run("a1_cx4", {}, budget=20.0)
+        st.spent_usd = 16.5
+        st.journal["k1"] = {"task": "sign_spec", "status": "started", "allowance_usd": 3.0, "readback_usd": 0.25,
+                            "writeup": True}
+        save_state(d, st)
+        m = mk(d, T, st)
+        ok(abs(m.st.spent_usd - 19.75) < 1e-9, f"CX1-4 an interrupted write-up task is charged its read-back too "
+                                                f"({m.st.spent_usd})")
+        d, T, st = new_run("a1_cx4b", {}, budget=20.0)
+        st.spent_usd = 16.5
+        save_state(d, st)
+        m = mk(d, T, st)
+        m._task("k1", "sign_spec", d, writeup=True)
+        ok(m.st.journal["k1"].get("readback_usd") == READBACK_CAP_USD,
+           f"CX1-4b a write-up task's journal entry records its read-back allowance ({m.st.journal['k1']})")
+
+    def r1_open():
+        # CX1-5: a rendered report without its manuscript is a draft too (the gate's predicate): nothing is deferred.
+        d = os.path.join(td, "a1_cx5")
+        os.makedirs(d)
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "D-061", "severity": "MEDIUM", "category": "PRESENTATION", "target_stage": "ANALYZE", "claim": "c"}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        open(os.path.join(d, "report.md"), "w").write("# Report\n")
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
+        ok(got == ["D-061"], f"CX1-5 with report.md and no manuscript.md a PRESENTATION finding is not deferred ({got})")
+
+    def r1_rethink():
+        # CX1-7: a fix plan file that is not a plan does not stop a back-edge; a gate's own back-edge reads none.
+        d, T, st = new_run("a1_cx7", {})
+        st.state = "GATE"
+        save_state(d, st)
+        open(os.path.join(d, "fix_plan_r1.json"), "w").write('{"plan": ["stale"]}')
+        m = mk(d, T, st)
+        m._rethink("ENGINE_CHOICE", "test", planned=True)
+        ok(load_state(d).state == "ENGINE_CHOICE", "CX1-7 a malformed fix plan does not stop a RETHINK back-edge")
+
+    def r1_claims():
+        d = os.path.join(td, "a1_cx2")
+        os.makedirs(os.path.join(d, "models"))
+        yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5},
+                                   {"id": "b.unit", "claim_kind": "label", "value": "case"},
+                                   {"id": "b.ci", "claim_kind": "scalar", "value": 5, "ci_low": 6, "ci_high": 7}]},
+                       open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\na.good[CLAIM:b.unit]s and [CLAIM:b.ci].\n")
+        got = {(f["kind"], f.get("key")) for f in report_claim_findings(d)}
+        ok(("report_claim_id_raw", "a.good") in got, f"CX1-2 a bare id beside a reference is still reported ({got})")
+        ok(("report_claim_invalid", "b.ci") in got and ("report_claim_unresolved", "b.ci") not in got,
+           f"CX1-9 a reference to an invalid claim is reported once, as invalid ({got})")
+
+    # Narrow Codex review of #297, round 2 (each failed on b148196a).
+    def r2_machine():
+        d, T, st = new_run("a1_cx21", {})                    # CX2-1: no cap
+        m = mk(d, T, st)
+        m._task("k1", "sign_spec", d, writeup=True)
+        ok(m.st.journal["k1"].get("readback_usd") == READBACK_CAP_USD,
+           f"CX2-1 without a cap a write-up task's read-back allowance is recorded too ({m.st.journal['k1']})")
+        for name, setup, want in (
+                ("CX2-2 an unreadable ledger does not stop a RETHINK back-edge",
+                 lambda d: _put(d, FL.LEDGER, "not json\n"), None),
+                ("CX2-3 a structural mismatch any reviewer reports is among the reasons",
+                 lambda d: yaml.safe_dump({"structural_mismatch": {"detected": True, "description": "no age classes"},
+                                           "blockers": [{"id": "M-9", "category": "STRUCTURAL", "claim": "needs ages"}]},
+                                          open(os.path.join(d, "critique_methods.yaml"), "w")),
+                 "M-9: needs ages")):       # round 3 (5): the blocker's own text, whatever the ledger holds
+            d, T, st = new_run("a1_" + name[:5].replace("-", ""), {})
+            st.state = "GATE"
+            save_state(d, st)
+            setup(d)
+            try:
+                mk(d, T, st)._rethink("ENGINE_CHOICE", "test")
+            except Exception as e:  # noqa: BLE001
+                ok(False, f"{name}: {type(e).__name__}: {e}")
+                continue
+            s = load_state(d)
+            why = (s.tries.get("rethink_engine") or {}).get("why") or []
+            ok(s.state == "ENGINE_CHOICE" and (want is None or any(want in w for w in why)), f"{name} ({why})")
+
+    def r2_findings():
+        # CX2-4: with report.md alone the presentation review's findings are open findings, as its file is read.
+        d = os.path.join(td, "a1_cx24")
+        os.makedirs(os.path.join(d, "models"))
+        yaml.safe_dump({"reviewer": "critique-presentation", "round": 1, "blockers": [
+            {"id": "P-002", "severity": "MEDIUM", "category": "METHODS", "target_stage": "WRITE", "claim": "c"}]},
+            open(os.path.join(d, "critique_presentation.yaml"), "w"))
+        open(os.path.join(d, "report.md"), "w").write("# Report\n")
+        got = [o["id"] for o in open_findings(d, {"action": "ACCEPT", "rigor_violations": []})]
+        ok(got == ["P-002"], f"CX2-4 with report.md alone the presentation review's findings are read ({got})")
+        # CX2-9: a reference broken over two lines is not one the renderer accepts: still reported.
+        yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5}]},
+                       open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts [CLAIM:\na.good] cases.\n")
+        os.remove(os.path.join(d, "report.md"))
+        got = {f["kind"] for f in report_claim_findings(d)}
+        ok(got & {"report_claim_unresolved", "report_claim_id_raw"},
+           f"CX2-9 a reference broken over two lines is still reported ({got})")
+        # CX3-6 (round 3): an open finding whose test regressed is listed with its regression, as before the key.
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 1, "blockers": [
+            {"id": "D-071", "severity": "MEDIUM", "category": "METHODS", "target_stage": "ANALYZE", "claim": "c"}]},
+            open(os.path.join(d, "critique_domain.yaml"), "w"))
+        got = [o["id"] for o in open_findings(d, {"action": "PATCH_OR_RETHINK", "rigor_violations": [
+            {"kind": "done_when_regressed", "key": "D-071", "severity": "HIGH", "claim": "c"}]})]
+        ok("done_when_regressed:D-071" in got and "D-071" in got, f"CX3-6 a regression is listed beside its finding ({got})")
+
+    def r3_presentation():
+        # CX3-1: documented behaviour, pinned (the base does this in an uninterrupted run).
+        class NoReview(StubTasks):
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                return self._r(f"critique:{reviewer}:{round_n}", False, note="no review written")
+        states = []
+        for name, journal in (("live", None), ("replay", {"task": "critique", "status": "completed", "ok": False})):
+            d, T, st = new_run("a1_cx31" + name, {}, budget=20.0)
+            st.state, st.spent_usd = "PRESENTATION", 20.0 if journal else 16.5
+            if journal:
+                st.journal["PRESENTATION#0:r1"] = journal
+            save_state(d, st)
+            mk(d, NoReview(T.s), st).step()
+            states.append(load_state(d).state)
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
+        for r in CRITICS:
+            StubTasks({}).critique(d, r, 1)
+        kinds = [(v.get("kind"), v.get("severity")) for v in v2_gate(d, 1, 3, True, [], history=False).get("rigor_violations") or []]
+        ok(states == ["GATE", "GATE"] and ("critique_presentation_missing", "MEDIUM") in kinds,
+           f"CX3-1 a failed presentation task goes to the gate, live and replayed alike; the gate reports the missing "
+           f"review ({states}, {kinds})")
+
+    for name, fn in (("T_PRES_BUDGET", budget), ("T_PW_GATE", post_write), ("F_HARNESS_IDS", ids),
+                     ("T_RETHINK", rethink), ("T_CLAIM", claims), ("CX1-3", r1_resume), ("CX1-4", r1_readback),
+                     ("CX1-5", r1_open), ("CX1-7", r1_rethink), ("CX1-2", r1_claims), ("CX2-1", r2_machine),
+                     ("CX2-4", r2_findings), ("CX3-1", r3_presentation)):
+        case(name, fn)
+
+
 def _self_test_resume(ok, td: str, spike, new_run) -> None:
     """T58-T60 (Nigeria v2 full run, 2026-11-02: ANALYZE -> FINAL run_failed when the runner's 1-h limit killed the
     engine batch). A toy engine batch through scripts/compute.py, as a pipeline step before the spike's analysis."""
@@ -3615,9 +4855,10 @@ def _self_test_geometry(ok, td: str) -> None:
        and [f.get("proposed") for f in rep["findings"]] == [why] and still,
        f"IG-M2a proposed by name with a reason, the spec reaches SIGN, where the owner decides; until then the gate "
        f"still carries the swap ({m2.st.state}, {m2.st.paused}, {still})")
+    _t_owner_disposes(d2)
     toolkit.sign(d2, "owner")
     m2.step()
-    ok(m2.st.state == "EVIDENCE" and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
+    ok(m2.st.state == "ENGINE_CHOICE" and "reciprocal_swap" not in {f["kind"] for f in m2.harness_findings()},
        f"IG-M2b the owner's sign-off approves the proposed exception: the run goes on and the gate no longer carries "
        f"it ({m2.st.state})")
     # IG-M4 (review P1): under --signoff lead a proposed HIGH exception pauses for the owner, as a spec sign-off does
@@ -3632,7 +4873,7 @@ def _self_test_geometry(ok, td: str) -> None:
        f"({m4.st.state}, {m4.st.paused}, {SO.status(m4.run_dir)})")
     toolkit.sign(m4.run_dir, "owner")
     m4.step()
-    ok(m4.st.state == "EVIDENCE" and "reciprocal_swap" not in {f["kind"] for f in m4.harness_findings()},
+    ok(m4.st.state == "ENGINE_CHOICE" and "reciprocal_swap" not in {f["kind"] for f in m4.harness_findings()},
        f"IG-M4b once the owner signs, the run goes on with the exception approved ({m4.st.state})")
     import v2_sdk_tasks as SDK
     ok({GEO.ARTIFACT, GEO.SIGNOFF_FILE} <= set(SDK.HARNESS_FILES),
@@ -3657,6 +4898,7 @@ def _self_test_geometry(ok, td: str) -> None:
             return real_osopen(f, *a, **k)
         builtins.open, os.open = bopen, oopen
         try:
+            _t_owner_disposes(d6)
             rec6 = sign(d6, "owner", "n")
         finally:
             builtins.open, os.open = real_open, real_osopen
@@ -3683,6 +4925,7 @@ def _self_test_geometry(ok, td: str) -> None:
             sp["engine"] = {"ref": ref}
             sp["engine_parameters"] = {"p": entry}
             _y.safe_dump(sp, open(os.path.join(d7, AB.SPEC_FILE), "w"))
+            _t_owner_disposes(d7)
             sign(d7, "owner", "n")
             why = ""
         except ValueError as e:
@@ -3765,6 +5008,7 @@ def _self_test_derived(ok, td: str) -> None:
            and "engine_attribute_unbound" in sheet and "group" in sheet,
            f"DI8a engine auto: the full checks run per candidate in SPEC, before SIGN; the candidate that needs an "
            f"unbound attribute is shown ineligible with the reason ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+        _t_owner_disposes(d)
         toolkit.sign(d, "owner")
         for _ in range(6):
             if m.st.state in ("CONFIGURE", "FINAL"):
@@ -3786,6 +5030,202 @@ def _self_test_derived(ok, td: str) -> None:
     finally:
         REPO = old_repo
         sys.path.remove(mods)
+
+
+def _self_test_evidence(ok, td: str) -> None:
+    """v2 autonomy 1B-ii (D1): the EVIDENCE stage before SIGN, on the toy engine whose component declares decision
+    inputs (toolkit/spec/toy_engines.py ToyDossierEngine)."""
+    import yaml
+    from v2_tasks import StubTasks
+    from toolkit.spec import evidence_dossier as ED, evidence_draft as EDR, toy_engines as TE
+    TE.enable_for_test()
+    toolkit = AB.backend("toolkit")
+    full = ED.toy_entries()
+
+    def setup(name, signoff, script, dossier=True):
+        d = os.path.join(td, name)
+        os.makedirs(d)
+        raw = yaml.safe_load(open(ED.toy_dossier_spec(d, dossier=dossier)))
+        for f in (AB.SPEC_FILE, ED.DOSSIER_FILE):
+            if os.path.exists(os.path.join(d, f)):
+                os.remove(os.path.join(d, f))
+        st = init_run(d, "toy question", 3, signoff, "v2", None, derived_inputs=False)
+        T = StubTasks(dict({"spec": raw}, **script))
+        return Machine(d, T, st, backend=toolkit, log=lambda *a: None, cross_engine_check=False), T
+
+    def until(m, stop=("ENGINE_CHOICE",), n=14):
+        for _ in range(n):
+            if m.st.state in stop or m.st.state == "FINAL" or m.st.paused:
+                break
+            m.step()
+        return [h.get("to") for h in m.st.history if "to" in h]
+
+    def fill(run_dir, feedback):        # the evidence task: two inputs observed or calibrated, one with no data
+        doc = yaml.safe_load(open(os.path.join(run_dir, ED.DOSSIER_FILE)))["inputs"]
+        k = dict(doc["parameter:k"], no_data={"reason": "no field measurement", "borrowing_rule": "the card's value"})
+        return {"parameter:eff_a": full["parameter:eff_a"], "unit_attribute:x": full["unit_attribute:x"],
+                "parameter:k": k}
+
+    # T_DOSSIER_AUTO: lead sign-off, the spec names the dossier and no one wrote it: scaffold, one task, signed
+    m, T = setup("ev_lead", "lead", {"evidence": fill})
+    hist = until(m)
+    rec = EDR.read_record(m.run_dir) or {}
+    so = _signoff(m.run_dir) or {}
+    ok(hist[:3] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE"] and T.calls.count("draft_evidence") == 1
+       and rec.get("status") == "complete" and so.get("signed_by") == "lead"
+       and so.get("evidence", {}).get("dossier") == ED.DOSSIER_FILE,
+       f"T_DOSSIER_AUTO under --signoff lead the run drafts the dossier before SIGN and the lead signs it ({hist}; "
+       f"{T.calls}; {rec.get('status')}; {rec.get('problems')})")
+    g = rec.get("gaps") or {}
+    ok(g.get("no_data") == ["parameter:k", "unit_attribute:x"] and g.get("default_kept") == ["parameter:k"]
+       and g.get("sources_unchecked") == ["parameter:eff_a"]
+       and "provisional" in so.get("note", "") and EDR.RECORD in so.get("note", ""),
+       f"T_DOSSIER_GAPS the gaps are declared in the record and the lead's note ({rec.get('gaps')}; {so.get('note')})")
+    # T_SIGN_REPAIR: the sheet goes stale between EVIDENCE and SIGN; the refusal sends the run back, then it signs
+    class Stale(StubTasks):
+        def sign_spec(self, run_dir):
+            if self.calls.count("sign_spec") == 0:
+                os.remove(os.path.join(run_dir, SIGNOFF_SHEET))
+            return super().sign_spec(run_dir)
+    d = os.path.join(td, "ev_repair")
+    os.makedirs(d)
+    raw = yaml.safe_load(open(ED.toy_dossier_spec(d, dossier=False)))
+    raw["evidence"] = {"dossier": ED.DOSSIER_FILE}
+    os.remove(os.path.join(d, AB.SPEC_FILE))
+    T = Stale({"spec": raw, "evidence": fill})
+    m = Machine(d, T, init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False), backend=toolkit,
+                log=lambda *a: None, cross_engine_check=False)
+    hist = until(m)
+    ok(hist[:5] == ["EVIDENCE", "SIGN", "EVIDENCE", "SIGN", "ENGINE_CHOICE"] and m.st.tries.get("sign_repair") == 1
+       and T.calls.count("draft_evidence") == 1 and (_signoff(d) or {}).get("signed_by") == "lead",
+       f"T_SIGN_REPAIR a refused lead sign-off goes back to EVIDENCE once, which rewrites the sheet, then signs ({hist}; "
+       f"{T.calls})")
+    # T_EVIDENCE_EXHAUSTED: a task that never supplies the evidence: three drafts, two repairs, then the owner
+    m, T = setup("ev_none", "lead", {})
+    hist = until(m)
+    rec = EDR.read_record(m.run_dir) or {}
+    ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and T.calls.count("draft_evidence") == EDR.MAX_TRIES
+       and m.st.tries.get("sign_repair") == MAX_SIGN_REPAIRS and rec.get("status") == "incomplete"
+       and not os.path.exists(os.path.join(m.run_dir, SIGNOFF_FILE)),
+       f"T_EVIDENCE_EXHAUSTED the check is never loosened: after {EDR.MAX_TRIES} drafts and {MAX_SIGN_REPAIRS} repairs "
+       f"the run waits for the owner, unsigned ({hist}; {T.calls})")
+    # T_EVIDENCE_OWNER: under --signoff owner the drafted dossier is on the sheet the owner signs
+    m, T = setup("ev_owner", "owner", {"evidence": fill})
+    until(m)
+    sheet = open(os.path.join(m.run_dir, SIGNOFF_SHEET)).read() if os.path.exists(
+        os.path.join(m.run_dir, SIGNOFF_SHEET)) else ""
+    ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff" and ED.SECTION in sheet, f"T_EVIDENCE_OWNER the "
+       f"owner is shown the drafted dossier on the sheet ({m.st.state}, {m.st.paused})")
+    _t_owner_disposes(m.run_dir)        # W0-G (v2 merge): the owner disposes of the review conditions before signing
+    toolkit.sign(m.run_dir, "owner")
+    m.step()
+    ok(m.st.state == "ENGINE_CHOICE", f"T_EVIDENCE_OWNER_SIGNED once the owner signs, the run goes on ({m.st.state})")
+    # T_EVIDENCE_NONE: --signoff none: the drafted dossier covers the engine at ENGINE_CHOICE (it failed there before)
+    m, T = setup("ev_unsigned", "none", {"evidence": fill})
+    hist = until(m, stop=("PREREGISTER", "CONFIGURE"))
+    ok(hist[:4] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", hist[3] if len(hist) > 3 else None]
+       and m.st.state in ("PREREGISTER", "CONFIGURE"),
+       f"T_EVIDENCE_NONE --signoff none passes ENGINE_CHOICE's coverage check with the drafted dossier ({hist})")
+    # T_EVIDENCE_NAME: the options need inputs and the spec names no dossier: back to the draft, nothing written
+    d = os.path.join(td, "ev_name")
+    os.makedirs(d)
+    raw = yaml.safe_load(open(ED.toy_dossier_spec(d, dossier=False)))
+    os.remove(os.path.join(d, AB.SPEC_FILE))
+    m = Machine(d, StubTasks({"spec": raw}), init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False),
+                backend=toolkit, log=lambda *a: None, cross_engine_check=False)
+    until(m, n=4)
+    ok(m.st.state == "SPEC" and any("name the evidence dossier" in x for x in m.st.tries.get("spec_feedback") or [])
+       and not os.path.exists(os.path.join(d, ED.DOSSIER_FILE)),
+       f"T_EVIDENCE_NAME a spec that needs a dossier and names none is redrafted with the reason "
+       f"({m.st.state}; {m.st.tries.get('spec_feedback')})")
+    # T_EVIDENCE_RESUME: a run signed under the earlier order (SIGN, then EVIDENCE) resumes past EVIDENCE untouched
+    d = os.path.join(td, "ev_resume")
+    os.makedirs(d)
+    ED.toy_dossier_spec(d)
+    from toolkit.spec import signoff as SO
+    SO.write_sheet(d)
+    toolkit.sign(d, "owner")
+    before = open(os.path.join(d, ED.DOSSIER_FILE), "rb").read()
+    T = StubTasks({})
+    m = Machine(d, T, RunState(question="q", state="EVIDENCE", signoff="owner"), backend=toolkit, log=lambda *a: None,
+                cross_engine_check=False)
+    m.step()
+    m.step()
+    ok(m.st.state == "ENGINE_CHOICE" and T.calls == [] and open(os.path.join(d, ED.DOSSIER_FILE), "rb").read() == before
+       and [h.get("to") for h in m.st.history] == ["SIGN", "ENGINE_CHOICE"],
+       f"T_EVIDENCE_RESUME a spec already signed is left as signed and SIGN checks it ({m.st.state}, {T.calls})")
+    # T_EVIDENCE_OWNER_MODE (Codex r1 P1-2): an owner-mode run whose spec the lead signed does not pass SIGN
+    d = os.path.join(td, "ev_leadsigned")
+    os.makedirs(d)
+    ED.toy_dossier_spec(d)
+    SO.write_sheet(d)
+    toolkit.sign(d, "lead")
+    m = Machine(d, StubTasks({}), RunState(question="q", state="EVIDENCE", signoff="owner"), backend=toolkit,
+                log=lambda *a: None, cross_engine_check=False)
+    until(m, n=4)
+    ok(m.st.state == "SIGN" and m.st.paused == "awaiting_signoff",
+       f"T_EVIDENCE_OWNER_MODE a lead's signature does not satisfy --signoff owner ({m.st.state}, {m.st.paused})")
+    # T_STALE_NO_LEAD (Codex r1 P1-1): a signature made stale by a dossier edit is never replaced by the lead's
+    d = os.path.join(td, "ev_stale")
+    os.makedirs(d)
+    ED.toy_dossier_spec(d)
+    SO.write_sheet(d)
+    toolkit.sign(d, "owner")
+    rec0 = open(os.path.join(d, SIGNOFF_FILE), "rb").read()
+    open(os.path.join(d, ED.DOSSIER_FILE), "a").write("# edited after signing\n")
+    T = StubTasks({})
+    m = Machine(d, T, RunState(question="q", state="SIGN", signoff="lead"), backend=toolkit, log=lambda *a: None,
+                cross_engine_check=False)
+    until(m, n=6)
+    ok(m.st.paused == "awaiting_signoff" and "sign_spec" not in T.calls
+       and open(os.path.join(d, SIGNOFF_FILE), "rb").read() == rec0,
+       f"T_STALE_NO_LEAD the owner's stale record stays and the run waits for the owner ({m.st.state}, {T.calls})")
+    # T_LOST_RECORD (Codex r1 P1-3): a run whose history records a signature is not a draft when the record is lost
+    os.remove(os.path.join(d, SIGNOFF_FILE))
+    st = RunState(question="q", state="EVIDENCE", signoff="lead",
+                  history=[{"from": "SIGN", "to": "EVIDENCE", "why": "spec signed by the lead"}])
+    T = StubTasks({})
+    m = Machine(d, T, st, backend=toolkit, log=lambda *a: None, cross_engine_check=False)
+    until(m, n=6)
+    ok(m.st.paused == "awaiting_signoff" and T.calls == [],
+       f"T_LOST_RECORD a lost sign-off record waits for the owner; nothing is redrafted or re-signed ({T.calls})")
+    # T_LEGACY_SIGN (Codex r1 P2-6): an unsigned run saved at SIGN under the earlier order runs the evidence stage
+    m, T = setup("ev_legacy", "owner", {"evidence": fill})
+    m.st.state = "SIGN"
+    m.step()
+    ok(m.st.state == "EVIDENCE", f"T_LEGACY_SIGN an unsigned run at SIGN with no evidence record goes to EVIDENCE "
+                                 f"({m.st.state})")
+    # T_EVIDENCE_JOURNAL (Codex r1 P2-7): the drafts are counted from the journal, not a counter a crash can lose
+    m, T = setup("ev_journal", "lead", {})
+    m.step()                                    # SPEC -> EVIDENCE: the spec is drafted
+    m.st.journal.update({f"EVIDENCE#0:try{i}": {"status": "completed", "ok": True} for i in (1, 2, 3)})
+    m.step()
+    ok("draft_evidence" not in T.calls and (EDR.read_record(m.run_dir) or {}).get("tries") == 3,
+       f"T_EVIDENCE_JOURNAL three completed drafts in the journal: no fourth ({T.calls})")
+    # T_SUPPLIED_OWNED (Codex r2 P1-5): a supplied dossier at a path the harness writes goes back to the draft
+    m, T = setup("ev_owned", "lead", {})
+    m.step()                                    # SPEC -> EVIDENCE
+    rawo = yaml.safe_load(open(os.path.join(m.run_dir, AB.SPEC_FILE)))
+    rawo["evidence"] = {"dossier": "report.md"}
+    yaml.safe_dump(rawo, open(os.path.join(m.run_dir, AB.SPEC_FILE), "w"))
+    m.step()
+    ok(m.st.state == "SPEC" and any("report.md" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"T_SUPPLIED_OWNED a dossier named report.md is refused before anything is written ({m.st.state})")
+    # T_SIGN_BUDGET (Codex r2 P2-3): no allowance for the lead's sign task is the budget path, not an owner pause
+    m, T = setup("ev_budget", "lead", {"evidence": fill})
+    until(m, stop=("SIGN",))
+    m._task = lambda *a, **k: None
+    m.step()
+    ok(m.st.state == "FINAL" and m.st.status == "budget_exhausted",
+       f"T_SIGN_BUDGET ({m.st.state}, {m.st.status}, {m.st.paused})")
+    # T_DELIVERABLE_DOSSIER (Codex r1 P1-5): the deliverable may not be the dossier or the sheet
+    raw = yaml.safe_load(open(os.path.join(d, AB.SPEC_FILE)))
+    for name in (ED.DOSSIER_FILE, SIGNOFF_SHEET, "src[1].yaml"):     # r2 P1-1: a name that is not its own glob
+        raw["evidence"] = {"dossier": "src[1].yaml"}
+        raw["deliverable_file"] = {"path": name, "columns": {"unit": "id"}}
+        yaml.safe_dump(raw, open(os.path.join(d, AB.SPEC_FILE), "w"))
+        ok(any("owns" in p or "evidence dossier" in p for p in deliverable_problems(d)),
+           f"T_DELIVERABLE_DOSSIER a deliverable named {name} is refused ({deliverable_problems(d)})")
 
 
 def main(argv=None) -> int:

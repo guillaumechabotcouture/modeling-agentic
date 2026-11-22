@@ -43,5 +43,5 @@ python3 scripts/lessons.py summary --md
 
 ## Limits
 - **Most model-quality lessons have no automatic signal.** They depend on expert answers to the checklist. That is deliberate: a keyword match on critic prose would count false recurrences.
-- **One run per version is anecdote.** For model-quality lessons, the stronger test is replaying the decision point from its stage snapshot several times, before and after the change (`scripts/replay.py`, recorded as `--by replay`).
+- **One run per version is anecdote.** For model-quality lessons, the stronger test is replaying the decision point from its stage snapshot several times, before and after the change (recorded as `--by replay`; `scripts/replay.py`, the v1 stage-replay lane, was removed with v1, so replaying needs a checkout from before the v1 retirement).
 - **The ledger describes error classes, not how to pass a gate.** Changes to agent prompts go in the prompts and skills themselves.

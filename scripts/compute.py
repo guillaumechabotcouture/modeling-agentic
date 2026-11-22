@@ -293,7 +293,7 @@ def _guard_registration():
     return g.worker_registration() if g is not None else None
 
 
-def _local_init(run_dir: str, fn_spec: str, init_dir: str | None = None, guard_reg=None):
+def _local_init(run_dir: str, fn_spec: str, init_dir: str | None = None, guard_reg=None, repo: str | None = None):
     """Pool initializer. Each process records its model load time in
     `init_dir`, so loads are charged even in processes that get no chunk; a
     load that raises is recorded there too (`<pid>.err`), so a pool that breaks
@@ -312,8 +312,13 @@ def _local_init(run_dir: str, fn_spec: str, init_dir: str | None = None, guard_r
     if not os.environ.get("MA_COMPUTE_IN_CHUNK"):
         os.setpgrp()
     os.chdir(run_dir)
+    _OBSERVED.update(run=run_dir, repo=repo or REPO)      # the caller's tree: what observed paths are relative to
+    if not _OBSERVED["hooked"]:
+        sys.addaudithook(_audit)                           # W0-A: files read and children started, from here on
+        _OBSERVED["hooked"] = True
     try:
         _LOCAL_FN = load_fn(run_dir, fn_spec)
+        _observed_files()          # hash what the load read now, near when it was read (an edit mid-batch is caught)
     except BaseException as e:
         if init_dir:
             open(os.path.join(init_dir, f"{os.getpid()}.err"), "w").write(f"{type(e).__name__}: {e}"[:500])
@@ -328,8 +333,85 @@ def _local_chunk(chunk):
     for i, params in chunk:
         row = _call(_LOCAL_FN, i, params)
         row["peak_mb"] = _peak_mb()
+        _observe(row)
         out.append(row)
     return out
+
+
+# W0-A: the observed closure. After each job returns, the repo and run files this process has used are recorded with
+# their sha256: its sys.modules entries' __file__, and the files it opened for reading (an audit hook, installed before
+# the model loads: imports, runpy, data read by path); run files only when Python (run_files covers models/ and
+# data/). A row carries the id of that set (`observed_id`, a digest of it) and, when the set changed since this
+# process last sent it, the set itself (`observed`). A stored row is reused only while every file of its set
+# re-hashes the same here (_observed_check). `observed_child`: the process started a child process (it may have
+# read files it did not record), so the key also holds the whole tree.
+_OBSERVED = {"run": None, "repo": None, "digests": {}, "sent": None, "opened": set(), "child": False, "hooked": False}
+_CHILD_EVENTS = ("subprocess.Popen", "os.system", "os.posix_spawn", "os.spawn", "os.exec", "os.fork", "os.forkpty",
+                 "pty.spawn")
+
+
+def _audit(event: str, args) -> None:
+    if event == "open":
+        path, mode = args[0], args[1] if len(args) > 1 else None
+        flags = args[2] if len(args) > 2 and isinstance(args[2], int) else 0
+        if isinstance(path, (str, bytes)) and not any(c in str(mode or "") for c in "wax+") \
+                and not flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
+            _OBSERVED["opened"].add(os.path.abspath(os.fsdecode(path)))
+    elif event in _CHILD_EVENTS:
+        _OBSERVED["child"] = True
+
+
+def _observed_files() -> dict:
+    """{path: sha256} of the repo files (relative to REPO) and run Python files ("run:<rel>") this process used. The
+    path is kept as used (a linked module is re-checked through its link), else as resolved."""
+    run, repo = _OBSERVED["run"] or os.getcwd(), _OBSERVED["repo"] or REPO
+    roots = [(base + os.sep, tag) for d, tag in ((run, "run:"), (repo, ""))       # a run dir may lie in the repo
+             for base in dict.fromkeys((os.path.abspath(d), os.path.realpath(d)))]
+    got, cache = {}, _OBSERVED["digests"]
+    used = [getattr(m, "__file__", None) for m in list(sys.modules.values())] + sorted(_OBSERVED["opened"])
+    for f in used:
+        if not isinstance(f, str) or "__pycache__" in f or f.endswith(".pyc"):
+            continue
+        for path in (os.path.abspath(f), os.path.realpath(f)):
+            hit = next(((b, t) for b, t in roots if path.startswith(b)), None)
+            if hit is None:
+                continue
+            rel = hit[1] + os.path.relpath(path, hit[0][:-1]).replace(os.sep, "/")
+            if (hit[1] and not rel.endswith(".py")) or rel in _FP_REPO_SKIP or os.path.isdir(path):
+                break
+            if path not in cache:
+                try:
+                    cache[path] = _file_digest(path)
+                except (OSError, ValueError):
+                    cache[path] = "unreadable"            # never matches: no reuse
+            got[rel] = cache[path]
+            break
+    return got
+
+
+def _had_child() -> bool:
+    """This process started a child (seen by the audit hook, reaped, or still alive). Cheap, best effort."""
+    if _OBSERVED["child"]:
+        return True
+    import resource
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if ru.ru_utime + ru.ru_stime > 0:
+        return True
+    try:
+        import psutil
+        return bool(psutil.Process().children())
+    except Exception:  # noqa: BLE001 -- psutil missing or refused: the reaped-child test above still applies
+        return False
+
+
+def _observe(row: dict) -> None:
+    files = _observed_files()
+    row["observed_id"] = _digest(files)
+    if row["observed_id"] != _OBSERVED["sent"]:
+        row["observed"] = files
+        _OBSERVED["sent"] = row["observed_id"]
+    if _had_child():
+        row["observed_child"] = True
 
 
 def _chunks(items: list, n_chunks: int) -> list:
@@ -457,7 +539,7 @@ def _map_local(run_dir, fn_spec, inputs, max_workers, deadline=None, allowance_s
     def new_pool(k):
         return cf.ProcessPoolExecutor(max_workers=k, mp_context=mp.get_context("spawn"),
                                       initializer=_local_init,
-                                      initargs=(run_dir, fn_spec, init_dir.name, _guard_registration()))
+                                      initargs=(run_dir, fn_spec, init_dir.name, _guard_registration(), REPO))
 
     def load_error():
         for name in os.listdir(init_dir.name):
@@ -663,12 +745,17 @@ def recycle_every(procs: int) -> int:
 # --------------------------------------------------------------------------- #
 
 def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple[bytes, dict]:
-    """tar.gz of the run's models/ and data/ and the repo's scripts/ and toolkit/, with
-    ABSOLUTE member paths so workers recreate the same layout. Logs and the records this
-    module keeps beside a batch are left out (`_bundle_skips`): a long run's
-    logs and partial rows were shipped to every VM."""
+    """tar.gz of the run's models/ and data/, the repo's scripts/ and toolkit/, and the declared data set
+    (FP_DATA_SET: repo data/, .claude/orchestration/, and the non-Python files of scripts/ and toolkit/), with
+    ABSOLUTE member paths so workers recreate the same layout. The data set is exactly the files the reuse key's
+    data_set part hashes (_data_set_files), shipped whatever their size: a worker that reads one computes with
+    the launcher's copy, the one the key names (BD1-BD4). Logs and the records this module keeps beside a batch
+    are left out (`_bundle_skips`; a long run's logs and partial rows were shipped to every VM), except a file of
+    the data set, which always ships (CD6c)."""
     run_dir = os.path.realpath(run_dir)
     skipped, n, n_out = [], 0, 0
+    data_set = {os.path.join(REPO, r) for r in _data_set_files(FP_DATA_SET, skip=run_dir)}
+    added, unreadable = set(), []
     buf = io.BytesIO()
     # dereference: symlinked inputs are stored as files (workers extract with
     # the "data" filter, which rejects absolute links).
@@ -684,27 +771,39 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                 if real in anc:
                     dirs[:] = []
                     continue
-                dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "_truth")]
+                dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git") and not d.startswith("_truth")]
                 for d in dirs:
                     ancestors[os.path.join(dp, d)] = anc | {real}
                 names, in_data = set(files), root == os.path.join(run_dir, "data")
                 for fn in files:
                     p = os.path.join(dp, fn)
-                    if _bundle_skips(fn, names, in_data, dp == os.path.join(run_dir, "models")):
+                    if p not in data_set and _bundle_skips(fn, names, in_data, dp == os.path.join(run_dir, "models")):
                         n_out += 1
                         continue
                     try:
                         size = os.path.getsize(p)
                     except OSError:
                         continue
-                    if size > max_file_mb * 2**20:
+                    if size > max_file_mb * 2**20 and p not in data_set:
                         skipped.append((os.path.relpath(p, run_dir), round(size / 2**20, 1)))
                         continue
+                    if p in added:
+                        continue
                     t.add(p, arcname=p.lstrip("/"))
+                    added.add(p)
                     n += 1
+        for p in sorted(data_set - added):     # repo data/ and .claude/orchestration/ (scripts/, toolkit/ are above)
+            try:
+                t.add(p, arcname=p.lstrip("/"))
+            except OSError:                    # a dangling link: the key hashes it as unreadable; no worker has it
+                unreadable.append(os.path.relpath(p, REPO))
+                continue
+            added.add(p)
+            n += 1
     data = buf.getvalue()
     return data, {"files": n, "bundle_mb": round(len(data) / 2**20, 1), "skipped_large": skipped,
                   "skipped_outputs": n_out,
+                  "data_set_files": len(data_set & added), "data_set_unreadable": unreadable,
                   "sha256": hashlib.sha256(data).hexdigest()}
 
 
@@ -2653,11 +2752,93 @@ def fn_id(run_dir: str, fn_spec: str) -> str:
     return fn_spec
 
 
-def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = False) -> str:
-    """What a result depends on besides its params: every file under the run's
-    models/ and data/ (following symlinked directories) and the repo's
-    scripts/ and toolkit/ (code content only: never the commit stamp, F6 S1-8) and its dependency manifests
-    (FP_DEP_MANIFESTS), except a v2 run's fixed-name analysis outputs (FP_HARNESS_OUTPUTS) and sign-off records
+def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = False, extra=None,
+                     record: dict | None = None, extra_digest: str | None = None) -> str:
+    """The reuse key of a batch's rows besides their params (W0-A), a hash of parts recorded with the batch
+    (`record` gets key_parts): run_files, the run's models/ and data/ and the function's file (_run_files_digest);
+    deps, the dependency manifests; data_set, the repo data read by path (FP_DATA_SET); extra, the caller's part
+    (batch.py: the engine identity), or `extra_digest` as recorded (reuse_report, the run console). The repo code is
+    not in it: it is the observed closure, recorded when the rows are computed and re-hashed when they are reused
+    (_observed_check). The spec reaches a job through its params, the row's own key (input_key)."""
+    run_dir = os.path.realpath(run_dir)
+    parts = {"version": FP_KEY_VERSION, "run_files": _run_files_digest(run_dir, fn_spec, exclude, confined),
+             "deps": _digest({m: _file_digest(os.path.join(REPO, m)) for m in FP_DEP_MANIFESTS
+                              if os.path.isfile(os.path.join(REPO, m))}),
+             "data_set": _files_digest(FP_DATA_SET, skip=run_dir)}
+    if extra is not None or extra_digest:
+        parts["extra"] = extra_digest or _digest(extra)
+    if record is not None:
+        record["key_parts"] = parts
+    return "k3-" + _digest(parts)[:20]
+
+
+FP_KEY_VERSION = 3
+# W0-A: the repo data a batch can read by path, hashed whole into every key (the one list). "all": every file;
+# "data": every file but code and docs (.py, .pyc, .md); the Python a job imports is its observed closure.
+FP_DATA_SET = {".claude/orchestration": "all", "data": "all", "scripts": "data", "toolkit": "data"}
+_FP_CODE_EXT = (".py", ".pyc", ".md")
+
+
+def _files_digest(spec: dict, skip: str | None = None) -> str:
+    """sha256 over {repo-relative path: sha256} of the files `spec` names (_data_set_files)."""
+    got = {}
+    for rel in _data_set_files(spec, skip):
+        try:
+            got[rel] = _file_digest(os.path.join(REPO, rel))
+        except OSError:
+            got[rel] = "unreadable"
+    return _digest(got)
+
+
+def _data_set_files(spec: dict, skip: str | None = None) -> list[str]:
+    """The repo-relative paths of the files `spec` names ({dir: "all" | "data"}), sorted; __pycache__, .git and any
+    `_truth*` component (eval_paths' hidden-material rule, also where a link leads) left out, linked directories
+    followed (a loop stops), the launch stamp (_FP_REPO_SKIP) and the directory `skip` (the run dir, when it lies
+    under one of them) skipped. The key hashes these files and make_bundle ships them."""
+    got = []
+    for root, kind in sorted(spec.items()):
+        top = os.path.join(REPO, root)
+        anc = {top: {os.path.realpath(top)}}
+        for dp, dirs, fns in os.walk(top, followlinks=True):
+            dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git") and not _hidden_path(os.path.join(dp, d))
+                             and os.path.realpath(os.path.join(dp, d)) not in anc[dp]
+                             and os.path.realpath(os.path.join(dp, d)) != (skip and os.path.realpath(skip)))
+            for d in dirs:
+                anc[os.path.join(dp, d)] = anc[dp] | {os.path.realpath(os.path.join(dp, d))}
+            for f in fns:
+                rel = os.path.relpath(os.path.join(dp, f), REPO).replace(os.sep, "/")
+                if rel in _FP_REPO_SKIP or (kind == "data" and f.endswith(_FP_CODE_EXT)) \
+                        or _hidden_path(os.path.join(dp, f)):
+                    continue
+                got.append(rel)
+    return sorted(set(got))
+
+
+def _hidden_path(path: str) -> bool:
+    """A `_truth*` component in the path or in where it leads (eval_paths: hidden eval-suite material)."""
+    return any(c.startswith("_truth") for p in (path, os.path.realpath(path)) for c in p.split(os.sep))
+
+
+def _digest(x) -> str:
+    return hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _file_digest(f: str) -> str:
+    """sha256 of a file's content, streamed; compute.py with its dispatch code left out (FP_DISPATCH_EXEMPT)."""
+    h = hashlib.sha256()
+    if os.path.realpath(f) == os.path.realpath(os.path.join(REPO, "scripts", "compute.py")):
+        with open(f, encoding="utf-8", errors="surrogateescape") as fh:
+            h.update(_fp_compute_source(fh.read()))
+    else:
+        with open(f, "rb") as fh:
+            for block in iter(lambda: fh.read(2**20), b""):
+                h.update(block)
+    return h.hexdigest()
+
+
+def _run_files_digest(run_dir: str, fn_spec: str, exclude=(), confined: bool = False) -> str:
+    """Every file under the run's
+    models/ and data/ (following symlinked directories) and the batch function's file, except a v2 run's fixed-name analysis outputs (FP_HARNESS_OUTPUTS) and sign-off records
     (FP_SIGNOFF_RECORDS) and (outside data/) logs,
     figures, summaries, the ledger, the
     pipeline runner's own files in models/ (_FP_RUNNER_FILES), and this call's own results file (`exclude`), and any batch's partial rows or
@@ -2678,8 +2859,7 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
     skip = {os.path.realpath(x) for x in exclude}
     files = {fn_file}
     links = []
-    for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data"),
-                 *(os.path.join(REPO, x) for x in REPO_CODE_DIRS)):
+    for root in (os.path.join(run_dir, "models"), os.path.join(run_dir, "data")):
         # Every path a model can use is walked, aliases included (each under its
         # own name); only a loop (a dir that is its own ancestor) stops the walk.
         ancestors = {root: frozenset()}
@@ -2707,7 +2887,6 @@ def code_fingerprint(run_dir: str, fn_spec: str, exclude=(), confined: bool = Fa
                 if _fp_ignored(fn, names, in_data, runner):
                     continue          # logs, figures, summaries, the ledger (never skipped under data/)
                 files.add(os.path.join(dp, fn))
-    files.update(os.path.join(REPO, m) for m in FP_DEP_MANIFESTS)     # missing ones are skipped below
     for ln in sorted(links):
         h.update(b"link:" + ln.encode() + b"\0")
     for f in sorted(files):
@@ -2808,14 +2987,32 @@ def _same_fn(rec: dict, fn_spec: str, fid: str | None) -> bool:
     return rec.get("fn") == fn_spec or bool(fid and rec.get("fn_id") == fid)
 
 
-def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None) -> dict:
+def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None, run_dir: str | None = None,
+              why: list | None = None, acc: dict | None = None, here: dict | None = None, confined: bool = False,
+              trust: bool = False) -> dict:
     """key -> ok row from an earlier --out of the same function and code, and
     (Phase 42 α) from the rows an interrupted or killed run of it had written
-    to `<out>.partial.jsonl` (its first line names the function and code)."""
+    to `<out>.partial.jsonl` (its first line names the function and code). W0-A: a record is used only with the same
+    key and an observed closure that still holds here (_observed_check); a row only when its observed set is one
+    the record holds. Each refusal's reason goes to `why`, the observed record of what is kept to `acc`; `here`
+    (this key's parts) names the parts that differ. `trust`: every ok row of the same function (reuse_report's count)."""
     got = {}
+    why = [] if why is None else why
+
+    def admit(rec, rows):
+        ok_rows = {r["key"]: r for r in rows if isinstance(r, dict) and r.get("ok") and r.get("key")}
+        if trust or not ok_rows:
+            return ok_rows
+        reason, a = record_check(rec, fp, run_dir, here, confined, rows)
+        if reason:
+            why.append(reason)
+            return {}
+        if acc is not None:
+            _merge_acc(acc, a)
+        return {k: r for k, r in ok_rows.items() if r.get("observed_id") in a["sets"]}
     try:
         prev = json.load(open(out + ".summary.json"))
-        if _same_fn(prev, fn_spec, fid) and prev.get("code_fp") == fp:
+        if _same_fn(prev, fn_spec, fid):
             body = open(out, "rb").read()
             rows = [json.loads(l) for l in body.decode().splitlines() if l.strip()]
             # Codex round 1 P1-1: a results file and a summary from two different writes (a torn snapshot) are
@@ -2825,23 +3022,127 @@ def _reusable(out: str, fn_spec: str, fp: str, fid: str | None = None) -> dict:
                 print(f"compute: {out}: results file does not match its summary ("
                       f"{'sha256' if want else 'row count'}): its rows are not reused", file=sys.stderr)
                 rows = []
-            got.update({r["key"]: r for r in rows if isinstance(r, dict) and r.get("ok") and r.get("key")})
+            got.update(admit(prev, rows))
     except (OSError, ValueError):
         pass
     try:
         with open(out + PARTIAL_EXT) as f:
             head = json.loads(f.readline() or "{}").get("_partial") or {}
-            if _same_fn(head, fn_spec, fid) and head.get("code_fp") == fp:
+            if _same_fn(head, fn_spec, fid):
+                rows = []
                 for line in f:
                     try:
-                        r = json.loads(line)
+                        rows.append(json.loads(line))
                     except ValueError:
                         continue                  # a line torn by a kill mid-write
-                    if isinstance(r, dict) and r.get("ok") and r.get("key"):
-                        got.setdefault(r["key"], r)
+                for k, r in admit(head, rows).items():
+                    got.setdefault(k, r)
     except (OSError, ValueError, AttributeError):
         pass
     return got
+
+
+# W0-A: the key parts code_fp hashes; the other key_parts entries are the observed record (not hashed: checked).
+FP_BASE_PARTS = ("version", "run_files", "deps", "data_set", "extra")
+
+
+def record_check(rec: dict, fp: str, run_dir: str | None, here: dict | None = None, confined: bool = False,
+                 rows=()) -> tuple[str | None, dict]:
+    """(why a stored batch record's rows are not reusable here or None, its observed record): it must hold an
+    observed closure (else `no_observed_closure`), carry this key `fp` (else the parts that differ from `here`),
+    and its closure must still hold (_observed_check). `rows`: a journal's rows, which carry their observed sets."""
+    a, kp = _new_acc(), rec.get("key_parts") if isinstance(rec.get("key_parts"), dict) else {}
+    _merge_parts(a, kp)
+    _gather(a, rows)
+    if not a["sets"]:
+        return "no_observed_closure", a
+    if rec.get("code_fp") != fp:
+        here = here or {}
+        return "key differs: " + ", ".join(sorted(k for k in FP_BASE_PARTS if here.get(k) != kp.get(k))), a
+    return _observed_check(a, run_dir, confined), a
+
+
+def _new_acc() -> dict:
+    return {"files": {}, "sets": set(), "conflict": False, "child": False, "tree": None}
+
+
+def _add_files(a: dict, files: dict) -> None:
+    for k, v in files.items():
+        if a["files"].setdefault(k, v) != v:
+            a["conflict"] = True              # one path, two contents: edited while the batch ran
+
+
+def _gather(a: dict, rows) -> None:
+    """Add the observed sets rows carry (_observe); a set whose id is not its digest is left out."""
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        obs = r.get("observed")
+        if isinstance(obs, dict) and r.get("observed_id") == _digest(obs):
+            _add_files(a, obs)
+            a["sets"].add(r["observed_id"])
+        a["child"] = a["child"] or bool(r.get("observed_child"))
+
+
+def _merge_parts(a: dict, kp: dict) -> None:
+    """Add a stored record's observed parts (_observed_parts)."""
+    if isinstance(kp.get("observed"), dict) and isinstance(kp.get("observed_sets"), list):
+        _add_files(a, kp["observed"])
+        a["sets"].update(x for x in kp["observed_sets"] if isinstance(x, str))
+    a["child"] = a["child"] or bool(kp.get("observed_child"))
+    a["conflict"] = a["conflict"] or bool(kp.get("observed_conflict"))
+    a["tree"] = a["tree"] or kp.get("tree")
+
+
+def _merge_acc(a: dict, b: dict) -> None:
+    _add_files(a, b["files"])
+    a["sets"] |= b["sets"]
+    a["child"], a["conflict"], a["tree"] = a["child"] or b["child"], a["conflict"] or b["conflict"], a["tree"] or b["tree"]
+
+
+def _observed_parts(a: dict, tree: str) -> dict:
+    """The observed record stored in key_parts: the union of the sets (files with sha256), their ids, and the
+    whole-tree hash (checked only when a job had a child process)."""
+    return {"observed": dict(sorted(a["files"].items())), "observed_sets": sorted(a["sets"]),
+            "observed_child": a["child"], "observed_conflict": a["conflict"], "tree": tree}
+
+
+def _here_digest(rel: str, run_dir: str | None, confined: bool) -> str | None:
+    """sha256 here of a recorded observed path ("run:<rel>" under the run dir, else under the repo); None when it
+    is missing, unreadable or not a plain relative path. `confined`: run files read with no link followed."""
+    in_run = rel.startswith("run:")
+    r = rel[4:] if in_run else rel
+    if not r or os.path.isabs(r) or ".." in r.split("/") or (in_run and not run_dir):
+        return None
+    try:
+        if in_run and confined:
+            if HERE not in sys.path:
+                sys.path.insert(0, HERE)
+            from lib.safe_io import open_nofollow
+            fd = open_nofollow(run_dir, r)
+            with os.fdopen(fd, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        return _file_digest(os.path.join(run_dir if in_run else REPO, r))
+    except (OSError, ValueError):
+        return None
+
+
+def _observed_check(a: dict, run_dir: str | None, confined: bool = False) -> str | None:
+    """Why a stored observed closure does not hold here, or None: every recorded file re-hashes the same, and when
+    a job had a child process the whole tree is unchanged."""
+    if a["conflict"]:
+        return "observed_conflict: a file had two contents while the batch ran"
+    for rel, sha in sorted(a["files"].items()):
+        now = _here_digest(rel, run_dir, confined)
+        if now != sha:
+            return f"observed file {'missing or unreadable' if now is None else 'changed'}: {rel}"
+    if a["child"] and (not a["tree"] or a["tree"] != _tree_digest()):
+        return "a job started a child process, and scripts/ or toolkit/ changed (whole-tree key)"
+    return None
+
+
+def _tree_digest() -> str:
+    return _files_digest({x: "all" for x in REPO_CODE_DIRS})
 
 
 def _stored_heads(out: str) -> list[dict]:
@@ -2870,7 +3171,8 @@ def _here_spec(rec: dict) -> str:
 
 REUSE_NOTE = ("cache eligibility, conditional on identical inputs: a stored row is reused only for the same params, "
               "and this check does not generate the next run's inputs; runtime_differs_here compares this "
-              "interpreter's packages with the one that recorded the batch, not the workers'")
+              "interpreter's packages with the one that recorded the batch, not the workers'; an engine identity "
+              "recorded in key_parts.extra is compared when the batch runs, not here (engine_checked)")
 
 
 def reuse_report(run_dir: str) -> dict:
@@ -2893,20 +3195,23 @@ def reuse_report(run_dir: str) -> dict:
             continue                     # not a compute batch: no function and code record
         stored = {}
         for h in heads:
-            stored.update(_reusable(out, h["fn"], h["code_fp"]))
+            stored.update(_reusable(out, h["fn"], h["code_fp"], trust=True))
         spec = _here_spec(heads[0])
         path = spec.partition("::")[0]
         if not os.path.exists(path if os.path.isabs(path) else os.path.join(run_dir, path)):
             n, why = 0, f"function file not found here: {spec}"
         else:
-            fp = code_fingerprint(run_dir, spec, exclude=_out_files(out))
-            n = len(_reusable(out, spec, fp, fn_id(run_dir, spec)))
-            why = "" if n >= len(stored) else (
-                "code fingerprint differs: code, data or a file under models/ changed"
-                if fp not in {h["code_fp"] for h in heads} else "recorded under another function")
+            rec, why_l = {}, []
+            kp = next((h["key_parts"] for h in heads if isinstance(h.get("key_parts"), dict)), {})
+            # the caller's part (an engine identity) is taken as recorded: it is compared when the batch runs
+            fp = code_fingerprint(run_dir, spec, exclude=_out_files(out), record=rec, extra_digest=kp.get("extra"))
+            n = len(_reusable(out, spec, fp, fn_id(run_dir, spec), run_dir=run_dir, why=why_l,
+                              here=rec.get("key_parts")))
+            why = "" if n >= len(stored) else "; ".join(dict.fromkeys(why_l)) or "recorded under another function"
         rt = heads[0].get("runtime")
         batches.append({"out": os.path.relpath(out, run_dir), "fn": heads[0].get("fn_id") or heads[0]["fn"],
                         "stored": len(stored), "eligible": n, "why": why,
+                        "engine_checked": "at run time" if "extra" in (heads[0].get("key_parts") or {}) else None,
                         "runtime_recorded": rt, "runtime_differs_here": bool(rt) and rt != runtime_versions()})
     return {"run_dir": run_dir, "stored": sum(b["stored"] for b in batches),
             "eligible": sum(b["eligible"] for b in batches), "note": REUSE_NOTE, "batches": batches}
@@ -2960,10 +3265,15 @@ def _out_lock(out: str, block: bool = False, suffix: str = ".lock", run_dir: str
 
 def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dict], dict]:
     rel_out =os.path.relpath(os.path.realpath(out), os.path.realpath(run_dir))
-    fp = code_fingerprint(run_dir, fn_spec, exclude=_out_files(out))
+    rec, extra = {}, kw.pop("key_extra", None)        # W0-A: the caller's key part (batch.py: the engine identity)
+    fp = code_fingerprint(run_dir, fn_spec, exclude=_out_files(out), extra=extra, record=rec)
     fid = fn_id(run_dir, fn_spec)
     keys = input_keys(inputs)
-    old = {} if fresh else _reusable(out, fn_spec, fp, fid)
+    acc, why, tree = _new_acc(), [], _tree_digest()
+    old = {} if fresh else _reusable(out, fn_spec, fp, fid, run_dir=run_dir, why=why, acc=acc,
+                                     here=rec["key_parts"])
+    if why:
+        print(f"compute: {out}: stored rows not reused: {'; '.join(dict.fromkeys(why))}", file=sys.stderr)
     todo = [k for k, key in enumerate(keys) if key not in old]
     if todo:
         # Phase 42 α: rows are appended to <out>.partial.jsonl as they finish, so
@@ -2972,7 +3282,8 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
         # one only once complete (a kill during the copy loses nothing).
         from lib.safe_io import open_append_nofollow, write_nofollow
         base, name = _out_base(out, run_dir)
-        journal = json.dumps({"_partial": {"fn": fn_spec, "fn_id": fid, "code_fp": fp, "n": len(inputs)}}) + "\n" + "".join(
+        journal = json.dumps({"_partial": {"fn": fn_spec, "fn_id": fid, "code_fp": fp, "n": len(inputs), "key_parts": {
+            **rec["key_parts"], **_observed_parts(acc, tree)}}}) + "\n" + "".join(
             json.dumps({**r, "key": key}) + "\n" for key, r in old.items())
         try:
             write_nofollow(base, name + PARTIAL_EXT, journal.encode(), atomic=True)
@@ -2994,6 +3305,7 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
         new_rows, summary = [], {"n": 0, "n_ok": 0, "n_failed": 0, "failed_by_kind": {}, "wall_s": 0.0,
                                  "task_core_s": 0.0, "stopped": None}
     by_pos = dict(zip(todo, new_rows))
+    _gather(acc, new_rows)
     rows = []
     for k, key in enumerate(keys):
         r = dict(by_pos[k]) if k in by_pos else {**old[key], "reused": True}
@@ -3007,7 +3319,9 @@ def _run_map(run_dir, fn_spec, inputs, out, fresh=False, **kw) -> tuple[list[dic
                "n_failed": sum(not r["ok"] for r in rows), "failed_by_kind": failed_by,
                "computed": len(todo), "reused": len(rows) - len(todo),
                "fn": fn_spec, "fn_id": fid, "code_fp": fp, "out": rel_out, "purpose": kw.get("purpose"),
-               "runtime": runtime_versions()}
+               "runtime": runtime_versions(), "key_parts": {**rec["key_parts"], **_observed_parts(acc, tree)}}
+    if why:
+        summary["reuse_refused"] = list(dict.fromkeys(why))
     body = "".join(json.dumps(r) + "\n" for r in rows).encode()
     summary["out_sha256"] = hashlib.sha256(body).hexdigest()     # Codex round 1 P1-1: which results it describes
     if os.environ.get("MA_PIPELINE_RUN"):        # the pipeline run that computed it (scripts/pipeline.py)
@@ -3646,6 +3960,13 @@ def _self_test() -> int:
         _self_test_durable(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CD: {type(e).__name__}: {e}")
+        _self_test_w0a(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"FP_OBSERVED: {type(e).__name__}: {e}")
+    try:
+        _self_test_bundle_data_set(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"BD: {type(e).__name__}: {e}")
     # CF-RW3 (round 4, P1-2): a batch's results, summary and journal never follow a planted link or .tmp
     with tempfile.TemporaryDirectory() as rd, tempfile.TemporaryDirectory() as out_:
         os.makedirs(os.path.join(rd, "models"))
@@ -3735,6 +4056,7 @@ def _self_test_durable(ok) -> None:
             self.fail = {"submit": 0, "marker": 0, "wait": 0, "view": False, "scatter": 0, "lose_at": 0, **fail}
             self.submits, self.scatters, self.views, self.waits = [], [], 0, 0
             self.bundles, self.lost, self.stale = [], False, 0
+            self.sent, self.obs = [], None      # the bytes of each scatter; an observed set rows carry (CD10)
 
         def __call__(self, *a, **kw):
             return self
@@ -3759,6 +4081,7 @@ def _self_test_durable(ok) -> None:
 
         def scatter(self, data, workers=None, **kw):
             self.scatters.append(None if workers is None else sorted(workers))
+            self.sent.append(data)
             if self.fail["scatter"] > 0:
                 self.fail["scatter"] -= 1
                 raise KeyError(workers[0] if workers else "no worker")      # as dask does for a stale address
@@ -3785,8 +4108,11 @@ def _self_test_durable(ok) -> None:
             exc = self.chunk_exc(sum(not s["failed"] for s in self.submits) - 1) if self.chunk_exc else None
             if exc is not None:                    # its worker leaves between two scheduler views
                 return Fut(key, exc=exc, on_result=lambda: (self.gone.add(w), self.retire and self.retired.add(w)))
-            return Fut(key, got={"rows": [{"i": i, "ok": True, "result": {}, "seconds": 1.0, "worker": w}
-                                          for i, _ in ch], "core_s": float(len(ch)), "summary": {}})
+            got = [{"i": i, "ok": True, "result": {}, "seconds": 1.0, "worker": w} for i, _ in ch]
+            if self.obs is not None:               # as _observe does: every row the set's id, the first the set
+                for j, r in enumerate(got):
+                    r.update({"observed_id": _digest(self.obs), **({"observed": dict(self.obs)} if j == 0 else {})})
+            return Fut(key, got={"rows": got, "core_s": float(len(ch)), "summary": {}})
 
         def run_on_scheduler(self, fn, res, key):
             self.views += 1
@@ -3816,12 +4142,13 @@ def _self_test_durable(ok) -> None:
            "MA_COMPUTE_EXCLUDE_WORKERS": run_vm, "MA_COMPUTE_DISPATCH_S": "0.01", "MA_COMPUTE_INFRA_BACKOFF_S": "0",
            "MA_COMPUTE_COMM_WAIT_S": "0.05", "MA_COMPUTE_SETTLE_S": "0.1", "MA_COMPUTE_TARGET_WORKERS": "2"}
 
-    def run(fake, n=16, limit=20.0, **more):
-        """(rows, summary, progress, error) of one _map_dask call against `fake`."""
+    def run(fake, n=16, limit=20.0, bundle=None, **more):
+        """(rows, summary, progress, error) of one _map_dask call against `fake`; `bundle`: make_bundle's stand-in
+        (default: a fixed one; CD5e passes the real one)."""
         cur["c"], prog = fake, {}
         with tempfile.TemporaryDirectory() as d, mock.patch.object(distributed, "Client", fake), \
                 mock.patch.object(distributed, "wait", fake_wait), mock.patch.dict(os.environ, {**env, **more}), \
-                mock.patch.dict(globals(), {"make_bundle": lambda rd: (b"x", {"sha256": "0"})}):
+                mock.patch.dict(globals(), {"make_bundle": bundle or (lambda rd: (b"x", {"sha256": "0"}))}):
             try:
                 rows, info = _map_dask(d, "models/m.py::f", [{"x": i} for i in range(n)], None,
                                        deadline=time.time() + limit, progress=prog)
@@ -3900,6 +4227,23 @@ def _self_test_durable(ok) -> None:
     rows, info, prog, err = run(fk)
     ok(err is None and all_ok(rows) and fk.lost and fk.stale == 0 and len(fk.bundles) == 2,
        f"CD5d no chunk is placed on a lost bundle: err={err} stale={fk.stale} scatters={len(fk.scatters)}")
+    # CD5e (merge with #328) the bundle scattered at the start and the one scattered again after its only copy was
+    # lost are make_bundle's, with the declared data set in them: repo data/ and a data file of toolkit/ that
+    # _bundle_skips would leave out by name (a `.log`); the summary's bundle record counts them.
+    with tempfile.TemporaryDirectory() as repo:
+        repo = os.path.realpath(repo)
+        for rel in ("data/pop.csv", "toolkit/eng/bench.log", "toolkit/eng/model.py"):
+            os.makedirs(os.path.dirname(os.path.join(repo, rel)), exist_ok=True)
+            open(os.path.join(repo, rel), "w").write(rel)
+        with mock.patch.dict(globals(), {"REPO": repo}):
+            fk = Fake([w1, w2], lose_at=2)
+            rows, info, prog, err = run(fk, bundle=make_bundle)
+        need = {os.path.join(repo, r).lstrip("/") for r in ("data/pop.csv", "toolkit/eng/bench.log")}
+        shipped = [set(tarfile.open(fileobj=io.BytesIO(b)).getnames()) for b in fk.sent]
+        ok(err is None and all_ok(rows) and len(fk.bundles) == 2 and all(need <= m for m in shipped)
+           and (info.get("bundle") or {}).get("data_set_files") == 2,
+           f"CD5e every scatter, the replacement included, ships the declared data set: err={err} "
+           f"scatters={len(fk.sent)} missing={[sorted(need - m) for m in shipped]} bundle={info.get('bundle')}")
     # CD6 the bundle leaves out the logs and what this module and the runner write beside a batch (partial
     # rows, job records, summaries, the ledger), and nothing else: inputs, earlier results and everything under
     # data/ stay, and so do other files the fingerprint ignores (figures, a step's `.out`: a model that reads
@@ -3932,6 +4276,28 @@ def _self_test_durable(ok) -> None:
            and all(changed),
            f"CD6 the bundle leaves out only logs and batch records, none of them fingerprinted: bundled={got} "
            f"skipped={binfo.get('skipped_outputs')} fingerprint kept={fp0 == fp1} changed={changed}")
+    # CD6c (merge with #328) a file of the declared data set is never left out by name: the key's data_set part
+    # hashes it, so a worker must read the launcher's copy. The run's own log is still left out and counted.
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as repo:
+        d, repo = os.path.realpath(d), os.path.realpath(repo)
+        for base, rel in ((d, "models/m.py"), (d, "models/run.log"), (repo, "toolkit/eng/bench.log"),
+                          (repo, "toolkit/eng/ref.jsonl.summary.json"), (repo, "data/pop.csv")):
+            os.makedirs(os.path.dirname(os.path.join(base, rel)), exist_ok=True)
+            open(os.path.join(base, rel), "w").write("def f(p):\n    return p\n" if rel.endswith(".py") else rel)
+        with mock.patch.dict(globals(), {"REPO": repo}):
+            data, binfo = make_bundle(d)
+            fp0 = code_fingerprint(d, "models/m.py::f")
+            open(os.path.join(repo, "toolkit/eng/bench.log"), "a").write("#\n")
+            fp1 = code_fingerprint(d, "models/m.py::f")
+        with tarfile.open(fileobj=io.BytesIO(data)) as t:
+            got = set("/" + m for m in t.getnames())
+        want = {os.path.join(repo, r) for r in ("toolkit/eng/bench.log", "toolkit/eng/ref.jsonl.summary.json",
+                                                "data/pop.csv")}
+        ok(want <= got and os.path.join(d, "models/run.log") not in got and binfo.get("skipped_outputs") == 1
+           and binfo.get("data_set_files") == 3 and fp0 != fp1,
+           f"CD6c a data-set file ships whatever its name, and only the run's log is left out: "
+           f"missing={sorted(want - got)} skipped={binfo.get('skipped_outputs')} "
+           f"data_set_files={binfo.get('data_set_files')} key follows the data file={fp0 != fp1}")
     # CD7 a dead caller on another host: each chunk it had out is bounded by its cores x the time from its
     # start to the caller's last heartbeat (plus one interval and the stop grace), never above its share.
     now = time.time()
@@ -3991,6 +4357,24 @@ def _self_test_durable(ok) -> None:
        and prog["cap_outlook"]["projected_core_s"] == 2400.0 and prog.get("_cap_warned") is True
        and "cap_outlook" not in small,
        f"CD9 measured task time projects the call past its allowance mid-batch: {first} then {prog.get('cap_outlook')}")
+    # CD10 (merge with #314) rows that come back through a retried submit or wait, or through a chunk resubmitted
+    # after a scale-down, keep the observed closure their chunk recorded: every ok row carries the set's id, the
+    # gathered record holds the set, and the closure verifies here (_observed_check), so the rows are reusable.
+    obs = {"scripts/compute.py": _file_digest(os.path.join(REPO, "scripts", "compute.py"))}
+    cases = {"comm": dict(submit=2, marker=1, wait=1),
+             "scale_down": dict(chunk_exc=lambda k: distributed.KilledWorker("t", mock.Mock(address=w1), 3)
+                                if k == 0 else None)}
+    for name, kw in cases.items():
+        fk = Fake([w1, w2], **kw)
+        fk.obs = obs
+        rows, info, prog, err = run(fk)
+        a = _new_acc()
+        _gather(a, rows)
+        ok(err is None and all_ok(rows) and all(r.get("observed_id") == _digest(obs) for r in rows)
+           and a["sets"] == {_digest(obs)} and a["files"] == obs and _observed_check(a, None) is None,
+           f"CD10 {name}: rows keep their observed closure through the retried path and it verifies: err={err} "
+           f"ids={sorted({str(r.get('observed_id'))[:8] for r in rows})} sets={len(a['sets'])} "
+           f"check={_observed_check(a, None) if a['sets'] else 'no set'}")
 
 
 def _self_test_s18(ok) -> None:
@@ -4022,9 +4406,10 @@ def _self_test_s18(ok) -> None:
             fp0 = fp()
             w(repo_a, "scripts/lib/code_commit.txt", "1" * 40 + "\n")
             ok(fp() == fp0, "RU1 a new launch commit (scripts/lib/code_commit.txt, export-subst) keeps the fingerprint")
-            w(repo_a, "scripts/lib/helper.py", "X = 2\n")
+            w(repo_a, "toolkit/eng/card.yaml", "version: 2\n")
             fp1 = fp()
-            ok(fp1 != fp0, "RU2 a change to repo code still changes the fingerprint")
+            ok(fp1 != fp0, "RU2 a change to repo data (a card) still changes the fingerprint (W0-A: repo code is the "
+                           "observed closure, FP_OBSERVED_*)")
             w(rd, "decision_spec.yaml", "spec: 1\n")       # a v2 run: its spec at the run root
             w(rd, "metadata.json", json.dumps({"pipeline": "v2"}))     # and its recorded pipeline (Codex r1 P2-2)
             fp1 = fp()
@@ -4177,8 +4562,10 @@ def _self_test_checkpoint_restore(ok) -> None:
         with open(cut + PARTIAL_EXT, "w") as f:
             f.write(json.dumps({"_partial": {"fn": "models/fn.py::f", "fn_id": fn_id(rd, "models/fn.py::f"),
                                              "code_fp": fp, "n": 4}}) + "\n")
+            obs = {"run:models/fn.py": _file_digest(os.path.join(rd, "models", "fn.py"))}    # W0-A: observed set
             for k in range(2):
-                f.write(json.dumps({"i": k, "ok": True, "result": {"y": 3 * k}, "key": keys[k]}) + "\n")
+                f.write(json.dumps({"i": k, "ok": True, "result": {"y": 3 * k}, "key": keys[k],
+                                    "observed_id": _digest(obs), **({"observed": obs} if k == 0 else {})}) + "\n")
         tgz = os.path.join(td, "checkpoint.tar.gz")
         rec = ws.build_checkpoint(os.path.join(td, "vm"), rd, tgz, results_store)
         ok(rec.get("cached_batches") == 2 and rec.get("sha256") == results_store.sha256_file(tgz),
@@ -4255,6 +4642,200 @@ def _self_test_checkpoint_restore(ok) -> None:
                f"{s4.get('computed')} computed")
 
 
+def _self_test_w0a(ok) -> None:
+    """W0-A: the reuse key is the job's inputs, the engine identity, the run's files, the dependency manifests and the
+    declared data set; the repo code is the observed closure. A copy of this scripts/ and a toy toolkit/ form the repo;
+    the batch function imports one module (the toy engine)."""
+    import shutil
+    import tempfile
+    from unittest import mock
+    g = globals()
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        repo, rd = os.path.join(td, "repo"), os.path.join(td, "run")
+        shutil.copytree(HERE, os.path.join(repo, "scripts"), ignore=shutil.ignore_patterns("__pycache__"))
+
+        def w(rel, txt, root=repo):
+            os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+            open(os.path.join(root, rel), "w").write(txt)
+        w("toolkit/__init__.py", "")
+        w("toolkit/eng/__init__.py", "")
+        w("toolkit/eng/m.py", "def g(p):\n    return 2 * p['x']\n")
+        w("toolkit/eng/card.yaml", "version: 1\n")
+        w("toolkit/analysis/__init__.py", "")
+        w("toolkit/analysis/figures.py", "def draw():\n    return 0\n")
+        w(".claude/orchestration/priors.yaml", "a: 1\n")
+        w("job.py", "from toolkit.eng import m\n\n\ndef f(p):\n    return {'y': m.g(p)}\n")
+        w("kid.py", "import subprocess, sys\n\n\ndef f(p):\n"
+                    "    subprocess.run([sys.executable, '-c', 'pass'], check=True)\n    return {'y': p['x']}\n")
+        w("data/units.csv", "u,a\n1,2\n", rd)
+        out = os.path.join(rd, "analysis", "b.jsonl")
+        os.makedirs(os.path.dirname(out))
+        ins = [{"x": i} for i in range(3)]
+        with mock.patch.dict(g, {"REPO": repo}):
+            def go(fn="job.py::f", inputs=ins, extra=None, o=out):
+                kw = {"key_extra": extra} if extra is not None else {}
+                return run_map(rd, os.path.join(repo, fn), inputs, o, backend="local", max_workers=1, ledger=False,
+                               **kw)[1]
+            e1 = {"engine": {"version": "1"}}
+            s0 = go(extra=e1)
+            kp = s0.get("key_parts") or {}
+            obs = kp.get("observed") or {}
+            ok(s0.get("computed") == 3 and {"job.py", "toolkit/eng/m.py"} <= set(obs)
+               and "toolkit/analysis/figures.py" not in obs and kp.get("observed_sets")
+               and obs["toolkit/eng/m.py"] == _file_digest(os.path.join(repo, "toolkit/eng/m.py"))
+               and set(FP_BASE_PARTS) <= set(kp) and not kp.get("observed_child"),
+               f"FP_OBSERVED_RECORDED the summary records the key parts and the imported repo files with their sha256 "
+               f"(the engine module, not figures.py): {sorted(obs)[:12]} {sorted(kp)}")
+            w("toolkit/analysis/figures.py", "def draw():\n    return 1\n")
+            s1 = go(extra=e1)
+            ok(s1.get("reused") == 3 and s1.get("computed") == 0,
+               f"FP_OBSERVED_UNRELATED_EDIT an edit to a file no job imported keeps every row ({s1.get('computed')} "
+               f"computed, {s1.get('reuse_refused')})")
+            w("toolkit/eng/m.py", "def g(p):\n    return 3 * p['x']\n")
+            s2 = go(extra=e1)
+            ok(s2.get("computed") == 3 and any("observed file changed: toolkit/eng/m.py" in x
+                                               for x in s2.get("reuse_refused") or []),
+               f"FP_OBSERVED_IMPORTED_EDIT an edit to an imported file recomputes, and says which "
+               f"({s2.get('computed')} computed, {s2.get('reuse_refused')})")
+            w("toolkit/eng/card.yaml", "version: 2\n")
+            s3 = go(extra=e1)
+            ok(s3.get("computed") == 3, f"FP_CARD_EDIT an edit to an engine card (data set) recomputes "
+                                        f"({s3.get('computed')} computed, {s3.get('reuse_refused')})")
+            s4 = go(extra={"engine": {"version": "2"}})
+            ok(s4.get("computed") == 3, f"FP_ENGINE_IDENTITY a new engine identity (version) recomputes "
+                                        f"({s4.get('computed')} computed)")
+            e2 = {"engine": {"version": "2"}}
+            s5 = go(inputs=ins[:2] + [{"x": 9}], extra=e2)
+            ok(s5.get("computed") == 1 and s5.get("reused") == 2,
+               f"FP_INPUT_EDIT a changed input recomputes that row only ({s5.get('computed')} computed)")
+            w(".claude/orchestration/priors.yaml", "a: 2\n")
+            s6 = go(inputs=ins[:2] + [{"x": 9}], extra=e2)
+            ok(s6.get("computed") == 3 and any("data_set" in x for x in s6.get("reuse_refused") or []),
+               f"FP_DATA_SET_EDIT a changed declared data file recomputes ({s6.get('computed')}, "
+               f"{s6.get('reuse_refused')})")
+            w("data/units.csv", "u,a\n1,3\n", rd)
+            s7 = go(inputs=ins[:2] + [{"x": 9}], extra=e2)
+            ok(s7.get("computed") == 3, f"FP_RUN_DATA_EDIT a changed run input file recomputes ({s7.get('computed')})")
+            r = reuse_report(rd)
+            w("toolkit/eng/m.py", "def g(p):\n    return 4 * p['x']\n")
+            r2 = reuse_report(rd)
+            b2 = (r2.get("batches") or [{}])[0]
+            ok(r.get("eligible") == 3 and r2.get("eligible") == 0 and "toolkit/eng/m.py" in b2.get("why", "")
+               and b2.get("engine_checked") == "at run time",
+               f"FP_REUSE_CHECK_PARTS reuse-check names the file that differs: {r.get('eligible')} {b2}")
+            # an interrupted batch's journal: rows carry their observed sets, and are reused while they hold
+            s8 = go(inputs=ins[:2] + [{"x": 9}], extra=e2)
+            body = open(out).read()
+            summ = json.load(open(out + ".summary.json"))
+            kp8 = {k: v for k, v in summ["key_parts"].items() if k in FP_BASE_PARTS}
+            os.remove(out + ".summary.json")
+            open(out + PARTIAL_EXT, "w").write(json.dumps({"_partial": {"fn": summ["fn"], "fn_id": summ["fn_id"],
+                                                                      "code_fp": summ["code_fp"], "n": 3,
+                                                                      "key_parts": kp8}}) + "\n" + body)
+            s9 = go(inputs=ins[:2] + [{"x": 9}], extra=e2)
+            ok(s8.get("computed") == 3 and s9.get("reused") == 3,
+               f"FP_PARTIAL_JOURNAL a journal's rows are reused from the observed sets they carry ({s9.get('computed')} "
+               f"computed, {s9.get('reuse_refused')})")
+            # rows stored before W0-A (no observed record) are recomputed, with the reason
+            summ = json.load(open(out + ".summary.json"))
+            summ["key_parts"] = kp8
+            stripped = "".join(json.dumps({k: v for k, v in json.loads(x).items() if not k.startswith("observed")})
+                               + "\n" for x in open(out) if x.strip())
+            open(out, "w").write(stripped)
+            summ.pop("out_sha256")
+            open(out + ".summary.json", "w").write(json.dumps(summ))
+            s10 = go(inputs=ins[:2] + [{"x": 9}], extra=e2)
+            ok(s10.get("computed") == 3 and s10.get("reuse_refused") == ["no_observed_closure"],
+               f"FP_NO_OBSERVED_CLOSURE a row with no observed record is recomputed ({s10.get('computed')}, "
+               f"{s10.get('reuse_refused')})")
+            # a job that starts a child process: the whole tree joins the key
+            kout = os.path.join(rd, "analysis", "k.jsonl")
+            k0 = go(fn="kid.py::f", inputs=ins[:2], o=kout)
+            k1 = go(fn="kid.py::f", inputs=ins[:2], o=kout)
+            w("toolkit/analysis/figures.py", "def draw():\n    return 2\n")
+            k2 = go(fn="kid.py::f", inputs=ins[:2], o=kout)
+            ok((k0.get("key_parts") or {}).get("observed_child") and k1.get("reused") == 2 and k2.get("computed") == 2,
+               f"FP_CHILD_PROCESS a job with a child process is keyed on the whole tree: reused while it holds, "
+               f"recomputed after any edit under toolkit/ ({k1.get('reused')}, {k2.get('computed')}, "
+               f"{k2.get('reuse_refused')})")
+            saved_m = open(os.path.join(repo, "toolkit/eng/m.py")).read()
+            os.remove(os.path.join(repo, "toolkit/eng/m.py"))
+            b3 = next((b for b in reuse_report(rd)["batches"] if b["out"] == "analysis/b.jsonl"), {})
+            ok(b3.get("eligible") == 0 and "missing or unreadable: toolkit/eng/m.py" in b3.get("why", ""),
+               f"FP_OBSERVED_MISSING a recorded file that is gone gives no reuse ({b3})")
+            w("toolkit/eng/m.py", saved_m)
+            # Codex r1 (λ): a repo file read by path (a table in a .md) is recorded too, through the audit hook
+            w("toolkit/eng/notes.md", "| k | 2 |\n")
+            w("reader.py", "import os\n\n\ndef f(p):\n    t = open(os.path.join(os.path.dirname(__file__), 'toolkit', "
+                           "'eng', 'notes.md')).read()\n    return {'y': len(t) * p['x']}\n")
+            nout = os.path.join(rd, "analysis", "n.jsonl")
+            n0 = go(fn="reader.py::f", inputs=ins[:2], o=nout)
+            w("toolkit/eng/notes.md", "| k | 3 |\n")
+            n1 = go(fn="reader.py::f", inputs=ins[:2], o=nout)
+            ok("toolkit/eng/notes.md" in ((n0.get("key_parts") or {}).get("observed") or {}) and n1.get("computed") == 2,
+               f"FP_OBSERVED_READ_BY_PATH a repo file the job opened is recorded, and editing it recomputes "
+               f"({n1.get('computed')}, {n1.get('reuse_refused')})")
+            # Codex r1 (λ): a run dir under the repo's data/ keeps its key when its own outputs change
+            rd_in = os.path.join(repo, "data", "trial_run")
+            w("models/fn.py", "def f(p):\n    return p\n", rd_in)
+            q0 = code_fingerprint(rd_in, "models/fn.py::f")
+            w("analysis/out.jsonl.summary.json", "{}", rd_in)
+            ok(q0 == code_fingerprint(rd_in, "models/fn.py::f"),
+               "FP_RUN_UNDER_REPO_DATA a run dir under the repo's data/ is not part of the data set")
+
+
+def _self_test_bundle_data_set(ok) -> None:
+    """BD0-BD5 (2026-11-21: make_bundle shipped the run's models/ and data/ and the repo's scripts/ and toolkit/, but
+    not repo data/ or .claude/orchestration/, though FP_DATA_SET puts them in every reuse key: a worker reading them
+    computed without them while the key hashed the launcher's copies). The bundle ships exactly the files the key's
+    data_set part hashes, whatever their size, and nothing under _truth. A toy repo; no network."""
+    import tempfile
+    from unittest import mock
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        repo, rd = os.path.join(td, "repo"), os.path.join(td, "repo", "runs", "r1")
+
+        def w(rel, txt="x", root=None):
+            f = os.path.join(root or repo, rel)
+            os.makedirs(os.path.dirname(f), exist_ok=True)
+            open(f, "w").write(txt)
+        for rel in ("data/pop.csv", "data/sub/costs.yaml", "data/_truth/key.csv", ".claude/orchestration/priors.yaml",
+                    "scripts/compute.py", "scripts/table.json", "scripts/README.md", "toolkit/eng/card.yaml",
+                    "toolkit/eng/model.py", "scripts/lib/code_commit.txt", "docs/notes.md"):
+            w(rel)
+        w("data/big.csv", "y" * (2 * 2**20))
+        w("data/_truth_copy/key.csv")
+        os.symlink(os.path.join(repo, "data", "_truth", "key.csv"), os.path.join(repo, "data", "alias.csv"))
+        os.symlink(os.path.join(repo, "data", "nowhere.csv"), os.path.join(repo, "data", "dangling.csv"))
+        w("models/fn.py", "def f(p):\n    return p\n", rd)
+        with mock.patch.dict(globals(), {"REPO": repo}):
+            want = set(_data_set_files(FP_DATA_SET, skip=rd))
+            b, info = make_bundle(rd, max_file_mb=1)
+        listed = ["/" + n for n in tarfile.open(fileobj=io.BytesIO(b)).getnames()]
+        names = set(listed)
+        manifest = {"data/pop.csv", "data/sub/costs.yaml", "data/big.csv", "data/dangling.csv",
+                    ".claude/orchestration/priors.yaml", "scripts/table.json", "toolkit/eng/card.yaml"}
+        ok(want == manifest, f"BD0 the declared data set is these files, no hidden ones ({sorted(want ^ manifest)})")
+        ok(len(listed) == len(names) and not any("_truth" in n or n.endswith("alias.csv") for n in names)
+           and info.get("data_set_unreadable") == ["data/dangling.csv"],
+           f"BD5 (Codex r1) no member twice; no _truth* path or link into one; a dangling link is recorded, not fatal "
+           f"({info.get('data_set_unreadable')})")
+        want.discard("data/dangling.csv")
+        data_like = {n for n in names if os.path.relpath(n, repo).split("/")[0] in ("data", ".claude")}
+        need = {os.path.join(repo, r) for r in want}
+        ok(os.path.join(repo, "data/pop.csv") in need and os.path.join(repo, ".claude/orchestration/priors.yaml") in need
+           and os.path.join(repo, "scripts/table.json") in need and need <= names,
+           f"BD1 the bundle ships every file of the declared data set ({sorted(need - names)})")
+        ok(data_like == {os.path.join(repo, r) for r in want if r.split("/")[0] in ("data", ".claude")},
+           f"BD2 the bundle's repo data/ and .claude/ are exactly the data set ({sorted(data_like)})")
+        ok(os.path.join(repo, "data/big.csv") in names and not any("/_truth/" in n for n in names)
+           and os.path.join(repo, "docs/notes.md") not in names,
+           f"BD3 a large data-set file ships (the key hashes it), _truth and undeclared dirs do not ({info})")
+        ok(info.get("data_set_files") == len(want) == 6,
+           f"BD4 the bundle reports the data-set files it ships ({info})")
+
+
 def _self_test_fp_dispatch(ok) -> None:
     """2026-11-12 (owner): dispatch code in this module is not part of the reuse fingerprint. PR #204 changed
     only how chunks are placed and retried (no row a reuse can take: only ok rows are reused), yet changed the
@@ -4288,10 +4869,9 @@ def _self_test_fp_dispatch(ok) -> None:
        "FPX3 a change anywhere else (_call, _remote_task, a constant, a comment) changes the fingerprint")
     ok(_fp_compute_source("def broken(:\n") == b"def broken(:\n",
        "FPX4 a source that does not parse is hashed whole (fail closed: never fewer bytes)")
-    # FPX5: code_fingerprint uses it for this file, and only for this file.
-    with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as rd:
-        os.makedirs(os.path.join(repo, "scripts")); os.makedirs(os.path.join(rd, "models"))
-        open(os.path.join(rd, "models", "m.py"), "w").write("def f(p):\n    return p\n")
+    # FPX5: the file digest (observed closure) uses it for this file, and only for this file.
+    with tempfile.TemporaryDirectory() as repo:
+        os.makedirs(os.path.join(repo, "scripts"))
         saved = globals()["REPO"]
         try:
             globals()["REPO"] = repo
@@ -4299,19 +4879,17 @@ def _self_test_fp_dispatch(ok) -> None:
             fps = []
             for text in (src, edit("_sched_view", "pass"), edit("_call", "pass")):
                 open(cp, "w").write(text)
-                fps.append(code_fingerprint(rd, "models/m.py::f"))
-            # Codex review of #205 (P3): another file already present, edited between two fingerprints in an
-            # exempt-named function, still changes the fingerprint (a new path alone would have).
-            open(cp, "w").write(src)
+                fps.append(_file_digest(cp))
+            # Codex review of #205 (P3): another file edited in an exempt-named function still changes its digest
             other = os.path.join(repo, "scripts", "other.py")
             open(other, "w").write(src)
-            fp_o1 = code_fingerprint(rd, "models/m.py::f")
+            fp_o1 = _file_digest(other)
             open(other, "w").write(edit("_sched_view", "pass"))
-            fp_o2 = code_fingerprint(rd, "models/m.py::f")
+            fp_o2 = _file_digest(other)
         finally:
             globals()["REPO"] = saved
         ok(fps[0] == fps[1] and fps[0] != fps[2] and fp_o1 != fp_o2,
-           f"FPX5 code_fingerprint applies the exemption to scripts/compute.py only: {fps} {fp_o1} {fp_o2}")
+           f"FPX5 the file digest applies the exemption to scripts/compute.py only: {fps} {fp_o1} {fp_o2}")
     # Codex review of #205 (P2): what reaches a worker and what reaches the reusable journal stays hashed:
     # _map_dask's nested submit (the params sent to _remote_task) and _rows_done (rows before the journal).
     t_ = ast.parse(src)

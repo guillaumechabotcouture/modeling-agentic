@@ -194,8 +194,8 @@ def _varied(raw, run_dir) -> tuple[set, set]:
     """(parameters, unit attributes) that a decision test or the uncertainty draws vary."""
     an, unc = raw.get("analysis") or {}, raw.get("uncertainty") or {}
     tests = [t for t in an.get("decision_tests") or [] if isinstance(t, dict)]
-    ps = {t.get("parameter") for t in tests if t.get("type") == "parameter_value"
-          and len(set(map(str, t.get("values") or []))) >= 2}
+    ps = {t.get("parameter") for t in tests if t.get("type") == "parameter_value" and "with" not in t
+          and len(set(map(str, t.get("values") or []))) >= 2}      # a test with companions is conditional on them
     from toolkit.spec import priors as PRI
     if not PRI.kind_excluded(unc, "priors"):
         ps |= set(unc.get("priors") or {}) - set(PRI.excluded_parameters(unc))   # drawn: a prior_range_<p> test

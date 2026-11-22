@@ -1660,6 +1660,23 @@ def _self_test() -> int:
             ok("remaining" in txt and "200.00" in txt and "f6-refit-a" in txt, f"BR14 status prints the table: {txt}")
             ok(scope_for_name("lw-smoke-gcc", sc) == "f6" and scope_for_name("ev-q", sc) == "other"
                and scope_for_name("dev-vm", sc) is None, "BR15 a cluster name resolves to the scope of its prefix")
+            # BR15b (owner 2026-11-21: an eval budget scope of $450): the tracked scopes file accepts the owner's
+            # `set --scope ev --usd 450`, the signed record carries the ev- prefix, and its launch check admits an
+            # eval cluster name and refuses another scope's
+            rev = root("ev_scope")
+            stores[rev] = _FakeKeys()
+            ev_env = _Env(budget_dir=rev, pub_file=os.path.join(rev, "owner.pub"), store=stores[rev], clock=lambda: clock[0],
+                          source=_FakeSource([], {}), scopes=SCOPES_FILE, prices=pr, confirm=lambda rec: True)
+            init_key(ev_env)
+            set_budget("ev", 450.0, "eval benchmark hb0", None, 14, ev_env)
+            rec = load_budget("ev", ev_env)
+            with_env(ev_env)
+            okay, why = launch_budget_ok("ev", 70, "ev-dengue-hb0-gcc", reserve=False)
+            bad, why2 = launch_budget_ok("ev", 1, "v2-nigeria-gf13-gcc", reserve=False)
+            ok(rec["usd"] == 450.0 and rec["prefixes"] == ["ev-"] and okay and not bad
+               and scope_for_name("ev-dengue-hb0-gcc-keeper") == "ev",
+               f"BR15b scope ev ($450, prefix ev-) signs from the tracked scopes file and admits eval clusters only: "
+               f"{rec['prefixes']} {why} | {why2}")
             with_env(env(os.path.join(d, "none"), source=_FakeSource(items, dets)))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):

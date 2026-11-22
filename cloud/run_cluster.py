@@ -155,7 +155,7 @@ class RunConfig:
     tree: str = os.path.expanduser("~/modeling-agentic-launch")
     labels: tuple = ("R1",)
     flags: tuple = ()                          # extra main.py flags (never --v1/--v2: set `pipeline`)
-    pipeline: str = ""                         # "v1" or "v2", required to launch; passed to main.py explicitly
+    pipeline: str = ""                         # "v2", required to launch; passed to main.py explicitly (v1 is retired)
     max_rounds: int = 8
     max_sessions: int = 5
     cross_model: bool = False                  # pass the OpenAI key for the cross-model critic
@@ -220,10 +220,12 @@ class RunConfig:
             raise ValueError(f"set {bad} through max_rounds / max_sessions, not flags")
         if not self.labels or len(set(self.labels)) != len(self.labels):
             raise ValueError("labels must be non-empty and distinct")
+        if self.pipeline in pipeline_id.RETIRED:
+            raise ValueError(f"{self.name}: {pipeline_id.RETIRED_MESSAGE}")
         if self.pipeline and self.pipeline not in pipeline_id.PIPELINES:
-            raise ValueError(f"pipeline must be one of {pipeline_id.PIPELINES}, not {self.pipeline!r}")
+            raise ValueError(f"pipeline must be 'v2', not {self.pipeline!r}")
         if {"--v1", "--v2"} & set(self.flags):
-            raise ValueError("set the pipeline with pipeline='v1' or 'v2', not flags: the launcher passes it to main.py")
+            raise ValueError("set the pipeline with pipeline='v2', not flags: the launcher passes it to main.py")
         for f in ("scale_down_after", "adapt_interval", "overflow_hold") + (("target_duration",) if self.target_duration else ()):
             seconds(getattr(self, f))   # fail at load, not on the keeper VM
         if not self.checkpoint_minutes >= 0:
@@ -384,6 +386,17 @@ def attach(name: str):
     return ws.attach_existing(name, WORKSPACE, cid)
 
 
+def _results_store():
+    """This repo's scripts/results_store, imported as eval_paths and pipeline_id are (from the repo this file is in),
+    not from cfg.tree or $PYTHONPATH: `collect` died with ModuleNotFoundError when neither held it (CI1-CI2)."""
+    d = os.path.join(os.path.dirname(HERE), "scripts")
+    while d in sys.path:            # first, even when $PYTHONPATH also names another checkout's scripts/ (Codex r1)
+        sys.path.remove(d)
+    sys.path.insert(0, d)
+    import results_store
+    return results_store
+
+
 def _compute(cfg):
     sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
     import compute
@@ -471,7 +484,11 @@ def stale_sheet_problems(code: bytes, flags, pipeline: str = "v2") -> list[str]:
         if raw is None or state is None:
             out.append(f"{rel}: run_state.json is missing or unreadable in the code to launch")
             continue
-        if state in PRE_SIGN_STATES:                        # a draft: nothing is signed yet
+        hist = st.get("history") if isinstance(st.get("history"), list) else []
+        signed_in_history = any(isinstance(h, dict) and h.get("from") == "SIGN"         # Codex r1 P1-3: a lost
+                                and str(h.get("why", "")).startswith("spec signed by") for h in hist)   # record
+        if state in PRE_SIGN_STATES or (state == "EVIDENCE" and not signed_in_history and not any(   # a draft
+                _archive_member(code, f"{rel}/{f}") is not None for f in SIGNOFF_RECORDS)):
             continue
         if st.get("signoff") == "none":     # nobody signs: the same rule as the runtime gate (coverage, no record)
             out += [f"{rel}: {p}" for p in _preconditions(code, rel, "unsigned")]
@@ -555,7 +572,8 @@ def _preconditions(code: bytes, rel: str, signer: str) -> list[str]:
 SIGNOFF_RECORDS = ("decision_spec.signoff.json", "decision_brief.signoff.json")   # toolkit/spec/signoff.py, decision_brief
 
 
-PRE_SIGN_STATES = ("SPEC",)          # agents/stage_machine.py EDGES: the only state before SIGN (a draft)
+PRE_SIGN_STATES = ("SPEC",)          # agents/stage_machine.py EDGES: always before SIGN (a draft); EVIDENCE is before SIGN
+# too (v2 autonomy 1B-ii) unless a sign-off record exists: a run signed under the earlier order (SIGN, then EVIDENCE)
 
 
 def _signoff_record(code: bytes, rel: str) -> tuple:
@@ -631,8 +649,10 @@ def pipeline_preflight(cfg, code: bytes, python: str = sys.executable) -> str:
     config that declares no pipeline, a tree that cannot state one (from before 2026-11-05, when
     main.py defaulted to v1 and nothing recorded it), and any disagreement with the declaration."""
     import tempfile
+    if cfg.pipeline in pipeline_id.RETIRED:
+        raise SystemExit(f"{cfg.name}: {pipeline_id.RETIRED_MESSAGE}: refusing")
     if cfg.pipeline not in pipeline_id.PIPELINES:
-        raise SystemExit(f"{cfg.name}: the config declares no pipeline (set pipeline='v1' or 'v2'): refusing")
+        raise SystemExit(f"{cfg.name}: the config declares no pipeline (set pipeline='v2'): refusing")
     want = "scripts/lib/pipeline_id.py"
     src = _archive_member(code, want)
     if src is None:
@@ -1668,8 +1688,7 @@ def checkpoint_now(cfg, timeout_s: float = 300.0, invocation=None, launch_id=Non
     if cid is None:
         raise SystemExit(f"{cfg.name}: clusters.json records no run cluster id: refusing")
     if store is None:
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-        import results_store as store
+        store = _results_store()
     try:   # sent by value: the agent VM's uploaded worker_side may predate this function
         import cloudpickle
         cloudpickle.register_pickle_by_value(ws)
@@ -1774,8 +1793,7 @@ def _download(client, label, worker, dest_file):
 
 
 def collect(cfg, shutdown_after: bool = True):
-    sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-    import results_store
+    results_store = _results_store()
     os.makedirs(cfg.out_dir, exist_ok=True)
     running = is_running(cfg.name)
     if not os.path.exists(cfg.state_file):
@@ -1997,9 +2015,8 @@ def report_cost(cfg, args):
     elif os.path.exists(cfg.state_file):
         clusters["run"]["id"] = next(iter(json.load(open(cfg.state_file)).values())).get("cluster_id")
     if not ledgers:
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
         try:
-            import results_store
+            results_store = _results_store()
         except ImportError:
             results_store = None
         ledgers = _find_ledgers(cfg, results_store)
@@ -2026,8 +2043,7 @@ def relaunch(cfg, label) -> int:
         if label not in assign:
             raise SystemExit(f"{label}: no assignment in {cfg.state_file}; not relaunching")
         budget_guard(cfg, reserve=False)  # more paid work on the live run cluster: the budget must still cover it
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-        import results_store
+        results_store = _results_store()
         launch_id = assign[label]["launch_id"]
         names = {b["name"] for b in results_store.list_blobs(f"outputs/{cfg.storage_prefix}/launch_{launch_id}/",
                                                               cfg.storage_account)}
@@ -2845,7 +2861,7 @@ def _self_test_51c(ok) -> None:
 
 def _self_test_attach(ok) -> None:
     """RC60: one attach call (worker_side.attach_existing) for the launcher, the keeper and the
-    overflow pool; one workspace name for the launcher and the VM jobs, equal to the replay backend's."""
+    overflow pool; one workspace name for the launcher and the VM jobs (worker_side.WORKSPACE)."""
     import importlib.util
     import types
     calls = []
@@ -2918,13 +2934,7 @@ def _self_test_attach(ok) -> None:
             sys.modules.pop("coiled", None)
         else:
             sys.modules["coiled"] = saved
-    spec = importlib.util.spec_from_file_location(
-        "_rc60_replay_coiled", os.path.join(os.path.dirname(HERE), "scripts", "replay_coiled.py"))
-    rq = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(rq)
-    # replay_coiled.py is uploaded to the workers on its own (client.upload_file), so it cannot load
-    # worker_side.py at import and keeps its own copy of the name: this check keeps the two equal.
-    ok(WORKSPACE == ws.WORKSPACE == rq.WORKSPACE, "RC60f launcher, worker side and replay backend name one workspace")
+    ok(WORKSPACE == ws.WORKSPACE, "RC60f launcher and worker side name one workspace")
     _self_test_bwrap(ok)
 
 
@@ -3982,13 +3992,12 @@ def _self_test_pipeline(ok, tb) -> None:
         except Exception as e:  # noqa: BLE001 -- RC16 reports the load itself
             ok(False, f"RP1 configs/{f} declares its pipeline: {e}")
             continue
-        ok(getattr(c, "pipeline", "") in ("v1", "v2"), f"RP1 configs/{f} declares its pipeline ({getattr(c, 'pipeline', None)})")
-        if f.startswith("eval_"):
-            ok(getattr(c, "pipeline", None) == "v2", f"RP2 configs/{f} runs v2 ({getattr(c, 'pipeline', None)})")
+        ok(getattr(c, "pipeline", None) == "v2", f"RP1 configs/{f} declares pipeline v2 ({getattr(c, 'pipeline', None)})")
         mf = g.get("main_flags")
         ok(mf is not None and f"--{getattr(c, 'pipeline', None)}" in mf(c) and not {"--v1", "--v2"} & set(c.flags),
            f"RP3 configs/{f}: the launcher passes the declared pipeline to main.py, flags never do")
-    for bad in (dict(pipeline="v3"), dict(pipeline="v2", flags=("--v1",)), dict(pipeline="v1", flags=("--v2",))):
+    for bad in (dict(pipeline="v3"), dict(pipeline="v2", flags=("--v1",)), dict(pipeline="v1", flags=("--v2",)),
+                dict(pipeline="v1")):
         try:
             RunConfig(name="t", question_file="/dev/null", **bad)
             ok(False, f"RP4 a config with {bad} is refused")
@@ -4003,13 +4012,31 @@ def _self_test_pipeline(ok, tb) -> None:
                         flags=("--max-budget-usd", "35", "--signoff", "lead"))
         code = tb({"main.py": real_main, "scripts/lib/pipeline_id.py": real})
         ok(pf(cfg, code) == "v2", "RP5 the shipped pipeline_id agrees with the declared v2")
-        ok(pf(RunConfig(name="t1", question_file="/dev/null", out_dir=d, pipeline="v1"), code) == "v1",
-           "RP6 an explicit v1 config passes the preflight")
+        try:
+            RunConfig(name="t1", question_file="/dev/null", out_dir=d, pipeline="v1")
+            ok(False, "RP6 (v1 retired) a v1 config is refused when it is built")
+        except ValueError as e:
+            ok(pipeline_id.RETIRED_MESSAGE in str(e), f"RP6 (v1 retired) a v1 config is refused when it is built: {e}")
+        v1cfg = RunConfig(name="t1", question_file="/dev/null", out_dir=d, pipeline="v2")
+        v1cfg.pipeline = "v1"          # a config changed after it was built: the preflight refuses it too
+        # (Codex P1) shipped code from before the retirement answers v1: the launcher refuses before asking it.
+        old_tree = tb({"main.py": real_main, "scripts/lib/pipeline_id.py": b"import sys\nprint('v1')\n"})
+        asked: list = []
+        real_run = subprocess.run
+        subprocess.run = lambda *a, **k: asked.append(a) or real_run(*a, **k)
+        try:
+            pf(v1cfg, old_tree)
+            ok(False, "RP6b the preflight refuses a v1 config, even for a tree that would run v1")
+        except SystemExit as e:
+            ok(pipeline_id.RETIRED_MESSAGE in str(e) and not asked,
+               f"RP6b the preflight refuses a v1 config before asking the shipped code ({len(asked)} calls): {e}")
+        finally:
+            subprocess.run = real_run
         for why, c2, code2 in (
                 ("a tree with no pipeline_id.py (from before 2026-11-05: defaults to v1)", cfg, tb({"main.py": b"x"})),
                 ("a config that declares no pipeline", RunConfig(name="t2", question_file="/dev/null", out_dir=d), code),
                 ("a main.py that does not dispatch through pipeline_id (Codex r1 P2: old main.py, new helper)",
-                 RunConfig(name="t3", question_file="/dev/null", out_dir=d, pipeline="v1"),
+                 RunConfig(name="t3", question_file="/dev/null", out_dir=d, pipeline="v2"),
                  tb({"main.py": b"parser.add_argument('--v2')\n", "scripts/lib/pipeline_id.py": real})),
                 ("shipped code that would run another pipeline", cfg,
                  tb({"main.py": real_main, "scripts/lib/pipeline_id.py":
@@ -4078,6 +4105,101 @@ def _self_test_collect_no_shutdown(ok) -> None:
                 contextlib.redirect_stdout(io.StringIO()):
             rc_ = main(["run_cluster.py", path, "collect", *extra])
         ok(rc_ == 0 and len(downs) == want, cid)
+
+
+def _self_test_collect_import(ok) -> None:
+    """CI1-CI3 (2026-11-21: `collect` died with ModuleNotFoundError: results_store unless PYTHONPATH=scripts):
+    collect and the other storage commands import results_store from this repo's scripts/, as eval_paths and
+    pipeline_id are imported, whatever cfg.tree holds and wherever the command runs from. A fresh interpreter
+    (no PYTHONPATH, cwd outside the repo, a config whose tree does not exist), so no earlier import hides it."""
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "cfg.py")
+    open(path, "w").write("from run_cluster import RunConfig\n"
+                          f"CONFIG = RunConfig(name='ci', question_file='q', labels=('A',), out_dir={tmp!r}, "
+                          f"tree={os.path.join(tmp, 'no-such-tree')!r})\n")
+    json.dump({"A": {"launch_id": "L1", "worker": "w"}}, open(os.path.join(tmp, "assignments.json"), "w"))
+    code = ("import sys, json\n"
+            f"sys.path.insert(0, {HERE!r})\n"
+            "import run_cluster as rc\n"
+            "from unittest import mock\n"
+            "got = {}\n"
+            "def fake(cfg, store, *a, **k):\n"
+            "    import os; got['file'] = os.path.realpath(store.__file__)\n"
+            "    return {'exit_code': 0, 'duration_s': 1}\n"
+            "with mock.patch.object(rc, 'is_running', lambda n, lister=None: True), "
+            "mock.patch.object(rc, 'collect_from_storage', fake), mock.patch.object(rc, 'shutdown', lambda c: None):\n"
+            f"    rc.main(['run_cluster.py', {path!r}, 'collect'])\n"
+            "print('RESULT ' + json.dumps(got))\n")
+    mine = os.path.realpath(os.path.join(os.path.dirname(HERE), "scripts", "results_store.py"))
+    decoy = os.path.join(tmp, "old_checkout", "scripts")         # CI3 (Codex r1): another checkout on $PYTHONPATH
+    os.makedirs(decoy)
+    open(os.path.join(decoy, "results_store.py"), "w").write("def list_blobs(*a, **k):\n    return []\n")
+    for pp, cid in ((None, "CI1-CI2 no PYTHONPATH"),
+                    (os.pathsep.join([decoy, os.path.join(os.path.dirname(HERE), "scripts")]),
+                     "CI3 PYTHONPATH naming another checkout's scripts/ first")):
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        if pp:
+            env["PYTHONPATH"] = pp
+        p = subprocess.run([sys.executable, "-c", code], cwd=tmp, env=env, capture_output=True, text=True,
+                           timeout=120)
+        line = next((ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")), None)
+        got = json.loads(line[len("RESULT "):]) if line else {}
+        ok(p.returncode == 0 and "ModuleNotFoundError" not in p.stderr,
+           f"{cid}: `collect` runs with a missing cfg.tree (rc={p.returncode}: {p.stderr[-300:]!r})")
+        ok(got.get("file") == mine,
+           f"{cid}: `collect` hands collect_from_storage this repo's scripts/results_store.py ({got})")
+
+
+def _self_test_eval_configs(ok) -> None:
+    """EV (harness benchmark protocol, owner 2026-11-21: an `ev` budget scope of $450): every eval config states
+    its cap (US$35 per run, times its replicates), runs v2 with lead sign-off, 3 rounds and a US$35 model cap, and
+    every cluster it makes (run, keeper, overflow) falls under the one scope `ev` of the tracked scopes file, so
+    `budget_guard` can admit it once the owner signs that scope."""
+    import glob as _glob
+    import budget
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = sorted(_glob.glob(os.path.join(here, "configs", "eval_*.py")))
+    ok(len(paths) == 5, f"EV0 five eval configs: {[os.path.basename(p) for p in paths]}")
+    ok(budget.load_scopes()["scopes"].get("ev") == ["ev-"],
+       f"EV1 the tracked scopes file has scope ev with prefix ev-: {budget.load_scopes()['scopes']}")
+    saved = {k: os.environ.pop(k, None) for k in ("EVAL_TAG", "EVAL_REPS", "EVAL_TREE", "EVAL_PIPELINE")}
+    try:
+        for reps in (1, 2):
+            os.environ.update(EVAL_TAG="hb0", EVAL_REPS=str(reps))
+            for p in paths:
+                q = os.path.basename(p)[len("eval_"):-3]
+                cfg = load_config(p)
+                fl = list(cfg.flags)
+                names = (cfg.name, cfg.keeper_name, cfg.overflow_name)
+                ok(cfg.cap_usd == 35 * reps and cfg.budget_scope == "ev"
+                   and all(budget.scope_for_name(n) == "ev" for n in names),
+                   f"EV2 {q} (reps {reps}): cap_usd {cfg.cap_usd} = US$35 x {reps}, scope {cfg.budget_scope!r}, "
+                   f"every cluster under ev: {[(n, budget.scope_for_name(n)) for n in names]}")
+                ok(cfg.pipeline == "v2" and cfg.max_rounds == 3 and fl[fl.index("--max-budget-usd") + 1] == "35"
+                   and fl[fl.index("--signoff") + 1] == "lead" and len(cfg.labels) == reps,
+                   f"EV3 {q}: pipeline {cfg.pipeline}, rounds {cfg.max_rounds}, flags {fl}, labels {cfg.labels}")
+                # Codex r1: each wrapper names its own question, and the unattended watcher (launch_watch) accepts
+                # the config without --allow-no-cloud-limits: main.py stops at the protocol's 24 h cut-off
+                import launch_watch
+                ok(cfg.name == f"ev-{q.split('_')[0]}-hb0-gcc" and cfg.question_file.endswith(f"/{q}/question.txt")
+                   and cfg.storage_prefix == f"runs/evals/hb0/{q}",
+                   f"EV3b {q}: the config is its own question's ({cfg.name}, {cfg.question_file})")
+                ok(cfg.run_timeout_hours == 24 and seconds(cfg.cluster_timeout) > 24 * 3600
+                   and launch_watch.refuse_reason(cfg) is None,
+                   f"EV3c {q}: cloud-side limits {cfg.run_timeout_hours} h / {cfg.cluster_timeout!r}, "
+                   f"watch refusal {launch_watch.refuse_reason(cfg)!r}")
+        os.environ.update(EVAL_TAG="Bad_Tag", EVAL_REPS="1")
+        try:
+            load_config(paths[0])
+            ok(False, "EV4 a tag that would put the cluster name outside a-z, 0-9 and - is refused at load")
+        except ValueError:
+            ok(True, "EV4 a tag that would put the cluster name outside a-z, 0-9 and - is refused at load")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
 
 
 def _self_test_budget(ok) -> None:
@@ -4862,6 +4984,19 @@ def _self_test_sheet(ok) -> None:
     norun = stale_sheet_problems(tar_of(base), ("--signoff", "lead"))
     ok(fresh == [] and signed == [] and norun == [],
        f"RC80a a fresh sheet, a run past SIGN and a launch with no resumed run pass: {fresh} {signed} {norun}")
+    # RC80f (v2 autonomy 1B-ii): EVIDENCE now runs before SIGN, so a run there with no sign-off record is a draft;
+    # one with a record (signed under the earlier order) is checked as signed
+    ev_draft = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("EVIDENCE"),
+                                            f"{R}/decision_spec.yaml": b"spec: 2\n"}), flags)
+    ev_signed = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": st("EVIDENCE"),
+                                             f"{R}/decision_spec.yaml": b"spec: 2\n",
+                                             f"{R}/decision_spec.signoff.json": rec_for(spec)}), flags)
+    ev_lost = stale_sheet_problems(tar_of({**base, f"{R}/run_state.json": json.dumps({"state": "EVIDENCE", "history": [
+        {"from": "SIGN", "to": "EVIDENCE", "why": "spec signed by the lead"}]}).encode()}), flags)
+    ok(ev_draft == [] and ev_signed and ev_lost,
+       f"RC80f a run at EVIDENCE with no sign-off is a draft; one signed under the earlier order (a record, or a "
+       f"signature in its history) is checked "
+       f"({ev_draft}; {ev_signed}; {ev_lost})")
     ok(len(stale) == 1 and "spec" in stale[0] and "signoff.py sheet" in stale[0] and "--write" in stale[0]
        and len(stale_rec) == 1
        and "derivation" in stale_rec[0],
@@ -5132,6 +5267,10 @@ def _self_test() -> int:
         _self_test_budget(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"BU: {type(e).__name__}: {e}")
+    try:
+        _self_test_eval_configs(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"EV: {type(e).__name__}: {e}")
     globals()["budget_guard"] = lambda cfg, reserve=True, inv=None: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
@@ -5168,6 +5307,10 @@ def _self_test() -> int:
         _self_test_collect_no_shutdown(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"CN: {type(e).__name__}: {e}")
+    try:
+        _self_test_collect_import(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"CI: {type(e).__name__}: {e}")
     try:
         _self_test_checkpoint(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
@@ -5220,8 +5363,7 @@ def main(argv) -> int:
     elif cmd == "collect":
         collect(cfg, shutdown_after="--no-shutdown" not in rest)
     elif cmd == "checkpoint":
-        sys.path.insert(0, os.path.join(cfg.tree, "scripts"))
-        import results_store
+        results_store = _results_store()
         for label in ([rest[rest.index("--label") + 1]] if "--label" in rest else cfg.labels):
             fetch_checkpoint(cfg, results_store, label)
     elif cmd == "checkpoint-now":

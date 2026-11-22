@@ -54,6 +54,7 @@ OWNER_STATE = {
     "WRITE": "WRITE", "PRESENTATION": "PRESENTATION",
 }
 _SEV_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+CONFLICT_KIND = "evidence_conflict_declared"      # W0-F: toolkit/analysis/conflicts.py FINDING_KIND
 
 
 @dataclass
@@ -81,6 +82,36 @@ class Finding:
 
     def to_row(self) -> dict:
         return asdict(self)
+
+
+_DW_ROWS = ("done_when_regressed", "done_when_unmet", "done_when_dropped")    # gate rows keyed by a finding's id
+
+
+def tests_of(dw) -> list | None:
+    """A finding's done_when as the ledger keeps it: a list of checks (one mapping is a list of one, as
+    scripts/done_when.py reads it), or None."""
+    t = dw if isinstance(dw, list) else [dw] if isinstance(dw, dict) else None
+    try:          # as save() writes it: a test it could not write (YAML keys of mixed types) is no test here
+        json.dumps(t, sort_keys=True)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return t
+
+
+def frozen_tests(run_dir: str) -> dict[str, list | None]:
+    """{finding id: the test the gate froze} (done_when_registry.json; scripts/done_when.py α): what a fix is checked
+    against, whatever the critic's YAML says later. A withdrawn test is None: the finding then has no test, and the
+    next critique judges it."""
+    _scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    import done_when as DW
+    try:
+        tests = DW.load_registry(run_dir)["tests"]
+    except Exception:  # noqa: BLE001 -- a registry that cannot be decoded: the gate reports it (done_when_unavailable)
+        return {}
+    return {str(k): None if t.get("withdrawn") else tests_of(t["done_when"]) for k, t in tests.items()
+            if isinstance(t, dict) and (t.get("withdrawn") or tests_of(t.get("done_when")))}
 
 
 def remedy(f: dict) -> str | None:
@@ -186,8 +217,17 @@ def from_critiques(run_dir: str) -> tuple[list[Finding], list[str]]:
                 source=reviewer, owner_state=st, owner_state_known=known, target_stage=str(b.get("target_stage") or ""),
                 status="fixed" if b.get("resolved") else "open", first_seen_round=b.get("first_seen_round"),
                 last_seen_round=doc.get("round"), claim=str(b.get("claim") or ""), fix_requires=remedy(b),
-                done_when=b.get("done_when") if isinstance(b.get("done_when"), list) else None))
+                done_when=tests_of(b.get("done_when"))))
     return found, problems
+
+
+def from_conflicts(run_dir: str) -> tuple[list[Finding], list[str]]:
+    """W0-F: one HIGH evidence_conflict_declared finding per target the analysis held out (toolkit/analysis/
+    conflicts.py findings): open, for the owner, when its test changes the plan or did not run; else declared."""
+    from toolkit.analysis import conflicts as CF
+    rows, probs = CF.findings(run_dir)
+    return [Finding(severity="HIGH", source="harness-conflicts", owner_state="ANALYZE", target_stage="ANALYZE",
+                    blocking=r["status"] == "open", **r) for r in rows], probs
 
 
 def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[str]]:
@@ -228,7 +268,8 @@ def from_gate(decision: dict, round_n: int | None) -> tuple[list[Finding], list[
                 owner_state_known=known, target_stage=str(stage or ""),
                 scope_declarable=v.get("scope_declarable") is not False,
                 first_seen_round=v.get("first_seen_round", round_n), last_seen_round=round_n,
-                claim=str(v.get("claim") or v.get("evidence") or ""), fix_requires=remedy(v))
+                claim=str(v.get("claim") or v.get("evidence") or ""), fix_requires=remedy(v),
+                done_when=tests_of(v.get("done_when")))       # a done_when row carries its finding's test
             if v.get("owner_signoff"):
                 rows[fid].resolution_type = "owner_decision"
     # Blocking gate entries whose kind no violation list carries (e.g. a required artifact).
@@ -307,21 +348,24 @@ def answer_fingerprint(fid: str, claim, fix_requires) -> str:
                                      sort_keys=True).encode()).hexdigest()[:16]
 
 
-def owner_answers(run_dir: str) -> dict[str, dict]:
+def owner_answers(run_dir: str, lead_ok: bool = False) -> dict[str, dict]:
     """The owner's answers (fingerprint -> {finding, decision, ...}) that the harness recorded (scripts/scope_signoff.py
     verified_answers: the answer's hash under a nonce trace.jsonl also holds), signed by the owner. Nothing else counts
-    (Codex review of #258 P1-8): not a lead's answer, not one written to scope_signoff.json without the harness."""
+    (Codex review of #258 P1-8): not a lead's answer, not one written to scope_signoff.json without the harness.
+    `lead_ok` (the run is a --signoff lead run, D2): the lead's recorded answers count too, as provisional ones."""
     try:
         import scope_signoff as SS
         verified, _bad = SS.verified_answers(run_dir)
     except Exception:  # noqa: BLE001 -- unreadable: no answer counts (fail closed)
         return {}
-    return {fp: a for fp, a in verified.items() if isinstance(a, dict) and a.get("by") == "owner"
+    return {fp: a for fp, a in verified.items() if isinstance(a, dict)
+            and (a.get("by") == "owner" or (lead_ok and a.get("by") == "lead" and a.get("provisional") is True))
             and a.get("finding") and a.get("decision") in ("accept", "decline")}
 
 
 # ------------------------------------------------------------------ sync
-def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: bool = False) -> tuple[dict[str, Finding], list[str]]:
+def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: bool = False,
+         lead_ok: bool = False) -> tuple[dict[str, Finding], list[str]]:
     """Bring the ledger up to date with the run's files and (optionally) a fresh gate decision.
 
     A gate finding open before and absent from this gate is `fixed` (pre-write
@@ -335,9 +379,11 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
     problems += p2
     decl, p3 = declarations(run_dir)
     problems += p3
-    answers = owner_answers(run_dir)
+    answers = owner_answers(run_dir, lead_ok)
+    conf, p4 = from_conflicts(run_dir)          # W0-F: declared evidence conflicts (analysis/conflicts.yaml)
+    problems += p4
     seen = set()
-    for new in crit + gate_rows:
+    for new in crit + gate_rows + conf:
         seen.add(new.id)
         old = led.get(new.id)
         if old is None:
@@ -357,6 +403,12 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             old.resolution_type = "owner_decision"
         if old.first_seen_round is None:
             old.first_seen_round = new.first_seen_round
+        if new.kind == CONFLICT_KIND and old.status not in ("owner_accepted", "owner_declined"):
+            old.resolution_type, old.blocking = new.resolution_type, new.blocking     # W0-F: the current test decides
+            if new.status != old.status:
+                old.status = new.status
+                _event(old, round_n, new.status, new.source)
+            continue
         if new.status != old.status and not (old.status == "declared" and new.status == "open"):
             old.status = new.status
             _event(old, round_n, new.status, new.source)
@@ -373,10 +425,15 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             if f.id not in seen and not f.source.startswith("critique") and f.status in ("open", "declared"):
                 f.status, f.blocking = "fixed", False
                 _event(f, round_n, "fixed", "gate", "absent at this gate")
+    frozen = frozen_tests(run_dir)
     for f in led.values():
-        names = {f.id, f.kind, f.key, f"{f.kind}:{f.key}" if f.key else f.kind}
+        fk = f.id if f.source.startswith("critique") else f.key if f.kind in _DW_ROWS else None
+        if fk in frozen:
+            f.done_when = frozen[fk]         # the frozen test (none once withdrawn), never a critic's later edit
+        # a regressed or unmet row is keyed by its finding's id: a declaration of that finding does not declare it
+        names = {f.id, f.kind, None if f.kind in _DW_ROWS[:2] else f.key, f"{f.kind}:{f.key}" if f.key else f.kind}
         hit = next((decl[n] for n in names if n and n in decl), None)
-        if hit is not None and f.status == "open":
+        if hit is not None and f.status == "open" and f.kind != CONFLICT_KIND:   # W0-F: only the owner closes one
             f.status = "declared"
             _event(f, round_n, "declared", "scope_declaration")
             if f.resolution_type == "fix":
@@ -388,12 +445,12 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         a = answers.get(answer_fingerprint(f.id, f.claim, f.fix_requires))    # bound to this claim and remedy
         ans = a.get("decision") if a and str(a.get("finding")) == f.id else None
         if ans is None and f.resolution_type == "owner_decision" and f.status in ("open", "declared") \
-                and any(isinstance(e, dict) and e.get("by") == "owner" for e in f.events):
+                and any(isinstance(e, dict) and e.get("by") in ("owner", "lead") for e in f.events):
             f.resolution_type = "fix"        # answered as it was before; revised since, so it is asked again
         if ans and f.status in ("open", "declared"):
             f.status = "owner_accepted" if ans == "accept" else "owner_declined"
             f.resolution_type = "owner_decision"
-            _event(f, round_n, f.status, "owner")
+            _event(f, round_n, f.status, "lead" if a.get("by") == "lead" else "owner")
     save(run_dir, led)
     return led, problems
 
@@ -542,6 +599,77 @@ def _self_test() -> int:
            and FX_.needs_owner_amendment(led17b["D-031"]),
            f"L17 a recorded owner answer applies to the finding it was given for; a revised one is asked again "
            f"({unverified}, {st17}, {led17b['D-031'].status})")
+    # L_OWNER_LEAD (1F, D2): a lead's recorded answer counts only when the run is a --signoff lead run
+    with tempfile.TemporaryDirectory() as d:
+        import scope_signoff as SS
+        claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
+        fp = answer_fingerprint("D-032", claim, fix)
+        json.dump({"answers": {fp: {"finding": "D-032", "decision": "accept", "by": "lead", "provisional": True}}},
+                  open(os.path.join(d, "scope_signoff.json"), "w"))
+        SS.harness_record(d)
+        save(d, {"D-032": Finding(id="D-032", kind="critique_blocker", severity="HIGH", source="harness", claim=claim,
+                                  fix_requires=fix)})
+        st_o = sync(d, None, 2)[0]["D-032"].status
+        led_l = sync(d, None, 2, lead_ok=True)[0]
+        ok(owner_answers(d) == {} and list(owner_answers(d, lead_ok=True)) == [fp] and st_o == "open"
+           and led_l["D-032"].status == "owner_accepted" and led_l["D-032"].events[-1].get("by") == "lead",
+           f"L_OWNER_LEAD a lead's answer counts only with lead_ok, and the ledger says it was the lead's ({st_o})")
+    # L_DICT_DW, L_FROZEN_DW, L_GATE_DW (v2 autonomy 1A, 4c and 4a): the test a fix task is checked against.
+    with tempfile.TemporaryDirectory() as d:
+        frozen, weaker = [{"file": "x.txt", "contains": "draws 32"}], [{"file": "x.txt", "exists": True}]
+        doc = {"reviewer": "critique-redteam", "round": 2, "blockers": [
+            {"id": "R-041", "severity": "HIGH", "target_stage": "MODEL", "claim": "c", "done_when": frozen[0]},
+            {"id": "R-042", "severity": "HIGH", "target_stage": "MODEL", "claim": "c", "done_when": weaker},
+            {"id": "R-043", "severity": "HIGH", "target_stage": "MODEL", "claim": "c", "done_when": weaker,
+             "done_when_withdrawn": "the output it read no longer exists"}]}
+        yaml.safe_dump(doc, open(os.path.join(d, "critique_redteam.yaml"), "w"))
+        json.dump({"tests": {"R-042": {"done_when": frozen, "frozen_round": 1},
+                             "R-043": {"done_when": frozen, "frozen_round": 1, "withdrawn": {"round": 2, "reason": "x"}}}},
+                  open(os.path.join(d, "done_when_registry.json"), "w"))
+        led, _ = sync(d, None, 2)
+        ok(led["R-043"].done_when is None,
+           f"L_WITHDRAWN_DW a withdrawn test is no test for a fix's check, whatever the critique then lists "
+           f"(narrow Codex review of #297, 6) ({led['R-043'].done_when})")
+        ok(led["R-041"].done_when == frozen, f"L_DICT_DW a test written as one mapping is kept ({led['R-041'].done_when})")
+        ok(led["R-042"].done_when == frozen,
+           f"L_FROZEN_DW the test the gate froze is kept over a critic's later edit ({led['R-042'].done_when})")
+        rows, _ = from_gate({"rigor_violations": [{"kind": "done_when_unmet", "key": "R-9", "severity": "MEDIUM",
+                                                   "claim": "c", "done_when": frozen}]}, 2)
+        ok(rows[0].id == "done_when_unmet:R-9" and rows[0].done_when == frozen,
+           f"L_GATE_DW a gate row that carries a test keeps it ({rows[0].id}, {rows[0].done_when})")
+        # Narrow Codex review of #297, round 2 (5-8).
+        yaml.safe_dump({"declarations": [{"blocker_id": "R-042", "why": "declared"}]},
+                       open(os.path.join(d, "scope_declaration.yaml"), "w"))
+        dec2 = {"rigor_violations": [{"kind": k, "key": i, "severity": "HIGH", "claim": "c", "done_when": frozen}
+                                     for k, i in (("done_when_regressed", "R-042"), ("done_when_unmet", "R-043"))]}
+        led2, _ = sync(d, dec2, 2)
+        ok(led2["done_when_regressed:R-042"].status == "open",
+           f"L_CX2-5 a declaration of a finding does not declare its regression ({led2['done_when_regressed:R-042'].status})")
+        ok(led2["done_when_unmet:R-043"].done_when is None,
+           f"L_CX2-6 a gate row of a withdrawn test carries no test ({led2['done_when_unmet:R-043'].done_when})")
+        ok(tests_of({"file": "x.csv", "where": {2024: "x", "site": "A"}}) is None,
+           "L_CX2-7 a test the ledger could not write (mixed key types) is not kept")
+        real_dumps = json.dumps
+
+        def too_deep(*a, **k):
+            raise RecursionError("nested too deep")
+        json.dumps = too_deep                # what the encoder raises for a test nested too deep (YAML aliases)
+        try:
+            td_ = tests_of({"file": "x.csv", "exists": True})
+        except BaseException as e:  # noqa: BLE001
+            td_ = type(e).__name__
+        finally:
+            json.dumps = real_dumps
+        ok(td_ is None, f"L_CX3-4 a test nested too deep to write is not kept, and does not stop the sync ({td_})")
+        import datetime
+        ok(tests_of({"file": "x.csv", "key": "d", "op": "==", "value": datetime.date(2024, 1, 1)}) is None,
+           "L_CX3-3 a test whose value JSON cannot hold as written is not kept")
+        open(os.path.join(d, "done_when_registry.json"), "w").write('{"tests": ' + "[" * 200000)
+        try:
+            ft = frozen_tests(d)
+        except BaseException as e:  # noqa: BLE001
+            ft = type(e).__name__
+        ok(ft == {}, f"L_CX2-8 a registry that cannot be decoded gives no frozen test and does not stop the sync ({ft})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

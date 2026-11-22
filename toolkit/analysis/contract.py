@@ -33,7 +33,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from toolkit.analysis.artifacts import (ENVELOPE, EXPECTED_KINDS, EXPECTED_ROLES, KINDS, MANIFEST,  # noqa: E402
                                         PRODUCED_BY, PRODUCER_PREFIX, sha256)
-from toolkit.analysis.figures import presentation_findings, resolve_source  # noqa: E402
+from toolkit.analysis.figures import presentation_findings, render_findings, resolve_source  # noqa: E402
 
 SPEC = "decision_spec.yaml"
 ENGINE_CHOICE = "engine_choice.json"     # toolkit/spec/schema.py ENGINE_CHOICE
@@ -202,6 +202,32 @@ def _boundary(run_dir: str, data, point) -> list[dict]:
     except Exception:  # noqa: BLE001 -- fail closed: findings() names a missing expectation
         expect = None
     return BD.findings(data, point, expect)
+
+
+def _solver(man: dict) -> list[dict]:
+    """1C-c (decision D3): the manifest's solver record (core.Analysis.solver_report). Auxiliary solves that returned
+    no usable plan are recorded where they occur (a fold or test not run, a variant or envelope not solved); above
+    `aux_not_solved_share_max` of all auxiliary solves they are a finding. A record that cannot be read is one too;
+    a manifest without the record (a run from before it existed) is not."""
+    if "solver" not in man:
+        return []
+    try:
+        sv = man["solver"]
+        tot = sv["auxiliary_total"]
+        n, bad, acc, lim = tot["solves"], tot["not_solved"], tot["feasible_accepted"], sv["aux_not_solved_share_max"]
+        # Codex r1 P1-9, r2 P1: whole-number, consistent counts and a numeric share (not a boolean, not NaN); a null
+        # record fails closed
+        if not (all(isinstance(x, int) and not isinstance(x, bool) for x in (n, bad, acc))
+                and isinstance(lim, (int, float)) and not isinstance(lim, bool)
+                and 0 <= bad <= n and 0 <= acc <= n - bad and 0 <= lim <= 1):
+            raise ValueError("counts or share out of range")
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return [_f("analysis_solver_degraded", f"{MANIFEST}: the solver record cannot be read", "solver")]
+    if n > 0 and bad / n > lim:
+        return [_f("analysis_solver_degraded", f"{bad} of {n} auxiliary solves (uncertainty draws, folds, tests, "
+                   f"variants, frontier) returned no plan proven within the stated gap, above the share {lim:g}: the "
+                   "items they belong to are recorded as not run or not solved", "solver")]
+    return []
 
 
 def _survey_changes(run_dir: str, data) -> list[dict]:
@@ -407,6 +433,12 @@ def _gate_findings(run_dir: str) -> list[dict]:
                                                          "was computed", f"{rel}:{src}"))
         if kind == "joint_calibration":       # F6 S2-3b: the change between survey rounds by group
             out += _survey_changes(run_dir, doc.get("data") or {})
+        if kind == "figures":                 # v2 autonomy 1C-a: a figure that failed to render, by its tier
+            npd = doc["data"].get("not_produced", []) if isinstance(doc.get("data"), dict) else []
+            if not isinstance(npd, list) or not all(isinstance(x, dict) for x in npd):     # absent: none; else a list
+                out.append(_f("analysis_contract_schema", f"artifact {rel}: not_produced is not a list of records", rel))
+            else:
+                out += render_findings(npd)
         if kind == "calibration":
             out += _calibration(rel, doc.get("data") or {})
             cal_doc = (rel, doc.get("data") or {})
@@ -449,6 +481,7 @@ def _gate_findings(run_dir: str) -> list[dict]:
         out += _boundary(run_dir, bd_doc, pt_doc)
         out += _value_of_information(run_dir, unc_doc, voi_doc)
     out += _decision_tests(run_dir, man)
+    out += _solver(man)
     out += _claims(run_dir, man)
     out += _figures(run_dir, man)
     return out
@@ -731,6 +764,34 @@ def _self_test() -> int:
         ok(kinds(d) == {"analysis_contract_missing"}, "K3 an unreadable manifest fails closed")
         S = complete_run(d)
         ok(gate_findings(d) == [], f"K4 a completed harness run for the current signed spec passes: {gate_findings(d)}")
+        # 1C-c (D3): auxiliary solves that could not be used are a finding only above the stated share
+        tot = {"solves": 100, "feasible_accepted": 3, "max_gap": 0.002, "not_solved": 5}
+        S.manifest["solver"] = {"aux_not_solved_share_max": 0.05, "auxiliary_total": tot}
+        S.finalize("complete")
+        ok(gate_findings(d) == [], f"KS1 auxiliary solves not solved at the stated share: recorded, no finding: "
+                                   f"{gate_findings(d)}")
+        tot["not_solved"] = 6
+        S.finalize("complete")
+        ok(kinds(d) == {"analysis_solver_degraded"}, f"KS2 above the share it is a gate finding: {kinds(d)}")
+        S.manifest["solver"] = {"auxiliary_total": "x"}
+        S.finalize("complete")
+        ok(kinds(d) == {"analysis_solver_degraded"}, f"KS3 a solver record that cannot be read fails closed: {kinds(d)}")
+        got = []      # Codex r1 P1-9: only an absent record is exempt; counts are whole numbers
+        for rec in (None, {"aux_not_solved_share_max": 0.05,
+                           "auxiliary_total": {"solves": 10, "feasible_accepted": 0, "max_gap": 0.0, "not_solved": 0.9}}):
+            S.manifest["solver"] = rec
+            S.finalize("complete")
+            got.append(kinds(d))
+        ok(got == [{"analysis_solver_degraded"}] * 2, f"KS4 a null record or fractional counts fail closed: {got}")
+        got = []      # Codex r2 P1: the share is a number, not a boolean; accepted counts are whole and consistent
+        for share, acc in ((True, 0), (0.05, 0.5), (0.05, 11)):
+            S.manifest["solver"] = {"aux_not_solved_share_max": share, "auxiliary_total": {
+                "solves": 10, "feasible_accepted": acc, "max_gap": 0.0, "not_solved": 10 if share is True else 0}}
+            S.finalize("complete")
+            got.append(kinds(d))
+        ok(got == [{"analysis_solver_degraded"}] * 3, f"KS5 a boolean share or an inconsistent accepted count fails "
+                                                      f"closed: {got}")
+        S = complete_run(d)
         rel = "analysis/sensitivity.yaml"
         doc = yaml.safe_load(open(os.path.join(d, rel)))
         doc["produced_by"] = "agent"
@@ -749,6 +810,27 @@ def _self_test() -> int:
         S = complete_run(d)
         S.finalize("blocked", "corrections bear on the plan")
         ok(kinds(d) == {"analysis_contract_blocked"}, "K9 a blocked run is reported as blocked")
+        # v2 autonomy 1C-a (item 4.1): a figure that failed to render is a MEDIUM finding of its own
+        S = complete_run(d)
+        S.write("figures", {"figures": [], "not_produced": [
+            {"figure": "f_a", "tier": "decision", "reason": "ValueError: x", "render_failed": True},
+            {"figure": "f_b", "tier": "simulation", "reason": "needs an input this run does not have"},
+            {"figure": "f_c", "tier": "data_model", "reason": "ValueError: x", "render_failed": True},
+            {"figure": "f_d", "tier": "simulation", "reason": "ValueError: x", "render_failed": True}]},
+            "toolkit/analysis/figures.py")
+        S.finalize("complete")
+        got = [(x["kind"], x["key"], x["severity"], x["scope_declarable"]) for x in gate_findings(d)]
+        ok(got == [("figure_render_failed", "f_a", "HIGH", False), ("figure_render_failed", "f_c", "MEDIUM", True),
+                   ("figure_render_failed", "f_d", "MEDIUM", True)],
+           f"K9b a figure that failed to render is one finding figure_render_failed:<figure>: HIGH and "
+           f"non-declarable in the decision tier (owner, 2026-11-20), MEDIUM and declarable in the others; a figure "
+           f"without its inputs is none ({got})")
+        for bad in ({}, False, "x", [1]):       # Codex r1: a value that is not a list of records is never read as none
+            S = complete_run(d)
+            S.write("figures", {"figures": [], "not_produced": bad}, "toolkit/analysis/figures.py")
+            S.finalize("complete")
+            ok(kinds(d) == {"analysis_contract_schema"},
+               f"K9c not_produced {bad!r} is a schema finding, never an empty list ({kinds(d)})")
         complete_run(d)
         open(os.path.join(d, "units.csv"), "a").write("2\n")
         ok("analysis_contract_stale" in kinds(d), "K10 an input changed after the artifact was computed (Codex P1-10)")
