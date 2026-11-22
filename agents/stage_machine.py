@@ -348,11 +348,11 @@ def owned_path(root: str, rel: str, owned) -> bool:
     return False
 
 
-# Phase 49 β's sign-off lifecycle in v2: a fingerprinted request (scope_signoff.record) written at
-# AWAIT_OWNER and the owner's answers taken through the harness (harness_record), honouring the
-# run's signoff mode. Not wired yet (Codex round 1 on #98): until it is, decision-bearing findings
-# stay non-declarable rather than waiting in OWNER_DECISION for an answer nobody can give.
-OWNER_LIFECYCLE_WIRED = False
+# Phase 49 β's sign-off lifecycle in v2 (autonomy 1F): a fingerprinted request (scope_signoff.record) written on the
+# AWAIT_OWNER route, kept in run_state.json, and the answers taken through the harness (harness_record), honouring the
+# run's signoff mode: the owner's under --signoff owner; under --signoff lead the lead's, provisionally (D2), so the run
+# never waits; under --signoff none decision-bearing findings stay non-declarable.
+OWNER_LIFECYCLE_WIRED = True
 
 
 def _owner_rule():
@@ -374,29 +374,86 @@ def _owner_rule():
     return scope_signoff
 
 
-def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto") -> list[dict]:
+def _bearing_item(run_dir: str, v: dict) -> dict:
+    """What the owner is asked about a decision-bearing finding: its claim and the analysis's record of the decision
+    test, fingerprinted (an answer binds to both: a changed result is asked again)."""
+    ev = None
+    try:
+        with open(os.path.join(run_dir, AB.ANALYSIS_JSON)) as fh:
+            tests = (json.load(fh) or {}).get("decision_tests") or []
+        ev = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(v.get("key"))), None)
+    except (OSError, ValueError, AttributeError, TypeError):
+        ev = None
+    gid = FL.gate_id(v)
+    fp = hashlib.sha256(json.dumps({"finding": gid, "claim": v.get("claim", ""), "evidence": ev}, sort_keys=True,
+                                   default=str).encode()).hexdigest()[:16]
+    return {"finding": gid, "kind": v.get("kind"), "reason": "a measured decision test changes the plan",
+            "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp}
+
+
+def _answer_counts(a: dict, mode: str) -> bool:
+    """Whose answer releases an owner item: the owner's; the lead's only in a --signoff lead run (D2), and only a
+    provisional one (the harness's, listed in the report: Codex r1 of #316)."""
+    return a.get("by") == "owner" or (a.get("by") == "lead" and mode == "lead" and a.get("provisional") is True)
+
+
+def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto", mode: str = "owner") -> list[dict]:
     """Decision-bearing findings (a measured decision test that changes the plan) go through
-    Phase 49 β's owner rule before they can be declared. Without the rule they are not
-    scope-declarable, so the run can neither declare them away nor finish around them."""
+    Phase 49 β's owner rule before they can be declared: marked for the owner (an item the
+    AWAIT_OWNER route requests) until a recorded answer counts (`mode`: the run's sign-off).
+    Without the rule, or under --signoff none, they are not scope-declarable, so the run can
+    neither declare them away nor finish around them."""
     import validate_critique_yaml as V
     rule = _owner_rule() if rule == "auto" else rule
     bearing = [v for v in viols if v.get("decision_bearing") or v.get("kind") in DECISION_BEARING_KINDS]
     if not bearing:
-        return []
-    if rule is not None:
-        for v in bearing:
-            v["owner_signoff"] = True
-            v.setdefault("owner_item", {"finding": FL.gate_id(v), "reason": "a measured decision test changes the plan",
-                                        "claim": v.get("claim", "")})
+        if rule is None or mode == "none":
+            return []
+        # Codex r2 of #316 (P1): an owner's recorded decline holds the gate whatever else is present; nothing new is
+        # put to the owner here (the policy kinds go to the owner only beside a decision-bearing finding, as before)
+        marked = {id(v) for v in viols if v.get("owner_signoff")}
         try:
-            return list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable) or [])
+            out = [f for f in rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
+                                                 mode=mode, provisional_only=True) or []
+                   if f.get("kind") == "scope_declaration_declined"]
+        except Exception:  # noqa: BLE001 -- as before this rule: nothing marked, nothing declined
+            out = []
+        for v in viols:
+            if v.get("owner_signoff") and id(v) not in marked:
+                v.pop("owner_signoff", None)
+                v.pop("owner_item", None)
+        return out
+    if rule is not None and mode != "none":
+        out = []
+        try:
+            answers = (getattr(rule, "verified_answers", None) or (lambda rd: ({}, [])))(run_dir)[0]
+            for v in bearing:
+                item = _bearing_item(run_dir, v)
+                a = answers.get(item["fingerprint"]) or {}
+                if str(a.get("finding")) == item["finding"] and _answer_counts(a, mode):
+                    if a.get("decision") == "accept":
+                        v["owner_signed"] = {"by": a.get("by"), "at": a.get("at"), "fingerprint": item["fingerprint"],
+                                             **({"provisional": True} if a.get("provisional") else {})}
+                        continue
+                    v["scope_declarable"], v["owner_declined"] = False, True
+                    out.append({"kind": "scope_declaration_declined", "severity": "HIGH", "stage": "GATE",
+                                "target_stage": "MODEL", "scope_declarable": False, "key": item["finding"],
+                                "claim": f"The {a.get('by')} declined the declaration of `{item['finding']}` "
+                                         f"({a.get('at')}): {str(a.get('note') or 'no note')[:300]}."})
+                    continue
+                v["owner_signoff"], v["owner_item"] = True, item
+            return out + list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
+                                                 mode=mode, provisional_only=True) or [])
         except Exception as e:  # noqa: BLE001 -- fail closed below
             reason = f"the owner rule failed ({type(e).__name__}: {e})"
+    elif rule is not None:
+        reason = "under --signoff none nobody can accept a finding that bears on the decision"
     else:
         reason = "the owner rule (Phase 49 β, scripts/scope_signoff.py) is not available"
     for v in bearing:
         v["scope_declarable"] = False
         v.pop("owner_signoff", None)
+        v.pop("owner_signed", None)
         v["claim"] = f"{v.get('claim', '')} Not declarable: {reason}."
     return []
 
@@ -415,9 +472,10 @@ def _earlier_round(path: str, round_n: int) -> int:
 
 def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
             history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None,
-            strict_done_when: bool = False, append_history: bool | None = None) -> dict:
+            strict_done_when: bool = False, append_history: bool | None = None, signoff: str = "owner") -> dict:
     """Today's rule functions, in today's order, on the v2 findings: the critic YAMLs, the
-    harness's checks (`extra`), and optionally spec-compliance and registry findings."""
+    harness's checks (`extra`), and optionally spec-compliance and registry findings. `signoff`:
+    the run's mode, for whose answers to owner items count (apply_owner_rule)."""
     import done_when
     import validate_critique_yaml as V
     critiques, schema_errors, refused = {}, [], {}
@@ -490,7 +548,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     if spec_violations is not None:
         d = V.incorporate_spec_violations(d, list(spec_violations), max_rounds, round_n)
     viols = extra + done_when.gate_findings(dw or {})
-    viols += apply_owner_rule(run_dir, round_n, viols)
+    viols += apply_owner_rule(run_dir, round_n, viols, mode=signoff)
     for v in viols:
         k = FL.gate_key(v)
         if k:
@@ -1109,7 +1167,8 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
         opts = {}
         if conflict:            # owner decision 2026-11-21: a refit is listed, with its estimated cost, never run
             from toolkit.analysis import conflicts as CF
-            opts = {"options": CF.options(run_dir, getattr(f, "key", ""))}
+            opts = {"options": CF.options(run_dir, getattr(f, "key", "")),
+                    "conflict": CF.verdict(run_dir, getattr(f, "key", ""))}     # Codex r4 of #316: the structured verdict
         items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix, **opts,
                       "reason": ("a held-out calibration target's automatic decision test changes the plan or could "
                                  "not run (conflicts.policy declare_and_test)") if conflict else
@@ -1884,7 +1943,7 @@ class Machine:
                         spec_violations=sv(self.run_dir) if sv else None,
                         registry_violations=rv(self.run_dir) if rv else None,
                         strict_done_when=self.st.v2_rules and self.st.tries.get("schema", 0) < MAX_SCHEMA_REPAIRS,
-                        append_history=False)
+                        append_history=False, signoff=self.st.signoff)
             opened = []
             if d.get("action") and self.st.v2_rules:
                 opened = open_findings(self.run_dir, d)
@@ -1892,7 +1951,8 @@ class Machine:
                 d = require_judged(d, opened)
                 # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
                 # (synced with this decision, so a gate finding is read as this gate states it: Codex round 3 of #258)
-                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw)[0])
+                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw,
+                                                    lead_ok=self.st.signoff == "lead")[0])
                 if d.get("rule_matched") == "owner_declined":
                     drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
                                                  if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
@@ -1915,7 +1975,7 @@ class Machine:
         self.st.last_gate = {k: (d or {}).get(k) for k in ("action", "rule_matched", "rounds_remaining", "rationale")}
         self.st.last_gate.update(round=self.st.round, post_write=pw)
         if (d or {}).get("action"):
-            FL.sync(self.run_dir, d, self.st.round, post_write=pw)
+            FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")
             if d.get("rule_matched") == "4m":           # these are why the loop runs: plan them
                 led = FL.load(self.run_dir)
                 for fid in d.get("open_tested") or []:
@@ -1932,6 +1992,8 @@ class Machine:
                     return self._go("OWNER_DECISION", f"{len(amend)} finding(s) need an owner amendment "
                                                       f"({', '.join(amend)[:120]})")
         nxt, status, mode = route_gate(d, pw)
+        if nxt == "OWNER_DECISION":
+            self._request_scope(d)
         lang = (d or {}).get("report_acceptance_language") or {}
         if nxt == "FINAL" and lang.get("remaining"):
             # Not delivered with acceptance language in place (F6 S1-7): the writer repairs the draft, which then
@@ -2013,11 +2075,37 @@ class Machine:
         self.st.tries["owner_request"] = [i["fingerprint"] for i in doc["items"]]
         save_state(self.run_dir, self.st)
 
-    def h_OWNER_DECISION(self):
-        """Released only by the owner's own answers to every item of the pending request (scripts/scope_signoff.py sign
-        --by owner, from the owner's shell); the machine, the harness here, then records them (harness_record), so the
-        ledger counts them (Codex review of #258 P1-8). No pending request, an empty one or a lead's answer: it waits."""
+    def _request_scope(self, d: dict) -> None:
+        """1F: the AWAIT_OWNER route's request (the decision-bearing items the gate marked), written with
+        scope_signoff.record and its fingerprints kept in run_state.json, as _request_owner does. No item: none is
+        kept, and OWNER_DECISION fails closed."""
         import scope_signoff as SS
+        SS.record(self.run_dir, d, self.st.round, producer="agents/stage_machine.py GATE (decision-bearing findings)")
+        try:
+            req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
+        except (OSError, ValueError):
+            req = {}
+        fps = [i.get("fingerprint") for i in req.get("items") or [] if isinstance(i, dict)] \
+            if isinstance(req, dict) and req.get("pending") else []
+        if fps and all(fps):
+            self.st.tries["owner_request"] = fps
+        else:
+            self.st.tries.pop("owner_request", None)
+        save_state(self.run_dir, self.st)
+
+    def h_OWNER_DECISION(self):
+        """Released by the answers to every item of the pending request: the owner's (scripts/scope_signoff.py sign
+        --by owner, from the owner's shell) or, under --signoff lead (D2), the lead's provisional ones, which the harness
+        writes here so the run never waits (scope_signoff.provisional_answers); the machine then records them
+        (harness_record), so the ledger counts them (Codex review of #258 P1-8). No recorded request: it fails closed.
+        Under --signoff owner a lead's answer does not count: it waits."""
+        import scope_signoff as SS
+        # Codex r4 of #316: the request is read, answered, recorded and closed under the sign-off lock, so an owner's
+        # sign that waited on it finds the request closed (and refuses) instead of reporting an answer never applied
+        with SS.locked(self.run_dir):
+            return self._owner_decision(SS)
+
+    def _owner_decision(self, SS):
         try:
             req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
         except (OSError, ValueError):
@@ -2031,13 +2119,35 @@ class Machine:
             return self._go("FINAL", "OWNER_DECISION has no recorded owner request: relaunch with reuse (a new run dir "
                                      "from this one's spec and stored rows)", "run_failed")
         answers, bad = SS.load_answers(self.run_dir)
-        answered = bool(want) and not bad and all(
-            isinstance(answers.get(fp), dict) and answers[fp].get("by") == "owner"
-            and answers[fp].get("decision") in SS.DECISIONS for fp in want)
+        lead = self.st.signoff == "lead"
+
+        def done(fp):
+            a = answers.get(fp)
+            return isinstance(a, dict) and _answer_counts(a, self.st.signoff) and a.get("decision") in SS.DECISIONS
+        if lead and bad:        # never overwritten (Codex r1 of #316): an owner answer in it would be lost
+            _withhold_report(self.run_dir)
+            return self._go("FINAL", f"{SS.SIGNOFF} cannot be read, so the lead cannot answer: restore it and resume",
+                            "run_failed")
+        if lead and not all(done(fp) for fp in want):
+            items = {i.get("fingerprint"): i for i in (req or {}).get("items") or [] if isinstance(i, dict)} \
+                if isinstance(req, dict) else {}
+            if any(fp not in items for fp in want):
+                _withhold_report(self.run_dir)
+                return self._go("FINAL", "the owner request cannot be read, so the lead cannot answer it: relaunch with "
+                                         "reuse", "run_failed")
+            todo = [items[fp] for fp in want if not done(fp)]
+            SS.provisional_answers(self.run_dir, todo, self.st.round,
+                                   plan_changing={i["fingerprint"]: _plan_changing(i) for i in todo})
+            self.st.history.append({"at": _now(), "provisional": [i.get("finding") for i in todo], "by": "lead",
+                                    "state": "OWNER_DECISION"})
+            answers, bad = SS.load_answers(self.run_dir)
+        answered = bool(want) and not bad and all(done(fp) for fp in want)
         if answered:
             SS.harness_record(self.run_dir)
             self.st.tries.pop("owner_request", None)
-            nxt = self._go("GATE", "the owner answered the scope declarations")    # persisted before the request closes
+            who = "the lead answered provisionally" if lead and any(answers[fp].get("by") == "lead" for fp in want) \
+                else "the owner answered"
+            nxt = self._go("GATE", f"{who} the scope declarations")    # persisted before the request closes
             if isinstance(req, dict):
                 from lib.safe_io import write_nofollow
                 write_nofollow(self.run_dir, OWNER_REQUEST, json.dumps(dict(req, pending=False, answered_at=_now()),
@@ -2302,6 +2412,56 @@ def _status_line(run_dir: str, status: str | None) -> str:
     return f"{STATUS_MARK}\n**Run status: {text}.** (`{status}`; rendered by the harness)\n\n"
 
 
+def _plan_changing(item: dict) -> bool:
+    """An owner item whose evidence shows the plan changes: a decision-bearing kind, a declaration whose decision
+    test changes the decision, or a W0-F evidence conflict whose verdict changes the plan (or whose test did not run:
+    W0-F counts that as changing it; Codex r4 of #316)."""
+    conf = item.get("conflict")
+    if item.get("kind") == "evidence_conflict_declared" and not isinstance(conf, dict):
+        return True     # a request saved before the verdict was carried: it holds only plan-changing or untested ones
+    return item.get("kind") in DECISION_BEARING_KINDS or (isinstance(conf, dict) and conf.get("changes_plan") is True) \
+        or any((d.get("test") or {}).get("decision_changes") is True
+               for d in item.get("declarations") or [] if isinstance(d, dict))
+
+
+def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:
+    """(lines above the draft, a section after it): the lead's provisional decisions of a --signoff lead run (D2),
+    the owner items answered (scripts/scope_signoff.py provisional) and the engine departures credited
+    (`provisional_lead` in engine_choice.json). Those whose decision test changes the plan head the report."""
+    import scope_signoff as SS
+    try:
+        rows = [(r.get("finding"), bool(r.get("plan_changing")), (r.get("review") or {}).get("decision"))
+                for r in SS.provisional(run_dir)]
+    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the list could not be read
+        return ([f"**Provisional decisions: the list could not be read ({type(e).__name__}).**\n\n"],
+                ["", "## Provisional decisions (the lead's)", "", f"Could not be read: {type(e).__name__}: {e}"])
+    try:
+        ch = json.load(open(os.path.join(run_dir, AB.ENGINE_CHOICE)))
+        deps = [d for d in ch.get("engine_departures") or [] if isinstance(d, dict) and d.get("status") == "provisional_lead"]
+    except (OSError, ValueError, AttributeError):
+        deps = []
+    try:
+        changes = {str(t.get("id")) for t in (json.load(open(os.path.join(run_dir, AB.ANALYSIS_JSON))) or {}).get(
+            "decision_tests") or [] if isinstance(t, dict) and t.get("plan_changes")}
+    except (OSError, ValueError, AttributeError, TypeError):
+        changes = set()
+    rows += [(f"engine departure {d.get('benchmark') or d.get('component')}", str(d.get("decision_test")) in changes,
+              None) for d in deps]
+    if not rows:
+        return [], []
+    flagged = [f for f, pc, _r in rows if pc]
+    how = (f"`python3 scripts/scope_signoff.py review {run_dir} --finding <id> --confirm|--overturn`; an engine departure "
+           "is confirmed by the owner's signature of the spec in a relaunch")
+    top = [f"**Provisional decisions that change the plan.** This run was unattended (`--signoff lead`); the lead "
+           f"answered, provisionally, {len(flagged)} decision(s) that are the owner's and whose decision test changes the "
+           f"plan: {', '.join(map(str, flagged))}. The owner confirms or overturns each ({how}).\n\n"] if flagged else []
+    sec = ["", "## Provisional decisions (the lead's, under --signoff lead; for the owner's review)", "",
+           f"Each decision below is the owner's; the lead made it provisionally so the run could finish. Review: {how}.", ""]
+    sec += [f"- **{f}**: accepted provisionally; plan changes: {'yes' if pc else 'no'}; owner review: "
+            f"{r or 'not yet'}." for f, pc, r in rows]
+    return top, sec
+
+
 def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     """report.md = the run status line, the writer's draft, and the blocks the harness renders from
     artifacts: the headline numbers, the declared limits and open findings (in full, with their
@@ -2383,7 +2543,9 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
             lines += ["", open(wmp, encoding="utf-8").read().rstrip()]
     except (OSError, ValueError) as e:      # fail soft: the report is rendered without it, and says so
         lines += ["", f"## World model\n\nThe world-model section could not be read: {type(e).__name__}."]
-    head, body = _status_line(run_dir, status), draft.rstrip() + "\n"
+    top, prov = provisional_lines(run_dir)
+    lines += prov
+    head, body = _status_line(run_dir, status) + "".join(top), draft.rstrip() + "\n"
     from toolkit.spec import review_conditions as RCN       # W0-G: conditions the lead deferred, at the top
     rcl = RCN.report_lines(run_dir)
     if rcl:
@@ -2946,8 +3108,8 @@ def _self_test() -> int:
                f"declared or accepted (Codex review of #258 P1-11) ({s2}, {p2[-5:]})")
         # W0-F: a held-out target whose automatic test changes the plan pauses the run once at OWNER_DECISION; one
         # whose test changes nothing is a declared limitation, and the run is not interrupted
-        def conflict_run(name, changes):
-            d_, T_, st_ = new_run(name, {}, max_rounds=2)
+        def conflict_run(name, changes, **kw):
+            d_, T_, st_ = new_run(name, {}, max_rounds=2, **kw)
             os.makedirs(os.path.join(d_, "analysis"), exist_ok=True)
             import yaml as _y
             _y.safe_dump({"data": {"policy": "declare_and_test", "refused": None, "needs_owner": ["g|1"] if changes
@@ -2978,6 +3140,33 @@ def _self_test() -> int:
                and "Held-out calibration targets" in open(os.path.join(dq, "report.md")).read(),
                f"T_CONFLICT_PLAN_CHANGE_PAUSES_ONCE the owner's accept resumes the run, which is not paused again, and "
                f"the report lists the held-out target ({sq2}, {nq} pause(s))")
+        # T_CONFLICT_LEAD_FLAGGED (Codex r4 of #316): under --signoff lead a conflict whose test changes the plan is
+        # answered provisionally and flagged as plan-changing: the request item carries the conflict's structured
+        # verdict, and the report names it above the draft and labels it "plan changes: yes"
+        dl, Tl, sl = conflict_run("conflict_change_lead", True, signoff="lead")
+        try:
+            rl = json.load(open(os.path.join(dl, "scope_signoff_request.json")))
+        except (OSError, ValueError):
+            rl = {}
+        it_l = next((i for i in rl.get("items") or [] if i.get("finding") == "evidence_conflict_declared:g|1"), {})
+        rep_cl = open(os.path.join(dl, "report.md")).read() if os.path.exists(os.path.join(dl, "report.md")) else ""
+        try:
+            span_cl = json.load(open(os.path.join(dl, "report_render.json")))["writer_span"]
+        except (OSError, ValueError, KeyError):
+            span_cl = [0, 0]
+        top_cl = rep_cl[:span_cl[0]]
+        ok(not sl.startswith("paused") and (it_l.get("conflict") or {}).get("status") == "CHANGES_PLAN"
+           and (it_l.get("conflict") or {}).get("verdicts") == {"conflict_1_g_1_lo": "CHANGES_PLAN"}
+           and "Provisional decisions that change the plan" in top_cl and "evidence_conflict_declared:g|1" in top_cl
+           and "**evidence_conflict_declared:g|1**: accepted provisionally; plan changes: yes" in rep_cl[span_cl[1]:],
+           f"T_CONFLICT_LEAD_FLAGGED a lead run flags a plan-changing conflict above the draft, with its verdict in the "
+           f"request ({sl}, {it_l.get('conflict')}, top has it: {'evidence_conflict_declared' in top_cl})")
+        # T_CONFLICT_OLD_REQUEST (Codex r5 of #316): a conflict item saved before the verdict was carried (a run resumed
+        # across this change) is plan-changing: the owner request holds only conflicts that change the plan or could
+        # not be tested
+        ok(_plan_changing({"finding": "evidence_conflict_declared:g|1", "kind": "evidence_conflict_declared"}) is True
+           and _plan_changing({"kind": "evidence_conflict_declared", "conflict": {"changes_plan": False}}) is False,
+           "T_CONFLICT_OLD_REQUEST a conflict item without its verdict counts as changing the plan")
         dn, Tn, sn = conflict_run("conflict_nochange", False)
         ok(sn in ACCEPTED_STATUSES and not os.path.exists(os.path.join(dn, "scope_signoff_request.json"))
            and FL.load(dn)["evidence_conflict_declared:g|1"].status == "declared"
@@ -3039,6 +3228,75 @@ def _self_test() -> int:
         p = [h["to"] for h in load_state(d).history if "to" in h]
         ok(s == "paused:awaiting_scope_signoff" and "SPEC" not in p and p[-1] == "OWNER_DECISION",
            f"R3-5 a structural blocker that needs an owner amendment goes to the owner, not to SPEC ({s}, {p[-3:]})")
+
+        # T_OWNER_DECISION_E2E (1F): a decision test that changes the plan, at the last round, goes to OWNER_DECISION
+        # with a request the machine recorded; the owner's accept resumes the run, which ends scope-declared
+        import scope_signoff as _SS
+        dtf_e = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT9",
+                 "claim": "Decision test DT9 changes the plan: a lower effect", "scope_declarable": True,
+                 "decision_bearing": True}
+
+        class _DTMachine(Machine):
+            def harness_findings(self):
+                return super().harness_findings() + [dict(dtf_e)]
+        mk = lambda d_, T_, st_: _DTMachine(d_, T_, st_, backend=spike, log=lambda *a: None,  # noqa: E731
+                                            cross_engine_check=False)
+        d, T, st = new_run("dt_owner", {}, signoff="owner", max_rounds=1)
+        mk(d, T, st).run()
+        _t_owner_disposes(d)        # W0-G (from v2): the owner disposes the spec critique's conditions before signing
+        sign(d, "owner", "ok")
+        s_o = mk(d, StubTasks(T.s), None).run()
+        st_o = load_state(d)
+        req_o = json.load(open(os.path.join(d, OWNER_REQUEST))) if os.path.exists(os.path.join(d, OWNER_REQUEST)) else {}
+        fps_o = [i.get("fingerprint") for i in req_o.get("items") or []]
+        ok(s_o == "paused:awaiting_scope_signoff" and st_o.state == "OWNER_DECISION" and req_o.get("pending")
+           and fps_o and st_o.tries.get("owner_request") == fps_o
+           and [i.get("finding") for i in req_o["items"]] == ["decision_test_changes_plan:DT9"],
+           f"T_OWNER_DECISION_E2E the AWAIT_OWNER route records a fingerprinted request and pauses ({s_o}, {fps_o})")
+        _SS.sign(d, "owner", all_decision="accept", note="the plan stands with this caveat")
+        s_o2 = mk(d, StubTasks(T.s), None).run()
+        rep_o = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        ok(s_o2 == "completed_scope_declared" and "DT9" in rep_o and "Provisional decisions" not in rep_o,
+           f"T_OWNER_DECISION_E2E2 the owner's accept resumes the run, which ends scope-declared ({s_o2})")
+        # T_OWNER_LEAD_PROVISIONAL (1F, D2): under --signoff lead the same finding never waits: the lead answers it
+        # provisionally, the answer is recorded and listed, and, as the plan changes, flagged above the report's draft
+        d, T, st = new_run("dt_lead", {}, signoff="lead", max_rounds=1)
+        held, real_hr = [], _SS.harness_record
+
+        def _hr(rd):     # T_OWNER_LEAD_LOCK (Codex r4 of #316): the lock is held while the answers are recorded
+            held.append(("record", getattr(_SS, "lock_held", lambda _r: "no lock_held")(rd)))
+            return real_hr(rd)
+        _SS.harness_record = _hr
+        try:
+            s_l = mk(d, T, st).run()
+        finally:
+            _SS.harness_record = real_hr
+        ok(held and all(h == ("record", True) for h in held),
+           f"T_OWNER_LEAD_LOCK the harness records the lead's provisional answers holding the sign-off lock, so an "
+           f"owner sign that waited on it sees the request closed ({held})")
+        prov = _SS.provisional(d)
+        rep_l = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        span = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep_l else [0, 0]
+        ok(s_l == "completed_scope_declared" and not any(h.get("paused") for h in load_state(d).history)
+           and [(r["finding"], r["decision"], r["plan_changing"], r["review"]) for r in prov]
+           == [("decision_test_changes_plan:DT9", "accept", True, None)]
+           and "Provisional decisions that change the plan" in rep_l[:span[0]]
+           and "## Provisional decisions" in rep_l[span[1]:],
+           f"T_OWNER_LEAD_PROVISIONAL a lead run answers the owner decision provisionally and never blocks; the "
+           f"plan-changing answer heads the report ({s_l}, {prov})")
+        _SS.review(d, "decision_test_changes_plan:DT9", "overturn", note="fix the effect first")
+        ok([r["review"]["decision"] for r in _SS.provisional(d)] == ["overturn"],
+           "T_OWNER_LEAD_REVIEW the owner later overturns (or confirms) a provisional answer; it is recorded")
+        # T_OWNER_LEAD_AMEND (1F, D2): an owner-amendment finding under --signoff lead is answered provisionally too
+        d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041")]}}},
+                           signoff="lead", max_rounds=2)
+        s_a = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
+        led_a = FL.load(d)
+        ok(not s_a.startswith("paused") and led_a["D-041"].status == "owner_accepted"
+           and [r["finding"] for r in _SS.provisional(d)] == ["D-041"]
+           and not _SS.provisional(d)[0]["plan_changing"],
+           f"T_OWNER_LEAD_AMEND an amendment finding under --signoff lead is accepted provisionally, not waited on "
+           f"({s_a}, {led_a['D-041'].status})")
 
         # R3-4 (F6 run 3): a paid task whose allowance is below the floor is not started: the run pauses for the owner
         # (resumable), and a resume with a higher cap continues.
@@ -3158,20 +3416,75 @@ def _self_test() -> int:
         dtf = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT1",
                "claim": "DT1 changes the plan", "scope_declarable": True, "decision_bearing": True}
         g = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        ok(_owner_rule() is None and g["action"] == "RUN_FAILED",
-           f"T30 without the owner rule the finding is not declarable: RUN_FAILED, not DECLARE_SCOPE ({g['action']})")
-        # T30b (Codex round 1 on #98): main #85's rule is now in the checkout, but v2 does not yet
-        # write a fingerprinted request (scope_signoff.record) or take answers through the harness
-        # (harness_record), so AWAIT_OWNER would wait for an answer nobody can give. v2 stays fail
-        # closed until that lifecycle is wired.
+        own = [b for b in list(g.get("unresolved_high") or []) + list(g.get("accept_blockers") or [])
+               if isinstance(b, dict) and b.get("owner_signoff")]
+        ok(OWNER_LIFECYCLE_WIRED and _owner_rule() is not None and g["action"] == "AWAIT_OWNER" and own
+           and (own[0].get("owner_item") or {}).get("fingerprint"),
+           f"T30 (1F) a measured decision test that changes the plan goes to the owner: AWAIT_OWNER with a "
+           f"fingerprinted item ({g['action']})")
+        gn = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="none")
+        ok(gn["action"] == "RUN_FAILED", f"T30b under --signoff none nobody can accept it: not declarable ({gn['action']})")
+        # T_OWNER_ANSWERED (1F): the harness-recorded answer to that item releases it; whose answer counts follows the
+        # run's sign-off mode (a lead's only under --signoff lead, D2)
         import scope_signoff as _ss
-        ok(hasattr(_ss, "gate_findings") and not OWNER_LIFECYCLE_WIRED,
-           "T30b the owner rule is merged, and v2 does not use it until its sign-off lifecycle is wired")
+        _ss.record(dd, g, 2)
+        _ss.sign(dd, "lead", all_decision="accept", note="t")          # not provisional: counts nowhere
+        _ss.harness_record(dd)
+        g_ln = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="lead")
+        _ss.provisional_answers(dd, json.load(open(os.path.join(dd, _ss.REQUEST)))["items"], 2)
+        _ss.harness_record(dd)
+        g_lo = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        g_ll = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="lead")
+        _ss.sign(dd, "owner", all_decision="decline", note="t")
+        _ss.harness_record(dd)
+        g_od = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        ok(g_ln["action"] == "AWAIT_OWNER" and g_lo["action"] == "AWAIT_OWNER" and g_ll["action"] == "DECLARE_SCOPE"
+           and g_od["action"] == "RUN_FAILED"
+           and any(isinstance(u, dict) and u.get("kind") == "scope_declaration_declined"
+                   for u in g_od.get("unresolved_high") or []),
+           f"T_OWNER_ANSWERED a lead's accept counts only under --signoff lead; the owner's decline holds the gate "
+           f"({g_lo['action']}, {g_ll['action']}, {g_od['action']})")
+        # T_OWNER_DECLINE_HOLDS and T_OWNER_LEAD_NONPROV (Codex r2 of #316, P1-2 and P1-3): with a policy-mapped
+        # finding beside the decision test, the owner's decline on it keeps holding the gate once the decision-test
+        # finding clears; and a lead answer that is not provisional never releases it, even in a lead run
+        for f_ in (_ss.SIGNOFF, _ss.LEDGER, _ss.REQUEST, "trace.jsonl"):
+            if os.path.exists(os.path.join(dd, f_)):
+                os.remove(os.path.join(dd, f_))
+        open(os.path.join(dd, "decision_rule.md"), "w").write("rule\n")          # the run allocates
+        alloc = {"kind": "allocation_unstable", "severity": "HIGH", "stage": "OPTIMIZATION",
+                 "key": "allocation_robustness", "claim": "UNSTABLE", "scope_declarable": True}
+        g2 = v2_gate(dd, 2, 2, False, [dict(dtf), dict(alloc)], history=False)
+        _ss.record(dd, g2, 2)
+        its = {i["kind"]: i for i in json.load(open(os.path.join(dd, _ss.REQUEST)))["items"]}
+        both = "decision_test_changes_plan" in its and "allocation_unstable" in its
+        if both:
+            _ss.sign(dd, "owner", {its["decision_test_changes_plan"]["fingerprint"]: "accept",
+                                   its["allocation_unstable"]["fingerprint"]: "decline"}, note="t")
+            _ss.harness_record(dd)
+        g_both = v2_gate(dd, 2, 2, False, [dict(dtf), dict(alloc)], history=False)
+        g_alone = v2_gate(dd, 2, 2, False, [dict(alloc)], history=False)
+        ok(both and g2["action"] == "AWAIT_OWNER" and g_both["action"] == "RUN_FAILED"
+           and g_alone["action"] == "RUN_FAILED",
+           f"T_OWNER_DECLINE_HOLDS the owner's decline of a policy-mapped finding holds the gate when the decision-test "
+           f"finding clears ({g2['action']}, {g_both['action']}, {g_alone['action']}, {sorted(its)})")
+        if both:
+            doc_ = json.load(open(os.path.join(dd, _ss.SIGNOFF)))
+            doc_["answers"][its["allocation_unstable"]["fingerprint"]].update(decision="accept", by="lead")
+            json.dump(doc_, open(os.path.join(dd, _ss.SIGNOFF), "w"))
+            _ss.harness_record(dd)
+        g_np = v2_gate(dd, 2, 2, False, [dict(dtf), dict(alloc)], history=False, signoff="lead")
+        ok(both and g_np["action"] != "DECLARE_SCOPE" and _ss.provisional(dd) == [],
+           f"T_OWNER_LEAD_NONPROV a lead answer that is not provisional does not release a policy-mapped item, even "
+           f"under --signoff lead ({g_np['action']})")
+        os.remove(os.path.join(dd, "decision_rule.md"))
+        for f_ in (_ss.SIGNOFF, _ss.LEDGER, _ss.REQUEST, "trace.jsonl"):
+            if os.path.exists(os.path.join(dd, f_)):
+                os.remove(os.path.join(dd, f_))
         seen = {}
 
         class Rule:
             @staticmethod
-            def gate_findings(rd, rn, viols, non_declarable=None):
+            def gate_findings(rd, rn, viols, non_declarable=None, mode=None, **k):
                 seen["marked"] = [v.get("owner_signoff") for v in viols if v.get("kind") == "decision_test_changes_plan"]
                 return []
         vs = [dict(dtf)]
@@ -3185,6 +3498,19 @@ def _self_test() -> int:
         vs = [dict(dtf)]
         apply_owner_rule(dd, 2, vs, rule=Broken)
         ok(vs[0]["scope_declarable"] is False and not vs[0].get("owner_signoff"), "T32 an owner rule that fails is fail-closed")
+
+        class Declines:
+            @staticmethod
+            def gate_findings(rd, rn, viols, non_declarable=None, mode=None, **k):
+                for v in viols:
+                    v["owner_signoff"] = True
+                return [{"kind": "scope_declaration_declined", "key": "allocation_unstable"}, dict(viols[0])]
+        vs = [{"kind": "allocation_unstable", "severity": "HIGH", "claim": "c"}]
+        got = apply_owner_rule(dd, 2, vs, rule=Declines)
+        ok([f["kind"] for f in got] == ["scope_declaration_declined"] and not vs[0].get("owner_signoff")
+           and apply_owner_rule(dd, 2, [dict(vs[0])], rule=Declines, mode="none") == [],
+           "T32b (Codex r2 of #316) a recorded decline holds the gate without a decision-bearing finding; nothing new "
+           "is put to the owner there")
 
         # T33 (Codex R2-1): the first spec draft is interrupted. On resume the started-but-uncompleted
         # entry is charged its allowance once and the draft runs again under the same key.

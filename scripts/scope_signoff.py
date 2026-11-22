@@ -5,6 +5,8 @@
     python3 scripts/scope_signoff.py status <run_dir>     # none | awaiting | answered
     python3 scripts/scope_signoff.py sign <run_dir> --answers answers.yaml [--note "..."]
     python3 scripts/scope_signoff.py sign <run_dir> --accept-all | --decline-all [--note "..."]
+    python3 scripts/scope_signoff.py provisional <run_dir>   # a lead run's provisional answers and their review
+    python3 scripts/scope_signoff.py review <run_dir> --finding <id> --confirm | --overturn [--note "..."]
     python3 scripts/scope_signoff.py --self-test
 
 E7 attempt 8 scope-declared, by the lead alone, the two findings that most
@@ -39,6 +41,11 @@ How it runs
   under a nonce the harness also writes to trace.jsonl. An answer without that
   record does not count, so a signature an agent wrote is not an approval; no
   script an agent runs is credited with writing it (agents/integrity.py).
+* v2 `--signoff lead` (owner default D2, autonomy 1F): the run never waits for the owner. The
+  harness answers each pending item `accept` as the lead, marked `provisional`
+  (`provisional_answers`), records it like any answer, and the report lists it (heading the report
+  when a decision test shows the plan changes). The owner later confirms or overturns each one
+  (`review`); the lead's answer stays in the record beside the owner's review.
 * `--signoff none`: no sign-off is asked for; the findings are declarable as
   before (the decision test of Phase 49 α still applies).
 * An accepted finding is declarable again (its α decision test is replaced by
@@ -58,6 +65,7 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import threading
 import os
 import re
 import sys
@@ -254,8 +262,81 @@ def build_item(run_dir: str, v: dict, reason: str, entries: list[dict], evidence
             "declarations": decls, "declared": bool(cover), "fingerprint": fp}
 
 
-def _signer_ok(by, mode: Optional[str]) -> bool:
-    return by == "owner" or (by == "lead" and mode == "lead")
+def _signer_ok(by, mode: Optional[str], ans: Optional[dict] = None, provisional_only: bool = False) -> bool:
+    """The owner's answer counts; the lead's only in a lead run and, where `provisional_only` (v2, D2: Codex r2 of
+    #316, P1-3), only a provisional one, which the harness wrote and the report lists."""
+    if by == "owner":
+        return True
+    return by == "lead" and mode == "lead" and (not provisional_only or (ans or {}).get("provisional") is True)
+
+
+LOCK = "scope_signoff.lock"
+
+
+_HELD = threading.local()      # {lock path: depth} held by this thread (the lock nests within one thread)
+
+
+class _Locked:
+    """An exclusive lock on the run's scope sign-off record, held while it is read and rewritten (Codex r2 of #316,
+    P1-4): an owner's answer signed while the harness writes provisional ones is never lost. The lock file is opened
+    with no link followed (lib.safe_io). It nests within one thread (Codex r4 of #316): the harness holds it across
+    its provisional answers, their record and the request's close, and the calls inside take it again."""
+
+    def __init__(self, run_dir: str):
+        self.run_dir = run_dir
+        self.key = os.path.realpath(os.path.join(run_dir, LOCK))
+        self.f = None
+
+    def __enter__(self):
+        held = _HELD.__dict__.setdefault("depth", {})
+        if held.get(self.key):
+            held[self.key] += 1
+            return self
+        import fcntl
+        from lib.safe_io import open_append_nofollow
+        f = open_append_nofollow(self.run_dir, LOCK)
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        except BaseException:
+            f.close()
+            raise
+        self.f = f
+        held[self.key] = 1
+        return self
+
+    def __exit__(self, *exc):
+        held = _HELD.__dict__.setdefault("depth", {})
+        held[self.key] -= 1
+        if held[self.key]:
+            return False
+        del held[self.key]
+        import fcntl
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_UN)
+        finally:
+            self.f.close()
+        return False
+
+
+def locked(run_dir: str) -> _Locked:
+    """The sign-off lock, for the harness (agents/stage_machine.py OWNER_DECISION)."""
+    return _Locked(run_dir)
+
+
+def lock_held(run_dir: str) -> bool:
+    """Whether some holder has the sign-off lock now (a non-blocking probe from a fresh descriptor)."""
+    import fcntl
+    from lib.safe_io import open_append_nofollow
+    f = open_append_nofollow(run_dir, LOCK)
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    finally:
+        f.close()
 
 
 def load_answers(run_dir: str) -> tuple[dict, list[dict]]:
@@ -338,13 +419,17 @@ def harness_record(run_dir: str) -> str:
         led = {}
     nonce = secrets.token_hex(16)
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    seen = _trace_nonces(run_dir)
     for fp, a in answers.items():
-        if not (isinstance(led.get(fp), dict) and led[fp].get("sha256") == _answer_sha(a)):
+        # Codex r1 of #316 (P1): an entry whose nonce trace.jsonl lacks (a record interrupted between its two writes)
+        # is recorded again, so a retry never leaves an answer the gate cannot verify
+        if not (isinstance(led.get(fp), dict) and led[fp].get("sha256") == _answer_sha(a)
+                and led[fp].get("nonce") in seen):
             led[fp] = {"sha256": _answer_sha(a), "nonce": nonce, "by": a.get("by"), "recorded_at": now}
     from lib.safe_io import open_append_nofollow, write_nofollow    # no link followed (review round 4, P1-2)
-    write_nofollow(run_dir, LEDGER, json.dumps({"entries": led, "producer": "main.py"}, indent=1).encode(), atomic=True)
-    with open_append_nofollow(run_dir, TRACE) as f:
+    with open_append_nofollow(run_dir, TRACE) as f:          # the nonce first: a ledger entry never names a lost one
         f.write(json.dumps({"ts": now, "type": "scope_signoff_recorded", "nonce": nonce}) + "\n")
+    write_nofollow(run_dir, LEDGER, json.dumps({"entries": led, "producer": "main.py"}, indent=1).encode(), atomic=True)
     return nonce
 
 
@@ -358,10 +443,13 @@ def lead_answers(run_dir: str) -> Optional[dict]:
 
 
 def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional[list] = None,
-                  non_declarable: Callable[[str, object], bool] = lambda k, e: e is False) -> list[dict]:
+                  non_declarable: Callable[[str, object], bool] = lambda k, e: e is False,
+                  mode: Optional[str] = None, provisional_only: bool = False) -> list[dict]:
     """Mark each decision-bearing HIGH finding of `current` for the owner (in
-    place), and report declined ones. Nothing under --signoff none."""
-    mode = os.environ.get("MA_SIGNOFF_MODE")
+    place), and report declined ones. Nothing under --signoff none. `mode`: the run's
+    sign-off mode (v2 passes it; else MA_SIGNOFF_MODE). `provisional_only` (v2): a lead's
+    answer counts only when it is a provisional one."""
+    mode = os.environ.get("MA_SIGNOFF_MODE") if mode is None else mode
     if mode == "none":
         return []
     cfg = load_map()
@@ -391,7 +479,7 @@ def gate_findings(run_dir: str, round_n: Optional[int] = None, current: Optional
             continue
         seen.add(item["finding"])
         ans = answers.get(item["fingerprint"])
-        if ans and _signer_ok(ans.get("by"), mode):
+        if ans and _signer_ok(ans.get("by"), mode, ans, provisional_only):
             if ans["decision"] == "accept":
                 v["owner_signed"] = {"by": ans.get("by"), "at": ans.get("at"), "fingerprint": item["fingerprint"]}
                 continue
@@ -446,7 +534,8 @@ def _not_applicable_analyses(run_dir: str, entries: list[dict], cfg: dict, ctx: 
     return out
 
 
-def record(run_dir: str, decision: dict, round_n: Optional[int] = None) -> Optional[str]:
+def record(run_dir: str, decision: dict, round_n: Optional[int] = None,
+           producer: str = "scripts/validate_critique_yaml.py") -> Optional[str]:
     """Write the request when the decision waits for the owner; mark an older
     pending request superseded otherwise. Returns the path written, if any."""
     p = os.path.join(run_dir, REQUEST)
@@ -458,16 +547,22 @@ def record(run_dir: str, decision: dict, round_n: Optional[int] = None) -> Optio
             seen.add(it.get("fingerprint"))
             items.append(it)
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    if decision.get("action") == ACTION and items:
-        doc = {"pending": True, "round": round_n, "requested_at": now, "items": items,
-               "decision_rationale": decision.get("rationale"), "producer": "scripts/validate_critique_yaml.py"}
-    else:
-        old = _load_request(run_dir)
-        if not old or not old.get("pending"):
-            return None
-        doc = dict(old, pending=False, superseded_at=now, superseded_by=decision.get("action"))
     from lib.safe_io import write_nofollow    # atomic, no link followed (review round 4, P1-2)
-    write_nofollow(run_dir, REQUEST, json.dumps(doc, indent=1).encode(), atomic=True)
+    # Codex r3/r4 of #316: the request is read and written under the sign-off lock, so a sign in progress finishes
+    # first, and a close supersedes the request that is current then; a record for an earlier round than the pending
+    # request's (a delayed call) never closes it
+    with _Locked(run_dir):
+        if decision.get("action") == ACTION and items:
+            doc = {"pending": True, "round": round_n, "requested_at": now, "items": items,
+                   "decision_rationale": decision.get("rationale"), "producer": producer}
+        else:
+            old = _load_request(run_dir)
+            if not old or not old.get("pending"):
+                return None
+            if isinstance(round_n, int) and isinstance(old.get("round"), int) and old["round"] > round_n:
+                return None
+            doc = dict(old, pending=False, superseded_at=now, superseded_by=decision.get("action"))
+        write_nofollow(run_dir, REQUEST, json.dumps(doc, indent=1).encode(), atomic=True)
     return p
 
 
@@ -528,7 +623,19 @@ def render_md(run_dir: str) -> str:
             lines += [f"Required remedy: {it['fix_requires']}", ""]
         if it.get("options"):            # W0-F: a held-out target's options, a refit with its estimated cost
             lines += ["Options:", ""] + [f"- {o}" for o in it["options"]] + [""]
-        if not it.get("declarations"):
+        conf = it.get("conflict") if isinstance(it.get("conflict"), dict) else None
+        if conf is not None:             # W0-F (Codex r4 of #316): the held-out target's tests and their verdicts
+            st_ = conf.get("status")
+            ch = {"CHANGES_PLAN": "**yes**", "NO_CHANGE": "no"}.get(st_, "**unknown (a test did not run)**"
+                                                                    if st_ == "NOT_RUN" else "**unknown (no readable "
+                                                                    "conflict record)**")
+            vs = conf.get("verdicts") if isinstance(conf.get("verdicts"), dict) else {}
+            lines += [f"Evidence-conflict decision tests: {', '.join(f'{k}: {v}' for k, v in vs.items()) or 'none'}; "
+                      f"changes the plan: {ch}.", ""]
+        elif it.get("kind") == "evidence_conflict_declared":    # a request written before the verdict was carried
+            lines += ["Evidence-conflict decision tests: see analysis/conflicts.yaml (this request predates their "
+                      "verdicts in it); the owner is asked only when a test changes the plan or could not run.", ""]
+        elif not it.get("declarations"):
             lines += ["Not declared in scope_declaration.yaml, and **untested**.", ""]
         for dcl in it.get("declarations") or []:
             lines += [f"- Declaration {dcl.get('id')}: {_test_md(dcl.get('test') or {})}"]
@@ -550,6 +657,22 @@ def sign(run_dir: str, by: str, answers: Optional[dict] = None, all_decision: Op
     req = _load_request(run_dir)
     if not req or not req.get("pending") or not req.get("items"):
         raise ValueError("no scope declaration is waiting for sign-off")
+    with _Locked(run_dir):
+        # Codex r3 of #316 (P1-6): the request is read again once the lock is held. One closed or replaced while this
+        # call waited (record holds the same lock) is refused: an answer to it would be reported signed and never applied
+        now_req = _load_request(run_dir)
+        if not now_req or not now_req.get("pending") or not now_req.get("items"):
+            raise ValueError("the scope declaration request closed while this sign-off waited; nothing was signed "
+                             "(scripts/scope_signoff.py status shows the current state)")
+        if [i.get("fingerprint") for i in now_req["items"]] != [i.get("fingerprint") for i in req["items"]] \
+                or now_req.get("round") != req.get("round"):
+            raise ValueError("the scope declaration request changed while this sign-off waited; nothing was signed: "
+                             "read it again (scripts/scope_signoff.py show) and sign the new request")
+        return _sign_locked(run_dir, now_req, by, answers, all_decision, note)
+
+
+def _sign_locked(run_dir: str, req: dict, by: str, answers: Optional[dict], all_decision: Optional[str],
+                 note: str) -> dict:
     prior, bad = load_answers(run_dir)
     if bad:
         prior = {}
@@ -569,14 +692,94 @@ def sign(run_dir: str, by: str, answers: Optional[dict] = None, all_decision: Op
                                   "round": req.get("round")}
     if missing:
         raise ValueError("no accept/decline answer for " + ", ".join(missing))
-    doc = {"answers": {**prior, **new}, "last_signed_by": by, "last_signed_at": now,
-           "producer": "scripts/scope_signoff.py"}
+    doc = {**_raw_doc(run_dir), "answers": {**prior, **new}, "last_signed_by": by, "last_signed_at": now,
+           "producer": "scripts/scope_signoff.py"}      # the owner's reviews of provisional answers are kept
     from lib.safe_io import LinkRefused, write_nofollow
     try:          # never through a link; published atomically (run console review round 2, P1-2)
         write_nofollow(run_dir, SIGNOFF, json.dumps(doc, indent=1).encode(), atomic=True)
     except (LinkRefused, OSError) as e:
         raise ValueError(f"{SIGNOFF} not written: {e}") from None
     return {"signed_by": by, "signed_at": now, "answers": new}
+
+
+def _raw_doc(run_dir: str) -> dict:
+    """scope_signoff.json as a mapping, {} when absent or unreadable (its answers are checked by load_answers)."""
+    try:
+        with open(os.path.join(run_dir, SIGNOFF), encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def provisional_answers(run_dir: str, items: list[dict], round_n: Optional[int] = None,
+                        plan_changing: Optional[dict] = None) -> dict:
+    """D2 (v2 `--signoff lead`): the harness answers each item `accept` as the lead, provisionally: the run goes on
+    with the finding declared, and the owner confirms or overturns the answer later (`review`). Only the harness calls
+    it, at OWNER_DECISION, and records the answers as it records the owner's (harness_record). An owner's answer
+    already given is kept. `plan_changing` {fingerprint: bool}: a decision test shows the plan changes. An unreadable
+    record raises ValueError (Codex r1 of #316, P1): it is never overwritten, so no owner answer in it is lost. The
+    record is read and written under the sign-off lock (Codex r2 of #316, P1-4)."""
+    with _Locked(run_dir):
+        return _provisional_locked(run_dir, items, round_n, plan_changing)
+
+
+def _provisional_locked(run_dir: str, items: list[dict], round_n: Optional[int], plan_changing: Optional[dict]) -> dict:
+    prior, bad = load_answers(run_dir)
+    if bad:
+        raise ValueError(bad[0]["claim"])
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    new = {}
+    for it in items:
+        fp = it.get("fingerprint")
+        if not fp or (prior.get(fp) or {}).get("by") == "owner":
+            continue
+        new[fp] = {"finding": it.get("finding"), "decision": "accept", "by": "lead", "provisional": True,
+                   "plan_changing": bool((plan_changing or {}).get(fp)), "kind": it.get("kind"), "at": now,
+                   "round": round_n, "note": "provisional lead answer (--signoff lead, owner default D2): the run "
+                                             "continues with the finding declared; the owner confirms or overturns it"}
+    raw = _raw_doc(run_dir)           # Codex r2 of #316: an owner answer that arrived since `prior` is kept
+    cur = raw.get("answers") if isinstance(raw.get("answers"), dict) else {}
+    new = {fp: a for fp, a in new.items() if (cur.get(fp) or {}).get("by") != "owner"}
+    doc = {**raw, "answers": {**prior, **cur, **new}, "last_signed_by": "lead", "last_signed_at": now,
+           "producer": "agents/stage_machine.py OWNER_DECISION (provisional lead answers)"}
+    from lib.safe_io import write_nofollow
+    write_nofollow(run_dir, SIGNOFF, json.dumps(doc, indent=1).encode(), atomic=True)
+    return new
+
+
+def provisional(run_dir: str) -> list[dict]:
+    """The lead's provisional answers the harness recorded (verified_answers), each with the owner's review (None:
+    not reviewed yet), in the order given."""
+    answers, bad = verified_answers(run_dir)
+    if bad:                 # Codex r2 of #316: an unreadable record is reported, never an empty list
+        raise ValueError(bad[0]["claim"])
+    reviews = _raw_doc(run_dir).get("reviews")
+    reviews = reviews if isinstance(reviews, dict) else {}
+    rows = [dict(a, fingerprint=fp, review=reviews.get(fp) if isinstance(reviews.get(fp), dict) else None)
+            for fp, a in answers.items() if a.get("by") == "lead" and a.get("provisional") is True]
+    return sorted(rows, key=lambda r: (str(r.get("at")), str(r.get("finding"))))
+
+
+def review(run_dir: str, finding: str, decision: str, note: str = "") -> dict:
+    """The owner's review of a provisional lead answer: `confirm` or `overturn`, recorded beside it (the lead's answer
+    stays as it was given). The run that made it may have finished; an overturned answer takes effect in a relaunch
+    with reuse, where the owner answers the item themselves."""
+    if decision not in ("confirm", "overturn"):
+        raise ValueError("review needs confirm or overturn")
+    with _Locked(run_dir):
+        rows = [r for r in provisional(run_dir) if str(r.get("finding")) == str(finding)]
+        if not rows:
+            raise ValueError(f"no provisional lead answer for {finding!r} (scripts/scope_signoff.py provisional lists "
+                             "them)")
+        doc = _raw_doc(run_dir)
+        rev = doc.get("reviews") if isinstance(doc.get("reviews"), dict) else {}
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        # the latest answer for the finding (Codex r1 of #316): a review never rewrites one given to an earlier revision
+        rev[rows[-1]["fingerprint"]] = {"decision": decision, "by": "owner", "at": now, "note": note}
+        from lib.safe_io import write_nofollow
+        write_nofollow(run_dir, SIGNOFF, json.dumps(dict(doc, reviews=rev), indent=1).encode(), atomic=True)
+        return rev
 
 
 def answer_text(run_dir: str) -> str:
@@ -829,6 +1032,210 @@ def _self_test() -> int:
         except (ValueError, OSError):
             pass
         ok(open(victim).read() == "untouched", "SO23 scope_signoff.json is not written through a link")
+    # SO31-SO33 (1F, D2): under --signoff lead the harness records the lead's provisional answers; the owner later
+    # confirms or overturns each; an owner's later sign-off keeps those reviews
+    with tempfile.TemporaryDirectory() as d:
+        items = [{"finding": "f1", "fingerprint": "fp1", "kind": "k"}, {"finding": "f2", "fingerprint": "fp2"}]
+        json.dump({"pending": True, "round": 2, "items": items}, open(os.path.join(d, REQUEST), "w"))
+        provisional_answers(d, items, 2, plan_changing={"fp1": True})
+        before = provisional(d)
+        harness_record(d)
+        rows = provisional(d)
+        ok(before == [] and [(r["finding"], r["decision"], r["by"], r["plan_changing"]) for r in rows]
+           == [("f1", "accept", "lead", True), ("f2", "accept", "lead", False)],
+           f"SO31 provisional answers are the lead's accepts, listed once the harness recorded them ({rows})")
+        import secrets as _sec
+        led0 = json.load(open(os.path.join(d, LEDGER)))
+        for e in led0["entries"].values():
+            e["nonce"] = _sec.token_hex(16)              # recorded, but its trace line was lost
+        json.dump(led0, open(os.path.join(d, LEDGER), "w"))
+        lost = provisional(d)
+        harness_record(d)
+        ok(lost == [] and len(provisional(d)) == 2,
+           "SO34 an answer whose trace line was lost is recorded again on retry (Codex r1 of #316)")
+        open(os.path.join(d, SIGNOFF), "a").write("garbage")
+        try:
+            provisional_answers(d, items, 2)
+            ok(False, "SO35 an unreadable record is never overwritten by provisional answers")
+        except ValueError:
+            ok(True, "SO35 an unreadable record is never overwritten by provisional answers")
+        doc0 = open(os.path.join(d, SIGNOFF)).read()
+        open(os.path.join(d, SIGNOFF), "w").write(doc0[:-len("garbage")])
+        review(d, "f1", "confirm", note="ok")
+        try:
+            review(d, "f9", "overturn")
+            ok(False, "SO32 a review of a finding with no provisional answer is refused")
+        except ValueError:
+            ok(True, "SO32 a review of a finding with no provisional answer is refused")
+        rows = provisional(d)
+        sign(d, "owner", {"f1": "accept", "f2": "decline"})
+        doc = json.load(open(os.path.join(d, SIGNOFF)))
+        ok([(r["finding"], (r["review"] or {}).get("decision")) for r in rows] == [("f1", "confirm"), ("f2", None)]
+           and doc["answers"]["fp2"]["by"] == "owner" and doc["reviews"]["fp1"]["decision"] == "confirm",
+           f"SO33 the owner's review is recorded; a later owner answer replaces the lead's and keeps the reviews ({rows})")
+    # SO36 (Codex r2 of #316, P1-3): where only provisional lead answers count (v2), a recorded lead answer that is
+    # not provisional does not release an owner item, even in a lead run
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "decision_rule.md"), "w").write("rule\n")
+        c = [cur()[0]]
+        gate_findings(d, 6, c, mode="lead")
+        fp = (c[0].get("owner_item") or {}).get("fingerprint")
+        json.dump({"answers": {fp: {"finding": c[0]["owner_item"]["finding"], "decision": "accept", "by": "lead"}}},
+                  open(os.path.join(d, SIGNOFF), "w"))
+        harness_record(d)
+        c_v1, c_v2 = [cur()[0]], [cur()[0]]
+        gate_findings(d, 6, c_v1, mode="lead")
+        try:
+            gate_findings(d, 6, c_v2, mode="lead", provisional_only=True)
+        except TypeError as e:
+            c_v2 = [{"error": str(e)}]
+        ok(bool(fp) and c_v1[0].get("owner_signed") and not c_v2[0].get("owner_signed")
+           and c_v2[0].get("owner_signoff"),
+           f"SO36 a non-provisional lead answer releases nothing where only provisional ones count ({c_v2[0]})")
+    # SO37 (Codex r2 of #316, P1-4; tightened after Codex r3): an owner's answer signed while the harness writes
+    # provisional answers is never lost: the record is read and written under one lock. The owner signs in the window
+    # after the provisional writer's last read (_raw_doc) and before it publishes; the same race with the lock replaced
+    # by a no-op loses the answer, so the test detects a missing lock.
+    import threading
+    import time as _time
+
+    class _NoLock:
+        def __init__(self, rd):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *e):
+            return False
+
+    def _race(lock_cls):
+        with tempfile.TemporaryDirectory() as d:
+            items = [{"finding": "f1", "fingerprint": "fp1", "kind": "k"}]
+            json.dump({"pending": True, "round": 2, "items": items}, open(os.path.join(d, REQUEST), "w"))
+            real_raw, real_lock = globals()["_raw_doc"], globals()["_Locked"]
+            th, me = [], threading.get_ident()
+
+            def racing_raw(rd):
+                out = real_raw(rd)
+                if not th and threading.get_ident() == me:      # the provisional writer's last read
+                    t = threading.Thread(target=lambda: sign(d, "owner", {"f1": "decline"}, note="owner, concurrently"))
+                    th.append(t)
+                    t.start()
+                    _time.sleep(0.5)
+                return out
+            globals()["_raw_doc"], globals()["_Locked"] = racing_raw, lock_cls
+            try:
+                provisional_answers(d, items, 2)
+            finally:
+                globals()["_raw_doc"], globals()["_Locked"] = real_raw, real_lock
+            for t in th:
+                t.join(10)
+            return bool(th), (json.load(open(os.path.join(d, SIGNOFF))).get("answers") or {}).get("fp1") or {}
+    raced, a = _race(_Locked)
+    raced_nl, a_nl = _race(_NoLock)
+    ok(raced and a.get("by") == "owner" and a.get("decision") == "decline"
+       and raced_nl and a_nl.get("by") == "lead",
+       f"SO37 an owner answer signed after the provisional writer's last read is kept ({a.get('by')}, "
+       f"{a.get('decision')}); without the lock it is lost ({a_nl.get('by')})")
+    # SO38 (Codex r3 of #316, P1-6; tightened after Codex r4): a sign waiting on the lock re-checks the request once
+    # it holds it: a request closed meanwhile is refused (the CLI exits non-zero) and no answer is written. The request
+    # is closed only after the signer has read it pending (signalled), so the refusal comes from the locked re-read.
+    with tempfile.TemporaryDirectory() as d:
+        items = [{"finding": "f1", "fingerprint": "fp1", "kind": "k"}]
+        json.dump({"pending": True, "round": 2, "items": items}, open(os.path.join(d, REQUEST), "w"))
+        rc, env_mode = [], os.environ.pop("MA_SIGNOFF_MODE", None)
+        read_pending = threading.Event()
+        real_req, me = globals()["_load_request"], threading.get_ident()
+
+        def signalling_req(rd):
+            out = real_req(rd)
+            if threading.get_ident() != me and (out or {}).get("pending"):
+                read_pending.set()
+            return out
+        globals()["_load_request"] = signalling_req
+        try:
+            with _Locked(d):
+                t = threading.Thread(target=lambda: rc.append(main(["sign", d, "--by", "owner", "--decline-all"])))
+                t.start()
+                signalled = read_pending.wait(10)
+                json.dump({"pending": False, "round": 2, "items": items, "superseded_by": "ACCEPT"},
+                          open(os.path.join(d, REQUEST), "w"))
+            t.join(10)
+        finally:
+            globals()["_load_request"] = real_req
+            if env_mode is not None:
+                os.environ["MA_SIGNOFF_MODE"] = env_mode
+        ok(signalled and rc == [1] and not os.path.exists(os.path.join(d, SIGNOFF)),
+           f"SO38 a sign that waited on the lock refuses a request closed meanwhile, exit non-zero ({signalled}, {rc}, "
+           f"written: {os.path.exists(os.path.join(d, SIGNOFF))})")
+    # SO39 (Codex r4 of #316): the lock nests within one thread (the harness holds it across its provisional answers,
+    # their record and the request's close), and blocks another holder meanwhile
+    def _bounded(fn, secs=10):
+        """Run fn in a daemon thread; a deadlock reports as a failure instead of hanging the self-test."""
+        out = []
+
+        def run():
+            try:
+                out.append(fn())
+            except Exception as e:  # noqa: BLE001
+                out.append(f"{type(e).__name__}: {e}")
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(secs)
+        return out[0] if out else "timed out (deadlock)"
+
+    with tempfile.TemporaryDirectory() as d:
+        def nest():
+            with _Locked(d):
+                with _Locked(d):
+                    inner = lock_held(d)
+                still = lock_held(d)
+            return inner, still, lock_held(d)
+        got = _bounded(nest)
+        ok(got == (True, True, False),
+           f"SO39 the sign-off lock nests in one thread and is held until the outer release ({got})")
+    # SO40 (Codex r4 of #316, P1-2): a delayed record for an earlier round never closes a newer pending request
+    with tempfile.TemporaryDirectory() as d:
+        it_a = {"finding": "fa", "fingerprint": "fpa", "kind": "k"}
+        it_b = {"finding": "fb", "fingerprint": "fpb", "kind": "k"}
+        json.dump({"pending": True, "round": 1, "items": [it_a]}, open(os.path.join(d, REQUEST), "w"))
+        def delayed():
+            with _Locked(d):
+                t = threading.Thread(target=lambda: record(d, {"action": "ACCEPT"}, 1), daemon=True)
+                t.start()
+                _time.sleep(0.3)
+                record(d, {"action": ACTION, "unresolved_high": [{"owner_signoff": True, "owner_item": it_b}]}, 2)
+            t.join(10)
+            return json.load(open(os.path.join(d, REQUEST)))
+        req_ = _bounded(delayed)
+        req_ = req_ if isinstance(req_, dict) else {"error": req_}
+        ok(req_.get("pending") is True and [i.get("fingerprint") for i in req_.get("items") or []] == ["fpb"],
+           f"SO40 a delayed record for round 1 leaves round 2's pending request in place ({req_})")
+    # SO41 (Codex r4 of #316): an evidence-conflict item shows the owner its tests' verdicts, not "untested"
+    with tempfile.TemporaryDirectory() as d:
+        conf = {"status": "CHANGES_PLAN", "changes_plan": True, "tests": ["conflict_1_g_1_lo"],
+                "verdicts": {"conflict_1_g_1_lo": "CHANGES_PLAN"}}
+        json.dump({"pending": True, "round": 2, "items": [
+            {"finding": "evidence_conflict_declared:g|1", "kind": "evidence_conflict_declared", "fingerprint": "fpc",
+             "claim": "c", "reason": "r", "declarations": [], "declared": False, "conflict": conf},
+            {"finding": "evidence_conflict_declared:h|2", "kind": "evidence_conflict_declared", "fingerprint": "fpn",
+             "claim": "c", "reason": "r", "declarations": [], "declared": False,
+             "conflict": dict(conf, status="NOT_RUN", verdicts={"t2": "NOT_RUN"})}]}, open(os.path.join(d, REQUEST), "w"))
+        md = render_md(d)
+        sec1, sec2 = md.split("## 2.")[0], md.split("## 2.")[1] if "## 2." in md else ""
+        ok("untested" not in md and "conflict_1_g_1_lo: CHANGES_PLAN" in sec1 and "changes the plan: **yes**" in sec1
+           and "unknown (a test did not run)" in sec2,
+           f"SO41 an evidence-conflict item shows its tests' verdicts, not 'untested' ({md[:600]!r})")
+    # SO42 (Codex r5 of #316): a conflict item from a request written before the verdict was carried (a resumed run)
+    # is not called "untested": the page points to the conflict record
+    with tempfile.TemporaryDirectory() as d:
+        json.dump({"pending": True, "round": 2, "items": [
+            {"finding": "evidence_conflict_declared:g|1", "kind": "evidence_conflict_declared", "fingerprint": "fpc",
+             "claim": "c", "reason": "r", "declarations": [], "declared": False}]}, open(os.path.join(d, REQUEST), "w"))
+        md = render_md(d)
+        ok("untested" not in md and "analysis/conflicts.yaml" in md,
+           f"SO42 an older conflict item without its verdict points to the conflict record, not 'untested' ({md[-700:]!r})")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1
@@ -839,13 +1246,16 @@ def _self_test() -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
-    ap.add_argument("cmd", nargs="?", choices=["show", "status", "sign"])
+    ap.add_argument("cmd", nargs="?", choices=["show", "status", "sign", "provisional", "review"])
     ap.add_argument("run_dir", nargs="?")
     ap.add_argument("--by", default=None, choices=["owner"])
     ap.add_argument("--answers", help="YAML mapping finding -> accept|decline (or {decision, note})")
     ap.add_argument("--accept-all", action="store_true")
     ap.add_argument("--decline-all", action="store_true")
     ap.add_argument("--note", default="")
+    ap.add_argument("--finding", help="review: the provisional answer's finding")
+    ap.add_argument("--confirm", action="store_true")
+    ap.add_argument("--overturn", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -859,12 +1269,28 @@ def main(argv=None) -> int:
     if a.cmd == "status":
         print(status(a.run_dir))
         return 0
+    if a.cmd == "provisional":
+        for r in provisional(a.run_dir) or [{}]:
+            print(f"{r['finding']}: {r['decision']} by the lead, provisional; plan changes: {r.get('plan_changing')}; "
+                  f"owner review: {(r.get('review') or {}).get('decision', 'not yet')}" if r else "none")
+        return 0
     if os.environ.get("MA_SIGNOFF_MODE"):
         # Set only in the agents' environment (main.py): the owner signs from a shell of their own.
         # Under --signoff lead the lead writes scope_signoff_answers.yaml and the harness signs.
         print("Agents cannot sign scope declarations. Owner: sign from your own shell. Lead (--signoff lead): "
               f"write {LEAD_ANSWERS} and end your turn with AWAITING_SIGNOFF.", file=sys.stderr)
         return 1
+    if a.cmd == "review":
+        if not a.finding or a.confirm == a.overturn:
+            ap.error("review needs --finding and one of --confirm / --overturn")
+        try:
+            review(a.run_dir, a.finding, "confirm" if a.confirm else "overturn", a.note)
+        except (ValueError, OSError) as e:
+            print(f"Not recorded: {e}", file=sys.stderr)
+            return 1
+        print(f"Recorded the owner's {'confirmation' if a.confirm else 'overturn'} of {a.finding}."
+              + ("" if a.confirm else " It takes effect in a relaunch with reuse, where you answer the item yourself."))
+        return 0
     if a.by is None:
         ap.error("sign needs --by owner")
     try:
