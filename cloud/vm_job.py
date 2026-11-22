@@ -626,6 +626,8 @@ def cmd_start(a, cluster=None):
                    shutdown_always=getattr(a, "shutdown_always", False), workers=[w], allow_other_workers=False,
                    pure=False, key=f"job-{a.job_id}-{int(time.time())}")
     fire_and_forget(fut)
+    if cluster is None:                 # interactive start returns at once: hold the client until the job runs
+        _await_claim(_runner(c, w), a.job_id)   # (`run` polls the job itself)
     dest = getattr(a, "dest", None) or local_dir(a.name, a.job_id, a.out)
     os.makedirs(dest, exist_ok=True)
     lrec = write_launch_record(dest, a.job_id, code, pipeline, _launch_commit(code, a.tree, a.dir), base)
@@ -640,6 +642,22 @@ def cmd_start(a, cluster=None):
             if a.shutdown_when_stored else "")
     print(f"started {a.job_id} on {a.name} ({w}); pipeline {lrec['pipeline']} @ {lrec['commit']}; "
           f"outputs -> {dest}{tail}")
+
+
+def _await_claim(run, job_id, timeout_s=600, every_s=5, clock=time.monotonic, sleep=time.sleep):
+    """Wait until the submitted job has claimed its id (W0-J smoke, 2026-11-22: `start` returned right after
+    fire_and_forget, the client closed before the 5 MB task reached the scheduler, and the job stayed 'queued' with
+    nothing running). Returns the job's state; an answer that is not a state record (a test fake) returns None."""
+    end = clock() + timeout_s
+    while True:
+        st = run(ws.job_state, job_id)
+        if not isinstance(st, dict) or not isinstance(st.get("state"), dict):
+            return None
+        if st["state"].get("state") != "queued":
+            return st["state"].get("state")
+        if clock() >= end:
+            raise SystemExit(f"{job_id}: still queued after {timeout_s}s: the submission did not reach the worker")
+        sleep(every_s)
 
 
 def _print(st, dest):
@@ -1454,6 +1472,20 @@ def _self_test_storage_account(ok) -> None:
        "SA7 (Codex r1) `run` refuses a bad storage account value before it creates a cluster")
     ok("secret_env(" in src and src.index("secret_env(") < src.index("_create("),
        "VS4 (Codex r1 of W0-J) `run` refuses a bad --secret-env before it creates a cluster")
+    # VS5 (W0-J smoke, 2026-11-22: `start` exited right after fire_and_forget, the 5 MB task never reached the
+    # scheduler and the job stayed queued): `start` waits until the job has claimed its id, and says so if it never does
+    seq = iter(["queued", "queued", "running"])
+    t = [0.0]
+    got = globals().get("_await_claim") and _await_claim(lambda fn, j: {"state": {"state": next(seq)}}, "j", timeout_s=60,
+                                                 every_s=5, clock=lambda: t[0], sleep=lambda s: t.__setitem__(0, t[0] + s))
+    ok(got == "running" and t[0] == 10.0, f"VS5 start waits until the job leaves 'queued' ({got}, {t})")
+    try:
+        globals().get("_await_claim") and _await_claim(lambda fn, j: {"state": {"state": "queued"}}, "j", timeout_s=20,
+                                               every_s=5, clock=lambda: t[0], sleep=lambda s: t.__setitem__(0, t[0] + s))
+        ok(False, "VS5b a job that never leaves 'queued' fails `start`")
+    except SystemExit as e:
+        ok("queued" in str(e), f"VS5b a job that never leaves 'queued' fails `start` ({e})")
+    ok("_await_claim(" in inspect.getsource(cmd_start), "VS5c cmd_start calls it after fire_and_forget")
 
     # SA8 (Codex r1): the submitted task, run as the worker runs it with no storage variable of its own, gives the
     # job's process $MA_STORAGE_ACCOUNT and uploads and reads back with the launcher's account.
