@@ -666,6 +666,16 @@ def _self_test() -> int:
         fp = R["uncertainty"]["fixed_plan"]["dalys"]
         ok(fp["ci_low"] <= fp["median"] <= fp["ci_high"] and "not covered" in R["uncertainty"]["label"],
            f"R5 the interval is computed and labelled with what it covers ({R['uncertainty']['label']})")
+        # hb1 fix 11 (L): uncertainty_report.yaml and analysis/uncertainty.yaml use one estimator for the same draws
+        # (an even number of draws here, where the order statistics and numpy's interpolation differ)
+        rep_ = (yaml.safe_load(open(os.path.join(d, "uncertainty_report.yaml"))) or {}).get("scalar_outputs") or {}
+        hd_ = spec["deliverable"]["headline"]
+        pairs_ = [(rep_.get(hd_["name"]) or {}, R["uncertainty"]["fixed_plan"][hd_["outcome"]])] + [
+            (rep_.get(f"{o}_averted") or {}, R["uncertainty"]["fixed_plan"][o]) for o in R["uncertainty"]["fixed_plan"]]
+        ok(R["uncertainty"]["draws"] % 2 == 0
+           and all(a.get(k) == b[k] for a, b in pairs_ for k in ("mean", "median", "ci_low", "ci_high")),
+           f"R5L the uncertainty report gives the same mean, median and interval as uncertainty.yaml "
+           f"({[(a.get('median'), b['median']) for a, b in pairs_]})")
         af = R["uncertainty"].get("affordability") or {}
         ok(af.get("draws") == R["uncertainty"]["draws"] and 0.0 <= af.get("share_over_budget", -1) <= 1.0
            and (af.get("fixed_plan_cost") or {}).get("median") is not None

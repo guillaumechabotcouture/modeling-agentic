@@ -646,6 +646,15 @@ def _run_self_test() -> int:
     a80 = summarise_outputs(outs, {}, 200, level=0.80)["scalar_outputs"]["y"]
     ok((a95["ci_low"], a95["ci_high"]) == (5.0, 195.0) and (a80["ci_low"], a80["ci_high"]) == (20.0, 180.0),
        f"UQ-L1 summarise_outputs honours the interval level: {a95['ci_low'], a95['ci_high'], a80['ci_low'], a80['ci_high']}")
+    # hb1 fix 11 (L): a caller with its own estimator passes it, so its two files agree; without one, nothing changes
+    est = lambda v, level: {"mean": -1.0, "median": -2.0, "ci_low": -3.0, "ci_high": -4.0}  # noqa: E731
+    try:
+        ae = summarise_outputs(outs, {}, 200, level=0.80, summary=est)["scalar_outputs"]["y"]
+    except TypeError as e:
+        ae = {"error": str(e)}
+    ok([ae.get(k) for k in ("mean", "median", "ci_low", "ci_high")] == [-1.0, -2.0, -3.0, -4.0] and ae.get("n") == 200
+       and a95["median"] == 100.0, f"UQ-L2 summarise_outputs takes the caller's estimator (summary=); the order "
+                                   f"statistics stay the default ({ae}, default median {a95['median']})")
 
     with tempfile.TemporaryDirectory() as run_dir:
         os.makedirs(os.path.join(run_dir, "models"))
