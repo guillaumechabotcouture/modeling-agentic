@@ -688,6 +688,8 @@ def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
 
 # ---- provenance of inputs
 _INPUT_EXT = (".csv", ".tsv", ".json", ".yaml", ".yml", ".txt", ".xlsx", ".parquet")
+_TRAILING_PUNCT = ".,;:!?)]}>\"'`"
+_LEADING_PUNCT = "([{<\"'`"
 PROVENANCE = "data/inputs_provenance.json"
 
 
@@ -715,7 +717,9 @@ def _question_paths(question: str) -> list[str]:
     import re
     q = question or ""
     toks = re.findall(r"[`\"']([^`\"'\n]+)[`\"']", q) + re.findall(r"[A-Za-z0-9_./-]+", q)
-    return [t.strip().strip("./") for t in toks if t.strip().lower().endswith(_INPUT_EXT)]
+    # Sentence punctuation comes off before the extension test: "... yields.csv." ends a sentence.
+    toks = [t.strip().rstrip(_TRAILING_PUNCT).lstrip(_LEADING_PUNCT).strip() for t in toks]
+    return [t.strip("./") for t in toks if t.lower().endswith(_INPUT_EXT)]
 
 
 def _safe_dest(run_dir: str, rel: str) -> str:
@@ -3684,6 +3688,20 @@ def _self_test() -> int:
         prov = json.load(open(os.path.join(fp, "data", "inputs_provenance.json")))
         ok(any("../outside/targets.csv" in x and "outside the run" in x for x in probs) and "data/inputs/requirements.txt" in prov["cited"],
            f"T41b cited inputs are recorded with their sha256; one outside the run is refused ({probs})")
+
+        # T41c: a path at the end of a sentence or clause keeps its input (trailing punctuation is
+        # stripped before the extension test, for bare, quoted and parenthesised paths).
+        qp = _question_paths('Use data/a/one.csv. Also data/b/two.csv, data/c/three.json; '
+                             '(data/d/four.yaml) "data/e/five.tsv." \'data/f/six.txt,\' `data/g/seven.csv;` '
+                             'and "./data/h/eight.csv").')
+        ok(all(x in qp for x in ("data/a/one.csv", "data/b/two.csv", "data/c/three.json", "data/d/four.yaml",
+                                 "data/e/five.tsv", "data/f/six.txt", "data/g/seven.csv", "data/h/eight.csv"))
+           and not any(x.endswith((".", ",", ";", ")", '"', "'", "`")) for x in qp),
+           f"T41c paths ending in . , ; ) or quotes are kept, punctuation stripped ({qp})")
+        fpp = os.path.join(td, "prov_punct")
+        os.makedirs(fpp)
+        staged = stage_inputs(fpp, "The pins are in requirements.txt.")
+        ok(staged == ["data/inputs/requirements.txt"], f"T41c a file named at the end of a sentence is staged ({staged})")
 
         # T42: through the machine. A MEDIUM with a runnable test goes to the fix loop (rule 4m) and
         # is fixed before ACCEPT; one that cannot be fixed, with no rounds left, is declared (3m) and
