@@ -2065,16 +2065,35 @@ _TRAILING_PUNCT = ".,;:!?)]}>\"'`"
 _LEADING_PUNCT = "([{<\"'`"
 
 
+def _token_path(tok: str) -> str | None:
+    """One token as a data file path, or None: kept as written when it ends in a data extension, else with its
+    sentence punctuation and quotes stripped first; a bare extension (".csv" as a word) is no path."""
+    t = tok.strip()
+    if not t.lower().endswith(_PATH_EXT):
+        t = t.rstrip(_TRAILING_PUNCT).lstrip(_LEADING_PUNCT).strip()
+    if not t.lower().endswith(_PATH_EXT) or os.path.basename(t).lower() in _PATH_EXT:
+        return None
+    return t
+
+
 def path_tokens(v: str, run_dir: str) -> list[str]:
-    """The file paths a spec string names. A string with no whitespace, or one naming an existing file as a whole
-    (a path with spaces), is one path. Prose (a `source:` naming a file, its provenance and a derived copy) yields
-    each whitespace-separated token that ends in a data extension once its sentence punctuation is stripped, so
-    each is checked on its own and a missing one is named."""
+    """The file paths a spec string names, each once. A string ending in a data extension that has no whitespace,
+    or names an existing run file as a whole (a path with spaces), is one path. Otherwise (prose: a `source:`
+    naming a file, its provenance and a derived copy) a quoted or backticked name is one path, spaces included, and
+    each other whitespace-separated token ending in a data extension once its punctuation is stripped is one, so each
+    is checked on its own and a missing one is named. Paths are read as written, relative to the run (no ~)."""
+    import re
     v = v.strip()
-    if not any(c.isspace() for c in v) or os.path.exists(os.path.join(run_dir, os.path.expanduser(v))):
+    if v.lower().endswith(_PATH_EXT) and (not any(c.isspace() for c in v) or os.path.exists(os.path.join(run_dir, v))):
         return [v]
-    toks = (t.rstrip(_TRAILING_PUNCT).lstrip(_LEADING_PUNCT) for t in v.split())
-    return [t for t in toks if t.lower().endswith(_PATH_EXT)]
+    out, rest = [], list(v)
+    for m in re.finditer(r"[`\"']([^`\"'\n]+)[`\"']", v):
+        c = _token_path(m.group(1))
+        if c is not None:            # a quoted name; a span between two apostrophes that names no file is prose
+            out.append(c)
+            rest[m.start():m.end()] = " " * (m.end() - m.start())
+    out += [c for c in map(_token_path, "".join(rest).split()) if c is not None]
+    return list(dict.fromkeys(out))
 
 
 def cited_paths(spec: dict, run_dir: str) -> list[str]:
@@ -2093,7 +2112,8 @@ def cited_paths(spec: dict, run_dir: str) -> list[str]:
                 if k in skip:
                     continue
                 if k in ("csv", "file", "path", "table") and isinstance(v, str) and v.strip():
-                    found.extend(path_tokens(v.strip(), run_dir))
+                    found.append(v.strip())       # a path key names one path, spaces and all (never re-split)
+                    continue
                 walk(v, str(k))
         elif isinstance(x, list):
             for v in x:
@@ -3159,6 +3179,21 @@ def _self_test_cited_prose(ok) -> None:
         ok(got == ["data/derived/a b.csv", "data/derived/item_costs.csv"],
            f"CP3 a single path, and an existing path with spaces, stay whole ({got})")
         ok(path_tokens("see notes (no file named here)", rd) == [], "CP4 prose naming no data file gives no path")
+        # CP5-CP9 (Codex r1 of #333): a bare extension is no path; a path key stays whole even when missing; a quoted
+        # name with spaces is one path; a backticked path with no whitespace is the path; ~ is not expanded
+        os.makedirs(os.path.join(rd, "data", "inputs"), exist_ok=True)
+        open(os.path.join(rd, "data", "inputs", "annual costs.csv"), "w").write("x\n")
+        open(os.path.join(rd, "data", "inputs", "rates.csv"), "w").write("x\n")
+        got = cited_paths({"question": "Should the report use .csv?",
+                           "t": {"file": "data/missing dir/costs.csv"},
+                           "a": {"source": 'rates from "data/inputs/annual costs.csv"'},
+                           "b": {"source": "`data/inputs/rates.csv`"}}, rd)
+        ok(got == ["data/inputs/annual costs.csv", "data/inputs/rates.csv", "data/missing dir/costs.csv"],
+           f"CP5-8 no bare '.csv'; a missing path key whole; a quoted name with spaces whole; backticks stripped ({got})")
+        os.makedirs(os.path.join(rd, "~"), exist_ok=True)
+        open(os.path.join(rd, "~", "quarter one.csv"), "w").write("x\n")
+        got = path_tokens("~/quarter one.csv", rd)
+        ok(got == ["~/quarter one.csv"], f"CP9 a run-local path is read as written (no ~ expansion) ({got})")
 
 
 _DI_GOOD = '''import argparse
