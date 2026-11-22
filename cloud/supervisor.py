@@ -63,7 +63,8 @@ STALE_S = 600            # status older than this: the loop is not running
 GIVE_UP_S = 3 * 3600     # a PR still waiting after this long is skipped
 UPDATE_WAIT_S = 300      # after update-branch, wait this long for the new head before asking again
 COLLECT_EVERY_S = 300    # a label not yet in storage is tried again after this long
-KEEP = 50                # last N acks / errors / finished merges kept in state
+CI_WORKFLOW = ".github/workflows/ci.yml"   # a head merges only once this workflow's run on it has succeeded
+KEEP = 50              # last N acks / errors / finished merges kept in state
 
 
 def utc(t: float) -> str:
@@ -514,6 +515,8 @@ class FakeGitHub:
 
     def pr(self, n):
         self.calls.append(("pr", n))
+        if n not in self.prs:
+            raise LookupError(f"PR {n} not found")
         return dict(self.prs[n])
 
     def behind(self, base, head):
@@ -548,8 +551,8 @@ def _self_test() -> int:
     def guard(fn, *a, **k):
         try:
             return fn(*a, **k)
-        except NotImplementedError:
-            return "NotImplemented"
+        except Exception as e:  # noqa: BLE001 -- a case that raises fails, it does not end the self-test
+            return f"raised {type(e).__name__}: {e}"
 
     N, T0 = "sv-test", 1_800_000_000.0
     P = paths(N)
@@ -740,6 +743,93 @@ def _self_test() -> int:
     r2 = guard(stop_own, DEFAULT_NAME, live_id=lambda n: None, stop=lambda n, cid, why: stopped.append((n, cid)))
     ok(stopped == [(DEFAULT_NAME, 123)] and r2 is not None and r2 != "NotImplemented",
        f"SV17 stop takes this supervisor's live cluster by id only ({stopped}, {r2})")
+
+
+    # Codex round 1. SV18 checks: every page, an unreadable status endpoint, the CI workflow must have run
+    def gh_with(pages, status=(200, {"statuses": []}), wf=("completed", "success")):
+        g = GitHub("tok_" + "a" * 20)
+        runs = [] if wf is None else [{"path": CI_WORKFLOW, "status": wf[0], "conclusion": wf[1]}]
+        g._call = lambda m, path, body=None: (
+            (200, {"check_runs": pages[int((re.findall(r"[?&]page=(\d+)", path) or [1])[0]) - 1]}) if "check-runs" in path else
+            status if path.endswith("/status") else (200, {"workflow_runs": runs}))
+        return g
+    green = {"status": "completed", "conclusion": "success"}
+    two = gh_with([[green] * 100, [{"status": "completed", "conclusion": "failure"}]])
+    ok("failure" in guard(two.checks, "s1"), "SV18 a failing check run on page two is seen")
+    try:
+        gh_with([[green]], status=(503, {})).checks("s1")
+        ok(False, "SV18b an unreadable commit-status endpoint raises (the PR waits)")
+    except Exception as e:  # noqa: BLE001
+        ok(isinstance(e, RuntimeError), "SV18b an unreadable commit-status endpoint raises (the PR waits)")
+    ok("pending" in guard(gh_with([[green]], wf=None).checks, "s1")
+       and "pending" in guard(gh_with([[green]], wf=("in_progress", None)).checks, "s1"),
+       "SV18c green checks without a finished CI workflow run on the head are pending")
+    # SV19 a malformed token is refused without echoing it
+    try:
+        GitHub("ghp_good\nX-Evil: 1")
+        ok(False, "SV19 a token with a newline is refused")
+    except ValueError as e:
+        ok("ghp_good" not in str(e), f"SV19 a token with a newline is refused, unechoed ({e})")
+    # SV20 bad requests: unreadable JSON, a traversing name, missing assignments; later requests still processed
+    b = FakeBlob()
+    b.d[P["requests"] + "20000101T000000-aaaa.json"] = b"{not json"
+    guard(enqueue, b, N, "collect", {"name": "../evil", "storage_prefix": "x", "assignments": {"q": {"launch_id": "L"}}}, T0)
+    guard(enqueue, b, N, "collect", {"name": "ev-y", "storage_prefix": "x"}, T0)
+    guard(enqueue, b, N, "noop", {}, T0 + 1)
+    with tempfile.TemporaryDirectory() as td:
+        st = guard(tick, b, N, {}, T0 + 2, td, fetch=fetch, metrics=metrics)
+        st = guard(tick, b, N, st, T0 + 3, td, fetch=fetch, metrics=metrics)
+    ok(isinstance(st, dict) and not st.get("collect") and [x["kind"] for x in st.get("acks", [])] == ["noop"]
+       and len(st.get("errors", [])) == 3, f"SV20 bad requests are refused once each, later ones processed ({st})")
+    # SV20b pull ignores names that would leave its directory
+    b = FakeBlob()
+    b.put_json(P["status"], {"collect": {"../evil": {"labels": {"q": {"state": "collected", "blob": "outputs/x",
+                                                                        "sha256": "0"}}}}})
+    with tempfile.TemporaryDirectory() as dest:
+        ok(guard(pull, b, N, os.path.join(dest, "in")) == [] and os.listdir(dest) == ["in"],
+           "SV20b pull ignores a launch name that would leave its directory")
+    # SV21 a PR that does not exist is skipped; the next one proceeds
+    gh = FakeGitHub({42: {"state": "open", "merged": False, "head": "y2", "base": "v2", "checks": ["success"]}})
+    b = FakeBlob()
+    guard(enqueue, b, N, "merge", {"prs": [41, 42]}, T0)
+    with tempfile.TemporaryDirectory() as td:
+        st = guard(tick, b, N, {}, T0 + 1, td, gh=gh)
+        st = guard(tick, b, N, st, T0 + 2, td, gh=gh)
+    ok(("merge", 42, "y2") in gh.calls, f"SV21 a missing PR is skipped and the next merged ({gh.calls})")
+    # SV22 a relaunch's run replaces the earlier launch's local copy; SV23 a failed metrics upload is retried
+    b = FakeBlob()
+    calls = {"m": 0}
+
+    def fetch2(e, label, work):
+        rd = os.path.join(work, e["name"], label, "runs", "run_" + e["assignments"][label]["launch_id"])
+        os.makedirs(rd, exist_ok=True)
+        json.dump({"status": "completed"}, open(os.path.join(rd, "metadata.json"), "w"))
+        return {}
+
+    def metrics2(dirs, out):
+        calls["m"] += 1
+        calls["dirs"] = [os.path.basename(d) for d in dirs]
+        if calls["m"] == 1:
+            raise RuntimeError("upload blip")
+        json.dump({}, open(out, "w"))
+        return out
+    with tempfile.TemporaryDirectory() as td:
+        guard(enqueue, b, N, "collect", {**entry, "assignments": {"q": {"launch_id": "A"}}}, T0)
+        st = guard(tick, b, N, {}, T0 + 1, td, fetch=fetch2, metrics=metrics2)
+        st = guard(tick, b, N, st, T0 + 2, td, fetch=fetch2, metrics=metrics2)
+        ok(calls["m"] == 2 and P["metrics"] in b.d, f"SV23 a failed metrics run is retried next loop ({calls})")
+        guard(enqueue, b, N, "collect", {**entry, "assignments": {"q": {"launch_id": "B"}}}, T0 + 3)
+        st = guard(tick, b, N, st, T0 + 4, td, fetch=fetch2, metrics=metrics2)
+        ok(calls.get("dirs") == ["run_B"], f"SV22 a relaunch does not carry the earlier launch's run ({calls})")
+    # SV24 processed requests are never replayed, however many there are
+    b = FakeBlob()
+    for i in range(1003):
+        b.put_json(f"{P['requests']}{i:06d}.json", {"kind": "noop"})
+    with tempfile.TemporaryDirectory() as td:
+        st = guard(tick, b, N, {}, T0, td)
+        st = guard(tick, b, N, st, T0 + 1, td)
+    ok(isinstance(st, dict) and len(st.get("seen", [])) == 1003 and st["acks"][-1]["at"] == utc(T0),
+       "SV24 no processed request is replayed")
 
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0

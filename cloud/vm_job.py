@@ -1451,6 +1451,8 @@ def _self_test_storage_account(ok) -> None:
     src = inspect.getsource(_run_locked)
     ok("storage_account(" in src and src.index("storage_account(") < src.index("_create("),
        "SA7 (Codex r1) `run` refuses a bad storage account value before it creates a cluster")
+    ok("secret_env(" in src and src.index("secret_env(") < src.index("_create("),
+       "VS4 (Codex r1 of W0-J) `run` refuses a bad --secret-env before it creates a cluster")
 
     # SA8 (Codex r1): the submitted task, run as the worker runs it with no storage variable of its own, gives the
     # job's process $MA_STORAGE_ACCOUNT and uploads and reads back with the launcher's account.
