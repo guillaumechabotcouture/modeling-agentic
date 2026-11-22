@@ -712,6 +712,21 @@ def _self_test() -> int:
         if not c:
             fails.append(m)
 
+    # hb1 fix 11 (L, Codex r1 of #345): the one estimator both uncertainty files use is finite and accurate at the
+    # extremes, and gives numpy's values on ordinary draws
+    import math
+    from toolkit.analysis.core import q as _q
+    big = _pu().summarise_outputs([{"y": 9e307}, {"y": 1e308}], {}, 2, summary=_q)["scalar_outputs"]["y"]
+    ok(all(math.isfinite(big[k]) for k in ("mean", "median")) and abs(big["mean"] / 9.5e307 - 1) < 1e-12
+       and abs(big["median"] / 9.5e307 - 1) < 1e-12 and not big.get("degenerate"),
+       f"UQE1 draws near the largest float: finite mean and median, not flagged constant ({big})")
+    can = _q([1e16, 1.0, -1e16])
+    ok(abs(can["mean"] - 1.0 / 3.0) < 1e-15, f"UQE2 a mean with cancelling draws is exact ({can['mean']})")
+    v_ = np.random.default_rng(3).normal(5.0, 2.0, 400)
+    q_ = _q(v_, 0.9)
+    ok(q_["median"] == float(np.median(v_)) and q_["ci_low"] == float(np.percentile(v_, 100 * (1 - 0.9) / 2))
+       and abs(q_["mean"] - float(v_.mean())) <= 1e-12 * abs(float(v_.mean())),
+       f"UQE3 on ordinary draws the median and bounds are numpy's, the mean equal to the last digits ({q_})")
     rng = np.random.default_rng(1)
     outs = [{"name": "b", "metric": "m2", "window": "w", "scale": "ratio"}, {"name": "a", "metric": "m1"}]
     vals = {"a": rng.normal(1.0, 0.1, 4000), "b": rng.normal(5.0, 1.0, 4000)}
