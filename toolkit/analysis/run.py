@@ -1353,7 +1353,18 @@ def _fixed_refusals(ok, d, r):
 
 def _self_test_plan_rule(ok, q):
     """EV-R (hb1 fix 11, J): deliverable.plan: expected_value delivers the plan with the best mean over the
-    uncertainty draws, per-unit means in the CSV and a fixed-plan mean claim; absent or `point`, nothing changes."""
+    uncertainty draws, per-unit means in the CSV and a fixed-plan mean claim; absent or `point`, nothing changes. The
+    golden capture is paused: the toy's decision tests are those of the runs above, and EV-R7 compares the records of
+    the three runs with each other."""
+    from toolkit.analysis import dt_golden as DG
+    DG._CAP["paused"] = True
+    try:
+        _self_test_plan_rule_runs(ok, q)
+    finally:
+        DG._CAP["paused"] = False
+
+
+def _self_test_plan_rule_runs(ok, q):
     import tempfile
     import yaml
     from toolkit.analysis import contract
@@ -1405,6 +1416,11 @@ def _self_test_plan_rule(ok, q):
            f"EV-R5 a fixed-plan mean claim and the plan rule in the results' recommendation "
            f"({sorted(k for k in cs if k.startswith(('headline', 'plan_rule')))})")
         ok(contract.gate_findings(d) == [], f"EV-R6 the contract checks pass: {contract.gate_findings(d)}")
+        vk = lambda R_: [(x["test_id"], x["status"], x.get("decision_changes"), x.get("recommendation"))  # noqa: E731
+                         for x in R_["decision_tests"]]
+        ok(R["decision_tests"] and vk(R) == vk(R0) and R["stability"].get("verdict") == R0["stability"].get("verdict"),
+           f"EV-R7 the decision tests and stability re-solve at the point values and compare with the point-value "
+           f"plan: the same records as the default run ({len(R['decision_tests'])} tests)")
 
 
 def _self_test_posterior(ok, q):
