@@ -112,7 +112,9 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     hold-out group; sensitivity; and **decision tests** for each simplification,
     decision-layer feature or known engine limit the owner should see tested (an
     interaction benchmark the engine misses, a group rule, the envelope). Give each a
-    `finding:` id when it answers a gate finding.
+    `finding:` id when it answers a gate finding. A new test is one `type: perturb` with a
+    `set:` of targets (what is moved, how, to what; format and targets in
+    `toolkit/spec/perturb.py`); the older type names still work and compile to it.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for.
 12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,

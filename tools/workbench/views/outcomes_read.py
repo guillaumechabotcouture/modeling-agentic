@@ -195,7 +195,7 @@ def empty(kind, s):
 
 def entries(s):
     """{test id: its entry in the verified signed spec's analysis.decision_tests}; {} with no verified spec."""
-    return {str(e.get("id")): e for e in dicts(at(s["doc"], "analysis", "decision_tests"))}
+    return {str(e.get("id")): e for e in checks.spec_tests(s["doc"] or {})}     # W0-B: perturb in per-target form
 
 
 def excluded(s):
