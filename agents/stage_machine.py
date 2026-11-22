@@ -3521,10 +3521,24 @@ def _self_test() -> int:
             s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
             rows = FX.impact_rows(d)
             man = os.path.exists(os.path.join(d, "analysis", "manifest.json"))
-            ok(s == "completed" and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
-               and FL.load(d)["D-001"].status == "fixed",
-               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto ({s}"
-               + ("" if s == "completed" else   # why it ended: CI showed only the status (flaky once on #156 and #160)
+            # lead-gaps α: the toy's automatic decision tests change the plan, so the toolkit backend now emits
+            # decision_test_changes_plan for each; this --signoff lead run answers them provisionally (never pausing) and
+            # is declared, not accepted, with each flagged above the draft. Everything else T36 checked is unchanged.
+            from toolkit.analysis import contract as _CT36
+            want = sorted(f"decision_test_changes_plan:{t.get('test_id')}" for t in _CT36.verified_decision_tests(d)
+                          if t.get("verdict") == "CHANGES_PLAN")
+            import scope_signoff as _SS36
+            prov36 = sorted(r["finding"] for r in _SS36.provisional(d) if r.get("plan_changing"))
+            rep36 = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+            sp36 = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep36 else [0, 0]
+            exp36 = "completed_scope_declared" if want else "completed"
+            ok(s == exp36 and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
+               and FL.load(d)["D-001"].status == "fixed" and prov36 == want
+               and not any(h.get("paused") for h in load_state(d).history)
+               and all(w in rep36[:sp36[0]] for w in want),
+               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto; each decision "
+               f"test that changes the plan is answered provisionally and flagged above the draft ({s}, {want}, {prov36}"
+               + ("" if s == exp36 else   # why it ended: CI showed only the status (flaky once on #156 and #160)
                   f"; path {[h.get('to') for h in load_state(d).history if 'to' in h]}; "
                   f"final {[h.get('why') for h in load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
         else:

@@ -701,8 +701,14 @@ def decision_test_findings(run_dir: str) -> list[dict]:
     for t in verified_decision_tests(run_dir):
         if isinstance(t, dict) and t.get("verdict") == "CHANGES_PLAN":
             tid = str(t.get("test_id"))
+            why = ", ".join(f"{k.replace('_pct', '').replace('_', ' ')} {t[k]:.3g}%" for k in
+                            ("share_pct", "regret_pct", "dollars_moved_pct")
+                            if isinstance(t.get(k), (int, float)) and not isinstance(t.get(k), bool))
+            trig = t.get("triggered_by")
             out.append({"kind": DECISION_TEST_KIND, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE",
-                        "claim": f"Decision test {tid} changes the plan: {' '.join(str(t.get('statement') or '').split())[:600]}",
+                        "claim": f"Decision test {tid} changes the plan: {' '.join(str(t.get('statement') or '').split())[:600]}"
+                                 + (f" ({why}" + (f"; triggered by {', '.join(map(str, trig))}" if isinstance(trig, list)
+                                                  and trig else "") + ")" if why else ""),
                         "key": tid, "scope_declarable": True, "decision_bearing": True,
                         "source": "toolkit/analysis/contract.py"})
     return out
@@ -1045,7 +1051,8 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as d:
         open(os.path.join(d, SPEC), "w").write("x: 1\n")
         S = complete_run(d, drop_kind="decision_tests", finalize=False)
-        rows = [{"test_id": "DT1", "verdict": "CHANGES_PLAN", "statement": "The plan changes at the low value."},
+        rows = [{"test_id": "DT1", "verdict": "CHANGES_PLAN", "statement": "The plan changes at the low value.",
+                 "share_pct": 40.0, "triggered_by": ["share"]},
                 {"test_id": "DT2", "verdict": "NO_CHANGE", "statement": "no"},
                 {"test_id": "DT3", "verdict": "NOT_RUN", "statement": "not run"},
                 {"test_id": "DT4", "verdict": "CHANGES_PLAN", "statement": "s", "within_solver_gap": True}]
@@ -1055,7 +1062,8 @@ def _self_test() -> int:
         ok([(x["kind"], x["key"], x["severity"], x["stage"], x["scope_declarable"], x["decision_bearing"])
             for x in fs] == [("decision_test_changes_plan", "DT1", "HIGH", "ANALYZE", True, True),
                              ("decision_test_changes_plan", "DT4", "HIGH", "ANALYZE", True, True)]
-           and "The plan changes at the low value." in fs[0]["claim"] and fs[0]["target_stage"] == "ANALYZE",
+           and "The plan changes at the low value." in fs[0]["claim"] and fs[0]["target_stage"] == "ANALYZE"
+           and "(share 40%; triggered by share)" in fs[0]["claim"] and "(" not in fs[1]["claim"],
            f"K-DTP1 each test whose verdict changes the plan is a decision-bearing HIGH, keyed by its id: {fs}")
         ok((decision_test_record(d, "DT1") or {}).get("statement") == rows[0]["statement"]
            and decision_test_record(d, "DT9") is None, "K-DTP5 the owner item's evidence: one verified row by its id")
