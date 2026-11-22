@@ -116,6 +116,7 @@ import io
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -217,9 +218,26 @@ def job_pipeline(cmd) -> str | None:
         raise SystemExit(f"{e}{hint}: refusing") from None
 
 
-def job_env(secrets: dict | None, name: str, job_id: str) -> dict:
-    """The job's extra environment: its secrets, and its launcher's name for main.py's metadata.json."""
-    return {**(secrets or {}), "MA_LAUNCHER": f"vm_job:{name}/{job_id}"}
+def job_env(secrets: dict | None, name: str, job_id: str, account: str | None = None) -> dict:
+    """The job's extra environment: its secrets, its launcher's name for main.py's metadata.json, and the
+    storage account's name (never a credential) when one is known (SA1-SA6)."""
+    return {**(secrets or {}), "MA_LAUNCHER": f"vm_job:{name}/{job_id}",
+            **({"MA_STORAGE_ACCOUNT": account} if account else {})}
+
+
+_ACCOUNT_NAME = re.compile(r"[a-z0-9]{3,24}")     # Azure storage account names: 3-24 lowercase letters and digits
+
+
+def storage_account(flag: str | None) -> str | None:
+    """The storage account name the job uses: --store-account, else the launcher's $MA_STORAGE_ACCOUNT /
+    $COILED_STORAGE_ACCOUNT (results_store.configured_account's order). The job VM does not inherit the
+    launcher's environment, so `start` passes the name on. Only a bare account name passes: a connection
+    string, URL or key is refused (and not echoed), so no credential reaches the job this way."""
+    acct = flag or os.environ.get("MA_STORAGE_ACCOUNT") or os.environ.get("COILED_STORAGE_ACCOUNT")
+    if acct and not _ACCOUNT_NAME.fullmatch(acct):
+        raise SystemExit("the storage account must be a bare storage account name (3-24 lowercase letters and "
+                         "digits), not a connection string, URL or key: refusing")
+    return acct or None
 
 
 def _write_json(path: str, obj) -> None:
@@ -575,14 +593,15 @@ def cmd_start(a, cluster=None):
         _budget_gate(a, a.name, reserve=False)
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
     base = getattr(a, "base_name", a.name)
+    account = storage_account(getattr(a, "store_account", None))
     secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
-                      base, a.job_id)
+                      base, a.job_id, account)
     c, w = _client(a.name, cluster, cid=None if cluster is not None else checked)
     token = _runner(c, w)(ws.job_queue, a.job_id)
     if not token:
         raise SystemExit(f"{a.job_id} is queued or running on {a.name}; pick another id")
     shell = " ".join(cmd) if len(cmd) == 1 else cmd
-    store = {"prefix": a.store.rstrip("/"), "account": a.store_account} if a.store else None
+    store = {"prefix": a.store.rstrip("/"), "account": account} if a.store else None
     fut = c.submit(ws.job_task, a.job_id, code, shell, secrets, a.max_hours, a.setup_sdk, token=token,
                    cluster_compute=a.cluster_compute, store=store, shutdown_when_stored=a.shutdown_when_stored,
                    shutdown_grace_s=getattr(a, "shutdown_grace_s", 0),
@@ -1189,6 +1208,10 @@ def _self_test() -> int:
     _self_test_vm_types(ok)
     _self_test_run(ok, real_gate)
     _self_test_pipeline(ok)
+    try:
+        _self_test_storage_account(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"SA: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -1315,6 +1338,65 @@ def _self_test_pipeline(ok) -> None:
         open(os.path.join(d2, "data", "evals", "q", "a.csv"), "w").write("1,2\n")
         r3 = g["write_launch_record"](os.path.join(td, "dev", "j3"), "j3", _tarball(None, d2), "v2", "x", "dev")
         ok(r3["eval_inputs_sha256"].get("data/evals/q/a.csv"), f"VP9 --dir archives record input hashes ({r3['eval_inputs_sha256']})")
+
+
+def _self_test_storage_account(ok) -> None:
+    """SA1-SA6 (2026-11-21: a job VM's `--store` upload failed "no storage account" while the launcher had
+    $COILED_STORAGE_ACCOUNT set; nothing passed it on). `start` resolves the account name (--store-account, else
+    the launcher's $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT, results_store's order) and passes the name, never
+    a credential, to the job: as the store's account and as $MA_STORAGE_ACCOUNT in the job's environment (a name
+    agents/enforcement.py's cloud-prefix filter leaves alone). A value that is not a storage account name is
+    refused before anything is submitted."""
+    import types
+    from unittest import mock
+    sent = []
+
+    class _C:
+        def submit(self, fn, *args, **kw):
+            sent.append((args, kw))
+            return None
+
+    def start(env, store_account=None, store="outputs/t/sa"):
+        sent.clear()
+        a = types.SimpleNamespace(name="sa", job_id="sa1", command=["true"], tree=None, dir=None, anthropic_key=False,
+                                  store=store, store_account=store_account, max_hours=1.0, setup_sdk=False,
+                                  cluster_compute=False, shutdown_when_stored=False, _code=None,
+                                  dest=os.path.join(td, "dest"))
+        keep = {k: v for k, v in os.environ.items() if k not in ("MA_STORAGE_ACCOUNT", "COILED_STORAGE_ACCOUNT")}
+        with mock.patch.dict(os.environ, {**keep, **env}, clear=True), \
+                mock.patch.dict(globals(), {"_client": lambda *x, **k: (_C(), "w1"),
+                                            "_runner": lambda c, w: (lambda fn, *x: "tok")}), \
+                mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cmd_start(a, cluster=object())
+        args, kw = sent[0]
+        return (args[3] or {}), (kw.get("store") or {})
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        env, st = start({"COILED_STORAGE_ACCOUNT": "launcheracct"})
+        ok(env.get("MA_STORAGE_ACCOUNT") == "launcheracct" and st.get("account") == "launcheracct",
+           f"SA1 the launcher's $COILED_STORAGE_ACCOUNT reaches the job's environment and its store ({env}, {st})")
+        env, st = start({"COILED_STORAGE_ACCOUNT": "launcheracct", "MA_STORAGE_ACCOUNT": "maacct"})
+        ok(env.get("MA_STORAGE_ACCOUNT") == "maacct" and st.get("account") == "maacct",
+           f"SA2 $MA_STORAGE_ACCOUNT wins over $COILED_STORAGE_ACCOUNT, as results_store reads them ({env}, {st})")
+        env, st = start({"COILED_STORAGE_ACCOUNT": "launcheracct"}, store_account="flagacct")
+        ok(env.get("MA_STORAGE_ACCOUNT") == "flagacct" and st.get("account") == "flagacct",
+           f"SA3 --store-account wins over the launcher's environment ({env}, {st})")
+        env, st = start({})
+        ok("MA_STORAGE_ACCOUNT" not in env and st.get("account") is None,
+           f"SA4 with no account anywhere nothing is invented: the worker's own configuration still applies ({env})")
+        env, _ = start({"COILED_STORAGE_ACCOUNT": "launcheracct"}, store=None)
+        ok(env.get("MA_STORAGE_ACCOUNT") == "launcheracct",
+           f"SA5 a job without --store still gets the account name, for its own storage reads ({env})")
+        for bad in ("DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc==", "https://x.blob.core.windows.net",
+                    "Acct", "ab"):
+            try:
+                start({"COILED_STORAGE_ACCOUNT": bad})
+                ok(False, f"SA6 a value that is not a storage account name is refused: {bad[:20]!r}")
+            except SystemExit as e:
+                ok(bool(sent) is False and "storage account" in str(e) and bad not in str(e),
+                   f"SA6 a value that is not a storage account name is refused before submit, unechoed: {bad[:20]!r}")
 
 
 def _self_test_sched(ok) -> None:
