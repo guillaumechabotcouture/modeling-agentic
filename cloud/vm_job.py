@@ -1390,6 +1390,37 @@ def _self_test_storage_account(ok) -> None:
         env, _ = start({"COILED_STORAGE_ACCOUNT": "launcheracct"}, store=None)
         ok(env.get("MA_STORAGE_ACCOUNT") == "launcheracct",
            f"SA5 a job without --store still gets the account name, for its own storage reads ({env})")
+        # VS1-VS3 (W0-J supervisor): --secret-env passes a named launcher variable to the job's environment only
+        tok = "github_pat_" + "Q" * 30
+        sent.clear()
+        a = types.SimpleNamespace(name="sa", job_id="vs1", command=["true"], tree=None, dir=None, anthropic_key=False,
+                                  store=None, store_account=None, max_hours=1.0, setup_sdk=False, cluster_compute=False,
+                                  shutdown_when_stored=False, _code=None, dest=os.path.join(td, "vs"),
+                                  secret_env=["GH_TOKEN"])
+        for env_, want in (({"GH_TOKEN": tok}, "pass"), ({}, "refuse")):
+            sent.clear()
+            try:
+                with mock.patch.dict(os.environ, env_), \
+                        mock.patch.dict(globals(), {"_client": lambda *x, **k: (_C(), "w1"),
+                                                    "_runner": lambda c, w: (lambda fn, *x: "tok")}), \
+                        mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    if not env_:
+                        os.environ.pop("GH_TOKEN", None)
+                    cmd_start(a, cluster=object())
+                got = (sent[0][0][3] or {}).get("GH_TOKEN") if sent else None
+                rec = open(os.path.join(td, "vs", "job.json")).read()
+                ok(want == "pass" and got == tok and tok not in rec,
+                   "VS1 --secret-env GH_TOKEN reaches the job's environment, never job.json")
+            except SystemExit as e:
+                ok(want == "refuse" and not sent and "GH_TOKEN" in str(e), f"VS2 a named variable that is not set is refused ({e})")
+        a.secret_env = ["ANTHROPIC_API_KEY_X"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_start(a, cluster=object())
+            ok(False, "VS3 a variable outside the allow-list is refused")
+        except SystemExit as e:
+            ok("allow" in str(e), f"VS3 a variable outside the allow-list is refused before submit ({e})")
         for bad in ("DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc==", "https://x.blob.core.windows.net",
                     "Acct", "ab"):
             try:
