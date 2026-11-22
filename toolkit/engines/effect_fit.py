@@ -324,10 +324,10 @@ def design_points(decl: dict) -> tuple:
 
 
 class Cache:
-    """Engine rows {scope digest + point: {per_seed, controls}}, appended to a JSONL file when `path` is set."""
+    """Engine rows {scope + point: {per_seed, controls}}; with `path`, appended via lib.safe_io under trusted `root`."""
 
-    def __init__(self, path: str | None = None, digest: str | None = None):
-        self.path, self.rows = path, {}
+    def __init__(self, path: str | None = None, digest: str | None = None, root: str | None = None):
+        self.path, self.root, self.rows = path, root, {}
         if path and os.path.exists(path):
             data = open(path, "rb").read()
             if digest is not None and hashlib.sha256(data).hexdigest() != digest:
@@ -350,8 +350,8 @@ class Cache:
              "controls": res.get("controls") or {}}
         self.rows[r["key"]] = r
         if self.path:
-            with open(self.path, "a") as f:
-                f.write(json.dumps(r, sort_keys=True) + "\n")
+            from toolkit.analysis.artifacts import _safe_io
+            _safe_io().append_text(self.path, json.dumps(r, sort_keys=True) + "\n", self.root)
 
     def digest(self) -> str:
         return _sha(sorted(self.rows))
@@ -534,11 +534,11 @@ def fit(decl: dict, pack: dict, evaluator, engine_identity: dict | None = None, 
             "engine_rows": {"calls": calls + vcalls, "cache_digest": cache.digest()}, "cost": cost}
 
 
-def write_record(path: str, rec: dict) -> str:
-    """Write the record; returns the file's sha256 (what the spec references)."""
+def write_record(path: str, rec: dict, root: str) -> str:
+    """Write the record through lib.safe_io under the trusted `root`; returns its sha256 (what the spec references)."""
+    from toolkit.analysis.artifacts import _safe_io
     data = yaml.safe_dump(rec, sort_keys=False, allow_unicode=True).encode()
-    with open(path, "wb") as f:
-        f.write(data)
+    _safe_io().publish(path, data, root)
     return hashlib.sha256(data).hexdigest()
 
 
@@ -692,23 +692,23 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "rows.jsonl")
         c1, n1 = [], []
-        fit(decl, pack, _toy_engine(c1), engine_identity={"name": "toy"}, cache=Cache(p))
+        fit(decl, pack, _toy_engine(c1), engine_identity={"name": "toy"}, cache=Cache(p, root=td))
         dig = hashlib.sha256(open(p, "rb").read()).hexdigest()
-        fit(decl, pack, _toy_engine(n1), engine_identity={"name": "toy"}, cache=Cache(p, digest=dig))
+        fit(decl, pack, _toy_engine(n1), engine_identity={"name": "toy"}, cache=Cache(p, digest=dig, root=td))
         ok(c1 and not n1, f"EF_CACHE: the replay from the stored rows ran no engine ({len(c1)} then {len(n1)} calls)")
         n2 = []
-        fit(decl, pack, _toy_engine(n2), engine_identity={"name": "toy2"}, cache=Cache(p))
+        fit(decl, pack, _toy_engine(n2), engine_identity={"name": "toy2"}, cache=Cache(p, root=td))
         ok(len(n2) == len(c1), "EF_CACHE: another engine identity reuses no row")
         n3, pk3 = [], _toy_pack()
         pk3["settings"]["site"]["calibrate"]["target"] = 0.8
-        r6 = fit(decl, pk3, _toy_engine(n3), engine_identity={"name": "toy"}, cache=Cache(p))
+        r6 = fit(decl, pk3, _toy_engine(n3), engine_identity={"name": "toy"}, cache=Cache(p, root=td))
         ok(len(n3) == len(c1) and r6["status"] == "rejected",
            "EF_CACHE: a changed calibration target of a target's setting reuses no row, and its control fails (Codex r1)")
-        ok(refused(lambda: fit(decl, pack, _toy_engine([]), cache=Cache(p))),
+        ok(refused(lambda: fit(decl, pack, _toy_engine([]), cache=Cache(p, root=td))),
            "EF_CACHE: a fit without an engine identity is refused (Codex r1)")
         ok(refused(lambda: Cache(p, digest="0" * 64)), "EF_CACHE: a cache whose digest differs is refused")
         rp = os.path.join(td, "effect_fit.yaml")
-        dg = write_record(rp, rec)
+        dg = write_record(rp, rec, td)
         ok(read_record(rp, dg)["point"] == rec["point"], "EF_RECORD_DIGEST: the record reads back by its digest")
         with open(rp, "a") as f:
             f.write("# edited\n")
