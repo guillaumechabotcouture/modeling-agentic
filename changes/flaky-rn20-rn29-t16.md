@@ -1,0 +1,8 @@
+---
+phase: "v2 debt"
+commit: "flaky self-tests α-γ"
+---
+
+## Changelog
+
+**Two flaky `cloud/vm_job.py` self-tests made deterministic; stage machine T16 now names why a run failed.** RN20 and RN29 run the job in its own thread against a fake Coiled with time scaled down 600x, so the job's grace before its own cluster stop (two poll intervals plus a minute) was 0.3 s of real time. On a loaded CI runner, `run` could take longer than that between reading the job's final state and stopping the cluster, so the job's stop came first. CI then showed `('job_shutdown', 100)` or "the cluster stopped before the job's final state was read". The fake job's grace now ends when `run` has stopped the cluster (a `threading.Event`, waited at most 15 s). RN29's job waited a fixed 0.6 s before passing 1.5 x the cap; it now waits for a file the cost meter writes on a reading taken under 1.5 x the cap. The fake world's 400-sleep guard against a runaway poll counts only `run`'s own sleeps, not the job thread's. No assertion changed and no product code changed: the race was in the test fixture, because at real scale the grace is 180 s against a 60 s poll. T16's flakes are configure-step failures on the CI runner (the reference run, or the run resumed after one transition, ends CONFIGURE -> FINAL `run_failed`). They did not reproduce locally in 150 configure steps under forkserver (Linux's default start method), 15 reference runs under spawn, or 25 forkserver reference runs beside the compute and pipeline self-tests, and the test never printed the reason. T16's failure message now carries the FINAL transition's `why`, which includes the failing step's log tail. Its assertion is unchanged, and the cause is still open.
