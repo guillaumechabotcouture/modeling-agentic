@@ -546,7 +546,8 @@ def decision_test_cards(run_dir: str) -> list:
     units = {str(x.get("name")): x.get("units") for x in (_data(run_dir, "analysis/engine.yaml").get("parameters") or [])
              if isinstance(x, dict)}
     spec, _ = _rread(run_dir, "decision_spec.yaml")
-    spec_tests = {str(x.get("id")): x for x in (_dig(spec, "analysis.decision_tests") or []) if isinstance(x, dict)}
+    from toolkit.spec import perturb as _PT       # W0-B: a perturb test in its per-target form
+    spec_tests = {str(x.get("id")): x for x in _PT.tests((spec or {}).get("analysis") if isinstance(spec, dict) else None)}
     out = []
     for t in tests:
         if not isinstance(t, dict):

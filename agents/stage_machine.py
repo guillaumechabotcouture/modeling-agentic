@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -64,7 +65,8 @@ EDGES = {
     # the analysis. Fail soft: neither state can end the run or change what the analysis computes.
     "PREREGISTER": {"CONFIGURE", "FINAL"},
     "CONFIGURE": {"ANALYZE", "FINAL"},
-    "ANALYZE": {"SCORE", "CRITIQUE", "FINAL"},
+    # A refused calibration goes back to SPEC (its revision), at most MAX_CALIBRATION_REFUSALS times
+    "ANALYZE": {"SCORE", "CRITIQUE", "SPEC", "FINAL"},
     "SCORE": {"CRITIQUE", "FINAL"},
     "CRITIQUE": {"GATE", "WRITE", "FINAL"},
     "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "FINAL"},
@@ -97,6 +99,8 @@ DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
 MAX_SIGN_REPAIRS = 2          # a refused lead sign-off goes back to EVIDENCE or SPEC at most this often, then waits
+MAX_CALIBRATION_REFUSALS = 2  # a refused calibration goes back to SPEC at most this often, then the run ends run_failed
+CALIBRATION_REFUSED = "calibration_refused"      # its findings-ledger kind and id
 
 
 @dataclass
@@ -377,14 +381,23 @@ def _owner_rule():
 
 def _bearing_item(run_dir: str, v: dict) -> dict:
     """What the owner is asked about a decision-bearing finding: its claim and the analysis's record of the decision
-    test, fingerprinted (an answer binds to both: a changed result is asked again)."""
+    test, fingerprinted (an answer binds to both: a changed result is asked again). The record is the producer's: the
+    toolkit's verified row (with its result file's hash) for a toolkit finding, the spike's analysis.json otherwise, so
+    a stale file of the other backend never stands in for it (Codex r1 of #327)."""
     ev = None
-    try:
-        with open(os.path.join(run_dir, AB.ANALYSIS_JSON)) as fh:
-            tests = (json.load(fh) or {}).get("decision_tests") or []
-        ev = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(v.get("key"))), None)
-    except (OSError, ValueError, AttributeError, TypeError):
-        ev = None
+    if v.get("source") == "toolkit/analysis/contract.py":      # lead-gaps α: analysis/decision_tests.yaml, verified
+        try:
+            from toolkit.analysis import contract as _CT
+            ev = _CT.decision_test_record(run_dir, v.get("key"))
+        except Exception:  # noqa: BLE001 -- no evidence: the item binds the claim alone, as before
+            ev = None
+    else:
+        try:
+            with open(os.path.join(run_dir, AB.ANALYSIS_JSON)) as fh:
+                tests = (json.load(fh) or {}).get("decision_tests") or []
+            ev = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(v.get("key"))), None)
+        except (OSError, ValueError, AttributeError, TypeError):
+            ev = None
     gid = FL.gate_id(v)
     fp = hashlib.sha256(json.dumps({"finding": gid, "claim": v.get("claim", ""), "evidence": ev}, sort_keys=True,
                                    default=str).encode()).hexdigest()[:16]
@@ -690,6 +703,8 @@ def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
 
 # ---- provenance of inputs
 _INPUT_EXT = (".csv", ".tsv", ".json", ".yaml", ".yml", ".txt", ".xlsx", ".parquet")
+_TRAILING_PUNCT = ".,;:!?)]}>\"'`"
+_LEADING_PUNCT = "([{<\"'`"
 PROVENANCE = "data/inputs_provenance.json"
 
 
@@ -712,12 +727,36 @@ def answer_key_path(rel: str) -> bool:
     return bool(parts) and (parts[0] == "evals" or "_truth" in parts)
 
 
+def _path_candidate(tok: str) -> str | None:
+    """A question token as a data file name, or None. A token that ends in a data extension is kept as written (a
+    quoted "[draft] x.csv" keeps its bracket); otherwise its sentence punctuation comes off first ("... yields.csv."
+    ends a sentence), unless a repository file has the exact name (never substituted by another). Only a leading
+    "./" is dropped: "../x.csv" and "/x.csv" stay as written, so stage_inputs refuses them as outside the
+    repository."""
+    t = tok.strip()
+    if not t.lower().endswith(_INPUT_EXT):
+        if os.path.isfile(os.path.join(REPO, t)):
+            return None
+        t = t.rstrip(_TRAILING_PUNCT).lstrip(_LEADING_PUNCT).strip()
+    while t.startswith("./"):
+        t = t[2:]
+    return t if t.lower().endswith(_INPUT_EXT) else None
+
+
 def _question_paths(question: str) -> list[str]:
-    """File names in the question: bare tokens, and quoted or backticked ones (which may hold spaces)."""
+    """File names in the question, each once: quoted or backticked ones (which may hold spaces), and bare tokens. The
+    text of a quoted name is not scanned again for bare tokens (a quoted evals/x y.csv never stages a repo-root
+    y.csv); a quoted span that names no file (between two apostrophes) still is."""
     import re
     q = question or ""
-    toks = re.findall(r"[`\"']([^`\"'\n]+)[`\"']", q) + re.findall(r"[A-Za-z0-9_./-]+", q)
-    return [t.strip().strip("./") for t in toks if t.strip().lower().endswith(_INPUT_EXT)]
+    out, bare = [], list(q)
+    for m in re.finditer(r"[`\"']([^`\"'\n]+)[`\"']", q):
+        c = _path_candidate(m.group(1))
+        if c is not None:
+            out.append(c)
+            bare[m.start():m.end()] = " " * (m.end() - m.start())
+    out += [c for c in map(_path_candidate, re.findall(r"[A-Za-z0-9_./-]+", "".join(bare))) if c is not None]
+    return list(dict.fromkeys(out))
 
 
 def _safe_dest(run_dir: str, rel: str) -> str:
@@ -2095,6 +2134,19 @@ class Machine:
         if not rep.get("ok"):
             cause = analysis_failure_cause(rep, self.run_dir)
             why = f"analysis failed: {_rep_error(rep)}" + ("; resumable with --resume" if cause else "")
+            ref = None if cause else calibration_refusal(rep, self.run_dir)
+            if ref is not None and not conflicts_policy_stop(self.run_dir):
+                # eval baseline: a refused calibration (a ridge, a fit pinned at its bounds) is a finding about the
+                # spec's calibration, not the end of the run: it goes to the spec revision with the refusal reason and
+                # the parameters at a bound, at most MAX_CALIBRATION_REFUSALS times (an unsigned spec is redrafted
+                # with it; a signed one is the owner's to amend: h_SPEC). conflicts.policy: stop keeps the old stop.
+                n = int(self.st.tries.get(CALIBRATION_REFUSED, 0) or 0)
+                if n < MAX_CALIBRATION_REFUSALS:
+                    self.st.tries[CALIBRATION_REFUSED] = n + 1
+                    record_calibration_refusal(self.run_dir, ref, self.st.round)
+                    return self._rethink("SPEC", f"calibration refused ({ref['code']}; try {n + 1} of "
+                                                 f"{MAX_CALIBRATION_REFUSALS}): {ref['reason']}"[:300])
+                why += f"; the calibration was refused {n} time(s) before (cap {MAX_CALIBRATION_REFUSALS})"
             return self._go("FINAL", why, "run_failed", extra={"resumable": cause} if cause else None)
         return self._go("SCORE" if self.st.world_model_stages else "CRITIQUE", "analysis built")
 
@@ -2448,9 +2500,35 @@ def _write_json(run_dir: str, rel: str, obj) -> None:
 
 
 def _rep_error(rep: dict) -> str:
-    errs = list(rep.get("errors") or []) + [f"{s.get('id')}: {s.get('error')}" for s in rep.get("steps") or []
-                                            if s.get("status") != "ok"]
+    errs = list(rep.get("errors") or []) + [f"{s.get('id')}: {_step_error(s.get('error'))}"
+                                            for s in rep.get("steps") or [] if s.get("status") != "ok"]
     return "; ".join(str(e) for e in errs)[:300]
+
+
+_TB_FRAME = re.compile(r'^[ |+]*File "([^"]+)", line (\d+)(?:, in (\S+))?\s*$')
+_TB_EXC = re.compile(r"^[A-Za-z_][\w.]*(?::|$)")
+_TB_HEAD = re.compile(r"[ |+]*(?:Exception Group )?Traceback \(most recent call last\):")
+
+
+def _step_error(err) -> str:
+    """A failed step's error, short enough for the history line. A Python traceback in it (the step's log tail; its
+    header may have fallen outside the tail) is reduced to the frame that raised and the exception's first line,
+    after whatever preceded the traceback (a timeout's own text); "Traceback at" keeps it read as a crash. The first
+    300 characters had held only the outer frames, so T16's CI flakes recorded no exception (T9b). Any other error is
+    kept as it is (T9c)."""
+    text = str(err)
+    lines = text.splitlines()
+    fr = [(k, m) for k, m in ((k, _TB_FRAME.match(ln)) for k, ln in enumerate(lines)) if m]
+    if not fr:
+        return text
+    k, m = fr[-1]
+    depth = lambda ln: len(ln) - len(ln.lstrip(" |+-"))  # noqa: E731 -- indent, ExceptionGroup borders included
+    exc = next((ln.lstrip(" |+-") for ln in lines[k + 1:] if depth(ln) < depth(lines[k])
+                and _TB_EXC.match(ln.lstrip(" |+-"))), "no exception line in the log tail")
+    hdr = _TB_HEAD.search(text)
+    head = text[:hdr.start()] if hdr else ""      # a timeout's own text, before the traceback it shows
+    where = f"{os.path.basename(m.group(1))}:{m.group(2)}" + (f" in {m.group(3)}" if m.group(3) else "")
+    return f"{head.strip()[:120]} Traceback at {where}: {exc[:150]}".strip()
 
 
 # Machine.reopen_interrupted_analysis's history line, per resumable cause.
@@ -2459,6 +2537,73 @@ _RESUME_WHY = {"timeout": "the analysis step had timed out", "killed": "the anal
 
 # A step killed by these signals was stopped from outside (out of memory, a stop); a crash (SIGSEGV...) is not.
 _KILL_SIGNALS = (9, 15, 2, 1)     # SIGKILL, SIGTERM, SIGINT, SIGHUP
+
+
+def calibration_refusal(rep: dict, run_dir: str) -> dict | None:
+    """{code, reason, at_bound} when the pipeline's failure is a refused calibration
+    (toolkit/analysis/calibration.py CalibrationRefused), else None. A failed step's output names the exception; the
+    analysis's own record (analysis/blocked.yaml, listed in this run's blocked manifest) adds its reason and the
+    parameters at a bound when it is there. Anything else (another error, a stopped or skipped step) is not one."""
+    import re
+    if not isinstance(rep, dict) or rep.get("errors"):
+        return None
+    failed = [s for s in rep.get("steps") or [] if isinstance(s, dict) and s.get("status") == "failed"]
+    hit = next((s for s in failed if "CalibrationRefused" in str(s.get("error") or "")), None)
+    if hit is None:
+        return None
+    err = str(hit.get("error") or "")
+    m = re.search(r"CalibrationRefused:\s*([a-z_]+):\s*(.*)", err)
+    out = {"code": m.group(1) if m else "calibration_refused", "reason": " ".join((m.group(2) if m else err).split()),
+           "at_bound": []}
+    try:
+        from toolkit.analysis import artifacts as AR
+        man = json.load(open(os.path.join(run_dir, AR.MANIFEST)))
+        rel = os.path.join("analysis", "blocked.yaml")
+        ent = (man.get("artifacts") or {}).get(rel) or {}
+        if man.get("status") == "blocked" and ent.get("sha256") == _sha256(os.path.join(run_dir, rel)):
+            data = (AR.read(run_dir, rel) or {}).get("data") or {}
+            if data.get("where") == "calibration" and data.get("exception") == "CalibrationRefused":
+                out["code"] = str(data.get("code") or out["code"])
+                out["reason"] = " ".join(str(data.get("reason") or out["reason"]).split())
+                out["at_bound"] = [str(x) for x in data.get("at_bound") or []]
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass                       # the step's own output still says what was refused
+    if out["reason"].startswith(f"{out['code']}:"):       # the exception's text repeats its code
+        out["reason"] = out["reason"][len(out["code"]) + 1:].strip()
+    return out
+
+
+def conflicts_policy_stop(run_dir: str) -> bool:
+    """The spec's conflicts.policy is stop (toolkit/analysis/conflicts.py; its default when undeclared): a refused
+    calibration then ends the run as before. An unreadable spec is read as stop (fail closed: the old behaviour)."""
+    import yaml
+    from toolkit.analysis import conflicts as CF
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, AB.SPEC_FILE))) or {}
+        return CF.policy(raw)["policy"] == "stop"
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def record_calibration_refusal(run_dir: str, ref: dict, round_n) -> None:
+    """The refusal as an open HIGH finding the spec owns (findings ledger), so the spec revision reads it: the
+    redraft's feedback (Machine._rethink) or the owner's amendment request (rethink_request). It names the parameters
+    at a bound and the remedy."""
+    ab = list(ref.get("at_bound") or [])
+    claim = (f"the calibration was refused ({ref.get('code')}): {ref.get('reason')}"
+             + (f". Parameters at a bound: {', '.join(ab[:20])}" + (f" and {len(ab) - 20} more" if len(ab) > 20 else "")
+                if ab else ""))
+    led = FL.load(run_dir)
+    f = led.get(CALIBRATION_REFUSED) or FL.Finding(id=CALIBRATION_REFUSED, kind=CALIBRATION_REFUSED, severity="HIGH",
+                                                    source="harness-calibration", first_seen_round=round_n)
+    f.severity, f.owner_state, f.target_stage, f.status, f.blocking = "HIGH", "SPEC", "PLAN", "open", True
+    f.scope_declarable, f.last_seen_round, f.claim = False, round_n, claim[:2000]
+    f.fix_requires = ("revise the spec's calibration: check calibration.scale and calibration.range against the "
+                      "attribute's values (a log scale cannot reach negative values), then the parameterisation (a "
+                      "reference package) or declared priors with method posterior")
+    FL._event(f, round_n, "open", "harness-calibration", "calibration refused at ANALYZE")
+    led[CALIBRATION_REFUSED] = f
+    FL.save(run_dir, led)
 
 
 def analysis_failure_cause(rep: dict, run_dir: str | None = None) -> str | None:
@@ -3285,6 +3430,55 @@ def _self_test() -> int:
             if nxt not in EDGES["GATE"]:
                 ok(False, f"T9 {a} routes outside the state table")
     ok(True, "T9 every route is an edge of the state table")
+    # T9b (T16's CI flakes, 2026-11-20/21): a failed step's error is its log tail, a traceback whose first 300
+    # characters are only its outer frames; the reason a run ended must keep the exception and where it was raised.
+    root = "/home/runner/work/modeling-agentic/modeling-agentic"
+    tb = ("Traceback (most recent call last):\n"
+          f'  File "{root}/agents/analysis_backend.py", line 1556, in <module>\n    sys.exit(main())\n'
+          "             ~~~~^^\n"
+          f'  File "{root}/agents/analysis_backend.py", line 776, in main\n    A = _analyze(spec, out)\n'
+          f'  File "{root}/agents/analysis_backend.py", line 515, in _analyze\n'
+          "    return Analysis(spec, out, log=lambda *a: None).run()\n"
+          f'  File "{root}/spike/analysis/run.py", line 120, in solve\n'
+          "    raise RuntimeError(f\"optimizer status {r['status']}\")\n"
+          "RuntimeError: optimizer status feasible\n")
+    why = _rep_error({"ok": False, "steps": [{"id": "configure", "status": "ok"},
+                                             {"id": "analyze", "status": "failed", "error": tb}]})
+    ok("RuntimeError: optimizer status feasible" in why and "run.py:120 in solve" in why and len(why) <= 300,
+       f"T9b a failed step's reason keeps its exception and the frame that raised it: {why!r}")
+    why2 = _rep_error({"ok": False, "errors": ["upstream step not rebuilt: configure"],
+                       "steps": [{"id": "batch", "status": "failed", "error": "timed out after 8s at its backstop"}]})
+    ok(why2 == "upstream step not rebuilt: configure; batch: timed out after 8s at its backstop",
+       f"T9c an error that is not a traceback is kept as it was: {why2!r}")
+    # T9d (Codex r1 on the T9b fix): real interpreter output, as an 800-character log tail holds it.
+    def tail_of(code, n=800):
+        r = subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                           timeout=60)
+        return r.stdout[-n:]
+    cases = {
+        "trailing output": ("import atexit; atexit.register(print, 'cleanup complete')\n"
+                            "def solve():\n    raise RuntimeError('boom')\nsolve()", "RuntimeError: boom", "in solve"),
+        "multi-line message": ("def f():\n    raise ValueError('invalid row\\ncolumn 7')\nf()",
+                               "ValueError: invalid row", "in f"),
+        "syntax error": ("compile('x =', 'broken.py', 'exec')", "SyntaxError", "broken.py:1"),
+        "frame text in message": ("def g():\n    raise ValueError('see File \"other.py\", line 97, in other')\ng()",
+                                  "ValueError: see", "in g"),
+        "exception group": ("raise ExceptionGroup('workers', [ValueError('bad row')])", "ExceptionGroup: workers",
+                            "<string>:1"),
+        "long message": ("def h():\n    raise ValueError('x' * 320)\nh()", "ValueError: xxx", "in h"),
+        "header cut": ("".join(f"def f{i}():\n    f{i + 1}()\n" for i in range(40))
+                       + "def f40():\n    raise RuntimeError('deep')\nf0()", "RuntimeError: deep", "in f40"),
+    }
+    for name, (code, want_exc, want_at) in cases.items():
+        why_ = _rep_error({"ok": False, "steps": [{"id": "analyze", "status": "failed", "error": tail_of(code)}]})
+        ok(want_exc in why_ and want_at in why_ and "Traceback at" in why_ and "at other.py" not in why_
+           and "Exception Group Traceback" not in why_,
+           f"T9d a traceback with {name} keeps its exception and raising frame: {why_!r}")
+    to = "timed out after 8s at its backstop (process group killed); last output: " + tail_of(
+        "def s():\n    raise RuntimeError('boom')\ns()", 300)
+    why3 = _rep_error({"ok": False, "steps": [{"id": "analyze", "status": "failed", "error": to}]})
+    ok(why3.startswith("analyze: timed out after 8s") and "RuntimeError: boom" in why3,
+       f"T9e a timeout whose last output is a traceback still reads as the timeout first: {why3!r}")
 
     with tempfile.TemporaryDirectory() as td:
         def new_run(name, script, signoff="none", max_rounds=3, budget=None):
@@ -3334,6 +3528,10 @@ def _self_test() -> int:
                                       "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
         ref_status = _SpikeMachine(d0, T0, st0, log=lambda *a: None, cross_engine_check=False).run()
         ref_path = [h["to"] for h in load_state(d0).history if "to" in h]
+
+        def _final_why(d_):     # the reason a run reached FINAL (a step's error carries its log tail): CI flakes of
+            return [h.get("why") for h in load_state(d_).history if h.get("to") == "FINAL"][-1:]   # T16 named none
+        ref_why = _final_why(d0) if ref_status != "completed" else []
         bad = []
         for k in range(1, len(ref_path)):
             dk, Tk, stk = new_run(f"resume{k}", {"critics": {1: {"critique-domain": [blocker]}},
@@ -3346,9 +3544,10 @@ def _self_test() -> int:
             s2 = m2.run()
             p2 = [h["to"] for h in load_state(dk).history if "to" in h]
             if s2 != ref_status or p2 != ref_path:
-                bad.append((k, s2, p2))
+                bad.append((k, s2, p2, _final_why(dk)))
             shutil.rmtree(dk)
-        ok(not bad, f"T16 a run stopped after any of {len(ref_path) - 1} transitions resumes to the same path and status {bad[:1]}")
+        ok(not bad, f"T16 a run stopped after any of {len(ref_path) - 1} transitions resumes to the same path and status {bad[:1]}"
+           + (f" (reference run {ref_status}: {ref_why})" if ref_why else ""))
 
         # T17: owner sign-off pauses, persists, resumes.
         d, T, st = new_run("owner", {}, signoff="owner")
@@ -3783,6 +3982,32 @@ def _self_test() -> int:
         _SS.review(d, "decision_test_changes_plan:DT9", "overturn", note="fix the effect first")
         ok([r["review"]["decision"] for r in _SS.provisional(d)] == ["overturn"],
            "T_OWNER_LEAD_REVIEW the owner later overturns (or confirms) a provisional answer; it is recorded")
+        # T_DT_TOOLKIT_FP (lead-gaps α): a toolkit finding's owner item binds the verified row of
+        # analysis/decision_tests.yaml, so a changed result is asked again; a stale spike analysis.json in the run dir
+        # never stands in for it, and a spike finding still binds analysis.json (Codex r1 of #327)
+        from toolkit.analysis import contract as _CTk
+        _rec = _CTk.decision_test_record
+        dtf_t = dict(dtf_e, source="toolkit/analysis/contract.py")
+        try:
+            with tempfile.TemporaryDirectory() as dk:
+                os.makedirs(os.path.join(dk, os.path.dirname(AB.ANALYSIS_JSON)), exist_ok=True)
+                json.dump({"decision_tests": [{"id": "DT9", "plan_changes": True, "text": "stale"}]},
+                          open(os.path.join(dk, AB.ANALYSIS_JSON), "w"))
+                _CTk.decision_test_record = lambda rd, k: {"test_id": k, "verdict": "CHANGES_PLAN", "share_pct": 40.0}
+                fa = _bearing_item(dk, dtf_t)["fingerprint"]
+                _CTk.decision_test_record = lambda rd, k: {"test_id": k, "verdict": "CHANGES_PLAN", "share_pct": 60.0}
+                fb = _bearing_item(dk, dtf_t)["fingerprint"]
+                _CTk.decision_test_record = lambda rd, k: None
+                fc = _bearing_item(dk, dtf_t)["fingerprint"]
+                fs1 = _bearing_item(dk, dtf_e)["fingerprint"]
+                json.dump({"decision_tests": [{"id": "DT9", "plan_changes": True, "text": "new"}]},
+                          open(os.path.join(dk, AB.ANALYSIS_JSON), "w"))
+                fs2 = _bearing_item(dk, dtf_e)["fingerprint"]
+                fc2 = _bearing_item(dk, dtf_t)["fingerprint"]
+        finally:
+            _CTk.decision_test_record = _rec
+        ok(len({fa, fb, fc}) == 3 and fc2 == fc and fs1 != fs2,
+           f"T_DT_TOOLKIT_FP each backend's finding binds its own decision-test record ({fa}, {fb}, {fc}, {fs1}, {fs2})")
         # T_OWNER_LEAD_AMEND (1F, D2): an owner-amendment finding under --signoff lead is answered provisionally too
         d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041")]}}},
                            signoff="lead", max_rounds=2)
@@ -4076,10 +4301,25 @@ def _self_test() -> int:
             s = Machine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
             rows = FX.impact_rows(d)
             man = os.path.exists(os.path.join(d, "analysis", "manifest.json"))
-            ok(s == "completed" and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
-               and FL.load(d)["D-001"].status == "fixed",
-               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto ({s}"
-               + ("" if s == "completed" else   # why it ended: CI showed only the status (flaky once on #156 and #160)
+            # lead-gaps α: the toy's automatic decision tests change the plan, so the toolkit backend now emits
+            # decision_test_changes_plan for each; this --signoff lead run answers them provisionally (never pausing) and
+            # is declared, not accepted, with each flagged above the draft. Everything else T36 checked is unchanged.
+            # the expected ids are read from the artifact itself, not through the reader under test (Codex r1 of #327)
+            _dt36 = (yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml"))) or {}).get("data") or {}
+            want = sorted(f"decision_test_changes_plan:{t.get('test_id')}" for t in _dt36.get("tests") or []
+                          if t.get("verdict") == "CHANGES_PLAN")
+            import scope_signoff as _SS36
+            prov36 = sorted(r["finding"] for r in _SS36.provisional(d) if r.get("plan_changing"))
+            rep36 = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+            sp36 = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep36 else [0, 0]
+            exp36 = "completed_scope_declared"
+            ok(want and s == exp36 and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
+               and FL.load(d)["D-001"].status == "fixed" and prov36 == want
+               and not any(h.get("paused") for h in load_state(d).history)
+               and all(w in rep36[:sp36[0]] for w in want),
+               f"T36 the default backend (workstream B) runs the machine end to end with engine: auto; each decision "
+               f"test that changes the plan is answered provisionally and flagged above the draft ({s}, {want}, {prov36}"
+               + ("" if s == exp36 else   # why it ended: CI showed only the status (flaky once on #156 and #160)
                   f"; path {[h.get('to') for h in load_state(d).history if 'to' in h]}; "
                   f"final {[h.get('why') for h in load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
         else:
@@ -4261,6 +4501,33 @@ def _self_test() -> int:
         prov = json.load(open(os.path.join(fp, "data", "inputs_provenance.json")))
         ok(any("../outside/targets.csv" in x and "outside the run" in x for x in probs) and "data/inputs/requirements.txt" in prov["cited"],
            f"T41b cited inputs are recorded with their sha256; one outside the run is refused ({probs})")
+
+        # T41c: a path at the end of a sentence or clause keeps its input (trailing punctuation is
+        # stripped before the extension test, for bare, quoted and parenthesised paths).
+        qp = _question_paths('Use data/a/one.csv. Also data/b/two.csv, data/c/three.json; '
+                             '(data/d/four.yaml) "data/e/five.tsv." \'data/f/six.txt,\' `data/g/seven.csv;` '
+                             'and "./data/h/eight.csv").')
+        ok(sorted(qp) == ["data/a/one.csv", "data/b/two.csv", "data/c/three.json", "data/d/four.yaml",
+                          "data/e/five.tsv", "data/f/six.txt", "data/g/seven.csv", "data/h/eight.csv"],
+           f"T41c paths ending in . , ; ) or quotes are kept once each, punctuation stripped ({qp})")
+        # T41d (Codex r1 of #332): a quoted name that ends in its extension is kept as written; "../" and "/" are kept
+        # (stage_inputs refuses them as outside the repository); a quoted name is not re-scanned for a bare suffix;
+        # an apostrophe span naming no file still is
+        q2 = _question_paths('Use "[draft] t.csv" and ../requirements.txt. and /requirements.txt; also '
+                             '"evals/private requirements.txt." and the program\'s file data/k/nine.csv in the '
+                             'district\'s table.')
+        ok(q2 == ["[draft] t.csv", "evals/private requirements.txt", "../requirements.txt", "/requirements.txt",
+                  "data/k/nine.csv"],
+           f"T41d brackets in a quoted name kept; ../ and / kept; no bare suffix from a quoted name; apostrophes "
+           f"do not hide a path ({q2})")
+        fpq = os.path.join(td, "prov_outside")
+        os.makedirs(fpq)
+        staged = stage_inputs(fpq, 'Inputs: ../requirements.txt. and "evals/private requirements.txt."')
+        ok(staged == [], f"T41d a path outside the repo or into the evaluation tree stages nothing ({staged})")
+        fpp = os.path.join(td, "prov_punct")
+        os.makedirs(fpp)
+        staged = stage_inputs(fpp, "The pins are in requirements.txt.")
+        ok(staged == ["data/inputs/requirements.txt"], f"T41c a file named at the end of a sentence is staged ({staged})")
 
         # T42: through the machine. A MEDIUM with a runnable test goes to the fix loop (rule 4m) and
         # is fixed before ACCEPT; one that cannot be fixed, with no rounds left, is declared (3m) and
@@ -5178,6 +5445,7 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
        and "resumable" not in st.history[-1]
        and resumable_failure(d, st) is None,
        f"T60 an analysis step that fails on its own stays run_failed on resume ({s1}, {s2}, {st.history[-1]})")
+    _self_test_calibration_refused(ok, td, toy_run, Batch, quiet)
     rep = {"ok": False, "errors": [], "steps": [{"id": "analyze", "status": "failed", "returncode": 1, "error": ""}]}
     causes = [analysis_failure_cause(dict(rep, steps=[dict(rep["steps"][0], returncode=rc, error=e)]))
               for rc, e in ((-9, ""), (-15, ""), (-11, ""), (1, "boom"), (None, "OSError: no such file"))]
@@ -5299,6 +5567,71 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
        f"T62 a restored run dir whose joint-calibration bench batch lost one task to infra is resumable 'infra' "
        f"(summaries matched by pipeline run id, not mtimes; an earlier run's model failure is ignored; a model "
        f"failure in this run is not resumable), so --resume reopens it at ANALYZE: {got2}")
+
+
+_TOY_REFUSAL = """import json, hashlib, os, sys
+rd = sys.argv[1]
+os.makedirs(os.path.join(rd, "analysis"), exist_ok=True)
+blocked = ("schema: analysis.blocked/1\\ndata:\\n  reason: 'calibration_ridge: the likelihood has 1 flat direction(s); 3 of "
+           "4 parameter(s) sit at a bound: z:u0, z:u1, z:u2'\\n  where: calibration\\n  exception: CalibrationRefused\\n"
+           "  code: calibration_ridge\\n  at_bound: [z:u0, z:u1, z:u2]\\n")
+p = os.path.join(rd, "analysis", "blocked.yaml")
+open(p, "w").write(blocked)
+sha = hashlib.sha256(open(p, "rb").read()).hexdigest()
+json.dump({"status": "blocked", "artifacts": {"analysis/blocked.yaml": {"kind": "blocked", "sha256": sha}}},
+          open(os.path.join(rd, "analysis", "manifest.json"), "w"))
+sys.stderr.write("toolkit.analysis.calibration.CalibrationRefused: calibration_ridge: the likelihood has 1 flat "
+                 "direction(s)\\n")
+sys.exit(1)
+"""
+
+
+def _self_test_calibration_refused(ok, td: str, toy_run, Batch, quiet) -> None:
+    """CRF1-4 (eval baseline: a refused calibration ended the run at ANALYZE): it goes to the spec revision with the
+    refusal and the parameters at a bound as a finding, at most MAX_CALIBRATION_REFUSALS times, then ends run_failed
+    as before; conflicts.policy: stop keeps the old stop; another failure is not one."""
+    drv = os.path.join(td, "toy_refusal.py")
+    open(drv, "w").write(_TOY_REFUSAL)
+
+    class Refuse(Batch):
+        """The toy batch step replaced by one that refuses the calibration as the analysis does."""
+        def pipeline_steps(self, spec_path, run_dir):
+            steps = super().pipeline_steps(spec_path, run_dir)
+            steps[0] = dict(steps[0], run=f"{sys.executable} {drv} {run_dir}")
+            return steps
+    refuse = Refuse(60)
+    d, T = toy_run("calibration_refused")
+    s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=refuse, cross_engine_check=False)
+    st = load_state(d)
+    back = [h for h in st.history if h.get("from") == "ANALYZE"]
+    led = FL.load(d)
+    f = led.get(CALIBRATION_REFUSED)
+    ok(s1 == "run_failed" and [h.get("to") for h in back] == ["SPEC"] * MAX_CALIBRATION_REFUSALS + ["FINAL"]
+       and all("calibration refused (calibration_ridge" in h.get("why", "") for h in back[:-1])
+       and "cap 2" in back[-1].get("why", "") and st.tries.get(CALIBRATION_REFUSED) == MAX_CALIBRATION_REFUSALS,
+       f"CRF1 a refused calibration goes back to SPEC {MAX_CALIBRATION_REFUSALS} times, then ends run_failed "
+       f"({s1}, {[(h.get('to'), h.get('why', '')[:60]) for h in back]})")
+    ok(f is not None and f.owner_state == "SPEC" and f.severity == "HIGH" and not f.scope_declarable
+       and "z:u0, z:u1, z:u2" in f.claim and "calibration.scale" in (f.fix_requires or "")
+       and "calibration_ridge): calibration_ridge" not in f.claim,
+       f"CRF2 the finding names the refusal, the parameters at a bound and the remedy ({f and f.claim[:160]})")
+    req = rethink_request(d, st.round + 99)
+    ok(any(x.get("id") == CALIBRATION_REFUSED for x in req.get("findings") or []),
+       "CRF3 a signed spec's amendment request carries the refusal (the spec owns it)")
+    # CRF4: conflicts.policy stop keeps today's behaviour: the first refusal ends the run
+    d2, T2 = toy_run("calibration_refused_stop")
+    g = globals()
+    orig = g["conflicts_policy_stop"]
+    g["conflicts_policy_stop"] = lambda run_dir: True
+    try:
+        s2 = run_v2("toy question", d2, T2, signoff="none", log=quiet, backend=refuse, cross_engine_check=False)
+    finally:
+        g["conflicts_policy_stop"] = orig
+    back2 = [h.get("to") for h in load_state(d2).history if h.get("from") == "ANALYZE"]
+    rep_other = {"ok": False, "errors": [], "steps": [{"id": "analyze", "status": "failed", "returncode": 1,
+                                                       "error": "ValueError: boom"}]}
+    ok(s2 == "run_failed" and back2 == ["FINAL"] and calibration_refusal(rep_other, d2) is None,
+       f"CRF4 under conflicts.policy stop the first refusal ends the run; another failure is no refusal ({back2})")
 
 
 def _self_test_geometry(ok, td: str) -> None:
