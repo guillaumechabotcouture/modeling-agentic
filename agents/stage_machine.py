@@ -5727,6 +5727,33 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     ok(any("bogus_key" in x for x in T.fbs[1]) and m.st.state == "EVIDENCE",
        f"HS11 a capped try that changed only the settings is checked, and goes on ({m.st.state}, "
        f"{m.st.tries.get('spec_feedback')})")
+    # HS14 (Codex r2 P1-2): when containment of the cited paths cannot be established, that is a problem, never a pass
+    import pipeline as _P
+    real_cp, n_cp = _P.cited_paths, []
+
+    def flaky(*a, **k):
+        n_cp.append(1)
+        if len(n_cp) >= 2:
+            raise OSError("listing failed")
+        return real_cp(*a, **k)
+    try:
+        _P.cited_paths = flaky
+        m, T = go("hs14", ["good"])
+    finally:
+        _P.cited_paths = real_cp
+    fb14 = m.st.tries.get("spec_feedback") or []
+    ok(m.st.state == "SPEC" and any("listing failed" in x for x in fb14),
+       f"HS14 a citation listing that fails is a problem, not a pass ({m.st.state}, {fb14})")
+    # HS15 (Codex r2 P1-5/P1-7/P2-8): a try with no completion output is checked on whatever draft files exist, with no
+    # comparison of the files before and after (a resume, a byte-identical rewrite or an odd file never skips it)
+    d15, T15, st15 = new_run("hs15", {})
+    T15 = Scripted(dict(T15.s, tries=["good"]))
+    StubTasks(T15.s).draft_spec("q", d15, None)        # a valid draft already on disk (an earlier, older journal)
+    T15 = Scripted(dict(T15.s, tries=["capped"]))
+    m = Machine(d15, T15, st15, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m.step()
+    ok(m.st.state == "EVIDENCE", f"HS15 a capped try leaves a valid draft on disk: it is checked and used, whatever "
+                                 f"changed during the try ({m.st.state}, {m.st.tries.get('spec_feedback')})")
     # HS12 (Codex r1 P2-6): the cap on the feedback never drops this try's own problems
     many = [f"problem {i}" for i in range(45)]
     got12 = _carry_feedback(many, ["old one"])
@@ -5755,6 +5782,11 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     t5.set_allowance(1.0)
     t5._session("draft_spec", "x", "y", ())
     ok(got == [5], f"HS13 a caller's explicit turn cap holds for the spec draft ({got})")
+    got.clear()
+    hw = os.path.join(hd, "wm")
+    os.makedirs(hw)
+    t5.world_model_seed(hw, {"question": "q"}, None, 1.0)
+    ok(got == [5], f"HS13b the explicit turn cap holds for the world-model seed's own session ({got})")
 
 
 def main(argv=None) -> int:
