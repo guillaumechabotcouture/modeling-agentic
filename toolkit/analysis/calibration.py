@@ -169,19 +169,35 @@ class Likelihood:
         return x
 
 
-def ridge_refusal(fa: dict) -> str | None:
+def at_bounds(x: dict, b: dict) -> list[str]:
+    """The fitted parameters sitting at a bound of their box."""
+    return [n for n in b if n in x and min(abs(x[n] - b[n][0]), abs(x[n] - b[n][1])) < 1e-6 * max(1.0, abs(x[n]))]
+
+
+def ridge_refusal(fa: dict, at_bound=None, n_params: int | None = None) -> str | None:
     """v2d §3.1 (AN-b3, Codex r1-10): why a likelihood fit is refused, or None. Every ridge scripts/identifiability.py
     reports (a null direction, or a direction whose relative SE exceeds its RIDGE_REL_SE) and a condition number above
-    the threshold are refused; the covariance is never jittered."""
+    the threshold are refused; the covariance is never jittered. `at_bound`: the parameters the fit left at a bound of
+    their box, named in the reason; when most of the `n_params` sit there the fit is pinned by its box, not by the
+    data, and the reason says to check the attribute's scale or range first."""
     ridges = fa.get("ridges") or []
     cond = fa.get("condition_number")
     cmax = float(thresholds()["ridge_condition_max"])
     if ridges:
-        return (f"the likelihood has {len(ridges)} flat or weakly determined direction(s) "
-                f"{[r.get('params') for r in ridges][:3]} (condition number {cond})")
-    if cond is None or not (cond <= cmax):
-        return f"condition number {cond} above {cmax:g}"
-    return None
+        why = (f"the likelihood has {len(ridges)} flat or weakly determined direction(s) "
+               f"{[r.get('params') for r in ridges][:3]} (condition number {cond})")
+    elif cond is None or not (cond <= cmax):
+        why = f"condition number {cond} above {cmax:g}"
+    else:
+        return None
+    ab = list(at_bound or [])
+    if ab:
+        shown = ", ".join(ab[:12]) + (f" and {len(ab) - 12} more" if len(ab) > 12 else "")
+        why += f"; {len(ab)}" + (f" of {n_params}" if n_params else "") + f" parameter(s) sit at a bound: {shown}"
+        if n_params and len(ab) > n_params / 2:
+            why += (" (most parameters sit at a bound: check the calibrated attribute's scale or range, e.g. a log "
+                    "scale for an attribute that takes values <= 0, before reparameterising)")
+    return why
 
 
 def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiability=True) -> dict:
@@ -205,10 +221,11 @@ def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiabi
     names_h, H = I.hessian(qnll, xh, b)
     # v2d §3.1 (AN-b3): a ridged fit is refused, never jittered into a positive-definite covariance. The finding tells
     # the planner to reparameterise (a reference package) or to declare priors and use `posterior`.
-    why = ridge_refusal(fa)
+    at_bound = at_bounds(xh, b)
+    why = ridge_refusal(fa, at_bound, len(names))
     if why:
         raise CalibrationRefused("calibration_ridge", f"{why}: reparameterise (a reference package) or declare priors "
-                                                      "and use method posterior")
+                                                      "and use method posterior", at_bound=at_bound)
     try:
         cov = np.linalg.inv(np.asarray(H))
         cov = (cov + cov.T) / 2
@@ -216,7 +233,6 @@ def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiabi
             raise CalibrationRefused("calibration_ridge", "the covariance is not positive definite")
     except np.linalg.LinAlgError:
         raise CalibrationRefused("calibration_ridge", "the Hessian is singular") from None
-    at_bound = [n for n in names if min(abs(xh[n] - b[n][0]), abs(xh[n] - b[n][1])) < 1e-6 * max(1.0, abs(xh[n]))]
     ident = {}
     if identifiability:
         for p in L.params:
@@ -252,8 +268,9 @@ def fit_likelihood(spec, model, rows=None, fixed_z=None, start=None, identifiabi
 class CalibrationRefused(ValueError):
     """A calibration that fails closed, with a finding code (calibration_ridge, posterior_ess, posterior_mcmc, ...)."""
 
-    def __init__(self, code: str, msg: str):
+    def __init__(self, code: str, msg: str, at_bound=None):
         self.code = code
+        self.at_bound = list(at_bound or [])        # the fitted parameters at a bound of their box, when known
         super().__init__(f"{code}: {msg}")
 
 
@@ -1646,6 +1663,44 @@ def _self_test() -> int:
         ok(ridge_refusal(fa) is not None, f"CR10 (Codex r1-10) a weak ridge the detector reports is refused, not only "
                                           f"a null direction ({fa.get('ridges')})")
     safe(cr10, "CR10 weak ridges")
+
+    def cr11():
+        # eval baseline: a log-named attribute on [-8, 2] with no declared scale was read on the log scale (exp(z) > 0),
+        # so the fit ran into the bound and was refused. Undeclared now follows the engine card (a range below 0:
+        # linear), and the same toy calibrates.
+        from toolkit.analysis import run as R
+        from toolkit.analysis.model import DirectModel
+        from toolkit.spec.schema import load
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            R._direct_toy(d)
+            sp = os.path.join(d, "decision_spec.yaml")
+            raw = yaml.safe_load(open(sp))
+            raw["calibration"].pop("scale", None)
+            yaml.safe_dump(raw, open(sp, "w"))
+            spec = load(sp)
+            m = DirectModel(spec, log=lambda *a: None)
+            m.fit()
+            try:
+                fit = fit_likelihood(spec, m, identifiability=False)
+                good = fit["cov"] is not None and not fit["diagnostics"]["at_bound"]
+                why = fit["diagnostics"]["at_bound"]
+            except CalibrationRefused as e:
+                good, why = False, str(e)
+            ok(spec.calibration_scale() == "linear" and good,
+               f"CR11 an undeclared scale for an attribute whose card range goes below 0 is linear, and the fit "
+               f"succeeds ({spec.calibration_scale()}, {why})")
+        # CR12: the refusal names the parameters at a bound, and says to check scale or range when most sit there
+        fa = {"ridges": [{"params": ["z:u0", "z:u1"]}], "condition_number": 1e12}
+        w3 = ridge_refusal(fa, ["z:u0", "z:u1", "z:u2"], 4) or ""
+        w1 = ridge_refusal(fa, ["z:u0"], 4) or ""
+        ok("z:u0, z:u1, z:u2" in w3 and "check the calibrated attribute's scale or range" in w3
+           and "z:u0" in w1 and "scale or range" not in w1,
+           f"CR12 the refusal names the bound parameters, and the scale/range hint only when most are bound "
+           f"({w3[-160:]} | {w1[-80:]})")
+        e = CalibrationRefused("calibration_ridge", "x", at_bound=["z:u0"])
+        ok(e.at_bound == ["z:u0"] and e.code == "calibration_ridge", "CR12b a refusal carries its bound parameters")
+    safe(cr11, "CR11-12 scale default and bound parameters")
 
     def cr7():
         from toolkit.analysis import run as R

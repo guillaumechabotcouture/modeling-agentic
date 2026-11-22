@@ -321,12 +321,14 @@ def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None,
     return out
 
 
-def derived_fields(spec_raw: dict) -> list[str]:
+def derived_fields(spec_raw: dict, scale: str | None = None) -> list[str]:
     """The job inputs computed by a transcendental function, so a platform's libm can move their last bits: the
     calibrated attribute on the log scale (batch.calibrated_value: exp(z)). Every other input is source-bound (copied
-    from the units table, the spec or the design) and must match exactly."""
+    from the units table, the spec or the design) and must match exactly. `scale`: the spec's resolved scale
+    (Spec.calibration_scale); without it, the declared one, else linear."""
+    from toolkit.spec import schema as _schema
     cal = (spec_raw or {}).get("calibration") or {}
-    if cal.get("attribute") and cal.get("scale", "log") == "log":
+    if cal.get("attribute") and (scale or _schema.calibration_scale(cal)) == "log":
         return [f"unit.{cal['attribute']}"]
     return []
 
@@ -407,7 +409,7 @@ def rebuild(run_dir: str, log=print):
     if _canon(stored) != _canon(design):
         raise RebuildRefused("the stored batch design differs from the spec's design (a shipped batch?)")
     res, by_ulp, other = {}, [], []
-    dfields = derived_fields(spec.raw)
+    dfields = derived_fields(spec.raw, spec.calibration_scale())
     with open(rows) as f:
         for line in f:
             r = json.loads(line)

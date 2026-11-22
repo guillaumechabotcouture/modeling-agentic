@@ -314,6 +314,7 @@ class Spec:
             self.engine_auto = self.engine_pending = True      # a mapping with no file beside it: no choice to read
         self._engine = None
         self._units = None
+        self._cal_scale = None
 
     def __getitem__(self, k):
         return self.raw[k]
@@ -343,6 +344,21 @@ class Spec:
         if self._engine is None:
             self._engine = load_engine(self.raw["engine"])
         return self._engine
+
+    def calibration_scale(self) -> str:
+        """The calibrated attribute's scale (calibration_scale): declared, else from the engine card, else linear.
+        The card is read only when the spec declares no scale."""
+        cal = self.raw.get("calibration") if isinstance(self.raw, dict) else None
+        if not (isinstance(cal, dict) and cal.get("scale") is None and isinstance(cal.get("attribute"), str)):
+            return calibration_scale(cal)
+        a = cal["attribute"]
+        if self._cal_scale is None or self._cal_scale[0] != a:          # the card's answer, per attribute
+            try:
+                card = self.engine().describe()
+            except Exception:  # noqa: BLE001 -- no card: the documented default (linear) applies
+                card = None
+            self._cal_scale = (a, calibration_scale(cal, card))
+        return self._cal_scale[1]
 
     def horizon(self, windows: dict | None = None) -> Horizon:
         """The engine horizon; a DeliveryHorizon when the spec gives objective.delivery (else the contract's own)."""
@@ -677,6 +693,50 @@ def _binding_extras(v: dict) -> list[str]:
         if not str(p.get("source") or "").strip():
             bad.append("prior needs a source")
     return bad
+
+
+CALIBRATION_SCALES = ("log", "linear")
+
+
+def card_scale(card, attr) -> str | None:
+    """The calibration scale an engine card implies for a unit attribute, from the attribute's valid range
+    (EngineCard.valid_ranges): "linear" when the range reaches 0 or below (exp(z) never produces such a value, so a
+    log scale cannot fit it), "log" when it is strictly positive; None when the card gives no range."""
+    rng = (getattr(card, "valid_ranges", None) or {}).get(attr) if isinstance(attr, str) else None
+    try:
+        lo = float(rng[0])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    if not math.isfinite(lo):
+        return None
+    return "linear" if lo <= 0 else "log"
+
+
+def calibration_scale(cal, card=None) -> str:
+    """The one place the calibrated attribute's scale is decided: the spec's declared calibration.scale; else what the
+    engine card implies for the attribute (card_scale); else "linear". (Before: toolkit/analysis/batch.py read an
+    undeclared scale as "log" while attribute_notes read it as "linear", so a log-named attribute on [-8, 2] was
+    given exp(z) > 0 and its fit ran into the bound.)"""
+    cal = cal if isinstance(cal, dict) else {}
+    sc = cal.get("scale")
+    if sc is not None:
+        return str(sc)
+    return card_scale(card, cal.get("attribute")) or "linear"
+
+
+def scale_problems(cal, card) -> list[str]:
+    """Pre-sign: a log scale for an attribute whose card range includes values <= 0 is refused (exp(z) > 0 can never
+    reach them, so the fit is impossible and ends at a bound)."""
+    cal = cal if isinstance(cal, dict) else {}
+    a = cal.get("attribute")
+    if not isinstance(a, str) or calibration_scale(cal, card) != "log":
+        return []
+    rng = (getattr(card, "valid_ranges", None) or {}).get(a)
+    if card_scale(card, a) != "linear":
+        return []
+    return [f"calibration.scale: log for {a}, whose engine card range {list(rng)} includes values <= 0: a log scale "
+            f"sets {a} = exp(z) > 0 and cannot reach them. Declare scale: linear (the range is then on {a}'s own "
+            f"scale)"]
 
 
 def attribute_notes(cal: dict, binding: dict) -> list[dict]:
@@ -1186,9 +1246,12 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
         bad.append(f"calibration.attribute: {cal['attribute']} is not declared by the engine")
     rg = cal["range"]
     if not (isinstance(rg, list) and len(rg) == 2 and all(_isnum(x) for x in rg) and rg[0] < rg[1]):
-        bad.append("calibration.range: [lo, hi] on the attribute's scale (log by default)")
-    if cal.get("scale", "log") not in ("log", "linear"):
+        bad.append("calibration.range: [lo, hi] on the attribute's scale (calibration.scale; when undeclared, what "
+                   "the engine card's range implies, else linear)")
+    if calibration_scale(cal, card) not in CALIBRATION_SCALES:
         bad.append("calibration.scale: log or linear")
+    else:
+        bad += scale_problems(cal, card)
     if m == "emulator_inversion":
         if cal["target_column"] not in cols:
             bad.append(f"calibration.target_column: the units table has no column {cal['target_column']}")
@@ -1919,6 +1982,18 @@ def _self_test() -> int:
             "SP3 a component mapped to an unknown engine value is refused")
         bad(lambda r: r["calibration"].update(target_column="nope"), "no column nope",
             "SP4 a missing calibration target column is refused")
+        bad(lambda r: r["calibration"].update(scale="log"), "includes values <= 0",
+            "SP4s a log scale for an attribute whose card range includes values <= 0 is refused before sign-off")
+        import types as _types
+        cneg, cpos = (_types.SimpleNamespace(valid_ranges={"a": [-8, 2]}), _types.SimpleNamespace(valid_ranges={"a": [0.2, 9]}))
+        ok(calibration_scale({"attribute": "a"}, cneg) == "linear" and calibration_scale({"attribute": "a"}, cpos) == "log"
+           and calibration_scale({"attribute": "a"}, None) == "linear"
+           and calibration_scale({"attribute": "a", "scale": "log"}, cneg) == "log"
+           and calibration_scale({"attribute": "a"}, _types.SimpleNamespace(valid_ranges={"a": [0.0, 1.0]})) == "linear",
+           "SP4t one scale default: declared, else the card's range (<= 0: linear; > 0: log), else linear")
+        ok(scale_problems({"attribute": "a", "scale": "log"}, cneg) and not scale_problems({"attribute": "a"}, cneg)
+           and not scale_problems({"attribute": "a", "scale": "log"}, cpos),
+           "SP4u only a declared log scale on a card range reaching <= 0 is refused")
         bad(lambda r: r["comparator"].update(package="x"), "comparator", "SP5 an unknown comparator is refused")
         bad(lambda r: r["options"]["cost_items"].pop(), "no cost item",
             "SP6 a packaged component without a cost item is refused (toolkit/alloc)")

@@ -109,7 +109,13 @@ def design_box(spec, eng) -> tuple:
 
 
 def calibrated_value(spec, z: float) -> float:
-    return float(math.exp(z)) if spec["calibration"].get("scale", "log") == "log" else float(z)
+    """The calibrated attribute from its fitted value z: exp(z) on the log scale, z on the linear one. The scale is
+    the spec's one resolution (toolkit/spec/schema.py calibration_scale: declared, else from the engine card, else
+    linear)."""
+    from toolkit.spec import schema as _schema
+    sc = spec.calibration_scale() if hasattr(spec, "calibration_scale") else _schema.calibration_scale(
+        spec["calibration"])
+    return float(math.exp(z)) if sc == "log" else float(z)
 
 
 def windows(spec) -> dict:

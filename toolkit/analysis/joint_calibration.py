@@ -756,7 +756,7 @@ def build(spec, units=None) -> tuple:
     feats = j.get("features") or []
     F = {i: [_feature(rows[i], f) for f in feats] for i in ids} if feats else {}
     up = {"name": cal["attribute"], "lo": float(cal["range"][0]), "hi": float(cal["range"][1]),
-          "scale": cal.get("scale", "log")}
+          "scale": spec.calibration_scale()}
     reg = spec.raw["decision_units"].get("region")
     P = HM.Problem(shared, up, ids, targets, features=F,
                    feature_names=[f if isinstance(f, str) else f["column"] for f in feats],
@@ -1419,7 +1419,7 @@ def sim_signature(spec) -> dict:
     return {"engine": engine_identity(spec.engine()), "engine_ref": raw["engine"], "horizon": raw["horizon"],
             "objective": {k: raw["objective"].get(k) for k in ("horizon", "delivery")},
             "comparator": spec.engine_package(spec.packages()[spec.comparator]),
-            "attribute": raw["calibration"].get("attribute"), "scale": raw["calibration"].get("scale", "log"),
+            "attribute": raw["calibration"].get("attribute"), "scale": spec.calibration_scale(),
             "held": {k: v for k, v in sorted(theta0(spec).items()) if k not in sh}, "shared": sorted(sh),
             "units": hashlib.sha256(blob).hexdigest()}
 

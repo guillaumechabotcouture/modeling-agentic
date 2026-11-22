@@ -113,6 +113,9 @@ def problems(spec, card, pnames) -> list[str]:
         # (exp(z): 1.8-3.3), every coverage clipped at 1 and the survey likelihood went flat. The scale is declared.
         bad.append("calibration.scale: declare log or linear for the attribute: the range and the prior are on that "
                    "scale (log: the attribute is exp(z))")
+    elif attr is not None:
+        from toolkit.spec import schema as _schema
+        bad += _schema.scale_problems(cal, card)
     for p in cal["parameters"]:
         if p not in pnames:
             bad.append(f"calibration.parameters: {p} is not an engine parameter")
