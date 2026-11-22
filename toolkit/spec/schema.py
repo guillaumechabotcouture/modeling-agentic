@@ -2246,6 +2246,62 @@ def _self_test() -> int:
         cinf = _ty.SimpleNamespace(valid_ranges={"x": [-math.inf, 0]})
         ok(scale_problems({"attribute": "x", "scale": "log"}, cinf) != [] and card_scale(cinf, "x") == "linear",
            "SP4ad (r2 P1-7) a card range from -inf is a range going below 0: a log scale is refused")
+        # Codex r3 of #334
+        import json as _json
+        import yaml as _yaml
+        from unittest import mock as _mock
+        from toolkit.spec import preconditions as _PC
+        r_pc = copy.deepcopy(s.raw)
+        r_pc["calibration"]["scale"] = None
+        pc_bad = _PC.problems(d, None, "owner", spec=Spec(r_pc, d))
+        ok(any("calibration.scale" in e for e in pc_bad),
+           f"SP4ae (r3 P1-1) the shared signing preconditions run the scale check ({pc_bad[-2:]})")
+        with tempfile.TemporaryDirectory() as dc:
+            r_ec = copy.deepcopy(s.raw)
+            r_ec["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}
+            r_ec["calibration"].update(attribute="seed", scale="log")
+            with open(os.path.join(dc, "decision_spec.yaml"), "w") as f:
+                _yaml.safe_dump(r_ec, f)
+            with open(os.path.join(dc, ENGINE_CHOICE), "w") as f:
+                _json.dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine"}}, f)
+            with _mock.patch(f"{__name__}._auto_cards", create=True, new=
+                             lambda raw: [("planted", _ty.SimpleNamespace(valid_ranges={"seed": [-1, 1]}))]):
+                s_ec = load(os.path.join(dc, "decision_spec.yaml"))
+                ec_bad = spec_scale_problems(s_ec)
+            ok(not s_ec.engine_pending and any("below 0" in e and "planted" in e for e in ec_bad),
+               f"SP4af (r3 P1-2) with an engine choice written, the scale is still checked against the signed "
+               f"candidates of engine: auto ({ec_bad})")
+        r_pr = copy.deepcopy(s.raw)
+        r_pr["engine"] = {"auto": True, "candidates": ["toolkit.engines.empirical.engine:PackageRateEngine"]}
+        r_pr["calibration"].pop("scale", None)
+        r_pr["calibration"]["attribute"] = "log_rate"
+        s_pr = Spec(r_pr, d)
+        pr_bad = spec_scale_problems(s_pr)
+        ok(pr_bad == [] and s_pr.calibration_scale() == "linear",
+           f"SP4ag (r3 P1-3) a candidate is read with the configuration engine selection gives it ({pr_bad})")
+        r_sw = copy.deepcopy(s.raw)
+        r_sw["calibration"].pop("scale", None)
+        s_sw = Spec(r_sw, d)
+        s_sw.calibration_scale()
+        r_sw["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}
+        try:
+            sw = s_sw.calibration_scale()
+        except SpecError as e:
+            sw = f"refused: {e}"
+        ok(sw == "linear", f"SP4ah (r3 P2-4) a Spec switched to engine: auto in place reads the candidates ({sw})")
+        mp_auto = _MP({"engine": _MP({"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}),
+                       "calibration": {"attribute": "x"}})
+        try:
+            mpa = resolved_scale(mp_auto)
+        except SpecError as e:
+            mpa = f"refused: {e}"
+        ok(mpa == "linear", f"SP4ai (r3 P2-5) a read-only engine: auto mapping keeps its candidates ({mpa})")
+        try:
+            ne = resolved_scale(Spec({"calibration": {"attribute": "x"}}, d))
+        except SpecError as e:
+            ne = f"refused: {e}"
+        ok(ne == resolved_scale({"calibration": {"attribute": "x"}}) == "linear",
+           f"SP4aj (r3 P2-6) a Spec naming no engine has the documented default, as its raw mapping does ({ne})")
         bad(lambda r: r["comparator"].update(package="x"), "comparator", "SP5 an unknown comparator is refused")
         bad(lambda r: r["options"]["cost_items"].pop(), "no cost item",
             "SP6 a packaged component without a cost item is refused (toolkit/alloc)")

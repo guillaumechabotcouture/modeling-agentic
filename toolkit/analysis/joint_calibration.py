@@ -1803,6 +1803,24 @@ def _self_test() -> int:
                    f"({bad[-1:]}, {built[:160]})")
     safe(ja_sc, "JA-SC")
 
+    def ja_sc2():
+        # Codex r3 of #334 P2-7: an unreadable card is the scale check's diagnostic, not a crash further on
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d)
+            raw = yaml.safe_load(open(p))
+            raw["calibration"].pop("scale", None)
+            raw["engine"] = {"ref": "toolkit.engines.contract:ToyEngine", "config": {"results_path": d}}
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            sp = schema.load(p)
+            try:
+                bad = spec_problems(sp)
+            except Exception as e:  # noqa: BLE001 -- the crash this case guards against
+                bad = [f"raised {type(e).__name__}: {e}"]
+            ok(any("could not be read" in b for b in bad) and not any(b.startswith("raised") for b in bad),
+               f"JA-SC2 (r3 P2-7) an unreadable engine card is reported by spec_problems ({bad[-1:]})")
+    safe(ja_sc2, "JA-SC2")
+
     def ja2():
         with tempfile.TemporaryDirectory() as d:
             from toolkit.spec import toy_engines as TE
