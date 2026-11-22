@@ -2060,9 +2060,46 @@ def _ignored_columns(d: dict, run_dir: str) -> dict:
     return out
 
 
+_PATH_EXT = (".csv", ".tsv", ".json", ".yaml", ".yml", ".txt", ".xlsx", ".parquet")
+_TRAILING_PUNCT = ".,;:!?)]}>\"'`"
+_LEADING_PUNCT = "([{<\"'`"
+
+
+def _token_path(tok: str) -> str | None:
+    """One token as a data file path, or None: kept as written when it ends in a data extension, else with its
+    sentence punctuation and quotes stripped first; a bare extension (".csv" as a word) is no path."""
+    t = tok.strip()
+    if not t.lower().endswith(_PATH_EXT):
+        t = t.rstrip(_TRAILING_PUNCT).lstrip(_LEADING_PUNCT).strip()
+    if not t.lower().endswith(_PATH_EXT) or os.path.basename(t).lower() in _PATH_EXT:
+        return None
+    return t
+
+
+def path_tokens(v: str, run_dir: str) -> list[str]:
+    """The file paths a spec string names, each once. A string ending in a data extension that has no whitespace,
+    or names an existing run file as a whole (a path with spaces), is one path. Otherwise (prose: a `source:`
+    naming a file, its provenance and a derived copy) a quoted or backticked name is one path, spaces included, and
+    each other whitespace-separated token ending in a data extension once its punctuation is stripped is one, so each
+    is checked on its own and a missing one is named. Paths are read as written, relative to the run (no ~)."""
+    import re
+    v = v.strip()
+    if v.lower().endswith(_PATH_EXT) and (not any(c.isspace() for c in v) or os.path.exists(os.path.join(run_dir, v))):
+        return [v]
+    out, rest = [], list(v)
+    for m in re.finditer(r"[`\"']([^`\"'\n]+)[`\"']", v):
+        c = _token_path(m.group(1))
+        if c is not None:            # a quoted name; a span between two apostrophes that names no file is prose
+            out.append(c)
+            rest[m.start():m.end()] = " " * (m.end() - m.start())
+    out += [c for c in map(_token_path, "".join(rest).split()) if c is not None]
+    return list(dict.fromkeys(out))
+
+
 def cited_paths(spec: dict, run_dir: str) -> list[str]:
     """Every path a decision spec names: by extension, by key (csv, file, path, table) and any value naming an existing
-    file or directory in the run (engine config included). The deliverable's paths are outputs, not inputs. The
+    file or directory in the run (engine config included). Prose that names files gives each path token
+    (`path_tokens`), never the whole sentence as one path. The deliverable's paths are outputs, not inputs. The
     evidence section names the owner-signed evidence dossier (toolkit/spec/evidence_dossier.py), not data: it is
     bound by hash in the signed input closure, not derived."""
     from_ext = (".csv", ".tsv", ".json", ".yaml", ".yml", ".txt", ".xlsx", ".parquet")
@@ -2075,15 +2112,16 @@ def cited_paths(spec: dict, run_dir: str) -> list[str]:
                 if k in skip:
                     continue
                 if k in ("csv", "file", "path", "table") and isinstance(v, str) and v.strip():
-                    found.append(v.strip())
+                    found.append(v.strip())       # a path key names one path, spaces and all (never re-split)
+                    continue
                 walk(v, str(k))
         elif isinstance(x, list):
             for v in x:
                 walk(v, key)
         elif isinstance(x, str) and x.strip():
             v = x.strip()
-            if v.lower().endswith(from_ext):
-                found.append(v)
+            if v.rstrip(_TRAILING_PUNCT).lower().endswith(from_ext):     # a sentence may end in a file name and "."
+                found.extend(path_tokens(v, run_dir))
             elif "/" in v or os.sep in v or key.endswith(("path", "file", "dir")):
                 if ":" in v and not v.startswith("/") and "/" not in v.split(":", 1)[0]:
                     return             # a module reference such as pkg.mod:Class
@@ -3111,6 +3149,7 @@ def _self_test() -> int:
         ok(not isinstance(res, NameError) and open(victim).read() == "untouched"
            and not (os.path.exists(a) and "SECRET" in open(a).read()),
            f"PL-RW2 derivation outputs are published without following a link in the work dir or a planted .tmp ({res})")
+    _self_test_cited_prose(ok)
     if fails:
         print("SELF-TEST FAILURES:")
         for f in fails:
@@ -3118,6 +3157,43 @@ def _self_test() -> int:
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_cited_prose(ok) -> None:
+    """CP1-CP4: a prose `source:` naming two files (an input and its derived copy) is two paths, each checked; one
+    missing is named by its own token; a single path and a path with spaces stay whole."""
+    with tempfile.TemporaryDirectory() as rd:
+        for rel in ("data/inputs/toy/item_costs.csv", "data/derived/item_costs.csv", "data/derived/a b.csv"):
+            os.makedirs(os.path.dirname(os.path.join(rd, rel)), exist_ok=True)
+            open(os.path.join(rd, rel), "w").write("x\n")
+        prose = ("data/inputs/toy/item_costs.csv (alpha, beta and gamma unit prices, toy list); derived copy "
+                 "data/derived/item_costs.csv")
+        got = cited_paths({"costs": {"source": prose}}, rd)
+        ok(got == ["data/derived/item_costs.csv", "data/inputs/toy/item_costs.csv"],
+           f"CP1 a prose source naming two files cites each file, not the sentence ({got})")
+        miss = prose.replace("data/derived/item_costs.csv", "data/derived/missing_costs.csv.")
+        got = cited_paths({"costs": {"source": miss}}, rd)
+        ok(got == ["data/derived/missing_costs.csv", "data/inputs/toy/item_costs.csv"],
+           f"CP2 a missing file in prose is its own token, punctuation stripped ({got})")
+        got = cited_paths({"units": {"csv": "data/derived/a b.csv"}, "t": {"file": "data/derived/item_costs.csv"}}, rd)
+        ok(got == ["data/derived/a b.csv", "data/derived/item_costs.csv"],
+           f"CP3 a single path, and an existing path with spaces, stay whole ({got})")
+        ok(path_tokens("see notes (no file named here)", rd) == [], "CP4 prose naming no data file gives no path")
+        # CP5-CP9 (Codex r1 of #333): a bare extension is no path; a path key stays whole even when missing; a quoted
+        # name with spaces is one path; a backticked path with no whitespace is the path; ~ is not expanded
+        os.makedirs(os.path.join(rd, "data", "inputs"), exist_ok=True)
+        open(os.path.join(rd, "data", "inputs", "annual costs.csv"), "w").write("x\n")
+        open(os.path.join(rd, "data", "inputs", "rates.csv"), "w").write("x\n")
+        got = cited_paths({"question": "Should the report use .csv?",
+                           "t": {"file": "data/missing dir/costs.csv"},
+                           "a": {"source": 'rates from "data/inputs/annual costs.csv"'},
+                           "b": {"source": "`data/inputs/rates.csv`"}}, rd)
+        ok(got == ["data/inputs/annual costs.csv", "data/inputs/rates.csv", "data/missing dir/costs.csv"],
+           f"CP5-8 no bare '.csv'; a missing path key whole; a quoted name with spaces whole; backticks stripped ({got})")
+        os.makedirs(os.path.join(rd, "~"), exist_ok=True)
+        open(os.path.join(rd, "~", "quarter one.csv"), "w").write("x\n")
+        got = path_tokens("~/quarter one.csv", rd)
+        ok(got == ["~/quarter one.csv"], f"CP9 a run-local path is read as written (no ~ expansion) ({got})")
 
 
 _DI_GOOD = '''import argparse
