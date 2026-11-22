@@ -529,8 +529,9 @@ def _test_problems(key: str, r: dict, rng: list, tid: str, run: dict, run_dir: s
             bad.append(f"entry {key}: decision_test {tid} {res[1]}")
             continue
         an = run.get("analysis") if isinstance(run.get("analysis"), dict) else {}
-        vals = list(res[2]) if len(res) > 2 else next((list(t.get("values") or []) for t in an.get("decision_tests") or []
-                                                       if isinstance(t, dict) and str(t.get("id")) == tid), [])
+        from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
+        vals = list(res[2]) if len(res) > 2 else next((list(t.get("values") or []) for t in PT.tests(an)
+                                                       if str(t.get("id")) == tid), [])
         nums = [v for v in vals if _num(v)]
         if not nums or min(nums) > rng[0] or max(nums) < rng[1]:
             bad.append(f"entry {key}: decision_test {tid}'s values {vals} do not cover the chosen range {rng}")
@@ -596,8 +597,9 @@ def _entry_problems(key: str, e, r: dict, run: dict, run_dir: str | None, memo: 
             # v2-dt-with (Codex r3): the run calibrates this input, so no test is required; one named anyway is shown
             # on the sheet as its range test, so it cannot be a conditional test (companions held with `with`)
             an = run.get("analysis") if isinstance(run.get("analysis"), dict) else {}
-            if any(isinstance(t, dict) and str(t.get("id")) == e["decision_test"].strip() and "with" in t
-                   for t in an.get("decision_tests") or []):
+            from toolkit.spec import perturb as PT       # W0-B: a joint perturb test holds companions too
+            if any(str(t.get("id")) == e["decision_test"].strip() and "with" in t for t in PT.tests(an)):
+
                 bad.append(f"entry {key}: decision_test {e['decision_test'].strip()} holds companion parameters "
                            "(with): a range test varies only its own parameter")
     return bad

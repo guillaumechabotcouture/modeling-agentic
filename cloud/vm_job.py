@@ -225,6 +225,22 @@ def job_env(secrets: dict | None, name: str, job_id: str, account: str | None = 
             **({"MA_STORAGE_ACCOUNT": account} if account else {})}
 
 
+SECRET_ENV_ALLOWED = ("GH_TOKEN",)     # cloud/supervisor.py's merge train (W0-J)
+
+
+def secret_env(names) -> dict:
+    """--secret-env NAME: the launcher's $NAME, for the job's environment only (never job.json or state.json, like
+    --anthropic-key). Only names in SECRET_ENV_ALLOWED; an unset one is refused. Values are never printed."""
+    out = {}
+    for n in names or ():
+        if n not in SECRET_ENV_ALLOWED:
+            raise SystemExit(f"--secret-env {n}: not in the allow-list {SECRET_ENV_ALLOWED}: refusing")
+        if not os.environ.get(n):
+            raise SystemExit(f"--secret-env {n}: ${n} is not set in the launcher's environment: refusing")
+        out[n] = os.environ[n]
+    return out
+
+
 _ACCOUNT_NAME = re.compile(r"[a-z0-9]{3,24}")     # Azure storage account names: 3-24 lowercase letters and digits
 
 
@@ -587,6 +603,7 @@ def cmd_start(a, cluster=None):
     cmd = a.command
     if not cmd:
         raise SystemExit("no command given (put it after --)")
+    secret_env(getattr(a, "secret_env", None))      # refused before the budget check or any cluster call
     pipeline = job_pipeline(cmd)        # a main.py job states its pipeline, or nothing starts
     if cluster is None:                 # interactive start keeps a paid cluster busy: the budget must still cover it
         checked = _live_vm_types_ok(a.name)     # and the budget must be able to price every VM it runs
@@ -594,8 +611,9 @@ def cmd_start(a, cluster=None):
     code = a._code if hasattr(a, "_code") else _tarball(a.tree, a.dir)
     base = getattr(a, "base_name", a.name)
     account = storage_account(getattr(a, "store_account", None))
-    secrets = job_env({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else None,
-                      base, a.job_id, account)
+    extra = secret_env(getattr(a, "secret_env", None))
+    secrets = job_env({**({"ANTHROPIC_API_KEY": rc.read_keys()["ANTHROPIC_API_KEY"]} if a.anthropic_key else {}),
+                       **extra} or None, base, a.job_id, account)
     c, w = _client(a.name, cluster, cid=None if cluster is not None else checked)
     token = _runner(c, w)(ws.job_queue, a.job_id)
     if not token:
@@ -608,6 +626,8 @@ def cmd_start(a, cluster=None):
                    shutdown_always=getattr(a, "shutdown_always", False), workers=[w], allow_other_workers=False,
                    pure=False, key=f"job-{a.job_id}-{int(time.time())}")
     fire_and_forget(fut)
+    if cluster is None:                 # interactive start returns at once: hold the client until the job runs
+        _await_claim(_runner(c, w), a.job_id)   # (`run` polls the job itself)
     dest = getattr(a, "dest", None) or local_dir(a.name, a.job_id, a.out)
     os.makedirs(dest, exist_ok=True)
     lrec = write_launch_record(dest, a.job_id, code, pipeline, _launch_commit(code, a.tree, a.dir), base)
@@ -622,6 +642,22 @@ def cmd_start(a, cluster=None):
             if a.shutdown_when_stored else "")
     print(f"started {a.job_id} on {a.name} ({w}); pipeline {lrec['pipeline']} @ {lrec['commit']}; "
           f"outputs -> {dest}{tail}")
+
+
+def _await_claim(run, job_id, timeout_s=600, every_s=5, clock=time.monotonic, sleep=time.sleep):
+    """Wait until the submitted job has claimed its id (W0-J smoke, 2026-11-22: `start` returned right after
+    fire_and_forget, the client closed before the 5 MB task reached the scheduler, and the job stayed 'queued' with
+    nothing running). Returns the job's state; an answer that is not a state record (a test fake) returns None."""
+    end = clock() + timeout_s
+    while True:
+        st = run(ws.job_state, job_id)
+        if not isinstance(st, dict) or not isinstance(st.get("state"), dict):
+            return None
+        if st["state"].get("state") != "queued":
+            return st["state"].get("state")
+        if clock() >= end:
+            raise SystemExit(f"{job_id}: still queued after {timeout_s}s: the submission did not reach the worker")
+        sleep(every_s)
 
 
 def _print(st, dest):
@@ -917,6 +953,7 @@ def _run_locked(a, dest):
     """`run` once the job's lock is held (see cmd_run)."""
     job_pipeline(a.command)                # an undeclared main.py pipeline is refused before anything is created
     storage_account(getattr(a, "store_account", None))   # so is a storage account value that is not a name
+    secret_env(getattr(a, "secret_env", None))           # and a --secret-env name that is not allowed or not set
     a._code = _tarball(a.tree, a.dir)      # a dirty tree is refused before anything is created
     _vm_request(a)                         # so is a request no priced VM type matches (before the reservation)
     base, unique = a.name, run_cluster_name(a.name, a.job_id)
@@ -1390,6 +1427,37 @@ def _self_test_storage_account(ok) -> None:
         env, _ = start({"COILED_STORAGE_ACCOUNT": "launcheracct"}, store=None)
         ok(env.get("MA_STORAGE_ACCOUNT") == "launcheracct",
            f"SA5 a job without --store still gets the account name, for its own storage reads ({env})")
+        # VS1-VS3 (W0-J supervisor): --secret-env passes a named launcher variable to the job's environment only
+        tok = "github_pat_" + "Q" * 30
+        sent.clear()
+        a = types.SimpleNamespace(name="sa", job_id="vs1", command=["true"], tree=None, dir=None, anthropic_key=False,
+                                  store=None, store_account=None, max_hours=1.0, setup_sdk=False, cluster_compute=False,
+                                  shutdown_when_stored=False, _code=None, dest=os.path.join(td, "vs"),
+                                  secret_env=["GH_TOKEN"])
+        for env_, want in (({"GH_TOKEN": tok}, "pass"), ({}, "refuse")):
+            sent.clear()
+            try:
+                with mock.patch.dict(os.environ, env_), \
+                        mock.patch.dict(globals(), {"_client": lambda *x, **k: (_C(), "w1"),
+                                                    "_runner": lambda c, w: (lambda fn, *x: "tok")}), \
+                        mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    if not env_:
+                        os.environ.pop("GH_TOKEN", None)
+                    cmd_start(a, cluster=object())
+                got = (sent[0][0][3] or {}).get("GH_TOKEN") if sent else None
+                rec = open(os.path.join(td, "vs", "job.json")).read()
+                ok(want == "pass" and got == tok and tok not in rec,
+                   "VS1 --secret-env GH_TOKEN reaches the job's environment, never job.json")
+            except SystemExit as e:
+                ok(want == "refuse" and not sent and "GH_TOKEN" in str(e), f"VS2 a named variable that is not set is refused ({e})")
+        a.secret_env = ["ANTHROPIC_API_KEY_X"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_start(a, cluster=object())
+            ok(False, "VS3 a variable outside the allow-list is refused")
+        except SystemExit as e:
+            ok("allow" in str(e), f"VS3 a variable outside the allow-list is refused before submit ({e})")
         for bad in ("DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc==", "https://x.blob.core.windows.net",
                     "Acct", "ab"):
             try:
@@ -1402,6 +1470,22 @@ def _self_test_storage_account(ok) -> None:
     src = inspect.getsource(_run_locked)
     ok("storage_account(" in src and src.index("storage_account(") < src.index("_create("),
        "SA7 (Codex r1) `run` refuses a bad storage account value before it creates a cluster")
+    ok("secret_env(" in src and src.index("secret_env(") < src.index("_create("),
+       "VS4 (Codex r1 of W0-J) `run` refuses a bad --secret-env before it creates a cluster")
+    # VS5 (W0-J smoke, 2026-11-22: `start` exited right after fire_and_forget, the 5 MB task never reached the
+    # scheduler and the job stayed queued): `start` waits until the job has claimed its id, and says so if it never does
+    seq = iter(["queued", "queued", "running"])
+    t = [0.0]
+    got = globals().get("_await_claim") and _await_claim(lambda fn, j: {"state": {"state": next(seq)}}, "j", timeout_s=60,
+                                                 every_s=5, clock=lambda: t[0], sleep=lambda s: t.__setitem__(0, t[0] + s))
+    ok(got == "running" and t[0] == 10.0, f"VS5 start waits until the job leaves 'queued' ({got}, {t})")
+    try:
+        globals().get("_await_claim") and _await_claim(lambda fn, j: {"state": {"state": "queued"}}, "j", timeout_s=20,
+                                               every_s=5, clock=lambda: t[0], sleep=lambda s: t.__setitem__(0, t[0] + s))
+        ok(False, "VS5b a job that never leaves 'queued' fails `start`")
+    except SystemExit as e:
+        ok("queued" in str(e), f"VS5b a job that never leaves 'queued' fails `start` ({e})")
+    ok("_await_claim(" in inspect.getsource(cmd_start), "VS5c cmd_start calls it after fire_and_forget")
 
     # SA8 (Codex r1): the submitted task, run as the worker runs it with no storage variable of its own, gives the
     # job's process $MA_STORAGE_ACCOUNT and uploads and reads back with the launcher's account.
@@ -2869,6 +2953,8 @@ def main(argv=None) -> int:
         p.add_argument("--max-hours", type=float, default=24.0)
         p.add_argument("--setup-sdk", action="store_true")
         p.add_argument("--anthropic-key", action="store_true")
+        p.add_argument("--secret-env", action="append", default=[], metavar="NAME",
+                       help=f"pass the launcher's $NAME to the job's environment only (allowed: {SECRET_ENV_ALLOWED})")
         p.add_argument("--cluster-compute", action="store_true",
                        help="the job's compute.py run_map uses every worker of this cluster")
         p.add_argument("--store", metavar="PREFIX", default=None,

@@ -103,7 +103,9 @@ docs/design/v2-spec-and-analysis.md §1):
       stability: {holdout_group: col, covariates: [..]}
       sensitivity: {parameters: fitted | [names], cost_items: {id: [lo, hi]}}
       share_threshold: 0.10                # decision tests: share of units changing package
-      decision_tests: [{id, type, text, finding, ...}]     # type cost_items: multipliers {cost_item_id: m}, one
+      decision_tests: [{id, type, text, finding, ...}]     # type perturb: set [{target, ..}] (W0-B, the one
+                                           # generic test: toolkit/spec/perturb.py); the types below are aliases
+                                           # compiled to it. type cost_items: multipliers {cost_item_id: m}, one
                                            # price case in which the listed unit costs change together;
                                            # type unit_attribute: unit_attribute {column, units: [ids] | all,
                                            # values | scale | set_from} (a units-table column, F6);
@@ -183,7 +185,8 @@ UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "c
 # F6 S2-5d: declared or excluded only when validation.burden has anchor rows with an interval (burden.py checks it)
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
                                       "each published interval"}
-DECISION_TEST_TYPES = ("interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
+# W0-B: `perturb` is the one generic test (toolkit/spec/perturb.py); the others are aliases compiled to it
+DECISION_TEST_TYPES = ("perturb", "interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
                        "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale", "boundary_engine")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
 CALIBRATION_FIELDS = {
@@ -446,8 +449,9 @@ class Spec:
                     lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
         for it_id, r in (((self.raw.get("analysis") or {}).get("sensitivity") or {}).get("cost_items") or {}).items():
             lo[it_id] = min(lo.get(it_id, 1.0), float(r[0]))
-        for dt in (self.raw.get("analysis") or {}).get("decision_tests") or []:      # a cost_items test's price case
-            if isinstance(dt, dict) and dt.get("type") == "cost_items" and isinstance(dt.get("multipliers"), dict):
+        from toolkit.spec import perturb as PT
+        for dt in PT.tests(self.raw.get("analysis")):      # a cost_items test's price case
+            if dt.get("type") == "cost_items" and isinstance(dt.get("multipliers"), dict):
                 for it_id, m in dt["multipliers"].items():
                     if _isnum(m):
                         lo[it_id] = min(lo.get(it_id, 1.0), float(m))
@@ -884,7 +888,14 @@ def _validate_pending(s: Spec) -> list[str]:
     bad += [e for e in _validate_uncertainty(s, {}) if "the engine" not in e]
     from toolkit.spec import engine_parameters as PV
     bad += PV.shape_problems(s)           # the engine-dependent checks run per candidate and after the choice
+    from toolkit.spec import perturb as PT
     for dt in r["analysis"].get("decision_tests") or []:
+        if str(dt.get("id") or "").startswith(("prior_range_", "fitted_range_", "scenario_excluded_",
+                                                "anchor_range_")):       # W0-B review r1: also before the engine
+            bad.append(f"decision test {dt.get('id')}: that id is one the harness generates; the spec cannot use it")
+        if dt.get("type") == PT.TYPE:          # W0-B: its structure here, the rest on its per-target form
+            bad += PT.problems(dt)
+            dt = PT.view(dt)
         if dt.get("type") not in DECISION_TEST_TYPES:
             bad.append(f"decision test {dt.get('id')}: type {dt.get('type')!r} not in {DECISION_TEST_TYPES}")
         if any(ch.isdigit() for ch in str(dt.get("text") or "")):
@@ -1136,8 +1147,9 @@ def parameter_domain(raw: dict, defaults: dict, drawn: dict) -> dict:
             dom.setdefault(n, []).append((f"uncertainty.priors.{n}.range", list(q["range"])))
     for n, (lo, hi) in (drawn or {}).items():
         dom.setdefault(n, []).append((f"the drawn prior on {n}", [lo, hi]))
-    for dt in ((raw or {}).get("analysis") or {}).get("decision_tests") or []:
-        if isinstance(dt, dict) and dt.get("type") == "parameter_value" and dt.get("parameter") in dom:
+    from toolkit.spec import perturb as PT
+    for dt in PT.tests((raw or {}).get("analysis")):
+        if dt.get("type") == "parameter_value" and dt.get("parameter") in dom:
             dom[dt["parameter"]].append((f"decision test {dt.get('id')}", list(dt.get("values") or [])))
         for n, v in PV.companions(dt).items():        # a companion value (`with`) is a value the run evaluates
             if n in dom:
@@ -1416,6 +1428,16 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
                        "generated by the harness (toolkit/analysis/decision_tests.py); the spec cannot declare one")
             continue
         seen.add(i)
+        from toolkit.spec import perturb as PT
+        if dt.get("type") == PT.TYPE:          # W0-B: its structure here; every check below on its per-target form
+            pb = PT.problems(dt)
+            bad += pb
+            if pb:
+                continue
+            dt = PT.view(dt)
+            if dt.get("type") in (PT.TYPE, "prior_range", "fitted_range", "scenario_excluded", "anchor_range"):
+                bad.append(f"decision test {i}: its targets cannot be read as one test the runner executes")
+                continue
         t = dt.get("type")
         if t not in DECISION_TEST_TYPES:
             bad.append(f"decision test {i}: type {t!r} not in {DECISION_TEST_TYPES}")
@@ -2016,6 +2038,23 @@ def _self_test() -> int:
         dtc(multipliers={"ca": 0.8, "cb": 1.3})(r_c)
         ok(validate(Spec(r_c, d)) == [], f"SP11j a cost_items decision test on declared cost items validates: "
                                          f"{validate(Spec(r_c, d))[:3]}")
+        # W0-B: one generic perturb test; the per-target checks are its alias's (toolkit/spec/perturb.py)
+        dtp = lambda *ts, **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731
+            dict({"id": "DTp", "type": "perturb", "text": "t", "set": list(ts)}, **kw)))
+        r_p = copy.deepcopy(s.raw)
+        dtp({"target": "cost_item", "name": "ca", "scale": 0.8}, {"target": "cost_item", "name": "cb", "scale": 1.3})(r_p)
+        dtp({"target": "parameter", "name": "eff_a", "values": [0.3, 0.6]}, id="DTq")(r_p)
+        ok(validate(Spec(r_p, d)) == [], f"SPP1 perturb tests (a price case, a parameter) validate: "
+                                         f"{validate(Spec(r_p, d))[:3]}")
+        bad(dtp({"target": "magic"}), "unknown target", "SPP2 DT_PERTURB_UNKNOWN_TARGET_REFUSED at validation")
+        bad(dtp({"target": "cost_item", "name": "nope", "scale": 1.2}), "unknown cost item",
+            "SPP3 a perturb target gets its alias's checks (an unknown cost item is refused)")
+        bad(dtp({"target": "parameter", "name": "nope", "values": [1.0]}), "not an engine parameter",
+            "SPP4 a perturb parameter target that is not an engine parameter is refused")
+        bad(dtp({"target": "parameter", "name": "eff_a", "values": [0.3]}, {"target": "envelope", "values": [9e3]}),
+            "cannot be applied together", "SPP5 targets of different kinds are refused together")
+        bad(dtp({"target": "parameter", "name": "eff_a", "values": [0.3]}, id="prior_range_eff_a"),
+            "generated by the harness", "SPP6 a perturb test cannot shadow an automatic test")
         _self_test_unit_attribute(ok, s, d, bad)
         # F6 run 1, owner decision R1: a calibration-target test (the listed units' targets scaled, the calibration redone)
         dct = lambda **kw: (lambda r: r["analysis"]["decision_tests"].append(  # noqa: E731

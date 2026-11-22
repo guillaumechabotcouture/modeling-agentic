@@ -34,6 +34,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -529,6 +530,37 @@ def remove_nofollow(base: str, rel: str, missing_ok: bool = True) -> bool:
         os.close(dfd)
 
 
+@contextlib.contextmanager
+def stream_nofollow(base: str, rel: str):
+    """write_nofollow(atomic=True) for data that must not be held whole (a large download): yields a binary file
+    object on a random temporary name in base/rel's directory (O_EXCL, no link followed at any component); when the
+    block ends cleanly it is fsynced and, if the temporary entry is still the file that was written, renamed over
+    the name (a link there is replaced, never followed); when the block raises, the temporary file is removed and
+    the name keeps what it held."""
+    import secrets as _secrets
+    parts = _parts(rel)
+    dfd = dir_fd_nofollow(base, parts[:-1], create=True)
+    tmp = f".{parts[-1]}.{_secrets.token_hex(6)}.tmp"
+    try:
+        f = os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd), "wb")
+        try:
+            with f:
+                yield f
+                f.flush()
+                os.fsync(f.fileno())
+                mine = os.fstat(f.fileno())
+            now = os.stat(tmp, dir_fd=dfd, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != (mine.st_dev, mine.st_ino):     # the entry is no longer the file written
+                raise LinkRefused(f"{rel}: its temporary file was replaced while it was written; not published")
+            os.replace(tmp, parts[-1], src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp, dir_fd=dfd)
+            raise
+    finally:
+        os.close(dfd)
+
+
 def write_nofollow(base: str, rel: str, data: bytes, append: bool = False, exclusive: bool = False,
                    atomic: bool = False) -> str:
     """Write base/rel with no link followed at any component. `atomic`: a temporary file in the same directory,
@@ -690,6 +722,41 @@ def _self_test() -> int:
         ok(sha256_file(p) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
            "S12 sha256 of 'abc'")
         ok(sha256_file(os.path.join(d, "missing")) is None, "S12b missing → None")
+        # S12e-g (storage durability): a streamed atomic write; a failure keeps the old file and leaves no temp file
+        os.symlink(p, os.path.join(d, "ln"))
+        with stream_nofollow(d, "sub/big.bin") as f:
+            f.write(b"x" * 10)
+            f.write(b"y")
+        with stream_nofollow(d, "ln") as f:
+            f.write(b"new")
+        ok(open(os.path.join(d, "sub", "big.bin"), "rb").read() == b"x" * 10 + b"y" and open(p).read() == "abc"
+           and not os.path.islink(os.path.join(d, "ln")), "S12e stream_nofollow publishes; a link is replaced, not followed")
+        try:
+            with stream_nofollow(d, "sub/big.bin") as f:
+                f.write(b"partial")
+                raise OSError("cut")
+        except OSError:
+            pass
+        ok(os.listdir(os.path.join(d, "sub")) == ["big.bin"]
+           and os.path.getsize(os.path.join(d, "sub", "big.bin")) == 11, "S12f a failed stream keeps the old file")
+        try:        # S12h (Codex 1E-i round 1): the temporary entry swapped while the stream is open is not published
+            with stream_nofollow(d, "sub/big.bin") as f:
+                f.write(b"streamed")
+                tmp_name = [n for n in os.listdir(os.path.join(d, "sub")) if n.endswith(".tmp")][0]
+                os.unlink(os.path.join(d, "sub", tmp_name))
+                with open(os.path.join(d, "sub", tmp_name), "wb") as g:
+                    g.write(b"planted")
+            ok(False, "S12h a swapped temporary entry is refused")
+        except LinkRefused:
+            pass
+        ok(open(os.path.join(d, "sub", "big.bin"), "rb").read() == b"x" * 10 + b"y"
+           and os.listdir(os.path.join(d, "sub")) == ["big.bin"], "S12h the name keeps its file; nothing is left")
+        try:
+            with stream_nofollow(d, "../x") as f:
+                pass
+            ok(False, "S12g a climbing name is refused")
+        except LinkRefused:
+            pass
         j = write(d, "a.jsonl", '{"a": 1}\nnot json\n[2]\n')
         ok(read_jsonl(j) == [{"a": 1}, [2]], "S12c bad line skipped")
         ok(read_jsonl(os.path.join(d, "missing")) == [], "S12d missing → []")

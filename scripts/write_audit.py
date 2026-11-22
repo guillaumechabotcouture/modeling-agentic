@@ -72,7 +72,7 @@ _SIO_MODS = ("lib.safe_io", "scripts.lib.safe_io", "safe_io")
 _SIO_GETTERS = ("_sio", "_safe_io")
 _SIO_ROOT_ARG = {"publish": 2, "append_text": 2, "remove_path": 1, "anchored": 1}   # index of the run-root argument
 _SIO_BASE_ARG = {**_SIO_ROOT_ARG, "write_nofollow": 0, "open_append_nofollow": 0, "remove_nofollow": 0,
-                 "rename_nofollow": 0, "copy_nofollow": 0, "dir_fd_nofollow": 0}         # ... and of a primitive's base
+                 "rename_nofollow": 0, "copy_nofollow": 0, "dir_fd_nofollow": 0, "stream_nofollow": 0}         # ... and of a primitive's base
 _DERIVED_ROOT = {"os.path.dirname", "os.getcwd", "os.getcwdb", "pathlib.Path.cwd", "Path.cwd"}
 _GETATTR_WRITERS = {"open", "fdopen"} | _OS_WRITE | _SHUTIL | _METHOD_WRITES | _NP_SAVE
 _SUBPROCESS = {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output",
@@ -313,10 +313,12 @@ REVIEWED: dict = {
                           "column-stripped input and mount points in its temporary work dirs")},
     "scripts/plant_defects.py": {"open-write": (3, _EVAL), "shutil": (4, _EVAL)},
     "scripts/regression_eval.py": {"open-write": (4, _EVAL), "shutil": (1, _EVAL), "os-remove": (1, _EVAL)},
-    "scripts/results_store.py": {"open-write": (1, "download() writes where the operator names"),
-                                 "tempfile-dir": (1, "write_archive's anonymous TemporaryFile beside the archive it "
-                                                     "writes (the checkpoint staging dir on the agent VM, outside any run "
-                                                     "dir), deleted on close")},
+    "scripts/results_store.py": {"safeio-derived-root": (1, "download() streams to the path its caller names (the "
+                                                         "launcher's out dir, a VM staging dir): no run root "
+                                                         "exists there; safe_io.stream_nofollow, no link followed"),
+                                 "tempfile-dir": (2, "write_archive's anonymous TemporaryFiles (a file's copy, and its "
+                                                     "redacted copy) beside the archive it writes (a staging dir "
+                                                     "outside any run dir), deleted on close")},
     "scripts/resume_smoke.py": {"open-write": (4, "the smoke's own temporary work dir (toy runs it creates) and the "
                                                    "--json report the operator names")},
     "scripts/lib/positive_control.py": {"open-write": (2, "builds the positive-control fixture run in a dir it creates")},
@@ -352,9 +354,8 @@ _V1 = ("v1 pipeline (main.py without --v2, its hooks and gates): writes in its r
 # lowers a count. These are known gaps, not exemptions.
 OPEN_ITEMS: dict = {
     "agents/integrity.py": {"open-write": (1, _V1)},
-    "agents/run_finish.py": {"open-write": (2, "store_run_results (shared with v2): the upload's temporary tarball and "
-                                              "metadata.json's stored/store_error fields, plain opens in the run dir"),
-                             "os-remove": (1, "store_run_results: its own temporary tarball")},
+    "agents/run_finish.py": {"open-write": (1, "store_run_results (shared with v2): metadata.json's stored/store_error "
+                                              "fields, a plain open in the run dir")},
     "scripts/ask.py": {"open-write": (1, _V1)},
     "scripts/benchmark_match.py": {"open-write": (1, _V1)},
     "scripts/coherence_audit.py": {"open-write": (1, _V1)},
