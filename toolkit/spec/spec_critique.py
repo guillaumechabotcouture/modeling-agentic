@@ -161,7 +161,8 @@ def _decision_date(raw, today) -> list:
 def _burden(raw, run_dir, data=None) -> list:
     if _estimates(raw):
         return [_f("INFO", "baseline_burden", "An estimates deliverable ranks no units.", "None")]
-    tests = [t for t in (raw.get("analysis") or {}).get("decision_tests") or [] if isinstance(t, dict)]
+    from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
+    tests = PT.tests(raw.get("analysis"))
     sec = (raw.get("validation") or {}).get("burden")
     scale = [str(t.get("id")) for t in tests if t.get("type") == "burden_scale"
              and (t.get("burden_scale") or {}).get("references") and isinstance(sec, dict) and sec.get("csv")]
@@ -193,7 +194,8 @@ def _burden(raw, run_dir, data=None) -> list:
 def _varied(raw, run_dir) -> tuple[set, set]:
     """(parameters, unit attributes) that a decision test or the uncertainty draws vary."""
     an, unc = raw.get("analysis") or {}, raw.get("uncertainty") or {}
-    tests = [t for t in an.get("decision_tests") or [] if isinstance(t, dict)]
+    from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
+    tests = PT.tests(an)
     ps = {t.get("parameter") for t in tests if t.get("type") == "parameter_value" and "with" not in t
           and len(set(map(str, t.get("values") or []))) >= 2}      # a test with companions is conditional on them
     from toolkit.spec import priors as PRI
@@ -217,8 +219,10 @@ def _varied(raw, run_dir) -> tuple[set, set]:
 
 def _ranges(raw, run_dir, dossier_bytes=None) -> list:
     an = raw.get("analysis") or {}
-    tests = [t for t in an.get("decision_tests") or [] if isinstance(t, dict)]
+    from toolkit.spec import perturb as PT       # W0-B: a perturb test in its per-target form
+    tests = PT.tests(an)
     unc = raw.get("uncertainty") or {}
+
     vp, va = _varied(raw, run_dir)
     out, nodata, held, excluded, inputs = [], [], [], [], {}
     excl_p = {str(x.get("parameter")): str(x.get("reason") or "").strip() for x in unc.get("excluded") or []

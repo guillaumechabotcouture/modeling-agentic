@@ -518,7 +518,9 @@ def held(spec) -> dict:
 def companions(dt) -> dict:
     """{parameter: value} of a parameter_value decision test's `with`: companion engine parameters held at these
     values in every case of the test (owner, 20 Nov). {} without the field or for a malformed one (validation
-    reports that)."""
+    reports that). A `perturb` test's held parameter targets are its companions (W0-B, toolkit/spec/perturb.py)."""
+    from toolkit.spec import perturb as PT
+    dt = PT.view(dt)
     w = dt.get("with") if isinstance(dt, dict) and dt.get("type") == "parameter_value" else None
     return {str(k): float(v) for k, v in w.items() if _isnum(v)} if isinstance(w, dict) else {}
 
@@ -530,8 +532,11 @@ def test_settings(dt, numbers_only: bool = False, names=None) -> dict:
     raises ValueError (as these readers did before `with`; Codex r1-r2). `numbers_only`: only values written as
     numbers, nothing raised (tested_boxes' rule before `with`). `names`: the parameters the reader uses; a test's own
     values are read only when its parameter is one of them, so a value the reader never used raises nothing (Codex
-    r3), and only those parameters are returned."""
+    r3), and only those parameters are returned. A `perturb` test is read in its per-target form (W0-B)."""
+    from toolkit.spec import perturb as PT
+    dt = PT.view(dt)
     if not isinstance(dt, dict) or dt.get("type") != "parameter_value":
+
         return {}
     out = {k: [v] for k, v in companions(dt).items() if names is None or k in names}
     if names is not None and dt.get("parameter") not in names:
