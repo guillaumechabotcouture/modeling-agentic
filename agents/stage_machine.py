@@ -4868,7 +4868,7 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
        and "resumable" not in st.history[-1]
        and resumable_failure(d, st) is None,
        f"T60 an analysis step that fails on its own stays run_failed on resume ({s1}, {s2}, {st.history[-1]})")
-    _t_calibration_refused(ok, td, toy_run, Batch, quiet)
+    _self_test_calibration_refused(ok, td, toy_run, Batch, quiet)
     rep = {"ok": False, "errors": [], "steps": [{"id": "analyze", "status": "failed", "returncode": 1, "error": ""}]}
     causes = [analysis_failure_cause(dict(rep, steps=[dict(rep["steps"][0], returncode=rc, error=e)]))
               for rc, e in ((-9, ""), (-15, ""), (-11, ""), (1, "boom"), (None, "OSError: no such file"))]
@@ -5009,7 +5009,7 @@ sys.exit(1)
 """
 
 
-def _t_calibration_refused(ok, td: str, toy_run, Batch, quiet) -> None:
+def _self_test_calibration_refused(ok, td: str, toy_run, Batch, quiet) -> None:
     """CRF1-4 (eval baseline: a refused calibration ended the run at ANALYZE): it goes to the spec revision with the
     refusal and the parameters at a bound as a finding, at most MAX_CALIBRATION_REFUSALS times, then ends run_failed
     as before; conflicts.policy: stop keeps the old stop; another failure is not one."""
