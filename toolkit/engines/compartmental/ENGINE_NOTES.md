@@ -4,23 +4,29 @@ Engine `compartmental-starsim` v0.3. Design note: `docs/design/v2d-compartmental
 v0.2 adds what age-structured allocation questions need. Each addition acts only when a configuration or a
 component asks for it, so every v0.1 configuration gives byte-identical outputs.
 
-v0.3 adds the direct final-size solver (plan: `docs/design/direct-final-size-solver.md`). A `final_size: true`
+v0.3 adds the direct final-size solver (plan: `docs/design/direct-final-size-solver.md`, PR #346). A `final_size: true`
 run with `forcing: none`, no component acting during the epidemic (`day` 0) and `importation: deterministic` no
 longer steps the sim. It solves the multigroup final-size relation z_i = s_i - (s_i - e_i) exp(-q sum_j C_ij z_j)
 on the groups the seeds reach after the interventions (`solve_final_size`, `infection_reach` in `engine.py`):
 - Reach follows the direction of infection from the groups with a seed left, through groups with susceptibles
   left, so a group behind a fully immune one keeps z = e.
-- Lower and upper iterates start at e and s and stay sub- and super-solutions; Newton candidates (and the Newton
-  point offset either way) are kept only when they pass that check as computed. The map is evaluated in the
+- Lower and upper iterates start at e and s and stay sub- and super-solutions. Plain steps move by T less or
+  plus a bound on its rounding error; Newton candidates (and the Newton point offset either way) are kept group by
+  group only where the check holds with that bound against them, so rounding never certifies a bound. The map is evaluated in the
   expm1 form: s - a exp(-x) loses about 2e-12 to cancellation at R = 1.
-- A member stops when its bracket is at most `tol` wide in every group (the returned midpoint is within tol / 2).
-  A bracket still open at `step_cap` iterations, or one that stops shrinking, fails closed (`converged: false`).
-- `meta.steps` and `windows.*.steps` count the solver's iterations, per member. `meta.final_size_path` is
+- A member stops when its bracket is at most `tol` wide in every group and returns the lower bound (within tol
+  of the root, never above it). A bracket still open at `step_cap` iterations, or one whose total width has not
+  shrunk by 1% in max(200, 4 G) iterations, fails closed (`converged: false`). That happens when the arithmetic
+  cannot certify `tol`: in a chain of exactly critical groups (FD14) the limit is about 1e-9.
+- `meta.steps` and `windows.*.steps` count the solver's iterations, per member, and `meta.time_axis` is
+  `solver_iterations`. `meta.final_size_path` is
   `direct_solver` or `simulation` on every final_size run.
 - Interventions, doses, `s_first`, p_major and the outcome ratios are unchanged. `run_series()` and every other
-  configuration keep the sim, and their outputs are byte-identical to v0.2.
+  configuration keep the sim. Their per-capita outcomes, windows and cost drivers are byte-identical to v0.2;
+  a final_size run on the simulation path (forcing, a component during the epidemic, or branching importation)
+  also gains `meta.final_size_path: simulation`, and every other configuration's whole output is unchanged.
 - The engine does not import `benchmarks/oracles.py`: that file is outside the engine fingerprint and is the
-  independent check (`selftest_final_size.py`, FD1–FD13).
+  independent check (`selftest_final_size.py`, FD1–FD17).
 
 ## Model and framework
 
@@ -103,4 +109,4 @@ citation, marked `unverified` until the evidence service checks it.
   identical, since no coverage configuration sets `final_size`. The coverage pack therefore does not test the
   solver; the analytic pack and `selftest_final_size.py` do.
 - Self-tests: `engine.py --self-test` (v0.1 contract, batching, stop rule, pack subset, stamps),
-  `selftest_final_size.py --self-test` (v0.3, FD1–FD13) and `selftest_age.py --self-test` (v0.2, A1–A24), about 15 s and 25 s locally with two BLAS threads.
+  `selftest_final_size.py --self-test` (v0.3, FD1–FD17) and `selftest_age.py --self-test` (v0.2, A1–A24), about 15 s and 25 s locally with two BLAS threads.

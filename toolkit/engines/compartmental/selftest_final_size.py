@@ -8,7 +8,7 @@ solves the multigroup final-size relation directly (engine.solve_final_size) ins
 cases check that path against the v0.2 stepping path (the generation grid, run here through the engine's own
 _simulate), against the pack's independent oracles (benchmarks/oracles.py, imported by this test only, never by the
 engine), on the edge cases (R below 1, unreachable groups, a group behind an immune one, no susceptibles, near the
-threshold), and that batched equals run. Design: docs/design/direct-final-size-solver.md. Nothing here names a
+threshold), and that batched equals run. Design: docs/design/direct-final-size-solver.md (PR #346). Nothing here names a
 disease.
 """
 from __future__ import annotations
@@ -159,7 +159,8 @@ def _self_test() -> int:
     uc = UnitSpec("c", {"N": N3, "s0": [1.0, 0.0, 1.0], "seed": 1e-9, "intro": "a", "contact": chain})
     oc = em.run({"q": 1.0}, uc, Package("0", {}), H, 1)
     uo = UnitSpec("o", {"N": N3, "s0": [1.0, 1.0, 1.0], "seed": 1e-9, "intro": "a", "contact": chain})
-    oo = em.run({"q": 1.0}, uo, Package("0", {}), H, 1)
+    # two critical groups in a row amplify rounding about 100-fold (FD14): the open chain is checked at tol 1e-11
+    oo = multi(["a", "b", "c"], tol=1e-11).run({"q": 1.0}, uo, Package("0", {}), H, 1)
     reach = E.infection_reach(np.asarray([chain]), np.asarray([[1.0, 0.0, 1.0]]), np.asarray([[3e-9, 0.0, 0.0]]))
     ok(od.per_capita["infections"]["b"] == 0.0 and od.per_capita["infections"]["c"] == 0.0
        and oc.per_capita["infections"]["b"] == 0.0 and oc.per_capita["infections"]["c"] == 0.0

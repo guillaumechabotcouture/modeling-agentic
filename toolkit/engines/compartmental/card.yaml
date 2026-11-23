@@ -1262,35 +1262,35 @@ benchmarks:
   in_band: true
   status: in_band
 - id: AS7
-  metric: final_size on the generation grid (one generation per step) equals the declared SEIR interval's final
-    size, near criticality (Reff about 1.05)
+  metric: 'final_size without forcing (v0.3: the direct final-size solver; v0.2: one generation per step) equals
+    the stepped declared SEIR interval''s final size, near criticality (Reff about 1.05)'
   role: held_out
   target: null
   band: null
   source: "exponential-survival identity: the final size does not depend on the generation interval (design note\
     \ \xA71.1)"
-  band_sha256: 9e0dc4de8c7dd7a5ba4be2d9a2bb104ba3b6ff005aa86becf5a7322517741b6a
-  computed: 4.08006961549745e-15
+  band_sha256: e313396b33431f632b507d980c3a47f35378779d1e632076fcbfa3f0ffcb2e6e
+  computed: 2.4591439995447217e-13
   reference:
   - 0.05892676388821895
   - 0.07545198554963957
   - 0.030245134553902132
   - 0.023417861801857644
   - 0.016848627122231397
-  error_abs: 4.08006961549745e-15
-  error_rel: 5.805298762232197e-14
+  error_abs: 2.4591439995447217e-13
+  error_rel: 3.959198340688164e-12
   tolerance:
     rel: 1.0e-07
   compare: eq
   per_seed_error_abs:
-  - 4.08006961549745e-15
-  - 4.08006961549745e-15
+  - 2.4591439995447217e-13
+  - 2.4591439995447217e-13
   computed_vector:
-  - 0.05892676388822237
-  - 0.07545198554964365
-  - 0.030245134553903732
-  - 0.023417861801858862
-  - 0.01684862712223225
+  - 0.058926763888020595
+  - 0.07545198554939365
+  - 0.03024513455379308
+  - 0.023417861801768997
+  - 0.01684862712216469
   in_band: true
   status: in_band
 - id: AS6
@@ -1444,5 +1444,5 @@ parameters:
   verified: unverified
 validation_label: validated against analytic identities and simulation-based coverage; published benchmarks FS7
   and RN5 not yet assessed
-results_sha256: 95187b027a5a0bdc633838eb220c7e34f18bfbd377e4acf6589dfd158b031da6
+results_sha256: 5e664a256c89ba65fa64ca0ada179cf3ebae1f26fb5d361a6f60eb41946e9677
 benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'

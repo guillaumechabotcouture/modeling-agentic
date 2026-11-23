@@ -297,13 +297,39 @@ def infection_reach(C: np.ndarray, s: np.ndarray, e: np.ndarray) -> np.ndarray:
     return m
 
 
+EPS = float(np.finfo(float).eps)
+
+
 def _final_size_map(K: np.ndarray, e: np.ndarray, a: np.ndarray, z: np.ndarray):
     """T(z) = e + a (1 - exp(-K z)) with a = s - e, per member and group, in the expm1 form (s - a exp(-K z) loses
-    the small final sizes near the threshold to cancellation), and the Jacobian's factor a exp(-K z). The row sums
-    run over the last axis of each member's own arrays, so a member's arithmetic does not depend on its batch
-    companions."""
+    the small final sizes near the threshold to cancellation); the Jacobian's factor a exp(-K z); and a bound on the
+    rounding error of the computed T (Codex r1 of #351, P1-1): the row sum x = sum_j K_ij z_j is off by at most
+    (G + 1) eps x, which moves T by at most a exp(-x) times that; expm1, the product and the sum add a few eps of
+    e + a (1 - exp(-x)). The row sums run over the last axis of each member's own arrays, so a
+    member's arithmetic does not depend on its batch companions."""
+    G = z.shape[-1]
     x = (K * z[:, None, :]).sum(axis=2)
-    return e + a * -np.expm1(-x), a * np.exp(-x)
+    T = e + a * -np.expm1(-x)
+    ax = a * np.exp(-x)
+    return T, ax, EPS * ((G + 1) * ax * x + 4.0 * T)
+
+
+def _certify(K, e, a, c, bound, upper: bool) -> np.ndarray:
+    """A candidate bound, made valid group by group (Codex r1 of #351, P1-1): start from min(c, bound) (upper) or
+    max(c, bound) (lower), so the vector never leaves the current bracket side; a group whose super- (sub-) solution
+    check fails with the rounding bound against it falls back to the current bound, and the check is repeated, since
+    that move changes the other groups' T. A group at the current bound is valid by monotonicity alone (bound is a
+    super- or sub-solution and the vector lies on its side of it), so the result is a valid bound in exact arithmetic,
+    and a group limited by rounding no longer blocks the others' progress."""
+    c = np.where(np.isfinite(c), c, bound)
+    c = np.minimum(c, bound) if upper else np.maximum(c, bound)
+    for _ in range(c.shape[-1] + 1):
+        Tc, _, rc = _final_size_map(K, e, a, c)
+        ok = (c == bound) | ((Tc + rc <= c) if upper else (Tc - rc >= c))
+        if ok.all():
+            break
+        c = np.where(ok, c, bound)
+    return c
 
 
 def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, cap: int):
@@ -312,20 +338,26 @@ def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, ca
     (0 <= e <= s); z counts the seeds. Groups the seeds do not reach (infection_reach) keep z = e. On the reached
     groups the map T is monotone and has one root in [e, s]: the lower iterate starts at e, the upper at s, and both
     stay valid bounds (a sub-solution v, T(v) >= v, lies below the root; a super-solution, T(v) <= v, above it). Each
-    iteration takes the plain step T on both sides and offers Newton candidates (from the upper iterate; the lower
-    candidate uses the upper Jacobian, so it stays below the root, Ortega & Rheinboldt 13.3) and the Newton point
-    offset either way along (I - J)^-1 1; a candidate is kept only when it passes the sub- or super-solution check
-    as computed. A member stops when its bracket is at most `tol` wide in every group, which bounds the error of the
-    midpoint it returns by tol / 2. A member whose bracket has not closed within `cap` iterations, or has stopped
-    shrinking (the floating-point limit), fails closed. Returns (z, iterations per member)."""
+    iteration takes the plain step on both sides, T less (lower) or plus (upper) its rounding bound, and offers
+    Newton candidates (from the upper iterate; the lower candidate uses the upper Jacobian, so it stays below the
+    root, Ortega & Rheinboldt 13.3) and the Newton point offset either way along (I - J)^-1 1. A candidate is kept,
+    group by group (_certify), only where the sub- or super-solution check holds with the rounding bound against it,
+    so floating point never certifies a bound (Codex r1 of #351, P1-1). Every member iterates at least once (P1-2). A member stops when its
+    bracket is at most `tol` wide in every group, and returns the lower bound: within tol of the root and never above
+    it, as the stepping path's truncated sum (a subcritical epidemic stays within the seed-size bound). A
+    member whose bracket has not closed within `cap` iterations, or whose total bracket width has not shrunk by 1%
+    within max(200, 4 G) iterations (the floating-point limit: an ill-conditioned problem whose tol the arithmetic
+    cannot certify, crawling on plain steps), fails closed.
+    Returns (z, iterations per member)."""
     B, G = s.shape
     m = infection_reach(K, s, e)
     top = np.where(m, s, e)                                # unreached groups: the relation is z = e
     a = top - e
     lo, hi = e.copy(), top.copy()
     iters = np.zeros(B, int)
-    live = np.max(hi - lo, axis=1) > tol
-    stall = np.zeros(B, int)
+    live = np.ones(B, bool)                                # Codex r1 P1-2: the map is evaluated at least once
+    ref_w, ref_n = np.full(B, np.inf), np.zeros(B, int)
+    window = max(200, 4 * G)
     eye = np.eye(G)[None]
     for n in range(1, int(cap) + 1):
         idx = np.nonzero(live)[0]
@@ -333,9 +365,9 @@ def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, ca
             break
         Kb, tb, eb, ab, mb = K[idx], top[idx], e[idx], a[idx], m[idx]
         l0, u0 = lo[idx], hi[idx]
-        Tl, _ = _final_size_map(Kb, eb, ab, l0)
-        Tu, xu = _final_size_map(Kb, eb, ab, u0)
-        l1, u1 = np.maximum(l0, Tl), np.minimum(u0, Tu)
+        Tl, _, rl = _final_size_map(Kb, eb, ab, l0)
+        Tu, xu, ru = _final_size_map(Kb, eb, ab, u0)
+        l1, u1 = np.maximum(l0, np.clip(Tl - rl, eb, tb)), np.minimum(u0, np.clip(Tu + ru, eb, tb))
         A = eye - np.where(mb[:, :, None] & mb[:, None, :], xu[:, :, None] * Kb, 0.0)
         rhs = np.stack([u0 - Tu, l0 - Tl, mb.astype(float)], axis=2)
         try:                                               # LAPACK solves each member's matrix on its own
@@ -352,21 +384,23 @@ def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, ca
         dmax = np.max(np.where(mb, np.abs(d), 0.0), axis=1, keepdims=True)
         off = np.where(mb & (dmax > 0), d / np.where(dmax > 0, dmax, 1.0), 0.0) * (0.25 * tol)
         for c in (newton, np.clip(newton + off, eb, tb)):
-            Tc, _ = _final_size_map(Kb, eb, ab, np.nan_to_num(c))
-            good = np.all(np.isfinite(c), axis=1) & np.all(Tc <= c, axis=1)
-            u1 = np.where(good[:, None], np.minimum(u1, c), u1)
+            u1 = _certify(Kb, eb, ab, c, u1, upper=True)
         for c in (np.clip(l0 - sol[:, :, 1], eb, tb), np.clip(newton - off, eb, tb)):
-            Tc, _ = _final_size_map(Kb, eb, ab, np.nan_to_num(c))
-            good = np.all(np.isfinite(c), axis=1) & np.all(Tc >= c, axis=1)
-            l1 = np.where(good[:, None], np.maximum(l1, c), l1)
-        w0, w1 = np.max(u0 - l0, axis=1), np.max(u1 - l1, axis=1)
+            l1 = _certify(Kb, eb, ab, c, l1, upper=False)
+        w1 = np.max(u1 - l1, axis=1)
+        # Codex r1 P2-3: progress is the total width over the groups (bounds advance along a chain while the widest
+        # group's width stays put)
+        tw = np.sum(u1 - l1, axis=1)
+        shrank = tw < 0.99 * ref_w[idx]
+        ref_w[idx] = np.where(shrank, tw, ref_w[idx])
+        ref_n[idx] = np.where(shrank, n, ref_n[idx])
         lo[idx], hi[idx] = l1, u1
         iters[idx] = n
-        stall[idx] = np.where(w1 < w0, 0, stall[idx] + 1)
         done = w1 <= tol
         live[idx[done]] = False
-        if np.any(stall[idx] >= 50):
-            bad = idx[stall[idx] >= 50]
+        stuck = live[idx] & (n - ref_n[idx] >= window)
+        if np.any(stuck):
+            bad = idx[stuck]
             raise RuntimeError(f"final-size solver: the bracket stopped shrinking above tol {tol:g} (converged: false; "
                                f"batch members {[int(b) for b in bad[:10]]}; width {float(np.max(w1)):.3g}); declare a "
                                "tol above the floating-point limit")
@@ -374,7 +408,7 @@ def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, ca
         bad = [int(b) for b in np.nonzero(live)[0]]
         raise RuntimeError(f"final-size solver: the bracket did not close within {cap} iterations (converged: false; "
                            f"batch members {bad[:10]})")
-    return np.clip(0.5 * (lo + hi), e, top), iters
+    return lo, iters
 
 
 def extinction_probability(K: np.ndarray, offspring: str, iters: int = 200000) -> np.ndarray:
@@ -1246,7 +1280,9 @@ class CompartmentalEngine:
                 d0 = self.days(t0, horizon)
                 # Codex r2 P1-4: a final-size window ends at this member's own last step (its stop), never at a
                 # batch companion's, so batched and single runs give the same endpoint diagnostics
-                k_end = int(state["stopped"][b]) if self.mode == "to_extinction" and state["stopped"][b] >= 0 else T1 - 1
+                # Codex r1 of #351 P1-2: on the direct path the end state is the last row, whatever the iteration count
+                k_end = (T1 - 1 if ctx.get("direct") else int(state["stopped"][b])
+                         if self.mode == "to_extinction" and state["stopped"][b] >= 0 else T1 - 1)
                 d1 = self.days(t1, horizon) if math.isfinite(t1) else float(times[min(max(k_end, 0), T1 - 1)])
                 if not math.isfinite(t1):
                     S1 = S_after[min(k_end, T1 - 1), b]
@@ -1287,7 +1323,8 @@ class CompartmentalEngine:
                 meta["converged"] = bool(not state["active"][b])
             if self.final_size:
                 meta["after_window_share"] = None if gens else float(after[b])
-                meta["time_axis"] = "generations" if gens else "days"
+                # Codex r1 of #351 P2-4: the direct path's steps are solver iterations, not generations
+                meta["time_axis"] = "solver_iterations" if ctx.get("direct") else "generations" if gens else "days"
                 meta["final_size_path"] = "direct_solver" if ctx.get("direct") else "simulation"     # v0.3
             if self.mode == "windowed" and self.rt_trajectory:
                 s_traj = S_after[:, b] / N[b]
