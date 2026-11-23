@@ -191,8 +191,11 @@ def spec_problems(spec) -> list[str]:
                        "independent of the calibration targets (independent: [{parameter, reason}])")
         for v in sorted(indn & set(sh)):
             bad.append(f"{w}.independent: {v} is also shared")
-        card = eng.describe()
-        wins = card.outputs.get("windows", [])
+        try:
+            wins = eng.describe().outputs.get("windows", [])
+        except Exception as e:  # noqa: BLE001 -- fail closed with the diagnostic (Codex r3 of #334, P2-7)
+            bad.append(f"{w}: the engine card cannot be read ({type(e).__name__}: {str(e)[:200]})")
+            return bad
     else:
         eng, wins = None, None
     bad += _unmatched_problems(j.get("unmatched"), w)

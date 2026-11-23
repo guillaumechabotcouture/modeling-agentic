@@ -263,7 +263,7 @@ ENGINE_CHOICE = "engine_choice.json"
 
 
 def engine_is_auto(eng) -> bool:
-    return eng == "auto" or (isinstance(eng, dict) and eng.get("auto") is True)
+    return eng == "auto" or (isinstance(eng, Mapping) and eng.get("auto") is True)
 
 
 def _resolve_engine_choice(s: "Spec") -> None:
@@ -316,6 +316,10 @@ class Spec:
         self.derived = None          # derived-input obligations: None = when the run declares derivations
         if engine_is_auto(raw.get("engine")) and path is None:
             self.engine_auto = self.engine_pending = True      # a mapping with no file beside it: no choice to read
+        try:          # the engine declaration as signed (an engine choice replaces raw["engine"] later)
+            self.engine_declared = copy.deepcopy(raw.get("engine"))
+        except TypeError:
+            self.engine_declared = raw.get("engine")
         self._engine = None
         self._engine_ref = None      # the engine declaration _engine was loaded from
         self._units = None
@@ -358,7 +362,9 @@ class Spec:
     def scale_cards(self):
         """check_scale's cards for this spec: each signed candidate while the engine choice is pending (scale_cards
         on the raw mapping), else the engine's own card (a read failure is the entry, so the check refuses)."""
-        if self.engine_pending:
+        if self.raw.get("engine") is None:
+            return None               # no engine named: the documented default, as for a raw mapping
+        if self.engine_pending or engine_is_auto(self.raw.get("engine")):
             return scale_cards(self.raw)
         try:
             eng = self.engine()
@@ -819,10 +825,40 @@ def _card_or_error(ref):
         return e
 
 
+def _auto_cards(raw: Mapping) -> list:
+    """[(ref, card or exception)] for engine: auto: the engines engine selection considers (the signed candidates,
+    else every registered engine: agents/analysis_backend.py candidate_entries), each built with the configuration
+    the selection gives it. A candidate whose card cannot be read that way, or that does not declare the calibrated
+    attribute, is one the selection never picks, so it is left out; when none is left, an entry that refuses."""
+    from agents import analysis_backend as AB
+    eng = raw.get("engine")
+    r = dict(raw, engine=dict(eng)) if isinstance(eng, Mapping) else dict(raw)
+    cal = r.get("calibration") if isinstance(r.get("calibration"), Mapping) else {}
+    a = cal.get("attribute")
+    out, why = [], []
+    try:
+        entries = AB.candidate_entries(r)
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        return [("engine: auto", e)]
+    for entry in entries:
+        ref, card_path, cfg_fn = (tuple(entry) + (None, None))[:3]
+        try:
+            card = AB._card(ref, card_path, cfg_fn(r) if cfg_fn else {})
+        except Exception as e:  # noqa: BLE001 -- not a candidate the selection can pick
+            why.append(f"{ref}: card unreadable ({type(e).__name__}: {str(e)[:120]})")
+            continue
+        if a not in (getattr(card, "unit_attributes", None) or {}):
+            why.append(f"{ref}: does not declare {a}")
+            continue
+        out.append((ref, card))
+    return out or [("engine: auto", SpecError(f"no candidate engine can run the calibrated attribute {a} "
+                                              f"({'; '.join(why) or 'none listed'})"))]
+
+
 def scale_cards(raw: Mapping, engine=None):
     """[(label, card or exception)] the scale of a raw spec mapping depends on: `engine` (an engine instance in hand)
-    or the engine the mapping names; with engine: auto, each signed candidate (none listed: an entry that refuses
-    anything but a declared linear scale); None when no engine is named."""
+    or the engine the mapping names; with engine: auto, the engines the selection may pick (_auto_cards); None when
+    no engine is named."""
     if engine is not None:
         try:
             return [(type(engine).__name__, engine.describe())]
@@ -832,12 +868,7 @@ def scale_cards(raw: Mapping, engine=None):
     if eng is None:
         return None
     if engine_is_auto(eng):
-        cands = eng.get("candidates") if isinstance(eng, Mapping) else None
-        if not cands:
-            return [("engine: auto (no candidate listed)",
-                     SpecError("the engine is not chosen yet, so no card can check the scale"))]
-        return [(c, _card_or_error({"ref": c}) if isinstance(c, str) else SpecError(f"candidate {c!r}"))
-                for c in cands]
+        return _auto_cards(raw)
     label = eng if isinstance(eng, str) else eng.get("ref") if isinstance(eng, Mapping) else repr(eng)
     return [(str(label), _card_or_error(dict(eng) if isinstance(eng, Mapping) else eng))]
 
@@ -875,7 +906,13 @@ def spec_scale_problems(s: "Spec") -> list[str]:
     cal = s.raw.get("calibration")
     if not isinstance(cal, Mapping) or ("scale" not in cal and not isinstance(cal.get("attribute"), str)):
         return []
-    return s.check_scale()[1]
+    bad = s.check_scale()[1]
+    dec = getattr(s, "engine_declared", None)
+    if engine_is_auto(dec) and not engine_is_auto(s.raw.get("engine")):
+        # an engine choice is written, but the signature covers engine: auto (the choice can be revisited): the
+        # scale must also hold on every engine the signed declaration lets the selection pick
+        bad += check_scale(cal, scale_cards(dict(s.raw, engine=dec)))[1]
+    return list(dict.fromkeys(bad))
 
 
 def attribute_notes(cal: dict, binding: dict, scale: str | None = None) -> list[dict]:
@@ -1082,7 +1119,6 @@ def _validate_pending(s: Spec) -> list[str]:
     if r["comparator"].get("package") not in s.packages():
         bad.append(f"comparator: package {r['comparator'].get('package')!r} is not a package")
     bad += [e for e in _validate_uncertainty(s, {}) if "the engine" not in e]
-    bad += spec_scale_problems(s)           # against every signed candidate's card (Codex r2 of #334, P1-3)
     from toolkit.spec import engine_parameters as PV
     bad += PV.shape_problems(s)           # the engine-dependent checks run per candidate and after the choice
     from toolkit.spec import perturb as PT
@@ -1385,8 +1421,9 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
     m = cal.get("method") if isinstance(cal, dict) else None
     if m not in CALIBRATION_METHODS:
         return [f"calibration.method: one of {CALIBRATION_METHODS}"]
-    # the scale on every method and path (method none and observed targets included): spec_scale_problems
-    return _validate_calibration_method(s, card, pnames, cols, cal, m) + spec_scale_problems(s)
+    # the scale on every method and path (method none and observed targets included): spec_scale_problems, run
+    # by validate() as the shared precondition calibration_scale (toolkit/spec/preconditions.py)
+    return _validate_calibration_method(s, card, pnames, cols, cal, m)
 
 
 def _validate_calibration_method(s, card, pnames, cols, cal, m) -> list[str]:
