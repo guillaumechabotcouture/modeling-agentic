@@ -298,6 +298,7 @@ def infection_reach(C: np.ndarray, s: np.ndarray, e: np.ndarray) -> np.ndarray:
 
 
 EPS = float(np.finfo(float).eps)
+TINY = float(np.finfo(float).smallest_subnormal)
 
 
 def _final_size_map(K: np.ndarray, e: np.ndarray, a: np.ndarray, z: np.ndarray):
@@ -305,13 +306,17 @@ def _final_size_map(K: np.ndarray, e: np.ndarray, a: np.ndarray, z: np.ndarray):
     the small final sizes near the threshold to cancellation); the Jacobian's factor a exp(-K z); and a bound on the
     rounding error of the computed T (Codex r1 of #351, P1-1): the row sum x = sum_j K_ij z_j is off by at most
     (G + 1) eps x, which moves T by at most a exp(-x) times that; expm1, the product and the sum add a few eps of
-    e + a (1 - exp(-x)). The row sums run over the last axis of each member's own arrays, so a
+    e + a (1 - exp(-x)). Products that underflow are off by at most one subnormal step each, so an absolute
+    (G + 1) TINY a is added (Codex r2 P1-1: a force rounded to zero still carries an allowance); a row sum that
+    overflows saturates T at e + a with no error term (r2 P2-4). The row sums run over the last axis of each member's own arrays, so a
     member's arithmetic does not depend on its batch companions."""
     G = z.shape[-1]
-    x = (K * z[:, None, :]).sum(axis=2)
+    with np.errstate(over="ignore"):
+        x = (K * z[:, None, :]).sum(axis=2)
     T = e + a * -np.expm1(-x)
     ax = a * np.exp(-x)
-    return T, ax, EPS * ((G + 1) * ax * x + 4.0 * T)
+    ax_x = np.where(ax > 0, ax * np.where(np.isfinite(x), x, 0.0), 0.0)
+    return T, ax, EPS * ((G + 1) * ax_x + 4.0 * T) + (G + 1) * TINY * a
 
 
 def _certify(K, e, a, c, bound, upper: bool) -> np.ndarray:
@@ -345,19 +350,20 @@ def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, ca
     so floating point never certifies a bound (Codex r1 of #351, P1-1). Every member iterates at least once (P1-2). A member stops when its
     bracket is at most `tol` wide in every group, and returns the lower bound: within tol of the root and never above
     it, as the stepping path's truncated sum (a subcritical epidemic stays within the seed-size bound). A
-    member whose bracket has not closed within `cap` iterations, or whose total bracket width has not shrunk by 1%
-    within max(200, 4 G) iterations (the floating-point limit: an ill-conditioned problem whose tol the arithmetic
-    cannot certify, crawling on plain steps), fails closed.
+    member whose bracket has not closed within `cap` iterations, or whose bounds have not moved at all for 50
+    iterations (the floating-point limit: an ill-conditioned problem whose tol the arithmetic cannot certify; slow
+    certified progress runs on to the cap, Codex r2 P2-3), fails closed.
     Returns (z, iterations per member)."""
+    K, s, e = (np.asarray(x, np.float64) for x in (K, s, e))     # Codex r2 P1-2: binary64 throughout
     B, G = s.shape
     m = infection_reach(K, s, e)
-    top = np.where(m, s, e)                                # unreached groups: the relation is z = e
+    # unreached groups, and groups no force reaches at all (a zero row: z = e exactly, r2 P2-5), keep the seed
+    top = np.where(m & np.any(K != 0, axis=2), s, e)
     a = top - e
     lo, hi = e.copy(), top.copy()
     iters = np.zeros(B, int)
     live = np.ones(B, bool)                                # Codex r1 P1-2: the map is evaluated at least once
-    ref_w, ref_n = np.full(B, np.inf), np.zeros(B, int)
-    window = max(200, 4 * G)
+    still = np.zeros(B, int)
     eye = np.eye(G)[None]
     for n in range(1, int(cap) + 1):
         idx = np.nonzero(live)[0]
@@ -388,17 +394,15 @@ def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, ca
         for c in (np.clip(l0 - sol[:, :, 1], eb, tb), np.clip(newton - off, eb, tb)):
             l1 = _certify(Kb, eb, ab, c, l1, upper=False)
         w1 = np.max(u1 - l1, axis=1)
-        # Codex r1 P2-3: progress is the total width over the groups (bounds advance along a chain while the widest
-        # group's width stays put)
-        tw = np.sum(u1 - l1, axis=1)
-        shrank = tw < 0.99 * ref_w[idx]
-        ref_w[idx] = np.where(shrank, tw, ref_w[idx])
-        ref_n[idx] = np.where(shrank, n, ref_n[idx])
+        # Codex r1/r2 P2-3: any bound that moves is progress (bounds advance along a chain while the widest group's
+        # width stays put; slow certified progress is not a floating-point limit)
+        moved = np.any(l1 != l0, axis=1) | np.any(u1 != u0, axis=1)
+        still[idx] = np.where(moved, 0, still[idx] + 1)
         lo[idx], hi[idx] = l1, u1
         iters[idx] = n
         done = w1 <= tol
         live[idx[done]] = False
-        stuck = live[idx] & (n - ref_n[idx] >= window)
+        stuck = live[idx] & (still[idx] >= 50)
         if np.any(stuck):
             bad = idx[stuck]
             raise RuntimeError(f"final-size solver: the bracket stopped shrinking above tol {tol:g} (converged: false; "

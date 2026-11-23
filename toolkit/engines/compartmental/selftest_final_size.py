@@ -224,7 +224,7 @@ def _self_test() -> int:
     # FD14 (P1-1): a chain of critical groups amplifies the rounding of T; a bracket certified by rounding alone
     # reported an error 55 x tol. The solver either meets tol against a 50-digit solution or fails closed.
     ch = [[0.0, 0.0, 0.0, 0.0], [1e-6, 1.0, 0.0, 0.0], [0.0, 1.0, 1.0, 0.0], [0.0, 0.0, 1.0, 1.0]]
-    e4 = multi(["a", "b", "c", "d"], generation_interval=[1.0])
+    e4 = multi(["a", "b", "c", "d"], generation_interval=[1.0], step_cap=20000)   # it crawls to the cap
     u4 = UnitSpec("k", {"N": [1e6] * 4, "s0": [1.0] * 4, "seed": 1e-9, "intro": "a", "contact": ch})
     o4, err = safe(lambda: e4.run({"q": 1.0}, u4, Package("0", {}), H, 1))
     ref = [D(4) * D("1e-9")]
