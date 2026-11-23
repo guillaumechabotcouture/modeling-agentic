@@ -174,6 +174,20 @@ def _withhold_report(run_dir: str) -> None:
         _quarantine_report(run_dir)
 
 
+def _retire_stale_withheld(run_dir: str) -> None:
+    """Baseline hb2 (§5 fix 8): a language repair quarantines the rejected draft in report_withheld.md; once the run
+    ends with a regular report.md (every withhold path moves report.md away, so it is the delivered one), the
+    leftover is removed (no link followed), so no reader takes the run's report as withheld. The repair stays in the
+    history and in the gate records (report_acceptance_language). The caller calls it only on a post-write gate's
+    decision (Codex r1 of #355: a run that ends before that gate keeps the quarantined copy). Anything at that name
+    other than a regular file or a link (a directory) is left alone."""
+    p = os.path.join(run_dir, "report.md")
+    w = os.path.join(run_dir, "report_withheld.md")
+    if os.path.isfile(p) and not os.path.islink(p) and (os.path.islink(w) or os.path.isfile(w)):
+        from lib.safe_io import remove_nofollow
+        remove_nofollow(run_dir, "report_withheld.md")
+
+
 def _quarantine_report(run_dir: str) -> None:
     """F6 S1-7: move report.md to report_withheld.md through lib.safe_io (no link followed at either name;
     a linked report.md is refused, a link at the destination is replaced)."""
@@ -864,9 +878,10 @@ def stage_inputs(run_dir: str, question: str) -> list[str]:
     return staged
 
 
-def record_cited_inputs(run_dir: str) -> list[str]:
+def record_cited_inputs(run_dir: str, derived_inputs: bool = True) -> list[str]:
     """Every file decision_spec.yaml cites must be inside the run directory; each is recorded with
-    its sha256 in data/inputs_provenance.json. Returns the problems (pre-sign)."""
+    its sha256 in data/inputs_provenance.json. Returns the problems (pre-sign). `derived_inputs`: the run derives its
+    units table, so a missing one's hint names the staged file as a derivation's input (Codex r3 of #355)."""
     import yaml
     import pipeline as P
     try:
@@ -884,6 +899,8 @@ def record_cited_inputs(run_dir: str) -> list[str]:
             probs.append(f"the staged input {dest} was changed or removed after it was copied")
         elif os.path.isfile(src) and _sha256(src) != e.get("sha256"):
             probs.append(f"the staged input {dest} no longer matches its source {e.get('source')}")
+    units = (spec.get("decision_units") or {}).get("csv") if isinstance(spec, dict) \
+        and isinstance(spec.get("decision_units"), dict) else None
     for rel in sorted(set(found)):
         p = os.path.realpath(os.path.join(run_dir, rel))
         if not p.startswith(root + os.sep):
@@ -891,7 +908,9 @@ def record_cited_inputs(run_dir: str) -> list[str]:
         elif os.path.isdir(p):
             prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/") + "/"] = {"dir": True}
         elif not os.path.isfile(p):
-            probs.append(f"the spec cites {rel}, which does not exist")
+            probs.append(f"the spec cites {rel}, which does not exist"
+                         + P.staged_copy_hint(rel, run_dir, derive=derived_inputs and isinstance(units, str)
+                                              and units.strip() == rel))
         else:
             prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/")] = {"sha256": _sha256(p)}
     os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
@@ -1410,6 +1429,9 @@ class Machine:
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
             self._withhold_if_acceptance_language()
+            if frm == "GATE" and (self.st.last_gate or {}).get("post_write") and self.st.last_gate.get("action") \
+                    and self.st.status in DELIVERED_STATUSES:     # a gate decision that delivers the report (Codex r2)
+                _retire_stale_withheld(self.run_dir)
             self._finish()
         if before_save is not None:
             before_save()
@@ -1780,13 +1802,16 @@ class Machine:
                 self.st.tries["spec_feedback_checked"] = list(self.st.tries["spec_feedback"])
             else:
                 self.st.tries.pop("spec_feedback_checked", None)
-            return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
+            # baseline hb2 §4.6: the whole feedback of each failed try is kept in its history entry
+            return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}",
+                            extra={"feedback": list(self.st.tries["spec_feedback"])})
         self.st.tries.pop("spec_feedback", None)
         self.st.tries.pop("spec_feedback_checked", None)
         if not self._review_conditions(self.st.signoff, defer=False):
             # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
             self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
-            return self._go("SPEC", "review conditions could not be prepared for signing")
+            return self._go("SPEC", "review conditions could not be prepared for signing",
+                            extra={"feedback": list(self.st.tries["spec_feedback"])})
         return self._go("EVIDENCE", "spec drafted and valid")
 
     def _spec_checks(self, rd: str) -> list[str]:
@@ -1817,7 +1842,7 @@ class Machine:
             return not got
         if self.st.derived_inputs:
             run("derivation", lambda: self._derive(rd))
-        run("cited-input", lambda: record_cited_inputs(rd))      # records the hashes before a check reads a cited file
+        run("cited-input", lambda: record_cited_inputs(rd, bool(self.st.derived_inputs)))      # records the hashes before a check reads a cited file
         outside = self._cites_outside(rd)
         if outside:             # Codex r1 P1-1: no later check opens a file the cited-input check refused
             out.extend(x for x in outside if x not in out)       # r2 P1-2: never empty, so never a pass
@@ -3054,6 +3079,10 @@ def _pre_engine_check(spec: dict) -> list[str]:
 
 
 ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
+# The final statuses under which a post-write gate's decision delivers report.md (accepted, declared or not accepted,
+# each with its write-up): only these retire a stale report_withheld.md (_retire_stale_withheld)
+DELIVERED_STATUSES = ACCEPTED_STATUSES + ("completed_scope_declared", "completed_scope_declined",
+                                          "completed_gate_not_accepted")
 STATUS_MARK = "<!-- harness: run status -->"
 
 
@@ -5520,6 +5549,35 @@ def _self_test() -> int:
             if want:
                 ok(any("data/missing.csv" in x for x in rc) and any("data/missing.csv" in x for x in dr),
                    f"T50d the joint target's own csv is still a cited file, and a missing one is refused ({rc}; {dr})")
+        # T50f (baseline hb2 §4.6): the spec cited a question file by its repository path; its staged copy
+        # existed. Both refusals name the staged path, so the next try cites it.
+        for cited in ("requirements.txt", "./requirements.txt"):
+            spec = {"decision_units": {"csv": "data/inputs/requirements.txt"},
+                    "calibration": {"targets": [{"id": "t", "csv": cited}]}}
+            yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+            rc = [x for x in record_cited_inputs(fk) if "does not exist" in x]
+            dr = [p["claim"] for p in P_.derivation_problems(fk, spec, required=True) if p["code"] == "data_ref_not_derived"]
+            ok(rc and all("data/inputs/requirements.txt" in x for x in rc)
+               and dr and all("data/inputs/requirements.txt" in x for x in dr),
+               f"T50f a cited path whose staged copy exists: the refusals name the staged path ({rc}; {dr})")
+        # T50g (Codex r1 of #355): a qualified path in another folder (a derived table) is not matched to a staged
+        # input by its file name: following that hint would skip the derivation.
+        spec = {"decision_units": {"csv": "data/inputs/requirements.txt"},
+                "calibration": {"targets": [{"id": "t", "csv": "data/derived/requirements.txt"}]}}
+        yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+        rc = [x for x in record_cited_inputs(fk) if "does not exist" in x]
+        ok(rc and not any("staged copy" in x for x in rc),
+           f"T50g a qualified path is matched to a staged input only by its full path ({rc})")
+        # T50h (Codex r2 of #355): the units table must be a derivation's output, so its hint names the staged file as
+        # the derivation's input, never as the path to cite.
+        spec = {"decision_units": {"csv": "requirements.txt"}}
+        yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+        rc = [x for x in record_cited_inputs(fk) if "does not exist" in x]
+        ok(rc and all("derivation" in x and "cite that path" not in x for x in rc),
+           f"T50h the units table's hint says to read the staged file in a derivation ({rc})")
+        rc = [x for x in record_cited_inputs(fk, derived_inputs=False) if "does not exist" in x]
+        ok(rc and all("cite that path" in x for x in rc),
+           f"T50i (Codex r3) a run that runs no derivations is told to cite the staged units table itself ({rc})")
         for kind, key in (("group", {"csv": {"file": "data/missing.csv"}, "units": "state"}),
                           ("unit", {"csv": "data/missing.csv"})):    # Codex: only a group target's column name
             spec = {"decision_units": {"csv": "data/inputs/requirements.txt"}, "calibration": {"joint": {"targets": [
@@ -5787,6 +5845,56 @@ def _self_test() -> int:
                 ok(s == want and any(c.endswith(":repair") for c in T.calls) and os.path.exists(rp)
                    and "validated" not in open(rp).read() and al.get("repairs") == 1 and not al.get("remaining"),
                    f"T84 a declared report with acceptance language goes back to the writer and is delivered repaired ({s}, {al})")
+                # T84b (baseline hb2 §5 fix 8): the rejected draft's report_withheld.md stayed beside the delivered
+                # report.md, and harness_metrics counted the run as not done. Delivery retires it.
+                ok(not os.path.lexists(os.path.join(d, "report_withheld.md")),
+                   "T84b once the repaired report.md is delivered, the stale report_withheld.md is retired")
+                # T84c-T84d (Codex r1 of #355): only a post-write gate's decision delivers the repaired draft; a run
+                # that ends before it (the budget, at WRITE or PRESENTATION) keeps the quarantined copy, and a
+                # directory at that name never stops the run's end.
+                t84 = {}
+                for case, frm, gate, wh_dir in (("budget_at_write", "WRITE", {}, False),
+                                                ("gate_no_action", "GATE", {"post_write": True, "action": None}, False),
+                                                ("gate_dir", "GATE", {"post_write": True, "action": "ACCEPT"}, True),
+                                                ("gate_ok", "GATE", {"post_write": True, "action": "ACCEPT"}, False)):
+                    dc = os.path.join(td, "t84c_" + case)
+                    os.makedirs(dc)
+                    open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+                    if wh_dir:
+                        os.makedirs(os.path.join(dc, "report_withheld.md"))
+                    else:
+                        open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+                    mc = Machine(dc, StubTasks({}), RunState(question="q", state=frm, v2_rules=False, last_gate=gate),
+                                 backend=spike, log=lambda *a: None)
+                    try:
+                        mc._go("FINAL", "t", "budget_exhausted" if frm == "WRITE" else "completed")
+                        t84[case] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+                    except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                        t84[case] = repr(e)
+                # T84d (Codex r2 of #355): a post-write gate that ends the run without delivering the report (a
+                # validator error) keeps the quarantined copy too.
+                dc = os.path.join(td, "t84d")
+                os.makedirs(dc)
+                open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+                open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+                mc = Machine(dc, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False,
+                                                         last_gate={"post_write": True, "action": "VALIDATOR_ERROR"}),
+                             backend=spike, log=lambda *a: None)
+                mc._go("FINAL", "validator error", "completed_gate_error")
+                t84["validator_error"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+                # T84e (Codex r3): an owner-declined declaration's report is delivered too
+                dc = os.path.join(td, "t84e")
+                os.makedirs(dc)
+                open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+                open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+                mc = Machine(dc, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False,
+                                                         last_gate={"post_write": True, "action": "RUN_FAILED"}),
+                             backend=spike, log=lambda *a: None)
+                mc._go("FINAL", "declined", "completed_scope_declined")
+                t84["declined"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+                ok(t84 == {"budget_at_write": True, "gate_no_action": True, "gate_dir": True, "gate_ok": False,
+                           "validator_error": True, "declined": False},
+                   f"T84c the quarantined draft is retired only after a post-write gate decided, never a directory ({t84})")
             else:
                 ok(s == want and not os.path.exists(rp) and os.path.exists(os.path.join(d, "report_withheld.md"))
                    and al.get("remaining"),
@@ -6781,6 +6889,12 @@ def _self_test_geometry(ok, td: str) -> None:
     ok(status == "run_failed" and any(x.startswith("reciprocal_swap") and "reciprocal_swap:0+1" in x for x in fb)
        and "SIGN" not in [h.get("to") for h in load_state(d1).history],
        f"IG-M1 a units table whose rows carry each other's points is refused before SIGN ({status}; {fb[:1]})")
+    # SH1 (baseline hb2 §4.6): each failed try's feedback is kept whole in its history entry (the `why` line is cut
+    # short, and spec_feedback is cleared once a try passes), so a later reader can tell what each try was told.
+    sh = [h for h in load_state(d1).history if h.get("from") == "SPEC" and h.get("to") == "SPEC"]
+    ok(sh and all(isinstance(h.get("feedback"), list) and h["feedback"] for h in sh)
+       and sh[-1]["feedback"] == fb and any(len("; ".join(h["feedback"])) > len(h["why"]) for h in sh),
+       f"SH1 every SPEC retry records its try's whole feedback in history ({[len(h.get('feedback') or []) for h in sh]})")
     hf = {f["kind"]: f for f in m1.harness_findings()}
     ok(hf.get("reciprocal_swap", {}).get("severity") == "HIGH" and hf["reciprocal_swap"]["scope_declarable"] is False,
        f"IG-M3 the gate carries the open swap as a HIGH finding that cannot be declared ({sorted(hf)})")

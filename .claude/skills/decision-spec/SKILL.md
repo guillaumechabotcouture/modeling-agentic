@@ -295,6 +295,10 @@ when that test changes the plan (toolkit/analysis/conflicts.py). Declare known m
 - Do not put digits in a decision test's `text`: it says in words what the test asks
   ("does the plan change if the effect is at the low end of its range?"). The values tested
   and the results are rendered from computed claims, and a text with a number is refused.
+  The same holds for the yes, no and undetermined texts of `deliverable.decision.statements`:
+  the harness renders the threshold and the probability.
+- Cite a question's input files by their staged path (`data/inputs/<the path in the question>`),
+  never by the repository path: only the staged copy is in the run directory.
 - Do not give a value in `engine_parameters` for a parameter the engine card lists as
   `calibrated` or `fitted`: fitting sets it, and the entry is refused. Calibrate a `calibrated`
   one under `calibration`, or leave it to the engine; a `fitted` one is set by the engine's own
