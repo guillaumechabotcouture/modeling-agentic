@@ -152,6 +152,7 @@ def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate
                  budget: dict | None, history_rows: int = 30, settings=None) -> dict:
     att = attempts(run_dir)
     fs, write_up, owner = [], [], []
+    current_gaps = FL.harness_gaps(ledger)
     for f in FL.open_findings(ledger):
         row = {"id": f.id, "kind": f.kind, "severity": f.severity, "blocking": f.blocking,
                "owner_state": f.owner_state, "resolution_type": f.resolution_type,
@@ -161,6 +162,8 @@ def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate
         gaps = [e for e in f.events or [] if isinstance(e, dict) and e.get("status") == HARNESS_GAP]
         if gaps:                                   # declared in an earlier round: the planner sees why
             row["harness_gap"] = gaps[-1].get("note") or "declared"
+        if f.id in current_gaps:                   # and it still reads as declared (hb2 fix 4)
+            row["harness_gap_current"] = True
         if needs_owner_amendment(f):           # the owner's decision first, whatever the stage (Codex #258 P2-4)
             owner.append(row)
         elif is_write_up(f):
@@ -315,13 +318,16 @@ def spec_patch(plan) -> dict | None:
 def default_plan(packet: dict) -> dict:
     """The harness's own plan when the planner fails twice: one task per blocking finding, in
     the packet's order (blocking first, then severity), each a fix by its owner state."""
-    tasks = []
+    tasks, gaps = [], []
     for f in packet["findings"]:
+        if f.get("harness_gap_current"):           # no task for a declared harness gap (Codex r1 of #357, P2-11)
+            gaps.append({"finding": f["id"], "reason": f"declared earlier: {f.get('harness_gap')}"[:300], "needs": []})
+            continue
         if f["blocking"] and f["resolution_type"] != "owner_decision" and not is_write_up(f):
             tasks.append({"id": f"T{len(tasks) + 1}", "findings": [f["id"]], "action": "fix",
                           "owner_state": f["owner_state"], "brief": f"Fix {f['id']}: {f.get('label') or FL.short_label(f['claim'])}",
                           "files": list(FIX_EDITABLE)})        # all it may edit: the planner did not narrow it
-    return {"tasks": tasks, "deferred": [], "by": "harness default"}
+    return {"tasks": tasks, "deferred": [], "by": "harness default", **({"harness_gaps": gaps} if gaps else {})}
 
 
 # ------------------------------------------------------------------ measurement
@@ -456,7 +462,7 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
                 # the gap binds the finding as it reads now (its kind and remedy class: hb2 fix 4)
                 FL._event(f, round_n, HARNESS_GAP, "fix_planner",
                           f"{str(g.get('reason')).strip()} Needs: {', '.join(map(str, g.get('needs') or []))}"[:600],
-                          key=FL.finding_fingerprint(f))
+                          key=FL.harness_gap_key(f))
         FL.save(run_dir, led)
         log(f"[fix loop] harness gap(s), not fix tasks: {', '.join(gap_ids)}")
     done = {r.get("task") for r in impact_rows(run_dir) if r.get("round") == round_n}
@@ -879,6 +885,9 @@ def _self_test() -> int:
            and s20["rows"] == 0 and impact_rows(d) == []
            and plan20.get("harness_gaps") == ["R-001", "R-004"] and ev20 and "harness code" in ev20[-1].get("note", "")
            and FL.load(d)["R-001"].status == "open" and "R-001" in FL.harness_gaps(FL.load(d))
+           # Codex r1 of #357 P2-11: the harness's default plan plans no task for a declared gap
+           and not any("R-001" in t["findings"] for t in default_plan(build_packet(d, FL.load(d), 2, 3, None,
+                                                                                   None))["tasks"])
            and build_packet(d, FL.load(d), 2, 3, None, None)["findings"][0].get("harness_gap"),
            f"F20c a harness gap is recorded with its reason (plan, summary, ledger event, next packet), not as a fix "
            f"row ({s20}, {ev20})")

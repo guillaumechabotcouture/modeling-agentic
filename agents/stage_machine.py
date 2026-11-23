@@ -408,7 +408,10 @@ def _bearing_item(run_dir: str, v: dict) -> dict:
     fp = hashlib.sha256(json.dumps({"finding": gid, "claim": v.get("claim", ""), "evidence": ev}, sort_keys=True,
                                    default=str).encode()).hexdigest()[:16]
     return {"finding": gid, "kind": v.get("kind"), "reason": "a measured decision test changes the plan",
-            "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp}
+            "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp,
+            # the producer's record the answer binds, for the report's statement of it (Codex r1 of #357, P1-7/8)
+            "record": "toolkit" if v.get("source") == "toolkit/analysis/contract.py" else "spike",
+            "result_sha256": (ev or {}).get("result_sha256") if isinstance(ev, dict) else None}
 
 
 def _answer_counts(a: dict, mode: str) -> bool:
@@ -458,6 +461,7 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
                 if str(a.get("finding")) == item["finding"] and _answer_counts(a, mode):
                     if a.get("decision") == "accept":
                         v["owner_signed"] = {"by": a.get("by"), "at": a.get("at"), "fingerprint": item["fingerprint"],
+                                             "record": item["record"], "result_sha256": item["result_sha256"],
                                              **({"provisional": True} if a.get("provisional") else {})}
                         continue
                     v["scope_declarable"], v["owner_declined"] = False, True
@@ -695,9 +699,9 @@ def owner_accepted_now(run_dir: str, opened: list[dict], lead_ok: bool) -> set[s
     out = set()
     for o in opened:
         fid = str(o.get("id"))
-        a = answers.get(FL.answer_fingerprint(fid, kind=o.get("kind") or FL.CRITIC_KIND,
-                                              fix_requires=o.get("fix_requires"), claim=str(o.get("claim") or "")))
-        if a and str(a.get("finding")) == fid and a.get("decision") == "accept":
+        a = FL.answer_for(answers, fid, kind=o.get("kind") or FL.CRITIC_KIND, fix_requires=o.get("fix_requires"),
+                          claim=str(o.get("claim") or ""))
+        if a and a.get("decision") == "accept":
             out.add(fid)
     return out
 
@@ -738,11 +742,12 @@ def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int,
     return d
 
 
-def apply_held_rule(decision: dict, ledger: dict, owner_held=(), harness_gaps=()) -> dict:
+def apply_held_rule(decision: dict, ledger: dict, owner_held=(), harness_gaps=(), opened=None) -> dict:
     """hb2 fix 1: a gate that patches (rule 2) only for critic findings the owner holds (accepted) or the fix planner
     declared harness gaps has nothing a fix task can do: they are declared now (rule 3h), as rule 3m declares them when
     no HIGH is open, instead of a fix loop with no task and another critique round (malaria R2, dengue R2). Never with a
-    gate finding, a required artifact missing or a structural mismatch open."""
+    gate finding, a required artifact missing or a structural mismatch open, nor while any open finding with a test
+    (`opened`, a MEDIUM too) is neither the owner's nor a gap: the fix loop works to it (Codex r1 of #357, P1-3)."""
     if decision.get("action") != "PATCH_OR_RETHINK" or str(decision.get("rule_matched")) != "2" \
             or decision.get("accept_blockers") or decision.get("structural_mismatch"):
         return decision
@@ -752,11 +757,24 @@ def apply_held_rule(decision: dict, ledger: dict, owner_held=(), harness_gaps=()
             str(b.get("reviewer") or "").startswith("critique") and str(b.get("id")) in keep and str(b.get("id")) in ledger
             for b in hi):
         return decision
+    if opened is None or any(o.get("tested") and str(o.get("id")) not in keep for o in opened):
+        return decision
     ids = sorted(str(b.get("id")) for b in hi)
-    return dict(decision, action="DECLARE_SCOPE", rule_matched="3h", declared_open=ids,
+    return dict(decision, action="DECLARE_SCOPE", rule_matched="3h", declared_open=[o["id"] for o in opened],
                 rationale=(f"{len(ids)} HIGH finding(s) are open ({', '.join(ids)[:200]}), each one the owner answered "
                            "or a declared harness gap: no fix task can work on them, so they are declared in the "
                            "write-up (declared_findings.yaml) now, not accepted."))
+
+
+def scope_request_view(d: dict) -> dict:
+    """What the AWAIT_OWNER route asks: under rule 2o (rounds left) only the findings whose resolution is the owner's;
+    a policy-mapped owner item is asked at the round cap, as before (Codex r1 of #357, P1-4: the request held both,
+    and an answer to the decision test alone could not release the run)."""
+    if not isinstance(d, dict) or str(d.get("rule_matched")) != "2o":
+        return d
+    keep = lambda b: not (isinstance(b, dict) and b.get("owner_signoff")) or b.get("owner_resolution")  # noqa: E731
+    return dict(d, unresolved_high=[b for b in d.get("unresolved_high") or [] if keep(b)],
+                accept_blockers=[b for b in d.get("accept_blockers") or [] if keep(b)])
 
 
 DECLARED_FILE = "declared_findings.yaml"
@@ -2418,7 +2436,7 @@ class Machine:
                 gaps_now = sorted(FL.harness_gaps(led0))            # hb2 fix 4: not fix-loop work
                 d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget(),
                                       owner_held=held_now, harness_gaps=gaps_now)
-                d = apply_held_rule(d, led0, held_now, gaps_now)
+                d = apply_held_rule(d, led0, held_now, gaps_now, opened)
                 d["owner_held"] = held_now      # what this gate read as the owner's (FIX_LOOP's shortcut reads it here)
                 d["harness_gaps"] = gaps_now
                 d = require_judged(d, opened)
@@ -2628,7 +2646,8 @@ class Machine:
         scope_signoff.record and its fingerprints kept in run_state.json, as _request_owner does. No item: none is
         kept, and OWNER_DECISION fails closed."""
         import scope_signoff as SS
-        SS.record(self.run_dir, d, self.st.round, producer="agents/stage_machine.py GATE (decision-bearing findings)")
+        SS.record(self.run_dir, scope_request_view(d), self.st.round,
+                  producer="agents/stage_machine.py GATE (decision-bearing findings)")
         try:
             req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
         except (OSError, ValueError):
@@ -3165,40 +3184,69 @@ def dependence_lines(run_dir: str) -> list[str]:
     out = ["## The plan depends on inputs the owner accepted\n\n",
            "The delivered plan is solved at the signed values. Each decision test below changes the plan within the "
            "range it tests, and the owner's decision was to accept the plan with that dependence (harness-rendered).\n\n"]
+    try:
+        ref = (_CT._verified_doc(run_dir)[3] or {}).get("reference_plan")
+    except Exception:  # noqa: BLE001 -- unknown: said as such below
+        ref = None
+    against = ("the plan solved at the point values (the delivered plan is the expected-value plan over the "
+               "uncertainty draws, which the tests do not re-solve)") if ref == "point_plan" else "the delivered plan"
+    out[-1] = out[-1].rstrip("\n") + f" Units and feasibility are counted against {against}.\n\n"
     for f in rows:
         ev = next((e for e in reversed(f.events or []) if isinstance(e, dict) and e.get("status") == "owner_accepted"), {})
         who = ("the lead, provisionally (`--signoff lead`; the owner confirms or overturns it)" if ev.get("by") == "lead"
                else "the owner")
-        rec, res = None, None
-        try:
-            rec = _CT.decision_test_record(run_dir, f.key)
-            if rec and rec.get("path"):
-                res = yaml.safe_load(open(os.path.join(run_dir, str(rec["path"])))) or {}
-        except Exception:  # noqa: BLE001 -- the item is listed with what the ledger holds
-            res = None
-        res = res if isinstance(res, dict) else {}
-        if not res and rec is None:          # the spike backend's record (analysis.json), not the toolkit's
+        line = f"- **{f.key or f.id}**: accepted by {who}" + (f" at {ev['at']}" if ev.get("at") else "")
+        res, stale = {}, False
+        kind_rec = ev.get("record")
+        if kind_rec is None:                  # an accept recorded without it: the record that exists
+            try:
+                kind_rec = "toolkit" if _CT.decision_test_record(run_dir, f.key) else "spike"
+            except Exception:  # noqa: BLE001
+                kind_rec = "spike"
+        if kind_rec == "spike":       # the record the answer bound (Codex r1 of #357, P1-8)
             try:
                 tests = (json.load(open(os.path.join(run_dir, AB.ANALYSIS_JSON))) or {}).get("decision_tests") or []
                 t = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(f.key)), None)
-                res = {"varied": t.get("text")} if isinstance(t, dict) and t.get("text") else {}
             except (OSError, ValueError, AttributeError, TypeError):
-                res = {}
+                t = None
+            if isinstance(t, dict):          # the spike's measured effects, as recorded (P1-9)
+                meas = [f"{k} {v}" for k, v in t.items() if k not in ("id", "text", "plan_changes")
+                        and isinstance(v, (int, float, str)) and not isinstance(v, bool)]
+                out.append(line + f"; varies {t.get('text') or 'the input its record names'}"
+                           + (f"; measured: {', '.join(meas)}" if meas else "") + ".\n")
+            else:
+                out.append(line + "; its record could not be read.\n")
+            continue
+        try:
+            rec = _CT.decision_test_record(run_dir, f.key)
+            # the result the answer bound: another one since is not what was accepted (P1-7)
+            stale = bool(rec) and bool(ev.get("result_sha256")) and rec.get("result_sha256") != ev.get("result_sha256")
+            if rec and rec.get("path") and not stale:
+                res = yaml.safe_load(open(os.path.join(run_dir, str(rec["path"])))) or {}
+        except Exception:  # noqa: BLE001 -- the item is listed with what the ledger holds
+            res = {}
+        res = res if isinstance(res, dict) else {}
+        if stale:
+            out.append(line + "; its result has changed since it was accepted, so the next gate asks again and the "
+                              "values are not repeated here.\n")
+            continue
         what = str(res.get("varied") or res.get("question") or "the input this test varies (its result file could "
                                                                   "not be read)")
-        line = f"- **{f.key or f.id}**: varies {what}; accepted by {who}" + (f" at {ev['at']}" if ev.get("at") else "")
         vals = []
         for r in res.get("results") or []:
             if not isinstance(r, dict) or not r.get("decision_changes"):
                 continue
             ids = r.get("units_changed_ids")
-            n = r.get("units_changed")
-            names = f" ({', '.join(map(str, ids[:12]))}{', ...' if len(ids) > 12 else ''})" if isinstance(ids, list) \
-                and ids else ""
-            vals.append(f"at {r.get('value')}: {n} unit(s) change package{names}"
+            names = f" ({', '.join(map(str, ids))})" if isinstance(ids, list) and ids else ""     # every one (P2-13)
+            cm = r.get("cost_multipliers")
+            # a price case names its cost items and multipliers, not "case" (P2-12)
+            at = ", ".join(f"{k} x{v}" for k, v in cm.items()) if isinstance(cm, dict) and cm else r.get("value")
+            vals.append(f"at {at}: {r.get('units_changed')} unit(s) change package{names}"
                         + (f"; re-solved plan {r['recommendation']}" if r.get("recommendation") else "")
-                        + ("; the delivered plan is not feasible there" if r.get("point_plan_feasible") is False else ""))
-        out.append(line + (". " + "; ".join(vals) + ".\n" if vals else ".\n"))
+                        + ("; the reference plan is not feasible there" if r.get("point_plan_feasible") is False else "")
+                        # an unproven solve: the change may lie within the solver's bound (P1-10)
+                        + ("; not settled within the solver's gap" if r.get("within_solver_gap") else ""))
+        out.append(f"{line}; varies {what}" + (". " + "; ".join(vals) + ".\n" if vals else ".\n"))
     return out + ["\n"]
 
 
@@ -6386,6 +6434,8 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
         hi = {"id": "D-009", "severity": "HIGH", "target_stage": "ANALYZE", "claim": "too few draws",
               "done_when": [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 32}]}
 
+        import yaml
+
         class _Reword(StubTasks):
             def critique(self, run_dir, reviewer, round_n, feedback=None):
                 res = super().critique(run_dir, reviewer, round_n, feedback)
@@ -6397,7 +6447,6 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
                             b["claim"] = f"net durability is untested; the lead accepted it before (round {round_n})"
                     yaml.safe_dump(doc, open(p_, "w"), sort_keys=False)
                 return res
-        import yaml
         d5, T5, st5 = new_run("wr_owner_reworded", {"critics": {1: {"critique-domain": [amend, hi]}},
                                                     "fixes": {"D-009": [("analysis_settings.yaml",
                                                                          "uncertainty.draws", 32)]}},
@@ -6412,7 +6461,6 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
            and FL.load(d5)["D-001"].status == "owner_accepted",
            f"WR5b a reworded re-raise of an answered finding is not asked again ({to5.count('OWNER_DECISION')} "
            f"request(s), {s5}, round {rounds5}, {to5[-10:]}, {crit5})")
-        import yaml
         dec = yaml.safe_load(open(os.path.join(d, DECLARED_FILE))) or {}
         g = json.load(open(os.path.join(d, "final_gate.json")))
         ok([x.get("id") for x in dec.get("declared") or []] == ["D-001"] and g.get("rule_matched") == "3m"
@@ -6555,14 +6603,17 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
         r2 = {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "accept_blockers": [],
               "unresolved_high": [{"reviewer": "critique-domain", "id": "D-1"}, {"reviewer": "critique-redteam",
                                                                                  "id": "R-1"}]}
-        h1 = apply_held_rule(r2, led, ["D-1"], ["R-1"])
-        h2 = apply_held_rule(r2, led, ["D-1"], [])
+        op2 = [{"id": "D-1", "tested": True}, {"id": "R-1", "tested": True}, {"id": "W-1", "tested": False}]
+        h1 = apply_held_rule(r2, led, ["D-1"], ["R-1"], op2)
+        h2 = apply_held_rule(r2, led, ["D-1"], [], op2)
         h3 = apply_held_rule(dict(r2, unresolved_high=r2["unresolved_high"] + [{"reviewer": "rigor-artifacts",
                                                                                 "id": "RIG-001", "kind": "k"}]),
-                             led, ["D-1"], ["R-1"])
-        h4 = apply_held_rule(dict(r2, accept_blockers=[{"id": "REQ-001"}]), led, ["D-1"], ["R-1"])
-        ok(h1["action"] == "DECLARE_SCOPE" and h1["rule_matched"] == "3h" and h1["declared_open"] == ["D-1", "R-1"]
-           and h2["action"] == h3["action"] == h4["action"] == "PATCH_OR_RETHINK",
+                             led, ["D-1"], ["R-1"], op2)
+        h4 = apply_held_rule(dict(r2, accept_blockers=[{"id": "REQ-001"}]), led, ["D-1"], ["R-1"], op2)
+        # Codex r1 of #357 (P1-3): a MEDIUM with a test a fix task can work to keeps the round
+        h5 = apply_held_rule(r2, led, ["D-1"], ["R-1"], op2 + [{"id": "R-002", "tested": True}])
+        ok(h1["action"] == "DECLARE_SCOPE" and h1["rule_matched"] == "3h" and h1["declared_open"] == ["D-1", "R-1", "W-1"]
+           and h2["action"] == h3["action"] == h4["action"] == h5["action"] == "PATCH_OR_RETHINK",
            f"HB2-2 a rule-2 gate holding only owner-held findings and harness gaps declares them now; a fixable one, a "
            f"gate finding or a missing artifact keeps rule 2 ({h1['action']}, {h2['action']}, {h3['action']}, "
            f"{h4['action']})")
@@ -6594,7 +6645,7 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
             def fake(rd, *a, **k):
                 lg = FL.load(rd)
                 FL._event(lg["R-001"], 1, FL.HARNESS_GAP, "fix_planner", "only harness code",
-                          key=FL.finding_fingerprint(lg["R-001"]))
+                          key=FL.harness_gap_key(lg["R-001"]))
                 FL.save(rd, lg)
                 return {"round": 1, "tasks": 0, "rows": 0, "passed": 0, "rethink": None, "write_up": ["W"],
                         "owner_amendments": [], "harness_gaps": ["R-001"], "harness_gaps_blocking": ["R-001"]}
@@ -6608,7 +6659,59 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
                f"HB2-4 a fix loop that declares a harness gap and plans no task goes to {want} ({name}: {s2.state}, "
                f"round {s2.round}, mode {s2.write_mode})")
 
-    for name, fn in (("WR1-WR3", rereview), ("WR1b", rereview_not_accepted), ("WR4-WR6", owner_held_run),
+    def hb2_request_and_report():
+        # HB2-5 (Codex r1 of #357, P1-4): rule 2o asks only the findings whose resolution is the owner's; a
+        # policy-mapped owner item waits for the round cap
+        dt_ = {"reviewer": "rigor-artifacts", "id": "RIG-001", "kind": "decision_test_changes_plan",
+               "owner_signoff": True, "owner_resolution": True}
+        al_ = {"reviewer": "rigor-artifacts", "id": "RIG-002", "kind": "allocation_unstable", "owner_signoff": True}
+        v2o = scope_request_view({"rule_matched": "2o", "unresolved_high": [dt_, al_], "accept_blockers": [
+            dict(al_, id="REQ-001")]})
+        v3o = scope_request_view({"rule_matched": "3o", "unresolved_high": [dt_, al_]})
+        ok([b["id"] for b in v2o["unresolved_high"]] == ["RIG-001"] and v2o["accept_blockers"] == []
+           and len(v3o["unresolved_high"]) == 2,
+           f"HB2-5 rule 2o requests only the owner-resolution findings ({v2o['unresolved_high']})")
+        # HB2-6 (Codex r1 of #357, P1-6..P1-10, P2-12, P2-13): the report's statement of an accepted dependence
+        from toolkit.analysis import contract as _CTd
+        import yaml as _yd
+        dd = os.path.join(td, "hb2_dependence")
+        os.makedirs(os.path.join(dd, "models", "decision_tests"))
+        ids13 = [f"u{i}" for i in range(1, 14)]
+        _yd.safe_dump({"varied": "the unit costs of the listed cost items multiplied together", "results": [
+            {"value": "case", "cost_multipliers": {"transport": 2}, "decision_changes": True, "units_changed": 13,
+             "units_changed_ids": ids13, "recommendation": "A: 13 units", "point_plan_feasible": False,
+             "within_solver_gap": True}]}, open(os.path.join(dd, "models", "decision_tests", "DTc.yaml"), "w"))
+        os.makedirs(os.path.join(dd, os.path.dirname(AB.ANALYSIS_JSON) or "."), exist_ok=True)
+        json.dump({"decision_tests": [{"id": "DTs", "text": "a lower effect", "trial_value": 0.4,
+                                       "units_changed": 2, "plan_changes": True}]},
+                  open(os.path.join(dd, AB.ANALYSIS_JSON), "w"))
+
+        def row(key, **ev):
+            f_ = FL.Finding(id=f"decision_test_changes_plan:{key}", kind="decision_test_changes_plan", key=key,
+                            severity="HIGH", source="rigor-artifacts", status="owner_accepted")
+            f_.events.append(dict({"round": 1, "status": "owner_accepted", "by": "owner"}, **ev))
+            return f_
+        FL.save(dd, {"c": row("DTc", record="toolkit", result_sha256="aa"),
+                     "s": row("DTs", record="spike"), "x": row("DTx", record="toolkit", result_sha256="old")})
+        real_rec, real_doc = _CTd.decision_test_record, _CTd._verified_doc
+        _CTd.decision_test_record = lambda rd, k: ({"path": f"models/decision_tests/{k}.yaml", "result_sha256": "aa"}
+                                                   if k == "DTc" else {"path": "models/decision_tests/DTx.yaml",
+                                                                       "result_sha256": "new"} if k == "DTx"
+                                                   else None)
+        _CTd._verified_doc = lambda rd: ([], {}, None, {"reference_plan": "point_plan"})
+        try:
+            txt = "".join(dependence_lines(dd))
+        finally:
+            _CTd.decision_test_record, _CTd._verified_doc = real_rec, real_doc
+        ok("counted against the plan solved at the point values" in txt and "transport x2" in txt
+           and "(" + ", ".join(ids13) + ")" in txt and "not settled within the solver's gap" in txt
+           and "**DTs**" in txt and "a lower effect" in txt and "trial_value 0.4" in txt
+           and "**DTx**" in txt and "has changed since it was accepted" in txt,
+           f"HB2-6 the accepted dependence names the reference plan, the price case, every unit, an unsettled solve, "
+           f"the spike record's measured effects, and a result changed since the accept ({txt!r})")
+
+    for name, fn in (("HB2-5-6", hb2_request_and_report), ("WR1-WR3", rereview), ("WR1b", rereview_not_accepted),
+                     ("WR4-WR6", owner_held_run),
                      ("WR7", medium_rule_unit), ("WR8", zero_tasks_prewrite), ("WR9", pending_post_write),
                      ("WR10", answer_binds_current_text), ("HB2-1-3", hb2_rules_unit), ("HB2-4", hb2_gap_prewrite)):
         case(name, fn)

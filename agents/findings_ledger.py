@@ -374,6 +374,32 @@ def finding_fingerprint(f) -> str:
     return answer_fingerprint(f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim)
 
 
+def legacy_fingerprint(fid: str, claim, fix_requires) -> str:
+    """The fingerprint answers were recorded under before hb2 fix 3 (the finding, its claim and remedy as asked): an
+    answer a run recorded then still binds the finding as it was asked (Codex r1 of #357, P1-1: a resumed run never
+    loses a recorded decline, nor lets a lead answer over it)."""
+    return hashlib.sha256(json.dumps({"finding": fid, "claim": claim, "fix_requires": fix_requires},
+                                     sort_keys=True).encode()).hexdigest()[:16]
+
+
+def answer_for(answers: dict, fid: str, *, kind, fix_requires, claim) -> dict | None:
+    """The recorded answer that binds this finding as it reads now: under its fingerprint, else under the legacy one."""
+    for fp in (answer_fingerprint(fid, kind=kind, fix_requires=fix_requires, claim=claim),
+               legacy_fingerprint(fid, claim, fix_requires)):
+        a = answers.get(fp)
+        if isinstance(a, dict) and str(a.get("finding")) == fid:
+            return a
+    return None
+
+
+def harness_gap_key(f) -> str:
+    """What a declared harness gap binds: the finding's fingerprint and its remedy as written. A remedy revised since
+    (even within its class) may name a fix a task can make, so the planner looks at it again (Codex r1 of #357, P1-5);
+    a reworded claim does not."""
+    return hashlib.sha256(json.dumps({"fp": finding_fingerprint(f), "fix_requires": f.fix_requires},
+                                     sort_keys=True).encode()).hexdigest()[:16]
+
+
 # hb2 fix 1: gate kinds whose resolution is the owner's (agents/stage_machine.py DECISION_BEARING_KINDS)
 OWNER_RESOLUTION_KINDS = ("decision_test_changes_plan",)
 HARNESS_GAP = "harness_gap"          # the ledger event a declared harness gap leaves on its finding (agents/fix_loop.py)
@@ -381,10 +407,10 @@ HARNESS_GAP = "harness_gap"          # the ledger event a declared harness gap l
 
 def harness_gaps(led: dict) -> set[str]:
     """Open findings the fix planner declared harness gaps (no file a fix task may edit can fix them) as they read now:
-    the gap's event carries the finding's fingerprint, so a finding revised into another kind or remedy class since is
-    not one (hb2 fix 4: no task can work on it, so it is declared, not sent to the fix loop again)."""
+    the gap's event carries harness_gap_key, so a finding whose kind or remedy was revised since is not one (hb2 fix
+    4: no task can work on it, so it is declared, not sent to the fix loop again)."""
     return {f.id for f in led.values() if f.status in ("open", "declared")
-            and any(isinstance(e, dict) and e.get("status") == HARNESS_GAP and e.get("key") == finding_fingerprint(f)
+            and any(isinstance(e, dict) and e.get("status") == HARNESS_GAP and e.get("key") == harness_gap_key(f)
                     for e in f.events or [])}
 
 
@@ -428,8 +454,8 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
               and isinstance(v.get("owner_signed"), dict) and not v.get("owner_signoff")}
 
     def held(f) -> bool:      # the answer still binds the finding as it reads now (hb2 fix 3: not its wording)
-        a = answers.get(finding_fingerprint(f))
-        return bool(a and str(a.get("finding")) == f.id) or f.id in signed
+        return answer_for(answers, f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim) is not None \
+            or f.id in signed
     seen = set()
     for new in crit + gate_rows + conf:
         seen.add(new.id)
@@ -493,7 +519,7 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             f.decision_test = decision_test_result(run_dir, hit["decision_test"])
         if not f.scope_declarable:
             f.resolution_type = "fix"
-        a = answers.get(finding_fingerprint(f))    # bound to its id, kind and remedy class (hb2 fix 3)
+        a = answer_for(answers, f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim)   # hb2 fix 3
         ans = a.get("decision") if a and str(a.get("finding")) == f.id else None
         if ans is None and f.resolution_type == "owner_decision" and f.status in ("open", "declared") \
                 and any(isinstance(e, dict) and e.get("by") in ("owner", "lead") for e in f.events):
@@ -506,7 +532,8 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         if s_ is not None and f.status in ("open", "declared"):
             f.status, f.resolution_type, f.blocking = "owner_accepted", "owner_decision", False
             _event(f, round_n, f.status, "lead" if s_.get("by") == "lead" else "owner",
-                   **({"provisional": True} if s_.get("provisional") else {}), **({"at": s_["at"]} if s_.get("at") else {}))
+                   **({"provisional": True} if s_.get("provisional") else {}),
+                   **{k: s_[k] for k in ("at", "record", "result_sha256", "fingerprint") if s_.get(k)})
         elif f.id not in signed and f.status == "owner_accepted" and f.kind in OWNER_RESOLUTION_KINDS \
                 and decision is not None and f.id in seen:
             f.status, f.resolution_type = "open", "owner_decision"     # asked again: its evidence changed
@@ -716,11 +743,11 @@ def _self_test() -> int:
     # L20 (hb2 fix 4, dengue R2 R-001): a declared harness gap is one while the finding keeps its kind and remedy class
     f20 = Finding(id="R-001", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
                   fix_requires="The ANALYZE stage emits claims.")
-    _event(f20, 1, HARNESS_GAP, "fix_planner", "only harness code", key=finding_fingerprint(f20))
+    _event(f20, 1, HARNESS_GAP, "fix_planner", "only harness code", key=harness_gap_key(f20))
     g1 = harness_gaps({"R-001": f20})
     f20.claim = "reworded"
     g2 = harness_gaps({"R-001": f20})
-    f20.fix_requires = "Owner amendment: add the claims to the spec."
+    f20.fix_requires = "Set analysis_settings.yaml uncertainty.draws to 64."      # Codex r1 of #357 P1-5: same class
     g3 = harness_gaps({"R-001": f20})
     f21 = Finding(id="R-002", kind="critique_blocker", severity="MEDIUM", source="critique-redteam")
     _event(f21, 1, HARNESS_GAP, "fix_planner", "an older event without a key")
@@ -731,6 +758,19 @@ def _self_test() -> int:
        and answer_fingerprint("D-1", kind=CRITIC_KIND, fix_requires="r", claim="a")
        == answer_fingerprint("D-1", kind=CRITIC_KIND, fix_requires="r2", claim="b"),
        "L21 a harness finding's measured claim stays bound; a critic's wording and remedy text within a class do not")
+    # L22 (Codex r1 of #357, P1-1): an answer recorded under the fingerprint used before hb2 fix 3 still binds the
+    # finding as it was asked, so a resumed run keeps a recorded decline
+    with tempfile.TemporaryDirectory() as d:
+        import scope_signoff as SS
+        claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
+        json.dump({"answers": {legacy_fingerprint("D-033", claim, fix): {"finding": "D-033", "decision": "decline",
+                                                                        "by": "owner"}}},
+                  open(os.path.join(d, "scope_signoff.json"), "w"))
+        SS.harness_record(d)
+        save(d, {"D-033": Finding(id="D-033", kind=CRITIC_KIND, severity="HIGH", source="critique-domain",
+                                  claim=claim, fix_requires=fix)})
+        st22 = sync(d, None, 2)[0]["D-033"].status
+        ok(st22 == "owner_declined", f"L22 an answer under the legacy fingerprint still binds the finding ({st22})")
     # L_OWNER_LEAD (1F, D2): a lead's recorded answer counts only when the run is a --signoff lead run
     with tempfile.TemporaryDirectory() as d:
         import scope_signoff as SS
