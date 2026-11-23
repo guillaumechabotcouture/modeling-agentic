@@ -390,10 +390,14 @@ def interval_quantiles(level: float = 0.95) -> tuple[float, float]:
     return a, round(1.0 - a, 12)
 
 
-def summarise_outputs(outs: list, per_param_samples: dict, n_draws: int, level: float = 0.95) -> dict:
+def summarise_outputs(outs: list, per_param_samples: dict, n_draws: int, level: float = 0.95,
+                      summary=None) -> dict:
     """Aggregate per-draw outcome dicts into the report's blocks (scalar_outputs, categorical_outputs,
     parameter_samples) with the degeneracy and rare-event diagnostics. Shared by propagate() and the v2
     analysis engine (toolkit/analysis/uncertainty.py), so both write the same uncertainty_report schema.
+    `summary(values, level)` -> {mean, median, ci_low, ci_high}: the caller's estimator, so a caller that writes
+    other files from the same draws reports the same numbers in both (hb1 fix 11: the v2 analysis passes
+    toolkit/analysis/core.q); without it, the order statistics below, as before.
     Raises RuntimeError when more than 20% of draws failed."""
     qlo, qhi = interval_quantiles(level)
     errors: list[dict] = []
@@ -444,14 +448,17 @@ def summarise_outputs(outs: list, per_param_samples: dict, n_draws: int, level: 
             continue
         vals_sorted = sorted(vals)
         n = len(vals_sorted)
-        entry = {
-            "mean": float(mean(vals)),
-            "median": float(vals_sorted[n // 2]),
-            "ci_low": float(vals_sorted[int(qlo * n)]),
-            "ci_high": float(vals_sorted[min(n - 1, int(qhi * n))]),
-            "n": n,
-            "n_nonfinite": n_nonfinite.get(key, 0),
-        }
+        if summary is not None:
+            est = summary(vals, level)
+            entry = {k: float(est[k]) for k in ("mean", "median", "ci_low", "ci_high")}
+        else:
+            entry = {
+                "mean": float(mean(vals)),
+                "median": float(vals_sorted[n // 2]),
+                "ci_low": float(vals_sorted[int(qlo * n)]),
+                "ci_high": float(vals_sorted[min(n - 1, int(qhi * n))]),
+            }
+        entry.update(n=n, n_nonfinite=n_nonfinite.get(key, 0))
         entry.update(rare_event_summary(vals))
         # Phase 21 δ: a zero-width interval from uncertain inputs is a
         # defect, not a precise answer. Flag it with a diagnostic.
@@ -646,6 +653,15 @@ def _run_self_test() -> int:
     a80 = summarise_outputs(outs, {}, 200, level=0.80)["scalar_outputs"]["y"]
     ok((a95["ci_low"], a95["ci_high"]) == (5.0, 195.0) and (a80["ci_low"], a80["ci_high"]) == (20.0, 180.0),
        f"UQ-L1 summarise_outputs honours the interval level: {a95['ci_low'], a95['ci_high'], a80['ci_low'], a80['ci_high']}")
+    # hb1 fix 11 (L): a caller with its own estimator passes it, so its two files agree; without one, nothing changes
+    est = lambda v, level: {"mean": -1.0, "median": -2.0, "ci_low": -3.0, "ci_high": -4.0}  # noqa: E731
+    try:
+        ae = summarise_outputs(outs, {}, 200, level=0.80, summary=est)["scalar_outputs"]["y"]
+    except TypeError as e:
+        ae = {"error": str(e)}
+    ok([ae.get(k) for k in ("mean", "median", "ci_low", "ci_high")] == [-1.0, -2.0, -3.0, -4.0] and ae.get("n") == 200
+       and a95["median"] == 100.0, f"UQ-L2 summarise_outputs takes the caller's estimator (summary=); the order "
+                                   f"statistics stay the default ({ae}, default median {a95['median']})")
 
     with tempfile.TemporaryDirectory() as run_dir:
         os.makedirs(os.path.join(run_dir, "models"))
