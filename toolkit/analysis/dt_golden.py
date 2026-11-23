@@ -108,7 +108,10 @@ def parts(rec: dict, summary: dict | None = None) -> dict:
     if isinstance(res, list):
         detail["cases"] = [{k: r.get(k) for k in ("value",) + DETAIL_KEYS if k in r} if isinstance(r, dict) else r
                            for r in res]
-        decision["results"] = [{k: v for k, v in r.items() if k not in ("value", "plan_sha256") and k not in DETAIL_KEYS}
+        # units_changed_ids (which units change package, hb2 owner decision (b)) follows from each case's plan, which
+        # plan_sha256 pins in the plans part; its count, units_changed, stays in decision
+        decision["results"] = [{k: v for k, v in r.items() if k not in ("value", "plan_sha256", "units_changed_ids")
+                                and k not in DETAIL_KEYS}
                                if isinstance(r, dict) else r for r in res]
         if any(isinstance(r, dict) and "plan_sha256" in r for r in res):
             plans = [r.get("plan_sha256") if isinstance(r, dict) else None for r in res]
