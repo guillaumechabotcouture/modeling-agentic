@@ -98,6 +98,28 @@ from .run import (  # noqa: E402,F401
 from . import namespace as _namespace  # noqa: E402
 
 _namespace.share(sys.modules[__name__])     # an assignment to this module reaches the package
+# what `from stage_machine import *` took from the module (not the submodules' names)
+__all__ = [
+    'AB', 'ACCEPTED_STATUSES', 'AMENDED_PROVISIONAL', 'AMENDMENT_RECORD', 'AMEND_LOCK', 'AWAITING_BUDGET',
+    'AWAITING_SPEC_AMENDMENT', 'AmendmentLocked', 'AwaitingBudget', 'BATCH_DIR', 'CALIBRATION_REFUSED', 'CARRIED',
+    'CRITICS', 'DECISION_BEARING_KINDS', 'DECLARED_FILE', 'EDGES', 'FL', 'FX', 'HERE', 'JC_DIR',
+    'LEGACY_BRIEF_SIGNOFF', 'LLM_STATES', 'MAX_CALIBRATION_REFUSALS', 'MAX_LANGUAGE_REPAIRS', 'MAX_SCHEMA_REPAIRS',
+    'MAX_SIGN_REPAIRS', 'MAX_SPEC_TRIES', 'MIN_TASK_ALLOWANCE_USD', 'Machine', 'OWNER_LIFECYCLE_WIRED',
+    'OWNER_REQUEST', 'OWNER_REQUEST_PRODUCER', 'PARENT_ENV', 'POST_CHOICE_STATES', 'PROTECTED_BY_FIX',
+    'PROVENANCE', 'READBACK_CAP_USD', 'REPO', 'RunState', 'SCOPE_SIGNOFF', 'SIGNOFF_FILE', 'SIGNOFF_SHEET',
+    'SPEC_RETHINK_REQUEST', 'STATES', 'STATE_FILE', 'STATUS_MARK', 'TASK_CAP_USD', 'amendment_lines',
+    'analysis_failure_cause', 'annotations', 'answer_key_path', 'apply_medium_rule', 'apply_owner_declines',
+    'apply_owner_rule', 'asdict', 'calibration_refusal', 'conflicts_policy_stop', 'dataclass', 'datetime',
+    'deliverable_problems', 'drop_declined', 'evidence_gate', 'field', 'given_values', 'handoff_chain',
+    'handoff_child', 'harness_owned', 'hashlib', 'init_run', 'iter_handoff_chain', 'json', 'legacy_gate',
+    'load_state', 'main', 'open_findings', 'os', 'owned_path', 'owner_accepted_now', 'owner_held',
+    'pending_amendments', 'pending_conflicts', 'provisional_lines', 're', 'record_calibration_refusal',
+    'record_cited_inputs', 'render_report', 'report_acceptance_findings', 'report_claim_findings',
+    'request_owner_amendments', 'require_judged', 'resumable_failure', 'rethink_request', 'rethink_target',
+    'route_gate', 'run_v2', 'save_state', 'shlex', 'short_label', 'sign', 'signed_hash', 'spec_signed_once',
+    'spec_signoff_findings', 'stage_inputs', 'subprocess', 'sys', 'time', 'timezone', 'typed_numbers', 'v2_gate',
+    'write_declared',
+]
 
 
 def _self_test() -> int:

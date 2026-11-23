@@ -14,18 +14,33 @@ import types
 
 _MISSING = object()
 _PKG = __name__.rpartition(".")[0]
+_MODULES = sys.modules          # held here: a patch of the package's `sys` must not reach the forwarding itself
+_SELF = __name__
+
+
+def _submodules(pkg):
+    me = _MODULES.get(_SELF)
+    return [m for k, m in list(_MODULES.items())
+            if m is not None and m is not pkg and m is not me and k.startswith(_PKG + ".")]
 
 
 class _Shared(types.ModuleType):
     def __setattr__(self, name, value):
         old = self.__dict__.get(name, _MISSING)
         super().__setattr__(name, value)
-        if old is _MISSING or old is value:
+        if old is value:
             return
-        for mname, mod in list(sys.modules.items()):
-            if mod is not None and mod is not self and mname.startswith(_PKG + ".") \
-                    and mod.__dict__.get(name, _MISSING) is old:
+        for mod in _submodules(self):
+            # the same object, or (old missing) a name the module resolved through builtins, as one module did
+            if mod.__dict__.get(name, _MISSING) is old:
                 setattr(mod, name, value)
+
+    def __delattr__(self, name):
+        old = self.__dict__.get(name, _MISSING)
+        super().__delattr__(name)
+        for mod in _submodules(self):
+            if old is not _MISSING and mod.__dict__.get(name, _MISSING) is old:
+                delattr(mod, name)
 
 
 def share(module) -> None:
