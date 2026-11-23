@@ -371,6 +371,10 @@ def merged_spec(run_dir: str) -> dict:
             for q in parts[:-1]:
                 cur = cur.setdefault(q, {})
             cur[parts[-1]] = v
+    from toolkit.spec import schema
+    unreg = schema.engine_ref_problems(spec)      # the declaration as signed, before a choice replaces it (#367)
+    if unreg:
+        raise ValueError("; ".join(unreg))
     eng = engine_choice_ref(run_dir)
     auto = spec.get("engine") in (None, "auto") or (isinstance(spec.get("engine"), dict) and spec["engine"].get("auto"))
     if eng and auto:                      # an explicit engine in the signed spec wins
@@ -442,7 +446,9 @@ def pre_sign_problems(run_dir: str, derived: bool | None = None) -> list[str]:
         spec = yaml.safe_load(open(os.path.join(run_dir, SPEC_FILE))) or {}
     except Exception as e:  # noqa: BLE001
         return [f"{SPEC_FILE} unreadable: {type(e).__name__}"]
-    return [f"missing section {k}" for k in REQUIRED if k != "engine" and k not in spec] + settings_problems(run_dir, spec)
+    from toolkit.spec import schema
+    return [f"missing section {k}" for k in REQUIRED if k != "engine" and k not in spec] + settings_problems(run_dir, spec) \
+        + schema.engine_ref_problems(spec)     # the declaration as signed: candidates and a named engine (#367)
 
 
 def choice_spec(run_dir: str) -> dict:
@@ -1395,14 +1401,30 @@ def _self_test_registry(ok) -> None:
         p = schema.toy_spec(d)
         raw = yaml.safe_load(open(p))
         reg = dict(raw["engine"]) if isinstance(raw["engine"], dict) else {"ref": raw["engine"]}
-        for name, eng in (("named", {"ref": hook}), ("auto candidate", {"auto": True, "candidates": [hook]})):
+        from toolkit.spec import preconditions as PC
+        for name, eng in (("named", {"ref": hook}), ("auto candidate", {"auto": True, "candidates": [hook]}),
+                          ("ref beside auto", {"auto": True, "ref": hook, "candidates": [reg["ref"]]})):
             yaml.safe_dump(dict(raw, engine=eng), open(p, "w"))
             pre = api.pre_sign_problems(d)
             sig = outcome(lambda: signoff.sign(d, "owner"))
+            try:
+                st = signoff.status(d)
+            except Exception as e:  # noqa: BLE001 -- a status that crashes is the failure
+                st = f"{type(e).__name__}: {e}"
+            # the shared preconditions every signing path runs (stage_machine.sign, decision_brief sign: no validate)
+            pc = PC.problems(d, open(p, "rb").read(), "owner")
             ok(any("not a registered engine" in x for x in pre) and "not a registered engine" in sig
-               and signoff.status(d) != "signed",
-               f"ER-SIGN1 ({name}) an unregistered engine is a pre-sign problem and signing refuses it ({pre[:1]}; "
-               f"{sig[:120]})")
+               and st == "invalid" and any("not a registered engine" in x for x in pc),
+               f"ER-SIGN1 ({name}) an unregistered engine is a pre-sign problem, a precondition of every signing path, "
+               f"signing refuses it and the status is invalid ({pre[:1]}; {sig[:100]}; {st[:80]}; {pc[:1]})")
+        # Codex r1 of #367: an unregistered class in a registered engine's module gets neither its coverage, pack nor
+        # decision-input declaration
+        from toolkit.engines import benchmark_coverage as BCOV
+        from toolkit.spec import evidence_dossier as EDOS
+        ghost = reg["ref"].split(":")[0] + ":NotRegisteredEngine"
+        dec = outcome(lambda: EDOS.engine_declaration(ghost))
+        ok(not os.path.exists(BCOV.path_for(ghost)) and BCOV._pack(ghost) is None and "not a registered engine" in dec,
+           f"ER-SIGN3 an unregistered class reads no registered engine's coverage, pack or declaration ({dec[:100]})")
         yaml.safe_dump(dict(raw, engine=reg), open(p, "w"))
         pre = [x for x in api.pre_sign_problems(d) if "registered engine" in x]
         ok(schema.check_engine_ref(reg["ref"]) and not pre,

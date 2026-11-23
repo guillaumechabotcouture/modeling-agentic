@@ -207,6 +207,10 @@ class SpecError(ValueError):
     pass
 
 
+class UnregisteredEngine(SpecError):
+    """An engine reference the import policy allows but the engine registry does not hold (REGISTERED_ENGINES)."""
+
+
 # --------------------------------------------------------------------------- loading
 SETTINGS = "analysis_settings.yaml"
 # Purely computational settings the run (and the fix loop) may change without a new owner sign-off. Only these
@@ -281,8 +285,8 @@ def _resolve_engine_choice(s: "Spec") -> None:
     cands = eng.get("candidates") if isinstance(eng, dict) else None
     if cands is not None and (not isinstance(cands, list) or not all(isinstance(c, str) and ":" in c for c in cands)):
         raise SpecError("engine.candidates: a list of 'module:Class' references")
-    for c in cands or []:
-        check_engine_ref(c)
+    for c in (cands or []) + ([eng["ref"]] if isinstance(eng, dict) and eng.get("ref") is not None else []):
+        check_engine_ref(c)         # the candidates, and a ref written beside auto: true (Codex r1 of #367)
     cp = os.path.join(s.base, ENGINE_CHOICE)
     if not os.path.exists(cp):
         s.engine_pending = True
@@ -609,15 +613,17 @@ def check_engine_ref(ref) -> tuple[str, str]:
         raise SpecError(f"engine {str(ref)[:80]}: {e}") from None
     reg = registered_engines()
     if ref not in reg and not G.test_engine_registered(ref):
-        raise SpecError(f"engine {ref}: not a registered engine; a spec may name one of: {', '.join(reg)}")
+        raise UnregisteredEngine(f"engine {ref}: not a registered engine; a spec may name one of: {', '.join(reg)}")
     return out
 
 
 def engine_ref_problems(raw: Mapping) -> list[str]:
-    """check_engine_ref on the engine a spec mapping names, or on each engine: auto candidate: the refusals."""
+    """check_engine_ref on the engine a spec mapping names, or on each engine: auto candidate and on a `ref` written
+    beside `auto: true` (never left unchecked behind auto): the refusals."""
     eng = raw.get("engine")
     if engine_is_auto(eng):
         refs = eng.get("candidates") if isinstance(eng, Mapping) and isinstance(eng.get("candidates"), list) else []
+        refs = list(refs) + ([eng["ref"]] if isinstance(eng, Mapping) and eng.get("ref") is not None else [])
     else:
         refs = [eng.get("ref") if isinstance(eng, Mapping) else eng] if eng is not None else []
     out = []

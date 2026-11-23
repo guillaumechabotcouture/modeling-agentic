@@ -7024,6 +7024,7 @@ def _self_test_derived(ok, td: str) -> None:
     sys.path.insert(0, mods)
     from toolkit import import_guard as _G
     _G.allow_for_test("engine", "di8_engines")             # a test engine outside toolkit/engines (allowlist)
+    _G.register_test_engine("di8_engines:NeedsGroup")      # and outside the engine registry: this self-test only
     fake = os.path.join(td, "di8repo")
     os.makedirs(os.path.join(fake, "toyraw"))
     tmp = os.path.join(td, "di8src")
