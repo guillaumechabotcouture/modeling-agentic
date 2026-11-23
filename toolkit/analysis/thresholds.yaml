@@ -113,3 +113,16 @@ value_of_information:
   permutations: 100         # shuffles of an input against the net benefits (GCV repeated) for its noise floor
   noise_quantile: 0.95      # the noise floor: this quantile of the shuffled EVPPI
   exceeds_evpi_tol: 0.02    # an EVPPI above EVPI by more than this share of EVPI is flagged (exceeds_evpi)
+wiring:
+  # Sensitivity wiring (owner, 2026-11-23; toolkit/analysis/wiring.py). Every declared input, moved to each end of its
+  # range with the others at their point values, must move at least one declared output (an outcome under a package,
+  # or a package's cost) by more than its tolerance; the change in one output is sum_i |y_i(end) - y_i(point)| /
+  # sum_i |y_i(point)| over the units. Proposals for the owner's review.
+  # Float rounding: a dead input changes nothing at all; any real effect is far above this.
+  rel_tol: 1.0e-9
+  # Direct evaluation: the engine's own noise is the change one seed shift makes at the point (zero for a
+  # deterministic engine); an input must move an output by more than this many times that change.
+  noise_multiplier: 3.0
+  # Emulator path: the check reads the emulator, which answers for the engine; an input the emulator learned to ignore
+  # still moves its prediction slightly, so the tolerance is this share.
+  emulator_rel_tol: 1.0e-4
