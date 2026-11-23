@@ -1097,8 +1097,9 @@ def _run_self_test() -> int:
         _store_chain(_p8)
     finally:
         _sm7.handoff_chain, globals()["store_run_results"] = _saved8
-    ok(_got8 == ["AmendmentLocked"] * 2 and _calls8 == [(_p8, _c8)] and "crash" not in _metadata_dict(
-        os.path.join(_p8, "metadata.json")) and _stored8 == [_p8, _p8, _c8, _c8 + ".amend1"],
+    ok(_got8 == ["AmendmentLocked"] * 2 and _calls8 == [(_p8, os.path.realpath(_c8))]
+       and "crash" not in _metadata_dict(os.path.join(_p8, "metadata.json"))
+       and _stored8 == [_p8, _p8, _c8, _c8 + ".amend1"],
        f"ST8 a held child stops the chain there: the parent is stored, the held child and later ones are not "
        f"({_got8}, {_calls8}, {_stored8})")
     shutil.rmtree(_p8, ignore_errors=True)
@@ -1162,14 +1163,15 @@ def run_v2_and_store(run, run_path: str, store=None):
     Finalization never raises: a failure there is logged, so the run's own exception and its exit
     code survive (ST3-ST5)."""
     store = store or store_run_results
-    refused = False
+    locked = None
     try:
         return run()
     except BaseException as e:
         # Codex r3 on #342 (P1-7): another process holds a lead run's amendment lock: not a crash of this run, and the
-        # run it is running is not uploaded half-way from here
-        refused = type(e).__name__ == "AmendmentLocked"
-        if refused:
+        # run it is running is not uploaded half-way from here; a parent this process finished is still stored, up to
+        # the held child (Codex r1 of #349)
+        if type(e).__name__ == "AmendmentLocked":
+            locked = os.path.realpath(getattr(e, "run_dir", None) or run_path)
             raise
         try:
             mp = os.path.join(run_path, "metadata.json")
@@ -1182,8 +1184,10 @@ def run_v2_and_store(run, run_path: str, store=None):
         raise
     finally:
         try:
-            if refused:
+            if locked == os.path.realpath(run_path):
                 print("v2 run not stored: another process holds its amendment lock", file=sys.stderr, flush=True)
+            elif locked:
+                print(f"v2 run stored up to {locked}: {store(run_path, upto=locked)}", flush=True)
             else:
                 print(f"v2 run stored: {store(run_path)}", flush=True)
         except Exception as fe:  # noqa: BLE001 -- never replace the run's exception or status
@@ -1230,6 +1234,18 @@ def main_v2(args, ident: dict | None = None) -> int:
         lock.__exit__(None, None, None)
 
 
+def _store_chain(run_path: str, upto: str | None = None) -> list:
+    """lead-gaps β: a provisional lead amendment continues the run in a child run dir; it is stored too. `upto`: a child
+    another process holds (AmendmentLocked): stored from there by that process, not here (Codex r1 of #349)."""
+    from agents import stage_machine
+    out = []
+    for x in [run_path] + stage_machine.handoff_chain(run_path, kept=True):
+        if upto and os.path.realpath(x) == os.path.realpath(upto):
+            break
+        out.append(store_run_results(x))
+    return out
+
+
 def _main_v2_run(args, ident: dict, run_path: str, question: str) -> int:
     from agents import stage_machine, v2_sdk_tasks
     pipeline_id.stamp(run_path, ident)
@@ -1239,8 +1255,7 @@ def _main_v2_run(args, ident: dict, run_path: str, question: str) -> int:
         question, run_path, tasks, max_rounds=args.max_rounds, signoff=args.signoff,
         budget_usd=args.max_budget_usd, derive_unsandboxed=getattr(args, "dev_unsandboxed_derivations", False)),
         run_path,
-        # lead-gaps β: a provisional lead amendment continues the run in a child run dir; it is stored too
-        store=lambda p: [store_run_results(x) for x in [p] + stage_machine.handoff_chain(p, kept=True)])
+        store=_store_chain)
     print(f"v2 status: {status}", flush=True)
     if status.startswith("paused:"):
         return 2
