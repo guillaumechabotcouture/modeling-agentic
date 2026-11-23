@@ -21,8 +21,10 @@ work for about 8 hours). One loop on a small Coiled VM, all its state in blob st
 
 `start` is vm_job `up` (2-vCPU worker, 2-vCPU scheduler; the name needs a budget scope, the default is in `sv`) then
 `start` with the loop as the job, a dask task that holds the cluster for --max-hours. `stop` stops this name's live
-cluster by id. GitHub token: `start` passes $GH_TOKEN (vm_job --secret-env: the job's environment only) when the login
-keychain holds it under the service "modeling-agentic-supervisor-github"; without it merges stay held.
+cluster by id. Secrets reach the job's environment only, by name (vm_job --secret-env), and neither is ever read by
+`start` or copied into a vm_job process's environment (no spelling of either variable): $GH_TOKEN, which vm_job reads
+from the login keychain (service "modeling-agentic-supervisor-github"; without it merges stay held), and the Coiled
+token, which vm_job reads from the laptop's dask config files.
 """
 from __future__ import annotations
 
@@ -435,27 +437,38 @@ def pull(blob, name, dest, now=None) -> list:
     return got
 
 
-def start_commands(a, job_id, token_present) -> list:
-    """The two vm_job commands `start` runs: up (2-vCPU worker) and start (the loop as a job)."""
+def start_commands(a, job_id, token_present, coiled=False) -> list:
+    """The two vm_job commands `start` runs: up (2-vCPU worker) and start (the loop as a job). Secrets by name only:
+    vm_job reads each where the laptop keeps it."""
     vm = [sys.executable, "cloud/vm_job.py"]
     budget = ["--cap-usd", str(a.cap_usd)] + (["--budget-scope", a.budget_scope] if a.budget_scope else [])
     acct = ["--store-account", a.account] if a.account else []
     up = vm + ["up", a.name, "--cpu", "2", "--memory", "8 GiB", "--idle-timeout", "20 minutes"] + budget
     start = (vm + ["start", a.name, job_id, "--tree", ".", "--max-hours", str(a.max_hours + 0.25)] + acct + budget
              + (["--secret-env", "GH_TOKEN"] if token_present else [])
+             + (["--secret-env", "DASK_COILED__TOKEN"] if coiled else [])
              + ["--", "python3", "cloud/supervisor.py", "loop", "--name", a.name, "--every", str(int(a.every)),
                 "--max-hours", str(a.max_hours)])
     return [up, start]
 
 
+def secret_free_env(environ=None) -> dict:
+    """The environment for a vm_job process: no spelling of GH_TOKEN or of Dask's Coiled token (Dask lower-cases
+    what follows DASK_), so neither secret is ever copied into a child's environment."""
+    env = os.environ if environ is None else environ
+    return {k: v for k, v in env.items() if not (k.upper() == "GH_TOKEN" or k.upper().startswith("DASK_COILED"))}
+
+
 def cmd_start(a):
-    r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"], capture_output=True,
-                       text=True)                      # the owner's one-time step stores it there
-    tok = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    import vm_job
+    # presence only, never the values: vm_job reads the GitHub token from the login keychain and the Coiled token
+    # from dask's config files itself (--secret-env), and neither reaches a vm_job process's environment
+    tok, co = vm_job.keychain_has(KEYCHAIN_SERVICE), vm_job.coiled_token_configured()
     job_id = "sv-" + time.strftime("%Y%m%d-%H%M%S")
-    env = {**os.environ, **({"GH_TOKEN": tok} if tok else {})}
-    print(f"merge train: {'enabled (token from the keychain)' if tok else 'disabled (no token in the keychain)'}")
-    for cmd in start_commands(a, job_id, bool(tok)):
+    env = secret_free_env()
+    print(f"merge train: {'enabled (token in the keychain)' if tok else 'disabled (no token in the keychain)'}; "
+          f"Coiled token: {'passed by name' if co else 'none in the dask config files'}")
+    for cmd in start_commands(a, job_id, tok, coiled=co):
         print("$ " + " ".join(cmd), flush=True)
         r = subprocess.run(cmd, cwd=REPO_ROOT, env=env)
         if r.returncode:
@@ -678,6 +691,39 @@ def _self_test() -> int:
        f"SV16 start runs vm_job up + start with the loop ({flat})")
     cmds = guard(start_commands, a, "sv-1", False)
     ok(isinstance(cmds, list) and "--secret-env" not in " ".join(cmds[1]), "SV16b no token: no --secret-env")
+    # SV60 (owner 2026-11-23) `start` passes the GitHub and Coiled tokens by name only: neither is read here, and no
+    # spelling of either variable (Dask lower-cases everything after DASK_) reaches a vm_job process's environment
+    import contextlib
+    import io
+    import types
+    from unittest import mock
+    import vm_job
+    runs_ = []
+    with mock.patch.object(subprocess, "run", lambda cmd, **k: runs_.append((list(cmd), k.get("env")))
+                           or types.SimpleNamespace(returncode=0, stdout="")), \
+            mock.patch.object(vm_job, "coiled_token_configured", lambda: True, create=True), \
+            mock.patch.object(vm_job, "keychain_has", lambda svc: True, create=True), \
+            mock.patch.dict(os.environ, {"DASK_COILED__TOKEN": "z" * 40, "DASK_coiled__token": "y" * 40,
+                                         "GH_TOKEN": "g" * 40, "gh_token": "h" * 40}), \
+            contextlib.redirect_stdout(io.StringIO()):
+        rc_ = guard(cmd_start, a)
+    vj = [(c, e_) for c, e_ in runs_ if "cloud/vm_job.py" in c]
+    flat = " ".join(" ".join(c) for c, _ in runs_)
+    leaked = [k for _, e_ in vj for k in (e_ or {}) if k.upper().startswith("DASK_COILED") or k.upper() == "GH_TOKEN"]
+    ok(rc_ == 0 and len(vj) == 2 and all(e_ is not None for _, e_ in vj) and not leaked
+       and "--secret-env GH_TOKEN" in " ".join(vj[1][0]) and "--secret-env DASK_COILED__TOKEN" in " ".join(vj[1][0])
+       and not any(x * 40 in flat for x in "zygh") and not any("-w" in c for c, _ in runs_),
+       f"SV60 start: both tokens by name, no spelling of either in a vm_job environment ({leaked})")
+    # SV61 without them: no --secret-env, and the job's merges and monitor stay held
+    runs_.clear()
+    with mock.patch.object(subprocess, "run", lambda cmd, **k: runs_.append((list(cmd), k.get("env")))
+                           or types.SimpleNamespace(returncode=0, stdout="")), \
+            mock.patch.object(vm_job, "coiled_token_configured", lambda: False, create=True), \
+            mock.patch.object(vm_job, "keychain_has", lambda svc: False, create=True), \
+            contextlib.redirect_stdout(io.StringIO()):
+        guard(cmd_start, a)
+    ok(runs_ and "--secret-env" not in " ".join(" ".join(c) for c, _ in runs_),
+       "SV61 start without either token passes no --secret-env")
     import budget
     ok(DEFAULT_NAME.startswith("sv-") and budget.scope_for_name(DEFAULT_NAME) == "sv",
        "SV16c the default name is in the supervisor's own budget scope, sv (owner 2026-11-22)")
