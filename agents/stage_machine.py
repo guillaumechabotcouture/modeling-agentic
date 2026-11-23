@@ -1924,11 +1924,11 @@ class Machine:
             disk = _state_or_none(self.run_dir)
             if disk is None or disk.status != AMENDED_PROVISIONAL:
                 self.st = saved
-                from lib.safe_io import write_nofollow
+                from lib.safe_io import remove_nofollow, write_nofollow
                 if meta0 is not None:
                     write_nofollow(self.run_dir, "metadata.json", meta0, atomic=True)
-                elif os.path.isfile(meta_p) and not os.path.islink(meta_p):
-                    os.remove(meta_p)
+                else:
+                    remove_nofollow(self.run_dir, "metadata.json")
             raise
 
     def _mark_child(self, child: str, rid) -> None:
