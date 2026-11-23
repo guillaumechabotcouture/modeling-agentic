@@ -768,6 +768,31 @@ def _self_test() -> int:
             refused(lambda: amend(par, pf, log=lambda *a: None), f"AM_BAD_PATCH_REFUSED {name}")
         ok(sorted(os.listdir(td)) == n_dirs and tree(par) == before,
            "AM_BAD_PATCH_REFUSED leaves no child and the parent unchanged")
+        # Codex r3 on #342 (P1-3): a patch naming a file outside the run, or an engine configuration over its limit, is
+        # refused before the schema reads the file or builds the engine
+        import analysis_backend as AB_
+        w(td, "outside/units.csv", open(os.path.join(par, "units.csv")).read())
+        real_validate, seen, n0 = schema.validate, [], sorted(os.listdir(td))
+        schema.validate = lambda sp, *a, **k: seen.append(sp.raw) or real_validate(sp, *a, **k)
+        try:
+            for name, op, why in (
+                    ("outside", {"set": "decision_units.csv", "value": os.path.join(td, "outside", "units.csv")},
+                     "outside the run directory"),
+                    ("engine limit", {"set": "engine", "value": {"ref": AB_.EMPIRICAL, "config": {"components": [
+                        f"c{i}" for i in range(AB_.EMPIRICAL_MAX_COMPONENTS + 1)]}}}, "at most")):
+                yaml.safe_dump({"reason": "r", "spec": [op]}, open(pf, "w"))
+                try:
+                    amend(par, pf, log=lambda *a: None)
+                    got = None
+                except AmendError as e:
+                    got = str(e)
+                ok(got is not None and why in got and not seen and sorted(os.listdir(td)) == n0,
+                   f"AM_GUARDS_BEFORE_VALIDATE {name}: refused before the schema reads the patched spec "
+                   f"({(got or '')[:120]}; validated {len(seen)})")
+                seen.clear()
+        finally:
+            schema.validate = real_validate
+        shutil.rmtree(os.path.join(td, "outside"))
         yaml.safe_dump({"reason": "r", "spec": [{"set": "constraints.envelope_usd", "value": 9200}]}, open(pf, "w"))
         st = json.load(open(os.path.join(par, "run_state.json")))
         w(par, "run_state.json", json.dumps(dict(st, state="ANALYZE", status=None, paused=None)))

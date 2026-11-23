@@ -1043,6 +1043,39 @@ def _run_self_test() -> int:
        f"ST6 store_run_results with a non-object metadata.json neither raises nor keeps the bad value ({_got})")
     shutil.rmtree(_sr6, ignore_errors=True)
     shutil.rmtree(_cr, ignore_errors=True)
+    # ST7 (Codex r3 on #342, P1-7): resuming a lead run whose amendment lock another process holds writes nothing:
+    # no identity stamp, no crash record, no upload of the active run
+    import argparse as _ap7
+    import threading as _th7
+    from agents import stage_machine as _sm7, v2_sdk_tasks as _vt7
+    _lr = tempfile.mkdtemp()
+    json.dump({"pipeline": "v2", "commit": "0" * 40, "launcher": "t"}, open(os.path.join(_lr, "metadata.json"), "w"))
+    _sm7.init_run(_lr, "Q?", signoff="lead")
+    _held, _done, _stored7 = _th7.Event(), _th7.Event(), []
+
+    def _hold():
+        with _sm7._amend_lock(_lr):
+            _held.set()
+            _done.wait(60)
+    _t7 = _th7.Thread(target=_hold)
+    _t7.start()
+    _held.wait(60)
+    _snap7 = {f: open(os.path.join(_lr, f), "rb").read() for f in ("metadata.json", _sm7.STATE_FILE)}
+    _saved7 = (globals()["store_run_results"], _vt7.SdkTasks)
+    globals()["store_run_results"], _vt7.SdkTasks = (lambda p: _stored7.append(p)), (lambda *a, **k: None)
+    try:
+        _got7 = _outcome(lambda: _stored7.append(("rc", main_v2(_ap7.Namespace(
+            resume=_lr, question=None, cloud=False, max_rounds=1, signoff="lead", max_budget_usd=None,
+            dev_unsandboxed_derivations=False)))))
+    finally:
+        globals()["store_run_results"], _vt7.SdkTasks = _saved7
+        _done.set()
+        _t7.join(60)
+    ok(_stored7 == [("rc", 1)] and _got7 is None
+       and all(open(os.path.join(_lr, f), "rb").read() == b for f, b in _snap7.items()),
+       f"ST7 a resume refused by a held amendment lock exits 1 with nothing stamped, recorded or stored ({_got7}, "
+       f"{_stored7})")
+    shutil.rmtree(_lr, ignore_errors=True)
     _self_test_pipeline(ok, _outcome)
 
     if failures:
