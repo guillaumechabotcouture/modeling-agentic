@@ -1684,13 +1684,11 @@ class Machine:
         # wrong on a resume or a rewrite (Codex r1 P1-3/P1-4, r2 P1-5/P1-7/P2-8). Only when the try's feedback is
         # what these checks wrote (or none): reasons they cannot verify (a rethink, a refused sign-off, the evidence
         # stage) are never cleared by an old draft that passes them; they are carried (Codex r3 P1-2).
-        recheckable = not fb or fb == self.st.tries.get("spec_feedback_checked")
+        recheckable = (not fb or fb == self.st.tries.get("spec_feedback_checked")
+                       or all(str(x).startswith("draft_spec failed:") for x in fb))   # r1 P1-5: a run saved before
         drafted = res.ok or (recheckable and os.path.lexists(os.path.join(rd, AB.SPEC_FILE)))
         if drafted:
             try:
-                from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
-                if CF.ensure_default(rd):
-                    self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
                 errs = self._spec_checks(rd)
                 if not errs and self.st.derived_inputs:
                     self._write_sheet(rd)
@@ -1722,11 +1720,14 @@ class Machine:
         hard) or not a regular file, or a spec that does not parse, is the problem and nothing else runs (Codex r4
         P1-5: the checks read these files by path)."""
         import yaml
-        bad = _draft_file_problems(rd)
+        bad = _draft_file_problems(rd) + _special_files(rd)     # before anything opens a file (Codex r1 on #350)
         if bad:
             return bad
         try:
             yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
+            from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
+            if CF.ensure_default(rd):                        # after the link checks: it replaces the file
+                self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
         except Exception as e:  # noqa: BLE001
             return [f"spec unreadable: {type(e).__name__}: {e}"]
         out: list[str] = []
@@ -2825,6 +2826,29 @@ def _draft_file_problems(run_dir: str) -> list[str]:
             out.append(f"{rel} is a link or not a regular file: write it as a plain file")
         elif st.st_nlink > 1:
             out.append(f"{rel} has {st.st_nlink} hard links: write it as its own file")
+    return out
+
+
+def _special_files(run_dir: str, limit: int = 20000) -> list[str]:
+    """Every entry in the run directory that is not a regular file, a directory or a link to one (a FIFO, a device, a
+    socket), as problems: a check or a derivation that opens one can block with no writer. The whole run is walked
+    (no link followed), so the result does not depend on how a path in the spec is spelled (Codex r1 on #350). Fail
+    closed past `limit` entries."""
+    import stat
+    out, n = [], 0
+    for base, dirs, files in os.walk(run_dir):
+        for name in dirs + files:
+            n += 1
+            if n > limit:
+                return out + [f"the run directory has more than {limit} entries: its files were not checked"]
+            p = os.path.join(base, name)
+            try:
+                mode = os.stat(p).st_mode           # a link: its target's type
+            except OSError:
+                continue                            # a dangling link opens nothing
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                out.append(f"{os.path.relpath(p, run_dir)!r} in the run is not a regular file: remove it, or write "
+                           "a plain file")
     return out
 
 
