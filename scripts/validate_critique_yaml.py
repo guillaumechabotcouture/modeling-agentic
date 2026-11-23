@@ -486,7 +486,7 @@ def validate_critique(path: str, expected_reviewer: str,
         CL = _checklist_module()
         if expected_reviewer in CL.CHECKLIST_REVIEWERS:
             errs.extend(CL.problems(doc.get("checklist"), ctx, checklist,
-                                    [b.get("id") for b in blockers if isinstance(b, dict)]))
+                                    [b for b in blockers if isinstance(b, dict)]))
 
     if errs:
         raise SchemaError(errs[0], errs)

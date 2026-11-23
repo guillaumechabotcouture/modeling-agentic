@@ -321,10 +321,10 @@ def _follow_up(raw, run_dir, dossier_bytes=None) -> list:
                "a decision test varies it", judgment=True)]
 
 
-def _symmetry(raw) -> list:
+def _symmetry(raw, run_dir=None) -> list:
     """Principle 8, computed (toolkit/spec/critique_checklist.py): the answer the critics' checklist records."""
     from toolkit.spec import critique_checklist as CL
-    a = CL.comparator_symmetry(raw)
+    a = CL.comparator_symmetry(raw, run_dir)
     if a is None or a["answer"] != "finding":
         return []
     return [_f("MEDIUM", "comparator_symmetry", f"Comparator asymmetry: {a['reason']}. Each such arm's effect is "
@@ -342,9 +342,10 @@ def _periods(raw) -> list:
     a = CL.holdout_shock_overlap(raw)
     if a is None or a["answer"] != "finding":
         return []
-    return [_f("MEDIUM", "holdout_shock_overlap", f"{a['reason']}: the holdout tests the model on a period whose "
-               "dynamics the calibration window does not share.",
-               "Move the holdout window off the shock period, or declare this check")]
+    return [_f("MEDIUM", "holdout_shock_overlap", f"{a['reason']}: the holdout tests the model across a declared "
+               "shock (this check does not compare the calibration window).",
+               "Move the holdout window off the shock period, show the calibration window spans the same shock, or "
+               "declare this check", judgment=True)]
 
 
 def _num(x):
@@ -395,7 +396,7 @@ def findings(raw: dict, run_dir: str | None = None, today: datetime.date | None 
                      ("baseline_burden", lambda: _burden(raw, run_dir, burden_data)),
                      ("decision_input_ranges", lambda: _ranges(raw, run_dir, dossier_bytes)),
                      ("follow_up_window", lambda: _follow_up(raw, run_dir, dossier_bytes)),
-                     ("comparator_symmetry", lambda: _symmetry(raw)),
+                     ("comparator_symmetry", lambda: _symmetry(raw, run_dir)),
                      ("holdout_shock_overlap", lambda: _periods(raw))):
         try:
             out += fn()

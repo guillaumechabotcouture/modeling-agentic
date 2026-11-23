@@ -190,7 +190,7 @@ class StubTasks:
         if reviewer in CL.CHECKLIST_REVIEWERS:      # owner 2026-11-23: every item the harness did not answer
             raw = CL.load_spec(run_dir)
             ck = {i: {"answer": "pass", "reason": "stub: checked"}
-                  for i in CL.critic_items(CL.harness_answers(raw) if raw is not None else {})}
+                  for i in CL.critic_items(CL.harness_answers(raw, run_dir) if raw is not None else {})}
             edit = self.s.get("checklist")
             ck = edit(reviewer, round_n, ck) if callable(edit) else ck
             if ck is not None:

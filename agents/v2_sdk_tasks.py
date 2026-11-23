@@ -581,14 +581,18 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
     return True
 
 
-def checklist_text(run_dir: str, reviewer: str) -> str:
-    """The structural checklist a domain or red-team review answers (owner 2026-11-23), with the harness's answers
-    for the items it computed from the run's spec (toolkit/spec/critique_checklist.py); empty for other reviewers."""
+def checklist_text(run_dir: str, reviewer: str) -> tuple[str, str]:
+    """(system text, message text) of the structural checklist a domain or red-team review answers (owner
+    2026-11-23; toolkit/spec/critique_checklist.py): the instructions and the items it answers in the system prompt,
+    the harness's computed results as one line of JSON data in the message (spec text never enters the system prompt;
+    Codex r1 of #366). Both empty for other reviewers."""
     from toolkit.spec import critique_checklist as CL
     if reviewer not in CL.CHECKLIST_REVIEWERS:
-        return ""
+        return "", ""
     raw = CL.load_spec(run_dir)
-    return "\n\n" + CL.prompt_block(CL.harness_answers(raw) if raw is not None else {})
+    harness = CL.harness_answers(raw, run_dir) if raw is not None else {}
+    comp = CL.computed(raw, run_dir) if raw is not None else {}
+    return "\n\n" + CL.prompt_block(harness), "\n\n" + CL.message_data(comp)
 
 
 class SdkTasks:
@@ -781,12 +785,14 @@ class SdkTasks:
         notes = RF.critic_notes(run_dir)
         msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
                                             + "\n- ".join(notes) if notes else "")
+        ck_sys, ck_msg = checklist_text(run_dir, reviewer)
+        msg += ck_msg
         before = _file_bytes(run_dir, f)
         res = self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
-            stages=" | ".join(sorted(V.VALID_TARGET_STAGE))) + checklist_text(run_dir, reviewer),
+            stages=" | ".join(sorted(V.VALID_TARGET_STAGE))) + ck_sys,
                             msg, (f,), model)
         stamp_critique(run_dir, reviewer, before)
         return res
@@ -970,11 +976,19 @@ def _self_test() -> int:
         yaml.safe_dump({"options": {"components": {"sc": {}, "a": {}, "c": {}},
                                     "packages": {"soc": ["sc"], "soc_a": ["sc", "a"], "c": ["c"]}},
                         "comparator": {"package": "soc"}}, open(os.path.join(ck, "decision_spec.yaml"), "w"))
-        tx = checklist_text(ck, "critique-redteam")
-        ok(all(i in tx for i in CL.ITEMS) and "comparator_symmetry (principle 8): finding" in tx
-           and "`c` lacks `sc`" in tx and checklist_text(ck, "critique-presentation") == ""
-           and "checklist (the domain and red-team" in cp2,
-           f"SCK1 the checklist and the harness's answers reach the domain and red-team prompts only: {tx[-300:]}")
+        tx, tm = checklist_text(ck, "critique-redteam")
+        ok(all(i in tx for i in CL.ITEMS) and "lacks" not in tx and "`c` lacks `sc`" in tm and "\n" not in tm.strip()
+           and checklist_text(ck, "critique-presentation") == ("", "") and "checklist (the domain and red-team" in cp2,
+           f"SCK1 the checklist reaches the domain and red-team prompts only; an undeclared computed finding is the "
+           f"critics' item, its result data in the message, never spec text in the system prompt: {tx[-200:]} | {tm}")
+        # SCK3 (Codex r1 of #366, P1-4): a spec that is a link (here into another run) is never read
+        other = os.path.join(d, "ck_other")
+        os.makedirs(other)
+        os.replace(os.path.join(ck, "decision_spec.yaml"), os.path.join(other, "decision_spec.yaml"))
+        os.symlink(os.path.join(other, "decision_spec.yaml"), os.path.join(ck, "decision_spec.yaml"))
+        tx3, tm3 = checklist_text(ck, "critique-redteam")
+        ok(CL.load_spec(ck) is None and "lacks" not in tm3 and all(i in tx3 for i in CL.ITEMS),
+           f"SCK3 a linked spec is not read: every item is the critics' ({tm3})")
         ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT, files="f")
            and "engine: auto" in PROMPTS["draft_spec"], "S10 the prompts follow the analysis backend's schema")
 

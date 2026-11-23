@@ -274,12 +274,15 @@ checklist:
 
 - `answer` is `pass`, `finding` or `not_applicable`; every answer has a
   non-empty `reason` (for `not_applicable`, why the check cannot arise).
-- A `finding` names the blocker(s) in the same file that state it. The
+- A `finding` names the open (unresolved) blocker(s) in the same file that state it. The
   checklist adds no finding of its own: `pass` and `not_applicable` cost
   no round, and a finding costs only what its blocker costs.
-- The harness answers `comparator_symmetry` from the spec's packages, and
-  `holdout_shock_overlap` when the spec declares `periods.holdout` and
-  `periods.shocks`. The prompt shows its answers; leave those items out.
+- The harness computes `comparator_symmetry` from the packages execution
+  uses, and `holdout_shock_overlap` when the spec declares `periods.holdout`
+  and `periods.shocks`; the review message gives the results as JSON data.
+  A computed pass or not_applicable, or a finding the spec declares, is the
+  harness's answer: leave that item out. An undeclared computed finding is
+  yours to answer (a blocker, or pass with the reason it does not matter).
   Both are also pre-sign checks on the sign-off sheet
   (`toolkit/spec/spec_critique.py`), where a finding is fixed or declared.
 - A missing item, an unknown item, an unknown answer, a missing reason, or

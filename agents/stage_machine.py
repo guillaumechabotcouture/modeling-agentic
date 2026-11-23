@@ -515,12 +515,14 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     critiques, schema_errors, refused = {}, [], {}
     # Owner 2026-11-23: the domain and red-team critics answer the structural checklist; the harness answers the
     # items it computes from the spec (toolkit/spec/critique_checklist.py). A missing item is a schema error.
-    # Required once the run has a decision spec (every v2 run at GATE; an unreadable spec leaves every item to the
-    # critics); a gate over critique files alone (no spec, the unit fixtures) needs none.
+    # Required in a run (its run_state.json or its decision spec exists; a missing or unreadable spec leaves every item
+    # to the critics); only a gate over critique files alone (the unit fixtures, no run) needs none (Codex r1 of #366).
     from toolkit.spec import critique_checklist as CL
     spec_raw = CL.load_spec(run_dir)
-    harness = CL.harness_answers(spec_raw) if spec_raw is not None else {}
-    checklist = harness if os.path.lexists(os.path.join(run_dir, "decision_spec.yaml")) else None
+    harness = CL.harness_answers(spec_raw, run_dir) if spec_raw is not None else {}
+    ck_results = CL.computed(spec_raw, run_dir) if spec_raw is not None else {}
+    in_run = any(os.path.lexists(os.path.join(run_dir, f)) for f in ("decision_spec.yaml", STATE_FILE))
+    checklist = harness if in_run else None
     draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     extra = list(extra)
     names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
@@ -582,7 +584,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     if schema_errors:
         return {"schema_errors": schema_errors, "action": None}
     d = V.decide(critiques, max_rounds, round_n)
-    d["critique_checklist"] = CL.record(critiques, harness)
+    d["critique_checklist"] = CL.record(critiques, harness, ck_results)
     d["declared"] = V._declared_ids(run_dir)
     d["declared_prev"] = V._previous_declared(run_dir, round_n)
     d = V._apply_brief_scope(d, critiques, run_dir, max_rounds, round_n)
@@ -5099,6 +5101,12 @@ def _self_test() -> int:
         open(os.path.join(dd, "decision_spec.yaml"), "w").write("not: [a spec\n")      # unreadable: every item is the critics'
         gck = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
         os.remove(os.path.join(dd, "decision_spec.yaml"))
+        open(os.path.join(dd, STATE_FILE), "w").write("{}")       # a run whose spec is gone (Codex r1 of #366, P1-3)
+        gck5 = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        os.remove(os.path.join(dd, STATE_FILE))
+        ok(gck5.get("action") is None and len([e for e in gck5.get("schema_errors") or []
+                                               if "missing required key 'checklist'" in e]) == len(CRITICS),
+           f"SM-CK5 a run without its spec still requires every checklist item: {(gck5.get('schema_errors') or [])[:2]}")
         ok(gck.get("action") is None and len([e for e in gck.get("schema_errors") or []
                                               if "missing required key 'checklist'" in e]) == len(CRITICS),
            f"SM-CK4 with a decision spec in the run (even an unreadable one), critiques without the checklist are "
