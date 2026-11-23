@@ -414,8 +414,8 @@ def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
                     return f"{rel} is the harness file {h}"
         except OSError:
             return f"{rel} cannot be checked"
-    if low == OUT.lower() or any(low.startswith(o.lower()) for o in owns if o.endswith("/")) \
-            or low in {o.lower() for o in owns}:
+    # what the task owns matches as written (Codex r3 on #341, P1-2): a case variant of an owned path is another file
+    if low == OUT.lower() or any(rel.startswith(o) for o in owns if o.endswith("/")) or rel in owns:
         return None
     return f"this task may write only {', '.join(owns + (OUT,))}"
 
@@ -1004,6 +1004,13 @@ def _self_test() -> int:
         # Codex review of #341 (P1-6): the worker writes only the in-scope files its validated plan names
         ok(got["fix"][1] == ("analysis_settings.yaml",) and "edit only analysis_settings.yaml" in got["fix:system"],
            f"S_FIX_TASK_FILES a fix task owns the files its plan names, and its prompt says so ({got['fix']})")
+        # Codex r3 P1-2: an owned path matches as written (case-sensitive): owning models/ext/rates.py is not owning
+        # models/ext/RATES.py, a different module on a case-sensitive filesystem
+        ok(_allowed("models/ext/rates.py", d, ("models/ext/rates.py",)) is None
+           and _allowed("models/ext/RATES.py", d, ("models/ext/rates.py",)) is not None
+           and _allowed("MODELS/ext/x.py", d, ("models/ext/",)) is not None
+           and _allowed("models/ext/sub/x.py", d, ("models/ext/",)) is None,
+           "S_OWNS_CASE an owned file or folder matches case-sensitively")
         # S_FOR_RUN_DIR (lead-gaps β): the tasks move to a child run with the same settings, rooted in the child
         t5 = SdkTasks(d, allow_cloud=True, task_cap_usd=2.5, max_turns=7, query_fn=rec_session)
         c5 = t5.for_run_dir(os.path.join(d, "child"))
