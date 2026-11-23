@@ -174,6 +174,20 @@ def _withhold_report(run_dir: str) -> None:
         _quarantine_report(run_dir)
 
 
+def _retire_stale_withheld(run_dir: str) -> None:
+    """Baseline hb2 (§5 fix 8): a language repair quarantines the rejected draft in report_withheld.md; once the run
+    ends with a regular report.md (every withhold path moves report.md away, so it is the delivered one), the
+    leftover is removed (no link followed), so no reader takes the run's report as withheld. The repair stays in the
+    history and in the gate records (report_acceptance_language). The caller calls it only on a post-write gate's
+    decision (Codex r1 of #355: a run that ends before that gate keeps the quarantined copy). Anything at that name
+    other than a regular file or a link (a directory) is left alone."""
+    p = os.path.join(run_dir, "report.md")
+    w = os.path.join(run_dir, "report_withheld.md")
+    if os.path.isfile(p) and not os.path.islink(p) and (os.path.islink(w) or os.path.isfile(w)):
+        from lib.safe_io import remove_nofollow
+        remove_nofollow(run_dir, "report_withheld.md")
+
+
 def _quarantine_report(run_dir: str) -> None:
     """F6 S1-7: move report.md to report_withheld.md through lib.safe_io (no link followed at either name;
     a linked report.md is refused, a link at the destination is replaced)."""
@@ -678,6 +692,9 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
 
 _remedy, short_label = FL.remedy, FL.short_label
 MAX_LANGUAGE_REPAIRS = 2
+# hb2: writer sessions inside WRITE that repair claim references (no round is spent on them)
+MAX_CLAIM_REPAIRS = 2
+CLAIM_REF_KINDS = ("report_claim_unresolved", "report_claim_id_raw", "report_claim_unrendered")
 
 
 def require_judged(d: dict, opened: list | None = None) -> dict:
@@ -801,8 +818,27 @@ def scope_request_view(d: dict) -> dict:
 DECLARED_FILE = "declared_findings.yaml"
 
 
+def _ledger_claims(run_dir: str) -> dict | None:
+    """The claims ledger's valid claims, or None when there is no ledger or it cannot be read."""
+    lp = os.path.join(run_dir, "models", "claims_ledger.yaml")
+    if not os.path.exists(lp):
+        return None
+    try:
+        import render_claims as RCL
+        return RCL.load_claims_tolerant(lp)[0]
+    except Exception:  # noqa: BLE001 -- report_claim_findings reports the unreadable ledger
+        return None
+
+
+def _quoted(text, claims: dict | None):
+    """A finding's text for the writer, who repeats it in full: no reference outside the ledger (hb2, dengue R2)."""
+    import render_claims as RCL
+    return RCL.quote_refs(text, claims or {}, render=False) if isinstance(text, str) else text
+
+
 def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
     import yaml
+    known = _ledger_claims(run_dir)
     try:            # a declared harness gap keeps the planner's reason and what it needs (Codex r3 of #357, P2-13)
         led = FL.load(run_dir)
         gaps = FL.harness_gaps(led)
@@ -813,9 +849,9 @@ def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
     _put(run_dir, DECLARED_FILE, yaml.safe_dump({
         "rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
         "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"],
-                      "label": short_label(o["claim"]), "claim": o["claim"],
-                      "required_remedy": o.get("fix_requires"), "tested": bool(o.get("tested")),
-                      **({"harness_gap": gap_note[o["id"]]} if gap_note.get(o["id"]) else {})}
+                      "label": _quoted(short_label(o["claim"]), known), "claim": _quoted(o["claim"], known),
+                      "required_remedy": _quoted(o.get("fix_requires"), known), "tested": bool(o.get("tested")),
+                      **({"harness_gap": _quoted(gap_note[o["id"]], known)} if gap_note.get(o["id"]) else {})}
                      for o in opened]}, sort_keys=False, width=10**6))
 
 
@@ -926,9 +962,10 @@ def stage_inputs(run_dir: str, question: str) -> list[str]:
     return staged
 
 
-def record_cited_inputs(run_dir: str) -> list[str]:
+def record_cited_inputs(run_dir: str, derived_inputs: bool = True) -> list[str]:
     """Every file decision_spec.yaml cites must be inside the run directory; each is recorded with
-    its sha256 in data/inputs_provenance.json. Returns the problems (pre-sign)."""
+    its sha256 in data/inputs_provenance.json. Returns the problems (pre-sign). `derived_inputs`: the run derives its
+    units table, so a missing one's hint names the staged file as a derivation's input (Codex r3 of #355)."""
     import yaml
     import pipeline as P
     try:
@@ -946,6 +983,8 @@ def record_cited_inputs(run_dir: str) -> list[str]:
             probs.append(f"the staged input {dest} was changed or removed after it was copied")
         elif os.path.isfile(src) and _sha256(src) != e.get("sha256"):
             probs.append(f"the staged input {dest} no longer matches its source {e.get('source')}")
+    units = (spec.get("decision_units") or {}).get("csv") if isinstance(spec, dict) \
+        and isinstance(spec.get("decision_units"), dict) else None
     for rel in sorted(set(found)):
         p = os.path.realpath(os.path.join(run_dir, rel))
         if not p.startswith(root + os.sep):
@@ -953,7 +992,9 @@ def record_cited_inputs(run_dir: str) -> list[str]:
         elif os.path.isdir(p):
             prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/") + "/"] = {"dir": True}
         elif not os.path.isfile(p):
-            probs.append(f"the spec cites {rel}, which does not exist")
+            probs.append(f"the spec cites {rel}, which does not exist"
+                         + P.staged_copy_hint(rel, run_dir, derive=derived_inputs and isinstance(units, str)
+                                              and units.strip() == rel))
         else:
             prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/")] = {"sha256": _sha256(p)}
     os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
@@ -976,8 +1017,9 @@ def report_claim_findings(run_dir: str) -> list[dict]:
         return [{"kind": "report_claims_unreadable", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                  "key": "claims", "scope_declarable": False, "claim": f"claims ledger unreadable: {e}"}]
     # The writer's own text, all of it: what the harness appends is not in manuscript.md, so no
-    # marker the writer could copy can hide anything.
-    text = open(rp).read()
+    # marker the writer could copy can hide anything. Read as render_report renders it: a known id alone in
+    # inline code is its reference (render_claims.normalise_refs).
+    text = RCL.normalise_refs(open(rp).read(), claims)
     # One invalid claim is its own finding (the valid ones still render: render_report); still HIGH and not
     # declarable, as the whole-ledger refusal it replaces was.
     out = [{"kind": "report_claim_invalid", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE", "key": cid,
@@ -998,7 +1040,8 @@ def report_claim_findings(run_dir: str) -> list[dict]:
     typed = typed_numbers(text, given_values(run_dir, claims))
     rp2 = os.path.join(run_dir, "report.md")
     if os.path.exists(rp2):
-        left = re.findall(r"\[CLAIM:([^\]]*)\]", open(rp2).read())
+        # a reference to an invalid claim is reported once, as invalid (the ledger's, not the writer's to repair)
+        left = [x for x in re.findall(r"\[CLAIM:([^\]]*)\]", open(rp2).read()) if x.strip() not in invalid]
         if left:
             out.append({"kind": "report_claim_unrendered", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                         "key": "unrendered", "scope_declarable": False,
@@ -1471,6 +1514,9 @@ class Machine:
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
             self._withhold_if_acceptance_language()
+            if frm == "GATE" and (self.st.last_gate or {}).get("post_write") and self.st.last_gate.get("action") \
+                    and self.st.status in DELIVERED_STATUSES:     # a gate decision that delivers the report (Codex r2)
+                _retire_stale_withheld(self.run_dir)
             self._finish()
         if before_save is not None:
             before_save()
@@ -1841,13 +1887,16 @@ class Machine:
                 self.st.tries["spec_feedback_checked"] = list(self.st.tries["spec_feedback"])
             else:
                 self.st.tries.pop("spec_feedback_checked", None)
-            return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
+            # baseline hb2 §4.6: the whole feedback of each failed try is kept in its history entry
+            return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}",
+                            extra={"feedback": list(self.st.tries["spec_feedback"])})
         self.st.tries.pop("spec_feedback", None)
         self.st.tries.pop("spec_feedback_checked", None)
         if not self._review_conditions(self.st.signoff, defer=False):
             # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
             self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
-            return self._go("SPEC", "review conditions could not be prepared for signing")
+            return self._go("SPEC", "review conditions could not be prepared for signing",
+                            extra={"feedback": list(self.st.tries["spec_feedback"])})
         return self._go("EVIDENCE", "spec drafted and valid")
 
     def _spec_checks(self, rd: str) -> list[str]:
@@ -1878,7 +1927,7 @@ class Machine:
             return not got
         if self.st.derived_inputs:
             run("derivation", lambda: self._derive(rd))
-        run("cited-input", lambda: record_cited_inputs(rd))      # records the hashes before a check reads a cited file
+        run("cited-input", lambda: record_cited_inputs(rd, bool(self.st.derived_inputs)))      # records the hashes before a check reads a cited file
         outside = self._cites_outside(rd)
         if outside:             # Codex r1 P1-1: no later check opens a file the cited-input check refused
             out.extend(x for x in outside if x not in out)       # r2 P1-2: never empty, so never a pass
@@ -2768,10 +2817,12 @@ class Machine:
 
     def h_WRITE(self):
         mode = self.st.write_mode or "not_accepted"
+        self._recover_claim_repair()        # before the draft is read: a repair interrupted before its check
         self._world_model("refresh")
         fb = self.st.tries.get("language_feedback")             # a language repair (F6 S1-7)
         # F6 run 3: the write-up findings the fix loop left to this stage, with their remedies
-        wf = [{"id": f.id, "claim": f.claim, "fix_requires": f.fix_requires}
+        known = _ledger_claims(self.run_dir)
+        wf = [{"id": f.id, "claim": _quoted(f.claim, known), "fix_requires": _quoted(f.fix_requires, known)}
               for f in FL.open_findings(FL.load(self.run_dir)) if FX.is_write_up(f)]
         res = self._task(f"WRITE#{self._visit()}:{mode}", "write", self.run_dir, mode, *([fb] if fb else []),
                          writeup=True, **({"findings": wf} if wf else {}))
@@ -2781,11 +2832,85 @@ class Machine:
         if not res.ok or not self._has_draft():
             return self._go("FINAL", "the writer produced no draft", "completed_no_report")
         render_report(self.run_dir, self.backend)
+        if self.st.v2_rules:
+            self._repair_claim_refs(mode)
         self.st.post_write = True
         if mode == "not_accepted" and not self._rereview_due():
             # (a revised not-accepted draft gets its presentation review at the new round too: Codex r1 of #344, P2-5)
             return self._go("GATE", "not-accepted report written; final gate")
         return self._go("PRESENTATION", f"draft written ({mode})")
+
+    def _repair_claim_refs(self, mode: str) -> None:
+        """hb2 (3 of 8 runs RUN_FAILED): a claim-reference finding in the draft (an id outside the ledger, a bare id,
+        a reference left unrendered) is the writer's alone, and it was found only at the post-write gate, with no
+        round left. It is repaired here, inside WRITE, before any gate, so it never costs a round: at most
+        MAX_CLAIM_REPAIRS writer sessions per draft, each told the findings, paid outside the write-up reserve (the
+        presentation review and the gate keep theirs). What is left goes to the gate, which still refuses it
+        (non-declarable HIGH): a number with no ledger entry is never accepted.
+        A repair only turns references into references (_claim_repair_undo): otherwise it is undone and the finding
+        stays for the gate. The draft before each session is kept in run_state.json until its check has run; a
+        session interrupted before its check is undone on resume (_recover_claim_repair). report.md is re-rendered
+        after every session."""
+        base = f"WRITE#{self._visit()}:{mode}:claims"
+        used = sum(1 for h in self.st.history if str(h.get("claim_repair_key", "")).startswith(base))
+        for n in range(used + 1, MAX_CLAIM_REPAIRS + 1):
+            bad = [f for f in report_claim_findings(self.run_dir)
+                   if f["severity"] == "HIGH" and f["kind"] in CLAIM_REF_KINDS]
+            if not bad:
+                return
+            key, before = f"{base}{n}", open(os.path.join(self.run_dir, "manuscript.md"), encoding="utf-8").read()
+            rec = {"claim_repair": n, "claim_repair_key": key, "state": "WRITE", "round": self.st.round,
+                   "kinds": sorted({f["kind"] for f in bad}), "findings": len(bad)}
+            self.st.tries["claim_repair"] = dict(rec, before=before)
+            save_state(self.run_dir, self.st)
+            fs = [{"id": f"{f['kind']}:{f['key']}", "claim": f["claim"], "fix_requires": None, "repair": "claims"}
+                  for f in bad]
+            res = self._task(key, "write", self.run_dir, mode, findings=fs)
+            self.st.tries.pop("claim_repair", None)
+            if res is None:                 # no session ran: the draft is as it was
+                save_state(self.run_dir, self.st)
+                return
+            undone = self._claim_repair_undo(before)
+            if undone:
+                _put(self.run_dir, "manuscript.md", before)
+            self.st.history.append(dict(rec, at=_now(), ok=bool(res.ok), **({"undone": undone} if undone else {})))
+            save_state(self.run_dir, self.st)
+            render_report(self.run_dir, self.backend)
+            if not res.ok or undone:
+                return
+
+    def _recover_claim_repair(self) -> None:
+        """A claim-repair session interrupted before its check (Codex r2-r3 of #353): its draft is undone from the
+        copy in run_state.json, and the session counts as used."""
+        rec = self.st.tries.pop("claim_repair", None)
+        if not isinstance(rec, dict) or not isinstance(rec.get("before"), str):
+            return
+        _put(self.run_dir, "manuscript.md", rec.pop("before"))
+        self.st.history.append(dict(rec, at=_now(), ok=False, undone=["interrupted before its check"]))
+        save_state(self.run_dir, self.st)
+
+    def _claim_repair_undo(self, before: str) -> list[str]:
+        """Why a repair is undone ([] when kept): the draft is missing, unreadable or empty; it lost more than a
+        fifth of its text outside references; or it holds a digit string outside a reference that the draft
+        before did not (counted per occurrence, years included; references read as the renderer reads them)."""
+        import re
+        from collections import Counter
+        try:
+            after = open(os.path.join(self.run_dir, "manuscript.md"), encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError) as e:
+            return [f"the draft could not be read ({type(e).__name__})"]
+        if not after.strip():
+            return ["the repair left the draft empty"]
+        import render_claims as RCL
+        known = _ledger_claims(self.run_dir) or {}
+
+        def prose(t):
+            return re.sub(r"\[CLAIM:[^\]]*\]", " ", RCL.normalise_refs(t, known))
+        if len(prose(after).split()) < 0.8 * len(prose(before).split()):
+            return ["the repair removed text other than references"]
+        added = Counter(re.findall(r"\d+(?:[.,]\d+)*", prose(after))) - Counter(re.findall(r"\d+(?:[.,]\d+)*",
+                                                                                            prose(before)))
+        return [f"added number {x}" for x in sorted(added)][:8]
 
     def h_PRESENTATION(self):
         # The review of the draft is part of the write-up: like WRITE, it may use the write-up reserve (an accepted
@@ -3074,6 +3199,10 @@ def _pre_engine_check(spec: dict) -> list[str]:
 
 
 ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
+# The final statuses under which a post-write gate's decision delivers report.md (accepted, declared or not accepted,
+# each with its write-up): only these retire a stale report_withheld.md (_retire_stale_withheld)
+DELIVERED_STATUSES = ACCEPTED_STATUSES + ("completed_scope_declared", "completed_scope_declined",
+                                          "completed_gate_not_accepted")
 STATUS_MARK = "<!-- harness: run status -->"
 
 
@@ -3361,14 +3490,14 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     artifacts: the headline numbers, the declared limits and open findings (in full, with their
     required remedy), and the deliverable file the spec names."""
     import yaml
+    import render_claims as RCL
     draft = open(os.path.join(run_dir, "manuscript.md")).read()
-    lp = os.path.join(run_dir, "models", "claims_ledger.yaml")
-    if os.path.exists(lp):
+    known = _ledger_claims(run_dir)
+    if known is not None:
         # The writer writes [CLAIM:id]; the harness substitutes the value (no number is typed).
-        import render_claims as RCL
         try:
             # the valid claims; an invalid one stays a reference, reported by report_claim_findings
-            draft, _unresolved = RCL.render_text(draft, RCL.load_claims_tolerant(lp)[0])
+            draft, _unresolved = RCL.render_text(RCL.normalise_refs(draft, known), known)
         except Exception:  # noqa: BLE001 -- left unrendered; report_claim_findings flags it
             pass
     h = backend.headline(run_dir)
@@ -3409,9 +3538,8 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
                   f"{e.get('required_remedy') or 'not stated by the finding.'}"
-                  # (planner text: no claim reference is rendered from it)
-                  + (" Harness gap (no fix task can make this change): "
-                     + re.sub(r"\[CLAIM:([^\]]*)\]", r"claim \1", str(e["harness_gap"])) if e.get("harness_gap")
+                  # (planner text, quoted by write_declared as the claim and remedy are)
+                  + (f" Harness gap (no fix task can make this change): {e['harness_gap']}" if e.get("harness_gap")
                      else "") for e in dec2["declared"]]
     try:            # v2 autonomy 1B-ii: who drafted and signed the evidence dossier, and its declared gaps
         from toolkit.spec import evidence_draft as EDR
@@ -3451,7 +3579,10 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     rcl = RCN.report_lines(run_dir)
     if rcl:
         head = head + "\n".join(rcl) + "\n"
-    full = head + body + "\n".join(lines) + "\n"
+    # hb2: what the harness quotes (findings, remedies, declarations) shows values or words, never a reference: a
+    # reference left in report.md is then the writer's, in the writer's span.
+    head, tail = RCL.quote_refs(head, known or {}), RCL.quote_refs("\n".join(lines), known or {})
+    full = head + body + tail + "\n"
     _put(run_dir, "report.md", full)
     # What the harness added, authenticated by the report's hash: writer_qa checks only the writer's span.
     _write_json(run_dir, "report_render.json", {"report_sha256": hashlib.sha256(full.encode("utf-8")).hexdigest(),
@@ -5546,7 +5677,7 @@ def _self_test() -> int:
         rep = open(os.path.join(fr, "report.md")).read()
         ok("[CLAIM:" not in rep and "headline.point" not in rep.split("<!-- harness")[0] and not report_claim_findings(fr),
            f"T40 claim references are rendered inline ({rep.splitlines()[0][:120]})")
-        open(os.path.join(fr, "manuscript.md"), "w").write("ITN in `mix.itn` districts; [CLAIM:no.such.claim].\n")
+        open(os.path.join(fr, "manuscript.md"), "w").write("ITN in mix.itn districts; [CLAIM:no.such.claim].\n")   # a known id in inline code renders (CR3)
         render_report(fr, AB)
         kinds = [(f["kind"], f["severity"]) for f in report_claim_findings(fr)]
         ok(("report_claim_id_raw", "HIGH") in kinds and ("report_claim_unresolved", "HIGH") in kinds,
@@ -5653,7 +5784,7 @@ def _self_test() -> int:
         k44 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
         ok(k44 and "999,999" in k44[0]["claim"] and "18000000" not in k44[0]["claim"] and "2026" not in k44[0]["claim"],
            f"T44 a typed result number is HIGH; the owner's given numbers, years, ids and list numbers are not ({k44[:1]})")
-        open(os.path.join(fr, "manuscript.md"), "w").write("Intro.\n<!-- harness: copied -->\n`headline.point` and [CLAIM:nope].\n")
+        open(os.path.join(fr, "manuscript.md"), "w").write("Intro.\n<!-- harness: copied -->\nheadline.point and [CLAIM:nope].\n")
         k44b = {f["kind"] for f in report_claim_findings(fr)}
         ok({"report_claim_id_raw", "report_claim_unresolved"} <= k44b, f"T44b no marker the writer copies hides an id ({k44b})")
         open(os.path.join(fr, "manuscript.md"), "w").write("Averts [CLAIM:headline.point] cases.\n")
@@ -5710,6 +5841,35 @@ def _self_test() -> int:
             if want:
                 ok(any("data/missing.csv" in x for x in rc) and any("data/missing.csv" in x for x in dr),
                    f"T50d the joint target's own csv is still a cited file, and a missing one is refused ({rc}; {dr})")
+        # T50f (baseline hb2 §4.6): the spec cited a question file by its repository path; its staged copy
+        # existed. Both refusals name the staged path, so the next try cites it.
+        for cited in ("requirements.txt", "./requirements.txt"):
+            spec = {"decision_units": {"csv": "data/inputs/requirements.txt"},
+                    "calibration": {"targets": [{"id": "t", "csv": cited}]}}
+            yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+            rc = [x for x in record_cited_inputs(fk) if "does not exist" in x]
+            dr = [p["claim"] for p in P_.derivation_problems(fk, spec, required=True) if p["code"] == "data_ref_not_derived"]
+            ok(rc and all("data/inputs/requirements.txt" in x for x in rc)
+               and dr and all("data/inputs/requirements.txt" in x for x in dr),
+               f"T50f a cited path whose staged copy exists: the refusals name the staged path ({rc}; {dr})")
+        # T50g (Codex r1 of #355): a qualified path in another folder (a derived table) is not matched to a staged
+        # input by its file name: following that hint would skip the derivation.
+        spec = {"decision_units": {"csv": "data/inputs/requirements.txt"},
+                "calibration": {"targets": [{"id": "t", "csv": "data/derived/requirements.txt"}]}}
+        yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+        rc = [x for x in record_cited_inputs(fk) if "does not exist" in x]
+        ok(rc and not any("staged copy" in x for x in rc),
+           f"T50g a qualified path is matched to a staged input only by its full path ({rc})")
+        # T50h (Codex r2 of #355): the units table must be a derivation's output, so its hint names the staged file as
+        # the derivation's input, never as the path to cite.
+        spec = {"decision_units": {"csv": "requirements.txt"}}
+        yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+        rc = [x for x in record_cited_inputs(fk) if "does not exist" in x]
+        ok(rc and all("derivation" in x and "cite that path" not in x for x in rc),
+           f"T50h the units table's hint says to read the staged file in a derivation ({rc})")
+        rc = [x for x in record_cited_inputs(fk, derived_inputs=False) if "does not exist" in x]
+        ok(rc and all("cite that path" in x for x in rc),
+           f"T50i (Codex r3) a run that runs no derivations is told to cite the staged units table itself ({rc})")
         for kind, key in (("group", {"csv": {"file": "data/missing.csv"}, "units": "state"}),
                           ("unit", {"csv": "data/missing.csv"})):    # Codex: only a group target's column name
             spec = {"decision_units": {"csv": "data/inputs/requirements.txt"}, "calibration": {"joint": {"targets": [
@@ -5738,10 +5898,10 @@ def _self_test() -> int:
         k53 = [f for f in report_claim_findings(fr) if f["kind"] == "report_number_typed"]
         ok(k53 and "57%" in k53[0]["claim"] and "10" not in k53[0]["claim"].split("(")[1].split(")")[0].split(", "),
            f"T53 only the question's own numbers are given; a timestamp's digits are not ({k53[:1]})")
-        open(os.path.join(fr, "manuscript.md"), "w").write("The plan averts `[CLAIM:headline.point]` cases.\n")
+        open(os.path.join(fr, "manuscript.md"), "w").write("The plan averts\n```\n[CLAIM:headline.point]\n```\n")
         render_report(fr, spike)
         ok(any(f["kind"] == "report_claim_unrendered" for f in report_claim_findings(fr)),
-           "T54 a claim reference left unrendered in the report (inside code) is a HIGH finding")
+           "T54 a claim reference left unrendered in the report (in a fenced block) is a HIGH finding")
         # T56: the typed-number rule is a text heuristic: MEDIUM and declarable (process rule 4), and the
         # interval level and any value in the spec, the ledger or the question are not typed numbers.
         open(os.path.join(fr, "manuscript.md"), "w").write(
@@ -5779,6 +5939,7 @@ def _self_test() -> int:
 
         _self_test_auto1a(ok, td, spike, new_run)
         _self_test_writeup_rounds(ok, td, spike, new_run)
+        _self_test_claim_refs(ok, td, spike, new_run)
         try:
             _self_test_hb2_spec(ok, td, spike, new_run)
         except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
@@ -5976,6 +6137,56 @@ def _self_test() -> int:
                 ok(s == want and any(c.endswith(":repair") for c in T.calls) and os.path.exists(rp)
                    and "validated" not in open(rp).read() and al.get("repairs") == 1 and not al.get("remaining"),
                    f"T84 a declared report with acceptance language goes back to the writer and is delivered repaired ({s}, {al})")
+                # T84b (baseline hb2 §5 fix 8): the rejected draft's report_withheld.md stayed beside the delivered
+                # report.md, and harness_metrics counted the run as not done. Delivery retires it.
+                ok(not os.path.lexists(os.path.join(d, "report_withheld.md")),
+                   "T84b once the repaired report.md is delivered, the stale report_withheld.md is retired")
+                # T84c-T84d (Codex r1 of #355): only a post-write gate's decision delivers the repaired draft; a run
+                # that ends before it (the budget, at WRITE or PRESENTATION) keeps the quarantined copy, and a
+                # directory at that name never stops the run's end.
+                t84 = {}
+                for case, frm, gate, wh_dir in (("budget_at_write", "WRITE", {}, False),
+                                                ("gate_no_action", "GATE", {"post_write": True, "action": None}, False),
+                                                ("gate_dir", "GATE", {"post_write": True, "action": "ACCEPT"}, True),
+                                                ("gate_ok", "GATE", {"post_write": True, "action": "ACCEPT"}, False)):
+                    dc = os.path.join(td, "t84c_" + case)
+                    os.makedirs(dc)
+                    open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+                    if wh_dir:
+                        os.makedirs(os.path.join(dc, "report_withheld.md"))
+                    else:
+                        open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+                    mc = Machine(dc, StubTasks({}), RunState(question="q", state=frm, v2_rules=False, last_gate=gate),
+                                 backend=spike, log=lambda *a: None)
+                    try:
+                        mc._go("FINAL", "t", "budget_exhausted" if frm == "WRITE" else "completed")
+                        t84[case] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+                    except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                        t84[case] = repr(e)
+                # T84d (Codex r2 of #355): a post-write gate that ends the run without delivering the report (a
+                # validator error) keeps the quarantined copy too.
+                dc = os.path.join(td, "t84d")
+                os.makedirs(dc)
+                open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+                open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+                mc = Machine(dc, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False,
+                                                         last_gate={"post_write": True, "action": "VALIDATOR_ERROR"}),
+                             backend=spike, log=lambda *a: None)
+                mc._go("FINAL", "validator error", "completed_gate_error")
+                t84["validator_error"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+                # T84e (Codex r3): an owner-declined declaration's report is delivered too
+                dc = os.path.join(td, "t84e")
+                os.makedirs(dc)
+                open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+                open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+                mc = Machine(dc, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False,
+                                                         last_gate={"post_write": True, "action": "RUN_FAILED"}),
+                             backend=spike, log=lambda *a: None)
+                mc._go("FINAL", "declined", "completed_scope_declined")
+                t84["declined"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+                ok(t84 == {"budget_at_write": True, "gate_no_action": True, "gate_dir": True, "gate_ok": False,
+                           "validator_error": True, "declined": False},
+                   f"T84c the quarantined draft is retired only after a post-write gate decided, never a directory ({t84})")
             else:
                 ok(s == want and not os.path.exists(rp) and os.path.exists(os.path.join(d, "report_withheld.md"))
                    and al.get("remaining"),
@@ -7188,6 +7399,12 @@ def _self_test_geometry(ok, td: str) -> None:
     ok(status == "run_failed" and any(x.startswith("reciprocal_swap") and "reciprocal_swap:0+1" in x for x in fb)
        and "SIGN" not in [h.get("to") for h in load_state(d1).history],
        f"IG-M1 a units table whose rows carry each other's points is refused before SIGN ({status}; {fb[:1]})")
+    # SH1 (baseline hb2 §4.6): each failed try's feedback is kept whole in its history entry (the `why` line is cut
+    # short, and spec_feedback is cleared once a try passes), so a later reader can tell what each try was told.
+    sh = [h for h in load_state(d1).history if h.get("from") == "SPEC" and h.get("to") == "SPEC"]
+    ok(sh and all(isinstance(h.get("feedback"), list) and h["feedback"] for h in sh)
+       and sh[-1]["feedback"] == fb and any(len("; ".join(h["feedback"])) > len(h["why"]) for h in sh),
+       f"SH1 every SPEC retry records its try's whole feedback in history ({[len(h.get('feedback') or []) for h in sh]})")
     hf = {f["kind"]: f for f in m1.harness_findings()}
     ok(hf.get("reciprocal_swap", {}).get("severity") == "HIGH" and hf["reciprocal_swap"]["scope_declarable"] is False,
        f"IG-M3 the gate carries the open swap as a HIGH finding that cannot be declared ({sorted(hf)})")
@@ -7573,6 +7790,263 @@ def _self_test_evidence(ok, td: str) -> None:
         yaml.safe_dump(raw, open(os.path.join(d, AB.SPEC_FILE), "w"))
         ok(any("owns" in p or "evidence dossier" in p for p in deliverable_problems(d)),
            f"T_DELIVERABLE_DOSSIER a deliverable named {name} is refused ({deliverable_problems(d)})")
+
+
+def _self_test_claim_refs(ok, td: str, spike, new_run) -> None:
+    """Harness baseline hb2: three runs ended RUN_FAILED (rule 5, post-write) on claim-reference findings the writer
+    could not repair before the round cap. CR1: the harness quoted a critic's remedy holding [CLAIM:x] in the report's
+    declared-findings block (measles R1, dengue R2). CR2: the writer copied a declared remedy's placeholder [CLAIM:id]
+    into Limitations (dengue R2). CR3: the writer named ledger ids in inline code (tb R2). CR4-CR5: whatever is left
+    is repaired inside WRITE, which costs no round; an unrepaired reference still fails closed."""
+    import shutil
+    import yaml
+    from v2_tasks import StubTasks
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- before the fix exists this is the failure
+            import traceback
+            traceback.print_exc()
+            ok(False, f"{name}: {type(e).__name__}: {e}")
+
+    def bare_run(name, manuscript):
+        d = os.path.join(td, name)
+        os.makedirs(os.path.join(d, "models"))
+        yaml.safe_dump({"claims": [{"id": "a.good", "claim_kind": "scalar", "value": 5}]},
+                       open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        yaml.safe_dump({"schema_version": 1}, open(os.path.join(d, AB.SPEC_FILE), "w"))
+        open(os.path.join(d, "manuscript.md"), "w").write(manuscript)
+        return d
+
+    opened = [{"id": "R-002", "severity": "MEDIUM", "source": "critique-redteam", "tested": True,
+               "claim": "The writer then cites them as [CLAIM:id].",
+               "fix_requires": "Cite [CLAIM:a.good] as the regret; write `[CLAIM:a.good]` as [CLAIM:id]."}]
+
+    def quoted():
+        d = bare_run("cr1", "# Report\n\nIt averts [CLAIM:a.good] cases.\n")
+        write_declared(d, opened, {"rule_matched": "3", "rationale": "rounds exhausted"})
+        doc = yaml.safe_load(open(os.path.join(d, DECLARED_FILE)))
+        doc["declared"][0]["required_remedy"] += " Also [CLAIM:id] and `[CLAIM:a.good]`."   # an older file, unquoted
+        yaml.safe_dump(doc, open(os.path.join(d, DECLARED_FILE), "w"))
+        render_report(d, AB)
+        rep = open(os.path.join(d, "report.md")).read()
+        kinds = {f["kind"] for f in report_claim_findings(d)}
+        ok("[CLAIM:" not in rep and "Open findings, declared" in rep
+           and not kinds & {"report_claim_unrendered", "report_claim_unresolved"},
+           f"CR1 a finding the harness quotes in report.md shows no claim reference, so no write-up finding comes from "
+           f"the harness's own text ({kinds}, {[x for x in rep.splitlines() if 'CLAIM' in x][:2]})")
+        d2 = bare_run("cr2", "")
+        write_declared(d2, opened, {"rule_matched": "3", "rationale": "rounds exhausted"})
+        dec2 = yaml.safe_load(open(os.path.join(d2, DECLARED_FILE)))["declared"][0]
+        ok("[CLAIM:id]" not in dec2["claim"] + dec2["required_remedy"] and "[CLAIM:a.good]" in dec2["required_remedy"],
+           f"CR2 declared_findings.yaml, which the writer repeats in full, holds no reference outside the ledger; a "
+           f"ledger reference stays one ({dec2})")
+
+    def code_ids():
+        d = bare_run("cr3", "# Report\n\nThe anchors `a.good` to `[CLAIM:a.good]` and ` a.good `.\n")
+        render_report(d, AB)
+        a, b = json.load(open(os.path.join(d, "report_render.json")))["writer_span"]
+        body = open(os.path.join(d, "report.md")).read()[a:b]
+        kinds = {f["kind"] for f in report_claim_findings(d)}
+        ok(not kinds & {"report_claim_id_raw", "report_claim_unrendered"} and "a.good" not in body
+           and "[CLAIM:" not in body,
+           f"CR3 a known claim id or reference alone in inline code is the reference: the harness renders it "
+           f"({kinds}, {body.splitlines()[-1][:120]!r})")
+        for txt, want in (("It averts `[CLAIM:no.such]` cases.\n", "report_claim_unresolved"),
+                          ("It averts a.good cases.\n", "report_claim_id_raw"),
+                          ("```\n[CLAIM:a.good]\n```\n", "report_claim_unrendered")):
+            open(os.path.join(d, "manuscript.md"), "w").write(txt)
+            render_report(d, AB)
+            got = {(f["kind"], f["severity"]) for f in report_claim_findings(d)}
+            ok((want, "HIGH") in got, f"CR3b still a HIGH finding (fail closed): {txt.strip()!r} -> {got}")
+
+    def repair(name, script, want_calls, want_status):
+        d, T, st = new_run(name, script, max_rounds=1)
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
+                    os.path.join(d, "models", "claims_ledger.yaml"))
+        s = Machine(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False).run()
+        h = load_state(d).history
+        reps = [x for x in h if "claim_repair" in x]
+        calls = [c for c in T.calls if c.endswith(":claims")]
+        rounds = {x.get("round") for x in h if x.get("from") == "WRITE" or x.get("to") == "WRITE"}
+        got = [f.get("id", "") for f in getattr(T, "write_findings", [])]
+        ok(len(calls) == want_calls and len(reps) == want_calls and s == want_status and len(rounds) == 1
+           and all(i.startswith("report_claim") for i in got) and got,
+           f"{name.upper()} {want_calls} claim repair(s) inside WRITE (no round), the writer told each finding; ends "
+           f"{want_status} ({s}, {calls}, {reps[-1:]}, rounds {rounds}, {got})")
+
+    case("CR1-CR2", quoted)
+    case("CR3", code_ids)
+    # CR4: the writer's draft has an id outside the ledger; the repair fixes it and the run is delivered.
+    case("CR4", lambda: repair("cr4", {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n",
+                                       "manuscript_claim_repair": "It averts [CLAIM:headline.point] cases.\n"},
+                               1, "completed"))
+    # CR5: a writer that never repairs: MAX_CLAIM_REPAIRS sessions, then the gate refuses it (a number with no ledger
+    # entry is never accepted).
+    case("CR5", lambda: repair("cr5", {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n"},
+                               MAX_CLAIM_REPAIRS, "run_failed"))
+
+    # Codex round 1 of #353.
+    def r1_units():
+        k = {"a.good": {"id": "a.good", "claim_kind": "scalar", "value": 5}}
+        RCL = __import__("render_claims")
+        fenced = "x\n  ```\n  SELECT `a.good` FROM t\n  ```\n"
+        ok(RCL.normalise_refs(fenced, k) == fenced, "CR8a an indented fenced block is code: nothing in it is normalised")
+        ok(RCL.normalise_refs("Use ``a.good`` here.", k) == "Use [CLAIM:a.good] here.",
+           "CR8b a known id in a double-backtick span is its reference too")
+        q = RCL.quote_refs("The prefix is `[CLAIM:`. See [source](notes.md).\nNext [CLAIM:a.good] and `a.good`.", k)
+        ok("[source](notes.md)" in q and "[CLAIM:" not in q and q.count("5") == 1 and "`a.good`" in q,
+           f"CR8c quoting never eats a link's bracket, leaves no marker, renders a reference and leaves a recorded "
+           f"identifier as it is ({q!r})")
+        # Codex round 2 of #353
+        for txt in ("> ```sql\n> SELECT `a.good` FROM t\n> ```\n", "  ````\n  ```\n  SELECT `a.good`\n  ````\n"):
+            ok(RCL.normalise_refs(txt, k) == txt, f"CR8d a fence in a block quote, or a longer fence, is code ({txt!r})")
+        k2 = dict(k, **{"uq.draws": {"id": "uq.draws", "claim_kind": "scalar", "value": 1000}})
+        q15 = RCL.quote_refs("This run continues under amendment `uq.draws`.", k2)
+        ok(q15 == "This run continues under amendment `uq.draws`.",
+           f"CR15 an identifier the harness records is never replaced by a claim value ({q15!r})")
+        q16 = RCL.quote_refs("Fix [CLAIM:[CLAIM:a.good]] now.", k) + RCL.quote_refs("[CLAIM:[CLAIM:a.good]]", k, False)
+        ok("[CLAIM:" not in q16.replace("[CLAIM:a.good]", ""),
+           f"CR16 a nested marker leaves no reference outside the ledger after quoting ({q16!r})")
+        d = bare_run("cr9", "# Report\n\nIt averts [CLAIM:bad] cases.\n")
+        yaml.safe_dump({"claims": [{"id": "bad", "claim_kind": "scalar", "value": "lots"}]},
+                       open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        render_report(d, AB)
+        kinds = {f["kind"] for f in report_claim_findings(d)}
+        ok("report_claim_invalid" in kinds and not kinds & set(CLAIM_REF_KINDS),
+           f"CR9 a reference to an invalid ledger entry is reported once, as invalid: no writer repair ({kinds})")
+        t = StubTasks({"manuscript": "revised\n"})
+        dd = bare_run("cr10", "old\n")
+        t.write(dd, "accepted", findings=[{"id": "report_claim_id_raw:a.good", "claim": "c"}])
+        ok("revised" in open(os.path.join(dd, "manuscript.md")).read(),
+           "CR10 an ordinary WRITE visit with claim findings writes the draft; only a marked repair keeps it")
+
+    def r1_machine(name, write, want, check, what):
+        from v2_tasks import TaskResult
+        d, T, st = new_run(name, {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n"}, max_rounds=1)
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
+                    os.path.join(d, "models", "claims_ledger.yaml"))
+        m = Machine(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        real, reserve = m._task, []
+
+        def _task(key, name_, *a, _real=real, **kw):
+            if name_ == "write" and key.split(":")[-1].startswith("claims"):
+                reserve.append(bool(kw.get("writeup")))
+                return write(d, TaskResult)
+            return _real(key, name_, *a, **kw)
+        m._task = _task
+        s = m.run()
+        reps = [x for x in load_state(d).history if "claim_repair" in x]
+        ok(s == want and check(d, reps), f"{name.upper()} {what} ({s}, {reps})")
+        if name == "cr6":
+            ok(reserve and not any(reserve), f"CR20 a repair is paid outside the write-up reserve, which the "
+                                             f"presentation review and the gate keep ({reserve})")
+
+    def typed(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts 987654321 cases.\n")
+        return TR(True, None, 0.0, "")
+
+    def unfinished(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts [CLAIM:headline.point] cases.\n")
+        return TR(False, None, 0.0, "stub: ended before its output file")
+
+    case("CR8-CR10", r1_units)
+    case("CR6", lambda: r1_machine(
+        "cr6", typed, "run_failed", lambda d, r: "987654321" not in open(os.path.join(d, "manuscript.md")).read()
+        and r and r[0].get("undone"), "a repair that types a number is undone; the gate refuses the reference"))
+    case("CR7", lambda: r1_machine(
+        "cr7", unfinished, "completed", lambda d, r: "[CLAIM:" not in open(os.path.join(d, "report.md")).read()
+        and len(r) == 1 and r[0]["ok"] is False, "an unfinished session's fix is rendered before the gate reads report.md"))
+    case("CR11", lambda: r1_machine("cr11", lambda d, TR: None, "run_failed", lambda d, r: r == [],
+                                    "a repair with no allowance runs no session and records none"))
+
+    def emptied(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("")
+        return TR(False, None, 0.0, "stub: truncated")
+
+    def year(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt used 2025 replicates.\n")
+        return TR(True, None, 0.0, "")
+
+    def kept(d):
+        return "no.such.claim" in open(os.path.join(d, "manuscript.md")).read()
+    case("CR13", lambda: r1_machine("cr13", emptied, "run_failed", lambda d, r: kept(d) and r and r[0].get("undone"),
+                                    "a repair that empties the draft is undone"))
+    case("CR14", lambda: r1_machine("cr14", year, "run_failed", lambda d, r: kept(d) and r and r[0].get("undone"),
+                                    "a repair that adds any digit string, a year included, is undone"))
+
+    def crash():
+        # CR12: the process dies after the repair session and before its check; the resume checks it
+        from v2_tasks import TaskResult
+        d, T, st = new_run("cr12", {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n"}, max_rounds=1)
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
+                    os.path.join(d, "models", "claims_ledger.yaml"))
+
+        def mk12(stx, session):
+            m = Machine(d, T, stx, backend=spike, log=lambda *a: None, cross_engine_check=False)
+            real = m._task
+
+            def _task(key, name_, *a, _real=real, **kw):
+                if name_ == "write" and key.split(":")[-1].startswith("claims"):
+                    return session(TaskResult)
+                return _real(key, name_, *a, **kw)
+            m._task = _task
+            return m
+
+        def typed12(TR):
+            open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts 987654321 cases.\n")
+            return TR(True, None, 0.0, "")
+        m = mk12(st, typed12)
+
+        def boom(before):
+            raise RuntimeError("killed before the check")
+        m._claim_repair_undo = boom
+        try:
+            m.run()
+        except RuntimeError:
+            pass
+        os.remove(os.path.join(d, "manuscript.md"))       # and the interrupted session had removed the draft
+        more = []
+
+        def again(TR):
+            more.append(1)
+            return TR(True, None, 0.0, "")
+        s12 = mk12(load_state(d), again).run()
+        ok(s12 == "run_failed" and len(more) == MAX_CLAIM_REPAIRS - 1
+           and "no.such.claim" in open(os.path.join(d, "manuscript.md")).read()
+           and "claim_repair" not in load_state(d).tries
+           and any("interrupted before its check" in str(h.get("undone")) for h in load_state(d).history),
+           f"CR12 a repair interrupted before its check is undone on resume, before the draft is read, and counts as "
+           f"one of the MAX_CLAIM_REPAIRS sessions ({s12}, {len(more)} more)")
+    case("CR12", crash)
+
+    def partial(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
+        return TR(False, None, 0.0, "stub: stopped")
+
+    def code_ref(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts `uq.units_stable_90` cases.\n")
+        return TR(True, None, 0.0, "")
+    case("CR17", lambda: r1_machine("cr17", partial, "run_failed", lambda d, r: kept(d) and r and r[0].get("undone"),
+                                    "a repair that drops the draft's other text is undone"))
+    case("CR18", lambda: r1_machine("cr18", code_ref, "completed", lambda d, r: r and not r[0].get("undone"),
+                                    "a repair to a known id in inline code (digits in the id) is kept"))
+
+    def units3():
+        RCL = __import__("render_claims")
+        k = {"a.good": {"id": "a.good", "claim_kind": "scalar", "value": 5},
+             "note": {"id": "note", "claim_kind": "label", "value": "See [CLAIM:note]"}}
+        lf = "- ```sql\n  SELECT `a.good` FROM t\n  ```\n\nThen `a.good`.\n"
+        got = RCL.normalise_refs(lf, k)
+        ok(got == lf.replace("Then `a.good`", "Then [CLAIM:a.good]"),
+           f"CR21 a fence opened after a list marker is code, and the prose after it is still read ({got!r})")
+        q = RCL.quote_refs("[CLAIM:note]", k)
+        ok(q.upper().count("SEE") == 1 and "[CLAIM:" not in q, f"CR22 a rendered value is never substituted again ({q!r})")
+    case("CR21-CR22", units3)
 
 
 def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:

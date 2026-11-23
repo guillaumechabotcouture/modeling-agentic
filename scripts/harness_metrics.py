@@ -161,9 +161,13 @@ def completion(run) -> dict:
         return no("no_status", "no terminal status or pause recorded by the cut-off")
     if st.get("status") and meta.get("status") != st["status"]:
         return no("status_mismatch", f"run_state.json {st['status']}, metadata.json {meta.get('status')}")
-    ok = status in COMPLETES and run["report"] and not run["withheld"]
+    # Every withhold path moves report.md away (stage_machine._quarantine_report), so a regular report.md is the
+    # delivered one; a report_withheld.md beside it is a repaired draft's leftover (baseline hb2 §5 fix 8).
+    ok = bool(status in COMPLETES and run["report"])
     cls = "completes" if ok else ("not_accepted" if status in NOT_ACCEPTED else "not_completed")
-    why = None if ok or status not in COMPLETES else "report withheld" if run["withheld"] else "no regular report.md"
+    why = ("a stale report_withheld.md remains beside the delivered report.md" if ok and run["withheld"]
+           else None if ok or status not in COMPLETES else "report withheld" if run["withheld"]
+           else "no regular report.md")
     return {"status": F(status, REC), "completes": F(ok, REC, why), "class": cls}
 
 
@@ -622,6 +626,13 @@ def _self_test() -> int:
            and r["autonomous_wall_h"]["value"] == 1.0, "HM1 a completed run with report.md: 0 interventions, 1 h")
         ok(not summarise([mk("r_wh", done, None, {"report_withheld.md": "x"})])["completes"]["value"],
            "HM2 a withheld report does not complete")
+        # HM2b (baseline hb2 §5 fix 8): a language repair left the rejected draft in report_withheld.md and the
+        # repaired report.md was delivered. Every withhold path moves report.md away, so a regular report.md at FINAL
+        # is the delivered one: the stale file does not make the run "not done".
+        r = summarise([mk("r_wh_stale", {**fin, "status": "completed_scope_declared"}, None,
+                          {"report.md": "x", "report_withheld.md": "old"})])
+        ok(r["completes"]["value"] and "stale" in str(r["completes"].get("note")),
+           f"HM2b a delivered report.md completes although a stale report_withheld.md remains ({r['completes']})")
         r = summarise([mk("r_sd", {**fin, "status": "completed_scope_declared"}, None, R)])
         ok(r["completes"]["value"] and wave_summary([r])["scope_declared"] == 1, "HM3 scope declared completes, apart")
         r = summarise([mk("r_none", {"state": "ANALYZE"})])
