@@ -322,7 +322,8 @@ def classify_tests(units):
             if len({("core" if TEST_FN.match(m) and m == "_self_test" else
                      m[len("_self_test_"):] if TEST_FN.match(m) else "common") for m in u.names}) > 1:
                 raise SplitError(f"line {u.first}: one statement binds names for two test files")
-            groups.setdefault(stem, []).append(u)
+            if u not in groups.setdefault(stem, []):     # `_TOY_A = _TOY_B = ...` moves once
+                groups[stem].append(u)
     late = [n for u in units[main_i + 1:] for n in u.names if TEST_FN.match(n) or TEST_HELPER.match(n)]
     if late:
         raise SplitError(f"self-test code after main(): {late}")
@@ -338,7 +339,7 @@ def _test_rewrites(tree_src: str, tests: list):
     """The edits that keep the moved tests rebinding the module, and the names they rebind."""
     rebound, edits, uses_globals = set(), [], False
     for u in tests:
-        holders = set()
+        holders, g_holders = set(), set()
         for n in ast.walk(u.node):
             if isinstance(n, ast.Global):
                 rebound |= set(n.names)
@@ -353,10 +354,13 @@ def _test_rewrites(tree_src: str, tests: list):
                 v = n.value
                 if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "globals":
                     holders.add(n.targets[0].id)
+                    g_holders.add(n.targets[0].id)
                 if _is_machine_module(v):
                     holders.add(n.targets[0].id)
+        _check_namespace_uses(u.node, g_holders)
         for n in ast.walk(u.node):
-            if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id in holders \
+            if isinstance(n, ast.Subscript) and (isinstance(n.value, ast.Name) and n.value.id in holders
+                                                 or _is_globals_call(n.value)) \
                     and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, str):
                 rebound.add(n.slice.value)
             if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in holders \
@@ -366,6 +370,7 @@ def _test_rewrites(tree_src: str, tests: list):
                     and isinstance(n.value.value, ast.Name) and n.value.value.id == "sys" and not _is_machine_module(n):
                 raise SplitError(f"line {n.lineno}: sys.modules[...] in a self-test other than "
                                  f"sys.modules[Machine.__module__]")
+    _check_bindings(tests, rebound)
     for u in tests:
         for n in ast.walk(u.node):
             if isinstance(n, ast.Global):
@@ -381,6 +386,64 @@ def _test_rewrites(tree_src: str, tests: list):
             elif isinstance(n, ast.Name) and n.id in rebound:
                 edits.append((n.lineno, n.col_offset, n.end_col_offset, "_SM." + n.id))
     return rebound, edits, uses_globals
+
+
+def _is_globals_call(n) -> bool:
+    return isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "globals" and not n.args
+
+
+def _check_namespace_uses(node, holders: set):
+    """globals() (or an alias of it) is used only in the ways SM_GLOBALS writes through to the module: a string
+    subscript (read, write), .get(), `in`, or an alias. Anything else (update, keys, pop, iteration) would act on
+    a private dict and silently drop a patch."""
+    parent = {c: p for p in ast.walk(node) for c in ast.iter_child_nodes(p)}
+    for n in ast.walk(node):
+        if not (_is_globals_call(n) or isinstance(n, ast.Name) and n.id in holders and isinstance(n.ctx, ast.Load)):
+            continue
+        p = parent.get(n)
+        ok_ = (isinstance(p, ast.Subscript) and p.value is n and isinstance(p.slice, ast.Constant)
+               and isinstance(p.slice.value, str)) \
+            or (isinstance(p, ast.Attribute) and p.attr == "get" and isinstance(parent.get(p), ast.Call)) \
+            or (isinstance(p, ast.Compare) and n in p.comparators and all(isinstance(o, (ast.In, ast.NotIn))
+                                                                          for o in p.ops)) \
+            or (isinstance(p, ast.Assign) and p.value is n and len(p.targets) == 1
+                and isinstance(p.targets[0], ast.Name))
+        if not ok_:
+            raise SplitError(f"line {n.lineno}: a use of globals() in a self-test that SM_GLOBALS cannot write "
+                             f"through ({ast.unparse(p)[:60]!r}); rewrite it as a subscript first")
+
+
+def _check_bindings(tests, rebound: set):
+    """A name the rewrite turns into `_SM.X` must be bound in the tests only by a plain assignment (which becomes
+    an assignment to the module), and `Machine` must be the module's class wherever a test names it."""
+    for u in tests:
+        comp_targets = set()
+        for n in ast.walk(u.node):
+            if isinstance(n, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                for g in n.generators:
+                    comp_targets |= {m.id for m in ast.walk(g.target) if isinstance(m, ast.Name)}
+        for n in ast.walk(u.node):
+            bound = []
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound = [n.name]
+            elif isinstance(n, ast.alias):
+                bound = [n.asname or n.name.split(".")[0]]
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                bound = [n.name]
+            elif isinstance(n, ast.arg):
+                bound = [n.arg]
+            elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+                bound = [n.name]
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)) and n.id == "Machine":
+                bound = ["Machine"]
+            for b in bound:
+                if b in rebound or b == "Machine":
+                    raise SplitError(f"line {getattr(n, 'lineno', u.first)}: `{b}` is bound in a self-test other "
+                                     f"than by a plain assignment; rename it first")
+        bad = sorted(comp_targets & (rebound | {"Machine"}))
+        if bad:
+            raise SplitError(f"line {u.first}: {bad} is a comprehension variable in a self-test and a name the "
+                             f"tests rebind in the module; rename it first")
 
 
 def _is_machine_module(n) -> bool:
@@ -423,6 +486,8 @@ STUB = '''def _self_test() -> int:
     """The cases live in tests/stage_machine/ (moved there verbatim by scripts/refactor/split_stage_machine.py);
     they run against this module, imported there as {target}."""
     sys.modules["{target}"] = sys.modules[__name__]
+    for k in [k for k in sys.modules if k.startswith("{prefix}")]:
+        del sys.modules[k]          # a second call (another copy of this module) binds the cases to it afresh
     d = os.path.join(REPO, "tests", "stage_machine")
     if d not in sys.path:
         sys.path.append(d)
@@ -484,11 +549,16 @@ def stage_tests(repo: str, log=print) -> bool:
         if u.names == ["_self_test"]:
             continue
         prod_refs |= unit_refs(top, u)
+    for u in prod:          # a name reached by string (globals()["_t_x"], getattr) counts as a use too
+        if u.names != ["_self_test"]:
+            prod_refs |= {c.value for c in ast.walk(u.node) if isinstance(c, ast.Constant) and isinstance(c.value, str)}
     used_by_prod = sorted((test_names - {"_self_test"}) & prod_refs)
     if used_by_prod:
         raise SplitError(f"production code uses test-named code: {used_by_prod}")
     rebound, edits, uses_globals = _test_rewrites(src, tests)
     _check_rebound_never_local(src, rebound, tests)
+    if uses_globals:
+        groups.setdefault("common", [])      # SM_GLOBALS lives there, with or without test helpers
     new_lines = apply_edits(lines, edits)
     defined_in = {n: stem for stem, us in groups.items() for u in us for n in u.names}
     imports = [u for u in units if u.kind == "import"]
@@ -500,7 +570,7 @@ def stage_tests(repo: str, log=print) -> bool:
         if extra:
             raise SplitError(f"{TESTS_DIR} holds files this script did not write: {extra}")
     files, deps = {}, {}
-    stems = sorted(groups, key=lambda s: (s != "common", s != "core", min(u.first for u in groups[s])))
+    stems = sorted(groups, key=lambda s: (s != "common", s != "core", min([u.first for u in groups[s]] or [0])))
     for stem in stems:
         body = "".join("".join(new_lines[u.lead - 1:u.last]) for u in groups[stem])
         body = body.lstrip("\n")
@@ -549,7 +619,8 @@ def stage_tests(repo: str, log=print) -> bool:
         out.append(t)
     out.append("".join(lines[units[-1].last:]))
     new_src = "".join(out)
-    _write_tree(repo, {MODULE: new_src, **{f"{TESTS_DIR}/{k}": v for k, v in files.items()}})
+    # the module last: its stamp marks the split done, so an interrupted write is re-run, not taken as split
+    _write_tree(repo, {**{f"{TESTS_DIR}/{k}": v for k, v in files.items()}, MODULE: new_src})
     log(f"tests: moved {len(test_names)} definitions into {len(files)} files under {TESTS_DIR}/; "
         f"rewrote {len(edits)} places that rebind the module ({sorted(rebound) or 'none'})")
     return True
@@ -1108,14 +1179,16 @@ def compare_cases(before: str, after: str) -> tuple[bool, str]:
     b, a = case_list(before), case_list(after)
     ok_b = "OK: all self-test cases passed." in before
     ok_a = "OK: all self-test cases passed." in after
-    if b == a and ok_b == ok_a:
+    if b == a and ok_b == ok_a and a and ok_a:
         n_pass = sum(1 for s, _ in a if s == "PASS")
         return True, (f"identical: {len(a)} cases in the same order, {n_pass} PASS, {len(a) - n_pass} FAIL; "
                       f"final line {'OK' if ok_a else 'not OK'} in both")
     import difflib
     diff = "\n".join(difflib.unified_diff([" ".join(x) for x in b], [" ".join(x) for x in a], "before", "after",
                                           lineterm="", n=1))
-    return False, f"DIFFERENT ({len(b)} before, {len(a)} after; OK line {ok_b} -> {ok_a}):\n{diff}"
+    return False, (f"DIFFERENT ({len(b)} before, {len(a)} after; OK line {ok_b} -> {ok_a}"
+                   + ("; an empty or unfinished run proves nothing" if not (a and ok_a and ok_b) else "")
+                   + f"):\n{diff}")
 
 
 # ----------------------------------------------------------------------------------------------- self-test
@@ -1215,9 +1288,10 @@ def _self_test() -> int:
     ok(_t_toy() == 7, "X2 a helper moves with the tests")
     g_ = globals()
     orig = g_["route_gate"]
-    g_["route_gate"] = lambda x: "FINAL"
+    seen = []
+    g_["route_gate"] = lambda x: seen.append(x) or "FINAL"
     try:
-        ok(run().log[-1][1] == "FINAL", "X3 a patch through globals() reaches the handler")
+        ok(run().log[-1][1] == "FINAL" and seen == [True], "X3 a patch through globals() reaches the handler")
     finally:
         g_["route_gate"] = orig
     _self_test_more(ok)
@@ -1352,9 +1426,43 @@ def _self_test() -> int:
             ok(False, "S19 eval() in a self-test stops the script")
         except SplitError as e:
             ok("eval" in str(e), "S19 eval() in a self-test stops the script")
+        refuse = {  # Codex r1 on #354: each would have split silently into a test that checks something else
+            "S23 a comprehension variable named like a rebound name":
+                ("        ok(REPO == \"/nowhere\",", "        _ = [REPO for REPO in 'ab']\n        ok(REPO == \"/nowhere\","),
+            "S24 a def binding a rebound name": ("    old, REPO = REPO,", "    def REPO(): pass\n    old, REPO = REPO,"),
+            "S25 a local name Machine": ("        mod = sys.modules", "        Machine = int\n        mod = sys.modules"),
+            "S26 globals().update": ("    g_ = globals()\n", "    globals().update(X=1)\n    g_ = globals()\n"),
+            "S27 production code reaching a test helper by name": (
+                "def shared(v):\n    return v", "def shared(v):\n    return v if v else globals()['_t_toy']()"),
+        }
+        for i, (what, (old, new)) in enumerate(refuse.items()):
+            assert old in TOY, what
+            dd = toy_repo(f"r{i}", TOY.replace(old, new, 1))
+            try:
+                stage_tests(dd, log=quiet)
+                ok(False, f"{what} stops the script")
+            except SplitError as e:
+                ok(True, f"{what} stops the script: {str(e)[:70]}")
+        d6 = toy_repo("g", TOY.replace("    ok(_t_toy() == 7, \"X2 a helper moves with the tests\")\n", "")
+                      .replace("def _t_toy():\n    return 7\n\n\n", ""))
+        os.makedirs(os.path.dirname(os.path.join(d6, TESTS_DIR)))
+        open(os.path.join(d6, TESTS_DIR), "w").write("a file where the directory goes")
+        try:
+            stage_tests(d6, log=quiet)
+        except (OSError, SplitError):
+            pass
+        unstamped = STAMP_TESTS not in open(os.path.join(d6, MODULE)).read()
+        os.remove(os.path.join(d6, TESTS_DIR))
+        retried = stage_tests(d6, log=quiet)
+        rc6, out6 = selftest(d6)
+        ok(unstamped and retried and rc6 == 0 and len(case_list(out6)) == 5,
+           f"S28 an interrupted split leaves the module unsplit, and the retry (globals() with no test helper) "
+           f"runs ({rc6}, {out6[-200:]!r})")
         ok(compare_cases("PASS T1 a\nPASS T2 b\n", "PASS T1 x\nFAIL T2 b\n")[0] is False
            and compare_cases("PASS T1 a\nOK: all self-test cases passed.", "PASS T1 b\nOK: all self-test cases "
-                             "passed.")[0], "S20 the case comparison keys on status and id, in order")
+                             "passed.")[0] and not compare_cases("", "")[0]
+           and not compare_cases("PASS T1 a\n", "PASS T1 a\n")[0],
+           "S20 the case comparison keys on status and id, in order, and needs a finished run with cases")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
