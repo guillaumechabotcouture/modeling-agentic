@@ -849,6 +849,21 @@ def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, cluste
                   + "".join(f"\n{w}" for w in warns))
 
 
+def release_reservation(invocation, name, env=None) -> int:
+    """Remove the reservation `launch_budget_ok` recorded for this invocation and cluster name, under the ledger lock:
+    for a launch refused after its budget check and before any cluster exists (run_cluster.api_keys). Returns how
+    many were removed; a malformed ledger raises BudgetError."""
+    env = env or _ENV
+    with _Lock(env.reservations):
+        rows = _ledger(env, env.clock())
+        keep = [r for r in rows if not (r["invocation"] == str(invocation) and r["name"] == name)]
+        if len(keep) != len(rows):
+            with open(env.reservations + ".tmp", "w") as f:
+                json.dump(keep, f, indent=1)
+            os.replace(env.reservations + ".tmp", env.reservations)
+    return len(rows) - len(keep)
+
+
 def job_meter(scope):
     """fn(cluster id) -> that cluster's USD now (max of billed and the estimate), at the scope's rates."""
     env = _ENV
@@ -1032,6 +1047,26 @@ def _self_test() -> int:
         if not cond:
             fails.append(msg)
 
+    # RR1-RR2 (Codex round 1 on #358): a launch refused after its budget check releases its own reservation only
+    with tempfile.TemporaryDirectory() as td:
+        renv = _Env(budget_dir=td, clock=lambda: 1000.0)
+        os.makedirs(os.path.dirname(renv.reservations), exist_ok=True)
+        rows = [{"scope": "ev", "cap_usd": 35.0, "name": "ev-a-gcc", "invocation": "inv-1", "time": 900.0},
+                {"scope": "ev", "cap_usd": 35.0, "name": "ev-a-gcc", "invocation": "inv-2", "time": 950.0},
+                {"scope": "ev", "cap_usd": 35.0, "name": "ev-b-gcc", "invocation": "inv-1", "time": 960.0}]
+        json.dump(rows, open(renv.reservations, "w"))
+        try:
+            n1 = release_reservation("inv-1", "ev-a-gcc", env=renv)
+            left = json.load(open(renv.reservations))
+        except Exception as e:  # noqa: BLE001 -- before the change this case fails here
+            n1, left = f"{type(e).__name__}: {e}", None
+        ok(n1 == 1 and left == rows[1:], f"RR1 only this invocation's reservation for this name is released ({n1})")
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            n2 = release_reservation("inv-1", "ev-a-gcc", env=_Env(budget_dir=td))
+        except Exception as e:  # noqa: BLE001
+            n2 = f"{type(e).__name__}: {e}"
+        ok(n2 == 0, f"RR2 no ledger: nothing to release ({n2})")
     # BKS (owner decision, 2026-11-17): no hard dollar ceilings; caps warn, project and alert.
     pr = cap_projection([(0.0, 4.0), (3600.0, 6.0)], 5.0, deadline=7200.0)
     ok(cap_level(4.9, 5) == "under_cap" and cap_level(5, 5) == "over_cap" and cap_level(7.5, 5) == "far_over_cap"
