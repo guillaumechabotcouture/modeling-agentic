@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import os
+from decimal import Decimal as D, getcontext
 import sys
 
 import numpy as np
@@ -38,8 +39,8 @@ G5 = ["g1", "g2", "g3", "g4", "g5"]
 
 
 def single(**kw):
-    return E.CompartmentalEngine(**dict(groups=["all"], generation_interval=[0.2, 0.3, 0.3, 0.2], tol=1e-13,
-                                        final_size=True, **kw))
+    return E.CompartmentalEngine(**dict(dict(groups=["all"], generation_interval=[0.2, 0.3, 0.3, 0.2], tol=1e-13,
+                                             final_size=True), **kw))
 
 
 def multi(groups, **kw):
@@ -63,6 +64,7 @@ def vec(o, groups):
 
 
 def _self_test() -> int:
+    getcontext().prec = 50
     fails = []
 
     def ok(cond, msg):
@@ -183,8 +185,6 @@ def _self_test() -> int:
 
     # FD9: the bracket bounds the error: against a 50-digit bisection (decimal) at R0 = 1, where s - a exp(-x)
     # cancellation alone costs about 2e-12
-    from decimal import Decimal as D, getcontext
-    getcontext().prec = 50
     lo, hi, eD = D("1e-12"), D("0.5"), D("1e-9")
     for _ in range(200):
         mid = (lo + hi) / 2
@@ -218,6 +218,43 @@ def _self_test() -> int:
     names = [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names] + \
             [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
     ok(not any("oracles" in x for x in names), f"FD12 engine.py imports no oracles module ({[x for x in names if 'oracles' in x]})")
+
+    # Codex r1 of #351 (tests first): FD14-FD17
+    # FD14 (P1-1): a chain of critical groups amplifies the rounding of T; a bracket certified by rounding alone
+    # reported an error 55 x tol. The solver either meets tol against a 50-digit solution or fails closed.
+    ch = [[0.0, 0.0, 0.0, 0.0], [1e-6, 1.0, 0.0, 0.0], [0.0, 1.0, 1.0, 0.0], [0.0, 0.0, 1.0, 1.0]]
+    e4 = multi(["a", "b", "c", "d"], generation_interval=[1.0])
+    u4 = UnitSpec("k", {"N": [1e6] * 4, "s0": [1.0] * 4, "seed": 1e-9, "intro": "a", "contact": ch})
+    o4, err = safe(lambda: e4.run({"q": 1.0}, u4, Package("0", {}), H, 1))
+    ref = [D(4) * D("1e-9")]
+    for k in range(1, 4):
+        lo, hi = D(0), D(1)
+        for _ in range(220):
+            mid = (lo + hi) / 2
+            x = D(str(ch[k][k - 1])) * ref[k - 1] + mid
+            lo, hi = (mid, hi) if mid - (1 - (-x).exp()) < 0 and mid > 0 else (lo, mid)
+            if mid == 0:
+                lo = mid
+        ref.append(hi)
+    gap = None if o4 is None else max(abs(o4.per_capita["infections"][g] - float(r)) for g, r in zip("abcd", ref))
+    ok((err is not None and "converged: false" in err) or (err is None and gap <= 1e-13),
+       f"FD14 (r1 P1-1) an ill-conditioned chain meets tol or fails closed ({err or f'error {gap:.1e}'})")
+    # FD15 (P1-2): a bracket already narrower than tol is still evaluated: q = 0 infects only the seed
+    e15 = single(transmission="q", tol=0.01)
+    o15 = e15.run({"q": 0.0}, UnitSpec("q", {"N": [1e6], "s0": [0.01], "seed": 0.001}), Package("0", {}), H, 1)
+    w = o15.windows["all"]
+    ok(abs(w["attack_rate"] - 0.001) < 1e-15 and abs(w["attack_rate"] + w["s_end"] - w["s_start"]) < 1e-15,
+       f"FD15 (r1 P1-2) q = 0: only the seed is infected and the population balances ({w['attack_rate']}, "
+       f"{w['s_end']}, {w['s_start']})")
+    # FD16 (P2-3): bounds advancing along a 64-group chain are progress, not a floating-point stall
+    K64 = np.diag([40.0] * 63, -1)[None]
+    e64 = np.zeros((1, 64))
+    e64[0, 0] = 1e-9
+    z64, err = safe(lambda: E.solve_final_size(K64, np.ones((1, 64)), e64, 1e-13, 500))
+    ok(err is None and z64[0][0, -1] > 0.99, f"FD16 (r1 P2-3) a long chain converges: {err or z64[1]}")
+    # FD17 (P2-4): the direct path's steps are solver iterations, not generations
+    ok(es.run({"r0": 2.0}, u1, Package("0", {}), H, 1).meta["time_axis"] == "solver_iterations",
+       "FD17 (r1 P2-4) a direct run's time axis is solver_iterations")
 
     # FD13: the card says what the solver's steps are, and the version moved
     card = es.describe()
