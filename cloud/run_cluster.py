@@ -433,6 +433,8 @@ def read_keys(path=ENV_FILE) -> dict:
                 if v[:1] in ("'", '"'):
                     end = v.find(v[0], 1)
                     v = v[1:end] if end > 0 else v[1:]
+                    if k and line.strip().partition("=")[2].strip()[:1] == '"':   # dotenv decodes these escapes
+                        v = re.sub(r"\\([nrt\\\"])", lambda m: {"n": "\n", "r": "\r", "t": "\t"}.get(m.group(1), m.group(1)), v)
                 else:
                     v = v.split(" #", 1)[0].strip()
                 keys[k] = v
@@ -4416,6 +4418,15 @@ def _self_test_api_keys(ok) -> None:
                 msg = None
             except SystemExit as e:
                 msg = str(e)
+        open(p, "w").write('ANTHROPIC_API_KEY="\\t"\n')
+        with mock.patch.dict(globals(), {"read_keys": lambda: real_read(p)}):
+            try:
+                api_keys()
+                msg6 = None
+            except SystemExit as e:
+                msg6 = str(e)
+        ok(bool(msg6), f"RK6 (Codex r2 on #362) a double-quoted value is decoded before the blank check: \\t is blank ({msg6})")
+        open(p, "w").write('ANTHROPIC_API_KEY="" # provision later\nOPENAI_API_KEY=sk-x # note\n')
         ok(bool(msg) and real_read(p).get("OPENAI_API_KEY") == "sk-x",
            f"RK4 (Codex r1 on #362) a quoted empty value with an inline comment is blank; comments are not values ({msg})")
     released.clear()

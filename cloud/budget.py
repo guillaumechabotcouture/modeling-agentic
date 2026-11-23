@@ -852,7 +852,7 @@ def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, cluste
 def release_reservation(invocation, name, clusters_file=None, env=None) -> int:
     """Remove the reservation `launch_budget_ok` recorded for this invocation, cluster name and clusters file, under
     the ledger lock: for a launch refused after its budget check and before any cluster exists (run_cluster.api_keys).
-    Only the newest such row goes (an invocation id can be reused: Codex r1 on #362). Returns how many were removed
+    Only the last one appended goes, which is the refused launch's own (an invocation id can be reused). Returns how many were removed
     (0 or 1); a malformed ledger raises BudgetError."""
     env = env or _ENV
     cf = os.path.abspath(str(clusters_file)) if clusters_file else None
@@ -860,7 +860,7 @@ def release_reservation(invocation, name, clusters_file=None, env=None) -> int:
         rows = _ledger(env, env.clock())
         hits = [i for i, r in enumerate(rows) if r["invocation"] == str(invocation) and r["name"] == name
                 and r.get("clusters_file") == cf]
-        drop = max(hits, key=lambda i: rows[i]["time"]) if hits else None
+        drop = hits[-1] if hits else None      # the last appended: the refused launch's own (rows are appended)
         keep = [r for i, r in enumerate(rows) if i != drop]
         if len(keep) != len(rows):
             with open(env.reservations + ".tmp", "w") as f:
@@ -1089,6 +1089,14 @@ def _self_test() -> int:
             n3, left = f"{type(e).__name__}: {e}", None
         ok(n3 == 1 and left == rows[:2],
            f"RR3 (Codex r1 on #362) a reused invocation id releases one row: the newest of this clusters file ({n3})")
+        rows = [{"scope": "ev", "cap_usd": 80.0, "name": "ev-d", "invocation": "retry", "time": 1000.0,
+                 "clusters_file": "/b/clusters.json"},
+                {"scope": "ev", "cap_usd": 5.0, "name": "ev-d", "invocation": "retry", "time": 1000.0,
+                 "clusters_file": "/b/clusters.json"}]
+        json.dump(rows, open(renv.reservations, "w"))
+        release_reservation("retry", "ev-d", clusters_file="/b/clusters.json", env=renv)
+        ok(json.load(open(renv.reservations)) == rows[:1],
+           "RR4 (Codex r2 on #362) the row released is the last one appended (the refused launch's), whatever its time")
     # BKS (owner decision, 2026-11-17): no hard dollar ceilings; caps warn, project and alert.
     pr = cap_projection([(0.0, 4.0), (3600.0, 6.0)], 5.0, deadline=7200.0)
     ok(cap_level(4.9, 5) == "under_cap" and cap_level(5, 5) == "over_cap" and cap_level(7.5, 5) == "far_over_cap"

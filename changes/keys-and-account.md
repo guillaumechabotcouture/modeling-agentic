@@ -12,7 +12,7 @@ Codex round 1 on #358 found two problems:
 - An invalid `--account` reached the log after `vm_job up` had created the VM.
 
 Changes:
-- **`run_cluster.api_keys()`** (launch and relaunch) refuses a missing or blank `ANTHROPIC_API_KEY` before any cluster is created or task submitted. A launch refused there releases the reservation its budget check made, through the new `budget.release_reservation(invocation, name)`, which removes only that invocation's reservation for that name, under the ledger lock.
+- **`run_cluster.api_keys()`** (launch and relaunch) refuses a missing or blank `ANTHROPIC_API_KEY` before any cluster is created or task submitted. A launch refused there releases the reservation its budget check made, through the new `budget.release_reservation(invocation, name, clusters_file)`, which removes only that invocation's reservation for that name, under the ledger lock.
 - **`supervisor.storage_account`** refuses an account that is not a bare name, from `--account` or the environment, without echoing it. It runs before any blob client is built and before `start` runs or prints any `vm_job` command.
 
 Also in this change, the fixes from Codex round 1 on #362:
