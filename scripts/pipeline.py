@@ -1784,11 +1784,40 @@ def sandbox_kind() -> str | None:
         kind = "bwrap-sudo"
     else:
         why = "bubblewrap is installed but cannot create its namespaces here (an unprivileged container)"
-    if kind is None and sys.platform.startswith("linux") and _audit_probe():
+    basis = _audit_basis() if kind is None and sys.platform.startswith("linux") else None
+    if basis is None and kind is None and sys.platform.startswith("linux"):
+        _SANDBOX_INFO["audit_probe"] = ("not tried: not in a container (the fallback is for containers; set "
+                                        f"{AUDIT_OPT_IN}={SANDBOX_AUDIT} to use it elsewhere)")
+    if basis is not None and _audit_probe():
         kind = SANDBOX_AUDIT
-        _SANDBOX_INFO["bwrap_not_used"] = why
+        _SANDBOX_INFO.update(bwrap_not_used=why, basis=basis)
     _SANDBOX.append(kind)
     return kind
+
+
+AUDIT_OPT_IN = "MA_DERIVATION_SANDBOX"
+
+
+def _audit_basis() -> str | None:
+    """Why the fallback may be used here: inside a container (its own isolation from the host is the outer wall), or
+    the operator's explicit choice. None on a plain host: there a planner's script would run with the host user's
+    permissions behind only the hook, so derivations fail closed (Codex r1 P1-1)."""
+    if os.environ.get(AUDIT_OPT_IN) == SANDBOX_AUDIT:
+        return f"operator: {AUDIT_OPT_IN}={SANDBOX_AUDIT}"
+    for marker in ("/.dockerenv", "/run/.containerenv"):
+        if os.path.exists(marker):
+            return f"container: {marker}"
+    if os.environ.get("container"):
+        return f"container: container={os.environ['container']}"
+    try:
+        with open("/proc/1/cgroup") as f:
+            cg = f.read()
+    except OSError:
+        cg = ""
+    for word in ("docker", "containerd", "kubepods", "lxc", "libpod"):
+        if word in cg:
+            return f"container: /proc/1/cgroup names {word}"
+    return None
 
 
 # ---- the audit-hook sandbox (Linux where bubblewrap cannot run) ---------- #
@@ -1806,11 +1835,14 @@ AUDIT_REFUSED_MODULES = ("socket", "_socket", "ssl", "_ssl", "http", "urllib.req
                          "urllib.robotparser", "ftplib", "smtplib", "poplib", "imaplib", "nntplib", "telnetlib",
                          "xmlrpc", "socketserver", "asyncio", "select", "selectors", "webbrowser", "subprocess",
                          "_posixsubprocess", "multiprocessing", "_multiprocessing", "concurrent.futures.process",
-                         "pty", "ctypes", "_ctypes", "signal", "mmap", "marshal")
+                         "pty", "ctypes", "_ctypes", "signal", "mmap", "marshal",
+                         # native code that opens files itself, unseen by the open event (Codex r1 P1-2)
+                         "sqlite3", "_sqlite3", "dbm", "_dbm", "_gdbm", "shelve", "readline", "syslog")
 AUDIT_REFUSED_EVENTS = ("subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork",
                         "os.forkpty", "pty.spawn", "os.startfile", "os.kill", "os.killpg", "signal.pthread_kill",
                         "os.link", "os.symlink", "gc.get_objects", "gc.get_referrers", "gc.get_referents",
-                        "sys.remote_exec")
+                        "sys.remote_exec", "resource.setrlimit", "resource.prlimit")
+AUDIT_REFUSED_PREFIXES = ("socket.", "ctypes.", "sqlite3.", "dbm.", "_gdbm.", "readline.", "syslog.")
 # (guarantee, under bubblewrap, under the audit-hook fallback)
 AUDIT_GUARANTEES = (
     ("no network", "kernel: a network namespace with no interface",
@@ -1872,7 +1904,7 @@ def _audit_install(policy: dict, script: str) -> None:
     def hook(ev, args, _lex=_audit_lex, _cwd=os.getcwd, _isinst=isinstance, _str=str, _bytes=bytes, _int=int,
              _len=len, _type=type, _paths=(pathlib.PurePosixPath, pathlib.PosixPath), _work=work, _hidden=hidden,
              _protect=protect, _wflags=wflags, _pe=path_events, _dfd=dir_fd_last, _mods=AUDIT_REFUSED_MODULES,
-             _evs=frozenset(AUDIT_REFUSED_EVENTS), _refuse=refuse):
+             _evs=frozenset(AUDIT_REFUSED_EVENTS), _pfx=AUDIT_REFUSED_PREFIXES, _refuse=refuse):
         def text(p):           # the path as the script wrote it; any other type is refused
             if _type(p) is _bytes:
                 return p.decode("utf-8", "surrogateescape")
@@ -1900,7 +1932,7 @@ def _audit_install(policy: dict, script: str) -> None:
 
         if ev.startswith("socket."):
             _refuse(f"network is unreachable ({ev})")
-        if ev in _evs or ev.startswith("ctypes."):
+        if ev in _evs or ev.startswith(_pfx):
             _refuse(ev)
         if ev == "import":
             m = args[0] if _type(args[0]) is _str else ""
@@ -1914,10 +1946,10 @@ def _audit_install(policy: dict, script: str) -> None:
             p, mode, flags = args[0], args[1], args[2]
             if _isinst(p, _int):
                 return                    # an fd, opened through this hook
+            if mode is None and not text(p).startswith("/"):     # os.open: the event omits dir_fd (Codex r1 P1-3)
+                _refuse(f"{ev}: os.open takes an absolute path here (a dir_fd is not visible to the check)")
             if (flags & _wflags) if _type(flags) is _int else ("w" in (mode or "") or "a" in (mode or "")
                                                                or "x" in (mode or "") or "+" in (mode or "")):
-                if mode is None and not text(p).startswith("/"):
-                    _refuse(f"{ev}: os.open for writing takes an absolute path (a dir_fd is not checked)")
                 writable(p)
             else:
                 visible(p)
@@ -1932,7 +1964,10 @@ def _audit_install(policy: dict, script: str) -> None:
                     ev == "os.rename" and _len(args) > 3 and (args[2] not in (None, -1) or args[3] not in (None, -1))):
                 _refuse(f"{ev}: a dir_fd is not checked")
             for i in _pe[ev]:
-                if i < _len(args) and not _isinst(args[i], _int):
+                if i < _len(args) and _isinst(args[i], _int):
+                    if ev != "os.truncate":        # only truncation needs an fd opened for writing (Codex r1 P1-4)
+                        _refuse(f"{ev}: on a file descriptor")
+                elif i < _len(args):
                     writable(args[i])
 
     sys.addaudithook(hook)
@@ -1941,9 +1976,11 @@ def _audit_install(policy: dict, script: str) -> None:
                        _script=script, _refused=AUDIT_REFUSED_MODULES + IMPORT_REFUSED, _isinst=isinstance,
                        _dict=dict, _str=str, _refuse=refuse):
         if _isinst(globals, _dict) and globals.get("__file__") == _script and _isinst(name, _str):
-            for r in _refused:          # the script's own imports, already loaded by a library or not
-                if name == r or name.startswith(r + "."):
-                    _refuse(f"import {name}")
+            names = [name] + [name + "." + f for f in (fromlist or ()) if _isinst(f, _str)]    # from x import y
+            for n in names:            # the script's own imports, already loaded by a library or not
+                for r in _refused:
+                    if n == r or n.startswith(r + "."):
+                        _refuse(f"import {n}")
         return _orig(name, globals, locals, fromlist, level)
     builtins.__import__ = guarded_import
 
@@ -1990,8 +2027,13 @@ def _audit_probe() -> bool:
     """Whether the fallback holds on this interpreter: a probe script, run exactly as a derivation is, meets each
     refusal and has its caps set. Any other outcome: no fallback (fail closed)."""
     if os.name != "posix" or not hasattr(sys, "addaudithook"):
+        _SANDBOX_INFO["audit_probe"] = "no audit hooks in this Python"
         return False
-    base = os.path.realpath(tempfile.mkdtemp(prefix="derive_probe_"))
+    try:
+        base = os.path.realpath(tempfile.mkdtemp(prefix="derive_probe_"))
+    except OSError as e:
+        _SANDBOX_INFO["audit_probe"] = f"no probe directory: {e}"
+        return False
     try:
         work, hid = os.path.join(base, "work"), os.path.join(base, "hidden")
         os.makedirs(work)
@@ -2009,7 +2051,8 @@ def _audit_probe() -> bool:
         got = open(res).read() if os.path.isfile(res) else ""
         _SANDBOX_INFO["audit_probe"] = got or (r.stderr or b"").decode("utf-8", "replace")[-300:]
         return r.returncode == 0 and got == "ok" and not os.path.exists(outside)
-    except (OSError, subprocess.SubprocessError, ValueError):
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        _SANDBOX_INFO["audit_probe"] = f"the probe did not complete: {type(e).__name__}: {str(e)[:200]}"
         return False
     finally:
         shutil.rmtree(base, ignore_errors=True)
@@ -2046,22 +2089,34 @@ SANDBOX_TEXT = {
 
 def sandbox_report_lines(run_dir: str) -> list[str]:
     """The report's block: which sandbox made each recorded derivation and what that sandbox guarantees."""
+    head = [f"## Derivation sandbox (rendered from {DERIVATIONS_RECORD})", ""]
+    p = os.path.join(run_dir, DERIVATIONS_RECORD)
+    if os.path.lexists(p):      # an unreadable record is said, not dropped (Codex r1 P2-11)
+        try:
+            with open(p) as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict) or not isinstance(raw.get("derivations"), dict):
+                raise ValueError("no derivations mapping")
+        except (OSError, ValueError) as e:
+            return head + [f"- The record could not be read ({type(e).__name__}): which sandbox ran the derivations "
+                           "is unknown.", ""]
     by: dict = {}
-    nets: set = set()
     for sid, e in sorted(load_record(run_dir)["derivations"].items()):
         sb = ((e or {}).get("sandbox") if isinstance(e, dict) else None) or {}
         sb = sb if isinstance(sb, dict) else {}
-        by.setdefault(str(sb.get("kind") or "unrecorded"), []).append(str(sid))
-        if sb.get("kind") == SANDBOX_AUDIT:
-            nets.add(str(sb.get("container_network") or "unknown"))
+        k = str(sb.get("kind") or "unrecorded")
+        if isinstance(e, dict) and "runs" in e and not e.get("runs") and not e.get("ok"):
+            k = "not run"                    # refused before launch: no sandbox ran it (Codex r1 P2-10)
+        net = str(sb.get("container_network") or "unknown") if k == SANDBOX_AUDIT else None
+        by.setdefault((k, net), []).append(str(sid))    # the network kept per derivation (Codex r1 P2-12)
     if not by:
         return []
-    out = [f"## Derivation sandbox (rendered from {DERIVATIONS_RECORD})", ""]
-    for k, ids in sorted(by.items()):
-        out.append(f"- `{k}` (derivations: {', '.join(ids)}): "
-                   + SANDBOX_TEXT.get(k, "not a sandbox kind the harness knows, so the derivation is not trusted.")
-                   + (f" The container's own network was recorded as: {', '.join(sorted(nets))}."
-                      if k == SANDBOX_AUDIT else ""))
+    out = list(head)
+    for (k, net), ids in sorted(by.items(), key=lambda x: (x[0][0], x[0][1] or "")):
+        text = ("refused before it was launched, so no sandbox ran it." if k == "not run" else
+                SANDBOX_TEXT.get(k, "not a sandbox kind the harness knows, so the derivation is not trusted."))
+        out.append(f"- `{k}` (derivations: {', '.join(ids)}): {text}"
+                   + (f" The container's own network: {net}." if net else ""))
     return out + [""]
 
 
@@ -2178,6 +2233,9 @@ def _run_derivation(d: dict, run_dir: str, kind: str, lim: dict, strip: dict | N
                 res["outputs"][rel] = _sha(os.path.join(dp, fn))
             else:
                 res["undeclared"].append(rel)
+    # a copied input that is gone (removed, or renamed onto a declared output) was written too (Codex r1 P1-5)
+    res["input_written"] += [rel for rel in copies if not os.path.isfile(os.path.join(work, rel))
+                             or os.path.islink(os.path.join(work, rel))]
     return res
 
 
@@ -2257,7 +2315,8 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
     kind = kind or "none"
     sb = {"kind": kind, "limits": lim}
     if kind == SANDBOX_AUDIT:
-        sb.update(bwrap_not_used=_SANDBOX_INFO.get("bwrap_not_used"), container_network=container_network())
+        sb.update(bwrap_not_used=_SANDBOX_INFO.get("bwrap_not_used"), basis=_SANDBOX_INFO.get("basis"),
+                  container_network=container_network())
     prov = _prov_inputs(run_dir)
     entries, bad_outputs = {}, set()
     for d in ders:
@@ -3766,13 +3825,14 @@ def _self_test_audit_sandbox(rep, codes, need) -> None:
     from unittest import mock as _mock
     saved, info = list(_SANDBOX), dict(_SANDBOX_INFO)
 
-    def detect(platform, which, bw, audit):
+    def detect(platform, which, bw, audit, basis="container: /.dockerenv"):
         _SANDBOX.clear()
         _SANDBOX_INFO.clear()
         calls = []
         with _mock.patch.object(sys, "platform", platform), \
                 _mock.patch.object(shutil, "which", lambda n: f"/usr/bin/{n}" if n in which else None), \
                 _mock.patch(f"{__name__}._bwrap_probe", lambda k: bw.get(k, False)), \
+                _mock.patch(f"{__name__}._audit_basis", lambda: basis), \
                 _mock.patch(f"{__name__}._audit_probe", lambda: calls.append(1) or audit):
             k = sandbox_kind()
         return k, dict(_SANDBOX_INFO), calls
@@ -3789,10 +3849,19 @@ def _self_test_audit_sandbox(rep, codes, need) -> None:
             f"DI-A0 detection: bwrap that fails (and bwrap-sudo that fails) gives the fallback, with the reason; a "
             f"fallback whose probe fails gives no sandbox; a working bwrap is used and the fallback not probed; no "
             f"bwrap installed gives the fallback; not Linux gives none: {[k1, k2, k3, k4, k5]} {i1}")
+        k6, i6, c6 = detect("linux", {"bwrap"}, {}, True, basis=None)
+        rep(k6 is None and not c6 and AUDIT_OPT_IN in (i6.get("audit_probe") or "")
+            and i1.get("basis") == "container: /.dockerenv",
+            f"DI-A0b a plain Linux host (no container, no operator choice) gets no fallback and fails closed; the "
+            f"record names the container basis where it is used: {k6} {i6} {i1.get('basis')}")
+        with _mock.patch.dict(os.environ, {AUDIT_OPT_IN: SANDBOX_AUDIT}):
+            b7 = _audit_basis()
+        rep(b7 == f"operator: {AUDIT_OPT_IN}={SANDBOX_AUDIT}", f"DI-A0c the operator's explicit choice is a basis: {b7}")
     finally:
         _SANDBOX[:] = saved
         _SANDBOX_INFO.clear()
         _SANDBOX_INFO.update(info)
+    _self_test_audit_records(rep)
     usable = sys.platform.startswith("linux") and _audit_probe()
     if not usable:
         msg = f"the {SANDBOX_AUDIT} fallback does not hold here ({sys.platform}: {_SANDBOX_INFO.get('audit_probe')!r})"
@@ -3827,6 +3896,12 @@ def _self_test_audit_sandbox(rep, codes, need) -> None:
         ("DI-A5", "reading the run directory", "open({run!r} + '/data/inputs_provenance.json').read()"),
         ("DI-A5", "listing the run directory", "import os\nos.listdir({run!r})"),
         ("DI-A6", "gc.get_objects", "import gc\ngc.get_objects()"),
+        ("DI-A2", "a SQLite file (native code opens it)", "import sqlite3\nsqlite3.connect('/tmp/di_a2.db')"),
+        ("DI-A5", "a read relative to a directory fd", "import os\nfd = os.open(os.path.dirname({run!r}), os.O_RDONLY)\n"
+                  "os.open(os.path.basename({run!r}) + '/data/inputs_provenance.json', os.O_RDONLY, dir_fd=fd)"),
+        ("DI-A2", "chmod through a read-only fd", "import os\nfd = os.open(os.path.abspath(a.inputs[0]), os.O_RDONLY)\n"
+                  "os.chmod(fd, 0o666)"),
+        ("DI-A4", "from urllib import request", "from urllib import request"),
         ("DI-A6", "rebinding the import guard's defaults", "import builtins\nbuiltins.__import__.__defaults__ = None"),
         ("DI-A6", "replacing the import guard's code", "import builtins\n"
                   "builtins.__import__.__code__ = (lambda *x, **k: None).__code__"))
@@ -3875,6 +3950,35 @@ def _self_test_audit_sandbox(rep, codes, need) -> None:
         rep(False, f"DI-A fallback: {type(e).__name__}: {e}")
     finally:
         _SANDBOX[:] = saved
+
+
+def _self_test_audit_records(rep) -> None:
+    """DI-A9 (a copied input that is gone counts as written) and DI-A10 (the report block: an unreadable record, a
+    derivation never launched, the network per derivation). Platform-independent."""
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(di_fixture(d, extra="import os\nos.remove(a.inputs[0])"))
+        ders, _i, _e = load_derivations(d)
+        r = _run_derivation(ders[0], d, "none", dict(LIMITS, wall_s=60))
+        shutil.rmtree(r["work"], ignore_errors=True)
+        shutil.rmtree(r["side"], ignore_errors=True)
+        rep(r["input_written"] == ["data/inputs/raw.csv"],
+            f"DI-A9 a copied input that is missing after the run counts as written: {r['input_written']} rc={r['rc']}")
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "data"))
+        rp = os.path.join(d, DERIVATIONS_RECORD)
+        open(rp, "w").write('{"derivations": {')
+        bad = "\n".join(sandbox_report_lines(d))
+        sb = {"kind": SANDBOX_AUDIT}
+        json.dump({"derivations": {"a": {"ok": True, "runs": 2, "sandbox": dict(sb, container_network="none")},
+                                   "b": {"ok": True, "runs": 2, "sandbox": dict(sb, container_network="present")},
+                                   "c": {"ok": False, "runs": 0, "sandbox": dict(sb, container_network="none")}}},
+                  open(rp, "w"))
+        good = "\n".join(sandbox_report_lines(d))
+        rep("could not be read" in bad and "`not run` (derivations: c)" in good
+            and "(derivations: a): " in good and "(derivations: b): " in good and "network: none" in good
+            and "network: present" in good,
+            f"DI-A10 the report block says an unreadable record, a derivation never launched, and the container network "
+            f"per derivation: {bad!r} {good!r}")
 
 
 def _self_test_derivations(ok) -> None:

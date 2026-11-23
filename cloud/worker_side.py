@@ -36,7 +36,8 @@ def ensure_bwrap(run=None, which=None, platform=None) -> str:
     if which("bwrap"):
         return "bwrap: present"
     if not which("sudo"):
-        return "bwrap: missing and no sudo; derivations that must run will fail closed"
+        return ("bwrap: missing and no sudo; derivations that must run fail closed unless the audit-hook "
+                "fallback holds")
 
     def sh(*cmd):
         try:
@@ -49,7 +50,8 @@ def ensure_bwrap(run=None, which=None, platform=None) -> str:
         rc = sh("apt-get", "install", "-y", "bubblewrap")
     if rc == 0 and which("bwrap"):
         return "bwrap: installed"
-    return f"bwrap: install failed ({rc}); derivations that must run will fail closed"
+    return (f"bwrap: install failed ({rc}); derivations that must run fail closed unless the audit-hook "
+            "fallback holds")
 
 
 def _run_main(cmd, cwd, env, log, timeout_s=None):

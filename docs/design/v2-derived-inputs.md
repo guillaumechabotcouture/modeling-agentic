@@ -310,14 +310,23 @@ reason is given.
   inside an unprivileged Docker container. There bubblewrap cannot create namespaces, so every
   derivation failed closed and, with the development flag, the run ended at SPEC on the HIGH
   `derivation_unsandboxed`. On Linux, when neither `bwrap` nor `bwrap-sudo` passes its probe (or
-  bubblewrap is not installed), `sandbox_kind()` now probes a third kind, `audit-hook`. The
+  bubblewrap is not installed), `sandbox_kind()` now probes a third kind, `audit-hook`. It is
+  used only inside a container, detected by `/.dockerenv`, `/run/.containerenv`, `$container`
+  or `/proc/1/cgroup`, because there the container's isolation from the host is the outer wall.
+  An operator can also choose it explicitly with `MA_DERIVATION_SANDBOX=audit-hook`. The record
+  names the basis. On a plain host the planner's script would run with the host user's
+  permissions behind only the hook, so derivations fail closed there. The
   derivation runs in a child Python (`-I`, the same scrubbed environment, cwd its private work
   directory, the same caps set strictly). Inputs and the script are copied in read-only, and their
   hashes are checked after the run. An audit hook (PEP 578), installed after numpy, pandas and pyyaml
   are imported and before the script runs, refuses:
   - every socket call;
   - process creation and signals;
-  - ctypes and links;
+  - ctypes, links, and the standard modules whose native code opens files itself (sqlite3,
+    dbm, shelve, readline, syslog);
+  - `os.open` with a relative path, since the audit event does not show its `dir_fd`;
+  - permission and ownership changes made through a file descriptor;
+  - raising a resource limit;
   - writes, renames and removals outside the work directory or onto an input;
   - reads and listings of the run directory;
   - the introspection that could reach the hook.
@@ -348,7 +357,7 @@ reason is given.
   The threat this answers is a planner-written script that reaches the network, writes or reads
   outside its declaration, or starts a process, by mistake or by design shortcut. It is not a
   hostile script. Against such a script bubblewrap still holds and the fallback does not. The
-  report says this in its block. Self-tests DI-A0 to DI-A8 cover this kind.
+  report says this in its block. Self-tests DI-A0 to DI-A10 cover this kind.
 - **The column accounting** reads the header of each staged `.csv`/`.tsv`. A staged table that the
   spec cites directly counts as used. The removal test (`ignored_column_used`) runs only for the
   ignored columns of tabular inputs.
