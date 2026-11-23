@@ -2070,25 +2070,28 @@ def container_network() -> str:
     return "present" if up else "none"
 
 
+# The fallback's limit, said in one sentence wherever its kind is reported (owner, 2026-11-23).
+AUDIT_NATIVE_LIMIT = ("It does not hold against native code: an audit hook sees Python-level calls, not the system "
+                      "calls that C extensions make, so a script written to escape through native code would not be "
+                      "stopped as bubblewrap would stop it.")
 SANDBOX_TEXT = {
     "bwrap": "Linux namespaces (bubblewrap): no network, the run directory hidden and writes only to the "
              "derivation's work directory, all enforced by the kernel.",
     "bwrap-sudo": "Linux namespaces (bubblewrap started by root, the script run as the run's user with no "
                   "capabilities): no network, the run directory hidden and writes only to the derivation's work "
                   "directory, all enforced by the kernel.",
-    SANDBOX_AUDIT: "bubblewrap could not run on this machine (an unprivileged container), so each derivation ran in a "
-                   "child Python with a scrubbed environment, a private work directory, inputs copied in read-only, "
-                   "the same resource caps, and an audit hook that refuses network, process creation, foreign code, "
-                   "reads of the run directory and writes outside the work directory. This holds for code that uses "
-                   "Python's file, network and process calls, including through numpy, pandas and pyyaml. It is not "
-                   "a kernel boundary: a script written to defeat the hook would not be stopped as bubblewrap would "
-                   "stop it.",
+    SANDBOX_AUDIT: "bubblewrap could not run in this container, so each derivation ran in a child Python with a "
+                   "scrubbed environment, a private work directory, inputs copied in read-only, the same resource "
+                   "caps, and an audit hook that refuses network, process creation, foreign code, reads of the run "
+                   "directory and writes outside the work directory (the owner accepted this fallback for containers "
+                   "only; a host without a working bubblewrap fails closed). " + AUDIT_NATIVE_LIMIT,
     "none": "no sandbox (the development flag): a run with such a derivation cannot be accepted.",
 }
 
 
 def sandbox_report_lines(run_dir: str) -> list[str]:
-    """The report's block: which sandbox made each recorded derivation and what that sandbox guarantees."""
+    """The report's block, in every report: which sandbox made each recorded derivation and what that sandbox
+    guarantees (a run with no derivation says so)."""
     head = [f"## Derivation sandbox (rendered from {DERIVATIONS_RECORD})", ""]
     p = os.path.join(run_dir, DERIVATIONS_RECORD)
     if os.path.lexists(p):      # an unreadable record is said, not dropped (Codex r1 P2-11)
@@ -2109,8 +2112,8 @@ def sandbox_report_lines(run_dir: str) -> list[str]:
             k = "not run"                    # refused before launch: no sandbox ran it (Codex r1 P2-10)
         net = str(sb.get("container_network") or "unknown") if k == SANDBOX_AUDIT else None
         by.setdefault((k, net), []).append(str(sid))    # the network kept per derivation (Codex r1 P2-12)
-    if not by:
-        return []
+    if not by:       # every report says which sandbox ran its derivations, also when none did
+        return head + ["- No derivation ran in this run: no data file was made by a script.", ""]
     out = list(head)
     for (k, net), ids in sorted(by.items(), key=lambda x: (x[0][0], x[0][1] or "")):
         text = ("refused before it was launched, so no sandbox ran it." if k == "not run" else
@@ -3927,7 +3930,7 @@ def _self_test_audit_sandbox(rep, codes, need) -> None:
             txt = "\n".join(sandbox_report_lines(d))
             rep(r["ok"] and sb["kind"] == SANDBOX_AUDIT and sb.get("container_network") in ("none", "present", "unknown")
                 and "bwrap_not_used" in sb and "derivation_unsandboxed" not in kinds
-                and "`audit-hook`" in txt and "not a kernel boundary" in txt,
+                and "`audit-hook`" in txt and AUDIT_NATIVE_LIMIT in txt,
                 f"DI-A7 a fallback derivation runs, records its sandbox kind, the container's network and why "
                 f"bubblewrap was not used, raises no derivation_unsandboxed, and the report block names it: {codes(r)} "
                 f"{sb} {kinds}")

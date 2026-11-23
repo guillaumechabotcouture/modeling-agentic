@@ -315,7 +315,10 @@ reason is given.
   or `/proc/1/cgroup`, because there the container's isolation from the host is the outer wall.
   An operator can also choose it explicitly with `MA_DERIVATION_SANDBOX=audit-hook`. The record
   names the basis. On a plain host the planner's script would run with the host user's
-  permissions behind only the hook, so derivations fail closed there. The
+  permissions behind only the hook, so derivations fail closed there. Owner decision
+  (2026-11-23): the fallback is accepted for containers only, and bubblewrap stays required on
+  hosts. Every report has a "Derivation sandbox" block, which says so when no derivation ran. Where
+  the fallback ran, the block states its native-code limit in one sentence (`AUDIT_NATIVE_LIMIT`). The
   derivation runs in a child Python (`-I`, the same scrubbed environment, cwd its private work
   directory, the same caps set strictly). Inputs and the script are copied in read-only, and their
   hashes are checked after the run. An audit hook (PEP 578), installed after numpy, pandas and pyyaml
