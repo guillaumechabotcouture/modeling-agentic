@@ -207,7 +207,9 @@ def attribute_simplifications(A) -> list[str]:
     is stated in the section, not dropped (Codex r3 P2-2)."""
     from toolkit.spec import schema
     b, bad = schema.load_binding(A.eng)
-    return schema.attribute_notes_markdown(schema.attribute_notes(A.spec.raw.get("calibration") or {}, b), problems=bad)
+    cal = A.spec.raw.get("calibration") or {}
+    sc = schema.resolved_scale(A.spec) if schema.attribute_notes(cal, b) else None    # the scale the run used
+    return schema.attribute_notes_markdown(schema.attribute_notes(cal, b, scale=sc), problems=bad)
 
 
 def variant_claims(A, arts, pv) -> list[dict]:

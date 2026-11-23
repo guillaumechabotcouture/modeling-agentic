@@ -28,11 +28,15 @@ then reads the same evaluations (`pre=`). The interval's label comes from the sp
 summariser), plus the scope and the draw plan: every source drawn or not, every engine
 parameter drawn or held fixed with why, and the emulator-error model with its held-out
 evidence, so a report cannot claim more precision than the draws carry.
+run() also returns `plan_draws`: each draw's fixed-plan total of the primary outcome and its per-package sums (units,
+cost, averted), which the figure step reads on direct evaluation instead of re-running the engine (hb1 flu R2: the
+re-run took as long as the draws). Long per-draw loops log a progress line with an ETA (Progress).
 """
 from __future__ import annotations
 
 import os
 import sys
+import time
 
 import numpy as np
 import yaml
@@ -44,6 +48,7 @@ from toolkit.analysis.core import q  # noqa: E402
 PRODUCER = "toolkit/analysis/uncertainty.py"
 ORDER = ("engine_parameters", "calibration", "costs", "emulator")
 POINT_TOL = 1e-6           # v2-posterior-point: a value within the fit file's 6-decimal rounding of the chosen point
+PROGRESS_EVERY_S = 300.0    # a long per-draw loop logs its progress at most this often (and at its last item)
 NE_STREAM = 0x6E6566        # the net-effect posterior's row choice: its own stream, the other sources' draws unchanged
 
 
@@ -376,6 +381,30 @@ class Drawer:
         return theta, zs, noise, mult, sampled
 
 
+class Progress:
+    """A progress line for a long per-item loop: the count done, the elapsed time and an ETA from the mean time per
+    item, at most once per `every_s` seconds and at the last item. It only logs: no output depends on it."""
+
+    def __init__(self, log, label: str, n: int, every_s: float = PROGRESS_EVERY_S, clock=time.monotonic):
+        self.log, self.label, self.n, self.every, self.clock = log, label, int(n), float(every_s), clock
+        self.t0 = self.last = clock()
+        self.done = 0
+
+    def step(self):
+        self.done += 1
+        if self.log is None:
+            return
+        now = self.clock()
+        if self.done < self.n and now - self.last < self.every:
+            return
+        self.last = now
+        el = now - self.t0
+        msg = f"{self.label}: {self.done}/{self.n} done, {el / 60:.1f} min elapsed"
+        if self.done < self.n:
+            msg += f", ETA {el / self.done * (self.n - self.done) / 60:.1f} min"
+        self.log(msg)
+
+
 def affordability(costs, budget: float, rule: dict | None = None, level: float = 0.95) -> dict:
     """The fixed plan's cost in each draw against the allocatable budget (F6 S1-1). A cost above budget * (1 + 1e-9), the
     solver's own tolerance, counts as over budget. With a rule (`uncertainty.affordability`), rule_met says whether the share of
@@ -487,9 +516,32 @@ def _n_seed(A, draws=None, seed=None):
     return int(draws if draws is not None else sp.get("draws", 32)), seed if seed is not None else sp.get("seed", 42)
 
 
-def _draw_rows(A, D, nd):
+def _draw_rows(A, D, nd, label="uncertainty draws", log=None):
     """Each draw's sampled values and evaluation, in draw order (lazily: the emulator error is drawn from the shared
-    stream inside evaluate)."""
+    stream inside evaluate). On direct evaluation with compute workers (draw_fanout.config) the engine runs of a wave
+    of draws fan out first; every draw is then evaluated in order on its own runs, with the same results."""
+    from toolkit.analysis import draw_fanout as DF
+    P = Progress(log if log is not None else getattr(A, "log", None), label, nd)
+    kw = DF.config(A)
+    if kw is not None:
+        w = DF.wave_size(A)
+        for a in range(0, nd, w):
+            wave = []
+            for _ in range(a, min(nd, a + w)):
+                D.last_clamped = []
+                theta, zs, noise, mult, sampled = D.draw()
+                if noise is not None:       # direct evaluation draws no emulator error (Drawer refuses it)
+                    raise ValueError("draw fan-out: a draw carries an emulator error stream on direct evaluation")
+                wave.append((theta, zs, mult, sampled, list(D.last_clamped)))
+            runs = DF.prefetch(A, [(x[0], x[1]) for x in wave], kw)
+            runs.reverse()
+            for theta, zs, mult, sampled, clamped in wave:
+                A.model.use_runs(theta, zs, runs.pop())        # each draw's outcomes released once evaluated
+                out, ben, cost = A.evaluate(theta, zs, noise=None, cost_mult=mult, sampled=sampled)
+                yield {"sampled": sampled, "clamped": clamped, "out": out, "ben": ben, "cost": cost,
+                       "events": list(A.last_events), "floors": list(getattr(A, "last_cost_floors", None) or [])}
+                P.step()
+        return
     for _ in range(nd):
         D.last_clamped = []
         theta, zs, noise, mult, sampled = D.draw()
@@ -497,6 +549,7 @@ def _draw_rows(A, D, nd):
         out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=sampled)
         yield {"sampled": sampled, "clamped": clamped, "out": out, "ben": ben, "cost": cost,
                "events": list(A.last_events), "floors": list(getattr(A, "last_cost_floors", None) or [])}
+        P.step()
 
 
 def evaluate_draws(A, draws=None, seed=None) -> dict:
@@ -534,6 +587,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
     clamped_draws = []
     floors = []          # F6 S1-3: each draw's floored per-outcome increments (also from precomputed draws)
     hl_outcome = A.spec["deliverable"]["headline"]["outcome"]
+    from toolkit.analysis.figure_data import _package_sums
+    plan_sums = []           # each draw's per-package sums of the fixed plan (the figure step reads them)
     for d, r in enumerate(rows):
         sampled, out, ben, cost = r["sampled"], r["out"], r["ben"], r["cost"]
         if r["clamped"]:
@@ -549,6 +604,7 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
             row[f"{o}_averted"] = v
         row[headline_name] = row[f"{hl_outcome}_averted"]
         fixed_cost.append(sum(cost[i][plan[i]] for i in A.ids))
+        plan_sums.append(_package_sums(A, plan, out, cost))
         from toolkit.analysis.core import auxiliary, best_known
         with auxiliary(A, "uncertainty_draws"):      # 1C-c: a feasible plan within the stated gap is used and counted
             sol = best_known(A, A.solve(ben, cost), plan, ben, cost)      # never below a feasible point plan
@@ -666,7 +722,9 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
                                          "unmatched calibration")
     if D.ne is not None:        # f6-posterior-ranges: these columns' ranges came from the posterior, with its sha256
         report["net_effect_posterior_ranges"] = posterior_range_record(D.ne)
-    return {"data": data, "report": report}
+    return {"data": data, "report": report,
+            "plan_draws": {"draws": nd, "seed": data["seed"], "primary": A.primary, "plan": {i: plan[i] for i in A.ids},
+                           "primary_averted": list(fixed[A.primary]), "per_draw": plan_sums}}
 
 
 def scalar_report(outputs, values: dict, level: float, label: str, n_draws: int, method: str, **extra) -> dict:
@@ -810,6 +868,10 @@ def _self_test() -> int:
             except ValueError:
                 ok(True, f"U12 {label} fails closed")
     _self_test_reserve(ok)
+    try:
+        _self_test_progress(ok)
+    except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
+        ok(False, f"UP1-UP3 the per-draw progress line ({type(e).__name__}: {e})")
     try:
         _self_test_exception(ok)
     except Exception as e:  # noqa: BLE001 -- a missing feature is a failing case
@@ -985,6 +1047,24 @@ def _self_test_posterior(ok):
         except NEF.PosteriorRefused as ex:
             why9 = str(ex)
         ok("fitted under engine" in why9, f"NP9 the cached sample does not bypass another engine's check: {why9[:100]}")
+
+
+def _self_test_progress(ok):
+    """hb1 flu R2: 200 direct draws ran 14.6 h with no line between start and end. Long per-draw loops log progress
+    with the elapsed time and an ETA, at most once per interval (and at the last item); the log never changes outputs."""
+    lines, now = [], [0.0]
+    P = Progress(lines.append, "uncertainty draws", 10, every_s=60.0, clock=lambda: now[0])
+    for k in range(10):
+        now[0] += 25.0           # 25 s per draw
+        P.step()
+    ok(len(lines) == 4 and lines[-1].startswith("uncertainty draws: 10/10") and "ETA" not in lines[-1],
+       f"UP1 a 10-draw loop at 25 s per draw logs at most once a minute and at the end ({lines})")
+    ok("ETA 2.9 min" in lines[0] and "3/10" in lines[0],
+       f"UP2 each line carries the count done and the ETA from the mean time per item ({lines[:1]})")
+    quiet = Progress(None, "x", 3, clock=lambda: 0.0)
+    for _ in range(3):
+        quiet.step()
+    ok(quiet.done == 3, "UP3 without a log the counter still runs and nothing is written")
 
 
 def _self_test_reserve(ok):
