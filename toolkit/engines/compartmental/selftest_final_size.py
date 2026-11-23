@@ -257,6 +257,39 @@ def _self_test() -> int:
     ok(es.run({"r0": 2.0}, u1, Package("0", {}), H, 1).meta["time_axis"] == "solver_iterations",
        "FD17 (r1 P2-4) a direct run's time axis is solver_iterations")
 
+    ok(o15.meta["steps"] >= 1, f"FD15b (r2 P3-6) the map was evaluated at least once ({o15.meta['steps']} iterations)")
+
+    # Codex r2 of #351 (tests first): FD18-FD22
+    def solve(K, s, e, tol, cap=500):
+        return safe(lambda: E.solve_final_size(np.asarray(K), np.asarray(s), np.asarray(e), tol, cap))
+    # FD18 (P1-1): a force that underflows to zero still carries an allowance: a 4-chain whose last share is
+    # 1 - exp(-1) must not be certified at zero
+    r18, err = solve(np.diag([1e-150, 1e175, 1e175], -1)[None], np.ones((1, 4)), [[1e-200, 0, 0, 0]], 1e-12)
+    ok((err is not None and "converged: false" in err) or (err is None and abs(r18[0][0, 3] - (1 - np.exp(-1))) <= 1e-12),
+       f"FD18 (r2 P1-1) underflow does not certify zero infections ({err or r18[0][0, 3]})")
+    # FD19 (P1-2): float32 inputs are promoted; the bound stays at or below the root of the stored inputs
+    r19, err = solve(np.asarray([[[2.0]]], np.float32), np.asarray([[1.0]], np.float32),
+                     np.asarray([[0.001]], np.float32), 1e-13)
+    e32 = D(float(np.float32(0.001)))
+    lo19, hi19 = D(0), D(1)
+    for _ in range(200):
+        mid = (lo19 + hi19) / 2
+        lo19, hi19 = (mid, hi19) if mid - (1 - (1 - e32) * (-2 * mid).exp()) < 0 else (lo19, mid)
+    ok(err is None and float(lo19) - 1e-13 <= r19[0][0, 0] <= float(hi19) + 1e-16,
+       f"FD19 (r2 P1-2) float32 inputs: within tol below the root ({err or r19[0][0, 0]} vs {float(lo19)})")
+    # FD20 (P2-3): slow but certified progress closes within the cap; it is not declared a floating-point limit
+    r20, err = solve([[[1.0, 0.0], [1e-4, 1.0]]], [[1.0, 1.0]], [[1.21e-11, 0.0]], 1e-13, cap=1500)
+    ok(err is None, f"FD20 (r2 P2-3) a slowly closing bracket is not aborted: {err or r20[1]}")
+    # FD21 (P2-4): a row sum that overflows saturates the map instead of poisoning the bracket with NaN
+    r21, err = solve([[[0, 0, 0], [1, 0, 0], [1e308, 1e308, 0]]], np.ones((1, 3)), [[1e-9, 0, 0]], 1e-9)
+    ok(err is None and np.all(np.isfinite(r21[0])) and abs(r21[0][0, 2] - 1.0) <= 1e-9,
+       f"FD21 (r2 P2-4) an overflowing force saturates: {err or r21[0]}")
+    # FD22 (P2-5): a structurally zero row is known exactly (z = e), at any tol
+    o22, err = safe(lambda: single(transmission="q", tol=5e-18).run(
+        {"q": 0.0}, UnitSpec("q", {"N": [1e6], "s0": [1.0], "seed": 0.01}), Package("0", {}), H, 1))
+    ok(err is None and o22.windows["all"]["attack_rate"] == 0.01,
+       f"FD22 (r2 P2-5) zero transmission gives the seed exactly: {err or o22.windows['all']['attack_rate']}")
+
     # FD13: the card says what the solver's steps are, and the version moved
     card = es.describe()
     ok(E.VERSION == "0.3" and any("solved directly" in m for m in card.mechanisms),
