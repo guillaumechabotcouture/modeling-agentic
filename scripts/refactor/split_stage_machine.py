@@ -76,6 +76,7 @@ BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__spec__", 
                                  "__builtins__", "__annotations__", "__dict__", "__debug__"}
 TEST_FN = re.compile(r"^_self_test(_\w+)?$")
 TEST_HELPER = re.compile(r"^(_t_\w+|_TOY_\w+)$")
+TMP_SUFFIX = ".split-tmp"
 HERE_LINE = "HERE = os.path.dirname(os.path.abspath(__file__))"
 HERE_PKG = "HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # agents/, as before the split"
 SHIM_UNITS = ("_self_test", "main")       # stay in agents/stage_machine.py (with the `if __name__` block)
@@ -602,6 +603,9 @@ def stage_tests(repo: str, log=print) -> bool:
     module_names = {n for u in prod for n in u.names} - import_names
     out_dir = os.path.join(repo, TESTS_DIR)
     if os.path.isdir(out_dir):
+        for f in os.listdir(out_dir):
+            if f.endswith(TMP_SUFFIX):           # left by an interrupted run of this script
+                os.remove(os.path.join(out_dir, f))
         extra = sorted(f for f in os.listdir(out_dir) if f != "__pycache__" and not f.startswith(TEST_PREFIX))
         if extra:
             raise SplitError(f"{TESTS_DIR} holds files this script did not write: {extra}")
@@ -683,10 +687,12 @@ def _write_tree(repo: str, files: dict):
         p = os.path.join(repo, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         compile(text, rel, "exec")            # never write a file that does not parse
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix="." + os.path.basename(p) + ".", suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=os.path.basename(p) + ".", suffix=TMP_SUFFIX)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
-        os.chmod(tmp, os.stat(p).st_mode & 0o7777 if os.path.exists(p) else 0o644)   # keep the file's mode
+        um = os.umask(0)
+        os.umask(um)
+        os.chmod(tmp, os.stat(p).st_mode & 0o7777 if os.path.exists(p) else 0o666 & ~um)   # as open() would
         os.replace(tmp, p)                    # whole or not at all: a retry never meets a half-written module
 
 
@@ -1082,7 +1088,17 @@ def _submodules(pkg):
             if m is not None and m is not pkg and m is not me and k.startswith(_PKG + ".")]
 
 
+_CREATED: set = set()           # (submodule name, attribute) bindings forwarding created, the only ones it deletes
+
+
 class _Shared(types.ModuleType):
+    @property
+    def __all__(self):
+        """What `import *` took from the one module: its public names, now and after any patch; not the
+        package's own submodules, which the module did not have."""
+        return [n for n, v in self.__dict__.items() if not n.startswith("_")
+                and not (isinstance(v, types.ModuleType) and (v.__name__ or "").startswith(_PKG + "."))]
+
     def __setattr__(self, name, value):
         old = self.__dict__.get(name, _MISSING)
         super().__setattr__(name, value)
@@ -1092,13 +1108,16 @@ class _Shared(types.ModuleType):
             # the same object, or (old missing) a name the module resolved through builtins, as one module did
             if mod.__dict__.get(name, _MISSING) is old:
                 setattr(mod, name, value)
+                if old is _MISSING:
+                    _CREATED.add((mod.__name__, name))
 
     def __delattr__(self, name):
-        old = self.__dict__.get(name, _MISSING)
         super().__delattr__(name)
         for mod in _submodules(self):
-            if old is not _MISSING and mod.__dict__.get(name, _MISSING) is old:
-                delattr(mod, name)
+            if (mod.__name__, name) in _CREATED:
+                _CREATED.discard((mod.__name__, name))
+                if name in mod.__dict__:
+                    delattr(mod, name)
 
 
 def share(module) -> None:
@@ -1144,11 +1163,9 @@ def _init(units, lines, assign, mods) -> str:
             out.append(wrap_import(f"from .{m} import ", sorted(by_mod[m]), noqa="  # noqa: E402,F401"))
     out.append("from . import namespace as _namespace  # noqa: E402\n\n"
                "_namespace.share(sys.modules[__name__])     # an assignment to this module reaches the package\n")
-    exported = _public_names(units)
-    if exported is not None:     # `from stage_machine import *` gives what the module gave, not the submodules
-        out.append("# what `from stage_machine import *` took from the module (not the submodules' names)\n"
-                   + wrap_import("__all__ = ", [repr(n) for n in exported]).replace("__all__ = (", "__all__ = [", 1)
-                   .rstrip("\n").rstrip(")") + "]\n" if len(exported) > 1 else "__all__ = " + repr(exported) + "\n")
+    if _public_names(units) is None:
+        raise SplitError("the module defines __all__: the package's computed __all__ (namespace.py) would replace "
+                         "it; extend the script")
     for u in units:
         if u.kind in ("doc", "future", "import") or _is_main_guard(u.node):
             continue
@@ -1278,11 +1295,6 @@ def _extra_code(repo: str, units, meths, mu) -> list:
             t = ast.parse(open(os.path.join(root, f), encoding="utf-8").read())
             for i, st in enumerate(t.body):
                 if isinstance(st, (ast.Import, ast.ImportFrom)) or (i == 0 and isinstance(st, ast.Expr)):
-                    continue
-                if rel == f"{PKG_DIR}/__init__.py" and isinstance(st, ast.Assign) \
-                        and [ast.unparse(x) for x in st.targets] == ["__all__"]:
-                    if ast.literal_eval(st.value) != _public_names(units):
-                        probs.append(f"{rel}: __all__ is not the module's public names")
                     continue
                 if isinstance(st, ast.ClassDef) and (st.name == "Machine" or (
                         len(st.decorator_list) == 1 and ast.unparse(st.decorator_list[0]).startswith("handler("))):
@@ -1584,11 +1596,14 @@ def _self_test() -> int:
                  "f = m.a_helper; m.a_helper = lambda v: 99; x = a.a_helper(0); m.a_helper = f\n"
                  "with um.patch.object(m, 'len', lambda v: 5, create=True):\n    y = a.len('')\n"
                  "ns = {'run': 'mine'}; exec('from stage_machine import *', ns)\n"
+                 "h = m.states.HANDLERS\n"
+                 "with um.patch.object(m, 'HANDLERS', h, create=True):\n    pass\n"
+                 "del m.run_toy; m.extra_tag = 1; ns2 = {}; exec('from stage_machine import *', ns2)\n"
                  "print(x == 99, a.a_helper is f, y == 5, 'len' not in vars(a), ns['run'] == 'mine', "
-                 "'run_toy' in ns)\n")
+                 "'run_toy' in ns, m.states.HANDLERS is h, 'extra_tag' in ns2 and 'run_toy' not in ns2)\n")
         r = subprocess.run([py, "-c", probe], cwd=d, capture_output=True, text=True)
         r2 = subprocess.run([py, "-m", "agents.stage_machine"], cwd=d, capture_output=True, text=True)
-        ok(r.stdout.split() == ["True"] * 6 and r2.returncode == 0 and '"A"' in r2.stdout,
+        ok(r.stdout.split() == ["True"] * 8 and r2.returncode == 0 and '"A"' in r2.stdout,
            f"S41 a patch of the package's sys and its undo leave forwarding working; a builtin patched on the "
            f"package reaches a submodule and its undo removes it; import * gives the module's names; -m runs "
            f"({r.stdout.strip()} {r.stderr[-300:]} {r2.returncode})")

@@ -315,7 +315,8 @@ REVIEWED: dict = {
     "scripts/refactor/split_stage_machine.py": {"open-write": (1, _REPO + "; the split's output files in the "
                                                                           "checkout it is pointed at"),
                                                 "os-rename": (1, "its own temporary file onto that output file"),
-                                                "tempfile-dir": (1, "that temporary file, made beside its output")},
+                                                "tempfile-dir": (1, "that temporary file, made beside its output"),
+                                                "os-remove": (1, "such a temporary file an interrupted run left")},
     "scripts/regression_eval.py": {"open-write": (4, _EVAL), "shutil": (1, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/results_store.py": {"safeio-derived-root": (1, "download() streams to the path its caller names (the "
                                                          "launcher's out dir, a VM staging dir): no run root "
