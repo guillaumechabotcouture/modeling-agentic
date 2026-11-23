@@ -7,7 +7,7 @@ output. It never edits a line of logic: every function, class and method moves v
 listed below), and it stops with an error, naming the code, when it meets something it cannot classify.
 
     python3 scripts/refactor/split_stage_machine.py --stage tests     # 1: the inline self-tests -> tests/stage_machine/
-    python3 scripts/refactor/split_stage_machine.py --stage package   # 2: the module -> the package agents/sm/ (+ shim)
+    python3 scripts/refactor/split_stage_machine.py --stage package   # 2: the module -> the package agents/stage_machine/ (+ CLI)
     python3 scripts/refactor/split_stage_machine.py --stage all       # both, in order
     python3 scripts/refactor/split_stage_machine.py --verify          # the package matches the module it came from
     python3 scripts/refactor/split_stage_machine.py --compare-cases BEFORE.txt AFTER.txt
@@ -27,22 +27,26 @@ rewritten so they still rebind the module, by assignment to it (`_SM`): `global 
 X becomes `_SM.X`), `globals()` (becomes `SM_GLOBALS`, a mapping that writes through to the module) and
 `sys.modules[Machine.__module__]` (becomes `_SM`); every other use of a name rebound this way also reads `_SM.X`.
 
-Stage `package`. The module becomes the package agents/sm/ (not agents/stage_machine/, which would shadow the
-file for every importer):
+Stage `package`. The module becomes the package agents/stage_machine/ (owner, 2026-11-22). A package shadows a
+module of the same name for every importer, so `from agents.stage_machine import X`, `from agents import
+stage_machine` and `import stage_machine` (agents/ on sys.path) all get the package:
+  __init__.py      the import surface: re-exports every name the module had, keeps main() and the self-test
+                   stub, and forwards an assignment to itself (`stage_machine.v2_gate = ...`, as
+                   scripts/golden_traces.py and the self-tests do) to every package module that holds the same
+                   object (namespace.py), as one module did
   common.py        paths, file names, caps, RunState and persistence (TABLE)
   edges.py         STATES, EDGES, LLM_STATES, POST_CHOICE_STATES, rethink_target, route_gate (TABLE)
-  signoff.py, findings.py, owner.py, report.py, failures.py, run.py   shared helpers (TABLE)
+  amend.py, signoff.py, findings.py, owner.py, report.py, failures.py, run.py   shared helpers (TABLE)
   machine.py       the Machine class: its loop, budget, journal and every method two states share
   states/<s>.py    one per `h_<STATE>` handler, a class registered by name (`@handler("GATE")`), holding the
                    handler and the methods only it calls; Machine inherits every registered class, so
                    `getattr(self, "h_" + state)` in Machine.step finds them as before
 A module-level helper that TABLE does not name goes where its callers are, when they are all in one module
-(the call graph); one used by several modules, or by none, stops the script: add it to TABLE. agents/
-stage_machine.py stays as the CLI and import shim: it re-exports every name the module had, keeps main() and
-the self-test stub, and forwards an assignment to itself (`stage_machine.v2_gate = ...`, as
-scripts/golden_traces.py and the self-tests do) to every package module that holds the same object
-(sm/namespace.py), as one module did. The one rewritten line: `HERE` in common.py climbs one directory more,
-so it is agents/ as before.
+(the call graph); one used by several modules, or by none, stops the script: add it to TABLE. The file
+agents/stage_machine.py stays as the command line only (`python3 agents/stage_machine.py sign ...`, which
+cloud/worker_side.py and tools/run_console run): it puts agents/ on sys.path, imports main() from the package
+and keeps the module's `if __name__ == "__main__"` block. Rewritten lines: `HERE` in common.py climbs one
+directory more, so it is agents/ as before, and the path block of __init__.py does the same.
 """
 from __future__ import annotations
 
@@ -61,12 +65,12 @@ from dataclasses import dataclass, field
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODULE = "agents/stage_machine.py"
 TESTS_DIR = "tests/stage_machine"
-PKG = "sm"
+PKG = "stage_machine"
 PKG_DIR = "agents/" + PKG
 TARGET = "_stage_machine_under_test"      # sys.modules key the stub gives the module the moved tests run against
 TEST_PREFIX = "sm_selftest_"
 STAMP_TESTS = "# split_stage_machine: self-tests moved to tests/stage_machine/"
-STAMP_PKG = "# split_stage_machine: the code lives in the package agents/sm/"
+STAMP_PKG = "# split_stage_machine: the code lives in the package agents/stage_machine/"
 GENERATED = "Moved verbatim from agents/stage_machine.py by scripts/refactor/split_stage_machine.py."
 BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__spec__", "__loader__", "__package__",
                                  "__builtins__", "__annotations__", "__dict__", "__debug__"}
@@ -85,7 +89,11 @@ TABLE = {
                "AwaitingBudget", "DECISION_BEARING_KINDS", "MAX_SPEC_TRIES", "MAX_SCHEMA_REPAIRS",
                "MAX_SIGN_REPAIRS", "RunState", "_now", "load_state", "_withhold_report", "_quarantine_report",
                "_put", "save_state", "_write_json", "AWAITING_SPEC_AMENDMENT", "SPEC_RETHINK_REQUEST",
-               "ACCEPTED_STATUSES", "DECLARED_FILE", "PARENT_ENV", "_remedy", "short_label"],
+               "ACCEPTED_STATUSES", "DECLARED_FILE", "PARENT_ENV", "_remedy", "short_label", "_state_bytes",
+               "_sha256"],
+    "amend": ["AMENDED_PROVISIONAL", "AMENDMENT_RECORD", "AMEND_LOCK", "AmendmentLocked", "_LOCK_HELD", "_amend_lock",
+              "_child_of", "_parent_of", "_own_spec_digest", "_made_by", "handoff_child", "_state_or_none",
+              "handoff_chain", "iter_handoff_chain", "_kept_child"],
     "edges": ["STATES", "EDGES", "LLM_STATES", "POST_CHOICE_STATES", "rethink_target", "route_gate"],
     "signoff": ["signed_hash", "_signoff", "sign", "spec_signoff_findings", "_spec_signed_sha", "spec_signed_once",
                 "evidence_gate"],
@@ -97,10 +105,11 @@ TABLE = {
                  "_infra_batch", "resumable_failure", "_with_abs_paths", "_pre_engine_check"],
     "run": ["init_run", "run_v2", "_record_invocation", "_runtime_ids", "_parent_record"],
 }
-SHARED_ORDER = ("common", "edges", "signoff", "findings", "owner", "report", "failures")
+SHARED_ORDER = ("common", "edges", "amend", "signoff", "findings", "owner", "report", "failures")
 DOCS = {
     "common": "Paths, run-file names, caps, the run state and its persistence.",
     "edges": "The state table: STATES, EDGES and the gate's routing (route_gate).",
+    "amend": "Lead amendments of a signed spec: the amendment lock and the parent/child hand-off chain of runs.",
     "signoff": "The decision spec's sign-off: the signed hash, the record, sign() and the evidence preconditions.",
     "findings": "Harness findings on the deliverable and the report (owned paths, claims, acceptance language).",
     "owner": "Owner requests: amendments put to the owner, and the answers counted.",
@@ -985,15 +994,16 @@ def stage_package(repo: str, table: dict = TABLE, log=print) -> bool:
     deps["states"] = {"states." + _state_mod(s) for s in state_order}
     _check_acyclic({k: {d for d in v if d != k} for k, v in deps.items()}, "package modules")
     files[f"{PKG_DIR}/states/__init__.py"] = _states_init(state_order)
-    files[f"{PKG_DIR}/__init__.py"] = (
-        '"""The v2 stage machine as a package; agents/stage_machine.py is its CLI and import shim.\n\n'
-        'Made by scripts/refactor/split_stage_machine.py from agents/stage_machine.py. `common` comes first: it puts\n'
-        'the repository, scripts/ and agents/ on sys.path, as the module did, before any module imports\n'
-        'analysis_backend, findings_ledger or fix_loop.\n"""\nfrom . import common  # noqa: F401\n')
+    children = {m.split(".", 1)[0] for m in mods} | {"states", "namespace"}
+    clash = sorted(children & {n for u in units for n in u.names})
+    if clash:
+        raise SplitError(f"the module defines {clash}, which the package's submodules would shadow on import: "
+                         f"rename the module or the name first")
+    files[f"{PKG_DIR}/__init__.py"] = _init(units, lines, assign, mods)
     files[f"{PKG_DIR}/namespace.py"] = NAMESPACE_PY
-    files[MODULE] = _shim(src, units, lines, assign, mods)
+    files[MODULE] = _cli(units, lines)
     _write_tree(repo, files)
-    log(f"package: {len(files)} files under {PKG_DIR}/ and the shim; {len(state_order)} state modules; "
+    log(f"package: {len(files) - 1} files under {PKG_DIR}/ and the CLI; {len(state_order)} state modules; "
         f"{sum(1 for n in meths if mplace[n] == 'machine')} methods stay in Machine")
     return True
 
@@ -1001,7 +1011,7 @@ def stage_package(repo: str, table: dict = TABLE, log=print) -> bool:
 def _states_init(state_order) -> str:
     mods = ", ".join(_state_mod(s) for s in state_order)
     return ('"""The state handlers of the v2 stage machine, one module per state, each a class registered by name\n'
-            '(`@handler("GATE")`). Machine (sm/machine.py) inherits every registered class, in this import order,\n'
+            '(`@handler("GATE")`). Machine (machine.py) inherits every registered class, in this import order,\n'
             'so `getattr(self, "h_" + state)` in Machine.step finds each handler as before the split.\n"""\n'
             "from __future__ import annotations\n\nHANDLERS: dict = {}\n\n\n"
             "def handler(state: str):\n"
@@ -1015,12 +1025,12 @@ def _states_init(state_order) -> str:
             + wrap_import("from . import ", [_state_mod(s) for s in state_order], noqa="  # noqa: E402,F401"))
 
 
-NAMESPACE_PY = '''"""One namespace for the shim and the package (no behaviour change from the split).
+NAMESPACE_PY = '''"""One namespace for the package (no behaviour change from the split).
 
 Before the split every name of the stage machine lived in one module, so a caller that rebinds one
 (`stage_machine.v2_gate = ...` in scripts/golden_traces.py; the self-tests' patches) changed what every
-function there calls. Now a name is bound in each package module that imports it. share() makes the shim
-forward an assignment to itself to every module of this package that holds the same object, as one module did.
+function there calls. Now a name is bound in each package module that imports it. share() makes the package
+(__init__.py) forward an assignment to itself to every submodule that holds the same object, as one module did.
 
 Made by scripts/refactor/split_stage_machine.py.
 """
@@ -1037,46 +1047,81 @@ class _Shared(types.ModuleType):
     def __setattr__(self, name, value):
         old = self.__dict__.get(name, _MISSING)
         super().__setattr__(name, value)
-        if old is _MISSING:
+        if old is _MISSING or old is value:
             return
         for mname, mod in list(sys.modules.items()):
-            if mod is not None and (mname == _PKG or mname.startswith(_PKG + ".")) \\
+            if mod is not None and mod is not self and mname.startswith(_PKG + ".") \\
                     and mod.__dict__.get(name, _MISSING) is old:
                 setattr(mod, name, value)
 
 
 def share(module) -> None:
-    """Make assignments to `module` (agents/stage_machine.py) reach the package."""
+    """Make assignments to `module` (the package, agents/stage_machine/__init__.py) reach its submodules."""
     module.__class__ = _Shared
 '''
 
 
-def _shim(src, units, lines, assign, mods) -> str:
+def _init(units, lines, assign, mods) -> str:
+    """agents/stage_machine/__init__.py, the import surface: the module's docstring (main() reads __doc__ for
+    --help), its imports, its path block (private names, one directory up: HERE and REPO themselves come from
+    common, the one object a patch of them reaches), every name re-exported from where it now lives, the namespace
+    forwarding, then the units that stay here (_self_test, main) verbatim."""
     doc = next(u for u in units if u.kind == "doc")
-    out = [doc.text(lines).replace(STAMP_TESTS + "\n", ""), STAMP_PKG + "\n"]
+    path_u = _first_path_unit(units)
+    text = doc.text(lines).replace(STAMP_TESTS + "\n", "")
+    if text.startswith("#!"):
+        text = text.split("\n", 1)[1]
+    out = [text, STAMP_PKG + "\n"]
     out.append("".join(u.text(lines) for u in units if u.kind == "future"))
-    out.append("".join(u.text(lines) for u in units if u.kind == "import" and u.lead < _first_path_unit(units).lead))
-    out.append("\n_HERE = os.path.dirname(os.path.abspath(__file__))\n_REPO = os.path.dirname(_HERE)\n"
-               'for _p in (_REPO, os.path.join(_REPO, "scripts"), _HERE):     # the module\'s own order, before sm\n'
+    out.append("".join(u.text(lines) for u in units if u.kind == "import" and u.lead < path_u.lead))
+    out.append("\n_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # agents/, as before\n"
+               "_REPO = os.path.dirname(_HERE)\n"
+               'for _p in (_REPO, os.path.join(_REPO, "scripts"), _HERE):     # the module\'s own order\n'
                "    if _p not in sys.path:\n        sys.path.insert(0, _p)\n\n")
     out.append("".join(render_import(u.node, set(u.names)).rstrip("\n") + "  # noqa: E402,F401\n"
-                       for u in units if u.kind == "import" and u.lead > _first_path_unit(units).lead))
+                       for u in units if u.kind == "import" and u.lead > path_u.lead))
     by_mod = {}
     for n, m in assign.items():
         if m != "shim" and n != "_p":
             by_mod.setdefault(m, set()).add(n)
     for m in mods:
         if m in by_mod:
-            out.append(wrap_import(f"from {PKG}.{m} import ", sorted(by_mod[m]), noqa="  # noqa: E402,F401"))
-    out.append(f"from {PKG} import namespace as _namespace  # noqa: E402\n\n"
+            out.append(wrap_import(f"from .{m} import ", sorted(by_mod[m]), noqa="  # noqa: E402,F401"))
+    out.append("from . import namespace as _namespace  # noqa: E402\n\n"
                "_namespace.share(sys.modules[__name__])     # an assignment to this module reaches the package\n")
     for u in units:
-        if u.kind in ("doc", "future", "import"):
+        if u.kind in ("doc", "future", "import") or _is_main_guard(u.node):
             continue
-        if (u.names and assign.get(u.names[0]) == "shim") or (not u.names and _is_main_guard(u.node)):
+        if u.names and assign.get(u.names[0]) == "shim":
             out.append(u.text(lines))
-    out.append("".join(lines[units[-1].last:]))
-    return "".join(out)
+    return "".join(out).rstrip("\n") + "\n"
+
+
+CLI_DOC = '''"""The command line of the v2 stage machine. The code is the package agents/stage_machine/ (split by
+scripts/refactor/split_stage_machine.py); this file is never imported, since the package shadows it.
+
+    python3 agents/stage_machine.py status <run_dir>
+    python3 agents/stage_machine.py sign <run_dir> --by owner [--note "..."]      # the owner signs the spec
+    python3 agents/stage_machine.py --self-test
+"""
+'''
+
+
+def _cli(units, lines) -> str:
+    """agents/stage_machine.py: the module's path block verbatim, at the point the module ran it (so sys.path is
+    what it was when the module ran as a script, and `stage_machine` is the package), main() from the package,
+    and the module's own `if __name__ == "__main__"` block."""
+    guard = [u for u in units if _is_main_guard(u.node)]
+    if len(guard) != 1:
+        raise SplitError('the module has no single `if __name__ == "__main__"` block')
+    first = _first_path_unit(units)
+    loop = next(u for u in units if u.names == ["_p"] and _is_path_loop(u.node))
+    head = lines[0] if lines[0].startswith("#!") else ""
+    std = [u for u in units if u.kind == "import" and u.lead < first.lead and set(u.names) & {"os", "sys"}]
+    return (head + CLI_DOC + STAMP_PKG + "\n" + "".join(render_import(u.node, {"os", "sys"}) for u in std) + "\n"
+            + "".join(lines[first.first - 1:loop.last])
+            + "\nfrom stage_machine import main  # noqa: E402  (agents/stage_machine/, the package)\n"
+            + guard[0].text(lines))
 
 
 def _first_path_unit(units):
@@ -1108,15 +1153,16 @@ def verify_package(repo: str, original_src: str, table: dict = TABLE) -> list:
                     for m in st.body:
                         if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
                             meth_new.setdefault(m.name, []).append(ast.dump(m))
-    shim = ast.parse(open(os.path.join(repo, MODULE), encoding="utf-8").read())
-    for st in shim.body:
-        for n in bound_names(st):
-            if isinstance(st, (ast.FunctionDef, ast.If, ast.AsyncFunctionDef)):
-                new.setdefault(n, []).append(ast.dump(st))
+    cli = ast.parse(open(os.path.join(repo, MODULE), encoding="utf-8").read())
+    guards = [ast.dump(u.node) for u in units if _is_main_guard(u.node)]
+    if [ast.dump(st) for st in cli.body if _is_main_guard(st)] != guards:
+        probs.append(f"{MODULE}: not the module's own `if __name__ == \"__main__\"` block")
+    if any(isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for st in cli.body):
+        probs.append(f"{MODULE}: defines code; the command line only imports main() from the package")
     for n, d in orig.items():
         got = new.get(n, [])
         if n == "HERE":
-            if len(got) != 1:
+            if len([x for x in got if not x.startswith(("ImportFrom(", "Import("))]) != 1:
                 probs.append("HERE is not defined once in the package")
             continue
         if assign.get(n) == "shim":
@@ -1130,6 +1176,46 @@ def verify_package(repo: str, original_src: str, table: dict = TABLE) -> list:
     for n, st in meths.items():
         if meth_new.get(n, []).count(ast.dump(st)) != 1:
             probs.append(f"Machine.{n}: not moved verbatim")
+    probs += _extra_code(repo, units, meths, mu)
+    return probs
+
+
+def _extra_code(repo: str, units, meths, mu) -> list:
+    """The other direction: every statement in the package is an original one, an import, or one of the few the
+    split writes (the handler wrappers and registry, the namespace module, the path block of __init__.py, the
+    rewritten HERE line, the namespace call)."""
+    probs = []
+    orig = {ast.dump(u.node) for u in units if u.kind not in ("doc", "future", "import")}
+    orig_meths = {ast.dump(st) for st in meths.values()}
+    cls_doc = [ast.dump(st) for st in mu.node.body if isinstance(st, ast.Expr)]
+    written = {ast.dump(st) for st in ast.parse(HERE_PKG + "\n").body}
+    written |= {ast.dump(st) for st in ast.parse(
+        '_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n_REPO = os.path.dirname(_HERE)\n'
+        'for _p in (_REPO, os.path.join(_REPO, "scripts"), _HERE):\n    if _p not in sys.path:\n'
+        '        sys.path.insert(0, _p)\n_namespace.share(sys.modules[__name__])\n').body}
+    states = [n[2:] for n in meths if n.startswith("h_")]
+    fixed = {f"{PKG_DIR}/namespace.py": NAMESPACE_PY, f"{PKG_DIR}/states/__init__.py": _states_init(states)}
+    for rel, text in fixed.items():
+        if open(os.path.join(repo, rel), encoding="utf-8").read() != text:
+            probs.append(f"{rel}: not the text the script writes")
+    for root, _d, fs in os.walk(os.path.join(repo, PKG_DIR)):
+        for f in sorted(fs):
+            rel = os.path.relpath(os.path.join(root, f), repo).replace(os.sep, "/")
+            if not f.endswith(".py") or rel in fixed:
+                continue
+            t = ast.parse(open(os.path.join(root, f), encoding="utf-8").read())
+            for i, st in enumerate(t.body):
+                if isinstance(st, (ast.Import, ast.ImportFrom)) or (i == 0 and isinstance(st, ast.Expr)):
+                    continue
+                if isinstance(st, ast.ClassDef) and (st.name == "Machine" or (
+                        len(st.decorator_list) == 1 and ast.unparse(st.decorator_list[0]).startswith("handler("))):
+                    for m in st.body:
+                        if ast.dump(m) not in orig_meths and not (st.name == "Machine" and ast.dump(m) in cls_doc):
+                            probs.append(f"{rel}: {st.name} holds code that is not an original method "
+                                         f"(line {m.lineno})")
+                    continue
+                if ast.dump(st) not in orig and ast.dump(st) not in written:
+                    probs.append(f"{rel}: line {st.lineno} is not an original statement")
     return probs
 
 
@@ -1266,7 +1352,7 @@ class Machine:
         return self._go(route_gate(shared(True)))
 
 
-def run(st=None):
+def run_toy(st=None):
     m = Machine(st)
     while m.st.state != "FINAL":
         m.step()
@@ -1284,14 +1370,14 @@ def _self_test() -> int:
         print(("PASS " if c else "FAIL ") + m)
         if not c:
             fails.append(m)
-    ok(run().state == "FINAL", "X1 the toy run ends FINAL")
+    ok(run_toy().state == "FINAL", "X1 the toy run ends FINAL")
     ok(_t_toy() == 7, "X2 a helper moves with the tests")
     g_ = globals()
     orig = g_["route_gate"]
     seen = []
     g_["route_gate"] = lambda x: seen.append(x) or "FINAL"
     try:
-        ok(run().log[-1][1] == "FINAL" and seen == [True], "X3 a patch through globals() reaches the handler")
+        ok(run_toy().log[-1][1] == "FINAL" and seen == [True], "X3 a patch through globals() reaches the handler")
     finally:
         g_["route_gate"] = orig
     _self_test_more(ok)
@@ -1332,7 +1418,7 @@ if __name__ == "__main__":
 '''
 
 TOY_TABLE = {"common": ["HERE", "REPO", "_p", "STATE_FILE", "RunState", "_now", "shared"],
-             "edges": ["STATES", "EDGES", "route_gate"], "run": ["run"]}
+             "edges": ["STATES", "EDGES", "route_gate"], "run": ["run_toy"]}
 
 
 def _self_test() -> int:
@@ -1392,20 +1478,32 @@ def _self_test() -> int:
            + ("" if rc2 == 0 else after2[-600:]))
         pk = sorted(os.path.relpath(os.path.join(r, f), d) for r, _x, fs in os.walk(os.path.join(d, PKG_DIR))
                     for f in fs if f.endswith(".py"))
-        ok(pk == ["agents/sm/__init__.py", "agents/sm/common.py", "agents/sm/edges.py", "agents/sm/machine.py",
-                  "agents/sm/namespace.py", "agents/sm/run.py", "agents/sm/states/__init__.py",
-                  "agents/sm/states/a.py", "agents/sm/states/b.py"], f"S11 the package layout: {pk}")
+        ok(pk == [f"{PKG_DIR}/{f}" for f in ("__init__.py", "common.py", "edges.py", "machine.py", "namespace.py",
+                                             "run.py", "states/__init__.py", "states/a.py", "states/b.py")]
+           and PKG_DIR == "agents/stage_machine", f"S11 the package layout: {pk}")
         sa = open(os.path.join(d, PKG_DIR, "states", "a.py")).read()
         ok('@handler("A")' in sa and "def _a_ok" in sa and "def a_helper" in sa,
            "S12 a state module holds its handler, the method only it calls and the helper only it uses")
         subprocess.run(["git", "-C", d, "add", "-A"], check=True)
         probs = verify_package(d, mod_src, TOY_TABLE)
         ok(probs == [], f"S13 verify: every definition moved verbatim {probs}")
-        probs = check_imports(d, py, ["Machine", "run", "route_gate", "RunState", "a_helper", "_t_toy"][:5])
+        probs = check_imports(d, py, ["Machine", "run_toy", "route_gate", "RunState", "a_helper", "_t_toy"][:5])
         ok(probs == [], f"S14 both import paths resolve every name {probs}")
         r = subprocess.run([py, MODULE], cwd=d, capture_output=True, text=True)
         ok(r.returncode == 0 and '"A"' in r.stdout, f"S15 the CLI still runs ({r.returncode})")
+        r = subprocess.run([py, "-c", "import sys; sys.path.insert(0, 'agents'); import stage_machine as m, "
+                            "stage_machine.edges as e; f = m.route_gate; m.route_gate = f; m.route_gate = 1; "
+                            "print(e.route_gate == 1); m.route_gate = f; print(e.route_gate is f)"],
+                           cwd=d, capture_output=True, text=True)
+        ok(r.stdout.split() == ["True", "True"], "S22 rebinding a name to the object it holds is a no-op, and a "
+                                                 f"patch and its undo reach the submodule ({r.stderr[-200:]})")
         ok(not stage_package(d, table=TOY_TABLE, log=quiet), "S16 stage package is idempotent")
+        pa = os.path.join(d, PKG_DIR, "states", "a.py")
+        open(pa, "w").write(sa.replace("== 3", "== 4") + "\nX_NEW = 1\n")
+        probs = verify_package(d, mod_src, TOY_TABLE)
+        ok(any("_a_ok" in p for p in probs) and any("not an original statement" in p for p in probs),
+           f"S21 verify catches an edited method and an added statement: {probs}")
+        open(pa, "w").write(sa)
         # fail loudly
         d3 = toy_repo("c", TOY.replace("def shared(v):", "def orphan():\n    return 1\n\n\ndef shared(v):"))
         stage_tests(d3, log=quiet)

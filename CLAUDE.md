@@ -27,10 +27,10 @@ its code removed:
   retired (owner, 2026-11-20); use v2".
 - **v2 (default since 2026-11-05, `python3 main.py "<question>"`; `--v2`
   is accepted as a no-op alias)**: code owns the flow.
-  `agents/stage_machine.py` steps through the states SPEC → SIGN →
+  The package `agents/stage_machine/` steps through the states SPEC → SIGN →
   EVIDENCE → ENGINE_CHOICE → CONFIGURE → ANALYZE → CRITIQUE → GATE →
   FIX_LOOP / OWNER_DECISION → WRITE → PRESENTATION → FINAL (the full
-  transition table is `EDGES` in that file) and persists them in
+  transition table is `EDGES` in its `edges.py`) and persists them in
   `run_state.json`. LLMs do bounded tasks (`agents/v2_tasks.py`,
   `agents/v2_sdk_tasks.py`): draft the decision spec, pick an engine,
   critique, plan and make fixes, write. Every number comes from harness
@@ -57,7 +57,7 @@ prompt (`agents/v2_sdk_tasks.py` `PRINCIPLES_FILE`, and the fix planner's prompt
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │  ORCHESTRATION  main.py + agents/                              │
-│  v2: stage machine (agents/stage_machine.py), findings ledger, │
+│  v2: stage machine (agents/stage_machine/), findings ledger,   │
 │  fix loop, bounded SDK tasks (agents/v2_sdk_tasks.py); shared: │
 │  tool/path enforcement (agents/enforcement.py), integrity,     │
 │  run budget, run finish (gate command, run upload), preflight. │
@@ -123,7 +123,7 @@ prompt (`agents/v2_sdk_tasks.py` `PRINCIPLES_FILE`, and the fix planner's prompt
 | Add a new skill                       | Create `.claude/skills/<name>/SKILL.md` with `name`/`description` frontmatter (a v2 task loads it by its SKILL.md path), run `python3 scripts/validate_skill_attachments.py` |
 | Trace a phase change                  | `CHANGELOG.md` (phase commit ledger and gate internals); `changes/` for merged phases not yet folded in |
 | See what artifacts a run produces     | Any local `runs/<timestamp>_*/` directory. `runs/` is gitignored, so there is no checked-in example; run the pipeline or ask a maintainer for one. |
-| Understand the v2 run                 | `agents/stage_machine.py` (states, `EDGES`, `route_gate`), `agents/findings_ledger.py`, `agents/fix_loop.py`, `agents/analysis_backend.py`; design in `docs/design/v2c-orchestration.md` |
+| Understand the v2 run                 | the package `agents/stage_machine/` (`edges.py`: states, `EDGES`, `route_gate`; `machine.py`: the loop; one handler module per state in `states/`; `agents/stage_machine.py` is its command line), `agents/findings_ledger.py`, `agents/fix_loop.py`, `agents/analysis_backend.py`; design in `docs/design/v2c-orchestration.md` |
 | Change a v2 engine or the analysis    | `toolkit/engines/contract.py` (the Engine contract) and each engine's `card.yaml`; `toolkit/analysis/run.py`; `toolkit/spec/schema.py` |
 | Run on the cloud                      | `cloud/run_cluster.py` docstring (launch, status, collect, shutdown) and a config in `cloud/configs/`; `cloud-compute` skill |
 | Reuse a finished run's model          | `<run>/model_card.md` (written at finalize by `scripts/model_card.py`), then `python3 scripts/ask.py <run> --set <input>=<value>` (refuses anything outside the card's valid domain) |
