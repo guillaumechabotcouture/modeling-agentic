@@ -452,20 +452,22 @@ def render_text(text: str, claims: dict[str, dict]) -> tuple[str, list[str]]:
 
 # One or two backticks, closed by the same run (CommonMark), on one line.
 _INLINE_CODE_RE = re.compile(r"(?<!`)(`{1,2})(?!`)([^\n]+?)(?<!`)\1(?!`)")
-_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# A fence line, also inside block quotes or list items (any run of '>' and blanks before it).
+_FENCE_LINE_RE = re.compile(r"^[ \t>]*(`{3,}|~{3,})")
 _QUOTED_REF_RE = re.compile(r"\[CLAIM:([^\]\[\n]*)\]")    # one line, no bracket inside: never a link's bracket
 
 
 def _code_block_lines(text: str) -> list[tuple[int, int]]:
-    """Spans of fenced blocks (a fence indented up to three spaces, closed by the same character) and of lines
-    indented four spaces or a tab (an indented code block, or a nested list line: not normalised either way)."""
+    """Spans of fenced blocks (a fence after any indentation or block-quote markers, closed only by a fence of the
+    same character at least as long) and of lines indented four spaces or a tab (an indented code block, or a
+    nested list line: not normalised either way)."""
     spans, pos, fence = [], 0, None
     for line in text.splitlines(keepends=True):
         m = _FENCE_LINE_RE.match(line)
         if fence is None and m:
-            fence = (pos, m.group(1)[0])
+            fence = (pos, m.group(1)[0], len(m.group(1)))
         elif fence is not None:
-            if m and m.group(1)[0] == fence[1]:
+            if m and m.group(1)[0] == fence[1] and len(m.group(1)) >= fence[2] and not line[m.end():].strip():
                 spans.append((fence[0], pos + len(line)))
                 fence = None
         elif line.startswith(("    ", "\t")):
@@ -497,24 +499,32 @@ def normalise_refs(text: str, claims: dict[str, dict]) -> str:
 def quote_refs(text: str, claims: dict[str, dict], render: bool = True) -> str:
     """Text the harness quotes from a finding (its claim or remedy) holds no claim reference outside the ledger:
     hb2 (measles R1, dengue R2) quoted a critic's [CLAIM:x] and placeholder [CLAIM:id] into report.md, and the
-    writer repeated the placeholder from declared_findings.yaml. A known id alone in inline code is first read as
-    its reference (normalise_refs). A reference outside the ledger becomes the words `claim x`; a ledger one is
-    rendered as its value (`render`, for report.md) or kept as a reference the writer may use (for the writer's
-    inputs). Any other `[CLAIM:` (unclosed, across lines) loses its bracket. Code spans are no exception: what the
-    harness quotes is never syntax."""
+    writer repeated the placeholder from declared_findings.yaml. A reference outside the ledger becomes the words
+    `claim x`; a ledger one is rendered as its value (`render`, for report.md) or kept as a reference the writer may
+    use (for the writer's inputs). Substitution repeats until nothing changes (a nested marker), then any other
+    `[CLAIM:` (unclosed, across lines, rebuilt) loses its bracket. Code spans are no exception: what the harness
+    quotes is never syntax. Nothing else is rewritten: a bare id stays as recorded."""
+    kept: list[str] = []
+
     def _sub(m: re.Match) -> str:
         cid = m.group(1).strip()
         c = claims.get(cid) if _CLAIM_ID_RE.fullmatch(cid or "") else None
         if c is None:
             return f"claim {cid or '(no id)'}"
         if not render:
-            return f"[CLAIM:{cid}]"
+            kept.append(cid)
+            return f"\x00{len(kept) - 1}\x01"
         try:
             return render_claim(c)
         except Exception:  # noqa: BLE001 -- a claim that cannot render is named, never left as a reference
             return f"claim {cid}"
-    done = _QUOTED_REF_RE.sub(_sub, normalise_refs(text, claims))
-    return re.sub(r"\[CLAIM:(?![^\]\[\n]*\])", "CLAIM:", done)     # what is left of a marker
+    out, prev = text.replace("\x00", "").replace("\x01", ""), None
+    for _ in range(8):                 # bounded: a label value could itself hold a marker
+        if out == prev:
+            break
+        prev, out = out, _QUOTED_REF_RE.sub(_sub, out)
+    out = out.replace("[CLAIM:", "CLAIM:")
+    return re.sub("\x00(\\d+)\x01", lambda m: f"[CLAIM:{kept[int(m.group(1))]}]", out)
 
 
 def _builder():
