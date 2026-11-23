@@ -1166,11 +1166,85 @@ def _self_test() -> int:
            "K-DTP4 a spec with no manifest (withdrawn by a rerun after the contract checks read it): a non-declarable HIGH")
         os.remove(os.path.join(d, SPEC))
         ok(decision_test_findings(d) == [], "K-DTP4b no spec and no manifest: nothing to read")
+    _self_test_stability(ok, complete_run)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
     print("OK: all self-test cases passed.")
     return 0
+
+
+def _self_test_stability(ok, complete_run) -> None:
+    """K-ST1-K-ST9 (check-value item 5): analysis/stability.yaml read by a harness finding."""
+    import tempfile
+    fold = lambda g, n, ch, share: {"group": g, "n_units": n, "units_changed": ch,  # noqa: E731
+                                    "share_units_changed": share, "units_changed_ids": [f"{g}u{i}" for i in range(ch)]}
+    unstable = {"method": "leave-one-grp-out", "holdout_group": "grp", "n_folds": 3,
+                "folds": [fold("g1", 4, 0, 0.0), fold("g2", 3, 2, 0.2), fold("g3", 3, 1, 0.1)], "folds_not_run": [],
+                "metrics": {}, "verdict": "UNSTABLE", "value_verdict": "ROBUST"}
+    skipped = {"method": "skipped", "reason": "no analysis.stability.holdout_group in the spec", "folds": [],
+               "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"}
+
+    def run_with(d, stab, kind=None):
+        open(os.path.join(d, SPEC), "w").write("x: 1\n")
+        os.makedirs(os.path.join(d, "analysis"), exist_ok=True)
+        S = complete_run(d, finalize=False)
+        S.write("stability", stab, "toolkit/analysis/stability.py", [])
+        if kind:
+            S.manifest["deliverable_kind"] = kind
+        S.finalize("complete")
+
+    def got(d):
+        try:
+            return [(x["kind"], x["severity"], x.get("scope_declarable"), x.get("key")) for x in stability_findings(d)], \
+                stability_findings(d)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            return [("crash", type(e).__name__, str(e)[:80], None)], []
+    with tempfile.TemporaryDirectory() as d:
+        run_with(d, unstable)
+        g, fs = got(d)
+        cl = fs[0]["claim"] if fs else ""
+        ok(g == [("allocation_unstable", "HIGH", True, "stability")] and fs[0].get("decision_bearing") is True
+           and fs[0].get("source") == "toolkit/analysis/contract.py" and "g2" in cl and "g3" in cl and "g1" not in cl
+           and "2 of 3" in cl and "30%" in cl,
+           f"K-ST1 an UNSTABLE allocation is a declarable, decision-bearing HIGH naming the groups whose exclusion "
+           f"changes the plan and the share of units affected: {g} {cl}")
+        try:
+            rec = stability_record(d) or {}
+        except Exception as e:  # noqa: BLE001
+            rec = {"crash": str(e)}
+        ok(rec.get("path") == "analysis/stability.yaml"
+           and rec.get("result_sha256") == sha256(os.path.join(d, "analysis", "stability.yaml")),
+           f"K-ST2 the owner item's evidence is the verified record's path and hash: {rec}")
+        run_with(d, dict(unstable, verdict="ROBUST", value_verdict="UNSTABLE"))
+        ok(got(d)[0] == [("allocation_unstable", "HIGH", True, "stability")],
+           f"K-ST3 an UNSTABLE value verdict raises it too: {got(d)[0]}")
+        run_with(d, dict(unstable, verdict="ROBUST"))
+        ok(got(d)[0] == [], f"K-ST4 a ROBUST record raises nothing: {got(d)[0]}")
+        run_with(d, skipped)
+        g, fs = got(d)
+        ok(g == [("stability_not_run", "MEDIUM", True, "stability")] and fs[0].get("fix_task") is False
+           and "no analysis.stability.holdout_group in the spec" in fs[0]["claim"],
+           f"K-ST5 NOT_RUN on an allocation is a MEDIUM with the reason, never silent: {g}")
+        run_with(d, dict(skipped, method="leave-one-grp-out", reason=None,
+                         folds_not_run=[{"group": "g1", "status": "not_run", "reason": "too few units"}]))
+        g, fs = got(d)
+        ok(g and g[0][0] == "stability_not_run" and "too few units" in fs[0]["claim"],
+           f"K-ST5b no fold ran: each fold's reason is stated: {g}")
+        run_with(d, skipped, kind="estimates")
+        ok(got(d)[0] == [], f"K-ST6 an estimates run allocates nothing: no finding: {got(d)[0]}")
+        for bad in (dict(unstable, verdict="WOBBLY"), dict(unstable, folds="x"), dict(unstable, folds=[])):
+            run_with(d, bad)
+            g = got(d)[0]
+            ok(g and g[0][:3] == ("analysis_contract_stability", "HIGH", False),
+               f"K-ST7 an unknown or malformed record is a non-declarable HIGH (fail closed): {g}")
+        run_with(d, unstable)
+        open(os.path.join(d, "analysis", "stability.yaml"), "a").write("# edited\n")
+        g = got(d)[0]
+        ok(g and g[0][:3] == ("analysis_contract_stability", "HIGH", False),
+           f"K-ST8 a record changed after the harness wrote it is not read: a non-declarable HIGH: {g}")
+        os.remove(os.path.join(d, MANIFEST))
+        ok(got(d)[0] == [], f"K-ST9 no completed manifest: the contract checks report it, not this: {got(d)[0]}")
 
 
 if __name__ == "__main__":

@@ -5520,7 +5520,11 @@ def _self_test() -> int:
             prov36 = sorted({r["finding"] for r in _SS36.provisional(d) if r.get("plan_changing")})
             rep36 = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
             sp36 = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep36 else [0, 0]
-            exp36 = "completed"
+            # check-value item 5: an unstable (or not run) allocation stability is declared, never accepted; read from
+            # the artifact itself
+            _st36 = (yaml.safe_load(open(os.path.join(d, "analysis", "stability.yaml"))) or {}).get("data") or {}
+            _v36 = {_st36.get("verdict"), _st36.get("value_verdict")}
+            exp36 = "completed_scope_declared" if _v36 & {"UNSTABLE", "NOT_RUN"} else "completed"
             ok(want and s == exp36 and "The plan depends on inputs the lead accepted provisionally" in rep36[:sp36[0]] and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
                and FL.load(d)["D-001"].status == "fixed" and prov36 == want
                and not any(h.get("paused") for h in load_state(d).history)
@@ -5949,6 +5953,12 @@ def _self_test() -> int:
 
         _self_test_auto1a(ok, td, spike, new_run)
         _self_test_writeup_rounds(ok, td, spike, new_run)
+        try:
+            _self_test_stability_owner(ok, td)
+        except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
+            import traceback
+            traceback.print_exc()
+            ok(False, f"SO-ST1-SO-ST6 an unstable allocation declared by its owner: {type(e).__name__}: {e}")
         _self_test_claim_refs(ok, td, spike, new_run)
         try:
             _self_test_hb2_spec(ok, td, spike, new_run)
@@ -6639,6 +6649,67 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
                      ("CX1-5", r1_open), ("CX1-7", r1_rethink), ("CX1-2", r1_claims), ("CX2-1", r2_machine),
                      ("CX2-4", r2_findings), ("CX3-1", r3_presentation)):
         case(name, fn)
+
+
+def _self_test_stability_owner(ok, td: str) -> None:
+    """SO-ST1-SO-ST6 (check-value item 5): the toolkit's unstable allocation goes to its owner at the first gate (rule
+    2o, as a plan-changing test does); an accept declares it (never ACCEPT), and the report states it at its top."""
+    d = os.path.join(td, "stab_owner")
+    os.makedirs(d)
+    us = {"kind": "allocation_unstable", "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE",
+          "key": "stability", "claim": "Leave-one-grp-out allocation stability is UNSTABLE: groups g2, g3",
+          "scope_declarable": True, "decision_bearing": True, "source": "toolkit/analysis/contract.py"}
+    seen, answers = {}, {}
+
+    class Rule:
+        @staticmethod
+        def verified_answers(rd):
+            return dict(answers), []
+
+        @staticmethod
+        def gate_findings(rd, rn, viols, **k):
+            seen["passed"] = [v.get("kind") for v in viols]
+            return []
+    vs = [dict(us)]
+    apply_owner_rule(d, 1, vs, rule=Rule)
+    it = vs[0].get("owner_item") or {}
+    ok(vs[0].get("owner_resolution") is True and vs[0].get("owner_disposition") == "declare"
+       and vs[0].get("owner_signoff") is True and "out of sample" in str(it.get("reason"))
+       and it.get("finding") == "allocation_unstable:stability" and seen.get("passed") == [],
+       f"SO-ST1 an unanswered unstable allocation is marked for its owner at the first gate, declared once accepted, "
+       f"and not also put through the policy map ({it}, {seen})")
+    answers[it.get("fingerprint")] = {"finding": it.get("finding"), "decision": "accept", "by": "owner", "at": "t"}
+    vs = [dict(us)]
+    apply_owner_rule(d, 1, vs, rule=Rule)
+    ok(isinstance(vs[0].get("owner_signed"), dict) and not vs[0].get("owner_signoff")
+       and vs[0].get("owner_disposition") == "declare",
+       f"SO-ST2 the owner's accept is recorded on the finding: {vs[0].get('owner_signed')}")
+    nr = {"kind": "stability_not_run", "severity": "MEDIUM", "stage": "ANALYZE", "key": "stability", "claim": "not run",
+          "scope_declarable": True, "fix_task": False}
+    dec = {"action": "ACCEPT", "rigor_violations": [vs[0], nr]}
+    op = {o["id"]: o for o in open_findings(d, dec)}
+    ok(set(op) == {"allocation_unstable:stability", "stability_not_run:stability"}
+       and not any(o["tested"] for o in op.values()),
+       f"SO-ST3 the accepted unstable allocation and a stability not run are listed open, with no test a fix task "
+       f"can work to: {op}")
+    m1 = apply_medium_rule({"action": "DECLARE_SCOPE", "rule_matched": "4d"}, list(op.values()), 2, True)
+    m2 = apply_medium_rule({"action": "DECLARE_SCOPE", "rule_matched": "4d"},
+                           list(op.values()) + [{"id": "R-9", "tested": True, "severity": "MEDIUM", "claim": "c",
+                                                 "source": "critique-redteam"}], 2, True)
+    ok(m1["action"] == "DECLARE_SCOPE" and m1["rule_matched"] == "3m"
+       and "allocation_unstable:stability" in m1["declared_open"] and m2["rule_matched"] == "4m",
+       f"SO-ST4 the declared item is written up (rule 3m); a finding with a test still goes to the fix loop first "
+       f"({m1['rule_matched']}, {m2['rule_matched']})")
+    FL.save(d, {"allocation_unstable:stability": FL.Finding(
+        id="allocation_unstable:stability", kind="allocation_unstable", severity="HIGH", source="rigor-artifacts",
+        key="stability", status="owner_accepted", claim=us["claim"],
+        events=[{"round": 1, "status": "owner_accepted", "by": "owner", "at": "t"}])})
+    txt = "".join(declared_dependence_lines(d))
+    ok("the owner accepted" in txt and "groups g2, g3" in txt and "declared limitation" in txt,
+       f"SO-ST5 the report states the accepted unstable allocation at its top: {txt!r}")
+    FL.sync(d, {"unresolved_high": [], "rigor_violations": []}, 2, post_write=True)
+    ok(FL.load(d)["allocation_unstable:stability"].status == "fixed" and declared_dependence_lines(d) == [],
+       "SO-ST6 an accepted unstable allocation a later gate no longer reports is closed and leaves the report")
 
 
 def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:

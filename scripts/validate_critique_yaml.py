@@ -4924,6 +4924,25 @@ def _run_self_test() -> int:
     _o7 = _incorporate_rigor_violations(_incorporate_rigor_violations(_e(), [dict(_acc)], 3, 1), [dict(_acc)], 3, 1)
     ok(_o7["action"] == "ACCEPT" and len(_o7.get("owner_accepted_high") or []) == 1,
        f"OR-V7 idempotent: folding the same accepted finding twice lists it once ({_o7.get('owner_accepted_high')})")
+    # OR-V8 (check-value item 5): an unstable allocation is asked at the first gate like a plan-changing test, but an
+    # accept declares it (owner_disposition: declare): it never yields ACCEPT
+    _us = {"kind": "allocation_unstable", "severity": "HIGH", "stage": "ANALYZE", "key": "stability",
+           "claim": "unstable", "scope_declarable": True, "owner_resolution": True, "owner_disposition": "declare"}
+    _usp = dict(_us, owner_signoff=True, owner_item={"finding": "allocation_unstable:stability", "fingerprint": "fp3"})
+    _usa = dict(_us, owner_signed={"by": "owner", "at": "t", "fingerprint": "fp3"})
+    _u1 = _incorporate_rigor_violations(_e(), [dict(_usp)], 3, 1)
+    _u2 = _incorporate_rigor_violations(_e(), [dict(_usa)], 3, 1)
+    _u2c = _incorporate_rigor_violations(_e(), [dict(_usa)], 3, 3)
+    _u3 = _incorporate_rigor_violations(_e(), [dict(_usa), dict(_other)], 3, 1)
+    _u4 = _incorporate_rigor_violations(_incorporate_rigor_violations(_e(), [dict(_usa)], 3, 1), [dict(_usa)], 3, 1)
+    ok(_u1["rule_matched"] == "2o" and _u2["action"] == "DECLARE_SCOPE" and _u2["rule_matched"] == "4d"
+       and _u2c["action"] == "DECLARE_SCOPE" and not _u2["unresolved_high"]
+       and [b.get("kind") for b in _u2.get("owner_declared_high") or []] == ["allocation_unstable"]
+       and not _u2.get("owner_accepted_high") and _u3["action"] == "PATCH_OR_RETHINK"
+       and len(_u4.get("owner_declared_high") or []) == 1 and _u4["action"] == "DECLARE_SCOPE",
+       f"OR-V8 an accepted owner-declared HIGH is declared, never accepted, at round 1 or at the cap; other HIGHs keep "
+       f"their rules; idempotent ({_u1['rule_matched']}, {_u2['action']}/{_u2['rule_matched']}, {_u2c['action']}, "
+       f"{_u3['action']}, {_u4.get('owner_declared_high')})")
     with tempfile.TemporaryDirectory() as d:
         yaml.safe_dump({"declarations": [{"id": "SD-7", "blocker_id": "allocation_unstable", "why_unresolved": "x"}]},
                        open(os.path.join(d, "scope_declaration.yaml"), "w"))

@@ -166,6 +166,14 @@ def _self_test() -> int:
             contract.decision_test_findings = _dtf
         ok(got[0] == "analysis_contract_missing" and got[-1] == "decision_test_changes_plan",
            f"AP9 gate_findings adds every plan-changing decision test after the contract checks: {got}")
+        _stf = getattr(contract, "stability_findings", None)
+        try:
+            contract.stability_findings = lambda rd: [{"kind": "allocation_unstable", "key": "stability"}]
+            got = [f["kind"] for f in gate_findings(d)]
+        finally:
+            contract.stability_findings = _stf
+        ok("allocation_unstable" in got and _stf is not None,
+           f"AP11 gate_findings adds the allocation-stability findings (check-value item 5): {got}")
         got = [f["kind"] for f in gate_findings(d)]
         ok(got.count("analysis_contract_missing") == 1 and "analysis_contract_decision_test" not in got,
            f"AP10 before the analysis ran the missing manifest is reported once, by the contract checks: {got}")
