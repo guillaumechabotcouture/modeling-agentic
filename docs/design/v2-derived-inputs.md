@@ -311,10 +311,11 @@ reason is given.
   derivation failed closed and, with the development flag, the run ended at SPEC on the HIGH
   `derivation_unsandboxed`. On Linux, when neither `bwrap` nor `bwrap-sudo` passes its probe (or
   bubblewrap is not installed), `sandbox_kind()` now probes a third kind, `audit-hook`. It is
-  used only inside a container, detected by `/.dockerenv`, `/run/.containerenv`, `$container`
-  or `/proc/1/cgroup`, because there the container's isolation from the host is the outer wall.
-  An operator can also choose it explicitly with `MA_DERIVATION_SANDBOX=audit-hook`. The record
-  names the basis. On a plain host the planner's script would run with the host user's
+  used only with unambiguous evidence of a container, because there the container's isolation
+  from the host is the outer wall. The evidence can be a runtime's marker file (`/.dockerenv`,
+  `/run/.containerenv`), a runtime's own `container=` value, or a runtime's cgroup path for PID 1.
+  `container=0`, or a path that merely contains "docker", is not evidence. No operator setting
+  overrides this. The record names the evidence, and the report repeats it. On a plain host the planner's script would run with the host user's
   permissions behind only the hook, so derivations fail closed there. Owner decision
   (2026-11-23): the fallback is accepted for containers only, and bubblewrap stays required on
   hosts. Every report has a "Derivation sandbox" block, which says so when no derivation ran. Where
