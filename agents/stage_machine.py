@@ -2623,6 +2623,10 @@ class Machine:
         ids = [str(i) for i in d.get("open_tested") or []]
         if not all(i in led and (FX.is_write_up(led[i]) or i in gaps) for i in ids):
             return None
+        # rule 2 leaves a MEDIUM non-blocking: one with a test a task can work to keeps the round (Codex r2 of #357)
+        if any(f.done_when and f.id not in keep and not FX.is_write_up(f) for f in FL.open_findings(led)
+               if f.status == "open"):
+            return None
         named = set(ids) | {str(b.get("id")) for b in hi}
         return sorted(set(map(str, held)) | (gaps & named))
 
@@ -3169,8 +3173,10 @@ def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:
 def dependence_lines(run_dir: str) -> list[str]:
     """Owner decision (b), 2026-11-23: a decision test that changes the plan, which the owner (or, under --signoff lead,
     the lead provisionally) accepted, lets the run ACCEPT; the report states the dependence at its top: which input the
-    test varies, at each tested value how many units change package (and which, when the result file names them) and
-    the re-solved plan, and who accepted it. From the ledger's owner_accepted rows and each test's verified result file."""
+    test varies, at each plan-changing value how many units change package and which, the re-solved plan, and who
+    accepted it. From the ledger's owner_accepted rows and the record each answer bound: the item's fingerprint is
+    recomputed from the record as it is now, and a toolkit result file is hashed on the bytes it is read from, so a
+    record changed since the accept is never shown as accepted (Codex r1-r2 of #357)."""
     try:
         led = FL.load(run_dir)
     except Exception as e:  # noqa: BLE001 -- fail closed: the report says the list could not be read
@@ -3181,55 +3187,73 @@ def dependence_lines(run_dir: str) -> list[str]:
         return []
     from toolkit.analysis import contract as _CT
     import yaml
-    out = ["## The plan depends on inputs the owner accepted\n\n",
-           "The delivered plan is solved at the signed values. Each decision test below changes the plan within the "
-           "range it tests, and the owner's decision was to accept the plan with that dependence (harness-rendered).\n\n"]
     try:
         ref = (_CT._verified_doc(run_dir)[3] or {}).get("reference_plan")
-    except Exception:  # noqa: BLE001 -- unknown: said as such below
+    except Exception:  # noqa: BLE001 -- not the point-value plan: said of the delivered plan
         ref = None
-    against = ("the plan solved at the point values (the delivered plan is the expected-value plan over the "
-               "uncertainty draws, which the tests do not re-solve)") if ref == "point_plan" else "the delivered plan"
-    out[-1] = out[-1].rstrip("\n") + f" Units and feasibility are counted against {against}.\n\n"
+    if ref == "point_plan":     # what was measured: the point-value plan's dependence (Codex r2 of #357, P1-7)
+        head = ("The delivered plan is the expected-value plan over the uncertainty draws. Each decision test below "
+                "re-solves the plan at the point values and shows that the point-value plan changes within the range "
+                "it tests; the tests do not re-solve the delivered plan. Units and feasibility are counted against the "
+                "point-value plan.")
+    else:
+        head = ("The delivered plan is solved at the signed values. Each decision test below changes it within the "
+                "range it tests. Units and feasibility are counted against the delivered plan.")
+    out = ["## The plan depends on inputs the owner accepted\n\n",
+           head + " The owner's decision was to accept the plan with that dependence (harness-rendered).\n\n"]
     for f in rows:
         ev = next((e for e in reversed(f.events or []) if isinstance(e, dict) and e.get("status") == "owner_accepted"), {})
         who = ("the lead, provisionally (`--signoff lead`; the owner confirms or overturns it)" if ev.get("by") == "lead"
                else "the owner")
         line = f"- **{f.key or f.id}**: accepted by {who}" + (f" at {ev['at']}" if ev.get("at") else "")
-        res, stale = {}, False
         kind_rec = ev.get("record")
         if kind_rec is None:                  # an accept recorded without it: the record that exists
             try:
                 kind_rec = "toolkit" if _CT.decision_test_record(run_dir, f.key) else "spike"
             except Exception:  # noqa: BLE001
                 kind_rec = "spike"
+        v_now = {"kind": f.kind, "key": f.key, "claim": f.claim,
+                 **({"source": "toolkit/analysis/contract.py"} if kind_rec == "toolkit" else {})}
+        try:
+            same = not ev.get("fingerprint") or _bearing_item(run_dir, v_now)["fingerprint"] == ev["fingerprint"]
+        except Exception:  # noqa: BLE001 -- cannot be compared: not shown as accepted
+            same = False
+        stale_line = (line + "; its record has changed since it was accepted, so the next gate asks again and the "
+                             "values are not repeated here.\n")
+        if not same:                          # P1-5: the record the answer bound is not the one there now
+            out.append(stale_line)
+            continue
         if kind_rec == "spike":       # the record the answer bound (Codex r1 of #357, P1-8)
             try:
                 tests = (json.load(open(os.path.join(run_dir, AB.ANALYSIS_JSON))) or {}).get("decision_tests") or []
                 t = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(f.key)), None)
             except (OSError, ValueError, AttributeError, TypeError):
                 t = None
-            if isinstance(t, dict):          # the spike's measured effects, as recorded (P1-9)
-                meas = [f"{k} {v}" for k, v in t.items() if k not in ("id", "text", "plan_changes")
-                        and isinstance(v, (int, float, str)) and not isinstance(v, bool)]
-                out.append(line + f"; varies {t.get('text') or 'the input its record names'}"
-                           + (f"; measured: {', '.join(meas)}" if meas else "") + ".\n")
-            else:
+            if not isinstance(t, dict):
                 out.append(line + "; its record could not be read.\n")
+                continue
+
+            def scal(d_):
+                return [f"{k} {v}" for k, v in d_.items() if k not in ("id", "text", "plan_changes", "results")
+                        and isinstance(v, (int, float, str)) and not isinstance(v, bool)]
+            # the measured effects, at the top and per tested value (the producer's shape: Codex r2, P1-6)
+            meas = scal(t) + ["; ".join(scal(r)) for r in t.get("results") or [] if isinstance(r, dict) and scal(r)]
+            out.append(line + f"; varies {t.get('text') or 'the input its record names'}"
+                       + (f"; measured: {', '.join(meas)}" if meas else "") + ".\n")
             continue
+        res = {}
         try:
             rec = _CT.decision_test_record(run_dir, f.key)
-            # the result the answer bound: another one since is not what was accepted (P1-7)
-            stale = bool(rec) and bool(ev.get("result_sha256")) and rec.get("result_sha256") != ev.get("result_sha256")
-            if rec and rec.get("path") and not stale:
-                res = yaml.safe_load(open(os.path.join(run_dir, str(rec["path"])))) or {}
+            if rec and rec.get("path"):
+                raw = open(os.path.join(run_dir, str(rec["path"])), "rb").read()
+                # the bytes shown are the bytes the accept bound (P1-4): hashed as read, against the bound hash
+                if ev.get("result_sha256") and hashlib.sha256(raw).hexdigest() != ev["result_sha256"]:
+                    out.append(stale_line)
+                    continue
+                res = yaml.safe_load(raw.decode("utf-8")) or {}
         except Exception:  # noqa: BLE001 -- the item is listed with what the ledger holds
             res = {}
         res = res if isinstance(res, dict) else {}
-        if stale:
-            out.append(line + "; its result has changed since it was accepted, so the next gate asks again and the "
-                              "values are not repeated here.\n")
-            continue
         what = str(res.get("varied") or res.get("question") or "the input this test varies (its result file could "
                                                                   "not be read)")
         vals = []
@@ -6630,7 +6654,11 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
                     {"reviewer": "critique-redteam", "id": "R-001"}, {"reviewer": "critique-domain", "id": "W"}],
                     "owner_held": []}, "WRITE"),
                 ("hb2_gap_r2_gate", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
-                    {"reviewer": "rigor-artifacts", "id": "RIG-001", "kind": "k"}], "owner_held": []}, "CRITIQUE")):
+                    {"reviewer": "rigor-artifacts", "id": "RIG-001", "kind": "k"}], "owner_held": []}, "CRITIQUE"),
+                # Codex r2 of #357 (P2-9): a non-blocking MEDIUM with a test a task can work to keeps the round
+                ("hb2_gap_r2_medium", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
+                    {"reviewer": "critique-redteam", "id": "R-001"}, {"reviewer": "critique-domain", "id": "W"}],
+                    "owner_held": []}, "CRITIQUE")):
             d, T, st = new_run(name, {}, max_rounds=3)
             json.dump(gate, open(os.path.join(d, "gate_r1.json"), "w"))
             gap = FL.Finding(id="R-001", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
@@ -6638,6 +6666,11 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
             led = {"R-001": gap,
                    "W": FL.Finding(id="W", kind="critique_blocker", severity="HIGH", source="critique-domain",
                                    status="open", owner_state="WRITE", target_stage="WRITE", blocking=True)}
+            if name == "hb2_gap_r2_medium":
+                led["M"] = FL.Finding(id="M", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                                      status="open", owner_state="ANALYZE", done_when=[
+                                          {"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=",
+                                           "value": 32}])
             FL.save(d, led)
             st.state, st.round, st.round_pending, st.post_write = "FIX_LOOP", 1, True, False
             save_state(d, st)
@@ -6682,31 +6715,43 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
              "units_changed_ids": ids13, "recommendation": "A: 13 units", "point_plan_feasible": False,
              "within_solver_gap": True}]}, open(os.path.join(dd, "models", "decision_tests", "DTc.yaml"), "w"))
         os.makedirs(os.path.join(dd, os.path.dirname(AB.ANALYSIS_JSON) or "."), exist_ok=True)
-        json.dump({"decision_tests": [{"id": "DTs", "text": "a lower effect", "trial_value": 0.4,
-                                       "units_changed": 2, "plan_changes": True}]},
-                  open(os.path.join(dd, AB.ANALYSIS_JSON), "w"))
+        # the spike producer's shape: the measured effects per tested value (Codex r2 of #357, P1-6)
+        spk = {"decision_tests": [{"id": "DTs", "text": "a lower effect", "type": "effect", "plan_changes": True,
+                                   "results": [{"trial_value": 0.4, "units_changed": 2}]},
+                                  {"id": "DTr", "text": "now reads differently", "plan_changes": True}]}
+        json.dump(spk, open(os.path.join(dd, AB.ANALYSIS_JSON), "w"))
+        _yd.safe_dump({"varied": "the envelope", "results": [{"value": 9, "decision_changes": True,
+                                                               "units_changed": 1}]},
+                      open(os.path.join(dd, "models", "decision_tests", "DTx.yaml"), "w"))
+        sha_c = hashlib.sha256(open(os.path.join(dd, "models", "decision_tests", "DTc.yaml"), "rb").read()).hexdigest()
 
         def row(key, **ev):
             f_ = FL.Finding(id=f"decision_test_changes_plan:{key}", kind="decision_test_changes_plan", key=key,
                             severity="HIGH", source="rigor-artifacts", status="owner_accepted")
             f_.events.append(dict({"round": 1, "status": "owner_accepted", "by": "owner"}, **ev))
             return f_
-        FL.save(dd, {"c": row("DTc", record="toolkit", result_sha256="aa"),
-                     "s": row("DTs", record="spike"), "x": row("DTx", record="toolkit", result_sha256="old")})
+        # DTx: its result file's bytes are not the ones the accept bound, though the manifest is unchanged (P1-4);
+        # DTr: the spike record now gives the item another fingerprint than the one accepted (P1-5)
+        rows_ = {"c": row("DTc", record="toolkit", result_sha256=sha_c), "s": row("DTs", record="spike"),
+                 "x": row("DTx", record="toolkit", result_sha256="0" * 64)}
         real_rec, real_doc = _CTd.decision_test_record, _CTd._verified_doc
         _CTd.decision_test_record = lambda rd, k: ({"path": f"models/decision_tests/{k}.yaml", "result_sha256": "aa"}
-                                                   if k == "DTc" else {"path": "models/decision_tests/DTx.yaml",
-                                                                       "result_sha256": "new"} if k == "DTx"
-                                                   else None)
+                                                   if k in ("DTc", "DTx") else None)
         _CTd._verified_doc = lambda rd: ([], {}, None, {"reference_plan": "point_plan"})
         try:
+            fr = row("DTr", record="spike")
+            fr.events[-1]["fingerprint"] = "not-the-current-one"
+            FL.save(dd, dict(rows_, r=fr))
             txt = "".join(dependence_lines(dd))
         finally:
             _CTd.decision_test_record, _CTd._verified_doc = real_rec, real_doc
-        ok("counted against the plan solved at the point values" in txt and "transport x2" in txt
+        line_r = next((x for x in txt.splitlines() if "**DTr**" in x), "")
+        ok("shows that the point-value plan changes" in txt and "counted against the point-value plan" in txt
+           and "The delivered plan is solved at the signed values" not in txt and "transport x2" in txt
            and "(" + ", ".join(ids13) + ")" in txt and "not settled within the solver's gap" in txt
-           and "**DTs**" in txt and "a lower effect" in txt and "trial_value 0.4" in txt
-           and "**DTx**" in txt and "has changed since it was accepted" in txt,
+           and "**DTs**" in txt and "a lower effect" in txt and "trial_value 0.4" in txt and "units_changed 2" in txt
+           and "has changed since it was accepted" in next((x for x in txt.splitlines() if "**DTx**" in x), "")
+           and "has changed since it was accepted" in line_r and "now reads differently" not in line_r,
            f"HB2-6 the accepted dependence names the reference plan, the price case, every unit, an unsettled solve, "
            f"the spike record's measured effects, and a result changed since the accept ({txt!r})")
 

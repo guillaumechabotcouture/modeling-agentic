@@ -383,13 +383,13 @@ def legacy_fingerprint(fid: str, claim, fix_requires) -> str:
 
 
 def answer_for(answers: dict, fid: str, *, kind, fix_requires, claim) -> dict | None:
-    """The recorded answer that binds this finding as it reads now: under its fingerprint, else under the legacy one."""
-    for fp in (answer_fingerprint(fid, kind=kind, fix_requires=fix_requires, claim=claim),
-               legacy_fingerprint(fid, claim, fix_requires)):
-        a = answers.get(fp)
-        if isinstance(a, dict) and str(a.get("finding")) == fid:
-            return a
-    return None
+    """The recorded answer that binds this finding as it reads now, under its fingerprint or the legacy one. When both
+    hold an answer, the owner's comes before the lead's and a decline before an accept (Codex r2 of #357, P1-1/P1-2:
+    a provisional lead accept or an older accept never stands over the owner's decline)."""
+    got = [a for fp in (answer_fingerprint(fid, kind=kind, fix_requires=fix_requires, claim=claim),
+                        legacy_fingerprint(fid, claim, fix_requires))
+           for a in [answers.get(fp)] if isinstance(a, dict) and str(a.get("finding")) == fid]
+    return min(got, key=lambda a: (a.get("by") != "owner", a.get("decision") != "decline"), default=None)
 
 
 def harness_gap_key(f) -> str:
@@ -454,8 +454,12 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
               and isinstance(v.get("owner_signed"), dict) and not v.get("owner_signoff")}
 
     def held(f) -> bool:      # the answer still binds the finding as it reads now (hb2 fix 3: not its wording)
-        return answer_for(answers, f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim) is not None \
-            or f.id in signed
+        if f.id in signed:
+            return f.status == "owner_accepted"
+        a = answer_for(answers, f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim)
+        # the answer that binds it now, and the status says that answer (Codex r2 of #357, P1-1)
+        return a is not None and {"accept": "owner_accepted", "decline": "owner_declined"}.get(a.get("decision")) \
+            == f.status
     seen = set()
     for new in crit + gate_rows + conf:
         seen.add(new.id)
@@ -498,8 +502,14 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             f.blocking = (f.id in held) if held is not None else (f.severity == "HIGH" and f.status == "open")
     if decision is not None and not post_write:
         for f in led.values():
-            if f.id not in seen and not f.source.startswith("critique") and (
-                    f.status in ("open", "declared") or (f.status == "owner_accepted" and f.kind in OWNER_RESOLUTION_KINDS)):
+            if f.id not in seen and not f.source.startswith("critique") and f.status in ("open", "declared"):
+                f.status, f.blocking = "fixed", False
+                _event(f, round_n, "fixed", "gate", "absent at this gate")
+    if decision is not None:
+        # an accepted plan-changing test this gate (pre- or post-write) no longer reports: the plan does not depend on
+        # it now, and the report does not list it (Codex r2 of #357, P1-8)
+        for f in led.values():
+            if f.id not in seen and f.kind in OWNER_RESOLUTION_KINDS and f.status == "owner_accepted":
                 f.status, f.blocking = "fixed", False
                 _event(f, round_n, "fixed", "gate", "absent at this gate")
     frozen = frozen_tests(run_dir)
@@ -529,6 +539,8 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             f.resolution_type = "owner_decision"
             _event(f, round_n, f.status, "lead" if a.get("by") == "lead" else "owner")
         s_ = signed.get(f.id)
+        if s_ is not None and f.status == "owner_accepted":
+            f.blocking = False             # from_gate blocks by kind; an accepted one does not block (P2-12)
         if s_ is not None and f.status in ("open", "declared"):
             f.status, f.resolution_type, f.blocking = "owner_accepted", "owner_decision", False
             _event(f, round_n, f.status, "lead" if s_.get("by") == "lead" else "owner",
@@ -771,6 +783,46 @@ def _self_test() -> int:
                                   claim=claim, fix_requires=fix)})
         st22 = sync(d, None, 2)[0]["D-033"].status
         ok(st22 == "owner_declined", f"L22 an answer under the legacy fingerprint still binds the finding ({st22})")
+    # L23 (Codex r2 of #357, P1-1/P1-2): the owner's decline under either fingerprint stands over an accept (an older
+    # wording's, or the lead's provisional one under the new fingerprint), and an owner_accepted row turns declined
+    claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
+    fpn = answer_fingerprint("D-034", kind=CRITIC_KIND, fix_requires=fix, claim=claim)
+    ans23 = {fpn: {"finding": "D-034", "decision": "accept", "by": "lead", "provisional": True},
+             legacy_fingerprint("D-034", claim, fix): {"finding": "D-034", "decision": "decline", "by": "owner"}}
+    a23 = answer_for(ans23, "D-034", kind=CRITIC_KIND, fix_requires=fix, claim=claim)
+    with tempfile.TemporaryDirectory() as d:
+        import scope_signoff as SS
+        json.dump({"answers": {legacy_fingerprint("D-035", "wording A", fix): {"finding": "D-035", "decision": "accept",
+                                                                             "by": "owner"},
+                               legacy_fingerprint("D-035", "wording B", fix): {"finding": "D-035", "decision": "decline",
+                                                                             "by": "owner"}}},
+                  open(os.path.join(d, "scope_signoff.json"), "w"))
+        SS.harness_record(d)
+        save(d, {"D-035": Finding(id="D-035", kind=CRITIC_KIND, severity="HIGH", source="critique-domain",
+                                  claim="wording A", fix_requires=fix, status="owner_accepted")})
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 2, "verdict": "REVISE",
+                        "structural_mismatch": {"detected": False}, "carried_forward": [],
+                        "blockers": [{"id": "D-035", "severity": "HIGH", "category": "METHODS", "target_stage": "PLAN",
+                                      "first_seen_round": 1, "claim": "wording B", "fix_requires": fix,
+                                      "resolved": False}]},
+                       open(os.path.join(d, CRITIQUE_FILES["critique-domain"]), "w"))
+        st23 = sync(d, None, 2, lead_ok=True)[0]["D-035"].status
+    ok((a23 or {}).get("decision") == "decline" and st23 == "owner_declined",
+       f"L23 the owner's decline stands over an accept under the other fingerprint ({a23}, {st23})")
+    # L24 (Codex r2 of #357, P1-8, P2-12): an accepted plan-changing test stays non-blocking over repeated syncs, and a
+    # post-write gate that no longer reports it closes it
+    with tempfile.TemporaryDirectory() as d:
+        v = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "claim": "c",
+             "owner_resolution": True}
+        g24 = {"rigor_violations": [dict(v, key="DT1", owner_signed={"by": "owner"}),
+                                    dict(v, key="DT2", owner_signoff=True)],
+               "unresolved_high": [{"reviewer": "rigor-artifacts", "kind": "decision_test_changes_plan"}]}
+        sync(d, g24, 1)
+        b24 = sync(d, g24, 1)[0]["decision_test_changes_plan:DT1"].blocking
+        s24 = sync(d, {"rigor_violations": [], "unresolved_high": []}, 1, post_write=True)[0][
+            "decision_test_changes_plan:DT1"].status
+    ok(b24 is False and s24 == "fixed",
+       f"L24 an accepted test does not block on a second sync; gone post-write, it is closed ({b24}, {s24})")
     # L_OWNER_LEAD (1F, D2): a lead's recorded answer counts only when the run is a --signoff lead run
     with tempfile.TemporaryDirectory() as d:
         import scope_signoff as SS

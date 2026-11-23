@@ -250,6 +250,9 @@ def validate_plan(plan, packet: dict) -> list[str]:
                 errs.append(f"{tid}: finding {fid} is in two tasks")
             elif by_id[fid]["resolution_type"] == "owner_decision":
                 errs.append(f"{tid}: {fid} is the owner's decision, not a task")
+            elif by_id[fid].get("harness_gap_current"):       # Codex r2 of #357 P2-10: as declared, no task fixes it
+                errs.append(f"{tid}: {fid} is a declared harness gap (its remedy has not changed since): list it in "
+                            "`harness_gaps`, not in a task")
             elif t.get("action") == "decision_test" and not by_id[fid]["scope_declarable"]:
                 errs.append(f"{tid}: {fid} is not scope-declarable; it needs a fix, not a decision test")
             used.add(fid)
@@ -321,7 +324,10 @@ def default_plan(packet: dict) -> dict:
     tasks, gaps = [], []
     for f in packet["findings"]:
         if f.get("harness_gap_current"):           # no task for a declared harness gap (Codex r1 of #357, P2-11)
-            gaps.append({"finding": f["id"], "reason": f"declared earlier: {f.get('harness_gap')}"[:300], "needs": []})
+            note = str(f.get("harness_gap") or "declared")
+            needs = [x.strip() for x in note.split("Needs:", 1)[1].split(",") if x.strip()] if "Needs:" in note else []
+            gaps.append({"finding": f["id"], "reason": f"declared earlier: {note}"[:300],
+                         "needs": needs or ["the harness change named when the gap was declared"]})   # r2 P2-11
             continue
         if f["blocking"] and f["resolution_type"] != "owner_decision" and not is_write_up(f):
             tasks.append({"id": f"T{len(tasks) + 1}", "findings": [f["id"]], "action": "fix",
@@ -888,6 +894,14 @@ def _self_test() -> int:
            # Codex r1 of #357 P2-11: the harness's default plan plans no task for a declared gap
            and not any("R-001" in t["findings"] for t in default_plan(build_packet(d, FL.load(d), 2, 3, None,
                                                                                    None))["tasks"])
+           # Codex r2 of #357 (P2-10, P2-11): a planner task for the declared gap is refused, and the default plan
+           # passes the plan check
+           and any("declared harness gap" in e for e in validate_plan(
+               {"tasks": [{"id": "T1", "findings": ["R-001"], "action": "fix", "owner_state": "ANALYZE",
+                           "files": ["analysis_settings.yaml"], "brief": "b"}], "deferred": []},
+               build_packet(d, FL.load(d), 2, 3, None, None)))
+           and validate_plan(default_plan(build_packet(d, FL.load(d), 2, 3, None, None)),
+                             build_packet(d, FL.load(d), 2, 3, None, None)) == []
            and build_packet(d, FL.load(d), 2, 3, None, None)["findings"][0].get("harness_gap"),
            f"F20c a harness gap is recorded with its reason (plan, summary, ledger event, next packet), not as a fix "
            f"row ({s20}, {ev20})")
