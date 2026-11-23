@@ -3744,21 +3744,30 @@ def _self_test_lead_amend_r4(ok, tdr: str, parent, good: dict, interrupted, pair
        and all(open(os.path.join(d + ".amend1", f), "rb").read() == b for f, b in snap.items()),
        f"T_R4_LINKED_CHILD a linked sibling is not a child: refused, the original untouched ({s})")
     # R1-4: a lineage write that fails leaves the parent at SPEC, recoverable; the next resume finishes the hand-off
+    # (Codex r2 of #349: the error injected, so it holds for any user, and the retry on the same machine)
     d = interrupted("r4_readonly")
-    os.chmod(d + ".amend1", 0o500)
+    real_wj, failed = globals()["_write_json"], []
+
+    def fail_once(rd, rel, doc):
+        if os.path.realpath(rd) == d + ".amend1" and not failed:
+            failed.append(rel)
+            raise PermissionError("injected")
+        return real_wj(rd, rel, doc)
+    m4 = machine(d)
+    globals()["_write_json"] = fail_once
     try:
-        machine(d).step()
+        m4.run()
         raised = None
     except OSError as e:
         raised = type(e).__name__
     finally:
-        os.chmod(d + ".amend1", 0o755)
-    st1 = load_state(d)
-    machine(d).step()
-    ok(raised and st1.status is None and st1.state == "SPEC" and load_state(d).status == AMENDED_PROVISIONAL
-       and handoff_child(d) == d + ".amend1",
-       f"T_R4_RELINK_FAILS a failed lineage write is raised before the parent is FINAL; a resume finishes it ({raised}, "
-       f"{st1.state}, {st1.status})")
+        globals()["_write_json"] = real_wj
+    st1, meta1 = load_state(d), json.load(open(os.path.join(d, "metadata.json")))
+    s = m4.run()
+    ok(raised and st1.status is None and st1.state == "SPEC" and meta1.get("status") != AMENDED_PROVISIONAL
+       and m4.st.state == "FINAL" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
+       f"T_R4_RELINK_FAILS a failed lineage write is raised before the parent is FINAL (state and metadata); the same "
+       f"machine's retry finishes it ({raised}, {st1.state}, {meta1.get('status')}, {s})")
     # R1-6: the kept child is verified by the signed digest the request names, not the working spec's bytes
     d = interrupted("r4_kept")
     sp, keep = os.path.join(d, AB.SPEC_FILE), None
@@ -3794,6 +3803,68 @@ def _self_test_lead_amend_r4(ok, tdr: str, parent, good: dict, interrupted, pair
         _sh.move(d + ".gone", d)
     ok(al and f"`{p}`" in al[0] and f"`{d}`" not in al[0],
        f"T_R4_MOVED_MANUAL a moved manual amendment names its moved parent ({al[:1]})")
+    _self_test_lead_amend_r5(ok, tdr, interrupted, pair, machine)
+
+
+def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
+    """Codex round 2 of #349: the child matched by its patch's content and the parent's own sign-off; storage of a
+    kept or unfinished child."""
+    import shutil as _sh
+    from toolkit.spec import signoff as SO
+    # R2-1: the same patch id with other content is not this request's child
+    d = interrupted("r5_patch")
+    rp = os.path.join(d, SPEC_RETHINK_REQUEST)
+    req = json.load(open(rp))
+    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, patch=dict(req["patch"], spec=[
+        {"set": "constraints.envelope_usd", "value": 8700}])))
+    s = machine(d).run()
+    la = json.load(open(rp)).get("lead_amendment") or {}
+    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and handoff_child(d) is None,
+       f"T_R5_PATCH_CONTENT a child made from another patch under the same id is not adopted ({s}, {la.get('why')})")
+    # R2-2: a kept child and its request must match the parent's own sign-off record, not only each other
+    d = interrupted("r5_signoff")
+    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    machine(d).run()                                  # refused (the legacy brief), the child kept
+    sop = os.path.join(d, SO.SPEC_SIGNOFF)
+    so0 = open(sop, "rb").read()
+    rec = json.loads(so0)
+    rec["sha256"] = dict(rec.get("sha256") or {}, **{AB.SPEC_FILE: "e" * 64})
+    open(sop, "w").write(json.dumps(rec))
+    other = handoff_chain(d, kept=True)
+    open(sop, "wb").write(so0)
+    # R2-7: a damaged parent state does not drop a recorded refusal's kept child
+    stp = os.path.join(d, STATE_FILE)
+    st0 = open(stp, "rb").read()
+    open(stp, "wb").write(st0[:20])
+    damaged = handoff_chain(d, kept=True)
+    open(stp, "wb").write(st0)
+    # R1-5 follow-up: a malformed lead_amendment record is not an error
+    req = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
+    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, lead_amendment=["bad"]))
+    try:
+        bad = handoff_chain(d, kept=True)
+    except Exception as e:  # noqa: BLE001 -- the finding
+        bad = type(e).__name__
+    _write_json(d, SPEC_RETHINK_REQUEST, req)
+    ok(other == [] and damaged == [d + ".amend1"] and bad == [],
+       f"T_R5_KEPT_PARENT_SIGNOFF a kept child is stored only when the parent's own sign-off binds the request's spec; "
+       f"a damaged parent state keeps it; a malformed record stores nothing ({other}, {damaged}, {bad})")
+    # R2-8: an unfinished hand-off stores its child only once the child has its state and the lead's signature
+    d = interrupted("r5_unsigned")
+    os.remove(os.path.join(d + ".amend1", SO.SPEC_SIGNOFF))
+    ok(handoff_chain(d, kept=True) == [],
+       f"T_R5_UNFINISHED_UNSIGNED an unfinished hand-off's unsigned child is not stored ({handoff_chain(d, kept=True)})")
+    # R2-9 (P2): a moved manual amendment without its metadata names its parent from the amendment record's digest
+    src = os.path.join(tdr, "r4_manual")
+    p = pair(src, "r5_moved_manual")
+    os.remove(os.path.join(p + ".amend1", "metadata.json"))
+    _sh.move(src, src + ".gone")
+    try:
+        al = amendment_lines(p + ".amend1")
+    finally:
+        _sh.move(src + ".gone", src)
+    ok(al and f"`{p}`" in al[0],
+       f"T_R5_MOVED_NO_METADATA a moved manual amendment without metadata names its moved parent ({al[:1]})")
 
 
 def _self_test() -> int:

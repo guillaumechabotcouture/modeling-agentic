@@ -1102,6 +1102,48 @@ def _run_self_test() -> int:
        and _stored8 == [_p8, _p8, _c8, _c8 + ".amend1"],
        f"ST8 a held child stops the chain there: the parent is stored, the held child and later ones are not "
        f"({_got8}, {_calls8}, {_stored8})")
+    # ST9 (Codex r2 of #349): a one-argument store still stores the parent; the chain is stored one run at a time, so a
+    # run that cannot be read after the parent stops the chain there, and a child whose lock another process holds is
+    # not stored from here
+    _calls9 = []
+    _outcome(lambda: _rs(_locked(_c8), _p8, store=lambda p: _calls9.append(p)))
+
+    def _gen(p, limit=8, kept=False):
+        yield _c8
+        raise AttributeError("unreadable next run")
+    _saved9 = (getattr(_sm7, "iter_handoff_chain", None), globals()["store_run_results"])
+    _stored9, _err9 = [], []
+    _sm7.iter_handoff_chain = _gen
+    globals()["store_run_results"] = _stored9.append
+    os.makedirs(_c8, exist_ok=True)
+    try:
+        for _upto in (_c8, None):
+            try:
+                _store_chain(_p8, upto=_upto)
+            except Exception as e:  # noqa: BLE001 -- the finding
+                _err9.append(type(e).__name__)
+        _held9, _rel9 = _th7.Event(), _th7.Event()
+
+        def _hold9():
+            with _sm7._amend_lock(_c8):
+                _held9.set()
+                _rel9.wait(60)
+        _t9 = _th7.Thread(target=_hold9)
+        _t9.start()
+        _held9.wait(60)
+        try:
+            _store_chain(_p8)
+        except Exception as e:  # noqa: BLE001
+            _err9.append(type(e).__name__)
+        finally:
+            _rel9.set()
+            _t9.join(60)
+    finally:
+        _sm7.iter_handoff_chain, globals()["store_run_results"] = _saved9
+    ok(_calls9 == [_p8] and _err9 == [] and _stored9 == [_p8, _p8, _c8, _p8],
+       f"ST9 a one-argument store stores the parent; the chain is stored run by run up to an unreadable or held run "
+       f"({_calls9}, {_err9}, {_stored9})")
+    shutil.rmtree(_c8, ignore_errors=True)
     shutil.rmtree(_p8, ignore_errors=True)
     _self_test_pipeline(ok, _outcome)
 
