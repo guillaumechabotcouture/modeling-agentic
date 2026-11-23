@@ -1236,8 +1236,9 @@ def run_v2_and_store(run, run_path: str, store=None):
                 print("v2 run not stored: another process holds its amendment lock", file=sys.stderr, flush=True)
             elif locked:          # a store without `upto` stores the one run it is given (Codex r2 of #349)
                 import inspect
-                try:
-                    chain = "upto" in inspect.signature(store).parameters
+                try:                  # a store that can bind `upto` (a keyword or **kwargs) is given it (Codex r3)
+                    inspect.signature(store).bind(run_path, upto=locked)
+                    chain = True
                 except (TypeError, ValueError):
                     chain = False
                 got = store(run_path, upto=locked) if chain else store(run_path)
@@ -1313,8 +1314,10 @@ def _store_chain(run_path: str, upto: str | None = None) -> list:
         except stage_machine.AmendmentLocked:
             print(f"v2 run chain stored up to {x}: another process holds it", file=sys.stderr, flush=True)
             break
-        except OSError:              # no lock can be taken there (a read-only copy): stored as it is
-            lock = contextlib.nullcontext()
+        except (OSError, ValueError) as e:   # no ownership established (Codex r3): never stored unlocked from here
+            print(f"[ERROR] v2 run chain stored up to {x}: its lock could not be taken ({type(e).__name__}: {e}); "
+                  "store it once it can be locked", file=sys.stderr, flush=True)
+            break
         try:
             out.append(store_run_results(x))
         finally:

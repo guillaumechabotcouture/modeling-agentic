@@ -1910,28 +1910,25 @@ class Machine:
         # the child is bound to the parent's final state before that state is saved, so no interruption leaves a FINAL
         # parent whose child binds its paused state (Codex r3 on #342, P1-4); until that save the parent is at SPEC and
         # a resume finishes the hand-off again
-        # a failed lineage write puts this machine and the parent's metadata back as they were (Codex r2 of #349): a
-        # retry, on this machine or a new one, finishes the hand-off
+        # a failure before the parent's FINAL state is saved (its metadata, the lineage) puts this machine and the
+        # parent's metadata back as they were (Codex r2 and r3 of #349): a retry, on this machine or a new one, finishes
+        # the hand-off
         import copy
-        saved, failed = copy.deepcopy(self.st), []
+        saved = copy.deepcopy(self.st)
         meta_p = os.path.join(self.run_dir, "metadata.json")
         meta0 = open(meta_p, "rb").read() if os.path.isfile(meta_p) else None
-
-        def link():
-            try:
-                self._relink(child)
-            except BaseException:
-                failed.append(1)
-                raise
         try:
             return self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
-                            AMENDED_PROVISIONAL, extra={"amended_to": child}, before_save=link)
+                            AMENDED_PROVISIONAL, extra={"amended_to": child}, before_save=lambda: self._relink(child))
         except BaseException:
-            if failed:
+            disk = _state_or_none(self.run_dir)
+            if disk is None or disk.status != AMENDED_PROVISIONAL:
                 self.st = saved
+                from lib.safe_io import write_nofollow
                 if meta0 is not None:
-                    from lib.safe_io import write_nofollow
                     write_nofollow(self.run_dir, "metadata.json", meta0, atomic=True)
+                elif os.path.isfile(meta_p) and not os.path.islink(meta_p):
+                    os.remove(meta_p)
             raise
 
     def _mark_child(self, child: str, rid) -> None:
@@ -3301,15 +3298,20 @@ def _made_by(child: str, req: dict, parent: str) -> bool:
 
 def handoff_child(run_dir: str) -> str | None:
     """The child run a provisional lead amendment handed this run to (`amended_provisional`), when it has a state."""
-    try:
-        st = load_state(run_dir)
-    except (OSError, ValueError):
-        return None
+    st = _state_or_none(run_dir)
     if st is None or st.status != AMENDED_PROVISIONAL:
         return None
     child = _child_of(run_dir, next((h.get("amended_to") for h in reversed(st.history)
                                      if isinstance(h, dict) and h.get("amended_to")), None), strict=True)
     return child if child and os.path.isfile(os.path.join(child, STATE_FILE)) else None
+
+
+def _state_or_none(run_dir: str):
+    """The run's state, or None when it is missing or cannot be read as one (Codex r3 of #349: `[]` too)."""
+    try:
+        return load_state(run_dir)
+    except Exception:  # noqa: BLE001 -- unreadable, or not a run state
+        return None
 
 
 def handoff_chain(run_dir: str, limit: int = 8, kept: bool = False) -> list[str]:
@@ -3349,10 +3351,7 @@ def _kept_child(run_dir: str) -> str | None:
         return None
     status = la.get("status")
     if status in ("started", "signed_provisionally"):
-        try:
-            st = load_state(run_dir)
-        except (OSError, ValueError):
-            st = None
+        st = _state_or_none(run_dir)
         if st is None or st.status == AMENDED_PROVISIONAL:
             return None
     elif status != "refused":
@@ -3362,7 +3361,7 @@ def _kept_child(run_dir: str) -> str | None:
         return None
     if status != "refused":              # an unfinished hand-off: only a child with its state and the lead's signature
         from toolkit.spec import signoff as SO
-        if not (os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
+        if not (_state_or_none(child) is not None and SO.status(child) == "signed"
                 and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
             return None
     return child

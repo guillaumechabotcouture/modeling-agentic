@@ -72,7 +72,9 @@ def _sha(b: bytes) -> str:
 def patch_sha256(patch) -> str:
     """The patch's content digest, recorded in the child's metadata: a lead recovering an interrupted hand-off adopts
     only the child its request's patch made (Codex r2 of #349)."""
-    return _sha(json.dumps(patch, sort_keys=True, default=str).encode())
+    # in the patch's own key order (a YAML patch may mix key types, which do not sort: Codex r3); the request's patch
+    # is read back from the same JSON in the same order
+    return _sha(json.dumps(patch, default=str).encode())
 
 
 def _derived_paths() -> set:
@@ -477,7 +479,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
         changes += dch
     if spec1 == spec0 and dossier is None:
         raise AmendError("the patch changes nothing")
-    label = str(p.get("id") or "unnamed")
+    label, psha = str(p.get("id") or "unnamed"), patch_sha256(p)     # before anything is made
     reason1 = " ".join(p["reason"].split())
     new_spec = _dump(spec1, spec_bytes, f"Amendment {label} by {PRODUCER} from parent spec sha256 "
                                         f"{signed or _sha(spec_bytes)}: {reason1}")
@@ -518,7 +520,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     pin = pipeline_id.code_pin(repo)
     meta = {"pipeline": "v2", "question": st.get("question"), "signoff": mode, "max_rounds": st.get("max_rounds"),
             "parent_run": {"run_dir": parent, "run_state_sha256": st_sha}, "parent_spec_sha256": signed,
-            "parent_spec_signed": bool(signed), "code_pin": pin, "amendment": label, "patch_sha256": patch_sha256(p),
+            "parent_spec_signed": bool(signed), "code_pin": pin, "amendment": label, "patch_sha256": psha,
             "producer": PRODUCER, "created": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
     write_nofollow(child, "metadata.json", json.dumps(meta, indent=2).encode(), atomic=True)
     rounds = st.get("max_rounds") if type(st.get("max_rounds")) is int and st["max_rounds"] > 0 else 3
