@@ -474,21 +474,59 @@ def _staged_list(run_dir: str) -> str:
 _ID = re.compile(r"^([A-Za-z]+)-(\d+)$")
 
 
-def stamp_critique(run_dir: str, reviewer: str) -> bool:
-    """Baseline hb2 (§4.5): the harness, not the critic, owns `reviewer` and the id prefix. After the
-    session, a critique file that is a mapping gets the literal reviewer, and each blocker id of the form X-NNN with
-    another prefix gets the critic's (validate_critique_yaml.PREFIXES), in blockers and carried_forward alike. An id
-    whose stamped form is already in the file is left as written (the gate refuses it; two findings are never merged).
-    A file that is missing, unreadable or not a mapping is left as it is: the gate refuses it (fail closed). True when
-    the file was rewritten."""
+def _registered_ids(run_dir: str, before) -> set | None:
+    """Every finding id an earlier round registered: the gate's frozen tests, the findings ledger, and the critique file
+    the session replaced. None when one cannot be read (then nothing is renumbered: the gate decides)."""
+    import yaml
+    from agents import findings_ledger as FL
+    try:
+        ids = set(FL.load(run_dir))
+        reg = os.path.join(run_dir, "done_when_registry.json")
+        if os.path.lexists(reg):
+            tests = json.load(open(reg)).get("tests")
+            if not isinstance(tests, dict):
+                return None
+            ids |= {str(k) for k in tests}
+        old = yaml.safe_load(before) if before else None
+    except Exception:  # noqa: BLE001 -- unreadable: no renumbering
+        return None
+    if isinstance(old, dict):
+        for k in ("blockers", "carried_forward"):
+            for x in old.get(k) if isinstance(old.get(k), list) else []:
+                i = x.get("id") if isinstance(x, dict) else x
+                if isinstance(i, str):
+                    ids.add(i)
+    return ids
+
+
+def _file_bytes(p: str) -> bytes | None:
+    try:
+        return None if os.path.islink(p) else open(p, "rb").read()
+    except OSError:
+        return None
+
+
+def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> bool:
+    """Baseline hb2 (§4.5): the harness, not the critic, owns `reviewer` and the id prefix. After a session that wrote
+    its critique file (`before`: the file's bytes before the session; an unchanged file is not stamped, so a file the
+    session did not write never becomes this critic's review), a file that is a mapping gets the literal reviewer, and
+    each blocker that defines an id of the form X-NNN with another prefix gets the critic's prefix
+    (validate_critique_yaml.PREFIXES), its carried_forward references with it. The new number is the first, from the
+    one written, that no blocker in the file and no earlier round uses (frozen tests, the ledger, the replaced file):
+    a new finding never takes an old finding's id, nor its test. When those records cannot be read, nothing is
+    renumbered. A file that is missing, unreadable or not a mapping, and any id that is not a string, is left as it
+    is for the gate to refuse (fail closed). True when the file was rewritten."""
     import yaml
     import validate_critique_yaml as V
     rel = CRITIQUE_FILE[reviewer]
     p = os.path.join(run_dir, rel)
     if os.path.islink(p) or not os.path.isfile(p):
         return False
+    now = _file_bytes(p)
+    if now is None or now == before:
+        return False
     try:
-        doc = yaml.safe_load(open(p))
+        doc = yaml.safe_load(now)
     except Exception:  # noqa: BLE001 -- unreadable: the gate reports it
         return False
     if not isinstance(doc, dict):
@@ -497,28 +535,35 @@ def stamp_critique(run_dir: str, reviewer: str) -> bool:
     blockers = [b for b in doc.get("blockers") or [] if isinstance(b, dict)] \
         if isinstance(doc.get("blockers"), list) else []
     cf = doc.get("carried_forward") if isinstance(doc.get("carried_forward"), list) else []
-    ids = [b.get("id") for b in blockers] + [c.get("id") if isinstance(c, dict) else c for c in cf]
-    taken = {i for i in ids if isinstance(i, str)}
-    ren = {}
-    for i in ids:
-        m = _ID.match(i) if isinstance(i, str) else None
-        if not m or i.startswith(want) or i in ren:
-            continue
-        new = want + m.group(2)
-        if new not in taken and new not in ren.values():
-            ren[i] = new
-    changed = doc.get("reviewer") != reviewer or bool(ren)
-    if not changed:
+    defined = [b.get("id") for b in blockers if isinstance(b.get("id"), str)]
+    ren: dict = {}
+    wrong = [i for i in defined if _ID.match(i) and not i.startswith(want)]
+    known = _registered_ids(run_dir, before) if wrong else set()
+    if known is not None:
+        used = set(defined) | known
+        for i in wrong:
+            if i in ren or defined.count(i) > 1:
+                continue                         # a duplicated id is the gate's to refuse
+            digits = _ID.match(i).group(2)
+            n = int(digits)
+            while f"{want}{n:0{len(digits)}d}" in used:
+                n += 1
+            ren[i] = f"{want}{n:0{len(digits)}d}"
+            used.add(ren[i])
+    if doc.get("reviewer") == reviewer and not ren:
         return False
     doc["reviewer"] = reviewer
     for b in blockers:
-        if b.get("id") in ren:
-            b["id"] = ren[b["id"]]
+        i = b.get("id")
+        if isinstance(i, str) and i in ren:
+            b["id"] = ren[i]
     for k, c in enumerate(cf):
-        if isinstance(c, dict) and c.get("id") in ren:
-            c["id"] = ren[c["id"]]
-        elif isinstance(c, str) and c in ren:
-            cf[k] = ren[c]
+        i = c.get("id") if isinstance(c, dict) else c
+        if isinstance(i, str) and i in ren:
+            if isinstance(c, dict):
+                c["id"] = ren[i]
+            else:
+                cf[k] = ren[i]
     _sio().write_nofollow(run_dir, rel, yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode(), atomic=True)
     return True
 
@@ -713,13 +758,14 @@ class SdkTasks:
         notes = RF.critic_notes(run_dir)
         msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
                                             + "\n- ".join(notes) if notes else "")
+        before = _file_bytes(os.path.join(run_dir, f))
         res = self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
             stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
                             msg, (f,), model)
-        stamp_critique(run_dir, reviewer)
+        stamp_critique(run_dir, reviewer, before)
         return res
 
     def plan_fixes(self, packet):
@@ -1076,8 +1122,8 @@ def _self_test() -> int:
         finally:
             SdkTasks._session = orig_session
         raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
-        ok(raw["reviewer"] == "critique-presentation" and [b["id"] for b in raw["blockers"]] == ["P-001", "R-001"],
-           f"CS2 an id whose stamped form is taken is left for the gate to refuse, never merged ({raw['blockers']})")
+        ok(raw["reviewer"] == "critique-presentation" and [b["id"] for b in raw["blockers"]] == ["P-001", "P-002"],
+           f"CS2 an id whose stamped form is taken gets the next free number, never merged ({raw['blockers']})")
         for name, body in (("cs_missing", None), ("cs_list", ["not", "a", "mapping"])):
             cd = os.path.join(d, name)
             os.makedirs(cd)
@@ -1118,6 +1164,58 @@ def _self_test() -> int:
         cpp = where.get("critique_prompt") or ""
         ok("reviewer: critique-presentation" in cpp and "P-NNN" in cpp,
            "CS4 the critique prompt states the literal reviewer value and id prefix")
+        # CS5-CS8 (Codex r1 of #355). CS5: an id an earlier round registered (a frozen test, a ledger row, the file the
+        # session replaced) is never given to a new finding: the old test would close it. The stamped id is the next
+        # free number.
+        cd = os.path.join(d, "cs_registered")
+        os.makedirs(cd)
+        json.dump({"tests": {"P-001": {"done_when": [{"file": "README.md", "exists": True}]}}},
+                  open(os.path.join(cd, "done_when_registry.json"), "w"))
+        _y.safe_dump({"blockers": [blk("P-002")]}, open(os.path.join(cd, "critique_presentation.yaml"), "w"))
+        SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 2, "verdict": "REVISE",
+                                           "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                           "blockers": [blk("R-001", severity="HIGH")]})
+        try:
+            SdkTasks(cd).critique(cd, "critique-presentation", 2)
+        finally:
+            SdkTasks._session = orig_session
+        raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
+        ok([b["id"] for b in raw["blockers"]] == ["P-003"],
+           f"CS5 a stamped id skips every id an earlier round registered ({[b['id'] for b in raw['blockers']]})")
+        # CS6: an id that is not a string is left for the validator to name, never a crash.
+        cs6 = {}
+        for name, body in (("list_id", {"reviewer": "presentation", "blockers": [{"id": ["R-001"]}]}),
+                           ("map_cf", {"reviewer": "presentation", "blockers": [blk("R-001")],
+                                       "carried_forward": [{"id": {"x": 1}}]})):
+            cd = os.path.join(d, "cs_" + name)
+            os.makedirs(cd)
+            SdkTasks._session = critic_writes(body)
+            try:
+                SdkTasks(cd).critique(cd, "critique-presentation", 1)
+                cs6[name] = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))["reviewer"]
+            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                cs6[name] = repr(e)
+            finally:
+                SdkTasks._session = orig_session
+        ok(all(v == "critique-presentation" for v in cs6.values()),
+           f"CS6 a non-string id does not stop the stamp ({cs6})")
+        # CS7: a session that wrote nothing leaves the file it found as it was (another critic's document is not
+        # turned into this critic's review).
+        cd = os.path.join(d, "cs_stale")
+        os.makedirs(cd)
+        before = {"reviewer": "critique-domain", "round": 2, "verdict": "PASS",
+                  "structural_mismatch": {"detected": False}, "carried_forward": [], "blockers": []}
+        _y.safe_dump(before, open(os.path.join(cd, "critique_presentation.yaml"), "w"))
+
+        def no_write(self_, kind, system, prompt, owns, model=None):
+            return TaskResult(False, None, 0.0, "fake failure")
+        SdkTasks._session = no_write
+        try:
+            SdkTasks(cd).critique(cd, "critique-presentation", 2)
+        finally:
+            SdkTasks._session = orig_session
+        ok(_y.safe_load(open(os.path.join(cd, "critique_presentation.yaml"))) == before,
+           "CS7 a session that did not write its file gets no stamp: the file it found is unchanged")
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")

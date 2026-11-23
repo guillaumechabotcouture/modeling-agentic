@@ -178,9 +178,12 @@ def _retire_stale_withheld(run_dir: str) -> None:
     """Baseline hb2 (§5 fix 8): a language repair quarantines the rejected draft in report_withheld.md; once the run
     ends with a regular report.md (every withhold path moves report.md away, so it is the delivered one), the
     leftover is removed (no link followed), so no reader takes the run's report as withheld. The repair stays in the
-    history and in the gate records (report_acceptance_language)."""
+    history and in the gate records (report_acceptance_language). The caller calls it only on a post-write gate's
+    decision (Codex r1 of #355: a run that ends before that gate keeps the quarantined copy). Anything at that name
+    other than a regular file or a link (a directory) is left alone."""
     p = os.path.join(run_dir, "report.md")
-    if os.path.isfile(p) and not os.path.islink(p) and os.path.lexists(os.path.join(run_dir, "report_withheld.md")):
+    w = os.path.join(run_dir, "report_withheld.md")
+    if os.path.isfile(p) and not os.path.islink(p) and (os.path.islink(w) or os.path.isfile(w)):
         from lib.safe_io import remove_nofollow
         remove_nofollow(run_dir, "report_withheld.md")
 
@@ -1397,7 +1400,8 @@ class Machine:
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
             self._withhold_if_acceptance_language()
-            _retire_stale_withheld(self.run_dir)
+            if frm == "GATE" and (self.st.last_gate or {}).get("post_write") and self.st.last_gate.get("action"):
+                _retire_stale_withheld(self.run_dir)
             self._finish()
         if before_save is not None:
             before_save()
@@ -1776,7 +1780,8 @@ class Machine:
         if not self._review_conditions(self.st.signoff, defer=False):
             # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
             self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
-            return self._go("SPEC", "review conditions could not be prepared for signing")
+            return self._go("SPEC", "review conditions could not be prepared for signing",
+                            extra={"feedback": list(self.st.tries["spec_feedback"])})
         return self._go("EVIDENCE", "spec drafted and valid")
 
     def _spec_checks(self, rd: str) -> list[str]:
@@ -5442,6 +5447,14 @@ def _self_test() -> int:
             ok(rc and all("data/inputs/requirements.txt" in x for x in rc)
                and dr and all("data/inputs/requirements.txt" in x for x in dr),
                f"T50f a cited path whose staged copy exists: the refusals name the staged path ({rc}; {dr})")
+        # T50g (Codex r1 of #355): a qualified path in another folder (a derived table) is not matched to a staged
+        # input by its file name: following that hint would skip the derivation.
+        spec = {"decision_units": {"csv": "data/inputs/requirements.txt"},
+                "calibration": {"targets": [{"id": "t", "csv": "data/derived/requirements.txt"}]}}
+        yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+        rc = [x for x in record_cited_inputs(fk) if "does not exist" in x]
+        ok(rc and not any("staged copy" in x for x in rc),
+           f"T50g a qualified path is matched to a staged input only by its full path ({rc})")
         for kind, key in (("group", {"csv": {"file": "data/missing.csv"}, "units": "state"}),
                           ("unit", {"csv": "data/missing.csv"})):    # Codex: only a group target's column name
             spec = {"decision_units": {"csv": "data/inputs/requirements.txt"}, "calibration": {"joint": {"targets": [
@@ -5712,6 +5725,30 @@ def _self_test() -> int:
                 # report.md, and harness_metrics counted the run as not done. Delivery retires it.
                 ok(not os.path.lexists(os.path.join(d, "report_withheld.md")),
                    "T84b once the repaired report.md is delivered, the stale report_withheld.md is retired")
+                # T84c-T84d (Codex r1 of #355): only a post-write gate's decision delivers the repaired draft; a run
+                # that ends before it (the budget, at WRITE or PRESENTATION) keeps the quarantined copy, and a
+                # directory at that name never stops the run's end.
+                t84 = {}
+                for case, frm, gate, wh_dir in (("budget_at_write", "WRITE", {}, False),
+                                                ("gate_no_action", "GATE", {"post_write": True, "action": None}, False),
+                                                ("gate_dir", "GATE", {"post_write": True, "action": "ACCEPT"}, True),
+                                                ("gate_ok", "GATE", {"post_write": True, "action": "ACCEPT"}, False)):
+                    dc = os.path.join(td, "t84c_" + case)
+                    os.makedirs(dc)
+                    open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+                    if wh_dir:
+                        os.makedirs(os.path.join(dc, "report_withheld.md"))
+                    else:
+                        open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+                    mc = Machine(dc, StubTasks({}), RunState(question="q", state=frm, v2_rules=False, last_gate=gate),
+                                 backend=spike, log=lambda *a: None)
+                    try:
+                        mc._go("FINAL", "t", "budget_exhausted" if frm == "WRITE" else "completed")
+                        t84[case] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+                    except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                        t84[case] = repr(e)
+                ok(t84 == {"budget_at_write": True, "gate_no_action": True, "gate_dir": True, "gate_ok": False},
+                   f"T84c the quarantined draft is retired only after a post-write gate decided, never a directory ({t84})")
             else:
                 ok(s == want and not os.path.exists(rp) and os.path.exists(os.path.join(d, "report_withheld.md"))
                    and al.get("remaining"),

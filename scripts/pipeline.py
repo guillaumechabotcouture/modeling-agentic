@@ -2147,13 +2147,15 @@ def _norm_rel(p: str, run_dir: str) -> str:
 
 def staged_copy_hint(rel: str, run_dir: str) -> str:
     """Baseline hb2 (§4.6): a cited path that is not itself a staged input but names one, by its repository path
-    (`data/inputs/<rel>` exists) or by a file name only one staged input has. The refusal's suffix naming it, or ""."""
+    (`data/inputs/<rel>` exists) or, for a bare file name, by the name only one staged input has (a qualified path in
+    another folder, a derived table, is never matched by its name; Codex r1 of #355). The refusal's suffix naming it,
+    or ""."""
     prov = _prov_inputs(run_dir)
     r = _norm_rel(rel, run_dir)
     if r.startswith(INPUTS_PREFIX) and r in prov:
         return ""
     hit = INPUTS_PREFIX + r if INPUTS_PREFIX + r in prov else None
-    if hit is None:
+    if hit is None and "/" not in r:
         same = [k for k in prov if k.rsplit("/", 1)[-1] == r.rsplit("/", 1)[-1]]
         hit = same[0] if len(same) == 1 else None
     return f" (its staged copy is {hit}: cite that path)" if hit else ""
