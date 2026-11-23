@@ -2741,6 +2741,10 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- before the checks exist (step α) this is the failure
         ok(False, f"DI spec checks: {type(e).__name__}: {e}")
     _self_test_engine_refs(ok)
+    try:
+        _self_test_registry(ok)
+    except Exception as e:  # noqa: BLE001 -- a crash in these cases is a failure, not a skip
+        ok(False, f"engine registry cases could not run: {type(e).__name__}: {e}")
     _self_test_joint_packages(ok)
     try:
         _self_test_plan_rule(ok)
@@ -2871,6 +2875,98 @@ def _self_test_engine_refs(ok) -> None:
            "SP-RW4 a registered engine still loads")
     except Exception as e:  # noqa: BLE001
         ok(False, f"SP-RW4 a registered engine still loads: {type(e).__name__}: {e}")
+
+
+def _self_test_registry(ok) -> None:
+    """ER1-ER6 (PR #363 question 15): a spec names only a registered engine (agents/analysis_backend.py ENGINES), at
+    sign-off and when the engine is built; self-tests extend the registry in code only, never from the spec."""
+    import json
+    import subprocess
+    import tempfile
+    from toolkit import import_guard as G
+    hook = "toolkit.engines.hooks:ToyScheduleEngine"      # allowed by the import policy, not registered
+    reg = registered_engines()
+    with tempfile.TemporaryDirectory() as d:
+        p = toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        raw["engine"] = {"ref": hook}
+        yaml.safe_dump(raw, open(p, "w"))
+        probs = validate(load(p))
+        try:
+            load(p).engine()
+            built = "built"
+        except SpecError as e:
+            built = str(e)
+        ok(any("not a registered engine" in x and all(r in x for r in reg) for x in probs[:1])
+           and "not a registered engine" in built,
+           f"ER1 a spec naming an unregistered engine is refused by validate (first problem, naming the registered "
+           f"engines) and when the engine is built ({probs[:1]}; {built[:80]})")
+        raw["engine"] = {"auto": True, "candidates": [hook]}
+        yaml.safe_dump(raw, open(p, "w"))
+        try:
+            load(p)
+            cand = "loaded"
+        except SpecError as e:
+            cand = str(e)
+        raw["engine"] = "auto"
+        yaml.safe_dump(raw, open(p, "w"))
+        json.dump({"engine": {"ref": hook}}, open(os.path.join(d, ENGINE_CHOICE), "w"))
+        try:
+            load(p)
+            choice = "loaded"
+        except SpecError as e:
+            choice = str(e)
+        ok("not a registered engine" in cand and "not a registered engine" in choice,
+           f"ER2 an unregistered engine: auto candidate and an engine choice of one are refused ({cand[:80]}; "
+           f"{choice[:80]})")
+        os.remove(os.path.join(d, ENGINE_CHOICE))
+        raw["engine"] = {"ref": reg[0]}
+        yaml.safe_dump(raw, open(p, "w"))
+        er3 = [x for x in validate(load(p)) if "registered engine" in x]
+        passes = []
+        for r in reg:
+            try:
+                check_engine_ref(r)
+                passes.append(True)
+            except SpecError:
+                passes.append(False)
+        ok(all(passes) and not er3, f"ER3 every registered engine passes the check, and a spec naming one has no "
+                                    f"registry problem ({passes}; {er3[:1]})")
+        # ER4: no spec field opts in (the registry is read from code only)
+        raw["engine"] = {"ref": hook, "registered": True, "test": True, "test_only": True}
+        raw["test_engines"] = [hook]
+        raw["register_test_engine"] = hook
+        yaml.safe_dump(raw, open(p, "w"))
+        probs4 = validate(load(p))
+        ok(any("not a registered engine" in x for x in probs4) and not G.test_engine_registered(hook),
+           f"ER4 no spec field registers an engine ({probs4[:1]})")
+    # ER5: no environment variable does either: a fresh process with test-looking variables set refuses the ref
+    code = ("import sys; sys.path.insert(0, %r)\n"
+            "from toolkit.spec import schema\n"
+            "try:\n"
+            "    schema.check_engine_ref(%r); print('allowed')\n"
+            "except schema.SpecError:\n"
+            "    print('refused')") % (ROOT, hook)
+    env = dict(os.environ, MA_TEST_ENGINES=hook, MA_IMPORT_GUARD_TEST_REFS=json.dumps([f"engine|{hook}"]))
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=ROOT)
+    ok(res.stdout.strip() == "refused", f"ER5 the environment registers no engine ({res.stdout.strip() or res.stderr[-200:]})")
+    # ER6: the test-only path: code in a self-test registers an engine the import policy allows, nothing else
+    try:
+        G.register_test_engine("os:system")
+        bad = "registered"
+    except G.ImportRefused:
+        bad = "refused"
+    G.register_test_engine(hook)
+    try:
+        check_engine_ref(hook)
+        er6 = "allowed"
+    except SpecError as e:
+        er6 = str(e)
+    finally:
+        G._TEST_ENGINES.discard(hook)
+    ok(bad == "refused" and er6 == "allowed",
+       f"ER6 a self-test registers an engine in-process (allowed: {er6}); a ref outside the import policy cannot be "
+       f"registered ({bad})")
 
 
 def _self_test_derived(ok) -> None:
