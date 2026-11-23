@@ -8,25 +8,44 @@ work for about 8 hours). One loop on a small Coiled VM, all its state in blob st
   (b) Eval collection: each enqueued launch (a run_cluster.py config's assignments.json) is fetched label by label with
       run_cluster.collect_from_storage (storage only: no cluster is attached or stopped), archived to the supervisor's
       prefix, and scripts/harness_metrics.py runs over every collected run (metrics.json).
-  (c) status.json, rewritten every loop: heartbeat, merge queue, collection, paused runs (resume is not automated
-      here), errors. Layout under outputs/supervisor/<name>/: requests/ (write-once, from the laptop), state.json and
-      status.json (the loop's only), collected/<launch>/<label>.tar.gz, metrics.json. The storage account comes from
-      $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT or --account, never the code.
+  (c) status.json, rewritten every loop: heartbeat, merge queue, collection, launches, paused runs
+      (resume is not automated here), errors. Layout under outputs/supervisor/<name>/: requests/ (write-once, from the
+      laptop), state.json and status.json (the loop's only), collected/<launch>/<label>.tar.gz,
+      launches/<request>/launch.log, metrics.json. The storage account comes from
+      $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT or --account (a bare account name only), never the code.
+  (d) Launches (`enqueue-launch`), one per request: the loop makes its own clean checkout of the commit (a fresh
+      clone; anything that differs from the commit, ignored files included, means a new clone), then runs
+      `run_cluster.py <checkout>/<config> launch` with EVAL_TAG, EVAL_REPS, EVAL_TREE=<checkout> and
+      MA_LAUNCH_INVOCATION=sv-<request>: run_cluster's own launch path and budget guard (scope ev; a config in another
+      scope is refused). The request is recorded as launching before the child starts and is never launched again
+      (one found launching after a restart is `interrupted`); a child past 45 min is ended and read as exit 4. On
+      exit 0/3/4/5 the launch id, cluster ids and assignments are recorded and its collection enqueued (b); otherwise
+      only this invocation's own failed record's ids are stopped (run_cluster's rule).
+      Health checks and stop rules for launches come in a separate change; until then a request with stop rules
+      is refused.
 
-    python3 cloud/supervisor.py start [--name sv-supervisor-gcc] [--cap-usd 15] [--max-hours 24]
+    python3 cloud/supervisor.py start [--name sv-supervisor-gcc] [--cap-usd 15] [--max-hours 168]
     python3 cloud/supervisor.py enqueue-merge <pr>... | enqueue-collect <config.py>... | enqueue-noop
+    python3 cloud/supervisor.py enqueue-launch cloud/configs/eval_<q>.py --tag T --reps N --commit SHA
     python3 cloud/supervisor.py status | pull [--dest ~/modeling-agentic-keep/supervisor] | stop
     python3 cloud/supervisor.py loop --name <name>      # on the VM; `start` runs it as a vm_job job
     python3 cloud/supervisor.py --self-test
 
 `start` is vm_job `up` (2-vCPU worker, 2-vCPU scheduler; the name needs a budget scope, the default is in `sv`) then
-`start` with the loop as the job, a dask task that holds the cluster for --max-hours. `stop` stops this name's live
-cluster by id. GitHub token: `start` passes $GH_TOKEN (vm_job --secret-env: the job's environment only) when the login
-keychain holds it under the service "modeling-agentic-supervisor-github"; without it merges stay held.
+`start` with the loop as the job, a dask task that holds the cluster for --max-hours (one long job, owner 2026-11-23:
+there is no hand-over to a successor). `stop` stops this name's live cluster by id. Secrets reach the job's
+environment only, by name (vm_job --secret-env), and `start` never copies the Coiled token or the Anthropic key into
+its own environment: $GH_TOKEN when the login keychain holds it under the service "modeling-agentic-supervisor-github"
+(without it merges stay held); DASK_COILED__TOKEN, which vm_job reads from the laptop's dask config, and
+ANTHROPIC_API_KEY, which it reads from the .env file (without either, launches stay held). A launch request carries the
+launch scope's signed budget record only when budget.py's checks pass on the laptop (signature, expiry, high-water
+mark), and the VM installs it only when they pass there too.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -36,6 +55,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -56,6 +76,7 @@ KEEP = 50              # last N acks / errors / finished merges kept in state
 
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")           # supervisor and launch names
 _LABEL = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}")  # run labels: neither can leave its directory
+_ACCOUNT = re.compile(r"[a-z0-9]{3,24}")                  # Azure storage account names
 
 
 def utc(t: float) -> str:
@@ -67,7 +88,8 @@ def paths(name: str) -> dict:
         raise SystemExit(f"bad supervisor name {name!r}")
     b = f"{ROOT}/{name}"
     return {"requests": f"{b}/requests/", "state": f"{b}/state.json", "status": f"{b}/status.json",
-            "collected": f"{b}/collected/", "metrics": f"{b}/metrics.json"}
+            "collected": f"{b}/collected/", "metrics": f"{b}/metrics.json",
+            "launches": f"{b}/launches/"}
 
 
 class Blob:
@@ -77,6 +99,10 @@ class Blob:
         self.rs, self.account = results_store, account or results_store.configured_account()
         if not self.account:
             raise SystemExit("no storage account: set $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT or pass --account")
+        if not _ACCOUNT.fullmatch(str(self.account)):   # vm_job.storage_account's rule; the value is never echoed
+            raise SystemExit("the storage account (--account or $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT) must be "
+                             "a bare storage account name (3-24 lowercase letters and digits), not a connection "
+                             "string, URL or key: refusing")
         self.svc = results_store._service(self.account)
     def put_json(self, blob, obj):
         with tempfile.TemporaryDirectory() as td:
@@ -285,12 +311,244 @@ def valid_entry(pl) -> dict:
     return pl
 
 
+# ---- (d) launches ----------------------------
+
+LAUNCH_MAX_S = 45 * 60    # a launch child past this is ended and read as run_cluster's exit 4 (launch_watch's bound)
+EVAL_SCOPE = "ev"
+SUBMITTED = (0, 3, 4, 5)  # run_cluster launch exits after which something may run: never read as failed
+STOP_RULES: dict = {}     # none yet: a request with stop rules is refused until they are enforced
+_SHA = re.compile(r"[0-9a-f]{40}")
+_CONFIG = re.compile(r"cloud/configs/eval_[a-z0-9_]+\.py")
+_TAG = re.compile(r"[a-z0-9][a-z0-9-]{0,19}")
+_SCOPE = re.compile(r"[a-z0-9]{1,16}")
+
+
+def valid_launch(pl) -> dict:
+    """A launch request's payload, or ValueError."""
+    pl = pl if isinstance(pl, dict) else {}
+    stop, reps = pl.get("stop") or {}, pl.get("reps")
+    num = lambda k, v: (isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0  # noqa: E731
+                        and (STOP_RULES[k] is float or isinstance(v, int)))
+    if not (_CONFIG.fullmatch(str(pl.get("config", ""))) and _TAG.fullmatch(str(pl.get("tag", "")))
+            and isinstance(reps, int) and not isinstance(reps, bool) and 1 <= reps <= 20
+            and _SHA.fullmatch(str(pl.get("commit", ""))) and isinstance(stop, dict) and set(stop) <= set(STOP_RULES)
+            and all(num(k, v) for k, v in stop.items()) and isinstance(pl.get("budget") or {}, dict)):
+        raise ValueError("launch request: needs cloud/configs/eval_<q>.py, a tag (a-z, 0-9, -), 1-20 reps, a full "
+                         f"commit sha and positive stop rules among {sorted(STOP_RULES)}")
+    return {"config": pl["config"], "tag": pl["tag"], "reps": reps, "commit": pl["commit"],
+            "stop": {k: STOP_RULES[k](v) for k, v in stop.items()}, "budget": pl.get("budget")}
+
+
+def make_tree(sha, root, url=f"https://github.com/{GH_REPO}.git") -> str:
+    """A clean checkout of `sha` at <root>/trees/<sha>, made here: cloned when absent, and cloned again when anything in
+    it differs from the commit (an edit, an untracked or an ignored file), so a launch never ships a dirty tree."""
+    import shutil
+    d = os.path.join(root, "trees", sha)
+    git = lambda *x: subprocess.run(["git", "-C", d, *x], capture_output=True, text=True, timeout=600)  # noqa: E731
+
+    def clean():
+        h, s = git("rev-parse", "HEAD"), git("status", "--porcelain", "--ignored", "--untracked-files=all")
+        return h.returncode == 0 and h.stdout.strip() == sha and s.returncode == 0 and not s.stdout.strip()
+    if os.path.isdir(d) and clean():
+        return d
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    r = subprocess.run(["git", "clone", "--quiet", "--no-checkout", url, d], capture_output=True, text=True,
+                       timeout=1800)
+    if r.returncode:
+        raise RuntimeError(f"git clone failed: {r.stderr.strip()[-200:]}")
+    r = git("checkout", "--quiet", "--detach", sha)
+    if r.returncode or not clean():
+        raise RuntimeError(f"no clean checkout of {sha[:9]}: {r.stderr.strip()[-200:]}")
+    return d
+
+
+def load_eval(e, tree):
+    """The request's RunConfig, loaded from `tree` with EVAL_TAG / EVAL_REPS / EVAL_TREE set as the launch sets them
+    (no bytecode written into the tree, and no `_eval` module kept from another tree)."""
+    import run_cluster as rc
+    keys, dwb = ("EVAL_TAG", "EVAL_REPS", "EVAL_TREE"), sys.dont_write_bytecode
+    saved = {k: os.environ.get(k) for k in keys}
+    sys.modules.pop("_eval", None)
+    try:
+        sys.dont_write_bytecode = True
+        os.environ.update(EVAL_TAG=e["tag"], EVAL_REPS=str(e["reps"]), EVAL_TREE=tree)
+        return rc.load_config(os.path.join(tree, e["config"]))
+    finally:
+        sys.dont_write_bytecode = dwb
+        sys.modules.pop("_eval", None)
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+def launch_env(e, tree, inv) -> dict:
+    return {**os.environ, "EVAL_TAG": e["tag"], "EVAL_REPS": str(e["reps"]), "EVAL_TREE": tree,
+            "MA_LAUNCH_INVOCATION": inv, "PYTHONDONTWRITEBYTECODE": "1"}
+
+
+def signed_budget(scope, budget_dir=None, load=None) -> dict:
+    """On the laptop: the scope's signed record as it is on disk, sent with a launch request only once budget.py's own
+    checks pass here (signature, scope, expiry, and the high-water mark that refuses an older record restored by
+    mistake). SystemExit otherwise: a request never carries a record the laptop would refuse."""
+    import budget
+    p = os.path.join(budget_dir or budget.BUDGET_DIR, f"budget_{scope}.json")
+    if not os.path.exists(p):
+        raise SystemExit(f"no budget record for scope {scope} on this machine: the owner signs one with "
+                         "`budget.py set`; refusing")
+    try:
+        (load or budget.load_budget)(scope)
+    except budget.BudgetError as e:
+        raise SystemExit(f"the {scope} budget record does not pass this machine's checks: {e}; refusing") from None
+    return json.load(open(p))
+
+
+def install_budget(scope, rec, budget_dir=None, load=None) -> bool:
+    """On the VM: put a signed record where budget.py reads it, only if budget.py's checks then pass here for this
+    scope (signature, scope, expiry, high-water mark); otherwise the record it had (or none) is put back. True when
+    installed, False when it was already there; ValueError when it does not verify."""
+    import budget
+    if not (_SCOPE.fullmatch(str(scope)) and isinstance(rec, dict)):
+        raise ValueError("a budget record needs a plain scope name and a record")
+    p = os.path.join(budget_dir or budget.BUDGET_DIR, f"budget_{scope}.json")
+    old = open(p).read() if os.path.exists(p) else None
+    if old is not None and json.loads(old) == rec:
+        return False
+    budget._write_private(p, json.dumps(rec, indent=1) + "\n")
+    try:
+        (load or budget.load_budget)(scope)
+    except Exception as e:  # noqa: BLE001 -- BudgetError or an unreadable record: the previous state is restored
+        if old is None:
+            os.remove(p)
+        else:
+            budget._write_private(p, old)
+        raise ValueError(f"the {scope} budget record does not verify on this VM ({type(e).__name__}: "
+                         f"{str(e)[:120]}): not installed") from None
+    return True
+
+
+class Cloud:
+    """What the loop does to the cloud. Not used by the self-test, which passes FakeCloud."""
+
+    def __init__(self, work, a):
+        self.work, self.a = work, a
+
+    def disabled(self):
+        miss = [f"${n}" for n in ("DASK_COILED__TOKEN", "ANTHROPIC_API_KEY") if not os.environ.get(n)]
+        import shutil
+        return (f"no {' or '.join(miss)} on the VM (`start` passes them when the laptop holds them)" if miss
+                else None if shutil.which("git") else "no git on the VM")
+
+    def tree(self, sha):
+        return make_tree(sha, self.work)
+
+    def config(self, e, tree):
+        c = load_eval(e, tree)
+        return {"name": c.name, "budget_scope": c.budget_scope, "cap_usd": c.cap_usd,
+                "storage_prefix": c.storage_prefix, "storage_account": c.storage_account,
+                "run_timeout_hours": c.run_timeout_hours, "max_rounds": c.max_rounds}
+
+    def install_budget(self, scope, rec):
+        return install_budget(scope, rec)
+
+    def start_launch(self, e, tree, inv, log):
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        return subprocess.Popen([sys.executable, os.path.join(HERE, "run_cluster.py"), os.path.join(tree, e["config"]),
+                                 "launch"], cwd=REPO_ROOT, env=launch_env(e, tree, inv), stdin=subprocess.DEVNULL,
+                                stdout=open(log, "ab"), stderr=subprocess.STDOUT)
+
+    def records(self, e, tree):
+        c = load_eval(e, tree)
+        rd = lambda p: json.load(open(p)) if os.path.exists(p) else {}  # noqa: E731
+        return rd(c.clusters_file), rd(c.state_file)
+
+    def stop(self, name, cid, why):
+        import launch_watch
+        launch_watch.CoiledApi().stop(name, cid, why)       # vm_job._stop_by_id: by id, bounded
+
+
+
+def launch_step(blob, name, state, now, work, cloud, handles, allow_new=True) -> None:
+    """Each finished launch child: read its records, then the launch's collection is enqueued (submitted) or its own
+    failed record's ids are stopped (run_cluster's rule). Then at most one queued request is launched: from a clean
+    checkout of its commit, through `run_cluster.py <config> launch` (its budget guard, scope ev), once: the request
+    is recorded as launching before the child starts, and one found launching with no child is never relaunched."""
+    for rid, e in sorted(state["launch"].items()):
+        if e["state"] != "launching":
+            continue
+        h = handles.get(rid)
+        if h is None:
+            e.update(state="interrupted", note="the loop restarted during the launch: not relaunched; read its "
+                     "clusters.json by hand")
+            continue
+        code = h.poll()
+        if code is None and now - e["started_at"] <= LAUNCH_MAX_S:
+            continue
+        if code is None:
+            h.kill()
+            code = 4                       # submitted, not confirmed: watch, never read as failed
+        handles.pop(rid)
+        e["exit_code"] = code
+        log = os.path.join(work, "launches", rid, "launch.log")
+        if os.path.exists(log):
+            blob.put_file(log, f"{paths(name)['launches']}{rid}/launch.log")
+        clusters, assign = cloud.records(e, cloud.tree(e["commit"]))
+        mine = clusters.get("invocation") == e["invocation"]
+        ids = {r: {"name": clusters[r]["name"], "id": clusters[r]["id"]} for r in ("run", "keeper", "overflow")
+               if mine and isinstance(clusters.get(r), dict) and clusters[r].get("id") is not None}
+        e.update(clusters=ids, clusters_rec=clusters if mine else {})
+        if code in SUBMITTED:
+            asg = {k: v for k, v in (assign or {}).items() if isinstance(v, dict) and v.get("launch_id")}
+            e.update(state="launched", launch_id=clusters.get("launch_id") if mine else None, assignments=asg,
+                     launched_at=now, launched_utc=utc(now), labels={}, note=f"run_cluster launch exit {code}")
+            if asg:
+                ent = valid_entry({"name": e["name"], "storage_prefix": e["storage_prefix"],
+                                   "storage_account": e["storage_account"], "assignments": asg})
+                state["collect"].setdefault(e["name"], {"labels": {}})["entry"] = ent
+        else:
+            failed = mine and clusters.get("status") == "failed"
+            for r, c in sorted(ids.items() if failed else ()):
+                cloud.stop(c["name"], c["id"], f"supervisor: launch {rid} failed")
+            e.update(state="failed", note=f"run_cluster launch exit {code}; "
+                     + (f"stopped this invocation's failed record's ids {sorted(c['id'] for c in ids.values())}"
+                        if failed else "no failed record of this invocation: nothing stopped"))
+    queued = [rid for rid, e in sorted(state["launch"].items()) if e["state"] == "queued"]
+    why = cloud.disabled() if queued else None
+    if not queued or why or not allow_new or handles:
+        for rid in queued:
+            state["launch"][rid]["note"] = ("held: " + why if why else "held: this job ends soon"
+                                            if not allow_new else "waiting for the launch before it")
+        return
+    rid = queued[0]
+    e = state["launch"][rid]
+    try:
+        tree = cloud.tree(e["commit"])
+        cfg = cloud.config(e, tree)
+        if cfg["budget_scope"] != EVAL_SCOPE or not _NAME.fullmatch(str(cfg["name"])):
+            raise ValueError(f"budget scope {cfg['budget_scope']!r} and name {cfg['name']!r}: an eval launch is in "
+                             f"scope {EVAL_SCOPE}")
+        if e.get("budget"):
+            cloud.install_budget(cfg["budget_scope"], e["budget"])
+    except Exception as ex:  # noqa: BLE001 -- refused once, never retried every loop
+        e.update(state="refused", note=f"{type(ex).__name__}: {str(ex)[:200]}")
+        return
+    e.update(cfg, state="launching", invocation=f"sv-{rid}", started_at=now, started_utc=utc(now), note="")
+    blob.put_json(paths(name)["state"], state)     # before the child: a restart finds it launching, never queued
+    try:
+        handles[rid] = cloud.start_launch(e, tree, e["invocation"], os.path.join(work, "launches", rid, "launch.log"))
+    except Exception as ex:  # noqa: BLE001 -- the launcher did not start: nothing was submitted
+        e.update(state="failed", note=f"the launcher did not start: {type(ex).__name__}: {str(ex)[:160]}")
+
+
+_HIDDEN = ("budget", "assignments", "clusters_rec", "started_at", "launched_at")
+
+
 def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metrics=run_metrics, host="",
-         merge_why="no GitHub token ($GH_TOKEN) on the VM: merges are held") -> dict:
-    """One pass: ingest new requests, one merge step, collection, then state.json and status.json. A failing part is
-    recorded in errors and the rest still runs; status is always written."""
+         merge_why="no GitHub token ($GH_TOKEN) on the VM: merges are held", cloud=None, handles=None,
+         allow_launch=True) -> dict:
+    """One pass: ingest new requests, one merge step, launches, collection, then state.json and status.json. A failing part is recorded in errors and the rest still runs; status is always written."""
     p, state = paths(name), {"seen": [], "merge": [], "merge_done": [], "collect": {}, "acks": [], "errors": [],
-                             **(state or {})}
+                             "launch": {}, **(state or {})}
+    handles = {} if handles is None else handles
 
     def err(where, e):
         state["errors"] = (state["errors"] + [{"at": utc(now), "where": where,
@@ -315,6 +573,8 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
                                    if int(n) not in queued]
             elif kind == "collect":
                 state["collect"].setdefault(valid_entry(pl)["name"], {"labels": {}})["entry"] = pl
+            elif kind == "launch":
+                state["launch"][rid] = {**valid_launch(pl), "state": "queued", "request": rid, "note": ""}
             elif kind != "noop":
                 raise ValueError(f"unknown kind {kind!r}")
             state["acks"] = (state["acks"] + [{"request": rid, "kind": kind, "at": utc(now)}])[-KEEP:]
@@ -327,11 +587,17 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
                 state["merge_done"] = (state["merge_done"] + [state["merge"].pop(0)])[-KEEP:]
         except Exception as e:  # noqa: BLE001
             err("merge", e)
+    if cloud is not None:
+        try:
+            launch_step(blob, name, state, now, work, cloud, handles, allow_new=allow_launch)
+        except Exception as e:  # noqa: BLE001
+            err("launch", e)
     try:
         collect_step(blob, name, state, now, work, fetch=fetch, metrics=metrics)
     except Exception as e:  # noqa: BLE001
         err("collect", e)
     state["loops"] = int(state.get("loops", 0)) + 1
+    launch_why = "no cloud access in this loop" if cloud is None else cloud.disabled() or ""
     paused = []
     for d in run_dirs(work):
         try:
@@ -343,6 +609,9 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
               "merge": {"enabled": gh is not None, "why": "" if gh is not None else merge_why,
                         "queue": state["merge"], "done": state["merge_done"][-10:]},
               "collect": {k: {"labels": v["labels"]} for k, v in state["collect"].items()},
+              "launch": {"enabled": not launch_why, "why": launch_why,
+                         "requests": {r: {k: v for k, v in e.items() if k not in _HIDDEN}
+                                      for r, e in state["launch"].items()}},
               "metrics_at": state.get("metrics_at"), "paused": paused,
               "acks": state["acks"][-10:], "errors": state["errors"][-10:]}
     blob.put_json(p["state"], state)
@@ -351,7 +620,7 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
 
 
 def loop(a):
-    blob, p, work = Blob(a.account), paths(a.name), os.path.abspath(a.work)
+    blob, p, work = Blob(a.account), paths(a.name), os.path.abspath(os.path.expanduser(a.work))
     gh, why = None, "no GitHub token ($GH_TOKEN) on the VM: merges are held"
     if os.environ.get("GH_TOKEN"):
         try:
@@ -368,13 +637,22 @@ def loop(a):
             print(f"state.json unreadable ({type(e).__name__}); retrying", flush=True)
             time.sleep(30)
     host, deadline = f"{os.uname().nodename}:{os.getpid()}", time.time() + a.max_hours * 3600
+    cloud, handles = Cloud(work, a), {}
     while time.time() < deadline:
+        now = time.time()
         try:
-            state = tick(blob, a.name, state, time.time(), work, gh=gh, host=host, merge_why=why)
+            state = tick(blob, a.name, state, now, work, gh=gh, host=host, merge_why=why, cloud=cloud,
+                         handles=handles, allow_launch=deadline - now > LAUNCH_MAX_S)
         except Exception as e:  # noqa: BLE001 -- the loop outlives one bad pass (storage blip, DNS)
             print(f"tick failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
-        time.sleep(a.every)
+        time.sleep(min(sleep_for(state, time.time(), a.every), max(0.0, deadline - time.time())))
     return 0
+
+
+def sleep_for(state, now, every) -> float:
+    """Seconds until the next due check, at most `every`: a launch child is polled every 15 s."""
+    due = [float(every)] + [15.0 for e in (state.get("launch") or {}).values() if e.get("state") == "launching"]
+    return max(1.0, min(due))
 
 
 def status_lines(st: dict | None, now: float) -> tuple[list, int]:
@@ -393,6 +671,12 @@ def status_lines(st: dict | None, now: float) -> tuple[list, int]:
     for lname, ent in sorted((st.get("collect") or {}).items()):
         for label, lab in sorted(ent.get("labels", {}).items()):
             out.append(f"collect {lname}/{label}: {lab.get('state')} {lab.get('note', '')}".rstrip())
+    la = st.get("launch") or {}
+    if la.get("requests"):
+        out.append(f"launches: {'enabled' if la.get('enabled') else 'held (' + str(la.get('why')) + ')'}")
+    for rid, e in sorted((la.get("requests") or {}).items()):
+        out.append(f"launch {rid} {e.get('config')} tag {e.get('tag')} x{e.get('reps')} @ {str(e.get('commit'))[:9]}: "
+                   f"{e.get('state')} {e.get('launch_id') or ''} {e.get('note') or ''}".rstrip())
     out.append(f"metrics.json: {st.get('metrics_at') or 'not yet'}")
     out += [f"paused run: {x['run']} ({x['status']}); resume is not automated" for x in st.get("paused") or []]
     out += [f"ack {x['kind']} request {x['request']} at {x['at']}" for x in st.get("acks") or []]
@@ -429,39 +713,78 @@ def pull(blob, name, dest, now=None) -> list:
                 os.rename(os.path.join(td, label), os.path.join(target, label))
             index[lab["blob"]] = lab["sha256"]
             got.append(lab["blob"])
+    lp = paths(name)["launches"]
+    for b in blob.names(lp):          # each launch's launch.log (small; fetched when new)
+        rid, _, fn = b[len(lp):].partition("/")
+        if _LABEL.fullmatch(rid) and fn == "launch.log":
+            dst = os.path.join(dest, "launches", rid, fn)
+            if not os.path.exists(dst):           # written once
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                blob.get_file(b, dst)
+                got.append(b)
     json.dump(index, open(ip, "w"), indent=1)
     if got and st.get("metrics_at"):
         blob.get_file(paths(name)["metrics"], os.path.join(dest, "metrics.json"))
     return got
 
 
-def start_commands(a, job_id, token_present) -> list:
-    """The two vm_job commands `start` runs: up (2-vCPU worker) and start (the loop as a job)."""
+def start_commands(a, job_id, token_present, coiled=False, anthropic=False) -> list:
+    """The two vm_job commands `start` runs: up (2-vCPU worker) and start (the loop as a job). Secrets pass by name only
+    (--secret-env): vm_job reads each where the laptop keeps it, and this process never holds them in its
+    environment."""
     vm = [sys.executable, "cloud/vm_job.py"]
-    budget = ["--cap-usd", str(a.cap_usd)] + (["--budget-scope", a.budget_scope] if a.budget_scope else [])
+    scope = ["--budget-scope", a.budget_scope] if a.budget_scope else []
     acct = ["--store-account", a.account] if a.account else []
-    up = vm + ["up", a.name, "--cpu", "2", "--memory", "8 GiB", "--idle-timeout", "20 minutes"] + budget
-    start = (vm + ["start", a.name, job_id, "--tree", ".", "--max-hours", str(a.max_hours + 0.25)] + acct + budget
+    up = vm + ["up", a.name, "--cpu", "2", "--memory", "8 GiB", "--idle-timeout", "20 minutes",
+               "--cap-usd", str(a.cap_usd)] + scope
+    start = (vm + ["start", a.name, job_id, "--tree", ".", "--max-hours", str(a.max_hours + 0.25)] + acct
+             + ["--cap-usd", str(a.cap_usd)] + scope
              + (["--secret-env", "GH_TOKEN"] if token_present else [])
+             + (["--secret-env", "DASK_COILED__TOKEN"] if coiled else [])
+             + (["--secret-env", "ANTHROPIC_API_KEY"] if anthropic else [])
              + ["--", "python3", "cloud/supervisor.py", "loop", "--name", a.name, "--every", str(int(a.every)),
-                "--max-hours", str(a.max_hours)])
+                "--max-hours", str(a.max_hours)] + (["--account", a.account] if a.account else []))
     return [up, start]
 
 
-def cmd_start(a):
+def _laptop_secrets() -> tuple:
+    """(GitHub token from the keychain, whether vm_job finds a Coiled token, whether it finds an Anthropic key). The
+    last two are presence only: their values stay where they are (dask config, .env) until vm_job reads them."""
     r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"], capture_output=True,
                        text=True)                      # the owner's one-time step stores it there
-    tok = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    gh = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    import vm_job
+    return gh, bool(vm_job._secret_value("DASK_COILED__TOKEN")), bool(vm_job._secret_value("ANTHROPIC_API_KEY"))
+
+
+def cmd_start(a):
+    tok, co, an = _laptop_secrets()
     job_id = "sv-" + time.strftime("%Y%m%d-%H%M%S")
     env = {**os.environ, **({"GH_TOKEN": tok} if tok else {})}
-    print(f"merge train: {'enabled (token from the keychain)' if tok else 'disabled (no token in the keychain)'}")
-    for cmd in start_commands(a, job_id, bool(tok)):
+    print(f"merge train: {'enabled (token from the keychain)' if tok else 'disabled (no token in the keychain)'}; "
+          f"launches: {'enabled' if co and an else 'held (no Coiled token or no Anthropic key here)'}")
+    for cmd in start_commands(a, job_id, bool(tok), coiled=co, anthropic=an):
         print("$ " + " ".join(cmd), flush=True)
         r = subprocess.run(cmd, cwd=REPO_ROOT, env=env)
         if r.returncode:
             return r.returncode
     print(f"started {job_id}; read it with `python3 cloud/supervisor.py status --name {a.name}`")
     return 0
+
+
+def launch_request(a, repo=REPO_ROOT) -> dict:
+    """enqueue-launch's payload, checked here first: the config loads with this tag and reps and is in scope ev,
+    the commit is a full sha known to this checkout, and the scope's signed budget record goes with it."""
+    r = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{a.commit}^{{commit}}"], capture_output=True,
+                       text=True)
+    if r.returncode:
+        raise SystemExit(f"{a.commit}: not a commit of {repo}")
+    e = valid_launch({"config": os.path.relpath(os.path.abspath(a.config), repo), "tag": a.tag, "reps": a.reps,
+                      "commit": r.stdout.strip(), "stop": {}})
+    cfg = load_eval(e, repo)
+    if cfg.budget_scope != EVAL_SCOPE:
+        raise SystemExit(f"{cfg.name}: budget scope {cfg.budget_scope!r}; the supervisor launches scope {EVAL_SCOPE}")
+    return {**e, "budget": signed_budget(cfg.budget_scope)}     # the scope this launch's guard checks
 
 
 def stop_own(name, live_id=None, stop=None):
@@ -521,6 +844,37 @@ class FakeGitHub:
         self.prs[n].update(state="closed", merged=True)
         return True
 
+
+class FakeCloud:
+    """The loop's cloud actions, recorded (no Coiled, GitHub or storage call). `code`: the launch child's exit (None:
+    still running)."""
+    def __init__(self, why=None, code=0, scope="ev", mine=True, status="launched", dirty=False):
+        self.why, self.code, self.scope = why, code, scope
+        self.mine, self.status, self.dirty, self.calls, self.inv = mine, status, dirty, [], None
+        self.seen_state = None
+    def disabled(self):
+        return self.why
+    def tree(self, sha):
+        if self.dirty:
+            raise RuntimeError(f"no clean checkout of {sha[:9]}")
+        return f"/trees/{sha}"
+    def config(self, e, tree):
+        return {"name": "ev-flu-t1-gcc", "budget_scope": self.scope, "cap_usd": 70,
+                "storage_prefix": "runs/evals/t1/flu_vaccine", "storage_account": "acct", "run_timeout_hours": 24,
+                "max_rounds": 3}
+    def install_budget(self, scope, rec):
+        self.calls.append(("budget", scope))
+    def start_launch(self, e, tree, inv, log, blob=None):
+        self.calls.append(("launch", e["config"], e["tag"], e["reps"], tree, inv))
+        self.inv = inv
+        return types.SimpleNamespace(poll=lambda: self.code, kill=lambda: self.calls.append(("kill",)))
+    def records(self, e, tree):
+        n = "ev-flu-t1-gcc"
+        return ({"invocation": self.inv if self.mine else "other", "launch_id": "L1", "status": self.status,
+                 "run": {"name": n, "id": 101}, "keeper": {"name": n + "-keeper", "id": 102}},
+                {"R1": {"launch_id": "L1", "worker": "w1"}, "R2": {"launch_id": "L1", "worker": "w2"}})
+    def stop(self, name, cid, why):
+        self.calls.append(("stop", name, cid))
 
 def _self_test() -> int:
     fails = []
@@ -753,6 +1107,193 @@ def _self_test() -> int:
     st = run(b, [T0, T0 + 1])
     ok(len(st.get("seen", [])) == 1003 and st["acks"][-1]["at"] == utc(T0), "SV24 no processed request is replayed")
 
+    # ---- launches (SV25-SV30, SV41-SV42) ----
+    import types
+    from unittest import mock
+    SHA = "ab" * 20
+    KW = {"fetch": lambda *x: (_ for _ in ()).throw(FileNotFoundError("not stored yet")), "metrics": metrics}
+    LREQ = {"config": "cloud/configs/eval_flu_vaccine.py", "tag": "t1", "reps": 2, "commit": SHA,
+            "budget": {"record": {"scope": "ev", "nonce": "N0NCE"}, "sig": "s"}}
+
+    def launched(cl, stop=None, extra=()):
+        """A FakeBlob and a state with one request launched at T0 (ticks at T0 and T0 + 1)."""
+        b, h = FakeBlob(), {}
+        guard(enqueue, b, N, "launch", {**LREQ, "stop": stop or {}}, T0)
+        for rq in extra:
+            guard(enqueue, b, N, "launch", rq, T0)
+        with tempfile.TemporaryDirectory() as td:
+            st = guard(tick, b, N, {}, T0, td, cloud=cl, handles=h, **KW)
+            st = guard(tick, b, N, st, T0 + 1, td, cloud=cl, handles=h, **KW)
+        return b, st if isinstance(st, dict) else {"raised": st}
+
+    def ticks(b, st, cl, times):
+        with tempfile.TemporaryDirectory() as td:
+            for t in times:
+                st = guard(tick, b, N, st, t, td, cloud=cl, handles={}, **KW)
+        return st if isinstance(st, dict) else {"raised": st}
+
+    def req_of(st):
+        return next(iter((st.get("launch") or {}).values()), {})
+
+    # SV25 a launch request needs an eval config, a tag, 1-20 reps and a full sha; stop rules are not taken yet
+    good = guard(valid_launch, LREQ)
+    bad = [{**LREQ, "commit": "abc123"}, {**LREQ, "config": "../evil/eval_x.py"},
+           {**LREQ, "config": "cloud/configs/nigeria_gf13_v2.py"}, {**LREQ, "tag": "Bad_Tag"}, {**LREQ, "reps": 0},
+           {**LREQ, "stop": {"usd": 5}}, {**LREQ, "stop": {"tag_usd": 50}}]
+    ok(isinstance(good, dict) and good["stop"] == {}
+       and all("ValueError" in str(guard(valid_launch, x)) for x in bad), f"SV25 launch requests are validated ({good})")
+    # SV26 without cloud access (no Coiled token / Anthropic key on the VM) launches are held, and status says why
+    cl = FakeCloud(why="no $DASK_COILED__TOKEN on the VM")
+    b, st = launched(cl)
+    la = (b.get_json(P["status"]) or {}).get("launch", {})
+    ok(not cl.calls and la.get("enabled") is False and "COILED" in la.get("why", "") and req_of(st).get("state") == "queued"
+       and "held" in req_of(st).get("note", ""), f"SV26 launches are held without cloud access ({la})")
+    # SV27 one launch per request, from the clean tree, recorded as launching before the child starts; on exit 0 its
+    # launch id, cluster ids and assignments are recorded and its collection enqueued; the budget record stays in state
+    cl, b, h = FakeCloud(code=None), FakeBlob(), {}
+    rid = guard(enqueue, b, N, "launch", LREQ, T0)
+    orig = cl.start_launch
+    cl.start_launch = lambda e, tree, inv, log: (setattr(cl, "seen_state", (b.get_json(P["state"]) or {})
+                                                         .get("launch", {}).get(rid, {}).get("state"))
+                                                 or orig(e, tree, inv, log))
+    with tempfile.TemporaryDirectory() as td:
+        st = guard(tick, b, N, {}, T0, td, cloud=cl, handles=h, **KW)
+        st = guard(tick, b, N, st, T0 + 60, td, cloud=cl, handles=h, **KW)
+        cl.code = 0
+        st = guard(tick, b, N, st, T0 + 120, td, cloud=cl, handles=h, **KW)
+    e, raw = req_of(st), b.d.get(P["status"], b"")
+    ok([c for c in cl.calls if c[0] == "launch"] == [("launch", LREQ["config"], "t1", 2, f"/trees/{SHA}", f"sv-{rid}")]
+       and cl.seen_state == "launching" and ("budget", "ev") in cl.calls,
+       f"SV27 launched once, from the commit's clean tree, recorded as launching first ({cl.calls}, {cl.seen_state})")
+    ok(e.get("state") == "launched" and e.get("launch_id") == "L1" and e.get("clusters", {}).get("run", {}).get("id") == 101
+       and sorted(st.get("collect", {}).get("ev-flu-t1-gcc", {}).get("entry", {}).get("assignments", {})) == ["R1", "R2"]
+       and b"N0NCE" not in raw and b"N0NCE" in b.d[P["state"]],
+       f"SV27b exit 0: launch id, cluster ids and assignments recorded, collection enqueued ({e})")
+    b2 = FakeBlob()
+    b2.d = dict(b.d)
+    st2 = b2.get_json(P["state"])
+    st2["launch"][rid]["state"] = "launching"
+    cl2 = FakeCloud()
+    with tempfile.TemporaryDirectory() as td:
+        st2 = guard(tick, b2, N, st2, T0 + 200, td, cloud=cl2, handles={}, **KW)
+    ok(not cl2.calls and req_of(st2).get("state") == "interrupted",
+       f"SV27c a request found launching after a restart is never launched again ({req_of(st2)})")
+    # SV28 make_tree: a clean checkout of the sha; anything that differs is replaced by a fresh clone; unknown sha refused
+    with tempfile.TemporaryDirectory() as td:
+        src, g = os.path.join(td, "src"), ["git", "-c", "user.name=t", "-c", "user.email=t@x", "-c", "commit.gpgsign=false"]
+        os.makedirs(src)
+        r = subprocess.run(["git", "init", "-q", src], capture_output=True)
+        open(os.path.join(src, "f.txt"), "w").write("one\n")
+        subprocess.run(g + ["-C", src, "add", "f.txt"], capture_output=True)
+        subprocess.run(g + ["-C", src, "commit", "-qm", "c1"], capture_output=True)
+        sha = subprocess.run(["git", "-C", src, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        d = guard(make_tree, sha, os.path.join(td, "w"), url=src)
+        ok(isinstance(d, str) and open(os.path.join(d, "f.txt")).read() == "one\n", f"SV28 a clean checkout of the sha ({d})")
+        if isinstance(d, str):
+            open(os.path.join(d, "stray.py"), "w").write("x")
+            open(os.path.join(d, "f.txt"), "w").write("edited\n")
+            d2 = guard(make_tree, sha, os.path.join(td, "w"), url=src)
+            ok(d2 == d and not os.path.exists(os.path.join(d, "stray.py")) and open(os.path.join(d, "f.txt")).read() == "one\n",
+               "SV28b a tree with an edit or an untracked file is replaced by a fresh clone, never launched")
+        ok("RuntimeError" in str(guard(make_tree, "cd" * 20, os.path.join(td, "w"), url=src)),
+           "SV28c a sha the repository does not hold is refused")
+    # SV29 a config outside budget scope ev, or a commit with no clean tree, is refused once and never launched
+    for cl, what in ((FakeCloud(scope="f6"), "scope"), (FakeCloud(dirty=True), "clean")):
+        b, st = launched(cl)
+        ok(not [c for c in cl.calls if c[0] == "launch"] and req_of(st).get("state") == "refused"
+           and what in req_of(st).get("note", ""), f"SV29 refused: {what} ({req_of(st)})")
+    # SV30 a launch that fails: this invocation's failed record's ids are stopped; another invocation's: nothing
+    for mine, want in ((True, [101, 102]), (False, [])):
+        cl = FakeCloud(code=1, mine=mine, status="failed")
+        b, st = launched(cl)
+        ok(req_of(st).get("state") == "failed" and sorted(c[2] for c in cl.calls if c[0] == "stop") == want,
+           f"SV30 exit 1, record {'ours' if mine else 'not ours'}: stops {want} ({cl.calls})")
+    # SV41 status lines show each launch; pull fetches each launch's log once
+    cl = FakeCloud()
+    b, st = launched(cl)
+    rid_ = req_of(st).get("request", "?")
+    b.d[f"{P['launches']}{rid_}/launch.log"] = b"invocation sv-x\n"
+    lines = "\n".join(guard(status_lines, b.get_json(P["status"]) or {}, T0 + 30)[0])
+    with tempfile.TemporaryDirectory() as dest:
+        got1, got2 = guard(pull, b, N, dest), guard(pull, b, N, dest)
+        ok(f"launch {rid_} cloud/configs/eval_flu_vaccine.py tag t1 x2 @ ababababa: launched L1" in lines
+           and any(g.endswith("launch.log") for g in got1) and got2 == []
+           and os.path.exists(os.path.join(dest, "launches", rid_, "launch.log")),
+           f"SV41 status shows each launch; pull fetches its log once ({lines})")
+    # SV42 close to the job's end no new launch starts
+    cl, b = FakeCloud(), FakeBlob()
+    guard(enqueue, b, N, "launch", LREQ, T0)
+    with tempfile.TemporaryDirectory() as td:
+        st = guard(tick, b, N, {}, T0, td, cloud=cl, handles={}, allow_launch=False, **KW)
+    ok(not cl.calls and "ends soon" in req_of(st).get("note", ""), f"SV42 no launch starts near the job's end ({st})")
+
+    # ---- Codex round 1 on #358, the parts that apply to launches (SV43-SV46) ----
+    def refused(fn, *a, **k):
+        """fn's result, or its SystemExit's message (guard lets SystemExit through)."""
+        try:
+            return fn(*a, **k)
+        except SystemExit as e:
+            return str(e)
+
+    # SV43 `start` passes the Coiled token and the Anthropic key by name only: never copied into vm_job's environment
+    a = argparse.Namespace(name=DEFAULT_NAME, cap_usd=15.0, max_hours=168.0, budget_scope=None, account="acct1",
+                           every=60)
+    runs_ = []
+    with mock.patch.dict(globals(), {"_laptop_secrets": lambda: (None, True, True)}), \
+            mock.patch.object(subprocess, "run", lambda cmd, **k: runs_.append((cmd, k.get("env")))
+                              or types.SimpleNamespace(returncode=0)), \
+            mock.patch.dict(os.environ, {}), contextlib.redirect_stdout(io.StringIO()):
+        for k_ in ("DASK_COILED__TOKEN", "ANTHROPIC_API_KEY"):
+            os.environ.pop(k_, None)
+        rc_ = guard(cmd_start, a)
+    flat = " ".join(" ".join(c) for c, _ in runs_)
+    ok(rc_ == 0 and len(runs_) == 2 and "--secret-env DASK_COILED__TOKEN" in flat
+       and "--secret-env ANTHROPIC_API_KEY" in flat and "--anthropic-key" not in flat
+       and not any(e_ and ("DASK_COILED__TOKEN" in e_ or "ANTHROPIC_API_KEY" in e_) for _, e_ in runs_),
+       f"SV43 start: secrets by name, none copied into the launcher's environment ({flat})")
+    # SV44 a storage account that is not a bare name (argument or environment) is refused before any Blob client
+    import results_store
+    built = []
+    with mock.patch.object(results_store, "_service", lambda acct: built.append(acct) or object()):
+        bad_ = "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc=="
+        r_arg = refused(Blob, bad_)
+        with mock.patch.dict(os.environ, {"MA_STORAGE_ACCOUNT": "https://x.blob.core.windows.net"}):
+            r_env = refused(Blob, None)
+        good_ = guard(Blob, "acct1")
+    ok(isinstance(r_arg, str) and "storage account" in r_arg and "AccountKey" not in r_arg
+       and isinstance(r_env, str) and "storage account" in r_env and built == ["acct1"] and isinstance(good_, Blob),
+       f"SV44 a connection string, URL or key as the account is refused, unechoed, before any client ({r_arg}, "
+       f"{r_env}, {built})")
+    # SV45 budget records: the laptop sends only one its own checks pass (signature, expiry, the high-water mark) for
+    # the scope the launch uses; the VM installs one only if it verifies there, and keeps what it had otherwise
+    import budget
+    with tempfile.TemporaryDirectory() as bd:
+        open(os.path.join(bd, "budget_ev.json"), "w").write(json.dumps({"record": {"scope": "ev"}, "sig": "s"}))
+        asked = []
+        ok_load = lambda sc: asked.append(sc) or {"scope": sc}  # noqa: E731
+
+        def bad_load(sc):
+            raise budget.BudgetError("issued before the newest one seen")
+        got_ = guard(signed_budget, "ev", budget_dir=bd, load=ok_load)
+        ref_ = refused(signed_budget, "ev", budget_dir=bd, load=bad_load)
+        none_ = refused(signed_budget, "sv", budget_dir=bd, load=ok_load)
+        ok(got_ == {"record": {"scope": "ev"}, "sig": "s"} and asked == ["ev"] and "issued before" in str(ref_)
+           and "SystemExit" not in str(got_) and isinstance(none_, str) and "no budget" in none_,
+           f"SV45 the laptop sends the launch scope's record only when its checks pass ({got_}, {ref_}, {none_})")
+        prev = open(os.path.join(bd, "budget_ev.json")).read()
+        r_bad = guard(install_budget, "ev", {"record": {"scope": "ev", "older": 1}}, budget_dir=bd, load=bad_load)
+        kept = open(os.path.join(bd, "budget_ev.json")).read() == prev
+        r_new = guard(install_budget, "sv", {"record": {"scope": "sv"}}, budget_dir=bd, load=bad_load)
+        ok("does not verify" in str(r_bad) and kept and "does not verify" in str(r_new)
+           and not os.path.exists(os.path.join(bd, "budget_sv.json"))
+           and guard(install_budget, "ev", {"record": {"scope": "ev", "n": 2}}, budget_dir=bd, load=ok_load) is True,
+           f"SV45b the VM keeps its record when a new one does not verify there ({r_bad}, {r_new})")
+    # SV46 the loop's sleep is bounded by the next due check: a launch child is polled every 15 s
+    T = T0 + 10_000
+    ok(guard(sleep_for, {}, T, 600) == 600 and guard(sleep_for, {"launch": {"a": {"state": "launching"}}}, T, 600) == 15
+       and guard(sleep_for, {"launch": {"a": {"state": "launching"}}}, T, 5) == 5,
+       "SV46 the sleep stops at the next due check (a launch child), never past --every")
+
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
@@ -766,16 +1307,21 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     ps = {c: sub.add_parser(c) for c in ("start", "stop", "loop", "enqueue-merge", "enqueue-collect", "enqueue-noop",
-                                         "status", "pull")}
+                                         "enqueue-launch", "status", "pull")}
     for c, p in ps.items():
         p.add_argument("--name", default=DEFAULT_NAME)
         p.add_argument("--account", default=None)
         if c in ("start", "loop"):
             p.add_argument("--every", type=float, default=60)
-            p.add_argument("--max-hours", type=float, default=24.0)
+            p.add_argument("--max-hours", type=float, default=168.0)
     ps["start"].add_argument("--cap-usd", type=float, default=15.0)
     ps["start"].add_argument("--budget-scope", default=None)
-    ps["loop"].add_argument("--work", default="supervisor_work")
+    ps["loop"].add_argument("--work", default="~/supervisor_work")
+    pl = ps["enqueue-launch"]
+    pl.add_argument("config")
+    pl.add_argument("--tag", required=True)
+    pl.add_argument("--reps", type=int, default=1)
+    pl.add_argument("--commit", required=True)
     ps["enqueue-merge"].add_argument("prs", nargs="+", type=int)
     ps["enqueue-collect"].add_argument("configs", nargs="+")
     ps["pull"].add_argument("--dest", default=os.path.expanduser("~/modeling-agentic-keep/supervisor"))
@@ -794,7 +1340,8 @@ def main(argv=None) -> int:
         got = pull(blob, a.name, os.path.join(a.dest, a.name))
         return print(f"pulled {len(got)} run(s) into {os.path.join(a.dest, a.name)}") or 0
     reqs = {"enqueue-merge": lambda: [("merge", {"prs": a.prs})], "enqueue-noop": lambda: [("noop", {})],
-            "enqueue-collect": lambda: [("collect", _assignments(c)) for c in a.configs]}[a.cmd]()
+            "enqueue-collect": lambda: [("collect", _assignments(c)) for c in a.configs],
+            "enqueue-launch": lambda: [("launch", launch_request(a))]}[a.cmd]()
     for kind, payload in reqs:
         print(enqueue(blob, a.name, kind, payload))
     return 0

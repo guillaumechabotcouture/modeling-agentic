@@ -421,13 +421,26 @@ def _on_worker(client, fn, *args, worker):
 
 
 def read_keys(path=ENV_FILE) -> dict:
-    """ANTHROPIC_API_KEY / OPENAI_API_KEY only; values are never printed."""
+    """ANTHROPIC_API_KEY / OPENAI_API_KEY only; values are never printed. With no file (the supervisor's VM,
+    cloud/supervisor.py, which gets them through vm_job's --secret-env), from the environment."""
+    if not os.path.exists(path):
+        return {k: os.environ[k] for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY") if os.environ.get(k)}
     keys = {}
     with open(path) as f:
         for line in f:
             k, _, v = line.strip().partition("=")
             if k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
                 keys[k] = v.strip().strip('"').strip("'")
+    return keys
+
+
+def api_keys() -> dict:
+    """read_keys, refused (SystemExit) without ANTHROPIC_API_KEY: launch and relaunch read the keys through this
+    before any cluster is created or task submitted (Codex round 1 on #358: a run cluster was made, then the submit
+    failed on the missing key)."""
+    keys = read_keys()
+    if not keys.get("ANTHROPIC_API_KEY"):
+        raise SystemExit(f"no ANTHROPIC_API_KEY in {ENV_FILE} or the environment: refusing before any cluster")
     return keys
 
 
@@ -1030,7 +1043,7 @@ def _launch_locked(cfg, inv) -> int:
     compute = _compute(cfg)
     vm = vm_request(cfg, compute)                 # every VM type priced, before the budget reserves anything
     budget_guard(cfg, inv=inv)                    # before any key is read or cluster created
-    keys = read_keys()
+    keys = api_keys()                             # refused here, before any cluster is created
     n0 = len(cfg.labels) + cfg.compute_start
     cluster = _construct(cfg, cfg.name, inv, lambda: coiled.Cluster(   # this invocation's, or refused unrecorded
         name=cfg.name, workspace=WORKSPACE, n_workers=n0, worker_vm_types=vm["run"]["worker_vm_types"],
@@ -2133,7 +2146,7 @@ def relaunch(cfg, label) -> int:
         if stale:
             raise SystemExit(f"{label}: refusing: " + "; ".join(stale))
         client.upload_file(os.path.join(HERE, "worker_side.py"))
-        question, keys = open(cfg.question_file).read().strip(), read_keys()
+        question, keys = open(cfg.question_file).read().strip(), api_keys()
         assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True, pipeline=pipeline,
                              launcher=f"run_cluster:{cfg.name}", eval_inputs_sha256=eval_paths.archive_sha256(code),
                              submission="sent", invocation=inv, task_key=_task_key(label))
@@ -4328,6 +4341,44 @@ def _self_test_eval_configs(ok) -> None:
                 os.environ[k] = v
 
 
+def _self_test_read_keys(ok) -> None:
+    """RK1-RK2 (supervisor launches): with no .env file (the supervisor VM) the keys come from the environment;
+    a file, when there is one, wins."""
+    import tempfile
+    from unittest import mock
+    with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "env-k",
+                                                                           "OTHER_SECRET": "x"}):
+        os.environ.pop("OPENAI_API_KEY", None)
+        ok(read_keys(os.path.join(td, "absent.env")) == {"ANTHROPIC_API_KEY": "env-k"},
+           "RK1 no .env file: ANTHROPIC_API_KEY / OPENAI_API_KEY from the environment, nothing else")
+        p = os.path.join(td, ".env")
+        open(p, "w").write('ANTHROPIC_API_KEY="file-k"\n')
+        ok(read_keys(p) == {"ANTHROPIC_API_KEY": "file-k"}, "RK2 a .env file wins over the environment")
+    # RK3 (Codex round 1 on #358): no Anthropic key refuses before any cluster is created or recorded
+    import types
+    made, recs = [], []
+    fake = types.SimpleNamespace(Cluster=lambda **kw: made.append(kw))
+    with mock.patch.dict(sys.modules, {"coiled": fake}), \
+            mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
+                                        "pipeline_preflight": lambda c, code: "v2", "budget_guard": lambda *a, **k: None,
+                                        "stale_sheet_problems": lambda *a: [], "vm_request": lambda *a: {"run": {}},
+                                        "_compute": lambda c: types.SimpleNamespace(WORKER_VM_TYPES=["x"]),
+                                        "write_clusters": lambda *a, **k: recs.append(a), "read_keys": lambda: {}}):
+        try:
+            _launch_locked(RunConfig(name="ev-t-gcc", question_file="/dev/null", pipeline="v2", cap_usd=5), "inv")
+            msg = None
+        except SystemExit as e:
+            msg = str(e)
+        except Exception as e:  # noqa: BLE001
+            msg = f"past the check: {type(e).__name__}"
+    ok(msg and "ANTHROPIC_API_KEY" in msg and not made and not recs,
+       f"RK3 no Anthropic key: refused before any cluster is created or recorded ({msg}, {len(made)} made)")
+    import inspect
+    src = inspect.getsource(relaunch)
+    ok("api_keys()" in src and src.index("api_keys()") < src.index("_submit("),
+       "RK4 relaunch reads the keys through the same refusal before it submits")
+
+
 def _self_test_budget(ok) -> None:
     """BU (F6 Stage 2, 2026-11-11: $106 spent of a $100 budget): `launch` refuses unless the owner-signed budget
     (cloud/budget.py) covers the scope's spend plus the config's cap_usd, before any key is read or cluster made."""
@@ -5765,6 +5816,10 @@ def _self_test() -> int:
         _self_test_eval_configs(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"EV: {type(e).__name__}: {e}")
+    try:
+        _self_test_read_keys(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"RK: {type(e).__name__}: {e}")
     globals()["budget_guard"] = lambda cfg, reserve=True, inv=None: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)

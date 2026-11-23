@@ -225,19 +225,42 @@ def job_env(secrets: dict | None, name: str, job_id: str, account: str | None = 
             **({"MA_STORAGE_ACCOUNT": account} if account else {})}
 
 
-SECRET_ENV_ALLOWED = ("GH_TOKEN",)     # cloud/supervisor.py's merge train (W0-J)
+# cloud/supervisor.py: the merge train's GitHub token; the launches' Coiled token and Anthropic key (owner 2026-11-23)
+SECRET_ENV_ALLOWED = ("GH_TOKEN", "DASK_COILED__TOKEN", "ANTHROPIC_API_KEY")
+
+
+def _secret_value(n):
+    """$n, else where the launcher keeps it: the Coiled token in dask's config (as `up` reads it), the Anthropic key in
+    the .env file (run_cluster.read_keys). Read here, never copied into this process's environment."""
+    if os.environ.get(n):
+        return os.environ[n]
+    try:
+        if n == "DASK_COILED__TOKEN":
+            with contextlib.suppress(Exception):
+                import coiled  # noqa: F401 -- loads the Coiled login into dask's config
+            import dask
+            return dask.config.get("coiled.token", None)
+        if n == "ANTHROPIC_API_KEY":
+            return rc.read_keys().get(n)
+    except (ImportError, OSError):
+        return None
+    return None
 
 
 def secret_env(names) -> dict:
-    """--secret-env NAME: the launcher's $NAME, for the job's environment only (never job.json or state.json, like
-    --anthropic-key). Only names in SECRET_ENV_ALLOWED; an unset one is refused. Values are never printed."""
+    """--secret-env NAME: the launcher's $NAME (or, for the Coiled token and the Anthropic key, where the launcher keeps
+    them), for the job's environment only (never job.json or state.json). Only names in SECRET_ENV_ALLOWED; one with
+    no value is refused. Values are never printed."""
     out = {}
     for n in names or ():
         if n not in SECRET_ENV_ALLOWED:
             raise SystemExit(f"--secret-env {n}: not in the allow-list {SECRET_ENV_ALLOWED}: refusing")
-        if not os.environ.get(n):
-            raise SystemExit(f"--secret-env {n}: ${n} is not set in the launcher's environment: refusing")
-        out[n] = os.environ[n]
+        v = _secret_value(n)
+        if not v:
+            raise SystemExit(f"--secret-env {n}: no ${n} for the launcher (environment"
+                             + {"DASK_COILED__TOKEN": ", dask config", "ANTHROPIC_API_KEY": ", .env"}.get(n, "")
+                             + "): refusing")
+        out[n] = v
     return out
 
 
@@ -1458,6 +1481,25 @@ def _self_test_storage_account(ok) -> None:
             ok(False, "VS3 a variable outside the allow-list is refused")
         except SystemExit as e:
             ok("allow" in str(e), f"VS3 a variable outside the allow-list is refused before submit ({e})")
+        # VS6 (supervisor launches): the Coiled token and the Anthropic key pass by name. Codex round 1 on #358: the
+        # launcher never copies them into its own environment; they are read where they live (dask config, .env)
+        ctok, akey = "c" * 40, "sk-" + "a" * 30
+        with mock.patch.dict(os.environ, {"DASK_COILED__TOKEN": ctok}):
+            got = secret_env(["DASK_COILED__TOKEN"])
+        ok(got == {"DASK_COILED__TOKEN": ctok}, "VS6 --secret-env DASK_COILED__TOKEN reaches the job's environment")
+        fake_dask = types.SimpleNamespace(config=types.SimpleNamespace(get=lambda k, d=None: ctok if k == "coiled.token" else d))
+        with mock.patch.dict(os.environ, {}), mock.patch.dict(sys.modules, {"dask": fake_dask}), \
+                mock.patch.object(rc, "read_keys", lambda *a: {"ANTHROPIC_API_KEY": akey}):
+            os.environ.pop("DASK_COILED__TOKEN", None)
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+            try:
+                got = secret_env(["DASK_COILED__TOKEN", "ANTHROPIC_API_KEY"])
+            except SystemExit as e:
+                got = str(e)
+            leaked = {k for k in ("DASK_COILED__TOKEN", "ANTHROPIC_API_KEY") if k in os.environ}
+        ok(got == {"DASK_COILED__TOKEN": ctok, "ANTHROPIC_API_KEY": akey} and not leaked,
+           f"VS6b with neither in the environment: the Coiled token from dask config, the key from .env, and neither "
+           f"copied into the launcher's environment ({sorted(got) if isinstance(got, dict) else got}, {leaked})")
         for bad in ("DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc==", "https://x.blob.core.windows.net",
                     "Acct", "ab"):
             try:
