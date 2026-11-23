@@ -533,8 +533,19 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     _safe_io().publish(dp, buf.getvalue(), run_dir)
     S.deliverable(dp, PRODUCER, "allocation")
     # ---- figures: the decision numbers they need (no engine runs), then every figure from the saved artifacts
-    fdat = FD.compute(A, plan, out0, ben0, cost0, u["data"], z0, log=log, events=events0)
-    arts["figure_data"] = S.write("figure_data", fdat, FD.PRODUCER, [arts["point"], arts["uncertainty"]])
+    # direct evaluation: the uncertainty step's per-draw plan sums are stored and read, not recomputed by re-running the
+    # engine for every draw (hb1 flu R2); the emulator path replays its cheap draws as before
+    fd_stored, fd_in = None, []
+    if model.kind == "direct" and u["data"].get("draws"):
+        from toolkit.analysis.artifacts import _safe_io
+        import hashlib
+        raw = json.dumps(plain(FD.stored_record(u["plan_draws"]))).encode()
+        fd_stored = json.loads(raw)
+        _safe_io().write_nofollow(run_dir, FD.STORED_REL, raw, atomic=True)
+        # Codex r1 P1-2: the hash of the bytes the figure step reads, not of whatever the file holds when recorded
+        fd_in = [(os.path.join(run_dir, FD.STORED_REL), hashlib.sha256(raw).hexdigest())]
+    fdat = FD.compute(A, plan, out0, ben0, cost0, u["data"], z0, log=log, events=events0, stored=fd_stored)
+    arts["figure_data"] = S.write("figure_data", fdat, FD.PRODUCER, [arts["point"], arts["uncertainty"]] + fd_in)
     rend = FG.render(run_dir)
     figs = rend["figures"]
     arts["figures"] = S.write("figures", {"figures": figs, "not_produced": rend["not_produced"],
