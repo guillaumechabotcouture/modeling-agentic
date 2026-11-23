@@ -1,0 +1,8 @@
+---
+phase: "v2 debt"
+commit: "direct-path speed α"
+---
+
+## Changelog
+
+**The figure step reads the uncertainty draws instead of re-running them (direct evaluation).** In the hb1 eval run flu_vaccine R2 (direct evaluation, 3,374 packages per draw), `figure_data.replay()` re-evaluated all 200 uncertainty draws serially after the uncertainty step had already evaluated them. That took as long as the draws themselves, and the step hit the 24 h backstop. `uncertainty.run()` now also returns each draw's fixed-plan total and per-package sums (`plan_draws`). On direct evaluation, `run.py` writes them to `analysis/uncertainty_draws.json`, an input of `figure_data`, and `figure_data.replay()` reads them. `reproduced` remains a real check. Every draw's package sums must add up to its total. The first `REPLAY_CHECK_DRAWS` (2) draws are re-evaluated with the same Drawer and seed and must give the stored values. The stored totals must give the stored fixed-plan interval. Otherwise package intervals are withheld, with the reason. Emulator runs keep the full replay, and `analysis/uncertainty.yaml` and job hashes are unchanged. Long per-draw loops log progress with an ETA (`uncertainty.Progress`, at most every 5 min). Self-tests FD19–FD38 and UP1–UP3. FD27–FD35 come from the Codex review: per-draw package costs checked against the recorded plan cost; each draw holds the plan's packages and unit counts; costs are non-negative and numbers finite; package sums are compared within a summation round-off bound on the units' magnitudes (`averted_abs`); statistics must be finite; the hash of the bytes used is recorded. Also added: a plan for a direct final-size solver in the compartmental engine (`docs/design/direct-final-size-solver.md`).

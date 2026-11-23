@@ -21,6 +21,7 @@ DirectModel: runs the engine for every unit and package (cheap engines).
 """
 from __future__ import annotations
 
+import json
 import math
 import time
 import warnings
@@ -519,9 +520,20 @@ class DirectModel:
         self.runs = 0
         self.seed = int((an.get("direct") or {}).get("seed", 1))
         self.last_events, self.train_corrections = [], {}
+        self._pre = None        # prefetched engine runs for the next evaluation (use_runs)
 
     def fit(self):
         return self
+
+    @staticmethod
+    def _key(theta, zs) -> str:
+        return json.dumps([theta, zs], sort_keys=True, default=float)
+
+    def use_runs(self, theta, zs, runs):
+        """Engine runs computed elsewhere ({(unit, package): Outcomes}: the draw fan-out, toolkit/analysis/
+        draw_fanout.py) for the next evaluation at these parameters and unit values. Taken once; an evaluation at other
+        values, or with other pairs, fails closed."""
+        self._pre = (self._key(theta, zs), runs)
 
     def unit_spec(self, i, z):
         a = dict(self.attrs[i])
@@ -541,6 +553,14 @@ class DirectModel:
         pair, a contract self-test of that engine) evaluates every (unit, package) pair in run_batch calls of up to
         BATCH members; any other engine runs pair by pair, as before."""
         pairs = [(i, k) for i in ids for k in self.packages]
+        if self._pre is not None:
+            key, pre = self._pre
+            self._pre = None
+            if key != self._key(theta, zs) or set(pre) != set(pairs):
+                raise ValueError("prefetched engine runs are not this evaluation's (other parameters, unit values or "
+                                 "pairs): fails closed")
+            self.runs += len(pairs)
+            return {p: pre[p] for p in pairs}
         if not (getattr(self.eng, "batch_equals_run", False) and callable(getattr(self.eng, "run_batch", None))):
             return {(i, k): self.run(theta, i, zs.get(i) if zs else None, k) for i, k in pairs}
         out = {}
