@@ -387,19 +387,28 @@ def q(v, level=0.95) -> dict | None:
     if not np.all(np.isfinite(v)):      # 1C-b 2d-iii: fail closed (one NaN made every quantile NaN)
         raise ValueError(f"quantiles: {int(np.sum(~np.isfinite(v)))} of {len(v)} values are not finite")
     a = 100 * (1 - level) / 2
+    v = v.ravel()
     n = len(v)
     try:      # hb1 fix 11 (L): the one estimator of both uncertainty files; an exactly rounded sum, no cancellation
         mean = math.fsum(v) / n
-    except OverflowError:
-        mean = math.fsum(v / n)
-    med, lo, hi = float(np.median(v)), float(np.percentile(v, a)), float(np.percentile(v, 100 - a))
-    if not all(math.isfinite(x) for x in (med, lo, hi)):      # numpy's interpolation overflowed near the largest float
-        s = np.sort(v)
+    except OverflowError:      # the sum overflows: the exact mean (rational arithmetic), whatever the order
+        import statistics
+        mean = float(statistics.mean(float(x) for x in v))
+    s = None
 
-        def lerp(p):
-            h = (n - 1) * p / 100.0
-            k = int(math.floor(h))
-            t = h - k
-            return float(s[k]) if k + 1 >= n else float(s[k] * (1 - t) + s[k + 1] * t)
-        med, lo, hi = lerp(50.0), lerp(a), lerp(100 - a)
+    def lerp(p):          # numpy's linear rule without overflow: equal neighbours give that value exactly
+        h = (n - 1) * p / 100.0
+        k = int(math.floor(h))
+        t = h - k
+        if k + 1 >= n or s[k] == s[k + 1] or t == 0:
+            return float(s[k])
+        return float(s[k] * (1 - t) + s[k + 1] * t)
+    out = []
+    for p in (50.0, a, 100 - a):
+        x = float(np.median(v)) if p == 50.0 else float(np.percentile(v, p))
+        if not math.isfinite(x):       # numpy's interpolation overflowed near the largest float: this statistic only
+            s = np.sort(v) if s is None else s
+            x = lerp(p)
+        out.append(x)
+    med, lo, hi = out
     return {"median": med, "ci_low": lo, "ci_high": hi, "mean": float(mean), "level": level}
