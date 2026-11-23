@@ -92,7 +92,8 @@ citation, marked `unverified` until the evidence service checks it.
 
 ## Validation
 
-- `benchmarks/results.yaml` (re-run on v0.3): 62 of 62 assessable benchmarks are in band. AS7 now compares the
+- `benchmarks/results.yaml` (re-run on v0.3): 76 of 76 assessable benchmarks are in band. DS1–DS8 run the direct
+  solver against the closed forms, the reference ODE, the pack's fixed-point oracle and the stepped sim; AS7 compares the
   direct solver with the stepped declared interval near criticality. The ten v0.2 benchmarks are AS1–AS6.
   - AS1: a 5-age-group SEIR with pre-existing immunity by age matches the reference ODE's final size per group.
   - AS1b: the per-group parameters give the attribute path's epidemic.

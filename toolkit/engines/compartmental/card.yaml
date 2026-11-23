@@ -430,6 +430,334 @@ benchmarks:
   - 0.0
   in_band: true
   status: in_band
+- id: DS1a
+  metric: 'direct solver: single-group final size, R0 = 1.5'
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  band_sha256: 1ad2c3c7a1649dfbf4f9974f48543b31e41730b15fd6d4ee41a2d340d8c0cb87
+  computed: 0.5828116449806153
+  reference: 0.58281164498064
+  error_abs: 2.4646951146678475e-14
+  error_rel: 4.2289736931212496e-14
+  tolerance:
+    abs: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 2.4646951146678475e-14
+  - 2.4646951146678475e-14
+  in_band: true
+  status: in_band
+- id: DS1b
+  metric: 'direct solver: single-group final size, R0 = 2.0'
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  band_sha256: ce986edfa9c7d8172d889a8ca7401950758f1035c86d3343fded07b2e0ffe550
+  computed: 0.7968121303622792
+  reference: 0.7968121303623036
+  error_abs: 2.4424906541753444e-14
+  error_rel: 3.065328150896454e-14
+  tolerance:
+    abs: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 2.4424906541753444e-14
+  - 2.4424906541753444e-14
+  in_band: true
+  status: in_band
+- id: DS1c
+  metric: 'direct solver: single-group final size, R0 = 18.0'
+  role: held_out
+  target: null
+  band: null
+  source: Kermack-McKendrick (1927); Lambert W closed form
+  band_sha256: 53f7080873a2872f3a2a40874741d7e7c458876803553212c7c35e04c5b956a2
+  computed: 0.9999999847699911
+  reference: 0.9999999847700161
+  error_abs: 2.4980018054066022e-14
+  error_rel: 2.4980018434511303e-14
+  tolerance:
+    abs: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 2.4980018054066022e-14
+  - 2.4980018054066022e-14
+  in_band: true
+  status: in_band
+- id: DS2a
+  metric: 'direct solver: R0 = 0.5, attack rate at most the seed-size bound seed / (1 - R0)'
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem
+  band_sha256: cf5a7889149fce9d0b84f3c771e636fe80a5c196ecc474bc22757f73867dc916
+  computed: 1.9999999969721175e-09
+  reference: 2.0e-09
+  error_abs: 3.0278826381314758e-18
+  error_rel: 1.5139413190657379e-09
+  tolerance:
+    abs: 1.0e-15
+  compare: le
+  per_seed_error_abs:
+  - 3.0278826381314758e-18
+  - 3.0278826381314758e-18
+  in_band: true
+  status: in_band
+- id: DS2b
+  metric: 'direct solver: R0 = 1.01, final size equals the seeded closed form'
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem; Lambert W
+  band_sha256: 00702c62c569625fbdfab4e31ad6a25b875ac843601d82a33df6f2a087b72ded
+  computed: 0.019736509118951643
+  reference: 0.01973650911894509
+  error_abs: 6.553785292240377e-15
+  error_rel: 3.3206405716142547e-13
+  tolerance:
+    abs: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 6.553785292240377e-15
+  - 6.553785292240377e-15
+  in_band: true
+  status: in_band
+- id: DS3
+  metric: 'direct solver: rank-one mixing reduces to the scalar final-size relation, per group'
+  role: held_out
+  target: null
+  band: null
+  source: Ma & Earn (2006) Bull Math Biol; Andreasen (2011)
+  band_sha256: e2f600ad43657a5a2a66f3892e536403d6ac0e47f7dae84a658a881d507a4786
+  computed: 2.4868995751603507e-14
+  reference:
+  - 0.4638279198514076
+  - 0.7125194993192094
+  - 0.26776227820404075
+  error_abs: 2.4868995751603507e-14
+  error_rel: 6.799933779312234e-14
+  tolerance:
+    rel: 1.0e-08
+  compare: eq
+  per_seed_error_abs:
+  - 2.4868995751603507e-14
+  - 2.4868995751603507e-14
+  computed_vector:
+  - 0.463827919851384
+  - 0.7125194993191846
+  - 0.26776227820402254
+  in_band: true
+  status: in_band
+- id: DS6a
+  metric: 'direct solver: multigroup final size equals the reference ODE, identity matrix (seeded group only)'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE (solve_ivp DOP853, rtol 1e-10)
+  band_sha256: 628cf5b851b4eea4c20a23dfbf9ad415726ab65ae85c768340850dd21adf62c2
+  computed: 2.878808302853031e-13
+  reference:
+  - 0.7968128145862968
+  - 0.0
+  - 0.0
+  error_abs: 2.878808302853031e-13
+  error_rel: 3.6129041227175803e-13
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.878808302853031e-13
+  - 2.878808302853031e-13
+  computed_vector:
+  - 0.7968128145860089
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
+- id: DS6b
+  metric: 'direct solver: same, rank-one matrix, partial susceptibility'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE
+  band_sha256: 943346227f4a399dfc678f0451428903be84f52b0b66ff4d5ec7bedb3ab6bb84
+  computed: 2.6645352591003757e-14
+  reference:
+  - 0.33869912292631776
+  - 0.4501435205607459
+  - 0.1681155953709316
+  error_abs: 2.6645352591003757e-14
+  error_rel: 9.162947930372419e-14
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 2.6645352591003757e-14
+  - 2.6645352591003757e-14
+  computed_vector:
+  - 0.3386991229262936
+  - 0.45014352056071927
+  - 0.1681155953709162
+  in_band: true
+  status: in_band
+- id: DS6c
+  metric: 'direct solver: same, asymmetric 5x5 matrix'
+  role: held_out
+  target: null
+  band: null
+  source: the pack's ODE
+  band_sha256: 014102811b8e8ec1c9a7136f3a1abc934d7d271394dc80e74b01f3190a75e8b6
+  computed: 1.2401191185062999e-13
+  reference:
+  - 0.9192900487786672
+  - 0.8631882864871628
+  - 0.6178062746082034
+  - 0.6582465122853505
+  - 0.67386809545775
+  error_abs: 1.2401191185062999e-13
+  error_rel: 1.4366727838176504e-13
+  tolerance:
+    abs: 1.0e-06
+  compare: eq
+  per_seed_error_abs:
+  - 1.2401191185062999e-13
+  - 1.2401191185062999e-13
+  computed_vector:
+  - 0.9192900487786045
+  - 0.8631882864870388
+  - 0.6178062746081804
+  - 0.6582465122853396
+  - 0.6738680954577217
+  in_band: true
+  status: in_band
+- id: DS6d
+  metric: 'direct solver: asymmetric 5x5 matrix against the pack''s own fixed-point solver'
+  role: held_out
+  target: null
+  band: null
+  source: 'multigroup final-size relation (oracles.oracle_final_size_multigroup: iteration from the seed, Newton
+    polish)'
+  band_sha256: 4794d35778cdc063ab40b3bc20424e3039f6e6072bbc913ecd7f8bdb4cb7691c
+  computed: 2.5091040356528538e-14
+  reference:
+  - 0.9192900487786223
+  - 0.863188286487055
+  - 0.6178062746081987
+  - 0.6582465122853604
+  - 0.6738680954577468
+  error_abs: 2.5091040356528538e-14
+  error_rel: 3.723434975725425e-14
+  tolerance:
+    abs: 1.0e-10
+  compare: eq
+  per_seed_error_abs:
+  - 2.5091040356528538e-14
+  - 2.5091040356528538e-14
+  computed_vector:
+  - 0.9192900487786045
+  - 0.8631882864870388
+  - 0.6178062746081804
+  - 0.6582465122853396
+  - 0.6738680954577217
+  in_band: true
+  status: in_band
+- id: DS7a
+  metric: direct solver equals the stepped sim, single group (R0 = 2)
+  role: held_out
+  target: null
+  band: null
+  source: identity (v0.3)
+  band_sha256: 5e32301cf3a9c25ab0f3b666870beaa0b04e4d5a21e668953ca6940a0dca9484
+  computed: 0.7968121303622792
+  reference: 0.7968121303622717
+  error_abs: 7.438494264988549e-15
+  error_rel: 9.335317550457756e-15
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 7.438494264988549e-15
+  - 7.438494264988549e-15
+  in_band: true
+  status: in_band
+- id: DS7b
+  metric: direct solver equals the stepped sim, rank-one 3 groups
+  role: held_out
+  target: null
+  band: null
+  source: identity (v0.3)
+  band_sha256: 14082b7e98bcd7e76587516019ccd2aadf4254fe89cb24150f64ab16da12609e
+  computed: 1.9761969838327786e-14
+  reference:
+  - 0.46382791985140287
+  - 0.7125194993192043
+  - 0.2677622782040377
+  error_abs: 1.9761969838327786e-14
+  error_rel: 5.659700980952016e-14
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 1.9761969838327786e-14
+  - 1.9761969838327786e-14
+  computed_vector:
+  - 0.463827919851384
+  - 0.7125194993191846
+  - 0.26776227820402254
+  in_band: true
+  status: in_band
+- id: DS7c
+  metric: direct solver equals the stepped sim, asymmetric 5x5, partial susceptibility
+  role: held_out
+  target: null
+  band: null
+  source: identity (v0.3)
+  band_sha256: 901d578ed24f2131585103098980b433fb8d36e36445d29a6d01b1c43d707404
+  computed: 2.0539125955565396e-14
+  reference:
+  - 0.9192900487786215
+  - 0.8631882864870548
+  - 0.6178062746081979
+  - 0.6582465122853587
+  - 0.6738680954577423
+  error_abs: 2.0539125955565396e-14
+  error_rel: 3.047944559775258e-14
+  tolerance:
+    rel: 1.0e-09
+  compare: eq
+  per_seed_error_abs:
+  - 2.0539125955565396e-14
+  - 2.0539125955565396e-14
+  computed_vector:
+  - 0.9192900487786045
+  - 0.8631882864870388
+  - 0.6178062746081804
+  - 0.6582465122853396
+  - 0.6738680954577217
+  in_band: true
+  status: in_band
+- id: DS8
+  metric: the direct solver's bracket closed on every DS arm
+  role: held_out
+  target: null
+  band: null
+  source: engine solver
+  band_sha256: 1650c7063e1b03d183c5d817d02d083cf01b29876b2fa672cf5fd2aab23c54b5
+  computed: 1.0
+  reference: 1.0
+  error_abs: 0.0
+  error_rel: 0.0
+  tolerance:
+    abs: 0.0
+  compare: eq
+  per_seed_error_abs:
+  - 0.0
+  - 0.0
+  in_band: true
+  status: in_band
 - id: BR1a
   metric: 'one group, Poisson offspring: 1 - p solves 1 - p = exp(-R0 p) (R0 = 2)'
   role: held_out
@@ -1444,5 +1772,5 @@ parameters:
   verified: unverified
 validation_label: validated against analytic identities and simulation-based coverage; published benchmarks FS7
   and RN5 not yet assessed
-results_sha256: ea7dd2158e8893e75a565cb1a4a090f02331b1d89f308f703a2fb18d97462fad
+results_sha256: 42506a40ecfe52468adb119dcd2158ad801a861e8b86bcdd382ffb5605e7461e
 benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'
