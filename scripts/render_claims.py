@@ -450,6 +450,48 @@ def render_text(text: str, claims: dict[str, dict]) -> tuple[str, list[str]]:
     return new_text, unresolved
 
 
+_INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+_ANY_REF_RE = re.compile(r"\[CLAIM:([^\]]*)\]")       # as report_claim_findings reads report.md: across lines too
+
+
+def normalise_refs(text: str, claims: dict[str, dict]) -> str:
+    """v2 write-up (hb2, tb R2): an inline code span whose whole content is a known claim reference, or a known
+    claim id (one with '.' or '_', as report_claim_id_raw reads ids), is that reference: `[CLAIM:x]` or `x` becomes
+    [CLAIM:x], which render_text then renders. An id outside the ledger, a longer span and fenced blocks are left
+    as written, so each is still reported."""
+    fenced = code_spans(text, inline=False)
+
+    def _sub(m: re.Match) -> str:
+        if in_spans(fenced, m.start()):
+            return m.group(0)
+        inner = m.group(1).strip()
+        ref = _CLAIM_REF_RE.fullmatch(inner)
+        cid = ref.group(1).strip() if ref else inner
+        known = cid in claims and bool(_CLAIM_ID_RE.fullmatch(cid))
+        return f"[CLAIM:{cid}]" if known and (ref or "." in cid or "_" in cid) else m.group(0)
+    return _INLINE_CODE_RE.sub(_sub, text)
+
+
+def quote_refs(text: str, claims: dict[str, dict], render: bool = True) -> str:
+    """Text the harness quotes from a finding (its claim or remedy) holds no claim reference outside the ledger:
+    hb2 (measles R1, dengue R2) quoted a critic's [CLAIM:x] and placeholder [CLAIM:id] into report.md, and the
+    writer repeated the placeholder from declared_findings.yaml. A reference outside the ledger becomes the words
+    `claim x`; a ledger one is rendered as its value (`render`, for report.md) or kept as a reference the writer may
+    use (for the writer's inputs). Code spans are no exception: what the harness quotes is never syntax."""
+    def _sub(m: re.Match) -> str:
+        cid = m.group(1).strip()
+        c = claims.get(cid) if _CLAIM_ID_RE.fullmatch(cid or "") else None
+        if c is None:
+            return f"claim {cid or '(no id)'}"
+        if not render:
+            return f"[CLAIM:{cid}]"
+        try:
+            return render_claim(c)
+        except Exception:  # noqa: BLE001 -- a claim that cannot render is named, never left as a reference
+            return f"claim {cid}"
+    return _ANY_REF_RE.sub(_sub, text)
+
+
 def _builder():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
