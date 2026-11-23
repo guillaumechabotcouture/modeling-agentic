@@ -48,6 +48,9 @@ def owner_held_note(run_dir: str, reviewer: str) -> str:
     (agents/findings_ledger.py answer_fingerprint): rewording keeps it; another remedy class is asked again."""
     try:
         from agents import findings_ledger as FL
+        # never block on what sits at the ledger's name (a FIFO: CS12); not a regular file: nothing is listed
+        if os.path.lexists(os.path.join(run_dir, FL.LEDGER)) and _file_bytes(run_dir, FL.LEDGER) is None:
+            return ""
         rows = [f for f in FL.load(run_dir).values() if f.source == reviewer
                 and f.status in ("owner_accepted", "owner_declined")]
     except Exception:  # noqa: BLE001 -- no ledger: nothing is listed (the gate still reads the answers)

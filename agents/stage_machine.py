@@ -3382,8 +3382,10 @@ def dependence_lines(run_dir: str, stale_out: list | None = None) -> list[str]:
                 kind_rec = "spike"
         v_now = {"kind": f.kind, "key": f.key, "claim": f.claim,
                  **({"source": "toolkit/analysis/contract.py"} if kind_rec == "toolkit" else {})}
-        stale_line = (line + "; its record has changed since it was accepted (or cannot be verified), so the gate asks "
-                             "again and the values are not repeated here.\n")
+        stale_line = (line + "; its record has changed since it was accepted, so the gate asks again and the values "
+                             "are not repeated here.\n")
+        # a record the accept bound that holds no verifiable values: listed, none shown (not a changed record)
+        bare_line = line + "; no verified values are recorded for it, so none are shown.\n"
 
         def stale():
             out.append(stale_line)
@@ -3394,8 +3396,11 @@ def dependence_lines(run_dir: str, stale_out: list | None = None) -> list[str]:
             same = bool(ev.get("fingerprint")) and _bearing_fp(v_now, rec) == ev["fingerprint"]
         except Exception:  # noqa: BLE001 -- cannot be compared: not shown as accepted
             rec, same = None, False
-        if not same or not isinstance(rec, dict):     # P1-5 (r2): the record the answer bound is not the one there now
+        if not same:                  # P1-5 (r2): the record the answer bound is not the one there now
             stale()
+            continue
+        if not isinstance(rec, dict):         # the accept bound no record (a spike finding without one): nothing shown
+            out.append(bare_line)
             continue
         if kind_rec == "spike":       # the record the answer bound (Codex r1 of #357, P1-8)
             def scal(d_):
@@ -3408,17 +3413,22 @@ def dependence_lines(run_dir: str, stale_out: list | None = None) -> list[str]:
                        + (f"; measured: {', '.join(meas)}" if meas else "")
                        + "; counted against the delivered plan (this backend's record does not name the units).\n")
             continue
-        res = None
+        res, changed = None, False
         try:
             if rec.get("path") and rec.get("result_sha256") and rec.get("result_sha256") == ev.get("result_sha256"):
                 raw = open(os.path.join(run_dir, str(rec["path"])), "rb").read()
                 # the bytes shown are the bytes the accept bound (P1-4): hashed as read, against the bound hash
                 if hashlib.sha256(raw).hexdigest() == ev["result_sha256"]:
                     res = yaml.safe_load(raw.decode("utf-8")) or {}
+                else:
+                    changed = True
         except Exception:  # noqa: BLE001 -- not verified: not shown
             res = None
-        if not isinstance(res, dict):        # no bound hash, or other bytes (r3, P1-8): never shown as accepted
+        if changed:                          # other bytes than the accepted ones: a changed record
             stale()
+            continue
+        if not isinstance(res, dict):        # no bound hash (r3, P1-8): never shown as accepted
+            out.append(bare_line)
             continue
         what = str(res.get("varied") or res.get("question") or "the input this test varies")
         against = ("the point-value plan (the delivered plan is the expected-value plan over the uncertainty draws, "
@@ -7056,9 +7066,10 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
            and "(" + ", ".join(ids13) + ")" in ln["DTc"] and "not settled within the solver's gap" in ln["DTc"]
            and "counted against the delivered plan" in ln["DTs"] and "trial_value 0.4" in ln["DTs"]
            and "units_changed 2" in ln["DTs"]
-           and all("has changed since it was accepted" in ln[k] for k in ("DTx", "DTn", "DTr"))
+           and all("has changed since it was accepted" in ln[k] for k in ("DTx", "DTr"))
+           and "no verified values are recorded" in ln["DTn"] and "at 9" not in ln["DTn"]
            and "now reads differently" not in ln["DTr"] and sorted(st6) == sorted(
-               f"decision_test_changes_plan:{k}" for k in ("DTn", "DTr", "DTx"))
+               f"decision_test_changes_plan:{k}" for k in ("DTr", "DTx"))
            and "The lead accepted the plan with that dependence, provisionally" in txt_l
            and "inputs the lead accepted provisionally" in txt_l and "inputs the owner accepted" not in txt_l,
            f"HB2-6 the accepted dependence names its reference plan, the price case, every unit, an unsettled solve, "
