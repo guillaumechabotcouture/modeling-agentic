@@ -337,7 +337,7 @@ def classify_tests(units):
 
 def _test_rewrites(tree_src: str, tests: list):
     """The edits that keep the moved tests rebinding the module, and the names they rebind."""
-    rebound, edits, uses_globals = set(), [], False
+    rebound, edits, uses_globals, gets = set(), [], False, set()
     for u in tests:
         holders, g_holders = set(), set()
         for n in ast.walk(u.node):
@@ -362,7 +362,17 @@ def _test_rewrites(tree_src: str, tests: list):
             if isinstance(n, ast.Subscript) and (isinstance(n.value, ast.Name) and n.value.id in holders
                                                  or _is_globals_call(n.value)) \
                     and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, str):
-                rebound.add(n.slice.value)
+                if isinstance(n.ctx, ast.Store):
+                    rebound.add(n.slice.value)
+                gets.add(n.slice.value)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and n.args \
+                    and (isinstance(n.func.value, ast.Name) and n.func.value.id in g_holders
+                         or _is_globals_call(n.func.value)):
+                if not (isinstance(n.args[0], ast.Constant) and isinstance(n.args[0].value, str)):
+                    raise SplitError(f"line {n.lineno}: globals().get() with a computed key in a self-test")
+                gets.add(n.args[0].value)
+            if isinstance(n, ast.Attribute) and _is_machine_module(n.value) and isinstance(n.ctx, ast.Store):
+                rebound.add(n.attr)
             if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in holders \
                     and isinstance(n.ctx, ast.Store):
                 rebound.add(n.attr)
@@ -388,7 +398,7 @@ def _test_rewrites(tree_src: str, tests: list):
                 uses_globals = True
             elif isinstance(n, ast.Name) and n.id in rebound:
                 edits.append((n.lineno, n.col_offset, n.end_col_offset, "_SM." + n.id))
-    return rebound, edits, uses_globals
+    return rebound, edits, uses_globals, gets
 
 
 def _is_globals_call(n) -> bool:
@@ -493,10 +503,8 @@ STUB = '''def _self_test() -> int:
     they run against this module, imported there as {target}."""
     sys.modules["{target}"] = sys.modules[__name__]
     d = os.path.join(REPO, "tests", "stage_machine")
-    for k, m in list(sys.modules.items()):  # a second call (another copy, another checkout) binds the cases afresh
-        if k.startswith("{prefix}") and os.path.basename(os.path.dirname(getattr(m, "__file__", None) or "")) \
-                == "stage_machine":
-            del sys.modules[k]
+    for k in {names}:     # the generated case modules, whatever is cached under their names: loaded afresh here
+        sys.modules.pop(k, None)
     while d in sys.path:
         sys.path.remove(d)
     sys.path.insert(0, d)           # this checkout's cases, not another's
@@ -562,14 +570,19 @@ def stage_tests(repo: str, log=print) -> bool:
         if u.names != ["_self_test"]:
             prod_refs |= {c.value for c in ast.walk(u.node) if isinstance(c, ast.Constant) and isinstance(c.value, str)}
             computed = [c for c in ast.walk(u.node) if isinstance(c, ast.Subscript) and _is_globals_call(c.value)
-                        and not isinstance(c.slice, ast.Constant)]
+                        and not isinstance(c.slice, ast.Constant)
+                        or isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == "get"
+                        and _is_globals_call(c.func.value) and c.args and not isinstance(c.args[0], ast.Constant)]
             if computed:
                 raise SplitError(f"line {computed[0].lineno}: production code reads globals() with a computed key; "
                                  f"the script cannot tell whether it reaches test code")
     used_by_prod = sorted((test_names - {"_self_test"}) & prod_refs)
     if used_by_prod:
         raise SplitError(f"production code uses test-named code: {used_by_prod}")
-    rebound, edits, uses_globals = _test_rewrites(src, tests)
+    rebound, edits, uses_globals, gets = _test_rewrites(src, tests)
+    moved_reads = sorted((gets & test_names) - {"_self_test"})
+    if moved_reads:      # SM_GLOBALS looks on the module, where the moved names are gone (r3 P1)
+        raise SplitError(f"a self-test reads moved test code through globals(): {moved_reads}; call it directly")
     _check_rebound_never_local(src, rebound, tests)
     if uses_globals:
         groups.setdefault("common", [])      # SM_GLOBALS lives there, with or without test helpers
@@ -620,7 +633,7 @@ def stage_tests(repo: str, log=print) -> bool:
         files[fname] = head + imp + "\n\n" + body.rstrip("\n") + "\n"
     _check_acyclic(deps, "test files")
     # the module: the test units go, the stub takes _self_test's place, the stamp follows the docstring
-    stub = STUB.format(target=TARGET, prefix=TEST_PREFIX)
+    stub = STUB.format(target=TARGET, prefix=TEST_PREFIX, names=repr(tuple(sorted(f[:-3] for f in files))))
     out = []
     for u in units:
         if u in tests:
@@ -661,9 +674,10 @@ def _write_tree(repo: str, files: dict):
         p = os.path.join(repo, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         compile(text, rel, "exec")            # never write a file that does not parse
-        tmp = p + ".split-tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix="." + os.path.basename(p) + ".", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+        os.chmod(tmp, os.stat(p).st_mode & 0o7777 if os.path.exists(p) else 0o644)   # keep the file's mode
         os.replace(tmp, p)                    # whole or not at all: a retry never meets a half-written module
 
 
@@ -1194,8 +1208,9 @@ def case_list(text: str) -> list:
 def compare_cases(before: str, after: str) -> tuple[bool, str]:
     b, a = case_list(before), case_list(after)
     def finished(text):
+        rcs = [x.strip() for x in text.splitlines() if x.startswith("rc=")]
         tail = [x.strip() for x in text.splitlines() if x.strip() and not x.startswith("rc=")]
-        return bool(tail) and tail[-1] == "OK: all self-test cases passed."
+        return bool(tail) and tail[-1] == "OK: all self-test cases passed." and all(x == "rc=0" for x in rcs)
     ok_b, ok_a = finished(before), finished(after)
     if b == a and ok_b == ok_a and a and ok_a:
         n_pass = sum(1 for s, _ in a if s == "PASS")
@@ -1464,6 +1479,13 @@ def _self_test() -> int:
                 "    old, REPO = REPO,", "    match {}:\n        case {**REPO}:\n            pass\n    old, REPO = REPO,"),
             "S35 production globals() with a computed key": (
                 "def shared(v):\n    return v", "def shared(v):\n    return v if v else globals()['_t_' + 'toy']()"),
+            # Codex r3 on #354
+            "S36 globals().get() of a moved test function": (
+                "    _self_test_more(ok)\n", "    if globals().get('_self_test_more'):\n        _self_test_more(ok)\n"),
+            "S37 production globals().get() with a computed key": (
+                "def shared(v):\n    return v", "def shared(v):\n    return v if v else globals().get('_t_' + 'toy')"),
+            "S38 a builtin rebound through sys.modules[Machine.__module__]": (
+                "    _self_test_more(ok)\n", "    sys.modules[Machine.__module__].any = len\n    _self_test_more(ok)\n"),
         }
         for i, (what, (old, new)) in enumerate(refuse.items()):
             assert old in TOY, what
@@ -1488,6 +1510,21 @@ def _self_test() -> int:
         ok(unstamped and retried and rc6 == 0 and len(case_list(out6)) == 5,
            f"S28 an interrupted split leaves the module unsplit, and the retry (globals() with no test helper) "
            f"runs ({rc6}, {out6[-200:]!r})")
+        d7 = toy_repo("h", TOY.replace("    g_ = globals()\n", "    assert globals()['__name__']\n    g_ = globals()\n"))
+        rc7 = None
+        open(os.path.join(d7, MODULE + ".split-tmp"), "w").write("a note")
+        try:
+            stage_tests(d7, log=quiet)
+            rc7, out7 = selftest(d7)
+        except SplitError as e:
+            out7 = str(e)
+        ok(rc7 == 0 and len(case_list(out7)) == 6
+           and open(os.path.join(d7, MODULE + ".split-tmp")).read() == "a note",
+           f"S39 a read through globals() is not a rebinding, and the writer never touches a file of its "
+           f"temporary's old name ({rc7}, {out7[-120:]!r})")
+        ok(not compare_cases("PASS X1 a\nOK: all self-test cases passed.\nrc=0\n",
+                             "PASS X1 a\nOK: all self-test cases passed.\nrc=1\n")[0],
+           "S40 a recorded non-zero exit status is not a finished run")
         ok(compare_cases("PASS T1 a\nPASS T2 b\n", "PASS T1 x\nFAIL T2 b\n")[0] is False
            and compare_cases("PASS T1 a\nOK: all self-test cases passed.", "PASS T1 b\nOK: all self-test cases "
                              "passed.")[0] and not compare_cases("", "")[0]
