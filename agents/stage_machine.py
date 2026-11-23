@@ -506,7 +506,8 @@ def _earlier_round(path: str, round_n: int) -> int:
 
 def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
             history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None,
-            strict_done_when: bool = False, append_history: bool | None = None, signoff: str = "owner") -> dict:
+            strict_done_when: bool = False, append_history: bool | None = None, signoff: str = "owner",
+            checklist_rules: bool = True) -> dict:
     """Today's rule functions, in today's order, on the v2 findings: the critic YAMLs, the
     harness's checks (`extra`), and optionally spec-compliance and registry findings. `signoff`:
     the run's mode, for whose answers to owner items count (apply_owner_rule)."""
@@ -522,7 +523,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     harness = CL.harness_answers(spec_raw, run_dir) if spec_raw is not None else {}
     ck_results = CL.computed(spec_raw, run_dir) if spec_raw is not None else {}
     in_run = any(os.path.lexists(os.path.join(run_dir, f)) for f in ("decision_spec.yaml", STATE_FILE))
-    checklist = harness if in_run else None
+    checklist = harness if in_run and checklist_rules else None     # not on a replay of stored gates (v2_rules off)
     draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     extra = list(extra)
     names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
@@ -2429,7 +2430,7 @@ class Machine:
                         spec_violations=sv(self.run_dir) if sv else None,
                         registry_violations=rv(self.run_dir) if rv else None,
                         strict_done_when=self.st.v2_rules and self.st.tries.get("schema", 0) < MAX_SCHEMA_REPAIRS,
-                        append_history=False, signoff=self.st.signoff)
+                        append_history=False, signoff=self.st.signoff, checklist_rules=self.st.v2_rules)
             opened = []
             if d.get("action") and self.st.v2_rules:
                 opened = open_findings(self.run_dir, d)
