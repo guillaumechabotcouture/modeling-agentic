@@ -75,19 +75,31 @@ def _shipped(path: str, run_dir: str) -> bool:
     `_bundle_skips` leaves out (logs, batch records), and within the size limit (Codex r2 P1-3)."""
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import compute
-    rp, rd = os.path.realpath(path), os.path.realpath(run_dir)
-    roots = [os.path.join(rd, "models"), os.path.join(rd, "data")] + [os.path.join(compute.REPO, x)
-                                                                     for x in compute.REPO_CODE_DIRS]
-    root = next((r for r in roots if rp.startswith(r + os.sep)), None)
-    if root is None or not os.path.isfile(rp):
+    try:
+        rd = os.path.realpath(run_dir)
+        # Codex r3 P1-1: the bundle walks real directories but filters the file's own name (a symlink is judged by
+        # its name, not its target's)
+        dp, fn = os.path.realpath(os.path.dirname(os.path.abspath(path))), os.path.basename(path)
+        rp = os.path.join(dp, fn)
+        if not os.path.isfile(rp):
+            return False
+        if rp in {os.path.join(compute.REPO, r) for r in compute._data_set_files(compute.FP_DATA_SET, skip=rd)}:
+            return True          # Codex r3 P2: the declared data set ships whatever its size or name
+        roots = [os.path.join(rd, "models"), os.path.join(rd, "data")] + [os.path.join(compute.REPO, x)
+                                                                         for x in compute.REPO_CODE_DIRS]
+        root = next((r for r in roots if rp.startswith(r + os.sep)), None)
+        if root is None:
+            return False
+        parts = os.path.relpath(dp, root).split(os.sep)
+        if any(x in ("__pycache__", ".git") or x.startswith("_truth") for x in parts):
+            return False
+        # Codex r3 P1-2: only the directory's files count as sidecars (os.walk's `files`, as make_bundle reads them)
+        names = {e.name for e in os.scandir(dp) if not e.is_dir()}
+        if compute._bundle_skips(fn, names, root == os.path.join(rd, "data"), dp == os.path.join(rd, "models")):
+            return False
+        return os.path.getsize(rp) <= compute.DEFAULT_MAX_FILE_MB * 2 ** 20
+    except OSError:          # Codex r3 P2: what cannot be verified is not shipped: the draws stay in-process
         return False
-    parts = os.path.relpath(os.path.dirname(rp), root).split(os.sep)
-    if any(x in ("__pycache__", ".git") or x.startswith("_truth") for x in parts):
-        return False
-    dp, fn = os.path.split(rp)
-    if compute._bundle_skips(fn, set(os.listdir(dp)), root == os.path.join(rd, "data"), dp == os.path.join(rd, "models")):
-        return False
-    return os.path.getsize(rp) <= compute.DEFAULT_MAX_FILE_MB * 2 ** 20
 
 
 def _wire_safe(x) -> bool:
@@ -225,16 +237,17 @@ def prefetch(A, drawn, kw) -> list[dict]:
         r_ = list(r_)
         ncalls += 1
         nworkers = max(nworkers, int(summ.get("workers") or 0))
-        if len(r_) != len(part) or any(not _row_ok(t, r, ident) for t, r in zip(part, r_)):
-            rows += r_
-            break            # Codex r2 P2: a failed slice stops the wave; the check below reports it
+        # Codex r2 P2, r3 P1-3: a slice is checked whole before anything is kept or the next one is sent
+        bad = [n for n, (t, r) in enumerate(zip(part, r_)) if not _row_ok(t, r, ident)]
+        if len(r_) != len(part) or bad:
+            n = a + (bad[0] if bad else min(len(r_), len(part)))
+            why = ((r_[bad[0]].get("error") or "inputs or engine identity differ") if bad
+                   else f"{len(r_)} rows for {len(part)} tasks")
+            raise ValueError(f"draw fan-out: task {n} of {len(flat)} failed or does not match its inputs ({why}); the "
+                             "analysis fails closed")
         rows += r_
-    bad = [n for n, (t, r) in enumerate(zip(flat, rows)) if not _row_ok(t, r, ident)]
-    if len(rows) != len(flat) or bad:
-        n = bad[0] if bad else len(rows)
-        why = (rows[n].get("error") if n < len(rows) else "missing row") or "inputs or engine identity differ"
-        raise ValueError(f"draw fan-out: {len(bad) or len(flat) - len(rows)} of {len(flat)} tasks failed or do not "
-                         f"match their inputs (e.g. task {n}: {why}); the analysis fails closed")
+    if len(rows) != len(flat):
+        raise ValueError(f"draw fan-out: {len(rows)} rows for {len(flat)} tasks; the analysis fails closed")
     out, n = [], 0
     for ts in per:
         runs = {}
@@ -379,6 +392,15 @@ def _self_test_cases(ok, fails, RUN, signoff, q, tempfile, yaml) -> int:
         open(lg, "w").write("{}")
         ok(not _shipped(lg, d) and _shipped(os.path.join(ROOT, "toolkit", "analysis", "draw_fanout.py"), d),
            "DF16 a file is shipped only under compute.py's own bundle rules (a .log under models/ is not)")
+        # Codex r3 P1-1: the name the engine opens is what the bundle filters, not a symlink's target
+        yml = os.path.join(d, "models", "bench.yaml")
+        open(yml, "w").write("{}")
+        ln = os.path.join(d, "models", "bench2.log")
+        os.symlink(yml, ln)
+        ok(_shipped(yml, d) and not _shipped(ln, d), "DF20 a .log symlink to a shipped file is judged by its own name")
+        # Codex r3 P1-1b: a directory named like a log's summary sidecar does not exempt the log
+        os.makedirs(os.path.join(d, "models", "bench.log.summary.json"), exist_ok=True)
+        ok(not _shipped(lg, d), "DF21 a directory named like a sidecar does not make a .log shipped")
         # Codex r2 P1-2: inputs a JSON round trip would change (non-text mapping keys) keep the draws in-process
         i0 = A.ids[0]
         keep_attrs = dict(A.model.attrs[i0])
@@ -395,6 +417,17 @@ def _self_test_cases(ok, fails, RUN, signoff, q, tempfile, yaml) -> int:
             ok(False, "DF18 max_tasks 0 is refused before dispatch")
         except ValueError as e:
             ok("max_tasks" in str(e), f"DF18 max_tasks 0 is refused before dispatch ({e})")
+        # Codex r3 P1-3: a slice that returns more or fewer rows than it was given fails closed at once
+        orig3 = compute.map_fn
+        compute.map_fn = lambda rd, fn, inputs, **k: ([{"ok": True, "result": run_task(inputs[0])}] * 2,
+                                                      {"backend": "local"})
+        try:
+            prefetch(A, [(dict(A.theta0), None)] * 2, dict(A.compute, max_tasks=1))
+            ok(False, "DF22 a slice with the wrong number of rows fails closed")
+        except ValueError as e:
+            ok("fails closed" in str(e), f"DF22 a slice with the wrong number of rows fails closed ({e})")
+        finally:
+            compute.map_fn = orig3
         # Codex r2 P2: a failed slice stops the wave before the next compute call
         calls = []
         orig2 = compute.map_fn
