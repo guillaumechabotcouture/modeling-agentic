@@ -123,6 +123,7 @@ wiring:
   # Direct evaluation: the engine's own noise is the change one seed shift makes at the point (zero for a
   # deterministic engine); an input must move an output by more than this many times that change.
   noise_multiplier: 3.0
-  # Emulator path: the check reads the emulator, which answers for the engine; an input the emulator learned to ignore
-  # still moves its prediction slightly, so the tolerance is this share.
-  emulator_rel_tol: 1.0e-4
+  # Emulator path: the check reads the emulator, which answers for the engine. A fitted emulator moved an engine-dead
+  # input by 2e-4 in the Codex round 2 probe of #365, so only a change above this share is `wired`; below it the row is
+  # `emulator_unverified` (an engine run would settle it), never certified either way.
+  emulator_wired_rel: 1.0e-2

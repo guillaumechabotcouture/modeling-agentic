@@ -119,11 +119,15 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     ranges and cost items, drawn priors and scenario values, fitted and calibrated
     parameters, decision-test inputs) to each end of its range and checks that it moves at
     least one declared outcome or cost (`toolkit/analysis/wiring.py`, `analysis/wiring.yaml`).
-    An input that moves nothing, or moves less than the engine's own noise, is a HIGH
-    `input_not_wired` finding. Only when the input is deliberately inert in this run,
-    declare `analysis.wiring_exempt: {<input name>: <reason>}` (the name as wiring.yaml
-    gives it: a parameter, a cost item id, `burden_anchor_<group>` or a decision-test id);
-    the results list every exemption with its reason. Fix a dead input; do not exempt it.
+    An input that moves nothing, moves less than the engine's own noise, or (on the emulator
+    path) moves the emulator too little to show the engine reads it, gets an
+    `input_not_wired` finding. The check is advisory for now: the finding is MEDIUM and
+    never fails a run, and it is marked `would_block` so that false positives can be counted.
+    Only when the input is deliberately inert in this run, declare
+    `analysis.wiring_exempt: {parameters | cost_items | burden_anchors | decision_tests:
+    {<name>: <reason>}}`, using the name wiring.yaml gives it under its own kind. The results
+    list every exemption with its reason, including unused ones. Fix a dead input; do not
+    exempt it.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for. When the question asks for the options that maximise an *expected*
     outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
