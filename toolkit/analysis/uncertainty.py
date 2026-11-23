@@ -742,6 +742,15 @@ def _self_test() -> int:
     ok(e5 == [m_, m_, m_] and e6 == (2.0, 2.0),
        f"UQE5 identical draws at the largest float give equal quantiles; a column vector is read flat (Codex r2) "
        f"({e5}, {e6})")
+    e7 = [_q([s_, s_, -s_, -s_, 0.1, 0.5])["mean"], _q([s_, -s_, s_, -s_, 0.1, 0.5])["mean"]]
+    try:
+        e8 = (_q(np.empty((2, 0))), str(_q([[1.0, np.nan], [np.nan, np.nan]])))
+    except ValueError as e:
+        e8 = (None, str(e))
+    except Exception as e:  # noqa: BLE001
+        e8 = (f"{type(e).__name__}", "")
+    ok(e7[0] == e7[1] == 0.1 and e8[0] is None and "3 of 4 values" in e8[1],
+       f"UQE6 the mean is the correctly rounded mean whatever the order; draws are counted flat (Codex r3) ({e7}, {e8})")
     v_ = np.random.default_rng(3).normal(5.0, 2.0, 400)
     q_ = _q(v_, 0.9)
     ok(q_["median"] == float(np.median(v_)) and q_["ci_low"] == float(np.percentile(v_, 100 * (1 - 0.9) / 2))
