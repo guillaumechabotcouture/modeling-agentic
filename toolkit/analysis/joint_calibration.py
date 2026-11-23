@@ -121,6 +121,8 @@ def spec_problems(spec) -> list[str]:
                    "per-unit parameter)")
     if (raw.get("analysis") or {}).get("evaluation") != "emulator":
         bad.append(f"{w}: needs analysis.evaluation emulator")
+    from toolkit.spec import schema as _schema       # the spec's one scale check (Codex r2 of #334, P1-2)
+    bad += _schema.spec_scale_problems(spec)
     unk = sorted(set(j) - {"shared", "features", "discrepancy_sd", "seed", "waves", "points_per_unit",
                            "shared_points", "targets", "independent", "record", "unmatched", "sensitivity",
                            "best_point_weighting", "changes"})
@@ -189,8 +191,11 @@ def spec_problems(spec) -> list[str]:
                        "independent of the calibration targets (independent: [{parameter, reason}])")
         for v in sorted(indn & set(sh)):
             bad.append(f"{w}.independent: {v} is also shared")
-        card = eng.describe()
-        wins = card.outputs.get("windows", [])
+        try:
+            wins = eng.describe().outputs.get("windows", [])
+        except Exception as e:  # noqa: BLE001 -- fail closed with the diagnostic (Codex r3 of #334, P2-7)
+            bad.append(f"{w}: the engine card cannot be read ({type(e).__name__}: {str(e)[:200]})")
+            return bad
     else:
         eng, wins = None, None
     bad += _unmatched_problems(j.get("unmatched"), w)
@@ -756,7 +761,7 @@ def build(spec, units=None) -> tuple:
     feats = j.get("features") or []
     F = {i: [_feature(rows[i], f) for f in feats] for i in ids} if feats else {}
     up = {"name": cal["attribute"], "lo": float(cal["range"][0]), "hi": float(cal["range"][1]),
-          "scale": cal.get("scale", "log")}
+          "scale": spec.calibration_scale()}
     reg = spec.raw["decision_units"].get("region")
     P = HM.Problem(shared, up, ids, targets, features=F,
                    feature_names=[f if isinstance(f, str) else f["column"] for f in feats],
@@ -1419,7 +1424,7 @@ def sim_signature(spec) -> dict:
     return {"engine": engine_identity(spec.engine()), "engine_ref": raw["engine"], "horizon": raw["horizon"],
             "objective": {k: raw["objective"].get(k) for k in ("horizon", "delivery")},
             "comparator": spec.engine_package(spec.packages()[spec.comparator]),
-            "attribute": raw["calibration"].get("attribute"), "scale": raw["calibration"].get("scale", "log"),
+            "attribute": raw["calibration"].get("attribute"), "scale": spec.calibration_scale(),
             "held": {k: v for k, v in sorted(theta0(spec).items()) if k not in sh}, "shared": sorted(sh),
             "units": hashlib.sha256(blob).hexdigest()}
 
@@ -1780,6 +1785,45 @@ def _self_test() -> int:
                "JA1 a shared parameter without a sourced prior is refused")
     safe(ja1, "JA1")
 
+    def ja_sc():
+        # Codex r2 of #334 P1-2: the standalone joint calibration goes through the spec's one scale check
+        import yaml
+        for sc, needle in (("log", "below 0"), (None, "calibration.scale")):
+            with tempfile.TemporaryDirectory() as d:
+                p = _toy_joint(d)
+                raw = yaml.safe_load(open(p))
+                raw["calibration"]["scale"] = sc
+                yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+                sp = schema.load(p)
+                bad = spec_problems(sp)
+                try:
+                    _, _meta = build(sp)
+                    built = "built"
+                except Exception as e:  # noqa: BLE001 -- the refusal expected
+                    built = f"refused: {e}"
+                ok(any(needle in b for b in bad) and built.startswith("refused"),
+                   f"JA-SC (r2 P1-2) scale {sc!r} on the toy's [-2, 2] attribute is refused by spec_problems and build "
+                   f"({bad[-1:]}, {built[:160]})")
+    safe(ja_sc, "JA-SC")
+
+    def ja_sc2():
+        # Codex r3 of #334 P2-7: an unreadable card is the scale check's diagnostic, not a crash further on
+        import yaml
+        with tempfile.TemporaryDirectory() as d:
+            p = _toy_joint(d)
+            raw = yaml.safe_load(open(p))
+            raw["calibration"].pop("scale", None)
+            raw["engine"] = {"ref": "toolkit.engines.contract:ToyEngine", "config": {"results_path": d}}
+            yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+            sp = schema.load(p)
+            try:
+                bad = spec_problems(sp)
+            except Exception as e:  # noqa: BLE001 -- the crash this case guards against
+                bad = [f"raised {type(e).__name__}: {e}"]
+            ok(any("could not be read" in b for b in bad) and not any(b.startswith("raised") for b in bad),
+               f"JA-SC2 (r3 P2-7) an unreadable engine card is reported by spec_problems ({bad[-1:]})")
+    safe(ja_sc2, "JA-SC2")
+
     def ja2():
         with tempfile.TemporaryDirectory() as d:
             from toolkit.spec import toy_engines as TE
@@ -1964,7 +2008,8 @@ def _self_test() -> int:
             pr3, info3 = load_prior(spec2, o1, meta2, log=q)
             ok(info3["reused"] == 0, f"JA9c earlier values of another window are never read as this window's ({info3})")
             raw["calibration"]["joint"]["targets"][0]["window"] = [1, 2]
-            raw["calibration"]["scale"] = "log" if raw["calibration"].get("scale") == "linear" else "linear"
+            # (the toy's attribute goes below 0, so only its linear scale resolves: the horizon is what changes)
+            raw["horizon"]["stop"] = raw["horizon"]["stop"] + 1
             yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
             try:
                 check_same_simulator(spec, schema.load(p))
