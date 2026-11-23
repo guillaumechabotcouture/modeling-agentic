@@ -541,16 +541,13 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     import done_when
     import validate_critique_yaml as V
     critiques, schema_errors, refused = {}, [], {}
-    # Owner 2026-11-23: the domain and red-team critics answer the structural checklist; the harness answers the
-    # items it computes from the spec (toolkit/spec/critique_checklist.py). A missing item is a schema error.
-    # Required in a run (its run_state.json or its decision spec exists; a missing or unreadable spec leaves every item
-    # to the critics); only a gate over critique files alone (the unit fixtures, no run) needs none (Codex r1 of #366).
+    # Owner 2026-11-23: the domain and red-team critics answer every item of the structural checklist
+    # (toolkit/spec/critique_checklist.py); a missing item is a schema error. Required in a run (its run_state.json or
+    # its decision spec exists); only a gate over critique files alone (the unit fixtures, no run) or a replay of
+    # stored gates (v2_rules off) needs none.
     from toolkit.spec import critique_checklist as CL
-    spec_raw = CL.load_spec(run_dir)
-    harness = CL.harness_answers(spec_raw, run_dir) if spec_raw is not None else {}
-    ck_results = CL.computed(spec_raw, run_dir) if spec_raw is not None else {}
     in_run = any(os.path.lexists(os.path.join(run_dir, f)) for f in ("decision_spec.yaml", STATE_FILE))
-    checklist = harness if in_run and checklist_rules else None     # not on a replay of stored gates (v2_rules off)
+    checklist = bool(in_run and checklist_rules)
     draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     extra = list(extra)
     names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
@@ -612,7 +609,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     if schema_errors:
         return {"schema_errors": schema_errors, "action": None}
     d = V.decide(critiques, max_rounds, round_n)
-    d["critique_checklist"] = CL.record(critiques, harness, ck_results)
+    d["critique_checklist"] = CL.record(critiques)
     d["declared"] = V._declared_ids(run_dir)
     d["declared_prev"] = V._previous_declared(run_dir, round_n)
     d = V._apply_brief_scope(d, critiques, run_dir, max_rounds, round_n)
@@ -4656,16 +4653,14 @@ def _self_test() -> int:
         ok(hist[:8] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
            and "FIX_LOOP" in hist
            and hist[-3:] == ["PRESENTATION", "GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
-        # SM-CK1-3 (owner 2026-11-23): the structural checklist. The gate records the harness's and each critic's
-        # answers; a missing item is a schema repair, never a round; not_applicable answers raise nothing.
+        # SM-CK1-3 (owner 2026-11-23): the structural checklist. The gate records each critic's answers to all five
+        # items; a missing item is a schema repair, never a round; not_applicable answers raise nothing.
         from toolkit.spec import critique_checklist as CLk
         g1 = json.load(open(os.path.join(d, "gate_r1.json")))
         ck = g1.get("critique_checklist") or {}
-        ok(set(ck) == set(CLk.ITEMS) and (ck["comparator_symmetry"].get("harness") or {}).get("answer") == "pass"
-           and ck["comparator_symmetry"]["critics"] == {}
-           and set(ck["burn_in_drift"]["critics"]) == {"critique-domain", "critique-redteam"},
-           f"SM-CK1 the gate record holds the harness's answer (generated packages: symmetric) and both critics': "
-           f"{json.dumps(ck)[:300]}")
+        ok(set(ck) == set(CLk.ITEMS) and all(set(ck[i]["critics"]) == {"critique-domain", "critique-redteam"}
+                                             for i in CLk.ITEMS),
+           f"SM-CK1 the gate record holds both critics' answers to all five items: {json.dumps(ck)[:300]}")
         dropped = []
 
         def drop_once(reviewer, rn, answers):
@@ -5407,7 +5402,7 @@ def _self_test() -> int:
            f"SM-CK5 a run without its spec still requires every checklist item: {(gck5.get('schema_errors') or [])[:2]}")
         ok(gck.get("action") is None and len([e for e in gck.get("schema_errors") or []
                                               if "missing required key 'checklist'" in e]) == len(CRITICS),
-           f"SM-CK4 with a decision spec in the run (even an unreadable one), critiques without the checklist are "
+           f"SM-CK4 with a decision spec in the run, critiques without the checklist are "
            f"schema errors: {(gck.get('schema_errors') or [])[:2]}")
         # T_OWNER_ANSWERED (1F): the harness-recorded answer to that item releases it; whose answer counts follows the
         # run's sign-off mode (a lead's only under --signoff lead, D2)

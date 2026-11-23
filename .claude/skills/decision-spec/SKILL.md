@@ -149,14 +149,6 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `evidence/dossier_draft.json` and the report declare every input with no data, every
     chosen value that differs from execution, every value left at the engine's and every
     source the harness could not locate.
-13. **Arms and periods (principles 8 and 9).** Give every arm the background or
-    standard-of-care components the comparator and the other arms carry, or add the arm
-    with them; the pre-sign critique flags an arm that lacks one (`comparator_symmetry`).
-    When the calibration or validation uses time windows, declare `periods: {holdout:
-    [[start, stop], ...], shocks: [{id, window, what}, ...]}` with every outbreak,
-    disruption or intervention period in the data; the critique flags a holdout window
-    that overlaps one (`holdout_shock_overlap`). Declare either check in
-    `principle_departures` when the departure is meant.
 
 ## Closed-population epidemic questions (the compartmental engine)
 

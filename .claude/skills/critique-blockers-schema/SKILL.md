@@ -266,30 +266,30 @@ section does not restate them.
 
 ```yaml
 checklist:
+  comparator_symmetry: {answer: pass, reason: "every arm carries the comparator's components (decision_spec.yaml options)"}
+  holdout_shock_overlap: {answer: not_applicable, reason: "the calibration holds out no time window"}
   burn_in_drift: {answer: pass, reason: "analysis/trajectories.yaml: coverage at the window start matches the spec"}
   surveillance_ranking: {answer: finding, reason: "units binned on raw notifications", blockers: [D-004]}
   natural_history_tension: {answer: not_applicable, reason: "the engine has no detection step"}
-  # comparator_symmetry and holdout_shock_overlap: left out when the harness answered them
 ```
 
-- `answer` is `pass`, `finding` or `not_applicable`; every answer has a
-  non-empty `reason` (for `not_applicable`, why the check cannot arise).
-- A `finding` names the open (unresolved) blocker(s) in the same file that state it. The
-  checklist adds no finding of its own: `pass` and `not_applicable` cost
-  no round, and a finding costs only what its blocker costs.
-- The harness computes `comparator_symmetry` from the packages execution
-  uses, and `holdout_shock_overlap` when the spec declares `periods.holdout`
-  and `periods.shocks`; the review message gives the results as JSON data.
-  A computed pass or not_applicable, or a finding the spec declares, is the
-  harness's answer: leave that item out. An undeclared computed finding is
-  yours to answer (a blocker, or pass with the reason it does not matter).
-  Both are also pre-sign checks on the sign-off sheet
-  (`toolkit/spec/spec_critique.py`), where a finding is fixed or declared.
+- You answer all five items, every round. `answer` is `pass`, `finding` or
+  `not_applicable`; every answer has a non-empty `reason` (for
+  `not_applicable`, why the check cannot arise).
+- A `finding` names the open (unresolved) blocker(s) in the same file that
+  state it. The checklist adds no finding of its own: `pass` and
+  `not_applicable` cost no round, and a finding costs only what its blocker
+  costs.
 - A missing item, an unknown item, an unknown answer, a missing reason, or
-  a finding without a blocker of this file is a schema error (fail
-  closed); the gate's schema repair lists every one.
-- The gate record (`gate_r<N>.json`, key `critique_checklist`) holds the
-  harness's and each critic's answers.
+  a finding without an open blocker of this file is a schema error (fail
+  closed); the gate's schema repair lists every one. The errors never quote
+  what you wrote: they name it by a marker such as `[CK-K6]` or
+  `[CK-B-burn_in_drift-1]`, and the repair's review message gives the
+  marked text as JSON data.
+- The gate record (`gate_r<N>.json`, key `critique_checklist`) holds each
+  critic's answers.
+- Deterministic audits of comparator symmetry and of holdout windows
+  against shock periods are deferred to the self-audit build (#369).
 
 ## Gate rules applied by the lead (for your awareness)
 

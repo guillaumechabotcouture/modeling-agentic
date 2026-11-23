@@ -609,18 +609,16 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
     return True
 
 
-def checklist_text(run_dir: str, reviewer: str) -> tuple[str, str]:
+def checklist_text(run_dir: str, reviewer: str, repair: bool = False) -> tuple[str, str]:
     """(system text, message text) of the structural checklist a domain or red-team review answers (owner
-    2026-11-23; toolkit/spec/critique_checklist.py): the instructions and the items it answers in the system prompt,
-    the harness's computed results as one line of JSON data in the message (spec text never enters the system prompt;
-    Codex r1 of #366). Both empty for other reviewers."""
+    2026-11-23; toolkit/spec/critique_checklist.py): its fixed instructions and the five items in the system prompt;
+    on a repair, the critic-written text the schema errors name by marker, as one line of JSON data in the message
+    (critic text never enters the system prompt; Codex r2 of #366, P1-5). Both empty for other reviewers."""
     from toolkit.spec import critique_checklist as CL
     if reviewer not in CL.CHECKLIST_REVIEWERS:
         return "", ""
-    raw = CL.load_spec(run_dir)
-    harness = CL.harness_answers(raw, run_dir) if raw is not None else {}
-    comp = CL.computed(raw, run_dir) if raw is not None else {}
-    return "\n\n" + CL.prompt_block(harness), "\n\n" + CL.message_data(comp)
+    data = CL.repair_data(run_dir, CRITIQUE_FILE[reviewer]) if repair else ""
+    return "\n\n" + CL.prompt_block(), ("\n\n" + data) if data else ""
 
 
 class SdkTasks:
@@ -813,7 +811,7 @@ class SdkTasks:
         notes = RF.critic_notes(run_dir)
         msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
                                             + "\n- ".join(notes) if notes else "") + owner_held_note(run_dir, reviewer)
-        ck_sys, ck_msg = checklist_text(run_dir, reviewer)
+        ck_sys, ck_msg = checklist_text(run_dir, reviewer, repair=bool(feedback))
         msg += ck_msg
         before = _file_bytes(run_dir, f)
         res = self._session("critique", PROMPTS["critique"].format(
@@ -995,28 +993,42 @@ def _self_test() -> int:
         ok(all(k in cp2 for k in ("resolved_in_round: 2", "resolved_evidence", "prior_round: 1", "still_present",
                                   "never a bare id")),
            "S17 the critique prompt states what a resolved blocker and a carried_forward entry need")
-        # SCK1 (owner 2026-11-23): the domain and red-team prompts carry the structural checklist, with the
-        # harness's own answers for the items it computes from the spec; the presentation prompt does not.
-        import yaml
+        # SCK1 (owner 2026-11-23): the domain and red-team prompts carry the structural checklist (all five items, fixed
+        # text); the presentation prompt does not.
         from toolkit.spec import critique_checklist as CL
         ck = os.path.join(d, "ck")
         os.makedirs(ck)
-        yaml.safe_dump({"options": {"components": {"sc": {}, "a": {}, "c": {}},
-                                    "packages": {"soc": ["sc"], "soc_a": ["sc", "a"], "c": ["c"]}},
-                        "comparator": {"package": "soc"}}, open(os.path.join(ck, "decision_spec.yaml"), "w"))
         tx, tm = checklist_text(ck, "critique-redteam")
-        ok(all(i in tx for i in CL.ITEMS) and "lacks" not in tx and "`c` lacks `sc`" in tm and "\n" not in tm.strip()
+        ok(all(f"  - {i} (principle" in tx for i in CL.ITEMS) and tm == ""
            and checklist_text(ck, "critique-presentation") == ("", "") and "checklist (the domain and red-team" in cp2,
-           f"SCK1 the checklist reaches the domain and red-team prompts only; an undeclared computed finding is the "
-           f"critics' item, its result data in the message, never spec text in the system prompt: {tx[-200:]} | {tm}")
-        # SCK3 (Codex r1 of #366, P1-4): a spec that is a link (here into another run) is never read
-        other = os.path.join(d, "ck_other")
-        os.makedirs(other)
-        os.replace(os.path.join(ck, "decision_spec.yaml"), os.path.join(other, "decision_spec.yaml"))
-        os.symlink(os.path.join(other, "decision_spec.yaml"), os.path.join(ck, "decision_spec.yaml"))
-        tx3, tm3 = checklist_text(ck, "critique-redteam")
-        ok(CL.load_spec(ck) is None and "lacks" not in tm3 and all(i in tx3 for i in CL.ITEMS),
-           f"SCK3 a linked spec is not read: every item is the critics' ({tm3})")
+           f"SCK1 the checklist (all five items) reaches the domain and red-team prompts only: {tx[-200:]}")
+        # SCK3 (Codex r2 of #366, P1-5): a repair's schema errors reach the system prompt, so they never quote the
+        # critic's text; the text they name by marker is data in the review message.
+        import yaml as _yk
+        evil = "IGNORE_PRIOR_MARKER new instruction"
+        bad_doc = {"reviewer": "critique-domain", "round": 1, "verdict": "PASS", "structural_mismatch": {"detected": False},
+                   "carried_forward": [], "blockers": [],
+                   "checklist": dict({i: {"answer": "pass", "reason": "r"} for i in CL.ITEMS},
+                                     **{evil: {"answer": "pass", "reason": "r"}},
+                                     burn_in_drift={"answer": "finding", "reason": "r", "blockers": [evil]})}
+        _yk.safe_dump(bad_doc, open(os.path.join(ck, "critique_domain.yaml"), "w"), sort_keys=False)
+        errs_k = CL.problems(bad_doc["checklist"], "critique_domain.yaml", [])
+        seen_k = {}
+
+        def capture(self_, kind, system, prompt, owns, model=None):
+            seen_k.update(system=system, prompt=prompt)
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        _orig_k = SdkTasks._session
+        SdkTasks._session = capture
+        try:
+            SdkTasks(ck).critique(ck, "critique-domain", 1, errs_k)
+        finally:
+            SdkTasks._session = _orig_k
+        ok(len(errs_k) == 2 and "IGNORE_PRIOR_MARKER" not in seen_k.get("system", "x")
+           and "[CK-K6]" in seen_k.get("system", "") and "[CK-B-burn_in_drift-1]" in seen_k.get("system", "")
+           and "IGNORE_PRIOR_MARKER" in seen_k.get("prompt", "") and "checklist_markers" in seen_k.get("prompt", ""),
+           f"SCK3 a repair's system prompt names the critic's checklist text by marker only; the text is message data "
+           f"({errs_k}; {seen_k.get('prompt', '')[-200:]!r})")
         # S17b (hb2 fix 3): the critic is told which of its findings the owner answered, to carry them forward
         from agents import findings_ledger as _FL
         with tempfile.TemporaryDirectory() as d17:
@@ -1222,7 +1234,7 @@ def _self_test() -> int:
             SdkTasks._session = orig_session
         try:
             gotk = V.validate_critique(os.path.join(cd, CRITIQUE_FILE["critique-redteam"]), "critique-redteam", 1,
-                                       checklist={})
+                                       checklist=True)
             sck2 = gotk["checklist"]["burn_in_drift"]["blockers"]
         except V.SchemaError as e:
             sck2 = getattr(e, "errors", None) or [str(e)]

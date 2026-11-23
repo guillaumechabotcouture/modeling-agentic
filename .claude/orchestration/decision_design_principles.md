@@ -65,7 +65,7 @@ only the owner can amend the signed spec.
 
 Principles 8 to 12 (owner, 2026-11-23) name five reasons an outside benchmark found models stopping at "good"
 rather than "excellent". The domain and red-team critics answer each one in their checklist every round (pass,
-finding or not applicable, with a reason); the harness answers 8 and 9 itself when the spec lets it.
+finding or not applicable, with a reason).
 
 8. Compare arms symmetrically. Every arm carries the background or standard-of-care components the comparator
    and the other arms carry, so arms differ only in what they add; a standalone arm without the backup the others
@@ -73,7 +73,7 @@ finding or not applicable, with a reason); the harness answers 8 and 9 itself wh
 
 9. Keep holdout windows clear of shocks. A validation or holdout window that overlaps an outbreak, a service
    disruption or a period of non-pharmaceutical interventions tests the model on dynamics its calibration window
-   does not share; declare such periods in the spec (`periods.shocks`) beside the holdout windows.
+   does not share; name such periods beside the holdout windows.
 
 10. Check the burn-in. After burn-in, the engine's settings at the start of the decision window (coverage,
     immunity, transmission level, population) are the nominal ones the spec declares; drift during burn-in

@@ -96,7 +96,7 @@ class StubTasks:
       usd:         spend charged per task (default 0)
       crash:       {call name: n}  the call raises (an interrupted session) the first n times
       checklist:   callable(reviewer, round, answers) -> answers (None: no checklist) for a domain or red-team
-                   critique (default: every item the harness did not answer, `pass`)
+                   critique (default: every item, `pass`)
     """
 
     def __init__(self, script: dict | None = None):
@@ -187,10 +187,8 @@ class StubTasks:
                "verdict": "REVISE" if any(not b["resolved"] for b in blockers) else "PASS",
                "structural_mismatch": sm, "carried_forward": carried, "blockers": blockers}
         from toolkit.spec import critique_checklist as CL
-        if reviewer in CL.CHECKLIST_REVIEWERS:      # owner 2026-11-23: every item the harness did not answer
-            raw = CL.load_spec(run_dir)
-            ck = {i: {"answer": "pass", "reason": "stub: checked"}
-                  for i in CL.critic_items(CL.harness_answers(raw, run_dir) if raw is not None else {})}
+        if reviewer in CL.CHECKLIST_REVIEWERS:      # owner 2026-11-23: every item of the structural checklist
+            ck = {i: {"answer": "pass", "reason": "stub: checked"} for i in CL.ITEMS}
             edit = self.s.get("checklist")
             ck = edit(reviewer, round_n, ck) if callable(edit) else ck
             if ck is not None:
