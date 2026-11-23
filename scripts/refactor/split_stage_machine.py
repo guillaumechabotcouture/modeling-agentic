@@ -371,6 +371,9 @@ def _test_rewrites(tree_src: str, tests: list):
                 raise SplitError(f"line {n.lineno}: sys.modules[...] in a self-test other than "
                                  f"sys.modules[Machine.__module__]")
     _check_bindings(tests, rebound)
+    shadow = sorted(rebound & set(dir(builtins)))
+    if shadow:
+        raise SplitError(f"a self-test rebinds the builtin(s) {shadow} in the module; patch them another way first")
     for u in tests:
         for n in ast.walk(u.node):
             if isinstance(n, ast.Global):
@@ -394,8 +397,8 @@ def _is_globals_call(n) -> bool:
 
 def _check_namespace_uses(node, holders: set):
     """globals() (or an alias of it) is used only in the ways SM_GLOBALS writes through to the module: a string
-    subscript (read, write), .get(), `in`, or an alias. Anything else (update, keys, pop, iteration) would act on
-    a private dict and silently drop a patch."""
+    subscript (read, write), .get(), or one alias of globals() itself. Anything else (update, keys, pop, del,
+    `in`, an alias of the alias) would act on a private dict or see the moved names missing."""
     parent = {c: p for p in ast.walk(node) for c in ast.iter_child_nodes(p)}
     for n in ast.walk(node):
         if not (_is_globals_call(n) or isinstance(n, ast.Name) and n.id in holders and isinstance(n.ctx, ast.Load)):
@@ -404,10 +407,10 @@ def _check_namespace_uses(node, holders: set):
         ok_ = (isinstance(p, ast.Subscript) and p.value is n and isinstance(p.slice, ast.Constant)
                and isinstance(p.slice.value, str)) \
             or (isinstance(p, ast.Attribute) and p.attr == "get" and isinstance(parent.get(p), ast.Call)) \
-            or (isinstance(p, ast.Compare) and n in p.comparators and all(isinstance(o, (ast.In, ast.NotIn))
-                                                                          for o in p.ops)) \
-            or (isinstance(p, ast.Assign) and p.value is n and len(p.targets) == 1
+            or (isinstance(p, ast.Assign) and p.value is n and _is_globals_call(n) and len(p.targets) == 1
                 and isinstance(p.targets[0], ast.Name))
+        if ok_ and isinstance(p, ast.Subscript) and isinstance(p.ctx, ast.Del):
+            ok_ = False
         if not ok_:
             raise SplitError(f"line {n.lineno}: a use of globals() in a self-test that SM_GLOBALS cannot write "
                              f"through ({ast.unparse(p)[:60]!r}); rewrite it as a subscript first")
@@ -434,10 +437,13 @@ def _check_bindings(tests, rebound: set):
                 bound = [n.arg]
             elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
                 bound = [n.name]
-            elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)) and n.id == "Machine":
-                bound = ["Machine"]
+            elif isinstance(n, ast.MatchMapping) and n.rest:
+                bound = [n.rest]
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)) and n.id in ("Machine",
+                                                                                                    "globals"):
+                bound = [n.id]
             for b in bound:
-                if b in rebound or b == "Machine":
+                if b in rebound or b in ("Machine", "globals"):
                     raise SplitError(f"line {getattr(n, 'lineno', u.first)}: `{b}` is bound in a self-test other "
                                      f"than by a plain assignment; rename it first")
         bad = sorted(comp_targets & (rebound | {"Machine"}))
@@ -486,11 +492,14 @@ STUB = '''def _self_test() -> int:
     """The cases live in tests/stage_machine/ (moved there verbatim by scripts/refactor/split_stage_machine.py);
     they run against this module, imported there as {target}."""
     sys.modules["{target}"] = sys.modules[__name__]
-    for k in [k for k in sys.modules if k.startswith("{prefix}")]:
-        del sys.modules[k]          # a second call (another copy of this module) binds the cases to it afresh
     d = os.path.join(REPO, "tests", "stage_machine")
-    if d not in sys.path:
-        sys.path.append(d)
+    for k, m in list(sys.modules.items()):  # a second call (another copy, another checkout) binds the cases afresh
+        if k.startswith("{prefix}") and os.path.basename(os.path.dirname(getattr(m, "__file__", None) or "")) \
+                == "stage_machine":
+            del sys.modules[k]
+    while d in sys.path:
+        sys.path.remove(d)
+    sys.path.insert(0, d)           # this checkout's cases, not another's
     import {prefix}core
     return {prefix}core._self_test()
 '''
@@ -552,6 +561,11 @@ def stage_tests(repo: str, log=print) -> bool:
     for u in prod:          # a name reached by string (globals()["_t_x"], getattr) counts as a use too
         if u.names != ["_self_test"]:
             prod_refs |= {c.value for c in ast.walk(u.node) if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+            computed = [c for c in ast.walk(u.node) if isinstance(c, ast.Subscript) and _is_globals_call(c.value)
+                        and not isinstance(c.slice, ast.Constant)]
+            if computed:
+                raise SplitError(f"line {computed[0].lineno}: production code reads globals() with a computed key; "
+                                 f"the script cannot tell whether it reaches test code")
     used_by_prod = sorted((test_names - {"_self_test"}) & prod_refs)
     if used_by_prod:
         raise SplitError(f"production code uses test-named code: {used_by_prod}")
@@ -647,8 +661,10 @@ def _write_tree(repo: str, files: dict):
         p = os.path.join(repo, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         compile(text, rel, "exec")            # never write a file that does not parse
-        with open(p, "w", encoding="utf-8") as f:
+        tmp = p + ".split-tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
+        os.replace(tmp, p)                    # whole or not at all: a retry never meets a half-written module
 
 
 # ---------------------------------------------------------------------------------------- stage 2: package
@@ -1177,8 +1193,10 @@ def case_list(text: str) -> list:
 
 def compare_cases(before: str, after: str) -> tuple[bool, str]:
     b, a = case_list(before), case_list(after)
-    ok_b = "OK: all self-test cases passed." in before
-    ok_a = "OK: all self-test cases passed." in after
+    def finished(text):
+        tail = [x.strip() for x in text.splitlines() if x.strip() and not x.startswith("rc=")]
+        return bool(tail) and tail[-1] == "OK: all self-test cases passed."
+    ok_b, ok_a = finished(before), finished(after)
     if b == a and ok_b == ok_a and a and ok_a:
         n_pass = sum(1 for s, _ in a if s == "PASS")
         return True, (f"identical: {len(a)} cases in the same order, {n_pass} PASS, {len(a) - n_pass} FAIL; "
@@ -1434,6 +1452,18 @@ def _self_test() -> int:
             "S26 globals().update": ("    g_ = globals()\n", "    globals().update(X=1)\n    g_ = globals()\n"),
             "S27 production code reaching a test helper by name": (
                 "def shared(v):\n    return v", "def shared(v):\n    return v if v else globals()['_t_toy']()"),
+            # Codex r2 on #354
+            "S29 an alias of the globals() alias": ("    g_ = globals()\n", "    g_ = globals()\n    h_ = g_\n"),
+            "S30 del globals()[...]": ("    g_ = globals()\n", "    globals()['zz'] = 1\n    del globals()['zz']\n"
+                                                             "    g_ = globals()\n"),
+            "S31 `in globals()`": ("    _self_test_more(ok)\n", "    if '_self_test_more' in globals():\n"
+                                                              "        _self_test_more(ok)\n"),
+            "S32 a local callable named globals": ("    g_ = globals()\n", "    globals = dict\n    g_ = globals()\n"),
+            "S33 a test rebinding a builtin": ("    g_ = globals()\n", "    globals()['open'] = open\n    g_ = globals()\n"),
+            "S34 a mapping-pattern capture of a rebound name": (
+                "    old, REPO = REPO,", "    match {}:\n        case {**REPO}:\n            pass\n    old, REPO = REPO,"),
+            "S35 production globals() with a computed key": (
+                "def shared(v):\n    return v", "def shared(v):\n    return v if v else globals()['_t_' + 'toy']()"),
         }
         for i, (what, (old, new)) in enumerate(refuse.items()):
             assert old in TOY, what

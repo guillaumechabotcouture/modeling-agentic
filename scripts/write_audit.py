@@ -313,7 +313,8 @@ REVIEWED: dict = {
                           "column-stripped input and mount points in its temporary work dirs")},
     "scripts/plant_defects.py": {"open-write": (3, _EVAL), "shutil": (4, _EVAL)},
     "scripts/refactor/split_stage_machine.py": {"open-write": (1, _REPO + "; the split's output files in the "
-                                                                          "checkout it is pointed at")},
+                                                                          "checkout it is pointed at"),
+                                                "os-rename": (1, "its own temporary file onto that output file")},
     "scripts/regression_eval.py": {"open-write": (4, _EVAL), "shutil": (1, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/results_store.py": {"safeio-derived-root": (1, "download() streams to the path its caller names (the "
                                                          "launcher's out dir, a VM staging dir): no run root "
