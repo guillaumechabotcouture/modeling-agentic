@@ -121,7 +121,10 @@ def _engine_dir(ref: str) -> str | None:
 def engine_declaration(ref: str, config: dict | None = None) -> dict | None:
     """An engine's decision-input declaration: the card files in its module's directory (read without importing the
     engine), else, walking its classes, a `DECISION_INPUTS` attribute or the card files of a base class's directory
-    (a subclass inherits its base's declaration); None when nothing declares one."""
+    (a subclass inherits its base's declaration); None when nothing declares one. An unregistered reference is
+    refused first (schema.UnregisteredEngine), never given the declaration of its module's registered engine."""
+    from toolkit.spec import schema
+    schema.check_engine_ref(ref)
     d0 = _engine_dir(ref)
     if d0:
         d = DI.load(d0)
