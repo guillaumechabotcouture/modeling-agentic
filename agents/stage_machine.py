@@ -399,11 +399,9 @@ def _owner_rule():
     return scope_signoff
 
 
-def _bearing_item(run_dir: str, v: dict) -> dict:
-    """What the owner is asked about a decision-bearing finding: its claim and the analysis's record of the decision
-    test, fingerprinted (an answer binds to both: a changed result is asked again). The record is the producer's: the
-    toolkit's verified row (with its result file's hash) for a toolkit finding, the spike's analysis.json otherwise, so
-    a stale file of the other backend never stands in for it (Codex r1 of #327)."""
+def _bearing_record(run_dir: str, v: dict):
+    """The producer's record of a decision-bearing finding's test: the toolkit's verified row (with its result file's
+    hash) for a toolkit finding, the spike's analysis.json entry otherwise (Codex r1 of #327); None when absent."""
     ev = None
     if v.get("source") == "toolkit/analysis/contract.py":      # lead-gaps α: analysis/decision_tests.yaml, verified
         try:
@@ -418,11 +416,34 @@ def _bearing_item(run_dir: str, v: dict) -> dict:
             ev = next((t for t in tests if isinstance(t, dict) and str(t.get("id")) == str(v.get("key"))), None)
         except (OSError, ValueError, AttributeError, TypeError):
             ev = None
+    return ev
+
+
+# What an owner's accept of a plan-changing decision test authorizes (owner decision (b), 2026-11-23): the run may
+# ACCEPT with the dependence stated. Bound into the item's fingerprint, so an accept given under the earlier contract
+# (the finding declared, the run not accepted) does not authorize it (Codex r3 of #357, P1-1).
+DT_DISPOSITION = "accept_with_dependence_stated"
+
+
+def _bearing_fp(v: dict, ev) -> str:
+    key = {"finding": FL.gate_id(v), "claim": v.get("claim", ""), "evidence": ev}
+    if v.get("kind") in DECISION_BEARING_KINDS:
+        key["disposition"] = DT_DISPOSITION
+    return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _bearing_item(run_dir: str, v: dict) -> dict:
+    """What the owner is asked about a decision-bearing finding: its claim and the analysis's record of the decision
+    test (_bearing_record), fingerprinted with the disposition an accept authorizes (an answer binds all three: a
+    changed result is asked again)."""
+    ev = _bearing_record(run_dir, v)
     gid = FL.gate_id(v)
-    fp = hashlib.sha256(json.dumps({"finding": gid, "claim": v.get("claim", ""), "evidence": ev}, sort_keys=True,
-                                   default=str).encode()).hexdigest()[:16]
+    fp = _bearing_fp(v, ev)
     return {"finding": gid, "kind": v.get("kind"), "reason": "a measured decision test changes the plan",
-            "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp}
+            "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp,
+            # the producer's record the answer binds, for the report's statement of it (Codex r1 of #357, P1-7/8)
+            "record": "toolkit" if v.get("source") == "toolkit/analysis/contract.py" else "spike",
+            "result_sha256": (ev or {}).get("result_sha256") if isinstance(ev, dict) else None}
 
 
 def _answer_counts(a: dict, mode: str) -> bool:
@@ -462,11 +483,17 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
         try:
             answers = (getattr(rule, "verified_answers", None) or (lambda rd: ({}, [])))(run_dir)[0]
             for v in bearing:
+                if v.get("kind") in DECISION_BEARING_KINDS:
+                    # hb2 fix 1: no fix task can change a measured decision test: the gate asks its owner at the
+                    # first gate (rule 2o), and an accept lets the run ACCEPT with the dependence stated (owner
+                    # decision (b), 2026-11-23); scripts/validate_critique_yaml.py _recompute_action
+                    v["owner_resolution"] = True
                 item = _bearing_item(run_dir, v)
                 a = answers.get(item["fingerprint"]) or {}
                 if str(a.get("finding")) == item["finding"] and _answer_counts(a, mode):
                     if a.get("decision") == "accept":
                         v["owner_signed"] = {"by": a.get("by"), "at": a.get("at"), "fingerprint": item["fingerprint"],
+                                             "record": item["record"], "result_sha256": item["result_sha256"],
                                              **({"provisional": True} if a.get("provisional") else {})}
                         continue
                     v["scope_declarable"], v["owner_declined"] = False, True
@@ -639,6 +666,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
                 continue
             dw = b.get("done_when")
             out.append({"id": str(b.get("id")), "source": reviewer, "severity": b.get("severity"),
+                        "kind": FL.CRITIC_KIND,
                         "tested": dw is not None and not DW.problems(dw), "claim": str(b.get("claim") or ""),
                         "fix_requires": _remedy(b)})
     critic_open = {o["id"] for o in out}
@@ -646,6 +674,8 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     for v in decision.get("rigor_violations") or []:
         if not (isinstance(v, dict) and str(v.get("severity")) in ("HIGH", "MEDIUM")):
             continue
+        if v.get("owner_resolution") and v.get("owner_signed") and not v.get("owner_signoff"):
+            continue          # the owner accepted it: the report states the dependence (owner decision (b), hb2 fix 1)
         fid = FL.gate_id(v)
         # Every gate finding counts (a resolved blocker whose test fails is done_when_unmet; a missing
         # presentation review is critique_presentation_missing); only one that restates an open
@@ -654,7 +684,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
         if (str(v.get("key") or "") in critic_open and v.get("kind") != "done_when_regressed") or fid in seen:
             continue
         seen.add(fid)
-        out.append({"id": fid, "source": "harness", "severity": v.get("severity"),
+        out.append({"id": fid, "source": "harness", "severity": v.get("severity"), "kind": str(v.get("kind") or ""),
                     "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing"),
                     "claim": str(v.get("claim") or ""), "fix_requires": _remedy(v)})
     return out
@@ -696,32 +726,37 @@ def owner_held(ledger: dict) -> set[str]:
 
 
 def owner_accepted_now(run_dir: str, opened: list[dict], lead_ok: bool) -> set[str]:
-    """The open findings whose current claim and remedy, as this gate reads them, carry the owner's (or, in a lead run,
-    the lead's provisional) accept: the answer binds to that fingerprint, so a finding revised since it was answered is
-    not among them (Codex r2 of #344, P1-2: the ledger may keep an older remedy)."""
+    """The open findings whose current kind and remedy class, as this gate reads them, carry the owner's (or, in a lead
+    run, the lead's provisional) accept: the answer binds to that fingerprint (FL.answer_fingerprint; hb2 fix 3: not
+    the critic's wording), so a finding revised into another kind or remedy class since is not among them (Codex r2 of
+    #344, P1-2: the ledger may keep an older remedy)."""
     answers = FL.owner_answers(run_dir, lead_ok)
     out = set()
     for o in opened:
         fid = str(o.get("id"))
-        a = answers.get(FL.answer_fingerprint(fid, str(o.get("claim") or ""), o.get("fix_requires")))
-        if a and str(a.get("finding")) == fid and a.get("decision") == "accept":
+        a = FL.answer_for(answers, fid, kind=o.get("kind") or FL.CRITIC_KIND, fix_requires=o.get("fix_requires"),
+                          claim=str(o.get("claim") or ""))
+        if a and a.get("decision") == "accept":
             out.add(fid)
     return out
 
 
 def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int, budget_ok: bool,
-                      owner_held=()) -> dict:
+                      owner_held=(), harness_gaps=()) -> dict:
     """v2: the gate never accepts an open HIGH or MEDIUM finding. Today's rules ACCEPT when no HIGH
     is open (rule 4); in v2 an open finding with a test goes to the fix loop while rounds and
     budget remain (rule 4m) and is declared, with the write-up saying so, when they do not (3m).
     A finding the owner holds (`owner_held`) never goes to the fix loop, which has no task for it: it is
-    declared (harness baseline hb1, malaria R2: two critique rounds ran for an accepted finding).
+    declared (harness baseline hb1, malaria R2: two critique rounds ran for an accepted finding). Nor does a declared
+    harness gap (`harness_gaps`, FL.harness_gaps: no file a fix task may edit can fix it; hb2 fix 4, dengue R2 R-001:
+    two critique rounds ran for one): it is declared with what it needs.
     The decision's action and rationale say what the machine then does."""
     if decision.get("action") != "ACCEPT" or not opened:
         return decision
     d = dict(decision)
     held = set(map(str, owner_held or ()))
-    tested = [f["id"] for f in opened if f["tested"] and str(f["id"]) not in held]
+    gaps = set(map(str, harness_gaps or ()))
+    tested = [f["id"] for f in opened if f["tested"] and str(f["id"]) not in held | gaps]
     if tested and rounds_remaining > 0 and budget_ok:
         d.update(action="PATCH_OR_RETHINK", rule_matched="4m", open_tested=tested,
                  rationale=(f"No HIGH finding is open, but {len(tested)} finding(s) with a test are "
@@ -731,12 +766,53 @@ def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int,
         why = "no rounds remain" if rounds_remaining <= 0 else ("the budget is used" if not budget_ok
                                                                  else "none has a test the fix loop can work to")
         mine = sorted(str(f["id"]) for f in opened if str(f["id"]) in held)
-        if mine and rounds_remaining > 0 and budget_ok:
-            why = f"the owner's answer, not a fix task, decides {', '.join(mine)[:200]}"
+        gap = sorted(str(f["id"]) for f in opened if str(f["id"]) in gaps and str(f["id"]) not in held)
+        if (mine or gap) and rounds_remaining > 0 and budget_ok:
+            why = "; ".join(x for x in (
+                f"the owner's answer, not a fix task, decides {', '.join(mine)[:200]}" if mine else "",
+                f"only a harness change can fix {', '.join(gap)[:200]} (declared harness gaps)" if gap else "") if x)
         d.update(action="DECLARE_SCOPE", rule_matched="3m", declared_open=[f["id"] for f in opened],
                  rationale=(f"{len(opened)} HIGH/MEDIUM finding(s) are still open and {why}: they are declared "
                             "in the write-up (declared_findings.yaml), not accepted."))
     return d
+
+
+def apply_held_rule(decision: dict, ledger: dict, owner_held=(), harness_gaps=(), opened=None) -> dict:
+    """hb2 fix 1: a gate that patches (rule 2) only for critic findings the owner holds (accepted) or the fix planner
+    declared harness gaps has nothing a fix task can do: they are declared now (rule 3h), as rule 3m declares them when
+    no HIGH is open, instead of a fix loop with no task and another critique round (malaria R2, dengue R2). Never with a
+    gate finding, a required artifact missing or a structural mismatch open, nor while any open finding with a test
+    (`opened`, a MEDIUM too) is neither the owner's nor a gap: the fix loop works to it (Codex r1 of #357, P1-3)."""
+    if decision.get("action") != "PATCH_OR_RETHINK" or str(decision.get("rule_matched")) != "2" \
+            or decision.get("accept_blockers") or decision.get("structural_mismatch"):
+        return decision
+    keep = set(map(str, owner_held or ())) | set(map(str, harness_gaps or ()))
+    hi = [b for b in decision.get("unresolved_high") or [] if isinstance(b, dict)]
+    if not hi or len(hi) != len(decision.get("unresolved_high") or []) or not all(
+            str(b.get("reviewer") or "").startswith("critique") and str(b.get("id")) in keep and str(b.get("id")) in ledger
+            for b in hi):
+        return decision
+    if opened is None:
+        return decision
+    work = [str(o.get("id")) for o in opened if o.get("tested") and str(o.get("id")) not in keep]
+    if work:      # these keep the round: they are what the fix loop works to (Codex r3 of #357, P2-12)
+        return dict(decision, open_tested=work)
+    ids = sorted(str(b.get("id")) for b in hi)
+    return dict(decision, action="DECLARE_SCOPE", rule_matched="3h", declared_open=[o["id"] for o in opened],
+                rationale=(f"{len(ids)} HIGH finding(s) are open ({', '.join(ids)[:200]}), each one the owner answered "
+                           "or a declared harness gap: no fix task can work on them, so they are declared in the "
+                           "write-up (declared_findings.yaml) now, not accepted."))
+
+
+def scope_request_view(d: dict) -> dict:
+    """What the AWAIT_OWNER route asks: under rule 2o (rounds left) only the findings whose resolution is the owner's;
+    a policy-mapped owner item is asked at the round cap, as before (Codex r1 of #357, P1-4: the request held both,
+    and an answer to the decision test alone could not release the run)."""
+    if not isinstance(d, dict) or str(d.get("rule_matched")) != "2o":
+        return d
+    keep = lambda b: not (isinstance(b, dict) and b.get("owner_signoff")) or b.get("owner_resolution")  # noqa: E731
+    return dict(d, unresolved_high=[b for b in d.get("unresolved_high") or [] if keep(b)],
+                accept_blockers=[b for b in d.get("accept_blockers") or [] if keep(b)])
 
 
 DECLARED_FILE = "declared_findings.yaml"
@@ -763,11 +839,19 @@ def _quoted(text, claims: dict | None):
 def write_declared(run_dir: str, opened: list[dict], decision: dict) -> None:
     import yaml
     known = _ledger_claims(run_dir)
+    try:            # a declared harness gap keeps the planner's reason and what it needs (Codex r3 of #357, P2-13)
+        led = FL.load(run_dir)
+        gaps = FL.harness_gaps(led)
+        gap_note = {i: next((e.get("note") for e in reversed(led[i].events or []) if isinstance(e, dict)
+                             and e.get("status") == FL.HARNESS_GAP), None) for i in gaps}
+    except Exception:  # noqa: BLE001 -- the declaration is written without it
+        gap_note = {}
     _put(run_dir, DECLARED_FILE, yaml.safe_dump({
         "rule": decision.get("rule_matched"), "rationale": decision.get("rationale"),
         "declared": [{"id": o["id"], "severity": o["severity"], "source": o["source"],
                       "label": _quoted(short_label(o["claim"]), known), "claim": _quoted(o["claim"], known),
-                      "required_remedy": _quoted(o.get("fix_requires"), known), "tested": bool(o.get("tested"))}
+                      "required_remedy": _quoted(o.get("fix_requires"), known), "tested": bool(o.get("tested")),
+                      **({"harness_gap": _quoted(gap_note[o["id"]], known)} if gap_note.get(o["id"]) else {})}
                      for o in opened]}, sort_keys=False, width=10**6))
 
 
@@ -1348,7 +1432,8 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
     for fid in ids:
         f = ledger.get(fid)
         claim, fix = (f.claim, f.fix_requires) if f is not None else ("", None)
-        fp = FL.answer_fingerprint(fid, claim, fix)       # the ledger binds the owner's answer to it
+        fp = FL.answer_fingerprint(fid, kind=getattr(f, "kind", None) or FL.CRITIC_KIND, fix_requires=fix,
+                                   claim=claim)       # the ledger binds the owner's answer to it (hb2 fix 3)
         conflict = getattr(f, "kind", None) == "evidence_conflict_declared"
         opts = {}
         if conflict:            # owner decision 2026-11-21: a refit is listed, with its estimated cost, never run
@@ -2426,9 +2511,13 @@ class Machine:
                 # and before the medium rule, which declares what the owner holds (hb1 cause H)
                 led0 = FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")[0]
                 held_now = sorted(owner_accepted_now(self.run_dir, opened, self.st.signoff == "lead"))
+                gaps_now = sorted(FL.harness_gaps(led0))            # hb2 fix 4: not fix-loop work
                 d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget(),
-                                      owner_held=held_now)
+                                      owner_held=held_now, harness_gaps=gaps_now)
+                d = apply_held_rule(d, led0, held_now, gaps_now, opened)
                 d["owner_held"] = held_now      # what this gate read as the owner's (FIX_LOOP's shortcut reads it here)
+                d["harness_gaps"] = gaps_now
+                d["open_tested_ids"] = sorted(str(o["id"]) for o in opened if o.get("tested"))   # the shortcut reads it
                 d = require_judged(d, opened)
                 # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
                 d = apply_owner_declines(d, led0)
@@ -2448,6 +2537,12 @@ class Machine:
                 # finding awaits the owner's answer the status is pending (Codex r2 of #344, P1-1).
                 fst = None if waiting else route_gate(d, pw)[1]
                 render_report(self.run_dir, self.backend, status=fst or "pending")
+                if fst in ACCEPTED_STATUSES and _render_stale(self.run_dir):
+                    # an accepted test's record changed between this gate's read and the report's (Codex r3 of #357,
+                    # P1-7): the report cannot state what was accepted, so the accept is not delivered
+                    _withhold_report(self.run_dir)
+                    return self._go("FINAL", "an accepted decision test's record changed after the gate read it: "
+                                             "the report could not state the accepted dependence", "completed_gate_error")
                 if fst is not None and fst not in ACCEPTED_STATUSES:
                     d["report_acceptance_language"] = self._language_check(fst)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
@@ -2461,7 +2556,8 @@ class Machine:
         self.st.last_gate.update(round=self.st.round, post_write=pw)
         if (d or {}).get("action"):
             FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")
-            if d.get("rule_matched") == "4m":           # these are why the loop runs: plan them
+            if d.get("rule_matched") == "4m" or (str(d.get("rule_matched")) == "2" and d.get("open_tested")):
+                # these are why the loop runs: plan them (rule 2 too, when apply_held_rule kept it for them)
                 led = FL.load(self.run_dir)
                 for fid in d.get("open_tested") or []:
                     if fid in led:
@@ -2545,7 +2641,8 @@ class Machine:
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
             return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})", planned=True)
-        if not summ["tasks"] and summ.get("write_up") and not summ.get("harness_gaps_blocking") and self._has_draft():
+        if not summ["tasks"] and summ.get("write_up") and not self._fixable_open() and self._has_draft():
+            # (a blocking harness gap no longer keeps it here: it is declared, not fixed; hb2 fix 4)
             # Every open finding is the write-up's: the writer revises the draft (with them) as the next round, and
             # the domain and red-team critics then re-review the revised draft at that round (hb1 cause G: they were
             # left on the round before, and the gate re-ran them through the schema repair).
@@ -2554,7 +2651,9 @@ class Machine:
                 self.st.round_pending = False
             self.st.write_mode = self.st.write_mode or "not_accepted"
             self.st.tries["rereview"] = self.st.round
-            return self._go("WRITE", f"every open finding is the write-up's ({', '.join(summ['write_up'])[:120]})")
+            gaps = summ.get("harness_gaps_blocking") or []
+            return self._go("WRITE", f"every open finding is the write-up's ({', '.join(summ['write_up'])[:120]})"
+                            + (f" or a declared harness gap ({', '.join(gaps)[:120]})" if gaps else ""))
         held_now = None if summ["tasks"] or self._drafted() or self._fixable_open() else self._shortcut_held()
         if held_now is not None:
             # hb1 cause H: pre-write, a loop with no task changed nothing, so another critique round can find nothing
@@ -2577,15 +2676,17 @@ class Machine:
         return self._has_draft() or os.path.exists(os.path.join(self.run_dir, "report.md"))
 
     def _shortcut_held(self) -> list[str] | None:
-        """Codex r1 of #344 (P1-3, P2-4): the shortcut to WRITE only follows a medium-rule gate (4m) with no unresolved
-        HIGH, whose tested findings are all the write-up's or the owner's answered ones; a gate that patches for any
-        other reason (a HIGH, a declared finding it still holds) keeps its critique round. None: no shortcut; else the
-        tested findings of that gate the owner holds."""
+        """Codex r1 of #344 (P1-3, P2-4): the shortcut to WRITE follows a gate that patched (rule 4m, or rule 2 for
+        HIGHs) only for findings that are the write-up's, the owner's answered ones or declared harness gaps (hb2 fixes
+        1 and 4: rule 2 too, and the gaps); a gate that patches for any other reason (a gate HIGH, a missing artifact, a
+        finding a task could fix) keeps its critique round. None: no shortcut; else the findings of that gate that are
+        declared, not written up (the owner's and the gaps)."""
         try:        # this round's pre-write gate (the one that routed here; the round is raised at the next CRITIQUE)
             d = json.load(open(os.path.join(self.run_dir, f"gate_r{self.st.round}.json")))
         except (OSError, ValueError):
             return None
-        if not isinstance(d, dict) or d.get("rule_matched") != "4m" or d.get("unresolved_high"):
+        if not isinstance(d, dict) or d.get("action") != "PATCH_OR_RETHINK" or str(d.get("rule_matched")) not in ("4m", "2") \
+                or d.get("accept_blockers") or d.get("structural_mismatch"):
             return None
         # the owner-held findings as this gate read them (their current fingerprint carries the accept), not the
         # ledger's status, which may keep an older remedy (Codex r3 of #344, P1-1); the medium rule kept them out of
@@ -2594,16 +2695,34 @@ class Machine:
         if not isinstance(held, list):
             return None
         led = FL.load(self.run_dir)
-        ids = [str(i) for i in d.get("open_tested") or []]
-        if not all(i in led and FX.is_write_up(led[i]) for i in ids):
+        gaps = FL.harness_gaps(led)           # as the fix loop just declared them (hb2 fix 4)
+        keep = set(map(str, held)) | gaps
+        hi = d.get("unresolved_high") or []
+        if str(d.get("rule_matched")) == "2" and not hi:
             return None
-        return sorted(map(str, held))
+        for b in hi:            # rule 2: every HIGH is a critic's, and the write-up's, the owner's or a gap
+            if not (isinstance(b, dict) and str(b.get("reviewer") or "").startswith("critique")):
+                return None
+            i = str(b.get("id"))
+            if not (i in led and (FX.is_write_up(led[i]) or i in keep)):
+                return None
+        ids = [str(i) for i in d.get("open_tested") or []]
+        if not all(i in led and (FX.is_write_up(led[i]) or i in gaps) for i in ids):
+            return None
+        # rule 2 leaves a MEDIUM non-blocking: one with a test a task can work to keeps the round (Codex r2 of #357)
+        tested = d.get("open_tested_ids")      # the gate's open findings with a test, harness checks included (r3 P2-11)
+        if not isinstance(tested, list) or any(str(i) not in keep and not (str(i) in led and FX.is_write_up(led[str(i)]))
+                                               for i in tested):
+            return None
+        named = set(ids) | {str(b.get("id")) for b in hi}
+        return sorted(set(map(str, held)) | (gaps & named))
 
     def _fixable_open(self) -> list[str]:
         """Open findings a fix task could still work to: the gate holds them (blocking), and they are neither the
-        write-up's nor the owner's."""
+        write-up's, the owner's (answered), nor a
+        declared harness gap (hb2 fixes 1 and 4)."""
         led = FL.load(self.run_dir)
-        held = owner_held(led)
+        held = owner_held(led) | FL.harness_gaps(led)
         return [f.id for f in FL.open_findings(led) if f.blocking and not FX.is_write_up(f) and f.id not in held]
 
     def _request_owner(self, led: dict, ids: list[str]) -> None:
@@ -2618,7 +2737,8 @@ class Machine:
         scope_signoff.record and its fingerprints kept in run_state.json, as _request_owner does. No item: none is
         kept, and OWNER_DECISION fails closed."""
         import scope_signoff as SS
-        SS.record(self.run_dir, d, self.st.round, producer="agents/stage_machine.py GATE (decision-bearing findings)")
+        SS.record(self.run_dir, scope_request_view(d), self.st.round,
+                  producer="agents/stage_machine.py GATE (decision-bearing findings)")
         try:
             req = json.load(open(os.path.join(self.run_dir, OWNER_REQUEST)))
         except (OSError, ValueError):
@@ -3217,6 +3337,121 @@ def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:
     return top, sec
 
 
+def dependence_lines(run_dir: str, stale_out: list | None = None) -> list[str]:
+    """Owner decision (b), 2026-11-23: a decision test that changes the plan, which the owner (or, under --signoff lead,
+    the lead provisionally) accepted, lets the run ACCEPT; the report states the dependence at its top: which input the
+    test varies, at each plan-changing value how many units change package and which, the re-solved plan, and who
+    accepted it. From the ledger's owner_accepted rows and the record each answer bound: the record is read once, its
+    fingerprint recomputed from that read and compared with the accepted one, and a toolkit result file is hashed on
+    the bytes it is parsed from, against the hash the accept bound; a record changed since, or one without a bound
+    hash, is never shown as accepted, and its id goes to `stale_out` (Codex r1-r3 of #357)."""
+    try:
+        led = FL.load(run_dir)
+    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the list could not be read
+        return [f"**Accepted dependence of the plan: the list could not be read ({type(e).__name__}).**\n\n"]
+    rows = sorted((f for f in led.values() if f.kind in DECISION_BEARING_KINDS and f.status == "owner_accepted"),
+                  key=lambda f: f.id)
+    if not rows:
+        return []
+    from toolkit.analysis import contract as _CT
+    import yaml
+    try:
+        ref = (_CT._verified_doc(run_dir)[3] or {}).get("reference_plan")
+    except Exception:  # noqa: BLE001 -- not the point-value plan: said of the delivered plan
+        ref = None
+    evs = {f.id: next((e for e in reversed(f.events or []) if isinstance(e, dict)
+                       and e.get("status") == "owner_accepted"), {}) for f in rows}
+    by_lead = all(e.get("by") == "lead" for e in evs.values())
+    # who decided: the lead alone in a lead run before any owner review (Codex r3 of #357, P1-9)
+    whose = ("The lead accepted the plan with that dependence, provisionally, under `--signoff lead`; the owner confirms "
+             "or overturns each" if by_lead else "Each was accepted as its line says")
+    out = ["## The plan depends on inputs the owner accepted\n\n" if not by_lead else
+           "## The plan depends on inputs the lead accepted provisionally\n\n",
+           "Each decision test below re-solves the plan over the range it tests and changes it there; each line says "
+           f"which plan its units and feasibility are counted against. {whose} (harness-rendered).\n\n"]
+    for f in rows:
+        ev = evs[f.id]
+        who = ("the lead, provisionally (`--signoff lead`; the owner confirms or overturns it)" if ev.get("by") == "lead"
+               else "the owner")
+        line = f"- **{f.key or f.id}**: accepted by {who}" + (f" at {ev['at']}" if ev.get("at") else "")
+        kind_rec = ev.get("record")
+        if kind_rec is None:                  # an accept recorded without it: the record that exists
+            try:
+                kind_rec = "toolkit" if _CT.decision_test_record(run_dir, f.key) else "spike"
+            except Exception:  # noqa: BLE001
+                kind_rec = "spike"
+        v_now = {"kind": f.kind, "key": f.key, "claim": f.claim,
+                 **({"source": "toolkit/analysis/contract.py"} if kind_rec == "toolkit" else {})}
+        stale_line = (line + "; its record has changed since it was accepted, so the gate asks again and the values "
+                             "are not repeated here.\n")
+        # a record the accept bound that holds no verifiable values: listed, none shown (not a changed record)
+        bare_line = line + "; no verified values are recorded for it, so none are shown.\n"
+
+        def stale():
+            out.append(stale_line)
+            if stale_out is not None:
+                stale_out.append(f.id)
+        try:
+            rec = _bearing_record(run_dir, v_now)           # one read: fingerprinted and shown (P1-6)
+            same = bool(ev.get("fingerprint")) and _bearing_fp(v_now, rec) == ev["fingerprint"]
+        except Exception:  # noqa: BLE001 -- cannot be compared: not shown as accepted
+            rec, same = None, False
+        if not same:                  # P1-5 (r2): the record the answer bound is not the one there now
+            stale()
+            continue
+        if not isinstance(rec, dict):         # the accept bound no record (a spike finding without one): nothing shown
+            out.append(bare_line)
+            continue
+        if kind_rec == "spike":       # the record the answer bound (Codex r1 of #357, P1-8)
+            def scal(d_):
+                return [f"{k} {v}" for k, v in d_.items() if k not in ("id", "text", "plan_changes", "results")
+                        and isinstance(v, (int, float, str)) and not isinstance(v, bool)]
+            # the measured effects, at the top and per tested value (the producer's shape: Codex r2, P1-6); this
+            # backend's record does not name the units (r3, P1-5)
+            meas = scal(rec) + ["; ".join(scal(r)) for r in rec.get("results") or [] if isinstance(r, dict) and scal(r)]
+            out.append(line + f"; varies {rec.get('text') or 'the input its record names'}"
+                       + (f"; measured: {', '.join(meas)}" if meas else "")
+                       + "; counted against the delivered plan (this backend's record does not name the units).\n")
+            continue
+        res, changed = None, False
+        try:
+            if rec.get("path") and rec.get("result_sha256") and rec.get("result_sha256") == ev.get("result_sha256"):
+                raw = open(os.path.join(run_dir, str(rec["path"])), "rb").read()
+                # the bytes shown are the bytes the accept bound (P1-4): hashed as read, against the bound hash
+                if hashlib.sha256(raw).hexdigest() == ev["result_sha256"]:
+                    res = yaml.safe_load(raw.decode("utf-8")) or {}
+                else:
+                    changed = True
+        except Exception:  # noqa: BLE001 -- not verified: not shown
+            res = None
+        if changed:                          # other bytes than the accepted ones: a changed record
+            stale()
+            continue
+        if not isinstance(res, dict):        # no bound hash (r3, P1-8): never shown as accepted
+            out.append(bare_line)
+            continue
+        what = str(res.get("varied") or res.get("question") or "the input this test varies")
+        against = ("the point-value plan (the delivered plan is the expected-value plan over the uncertainty draws, "
+                   "which the test does not re-solve)") if ref == "point_plan" else "the delivered plan"   # P1-10
+        vals = []
+        for r in res.get("results") or []:
+            if not isinstance(r, dict) or not r.get("decision_changes"):
+                continue
+            ids = r.get("units_changed_ids")
+            names = f" ({', '.join(map(str, ids))})" if isinstance(ids, list) and ids else ""     # every one (P2-13)
+            cm = r.get("cost_multipliers")
+            # a price case names its cost items and multipliers, not "case" (P2-12)
+            at = ", ".join(f"{k} x{v}" for k, v in cm.items()) if isinstance(cm, dict) and cm else r.get("value")
+            vals.append(f"at {at}: {r.get('units_changed')} unit(s) change package{names}"
+                        + (f"; re-solved plan {r['recommendation']}" if r.get("recommendation") else "")
+                        + ("; the reference plan is not feasible there" if r.get("point_plan_feasible") is False else "")
+                        # an unproven solve: the change may lie within the solver's bound (P1-10)
+                        + ("; not settled within the solver's gap" if r.get("within_solver_gap") else ""))
+        out.append(f"{line}; varies {what}; counted against {against}"
+                   + (". " + "; ".join(vals) + ".\n" if vals else ".\n"))
+    return out + ["\n"]
+
+
 def amendment_lines(run_dir: str) -> list[str]:
     """lead-gaps β: a run made by an amendment its owner has not signed (the lead's, provisional) heads its report with
     the amendment: its id, reason and changes, from toolkit/spec/amend.py's record. Nothing once the owner signs. The
@@ -3312,7 +3547,10 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     if dec2.get("declared"):
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
-                  f"{e.get('required_remedy') or 'not stated by the finding.'}" for e in dec2["declared"]]
+                  f"{e.get('required_remedy') or 'not stated by the finding.'}"
+                  # (planner text, quoted by write_declared as the claim and remedy are)
+                  + (f" Harness gap (no fix task can make this change): {e['harness_gap']}" if e.get("harness_gap")
+                     else "") for e in dec2["declared"]]
     try:            # v2 autonomy 1B-ii: who drafted and signed the evidence dossier, and its declared gaps
         from toolkit.spec import evidence_draft as EDR
         so = {}
@@ -3343,7 +3581,9 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         lines += ["", f"## World model\n\nThe world-model section could not be read: {type(e).__name__}."]
     top, prov = provisional_lines(run_dir)
     lines += prov
-    head = _status_line(run_dir, status) + "".join(amendment_lines(run_dir)) + "".join(top)
+    stale_dt: list = []
+    head = (_status_line(run_dir, status) + "".join(amendment_lines(run_dir)) + "".join(top)
+            + "".join(dependence_lines(run_dir, stale_dt)))
     body = draft.rstrip() + "\n"
     from toolkit.spec import review_conditions as RCN       # W0-G: conditions the lead deferred, at the top
     rcl = RCN.report_lines(run_dir)
@@ -3356,9 +3596,21 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     _put(run_dir, "report.md", full)
     # What the harness added, authenticated by the report's hash: writer_qa checks only the writer's span.
     _write_json(run_dir, "report_render.json", {"report_sha256": hashlib.sha256(full.encode("utf-8")).hexdigest(),
-                                                "writer_span": [len(head), len(head) + len(body)]})
+                                                "writer_span": [len(head), len(head) + len(body)],
+                                                "dependence_stale": sorted(stale_dt)})
     _write_deliverable(run_dir)
     return os.path.join(run_dir, "report.md")
+
+
+def _render_stale(run_dir: str) -> list:
+    """The accepted decision tests the last rendering could not state as accepted (dependence_lines); unreadable: all
+    of them count as stale (fail closed)."""
+    try:
+        doc = json.load(open(os.path.join(run_dir, "report_render.json")))
+        st = doc.get("dependence_stale") if isinstance(doc, dict) else None
+        return list(st) if isinstance(st, list) else ["report_render.json"]
+    except (OSError, ValueError):
+        return ["report_render.json"]
 
 
 def _write_deliverable(run_dir: str) -> None:
@@ -4638,12 +4890,17 @@ def _self_test() -> int:
         ok("FIX_LOOP" in p and not any(c.startswith("fix:") for c in T.calls)
            and any(f.get("id") == "R-030" for f in got),
            f"R3-1 a write-up finding goes to the writer, not to a FIX_LOOP task ({s}, {T.calls}, {got})")
-        # HG1 (Codex review of #341, r1 P1-5 and r3 P2-10): a blocking harness gap is an open finding the writer cannot
-        # fix, so a loop with no task, write-up findings and a draft goes to CRITIQUE, not the "every finding is the
-        # write-up's" WRITE; a non-blocking gap does not hold the writer back. HG1c (r3 P2-8): the fix loop is given the
-        # settings of the backend this machine runs.
-        def hg_route(blocking):
-            d, T, st = new_run(f"harness_gap_route_{len(blocking)}", {}, max_rounds=3)
+        # HG1 (Codex review of #341, r1 P1-5 and r3 P2-10; changed by hb2 fix 4): a blocking harness gap is declared,
+        # not fixed (the gate declares it after the revised draft), so it no longer keeps a loop with no task,
+        # write-up findings and a draft off the write-up route, which names it; an open blocking finding a fix task
+        # could work on still does (HG1d). HG1c (r3 P2-8): the fix loop is given the settings of the backend this
+        # machine runs.
+        def hg_route(blocking, fixable=False):
+            d, T, st = new_run(f"harness_gap_route_{len(blocking)}{'_fx' if fixable else ''}", {}, max_rounds=3)
+            if fixable:
+                FL.save(d, {"D-002": FL.Finding(id="D-002", kind="critique_blocker", severity="HIGH",
+                                                source="critique-domain", status="open", owner_state="ANALYZE",
+                                                blocking=True)})
             mh = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
             mh.st.state, mh._has_draft = "FIX_LOOP", (lambda: True)
             seen, _rl = {}, FX.run_loop
@@ -4655,7 +4912,11 @@ def _self_test() -> int:
             finally:
                 FX.run_loop = _rl
         to_hg, set_hg, be_hg = hg_route(["D-001"])
-        ok(to_hg == "CRITIQUE", f"HG1 a blocking harness gap keeps the loop off the write-up-only WRITE route ({to_hg})")
+        why_hg = str(load_state(os.path.join(td, "harness_gap_route_1")).history[-1].get("why"))
+        ok(to_hg == "WRITE" and "harness gap (D-001)" in why_hg,
+           f"HG1 a blocking harness gap goes with the write-up route, named in it ({to_hg}, {why_hg!r})")
+        ok(hg_route(["D-001"], fixable=True)[0] == "CRITIQUE",
+           "HG1d an open blocking finding a task could fix keeps the loop off the write-up route")
         ok(hg_route([])[0] == "WRITE", "HG1b a non-blocking harness gap leaves the write-up-only WRITE route open")
         ok(set_hg is not None and tuple(set_hg) == tuple(getattr(be_hg, "settings_paths", AB.SETTINGS_PATHS)),
            f"HG1c the fix loop is given the running backend's settings ({set_hg})")
@@ -4830,8 +5091,9 @@ def _self_test() -> int:
         ok(s == "paused:awaiting_scope_signoff" and "SPEC" not in p and p[-1] == "OWNER_DECISION",
            f"R3-5 a structural blocker that needs an owner amendment goes to the owner, not to SPEC ({s}, {p[-3:]})")
 
-        # T_OWNER_DECISION_E2E (1F): a decision test that changes the plan, at the last round, goes to OWNER_DECISION
-        # with a request the machine recorded; the owner's accept resumes the run, which ends scope-declared
+        # T_OWNER_DECISION_E2E (1F): a decision test that changes the plan goes to OWNER_DECISION with a request the
+        # machine recorded; the owner's accept resumes the run, which ends accepted with the dependence at the top of
+        # the report (owner decision (b), 2026-11-23; it ended scope-declared before)
         import scope_signoff as _SS
         dtf_e = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT9",
                  "claim": "Decision test DT9 changes the plan: a lower effect", "scope_declarable": True,
@@ -4857,8 +5119,13 @@ def _self_test() -> int:
         _SS.sign(d, "owner", all_decision="accept", note="the plan stands with this caveat")
         s_o2 = mk(d, StubTasks(T.s), None).run()
         rep_o = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
-        ok(s_o2 == "completed_scope_declared" and "DT9" in rep_o and "Provisional decisions" not in rep_o,
-           f"T_OWNER_DECISION_E2E2 the owner's accept resumes the run, which ends scope-declared ({s_o2})")
+        span_o = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep_o else [0, 0]
+        top_o = rep_o[:span_o[0]]
+        ok(s_o2 == "completed" and "The plan depends on inputs the owner accepted" in top_o and "**DT9**" in top_o
+           and "accepted by the owner" in top_o and "Provisional decisions" not in rep_o
+           and FL.load(d)["decision_test_changes_plan:DT9"].status == "owner_accepted",
+           f"T_OWNER_DECISION_E2E2 the owner's accept resumes the run, which ends accepted with the dependence stated "
+           f"above the draft ({s_o2}, {top_o[-400:]!r})")
         # T_OWNER_LEAD_PROVISIONAL (1F, D2): under --signoff lead the same finding never waits: the lead answers it
         # provisionally, the answer is recorded and listed, and, as the plan changes, flagged above the report's draft
         d, T, st = new_run("dt_lead", {}, signoff="lead", max_rounds=1)
@@ -4878,13 +5145,43 @@ def _self_test() -> int:
         prov = _SS.provisional(d)
         rep_l = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
         span = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep_l else [0, 0]
-        ok(s_l == "completed_scope_declared" and not any(h.get("paused") for h in load_state(d).history)
+        ok(s_l == "completed" and not any(h.get("paused") for h in load_state(d).history)
+           and "accepted by the lead, provisionally" in rep_l[:span[0]]
            and [(r["finding"], r["decision"], r["plan_changing"], r["review"]) for r in prov]
            == [("decision_test_changes_plan:DT9", "accept", True, None)]
            and "Provisional decisions that change the plan" in rep_l[:span[0]]
            and "## Provisional decisions" in rep_l[span[1]:],
            f"T_OWNER_LEAD_PROVISIONAL a lead run answers the owner decision provisionally and never blocks; the "
            f"plan-changing answer heads the report ({s_l}, {prov})")
+        # T_HB2_FIRST_GATE (hb2 fix 1; malaria R1/R2, measles R1/R2, tb R1/R2 used all 3 rounds): with rounds left the
+        # plan-changing test is asked at the first gate, once; accepted, the run writes in round 1, with no fix loop and
+        # no second critique round, and ends accepted
+        d1, T1, st1 = new_run("dt_lead_r3", {}, signoff="lead", max_rounds=3)
+        s_r3 = mk(d1, T1, st1).run()
+        h_r3 = [h for h in load_state(d1).history if "to" in h]
+        to_r3 = [h["to"] for h in h_r3]
+        g_r1 = json.load(open(os.path.join(d1, "gate_r1.json")))
+        crit_r3 = sorted({c.rsplit(":", 1)[-1] for c in T1.calls if c.startswith("critique:critique-domain")})
+        ok(s_r3 == "completed" and to_r3.count("OWNER_DECISION") == 1 and "FIX_LOOP" not in to_r3
+           and crit_r3 == ["1"] and load_state(d1).round == 1
+           and any(h["from"] == "GATE" and h["to"] == "OWNER_DECISION" and "rule 2o" in str(h.get("why")) for h in h_r3)
+           and g_r1.get("action") == "ACCEPT",
+           f"T_HB2_FIRST_GATE an owner-resolved HIGH is asked at the first gate, once, and the run ends in round 1 "
+           f"({s_r3}, {to_r3[-8:]}, critique rounds {crit_r3}, gate r1 {g_r1.get('action')})")
+        d2, T2, st2 = new_run("dt_owner_r3", {}, signoff="owner", max_rounds=3)
+        mk(d2, T2, st2).run()
+        _t_owner_disposes(d2)
+        sign(d2, "owner", "ok")
+        s_p = mk(d2, StubTasks(T2.s), None).run()
+        st_p = load_state(d2)
+        ok(s_p == "paused:awaiting_scope_signoff" and st_p.round == 1
+           and "rule 2o" in str([h for h in st_p.history if "to" in h][-1].get("why")),
+           f"T_HB2_FIRST_GATE_OWNER under --signoff owner the run pauses for the owner at round 1, not at round 3 "
+           f"({s_p}, round {st_p.round})")
+        _SS.sign(d2, "owner", all_decision="decline", note="the plan must not depend on this")
+        s_d = mk(d2, StubTasks(T2.s), None).run()
+        ok(s_d != "completed" and s_d.startswith(("completed_scope_declined", "run_failed")),
+           f"T_HB2_DECLINED a declined plan-changing test never accepts ({s_d})")
         _SS.review(d, "decision_test_changes_plan:DT9", "overturn", note="fix the effect first")
         ok([r["review"]["decision"] for r in _SS.provisional(d)] == ["overturn"],
            "T_OWNER_LEAD_REVIEW the owner later overturns (or confirms) a provisional answer; it is recorded")
@@ -4998,7 +5295,7 @@ def _self_test() -> int:
                          fix_requires="use the new data", status="owner_declined", resolution_type="owner_decision")
         old.events.append({"round": 1, "status": "owner_declined", "by": "owner"})
         FL.save(d, {fid8: old})
-        fp8 = FL.answer_fingerprint(fid8, "the old claim", "use the new data")
+        fp8 = FL.answer_fingerprint(fid8, kind="k_demo", fix_requires="use the new data", claim="the old claim")
         json.dump({"answers": {fp8: {"finding": fid8, "decision": "decline", "by": "owner"}}},
                   open(os.path.join(d, SCOPE_SIGNOFF), "w"))
         _SS8.harness_record(d)
@@ -5065,7 +5362,9 @@ def _self_test() -> int:
         _ss.sign(dd, "owner", all_decision="decline", note="t")
         _ss.harness_record(dd)
         g_od = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
-        ok(g_ln["action"] == "AWAIT_OWNER" and g_lo["action"] == "AWAIT_OWNER" and g_ll["action"] == "DECLARE_SCOPE"
+        # owner decision (b), 2026-11-23: an accepted plan-changing test lets the gate ACCEPT (it was DECLARE_SCOPE)
+        ok(g_ln["action"] == "AWAIT_OWNER" and g_lo["action"] == "AWAIT_OWNER" and g_ll["action"] == "ACCEPT"
+           and [b.get("kind") for b in g_ll.get("owner_accepted_high") or []] == ["decision_test_changes_plan"]
            and g_od["action"] == "RUN_FAILED"
            and any(isinstance(u, dict) and u.get("kind") == "scope_declaration_declined"
                    for u in g_od.get("unresolved_high") or []),
@@ -5210,16 +5509,19 @@ def _self_test() -> int:
             # lead-gaps α: the toy's automatic decision tests change the plan, so the toolkit backend now emits
             # decision_test_changes_plan for each; this --signoff lead run answers them provisionally (never pausing) and
             # is declared, not accepted, with each flagged above the draft. Everything else T36 checked is unchanged.
+            # Owner decision (b), 2026-11-23 (hb2 fix 1): the lead's provisional accept lets it end accepted, with the
+            # dependence stated above the draft (it ended completed_scope_declared before)
             # the expected ids are read from the artifact itself, not through the reader under test (Codex r1 of #327)
             _dt36 = (yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml"))) or {}).get("data") or {}
             want = sorted(f"decision_test_changes_plan:{t.get('test_id')}" for t in _dt36.get("tests") or []
                           if t.get("verdict") == "CHANGES_PLAN")
             import scope_signoff as _SS36
-            prov36 = sorted(r["finding"] for r in _SS36.provisional(d) if r.get("plan_changing"))
+            # (asked again after the fix moved their evidence: one finding may carry two answers)
+            prov36 = sorted({r["finding"] for r in _SS36.provisional(d) if r.get("plan_changing")})
             rep36 = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
             sp36 = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep36 else [0, 0]
-            exp36 = "completed_scope_declared"
-            ok(want and s == exp36 and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
+            exp36 = "completed"
+            ok(want and s == exp36 and "The plan depends on inputs the lead accepted provisionally" in rep36[:sp36[0]] and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
                and FL.load(d)["D-001"].status == "fixed" and prov36 == want
                and not any(h.get("paused") for h in load_state(d).history)
                and all(w in rep36[:sp36[0]] for w in want),
@@ -6428,7 +6730,38 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
            f"WR4 an owner-accepted finding is declared, not sent to a fix loop with no task ({s}, {to[-8:]}, {crit})")
         ok(to.count("OWNER_DECISION") == 1,
            f"WR5 the same finding (same fingerprint) is asked once ({to.count('OWNER_DECISION')} request(s))")
+        # WR5b (hb2 fix 3, malaria R2 D-002): the critic carries the answered finding into round 2 reworded, beside a
+        # HIGH a fix closed in round 1; the answer holds through the rewording: asked once, declared in round 2
+        hi = {"id": "D-009", "severity": "HIGH", "target_stage": "ANALYZE", "claim": "too few draws",
+              "done_when": [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 32}]}
+
         import yaml
+
+        class _Reword(StubTasks):
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                res = super().critique(run_dir, reviewer, round_n, feedback)
+                p_ = os.path.join(run_dir, "critique_domain.yaml")
+                if reviewer == "critique-domain" and os.path.exists(p_):
+                    doc = yaml.safe_load(open(p_))
+                    for b in doc.get("blockers") or []:
+                        if b.get("id") == "D-001":
+                            b["claim"] = f"net durability is untested; the lead accepted it before (round {round_n})"
+                    yaml.safe_dump(doc, open(p_, "w"), sort_keys=False)
+                return res
+        d5, T5, st5 = new_run("wr_owner_reworded", {"critics": {1: {"critique-domain": [amend, hi]}},
+                                                    "fixes": {"D-009": [("analysis_settings.yaml",
+                                                                         "uncertainty.draws", 32)]}},
+                              signoff="lead", max_rounds=3)
+        tk5 = _Reword(T5.s)
+        s5 = mk(d5, tk5, st5).run()
+        to5 = [x["to"] for x in hist(d5)]
+        crit5 = [c for c in tk5.calls if c.startswith("critique:critique-domain")]
+        rounds5 = load_state(d5).round
+        ok(to5.count("OWNER_DECISION") == 1 and s5 == "completed_scope_declared" and rounds5 == 2
+           and "(round 2)" in FL.load(d5)["D-001"].claim
+           and FL.load(d5)["D-001"].status == "owner_accepted",
+           f"WR5b a reworded re-raise of an answered finding is not asked again ({to5.count('OWNER_DECISION')} "
+           f"request(s), {s5}, round {rounds5}, {to5[-10:]}, {crit5})")
         dec = yaml.safe_load(open(os.path.join(d, DECLARED_FILE))) or {}
         g = json.load(open(os.path.join(d, "final_gate.json")))
         ok([x.get("id") for x in dec.get("declared") or []] == ["D-001"] and g.get("rule_matched") == "3m"
@@ -6507,7 +6840,7 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
         # Codex r1 of #344: a rendered report.md counts as a draft (P1-2), and a gate that holds an unresolved HIGH (a
         # declared finding it still blocks on: P1-3) or patches by another rule (P2-4) keeps its critique round
         gate4m = {"action": "PATCH_OR_RETHINK", "rule_matched": "4m", "open_tested": ["W"], "unresolved_high": [],
-                  "owner_held": ["A"]}
+                  "owner_held": ["A"], "open_tested_ids": ["W"]}
         # Codex r2 of #344: the mode follows what this gate holds, not an older owner-accepted finding (P1-4: wr_zero_wu2,
         # whose gate holds only the write-up's W), and the pre-write plan is kept apart from this round's post-write one
         # (P1-3)
@@ -6556,9 +6889,197 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
                f"WR8 pre-write, a fix loop with no task goes to {want} ({name}: {s2.state}, round {s2.round}, "
                f"pending {s2.round_pending}, mode {s2.write_mode}, {last.get('why')!r})")
 
-    for name, fn in (("WR1-WR3", rereview), ("WR1b", rereview_not_accepted), ("WR4-WR6", owner_held_run),
+    def hb2_rules_unit():
+        # HB2-1..HB2-3 (hb2 fixes 1 and 4): a declared harness gap is not fix-loop work for the medium rule (dengue R2
+        # R-001); a rule-2 gate whose HIGHs are all owner-held or gaps declares them now; anything else keeps rule 2
+        op = [{"id": "R-001", "tested": True, "severity": "MEDIUM", "source": "critique-redteam", "claim": "c"}]
+        acc = {"action": "ACCEPT", "rule_matched": "4"}
+        g1 = apply_medium_rule(acc, op, 2, True, harness_gaps={"R-001"})
+        g2 = apply_medium_rule(acc, op + [dict(op[0], id="R-002")], 2, True, harness_gaps={"R-001"})
+        ok(g1["action"] == "DECLARE_SCOPE" and g1["rule_matched"] == "3m" and "harness" in g1["rationale"]
+           and g2["action"] == "PATCH_OR_RETHINK" and g2["open_tested"] == ["R-002"],
+           f"HB2-1 a declared harness gap is declared, not sent to the fix loop ({g1['action']}, {g2.get('open_tested')})")
+        led = {"D-1": FL.Finding(id="D-1", kind="critique_blocker", severity="HIGH", source="critique-domain"),
+               "R-1": FL.Finding(id="R-1", kind="critique_blocker", severity="HIGH", source="critique-redteam")}
+        r2 = {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "accept_blockers": [],
+              "unresolved_high": [{"reviewer": "critique-domain", "id": "D-1"}, {"reviewer": "critique-redteam",
+                                                                                 "id": "R-1"}]}
+        op2 = [{"id": "D-1", "tested": True}, {"id": "R-1", "tested": True}, {"id": "W-1", "tested": False}]
+        h1 = apply_held_rule(r2, led, ["D-1"], ["R-1"], op2)
+        h2 = apply_held_rule(r2, led, ["D-1"], [], op2)
+        h3 = apply_held_rule(dict(r2, unresolved_high=r2["unresolved_high"] + [{"reviewer": "rigor-artifacts",
+                                                                                "id": "RIG-001", "kind": "k"}]),
+                             led, ["D-1"], ["R-1"], op2)
+        h4 = apply_held_rule(dict(r2, accept_blockers=[{"id": "REQ-001"}]), led, ["D-1"], ["R-1"], op2)
+        # Codex r1 of #357 (P1-3): a MEDIUM with a test a fix task can work to keeps the round
+        h5 = apply_held_rule(r2, led, ["D-1"], ["R-1"], op2 + [{"id": "R-002", "tested": True}])
+        ok(h1["action"] == "DECLARE_SCOPE" and h1["rule_matched"] == "3h" and h1["declared_open"] == ["D-1", "R-1", "W-1"]
+           and h2["action"] == h3["action"] == h4["action"] == h5["action"] == "PATCH_OR_RETHINK"
+           and h5.get("open_tested") == ["R-002"],      # Codex r3 of #357 (P2-12): the fix loop's work, planned
+           f"HB2-2 a rule-2 gate holding only owner-held findings and harness gaps declares them now; a fixable one, a "
+           f"gate finding or a missing artifact keeps rule 2 ({h1['action']}, {h2['action']}, {h3['action']}, "
+           f"{h4['action']})")
+
+    def hb2_gap_prewrite():
+        # HB2-4 (dengue R2 in miniature): pre-write, the fix loop declares the only tested finding a harness gap and
+        # plans no task; the run writes in that round instead of running FIX_LOOP -> CRITIQUE twice
+        import fix_loop as _FX
+        real = _FX.run_loop
+        for name, gate, want in (
+                ("hb2_gap_4m", {"action": "PATCH_OR_RETHINK", "rule_matched": "4m", "open_tested": ["R-001"],
+                                "unresolved_high": [], "owner_held": ["D-002"], "open_tested_ids": ["R-001"]}, "WRITE"),
+                ("hb2_gap_r2", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
+                    {"reviewer": "critique-redteam", "id": "R-001"}, {"reviewer": "critique-domain", "id": "W"}],
+                    "owner_held": [], "open_tested_ids": ["R-001", "W"]}, "WRITE"),
+                ("hb2_gap_r2_gate", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
+                    {"reviewer": "rigor-artifacts", "id": "RIG-001", "kind": "k"}], "owner_held": []}, "CRITIQUE"),
+                # Codex r2 of #357 (P2-9): a non-blocking MEDIUM with a test a task can work to keeps the round
+                ("hb2_gap_r2_medium", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
+                    {"reviewer": "critique-redteam", "id": "R-001"}, {"reviewer": "critique-domain", "id": "W"}],
+                    "owner_held": [], "open_tested_ids": ["M", "R-001", "W"]}, "CRITIQUE"),
+                # Codex r3 of #357 (P2-11): a harness check with its own test (no done_when) keeps the round too
+                ("hb2_gap_r2_check", {"action": "PATCH_OR_RETHINK", "rule_matched": 2, "unresolved_high": [
+                    {"reviewer": "critique-redteam", "id": "R-001"}], "owner_held": [],
+                    "open_tested_ids": ["R-001", "uncertainty_draws_low:draws"]}, "CRITIQUE")):
+            d, T, st = new_run(name, {}, max_rounds=3)
+            json.dump(gate, open(os.path.join(d, "gate_r1.json"), "w"))
+            gap = FL.Finding(id="R-001", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                             status="open", owner_state="ANALYZE", blocking=True, fix_requires="emit the claims")
+            led = {"R-001": gap,
+                   "W": FL.Finding(id="W", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                   status="open", owner_state="WRITE", target_stage="WRITE", blocking=True)}
+            if name == "hb2_gap_r2_medium":
+                led["M"] = FL.Finding(id="M", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                                      status="open", owner_state="ANALYZE", done_when=[
+                                          {"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=",
+                                           "value": 32}])
+            FL.save(d, led)
+            st.state, st.round, st.round_pending, st.post_write = "FIX_LOOP", 1, True, False
+            save_state(d, st)
+
+            def fake(rd, *a, **k):
+                lg = FL.load(rd)
+                FL._event(lg["R-001"], 1, FL.HARNESS_GAP, "fix_planner", "only harness code",
+                          key=FL.harness_gap_key(lg["R-001"]))
+                FL.save(rd, lg)
+                return {"round": 1, "tasks": 0, "rows": 0, "passed": 0, "rethink": None, "write_up": ["W"],
+                        "owner_amendments": [], "harness_gaps": ["R-001"], "harness_gaps_blocking": ["R-001"]}
+            _FX.run_loop = fake
+            try:
+                mk(d, T, st).step()
+            finally:
+                _FX.run_loop = real
+            s2 = load_state(d)
+            ok(s2.state == want and (want == "CRITIQUE" or (s2.round == 1 and s2.write_mode == "declared")),
+               f"HB2-4 a fix loop that declares a harness gap and plans no task goes to {want} ({name}: {s2.state}, "
+               f"round {s2.round}, mode {s2.write_mode})")
+
+    def hb2_declared_gap_and_fp():
+        # HB2-7 (Codex r3 of #357): a declared harness gap keeps the planner's reason in the declaration (P2-13); an
+        # accept given under the earlier contract (no disposition in the fingerprint) does not authorize ACCEPT (P1-1);
+        # a report rendering that could not state an accepted test is read as stale, unreadable too (P1-7)
+        import yaml as _y7
+        dg = os.path.join(td, "hb2_declared_gap")
+        os.makedirs(dg)
+        g7 = FL.Finding(id="R-001", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                        fix_requires="emit the claims")
+        FL._event(g7, 1, FL.HARNESS_GAP, "fix_planner", "only harness code. Needs: toolkit/analysis/estimates.py",
+                  key=FL.harness_gap_key(g7))
+        FL.save(dg, {"R-001": g7})
+        write_declared(dg, [{"id": "R-001", "severity": "MEDIUM", "source": "critique-redteam", "claim": "c",
+                             "fix_requires": "emit the claims", "tested": True}], {"rule_matched": "3m"})
+        dec7 = _y7.safe_load(open(os.path.join(dg, DECLARED_FILE)))["declared"][0]
+        v7 = {"kind": "decision_test_changes_plan", "key": "DT1", "claim": "c"}
+        old7 = hashlib.sha256(json.dumps({"finding": FL.gate_id(v7), "claim": "c", "evidence": None}, sort_keys=True,
+                                         default=str).encode()).hexdigest()[:16]
+        st_missing = _render_stale(dg)
+        json.dump({"dependence_stale": []}, open(os.path.join(dg, "report_render.json"), "w"))
+        ok("estimates.py" in str(dec7.get("harness_gap")) and _bearing_fp(v7, None) != old7
+           and _bearing_item(dg, v7)["fingerprint"] == _bearing_fp(v7, None)
+           and st_missing and _render_stale(dg) == [],
+           f"HB2-7 a declared gap keeps its reason; the accept binds the disposition; a stale rendering is read "
+           f"({dec7}, {st_missing})")
+
+    def hb2_request_and_report():
+        # HB2-5 (Codex r1 of #357, P1-4): rule 2o asks only the findings whose resolution is the owner's; a
+        # policy-mapped owner item waits for the round cap
+        dt_ = {"reviewer": "rigor-artifacts", "id": "RIG-001", "kind": "decision_test_changes_plan",
+               "owner_signoff": True, "owner_resolution": True}
+        al_ = {"reviewer": "rigor-artifacts", "id": "RIG-002", "kind": "allocation_unstable", "owner_signoff": True}
+        v2o = scope_request_view({"rule_matched": "2o", "unresolved_high": [dt_, al_], "accept_blockers": [
+            dict(al_, id="REQ-001")]})
+        v3o = scope_request_view({"rule_matched": "3o", "unresolved_high": [dt_, al_]})
+        ok([b["id"] for b in v2o["unresolved_high"]] == ["RIG-001"] and v2o["accept_blockers"] == []
+           and len(v3o["unresolved_high"]) == 2,
+           f"HB2-5 rule 2o requests only the owner-resolution findings ({v2o['unresolved_high']})")
+        # HB2-6 (Codex r1-r3 of #357): the report's statement of an accepted dependence. Each accept binds the record
+        # it was given for (its fingerprint, with the disposition); a record changed since, a toolkit result whose
+        # bytes are not the bound ones or that has no bound hash is never shown as accepted
+        from toolkit.analysis import contract as _CTd
+        import yaml as _yd
+        dd = os.path.join(td, "hb2_dependence")
+        os.makedirs(os.path.join(dd, "models", "decision_tests"))
+        ids13 = [f"u{i}" for i in range(1, 14)]
+        _yd.safe_dump({"varied": "the unit costs of the listed cost items multiplied together", "results": [
+            {"value": "case", "cost_multipliers": {"transport": 2}, "decision_changes": True, "units_changed": 13,
+             "units_changed_ids": ids13, "recommendation": "A: 13 units", "point_plan_feasible": False,
+             "within_solver_gap": True}]}, open(os.path.join(dd, "models", "decision_tests", "DTc.yaml"), "w"))
+        for k_ in ("DTx", "DTn"):
+            _yd.safe_dump({"varied": "the envelope", "results": [{"value": 9, "decision_changes": True,
+                                                                   "units_changed": 1}]},
+                          open(os.path.join(dd, "models", "decision_tests", f"{k_}.yaml"), "w"))
+        os.makedirs(os.path.join(dd, os.path.dirname(AB.ANALYSIS_JSON) or "."), exist_ok=True)
+        # the spike producer's shape: the measured effects per tested value (Codex r2 of #357, P1-6)
+        json.dump({"decision_tests": [{"id": "DTs", "text": "a lower effect", "type": "effect", "plan_changes": True,
+                                       "results": [{"trial_value": 0.4, "units_changed": 2}]},
+                                      {"id": "DTr", "text": "now reads differently", "plan_changes": True}]},
+                  open(os.path.join(dd, AB.ANALYSIS_JSON), "w"))
+        sha_c = hashlib.sha256(open(os.path.join(dd, "models", "decision_tests", "DTc.yaml"), "rb").read()).hexdigest()
+        recs = {"DTc": {"path": "models/decision_tests/DTc.yaml", "result_sha256": sha_c},
+                "DTx": {"path": "models/decision_tests/DTx.yaml", "result_sha256": "0" * 64},
+                "DTn": {"path": "models/decision_tests/DTn.yaml", "result_sha256": None}}
+        real_rec, real_doc = _CTd.decision_test_record, _CTd._verified_doc
+        _CTd.decision_test_record = lambda rd, k: recs.get(k)
+        _CTd._verified_doc = lambda rd: ([], {}, None, {"reference_plan": "point_plan"})
+
+        def row(key, by="owner", fp=None, toolkit=True):
+            v_ = {"kind": "decision_test_changes_plan", "key": key, "claim": "c",
+                  **({"source": "toolkit/analysis/contract.py"} if toolkit else {})}
+            f_ = FL.Finding(id=f"decision_test_changes_plan:{key}", kind="decision_test_changes_plan", key=key,
+                            severity="HIGH", source="rigor-artifacts", status="owner_accepted", claim="c")
+            f_.events.append({"round": 1, "status": "owner_accepted", "by": by,
+                              "record": "toolkit" if toolkit else "spike",
+                              "fingerprint": fp or _bearing_fp(v_, _bearing_record(dd, v_)),
+                              "result_sha256": (recs.get(key) or {}).get("result_sha256")})
+            return f_
+        try:
+            FL.save(dd, {"c": row("DTc"), "x": row("DTx"), "n": row("DTn"), "s": row("DTs", toolkit=False),
+                         "r": row("DTr", toolkit=False, fp="not-the-current-one")})
+            st6: list = []
+            txt = "".join(dependence_lines(dd, st6))
+            FL.save(dd, {"c": row("DTc", by="lead")})
+            txt_l = "".join(dependence_lines(dd))
+        finally:
+            _CTd.decision_test_record, _CTd._verified_doc = real_rec, real_doc
+        ln = {k: next((x for x in txt.splitlines() if f"**{k}**" in x), "") for k in ("DTc", "DTx", "DTn", "DTs", "DTr")}
+        ok("counted against the point-value plan" in ln["DTc"] and "transport x2" in ln["DTc"]
+           and "(" + ", ".join(ids13) + ")" in ln["DTc"] and "not settled within the solver's gap" in ln["DTc"]
+           and "counted against the delivered plan" in ln["DTs"] and "trial_value 0.4" in ln["DTs"]
+           and "units_changed 2" in ln["DTs"]
+           and all("has changed since it was accepted" in ln[k] for k in ("DTx", "DTr"))
+           and "no verified values are recorded" in ln["DTn"] and "at 9" not in ln["DTn"]
+           and "now reads differently" not in ln["DTr"] and sorted(st6) == sorted(
+               f"decision_test_changes_plan:{k}" for k in ("DTr", "DTx"))
+           and "The lead accepted the plan with that dependence, provisionally" in txt_l
+           and "inputs the lead accepted provisionally" in txt_l and "inputs the owner accepted" not in txt_l,
+           f"HB2-6 the accepted dependence names its reference plan, the price case, every unit, an unsettled solve, "
+           f"the spike record's measured effects, who accepted it, and never shows a changed or unbound record as "
+           f"accepted ({txt!r}, {txt_l!r}, {st6})")
+
+    for name, fn in (("HB2-5-6", hb2_request_and_report), ("HB2-7", hb2_declared_gap_and_fp), ("WR1-WR3", rereview), ("WR1b", rereview_not_accepted),
+                     ("WR4-WR6", owner_held_run),
                      ("WR7", medium_rule_unit), ("WR8", zero_tasks_prewrite), ("WR9", pending_post_write),
-                     ("WR10", answer_binds_current_text)):
+                     ("WR10", answer_binds_current_text), ("HB2-1-3", hb2_rules_unit), ("HB2-4", hb2_gap_prewrite)):
         case(name, fn)
 
 
