@@ -26,6 +26,12 @@ OUT = "_task_output.json"
 # baseline hb1: 4 of 10 runs lost a SPEC try to the 30-turn cap (the draft reads inputs, writes derivations and
 # iterates); the spec draft gets its own cap, still bounded by the call's dollar allowance.
 SPEC_MAX_TURNS = 60
+# baseline hb1, ranked fix 10: the spec draft checks its own draft in process (validate_spec, no shell), so problems
+# cost a tool call, not a try; each check takes turns, so a draft holding the tool has a higher cap.
+SPEC_TOOL_SERVER = "harness"
+VALIDATE_SPEC_TOOL = f"mcp__{SPEC_TOOL_SERVER}__validate_spec"
+SPEC_MAX_TURNS_VALIDATING = 80
+MAX_VALIDATE_CALLS = 12
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
@@ -84,7 +90,9 @@ rules the check refuses often: a decision test's `text` has no digits (it says i
 test asks; the values tested are rendered from computed claims); and `engine_parameters` gives no
 value for a parameter the engine card lists as calibrated or fitted (calibrate a calibrated one
 under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
-it out). Output:
+it out). When you hold the validate_spec tool, call it after writing the draft and after each fix:
+it runs the same checks the harness runs when your try ends, so finish only once it finds no
+problem (or say in notes what you could not fix). Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """
@@ -480,11 +488,20 @@ class SdkTasks:
         self.turns_explicit = max_turns is not None      # a caller's cap holds for every task (Codex r1 P1-5)
         self.query_fn = query_fn
         self.n = 0
+        self.spec_check = None
+        self.busy = {"n": 0}         # validate_spec checks running now: the draft's edits wait (Codex r2 P1-2/P1-3)
+
+    def set_spec_check(self, fn) -> None:
+        """The machine's pre-sign checks on the current draft (a callable returning the problems), offered to the next
+        spec draft as its validate_spec tool; None withdraws it."""
+        self.spec_check = fn
 
     def turns_for(self, kind: str) -> int:
-        """The turn cap of one session: the caller's cap when it gave one; else SPEC_MAX_TURNS for the spec draft and
-        the default of 30 for the others."""
-        return SPEC_MAX_TURNS if kind == "draft_spec" and not self.turns_explicit else self.turns
+        """The turn cap of one session: the caller's cap when it gave one; else for the spec draft SPEC_MAX_TURNS, or
+        SPEC_MAX_TURNS_VALIDATING when it holds the validate_spec tool (its checks take turns); else the default of 30."""
+        if kind != "draft_spec" or self.turns_explicit:
+            return self.turns
+        return SPEC_MAX_TURNS_VALIDATING if self.spec_check else SPEC_MAX_TURNS
 
     def for_run_dir(self, run_dir: str) -> "SdkTasks":
         """The same tasks for another run dir (lead-gaps β: the child run a provisional lead amendment continues in),
@@ -517,13 +534,22 @@ class SdkTasks:
             return TaskResult(False, None, 0.0, "no allowance: the call was not made")
         out = os.path.join(self.run_dir, OUT)
         _sio().remove_path(out, self.io_root)
+        servers, extra = {}, []
+        if kind == "draft_spec" and self.spec_check:
+            from claude_agent_sdk import create_sdk_mcp_server
+            servers = {SPEC_TOOL_SERVER: create_sdk_mcp_server(SPEC_TOOL_SERVER, tools=[
+                validate_spec_tool(self.spec_check, busy=self.busy)])}
+            extra = [VALIDATE_SPEC_TOOL]
+        mine = TOOLS + extra
 
         async def pre(input_data, tool_use_id, context):
             name = input_data.get("tool_name")
             ti = input_data.get("tool_input") or {}
-            if name not in TOOLS:
+            if name not in mine:
                 # Fail closed (main #97): no shell, so no full pipeline build and no background call.
-                return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(TOOLS)})")
+                return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(mine)})")
+            if name in ("Write", "Edit") and self.busy["n"]:
+                return enforcement.deny_output(f"{kind}: validate_spec is checking the draft; edit once it returns")
             if name in ("Write", "Edit"):
                 why = _allowed(ti.get("file_path", ""), self.run_dir, owns)
                 if why:
@@ -535,8 +561,8 @@ class SdkTasks:
             return {}
 
         opts = ClaudeAgentOptions(system_prompt=system, model=model or enforcement.MODEL_DEEP, tools=TOOLS,
-                                  allowed_tools=TOOLS, permission_mode="bypassPermissions", cwd=self.run_dir,
-                                  max_turns=self.turns_for(kind), max_budget_usd=allowance, setting_sources=[],
+                                  allowed_tools=mine, mcp_servers=servers, permission_mode="bypassPermissions",
+                                  cwd=self.run_dir, max_turns=self.turns_for(kind), max_budget_usd=allowance, setting_sources=[],
                                   env=enforcement.filtered_env(dict(os.environ), self.cloud),
                                   hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[pre])]})
 
@@ -564,7 +590,7 @@ class SdkTasks:
             # One read-back, capped at its own small budget (never the SDK's unbounded default).
             import dataclasses
             probe = dataclasses.replace(opts, resume=seen["sid"], max_turns=1, tools=[], allowed_tools=[],
-                                        hooks=None, max_budget_usd=self.readback)
+                                        mcp_servers={}, hooks=None, max_budget_usd=self.readback)
             charge_cap = allowance + self.readback
 
             async def readback():
@@ -699,6 +725,195 @@ class SdkTasks:
 
 
 SdkTasks.pick_engine = _no_session_when_sole(SdkTasks.pick_engine)
+
+
+def validate_spec_tool(check, limit: int = MAX_VALIDATE_CALLS, busy: dict | None = None):
+    """The spec draft's in-process validate_spec tool (baseline hb1, ranked fix 10): `check()` is the machine's own
+    pre-sign check chain on the current files (Machine._spec_checks), so a pass here is what the harness finds after
+    the try. No arguments, no shell. A check that raises is an error result, never a pass; past `limit` calls in one
+    try the tool says so (the turn and dollar caps bound the rest). One check at a time: the lock is taken before
+    the worker thread starts, so a queued call that is cancelled never runs its check, and it is held until the worker
+    ends, even when the call is cancelled. `busy["n"]` counts running checks: the session's PreToolUse hook refuses a
+    Write or Edit while one runs, so the check reads (and the conflicts default is written to) a draft nobody edits."""
+    from claude_agent_sdk import tool
+    state = {"calls": 0, "lock": None}
+    busy = busy if busy is not None else {"n": 0}
+
+    def run():
+        return list(check() or [])
+
+    async def guarded():
+        busy["n"] += 1
+        try:
+            work = asyncio.ensure_future(asyncio.to_thread(run))
+            try:
+                return await asyncio.shield(work)
+            except asyncio.CancelledError:
+                await asyncio.gather(work, return_exceptions=True)     # the worker ends before the lock is released
+                raise
+        finally:
+            busy["n"] -= 1
+
+    @tool("validate_spec", "Run the harness's pre-sign checks on the current decision_spec.yaml, its settings, "
+          "derivations and cited inputs: the same checks the harness runs when your try ends. Takes no arguments. "
+          "Returns every problem found, or that none was found.", {})
+    async def validate_spec(args):
+        state["calls"] += 1
+        if state["calls"] > limit:
+            return {"is_error": True, "content": [{"type": "text", "text": (
+                f"validate_spec: the limit of {limit} checks in one try is reached; fix what the last check "
+                "reported, then finish (the harness checks the draft when the try ends)")}]}
+        state["lock"] = state["lock"] or asyncio.Lock()
+        try:
+            async with state["lock"]:
+                probs = await guarded()
+        except Exception as e:  # noqa: BLE001 -- fail closed: never a pass
+            return {"is_error": True, "content": [{"type": "text", "text": (
+                f"validate_spec: the checks could not run: {type(e).__name__}: {e}"[:2000])}]}
+        if not probs:
+            return {"content": [{"type": "text", "text": "validate_spec: no problems found by the pre-sign checks"}]}
+        return {"content": [{"type": "text", "text": f"validate_spec: {len(probs)} problem(s), fix every one:\n- "
+                             + "\n- ".join(str(p) for p in probs)}]}
+    return validate_spec
+
+
+def _self_test_validate_spec(ok) -> None:
+    """VS1-VS5 (baseline hb1, ranked fix 10): the spec draft had no way to learn whether its draft passed before its try
+    ended, so each problem cost a whole try (MAX_SPEC_TRIES is small). The harness hands it an in-process
+    validate_spec tool that runs the pre-sign checks the machine runs after the try; no shell."""
+    import tempfile
+    from types import SimpleNamespace as NS
+    calls = []
+
+    def check():
+        calls.append(1)
+        return ["missing section objective"] if len(calls) == 1 else []
+    with tempfile.TemporaryDirectory() as d:
+        seen = {}
+
+        async def probe(prompt=None, options=None):
+            pre = options.hooks["PreToolUse"][0].hooks[0]
+            out = await pre({"tool_name": VALIDATE_SPEC_TOOL, "tool_input": {}}, "v1", None)
+            seen.setdefault("deny", []).append((out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny")
+            seen.setdefault("servers", []).append(dict(options.mcp_servers or {}))
+            seen.setdefault("allowed", []).append(list(options.allowed_tools))
+            seen.setdefault("turns", []).append(options.max_turns)
+            yield NS(total_cost_usd=0.01, session_id="vs", is_error=False)
+        t = SdkTasks(d, query_fn=probe)
+        t.set_allowance(1.0)
+        t.set_spec_check(check)
+        t._session("draft_spec", "x", "y", OWNS["draft_spec"])
+        t._session("pick_engine", "x", "y", ())
+        t.set_spec_check(None)
+        t._session("draft_spec", "x", "y", OWNS["draft_spec"])
+        ok(seen["deny"] == [False, True, True] and VALIDATE_SPEC_TOOL in seen["allowed"][0]
+           and SPEC_TOOL_SERVER in seen["servers"][0] and not seen["servers"][1] and not seen["servers"][2]
+           and VALIDATE_SPEC_TOOL not in seen["allowed"][1],
+           f"VS1 the spec draft (and no other task, nor a draft with no check) gets the in-process validate_spec tool "
+           f"({seen['deny']}, {[list(s) for s in seen['servers']]})")
+        ok(seen["turns"][0] == SPEC_MAX_TURNS_VALIDATING > SPEC_MAX_TURNS and seen["turns"][2] == SPEC_MAX_TURNS,
+           f"VS4 a draft with the tool has a higher turn cap, for its checks ({seen['turns']})")
+
+        def text(r):
+            return " ".join(c.get("text", "") for c in r.get("content") or [])
+        tl = validate_spec_tool(check, limit=3)
+        r1 = asyncio.run(tl.handler({}))
+        r2 = asyncio.run(tl.handler({}))
+        ok("missing section objective" in text(r1) and "no problem" in text(r2).lower() and len(calls) == 2,
+           f"VS2 validate_spec returns the checks' problems, then that none was found ({text(r1)!r}, {text(r2)!r})")
+
+        def boom():
+            raise RuntimeError("check boom")
+        tb = validate_spec_tool(boom, limit=1)
+        rb, rl = asyncio.run(tb.handler({})), asyncio.run(tb.handler({}))
+        ok("check boom" in text(rb) and "could not run" in text(rb) and rb.get("is_error")
+           and "limit" in text(rl) and rl.get("is_error"),
+           f"VS3 a check that raises is reported as an error, never as a pass; past its limit the tool says so "
+           f"({text(rb)!r}, {text(rl)!r})")
+    # VS10 (Codex r1 P1-4): every problem is returned, none dropped past a count
+    many = [f"problem {i}" for i in range(45)]
+    r10 = asyncio.run(validate_spec_tool(lambda: many).handler({}))
+    ok(all(f"problem {i}\n" in text(r10) + "\n" for i in range(45)), "VS10 the tool returns every problem")
+    # VS11 (Codex r1 P2-5): a queued call that is cancelled never runs its check
+    import threading
+    gate, ran = threading.Event(), []
+
+    def slow():
+        ran.append(1)
+        gate.wait(5)
+        return []
+    t11 = validate_spec_tool(slow)
+
+    async def race():
+        a = asyncio.create_task(t11.handler({}))
+        await asyncio.sleep(0.2)
+        b = asyncio.create_task(t11.handler({}))
+        await asyncio.sleep(0.2)
+        b.cancel()
+        gate.set()
+        await a
+        try:
+            await b
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.3)
+    asyncio.run(race())
+    ok(len(ran) == 1, f"VS11 a cancelled queued validate_spec call never starts its check ({len(ran)} ran)")
+    # VS12 (Codex r2 P1-1): cancelling the active call keeps the lock until its worker ends
+    gate12, active, overlap = threading.Event(), [], []
+
+    def slow12():
+        if active:
+            overlap.append(1)
+        active.append(1)
+        gate12.wait(5)
+        active.pop()
+        return []
+    t12 = validate_spec_tool(slow12)
+
+    async def race12():
+        a = asyncio.create_task(t12.handler({}))
+        await asyncio.sleep(0.2)
+        a.cancel()
+        b = asyncio.create_task(t12.handler({}))
+        await asyncio.sleep(0.3)
+        gate12.set()
+        for x in (a, b):
+            try:
+                await x
+            except asyncio.CancelledError:
+                pass
+    asyncio.run(race12())
+    ok(not overlap, f"VS12 a cancelled active check still holds the lock until its worker ends ({len(overlap)} overlap)")
+    # VS13 (Codex r2 P1-2/P1-3): while a check runs, the draft session cannot edit its files (a parallel Write or
+    # Edit is refused), so the check reads, and the default it applies is written to, a draft nobody is changing
+    with tempfile.TemporaryDirectory() as d13:
+        busy_seen, verdicts = [], {}
+        t13 = SdkTasks(d13)
+
+        def check13():
+            busy_seen.append(t13.busy["n"])
+            return []
+
+        async def probe13(prompt=None, options=None):
+            pre = options.hooks["PreToolUse"][0].hooks[0]
+            w = {"tool_name": "Write", "tool_input": {"file_path": os.path.join(d13, "decision_spec.yaml")}}
+            t13.busy["n"] += 1
+            verdicts["during"] = ((await pre(w, "w1", None)).get("hookSpecificOutput") or {}).get(
+                "permissionDecision") == "deny"
+            t13.busy["n"] -= 1
+            verdicts["after"] = ((await pre(w, "w2", None)).get("hookSpecificOutput") or {}).get(
+                "permissionDecision") == "deny"
+            yield NS(total_cost_usd=0.01, session_id="vs13", is_error=False)
+        t13.query_fn = probe13
+        t13.set_allowance(1.0)
+        t13.set_spec_check(check13)
+        t13._session("draft_spec", "x", "y", OWNS["draft_spec"])
+        asyncio.run(validate_spec_tool(check13, busy=t13.busy).handler({}))
+        ok(verdicts == {"during": True, "after": False} and busy_seen == [1],
+           f"VS13 a Write during a check is refused, and allowed after it ({verdicts}, {busy_seen})")
+    ok("validate_spec" in PROMPTS["draft_spec"],
+       "VS5 the draft_spec prompt tells the drafter to check its draft with validate_spec before it finishes")
 
 
 def _self_test() -> int:
@@ -1090,6 +1305,10 @@ def _self_test() -> int:
                "SW3 the seed task writes only its own seed file; analysis/ stays the harness's")
     except Exception as e:  # noqa: BLE001 -- before the task exists this is the failure
         ok(False, f"SW1-SW3 seed task: {type(e).__name__}: {e}")
+    try:
+        _self_test_validate_spec(ok)
+    except Exception as e:  # noqa: BLE001 -- before the tool exists this is the failure
+        ok(False, f"VS1-VS5 validate_spec tool: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -819,6 +819,7 @@ def record_cited_inputs(run_dir: str) -> list[str]:
         return [f"{AB.SPEC_FILE} unreadable: {type(e).__name__}"]
     found = P.cited_paths(spec, run_dir)       # one walk, shared with the derived-input checks
     prov, probs, root = _provenance(run_dir), [], os.path.realpath(run_dir)
+    prov["cited"] = {}          # the current draft's citations only: a citation it dropped leaves the record
     # The staged copies must still be the files the question named (the draft task may not touch
     # them; this checks it).
     for dest, e in (prov.get("inputs") or {}).items():
@@ -1674,7 +1675,15 @@ class Machine:
         fb = self.st.tries.get("spec_feedback")
         # The key is fixed before the call and the try is counted only once the call returns, so an
         # interrupted draft resumes under the same key (charged once by _settle_interrupted).
-        res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, rd, fb)
+        # baseline hb1, fix 10: the draft checks itself during its try with these same checks (validate_spec)
+        offer = getattr(self.tasks, "set_spec_check", None)
+        if offer:
+            offer(lambda: self._spec_checks(rd))
+        try:
+            res = self._task(f"SPEC#{self._visit()}:try{n + 1}", "draft_spec", self.st.question, rd, fb)
+        finally:
+            if offer:
+                offer(None)
         self.st.tries["spec"] = n + 1
         if res is None:
             return self._budget_out("SPEC")
@@ -1688,9 +1697,6 @@ class Machine:
         drafted = res.ok or (recheckable and os.path.lexists(os.path.join(rd, AB.SPEC_FILE)))
         if drafted:
             try:
-                from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
-                if CF.ensure_default(rd):
-                    self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
                 errs = self._spec_checks(rd)
                 if not errs and self.st.derived_inputs:
                     self._write_sheet(rd)
@@ -1716,13 +1722,25 @@ class Machine:
     def _spec_checks(self, rd: str) -> list[str]:
         """Every pre-sign check class on the draft, each run whatever the others found, so one try hears every problem
         (baseline hb1: the chain stopped at the first class that failed, and MAX_SPEC_TRIES is small). A class that
-        raises is named in the problems and the others still run. A spec that does not parse is the one problem."""
+        raises is named in the problems and the others still run. A spec that is a link or does not parse is the one
+        problem. The draft task's validate_spec tool runs exactly this, so a pass in the try is a pass at its end
+        (hb1 fix 10): the owner default for conflicts is applied here, in both paths."""
         import yaml
+        from lib.safe_io import read_nofollow
         try:
-            yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
+            data, fst = read_nofollow(rd, AB.SPEC_FILE)                             # never a link's target
+            if fst.st_nlink > 1:            # Codex r2 P1-4: nor another file's content through a hard link
+                return [f"spec unreadable: {AB.SPEC_FILE} has {fst.st_nlink} hard links: write it as its own file"]
+            yaml.safe_load(data.decode("utf-8"))
         except Exception as e:  # noqa: BLE001
             return [f"spec unreadable: {type(e).__name__}: {e}"]
         out: list[str] = []
+        try:
+            from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
+            if CF.ensure_default(rd):
+                self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
+        except Exception as e:  # noqa: BLE001 -- r2 P2-5: named, and the other checks still run
+            out.append(f"the conflicts default could not be applied: {type(e).__name__}: {e}")
 
         def run(name, fn) -> bool:
             try:
@@ -4825,6 +4843,10 @@ def _self_test() -> int:
             _self_test_hb2_spec(ok, td, spike, new_run)
         except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
             ok(False, f"HS: {type(e).__name__}: {e}")
+        try:
+            _self_test_hb2_validate(ok, td, new_run)
+        except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
+            ok(False, f"VS6: {type(e).__name__}: {e}")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
@@ -6389,6 +6411,87 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     os.makedirs(hw)
     t5.world_model_seed(hw, {"question": "q"}, None, 1.0)
     ok(got == [5], f"HS13b the explicit turn cap holds for the world-model seed's own session ({got})")
+
+
+def _self_test_hb2_validate(ok, td: str, new_run) -> None:
+    """VS6 (baseline hb1, ranked fix 10): during a SPEC try the draft task holds a check that runs the machine's own
+    pre-sign checks on its current draft (the validate_spec tool), and it is withdrawn when the try ends."""
+    from v2_tasks import StubTasks
+    spike = AB.backend("spike")
+
+    class Checking(StubTasks):
+        def set_spec_check(self, fn):
+            self.check = fn
+
+        def draft_spec(self, q, rd, fb):
+            spec = dict(self.s["spec"])
+            spec.pop("objective", None)
+            r = StubTasks(dict(self.s, spec=spec)).draft_spec(q, rd, fb)
+            self.mid = self.check() if getattr(self, "check", None) else None
+            return r
+    d, T, st = new_run("vs6", {})
+    T = Checking(T.s)
+    m = Machine(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m.step()
+    fb = m.st.tries.get("spec_feedback") or []
+    ok(getattr(T, "mid", None) is not None and any("missing section objective" in x for x in T.mid)
+       and set(T.mid) <= set(fb) and getattr(T, "check", 1) is None,
+       f"VS6 the draft task's check runs the machine's own pre-sign checks on its draft, and is withdrawn after the "
+       f"try ({getattr(T, 'mid', None)}, {fb})")
+    import yaml
+    # VS7 (Codex r1 P1-1): the check never follows a spec that is a link (the try-end gate refuses it): no parser
+    # diagnostic from the link's target
+    d7, T7, st7 = new_run("vs7", {})
+    m7 = Machine(d7, T7, st7, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    open(os.path.join(td, "vs7_target.yaml"), "w").write("a: [unclosed\n")
+    os.symlink(os.path.join(td, "vs7_target.yaml"), os.path.join(d7, AB.SPEC_FILE))
+    got7 = m7._spec_checks(d7)
+    ok(got7 and not any("unclosed" in x or "while parsing" in x or "flow sequence" in x for x in got7),
+       f"VS7 a spec that is a link is refused before it is read ({got7})")
+    # VS14 (Codex r2 P1-4): a spec with a second hard link is refused before it is parsed
+    d14, T14, st14 = new_run("vs14", {})
+    m14 = Machine(d14, T14, st14, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    os.link(os.path.join(td, "vs7_target.yaml"), os.path.join(d14, AB.SPEC_FILE))
+    got14 = m14._spec_checks(d14)
+    ok(got14 and not any("unclosed" in x or "while parsing" in x or "flow sequence" in x for x in got14),
+       f"VS14 a hard-linked spec is refused before it is read ({got14})")
+    # VS15 (Codex r2 P2-5): a failed write of the conflicts default is a problem, and the other checks still run
+    d15, T15, st15 = new_run("vs15", {})
+    m15 = Machine(d15, T15, st15, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    StubTasks(dict(T15.s, spec={k: v for k, v in T15.s["spec"].items() if k != "objective"})).draft_spec("q", d15, None)
+    from toolkit.analysis import conflicts as _CF
+    real_ed = _CF.ensure_default
+
+    def no_write(*a, **k):
+        raise PermissionError("cannot publish")
+    try:
+        _CF.ensure_default = no_write
+        got15 = m15._spec_checks(d15)
+    finally:
+        _CF.ensure_default = real_ed
+    ok(any("cannot publish" in x for x in got15) and any("missing section objective" in x for x in got15),
+       f"VS15 a failed conflicts-default write does not hide the other problems ({got15})")
+    # VS8 (Codex r1 P1-2): the check applies the owner default (conflicts) the try-end path applies, so a pass in the
+    # try is a pass at its end
+    d8, T8, st8 = new_run("vs8", {})
+    m8 = Machine(d8, T8, st8, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    T8.draft_spec("q", d8, None)
+    m8._spec_checks(d8)
+    raw8 = yaml.safe_load(open(os.path.join(d8, AB.SPEC_FILE)))
+    ok((raw8.get("conflicts") or {}).get("policy") == "declare_and_test",
+       f"VS8 the check applies the conflicts default before it validates ({raw8.get('conflicts')})")
+    # VS9 (Codex r1 P1-3): the cited-input record holds the current draft's citations only
+    d9, T9, st9 = new_run("vs9", {})
+    AB.write_toy_units(os.path.join(d9, "other_units.csv"), n=12)
+    spec9 = dict(T9.s["spec"])
+    StubTasks(dict(T9.s, spec=spec9)).draft_spec("q", d9, None)
+    record_cited_inputs(d9)
+    spec9 = json.loads(json.dumps(spec9).replace('"units.csv"', '"other_units.csv"'))     # every citation of it
+    StubTasks(dict(T9.s, spec=spec9)).draft_spec("q", d9, None)
+    record_cited_inputs(d9)
+    cited9 = sorted((json.load(open(os.path.join(d9, PROVENANCE))).get("cited") or {}))
+    ok("other_units.csv" in cited9 and "units.csv" not in cited9,
+       f"VS9 a citation the draft dropped leaves the record ({cited9})")
 
 
 def main(argv=None) -> int:
