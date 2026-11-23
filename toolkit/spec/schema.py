@@ -583,13 +583,50 @@ class Spec:
 ENGINE_METHODS = ("describe", "parameters", "run")
 
 
+# The engine registry's references: the engines agents/analysis_backend.py ENGINES lists with their card, configuration
+# and benchmark checks (its self-test B_REGISTRY holds the two lists equal). Kept here, not read from agents/, because
+# engine workers receive toolkit/ and scripts/ only (scripts/compute.py REPO_CODE_DIRS).
+REGISTERED_ENGINES = ("toolkit.engines.contract:ToyEngine", "toolkit.engines.malaria.engine:MalariaEngine",
+                      "toolkit.engines.empirical.engine:PackageRateEngine",
+                      "toolkit.engines.compartmental.engine:CompartmentalEngine",
+                      "toolkit.engines.renewal.engine:RenewalEngine")
+
+
+def registered_engines() -> list[str]:
+    """The engine references a spec may name (REGISTERED_ENGINES)."""
+    return list(REGISTERED_ENGINES)
+
+
 def check_engine_ref(ref) -> tuple[str, str]:
-    """(module, class) of an allowed engine reference, or SpecError. Imports nothing."""
+    """(module, class) of an allowed engine reference, or SpecError. Imports nothing. The import guard's policy, then
+    the registry (PR #363 question 15): a ref the policy allows but the registry does not hold (a hook or toy engine
+    under toolkit/engines/) is refused, whether the signed spec names it, an engine: auto candidate lists it or an
+    engine choice picks it. Self-tests extend the registry in-process only (import_guard.register_test_engine)."""
     from toolkit import import_guard as G
     try:
-        return G.check_ref("engine", ref)
+        out = G.check_ref("engine", ref)
     except G.ImportRefused as e:
         raise SpecError(f"engine {str(ref)[:80]}: {e}") from None
+    reg = registered_engines()
+    if ref not in reg and not G.test_engine_registered(ref):
+        raise SpecError(f"engine {ref}: not a registered engine; a spec may name one of: {', '.join(reg)}")
+    return out
+
+
+def engine_ref_problems(raw: Mapping) -> list[str]:
+    """check_engine_ref on the engine a spec mapping names, or on each engine: auto candidate: the refusals."""
+    eng = raw.get("engine")
+    if engine_is_auto(eng):
+        refs = eng.get("candidates") if isinstance(eng, Mapping) and isinstance(eng.get("candidates"), list) else []
+    else:
+        refs = [eng.get("ref") if isinstance(eng, Mapping) else eng] if eng is not None else []
+    out = []
+    for r in refs:
+        try:
+            check_engine_ref(r)
+        except SpecError as e:
+            out.append(str(e))
+    return out
 
 
 def engine_class(ref: str):
@@ -640,6 +677,9 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
     if derived is not None:
         spec.derived = derived
     try:
+        unreg = engine_ref_problems(spec.raw)         # an unregistered engine is refused first, before it is built
+        if unreg:
+            return unreg
         pres = presentation_refusal(spec.raw)         # every path, sign-off with engine: auto pending included
         from toolkit.engines import benchmark_coverage as BC      # owner decision 2026-11-12: signed departures
         pres = pres + BC.departure_problems(spec.raw)
@@ -2230,6 +2270,8 @@ def _self_test() -> int:
         ok(validate(s) == [], f"SP1 a well-formed toy spec validates: {validate(s)}")
 
         # Codex r2 P2-2 (integrated): the toy spec draws the fitted parameters (uncertainty source engine_parameters)
+        from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+        _G.register_test_engine("toolkit.engines.conditional_drivers:ToyConditionalEngine")
         def cd_errs(when):
             r = copy.deepcopy(s.raw)
             r["engine"] = {"ref": "toolkit.engines.conditional_drivers:ToyConditionalEngine", "config": {"when": when}}
