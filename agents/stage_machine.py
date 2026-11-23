@@ -1843,7 +1843,7 @@ class Machine:
             # resolved beside this run only (a moved copy: r2); never the recorded path, which may be the original tree
             # of a restored copy (Codex r3 on #342, P1-5); and only the child this request made (Codex r1 of #349)
             child = _child_of(self.run_dir, child)
-            child = child if child and _made_by(child, req) else None
+            child = child if child and _made_by(child, req, self.run_dir) else None
         if la.get("status") == "refused":
             return None                   # the first refusal stands, with its reason and any kept child
         if any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
@@ -1910,8 +1910,29 @@ class Machine:
         # the child is bound to the parent's final state before that state is saved, so no interruption leaves a FINAL
         # parent whose child binds its paused state (Codex r3 on #342, P1-4); until that save the parent is at SPEC and
         # a resume finishes the hand-off again
-        return self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
-                        AMENDED_PROVISIONAL, extra={"amended_to": child}, before_save=lambda: self._relink(child))
+        # a failed lineage write puts this machine and the parent's metadata back as they were (Codex r2 of #349): a
+        # retry, on this machine or a new one, finishes the hand-off
+        import copy
+        saved, failed = copy.deepcopy(self.st), []
+        meta_p = os.path.join(self.run_dir, "metadata.json")
+        meta0 = open(meta_p, "rb").read() if os.path.isfile(meta_p) else None
+
+        def link():
+            try:
+                self._relink(child)
+            except BaseException:
+                failed.append(1)
+                raise
+        try:
+            return self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
+                            AMENDED_PROVISIONAL, extra={"amended_to": child}, before_save=link)
+        except BaseException:
+            if failed:
+                self.st = saved
+                if meta0 is not None:
+                    from lib.safe_io import write_nofollow
+                    write_nofollow(self.run_dir, "metadata.json", meta0, atomic=True)
+            raise
 
     def _mark_child(self, child: str, rid) -> None:
         """The child's state, once: not paused, what is left of the cap (always > 0 here), the handoff event."""
@@ -3235,29 +3256,47 @@ def _parent_of(run_dir: str, recorded):
     c = handoff_child(here)
     if c and os.path.realpath(c) == os.path.realpath(run_dir):
         return here
-    try:                 # a manual amendment's parent keeps its status: the parent-state digest the child records
-        bound = ((json.load(open(os.path.join(run_dir, "metadata.json"))) or {}).get("parent_run") or {}).get(
-            "run_state_sha256")
-        if not os.path.islink(here) and isinstance(bound, str) and bound == hashlib.sha256(
-                open(os.path.join(here, STATE_FILE), "rb").read()).hexdigest():
-            return here
-    except (OSError, ValueError, AttributeError):
-        pass
+    # a manual amendment's parent keeps its status: the parent-state digest the child records (in its metadata or its
+    # amendment record: Codex r2 of #349)
+    for rel in ("metadata.json", AMENDMENT_RECORD):
+        try:
+            bound = ((json.load(open(os.path.join(run_dir, rel))) or {}).get("parent_run") or {}).get(
+                "run_state_sha256")
+            if not os.path.islink(here) and isinstance(bound, str) and bound == hashlib.sha256(
+                    open(os.path.join(here, STATE_FILE), "rb").read()).hexdigest():
+                return here
+        except (OSError, ValueError, AttributeError):
+            continue
     return recorded
 
 
-def _made_by(child: str, req: dict) -> bool:
-    """`child` is the run toolkit/spec/amend.py made from this rethink request: from the signed spec the request names,
-    under its patch's id (Codex r1 of #349: a same-named child from another backup is not this request's)."""
+def _own_spec_digest(run_dir: str):
+    """The spec digest the run's own sign-off record binds (decision_spec.signoff.json; never a legacy brief's)."""
+    from toolkit.spec import signoff as SO
+    try:
+        rec = json.load(open(os.path.join(run_dir, SO.SPEC_SIGNOFF)))
+        m = rec.get("sha256")
+        return (m.get(AB.SPEC_FILE) if isinstance(m, dict) else None) or rec.get("spec_sha256")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _made_by(child: str, req: dict, parent: str) -> bool:
+    """`child` is the run toolkit/spec/amend.py made from this rethink request of `parent`: from the signed spec the
+    request names, which the parent's own sign-off binds, with the request's patch (its id and content digest). A
+    same-named child from another backup or another patch is not this request's (Codex r1 and r2 of #349)."""
+    from toolkit.spec import amend as AM
     try:
         meta = json.load(open(os.path.join(child, "metadata.json")))
     except (OSError, ValueError):
         return False
     req = req if isinstance(req, dict) else {}
     sig, patch = req.get("signed_spec_sha256"), req.get("patch")
-    pid = str((patch if isinstance(patch, dict) else {}).get("id") or "unnamed")
-    return isinstance(meta, dict) and isinstance(sig, str) and meta.get("parent_spec_sha256") == sig \
-        and meta.get("amendment") == pid
+    if not (isinstance(meta, dict) and isinstance(sig, str) and isinstance(patch, dict)):
+        return False
+    return meta.get("parent_spec_sha256") == sig == _own_spec_digest(parent) \
+        and meta.get("amendment") == str(patch.get("id") or "unnamed") \
+        and meta.get("patch_sha256") == AM.patch_sha256(patch)
 
 
 def handoff_child(run_dir: str) -> str | None:
@@ -3278,29 +3317,55 @@ def handoff_chain(run_dir: str, limit: int = 8, kept: bool = False) -> list[str]
     left for the owner, or one an interrupted hand-off signed (main.py stores each with the run: Codex r1): only
     after a recorded refusal or an unfinished hand-off, and only the child this run's request made (Codex r3 on #342,
     P1-11; Codex r1 of #349)."""
+    return list(iter_handoff_chain(run_dir, limit, kept))
+
+
+def iter_handoff_chain(run_dir: str, limit: int = 8, kept: bool = False):
+    """handoff_chain, one run at a time: main.py stores each run before it reads the next (Codex r2 of #349)."""
     out, cur = [], run_dir
     while len(out) < limit:
         nxt = handoff_child(cur)
         if nxt is None and kept:
-            try:
-                req = json.load(open(os.path.join(cur, SPEC_RETHINK_REQUEST)))
-                la = req.get("lead_amendment") or {}
-                st = load_state(cur)
-            except (OSError, ValueError, AttributeError):
-                req, la, st = {}, {}, None
-            # a refusal, or a hand-off interrupted before the parent was saved FINAL (Codex r1 of #349)
-            unfinished = la.get("status") in ("started", "signed_provisionally") and st is not None \
-                and st.status != AMENDED_PROVISIONAL
-            nxt = _child_of(cur, la.get("child")) if la.get("status") == "refused" or unfinished else None
-            nxt = nxt if nxt and _made_by(nxt, req) else None
+            nxt = _kept_child(cur)
             if nxt is not None and nxt not in out:
-                out.append(nxt)
-            break
+                yield nxt
+            return
         if nxt is None or nxt in out:
-            break
+            return
         out.append(nxt)
+        yield nxt
         cur = nxt
-    return out
+
+
+def _kept_child(run_dir: str) -> str | None:
+    """A refused amendment's kept child, or the lead-signed child of a hand-off interrupted before the parent was saved
+    FINAL; only the child this run's request made (Codex r1 and r2 of #349)."""
+    try:
+        req = json.load(open(os.path.join(run_dir, SPEC_RETHINK_REQUEST)))
+    except (OSError, ValueError):
+        return None
+    la = req.get("lead_amendment") if isinstance(req, dict) else None
+    if not isinstance(la, dict):
+        return None
+    status = la.get("status")
+    if status in ("started", "signed_provisionally"):
+        try:
+            st = load_state(run_dir)
+        except (OSError, ValueError):
+            st = None
+        if st is None or st.status == AMENDED_PROVISIONAL:
+            return None
+    elif status != "refused":
+        return None
+    child = _child_of(run_dir, la.get("child"))
+    if child is None or not _made_by(child, req, run_dir):
+        return None
+    if status != "refused":              # an unfinished hand-off: only a child with its state and the lead's signature
+        from toolkit.spec import signoff as SO
+        if not (os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
+                and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
+            return None
+    return child
 
 
 # ------------------------------------------------------------------ self-test

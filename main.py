@@ -1088,15 +1088,18 @@ def _run_self_test() -> int:
         return f
     _got8 = [_outcome(lambda: _rs(_locked(rd), _p8, store=lambda p, upto=None: _calls8.append((p, upto))))
              for rd in (_c8, _p8)]
-    _saved8 = (_sm7.handoff_chain, globals()["store_run_results"])
+    _saved8 = (_sm7.iter_handoff_chain, globals()["store_run_results"])
     _stored8 = []
-    _sm7.handoff_chain = lambda p, limit=8, kept=False: [_c8, _c8 + ".amend1"]
+    _sm7.iter_handoff_chain = lambda p, limit=8, kept=False: iter([_c8, _c8 + ".amend1"])
     globals()["store_run_results"] = _stored8.append
+    for _x in (_c8, _c8 + ".amend1"):
+        os.makedirs(_x, exist_ok=True)
     try:
         _store_chain(_p8, upto=_c8)
         _store_chain(_p8)
     finally:
-        _sm7.handoff_chain, globals()["store_run_results"] = _saved8
+        _sm7.iter_handoff_chain, globals()["store_run_results"] = _saved8
+        shutil.rmtree(_c8 + ".amend1", ignore_errors=True)
     ok(_got8 == ["AmendmentLocked"] * 2 and _calls8 == [(_p8, os.path.realpath(_c8))]
        and "crash" not in _metadata_dict(os.path.join(_p8, "metadata.json"))
        and _stored8 == [_p8, _p8, _c8, _c8 + ".amend1"],
@@ -1228,8 +1231,14 @@ def run_v2_and_store(run, run_path: str, store=None):
         try:
             if locked == os.path.realpath(run_path):
                 print("v2 run not stored: another process holds its amendment lock", file=sys.stderr, flush=True)
-            elif locked:
-                print(f"v2 run stored up to {locked}: {store(run_path, upto=locked)}", flush=True)
+            elif locked:          # a store without `upto` stores the one run it is given (Codex r2 of #349)
+                import inspect
+                try:
+                    chain = "upto" in inspect.signature(store).parameters
+                except (TypeError, ValueError):
+                    chain = False
+                got = store(run_path, upto=locked) if chain else store(run_path)
+                print(f"v2 run stored up to {locked}: {got}", flush=True)
             else:
                 print(f"v2 run stored: {store(run_path)}", flush=True)
         except Exception as fe:  # noqa: BLE001 -- never replace the run's exception or status
@@ -1278,13 +1287,35 @@ def main_v2(args, ident: dict | None = None) -> int:
 
 def _store_chain(run_path: str, upto: str | None = None) -> list:
     """lead-gaps β: a provisional lead amendment continues the run in a child run dir; it is stored too. `upto`: a child
-    another process holds (AmendmentLocked): stored from there by that process, not here (Codex r1 of #349)."""
+    another process holds (AmendmentLocked): stored from there by that process, not here (Codex r1 of #349). Each run
+    is stored before the next is read, and a child whose amendment lock another process holds, or that cannot be read,
+    ends the chain there (Codex r2 of #349)."""
     from agents import stage_machine
-    out = []
-    for x in [run_path] + stage_machine.handoff_chain(run_path, kept=True):
+    out = [store_run_results(run_path)]
+    chain = stage_machine.iter_handoff_chain(run_path, kept=True)
+    while True:
+        try:
+            x = next(chain)
+        except StopIteration:
+            break
+        except Exception as e:  # noqa: BLE001 -- the runs stored so far stand; the rest is reported
+            print(f"[ERROR] the run chain after {len(out)} run(s) was not read: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+            break
         if upto and os.path.realpath(x) == os.path.realpath(upto):
             break
-        out.append(store_run_results(x))
+        lock = stage_machine._amend_lock(x)
+        try:
+            lock.__enter__()
+        except stage_machine.AmendmentLocked:
+            print(f"v2 run chain stored up to {x}: another process holds it", file=sys.stderr, flush=True)
+            break
+        except OSError:              # no lock can be taken there (a read-only copy): stored as it is
+            lock = contextlib.nullcontext()
+        try:
+            out.append(store_run_results(x))
+        finally:
+            lock.__exit__(None, None, None)
     return out
 
 

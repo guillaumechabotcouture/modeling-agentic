@@ -69,6 +69,12 @@ def _sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def patch_sha256(patch) -> str:
+    """The patch's content digest, recorded in the child's metadata: a lead recovering an interrupted hand-off adopts
+    only the child its request's patch made (Codex r2 of #349)."""
+    return _sha(json.dumps(patch, sort_keys=True, default=str).encode())
+
+
 def _derived_paths() -> set:
     """Files the harness writes after SIGN: typed analysis artifacts, the manifest, geometry sign-off, models/ outputs."""
     from toolkit.analysis import artifacts as A
@@ -512,7 +518,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     pin = pipeline_id.code_pin(repo)
     meta = {"pipeline": "v2", "question": st.get("question"), "signoff": mode, "max_rounds": st.get("max_rounds"),
             "parent_run": {"run_dir": parent, "run_state_sha256": st_sha}, "parent_spec_sha256": signed,
-            "parent_spec_signed": bool(signed), "code_pin": pin, "amendment": label,
+            "parent_spec_signed": bool(signed), "code_pin": pin, "amendment": label, "patch_sha256": patch_sha256(p),
             "producer": PRODUCER, "created": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
     write_nofollow(child, "metadata.json", json.dumps(meta, indent=2).encode(), atomic=True)
     rounds = st.get("max_rounds") if type(st.get("max_rounds")) is int and st["max_rounds"] > 0 else 3
