@@ -4825,6 +4825,10 @@ def _self_test() -> int:
             _self_test_hb2_spec(ok, td, spike, new_run)
         except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
             ok(False, f"HS: {type(e).__name__}: {e}")
+        try:
+            _self_test_spec_p1s(ok, td, spike, new_run)
+        except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
+            ok(False, f"SP: {type(e).__name__}: {e}")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
@@ -6389,6 +6393,74 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     os.makedirs(hw)
     t5.world_model_seed(hw, {"question": "q"}, None, 1.0)
     ok(got == [5], f"HS13b the explicit turn cap holds for the world-model seed's own session ({got})")
+
+
+def _self_test_spec_p1s(ok, td: str, spike, new_run) -> None:
+    """SP1-SP4 (Codex round 4 on #348, on code merged through #342): a capped try with no draft must not stop later
+    capped tries' drafts from being checked; a cited input that is not a regular file (a FIFO) is never opened by a later
+    check; the spec and its settings are refused as links or hard links before any check reads them; an explicit zero
+    turn cap is refused (it would remove the session's limit)."""
+    from v2_tasks import StubTasks, TaskResult
+
+    class Capped(StubTasks):
+        """Per try: "none" (no draft, capped) or "good" (a valid draft written, then capped)."""
+        def draft_spec(self, q, rd, fb):
+            self.n_ = getattr(self, "n_", 0) + 1
+            if self.s["tries"][self.n_ - 1] == "good":
+                StubTasks(self.s).draft_spec(q, rd, fb)
+            self.calls.append("draft_spec")
+            return TaskResult(False, None, 0.0, "max turns")
+    d1, T1, st1 = new_run("sp1", {})
+    T1 = Capped(dict(T1.s, tries=["none", "good", "good"]))
+    m = Machine(d1, T1, st1, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    for _ in range(3):
+        if m.st.state != "SPEC" or m.st.status:
+            break
+        m.step()
+    ok(m.st.state == "EVIDENCE", f"SP1 a first capped try with no draft does not stop the next capped try's valid draft "
+                                 f"from being checked ({m.st.state}, {m.st.status}, {m.st.tries.get('spec_feedback')})")
+
+    class Spy(Machine):
+        def _geometry_problems(self, rd=None):
+            self.ran = getattr(self, "ran", []) + ["geometry"]
+            return []
+
+        def _evidence_assess(self, rd):
+            self.ran = getattr(self, "ran", []) + ["evidence"]
+            return super()._evidence_assess(rd)
+    # SP3: a cited FIFO inside the run is refused and no later check opens it (it would block with no writer)
+    d3, T3, st3 = new_run("sp3", {})
+    m3 = Spy(d3, T3, st3, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    spec3 = dict(T3.s["spec"], decision_units=dict(T3.s["spec"]["decision_units"], csv="units_fifo.csv"))
+    StubTasks(dict(T3.s, spec=spec3)).draft_spec("q", d3, None)
+    os.mkfifo(os.path.join(d3, "units_fifo.csv"))
+    got3 = m3._spec_checks(d3)
+    ok(any("units_fifo.csv" in x and "regular file" in x for x in got3) and not getattr(m3, "ran", []),
+       f"SP3 a cited FIFO is refused and never opened by a later check ({getattr(m3, 'ran', [])}, {got3})")
+    # SP4: the spec and analysis_settings.yaml are refused as a symlink or a hard link, before any check reads them
+    marker = os.path.join(td, "sp4_fixture.yaml")
+    open(marker, "w").write("fixture_marker: 1\n")
+    res4 = {}
+    for name, rel, how in (("settings link", "analysis_settings.yaml", os.symlink),
+                           ("settings hard link", "analysis_settings.yaml", os.link),
+                           ("spec hard link", AB.SPEC_FILE, os.link)):
+        d4, T4, st4 = new_run("sp4_" + name.replace(" ", "_"), {})
+        T4.draft_spec("q", d4, None)
+        os.remove(os.path.join(d4, rel))
+        how(marker, os.path.join(d4, rel))
+        m4 = Spy(d4, T4, st4, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        got4 = m4._spec_checks(d4)
+        res4[name] = bool(any(rel in x and "link" in x for x in got4) and not any("fixture_marker" in x for x in got4)
+                          and not getattr(m4, "ran", []))
+    ok(all(res4.values()), f"SP4 a linked spec or settings file is refused before any check reads it ({res4})")
+    # SP2: an explicit zero turn cap is refused, never passed on as "no limit"
+    from v2_sdk_tasks import SdkTasks
+    try:
+        SdkTasks(os.path.join(td, "sp2"), max_turns=0)
+        refused = False
+    except ValueError:
+        refused = True
+    ok(refused, "SP2 SdkTasks(max_turns=0) is refused: the SDK reads 0 as no turn limit")
 
 
 def main(argv=None) -> int:
