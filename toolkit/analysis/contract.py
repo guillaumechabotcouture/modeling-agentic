@@ -480,6 +480,7 @@ def _gate_findings(run_dir: str) -> list[dict]:
     if man.get("deliverable_kind") != "estimates":
         out += _boundary(run_dir, bd_doc, pt_doc)
         out += _value_of_information(run_dir, unc_doc, voi_doc)
+        out += _plan_rule(run_dir, pt_doc, unc_doc)
     out += _decision_tests(run_dir, man)
     out += _solver(man)
     out += _claims(run_dir, man)
@@ -619,6 +620,18 @@ def _plan_variants(run_dir: str, point: dict, pv) -> list[dict]:
     return [_f("analysis_contract_plan_variants", m) for m in V.contract_findings(raw, point, pv)]
 
 
+def _plan_rule(run_dir: str, point, unc) -> list[dict]:
+    """hb1 fix 11: the completed run carries the plan rule its signed spec asks for (toolkit/analysis/plan_rule.py)."""
+    from toolkit.analysis import plan_rule as PR
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return [_f("analysis_contract_plan_rule", f"{SPEC} unreadable: {e}")]
+    _rows, _man, problem, payload = _verified_doc(run_dir)
+    return [_f("analysis_contract_plan_rule", m, "plan_rule") for m in PR.contract_findings(raw, point, unc)
+            + (PR.reference_findings(point, payload) if not problem and payload else [])]
+
+
 def _value_of_information(run_dir: str, unc, voi) -> list[dict]:
     """F6: the artifact the signed spec asks for (on by default from the minimum draws), whatever the manifest
     expects, and its shape and arithmetic (toolkit/analysis/value_of_information.py contract_findings)."""
@@ -671,6 +684,11 @@ NO_MANIFEST = "has no completed analysis manifest to be read from"    # api.gate
 
 
 def _verified(run_dir: str) -> tuple:
+    rows, man, problem, _data = _verified_doc(run_dir)
+    return rows, man, problem
+
+
+def _verified_doc(run_dir: str) -> tuple:
     """(rows, manifest, problem) of analysis/decision_tests.yaml: read once with no link followed, the hash taken on
     the bytes parsed (Codex r1 of #327). problem is None when there is nothing to read (no spec, or a completed manifest
     that lists no such artifact) or the rows verified; else why they cannot be trusted. A spec without a completed
@@ -679,27 +697,28 @@ def _verified(run_dir: str) -> tuple:
     try:
         man = json.load(open(os.path.join(run_dir, MANIFEST)))
     except (OSError, ValueError):
-        return [], {}, None if no_spec else NO_MANIFEST
+        return [], {}, None if no_spec else NO_MANIFEST, {}
     if not isinstance(man, dict) or man.get("status") != "complete" or man.get("complete") is not True:
-        return [], man if isinstance(man, dict) else {}, None if no_spec else NO_MANIFEST
+        return [], man if isinstance(man, dict) else {}, None if no_spec else NO_MANIFEST, {}
     ent = (man.get("artifacts") or {}).get(DECISION_TESTS_ARTIFACT)
     if not isinstance(ent, dict):
-        return [], man, None
+        return [], man, None, {}
     from toolkit.analysis.artifacts import _safe_io
     try:
         data = _safe_io().read_nofollow(run_dir, DECISION_TESTS_ARTIFACT)[0]
     except Exception as e:  # noqa: BLE001 -- a link, a missing or unreadable file: not trusted
-        return [], man, f"cannot be read with no link followed ({type(e).__name__})"
+        return [], man, f"cannot be read with no link followed ({type(e).__name__})", {}
     import hashlib
     if hashlib.sha256(data).hexdigest() != ent.get("sha256"):
-        return [], man, "changed after the harness wrote it"
+        return [], man, "changed after the harness wrote it", {}
     try:
-        tests = ((yaml.safe_load(data.decode("utf-8")) or {}).get("data") or {}).get("tests")
+        payload = (yaml.safe_load(data.decode("utf-8")) or {}).get("data") or {}
+        tests = payload.get("tests")
     except (yaml.YAMLError, UnicodeDecodeError, AttributeError) as e:
-        return [], man, f"does not parse ({type(e).__name__})"
+        return [], man, f"does not parse ({type(e).__name__})", {}
     if not isinstance(tests, list):
-        return [], man, "has no list of tests"
-    return tests, man, None
+        return [], man, "has no list of tests", {}
+    return tests, man, None, payload
 
 
 def verified_decision_tests(run_dir: str) -> list:
@@ -726,11 +745,14 @@ def decision_test_findings(run_dir: str) -> list[dict]:
     #316): HIGH, scope-declarable only through the owner's (or, under --signoff lead, the lead's provisional) answer.
     Not a contract finding: gate_findings is unchanged. A completed manifest whose artifact cannot be read and verified
     gives one non-declarable HIGH instead (fail closed: a plan-changing test is never dropped silently)."""
-    rows, _man, problem = _verified(run_dir)
+    rows, _man, problem, payload = _verified_doc(run_dir)
     if problem:
         return [_f("analysis_contract_decision_test", f"{DECISION_TESTS_ARTIFACT} {problem}: the decision tests that "
                                                       "change the plan cannot be read", DECISION_TESTS_ARTIFACT)]
     out = []
+    # hb1 fix 11: under deliverable.plan: expected_value the tests compare with the point-value plan, which the
+    # verified artifact names (not the spec, which may have changed since: Codex r2 of #343 P2-8)
+    ev = isinstance(payload, dict) and payload.get("reference_plan") == "point_plan"
     for t in rows:
         if isinstance(t, dict) and t.get("verdict") == "CHANGES_PLAN":
             tid = str(t.get("test_id"))
@@ -742,7 +764,10 @@ def decision_test_findings(run_dir: str) -> list[dict]:
             if not why and isinstance(trig, list) and trig:
                 why = "see its result file"
             out.append({"kind": DECISION_TEST_KIND, "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE",
-                        "claim": f"Decision test {tid} changes the plan: {' '.join(str(t.get('statement') or '').split())[:600]}"
+                        "claim": f"Decision test {tid} changes the plan"
+                                 + (" solved at the point values (the delivered plan is the expected-value plan over the "
+                                    "uncertainty draws, which the test does not re-solve; deliverable.plan)" if ev else "")
+                                 + f": {' '.join(str(t.get('statement') or '').split())[:600]}"
                                  + (f" ({why}" + (f"; triggered by {', '.join(map(str, trig))}" if isinstance(trig, list)
                                                   and trig else "") + ")" if why else ""),
                         "key": tid, "scope_declarable": True, "decision_bearing": True,

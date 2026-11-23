@@ -381,11 +381,32 @@ class Analysis:
 
 
 def q(v, level=0.95) -> dict | None:
-    v = np.asarray(v, float)
+    import statistics
+    v = np.asarray(v, float).ravel()      # draws are counted flat
     if not len(v):
         return None
     if not np.all(np.isfinite(v)):      # 1C-b 2d-iii: fail closed (one NaN made every quantile NaN)
         raise ValueError(f"quantiles: {int(np.sum(~np.isfinite(v)))} of {len(v)} values are not finite")
     a = 100 * (1 - level) / 2
-    return {"median": float(np.median(v)), "ci_low": float(np.percentile(v, a)),
-            "ci_high": float(np.percentile(v, 100 - a)), "mean": float(v.mean()), "level": level}
+    n = len(v)
+    # hb1 fix 11 (L): the one estimator of both uncertainty files; the correctly rounded mean (exact rational
+    # arithmetic), so neither cancellation, overflow nor the order of the draws changes it
+    mean = float(statistics.mean(v.tolist()))
+    s = None
+
+    def lerp(p):          # numpy's linear rule without overflow: equal neighbours give that value exactly
+        h = (n - 1) * p / 100.0
+        k = int(math.floor(h))
+        t = h - k
+        if k + 1 >= n or s[k] == s[k + 1] or t == 0:
+            return float(s[k])
+        return float(s[k] * (1 - t) + s[k + 1] * t)
+    out = []
+    for p in (50.0, a, 100 - a):
+        x = float(np.median(v)) if p == 50.0 else float(np.percentile(v, p))
+        if not math.isfinite(x):       # numpy's interpolation overflowed near the largest float: this statistic only
+            s = np.sort(v) if s is None else s
+            x = lerp(p)
+        out.append(x)
+    med, lo, hi = out
+    return {"median": med, "ci_low": lo, "ci_high": hi, "mean": float(mean), "level": level}

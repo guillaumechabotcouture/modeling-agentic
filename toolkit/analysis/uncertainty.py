@@ -639,7 +639,8 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
     flagged = sorted((getattr(A, "flagged", None) or {}).values(), key=lambda f: str(f["unit"]))
     if flagged:        # calibration.joint.unmatched: flag: these units' values carry no calibrated match
         data["low_confidence_units"] = flagged
-    agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"])   # the signed level (Codex P1-11)
+    from toolkit.analysis.core import q as _q     # hb1 fix 11 (L): one estimator for this report and uncertainty.yaml
+    agg = _pu().summarise_outputs(outs, samples, nd, level=scope["level"], summary=_q)   # signed level (Codex P1-11)
     report = {"producer": PRODUCER, "produced_by": "harness", "n_draws": nd, "n_draws_requested": nd,
               "n_successful": nd - len(agg["errors"]), "n_failed": len(agg["errors"]), "seed": data["seed"],
               "interval_label": scope["label"], "interval": scope["interval"], "covers": scope["covers"],
@@ -711,6 +712,50 @@ def _self_test() -> int:
         if not c:
             fails.append(m)
 
+    # hb1 fix 11 (L, Codex r1 of #345): the one estimator both uncertainty files use is finite and accurate at the
+    # extremes, and gives numpy's values on ordinary draws
+    import math
+    from toolkit.analysis.core import q as _q
+    big = _pu().summarise_outputs([{"y": 9e307}, {"y": 1e308}], {}, 2, summary=_q)["scalar_outputs"]["y"]
+    ok(all(math.isfinite(big[k]) for k in ("mean", "median")) and abs(big["mean"] / 9.5e307 - 1) < 1e-12
+       and abs(big["median"] / 9.5e307 - 1) < 1e-12 and not big.get("degenerate"),
+       f"UQE1 draws near the largest float: finite mean and median, not flagged constant ({big})")
+    can = _q([1e16, 1.0, -1e16])
+    ok(abs(can["mean"] - 1.0 / 3.0) < 1e-15, f"UQE2 a mean with cancelling draws is exact ({can['mean']})")
+    s_, m_ = 2.0 ** 1023, sys.float_info.max
+    try:
+        e4 = [_q([s_, s_, -s_, -0.75 * s_, -0.25 * s_])["mean"], _q([s_, -s_, s_, -0.75 * s_, -0.25 * s_])["mean"],
+              _q([m_] * 3)["mean"]]
+    except OverflowError as e:
+        e4 = [f"OverflowError: {e}"]
+    ok(e4 == [0.0, 0.0, m_], f"UQE4 the overflow fallback of the mean is exact and order-free (Codex r2) ({e4})")
+    try:
+        e5 = _q([m_] * 4, level=0.8)
+        e5 = [e5[k] for k in ("ci_low", "median", "ci_high")]
+    except Exception as e:  # noqa: BLE001
+        e5 = [f"{type(e).__name__}"]
+    try:
+        e6 = _q(np.array([[1.0], [3.0]]))
+        e6 = (e6["mean"], e6["median"])
+    except Exception as e:  # noqa: BLE001
+        e6 = f"{type(e).__name__}"
+    ok(e5 == [m_, m_, m_] and e6 == (2.0, 2.0),
+       f"UQE5 identical draws at the largest float give equal quantiles; a column vector is read flat (Codex r2) "
+       f"({e5}, {e6})")
+    e7 = [_q([s_, s_, -s_, -s_, 0.1, 0.5])["mean"], _q([s_, -s_, s_, -s_, 0.1, 0.5])["mean"]]
+    try:
+        e8 = (_q(np.empty((2, 0))), str(_q([[1.0, np.nan], [np.nan, np.nan]])))
+    except ValueError as e:
+        e8 = (None, str(e))
+    except Exception as e:  # noqa: BLE001
+        e8 = (f"{type(e).__name__}", "")
+    ok(e7[0] == e7[1] == 0.1 and e8[0] is None and "3 of 4 values" in e8[1],
+       f"UQE6 the mean is the correctly rounded mean whatever the order; draws are counted flat (Codex r3) ({e7}, {e8})")
+    v_ = np.random.default_rng(3).normal(5.0, 2.0, 400)
+    q_ = _q(v_, 0.9)
+    ok(q_["median"] == float(np.median(v_)) and q_["ci_low"] == float(np.percentile(v_, 100 * (1 - 0.9) / 2))
+       and abs(q_["mean"] - float(v_.mean())) <= 1e-12 * abs(float(v_.mean())),
+       f"UQE3 on ordinary draws the median and bounds are numpy's, the mean equal to the last digits ({q_})")
     rng = np.random.default_rng(1)
     outs = [{"name": "b", "metric": "m2", "window": "w", "scale": "ratio"}, {"name": "a", "metric": "m1"}]
     vals = {"a": rng.normal(1.0, 0.1, 4000), "b": rng.normal(5.0, 1.0, 4000)}
