@@ -283,7 +283,7 @@ def _replay_stored(A, plan, uq, stored, log=None) -> dict:
     if why is None:
         D = UQ.Drawer(A, seed)
         D.prepare(nd)
-        for d, r in enumerate(UQ._draw_rows(A, D, k, label="figure data: re-evaluating stored draws")):
+        for d, r in enumerate(UQ._draw_rows(A, D, k, label="figure data: re-evaluating stored draws", log=log)):
             out, cost = r["out"], r["cost"]
             t = sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][plan[i]][A.primary] for i in A.ids)
             if not (_close(t, tot[d]) and _same_sums(_package_sums(A, plan, out, cost), per[d])):
