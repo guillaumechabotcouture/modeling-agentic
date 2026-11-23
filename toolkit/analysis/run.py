@@ -173,6 +173,8 @@ def run(run_dir: str, spec_rel: str = "decision_spec.yaml", adopt: dict | None =
 
 def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> dict:
     t0 = time.time()
+    compute_kw = dict(compute_kw or {})
+    fan_out = compute_kw.pop("draw_fanout", None) is True       # only the draw fan-out reads it, never compute.py
     run_dir = os.path.abspath(run_dir)
     spec_path = os.path.join(run_dir, spec_rel)
     spec = schema.load(spec_path)
@@ -189,6 +191,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     info = dict(_engine_info(eng), **({"net_effect_posterior_sha256": post["sha256"]} if post else {}))
     S = Store(run_dir, spec.sha256, st == "signed", info, spec.settings_sha256, spec.engine_choice_sha256)
     holder["S"] = S
+    from toolkit.analysis import draw_fanout as DFO_
+    from toolkit.analysis.artifacts import _safe_io as _sio
+    _sio().remove_nofollow(run_dir, DFO_.REL)    # an earlier analysis's fan-out record never stands for this one
     from toolkit.engines.benchmark_sources import load_evidence
     stale = load_evidence(eng).problems          # S1-2b: never an analysis on evidence the snapshot does not back
     if stale:
@@ -299,6 +304,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         arts["batch"] = S.write("batch", {"evaluation": "direct", "note": "the engine runs per unit, package and draw"},
                                 Bt.PRODUCER, data_in)
     A = Analysis(spec, model, log=log)
+    # direct evaluation: the uncertainty draws' engine runs fan out over the compute workers when the run has them
+    # (MA_COMPUTE_SCHEDULER) or the caller asks (draw_fanout: true); toolkit/analysis/draw_fanout.py
+    A.compute = dict(compute_kw or {}, run_dir=run_dir, **({"draw_fanout": True} if fan_out else {}))
+    if spec["analysis"].get("workers"):         # the same precedence as the other compute stages
+        A.compute.setdefault("max_workers", int(spec["analysis"]["workers"]))
+    from toolkit.analysis import draw_fanout as DFO
     if jc is not None:
         A.set_joint(jc)
         A.flagged = {f["unit"]: f for f in jc["unmatched_decision"]["flagged"]}
@@ -545,6 +556,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         # Codex r1 P1-2: the hash of the bytes the figure step reads, not of whatever the file holds when recorded
         fd_in = [(os.path.join(run_dir, FD.STORED_REL), hashlib.sha256(raw).hexdigest())]
     fdat = FD.compute(A, plan, out0, ben0, cost0, u["data"], z0, log=log, events=events0, stored=fd_stored)
+    if getattr(A, "draw_fanout", None):         # the smoke marker: the draws fanned out (backend, tasks, workers)
+        from toolkit.analysis.artifacts import _safe_io
+        _safe_io().write_nofollow(run_dir, DFO.REL, json.dumps(plain(A.draw_fanout), indent=1).encode(), atomic=True)
     arts["figure_data"] = S.write("figure_data", fdat, FD.PRODUCER, [arts["point"], arts["uncertainty"]] + fd_in)
     rend = FG.render(run_dir)
     figs = rend["figures"]
