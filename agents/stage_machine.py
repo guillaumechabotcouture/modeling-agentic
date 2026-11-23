@@ -6307,6 +6307,26 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     m.step()
     ok(m.st.state == "EVIDENCE", f"HS15 a capped try leaves a valid draft on disk: it is checked and used, whatever "
                                  f"changed during the try ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+    # HS16 (Codex r3 P1-1): the signed-configuration guard's problems go back to the drafter, whatever the backend
+    real_sc = AB.signed_config_problems
+    try:
+        AB.signed_config_problems = lambda spec: ["engine.config: more components than the engine's limit"]
+        m, T = go("hs16", ["good"])
+    finally:
+        AB.signed_config_problems = real_sc
+    ok(m.st.state == "SPEC" and any("engine's limit" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"HS16 the configuration guard's refusal reaches the drafter ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+    # HS17 (Codex r3 P1-2): feedback the pre-sign checks cannot verify (a rethink's reasons) is never cleared by a
+    # capped try whose old draft passes those checks; the reasons are carried to the next try
+    d17, T17, st17 = new_run("hs17", {})
+    StubTasks(T17.s).draft_spec("q", d17, None)          # the earlier, valid draft
+    st17.tries["spec_feedback"] = ["rethink after review round 1: the comparator answers another question"]
+    T17 = Scripted(dict(T17.s, tries=["capped"]))
+    m = Machine(d17, T17, st17, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m.step()
+    ok(m.st.state == "SPEC" and any("comparator" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"HS17 a capped try after a rethink keeps the rethink's reasons and does not pass on the old draft "
+       f"({m.st.state}, {m.st.tries.get('spec_feedback')})")
     # HS12 (Codex r1 P2-6): the cap on the feedback never drops this try's own problems
     many = [f"problem {i}" for i in range(45)]
     got12 = _carry_feedback(many, ["old one"])
