@@ -105,9 +105,8 @@ def _self_test() -> int:
     they run against this module, imported there as _stage_machine_under_test."""
     sys.modules["_stage_machine_under_test"] = sys.modules[__name__]
     d = os.path.join(REPO, "tests", "stage_machine")
-    for k, m in list(sys.modules.items()):  # a second call (another copy, another checkout) binds the cases afresh
-        if k.startswith("sm_selftest_") and os.path.basename(os.path.dirname(getattr(m, "__file__", None) or ""))                 == "stage_machine":
-            del sys.modules[k]
+    for k in ('sm_selftest_auto1a', 'sm_selftest_calibration_refused', 'sm_selftest_common', 'sm_selftest_core', 'sm_selftest_derived', 'sm_selftest_evidence', 'sm_selftest_geometry', 'sm_selftest_hb2_spec', 'sm_selftest_lead_amend', 'sm_selftest_lead_amend_r3', 'sm_selftest_lead_amend_r4', 'sm_selftest_lead_amend_r5', 'sm_selftest_resume', 'sm_selftest_spec_p1s', 'sm_selftest_writeup_rounds'):     # the generated case modules, whatever is cached under their names: loaded afresh here
+        sys.modules.pop(k, None)
     while d in sys.path:
         sys.path.remove(d)
     sys.path.insert(0, d)           # this checkout's cases, not another's
