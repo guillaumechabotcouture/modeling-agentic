@@ -56,7 +56,9 @@ REVIEWED = {
     "scripts/lib/siblings.py": {"spec_from_file_location": (2, "sibling script names written in the code")},
     "scripts/model_card.py": {"__import__": (1, "_sibling(name): sibling script names written in the code"),
                               "spec_from_file_location": (1, _REPO_FILE)},
-    "scripts/pipeline.py": {"spec_from_file_location": (1, _REPO_FILE)},
+    "scripts/pipeline.py": {"spec_from_file_location": (1, _REPO_FILE),
+                            "__import__": (1, "the derivation child preloads IMPORT_ALLOW (numpy, pandas, yaml), "
+                                              "names written in the code, before the audit hook")},
     "scripts/propagate_uncertainty.py": {"__import__": (1, "_sibling(name): sibling script names written in the code"),
                                          "spec_from_file_location": (1, _RUN_CODE)},
     "scripts/render_claims.py": {"spec_from_file_location": (2, _REPO_FILE)},

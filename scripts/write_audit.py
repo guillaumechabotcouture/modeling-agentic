@@ -300,7 +300,8 @@ REVIEWED: dict = {
         "shell-command": (1, "_run_cmd runs a step's declared `run` command (shell=True for a non-compute step): the "
                              "agent's own command, run in the run dir with the agent's reach; the harness writes "
                              "nothing through the shell, and the step's outputs are hashed after it exits"),
-        "shutil": (10, "the step's pyc cache and derivation work dirs (" + _TMP_REASON + "); the aside dir the harness "
+        "shutil": (11, "the step's pyc cache, derivation work dirs and the audit-hook probe dir (" + _TMP_REASON
+                       + "); the aside dir the harness "
                        "made (mkdtemp) and a planted .pipeline_aside_* dir, removed with rmtree, which removes links, "
                        "never their targets; the scratch copy (copytree with symlinks=True, a sibling temp dir the "
                        "harness made, then rmtree)"),
@@ -309,8 +310,9 @@ REVIEWED: dict = {
         "os-remove": (3, "inside the scratch copy the harness made: links re-pointed into the copy, and its own "
                          "manifest replaced"),
         "os-symlink": (1, "inside the scratch copy: a link re-pointed into the copy, never at the real run dir"),
-        "open-write": (3, "the scratch copy's manifest (its own file after the link is removed); the derivation's "
-                          "column-stripped input and mount points in its temporary work dirs")},
+        "open-write": (5, "the scratch copy's manifest (its own file after the link is removed); the derivation's "
+                          "column-stripped input and mount points in its temporary work dirs; the audit-hook probe's "
+                          "script and planted file, in the probe dir it made (mkdtemp)")},
     "scripts/plant_defects.py": {"open-write": (3, _EVAL), "shutil": (4, _EVAL)},
     "scripts/regression_eval.py": {"open-write": (4, _EVAL), "shutil": (1, _EVAL), "os-remove": (1, _EVAL)},
     "scripts/results_store.py": {"safeio-derived-root": (1, "download() streams to the path its caller names (the "
