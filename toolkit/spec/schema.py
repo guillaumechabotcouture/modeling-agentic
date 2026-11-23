@@ -156,6 +156,7 @@ import math
 import os
 import re
 import sys
+from collections.abc import Mapping
 
 import yaml
 
@@ -266,7 +267,7 @@ ENGINE_CHOICE = "engine_choice.json"
 
 
 def engine_is_auto(eng) -> bool:
-    return eng == "auto" or (isinstance(eng, dict) and eng.get("auto") is True)
+    return eng == "auto" or (isinstance(eng, Mapping) and eng.get("auto") is True)
 
 
 def _resolve_engine_choice(s: "Spec") -> None:
@@ -319,8 +320,14 @@ class Spec:
         self.derived = None          # derived-input obligations: None = when the run declares derivations
         if engine_is_auto(raw.get("engine")) and path is None:
             self.engine_auto = self.engine_pending = True      # a mapping with no file beside it: no choice to read
+        try:          # the engine declaration as signed (an engine choice replaces raw["engine"] later)
+            self.engine_declared = copy.deepcopy(raw.get("engine"))
+        except TypeError:
+            self.engine_declared = raw.get("engine")
         self._engine = None
+        self._engine_ref = None      # the engine declaration _engine was loaded from
         self._units = None
+        self._cal_scale = None
 
     def __getitem__(self, k):
         return self.raw[k]
@@ -344,12 +351,57 @@ class Spec:
         return sha256_file(self.engine_choice_path) if self.engine_choice_path else None
 
     # ---- engine
+    def _engine_key(self) -> str:
+        return json.dumps(self.raw.get("engine"), sort_keys=True, default=str)
+
     def engine(self):
         if self.engine_pending:
             raise SpecError(f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet")
-        if self._engine is None:
+        # loaded again when the spec's engine changed since (an engine set in place, with no key, is kept)
+        if self._engine is None or (self._engine_ref is not None and self._engine_ref != self._engine_key()):
             self._engine = load_engine(self.raw["engine"])
+            self._engine_ref = self._engine_key()
         return self._engine
+
+    def scale_cards(self):
+        """check_scale's cards for this spec: each signed candidate while the engine choice is pending (scale_cards
+        on the raw mapping), else the engine's own card (a read failure is the entry, so the check refuses)."""
+        if self.raw.get("engine") is None:
+            return None               # no engine named: the documented default, as for a raw mapping
+        if self.engine_pending or engine_is_auto(self.raw.get("engine")):
+            return scale_cards(self.raw)
+        try:
+            eng = self.engine()
+        except Exception as e:  # noqa: BLE001 -- fail closed
+            return [(self._engine_key(), e)]
+        return scale_cards(self.raw, engine=eng)
+
+    def check_scale(self) -> tuple[str | None, list[str]]:
+        """check_scale for this spec: the cards are read only when the answer depends on them (an attribute, and a
+        scale that is not a declared linear one)."""
+        cal = self.raw.get("calibration") if isinstance(self.raw, Mapping) else None
+        cal = cal if isinstance(cal, Mapping) else {}
+        try:
+            need = _scale_of(cal) != "linear" and isinstance(cal.get("attribute"), str)
+        except CalibrationScaleError as e:
+            return None, [str(e)]
+        return check_scale(cal, self.scale_cards() if need else None)
+
+    def calibration_scale(self) -> str:
+        """The calibrated attribute's scale (check_scale: declared, else from the engine card, else linear), or
+        CalibrationScaleError. An answer is kept per calibration attribute, declared scale and engine; a refusal (a
+        card read failure included) is never kept, so every call refuses until the card is read."""
+        cal = self.raw.get("calibration") if isinstance(self.raw, Mapping) else None
+        cal = cal if isinstance(cal, Mapping) else {}
+        key = (repr(cal.get("attribute")), "scale" in cal, repr(cal.get("scale")), self.engine_pending,
+               self._engine_key())
+        if self._cal_scale is not None and self._cal_scale[0] == key:
+            return self._cal_scale[1]
+        sc, bad = self.check_scale()
+        if bad:
+            raise CalibrationScaleError("; ".join(bad))
+        self._cal_scale = (key, sc)
+        return sc
 
     def horizon(self, windows: dict | None = None) -> Horizon:
         """The engine horizon; a DeliveryHorizon when the spec gives objective.delivery (else the contract's own)."""
@@ -687,9 +739,190 @@ def _binding_extras(v: dict) -> list[str]:
     return bad
 
 
-def attribute_notes(cal: dict, binding: dict) -> list[dict]:
+CALIBRATION_SCALES = ("log", "linear")
+
+
+class CalibrationScaleError(SpecError):
+    """The calibrated attribute's scale cannot be resolved: an invalid declared scale (null included), a log scale on
+    a card range going below 0, candidate cards that disagree, or an engine card that could not be read. Never a
+    silent fallback to another scale."""
+
+
+def card_scale(card, attr) -> str | None:
+    """The calibration scale an engine card implies for a unit attribute, from the attribute's valid range
+    (EngineCard.valid_ranges): "linear" when the range goes below 0, -inf included (exp(z) > 0 never produces such a
+    value, so a log scale cannot fit it), "log" otherwise (a range from 0 up: exp(z) reaches as close to 0 as the
+    calibration range asks, the default these attributes always had); None when the card gives no range."""
+    rng = (getattr(card, "valid_ranges", None) or {}).get(attr) if isinstance(attr, str) else None
+    try:
+        lo = float(rng[0])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    if math.isnan(lo):
+        return None
+    return "linear" if lo < 0 else "log"
+
+
+def _scale_of(cal: Mapping) -> str | None:
+    """The declared scale, None when undeclared; CalibrationScaleError for anything but log or linear (null too)."""
+    if "scale" not in cal:
+        return None
+    if cal["scale"] not in CALIBRATION_SCALES:
+        raise CalibrationScaleError(f"calibration.scale: log or linear (got {cal['scale']!r}; an explicit null is not "
+                                    "the default)")
+    return cal["scale"]
+
+
+def check_scale(cal, cards) -> tuple[str | None, list[str]]:
+    """(scale, problems): the one place the calibrated attribute's scale is decided and checked. The declared
+    calibration.scale; else what the engine cards imply for the attribute (card_scale; no range: linear); else, with
+    no engine to read (`cards` None), linear. `cards`: [(label, card or the exception its read raised)] for every
+    engine the scale can depend on (the engine; with engine: auto before the choice, each signed candidate).
+    Problems (scale None): an invalid declared scale; a log scale (declared or implied) on a card range going below
+    0; candidates implying different scales for an undeclared scale; a card that could not be read when the answer
+    depends on it (a declared linear scale does not). (Before: toolkit/analysis/batch.py read an undeclared scale as
+    log while attribute_notes read it as linear, so a log-named attribute on [-8, 2] was given exp(z) > 0.)"""
+    cal = cal if isinstance(cal, Mapping) else {}
+    try:
+        sc = _scale_of(cal)
+    except CalibrationScaleError as e:
+        return None, [str(e)]
+    a = cal.get("attribute")
+    if not isinstance(a, str) or not a or sc == "linear" or cards is None:
+        return sc or "linear", []
+    bad, implied = [], {}
+    for label, card in cards:
+        if isinstance(card, BaseException):
+            bad.append(f"calibration.scale: the engine card of {label} could not be read to resolve the scale of {a} "
+                       f"({type(card).__name__}: {str(card)[:200]}); no scale is assumed")
+            continue
+        cs = card_scale(card, a)
+        implied[label] = cs or "linear"
+        if cs == "linear" and sc == "log":
+            rng = (getattr(card, "valid_ranges", None) or {}).get(a)
+            bad.append(f"calibration.scale: log for {a}, whose engine card range {list(rng)} ({label}) includes "
+                       f"values below 0: a log scale sets {a} = exp(z) > 0 and cannot reach them. Declare scale: "
+                       f"linear (the range is then on {a}'s own scale)")
+    if bad:
+        return None, bad
+    if sc is None:
+        got = set(implied.values())
+        if len(got) > 1:
+            return None, [f"calibration.scale: undeclared, and the candidate engines' cards imply different scales "
+                          f"for {a} ({implied}); declare log or linear"]
+        sc = got.pop() if got else "linear"
+    return sc, []
+
+
+def calibration_scale(cal, card=None) -> str:
+    """check_scale against one card already in hand (None: no card): the scale, or CalibrationScaleError."""
+    sc, bad = check_scale(cal, [("the engine", card)] if card is not None else None)
+    if bad:
+        raise CalibrationScaleError("; ".join(bad))
+    return sc
+
+
+def _card_or_error(ref):
+    try:
+        return load_engine(ref).describe()
+    except Exception as e:  # noqa: BLE001 -- fail closed: check_scale refuses when the answer needs this card
+        return e
+
+
+def _auto_cards(raw: Mapping) -> list:
+    """[(ref, card or exception)] for engine: auto: the engines engine selection considers (the signed candidates,
+    else every registered engine: agents/analysis_backend.py candidate_entries), each built with the configuration
+    the selection gives it. A candidate whose card cannot be read that way, or that does not declare the calibrated
+    attribute, is one the selection never picks, so it is left out; when none is left, an entry that refuses."""
+    from agents import analysis_backend as AB
+    eng = raw.get("engine")
+    r = dict(raw, engine=dict(eng)) if isinstance(eng, Mapping) else dict(raw)
+    cal = r.get("calibration") if isinstance(r.get("calibration"), Mapping) else {}
+    a = cal.get("attribute")
+    out, why = [], []
+    try:
+        entries = AB.candidate_entries(r)
+    except Exception as e:  # noqa: BLE001 -- fail closed
+        return [("engine: auto", e)]
+    for entry in entries:
+        ref, card_path, cfg_fn = (tuple(entry) + (None, None))[:3]
+        try:
+            card = AB._card(ref, card_path, cfg_fn(r) if cfg_fn else {})
+        except Exception as e:  # noqa: BLE001 -- not a candidate the selection can pick
+            why.append(f"{ref}: card unreadable ({type(e).__name__}: {str(e)[:120]})")
+            continue
+        if a not in (getattr(card, "unit_attributes", None) or {}):
+            why.append(f"{ref}: does not declare {a}")
+            continue
+        out.append((ref, card))
+    return out or [("engine: auto", SpecError(f"no candidate engine can run the calibrated attribute {a} "
+                                              f"({'; '.join(why) or 'none listed'})"))]
+
+
+def scale_cards(raw: Mapping, engine=None):
+    """[(label, card or exception)] the scale of a raw spec mapping depends on: `engine` (an engine instance in hand)
+    or the engine the mapping names; with engine: auto, the engines the selection may pick (_auto_cards); None when
+    no engine is named."""
+    if engine is not None:
+        try:
+            return [(type(engine).__name__, engine.describe())]
+        except Exception as e:  # noqa: BLE001 -- fail closed
+            return [(type(engine).__name__, e)]
+    eng = raw.get("engine")
+    if eng is None:
+        return None
+    if engine_is_auto(eng):
+        return _auto_cards(raw)
+    label = eng if isinstance(eng, str) else eng.get("ref") if isinstance(eng, Mapping) else repr(eng)
+    return [(str(label), _card_or_error(dict(eng) if isinstance(eng, Mapping) else eng))]
+
+
+def resolved_scale(spec) -> str:
+    """The calibrated attribute's scale for a Spec (Spec.calibration_scale) or any raw spec mapping (read-only ones
+    included): check_scale against the cards of the engine(s) it names. Raises CalibrationScaleError, never falls
+    back. Every consumer (the batch design, the joint calibration, the figure-data rebuild) reads the scale here."""
+    if hasattr(spec, "calibration_scale"):
+        return spec.calibration_scale()
+    raw = spec if isinstance(spec, Mapping) else {}
+    cal = raw.get("calibration")
+    cal = cal if isinstance(cal, Mapping) else {}
+    try:
+        need = _scale_of(cal) != "linear" and isinstance(cal.get("attribute"), str)
+    except CalibrationScaleError:
+        need = False
+    sc, bad = check_scale(cal, scale_cards(raw) if need else None)
+    if bad:
+        raise CalibrationScaleError("; ".join(bad))
+    return sc
+
+
+def scale_problems(cal, card) -> list[str]:
+    """Pre-sign, one card in hand: check_scale's problems (a log scale for an attribute whose card range includes
+    negative values, an invalid declared scale). A range from 0 up is accepted: exp(z) reaches as close to 0 as the
+    calibration range asks (a seed share on a log range of tiny values is valid)."""
+    return check_scale(cal, [("the engine", card)] if card is not None else None)[1]
+
+
+def spec_scale_problems(s: "Spec") -> list[str]:
+    """Every path that signs or runs a spec checks its calibration scale here (Spec.check_scale: the engine's card,
+    or each signed candidate's while the choice is pending), whatever the calibration method (method none included:
+    the emulator design still consumes the attribute and its range)."""
+    cal = s.raw.get("calibration")
+    if not isinstance(cal, Mapping) or ("scale" not in cal and not isinstance(cal.get("attribute"), str)):
+        return []
+    bad = s.check_scale()[1]
+    dec = getattr(s, "engine_declared", None)
+    if engine_is_auto(dec) and not engine_is_auto(s.raw.get("engine")):
+        # an engine choice is written, but the signature covers engine: auto (the choice can be revisited): the
+        # scale must also hold on every engine the signed declaration lets the selection pick
+        bad += check_scale(cal, scale_cards(dict(s.raw, engine=dec)))[1]
+    return list(dict.fromkeys(bad))
+
+
+def attribute_notes(cal: dict, binding: dict, scale: str | None = None) -> list[dict]:
     """[{attribute, limitation, card_prior, run_prior}] for the unit attribute a calibration moves, when its card gives
-    a limitation."""
+    a limitation. `scale`: the spec's resolved scale (Spec.calibration_scale), which the run's prior is on; without
+    it, the declared scale, else linear."""
     cal = cal if isinstance(cal, dict) else {}
     a = cal.get("attribute")
     if cal.get("method") in (None, "none") or not isinstance(a, str) or not a:
@@ -699,7 +932,7 @@ def attribute_notes(cal: dict, binding: dict) -> list[dict]:
         return []
     run = (cal.get("priors") or {}).get(a) if isinstance(cal.get("priors"), dict) else None
     return [{"attribute": a, "limitation": rule["limitation"].strip(), "card_prior": rule.get("prior"),
-             "run_prior": run if isinstance(run, dict) else None, "scale": str(cal.get("scale") or "linear")}]
+             "run_prior": run if isinstance(run, dict) else None, "scale": str(scale or cal.get("scale") or "linear")}]
 
 
 def _prior_text(p, scale: str = "linear", attr: str = "") -> str:
@@ -1192,6 +1425,12 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
     m = cal.get("method") if isinstance(cal, dict) else None
     if m not in CALIBRATION_METHODS:
         return [f"calibration.method: one of {CALIBRATION_METHODS}"]
+    # the scale on every method and path (method none and observed targets included): spec_scale_problems, run
+    # by validate() as the shared precondition calibration_scale (toolkit/spec/preconditions.py)
+    return _validate_calibration_method(s, card, pnames, cols, cal, m)
+
+
+def _validate_calibration_method(s, card, pnames, cols, cal, m) -> list[str]:
     from toolkit.analysis import observed_targets as OT
     if OT.applies(s):          # posterior on observations of group states and outcomes, through declared sources
         return OT.problems(s, card, pnames)
@@ -1202,9 +1441,8 @@ def _validate_calibration(s, card, pnames, cols) -> list[str]:
         bad.append(f"calibration.attribute: {cal['attribute']} is not declared by the engine")
     rg = cal["range"]
     if not (isinstance(rg, list) and len(rg) == 2 and all(_isnum(x) for x in rg) and rg[0] < rg[1]):
-        bad.append("calibration.range: [lo, hi] on the attribute's scale (log by default)")
-    if cal.get("scale", "log") not in ("log", "linear"):
-        bad.append("calibration.scale: log or linear")
+        bad.append("calibration.range: [lo, hi] on the attribute's scale (calibration.scale; when undeclared, what "
+                   "the engine card's range implies, else linear)")
     if m == "emulator_inversion":
         if cal["target_column"] not in cols:
             bad.append(f"calibration.target_column: the units table has no column {cal['target_column']}")
@@ -2013,6 +2251,166 @@ def _self_test() -> int:
             "SP3 a component mapped to an unknown engine value is refused")
         bad(lambda r: r["calibration"].update(target_column="nope"), "no column nope",
             "SP4 a missing calibration target column is refused")
+        bad(lambda r: r["calibration"].update(scale="log"), "includes values below 0",
+            "SP4s a log scale for an attribute whose card range includes negative values is refused before sign-off")
+        import types as _types
+        cneg, cpos = (_types.SimpleNamespace(valid_ranges={"a": [-8, 2]}), _types.SimpleNamespace(valid_ranges={"a": [0.2, 9]}))
+        ok(calibration_scale({"attribute": "a"}, cneg) == "linear" and calibration_scale({"attribute": "a"}, cpos) == "log"
+           and calibration_scale({"attribute": "a"}, None) == "linear"
+           and calibration_scale({"attribute": "a", "scale": "log"}, cpos) == "log"
+           and calibration_scale({"attribute": "a", "scale": "linear"}, cpos) == "linear"
+           and calibration_scale({"attribute": "a"}, _types.SimpleNamespace(valid_ranges={"a": [0.0, 1.0]})) == "log",
+           "SP4t one scale default: declared, else the card's range (below 0: linear; from 0 up: log), else linear")
+        try:
+            calibration_scale({"attribute": "a", "scale": "log"}, cneg)
+            neg = "resolved"
+        except CalibrationScaleError as e:
+            neg = f"refused: {e}"
+        ok(neg.startswith("refused") and "below 0" in neg,
+           f"SP4t2 the resolution itself refuses a declared log scale on a card range going below 0 ({neg[:120]})")
+        bad(lambda r: r["calibration"].update(scale=None), "calibration.scale: log or linear",
+            "SP4v an explicit null scale is refused, not read as the default")
+        czero = _types.SimpleNamespace(valid_ranges={"a": [0.0, 0.1]})
+        ok(not scale_problems({"attribute": "a", "scale": "log", "range": [-13.8, -9.2]}, czero),
+           "SP4w a log scale on a card range from 0 up (tiny positive values) is accepted")
+        raw_r = copy.deepcopy(s.raw)
+        raw_r["calibration"].pop("scale", None)
+        ok(resolved_scale(raw_r) == resolved_scale(Spec(raw_r, d)) == "linear",
+           f"SP4x a raw mapping and its Spec resolve the same scale from the engine card ({resolved_scale(raw_r)})")
+        ok(scale_problems({"attribute": "a", "scale": "log"}, cneg) and not scale_problems({"attribute": "a"}, cneg)
+           and not scale_problems({"attribute": "a", "scale": "log"}, cpos),
+           "SP4u only a declared log scale on a card range going below 0 is refused")
+        # Codex r2 of #334: one resolution that fails closed, reached by every path that consumes the scale
+        import types as _ty
+        from types import MappingProxyType as _MP
+
+        class _Flaky:          # a card read that fails once, then answers [0, 0.1] (a log range)
+            n = 0
+
+            def describe(self):
+                _Flaky.n += 1
+                if _Flaky.n == 1:
+                    raise OSError("planted: card unreadable")
+                return _ty.SimpleNamespace(valid_ranges={"seed": [0, 0.1]})
+        rf = copy.deepcopy(s.raw)
+        rf["calibration"].pop("scale", None)
+        rf["calibration"]["attribute"] = "seed"
+        sf = Spec(rf, d)
+        sf._engine = _Flaky()
+        try:
+            got1 = sf.calibration_scale()
+        except SpecError as e:
+            got1 = f"refused: {e}"
+        ok(str(got1).startswith("refused") and "card" in str(got1),
+           f"SP4y (r2 P1-1) a failed card read refuses the scale instead of falling back to linear ({got1})")
+        rb = copy.deepcopy(rf)
+        rb["engine"] = {"ref": "toolkit.engines.contract:NoSuchEngine"}
+        try:
+            got2 = resolved_scale(rb)
+        except SpecError as e:
+            got2 = f"refused: {e}"
+        ok(str(got2).startswith("refused"),
+           f"SP4y2 (r2 P1-1) a raw mapping whose engine card cannot be read refuses too ({got2})")
+        r_pl = copy.deepcopy(s.raw)
+        r_pl["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}
+        r_pl["calibration"]["scale"] = "log"
+        e_log = validate(Spec(r_pl, d), pending_ok=True)
+        r_pl["calibration"]["scale"] = None
+        e_nul = validate(Spec(r_pl, d), pending_ok=True)
+        ok(any("below 0" in e for e in e_log) and any("calibration.scale" in e for e in e_nul),
+           f"SP4z (r2 P1-3) sign-off with the engine pending checks the scale against every candidate's card "
+           f"({e_log[-2:]}, {e_nul[-2:]})")
+        r_pu = copy.deepcopy(s.raw)
+        r_pu["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine",
+                                                       "toolkit.engines.compartmental.engine:CompartmentalEngine"]}
+        r_pu["calibration"].pop("scale", None)
+        r_pu["calibration"]["attribute"] = "seed"
+        e_und = validate(Spec(r_pu, d), pending_ok=True)
+        ok(any("calibration.scale" in e for e in e_und),
+           f"SP4z2 (r2 P1-3) an undeclared scale is refused at sign-off when the candidates' cards cannot settle it "
+           f"({e_und[-2:]})")
+
+        def _none(r, sc):
+            r["calibration"]["method"] = "none"
+            r["calibration"]["scale"] = sc
+            r["uncertainty"]["sources"] = [x for x in r["uncertainty"]["sources"] if x.get("kind") != "calibration"]
+            r["uncertainty"]["excluded"] = r["uncertainty"]["excluded"] + [{"kind": "calibration", "reason": "toy"}]
+        bad(lambda r: _none(r, "log"), "below 0",
+            "SP4aa (r2 P1-4) method none still has its scale checked (the emulator design consumes the attribute)")
+        bad(lambda r: _none(r, None), "calibration.scale",
+            "SP4aa2 (r2 P1-4) method none refuses an explicit null scale too")
+        r_ch = copy.deepcopy(s.raw)
+        r_ch["calibration"].pop("scale", None)
+        s_ch = Spec(r_ch, d)
+        first = s_ch.calibration_scale()
+        r_ch["engine"] = {"ref": "toolkit.engines.renewal.engine:RenewalEngine",
+                          "config": {"generation_interval": [1.0]}}
+        r_ch["calibration"]["attribute"] = "seed"
+        got_s, got_r = s_ch.calibration_scale(), resolved_scale(copy.deepcopy(r_ch))
+        ok(first == "linear" and got_s == got_r == "log" and type(s_ch.engine()).__name__ == "RenewalEngine",
+           f"SP4ab (r2 P1-5) a Spec whose engine changed reads the new engine's card ({first}, {got_s}, {got_r}, "
+           f"{type(s_ch.engine()).__name__})")
+        mp = _MP({"calibration": {"attribute": "seed", "scale": "log"}})
+        ok(resolved_scale(mp) == "log", "SP4ac (r2 P1-6) a read-only mapping keeps its declared scale")
+        cinf = _ty.SimpleNamespace(valid_ranges={"x": [-math.inf, 0]})
+        ok(scale_problems({"attribute": "x", "scale": "log"}, cinf) != [] and card_scale(cinf, "x") == "linear",
+           "SP4ad (r2 P1-7) a card range from -inf is a range going below 0: a log scale is refused")
+        # Codex r3 of #334
+        import json as _json
+        import yaml as _yaml
+        from unittest import mock as _mock
+        from toolkit.spec import preconditions as _PC
+        r_pc = copy.deepcopy(s.raw)
+        r_pc["calibration"]["scale"] = None
+        pc_bad = _PC.problems(d, None, "owner", spec=Spec(r_pc, d))
+        ok(any("calibration.scale" in e for e in pc_bad),
+           f"SP4ae (r3 P1-1) the shared signing preconditions run the scale check ({pc_bad[-2:]})")
+        with tempfile.TemporaryDirectory() as dc:
+            r_ec = copy.deepcopy(s.raw)
+            r_ec["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}
+            r_ec["calibration"].update(attribute="seed", scale="log")
+            with open(os.path.join(dc, "decision_spec.yaml"), "w") as f:
+                _yaml.safe_dump(r_ec, f)
+            with open(os.path.join(dc, ENGINE_CHOICE), "w") as f:
+                _json.dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine"}}, f)
+            with _mock.patch(f"{__name__}._auto_cards", create=True, new=
+                             lambda raw: [("planted", _ty.SimpleNamespace(valid_ranges={"seed": [-1, 1]}))]):
+                s_ec = load(os.path.join(dc, "decision_spec.yaml"))
+                ec_bad = spec_scale_problems(s_ec)
+            ok(not s_ec.engine_pending and any("below 0" in e and "planted" in e for e in ec_bad),
+               f"SP4af (r3 P1-2) with an engine choice written, the scale is still checked against the signed "
+               f"candidates of engine: auto ({ec_bad})")
+        r_pr = copy.deepcopy(s.raw)
+        r_pr["engine"] = {"auto": True, "candidates": ["toolkit.engines.empirical.engine:PackageRateEngine"]}
+        r_pr["calibration"].pop("scale", None)
+        r_pr["calibration"]["attribute"] = "log_rate"
+        s_pr = Spec(r_pr, d)
+        pr_bad = spec_scale_problems(s_pr)
+        ok(pr_bad == [] and s_pr.calibration_scale() == "linear",
+           f"SP4ag (r3 P1-3) a candidate is read with the configuration engine selection gives it ({pr_bad})")
+        r_sw = copy.deepcopy(s.raw)
+        r_sw["calibration"].pop("scale", None)
+        s_sw = Spec(r_sw, d)
+        s_sw.calibration_scale()
+        r_sw["engine"] = {"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}
+        try:
+            sw = s_sw.calibration_scale()
+        except SpecError as e:
+            sw = f"refused: {e}"
+        ok(sw == "linear", f"SP4ah (r3 P2-4) a Spec switched to engine: auto in place reads the candidates ({sw})")
+        mp_auto = _MP({"engine": _MP({"auto": True, "candidates": ["toolkit.engines.contract:ToyEngine"]}),
+                       "calibration": {"attribute": "x"}})
+        try:
+            mpa = resolved_scale(mp_auto)
+        except SpecError as e:
+            mpa = f"refused: {e}"
+        ok(mpa == "linear", f"SP4ai (r3 P2-5) a read-only engine: auto mapping keeps its candidates ({mpa})")
+        try:
+            ne = resolved_scale(Spec({"calibration": {"attribute": "x"}}, d))
+        except SpecError as e:
+            ne = f"refused: {e}"
+        ok(ne == resolved_scale({"calibration": {"attribute": "x"}}) == "linear",
+           f"SP4aj (r3 P2-6) a Spec naming no engine has the documented default, as its raw mapping does ({ne})")
         bad(lambda r: r["comparator"].update(package="x"), "comparator", "SP5 an unknown comparator is refused")
         bad(lambda r: r["options"]["cost_items"].pop(), "no cost item",
             "SP6 a packaged component without a cost item is refused (toolkit/alloc)")
@@ -2561,6 +2959,11 @@ def _self_test_derived(ok) -> None:
                                  "priors": {"a": {"dist": "uniform", "range": [-0.693, 0.0953], "source": "p"}}}, b)
         n_beta = attribute_notes({"method": "posterior", "attribute": "a",
                                   "priors": {"a": {"dist": "beta", "a": 2.0, "b": 5.0, "source": "p"}}}, b)
+        n_res = attribute_notes({"method": "posterior", "attribute": "a",
+                                 "priors": {"a": {"dist": "uniform", "range": [-0.693, 0.0953], "source": "p"}}}, b,
+                                scale="log")
+        ok(n_res and n_res[0]["scale"] == "log",
+           "AB3c an undeclared scale is shown as the spec resolved it (the engine card's), not read as linear")
         md_log, md_beta = "\n".join(attribute_notes_markdown(n_log)), "\n".join(attribute_notes_markdown(n_beta))
         ok("log scale" in md_log and "exp" in md_log and "a=2" in md_beta and "None" not in md_beta,
            f"AB3b (Codex r3 P2-3) the run's prior is shown on its declared scale, and a beta prior by its shape "

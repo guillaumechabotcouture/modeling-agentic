@@ -321,12 +321,15 @@ def compute(A, plan, out0, ben0, cost0, uq: dict | None, z0: dict | None = None,
     return out
 
 
-def derived_fields(spec_raw: dict) -> list[str]:
+def derived_fields(spec_raw: dict, scale: str | None = None) -> list[str]:
     """The job inputs computed by a transcendental function, so a platform's libm can move their last bits: the
     calibrated attribute on the log scale (batch.calibrated_value: exp(z)). Every other input is source-bound (copied
-    from the units table, the spec or the design) and must match exactly."""
+    from the units table, the spec or the design) and must match exactly. `scale`: the spec's resolved scale
+    (Spec.calibration_scale); without it, the mapping's own resolution (schema.resolved_scale, the engine card
+    included)."""
+    from toolkit.spec import schema as _schema
     cal = (spec_raw or {}).get("calibration") or {}
-    if cal.get("attribute") and cal.get("scale", "log") == "log":
+    if cal.get("attribute") and (scale or _schema.resolved_scale(spec_raw or {})) == "log":
         return [f"unit.{cal['attribute']}"]
     return []
 
@@ -411,7 +414,7 @@ def rebuild(run_dir: str, log=print):
     if _canon(stored) != _canon(design):
         raise RebuildRefused("the stored batch design differs from the spec's design (a shipped batch?)")
     res, by_ulp, other = {}, [], []
-    dfields = derived_fields(spec.raw)
+    dfields = derived_fields(spec.raw, spec.calibration_scale())
     with open(rows) as f:
         for line in f:
             r = json.loads(line)
@@ -566,8 +569,14 @@ def _self_test() -> int:
            "FD19 the ulp tolerance covers only the declared derived fields")
         lg = copy.deepcopy(A.spec.raw)
         lg["calibration"]["scale"] = "log"
-        ok(derived_fields(lg) == ["unit.x"] and derived_fields(A.spec.raw) == [],
-           f"FD19b the derived field is the calibrated attribute on the log scale only: {derived_fields(lg)}")
+        try:
+            refused = f"resolved {derived_fields(lg)}"
+        except Exception as e:  # noqa: BLE001 -- the scale check's refusal expected
+            refused = f"refused: {type(e).__name__}"
+        ok(derived_fields(A.spec.raw, "log") == ["unit.x"] and derived_fields(A.spec.raw) == []
+           and refused == "refused: CalibrationScaleError",
+           f"FD19b the derived field is the calibrated attribute on the log scale only, and a log scale the engine "
+           f"card refuses is refused here too ({refused})")
         rewrite(lambda n, r: r["result"]["provenance"].update(job_sha="0" * 64) if n == 5 else None)
         try:
             rebuild(d, log=q)

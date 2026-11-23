@@ -109,7 +109,11 @@ def design_box(spec, eng) -> tuple:
 
 
 def calibrated_value(spec, z: float) -> float:
-    return float(math.exp(z)) if spec["calibration"].get("scale", "log") == "log" else float(z)
+    """The calibrated attribute from its fitted value z: exp(z) on the log scale, z on the linear one. The scale is
+    the spec's one resolution (toolkit/spec/schema.py calibration_scale: declared, else from the engine card, else
+    linear)."""
+    from toolkit.spec import schema as _schema
+    return float(math.exp(z)) if _schema.resolved_scale(spec) == "log" else float(z)
 
 
 def windows(spec) -> dict:
@@ -1058,6 +1062,36 @@ def _self_test() -> int:
         o4 = cover_features([0, 1], {1}, [[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]])
         ok(o4 == [3, 1], f"BA-XU7 of the units tied at a missing extreme, one that can take a training point is used: {o4}")
     case("BA-XU2", bxu2)
+
+    def ba_sc1():
+        # eval baseline: a log-named attribute on [-8, 2] with no declared scale was read on the log scale (exp(z) > 0),
+        # so the likelihood fit ran into the bound and was refused. Undeclared now follows the engine card (a range
+        # going below 0: linear), and the same toy panel calibrates with no parameter at a bound.
+        import yaml
+        from toolkit.analysis import run as R
+        from toolkit.analysis.calibration import CalibrationRefused, fit_likelihood
+        from toolkit.analysis.model import DirectModel
+        from toolkit.spec.schema import load
+        with tempfile.TemporaryDirectory() as d:
+            R._direct_toy(d)
+            sp = os.path.join(d, "decision_spec.yaml")
+            raw = yaml.safe_load(open(sp))
+            raw["calibration"].pop("scale", None)
+            yaml.safe_dump(raw, open(sp, "w"))
+            spec = load(sp)
+            m = DirectModel(spec, log=lambda *a: None)
+            m.fit()
+            try:
+                fit = fit_likelihood(spec, m, identifiability=False)
+                dg = fit["diagnostics"]
+                good = fit["cov"] is not None and not dg["at_bound"] and dg.get("converged") is True
+                why = {"at_bound": dg["at_bound"], "converged": dg.get("converged")}
+            except CalibrationRefused as e:
+                good, why = False, str(e)[:200]
+            ok(spec.calibration_scale() == "linear" and calibrated_value(spec, -1.0) == -1.0 and good,
+               f"BA-SC1 an undeclared scale for an attribute whose card range goes below 0 is linear, and the toy panel "
+               f"calibrates ({spec.calibration_scale()}, {why})")
+    case("BA-SC1", ba_sc1)
     if fails:
         print(f"FAILED: {len(fails)} self-test case(s)")
         return 1
