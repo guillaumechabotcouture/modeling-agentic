@@ -389,7 +389,17 @@ def answer_for(answers: dict, fid: str, *, kind, fix_requires, claim) -> dict | 
     got = [a for fp in (answer_fingerprint(fid, kind=kind, fix_requires=fix_requires, claim=claim),
                         legacy_fingerprint(fid, claim, fix_requires))
            for a in [answers.get(fp)] if isinstance(a, dict) and str(a.get("finding")) == fid]
-    return min(got, key=lambda a: (a.get("by") != "owner", a.get("decision") != "decline"), default=None)
+    best = min(got, key=lambda a: (a.get("by") != "owner", a.get("decision") != "decline"), default=None)
+    if best is None or best.get("by") == "lead":
+        # the lead never answers over the owner's decline of this finding (same id and kind) under any wording, an
+        # older one included (Codex r3 of #357, P1-3); the owner is asked again under the owner's own sign-off
+        dec = next((a for a in answers.values() if isinstance(a, dict) and str(a.get("finding")) == fid
+                    and a.get("by") == "owner" and a.get("decision") == "decline"
+                    and str(a.get("kind") or kind or "") == str(kind or "")), None)
+        if dec is not None and (best is not None or any(isinstance(a, dict) and a.get("by") == "lead"
+                                                        for a in answers.values())):
+            return dec
+    return best
 
 
 def harness_gap_key(f) -> str:
@@ -449,8 +459,9 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
     conf, p4 = from_conflicts(run_dir)          # W0-F: declared evidence conflicts (analysis/conflicts.yaml)
     problems += p4
     # hb2 fix 1: the gate findings whose resolution is the owner's and which this gate read as accepted
-    signed = {gate_id(v): v["owner_signed"] for v in ((decision or {}).get("rigor_violations") or [])
-              if isinstance(decision, dict) and isinstance(v, dict) and v.get("owner_resolution")
+    rv = decision.get("rigor_violations") if isinstance(decision, dict) else None      # P2-15: guard before .get
+    signed = {gate_id(v): v["owner_signed"] for v in (rv if isinstance(rv, list) else [])
+              if isinstance(v, dict) and v.get("owner_resolution")
               and isinstance(v.get("owner_signed"), dict) and not v.get("owner_signoff")}
 
     def held(f) -> bool:      # the answer still binds the finding as it reads now (hb2 fix 3: not its wording)
@@ -541,6 +552,15 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         s_ = signed.get(f.id)
         if s_ is not None and f.status == "owner_accepted":
             f.blocking = False             # from_gate blocks by kind; an accepted one does not block (P2-12)
+            last = next((e for e in reversed(f.events or []) if isinstance(e, dict)
+                         and e.get("status") == "owner_accepted"), {})
+            if s_.get("fingerprint") and last.get("fingerprint") != s_.get("fingerprint"):
+                # another accepted version of the test is the one this gate read: its accept is the record
+                # (Codex r3 of #357, P1-4), whatever was accepted last
+                f.events.append({"round": round_n, "status": "owner_accepted",
+                                 "by": "lead" if s_.get("by") == "lead" else "owner",
+                                 **({"provisional": True} if s_.get("provisional") else {}),
+                                 **{k: s_[k] for k in ("at", "record", "result_sha256", "fingerprint") if s_.get(k)}})
         if s_ is not None and f.status in ("open", "declared"):
             f.status, f.resolution_type, f.blocking = "owner_accepted", "owner_decision", False
             _event(f, round_n, f.status, "lead" if s_.get("by") == "lead" else "owner",
@@ -821,6 +841,27 @@ def _self_test() -> int:
         b24 = sync(d, g24, 1)[0]["decision_test_changes_plan:DT1"].blocking
         s24 = sync(d, {"rigor_violations": [], "unresolved_high": []}, 1, post_write=True)[0][
             "decision_test_changes_plan:DT1"].status
+    # L25 (Codex r3 of #357): the lead never answers over an owner's decline under an older wording (P1-3); the
+    # accept of the version this gate read is the record (P1-4); a malformed gate document is a problem (P2-15)
+    fx_ = "Owner amendment: add it."
+    ans25 = {legacy_fingerprint("D-036", "old wording", fx_): {"finding": "D-036", "decision": "decline",
+                                                              "by": "owner", "kind": CRITIC_KIND},
+             answer_fingerprint("D-036", kind=CRITIC_KIND, fix_requires=fx_, claim="new"): {
+                 "finding": "D-036", "decision": "accept", "by": "lead", "provisional": True}}
+    a25 = answer_for(ans25, "D-036", kind=CRITIC_KIND, fix_requires=fx_, claim="new wording")
+    with tempfile.TemporaryDirectory() as d:
+        v = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "claim": "c", "key": "DT1",
+             "owner_resolution": True}
+        mk25 = lambda fp: {"rigor_violations": [dict(v, owner_signed={"by": "owner", "fingerprint": fp})],  # noqa: E731
+                           "unresolved_high": []}
+        sync(d, mk25("A"), 1)
+        sync(d, mk25("B"), 2)
+        e25 = [e for e in sync(d, mk25("A"), 3)[0]["decision_test_changes_plan:DT1"].events
+               if e.get("status") == "owner_accepted"][-1]
+        _l, p25 = sync(d, ["unexpected"], 4)
+    ok((a25 or {}).get("decision") == "decline" and e25.get("fingerprint") == "A" and p25,
+       f"L25 an owner decline holds against a lead accept under another wording; the accept read now is the record; a "
+       f"malformed gate is reported ({a25}, {e25}, {p25})")
     ok(b24 is False and s24 == "fixed",
        f"L24 an accepted test does not block on a second sync; gone post-write, it is closed ({b24}, {s24})")
     # L_OWNER_LEAD (1F, D2): a lead's recorded answer counts only when the run is a --signoff lead run
