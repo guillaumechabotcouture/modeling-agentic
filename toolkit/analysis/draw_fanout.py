@@ -20,7 +20,13 @@ self-test of that engine: its results do not depend on how pairs are grouped), a
 results, fitted values, priors, file paths in its config) lie where compute.py ships them to workers (the repo's
 toolkit/ and scripts/, the run's models/ and data/). Any other engine keeps its draws in-process, and the reason is
 logged (`A.draw_fanout_off`). Codex review of #347: the package-rate engine multiplies rate ratios in frozenset order,
-which depends on each process's hash seed, so it is not fanned out.
+which depends on each process's hash seed, so it is not fanned out. Inputs that a JSON round trip would change
+(mapping keys that are not text) also stay in-process, since a task may cross to a worker as JSON.
+
+Limits, as they are. A wave holds at most WAVE_PAIRS engine outcomes, but never less than one whole draw: a draw with
+more pairs is held whole, as the in-process evaluation holds it. `max_workers` (from compute_kw or
+`analysis.workers`) reaches compute.py as for the batch stage; compute.py's tagged Dask pool does not apply it
+(its own MA_COMPUTE_* settings govern that pool, for every stage).
 """
 from __future__ import annotations
 
@@ -64,12 +70,32 @@ def _engine_files(A) -> list:
 
 
 def _shipped(path: str, run_dir: str) -> bool:
-    """Whether compute.py ships this file to its workers at the same path (the repo's code dirs, the run's models/ and
-    data/)."""
-    rp = os.path.realpath(path)
-    roots = [os.path.join(ROOT, d) for d in ("toolkit", "scripts")] + [os.path.join(os.path.realpath(run_dir), d)
-                                                                      for d in ("models", "data")]
-    return any(rp == r or rp.startswith(r + os.sep) for r in roots)
+    """Whether compute.make_bundle ships this file to its workers at the same path, under its own rules: inside the
+    run's models/ or data/ or the repo's code dirs, in no __pycache__, .git or _truth* directory, not a file
+    `_bundle_skips` leaves out (logs, batch records), and within the size limit (Codex r2 P1-3)."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import compute
+    rp, rd = os.path.realpath(path), os.path.realpath(run_dir)
+    roots = [os.path.join(rd, "models"), os.path.join(rd, "data")] + [os.path.join(compute.REPO, x)
+                                                                     for x in compute.REPO_CODE_DIRS]
+    root = next((r for r in roots if rp.startswith(r + os.sep)), None)
+    if root is None or not os.path.isfile(rp):
+        return False
+    parts = os.path.relpath(os.path.dirname(rp), root).split(os.sep)
+    if any(x in ("__pycache__", ".git") or x.startswith("_truth") for x in parts):
+        return False
+    dp, fn = os.path.split(rp)
+    if compute._bundle_skips(fn, set(os.listdir(dp)), root == os.path.join(rd, "data"), dp == os.path.join(rd, "models")):
+        return False
+    return os.path.getsize(rp) <= compute.DEFAULT_MAX_FILE_MB * 2 ** 20
+
+
+def _wire_safe(x) -> bool:
+    """Whether a JSON round trip gives the same value back (tasks may cross to workers as JSON)."""
+    try:
+        return json.loads(json.dumps(x)) == x
+    except (TypeError, ValueError):
+        return False
 
 
 def config(A) -> dict | None:
@@ -91,6 +117,8 @@ def config(A) -> dict | None:
         out = [f for f in _engine_files(A) if not _shipped(f, kw["run_dir"])]
         if out:
             off = f"engine input files lie outside what compute.py ships to workers ({', '.join(out[:3])})"
+        elif not _wire_safe([A.spec["engine"], A.model.attrs, dict(A.theta0)]):
+            off = "the engine config, unit attributes or parameters change in a JSON round trip (non-text keys)"
     if off is not None:
         A.__dict__["draw_fanout_off"] = off
         if not A.__dict__.get("_draw_fanout_logged"):
@@ -162,6 +190,12 @@ def run_task(task: dict) -> dict:
             "task_sha": _sha(task), "engine": engine_identity(eng)}
 
 
+def _row_ok(task, row, ident) -> bool:
+    res = row.get("result") or {}
+    return bool(row.get("ok")) and res.get("task_sha") == _sha(task) and res.get("engine") == ident \
+        and len(res.get("rows") or []) == len(task["members"])
+
+
 def wave_size(A) -> int:
     """Draws per wave: WAVE, fewer when a draw has many engine runs (WAVE_PAIRS bounds the outcomes held)."""
     n = max(1, len(A.ids) * len(A.model.packages))
@@ -177,19 +211,25 @@ def prefetch(A, drawn, kw) -> list[dict]:
     per = [tasks(A, th, zs) for th, zs in drawn]
     flat = [t for ts in per for t in ts]
     t0 = time.time()
-    lim = int(kw.get("max_tasks") or compute.DEFAULT_MAX_TASKS)     # Codex r1 P2-5: calls within the task limit
-    rows, summ, ncalls = [], {}, 0
-    for a in range(0, len(flat), lim):
+    lim = int(kw["max_tasks"]) if kw.get("max_tasks") is not None else compute.DEFAULT_MAX_TASKS
+    if lim < 1:          # Codex r2 P1-5: a non-positive limit is refused, never read as "no limit"
+        raise ValueError(f"draw fan-out: max_tasks must be positive (got {kw.get('max_tasks')})")
+    rows, summ, ncalls, nworkers = [], {}, 0, 0
+    ident = engine_identity(A.eng)
+    for a in range(0, len(flat), lim):       # Codex r1 P2-5: calls within the task limit, in draw order
+        part = flat[a:a + lim]
         r_, summ = compute.map_fn(kw["run_dir"], os.path.join(ROOT, "toolkit", "analysis", "draw_fanout.py")
-                                  + "::run_task", flat[a:a + lim], max_tasks=lim,
+                                  + "::run_task", part, max_tasks=lim,
                                   purpose="v2 analysis: uncertainty draws (direct evaluation)",
                                   **{k: kw[k] for k in MAP_KEYS if k in kw})
-        rows += list(r_)
+        r_ = list(r_)
         ncalls += 1
-    ident = engine_identity(A.eng)
-    bad = [n for n, (t, r) in enumerate(zip(flat, rows)) if not r.get("ok") or (r.get("result") or {}).get("task_sha")
-           != _sha(t) or (r.get("result") or {}).get("engine") != ident
-           or len((r.get("result") or {}).get("rows") or []) != len(t["members"])]
+        nworkers = max(nworkers, int(summ.get("workers") or 0))
+        if len(r_) != len(part) or any(not _row_ok(t, r, ident) for t, r in zip(part, r_)):
+            rows += r_
+            break            # Codex r2 P2: a failed slice stops the wave; the check below reports it
+        rows += r_
+    bad = [n for n, (t, r) in enumerate(zip(flat, rows)) if not _row_ok(t, r, ident)]
     if len(rows) != len(flat) or bad:
         n = bad[0] if bad else len(rows)
         why = (rows[n].get("error") if n < len(rows) else "missing row") or "inputs or engine identity differ"
@@ -207,7 +247,7 @@ def prefetch(A, drawn, kw) -> list[dict]:
                                                "tasks": 0, "wall_s": 0.0, "workers": 0})
     st.update(backend=summ.get("backend"), calls=st["calls"] + ncalls, draws=st["draws"] + len(drawn),
               tasks=st["tasks"] + len(flat), wall_s=round(st["wall_s"] + time.time() - t0, 3),
-              workers=max(int(st["workers"] or 0), int(summ.get("workers") or 0)))
+              workers=max(int(st["workers"] or 0), nworkers))
     return out
 
 
@@ -323,16 +363,53 @@ def _self_test_cases(ok, fails, RUN, signoff, q, tempfile, yaml) -> int:
         except TypeError as e:
             ok(False, f"DF8 a task whose unit attributes mix key types hashes ({e})")
         # Codex r1 P1-2, P1-3: engines the fan-out cannot reproduce on a worker stay in-process, with the reason
-        out = os.path.join(os.path.dirname(d), "fitted_outside.yaml")
-        A.eng.fitted_path = out
-        open(out, "w").write("{}")
+        with tempfile.TemporaryDirectory() as elsewhere:      # Codex r2 P1-1: a private directory outside the run
+            out = os.path.join(elsewhere, "fitted_outside.yaml")
+            A.eng.fitted_path = out
+            open(out, "w").write("{}")
+            try:
+                ok(config(A) is None and "outside" in (A.__dict__.get("draw_fanout_off") or ""),
+                   f"DF9 an engine input file outside what compute.py ships keeps the draws in-process "
+                   f"({A.__dict__.get('draw_fanout_off')})")
+            finally:
+                del A.eng.fitted_path
+        # Codex r2 P1-3: a file under the run's models/ that compute.py's bundle leaves out (a .log) is not shipped
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        lg = os.path.join(d, "models", "bench.log")
+        open(lg, "w").write("{}")
+        ok(not _shipped(lg, d) and _shipped(os.path.join(ROOT, "toolkit", "analysis", "draw_fanout.py"), d),
+           "DF16 a file is shipped only under compute.py's own bundle rules (a .log under models/ is not)")
+        # Codex r2 P1-2: inputs a JSON round trip would change (non-text mapping keys) keep the draws in-process
+        i0 = A.ids[0]
+        keep_attrs = dict(A.model.attrs[i0])
+        A.model.attrs[i0] = dict(keep_attrs, year_map={2014: "x"})
         try:
-            ok(config(A) is None and "outside" in (A.__dict__.get("draw_fanout_off") or ""),
-               f"DF9 an engine input file outside what compute.py ships keeps the draws in-process "
+            ok(config(A) is None and "JSON" in (A.__dict__.get("draw_fanout_off") or ""),
+               f"DF17 unit attributes a JSON round trip changes keep the draws in-process "
                f"({A.__dict__.get('draw_fanout_off')})")
         finally:
-            os.remove(out)
-            del A.eng.fitted_path
+            A.model.attrs[i0] = keep_attrs
+        # Codex r2 P1-5: a non-positive task limit is refused before anything is dispatched
+        try:
+            prefetch(A, [(dict(A.theta0), None)], dict(A.compute, max_tasks=0))
+            ok(False, "DF18 max_tasks 0 is refused before dispatch")
+        except ValueError as e:
+            ok("max_tasks" in str(e), f"DF18 max_tasks 0 is refused before dispatch ({e})")
+        # Codex r2 P2: a failed slice stops the wave before the next compute call
+        calls = []
+        orig2 = compute.map_fn
+
+        def failing(rd, fn, inputs, **k):
+            calls.append(len(inputs))
+            return [{"ok": False, "error": "model: boom"} for _ in inputs], {"backend": "local"}
+        compute.map_fn = failing
+        try:
+            prefetch(A, [(dict(A.theta0), None)] * 3, dict(A.compute, max_tasks=1))
+            ok(False, "DF19 a failed slice stops the wave")
+        except ValueError:
+            ok(len(calls) == 1, f"DF19 a failed slice stops the wave before the next compute call ({len(calls)} calls)")
+        finally:
+            compute.map_fn = orig2
         _declared(False)
         try:
             ok(config(A) is None and "batch_equals_run" in (A.__dict__.get("draw_fanout_off") or ""),
@@ -371,7 +448,8 @@ def _self_test_cases(ok, fails, RUN, signoff, q, tempfile, yaml) -> int:
         R1 = RUN.run(d, log=q, compute_kw={"draw_fanout": True, "backend": "local"})
         had = os.path.exists(os.path.join(d, REL))
         ok(R1["_A"].compute.get("max_workers") == 1 and had,
-           f"DF14 analysis.workers sets the fan-out's workers ({R1['_A'].compute.get('max_workers')})")
+           f"DF14 analysis.workers reaches the fan-out's compute calls as max_workers, as for the batch stage "
+           f"({R1['_A'].compute.get('max_workers')})")
         RUN.run(d, log=q)
         ok(not os.path.exists(os.path.join(d, REL)),
            "DF15 a serial rerun in the same directory leaves no fan-out record from the earlier run")

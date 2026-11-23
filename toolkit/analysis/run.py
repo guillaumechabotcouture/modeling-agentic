@@ -188,6 +188,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     info = dict(_engine_info(eng), **({"net_effect_posterior_sha256": post["sha256"]} if post else {}))
     S = Store(run_dir, spec.sha256, st == "signed", info, spec.settings_sha256, spec.engine_choice_sha256)
     holder["S"] = S
+    from toolkit.analysis import draw_fanout as DFO_
+    from toolkit.analysis.artifacts import _safe_io as _sio
+    _sio().remove_nofollow(run_dir, DFO_.REL)    # an earlier analysis's fan-out record never stands for this one
     from toolkit.engines.benchmark_sources import load_evidence
     stale = load_evidence(eng).problems          # S1-2b: never an analysis on evidence the snapshot does not back
     if stale:
@@ -304,8 +307,6 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if spec["analysis"].get("workers"):         # the same precedence as the other compute stages
         A.compute.setdefault("max_workers", int(spec["analysis"]["workers"]))
     from toolkit.analysis import draw_fanout as DFO
-    from toolkit.analysis.artifacts import _safe_io as _sio
-    _sio().remove_nofollow(run_dir, DFO.REL)     # an earlier analysis's fan-out record never stands for this one
     if jc is not None:
         A.set_joint(jc)
         A.flagged = {f["unit"]: f for f in jc["unmatched_decision"]["flagged"]}
