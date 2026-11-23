@@ -306,6 +306,49 @@ reason is given.
   recorded as ok, made in a sandbox, and unchanged since is up to date on any machine, so a run
   resumed past SIGN on a host without bubblewrap only checks hashes (`derivation_stale`). A record
   made with the development flag is re-made wherever a sandbox exists.
+- **The container sandbox (`audit-hook`, added 2026-11-23).** The outside benchmark runs the harness
+  inside an unprivileged Docker container. There bubblewrap cannot create namespaces, so every
+  derivation failed closed and, with the development flag, the run ended at SPEC on the HIGH
+  `derivation_unsandboxed`. On Linux, when neither `bwrap` nor `bwrap-sudo` passes its probe (or
+  bubblewrap is not installed), `sandbox_kind()` now probes a third kind, `audit-hook`. The
+  derivation runs in a child Python (`-I`, the same scrubbed environment, cwd its private work
+  directory, the same caps set strictly). Inputs and the script are copied in read-only, and their
+  hashes are checked after the run. An audit hook (PEP 578), installed after numpy, pandas and pyyaml
+  are imported and before the script runs, refuses:
+  - every socket call;
+  - process creation and signals;
+  - ctypes and links;
+  - writes, renames and removals outside the work directory or onto an input;
+  - reads and listings of the run directory;
+  - the introspection that could reach the hook.
+
+  The script's own imports of network, process and foreign-code modules are refused, even when a
+  library has already loaded them. Outputs are still collected only from the declared paths. The
+  probe runs a script that tries each refusal, and a kind whose probe fails is not used. If no kind
+  passes, derivations fail closed as before. macOS is unchanged: it has no fallback, because
+  `RLIMIT_AS` cannot be set there. The record holds the kind, why bubblewrap was not used, and
+  whether the container itself has a network (`none`, `present` or `unknown`, read from
+  `/sys/class/net`). The report renders a "Derivation sandbox" block from the record. An
+  `audit-hook` record raises no `derivation_unsandboxed`. Like a bubblewrap record, it stays
+  current on a machine with another sandbox, so a resumed run does not change the record that
+  was signed.
+
+  | guarantee | `bwrap` / `bwrap-sudo` | `audit-hook` |
+  |---|---|---|
+  | no network | kernel: a network namespace with no interface | harness: every socket call refused; the container's own network recorded |
+  | no process creation | kernel: a PID namespace, the process cap | harness: subprocess, os.system/exec/spawn/fork, pty and signals refused; the process cap (root ignores it) |
+  | writes only to the work directory | kernel: `/` read-only, the work directory the only writable bind | harness: writes, renames and removals refused outside it and on inputs; read-only input copies, hashes checked after |
+  | the run directory hidden | kernel: an empty read-only tmpfs over it | harness: reads and listings refused (by path text: a link elsewhere that points into it is not seen) |
+  | only the allowed imports | the scan before the run | the same scan, plus run-time refusal of network, process and foreign-code modules |
+  | no credentials | a cleared environment | the same scrubbed environment and `python -I` |
+  | resource caps | memory, CPU, file size, processes, wall clock | the same, set strictly |
+  | outputs from the declared paths only | yes | yes |
+  | holds against a script written to escape | yes, short of a kernel flaw | **no**: an audit hook sees Python-level calls, not system calls, and is not a security boundary (PEP 578). Native code reports only what CPython reports |
+
+  The threat this answers is a planner-written script that reaches the network, writes or reads
+  outside its declaration, or starts a process, by mistake or by design shortcut. It is not a
+  hostile script. Against such a script bubblewrap still holds and the fallback does not. The
+  report says this in its block. Self-tests DI-A0 to DI-A8 cover this kind.
 - **The column accounting** reads the header of each staged `.csv`/`.tsv`. A staged table that the
   spec cites directly counts as used. The removal test (`ignored_column_used`) runs only for the
   ignored columns of tabular inputs.
