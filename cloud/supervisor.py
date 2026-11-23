@@ -521,6 +521,7 @@ def _refresh(state, lname, w, now) -> None:
     h = _hist(state, lname, w)
     h.update(failures={k: v.get("failure") for k, v in w["labels"].items()},
              complete=bool(w["labels"]) and all(v.get("complete") for v in w["labels"].values()),
+             unknown_outcomes=any(v.get("status_unknown") for v in w["labels"].values()),
              final=w["state"] == "ended" or h.get("final", False) and w["state"] != "watching")
 
 
@@ -602,7 +603,8 @@ def evaluate(state, lname, w, now, held=False) -> dict:
         out["same_failure_runs"] = (
             {"would_trip": True, "reason": why} if top[1] >= r["same_failure_runs"] else
             {"would_trip": "unknown", "reason": why + "; not every run's outcome is known"}
-            if not peers_ok or not all(h.get("complete") or h.get("final") for h in tag.values()) else
+            if not peers_ok or any(h.get("unknown_outcomes") for h in tag.values())
+            or not all(h.get("complete") or h.get("final") for h in tag.values()) else
             {"would_trip": False, "reason": why})
     return {k: {**v, "reason": _red(v["reason"]), "at": utc(now)} for k, v in out.items()}
 
