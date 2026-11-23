@@ -156,10 +156,12 @@ def _package_sums(A, plan, out, cost) -> dict:
     s = {}
     for i in A.ids:
         k = plan[i]
-        e = s.setdefault(k, {"units": 0, "cost": 0.0, "averted": 0.0})
+        e = s.setdefault(k, {"units": 0, "cost": 0.0, "averted": 0.0, "averted_abs": 0.0})
+        v = out[i]["y"][A.comp][A.primary] - out[i]["y"][k][A.primary]
         e["units"] += 1
         e["cost"] += cost[i][k]
-        e["averted"] += out[i]["y"][A.comp][A.primary] - out[i]["y"][k][A.primary]
+        e["averted"] += v
+        e["averted_abs"] += abs(v)       # the units' magnitudes: the round-off bound of the stored-draw check
     return s
 
 
@@ -185,7 +187,8 @@ def _well_formed(per_draw, totals) -> bool:
         isinstance(d, dict) and all(isinstance(e, dict) and isinstance(e.get("units"), int)
                                     and not isinstance(e.get("units"), bool) and e["units"] > 0
                                     and _finite(e.get("cost")) and float(e["cost"]) >= 0.0
-                                    and _finite(e.get("averted")) for e in d.values()) for d in per_draw)
+                                    and _finite(e.get("averted")) and _finite(e.get("averted_abs"))
+                                    and float(e["averted_abs"]) >= 0.0 for e in d.values()) for d in per_draw)
 
 
 def _sums_match(per: dict, total, key: str = "averted") -> bool:
@@ -196,12 +199,34 @@ def _sums_match(per: dict, total, key: str = "averted") -> bool:
     import math
     try:
         vals = [float(e[key]) for e in per.values()]
+        # Codex r3 P1-1: the magnitudes of the unit contributions (cancellation can happen inside a package too);
+        # costs are non-negative, so their subtotals are their magnitudes
+        mags = [abs(float(e["averted_abs"] if key == "averted" else e[key])) for e in per.values()]
         n = max(1, sum(int(e["units"]) for e in per.values()))
         err = abs(math.fsum(vals) - float(total))
-        bound = REPLAY_RTOL * max(abs(float(total)), 1.0) + 4.0 * n * 2.0 ** -52 * math.fsum(abs(v) for v in vals)
+        big = max(mags + [1.0])
+        rel = math.fsum(m / big for m in mags)          # Codex r3 P1-2: scaled, so the bound does not overflow
+        bound = REPLAY_RTOL * max(abs(float(total)), 1.0) + 4.0 * n * 2.0 ** -52 * rel * big
         return math.isfinite(err) and err <= bound
     except (OverflowError, ValueError, TypeError, KeyError):
         return False
+
+
+def _interval(tot, lvl) -> tuple:
+    """(quantile summary, None) of the stored totals, or ({}, why) when it cannot be computed or a statistic is not
+    finite (Codex r3 P1-3: an overflowing mean is a warning in numpy, not an exception)."""
+    import math
+    import warnings
+    from toolkit.analysis.core import q
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            got = q(tot, lvl)
+    except (ValueError, OverflowError) as e:
+        return {}, f"the stored totals give no interval ({e})"
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in got.values()):
+        return {}, "the stored totals give a non-finite statistic"
+    return got, None
 
 
 def _same_sums(a: dict, b: dict) -> bool:
@@ -270,10 +295,9 @@ def _replay_stored(A, plan, uq, stored, log=None) -> dict:
                 break
             checked += 1
             P.step()
-    try:
-        got = q(tot, lvl) if why is None else {}
-    except (ValueError, OverflowError) as e:
-        got, why = {}, f"the stored totals give no interval ({e})"
+    got = {}
+    if why is None:
+        got, why = _interval(tot, lvl)
     if why is None and not (want and all(_close(got[x], want[x]) for x in ("median", "ci_low", "ci_high"))):
         why = "the stored draws do not give the stored fixed-plan interval"
     return {"draws": nd, "seed": seed, "level": lvl, "reproduced": why is None, "replayed": got, "stored": want,
@@ -946,6 +970,14 @@ def _self_test_stored_draws(ok, q):
             except Exception as e:  # noqa: BLE001 -- the failing case
                 outs.append((label, f"{type(e).__name__}: {e}"))
         ok(all(v is True for _l, v in outs), f"FD34 non-finite or unrepresentable stored numbers are refused ({outs})")
+        # Codex r3 P1-3: totals whose mean overflows give no interval statistics, never an infinite one
+        import math as _m
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            got_, why_ = _interval([1.0] * 198 + [1e308] * 2, 0.95)
+        ok(why_ is not None or all(_m.isfinite(v) for v in got_.values()),
+           f"FD38 a replayed statistic is never infinite ({why_}; {got_})")
         # Codex r1 P3-9: checked_draws counts the evaluations actually run
         ok(r2.get("checked_draws") == 0, f"FD29 refused stored draws report no checked draw ({r2.get('checked_draws')})")
     # Codex r1 P2-4: package subtotals of benefits and harms that cancel still add up to the draw's total
@@ -957,12 +989,29 @@ def _self_test_stored_draws(ok, q):
         per["b"]["averted"] += -999999.9999999
         tot += big
         tot += -999999.9999999
+    per["a"]["averted_abs"], per["b"]["averted_abs"] = abs(per["a"]["averted"]), abs(per["b"]["averted"])
     ok(_sums_match(per, tot), "FD30 package subtotals that cancel are compared at their own scale")
     # Codex r2 P1-1: the cancellation allowance is a summation round-off bound, not the replay tolerance of the
     # largest subtotal: three exact integers off by 900 are caught
-    tri = {"a": {"units": 1, "cost": 0.0, "averted": 1e9}, "b": {"units": 1, "cost": 0.0, "averted": -1e9},
-           "c": {"units": 1, "cost": 0.0, "averted": 901.0}}
+    tri = {"a": {"units": 1, "cost": 0.0, "averted": 1e9, "averted_abs": 1e9},
+           "b": {"units": 1, "cost": 0.0, "averted": -1e9, "averted_abs": 1e9},
+           "c": {"units": 1, "cost": 0.0, "averted": 901.0, "averted_abs": 901.0}}
     ok(not _sums_match(tri, 1.0), "FD35 subtotals that cancel do not hide an error far above their round-off")
+    # Codex r3 P1-1: cancellation inside a package; the bound uses the units' magnitudes (averted_abs), recorded
+    # by _package_sums, not the already cancelled subtotals
+    units = [("A", 1e16), ("B", -1e16), ("A", 1.0), ("A", 1.0), ("A", 2e6 - 1e16), ("B", 1e16 - 2e6)]
+    tot_, sub = 0.0, {}
+    for k, v in units:
+        tot_ += v
+        e = sub.setdefault(k, {"units": 0, "cost": 0.0, "averted": 0.0, "averted_abs": 0.0})
+        e["units"] += 1
+        e["averted"] += v
+        e["averted_abs"] += abs(v)
+    ok(_sums_match(sub, tot_), f"FD36 a valid draw whose unit contributions cancel inside a package matches ({tot_})")
+    # Codex r3 P1-2: an exact sum of huge values does not overflow the bound
+    huge = {"a": {"units": 1, "cost": 0.0, "averted": 1e308, "averted_abs": 1e308},
+            "b": {"units": 1, "cost": 0.0, "averted": -1e308, "averted_abs": 1e308}}
+    ok(_sums_match(huge, 0.0), "FD37 an exact sum of huge subtotals matches; computing the bound does not overflow")
     # Codex r1 P1-2: figure_data records the hash of the sidecar bytes it used, whatever the file holds afterwards
     import hashlib
     with tempfile.TemporaryDirectory() as d:

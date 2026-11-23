@@ -25,7 +25,8 @@ with z, s and e as fractions of N_i, s the susceptible share after the intervent
 
 - `CompartmentalEngine.run_batch`: when `final_generations` holds and `importation: deterministic`, solve the
   relation for the whole batch at once (arrays B x G), on the groups the seeds reach. Reach is computed per member,
-  after the interventions: group j is reached when a path of contacts C_ij > 0 runs from a group with a surviving
+  after the interventions, following the direction of infection: from source i, destination j is reached when
+  C_ji > 0 (the force on j sums C_ji z_i), along a path that starts from a group with a surviving
   seed (e_i > 0) through groups with susceptibles left (s > e). A group behind a fully immune one is not reached,
   even though the contact mask connects it (Codex review: a chain A–B–C with B immune). Unreached groups get
   z = e. On the reached groups the relation has a single root in [e, s]. The map T(z) = s − (s − e) exp(−q C z) is
@@ -66,7 +67,8 @@ identical: **engine 0.2 → 0.3**, with a new code sha256 in `engine_identity`. 
   cases by path, re-stamping only the byte-identical ones. Two: re-run the coverage pack on the VM. The second is
   simpler, and its cost should be measured before choosing. With option two, `compat_proof.py`'s self-test needs a
   path for freshly computed rows: CP5 requires an all-identical proof and CP6 requires `restamped.proof`, and
-  neither holds for a fresh run. None of the three coverage configurations enables `final_size` today. Re-running
+  neither holds for a fresh run. CP9 also calls `restamp()` on a fixture that needs `restamped.old_identity`, so
+  CP9 and CP10 need a restampable fixture of their own, kept separate from the fresh rows. None of the three coverage configurations enables `final_size` today. Re-running
   them therefore tests nothing new; a final-size coverage configuration has to be added for the pack to cover the
   solver.
 - **CP8** binds the live calibrator files (`CALIBRATOR_FILES`: `toolkit/analysis/calibration.py`,
