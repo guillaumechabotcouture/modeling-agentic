@@ -421,7 +421,10 @@ def _on_worker(client, fn, *args, worker):
 
 
 def read_keys(path=ENV_FILE) -> dict:
-    """ANTHROPIC_API_KEY / OPENAI_API_KEY only; values are never printed."""
+    """ANTHROPIC_API_KEY / OPENAI_API_KEY only; values are never printed. With no file (the supervisor's VM,
+    cloud/supervisor.py, which gets them through vm_job's --anthropic-key), from the environment."""
+    if not os.path.exists(path):
+        return {k: os.environ[k] for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY") if os.environ.get(k)}
     keys = {}
     with open(path) as f:
         for line in f:
@@ -4328,6 +4331,21 @@ def _self_test_eval_configs(ok) -> None:
                 os.environ[k] = v
 
 
+def _self_test_read_keys(ok) -> None:
+    """RK1-RK2 (supervisor launches): with no .env file (the supervisor VM) the keys come from the environment;
+    a file, when there is one, wins."""
+    import tempfile
+    from unittest import mock
+    with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "env-k",
+                                                                           "OTHER_SECRET": "x"}):
+        os.environ.pop("OPENAI_API_KEY", None)
+        ok(read_keys(os.path.join(td, "absent.env")) == {"ANTHROPIC_API_KEY": "env-k"},
+           "RK1 no .env file: ANTHROPIC_API_KEY / OPENAI_API_KEY from the environment, nothing else")
+        p = os.path.join(td, ".env")
+        open(p, "w").write('ANTHROPIC_API_KEY="file-k"\n')
+        ok(read_keys(p) == {"ANTHROPIC_API_KEY": "file-k"}, "RK2 a .env file wins over the environment")
+
+
 def _self_test_budget(ok) -> None:
     """BU (F6 Stage 2, 2026-11-11: $106 spent of a $100 budget): `launch` refuses unless the owner-signed budget
     (cloud/budget.py) covers the scope's spend plus the config's cap_usd, before any key is read or cluster made."""
@@ -5765,6 +5783,10 @@ def _self_test() -> int:
         _self_test_eval_configs(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"EV: {type(e).__name__}: {e}")
+    try:
+        _self_test_read_keys(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"RK: {type(e).__name__}: {e}")
     globals()["budget_guard"] = lambda cfg, reserve=True, inv=None: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)

@@ -225,7 +225,7 @@ def job_env(secrets: dict | None, name: str, job_id: str, account: str | None = 
             **({"MA_STORAGE_ACCOUNT": account} if account else {})}
 
 
-SECRET_ENV_ALLOWED = ("GH_TOKEN",)     # cloud/supervisor.py's merge train (W0-J)
+SECRET_ENV_ALLOWED = ("GH_TOKEN", "DASK_COILED__TOKEN")   # cloud/supervisor.py: merge train; launches and renewal
 
 
 def secret_env(names) -> dict:
@@ -1458,6 +1458,11 @@ def _self_test_storage_account(ok) -> None:
             ok(False, "VS3 a variable outside the allow-list is refused")
         except SystemExit as e:
             ok("allow" in str(e), f"VS3 a variable outside the allow-list is refused before submit ({e})")
+        # VS6 (supervisor launches and self-renewal): the Coiled token passes the same way, and only by name
+        ctok = "c" * 40
+        with mock.patch.dict(os.environ, {"DASK_COILED__TOKEN": ctok}):
+            got = secret_env(["DASK_COILED__TOKEN"])
+        ok(got == {"DASK_COILED__TOKEN": ctok}, "VS6 --secret-env DASK_COILED__TOKEN reaches the job's environment")
         for bad in ("DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc==", "https://x.blob.core.windows.net",
                     "Acct", "ab"):
             try:

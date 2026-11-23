@@ -8,10 +8,16 @@ work for about 8 hours). One loop on a small Coiled VM, all its state in blob st
   (b) Eval collection: each enqueued launch (a run_cluster.py config's assignments.json) is fetched label by label with
       run_cluster.collect_from_storage (storage only: no cluster is attached or stopped), archived to the supervisor's
       prefix, and scripts/harness_metrics.py runs over every collected run (metrics.json).
-  (c) status.json, rewritten every loop: heartbeat, merge queue, collection, paused runs (resume is not automated
-      here), errors. Layout under outputs/supervisor/<name>/: requests/ (write-once, from the laptop), state.json and
-      status.json (the loop's only), collected/<launch>/<label>.tar.gz, metrics.json. The storage account comes from
+  (c) status.json, rewritten every loop: heartbeat, merge queue, collection, lease, renewal, paused runs (resume is
+      not automated here), errors. Layout under outputs/supervisor/<name>/: requests/ (write-once, from the laptop),
+      state.json and status.json (the loop's only), lease.json, budgets/<scope>.json (owner-signed records `start`
+      copies, no secret), collected/<launch>/<label>.tar.gz, metrics.json. The storage account comes from
       $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT or --account, never the code.
+  (d) Self-renewal: one loop holds lease.json (every write a compare-and-swap on the blob's etag; free when not
+      renewed for 15 min). 30 min before --max-hours the loop starts its successor (vm_job start on the same name
+      with its shipped tree, the same secrets by name, --holder <id>), hands the lease to it and exits. A loop that
+      finds another loop's live lease does nothing; a named successor waits for the handover. Renewal needs
+      $DASK_COILED__TOKEN on the VM (held otherwise).
 
     python3 cloud/supervisor.py start [--name sv-supervisor-gcc] [--cap-usd 15] [--max-hours 24]
     python3 cloud/supervisor.py enqueue-merge <pr>... | enqueue-collect <config.py>... | enqueue-noop
@@ -21,12 +27,16 @@ work for about 8 hours). One loop on a small Coiled VM, all its state in blob st
 
 `start` is vm_job `up` (2-vCPU worker, 2-vCPU scheduler; the name needs a budget scope, the default is in `sv`) then
 `start` with the loop as the job, a dask task that holds the cluster for --max-hours. `stop` stops this name's live
-cluster by id. GitHub token: `start` passes $GH_TOKEN (vm_job --secret-env: the job's environment only) when the login
-keychain holds it under the service "modeling-agentic-supervisor-github"; without it merges stay held.
+cluster by id. Secrets reach the job's environment only, by name: $GH_TOKEN (vm_job --secret-env) when the login
+keychain holds it under the service "modeling-agentic-supervisor-github" (without it merges stay held); the Coiled
+token from the laptop's dask config ($DASK_COILED__TOKEN, --secret-env) and the Anthropic key (--anthropic-key) when
+the laptop has them (without the Coiled token renewal stays held).
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -67,7 +77,8 @@ def paths(name: str) -> dict:
         raise SystemExit(f"bad supervisor name {name!r}")
     b = f"{ROOT}/{name}"
     return {"requests": f"{b}/requests/", "state": f"{b}/state.json", "status": f"{b}/status.json",
-            "collected": f"{b}/collected/", "metrics": f"{b}/metrics.json"}
+            "collected": f"{b}/collected/", "metrics": f"{b}/metrics.json", "lease": f"{b}/lease.json",
+            "budgets": f"{b}/budgets/"}
 
 
 class Blob:
@@ -97,6 +108,30 @@ class Blob:
         return self.rs.download(blob, path, self.account, service=self.svc)
     def names(self, prefix):
         return sorted(b["name"] for b in self.rs.list_blobs(prefix, self.account, service=self.svc))
+    def get_json_etag(self, blob):
+        """(object, etag), or (None, None) when absent: the lease's compare-and-swap reads this."""
+        try:
+            d = self.svc.get_blob_client(*self.rs._split(blob)).download_blob()
+            return json.loads(d.readall()), d.properties.etag
+        except Exception as e:  # noqa: BLE001
+            if type(e).__name__ == "ResourceNotFoundError":
+                return None, None
+            raise
+    def put_json_if(self, blob, obj, etag) -> bool:
+        """Write only if the blob is unchanged since `etag` was read (absent when etag is None); False otherwise."""
+        from azure.core import MatchConditions
+        bc, data = self.svc.get_blob_client(*self.rs._split(blob)), json.dumps(obj, default=str).encode()
+        try:
+            if etag is None:
+                bc.upload_blob(data, overwrite=False)
+            else:
+                bc.upload_blob(data, overwrite=True, etag=etag, match_condition=MatchConditions.IfNotModified)
+            return True
+        except Exception as e:  # noqa: BLE001 -- another writer came first: 409 (exists) or 412 (modified)
+            if type(e).__name__ in ("ResourceExistsError", "ResourceModifiedError") or \
+                    getattr(e, "status_code", None) in (409, 412):
+                return False
+            raise
 
 
 def enqueue(blob, name: str, kind: str, payload: dict, now: float | None = None) -> str:
@@ -285,8 +320,108 @@ def valid_entry(pl) -> dict:
     return pl
 
 
+# ---- (d) the lease and self-renewal ----------------------------
+
+RENEW_LEAD_S = 30 * 60    # the successor is started this long before --max-hours runs out
+RENEW_RETRY_S = 300
+LEASE_TTL_S = 900         # a lease its holder has not renewed for this long is free
+EVAL_SCOPE = "ev"
+_SCOPE = re.compile(r"[a-z0-9]{1,16}")
+
+
+def install_budget(scope, rec, budget_dir=None) -> bool:
+    """Put an owner-signed budget record where budget.py reads it on this VM (verified by budget.py at each use)."""
+    import budget
+    if not (_SCOPE.fullmatch(str(scope)) and isinstance(rec, dict)):
+        raise ValueError("a budget record needs a plain scope name and a record")
+    p = os.path.join(budget_dir or budget.BUDGET_DIR, f"budget_{scope}.json")
+    if os.path.exists(p) and json.load(open(p)) == rec:
+        return False
+    budget._write_private(p, json.dumps(rec, indent=1) + "\n")
+    return True
+
+
+class Cloud:
+    """What the loop does to the cloud. Not used by the self-test, which passes FakeCloud."""
+
+    def __init__(self, work, a):
+        self.work, self.a = work, a
+
+    def renew_disabled(self):
+        return None if os.environ.get("DASK_COILED__TOKEN") else \
+            "no $DASK_COILED__TOKEN on the VM (`start` passes it when the laptop holds it)"
+
+    def start_successor(self, job_id, holder):
+        cmd = start_commands(self.a, job_id, bool(os.environ.get("GH_TOKEN")), coiled=True,
+                             anthropic=bool(os.environ.get("ANTHROPIC_API_KEY")), tree=("--dir", REPO_ROOT),
+                             holder=holder)[1]
+        return subprocess.run(cmd, cwd=REPO_ROOT, timeout=1800).returncode
+
+
+def lease_take(blob, name, me, now, host="") -> str:
+    """mine | successor | other. A lease is held by one loop; another one's live lease (renewed within LEASE_TTL_S)
+    is never taken, and every write is a compare-and-swap on the blob's etag, so two loops never both hold it."""
+    p = paths(name)["lease"]
+    lease, etag = blob.get_json_etag(p)
+    if lease and lease.get("holder") == me:
+        new = {**lease, "renewed": now, "renewed_utc": utc(now), "host": host}
+    elif lease and now - float(lease.get("renewed") or 0) < LEASE_TTL_S:
+        return "successor" if lease.get("successor") == me else "other"
+    else:
+        new = {"holder": me, "renewed": now, "renewed_utc": utc(now), "host": host, "successor": None,
+               "taken_from": (lease or {}).get("holder")}
+    return "mine" if blob.put_json_if(p, new, etag) else "other"
+
+
+def wait_for_lease(blob, name, me, host="", clock=time.time, sleep=time.sleep, max_wait_s=2 * 3600) -> str:
+    """At start: a successor waits for its predecessor's handover (or for the lease to lapse); anything else answers
+    at once."""
+    end = clock() + max_wait_s
+    while True:
+        s = lease_take(blob, name, me, clock(), host)
+        if s != "successor" or clock() >= end:
+            return s
+        sleep(30)
+
+
+def renew_step(blob, name, me, state, now, cloud) -> bool:
+    """Start the successor (same name and state prefix, through vm_job start), then hand the lease to it. True once
+    handed over: the caller exits. A failed start keeps the lease and is retried after RENEW_RETRY_S."""
+    p, rn = paths(name), state.setdefault("renewal", {})
+    why = cloud.renew_disabled()
+    if why:
+        rn.update(state="held", why=why, at=utc(now))
+        return False
+    if now - rn.get("tried", -1e18) < RENEW_RETRY_S:
+        return False
+    rn["tried"] = now
+    lease, etag = blob.get_json_etag(p["lease"])
+    succ, job = f"h-{secrets.token_hex(6)}", "sv-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime(now))
+    if not (lease and lease.get("holder") == me and blob.put_json_if(p["lease"], {**lease, "successor": succ}, etag)):
+        return False
+    try:
+        code = cloud.start_successor(job, succ)
+    except Exception as ex:  # noqa: BLE001
+        code = f"{type(ex).__name__}: {str(ex)[:160]}"
+    if code != 0:
+        rn.update(state="failed", job_id=job, error=f"vm_job start: {code}", at=utc(now))
+        lease, etag = blob.get_json_etag(p["lease"])
+        if lease and lease.get("holder") == me:
+            blob.put_json_if(p["lease"], {**lease, "successor": None}, etag)
+        return False
+    rn.update(state="handed_over", job_id=job, successor=succ, at=utc(now), error="")
+    blob.put_json(p["state"], state)
+    st = blob.get_json(p["status"]) or {}
+    blob.put_json(p["status"], {**st, "renewal": {k: v for k, v in rn.items() if k != "tried"}})
+    lease, etag = blob.get_json_etag(p["lease"])
+    if lease and lease.get("holder") == me:
+        blob.put_json_if(p["lease"], {"holder": succ, "renewed": now, "renewed_utc": utc(now), "successor": None,
+                                      "taken_from": me}, etag)
+    return True
+
+
 def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metrics=run_metrics, host="",
-         merge_why="no GitHub token ($GH_TOKEN) on the VM: merges are held") -> dict:
+         merge_why="no GitHub token ($GH_TOKEN) on the VM: merges are held", lease=None) -> dict:
     """One pass: ingest new requests, one merge step, collection, then state.json and status.json. A failing part is
     recorded in errors and the rest still runs; status is always written."""
     p, state = paths(name), {"seen": [], "merge": [], "merge_done": [], "collect": {}, "acks": [], "errors": [],
@@ -343,6 +478,8 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
               "merge": {"enabled": gh is not None, "why": "" if gh is not None else merge_why,
                         "queue": state["merge"], "done": state["merge_done"][-10:]},
               "collect": {k: {"labels": v["labels"]} for k, v in state["collect"].items()},
+              "lease": lease or {},
+              "renewal": {k: v for k, v in (state.get("renewal") or {}).items() if k != "tried"},
               "metrics_at": state.get("metrics_at"), "paused": paused,
               "acks": state["acks"][-10:], "errors": state["errors"][-10:]}
     blob.put_json(p["state"], state)
@@ -351,30 +488,51 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
 
 
 def loop(a):
-    blob, p, work = Blob(a.account), paths(a.name), os.path.abspath(a.work)
+    blob, p, work = Blob(a.account), paths(a.name), os.path.abspath(os.path.expanduser(a.work))
     gh, why = None, "no GitHub token ($GH_TOKEN) on the VM: merges are held"
     if os.environ.get("GH_TOKEN"):
         try:
             gh = GitHub(os.environ["GH_TOKEN"].strip())
         except ValueError as e:
             why = str(e)
+    host, me = f"{os.uname().nodename}:{os.getpid()}", a.holder or f"h-{secrets.token_hex(6)}"
     for i in range(21):                       # a storage blip at start-up must not end the supervisor
         try:
+            got = wait_for_lease(blob, a.name, me, host)
+            if got != "mine":
+                print(f"{a.name}: a live lease is held by another loop: this loop does nothing", flush=True)
+                return 0
+            for b in blob.names(p["budgets"]):       # signed budget records `start` stored (verified at each use)
+                install_budget(b[len(p["budgets"]):-len(".json")], blob.get_json(b))
             state = blob.get_json(p["state"]) or {}
             break
         except Exception as e:  # noqa: BLE001
             if i == 20:
                 raise
-            print(f"state.json unreadable ({type(e).__name__}); retrying", flush=True)
+            print(f"start-up read failed ({type(e).__name__}); retrying", flush=True)
             time.sleep(30)
-    host, deadline = f"{os.uname().nodename}:{os.getpid()}", time.time() + a.max_hours * 3600
-    while time.time() < deadline:
+    cloud, deadline = Cloud(work, a), time.time() + a.max_hours * 3600
+    while True:
+        now = time.time()
         try:
-            state = tick(blob, a.name, state, time.time(), work, gh=gh, host=host, merge_why=why)
-        except Exception as e:  # noqa: BLE001 -- the loop outlives one bad pass (storage blip, DNS)
-            print(f"tick failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+            held = lease_take(blob, a.name, me, now, host)
+        except Exception as e:  # noqa: BLE001 -- unconfirmed: this pass does nothing
+            held = f"unknown ({type(e).__name__})"
+        if held in ("other", "successor"):
+            print(f"{a.name}: the lease is no longer this loop's ({held}): exiting", flush=True)
+            return 0
+        if held == "mine":
+            try:
+                state = tick(blob, a.name, state, now, work, gh=gh, host=host, merge_why=why,
+                             lease={"holder": me, "renewed_utc": utc(now), "deadline_utc": utc(deadline)})
+                if deadline - now <= RENEW_LEAD_S and renew_step(blob, a.name, me, state, now, cloud):
+                    print(f"{a.name}: handed over to {state['renewal']['successor']}: exiting", flush=True)
+                    return 0
+            except Exception as e:  # noqa: BLE001 -- the loop outlives one bad pass (storage blip, DNS)
+                print(f"tick failed: {type(e).__name__}: {str(e)[:200]}", flush=True)
+        if now >= deadline:
+            return 0
         time.sleep(a.every)
-    return 0
 
 
 def status_lines(st: dict | None, now: float) -> tuple[list, int]:
@@ -393,6 +551,12 @@ def status_lines(st: dict | None, now: float) -> tuple[list, int]:
     for lname, ent in sorted((st.get("collect") or {}).items()):
         for label, lab in sorted(ent.get("labels", {}).items()):
             out.append(f"collect {lname}/{label}: {lab.get('state')} {lab.get('note', '')}".rstrip())
+    le, rn = st.get("lease") or {}, st.get("renewal") or {}
+    if le:
+        out.append(f"lease: {le.get('holder')} (renewed {le.get('renewed_utc')}; hands over before "
+                   f"{le.get('deadline_utc')})")
+    if rn:
+        out.append(f"renewal: {rn.get('state')} {rn.get('job_id') or ''} {rn.get('why') or rn.get('error') or ''}".rstrip())
     out.append(f"metrics.json: {st.get('metrics_at') or 'not yet'}")
     out += [f"paused run: {x['run']} ({x['status']}); resume is not automated" for x in st.get("paused") or []]
     out += [f"ack {x['kind']} request {x['request']} at {x['at']}" for x in st.get("acks") or []]
@@ -435,27 +599,56 @@ def pull(blob, name, dest, now=None) -> list:
     return got
 
 
-def start_commands(a, job_id, token_present) -> list:
-    """The two vm_job commands `start` runs: up (2-vCPU worker) and start (the loop as a job)."""
+def start_commands(a, job_id, token_present, coiled=False, anthropic=False, tree=("--tree", "."), holder=None) -> list:
+    """The two vm_job commands `start` runs: up (2-vCPU worker) and start (the loop as a job). The successor uses the
+    second only (its own tree with --dir, its holder id). Secrets pass by name (--secret-env, --anthropic-key)."""
     vm = [sys.executable, "cloud/vm_job.py"]
-    budget = ["--cap-usd", str(a.cap_usd)] + (["--budget-scope", a.budget_scope] if a.budget_scope else [])
+    scope = ["--budget-scope", a.budget_scope] if a.budget_scope else []
     acct = ["--store-account", a.account] if a.account else []
-    up = vm + ["up", a.name, "--cpu", "2", "--memory", "8 GiB", "--idle-timeout", "20 minutes"] + budget
-    start = (vm + ["start", a.name, job_id, "--tree", ".", "--max-hours", str(a.max_hours + 0.25)] + acct + budget
+    up = vm + ["up", a.name, "--cpu", "2", "--memory", "8 GiB", "--idle-timeout", "20 minutes",
+               "--cap-usd", str(a.cap_usd)] + scope
+    start = (vm + ["start", a.name, job_id, *tree, "--max-hours", str(a.max_hours + 0.25)] + acct
+             + ["--cap-usd", str(a.cap_usd)] + scope
              + (["--secret-env", "GH_TOKEN"] if token_present else [])
+             + (["--secret-env", "DASK_COILED__TOKEN"] if coiled else []) + (["--anthropic-key"] if anthropic else [])
              + ["--", "python3", "cloud/supervisor.py", "loop", "--name", a.name, "--every", str(int(a.every)),
-                "--max-hours", str(a.max_hours)])
+                "--max-hours", str(a.max_hours), "--cap-usd", str(a.cap_usd)]
+             + (["--account", a.account] if a.account else []) + scope + (["--holder", holder] if holder else []))
     return [up, start]
 
 
-def cmd_start(a):
+def _laptop_secrets() -> tuple:
+    """(GitHub token, Coiled token, Anthropic key present) on the laptop; values are never printed."""
     r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"], capture_output=True,
                        text=True)                      # the owner's one-time step stores it there
-    tok = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    gh = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    try:
+        import coiled  # noqa: F401 -- loads the Coiled login into dask's config
+        import dask
+        co = dask.config.get("coiled.token", None)
+    except Exception:  # noqa: BLE001
+        co = None
+    try:
+        import run_cluster as rc
+        an = bool(rc.read_keys().get("ANTHROPIC_API_KEY"))
+    except OSError:
+        an = False
+    return gh, co, an
+
+
+def cmd_start(a):
+    tok, co, an = _laptop_secrets()
     job_id = "sv-" + time.strftime("%Y%m%d-%H%M%S")
-    env = {**os.environ, **({"GH_TOKEN": tok} if tok else {})}
-    print(f"merge train: {'enabled (token from the keychain)' if tok else 'disabled (no token in the keychain)'}")
-    for cmd in start_commands(a, job_id, bool(tok)):
+    env = {**os.environ, **({"GH_TOKEN": tok} if tok else {}), **({"DASK_COILED__TOKEN": co} if co else {})}
+    print(f"merge train: {'enabled (token from the keychain)' if tok else 'disabled (no token in the keychain)'}; "
+          f"renewal: {'enabled' if co else 'held (no Coiled token here)'}")
+    import budget
+    blob = Blob(a.account)
+    for scope in ("sv", EVAL_SCOPE):                    # signed records (no secret) for the VM's budget checks
+        f = os.path.join(budget.BUDGET_DIR, f"budget_{scope}.json")
+        if os.path.exists(f):
+            blob.put_json(f"{paths(a.name)['budgets']}{scope}.json", json.load(open(f)))
+    for cmd in start_commands(a, job_id, bool(tok), coiled=bool(co), anthropic=an):
         print("$ " + " ".join(cmd), flush=True)
         r = subprocess.run(cmd, cwd=REPO_ROOT, env=env)
         if r.returncode:
@@ -484,9 +677,16 @@ def _assignments(config_path):
 
 class FakeBlob:
     def __init__(self):
-        self.d = {}
+        self.d, self.v = {}, {}
     def put_json(self, blob, obj):
-        self.d[blob] = json.dumps(obj, default=str).encode()
+        self.d[blob], self.v[blob] = json.dumps(obj, default=str).encode(), self.v.get(blob, 0) + 1
+    def get_json_etag(self, blob):
+        return self.get_json(blob), self.v.get(blob) if blob in self.d else None
+    def put_json_if(self, blob, obj, etag):
+        if (self.v.get(blob) if blob in self.d else None) != etag:
+            return False
+        self.put_json(blob, obj)
+        return True
     def get_json(self, blob):
         return json.loads(self.d[blob]) if blob in self.d else None
     def put_file(self, path, blob):
@@ -520,6 +720,17 @@ class FakeGitHub:
         self.calls.append(("merge", n, sha))
         self.prs[n].update(state="closed", merged=True)
         return True
+
+
+class FakeCloud:
+    """The loop's renewal actions, recorded (no Coiled call). `successor`: vm_job start's exit code."""
+    def __init__(self, why=None, successor=0):
+        self.why, self.successor, self.calls = why, successor, []
+    def renew_disabled(self):
+        return self.why
+    def start_successor(self, job, holder):
+        self.calls.append(("successor", job, holder))
+        return self.successor
 
 
 def _self_test() -> int:
@@ -753,6 +964,73 @@ def _self_test() -> int:
     st = run(b, [T0, T0 + 1])
     ok(len(st.get("seen", [])) == 1003 and st["acks"][-1]["at"] == utc(T0), "SV24 no processed request is replayed")
 
+    # ---- the lease and self-renewal (SV37-SV40) ----
+    import types
+    from unittest import mock
+    # SV37 the lease: one holder at a time, a compare-and-swap on the etag; a live lease of another is never taken
+    b = FakeBlob()
+    ok(lease_take(b, N, "A", T0) == "mine" and lease_take(b, N, "B", T0 + 10) == "other"
+       and lease_take(b, N, "A", T0 + 20) == "mine" and lease_take(b, N, "B", T0 + 20 + LEASE_TTL_S + 1) == "mine"
+       and lease_take(b, N, "A", T0 + 20 + LEASE_TTL_S + 2) == "other",
+       "SV37 a live lease is the holder's; a lapsed one is taken, and its old holder then sees another's")
+    b = FakeBlob()
+    _, tag0 = b.get_json_etag(P["lease"])
+    ok(b.put_json_if(P["lease"], {"holder": "A"}, tag0) and not b.put_json_if(P["lease"], {"holder": "B"}, tag0),
+       "SV37b two loops racing for a free lease: the second write fails")
+    b = FakeBlob()
+    lease_take(b, N, "A", time.time())
+    before = dict(b.d)
+    a = argparse.Namespace(account="acct", name=N, work="~/w", holder=None, max_hours=1.0, every=1)
+    with mock.patch.dict(globals(), {"Blob": lambda acct: b}), contextlib.redirect_stdout(io.StringIO()):
+        rc_ = guard(loop, a)
+    ok(rc_ == 0 and b.d == before, f"SV37c a loop that finds another loop's live lease does nothing ({rc_})")
+    # SV38 renewal: the successor starts through vm_job (same name), then the lease is handed to it; a failed start
+    # keeps the lease and is retried after RENEW_RETRY_S; no cloud access: held
+    b, cl, st = FakeBlob(), FakeCloud(), {}
+    lease_take(b, N, "A", T0)
+    done = guard(renew_step, b, N, "A", st, T0 + 5, cl)
+    succ = st.get("renewal", {}).get("successor")
+    ok(done is True and [c[0] for c in cl.calls] == ["successor"] and cl.calls[0][2] == succ
+       and (b.get_json(P["lease"]) or {}).get("holder") == succ and lease_take(b, N, succ, T0 + 6) == "mine"
+       and lease_take(b, N, "A", T0 + 7) == "other"
+       and (b.get_json(P["status"]) or {}).get("renewal", {}).get("state") == "handed_over",
+       f"SV38 the successor is started, then holds the lease; the predecessor no longer does ({cl.calls}, {st})")
+    b, cl, st = FakeBlob(), FakeCloud(successor=1), {}
+    lease_take(b, N, "A", T0)
+    r1_ = guard(renew_step, b, N, "A", st, T0 + 5, cl)
+    r2_ = guard(renew_step, b, N, "A", st, T0 + 6, cl)
+    lz = b.get_json(P["lease"]) or {}
+    ok(r1_ is False and r2_ is False and len(cl.calls) == 1 and lz.get("holder") == "A" and lz.get("successor") is None
+       and st["renewal"]["state"] == "failed", f"SV38b a failed successor start keeps the lease, retried later ({lz})")
+    st = {}
+    ok(guard(renew_step, b, N, "A", st, T0 + 5, FakeCloud(why="no $DASK_COILED__TOKEN")) is False
+       and st["renewal"]["state"] == "held", "SV38c without cloud access renewal is held")
+    # SV39 a successor waits for the handover; then it holds the lease
+    b = FakeBlob()
+    lease_take(b, N, "A", time.time())
+    lz, tag1 = b.get_json_etag(P["lease"])
+    b.put_json_if(P["lease"], {**lz, "successor": "S"}, tag1)
+    hand = lambda s_: (lambda l, t: b.put_json_if(P["lease"], {**l, "holder": "S", "successor": None}, t))(  # noqa: E731
+        *b.get_json_etag(P["lease"]))
+    ok(lease_take(b, N, "S", time.time()) == "successor" and guard(wait_for_lease, b, N, "S", sleep=hand) == "mine",
+       "SV39 the named successor waits, and holds the lease after the handover")
+    # SV40 the successor's command: vm_job start on the same name with the shipped dir, secrets by name, its holder
+    a = argparse.Namespace(name=DEFAULT_NAME, cap_usd=15.0, max_hours=24.0, budget_scope=None, account="acct1", every=60)
+    sent_ = []
+    with mock.patch.object(subprocess, "run", lambda cmd, **k: sent_.append(cmd) or types.SimpleNamespace(returncode=0)), \
+            mock.patch.dict(os.environ, {"GH_TOKEN": "x" * 30, "ANTHROPIC_API_KEY": "k" * 30}):
+        rc_ = guard(Cloud("/w", a).start_successor, "sv-2", "h-1")
+    flat = " ".join(sent_[0]) if sent_ else ""
+    ok(rc_ == 0 and len(sent_) == 1 and " start " + DEFAULT_NAME + " sv-2 --dir " + REPO_ROOT in flat
+       and " up " not in flat and "--secret-env GH_TOKEN" in flat and "--secret-env DASK_COILED__TOKEN" in flat
+       and "--anthropic-key" in flat and "loop --name " + DEFAULT_NAME in flat and "--holder h-1" in flat
+       and "x" * 30 not in flat, f"SV40 the successor: vm_job start, same name, secrets by name only ({flat})")    # SV41a status shows the lease holder and the renewal
+    lines = guard(status_lines, {"heartbeat_utc": utc(T0), "lease": {"holder": "h-9", "renewed_utc": utc(T0),
+                                 "deadline_utc": utc(T0 + 3600)}, "renewal": {"state": "failed", "job_id": "sv-2",
+                                                                               "error": "vm_job start: 1"}}, T0 + 30)
+    ok("lease: h-9" in "\n".join(lines[0]) and "renewal: failed sv-2 vm_job start: 1" in "\n".join(lines[0]),
+       f"SV41a status shows the lease and the renewal ({lines})")
+
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 
@@ -773,9 +1051,11 @@ def main(argv=None) -> int:
         if c in ("start", "loop"):
             p.add_argument("--every", type=float, default=60)
             p.add_argument("--max-hours", type=float, default=24.0)
-    ps["start"].add_argument("--cap-usd", type=float, default=15.0)
-    ps["start"].add_argument("--budget-scope", default=None)
-    ps["loop"].add_argument("--work", default="supervisor_work")
+    for c in ("start", "loop"):
+        ps[c].add_argument("--cap-usd", type=float, default=15.0)
+        ps[c].add_argument("--budget-scope", default=None)
+    ps["loop"].add_argument("--work", default="~/supervisor_work")    # outside the tree a successor ships
+    ps["loop"].add_argument("--holder", default=None, help=argparse.SUPPRESS)   # set by the predecessor
     ps["enqueue-merge"].add_argument("prs", nargs="+", type=int)
     ps["enqueue-collect"].add_argument("configs", nargs="+")
     ps["pull"].add_argument("--dest", default=os.path.expanduser("~/modeling-agentic-keep/supervisor"))
