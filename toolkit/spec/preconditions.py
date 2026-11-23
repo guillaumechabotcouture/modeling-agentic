@@ -116,9 +116,37 @@ def _calibration_scale(run_dir, spec, signer) -> list:
     return schema.spec_scale_problems(spec)
 
 
-CHECKS = {"benchmark_eligibility": _benchmark_eligibility, "net_effect_posterior": _net_effect_posterior,
-          "calibration_scale": _calibration_scale}
-CONTEXT_CHECKS: set = set()          # checks called with the context: fn(run_dir, spec, signer, spec_bytes=, mode=, ...)
+def _engine_registry(run_dir, spec, signer, spec_bytes=None, **_ctx) -> list:
+    """Every engine the spec may run is a registered one (toolkit/spec/schema.py REGISTERED_ENGINES): the engine in
+    use (an engine choice resolved), the declaration as written in the spec bytes (auto candidates, a ref beside auto)
+    and the run's engine_choice.json, which a spec that does not load (the fallback below) has not resolved. Every
+    signing path runs it, also those that do not call the schema's validation (stage_machine.sign, decision_brief)."""
+    import json
+    import yaml
+    from toolkit.spec import schema
+    out = list(schema.engine_ref_problems(spec.raw))
+    try:
+        raw0 = yaml.safe_load(spec_bytes.decode("utf-8")) if spec_bytes else None
+    except (yaml.YAMLError, UnicodeDecodeError):
+        raw0 = None         # an unreadable spec is refused by problems() itself
+    if isinstance(raw0, dict):
+        out += [p for p in schema.engine_ref_problems(raw0) if p not in out]
+    decl = raw0 if isinstance(raw0, dict) else spec.raw
+    auto = schema.engine_is_auto(decl.get("engine")) or getattr(spec, "engine_auto", False)
+    cp = os.path.join(run_dir, schema.ENGINE_CHOICE) if run_dir and auto else None     # a named engine ignores it
+    if cp and os.path.exists(cp):
+        try:
+            ch = (json.load(open(cp, encoding="utf-8")) or {}).get("engine")
+            ref = ch.get("ref") if isinstance(ch, dict) else None
+        except (OSError, ValueError, AttributeError) as e:
+            return out + [f"{schema.ENGINE_CHOICE}: unreadable: {type(e).__name__}: {e}"]
+        out += [p for p in schema.engine_ref_problems({"engine": {"ref": ref}}) if p not in out]
+    return out
+
+
+CHECKS = {"engine_registry": _engine_registry, "benchmark_eligibility": _benchmark_eligibility,
+          "net_effect_posterior": _net_effect_posterior, "calibration_scale": _calibration_scale}
+CONTEXT_CHECKS: set = {"engine_registry"}  # checks called with the context: fn(run_dir, spec, signer, spec_bytes=, ...)
 
 
 def register(name: str, fn, context: bool = False) -> None:

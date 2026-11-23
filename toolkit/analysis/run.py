@@ -2081,6 +2081,8 @@ def _self_test_priors(ok, q):
         pp = PRI.toy_priors_file(d)
         p = schema.toy_spec(d, n=24)
         r = yaml.safe_load(open(p))
+        from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+        _G.register_test_engine("toolkit.spec.priors:ToyPriorEngine")
         r["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
         r["uncertainty"]["sources"].append({"kind": "emulator"})
         r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"}]
@@ -2408,6 +2410,8 @@ def _self_test_test_ranges(ok, q):
         pp = PRI.toy_priors_file(d)
         p = schema.toy_spec(d, n=24)
         r = yaml.safe_load(open(p))
+        from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+        _G.register_test_engine("toolkit.spec.priors:ToyPriorEngine")
         r["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
         r["uncertainty"]["sources"].append({"kind": "emulator"})
         r["uncertainty"]["excluded"] = [{"kind": "costs", "reason": "toy"},

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,6 +40,34 @@ HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evi
 # The owner's decision design principles (2026-11-12): one file, the source of truth, in every task's system prompt.
 PRINCIPLES_FILE = os.path.join(_REPO, ".claude", "orchestration", "decision_design_principles.md")
 PRINCIPLES = open(PRINCIPLES_FILE).read().strip()
+
+def owner_held_note(run_dir: str, reviewer: str) -> str:
+    """hb2 fix 3: the critic's own findings the owner (or, under --signoff lead, the lead provisionally) has answered,
+    so it carries each forward under its id instead of re-raising it (malaria R2: D-002 and R-003 were re-raised,
+    reworded, in every round, and asked again each time). The answer binds the finding's id, kind and remedy class
+    (agents/findings_ledger.py answer_fingerprint): rewording keeps it; another remedy class is asked again."""
+    try:
+        from agents import findings_ledger as FL
+        # never block on what sits at the ledger's name (a FIFO: CS12); not a regular file: nothing is listed
+        if os.path.lexists(os.path.join(run_dir, FL.LEDGER)) and _file_bytes(run_dir, FL.LEDGER) is None:
+            return ""
+        rows = [f for f in FL.load(run_dir).values() if f.source == reviewer
+                and f.status in ("owner_accepted", "owner_declined")]
+    except Exception:  # noqa: BLE001 -- no ledger: nothing is listed (the gate still reads the answers)
+        return ""
+    if not rows:
+        return ""
+    lines = []
+    for f in sorted(rows, key=lambda f: f.id):
+        ev = next((e for e in reversed(f.events or []) if isinstance(e, dict) and e.get("status") == f.status), {})
+        who = "the lead, provisionally" if ev.get("by") == "lead" else "the owner"
+        lines.append(f"{f.id} ({'accepted' if f.status == 'owner_accepted' else 'declined'} by {who}; "
+                     f"{FL.remedy_class(f.fix_requires).replace('_', ' ')}): {FL.short_label(f.claim)}")
+    return ("\n\nFindings of yours the owner has answered. Carry each forward under the same id (resolved: false while "
+            "it holds, with still_present: true in carried_forward); do not raise it again under a new id. Keep its "
+            "kind of remedy: an \"Owner amendment:\" remedy stays one, or the owner is asked again. Raise a new "
+            "finding only for something the answer did not cover.\n- " + "\n- ".join(lines))
+
 
 COMMON = """You are one bounded task inside a modeling run driven by code (a state machine). The harness
 computes every number from the decision spec and the engine; you never type a number the report
@@ -79,9 +108,10 @@ parameter, never on a unit attribute bound to data. Note what each derivation do
 data/README.md. Every file the spec cites is a staged input or a derived output; paths are relative
 to the run directory. When the options use a component whose effect depends on decision inputs
 (each engine's decision_inputs.yaml), name the evidence dossier: `evidence: {{dossier:
-evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Two
+evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Three
 rules the check refuses often: a decision test's `text` has no digits (it says in words what the
-test asks; the values tested are rendered from computed claims); and `engine_parameters` gives no
+test asks; the values tested are rendered from computed claims); nor have the yes, no and
+undetermined texts of deliverable.decision.statements (the harness renders the values); and `engine_parameters` gives no
 value for a parameter the engine card lists as calibrated or fitted (calibrate a calibrated one
 under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
 it out). Output:
@@ -122,8 +152,8 @@ say whether the engine, an input or the belief is wrong. The presentation review
 its LOW report_number_typed rows (advisory) name numbers the writer typed instead of [CLAIM:id];
 raise one only if it misleads the reader. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
-{file} in the critique-blockers schema: reviewer, round, verdict (PASS | REVISE),
-structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN;
+{file} in the critique-blockers schema: reviewer: {reviewer} (this literal value), round: {round}, verdict (PASS | REVISE),
+structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN, this prefix;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
 first_seen_round, claim, evidence, fix_requires (when the fix needs the signed decision_spec.yaml changed, start it
 with "Owner amendment:": the owner decides it, no task can), resolved (true/false), and done_when (required for
@@ -458,6 +488,122 @@ def _sio():
     return safe_io
 
 
+def _staged_list(run_dir: str) -> str:
+    """Baseline hb2 (§4.6): the drafter cited a question file by its repository path. The staged copies the spec
+    cites, from data/inputs_provenance.json (written by the stage machine's stage_inputs before the task)."""
+    try:
+        staged = sorted((json.load(open(os.path.join(run_dir, "data", "inputs_provenance.json"))).get("inputs") or {}))
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return ("\nThe staged inputs (cite these paths, relative to the run directory):\n- " + "\n- ".join(staged) + "\n"
+            if staged else "")
+
+
+_ID = re.compile(r"^([A-Za-z]+)-(\d{3,6})$")     # any other form is left as written (Codex r2, r3)
+
+
+def _registered_ids(run_dir: str, before) -> set | None:
+    """Every finding id an earlier round registered: the gate's frozen tests, the findings ledger, and the critique file
+    the session replaced. None when one cannot be read (then nothing is renumbered: the gate decides)."""
+    import yaml
+    from agents import findings_ledger as FL
+    try:
+        for rel in (FL.LEDGER, "done_when_registry.json"):      # never block on what sits there (Codex r3: a FIFO)
+            if os.path.lexists(os.path.join(run_dir, rel)) and _file_bytes(run_dir, rel) is None:
+                return None
+        ids = set(FL.load(run_dir))
+        raw = _file_bytes(run_dir, "done_when_registry.json")
+        if raw is not None:
+            tests = json.loads(raw).get("tests")
+            if not isinstance(tests, dict):
+                return None
+            ids |= {str(k) for k in tests}
+        old = yaml.safe_load(before) if before else None
+    except Exception:  # noqa: BLE001 -- unreadable: no renumbering
+        return None
+    if isinstance(old, dict):
+        for k in ("blockers", "carried_forward"):
+            for x in old.get(k) if isinstance(old.get(k), list) else []:
+                i = x.get("id") if isinstance(x, dict) else x
+                if isinstance(i, str):
+                    ids.add(i)
+    return ids
+
+
+def _file_bytes(run_dir: str, rel: str) -> bytes | None:
+    """The bytes of a regular file, read with no link followed and never blocking (a FIFO is refused; Codex r2); None
+    for anything else."""
+    try:
+        return _sio().read_nofollow(run_dir, rel)[0]
+    except Exception:  # noqa: BLE001 -- missing, a link, not a regular file: no bytes
+        return None
+
+
+def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> bool:
+    """Baseline hb2 (§4.5): the harness, not the critic, owns `reviewer` and the id prefix. After a session that wrote
+    its critique file (`before`: the file's bytes before the session; an unchanged file is not stamped, so a file the
+    session did not write never becomes this critic's review), a file that is a mapping gets the literal reviewer, and
+    each blocker that defines an id of the form X-NNN (three to six digits) with another prefix gets the critic's
+    prefix (validate_critique_yaml.PREFIXES), its carried_forward references with it, when that stamped id is free: no
+    other blocker in the file and no earlier record uses it (frozen tests, the findings ledger, the replaced file).
+    When it is used, whether the critic meant a new finding or that one cannot be told, so the id is left for the
+    critic's repair (Codex r1-r3 of #355: a new number lost a resolved finding; the old id let a new finding inherit
+    its test). When those records cannot be read (or are not regular files), nothing is renamed. A file that is
+    missing, unreadable or not a mapping, and any id that is not a string, is left as it is for the gate to refuse
+    (fail closed). True when the file was rewritten."""
+    import yaml
+    import validate_critique_yaml as V
+    rel = CRITIQUE_FILE[reviewer]
+    p = os.path.join(run_dir, rel)
+    if os.path.islink(p) or not os.path.isfile(p):
+        return False
+    now = _file_bytes(run_dir, rel)
+    if now is None or now == before:
+        return False
+    try:
+        doc = yaml.safe_load(now)
+    except Exception:  # noqa: BLE001 -- unreadable: the gate reports it
+        return False
+    if not isinstance(doc, dict):
+        return False
+    want = V.PREFIXES[reviewer]
+    blockers = [b for b in doc.get("blockers") or [] if isinstance(b, dict)] \
+        if isinstance(doc.get("blockers"), list) else []
+    cf = doc.get("carried_forward") if isinstance(doc.get("carried_forward"), list) else []
+    defined = [b.get("id") for b in blockers if isinstance(b.get("id"), str)]
+    ren: dict = {}
+    wrong = [i for i in defined if _ID.match(i) and not i.startswith(want)]
+    known = _registered_ids(run_dir, before) if wrong else set()
+    if known is not None:
+        used = set(defined) | known
+        for i in wrong:
+            if i in ren or defined.count(i) > 1:
+                continue                         # a duplicated id is the gate's to refuse
+            new = want + _ID.match(i).group(2)
+            if new in used:
+                # Codex r3: a new finding or that finding (resolved, carried, re-reviewed in the same round) cannot be
+                # told apart, so neither a new number nor the old id is given: the critic repairs it
+                continue
+            ren[i] = new
+            used.add(new)
+    if doc.get("reviewer") == reviewer and not ren:
+        return False
+    doc["reviewer"] = reviewer
+    for b in blockers:
+        i = b.get("id")
+        if isinstance(i, str) and i in ren:
+            b["id"] = ren[i]
+    for k, c in enumerate(cf):
+        i = c.get("id") if isinstance(c, dict) else c
+        if isinstance(i, str) and i in ren:
+            if isinstance(c, dict):
+                c["id"] = ren[i]
+            else:
+                cf[k] = ren[i]
+    _sio().write_nofollow(run_dir, rel, yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode(), atomic=True)
+    return True
+
+
 class SdkTasks:
     """Each call's dollar cap is the allowance the machine sets just before it (set_allowance: the
     run's remaining budget less the write-up reserve, at most the task cap). Spend is charged
@@ -603,7 +749,8 @@ class SdkTasks:
 
     def draft_spec(self, question, run_dir, feedback):
         R = enforcement.REPO_ROOT
-        p = f"Question:\n{question}\n" + (f"\nThe last draft failed validation:\n- " + "\n- ".join(feedback) if feedback else "")
+        p = f"Question:\n{question}\n" + _staged_list(run_dir) + (
+            f"\nThe last draft failed validation:\n- " + "\n- ".join(feedback) if feedback else "")
         return self._session("draft_spec", PROMPTS["draft_spec"].format(
             settings=_settings_text(), skill=os.path.join(R, ".claude", "skills", "decision-spec", "SKILL.md"),
             schema=os.path.join(R, "toolkit", "spec", "schema.py"), example=os.path.join(R, "spike", "decision_spec.v2.yaml"),
@@ -646,13 +793,16 @@ class SdkTasks:
         from toolkit.analysis import red_flag as RF       # heuristic notes the reviewer judges; never a gate
         notes = RF.critic_notes(run_dir)
         msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
-                                            + "\n- ".join(notes) if notes else "")
-        return self._session("critique", PROMPTS["critique"].format(
+                                            + "\n- ".join(notes) if notes else "") + owner_held_note(run_dir, reviewer)
+        before = _file_bytes(run_dir, f)
+        res = self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
             stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
-                             msg, (f,), model)
+                            msg, (f,), model)
+        stamp_critique(run_dir, reviewer, before)
+        return res
 
     def plan_fixes(self, packet):
         inp = self._input(packet)
@@ -824,6 +974,22 @@ def _self_test() -> int:
         ok(all(k in cp2 for k in ("resolved_in_round: 2", "resolved_evidence", "prior_round: 1", "still_present",
                                   "never a bare id")),
            "S17 the critique prompt states what a resolved blocker and a carried_forward entry need")
+        # S17b (hb2 fix 3): the critic is told which of its findings the owner answered, to carry them forward
+        from agents import findings_ledger as _FL
+        with tempfile.TemporaryDirectory() as d17:
+            _a = _FL.Finding(id="D-002", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                             status="owner_accepted", claim="ITN durability is a point value.",
+                             fix_requires="Owner amendment: add a range.")
+            _a.events.append({"round": 1, "status": "owner_accepted", "by": "lead"})
+            _o = _FL.Finding(id="R-003", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                             status="owner_accepted", claim="k is fixed.")
+            _FL.save(d17, {"D-002": _a, "R-003": _o})
+            n_dom, n_red = owner_held_note(d17, "critique-domain"), owner_held_note(d17, "critique-redteam")
+            n_none = owner_held_note(d17, "critique-presentation")
+        ok("D-002 (accepted by the lead, provisionally; owner amendment)" in n_dom and "R-003" not in n_dom
+           and "same id" in n_dom and "R-003 (accepted by the owner; fix)" in n_red and n_none == ""
+           and owner_held_note(os.path.join(d17, "gone"), "critique-domain") == "",
+           f"S17b each critic is told which of its findings the owner answered ({n_dom!r}, {n_red!r})")
         ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT, files="f")
            and "engine: auto" in PROMPTS["draft_spec"], "S10 the prompts follow the analysis backend's schema")
 
@@ -953,6 +1119,236 @@ def _self_test() -> int:
             SdkTasks._session = orig_session
         ok("R-030: overstates Required: say tested" in where.get("write", ("", "", 0, ""))[3],
            "PS1 the writer gets the write-up findings with their remedies")
+        # CS1-CS5 (baseline hb2 §4.5, three runs): the presentation critic wrote reviewer 'presentation' (or
+        # 'critique_presentation') and ids R-NNN; each cost a schema repair. The harness stamps the literal reviewer
+        # and the critic's id prefix after the session; the prompt states both literally.
+        import yaml as _y
+
+        def critic_writes(doc):
+            def fake(self_, kind, system, prompt, owns, model=None):
+                where["critique_prompt"] = system
+                if doc is not None:
+                    _y.safe_dump(doc, open(os.path.join(self_.run_dir, owns[0]), "w"), sort_keys=False)
+                return TaskResult(True, {"ok": True}, 0.0, "fake")
+            return fake
+
+        def blk(i, **k):
+            return dict({"id": i, "severity": "LOW", "category": "PRESENTATION", "target_stage": "WRITE",
+                         "first_seen_round": 1, "claim": "c", "evidence": "e", "fix_requires": "f",
+                         "resolved": False}, **k)
+        cs = {}
+        for name, rev, doc in (
+                ("run_a", "critique-presentation", {"reviewer": "presentation", "round": 2, "verdict": "PASS",
+                                                    "structural_mismatch": {"detected": False},
+                                                    "carried_forward": [{"id": "R-001", "prior_round": 1,
+                                                                         "still_present": True, "notes": "n"}],
+                                                    "blockers": [blk("R-001"), blk("R-002")]}),
+                ("run_b", "critique-presentation", {"reviewer": "critique_presentation", "round": 2,
+                                                         "verdict": "PASS", "structural_mismatch": {"detected": False},
+                                                         "carried_forward": [], "blockers": []}),
+                ("domain", "critique-domain", {"reviewer": "domain", "round": 2, "verdict": "PASS",
+                                               "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                               "blockers": [blk("D-001", category="HYPOTHESES")]})):
+            cd = os.path.join(d, "cs_" + name)
+            os.makedirs(cd)
+            SdkTasks._session = critic_writes(doc)
+            try:
+                SdkTasks(cd).critique(cd, rev, 2)
+            finally:
+                SdkTasks._session = orig_session
+            try:
+                got = V.validate_critique(os.path.join(cd, CRITIQUE_FILE[rev]), rev, 2)
+                cs[name] = ("ok", [b["id"] for b in got["blockers"]], [c["id"] for c in got["carried_forward"]])
+            except V.SchemaError as e:
+                cs[name] = ("refused", getattr(e, "errors", None) or [str(e)])
+        ok(cs.get("run_a") == ("ok", ["P-001", "P-002"], ["P-001"]) and cs.get("run_b", ("",))[0] == "ok"
+           and cs.get("domain") == ("ok", ["D-001"], []),
+           f"CS1 the harness stamps each critic's reviewer and id prefix, carried_forward ids with them ({cs})")
+        cd = os.path.join(d, "cs_collide")
+        os.makedirs(cd)
+        SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 1, "verdict": "PASS",
+                                           "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                           "blockers": [blk("P-001"), blk("R-001")]})
+        try:
+            SdkTasks(cd).critique(cd, "critique-presentation", 1)
+        finally:
+            SdkTasks._session = orig_session
+        raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
+        ok(raw["reviewer"] == "critique-presentation" and [b["id"] for b in raw["blockers"]] == ["P-001", "R-001"],
+           f"CS2 an id whose stamped form is taken is left for the critic's repair, never merged or renumbered "
+           f"({raw['blockers']})")
+        for name, body in (("cs_missing", None), ("cs_list", ["not", "a", "mapping"])):
+            cd = os.path.join(d, name)
+            os.makedirs(cd)
+            SdkTasks._session = critic_writes(body)
+            try:
+                SdkTasks(cd).critique(cd, "critique-presentation", 1)
+                crashed = None
+            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                crashed = repr(e)
+            finally:
+                SdkTasks._session = orig_session
+            p = os.path.join(cd, "critique_presentation.yaml")
+            ok(crashed is None and (os.path.exists(p) == (body is not None))
+               and (body is None or _y.safe_load(open(p)) == body),
+               f"CS3 a missing or non-mapping critique file is left as it is for the gate to refuse ({name}, {crashed})")
+        # SD1-SD2 (baseline hb2 §4.6): the drafter put digits in deliverable.decision.statements
+        # and cited a question file by its repository path, not its staged copy. The prompt names the statements in
+        # the no-digits rule, and the task's message lists the staged input paths.
+        sd = os.path.join(d, "sd")
+        os.makedirs(os.path.join(sd, "data"))
+        json.dump({"inputs": {"data/inputs/data/evals/q/districts.csv": {"source": "data/evals/q/districts.csv"},
+                              "data/inputs/data/evals/q/sero.csv": {"source": "data/evals/q/sero.csv"}}},
+                  open(os.path.join(sd, "data", "inputs_provenance.json"), "w"))
+
+        def sd_session(self_, kind, system, prompt, owns, model=None):
+            where["draft_msg"] = prompt
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        SdkTasks._session = sd_session
+        try:
+            SdkTasks(sd).draft_spec("Q? Inputs: data/evals/q/districts.csv, data/evals/q/sero.csv", sd, None)
+        finally:
+            SdkTasks._session = orig_session
+        dm = where.get("draft_msg") or ""
+        ok("data/inputs/data/evals/q/districts.csv" in dm and "data/inputs/data/evals/q/sero.csv" in dm,
+           f"SD1 the draft task's message lists the staged input paths to cite ({dm[-300:]!r})")
+        ok("deliverable.decision.statements" in " ".join(PROMPTS["draft_spec"].split()),
+           "SD2 the draft prompt's no-digits rule names deliverable.decision.statements")
+        cpp = where.get("critique_prompt") or ""
+        ok("reviewer: critique-presentation" in cpp and "P-NNN" in cpp,
+           "CS4 the critique prompt states the literal reviewer value and id prefix")
+        # CS5-CS8 (Codex r1 of #355). CS5: an id an earlier round registered (a frozen test, a ledger row, the file the
+        # session replaced) is never given to a new finding: the old test would close it. The stamped id is the next
+        # free number.
+        cd = os.path.join(d, "cs_registered")
+        os.makedirs(cd)
+        json.dump({"tests": {"P-001": {"done_when": [{"file": "README.md", "exists": True}]}}},
+                  open(os.path.join(cd, "done_when_registry.json"), "w"))
+        _y.safe_dump({"blockers": [blk("P-002")]}, open(os.path.join(cd, "critique_presentation.yaml"), "w"))
+        SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 2, "verdict": "REVISE",
+                                           "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                           "blockers": [blk("R-001", severity="HIGH")]})
+        try:
+            SdkTasks(cd).critique(cd, "critique-presentation", 2)
+        finally:
+            SdkTasks._session = orig_session
+        raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
+        # Codex r3 of #355: whether R-001 is a new finding or P-001 resolved (a same-round re-review has no
+        # carried_forward) cannot be told, so neither a new number nor the old id is given: the critic repairs it.
+        ok([b["id"] for b in raw["blockers"]] == ["R-001"],
+           f"CS5 an id whose stamped form an earlier round registered is left for the critic's repair "
+           f"({[b['id'] for b in raw['blockers']]})")
+        # CS11 (Codex r3): an id not in the NNN form (R-1) is left as written, so no second identity of P-001 passes.
+        # CS12 (Codex r3): a FIFO at the registry's or the ledger's name never blocks the stamp.
+        import threading
+        cs11 = {}
+        for name, fifo in (("short", None), ("fifo_registry", "done_when_registry.json"), ("fifo_ledger", "findings.jsonl")):
+            cd = os.path.join(d, "cs11_" + name)
+            os.makedirs(cd)
+            if fifo:
+                os.mkfifo(os.path.join(cd, fifo))
+            SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 2, "verdict": "PASS",
+                                               "structural_mismatch": {"detected": False},
+                                               "carried_forward": [] if fifo else [{"id": "R-1", "prior_round": 1,
+                                                                                    "still_present": False, "notes": "n"}],
+                                               "blockers": [blk("R-1" if not fifo else "R-001")]})
+            th = threading.Thread(target=lambda: SdkTasks(cd).critique(cd, "critique-presentation", 2), daemon=True)
+            try:
+                th.start()
+                th.join(10)
+            finally:
+                SdkTasks._session = orig_session
+            if th.is_alive():
+                cs11[name] = "blocked"
+                try:
+                    os.close(os.open(os.path.join(cd, fifo), os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:
+                    pass
+                th.join(5)
+            else:
+                cs11[name] = [b["id"] for b in _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))["blockers"]]
+        ok(cs11 == {"short": ["R-1"], "fifo_registry": ["R-001"], "fifo_ledger": ["R-001"]},
+           f"CS11/CS12 an id outside the NNN form is left as written; an unreadable registry or ledger renumbers "
+           f"nothing and never blocks ({cs11})")
+        # CS6: an id that is not a string is left for the validator to name, never a crash.
+        cs6 = {}
+        for name, body in (("list_id", {"reviewer": "presentation", "blockers": [{"id": ["R-001"]}]}),
+                           ("map_cf", {"reviewer": "presentation", "blockers": [blk("R-001")],
+                                       "carried_forward": [{"id": {"x": 1}}]})):
+            cd = os.path.join(d, "cs_" + name)
+            os.makedirs(cd)
+            SdkTasks._session = critic_writes(body)
+            try:
+                SdkTasks(cd).critique(cd, "critique-presentation", 1)
+                cs6[name] = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))["reviewer"]
+            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                cs6[name] = repr(e)
+            finally:
+                SdkTasks._session = orig_session
+        ok(all(v == "critique-presentation" for v in cs6.values()),
+           f"CS6 a non-string id does not stop the stamp ({cs6})")
+        # CS7: a session that wrote nothing leaves the file it found as it was (another critic's document is not
+        # turned into this critic's review).
+        cd = os.path.join(d, "cs_stale")
+        os.makedirs(cd)
+        before = {"reviewer": "critique-domain", "round": 2, "verdict": "PASS",
+                  "structural_mismatch": {"detected": False}, "carried_forward": [], "blockers": []}
+        _y.safe_dump(before, open(os.path.join(cd, "critique_presentation.yaml"), "w"))
+
+        def no_write(self_, kind, system, prompt, owns, model=None):
+            return TaskResult(False, None, 0.0, "fake failure")
+        SdkTasks._session = no_write
+        try:
+            SdkTasks(cd).critique(cd, "critique-presentation", 2)
+        finally:
+            SdkTasks._session = orig_session
+        ok(_y.safe_load(open(os.path.join(cd, "critique_presentation.yaml"))) == before,
+           "CS7 a session that did not write its file gets no stamp: the file it found is unchanged")
+        # CS8-CS10 (Codex r2 of #355). CS8: a wrong-prefix id the critic also carries forward, whose stamped form an
+        # earlier round registered, is a reference to that finding: it is not given a new id (the old finding would be
+        # reported dropped); it is left for the gate's repair. CS9: an id too long to be one is left as written.
+        cs8 = {}
+        for name, doc, reg in (
+                ("carried", {"reviewer": "presentation", "round": 2, "verdict": "PASS",
+                             "structural_mismatch": {"detected": False},
+                             "carried_forward": [{"id": "R-001", "prior_round": 1, "still_present": False, "notes": "n"}],
+                             "blockers": [blk("R-001", resolved=True)]}, True),
+                ("long", {"reviewer": "presentation", "blockers": [blk("R-" + "9" * 5000)]}, False)):
+            cd = os.path.join(d, "cs8_" + name)
+            os.makedirs(cd)
+            if reg:
+                json.dump({"tests": {"P-001": {"done_when": [{"judgement": "j"}]}}},
+                          open(os.path.join(cd, "done_when_registry.json"), "w"))
+            SdkTasks._session = critic_writes(doc)
+            try:
+                SdkTasks(cd).critique(cd, "critique-presentation", 2)
+                raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
+                cs8[name] = ([b["id"][:4] for b in raw["blockers"]],
+                             [c["id"] for c in raw.get("carried_forward") or []])
+            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                cs8[name] = repr(e)[:120]
+            finally:
+                SdkTasks._session = orig_session
+        ok(cs8 == {"carried": (["R-00"], ["R-001"]), "long": (["R-99"], [])},
+           f"CS8/CS9 a carried reference to a registered id, and an id too long to be one, are left for the gate ({cs8})")
+        # CS10: the snapshot before the session never blocks on what sits at the file's name (a FIFO).
+        import threading
+        cd = os.path.join(d, "cs_fifo")
+        os.makedirs(cd)
+        os.mkfifo(os.path.join(cd, "critique_presentation.yaml"))
+        SdkTasks._session = no_write
+        th = threading.Thread(target=lambda: SdkTasks(cd).critique(cd, "critique-presentation", 1), daemon=True)
+        try:
+            th.start()
+            th.join(10)
+        finally:
+            SdkTasks._session = orig_session
+        ok(not th.is_alive(), "CS10 a FIFO at the critique file's name does not block the snapshot")
+        if th.is_alive():                                 # release the blocked open so the test can end
+            try:
+                os.close(os.open(os.path.join(cd, "critique_presentation.yaml"), os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")

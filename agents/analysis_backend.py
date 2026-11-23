@@ -371,6 +371,10 @@ def merged_spec(run_dir: str) -> dict:
             for q in parts[:-1]:
                 cur = cur.setdefault(q, {})
             cur[parts[-1]] = v
+    from toolkit.spec import schema
+    unreg = schema.engine_ref_problems(spec)      # the declaration as signed, before a choice replaces it (#367)
+    if unreg:
+        raise ValueError("; ".join(unreg))
     eng = engine_choice_ref(run_dir)
     auto = spec.get("engine") in (None, "auto") or (isinstance(spec.get("engine"), dict) and spec["engine"].get("auto"))
     if eng and auto:                      # an explicit engine in the signed spec wins
@@ -442,7 +446,9 @@ def pre_sign_problems(run_dir: str, derived: bool | None = None) -> list[str]:
         spec = yaml.safe_load(open(os.path.join(run_dir, SPEC_FILE))) or {}
     except Exception as e:  # noqa: BLE001
         return [f"{SPEC_FILE} unreadable: {type(e).__name__}"]
-    return [f"missing section {k}" for k in REQUIRED if k != "engine" and k not in spec] + settings_problems(run_dir, spec)
+    from toolkit.spec import schema
+    return [f"missing section {k}" for k in REQUIRED if k != "engine" and k not in spec] + settings_problems(run_dir, spec) \
+        + schema.engine_ref_problems(spec)     # the declaration as signed: candidates and a named engine (#367)
 
 
 def choice_spec(run_dir: str) -> dict:
@@ -1260,10 +1266,12 @@ def _self_test_benchmark_gate(ok) -> None:
     strip = lambda r: sorted(w.replace(r["ref"], "") for w in r["why_not"])  # noqa: E731
     # the engine is refused either for its uncovered cm component or, while a pack benchmark is not yet run (F6 option
     # A: B9d-B9g until the cloud pack run), for its refused benchmark record; the alias must match either way
-    ok(not rc["eligible"] and strip(rc) == strip(ra)
-       and any("component cm" in w or ("benchmark record refused" in w and "not yet run" in w) for w in ra["why_not"]),
-       f"G24 an alias import of the malaria engine is assessed exactly like the canonical reference "
-       f"({strip(ra)[:1]})")
+    # PR #363 question 15: the alias is not a registered engine, so it is now refused outright (stricter than before)
+    ok(not rc["eligible"] and not ra["eligible"]
+       and any("component cm" in w or ("benchmark record refused" in w and "not yet run" in w) for w in rc["why_not"])
+       and any("not a registered engine" in w for w in ra["why_not"]),
+       f"G24 an alias import of the malaria engine is refused as unregistered; the canonical reference is assessed "
+       f"as before ({strip(ra)[:1]})")
 
 
 def _self_test_engine_choice(ok) -> None:
@@ -1367,6 +1375,76 @@ def _self_test_engine_choice(ok) -> None:
        and forms.get(COMPARTMENTAL, {}).get("auto") is False and forms.get(REN, {}).get("auto") == "estimates",
        f"B_SPEC_FORMS each registered engine is configurable by `auto`, by an estimates spec, or only when named "
        f"({ {k.rsplit(':', 1)[-1]: v.get('auto') for k, v in forms.items()} })")
+
+
+def _self_test_registry(ok) -> None:
+    """B_REGISTRY, ER-SIGN1/2, ER-ANALYZE1/2 (PR #363 question 15): a spec names only a registered engine; an
+    unregistered one is refused at sign-off and again when the analysis runs, and a registered one passes."""
+    import json
+    import tempfile
+    import yaml
+    from types import SimpleNamespace as _NS
+    from toolkit.spec import schema, signoff
+    from toolkit.analysis import run as RUN
+    ok([e[0] for e in ENGINES] == list(schema.REGISTERED_ENGINES),
+       "B_REGISTRY ENGINES and toolkit/spec/schema.py REGISTERED_ENGINES name the same engines in the same order")
+    hook = "toolkit.engines.hooks:ToyScheduleEngine"      # allowed by the import policy, not registered
+    api = _ToolkitApi(_NS(headline=None, gate_findings=None))
+
+    def outcome(fn):
+        try:
+            fn()
+            return "accepted"
+        except Exception as e:  # noqa: BLE001 -- the refusal's text is the result
+            return f"{type(e).__name__}: {e}"
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d)
+        raw = yaml.safe_load(open(p))
+        reg = dict(raw["engine"]) if isinstance(raw["engine"], dict) else {"ref": raw["engine"]}
+        from toolkit.spec import preconditions as PC
+        for name, eng in (("named", {"ref": hook}), ("auto candidate", {"auto": True, "candidates": [hook]}),
+                          ("ref beside auto", {"auto": True, "ref": hook, "candidates": [reg["ref"]]})):
+            yaml.safe_dump(dict(raw, engine=eng), open(p, "w"))
+            pre = api.pre_sign_problems(d)
+            sig = outcome(lambda: signoff.sign(d, "owner"))
+            try:
+                st = signoff.status(d)
+            except Exception as e:  # noqa: BLE001 -- a status that crashes is the failure
+                st = f"{type(e).__name__}: {e}"
+            # the shared preconditions every signing path runs (stage_machine.sign, decision_brief sign: no validate)
+            pc = PC.problems(d, open(p, "rb").read(), "owner")
+            ok(any("not a registered engine" in x for x in pre) and "not a registered engine" in sig
+               and st == "invalid" and any("not a registered engine" in x for x in pc),
+               f"ER-SIGN1 ({name}) an unregistered engine is a pre-sign problem, a precondition of every signing path, "
+               f"signing refuses it and the status is invalid ({pre[:1]}; {sig[:100]}; {st[:80]}; {pc[:1]})")
+        # Codex r1 of #367: an unregistered class in a registered engine's module gets neither its coverage, pack nor
+        # decision-input declaration
+        from toolkit.engines import benchmark_coverage as BCOV
+        from toolkit.spec import evidence_dossier as EDOS
+        ghost = reg["ref"].split(":")[0] + ":NotRegisteredEngine"
+        dec = outcome(lambda: EDOS.engine_declaration(ghost))
+        ok(not os.path.exists(BCOV.path_for(ghost)) and BCOV._pack(ghost) is None and "not a registered engine" in dec,
+           f"ER-SIGN3 an unregistered class reads no registered engine's coverage, pack or declaration ({dec[:100]})")
+        yaml.safe_dump(dict(raw, engine=reg), open(p, "w"))
+        pre = [x for x in api.pre_sign_problems(d) if "registered engine" in x]
+        ok(schema.check_engine_ref(reg["ref"]) and not pre,
+           f"ER-SIGN2 a registered engine raises no registry problem before sign-off ({pre[:1]})")
+        # ANALYZE: the analysis validates and builds the engine itself, so a spec edited after sign-off, or an
+        # engine choice written after it, is refused there too (fail closed)
+        yaml.safe_dump(dict(raw, engine={"ref": hook}), open(p, "w"))
+        an1 = outcome(lambda: RUN.run(d, unsigned=True, log=lambda *a, **k: None))
+        yaml.safe_dump(dict(raw, engine="auto"), open(p, "w"))
+        json.dump({"engine": {"ref": hook}}, open(os.path.join(d, schema.ENGINE_CHOICE), "w"))
+        an2 = outcome(lambda: RUN.run(d, unsigned=True, log=lambda *a, **k: None))
+        ok("not a registered engine" in an1 and "not a registered engine" in an2
+           and not os.path.exists(os.path.join(d, "analysis", "analysis.json")),
+           f"ER-ANALYZE1 the analysis refuses an unregistered engine, named or chosen, before it writes a result "
+           f"({an1[:100]}; {an2[:100]})")
+        os.remove(os.path.join(d, schema.ENGINE_CHOICE))
+        yaml.safe_dump(dict(raw, engine=dict(reg, registered=True, test=True)), open(p, "w"))
+        loaded = schema.load(p)
+        ok(type(loaded.engine()).__name__ == reg["ref"].split(":")[1],
+           "ER-ANALYZE2 a registered engine still builds at the analysis boundary")
 
 
 def _self_test() -> int:
@@ -1541,6 +1619,10 @@ def _self_test() -> int:
            "B23b an allocation spec: the renewal engine is not eligible")
     _self_test_engine_choice(ok)
     _self_test_benchmark_gate(ok)
+    try:
+        _self_test_registry(ok)
+    except Exception as e:  # noqa: BLE001 -- a crash in these cases is a failure, not a skip
+        ok(False, f"engine registry cases could not run: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

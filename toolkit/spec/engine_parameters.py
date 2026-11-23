@@ -1116,6 +1116,8 @@ def _self_test() -> int:
             s = schema.load(schema.toy_spec(d))
             pp = PRI.toy_priors_file(d)
             rp = copy.deepcopy(s.raw)
+            from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+            _G.register_test_engine("toolkit.spec.priors:ToyPriorEngine")
             rp["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
             got = {"toy": dig(s), "toy_priors": dig(schema.Spec(rp, d))}
             ok(got == GOLDEN_JOB_DIGESTS, f"EP-H1 without the field, batch job hashes are byte-identical to before it "

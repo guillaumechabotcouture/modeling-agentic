@@ -104,7 +104,9 @@ def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, comp
         by = [{"group": g, "changed": v[0], "units": v[1]} for g, v in sorted(n.items(), key=lambda kv: (-kv[1][0],
                                                                                                          kv[0])) if v[0]]
     share = lambda x: x / float(budget) if budget > 0 else None  # noqa: E731
-    rec = {"units_changed": len(changed), "share_units_changed": len(changed) / len(ids),
+    # the units whose package changes (owner decision (b), 2026-11-23: an accepted plan-changing test's report names them)
+    rec = {"units_changed": len(changed), "units_changed_ids": [str(i) for i in changed],
+           "share_units_changed": len(changed) / len(ids),
            "point_plan_feasible": not why, "point_plan_infeasible": why,
            "point_plan_objective_under_test": point, "reoptimised_objective": float(objective), "objective_gap": gap,
            "regret": regret, "regret_share": regret / float(objective) if regret is not None and objective > 0 else None,
@@ -308,6 +310,8 @@ def _self_test() -> int:
     ok(e is None and abs(m.get("regret", -1) - 6.0) < 1e-12 and abs(m.get("regret_share", -1) - 0.3) < 1e-12
        and m.get("point_plan_objective_under_test") == 14.0,
        f"MV1 regret is the re-optimised objective minus the point plan's under the test ({e or m.get('regret')})")
+    ok(m.get("units_changed_ids") == ["u1", "u4"], f"MV2b the units whose package changes are named "
+                                                   f"({m.get('units_changed_ids')})")
     ok(m.get("units_changed") == 2 and m.get("share_units_changed") == 0.5 and m.get("population_changed") == 500.0
        and abs(m.get("population_changed_share", -1) - 0.5) < 1e-12,
        f"MV2 population whose package changes, from the population column ({m.get('population_changed')})")
