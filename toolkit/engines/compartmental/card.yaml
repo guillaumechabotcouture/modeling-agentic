@@ -506,6 +506,25 @@ benchmarks:
   - 3.0278826381314758e-18
   in_band: true
   status: in_band
+- id: DS2c
+  metric: 'direct solver: R0 = 0.5, attack rate equals the seeded closed form (seeds included, so above 1e-9)'
+  role: held_out
+  target: null
+  band: null
+  source: threshold theorem; Lambert W
+  band_sha256: 3990c88407c053fb328b435bfafec95bb9fec7776d06148f445ea83d806dde66
+  computed: 1.9999999969721175e-09
+  reference: 1.9999998324138346e-09
+  error_abs: 1.6455828287579792e-16
+  error_rel: 8.227914833232244e-08
+  tolerance:
+    abs: 1.0e-12
+  compare: eq
+  per_seed_error_abs:
+  - 1.6455828287579792e-16
+  - 1.6455828287579792e-16
+  in_band: true
+  status: in_band
 - id: DS2b
   metric: 'direct solver: R0 = 1.01, final size equals the seeded closed form'
   role: held_out
@@ -552,7 +571,7 @@ benchmarks:
   in_band: true
   status: in_band
 - id: DS6a
-  metric: 'direct solver: multigroup final size equals the reference ODE, identity matrix (seeded group only)'
+  metric: 'direct solver: multigroup final size equals the reference ODE, C = 2I (seeded group only)'
   role: held_out
   target: null
   band: null
@@ -1772,5 +1791,5 @@ parameters:
   verified: unverified
 validation_label: validated against analytic identities and simulation-based coverage; published benchmarks FS7
   and RN5 not yet assessed
-results_sha256: 42506a40ecfe52468adb119dcd2158ad801a861e8b86bcdd382ffb5605e7461e
+results_sha256: beb9908a0a89411683472a2e4707e3ca427f428b16bb27418ca71897bafbb1cd
 benchmark_pack: 'benchmarks/pack.yaml (oracles: benchmarks/oracles.py, test only)'

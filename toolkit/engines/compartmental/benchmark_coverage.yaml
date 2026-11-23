@@ -83,6 +83,7 @@ benchmarks:
   DS1b: {covers: {}, covers_none_because: *ds}
   DS1c: {covers: {}, covers_none_because: *ds}
   DS2a: {covers: {}, covers_none_because: *ds}
+  DS2c: {covers: {}, covers_none_because: *ds}
   DS2b: {covers: {}, covers_none_because: *ds}
   DS3: {covers: {}, covers_none_because: *ds}
   DS6a: {covers: {}, covers_none_because: *ds}
