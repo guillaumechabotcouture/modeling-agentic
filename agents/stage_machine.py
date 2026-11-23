@@ -6495,6 +6495,49 @@ def _self_test_spec_p1s(ok, td: str, spike, new_run) -> None:
         res4[name] = bool(any(rel in x and "link" in x for x in got4) and not any("fixture_marker" in x for x in got4)
                           and not getattr(m4, "ran", []))
     ok(all(res4.values()), f"SP4 a linked spec or settings file is refused before any check reads it ({res4})")
+    # SP5 (Codex r1 P1-1): through h_SPEC, a hard-linked spec is refused before the conflicts default rewrites it
+    d5, T5, st5 = new_run("sp5", {})
+
+    class Linking(StubTasks):
+        def draft_spec(self, q, rd, fb):
+            r = StubTasks(self.s).draft_spec(q, rd, fb)
+            os.link(os.path.join(rd, AB.SPEC_FILE), os.path.join(td, "sp5_other_name.yaml"))
+            return r
+    m5 = Machine(d5, Linking(T5.s), st5, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m5.step()
+    ok(m5.st.state == "SPEC" and any("hard links" in x for x in m5.st.tries.get("spec_feedback") or []),
+       f"SP5 a hard-linked spec is refused at the try's end, before the conflicts default is applied ({m5.st.state}, "
+       f"{m5.st.tries.get('spec_feedback')})")
+
+    # SP6 (Codex r1 P1-2/P1-3): a FIFO anywhere in the run, whatever path names it (a staged input a derivation reads,
+    # a name with a leading space), is refused before derivations or any check runs
+    class SpyAll(Spy):
+        def _derive(self, rd=None):
+            self.ran = getattr(self, "ran", []) + ["derive"]
+            return []
+    res6 = {}
+    for name, rel, cite in (("staged input", "data/inputs/t.csv", None), ("spaced name", " units.csv", " units.csv")):
+        d6, T6, st6 = new_run("sp6_" + name.replace(" ", "_"), {})
+        spec6 = T6.s["spec"] if cite is None else dict(
+            T6.s["spec"], decision_units=dict(T6.s["spec"]["decision_units"], csv=cite))
+        StubTasks(dict(T6.s, spec=spec6)).draft_spec("q", d6, None)
+        os.makedirs(os.path.dirname(os.path.join(d6, rel)), exist_ok=True)
+        os.mkfifo(os.path.join(d6, rel))
+        m6 = SpyAll(d6, T6, st6, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        m6.st.derived_inputs = True
+        got6 = m6._spec_checks(d6)
+        res6[name] = bool(any("regular file" in x for x in got6) and not getattr(m6, "ran", []))
+    ok(all(res6.values()), f"SP6 a FIFO in the run is refused before derivations or any reading check ({res6})")
+    # SP7 (Codex r1 P1-5): a run saved before this fix (feedback "draft_spec failed: ...", no checked copy) still has a
+    # later capped try's valid draft checked
+    d7, T7, st7 = new_run("sp7", {})
+    st7.tries.update(spec=1, spec_feedback=["draft_spec failed: max turns"])
+    save_state(d7, st7)
+    T7 = Capped(dict(T7.s, tries=["good"]))
+    m7 = Machine(d7, T7, st7, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m7.step()
+    ok(m7.st.state == "EVIDENCE", f"SP7 a capped try after an earlier no-draft note is checked ({m7.st.state}, "
+                                  f"{m7.st.tries.get('spec_feedback')})")
     # SP2: an explicit zero turn cap is refused, never passed on as "no limit"
     from v2_sdk_tasks import SdkTasks
     try:
