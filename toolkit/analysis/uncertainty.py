@@ -722,6 +722,26 @@ def _self_test() -> int:
        f"UQE1 draws near the largest float: finite mean and median, not flagged constant ({big})")
     can = _q([1e16, 1.0, -1e16])
     ok(abs(can["mean"] - 1.0 / 3.0) < 1e-15, f"UQE2 a mean with cancelling draws is exact ({can['mean']})")
+    s_, m_ = 2.0 ** 1023, sys.float_info.max
+    try:
+        e4 = [_q([s_, s_, -s_, -0.75 * s_, -0.25 * s_])["mean"], _q([s_, -s_, s_, -0.75 * s_, -0.25 * s_])["mean"],
+              _q([m_] * 3)["mean"]]
+    except OverflowError as e:
+        e4 = [f"OverflowError: {e}"]
+    ok(e4 == [0.0, 0.0, m_], f"UQE4 the overflow fallback of the mean is exact and order-free (Codex r2) ({e4})")
+    try:
+        e5 = _q([m_] * 4, level=0.8)
+        e5 = [e5[k] for k in ("ci_low", "median", "ci_high")]
+    except Exception as e:  # noqa: BLE001
+        e5 = [f"{type(e).__name__}"]
+    try:
+        e6 = _q(np.array([[1.0], [3.0]]))
+        e6 = (e6["mean"], e6["median"])
+    except Exception as e:  # noqa: BLE001
+        e6 = f"{type(e).__name__}"
+    ok(e5 == [m_, m_, m_] and e6 == (2.0, 2.0),
+       f"UQE5 identical draws at the largest float give equal quantiles; a column vector is read flat (Codex r2) "
+       f"({e5}, {e6})")
     v_ = np.random.default_rng(3).normal(5.0, 2.0, 400)
     q_ = _q(v_, 0.9)
     ok(q_["median"] == float(np.median(v_)) and q_["ci_low"] == float(np.percentile(v_, 100 * (1 - 0.9) / 2))
