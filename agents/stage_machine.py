@@ -6381,19 +6381,37 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
            f"WR4 an owner-accepted finding is declared, not sent to a fix loop with no task ({s}, {to[-8:]}, {crit})")
         ok(to.count("OWNER_DECISION") == 1,
            f"WR5 the same finding (same fingerprint) is asked once ({to.count('OWNER_DECISION')} request(s))")
-        # WR5b (hb2 fix 3): the critic re-raises it reworded in each round, with a HIGH beside it that a fix closes; the
-        # answer holds through the rewording: asked once in three rounds
+        # WR5b (hb2 fix 3, malaria R2 D-002): the critic carries the answered finding into round 2 reworded, beside a
+        # HIGH a fix closed in round 1; the answer holds through the rewording: asked once, declared in round 2
         hi = {"id": "D-009", "severity": "HIGH", "target_stage": "ANALYZE", "claim": "too few draws",
               "done_when": [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 32}]}
-        rw = {r: {"critique-domain": [dict(amend, claim=f"net durability is untested (round {r} wording)")]
-                  + ([hi] if r == 1 else [])} for r in (1, 2, 3)}
-        d5, T5, st5 = new_run("wr_owner_reworded", {"critics": rw, "fixes": {"D-009": [
-            ("analysis_settings.yaml", "uncertainty.draws", 32)]}}, signoff="lead", max_rounds=3)
-        s5 = mk(d5, T5, st5).run()
+
+        class _Reword(StubTasks):
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                res = super().critique(run_dir, reviewer, round_n, feedback)
+                p_ = os.path.join(run_dir, "critique_domain.yaml")
+                if reviewer == "critique-domain" and os.path.exists(p_):
+                    doc = yaml.safe_load(open(p_))
+                    for b in doc.get("blockers") or []:
+                        if b.get("id") == "D-001":
+                            b["claim"] = f"net durability is untested; the lead accepted it before (round {round_n})"
+                    yaml.safe_dump(doc, open(p_, "w"), sort_keys=False)
+                return res
+        import yaml
+        d5, T5, st5 = new_run("wr_owner_reworded", {"critics": {1: {"critique-domain": [amend, hi]}},
+                                                    "fixes": {"D-009": [("analysis_settings.yaml",
+                                                                         "uncertainty.draws", 32)]}},
+                              signoff="lead", max_rounds=3)
+        tk5 = _Reword(T5.s)
+        s5 = mk(d5, tk5, st5).run()
         to5 = [x["to"] for x in hist(d5)]
-        ok(to5.count("OWNER_DECISION") == 1 and s5.startswith("completed"),
+        crit5 = [c for c in tk5.calls if c.startswith("critique:critique-domain")]
+        rounds5 = load_state(d5).round
+        ok(to5.count("OWNER_DECISION") == 1 and s5 == "completed_scope_declared" and rounds5 == 2
+           and "(round 2)" in FL.load(d5)["D-001"].claim
+           and FL.load(d5)["D-001"].status == "owner_accepted",
            f"WR5b a reworded re-raise of an answered finding is not asked again ({to5.count('OWNER_DECISION')} "
-           f"request(s), {s5}, {to5[-10:]})")
+           f"request(s), {s5}, round {rounds5}, {to5[-10:]}, {crit5})")
         import yaml
         dec = yaml.safe_load(open(os.path.join(d, DECLARED_FILE))) or {}
         g = json.load(open(os.path.join(d, "final_gate.json")))
