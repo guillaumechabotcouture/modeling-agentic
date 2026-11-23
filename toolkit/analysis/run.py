@@ -1009,7 +1009,6 @@ def _self_test() -> int:
     _self_test_voi(ok, q)
     _self_test_plan_rule(ok, q)
     _self_test_unit_attr(ok, q)
-    _self_test_wiring(ok, q)
     # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
     import tempfile as _tf
     with _tf.TemporaryDirectory() as d, _tf.TemporaryDirectory() as out:
@@ -1028,6 +1027,7 @@ def _self_test() -> int:
         ok(open(os.path.join(out, "v")).read() == "untouched",
            "AR-RW1 an analysis artifact and the manifest are not written through a link or a planted .tmp")
     DG.check_capture(ok, failed=fails)
+    _self_test_wiring(ok, q)       # after the golden capture: its runs' decision tests are not golden records
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
