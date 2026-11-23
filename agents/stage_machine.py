@@ -187,10 +187,15 @@ def _put(run_dir: str, rel: str, text: str) -> None:
     write_nofollow(run_dir, rel.replace(os.sep, "/"), text.encode("utf-8"), atomic=True)
 
 
+def _state_bytes(st: RunState) -> bytes:
+    """run_state.json's bytes for `st` (a lead hand-off binds its child to them before they are saved: Codex r3)."""
+    return json.dumps(st.to_dict(), indent=1, default=str).encode()
+
+
 def save_state(run_dir: str, st: RunState) -> None:
     """run_state.json, published atomically with no link followed (lib.safe_io; review round 4, P1-2)."""
     from lib.safe_io import write_nofollow
-    write_nofollow(run_dir, STATE_FILE, json.dumps(st.to_dict(), indent=1, default=str).encode(), atomic=True)
+    write_nofollow(run_dir, STATE_FILE, _state_bytes(st), atomic=True)
 
 
 # ------------------------------------------------------------------ gate routing (pure)
@@ -1120,7 +1125,12 @@ LEGACY_BRIEF_SIGNOFF = ("decision_brief.signoff.json",)      # scripts/decision_
 
 class AmendmentLocked(RuntimeError):
     """Another process holds the parent's amendment lock, or has already handed the run to its child: this resume
-    stops with nothing written (owner decision on #330)."""
+    stops with nothing written (owner decision on #330). `run_dir`: the run whose lock is held (main.py stores a
+    parent it finished up to a child another process holds: Codex r1 of #349)."""
+
+    def __init__(self, msg: str, run_dir: str | None = None):
+        super().__init__(msg)
+        self.run_dir = run_dir
 
 
 _LOCK_HELD = __import__("threading").local()
@@ -1148,7 +1158,8 @@ class _amend_lock:
         except BlockingIOError:
             f.close()
             raise AmendmentLocked(f"another process is amending {self.run_dir} ({AMEND_LOCK} is held): this resume "
-                                  "stops with nothing written; resume again once that process has ended") from None
+                                  "stops with nothing written; resume again once that process has ended",
+                                  run_dir=self.run_dir) from None
         except BaseException:
             f.close()
             raise
@@ -1324,13 +1335,22 @@ class Machine:
         self.log = log
         self.cross = cross_engine_check
         st = load_state(self.run_dir)
+        if (st or state) is not None and (st or state).signoff == "lead":
+            # a lead run's state is read again and written back under its amendment lock, so a state read before
+            # another process's hand-off is never written over it (Codex r3 on #342, P1-9)
+            with _amend_lock(self.run_dir):
+                self._load(load_state(self.run_dir), state)
+        else:
+            self._load(st, state)
+        self.seed_fn = getattr(tasks, "world_model_seed", None)    # §14: the world model's seed task, when the tasks have one
+        self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
+
+    def _load(self, st: RunState | None, state: RunState | None) -> None:
         self.st = st or state
         if self.st is None:
             raise ValueError("no run_state.json and no initial state")
         self._settle_interrupted()
         save_state(self.run_dir, self.st)
-        self.seed_fn = getattr(tasks, "world_model_seed", None)    # §14: the world model's seed task, when the tasks have one
-        self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
 
     def persist(self) -> None:
         # Named persist, not save, only because scripts/write_audit.py WA3 reads any `<obj>.save()` call as PIL's
@@ -1355,7 +1375,8 @@ class Machine:
         return float(a if a is not None else self.st.task_cap_usd) + float(rb if isinstance(rb, (int, float)) else 0.0)
 
     # -------------------------------------------------- plumbing
-    def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None) -> str:
+    def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None,
+            before_save=None) -> str:
         frm = self.st.state
         if to not in EDGES[frm]:
             raise RuntimeError(f"transition {frm} -> {to} is not in the state table")
@@ -1366,6 +1387,8 @@ class Machine:
             self.st.status = self.st.forced_status or status or "completed_gate_error"
             self._withhold_if_acceptance_language()
             self._finish()
+        if before_save is not None:
+            before_save()
         save_state(self.run_dir, self.st)
         self.log(f"[machine] {frm} -> {to}" + (f" ({why})" if why else ""))
         return to
@@ -1848,7 +1871,7 @@ class Machine:
             disk = load_state(self.run_dir)
             if disk is not None and disk.status == AMENDED_PROVISIONAL:
                 raise AmendmentLocked(f"{self.run_dir} was already handed to its child by another process: this "
-                                      "resume stops with nothing written")
+                                      "resume stops with nothing written", run_dir=self.run_dir)
             try:
                 cur = json.load(open(os.path.join(self.run_dir, SPEC_RETHINK_REQUEST)))
             except (OSError, ValueError):
@@ -1866,8 +1889,11 @@ class Machine:
         from toolkit.spec import amend as AM, signoff as SO
         la, why, rec = req.get("lead_amendment") or {}, None, None
         child = la.get("child")
-        if la.get("status") in ("started", "signed_provisionally"):     # resolved beside this run (a moved copy: r2)
-            child = _child_of(self.run_dir, child) or child
+        if la.get("status") in ("started", "signed_provisionally"):
+            # resolved beside this run only (a moved copy: r2); never the recorded path, which may be the original tree
+            # of a restored copy (Codex r3 on #342, P1-5); and only the child this request made (Codex r1 of #349)
+            child = _child_of(self.run_dir, child)
+            child = child if child and _made_by(child, req, self.run_dir) else None
         if la.get("status") == "refused":
             return None                   # the first refusal stands, with its reason and any kept child
         if any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
@@ -1875,8 +1901,11 @@ class Machine:
             # never satisfies the lead's check, also when recovering an interrupted hand-off (Codex r3); the owner decides
             why = "the parent carries a legacy decision brief signature, which a lead amendment never relies on in v2"
         elif la.get("status") in ("started", "signed_provisionally"):
-            # an interrupted handoff: finished when the child is signed by the lead, else refused (the owner decides)
-            if not (child and os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
+            # an interrupted handoff: finished when the parent's signature still holds (Codex r3 on #342, P1-6) and the
+            # child is signed by the lead, else refused (the owner decides)
+            if self._signed_by() is None:
+                why = "the parent's sign-off no longer holds (a signed input changed since): the owner decides"
+            elif not (child and os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
                     and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
                 why = "an interrupted amendment left no lead-signed child"
             else:
@@ -1928,10 +1957,29 @@ class Machine:
             self.log(f"[machine] the lead does not amend the signed spec ({why[:300]}): the run waits for the owner")
             return None
         self.st.paused = None
-        to = self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
-                      AMENDED_PROVISIONAL, extra={"amended_to": child})
-        self._relink(child)
-        return to
+        # the child is bound to the parent's final state before that state is saved, so no interruption leaves a FINAL
+        # parent whose child binds its paused state (Codex r3 on #342, P1-4); until that save the parent is at SPEC and
+        # a resume finishes the hand-off again
+        # a failure before the parent's FINAL state is saved (its metadata, the lineage) puts this machine and the
+        # parent's metadata back as they were (Codex r2 and r3 of #349): a retry, on this machine or a new one, finishes
+        # the hand-off
+        import copy
+        saved = copy.deepcopy(self.st)
+        meta_p = os.path.join(self.run_dir, "metadata.json")
+        meta0 = open(meta_p, "rb").read() if os.path.isfile(meta_p) else None
+        try:
+            return self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
+                            AMENDED_PROVISIONAL, extra={"amended_to": child}, before_save=lambda: self._relink(child))
+        except BaseException:
+            disk = _state_or_none(self.run_dir)
+            if disk is None or disk.status != AMENDED_PROVISIONAL:
+                self.st = saved
+                from lib.safe_io import remove_nofollow, write_nofollow
+                if meta0 is not None:
+                    write_nofollow(self.run_dir, "metadata.json", meta0, atomic=True)
+                else:
+                    remove_nofollow(self.run_dir, "metadata.json")
+            raise
 
     def _mark_child(self, child: str, rid) -> None:
         """The child's state, once: not paused, what is left of the cap (always > 0 here), the handoff event."""
@@ -1953,16 +2001,14 @@ class Machine:
 
     def _relink(self, child: str) -> None:
         """The child's parent_run binds the parent's final run_state.json (amend recorded it while paused), so the
-        chain still links (scripts/harness_metrics.py chains)."""
-        try:
-            sha = hashlib.sha256(open(os.path.join(self.run_dir, STATE_FILE), "rb").read()).hexdigest()
-            for rel in ("metadata.json", AMENDMENT_RECORD):
-                doc = json.load(open(os.path.join(child, rel)))
-                if isinstance(doc.get("parent_run"), dict):
-                    doc["parent_run"]["run_state_sha256"] = sha
-                    _write_json(child, rel, doc)
-        except (OSError, ValueError, AttributeError) as e:     # the lineage link only: the run goes on
-            self.log(f"[machine] the child's parent link was not refreshed: {type(e).__name__}")
+        chain still links (scripts/harness_metrics.py chains): the bytes about to be saved, from the state in memory. A
+        failure is raised before the parent is saved FINAL, so a resume finishes the hand-off (Codex r1 of #349)."""
+        sha = hashlib.sha256(_state_bytes(self.st)).hexdigest()
+        for rel in ("metadata.json", AMENDMENT_RECORD):
+            doc = json.load(open(os.path.join(child, rel)))
+            if isinstance(doc.get("parent_run"), dict):
+                doc["parent_run"]["run_state_sha256"] = sha
+                _write_json(child, rel, doc)
 
     def _derive(self, rd: str | None = None) -> list[str]:
         """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
@@ -3067,7 +3113,7 @@ def amendment_lines(run_dir: str) -> list[str]:
         ch = "; ".join(f"{c.get('op')} `{c.get('path')}`" + ("" if c.get("op") == "remove" else
                                                              f" to {json.dumps(c.get('after'), default=str)[:160]}")
                        for c in rec.get("changes") or [] if isinstance(c, dict))
-        parent = (rec.get("parent_run") or {}).get("run_dir")
+        parent = _parent_of(run_dir, (rec.get("parent_run") or {}).get("run_dir"))
     except (OSError, ValueError, AttributeError, TypeError) as e:
         return [f"**Provisional amendment of the signed spec ({(s7 or {}).get('provisional_amendment') or 'unnamed'}): "
                 f"its record could not be read ({type(e).__name__}); the owner has not reviewed it.**\n\n"]
@@ -3286,20 +3332,26 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
     (Machine.reopen_interrupted_analysis). A --signoff lead run holds its amendment lock from before its state is read
-    to its hand-off (owner decision on #330, Codex r3): a second process resuming it fails with AmendmentLocked before
-    writing anything, also to the child it was handed to."""
+    through its hand-off and the run of the child it handed to (owner decision on #330, Codex r3 on #330 and #342): a
+    second process resuming it fails with AmendmentLocked before writing anything, also to that child."""
     try:
         prev = load_state(run_dir)
     except (OSError, ValueError):
         prev = None
     if signoff != "lead" and (prev is None or prev.signoff != "lead"):
-        child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
-                                     derive_unsandboxed, backend, cross_engine_check, _stamp)
-    else:
-        os.makedirs(run_dir, exist_ok=True)
-        with _amend_lock(run_dir):
-            child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
-                                         derive_unsandboxed, backend, cross_engine_check, _stamp)
+        return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
+                             backend, cross_engine_check, _depth, _stamp)
+    os.makedirs(run_dir, exist_ok=True)
+    with _amend_lock(run_dir):     # held through the hand-off and the child's run (Codex r3 on #342, P1-8)
+        return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
+                             backend, cross_engine_check, _depth, _stamp)
+
+
+def _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
+                  cross_engine_check, _depth, _stamp) -> str:
+    """One run dir, then the child its provisional amendment handed it to (run_v2, under the caller's lock)."""
+    child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
+                                 derive_unsandboxed, backend, cross_engine_check, _stamp)
     if child is None or _depth >= 8:          # a bounded chain (a restored cycle cannot recurse: Codex r2)
         return status
     # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher);
@@ -3346,25 +3398,77 @@ def _child_of(run_dir: str, recorded, strict: bool = False) -> str | None:
     if not isinstance(recorded, str) or not recorded:
         return None
     here = os.path.join(os.path.dirname(os.path.abspath(run_dir)), os.path.basename(recorded.rstrip(os.sep)))
+    if os.path.islink(here):          # a link to another tree is not this run's child (Codex r1 of #349)
+        return None
     try:
         pr = (json.load(open(os.path.join(here, "metadata.json"))) or {}).get("parent_run") or {}
     except (OSError, ValueError, AttributeError):
         return None
     ok_ = os.path.basename(str(pr.get("run_dir") or "").rstrip(os.sep)) == os.path.basename(os.path.abspath(run_dir))
-    if ok_ and strict and pr.get("run_state_sha256"):   # a finished parent: the child binds its final state (r2)
+    if ok_ and strict:      # a finished parent: the child binds its final state (r2); a missing digest binds none (r3)
         try:
-            ok_ = hashlib.sha256(open(os.path.join(run_dir, STATE_FILE), "rb").read()).hexdigest() == pr["run_state_sha256"]
+            ok_ = isinstance(pr.get("run_state_sha256"), str) and hashlib.sha256(
+                open(os.path.join(run_dir, STATE_FILE), "rb").read()).hexdigest() == pr["run_state_sha256"]
         except OSError:
             ok_ = False
     return here if ok_ and os.path.realpath(here) != os.path.realpath(run_dir) else None
 
 
+def _parent_of(run_dir: str, recorded):
+    """The parent a child run continues: its sibling of the recorded name when that sibling hands off to this child (a
+    parent and child moved together: Codex r3 on #342, P2-12), else the recorded path."""
+    if not isinstance(recorded, str) or not recorded:
+        return recorded
+    here = os.path.join(os.path.dirname(os.path.abspath(run_dir)), os.path.basename(recorded.rstrip(os.sep)))
+    c = handoff_child(here)
+    if c and os.path.realpath(c) == os.path.realpath(run_dir):
+        return here
+    # a manual amendment's parent keeps its status: the parent-state digest the child records (in its metadata or its
+    # amendment record: Codex r2 of #349)
+    for rel in ("metadata.json", AMENDMENT_RECORD):
+        try:
+            bound = ((json.load(open(os.path.join(run_dir, rel))) or {}).get("parent_run") or {}).get(
+                "run_state_sha256")
+            if not os.path.islink(here) and isinstance(bound, str) and bound == hashlib.sha256(
+                    open(os.path.join(here, STATE_FILE), "rb").read()).hexdigest():
+                return here
+        except (OSError, ValueError, AttributeError):
+            continue
+    return recorded
+
+
+def _own_spec_digest(run_dir: str):
+    """The spec digest the run's own sign-off record binds (decision_spec.signoff.json; never a legacy brief's)."""
+    from toolkit.spec import signoff as SO
+    try:
+        rec = json.load(open(os.path.join(run_dir, SO.SPEC_SIGNOFF)))
+        m = rec.get("sha256")
+        return (m.get(AB.SPEC_FILE) if isinstance(m, dict) else None) or rec.get("spec_sha256")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _made_by(child: str, req: dict, parent: str) -> bool:
+    """`child` is the run toolkit/spec/amend.py made from this rethink request of `parent`: from the signed spec the
+    request names, which the parent's own sign-off binds, with the request's patch (its id and content digest). A
+    same-named child from another backup or another patch is not this request's (Codex r1 and r2 of #349)."""
+    from toolkit.spec import amend as AM
+    try:
+        meta = json.load(open(os.path.join(child, "metadata.json")))
+    except (OSError, ValueError):
+        return False
+    req = req if isinstance(req, dict) else {}
+    sig, patch = req.get("signed_spec_sha256"), req.get("patch")
+    if not (isinstance(meta, dict) and isinstance(sig, str) and isinstance(patch, dict)):
+        return False
+    return meta.get("parent_spec_sha256") == sig == _own_spec_digest(parent) \
+        and meta.get("amendment") == str(patch.get("id") or "unnamed") \
+        and meta.get("patch_sha256") == AM.patch_sha256(patch)
+
+
 def handoff_child(run_dir: str) -> str | None:
     """The child run a provisional lead amendment handed this run to (`amended_provisional`), when it has a state."""
-    try:
-        st = load_state(run_dir)
-    except (OSError, ValueError):
-        return None
+    st = _state_or_none(run_dir)
     if st is None or st.status != AMENDED_PROVISIONAL:
         return None
     child = _child_of(run_dir, next((h.get("amended_to") for h in reversed(st.history)
@@ -3372,26 +3476,65 @@ def handoff_child(run_dir: str) -> str | None:
     return child if child and os.path.isfile(os.path.join(child, STATE_FILE)) else None
 
 
+def _state_or_none(run_dir: str):
+    """The run's state, or None when it is missing or cannot be read as one (Codex r3 of #349: `[]` too)."""
+    try:
+        return load_state(run_dir)
+    except Exception:  # noqa: BLE001 -- unreadable, or not a run state
+        return None
+
+
 def handoff_chain(run_dir: str, limit: int = 8, kept: bool = False) -> list[str]:
     """Every child run this run continued in, in order; with `kept`, also a child an amendment refused at signing
-    left for the owner (main.py stores each with the run: Codex r1)."""
+    left for the owner, or one an interrupted hand-off signed (main.py stores each with the run: Codex r1): only
+    after a recorded refusal or an unfinished hand-off, and only the child this run's request made (Codex r3 on #342,
+    P1-11; Codex r1 of #349)."""
+    return list(iter_handoff_chain(run_dir, limit, kept))
+
+
+def iter_handoff_chain(run_dir: str, limit: int = 8, kept: bool = False):
+    """handoff_chain, one run at a time: main.py stores each run before it reads the next (Codex r2 of #349)."""
     out, cur = [], run_dir
     while len(out) < limit:
         nxt = handoff_child(cur)
         if nxt is None and kept:
-            try:
-                la = json.load(open(os.path.join(cur, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
-            except (OSError, ValueError, AttributeError):
-                la = {}
-            nxt = _child_of(cur, la.get("child"))
+            nxt = _kept_child(cur)
             if nxt is not None and nxt not in out:
-                out.append(nxt)
-            break
+                yield nxt
+            return
         if nxt is None or nxt in out:
-            break
+            return
         out.append(nxt)
+        yield nxt
         cur = nxt
-    return out
+
+
+def _kept_child(run_dir: str) -> str | None:
+    """A refused amendment's kept child, or the lead-signed child of a hand-off interrupted before the parent was saved
+    FINAL; only the child this run's request made (Codex r1 and r2 of #349)."""
+    try:
+        req = json.load(open(os.path.join(run_dir, SPEC_RETHINK_REQUEST)))
+    except (OSError, ValueError):
+        return None
+    la = req.get("lead_amendment") if isinstance(req, dict) else None
+    if not isinstance(la, dict):
+        return None
+    status = la.get("status")
+    if status in ("started", "signed_provisionally"):
+        st = _state_or_none(run_dir)
+        if st is None or st.status == AMENDED_PROVISIONAL:
+            return None
+    elif status != "refused":
+        return None
+    child = _child_of(run_dir, la.get("child"))
+    if child is None or not _made_by(child, req, run_dir):
+        return None
+    if status != "refused":              # an unfinished hand-off: only a child with its state and the lead's signature
+        from toolkit.spec import signoff as SO
+        if not (_state_or_none(child) is not None and SO.status(child) == "signed"
+                and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
+            return None
+    return child
 
 
 # ------------------------------------------------------------------ self-test
@@ -3644,6 +3787,357 @@ def _self_test_lead_amend(ok, td: str) -> None:
        f"T_LEAD_AMEND_BRIEF_RESUME an interrupted hand-off with a legacy brief signature is refused, the child kept ({la})")
     ok(AMEND_LOCK.startswith("analysis/") and "analysis/*" in harness_owned(),
        "T_LEAD_AMEND_LOCK_PATH the lock lives under a path reserved for every run (no owner-mode deliverable changes)")
+    ok(handoff_chain(d, kept=True) == [d + ".amend1"],
+       "T_LEAD_AMEND_KEPT_CHAIN a refused amendment's verified kept child is stored with the run")
+    _self_test_lead_amend_r3(ok, td, parent, good, _boom)
+
+
+def _self_test_lead_amend_r3(ok, td: str, parent, good: dict, _boom) -> None:
+    """Codex round 3 of #342 on the lead amendment (#330): findings 4-12, each from its reproduction."""
+    import shutil as _sh
+    import threading
+    from v2_tasks import StubTasks
+    tdr = os.path.realpath(td)
+
+    def machine(rd):
+        return Machine(rd, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
+
+    def interrupted(name):       # the child made and signed by the lead, the parent not yet FINAL
+        d_ = parent(name, "lead", good)[0]
+        mi = machine(d_)
+        mi._go = _boom
+        try:
+            mi.step()
+        except KeyboardInterrupt:
+            pass
+        return d_
+
+    def pair(src, where):        # the parent and its child, copied together to another directory
+        os.makedirs(os.path.join(tdr, where))
+        for x in (src, src + ".amend1"):
+            _sh.copytree(x, os.path.join(tdr, where, os.path.basename(x)))
+        return os.path.join(tdr, where, os.path.basename(src))
+    # P1-4: an interruption just after the parent's FINAL state is saved still leaves a child bound to that state
+    d = parent("r3_final_window", "lead", good)[0]
+    real_save = globals()["save_state"]
+
+    def save_then_stop(rd, st):
+        real_save(rd, st)
+        if st.status == AMENDED_PROVISIONAL and os.path.realpath(rd) == d:
+            raise KeyboardInterrupt("stopped after FINAL")
+    globals()["save_state"] = save_then_stop
+    try:
+        machine(d).step()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        globals()["save_state"] = real_save
+    ok(load_state(d).status == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
+       f"T_R3_FINAL_WINDOW (P1-4) interrupted after the parent's FINAL is saved, the child already binds it "
+       f"({handoff_child(d)})")
+    # P1-5: recovering a restored copy of the parent alone never writes to the original tree
+    d = interrupted("r3_restore")
+    c0 = d + ".amend1"
+    snap = {f: open(os.path.join(c0, f), "rb").read() for f in ("metadata.json", STATE_FILE, AMENDMENT_RECORD)}
+    os.makedirs(os.path.join(tdr, "r3_restored"))
+    r = os.path.join(tdr, "r3_restored", "r3_restore")
+    _sh.copytree(d, r)
+    s = machine(r).run()
+    la = json.load(open(os.path.join(r, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+    ok(all(open(os.path.join(c0, f), "rb").read() == b for f, b in snap.items()) and handoff_child(r) is None
+       and s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and c0 not in json.dumps(la),
+       f"T_R3_RESTORED_ALONE (P1-5) a restored parent without its child is refused, the original child untouched "
+       f"({s}, {la})")
+    # P1-6: the parent's signature is checked again when an interrupted hand-off is recovered
+    d = interrupted("r3_resig")
+    open(os.path.join(d, AB.SPEC_FILE), "ab").write(b"# edited after signing\n")
+    s = machine(d).run()
+    la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused"
+       and "sign-off no longer holds" in la.get("why", "") and handoff_child(d) is None,
+       f"T_R3_RECOVER_PARENT_SIG (P1-6) a recovered hand-off whose parent spec changed since signing is refused ({la})")
+    # P1-10 and P1-11: strict lineage needs the matching parent digest; the kept-child fallback only follows a refusal
+    src = interrupted("r3_lineage")
+    machine(src).step()
+    for where, digest in (("r3_nodigest", None), ("r3_otherdigest", "0" * 64)):
+        p = pair(src, where)
+        mc = os.path.join(p + ".amend1", "metadata.json")
+        meta = json.load(open(mc))
+        pr = {k: v for k, v in meta["parent_run"].items() if k != "run_state_sha256"}
+        json.dump(dict(meta, parent_run=dict(pr, **({"run_state_sha256": digest} if digest else {}))), open(mc, "w"))
+        ok(load_state(p).status == AMENDED_PROVISIONAL and handoff_child(p) is None
+           and handoff_chain(p) == [] and handoff_chain(p, kept=True) == [],
+           f"T_R3_STRICT_LINEAGE (P1-10, P1-11) {where}: a child without the parent's final digest is neither resumed "
+           f"nor stored with it ({handoff_chain(p, kept=True)})")
+    # P2-12: a parent and child moved together, the original tree gone: the confirmation names the moved parent
+    p = pair(src, "r3_moved")
+    _sh.move(src, src + ".gone")
+    try:
+        al = amendment_lines(p + ".amend1")
+    finally:
+        _sh.move(src + ".gone", src)
+    ok(al and shlex.quote(p) in al[0] and f"`{src}`" not in al[0] and f"{shlex.quote(src)} " not in al[0],
+       f"T_R3_MOVED_COMMAND (P2-12) the owner's confirmation command names the moved parent ({al[:1]})")
+    # P1-8: the parent stays held across the hand-off; a second resumer cannot take over its child
+    d = parent("r3_handover", "lead", good)[0]
+    paused, go, got_b = threading.Event(), threading.Event(), []
+
+    def log_a(msg):
+        if "continuing in" in str(msg):
+            cst = load_state(d + ".amend1")
+            cst.state, cst.status = "FINAL", "completed"     # the child stops at once (the test stays small)
+            save_state(d + ".amend1", cst)
+            paused.set()
+            go.wait(60)
+    res_a = []
+    ta = threading.Thread(target=lambda: res_a.append(run_v2("q", d, StubTasks({}), signoff="lead", log=log_a,
+                                                             cross_engine_check=False)))
+    ta.start()
+    paused.wait(60)
+
+    def second():
+        try:
+            got_b.append(run_v2("q", d, StubTasks({}), signoff="lead", log=lambda *a: None, cross_engine_check=False))
+        except AmendmentLocked:
+            got_b.append("locked")
+    tb = threading.Thread(target=second)
+    tb.start()
+    tb.join(60)
+    go.set()
+    ta.join(60)
+    ok(got_b == ["locked"] and res_a == ["completed"],
+       f"T_R3_HANDOVER (P1-8) a second resumer during the hand-off fails clearly; the first continues in the child "
+       f"({got_b}, {res_a})")
+    # P1-9: a direct Machine whose constructor read the state before another process's hand-off never writes it back
+    d = parent("r3_stale_ctor", "lead", good)[0]
+    real_load, read, release, errs = globals()["load_state"], threading.Event(), threading.Event(), []
+    blocked = []
+
+    def slow_load(rd):
+        st_ = real_load(rd)
+        if threading.current_thread().name == "r3-second" and not blocked:
+            blocked.append(1)
+            read.set()
+            release.wait(30)
+        return st_
+
+    def ctor():
+        try:
+            machine(d)
+        except AmendmentLocked as e:
+            errs.append(str(e))
+    globals()["load_state"] = slow_load
+    try:
+        t2 = threading.Thread(target=ctor, name="r3-second")
+        t2.start()
+        read.wait(30)
+        try:
+            machine(d).step()
+        except AmendmentLocked as e:
+            errs.append(str(e))
+        release.set()
+        t2.join(60)
+    finally:
+        globals()["load_state"] = real_load
+    made = os.path.lexists(d + ".amend1")
+    ok(made == (load_state(d).status == AMENDED_PROVISIONAL),
+       f"T_R3_STALE_CTOR (P1-9) a constructor that read the state before the hand-off never writes it back "
+       f"(child made: {made}; parent status {load_state(d).status}; {len(errs)} refused)")
+    _self_test_lead_amend_r4(ok, tdr, parent, good, interrupted, pair, machine)
+
+
+def _self_test_lead_amend_r4(ok, tdr: str, parent, good: dict, interrupted, pair, machine) -> None:
+    """Codex round 1 of #349 on the lead amendment's recovery, lineage and storage."""
+    import shutil as _sh
+    from toolkit.spec import amend as AM
+    # R1-1: an interrupted hand-off (the parent still at SPEC) stores its verified signed child
+    d = interrupted("r4_store")
+    ok(load_state(d).status is None and handoff_chain(d, kept=True) == [d + ".amend1"],
+       f"T_R4_STORE_INTERRUPTED an interrupted hand-off's signed child is stored with the parent "
+       f"({handoff_chain(d, kept=True)})")
+    # R1-2: recovery never adopts a same-named child made from another spec or another amendment
+    for name, field, value in (("r4_foreign_spec", "parent_spec_sha256", "f" * 64), ("r4_foreign_id", "amendment", "B1")):
+        d = interrupted(name)
+        mc = os.path.join(d + ".amend1", "metadata.json")
+        json.dump(dict(json.load(open(mc)), **{field: value}), open(mc, "w"))
+        before = open(mc, "rb").read()
+        s = machine(d).run()
+        la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+        ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and open(mc, "rb").read() == before
+           and handoff_chain(d, kept=True) == [],
+           f"T_R4_FOREIGN_CHILD {name}: a child this request did not make is neither adopted, relinked nor stored ({la})")
+    # R1-3: a restored parent whose sibling is a link to the original child never writes through it
+    d = interrupted("r4_link")
+    snap = {f: open(os.path.join(d + ".amend1", f), "rb").read() for f in ("metadata.json", AMENDMENT_RECORD)}
+    os.makedirs(os.path.join(tdr, "r4_linked"))
+    r = os.path.join(tdr, "r4_linked", "r4_link")
+    _sh.copytree(d, r)
+    os.symlink(d + ".amend1", r + ".amend1")
+    s = machine(r).run()
+    ok(s == "paused:awaiting_spec_amendment" and handoff_child(r) is None and handoff_chain(r, kept=True) == []
+       and all(open(os.path.join(d + ".amend1", f), "rb").read() == b for f, b in snap.items()),
+       f"T_R4_LINKED_CHILD a linked sibling is not a child: refused, the original untouched ({s})")
+    # R1-4: a lineage write that fails leaves the parent at SPEC, recoverable; the next resume finishes the hand-off
+    # (Codex r2 of #349: the error injected, so it holds for any user, and the retry on the same machine)
+    d = interrupted("r4_readonly")
+    real_wj, failed = globals()["_write_json"], []
+
+    def fail_once(rd, rel, doc):
+        if os.path.realpath(rd) == d + ".amend1" and not failed:
+            failed.append(rel)
+            raise PermissionError("injected")
+        return real_wj(rd, rel, doc)
+    m4 = machine(d)
+    globals()["_write_json"] = fail_once
+    try:
+        m4.run()
+        raised = None
+    except OSError as e:
+        raised = type(e).__name__
+    finally:
+        globals()["_write_json"] = real_wj
+    st1, meta1 = load_state(d), json.load(open(os.path.join(d, "metadata.json")))
+    s = m4.run()
+    ok(raised and st1.status is None and st1.state == "SPEC" and meta1.get("status") != AMENDED_PROVISIONAL
+       and m4.st.state == "FINAL" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
+       f"T_R4_RELINK_FAILS a failed lineage write is raised before the parent is FINAL (state and metadata); the same "
+       f"machine's retry finishes it ({raised}, {st1.state}, {meta1.get('status')}, {s})")
+    # R1-6: the kept child is verified by the signed digest the request names, not the working spec's bytes
+    d = interrupted("r4_kept")
+    sp, keep = os.path.join(d, AB.SPEC_FILE), None
+    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    machine(d).run()                                  # refused (the legacy brief), the child kept
+    keep = open(sp, "rb").read()
+    os.remove(sp)
+    gone = handoff_chain(d, kept=True)
+    open(sp, "wb").write(b"# another spec\n")
+    mc = os.path.join(d + ".amend1", "metadata.json")
+    meta0 = open(mc, "rb").read()
+    json.dump(dict(json.loads(meta0), parent_spec_sha256=hashlib.sha256(b"# another spec\n").hexdigest()), open(mc, "w"))
+    other = handoff_chain(d, kept=True)
+    open(sp, "wb").write(keep)
+    open(mc, "wb").write(meta0)
+    ok(gone == [d + ".amend1"] and other == [],
+       f"T_R4_KEPT_SIGNED_DIGEST a kept child is stored by the request's signed digest: also without the working spec, "
+       f"never by replacement bytes ({gone}, {other})")
+    # R1-7 (P2): a manual amendment moved with its parent names the moved parent (verified by the parent-state digest)
+    d = parent("r4_manual", "lead", good)[0]
+    st = load_state(d)
+    st.state, st.status = "FINAL", "completed"
+    save_state(d, st)
+    import yaml
+    pf = os.path.join(tdr, "r4_manual_patch.yaml")
+    yaml.safe_dump(good, open(pf, "w"))
+    AM.amend(d, pf, signoff="lead", log=lambda *a: None)
+    p = pair(d, "r4_moved_manual")
+    _sh.move(d, d + ".gone")
+    try:
+        al = amendment_lines(p + ".amend1")
+    finally:
+        _sh.move(d + ".gone", d)
+    ok(al and f"`{p}`" in al[0] and f"`{d}`" not in al[0],
+       f"T_R4_MOVED_MANUAL a moved manual amendment names its moved parent ({al[:1]})")
+    _self_test_lead_amend_r5(ok, tdr, interrupted, pair, machine)
+
+
+def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
+    """Codex round 2 of #349: the child matched by its patch's content and the parent's own sign-off; storage of a
+    kept or unfinished child."""
+    import shutil as _sh
+    from toolkit.spec import signoff as SO
+    # R2-1: the same patch id with other content is not this request's child
+    d = interrupted("r5_patch")
+    rp = os.path.join(d, SPEC_RETHINK_REQUEST)
+    req = json.load(open(rp))
+    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, patch=dict(req["patch"], spec=[
+        {"set": "constraints.envelope_usd", "value": 8700}])))
+    s = machine(d).run()
+    la = json.load(open(rp)).get("lead_amendment") or {}
+    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and handoff_child(d) is None,
+       f"T_R5_PATCH_CONTENT a child made from another patch under the same id is not adopted ({s}, {la.get('why')})")
+    # R2-2: a kept child and its request must match the parent's own sign-off record, not only each other
+    d = interrupted("r5_signoff")
+    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    machine(d).run()                                  # refused (the legacy brief), the child kept
+    sop = os.path.join(d, SO.SPEC_SIGNOFF)
+    so0 = open(sop, "rb").read()
+    rec = json.loads(so0)
+    rec["sha256"] = dict(rec.get("sha256") or {}, **{AB.SPEC_FILE: "e" * 64})
+    open(sop, "w").write(json.dumps(rec))
+    other = handoff_chain(d, kept=True)
+    open(sop, "wb").write(so0)
+    # R2-7: a damaged parent state does not drop a recorded refusal's kept child
+    stp = os.path.join(d, STATE_FILE)
+    st0 = open(stp, "rb").read()
+    damaged = []
+    for bad_state in (st0[:20], b"[]"):              # unparseable, and parseable but not a state (Codex r3 of #349)
+        open(stp, "wb").write(bad_state)
+        try:
+            damaged.append(handoff_chain(d, kept=True))
+        except Exception as e:  # noqa: BLE001 -- the finding
+            damaged.append(type(e).__name__)
+    open(stp, "wb").write(st0)
+    damaged = damaged[0] if damaged[0] == damaged[1] else damaged
+    # R1-5 follow-up: a malformed lead_amendment record is not an error
+    req = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
+    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, lead_amendment=["bad"]))
+    try:
+        bad = handoff_chain(d, kept=True)
+    except Exception as e:  # noqa: BLE001 -- the finding
+        bad = type(e).__name__
+    _write_json(d, SPEC_RETHINK_REQUEST, req)
+    ok(other == [] and damaged == [d + ".amend1"] and bad == [],
+       f"T_R5_KEPT_PARENT_SIGNOFF a kept child is stored only when the parent's own sign-off binds the request's spec; "
+       f"a damaged parent state keeps it; a malformed record stores nothing ({other}, {damaged}, {bad})")
+    # R2-8: an unfinished hand-off stores its child only once the child has its state and the lead's signature
+    d = interrupted("r5_unsigned")
+    os.remove(os.path.join(d + ".amend1", SO.SPEC_SIGNOFF))
+    unsigned = handoff_chain(d, kept=True)
+    d = interrupted("r6_bad_child_state")            # Codex r3 of #349: a child state that cannot be resumed
+    open(os.path.join(d + ".amend1", STATE_FILE), "wb").write(b"")
+    ok(unsigned == [] and handoff_chain(d, kept=True) == [],
+       f"T_R5_UNFINISHED_UNSIGNED an unfinished hand-off's unsigned child, or one whose state cannot be read, is not "
+       f"stored ({unsigned}, {handoff_chain(d, kept=True)})")
+    # Codex r3 of #349: a failure anywhere before the parent's FINAL state is saved (its own metadata write included)
+    # puts the machine back, and parent metadata the hand-off created is removed again
+    for name, where, drop_meta in (("r6_parent_meta", "parent", False), ("r6_no_meta", "child", True)):
+        d = interrupted(name)
+        if drop_meta:
+            os.remove(os.path.join(d, "metadata.json"))
+        real_wj, failed = globals()["_write_json"], []
+
+        def fail_once(rd, rel, doc):
+            if os.path.realpath(rd) == (d if where == "parent" else d + ".amend1") and not failed \
+                    and (where == "child" or rel == "metadata.json"):
+                failed.append(rel)
+                raise PermissionError("injected")
+            return real_wj(rd, rel, doc)
+        m6 = machine(d)
+        globals()["_write_json"] = fail_once
+        try:
+            m6.run()
+        except OSError:
+            pass
+        finally:
+            globals()["_write_json"] = real_wj
+        meta6 = os.path.join(d, "metadata.json")
+        meta_ok = not os.path.exists(meta6) if drop_meta else json.load(open(meta6)).get("status") != AMENDED_PROVISIONAL
+        st6 = load_state(d)
+        s = m6.run()
+        ok(failed and meta_ok and st6.state == "SPEC" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
+           f"T_R6_ROLLBACK {name}: a failed write before the parent's FINAL is saved leaves it at SPEC with its metadata as "
+           f"it was; the same machine's retry finishes the hand-off ({failed}, {meta_ok}, {st6.state}, {s})")
+    # R2-9 (P2): a moved manual amendment without its metadata names its parent from the amendment record's digest
+    src = os.path.join(tdr, "r4_manual")
+    p = pair(src, "r5_moved_manual")
+    os.remove(os.path.join(p + ".amend1", "metadata.json"))
+    _sh.move(src, src + ".gone")
+    try:
+        al = amendment_lines(p + ".amend1")
+    finally:
+        _sh.move(src + ".gone", src)
+    ok(al and f"`{p}`" in al[0],
+       f"T_R5_MOVED_NO_METADATA a moved manual amendment without metadata names its moved parent ({al[:1]})")
 
 
 def _self_test() -> int:
