@@ -65,8 +65,9 @@ _ACCOUNT = re.compile(r"[a-z0-9]{3,24}")                  # Azure storage accoun
 def storage_account(flag=None):
     """--account, else $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT; refused (SystemExit, the value never echoed)
     unless it is a bare storage account name, before any client is built or command run (Codex round 1 on #358)."""
-    acct = flag or os.environ.get("MA_STORAGE_ACCOUNT") or os.environ.get("COILED_STORAGE_ACCOUNT")
-    if acct and not _ACCOUNT.fullmatch(str(acct)):
+    acct = flag if flag is not None else (os.environ.get("MA_STORAGE_ACCOUNT")
+                                          or os.environ.get("COILED_STORAGE_ACCOUNT"))
+    if (acct is not None and not acct and flag is not None) or (acct and not _ACCOUNT.fullmatch(str(acct))):
         raise SystemExit("the storage account (--account, $MA_STORAGE_ACCOUNT or $COILED_STORAGE_ACCOUNT) must be a "
                          "bare storage account name (3-24 lowercase letters and digits), not a connection string, URL "
                          "or key: refusing")
@@ -224,6 +225,7 @@ def fetch_from_storage(entry, label, work):
     import types
     import results_store
     import run_cluster as rc
+    storage_account(entry.get("storage_account") or None)     # a state.json from before the check is covered too
     cfg = types.SimpleNamespace(out_dir=os.path.join(work, entry["name"]), storage_prefix=entry["storage_prefix"],
                                 storage_account=entry.get("storage_account"))
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -297,6 +299,8 @@ def valid_entry(pl) -> dict:
             isinstance(a, dict) and a and all(_LABEL.fullmatch(str(k)) and isinstance(v, dict) and v.get("launch_id")
                                                for k, v in a.items())):
         raise ValueError("collect request: needs a plain name, storage_prefix and a launch_id per plain label")
+    if pl.get("storage_account") and not _ACCOUNT.fullmatch(str(pl["storage_account"])):
+        raise ValueError("collect request: storage_account is not a bare storage account name (not echoed)")
     return pl
 
 
@@ -492,6 +496,7 @@ def stop_own(name, live_id=None, stop=None):
 def _assignments(config_path):
     import run_cluster as rc
     cfg = rc.load_config(config_path)
+    storage_account(cfg.storage_account or None)        # never enqueued: a config's account that is not a bare name
     if not os.path.exists(cfg.state_file):
         raise SystemExit(f"no {cfg.state_file}: this machine did not launch {cfg.name}")
     return {"name": cfg.name, "storage_prefix": cfg.storage_prefix, "storage_account": cfg.storage_account,
@@ -798,6 +803,18 @@ def _self_test() -> int:
         r_start = refused(cmd_start, a)
     ok(r_start.startswith("SystemExit") and not runs_ and "SECRET" not in out_.getvalue() + r_start,
        f"SV51 start refuses a bad account before any vm_job command runs or is printed ({r_start}, {len(runs_)} runs)")
+    with mock.patch.dict(os.environ, {"MA_STORAGE_ACCOUNT": "acct1"}):
+        r_empty = refused(storage_account, "")
+    ok(r_empty.startswith("SystemExit"), f"SV52 (Codex r1 on #362) an explicitly empty --account is refused, not "
+       f"replaced by the environment's ({r_empty})")
+    ent_bad = {"name": "ev-x", "storage_prefix": "runs/ev-x", "storage_account": bad_,
+               "assignments": {"q": {"launch_id": "L1"}}}
+    r_valid = refused(valid_entry, ent_bad)
+    r_fetch = refused(fetch_from_storage, ent_bad, "q", "/nonexistent")
+    ok("SECRET" not in r_valid + r_fetch and ("ValueError" in r_valid or "SystemExit" in r_valid)
+       and r_fetch.startswith("SystemExit"),
+       f"SV53 (Codex r1 on #362) a collection entry's account is checked when the request arrives and before each "
+       f"fetch, unechoed ({r_valid}; {r_fetch})")
 
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0

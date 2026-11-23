@@ -849,14 +849,19 @@ def launch_budget_ok(scope, cap_usd, name, reserve=True, invocation=None, cluste
                   + "".join(f"\n{w}" for w in warns))
 
 
-def release_reservation(invocation, name, env=None) -> int:
-    """Remove the reservation `launch_budget_ok` recorded for this invocation and cluster name, under the ledger lock:
-    for a launch refused after its budget check and before any cluster exists (run_cluster.api_keys). Returns how
-    many were removed; a malformed ledger raises BudgetError."""
+def release_reservation(invocation, name, clusters_file=None, env=None) -> int:
+    """Remove the reservation `launch_budget_ok` recorded for this invocation, cluster name and clusters file, under
+    the ledger lock: for a launch refused after its budget check and before any cluster exists (run_cluster.api_keys).
+    Only the newest such row goes (an invocation id can be reused: Codex r1 on #362). Returns how many were removed
+    (0 or 1); a malformed ledger raises BudgetError."""
     env = env or _ENV
+    cf = os.path.abspath(str(clusters_file)) if clusters_file else None
     with _Lock(env.reservations):
         rows = _ledger(env, env.clock())
-        keep = [r for r in rows if not (r["invocation"] == str(invocation) and r["name"] == name)]
+        hits = [i for i, r in enumerate(rows) if r["invocation"] == str(invocation) and r["name"] == name
+                and r.get("clusters_file") == cf]
+        drop = max(hits, key=lambda i: rows[i]["time"]) if hits else None
+        keep = [r for i, r in enumerate(rows) if i != drop]
         if len(keep) != len(rows):
             with open(env.reservations + ".tmp", "w") as f:
                 json.dump(keep, f, indent=1)
@@ -1067,6 +1072,23 @@ def _self_test() -> int:
         except Exception as e:  # noqa: BLE001
             n2 = f"{type(e).__name__}: {e}"
         ok(n2 == 0, f"RR2 no ledger: nothing to release ({n2})")
+    with tempfile.TemporaryDirectory() as td:
+        renv = _Env(budget_dir=td, clock=lambda: 1000.0)
+        os.makedirs(os.path.dirname(renv.reservations), exist_ok=True)
+        rows = [{"scope": "ev", "cap_usd": 35.0, "name": "ev-d", "invocation": "retry", "time": 900.0,
+                 "clusters_file": "/a/clusters.json"},
+                {"scope": "ev", "cap_usd": 35.0, "name": "ev-d", "invocation": "retry", "time": 950.0,
+                 "clusters_file": "/b/clusters.json"},
+                {"scope": "ev", "cap_usd": 35.0, "name": "ev-d", "invocation": "retry", "time": 990.0,
+                 "clusters_file": "/b/clusters.json"}]
+        json.dump(rows, open(renv.reservations, "w"))
+        try:
+            n3 = release_reservation("retry", "ev-d", clusters_file="/b/clusters.json", env=renv)
+            left = json.load(open(renv.reservations))
+        except Exception as e:  # noqa: BLE001
+            n3, left = f"{type(e).__name__}: {e}", None
+        ok(n3 == 1 and left == rows[:2],
+           f"RR3 (Codex r1 on #362) a reused invocation id releases one row: the newest of this clusters file ({n3})")
     # BKS (owner decision, 2026-11-17): no hard dollar ceilings; caps warn, project and alert.
     pr = cap_projection([(0.0, 4.0), (3600.0, 6.0)], 5.0, deadline=7200.0)
     ok(cap_level(4.9, 5) == "under_cap" and cap_level(5, 5) == "over_cap" and cap_level(7.5, 5) == "far_over_cap"
