@@ -856,9 +856,10 @@ def stage_inputs(run_dir: str, question: str) -> list[str]:
     return staged
 
 
-def record_cited_inputs(run_dir: str) -> list[str]:
+def record_cited_inputs(run_dir: str, derived_inputs: bool = True) -> list[str]:
     """Every file decision_spec.yaml cites must be inside the run directory; each is recorded with
-    its sha256 in data/inputs_provenance.json. Returns the problems (pre-sign)."""
+    its sha256 in data/inputs_provenance.json. Returns the problems (pre-sign). `derived_inputs`: the run derives its
+    units table, so a missing one's hint names the staged file as a derivation's input (Codex r3 of #355)."""
     import yaml
     import pipeline as P
     try:
@@ -886,7 +887,8 @@ def record_cited_inputs(run_dir: str) -> list[str]:
             prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/") + "/"] = {"dir": True}
         elif not os.path.isfile(p):
             probs.append(f"the spec cites {rel}, which does not exist"
-                         + P.staged_copy_hint(rel, run_dir, derive=isinstance(units, str) and units.strip() == rel))
+                         + P.staged_copy_hint(rel, run_dir, derive=derived_inputs and isinstance(units, str)
+                                              and units.strip() == rel))
         else:
             prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/")] = {"sha256": _sha256(p)}
     os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
@@ -1816,7 +1818,7 @@ class Machine:
             return not got
         if self.st.derived_inputs:
             run("derivation", lambda: self._derive(rd))
-        run("cited-input", lambda: record_cited_inputs(rd))      # records the hashes before a check reads a cited file
+        run("cited-input", lambda: record_cited_inputs(rd, bool(self.st.derived_inputs)))      # records the hashes before a check reads a cited file
         outside = self._cites_outside(rd)
         if outside:             # Codex r1 P1-1: no later check opens a file the cited-input check refused
             out.extend(x for x in outside if x not in out)       # r2 P1-2: never empty, so never a pass
@@ -2979,7 +2981,8 @@ def _pre_engine_check(spec: dict) -> list[str]:
 ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
 # The final statuses under which a post-write gate's decision delivers report.md (accepted, declared or not accepted,
 # each with its write-up): only these retire a stale report_withheld.md (_retire_stale_withheld)
-DELIVERED_STATUSES = ACCEPTED_STATUSES + ("completed_scope_declared", "completed_gate_not_accepted")
+DELIVERED_STATUSES = ACCEPTED_STATUSES + ("completed_scope_declared", "completed_scope_declined",
+                                          "completed_gate_not_accepted")
 STATUS_MARK = "<!-- harness: run status -->"
 
 
@@ -5469,6 +5472,9 @@ def _self_test() -> int:
         rc = [x for x in record_cited_inputs(fk) if "does not exist" in x]
         ok(rc and all("derivation" in x and "cite that path" not in x for x in rc),
            f"T50h the units table's hint says to read the staged file in a derivation ({rc})")
+        rc = [x for x in record_cited_inputs(fk, derived_inputs=False) if "does not exist" in x]
+        ok(rc and all("cite that path" in x for x in rc),
+           f"T50i (Codex r3) a run that runs no derivations is told to cite the staged units table itself ({rc})")
         for kind, key in (("group", {"csv": {"file": "data/missing.csv"}, "units": "state"}),
                           ("unit", {"csv": "data/missing.csv"})):    # Codex: only a group target's column name
             spec = {"decision_units": {"csv": "data/inputs/requirements.txt"}, "calibration": {"joint": {"targets": [
@@ -5772,8 +5778,18 @@ def _self_test() -> int:
                              backend=spike, log=lambda *a: None)
                 mc._go("FINAL", "validator error", "completed_gate_error")
                 t84["validator_error"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
+                # T84e (Codex r3): an owner-declined declaration's report is delivered too
+                dc = os.path.join(td, "t84e")
+                os.makedirs(dc)
+                open(os.path.join(dc, "report.md"), "w").write("repaired\n")
+                open(os.path.join(dc, "report_withheld.md"), "w").write("rejected\n")
+                mc = Machine(dc, StubTasks({}), RunState(question="q", state="GATE", v2_rules=False,
+                                                         last_gate={"post_write": True, "action": "RUN_FAILED"}),
+                             backend=spike, log=lambda *a: None)
+                mc._go("FINAL", "declined", "completed_scope_declined")
+                t84["declined"] = os.path.lexists(os.path.join(dc, "report_withheld.md"))
                 ok(t84 == {"budget_at_write": True, "gate_no_action": True, "gate_dir": True, "gate_ok": False,
-                           "validator_error": True},
+                           "validator_error": True, "declined": False},
                    f"T84c the quarantined draft is retired only after a post-write gate decided, never a directory ({t84})")
             else:
                 ok(s == want and not os.path.exists(rp) and os.path.exists(os.path.join(d, "report_withheld.md"))

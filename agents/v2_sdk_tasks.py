@@ -471,7 +471,7 @@ def _staged_list(run_dir: str) -> str:
             if staged else "")
 
 
-_ID = re.compile(r"^([A-Za-z]+)-(\d{1,6})$")     # an id too long to be one is left as written (Codex r2)
+_ID = re.compile(r"^([A-Za-z]+)-(\d{3,6})$")     # any other form is left as written (Codex r2, r3)
 
 
 def _registered_ids(run_dir: str, before) -> set | None:
@@ -480,10 +480,13 @@ def _registered_ids(run_dir: str, before) -> set | None:
     import yaml
     from agents import findings_ledger as FL
     try:
+        for rel in (FL.LEDGER, "done_when_registry.json"):      # never block on what sits there (Codex r3: a FIFO)
+            if os.path.lexists(os.path.join(run_dir, rel)) and _file_bytes(run_dir, rel) is None:
+                return None
         ids = set(FL.load(run_dir))
-        reg = os.path.join(run_dir, "done_when_registry.json")
-        if os.path.lexists(reg):
-            tests = json.load(open(reg)).get("tests")
+        raw = _file_bytes(run_dir, "done_when_registry.json")
+        if raw is not None:
+            tests = json.loads(raw).get("tests")
             if not isinstance(tests, dict):
                 return None
             ids |= {str(k) for k in tests}
@@ -512,13 +515,14 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
     """Baseline hb2 (§4.5): the harness, not the critic, owns `reviewer` and the id prefix. After a session that wrote
     its critique file (`before`: the file's bytes before the session; an unchanged file is not stamped, so a file the
     session did not write never becomes this critic's review), a file that is a mapping gets the literal reviewer, and
-    each blocker that defines an id of the form X-NNN with another prefix gets the critic's prefix
-    (validate_critique_yaml.PREFIXES), its carried_forward references with it. The new number is the first, from the
-    one written, that no blocker in the file and no earlier round uses (frozen tests, the ledger, the replaced file):
-    a new finding never takes an old finding's id, nor its test. A wrong-prefix id the file also carries forward, whose
-    stamped form is already used, refers to that finding and is left for the critic's repair (Codex r2). When those
-    records cannot be read, nothing is renumbered. A file that is missing, unreadable or not a mapping, and any id that is not a string, is left as it
-    is for the gate to refuse (fail closed). True when the file was rewritten."""
+    each blocker that defines an id of the form X-NNN (three to six digits) with another prefix gets the critic's
+    prefix (validate_critique_yaml.PREFIXES), its carried_forward references with it, when that stamped id is free: no
+    other blocker in the file and no earlier record uses it (frozen tests, the findings ledger, the replaced file).
+    When it is used, whether the critic meant a new finding or that one cannot be told, so the id is left for the
+    critic's repair (Codex r1-r3 of #355: a new number lost a resolved finding; the old id let a new finding inherit
+    its test). When those records cannot be read (or are not regular files), nothing is renamed. A file that is
+    missing, unreadable or not a mapping, and any id that is not a string, is left as it is for the gate to refuse
+    (fail closed). True when the file was rewritten."""
     import yaml
     import validate_critique_yaml as V
     rel = CRITIQUE_FILE[reviewer]
@@ -542,21 +546,18 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
     ren: dict = {}
     wrong = [i for i in defined if _ID.match(i) and not i.startswith(want)]
     known = _registered_ids(run_dir, before) if wrong else set()
-    refs = [c.get("id") if isinstance(c, dict) else c for c in cf]
-    refs = {r for r in refs if isinstance(r, str)}
     if known is not None:
         used = set(defined) | known
         for i in wrong:
             if i in ren or defined.count(i) > 1:
                 continue                         # a duplicated id is the gate's to refuse
-            digits = _ID.match(i).group(2)
-            if want + digits in used and i in refs:
-                continue                         # a carried reference to a finding of that id: the critic repairs it
-            n = int(digits)
-            while f"{want}{n:0{len(digits)}d}" in used:
-                n += 1
-            ren[i] = f"{want}{n:0{len(digits)}d}"
-            used.add(ren[i])
+            new = want + _ID.match(i).group(2)
+            if new in used:
+                # Codex r3: a new finding or that finding (resolved, carried, re-reviewed in the same round) cannot be
+                # told apart, so neither a new number nor the old id is given: the critic repairs it
+                continue
+            ren[i] = new
+            used.add(new)
     if doc.get("reviewer") == reviewer and not ren:
         return False
     doc["reviewer"] = reviewer
@@ -1129,8 +1130,9 @@ def _self_test() -> int:
         finally:
             SdkTasks._session = orig_session
         raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
-        ok(raw["reviewer"] == "critique-presentation" and [b["id"] for b in raw["blockers"]] == ["P-001", "P-002"],
-           f"CS2 an id whose stamped form is taken gets the next free number, never merged ({raw['blockers']})")
+        ok(raw["reviewer"] == "critique-presentation" and [b["id"] for b in raw["blockers"]] == ["P-001", "R-001"],
+           f"CS2 an id whose stamped form is taken is left for the critic's repair, never merged or renumbered "
+           f"({raw['blockers']})")
         for name, body in (("cs_missing", None), ("cs_list", ["not", "a", "mapping"])):
             cd = os.path.join(d, name)
             os.makedirs(cd)
@@ -1187,8 +1189,43 @@ def _self_test() -> int:
         finally:
             SdkTasks._session = orig_session
         raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
-        ok([b["id"] for b in raw["blockers"]] == ["P-003"],
-           f"CS5 a stamped id skips every id an earlier round registered ({[b['id'] for b in raw['blockers']]})")
+        # Codex r3 of #355: whether R-001 is a new finding or P-001 resolved (a same-round re-review has no
+        # carried_forward) cannot be told, so neither a new number nor the old id is given: the critic repairs it.
+        ok([b["id"] for b in raw["blockers"]] == ["R-001"],
+           f"CS5 an id whose stamped form an earlier round registered is left for the critic's repair "
+           f"({[b['id'] for b in raw['blockers']]})")
+        # CS11 (Codex r3): an id not in the NNN form (R-1) is left as written, so no second identity of P-001 passes.
+        # CS12 (Codex r3): a FIFO at the registry's or the ledger's name never blocks the stamp.
+        import threading
+        cs11 = {}
+        for name, fifo in (("short", None), ("fifo_registry", "done_when_registry.json"), ("fifo_ledger", "findings.jsonl")):
+            cd = os.path.join(d, "cs11_" + name)
+            os.makedirs(cd)
+            if fifo:
+                os.mkfifo(os.path.join(cd, fifo))
+            SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 2, "verdict": "PASS",
+                                               "structural_mismatch": {"detected": False},
+                                               "carried_forward": [] if fifo else [{"id": "R-1", "prior_round": 1,
+                                                                                    "still_present": False, "notes": "n"}],
+                                               "blockers": [blk("R-1" if not fifo else "R-001")]})
+            th = threading.Thread(target=lambda: SdkTasks(cd).critique(cd, "critique-presentation", 2), daemon=True)
+            try:
+                th.start()
+                th.join(10)
+            finally:
+                SdkTasks._session = orig_session
+            if th.is_alive():
+                cs11[name] = "blocked"
+                try:
+                    os.close(os.open(os.path.join(cd, fifo), os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:
+                    pass
+                th.join(5)
+            else:
+                cs11[name] = [b["id"] for b in _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))["blockers"]]
+        ok(cs11 == {"short": ["R-1"], "fifo_registry": ["R-001"], "fifo_ledger": ["R-001"]},
+           f"CS11/CS12 an id outside the NNN form is left as written; an unreadable registry or ledger renumbers "
+           f"nothing and never blocks ({cs11})")
         # CS6: an id that is not a string is left for the validator to name, never a crash.
         cs6 = {}
         for name, body in (("list_id", {"reviewer": "presentation", "blockers": [{"id": ["R-001"]}]}),
