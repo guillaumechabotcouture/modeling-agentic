@@ -1681,8 +1681,11 @@ class Machine:
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
         # baseline hb1: a try cut off (the turn cap) is checked on whatever draft is on disk, written or repaired in
         # this try or left by an earlier one: the checks say what holds now, with no before/after comparison to get
-        # wrong on a resume or a rewrite (Codex r1 P1-3/P1-4, r2 P1-5/P1-7/P2-8)
-        drafted = res.ok or os.path.lexists(os.path.join(rd, AB.SPEC_FILE))
+        # wrong on a resume or a rewrite (Codex r1 P1-3/P1-4, r2 P1-5/P1-7/P2-8). Only when the try's feedback is
+        # what these checks wrote (or none): reasons they cannot verify (a rethink, a refused sign-off, the evidence
+        # stage) are never cleared by an old draft that passes them; they are carried (Codex r3 P1-2).
+        recheckable = not fb or fb == self.st.tries.get("spec_feedback_checked")
+        drafted = res.ok or (recheckable and os.path.lexists(os.path.join(rd, AB.SPEC_FILE)))
         if drafted:
             try:
                 from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
@@ -1697,8 +1700,13 @@ class Machine:
                 errs = [f"draft_spec failed: {res.note} (its draft was checked)"] + errs
         if errs:
             self.st.tries["spec_feedback"] = _carry_feedback(errs, fb if not drafted else None)
+            if drafted:     # these checks' own output: a capped next try may be re-checked against it
+                self.st.tries["spec_feedback_checked"] = list(self.st.tries["spec_feedback"])
+            else:
+                self.st.tries.pop("spec_feedback_checked", None)
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
+        self.st.tries.pop("spec_feedback_checked", None)
         if not self._review_conditions(self.st.signoff, defer=False):
             # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
             self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
@@ -1741,20 +1749,18 @@ class Machine:
         else:
             signable = run("pre-sign", lambda: self.backend.pre_sign_problems(rd))
         run("geometry", lambda: self._geometry_problems(rd))
-        if signable and not self._config_refused(rd):
-            # Codex r1 P1-2, r2 P1-3: the assessment builds the engine, only after the pre-sign guards have passed
+        if signable and run("signed-configuration", lambda: self._config_problems(rd)):
+            # Codex r1 P1-2, r2 P1-3: the assessment builds the engine, only after the pre-sign guards have passed; the
+            # configuration guard's own problems go back to the drafter (r3 P1-1)
             run("evidence", lambda: self._evidence_assess(rd)[1]["spec_problems"])   # tb R2: heard one stage late
         return out
 
     @staticmethod
-    def _config_refused(rd: str) -> bool:
-        """The signed engine configuration's guard (analysis_backend.signed_config_problems) refuses the draft, whatever
-        the backend: no engine is built from it. Fail closed."""
+    def _config_problems(rd: str) -> list[str]:
+        """The signed engine configuration's guard (analysis_backend.signed_config_problems) on the draft, whatever the
+        backend: no engine is built from a draft it refuses (an error is reported by _spec_checks, fail closed)."""
         import yaml
-        try:
-            return bool(AB.signed_config_problems(yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}))
-        except Exception:  # noqa: BLE001
-            return True
+        return list(AB.signed_config_problems(yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}))
 
     @staticmethod
     def _cites_outside(rd: str) -> list[str]:
@@ -6321,6 +6327,7 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     d17, T17, st17 = new_run("hs17", {})
     StubTasks(T17.s).draft_spec("q", d17, None)          # the earlier, valid draft
     st17.tries["spec_feedback"] = ["rethink after review round 1: the comparator answers another question"]
+    save_state(d17, st17)
     T17 = Scripted(dict(T17.s, tries=["capped"]))
     m = Machine(d17, T17, st17, backend=spike, log=lambda *a: None, cross_engine_check=False)
     m.step()
