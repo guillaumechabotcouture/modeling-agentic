@@ -306,17 +306,20 @@ def _final_size_map(K: np.ndarray, e: np.ndarray, a: np.ndarray, z: np.ndarray):
     the small final sizes near the threshold to cancellation); the Jacobian's factor a exp(-K z); and a bound on the
     rounding error of the computed T (Codex r1 of #351, P1-1): the row sum x = sum_j K_ij z_j is off by at most
     (G + 1) eps x, which moves T by at most a exp(-x) times that; expm1, the product and the sum add a few eps of
-    e + a (1 - exp(-x)). Products that underflow are off by at most one subnormal step each, so an absolute
-    (G + 1) TINY a is added (Codex r2 P1-1: a force rounded to zero still carries an allowance); a row sum that
-    overflows saturates T at e + a with no error term (r2 P2-4). The row sums run over the last axis of each member's own arrays, so a
-    member's arithmetic does not depend on its batch companions."""
+    e + a (1 - exp(-x)). Products that underflow are off by at most one subnormal step each, which moves T by at most
+    (G + 1) TINY wherever a > 0: that absolute floor is added unscaled, so it cannot round to zero itself (Codex r2
+    and r3 P1-1: a force rounded to zero still carries an allowance). A row sum that overflows saturates T at e + a
+    with no error term (r2 P2-4). Overflow and underflow are handled here, whatever the caller's numpy error settings
+    (r3 P2-3). The row sums run over the last axis of each member's own arrays, so a member's arithmetic does not
+    depend on its batch companions."""
     G = z.shape[-1]
-    with np.errstate(over="ignore"):
+    with np.errstate(over="ignore", under="ignore"):
         x = (K * z[:, None, :]).sum(axis=2)
-    T = e + a * -np.expm1(-x)
-    ax = a * np.exp(-x)
-    ax_x = np.where(ax > 0, ax * np.where(np.isfinite(x), x, 0.0), 0.0)
-    return T, ax, EPS * ((G + 1) * ax_x + 4.0 * T) + (G + 1) * TINY * a
+        T = e + a * -np.expm1(-x)
+        ax = a * np.exp(-x)
+        ax_x = np.where(ax > 0, ax * np.where(np.isfinite(x), x, 0.0), 0.0)
+        r = EPS * ((G + 1) * ax_x + 4.0 * T) + np.where(a > 0, (G + 1) * TINY, 0.0)
+    return T, ax, r
 
 
 def _certify(K, e, a, c, bound, upper: bool) -> np.ndarray:
@@ -338,6 +341,13 @@ def _certify(K, e, a, c, bound, upper: bool) -> np.ndarray:
 
 
 def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, cap: int):
+    """See _solve_final_size; overflow and underflow are handled inside, whatever the caller's numpy error settings
+    (Codex r3 of #351, P2-3)."""
+    with np.errstate(over="ignore", under="ignore"):
+        return _solve_final_size(K, s, e, tol, cap)
+
+
+def _solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, cap: int):
     """v0.3: the multigroup final-size relation z_i = s_i - (s_i - e_i) exp(-sum_j K_ij z_j), solved directly, per
     member. K (B, G, G) is q C, s (B, G) the susceptible share after the interventions, e (B, G) the seed share
     (0 <= e <= s); z counts the seeds. Groups the seeds do not reach (infection_reach) keep z = e. On the reached
@@ -357,8 +367,9 @@ def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, ca
     K, s, e = (np.asarray(x, np.float64) for x in (K, s, e))     # Codex r2 P1-2: binary64 throughout
     B, G = s.shape
     m = infection_reach(K, s, e)
-    # unreached groups, and groups no force reaches at all (a zero row: z = e exactly, r2 P2-5), keep the seed
-    top = np.where(m & np.any(K != 0, axis=2), s, e)
+    # unreached groups, and groups no force from a reached group acts on (z = e exactly, r2 P2-5; r3 P2-2: contacts
+    # from unreached groups do not count), keep the seed
+    top = np.where(m & np.any((K != 0) & m[:, None, :], axis=2), s, e)
     a = top - e
     lo, hi = e.copy(), top.copy()
     iters = np.zeros(B, int)

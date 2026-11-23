@@ -19,8 +19,9 @@ on the groups the seeds reach after the interventions (`solve_final_size`, `infe
   moved at all for 50 iterations, fails closed (`converged: false`). That happens when the arithmetic cannot
   certify `tol`: in a chain of exactly critical groups (FD14) the limit is about 1e-9, and such a member crawls
   on plain steps to `step_cap` (10^6 for final_size, roughly a minute) before failing. The rounding bound includes
-  an absolute allowance for underflow, so a force rounded to zero is never certified as zero (FD18); inputs are
-  promoted to binary64; a zero row is exact (z = e); an overflowing force saturates the map.
+  an absolute, unscaled allowance for underflow, so a force rounded to zero is never certified as zero (FD18,
+  FD23); inputs are promoted to binary64; a group no reached group acts on is exact (z = e); an overflowing force
+  saturates the map; overflow and underflow are handled inside, whatever the caller's numpy error settings.
 - `meta.steps` and `windows.*.steps` count the solver's iterations, per member, and `meta.time_axis` is
   `solver_iterations`. `meta.final_size_path` is
   `direct_solver` or `simulation` on every final_size run.
@@ -29,7 +30,7 @@ on the groups the seeds reach after the interventions (`solve_final_size`, `infe
   a final_size run on the simulation path (forcing, a component during the epidemic, or branching importation)
   also gains `meta.final_size_path: simulation`, and every other configuration's whole output is unchanged.
 - The engine does not import `benchmarks/oracles.py`: that file is outside the engine fingerprint and is the
-  independent check (`selftest_final_size.py`, FD1–FD22).
+  independent check (`selftest_final_size.py`, FD1–FD25).
 
 ## Model and framework
 
@@ -112,4 +113,4 @@ citation, marked `unverified` until the evidence service checks it.
   identical, since no coverage configuration sets `final_size`. The coverage pack therefore does not test the
   solver; the analytic pack and `selftest_final_size.py` do.
 - Self-tests: `engine.py --self-test` (v0.1 contract, batching, stop rule, pack subset, stamps),
-  `selftest_final_size.py --self-test` (v0.3, FD1–FD22) and `selftest_age.py --self-test` (v0.2, A1–A24), about 15 s and 25 s locally with two BLAS threads.
+  `selftest_final_size.py --self-test` (v0.3, FD1–FD25) and `selftest_age.py --self-test` (v0.2, A1–A24), about 15 s and 25 s locally with two BLAS threads.
