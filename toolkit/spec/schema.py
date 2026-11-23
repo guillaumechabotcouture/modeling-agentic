@@ -128,6 +128,9 @@ docs/design/v2-spec-and-analysis.md §1):
       allocation_file: allocation_optimized.csv
       columns: {unit: district, package: package, value: cases_averted}
       headline: {name: total_cases_averted, outcome: cases}
+      plan: expected_value             # optional: point (the default) or expected_value, the plan with the best mean
+                                       # over the uncertainty draws, per-unit means in the CSV, a fixed-plan mean
+                                       # claim (toolkit/analysis/plan_rule.py)
       by_group: {columns: {group, quantity, value}, quantity: {<engine group>: <cost_outputs name>}}
                                        # optional: one row per (unit, engine group) with the plan's quantity and
                                        # the outcome averted there (a joint package within a unit)
@@ -190,6 +193,7 @@ CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (v
 DECISION_TEST_TYPES = ("perturb", "interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
                        "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale", "boundary_engine")
 DELIVERABLE_KINDS = ("package_per_unit", "estimates")    # estimates: no allocation units (toolkit/spec/estimates.py)
+PLAN_RULES = ("point", "expected_value")     # deliverable.plan (toolkit/analysis/plan_rule.py); absent: point
 CALIBRATION_FIELDS = {
     "emulator_inversion": ("attribute", "range", "target_column", "window", "metric"),
     "likelihood": ("attribute", "range", "parameters", "targets"),
@@ -1850,6 +1854,24 @@ def _validate_deliverable(s) -> list[str]:
     hl = d.get("headline") or {}
     if not hl.get("name") or hl.get("outcome") not in s.outcomes():
         bad.append("deliverable.headline: {name, outcome} with outcome in objective/outcomes_reported")
+    pr = d.get("plan")
+    if pr is not None and pr not in PLAN_RULES:
+        bad.append(f"deliverable.plan: one of {PLAN_RULES} (absent: point), got {pr!r}")
+    if pr == "expected_value":       # hb1 fix 11: the plan with the best mean over the uncertainty draws
+        un = s.raw.get("uncertainty") or {}
+        if not un.get("sources"):
+            bad.append("deliverable.plan: expected_value needs at least one uncertainty source to average over")
+        if (un.get("affordability") or {}).get("enforce"):
+            bad.append("deliverable.plan: expected_value is not combined with uncertainty.affordability.enforce (a "
+                       "plan solved within a reserve); the expected-value plan already fits the budget in every draw")
+        if (s.raw.get("analysis") or {}).get("plan_variants"):
+            bad.append("deliverable.plan: expected_value is not combined with analysis.plan_variants (the variants are "
+                       "solved and compared at the point values)")
+        if d.get("kind") != "package_per_unit":
+            bad.append("deliverable.plan: expected_value applies to a package_per_unit deliverable")
+        if d.get("by_group") is not None:
+            bad.append("deliverable.plan: expected_value does not yet write a by-group table (its values are at the "
+                       "point values); use the point plan or drop by_group")
     bg = d.get("by_group")
     if bg is not None:
         gc = (bg or {}).get("columns") if isinstance(bg, dict) else None
@@ -1931,6 +1953,56 @@ def _self_test_joint_packages(ok):
         ok(any("by_group.columns" in e for e in errs) and any("not an engine group" in e for e in errs)
            and any("not in analysis.cost_outputs" in e for e in errs) and any("evaluation: direct" in e for e in errs),
            f"SPJ5 a malformed by_group deliverable is refused: {errs}")
+
+
+def _self_test_plan_rule(ok):
+    """SPEV (hb1 fix 11, J): deliverable.plan picks the plan the deliverable carries; absent is the point plan."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        raw = yaml.safe_load(open(toy_spec(d)))
+        ok(_validate_deliverable(Spec(raw, d)) == [] and "plan" not in raw["deliverable"],
+           "SPEV1 a spec without deliverable.plan validates as before (the point plan)")
+        good = []
+        for v in PLAN_RULES:
+            r = copy.deepcopy(raw)
+            r["deliverable"]["plan"] = v
+            good.append(_validate_deliverable(Spec(r, d)))
+        ok(good == [[] for _ in PLAN_RULES], f"SPEV2 each declared plan rule {PLAN_RULES} validates: {good}")
+        r = copy.deepcopy(raw)
+        r["deliverable"]["plan"] = "mean"
+        errs = _validate_deliverable(Spec(r, d))
+        ok(any("deliverable.plan" in e for e in errs), f"SPEV3 an unknown plan rule is refused: {errs}")
+        bad = {"no uncertainty source": lambda x: x["uncertainty"].update(sources=[]),
+               "affordability enforce": lambda x: x["uncertainty"].update(
+                   affordability={"enforce": True, "max_share_over_budget": 0.05}),
+               "estimates kind": lambda x: x["deliverable"].update(kind="estimates"),
+               "headline variant": lambda x: x["analysis"].update(plan_variants={"headline": "v", "variants": []}),
+               "variants, no headline": lambda x: x["analysis"].update(plan_variants={"variants": [
+                   {"id": "given", "type": "fixed_plan", "column": "given", "text": "t"}]}),
+               "by_group": lambda x: x["deliverable"].update(by_group={"columns": {"group": "g", "quantity": "q",
+                                                                                   "value": "v"}, "quantity": {}})}
+        miss = []
+        for k, mut in bad.items():
+            r = copy.deepcopy(raw)
+            r["deliverable"]["plan"] = "expected_value"
+            mut(r)
+            if not any("deliverable.plan" in e for e in _validate_deliverable(Spec(r, d))):
+                miss.append(k)
+        from toolkit.spec import estimates as ES
+        es_bad = {}
+        with tempfile.TemporaryDirectory() as de:
+            ep = ES.toy_dir(de)
+            es_bad["(none)"] = validate(load(ep))
+            for v in ("expected_value", "bogus", "point"):
+                re_ = yaml.safe_load(open(ep))
+                re_["deliverable"]["plan"] = v
+                yaml.safe_dump(re_, open(ep, "w"), sort_keys=False)
+                es_bad[v] = [e for e in validate(load(ep)) if "deliverable.plan" in e]
+        es_bad["(none)"] = not es_bad["(none)"]       # the plain estimates spec validates
+        ok(all(es_bad.values()), f"SPEV5 the public validate() refuses deliverable.plan on an estimates spec, whatever "
+                                 f"its value (Codex r1 P1-4): {es_bad}")
+        ok(not miss, f"SPEV4 expected_value is refused without an uncertainty source, with a reserve "
+                     f"(affordability enforce), with plan variants, on an estimates deliverable and with a by-group table (not refused: {miss})")
 
 
 def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)) -> str:
@@ -2670,6 +2742,10 @@ def _self_test() -> int:
         ok(False, f"DI spec checks: {type(e).__name__}: {e}")
     _self_test_engine_refs(ok)
     _self_test_joint_packages(ok)
+    try:
+        _self_test_plan_rule(ok)
+    except Exception as e:  # noqa: BLE001 -- before the rule exists (step α) this is the failure
+        ok(False, f"SPEV deliverable.plan checks: {type(e).__name__}: {e}")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

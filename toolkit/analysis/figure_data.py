@@ -395,6 +395,10 @@ def rebuild(run_dir: str, log=print):
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))
     if spec["analysis"]["evaluation"] != "emulator":
         raise RebuildRefused("the run evaluates the engine directly; a rebuild would run the engine")
+    from toolkit.analysis import plan_rule as PR
+    if PR.rule(spec.raw) != "point":     # hb1 fix 11 (Codex r2 of #343 P1-4): a point solve cannot verify that plan
+        raise RebuildRefused("the plan was solved over the uncertainty draws (deliverable.plan: expected_value); a "
+                             "rebuild from the point tables cannot reproduce it")
     eng = spec.engine()
     rows = os.path.join(run_dir, "analysis", "batch", "results.jsonl")
     if not os.path.exists(rows):
@@ -450,6 +454,9 @@ def rebuild(run_dir: str, log=print):
     out0, ben0, cost0 = A.evaluate(A.theta0, z0)
     A.point_events = list(A.last_events)
     point = yaml.safe_load(open(os.path.join(run_dir, "analysis", "point.yaml")))["data"]
+    if point.get("plan_rule"):       # hb1 fix 11 (Codex r3 P2-6): the stored plan's rule, whatever the spec says now
+        raise RebuildRefused("point.yaml records a plan solved over the uncertainty draws (plan_rule); a rebuild from "
+                             "the point tables cannot reproduce it")
     if ((spec["uncertainty"].get("affordability") or {}).get("enforce")):
         # F6 S1-1b: an enforced run's plan was solved within its reserve; restore it before solving
         rv = point.get("reserve")

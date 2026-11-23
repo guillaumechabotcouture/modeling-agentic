@@ -19,7 +19,7 @@ for _p in (_REPO, os.path.join(_REPO, "scripts")):
         sys.path.insert(0, _p)
 from agents import enforcement  # noqa: E402
 from agents.v2_tasks import CRITIQUE_FILE, PREFIX, TaskResult
-from agents.fix_loop import FIX_PLANNER_PROMPT
+from agents.fix_loop import FIX_EDITABLE, FIX_PLANNER_PROMPT, task_scope
 
 TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"]
 OUT = "_task_output.json"
@@ -146,8 +146,8 @@ Then write {out} = {{"ok": true}}.""",
 
 Task: fix task {tid}: {brief}
 Findings: {findings}. Evidence from the last check (if any): {evidence}
-You may edit analysis_settings.yaml, which holds only computational settings
-({settings}), and files under models/ext/.
+You may edit only {files} (the files this task's plan names). analysis_settings.yaml holds only
+computational settings ({settings}).
 decision_spec.yaml is signed by the owner and you cannot change it; a fix that needs it changed is
 a finding for the owner. The harness undoes any other edit, then rebuilds and measures the effect.
 Output: {out} = {{"ok": true, "changed": "<one line>"}}.""",
@@ -250,7 +250,7 @@ PROMPTS["seed_world_model"] = seed_prompt_text().replace("{", "{{").replace("}",
     .replace("{{out_in}}", "{out_in}").replace("{{out}}", "{out}")
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
-        "critique": (), "fix": ("analysis_settings.yaml", "models/ext/"), "write": ("manuscript.md",),
+        "critique": (), "fix": FIX_EDITABLE, "write": ("manuscript.md",),
         "seed_world_model": (SEED_FILE,),
         # v2 autonomy 1B-ii: the dossier the spec names (draft_evidence(rel=...)); this is the default name
         "draft_evidence": ("evidence_dossier.yaml",)}
@@ -414,8 +414,8 @@ def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
                     return f"{rel} is the harness file {h}"
         except OSError:
             return f"{rel} cannot be checked"
-    if low == OUT.lower() or any(low.startswith(o.lower()) for o in owns if o.endswith("/")) \
-            or low in {o.lower() for o in owns}:
+    # what the task owns matches as written (Codex r3 on #341, P1-2): a case variant of an owned path is another file
+    if low == OUT.lower() or any(rel.startswith(o) for o in owns if o.endswith("/")) or rel in owns:
         return None
     return f"this task may write only {', '.join(owns + (OUT,))}"
 
@@ -648,8 +648,9 @@ class SdkTasks:
         return self._session("fix", PROMPTS["fix"].format(tid=task["id"], brief=task.get("brief", ""),
                                                            findings=task["findings"],
                                                            evidence=json.dumps(evidence)[:2000] if evidence else "none",
-                                                           settings=_settings_text(), out=OUT), "Make the fix.",
-                             OWNS["fix"])
+                                                           settings=_settings_text(), out=OUT,
+                                                           files=", ".join(task_scope(task))), "Make the fix.",
+                             task_scope(task))       # the in-scope files its validated plan names (FIX_EDITABLE at most)
 
     def write(self, run_dir, mode, feedback=None, findings=None):
         fb = ("\n\nThis is a repair: the report was not accepted, and the harness will not deliver it while it "
@@ -805,7 +806,7 @@ def _self_test() -> int:
         ok(all(k in cp2 for k in ("resolved_in_round: 2", "resolved_evidence", "prior_round: 1", "still_present",
                                   "never a bare id")),
            "S17 the critique prompt states what a resolved blocker and a carried_forward entry need")
-        ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT)
+        ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT, files="f")
            and "engine: auto" in PROMPTS["draft_spec"], "S10 the prompts follow the analysis backend's schema")
 
         async def crash_no_sid(prompt=None, options=None):
@@ -981,6 +982,7 @@ def _self_test() -> int:
 
         def rec_session(self_, kind, system, prompt, owns, model=None):
             got[kind] = (prompt, owns)
+            got[kind + ":system"] = system
             return TaskResult(True, {"ok": True}, 0.0, "fake")
         SdkTasks._session = rec_session
         try:
@@ -991,11 +993,24 @@ def _self_test() -> int:
             except TypeError as e:
                 got["pick_engine"] = (f"TypeError: {e}", ())
             t3.fix({"id": "T1", "brief": "b", "findings": ["R-001"], "owner_state": "WRITE"}, d, None)
+            got["fix_all"] = got["fix"]
+            t3.fix({"id": "T2", "brief": "b", "findings": ["R-002"], "owner_state": "ANALYZE",
+                    "files": ["analysis_settings.yaml"]}, d, None)
         finally:
             SdkTasks._session = orig_session
         ok("e1" in got["pick_engine"][0] and "D-001: it has no age structure {x}" in got["pick_engine"][0],
            f"S_PICK_RETHINK the engine pick after a rethink names the engine left and the reasons ({got['pick_engine'][0]!r})")
-        ok(got["fix"][1] == OWNS["fix"], f"S_FIX_OWNS a fix task owns the fix files ({got['fix'][1]})")
+        ok(got["fix_all"][1] == OWNS["fix"], f"S_FIX_OWNS a fix task owns the fix files ({got['fix_all'][1]})")
+        # Codex review of #341 (P1-6): the worker writes only the in-scope files its validated plan names
+        ok(got["fix"][1] == ("analysis_settings.yaml",) and "edit only analysis_settings.yaml" in got["fix:system"],
+           f"S_FIX_TASK_FILES a fix task owns the files its plan names, and its prompt says so ({got['fix']})")
+        # Codex r3 P1-2: an owned path matches as written (case-sensitive): owning models/ext/rates.py is not owning
+        # models/ext/RATES.py, a different module on a case-sensitive filesystem
+        ok(_allowed("models/ext/rates.py", d, ("models/ext/rates.py",)) is None
+           and _allowed("models/ext/RATES.py", d, ("models/ext/rates.py",)) is not None
+           and _allowed("MODELS/ext/x.py", d, ("models/ext/",)) is not None
+           and _allowed("models/ext/sub/x.py", d, ("models/ext/",)) is None,
+           "S_OWNS_CASE an owned file or folder matches case-sensitively")
         # S_FOR_RUN_DIR (lead-gaps β): the tasks move to a child run with the same settings, rooted in the child
         t5 = SdkTasks(d, allow_cloud=True, task_cap_usd=2.5, max_turns=7, query_fn=rec_session)
         c5 = t5.for_run_dir(os.path.join(d, "child"))
