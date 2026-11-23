@@ -7,7 +7,8 @@ owner-wait split into owner response and operator latency, censored at the cut-o
 chain as it stood at the cut-off: by default the strict arm's (24 h after the first launch, or the first time every
 chain is FINAL or paused); pass --cutoff for an assisted arm (a harvest at run exit passes "now"). Read-only: it reads
 metadata.json, run_state.json, the sign-off records, findings.jsonl and whether report.md / report_withheld.md
-exist, through lib.safe_io (no link followed). It refuses any path under `_truth` or `evals_private`.
+exist (and, for provenance and check value, amendment_record.json, impact_ledger.jsonl, the critique YAMLs and the
+point, estimates and decision_tests analysis artifacts), through lib.safe_io (no link followed). It refuses any path under `_truth` or `evals_private`.
 
 Every field says how it was derived: `record` (a harness record states it), `inferred` (reconstructed from
 other records, for example a pause from a transition followed by a resume), or `unavailable`. A run directory
@@ -18,7 +19,13 @@ local time, converted with `metadata.utc_offset_s`. With no offset a naive time 
 any wait that needs it.
 
     python3 scripts/harness_metrics.py <run_dir>... [--chain a,b ...] [--cutoff ISO] [--ledger L] [--json out.json]
+    python3 scripts/harness_metrics.py --check-value <run_dir>... [--json out.json]
     python3 scripts/harness_metrics.py --self-test
+
+Finding provenance: a run made by toolkit/spec/amend.py (or relaunched with MA_PARENT_RUN) records `motivated_by`, the
+parent's findings that led to it. The per-kind table counts those findings and whether the amended run's plan,
+headline (by more than 0.5%) or decision-test verdicts changed against the parent's analysis artifacts.
+--check-value prints the per-check productive / noise table of the check-value analysis (`check_value`).
 
 Importable (PR 4B run_harvest / feedback_store): `load_run`, `as_of`, `chains`, `summarise`, `rows`, `wave_summary`.
 """
@@ -560,6 +567,252 @@ def table(rs) -> str:
         f"{s['median_interventions']}; total owner-wait {s['total_owner_wait_h']} h"])
 
 
+# ------------------------------------------------------------------ finding provenance and check value
+# A finding's value is read from the records only (no engine run): a fix task's impact row (agents/fix_loop.py), and
+# an amendment's motivated_by (toolkit/spec/amend.py motivation) compared with the parent's analysis artifacts.
+CRITIC_KIND = "critique_blocker"                  # agents/findings_ledger.py CRITIC_KIND
+CRITIQUES = {"critique-domain": "critique_domain.yaml", "critique-redteam": "critique_redteam.yaml",
+             "critique-presentation": "critique_presentation.yaml", "critique-methods": "critique_methods.yaml",
+             "critique-sufficiency": "critique_sufficiency.yaml"}          # agents/findings_ledger.py CRITIQUE_FILES
+HEADLINE_MOVE = 0.005                             # the analysis's threshold: a headline number moved by more than 0.5%
+WORDING_ONLY = {"manuscript.md"}
+
+
+def _data(run_dir, rel):
+    """The `data` payload of a harness analysis artifact (YAML), or None when absent or unreadable."""
+    import yaml
+    try:
+        doc = yaml.safe_load(safe_io.read_nofollow(run_dir, rel)[0])
+    except Exception:  # noqa: BLE001 -- absent, a link, or not YAML: no record
+        return None
+    return doc.get("data") if isinstance(doc, dict) and isinstance(doc.get("data"), dict) else None
+
+
+def _numbers(x, pre="") -> dict:
+    if isinstance(x, dict):
+        return {k: v for kk, vv in x.items() for k, v in _numbers(vv, f"{pre}{kk}.").items()}
+    return {pre.rstrip("."): float(x)} if isinstance(x, (int, float)) and not isinstance(x, bool) else {}
+
+
+def _moved(a, b) -> bool | None:
+    """A headline number in both moved by more than HEADLINE_MOVE (relative); None when no number is in both."""
+    a, b = _numbers(a), _numbers(b)
+    common = set(a) & set(b)
+    if not common:
+        return None
+    return any(abs(b[k] - a[k]) > HEADLINE_MOVE * abs(a[k]) if a[k] else b[k] != 0 for k in common)
+
+
+def outcome(run_dir) -> dict:
+    """What a run decided, from its analysis artifacts: the plan (point.yaml plan, or estimates.yaml decision), the
+    headline (point.yaml averted, or estimates.yaml outputs) and the decision-test verdicts by test id."""
+    pt, est, dts = (_data(run_dir, f"analysis/{k}.yaml") for k in ("point", "estimates", "decision_tests"))
+    src = pt or est or {}
+    tests = [t for t in _l((dts or {}).get("tests")) if isinstance(t, dict) and t.get("test_id") is not None]
+    return {"plan": src.get("plan" if pt else "decision"), "headline": src.get("averted" if pt else "outputs"),
+            "verdicts": {str(t["test_id"]): t.get("verdict") for t in tests} if dts else None}
+
+
+def compare(parent_dir, child_dir) -> dict:
+    """changed / same / unavailable for the plan, the headline and the decision-test verdicts, child against parent."""
+    p, c = outcome(parent_dir), outcome(child_dir)
+    common = set(p["verdicts"] or {}) & set(c["verdicts"] or {})
+    mv = _moved(p["headline"], c["headline"])
+    out = {"plan": "unavailable" if p["plan"] is None or c["plan"] is None else
+           "changed" if p["plan"] != c["plan"] else "same",
+           "headline": "unavailable" if mv is None else "changed" if mv else "same",
+           "verdicts": "unavailable" if not common else
+           "changed" if any(p["verdicts"][t] != c["verdicts"][t] for t in common) else "same"}
+    v = set(out.values())
+    out["any"] = "changed" if "changed" in v else "unavailable" if "unavailable" in v else "same"
+    return out
+
+
+def check_label(f, category=None) -> str:
+    """The check a finding belongs to: a harness finding's kind, or a critic reviewer with the blocker's category."""
+    f = _d(f)
+    if f.get("kind") == CRITIC_KIND:
+        return f"{f.get('source')}/{(category or f.get('category') or 'uncategorised').upper()}"
+    return str(f.get("kind") or "unknown")
+
+
+def _categories(run_dir) -> dict:
+    import yaml
+    out = {}
+    for reviewer, name in CRITIQUES.items():
+        try:
+            doc = yaml.safe_load(safe_io.read_nofollow(run_dir, name)[0]) or {}
+        except Exception:  # noqa: BLE001 -- absent or unreadable: uncategorised
+            continue
+        for b in _l(_d(doc).get("blockers")):
+            if isinstance(b, dict) and b.get("id") is not None and b.get("category"):
+                out[(reviewer, str(b["id"]))] = str(b["category"]).upper()
+    return out
+
+
+def _motive(run_dir):
+    """A run's motivated_by: metadata.json's, else its amendment record's; None when neither records one."""
+    for rel in ("metadata.json", "amendment_record.json"):
+        obj, _ = _read(run_dir, rel)
+        if isinstance(_d(obj).get("motivated_by"), dict):
+            return obj["motivated_by"]
+    return None
+
+
+def provenance(dirs) -> list[dict]:
+    """One row per run that records motivated_by: its parent among `dirs` (by name, unique, and by the parent's
+    run_state.json sha256 when recorded), the motivating findings, and the comparison with the parent."""
+    names = {}
+    for d in dirs:
+        names.setdefault(os.path.basename(os.path.normpath(d)), []).append(d)
+    out = []
+    for d in dirs:
+        if not os.path.isdir(d) or any(p in REFUSED_PARTS for p in os.path.abspath(d).split(os.sep)):
+            continue
+        mb = _motive(d)
+        if mb is None:
+            continue
+        meta, _ = _read(d, "metadata.json")
+        pr = _d(_d(meta).get("parent_run"))
+        cand = [x for x in names.get(str(mb.get("parent_run")), []) if x != d]
+        sha = pr.get("run_state_sha256")
+        why = ("parent not among the runs given" if not cand else "parent name not unique" if len(cand) > 1 else
+               "the parent's run_state.json changed since" if sha is not None and sha != _sha(cand[0], "run_state.json")
+               else None)
+        out.append({"child": os.path.basename(os.path.normpath(d)), "parent": mb.get("parent_run"),
+                    "source": mb.get("source"), "findings": [f for f in _l(mb.get("findings")) if isinstance(f, dict)],
+                    "linked": why is None, **({"why": why} if why else {}),
+                    "compare": compare(cand[0], d) if why is None else None})
+    return out
+
+
+def amendment_table(prov) -> list[dict]:
+    """Per finding kind (check): findings that led to an amendment or relaunch, and how often the amended run's plan,
+    headline or decision-test verdicts changed against the parent's."""
+    t = {}
+    for p in prov:
+        for f in p["findings"]:
+            r = t.setdefault(check_label(f), {"check": check_label(f), "findings": 0, "compared": 0, "plan": 0,
+                                              "headline": 0, "verdicts": 0, "any_changed": 0, "unchanged": 0,
+                                              "unavailable": 0})
+            r["findings"] += 1
+            cmp_ = p["compare"]
+            if cmp_ is None or cmp_["any"] == "unavailable":
+                r["unavailable"] += 1
+                continue
+            r["compared"] += 1
+            for k in ("plan", "headline", "verdicts"):
+                r[k] += cmp_[k] == "changed"
+            r["any_changed" if cmp_["any"] == "changed" else "unchanged"] += 1
+    return sorted(t.values(), key=lambda r: (-r["any_changed"], -r["findings"], r["check"]))
+
+
+def _reraised(f, fps) -> bool:
+    ev = [_d(e).get("status") for e in _l(_d(f).get("events"))]
+    cycle = any(s == "owner_accepted" and "open" in ev[i + 1:] for i, s in enumerate(ev))
+    return cycle or len(fps.get(_d(f).get("id"), ())) > 1
+
+
+def check_value(dirs) -> dict:
+    """The productive / noise table of the check-value analysis (its method section), per check. Runs: v2 run dirs
+    with a findings ledger; copies with the same findings.jsonl bytes count once. Productive: (a) a fix task moved a
+    headline number by more than 0.5% or changed an allocation CSV or a decision-test file (its impact row); (b) the
+    finding motivated an amendment whose run changed the plan, headline or a decision-test verdict against the
+    parent's. Noise: closed (fixed, declared, accepted) with nothing changed but manuscript.md, or re-raised after an
+    acceptance (an owner_accepted -> open cycle, or several answer fingerprints in scope_signoff.json). Not computed:
+    blocking gate-rounds, allocated loop dollars, and findings shown false by a later commit (a reader's call)."""
+    prov = provenance(dirs)
+    moved = {(p["parent"], f.get("id")): p["compare"]["any"] for p in prov if p["compare"] for f in p["findings"]}
+    seen, stats, notes = set(), {}, []
+    for d in dirs:
+        run = load_run(d)
+        if run["errors"]:
+            notes.append(f"{run['name']}: unreadable ({'; '.join(run['errors'])})")
+            continue
+        if run["meta"].get("pipeline") != "v2":
+            notes.append(f"{run['name']}: pipeline {run['meta'].get('pipeline') or 'unknown'}, not counted")
+            continue
+        fsha = _sha(d, "findings.jsonl")
+        fsha = fsha if fsha is None or run["findings"] else os.path.abspath(d)     # empty ledgers are not copies
+        if fsha is None or fsha in seen:
+            notes.append(f"{run['name']}: " + ("no findings ledger" if fsha is None else "a copy of a run counted"))
+            continue
+        seen.add(fsha)
+        cats, delivered = _categories(d), completion(run)["class"] == "completes"
+        impact = [x for x in _l(_read(d, "impact_ledger.jsonl")[0]) if isinstance(x, dict)]
+        fps = {}
+        for fp, a in _d(_d(run.get("scope")).get("answers")).items():
+            fps.setdefault(_d(a).get("finding"), set()).add(fp)
+        for f in (x for x in _l(run["findings"]) if isinstance(x, dict)):
+            lab = check_label(f, cats.get((f.get("source"), str(f.get("id")))))
+            s = stats.setdefault(lab, {"check": lab, "runs": set(), "rows": 0, "high": 0, "fix_tasks": 0,
+                                       "fix_usd": 0.0, "owner": 0, "resolution": {}, "productive_in_run": 0,
+                                       "amended": 0, "amended_changed": 0, "noise_wording": 0, "noise_reraised": 0})
+            s["runs"].add(fsha)
+            s["rows"] += 1
+            s["high"] += f.get("severity") == "HIGH"
+            rows_ = [x for x in impact if f.get("id") in _l(x.get("findings"))]
+            s["fix_tasks"] += len(rows_)
+            s["fix_usd"] += sum(float(x.get("usd") or 0) for x in rows_)
+            st_ = f.get("status")
+            s["owner"] += st_ in ("owner_accepted", "owner_declined") or any(
+                _d(e).get("status") in ("owner_accepted", "owner_declined") for e in _l(f.get("events")))
+            code = {"fixed": "F", "declared": "D", "owner_accepted": "A", "owner_declined": "N"}.get(
+                st_, "O" if delivered else "X")
+            s["resolution"][code] = s["resolution"].get(code, 0) + 1
+            touched = [set(_l(x.get("files_changed"))) | set(_l(x.get("outputs_changed"))) for x in rows_]
+            prod = any(_moved(x.get("headline_before"), x.get("headline_after")) for x in rows_) or any(
+                ("allocation" in p.rsplit("/", 1)[-1] and p.endswith(".csv")) or p.startswith("models/decision_tests/")
+                for t in touched for p in t)
+            s["productive_in_run"] += bool(prod)
+            m = moved.get((run["name"], f.get("id")))
+            s["amended"] += m is not None
+            s["amended_changed"] += m == "changed"
+            if prod or m == "changed":
+                continue
+            if _reraised(f, fps):
+                s["noise_reraised"] += 1
+            elif st_ in ("fixed", "declared", "owner_accepted") and (rows_ or st_ != "fixed") \
+                    and all(t <= WORDING_ONLY for t in touched):
+                s["noise_wording"] += 1
+    out = []
+    for s in stats.values():
+        s["runs"] = len(s["runs"])
+        s["fix_usd"] = round(s["fix_usd"], 2)
+        s["class"] = ("productive" if s["productive_in_run"] + s["amended_changed"] else
+                      "noisy" if s["noise_wording"] + s["noise_reraised"] else "no signal")
+        out.append(s)
+    order = {"productive": 0, "noisy": 1, "no signal": 2}
+    return {"runs": len(seen), "checks": sorted(out, key=lambda s: (order[s["class"]], -s["rows"], s["check"])),
+            "amendments": prov, "by_kind": amendment_table(prov), "notes": notes}
+
+
+def _grid(cols, lines) -> list[str]:
+    w = [max(len(c), *(len(x[i]) for x in lines)) if lines else len(c) for i, c in enumerate(cols)]
+    fmt = "  ".join("{:<%d}" % n for n in w)
+    return [fmt.format(*cols)] + [fmt.format(*x) for x in lines]
+
+
+def amendment_text(by_kind) -> str:
+    return "\n".join(["Findings that led to an amendment (changed against the parent: plan / headline / verdicts)"]
+                     + _grid(["check", "findings", "compared", "plan", "headline", "verdicts", "changed", "same",
+                              "n/a"], [[r["check"][:48]] + [str(r[k]) for k in (
+                                  "findings", "compared", "plan", "headline", "verdicts", "any_changed", "unchanged",
+                                  "unavailable")] for r in by_kind]))
+
+
+def check_value_text(cv) -> str:
+    lines = [[s["check"][:48], str(s["runs"]), f"{s['rows']} ({s['high']})", f"{s['fix_tasks']}, ${s['fix_usd']:.2f}",
+              str(s["owner"]), " ".join(f"{k}{v}" for k, v in sorted(s["resolution"].items())),
+              str(s["productive_in_run"]), f"{s['amended_changed']}/{s['amended']}",
+              f"{s['noise_wording']}/{s['noise_reraised']}", s["class"]] for s in cv["checks"]]
+    return "\n".join([f"Check value over {cv['runs']} run(s) with a findings ledger"] + _grid(
+        ["check", "runs", "rows (HIGH)", "fix", "owner", "resolution", "prod in run", "amended changed/n",
+         "noise wording/re-raised", "class"], lines) + [
+        "", "resolution: F fixed, D declared, A accepted, N declined, O open in a delivered run, X open otherwise",
+        "", amendment_text(cv["by_kind"])] + [f"note: {n}" for n in cv["notes"]])
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("run_dirs", nargs="*")
@@ -567,6 +820,8 @@ def main(argv=None) -> int:
     ap.add_argument("--cutoff", help="ISO time with offset (default: first launch + 24 h)")
     ap.add_argument("--ledger", help="JSON operator ledger: {run dir name: {i9: n}}")
     ap.add_argument("--json", help="write the rows and the wave summary here")
+    ap.add_argument("--check-value", action="store_true",
+                    help="per check: productive / noise from the ledgers, fix rows and amendment provenance")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
@@ -574,11 +829,20 @@ def main(argv=None) -> int:
     explicit = [[x for x in c.split(",") if x] for c in a.chain]
     if not a.run_dirs and not explicit:
         ap.error("no run directory")
+    if a.check_value:
+        cv = check_value(list(dict.fromkeys(list(a.run_dirs) + [d for c in explicit for d in c])))
+        print(check_value_text(cv))
+        if a.json:
+            safe_io.publish(a.json, json.dumps(cv, indent=1, default=str), os.path.dirname(os.path.abspath(a.json)))
+        return 0
     rs = rows(list(a.run_dirs), explicit, a.cutoff, json.load(open(a.ledger)) if a.ledger else None)
     print(table(rs))
+    by_kind = amendment_table(provenance(list(a.run_dirs) + [d for c in explicit for d in c]))
+    if by_kind:
+        print("\n" + amendment_text(by_kind))
     if a.json:
-        safe_io.publish(a.json, json.dumps({"rows": rs, "summary": wave_summary(rs)}, indent=1, default=str),
-                        os.path.dirname(os.path.abspath(a.json)))
+        safe_io.publish(a.json, json.dumps({"rows": rs, "summary": wave_summary(rs), "amendments_by_kind": by_kind},
+                                           indent=1, default=str), os.path.dirname(os.path.abspath(a.json)))
     return 0
 
 
@@ -808,6 +1072,73 @@ def _self_test() -> int:
         r2 = summarise([mk("r_sec3", {"state": "SIGN", "paused": "awaiting_signoff", "history": h}, inv=(0, 2))], A)
         ok(iv(r, "I1_pauses") == 1 and iv(r2, "I1_pauses") == 0, "HM42 same-second edges: a resume in the second "
            "the new build re-pauses ends the old pause; a resume in the second SIGN is entered ends none")
+        # ---- finding provenance and check value (synthetic records; no engine run)
+        def art(d, kind, data):
+            os.makedirs(os.path.join(d, "analysis"), exist_ok=True)
+            open(os.path.join(d, "analysis", f"{kind}.yaml"), "w").write(json.dumps({"data": data}))
+        led = [{"id": "D-001", "kind": CRITIC_KIND, "source": "critique-domain", "severity": "HIGH", "status": "open"},
+               {"id": "D-002", "kind": CRITIC_KIND, "source": "critique-domain", "severity": "MEDIUM", "status": "fixed"},
+               {"id": "D-003", "kind": CRITIC_KIND, "source": "critique-redteam", "severity": "MEDIUM", "status": "open",
+                "events": [{"status": "open"}, {"status": "owner_accepted"}, {"status": "open"}]},
+               {"id": "cal:u1", "kind": "calibration_change_discrepancy", "source": "rigor-artifacts",
+                "severity": "HIGH", "status": "fixed"}]
+        imp = [{"findings": ["D-002"], "files_changed": ["manuscript.md"], "usd": 0.25},
+               {"findings": ["cal:u1"], "files_changed": ["analysis_settings.yaml"], "usd": 1.0,
+                "headline_before": {"averted.y": 100.0}, "headline_after": {"averted.y": 102.0}}]
+        lt = "".join(json.dumps(x) + "\n" for x in led)
+        crit = "blockers:\n- {id: D-001, category: methods}\n- {id: D-002, category: presentation}\n"
+        files = {**R, "findings.jsonl": lt, "impact_ledger.jsonl": "".join(json.dumps(x) + "\n" for x in imp),
+                 "critique_domain.yaml": crit, "critique_redteam.yaml": "blockers:\n- {id: D-003, category: data}\n"}
+        par = mk("v_par", {**done, "pipeline": "v2"}, {"pipeline": "v2"}, files)
+        cp = mk("v_copy", {**done}, {"pipeline": "v2"}, files)
+        for d in (par, cp):
+            art(d, "point", {"plan": {"u1": "a", "u2": "a"}, "averted": {"y": 10.0}})
+            art(d, "decision_tests", {"tests": [{"test_id": "DT1", "verdict": "NO_CHANGE"}]})
+        psha = hashlib.sha256(open(os.path.join(par, "run_state.json"), "rb").read()).hexdigest()
+
+        def kid(name, fid, plan, parent="v_par", sha=psha):
+            f = next(x for x in led if x["id"] == fid)
+            mb = {"schema": "motivated_by/1", "parent_run": parent, "source": "rethink_request",
+                  "findings": [dict(f, in_ledger=True, category={"D-001": "METHODS"}.get(fid))]}
+            d = mk(name, done, {"pipeline": "v2", "motivated_by": mb,
+                                "parent_run": {"run_dir": os.path.join("/elsewhere", parent), "run_state_sha256": sha}}, R)
+            art(d, "point", {"plan": plan, "averted": {"y": 10.02}})
+            return d
+        k1 = kid("v_kid", "D-001", {"u1": "b", "u2": "a"})
+        k2 = kid("v_kid2", "cal:u1", {"u1": "a", "u2": "a"})
+        k3 = kid("v_orphan", "D-001", {"u1": "b"}, parent="v_gone")
+        k4 = kid("v_stale", "D-001", {"u1": "b"}, sha="0" * 64)
+        c1 = compare(par, k1)
+        ok(c1["plan"] == "changed" and c1["headline"] == "same" and c1["verdicts"] == "unavailable"
+           and c1["any"] == "changed" and compare(par, k2)["any"] == "unavailable"
+           and _moved({"a": 100.0}, {"a": 100.6}) and not _moved({"a": 100.0}, {"a": 100.4}),
+           f"HM43 the amended run against its parent: plan changed, headline within 0.5%, no common test ({c1})")
+        pv = {p["child"]: p for p in provenance([par, k1, k2, k3, k4])}
+        ok(pv["v_kid"]["linked"] and not pv["v_orphan"]["linked"] and "not among" in pv["v_orphan"]["why"]
+           and not pv["v_stale"]["linked"] and "changed since" in pv["v_stale"]["why"] and "v_par" not in pv,
+           f"HM44 provenance links a child to its parent by name and the parent's run_state hash ({pv['v_stale']})")
+        bk = {r["check"]: r for r in amendment_table(list(pv.values()))}
+        m_ = bk.get("critique-domain/METHODS", {})
+        ok(m_.get("findings") == 3 and m_.get("compared") == 1 and m_.get("plan") == 1 and m_.get("any_changed") == 1
+           and m_.get("unavailable") == 2 and bk.get("calibration_change_discrepancy", {}).get("unavailable") == 1,
+           f"HM45 per finding kind: findings that led to an amendment and what changed ({bk})")
+        cv = check_value([par, cp, k1, k2, os.path.join(root, "r_ok")])
+        ch = {s["check"]: s for s in cv["checks"]}
+        ok(cv["runs"] == 1 and any("copy" in n for n in cv["notes"]) and any("no findings ledger" in n for n in cv["notes"])
+           and ch["critique-domain/METHODS"]["class"] == "productive" and ch["critique-domain/METHODS"]["amended_changed"] == 1
+           and ch["critique-domain/METHODS"]["resolution"] == {"O": 1}
+           and ch["calibration_change_discrepancy"]["productive_in_run"] == 1
+           and ch["critique-domain/PRESENTATION"]["class"] == "noisy" and ch["critique-domain/PRESENTATION"]["noise_wording"] == 1
+           and ch["critique-domain/PRESENTATION"]["fix_usd"] == 0.25
+           and ch["critique-redteam/DATA"]["noise_reraised"] == 1 and cv["checks"][0]["class"] == "productive",
+           f"HM46 check value: productive in run and across runs, wording and re-raise noise, copies once ({ch})")
+        out = os.path.join(root, "cv.json")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main(["--check-value", par, k1, "--json", out])
+        ok("critique-domain/METHODS" in buf.getvalue() and "Findings that led to an amendment" in buf.getvalue()
+           and json.load(open(out))["by_kind"][0]["check"] == "critique-domain/METHODS",
+           "HM47 --check-value prints the productive / noise table and the per-kind amendment table")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
