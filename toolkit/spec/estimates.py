@@ -159,6 +159,8 @@ def validate_pending(s) -> list[str]:
     if bad:
         return bad
     bad += [f"{k}: not part of an estimates spec (no allocation): remove it" for k in NOT_APPLICABLE if k in r]
+    if isinstance(r.get("deliverable"), dict) and "plan" in r["deliverable"]:     # hb1 fix 11 (Codex r1 P1-4)
+        bad.append("deliverable.plan: not part of an estimates spec (no plan to choose): remove it")
     from toolkit.spec.schema import SCHEMA_VERSION
     if r["schema_version"] != SCHEMA_VERSION:
         return [f"schema_version {r['schema_version']!r} is not {SCHEMA_VERSION}"]

@@ -116,7 +116,10 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `set:` of targets (what is moved, how, to what; format and targets in
     `toolkit/spec/perturb.py`); the older type names still work and compile to it.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
-    the question asks for.
+    the question asks for. When the question asks for the options that maximise an *expected*
+    outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
+    best mean over the uncertainty draws, per-unit means in the file and a mean claim
+    (`toolkit/analysis/plan_rule.py`). Without it the plan is solved at the point values.
 12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
     parameters and card tables its effect depends on (`decision_inputs`, read by
     `toolkit/engines/decision_inputs.py`). When the options use such a component, name the
