@@ -12,6 +12,7 @@ reasons:
   rn: &rn "renewal-form verification (growth rate, attack rate, reproduction number); no package component"
   ci: &ci "cohort-immunity arithmetic checked by hand; the dose effects it combines are spec inputs with a source"
   ob: &ob "observation-model arithmetic checked by hand (coverage, assay, frame, waning); no package component"
+  ds: &ds "direct final-size solver verification (closed forms, the reference ODE, the stepped sim); no package component"
   as: &as "age-structured verification (closed forms, next-generation threshold); dose effects are spec inputs"
   pubfs: &pubfs "published age-specific final sizes (not transcribed): the transmission structure, no component"
   pub: &pub "published reproduction-number estimates (not transcribed): the estimator, no component"
@@ -78,5 +79,20 @@ benchmarks:
   AS5b: {covers: {}, covers_none_because: *as}
   AS7: {covers: {}, covers_none_because: *as}
   AS6: {covers: {}, covers_none_because: *as}
+  DS1a: {covers: {}, covers_none_because: *ds}
+  DS1b: {covers: {}, covers_none_because: *ds}
+  DS1c: {covers: {}, covers_none_because: *ds}
+  DS2a: {covers: {}, covers_none_because: *ds}
+  DS2c: {covers: {}, covers_none_because: *ds}
+  DS2b: {covers: {}, covers_none_because: *ds}
+  DS3: {covers: {}, covers_none_because: *ds}
+  DS6a: {covers: {}, covers_none_because: *ds}
+  DS6b: {covers: {}, covers_none_because: *ds}
+  DS6c: {covers: {}, covers_none_because: *ds}
+  DS6d: {covers: {}, covers_none_because: *ds}
+  DS7a: {covers: {}, covers_none_because: *ds}
+  DS7b: {covers: {}, covers_none_because: *ds}
+  DS7c: {covers: {}, covers_none_because: *ds}
+  DS8: {covers: {}, covers_none_because: *ds}
   FS7: {covers: {}, covers_none_because: *pubfs}
   RN5: {covers: {}, covers_none_because: *pub}

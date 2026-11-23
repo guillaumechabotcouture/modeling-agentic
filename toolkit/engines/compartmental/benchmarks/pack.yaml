@@ -92,6 +92,16 @@ configs:
               generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}},
               components: {d2: {kind: doses, group: g2, block_size: 5.0e+4, max_blocks: 6}}}
 
+  # v0.3: the direct final-size solver (final_size, no forcing, no component during the epidemic, deterministic
+  # importation). The same structures as single_day, multi3 and multi5, so each case has a stepped twin above.
+  fs_direct: {groups: [all], structure: single_group, mode: to_extinction, initialiser: given, dt: day,
+              generation_interval: [0.2, 0.3, 0.3, 0.2], tol: 1.0e-13, final_size: true}
+  multi3_direct: {groups: [a, b, c], structure: age_groups_contact_matrix, mode: to_extinction, initialiser: given,
+                  dt: day, transmission: q, generation_interval: [0.5, 0.3, 0.2], tol: 1.0e-13, final_size: true}
+  multi5_direct: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
+                  initialiser: given, dt: day, transmission: q, generation_interval: [0.5, 0.3, 0.2], tol: 1.0e-13,
+                  final_size: true}
+
 settings:
   r0_1p5: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.5}}
   r0_2: {config: single_day, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
@@ -167,6 +177,24 @@ settings:
                   unit: {N: [5.5e+5, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4], s0: [0.0, 0.08, 0.12, 0.25, 0.4, 1.0],
                          contact_rate: 10.0, seed: 1.0e-9, intro: c5}}
 
+  # v0.3: the direct solver's twins of FS1, FS2, FS3 and FS6
+  d_1p5: {config: fs_direct, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.5}}
+  d_2: {config: fs_direct, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 2.0}}
+  d_18: {config: fs_direct, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 18.0}}
+  d_sub: {config: fs_direct, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 0.5}}
+  d_crit: {config: fs_direct, unit: {N: [1.0e+6], s0: [1.0], seed: 1.0e-9}, params: {r0: 1.01}}
+  d_rank_one: {config: multi3_direct, params: {q: 1.5},
+               unit: {N: [3.0e+5, 2.0e+5, 1.0e+5], s0: [1.0, 1.0, 1.0], seed: 1.0e-9, intro: a,
+                      contact: [[0.3, 0.2, 0.5], [0.6, 0.4, 1.0], [0.15, 0.1, 0.25]]}}
+  d_identity3: {config: multi3_direct, params: {q: 1.0},
+                unit: {N: [3.0e+5, 2.0e+5, 1.0e+5], s0: [1.0, 1.0, 1.0], seed: 1.0e-6, intro: a,
+                       contact: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]}}
+  d_rank_one_ode: {config: multi3_direct, params: {q: 1.5},
+                   unit: {N: [3.0e+5, 2.0e+5, 1.0e+5], s0: [1.0, 0.8, 0.9], seed: 1.0e-6, intro: a,
+                          contact: [[0.3, 0.2, 0.5], [0.6, 0.4, 1.0], [0.15, 0.1, 0.25]]}}
+  d_asym5: {config: multi5_direct, params: {q: 0.6},
+            unit: {N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s0: [1.0, 0.9, 0.7, 0.8, 1.0], seed: 1.0e-6, intro: g2, contact: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}
+
 arms:
   fs1_1p5: {setting: r0_1p5, package: {}}
   fs1_2: {setting: r0_2, package: {}}
@@ -203,6 +231,15 @@ arms:
   as_late_vax: {setting: as_late, package: {vax: 1}}
   as_c12: {setting: as_cohorts_12, package: {}}
   as_c18: {setting: as_cohorts_18, package: {}}
+  ds_1p5: {setting: d_1p5, package: {}}
+  ds_2: {setting: d_2, package: {}}
+  ds_18: {setting: d_18, package: {}}
+  ds_sub: {setting: d_sub, package: {}}
+  ds_crit: {setting: d_crit, package: {}}
+  ds_rank1: {setting: d_rank_one, package: {}}
+  ds_id: {setting: d_identity3, package: {}}
+  ds_r1: {setting: d_rank_one_ode, package: {}}
+  ds_asym: {setting: d_asym5, package: {}}
 
 benchmarks:
   # ---------------------------------------------------------------- to_extinction mode
@@ -283,6 +320,65 @@ benchmarks:
                     {arm: fs4_herd, value: windows.all.converged}, {arm: fs6_id, value: windows.all.converged},
                     {arm: fs6_r1, value: windows.all.converged}, {arm: fs6_asym, value: windows.all.converged},
                     {arm: fs8_week, value: windows.all.converged}]}},
+                b: 1.0, tol: {abs: 0.0}}}
+  # ---------------------------------------------------------------- v0.3: the direct final-size solver
+  - {id: DS1a, metric: "direct solver: single-group final size, R0 = 1.5", source: "Kermack-McKendrick (1927); Lambert W closed form",
+     estimand: {type: value, a: {arm: ds_1p5, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 1.5, seed: 1.0e-9}}, tol: {abs: 1.0e-9}}}
+  - {id: DS1b, metric: "direct solver: single-group final size, R0 = 2.0", source: "Kermack-McKendrick (1927); Lambert W closed form",
+     estimand: {type: value, a: {arm: ds_2, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 2.0, seed: 1.0e-9}}, tol: {abs: 1.0e-9}}}
+  - {id: DS1c, metric: "direct solver: single-group final size, R0 = 18.0", source: "Kermack-McKendrick (1927); Lambert W closed form",
+     estimand: {type: value, a: {arm: ds_18, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 18.0, seed: 1.0e-9}}, tol: {abs: 1.0e-9}}}
+  - {id: DS2a, metric: "direct solver: R0 = 0.5, attack rate at most the seed-size bound seed / (1 - R0)", source: "threshold theorem",
+     estimand: {type: value, compare: le, a: {arm: ds_sub, value: windows.all.attack_rate},
+                b: {oracle: seed_bound, args: {r0: 0.5, seed: 1.0e-9}}, tol: {abs: 1.0e-15}}}
+  - {id: DS2c, metric: "direct solver: R0 = 0.5, attack rate equals the seeded closed form (seeds included, so above 1e-9)",
+     source: "threshold theorem; Lambert W",
+     estimand: {type: value, a: {arm: ds_sub, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 0.5, seed: 1.0e-9}}, tol: {abs: 1.0e-12}}}
+  - {id: DS2b, metric: "direct solver: R0 = 1.01, final size equals the seeded closed form", source: "threshold theorem; Lambert W",
+     estimand: {type: value, a: {arm: ds_crit, value: windows.all.attack_rate},
+                b: {oracle: final_size_lambert, args: {r0: 1.01, seed: 1.0e-9}}, tol: {abs: 1.0e-9}}}
+  - {id: DS3, metric: "direct solver: rank-one mixing reduces to the scalar final-size relation, per group",
+     source: "Ma & Earn (2006) Bull Math Biol; Andreasen (2011)",
+     estimand: {type: value, a: {arm: ds_rank1, value: per_capita_vec.infections},
+                b: {oracle: final_size_rank_one, args: {q: 1.5, a: [1.0, 2.0, 0.5], b: [0.3, 0.2, 0.5],
+                    N: [3.0e+5, 2.0e+5, 1.0e+5], s: [1.0, 1.0, 1.0], seed: [2.0e-9, 0.0, 0.0]}}, tol: {rel: 1.0e-8}}}
+  - {id: DS6a, metric: "direct solver: multigroup final size equals the reference ODE, C = 2I (seeded group only)",
+     source: "the pack's ODE (solve_ivp DOP853, rtol 1e-10)",
+     estimand: {type: value, a: {arm: ds_id, value: per_capita_vec.infections},
+                b: {oracle: ode_final_size, args: {q: 1.0, gamma: 0.25, N: [3.0e+5, 2.0e+5, 1.0e+5], s: [1.0, 1.0, 1.0],
+                    seed: [2.0e-6, 0.0, 0.0], C: [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]]}}, tol: {abs: 1.0e-6}}}
+  - {id: DS6b, metric: "direct solver: same, rank-one matrix, partial susceptibility", source: "the pack's ODE",
+     estimand: {type: value, a: {arm: ds_r1, value: per_capita_vec.infections},
+                b: {oracle: ode_final_size, args: {q: 1.5, gamma: 0.25, N: [3.0e+5, 2.0e+5, 1.0e+5], s: [1.0, 0.8, 0.9],
+                    seed: [2.0e-6, 0.0, 0.0], C: [[0.3, 0.2, 0.5], [0.6, 0.4, 1.0], [0.15, 0.1, 0.25]]}}, tol: {abs: 1.0e-6}}}
+  - {id: DS6c, metric: "direct solver: same, asymmetric 5x5 matrix", source: "the pack's ODE",
+     estimand: {type: value, a: {arm: ds_asym, value: per_capita_vec.infections},
+                b: {oracle: ode_final_size, args: {q: 0.6, gamma: 0.25, N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s: [1.0, 0.9, 0.7, 0.8, 1.0], seed: [0.0, 3.3333333333333335e-6, 0.0, 0.0, 0.0], C: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}, tol: {abs: 1.0e-6}}}
+  - {id: DS6d, metric: "direct solver: asymmetric 5x5 matrix against the pack's own fixed-point solver",
+     source: "multigroup final-size relation (oracles.oracle_final_size_multigroup: iteration from the seed, Newton polish)",
+     estimand: {type: value, a: {arm: ds_asym, value: per_capita_vec.infections},
+                b: {oracle: final_size_multigroup, args: {q: 0.6, N: [2.0e+5, 3.0e+5, 2.5e+5, 1.5e+5, 1.0e+5], s: [1.0, 0.9, 0.7, 0.8, 1.0],
+                    seed: [0.0, 3.3333333333333335e-6, 0.0, 0.0, 0.0], C: [[3.0, 1.0, 0.5, 0.3, 0.1], [0.8, 4.0, 1.2, 0.4, 0.2], [0.4, 1.0, 2.5, 0.9, 0.3], [0.2, 0.5, 1.1, 1.8, 0.6], [0.1, 0.3, 0.4, 0.7, 1.2]]}}, tol: {abs: 1.0e-10}}}
+  - {id: DS7a, metric: "direct solver equals the stepped sim, single group (R0 = 2)", source: "identity (v0.3)",
+     estimand: {type: identity, a: {arm: ds_2, value: windows.all.attack_rate},
+                b: {arm: fs1_2, value: windows.all.attack_rate}, tol: {rel: 1.0e-9}}}
+  - {id: DS7b, metric: "direct solver equals the stepped sim, rank-one 3 groups", source: "identity (v0.3)",
+     estimand: {type: identity, a: {arm: ds_rank1, value: per_capita_vec.infections},
+                b: {arm: fs3_rank1, value: per_capita_vec.infections}, tol: {rel: 1.0e-9}}}
+  - {id: DS7c, metric: "direct solver equals the stepped sim, asymmetric 5x5, partial susceptibility", source: "identity (v0.3)",
+     estimand: {type: identity, a: {arm: ds_asym, value: per_capita_vec.infections},
+                b: {arm: fs6_asym, value: per_capita_vec.infections}, tol: {rel: 1.0e-9}}}
+  - {id: DS8, metric: "the direct solver's bracket closed on every DS arm", source: "engine solver",
+     estimand: {type: value,
+                a: {oracle: minimum, args: {values: [{arm: ds_1p5, value: windows.all.converged},
+                    {arm: ds_2, value: windows.all.converged}, {arm: ds_18, value: windows.all.converged},
+                    {arm: ds_sub, value: windows.all.converged}, {arm: ds_crit, value: windows.all.converged},
+                    {arm: ds_rank1, value: windows.all.converged}, {arm: ds_id, value: windows.all.converged},
+                    {arm: ds_r1, value: windows.all.converged}, {arm: ds_asym, value: windows.all.converged}]}},
                 b: 1.0, tol: {abs: 0.0}}}
   # ---------------------------------------------------------------- multitype extinction (p_major, derived)
   - {id: BR1a, metric: "one group, Poisson offspring: 1 - p solves 1 - p = exp(-R0 p) (R0 = 2)", source: "branching-process identities",
