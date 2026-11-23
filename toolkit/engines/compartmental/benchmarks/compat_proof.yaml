@@ -1,7 +1,7 @@
 producer: toolkit/engines/compartmental/benchmarks/compat_proof.py
 scope: every pack setting of a configuration the old pack declared, and one representative unit per coverage-pack
   configuration (all arms in one run_batch, each arm's run(), and initial_state()), seed 1
-old_ref: origin/v2
+old_ref: b24d147819aee932049c404bd33d97784a0fbfcf
 old_commit: b24d147819aee932049c404bd33d97784a0fbfcf
 old_configs:
 - single_day
@@ -22,8 +22,8 @@ old_configs:
 - cohort_nested
 new_identity:
   name: compartmental-starsim
-  version: '0.2'
-  code_sha256: 339ef0a7ce81e9b9514a8a914e0fcb017eb4c69925c596cd5b491a283b8891e2
+  version: '0.3'
+  code_sha256: 9ce006e499a6fb9f8a4f64e0fefba4eb3dd174e4a578c508d22ea0e8bbdc5999
   params_sha256: f498058635c8fd432017ed42e7a4a9b51d9355e39178b298d90f5512b1c5f372
   config_sha256: 7fb325cd3215f687d2adcdcd1d8f666a811c609b76939cb8f819e574f5ccd32f
 old_coverage_identity:

@@ -1,0 +1,8 @@
+---
+phase: "F6"
+commit: "FSD α–β"
+---
+
+## Changelog
+
+**Compartmental engine v0.3: the direct final-size solver.** A `final_size: true` run with `forcing: none`, no component acting during the epidemic and `importation: deterministic` solves the multigroup final-size relation z = s - (s - e) exp(-q C z) directly instead of stepping the Starsim sim (`solve_final_size`, `infection_reach` in `toolkit/engines/compartmental/engine.py`; plan `docs/design/direct-final-size-solver.md`). Reach follows the direction of infection after the interventions, through groups with susceptibles left; lower and upper iterates start at e and s and stay sub- and super-solutions, with Newton candidates kept only when they pass that check; the map is evaluated in the expm1 form; a member stops when its bracket is at most `tol` wide in every group, and a bracket still open at `step_cap` iterations, or no longer shrinking, fails closed. `meta.steps` counts solver iterations per member and `meta.final_size_path` records the path on every final_size run. The engine does not import `benchmarks/oracles.py`. Every other configuration keeps the sim and is byte-identical. Engine 0.2 to 0.3 (new code sha256, so row reuse keys move); `results.yaml` re-run (62 of 62 assessable in band), card regenerated, `compat_proof.yaml` re-proved against the v0.1 commit that computed the coverage rows (27 of 27 identical) and `coverage_results.yaml` re-stamped; no coverage configuration sets `final_size`, so no VM re-run. Flu R2 spec, 3,374 packages on one draw, locally: 0.48 ms per member for the whole run_batch (solver itself about 12 µs; the p_major diagnostic dominates) against 65 ms per member stepping. Self-tests FD1-FD13 (`selftest_final_size.py`).

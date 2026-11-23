@@ -1,8 +1,8 @@
 producer: toolkit/engines/benchmark.py
 engine_identity:
   name: compartmental-starsim
-  version: '0.2'
-  code_sha256: 339ef0a7ce81e9b9514a8a914e0fcb017eb4c69925c596cd5b491a283b8891e2
+  version: '0.3'
+  code_sha256: 9ce006e499a6fb9f8a4f64e0fefba4eb3dd174e4a578c508d22ea0e8bbdc5999
   params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
   config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
 engine_config_sha256: 6430f390a3fc3746f15649cdcfe6c65ea257d47a896b6ffa069d5ecdaae006c8
@@ -728,7 +728,7 @@ restamped:
     code_sha256: 4ba0e3e89a1cbbd81e43b0fcf00475d7101eb4ea42836b95f72518924d2b0ab0
     params_sha256: 84120e872544e4d566f625a1bf62f2e5cbd865dd1031f8884dbb6087f73ef65d
     config_sha256: 6732c72c3c8e0a4c85c9956ba75427e3366bf846807814032db292edb7160eaf
-  old_ref: origin/v2
+  old_ref: b24d147819aee932049c404bd33d97784a0fbfcf
   old_commit: b24d147819aee932049c404bd33d97784a0fbfcf
   rows_not_rebound:
   - SB1
