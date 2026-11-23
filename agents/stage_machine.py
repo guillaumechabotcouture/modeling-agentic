@@ -1679,38 +1679,116 @@ class Machine:
         if res is None:
             return self._budget_out("SPEC")
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
-        if res.ok:
+        # baseline hb1: a try cut off (the turn cap) is checked on whatever draft is on disk, written or repaired in
+        # this try or left by an earlier one: the checks say what holds now, with no before/after comparison to get
+        # wrong on a resume or a rewrite (Codex r1 P1-3/P1-4, r2 P1-5/P1-7/P2-8). Only when the try's feedback is
+        # what these checks wrote (or none): reasons they cannot verify (a rethink, a refused sign-off, the evidence
+        # stage) are never cleared by an old draft that passes them; they are carried (Codex r3 P1-2).
+        recheckable = not fb or fb == self.st.tries.get("spec_feedback_checked")
+        drafted = res.ok or (recheckable and os.path.lexists(os.path.join(rd, AB.SPEC_FILE)))
+        if drafted:
             try:
                 from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
                 if CF.ensure_default(rd):
                     self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
-                errs = self._derive(rd) if self.st.derived_inputs else []
-                errs = errs or record_cited_inputs(rd)       # before anything reads a cited file
-                if self.st.derived_inputs:
-                    # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the
-                    # spike adapter does not know them, so the harness runs them for it.
-                    if not errs and not hasattr(self.backend, "candidate_rows"):
-                        import pipeline as P
-                        errs = [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
-                            rd, self._spec(rd), required=True)]
-                    errs = errs or self.backend.pre_sign_problems(rd, derived=True)
-                    errs = errs or self._geometry_problems(rd)
-                    if not errs:
-                        self._write_sheet(rd)
-                else:
-                    errs = errs or self.backend.pre_sign_problems(rd)
-                    errs = errs or self._geometry_problems(rd)
+                errs = self._spec_checks(rd)
+                if not errs and self.st.derived_inputs:
+                    self._write_sheet(rd)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
+            if errs and not res.ok:
+                errs = [f"draft_spec failed: {res.note} (its draft was checked)"] + errs
         if errs:
-            self.st.tries["spec_feedback"] = errs
+            self.st.tries["spec_feedback"] = _carry_feedback(errs, fb if not drafted else None)
+            if drafted:     # these checks' own output: a capped next try may be re-checked against it
+                self.st.tries["spec_feedback_checked"] = list(self.st.tries["spec_feedback"])
+            else:
+                self.st.tries.pop("spec_feedback_checked", None)
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
+        self.st.tries.pop("spec_feedback_checked", None)
         if not self._review_conditions(self.st.signoff, defer=False):
             # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
             self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
             return self._go("SPEC", "review conditions could not be prepared for signing")
         return self._go("EVIDENCE", "spec drafted and valid")
+
+    def _spec_checks(self, rd: str) -> list[str]:
+        """Every pre-sign check class on the draft, each run whatever the others found, so one try hears every problem
+        (baseline hb1: the chain stopped at the first class that failed, and MAX_SPEC_TRIES is small). A class that
+        raises is named in the problems and the others still run. A spec that does not parse is the one problem."""
+        import yaml
+        try:
+            yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
+        except Exception as e:  # noqa: BLE001
+            return [f"spec unreadable: {type(e).__name__}: {e}"]
+        out: list[str] = []
+
+        def run(name, fn) -> bool:
+            try:
+                got = list(fn() or [])
+            except Exception as e:  # noqa: BLE001 -- fail closed, and the other classes still run
+                got = [f"the {name} check could not run: {type(e).__name__}: {e}"]
+            out.extend(x for x in got if x not in out)
+            return not got
+        if self.st.derived_inputs:
+            run("derivation", lambda: self._derive(rd))
+        run("cited-input", lambda: record_cited_inputs(rd))      # records the hashes before a check reads a cited file
+        outside = self._cites_outside(rd)
+        if outside:             # Codex r1 P1-1: no later check opens a file the cited-input check refused
+            out.extend(x for x in outside if x not in out)       # r2 P1-2: never empty, so never a pass
+            return out
+        if self.st.derived_inputs:
+            # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the spike adapter
+            # does not know them, so the harness runs them for it.
+            if not hasattr(self.backend, "candidate_rows"):
+                import pipeline as P
+                run("derived-input", lambda: [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
+                    rd, self._spec(rd), required=True)])
+            signable = run("pre-sign", lambda: self.backend.pre_sign_problems(rd, derived=True))
+        else:
+            signable = run("pre-sign", lambda: self.backend.pre_sign_problems(rd))
+        run("geometry", lambda: self._geometry_problems(rd))
+        if signable and run("signed-configuration", lambda: self._config_problems(rd)):
+            # Codex r1 P1-2, r2 P1-3: the assessment builds the engine, only after the pre-sign guards have passed; the
+            # configuration guard's own problems go back to the drafter (r3 P1-1)
+            run("evidence", lambda: self._evidence_assess(rd)[1]["spec_problems"])   # tb R2: heard one stage late
+        return out
+
+    @staticmethod
+    def _config_problems(rd: str) -> list[str]:
+        """The signed engine configuration's guard (analysis_backend.signed_config_problems) on the draft, whatever the
+        backend: no engine is built from a draft it refuses (an error is reported by _spec_checks, fail closed)."""
+        import yaml
+        return list(AB.signed_config_problems(yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}))
+
+    @staticmethod
+    def _cites_outside(rd: str) -> list[str]:
+        """The spec's citations that resolve outside the run directory (record_cited_inputs refuses them), as problems.
+        Fail closed: when the citations cannot be listed, that is the problem."""
+        import yaml
+        import pipeline as P
+        try:
+            spec = yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}
+            root = os.path.realpath(rd)
+            return [f"the spec cites {r}, outside the run directory: copy it into data/" for r in P.cited_paths(spec, rd)
+                    if not os.path.realpath(os.path.join(rd, r)).startswith(root + os.sep)]
+        except Exception as e:  # noqa: BLE001
+            return [f"the spec's cited paths could not be listed, so no check reads them: {type(e).__name__}: {e}"]
+
+    def _evidence_assess(self, rd: str) -> tuple[dict, dict]:
+        """The spec and the evidence stage's assessment of it (toolkit/spec/evidence_draft.py assess), with a dossier
+        path that the harness, the gate or a task writes added to its spec problems. SPEC and EVIDENCE share it."""
+        from toolkit.spec import evidence_draft as EDR
+        raw = EDR._spec(rd)
+        a = EDR.assess(rd, raw)
+        rel = a.get("rel")
+        if rel and not a.get("draftable") and owned_path(rd, os.path.normpath(rel).replace(os.sep, "/"), tuple(
+                p for p in harness_owned() if p not in ("data/*", EDR.ED.DOSSIER_FILE))):
+            a["spec_problems"] = a["spec_problems"] + [   # Codex r2 P1-5: a file the harness or a task writes
+                f"evidence.dossier {rel!r} is a file the harness, the gate or a task writes: name "
+                f"{EDR.ED.DOSSIER_FILE}"]
+        return raw, a
 
     def _lead_amend(self, req: dict) -> str | None:
         """The lead amendment under the parent's amendment lock (owner decision on #330): the request and the parent's
@@ -1982,14 +2060,7 @@ class Machine:
             self.st.tries["spec_feedback"] = probs
             return self._go("SPEC", "evidence: " + "; ".join(probs)[:200])
         try:
-            raw = EDR._spec(rd)
-            a = EDR.assess(rd, raw)
-            rel = a.get("rel")
-            if rel and not a.get("draftable") and owned_path(rd, os.path.normpath(rel).replace(os.sep, "/"), tuple(
-                    p for p in harness_owned() if p not in ("data/*", EDR.ED.DOSSIER_FILE))):
-                a["spec_problems"] = a["spec_problems"] + [   # Codex r2 P1-5: a file the harness or a task writes
-                    f"evidence.dossier {rel!r} is a file the harness, the gate or a task writes: name "
-                    f"{EDR.ED.DOSSIER_FILE}"]
+            raw, a = self._evidence_assess(rd)
             if a["spec_problems"]:
                 return spec_back(a["spec_problems"])
             sc = EDR.scaffold(rd, a, raw)["scaffold"] if a["needed"] else {}
@@ -2304,7 +2375,8 @@ class Machine:
         summ = FX.run_loop(self.run_dir, self.st.round, self.st.max_rounds, self._last_decision(),
                            _Journaled(self, f"FIX_LOOP#{v}:r{self.st.round}"),
                            rebuild=self.rebuild, harness_ids=self.harness_ids, headline=self.backend.headline,
-                           budget=self._budget, log=self.log, guard=self.fix_guard, protect=PROTECTED_BY_FIX)
+                           budget=self._budget, log=self.log, guard=self.fix_guard, protect=PROTECTED_BY_FIX,
+                           settings=getattr(self.backend, "settings_paths", AB.SETTINGS_PATHS))
         self.st.history.append({"at": _now(), "fix_loop": summ})
         if summ.get("owner_amendments"):
             # F6 run 3: their remedy is an owner amendment of the signed spec; the owner answers, no redraft runs.
@@ -2313,7 +2385,7 @@ class Machine:
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
             return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})", planned=True)
-        if not summ["tasks"] and summ.get("write_up") and self._has_draft():
+        if not summ["tasks"] and summ.get("write_up") and not summ.get("harness_gaps_blocking") and self._has_draft():
             # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
             if self.st.round_pending:
                 self.st.round += 1
@@ -2712,6 +2784,23 @@ def _pre_engine_check(spec: dict) -> list[str]:
 
 ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
 STATUS_MARK = "<!-- harness: run status -->"
+
+
+CARRIED = "from an earlier try, still unresolved: "
+
+
+def _carry_feedback(errs: list, earlier: list | None, cap: int = 40) -> list:
+    """The SPEC feedback for the next try: this try's problems, then the earlier try's when there is no draft on
+    disk to check (baseline hb1: a try lost to the turn cap replaced the validation errors with "max turns", so
+    the next try repeated them). Earlier items are marked once and never repeated."""
+    out = list(errs)
+    seen = {x[len(CARRIED):] if x.startswith(CARRIED) else x for x in out}
+    for x in earlier or []:
+        core = x[len(CARRIED):] if x.startswith(CARRIED) else x
+        if core not in seen and not core.startswith("draft_spec failed:"):
+            seen.add(core)
+            out.append(CARRIED + core)
+    return out[:max(cap, len(errs))]          # the cap trims the carried items only (Codex r1 P2-6)
 
 
 def _status_line(run_dir: str, status: str | None) -> str:
@@ -3753,6 +3842,27 @@ def _self_test() -> int:
         ok("FIX_LOOP" in p and not any(c.startswith("fix:") for c in T.calls)
            and any(f.get("id") == "R-030" for f in got),
            f"R3-1 a write-up finding goes to the writer, not to a FIX_LOOP task ({s}, {T.calls}, {got})")
+        # HG1 (Codex review of #341, r1 P1-5 and r3 P2-10): a blocking harness gap is an open finding the writer cannot
+        # fix, so a loop with no task, write-up findings and a draft goes to CRITIQUE, not the "every finding is the
+        # write-up's" WRITE; a non-blocking gap does not hold the writer back. HG1c (r3 P2-8): the fix loop is given the
+        # settings of the backend this machine runs.
+        def hg_route(blocking):
+            d, T, st = new_run(f"harness_gap_route_{len(blocking)}", {}, max_rounds=3)
+            mh = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
+            mh.st.state, mh._has_draft = "FIX_LOOP", (lambda: True)
+            seen, _rl = {}, FX.run_loop
+            try:
+                FX.run_loop = lambda *a, **k: seen.update(k) or {
+                    "round": 1, "tasks": 0, "rows": 0, "passed": 0, "rethink": None, "write_up": ["R-030"],
+                    "owner_amendments": [], "harness_gaps": ["D-001"], "harness_gaps_blocking": blocking}
+                return mh.h_FIX_LOOP(), seen.get("settings"), mh.backend
+            finally:
+                FX.run_loop = _rl
+        to_hg, set_hg, be_hg = hg_route(["D-001"])
+        ok(to_hg == "CRITIQUE", f"HG1 a blocking harness gap keeps the loop off the write-up-only WRITE route ({to_hg})")
+        ok(hg_route([])[0] == "WRITE", "HG1b a non-blocking harness gap leaves the write-up-only WRITE route open")
+        ok(set_hg is not None and tuple(set_hg) == tuple(getattr(be_hg, "settings_paths", AB.SETTINGS_PATHS)),
+           f"HG1c the fix loop is given the running backend's settings ({set_hg})")
 
         # R3-3 (F6 run 3): a finding whose remedy is an owner amendment goes to OWNER_DECISION, never a SPEC rethink.
         amend = {"id": "D-031", "severity": "HIGH", "target_stage": "PLAN", "claim": "the comparator omits the funded plan",
@@ -4711,6 +4821,10 @@ def _self_test() -> int:
             ok(False, f"T58-T60 analysis timeout and resume: {type(e).__name__}: {e}")
 
         _self_test_auto1a(ok, td, spike, new_run)
+        try:
+            _self_test_hb2_spec(ok, td, spike, new_run)
+        except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
+            ok(False, f"HS: {type(e).__name__}: {e}")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
@@ -5962,8 +6076,9 @@ def _self_test_evidence(ok, td: str) -> None:
     os.remove(os.path.join(d, AB.SPEC_FILE))
     m = Machine(d, StubTasks({"spec": raw}), init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False),
                 backend=toolkit, log=lambda *a: None, cross_engine_check=False)
-    until(m, n=4)
-    ok(m.st.state == "SPEC" and any("name the evidence dossier" in x for x in m.st.tries.get("spec_feedback") or [])
+    m.step()        # hb2 (HS6): the SPEC try itself hears it, before the evidence stage
+    ok(m.st.state == "SPEC" and m.st.tries.get("spec") == 1
+       and any("name the evidence dossier" in x for x in m.st.tries.get("spec_feedback") or [])
        and not os.path.exists(os.path.join(d, ED.DOSSIER_FILE)),
        f"T_EVIDENCE_NAME a spec that needs a dossier and names none is redrafted with the reason "
        f"({m.st.state}; {m.st.tries.get('spec_feedback')})")
@@ -6055,6 +6170,225 @@ def _self_test_evidence(ok, td: str) -> None:
         yaml.safe_dump(raw, open(os.path.join(d, AB.SPEC_FILE), "w"))
         ok(any("owns" in p or "evidence dossier" in p for p in deliverable_problems(d)),
            f"T_DELIVERABLE_DOSSIER a deliverable named {name} is refused ({deliverable_problems(d)})")
+
+
+def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
+    """HS1-HS7 (baseline hb1, 2026-11-22): a SPEC try that returns no draft (the 30-turn cap) replaced the
+    validation feedback, so the next try never saw the error and repeated it (tb R1, run_failed at the try cap); the
+    checks stopped at the first class that failed, so each try heard one class of problem (HS4-HS6); the drafter's
+    prompt did not state the two rules that cost retries in measles and dengue (HS7)."""
+    from v2_tasks import StubTasks
+
+    class Scripted(StubTasks):
+        """script["tries"]: per try, "bad" (an invalid draft), "good" (a valid one), "capped" (no draft written,
+        the call fails) or "capped_good" (a valid draft written, then the call fails, as at the turn cap)."""
+        def draft_spec(self, q, rd, fb):
+            self.fbs = getattr(self, "fbs", []) + [list(fb or [])]
+            kind = (self.s["tries"] + ["capped"] * 9)[len(self.fbs) - 1]
+            if kind == "capped":
+                return self._r("draft_spec", False, note="max turns")
+            spec = dict(self.s["spec"])
+            if kind in ("bad", "bad2"):
+                spec["decision_units"] = dict(spec["decision_units"], csv="missing_units_table.csv")
+            if kind in ("bad2", "noobj"):
+                spec.pop("objective", None)
+            if kind == "outside":
+                spec["decision_units"] = dict(spec["decision_units"], csv="../outside_units.csv")
+            if kind == "settings_capped":       # repairs only the settings, then hits the cap
+                from v2_tasks import _yaml_dump
+                _yaml_dump(self.s["settings"], os.path.join(rd, "analysis_settings.yaml"), rd)
+                return self._r("draft_spec", False, note="max turns")
+            settings = dict(self.s["settings"], bogus_key=1) if kind == "bad_settings" else self.s["settings"]
+            r = StubTasks(dict(self.s, spec=spec, settings=settings)).draft_spec(q, rd, fb)
+            return self._r("draft_spec", False, note="max turns") if kind == "capped_good" else r
+
+    def go(name, tries, cls=None):
+        d, T, st = new_run(name, {})
+        T = Scripted(dict(T.s, tries=tries))
+        m = (cls or Machine)(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        for _ in range(len(tries) + 1):
+            if m.st.state != "SPEC" or m.st.paused or m.st.status:
+                break
+            m.step()
+        return m, T
+
+    m, T = go("hs1", ["bad", "capped", "bad"])
+    first = [x for x in T.fbs[1] if "missing_units_table" in x]
+    ok(len(T.fbs) == 3 and first and any("missing_units_table" in x for x in T.fbs[2])
+       and any("max turns" in x for x in T.fbs[2]),
+       f"HS1 a try that returns no draft keeps the earlier validation feedback, and adds its own note ({T.fbs})")
+    ok(sum("missing_units_table" in x for x in T.fbs[2]) == len(first),
+       f"HS1b feedback carried from an earlier try is not repeated ({T.fbs[2]})")
+    m, T = go("hs2", ["capped_good"])
+    ok(m.st.state != "SPEC" and m.st.tries.get("spec") == 1,
+       f"HS2 a valid draft written before the call failed (the turn cap) is validated and used ({m.st.state}, "
+       f"{m.st.tries.get('spec_feedback')})")
+    # HS4: one try hears every check class (a missing cited file and a missing section), not only the first
+    m, T = go("hs4", ["bad2", "good"])
+    ok(len(T.fbs) >= 2 and any("missing_units_table" in x for x in T.fbs[1])
+       and any("missing section objective" in x for x in T.fbs[1]),
+       f"HS4 one SPEC try reports the cited-input and the pre-sign problems together ({T.fbs[1:2]})")
+
+    # HS5: a check class that raises is reported by name, and the other classes' problems are kept
+    class GeoBoom(Machine):
+        def _geometry_problems(self, rd=None):
+            raise RuntimeError("geometry boom")
+    m, T = go("hs5", ["bad", "good"], GeoBoom)
+    ok(len(T.fbs) >= 2 and any("missing_units_table" in x for x in T.fbs[1])
+       and any("geometry boom" in x for x in T.fbs[1]),
+       f"HS5 a check that raises is named and does not hide the others' problems ({T.fbs[1:2]})")
+
+    # HS6: the evidence stage's spec problems (decision inputs with no dossier named) are heard at SPEC, in the same
+    # try, not one stage later (tb R2: EVIDENCE sent the spec back for 7 missing decision inputs)
+    from toolkit.spec import evidence_draft as EDR
+    real = EDR.assess
+    try:
+        EDR.assess = lambda rd, raw=None: dict(real(rd, raw), spec_problems=["the options need 7 decision input(s)"])
+        m, T = go("hs6", ["good", "good"])
+    finally:
+        EDR.assess = real
+    ok(len(T.fbs) >= 2 and any("7 decision input" in x for x in T.fbs[1]) and m.st.tries.get("spec") >= 2,
+       f"HS6 the evidence stage's spec problems come back from the SPEC try ({T.fbs[1:2]}, {m.st.state})")
+
+    # HS7: the drafter's prompt states the two rules that cost SPEC retries; a fitted parameter is never moved under
+    # calibration (Codex r1 P2-7: calibration accepts kind calibrated only)
+    from v2_sdk_tasks import PROMPTS
+    pr = PROMPTS["draft_spec"]
+    ok("no digits" in pr and "decision test" in pr and "engine_parameters" in pr and "calibrated" in pr
+       and "a fitted one" in pr,
+       "HS7 the draft_spec prompt says: no digits in a decision test's text; no engine_parameters value for a "
+       "calibrated or fitted parameter (a fitted one is left to the engine)")
+
+    class Calls(Machine):
+        """Records which reading checks ran."""
+        def _geometry_problems(self, rd=None):
+            self.ran = getattr(self, "ran", []) + ["geometry"]
+            return super()._geometry_problems(rd)
+
+        def _evidence_assess(self, rd):
+            self.ran = getattr(self, "ran", []) + ["evidence"]
+            return super()._evidence_assess(rd)
+    # HS8 (Codex r1 P1-1): a cited file outside the run is refused, and no check reads it
+    AB.write_toy_units(os.path.join(td, "outside_units.csv"), n=12)
+    m, T = go("hs8", ["outside"], Calls)
+    fb8 = m.st.tries.get("spec_feedback") or []
+    ok(any("outside the run directory" in x for x in fb8) and not getattr(m, "ran", []),
+       f"HS8 a cited file outside the run is refused and no later check reads it ({getattr(m, 'ran', [])}, {fb8})")
+    # HS9 (Codex r1 P1-2): the evidence assessment (it builds the engine) runs only on a spec the pre-sign checks pass
+    m, T = go("hs9", ["noobj"], Calls)
+    ok("evidence" not in getattr(m, "ran", []) and any("objective" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"HS9 a spec the pre-sign checks refuse is not given to the evidence assessment ({getattr(m, 'ran', [])})")
+
+    # HS10 (Codex r1 P1-3): interrupted after the task's journal entry completed, a resume reaches the same decision
+    class Crash(Exception):
+        pass
+
+    class CrashOnce(Machine):
+        def _task(self, *a, **k):
+            r = super()._task(*a, **k)
+            if not getattr(self, "crashed", False):
+                self.crashed = True
+                save_state(self.run_dir, self.st)
+                raise Crash()
+            return r
+    d10, T10, st10 = new_run("hs10", {})
+    T10 = Scripted(dict(T10.s, tries=["capped_good"]))
+    m = CrashOnce(d10, T10, st10, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    try:
+        m.step()
+    except Crash:
+        pass
+    m2 = Machine(d10, T10, load_state(d10), backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m2.step()
+    ok(m2.st.state == "EVIDENCE" and len(T10.fbs) == 1,
+       f"HS10 a resume after the completed task replays it and still checks the draft it wrote ({m2.st.state}, "
+       f"{m2.st.tries.get('spec_feedback')})")
+    # HS11 (Codex r1 P1-4): a capped try that repaired only the settings has its draft checked again
+    m, T = go("hs11", ["bad_settings", "settings_capped"])
+    ok(any("bogus_key" in x for x in T.fbs[1]) and m.st.state == "EVIDENCE",
+       f"HS11 a capped try that changed only the settings is checked, and goes on ({m.st.state}, "
+       f"{m.st.tries.get('spec_feedback')})")
+    # HS14 (Codex r2 P1-2): when containment of the cited paths cannot be established, that is a problem, never a pass
+    import pipeline as _P
+    real_cp, n_cp = _P.cited_paths, []
+
+    def flaky(*a, **k):
+        n_cp.append(1)
+        if len(n_cp) >= 2:
+            raise OSError("listing failed")
+        return real_cp(*a, **k)
+    try:
+        _P.cited_paths = flaky
+        m, T = go("hs14", ["good"])
+    finally:
+        _P.cited_paths = real_cp
+    fb14 = m.st.tries.get("spec_feedback") or []
+    ok(m.st.state == "SPEC" and any("listing failed" in x for x in fb14),
+       f"HS14 a citation listing that fails is a problem, not a pass ({m.st.state}, {fb14})")
+    # HS15 (Codex r2 P1-5/P1-7/P2-8): a try with no completion output is checked on whatever draft files exist, with no
+    # comparison of the files before and after (a resume, a byte-identical rewrite or an odd file never skips it)
+    d15, T15, st15 = new_run("hs15", {})
+    T15 = Scripted(dict(T15.s, tries=["good"]))
+    StubTasks(T15.s).draft_spec("q", d15, None)        # a valid draft already on disk (an earlier, older journal)
+    T15 = Scripted(dict(T15.s, tries=["capped"]))
+    m = Machine(d15, T15, st15, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m.step()
+    ok(m.st.state == "EVIDENCE", f"HS15 a capped try leaves a valid draft on disk: it is checked and used, whatever "
+                                 f"changed during the try ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+    # HS16 (Codex r3 P1-1): the signed-configuration guard's problems go back to the drafter, whatever the backend
+    real_sc = AB.signed_config_problems
+    try:
+        AB.signed_config_problems = lambda spec: ["engine.config: more components than the engine's limit"]
+        m, T = go("hs16", ["good"])
+    finally:
+        AB.signed_config_problems = real_sc
+    ok(m.st.state == "SPEC" and any("engine's limit" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"HS16 the configuration guard's refusal reaches the drafter ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+    # HS17 (Codex r3 P1-2): feedback the pre-sign checks cannot verify (a rethink's reasons) is never cleared by a
+    # capped try whose old draft passes those checks; the reasons are carried to the next try
+    d17, T17, st17 = new_run("hs17", {})
+    StubTasks(T17.s).draft_spec("q", d17, None)          # the earlier, valid draft
+    st17.tries["spec_feedback"] = ["rethink after review round 1: the comparator answers another question"]
+    save_state(d17, st17)
+    T17 = Scripted(dict(T17.s, tries=["capped"]))
+    m = Machine(d17, T17, st17, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m.step()
+    ok(m.st.state == "SPEC" and any("comparator" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"HS17 a capped try after a rethink keeps the rethink's reasons and does not pass on the old draft "
+       f"({m.st.state}, {m.st.tries.get('spec_feedback')})")
+    # HS12 (Codex r1 P2-6): the cap on the feedback never drops this try's own problems
+    many = [f"problem {i}" for i in range(45)]
+    got12 = _carry_feedback(many, ["old one"])
+    ok(all(x in got12 for x in many), f"HS12 every current problem reaches the next try ({len(got12)})")
+
+    from types import SimpleNamespace as NS
+    from v2_sdk_tasks import SPEC_MAX_TURNS, SdkTasks
+    got = []
+
+    def q(prompt=None, options=None):
+        async def gen():
+            got.append(options.max_turns)
+            yield NS(total_cost_usd=0.0, session_id="hs3", is_error=False)
+        return gen()
+    hd = os.path.join(td, "hs3")
+    os.makedirs(hd)
+    t = SdkTasks(hd, query_fn=q)
+    t.set_allowance(1.0)
+    t._session("draft_spec", "x", "y", ())
+    t._session("pick_engine", "x", "y", ())
+    ok(got == [SPEC_MAX_TURNS, 30] and SPEC_MAX_TURNS > 30,
+       f"HS3 the spec draft has its own turn cap, above the 30 of the other tasks ({got})")
+    # HS13 (Codex r1 P1-5): an explicit cap is honoured by every task, the spec draft included
+    got.clear()
+    t5 = SdkTasks(hd, max_turns=5, query_fn=q)
+    t5.set_allowance(1.0)
+    t5._session("draft_spec", "x", "y", ())
+    ok(got == [5], f"HS13 a caller's explicit turn cap holds for the spec draft ({got})")
+    got.clear()
+    hw = os.path.join(hd, "wm")
+    os.makedirs(hw)
+    t5.world_model_seed(hw, {"question": "q"}, None, 1.0)
+    ok(got == [5], f"HS13b the explicit turn cap holds for the world-model seed's own session ({got})")
 
 
 def main(argv=None) -> int:

@@ -116,7 +116,10 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `set:` of targets (what is moved, how, to what; format and targets in
     `toolkit/spec/perturb.py`); the older type names still work and compile to it.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
-    the question asks for.
+    the question asks for. When the question asks for the options that maximise an *expected*
+    outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
+    best mean over the uncertainty draws, per-unit means in the file and a mean claim
+    (`toolkit/analysis/plan_rule.py`). Without it the plan is solved at the point values.
 12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
     parameters and card tables its effect depends on (`decision_inputs`, read by
     `toolkit/engines/decision_inputs.py`). When the options use such a component, name the
@@ -289,3 +292,10 @@ when that test changes the plan (toolkit/analysis/conflicts.py). Declare known m
   sign-off.
 - Do not mark a parameter `calibrated` that the engine card fixes or fits from its
   benchmark pack.
+- Do not put digits in a decision test's `text`: it says in words what the test asks
+  ("does the plan change if the effect is at the low end of its range?"). The values tested
+  and the results are rendered from computed claims, and a text with a number is refused.
+- Do not give a value in `engine_parameters` for a parameter the engine card lists as
+  `calibrated` or `fitted`: fitting sets it, and the entry is refused. Calibrate a `calibrated`
+  one under `calibration`, or leave it to the engine; a `fitted` one is set by the engine's own
+  fit (`calibration` accepts kind `calibrated` only): leave it out.
