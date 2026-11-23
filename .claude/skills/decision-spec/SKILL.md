@@ -115,6 +115,15 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `finding:` id when it answers a gate finding. A new test is one `type: perturb` with a
     `set:` of targets (what is moved, how, to what; format and targets in
     `toolkit/spec/perturb.py`); the older type names still work and compile to it.
+    **Wiring.** The analysis moves every input the spec declares as varying (sensitivity
+    ranges and cost items, drawn priors and scenario values, fitted and calibrated
+    parameters, decision-test inputs) to each end of its range and checks that it moves at
+    least one declared outcome or cost (`toolkit/analysis/wiring.py`, `analysis/wiring.yaml`).
+    An input that moves nothing, or moves less than the engine's own noise, is a HIGH
+    `input_not_wired` finding. Only when the input is deliberately inert in this run,
+    declare `analysis.wiring_exempt: {<input name>: <reason>}` (the name as wiring.yaml
+    gives it: a parameter, a cost item id, `burden_anchor_<group>` or a decision-test id);
+    the results list every exemption with its reason. Fix a dead input; do not exempt it.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for. When the question asks for the options that maximise an *expected*
     outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
