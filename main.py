@@ -1110,6 +1110,9 @@ def _run_self_test() -> int:
     # not stored from here
     _calls9 = []
     _outcome(lambda: _rs(_locked(_c8), _p8, store=lambda p: _calls9.append(p)))
+    _kw9 = []        # Codex r3 of #349: a store taking **kwargs is given the held child too
+    _outcome(lambda: _rs(_locked(_c8), _p8, store=lambda p, **kw: _kw9.append(kw.get("upto"))))
+    _calls9 += [] if _kw9 == [os.path.realpath(_c8)] else ["kwargs lost upto"]
 
     def _gen(p, limit=8, kept=False):
         yield _c8

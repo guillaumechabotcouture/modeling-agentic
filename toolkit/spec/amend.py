@@ -811,6 +811,20 @@ def _self_test() -> int:
         finally:
             schema.validate = real_validate
         shutil.rmtree(os.path.join(td, "outside"))
+        # Codex r3 of #349: a patch with mixed key types (YAML) has a digest; no half-made child is left
+        open(pf, "w").write("reason: r\nspec:\n- set: options.prices.index\n  value: {'2024': 1.0, 2025: 1.03}\n")
+        try:
+            got = amend(par, pf, log=lambda *a: None).get("child")
+        except AmendError:
+            got = None
+        except Exception as e:  # noqa: BLE001 -- the finding
+            got = f"{type(e).__name__}: {e}"
+        half = [c for c in sorted(os.listdir(td)) if c.startswith("parent.amend")
+                and not os.path.isfile(os.path.join(td, c, "metadata.json"))]
+        ok((got is None or os.path.isdir(str(got))) and not half,
+           f"AM_PATCH_DIGEST_MIXED_KEYS a YAML patch with mixed key types leaves no half-made child ({got}, {half})")
+        if got and os.path.isdir(str(got)):
+            shutil.rmtree(got)
         yaml.safe_dump({"reason": "r", "spec": [{"set": "constraints.envelope_usd", "value": 9200}]}, open(pf, "w"))
         st = json.load(open(os.path.join(par, "run_state.json")))
         w(par, "run_state.json", json.dumps(dict(st, state="ANALYZE", status=None, paused=None)))

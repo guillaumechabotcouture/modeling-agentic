@@ -3900,9 +3900,15 @@ def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
     # R2-7: a damaged parent state does not drop a recorded refusal's kept child
     stp = os.path.join(d, STATE_FILE)
     st0 = open(stp, "rb").read()
-    open(stp, "wb").write(st0[:20])
-    damaged = handoff_chain(d, kept=True)
+    damaged = []
+    for bad_state in (st0[:20], b"[]"):              # unparseable, and parseable but not a state (Codex r3 of #349)
+        open(stp, "wb").write(bad_state)
+        try:
+            damaged.append(handoff_chain(d, kept=True))
+        except Exception as e:  # noqa: BLE001 -- the finding
+            damaged.append(type(e).__name__)
     open(stp, "wb").write(st0)
+    damaged = damaged[0] if damaged[0] == damaged[1] else damaged
     # R1-5 follow-up: a malformed lead_amendment record is not an error
     req = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
     _write_json(d, SPEC_RETHINK_REQUEST, dict(req, lead_amendment=["bad"]))
@@ -3917,8 +3923,41 @@ def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
     # R2-8: an unfinished hand-off stores its child only once the child has its state and the lead's signature
     d = interrupted("r5_unsigned")
     os.remove(os.path.join(d + ".amend1", SO.SPEC_SIGNOFF))
-    ok(handoff_chain(d, kept=True) == [],
-       f"T_R5_UNFINISHED_UNSIGNED an unfinished hand-off's unsigned child is not stored ({handoff_chain(d, kept=True)})")
+    unsigned = handoff_chain(d, kept=True)
+    d = interrupted("r6_bad_child_state")            # Codex r3 of #349: a child state that cannot be resumed
+    open(os.path.join(d + ".amend1", STATE_FILE), "wb").write(b"")
+    ok(unsigned == [] and handoff_chain(d, kept=True) == [],
+       f"T_R5_UNFINISHED_UNSIGNED an unfinished hand-off's unsigned child, or one whose state cannot be read, is not "
+       f"stored ({unsigned}, {handoff_chain(d, kept=True)})")
+    # Codex r3 of #349: a failure anywhere before the parent's FINAL state is saved (its own metadata write included)
+    # puts the machine back, and parent metadata the hand-off created is removed again
+    for name, where, drop_meta in (("r6_parent_meta", "parent", False), ("r6_no_meta", "child", True)):
+        d = interrupted(name)
+        if drop_meta:
+            os.remove(os.path.join(d, "metadata.json"))
+        real_wj, failed = globals()["_write_json"], []
+
+        def fail_once(rd, rel, doc):
+            if os.path.realpath(rd) == (d if where == "parent" else d + ".amend1") and not failed \
+                    and (where == "child" or rel == "metadata.json"):
+                failed.append(rel)
+                raise PermissionError("injected")
+            return real_wj(rd, rel, doc)
+        m6 = machine(d)
+        globals()["_write_json"] = fail_once
+        try:
+            m6.run()
+        except OSError:
+            pass
+        finally:
+            globals()["_write_json"] = real_wj
+        meta6 = os.path.join(d, "metadata.json")
+        meta_ok = not os.path.exists(meta6) if drop_meta else json.load(open(meta6)).get("status") != AMENDED_PROVISIONAL
+        st6 = load_state(d)
+        s = m6.run()
+        ok(failed and meta_ok and st6.state == "SPEC" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
+           f"T_R6_ROLLBACK {name}: a failed write before the parent's FINAL is saved leaves it at SPEC with its metadata as "
+           f"it was; the same machine's retry finishes the hand-off ({failed}, {meta_ok}, {st6.state}, {s})")
     # R2-9 (P2): a moved manual amendment without its metadata names its parent from the amendment record's digest
     src = os.path.join(tdr, "r4_manual")
     p = pair(src, "r5_moved_manual")
