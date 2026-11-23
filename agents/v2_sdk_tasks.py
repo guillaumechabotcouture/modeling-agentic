@@ -40,6 +40,31 @@ HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evi
 PRINCIPLES_FILE = os.path.join(_REPO, ".claude", "orchestration", "decision_design_principles.md")
 PRINCIPLES = open(PRINCIPLES_FILE).read().strip()
 
+def owner_held_note(run_dir: str, reviewer: str) -> str:
+    """hb2 fix 3: the critic's own findings the owner (or, under --signoff lead, the lead provisionally) has answered,
+    so it carries each forward under its id instead of re-raising it (malaria R2: D-002 and R-003 were re-raised,
+    reworded, in every round, and asked again each time). The answer binds the finding's id, kind and remedy class
+    (agents/findings_ledger.py answer_fingerprint): rewording keeps it; another remedy class is asked again."""
+    try:
+        from agents import findings_ledger as FL
+        rows = [f for f in FL.load(run_dir).values() if f.source == reviewer
+                and f.status in ("owner_accepted", "owner_declined")]
+    except Exception:  # noqa: BLE001 -- no ledger: nothing is listed (the gate still reads the answers)
+        return ""
+    if not rows:
+        return ""
+    lines = []
+    for f in sorted(rows, key=lambda f: f.id):
+        ev = next((e for e in reversed(f.events or []) if isinstance(e, dict) and e.get("status") == f.status), {})
+        who = "the lead, provisionally" if ev.get("by") == "lead" else "the owner"
+        lines.append(f"{f.id} ({'accepted' if f.status == 'owner_accepted' else 'declined'} by {who}; "
+                     f"{FL.remedy_class(f.fix_requires).replace('_', ' ')}): {FL.short_label(f.claim)}")
+    return ("\n\nFindings of yours the owner has answered. Carry each forward under the same id (resolved: false while "
+            "it holds, with still_present: true in carried_forward); do not raise it again under a new id. Keep its "
+            "kind of remedy: an \"Owner amendment:\" remedy stays one, or the owner is asked again. Raise a new "
+            "finding only for something the answer did not cover.\n- " + "\n- ".join(lines))
+
+
 COMMON = """You are one bounded task inside a modeling run driven by code (a state machine). The harness
 computes every number from the decision spec and the engine; you never type a number the report
 uses and never edit harness outputs (analysis/, run_state.json, findings.jsonl, gate files).
@@ -646,7 +671,7 @@ class SdkTasks:
         from toolkit.analysis import red_flag as RF       # heuristic notes the reviewer judges; never a gate
         notes = RF.critic_notes(run_dir)
         msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
-                                            + "\n- ".join(notes) if notes else "")
+                                            + "\n- ".join(notes) if notes else "") + owner_held_note(run_dir, reviewer)
         return self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
@@ -824,6 +849,22 @@ def _self_test() -> int:
         ok(all(k in cp2 for k in ("resolved_in_round: 2", "resolved_evidence", "prior_round: 1", "still_present",
                                   "never a bare id")),
            "S17 the critique prompt states what a resolved blocker and a carried_forward entry need")
+        # S17b (hb2 fix 3): the critic is told which of its findings the owner answered, to carry them forward
+        from agents import findings_ledger as _FL
+        with tempfile.TemporaryDirectory() as d17:
+            _a = _FL.Finding(id="D-002", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                             status="owner_accepted", claim="ITN durability is a point value.",
+                             fix_requires="Owner amendment: add a range.")
+            _a.events.append({"round": 1, "status": "owner_accepted", "by": "lead"})
+            _o = _FL.Finding(id="R-003", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                             status="owner_accepted", claim="k is fixed.")
+            _FL.save(d17, {"D-002": _a, "R-003": _o})
+            n_dom, n_red = owner_held_note(d17, "critique-domain"), owner_held_note(d17, "critique-redteam")
+            n_none = owner_held_note(d17, "critique-presentation")
+        ok("D-002 (accepted by the lead, provisionally; owner amendment)" in n_dom and "R-003" not in n_dom
+           and "same id" in n_dom and "R-003 (accepted by the owner; fix)" in n_red and n_none == ""
+           and owner_held_note(os.path.join(d17, "gone"), "critique-domain") == "",
+           f"S17b each critic is told which of its findings the owner answered ({n_dom!r}, {n_red!r})")
         ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT, files="f")
            and "engine: auto" in PROMPTS["draft_spec"], "S10 the prompts follow the analysis backend's schema")
 

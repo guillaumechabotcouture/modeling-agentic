@@ -568,7 +568,25 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
 
     `accept_blockers` are required artifacts that are absent (Phase 21
     β): they forbid ACCEPT at every round, even when no HIGH is open.
+
+    Harness baseline hb2 fix 1, and the owner's decision (b) of 2026-11-23:
+    a HIGH whose resolution is the owner's (`owner_resolution`: a measured
+    decision test that changes the plan; agents/stage_machine.py
+    apply_owner_rule) is put to the owner at the first gate (rule 2o), not
+    at the round cap; once the owner (or, under --signoff lead, the lead
+    provisionally) accepts it, it no longer blocks ACCEPT: it moves from
+    `unresolved_high` to `owner_accepted_high`, and the report states the
+    dependence at its top. Declined or unanswered, it never accepts. Other
+    owner items (policy-mapped kinds, scripts/scope_signoff.py) keep rule 3o.
     """
+    moved = [b for b in d.get("unresolved_high") or [] if isinstance(b, dict) and b.get("owner_resolution")
+             and b.get("owner_signed") and not b.get("owner_signoff") and not b.get("owner_declined")
+             and not is_non_declarable(b.get("kind"), b.get("scope_declarable"))]
+    if moved:
+        d["unresolved_high"] = [b for b in d["unresolved_high"] if not any(b is m for m in moved)]
+        held = list(d.get("owner_accepted_high") or [])
+        seen = {(b.get("kind"), b.get("claim")) for b in held if isinstance(b, dict)}
+        d["owner_accepted_high"] = held + [b for b in moved if (b.get("kind"), b.get("claim")) not in seen]
     unresolved_high = d.get("unresolved_high") or []
     accept_blockers = d.get("accept_blockers") or []
     structural = d.get("structural_mismatch", False)
@@ -595,6 +613,17 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
                 f"not answer the question. Do NOT spawn writer."
             )
         rule_matched = 1
+    elif rounds_remaining > 0 and any(b.get("owner_resolution") and b.get("owner_signoff") for b in outstanding):
+        # hb2 fix 1: no fix task can change a measured decision test, so its owner is asked now; the gate re-runs
+        # on the answers and the other findings keep their rules
+        ask = [b for b in outstanding if b.get("owner_resolution") and b.get("owner_signoff")]
+        action = "AWAIT_OWNER"
+        rationale = (
+            f"{len(ask)} HIGH finding(s) are the owner's to resolve "
+            f"({', '.join(str((b.get('owner_item') or {}).get('finding') or b.get('kind')) for b in ask)[:300]}): "
+            f"no fix task can change them, so the owner is asked now, with {rounds_remaining} round(s) left. The "
+            f"gate wrote scope_signoff_request.json; it re-runs on the answers.")
+        rule_matched = "2o"
     elif outstanding and rounds_remaining > 0 and _declared_early(outstanding, d):
         # Phase 39: a run whose only outstanding items are gate findings it
         # declared (with a justification) at this gate and the previous one
@@ -837,7 +866,9 @@ def _append_synthetic_blockers(d: dict, reviewer: str, prefix: str,
     """Phase 21 β: idempotent append. An entry already present (same
     reviewer + kind + claim) is not re-added, so calling an incorporate_*
     function twice yields identical output."""
-    existing = [b for b in d["unresolved_high"] if b.get("reviewer") == reviewer]
+    # (an entry the owner accepted was moved to owner_accepted_high: still present, hb2 fix 1)
+    existing = [b for b in list(d["unresolved_high"]) + list(d.get("owner_accepted_high") or [])
+                if isinstance(b, dict) and b.get("reviewer") == reviewer]
     seen = {(b.get("kind"), b.get("claim")) for b in existing}
     n = len(existing)
     for e in new_entries:
@@ -4425,6 +4456,8 @@ def _incorporate_rigor_violations(decision: dict, violations: list[dict],
                 v["kind"], v.get("scope_declarable")),
             # Phase 49 β: a finding the owner must sign off before it is declared.
             **({"owner_signoff": True, "owner_item": v.get("owner_item")} if v.get("owner_signoff") else {}),
+            # hb2 fix 1: a finding whose resolution is the owner's, and the owner's recorded accept
+            **({k: v[k] for k in ("owner_resolution", "owner_signed", "owner_declined") if v.get(k)}),
         })
     _append_synthetic_blockers(d, "rigor-artifacts", "RIG", entries)
 
@@ -4845,6 +4878,52 @@ def _run_self_test() -> int:
     ok(act([bdo, sa, ut], both, both)["action"] == "PATCH_OR_RETHINK"
        and act([bdo, sa, ut], both, both, cur=8)["action"] == "RUN_FAILED",
        "SO-V2 the owner is asked only when the run would otherwise declare scope")
+    # OR-V1..OR-V7 (harness baseline hb2 fix 1; owner decision (b), 2026-11-23): a HIGH whose resolution is the
+    # owner's (`owner_resolution`: a measured decision test that changes the plan) is asked at the first gate, not at
+    # the round cap; once accepted it no longer blocks ACCEPT; declined or unanswered it never accepts.
+    _dt = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT1",
+           "claim": "DT1 changes the plan", "scope_declarable": True}
+    _pend = dict(_dt, owner_signoff=True, owner_resolution=True,
+                 owner_item={"finding": "decision_test_changes_plan:DT1", "fingerprint": "fp1"})
+    _acc = dict(_dt, owner_resolution=True, owner_signed={"by": "owner", "at": "t", "fingerprint": "fp1"})
+    _other = {"kind": "benchmark_drift", "severity": "HIGH", "stage": "MODEL", "key": "B1", "claim": "drift",
+              "scope_declarable": True}
+    _e = lambda: {"unresolved_high": [], "declared": [], "declared_prev": []}  # noqa: E731
+    _o1 = _incorporate_rigor_violations(_e(), [dict(_pend)], 3, 1)
+    ok(_o1["action"] == "AWAIT_OWNER" and _o1["rule_matched"] == "2o",
+       f"OR-V1 an unanswered owner-resolution HIGH goes to the owner at the first gate ({_o1['action']}, "
+       f"{_o1['rule_matched']})")
+    _o2 = _incorporate_rigor_violations(_e(), [dict(_pend), dict(_other)], 3, 1)
+    ok(_o2["action"] == "AWAIT_OWNER" and _o2["rule_matched"] == "2o",
+       f"OR-V2 it is asked first, beside a HIGH a fix may close ({_o2['action']})")
+    _o3 = _incorporate_rigor_violations(_e(), [dict(_acc)], 3, 1)
+    _o3c = _incorporate_rigor_violations(_e(), [dict(_acc)], 3, 3)
+    ok(_o3["action"] == "ACCEPT" and _o3c["action"] == "ACCEPT" and not _o3["unresolved_high"]
+       and [b.get("kind") for b in _o3.get("owner_accepted_high") or []] == ["decision_test_changes_plan"]
+       and (_o3["owner_accepted_high"][0].get("owner_signed") or {}).get("by") == "owner",
+       f"OR-V3 an owner-accepted plan-changing test does not block ACCEPT, at round 1 or at the cap; the gate lists it "
+       f"as accepted ({_o3['action']}, {_o3c['action']}, {_o3.get('owner_accepted_high')})")
+    _o4 = _incorporate_rigor_violations(_e(), [dict(_acc), dict(_other)], 3, 1)
+    _o4c = _incorporate_rigor_violations(_e(), [dict(_acc), dict(_other)], 3, 3)
+    ok(_o4["action"] == "PATCH_OR_RETHINK" and _o4c["action"] == "DECLARE_SCOPE"
+       and [b.get("kind") for b in _o4c["unresolved_high"]] == ["benchmark_drift"],
+       f"OR-V4 the other HIGHs keep their rules ({_o4['action']}, {_o4c['action']})")
+    _pol = dict(_other, owner_signed={"by": "owner", "at": "t", "fingerprint": "fp2"})
+    _o5 = _incorporate_rigor_violations(_e(), [dict(_pol)], 3, 3)
+    _o5p = _incorporate_rigor_violations(_e(), [dict(_other, owner_signoff=True, owner_item={"finding": "b"})], 3, 1)
+    ok(_o5["action"] == "DECLARE_SCOPE" and _o5p["action"] == "PATCH_OR_RETHINK",
+       f"OR-V5 a policy-mapped owner item (no owner_resolution) is unchanged: declared once accepted, asked only at "
+       f"the cap ({_o5['action']}, {_o5p['action']})")
+    _dec = dict(_dt, owner_resolution=True, owner_declined=True, scope_declarable=False)
+    _o6 = _incorporate_rigor_violations(_e(), [dict(_dec)], 3, 3)
+    _o6u = _incorporate_rigor_violations(_e(), [dict(_pend)], 3, 3)
+    _o6s = _incorporate_rigor_violations(_e(), [dict(_acc, scope_declarable=False)], 3, 3)
+    ok(_o6["action"] == "RUN_FAILED" and _o6u["action"] == "AWAIT_OWNER" and _o6s["action"] == "RUN_FAILED",
+       f"OR-V6 a declined, unanswered or non-declarable plan-changing test never accepts ({_o6['action']}, "
+       f"{_o6u['action']}, {_o6s['action']})")
+    _o7 = _incorporate_rigor_violations(_incorporate_rigor_violations(_e(), [dict(_acc)], 3, 1), [dict(_acc)], 3, 1)
+    ok(_o7["action"] == "ACCEPT" and len(_o7.get("owner_accepted_high") or []) == 1,
+       f"OR-V7 idempotent: folding the same accepted finding twice lists it once ({_o7.get('owner_accepted_high')})")
     with tempfile.TemporaryDirectory() as d:
         yaml.safe_dump({"declarations": [{"id": "SD-7", "blocker_id": "allocation_unstable", "why_unresolved": "x"}]},
                        open(os.path.join(d, "scope_declaration.yaml"), "w"))

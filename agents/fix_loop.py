@@ -19,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import sys
 import time
 
@@ -38,7 +37,7 @@ IMPACT = "impact_ledger.jsonl"
 # every one changed nothing.
 FIX_EDITABLE = ("analysis_settings.yaml", "models/ext/")
 ACTIONS = ("fix", "rethink", "decision_test")
-HARNESS_GAP = "harness_gap"          # the ledger event a declared harness gap leaves on its finding
+HARNESS_GAP = FL.HARNESS_GAP          # the ledger event a declared harness gap leaves on its finding
 RETHINK_STATES = ("SPEC", "ENGINE_CHOICE")
 # F6 run 3: a write-up finding (report or manuscript text) is the WRITE stage's. A FIX_LOOP task may edit only
 # analysis_settings.yaml and models/ext/, so a task for one can never pass its check; the writer gets it instead.
@@ -46,7 +45,7 @@ WRITE_STATES = ("WRITE", "PRESENTATION")
 # F6 run 3: a finding whose required remedy is an owner amendment of the signed spec is the owner's, not a SPEC
 # rethink's. The critics are told to write "owner amendment" in fix_requires when the fix needs the signed spec changed
 # (agents/v2_sdk_tasks.py, critique prompt).
-_OWNER_AMENDMENT = re.compile(r"^\s*owner amendment\b", re.I)     # the documented prefix only (Codex #258 P2-4)
+_OWNER_AMENDMENT = FL.OWNER_AMENDMENT_RE     # the documented prefix only (Codex #258 P2-4)
 
 
 def is_write_up(f) -> bool:
@@ -454,8 +453,10 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
         for g in gaps:
             f = led.get(str(g.get("finding")))
             if f is not None:
+                # the gap binds the finding as it reads now (its kind and remedy class: hb2 fix 4)
                 FL._event(f, round_n, HARNESS_GAP, "fix_planner",
-                          f"{str(g.get('reason')).strip()} Needs: {', '.join(map(str, g.get('needs') or []))}"[:600])
+                          f"{str(g.get('reason')).strip()} Needs: {', '.join(map(str, g.get('needs') or []))}"[:600],
+                          key=FL.finding_fingerprint(f))
         FL.save(run_dir, led)
         log(f"[fix loop] harness gap(s), not fix tasks: {', '.join(gap_ids)}")
     done = {r.get("task") for r in impact_rows(run_dir) if r.get("round") == round_n}
@@ -877,7 +878,7 @@ def _self_test() -> int:
         ok(s20.get("harness_gaps") == ["R-001", "R-004"] and s20.get("harness_gaps_blocking") == ["R-001"]
            and s20["rows"] == 0 and impact_rows(d) == []
            and plan20.get("harness_gaps") == ["R-001", "R-004"] and ev20 and "harness code" in ev20[-1].get("note", "")
-           and FL.load(d)["R-001"].status == "open"
+           and FL.load(d)["R-001"].status == "open" and "R-001" in FL.harness_gaps(FL.load(d))
            and build_packet(d, FL.load(d), 2, 3, None, None)["findings"][0].get("harness_gap"),
            f"F20c a harness gap is recorded with its reason (plan, summary, ledger event, next packet), not as a fix "
            f"row ({s20}, {ev20})")
