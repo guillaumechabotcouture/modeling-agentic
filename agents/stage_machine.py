@@ -72,8 +72,9 @@ EDGES = {
     "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "FINAL"},
     "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "WRITE", "OWNER_DECISION", "FINAL"},
     "OWNER_DECISION": {"GATE", "OWNER_DECISION", "FINAL"},
+    # hb1 cause G: a draft revised for write-up findings as a new round is re-reviewed (CRITIQUE) before the gate
     "WRITE": {"PRESENTATION", "GATE", "FINAL"},
-    "PRESENTATION": {"GATE", "FINAL"},
+    "PRESENTATION": {"GATE", "CRITIQUE", "FINAL"},
     "FINAL": set(),
 }
 LLM_STATES = ("SPEC", "ENGINE_CHOICE", "CRITIQUE", "FIX_LOOP", "PRESENTATION")
@@ -665,15 +666,40 @@ def require_judged(d: dict, opened: list | None = None) -> dict:
     return d
 
 
-def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int, budget_ok: bool) -> dict:
+def owner_held(ledger: dict) -> set[str]:
+    """Findings the owner has answered (hb1 cause H): accepted by the owner (or provisionally by the lead). No fix task
+    can work to their test. One still awaiting the owner's answer is not among them (Codex r1 of #344, P1-1): the gate
+    sends it to OWNER_DECISION before anything declares it."""
+    return {f.id for f in ledger.values() if f.status == "owner_accepted"}
+
+
+def owner_accepted_now(run_dir: str, opened: list[dict], lead_ok: bool) -> set[str]:
+    """The open findings whose current claim and remedy, as this gate reads them, carry the owner's (or, in a lead run,
+    the lead's provisional) accept: the answer binds to that fingerprint, so a finding revised since it was answered is
+    not among them (Codex r2 of #344, P1-2: the ledger may keep an older remedy)."""
+    answers = FL.owner_answers(run_dir, lead_ok)
+    out = set()
+    for o in opened:
+        fid = str(o.get("id"))
+        a = answers.get(FL.answer_fingerprint(fid, str(o.get("claim") or ""), o.get("fix_requires")))
+        if a and str(a.get("finding")) == fid and a.get("decision") == "accept":
+            out.add(fid)
+    return out
+
+
+def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int, budget_ok: bool,
+                      owner_held=()) -> dict:
     """v2: the gate never accepts an open HIGH or MEDIUM finding. Today's rules ACCEPT when no HIGH
     is open (rule 4); in v2 an open finding with a test goes to the fix loop while rounds and
     budget remain (rule 4m) and is declared, with the write-up saying so, when they do not (3m).
+    A finding the owner holds (`owner_held`) never goes to the fix loop, which has no task for it: it is
+    declared (harness baseline hb1, malaria R2: two critique rounds ran for an accepted finding).
     The decision's action and rationale say what the machine then does."""
     if decision.get("action") != "ACCEPT" or not opened:
         return decision
     d = dict(decision)
-    tested = [f["id"] for f in opened if f["tested"]]
+    held = set(map(str, owner_held or ()))
+    tested = [f["id"] for f in opened if f["tested"] and str(f["id"]) not in held]
     if tested and rounds_remaining > 0 and budget_ok:
         d.update(action="PATCH_OR_RETHINK", rule_matched="4m", open_tested=tested,
                  rationale=(f"No HIGH finding is open, but {len(tested)} finding(s) with a test are "
@@ -682,6 +708,9 @@ def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int,
     else:
         why = "no rounds remain" if rounds_remaining <= 0 else ("the budget is used" if not budget_ok
                                                                  else "none has a test the fix loop can work to")
+        mine = sorted(str(f["id"]) for f in opened if str(f["id"]) in held)
+        if mine and rounds_remaining > 0 and budget_ok:
+            why = f"the owner's answer, not a fix task, decides {', '.join(mine)[:200]}"
         d.update(action="DECLARE_SCOPE", rule_matched="3m", declared_open=[f["id"] for f in opened],
                  rationale=(f"{len(opened)} HIGH/MEDIUM finding(s) are still open and {why}: they are declared "
                             "in the write-up (declared_findings.yaml), not accepted."))
@@ -2269,16 +2298,21 @@ class Machine:
         v = self._visit()
         fb = self.st.tries.get("schema_feedback") or {}
         critics = list(CRITICS) if (not fb or "*" in fb) else [r for r in fb if r in CRITICS or r == "critique-presentation"]
+        rereview = self._rereview_due()          # hb1 cause G: the domain and red-team critics, on the revised draft
         for reviewer in critics:
             args = (self.run_dir, reviewer, self.st.round) + ((fb.get(reviewer) or fb.get("*"),) if fb else ())
             res = self._task(f"CRITIQUE#{v}:r{self.st.round}:{reviewer}", "critique", *args)
             if res is None:
                 return self._budget_out("CRITIQUE")
         self.st.tries.pop("schema_feedback", None)
+        if rereview:
+            self.st.tries.pop("rereview", None)
+            return self._go("GATE", f"critique round {self.st.round} (re-review of the revised draft)")
         return self._go("GATE", f"critique round {self.st.round}")
 
     def h_GATE(self):
         pw = self.st.post_write
+        waiting: list = []        # findings awaiting the owner's answer: no final disposition is published before it
         if self.st.gate_mode == "legacy":
             d = legacy_gate(self.run_dir, self.st.round, self.st.max_rounds, pw)
             # (owner amendments and declines are v2 rules: the legacy mode replays stored v1 gates and applies neither)
@@ -2293,31 +2327,41 @@ class Machine:
             opened = []
             if d.get("action") and self.st.v2_rules:
                 opened = open_findings(self.run_dir, d)
-                d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget())
+                # synced with this decision, so a gate finding is read as this gate states it (Codex round 3 of #258),
+                # and before the medium rule, which declares what the owner holds (hb1 cause H)
+                led0 = FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")[0]
+                held_now = sorted(owner_accepted_now(self.run_dir, opened, self.st.signoff == "lead"))
+                d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget(),
+                                      owner_held=held_now)
+                d["owner_held"] = held_now      # what this gate read as the owner's (FIX_LOOP's shortcut reads it here)
                 d = require_judged(d, opened)
                 # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
-                # (synced with this decision, so a gate finding is read as this gate states it: Codex round 3 of #258)
-                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw,
-                                                    lead_ok=self.st.signoff == "lead")[0])
+                d = apply_owner_declines(d, led0)
+                waiting = sorted(set(pending_amendments(led0, d.get("resolved_by_test")) + pending_conflicts(led0)))
                 if d.get("rule_matched") == "owner_declined":
                     drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
                                                  if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
             if d.get("action"):
                 import validate_critique_yaml as V
                 V._append_validator_history(self.run_dir, self.st.round, d, pw)
-            if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE":
+            if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE" and not waiting:
+                # (not while a finding awaits the owner's answer: the gate re-runs after it; Codex r3 of #344, P1-2)
                 # Every DECLARE_SCOPE (rule 3, 3a or 3m) lists what is still open in the write-up.
                 write_declared(self.run_dir, opened, d)
             if self.st.v2_rules and pw and d.get("action") and self._has_draft():
-                # The final status heads the report; a not-accepted one records any acceptance language.
-                fst = route_gate(d, pw)[1]
+                # The final status heads the report; a not-accepted one records any acceptance language. While a
+                # finding awaits the owner's answer the status is pending (Codex r2 of #344, P1-1).
+                fst = None if waiting else route_gate(d, pw)[1]
                 render_report(self.run_dir, self.backend, status=fst or "pending")
                 if fst is not None and fst not in ACCEPTED_STATUSES:
                     d["report_acceptance_language"] = self._language_check(fst)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
-        if pw:
+        if pw and not waiting:
             _write_json(self.run_dir, "final_gate.json", d or {})
+        elif pw:            # an earlier post-write gate's record is not the decision while the owner answers (Codex r3)
+            from lib.safe_io import remove_nofollow
+            remove_nofollow(self.run_dir, "final_gate.json")
         self.st.last_gate = {k: (d or {}).get(k) for k in ("action", "rule_matched", "rounds_remaining", "rationale")}
         self.st.last_gate.update(round=self.st.round, post_write=pw)
         if (d or {}).get("action"):
@@ -2407,13 +2451,65 @@ class Machine:
         if summ.get("rethink"):
             return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})", planned=True)
         if not summ["tasks"] and summ.get("write_up") and not summ.get("harness_gaps_blocking") and self._has_draft():
-            # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
+            # Every open finding is the write-up's: the writer revises the draft (with them) as the next round, and
+            # the domain and red-team critics then re-review the revised draft at that round (hb1 cause G: they were
+            # left on the round before, and the gate re-ran them through the schema repair).
             if self.st.round_pending:
                 self.st.round += 1
                 self.st.round_pending = False
             self.st.write_mode = self.st.write_mode or "not_accepted"
+            self.st.tries["rereview"] = self.st.round
             return self._go("WRITE", f"every open finding is the write-up's ({', '.join(summ['write_up'])[:120]})")
+        held_now = None if summ["tasks"] or self._drafted() or self._fixable_open() else self._shortcut_held()
+        if held_now is not None:
+            # hb1 cause H: pre-write, a loop with no task changed nothing, so another critique round can find nothing
+            # new; every open finding the gate holds is the write-up's or the owner's. The draft is written, as the
+            # gate's WRITE route would, in this round; the post-write gate then decides its status.
+            self.st.round_pending = False
+            # the post-write fix loop of this round writes its own plan: this one is kept apart (Codex r2 of #344, P1-3)
+            if os.path.lexists(os.path.join(self.run_dir, f"fix_plan_r{self.st.round}.json")):
+                from lib.safe_io import rename_nofollow        # moved with a source identity check (Codex r3, P1-4)
+                rename_nofollow(self.run_dir, f"fix_plan_r{self.st.round}.json",
+                                f"fix_plan_r{self.st.round}_prewrite.json")
+            # the mode follows what this gate holds, not the whole ledger's history (Codex r2 of #344, P1-4)
+            self.st.write_mode = "declared" if held_now else "accepted"
+            return self._go("WRITE", "fix loop: no task; every open finding is the write-up's"
+                                     + (f" or the owner's ({', '.join(held_now)[:120]})" if held_now else ""))
         return self._go("CRITIQUE", f"fix loop: {summ['rows']} task(s), {summ['passed']} passed their checks")
+
+    def _drafted(self) -> bool:
+        """The gate's own test for a draft (open_findings): a manuscript or a rendered report (Codex r1 of #344, P1-2)."""
+        return self._has_draft() or os.path.exists(os.path.join(self.run_dir, "report.md"))
+
+    def _shortcut_held(self) -> list[str] | None:
+        """Codex r1 of #344 (P1-3, P2-4): the shortcut to WRITE only follows a medium-rule gate (4m) with no unresolved
+        HIGH, whose tested findings are all the write-up's or the owner's answered ones; a gate that patches for any
+        other reason (a HIGH, a declared finding it still holds) keeps its critique round. None: no shortcut; else the
+        tested findings of that gate the owner holds."""
+        try:        # this round's pre-write gate (the one that routed here; the round is raised at the next CRITIQUE)
+            d = json.load(open(os.path.join(self.run_dir, f"gate_r{self.st.round}.json")))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(d, dict) or d.get("rule_matched") != "4m" or d.get("unresolved_high"):
+            return None
+        # the owner-held findings as this gate read them (their current fingerprint carries the accept), not the
+        # ledger's status, which may keep an older remedy (Codex r3 of #344, P1-1); the medium rule kept them out of
+        # open_tested, so the mode comes from that record (P2-5)
+        held = d.get("owner_held")
+        if not isinstance(held, list):
+            return None
+        led = FL.load(self.run_dir)
+        ids = [str(i) for i in d.get("open_tested") or []]
+        if not all(i in led and FX.is_write_up(led[i]) for i in ids):
+            return None
+        return sorted(map(str, held))
+
+    def _fixable_open(self) -> list[str]:
+        """Open findings a fix task could still work to: the gate holds them (blocking), and they are neither the
+        write-up's nor the owner's."""
+        led = FL.load(self.run_dir)
+        held = owner_held(led)
+        return [f.id for f in FL.open_findings(led) if f.blocking and not FX.is_write_up(f) and f.id not in held]
 
     def _request_owner(self, led: dict, ids: list[str]) -> None:
         """The request, and the fingerprints it asks, kept in run_state.json: the answers must be to them (Codex
@@ -2520,7 +2616,8 @@ class Machine:
             return self._go("FINAL", "the writer produced no draft", "completed_no_report")
         render_report(self.run_dir, self.backend)
         self.st.post_write = True
-        if mode == "not_accepted":
+        if mode == "not_accepted" and not self._rereview_due():
+            # (a revised not-accepted draft gets its presentation review at the new round too: Codex r1 of #344, P2-5)
             return self._go("GATE", "not-accepted report written; final gate")
         return self._go("PRESENTATION", f"draft written ({mode})")
 
@@ -2531,7 +2628,14 @@ class Machine:
                          "critique-presentation", self.st.round, writeup=True)
         if res is None:
             return self._budget_out("PRESENTATION")
+        if self._rereview_due():
+            return self._go("CRITIQUE", f"re-review of the revised draft, round {self.st.round}")
         return self._go("GATE", "presentation review of the draft")
+
+    def _rereview_due(self) -> bool:
+        """hb1 cause G: a draft revised for write-up findings as a new round is re-reviewed by the domain and red-team
+        critics at that round before the gate (set by FIX_LOOP; cleared by the re-review)."""
+        return self.st.tries.get("rereview") == self.st.round and self.st.post_write
 
     def _last_decision(self) -> dict | None:
         for name in (f"gate_r{self.st.round - (1 if self.st.round_pending else 0)}_post.json",
@@ -4887,6 +4991,7 @@ def _self_test() -> int:
             ok(False, f"T58-T60 analysis timeout and resume: {type(e).__name__}: {e}")
 
         _self_test_auto1a(ok, td, spike, new_run)
+        _self_test_writeup_rounds(ok, td, spike, new_run)
         try:
             _self_test_hb2_spec(ok, td, spike, new_run)
         except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
@@ -5525,6 +5630,229 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
                      ("T_RETHINK", rethink), ("T_CLAIM", claims), ("CX1-3", r1_resume), ("CX1-4", r1_readback),
                      ("CX1-5", r1_open), ("CX1-7", r1_rethink), ("CX1-2", r1_claims), ("CX2-1", r2_machine),
                      ("CX2-4", r2_findings), ("CX3-1", r3_presentation)):
+        case(name, fn)
+
+
+def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
+    """Harness baseline hb1 (ranked fixes 6 and 7): the rounds a run spent with nothing to fix.
+
+    WR1-WR3 (cause G; dengue R1 and R2, measles R1, tb R2): a write-up-only fix went FIX_LOOP -> WRITE with the round
+    raised, and the post-write gate refused the domain and red-team files as a stale round ("round must be N, got
+    N-1"), re-running them through the schema repair. They now re-review the draft as a route of their own.
+    WR4-WR7 (cause H; malaria R2, measles R2 round 2): the medium rule sent a finding the owner (or the lead,
+    provisionally) had accepted to the fix loop, which had no task for it, and two more critique rounds ran."""
+    from v2_tasks import StubTasks
+
+    def mk(d, T, st):
+        return Machine(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
+
+    def hist(d):
+        return [h for h in load_state(d).history if "to" in h]
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- before the fix exists this is the failure
+            import traceback
+            traceback.print_exc()
+            ok(False, f"{name}: {type(e).__name__}: {e}")
+
+    def rereview():
+        # WR1-WR3: a HIGH write-up finding: ACCEPT pre-write, the post-write gate patches it, the writer revises
+        wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect",
+               "done_when": [{"file": "manuscript.md", "contains": "(?i)effect is bounded"}]}
+        d, T, st = new_run("wr_rereview", {"critics": {1: {"critique-redteam": [wup]}}}, max_rounds=3)
+        s = mk(d, T, st).run()
+        h = hist(d)
+        edges = [(x["from"], x["to"]) for x in h]
+        whys = [str(x.get("why")) for x in h]
+        st2 = load_state(d)
+        ok(("FIX_LOOP", "WRITE") in edges and ("PRESENTATION", "CRITIQUE") in edges
+           and not any(w.startswith("schema errors") for w in whys),
+           f"WR1 a write-up-only fix goes WRITE -> PRESENTATION -> CRITIQUE, never through a schema repair "
+           f"({s}, {edges[-8:]}, {[w for w in whys if 'schema' in w]})")
+        i = edges.index(("PRESENTATION", "CRITIQUE"))
+        r = h[i]["round"]
+        ok("re-review" in whys[i] and f"critique:critique-domain:{r}" in T.calls
+           and f"critique:critique-redteam:{r}" in T.calls and edges[i + 1] == ("CRITIQUE", "GATE")
+           and h[i + 1]["round"] == r,
+           f"WR2 the re-review runs the domain and red-team critics at the revised draft's round, then the gate "
+           f"({whys[i]!r}, round {r}, {T.calls[-6:]})")
+        ok("schema" not in (st2.tries or {}) and "rereview" not in (st2.tries or {}),
+           f"WR3 the re-review uses no schema repair and leaves no pending re-review ({st2.tries})")
+
+    def rereview_not_accepted():
+        # WR1b: the same route for a not-accepted draft (which otherwise goes WRITE -> GATE): its presentation review
+        # is redone at the new round too, so the gate finds no stale file (Codex r1 of #344, P2-5)
+        import shutil
+        src = os.path.join(td, "wr_rereview")
+        d = os.path.join(td, "wr_rereview_na")
+        shutil.copytree(src, d)
+        T, st = StubTasks({}), load_state(d)
+        st.state, st.round, st.post_write, st.round_pending, st.write_mode = "WRITE", 2, False, False, "not_accepted"
+        st.status, st.forced_status = None, None
+        st.tries["rereview"] = 2
+        save_state(d, st)
+        for r in CRITICS + ("critique-presentation",):
+            StubTasks({}).critique(d, r, 1)
+        m = mk(d, T, st)
+        for _ in range(4):
+            m.step()
+        h = hist(d)
+        e = [(x["from"], x["to"]) for x in h]
+        ok(e[-4:-1] == [("WRITE", "PRESENTATION"), ("PRESENTATION", "CRITIQUE"), ("CRITIQUE", "GATE")]
+           and "critique:critique-domain:2" in T.calls and "critique:critique-redteam:2" in T.calls
+           and "critique:critique-presentation:2" in T.calls and not str(h[-1].get("why")).startswith("schema errors"),
+           f"WR1b a revised not-accepted draft goes WRITE -> PRESENTATION -> CRITIQUE (re-review) -> GATE, and the gate "
+           f"finds no stale round ({e[-4:]}, {h[-1].get('why')!r}, {T.calls})")
+
+    def owner_held_run():
+        # WR4-WR6: malaria R2 in miniature. A MEDIUM finding whose remedy is an owner amendment, with a test that fails;
+        # the lead accepts it provisionally. It is declared at once: no fix loop with no task, no second critique round.
+        dw = [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 9999}]
+        amend = {"id": "D-001", "severity": "MEDIUM", "target_stage": "PLAN", "claim": "net durability is untested",
+                 "fix_requires": "Owner amendment: add a durability decision test.", "done_when": dw}
+        d, T, st = new_run("wr_owner_held", {"critics": {1: {"critique-domain": [amend]}}}, signoff="lead",
+                           max_rounds=3)
+        s = mk(d, T, st).run()
+        h = hist(d)
+        to = [x["to"] for x in h]
+        crit = [c for c in T.calls if c.startswith("critique:critique-domain")]
+        ok(s == "completed_scope_declared" and "FIX_LOOP" not in to and crit == ["critique:critique-domain:1"],
+           f"WR4 an owner-accepted finding is declared, not sent to a fix loop with no task ({s}, {to[-8:]}, {crit})")
+        ok(to.count("OWNER_DECISION") == 1,
+           f"WR5 the same finding (same fingerprint) is asked once ({to.count('OWNER_DECISION')} request(s))")
+        import yaml
+        dec = yaml.safe_load(open(os.path.join(d, DECLARED_FILE))) or {}
+        g = json.load(open(os.path.join(d, "final_gate.json")))
+        ok([x.get("id") for x in dec.get("declared") or []] == ["D-001"] and g.get("rule_matched") == "3m"
+           and "owner" in str(g.get("rationale")),
+           f"WR6 the write-up declares it, and the gate says the owner answered it ({dec.get('declared')}, "
+           f"{g.get('rule_matched')}, {g.get('rationale')!r})")
+
+    def pending_post_write():
+        # WR9 (Codex r2 of #344, P1-1): the owner accepted D-001 pre-write; the presentation review raises P-001, whose
+        # remedy is an owner amendment. The post-write gate asks the owner before it publishes a final disposition:
+        # no final_gate.json, and the report's status is pending, while P-001 waits.
+        import scope_signoff as _SS
+        dw = [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 9999}]
+        amend = {"id": "D-001", "severity": "MEDIUM", "target_stage": "PLAN", "claim": "durability untested",
+                 "fix_requires": "Owner amendment: add a durability test.", "done_when": dw}
+        pres = {"id": "P-001", "severity": "MEDIUM", "target_stage": "WRITE", "claim": "the comparator label is unclear",
+                "fix_requires": "Owner amendment: rename the comparator in the spec.",
+                "done_when": [{"file": "manuscript.md", "contains": "(?i)funded plan comparator"}]}
+        d, T, st = new_run("wr_pending_pw", {"critics": {1: {"critique-domain": [amend],
+                                                            "critique-presentation": [pres]}}}, max_rounds=1)
+        s1 = mk(d, T, st).run()
+        _SS.sign(d, "owner", all_decision="accept", note="WR9")
+        json.dump({"action": "DECLARE_SCOPE", "stale": True}, open(os.path.join(d, "final_gate.json"), "w"))
+        s2 = mk(d, StubTasks(T.s), None).run()
+        rep = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        req = json.load(open(os.path.join(d, "scope_signoff_request.json")))
+        ok(s1 == s2 == "paused:awaiting_scope_signoff" and [i.get("finding") for i in req.get("items") or []] == ["P-001"]
+           and not os.path.exists(os.path.join(d, "final_gate.json")) and "completed_scope_declared" not in rep
+           and "P-001" not in open(os.path.join(d, DECLARED_FILE)).read(),
+           f"WR9 a post-write gate with a finding awaiting the owner publishes no final disposition ({s1}, {s2}, "
+           f"final_gate: {os.path.exists(os.path.join(d, 'final_gate.json'))}, declared status in report: "
+           f"{'completed_scope_declared' in rep})")
+
+    def answer_binds_current_text():
+        # WR10 (Codex r2 of #344, P1-2): the owner's accept holds a finding only for the claim and remedy it was given
+        # for, as the gate reads them now
+        d = os.path.join(td, "wr_owner_held")          # WR4's run: the lead accepted D-001 as stated
+        o = {"id": "D-001", "claim": "net durability is untested",
+             "fix_requires": "Owner amendment: add a durability decision test."}
+        ok(owner_accepted_now(d, [o], True) == {"D-001"} and owner_accepted_now(d, [dict(o, fix_requires=None)], True)
+           == set() and owner_accepted_now(d, [o], False) == set(),
+           "WR10 an accept holds the finding as answered; a revised remedy, or a lead answer in an owner run, does not")
+
+    def medium_rule_unit():
+        # WR7: the rule itself. A tested finding the owner holds is declared; a tested one the fix loop can work to is
+        # still patched while rounds remain.
+        op = [{"id": "D-001", "tested": True, "severity": "MEDIUM", "source": "critique-domain", "claim": "c"}]
+        acc = {"action": "ACCEPT", "rule_matched": "4"}
+        d1 = apply_medium_rule(acc, op, 2, True, owner_held={"D-001"})
+        d2 = apply_medium_rule(acc, op, 2, True)
+        d3 = apply_medium_rule(acc, op + [dict(op[0], id="R-002")], 2, True, owner_held={"D-001"})
+        ok(d1["action"] == "DECLARE_SCOPE" and d1["rule_matched"] == "3m" and d2["action"] == "PATCH_OR_RETHINK"
+           and d3["action"] == "PATCH_OR_RETHINK" and d3["open_tested"] == ["R-002"],
+           f"WR7 the medium rule never sends an owner-held finding to the fix loop ({d1['action']}, {d2['action']}, "
+           f"{d3.get('open_tested')})")
+        led = {"A": FL.Finding(id="A", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                               status="owner_accepted", resolution_type="owner_decision"),
+               "B": FL.Finding(id="B", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                               status="open", fix_requires="Owner amendment: x"),
+               "C": FL.Finding(id="C", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                               status="open", fix_requires="re-run the batch"),
+               "E": FL.Finding(id="E", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                               status="owner_declined", resolution_type="owner_decision")}
+        ok(owner_held(led) == {"A"}, f"WR7b owner-held: answered and accepted only; one awaiting the owner's answer is "
+                                     f"not declared before it (Codex r1 of #344, P1-1) ({sorted(owner_held(led))})")
+        # WR7c (Codex r1 of #344, P1-1): post-write, an unanswered amendment is not declared (no DECLARE_SCOPE is
+        # published while the owner has not answered); the gate keeps it as fix-loop work and asks the owner first
+        d4 = apply_medium_rule(acc, op, 2, True, owner_held=owner_held({"D-001": led["B"]}))
+        ok(d4["action"] == "PATCH_OR_RETHINK", f"WR7c an unanswered amendment is not declared ({d4['action']})")
+
+    def zero_tasks_prewrite():
+        # WR8-WR9: pre-write, a fix loop with no task where every open finding the gate holds is the write-up's or
+        # the owner's goes to WRITE, not to another critique round; one with an open finding a task could fix does not.
+        import fix_loop as _FX
+        real = _FX.run_loop
+        # Codex r1 of #344: a rendered report.md counts as a draft (P1-2), and a gate that holds an unresolved HIGH (a
+        # declared finding it still blocks on: P1-3) or patches by another rule (P2-4) keeps its critique round
+        gate4m = {"action": "PATCH_OR_RETHINK", "rule_matched": "4m", "open_tested": ["W"], "unresolved_high": [],
+                  "owner_held": ["A"]}
+        # Codex r2 of #344: the mode follows what this gate holds, not an older owner-accepted finding (P1-4: wr_zero_wu2,
+        # whose gate holds only the write-up's W), and the pre-write plan is kept apart from this round's post-write one
+        # (P1-3)
+        for name, extra, want, gate, report in (
+                ("wr_zero_wu", None, "WRITE", gate4m, False),
+                ("wr_zero_wu2", None, "WRITE", dict(gate4m, owner_held=[]), False),
+                # Codex r3 of #344 (P1-1): the ledger still says A is accepted, but this gate read A as revised (not
+                # held, in open_tested); and a gate record with no owner_held list (an older gate) takes no shortcut
+                ("wr_zero_revised", None, "CRITIQUE", dict(gate4m, open_tested=["W", "A"], owner_held=[]), False),
+                ("wr_zero_oldgate", None, "CRITIQUE", {k: v for k, v in gate4m.items() if k != "owner_held"}, False),
+                ("wr_zero_fixable", "C", "CRITIQUE", gate4m, False),
+                ("wr_zero_report", None, "CRITIQUE", gate4m, True),
+                ("wr_zero_high", None, "CRITIQUE", dict(gate4m, unresolved_high=[{"id": "D-9", "severity": "HIGH"}]),
+                 False),
+                ("wr_zero_rule2", None, "CRITIQUE", dict(gate4m, rule_matched="2"), False),
+                ("wr_zero_nogate", None, "CRITIQUE", None, False)):
+            d, T, st = new_run(name, {}, max_rounds=3)
+            if gate is not None:
+                json.dump(gate, open(os.path.join(d, "gate_r1.json"), "w"))
+            if report:
+                open(os.path.join(d, "report.md"), "w").write("# Report\n")
+            led = {"W": FL.Finding(id="W", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                                   status="open", owner_state="WRITE", target_stage="WRITE"),
+                   "A": FL.Finding(id="A", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                                   status="owner_accepted", resolution_type="owner_decision", blocking=True)}
+            if extra:
+                led[extra] = FL.Finding(id=extra, kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                                        status="open", owner_state="ANALYZE", blocking=True)
+            FL.save(d, led)
+            open(os.path.join(d, "fix_plan_r1.json"), "w").write('{"round": 1, "plan": {"tasks": []}}')
+            st.state, st.round, st.round_pending, st.post_write = "FIX_LOOP", 1, True, False
+            save_state(d, st)
+            _FX.run_loop = lambda *a, **k: {"round": 1, "tasks": 0, "rows": 0, "passed": 0, "rethink": None,
+                                            "write_up": ["W"], "owner_amendments": []}
+            try:
+                mk(d, T, st).step()
+            finally:
+                _FX.run_loop = real
+            s2 = load_state(d)
+            last = hist(d)[-1]
+            mode = "accepted" if name == "wr_zero_wu2" else "declared"
+            kept = (os.path.exists(os.path.join(d, "fix_plan_r1_prewrite.json"))
+                    and not os.path.exists(os.path.join(d, "fix_plan_r1.json")))
+            ok(s2.state == want and (want == "CRITIQUE" or (s2.round == 1 and not s2.round_pending
+                                                            and s2.write_mode == mode and kept)),
+               f"WR8 pre-write, a fix loop with no task goes to {want} ({name}: {s2.state}, round {s2.round}, "
+               f"pending {s2.round_pending}, mode {s2.write_mode}, {last.get('why')!r})")
+
+    for name, fn in (("WR1-WR3", rereview), ("WR1b", rereview_not_accepted), ("WR4-WR6", owner_held_run),
+                     ("WR7", medium_rule_unit), ("WR8", zero_tasks_prewrite), ("WR9", pending_post_write),
+                     ("WR10", answer_binds_current_text)):
         case(name, fn)
 
 
