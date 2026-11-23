@@ -3653,12 +3653,12 @@ def _parent_record(path: str) -> dict:
 
 
 def _relaunch_motivation(path: str) -> dict:
-    """metadata.json motivated_by for a relaunch from `path` (toolkit/spec/amend.py motivation): the parent's
-    rethink request's findings when it wrote one, else `unstated`. Recorded, never raised: a parent that cannot be read
-    gives `source: unreadable` with the error."""
+    """motivated_by of a relaunch (amend.motivation of the parent's rethink request); never raised: `unreadable`."""
     from lib.safe_io import read_nofollow
     from toolkit.spec import amend as AM
     try:
+        if not os.path.isdir(path):
+            raise FileNotFoundError(path)          # a missing parent is unreadable, not a parent with no request
         try:
             req = json.loads(read_nofollow(path, SPEC_RETHINK_REQUEST)[0])
         except FileNotFoundError:
@@ -3975,8 +3975,7 @@ def _self_test_lead_amend(ok, td: str) -> None:
         AM._pre_sign(d, False)
         SO.write_sheet(d)
         SO.sign(d, mode)
-        # the rethink names the finding that motivated it (toolkit/spec/amend.py motivation: required for a rethink);
-        # MEDIUM, so no review condition is carried from it
+        # the rethink names its motivating finding (amend.motivation requires one); MEDIUM: no review condition
         open(os.path.join(d, FL.LEDGER), "w").write(json.dumps({
             "id": "D-001", "kind": FL.CRITIC_KIND, "severity": "MEDIUM", "source": "critique-domain", "status": "open",
             "owner_state": "SPEC", "claim": "the envelope is last year's", "fix_requires": "raise the envelope"}) + "\n")
@@ -5278,20 +5277,12 @@ def _self_test() -> int:
             open(os.path.join(d, STATE_FILE), "rb").read()).hexdigest(),
            f"RR5 a run launched with MA_PARENT_RUN records its parent and the parent's run_state hash ({pr})")
         mb5 = json.load(open(os.path.join(dp, "metadata.json"))).get("motivated_by") or {}
-        dq, rqp = os.path.join(td, "rr5_child_rq"), os.path.join(d, SPEC_RETHINK_REQUEST)
-        rq5 = open(rqp, "rb").read() if os.path.isfile(rqp) else None
-        _write_json(d, SPEC_RETHINK_REQUEST, {"round": 1, "findings": [{"id": "X-404"}], "briefs": []})
-        os.environ["MA_PARENT_RUN"] = d
-        try:
-            init_run(dq, "toy question", derived_inputs=False)
-        finally:
-            os.environ.pop("MA_PARENT_RUN", None)
-            os.remove(rqp)
-            if rq5 is not None:
-                open(rqp, "wb").write(rq5)
-        mq = json.load(open(os.path.join(dq, "metadata.json"))).get("motivated_by") or {}
-        ok(mb5.get("parent_run") == os.path.basename(d)
-           and mb5.get("source") == ("unstated" if rq5 is None else "rethink_request")
+        dq = os.path.join(td, "rr5_parent_rq")
+        os.makedirs(dq)
+        _write_json(dq, SPEC_RETHINK_REQUEST, {"round": 1, "findings": [{"id": "X-404"}], "briefs": []})
+        mq = _relaunch_motivation(dq)
+        ok(mb5.get("parent_run") == os.path.basename(d) and mb5.get("source") == (
+            "rethink_request" if os.path.isfile(os.path.join(d, SPEC_RETHINK_REQUEST)) else "unstated")
            and mq.get("source") == "rethink_request" and [f.get("id") for f in mq.get("findings") or []] == ["X-404"],
            f"RR5b a relaunch records motivated_by: the parent's rethink request's findings, else unstated ({mb5}, {mq})")
         cwd6 = os.getcwd()
@@ -5305,7 +5296,9 @@ def _self_test() -> int:
                 os.environ.pop("MA_PARENT_RUN", None)
                 os.chdir(cwd6)
             prs.append(json.load(open(os.path.join(td, f"rr6_child{k6}", "metadata.json"))).get("parent_run") or {})
-        ok(prs[0].get("run_state_sha256") is None and prs[0].get("error") and prs[1].get("run_dir") == os.path.basename(d),
+        mb6 = json.load(open(os.path.join(td, "rr6_child0", "metadata.json"))).get("motivated_by") or {}
+        ok(prs[0].get("run_state_sha256") is None and prs[0].get("error") and prs[1].get("run_dir") == os.path.basename(d)
+           and mb6.get("source") == "unreadable",
            f"RR6 an unreadable parent records no hash (never linked); a relative parent path records its dir name ({prs})")
         st7 = load_state(d)
         if st7.state == "FINAL":

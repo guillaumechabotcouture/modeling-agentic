@@ -22,10 +22,8 @@ Patch file: `id` (optional), `reason` (required), and `spec` / `dossier` lists o
 Paths are dotted keys; a list element by index (`.0`) or `[key=value]` (exactly one element with that key).
 --from-request: the parent's spec_rethink_request.json must name its signed spec; its briefs and findings are the
 why, and its `patch` is applied when present, else --patch is required. Nothing here names a disease or a place.
-Provenance: the child's metadata.json and amendment_record.json carry `motivated_by` (`motivation`): the parent
-run's id and the ledger findings (id, kind, source, category, fingerprint) that motivated the amendment. Required with
---from-request (its findings and briefs); a manual patch may name them, `motivated_by: {findings: [ids], reason}`,
-or give the reason none did; without it the record says `source: unstated`. scripts/harness_metrics.py reads it.
+Provenance: metadata.json and the record carry `motivated_by` (`motivation`); a patch may add `motivated_by:
+{findings: [ids], reason}`. scripts/harness_metrics.py --check-value reads it.
 """
 from __future__ import annotations
 
@@ -59,7 +57,7 @@ NOT_COPIED = {STATE, "metadata.json", RECORD, REQUEST, "decision_spec.signoff.js
               "scope_signoff_request.json", "report.md", "report_withheld.md", "manuscript.md", "final_gate.json",
               "findings.jsonl", "declared_findings.yaml", "engine_choice.json", "figures", "trace.jsonl",
               "budget_ledger.json", "progress.md", "copied_run.json", "_task_input.json", "done_when_registry.json",
-              "scope_declaration.yaml"}
+              "scope_declaration.yaml", "impact_ledger.jsonl"}
 NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact", "fix_progress")
 NOT_COPIED_DIRS = ("models/decision_tests",)     # the parent's decision-test results: the child tests again
 OPS = ("set", "add", "remove")
@@ -229,6 +227,7 @@ def load_patch(path, request) -> dict:
 # ------------------------------------------------------------------ why: the parent's findings
 MOTIVE = "motivated_by/1"
 _MOTIVE_FIELDS = ("kind", "source", "severity", "status", "owner_state")
+_list = lambda x: x if isinstance(x, list) else []       # noqa: E731
 
 
 def _ledger_rows(parent: str):
@@ -240,17 +239,13 @@ def _ledger_rows(parent: str):
         return None
     except (OSError, ValueError, LinkRefused, UnicodeDecodeError) as e:
         raise AmendError(f"the parent's findings.jsonl cannot be read ({type(e).__name__})") from None
-    rows = {}
-    for n, line in enumerate(data.splitlines(), 1):
-        try:
-            r = json.loads(line) if line.strip() else None
-        except ValueError:
-            r = []
-        if r is not None and not (isinstance(r, dict) and isinstance(r.get("id"), str)):
-            raise AmendError(f"the parent's findings.jsonl line {n} is not a finding row")
-        if r is not None:
-            rows[r["id"]] = r
-    return rows
+    try:
+        rows = [json.loads(x) for x in data.splitlines() if x.strip()]
+    except ValueError:
+        rows = [None]
+    if not all(isinstance(r, dict) and isinstance(r.get("id"), str) for r in rows):
+        raise AmendError("the parent's findings.jsonl holds a line that is not a finding row")
+    return {r["id"]: r for r in rows}
 
 
 def _categories(parent: str) -> dict:
@@ -264,38 +259,37 @@ def _categories(parent: str) -> dict:
             doc = yaml.safe_load(read_nofollow(parent, name)[0]) or {}
         except Exception:  # noqa: BLE001 -- absent or unreadable: no category, never a refusal
             continue
-        for b in (doc.get("blockers") if isinstance(doc, dict) else None) or []:
+        for b in _list(doc.get("blockers") if isinstance(doc, dict) else None):
             if isinstance(b, dict) and b.get("id") is not None and b.get("category"):
                 out[(reviewer, str(b["id"]))] = str(b["category"]).upper()
     return out
 
 
 def motivation(parent: str, request=None, declared=None, required=False) -> dict:
-    """The parent run's findings that motivated an amendment or a relaunch: each one's id, kind, source, critic
-    category and answer fingerprint (agents/findings_ledger.py answer_fingerprint) from the parent's ledger, and the
-    parent run's id (its directory name). `request`: a rethink request (its findings and its briefs' findings);
-    `declared`: a patch's `motivated_by` ({findings: [ids], reason}). `required` (a rethink-driven amendment): at least
-    one finding, else AmendError. A declared finding must be in the parent's ledger, and a declaration naming none
-    needs a reason. A request's finding the ledger does not hold is kept with `in_ledger: false`."""
+    """The parent's findings behind an amendment or relaunch (id, kind, source, category, answer fingerprint from its
+    ledger) and its run id. `required` (a rethink): the request names one, else AmendError. A patch's declared id must
+    be in the ledger, and naming none needs a reason; a request id the ledger lacks is kept, `in_ledger: false`."""
     if os.path.join(ROOT, "agents") not in sys.path:
         sys.path.insert(0, os.path.join(ROOT, "agents"))
     import findings_ledger as FL
     ids, mine, reason = [], [], None
     if request is not None:
-        ids = [f.get("id") for f in request.get("findings") or [] if isinstance(f, dict)]
-        ids += [x for b in request.get("briefs") or [] if isinstance(b, dict) for x in b.get("findings") or []]
+        ids = [f.get("id") for f in _list(request.get("findings")) if isinstance(f, dict)]
+        ids += [x for b in _list(request.get("briefs")) if isinstance(b, dict) for x in _list(b.get("findings"))]
+        ids = [str(x) for x in ids if x is not None and str(x).strip()]
+    if required and not ids:          # the request's own findings: a patch's declaration does not stand in for them
+        raise AmendError("a rethink-driven amendment records the findings that motivated it: the request names none")
     if declared is not None:
         if not isinstance(declared, dict) or set(declared) - {"findings", "reason"} \
                 or not isinstance(declared.get("findings") or [], list) \
-                or not isinstance(declared.get("reason") or "", str):
-            raise AmendError("motivated_by is a mapping of findings (a list of ids) and reason (text)")
-        mine = [str(x) for x in declared.get("findings") or []]
+                or not isinstance(declared.get("reason") or "", str) \
+                or not all(isinstance(x, str) and x.strip() for x in declared.get("findings") or []):
+            raise AmendError("motivated_by is a mapping of findings (a list of finding ids) and reason (text)")
+        mine = [x.strip() for x in declared.get("findings") or []]
         reason = " ".join(str(declared.get("reason") or "").split()) or None
         if not mine and not reason:
             raise AmendError("motivated_by names no finding: give the reason none did")
-    ids = list(dict.fromkeys(str(x) for x in ids + mine if x is not None and str(x).strip()))
-    if required and not ids:
-        raise AmendError("a rethink-driven amendment records the findings that motivated it: the request names none")
+    ids = list(dict.fromkeys(ids + mine))
     led = _ledger_rows(parent) if ids else {}
     if mine and led is None:
         raise AmendError("motivated_by names findings but the parent has no findings.jsonl")
@@ -872,8 +866,7 @@ def _self_test() -> int:
            and f2.get("source") == "critique-domain"
            and f2.get("fingerprint") == FL_.answer_fingerprint("D-1", kind="critique_blocker", fix_requires="r", claim="c")
            and json.load(open(os.path.join(c2, "metadata.json"))).get("motivated_by") == mb2,
-           f"AM_MOTIVE_FROM_REQUEST the child's metadata and record name the parent's motivating finding: id, kind, "
-           f"category, fingerprint and the parent run ({mb2})")
+           f"AM_MOTIVE_FROM_REQUEST metadata and record name the parent's motivating finding and the parent ({mb2})")
         ok((rec.get("motivated_by") or {}).get("source") == "unstated" and rec["motivated_by"]["findings"] == []
            and meta.get("motivated_by") == rec["motivated_by"],
            f"AM_MOTIVE_UNSTATED a manual patch naming no finding is recorded as unstated ({rec.get('motivated_by')})")
@@ -888,12 +881,14 @@ def _self_test() -> int:
         w(par, "spec_rethink_request.json", json.dumps({k: v for k, v in rq.items() if k != "patch"}))
         refused(lambda: amend(par, from_request=True, log=lambda *a: None),
                 "AM_REQUEST_WITHOUT_PATCH_REFUSED a request with no patch and no --patch")
-        w(par, "spec_rethink_request.json", json.dumps(dict(rq, findings=[], briefs=[{"task": "T1", "findings": [],
-                                                                                     "brief": "b"}])))
-        refused(lambda: amend(par, from_request=True, log=lambda *a: None),
-                "AM_MOTIVE_REQUIRED a rethink-driven amendment that names no finding")
-        os.remove(os.path.join(par, "spec_rethink_request.json"))
         w(par, "findings.jsonl", row1)
+        w(par, "spec_rethink_request.json", json.dumps(dict(rq, findings=[], briefs=[{"task": "T1", "findings": [],
+                                                                                     "brief": "b"}],
+                                                       patch=dict(rq["patch"], motivated_by={"findings": ["D-1"]}))))
+        refused(lambda: amend(par, from_request=True, log=lambda *a: None),
+                "AM_MOTIVE_REQUIRED a rethink whose request names no finding (a patch's declaration is no substitute)")
+        os.remove(os.path.join(par, "spec_rethink_request.json"))
+        w(par, "critique_domain.yaml", "blockers: 1\n")      # malformed but descriptive: no category, no refusal
         env = {"reason": "r", "spec": [{"set": "constraints.envelope_usd", "value": 9300}]}
         yaml.safe_dump(dict(env, motivated_by={"findings": ["D-1"]}), open(pf, "w"))
         rec6 = amend(par, pf, log=lambda *a: None)
@@ -902,7 +897,9 @@ def _self_test() -> int:
            and m6["findings"][0].get("in_ledger") is True and m6["findings"][0].get("fingerprint"),
            f"AM_MOTIVE_DECLARED a manual patch names its motivating finding from the parent's ledger ({m6})")
         shutil.rmtree(rec6["child"])
+        w(par, "critique_domain.yaml", "stale\n")
         for name, mb in (("unknown id", {"findings": ["D-9"]}), ("no finding and no reason", {}),
+                         ("a blank id", {"findings": [" "]}),
                          ("findings not a list", {"findings": "D-1"}), ("another key", {"why": "x"})):
             yaml.safe_dump(dict(env, motivated_by=mb), open(pf, "w"))
             refused(lambda: amend(par, pf, log=lambda *a: None), f"AM_MOTIVE_REFUSED {name}")
