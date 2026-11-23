@@ -515,9 +515,12 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     critiques, schema_errors, refused = {}, [], {}
     # Owner 2026-11-23: the domain and red-team critics answer the structural checklist; the harness answers the
     # items it computes from the spec (toolkit/spec/critique_checklist.py). A missing item is a schema error.
+    # Required once the run has a decision spec (every v2 run at GATE; an unreadable spec leaves every item to the
+    # critics); a gate over critique files alone (no spec, the unit fixtures) needs none.
     from toolkit.spec import critique_checklist as CL
     spec_raw = CL.load_spec(run_dir)
     harness = CL.harness_answers(spec_raw) if spec_raw is not None else {}
+    checklist = harness if os.path.lexists(os.path.join(run_dir, "decision_spec.yaml")) else None
     draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     extra = list(extra)
     names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
@@ -541,7 +544,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
             # round, which cost a schema repair and a paid review of a draft about to be replaced.
             rn = _earlier_round(path, round_n)
         try:
-            critiques[reviewer] = V.validate_critique(path, reviewer, rn, checklist=harness)
+            critiques[reviewer] = V.validate_critique(path, reviewer, rn, checklist=checklist)
         except V.SchemaError as e:
             # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
             # blockers still have their done_when tests checked below, for the same reason.
@@ -5093,6 +5096,13 @@ def _self_test() -> int:
            f"fingerprinted item ({g['action']})")
         gn = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="none")
         ok(gn["action"] == "RUN_FAILED", f"T30b under --signoff none nobody can accept it: not declarable ({gn['action']})")
+        open(os.path.join(dd, "decision_spec.yaml"), "w").write("not: [a spec\n")      # unreadable: every item is the critics'
+        gck = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        os.remove(os.path.join(dd, "decision_spec.yaml"))
+        ok(gck.get("action") is None and len([e for e in gck.get("schema_errors") or []
+                                              if "missing required key 'checklist'" in e]) == len(CRITICS),
+           f"SM-CK4 with a decision spec in the run (even an unreadable one), critiques without the checklist are "
+           f"schema errors: {(gck.get('schema_errors') or [])[:2]}")
         # T_OWNER_ANSWERED (1F): the harness-recorded answer to that item releases it; whose answer counts follows the
         # run's sign-off mode (a lead's only under --signoff lead, D2)
         import scope_signoff as _ss
