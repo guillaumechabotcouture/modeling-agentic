@@ -1,8 +1,36 @@
-# Compartmental engine v0.2: notes
+# Compartmental engine v0.3: notes
 
-Engine `compartmental-starsim` v0.2. Design note: `docs/design/v2d-compartmental-engines.md` (§1.1, §5).
+Engine `compartmental-starsim` v0.3. Design note: `docs/design/v2d-compartmental-engines.md` (§1.1, §5).
 v0.2 adds what age-structured allocation questions need. Each addition acts only when a configuration or a
 component asks for it, so every v0.1 configuration gives byte-identical outputs.
+
+v0.3 adds the direct final-size solver (plan: `docs/design/direct-final-size-solver.md`, PR #346). A `final_size: true`
+run with `forcing: none`, no component acting during the epidemic (`day` 0) and `importation: deterministic` no
+longer steps the sim. It solves the multigroup final-size relation z_i = s_i - (s_i - e_i) exp(-q sum_j C_ij z_j)
+on the groups the seeds reach after the interventions (`solve_final_size`, `infection_reach` in `engine.py`):
+- Reach follows the direction of infection from the groups with a seed left, through groups with susceptibles
+  left, so a group behind a fully immune one keeps z = e.
+- Lower and upper iterates start at e and s and stay sub- and super-solutions. Plain steps move by T less or
+  plus a bound on its rounding error; Newton candidates (and the Newton point offset either way) are kept group by
+  group only where the check holds with that bound against them, so rounding never certifies a bound. The map is evaluated in the
+  expm1 form: s - a exp(-x) loses about 2e-12 to cancellation at R = 1.
+- A member stops when its bracket is at most `tol` wide in every group and returns the lower bound (within tol
+  of the root, never above it). A bracket still open at `step_cap` iterations, or one whose bounds have not
+  moved at all for 50 iterations, fails closed (`converged: false`). That happens when the arithmetic cannot
+  certify `tol`: in a chain of exactly critical groups (FD14) the limit is about 1e-9, and such a member crawls
+  on plain steps to `step_cap` (10^6 for final_size, roughly a minute) before failing. The rounding bound includes
+  an absolute, unscaled allowance for underflow, so a force rounded to zero is never certified as zero (FD18,
+  FD23); inputs are promoted to binary64; a group no reached group acts on is exact (z = e); an overflowing force
+  saturates the map; overflow and underflow are handled inside, whatever the caller's numpy error settings.
+- `meta.steps` and `windows.*.steps` count the solver's iterations, per member, and `meta.time_axis` is
+  `solver_iterations`. `meta.final_size_path` is
+  `direct_solver` or `simulation` on every final_size run.
+- Interventions, doses, `s_first`, p_major and the outcome ratios are unchanged. `run_series()` and every other
+  configuration keep the sim. Their per-capita outcomes, windows and cost drivers are byte-identical to v0.2;
+  a final_size run on the simulation path (forcing, a component during the epidemic, or branching importation)
+  also gains `meta.final_size_path: simulation`, and every other configuration's whole output is unchanged.
+- The engine does not import `benchmarks/oracles.py`: that file is outside the engine fingerprint and is the
+  independent check (`selftest_final_size.py`, FD1–FD25).
 
 ## Model and framework
 
@@ -64,7 +92,8 @@ citation, marked `unverified` until the evidence service checks it.
 
 ## Validation
 
-- `benchmarks/results.yaml`: 61 of 61 assessable benchmarks are in band. The ten v0.2 benchmarks are AS1–AS6.
+- `benchmarks/results.yaml` (re-run on v0.3): 62 of 62 assessable benchmarks are in band. AS7 now compares the
+  direct solver with the stepped declared interval near criticality. The ten v0.2 benchmarks are AS1–AS6.
   - AS1: a 5-age-group SEIR with pre-existing immunity by age matches the reference ODE's final size per group.
   - AS1b: the per-group parameters give the attribute path's epidemic.
   - AS2: the SEIR growth relation.
@@ -79,6 +108,9 @@ citation, marked `unverified` until the evidence service checks it.
   byte-identity proof, `benchmarks/compat_proof.py`. Every pack setting of a v0.1 configuration, and one
   representative unit per coverage-pack configuration, give identical outputs under v0.1 (ce79ccf) and v0.2: 27
   of 27 cases. Its identity fields were re-stamped by that proof, recorded under `restamped:`, and were not
-  recomputed.
-- Self-tests: `engine.py --self-test` (v0.1 contract, batching, stop rule, pack subset, stamps) and
-  `selftest_age.py --self-test` (v0.2, A1–A24), about 15 s and 25 s locally with two BLAS threads.
+  recomputed. For v0.3 the proof was re-run against the v0.1 commit that computed the rows (b24d147), not against
+  v0.2: the restamp checks the proof's old side against the code that computed the values. 27 of 27 cases are
+  identical, since no coverage configuration sets `final_size`. The coverage pack therefore does not test the
+  solver; the analytic pack and `selftest_final_size.py` do.
+- Self-tests: `engine.py --self-test` (v0.1 contract, batching, stop rule, pack subset, stamps),
+  `selftest_final_size.py --self-test` (v0.3, FD1–FD25) and `selftest_age.py --self-test` (v0.2, A1–A24), about 15 s and 25 s locally with two BLAS threads.

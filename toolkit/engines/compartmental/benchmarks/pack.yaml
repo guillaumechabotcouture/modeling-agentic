@@ -82,8 +82,10 @@ configs:
   cohorts_homog: {groups: [old, c1, c2, c3, c4, c5], structure: birth_cohorts, mode: to_extinction, initialiser: given,
                   dt: day, generation_interval: {seir: {latent_days: 10.0, infectious_days: 8.0}}, tol: 1.0e-14,
                   step_cap: 50000}
+  # v0.3: tol 1e-12, not 1e-14: the direct solver certifies its bracket with a bound on its own rounding, and near
+  # criticality that bound sits at about 1e-14 (it fails closed below it); AS7 compares at rel 1e-7
   age5_final: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
-               initialiser: given, dt: day, transmission: q, tol: 1.0e-14, time_unit: year, final_size: true,
+               initialiser: given, dt: day, transmission: q, tol: 1.0e-12, time_unit: year, final_size: true,
                generation_interval: {seir: {latent_days: 1.5, infectious_days: 3.0}}}
   age5_year: {groups: [g1, g2, g3, g4, g5], structure: age_groups_contact_matrix, mode: to_extinction,
               initialiser: given, dt: day, transmission: q, tol: 1.0e-12, step_cap: 50000, time_unit: year,
@@ -439,7 +441,7 @@ benchmarks:
                 b: {oracle: final_size_rank_one, args: {q: 1.8, a: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
                     b: [0.55, 0.09, 0.09, 0.09, 0.09, 0.09], N: [5.5e+5, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4, 9.0e+4], s: [0.0, 0.08, 0.12, 0.25, 0.4, 1.0],
                     seed: [0.0, 0.0, 0.0, 0.0, 0.0, 1.1111111111111112e-8]}}, tol: {rel: 1.0e-6}}}
-  - {id: AS7, metric: "final_size on the generation grid (one generation per step) equals the declared SEIR interval's final size, near criticality (Reff about 1.05)",
+  - {id: AS7, metric: "final_size without forcing (v0.3: the direct final-size solver; v0.2: one generation per step) equals the stepped declared SEIR interval's final size, near criticality (Reff about 1.05)",
      source: "exponential-survival identity: the final size does not depend on the generation interval (design note §1.1)",
      estimand: {type: identity, a: {arm: as_fin_gen, value: per_capita_vec.infections},
                 b: {arm: as_fin_day, value: per_capita_vec.infections}, tol: {rel: 1.0e-7}}}

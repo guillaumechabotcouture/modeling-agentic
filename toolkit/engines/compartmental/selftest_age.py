@@ -202,7 +202,7 @@ def _self_test() -> int:
     o_fs = efs.run(P, _unit(), Package("0", {}), short, 1)
     ok(abs(o_fs.windows["all"]["attack_rate"] - od.windows["all"]["attack_rate"]) < 1e-9
        and abs(o_fs.per_capita["infections"]["a2"] - od.per_capita["infections"]["a2"]) < 1e-9
-       and o_fs.meta["time_axis"] == "generations",
+       and o_fs.meta["time_axis"] in ("generations", "solver_iterations"),     # v0.3: the direct solver
        f"A25 final_size: a window shorter than the epidemic still counts its final size, on the generation grid "
        f"({o_fs.windows['all']['attack_rate']:.10f} vs {od.windows['all']['attack_rate']:.10f})")
     # A33: near criticality the generation grid converges in few steps, to the declared interval's final size

@@ -63,7 +63,11 @@ Time is in days (time_unit day) or decimal years (time_unit year). Nothing here 
 
 `p_major` (probability of a major outbreak) is the one quantity computed from an equation rather
 than from the sim: the multitype branching-process extinction equations x_i = G_i(x). It is labelled
-derived. Analytic final-size solvers are test oracles in benchmarks/oracles.py, never used here.
+derived. v0.3: a final_size run without forcing, without a component acting during the epidemic and with
+deterministic importation solves the multigroup final-size relation directly (solve_final_size: our own bracketed
+fixed point, error at most tol per group) instead of stepping the sim, and records final_size_path in its meta; the
+sim still gives the timing (run_series) and every other configuration. The pack's oracles (benchmarks/oracles.py) are
+test oracles only and are never imported here.
 """
 from __future__ import annotations
 
@@ -85,7 +89,7 @@ from toolkit.engines.contract import (EngineCard, Horizon, Outcomes, Package, Pa
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.join(HERE, "benchmarks", "pack.yaml")
 RESULTS = os.path.join(HERE, "benchmarks", "results.yaml")
-NAME, VERSION = "compartmental-starsim", "0.2"
+NAME, VERSION = "compartmental-starsim", "0.3"
 TIME_UNITS = ("day", "year")
 YEAR_DAYS = 365.0                 # time_unit year: one model year is 365 days (the forcing period's default)
 PER_GROUP = ("s0", "ratio")       # per_group_parameters: s0 and ratio:<outcome>
@@ -275,6 +279,151 @@ def reachable(C: np.ndarray, seeded: np.ndarray) -> np.ndarray:
             break
         m = nxt
     return m.astype(float)
+
+
+def infection_reach(C: np.ndarray, s: np.ndarray, e: np.ndarray) -> np.ndarray:
+    """v0.3: the groups a deterministic epidemic infects, per member, after the interventions: (B, G) bool. It starts
+    from the groups with a seed left after clipping (e_i > 0) and follows the direction of infection (infection in i
+    reaches j when C_ji > 0, the force on j sums C_ji z_i) through groups with susceptibles left (s_j > e_j). A group
+    behind a fully immune one is not reached, even when the contact graph connects it."""
+    m = e > 0
+    open_ = s > e
+    edge = (C > 0).astype(float)                           # edge[b, j, i]: infection in i reaches j
+    for _ in range(C.shape[-1]):
+        nxt = m | (open_ & ((edge * m[:, None, :].astype(float)).sum(axis=2) > 0))
+        if np.array_equal(nxt, m):
+            break
+        m = nxt
+    return m
+
+
+EPS = float(np.finfo(float).eps)
+TINY = float(np.finfo(float).smallest_subnormal)
+
+
+def _final_size_map(K: np.ndarray, e: np.ndarray, a: np.ndarray, z: np.ndarray):
+    """T(z) = e + a (1 - exp(-K z)) with a = s - e, per member and group, in the expm1 form (s - a exp(-K z) loses
+    the small final sizes near the threshold to cancellation); the Jacobian's factor a exp(-K z); and a bound on the
+    rounding error of the computed T (Codex r1 of #351, P1-1): the row sum x = sum_j K_ij z_j is off by at most
+    (G + 1) eps x, which moves T by at most a exp(-x) times that; expm1, the product and the sum add a few eps of
+    e + a (1 - exp(-x)). Products that underflow are off by at most one subnormal step each, which moves T by at most
+    (G + 1) TINY wherever a > 0: that absolute floor is added unscaled, so it cannot round to zero itself (Codex r2
+    and r3 P1-1: a force rounded to zero still carries an allowance). A row sum that overflows saturates T at e + a
+    with no error term (r2 P2-4). Overflow and underflow are handled here, whatever the caller's numpy error settings
+    (r3 P2-3). The row sums run over the last axis of each member's own arrays, so a member's arithmetic does not
+    depend on its batch companions."""
+    G = z.shape[-1]
+    with np.errstate(over="ignore", under="ignore"):
+        x = (K * z[:, None, :]).sum(axis=2)
+        T = e + a * -np.expm1(-x)
+        ax = a * np.exp(-x)
+        ax_x = np.where(ax > 0, ax * np.where(np.isfinite(x), x, 0.0), 0.0)
+        r = EPS * ((G + 1) * ax_x + 4.0 * T) + np.where(a > 0, (G + 1) * TINY, 0.0)
+    return T, ax, r
+
+
+def _certify(K, e, a, c, bound, upper: bool) -> np.ndarray:
+    """A candidate bound, made valid group by group (Codex r1 of #351, P1-1): start from min(c, bound) (upper) or
+    max(c, bound) (lower), so the vector never leaves the current bracket side; a group whose super- (sub-) solution
+    check fails with the rounding bound against it falls back to the current bound, and the check is repeated, since
+    that move changes the other groups' T. A group at the current bound is valid by monotonicity alone (bound is a
+    super- or sub-solution and the vector lies on its side of it), so the result is a valid bound in exact arithmetic,
+    and a group limited by rounding no longer blocks the others' progress."""
+    c = np.where(np.isfinite(c), c, bound)
+    c = np.minimum(c, bound) if upper else np.maximum(c, bound)
+    for _ in range(c.shape[-1] + 1):
+        Tc, _, rc = _final_size_map(K, e, a, c)
+        ok = (c == bound) | ((Tc + rc <= c) if upper else (Tc - rc >= c))
+        if ok.all():
+            break
+        c = np.where(ok, c, bound)
+    return c
+
+
+def solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, cap: int):
+    """See _solve_final_size; overflow and underflow are handled inside, whatever the caller's numpy error settings
+    (Codex r3 of #351, P2-3)."""
+    with np.errstate(over="ignore", under="ignore"):
+        return _solve_final_size(K, s, e, tol, cap)
+
+
+def _solve_final_size(K: np.ndarray, s: np.ndarray, e: np.ndarray, tol: float, cap: int):
+    """v0.3: the multigroup final-size relation z_i = s_i - (s_i - e_i) exp(-sum_j K_ij z_j), solved directly, per
+    member. K (B, G, G) is q C, s (B, G) the susceptible share after the interventions, e (B, G) the seed share
+    (0 <= e <= s); z counts the seeds. Groups the seeds do not reach (infection_reach) keep z = e. On the reached
+    groups the map T is monotone and has one root in [e, s]: the lower iterate starts at e, the upper at s, and both
+    stay valid bounds (a sub-solution v, T(v) >= v, lies below the root; a super-solution, T(v) <= v, above it). Each
+    iteration takes the plain step on both sides, T less (lower) or plus (upper) its rounding bound, and offers
+    Newton candidates (from the upper iterate; the lower candidate uses the upper Jacobian, so it stays below the
+    root, Ortega & Rheinboldt 13.3) and the Newton point offset either way along (I - J)^-1 1. A candidate is kept,
+    group by group (_certify), only where the sub- or super-solution check holds with the rounding bound against it,
+    so floating point never certifies a bound (Codex r1 of #351, P1-1). Every member iterates at least once (P1-2). A member stops when its
+    bracket is at most `tol` wide in every group, and returns the lower bound: within tol of the root and never above
+    it, as the stepping path's truncated sum (a subcritical epidemic stays within the seed-size bound). A
+    member whose bracket has not closed within `cap` iterations, or whose bounds have not moved at all for 50
+    iterations (the floating-point limit: an ill-conditioned problem whose tol the arithmetic cannot certify; slow
+    certified progress runs on to the cap, Codex r2 P2-3), fails closed.
+    Returns (z, iterations per member)."""
+    K, s, e = (np.asarray(x, np.float64) for x in (K, s, e))     # Codex r2 P1-2: binary64 throughout
+    B, G = s.shape
+    m = infection_reach(K, s, e)
+    # unreached groups, and groups no force from a reached group acts on (z = e exactly, r2 P2-5; r3 P2-2: contacts
+    # from unreached groups do not count), keep the seed
+    top = np.where(m & np.any((K != 0) & m[:, None, :], axis=2), s, e)
+    a = top - e
+    lo, hi = e.copy(), top.copy()
+    iters = np.zeros(B, int)
+    live = np.ones(B, bool)                                # Codex r1 P1-2: the map is evaluated at least once
+    still = np.zeros(B, int)
+    eye = np.eye(G)[None]
+    for n in range(1, int(cap) + 1):
+        idx = np.nonzero(live)[0]
+        if not len(idx):
+            break
+        Kb, tb, eb, ab, mb = K[idx], top[idx], e[idx], a[idx], m[idx]
+        l0, u0 = lo[idx], hi[idx]
+        Tl, _, rl = _final_size_map(Kb, eb, ab, l0)
+        Tu, xu, ru = _final_size_map(Kb, eb, ab, u0)
+        l1, u1 = np.maximum(l0, np.clip(Tl - rl, eb, tb)), np.minimum(u0, np.clip(Tu + ru, eb, tb))
+        A = eye - np.where(mb[:, :, None] & mb[:, None, :], xu[:, :, None] * Kb, 0.0)
+        rhs = np.stack([u0 - Tu, l0 - Tl, mb.astype(float)], axis=2)
+        try:                                               # LAPACK solves each member's matrix on its own
+            sol = np.linalg.solve(A, rhs)
+        except np.linalg.LinAlgError:                      # a singular matrix: that member gets no Newton candidate
+            sol = np.full(rhs.shape, np.nan)
+            for j in range(len(idx)):
+                try:
+                    sol[j] = np.linalg.solve(A[j], rhs[j])
+                except np.linalg.LinAlgError:
+                    pass
+        newton = np.clip(u0 - sol[:, :, 0], eb, tb)
+        d = sol[:, :, 2]
+        dmax = np.max(np.where(mb, np.abs(d), 0.0), axis=1, keepdims=True)
+        off = np.where(mb & (dmax > 0), d / np.where(dmax > 0, dmax, 1.0), 0.0) * (0.25 * tol)
+        for c in (newton, np.clip(newton + off, eb, tb)):
+            u1 = _certify(Kb, eb, ab, c, u1, upper=True)
+        for c in (np.clip(l0 - sol[:, :, 1], eb, tb), np.clip(newton - off, eb, tb)):
+            l1 = _certify(Kb, eb, ab, c, l1, upper=False)
+        w1 = np.max(u1 - l1, axis=1)
+        # Codex r1/r2 P2-3: any bound that moves is progress (bounds advance along a chain while the widest group's
+        # width stays put; slow certified progress is not a floating-point limit)
+        moved = np.any(l1 != l0, axis=1) | np.any(u1 != u0, axis=1)
+        still[idx] = np.where(moved, 0, still[idx] + 1)
+        lo[idx], hi[idx] = l1, u1
+        iters[idx] = n
+        done = w1 <= tol
+        live[idx[done]] = False
+        stuck = live[idx] & (still[idx] >= 50)
+        if np.any(stuck):
+            bad = idx[stuck]
+            raise RuntimeError(f"final-size solver: the bracket stopped shrinking above tol {tol:g} (converged: false; "
+                               f"batch members {[int(b) for b in bad[:10]]}; width {float(np.max(w1)):.3g}); declare a "
+                               "tol above the floating-point limit")
+    if live.any():
+        bad = [int(b) for b in np.nonzero(live)[0]]
+        raise RuntimeError(f"final-size solver: the bracket did not close within {cap} iterations (converged: false; "
+                           f"batch members {bad[:10]})")
+    return lo, iters
 
 
 def extinction_probability(K: np.ndarray, offspring: str, iters: int = 200000) -> np.ndarray:
@@ -590,6 +739,8 @@ class CompartmentalEngine:
             raise ValueError("final_size needs mode to_extinction")
         self.final_generations = (self.final_size and forcing == "none"
                                   and not any(cfg.get("day") for cfg in self.components.values()))
+        # v0.3: the same conditions and deterministic importation admit the direct final-size solver
+        self.final_direct = self.final_generations and importation == "deterministic"
         self.tol = _num(tol, "tol")
         # v0.2: a final-size run counts generations (below), and a near-critical one needs many of them
         step_cap = (1000000 if self.final_size else 20000) if step_cap is None else step_cap
@@ -715,7 +866,10 @@ class CompartmentalEngine:
                 f"run mode {self.mode}"] + (
                 ["final_size: per-capita outcomes are the final size of the epidemic seeded at horizon.start (to "
                  "extinction, whatever its duration); the decision window's end bounds only the figures"]
-                if self.final_size else []),
+                if self.final_size else []) + (
+                ["final_size: per-capita outcomes from the multigroup final-size relation, solved directly (bracketed "
+                 "fixed point with Newton steps, error at most tol per group; steps count its iterations); the "
+                 "simulation gives the timing"] if self.final_direct else []),
             components=comps or {"none": [0]},
             unit_attributes=self._unit_attributes(),
             outputs={"per_capita": ["infections"] + self.outcomes, "windows": self._window_metrics(),
@@ -1004,6 +1158,11 @@ class CompartmentalEngine:
         late = [k for cn, k in ctx["late"] if np.any(ctx["levels"][cn] > 0)]     # components a package sets
         if self.mode == "windowed" and late and max(late) >= self._first_steps(horizon):
             raise ValueError(f"a component acts at step {max(late)}, after the windowed horizon ends")
+        if self.final_direct:
+            # v0.3: the final-size relation solved directly (solve_final_size); no sim is built
+            ctx["w"] = np.ones(1)
+            ctx["generations"] = ctx["direct"] = True
+            return self._outcomes(ctx, self._solve_final_size(ctx), horizon, seed)
         if self.final_generations:
             # v0.2 final_size without forcing or components acting during the epidemic: the outcome does not depend
             # on the generation interval or the step length (the exponential-survival identity, FS8, AS7), so the
@@ -1013,6 +1172,26 @@ class CompartmentalEngine:
             ctx["generations"] = True
         state, sim = self._simulate(ctx, horizon, seed)
         return self._outcomes(ctx, state, horizon, seed)
+
+    def _solve_final_size(self, ctx) -> dict:
+        """v0.3: the module state a final-size run ends in, from the final-size relation: the start-of-sim components
+        act in the sim's order and arithmetic (S = s N, then each component on S / N), the seeds are clipped to the
+        susceptibles as at the sim's first step, and the rest of the epidemic is solve_final_size's root. `stopped`
+        holds each member's iteration count (meta.steps)."""
+        N = ctx["N"]
+        S = ctx["s_init"] * N
+        doses = {cn: np.zeros(ctx["B"]) for cn in self.components}
+        for cn in self.components:
+            s, doses[cn] = apply_component(S / N, N, self.components[cn], ctx["levels"][cn], ctx["eff"][cn],
+                                           ctx["reach"][cn], self.groups, self.targets_susceptible)
+            S = s * N
+        s_first = S / N
+        seed = np.minimum(ctx["seed"], S)
+        e = np.minimum(seed / N, s_first)
+        z, iters = solve_final_size(ctx["q"][:, None, None] * ctx["C"], s_first, e, self.tol, self.step_cap)
+        cum = np.maximum((z - e) * N, 0.0)
+        return {"S": S - seed - cum, "inc": [seed], "cum": cum, "active": np.zeros(ctx["B"], bool), "stopped": iters,
+                "n_steps": int(iters.max(initial=0)), "s_first": s_first, "doses": doses, "removed": {}}
 
     # ------------------------------------------------------------------------------ outputs
     def _p_major(self, ctx, s_start) -> np.ndarray:
@@ -1116,7 +1295,9 @@ class CompartmentalEngine:
                 d0 = self.days(t0, horizon)
                 # Codex r2 P1-4: a final-size window ends at this member's own last step (its stop), never at a
                 # batch companion's, so batched and single runs give the same endpoint diagnostics
-                k_end = int(state["stopped"][b]) if self.mode == "to_extinction" and state["stopped"][b] >= 0 else T1 - 1
+                # Codex r1 of #351 P1-2: on the direct path the end state is the last row, whatever the iteration count
+                k_end = (T1 - 1 if ctx.get("direct") else int(state["stopped"][b])
+                         if self.mode == "to_extinction" and state["stopped"][b] >= 0 else T1 - 1)
                 d1 = self.days(t1, horizon) if math.isfinite(t1) else float(times[min(max(k_end, 0), T1 - 1)])
                 if not math.isfinite(t1):
                     S1 = S_after[min(k_end, T1 - 1), b]
@@ -1144,7 +1325,9 @@ class CompartmentalEngine:
                 wins[wn] = m
             cost = {f"doses:{c}": float(state["doses"][c][b] / Ntot[b]) for c in self.components}
             meta = {"seed": int(seed), "dt_days": self.dt_days,
-                    "steps": int(state["n_steps"]) if ctx.get("generations") else int(T1 - 1),
+                    # v0.3: the direct solver's own iteration count (per member, so batched equals run)
+                    "steps": (int(state["stopped"][b]) if ctx.get("direct") else
+                              int(state["n_steps"]) if ctx.get("generations") else int(T1 - 1)),
                     "age_shares": {g: float(N[b, i] / Ntot[b]) for i, g in enumerate(self.groups)},
                     "s_initialiser": [float(x) for x in ctx["s_init"][b]], "s_start": [float(x) for x in s_start0[b]],
                     "incidence": ([] if ctx.get("generations") else
@@ -1155,7 +1338,9 @@ class CompartmentalEngine:
                 meta["converged"] = bool(not state["active"][b])
             if self.final_size:
                 meta["after_window_share"] = None if gens else float(after[b])
-                meta["time_axis"] = "generations" if gens else "days"
+                # Codex r1 of #351 P2-4: the direct path's steps are solver iterations, not generations
+                meta["time_axis"] = "solver_iterations" if ctx.get("direct") else "generations" if gens else "days"
+                meta["final_size_path"] = "direct_solver" if ctx.get("direct") else "simulation"     # v0.3
             if self.mode == "windowed" and self.rt_trajectory:
                 s_traj = S_after[:, b] / N[b]
                 f_t = np.asarray([ctx["forcing"](t)[b] for t in times])
