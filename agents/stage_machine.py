@@ -6406,6 +6406,37 @@ def _self_test_hb2_validate(ok, td: str, new_run) -> None:
        and set(T.mid) <= set(fb) and getattr(T, "check", 1) is None,
        f"VS6 the draft task's check runs the machine's own pre-sign checks on its draft, and is withdrawn after the "
        f"try ({getattr(T, 'mid', None)}, {fb})")
+    import yaml
+    # VS7 (Codex r1 P1-1): the check never follows a spec that is a link (the try-end gate refuses it): no parser
+    # diagnostic from the link's target
+    d7, T7, st7 = new_run("vs7", {})
+    m7 = Machine(d7, T7, st7, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    open(os.path.join(td, "vs7_target.yaml"), "w").write("a: [unclosed\n")
+    os.symlink(os.path.join(td, "vs7_target.yaml"), os.path.join(d7, AB.SPEC_FILE))
+    got7 = m7._spec_checks(d7)
+    ok(got7 and not any("unclosed" in x or "while parsing" in x or "flow sequence" in x for x in got7),
+       f"VS7 a spec that is a link is refused before it is read ({got7})")
+    # VS8 (Codex r1 P1-2): the check applies the owner default (conflicts) the try-end path applies, so a pass in the
+    # try is a pass at its end
+    d8, T8, st8 = new_run("vs8", {})
+    m8 = Machine(d8, T8, st8, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    T8.draft_spec("q", d8, None)
+    m8._spec_checks(d8)
+    raw8 = yaml.safe_load(open(os.path.join(d8, AB.SPEC_FILE)))
+    ok((raw8.get("conflicts") or {}).get("policy") == "declare_and_test",
+       f"VS8 the check applies the conflicts default before it validates ({raw8.get('conflicts')})")
+    # VS9 (Codex r1 P1-3): the cited-input record holds the current draft's citations only
+    d9, T9, st9 = new_run("vs9", {})
+    AB.write_toy_units(os.path.join(d9, "other_units.csv"), n=12)
+    spec9 = dict(T9.s["spec"])
+    StubTasks(dict(T9.s, spec=spec9)).draft_spec("q", d9, None)
+    record_cited_inputs(d9)
+    spec9 = dict(spec9, decision_units=dict(spec9["decision_units"], csv="other_units.csv"))
+    StubTasks(dict(T9.s, spec=spec9)).draft_spec("q", d9, None)
+    record_cited_inputs(d9)
+    cited9 = sorted((json.load(open(os.path.join(d9, PROVENANCE))).get("cited") or {}))
+    ok("other_units.csv" in cited9 and "units.csv" not in cited9,
+       f"VS9 a citation the draft dropped leaves the record ({cited9})")
 
 
 def main(argv=None) -> int:

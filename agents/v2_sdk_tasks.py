@@ -811,6 +811,35 @@ def _self_test_validate_spec(ok) -> None:
            and "limit" in text(rl) and rl.get("is_error"),
            f"VS3 a check that raises is reported as an error, never as a pass; past its limit the tool says so "
            f"({text(rb)!r}, {text(rl)!r})")
+    # VS10 (Codex r1 P1-4): every problem is returned, none dropped past a count
+    many = [f"problem {i}" for i in range(45)]
+    r10 = asyncio.run(validate_spec_tool(lambda: many).handler({}))
+    ok(all(f"problem {i}\n" in text(r10) + "\n" for i in range(45)), "VS10 the tool returns every problem")
+    # VS11 (Codex r1 P2-5): a queued call that is cancelled never runs its check
+    import threading
+    gate, ran = threading.Event(), []
+
+    def slow():
+        ran.append(1)
+        gate.wait(5)
+        return []
+    t11 = validate_spec_tool(slow)
+
+    async def race():
+        a = asyncio.create_task(t11.handler({}))
+        await asyncio.sleep(0.2)
+        b = asyncio.create_task(t11.handler({}))
+        await asyncio.sleep(0.2)
+        b.cancel()
+        gate.set()
+        await a
+        try:
+            await b
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.3)
+    asyncio.run(race())
+    ok(len(ran) == 1, f"VS11 a cancelled queued validate_spec call never starts its check ({len(ran)} ran)")
     ok("validate_spec" in PROMPTS["draft_spec"],
        "VS5 the draft_spec prompt tells the drafter to check its draft with validate_spec before it finishes")
 
