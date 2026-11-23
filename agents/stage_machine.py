@@ -651,7 +651,6 @@ MAX_LANGUAGE_REPAIRS = 2
 # hb2: writer sessions inside WRITE that repair claim references (no round is spent on them)
 MAX_CLAIM_REPAIRS = 2
 CLAIM_REF_KINDS = ("report_claim_unresolved", "report_claim_id_raw", "report_claim_unrendered")
-CLAIM_REPAIR_DRAFT = "manuscript.before_claim_repair.md"     # the draft a repair session started from
 
 
 def require_judged(d: dict, opened: list | None = None) -> dict:
@@ -2673,6 +2672,7 @@ class Machine:
 
     def h_WRITE(self):
         mode = self.st.write_mode or "not_accepted"
+        self._recover_claim_repair()        # before the draft is read: a repair interrupted before its check
         self._world_model("refresh")
         fb = self.st.tries.get("language_feedback")             # a language repair (F6 S1-7)
         # F6 run 3: the write-up findings the fix loop left to this stage, with their remedies
@@ -2699,73 +2699,73 @@ class Machine:
         """hb2 (3 of 8 runs RUN_FAILED): a claim-reference finding in the draft (an id outside the ledger, a bare id,
         a reference left unrendered) is the writer's alone, and it was found only at the post-write gate, with no
         round left. It is repaired here, inside WRITE, before any gate, so it never costs a round: at most
-        MAX_CLAIM_REPAIRS writer sessions, each told the findings. What is left goes to the gate, which still
-        refuses it (non-declarable HIGH): a number with no ledger entry is never accepted.
-        A repair only turns references into references: one that leaves the draft empty, or adds any digit string
-        outside a reference (counted occurrence by occurrence, years included), is undone, and the finding stays
-        for the gate. The draft before each session is kept in CLAIM_REPAIR_DRAFT until that check has run, so a
-        crash in between is checked on resume (Codex r2 of #353). report.md is re-rendered after every session."""
-        pend = self.st.tries.get("claim_repair")
-        keys = [f"WRITE#{self._visit()}:{mode}:claims{n}" for n in range(1, MAX_CLAIM_REPAIRS + 1)]
-        if pend and (pend.get("key") not in keys or (self.st.journal.get(pend.get("key")) or {}).get("status")
-                     != "completed"):
-            # a resume of another visit, or of a session that never finished: check the draft it left, then go on
-            self._end_claim_repair(pend.get("key"))
-            render_report(self.run_dir, self.backend)
-            pend = None
-        for n, key in enumerate(keys, 1):
-            if pend and pend.get("key") != key:
-                continue                    # a resume: catch up to the session that was interrupted
+        MAX_CLAIM_REPAIRS writer sessions per draft, each told the findings, paid outside the write-up reserve (the
+        presentation review and the gate keep theirs). What is left goes to the gate, which still refuses it
+        (non-declarable HIGH): a number with no ledger entry is never accepted.
+        A repair only turns references into references (_claim_repair_undo): otherwise it is undone and the finding
+        stays for the gate. The draft before each session is kept in run_state.json until its check has run; a
+        session interrupted before its check is undone on resume (_recover_claim_repair). report.md is re-rendered
+        after every session."""
+        base = f"WRITE#{self._visit()}:{mode}:claims"
+        used = sum(1 for h in self.st.history if str(h.get("claim_repair_key", "")).startswith(base))
+        for n in range(used + 1, MAX_CLAIM_REPAIRS + 1):
             bad = [f for f in report_claim_findings(self.run_dir)
                    if f["severity"] == "HIGH" and f["kind"] in CLAIM_REF_KINDS]
-            if pend:                        # its session completed (journaled): replayed below, then checked
-                kinds, count, pend = pend.get("kinds") or [], pend.get("findings"), None
-            elif not bad:
+            if not bad:
                 return
-            else:
-                kinds, count = sorted({f["kind"] for f in bad}), len(bad)
-                _put(self.run_dir, CLAIM_REPAIR_DRAFT, open(os.path.join(self.run_dir, "manuscript.md")).read())
-                self.st.tries["claim_repair"] = {"key": key, "kinds": kinds, "findings": count}
-                save_state(self.run_dir, self.st)
+            key, before = f"{base}{n}", open(os.path.join(self.run_dir, "manuscript.md"), encoding="utf-8").read()
+            rec = {"claim_repair": n, "claim_repair_key": key, "state": "WRITE", "round": self.st.round,
+                   "kinds": sorted({f["kind"] for f in bad}), "findings": len(bad)}
+            self.st.tries["claim_repair"] = dict(rec, before=before)
+            save_state(self.run_dir, self.st)
             fs = [{"id": f"{f['kind']}:{f['key']}", "claim": f["claim"], "fix_requires": None, "repair": "claims"}
-                  for f in bad] or [{"id": "report_claim_repair:resumed", "claim": "resumed", "repair": "claims"}]
-            res = self._task(key, "write", self.run_dir, mode, writeup=True, findings=fs)
+                  for f in bad]
+            res = self._task(key, "write", self.run_dir, mode, findings=fs)
+            self.st.tries.pop("claim_repair", None)
             if res is None:                 # no session ran: the draft is as it was
-                self._end_claim_repair(None)
+                save_state(self.run_dir, self.st)
                 return
-            undone = self._end_claim_repair(key)
-            self.st.history.append({"at": _now(), "claim_repair": n, "claim_repair_key": key, "state": "WRITE",
-                                    "round": self.st.round, "kinds": kinds, "findings": count, "ok": bool(res.ok),
-                                    **({"undone": undone} if undone else {})})
+            undone = self._claim_repair_undo(before)
+            if undone:
+                _put(self.run_dir, "manuscript.md", before)
+            self.st.history.append(dict(rec, at=_now(), ok=bool(res.ok), **({"undone": undone} if undone else {})))
             save_state(self.run_dir, self.st)
             render_report(self.run_dir, self.backend)
             if not res.ok or undone:
                 return
 
-    def _end_claim_repair(self, key: str | None) -> list[str]:
-        """Check a finished repair session against the draft kept before it, restore that draft when the repair
-        emptied it or added a number, and clear the record. Returns why it was undone ([] when kept)."""
+    def _recover_claim_repair(self) -> None:
+        """A claim-repair session interrupted before its check (Codex r2-r3 of #353): its draft is undone from the
+        copy in run_state.json, and the session counts as used."""
+        rec = self.st.tries.pop("claim_repair", None)
+        if not isinstance(rec, dict) or not isinstance(rec.get("before"), str):
+            return
+        _put(self.run_dir, "manuscript.md", rec.pop("before"))
+        self.st.history.append(dict(rec, at=_now(), ok=False, undone=["interrupted before its check"]))
+        save_state(self.run_dir, self.st)
+
+    def _claim_repair_undo(self, before: str) -> list[str]:
+        """Why a repair is undone ([] when kept): the draft is missing, unreadable or empty; it lost more than a
+        fifth of its text outside references; or it holds a digit string outside a reference that the draft
+        before did not (counted per occurrence, years included; references read as the renderer reads them)."""
         import re
         from collections import Counter
-        from lib.safe_io import remove_nofollow
-        kp, mp = os.path.join(self.run_dir, CLAIM_REPAIR_DRAFT), os.path.join(self.run_dir, "manuscript.md")
-        why: list[str] = []
-        if key is not None and os.path.exists(kp):
-            before = open(kp).read()
-            after = open(mp).read() if os.path.isfile(mp) and not os.path.islink(mp) else ""
+        try:
+            after = open(os.path.join(self.run_dir, "manuscript.md"), encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError) as e:
+            return [f"the draft could not be read ({type(e).__name__})"]
+        if not after.strip():
+            return ["the repair left the draft empty"]
+        import render_claims as RCL
+        known = _ledger_claims(self.run_dir) or {}
 
-            def nums(t):
-                return Counter(re.findall(r"\d[\d,]*(?:\.\d+)?", re.sub(r"\[CLAIM:[^\]]*\]", " ", t)))
-            if not after.strip():
-                why = ["the repair left the draft empty"]
-            else:
-                why = [f"added number {x}" for x in sorted(nums(after) - nums(before))][:8]
-            if why:
-                _put(self.run_dir, "manuscript.md", before)
-        if os.path.exists(kp):
-            remove_nofollow(self.run_dir, CLAIM_REPAIR_DRAFT)
-        self.st.tries.pop("claim_repair", None)
-        return why
+        def prose(t):
+            return re.sub(r"\[CLAIM:[^\]]*\]", " ", RCL.normalise_refs(t, known))
+        if len(prose(after).split()) < 0.8 * len(prose(before).split()):
+            return ["the repair removed text other than references"]
+        added = Counter(re.findall(r"\d+(?:[.,]\d+)*", prose(after))) - Counter(re.findall(r"\d+(?:[.,]\d+)*",
+                                                                                            prose(before)))
+        return [f"added number {x}" for x in sorted(added)][:8]
 
     def h_PRESENTATION(self):
         # The review of the draft is part of the write-up: like WRITE, it may use the write-up reserve (an accepted
@@ -7306,16 +7306,20 @@ def _self_test_claim_refs(ok, td: str, spike, new_run) -> None:
         shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
                     os.path.join(d, "models", "claims_ledger.yaml"))
         m = Machine(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
-        real = m._task
+        real, reserve = m._task, []
 
         def _task(key, name_, *a, _real=real, **kw):
             if name_ == "write" and key.split(":")[-1].startswith("claims"):
+                reserve.append(bool(kw.get("writeup")))
                 return write(d, TaskResult)
             return _real(key, name_, *a, **kw)
         m._task = _task
         s = m.run()
         reps = [x for x in load_state(d).history if "claim_repair" in x]
         ok(s == want and check(d, reps), f"{name.upper()} {what} ({s}, {reps})")
+        if name == "cr6":
+            ok(reserve and not any(reserve), f"CR20 a repair is paid outside the write-up reserve, which the "
+                                             f"presentation review and the gate keep ({reserve})")
 
     def typed(d, TR):
         open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts 987654321 cases.\n")
@@ -7374,18 +7378,51 @@ def _self_test_claim_refs(ok, td: str, spike, new_run) -> None:
             return TR(True, None, 0.0, "")
         m = mk12(st, typed12)
 
-        def boom(key):
+        def boom(before):
             raise RuntimeError("killed before the check")
-        m._end_claim_repair = boom
+        m._claim_repair_undo = boom
         try:
             m.run()
         except RuntimeError:
             pass
-        s12 = mk12(load_state(d), lambda TR: None).run()
-        ok(s12 == "run_failed" and "987654321" not in open(os.path.join(d, "manuscript.md")).read()
-           and not os.path.exists(os.path.join(d, CLAIM_REPAIR_DRAFT)) and "claim_repair" not in load_state(d).tries,
-           f"CR12 a repair interrupted before its check is checked on resume: its typed number is undone ({s12})")
+        os.remove(os.path.join(d, "manuscript.md"))       # and the interrupted session had removed the draft
+        more = []
+
+        def again(TR):
+            more.append(1)
+            return TR(True, None, 0.0, "")
+        s12 = mk12(load_state(d), again).run()
+        ok(s12 == "run_failed" and len(more) == MAX_CLAIM_REPAIRS - 1
+           and "no.such.claim" in open(os.path.join(d, "manuscript.md")).read()
+           and "claim_repair" not in load_state(d).tries
+           and any("interrupted before its check" in str(h.get("undone")) for h in load_state(d).history),
+           f"CR12 a repair interrupted before its check is undone on resume, before the draft is read, and counts as "
+           f"one of the MAX_CLAIM_REPAIRS sessions ({s12}, {len(more)} more)")
     case("CR12", crash)
+
+    def partial(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
+        return TR(False, None, 0.0, "stub: stopped")
+
+    def code_ref(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts `uq.units_stable_90` cases.\n")
+        return TR(True, None, 0.0, "")
+    case("CR17", lambda: r1_machine("cr17", partial, "run_failed", lambda d, r: kept(d) and r and r[0].get("undone"),
+                                    "a repair that drops the draft's other text is undone"))
+    case("CR18", lambda: r1_machine("cr18", code_ref, "completed", lambda d, r: r and not r[0].get("undone"),
+                                    "a repair to a known id in inline code (digits in the id) is kept"))
+
+    def units3():
+        RCL = __import__("render_claims")
+        k = {"a.good": {"id": "a.good", "claim_kind": "scalar", "value": 5},
+             "note": {"id": "note", "claim_kind": "label", "value": "See [CLAIM:note]"}}
+        lf = "- ```sql\n  SELECT `a.good` FROM t\n  ```\n\nThen `a.good`.\n"
+        got = RCL.normalise_refs(lf, k)
+        ok(got == lf.replace("Then `a.good`", "Then [CLAIM:a.good]"),
+           f"CR21 a fence opened after a list marker is code, and the prose after it is still read ({got!r})")
+        q = RCL.quote_refs("[CLAIM:note]", k)
+        ok(q.upper().count("SEE") == 1 and "[CLAIM:" not in q, f"CR22 a rendered value is never substituted again ({q!r})")
+    case("CR21-CR22", units3)
 
 
 def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
