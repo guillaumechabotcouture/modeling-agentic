@@ -8,8 +8,8 @@ at the first gate, and the owner or lead decides each one. The **fix loop** is r
 step. The writer keeps its revision rounds. It also says how decision (b), #357, the new stability finding and the
 architecture wave's lead-amendment redesign (item 6) fit together.
 
-Counts and statuses only. This note quotes no run output value (burden, plan, cost of a plan, fit). The dollar
-figures are model API spend by harness stage, not values computed by a run.
+Counts, statuses and shares only. This note quotes no run output value (burden, plan, cost of a plan, fit) and no
+spend figure: model spend appears only as a share of total model spend.
 
 ## 1. Terms (defined once)
 
@@ -34,17 +34,17 @@ The ops files are outside the repository.
 
 ### 2.1 What the fix loop did (31 runs, 109 tasks)
 
-| what the task changed (`impact_ledger.jsonl` `files_changed`, harness files excluded) | tasks | passed its check | model spend |
+| what the task changed (`impact_ledger.jsonl` `files_changed`, harness files excluded) | tasks | passed its check | share of model spend (31 runs) |
 |---|---|---|---|
-| nothing | 82 | 6 | about $20 |
-| `manuscript.md` only (before #344 sent write-up findings to the writer) | 17 | 8 | about $7 |
-| `analysis_settings.yaml` | 2 | 0 | under $1 |
-| `models/ext/` (a markdown note, no code) | 1 | 0 | about $1 |
+| nothing | 82 | 6 | 9% |
+| `manuscript.md` only (before #344 sent write-up findings to the writer) | 17 | 8 | 3% |
+| `analysis_settings.yaml` | 2 | 0 | under 1% |
+| `models/ext/` (a markdown note, no code) | 1 | 0 | under 1% |
 | rethink (routed to SPEC or ENGINE_CHOICE; the run then ended) | 7 | – | – |
 
 - **No task changed a plan, a headline or a decision-test verdict.** One moved interval ends by about 1% (draws 400 → 401 to align two quantile estimators). Of the other settings change, one raised emulator design points, and the same finding fired again in the next run.
 - **Many briefs asked for model changes a task cannot make.** Examples: per-cohort coverage instead of one scale, a dose-dependence assumption, an expected-value objective instead of the posterior mode, trial-anchored effects. Every one of these took effect only across runs, through an owner amendment or a harness PR (#343 for the expected-value plan).
-- The fix loop took $36 of $217 of model spend (17%), and fix tasks took $29.
+- The fix loop took 17% of model spend, and fix tasks 13%.
 
 ### 2.2 Where the productive catches came from
 
@@ -62,11 +62,11 @@ Every one acted **across runs**, through a spec amendment or a PR. None acted th
 - **hb2, before #357:**
   - 6 of 6 allocation runs used all 3 rounds.
   - Rounds 2 and 3 re-ran both critics, with fix loops that planned 0 tasks (15 of 15 fix-loop visits). The only open HIGHs were `decision_test_changes_plan`, which is an owner question.
-  - Cost: about $12 over the six runs, and 23 owner-question visits (re-asked whenever a critic reworded a finding).
+  - Cost: about a quarter of those six runs' model spend, and 23 owner-question visits (re-asked whenever a critic reworded a finding).
 - **hb3 malaria, after #357** (2 runs):
   - Both ended `completed` (rule 4, post-write).
   - The plan-changing decision tests went to the lead at the first gate (rule 2o).
-  - 0 fix tasks ran. The fix loop cost only its planner call, under $0.25 a run.
+  - 0 fix tasks ran. The fix loop cost only its planner call, under 4% of each run's model spend.
   - Every round after the first was a **writer revision with a re-review**, and the re-reviews still found real slips (a test attributed to the wrong unit in the summary, wording about which part of the rule is robust).
   - One MEDIUM METHODS finding (the uncertainty interval draws the effect parameters but not the baseline rates) had no fix in scope. The planner declared it a harness gap and the writer disclosed it. That is a model-change finding handled as a caveat with no route to a change, which is the gap this design closes.
 
@@ -193,7 +193,7 @@ rates jointly with effects, from hb3.
 
 | option | what it keeps | evidence for | evidence against |
 |---|---|---|---|
-| keep as is | LLM planner and fix worker over settings and `models/ext/` | none in 109 tasks | 0 productive tasks; 82 changed nothing; $36 (17% of spend); 15 of 15 hb2 visits planned nothing |
+| keep as is | LLM planner and fix worker over settings and `models/ext/` | none in 109 tasks | 0 productive tasks; 82 changed nothing; 17% of model spend; 15 of 15 hb2 visits planned nothing |
 | scope to settings (LLM chooses settings) | the planner for the 4 leaves | 2 tasks changed settings | both were mechanical; an LLM choosing draws or seeds invites tuning a result; a rule does it more cheaply and with a record |
 | keep `models/ext/` | code extensions in the run | none (1 task, a markdown note, failed) | an extension bypasses the engine contract and its benchmarks; engine changes go through PRs (engine registry #367) |
 | **remove (recommended)** | the settings rules (§3.3) in harness code; the planner's useful outputs move elsewhere: the rethink patch to the amendment drafter, harness-gap declaration to the lane rules | §2.1, §2.3 | loses an LLM pass that sometimes classified findings well; the lane rules and the drafter cover that |
@@ -221,13 +221,13 @@ baseline confirms the change.**
 `--max-rounds N` stays as an alias, setting `max_revisions = N − 1`, so existing launch configs keep working. The
 gate's `rounds_remaining` is computed from the budget that applies to the open lanes.
 
-### 5.2 Effect on the runs we have (counts from the records; dollars are model spend)
+### 5.2 Effect on the runs we have (counts and shares from the records)
 
 | set | today | under this design |
 |---|---|---|
-| hb2 allocation runs (6) | 3 rounds each; rounds 2–3 re-ran critics with 0 tasks (about $12 in total); 23 owner visits | 1 analysis pass; owner questions at gate 1 (one request per gate, keyed answers); writer revisions as needed. About $2 a run saved, and the re-asked owner visits go (already mostly done by #357) |
-| hb3 malaria (2) | `completed`; 2 and 3 rounds, all after the first were writer revisions; fix loop = planner call only | the same path, minus the planner call (under $0.25 a run). The MEDIUM METHODS gap is filed as an H proposal instead of only a caveat |
-| fix loop over 31 runs | $36 model spend | $0; the drafter runs only when lane A is not empty (about $0.3–1 a call, the planner's cost) |
+| hb2 allocation runs (6) | 3 rounds each; rounds 2–3 re-ran critics with 0 tasks (about a quarter of their model spend); 23 owner visits | 1 analysis pass; owner questions at gate 1 (one request per gate, keyed answers); writer revisions as needed. About a quarter of each run's model spend saved, and the re-asked owner visits go (already mostly done by #357) |
+| hb3 malaria (2) | `completed`; 2 and 3 rounds, all after the first were writer revisions; fix loop = planner call only | the same path, minus the planner call (under 4% of a run's model spend). The MEDIUM METHODS gap is filed as an H proposal instead of only a caveat |
+| fix loop over 31 runs | 17% of model spend | none; the drafter runs only when lane A is not empty (about the planner's cost, a few percent of a run's spend) |
 | a run with an A-lane HIGH (for example the four Nigeria runs whose critics drove amendments) | the finding went to a fix task that could not act, or to a rethink that ended the run; the change came in a new launch, by hand, sometimes 17 h later | the proposal at gate 1; `amend_now` re-analyses in the same run with reuse. That adds one ANALYZE and one critique (minutes on the package-rate engine; hours and cloud cost on the malaria engine, so the cost field and the cap matter) |
 
 Time: removing the empty critique rounds saved most of the hb2 rounds-2-and-3 time, and #357 already captures
@@ -274,8 +274,8 @@ ANALYZE (+ settings step) → CRITIQUE → GATE ─ classify by lane
 - Same questions, two replicates, `--signoff lead`.
 - One arm uses this design. If the owner wants a direct comparison (open question 1), a second arm on two
   questions keeps `--fix-loop`.
-- Report per run: status; analysis passes, revisions and amendments; dollars by stage (fix-loop dollars should be
-  0); owner/lead visits; proposals by choice; amended runs whose plan, headline or verdict changed (now measurable
+- Report per run: status; analysis passes, revisions and amendments; share of spend by stage (the fix-loop share should
+  be 0); owner/lead visits; proposals by choice; amended runs whose plan, headline or verdict changed (now measurable
   inside one run); share of A-lane findings with a link; the settings probe actions; wall time.
 - **Smoke markers:**
   - `findings.jsonl~"lane"`;
