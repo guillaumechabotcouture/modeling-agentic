@@ -167,6 +167,25 @@ def _close(a, b) -> bool:
     return abs(float(a) - float(b)) <= REPLAY_RTOL * max(abs(float(b)), 1.0)
 
 
+def _well_formed(per_draw) -> bool:
+    """Every stored draw is {package: {units: int, cost: finite number, averted: finite number}}."""
+    import math
+    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)  # noqa: E731
+    return isinstance(per_draw, list) and all(
+        isinstance(d, dict) and all(isinstance(e, dict) and isinstance(e.get("units"), int)
+                                    and not isinstance(e.get("units"), bool) and num(e.get("cost"))
+                                    and num(e.get("averted")) for e in d.values()) for d in per_draw)
+
+
+def _sums_match(per: dict, total, key: str = "averted") -> bool:
+    """The package subtotals of one draw add up to its total, compared at the subtotals' own scale (benefits and
+    harms can cancel, so the rounding is that of the largest subtotal, not of the total)."""
+    import math
+    vals = [float(e[key]) for e in per.values()]
+    scale = max([abs(float(total)), 1.0] + [abs(v) for v in vals])
+    return abs(math.fsum(vals) - float(total)) <= REPLAY_RTOL * scale
+
+
 def _same_sums(a: dict, b: dict) -> bool:
     return set(a) == set(b) and all(a[k]["units"] == b[k]["units"] and _close(a[k]["cost"], b[k]["cost"])
                                     and _close(a[k]["averted"], b[k]["averted"]) for k in a)
@@ -188,17 +207,31 @@ def _replay_stored(A, plan, uq, stored, log=None) -> dict:
     want = (uq.get("fixed_plan") or {}).get(A.primary) or {}
     tot, per = list(stored.get("primary_averted") or []), list(stored.get("per_draw") or [])
     k = min(REPLAY_CHECK_DRAWS, nd)
-    why = None
+    costs = (uq.get("affordability") or {}).get("per_draw_cost") or []
+    why, checked = None, 0
     if stored.get("schema") != STORED_SCHEMA or stored.get("draws") != nd or stored.get("seed") != seed \
             or len(tot) != nd or len(per) != nd:
         why = "the stored draws are not this uncertainty step's (schema, number of draws or seed differ)"
     elif stored.get("primary") != A.primary or {str(i): v for i, v in (stored.get("plan") or {}).items()} \
             != {i: plan[i] for i in A.ids}:
         why = "the stored draws are for another plan or primary outcome"
+    elif not _well_formed(per) or not all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in tot):
+        why = "the stored draws are malformed (a package entry lacks units, cost or averted, or is not numeric)"
+    elif len(costs) != nd:
+        why = "the uncertainty record has no per-draw plan cost to check the stored costs against"
     else:
-        bad = [d for d in range(nd) if not _close(sum(e["averted"] for e in per[d].values()), tot[d])]
+        # Codex r1 P1-1: every draw's package costs add up to the plan cost the uncertainty step recorded for it
+        # (affordability.per_draw_cost), and its package outcomes to its stored total
+        bad = [d for d in range(nd) if not _sums_match(per[d], tot[d])]
+        badc = [d for d in range(nd) if not _sums_match(per[d], costs[d], key="cost")]
+        badu = [d for d in range(nd) if sum(e["units"] for e in per[d].values()) != len(A.ids)]
         if bad:
             why = f"{len(bad)} stored draws' package sums do not add up to their total (e.g. draw {bad[0]})"
+        elif badc:
+            why = (f"{len(badc)} stored draws' package costs do not add up to the plan cost the uncertainty step recorded "
+                   f"(e.g. draw {badc[0]})")
+        elif badu:
+            why = f"{len(badu)} stored draws do not count every unit once (e.g. draw {badu[0]})"
     if why is None:
         D = UQ.Drawer(A, seed)
         D.prepare(nd)
@@ -210,13 +243,15 @@ def _replay_stored(A, plan, uq, stored, log=None) -> dict:
             t = sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][plan[i]][A.primary] for i in A.ids)
             if not (_close(t, tot[d]) and _same_sums(_package_sums(A, plan, out, cost), per[d])):
                 why = f"draw {d}, re-evaluated, does not give the stored values"
+                checked += 1
                 break
+            checked += 1
             P.step()
     got = q(tot, lvl) if why is None else {}
     if why is None and not (want and all(_close(got[x], want[x]) for x in ("median", "ci_low", "ci_high"))):
         why = "the stored draws do not give the stored fixed-plan interval"
     return {"draws": nd, "seed": seed, "level": lvl, "reproduced": why is None, "replayed": got, "stored": want,
-            "per_draw": per, "method": "stored_draws", "checked_draws": k, **({"reason": why} if why else {})}
+            "per_draw": per, "method": "stored_draws", "checked_draws": checked, **({"reason": why} if why else {})}
 
 
 def replay(A, plan, uq: dict, stored: dict | None = None, log=None) -> dict:
@@ -822,16 +857,63 @@ def _self_test_stored_draws(ok, q):
         r3 = replay(A, {i: A.comp for i in A.ids}, uq, stored=st)
         ok(r2["reproduced"] is False and r3["reproduced"] is False,
            f"FD25 stored draws of another seed or another plan are not used ({r2.get('reason')}; {r3.get('reason')})")
-        bad = copy.deepcopy(st)
+        bad = copy.deepcopy(st)          # Codex r1 P3-10: the last total and its package sum moved together
         bad["primary_averted"][-1] += 1e6
+        next(iter(bad["per_draw"][-1].values()))["averted"] += 1e6
         r4 = replay(A, plan, uq, stored=bad)
         bad = copy.deepcopy(st)
         e = next(iter(bad["per_draw"][-1].values()))
         e["averted"] += 1.0
         r5 = replay(A, plan, uq, stored=bad)
-        ok(nd > k and r4["reproduced"] is False and r5["reproduced"] is False,
+        ok(nd > k and r4["reproduced"] is False and "interval" in (r4.get("reason") or "")
+           and r5["reproduced"] is False and "add up" in (r5.get("reason") or ""),
            f"FD26 an unchecked draw is still checked: its total against the stored interval, its package sums against "
            f"its total ({r4.get('reason')}; {r5.get('reason')})")
+        # Codex r1 P1-1: an unchecked draw's package cost is checked against the draw's fixed-plan cost
+        bad = copy.deepcopy(st)
+        next(iter(bad["per_draw"][-1].values()))["cost"] *= 1000.0
+        r6 = replay(A, plan, uq, stored=bad)
+        ok(r6["reproduced"] is False and "cost" in (r6.get("reason") or ""),
+           f"FD27 a stored package cost that is not the draw's recorded plan cost is caught ({r6.get('reason')})")
+        # Codex r1 P2-3: a malformed row withholds the intervals with a reason; it does not abort the figures
+        bad = copy.deepcopy(st)
+        del next(iter(bad["per_draw"][-1].values()))["averted"]
+        try:
+            r7 = replay(A, plan, uq, stored=bad)
+            ok(r7["reproduced"] is False and "malformed" in (r7.get("reason") or ""),
+               f"FD28 a malformed stored draw is not reproduced, with the reason ({r7.get('reason')})")
+        except Exception as e:  # noqa: BLE001 -- the failing case
+            ok(False, f"FD28 a malformed stored draw is not reproduced, with the reason ({type(e).__name__}: {e})")
+        # Codex r1 P3-9: checked_draws counts the evaluations actually run
+        ok(r2.get("checked_draws") == 0, f"FD29 refused stored draws report no checked draw ({r2.get('checked_draws')})")
+    # Codex r1 P2-4: package subtotals of benefits and harms that cancel still add up to the draw's total
+    big, n = 1000000.0, 1000
+    per = {"a": {"units": n, "cost": 1.0, "averted": 0.0}, "b": {"units": n, "cost": 1.0, "averted": 0.0}}
+    tot = 0.0
+    for _ in range(n):
+        per["a"]["averted"] += big
+        per["b"]["averted"] += -999999.9999999
+        tot += big
+        tot += -999999.9999999
+    ok(_sums_match(per, tot), "FD30 package subtotals that cancel are compared at their own scale")
+    # Codex r1 P1-2: figure_data records the hash of the sidecar bytes it used, whatever the file holds afterwards
+    import hashlib
+    with tempfile.TemporaryDirectory() as d:
+        RUN._direct_toy(d)
+        signoff.sign(d, "lead")
+        used, orig = {}, RUN.FD.compute
+
+        def swapping(*a, **kw):
+            used["sha"] = hashlib.sha256(json.dumps(kw.get("stored")).encode()).hexdigest()
+            open(os.path.join(d, STORED_REL), "w").write("{}")      # replaced while the figure step reads
+            return orig(*a, **kw)
+        RUN.FD.compute = swapping
+        try:
+            RUN.run(d, log=q)
+        finally:
+            RUN.FD.compute = orig
+        rec = (yaml.safe_load(open(os.path.join(d, "analysis", "figure_data.yaml"))).get("inputs") or {}).get(STORED_REL)
+        ok(rec == used.get("sha"), "FD31 figure_data records the sha256 of the sidecar bytes the figure step used")
 
 
 if __name__ == "__main__":

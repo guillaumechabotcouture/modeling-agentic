@@ -519,9 +519,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     fd_stored, fd_in = None, []
     if model.kind == "direct" and u["data"].get("draws"):
         from toolkit.analysis.artifacts import _safe_io
-        fd_stored = json.loads(json.dumps(plain(FD.stored_record(u["plan_draws"]))))
-        _safe_io().write_nofollow(run_dir, FD.STORED_REL, json.dumps(fd_stored).encode(), atomic=True)
-        fd_in = [os.path.join(run_dir, FD.STORED_REL)]
+        import hashlib
+        raw = json.dumps(plain(FD.stored_record(u["plan_draws"]))).encode()
+        fd_stored = json.loads(raw)
+        _safe_io().write_nofollow(run_dir, FD.STORED_REL, raw, atomic=True)
+        # Codex r1 P1-2: the hash of the bytes the figure step reads, not of whatever the file holds when recorded
+        fd_in = [(os.path.join(run_dir, FD.STORED_REL), hashlib.sha256(raw).hexdigest())]
     fdat = FD.compute(A, plan, out0, ben0, cost0, u["data"], z0, log=log, events=events0, stored=fd_stored)
     arts["figure_data"] = S.write("figure_data", fdat, FD.PRODUCER, [arts["point"], arts["uncertainty"]] + fd_in)
     rend = FG.render(run_dir)

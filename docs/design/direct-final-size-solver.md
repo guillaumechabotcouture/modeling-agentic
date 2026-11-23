@@ -24,15 +24,22 @@ with z, s and e as fractions of N_i, s the susceptible share after the intervent
 ## What changes
 
 - `CompartmentalEngine.run_batch`: when `final_generations` holds and `importation: deterministic`, solve the
-  relation for the whole batch at once (arrays B x G). Start the fixed-point iteration at z = e, which gives the
-  minimal root (only what the seeds reach), and stop it at the same `tol` the stop rule uses. Then polish with a
-  vectorised Newton step on the members whose iteration converged slowly (near-critical members). A member that
-  converges to neither fails closed, as the step cap does now.
+  relation for the whole batch at once (arrays B x G), on the groups the seeds reach. With e > 0 on those groups
+  (C irreducible there), the relation has a single root in [e, s]. The map T(z) = s − (s − e) exp(−q C z) is
+  monotone, so iterating from the lower bound z = e and from the upper bound z = s brackets the root from both
+  sides. Stop when the bracket is narrower than `tol` in every group: that is a bound on the error. A step-size test
+  is not enough. With a 1e-12 seed in a growing epidemic, the first step from e changes z by about 1e-12 while the
+  root is about 0.8 (Codex review). Speed up the bracket with a vectorised Newton step on the upper iterate, kept
+  only while it stays inside the bracket. A member whose bracket does not close within the iteration cap fails
+  closed, as the step cap does now.
 - Unchanged: the interventions (`apply_component`, doses and wasted doses: `cost_drivers`), `s_first`, p_major,
   the per-group outcome ratios and `Outcomes` itself. `meta.converged` stays. `meta.steps` becomes the iteration
   count, and the card says so.
 - `run_series()` (figure timing) and every other mode keep the Starsim simulation. The sim also stays as the
   benchmark path: a new pack case asserts that solver and sim agree within `tol` on every final-size configuration.
+- The solver code lives in `engine.py`, which `engine_identity()` fingerprints. It does not import
+  `benchmarks/oracles.py`: that directory is outside the engine fingerprint, so a change there would move results
+  without moving the identity. It would also stop the oracle from being an independent check.
 - Card mechanism line: "final_size: per-capita outcomes from the multigroup final-size relation, solved directly;
   the simulation gives the timing".
 
@@ -44,15 +51,20 @@ identical: **engine 0.2 → 0.3**, with a new code sha256 in `engine_identity`. 
 
 ## What re-runs
 
-- **Analytic pack** (`benchmarks/results.yaml`): re-run in full on 0.3 (about two minutes locally). FS1–FS4, AS1
-  and AS7 compare against the oracles at `abs 1e-6` or tighter and should land closer to them.
-- **Coverage pack** (`coverage_results.yaml`, 200 replicates per case on a VM): `compat_proof.py prove` shows byte
-  identity for every configuration that does not take the new path. Those rows are re-stamped (`restamp`); the
-  final-size configurations are re-run on the VM. `prove` needs one addition: it must classify cases by path and
-  restamp only the identical ones. Today it requires every case to be identical.
+- **Analytic pack** (`benchmarks/results.yaml`): re-run in full on 0.3 (about two minutes locally). It needs new
+  cases first. FS1–FS4 run configurations without `final_size: true` (FS1a runs `r0_1p5` on `single_day`), and AS7
+  compares two engine arms, so neither covers the solver against an independent oracle. Add solver-enabled
+  configurations of the FS1 (Lambert), FS3 (rank-one) and multigroup ODE final-size cases, at `abs 1e-6` or tighter
+  (the `ode_final_size` cases already use 5 groups).
+- **Coverage pack** (`coverage_results.yaml`, 200 replicates per case on a VM): its rows were computed by 0.1 and
+  re-stamped to 0.2 (`restamped.old_identity.version: 0.1`). `restamp` checks the proof's old identity against the
+  identity that computed the rows (`compat_proof.py` near line 244), so a 0.2 → 0.3 proof alone is refused. There
+  are two ways forward. One: `compat_proof` accepts a chain of committed proofs (0.1 → 0.2 → 0.3) and classifies
+  cases by path, re-stamping only the byte-identical ones. Two: re-run the coverage pack on the VM. The second is
+  simpler, and its cost should be measured before choosing. Either way, the final-size configurations re-run.
 - **CP8** binds the live calibrator files (`CALIBRATOR_FILES`: `toolkit/analysis/calibration.py`,
-  `observation.py`, `oracles.py`) to the committed proof. The solver lives in `engine.py` and copies nothing from
-  `oracles.py` (it may import it read-only, or reimplement it). None of those files changes, so CP8 holds without
+  `observation.py`, `oracles.py`) to the committed proof. The solver lives in `engine.py` and neither copies nor imports
+  `oracles.py`. None of those files changes, so CP8 holds without
   a new calibrator-code proof. `compat_proof.yaml` is regenerated against the 0.3 identity.
 - **Eligibility**: `benchmark_coverage.yaml` and the engine-eligibility check read the re-stamped results. They
   need no other change.
