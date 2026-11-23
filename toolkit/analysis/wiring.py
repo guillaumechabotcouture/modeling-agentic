@@ -28,7 +28,9 @@ Inputs (one row each in analysis/wiring.yaml):
                  holds fixed by name is `held_fixed` with the spec's reason.
 An end equal to the point value (a range like [1, 1]) perturbs nothing and is dropped; an input with no other end is
 `not_perturbed`. An input whose effect could only show through packages the run pruned (spec components in no
-package) and that moved nothing is `not_applicable`.
+package) and that moved nothing is `not_applicable`. A parameter that is not an engine parameter (a calibration
+measurement or bias parameter) is `calibration_only`; an input whose evaluation raised is `not_evaluated` with the
+error (both recorded, no finding: advisory).
 Outputs: every spec outcome under every package, and every package's cost, per unit. An end's change in one output
 is sum_i |y_i(end) - y_i(point)| / sum_i |y_i(point)| (no cancellation across units).
 
@@ -63,7 +65,7 @@ if ROOT not in sys.path:
 PRODUCER = "toolkit/analysis/wiring.py"
 FINDING = "input_not_wired"
 VERDICTS = ("wired", "below_noise_floor", "not_wired", "not_checked", "emulator_unverified", "not_perturbed",
-            "not_applicable", "not_model_input", "test_not_run", "held_fixed")
+            "not_applicable", "not_model_input", "test_not_run", "held_fixed", "calibration_only", "not_evaluated")
 FAILING = ("below_noise_floor", "not_wired", "not_checked", "emulator_unverified")
 PARAM_TESTS = ("parameter_value", "prior_range", "fitted_range")
 NOT_INPUT_TESTS = ("group_rule", "envelope", "boundary_engine")
@@ -282,19 +284,31 @@ def run(A, rec, dts, z0, ben0) -> dict:
         return dict({"max_rel_change": None, "moves": [], "n_outputs_moved": 0}, **kw)
 
     rows = []
+    eng = getattr(A, "eng", None)
+    eng_names = {q.name for q in eng.parameters()} if eng is not None else None
     for p, r in sorted(_param_inputs(A, dts).items()):
         p0 = A.theta0.get(p)
-        ends = [v for v in r["ends"] if p0 is None or not _same(v, p0)]
-        chs = {v: measure(dict(A.theta0, **{p: float(v)}), recal=True) for v in ends}
-        tried = bool(r["ends"])
-        for wc in r["with_cases"]:
-            b_theta = dict(A.theta0, **wc["with"])
-            vals = [v for v in wc["values"] if not _same(v, b_theta.get(p))]
-            tried = tried or bool(wc["values"])
-            if vals:
-                s0 = sig_at(b_theta)
-                for v in vals:
-                    chs[f"{v:g} with {wc['test']}"] = changes(s0, sig_at(dict(b_theta, **{p: float(v)})))
+        if eng_names is not None and p not in eng_names:
+            # a calibration (measurement or bias) parameter: no engine input to set; its decision test refits the
+            # calibration (open item: that refit is not read here)
+            rows.append(dict(name=p, point=p0, **r, **blank(verdict="calibration_only")))
+            continue
+        try:
+            ends = [v for v in r["ends"] if p0 is None or not _same(v, p0)]
+            chs = {v: measure(dict(A.theta0, **{p: float(v)}), recal=True) for v in ends}
+            tried = bool(r["ends"])
+            for wc in r["with_cases"]:
+                b_theta = dict(A.theta0, **wc["with"])
+                vals = [v for v in wc["values"] if not _same(v, b_theta.get(p))]
+                tried = tried or bool(wc["values"])
+                if vals:
+                    s0 = sig_at(b_theta)
+                    for v in vals:
+                        chs[f"{v:g} with {wc['test']}"] = changes(s0, sig_at(dict(b_theta, **{p: float(v)})))
+        except Exception as e:  # noqa: BLE001 -- advisory: this input is recorded as not evaluated, the rest go on
+            rows.append(dict(name=p, point=p0, **r, **blank(verdict="not_evaluated",
+                                                            error=f"{type(e).__name__}: {e}"[:300])))
+            continue
         if chs:
             res = _verdict(chs, floor, th, emu)
         elif tried:
@@ -632,6 +646,15 @@ def _self_test() -> int:
            "WR19 advisory: a recording problem never fails the evaluation, and a check that fails is recorded")
     finally:
         rec.close()
+    A, o, b, c = _toy(fn=lambda th: (1 / 0) if th.get("boom", 0.5) != 0.5 else 1.0)
+    A.fr["boom"], A.theta0["boom"] = (0.0, 1.0, 0.5), 0.5
+    A.fr["se"], A.theta0["se"] = (0.6, 0.9, 0.8), 0.8
+    A.eng = type("E", (), {"parameters": lambda self: [type("Q", (), {"name": n})() for n in ("eff", "boom")]})()
+    W = check(A, o, b, c)
+    ok(by(W)[P("se")]["verdict"] == "calibration_only" and by(W)[P("boom")]["verdict"] == "not_evaluated"
+       and "ZeroDivisionError" in by(W)[P("boom")]["error"] and by(W)[P("eff")]["verdict"] == "wired"
+       and keys(W) == [],
+       "WR21 a calibration-only parameter is never set on the engine, and one input that raises never stops the rest")
     from toolkit.analysis.artifacts import EXPECTED_KINDS
     ok("wiring" not in EXPECTED_KINDS,
        "WR20 a manifest from before the check is not required to hold a wiring artifact (expected per run only)")
