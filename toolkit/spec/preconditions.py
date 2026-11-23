@@ -109,7 +109,15 @@ def _net_effect_posterior(run_dir, spec, signer) -> list:
     return out
 
 
-CHECKS = {"benchmark_eligibility": _benchmark_eligibility, "net_effect_posterior": _net_effect_posterior}
+def _calibration_scale(run_dir, spec, signer) -> list:
+    """The calibration scale resolves on every engine the spec may run (toolkit/spec/schema.py
+    spec_scale_problems): signing, launch and the analysis's validation all run it (Codex r3 of #334, P1-1)."""
+    from toolkit.spec import schema
+    return schema.spec_scale_problems(spec)
+
+
+CHECKS = {"benchmark_eligibility": _benchmark_eligibility, "net_effect_posterior": _net_effect_posterior,
+          "calibration_scale": _calibration_scale}
 CONTEXT_CHECKS: set = set()          # checks called with the context: fn(run_dir, spec, signer, spec_bytes=, mode=, ...)
 
 

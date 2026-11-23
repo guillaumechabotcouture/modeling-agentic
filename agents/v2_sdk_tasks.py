@@ -23,6 +23,9 @@ from agents.fix_loop import FIX_EDITABLE, FIX_PLANNER_PROMPT, task_scope
 
 TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"]
 OUT = "_task_output.json"
+# baseline hb1: 4 of 10 runs lost a SPEC try to the 30-turn cap (the draft reads inputs, writes derivations and
+# iterates); the spec draft gets its own cap, still bounded by the call's dollar allowance.
+SPEC_MAX_TURNS = 60
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
@@ -76,7 +79,12 @@ parameter, never on a unit attribute bound to data. Note what each derivation do
 data/README.md. Every file the spec cites is a staged input or a derived output; paths are relative
 to the run directory. When the options use a component whose effect depends on decision inputs
 (each engine's decision_inputs.yaml), name the evidence dossier: `evidence: {{dossier:
-evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Output:
+evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Two
+rules the check refuses often: a decision test's `text` has no digits (it says in words what the
+test asks; the values tested are rendered from computed claims); and `engine_parameters` gives no
+value for a parameter the engine card lists as calibrated or fitted (calibrate a calibrated one
+under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
+it out). Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """
@@ -458,7 +466,7 @@ class SdkTasks:
     (crashed_session_cost); when it cannot be, the whole allowance. Never $0 for a call that ran.
     Every charge is also written to budget_ledger.json."""
 
-    def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int = 30,
+    def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int | None = None,
                  query_fn=None, io_root: str | None = None):
         self.run_dir = os.path.abspath(run_dir)
         # lib.safe_io's trusted root: the run dir. A world-model seed session runs in <run>/world_model/seed/, and
@@ -468,15 +476,24 @@ class SdkTasks:
         self.cap = task_cap_usd
         self.allowance = task_cap_usd
         self.readback = 0.0          # no read-back unless the machine grants a budget for it
-        self.turns = max_turns
+        if max_turns is not None and (not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1):
+            # Codex r4 P1-8: the SDK passes --max-turns only for a truthy value, so 0 would mean no limit at all
+            raise ValueError(f"max_turns must be a positive integer, got {max_turns!r}")
+        self.turns = 30 if max_turns is None else max_turns
+        self.turns_explicit = max_turns is not None      # a caller's cap holds for every task (Codex r1 P1-5)
         self.query_fn = query_fn
         self.n = 0
+
+    def turns_for(self, kind: str) -> int:
+        """The turn cap of one session: the caller's cap when it gave one; else SPEC_MAX_TURNS for the spec draft and
+        the default of 30 for the others."""
+        return SPEC_MAX_TURNS if kind == "draft_spec" and not self.turns_explicit else self.turns
 
     def for_run_dir(self, run_dir: str) -> "SdkTasks":
         """The same tasks for another run dir (lead-gaps β: the child run a provisional lead amendment continues in),
         with this one's settings; its own budget ledger is the child's."""
-        return SdkTasks(run_dir, allow_cloud=self.cloud, task_cap_usd=self.cap, max_turns=self.turns,
-                        query_fn=self.query_fn)
+        return SdkTasks(run_dir, allow_cloud=self.cloud, task_cap_usd=self.cap,
+                        max_turns=self.turns if self.turns_explicit else None, query_fn=self.query_fn)
 
     def set_allowance(self, usd: float, readback_usd: float | None = None) -> None:
         """The call's dollar cap, and the cap of one crash read-back (0: none; the whole allowance
@@ -522,7 +539,7 @@ class SdkTasks:
 
         opts = ClaudeAgentOptions(system_prompt=system, model=model or enforcement.MODEL_DEEP, tools=TOOLS,
                                   allowed_tools=TOOLS, permission_mode="bypassPermissions", cwd=self.run_dir,
-                                  max_turns=self.turns, max_budget_usd=allowance, setting_sources=[],
+                                  max_turns=self.turns_for(kind), max_budget_usd=allowance, setting_sources=[],
                                   env=enforcement.filtered_env(dict(os.environ), self.cloud),
                                   hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[pre])]})
 
@@ -678,7 +695,8 @@ class SdkTasks:
     def world_model_seed(self, run_dir, ctx, feedback, cap_usd):
         """The stage machine's PREREGISTER seed (docs/design/v2c-orchestration.md §14): one session in `run_dir`
         (the run's world_model/seed/), capped at `cap_usd`, through the same adapter the trials use."""
-        t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir)
+        t = SdkTasks(run_dir, task_cap_usd=cap_usd, query_fn=self.query_fn, io_root=self.run_dir,
+                     max_turns=self.turns if self.turns_explicit else None)     # a caller's cap holds (Codex r2 P1-6)
         t.set_allowance(cap_usd)
         return t.seed_world_model(ctx, feedback)
 

@@ -69,6 +69,14 @@ def _sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def patch_sha256(patch) -> str:
+    """The patch's content digest, recorded in the child's metadata: a lead recovering an interrupted hand-off adopts
+    only the child its request's patch made (Codex r2 of #349)."""
+    # in the patch's own key order (a YAML patch may mix key types, which do not sort: Codex r3); the request's patch
+    # is read back from the same JSON in the same order
+    return _sha(json.dumps(patch, default=str).encode())
+
+
 def _derived_paths() -> set:
     """Files the harness writes after SIGN: typed analysis artifacts, the manifest, geometry sign-off, models/ outputs."""
     from toolkit.analysis import artifacts as A
@@ -385,6 +393,17 @@ def dry_sign(child: str, by: str, expect: dict) -> dict:
             return {"ok": False, "by": by, "error": str(e)[:3000]}
 
 
+def _guards(rd: str, raw: dict) -> list:
+    """What must hold before anything reads the patched spec's files or builds its engine (Codex r3 on #342): every
+    cited path inside the run (h_SPEC's record_cited_inputs) and the named engine's signed configuration within its
+    limits (analysis_backend.signed_config_problems)."""
+    if os.path.join(ROOT, "agents") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "agents"))
+    import analysis_backend as AB
+    import stage_machine as SM
+    return list(SM.record_cited_inputs(rd)) + list(AB.signed_config_problems(raw))
+
+
 def _pre_sign(rd: str, derived) -> tuple:
     """(problems, candidate rows): the backend's pre-sign checks and the geometry check, as h_SPEC runs them."""
     if os.path.join(ROOT, "agents") not in sys.path:
@@ -460,7 +479,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
         changes += dch
     if spec1 == spec0 and dossier is None:
         raise AmendError("the patch changes nothing")
-    label = str(p.get("id") or "unnamed")
+    label, psha = str(p.get("id") or "unnamed"), patch_sha256(p)     # before anything is made
     reason1 = " ".join(p["reason"].split())
     new_spec = _dump(spec1, spec_bytes, f"Amendment {label} by {PRODUCER} from parent spec sha256 "
                                         f"{signed or _sha(spec_bytes)}: {reason1}")
@@ -487,8 +506,9 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
             mode0 = os.stat(os.path.join(stage, rel)).st_mode & 0o777
             write_nofollow(stage, rel, data, atomic=True)
             os.chmod(os.path.join(stage, rel), mode0)
-        sp = schema.load(os.path.join(stage, SPEC), data=new_spec)
-        errs = list(schema.validate(sp, pending_ok=True))
+        errs = _guards(stage, spec1)       # before the schema reads a cited file or builds the engine (Codex r3)
+        if not errs:
+            errs = list(schema.validate(schema.load(os.path.join(stage, SPEC), data=new_spec), pending_ok=True))
         if not errs:               # what h_SPEC checks before SIGN (backend pre-sign checks, geometry)
             errs, cands = _pre_sign(stage, st.get("derived_inputs"))
         if errs:
@@ -500,7 +520,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     pin = pipeline_id.code_pin(repo)
     meta = {"pipeline": "v2", "question": st.get("question"), "signoff": mode, "max_rounds": st.get("max_rounds"),
             "parent_run": {"run_dir": parent, "run_state_sha256": st_sha}, "parent_spec_sha256": signed,
-            "parent_spec_signed": bool(signed), "code_pin": pin, "amendment": label,
+            "parent_spec_signed": bool(signed), "code_pin": pin, "amendment": label, "patch_sha256": psha,
             "producer": PRODUCER, "created": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
     write_nofollow(child, "metadata.json", json.dumps(meta, indent=2).encode(), atomic=True)
     rounds = st.get("max_rounds") if type(st.get("max_rounds")) is int and st["max_rounds"] > 0 else 3
@@ -768,6 +788,45 @@ def _self_test() -> int:
             refused(lambda: amend(par, pf, log=lambda *a: None), f"AM_BAD_PATCH_REFUSED {name}")
         ok(sorted(os.listdir(td)) == n_dirs and tree(par) == before,
            "AM_BAD_PATCH_REFUSED leaves no child and the parent unchanged")
+        # Codex r3 on #342 (P1-3): a patch naming a file outside the run, or an engine configuration over its limit, is
+        # refused before the schema reads the file or builds the engine
+        import analysis_backend as AB_
+        w(td, "outside/units.csv", open(os.path.join(par, "units.csv")).read())
+        real_validate, seen, n0 = schema.validate, [], sorted(os.listdir(td))
+        schema.validate = lambda sp, *a, **k: seen.append(sp.raw) or real_validate(sp, *a, **k)
+        try:
+            for name, op, why in (
+                    ("outside", {"set": "decision_units.csv", "value": os.path.join(td, "outside", "units.csv")},
+                     "outside the run directory"),
+                    ("engine limit", {"set": "engine", "value": {"ref": AB_.EMPIRICAL, "config": {"components": [
+                        f"c{i}" for i in range(AB_.EMPIRICAL_MAX_COMPONENTS + 1)]}}}, "at most")):
+                yaml.safe_dump({"reason": "r", "spec": [op]}, open(pf, "w"))
+                try:
+                    amend(par, pf, log=lambda *a: None)
+                    got = None
+                except AmendError as e:
+                    got = str(e)
+                ok(got is not None and why in got and not seen and sorted(os.listdir(td)) == n0,
+                   f"AM_GUARDS_BEFORE_VALIDATE {name}: refused before the schema reads the patched spec "
+                   f"({(got or '')[:120]}; validated {len(seen)})")
+                seen.clear()
+        finally:
+            schema.validate = real_validate
+        shutil.rmtree(os.path.join(td, "outside"))
+        # Codex r3 of #349: a patch with mixed key types (YAML) has a digest; no half-made child is left
+        open(pf, "w").write("reason: r\nspec:\n- set: options.prices.index\n  value: {'2024': 1.0, 2025: 1.03}\n")
+        try:
+            got = amend(par, pf, log=lambda *a: None).get("child")
+        except AmendError:
+            got = None
+        except Exception as e:  # noqa: BLE001 -- the finding
+            got = f"{type(e).__name__}: {e}"
+        half = [c for c in sorted(os.listdir(td)) if c.startswith("parent.amend")
+                and not os.path.isfile(os.path.join(td, c, "metadata.json"))]
+        ok((got is None or os.path.isdir(str(got))) and not half,
+           f"AM_PATCH_DIGEST_MIXED_KEYS a YAML patch with mixed key types leaves no half-made child ({got}, {half})")
+        if got and os.path.isdir(str(got)):
+            shutil.rmtree(got)
         yaml.safe_dump({"reason": "r", "spec": [{"set": "constraints.envelope_usd", "value": 9200}]}, open(pf, "w"))
         st = json.load(open(os.path.join(par, "run_state.json")))
         w(par, "run_state.json", json.dumps(dict(st, state="ANALYZE", status=None, paused=None)))

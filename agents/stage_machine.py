@@ -72,8 +72,9 @@ EDGES = {
     "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "FINAL"},
     "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "WRITE", "OWNER_DECISION", "FINAL"},
     "OWNER_DECISION": {"GATE", "OWNER_DECISION", "FINAL"},
+    # hb1 cause G: a draft revised for write-up findings as a new round is re-reviewed (CRITIQUE) before the gate
     "WRITE": {"PRESENTATION", "GATE", "FINAL"},
-    "PRESENTATION": {"GATE", "FINAL"},
+    "PRESENTATION": {"GATE", "CRITIQUE", "FINAL"},
     "FINAL": set(),
 }
 LLM_STATES = ("SPEC", "ENGINE_CHOICE", "CRITIQUE", "FIX_LOOP", "PRESENTATION")
@@ -186,10 +187,15 @@ def _put(run_dir: str, rel: str, text: str) -> None:
     write_nofollow(run_dir, rel.replace(os.sep, "/"), text.encode("utf-8"), atomic=True)
 
 
+def _state_bytes(st: RunState) -> bytes:
+    """run_state.json's bytes for `st` (a lead hand-off binds its child to them before they are saved: Codex r3)."""
+    return json.dumps(st.to_dict(), indent=1, default=str).encode()
+
+
 def save_state(run_dir: str, st: RunState) -> None:
     """run_state.json, published atomically with no link followed (lib.safe_io; review round 4, P1-2)."""
     from lib.safe_io import write_nofollow
-    write_nofollow(run_dir, STATE_FILE, json.dumps(st.to_dict(), indent=1, default=str).encode(), atomic=True)
+    write_nofollow(run_dir, STATE_FILE, _state_bytes(st), atomic=True)
 
 
 # ------------------------------------------------------------------ gate routing (pure)
@@ -665,15 +671,40 @@ def require_judged(d: dict, opened: list | None = None) -> dict:
     return d
 
 
-def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int, budget_ok: bool) -> dict:
+def owner_held(ledger: dict) -> set[str]:
+    """Findings the owner has answered (hb1 cause H): accepted by the owner (or provisionally by the lead). No fix task
+    can work to their test. One still awaiting the owner's answer is not among them (Codex r1 of #344, P1-1): the gate
+    sends it to OWNER_DECISION before anything declares it."""
+    return {f.id for f in ledger.values() if f.status == "owner_accepted"}
+
+
+def owner_accepted_now(run_dir: str, opened: list[dict], lead_ok: bool) -> set[str]:
+    """The open findings whose current claim and remedy, as this gate reads them, carry the owner's (or, in a lead run,
+    the lead's provisional) accept: the answer binds to that fingerprint, so a finding revised since it was answered is
+    not among them (Codex r2 of #344, P1-2: the ledger may keep an older remedy)."""
+    answers = FL.owner_answers(run_dir, lead_ok)
+    out = set()
+    for o in opened:
+        fid = str(o.get("id"))
+        a = answers.get(FL.answer_fingerprint(fid, str(o.get("claim") or ""), o.get("fix_requires")))
+        if a and str(a.get("finding")) == fid and a.get("decision") == "accept":
+            out.add(fid)
+    return out
+
+
+def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int, budget_ok: bool,
+                      owner_held=()) -> dict:
     """v2: the gate never accepts an open HIGH or MEDIUM finding. Today's rules ACCEPT when no HIGH
     is open (rule 4); in v2 an open finding with a test goes to the fix loop while rounds and
     budget remain (rule 4m) and is declared, with the write-up saying so, when they do not (3m).
+    A finding the owner holds (`owner_held`) never goes to the fix loop, which has no task for it: it is
+    declared (harness baseline hb1, malaria R2: two critique rounds ran for an accepted finding).
     The decision's action and rationale say what the machine then does."""
     if decision.get("action") != "ACCEPT" or not opened:
         return decision
     d = dict(decision)
-    tested = [f["id"] for f in opened if f["tested"]]
+    held = set(map(str, owner_held or ()))
+    tested = [f["id"] for f in opened if f["tested"] and str(f["id"]) not in held]
     if tested and rounds_remaining > 0 and budget_ok:
         d.update(action="PATCH_OR_RETHINK", rule_matched="4m", open_tested=tested,
                  rationale=(f"No HIGH finding is open, but {len(tested)} finding(s) with a test are "
@@ -682,6 +713,9 @@ def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int,
     else:
         why = "no rounds remain" if rounds_remaining <= 0 else ("the budget is used" if not budget_ok
                                                                  else "none has a test the fix loop can work to")
+        mine = sorted(str(f["id"]) for f in opened if str(f["id"]) in held)
+        if mine and rounds_remaining > 0 and budget_ok:
+            why = f"the owner's answer, not a fix task, decides {', '.join(mine)[:200]}"
         d.update(action="DECLARE_SCOPE", rule_matched="3m", declared_open=[f["id"] for f in opened],
                  rationale=(f"{len(opened)} HIGH/MEDIUM finding(s) are still open and {why}: they are declared "
                             "in the write-up (declared_findings.yaml), not accepted."))
@@ -1091,7 +1125,12 @@ LEGACY_BRIEF_SIGNOFF = ("decision_brief.signoff.json",)      # scripts/decision_
 
 class AmendmentLocked(RuntimeError):
     """Another process holds the parent's amendment lock, or has already handed the run to its child: this resume
-    stops with nothing written (owner decision on #330)."""
+    stops with nothing written (owner decision on #330). `run_dir`: the run whose lock is held (main.py stores a
+    parent it finished up to a child another process holds: Codex r1 of #349)."""
+
+    def __init__(self, msg: str, run_dir: str | None = None):
+        super().__init__(msg)
+        self.run_dir = run_dir
 
 
 _LOCK_HELD = __import__("threading").local()
@@ -1119,7 +1158,8 @@ class _amend_lock:
         except BlockingIOError:
             f.close()
             raise AmendmentLocked(f"another process is amending {self.run_dir} ({AMEND_LOCK} is held): this resume "
-                                  "stops with nothing written; resume again once that process has ended") from None
+                                  "stops with nothing written; resume again once that process has ended",
+                                  run_dir=self.run_dir) from None
         except BaseException:
             f.close()
             raise
@@ -1295,13 +1335,22 @@ class Machine:
         self.log = log
         self.cross = cross_engine_check
         st = load_state(self.run_dir)
+        if (st or state) is not None and (st or state).signoff == "lead":
+            # a lead run's state is read again and written back under its amendment lock, so a state read before
+            # another process's hand-off is never written over it (Codex r3 on #342, P1-9)
+            with _amend_lock(self.run_dir):
+                self._load(load_state(self.run_dir), state)
+        else:
+            self._load(st, state)
+        self.seed_fn = getattr(tasks, "world_model_seed", None)    # §14: the world model's seed task, when the tasks have one
+        self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
+
+    def _load(self, st: RunState | None, state: RunState | None) -> None:
         self.st = st or state
         if self.st is None:
             raise ValueError("no run_state.json and no initial state")
         self._settle_interrupted()
         save_state(self.run_dir, self.st)
-        self.seed_fn = getattr(tasks, "world_model_seed", None)    # §14: the world model's seed task, when the tasks have one
-        self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
 
     def persist(self) -> None:
         # Named persist, not save, only because scripts/write_audit.py WA3 reads any `<obj>.save()` call as PIL's
@@ -1326,7 +1375,8 @@ class Machine:
         return float(a if a is not None else self.st.task_cap_usd) + float(rb if isinstance(rb, (int, float)) else 0.0)
 
     # -------------------------------------------------- plumbing
-    def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None) -> str:
+    def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None,
+            before_save=None) -> str:
         frm = self.st.state
         if to not in EDGES[frm]:
             raise RuntimeError(f"transition {frm} -> {to} is not in the state table")
@@ -1337,6 +1387,8 @@ class Machine:
             self.st.status = self.st.forced_status or status or "completed_gate_error"
             self._withhold_if_acceptance_language()
             self._finish()
+        if before_save is not None:
+            before_save()
         save_state(self.run_dir, self.st)
         self.log(f"[machine] {frm} -> {to}" + (f" ({why})" if why else ""))
         return to
@@ -1679,38 +1731,137 @@ class Machine:
         if res is None:
             return self._budget_out("SPEC")
         errs = [f"draft_spec failed: {res.note}"] if not res.ok else []
-        if res.ok:
+        # baseline hb1: a try cut off (the turn cap) is checked on whatever draft is on disk, written or repaired in
+        # this try or left by an earlier one: the checks say what holds now, with no before/after comparison to get
+        # wrong on a resume or a rewrite (Codex r1 P1-3/P1-4, r2 P1-5/P1-7/P2-8). Only when the try's feedback is
+        # what these checks wrote (or none): reasons they cannot verify (a rethink, a refused sign-off, the evidence
+        # stage) are never cleared by an old draft that passes them; they are carried (Codex r3 P1-2).
+        recheckable = (not fb or fb == self.st.tries.get("spec_feedback_checked")
+                       or all(str(x).startswith("draft_spec failed:") for x in fb))   # r1 P1-5: a run saved before
+        drafted = res.ok or (recheckable and os.path.lexists(os.path.join(rd, AB.SPEC_FILE)))
+        if drafted:
             try:
-                from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
-                if CF.ensure_default(rd):
-                    self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
-                errs = self._derive(rd) if self.st.derived_inputs else []
-                errs = errs or record_cited_inputs(rd)       # before anything reads a cited file
-                if self.st.derived_inputs:
-                    # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the
-                    # spike adapter does not know them, so the harness runs them for it.
-                    if not errs and not hasattr(self.backend, "candidate_rows"):
-                        import pipeline as P
-                        errs = [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
-                            rd, self._spec(rd), required=True)]
-                    errs = errs or self.backend.pre_sign_problems(rd, derived=True)
-                    errs = errs or self._geometry_problems(rd)
-                    if not errs:
-                        self._write_sheet(rd)
-                else:
-                    errs = errs or self.backend.pre_sign_problems(rd)
-                    errs = errs or self._geometry_problems(rd)
+                errs = self._spec_checks(rd)
+                if not errs and self.st.derived_inputs:
+                    self._write_sheet(rd)
             except Exception as e:  # noqa: BLE001
                 errs = [f"spec unreadable: {e}"]
+            if errs and not res.ok:
+                errs = [f"draft_spec failed: {res.note} (its draft was checked)"] + errs
         if errs:
-            self.st.tries["spec_feedback"] = errs
+            self.st.tries["spec_feedback"] = _carry_feedback(errs, fb if not drafted else None)
+            if drafted or recheckable:
+                # these checks' own output (or, with no draft on disk, what they wrote before plus that note): a capped
+                # next try may be re-checked against it (Codex r4 P1-3: a first try with no draft blocked every later one)
+                self.st.tries["spec_feedback_checked"] = list(self.st.tries["spec_feedback"])
+            else:
+                self.st.tries.pop("spec_feedback_checked", None)
             return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
         self.st.tries.pop("spec_feedback", None)
+        self.st.tries.pop("spec_feedback_checked", None)
         if not self._review_conditions(self.st.signoff, defer=False):
             # Codex narrow round P1: the conditions exist before the run ever asks for a signature (owner 2026-11-21)
             self.st.tries["spec_feedback"] = ["review conditions could not be prepared for signing"]
             return self._go("SPEC", "review conditions could not be prepared for signing")
         return self._go("EVIDENCE", "spec drafted and valid")
+
+    def _spec_checks(self, rd: str) -> list[str]:
+        """Every pre-sign check class on the draft, each run whatever the others found, so one try hears every problem
+        (baseline hb1: the chain stopped at the first class that failed, and MAX_SPEC_TRIES is small). A class that
+        raises is named in the problems and the others still run. A spec or settings file that is a link (symbolic or
+        hard) or not a regular file, or a spec that does not parse, is the problem and nothing else runs (Codex r4
+        P1-5: the checks read these files by path)."""
+        import yaml
+        bad = _draft_file_problems(rd) + _special_files(rd)     # before anything opens a file (Codex r1 on #350)
+        if bad:
+            return bad
+        try:
+            yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
+            from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
+            if CF.ensure_default(rd):                        # after the link checks: it replaces the file
+                self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
+        except Exception as e:  # noqa: BLE001
+            return [f"spec unreadable: {type(e).__name__}: {e}"]
+        out: list[str] = []
+
+        def run(name, fn) -> bool:
+            try:
+                got = list(fn() or [])
+            except Exception as e:  # noqa: BLE001 -- fail closed, and the other classes still run
+                got = [f"the {name} check could not run: {type(e).__name__}: {e}"]
+            out.extend(x for x in got if x not in out)
+            return not got
+        if self.st.derived_inputs:
+            run("derivation", lambda: self._derive(rd))
+        run("cited-input", lambda: record_cited_inputs(rd))      # records the hashes before a check reads a cited file
+        outside = self._cites_outside(rd)
+        if outside:             # Codex r1 P1-1: no later check opens a file the cited-input check refused
+            out.extend(x for x in outside if x not in out)       # r2 P1-2: never empty, so never a pass
+            return out
+        if self.st.derived_inputs:
+            # Workstream B's schema runs the derived-input checks itself (and per candidate engine); the spike adapter
+            # does not know them, so the harness runs them for it.
+            if not hasattr(self.backend, "candidate_rows"):
+                import pipeline as P
+                run("derived-input", lambda: [f"{p['code']}: {p['claim']}" for p in P.derivation_problems(
+                    rd, self._spec(rd), required=True)])
+            signable = run("pre-sign", lambda: self.backend.pre_sign_problems(rd, derived=True))
+        else:
+            signable = run("pre-sign", lambda: self.backend.pre_sign_problems(rd))
+        run("geometry", lambda: self._geometry_problems(rd))
+        if signable and run("signed-configuration", lambda: self._config_problems(rd)):
+            # Codex r1 P1-2, r2 P1-3: the assessment builds the engine, only after the pre-sign guards have passed; the
+            # configuration guard's own problems go back to the drafter (r3 P1-1)
+            run("evidence", lambda: self._evidence_assess(rd)[1]["spec_problems"])   # tb R2: heard one stage late
+        return out
+
+    @staticmethod
+    def _config_problems(rd: str) -> list[str]:
+        """The signed engine configuration's guard (analysis_backend.signed_config_problems) on the draft, whatever the
+        backend: no engine is built from a draft it refuses (an error is reported by _spec_checks, fail closed)."""
+        import yaml
+        return list(AB.signed_config_problems(yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}))
+
+    @staticmethod
+    def _cites_outside(rd: str) -> list[str]:
+        """The spec's citations no later check may open, as problems: one that resolves outside the run directory
+        (record_cited_inputs refuses it), or one that exists but is neither a regular file nor a directory (a FIFO or a
+        device blocks the reader: Codex r4 P1-4). Fail closed: when the citations cannot be listed, that is the
+        problem."""
+        import stat
+        import yaml
+        import pipeline as P
+        try:
+            spec = yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}
+            root, out = os.path.realpath(rd), []
+            for r in P.cited_paths(spec, rd):
+                p = os.path.realpath(os.path.join(rd, r))
+                if not p.startswith(root + os.sep):
+                    out.append(f"the spec cites {r}, outside the run directory: copy it into data/")
+                    continue
+                try:
+                    mode = os.stat(p).st_mode
+                except FileNotFoundError:
+                    continue                    # record_cited_inputs says it does not exist; nothing can open it
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    out.append(f"the spec cites {r}, which is not a regular file: write the table as a plain file")
+            return out
+        except Exception as e:  # noqa: BLE001
+            return [f"the spec's cited paths could not be listed, so no check reads them: {type(e).__name__}: {e}"]
+
+    def _evidence_assess(self, rd: str) -> tuple[dict, dict]:
+        """The spec and the evidence stage's assessment of it (toolkit/spec/evidence_draft.py assess), with a dossier
+        path that the harness, the gate or a task writes added to its spec problems. SPEC and EVIDENCE share it."""
+        from toolkit.spec import evidence_draft as EDR
+        raw = EDR._spec(rd)
+        a = EDR.assess(rd, raw)
+        rel = a.get("rel")
+        if rel and not a.get("draftable") and owned_path(rd, os.path.normpath(rel).replace(os.sep, "/"), tuple(
+                p for p in harness_owned() if p not in ("data/*", EDR.ED.DOSSIER_FILE))):
+            a["spec_problems"] = a["spec_problems"] + [   # Codex r2 P1-5: a file the harness or a task writes
+                f"evidence.dossier {rel!r} is a file the harness, the gate or a task writes: name "
+                f"{EDR.ED.DOSSIER_FILE}"]
+        return raw, a
 
     def _lead_amend(self, req: dict) -> str | None:
         """The lead amendment under the parent's amendment lock (owner decision on #330): the request and the parent's
@@ -1720,7 +1871,7 @@ class Machine:
             disk = load_state(self.run_dir)
             if disk is not None and disk.status == AMENDED_PROVISIONAL:
                 raise AmendmentLocked(f"{self.run_dir} was already handed to its child by another process: this "
-                                      "resume stops with nothing written")
+                                      "resume stops with nothing written", run_dir=self.run_dir)
             try:
                 cur = json.load(open(os.path.join(self.run_dir, SPEC_RETHINK_REQUEST)))
             except (OSError, ValueError):
@@ -1738,8 +1889,11 @@ class Machine:
         from toolkit.spec import amend as AM, signoff as SO
         la, why, rec = req.get("lead_amendment") or {}, None, None
         child = la.get("child")
-        if la.get("status") in ("started", "signed_provisionally"):     # resolved beside this run (a moved copy: r2)
-            child = _child_of(self.run_dir, child) or child
+        if la.get("status") in ("started", "signed_provisionally"):
+            # resolved beside this run only (a moved copy: r2); never the recorded path, which may be the original tree
+            # of a restored copy (Codex r3 on #342, P1-5); and only the child this request made (Codex r1 of #349)
+            child = _child_of(self.run_dir, child)
+            child = child if child and _made_by(child, req, self.run_dir) else None
         if la.get("status") == "refused":
             return None                   # the first refusal stands, with its reason and any kept child
         if any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
@@ -1747,8 +1901,11 @@ class Machine:
             # never satisfies the lead's check, also when recovering an interrupted hand-off (Codex r3); the owner decides
             why = "the parent carries a legacy decision brief signature, which a lead amendment never relies on in v2"
         elif la.get("status") in ("started", "signed_provisionally"):
-            # an interrupted handoff: finished when the child is signed by the lead, else refused (the owner decides)
-            if not (child and os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
+            # an interrupted handoff: finished when the parent's signature still holds (Codex r3 on #342, P1-6) and the
+            # child is signed by the lead, else refused (the owner decides)
+            if self._signed_by() is None:
+                why = "the parent's sign-off no longer holds (a signed input changed since): the owner decides"
+            elif not (child and os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
                     and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
                 why = "an interrupted amendment left no lead-signed child"
             else:
@@ -1800,10 +1957,29 @@ class Machine:
             self.log(f"[machine] the lead does not amend the signed spec ({why[:300]}): the run waits for the owner")
             return None
         self.st.paused = None
-        to = self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
-                      AMENDED_PROVISIONAL, extra={"amended_to": child})
-        self._relink(child)
-        return to
+        # the child is bound to the parent's final state before that state is saved, so no interruption leaves a FINAL
+        # parent whose child binds its paused state (Codex r3 on #342, P1-4); until that save the parent is at SPEC and
+        # a resume finishes the hand-off again
+        # a failure before the parent's FINAL state is saved (its metadata, the lineage) puts this machine and the
+        # parent's metadata back as they were (Codex r2 and r3 of #349): a retry, on this machine or a new one, finishes
+        # the hand-off
+        import copy
+        saved = copy.deepcopy(self.st)
+        meta_p = os.path.join(self.run_dir, "metadata.json")
+        meta0 = open(meta_p, "rb").read() if os.path.isfile(meta_p) else None
+        try:
+            return self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
+                            AMENDED_PROVISIONAL, extra={"amended_to": child}, before_save=lambda: self._relink(child))
+        except BaseException:
+            disk = _state_or_none(self.run_dir)
+            if disk is None or disk.status != AMENDED_PROVISIONAL:
+                self.st = saved
+                from lib.safe_io import remove_nofollow, write_nofollow
+                if meta0 is not None:
+                    write_nofollow(self.run_dir, "metadata.json", meta0, atomic=True)
+                else:
+                    remove_nofollow(self.run_dir, "metadata.json")
+            raise
 
     def _mark_child(self, child: str, rid) -> None:
         """The child's state, once: not paused, what is left of the cap (always > 0 here), the handoff event."""
@@ -1825,16 +2001,14 @@ class Machine:
 
     def _relink(self, child: str) -> None:
         """The child's parent_run binds the parent's final run_state.json (amend recorded it while paused), so the
-        chain still links (scripts/harness_metrics.py chains)."""
-        try:
-            sha = hashlib.sha256(open(os.path.join(self.run_dir, STATE_FILE), "rb").read()).hexdigest()
-            for rel in ("metadata.json", AMENDMENT_RECORD):
-                doc = json.load(open(os.path.join(child, rel)))
-                if isinstance(doc.get("parent_run"), dict):
-                    doc["parent_run"]["run_state_sha256"] = sha
-                    _write_json(child, rel, doc)
-        except (OSError, ValueError, AttributeError) as e:     # the lineage link only: the run goes on
-            self.log(f"[machine] the child's parent link was not refreshed: {type(e).__name__}")
+        chain still links (scripts/harness_metrics.py chains): the bytes about to be saved, from the state in memory. A
+        failure is raised before the parent is saved FINAL, so a resume finishes the hand-off (Codex r1 of #349)."""
+        sha = hashlib.sha256(_state_bytes(self.st)).hexdigest()
+        for rel in ("metadata.json", AMENDMENT_RECORD):
+            doc = json.load(open(os.path.join(child, rel)))
+            if isinstance(doc.get("parent_run"), dict):
+                doc["parent_run"]["run_state_sha256"] = sha
+                _write_json(child, rel, doc)
 
     def _derive(self, rd: str | None = None) -> list[str]:
         """The draft's declared derivations, run by the harness (scripts/pipeline.py derive). Their problems go back
@@ -1982,14 +2156,7 @@ class Machine:
             self.st.tries["spec_feedback"] = probs
             return self._go("SPEC", "evidence: " + "; ".join(probs)[:200])
         try:
-            raw = EDR._spec(rd)
-            a = EDR.assess(rd, raw)
-            rel = a.get("rel")
-            if rel and not a.get("draftable") and owned_path(rd, os.path.normpath(rel).replace(os.sep, "/"), tuple(
-                    p for p in harness_owned() if p not in ("data/*", EDR.ED.DOSSIER_FILE))):
-                a["spec_problems"] = a["spec_problems"] + [   # Codex r2 P1-5: a file the harness or a task writes
-                    f"evidence.dossier {rel!r} is a file the harness, the gate or a task writes: name "
-                    f"{EDR.ED.DOSSIER_FILE}"]
+            raw, a = self._evidence_assess(rd)
             if a["spec_problems"]:
                 return spec_back(a["spec_problems"])
             sc = EDR.scaffold(rd, a, raw)["scaffold"] if a["needed"] else {}
@@ -2177,16 +2344,21 @@ class Machine:
         v = self._visit()
         fb = self.st.tries.get("schema_feedback") or {}
         critics = list(CRITICS) if (not fb or "*" in fb) else [r for r in fb if r in CRITICS or r == "critique-presentation"]
+        rereview = self._rereview_due()          # hb1 cause G: the domain and red-team critics, on the revised draft
         for reviewer in critics:
             args = (self.run_dir, reviewer, self.st.round) + ((fb.get(reviewer) or fb.get("*"),) if fb else ())
             res = self._task(f"CRITIQUE#{v}:r{self.st.round}:{reviewer}", "critique", *args)
             if res is None:
                 return self._budget_out("CRITIQUE")
         self.st.tries.pop("schema_feedback", None)
+        if rereview:
+            self.st.tries.pop("rereview", None)
+            return self._go("GATE", f"critique round {self.st.round} (re-review of the revised draft)")
         return self._go("GATE", f"critique round {self.st.round}")
 
     def h_GATE(self):
         pw = self.st.post_write
+        waiting: list = []        # findings awaiting the owner's answer: no final disposition is published before it
         if self.st.gate_mode == "legacy":
             d = legacy_gate(self.run_dir, self.st.round, self.st.max_rounds, pw)
             # (owner amendments and declines are v2 rules: the legacy mode replays stored v1 gates and applies neither)
@@ -2201,31 +2373,41 @@ class Machine:
             opened = []
             if d.get("action") and self.st.v2_rules:
                 opened = open_findings(self.run_dir, d)
-                d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget())
+                # synced with this decision, so a gate finding is read as this gate states it (Codex round 3 of #258),
+                # and before the medium rule, which declares what the owner holds (hb1 cause H)
+                led0 = FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")[0]
+                held_now = sorted(owner_accepted_now(self.run_dir, opened, self.st.signoff == "lead"))
+                d = apply_medium_rule(d, opened, int(d.get("rounds_remaining") or 0), not self._out_of_budget(),
+                                      owner_held=held_now)
+                d["owner_held"] = held_now      # what this gate read as the owner's (FIX_LOOP's shortcut reads it here)
                 d = require_judged(d, opened)
                 # Codex re-review of #258 P1-11: the owner's declines hold this gate before anything is written from it
-                # (synced with this decision, so a gate finding is read as this gate states it: Codex round 3 of #258)
-                d = apply_owner_declines(d, FL.sync(self.run_dir, d, self.st.round, post_write=pw,
-                                                    lead_ok=self.st.signoff == "lead")[0])
+                d = apply_owner_declines(d, led0)
+                waiting = sorted(set(pending_amendments(led0, d.get("resolved_by_test")) + pending_conflicts(led0)))
                 if d.get("rule_matched") == "owner_declined":
                     drop_declined(self.run_dir, [h["finding"] for h in d["unresolved_high"]
                                                  if isinstance(h, dict) and h.get("kind") == "scope_declaration_declined"])
             if d.get("action"):
                 import validate_critique_yaml as V
                 V._append_validator_history(self.run_dir, self.st.round, d, pw)
-            if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE":
+            if self.st.v2_rules and d.get("action") == "DECLARE_SCOPE" and not waiting:
+                # (not while a finding awaits the owner's answer: the gate re-runs after it; Codex r3 of #344, P1-2)
                 # Every DECLARE_SCOPE (rule 3, 3a or 3m) lists what is still open in the write-up.
                 write_declared(self.run_dir, opened, d)
             if self.st.v2_rules and pw and d.get("action") and self._has_draft():
-                # The final status heads the report; a not-accepted one records any acceptance language.
-                fst = route_gate(d, pw)[1]
+                # The final status heads the report; a not-accepted one records any acceptance language. While a
+                # finding awaits the owner's answer the status is pending (Codex r2 of #344, P1-1).
+                fst = None if waiting else route_gate(d, pw)[1]
                 render_report(self.run_dir, self.backend, status=fst or "pending")
                 if fst is not None and fst not in ACCEPTED_STATUSES:
                     d["report_acceptance_language"] = self._language_check(fst)
         tag = f"gate_r{self.st.round}{'_post' if pw else ''}.json"
         _write_json(self.run_dir, tag, d or {})
-        if pw:
+        if pw and not waiting:
             _write_json(self.run_dir, "final_gate.json", d or {})
+        elif pw:            # an earlier post-write gate's record is not the decision while the owner answers (Codex r3)
+            from lib.safe_io import remove_nofollow
+            remove_nofollow(self.run_dir, "final_gate.json")
         self.st.last_gate = {k: (d or {}).get(k) for k in ("action", "rule_matched", "rounds_remaining", "rationale")}
         self.st.last_gate.update(round=self.st.round, post_write=pw)
         if (d or {}).get("action"):
@@ -2315,13 +2497,65 @@ class Machine:
         if summ.get("rethink"):
             return self._rethink(summ["rethink"], f"the planner chose a rethink ({summ['rethink']})", planned=True)
         if not summ["tasks"] and summ.get("write_up") and not summ.get("harness_gaps_blocking") and self._has_draft():
-            # Every open finding is the write-up's: the writer revises the draft (with them) as the next round.
+            # Every open finding is the write-up's: the writer revises the draft (with them) as the next round, and
+            # the domain and red-team critics then re-review the revised draft at that round (hb1 cause G: they were
+            # left on the round before, and the gate re-ran them through the schema repair).
             if self.st.round_pending:
                 self.st.round += 1
                 self.st.round_pending = False
             self.st.write_mode = self.st.write_mode or "not_accepted"
+            self.st.tries["rereview"] = self.st.round
             return self._go("WRITE", f"every open finding is the write-up's ({', '.join(summ['write_up'])[:120]})")
+        held_now = None if summ["tasks"] or self._drafted() or self._fixable_open() else self._shortcut_held()
+        if held_now is not None:
+            # hb1 cause H: pre-write, a loop with no task changed nothing, so another critique round can find nothing
+            # new; every open finding the gate holds is the write-up's or the owner's. The draft is written, as the
+            # gate's WRITE route would, in this round; the post-write gate then decides its status.
+            self.st.round_pending = False
+            # the post-write fix loop of this round writes its own plan: this one is kept apart (Codex r2 of #344, P1-3)
+            if os.path.lexists(os.path.join(self.run_dir, f"fix_plan_r{self.st.round}.json")):
+                from lib.safe_io import rename_nofollow        # moved with a source identity check (Codex r3, P1-4)
+                rename_nofollow(self.run_dir, f"fix_plan_r{self.st.round}.json",
+                                f"fix_plan_r{self.st.round}_prewrite.json")
+            # the mode follows what this gate holds, not the whole ledger's history (Codex r2 of #344, P1-4)
+            self.st.write_mode = "declared" if held_now else "accepted"
+            return self._go("WRITE", "fix loop: no task; every open finding is the write-up's"
+                                     + (f" or the owner's ({', '.join(held_now)[:120]})" if held_now else ""))
         return self._go("CRITIQUE", f"fix loop: {summ['rows']} task(s), {summ['passed']} passed their checks")
+
+    def _drafted(self) -> bool:
+        """The gate's own test for a draft (open_findings): a manuscript or a rendered report (Codex r1 of #344, P1-2)."""
+        return self._has_draft() or os.path.exists(os.path.join(self.run_dir, "report.md"))
+
+    def _shortcut_held(self) -> list[str] | None:
+        """Codex r1 of #344 (P1-3, P2-4): the shortcut to WRITE only follows a medium-rule gate (4m) with no unresolved
+        HIGH, whose tested findings are all the write-up's or the owner's answered ones; a gate that patches for any
+        other reason (a HIGH, a declared finding it still holds) keeps its critique round. None: no shortcut; else the
+        tested findings of that gate the owner holds."""
+        try:        # this round's pre-write gate (the one that routed here; the round is raised at the next CRITIQUE)
+            d = json.load(open(os.path.join(self.run_dir, f"gate_r{self.st.round}.json")))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(d, dict) or d.get("rule_matched") != "4m" or d.get("unresolved_high"):
+            return None
+        # the owner-held findings as this gate read them (their current fingerprint carries the accept), not the
+        # ledger's status, which may keep an older remedy (Codex r3 of #344, P1-1); the medium rule kept them out of
+        # open_tested, so the mode comes from that record (P2-5)
+        held = d.get("owner_held")
+        if not isinstance(held, list):
+            return None
+        led = FL.load(self.run_dir)
+        ids = [str(i) for i in d.get("open_tested") or []]
+        if not all(i in led and FX.is_write_up(led[i]) for i in ids):
+            return None
+        return sorted(map(str, held))
+
+    def _fixable_open(self) -> list[str]:
+        """Open findings a fix task could still work to: the gate holds them (blocking), and they are neither the
+        write-up's nor the owner's."""
+        led = FL.load(self.run_dir)
+        held = owner_held(led)
+        return [f.id for f in FL.open_findings(led) if f.blocking and not FX.is_write_up(f) and f.id not in held]
 
     def _request_owner(self, led: dict, ids: list[str]) -> None:
         """The request, and the fingerprints it asks, kept in run_state.json: the answers must be to them (Codex
@@ -2428,7 +2662,8 @@ class Machine:
             return self._go("FINAL", "the writer produced no draft", "completed_no_report")
         render_report(self.run_dir, self.backend)
         self.st.post_write = True
-        if mode == "not_accepted":
+        if mode == "not_accepted" and not self._rereview_due():
+            # (a revised not-accepted draft gets its presentation review at the new round too: Codex r1 of #344, P2-5)
             return self._go("GATE", "not-accepted report written; final gate")
         return self._go("PRESENTATION", f"draft written ({mode})")
 
@@ -2439,7 +2674,14 @@ class Machine:
                          "critique-presentation", self.st.round, writeup=True)
         if res is None:
             return self._budget_out("PRESENTATION")
+        if self._rereview_due():
+            return self._go("CRITIQUE", f"re-review of the revised draft, round {self.st.round}")
         return self._go("GATE", "presentation review of the draft")
+
+    def _rereview_due(self) -> bool:
+        """hb1 cause G: a draft revised for write-up findings as a new round is re-reviewed by the domain and red-team
+        critics at that round before the gate (set by FIX_LOOP; cleared by the re-review)."""
+        return self.st.tries.get("rereview") == self.st.round and self.st.post_write
 
     def _last_decision(self) -> dict | None:
         for name in (f"gate_r{self.st.round - (1 if self.st.round_pending else 0)}_post.json",
@@ -2715,6 +2957,68 @@ ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
 STATUS_MARK = "<!-- harness: run status -->"
 
 
+def _draft_file_problems(run_dir: str) -> list[str]:
+    """The spec (required) and analysis_settings.yaml (optional) must each be a regular file with one link: the pre-sign
+    checks read them by path, so a symbolic or hard link would show them another file's content (Codex r4 P1-5)."""
+    import stat
+    out = []
+    for rel, required in ((AB.SPEC_FILE, True), (AB.SETTINGS_FILE, False)):
+        try:
+            st = os.lstat(os.path.join(run_dir, rel))
+        except FileNotFoundError:
+            if required:
+                out.append(f"spec unreadable: {rel} does not exist")
+            continue
+        except OSError as e:
+            out.append(f"{rel} cannot be read: {type(e).__name__}")
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            out.append(f"{rel} is a link or not a regular file: write it as a plain file")
+        elif st.st_nlink > 1:
+            out.append(f"{rel} has {st.st_nlink} hard links: write it as its own file")
+    return out
+
+
+def _special_files(run_dir: str, limit: int = 20000) -> list[str]:
+    """Every entry in the run directory that is not a regular file, a directory or a link to one (a FIFO, a device, a
+    socket), as problems: a check or a derivation that opens one can block with no writer. The whole run is walked
+    (no link followed), so the result does not depend on how a path in the spec is spelled (Codex r1 on #350). Fail
+    closed past `limit` entries."""
+    import stat
+    out, n = [], 0
+    for base, dirs, files in os.walk(run_dir):
+        for name in dirs + files:
+            n += 1
+            if n > limit:
+                return out + [f"the run directory has more than {limit} entries: its files were not checked"]
+            p = os.path.join(base, name)
+            try:
+                mode = os.stat(p).st_mode           # a link: its target's type
+            except OSError:
+                continue                            # a dangling link opens nothing
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                out.append(f"{os.path.relpath(p, run_dir)!r} in the run is not a regular file: remove it, or write "
+                           "a plain file")
+    return out
+
+
+CARRIED = "from an earlier try, still unresolved: "
+
+
+def _carry_feedback(errs: list, earlier: list | None, cap: int = 40) -> list:
+    """The SPEC feedback for the next try: this try's problems, then the earlier try's when there is no draft on
+    disk to check (baseline hb1: a try lost to the turn cap replaced the validation errors with "max turns", so
+    the next try repeated them). Earlier items are marked once and never repeated."""
+    out = list(errs)
+    seen = {x[len(CARRIED):] if x.startswith(CARRIED) else x for x in out}
+    for x in earlier or []:
+        core = x[len(CARRIED):] if x.startswith(CARRIED) else x
+        if core not in seen and not core.startswith("draft_spec failed:"):
+            seen.add(core)
+            out.append(CARRIED + core)
+    return out[:max(cap, len(errs))]          # the cap trims the carried items only (Codex r1 P2-6)
+
+
 def _status_line(run_dir: str, status: str | None) -> str:
     """F6 S1-7: the run status, from .claude/orchestration/acceptance_language.yaml (a declared-scope
     run reads "declared scope, not accepted"). Without a status: the run state's, else the write mode's."""
@@ -2809,7 +3113,7 @@ def amendment_lines(run_dir: str) -> list[str]:
         ch = "; ".join(f"{c.get('op')} `{c.get('path')}`" + ("" if c.get("op") == "remove" else
                                                              f" to {json.dumps(c.get('after'), default=str)[:160]}")
                        for c in rec.get("changes") or [] if isinstance(c, dict))
-        parent = (rec.get("parent_run") or {}).get("run_dir")
+        parent = _parent_of(run_dir, (rec.get("parent_run") or {}).get("run_dir"))
     except (OSError, ValueError, AttributeError, TypeError) as e:
         return [f"**Provisional amendment of the signed spec ({(s7 or {}).get('provisional_amendment') or 'unnamed'}): "
                 f"its record could not be read ({type(e).__name__}); the owner has not reviewed it.**\n\n"]
@@ -3028,20 +3332,26 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
     (Machine.reopen_interrupted_analysis). A --signoff lead run holds its amendment lock from before its state is read
-    to its hand-off (owner decision on #330, Codex r3): a second process resuming it fails with AmendmentLocked before
-    writing anything, also to the child it was handed to."""
+    through its hand-off and the run of the child it handed to (owner decision on #330, Codex r3 on #330 and #342): a
+    second process resuming it fails with AmendmentLocked before writing anything, also to that child."""
     try:
         prev = load_state(run_dir)
     except (OSError, ValueError):
         prev = None
     if signoff != "lead" and (prev is None or prev.signoff != "lead"):
-        child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
-                                     derive_unsandboxed, backend, cross_engine_check, _stamp)
-    else:
-        os.makedirs(run_dir, exist_ok=True)
-        with _amend_lock(run_dir):
-            child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
-                                         derive_unsandboxed, backend, cross_engine_check, _stamp)
+        return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
+                             backend, cross_engine_check, _depth, _stamp)
+    os.makedirs(run_dir, exist_ok=True)
+    with _amend_lock(run_dir):     # held through the hand-off and the child's run (Codex r3 on #342, P1-8)
+        return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
+                             backend, cross_engine_check, _depth, _stamp)
+
+
+def _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
+                  cross_engine_check, _depth, _stamp) -> str:
+    """One run dir, then the child its provisional amendment handed it to (run_v2, under the caller's lock)."""
+    child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
+                                 derive_unsandboxed, backend, cross_engine_check, _stamp)
     if child is None or _depth >= 8:          # a bounded chain (a restored cycle cannot recurse: Codex r2)
         return status
     # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher);
@@ -3088,25 +3398,77 @@ def _child_of(run_dir: str, recorded, strict: bool = False) -> str | None:
     if not isinstance(recorded, str) or not recorded:
         return None
     here = os.path.join(os.path.dirname(os.path.abspath(run_dir)), os.path.basename(recorded.rstrip(os.sep)))
+    if os.path.islink(here):          # a link to another tree is not this run's child (Codex r1 of #349)
+        return None
     try:
         pr = (json.load(open(os.path.join(here, "metadata.json"))) or {}).get("parent_run") or {}
     except (OSError, ValueError, AttributeError):
         return None
     ok_ = os.path.basename(str(pr.get("run_dir") or "").rstrip(os.sep)) == os.path.basename(os.path.abspath(run_dir))
-    if ok_ and strict and pr.get("run_state_sha256"):   # a finished parent: the child binds its final state (r2)
+    if ok_ and strict:      # a finished parent: the child binds its final state (r2); a missing digest binds none (r3)
         try:
-            ok_ = hashlib.sha256(open(os.path.join(run_dir, STATE_FILE), "rb").read()).hexdigest() == pr["run_state_sha256"]
+            ok_ = isinstance(pr.get("run_state_sha256"), str) and hashlib.sha256(
+                open(os.path.join(run_dir, STATE_FILE), "rb").read()).hexdigest() == pr["run_state_sha256"]
         except OSError:
             ok_ = False
     return here if ok_ and os.path.realpath(here) != os.path.realpath(run_dir) else None
 
 
+def _parent_of(run_dir: str, recorded):
+    """The parent a child run continues: its sibling of the recorded name when that sibling hands off to this child (a
+    parent and child moved together: Codex r3 on #342, P2-12), else the recorded path."""
+    if not isinstance(recorded, str) or not recorded:
+        return recorded
+    here = os.path.join(os.path.dirname(os.path.abspath(run_dir)), os.path.basename(recorded.rstrip(os.sep)))
+    c = handoff_child(here)
+    if c and os.path.realpath(c) == os.path.realpath(run_dir):
+        return here
+    # a manual amendment's parent keeps its status: the parent-state digest the child records (in its metadata or its
+    # amendment record: Codex r2 of #349)
+    for rel in ("metadata.json", AMENDMENT_RECORD):
+        try:
+            bound = ((json.load(open(os.path.join(run_dir, rel))) or {}).get("parent_run") or {}).get(
+                "run_state_sha256")
+            if not os.path.islink(here) and isinstance(bound, str) and bound == hashlib.sha256(
+                    open(os.path.join(here, STATE_FILE), "rb").read()).hexdigest():
+                return here
+        except (OSError, ValueError, AttributeError):
+            continue
+    return recorded
+
+
+def _own_spec_digest(run_dir: str):
+    """The spec digest the run's own sign-off record binds (decision_spec.signoff.json; never a legacy brief's)."""
+    from toolkit.spec import signoff as SO
+    try:
+        rec = json.load(open(os.path.join(run_dir, SO.SPEC_SIGNOFF)))
+        m = rec.get("sha256")
+        return (m.get(AB.SPEC_FILE) if isinstance(m, dict) else None) or rec.get("spec_sha256")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _made_by(child: str, req: dict, parent: str) -> bool:
+    """`child` is the run toolkit/spec/amend.py made from this rethink request of `parent`: from the signed spec the
+    request names, which the parent's own sign-off binds, with the request's patch (its id and content digest). A
+    same-named child from another backup or another patch is not this request's (Codex r1 and r2 of #349)."""
+    from toolkit.spec import amend as AM
+    try:
+        meta = json.load(open(os.path.join(child, "metadata.json")))
+    except (OSError, ValueError):
+        return False
+    req = req if isinstance(req, dict) else {}
+    sig, patch = req.get("signed_spec_sha256"), req.get("patch")
+    if not (isinstance(meta, dict) and isinstance(sig, str) and isinstance(patch, dict)):
+        return False
+    return meta.get("parent_spec_sha256") == sig == _own_spec_digest(parent) \
+        and meta.get("amendment") == str(patch.get("id") or "unnamed") \
+        and meta.get("patch_sha256") == AM.patch_sha256(patch)
+
+
 def handoff_child(run_dir: str) -> str | None:
     """The child run a provisional lead amendment handed this run to (`amended_provisional`), when it has a state."""
-    try:
-        st = load_state(run_dir)
-    except (OSError, ValueError):
-        return None
+    st = _state_or_none(run_dir)
     if st is None or st.status != AMENDED_PROVISIONAL:
         return None
     child = _child_of(run_dir, next((h.get("amended_to") for h in reversed(st.history)
@@ -3114,26 +3476,65 @@ def handoff_child(run_dir: str) -> str | None:
     return child if child and os.path.isfile(os.path.join(child, STATE_FILE)) else None
 
 
+def _state_or_none(run_dir: str):
+    """The run's state, or None when it is missing or cannot be read as one (Codex r3 of #349: `[]` too)."""
+    try:
+        return load_state(run_dir)
+    except Exception:  # noqa: BLE001 -- unreadable, or not a run state
+        return None
+
+
 def handoff_chain(run_dir: str, limit: int = 8, kept: bool = False) -> list[str]:
     """Every child run this run continued in, in order; with `kept`, also a child an amendment refused at signing
-    left for the owner (main.py stores each with the run: Codex r1)."""
+    left for the owner, or one an interrupted hand-off signed (main.py stores each with the run: Codex r1): only
+    after a recorded refusal or an unfinished hand-off, and only the child this run's request made (Codex r3 on #342,
+    P1-11; Codex r1 of #349)."""
+    return list(iter_handoff_chain(run_dir, limit, kept))
+
+
+def iter_handoff_chain(run_dir: str, limit: int = 8, kept: bool = False):
+    """handoff_chain, one run at a time: main.py stores each run before it reads the next (Codex r2 of #349)."""
     out, cur = [], run_dir
     while len(out) < limit:
         nxt = handoff_child(cur)
         if nxt is None and kept:
-            try:
-                la = json.load(open(os.path.join(cur, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
-            except (OSError, ValueError, AttributeError):
-                la = {}
-            nxt = _child_of(cur, la.get("child"))
+            nxt = _kept_child(cur)
             if nxt is not None and nxt not in out:
-                out.append(nxt)
-            break
+                yield nxt
+            return
         if nxt is None or nxt in out:
-            break
+            return
         out.append(nxt)
+        yield nxt
         cur = nxt
-    return out
+
+
+def _kept_child(run_dir: str) -> str | None:
+    """A refused amendment's kept child, or the lead-signed child of a hand-off interrupted before the parent was saved
+    FINAL; only the child this run's request made (Codex r1 and r2 of #349)."""
+    try:
+        req = json.load(open(os.path.join(run_dir, SPEC_RETHINK_REQUEST)))
+    except (OSError, ValueError):
+        return None
+    la = req.get("lead_amendment") if isinstance(req, dict) else None
+    if not isinstance(la, dict):
+        return None
+    status = la.get("status")
+    if status in ("started", "signed_provisionally"):
+        st = _state_or_none(run_dir)
+        if st is None or st.status == AMENDED_PROVISIONAL:
+            return None
+    elif status != "refused":
+        return None
+    child = _child_of(run_dir, la.get("child"))
+    if child is None or not _made_by(child, req, run_dir):
+        return None
+    if status != "refused":              # an unfinished hand-off: only a child with its state and the lead's signature
+        from toolkit.spec import signoff as SO
+        if not (_state_or_none(child) is not None and SO.status(child) == "signed"
+                and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
+            return None
+    return child
 
 
 # ------------------------------------------------------------------ self-test
@@ -3386,6 +3787,357 @@ def _self_test_lead_amend(ok, td: str) -> None:
        f"T_LEAD_AMEND_BRIEF_RESUME an interrupted hand-off with a legacy brief signature is refused, the child kept ({la})")
     ok(AMEND_LOCK.startswith("analysis/") and "analysis/*" in harness_owned(),
        "T_LEAD_AMEND_LOCK_PATH the lock lives under a path reserved for every run (no owner-mode deliverable changes)")
+    ok(handoff_chain(d, kept=True) == [d + ".amend1"],
+       "T_LEAD_AMEND_KEPT_CHAIN a refused amendment's verified kept child is stored with the run")
+    _self_test_lead_amend_r3(ok, td, parent, good, _boom)
+
+
+def _self_test_lead_amend_r3(ok, td: str, parent, good: dict, _boom) -> None:
+    """Codex round 3 of #342 on the lead amendment (#330): findings 4-12, each from its reproduction."""
+    import shutil as _sh
+    import threading
+    from v2_tasks import StubTasks
+    tdr = os.path.realpath(td)
+
+    def machine(rd):
+        return Machine(rd, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
+
+    def interrupted(name):       # the child made and signed by the lead, the parent not yet FINAL
+        d_ = parent(name, "lead", good)[0]
+        mi = machine(d_)
+        mi._go = _boom
+        try:
+            mi.step()
+        except KeyboardInterrupt:
+            pass
+        return d_
+
+    def pair(src, where):        # the parent and its child, copied together to another directory
+        os.makedirs(os.path.join(tdr, where))
+        for x in (src, src + ".amend1"):
+            _sh.copytree(x, os.path.join(tdr, where, os.path.basename(x)))
+        return os.path.join(tdr, where, os.path.basename(src))
+    # P1-4: an interruption just after the parent's FINAL state is saved still leaves a child bound to that state
+    d = parent("r3_final_window", "lead", good)[0]
+    real_save = globals()["save_state"]
+
+    def save_then_stop(rd, st):
+        real_save(rd, st)
+        if st.status == AMENDED_PROVISIONAL and os.path.realpath(rd) == d:
+            raise KeyboardInterrupt("stopped after FINAL")
+    globals()["save_state"] = save_then_stop
+    try:
+        machine(d).step()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        globals()["save_state"] = real_save
+    ok(load_state(d).status == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
+       f"T_R3_FINAL_WINDOW (P1-4) interrupted after the parent's FINAL is saved, the child already binds it "
+       f"({handoff_child(d)})")
+    # P1-5: recovering a restored copy of the parent alone never writes to the original tree
+    d = interrupted("r3_restore")
+    c0 = d + ".amend1"
+    snap = {f: open(os.path.join(c0, f), "rb").read() for f in ("metadata.json", STATE_FILE, AMENDMENT_RECORD)}
+    os.makedirs(os.path.join(tdr, "r3_restored"))
+    r = os.path.join(tdr, "r3_restored", "r3_restore")
+    _sh.copytree(d, r)
+    s = machine(r).run()
+    la = json.load(open(os.path.join(r, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+    ok(all(open(os.path.join(c0, f), "rb").read() == b for f, b in snap.items()) and handoff_child(r) is None
+       and s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and c0 not in json.dumps(la),
+       f"T_R3_RESTORED_ALONE (P1-5) a restored parent without its child is refused, the original child untouched "
+       f"({s}, {la})")
+    # P1-6: the parent's signature is checked again when an interrupted hand-off is recovered
+    d = interrupted("r3_resig")
+    open(os.path.join(d, AB.SPEC_FILE), "ab").write(b"# edited after signing\n")
+    s = machine(d).run()
+    la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused"
+       and "sign-off no longer holds" in la.get("why", "") and handoff_child(d) is None,
+       f"T_R3_RECOVER_PARENT_SIG (P1-6) a recovered hand-off whose parent spec changed since signing is refused ({la})")
+    # P1-10 and P1-11: strict lineage needs the matching parent digest; the kept-child fallback only follows a refusal
+    src = interrupted("r3_lineage")
+    machine(src).step()
+    for where, digest in (("r3_nodigest", None), ("r3_otherdigest", "0" * 64)):
+        p = pair(src, where)
+        mc = os.path.join(p + ".amend1", "metadata.json")
+        meta = json.load(open(mc))
+        pr = {k: v for k, v in meta["parent_run"].items() if k != "run_state_sha256"}
+        json.dump(dict(meta, parent_run=dict(pr, **({"run_state_sha256": digest} if digest else {}))), open(mc, "w"))
+        ok(load_state(p).status == AMENDED_PROVISIONAL and handoff_child(p) is None
+           and handoff_chain(p) == [] and handoff_chain(p, kept=True) == [],
+           f"T_R3_STRICT_LINEAGE (P1-10, P1-11) {where}: a child without the parent's final digest is neither resumed "
+           f"nor stored with it ({handoff_chain(p, kept=True)})")
+    # P2-12: a parent and child moved together, the original tree gone: the confirmation names the moved parent
+    p = pair(src, "r3_moved")
+    _sh.move(src, src + ".gone")
+    try:
+        al = amendment_lines(p + ".amend1")
+    finally:
+        _sh.move(src + ".gone", src)
+    ok(al and shlex.quote(p) in al[0] and f"`{src}`" not in al[0] and f"{shlex.quote(src)} " not in al[0],
+       f"T_R3_MOVED_COMMAND (P2-12) the owner's confirmation command names the moved parent ({al[:1]})")
+    # P1-8: the parent stays held across the hand-off; a second resumer cannot take over its child
+    d = parent("r3_handover", "lead", good)[0]
+    paused, go, got_b = threading.Event(), threading.Event(), []
+
+    def log_a(msg):
+        if "continuing in" in str(msg):
+            cst = load_state(d + ".amend1")
+            cst.state, cst.status = "FINAL", "completed"     # the child stops at once (the test stays small)
+            save_state(d + ".amend1", cst)
+            paused.set()
+            go.wait(60)
+    res_a = []
+    ta = threading.Thread(target=lambda: res_a.append(run_v2("q", d, StubTasks({}), signoff="lead", log=log_a,
+                                                             cross_engine_check=False)))
+    ta.start()
+    paused.wait(60)
+
+    def second():
+        try:
+            got_b.append(run_v2("q", d, StubTasks({}), signoff="lead", log=lambda *a: None, cross_engine_check=False))
+        except AmendmentLocked:
+            got_b.append("locked")
+    tb = threading.Thread(target=second)
+    tb.start()
+    tb.join(60)
+    go.set()
+    ta.join(60)
+    ok(got_b == ["locked"] and res_a == ["completed"],
+       f"T_R3_HANDOVER (P1-8) a second resumer during the hand-off fails clearly; the first continues in the child "
+       f"({got_b}, {res_a})")
+    # P1-9: a direct Machine whose constructor read the state before another process's hand-off never writes it back
+    d = parent("r3_stale_ctor", "lead", good)[0]
+    real_load, read, release, errs = globals()["load_state"], threading.Event(), threading.Event(), []
+    blocked = []
+
+    def slow_load(rd):
+        st_ = real_load(rd)
+        if threading.current_thread().name == "r3-second" and not blocked:
+            blocked.append(1)
+            read.set()
+            release.wait(30)
+        return st_
+
+    def ctor():
+        try:
+            machine(d)
+        except AmendmentLocked as e:
+            errs.append(str(e))
+    globals()["load_state"] = slow_load
+    try:
+        t2 = threading.Thread(target=ctor, name="r3-second")
+        t2.start()
+        read.wait(30)
+        try:
+            machine(d).step()
+        except AmendmentLocked as e:
+            errs.append(str(e))
+        release.set()
+        t2.join(60)
+    finally:
+        globals()["load_state"] = real_load
+    made = os.path.lexists(d + ".amend1")
+    ok(made == (load_state(d).status == AMENDED_PROVISIONAL),
+       f"T_R3_STALE_CTOR (P1-9) a constructor that read the state before the hand-off never writes it back "
+       f"(child made: {made}; parent status {load_state(d).status}; {len(errs)} refused)")
+    _self_test_lead_amend_r4(ok, tdr, parent, good, interrupted, pair, machine)
+
+
+def _self_test_lead_amend_r4(ok, tdr: str, parent, good: dict, interrupted, pair, machine) -> None:
+    """Codex round 1 of #349 on the lead amendment's recovery, lineage and storage."""
+    import shutil as _sh
+    from toolkit.spec import amend as AM
+    # R1-1: an interrupted hand-off (the parent still at SPEC) stores its verified signed child
+    d = interrupted("r4_store")
+    ok(load_state(d).status is None and handoff_chain(d, kept=True) == [d + ".amend1"],
+       f"T_R4_STORE_INTERRUPTED an interrupted hand-off's signed child is stored with the parent "
+       f"({handoff_chain(d, kept=True)})")
+    # R1-2: recovery never adopts a same-named child made from another spec or another amendment
+    for name, field, value in (("r4_foreign_spec", "parent_spec_sha256", "f" * 64), ("r4_foreign_id", "amendment", "B1")):
+        d = interrupted(name)
+        mc = os.path.join(d + ".amend1", "metadata.json")
+        json.dump(dict(json.load(open(mc)), **{field: value}), open(mc, "w"))
+        before = open(mc, "rb").read()
+        s = machine(d).run()
+        la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
+        ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and open(mc, "rb").read() == before
+           and handoff_chain(d, kept=True) == [],
+           f"T_R4_FOREIGN_CHILD {name}: a child this request did not make is neither adopted, relinked nor stored ({la})")
+    # R1-3: a restored parent whose sibling is a link to the original child never writes through it
+    d = interrupted("r4_link")
+    snap = {f: open(os.path.join(d + ".amend1", f), "rb").read() for f in ("metadata.json", AMENDMENT_RECORD)}
+    os.makedirs(os.path.join(tdr, "r4_linked"))
+    r = os.path.join(tdr, "r4_linked", "r4_link")
+    _sh.copytree(d, r)
+    os.symlink(d + ".amend1", r + ".amend1")
+    s = machine(r).run()
+    ok(s == "paused:awaiting_spec_amendment" and handoff_child(r) is None and handoff_chain(r, kept=True) == []
+       and all(open(os.path.join(d + ".amend1", f), "rb").read() == b for f, b in snap.items()),
+       f"T_R4_LINKED_CHILD a linked sibling is not a child: refused, the original untouched ({s})")
+    # R1-4: a lineage write that fails leaves the parent at SPEC, recoverable; the next resume finishes the hand-off
+    # (Codex r2 of #349: the error injected, so it holds for any user, and the retry on the same machine)
+    d = interrupted("r4_readonly")
+    real_wj, failed = globals()["_write_json"], []
+
+    def fail_once(rd, rel, doc):
+        if os.path.realpath(rd) == d + ".amend1" and not failed:
+            failed.append(rel)
+            raise PermissionError("injected")
+        return real_wj(rd, rel, doc)
+    m4 = machine(d)
+    globals()["_write_json"] = fail_once
+    try:
+        m4.run()
+        raised = None
+    except OSError as e:
+        raised = type(e).__name__
+    finally:
+        globals()["_write_json"] = real_wj
+    st1, meta1 = load_state(d), json.load(open(os.path.join(d, "metadata.json")))
+    s = m4.run()
+    ok(raised and st1.status is None and st1.state == "SPEC" and meta1.get("status") != AMENDED_PROVISIONAL
+       and m4.st.state == "FINAL" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
+       f"T_R4_RELINK_FAILS a failed lineage write is raised before the parent is FINAL (state and metadata); the same "
+       f"machine's retry finishes it ({raised}, {st1.state}, {meta1.get('status')}, {s})")
+    # R1-6: the kept child is verified by the signed digest the request names, not the working spec's bytes
+    d = interrupted("r4_kept")
+    sp, keep = os.path.join(d, AB.SPEC_FILE), None
+    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    machine(d).run()                                  # refused (the legacy brief), the child kept
+    keep = open(sp, "rb").read()
+    os.remove(sp)
+    gone = handoff_chain(d, kept=True)
+    open(sp, "wb").write(b"# another spec\n")
+    mc = os.path.join(d + ".amend1", "metadata.json")
+    meta0 = open(mc, "rb").read()
+    json.dump(dict(json.loads(meta0), parent_spec_sha256=hashlib.sha256(b"# another spec\n").hexdigest()), open(mc, "w"))
+    other = handoff_chain(d, kept=True)
+    open(sp, "wb").write(keep)
+    open(mc, "wb").write(meta0)
+    ok(gone == [d + ".amend1"] and other == [],
+       f"T_R4_KEPT_SIGNED_DIGEST a kept child is stored by the request's signed digest: also without the working spec, "
+       f"never by replacement bytes ({gone}, {other})")
+    # R1-7 (P2): a manual amendment moved with its parent names the moved parent (verified by the parent-state digest)
+    d = parent("r4_manual", "lead", good)[0]
+    st = load_state(d)
+    st.state, st.status = "FINAL", "completed"
+    save_state(d, st)
+    import yaml
+    pf = os.path.join(tdr, "r4_manual_patch.yaml")
+    yaml.safe_dump(good, open(pf, "w"))
+    AM.amend(d, pf, signoff="lead", log=lambda *a: None)
+    p = pair(d, "r4_moved_manual")
+    _sh.move(d, d + ".gone")
+    try:
+        al = amendment_lines(p + ".amend1")
+    finally:
+        _sh.move(d + ".gone", d)
+    ok(al and f"`{p}`" in al[0] and f"`{d}`" not in al[0],
+       f"T_R4_MOVED_MANUAL a moved manual amendment names its moved parent ({al[:1]})")
+    _self_test_lead_amend_r5(ok, tdr, interrupted, pair, machine)
+
+
+def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
+    """Codex round 2 of #349: the child matched by its patch's content and the parent's own sign-off; storage of a
+    kept or unfinished child."""
+    import shutil as _sh
+    from toolkit.spec import signoff as SO
+    # R2-1: the same patch id with other content is not this request's child
+    d = interrupted("r5_patch")
+    rp = os.path.join(d, SPEC_RETHINK_REQUEST)
+    req = json.load(open(rp))
+    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, patch=dict(req["patch"], spec=[
+        {"set": "constraints.envelope_usd", "value": 8700}])))
+    s = machine(d).run()
+    la = json.load(open(rp)).get("lead_amendment") or {}
+    ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and handoff_child(d) is None,
+       f"T_R5_PATCH_CONTENT a child made from another patch under the same id is not adopted ({s}, {la.get('why')})")
+    # R2-2: a kept child and its request must match the parent's own sign-off record, not only each other
+    d = interrupted("r5_signoff")
+    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    machine(d).run()                                  # refused (the legacy brief), the child kept
+    sop = os.path.join(d, SO.SPEC_SIGNOFF)
+    so0 = open(sop, "rb").read()
+    rec = json.loads(so0)
+    rec["sha256"] = dict(rec.get("sha256") or {}, **{AB.SPEC_FILE: "e" * 64})
+    open(sop, "w").write(json.dumps(rec))
+    other = handoff_chain(d, kept=True)
+    open(sop, "wb").write(so0)
+    # R2-7: a damaged parent state does not drop a recorded refusal's kept child
+    stp = os.path.join(d, STATE_FILE)
+    st0 = open(stp, "rb").read()
+    damaged = []
+    for bad_state in (st0[:20], b"[]"):              # unparseable, and parseable but not a state (Codex r3 of #349)
+        open(stp, "wb").write(bad_state)
+        try:
+            damaged.append(handoff_chain(d, kept=True))
+        except Exception as e:  # noqa: BLE001 -- the finding
+            damaged.append(type(e).__name__)
+    open(stp, "wb").write(st0)
+    damaged = damaged[0] if damaged[0] == damaged[1] else damaged
+    # R1-5 follow-up: a malformed lead_amendment record is not an error
+    req = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
+    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, lead_amendment=["bad"]))
+    try:
+        bad = handoff_chain(d, kept=True)
+    except Exception as e:  # noqa: BLE001 -- the finding
+        bad = type(e).__name__
+    _write_json(d, SPEC_RETHINK_REQUEST, req)
+    ok(other == [] and damaged == [d + ".amend1"] and bad == [],
+       f"T_R5_KEPT_PARENT_SIGNOFF a kept child is stored only when the parent's own sign-off binds the request's spec; "
+       f"a damaged parent state keeps it; a malformed record stores nothing ({other}, {damaged}, {bad})")
+    # R2-8: an unfinished hand-off stores its child only once the child has its state and the lead's signature
+    d = interrupted("r5_unsigned")
+    os.remove(os.path.join(d + ".amend1", SO.SPEC_SIGNOFF))
+    unsigned = handoff_chain(d, kept=True)
+    d = interrupted("r6_bad_child_state")            # Codex r3 of #349: a child state that cannot be resumed
+    open(os.path.join(d + ".amend1", STATE_FILE), "wb").write(b"")
+    ok(unsigned == [] and handoff_chain(d, kept=True) == [],
+       f"T_R5_UNFINISHED_UNSIGNED an unfinished hand-off's unsigned child, or one whose state cannot be read, is not "
+       f"stored ({unsigned}, {handoff_chain(d, kept=True)})")
+    # Codex r3 of #349: a failure anywhere before the parent's FINAL state is saved (its own metadata write included)
+    # puts the machine back, and parent metadata the hand-off created is removed again
+    for name, where, drop_meta in (("r6_parent_meta", "parent", False), ("r6_no_meta", "child", True)):
+        d = interrupted(name)
+        if drop_meta:
+            os.remove(os.path.join(d, "metadata.json"))
+        real_wj, failed = globals()["_write_json"], []
+
+        def fail_once(rd, rel, doc):
+            if os.path.realpath(rd) == (d if where == "parent" else d + ".amend1") and not failed \
+                    and (where == "child" or rel == "metadata.json"):
+                failed.append(rel)
+                raise PermissionError("injected")
+            return real_wj(rd, rel, doc)
+        m6 = machine(d)
+        globals()["_write_json"] = fail_once
+        try:
+            m6.run()
+        except OSError:
+            pass
+        finally:
+            globals()["_write_json"] = real_wj
+        meta6 = os.path.join(d, "metadata.json")
+        meta_ok = not os.path.exists(meta6) if drop_meta else json.load(open(meta6)).get("status") != AMENDED_PROVISIONAL
+        st6 = load_state(d)
+        s = m6.run()
+        ok(failed and meta_ok and st6.state == "SPEC" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
+           f"T_R6_ROLLBACK {name}: a failed write before the parent's FINAL is saved leaves it at SPEC with its metadata as "
+           f"it was; the same machine's retry finishes the hand-off ({failed}, {meta_ok}, {st6.state}, {s})")
+    # R2-9 (P2): a moved manual amendment without its metadata names its parent from the amendment record's digest
+    src = os.path.join(tdr, "r4_manual")
+    p = pair(src, "r5_moved_manual")
+    os.remove(os.path.join(p + ".amend1", "metadata.json"))
+    _sh.move(src, src + ".gone")
+    try:
+        al = amendment_lines(p + ".amend1")
+    finally:
+        _sh.move(src + ".gone", src)
+    ok(al and f"`{p}`" in al[0],
+       f"T_R5_MOVED_NO_METADATA a moved manual amendment without metadata names its moved parent ({al[:1]})")
 
 
 def _self_test() -> int:
@@ -4733,6 +5485,15 @@ def _self_test() -> int:
             ok(False, f"T58-T60 analysis timeout and resume: {type(e).__name__}: {e}")
 
         _self_test_auto1a(ok, td, spike, new_run)
+        _self_test_writeup_rounds(ok, td, spike, new_run)
+        try:
+            _self_test_hb2_spec(ok, td, spike, new_run)
+        except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
+            ok(False, f"HS: {type(e).__name__}: {e}")
+        try:
+            _self_test_spec_p1s(ok, td, spike, new_run)
+        except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
+            ok(False, f"SP: {type(e).__name__}: {e}")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
@@ -5366,6 +6127,229 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         case(name, fn)
 
 
+def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
+    """Harness baseline hb1 (ranked fixes 6 and 7): the rounds a run spent with nothing to fix.
+
+    WR1-WR3 (cause G; dengue R1 and R2, measles R1, tb R2): a write-up-only fix went FIX_LOOP -> WRITE with the round
+    raised, and the post-write gate refused the domain and red-team files as a stale round ("round must be N, got
+    N-1"), re-running them through the schema repair. They now re-review the draft as a route of their own.
+    WR4-WR7 (cause H; malaria R2, measles R2 round 2): the medium rule sent a finding the owner (or the lead,
+    provisionally) had accepted to the fix loop, which had no task for it, and two more critique rounds ran."""
+    from v2_tasks import StubTasks
+
+    def mk(d, T, st):
+        return Machine(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
+
+    def hist(d):
+        return [h for h in load_state(d).history if "to" in h]
+
+    def case(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 -- before the fix exists this is the failure
+            import traceback
+            traceback.print_exc()
+            ok(False, f"{name}: {type(e).__name__}: {e}")
+
+    def rereview():
+        # WR1-WR3: a HIGH write-up finding: ACCEPT pre-write, the post-write gate patches it, the writer revises
+        wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect",
+               "done_when": [{"file": "manuscript.md", "contains": "(?i)effect is bounded"}]}
+        d, T, st = new_run("wr_rereview", {"critics": {1: {"critique-redteam": [wup]}}}, max_rounds=3)
+        s = mk(d, T, st).run()
+        h = hist(d)
+        edges = [(x["from"], x["to"]) for x in h]
+        whys = [str(x.get("why")) for x in h]
+        st2 = load_state(d)
+        ok(("FIX_LOOP", "WRITE") in edges and ("PRESENTATION", "CRITIQUE") in edges
+           and not any(w.startswith("schema errors") for w in whys),
+           f"WR1 a write-up-only fix goes WRITE -> PRESENTATION -> CRITIQUE, never through a schema repair "
+           f"({s}, {edges[-8:]}, {[w for w in whys if 'schema' in w]})")
+        i = edges.index(("PRESENTATION", "CRITIQUE"))
+        r = h[i]["round"]
+        ok("re-review" in whys[i] and f"critique:critique-domain:{r}" in T.calls
+           and f"critique:critique-redteam:{r}" in T.calls and edges[i + 1] == ("CRITIQUE", "GATE")
+           and h[i + 1]["round"] == r,
+           f"WR2 the re-review runs the domain and red-team critics at the revised draft's round, then the gate "
+           f"({whys[i]!r}, round {r}, {T.calls[-6:]})")
+        ok("schema" not in (st2.tries or {}) and "rereview" not in (st2.tries or {}),
+           f"WR3 the re-review uses no schema repair and leaves no pending re-review ({st2.tries})")
+
+    def rereview_not_accepted():
+        # WR1b: the same route for a not-accepted draft (which otherwise goes WRITE -> GATE): its presentation review
+        # is redone at the new round too, so the gate finds no stale file (Codex r1 of #344, P2-5)
+        import shutil
+        src = os.path.join(td, "wr_rereview")
+        d = os.path.join(td, "wr_rereview_na")
+        shutil.copytree(src, d)
+        T, st = StubTasks({}), load_state(d)
+        st.state, st.round, st.post_write, st.round_pending, st.write_mode = "WRITE", 2, False, False, "not_accepted"
+        st.status, st.forced_status = None, None
+        st.tries["rereview"] = 2
+        save_state(d, st)
+        for r in CRITICS + ("critique-presentation",):
+            StubTasks({}).critique(d, r, 1)
+        m = mk(d, T, st)
+        for _ in range(4):
+            m.step()
+        h = hist(d)
+        e = [(x["from"], x["to"]) for x in h]
+        ok(e[-4:-1] == [("WRITE", "PRESENTATION"), ("PRESENTATION", "CRITIQUE"), ("CRITIQUE", "GATE")]
+           and "critique:critique-domain:2" in T.calls and "critique:critique-redteam:2" in T.calls
+           and "critique:critique-presentation:2" in T.calls and not str(h[-1].get("why")).startswith("schema errors"),
+           f"WR1b a revised not-accepted draft goes WRITE -> PRESENTATION -> CRITIQUE (re-review) -> GATE, and the gate "
+           f"finds no stale round ({e[-4:]}, {h[-1].get('why')!r}, {T.calls})")
+
+    def owner_held_run():
+        # WR4-WR6: malaria R2 in miniature. A MEDIUM finding whose remedy is an owner amendment, with a test that fails;
+        # the lead accepts it provisionally. It is declared at once: no fix loop with no task, no second critique round.
+        dw = [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 9999}]
+        amend = {"id": "D-001", "severity": "MEDIUM", "target_stage": "PLAN", "claim": "net durability is untested",
+                 "fix_requires": "Owner amendment: add a durability decision test.", "done_when": dw}
+        d, T, st = new_run("wr_owner_held", {"critics": {1: {"critique-domain": [amend]}}}, signoff="lead",
+                           max_rounds=3)
+        s = mk(d, T, st).run()
+        h = hist(d)
+        to = [x["to"] for x in h]
+        crit = [c for c in T.calls if c.startswith("critique:critique-domain")]
+        ok(s == "completed_scope_declared" and "FIX_LOOP" not in to and crit == ["critique:critique-domain:1"],
+           f"WR4 an owner-accepted finding is declared, not sent to a fix loop with no task ({s}, {to[-8:]}, {crit})")
+        ok(to.count("OWNER_DECISION") == 1,
+           f"WR5 the same finding (same fingerprint) is asked once ({to.count('OWNER_DECISION')} request(s))")
+        import yaml
+        dec = yaml.safe_load(open(os.path.join(d, DECLARED_FILE))) or {}
+        g = json.load(open(os.path.join(d, "final_gate.json")))
+        ok([x.get("id") for x in dec.get("declared") or []] == ["D-001"] and g.get("rule_matched") == "3m"
+           and "owner" in str(g.get("rationale")),
+           f"WR6 the write-up declares it, and the gate says the owner answered it ({dec.get('declared')}, "
+           f"{g.get('rule_matched')}, {g.get('rationale')!r})")
+
+    def pending_post_write():
+        # WR9 (Codex r2 of #344, P1-1): the owner accepted D-001 pre-write; the presentation review raises P-001, whose
+        # remedy is an owner amendment. The post-write gate asks the owner before it publishes a final disposition:
+        # no final_gate.json, and the report's status is pending, while P-001 waits.
+        import scope_signoff as _SS
+        dw = [{"file": "analysis_settings.yaml", "key": "uncertainty.draws", "op": ">=", "value": 9999}]
+        amend = {"id": "D-001", "severity": "MEDIUM", "target_stage": "PLAN", "claim": "durability untested",
+                 "fix_requires": "Owner amendment: add a durability test.", "done_when": dw}
+        pres = {"id": "P-001", "severity": "MEDIUM", "target_stage": "WRITE", "claim": "the comparator label is unclear",
+                "fix_requires": "Owner amendment: rename the comparator in the spec.",
+                "done_when": [{"file": "manuscript.md", "contains": "(?i)funded plan comparator"}]}
+        d, T, st = new_run("wr_pending_pw", {"critics": {1: {"critique-domain": [amend],
+                                                            "critique-presentation": [pres]}}}, max_rounds=1)
+        s1 = mk(d, T, st).run()
+        _SS.sign(d, "owner", all_decision="accept", note="WR9")
+        json.dump({"action": "DECLARE_SCOPE", "stale": True}, open(os.path.join(d, "final_gate.json"), "w"))
+        s2 = mk(d, StubTasks(T.s), None).run()
+        rep = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
+        req = json.load(open(os.path.join(d, "scope_signoff_request.json")))
+        ok(s1 == s2 == "paused:awaiting_scope_signoff" and [i.get("finding") for i in req.get("items") or []] == ["P-001"]
+           and not os.path.exists(os.path.join(d, "final_gate.json")) and "completed_scope_declared" not in rep
+           and "P-001" not in open(os.path.join(d, DECLARED_FILE)).read(),
+           f"WR9 a post-write gate with a finding awaiting the owner publishes no final disposition ({s1}, {s2}, "
+           f"final_gate: {os.path.exists(os.path.join(d, 'final_gate.json'))}, declared status in report: "
+           f"{'completed_scope_declared' in rep})")
+
+    def answer_binds_current_text():
+        # WR10 (Codex r2 of #344, P1-2): the owner's accept holds a finding only for the claim and remedy it was given
+        # for, as the gate reads them now
+        d = os.path.join(td, "wr_owner_held")          # WR4's run: the lead accepted D-001 as stated
+        o = {"id": "D-001", "claim": "net durability is untested",
+             "fix_requires": "Owner amendment: add a durability decision test."}
+        ok(owner_accepted_now(d, [o], True) == {"D-001"} and owner_accepted_now(d, [dict(o, fix_requires=None)], True)
+           == set() and owner_accepted_now(d, [o], False) == set(),
+           "WR10 an accept holds the finding as answered; a revised remedy, or a lead answer in an owner run, does not")
+
+    def medium_rule_unit():
+        # WR7: the rule itself. A tested finding the owner holds is declared; a tested one the fix loop can work to is
+        # still patched while rounds remain.
+        op = [{"id": "D-001", "tested": True, "severity": "MEDIUM", "source": "critique-domain", "claim": "c"}]
+        acc = {"action": "ACCEPT", "rule_matched": "4"}
+        d1 = apply_medium_rule(acc, op, 2, True, owner_held={"D-001"})
+        d2 = apply_medium_rule(acc, op, 2, True)
+        d3 = apply_medium_rule(acc, op + [dict(op[0], id="R-002")], 2, True, owner_held={"D-001"})
+        ok(d1["action"] == "DECLARE_SCOPE" and d1["rule_matched"] == "3m" and d2["action"] == "PATCH_OR_RETHINK"
+           and d3["action"] == "PATCH_OR_RETHINK" and d3["open_tested"] == ["R-002"],
+           f"WR7 the medium rule never sends an owner-held finding to the fix loop ({d1['action']}, {d2['action']}, "
+           f"{d3.get('open_tested')})")
+        led = {"A": FL.Finding(id="A", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                               status="owner_accepted", resolution_type="owner_decision"),
+               "B": FL.Finding(id="B", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                               status="open", fix_requires="Owner amendment: x"),
+               "C": FL.Finding(id="C", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                               status="open", fix_requires="re-run the batch"),
+               "E": FL.Finding(id="E", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                               status="owner_declined", resolution_type="owner_decision")}
+        ok(owner_held(led) == {"A"}, f"WR7b owner-held: answered and accepted only; one awaiting the owner's answer is "
+                                     f"not declared before it (Codex r1 of #344, P1-1) ({sorted(owner_held(led))})")
+        # WR7c (Codex r1 of #344, P1-1): post-write, an unanswered amendment is not declared (no DECLARE_SCOPE is
+        # published while the owner has not answered); the gate keeps it as fix-loop work and asks the owner first
+        d4 = apply_medium_rule(acc, op, 2, True, owner_held=owner_held({"D-001": led["B"]}))
+        ok(d4["action"] == "PATCH_OR_RETHINK", f"WR7c an unanswered amendment is not declared ({d4['action']})")
+
+    def zero_tasks_prewrite():
+        # WR8-WR9: pre-write, a fix loop with no task where every open finding the gate holds is the write-up's or
+        # the owner's goes to WRITE, not to another critique round; one with an open finding a task could fix does not.
+        import fix_loop as _FX
+        real = _FX.run_loop
+        # Codex r1 of #344: a rendered report.md counts as a draft (P1-2), and a gate that holds an unresolved HIGH (a
+        # declared finding it still blocks on: P1-3) or patches by another rule (P2-4) keeps its critique round
+        gate4m = {"action": "PATCH_OR_RETHINK", "rule_matched": "4m", "open_tested": ["W"], "unresolved_high": [],
+                  "owner_held": ["A"]}
+        # Codex r2 of #344: the mode follows what this gate holds, not an older owner-accepted finding (P1-4: wr_zero_wu2,
+        # whose gate holds only the write-up's W), and the pre-write plan is kept apart from this round's post-write one
+        # (P1-3)
+        for name, extra, want, gate, report in (
+                ("wr_zero_wu", None, "WRITE", gate4m, False),
+                ("wr_zero_wu2", None, "WRITE", dict(gate4m, owner_held=[]), False),
+                # Codex r3 of #344 (P1-1): the ledger still says A is accepted, but this gate read A as revised (not
+                # held, in open_tested); and a gate record with no owner_held list (an older gate) takes no shortcut
+                ("wr_zero_revised", None, "CRITIQUE", dict(gate4m, open_tested=["W", "A"], owner_held=[]), False),
+                ("wr_zero_oldgate", None, "CRITIQUE", {k: v for k, v in gate4m.items() if k != "owner_held"}, False),
+                ("wr_zero_fixable", "C", "CRITIQUE", gate4m, False),
+                ("wr_zero_report", None, "CRITIQUE", gate4m, True),
+                ("wr_zero_high", None, "CRITIQUE", dict(gate4m, unresolved_high=[{"id": "D-9", "severity": "HIGH"}]),
+                 False),
+                ("wr_zero_rule2", None, "CRITIQUE", dict(gate4m, rule_matched="2"), False),
+                ("wr_zero_nogate", None, "CRITIQUE", None, False)):
+            d, T, st = new_run(name, {}, max_rounds=3)
+            if gate is not None:
+                json.dump(gate, open(os.path.join(d, "gate_r1.json"), "w"))
+            if report:
+                open(os.path.join(d, "report.md"), "w").write("# Report\n")
+            led = {"W": FL.Finding(id="W", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                                   status="open", owner_state="WRITE", target_stage="WRITE"),
+                   "A": FL.Finding(id="A", kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                                   status="owner_accepted", resolution_type="owner_decision", blocking=True)}
+            if extra:
+                led[extra] = FL.Finding(id=extra, kind="critique_blocker", severity="MEDIUM", source="critique-domain",
+                                        status="open", owner_state="ANALYZE", blocking=True)
+            FL.save(d, led)
+            open(os.path.join(d, "fix_plan_r1.json"), "w").write('{"round": 1, "plan": {"tasks": []}}')
+            st.state, st.round, st.round_pending, st.post_write = "FIX_LOOP", 1, True, False
+            save_state(d, st)
+            _FX.run_loop = lambda *a, **k: {"round": 1, "tasks": 0, "rows": 0, "passed": 0, "rethink": None,
+                                            "write_up": ["W"], "owner_amendments": []}
+            try:
+                mk(d, T, st).step()
+            finally:
+                _FX.run_loop = real
+            s2 = load_state(d)
+            last = hist(d)[-1]
+            mode = "accepted" if name == "wr_zero_wu2" else "declared"
+            kept = (os.path.exists(os.path.join(d, "fix_plan_r1_prewrite.json"))
+                    and not os.path.exists(os.path.join(d, "fix_plan_r1.json")))
+            ok(s2.state == want and (want == "CRITIQUE" or (s2.round == 1 and not s2.round_pending
+                                                            and s2.write_mode == mode and kept)),
+               f"WR8 pre-write, a fix loop with no task goes to {want} ({name}: {s2.state}, round {s2.round}, "
+               f"pending {s2.round_pending}, mode {s2.write_mode}, {last.get('why')!r})")
+
+    for name, fn in (("WR1-WR3", rereview), ("WR1b", rereview_not_accepted), ("WR4-WR6", owner_held_run),
+                     ("WR7", medium_rule_unit), ("WR8", zero_tasks_prewrite), ("WR9", pending_post_write),
+                     ("WR10", answer_binds_current_text)):
+        case(name, fn)
+
+
 def _self_test_resume(ok, td: str, spike, new_run) -> None:
     """T58-T60 (Nigeria v2 full run, 2026-11-02: ANALYZE -> FINAL run_failed when the runner's 1-h limit killed the
     engine batch). A toy engine batch through scripts/compute.py, as a pipeline step before the spike's analysis."""
@@ -5984,8 +6968,9 @@ def _self_test_evidence(ok, td: str) -> None:
     os.remove(os.path.join(d, AB.SPEC_FILE))
     m = Machine(d, StubTasks({"spec": raw}), init_run(d, "toy question", 3, "lead", "v2", None, derived_inputs=False),
                 backend=toolkit, log=lambda *a: None, cross_engine_check=False)
-    until(m, n=4)
-    ok(m.st.state == "SPEC" and any("name the evidence dossier" in x for x in m.st.tries.get("spec_feedback") or [])
+    m.step()        # hb2 (HS6): the SPEC try itself hears it, before the evidence stage
+    ok(m.st.state == "SPEC" and m.st.tries.get("spec") == 1
+       and any("name the evidence dossier" in x for x in m.st.tries.get("spec_feedback") or [])
        and not os.path.exists(os.path.join(d, ED.DOSSIER_FILE)),
        f"T_EVIDENCE_NAME a spec that needs a dossier and names none is redrafted with the reason "
        f"({m.st.state}; {m.st.tries.get('spec_feedback')})")
@@ -6077,6 +7062,336 @@ def _self_test_evidence(ok, td: str) -> None:
         yaml.safe_dump(raw, open(os.path.join(d, AB.SPEC_FILE), "w"))
         ok(any("owns" in p or "evidence dossier" in p for p in deliverable_problems(d)),
            f"T_DELIVERABLE_DOSSIER a deliverable named {name} is refused ({deliverable_problems(d)})")
+
+
+def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
+    """HS1-HS7 (baseline hb1, 2026-11-22): a SPEC try that returns no draft (the 30-turn cap) replaced the
+    validation feedback, so the next try never saw the error and repeated it (tb R1, run_failed at the try cap); the
+    checks stopped at the first class that failed, so each try heard one class of problem (HS4-HS6); the drafter's
+    prompt did not state the two rules that cost retries in measles and dengue (HS7)."""
+    from v2_tasks import StubTasks
+
+    class Scripted(StubTasks):
+        """script["tries"]: per try, "bad" (an invalid draft), "good" (a valid one), "capped" (no draft written,
+        the call fails) or "capped_good" (a valid draft written, then the call fails, as at the turn cap)."""
+        def draft_spec(self, q, rd, fb):
+            self.fbs = getattr(self, "fbs", []) + [list(fb or [])]
+            kind = (self.s["tries"] + ["capped"] * 9)[len(self.fbs) - 1]
+            if kind == "capped":
+                return self._r("draft_spec", False, note="max turns")
+            spec = dict(self.s["spec"])
+            if kind in ("bad", "bad2"):
+                spec["decision_units"] = dict(spec["decision_units"], csv="missing_units_table.csv")
+            if kind in ("bad2", "noobj"):
+                spec.pop("objective", None)
+            if kind == "outside":
+                spec["decision_units"] = dict(spec["decision_units"], csv="../outside_units.csv")
+            if kind == "settings_capped":       # repairs only the settings, then hits the cap
+                from v2_tasks import _yaml_dump
+                _yaml_dump(self.s["settings"], os.path.join(rd, "analysis_settings.yaml"), rd)
+                return self._r("draft_spec", False, note="max turns")
+            settings = dict(self.s["settings"], bogus_key=1) if kind == "bad_settings" else self.s["settings"]
+            r = StubTasks(dict(self.s, spec=spec, settings=settings)).draft_spec(q, rd, fb)
+            return self._r("draft_spec", False, note="max turns") if kind == "capped_good" else r
+
+    def go(name, tries, cls=None):
+        d, T, st = new_run(name, {})
+        T = Scripted(dict(T.s, tries=tries))
+        m = (cls or Machine)(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        for _ in range(len(tries) + 1):
+            if m.st.state != "SPEC" or m.st.paused or m.st.status:
+                break
+            m.step()
+        return m, T
+
+    m, T = go("hs1", ["bad", "capped", "bad"])
+    first = [x for x in T.fbs[1] if "missing_units_table" in x]
+    ok(len(T.fbs) == 3 and first and any("missing_units_table" in x for x in T.fbs[2])
+       and any("max turns" in x for x in T.fbs[2]),
+       f"HS1 a try that returns no draft keeps the earlier validation feedback, and adds its own note ({T.fbs})")
+    ok(sum("missing_units_table" in x for x in T.fbs[2]) == len(first),
+       f"HS1b feedback carried from an earlier try is not repeated ({T.fbs[2]})")
+    m, T = go("hs2", ["capped_good"])
+    ok(m.st.state != "SPEC" and m.st.tries.get("spec") == 1,
+       f"HS2 a valid draft written before the call failed (the turn cap) is validated and used ({m.st.state}, "
+       f"{m.st.tries.get('spec_feedback')})")
+    # HS4: one try hears every check class (a missing cited file and a missing section), not only the first
+    m, T = go("hs4", ["bad2", "good"])
+    ok(len(T.fbs) >= 2 and any("missing_units_table" in x for x in T.fbs[1])
+       and any("missing section objective" in x for x in T.fbs[1]),
+       f"HS4 one SPEC try reports the cited-input and the pre-sign problems together ({T.fbs[1:2]})")
+
+    # HS5: a check class that raises is reported by name, and the other classes' problems are kept
+    class GeoBoom(Machine):
+        def _geometry_problems(self, rd=None):
+            raise RuntimeError("geometry boom")
+    m, T = go("hs5", ["bad", "good"], GeoBoom)
+    ok(len(T.fbs) >= 2 and any("missing_units_table" in x for x in T.fbs[1])
+       and any("geometry boom" in x for x in T.fbs[1]),
+       f"HS5 a check that raises is named and does not hide the others' problems ({T.fbs[1:2]})")
+
+    # HS6: the evidence stage's spec problems (decision inputs with no dossier named) are heard at SPEC, in the same
+    # try, not one stage later (tb R2: EVIDENCE sent the spec back for 7 missing decision inputs)
+    from toolkit.spec import evidence_draft as EDR
+    real = EDR.assess
+    try:
+        EDR.assess = lambda rd, raw=None: dict(real(rd, raw), spec_problems=["the options need 7 decision input(s)"])
+        m, T = go("hs6", ["good", "good"])
+    finally:
+        EDR.assess = real
+    ok(len(T.fbs) >= 2 and any("7 decision input" in x for x in T.fbs[1]) and m.st.tries.get("spec") >= 2,
+       f"HS6 the evidence stage's spec problems come back from the SPEC try ({T.fbs[1:2]}, {m.st.state})")
+
+    # HS7: the drafter's prompt states the two rules that cost SPEC retries; a fitted parameter is never moved under
+    # calibration (Codex r1 P2-7: calibration accepts kind calibrated only)
+    from v2_sdk_tasks import PROMPTS
+    pr = PROMPTS["draft_spec"]
+    ok("no digits" in pr and "decision test" in pr and "engine_parameters" in pr and "calibrated" in pr
+       and "a fitted one" in pr,
+       "HS7 the draft_spec prompt says: no digits in a decision test's text; no engine_parameters value for a "
+       "calibrated or fitted parameter (a fitted one is left to the engine)")
+
+    class Calls(Machine):
+        """Records which reading checks ran."""
+        def _geometry_problems(self, rd=None):
+            self.ran = getattr(self, "ran", []) + ["geometry"]
+            return super()._geometry_problems(rd)
+
+        def _evidence_assess(self, rd):
+            self.ran = getattr(self, "ran", []) + ["evidence"]
+            return super()._evidence_assess(rd)
+    # HS8 (Codex r1 P1-1): a cited file outside the run is refused, and no check reads it
+    AB.write_toy_units(os.path.join(td, "outside_units.csv"), n=12)
+    m, T = go("hs8", ["outside"], Calls)
+    fb8 = m.st.tries.get("spec_feedback") or []
+    ok(any("outside the run directory" in x for x in fb8) and not getattr(m, "ran", []),
+       f"HS8 a cited file outside the run is refused and no later check reads it ({getattr(m, 'ran', [])}, {fb8})")
+    # HS9 (Codex r1 P1-2): the evidence assessment (it builds the engine) runs only on a spec the pre-sign checks pass
+    m, T = go("hs9", ["noobj"], Calls)
+    ok("evidence" not in getattr(m, "ran", []) and any("objective" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"HS9 a spec the pre-sign checks refuse is not given to the evidence assessment ({getattr(m, 'ran', [])})")
+
+    # HS10 (Codex r1 P1-3): interrupted after the task's journal entry completed, a resume reaches the same decision
+    class Crash(Exception):
+        pass
+
+    class CrashOnce(Machine):
+        def _task(self, *a, **k):
+            r = super()._task(*a, **k)
+            if not getattr(self, "crashed", False):
+                self.crashed = True
+                save_state(self.run_dir, self.st)
+                raise Crash()
+            return r
+    d10, T10, st10 = new_run("hs10", {})
+    T10 = Scripted(dict(T10.s, tries=["capped_good"]))
+    m = CrashOnce(d10, T10, st10, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    try:
+        m.step()
+    except Crash:
+        pass
+    m2 = Machine(d10, T10, load_state(d10), backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m2.step()
+    ok(m2.st.state == "EVIDENCE" and len(T10.fbs) == 1,
+       f"HS10 a resume after the completed task replays it and still checks the draft it wrote ({m2.st.state}, "
+       f"{m2.st.tries.get('spec_feedback')})")
+    # HS11 (Codex r1 P1-4): a capped try that repaired only the settings has its draft checked again
+    m, T = go("hs11", ["bad_settings", "settings_capped"])
+    ok(any("bogus_key" in x for x in T.fbs[1]) and m.st.state == "EVIDENCE",
+       f"HS11 a capped try that changed only the settings is checked, and goes on ({m.st.state}, "
+       f"{m.st.tries.get('spec_feedback')})")
+    # HS14 (Codex r2 P1-2): when containment of the cited paths cannot be established, that is a problem, never a pass
+    import pipeline as _P
+    real_cp, n_cp = _P.cited_paths, []
+
+    def flaky(*a, **k):
+        n_cp.append(1)
+        if len(n_cp) >= 2:
+            raise OSError("listing failed")
+        return real_cp(*a, **k)
+    try:
+        _P.cited_paths = flaky
+        m, T = go("hs14", ["good"])
+    finally:
+        _P.cited_paths = real_cp
+    fb14 = m.st.tries.get("spec_feedback") or []
+    ok(m.st.state == "SPEC" and any("listing failed" in x for x in fb14),
+       f"HS14 a citation listing that fails is a problem, not a pass ({m.st.state}, {fb14})")
+    # HS15 (Codex r2 P1-5/P1-7/P2-8): a try with no completion output is checked on whatever draft files exist, with no
+    # comparison of the files before and after (a resume, a byte-identical rewrite or an odd file never skips it)
+    d15, T15, st15 = new_run("hs15", {})
+    T15 = Scripted(dict(T15.s, tries=["good"]))
+    StubTasks(T15.s).draft_spec("q", d15, None)        # a valid draft already on disk (an earlier, older journal)
+    T15 = Scripted(dict(T15.s, tries=["capped"]))
+    m = Machine(d15, T15, st15, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m.step()
+    ok(m.st.state == "EVIDENCE", f"HS15 a capped try leaves a valid draft on disk: it is checked and used, whatever "
+                                 f"changed during the try ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+    # HS16 (Codex r3 P1-1): the signed-configuration guard's problems go back to the drafter, whatever the backend
+    real_sc = AB.signed_config_problems
+    try:
+        AB.signed_config_problems = lambda spec: ["engine.config: more components than the engine's limit"]
+        m, T = go("hs16", ["good"])
+    finally:
+        AB.signed_config_problems = real_sc
+    ok(m.st.state == "SPEC" and any("engine's limit" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"HS16 the configuration guard's refusal reaches the drafter ({m.st.state}, {m.st.tries.get('spec_feedback')})")
+    # HS17 (Codex r3 P1-2): feedback the pre-sign checks cannot verify (a rethink's reasons) is never cleared by a
+    # capped try whose old draft passes those checks; the reasons are carried to the next try
+    d17, T17, st17 = new_run("hs17", {})
+    StubTasks(T17.s).draft_spec("q", d17, None)          # the earlier, valid draft
+    st17.tries["spec_feedback"] = ["rethink after review round 1: the comparator answers another question"]
+    save_state(d17, st17)
+    T17 = Scripted(dict(T17.s, tries=["capped"]))
+    m = Machine(d17, T17, st17, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m.step()
+    ok(m.st.state == "SPEC" and any("comparator" in x for x in m.st.tries.get("spec_feedback") or []),
+       f"HS17 a capped try after a rethink keeps the rethink's reasons and does not pass on the old draft "
+       f"({m.st.state}, {m.st.tries.get('spec_feedback')})")
+    # HS12 (Codex r1 P2-6): the cap on the feedback never drops this try's own problems
+    many = [f"problem {i}" for i in range(45)]
+    got12 = _carry_feedback(many, ["old one"])
+    ok(all(x in got12 for x in many), f"HS12 every current problem reaches the next try ({len(got12)})")
+
+    from types import SimpleNamespace as NS
+    from v2_sdk_tasks import SPEC_MAX_TURNS, SdkTasks
+    got = []
+
+    def q(prompt=None, options=None):
+        async def gen():
+            got.append(options.max_turns)
+            yield NS(total_cost_usd=0.0, session_id="hs3", is_error=False)
+        return gen()
+    hd = os.path.join(td, "hs3")
+    os.makedirs(hd)
+    t = SdkTasks(hd, query_fn=q)
+    t.set_allowance(1.0)
+    t._session("draft_spec", "x", "y", ())
+    t._session("pick_engine", "x", "y", ())
+    ok(got == [SPEC_MAX_TURNS, 30] and SPEC_MAX_TURNS > 30,
+       f"HS3 the spec draft has its own turn cap, above the 30 of the other tasks ({got})")
+    # HS13 (Codex r1 P1-5): an explicit cap is honoured by every task, the spec draft included
+    got.clear()
+    t5 = SdkTasks(hd, max_turns=5, query_fn=q)
+    t5.set_allowance(1.0)
+    t5._session("draft_spec", "x", "y", ())
+    ok(got == [5], f"HS13 a caller's explicit turn cap holds for the spec draft ({got})")
+    got.clear()
+    hw = os.path.join(hd, "wm")
+    os.makedirs(hw)
+    t5.world_model_seed(hw, {"question": "q"}, None, 1.0)
+    ok(got == [5], f"HS13b the explicit turn cap holds for the world-model seed's own session ({got})")
+
+
+def _self_test_spec_p1s(ok, td: str, spike, new_run) -> None:
+    """SP1-SP4 (Codex round 4 on #348, on code merged through #342): a capped try with no draft must not stop later
+    capped tries' drafts from being checked; a cited input that is not a regular file (a FIFO) is never opened by a later
+    check; the spec and its settings are refused as links or hard links before any check reads them; an explicit zero
+    turn cap is refused (it would remove the session's limit)."""
+    from v2_tasks import StubTasks, TaskResult
+
+    class Capped(StubTasks):
+        """Per try: "none" (no draft, capped) or "good" (a valid draft written, then capped)."""
+        def draft_spec(self, q, rd, fb):
+            self.n_ = getattr(self, "n_", 0) + 1
+            if self.s["tries"][self.n_ - 1] == "good":
+                StubTasks(self.s).draft_spec(q, rd, fb)
+            self.calls.append("draft_spec")
+            return TaskResult(False, None, 0.0, "max turns")
+    d1, T1, st1 = new_run("sp1", {})
+    T1 = Capped(dict(T1.s, tries=["none", "good", "good"]))
+    m = Machine(d1, T1, st1, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    for _ in range(3):
+        if m.st.state != "SPEC" or m.st.status:
+            break
+        m.step()
+    ok(m.st.state == "EVIDENCE", f"SP1 a first capped try with no draft does not stop the next capped try's valid draft "
+                                 f"from being checked ({m.st.state}, {m.st.status}, {m.st.tries.get('spec_feedback')})")
+
+    class Spy(Machine):
+        def _geometry_problems(self, rd=None):
+            self.ran = getattr(self, "ran", []) + ["geometry"]
+            return []
+
+        def _evidence_assess(self, rd):
+            self.ran = getattr(self, "ran", []) + ["evidence"]
+            return super()._evidence_assess(rd)
+    # SP3: a cited FIFO inside the run is refused and no later check opens it (it would block with no writer)
+    d3, T3, st3 = new_run("sp3", {})
+    m3 = Spy(d3, T3, st3, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    spec3 = dict(T3.s["spec"], decision_units=dict(T3.s["spec"]["decision_units"], csv="units_fifo.csv"))
+    StubTasks(dict(T3.s, spec=spec3)).draft_spec("q", d3, None)
+    os.mkfifo(os.path.join(d3, "units_fifo.csv"))
+    got3 = m3._spec_checks(d3)
+    ok(any("units_fifo.csv" in x and "regular file" in x for x in got3) and not getattr(m3, "ran", []),
+       f"SP3 a cited FIFO is refused and never opened by a later check ({getattr(m3, 'ran', [])}, {got3})")
+    # SP4: the spec and analysis_settings.yaml are refused as a symlink or a hard link, before any check reads them
+    marker = os.path.join(td, "sp4_fixture.yaml")
+    open(marker, "w").write("fixture_marker: 1\n")
+    res4 = {}
+    for name, rel, how in (("settings link", "analysis_settings.yaml", os.symlink),
+                           ("settings hard link", "analysis_settings.yaml", os.link),
+                           ("spec hard link", AB.SPEC_FILE, os.link)):
+        d4, T4, st4 = new_run("sp4_" + name.replace(" ", "_"), {})
+        T4.draft_spec("q", d4, None)
+        os.remove(os.path.join(d4, rel))
+        how(marker, os.path.join(d4, rel))
+        m4 = Spy(d4, T4, st4, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        got4 = m4._spec_checks(d4)
+        res4[name] = bool(any(rel in x and "link" in x for x in got4) and not any("fixture_marker" in x for x in got4)
+                          and not getattr(m4, "ran", []))
+    ok(all(res4.values()), f"SP4 a linked spec or settings file is refused before any check reads it ({res4})")
+    # SP5 (Codex r1 P1-1): through h_SPEC, a hard-linked spec is refused before the conflicts default rewrites it
+    d5, T5, st5 = new_run("sp5", {})
+
+    class Linking(StubTasks):
+        def draft_spec(self, q, rd, fb):
+            r = StubTasks(self.s).draft_spec(q, rd, fb)
+            os.link(os.path.join(rd, AB.SPEC_FILE), os.path.join(td, "sp5_other_name.yaml"))
+            return r
+    m5 = Machine(d5, Linking(T5.s), st5, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m5.step()
+    ok(m5.st.state == "SPEC" and any("hard links" in x for x in m5.st.tries.get("spec_feedback") or []),
+       f"SP5 a hard-linked spec is refused at the try's end, before the conflicts default is applied ({m5.st.state}, "
+       f"{m5.st.tries.get('spec_feedback')})")
+
+    # SP6 (Codex r1 P1-2/P1-3): a FIFO anywhere in the run, whatever path names it (a staged input a derivation reads,
+    # a name with a leading space), is refused before derivations or any check runs
+    class SpyAll(Spy):
+        def _derive(self, rd=None):
+            self.ran = getattr(self, "ran", []) + ["derive"]
+            return []
+    res6 = {}
+    for name, rel, cite in (("staged input", "data/inputs/t.csv", None), ("spaced name", " units.csv", " units.csv")):
+        d6, T6, st6 = new_run("sp6_" + name.replace(" ", "_"), {})
+        spec6 = T6.s["spec"] if cite is None else dict(
+            T6.s["spec"], decision_units=dict(T6.s["spec"]["decision_units"], csv=cite))
+        StubTasks(dict(T6.s, spec=spec6)).draft_spec("q", d6, None)
+        os.makedirs(os.path.dirname(os.path.join(d6, rel)), exist_ok=True)
+        os.mkfifo(os.path.join(d6, rel))
+        m6 = SpyAll(d6, T6, st6, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        m6.st.derived_inputs = True
+        got6 = m6._spec_checks(d6)
+        res6[name] = bool(any("regular file" in x for x in got6) and not getattr(m6, "ran", []))
+    ok(all(res6.values()), f"SP6 a FIFO in the run is refused before derivations or any reading check ({res6})")
+    # SP7 (Codex r1 P1-5): a run saved before this fix (feedback "draft_spec failed: ...", no checked copy) still has a
+    # later capped try's valid draft checked
+    d7, T7, st7 = new_run("sp7", {})
+    st7.tries.update(spec=1, spec_feedback=["draft_spec failed: max turns"])
+    save_state(d7, st7)
+    T7 = Capped(dict(T7.s, tries=["good"]))
+    m7 = Machine(d7, T7, st7, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m7.step()
+    ok(m7.st.state == "EVIDENCE", f"SP7 a capped try after an earlier no-draft note is checked ({m7.st.state}, "
+                                  f"{m7.st.tries.get('spec_feedback')})")
+    # SP2: an explicit zero turn cap is refused, never passed on as "no limit"
+    from v2_sdk_tasks import SdkTasks
+    try:
+        SdkTasks(os.path.join(td, "sp2"), max_turns=0)
+        refused = False
+    except ValueError:
+        refused = True
+    ok(refused, "SP2 SdkTasks(max_turns=0) is refused: the SDK reads 0 as no turn limit")
 
 
 def main(argv=None) -> int:
