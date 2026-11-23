@@ -1728,13 +1728,19 @@ class Machine:
         import yaml
         from lib.safe_io import read_nofollow
         try:
-            yaml.safe_load(read_nofollow(rd, AB.SPEC_FILE)[0].decode("utf-8"))     # never a link's target
-            from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
-            if CF.ensure_default(rd):
-                self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
+            data, fst = read_nofollow(rd, AB.SPEC_FILE)                             # never a link's target
+            if fst.st_nlink > 1:            # Codex r2 P1-4: nor another file's content through a hard link
+                return [f"spec unreadable: {AB.SPEC_FILE} has {fst.st_nlink} hard links: write it as its own file"]
+            yaml.safe_load(data.decode("utf-8"))
         except Exception as e:  # noqa: BLE001
             return [f"spec unreadable: {type(e).__name__}: {e}"]
         out: list[str] = []
+        try:
+            from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
+            if CF.ensure_default(rd):
+                self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
+        except Exception as e:  # noqa: BLE001 -- r2 P2-5: named, and the other checks still run
+            out.append(f"the conflicts default could not be applied: {type(e).__name__}: {e}")
 
         def run(name, fn) -> bool:
             try:

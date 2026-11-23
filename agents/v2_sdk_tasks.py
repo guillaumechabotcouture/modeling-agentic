@@ -489,6 +489,7 @@ class SdkTasks:
         self.query_fn = query_fn
         self.n = 0
         self.spec_check = None
+        self.busy = {"n": 0}         # validate_spec checks running now: the draft's edits wait (Codex r2 P1-2/P1-3)
 
     def set_spec_check(self, fn) -> None:
         """The machine's pre-sign checks on the current draft (a callable returning the problems), offered to the next
@@ -537,7 +538,7 @@ class SdkTasks:
         if kind == "draft_spec" and self.spec_check:
             from claude_agent_sdk import create_sdk_mcp_server
             servers = {SPEC_TOOL_SERVER: create_sdk_mcp_server(SPEC_TOOL_SERVER, tools=[
-                validate_spec_tool(self.spec_check)])}
+                validate_spec_tool(self.spec_check, busy=self.busy)])}
             extra = [VALIDATE_SPEC_TOOL]
         mine = TOOLS + extra
 
@@ -547,6 +548,8 @@ class SdkTasks:
             if name not in mine:
                 # Fail closed (main #97): no shell, so no full pipeline build and no background call.
                 return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(mine)})")
+            if name in ("Write", "Edit") and self.busy["n"]:
+                return enforcement.deny_output(f"{kind}: validate_spec is checking the draft; edit once it returns")
             if name in ("Write", "Edit"):
                 why = _allowed(ti.get("file_path", ""), self.run_dir, owns)
                 if why:
@@ -723,17 +726,32 @@ class SdkTasks:
 SdkTasks.pick_engine = _no_session_when_sole(SdkTasks.pick_engine)
 
 
-def validate_spec_tool(check, limit: int = MAX_VALIDATE_CALLS):
+def validate_spec_tool(check, limit: int = MAX_VALIDATE_CALLS, busy: dict | None = None):
     """The spec draft's in-process validate_spec tool (baseline hb1, ranked fix 10): `check()` is the machine's own
     pre-sign check chain on the current files (Machine._spec_checks), so a pass here is what the harness finds after
     the try. No arguments, no shell. A check that raises is an error result, never a pass; past `limit` calls in one
     try the tool says so (the turn and dollar caps bound the rest). One check at a time: the lock is taken before
-    the worker thread starts, so a queued call that is cancelled never runs its check."""
+    the worker thread starts, so a queued call that is cancelled never runs its check, and it is held until the worker
+    ends, even when the call is cancelled. `busy["n"]` counts running checks: the session's PreToolUse hook refuses a
+    Write or Edit while one runs, so the check reads (and the conflicts default is written to) a draft nobody edits."""
     from claude_agent_sdk import tool
     state = {"calls": 0, "lock": None}
+    busy = busy if busy is not None else {"n": 0}
 
     def run():
         return list(check() or [])
+
+    async def guarded():
+        busy["n"] += 1
+        try:
+            work = asyncio.ensure_future(asyncio.to_thread(run))
+            try:
+                return await asyncio.shield(work)
+            except asyncio.CancelledError:
+                await asyncio.gather(work, return_exceptions=True)     # the worker ends before the lock is released
+                raise
+        finally:
+            busy["n"] -= 1
 
     @tool("validate_spec", "Run the harness's pre-sign checks on the current decision_spec.yaml, its settings, "
           "derivations and cited inputs: the same checks the harness runs when your try ends. Takes no arguments. "
@@ -747,7 +765,7 @@ def validate_spec_tool(check, limit: int = MAX_VALIDATE_CALLS):
         state["lock"] = state["lock"] or asyncio.Lock()
         try:
             async with state["lock"]:
-                probs = await asyncio.to_thread(run)
+                probs = await guarded()
         except Exception as e:  # noqa: BLE001 -- fail closed: never a pass
             return {"is_error": True, "content": [{"type": "text", "text": (
                 f"validate_spec: the checks could not run: {type(e).__name__}: {e}"[:2000])}]}
