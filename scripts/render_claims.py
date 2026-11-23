@@ -450,21 +450,43 @@ def render_text(text: str, claims: dict[str, dict]) -> tuple[str, list[str]]:
     return new_text, unresolved
 
 
-_INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
-_ANY_REF_RE = re.compile(r"\[CLAIM:([^\]]*)\]")       # as report_claim_findings reads report.md: across lines too
+# One or two backticks, closed by the same run (CommonMark), on one line.
+_INLINE_CODE_RE = re.compile(r"(?<!`)(`{1,2})(?!`)([^\n]+?)(?<!`)\1(?!`)")
+_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_QUOTED_REF_RE = re.compile(r"\[CLAIM:([^\]\[\n]*)\]")    # one line, no bracket inside: never a link's bracket
+
+
+def _code_block_lines(text: str) -> list[tuple[int, int]]:
+    """Spans of fenced blocks (a fence indented up to three spaces, closed by the same character) and of lines
+    indented four spaces or a tab (an indented code block, or a nested list line: not normalised either way)."""
+    spans, pos, fence = [], 0, None
+    for line in text.splitlines(keepends=True):
+        m = _FENCE_LINE_RE.match(line)
+        if fence is None and m:
+            fence = (pos, m.group(1)[0])
+        elif fence is not None:
+            if m and m.group(1)[0] == fence[1]:
+                spans.append((fence[0], pos + len(line)))
+                fence = None
+        elif line.startswith(("    ", "\t")):
+            spans.append((pos, pos + len(line)))
+        pos += len(line)
+    if fence is not None:            # an unclosed fence runs to the end (CommonMark)
+        spans.append((fence[0], len(text)))
+    return spans
 
 
 def normalise_refs(text: str, claims: dict[str, dict]) -> str:
     """v2 write-up (hb2, tb R2): an inline code span whose whole content is a known claim reference, or a known
     claim id (one with '.' or '_', as report_claim_id_raw reads ids), is that reference: `[CLAIM:x]` or `x` becomes
-    [CLAIM:x], which render_text then renders. An id outside the ledger, a longer span and fenced blocks are left
+    [CLAIM:x], which render_text then renders. An id outside the ledger, a longer span and code blocks are left
     as written, so each is still reported."""
-    fenced = code_spans(text, inline=False)
+    blocks = _code_block_lines(text)
 
     def _sub(m: re.Match) -> str:
-        if in_spans(fenced, m.start()):
+        if in_spans(blocks, m.start()):
             return m.group(0)
-        inner = m.group(1).strip()
+        inner = m.group(2).strip()
         ref = _CLAIM_REF_RE.fullmatch(inner)
         cid = ref.group(1).strip() if ref else inner
         known = cid in claims and bool(_CLAIM_ID_RE.fullmatch(cid))
@@ -475,9 +497,11 @@ def normalise_refs(text: str, claims: dict[str, dict]) -> str:
 def quote_refs(text: str, claims: dict[str, dict], render: bool = True) -> str:
     """Text the harness quotes from a finding (its claim or remedy) holds no claim reference outside the ledger:
     hb2 (measles R1, dengue R2) quoted a critic's [CLAIM:x] and placeholder [CLAIM:id] into report.md, and the
-    writer repeated the placeholder from declared_findings.yaml. A reference outside the ledger becomes the words
-    `claim x`; a ledger one is rendered as its value (`render`, for report.md) or kept as a reference the writer may
-    use (for the writer's inputs). Code spans are no exception: what the harness quotes is never syntax."""
+    writer repeated the placeholder from declared_findings.yaml. A known id alone in inline code is first read as
+    its reference (normalise_refs). A reference outside the ledger becomes the words `claim x`; a ledger one is
+    rendered as its value (`render`, for report.md) or kept as a reference the writer may use (for the writer's
+    inputs). Any other `[CLAIM:` (unclosed, across lines) loses its bracket. Code spans are no exception: what the
+    harness quotes is never syntax."""
     def _sub(m: re.Match) -> str:
         cid = m.group(1).strip()
         c = claims.get(cid) if _CLAIM_ID_RE.fullmatch(cid or "") else None
@@ -489,7 +513,8 @@ def quote_refs(text: str, claims: dict[str, dict], render: bool = True) -> str:
             return render_claim(c)
         except Exception:  # noqa: BLE001 -- a claim that cannot render is named, never left as a reference
             return f"claim {cid}"
-    return _ANY_REF_RE.sub(_sub, text)
+    done = _QUOTED_REF_RE.sub(_sub, normalise_refs(text, claims))
+    return re.sub(r"\[CLAIM:(?![^\]\[\n]*\])", "CLAIM:", done)     # what is left of a marker
 
 
 def _builder():

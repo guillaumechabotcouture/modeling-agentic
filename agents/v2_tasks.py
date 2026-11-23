@@ -221,7 +221,7 @@ class StubTasks:
             text = f"# Report\n\n{head}{self.s['manuscript']}"
         if feedback and self.s.get("manuscript_repair"):     # a repair of the write-up (F6 S1-7)
             text = f"# Report\n\n{head}{self.s['manuscript_repair']}"
-        claims_fix = bool(findings) and all(str(f.get("id", "")).startswith("report_claim") for f in findings)
+        claims_fix = bool(findings) and all(f.get("repair") == "claims" for f in findings)
         if claims_fix:      # a claim-reference repair inside WRITE (hb2): scripted, or a writer that leaves the draft
             if not self.s.get("manuscript_claim_repair"):
                 return self._r(f"write:{mode}:claims")

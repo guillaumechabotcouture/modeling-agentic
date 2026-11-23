@@ -937,7 +937,8 @@ def report_claim_findings(run_dir: str) -> list[dict]:
     typed = typed_numbers(text, given_values(run_dir, claims))
     rp2 = os.path.join(run_dir, "report.md")
     if os.path.exists(rp2):
-        left = re.findall(r"\[CLAIM:([^\]]*)\]", open(rp2).read())
+        # a reference to an invalid claim is reported once, as invalid (the ledger's, not the writer's to repair)
+        left = [x for x in re.findall(r"\[CLAIM:([^\]]*)\]", open(rp2).read()) if x.strip() not in invalid]
         if left:
             out.append({"kind": "report_claim_unrendered", "severity": "HIGH", "stage": "WRITE", "target_stage": "WRITE",
                         "key": "unrendered", "scope_declarable": False,
@@ -2698,20 +2699,35 @@ class Machine:
         a reference left unrendered) is the writer's alone, and it was found only at the post-write gate, with no
         round left. It is repaired here, inside WRITE, before any gate, so it never costs a round: at most
         MAX_CLAIM_REPAIRS writer sessions, each told the findings. What is left goes to the gate, which still
-        refuses it (non-declarable HIGH): a number with no ledger entry is never accepted."""
+        refuses it (non-declarable HIGH): a number with no ledger entry is never accepted. A repair that types a
+        number the draft did not have is undone (the reference finding then stays for the gate), and report.md is
+        re-rendered from whatever manuscript.md holds after every session, finished or not (Codex r1 of #353)."""
+        mp = os.path.join(self.run_dir, "manuscript.md")
         for n in range(1, MAX_CLAIM_REPAIRS + 1):
             bad = [f for f in report_claim_findings(self.run_dir)
                    if f["severity"] == "HIGH" and f["kind"] in CLAIM_REF_KINDS]
             if not bad:
                 return
-            self.st.history.append({"at": _now(), "claim_repair": n, "state": "WRITE", "round": self.st.round,
-                                    "kinds": sorted({f["kind"] for f in bad}), "findings": len(bad)})
-            fs = [{"id": f"{f['kind']}:{f['key']}", "claim": f["claim"], "fix_requires": None} for f in bad]
-            res = self._task(f"WRITE#{self._visit()}:{mode}:claims{n}", "write", self.run_dir, mode,
-                             writeup=True, findings=fs)
-            if res is None or not res.ok or not self._has_draft():
+            key = f"WRITE#{self._visit()}:{mode}:claims{n}"
+            before = open(mp).read()
+            given = given_values(self.run_dir, _ledger_claims(self.run_dir) or {})
+            fs = [{"id": f"{f['kind']}:{f['key']}", "claim": f["claim"], "fix_requires": None, "repair": "claims"}
+                  for f in bad]
+            res = self._task(key, "write", self.run_dir, mode, writeup=True, findings=fs)
+            if res is None:                 # no session ran: nothing to record or re-render
                 return
+            after = open(mp).read() if self._has_draft() else None
+            new = sorted(set(typed_numbers(after, given)) - set(typed_numbers(before, given))) if after else []
+            if after is None or new:
+                _put(self.run_dir, "manuscript.md", before)
+            if not any(h.get("claim_repair_key") == key for h in self.st.history):     # once, also on a resume
+                self.st.history.append({"at": _now(), "claim_repair": n, "claim_repair_key": key, "state": "WRITE",
+                                        "round": self.st.round, "kinds": sorted({f["kind"] for f in bad}),
+                                        "findings": len(bad), "ok": bool(res.ok),
+                                        **({"undone_typed_numbers": new[:8]} if new else {})})
             render_report(self.run_dir, self.backend)
+            if not res.ok or after is None or new:
+                return
 
     def h_PRESENTATION(self):
         # The review of the draft is part of the write-up: like WRITE, it may use the write-up reserve (an accepted
@@ -7209,6 +7225,66 @@ def _self_test_claim_refs(ok, td: str, spike, new_run) -> None:
     # entry is never accepted).
     case("CR5", lambda: repair("cr5", {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n"},
                                MAX_CLAIM_REPAIRS, "run_failed"))
+
+    # Codex round 1 of #353.
+    def r1_units():
+        k = {"a.good": {"id": "a.good", "claim_kind": "scalar", "value": 5}}
+        RCL = __import__("render_claims")
+        fenced = "x\n  ```\n  SELECT `a.good` FROM t\n  ```\n"
+        ok(RCL.normalise_refs(fenced, k) == fenced, "CR8a an indented fenced block is code: nothing in it is normalised")
+        ok(RCL.normalise_refs("Use ``a.good`` here.", k) == "Use [CLAIM:a.good] here.",
+           "CR8b a known id in a double-backtick span is its reference too")
+        q = RCL.quote_refs("The prefix is `[CLAIM:`. See [source](notes.md).\nNext [CLAIM:a.good] and `a.good`.", k)
+        ok("[source](notes.md)" in q and "[CLAIM:" not in q and q.count("5") == 2,
+           f"CR8c quoting never eats a link's bracket, leaves no marker, and renders a code-span id as its value ({q!r})")
+        d = bare_run("cr9", "# Report\n\nIt averts [CLAIM:bad] cases.\n")
+        yaml.safe_dump({"claims": [{"id": "bad", "claim_kind": "scalar", "value": "lots"}]},
+                       open(os.path.join(d, "models", "claims_ledger.yaml"), "w"))
+        render_report(d, AB)
+        kinds = {f["kind"] for f in report_claim_findings(d)}
+        ok("report_claim_invalid" in kinds and not kinds & set(CLAIM_REF_KINDS),
+           f"CR9 a reference to an invalid ledger entry is reported once, as invalid: no writer repair ({kinds})")
+        t = StubTasks({"manuscript": "revised\n"})
+        dd = bare_run("cr10", "old\n")
+        t.write(dd, "accepted", findings=[{"id": "report_claim_id_raw:a.good", "claim": "c"}])
+        ok("revised" in open(os.path.join(dd, "manuscript.md")).read(),
+           "CR10 an ordinary WRITE visit with claim findings writes the draft; only a marked repair keeps it")
+
+    def r1_machine(name, write, want, check, what):
+        from v2_tasks import TaskResult
+        d, T, st = new_run(name, {"manuscript": "It averts [CLAIM:no.such.claim] cases.\n"}, max_rounds=1)
+        os.makedirs(os.path.join(d, "models"), exist_ok=True)
+        shutil.copy(os.path.join(REPO, "tests", "fixtures", "v2blind1", "claims_ledger.yaml"),
+                    os.path.join(d, "models", "claims_ledger.yaml"))
+        m = Machine(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        real = m._task
+
+        def _task(key, name_, *a, _real=real, **kw):
+            if name_ == "write" and key.split(":")[-1].startswith("claims"):
+                return write(d, TaskResult)
+            return _real(key, name_, *a, **kw)
+        m._task = _task
+        s = m.run()
+        reps = [x for x in load_state(d).history if "claim_repair" in x]
+        ok(s == want and check(d, reps), f"{name.upper()} {what} ({s}, {reps})")
+
+    def typed(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts 987654321 cases.\n")
+        return TR(True, None, 0.0, "")
+
+    def unfinished(d, TR):
+        open(os.path.join(d, "manuscript.md"), "w").write("# Report\n\nIt averts [CLAIM:headline.point] cases.\n")
+        return TR(False, None, 0.0, "stub: ended before its output file")
+
+    case("CR8-CR10", r1_units)
+    case("CR6", lambda: r1_machine(
+        "cr6", typed, "run_failed", lambda d, r: "987654321" not in open(os.path.join(d, "manuscript.md")).read()
+        and r and r[0].get("undone_typed_numbers"), "a repair that types a number is undone; the gate refuses the reference"))
+    case("CR7", lambda: r1_machine(
+        "cr7", unfinished, "completed", lambda d, r: "[CLAIM:" not in open(os.path.join(d, "report.md")).read()
+        and len(r) == 1 and r[0]["ok"] is False, "an unfinished session's fix is rendered before the gate reads report.md"))
+    case("CR11", lambda: r1_machine("cr11", lambda d, TR: None, "run_failed", lambda d, r: r == [],
+                                    "a repair with no allowance runs no session and records none"))
 
 
 def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
