@@ -3652,6 +3652,23 @@ def _parent_record(path: str) -> dict:
     return rec
 
 
+def _relaunch_motivation(path: str) -> dict:
+    """metadata.json motivated_by for a relaunch from `path` (toolkit/spec/amend.py motivation): the parent's
+    rethink request's findings when it wrote one, else `unstated`. Recorded, never raised: a parent that cannot be read
+    gives `source: unreadable` with the error."""
+    from lib.safe_io import read_nofollow
+    from toolkit.spec import amend as AM
+    try:
+        try:
+            req = json.loads(read_nofollow(path, SPEC_RETHINK_REQUEST)[0])
+        except FileNotFoundError:
+            req = None
+        return AM.motivation(path, req if isinstance(req, dict) else None)
+    except Exception as e:  # noqa: BLE001
+        return {"schema": AM.MOTIVE, "parent_run": os.path.basename(os.path.abspath(path)), "source": "unreadable",
+                "findings": [], "error": type(e).__name__}
+
+
 def _runtime_ids() -> dict:
     """The model ids and the Agent SDK version this process runs with ("unknown" when they cannot be read)."""
     try:
@@ -3705,6 +3722,7 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
                  "max_rounds": max_rounds, "signoff": signoff})
     if os.environ.get(PARENT_ENV):
         meta["parent_run"] = _parent_record(os.environ[PARENT_ENV])
+        meta["motivated_by"] = _relaunch_motivation(os.environ[PARENT_ENV])
     _write_json(run_dir, "metadata.json", meta)
     save_state(run_dir, st)
     return st
@@ -3957,8 +3975,13 @@ def _self_test_lead_amend(ok, td: str) -> None:
         AM._pre_sign(d, False)
         SO.write_sheet(d)
         SO.sign(d, mode)
-        open(os.path.join(d, FL.LEDGER), "w").write("")
-        task = {"id": "T1", "findings": [], "action": "rethink", "owner_state": "SPEC", "brief": "raise the envelope"}
+        # the rethink names the finding that motivated it (toolkit/spec/amend.py motivation: required for a rethink);
+        # MEDIUM, so no review condition is carried from it
+        open(os.path.join(d, FL.LEDGER), "w").write(json.dumps({
+            "id": "D-001", "kind": FL.CRITIC_KIND, "severity": "MEDIUM", "source": "critique-domain", "status": "open",
+            "owner_state": "SPEC", "claim": "the envelope is last year's", "fix_requires": "raise the envelope"}) + "\n")
+        task = {"id": "T1", "findings": ["D-001"], "action": "rethink", "owner_state": "SPEC",
+                "brief": "raise the envelope"}
         _write_json(d, "fix_plan_r2.json", {"round": 2, "plan": {"tasks": [dict(task, **({"patch": patch} if patch
                                                                                      else {}))]}})
         st = RunState(question="q", state="SPEC", round=2, max_rounds=3, signoff=mode, budget_usd=5.0, spent_usd=spent)
@@ -5254,6 +5277,23 @@ def _self_test() -> int:
         ok(pr.get("run_dir") == os.path.basename(d) and pr.get("run_state_sha256") == hashlib.sha256(
             open(os.path.join(d, STATE_FILE), "rb").read()).hexdigest(),
            f"RR5 a run launched with MA_PARENT_RUN records its parent and the parent's run_state hash ({pr})")
+        mb5 = json.load(open(os.path.join(dp, "metadata.json"))).get("motivated_by") or {}
+        dq, rqp = os.path.join(td, "rr5_child_rq"), os.path.join(d, SPEC_RETHINK_REQUEST)
+        rq5 = open(rqp, "rb").read() if os.path.isfile(rqp) else None
+        _write_json(d, SPEC_RETHINK_REQUEST, {"round": 1, "findings": [{"id": "X-404"}], "briefs": []})
+        os.environ["MA_PARENT_RUN"] = d
+        try:
+            init_run(dq, "toy question", derived_inputs=False)
+        finally:
+            os.environ.pop("MA_PARENT_RUN", None)
+            os.remove(rqp)
+            if rq5 is not None:
+                open(rqp, "wb").write(rq5)
+        mq = json.load(open(os.path.join(dq, "metadata.json"))).get("motivated_by") or {}
+        ok(mb5.get("parent_run") == os.path.basename(d)
+           and mb5.get("source") == ("unstated" if rq5 is None else "rethink_request")
+           and mq.get("source") == "rethink_request" and [f.get("id") for f in mq.get("findings") or []] == ["X-404"],
+           f"RR5b a relaunch records motivated_by: the parent's rethink request's findings, else unstated ({mb5}, {mq})")
         cwd6 = os.getcwd()
         prs = []
         for k6, par in enumerate((os.path.join(td, "no_such_run"), ".")):
