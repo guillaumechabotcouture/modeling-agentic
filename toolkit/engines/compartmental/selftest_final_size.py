@@ -275,13 +275,15 @@ def _self_test() -> int:
     for _ in range(200):
         mid = (lo19 + hi19) / 2
         lo19, hi19 = (mid, hi19) if mid - (1 - (1 - e32) * (-2 * mid).exp()) < 0 else (lo19, mid)
-    ok(err is None and float(lo19) - 1e-13 <= r19[0][0, 0] <= float(hi19) + 1e-16,
+    # r3 P3-5: compared in Decimal, so rounding the reference cannot hide an overshoot
+    ok(err is None and lo19 - D("1e-13") <= D(float(r19[0][0, 0])) <= hi19,
        f"FD19 (r2 P1-2) float32 inputs: within tol below the root ({err or r19[0][0, 0]} vs {float(lo19)})")
     # FD20 (P2-3): slow but certified progress closes within the cap; it is not declared a floating-point limit
     r20, err = solve([[[1.0, 0.0], [1e-4, 1.0]]], [[1.0, 1.0]], [[1.21e-11, 0.0]], 1e-13, cap=1500)
     ok(err is None, f"FD20 (r2 P2-3) a slowly closing bracket is not aborted: {err or r20[1]}")
     # FD21 (P2-4): a row sum that overflows saturates the map instead of poisoning the bracket with NaN
-    r21, err = solve([[[0, 0, 0], [1, 0, 0], [1e308, 1e308, 0]]], np.ones((1, 3)), [[1e-9, 0, 0]], 1e-9)
+    # r3 P3-4: both sources at 1, so the last row sum really overflows
+    r21, err = solve([[[0, 0, 0], [1, 0, 0], [1e308, 1e308, 0]]], np.ones((1, 3)), [[1.0, 1.0, 0.0]], 1e-9)
     ok(err is None and np.all(np.isfinite(r21[0])) and abs(r21[0][0, 2] - 1.0) <= 1e-9,
        f"FD21 (r2 P2-4) an overflowing force saturates: {err or r21[0]}")
     # FD22 (P2-5): a structurally zero row is known exactly (z = e), at any tol
@@ -289,6 +291,19 @@ def _self_test() -> int:
         {"q": 0.0}, UnitSpec("q", {"N": [1e6], "s0": [1.0], "seed": 0.01}), Package("0", {}), H, 1))
     ok(err is None and o22.windows["all"]["attack_rate"] == 0.01,
        f"FD22 (r2 P2-5) zero transmission gives the seed exactly: {err or o22.windows['all']['attack_rate']}")
+
+    # Codex r3 of #351 (tests first): FD23-FD25
+    # FD23 (P1-1): the underflow allowance has a representable floor (a * TINY can itself round to zero)
+    r23, err = solve(np.diag([1e-150, 1e177, 1e175], -1)[None], [[1.0, 0.01, 1.0, 1.0]], [[1e-200, 0, 0, 0]], 1e-12)
+    ok((err is not None and "converged: false" in err) or (err is None and abs(r23[0][0, 3] - 0.6321205588285577) <= 1e-12),
+       f"FD23 (r3 P1-1) an allowance that would underflow keeps a floor ({err or r23[0][0, 3]})")
+    # FD24 (P2-2): contacts only from groups the seeds never reach do not make a seeded group's row non-zero
+    r24, err = solve([[[0.0, 1.0], [0.0, 0.0]]], [[1.0, 1.0]], [[0.01, 0.0]], 5e-18)
+    ok(err is None and r24[0].tolist() == [[0.01, 0.0]], f"FD24 (r3 P2-2) the seed is exact: {err or r24[0]}")
+    # FD25 (P2-3): the solver does not depend on the caller's floating-point error settings
+    with np.errstate(under="raise"):
+        r25, err = solve([[[2.0]]], [[1.0]], [[0.001]], 1e-13)
+    ok(err is None, f"FD25 (r3 P2-3) underflow handled locally: {err}")
 
     # FD13: the card says what the solver's steps are, and the version moved
     card = es.describe()
