@@ -24,8 +24,11 @@ with z, s and e as fractions of N_i, s the susceptible share after the intervent
 ## What changes
 
 - `CompartmentalEngine.run_batch`: when `final_generations` holds and `importation: deterministic`, solve the
-  relation for the whole batch at once (arrays B x G), on the groups the seeds reach. With e > 0 on those groups
-  (C irreducible there), the relation has a single root in [e, s]. The map T(z) = s − (s − e) exp(−q C z) is
+  relation for the whole batch at once (arrays B x G), on the groups the seeds reach. Reach is computed per member,
+  after the interventions: group j is reached when a path of contacts C_ij > 0 runs from a group with a surviving
+  seed (e_i > 0) through groups with susceptibles left (s > e). A group behind a fully immune one is not reached,
+  even though the contact mask connects it (Codex review: a chain A–B–C with B immune). Unreached groups get
+  z = e. On the reached groups the relation has a single root in [e, s]. The map T(z) = s − (s − e) exp(−q C z) is
   monotone, so iterating from the lower bound z = e and from the upper bound z = s brackets the root from both
   sides. Stop when the bracket is narrower than `tol` in every group: that is a bound on the error. A step-size test
   is not enough. With a 1e-12 seed in a growing epidemic, the first step from e changes z by about 1e-12 while the
@@ -61,7 +64,11 @@ identical: **engine 0.2 → 0.3**, with a new code sha256 in `engine_identity`. 
   identity that computed the rows (`compat_proof.py` near line 244), so a 0.2 → 0.3 proof alone is refused. There
   are two ways forward. One: `compat_proof` accepts a chain of committed proofs (0.1 → 0.2 → 0.3) and classifies
   cases by path, re-stamping only the byte-identical ones. Two: re-run the coverage pack on the VM. The second is
-  simpler, and its cost should be measured before choosing. Either way, the final-size configurations re-run.
+  simpler, and its cost should be measured before choosing. With option two, `compat_proof.py`'s self-test needs a
+  path for freshly computed rows: CP5 requires an all-identical proof and CP6 requires `restamped.proof`, and
+  neither holds for a fresh run. None of the three coverage configurations enables `final_size` today. Re-running
+  them therefore tests nothing new; a final-size coverage configuration has to be added for the pack to cover the
+  solver.
 - **CP8** binds the live calibrator files (`CALIBRATOR_FILES`: `toolkit/analysis/calibration.py`,
   `observation.py`, `oracles.py`) to the committed proof. The solver lives in `engine.py` and neither copies nor imports
   `oracles.py`. None of those files changes, so CP8 holds without

@@ -167,23 +167,41 @@ def _close(a, b) -> bool:
     return abs(float(a) - float(b)) <= REPLAY_RTOL * max(abs(float(b)), 1.0)
 
 
-def _well_formed(per_draw) -> bool:
-    """Every stored draw is {package: {units: int, cost: finite number, averted: finite number}}."""
+def _finite(x) -> bool:
+    """A real number a float holds finitely (an int too large for a float, or inf/nan, is not)."""
     import math
-    num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)  # noqa: E731
-    return isinstance(per_draw, list) and all(
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return False
+    try:
+        return math.isfinite(float(x))
+    except OverflowError:
+        return False
+
+
+def _well_formed(per_draw, totals) -> bool:
+    """Every stored draw is {package: {units: positive int, cost: finite number >= 0, averted: finite number}} and
+    every total a finite number (Codex r2 P1-3, P1-4)."""
+    return isinstance(per_draw, list) and isinstance(totals, list) and all(_finite(t) for t in totals) and all(
         isinstance(d, dict) and all(isinstance(e, dict) and isinstance(e.get("units"), int)
-                                    and not isinstance(e.get("units"), bool) and num(e.get("cost"))
-                                    and num(e.get("averted")) for e in d.values()) for d in per_draw)
+                                    and not isinstance(e.get("units"), bool) and e["units"] > 0
+                                    and _finite(e.get("cost")) and float(e["cost"]) >= 0.0
+                                    and _finite(e.get("averted")) for e in d.values()) for d in per_draw)
 
 
 def _sums_match(per: dict, total, key: str = "averted") -> bool:
-    """The package subtotals of one draw add up to its total, compared at the subtotals' own scale (benefits and
-    harms can cancel, so the rounding is that of the largest subtotal, not of the total)."""
+    """The package subtotals of one draw add up to its total. The total and the subtotals are sums of the same per-unit
+    values in different orders, so they may differ by summation round-off: at most about n x eps x the sum of the
+    absolute values over n units (Codex r2 P1-1: a bound on round-off, not a relative tolerance of the largest
+    subtotal, which let cancelling subtotals hide a real error), plus the replay tolerance on the total."""
     import math
-    vals = [float(e[key]) for e in per.values()]
-    scale = max([abs(float(total)), 1.0] + [abs(v) for v in vals])
-    return abs(math.fsum(vals) - float(total)) <= REPLAY_RTOL * scale
+    try:
+        vals = [float(e[key]) for e in per.values()]
+        n = max(1, sum(int(e["units"]) for e in per.values()))
+        err = abs(math.fsum(vals) - float(total))
+        bound = REPLAY_RTOL * max(abs(float(total)), 1.0) + 4.0 * n * 2.0 ** -52 * math.fsum(abs(v) for v in vals)
+        return math.isfinite(err) and err <= bound
+    except (OverflowError, ValueError, TypeError, KeyError):
+        return False
 
 
 def _same_sums(a: dict, b: dict) -> bool:
@@ -215,8 +233,9 @@ def _replay_stored(A, plan, uq, stored, log=None) -> dict:
     elif stored.get("primary") != A.primary or {str(i): v for i, v in (stored.get("plan") or {}).items()} \
             != {i: plan[i] for i in A.ids}:
         why = "the stored draws are for another plan or primary outcome"
-    elif not _well_formed(per) or not all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in tot):
-        why = "the stored draws are malformed (a package entry lacks units, cost or averted, or is not numeric)"
+    elif not _well_formed(per, tot):
+        why = ("the stored draws are malformed (a package entry lacks units, cost or averted, a number is not finite, "
+               "or a cost is negative)")
     elif len(costs) != nd:
         why = "the uncertainty record has no per-draw plan cost to check the stored costs against"
     else:
@@ -224,14 +243,18 @@ def _replay_stored(A, plan, uq, stored, log=None) -> dict:
         # (affordability.per_draw_cost), and its package outcomes to its stored total
         bad = [d for d in range(nd) if not _sums_match(per[d], tot[d])]
         badc = [d for d in range(nd) if not _sums_match(per[d], costs[d], key="cost")]
-        badu = [d for d in range(nd) if sum(e["units"] for e in per[d].values()) != len(A.ids)]
+        want_units = {}
+        for i in A.ids:
+            want_units[plan[i]] = want_units.get(plan[i], 0) + 1
+        # Codex r2 P1-2: each draw holds exactly the plan's packages, each with the plan's unit count
+        badu = [d for d in range(nd) if {k: e["units"] for k, e in per[d].items()} != want_units]
         if bad:
             why = f"{len(bad)} stored draws' package sums do not add up to their total (e.g. draw {bad[0]})"
         elif badc:
             why = (f"{len(badc)} stored draws' package costs do not add up to the plan cost the uncertainty step recorded "
                    f"(e.g. draw {badc[0]})")
         elif badu:
-            why = f"{len(badu)} stored draws do not count every unit once (e.g. draw {badu[0]})"
+            why = f"{len(badu)} stored draws do not hold the plan's packages with their units (e.g. draw {badu[0]})"
     if why is None:
         D = UQ.Drawer(A, seed)
         D.prepare(nd)
@@ -247,7 +270,10 @@ def _replay_stored(A, plan, uq, stored, log=None) -> dict:
                 break
             checked += 1
             P.step()
-    got = q(tot, lvl) if why is None else {}
+    try:
+        got = q(tot, lvl) if why is None else {}
+    except (ValueError, OverflowError) as e:
+        got, why = {}, f"the stored totals give no interval ({e})"
     if why is None and not (want and all(_close(got[x], want[x]) for x in ("median", "ci_low", "ci_high"))):
         why = "the stored draws do not give the stored fixed-plan interval"
     return {"draws": nd, "seed": seed, "level": lvl, "reproduced": why is None, "replayed": got, "stored": want,
@@ -884,6 +910,42 @@ def _self_test_stored_draws(ok, q):
                f"FD28 a malformed stored draw is not reproduced, with the reason ({r7.get('reason')})")
         except Exception as e:  # noqa: BLE001 -- the failing case
             ok(False, f"FD28 a malformed stored draw is not reproduced, with the reason ({type(e).__name__}: {e})")
+        # Codex r2 P1-2: a package's rows moved to another package (totals unchanged) is caught
+        bad = copy.deepcopy(st)
+        last = bad["per_draw"][-1]
+        k1 = next(iter(last))
+        k2 = next(k for k in A.pk if k not in last)
+        last[k2] = last.pop(k1)
+        r8 = replay(A, plan, uq, stored=bad)
+        ok(r8["reproduced"] is False and "units" in (r8.get("reason") or ""),
+           f"FD32 a draw whose package rows do not match the plan's packages and unit counts is caught "
+           f"({r8.get('reason')})")
+        # Codex r2 P1-3: a negative package cost (the draw's total cost unchanged) is malformed
+        bad = copy.deepcopy(st)
+        ks = list(bad["per_draw"][-1])
+        r9 = None
+        if len(ks) >= 2:
+            e1, e2 = bad["per_draw"][-1][ks[0]], bad["per_draw"][-1][ks[1]]
+            e2["cost"] += e1["cost"] + 3.0
+            e1["cost"] = -3.0
+            r9 = replay(A, plan, uq, stored=bad)
+        ok(r9 is not None and r9["reproduced"] is False,
+           f"FD33 a negative package cost is not reproduced ({len(ks)} packages; {(r9 or {}).get('reason')})")
+        # Codex r2 P1-4: non-finite or unrepresentable numbers withhold the intervals; they never abort the figures
+        outs = []
+        for label, mut in (("an infinite total", lambda b: b["primary_averted"].__setitem__(-1, float("inf"))),
+                           ("a cost of 10**400", lambda b: next(iter(b["per_draw"][-1].values())).__setitem__(
+                               "cost", 10 ** 400)),
+                           ("subtotals that overflow", lambda b: [e.__setitem__("averted", 1e308)
+                                                                 for e in b["per_draw"][-1].values()])):
+            bad = copy.deepcopy(st)
+            mut(bad)
+            try:
+                r = replay(A, plan, uq, stored=bad)
+                outs.append((label, r["reproduced"] is False))
+            except Exception as e:  # noqa: BLE001 -- the failing case
+                outs.append((label, f"{type(e).__name__}: {e}"))
+        ok(all(v is True for _l, v in outs), f"FD34 non-finite or unrepresentable stored numbers are refused ({outs})")
         # Codex r1 P3-9: checked_draws counts the evaluations actually run
         ok(r2.get("checked_draws") == 0, f"FD29 refused stored draws report no checked draw ({r2.get('checked_draws')})")
     # Codex r1 P2-4: package subtotals of benefits and harms that cancel still add up to the draw's total
@@ -896,6 +958,11 @@ def _self_test_stored_draws(ok, q):
         tot += big
         tot += -999999.9999999
     ok(_sums_match(per, tot), "FD30 package subtotals that cancel are compared at their own scale")
+    # Codex r2 P1-1: the cancellation allowance is a summation round-off bound, not the replay tolerance of the
+    # largest subtotal: three exact integers off by 900 are caught
+    tri = {"a": {"units": 1, "cost": 0.0, "averted": 1e9}, "b": {"units": 1, "cost": 0.0, "averted": -1e9},
+           "c": {"units": 1, "cost": 0.0, "averted": 901.0}}
+    ok(not _sums_match(tri, 1.0), "FD35 subtotals that cancel do not hide an error far above their round-off")
     # Codex r1 P1-2: figure_data records the hash of the sidecar bytes it used, whatever the file holds afterwards
     import hashlib
     with tempfile.TemporaryDirectory() as d:
