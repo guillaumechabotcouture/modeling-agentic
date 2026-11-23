@@ -452,8 +452,8 @@ def render_text(text: str, claims: dict[str, dict]) -> tuple[str, list[str]]:
 
 # One or two backticks, closed by the same run (CommonMark), on one line.
 _INLINE_CODE_RE = re.compile(r"(?<!`)(`{1,2})(?!`)([^\n]+?)(?<!`)\1(?!`)")
-# A fence line, also inside block quotes or list items (any run of '>' and blanks before it).
-_FENCE_LINE_RE = re.compile(r"^[ \t>]*(`{3,}|~{3,})")
+# A fence line, also inside block quotes or list items ('>', blanks and list markers before it).
+_FENCE_LINE_RE = re.compile(r"^(?:[ \t>]|[-*+][ \t]|\d{1,9}[.)][ \t])*(`{3,}|~{3,})")
 _QUOTED_REF_RE = re.compile(r"\[CLAIM:([^\]\[\n]*)\]")    # one line, no bracket inside: never a link's bracket
 
 
@@ -504,27 +504,25 @@ def quote_refs(text: str, claims: dict[str, dict], render: bool = True) -> str:
     use (for the writer's inputs). Substitution repeats until nothing changes (a nested marker), then any other
     `[CLAIM:` (unclosed, across lines, rebuilt) loses its bracket. Code spans are no exception: what the harness
     quotes is never syntax. Nothing else is rewritten: a bare id stays as recorded."""
-    kept: list[str] = []
+    kept: list[str] = []       # final text, put back last: a rendered value is never substituted again
 
     def _sub(m: re.Match) -> str:
         cid = m.group(1).strip()
         c = claims.get(cid) if _CLAIM_ID_RE.fullmatch(cid or "") else None
         if c is None:
             return f"claim {cid or '(no id)'}"
-        if not render:
-            kept.append(cid)
-            return f"\x00{len(kept) - 1}\x01"
         try:
-            return render_claim(c)
+            kept.append(f"[CLAIM:{cid}]" if not render else render_claim(c).replace("[CLAIM:", "CLAIM:"))
         except Exception:  # noqa: BLE001 -- a claim that cannot render is named, never left as a reference
             return f"claim {cid}"
+        return f"\x00{len(kept) - 1}\x01"
     out, prev = text.replace("\x00", "").replace("\x01", ""), None
     for _ in range(8):                 # bounded: a label value could itself hold a marker
         if out == prev:
             break
         prev, out = out, _QUOTED_REF_RE.sub(_sub, out)
     out = out.replace("[CLAIM:", "CLAIM:")
-    return re.sub("\x00(\\d+)\x01", lambda m: f"[CLAIM:{kept[int(m.group(1))]}]", out)
+    return re.sub("\x00(\\d+)\x01", lambda m: kept[int(m.group(1))], out)
 
 
 def _builder():
