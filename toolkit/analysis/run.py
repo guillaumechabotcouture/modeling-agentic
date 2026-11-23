@@ -355,8 +355,17 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         A.set_reserve(reserve["fraction"])
         log(f"affordability: plan within {reserve['fraction']:.4f} of the budget ({reserve['reserve_usd']:,.0f} held "
             f"back), {reserve['value_given_up_pct'] or 0:.2f}% of the objective given up")
-    plan = sol["choice"]
+    plan = plan_pt = sol["choice"]
     A.guard("point plan", [plan] + ([reserve["unconstrained"]["plan"]] if reserve else []), events0)  # Codex P1-6
+    from toolkit.analysis import plan_rule as PR
+    evp = None
+    if PR.rule(spec.raw) == "expected_value":
+        # hb1 fix 11: the plan with the best mean over the uncertainty draws, which the uncertainty step then reuses
+        pre = UQ.evaluate_draws(A, draws)
+        evp = PR.expected_value_plan(A, pre["rows"], plan_pt, cost0, point_events=events0)
+        plan = evp["solution"]["choice"]
+        A.guard("expected-value plan", [plan], events0)
+        log(f"expected-value plan: {evp['record']['n_units_differ']} of {len(A.ids)} units differ from the point plan")
     on_plan = []
     point = A.summary(plan, out0, cost0)
     from toolkit.engines.contract import engine_identity
@@ -365,8 +374,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     point.update(engine_identity=engine_identity(eng))
     point.update(plan=plan, n_units=len(A.ids),
                  # 1C-c (D3): the status and the relative gap it was proven within, with the threads and time limit
-                 solver={**{k: sol[k] for k in ("status", "method", "objective", "cost")},
-                         **{k: sol.get(k) for k in ("gap_rel", "threads", "time_limit_s", "solver_status")}},
+                 solver=_solver_record(evp["solution"] if evp else sol),
                  interactions=interactions(A, out0), rule=decision_rule(A, out0, plan),
                  model_corrections={"n": len(events0), "on_plan": on_plan, "kinds": sorted({e["kind"] for e in events0}),
                                     "examples": events0[:20]},
@@ -379,6 +387,10 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                                "calibration_status": A.flagged[i]["status"]}
                                               if i in getattr(A, "flagged", {}) else {})} for i in A.ids})
     point["cost_floors"] = floors0
+    if evp is not None:      # hb1 fix 11: the rule, the point-value plan and its solve, and each unit's mean
+        point["plan_rule"] = dict(evp["record"], point_solver=_solver_record(sol))
+        for i in A.ids:
+            point["per_unit"][i]["averted_mean"] = evp["record"]["per_unit_mean"][i]
     if getattr(A, "adjust", None):    # F6 run 4 R3: the base outcome adjustments every evaluation applied
         from toolkit.analysis import outcome_adjust as OA
         point["outcome_adjustments"] = OA.record(A.adjust)
@@ -425,7 +437,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
                                             [arts["point"], arts["uncertainty"], BV.csv_path(spec)])
         log(f"burden validation: {bvd['summary']}")
     # ---- stability
-    stab = ST.run(A, z0, out0, ben0, cost0, plan)
+    stab = ST.run(A, z0, out0, ben0, cost0, plan_pt)    # re-solved at the point values: the point-value plan
     arts["stability"] = S.write("stability", stab, ST.PRODUCER, [arts["point"], arts["calibration"]])
     if stab.get("folds"):
         import yaml
@@ -439,17 +451,20 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if pv is not None:
         arts["plan_variants"] = S.write("plan_variants", pv, V.PRODUCER, [arts["point"]])
     # ---- sensitivity
-    sens = SE.run(A, z0, ben0, cost0, plan, sol["objective"])
+    sens = SE.run(A, z0, ben0, cost0, plan_pt, sol["objective"])
     arts["sensitivity"] = S.write("sensitivity", sens, SE.PRODUCER, [arts["point"]])
     # ---- decision tests
-    dts = DT.run_all(A, z0, out0, ben0, cost0, plan, u["data"], run_dir)
+    dts = DT.run_all(A, z0, out0, ben0, cost0, plan_pt, u["data"], run_dir)
     if jc is not None:      # owner decision R1 (F6 run 1): a declared calibration miss stands only with its test run
         from toolkit.analysis import joint_calibration as JC
         dp = JC.declared_test_problems(jc["unmatched_decision"], dts)
         if dp:
             raise AnalysisBlocked("calibration", [{"unit": "*", "package": "*", "kind": "declared_miss_untested"}],
                                   reason="; ".join(dp))
-    arts["decision_tests"] = S.write("decision_tests", {"tests": [
+    # hb1 fix 11: under deliverable.plan: expected_value each test re-solves at the point values and compares with
+    # the point-value plan, which the artifact names (the owner finding says so: contract.decision_test_findings)
+    arts["decision_tests"] = S.write("decision_tests", {**({"reference_plan": "point_plan"} if evp is not None else {}),
+                                                        "tests": [
         {"test_id": x["test_id"], "path": x["path"], "status": x["status"],
          "verdict": ("NOT_RUN" if x["status"] == "not_run" else "CHANGES_PLAN" if x["decision_changes"] else "NO_CHANGE"),
          # 1C-c follow-up: the verdict words are unchanged (tools/workbench and tools/run_console read exactly these
@@ -508,7 +523,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         w.writerow([cols["unit"], cols["package"], cols["value"], "cost_usd", "region"]
                    + (["calibration_flag"] if fl else []))
         for i in A.ids:
-            w.writerow([i, plan[i], round(point["per_unit"][i]["averted"][hl_o], 4), round(cost0[i][plan[i]], 2),
+            val = point["per_unit"][i]["averted_mean" if evp is not None else "averted"][hl_o]   # hb1 fix 11
+            w.writerow([i, plan[i], round(val, 4), round(cost0[i][plan[i]], 2),
                         A.by_id[i].get(reg, "") if reg else ""] + ([fl[i]["reason"] if i in fl else ""] if fl else []))
     from toolkit.analysis.artifacts import _safe_io
     _safe_io().publish(dp, buf.getvalue(), run_dir)
@@ -548,6 +564,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     return {"artifacts": arts, "point": point, "uncertainty": u["data"], "stability": stab, "sensitivity": sens,
             "decision_tests": dts, "calibration": cal, "emulator_accuracy": model.accuracy, "wall_s": S.manifest["wall_s"],
             "_A": A, "_model": model}
+
+
+def _solver_record(sol: dict) -> dict:
+    """point.solver: the status and the relative gap it was proven within, with the threads and time limit (1C-c)."""
+    return {**{k: sol[k] for k in ("status", "method", "objective", "cost")},
+            **{k: sol.get(k) for k in ("gap_rel", "threads", "time_limit_s", "solver_status")}}
 
 
 # --------------------------------------------------------------------------- self-test
@@ -935,6 +957,7 @@ def _self_test() -> int:
     _self_test_stability_flagged(ok)
     _self_test_variants(ok, q)
     _self_test_voi(ok, q)
+    _self_test_plan_rule(ok, q)
     _self_test_unit_attr(ok, q)
     # AR-RW1 (run console review round 4, P1-2): artifacts and the manifest never follow a link or a planted .tmp
     import tempfile as _tf
@@ -1329,6 +1352,112 @@ def _fixed_refusals(ok, d, r):
     rows = list(csv.DictReader(open(os.path.join(d, "units.csv"))))
     e3 = errs(lambda x: None, [dict(rows[0], given="zz")] + rows[1:])
     ok(any("zz" in e for e in e3), f"PV-R12 the spec refuses a unit given an unknown package ({e3[:2]})")
+
+
+def _self_test_plan_rule(ok, q):
+    """EV-R (hb1 fix 11, J): deliverable.plan: expected_value delivers the plan with the best mean over the
+    uncertainty draws, per-unit means in the CSV and a fixed-plan mean claim; absent or `point`, nothing changes. The
+    golden capture is paused: the toy's decision tests are those of the runs above, and EV-R7 compares the records of
+    the three runs with each other."""
+    from toolkit.analysis import dt_golden as DG
+    DG._CAP["paused"] = True
+    try:
+        _self_test_plan_rule_runs(ok, q)
+    finally:
+        DG._CAP["paused"] = False
+
+
+def _self_test_plan_rule_runs(ok, q):
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    with tempfile.TemporaryDirectory() as d:
+        p = schema.toy_spec(d, n=12)
+        r = yaml.safe_load(open(p))
+        r["analysis"]["decision_tests"] = []
+        yaml.safe_dump(r, open(p, "w"), sort_keys=False)
+        signoff.sign(d, "lead", note="self-test")
+        csvp = os.path.join(d, "allocation_optimized.csv")
+        unc = lambda: yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]  # noqa: E731
+        R0 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        R0_frontier = os.path.exists(os.path.join(d, "figures", "frontier.png"))
+        csv0, unc0, rep0 = open(csvp).read(), unc(), open(os.path.join(d, "uncertainty_report.yaml")).read()
+        _resign(d, lambda x: x["deliverable"].update(plan="point"))
+        R1 = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        ok(open(csvp).read() == csv0 and unc() == unc0 and R1["point"]["plan"] == R0["point"]["plan"]
+           and open(os.path.join(d, "uncertainty_report.yaml")).read() == rep0
+           and "plan_rule" not in R0["point"] and "plan_rule" not in R1["point"],
+           "EV-R1 deliverable.plan: point is the default: the plan, the CSV and both uncertainty files are unchanged")
+        _resign(d, lambda x: x["deliverable"].update(plan="expected_value"))
+        keep_p = os.path.join(d, "figures", "comparison.csv")      # a file no earlier render published
+        open(keep_p, "w").write("kept\n")
+        try:
+            R = run(d, log=q, compute_kw={"max_workers": 2}, draws=32)
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            ok(False, f"EV-R2 a run with deliverable.plan: expected_value completes ({type(e).__name__}: {str(e)[:200]})")
+            return
+        pr = R["point"].get("plan_rule") or {}
+        voi = yaml.safe_load(open(os.path.join(d, "analysis", "value_of_information.yaml")))["data"]
+        cand = {c["id"]: c["expected_value"] for c in voi["candidates"]["list"]}
+        ok(pr.get("rule") == "expected_value" and pr.get("draws") == 32 and pr.get("point_plan") == R0["point"]["plan"]
+           and cand["point"] >= max(cand.values()) - 1e-9 * max(1.0, abs(max(cand.values()))),
+           f"EV-R2 the delivered plan has the best mean over the draws of every candidate; the point-value plan is "
+           f"recorded beside it ({pr.get('rule')}, {cand.get('point')} vs {max(cand.values()) if cand else None})")
+        u = R["uncertainty"]["fixed_plan"]
+        pu = R["point"]["per_unit"]
+        sums = {o: sum((pu[i].get("averted_mean") or {}).get(o, float("nan")) for i in pu) for o in u}
+        ok(all(abs(sums[o] - u[o]["mean"]) <= 1e-9 * max(1.0, abs(u[o]["mean"])) for o in u),
+           f"EV-R3 the per-unit means add up to the fixed plan's mean over the draws ({sums} vs "
+           f"{ {o: u[o]['mean'] for o in u} })")
+        hl = r["deliverable"]["headline"]["outcome"]
+        rows = list(csv.DictReader(open(csvp)))
+        vc = r["deliverable"]["columns"]["value"]
+        ok(all(abs(float(x[vc]) - round((pu[x["unit"]].get("averted_mean") or {}).get(hl, float("nan")), 4)) < 1e-9 for x in rows)
+           and [x["package"] for x in rows] == [R["point"]["plan"][x["unit"]] for x in rows],
+           "EV-R4 the CSV carries the delivered plan and each unit's mean over the draws")
+        cs = {c["id"]: c for c in (yaml.safe_load(open(os.path.join(d, CL.SPEC_REL))) or {}).get("claims", [])}
+        txt = open(os.path.join(d, "results.md")).read()
+        ok((cs.get("headline.mean") or {}).get("source_field") == f"data.fixed_plan.{hl}.mean"
+           and "plan_rule.units_differ" in cs and "[CLAIM:" not in txt and "expected" in txt.split("## ")[1],
+           f"EV-R5 a fixed-plan mean claim and the plan rule in the results' recommendation "
+           f"({sorted(k for k in cs if k.startswith(('headline', 'plan_rule')))})")
+        ok(contract.gate_findings(d) == [], f"EV-R6 the contract checks pass: {contract.gate_findings(d)}")
+        vk = lambda R_: [(x["test_id"], x["status"], x.get("decision_changes"), x.get("recommendation"))  # noqa: E731
+                         for x in R_["decision_tests"]]
+        ok(R["decision_tests"] and vk(R) == vk(R0) and R["stability"].get("verdict") == R0["stability"].get("verdict"),
+           f"EV-R7 the decision tests and stability re-solve at the point values and compare with the point-value "
+           f"plan: the same records as the default run ({len(R['decision_tests'])} tests)")
+        # Codex r1 of #343: what reads the delivered plan elsewhere
+        dtf = contract.decision_test_findings(d)
+        ok(all("solved at the point values" in f["claim"] for f in dtf)
+           and yaml.safe_load(open(os.path.join(d, "analysis", "decision_tests.yaml")))["data"].get("reference_plan")
+           == "point_plan", f"EV-R8 the decision tests name their reference plan, and each owner finding says it is "
+                            f"the point-value plan ({len(dtf)} findings; P1-3)")
+        from toolkit.analysis import figure_data as FDm
+        try:
+            FDm.rebuild(d, log=q)
+            rb = "rebuilt"
+        except FDm.RebuildRefused as e:
+            rb = "expected_value" in str(e)
+        figs = yaml.safe_load(open(os.path.join(d, "analysis", "figures.yaml")))["data"]
+        fr_np = [x for x in figs.get("not_produced") or [] if x.get("figure") == "frontier"]
+        stale = [e for e in (".png", ".svg", ".csv") if os.path.exists(os.path.join(d, "figures", "frontier" + e))]
+        ok(rb is True and fr_np and "expected-value" in str(fr_np[0].get("reason")) and not fr_np[0].get("render_failed")
+           and not stale and R0_frontier and os.path.exists(keep_p),
+           f"EV-R9 a rebuild from the point tables is refused (it cannot verify the plan; r2 P1-4); the frontier is not "
+           f"drawn, with the reason, and no earlier run's frontier file is left, while a file no render published is kept (P1-8, r2 P1-5, r3 P1-1) ({rb}, {fr_np}, {stale})")
+        pp = os.path.join(d, "analysis", "point.yaml")
+        keep = open(pp).read()
+        try:
+            doc = yaml.safe_load(keep)
+            doc["data"].pop("plan_rule")
+            from toolkit.analysis import plan_rule as PRm
+            miss = PRm.contract_findings(r_ev := yaml.safe_load(open(os.path.join(d, "decision_spec.yaml"))),
+                                         doc["data"], R["uncertainty"])
+        finally:
+            open(pp, "w").write(keep)
+        ok(r_ev["deliverable"]["plan"] == "expected_value" and len(miss) == 1 and "no expected-value plan" in miss[0],
+           f"EV-R10 a completed run without the plan rule its spec asks for is a finding (P1-10): {miss}")
 
 
 def _self_test_posterior(ok, q):
