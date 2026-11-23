@@ -29,6 +29,17 @@ A launch is identified by its launch id and invocation, and must agree with the 
 - Only a request file named `<generated id>.json` is read.
 - `tick` updates the state in place, so a failed `status.json` write loses nothing.
 - The loop's sleep is bounded by the next probe or collection retry, with no 1-second polling while the monitor is held.
-- `vm_job --secret-env` passes `GH_TOKEN` and `DASK_COILED__TOKEN` by name, reading them from the keychain and from dask's config files. `supervisor start` strips both from every `vm_job` process's environment, even when they are exported in the shell. It checks only that each is present; it never reads the values.
+- Passing the Coiled token by name is a separate change (#370).
 
-**Self-tests:** SV25-SV42 (supervisor), VS6-VS7b (vm_job).
+**Fixes from Codex review of the reporting-only version.**
+- **Probes:** they run at once on their own threads under one deadline. A probe still running from an earlier pass is not started again.
+- **Evaluation:** rules are evaluated after all probes, so launches of one tag agree. A tag rule is definite only when every launch of the tag has a fresh or final reading.
+- **Unknown:** an incomplete probe, a live run without a phase or heartbeat, or a probe that cannot be applied gives `unknown`. A held monitor reports `unknown`.
+- **Ended launches:** they are evaluated on their final reading and late collections.
+- **Identity:** a collected result counts only for its own launch id and invocation, and an assignment missing its invocation or run id binds nothing.
+- **Spend:** it covers every id ever recorded for the launch, and is unread when one id is listed under another name.
+- **History:** each launch keeps one history entry, under one tag.
+- **Failure kinds:** `completed_no_report` is an eval outcome, and a run collected before `run_status` existed is unknown.
+- **Inputs:** a refused request name is stored as a digest. Probe text is redacted and progress is kept as a digest. No ETA is made up without a launch time. Rules must be finite, and an unreadable `clusters.json` still collects.
+
+**Self-tests:** SV25-SV39, SV41-SV55 (supervisor).

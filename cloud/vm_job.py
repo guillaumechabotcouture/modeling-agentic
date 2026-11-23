@@ -225,67 +225,19 @@ def job_env(secrets: dict | None, name: str, job_id: str, account: str | None = 
             **({"MA_STORAGE_ACCOUNT": account} if account else {})}
 
 
-# cloud/supervisor.py: the merge train's GitHub token; the run monitor's Coiled token (owner 2026-11-23)
-SECRET_ENV_ALLOWED = ("GH_TOKEN", "DASK_COILED__TOKEN")
-
-
-def _dask():
-    with contextlib.suppress(Exception):
-        import coiled  # noqa: F401 -- loads the Coiled login into dask's config
-    import dask
-    return dask
-
-
-def coiled_token_configured() -> bool:
-    """Whether dask's config files (not the environment) hold a Coiled token: what a launcher whose child environment
-    has DASK_COILED__TOKEN stripped can still pass by name."""
-    try:
-        return bool(((_dask().config.collect(env={}) or {}).get("coiled") or {}).get("token"))
-    except Exception:  # noqa: BLE001
-        return False
-
-
-GH_KEYCHAIN_SERVICE = "modeling-agentic-supervisor-github"     # the owner's one-time step stores the token there
-
-
-def keychain_has(service) -> bool:
-    """Whether the login keychain holds a generic password for `service`: its attributes only, never its secret."""
-    try:
-        return subprocess.run(["security", "find-generic-password", "-s", service], capture_output=True,
-                              text=True).returncode == 0
-    except OSError:
-        return False
-
-
-def _keychain_secret(service):
-    try:
-        r = subprocess.run(["security", "find-generic-password", "-s", service, "-w"], capture_output=True, text=True)
-    except OSError:
-        return None
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+SECRET_ENV_ALLOWED = ("GH_TOKEN",)     # cloud/supervisor.py's merge train (W0-J)
 
 
 def secret_env(names) -> dict:
-    """--secret-env NAME: the launcher's $NAME (the Coiled token: from dask's config when the environment does not hold
-    it), for the job's environment only (never job.json or state.json, like --anthropic-key), and never copied into
-    this process's environment. Only names in SECRET_ENV_ALLOWED; one with no value is refused. Values are never
-    printed."""
+    """--secret-env NAME: the launcher's $NAME, for the job's environment only (never job.json or state.json, like
+    --anthropic-key). Only names in SECRET_ENV_ALLOWED; an unset one is refused. Values are never printed."""
     out = {}
     for n in names or ():
         if n not in SECRET_ENV_ALLOWED:
             raise SystemExit(f"--secret-env {n}: not in the allow-list {SECRET_ENV_ALLOWED}: refusing")
-        v = os.environ.get(n)
-        if not v and n == "GH_TOKEN":
-            v = _keychain_secret(GH_KEYCHAIN_SERVICE)
-        if not v and n == "DASK_COILED__TOKEN":
-            try:
-                v = _dask().config.get("coiled.token", None)
-            except ImportError:
-                v = None
-        if not v:
-            raise SystemExit(f"--secret-env {n}: ${n} is not set in the launcher's environment"
-                             + (" or dask's config" if n == "DASK_COILED__TOKEN" else "") + ": refusing")
-        out[n] = v
+        if not os.environ.get(n):
+            raise SystemExit(f"--secret-env {n}: ${n} is not set in the launcher's environment: refusing")
+        out[n] = os.environ[n]
     return out
 
 
@@ -1487,8 +1439,7 @@ def _self_test_storage_account(ok) -> None:
             try:
                 with mock.patch.dict(os.environ, env_), \
                         mock.patch.dict(globals(), {"_client": lambda *x, **k: (_C(), "w1"),
-                                                    "_runner": lambda c, w: (lambda fn, *x: "tok"),
-                                                    "_keychain_secret": lambda svc: None}), \
+                                                    "_runner": lambda c, w: (lambda fn, *x: "tok")}), \
                         mock.patch.dict(sys.modules, {"distributed": types.SimpleNamespace(fire_and_forget=lambda f: None)}), \
                         contextlib.redirect_stdout(io.StringIO()):
                     if not env_:
@@ -1507,51 +1458,6 @@ def _self_test_storage_account(ok) -> None:
             ok(False, "VS3 a variable outside the allow-list is refused")
         except SystemExit as e:
             ok("allow" in str(e), f"VS3 a variable outside the allow-list is refused before submit ({e})")
-        # VS6 (supervisor run monitor, owner 2026-11-23): the Coiled token passes by name, read from dask's config
-        # when the launcher's environment does not hold it; VS6b `coiled_token_configured` reads the config files
-        # only, so a token exported in a shell (and stripped from a child's environment) does not count
-        ctok = "c" * 40
-        fake_dask = types.SimpleNamespace(config=types.SimpleNamespace(
-            get=lambda k, d=None: ctok if k == "coiled.token" else d,
-            collect=lambda env=None, **kw: {"coiled": {"token": ctok}} if env == {} else {}))
-        with mock.patch.dict(os.environ, {}), mock.patch.dict(sys.modules, {"dask": fake_dask}):
-            os.environ.pop("DASK_COILED__TOKEN", None)
-            try:
-                got = secret_env(["DASK_COILED__TOKEN"])
-                conf = coiled_token_configured()
-            except (SystemExit, NameError) as e:
-                got, conf = str(e), None
-            leaked = "DASK_COILED__TOKEN" in os.environ
-        ok(got == {"DASK_COILED__TOKEN": ctok} and not leaked,
-           f"VS6 --secret-env DASK_COILED__TOKEN from dask config, not copied into this environment ({got!r:.60})")
-        empty_dask = types.SimpleNamespace(config=types.SimpleNamespace(get=lambda k, d=None: d,
-                                                                        collect=lambda env=None, **kw: {}))
-        with mock.patch.dict(os.environ, {"DASK_COILED__TOKEN": ctok}), mock.patch.dict(sys.modules, {"dask": empty_dask}):
-            try:
-                conf2 = coiled_token_configured()
-            except NameError as e:
-                conf2 = str(e)
-        ok(conf is True and conf2 is False,
-           f"VS6b a token in the config files counts; one only exported in the shell does not ({conf}, {conf2})")
-        # VS7 (supervisor, owner 2026-11-23): GH_TOKEN passes by name, read from the login keychain when the
-        # launcher's environment does not hold it, never copied into it; VS7b presence reads no secret (no -w)
-        gtok, seen_cmds = "ghp_" + "K" * 36, []
-
-        def fake_security(cmd, **k):
-            seen_cmds.append(list(cmd))
-            return types.SimpleNamespace(returncode=0, stdout=(gtok + "\n") if "-w" in cmd else "attrs")
-        with mock.patch.dict(os.environ, {}), mock.patch.object(subprocess, "run", fake_security):
-            os.environ.pop("GH_TOKEN", None)
-            try:
-                got = secret_env(["GH_TOKEN"])
-                has = keychain_has("modeling-agentic-supervisor-github")
-            except (SystemExit, NameError) as e:
-                got, has = str(e), None
-            leaked = "GH_TOKEN" in os.environ
-        ok(got == {"GH_TOKEN": gtok} and not leaked, f"VS7 --secret-env GH_TOKEN from the keychain, not copied into "
-           f"this environment ({got!r:.40})")
-        ok(has is True and seen_cmds and "-w" not in seen_cmds[-1],
-           f"VS7b keychain_has asks for the item's attributes only, never its secret ({seen_cmds[-1:]})")
         for bad in ("DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc==", "https://x.blob.core.windows.net",
                     "Acct", "ab"):
             try:

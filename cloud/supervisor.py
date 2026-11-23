@@ -37,15 +37,17 @@ work for about 8 hours). One loop on a small Coiled VM, all its state in blob st
 
 `start` is vm_job `up` (2-vCPU worker, 2-vCPU scheduler; the name needs a budget scope, the default is in `sv`) then
 `start` with the loop as the job, a dask task that holds the cluster for --max-hours. `stop` stops this name's live
-cluster by id. Secrets reach the job's environment only, by name (vm_job --secret-env), and neither token is ever in a
-vm_job process's environment or command line, even when exported in the shell: $GH_TOKEN, which vm_job reads from the
-login keychain (service "modeling-agentic-supervisor-github"; without it merges stay held), and the Coiled token,
-which vm_job reads from the laptop's dask config files (without it the run monitor is held).
+cluster by id. GitHub token: `start` passes $GH_TOKEN (vm_job --secret-env: the job's environment only) when the login
+keychain holds it under the service "modeling-agentic-supervisor-github"; without it merges stay held. The Coiled
+token the run monitor needs reaches the job by name through a separate change (vm_job --secret-env DASK_COILED__TOKEN).
 """
 from __future__ import annotations
 
 import argparse
 import calendar
+import hashlib
+import math
+import threading
 import json
 import os
 import re
@@ -79,8 +81,8 @@ _RID = re.compile(r"[0-9]{8}T[0-9]{6}-[0-9a-f]{8}")       # request ids as `enqu
 HEALTH_EVERY_S = 300      # each watched launch is probed this often
 PROBE_TIMEOUT_S = 240     # one launch's probe (listing, costs, health reads) past this is reported, not waited on
 STOP_RULES = {"tag_usd": float, "run_usd": float, "no_progress_min": float, "same_failure_runs": int}
-OK_STATUSES = ("completed", "completed_with_report_restored", "completed_scope_declared",
-               "completed_gate_not_accepted", "completed_scope_declined")   # an eval outcome, not a failure kind
+OK_STATUSES = ("completed", "completed_with_report_restored", "completed_scope_declared",   # eval outcomes
+               "completed_gate_not_accepted", "completed_scope_declined", "completed_no_report")   # an eval outcome, not a failure kind
 _ENDED = ("stopped", "error")
 _LAUNCH_ID = re.compile(r"[A-Za-z0-9_.-]{1,40}")          # one path component
 _ROLES = {"run": "", "keeper": "-keeper", "overflow": "-overflow"}
@@ -298,10 +300,12 @@ def collect_step(blob, name, state, now, work, fetch=fetch_from_storage, metrics
     for lname, ent in sorted((state.get("collect") or {}).items()):
         for label, a in sorted(ent["entry"]["assignments"].items()):
             lab = ent["labels"].setdefault(label, {})
-            if lab.get("launch_id") != a.get("launch_id"):   # a relaunch: the earlier launch's copy must not mix in
-                shutil.rmtree(os.path.join(work, lname, label), ignore_errors=True)
+            if (lab.get("launch_id"), lab.get("invocation")) != (a.get("launch_id"), a.get("invocation")):
+                shutil.rmtree(os.path.join(work, lname, label), ignore_errors=True)   # another launch's copy
                 lab.clear()
-                lab.update(state="waiting", launch_id=a.get("launch_id"))
+                lab.update(state="waiting", launch_id=a.get("launch_id"), invocation=a.get("invocation"))
+            if lab.get("state") == "collected" and "run_status" not in lab and os.path.isdir(os.path.join(work, lname, label)):
+                lab["run_status"] = _run_status(os.path.join(work, lname, label))   # collected before this field
             if lab.get("state") == "collected" or now - lab.get("tried", -1e18) < COLLECT_EVERY_S:
                 continue
             lab["tried"] = now
@@ -339,13 +343,13 @@ def valid_entry(pl) -> dict:
     return pl
 
 
-# ---- (d) the run monitor ----------------------------------------------------------------------------------------
+# ---- (d) the run monitor (reporting only) ------------------------------------------------------------------------
 
 def _stop_rules(stop) -> dict:
-    num = lambda k, v: (isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0  # noqa: E731
+    num = lambda k, v: (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0  # noqa: E731
                         and (STOP_RULES[k] is float or isinstance(v, int)))
     if not (isinstance(stop, dict) and set(stop) <= set(STOP_RULES) and all(num(k, v) for k, v in stop.items())):
-        raise ValueError(f"stop rules: positive numbers among {sorted(STOP_RULES)} (same_failure_runs an integer)")
+        raise ValueError(f"stop rules: finite positive numbers among {sorted(STOP_RULES)} (same_failure_runs an integer)")
     return {k: STOP_RULES[k](v) for k, v in stop.items()}
 
 
@@ -356,44 +360,51 @@ def _utc_epoch(v):
         return None
 
 
+def _key(lname, w) -> str:
+    return f"{lname}@{w['launch_id']}@{w['invocation']}"
+
+
 def valid_watch(w, entry) -> dict:
     """A collect request's `watch`, or ValueError: the run cluster's id and any helper's, each under the launch's own
-    name; a launch id (one path component) and invocation that every assignment has, and the run id it records; a
-    tag and known positive stop rules. A launch time that does not parse is none (not an error)."""
+    name; a launch id (one path component), invocation and run id that every assignment records (none missing); a tag
+    and finite positive stop rules. A launch time that does not parse is none."""
     cl = w.get("clusters") if isinstance(w, dict) else None
-    asg = entry["assignments"].values()
     ok_ids = isinstance(cl, dict) and "run" in cl and set(cl) <= set(_ROLES) and all(
         isinstance(r, dict) and r.get("name") == entry["name"] + _ROLES[k] and isinstance(r.get("id"), int)
         and not isinstance(r.get("id"), bool) and r["id"] > 0 for k, r in cl.items())
-    agrees = ok_ids and all((a or {}).get("launch_id") == w.get("launch_id")
-                            and (a or {}).get("invocation", w.get("invocation")) == w.get("invocation")
-                            and (a or {}).get("cluster_id", cl["run"]["id"]) == cl["run"]["id"] for a in asg)
+    agrees = ok_ids and all(isinstance(a, dict) and a.get("launch_id") == w.get("launch_id") and "invocation" in a
+                            and a["invocation"] == w.get("invocation") and a.get("cluster_id") == cl["run"]["id"]
+                            for a in entry["assignments"].values())
     if not (agrees and _LAUNCH_ID.fullmatch(str(w.get("launch_id", ""))) and isinstance(w.get("invocation"), str)
             and w["invocation"] and _TAG.fullmatch(str(w.get("tag", "")))):
         raise ValueError("watch: needs the run cluster's id (helpers under the launch's own names), and a launch id, "
-                         "invocation and run id that every assignment has, and a tag")
-    num = lambda x: x if isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0 else None  # noqa: E731
+                         "invocation and run id that every assignment records, and a tag")
+    num = lambda x, top: x if isinstance(x, (int, float)) and not isinstance(x, bool) and 0 < x <= top else None  # noqa: E731
     return {"launch_id": w["launch_id"], "invocation": w["invocation"], "tag": w["tag"],
             "stop": _stop_rules(w.get("stop") or {}),
-            "clusters": {k: {"name": r["name"], "id": r["id"]} for k, r in cl.items()}, "cap_usd": num(w.get("cap_usd")),
-            "run_timeout_hours": num(w.get("run_timeout_hours")), "max_rounds": num(w.get("max_rounds")),
-            "launched_at": _utc_epoch(w.get("launched_utc"))}
+            "clusters": {k: {"name": r["name"], "id": r["id"]} for k, r in cl.items()},
+            "cap_usd": num(w.get("cap_usd"), 1e6), "run_timeout_hours": num(w.get("run_timeout_hours"), 1000),
+            "max_rounds": num(w.get("max_rounds"), 100), "launched_at": _utc_epoch(w.get("launched_utc"))}
 
 
 def watch_payload(cfg, assign, stop, tag):
     """On the laptop: the `watch` for a collect request, from cfg.clusters_file, only when that record is this launch's
-    (an invocation, and the invocation and launch id of every assignment); helpers only under the config's own names.
-    None when it cannot be bound (a legacy record without an invocation included); SystemExit then if stop rules
-    were asked for."""
-    rec = json.load(open(cfg.clusters_file)) if os.path.exists(cfg.clusters_file) else {}
-    lids = {(a or {}).get("launch_id") for a in assign.values()}
-    invs = {(a or {}).get("invocation") for a in assign.values()}
+    (an invocation; every assignment's invocation, launch id and run cluster id); helpers only under the config's own
+    names. None when it cannot be bound (an unreadable or legacy record included); SystemExit then if stop rules were
+    asked for."""
+    try:
+        rec = json.load(open(cfg.clusters_file)) if os.path.exists(cfg.clusters_file) else {}
+    except (OSError, ValueError):
+        rec = {}
+    rec = rec if isinstance(rec, dict) else {}
     cl = {k: {"name": rec[k]["name"], "id": rec[k]["id"]} for k, suf in _ROLES.items()
           if isinstance(rec.get(k), dict) and rec[k].get("name") == cfg.name + suf and rec[k].get("id") is not None}
-    if not (rec.get("invocation") and rec.get("launch_id") and lids == {rec["launch_id"]}
-            and invs == {rec["invocation"]} and "run" in cl):
+    bound = rec.get("invocation") and rec.get("launch_id") and "run" in cl and all(
+        isinstance(a, dict) and a.get("launch_id") == rec["launch_id"] and a.get("invocation") == rec["invocation"]
+        and a.get("cluster_id") == cl["run"]["id"] for a in assign.values())
+    if not bound:
         if stop:
-            raise SystemExit(f"{cfg.name}: clusters.json is not this launch's (invocation and launch id of "
+            raise SystemExit(f"{cfg.name}: clusters.json is not this launch's (invocation, launch id and run id of "
                              "assignments.json): no stop rule can be evaluated on its ids; refusing")
         return None
     m = re.fullmatch(r"runs/evals/([a-z0-9-]+)/[a-z0-9_]+", cfg.storage_prefix or "")
@@ -401,6 +412,20 @@ def watch_payload(cfg, assign, stop, tag):
             "tag": tag or (m.group(1) if m else cfg.name), "stop": _stop_rules(stop or {}),
             "cap_usd": cfg.cap_usd, "run_timeout_hours": cfg.run_timeout_hours, "max_rounds": cfg.max_rounds,
             "launched_utc": rec.get("launched_utc")}
+
+
+def spend_of(states, costs):
+    """The launch's USD: the sum over every id it ever recorded, or None when one is listed under another name (its
+    cost is not this launch's) or could not be read."""
+    if any(v == "listed under another name" for v in states.values()) or any(c is None for c in costs.values()):
+        return None
+    return float(sum(costs.values()))
+
+
+def label_complete(m, snap) -> bool:
+    """A run's inputs were all read: its state, and for a live run its phase and heartbeat, and its files."""
+    return bool(m.get("state")) and not (snap or {}).get("input_errors") and (
+        m["state"] not in ("running", "preparing") or (m.get("phase") is not None and m.get("heartbeat_age_s") is not None))
 
 
 class Cloud:
@@ -412,24 +437,31 @@ class Cloud:
             "no $DASK_COILED__TOKEN on the VM (`start` passes it when the laptop's dask config holds it)"
 
     def probe(self, w, entry):
-        import math
         import types
         import budget
         import run_cluster as rc
         import run_health as rh
         import worker_side as ws
-        items = {c.get("id"): c for c in budget.CoiledSource().list_clusters()}      # every page (max_pages=None)
+        listing = budget.CoiledSource().list_clusters()                  # every page (max_pages=None)
+        items = {c.get("id"): c for c in listing}
+        named = lambda cid, nm: (items[cid].get("name") == nm) if cid in items else None  # noqa: E731
         states = {k: ("not listed" if r["id"] not in items else ws.state_of(items[r["id"]])
-                      if items[r["id"]].get("name") == r["name"] else "listed under another name")
-                  for k, r in w["clusters"].items()}
-        floor, prices = budget.load_scopes()["floor"], budget.load_prices()
-        usd = sum(budget._cluster_cost(budget.CoiledSource().details(r["id"]), time.time(), -math.inf, floor,
-                                       prices)["usd"] for r in w["clusters"].values())
-        out = {"clusters": states, "usd": usd, "labels": {}}
+                      if named(r["id"], r["name"]) else "listed under another name") for k, r in w["clusters"].items()}
+        floor, prices, costs = budget.load_scopes()["floor"], budget.load_prices(), {}
+        for cid, nm in (w.get("seen_ids") or {}).items():
+            if named(int(cid), nm) is False:
+                states[f"earlier {cid}"] = "listed under another name"
+                continue
+            try:
+                costs[cid] = budget._cluster_cost(budget.CoiledSource().details(int(cid)), time.time(), -math.inf,
+                                                  floor, prices)["usd"]
+            except budget.BudgetError:
+                costs[cid] = None
+        out = {"clusters": states, "usd": spend_of(states, costs), "labels": {}}
         if states.get("run") in ("ready", "running"):
             asg = entry["assignments"]
             cfg = types.SimpleNamespace(name=entry["name"], labels=tuple(sorted(asg)), compute_env={})
-            client = rc._connect_recorded(cfg, w["clusters"]["run"]["id"])
+            client = rc._connect_recorded(cfg, w["clusters"]["run"]["id"], lister=lambda: listing)
             try:
                 snaps = rc.health_snapshots(cfg, client, asg)
                 for label, a in asg.items():
@@ -440,9 +472,9 @@ class Cloud:
                         m = {}
                     tr = snap.get("trace") or []
                     out["labels"][label] = {
-                        "complete": bool(m) and not snap.get("input_errors"),
-                        "state": m.get("state"), "phase": m.get("phase"), "heartbeat_age_s": m.get("heartbeat_age_s"),
-                        "exit_code": (m.get("meta") or {}).get("exit_code"), "round": rh._current_round(snap),
+                        "complete": label_complete(m, snap), "state": m.get("state"), "phase": m.get("phase"),
+                        "heartbeat_age_s": m.get("heartbeat_age_s"), "exit_code": (m.get("meta") or {}).get("exit_code"),
+                        "round": rh._current_round(snap),
                         "progress": [m.get("log_bytes"), m.get("phase"), len(tr), (tr[-1] or {}).get("ts") if tr else None]}
             finally:
                 client.close()
@@ -461,7 +493,8 @@ def failure_kind(lab):
 
 
 def eta_of(lab, w, now):
-    """Rounds done over max_rounds, from the launch time, capped at run_timeout_hours; None before a round is done."""
+    """Rounds done over max_rounds, from the launch time, capped at run_timeout_hours; None before a round is done or
+    without a launch time."""
     done, t0 = (lab.get("round") or 1) - 1, w.get("launched_at")
     if done < 1 or not w.get("max_rounds") or t0 is None or lab.get("state") not in ("running", "preparing"):
         return None
@@ -469,35 +502,95 @@ def eta_of(lab, w, now):
     return min(t, t0 + w["run_timeout_hours"] * 3600) if w.get("run_timeout_hours") else t
 
 
-def evaluate(w, hist, now) -> dict:
-    """{rule: {would_trip: True | False | "unknown", reason}} from this launch's fresh probe and the tag's history
-    (one entry per launch). Called only right after a successful probe; compared unrounded."""
-    r, out = w.get("stop") or {}, {}
-    labs, n = w.get("labels") or {}, max(1, len(w.get("labels") or {}))
-    tag = hist.get(w["tag"]) or {}
+def _hist(state, lname, w):
+    """This launch's entry in its tag's history (one per launch: a reused name loses nothing)."""
+    return state["tags"].setdefault(w["tag"], {}).setdefault(_key(lname, w), {"usd": None, "failures": {}})
+
+
+def _refresh(state, lname, w, now) -> None:
+    """Fold the collection's results into the labels and the tag history, for an ended launch too. A result counts
+    only for this launch (launch id and invocation); one collected before run_status was recorded is unknown."""
+    col = (state["collect"].get(lname) or {}).get("labels", {})
+    for label, c in col.items():
+        if c.get("state") == "collected" and (c.get("launch_id"), c.get("invocation")) == (w["launch_id"], w["invocation"]):
+            lab = w["labels"].setdefault(label, {"last_progress": now})
+            lab.update(state="collected", exit_code=c.get("exit_code"), run_status=c.get("run_status"),
+                       status_unknown="run_status" not in c, complete="run_status" in c)
+    for lab in w["labels"].values():
+        lab["failure"] = failure_kind(lab)
+    h = _hist(state, lname, w)
+    h.update(failures={k: v.get("failure") for k, v in w["labels"].items()},
+             complete=bool(w["labels"]) and all(v.get("complete") for v in w["labels"].values()),
+             final=w["state"] == "ended" or h.get("final", False) and w["state"] != "watching")
+
+
+def _apply(state, lname, w, now, pr_) -> None:
+    """One successful probe into the watch (all text redacted; progress kept as a digest only)."""
+    entry = (state["collect"].get(lname) or {}).get("entry") or {}
+    w["cluster_states"] = {k: _red(v, 40) for k, v in (pr_.get("clusters") or {}).items()}
+    for label in sorted(set(entry.get("assignments") or {}) | set(pr_.get("labels") or {})):
+        lab, got = w["labels"].setdefault(label, {"last_progress": now}), (pr_.get("labels") or {}).get(label)
+        if got:
+            dig = hashlib.sha256(json.dumps(got.get("progress"), default=str).encode()).hexdigest()[:16]
+            if dig != lab.get("progress"):
+                lab.update(progress=dig, last_progress=now)
+            lab.update(state=_red(got.get("state"), 20) if got.get("state") else None,
+                       phase=_red(got.get("phase"), 40) if got.get("phase") else None,
+                       heartbeat_age_s=got.get("heartbeat_age_s") if isinstance(got.get("heartbeat_age_s"), (int, float)) else None,
+                       exit_code=got.get("exit_code") if isinstance(got.get("exit_code"), int) else None,
+                       round=got.get("round") if isinstance(got.get("round"), int) else None, complete=bool(got.get("complete")))
+        elif lab.get("state") != "collected":
+            lab["complete"] = False
+        lab["last_progress_utc"] = utc(lab["last_progress"])
+        t = eta_of(lab, w, now)
+        lab["eta_utc"] = utc(t) if t else None
+    usd = pr_.get("usd")
+    w["usd"] = float(usd) if isinstance(usd, (int, float)) and math.isfinite(usd) else None
+    w["usd_per_run"] = None if w["usd"] is None else w["usd"] / max(1, len(w["labels"]))
+    _hist(state, lname, w).update(usd=w["usd"], fresh_at=now, stale=False)
+    if pr_.get("clusters") and all(v in _ENDED for v in pr_["clusters"].values()):
+        w["state"] = "ended"
+    _refresh(state, lname, w, now)
+
+
+def evaluate(state, lname, w, now, held=False) -> dict:
+    """{rule: {would_trip: True | False | "unknown", reason, at}}: from this launch's last probe when it is fresh and
+    complete (an ended launch: its final reading) and the tag's history, every launch of which must be fresh or final;
+    compared unrounded. Held, stale, failed or incomplete: unknown."""
+    r = w.get("stop") or {}
+    unk = lambda why: {k: {"would_trip": "unknown", "reason": why, "at": utc(now)} for k in r}  # noqa: E731
+    ended = w["state"] == "ended"
+    if held and not ended:
+        return unk("the monitor is held (no Coiled token on the VM)")
+    if not ended and not (w.get("probe_ok") and now - w.get("probe_ok_at", -1e18) <= 2 * HEALTH_EVERY_S):
+        return unk(w.get("note") or "no fresh probe yet")
+    tag, labs, out = state["tags"].get(w["tag"]) or {}, w.get("labels") or {}, {}
+    ok_peer = lambda h: h.get("final") or (not h.get("stale") and now - h.get("fresh_at", -1e18) <= 2 * HEALTH_EVERY_S)  # noqa: E731
+    peers_ok = all(ok_peer(h) for h in tag.values())
     if "tag_usd" in r:
-        if any(h.get("usd") is None for h in tag.values()):
-            out["tag_usd"] = {"would_trip": "unknown", "reason": "a launch of the tag has no spend reading yet"}
+        read = [h for h in tag.values() if h.get("usd") is not None]
+        if not peers_ok or any(h.get("usd") is None and not h.get("final") for h in tag.values()):
+            out["tag_usd"] = {"would_trip": "unknown", "reason": f"not every launch of tag {w['tag']} has a fresh reading"}
         else:
-            tot = sum(h["usd"] for h in tag.values())
-            out["tag_usd"] = {"would_trip": tot >= r["tag_usd"], "reason": f"tag {w['tag']}: ${tot:.4f} over "
-                              f"{len(tag)} launch(es); rule ${r['tag_usd']:.2f}"}
+            tot = sum(h["usd"] for h in read)
+            out["tag_usd"] = {"would_trip": tot >= r["tag_usd"], "reason": f"tag {w['tag']}: ${tot:.4f} over {len(read)} "
+                              f"launch(es) read; rule ${r['tag_usd']:.2f}"}
     if "run_usd" in r:
-        out["run_usd"] = ({"would_trip": "unknown", "reason": "no spend reading"} if w.get("usd") is None else
-                          {"would_trip": w["usd"] / n >= r["run_usd"],
-                           "reason": f"${w['usd'] / n:.4f} per run over {n} run(s); rule ${r['run_usd']:.2f}"})
+        out["run_usd"] = ({"would_trip": "unknown", "reason": "spend not fully read"} if w.get("usd") is None else
+                          {"would_trip": w["usd"] / max(1, len(labs)) >= r["run_usd"],
+                           "reason": f"${w['usd'] / max(1, len(labs)):.4f} per run over {max(1, len(labs))} run(s); "
+                                     f"rule ${r['run_usd']:.2f}"})
     if "no_progress_min" in r:
-        hits, unknown = [], [lb for lb, x in labs.items() if not x.get("complete")]
-        for lb, x in sorted(labs.items()):
-            idle = now - x.get("last_progress", now)
-            if x.get("complete") and x.get("state") in ("running", "preparing") and x.get("eta_utc") is None \
-                    and idle >= r["no_progress_min"] * 60:
-                hits.append(f"{lb}: no progress for {idle / 60:.0f} min and no ETA")
-        out["no_progress_min"] = ({"would_trip": True, "reason": "; ".join(hits)} if hits else
-                                  {"would_trip": "unknown", "reason": f"inputs not all read: {sorted(unknown)}"}
-                                  if unknown or not labs else
-                                  {"would_trip": False, "reason": f"every run progressed or has an ETA "
-                                   f"(rule {r['no_progress_min']:g} min)"})
+        hits = [f"{lb}: no progress for {(now - x.get('last_progress', now)) / 60:.0f} min and no ETA"
+                for lb, x in sorted(labs.items()) if x.get("state") in ("running", "preparing") and x.get("eta_utc") is None
+                and now - x.get("last_progress", now) >= r["no_progress_min"] * 60]
+        incomplete = sorted(lb for lb, x in labs.items() if not x.get("complete"))
+        out["no_progress_min"] = (
+            {"would_trip": False, "reason": "the launch's clusters have ended"} if ended else
+            {"would_trip": "unknown", "reason": f"inputs not all read: {incomplete or 'no runs read'}"}
+            if incomplete or not labs else
+            {"would_trip": True, "reason": "; ".join(hits)} if hits else
+            {"would_trip": False, "reason": f"every run progressed or has an ETA (rule {r['no_progress_min']:g} min)"})
     if "same_failure_runs" in r:
         kinds: dict = {}
         for h in tag.values():
@@ -505,90 +598,88 @@ def evaluate(w, hist, now) -> dict:
                 if k:
                     kinds[k] = kinds.get(k, 0) + 1
         top = max(kinds.items(), key=lambda kv: kv[1]) if kinds else (None, 0)
-        out["same_failure_runs"] = {"would_trip": top[1] >= r["same_failure_runs"],
-                                    "reason": f"most common failure in tag {w['tag']}: {top[0] or 'none'} x{top[1]}; "
-                                              f"rule {r['same_failure_runs']}"}
-    return {k: {**v, "at": utc(now)} for k, v in out.items()}
+        why = f"most common failure in tag {w['tag']}: {top[0] or 'none'} x{top[1]}; rule {r['same_failure_runs']}"
+        out["same_failure_runs"] = (
+            {"would_trip": True, "reason": why} if top[1] >= r["same_failure_runs"] else
+            {"would_trip": "unknown", "reason": why + "; not every run's outcome is known"}
+            if not peers_ok or not all(h.get("complete") or h.get("final") for h in tag.values()) else
+            {"would_trip": False, "reason": why})
+    return {k: {**v, "reason": _red(v["reason"]), "at": utc(now)} for k, v in out.items()}
 
 
-def _hist(state, lname, w):
-    """This launch's entry in the tag's history (keyed by launch, so a reused name loses nothing)."""
-    return state["tags"].setdefault(w["tag"], {}).setdefault(f"{lname}@{w['launch_id']}@{w['invocation']}", {})
+_INFLIGHT: dict = {}     # launch key -> the thread of a probe that has not returned (this process only)
 
 
-def _refresh(state, lname, w, now) -> None:
-    """Fold the collection's results (a run's status and exit code) into the labels and the tag history: also for a
-    launch whose clusters have ended, so a late collection still counts."""
-    col = (state["collect"].get(lname) or {}).get("labels", {})
-    for label, c in col.items():
-        if c.get("state") == "collected" and c.get("launch_id") == w["launch_id"]:
-            w["labels"].setdefault(label, {"last_progress": now}).update(
-                state="collected", run_status=c.get("run_status"), exit_code=c.get("exit_code"))
-    for lab in w["labels"].values():
-        lab["failure"] = failure_kind(lab)
-    _hist(state, lname, w)["failures"] = {k: v.get("failure") for k, v in w["labels"].items()}
-
-
-def _probe_one(state, lname, w, now, cloud) -> None:
-    import run_cluster as rc
-    w["health_at"] = now
-    entry = (state["collect"].get(lname) or {}).get("entry") or {}
+def _run_probe(cloud, w, entry, box):
     try:
-        pr_ = rc._bounded(cloud.probe, w, entry, timeout_s=PROBE_TIMEOUT_S)
-    except (Exception, SystemExit) as e:  # noqa: BLE001 -- a connect that refuses (SystemExit) included: unknown
-        w["note"] = _red(f"probe failed: {type(e).__name__}: {e}", 200)
-        w["rules"] = {k: {"would_trip": "unknown", "reason": w["note"], "at": utc(now)} for k in w.get("stop") or {}}
-        return
-    w.update(note="", cluster_states=pr_.get("clusters") or {})
-    for label in sorted(set(entry.get("assignments") or {}) | set(pr_.get("labels") or {})):
-        lab, got = w["labels"].setdefault(label, {"last_progress": now}), (pr_.get("labels") or {}).get(label)
-        if got:
-            if got.get("progress") != lab.get("progress"):
-                lab.update(progress=got.get("progress"), last_progress=now)
-            lab.update({k: got.get(k) for k in ("state", "phase", "heartbeat_age_s", "exit_code", "round", "complete")})
-        else:
-            lab["complete"] = False
-        lab["last_progress_utc"] = utc(lab["last_progress"])
-        t = eta_of(lab, w, now)
-        lab["eta_utc"] = utc(t) if t else None
-    if pr_.get("usd") is not None:
-        n = max(1, len(w["labels"]))
-        w.update(usd=float(pr_["usd"]), usd_per_run=float(pr_["usd"]) / n)
-        _hist(state, lname, w)["usd"] = w["usd"]
-    _refresh(state, lname, w, now)
-    w["rules"] = evaluate(w, state["tags"], now)
-    if pr_.get("clusters") and all(v in _ENDED for v in pr_["clusters"].values()):
-        w["state"] = "ended"
+        box["v"] = cloud.probe(w, entry)
+    except BaseException as e:  # noqa: BLE001 -- SystemExit from a connect that refuses included
+        box["e"] = e
 
 
 def watch_step(blob, name, state, now, cloud) -> None:
-    """Each watched launch on its own: fold in collection results, and every HEALTH_EVERY_S probe it under a deadline
-    and evaluate its rules. Reporting only: nothing here deletes, stops or checkpoints."""
+    """Reporting only (nothing here deletes, stops or checkpoints). Fold collection results into every watch; start
+    every due probe at once, each on its own thread under one deadline (a probe still running from an earlier pass
+    is not started again); apply each result; then evaluate every watch's rules, after all probes, so launches of
+    one tag agree. One launch's failure never touches another's."""
     off = cloud.disabled()
     for lname, w in sorted(state["watch"].items()):
         try:
             _refresh(state, lname, w, now)
-            if not off and w["state"] == "watching" and now - w.get("health_at", -1e18) >= HEALTH_EVERY_S:
-                _probe_one(state, lname, w, now, cloud)
-        except (Exception, SystemExit) as e:  # noqa: BLE001 -- one launch never stops the others or the loop
+        except Exception as e:  # noqa: BLE001
             w["note"] = _red(f"{type(e).__name__}: {e}")
+    boxes = {}
+    for lname, w in sorted(state["watch"].items()):
+        if off or w["state"] != "watching" or now - w.get("health_at", -1e18) < HEALTH_EVERY_S:
+            continue
+        w["health_at"], key = now, _key(lname, w)
+        if key in _INFLIGHT and _INFLIGHT[key].is_alive():
+            w.update(probe_ok=False, note="the previous probe has not returned yet")
+            _hist(state, lname, w)["stale"] = True
+            continue
+        box, entry = {}, json.loads(json.dumps((state["collect"].get(lname) or {}).get("entry") or {}))
+        th = threading.Thread(target=_run_probe, args=(cloud, json.loads(json.dumps(w)), entry, box), daemon=True)
+        th.start()
+        _INFLIGHT[key], boxes[lname] = th, (th, box)
+    end = time.monotonic() + PROBE_TIMEOUT_S
+    for th, _ in boxes.values():
+        th.join(max(0.0, end - time.monotonic()))
+    for lname, (th, box) in boxes.items():
+        w = state["watch"][lname]
+        try:
+            if th.is_alive():
+                raise TimeoutError(f"probe did not return within {PROBE_TIMEOUT_S:g} s")
+            if "e" in box:
+                raise box["e"]
+            _apply(state, lname, w, now, box["v"])
+            w.update(probe_ok=True, probe_ok_at=now, note="")
+        except (Exception, SystemExit) as e:  # noqa: BLE001 -- unknown, and the others go on
+            w.update(probe_ok=False, note=_red(f"probe failed: {type(e).__name__}: {e}"))
+            _hist(state, lname, w)["stale"] = True
+    for lname, w in sorted(state["watch"].items()):
+        try:
+            w["rules"] = evaluate(state, lname, w, now, held=bool(off))
+        except Exception as e:  # noqa: BLE001
+            w["rules"] = {k: {"would_trip": "unknown", "reason": _red(f"{type(e).__name__}: {e}"), "at": utc(now)}
+                          for k in w.get("stop") or {}}
 
 
 def sleep_for(state, now, every, watching=True) -> float:
     """Seconds until the next due check, at most `every`: a watched launch's probe (not while the monitor is held), a
-    label's collection retry."""
+    current label's collection retry."""
     due = [float(every)]
     for w in (state.get("watch") or {}).values() if watching else ():
         if w.get("state") == "watching":
             due.append(w.get("health_at", -1e18) + HEALTH_EVERY_S - now)
     for ent in (state.get("collect") or {}).values():
-        for lab in (ent.get("labels") or {}).values():
-            if lab.get("state") != "collected":
+        cur = set(((ent.get("entry") or {}).get("assignments") or {}))
+        for label, lab in (ent.get("labels") or {}).items():
+            if label in cur and lab.get("state") != "collected":
                 due.append(lab.get("tried", -1e18) + COLLECT_EVERY_S - now)
     return max(1.0, min(due))
 
 
-_HIDDEN = ("health_at", "launched_at")
+_HIDDEN = ("health_at", "launched_at", "seen_ids")
 
 
 def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metrics=run_metrics, host="",
@@ -612,12 +703,13 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
     seen = set(state["seen"])
     for b in names:
         rel = b[len(p["requests"]):]
-        rid = rel[:-len(".json")] if re.fullmatch(_RID.pattern + r"\.json", rel) else rel
+        good = re.fullmatch(_RID.pattern + r"\.json", rel)
+        rid = rel[:-len(".json")] if good else "refused-" + hashlib.sha256(rel.encode()).hexdigest()[:16]
         if rid in seen:
             continue
         state["seen"].append(rid)            # a bad request is recorded once, never retried every loop
         try:
-            if rid == rel:
+            if not good:
                 raise ValueError("a request name that is not <generated id>.json: not read")
             req = blob.get_json(b) or {}
             kind, pl = req.get("kind"), req.get("payload") or {}
@@ -630,17 +722,21 @@ def tick(blob, name, state, now, work, gh=None, fetch=fetch_from_storage, metric
                 w = valid_watch(pl["watch"], ent) if pl.get("watch") else None     # all checked first
                 cur = state["watch"].get(pl["name"])
                 same = cur and w and (cur["launch_id"], cur["invocation"]) == (w["launch_id"], w["invocation"])
+                if w:                              # a launch counts under one tag: its history moves with it
+                    for t, hs in list(state["tags"].items()):
+                        if t != w["tag"] and _key(pl["name"], w) in hs:
+                            state["tags"].setdefault(w["tag"], {})[_key(pl["name"], w)] = hs.pop(_key(pl["name"], w))
+                if cur and not same:               # no longer watched: its last reading stays in the tag's history
+                    state["tags"].setdefault(cur["tag"], {}).setdefault(_key(pl["name"], cur), {})["final"] = True
                 state["collect"].setdefault(pl["name"], {"labels": {}})["entry"] = pl
+                ids = {str(r["id"]): r["name"] for r in (w or {}).get("clusters", {}).values()}
                 if same:                           # the same launch: its ids (a keeper started later), rules, tag
-                    key = f"{pl['name']}@{cur['launch_id']}@{cur['invocation']}"
-                    moved = state["tags"].get(cur["tag"], {}).pop(key, None)
-                    if moved is not None:          # a launch counts under one tag: its history moves with it
-                        state["tags"].setdefault(w["tag"], {})[key] = moved
-                    cur.update(clusters=w["clusters"], stop=w["stop"], tag=w["tag"])
+                    cur.update(clusters=w["clusters"], stop=w["stop"], tag=w["tag"],
+                               seen_ids={**cur.get("seen_ids", {}), **ids})
                     cur.pop("health_at", None)
-                elif w:                            # another launch (or none): its history stays under `tags`
-                    state["watch"][pl["name"]] = {**w, "state": "watching", "labels": {},
-                                                  "launched_at": w["launched_at"] or now}
+                elif w:
+                    state["watch"][pl["name"]] = {**w, "state": "watching", "labels": {}, "seen_ids": ids}
+                    _hist(state, pl["name"], w)["final"] = False
                 else:
                     state["watch"].pop(pl["name"], None)
             elif kind != "noop":
@@ -795,8 +891,7 @@ def pull(blob, name, dest, now=None) -> list:
     return got
 
 
-def start_commands(a, job_id, token_present, coiled=False) -> list:
-    """vm_job up and start; secrets by name only (vm_job reads each where the laptop keeps it)."""
+def start_commands(a, job_id, token_present) -> list:
     """The two vm_job commands `start` runs: up (2-vCPU worker) and start (the loop as a job)."""
     vm = [sys.executable, "cloud/vm_job.py"]
     budget = ["--cap-usd", str(a.cap_usd)] + (["--budget-scope", a.budget_scope] if a.budget_scope else [])
@@ -804,22 +899,19 @@ def start_commands(a, job_id, token_present, coiled=False) -> list:
     up = vm + ["up", a.name, "--cpu", "2", "--memory", "8 GiB", "--idle-timeout", "20 minutes"] + budget
     start = (vm + ["start", a.name, job_id, "--tree", ".", "--max-hours", str(a.max_hours + 0.25)] + acct + budget
              + (["--secret-env", "GH_TOKEN"] if token_present else [])
-             + (["--secret-env", "DASK_COILED__TOKEN"] if coiled else [])
              + ["--", "python3", "cloud/supervisor.py", "loop", "--name", a.name, "--every", str(int(a.every)),
                 "--max-hours", str(a.max_hours)])
     return [up, start]
 
 
 def cmd_start(a):
-    import vm_job
-    # presence only, never the values: vm_job reads the GitHub token from the keychain and the Coiled token from
-    # dask's config files itself, and neither variable reaches a vm_job process's environment
-    tok, co = vm_job.keychain_has(KEYCHAIN_SERVICE), vm_job.coiled_token_configured()
+    r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"], capture_output=True,
+                       text=True)                      # the owner's one-time step stores it there
+    tok = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
     job_id = "sv-" + time.strftime("%Y%m%d-%H%M%S")
-    env = {k: v for k, v in os.environ.items() if k not in ("DASK_COILED__TOKEN", "GH_TOKEN")}
-    print(f"merge train: {'enabled (token in the keychain)' if tok else 'disabled (no token in the keychain)'}; "
-          f"run monitor: {'enabled' if co else 'held (no Coiled token in the dask config files)'}")
-    for cmd in start_commands(a, job_id, tok, coiled=co):
+    env = {**os.environ, **({"GH_TOKEN": tok} if tok else {})}
+    print(f"merge train: {'enabled (token from the keychain)' if tok else 'disabled (no token in the keychain)'}")
+    for cmd in start_commands(a, job_id, bool(tok)):
         print("$ " + " ".join(cmd), flush=True)
         r = subprocess.run(cmd, cwd=REPO_ROOT, env=env)
         if r.returncode:
@@ -1141,9 +1233,7 @@ def _self_test() -> int:
     st = run(b, [T0, T0 + 1])
     ok(len(st.get("seen", [])) == 1003 and st["acks"][-1]["at"] == utc(T0), "SV24 no processed request is replayed")
 
-    # ---- the run monitor, reporting only: health, spend and each stop rule's evaluation (SV25-SV42) ----
-    import contextlib
-    import io
+    # ---- the run monitor, reporting only: health, spend and each stop rule's evaluation (SV25-SV55) ----
     import types
     from unittest import mock
 
@@ -1306,6 +1396,7 @@ def _self_test() -> int:
         b, st = watched(FakeCloud(probes=[(1.0, probe(1.0))]), stop={"tag_usd": 0.5}, times=(T0,))
     ok("did not return" in wv(st).get("note", "") and rule(st, "tag_usd").get("would_trip") == "unknown",
        f"SV35 a probe past its deadline is unknown ({wv(st).get('note')})")
+    _INFLIGHT.clear()                  # that probe's thread is still sleeping: the cases below are other passes
     # SV36 a failed status.json write loses nothing: the next pass neither re-ingests the request nor probes again early
 
     class FlakyBlob(FakeBlob):
@@ -1350,37 +1441,133 @@ def _self_test() -> int:
     # SV39 the sleep stops at the next probe or collection retry; while held, watches add nothing
     T = T0 + 10_000
     s1 = {"watch": {LN: {"state": "watching", "health_at": T - HEALTH_EVERY_S + 10}}}
-    s3 = {"collect": {LN: {"labels": {"R1": {"state": "waiting", "tried": T - COLLECT_EVERY_S + 20},
-                                      "R2": {"state": "collected", "tried": T - 1000}}}}}
+    s3 = {"collect": {LN: {"entry": {"assignments": {"R1": {}, "R2": {}}},
+                           "labels": {"R1": {"state": "waiting", "tried": T - COLLECT_EVERY_S + 20},
+                                      "R2": {"state": "collected", "tried": T - 1000},
+                                      "R9": {"state": "waiting", "tried": T - 5000}}}}}
     ok(guard(sleep_for, {}, T, 600) == 600 and guard(sleep_for, s1, T, 600) == 10 and guard(sleep_for, s3, T, 600) == 20
        and guard(sleep_for, s1, T, 5) == 5 and guard(sleep_for, s1, T, 600, watching=False) == 600,
-       "SV39 the sleep stops at the next due check, never past --every")
-    # SV40 `start` passes the GitHub and Coiled tokens by name only: neither is in any vm_job process's environment
-    # or command line, even when both are exported in the shell
-    import vm_job
-    runs_ = []
-    a = argparse.Namespace(name=DEFAULT_NAME, cap_usd=15.0, max_hours=168.0, budget_scope=None, account="acct1", every=60)
-    with mock.patch.object(subprocess, "run", lambda cmd, **k: runs_.append((cmd, k.get("env")))
-                           or types.SimpleNamespace(returncode=0, stdout="")), \
-            mock.patch.object(vm_job, "coiled_token_configured", lambda: True), \
-            mock.patch.object(vm_job, "keychain_has", lambda svc: True, create=True), \
-            mock.patch.dict(os.environ, {"DASK_COILED__TOKEN": "z" * 40, "GH_TOKEN": "g" * 40}), \
-            contextlib.redirect_stdout(io.StringIO()):
-        rc_ = guard(cmd_start, a)
-    vj = [(c, e_) for c, e_ in runs_ if "cloud/vm_job.py" in c]
-    flat = " ".join(" ".join(c) for c, _ in runs_)
-    ok(rc_ == 0 and len(vj) == 2 and "--secret-env DASK_COILED__TOKEN" in " ".join(vj[1][0])
-       and "--secret-env GH_TOKEN" in " ".join(vj[1][0])
-       and all(e_ is not None and not {"DASK_COILED__TOKEN", "GH_TOKEN"} & set(e_) for _, e_ in vj)
-       and "z" * 40 not in flat and "g" * 40 not in flat and not any("find-generic-password" in " ".join(c) and "-w" in c
-                                                                     for c, _ in runs_),
-       f"SV40 start: both tokens by name, in no vm_job environment ({[' '.join(c)[:70] for c, _ in vj]})")
+       "SV39 the sleep stops at the next due check (a label no longer assigned adds nothing), never past --every")
     # SV41 `status` prints the watch as tables: runs, then each rule's would_trip and reason
     b, st = watched(FakeCloud(probes=[probe(20.0)]), stop={"tag_usd": 15, "no_progress_min": 600})
     lines = "\n".join(guard(status_lines, b.get_json(P["status"]) or {}, T0 + 30)[0])
     ok("RUN" in lines and "PHASE" in lines and "WOULD_TRIP" in lines and "tag_usd" in lines and " yes " in lines
        and "R1" in lines and "ANALYZE" in lines and "$20.00" in lines,
        f"SV41 status prints runs and rule evaluations as tables ({lines})")
+    # ---- Codex on the reporting-only version (SV43-SV55) ----
+    # SV43 probe text is redacted and a run's progress is kept as a digest only
+    b, st = watched(FakeCloud(probes=[probe(1.0, R1=lab(phase=f"x ApiToken {leak}", prog=(1, "ts", leak)), R2=lab())]))
+    blobs_ = json.dumps({k: v.decode(errors="replace") for k, v in b.d.items()})
+    ok(leak not in blobs_ and isinstance(wv(st)["labels"]["R1"].get("progress"), str), "SV43 probe text redacted, progress a digest")
+    # SV44 two launches of one tag, probed in one pass, report the same tag decision
+    ent2 = {"name": LN2, "storage_prefix": "runs/evals/t1/tb_acf", "storage_account": "acct", "assignments": ASG,
+            "watch": {**W, "clusters": {"run": {"name": LN2, "id": 101}}, "stop": {"tag_usd": 10}}}
+    b, st = watched(FakeCloud(probes=[probe(6.0)]), stop={"tag_usd": 10}, extra=(ent2,))
+    ok(rule(st, "tag_usd").get("would_trip") is True and rule(st, "tag_usd", LN2).get("would_trip") is True,
+       f"SV44 launches of one tag agree ({rule(st, 'tag_usd')}, {rule(st, 'tag_usd', LN2)})")
+    # SV45 an incomplete probe gives unknown for the run-outcome rules, even next to a stalled run with full inputs
+    labs_ = {"R1": lab(rnd=1), "R2": lab(rnd=1, complete=False)}
+    b, st = watched(FakeCloud(probes=[probe(1.0, **labs_)]), stop={"same_failure_runs": 1, "no_progress_min": 30},
+                    times=[T0 + k * HEALTH_EVERY_S for k in range(8)])
+    ok(rule(st, "same_failure_runs").get("would_trip") == "unknown" and rule(st, "no_progress_min").get("would_trip") == "unknown",
+       f"SV45 incomplete inputs: unknown ({wv(st).get('rules')})")
+    ok(label_complete({"state": "running", "log_bytes": 5}, {}) is False
+       and label_complete({"state": "running", "phase": "ANALYZE", "heartbeat_age_s": 3}, {}) is True
+       and label_complete({"state": "running", "phase": "A", "heartbeat_age_s": 3}, {"input_errors": ["x"]}) is False,
+       "SV45b a live run without a phase or heartbeat, or with unreadable files, is not complete")
+    # SV46 an ended launch is evaluated on its final reading and late collections; a held monitor reports unknown
+    b, st = watched(FakeCloud(probes=[{**probe(1.0), "clusters": {"run": "stopped", "keeper": "stopped"}}]),
+                    stop={"same_failure_runs": 1})
+    st["collect"][LN]["labels"]["R1"] = {"state": "collected", "launch_id": "L1", "invocation": "inv-1", "exit_code": 1,
+                                         "run_status": None}
+    with tempfile.TemporaryDirectory() as td:
+        st = guard(tick, b, N, st, T0 + 2, td, cloud=FakeCloud(), fetch=NOFETCH, metrics=metrics)
+        held_ = guard(tick, b, N, {**st, "watch": {LN: {**wv(st), "state": "watching"}}}, T0 + 3, td,
+                      cloud=FakeCloud(why="held"), fetch=NOFETCH, metrics=metrics)
+    ok(wv(st).get("state") == "ended" and rule(st, "same_failure_runs").get("would_trip") is True
+       and rule(held_, "same_failure_runs").get("would_trip") == "unknown",
+       f"SV46 ended: re-evaluated on late results; held: unknown ({rule(st, 'same_failure_runs')})")
+    # SV47 an error while applying a probe leaves no earlier decision standing
+    b, st = watched(FakeCloud(probes=[probe(20.0), {"clusters": {}, "usd": 1.0, "labels": "not a mapping"}]),
+                    stop={"tag_usd": 15}, times=(T0, T0 + HEALTH_EVERY_S))
+    ok(rule(st, "tag_usd").get("would_trip") == "unknown", f"SV47 a probe that cannot be applied: unknown ({rule(st, 'tag_usd')})")
+    # SV48 another invocation never inherits a collected result; an assignment without its identity binds nothing
+    asgB = {k: {**v, "invocation": "inv-B"} for k, v in ASG.items()}
+    b = FakeBlob()
+    guard(enqueue, b, N, "collect", {**CENT, "assignments": asgB, "watch": {**W, "invocation": "inv-B", "stop": {"same_failure_runs": 1}}}, T0 - 2)
+    st = {"collect": {LN: {"labels": {"R1": {"state": "collected", "launch_id": "L1", "invocation": "inv-1",
+                                             "exit_code": 1, "run_status": None}}}}}
+    with tempfile.TemporaryDirectory() as td:
+        st = guard(tick, b, N, st, T0, td, cloud=FakeCloud(probes=[probe(1.0)]), fetch=NOFETCH, metrics=metrics)
+    noid = {k: {x: y for x, y in v.items() if x != "cluster_id"} for k, v in ASG.items()}
+    ok(wv(st)["labels"]["R1"].get("failure") is None and "ValueError" in str(guard(valid_watch, W, {**CENT, "assignments": noid})),
+       f"SV48 a collected result counts only for its own invocation; missing identity is refused ({wv(st)['labels']['R1']})")
+    # SV49 spend: an id listed under another name makes it unread; a replaced helper's cost stays counted
+    ok(spend_of({"run": "running", "keeper": "listed under another name"}, {"101": 2.0}) is None
+       and spend_of({"run": "running"}, {"101": 2.0, "102": 9.0, "104": 1.0}) == 12.0 and spend_of({}, {"1": None}) is None,
+       "SV49 spend is the sum over every id ever recorded, unread when one is not this launch's")
+    b, st = watched(FakeCloud(probes=[probe(1.0)]))
+    with tempfile.TemporaryDirectory() as td:
+        guard(enqueue, b, N, "collect", {**CENT, "watch": {**W, "clusters": {**W["clusters"], "keeper": {"name": LN + "-keeper", "id": 104}}}}, T0 + 2)
+        st = guard(tick, b, N, st, T0 + 3, td, cloud=FakeCloud(probes=[probe(1.0)]), fetch=NOFETCH, metrics=metrics)
+    ok(sorted(wv(st).get("seen_ids", {})) == ["101", "102", "104"], f"SV49b every id ever recorded is kept ({wv(st).get('seen_ids')})")
+    # SV50 two launches of one name queued for one pass both keep a history entry; a re-tag never counts one twice
+    asgC = {k: {**v, "invocation": "inv-C", "cluster_id": 303} for k, v in ASG.items()}
+    b, st = watched(FakeCloud(probes=[probe(2.0)]), extra=({**CENT, "assignments": asgC, "watch": {**W, "invocation": "inv-C",
+                                                            "clusters": {"run": {"name": LN, "id": 303}}}},))
+    with tempfile.TemporaryDirectory() as td:
+        guard(enqueue, b, N, "collect", {**CENT, "watch": {**W, "tag": "t2"}}, T0 + 2)
+        st = guard(tick, b, N, st, T0 + 3, td, cloud=FakeCloud(probes=[probe(2.0)]), fetch=NOFETCH, metrics=metrics)
+    keys_ = [(t, k) for t, hs in st.get("tags", {}).items() for k in hs]
+    ok(sorted(k for _, k in keys_) == sorted({k for _, k in keys_}) and (("t2", f"{LN}@L1@inv-1") in keys_)
+       and any(k.endswith("inv-C") for _, k in keys_), f"SV50 history per launch, each under one tag ({keys_})")
+    # SV51 completed_no_report is an eval outcome; a run collected before run_status existed is unknown
+    ok(failure_kind({"state": "collected", "run_status": "completed_no_report", "exit_code": 2}) is None,
+       "SV51 completed_no_report is no failure")
+    b, st = watched(FakeCloud(probes=[{**probe(1.0), "clusters": {"run": "stopped", "keeper": "stopped"}}]),
+                    stop={"same_failure_runs": 1})
+    st["collect"][LN]["labels"]["R1"] = {"state": "collected", "launch_id": "L1", "invocation": "inv-1", "exit_code": 2}
+    with tempfile.TemporaryDirectory() as td:
+        st = guard(tick, b, N, st, T0 + 2, td, cloud=FakeCloud(), fetch=NOFETCH, metrics=metrics)
+    ok(rule(st, "same_failure_runs").get("would_trip") == "unknown", f"SV51b an old record's outcome is unknown ({rule(st, 'same_failure_runs')})")
+    # SV52 a refused name never shadows a later request of the same id, and is not stored verbatim
+    b = FakeBlob()
+    b.d[P["requests"] + "20260101T000000-0000abcd"] = json.dumps({"kind": "noop"}).encode()
+    st = run(b, [T0 + 1])
+    b.d[P["requests"] + "20260101T000000-0000abcd.json"] = json.dumps({"kind": "noop"}).encode()
+    st = run(b, [T0 + 2], state=st)
+    ok([x["request"] for x in st.get("acks", [])] == ["20260101T000000-0000abcd"]
+       and "20260101T000000-0000abcd" not in json.dumps(st.get("seen", [])[:1]), f"SV52 a refused name shadows nothing ({st.get('seen')})")
+    # SV53 probes run at once under one deadline: slow launches never delay a healthy one past it
+    ent3 = {"name": "ev-ok-t1-gcc", "storage_prefix": "runs/evals/t1/ok", "storage_account": "acct", "assignments": ASG,
+            "watch": {**W, "clusters": {"run": {"name": "ev-ok-t1-gcc", "id": 101}}}}
+    slow = (2.0, probe(1.0))
+    t_ = time.monotonic()
+    with mock.patch.dict(globals(), {"PROBE_TIMEOUT_S": 0.5}):
+        b, st = watched(FakeCloud(probes=[{LN: slow, LN2: slow, "ev-ok-t1-gcc": probe(3.0)}]), times=(T0,),
+                        extra=(ent2, ent3))
+    took = time.monotonic() - t_
+    _INFLIGHT.clear()
+    ok(wv(st, "ev-ok-t1-gcc").get("usd") == 3.0 and "did not return" in wv(st).get("note", "") and took < 1.5,
+       f"SV53 slow probes run alongside, under one deadline ({took:.2f} s)")
+    # SV54 no launch time: no ETA is made up, so a stalled round-two run is reported
+    b = FakeBlob()
+    guard(enqueue, b, N, "collect", {**CENT, "watch": {**{k: v for k, v in W.items() if k != "launched_utc"},
+                                                       "stop": {"no_progress_min": 30}}}, T0 - 2)
+    st = {}
+    with tempfile.TemporaryDirectory() as td:
+        for t in [T0 + k * HEALTH_EVERY_S for k in range(8)]:
+            st = guard(tick, b, N, st, t, td, cloud=FakeCloud(probes=[probe(1.0)]), fetch=NOFETCH, metrics=metrics)
+    ok(rule(st, "no_progress_min").get("would_trip") is True, f"SV54 no launch time, no ETA ({rule(st, 'no_progress_min')})")
+    # SV55 rules must be finite; an unreadable clusters.json still collects
+    ok("ValueError" in str(guard(_stop_rules, {"run_usd": float("inf")})) and "ValueError" in str(guard(_stop_rules, {"tag_usd": float("nan")})),
+       "SV55 an infinite or NaN rule is refused")
+    with tempfile.TemporaryDirectory() as td:
+        cfg_ = types.SimpleNamespace(name=LN, clusters_file=os.path.join(td, "clusters.json"), cap_usd=70,
+                                     storage_prefix="runs/evals/t1/flu_vaccine", run_timeout_hours=24, max_rounds=3)
+        open(cfg_.clusters_file, "w").write('{"invocation": "inv-1", "laun')
+        ok(guard(watch_payload, cfg_, ASG, {}, None) is None, "SV55b a truncated clusters.json: collection only")
+
     # SV42 reporting only: the monitor has no path that deletes, stops or checkpoints a cluster
     import inspect
     src_ = inspect.getsource(Cloud) + inspect.getsource(watch_step) + inspect.getsource(evaluate)
