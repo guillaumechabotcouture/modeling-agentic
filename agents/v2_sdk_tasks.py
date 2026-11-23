@@ -727,15 +727,13 @@ def validate_spec_tool(check, limit: int = MAX_VALIDATE_CALLS):
     """The spec draft's in-process validate_spec tool (baseline hb1, ranked fix 10): `check()` is the machine's own
     pre-sign check chain on the current files (Machine._spec_checks), so a pass here is what the harness finds after
     the try. No arguments, no shell. A check that raises is an error result, never a pass; past `limit` calls in one
-    try the tool says so (the turn and dollar caps bound the rest). One check at a time."""
-    import threading
+    try the tool says so (the turn and dollar caps bound the rest). One check at a time: the lock is taken before
+    the worker thread starts, so a queued call that is cancelled never runs its check."""
     from claude_agent_sdk import tool
-    state = {"calls": 0}
-    lock = threading.Lock()
+    state = {"calls": 0, "lock": None}
 
     def run():
-        with lock:
-            return list(check() or [])
+        return list(check() or [])
 
     @tool("validate_spec", "Run the harness's pre-sign checks on the current decision_spec.yaml, its settings, "
           "derivations and cited inputs: the same checks the harness runs when your try ends. Takes no arguments. "
@@ -746,15 +744,17 @@ def validate_spec_tool(check, limit: int = MAX_VALIDATE_CALLS):
             return {"is_error": True, "content": [{"type": "text", "text": (
                 f"validate_spec: the limit of {limit} checks in one try is reached; fix what the last check "
                 "reported, then finish (the harness checks the draft when the try ends)")}]}
+        state["lock"] = state["lock"] or asyncio.Lock()
         try:
-            probs = await asyncio.to_thread(run)
+            async with state["lock"]:
+                probs = await asyncio.to_thread(run)
         except Exception as e:  # noqa: BLE001 -- fail closed: never a pass
             return {"is_error": True, "content": [{"type": "text", "text": (
                 f"validate_spec: the checks could not run: {type(e).__name__}: {e}"[:2000])}]}
         if not probs:
             return {"content": [{"type": "text", "text": "validate_spec: no problems found by the pre-sign checks"}]}
         return {"content": [{"type": "text", "text": f"validate_spec: {len(probs)} problem(s), fix every one:\n- "
-                             + "\n- ".join(str(p) for p in probs[:40])}]}
+                             + "\n- ".join(str(p) for p in probs)}]}
     return validate_spec
 
 

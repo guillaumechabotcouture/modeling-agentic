@@ -819,6 +819,7 @@ def record_cited_inputs(run_dir: str) -> list[str]:
         return [f"{AB.SPEC_FILE} unreadable: {type(e).__name__}"]
     found = P.cited_paths(spec, run_dir)       # one walk, shared with the derived-input checks
     prov, probs, root = _provenance(run_dir), [], os.path.realpath(run_dir)
+    prov["cited"] = {}          # the current draft's citations only: a citation it dropped leaves the record
     # The staged copies must still be the files the question named (the draft task may not touch
     # them; this checks it).
     for dest, e in (prov.get("inputs") or {}).items():
@@ -1696,9 +1697,6 @@ class Machine:
         drafted = res.ok or (recheckable and os.path.lexists(os.path.join(rd, AB.SPEC_FILE)))
         if drafted:
             try:
-                from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
-                if CF.ensure_default(rd):
-                    self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
                 errs = self._spec_checks(rd)
                 if not errs and self.st.derived_inputs:
                     self._write_sheet(rd)
@@ -1724,10 +1722,16 @@ class Machine:
     def _spec_checks(self, rd: str) -> list[str]:
         """Every pre-sign check class on the draft, each run whatever the others found, so one try hears every problem
         (baseline hb1: the chain stopped at the first class that failed, and MAX_SPEC_TRIES is small). A class that
-        raises is named in the problems and the others still run. A spec that does not parse is the one problem."""
+        raises is named in the problems and the others still run. A spec that is a link or does not parse is the one
+        problem. The draft task's validate_spec tool runs exactly this, so a pass in the try is a pass at its end
+        (hb1 fix 10): the owner default for conflicts is applied here, in both paths."""
         import yaml
+        from lib.safe_io import read_nofollow
         try:
-            yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
+            yaml.safe_load(read_nofollow(rd, AB.SPEC_FILE)[0].decode("utf-8"))     # never a link's target
+            from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
+            if CF.ensure_default(rd):
+                self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
         except Exception as e:  # noqa: BLE001
             return [f"spec unreadable: {type(e).__name__}: {e}"]
         out: list[str] = []
@@ -6431,7 +6435,7 @@ def _self_test_hb2_validate(ok, td: str, new_run) -> None:
     spec9 = dict(T9.s["spec"])
     StubTasks(dict(T9.s, spec=spec9)).draft_spec("q", d9, None)
     record_cited_inputs(d9)
-    spec9 = dict(spec9, decision_units=dict(spec9["decision_units"], csv="other_units.csv"))
+    spec9 = json.loads(json.dumps(spec9).replace('"units.csv"', '"other_units.csv"'))     # every citation of it
     StubTasks(dict(T9.s, spec=spec9)).draft_spec("q", d9, None)
     record_cited_inputs(d9)
     cited9 = sorted((json.load(open(os.path.join(d9, PROVENANCE))).get("cited") or {}))
