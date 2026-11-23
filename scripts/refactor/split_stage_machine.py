@@ -1031,6 +1031,7 @@ def stage_package(repo: str, table: dict = TABLE, log=print) -> bool:
                          f"rename the module or the name first")
     files[f"{PKG_DIR}/__init__.py"] = _init(units, lines, assign, mods)
     files[f"{PKG_DIR}/namespace.py"] = NAMESPACE_PY
+    files[f"{PKG_DIR}/__main__.py"] = MAIN_PY
     files[MODULE] = _cli(units, lines)
     _write_tree(repo, files)
     log(f"package: {len(files) - 1} files under {PKG_DIR}/ and the CLI; {len(state_order)} state modules; "
@@ -1071,23 +1072,47 @@ import types
 
 _MISSING = object()
 _PKG = __name__.rpartition(".")[0]
+_MODULES = sys.modules          # held here: a patch of the package's `sys` must not reach the forwarding itself
+_SELF = __name__
+
+
+def _submodules(pkg):
+    me = _MODULES.get(_SELF)
+    return [m for k, m in list(_MODULES.items())
+            if m is not None and m is not pkg and m is not me and k.startswith(_PKG + ".")]
 
 
 class _Shared(types.ModuleType):
     def __setattr__(self, name, value):
         old = self.__dict__.get(name, _MISSING)
         super().__setattr__(name, value)
-        if old is _MISSING or old is value:
+        if old is value:
             return
-        for mname, mod in list(sys.modules.items()):
-            if mod is not None and mod is not self and mname.startswith(_PKG + ".") \\
-                    and mod.__dict__.get(name, _MISSING) is old:
+        for mod in _submodules(self):
+            # the same object, or (old missing) a name the module resolved through builtins, as one module did
+            if mod.__dict__.get(name, _MISSING) is old:
                 setattr(mod, name, value)
+
+    def __delattr__(self, name):
+        old = self.__dict__.get(name, _MISSING)
+        super().__delattr__(name)
+        for mod in _submodules(self):
+            if old is not _MISSING and mod.__dict__.get(name, _MISSING) is old:
+                delattr(mod, name)
 
 
 def share(module) -> None:
     """Make assignments to `module` (the package, agents/stage_machine/__init__.py) reach its submodules."""
     module.__class__ = _Shared
+'''
+
+MAIN_PY = '''"""`python3 -m agents.stage_machine`: the command line, as when the module ran under -m (split_stage_machine.py)."""
+import sys
+
+from . import main
+
+if __name__ == "__main__":
+    sys.exit(main())
 '''
 
 
@@ -1119,6 +1144,11 @@ def _init(units, lines, assign, mods) -> str:
             out.append(wrap_import(f"from .{m} import ", sorted(by_mod[m]), noqa="  # noqa: E402,F401"))
     out.append("from . import namespace as _namespace  # noqa: E402\n\n"
                "_namespace.share(sys.modules[__name__])     # an assignment to this module reaches the package\n")
+    exported = _public_names(units)
+    if exported is not None:     # `from stage_machine import *` gives what the module gave, not the submodules
+        out.append("# what `from stage_machine import *` took from the module (not the submodules' names)\n"
+                   + wrap_import("__all__ = ", [repr(n) for n in exported]).replace("__all__ = (", "__all__ = [", 1)
+                   .rstrip("\n").rstrip(")") + "]\n" if len(exported) > 1 else "__all__ = " + repr(exported) + "\n")
     for u in units:
         if u.kind in ("doc", "future", "import") or _is_main_guard(u.node):
             continue
@@ -1135,6 +1165,14 @@ scripts/refactor/split_stage_machine.py); this file is never imported, since the
     python3 agents/stage_machine.py --self-test
 """
 '''
+
+
+def _public_names(units):
+    """The names `import *` took from the module; None when it has an __all__ of its own (nothing generated)."""
+    names = {n for u in units for n in u.names}
+    if "__all__" in names:
+        return None
+    return sorted(n for n in names if not n.startswith("_"))
 
 
 def _cli(units, lines) -> str:
@@ -1183,7 +1221,10 @@ def verify_package(repo: str, original_src: str, table: dict = TABLE) -> list:
                     for m in st.body:
                         if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
                             meth_new.setdefault(m.name, []).append(ast.dump(m))
-    cli = ast.parse(open(os.path.join(repo, MODULE), encoding="utf-8").read())
+    cli_text = open(os.path.join(repo, MODULE), encoding="utf-8").read()
+    if cli_text != _cli(units, original_src.splitlines(keepends=True)):
+        probs.append(f"{MODULE}: not the command line the script writes")
+    cli = ast.parse(cli_text)
     guards = [ast.dump(u.node) for u in units if _is_main_guard(u.node)]
     if [ast.dump(st) for st in cli.body if _is_main_guard(st)] != guards:
         probs.append(f"{MODULE}: not the module's own `if __name__ == \"__main__\"` block")
@@ -1224,7 +1265,8 @@ def _extra_code(repo: str, units, meths, mu) -> list:
         'for _p in (_REPO, os.path.join(_REPO, "scripts"), _HERE):\n    if _p not in sys.path:\n'
         '        sys.path.insert(0, _p)\n_namespace.share(sys.modules[__name__])\n').body}
     states = [n[2:] for n in meths if n.startswith("h_")]
-    fixed = {f"{PKG_DIR}/namespace.py": NAMESPACE_PY, f"{PKG_DIR}/states/__init__.py": _states_init(states)}
+    fixed = {f"{PKG_DIR}/namespace.py": NAMESPACE_PY, f"{PKG_DIR}/states/__init__.py": _states_init(states),
+             f"{PKG_DIR}/__main__.py": MAIN_PY}
     for rel, text in fixed.items():
         if open(os.path.join(repo, rel), encoding="utf-8").read() != text:
             probs.append(f"{rel}: not the text the script writes")
@@ -1236,6 +1278,11 @@ def _extra_code(repo: str, units, meths, mu) -> list:
             t = ast.parse(open(os.path.join(root, f), encoding="utf-8").read())
             for i, st in enumerate(t.body):
                 if isinstance(st, (ast.Import, ast.ImportFrom)) or (i == 0 and isinstance(st, ast.Expr)):
+                    continue
+                if rel == f"{PKG_DIR}/__init__.py" and isinstance(st, ast.Assign) \
+                        and [ast.unparse(x) for x in st.targets] == ["__all__"]:
+                    if ast.literal_eval(st.value) != _public_names(units):
+                        probs.append(f"{rel}: __all__ is not the module's public names")
                     continue
                 if isinstance(st, ast.ClassDef) and (st.name == "Machine" or (
                         len(st.decorator_list) == 1 and ast.unparse(st.decorator_list[0]).startswith("handler("))):
@@ -1511,7 +1558,8 @@ def _self_test() -> int:
            + ("" if rc2 == 0 else after2[-600:]))
         pk = sorted(os.path.relpath(os.path.join(r, f), d) for r, _x, fs in os.walk(os.path.join(d, PKG_DIR))
                     for f in fs if f.endswith(".py"))
-        ok(pk == [f"{PKG_DIR}/{f}" for f in ("__init__.py", "common.py", "edges.py", "machine.py", "namespace.py",
+        ok(pk == [f"{PKG_DIR}/{f}" for f in ("__init__.py", "__main__.py", "common.py", "edges.py", "machine.py",
+                                             "namespace.py",
                                              "run.py", "states/__init__.py", "states/a.py", "states/b.py")]
            and PKG_DIR == "agents/stage_machine", f"S11 the package layout: {pk}")
         sa = open(os.path.join(d, PKG_DIR, "states", "a.py")).read()
@@ -1530,6 +1578,20 @@ def _self_test() -> int:
                            cwd=d, capture_output=True, text=True)
         ok(r.stdout.split() == ["True", "True"], "S22 rebinding a name to the object it holds is a no-op, and a "
                                                  f"patch and its undo reach the submodule ({r.stderr[-200:]})")
+        probe = ("import sys, types, unittest.mock as um; sys.path.insert(0, 'agents'); import stage_machine as m, "
+                 "stage_machine.states.a as a\n"
+                 "with um.patch.object(m, 'sys', types.SimpleNamespace(argv=[])):\n    pass\n"
+                 "f = m.a_helper; m.a_helper = lambda v: 99; x = a.a_helper(0); m.a_helper = f\n"
+                 "with um.patch.object(m, 'len', lambda v: 5, create=True):\n    y = a.len('')\n"
+                 "ns = {'run': 'mine'}; exec('from stage_machine import *', ns)\n"
+                 "print(x == 99, a.a_helper is f, y == 5, 'len' not in vars(a), ns['run'] == 'mine', "
+                 "'run_toy' in ns)\n")
+        r = subprocess.run([py, "-c", probe], cwd=d, capture_output=True, text=True)
+        r2 = subprocess.run([py, "-m", "agents.stage_machine"], cwd=d, capture_output=True, text=True)
+        ok(r.stdout.split() == ["True"] * 6 and r2.returncode == 0 and '"A"' in r2.stdout,
+           f"S41 a patch of the package's sys and its undo leave forwarding working; a builtin patched on the "
+           f"package reaches a submodule and its undo removes it; import * gives the module's names; -m runs "
+           f"({r.stdout.strip()} {r.stderr[-300:]} {r2.returncode})")
         ok(not stage_package(d, table=TOY_TABLE, log=quiet), "S16 stage package is idempotent")
         pa = os.path.join(d, PKG_DIR, "states", "a.py")
         open(pa, "w").write(sa.replace("== 3", "== 4") + "\nX_NEW = 1\n")
