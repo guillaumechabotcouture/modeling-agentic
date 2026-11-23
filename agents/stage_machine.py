@@ -1713,13 +1713,11 @@ class Machine:
         # wrong on a resume or a rewrite (Codex r1 P1-3/P1-4, r2 P1-5/P1-7/P2-8). Only when the try's feedback is
         # what these checks wrote (or none): reasons they cannot verify (a rethink, a refused sign-off, the evidence
         # stage) are never cleared by an old draft that passes them; they are carried (Codex r3 P1-2).
-        recheckable = not fb or fb == self.st.tries.get("spec_feedback_checked")
+        recheckable = (not fb or fb == self.st.tries.get("spec_feedback_checked")
+                       or all(str(x).startswith("draft_spec failed:") for x in fb))   # r1 P1-5: a run saved before
         drafted = res.ok or (recheckable and os.path.lexists(os.path.join(rd, AB.SPEC_FILE)))
         if drafted:
             try:
-                from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
-                if CF.ensure_default(rd):
-                    self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
                 errs = self._spec_checks(rd)
                 if not errs and self.st.derived_inputs:
                     self._write_sheet(rd)
@@ -1729,7 +1727,9 @@ class Machine:
                 errs = [f"draft_spec failed: {res.note} (its draft was checked)"] + errs
         if errs:
             self.st.tries["spec_feedback"] = _carry_feedback(errs, fb if not drafted else None)
-            if drafted:     # these checks' own output: a capped next try may be re-checked against it
+            if drafted or recheckable:
+                # these checks' own output (or, with no draft on disk, what they wrote before plus that note): a capped
+                # next try may be re-checked against it (Codex r4 P1-3: a first try with no draft blocked every later one)
                 self.st.tries["spec_feedback_checked"] = list(self.st.tries["spec_feedback"])
             else:
                 self.st.tries.pop("spec_feedback_checked", None)
@@ -1745,10 +1745,18 @@ class Machine:
     def _spec_checks(self, rd: str) -> list[str]:
         """Every pre-sign check class on the draft, each run whatever the others found, so one try hears every problem
         (baseline hb1: the chain stopped at the first class that failed, and MAX_SPEC_TRIES is small). A class that
-        raises is named in the problems and the others still run. A spec that does not parse is the one problem."""
+        raises is named in the problems and the others still run. A spec or settings file that is a link (symbolic or
+        hard) or not a regular file, or a spec that does not parse, is the problem and nothing else runs (Codex r4
+        P1-5: the checks read these files by path)."""
         import yaml
+        bad = _draft_file_problems(rd) + _special_files(rd)     # before anything opens a file (Codex r1 on #350)
+        if bad:
+            return bad
         try:
             yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
+            from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
+            if CF.ensure_default(rd):                        # after the link checks: it replaces the file
+                self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
         except Exception as e:  # noqa: BLE001
             return [f"spec unreadable: {type(e).__name__}: {e}"]
         out: list[str] = []
@@ -1793,15 +1801,28 @@ class Machine:
 
     @staticmethod
     def _cites_outside(rd: str) -> list[str]:
-        """The spec's citations that resolve outside the run directory (record_cited_inputs refuses them), as problems.
-        Fail closed: when the citations cannot be listed, that is the problem."""
+        """The spec's citations no later check may open, as problems: one that resolves outside the run directory
+        (record_cited_inputs refuses it), or one that exists but is neither a regular file nor a directory (a FIFO or a
+        device blocks the reader: Codex r4 P1-4). Fail closed: when the citations cannot be listed, that is the
+        problem."""
+        import stat
         import yaml
         import pipeline as P
         try:
             spec = yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}
-            root = os.path.realpath(rd)
-            return [f"the spec cites {r}, outside the run directory: copy it into data/" for r in P.cited_paths(spec, rd)
-                    if not os.path.realpath(os.path.join(rd, r)).startswith(root + os.sep)]
+            root, out = os.path.realpath(rd), []
+            for r in P.cited_paths(spec, rd):
+                p = os.path.realpath(os.path.join(rd, r))
+                if not p.startswith(root + os.sep):
+                    out.append(f"the spec cites {r}, outside the run directory: copy it into data/")
+                    continue
+                try:
+                    mode = os.stat(p).st_mode
+                except FileNotFoundError:
+                    continue                    # record_cited_inputs says it does not exist; nothing can open it
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    out.append(f"the spec cites {r}, which is not a regular file: write the table as a plain file")
+            return out
         except Exception as e:  # noqa: BLE001
             return [f"the spec's cited paths could not be listed, so no check reads them: {type(e).__name__}: {e}"]
 
@@ -2888,6 +2909,51 @@ def _pre_engine_check(spec: dict) -> list[str]:
 
 ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
 STATUS_MARK = "<!-- harness: run status -->"
+
+
+def _draft_file_problems(run_dir: str) -> list[str]:
+    """The spec (required) and analysis_settings.yaml (optional) must each be a regular file with one link: the pre-sign
+    checks read them by path, so a symbolic or hard link would show them another file's content (Codex r4 P1-5)."""
+    import stat
+    out = []
+    for rel, required in ((AB.SPEC_FILE, True), (AB.SETTINGS_FILE, False)):
+        try:
+            st = os.lstat(os.path.join(run_dir, rel))
+        except FileNotFoundError:
+            if required:
+                out.append(f"spec unreadable: {rel} does not exist")
+            continue
+        except OSError as e:
+            out.append(f"{rel} cannot be read: {type(e).__name__}")
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            out.append(f"{rel} is a link or not a regular file: write it as a plain file")
+        elif st.st_nlink > 1:
+            out.append(f"{rel} has {st.st_nlink} hard links: write it as its own file")
+    return out
+
+
+def _special_files(run_dir: str, limit: int = 20000) -> list[str]:
+    """Every entry in the run directory that is not a regular file, a directory or a link to one (a FIFO, a device, a
+    socket), as problems: a check or a derivation that opens one can block with no writer. The whole run is walked
+    (no link followed), so the result does not depend on how a path in the spec is spelled (Codex r1 on #350). Fail
+    closed past `limit` entries."""
+    import stat
+    out, n = [], 0
+    for base, dirs, files in os.walk(run_dir):
+        for name in dirs + files:
+            n += 1
+            if n > limit:
+                return out + [f"the run directory has more than {limit} entries: its files were not checked"]
+            p = os.path.join(base, name)
+            try:
+                mode = os.stat(p).st_mode           # a link: its target's type
+            except OSError:
+                continue                            # a dangling link opens nothing
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                out.append(f"{os.path.relpath(p, run_dir)!r} in the run is not a regular file: remove it, or write "
+                           "a plain file")
+    return out
 
 
 CARRIED = "from an earlier try, still unresolved: "
@@ -4930,6 +4996,10 @@ def _self_test() -> int:
             _self_test_hb2_spec(ok, td, spike, new_run)
         except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
             ok(False, f"HS: {type(e).__name__}: {e}")
+        try:
+            _self_test_spec_p1s(ok, td, spike, new_run)
+        except Exception as e:  # noqa: BLE001 -- before the fix this is the failure
+            ok(False, f"SP: {type(e).__name__}: {e}")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
@@ -6717,6 +6787,117 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     os.makedirs(hw)
     t5.world_model_seed(hw, {"question": "q"}, None, 1.0)
     ok(got == [5], f"HS13b the explicit turn cap holds for the world-model seed's own session ({got})")
+
+
+def _self_test_spec_p1s(ok, td: str, spike, new_run) -> None:
+    """SP1-SP4 (Codex round 4 on #348, on code merged through #342): a capped try with no draft must not stop later
+    capped tries' drafts from being checked; a cited input that is not a regular file (a FIFO) is never opened by a later
+    check; the spec and its settings are refused as links or hard links before any check reads them; an explicit zero
+    turn cap is refused (it would remove the session's limit)."""
+    from v2_tasks import StubTasks, TaskResult
+
+    class Capped(StubTasks):
+        """Per try: "none" (no draft, capped) or "good" (a valid draft written, then capped)."""
+        def draft_spec(self, q, rd, fb):
+            self.n_ = getattr(self, "n_", 0) + 1
+            if self.s["tries"][self.n_ - 1] == "good":
+                StubTasks(self.s).draft_spec(q, rd, fb)
+            self.calls.append("draft_spec")
+            return TaskResult(False, None, 0.0, "max turns")
+    d1, T1, st1 = new_run("sp1", {})
+    T1 = Capped(dict(T1.s, tries=["none", "good", "good"]))
+    m = Machine(d1, T1, st1, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    for _ in range(3):
+        if m.st.state != "SPEC" or m.st.status:
+            break
+        m.step()
+    ok(m.st.state == "EVIDENCE", f"SP1 a first capped try with no draft does not stop the next capped try's valid draft "
+                                 f"from being checked ({m.st.state}, {m.st.status}, {m.st.tries.get('spec_feedback')})")
+
+    class Spy(Machine):
+        def _geometry_problems(self, rd=None):
+            self.ran = getattr(self, "ran", []) + ["geometry"]
+            return []
+
+        def _evidence_assess(self, rd):
+            self.ran = getattr(self, "ran", []) + ["evidence"]
+            return super()._evidence_assess(rd)
+    # SP3: a cited FIFO inside the run is refused and no later check opens it (it would block with no writer)
+    d3, T3, st3 = new_run("sp3", {})
+    m3 = Spy(d3, T3, st3, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    spec3 = dict(T3.s["spec"], decision_units=dict(T3.s["spec"]["decision_units"], csv="units_fifo.csv"))
+    StubTasks(dict(T3.s, spec=spec3)).draft_spec("q", d3, None)
+    os.mkfifo(os.path.join(d3, "units_fifo.csv"))
+    got3 = m3._spec_checks(d3)
+    ok(any("units_fifo.csv" in x and "regular file" in x for x in got3) and not getattr(m3, "ran", []),
+       f"SP3 a cited FIFO is refused and never opened by a later check ({getattr(m3, 'ran', [])}, {got3})")
+    # SP4: the spec and analysis_settings.yaml are refused as a symlink or a hard link, before any check reads them
+    marker = os.path.join(td, "sp4_fixture.yaml")
+    open(marker, "w").write("fixture_marker: 1\n")
+    res4 = {}
+    for name, rel, how in (("settings link", "analysis_settings.yaml", os.symlink),
+                           ("settings hard link", "analysis_settings.yaml", os.link),
+                           ("spec hard link", AB.SPEC_FILE, os.link)):
+        d4, T4, st4 = new_run("sp4_" + name.replace(" ", "_"), {})
+        T4.draft_spec("q", d4, None)
+        os.remove(os.path.join(d4, rel))
+        how(marker, os.path.join(d4, rel))
+        m4 = Spy(d4, T4, st4, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        got4 = m4._spec_checks(d4)
+        res4[name] = bool(any(rel in x and "link" in x for x in got4) and not any("fixture_marker" in x for x in got4)
+                          and not getattr(m4, "ran", []))
+    ok(all(res4.values()), f"SP4 a linked spec or settings file is refused before any check reads it ({res4})")
+    # SP5 (Codex r1 P1-1): through h_SPEC, a hard-linked spec is refused before the conflicts default rewrites it
+    d5, T5, st5 = new_run("sp5", {})
+
+    class Linking(StubTasks):
+        def draft_spec(self, q, rd, fb):
+            r = StubTasks(self.s).draft_spec(q, rd, fb)
+            os.link(os.path.join(rd, AB.SPEC_FILE), os.path.join(td, "sp5_other_name.yaml"))
+            return r
+    m5 = Machine(d5, Linking(T5.s), st5, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m5.step()
+    ok(m5.st.state == "SPEC" and any("hard links" in x for x in m5.st.tries.get("spec_feedback") or []),
+       f"SP5 a hard-linked spec is refused at the try's end, before the conflicts default is applied ({m5.st.state}, "
+       f"{m5.st.tries.get('spec_feedback')})")
+
+    # SP6 (Codex r1 P1-2/P1-3): a FIFO anywhere in the run, whatever path names it (a staged input a derivation reads,
+    # a name with a leading space), is refused before derivations or any check runs
+    class SpyAll(Spy):
+        def _derive(self, rd=None):
+            self.ran = getattr(self, "ran", []) + ["derive"]
+            return []
+    res6 = {}
+    for name, rel, cite in (("staged input", "data/inputs/t.csv", None), ("spaced name", " units.csv", " units.csv")):
+        d6, T6, st6 = new_run("sp6_" + name.replace(" ", "_"), {})
+        spec6 = T6.s["spec"] if cite is None else dict(
+            T6.s["spec"], decision_units=dict(T6.s["spec"]["decision_units"], csv=cite))
+        StubTasks(dict(T6.s, spec=spec6)).draft_spec("q", d6, None)
+        os.makedirs(os.path.dirname(os.path.join(d6, rel)), exist_ok=True)
+        os.mkfifo(os.path.join(d6, rel))
+        m6 = SpyAll(d6, T6, st6, backend=spike, log=lambda *a: None, cross_engine_check=False)
+        m6.st.derived_inputs = True
+        got6 = m6._spec_checks(d6)
+        res6[name] = bool(any("regular file" in x for x in got6) and not getattr(m6, "ran", []))
+    ok(all(res6.values()), f"SP6 a FIFO in the run is refused before derivations or any reading check ({res6})")
+    # SP7 (Codex r1 P1-5): a run saved before this fix (feedback "draft_spec failed: ...", no checked copy) still has a
+    # later capped try's valid draft checked
+    d7, T7, st7 = new_run("sp7", {})
+    st7.tries.update(spec=1, spec_feedback=["draft_spec failed: max turns"])
+    save_state(d7, st7)
+    T7 = Capped(dict(T7.s, tries=["good"]))
+    m7 = Machine(d7, T7, st7, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m7.step()
+    ok(m7.st.state == "EVIDENCE", f"SP7 a capped try after an earlier no-draft note is checked ({m7.st.state}, "
+                                  f"{m7.st.tries.get('spec_feedback')})")
+    # SP2: an explicit zero turn cap is refused, never passed on as "no limit"
+    from v2_sdk_tasks import SdkTasks
+    try:
+        SdkTasks(os.path.join(td, "sp2"), max_turns=0)
+        refused = False
+    except ValueError:
+        refused = True
+    ok(refused, "SP2 SdkTasks(max_turns=0) is refused: the SDK reads 0 as no turn limit")
 
 
 def main(argv=None) -> int:
