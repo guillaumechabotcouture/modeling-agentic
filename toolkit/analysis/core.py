@@ -381,19 +381,17 @@ class Analysis:
 
 
 def q(v, level=0.95) -> dict | None:
-    v = np.asarray(v, float)
+    import statistics
+    v = np.asarray(v, float).ravel()      # draws are counted flat
     if not len(v):
         return None
     if not np.all(np.isfinite(v)):      # 1C-b 2d-iii: fail closed (one NaN made every quantile NaN)
         raise ValueError(f"quantiles: {int(np.sum(~np.isfinite(v)))} of {len(v)} values are not finite")
     a = 100 * (1 - level) / 2
-    v = v.ravel()
     n = len(v)
-    try:      # hb1 fix 11 (L): the one estimator of both uncertainty files; an exactly rounded sum, no cancellation
-        mean = math.fsum(v) / n
-    except OverflowError:      # the sum overflows: the exact mean (rational arithmetic), whatever the order
-        import statistics
-        mean = float(statistics.mean(float(x) for x in v))
+    # hb1 fix 11 (L): the one estimator of both uncertainty files; the correctly rounded mean (exact rational
+    # arithmetic), so neither cancellation, overflow nor the order of the draws changes it
+    mean = float(statistics.mean(v.tolist()))
     s = None
 
     def lerp(p):          # numpy's linear rule without overflow: equal neighbours give that value exactly
