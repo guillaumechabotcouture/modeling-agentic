@@ -2145,7 +2145,7 @@ def _norm_rel(p: str, run_dir: str) -> str:
     return os.path.relpath(full, os.path.realpath(run_dir)).replace(os.sep, "/")
 
 
-def staged_copy_hint(rel: str, run_dir: str) -> str:
+def staged_copy_hint(rel: str, run_dir: str, derive: bool = False) -> str:
     """Baseline hb2 (§4.6): a cited path that is not itself a staged input but names one, by its repository path
     (`data/inputs/<rel>` exists) or, for a bare file name, by the name only one staged input has (a qualified path in
     another folder, a derived table, is never matched by its name; Codex r1 of #355). The refusal's suffix naming it,
@@ -2158,7 +2158,12 @@ def staged_copy_hint(rel: str, run_dir: str) -> str:
     if hit is None and "/" not in r:
         same = [k for k in prov if k.rsplit("/", 1)[-1] == r.rsplit("/", 1)[-1]]
         hit = same[0] if len(same) == 1 else None
-    return f" (its staged copy is {hit}: cite that path)" if hit else ""
+    if not hit:
+        return ""
+    if derive:     # a table that must be a derivation's output (the units table; Codex r2 of #355)
+        return (f" (the staged input is {hit}: read it in a derivation under {DERIVE_PREFIX} and cite the "
+                f"derivation's output)")
+    return f" (its staged copy is {hit}: cite that path)"
 
 
 def derivation_problems(run_dir: str, spec: dict | None = None, required: bool = False) -> list[dict]:

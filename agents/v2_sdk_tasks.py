@@ -471,7 +471,7 @@ def _staged_list(run_dir: str) -> str:
             if staged else "")
 
 
-_ID = re.compile(r"^([A-Za-z]+)-(\d+)$")
+_ID = re.compile(r"^([A-Za-z]+)-(\d{1,6})$")     # an id too long to be one is left as written (Codex r2)
 
 
 def _registered_ids(run_dir: str, before) -> set | None:
@@ -499,10 +499,12 @@ def _registered_ids(run_dir: str, before) -> set | None:
     return ids
 
 
-def _file_bytes(p: str) -> bytes | None:
+def _file_bytes(run_dir: str, rel: str) -> bytes | None:
+    """The bytes of a regular file, read with no link followed and never blocking (a FIFO is refused; Codex r2); None
+    for anything else."""
     try:
-        return None if os.path.islink(p) else open(p, "rb").read()
-    except OSError:
+        return _sio().read_nofollow(run_dir, rel)[0]
+    except Exception:  # noqa: BLE001 -- missing, a link, not a regular file: no bytes
         return None
 
 
@@ -513,8 +515,9 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
     each blocker that defines an id of the form X-NNN with another prefix gets the critic's prefix
     (validate_critique_yaml.PREFIXES), its carried_forward references with it. The new number is the first, from the
     one written, that no blocker in the file and no earlier round uses (frozen tests, the ledger, the replaced file):
-    a new finding never takes an old finding's id, nor its test. When those records cannot be read, nothing is
-    renumbered. A file that is missing, unreadable or not a mapping, and any id that is not a string, is left as it
+    a new finding never takes an old finding's id, nor its test. A wrong-prefix id the file also carries forward, whose
+    stamped form is already used, refers to that finding and is left for the critic's repair (Codex r2). When those
+    records cannot be read, nothing is renumbered. A file that is missing, unreadable or not a mapping, and any id that is not a string, is left as it
     is for the gate to refuse (fail closed). True when the file was rewritten."""
     import yaml
     import validate_critique_yaml as V
@@ -522,7 +525,7 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
     p = os.path.join(run_dir, rel)
     if os.path.islink(p) or not os.path.isfile(p):
         return False
-    now = _file_bytes(p)
+    now = _file_bytes(run_dir, rel)
     if now is None or now == before:
         return False
     try:
@@ -539,12 +542,16 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
     ren: dict = {}
     wrong = [i for i in defined if _ID.match(i) and not i.startswith(want)]
     known = _registered_ids(run_dir, before) if wrong else set()
+    refs = [c.get("id") if isinstance(c, dict) else c for c in cf]
+    refs = {r for r in refs if isinstance(r, str)}
     if known is not None:
         used = set(defined) | known
         for i in wrong:
             if i in ren or defined.count(i) > 1:
                 continue                         # a duplicated id is the gate's to refuse
             digits = _ID.match(i).group(2)
+            if want + digits in used and i in refs:
+                continue                         # a carried reference to a finding of that id: the critic repairs it
             n = int(digits)
             while f"{want}{n:0{len(digits)}d}" in used:
                 n += 1
@@ -758,7 +765,7 @@ class SdkTasks:
         notes = RF.critic_notes(run_dir)
         msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
                                             + "\n- ".join(notes) if notes else "")
-        before = _file_bytes(os.path.join(run_dir, f))
+        before = _file_bytes(run_dir, f)
         res = self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
@@ -1216,6 +1223,51 @@ def _self_test() -> int:
             SdkTasks._session = orig_session
         ok(_y.safe_load(open(os.path.join(cd, "critique_presentation.yaml"))) == before,
            "CS7 a session that did not write its file gets no stamp: the file it found is unchanged")
+        # CS8-CS10 (Codex r2 of #355). CS8: a wrong-prefix id the critic also carries forward, whose stamped form an
+        # earlier round registered, is a reference to that finding: it is not given a new id (the old finding would be
+        # reported dropped); it is left for the gate's repair. CS9: an id too long to be one is left as written.
+        cs8 = {}
+        for name, doc, reg in (
+                ("carried", {"reviewer": "presentation", "round": 2, "verdict": "PASS",
+                             "structural_mismatch": {"detected": False},
+                             "carried_forward": [{"id": "R-001", "prior_round": 1, "still_present": False, "notes": "n"}],
+                             "blockers": [blk("R-001", resolved=True)]}, True),
+                ("long", {"reviewer": "presentation", "blockers": [blk("R-" + "9" * 5000)]}, False)):
+            cd = os.path.join(d, "cs8_" + name)
+            os.makedirs(cd)
+            if reg:
+                json.dump({"tests": {"P-001": {"done_when": [{"judgement": "j"}]}}},
+                          open(os.path.join(cd, "done_when_registry.json"), "w"))
+            SdkTasks._session = critic_writes(doc)
+            try:
+                SdkTasks(cd).critique(cd, "critique-presentation", 2)
+                raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
+                cs8[name] = ([b["id"][:4] for b in raw["blockers"]],
+                             [c["id"] for c in raw.get("carried_forward") or []])
+            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                cs8[name] = repr(e)[:120]
+            finally:
+                SdkTasks._session = orig_session
+        ok(cs8 == {"carried": (["R-00"], ["R-001"]), "long": (["R-99"], [])},
+           f"CS8/CS9 a carried reference to a registered id, and an id too long to be one, are left for the gate ({cs8})")
+        # CS10: the snapshot before the session never blocks on what sits at the file's name (a FIFO).
+        import threading
+        cd = os.path.join(d, "cs_fifo")
+        os.makedirs(cd)
+        os.mkfifo(os.path.join(cd, "critique_presentation.yaml"))
+        SdkTasks._session = no_write
+        th = threading.Thread(target=lambda: SdkTasks(cd).critique(cd, "critique-presentation", 1), daemon=True)
+        try:
+            th.start()
+            th.join(10)
+        finally:
+            SdkTasks._session = orig_session
+        ok(not th.is_alive(), "CS10 a FIFO at the critique file's name does not block the snapshot")
+        if th.is_alive():                                 # release the blocked open so the test can end
+            try:
+                os.close(os.open(os.path.join(cd, "critique_presentation.yaml"), os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")
