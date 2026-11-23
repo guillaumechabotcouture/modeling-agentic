@@ -1700,7 +1700,9 @@ class Machine:
                 errs = [f"draft_spec failed: {res.note} (its draft was checked)"] + errs
         if errs:
             self.st.tries["spec_feedback"] = _carry_feedback(errs, fb if not drafted else None)
-            if drafted:     # these checks' own output: a capped next try may be re-checked against it
+            if drafted or recheckable:
+                # these checks' own output (or, with no draft on disk, what they wrote before plus that note): a capped
+                # next try may be re-checked against it (Codex r4 P1-3: a first try with no draft blocked every later one)
                 self.st.tries["spec_feedback_checked"] = list(self.st.tries["spec_feedback"])
             else:
                 self.st.tries.pop("spec_feedback_checked", None)
@@ -1716,8 +1718,13 @@ class Machine:
     def _spec_checks(self, rd: str) -> list[str]:
         """Every pre-sign check class on the draft, each run whatever the others found, so one try hears every problem
         (baseline hb1: the chain stopped at the first class that failed, and MAX_SPEC_TRIES is small). A class that
-        raises is named in the problems and the others still run. A spec that does not parse is the one problem."""
+        raises is named in the problems and the others still run. A spec or settings file that is a link (symbolic or
+        hard) or not a regular file, or a spec that does not parse, is the problem and nothing else runs (Codex r4
+        P1-5: the checks read these files by path)."""
         import yaml
+        bad = _draft_file_problems(rd)
+        if bad:
+            return bad
         try:
             yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
         except Exception as e:  # noqa: BLE001
@@ -1764,15 +1771,28 @@ class Machine:
 
     @staticmethod
     def _cites_outside(rd: str) -> list[str]:
-        """The spec's citations that resolve outside the run directory (record_cited_inputs refuses them), as problems.
-        Fail closed: when the citations cannot be listed, that is the problem."""
+        """The spec's citations no later check may open, as problems: one that resolves outside the run directory
+        (record_cited_inputs refuses it), or one that exists but is neither a regular file nor a directory (a FIFO or a
+        device blocks the reader: Codex r4 P1-4). Fail closed: when the citations cannot be listed, that is the
+        problem."""
+        import stat
         import yaml
         import pipeline as P
         try:
             spec = yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE))) or {}
-            root = os.path.realpath(rd)
-            return [f"the spec cites {r}, outside the run directory: copy it into data/" for r in P.cited_paths(spec, rd)
-                    if not os.path.realpath(os.path.join(rd, r)).startswith(root + os.sep)]
+            root, out = os.path.realpath(rd), []
+            for r in P.cited_paths(spec, rd):
+                p = os.path.realpath(os.path.join(rd, r))
+                if not p.startswith(root + os.sep):
+                    out.append(f"the spec cites {r}, outside the run directory: copy it into data/")
+                    continue
+                try:
+                    mode = os.stat(p).st_mode
+                except FileNotFoundError:
+                    continue                    # record_cited_inputs says it does not exist; nothing can open it
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    out.append(f"the spec cites {r}, which is not a regular file: write the table as a plain file")
+            return out
         except Exception as e:  # noqa: BLE001
             return [f"the spec's cited paths could not be listed, so no check reads them: {type(e).__name__}: {e}"]
 
@@ -2784,6 +2804,28 @@ def _pre_engine_check(spec: dict) -> list[str]:
 
 ACCEPTED_STATUSES = ("completed", "completed_with_report_restored")
 STATUS_MARK = "<!-- harness: run status -->"
+
+
+def _draft_file_problems(run_dir: str) -> list[str]:
+    """The spec (required) and analysis_settings.yaml (optional) must each be a regular file with one link: the pre-sign
+    checks read them by path, so a symbolic or hard link would show them another file's content (Codex r4 P1-5)."""
+    import stat
+    out = []
+    for rel, required in ((AB.SPEC_FILE, True), (AB.SETTINGS_FILE, False)):
+        try:
+            st = os.lstat(os.path.join(run_dir, rel))
+        except FileNotFoundError:
+            if required:
+                out.append(f"spec unreadable: {rel} does not exist")
+            continue
+        except OSError as e:
+            out.append(f"{rel} cannot be read: {type(e).__name__}")
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            out.append(f"{rel} is a link or not a regular file: write it as a plain file")
+        elif st.st_nlink > 1:
+            out.append(f"{rel} has {st.st_nlink} hard links: write it as its own file")
+    return out
 
 
 CARRIED = "from an earlier try, still unresolved: "

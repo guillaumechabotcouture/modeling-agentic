@@ -476,7 +476,10 @@ class SdkTasks:
         self.cap = task_cap_usd
         self.allowance = task_cap_usd
         self.readback = 0.0          # no read-back unless the machine grants a budget for it
-        self.turns = 30 if max_turns is None else int(max_turns)
+        if max_turns is not None and (not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1):
+            # Codex r4 P1-8: the SDK passes --max-turns only for a truthy value, so 0 would mean no limit at all
+            raise ValueError(f"max_turns must be a positive integer, got {max_turns!r}")
+        self.turns = 30 if max_turns is None else max_turns
         self.turns_explicit = max_turns is not None      # a caller's cap holds for every task (Codex r1 P1-5)
         self.query_fn = query_fn
         self.n = 0
