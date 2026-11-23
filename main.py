@@ -6,6 +6,7 @@ passed (`--max-sessions`, `--signoff-hours`, ...) are still accepted so no launc
 
 import asyncio
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -1136,9 +1137,15 @@ def run_v2_and_store(run, run_path: str, store=None):
     Finalization never raises: a failure there is logged, so the run's own exception and its exit
     code survive (ST3-ST5)."""
     store = store or store_run_results
+    refused = False
     try:
         return run()
     except BaseException as e:
+        # Codex r3 on #342 (P1-7): another process holds a lead run's amendment lock: not a crash of this run, and the
+        # run it is running is not uploaded half-way from here
+        refused = type(e).__name__ == "AmendmentLocked"
+        if refused:
+            raise
         try:
             mp = os.path.join(run_path, "metadata.json")
             meta = _metadata_dict(mp)
@@ -1150,7 +1157,10 @@ def run_v2_and_store(run, run_path: str, store=None):
         raise
     finally:
         try:
-            print(f"v2 run stored: {store(run_path)}", flush=True)
+            if refused:
+                print("v2 run not stored: another process holds its amendment lock", file=sys.stderr, flush=True)
+            else:
+                print(f"v2 run stored: {store(run_path)}", flush=True)
         except Exception as fe:  # noqa: BLE001 -- never replace the run's exception or status
             print(f"[ERROR] RUN RESULTS NOT STORED: {type(fe).__name__}: {fe}", file=sys.stderr, flush=True)
 
@@ -1179,6 +1189,24 @@ def main_v2(args, ident: dict | None = None) -> int:
             return 1
         question = args.question
         run_path = os.path.join(REPO_ROOT, "runs", create_run_dir(question))
+    lock = contextlib.nullcontext()
+    if args.resume and "lead" in (args.signoff, st.signoff):
+        # Codex r3 on #342 (P1-7): a lead run's amendment lock is taken before anything is written (run_v2 holds it
+        # again, nested): a resume another process holds stops here with nothing stamped, recorded or stored
+        lock = stage_machine._amend_lock(run_path)
+        try:
+            lock.__enter__()
+        except stage_machine.AmendmentLocked as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+    try:
+        return _main_v2_run(args, ident, run_path, question)
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def _main_v2_run(args, ident: dict, run_path: str, question: str) -> int:
+    from agents import stage_machine, v2_sdk_tasks
     pipeline_id.stamp(run_path, ident)
     print(f"Run (v2): {run_path}", flush=True)
     tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud)

@@ -385,6 +385,17 @@ def dry_sign(child: str, by: str, expect: dict) -> dict:
             return {"ok": False, "by": by, "error": str(e)[:3000]}
 
 
+def _guards(rd: str, raw: dict) -> list:
+    """What must hold before anything reads the patched spec's files or builds its engine (Codex r3 on #342): every
+    cited path inside the run (h_SPEC's record_cited_inputs) and the named engine's signed configuration within its
+    limits (analysis_backend.signed_config_problems)."""
+    if os.path.join(ROOT, "agents") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "agents"))
+    import analysis_backend as AB
+    import stage_machine as SM
+    return list(SM.record_cited_inputs(rd)) + list(AB.signed_config_problems(raw))
+
+
 def _pre_sign(rd: str, derived) -> tuple:
     """(problems, candidate rows): the backend's pre-sign checks and the geometry check, as h_SPEC runs them."""
     if os.path.join(ROOT, "agents") not in sys.path:
@@ -487,8 +498,9 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
             mode0 = os.stat(os.path.join(stage, rel)).st_mode & 0o777
             write_nofollow(stage, rel, data, atomic=True)
             os.chmod(os.path.join(stage, rel), mode0)
-        sp = schema.load(os.path.join(stage, SPEC), data=new_spec)
-        errs = list(schema.validate(sp, pending_ok=True))
+        errs = _guards(stage, spec1)       # before the schema reads a cited file or builds the engine (Codex r3)
+        if not errs:
+            errs = list(schema.validate(schema.load(os.path.join(stage, SPEC), data=new_spec), pending_ok=True))
         if not errs:               # what h_SPEC checks before SIGN (backend pre-sign checks, geometry)
             errs, cands = _pre_sign(stage, st.get("derived_inputs"))
         if errs:

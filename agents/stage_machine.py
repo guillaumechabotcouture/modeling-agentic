@@ -186,10 +186,15 @@ def _put(run_dir: str, rel: str, text: str) -> None:
     write_nofollow(run_dir, rel.replace(os.sep, "/"), text.encode("utf-8"), atomic=True)
 
 
+def _state_bytes(st: RunState) -> bytes:
+    """run_state.json's bytes for `st` (a lead hand-off binds its child to them before they are saved: Codex r3)."""
+    return json.dumps(st.to_dict(), indent=1, default=str).encode()
+
+
 def save_state(run_dir: str, st: RunState) -> None:
     """run_state.json, published atomically with no link followed (lib.safe_io; review round 4, P1-2)."""
     from lib.safe_io import write_nofollow
-    write_nofollow(run_dir, STATE_FILE, json.dumps(st.to_dict(), indent=1, default=str).encode(), atomic=True)
+    write_nofollow(run_dir, STATE_FILE, _state_bytes(st), atomic=True)
 
 
 # ------------------------------------------------------------------ gate routing (pure)
@@ -1295,13 +1300,22 @@ class Machine:
         self.log = log
         self.cross = cross_engine_check
         st = load_state(self.run_dir)
+        if (st or state) is not None and (st or state).signoff == "lead":
+            # a lead run's state is read again and written back under its amendment lock, so a state read before
+            # another process's hand-off is never written over it (Codex r3 on #342, P1-9)
+            with _amend_lock(self.run_dir):
+                self._load(load_state(self.run_dir), state)
+        else:
+            self._load(st, state)
+        self.seed_fn = getattr(tasks, "world_model_seed", None)    # §14: the world model's seed task, when the tasks have one
+        self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
+
+    def _load(self, st: RunState | None, state: RunState | None) -> None:
         self.st = st or state
         if self.st is None:
             raise ValueError("no run_state.json and no initial state")
         self._settle_interrupted()
         save_state(self.run_dir, self.st)
-        self.seed_fn = getattr(tasks, "world_model_seed", None)    # §14: the world model's seed task, when the tasks have one
-        self.wm_repo = REPO                                         # where the beliefs are anchored (wm-trials)
 
     def persist(self) -> None:
         # Named persist, not save, only because scripts/write_audit.py WA3 reads any `<obj>.save()` call as PIL's
@@ -1326,7 +1340,8 @@ class Machine:
         return float(a if a is not None else self.st.task_cap_usd) + float(rb if isinstance(rb, (int, float)) else 0.0)
 
     # -------------------------------------------------- plumbing
-    def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None) -> str:
+    def _go(self, to: str, why: str = "", status: str | None = None, extra: dict | None = None,
+            before_save=None) -> str:
         frm = self.st.state
         if to not in EDGES[frm]:
             raise RuntimeError(f"transition {frm} -> {to} is not in the state table")
@@ -1337,6 +1352,8 @@ class Machine:
             self.st.status = self.st.forced_status or status or "completed_gate_error"
             self._withhold_if_acceptance_language()
             self._finish()
+        if before_save is not None:
+            before_save()
         save_state(self.run_dir, self.st)
         self.log(f"[machine] {frm} -> {to}" + (f" ({why})" if why else ""))
         return to
@@ -1816,8 +1833,10 @@ class Machine:
         from toolkit.spec import amend as AM, signoff as SO
         la, why, rec = req.get("lead_amendment") or {}, None, None
         child = la.get("child")
-        if la.get("status") in ("started", "signed_provisionally"):     # resolved beside this run (a moved copy: r2)
-            child = _child_of(self.run_dir, child) or child
+        if la.get("status") in ("started", "signed_provisionally"):
+            # resolved beside this run only (a moved copy: r2); never the recorded path, which may be the original tree
+            # of a restored copy (Codex r3 on #342, P1-5)
+            child = _child_of(self.run_dir, child)
         if la.get("status") == "refused":
             return None                   # the first refusal stands, with its reason and any kept child
         if any(os.path.lexists(os.path.join(self.run_dir, f)) for f in LEGACY_BRIEF_SIGNOFF):
@@ -1825,8 +1844,11 @@ class Machine:
             # never satisfies the lead's check, also when recovering an interrupted hand-off (Codex r3); the owner decides
             why = "the parent carries a legacy decision brief signature, which a lead amendment never relies on in v2"
         elif la.get("status") in ("started", "signed_provisionally"):
-            # an interrupted handoff: finished when the child is signed by the lead, else refused (the owner decides)
-            if not (child and os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
+            # an interrupted handoff: finished when the parent's signature still holds (Codex r3 on #342, P1-6) and the
+            # child is signed by the lead, else refused (the owner decides)
+            if self._signed_by() is None:
+                why = "the parent's sign-off no longer holds (a signed input changed since): the owner decides"
+            elif not (child and os.path.isfile(os.path.join(child, STATE_FILE)) and SO.status(child) == "signed"
                     and (SO._spec_record(child) or {}).get("signed_by") == "lead"):
                 why = "an interrupted amendment left no lead-signed child"
             else:
@@ -1878,10 +1900,11 @@ class Machine:
             self.log(f"[machine] the lead does not amend the signed spec ({why[:300]}): the run waits for the owner")
             return None
         self.st.paused = None
-        to = self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
-                      AMENDED_PROVISIONAL, extra={"amended_to": child})
-        self._relink(child)
-        return to
+        # the child is bound to the parent's final state before that state is saved, so no interruption leaves a FINAL
+        # parent whose child binds its paused state (Codex r3 on #342, P1-4); until that save the parent is at SPEC and
+        # a resume finishes the hand-off again
+        return self._go("FINAL", f"provisional amendment {rec.get('id')} by the lead: the run continues in {child}",
+                        AMENDED_PROVISIONAL, extra={"amended_to": child}, before_save=lambda: self._relink(child))
 
     def _mark_child(self, child: str, rid) -> None:
         """The child's state, once: not paused, what is left of the cap (always > 0 here), the handoff event."""
@@ -1903,9 +1926,9 @@ class Machine:
 
     def _relink(self, child: str) -> None:
         """The child's parent_run binds the parent's final run_state.json (amend recorded it while paused), so the
-        chain still links (scripts/harness_metrics.py chains)."""
+        chain still links (scripts/harness_metrics.py chains): the bytes about to be saved, from the state in memory."""
         try:
-            sha = hashlib.sha256(open(os.path.join(self.run_dir, STATE_FILE), "rb").read()).hexdigest()
+            sha = hashlib.sha256(_state_bytes(self.st)).hexdigest()
             for rel in ("metadata.json", AMENDMENT_RECORD):
                 doc = json.load(open(os.path.join(child, rel)))
                 if isinstance(doc.get("parent_run"), dict):
@@ -2897,7 +2920,7 @@ def amendment_lines(run_dir: str) -> list[str]:
         ch = "; ".join(f"{c.get('op')} `{c.get('path')}`" + ("" if c.get("op") == "remove" else
                                                              f" to {json.dumps(c.get('after'), default=str)[:160]}")
                        for c in rec.get("changes") or [] if isinstance(c, dict))
-        parent = (rec.get("parent_run") or {}).get("run_dir")
+        parent = _parent_of(run_dir, (rec.get("parent_run") or {}).get("run_dir"))
     except (OSError, ValueError, AttributeError, TypeError) as e:
         return [f"**Provisional amendment of the signed spec ({(s7 or {}).get('provisional_amendment') or 'unnamed'}): "
                 f"its record could not be read ({type(e).__name__}); the owner has not reviewed it.**\n\n"]
@@ -3116,20 +3139,26 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
     (Machine.reopen_interrupted_analysis). A --signoff lead run holds its amendment lock from before its state is read
-    to its hand-off (owner decision on #330, Codex r3): a second process resuming it fails with AmendmentLocked before
-    writing anything, also to the child it was handed to."""
+    through its hand-off and the run of the child it handed to (owner decision on #330, Codex r3 on #330 and #342): a
+    second process resuming it fails with AmendmentLocked before writing anything, also to that child."""
     try:
         prev = load_state(run_dir)
     except (OSError, ValueError):
         prev = None
     if signoff != "lead" and (prev is None or prev.signoff != "lead"):
-        child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
-                                     derive_unsandboxed, backend, cross_engine_check, _stamp)
-    else:
-        os.makedirs(run_dir, exist_ok=True)
-        with _amend_lock(run_dir):
-            child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
-                                         derive_unsandboxed, backend, cross_engine_check, _stamp)
+        return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
+                             backend, cross_engine_check, _depth, _stamp)
+    os.makedirs(run_dir, exist_ok=True)
+    with _amend_lock(run_dir):     # held through the hand-off and the child's run (Codex r3 on #342, P1-8)
+        return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
+                             backend, cross_engine_check, _depth, _stamp)
+
+
+def _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
+                  cross_engine_check, _depth, _stamp) -> str:
+    """One run dir, then the child its provisional amendment handed it to (run_v2, under the caller's lock)."""
+    child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
+                                 derive_unsandboxed, backend, cross_engine_check, _stamp)
     if child is None or _depth >= 8:          # a bounded chain (a restored cycle cannot recurse: Codex r2)
         return status
     # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher);
@@ -3181,12 +3210,23 @@ def _child_of(run_dir: str, recorded, strict: bool = False) -> str | None:
     except (OSError, ValueError, AttributeError):
         return None
     ok_ = os.path.basename(str(pr.get("run_dir") or "").rstrip(os.sep)) == os.path.basename(os.path.abspath(run_dir))
-    if ok_ and strict and pr.get("run_state_sha256"):   # a finished parent: the child binds its final state (r2)
+    if ok_ and strict:      # a finished parent: the child binds its final state (r2); a missing digest binds none (r3)
         try:
-            ok_ = hashlib.sha256(open(os.path.join(run_dir, STATE_FILE), "rb").read()).hexdigest() == pr["run_state_sha256"]
+            ok_ = isinstance(pr.get("run_state_sha256"), str) and hashlib.sha256(
+                open(os.path.join(run_dir, STATE_FILE), "rb").read()).hexdigest() == pr["run_state_sha256"]
         except OSError:
             ok_ = False
     return here if ok_ and os.path.realpath(here) != os.path.realpath(run_dir) else None
+
+
+def _parent_of(run_dir: str, recorded):
+    """The parent a child run continues: its sibling of the recorded name when that sibling hands off to this child (a
+    parent and child moved together: Codex r3 on #342, P2-12), else the recorded path."""
+    if not isinstance(recorded, str) or not recorded:
+        return recorded
+    here = os.path.join(os.path.dirname(os.path.abspath(run_dir)), os.path.basename(recorded.rstrip(os.sep)))
+    c = handoff_child(here)
+    return here if c and os.path.realpath(c) == os.path.realpath(run_dir) else recorded
 
 
 def handoff_child(run_dir: str) -> str | None:
@@ -3204,7 +3244,8 @@ def handoff_child(run_dir: str) -> str | None:
 
 def handoff_chain(run_dir: str, limit: int = 8, kept: bool = False) -> list[str]:
     """Every child run this run continued in, in order; with `kept`, also a child an amendment refused at signing
-    left for the owner (main.py stores each with the run: Codex r1)."""
+    left for the owner (main.py stores each with the run: Codex r1): only after a recorded refusal, and only a child
+    made from this run's signed spec (Codex r3 on #342, P1-11)."""
     out, cur = [], run_dir
     while len(out) < limit:
         nxt = handoff_child(cur)
@@ -3213,7 +3254,16 @@ def handoff_chain(run_dir: str, limit: int = 8, kept: bool = False) -> list[str]
                 la = json.load(open(os.path.join(cur, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
             except (OSError, ValueError, AttributeError):
                 la = {}
-            nxt = _child_of(cur, la.get("child"))
+            nxt = _child_of(cur, la.get("child")) if la.get("status") == "refused" else None
+            try:
+                from toolkit.spec import signoff as SO
+                made_from = (json.load(open(os.path.join(nxt, "metadata.json"))) or {}).get("parent_spec_sha256") \
+                    if nxt else None
+                ours = {SO.signed_sha(cur),       # the spec it signed, or the spec it holds (a legacy brief record)
+                        hashlib.sha256(open(os.path.join(cur, AB.SPEC_FILE), "rb").read()).hexdigest()}
+                nxt = nxt if isinstance(made_from, str) and made_from in ours else None
+            except Exception:  # noqa: BLE001 -- an unverifiable kept child is not stored with this run
+                nxt = None
             if nxt is not None and nxt not in out:
                 out.append(nxt)
             break
