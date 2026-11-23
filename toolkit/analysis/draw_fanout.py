@@ -465,8 +465,8 @@ def _self_test_cases(ok, fails, RUN, signoff, q, tempfile, yaml) -> int:
         from toolkit.analysis import figure_data as FD
         msgs = []
         A.fit_calibration()
-        rows = list(__import__("toolkit.analysis.uncertainty", fromlist=["x"])._draw_rows(
-            A, _drawer(A, 2), 2, label="t", log=msgs.append))
+        from toolkit.analysis import uncertainty as UQ
+        rows = list(UQ._draw_rows(A, _drawer(A, 2), 2, label="t", log=msgs.append))
         ok(len(rows) == 2 and any(m.startswith("t: 2/2") for m in msgs),
            f"DF13 per-draw progress goes to the logger the caller passes ({msgs})")
         del FD
