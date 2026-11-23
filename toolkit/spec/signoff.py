@@ -126,7 +126,11 @@ def status(run_dir: str) -> str:
             return "changed"
         st = preconditions_state(run_dir, rec)[0]
         return "signed" if st == "ok" else st
-    return "invalid" if schema.validate(schema.load(path), pending_ok=True) else "awaiting"
+    try:
+        sp = schema.load(path)
+    except schema.SpecError:        # a spec that does not load (e.g. an unregistered engine candidate) is invalid
+        return "invalid"
+    return "invalid" if schema.validate(sp, pending_ok=True) else "awaiting"
 
 
 def derived_changed(run_dir: str, rec: dict) -> list[str]:

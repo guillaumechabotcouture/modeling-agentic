@@ -434,6 +434,8 @@ def _self_test() -> int:
         pp = toy_priors_file(d)
         s0 = schema.load(schema.toy_spec(d))
         r = copy.deepcopy(s0.raw)
+        from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+        _G.register_test_engine("toolkit.spec.priors:ToyPriorEngine")
         r["engine"] = {"ref": "toolkit.spec.priors:ToyPriorEngine", "config": {"priors_path": pp}}
         s = schema.Spec(r, d)
         ok(schema.validate(s) == [], f"PR1 a spec on an engine with card priors validates unchanged: {schema.validate(s)}")

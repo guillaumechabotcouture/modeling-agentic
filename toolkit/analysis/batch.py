@@ -895,6 +895,8 @@ def _self_test() -> int:
         def b10():
             from toolkit.engines.benchmark import SharedStateToy
             ref = "toolkit.engines.benchmark:SharedStateToy"
+            from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+            _G.register_test_engine("toolkit.engines.benchmark:SharedStateToy")
             sj = [dict(j, engine=ref) for j in jobs0 if j["point"] in (0, 1)]
             groups = g["point_groups"](sj)
             SharedStateToy.calls.clear()
