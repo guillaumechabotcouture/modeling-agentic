@@ -6420,6 +6420,29 @@ def _self_test_hb2_validate(ok, td: str, new_run) -> None:
     got7 = m7._spec_checks(d7)
     ok(got7 and not any("unclosed" in x or "while parsing" in x or "flow sequence" in x for x in got7),
        f"VS7 a spec that is a link is refused before it is read ({got7})")
+    # VS14 (Codex r2 P1-4): a spec with a second hard link is refused before it is parsed
+    d14, T14, st14 = new_run("vs14", {})
+    m14 = Machine(d14, T14, st14, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    os.link(os.path.join(td, "vs7_target.yaml"), os.path.join(d14, AB.SPEC_FILE))
+    got14 = m14._spec_checks(d14)
+    ok(got14 and not any("unclosed" in x or "while parsing" in x or "flow sequence" in x for x in got14),
+       f"VS14 a hard-linked spec is refused before it is read ({got14})")
+    # VS15 (Codex r2 P2-5): a failed write of the conflicts default is a problem, and the other checks still run
+    d15, T15, st15 = new_run("vs15", {})
+    m15 = Machine(d15, T15, st15, backend=spike, log=lambda *a: None, cross_engine_check=False)
+    StubTasks(dict(T15.s, spec={k: v for k, v in T15.s["spec"].items() if k != "objective"})).draft_spec("q", d15, None)
+    from toolkit.analysis import conflicts as _CF
+    real_ed = _CF.ensure_default
+
+    def no_write(*a, **k):
+        raise PermissionError("cannot publish")
+    try:
+        _CF.ensure_default = no_write
+        got15 = m15._spec_checks(d15)
+    finally:
+        _CF.ensure_default = real_ed
+    ok(any("cannot publish" in x for x in got15) and any("missing section objective" in x for x in got15),
+       f"VS15 a failed conflicts-default write does not hide the other problems ({got15})")
     # VS8 (Codex r1 P1-2): the check applies the owner default (conflicts) the try-end path applies, so a pass in the
     # try is a pass at its end
     d8, T8, st8 = new_run("vs8", {})

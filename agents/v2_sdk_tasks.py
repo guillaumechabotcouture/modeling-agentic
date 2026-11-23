@@ -840,6 +840,59 @@ def _self_test_validate_spec(ok) -> None:
         await asyncio.sleep(0.3)
     asyncio.run(race())
     ok(len(ran) == 1, f"VS11 a cancelled queued validate_spec call never starts its check ({len(ran)} ran)")
+    # VS12 (Codex r2 P1-1): cancelling the active call keeps the lock until its worker ends
+    gate12, active, overlap = threading.Event(), [], []
+
+    def slow12():
+        if active:
+            overlap.append(1)
+        active.append(1)
+        gate12.wait(5)
+        active.pop()
+        return []
+    t12 = validate_spec_tool(slow12)
+
+    async def race12():
+        a = asyncio.create_task(t12.handler({}))
+        await asyncio.sleep(0.2)
+        a.cancel()
+        b = asyncio.create_task(t12.handler({}))
+        await asyncio.sleep(0.3)
+        gate12.set()
+        for x in (a, b):
+            try:
+                await x
+            except asyncio.CancelledError:
+                pass
+    asyncio.run(race12())
+    ok(not overlap, f"VS12 a cancelled active check still holds the lock until its worker ends ({len(overlap)} overlap)")
+    # VS13 (Codex r2 P1-2/P1-3): while a check runs, the draft session cannot edit its files (a parallel Write or
+    # Edit is refused), so the check reads, and the default it applies is written to, a draft nobody is changing
+    with tempfile.TemporaryDirectory() as d13:
+        busy_seen, verdicts = [], {}
+        t13 = SdkTasks(d13)
+
+        def check13():
+            busy_seen.append(t13.busy["n"])
+            return []
+
+        async def probe13(prompt=None, options=None):
+            pre = options.hooks["PreToolUse"][0].hooks[0]
+            w = {"tool_name": "Write", "tool_input": {"file_path": os.path.join(d13, "decision_spec.yaml")}}
+            t13.busy["n"] += 1
+            verdicts["during"] = ((await pre(w, "w1", None)).get("hookSpecificOutput") or {}).get(
+                "permissionDecision") == "deny"
+            t13.busy["n"] -= 1
+            verdicts["after"] = ((await pre(w, "w2", None)).get("hookSpecificOutput") or {}).get(
+                "permissionDecision") == "deny"
+            yield NS(total_cost_usd=0.01, session_id="vs13", is_error=False)
+        t13.query_fn = probe13
+        t13.set_allowance(1.0)
+        t13.set_spec_check(check13)
+        t13._session("draft_spec", "x", "y", OWNS["draft_spec"])
+        asyncio.run(validate_spec_tool(check13, busy=t13.busy).handler({}))
+        ok(verdicts == {"during": True, "after": False} and busy_seen == [1],
+           f"VS13 a Write during a check is refused, and allowed after it ({verdicts}, {busy_seen})")
     ok("validate_spec" in PROMPTS["draft_spec"],
        "VS5 the draft_spec prompt tells the drafter to check its draft with validate_spec before it finishes")
 
