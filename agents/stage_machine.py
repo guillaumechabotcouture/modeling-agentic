@@ -174,6 +174,17 @@ def _withhold_report(run_dir: str) -> None:
         _quarantine_report(run_dir)
 
 
+def _retire_stale_withheld(run_dir: str) -> None:
+    """Baseline hb2 (§5 fix 8): a language repair quarantines the rejected draft in report_withheld.md; once the run
+    ends with a regular report.md (every withhold path moves report.md away, so it is the delivered one), the
+    leftover is removed (no link followed), so no reader takes the run's report as withheld. The repair stays in the
+    history and in the gate records (report_acceptance_language)."""
+    p = os.path.join(run_dir, "report.md")
+    if os.path.isfile(p) and not os.path.islink(p) and os.path.lexists(os.path.join(run_dir, "report_withheld.md")):
+        from lib.safe_io import remove_nofollow
+        remove_nofollow(run_dir, "report_withheld.md")
+
+
 def _quarantine_report(run_dir: str) -> None:
     """F6 S1-7: move report.md to report_withheld.md through lib.safe_io (no link followed at either name;
     a linked report.md is refused, a link at the destination is replaced)."""
@@ -869,7 +880,7 @@ def record_cited_inputs(run_dir: str) -> list[str]:
         elif os.path.isdir(p):
             prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/") + "/"] = {"dir": True}
         elif not os.path.isfile(p):
-            probs.append(f"the spec cites {rel}, which does not exist")
+            probs.append(f"the spec cites {rel}, which does not exist" + P.staged_copy_hint(rel, run_dir))
         else:
             prov.setdefault("cited", {})[os.path.relpath(p, root).replace(os.sep, "/")] = {"sha256": _sha256(p)}
     os.makedirs(os.path.join(run_dir, "data"), exist_ok=True)
@@ -1386,6 +1397,7 @@ class Machine:
         if to == "FINAL":
             self.st.status = self.st.forced_status or status or "completed_gate_error"
             self._withhold_if_acceptance_language()
+            _retire_stale_withheld(self.run_dir)
             self._finish()
         if before_save is not None:
             before_save()
@@ -1756,7 +1768,9 @@ class Machine:
                 self.st.tries["spec_feedback_checked"] = list(self.st.tries["spec_feedback"])
             else:
                 self.st.tries.pop("spec_feedback_checked", None)
-            return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}")
+            # baseline hb2 §4.6: the whole feedback of each failed try is kept in its history entry
+            return self._go("SPEC", f"spec invalid: {'; '.join(errs)[:200]}",
+                            extra={"feedback": list(self.st.tries["spec_feedback"])})
         self.st.tries.pop("spec_feedback", None)
         self.st.tries.pop("spec_feedback_checked", None)
         if not self._review_conditions(self.st.signoff, defer=False):
@@ -5417,6 +5431,17 @@ def _self_test() -> int:
             if want:
                 ok(any("data/missing.csv" in x for x in rc) and any("data/missing.csv" in x for x in dr),
                    f"T50d the joint target's own csv is still a cited file, and a missing one is refused ({rc}; {dr})")
+        # T50f (baseline hb2 §4.6): the spec cited a question file by its repository path; its staged copy
+        # existed. Both refusals name the staged path, so the next try cites it.
+        for cited in ("requirements.txt", "./requirements.txt"):
+            spec = {"decision_units": {"csv": "data/inputs/requirements.txt"},
+                    "calibration": {"targets": [{"id": "t", "csv": cited}]}}
+            yaml.safe_dump(spec, open(os.path.join(fk, AB.SPEC_FILE), "w"))
+            rc = [x for x in record_cited_inputs(fk) if "does not exist" in x]
+            dr = [p["claim"] for p in P_.derivation_problems(fk, spec, required=True) if p["code"] == "data_ref_not_derived"]
+            ok(rc and all("data/inputs/requirements.txt" in x for x in rc)
+               and dr and all("data/inputs/requirements.txt" in x for x in dr),
+               f"T50f a cited path whose staged copy exists: the refusals name the staged path ({rc}; {dr})")
         for kind, key in (("group", {"csv": {"file": "data/missing.csv"}, "units": "state"}),
                           ("unit", {"csv": "data/missing.csv"})):    # Codex: only a group target's column name
             spec = {"decision_units": {"csv": "data/inputs/requirements.txt"}, "calibration": {"joint": {"targets": [
@@ -5683,6 +5708,10 @@ def _self_test() -> int:
                 ok(s == want and any(c.endswith(":repair") for c in T.calls) and os.path.exists(rp)
                    and "validated" not in open(rp).read() and al.get("repairs") == 1 and not al.get("remaining"),
                    f"T84 a declared report with acceptance language goes back to the writer and is delivered repaired ({s}, {al})")
+                # T84b (baseline hb2 §5 fix 8): the rejected draft's report_withheld.md stayed beside the delivered
+                # report.md, and harness_metrics counted the run as not done. Delivery retires it.
+                ok(not os.path.lexists(os.path.join(d, "report_withheld.md")),
+                   "T84b once the repaired report.md is delivered, the stale report_withheld.md is retired")
             else:
                 ok(s == want and not os.path.exists(rp) and os.path.exists(os.path.join(d, "report_withheld.md"))
                    and al.get("remaining"),
@@ -6677,6 +6706,12 @@ def _self_test_geometry(ok, td: str) -> None:
     ok(status == "run_failed" and any(x.startswith("reciprocal_swap") and "reciprocal_swap:0+1" in x for x in fb)
        and "SIGN" not in [h.get("to") for h in load_state(d1).history],
        f"IG-M1 a units table whose rows carry each other's points is refused before SIGN ({status}; {fb[:1]})")
+    # SH1 (baseline hb2 §4.6): each failed try's feedback is kept whole in its history entry (the `why` line is cut
+    # short, and spec_feedback is cleared once a try passes), so a later reader can tell what each try was told.
+    sh = [h for h in load_state(d1).history if h.get("from") == "SPEC" and h.get("to") == "SPEC"]
+    ok(sh and all(isinstance(h.get("feedback"), list) and h["feedback"] for h in sh)
+       and sh[-1]["feedback"] == fb and any(len("; ".join(h["feedback"])) > len(h["why"]) for h in sh),
+       f"SH1 every SPEC retry records its try's whole feedback in history ({[len(h.get('feedback') or []) for h in sh]})")
     hf = {f["kind"]: f for f in m1.harness_findings()}
     ok(hf.get("reciprocal_swap", {}).get("severity") == "HIGH" and hf["reciprocal_swap"]["scope_declarable"] is False,
        f"IG-M3 the gate carries the open swap as a HIGH finding that cannot be declared ({sorted(hf)})")

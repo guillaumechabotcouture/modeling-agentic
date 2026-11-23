@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -79,9 +80,10 @@ parameter, never on a unit attribute bound to data. Note what each derivation do
 data/README.md. Every file the spec cites is a staged input or a derived output; paths are relative
 to the run directory. When the options use a component whose effect depends on decision inputs
 (each engine's decision_inputs.yaml), name the evidence dossier: `evidence: {{dossier:
-evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Two
+evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Three
 rules the check refuses often: a decision test's `text` has no digits (it says in words what the
-test asks; the values tested are rendered from computed claims); and `engine_parameters` gives no
+test asks; the values tested are rendered from computed claims); nor have the yes, no and
+undetermined texts of deliverable.decision.statements (the harness renders the values); and `engine_parameters` gives no
 value for a parameter the engine card lists as calibrated or fitted (calibrate a calibrated one
 under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
 it out). Output:
@@ -122,8 +124,8 @@ say whether the engine, an input or the belief is wrong. The presentation review
 its LOW report_number_typed rows (advisory) name numbers the writer typed instead of [CLAIM:id];
 raise one only if it misleads the reader. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
-{file} in the critique-blockers schema: reviewer, round, verdict (PASS | REVISE),
-structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN;
+{file} in the critique-blockers schema: reviewer: {reviewer} (this literal value), round: {round}, verdict (PASS | REVISE),
+structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN, this prefix;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
 first_seen_round, claim, evidence, fix_requires (when the fix needs the signed decision_spec.yaml changed, start it
 with "Owner amendment:": the owner decides it, no task can), resolved (true/false), and done_when (required for
@@ -458,6 +460,69 @@ def _sio():
     return safe_io
 
 
+def _staged_list(run_dir: str) -> str:
+    """Baseline hb2 (§4.6): the drafter cited a question file by its repository path. The staged copies the spec
+    cites, from data/inputs_provenance.json (written by the stage machine's stage_inputs before the task)."""
+    try:
+        staged = sorted((json.load(open(os.path.join(run_dir, "data", "inputs_provenance.json"))).get("inputs") or {}))
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return ("\nThe staged inputs (cite these paths, relative to the run directory):\n- " + "\n- ".join(staged) + "\n"
+            if staged else "")
+
+
+_ID = re.compile(r"^([A-Za-z]+)-(\d+)$")
+
+
+def stamp_critique(run_dir: str, reviewer: str) -> bool:
+    """Baseline hb2 (§4.5): the harness, not the critic, owns `reviewer` and the id prefix. After the
+    session, a critique file that is a mapping gets the literal reviewer, and each blocker id of the form X-NNN with
+    another prefix gets the critic's (validate_critique_yaml.PREFIXES), in blockers and carried_forward alike. An id
+    whose stamped form is already in the file is left as written (the gate refuses it; two findings are never merged).
+    A file that is missing, unreadable or not a mapping is left as it is: the gate refuses it (fail closed). True when
+    the file was rewritten."""
+    import yaml
+    import validate_critique_yaml as V
+    rel = CRITIQUE_FILE[reviewer]
+    p = os.path.join(run_dir, rel)
+    if os.path.islink(p) or not os.path.isfile(p):
+        return False
+    try:
+        doc = yaml.safe_load(open(p))
+    except Exception:  # noqa: BLE001 -- unreadable: the gate reports it
+        return False
+    if not isinstance(doc, dict):
+        return False
+    want = V.PREFIXES[reviewer]
+    blockers = [b for b in doc.get("blockers") or [] if isinstance(b, dict)] \
+        if isinstance(doc.get("blockers"), list) else []
+    cf = doc.get("carried_forward") if isinstance(doc.get("carried_forward"), list) else []
+    ids = [b.get("id") for b in blockers] + [c.get("id") if isinstance(c, dict) else c for c in cf]
+    taken = {i for i in ids if isinstance(i, str)}
+    ren = {}
+    for i in ids:
+        m = _ID.match(i) if isinstance(i, str) else None
+        if not m or i.startswith(want) or i in ren:
+            continue
+        new = want + m.group(2)
+        if new not in taken and new not in ren.values():
+            ren[i] = new
+    changed = doc.get("reviewer") != reviewer or bool(ren)
+    if not changed:
+        return False
+    doc["reviewer"] = reviewer
+    for b in blockers:
+        if b.get("id") in ren:
+            b["id"] = ren[b["id"]]
+    for k, c in enumerate(cf):
+        if isinstance(c, dict) and c.get("id") in ren:
+            c["id"] = ren[c["id"]]
+        elif isinstance(c, str) and c in ren:
+            cf[k] = ren[c]
+    _sio().write_nofollow(run_dir, rel, yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode(), atomic=True)
+    return True
+
+
 class SdkTasks:
     """Each call's dollar cap is the allowance the machine sets just before it (set_allowance: the
     run's remaining budget less the write-up reserve, at most the task cap). Spend is charged
@@ -603,7 +668,8 @@ class SdkTasks:
 
     def draft_spec(self, question, run_dir, feedback):
         R = enforcement.REPO_ROOT
-        p = f"Question:\n{question}\n" + (f"\nThe last draft failed validation:\n- " + "\n- ".join(feedback) if feedback else "")
+        p = f"Question:\n{question}\n" + _staged_list(run_dir) + (
+            f"\nThe last draft failed validation:\n- " + "\n- ".join(feedback) if feedback else "")
         return self._session("draft_spec", PROMPTS["draft_spec"].format(
             settings=_settings_text(), skill=os.path.join(R, ".claude", "skills", "decision-spec", "SKILL.md"),
             schema=os.path.join(R, "toolkit", "spec", "schema.py"), example=os.path.join(R, "spike", "decision_spec.v2.yaml"),
@@ -647,12 +713,14 @@ class SdkTasks:
         notes = RF.critic_notes(run_dir)
         msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
                                             + "\n- ".join(notes) if notes else "")
-        return self._session("critique", PROMPTS["critique"].format(
+        res = self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
             stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
-                             msg, (f,), model)
+                            msg, (f,), model)
+        stamp_critique(run_dir, reviewer)
+        return res
 
     def plan_fixes(self, packet):
         inp = self._input(packet)
@@ -953,6 +1021,103 @@ def _self_test() -> int:
             SdkTasks._session = orig_session
         ok("R-030: overstates Required: say tested" in where.get("write", ("", "", 0, ""))[3],
            "PS1 the writer gets the write-up findings with their remedies")
+        # CS1-CS5 (baseline hb2 §4.5, three runs): the presentation critic wrote reviewer 'presentation' (or
+        # 'critique_presentation') and ids R-NNN; each cost a schema repair. The harness stamps the literal reviewer
+        # and the critic's id prefix after the session; the prompt states both literally.
+        import yaml as _y
+
+        def critic_writes(doc):
+            def fake(self_, kind, system, prompt, owns, model=None):
+                where["critique_prompt"] = system
+                if doc is not None:
+                    _y.safe_dump(doc, open(os.path.join(self_.run_dir, owns[0]), "w"), sort_keys=False)
+                return TaskResult(True, {"ok": True}, 0.0, "fake")
+            return fake
+
+        def blk(i, **k):
+            return dict({"id": i, "severity": "LOW", "category": "PRESENTATION", "target_stage": "WRITE",
+                         "first_seen_round": 1, "claim": "c", "evidence": "e", "fix_requires": "f",
+                         "resolved": False}, **k)
+        cs = {}
+        for name, rev, doc in (
+                ("run_a", "critique-presentation", {"reviewer": "presentation", "round": 2, "verdict": "PASS",
+                                                    "structural_mismatch": {"detected": False},
+                                                    "carried_forward": [{"id": "R-001", "prior_round": 1,
+                                                                         "still_present": True, "notes": "n"}],
+                                                    "blockers": [blk("R-001"), blk("R-002")]}),
+                ("run_b", "critique-presentation", {"reviewer": "critique_presentation", "round": 2,
+                                                         "verdict": "PASS", "structural_mismatch": {"detected": False},
+                                                         "carried_forward": [], "blockers": []}),
+                ("domain", "critique-domain", {"reviewer": "domain", "round": 2, "verdict": "PASS",
+                                               "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                               "blockers": [blk("D-001", category="HYPOTHESES")]})):
+            cd = os.path.join(d, "cs_" + name)
+            os.makedirs(cd)
+            SdkTasks._session = critic_writes(doc)
+            try:
+                SdkTasks(cd).critique(cd, rev, 2)
+            finally:
+                SdkTasks._session = orig_session
+            try:
+                got = V.validate_critique(os.path.join(cd, CRITIQUE_FILE[rev]), rev, 2)
+                cs[name] = ("ok", [b["id"] for b in got["blockers"]], [c["id"] for c in got["carried_forward"]])
+            except V.SchemaError as e:
+                cs[name] = ("refused", getattr(e, "errors", None) or [str(e)])
+        ok(cs.get("run_a") == ("ok", ["P-001", "P-002"], ["P-001"]) and cs.get("run_b", ("",))[0] == "ok"
+           and cs.get("domain") == ("ok", ["D-001"], []),
+           f"CS1 the harness stamps each critic's reviewer and id prefix, carried_forward ids with them ({cs})")
+        cd = os.path.join(d, "cs_collide")
+        os.makedirs(cd)
+        SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 1, "verdict": "PASS",
+                                           "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                           "blockers": [blk("P-001"), blk("R-001")]})
+        try:
+            SdkTasks(cd).critique(cd, "critique-presentation", 1)
+        finally:
+            SdkTasks._session = orig_session
+        raw = _y.safe_load(open(os.path.join(cd, "critique_presentation.yaml")))
+        ok(raw["reviewer"] == "critique-presentation" and [b["id"] for b in raw["blockers"]] == ["P-001", "R-001"],
+           f"CS2 an id whose stamped form is taken is left for the gate to refuse, never merged ({raw['blockers']})")
+        for name, body in (("cs_missing", None), ("cs_list", ["not", "a", "mapping"])):
+            cd = os.path.join(d, name)
+            os.makedirs(cd)
+            SdkTasks._session = critic_writes(body)
+            try:
+                SdkTasks(cd).critique(cd, "critique-presentation", 1)
+                crashed = None
+            except Exception as e:  # noqa: BLE001 -- the test is that it does not raise
+                crashed = repr(e)
+            finally:
+                SdkTasks._session = orig_session
+            p = os.path.join(cd, "critique_presentation.yaml")
+            ok(crashed is None and (os.path.exists(p) == (body is not None))
+               and (body is None or _y.safe_load(open(p)) == body),
+               f"CS3 a missing or non-mapping critique file is left as it is for the gate to refuse ({name}, {crashed})")
+        # SD1-SD2 (baseline hb2 §4.6): the drafter put digits in deliverable.decision.statements
+        # and cited a question file by its repository path, not its staged copy. The prompt names the statements in
+        # the no-digits rule, and the task's message lists the staged input paths.
+        sd = os.path.join(d, "sd")
+        os.makedirs(os.path.join(sd, "data"))
+        json.dump({"inputs": {"data/inputs/data/evals/q/districts.csv": {"source": "data/evals/q/districts.csv"},
+                              "data/inputs/data/evals/q/sero.csv": {"source": "data/evals/q/sero.csv"}}},
+                  open(os.path.join(sd, "data", "inputs_provenance.json"), "w"))
+
+        def sd_session(self_, kind, system, prompt, owns, model=None):
+            where["draft_msg"] = prompt
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        SdkTasks._session = sd_session
+        try:
+            SdkTasks(sd).draft_spec("Q? Inputs: data/evals/q/districts.csv, data/evals/q/sero.csv", sd, None)
+        finally:
+            SdkTasks._session = orig_session
+        dm = where.get("draft_msg") or ""
+        ok("data/inputs/data/evals/q/districts.csv" in dm and "data/inputs/data/evals/q/sero.csv" in dm,
+           f"SD1 the draft task's message lists the staged input paths to cite ({dm[-300:]!r})")
+        ok("deliverable.decision.statements" in " ".join(PROMPTS["draft_spec"].split()),
+           "SD2 the draft prompt's no-digits rule names deliverable.decision.statements")
+        cpp = where.get("critique_prompt") or ""
+        ok("reviewer: critique-presentation" in cpp and "P-NNN" in cpp,
+           "CS4 the critique prompt states the literal reviewer value and id prefix")
         ok(not errors and set(seen_prompts) == set(PROMPTS),
            f"PF2 every PROMPTS entry is assembled by its task method with real arguments "
            f"(errors {errors}; not driven {sorted(set(PROMPTS) - set(seen_prompts))})")
