@@ -24,7 +24,17 @@ def _submodules(pkg):
             if m is not None and m is not pkg and m is not me and k.startswith(_PKG + ".")]
 
 
+_CREATED: set = set()           # (submodule name, attribute) bindings forwarding created, the only ones it deletes
+
+
 class _Shared(types.ModuleType):
+    @property
+    def __all__(self):
+        """What `import *` took from the one module: its public names, now and after any patch; not the
+        package's own submodules, which the module did not have."""
+        return [n for n, v in self.__dict__.items() if not n.startswith("_")
+                and not (isinstance(v, types.ModuleType) and (v.__name__ or "").startswith(_PKG + "."))]
+
     def __setattr__(self, name, value):
         old = self.__dict__.get(name, _MISSING)
         super().__setattr__(name, value)
@@ -34,13 +44,16 @@ class _Shared(types.ModuleType):
             # the same object, or (old missing) a name the module resolved through builtins, as one module did
             if mod.__dict__.get(name, _MISSING) is old:
                 setattr(mod, name, value)
+                if old is _MISSING:
+                    _CREATED.add((mod.__name__, name))
 
     def __delattr__(self, name):
-        old = self.__dict__.get(name, _MISSING)
         super().__delattr__(name)
         for mod in _submodules(self):
-            if old is not _MISSING and mod.__dict__.get(name, _MISSING) is old:
-                delattr(mod, name)
+            if (mod.__name__, name) in _CREATED:
+                _CREATED.discard((mod.__name__, name))
+                if name in mod.__dict__:
+                    delattr(mod, name)
 
 
 def share(module) -> None:
