@@ -3542,11 +3542,13 @@ def _self_test() -> int:
     """The cases live in tests/stage_machine/ (moved there verbatim by scripts/refactor/split_stage_machine.py);
     they run against this module, imported there as _stage_machine_under_test."""
     sys.modules["_stage_machine_under_test"] = sys.modules[__name__]
-    for k in [k for k in sys.modules if k.startswith("sm_selftest_")]:
-        del sys.modules[k]          # a second call (another copy of this module) binds the cases to it afresh
     d = os.path.join(REPO, "tests", "stage_machine")
-    if d not in sys.path:
-        sys.path.append(d)
+    for k, m in list(sys.modules.items()):  # a second call (another copy, another checkout) binds the cases afresh
+        if k.startswith("sm_selftest_") and os.path.basename(os.path.dirname(getattr(m, "__file__", None) or ""))                 == "stage_machine":
+            del sys.modules[k]
+    while d in sys.path:
+        sys.path.remove(d)
+    sys.path.insert(0, d)           # this checkout's cases, not another's
     import sm_selftest_core
     return sm_selftest_core._self_test()
 
