@@ -567,6 +567,9 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
         return False
     if not isinstance(doc, dict):
         return False
+    from toolkit.spec import critique_checklist as CLst
+    if reviewer in CLst.CHECKLIST_REVIEWERS and CLst.strict_load(now)[1] is not None:
+        return False        # a duplicate key: a rewrite would drop one silently; the gate refuses it (Codex r3 of #366)
     want = V.PREFIXES[reviewer]
     blockers = [b for b in doc.get("blockers") or [] if isinstance(b, dict)] \
         if isinstance(doc.get("blockers"), list) else []
@@ -1239,6 +1242,17 @@ def _self_test() -> int:
         except V.SchemaError as e:
             sck2 = getattr(e, "errors", None) or [str(e)]
         ok(sck2 == ["R-001"], f"SCK2 the stamp renames the checklist's blocker references with the ids ({sck2})")
+        # SCK4 (Codex r3 of #366, P1-1): the stamp never rewrites a checklist file with a duplicate key (a rewrite
+        # would keep one entry silently); the gate refuses the file as written
+        cd = os.path.join(d, "cs_dup")
+        os.makedirs(cd)
+        dup_txt = ("reviewer: domain\nround: 1\nverdict: PASS\nstructural_mismatch: {detected: false}\n"
+                   "carried_forward: []\nblockers: []\nchecklist:\n  burn_in_drift: {answer: finding, reason: r}\n"
+                   "  burn_in_drift: {answer: pass, reason: r}\n").encode()
+        open(os.path.join(cd, "critique_domain.yaml"), "wb").write(dup_txt)
+        ok(stamp_critique(cd, "critique-domain", None) is False
+           and open(os.path.join(cd, "critique_domain.yaml"), "rb").read() == dup_txt,
+           "SCK4 the stamp leaves a checklist file with a duplicate key as written")
         cd = os.path.join(d, "cs_collide")
         os.makedirs(cd)
         SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 1, "verdict": "PASS",

@@ -99,6 +99,7 @@ class AwaitingBudget(Exception):
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
+CHECKLIST_MISSING = "missing required key 'checklist'"     # toolkit/spec/critique_checklist.py's error for a file without it
 MAX_SIGN_REPAIRS = 2          # a refused lead sign-off goes back to EVIDENCE or SPEC at most this often, then waits
 MAX_CALIBRATION_REFUSALS = 2  # a refused calibration goes back to SPEC at most this often, then the run ends run_failed
 CALIBRATION_REFUSED = "calibration_refused"      # its findings-ledger kind and id
@@ -609,7 +610,8 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     if schema_errors:
         return {"schema_errors": schema_errors, "action": None}
     d = V.decide(critiques, max_rounds, round_n)
-    d["critique_checklist"] = CL.record(critiques)
+    if checklist:        # a replay (checklist_rules off) never reads, so never records, a legacy field (Codex r3 P1-5)
+        d["critique_checklist"] = CL.record(critiques)
     d["declared"] = V._declared_ids(run_dir)
     d["declared_prev"] = V._previous_declared(run_dir, round_n)
     d = V._apply_brief_scope(d, critiques, run_dir, max_rounds, round_n)
@@ -2600,7 +2602,13 @@ class Machine:
             return self._go("FINAL", "the report kept acceptance language after its repairs: withheld",
                             "completed_no_report")
         if nxt == "CRITIQUE":                               # schema errors: re-run the critics
-            n = self.st.tries.get("schema", 0) + 1
+            # Codex r3 of #366 (P1-3): a run started before the structural checklist (critique files without it) gets
+            # one repair to add it outside the schema-repair count, once per run, so the upgrade cannot end it.
+            upgrade = (not self.st.tries.get("checklist_upgrade")
+                       and any(CHECKLIST_MISSING in str(e) for e in d["schema_errors"]))
+            n = self.st.tries.get("schema", 0) + (0 if upgrade else 1)
+            if upgrade:
+                self.st.tries["checklist_upgrade"] = 1
             self.st.tries["schema"] = n
             if n > MAX_SCHEMA_REPAIRS:
                 return self._go("FINAL", "critique schema errors persist", "completed_gate_error")
@@ -4687,6 +4695,41 @@ def _self_test() -> int:
         ok(runs_ck["ck_na"] == runs_ck["ck_pass"] and runs_ck["ck_na"][0] == "completed",
            f"SM-CK3 not_applicable answers (with reasons) cost no round and raise no finding (same path as pass): "
            f"{runs_ck['ck_na'][0]}, round {runs_ck['ck_na'][2]} vs {runs_ck['ck_pass'][2]}")
+        # SM-CK6 (Codex r3 of #366, P1-3): a run that had used its schema repairs before the upgrade, whose critics then
+        # write no checklist once, gets one repair outside the count and completes; a second missing checklist counts
+        mig = []
+
+        def no_checklist_once(reviewer, rn, answers):
+            if reviewer == "critique-domain" and not mig:
+                mig.append(rn)
+                return None
+            return answers
+        dk, Tk, stk = new_run("ck_upgrade", {"checklist": no_checklist_once})
+        stk.tries["schema"] = MAX_SCHEMA_REPAIRS
+        status_k = _SpikeMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False).run()
+        ok(status_k == "completed" and Tk.calls.count("critique:critique-domain:1") == 2
+           and load_state(dk).tries.get("checklist_upgrade") == 1 and CHECKLIST_MISSING in CLk.problems(None, "f", [])[0],
+           f"SM-CK6 a pre-upgrade run gets one checklist repair outside the schema count: {status_k}")
+        # SM-CK7 (P1-5): a replay of stored gates ignores a malformed legacy checklist field (here a date key)
+        rd7 = os.path.join(td, "ck_replay")
+        os.makedirs(rd7)
+        import datetime as _dt7
+        for r in CRITICS:
+            __import__("yaml").safe_dump({"reviewer": r, "round": 1, "verdict": "PASS",
+                                          "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                          "blockers": [], "checklist": {"burn_in_drift": {
+                                              "reason": {_dt7.date(2026, 11, 23): "reviewed"}}}},
+                                         open(os.path.join(rd7, __import__("validate_critique_yaml").FILENAMES[r]), "w"))
+        open(os.path.join(rd7, STATE_FILE), "w").write("{}")
+        g7 = v2_gate(rd7, 1, 3, False, [], history=False, checklist_rules=False)
+        try:
+            json.dumps(g7)
+            j7 = True
+        except TypeError:
+            j7 = False
+        ok(not g7.get("schema_errors") and "critique_checklist" not in g7 and j7,
+           f"SM-CK7 a replay (checklist_rules off) neither requires nor records a legacy checklist field: "
+           f"{g7.get('action')}, {g7.get('schema_errors')}")
         from toolkit.spec import evidence_draft as EDR_
         ok("draft_evidence" not in T.calls and (EDR_.read_record(d) or {}).get("status") == "not_required",
            f"T11b a spec whose options need no decision input passes EVIDENCE with no task ({EDR_.read_record(d)})")

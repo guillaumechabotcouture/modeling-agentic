@@ -429,8 +429,24 @@ def validate_critique(path: str, expected_reviewer: str,
     """The parsed critique, or SchemaError listing every problem in the file (`.errors`).
     `checklist`: True for a v2 gate, where a checklist reviewer answers every item of the structural
     checklist; False (the legacy gate) requires none."""
-    doc = _load(path)
     ctx = os.path.basename(path)
+    if checklist and expected_reviewer in _checklist_module().CHECKLIST_REVIEWERS:
+        # Codex r3 of #366: read with no duplicate key, and a parse failure named by fixed text (the parser's report
+        # quotes the file; the repair's review message carries it as data, critique_checklist.repair_data).
+        CL0 = _checklist_module()
+        try:
+            with open(path, "rb") as fh:
+                raw0 = fh.read()
+        except FileNotFoundError:
+            raise SchemaError(f"missing file: {path}")
+        except OSError:
+            raise SchemaError(f"{ctx}: {CL0.LOAD_ERROR}")
+        doc, diag = CL0.strict_load(raw0)
+        if diag is not None:
+            raise SchemaError(f"{ctx}: {CL0.LOAD_ERROR}")
+        _require(isinstance(doc, dict), f"{ctx}: top-level must be a mapping")
+    else:
+        doc = _load(path)
     prefix = PREFIXES[expected_reviewer]
     errs = _Errors()
 
@@ -4799,6 +4815,25 @@ def _run_self_test() -> int:
                      cl=True)
         ok(len(e6) == 1 and "[CK-B-burn_in_drift-1]" in e6[0] and "D-7" not in e6[0],
            f"CK6 a finding naming no blocker of the file is refused, by marker (critic text is never quoted): {e6}")
+        # CK7-CK8 (Codex r3 of #366): a duplicate checklist key, and a value the parser cannot construct, are schema
+        # errors in fixed text; the legacy gate keeps its old reading
+        base_y = ("reviewer: critique-domain\nround: 1\nverdict: PASS\nstructural_mismatch: {detected: false}\n"
+                  "carried_forward: []\nblockers: []\nchecklist:\n"
+                  + "".join(f"  {i}: {{answer: pass, reason: r}}\n" for i in CLm.ITEMS))
+        for tag, extra in (("CK7", "  burn_in_drift: {answer: finding, reason: r}\n"),
+                           ("CK8", "  surveillance_ranking: {answer: pass, reason: !!bool observation_SECRET}\n")):
+            body = base_y if tag == "CK8" else base_y + extra
+            if tag == "CK8":
+                body = base_y.replace("  surveillance_ranking: {answer: pass, reason: r}\n", extra)
+            open(pth, "w").write(body)
+            try:
+                validate_critique(pth, "critique-domain", 1, checklist=True)
+                ek = []
+            except SchemaError as e:
+                ek = list(e.errors)
+            ok(len(ek) == 1 and "[CK-YAML]" in ek[0] and "observation_SECRET" not in ek[0],
+               f"{tag} a {'duplicate key' if tag == 'CK7' else 'value the parser cannot construct'} is one schema "
+               f"error in fixed text: {ek}")
 
     # --- Phase 39 α: presentation polish waits for the first draft ---
     with tempfile.TemporaryDirectory() as d:
