@@ -123,6 +123,11 @@ docs/design/v2-spec-and-analysis.md §1):
                                            # (toolkit/spec/evidence_dossier.py); the signature binds the file's sha256
     principle_departures:                  # optional: a decision design principle the spec departs from, by the
       - {principle: 2, check: headline_comparator, reason: "..."}   # pre-sign check that finds it (spec_critique.py)
+    periods:                               # optional (principle 9): time windows the pre-sign critique compares
+      holdout: [[2019.0, 2020.0]]          # windows held out of calibration for validation
+      shocks: [{id: s1, window: [2020.2, 2021.5], what: "..."}]   # outbreaks, disruptions, intervention periods
+                                           # (toolkit/spec/critique_checklist.py checks the section; the critics'
+                                           # checklist item is then the harness's)
     deliverable:
       kind: package_per_unit
       allocation_file: allocation_optimized.csv

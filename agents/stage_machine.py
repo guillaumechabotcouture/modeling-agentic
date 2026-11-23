@@ -513,6 +513,11 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     import done_when
     import validate_critique_yaml as V
     critiques, schema_errors, refused = {}, [], {}
+    # Owner 2026-11-23: the domain and red-team critics answer the structural checklist; the harness answers the
+    # items it computes from the spec (toolkit/spec/critique_checklist.py). A missing item is a schema error.
+    from toolkit.spec import critique_checklist as CL
+    spec_raw = CL.load_spec(run_dir)
+    harness = CL.harness_answers(spec_raw) if spec_raw is not None else {}
     draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     extra = list(extra)
     names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
@@ -536,7 +541,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
             # round, which cost a schema repair and a paid review of a draft about to be replaced.
             rn = _earlier_round(path, round_n)
         try:
-            critiques[reviewer] = V.validate_critique(path, reviewer, rn)
+            critiques[reviewer] = V.validate_critique(path, reviewer, rn, checklist=harness)
         except V.SchemaError as e:
             # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
             # blockers still have their done_when tests checked below, for the same reason.
@@ -574,6 +579,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     if schema_errors:
         return {"schema_errors": schema_errors, "action": None}
     d = V.decide(critiques, max_rounds, round_n)
+    d["critique_checklist"] = CL.record(critiques, harness)
     d["declared"] = V._declared_ids(run_dir)
     d["declared_prev"] = V._previous_declared(run_dir, round_n)
     d = V._apply_brief_scope(d, critiques, run_dir, max_rounds, round_n)
@@ -4392,6 +4398,42 @@ def _self_test() -> int:
         ok(hist[:8] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
            and "FIX_LOOP" in hist
            and hist[-3:] == ["PRESENTATION", "GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
+        # SM-CK1-3 (owner 2026-11-23): the structural checklist. The gate records the harness's and each critic's
+        # answers; a missing item is a schema repair, never a round; not_applicable answers raise nothing.
+        from toolkit.spec import critique_checklist as CLk
+        g1 = json.load(open(os.path.join(d, "gate_r1.json")))
+        ck = g1.get("critique_checklist") or {}
+        ok(set(ck) == set(CLk.ITEMS) and (ck["comparator_symmetry"].get("harness") or {}).get("answer") == "pass"
+           and ck["comparator_symmetry"]["critics"] == {}
+           and set(ck["burn_in_drift"]["critics"]) == {"critique-domain", "critique-redteam"},
+           f"SM-CK1 the gate record holds the harness's answer (generated packages: symmetric) and both critics': "
+           f"{json.dumps(ck)[:300]}")
+        dropped = []
+
+        def drop_once(reviewer, rn, answers):
+            if reviewer == "critique-domain" and not dropped:
+                dropped.append(rn)
+                answers.pop("surveillance_ranking")
+            return answers
+        dk, Tk, stk = new_run("ck_missing", {"checklist": drop_once})
+        status_k = _SpikeMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False).run()
+        s2 = load_state(dk)
+        ok(status_k == "completed" and Tk.calls.count("critique:critique-domain:1") == 2
+           and Tk.calls.count("critique:critique-redteam:1") == 1 and not any(c.endswith(":2") and c.startswith(
+               "critique:") for c in Tk.calls) and any("schema" in str(h.get("why", "")) for h in s2.history),
+           f"SM-CK2 a missing checklist item is a schema repair of that critic in the same round: {status_k}, "
+           f"{[c for c in Tk.calls if c.startswith('critique')]}")
+        runs_ck = {}
+        for name, edit in (("ck_pass", None), ("ck_na", lambda r, n, a: {i: {"answer": "not_applicable",
+                                                                             "reason": "stub: cannot arise"} for i in a})):
+            dk, Tk, stk = new_run(name, {"checklist": edit} if edit else {})
+            status_k = _SpikeMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False).run()
+            s3 = load_state(dk)
+            runs_ck[name] = (status_k, [h["to"] for h in s3.history if "to" in h], s3.round,
+                             len(json.load(open(os.path.join(dk, "gate_r1.json"))).get("unresolved_high") or []))
+        ok(runs_ck["ck_na"] == runs_ck["ck_pass"] and runs_ck["ck_na"][0] == "completed",
+           f"SM-CK3 not_applicable answers (with reasons) cost no round and raise no finding (same path as pass): "
+           f"{runs_ck['ck_na'][0]}, round {runs_ck['ck_na'][2]} vs {runs_ck['ck_pass'][2]}")
         from toolkit.spec import evidence_draft as EDR_
         ok("draft_evidence" not in T.calls and (EDR_.read_record(d) or {}).get("status") == "not_required",
            f"T11b a spec whose options need no decision input passes EVIDENCE with no task ({EDR_.read_record(d)})")

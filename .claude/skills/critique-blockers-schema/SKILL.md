@@ -256,6 +256,38 @@ mismatch is NEVER scope-declarable — the delivered model does not answer
 the question and the run fails if rounds are exhausted without RETHINK
 resolving it.
 
+## Structural checklist (domain and red-team, v2)
+
+`critique-domain` and `critique-redteam` answer five structural checks in
+every round's file (owner, 2026-11-23; principles 8-12 of
+`.claude/orchestration/decision_design_principles.md`). The item list,
+questions and checks live in `toolkit/spec/critique_checklist.py`; this
+section does not restate them.
+
+```yaml
+checklist:
+  burn_in_drift: {answer: pass, reason: "analysis/trajectories.yaml: coverage at the window start matches the spec"}
+  surveillance_ranking: {answer: finding, reason: "units binned on raw notifications", blockers: [D-004]}
+  natural_history_tension: {answer: not_applicable, reason: "the engine has no detection step"}
+  # comparator_symmetry and holdout_shock_overlap: left out when the harness answered them
+```
+
+- `answer` is `pass`, `finding` or `not_applicable`; every answer has a
+  non-empty `reason` (for `not_applicable`, why the check cannot arise).
+- A `finding` names the blocker(s) in the same file that state it. The
+  checklist adds no finding of its own: `pass` and `not_applicable` cost
+  no round, and a finding costs only what its blocker costs.
+- The harness answers `comparator_symmetry` from the spec's packages, and
+  `holdout_shock_overlap` when the spec declares `periods.holdout` and
+  `periods.shocks`. The prompt shows its answers; leave those items out.
+  Both are also pre-sign checks on the sign-off sheet
+  (`toolkit/spec/spec_critique.py`), where a finding is fixed or declared.
+- A missing item, an unknown item, an unknown answer, a missing reason, or
+  a finding without a blocker of this file is a schema error (fail
+  closed); the gate's schema repair lists every one.
+- The gate record (`gate_r<N>.json`, key `critique_checklist`) holds the
+  harness's and each critic's answers.
+
 ## Gate rules applied by the lead (for your awareness)
 
 The lead runs `scripts/validate_critique_yaml.py {run_dir}` after each

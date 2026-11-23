@@ -125,7 +125,8 @@ its LOW report_number_typed rows (advisory) name numbers the writer typed instea
 raise one only if it misleads the reader. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
 {file} in the critique-blockers schema: reviewer: {reviewer} (this literal value), round: {round}, verdict (PASS | REVISE),
-structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN, this prefix;
+structural_mismatch {{detected: bool}}, carried_forward (round 1: []), checklist (the domain and red-team
+reviews only: the checklist below), blockers (ids {prefix}-NNN, this prefix;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
 first_seen_round, claim, evidence, fix_requires (when the fix needs the signed decision_spec.yaml changed, start it
 with "Owner amendment:": the owner decides it, no task can), resolved (true/false), and done_when (required for
@@ -572,8 +573,22 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
                 c["id"] = ren[i]
             else:
                 cf[k] = ren[i]
+    ck = doc.get("checklist") if isinstance(doc.get("checklist"), dict) else {}
+    for e in ck.values():               # the structural checklist's finding references follow the renamed ids
+        if isinstance(e, dict) and isinstance(e.get("blockers"), list):
+            e["blockers"] = [ren.get(x, x) if isinstance(x, str) else x for x in e["blockers"]]
     _sio().write_nofollow(run_dir, rel, yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode(), atomic=True)
     return True
+
+
+def checklist_text(run_dir: str, reviewer: str) -> str:
+    """The structural checklist a domain or red-team review answers (owner 2026-11-23), with the harness's answers
+    for the items it computed from the run's spec (toolkit/spec/critique_checklist.py); empty for other reviewers."""
+    from toolkit.spec import critique_checklist as CL
+    if reviewer not in CL.CHECKLIST_REVIEWERS:
+        return ""
+    raw = CL.load_spec(run_dir)
+    return "\n\n" + CL.prompt_block(CL.harness_answers(raw) if raw is not None else {})
 
 
 class SdkTasks:
@@ -771,7 +786,7 @@ class SdkTasks:
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
-            stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
+            stages=" | ".join(sorted(V.VALID_TARGET_STAGE))) + checklist_text(run_dir, reviewer),
                             msg, (f,), model)
         stamp_critique(run_dir, reviewer, before)
         return res
@@ -946,6 +961,20 @@ def _self_test() -> int:
         ok(all(k in cp2 for k in ("resolved_in_round: 2", "resolved_evidence", "prior_round: 1", "still_present",
                                   "never a bare id")),
            "S17 the critique prompt states what a resolved blocker and a carried_forward entry need")
+        # SCK1 (owner 2026-11-23): the domain and red-team prompts carry the structural checklist, with the
+        # harness's own answers for the items it computes from the spec; the presentation prompt does not.
+        import yaml
+        from toolkit.spec import critique_checklist as CL
+        ck = os.path.join(d, "ck")
+        os.makedirs(ck)
+        yaml.safe_dump({"options": {"components": {"sc": {}, "a": {}, "c": {}},
+                                    "packages": {"soc": ["sc"], "soc_a": ["sc", "a"], "c": ["c"]}},
+                        "comparator": {"package": "soc"}}, open(os.path.join(ck, "decision_spec.yaml"), "w"))
+        tx = checklist_text(ck, "critique-redteam")
+        ok(all(i in tx for i in CL.ITEMS) and "comparator_symmetry (principle 8): finding" in tx
+           and "`c` lacks `sc`" in tx and checklist_text(ck, "critique-presentation") == ""
+           and "checklist (the domain and red-team" in cp2,
+           f"SCK1 the checklist and the harness's answers reach the domain and red-team prompts only: {tx[-300:]}")
         ok("{settings}" not in PROMPTS["fix"].format(tid="T", brief="b", findings=[], evidence="", settings="a.b", out=OUT, files="f")
            and "engine: auto" in PROMPTS["draft_spec"], "S10 the prompts follow the analysis backend's schema")
 
@@ -1120,6 +1149,26 @@ def _self_test() -> int:
         ok(cs.get("run_a") == ("ok", ["P-001", "P-002"], ["P-001"]) and cs.get("run_b", ("",))[0] == "ok"
            and cs.get("domain") == ("ok", ["D-001"], []),
            f"CS1 the harness stamps each critic's reviewer and id prefix, carried_forward ids with them ({cs})")
+        # SCK2: a stamped id is renamed in the structural checklist's finding references too, so the file stays valid
+        from toolkit.spec import critique_checklist as CLs
+        cd = os.path.join(d, "cs_checklist")
+        os.makedirs(cd)
+        ckd = {i: {"answer": "pass", "reason": "r"} for i in CLs.ITEMS}
+        ckd["burn_in_drift"] = {"answer": "finding", "reason": "drift", "blockers": ["D-001"]}
+        SdkTasks._session = critic_writes({"reviewer": "redteam", "round": 1, "verdict": "REVISE",
+                                           "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                           "checklist": ckd, "blockers": [blk("D-001", category="HYPOTHESES")]})
+        try:
+            SdkTasks(cd).critique(cd, "critique-redteam", 1)
+        finally:
+            SdkTasks._session = orig_session
+        try:
+            gotk = V.validate_critique(os.path.join(cd, CRITIQUE_FILE["critique-redteam"]), "critique-redteam", 1,
+                                       checklist={})
+            sck2 = gotk["checklist"]["burn_in_drift"]["blockers"]
+        except V.SchemaError as e:
+            sck2 = getattr(e, "errors", None) or [str(e)]
+        ok(sck2 == ["R-001"], f"SCK2 the stamp renames the checklist's blocker references with the ids ({sck2})")
         cd = os.path.join(d, "cs_collide")
         os.makedirs(cd)
         SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 1, "verdict": "PASS",

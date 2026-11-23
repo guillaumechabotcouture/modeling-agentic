@@ -23,6 +23,12 @@ Checks (principle numbers from .claude/orchestration/decision_design_principles.
                            engine_parameters value with a range that no decision test varies (HIGH), or a point value
                            nothing varies (MEDIUM); an allocated component's cost item with no uncertainty range and
                            no price test (MEDIUM).
+  comparator_symmetry (8)  an arm lacks a background component that the comparator and another arm carry (or, with
+                           an empty comparator, that every other arm carries), and no arm is it with the component
+                           added: its effect is measured without the backup the others have (MEDIUM, owner judgment;
+                           toolkit/spec/critique_checklist.py, which also answers the critics' checklist item).
+  holdout_shock_overlap (9) a window in `periods.holdout` overlaps a shock period in `periods.shocks` (MEDIUM); a
+                           malformed `periods` section is HIGH. Without both lists it is not computed.
 
 A finding is declared when the spec's `principle_departures` names its check with a reason:
 
@@ -47,7 +53,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 CHECKS = {"headline_comparator": 2, "decision_date": 2, "baseline_burden": 3, "decision_input_ranges": 6,
-          "follow_up_window": 3}
+          "follow_up_window": 3, "comparator_symmetry": 8, "holdout_shock_overlap": 9}
 SECTION = "## Spec critique (decision design principles, before signing)"
 PAST_DAYS = 90             # an ISO decision date more than this before today is past
 CALENDAR_MIN = 1900        # a window starting earlier is in model years, not calendar years: not compared with today
@@ -315,6 +321,32 @@ def _follow_up(raw, run_dir, dossier_bytes=None) -> list:
                "a decision test varies it", judgment=True)]
 
 
+def _symmetry(raw) -> list:
+    """Principle 8, computed (toolkit/spec/critique_checklist.py): the answer the critics' checklist records."""
+    from toolkit.spec import critique_checklist as CL
+    a = CL.comparator_symmetry(raw)
+    if a is None or a["answer"] != "finding":
+        return []
+    return [_f("MEDIUM", "comparator_symmetry", f"Comparator asymmetry: {a['reason']}. Each such arm's effect is "
+               "measured without the backup or standard-of-care component the other arms have.",
+               "Add the arm with the component, add the component to the arm, or declare this check with the reason "
+               "the arm is meant to replace it", judgment=True)]
+
+
+def _periods(raw) -> list:
+    """Principle 9, computed when the spec declares `periods`: a holdout window over a declared shock period."""
+    from toolkit.spec import critique_checklist as CL
+    bad = CL.period_problems(raw)
+    if bad:
+        return [_f("HIGH", "holdout_shock_overlap", "; ".join(bad)[:600], "Fix the periods section", error=True)]
+    a = CL.holdout_shock_overlap(raw)
+    if a is None or a["answer"] != "finding":
+        return []
+    return [_f("MEDIUM", "holdout_shock_overlap", f"{a['reason']}: the holdout tests the model on a period whose "
+               "dynamics the calibration window does not share.",
+               "Move the holdout window off the shock period, or declare this check")]
+
+
 def _num(x):
     if isinstance(x, bool):
         return None
@@ -362,7 +394,9 @@ def findings(raw: dict, run_dir: str | None = None, today: datetime.date | None 
                      ("decision_date", lambda: _decision_date(raw, today)),
                      ("baseline_burden", lambda: _burden(raw, run_dir, burden_data)),
                      ("decision_input_ranges", lambda: _ranges(raw, run_dir, dossier_bytes)),
-                     ("follow_up_window", lambda: _follow_up(raw, run_dir, dossier_bytes))):
+                     ("follow_up_window", lambda: _follow_up(raw, run_dir, dossier_bytes)),
+                     ("comparator_symmetry", lambda: _symmetry(raw)),
+                     ("holdout_shock_overlap", lambda: _periods(raw))):
         try:
             out += fn()
         except Exception as e:  # noqa: BLE001 -- fail closed: a check that cannot run is a finding
@@ -576,6 +610,23 @@ def _self_test() -> int:
            "SC39 no flag when every declared follow-up covers the window")
         md = "\n".join(sheet_lines(r, d, T))
         ok("| MEDIUM | 3 | follow_up_window |" in md, "SC40 the flag is on the sheet")
+    # principles 8-9 (owner, 2026-11-23): computed before signing, and in the critics' checklist record
+    r = spec(comparator={"package": "soc"})
+    r["options"]["packages"] = {"soc": ["c1"], "soc_c2": ["c1", "c2"], "c3": ["c3"]}
+    r["options"]["components"]["c3"] = {}
+    fs = [f for f in findings(r, today=T) if f["check"] == "comparator_symmetry"]
+    ok([f["severity"] for f in fs] == ["MEDIUM"] and "`c3` lacks `c1`" in fs[0]["text"],
+       f"SC41 an arm without the comparator's component that another arm carries is MEDIUM: {fs}")
+    r["principle_departures"] = [{"principle": 8, "check": "comparator_symmetry", "reason": "c3 replaces c1"}]
+    ok(sev(findings(r, today=T), "comparator_symmetry") == ["DECLARED"], "SC42 the asymmetry can be declared")
+    ok(sev(findings(spec(), today=T), "comparator_symmetry") == [], "SC43 the base toy spec is symmetric")
+    r = spec(periods={"holdout": [[2019.0, 2020.5]], "shocks": [{"id": "s1", "window": [2020.0, 2021.0],
+                                                                "what": "disruption"}]})
+    ok(sev(findings(r, today=T), "holdout_shock_overlap") == ["MEDIUM"], "SC44 a holdout window over a shock is MEDIUM")
+    r["periods"]["holdout"] = [[2017.0, 2018.0]]
+    ok(sev(findings(r, today=T), "holdout_shock_overlap") == [], "SC45 a holdout window clear of every shock is clean")
+    r["periods"]["shocks"] = [{"id": "s1", "window": [2021, 2020], "what": "x"}]
+    ok(sev(findings(r, today=T), "holdout_shock_overlap") == ["HIGH"], "SC46 a malformed periods section is HIGH")
     print(f"{'FAIL' if fails else 'OK'}: " + (f"{len(fails)} case(s) failed" if fails else
                                                "all self-test cases passed."))
     return 1 if fails else 0
