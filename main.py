@@ -1077,6 +1077,31 @@ def _run_self_test() -> int:
        f"ST7 a resume refused by a held amendment lock exits 1 with nothing stamped, recorded or stored ({_got7}, "
        f"{_stored7})")
     shutil.rmtree(_lr, ignore_errors=True)
+    # ST8 (Codex r1 of #349): a child another process holds stops this run, which still stores the parent it finished,
+    # up to that child; its own held lock stores nothing
+    _p8, _calls8 = tempfile.mkdtemp(), []
+    _c8 = _p8.rstrip(os.sep) + ".amend1"
+
+    def _locked(rd):
+        def f():
+            raise _sm7.AmendmentLocked("held", run_dir=rd)
+        return f
+    _got8 = [_outcome(lambda: _rs(_locked(rd), _p8, store=lambda p, upto=None: _calls8.append((p, upto))))
+             for rd in (_c8, _p8)]
+    _saved8 = (_sm7.handoff_chain, globals()["store_run_results"])
+    _stored8 = []
+    _sm7.handoff_chain = lambda p, limit=8, kept=False: [_c8, _c8 + ".amend1"]
+    globals()["store_run_results"] = _stored8.append
+    try:
+        _store_chain(_p8, upto=_c8)
+        _store_chain(_p8)
+    finally:
+        _sm7.handoff_chain, globals()["store_run_results"] = _saved8
+    ok(_got8 == ["AmendmentLocked"] * 2 and _calls8 == [(_p8, _c8)] and "crash" not in _metadata_dict(
+        os.path.join(_p8, "metadata.json")) and _stored8 == [_p8, _p8, _c8, _c8 + ".amend1"],
+       f"ST8 a held child stops the chain there: the parent is stored, the held child and later ones are not "
+       f"({_got8}, {_calls8}, {_stored8})")
+    shutil.rmtree(_p8, ignore_errors=True)
     _self_test_pipeline(ok, _outcome)
 
     if failures:
