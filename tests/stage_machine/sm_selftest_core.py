@@ -18,10 +18,10 @@ from _stage_machine_under_test import (
     ACCEPTED_STATUSES, AWAITING_BUDGET, AWAITING_SPEC_AMENDMENT, CRITICS, DECLARED_FILE, EDGES, Machine,
     OWNER_LIFECYCLE_WIRED, OWNER_REQUEST, PROVENANCE, RunState, SCOPE_SIGNOFF, SIGNOFF_FILE, SIGNOFF_SHEET,
     STATE_FILE, _bearing_item, _owner_rule, _plan_changing, _quarantine_report, _question_paths, _rep_error,
-    _signoff, _spec_signed_sha, _write_json, answer_key_path, apply_medium_rule, apply_owner_declines,
-    apply_owner_rule, deliverable_problems, drop_declined, init_run, load_state, main, pending_amendments,
-    record_cited_inputs, render_report, report_acceptance_findings, report_claim_findings, require_judged,
-    route_gate, run_v2, save_state, sign, signed_hash, spec_signed_once, stage_inputs, write_declared,
+    _signoff, _spec_signed_sha, answer_key_path, apply_medium_rule, apply_owner_declines, apply_owner_rule,
+    deliverable_problems, drop_declined, init_run, main, pending_amendments, record_cited_inputs, render_report,
+    report_acceptance_findings, report_claim_findings, require_judged, route_gate, run_v2, sign, signed_hash,
+    spec_signed_once, stage_inputs, write_declared,
 )
 from sm_selftest_auto1a import _self_test_auto1a
 from sm_selftest_common import SM_GLOBALS, _t_owner_disposes
@@ -150,7 +150,7 @@ def _self_test() -> int:
                                      "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)],
                                                "uncertainty_draws_low:draws": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
         status = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        hist = [h["to"] for h in load_state(d).history if "to" in h]
+        hist = [h["to"] for h in _SM.load_state(d).history if "to" in h]
         ok(status == "completed", f"T10 toy run completes: {status} via {hist}")
         ok(hist[:8] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
            and "FIX_LOOP" in hist
@@ -168,17 +168,17 @@ def _self_test() -> int:
            "T13 the ledger closes the finding; report and deliverable are rendered by the harness")
         ok(json.load(open(os.path.join(d, "engine_choice.json")))["engine"]["ref"].endswith("ToyEngine")
            and AB.engine_choice_ref(d).endswith("ToyEngine") and "candidates" in json.load(open(os.path.join(d, AB.ENGINE_CHOICE)))
-           and load_state(d).engine.endswith("ToyEngine"), "T14 the engine choice is automatic and recorded")
+           and _SM.load_state(d).engine.endswith("ToyEngine"), "T14 the engine choice is automatic and recorded")
         ok(json.load(open(os.path.join(d, "metadata.json")))["status"] == "completed", "T15 metadata.json carries the status")
 
         # T16: resume after every state. Stop after k steps, rebuild the machine from disk, finish.
         d0, T0, st0 = new_run("ref", {"critics": {1: {"critique-domain": [blocker]}},
                                       "fixes": {"D-001": [("analysis_settings.yaml", "uncertainty.draws", 32)]}})
         ref_status = _SpikeMachine(d0, T0, st0, log=lambda *a: None, cross_engine_check=False).run()
-        ref_path = [h["to"] for h in load_state(d0).history if "to" in h]
+        ref_path = [h["to"] for h in _SM.load_state(d0).history if "to" in h]
 
         def _final_why(d_):     # the reason a run reached FINAL (a step's error carries its log tail): CI flakes of
-            return [h.get("why") for h in load_state(d_).history if h.get("to") == "FINAL"][-1:]   # T16 named none
+            return [h.get("why") for h in _SM.load_state(d_).history if h.get("to") == "FINAL"][-1:]   # T16 named none
         ref_why = _final_why(d0) if ref_status != "completed" else []
         bad = []
         for k in range(1, len(ref_path)):
@@ -190,7 +190,7 @@ def _self_test() -> int:
             del m
             m2 = _SpikeMachine(dk, StubTasks(Tk.s), None, log=lambda *a: None, cross_engine_check=False)   # from run_state.json
             s2 = m2.run()
-            p2 = [h["to"] for h in load_state(dk).history if "to" in h]
+            p2 = [h["to"] for h in _SM.load_state(dk).history if "to" in h]
             if s2 != ref_status or p2 != ref_path:
                 bad.append((k, s2, p2, _final_why(dk)))
             shutil.rmtree(dk)
@@ -201,8 +201,8 @@ def _self_test() -> int:
         d, T, st = new_run("owner", {}, signoff="owner")
         m = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False)
         s = m.run()
-        ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
-        pz = [(h.get("paused"), h.get("state")) for h in load_state(d).history if "paused" in h]
+        ok(s == "paused:awaiting_signoff" and _SM.load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
+        pz = [(h.get("paused"), h.get("state")) for h in _SM.load_state(d).history if "paused" in h]
         ok(pz == [("awaiting_signoff", "SIGN")], f"RR1 a SIGN pause writes one history entry ({pz})")
         from toolkit.spec import review_conditions as _RC
         _rows = _RC.parse(_RC.read_bytes(d))
@@ -265,9 +265,9 @@ def _self_test() -> int:
         # T20: a structural mismatch is a back-edge to ENGINE_CHOICE, then the run continues.
         d, T, st = new_run("rethink", {"structural": {1: "critique-domain"}})
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        p = [h["to"] for h in load_state(d).history if "to" in h]
+        p = [h["to"] for h in _SM.load_state(d).history if "to" in h]
         i = p.index("GATE")
-        ok(p[i + 1] == "ENGINE_CHOICE" and s == "completed" and load_state(d).round == 2,
+        ok(p[i + 1] == "ENGINE_CHOICE" and s == "completed" and _SM.load_state(d).round == 2,
            f"T20 RETHINK_STRUCTURAL goes back to ENGINE_CHOICE and the next critique is round 2 ({s})")
 
         # T21: an open blocker at the last round: DECLARE_SCOPE when declarable.
@@ -282,7 +282,7 @@ def _self_test() -> int:
         # T22: the budget, not the gate, ends the run: the harness writes the report.
         d, T, st = new_run("budget", {"critics": {1: {"critique-domain": [nofix]}}, "usd": 30.0}, budget=100.0)
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        p = [h["to"] for h in load_state(d).history if "to" in h]
+        p = [h["to"] for h in _SM.load_state(d).history if "to" in h]
         ok(s == "budget_exhausted" and "WRITE" in p and os.path.exists(os.path.join(d, "report.md")),
            f"T22 with the budget used the run ends budget_exhausted with a report ({s}, {p[-4:]})")
 
@@ -295,29 +295,29 @@ def _self_test() -> int:
             ok(False, "T25 the stub crash propagates")
         except RuntimeError:
             pass
-        spent_at_crash = load_state(d).spent_usd
+        spent_at_crash = _SM.load_state(d).spent_usd
         T2 = StubTasks(dict(T.s, crash={}))
         s = _SpikeMachine(d, T2, None, log=lambda *a: None, cross_engine_check=False).run()
-        j = load_state(d).journal
+        j = _SM.load_state(d).journal
         dom = [k for k in j if k.endswith(":r1:critique-domain")]
         red = [k for k in j if k.endswith(":r1:critique-redteam")]
         ok(s == "completed" and "critique:critique-domain:1" not in T2.calls and T2.calls.count("critique:critique-redteam:1") == 1
            and dom and j[dom[0]]["status"] == "completed" and red and j[red[0]].get("interrupted_charged") == 1,
            f"T25 resume skips the completed critique and re-runs the interrupted one ({s}, {T2.calls[:3]})")
-        ok(abs(load_state(d).spent_usd - spent_at_crash - 3.0 - 1.0 * len(T2.calls)) < 1e-9,
+        ok(abs(_SM.load_state(d).spent_usd - spent_at_crash - 3.0 - 1.0 * len(T2.calls)) < 1e-9,
            f"T26 the interrupted task is charged its allowance ($3) once; completed ones are not charged again "
-           f"({spent_at_crash} -> {load_state(d).spent_usd}, {len(T2.calls)} new calls)")
+           f"({spent_at_crash} -> {_SM.load_state(d).spent_usd}, {len(T2.calls)} new calls)")
 
         # T27: each paid task gets an allowance from what is left (less the write-up reserve), set before
         # the call; the second critic of a pair is not called when the first used the budget.
         d, T, st = new_run("allow", {"usd": 9.0}, budget=30.0)
         st.task_cap_usd = 9.0
-        save_state(d, st)
+        _SM.save_state(d, st)
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         ok(T.allowances == [9.0, 9.0, 2.0, 3.0] and "critique:critique-redteam:1" not in T.calls
            and s == "budget_exhausted",
            f"T27 allowances follow the budget and the pair stops when it is used ({T.allowances}, {s})")
-        jj = load_state(d).journal
+        jj = _SM.load_state(d).journal
         ok(all("allowance_usd" in e for k, e in jj.items() if not k.endswith("spec_sha256")),
            "T28 every journal entry records the allowance it was given")
 
@@ -351,7 +351,7 @@ def _self_test() -> int:
            and "D-040" in json.dumps(rq.get("findings")) and "redraft the envelope" in json.dumps(rq.get("briefs"))
            and rq.get("signed_spec_sha256") == hashlib.sha256(signed_bytes).hexdigest(),
            f"R3-2 a rethink of a signed spec writes the request and pauses; nothing is redrafted ({s}, {T2.calls[-3:]})")
-        pz = [(h.get("paused"), h.get("state")) for h in load_state(d).history if "paused" in h]
+        pz = [(h.get("paused"), h.get("state")) for h in _SM.load_state(d).history if "paused" in h]
         ok(pz[-1:] == [("awaiting_spec_amendment", "SPEC")], f"RR2 an amendment pause writes a history entry ({pz})")
         T3 = StubTasks(T.s)
         s2 = _SpikeMachine(d, T3, None, log=lambda *a: None, cross_engine_check=False).run()
@@ -367,9 +367,9 @@ def _self_test() -> int:
         ok(s3 == "paused:awaiting_spec_amendment" and "draft_spec" not in T4.calls
            and json.load(open(os.path.join(d, "spec_rethink_request.json")))["requested_at"] == rq0["requested_at"],
            f"R3-2c a resumed amendment pause is honoured without the sign-off record and keeps its request ({s3})")
-        st5 = load_state(d)
+        st5 = _SM.load_state(d)
         st5.budget_usd, st5.spent_usd = 20.0, 20.0
-        save_state(d, st5)
+        _SM.save_state(d, st5)
         s5 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
         ok(s5 == "paused:awaiting_spec_amendment", f"R3-2d with no budget left the amendment pause still holds ({s5})")
         # R3-2e (narrow re-review of #261): an unreadable sign-off record still protects the spec; a persisted pause is
@@ -377,14 +377,14 @@ def _self_test() -> int:
         d6 = os.path.join(td, "r32e")
         os.makedirs(d6)
         open(os.path.join(d6, SIGNOFF_FILE), "w").write('{"by": "own')
-        st6 = load_state(d)
+        st6 = _SM.load_state(d)
         st6.tries.pop("spec_amendment", None)
         st6.paused = AWAITING_SPEC_AMENDMENT
-        save_state(d, st6)
+        _SM.save_state(d, st6)
         T6 = StubTasks(T.s)
         m6 = _SpikeMachine(d, T6, None, log=lambda *a: None, cross_engine_check=False)
         m6.step()
-        ok(spec_signed_once(d6) and "draft_spec" not in T6.calls and load_state(d).paused == AWAITING_SPEC_AMENDMENT,
+        ok(spec_signed_once(d6) and "draft_spec" not in T6.calls and _SM.load_state(d).paused == AWAITING_SPEC_AMENDMENT,
            "R3-2e a truncated sign-off record still protects the spec; a persisted amendment pause is honoured")
         # R3-2f (lead follow-up): the pause says when the signing evidence is missing or unreadable (a warning, no block)
         rq6 = json.load(open(os.path.join(d, "spec_rethink_request.json")))
@@ -396,7 +396,7 @@ def _self_test() -> int:
         wup = {"id": "R-030", "severity": "HIGH", "target_stage": "WRITE", "claim": "the report overstates the effect"}
         d, T, st = new_run("writeup", {"critics": {1: {"critique-redteam": [wup]}}}, max_rounds=2)
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        p = [h["to"] for h in load_state(d).history if "to" in h]
+        p = [h["to"] for h in _SM.load_state(d).history if "to" in h]
         got = getattr(T, "write_findings", None) or []
         ok("FIX_LOOP" in p and not any(c.startswith("fix:") for c in T.calls)
            and any(f.get("id") == "R-030" for f in got),
@@ -433,12 +433,12 @@ def _self_test() -> int:
                                                                     "brief": "redraft the comparator"}]
                                                          if pk["findings"] else {"tasks": []}}}, max_rounds=3)
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        p = [h["to"] for h in load_state(d).history if "to" in h]
+        p = [h["to"] for h in _SM.load_state(d).history if "to" in h]
         try:
             req = json.load(open(os.path.join(d, "scope_signoff_request.json")))
         except (OSError, ValueError):
             req = {}
-        ok(s == "paused:awaiting_scope_signoff" and load_state(d).state == "OWNER_DECISION"
+        ok(s == "paused:awaiting_scope_signoff" and _SM.load_state(d).state == "OWNER_DECISION"
            and "SPEC" not in p and not any(c.startswith("fix:") for c in T.calls)
            and req.get("pending") and [i.get("finding") for i in req.get("items") or []] == ["D-031"],
            f"R3-3 an owner-amendment finding pauses at OWNER_DECISION with a request, no redraft ({s}, {p[-4:]})")
@@ -465,7 +465,7 @@ def _self_test() -> int:
                f"R3-3c an answer that is not the owner's does not release OWNER_DECISION ({s_l})")
             _SS.sign(d, "owner", all_decision="decline", note="R3-3")
             s2 = _SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run()
-            p2 = [h["to"] for h in load_state(d).history if "to" in h]
+            p2 = [h["to"] for h in _SM.load_state(d).history if "to" in h]
             ok(s2 == "completed_scope_declined" and "SPEC" not in p2 and FL.load(d)["D-031"].status == "owner_declined"
                and "`completed_scope_declined`" in open(os.path.join(d, "report.md")).read(),
                f"R3-3b the owner's decline resumes the run, is not redrafted, and constrains the gate: the run is not "
@@ -499,7 +499,7 @@ def _self_test() -> int:
             import scope_signoff as _SS
             _SS.sign(dq, "owner", all_decision="accept", note="W0-F")
             sq2 = _SpikeMachine(dq, StubTasks(Tq.s), None, log=lambda *a: None, cross_engine_check=False).run()
-            nq = sum(1 for h in load_state(dq).history if h.get("to") == "OWNER_DECISION")
+            nq = sum(1 for h in _SM.load_state(dq).history if h.get("to") == "OWNER_DECISION")
             ok(sq2 in ACCEPTED_STATUSES and nq == 1
                and "Held-out calibration targets" in open(os.path.join(dq, "report.md")).read(),
                f"T_CONFLICT_PLAN_CHANGE_PAUSES_ONCE the owner's accept resumes the run, which is not paused again, and "
@@ -560,17 +560,17 @@ def _self_test() -> int:
            "R3-7b a finding the owner declined is no longer listed as declared")
         d, T, st = new_run("noreq", {})
         st.state = "OWNER_DECISION"
-        save_state(d, st)
+        _SM.save_state(d, st)
         _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False).step()   # the handler itself
-        s7 = load_state(d).status
-        ok(s7 == "run_failed" and "relaunch with reuse" in str(load_state(d).history[-1].get("why")),
+        s7 = _SM.load_state(d).status
+        ok(s7 == "run_failed" and "relaunch with reuse" in str(_SM.load_state(d).history[-1].get("why")),
            f"R3-7c a pause at OWNER_DECISION with no recorded request fails with how to go on ({s7})")
         # R3-7e (narrow Codex review of #272): a resume whose preconditions fail ends the run run_failed before any
         # handler runs; an earlier report.md is not left deliverable under that status; malformed signing evidence is
         # "unreadable", never a crash or "present"
         d, T, st = new_run("noreq_resume", {})
         st.state = "OWNER_DECISION"
-        save_state(d, st)
+        _SM.save_state(d, st)
         open(os.path.join(d, "report.md"), "w").write("# Report\n\nStatus: completed\n")
         s7e = _SpikeMachine(d, T, None, log=lambda *a: None, cross_engine_check=False).run()
         ok(s7e == "run_failed" and not os.path.exists(os.path.join(d, "report.md"))
@@ -589,7 +589,7 @@ def _self_test() -> int:
         amend5 = dict(amend, id="D-035", category="STRUCTURAL")
         d, T, st = new_run("amend5", {"critics": {1: {"critique-domain": [amend5]}}, "structural": {1: "critique-domain"}})
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        p = [h["to"] for h in load_state(d).history if "to" in h]
+        p = [h["to"] for h in _SM.load_state(d).history if "to" in h]
         ok(s == "paused:awaiting_scope_signoff" and "SPEC" not in p and p[-1] == "OWNER_DECISION",
            f"R3-5 a structural blocker that needs an owner amendment goes to the owner, not to SPEC ({s}, {p[-3:]})")
 
@@ -610,7 +610,7 @@ def _self_test() -> int:
         _t_owner_disposes(d)        # W0-G (from v2): the owner disposes the spec critique's conditions before signing
         sign(d, "owner", "ok")
         s_o = mk(d, StubTasks(T.s), None).run()
-        st_o = load_state(d)
+        st_o = _SM.load_state(d)
         req_o = json.load(open(os.path.join(d, OWNER_REQUEST))) if os.path.exists(os.path.join(d, OWNER_REQUEST)) else {}
         fps_o = [i.get("fingerprint") for i in req_o.get("items") or []]
         ok(s_o == "paused:awaiting_scope_signoff" and st_o.state == "OWNER_DECISION" and req_o.get("pending")
@@ -641,7 +641,7 @@ def _self_test() -> int:
         prov = _SS.provisional(d)
         rep_l = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
         span = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep_l else [0, 0]
-        ok(s_l == "completed_scope_declared" and not any(h.get("paused") for h in load_state(d).history)
+        ok(s_l == "completed_scope_declared" and not any(h.get("paused") for h in _SM.load_state(d).history)
            and [(r["finding"], r["decision"], r["plan_changing"], r["review"]) for r in prov]
            == [("decision_test_changes_plan:DT9", "accept", True, None)]
            and "Provisional decisions that change the plan" in rep_l[:span[0]]
@@ -692,10 +692,10 @@ def _self_test() -> int:
         # (resumable), and a resume with a higher cap continues.
         d, T, st = new_run("floor", {}, budget=20.0)
         st.spent_usd = 20.0 - 10.0 - 0.13            # cap less the write-up reserve ($10) leaves $0.13
-        save_state(d, st)
+        _SM.save_state(d, st)
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
-        ok(s == "paused:awaiting_budget" and T.calls == [] and load_state(d).state == "SPEC"
-           and load_state(d).status is None,
+        ok(s == "paused:awaiting_budget" and T.calls == [] and _SM.load_state(d).state == "SPEC"
+           and _SM.load_state(d).status is None,
            f"R3-4 a $0.13 allowance starts no task; the run pauses awaiting budget ({s}, {T.calls}, {T.allowances})")
         T2 = StubTasks(T.s)
         mp4 = os.path.join(d, "metadata.json")
@@ -703,7 +703,7 @@ def _self_test() -> int:
                   open(mp4, "w"))
         s2 = run_v2("toy question", d, T2, signoff="none", budget_usd=60.0, log=lambda *a: None,
                     backend=spike, cross_engine_check=False)
-        m4, h4 = json.load(open(mp4)), load_state(d).history
+        m4, h4 = json.load(open(mp4)), _SM.load_state(d).history
         ok(m4["invocations"][-1].get("budget_usd") == 60.0 and m4["invocations"][-1].get("cap_usd") == 60.0
            and "budget_usd" not in m4["invocations"][0] and set(m4.get("models") or {}) == {"deep", "fast"}
            and m4.get("sdk_version") and m4["invocations"][-1].get("models") == m4["models"]
@@ -733,19 +733,19 @@ def _self_test() -> int:
             prs.append(json.load(open(os.path.join(td, f"rr6_child{k6}", "metadata.json"))).get("parent_run") or {})
         ok(prs[0].get("run_state_sha256") is None and prs[0].get("error") and prs[1].get("run_dir") == os.path.basename(d),
            f"RR6 an unreadable parent records no hash (never linked); a relative parent path records its dir name ({prs})")
-        st7 = load_state(d)
+        st7 = _SM.load_state(d)
         if st7.state == "FINAL":
             st7.paused = "awaiting_scope_signoff"            # a stale flag a terminal run can carry
-            save_state(d, st7)
-            n7 = len(load_state(d).history)
+            _SM.save_state(d, st7)
+            n7 = len(_SM.load_state(d).history)
             _SpikeMachine(d, StubTasks(T.s), st7, log=lambda *a: None, cross_engine_check=False).run()
-            ok(len(load_state(d).history) == n7, "RR7 a FINAL run carrying a stale paused flag writes no pause entry")
+            ok(len(_SM.load_state(d).history) == n7, "RR7 a FINAL run carrying a stale paused flag writes no pause entry")
         else:
             ok(False, f"RR7 fixture: the resumed run should be FINAL ({st7.state})")
         ok(not s2.startswith("paused") and "draft_spec" in T2.calls
-           and load_state(d).budget_usd == 60.0
-           and any(h.get("budget_raised") for h in load_state(d).history),
-           f"R3-4b resumed with a higher cap, the run continues ({s2}, cap {load_state(d).budget_usd})")
+           and _SM.load_state(d).budget_usd == 60.0
+           and any(h.get("budget_raised") for h in _SM.load_state(d).history),
+           f"R3-4b resumed with a higher cap, the run continues ({s2}, cap {_SM.load_state(d).budget_usd})")
 
         # R3-8 (fix 4 of Codex round 3 on #258): the decline override reads the ledger synced with this gate's decision,
         # so a gate-supplied finding the owner declined, and that this gate states with a revised claim, is not held by
@@ -753,7 +753,7 @@ def _self_test() -> int:
         import scope_signoff as _SS8
         d, T, st = new_run("stale_decline", {})
         st.state = "GATE"
-        save_state(d, st)
+        _SM.save_state(d, st)
         v8 = {"kind": "k_demo", "key": "x", "severity": "HIGH", "stage": "ANALYZE", "scope_declarable": True,
               "claim": "the new claim", "fix_requires": "use the new data"}
         fid8 = FL.gate_id(v8)
@@ -912,14 +912,14 @@ def _self_test() -> int:
         T2 = StubTasks(dict(T.s, crash={}))
         m2 = _SpikeMachine(d, T2, None, log=lambda *a: None, cross_engine_check=False)
         s = m2.run()
-        j = load_state(d).journal
+        j = _SM.load_state(d).journal
         spec_keys = sorted(k for k in j if k.startswith("SPEC#"))
         ok(s == "completed" and spec_keys == ["SPEC#0:try1"] and j["SPEC#0:try1"].get("interrupted_charged") == 1
            and j["SPEC#0:try1"]["status"] == "completed",
            f"T33 an interrupted spec draft is charged once and re-run under its own key {spec_keys}")
         d, T, st = new_run("orphan", {}, budget=100.0)
         st.journal["X#0:orphan"] = {"task": "critique", "status": "started", "allowance_usd": 2.5}
-        save_state(d, st)
+        _SM.save_state(d, st)
         m3 = _SpikeMachine(d, StubTasks({}), None, log=lambda *a: None)
         ok(abs(m3.st.spent_usd - 2.5) < 1e-9 and m3.st.journal["X#0:orphan"]["status"] == "interrupted"
            and abs(_SpikeMachine(d, StubTasks({}), None, log=lambda *a: None).st.spent_usd - 2.5) < 1e-9,
@@ -984,13 +984,13 @@ def _self_test() -> int:
             exp36 = "completed_scope_declared"
             ok(want and s == exp36 and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
                and FL.load(d)["D-001"].status == "fixed" and prov36 == want
-               and not any(h.get("paused") for h in load_state(d).history)
+               and not any(h.get("paused") for h in _SM.load_state(d).history)
                and all(w in rep36[:sp36[0]] for w in want),
                f"T36 the default backend (workstream B) runs the machine end to end with engine: auto; each decision "
                f"test that changes the plan is answered provisionally and flagged above the draft ({s}, {want}, {prov36}"
                + ("" if s == exp36 else   # why it ended: CI showed only the status (flaky once on #156 and #160)
-                  f"; path {[h.get('to') for h in load_state(d).history if 'to' in h]}; "
-                  f"final {[h.get('why') for h in load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
+                  f"; path {[h.get('to') for h in _SM.load_state(d).history if 'to' in h]}; "
+                  f"final {[h.get('why') for h in _SM.load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
         else:
             ok(True, "T36 skipped: workstream B's analysis engine is not on this branch")
 
@@ -1401,7 +1401,7 @@ def _self_test() -> int:
         p = os.path.join(td, "ref", STATE_FILE)
         json.dump(dict(json.load(open(p)), state="LEAD_PROMPT"), open(p, "w"))
         try:
-            load_state(os.path.join(td, "ref"))
+            _SM.load_state(os.path.join(td, "ref"))
             ok(False, "T24 an unknown persisted state fails closed")
         except ValueError:
             ok(True, "T24 an unknown persisted state fails closed")
@@ -1460,7 +1460,7 @@ def _self_test() -> int:
         open(os.path.join(o73, "v"), "w").write("untouched")
         os.symlink(os.path.join(o73, "v"), os.path.join(d73, STATE_FILE + ".tmp"))
         os.symlink(os.path.join(o73, "v"), os.path.join(d73, "rec.json.tmp"))
-        for fn in (lambda: save_state(d73, RunState(question="q", state="SPEC")), lambda: _write_json(d73, "rec.json", {})):
+        for fn in (lambda: _SM.save_state(d73, RunState(question="q", state="SPEC")), lambda: _SM._write_json(d73, "rec.json", {})):
             try:
                 fn()
             except (ValueError, OSError):

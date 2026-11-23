@@ -10,8 +10,7 @@ import analysis_backend as AB
 import findings_ledger as FL
 import _stage_machine_under_test as _SM
 from _stage_machine_under_test import (
-    CRITICS, MAX_SPEC_TRIES, Machine, READBACK_CAP_USD, _put, load_state, render_report, report_claim_findings,
-    save_state,
+    CRITICS, MAX_SPEC_TRIES, Machine, READBACK_CAP_USD, _put, render_report, report_claim_findings,
 )
 
 
@@ -34,16 +33,16 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
     def budget():
         d, T, st = new_run("a1_pres", {}, budget=20.0)
         st.state, st.spent_usd = "PRESENTATION", 16.5        # past cap less reserve, $3.50 of the reserve left
-        save_state(d, st)
+        _SM.save_state(d, st)
         mk(d, T, st).step()
-        s = load_state(d)
+        s = _SM.load_state(d)
         ok(s.state == "GATE" and s.forced_status is None and T.calls == ["critique:critique-presentation:1"],
            f"T_PRES_BUDGET the presentation review runs on the write-up reserve ({s.state}, {s.forced_status}, {T.calls})")
         d, T, st = new_run("a1_pres_out", {}, budget=20.0)
         st.state, st.spent_usd = "PRESENTATION", 20.0
-        save_state(d, st)
+        _SM.save_state(d, st)
         mk(d, T, st).step()
-        s = load_state(d)
+        s = _SM.load_state(d)
         ok(s.state == "FINAL" and s.status == "budget_exhausted" and T.calls == [],
            f"T_PRES_BUDGET2 with the whole cap spent the run still ends budget_exhausted ({s.state}, {s.status})")
 
@@ -53,7 +52,7 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
                 super().set_allowance(usd)
         d, T, st = new_run("a1_rb", {}, budget=20.0)
         st.spent_usd = 16.5
-        save_state(d, st)
+        _SM.save_state(d, st)
         T = RBT(T.s)
         m = mk(d, T, st)
         m._task("k1", "sign_spec", d, writeup=True)
@@ -115,7 +114,7 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         d, T, st = new_run("a1_rspec", {"critics": {1: {"critique-domain": [sb]}}, "structural": {1: "critique-domain"}},
                            max_rounds=2)
         st.tries["spec"] = MAX_SPEC_TRIES - 1
-        save_state(d, st)
+        _SM.save_state(d, st)
         T = ST(T.s)
         s = mk(d, T, st).run()
         fbs = T.fbs
@@ -168,9 +167,9 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         d, T, st = new_run("a1_cx3", {}, budget=20.0)
         st.state, st.spent_usd = "PRESENTATION", 20.0
         st.journal["PRESENTATION#0:r1"] = {"task": "critique", "status": "completed", "ok": True}
-        save_state(d, st)
+        _SM.save_state(d, st)
         mk(d, T, st).step()
-        s = load_state(d)
+        s = _SM.load_state(d)
         ok(s.state == "GATE" and s.forced_status is None and T.calls == [],
            f"CX1-3 a completed presentation review is replayed on resume with the cap spent ({s.state}, {s.status})")
 
@@ -179,13 +178,13 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         st.spent_usd = 16.5
         st.journal["k1"] = {"task": "sign_spec", "status": "started", "allowance_usd": 3.0, "readback_usd": 0.25,
                             "writeup": True}
-        save_state(d, st)
+        _SM.save_state(d, st)
         m = mk(d, T, st)
         ok(abs(m.st.spent_usd - 19.75) < 1e-9, f"CX1-4 an interrupted write-up task is charged its read-back too "
                                                 f"({m.st.spent_usd})")
         d, T, st = new_run("a1_cx4b", {}, budget=20.0)
         st.spent_usd = 16.5
-        save_state(d, st)
+        _SM.save_state(d, st)
         m = mk(d, T, st)
         m._task("k1", "sign_spec", d, writeup=True)
         ok(m.st.journal["k1"].get("readback_usd") == READBACK_CAP_USD,
@@ -206,11 +205,11 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
         # CX1-7: a fix plan file that is not a plan does not stop a back-edge; a gate's own back-edge reads none.
         d, T, st = new_run("a1_cx7", {})
         st.state = "GATE"
-        save_state(d, st)
+        _SM.save_state(d, st)
         open(os.path.join(d, "fix_plan_r1.json"), "w").write('{"plan": ["stale"]}')
         m = mk(d, T, st)
         m._rethink("ENGINE_CHOICE", "test", planned=True)
-        ok(load_state(d).state == "ENGINE_CHOICE", "CX1-7 a malformed fix plan does not stop a RETHINK back-edge")
+        ok(_SM.load_state(d).state == "ENGINE_CHOICE", "CX1-7 a malformed fix plan does not stop a RETHINK back-edge")
 
     def r1_claims():
         d = os.path.join(td, "a1_cx2")
@@ -242,14 +241,14 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
                  "M-9: needs ages")):       # round 3 (5): the blocker's own text, whatever the ledger holds
             d, T, st = new_run("a1_" + name[:5].replace("-", ""), {})
             st.state = "GATE"
-            save_state(d, st)
+            _SM.save_state(d, st)
             setup(d)
             try:
                 mk(d, T, st)._rethink("ENGINE_CHOICE", "test")
             except Exception as e:  # noqa: BLE001
                 ok(False, f"{name}: {type(e).__name__}: {e}")
                 continue
-            s = load_state(d)
+            s = _SM.load_state(d)
             why = (s.tries.get("rethink_engine") or {}).get("why") or []
             ok(s.state == "ENGINE_CHOICE" and (want is None or any(want in w for w in why)), f"{name} ({why})")
 
@@ -290,9 +289,9 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
             st.state, st.spent_usd = "PRESENTATION", 20.0 if journal else 16.5
             if journal:
                 st.journal["PRESENTATION#0:r1"] = journal
-            save_state(d, st)
+            _SM.save_state(d, st)
             mk(d, NoReview(T.s), st).step()
-            states.append(load_state(d).state)
+            states.append(_SM.load_state(d).state)
         open(os.path.join(d, "manuscript.md"), "w").write("# Report\n")
         for r in CRITICS:
             StubTasks({}).critique(d, r, 1)

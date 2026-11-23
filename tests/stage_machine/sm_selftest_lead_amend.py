@@ -10,10 +10,10 @@ import json
 import os
 import analysis_backend as AB
 import findings_ledger as FL
+import _stage_machine_under_test as _SM
 from _stage_machine_under_test import (
     AMENDED_PROVISIONAL, AMENDMENT_RECORD, AMEND_LOCK, AmendmentLocked, Machine, RunState, SPEC_RETHINK_REQUEST,
-    STATE_FILE, _amend_lock, _write_json, amendment_lines, handoff_chain, handoff_child, harness_owned, load_state,
-    run_v2, save_state,
+    STATE_FILE, _amend_lock, amendment_lines, handoff_chain, handoff_child, harness_owned, run_v2,
 )
 from sm_selftest_lead_amend_r3 import _self_test_lead_amend_r3
 
@@ -28,7 +28,7 @@ def _self_test_lead_amend(ok, td: str) -> None:
     def parent(name, mode, patch, spent=3.0):
         d = os.path.join(os.path.realpath(td), name)
         os.makedirs(d)
-        _write_json(d, "metadata.json", {"pipeline": "v2", "commit": "0" * 40, "launcher": "t"})
+        _SM._write_json(d, "metadata.json", {"pipeline": "v2", "commit": "0" * 40, "launcher": "t"})
         raw = yaml.safe_load(open(schema.toy_spec(d)))      # the toy's critique findings declared, as in amend's tests
         raw["principle_departures"] = [{"principle": 2, "check": "headline_comparator", "reason": "toy"},
                                        {"principle": 3, "check": "baseline_burden", "reason": "toy"}]
@@ -38,10 +38,10 @@ def _self_test_lead_amend(ok, td: str) -> None:
         SO.sign(d, mode)
         open(os.path.join(d, FL.LEDGER), "w").write("")
         task = {"id": "T1", "findings": [], "action": "rethink", "owner_state": "SPEC", "brief": "raise the envelope"}
-        _write_json(d, "fix_plan_r2.json", {"round": 2, "plan": {"tasks": [dict(task, **({"patch": patch} if patch
+        _SM._write_json(d, "fix_plan_r2.json", {"round": 2, "plan": {"tasks": [dict(task, **({"patch": patch} if patch
                                                                                      else {}))]}})
         st = RunState(question="q", state="SPEC", round=2, max_rounds=3, signoff=mode, budget_usd=5.0, spent_usd=spent)
-        save_state(d, st)
+        _SM.save_state(d, st)
         return d, open(os.path.join(d, AB.SPEC_FILE), "rb").read()
 
     good = {"id": "A1", "reason": "the envelope is the decision year's", "spec": [
@@ -49,9 +49,9 @@ def _self_test_lead_amend(ok, td: str) -> None:
     d, spec0 = parent("lead_amend", "lead", good)
     m = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
     m.step()
-    st, child = load_state(d), handoff_child(d)
+    st, child = _SM.load_state(d), handoff_child(d)
     rq = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
-    cst = load_state(child) if child else None
+    cst = _SM.load_state(child) if child else None
     ok(st.state == "FINAL" and st.status == AMENDED_PROVISIONAL and child == d + ".amend1" and rq.get("patch") == good
        and (rq.get("lead_amendment") or {}).get("status") == "signed_provisionally"
        and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == spec0 and not any(h.get("paused") for h in st.history),
@@ -75,7 +75,7 @@ def _self_test_lead_amend(ok, td: str) -> None:
        f"T_LEAD_AMEND_REPORT the child's report heads with the amendment, as provisional ({al[:1]})")
     if child:            # run_v2 continues in the child (stopped here at FINAL to keep the test small)
         cst.state, cst.status = "FINAL", "completed"
-        save_state(child, cst)
+        _SM.save_state(child, cst)
         seen = []
         s = run_v2("q", d, StubTasks({}), signoff="lead", log=seen.append, cross_engine_check=False)
         inv = json.load(open(os.path.join(child, "metadata.json"))).get("invocations") or []
@@ -127,7 +127,7 @@ def _self_test_lead_amend(ok, td: str) -> None:
     except KeyboardInterrupt:
         pass
     Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).step()
-    sti = load_state(d)
+    sti = _SM.load_state(d)
     ok(sti.status == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1" and not os.path.lexists(d + ".amend2"),
        f"T_LEAD_AMEND_RESUME an interrupted handoff is finished with the same child ({sti.status})")
     # Codex r1: a restored copy (parent and child moved together) resumes its own child; a lost record keeps the flag
@@ -143,8 +143,8 @@ def _self_test_lead_amend(ok, td: str) -> None:
     json.dump(dict(meta_m, parent_run=dict(meta_m["parent_run"], run_state_sha256="0" * 64)), open(mc, "w"))
     cyc = os.path.join(mv, "cyc")
     os.makedirs(cyc)
-    save_state(cyc, RunState(question="q", state="FINAL", status=AMENDED_PROVISIONAL, history=[{"amended_to": cyc}]))
-    _write_json(cyc, "metadata.json", {"parent_run": {"run_dir": cyc}})
+    _SM.save_state(cyc, RunState(question="q", state="FINAL", status=AMENDED_PROVISIONAL, history=[{"amended_to": cyc}]))
+    _SM._write_json(cyc, "metadata.json", {"parent_run": {"run_dir": cyc}})
     ok(handoff_child(os.path.join(mv, "lead_interrupt")) is None and handoff_child(cyc) is None
        and handoff_chain(cyc, kept=True) == [],
        "T_LEAD_AMEND_STRICT a sibling bound to another parent state, or the run itself, is never resumed (Codex r2)")
@@ -158,7 +158,7 @@ def _self_test_lead_amend(ok, td: str) -> None:
        f"amendment; no deliverable may overwrite the record ({al2[:1]})")
     # Owner decision (#330 review): a legacy decision-brief signature never satisfies the lead's check in v2
     d, spec0 = parent("lead_brief", "lead", good)
-    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    _SM._write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
     s = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
     la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
     ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and "decision brief" in la.get("why", "")
@@ -187,7 +187,7 @@ def _self_test_lead_amend(ok, td: str) -> None:
     rq1 = open(os.path.join(d, SPEC_RETHINK_REQUEST), "rb").read() if os.path.exists(
         os.path.join(d, SPEC_RETHINK_REQUEST)) else None
     ok(err and "another process" in err and not os.path.lexists(d + ".amend1") and rq1 == rq0
-       and load_state(d).status is None,
+       and _SM.load_state(d).status is None,
        f"T_LEAD_AMEND_LOCKED a second resumer fails clearly while the lock is held and amends nothing ({err}; "
        f"{rq0 is None})")
     d, _ = parent("lead_race", "lead", good)
@@ -214,7 +214,7 @@ def _self_test_lead_amend(ok, td: str) -> None:
     finally:
         AM.amend = real_amend
     ok(sorted(g[:6] for g in got) == ["locked", "ok"] and handoff_child(d) == d + ".amend1"
-       and not os.path.lexists(d + ".amend2") and load_state(d).status == AMENDED_PROVISIONAL,
+       and not os.path.lexists(d + ".amend2") and _SM.load_state(d).status == AMENDED_PROVISIONAL,
        f"T_LEAD_AMEND_RACE two racing resumers: one amends and hands off, the other fails clearly ({got})")
     # Codex r3: run_v2 holds the lock from before it reads the state to the hand-off, so a second process resuming a
     # handed-off parent fails before writing to the parent or its child
@@ -242,7 +242,7 @@ def _self_test_lead_amend(ok, td: str) -> None:
         mi.step()
     except KeyboardInterrupt:
         pass
-    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    _SM._write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
     s = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
     la = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment") or {}
     ok(s == "paused:awaiting_spec_amendment" and la.get("status") == "refused" and "decision brief" in la.get("why", "")

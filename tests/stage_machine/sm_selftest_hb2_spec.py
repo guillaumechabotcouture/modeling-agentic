@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import os
 import analysis_backend as AB
-from _stage_machine_under_test import Machine, _carry_feedback, load_state, save_state
+import _stage_machine_under_test as _SM
+from _stage_machine_under_test import Machine, _carry_feedback
 
 
 def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
@@ -126,7 +127,7 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
             r = super()._task(*a, **k)
             if not getattr(self, "crashed", False):
                 self.crashed = True
-                save_state(self.run_dir, self.st)
+                _SM.save_state(self.run_dir, self.st)
                 raise Crash()
             return r
     d10, T10, st10 = new_run("hs10", {})
@@ -136,7 +137,7 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
         m.step()
     except Crash:
         pass
-    m2 = Machine(d10, T10, load_state(d10), backend=spike, log=lambda *a: None, cross_engine_check=False)
+    m2 = Machine(d10, T10, _SM.load_state(d10), backend=spike, log=lambda *a: None, cross_engine_check=False)
     m2.step()
     ok(m2.st.state == "EVIDENCE" and len(T10.fbs) == 1,
        f"HS10 a resume after the completed task replays it and still checks the draft it wrote ({m2.st.state}, "
@@ -187,7 +188,7 @@ def _self_test_hb2_spec(ok, td: str, spike, new_run) -> None:
     d17, T17, st17 = new_run("hs17", {})
     StubTasks(T17.s).draft_spec("q", d17, None)          # the earlier, valid draft
     st17.tries["spec_feedback"] = ["rethink after review round 1: the comparator answers another question"]
-    save_state(d17, st17)
+    _SM.save_state(d17, st17)
     T17 = Scripted(dict(T17.s, tries=["capped"]))
     m = Machine(d17, T17, st17, backend=spike, log=lambda *a: None, cross_engine_check=False)
     m.step()

@@ -11,7 +11,7 @@ import sys
 import time
 import analysis_backend as AB
 import _stage_machine_under_test as _SM
-from _stage_machine_under_test import RunState, analysis_failure_cause, load_state, resumable_failure, run_v2
+from _stage_machine_under_test import RunState, analysis_failure_cause, resumable_failure, run_v2
 from sm_selftest_calibration_refused import _self_test_calibration_refused
 from sm_selftest_common import _TOY_BATCH_DRIVER, _TOY_BATCH_FN
 
@@ -82,7 +82,7 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     finally:
         os.environ.pop("MA_TOY_SLOW_FROM", None)
         P_.BACKSTOP_MULTIPLE, P_.BACKSTOP_FLOOR_S = saved
-    st = load_state(d)
+    st = _SM.load_state(d)
     first = open(calls).read().split() if os.path.exists(calls) else []
     kill = next((r for r in json.load(open(os.path.join(d, P_.REPORT)))["steps"] if r["id"] == "batch"), {})
     ok(s1 == "run_failed" and st.history[-1]["from"] == "ANALYZE" and st.history[-1].get("resumable") == "timeout"
@@ -93,7 +93,7 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     # T59: --resume (run_v2 on the same run) continues at ANALYZE with the step limit as the backend gives it now,
     # and the batch computes only the rows the killed attempt had not finished.
     s2 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False)
-    st = load_state(d)
+    st = _SM.load_state(d)
     again = open(calls).read().split()[len(first):]
     back = [h for h in st.history if h.get("from") == "FINAL"]
     tmo = {s["id"]: s.get("timeout_s") for s in yaml.safe_load(open(os.path.join(d, "models", "pipeline.yaml")))["steps"]}
@@ -103,16 +103,16 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
     ok(sorted(again) == ["3", "4", "5"],
        f"T59b the resumed batch reuses the rows the killed attempt kept and computes the rest only ({again})")
     ok(run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False) == s2
-       and len([h for h in load_state(d).history if h.get("from") == "FINAL"]) == 1,
+       and len([h for h in _SM.load_state(d).history if h.get("from") == "FINAL"]) == 1,
        "T59c a finished run is not reopened")
     # T60: other run_failed causes stay terminal.
     d, T = toy_run("analyze_error")
     open(os.path.join(td, "toy_fail.py"), "w").write("import sys\nsys.exit(3)\n")
     fail = Batch(30, run=f"{sys.executable} {os.path.join(td, 'toy_fail.py')}")
     s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=fail, cross_engine_check=False)
-    n = len(load_state(d).history)
+    n = len(_SM.load_state(d).history)
     s2 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=fail, cross_engine_check=False)
-    st = load_state(d)
+    st = _SM.load_state(d)
     ok(s1 == s2 == "run_failed" and len(st.history) == n and st.history[-1]["from"] == "ANALYZE"
        and "resumable" not in st.history[-1]
        and resumable_failure(d, st) is None,
@@ -137,7 +137,7 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
             raise ValueError("MA_COMPUTE_MAX_CORE_HOURS='lots' is not a number")
     d, T = toy_run("configure_unreadable")
     s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Unreadable(30), cross_engine_check=False)
-    st = load_state(d)
+    st = _SM.load_state(d)
     ok(s1 == "run_failed" and st.history[-1]["from"] == "CONFIGURE" and "MA_COMPUTE_MAX_CORE_HOURS" in st.history[-1]["why"],
        f"T60d an unreadable compute budget fails the run at CONFIGURE (fail closed): {st.history[-1]}")
     # T61 (Nigeria v2 full run F3, 2026-11-02: 16 of 256 design points failed with kind infra when the autoscaler
@@ -150,14 +150,14 @@ def _self_test_resume(ok, td: str, spike, new_run) -> None:
         s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False)
     finally:
         os.environ.pop("MA_TOY_INFRA_FROM", None)
-    st = load_state(d)
+    st = _SM.load_state(d)
     first = open(calls2).read().split() if os.path.exists(calls2) else []
     ok(s1 == "run_failed" and st.history[-1]["from"] == "ANALYZE" and st.history[-1].get("resumable") == "infra"
        and resumable_failure(d, st) == "infra" and sorted(first) == ["0", "1", "2", "3", "4", "5"],
        f"T61 an analysis that failed only on infra engine rows ends run_failed, marked resumable ({s1}, "
        f"{st.history[-1]}, calls {first})")
     s2 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=Batch(120), cross_engine_check=False)
-    st = load_state(d)
+    st = _SM.load_state(d)
     again = open(calls2).read().split()[len(first):]
     back = [h for h in st.history if h.get("from") == "FINAL"]
     ok(s2 in ("completed", "completed_scope_declared") and len(back) == 1 and back[0]["to"] == "ANALYZE"

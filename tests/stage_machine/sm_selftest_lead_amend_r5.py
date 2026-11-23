@@ -8,9 +8,9 @@ from __future__ import annotations
 import json
 import os
 import analysis_backend as AB
+import _stage_machine_under_test as _SM
 from _stage_machine_under_test import (
-    AMENDED_PROVISIONAL, SPEC_RETHINK_REQUEST, STATE_FILE, _write_json, amendment_lines, handoff_chain,
-    handoff_child, load_state,
+    AMENDED_PROVISIONAL, SPEC_RETHINK_REQUEST, STATE_FILE, amendment_lines, handoff_chain, handoff_child,
 )
 from sm_selftest_common import SM_GLOBALS
 
@@ -24,7 +24,7 @@ def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
     d = interrupted("r5_patch")
     rp = os.path.join(d, SPEC_RETHINK_REQUEST)
     req = json.load(open(rp))
-    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, patch=dict(req["patch"], spec=[
+    _SM._write_json(d, SPEC_RETHINK_REQUEST, dict(req, patch=dict(req["patch"], spec=[
         {"set": "constraints.envelope_usd", "value": 8700}])))
     s = machine(d).run()
     la = json.load(open(rp)).get("lead_amendment") or {}
@@ -32,7 +32,7 @@ def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
        f"T_R5_PATCH_CONTENT a child made from another patch under the same id is not adopted ({s}, {la.get('why')})")
     # R2-2: a kept child and its request must match the parent's own sign-off record, not only each other
     d = interrupted("r5_signoff")
-    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    _SM._write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
     machine(d).run()                                  # refused (the legacy brief), the child kept
     sop = os.path.join(d, SO.SPEC_SIGNOFF)
     so0 = open(sop, "rb").read()
@@ -55,12 +55,12 @@ def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
     damaged = damaged[0] if damaged[0] == damaged[1] else damaged
     # R1-5 follow-up: a malformed lead_amendment record is not an error
     req = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST)))
-    _write_json(d, SPEC_RETHINK_REQUEST, dict(req, lead_amendment=["bad"]))
+    _SM._write_json(d, SPEC_RETHINK_REQUEST, dict(req, lead_amendment=["bad"]))
     try:
         bad = handoff_chain(d, kept=True)
     except Exception as e:  # noqa: BLE001 -- the finding
         bad = type(e).__name__
-    _write_json(d, SPEC_RETHINK_REQUEST, req)
+    _SM._write_json(d, SPEC_RETHINK_REQUEST, req)
     ok(other == [] and damaged == [d + ".amend1"] and bad == [],
        f"T_R5_KEPT_PARENT_SIGNOFF a kept child is stored only when the parent's own sign-off binds the request's spec; "
        f"a damaged parent state keeps it; a malformed record stores nothing ({other}, {damaged}, {bad})")
@@ -97,7 +97,7 @@ def _self_test_lead_amend_r5(ok, tdr: str, interrupted, pair, machine) -> None:
             SM_GLOBALS["_write_json"] = real_wj
         meta6 = os.path.join(d, "metadata.json")
         meta_ok = not os.path.exists(meta6) if drop_meta else json.load(open(meta6)).get("status") != AMENDED_PROVISIONAL
-        st6 = load_state(d)
+        st6 = _SM.load_state(d)
         s = m6.run()
         ok(failed and meta_ok and st6.state == "SPEC" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
            f"T_R6_ROLLBACK {name}: a failed write before the parent's FINAL is saved leaves it at SPEC with its metadata as "

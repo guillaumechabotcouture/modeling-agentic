@@ -8,8 +8,9 @@ from __future__ import annotations
 import os
 import sys
 import findings_ledger as FL
+import _stage_machine_under_test as _SM
 from _stage_machine_under_test import (
-    CALIBRATION_REFUSED, MAX_CALIBRATION_REFUSALS, calibration_refusal, load_state, rethink_request, run_v2,
+    CALIBRATION_REFUSED, MAX_CALIBRATION_REFUSALS, calibration_refusal, rethink_request, run_v2,
 )
 from sm_selftest_common import SM_GLOBALS, _TOY_REFUSAL
 
@@ -30,7 +31,7 @@ def _self_test_calibration_refused(ok, td: str, toy_run, Batch, quiet) -> None:
     refuse = Refuse(60)
     d, T = toy_run("calibration_refused")
     s1 = run_v2("toy question", d, T, signoff="none", log=quiet, backend=refuse, cross_engine_check=False)
-    st = load_state(d)
+    st = _SM.load_state(d)
     back = [h for h in st.history if h.get("from") == "ANALYZE"]
     led = FL.load(d)
     f = led.get(CALIBRATION_REFUSED)
@@ -55,7 +56,7 @@ def _self_test_calibration_refused(ok, td: str, toy_run, Batch, quiet) -> None:
         s2 = run_v2("toy question", d2, T2, signoff="none", log=quiet, backend=refuse, cross_engine_check=False)
     finally:
         g["conflicts_policy_stop"] = orig
-    back2 = [h.get("to") for h in load_state(d2).history if h.get("from") == "ANALYZE"]
+    back2 = [h.get("to") for h in _SM.load_state(d2).history if h.get("from") == "ANALYZE"]
     rep_other = {"ok": False, "errors": [], "steps": [{"id": "analyze", "status": "failed", "returncode": 1,
                                                        "error": "ValueError: boom"}]}
     ok(s2 == "run_failed" and back2 == ["FINAL"] and calibration_refusal(rep_other, d2) is None,

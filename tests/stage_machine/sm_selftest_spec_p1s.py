@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import os
 import analysis_backend as AB
-from _stage_machine_under_test import Machine, save_state
+import _stage_machine_under_test as _SM
+from _stage_machine_under_test import Machine
 
 
 def _self_test_spec_p1s(ok, td: str, spike, new_run) -> None:
@@ -105,7 +106,7 @@ def _self_test_spec_p1s(ok, td: str, spike, new_run) -> None:
     # later capped try's valid draft checked
     d7, T7, st7 = new_run("sp7", {})
     st7.tries.update(spec=1, spec_feedback=["draft_spec failed: max turns"])
-    save_state(d7, st7)
+    _SM.save_state(d7, st7)
     T7 = Capped(dict(T7.s, tries=["good"]))
     m7 = Machine(d7, T7, st7, backend=spike, log=lambda *a: None, cross_engine_check=False)
     m7.step()

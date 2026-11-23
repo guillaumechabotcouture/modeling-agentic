@@ -9,9 +9,10 @@ import json
 import os
 import shlex
 import analysis_backend as AB
+import _stage_machine_under_test as _SM
 from _stage_machine_under_test import (
     AMENDED_PROVISIONAL, AMENDMENT_RECORD, AmendmentLocked, Machine, SPEC_RETHINK_REQUEST, STATE_FILE,
-    amendment_lines, handoff_chain, handoff_child, load_state, run_v2, save_state,
+    amendment_lines, handoff_chain, handoff_child, run_v2,
 )
 from sm_selftest_common import SM_GLOBALS
 from sm_selftest_lead_amend_r4 import _self_test_lead_amend_r4
@@ -57,7 +58,7 @@ def _self_test_lead_amend_r3(ok, td: str, parent, good: dict, _boom) -> None:
         pass
     finally:
         SM_GLOBALS["save_state"] = real_save
-    ok(load_state(d).status == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
+    ok(_SM.load_state(d).status == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
        f"T_R3_FINAL_WINDOW (P1-4) interrupted after the parent's FINAL is saved, the child already binds it "
        f"({handoff_child(d)})")
     # P1-5: recovering a restored copy of the parent alone never writes to the original tree
@@ -90,7 +91,7 @@ def _self_test_lead_amend_r3(ok, td: str, parent, good: dict, _boom) -> None:
         meta = json.load(open(mc))
         pr = {k: v for k, v in meta["parent_run"].items() if k != "run_state_sha256"}
         json.dump(dict(meta, parent_run=dict(pr, **({"run_state_sha256": digest} if digest else {}))), open(mc, "w"))
-        ok(load_state(p).status == AMENDED_PROVISIONAL and handoff_child(p) is None
+        ok(_SM.load_state(p).status == AMENDED_PROVISIONAL and handoff_child(p) is None
            and handoff_chain(p) == [] and handoff_chain(p, kept=True) == [],
            f"T_R3_STRICT_LINEAGE (P1-10, P1-11) {where}: a child without the parent's final digest is neither resumed "
            f"nor stored with it ({handoff_chain(p, kept=True)})")
@@ -109,9 +110,9 @@ def _self_test_lead_amend_r3(ok, td: str, parent, good: dict, _boom) -> None:
 
     def log_a(msg):
         if "continuing in" in str(msg):
-            cst = load_state(d + ".amend1")
+            cst = _SM.load_state(d + ".amend1")
             cst.state, cst.status = "FINAL", "completed"     # the child stops at once (the test stays small)
-            save_state(d + ".amend1", cst)
+            _SM.save_state(d + ".amend1", cst)
             paused.set()
             go.wait(60)
     res_a = []
@@ -165,7 +166,7 @@ def _self_test_lead_amend_r3(ok, td: str, parent, good: dict, _boom) -> None:
     finally:
         SM_GLOBALS["load_state"] = real_load
     made = os.path.lexists(d + ".amend1")
-    ok(made == (load_state(d).status == AMENDED_PROVISIONAL),
+    ok(made == (_SM.load_state(d).status == AMENDED_PROVISIONAL),
        f"T_R3_STALE_CTOR (P1-9) a constructor that read the state before the hand-off never writes it back "
-       f"(child made: {made}; parent status {load_state(d).status}; {len(errs)} refused)")
+       f"(child made: {made}; parent status {_SM.load_state(d).status}; {len(errs)} refused)")
     _self_test_lead_amend_r4(ok, tdr, parent, good, interrupted, pair, machine)

@@ -9,9 +9,9 @@ import hashlib
 import json
 import os
 import analysis_backend as AB
+import _stage_machine_under_test as _SM
 from _stage_machine_under_test import (
-    AMENDED_PROVISIONAL, AMENDMENT_RECORD, SPEC_RETHINK_REQUEST, _write_json, amendment_lines, handoff_chain,
-    handoff_child, load_state, save_state,
+    AMENDED_PROVISIONAL, AMENDMENT_RECORD, SPEC_RETHINK_REQUEST, amendment_lines, handoff_chain, handoff_child,
 )
 from sm_selftest_common import SM_GLOBALS
 from sm_selftest_lead_amend_r5 import _self_test_lead_amend_r5
@@ -23,7 +23,7 @@ def _self_test_lead_amend_r4(ok, tdr: str, parent, good: dict, interrupted, pair
     from toolkit.spec import amend as AM
     # R1-1: an interrupted hand-off (the parent still at SPEC) stores its verified signed child
     d = interrupted("r4_store")
-    ok(load_state(d).status is None and handoff_chain(d, kept=True) == [d + ".amend1"],
+    ok(_SM.load_state(d).status is None and handoff_chain(d, kept=True) == [d + ".amend1"],
        f"T_R4_STORE_INTERRUPTED an interrupted hand-off's signed child is stored with the parent "
        f"({handoff_chain(d, kept=True)})")
     # R1-2: recovery never adopts a same-named child made from another spec or another amendment
@@ -67,7 +67,7 @@ def _self_test_lead_amend_r4(ok, tdr: str, parent, good: dict, interrupted, pair
         raised = type(e).__name__
     finally:
         SM_GLOBALS["_write_json"] = real_wj
-    st1, meta1 = load_state(d), json.load(open(os.path.join(d, "metadata.json")))
+    st1, meta1 = _SM.load_state(d), json.load(open(os.path.join(d, "metadata.json")))
     s = m4.run()
     ok(raised and st1.status is None and st1.state == "SPEC" and meta1.get("status") != AMENDED_PROVISIONAL
        and m4.st.state == "FINAL" and s == AMENDED_PROVISIONAL and handoff_child(d) == d + ".amend1",
@@ -76,7 +76,7 @@ def _self_test_lead_amend_r4(ok, tdr: str, parent, good: dict, interrupted, pair
     # R1-6: the kept child is verified by the signed digest the request names, not the working spec's bytes
     d = interrupted("r4_kept")
     sp, keep = os.path.join(d, AB.SPEC_FILE), None
-    _write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
+    _SM._write_json(d, "decision_brief.signoff.json", {"signed_by": "owner", "sha256": {AB.SPEC_FILE: "0" * 64}})
     machine(d).run()                                  # refused (the legacy brief), the child kept
     keep = open(sp, "rb").read()
     os.remove(sp)
@@ -93,9 +93,9 @@ def _self_test_lead_amend_r4(ok, tdr: str, parent, good: dict, interrupted, pair
        f"never by replacement bytes ({gone}, {other})")
     # R1-7 (P2): a manual amendment moved with its parent names the moved parent (verified by the parent-state digest)
     d = parent("r4_manual", "lead", good)[0]
-    st = load_state(d)
+    st = _SM.load_state(d)
     st.state, st.status = "FINAL", "completed"
-    save_state(d, st)
+    _SM.save_state(d, st)
     import yaml
     pf = os.path.join(tdr, "r4_manual_patch.yaml")
     yaml.safe_dump(good, open(pf, "w"))

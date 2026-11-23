@@ -10,7 +10,7 @@ import os
 import sys
 import analysis_backend as AB
 import _stage_machine_under_test as _SM
-from _stage_machine_under_test import Machine, SIGNOFF_SHEET, init_run, load_state
+from _stage_machine_under_test import Machine, SIGNOFF_SHEET, init_run
 from sm_selftest_common import _t_owner_disposes
 
 
@@ -31,7 +31,7 @@ def _self_test_derived(ok, td: str) -> None:
     st = init_run(d, "toy question", 3, "none", "v2", None, derived_inputs=True, derive_unsandboxed=flag)
     status = Machine(d, StubTasks({"spec": raw}), st, backend=toolkit, log=lambda *a: None,
                      cross_engine_check=False).run(max_steps=12)
-    s1 = load_state(d)
+    s1 = _SM.load_state(d)
     fb = s1.tries.get("spec_feedback") or []
     ok(status == "run_failed" and any(x.startswith("units_not_derived") for x in fb)
        and "SIGN" not in [h.get("to") for h in s1.history],

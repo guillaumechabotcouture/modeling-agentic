@@ -8,7 +8,8 @@ from __future__ import annotations
 import json
 import os
 import analysis_backend as AB
-from _stage_machine_under_test import Machine, SIGNOFF_FILE, init_run, load_state, sign, signed_hash
+import _stage_machine_under_test as _SM
+from _stage_machine_under_test import Machine, SIGNOFF_FILE, init_run, sign, signed_hash
 from sm_selftest_common import _t_owner_disposes
 
 
@@ -45,9 +46,9 @@ def _self_test_geometry(ok, td: str) -> None:
     d1 = os.path.join(td, "ig1")
     m1 = setup(d1)
     status = m1.run(max_steps=12)
-    fb = load_state(d1).tries.get("spec_feedback") or []
+    fb = _SM.load_state(d1).tries.get("spec_feedback") or []
     ok(status == "run_failed" and any(x.startswith("reciprocal_swap") and "reciprocal_swap:0+1" in x for x in fb)
-       and "SIGN" not in [h.get("to") for h in load_state(d1).history],
+       and "SIGN" not in [h.get("to") for h in _SM.load_state(d1).history],
        f"IG-M1 a units table whose rows carry each other's points is refused before SIGN ({status}; {fb[:1]})")
     hf = {f["kind"]: f for f in m1.harness_findings()}
     ok(hf.get("reciprocal_swap", {}).get("severity") == "HIGH" and hf["reciprocal_swap"]["scope_declarable"] is False,

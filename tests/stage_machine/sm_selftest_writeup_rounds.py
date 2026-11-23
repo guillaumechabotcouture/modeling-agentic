@@ -8,8 +8,9 @@ from __future__ import annotations
 import json
 import os
 import findings_ledger as FL
+import _stage_machine_under_test as _SM
 from _stage_machine_under_test import (
-    CRITICS, DECLARED_FILE, Machine, apply_medium_rule, load_state, owner_accepted_now, owner_held, save_state,
+    CRITICS, DECLARED_FILE, Machine, apply_medium_rule, owner_accepted_now, owner_held,
 )
 
 
@@ -27,7 +28,7 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
         return Machine(d, T, st, backend=spike, log=lambda *a: None, cross_engine_check=False)
 
     def hist(d):
-        return [h for h in load_state(d).history if "to" in h]
+        return [h for h in _SM.load_state(d).history if "to" in h]
 
     def case(name, fn):
         try:
@@ -46,7 +47,7 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
         h = hist(d)
         edges = [(x["from"], x["to"]) for x in h]
         whys = [str(x.get("why")) for x in h]
-        st2 = load_state(d)
+        st2 = _SM.load_state(d)
         ok(("FIX_LOOP", "WRITE") in edges and ("PRESENTATION", "CRITIQUE") in edges
            and not any(w.startswith("schema errors") for w in whys),
            f"WR1 a write-up-only fix goes WRITE -> PRESENTATION -> CRITIQUE, never through a schema repair "
@@ -68,11 +69,11 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
         src = os.path.join(td, "wr_rereview")
         d = os.path.join(td, "wr_rereview_na")
         shutil.copytree(src, d)
-        T, st = StubTasks({}), load_state(d)
+        T, st = StubTasks({}), _SM.load_state(d)
         st.state, st.round, st.post_write, st.round_pending, st.write_mode = "WRITE", 2, False, False, "not_accepted"
         st.status, st.forced_status = None, None
         st.tries["rereview"] = 2
-        save_state(d, st)
+        _SM.save_state(d, st)
         for r in CRITICS + ("critique-presentation",):
             StubTasks({}).critique(d, r, 1)
         m = mk(d, T, st)
@@ -213,14 +214,14 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
             FL.save(d, led)
             open(os.path.join(d, "fix_plan_r1.json"), "w").write('{"round": 1, "plan": {"tasks": []}}')
             st.state, st.round, st.round_pending, st.post_write = "FIX_LOOP", 1, True, False
-            save_state(d, st)
+            _SM.save_state(d, st)
             _FX.run_loop = lambda *a, **k: {"round": 1, "tasks": 0, "rows": 0, "passed": 0, "rethink": None,
                                             "write_up": ["W"], "owner_amendments": []}
             try:
                 mk(d, T, st).step()
             finally:
                 _FX.run_loop = real
-            s2 = load_state(d)
+            s2 = _SM.load_state(d)
             last = hist(d)[-1]
             mode = "accepted" if name == "wr_zero_wu2" else "declared"
             kept = (os.path.exists(os.path.join(d, "fix_plan_r1_prewrite.json"))
