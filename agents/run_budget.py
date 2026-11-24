@@ -171,3 +171,65 @@ def remaining_budget(cap: float | None, records: list[dict]) -> float | None:
     spent = sum(r.get("total_cost_usd") or 0 for r in records
                 if isinstance(r.get("total_cost_usd"), (int, float)))
     return round(cap - spent, 4)
+
+
+def reserve_compute(
+    run_path: str,
+    amount_usd: float,
+    *,
+    cap_usd: float | None,
+    stage: str = "ENGINE_ADMIT",
+    label: str = "admission_compute",
+    integrity=None,
+) -> tuple[bool, str | None]:
+    """Reserve `amount_usd` against the run's remaining balance BEFORE dispatching cloud compute
+    (docs/design/agent-built-engines.md §6.2, BE33). Returns `(True, reservation_id)` when the
+    reservation is persisted in `budget_ledger.json`, or `(False, reason)` without mutating the
+    ledger when remaining balance is below `amount_usd`."""
+    import uuid
+    amt = round(float(amount_usd), 4)
+    if amt < 0:
+        raise ValueError(f"reserve_compute: negative amount {amt}")
+    ledger = load_budget_ledger(run_path)
+    rem = remaining_budget(cap_usd, ledger["sessions"])
+    if rem is not None and rem + 1e-9 < amt:
+        return False, f"insufficient budget for {stage} {label}: need ${amt:.2f}, remaining ${rem:.2f}"
+    res_id = f"res-{stage.lower()}-{uuid.uuid4().hex[:10]}"
+    ledger["sessions"].append({
+        "session": len(ledger["sessions"]) + 1,
+        "session_id": res_id,
+        "stage": str(stage),
+        "label": str(label),
+        "status": "reserved",
+        "reserved_usd": amt,
+        "total_cost_usd": amt,
+        "source": f"{stage} compute reservation",
+    })
+    write_budget_ledger(run_path, ledger, cap_usd, integrity=integrity)
+    return True, res_id
+
+
+def reconcile_compute(
+    run_path: str,
+    reservation_id: str,
+    actual_usd: float,
+    *,
+    cap_usd: float | None = None,
+    integrity=None,
+) -> dict:
+    """Reconcile a prior `reserve_compute` entry to its measured spend `actual_usd` (BE33)."""
+    act = round(max(float(actual_usd), 0.0), 4)
+    ledger = load_budget_ledger(run_path)
+    eff_cap = cap_usd if cap_usd is not None else ledger.get("cap_usd")
+    matched = None
+    for entry in ledger["sessions"]:
+        if entry.get("session_id") == reservation_id:
+            entry["total_cost_usd"] = act
+            entry["actual_usd"] = act
+            entry["status"] = "reconciled"
+            matched = entry
+            break
+    if matched is None:
+        raise KeyError(f"reconcile_compute: unknown reservation_id {reservation_id!r}")
+    write_budget_ledger(run_path, ledger, eff_cap, integrity=integrity)
+    return matched

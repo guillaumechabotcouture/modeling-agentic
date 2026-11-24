@@ -1,0 +1,1764 @@
+#!/usr/bin/env python3
+"""Admission gate for agent-built engines (docs/design/agent-built-engines.md §4 & §5).
+
+    python3 toolkit/engines/built/admission.py --self-test
+
+Deterministic harness verification of an immutable content-addressed snapshot against the signed
+`engine.build` request, spec, and dossier:
+- Public + hidden + real-unit typed domain generators with opaque IDs and invariance checks
+- Static checks S1-S4 (before any run)
+- Run checks A1-A11:
+  - A1: conformance (`contract.check_engine` + exact card/parameter/output checks)
+  - A2: determinism across processes, `PYTHONHASHSEED`, case order, and `seed_test_setting`
+  - A3: `run_batch` vs `run` parity (skipped when no batch path exists)
+  - A4: analytic/oracle reductions (`oracles.py`) + absent-component & N-invariance identities
+  - A5: mass balance, population conservation, and compartment transition-count witness (`starsim_module`)
+  - A6: sensitivity wiring over signed `(input, output)` pairs + `meta.param_reads`
+  - A7: declared directions on every A6 pair (never vacuous)
+  - A8: trial benchmarks (`benchmark.py`) + built-engine coverage policy (`benchmark_coverage.gate(..., policy="built")`)
+  - A9: literature/dossier value benchmarks (gating only for `gating_benchmarks`)
+  - A10: identifiability via `calibrators.calibrate_as_run`
+  - A11: independent reference equivalence (deterministic tolerance or stochastic 95% CRN CI with `inconclusive`)
+- Overfit detection (`engine_overfit_suspected` HIGH when public passes and hidden fails)
+- Hidden-seed commitment (`engine_build/.hidden/seed.json`), reuse key (`compute_reuse_key`,
+  `try_reuse_admission`), authoritative `engine_build/bench/*`, `engine_build/admission_sheet.md`,
+  and atomic `engine_build/admission.json`. Nothing here names a disease.
+"""
+from __future__ import annotations
+
+import copy
+import datetime as _dt
+import hashlib
+import itertools
+import json
+import math
+import os
+import secrets
+import sys
+from collections.abc import Mapping
+from statistics import NormalDist
+
+import numpy as np
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+for _p in (ROOT, os.path.join(ROOT, "scripts")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from lib import safe_io as SIO  # noqa: E402
+from toolkit.engines import benchmark as BM  # noqa: E402
+from toolkit.engines import benchmark_coverage as BC  # noqa: E402
+from toolkit.engines import benchmark_sources as BS  # noqa: E402
+from toolkit.engines import contract as C  # noqa: E402
+from toolkit.engines.contract import Horizon, Outcomes, Package, UnitSpec  # noqa: E402
+from toolkit.engines.built import adapter as BADAPT  # noqa: E402
+from toolkit.engines.built import candidate as BCAND  # noqa: E402
+from toolkit.engines.built import oracles as BORC  # noqa: E402
+from toolkit.engines.built import requested as BREQ  # noqa: E402
+from toolkit.engines.built import snapshot as BSNAP  # noqa: E402
+from toolkit.engines.built import worker as BWORK  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+THRESHOLDS_PATH = os.path.join(HERE, "thresholds.yaml")
+PUBLIC_SEED_BYTES = hashlib.sha256(b"modeling-agentic:built-engine-public-seed-v1").digest()
+HIDDEN_SEED_REL = "engine_build/.hidden/seed.json"
+
+
+def load_thresholds() -> dict:
+    import yaml
+    with open(THRESHOLDS_PATH, encoding="utf-8") as f:
+        return dict(yaml.safe_load(f) or {})
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_json(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _rng_from(seed_bytes: bytes, tag: str) -> np.random.Generator:
+    digest = hashlib.sha256(seed_bytes + b":" + tag.encode("utf-8")).digest()
+    return np.random.default_rng(int.from_bytes(digest[:8], "big"))
+
+
+def _finite(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))
+
+
+def _out_dict(out: Outcomes) -> dict:
+    return {
+        "per_capita": out.per_capita,
+        "windows": out.windows,
+        "cost_drivers": out.cost_drivers,
+        "meta": out.meta or {},
+    }
+
+
+def _extract_output(out: Outcomes, name: str) -> float:
+    """Resolve a declared output name (per_capita outcome, cost driver, window metric, or full path) to a scalar."""
+    od = _out_dict(out)
+    if "." in name:
+        return float(BM.get(od, name))
+    if name in (out.per_capita or {}):
+        return float(BM.get(od, f"per_capita_all.{name}"))
+    if name in (out.cost_drivers or {}):
+        return float(out.cost_drivers[name])
+    for wname in sorted(out.windows or {}):
+        if name in (out.windows[wname] or {}):
+            return float(out.windows[wname][name])
+    raise KeyError(f"output {name!r} not found in Outcomes")
+
+
+def _outcomes_close(a: Outcomes, b: Outcomes, *, rel: float = 1e-12, abs_tol: float = 1e-12) -> tuple[bool, float]:
+    worst = 0.0
+    for k, m in a.per_capita.items():
+        bm = b.per_capita.get(k) or {}
+        for g, va in m.items():
+            vb = bm.get(g)
+            if not (_finite(va) and _finite(vb)):
+                return False, float("inf")
+            diff = abs(float(va) - float(vb))
+            scale = max(abs(float(va)), abs(float(vb)), 1.0)
+            worst = max(worst, diff / scale)
+            if diff > max(abs_tol, rel * scale):
+                return False, worst
+    for w, m in a.windows.items():
+        bm = b.windows.get(w) or {}
+        for mk, va in m.items():
+            vb = bm.get(mk)
+            if not (_finite(va) and _finite(vb)):
+                return False, float("inf")
+            diff = abs(float(va) - float(vb))
+            scale = max(abs(float(va)), abs(float(vb)), 1.0)
+            worst = max(worst, diff / scale)
+            if diff > max(abs_tol, rel * scale):
+                return False, worst
+    for k, va in a.cost_drivers.items():
+        vb = b.cost_drivers.get(k)
+        if not (_finite(va) and _finite(vb)):
+            return False, float("inf")
+        diff = abs(float(va) - float(vb))
+        scale = max(abs(float(va)), abs(float(vb)), 1.0)
+        worst = max(worst, diff / scale)
+        if diff > max(abs_tol, rel * scale):
+            return False, worst
+    return True, worst
+
+
+def _default_horizon(spec_raw: Mapping, req: Mapping) -> Horizon:
+    obj = spec_raw.get("objective") if isinstance(spec_raw, Mapping) else None
+    hor = (obj.get("horizon") if isinstance(obj, Mapping) else None) or [0.0, 100.0]
+    wins = (obj.get("windows") if isinstance(obj, Mapping) else None) or {}
+    if not wins:
+        req_wins = (req.get("outputs") or {}).get("windows") or {}
+        wins = {str(w): [float(hor[0]), float(hor[1])] for w in req_wins}
+    return Horizon(float(hor[0]), float(hor[1]), (float(hor[0]), float(hor[1])),
+                   {str(k): [float(v[0]), float(v[1])] for k, v in wins.items()})
+
+
+def _sample_attr(aspec: Mapping, rng: np.random.Generator, *, ref_vec=None, u_val: float | None = None):
+    at = aspec.get("type")
+    if at == "continuous":
+        lo, hi = aspec.get("range") or aspec.get("test_range") or [0.0, 1.0]
+        u = float(rng.random()) if u_val is None else float(u_val)
+        return float(lo) + u * (float(hi) - float(lo))
+    if at == "integer":
+        lo, hi = aspec.get("range") or aspec.get("test_range") or [0, 10]
+        return int(rng.integers(int(lo), int(hi) + 1))
+    if at == "categorical":
+        vs = list(aspec.get("values") or [])
+        return vs[int(rng.integers(0, len(vs)))]
+    if at == "vector":
+        ln = int(aspec.get("length", 1))
+        if isinstance(ref_vec, (list, tuple)) and len(ref_vec) == ln:
+            scale = float(rng.uniform(0.6, 1.4))
+            return [max(1.0, float(x) * scale) for x in ref_vec]
+        w = rng.uniform(0.2, 1.0, size=ln)
+        return [float(x * 1000.0) for x in w]
+    return 0.0
+
+
+def _domain_points_attr(aspec: Mapping, *, ref_vec=None) -> list:
+    """2 ends + 2 interior points (or all categorical/integer values) for A6 perturbation."""
+    at = aspec.get("type")
+    if at == "continuous":
+        lo, hi = [float(x) for x in (aspec.get("range") or aspec.get("test_range") or [0.0, 1.0])]
+        return [lo, lo + 0.33 * (hi - lo), lo + 0.67 * (hi - lo), hi]
+    if at == "integer":
+        lo, hi = [int(x) for x in (aspec.get("range") or aspec.get("test_range") or [0, 3])]
+        if hi - lo + 1 <= 4:
+            return list(range(lo, hi + 1))
+        return sorted({lo, lo + (hi - lo) // 3, lo + 2 * (hi - lo) // 3, hi})
+    if at == "categorical":
+        return list(aspec.get("values") or [])
+    if at == "vector":
+        ln = int(aspec.get("length", 1))
+        base = [float(x) for x in ref_vec] if isinstance(ref_vec, (list, tuple)) and len(ref_vec) == ln else [1000.0] * ln
+        return [
+            [x * 0.5 for x in base],
+            [x * 0.85 for x in base],
+            [x * 1.15 for x in base],
+            [x * 1.5 for x in base],
+        ]
+    return [0.0]
+
+
+def _domain_points_param(ps: Mapping) -> list:
+    dom = ps.get("domain") if isinstance(ps.get("domain"), Mapping) else {}
+    if dom.get("values"):
+        return list(dom["values"])
+    rng = dom.get("range")
+    if rng is None and _finite(ps.get("lo")) and _finite(ps.get("hi")):
+        rng = [float(ps["lo"]), float(ps["hi"])]
+    if rng is not None:
+        lo, hi = float(rng[0]), float(rng[1])
+        if dom.get("type") == "integer":
+            ilo, ihi = int(round(lo)), int(round(hi))
+            if ihi - ilo + 1 <= 4:
+                return list(range(ilo, ihi + 1))
+            return sorted({ilo, ilo + (ihi - ilo) // 3, ilo + 2 * (ihi - ilo) // 3, ihi})
+        return [lo, lo + 0.33 * (hi - lo), lo + 0.67 * (hi - lo), hi]
+    v = float(ps.get("value", 1.0))
+    return [v * 0.5, v * 0.85, v * 1.15, v * 1.5] if abs(v) > 1e-12 else [0.0, 0.25, 0.75, 1.0]
+
+
+def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str | None = None,
+                             max_units: int = 200, max_packages: int = 64,
+                             rng: np.random.Generator | None = None) -> tuple[list[UnitSpec], list[Package]]:
+    """Extract the signed spec's real decision units and packages (stratified + extremes when > cap)."""
+    rng = rng or np.random.default_rng(0)
+    attr_specs = req.get("unit_attributes") or {}
+    comp_specs = req.get("components") or {}
+    du = spec_raw.get("decision_units") if isinstance(spec_raw, Mapping) else None
+    raw_units: list[dict] = []
+    if isinstance(du, Mapping):
+        if isinstance(du.get("units_inline"), list):
+            raw_units = [dict(u) for u in du["units_inline"] if isinstance(u, Mapping)]
+        elif du.get("csv") and base_dir:
+            import csv
+            csv_p = os.path.join(base_dir, str(du["csv"]))
+            if os.path.isfile(csv_p):
+                with open(csv_p, encoding="utf-8", newline="") as f:
+                    raw_units = list(csv.DictReader(f))
+    id_col = str((du or {}).get("id_column", "unit_id")) if isinstance(du, Mapping) else "unit_id"
+    ea = (du or {}).get("engine_attributes") if isinstance(du, Mapping) else {}
+    ea = ea if isinstance(ea, Mapping) else {}
+    ab = req.get("attribute_binding") or {}
+
+    units: list[UnitSpec] = []
+    for idx, row in enumerate(raw_units):
+        uid = str(row.get(id_col) or f"unit_{idx}")
+        attrs: dict = {}
+        for aname, aspec in attr_specs.items():
+            val = None
+            bind = ea.get(aname)
+            if isinstance(bind, Mapping) and "column" in bind and bind["column"] in row:
+                val = row[bind["column"]]
+            elif isinstance(bind, Mapping) and "value" in bind:
+                val = bind["value"]
+            elif aname in row:
+                val = row[aname]
+            elif isinstance(ab.get(aname), Mapping) and "default" in ab[aname]:
+                val = copy.deepcopy(ab[aname]["default"])
+            else:
+                val = _sample_attr(aspec, rng)
+            at = aspec.get("type")
+            if at == "continuous":
+                val = float(val)
+            elif at == "integer":
+                val = int(round(float(val)))
+            elif at == "vector" and isinstance(val, str):
+                val = json.loads(val)
+            attrs[aname] = val
+        units.append(UnitSpec(uid, attrs))
+
+    if len(units) > max_units:
+        # Include every unit at an attribute extreme + stratified remainder up to max_units
+        keep_idx: set[int] = set()
+        for aname, aspec in attr_specs.items():
+            if aspec.get("type") in ("continuous", "integer"):
+                vals = [(float(u.attributes[aname]), i) for i, u in enumerate(units)]
+                vals.sort()
+                keep_idx.add(vals[0][1])
+                keep_idx.add(vals[-1][1])
+        rem = [i for i in range(len(units)) if i not in keep_idx]
+        need = max(0, max_units - len(keep_idx))
+        if need and rem:
+            chosen = rng.choice(rem, size=min(need, len(rem)), replace=False).tolist()
+            keep_idx.update(int(i) for i in chosen)
+        units = [units[i] for i in sorted(keep_idx)[:max_units]]
+
+    # Packages from options.engine_map + options.packages
+    opts = spec_raw.get("options") if isinstance(spec_raw, Mapping) else {}
+    emap = (opts.get("engine_map") or {}) if isinstance(opts, Mapping) else {}
+    pks_decl = (opts.get("packages") or {}) if isinstance(opts, Mapping) else {}
+    absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
+    packages: list[Package] = []
+    if isinstance(pks_decl, Mapping) and pks_decl and "generate" not in pks_decl:
+        for pid, members in pks_decl.items():
+            comp_map = dict(absent_pkg)
+            for m in (members or []):
+                if m in emap and isinstance(emap[m], Mapping):
+                    comp_map.update(emap[m])
+            packages.append(Package(str(pid), comp_map))
+    else:
+        # Cartesian product across declared component values, capped at max_packages
+        names = sorted(comp_specs)
+        combos = list(itertools.product(*[comp_specs[c]["values"] for c in names]))
+        if len(combos) > max_packages:
+            idx = sorted(set([0, len(combos) - 1] + rng.choice(len(combos), size=max_packages - 2, replace=False).tolist()))
+            combos = [combos[i] for i in idx]
+        for idx, vals in enumerate(combos):
+            packages.append(Package(f"pkg_{idx}", dict(zip(names, vals))))
+    if not packages:
+        packages = [Package("none", dict(absent_pkg))]
+    return units, packages
+
+
+def generate_domain_units(req: Mapping, n: int, rng: np.random.Generator, *, ref_units: list[UnitSpec] | None = None) -> list[UnitSpec]:
+    """Generate `n` synthetic units across the declared typed attribute domains using LHS for continuous dims."""
+    attr_specs = req.get("unit_attributes") or {}
+    cont_names = sorted(k for k, v in attr_specs.items() if v.get("type") == "continuous")
+    lhs_draws = BM.lhs(len(cont_names), n, rng) if cont_names and n > 0 else np.zeros((n, 0))
+    ref_vecs = {}
+    for u in (ref_units or []):
+        for k, v in u.attributes.items():
+            if isinstance(v, list) and k not in ref_vecs:
+                ref_vecs[k] = v
+    out: list[UnitSpec] = []
+    for i in range(n):
+        attrs = {}
+        c_idx = 0
+        for aname in sorted(attr_specs):
+            aspec = attr_specs[aname]
+            if aspec.get("type") == "continuous":
+                attrs[aname] = _sample_attr(aspec, rng, u_val=float(lhs_draws[i, c_idx]))
+                c_idx += 1
+            else:
+                attrs[aname] = _sample_attr(aspec, rng, ref_vec=ref_vecs.get(aname))
+        out.append(UnitSpec(f"gen_{i}", attrs))
+    return out
+
+
+# --------------------------------------------------------------------------- Individual checks A1-A11
+def check_a1(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+             units: list[UnitSpec], packages: list[Package], horizon: Horizon, *, seed: int = 1) -> dict:
+    """A1 conformance: `contract.check_engine` + exact card/parameter/output agreement with signed request."""
+    import yaml
+    req = build_decl["request"]
+    probs: list[str] = []
+    card = cand.describe()
+    params = cand.parameters()
+
+    # 1. card.yaml agrees with describe()
+    try:
+        card_doc = yaml.safe_load(cand._files["card.yaml"].decode("utf-8")) or {}
+    except Exception as e:  # noqa: BLE001
+        probs.append(f"card.yaml unreadable: {e}")
+        card_doc = {}
+    for field in ("name", "version", "mechanisms", "components", "outputs", "age_groups"):
+        if field in card_doc and card_doc[field] != getattr(card, field):
+            probs.append(f"describe().{field} disagrees with card.yaml")
+
+    # 2. describe() agrees with signed request on components, unit_attributes, outputs, age_groups
+    req_comps = {c: list(cs["values"]) for c, cs in (req.get("components") or {}).items()}
+    if card.components != req_comps:
+        probs.append(f"card.components {card.components!r} != request {req_comps!r}")
+    if set(card.unit_attributes) != set(req.get("unit_attributes") or {}):
+        probs.append(f"card.unit_attributes {sorted(card.unit_attributes)} != request {sorted(req.get('unit_attributes') or {})}")
+    if list(card.age_groups) != list(req.get("age_groups") or []):
+        probs.append(f"card.age_groups {card.age_groups!r} != request {req.get('age_groups')!r}")
+    req_outs = req.get("outputs") or {}
+    if list(card.outputs.get("per_capita") or []) != list(req_outs.get("per_capita") or []):
+        probs.append("card.outputs.per_capita differs from request")
+    if list(card.outputs.get("cost_drivers") or []) != list(req_outs.get("cost_drivers") or []):
+        probs.append("card.outputs.cost_drivers differs from request")
+
+    # 3. parameters() matches request.parameters EXACTLY on name, kind, value, lo, hi, units, source (BE13)
+    req_params = {p["name"]: p for p in (req.get("parameters") or [])}
+    got_params = {p.name: p for p in params}
+    if set(got_params) != set(req_params):
+        probs.append(f"parameter names differ: extra={sorted(set(got_params) - set(req_params))}, "
+                     f"missing={sorted(set(req_params) - set(got_params))}")
+    for pname, rp in req_params.items():
+        gp = got_params.get(pname)
+        if gp is None:
+            continue
+        if gp.kind != rp.get("kind"):
+            probs.append(f"parameter {pname}: kind {gp.kind!r} != request {rp.get('kind')!r}")
+        if abs(float(gp.value) - float(rp["value"])) > 1e-12:
+            probs.append(f"parameter {pname}: value {gp.value} != request {rp['value']}")
+        for bkey in ("lo", "hi"):
+            rv, gv = rp.get(bkey), getattr(gp, bkey)
+            if (rv is None) != (gv is None) or (rv is not None and abs(float(gv) - float(rv)) > 1e-12):
+                probs.append(f"parameter {pname}: {bkey} {gv!r} != request {rv!r}")
+        if (rp.get("units") or "") != (gp.units or ""):
+            probs.append(f"parameter {pname}: units {gp.units!r} != request {rp.get('units')!r}")
+        if str(rp.get("source") or "") != str(gp.source or ""):
+            probs.append(f"parameter {pname}: source {gp.source!r} != request {rp.get('source')!r}")
+
+    # 4. Run contract.check_engine + strict built-output checks on each case
+    req_win_metrics = req_outs.get("windows") or {}
+    n_total, n_pass = 0, 0
+    for u in units:
+        for pk in packages:
+            n_total += 1
+            case_probs: list[str] = []
+            if n_total == 1:
+                case_probs += C.check_engine(cand, u, pk, horizon, seed=seed)
+            out = cand.run({}, u, pk, horizon, seed=seed)
+            for k in req_outs.get("per_capita") or []:
+                if k not in out.per_capita:
+                    case_probs.append(f"missing per_capita.{k}")
+                    continue
+                for g in card.age_groups:
+                    v = (out.per_capita[k] or {}).get(g)
+                    if not _finite(v) or float(v) < 0.0:
+                        case_probs.append(f"{u.id}/{pk.id}: per_capita.{k}[{g}]={v!r} (must be finite >= 0)")
+            for wname, metrics in req_win_metrics.items():
+                if wname in horizon.windows:
+                    wmap = out.windows.get(wname)
+                    if not isinstance(wmap, Mapping) or not wmap:
+                        case_probs.append(f"{u.id}/{pk.id}: window {wname!r} missing or empty")
+                    else:
+                        for m in metrics:
+                            mv = wmap.get(m)
+                            if not _finite(mv):
+                                case_probs.append(f"{u.id}/{pk.id}: window {wname}.{m}={mv!r} not finite")
+            for drv in req_outs.get("cost_drivers") or []:
+                dv = (out.cost_drivers or {}).get(drv)
+                if not _finite(dv) or float(dv) < 0.0:
+                    case_probs.append(f"{u.id}/{pk.id}: cost_driver {drv}={dv!r} (must be finite >= 0)")
+            if not case_probs:
+                n_pass += 1
+            else:
+                probs.extend(case_probs[:3])
+    return {"id": "A1", "status": "pass" if not probs else "fail", "passed": n_pass, "total": n_total,
+            "problems": probs[:12]}
+
+
+def check_a2(cand: BCAND.CandidateEngine, build_decl: Mapping, units: list[UnitSpec],
+             packages: list[Package], horizon: Horizon, *, th: Mapping, check_invariance: bool = True) -> dict:
+    """A2 determinism under seed across processes, PYTHONHASHSEED, case orders, opaque IDs, and seed_test_setting."""
+    req = build_decl["request"]
+    stochastic = bool(req.get("stochastic", False))
+    tol = float(th["invariance_rel_tol"])
+    probs: list[str] = []
+    cases = [(dict(), u, packages[i % len(packages)], horizon, 100 + i) for i, u in enumerate(units)]
+    if not cases:
+        return {"id": "A2", "status": "fail", "passed": 0, "total": 0, "problems": ["no cases generated for A2"]}
+    # 1. Forward order with hash_seed=0 vs reversed order with hash_seed=42 (separate worker processes!)
+    fwd = cand.run_many(cases, hash_seed="0", id_salt="salt_a")
+    rev = list(reversed(cand.run_many(list(reversed(cases)), hash_seed="42", id_salt="salt_b" if check_invariance else "salt_a")))
+    n_pass = 0
+    for idx, (oa, ob) in enumerate(zip(fwd, rev)):
+        same, worst = _outcomes_close(oa, ob, rel=tol, abs_tol=tol)
+        if same:
+            n_pass += 1
+        else:
+            probs.append(f"case {idx}: differs across process/PYTHONHASHSEED/order/opaque-id (rel={worst:.3g})")
+    # 2. Seed sensitivity at request.seed_test_setting (BE6)
+    sts = req.get("seed_test_setting")
+    if isinstance(sts, Mapping) and isinstance(sts.get("unit"), Mapping):
+        su = UnitSpec("seed_test", dict(sts["unit"]))
+    else:
+        su = units[0]
+    spkg = packages[0]
+    o_s1 = cand.run({}, su, spkg, horizon, seed=101, hash_seed="0")
+    o_s2 = cand.run({}, su, spkg, horizon, seed=202, hash_seed="0")
+    same_seeds, _ = _outcomes_close(o_s1, o_s2, rel=tol, abs_tol=tol)
+    if stochastic and same_seeds:
+        probs.append("stochastic engine produced identical outcomes for different seeds at seed_test_setting")
+    elif not stochastic and not same_seeds:
+        probs.append("deterministic engine produced different outcomes for different seeds at seed_test_setting")
+    return {"id": "A2", "status": "pass" if not probs else "fail", "passed": n_pass, "total": len(cases),
+            "problems": probs[:12]}
+
+
+def check_a3(cand: BCAND.CandidateEngine, units: list[UnitSpec], packages: list[Package],
+             horizon: Horizon, *, th: Mapping) -> dict:
+    """A3 batch equals run: skipped when module has no `run_batch_state`; else exact pair-by-pair match (BE7)."""
+    if not cand.has_batch():
+        return {"id": "A3", "status": "skipped", "passed": 0, "total": 0, "problems": []}
+    tol = float(th["batch_vs_run_rel_tol"])
+    probs: list[str] = []
+    n_total, n_pass = 0, 0
+    for u in units[:4]:
+        p_sets = [{} for _ in packages]
+        b_outs = cand.run_batch(p_sets, u, packages, horizon, seed=7)
+        for pk, bo in zip(packages, b_outs):
+            n_total += 1
+            so = cand.run({}, u, pk, horizon, seed=7)
+            same, worst = _outcomes_close(bo, so, rel=tol, abs_tol=tol)
+            if same:
+                n_pass += 1
+            else:
+                probs.append(f"{u.id}/{pk.id}: run_batch differs from run (rel={worst:.3g} > {tol})")
+    return {"id": "A3", "status": "pass" if not probs else "fail", "passed": n_pass, "total": n_total,
+            "problems": probs[:12]}
+
+
+def _within_tol(got, want, tol: Mapping) -> tuple[bool, float]:
+    if isinstance(want, (list, tuple)):
+        if not isinstance(got, (list, tuple)) or len(got) != len(want):
+            return False, float("inf")
+        worst = 0.0
+        for g, w in zip(got, want):
+            ok_, err = _within_tol(g, w, tol)
+            worst = max(worst, err)
+            if not ok_:
+                return False, worst
+        return True, worst
+    g, w = float(got), float(want)
+    if not (math.isfinite(g) and math.isfinite(w)):
+        return False, float("inf")
+    diff = abs(g - w)
+    ok_abs = ("abs" in tol) and diff <= float(tol["abs"])
+    ok_rel = ("rel" in tol) and diff <= float(tol["rel"]) * max(abs(w), 1e-12)
+    return (ok_abs or ok_rel), diff
+
+
+def check_a4(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+             rng: np.random.Generator, *, n_free: int, th: Mapping, ref_units: list[UnitSpec] | None = None) -> dict:
+    """A4 analytic/oracle reductions + harness-derived absent-component & N-invariance identities (BE10)."""
+    req = build_decl["request"]
+    comp_specs = req.get("components") or {}
+    attr_specs = req.get("unit_attributes") or {}
+    param_specs = {p["name"]: p for p in (req.get("parameters") or [])}
+    absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
+    default_hor = _default_horizon(spec_raw, req)
+    probs: list[str] = []
+    n_total, n_pass = 0, 0
+    details: list[dict] = []
+
+    # 1. Declared reductions × n_free settings of inputs left free by the reduction
+    for red in (req.get("reductions") or []):
+        rid = str(red["id"])
+        expected = BORC.call_oracle(red["oracle"], red["oracle_args"])
+        rset = red.get("set") or {}
+        runit = red.get("unit") or {}
+        rhor_d = red.get("horizon")
+        rhor = (Horizon(float(rhor_d["start"]), float(rhor_d["stop"]),
+                        tuple(rhor_d.get("window") or (rhor_d["start"], rhor_d["stop"])),
+                        {str(k): list(v) for k, v in (rhor_d.get("windows") or {}).items()})
+                if isinstance(rhor_d, Mapping) else default_hor)
+        free_units = generate_domain_units(req, n_free, rng, ref_units=ref_units)
+        for fi, fu in enumerate(free_units):
+            # Apply declared unit overrides on top of free draw
+            u_attrs = dict(fu.attributes)
+            u_attrs.update(runit)
+            # Apply declared parameter & component overrides, varying free parameters slightly on hidden draws
+            prm = {}
+            pkg_c = dict(absent_pkg)
+            for k, v in rset.items():
+                if k in param_specs:
+                    prm[k] = float(v)
+                elif k in comp_specs:
+                    pkg_c[k] = v
+            if fi > 0:
+                for pn, ps in param_specs.items():
+                    if pn not in prm and ps.get("kind") != "calibrated":
+                        pts = _domain_points_param(ps)
+                        prm[pn] = float(pts[int(rng.integers(0, len(pts)))])
+            out = cand.run(prm, UnitSpec(f"red_{rid}_{fi}", u_attrs), Package(f"red_{rid}", pkg_c), rhor, seed=11 + fi)
+            od = _out_dict(out)
+            for path, tol in (red.get("compare") or {}).items():
+                n_total += 1
+                got = BM.get(od, path)
+                ok_, err = _within_tol(got, expected, tol)
+                details.append({"id": f"{rid}[{fi}]:{path}", "expected": expected, "computed": got, "ok": ok_})
+                if ok_:
+                    n_pass += 1
+                else:
+                    probs.append(f"{rid}[{fi}] {path}: computed={got!r}, expected={expected!r} (err={err:.4g}, tol={tol})")
+
+    # 2. Identity: all components at absent values equals empty package {}
+    id_u = generate_domain_units(req, 1, rng, ref_units=ref_units)[0]
+    o_empty = cand.run({}, id_u, Package("empty", {}), default_hor, seed=17)
+    o_abs = cand.run({}, id_u, Package("absent", dict(absent_pkg)), default_hor, seed=17)
+    n_total += 1
+    same_abs, worst_abs = _outcomes_close(o_empty, o_abs, rel=1e-12, abs_tol=1e-12)
+    if same_abs:
+        n_pass += 1
+    else:
+        probs.append(f"absent-components identity failed (rel={worst_abs:.3g})")
+
+    # 3. Identity: per_capita invariant to N when declared
+    if req.get("per_capita_invariant_to_N") and "N" in attr_specs and attr_specs["N"].get("type") in ("continuous", "integer"):
+        n_lo, n_hi = attr_specs["N"].get("range") or attr_specs["N"].get("test_range") or [1000.0, 10000.0]
+        n1 = float(n_lo) + 0.25 * (float(n_hi) - float(n_lo))
+        n2 = float(n_lo) + 0.75 * (float(n_hi) - float(n_lo))
+        if attr_specs["N"].get("type") == "integer":
+            n1, n2 = int(round(n1)), int(round(n2))
+        u1 = UnitSpec("n_inv_1", dict(id_u.attributes, N=n1))
+        u2 = UnitSpec("n_inv_2", dict(id_u.attributes, N=n2))
+        o1 = cand.run({}, u1, Package("none", dict(absent_pkg)), default_hor, seed=19)
+        o2 = cand.run({}, u2, Package("none", dict(absent_pkg)), default_hor, seed=19)
+        n_total += 1
+        same_n = True
+        tol_n = 0.05 if req.get("stochastic") else 1e-6
+        for k, m in o1.per_capita.items():
+            for g, v1 in m.items():
+                v2 = (o2.per_capita.get(k) or {}).get(g, float("nan"))
+                if abs(float(v1) - float(v2)) > max(1e-9, tol_n * max(abs(float(v1)), abs(float(v2)), 1.0)):
+                    same_n = False
+                    probs.append(f"per_capita_invariant_to_N failed on {k}[{g}]: N={n1}->{v1:.5g}, N={n2}->{v2:.5g}")
+        if same_n:
+            n_pass += 1
+
+    return {"id": "A4", "status": "pass" if not probs else "fail", "passed": n_pass, "total": n_total,
+            "problems": probs[:12], "details": details[:12]}
+
+
+def check_a5(cand: BCAND.CandidateEngine, build_decl: Mapping, units: list[UnitSpec],
+             packages: list[Package], horizon: Horizon, *, th: Mapping) -> dict:
+    """A5 mass balance, population conservation, and compartment transition-count witness (BE8, BE9)."""
+    if build_decl.get("kind") != "starsim_module":
+        return {"id": "A5", "status": "not_applicable", "passed": 0, "total": 0, "problems": []}
+    req = build_decl["request"]
+    cmps = req.get("compartments") or {}
+    decl_states = list(cmps.get("states") or [])
+    conservation = str(cmps.get("conservation") or "closed")
+    transitions = list(cmps.get("transitions") or [])
+    bal_tol = float(th["mass_balance_rel_tol"])
+    tr_tol = float(th["transition_count_rel_tol"])
+    probs: list[str] = []
+    n_total, n_pass = 0, 0
+
+    # Identify pure-exit states (no inflows) and pure-entry states (no outflows) for transition-count verification (BE9)
+    in_edges: dict[str, list[dict]] = {s: [] for s in decl_states}
+    out_edges: dict[str, list[dict]] = {s: [] for s in decl_states}
+    for tr in transitions:
+        frm, to = tr.get("from"), tr.get("to")
+        if frm in out_edges:
+            out_edges[frm].append(tr)
+        if to in in_edges:
+            in_edges[to].append(tr)
+
+    for idx, u in enumerate(units):
+        pk = packages[idx % len(packages)]
+        n_total += 1
+        c_probs: list[str] = []
+        out = cand.run({}, u, pk, horizon, seed=23 + idx)
+        bal = (out.meta or {}).get("balance")
+        if not isinstance(bal, dict) or not bal.get("n_steps"):
+            c_probs.append(f"{u.id}: missing harness balance trace (state_vars() empty or omitted)")
+        else:
+            init_s = bal.get("initial_states") or {}
+            final_s = bal.get("final_states") or {}
+            miss = [s for s in decl_states if s not in init_s]
+            if miss:
+                c_probs.append(f"{u.id}: state_vars() missing declared state(s) {miss}")
+            mn = bal.get("min_state")
+            if mn is None or not _finite(mn) or float(mn) < -1e-9:
+                c_probs.append(f"{u.id}: negative or non-finite state detected (min_state={mn!r})")
+            if conservation == "closed":
+                drift = bal.get("max_rel_drift")
+                if drift is None or not _finite(drift) or float(drift) > bal_tol:
+                    c_probs.append(f"{u.id}: closed conservation violated (max_rel_drift={drift!r} > {bal_tol})")
+            # Transition-count witness (BE9): any output counted uniquely by a pure-exit or pure-entry transition
+            # must agree with the compartment trace's net count divided by total population N0!
+            n0 = float(bal.get("initial_total") or 0.0)
+            if n0 > 0 and not c_probs:
+                for tr in transitions:
+                    frm, to = tr.get("from"), tr.get("to")
+                    cnts = list(tr.get("counts") or [])
+                    if not cnts:
+                        continue
+                    witness_count = None
+                    # Pure exit state with a single outgoing transition (e.g. S -> I in SIR)
+                    if frm in out_edges and len(out_edges[frm]) == 1 and len(in_edges[frm]) == 0 and frm in init_s:
+                        witness_count = float(init_s[frm]) - float(final_s[frm])
+                    # Pure sink state with a single incoming transition (e.g. I -> H in SIRH)
+                    elif to in in_edges and len(in_edges[to]) == 1 and len(out_edges[to]) == 0 and to in init_s:
+                        witness_count = float(final_s[to]) - float(init_s[to])
+                    if witness_count is not None:
+                        want_pc = witness_count / n0
+                        for cname in cnts:
+                            got_pc = _extract_output(out, cname)
+                            if abs(got_pc - want_pc) > max(1e-6, tr_tol * max(abs(want_pc), 1.0)):
+                                c_probs.append(
+                                    f"{u.id}: output {cname!r}={got_pc:.6g} disagrees with signed transition "
+                                    f"{frm}->{to} witness {want_pc:.6g} (computed apart from dynamics)"
+                                )
+        if not c_probs:
+            n_pass += 1
+        else:
+            probs.extend(c_probs[:3])
+    return {"id": "A5", "status": "pass" if not probs else "fail", "passed": n_pass, "total": n_total,
+            "problems": probs[:12]}
+
+
+def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+                rng: np.random.Generator, *, n_bases: int, min_moving: int, th: Mapping,
+                ref_units: list[UnitSpec] | None = None) -> tuple[dict, dict]:
+    """A6 sensitivity wiring + param_reads + A7 declared directions (BE2, BE3, BE4, BE5)."""
+    req = build_decl["request"]
+    abs_floor = float(th["move_abs_floor"])
+    rel_floor = float(th["move_rel_floor"])
+    stochastic = bool(req.get("stochastic", False))
+    k_seeds = int(th["stochastic_seeds_init"]) if stochastic else 1
+    z_crit = NormalDist().inv_cdf(0.5 + float(th["move_ci_level"]) / 2.0)
+
+    comp_specs = req.get("components") or {}
+    attr_specs = req.get("unit_attributes") or {}
+    param_specs = {p["name"]: p for p in (req.get("parameters") or [])}
+    inert = set((req.get("inert") or {}).keys())
+    param_roles = dict(req.get("parameter_roles") or {})
+    expected_effects = req.get("expected_effects") or {}
+    absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
+    hor = _default_horizon(spec_raw, req)
+
+    # Map intervention parameters (from decision_inputs) to their owning component so base points turn it ON
+    param_to_comp: dict[str, tuple[str, object]] = {}
+    for cname, spec_or_items in (req.get("decision_inputs") or {}).items():
+        items = spec_or_items if isinstance(spec_or_items, list) else (spec_or_items.get("inputs") or [])
+        active_vals = [v for v in (comp_specs.get(cname, {}).get("values") or []) if v != comp_specs.get(cname, {}).get("absent")]
+        if active_vals:
+            for it in items:
+                if isinstance(it, Mapping) and it.get("kind") == "parameter":
+                    param_to_comp[str(it["name"])] = (cname, active_vals[-1])
+
+    # Generate base units (interior of domains)
+    base_units = generate_domain_units(req, n_bases, rng, ref_units=ref_units)
+    a6_probs: list[str] = []
+    a7_probs: list[str] = []
+    wiring_rows: list[dict] = []
+    outputs_moved: set[str] = set()
+    reads_build_all: set[str] = set()
+    reads_outcomes_all: set[str] = set()
+    pair_total, pair_pass_a6, pair_pass_a7 = 0, 0, 0
+
+    def _eval_vec(prm: dict, u: UnitSpec, pk: Package, seeds: list[int]) -> list[Outcomes]:
+        if len(seeds) == 1:
+            return [cand.run(prm, u, pk, hor, seed=seeds[0])]
+        return cand.run_many([(prm, u, pk, hor, s) for s in seeds])
+
+    seeds = [31 + i for i in range(k_seeds)]
+
+    for iname, out_signs in sorted(expected_effects.items()):
+        if iname in inert:
+            continue
+        if iname in param_specs:
+            ikind = "parameter"
+            pts = _domain_points_param(param_specs[iname])
+        elif iname in comp_specs:
+            ikind = "component"
+            pts = list(comp_specs[iname]["values"])
+        elif iname in attr_specs:
+            ikind = "attribute"
+            ref_v = base_units[0].attributes.get(iname) if base_units else None
+            pts = _domain_points_attr(attr_specs[iname], ref_vec=ref_v)
+        else:
+            continue
+
+        for oname, sign in sorted(out_signs.items()):
+            pair_total += 1
+            moved_bases = 0
+            sign_ok_all = True
+            max_rel_change = 0.0
+            for bi, bu in enumerate(base_units):
+                base_pkg = dict(absent_pkg)
+                if ikind == "parameter" and iname in param_to_comp:
+                    oc, ov = param_to_comp[iname]
+                    base_pkg[oc] = ov
+                ys_by_pt: list[list[float]] = []
+                for pt in pts:
+                    prm = {iname: float(pt)} if ikind == "parameter" else {}
+                    pk_map = dict(base_pkg, **{iname: pt}) if ikind == "component" else dict(base_pkg)
+                    u_use = UnitSpec(f"a6_{bi}", dict(bu.attributes, **{iname: pt})) if ikind == "attribute" else bu
+                    outs = _eval_vec(prm, u_use, Package(f"p_{bi}", pk_map), seeds)
+                    for o in outs:
+                        pr = (o.meta or {}).get("param_reads") or {}
+                        reads_build_all.update(pr.get("build") or [])
+                        reads_outcomes_all.update(pr.get("read_outcomes") or [])
+                    ys_by_pt.append([_extract_output(o, oname) for o in outs])
+                # Compare endpoints (pt[-1] vs pt[0]) and max span across points
+                diffs = [ys_by_pt[-1][s] - ys_by_pt[0][s] for s in range(len(seeds))]
+                y0_mean = float(np.mean(ys_by_pt[0]))
+                floor = max(abs_floor, rel_floor * abs(y0_mean))
+                d_mean = float(np.mean(diffs))
+                rel_ch = abs(d_mean) / max(abs(y0_mean), 1e-12)
+                max_rel_change = max(max_rel_change, rel_ch)
+                if stochastic and len(seeds) > 1:
+                    se = float(np.std(diffs, ddof=1)) / math.sqrt(len(seeds))
+                    lo_ci, hi_ci = d_mean - z_crit * se, d_mean + z_crit * se
+                    moved = (lo_ci > floor) or (hi_ci < -floor)
+                else:
+                    # Also check interior points for non-monotonic 'nonzero' effects
+                    span = max(float(np.mean(ys)) for ys in ys_by_pt) - min(float(np.mean(ys)) for ys in ys_by_pt)
+                    moved = (span > floor) if sign == "nonzero" else (abs(d_mean) > floor)
+                if moved:
+                    moved_bases += 1
+                    outputs_moved.add(oname)
+                    if sign == "+" and not (d_mean > 0):
+                        sign_ok_all = False
+                    elif sign == "-" and not (d_mean < 0):
+                        sign_ok_all = False
+            ok_a6 = moved_bases >= min(min_moving, n_bases)
+            ok_a7 = ok_a6 and sign_ok_all  # A7 CANNOT pass vacuously if A6 failed (BE4)
+            wiring_rows.append({
+                "input": iname, "output": oname, "sign": sign,
+                "moved_bases": moved_bases, "n_bases": n_bases,
+                "max_rel_change": round(max_rel_change, 6),
+                "a6_ok": ok_a6, "a7_ok": ok_a7,
+            })
+            if ok_a6:
+                pair_pass_a6 += 1
+            else:
+                a6_probs.append(f"({iname} -> {oname}): moved at only {moved_bases}/{n_bases} base points "
+                                f"(max_rel_change={max_rel_change:.3g}, floor={rel_floor})")
+            if ok_a7:
+                pair_pass_a7 += 1
+            elif ok_a6 and not sign_ok_all:
+                a7_probs.append(f"({iname} -> {oname}): declared sign {sign!r} violated")
+            else:
+                a7_probs.append(f"({iname} -> {oname}): cannot verify sign {sign!r} because pair did not move in A6")
+
+    # Every declared non-inert parameter must be read; read_outcomes-only parameters require parameter_roles (BE5)
+    for pname in sorted(param_specs):
+        if pname in inert:
+            continue
+        if pname not in reads_build_all and pname not in reads_outcomes_all:
+            a6_probs.append(f"parameter {pname!r} was never read during A6 evaluations (dead parameter)")
+        elif pname in reads_outcomes_all and pname not in reads_build_all and pname not in param_roles:
+            a6_probs.append(f"parameter {pname!r} was read ONLY in read_outcomes() without a signed parameter_roles entry")
+
+    # Every declared output must be moved by at least one input
+    req_outs = req.get("outputs") or {}
+    all_decl_outs = list(req_outs.get("per_capita") or []) + list(req_outs.get("cost_drivers") or []) + [
+        m for ms in (req_outs.get("windows") or {}).values() for m in ms
+    ]
+    for oname in all_decl_outs:
+        if oname not in outputs_moved:
+            a6_probs.append(f"declared output {oname!r} was not moved by any input in A6")
+
+    a6 = {"id": "A6", "status": "pass" if not a6_probs else "fail",
+          "passed": pair_pass_a6, "total": pair_total, "problems": a6_probs[:12], "wiring": wiring_rows}
+    a7 = {"id": "A7", "status": "pass" if not a7_probs else "fail",
+          "passed": pair_pass_a7, "total": pair_total, "problems": a7_probs[:12]}
+    return a6, a7
+
+
+def build_trial_bench_artifacts(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping) -> tuple[dict, dict, dict, dict | None]:
+    """Generate authoritative `pack.yaml`, `results.yaml`, `benchmark_coverage.yaml`, and optional
+    `fitted.yaml` for A8 from `request.trials`, run through `toolkit/engines/benchmark.py`."""
+    req = build_decl["request"]
+    comp_specs = req.get("components") or {}
+    absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
+    hor = _default_horizon(spec_raw, req)
+    seeds = [1, 2, 3, 4] if req.get("stochastic") else [1]
+
+    settings: dict = {}
+    arms: dict = {}
+    benchmarks: list[dict] = []
+    cov_benchmarks: dict = {}
+
+    for tr in (req.get("trials") or []):
+        tid = str(tr["id"])
+        sname = f"set_{tid}"
+        tset = tr.get("setting") or {}
+        if "unit" in tset and isinstance(tset["unit"], Mapping):
+            u_map = dict(tset["unit"])
+            p_map = dict(tset.get("params") or {})
+        else:
+            u_map = dict(tset)
+            p_map = {}
+        w = tr.get("window") or [hor.start, hor.stop]
+        st_entry: dict = {
+            "unit": u_map,
+            "horizon": {"start": float(w[0]), "stop": float(w[1]), "window": [float(w[0]), float(w[1])],
+                        "windows": {str(wn): [float(w[0]), float(w[1])] for wn in hor.windows}},
+        }
+        if p_map:
+            st_entry["params"] = p_map
+        settings[sname] = st_entry
+
+        arm_rename: dict[str, str] = {}
+        covered_vals: set = set()
+        tcomp = str(tr["component"])
+        for aname, amap in (tr.get("arms") or {}).items():
+            full_arm = f"{tid}_{aname}"
+            arm_rename[str(aname)] = full_arm
+            pkg = dict(absent_pkg)
+            pkg.update(amap or {})
+            arms[full_arm] = {"setting": sname, "package": pkg}
+            if tcomp in pkg and pkg[tcomp] != absent_pkg.get(tcomp):
+                covered_vals.add(pkg[tcomp])
+
+        em = copy.deepcopy(tr.get("estimand_mapping") or {})
+        et = str(tr.get("estimand_type", "ratio"))
+        for ak in ("num", "den", "a11", "a10", "a01", "a00"):
+            if ak in em:
+                if isinstance(em[ak], list):
+                    em[ak] = [arm_rename.get(x, x) for x in em[ak]]
+                else:
+                    em[ak] = arm_rename.get(em[ak], em[ak])
+        em["type"] = et
+        pub = tr.get("published") or {}
+        lo, hi = float(pub["lower"]), float(pub["upper"])
+        level = float(pub.get("level", 0.95))
+        scale = "currency_per_outcome" if et == "cost_per_outcome" else "ratio"
+        src_et = "odds_ratio" if et in ("odds_ratio", "interaction_or") else (
+            "cost_per_outcome" if et == "cost_per_outcome" else "risk_ratio"
+        )
+        bm_entry = {
+            "id": tid,
+            "metric": f"{tcomp} trial {tid} ({tr.get('dossier')})",
+            "source": str(tr.get("dossier", "dossier")),
+            "target": round(0.5 * (lo + hi), 6),
+            "band": [lo, hi],
+            "published": {"lower": lo, "upper": hi, "level": level, "scale": scale, "table": str(tr.get("dossier", "dossier"))},
+            "estimand_type": src_et,
+            "diagnostic": "not reported",
+            "age_band": "mixed",
+            "estimand": em,
+        }
+        benchmarks.append(bm_entry)
+        # Coverage entry (NO effects_from_spec under policy="built")
+        eff_params = []
+        di_entry = (req.get("decision_inputs") or {}).get(tcomp)
+        di_items = di_entry if isinstance(di_entry, list) else ((di_entry or {}).get("inputs") or [])
+        for it in di_items:
+            if isinstance(it, Mapping) and it.get("kind") == "parameter":
+                eff_params.append(str(it["name"]))
+        cov_benchmarks[tid] = {
+            "covers": {tcomp: sorted(covered_vals, key=str)} if covered_vals else {},
+            "estimand": "effect_vs_none" if et != "cost_per_outcome" else "cost_per_outcome",
+            **({"effect_parameters": eff_params} if eff_params else {}),
+            **({"covers_none_because": "no active component arm"} if not covered_vals else {}),
+        }
+
+    # If request has no trials, add a single exempt value benchmark so pack.yaml has non-empty benchmarks list
+    if not benchmarks:
+        u0 = generate_domain_units(req, 1, np.random.default_rng(0))[0]
+        settings["s_id"] = {"unit": dict(u0.attributes)}
+        arms["a_none"] = {"setting": "s_id", "package": dict(absent_pkg)}
+        pc0 = (req.get("outputs") or {}).get("per_capita", ["cases"])[0]
+        benchmarks.append({
+            "id": "ID0",
+            "metric": "baseline non-negative identity",
+            "source": "harness",
+            "band": [0.0, 1e12],
+            "estimand": {"type": "value", "a": {"arm": "a_none", "value": f"per_capita_all.{pc0}"},
+                         "b": {"arm": "a_none", "value": f"per_capita_all.{pc0}"}, "tol": {"abs": 1e-9}},
+        })
+        cov_benchmarks["ID0"] = {"covers": {}, "covers_none_because": "structural identity benchmark (no trial declared)"}
+
+    pack_doc = {
+        "engine": BCAND.CandidateEngine.ENGINE_REF,
+        "seeds": seeds,
+        "initialisation": {
+            "method": "built-engine admission harness",
+            "evidence": ["not applicable: verified by admission checks A1-A11"],
+        },
+        "horizon": {"start": hor.start, "stop": hor.stop, "window": list(hor.window), "windows": dict(hor.windows)},
+        "settings": settings,
+        "arms": arms,
+        "benchmarks": benchmarks,
+    }
+    cov_doc = {
+        "engine": cand.describe().name,
+        "absent_values": {c: [cs["absent"]] for c, cs in comp_specs.items()},
+        "benchmarks": cov_benchmarks,
+    }
+
+    # If the built engine declares any `fitted` parameters, create a stamped fitted.yaml backing them
+    fitted_params = [p for p in cand.parameters() if p.kind == "fitted"]
+    fitted_doc = None
+    if fitted_params:
+        fitted_doc = BM.stamp({
+            "parameters": {p.name: {"value": p.value, "lo": p.lo, "hi": p.hi} for p in fitted_params},
+            "band_declarations": BS.fit_declarations(pack_doc),
+        }, cand)
+
+    # Run pack through benchmark.Runner(mode='fit' when fitted_doc not yet written on disk, then stamp)
+    runner = BM.Runner(pack_doc, cand, workers=1, seeds=seeds, mode="fit")
+    raw_res = BM.run_pack(pack_doc, cand, runner, {})
+    res_doc = BM.stamp(raw_res, cand)
+    return pack_doc, res_doc, cov_doc, fitted_doc
+
+
+def check_a8(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+             *, departures_status: str = "signed") -> tuple[dict, dict, dict, dict, dict | None]:
+    """A8 trial benchmarks + built coverage policy (`policy='built'`, BE15)."""
+    pack_doc, res_doc, cov_doc, fitted_doc = build_trial_bench_artifacts(cand, build_decl, spec_raw)
+    rows = res_doc.get("benchmarks") or []
+    card = cand.describe()
+    pnames = [p.name for p in cand.parameters()]
+    g = BC.gate(
+        cov_doc,
+        BC.problems(cov_doc),
+        card.name,
+        dict(spec_raw),
+        lambda: (rows, None),
+        list(spec_raw.get("engine_departures") or []),
+        departures_status,
+        pack=pack_doc,
+        has_benchmarks=True,
+        version=card.version,
+        param_names=pnames,
+        policy="built",
+    )
+    probs = list(g.get("why_not") or [])
+    n_total = len(rows)
+    n_pass = sum(1 for r in rows if r.get("status") == "in_band")
+    routing = "spec_amendment" if (probs and (g.get("blocking") or any("no benchmark" in p for p in probs))) else None
+    chk = {
+        "id": "A8",
+        "status": "pass" if not probs else "fail",
+        "passed": n_pass,
+        "total": n_total,
+        "problems": probs[:12],
+        "rows": [{"id": r.get("id"), "computed": r.get("computed"), "band": r.get("band"), "status": r.get("status")}
+                 for r in rows],
+        "routing": routing,
+    }
+    return chk, pack_doc, res_doc, cov_doc, fitted_doc
+
+
+def check_a9(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+             dossier_benchmarks: list[dict] | None = None) -> dict:
+    """A9 literature/dossier value benchmarks: reported, gating only for IDs in `gating_benchmarks`."""
+    req = build_decl["request"]
+    gating_ids = set(req.get("gating_benchmarks") or [])
+    items = list(dossier_benchmarks or [])
+    if not items:
+        return {"id": "A9", "status": "pass", "passed": 0, "total": 0, "problems": [], "rows": []}
+    hor = _default_horizon(spec_raw, req)
+    absent_pkg = {c: cs["absent"] for c, cs in (req.get("components") or {}).items()}
+    probs: list[str] = []
+    rows: list[dict] = []
+    n_pass = 0
+    for b in items:
+        bid = str(b["id"])
+        u = UnitSpec(f"a9_{bid}", dict(b.get("unit") or {}))
+        pk = Package(f"a9_{bid}", dict(absent_pkg, **(b.get("package") or {})))
+        out = cand.run(dict(b.get("params") or {}), u, pk, hor, seed=41)
+        val = _extract_output(out, str(b["path"]))
+        lo, hi = float(b["band"][0]), float(b["band"][1])
+        in_b = lo <= val <= hi
+        if in_b:
+            n_pass += 1
+        elif bid in gating_ids:
+            probs.append(f"gating literature benchmark {bid}: computed={val:.5g} outside [{lo}, {hi}]")
+        rows.append({"id": bid, "computed": val, "band": [lo, hi], "in_band": in_b, "gating": bid in gating_ids})
+    return {"id": "A9", "status": "pass" if not probs else "fail", "passed": n_pass, "total": len(items),
+            "problems": probs, "rows": rows}
+
+
+def check_a10(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+              *, base_dir: str | None = None) -> dict:
+    """A10 identifiability on calibration targets via `calibrators.calibrate_as_run` (non-gating on its own)."""
+    cal = spec_raw.get("calibration") if isinstance(spec_raw, Mapping) else None
+    method = str((cal or {}).get("method", "none")) if isinstance(cal, Mapping) else "none"
+    if method == "none" and not (isinstance(cal, Mapping) and cal.get("joint")):
+        return {"id": "A10", "status": "skipped", "passed": 0, "total": 0, "problems": [], "classes": {}}
+    from toolkit.engines.built import calibrators as BCAL
+    try:
+        res = BCAL.calibrate_as_run(
+            lambda _cfg=None: cand,
+            {"spec_raw": dict(spec_raw), "base_dir": base_dir or os.getcwd()},
+            seed=53,
+        )
+        classes = dict(res.get("classes") or {})
+        unid = sorted(k for k, v in classes.items() if v == "unidentified")
+        return {
+            "id": "A10",
+            "status": "pass",
+            "passed": len(classes) - len(unid),
+            "total": len(classes),
+            "classes": classes,
+            "ridges": res.get("ridges") or [],
+            "unidentified": unid,
+            "problems": [],
+        }
+    except Exception as e:  # noqa: BLE001 -- A10 does not gate admission on its own (open question 8)
+        return {"id": "A10", "status": "unavailable", "passed": 0, "total": 0,
+                "classes": {}, "problems": [f"A10 calibration check unavailable: {e}"]}
+
+
+def check_a11(cand: BCAND.CandidateEngine, ref_cand: BCAND.CandidateEngine | None, build_decl: Mapping,
+              cases: list[tuple[dict, UnitSpec, Package, Horizon]], *, th: Mapping, required: bool = True) -> dict:
+    """A11 independent reference equivalence test (BE17):
+    - Deterministic: every compared output within `min(request.reference_tolerance, thresholds.reference_rel_ceiling)`.
+    - Stochastic: 95% paired CRN CI of mean difference must lie ENTIRELY inside tolerance; doubles K up to
+      `stochastic_seeds_max`; still straddling -> `inconclusive` (NOT admitted!)."""
+    if ref_cand is None:
+        if not required:
+            return {"id": "A11", "status": "skipped", "passed": 0, "total": 0, "problems": []}
+        return {"id": "A11", "status": "unavailable", "passed": 0, "total": 0,
+                "problems": ["independent reference implementation unavailable (A11 required)"]}
+    req = build_decl["request"]
+    stochastic = bool(req.get("stochastic", False))
+    rtol_decl = req.get("reference_tolerance") or {}
+    rel_lim = min(float(rtol_decl.get("rel", th["reference_rel_ceiling"])), float(th["reference_rel_ceiling"]))
+    abs_lim = float(rtol_decl.get("abs", th["reference_abs_default"]))
+    z_crit = NormalDist().inv_cdf(0.5 + float(th["move_ci_level"]) / 2.0)
+    k_init = int(th["stochastic_seeds_init"])
+    k_max = int(th["stochastic_seeds_max"])
+
+    req_outs = req.get("outputs") or {}
+    out_names = list(req_outs.get("per_capita") or []) + list(req_outs.get("cost_drivers") or []) + [
+        m for ms in (req_outs.get("windows") or {}).values() for m in ms
+    ]
+    probs: list[str] = []
+    inconclusive = False
+    n_total, n_pass = 0, 0
+    rows: list[dict] = []
+
+    for ci, (prm, u, pk, hor) in enumerate(cases):
+        if not stochastic:
+            oc = cand.run(prm, u, pk, hor, seed=71 + ci)
+            or_ = ref_cand.run(prm, u, pk, hor, seed=71 + ci)
+            for oname in out_names:
+                n_total += 1
+                vc, vr = _extract_output(oc, oname), _extract_output(or_, oname)
+                diff = abs(vc - vr)
+                tol = max(abs_lim, rel_lim * max(abs(vr), 1e-12))
+                ok_ = math.isfinite(diff) and diff <= tol
+                rows.append({"case": ci, "output": oname, "cand": vc, "ref": vr, "tol": tol, "ok": ok_})
+                if ok_:
+                    n_pass += 1
+                else:
+                    probs.append(f"case {ci} {oname}: candidate={vc:.5g} vs ref={vr:.5g} (|diff|={diff:.4g} > tol={tol:.4g})")
+        else:
+            # Stochastic equivalence: double K until CI lies inside [-tol, +tol], clearly outside, or hits k_max
+            k = k_init
+            while True:
+                seeds = [200 + ci * 1000 + s for s in range(k)]
+                c_outs = cand.run_many([(prm, u, pk, hor, s) for s in seeds])
+                r_outs = ref_cand.run_many([(prm, u, pk, hor, s) for s in seeds])
+                need_more = False
+                case_rows = []
+                case_probs = []
+                case_inc = False
+                for oname in out_names:
+                    cs = [_extract_output(o, oname) for o in c_outs]
+                    rs = [_extract_output(o, oname) for o in r_outs]
+                    diffs = [a - b for a, b in zip(cs, rs)]
+                    mean_d = float(np.mean(diffs))
+                    mean_r = float(np.mean(rs))
+                    se = float(np.std(diffs, ddof=1)) / math.sqrt(k) if k > 1 else 0.0
+                    lo_ci, hi_ci = mean_d - z_crit * se, mean_d + z_crit * se
+                    tol = max(abs_lim, rel_lim * max(abs(mean_r), 1e-12))
+                    if lo_ci >= -tol and hi_ci <= tol:
+                        case_rows.append({"case": ci, "output": oname, "mean_diff": mean_d, "ci": [lo_ci, hi_ci],
+                                          "tol": tol, "k": k, "status": "equivalent"})
+                    elif lo_ci > tol or hi_ci < -tol:
+                        case_probs.append(f"case {ci} {oname}: ref mismatch CI [{lo_ci:.4g}, {hi_ci:.4g}] outside +/-{tol:.4g} (K={k})")
+                        case_rows.append({"case": ci, "output": oname, "mean_diff": mean_d, "ci": [lo_ci, hi_ci],
+                                          "tol": tol, "k": k, "status": "fail"})
+                    elif k < k_max:
+                        need_more = True
+                        break
+                    else:
+                        case_inc = True
+                        case_probs.append(f"case {ci} {oname}: inconclusive at K={k} (CI [{lo_ci:.4g}, {hi_ci:.4g}], tol +/-{tol:.4g})")
+                        case_rows.append({"case": ci, "output": oname, "mean_diff": mean_d, "ci": [lo_ci, hi_ci],
+                                          "tol": tol, "k": k, "status": "inconclusive"})
+                if need_more:
+                    k = min(k * 2, k_max)
+                    continue
+                for cr in case_rows:
+                    n_total += 1
+                    if cr["status"] == "equivalent":
+                        n_pass += 1
+                rows.extend(case_rows)
+                probs.extend(case_probs)
+                if case_inc:
+                    inconclusive = True
+                break
+
+    if probs:
+        status = "inconclusive" if inconclusive and not any("ref mismatch" in p for p in probs) else "fail"
+    else:
+        status = "pass"
+    return {"id": "A11", "status": status, "passed": n_pass, "total": n_total,
+            "problems": probs[:12], "rows": rows[:12]}
+
+
+# --------------------------------------------------------------------------- Public checks (try tool & overfit baseline)
+def run_public_checks(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping,
+                      *, checks: list[str] | None = None) -> dict:
+    """Run ONLY public checks using `PUBLIC_SEED_BYTES` (shared by `try_tool` and overfit comparison)."""
+    th = load_thresholds()
+    req = build_decl["request"]
+    want = set(checks) if checks is not None else {"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"}
+    rng = _rng_from(PUBLIC_SEED_BYTES, "public")
+    hor = _default_horizon(spec_raw, req)
+    comp_specs = req.get("components") or {}
+    absent_pkg = {c: cs["absent"] for c, cs in comp_specs.items()}
+    pub_pkgs = [Package("pub_none", dict(absent_pkg))]
+    for c, cs in sorted(comp_specs.items()):
+        for v in cs["values"]:
+            if v != cs["absent"]:
+                pub_pkgs.append(Package(f"pub_{c}_{v}", dict(absent_pkg, **{c: v})))
+    pub_units = generate_domain_units(req, 2, rng)
+    out_checks: dict[str, dict] = {}
+    if "A1" in want:
+        out_checks["A1"] = check_a1(cand, build_decl, spec_raw, pub_units, pub_pkgs, hor)
+    if "A2" in want:
+        out_checks["A2"] = check_a2(cand, build_decl, pub_units, pub_pkgs, hor, th=th, check_invariance=False)
+    if "A3" in want:
+        out_checks["A3"] = check_a3(cand, pub_units, pub_pkgs, hor, th=th)
+    if "A4" in want:
+        out_checks["A4"] = check_a4(cand, build_decl, spec_raw, _rng_from(PUBLIC_SEED_BYTES, "a4"), n_free=1, th=th)
+    if "A5" in want:
+        out_checks["A5"] = check_a5(cand, build_decl, pub_units, pub_pkgs, hor, th=th)
+    if "A6" in want or "A7" in want:
+        a6, a7 = check_a6_a7(cand, build_decl, spec_raw, _rng_from(PUBLIC_SEED_BYTES, "a6"),
+                             n_bases=1, min_moving=1, th=th)
+        if "A6" in want:
+            out_checks["A6"] = a6
+        if "A7" in want:
+            out_checks["A7"] = a7
+    if "A8" in want:
+        a8, *_ = check_a8(cand, build_decl, spec_raw)
+        out_checks["A8"] = a8
+    ok_all = all(c.get("status") in ("pass", "skipped", "not_applicable") for c in out_checks.values())
+    return {"ok": ok_all, "checks": out_checks}
+
+
+# --------------------------------------------------------------------------- Reuse key & cross-run reuse (§5.4, BE32)
+def compute_reuse_key(
+    snapshot_sha256: str,
+    build_decl: Mapping,
+    spec_raw: Mapping,
+    *,
+    dossier_bytes: bytes | None = None,
+    base_dir: str | None = None,
+    deps_digest: str | None = None,
+) -> str:
+    """Reuse key over every resolved input of every admission check (BE32)."""
+    def _file_sha(p: str) -> str:
+        if os.path.isfile(p):
+            return _sha256_bytes(open(p, "rb").read())
+        return "missing"
+
+    # Hash spec sections that generators read, plus referenced data files if base_dir given
+    du = spec_raw.get("decision_units") if isinstance(spec_raw, Mapping) else None
+    cal = spec_raw.get("calibration") if isinstance(spec_raw, Mapping) else None
+    data_digests: dict[str, str] = {}
+    if base_dir:
+        for sec_name, sec in (("units", du), ("cal", cal)):
+            if isinstance(sec, Mapping):
+                for key in ("csv", "targets_csv", "file", "data"):
+                    rel = sec.get(key)
+                    if isinstance(rel, str) and rel:
+                        data_digests[f"{sec_name}:{rel}"] = _file_sha(os.path.join(base_dir, rel))
+    payload = {
+        "snapshot_sha256": str(snapshot_sha256),
+        "request_sha256": BREQ.request_sha256(build_decl),
+        "decision_units": du,
+        "options": spec_raw.get("options") if isinstance(spec_raw, Mapping) else None,
+        "objective": spec_raw.get("objective") if isinstance(spec_raw, Mapping) else None,
+        "calibration": cal,
+        "engine_departures": spec_raw.get("engine_departures") if isinstance(spec_raw, Mapping) else None,
+        "data_digests": data_digests,
+        "dossier_sha256": _sha256_bytes(dossier_bytes) if dossier_bytes is not None else "none",
+        "thresholds_sha256": _file_sha(THRESHOLDS_PATH),
+        "oracles_sha256": _file_sha(os.path.join(HERE, "oracles.py")),
+        "admission_sha256": _file_sha(os.path.abspath(__file__)),
+        "deps_sha256": deps_digest if deps_digest is not None else BADAPT.deps_sha256(),
+    }
+    return _sha256_json(payload)
+
+
+def try_reuse_admission(prior_run_dir: str, target_run_dir: str, expected_reuse_key: str) -> dict | None:
+    """Reuse a prior run's admission when `reuse_key` matches and every copied artifact verifies (BE32).
+    Never copies `signoff.json` (the owner signs the engine again for the new run, §5.4)."""
+    try:
+        adm_bytes, st = SIO.read_nofollow(prior_run_dir, "engine_build/admission.json")
+        if st.st_nlink > 1:
+            return None
+        adm = json.loads(adm_bytes.decode("utf-8"))
+    except (FileNotFoundError, SIO.LinkRefused, OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(adm, dict) or adm.get("status") != "admitted" or adm.get("reuse_key") != expected_reuse_key:
+        return None
+    snap_sha = adm.get("snapshot_sha256")
+    if not isinstance(snap_sha, str):
+        return None
+    prior_snaps = os.path.join(prior_run_dir, "engine_build", "snapshots")
+    try:
+        verified_files = BSNAP.read_verified_snapshot(prior_snaps, snap_sha)
+    except BSNAP.SnapshotError:
+        return None
+    # Verify prior bench/* digests against prior admission.json before copying anything
+    digests = adm.get("digests") if isinstance(adm.get("digests"), Mapping) else {}
+    copied_bench: dict[str, bytes] = {}
+    for rel, want in digests.items():
+        try:
+            raw, bst = SIO.read_nofollow(prior_run_dir, f"engine_build/{rel}")
+            if bst.st_nlink > 1 or _sha256_bytes(raw) != want:
+                return None
+            copied_bench[rel] = raw
+        except (FileNotFoundError, SIO.LinkRefused, OSError):
+            return None
+
+    # Publish verified snapshot, bench/*, sheet (with reused banner), and admission.json to target_run_dir
+    target_snaps = os.path.join(target_run_dir, "engine_build", "snapshots")
+    os.makedirs(target_snaps, exist_ok=True)
+    for name in sorted(verified_files):
+        SIO.write_nofollow(target_snaps, f"{snap_sha}/{name}", verified_files[name], atomic=True)
+        fd = SIO.open_nofollow(target_snaps, f"{snap_sha}/{name}")
+        try:
+            os.fchmod(fd, 0o444)
+        finally:
+            os.close(fd)
+    dfd = SIO.dir_fd_nofollow(target_snaps, [snap_sha])
+    try:
+        os.fchmod(dfd, 0o555)
+    finally:
+        os.close(dfd)
+    man = {
+        "snapshot_sha256": snap_sha,
+        "files": [{"name": n, "sha256": _sha256_bytes(verified_files[n]), "size": len(verified_files[n])}
+                  for n in sorted(verified_files)],
+    }
+    SIO.write_nofollow(target_snaps, f"{snap_sha}.json", json.dumps(man, indent=1, sort_keys=True).encode("utf-8"), atomic=True)
+    # Re-verify target snapshot
+    BSNAP.read_verified_snapshot(target_snaps, snap_sha)
+    for rel, raw in copied_bench.items():
+        SIO.write_nofollow(target_run_dir, f"engine_build/{rel}", raw, atomic=True)
+    prior_sheet = ""
+    try:
+        prior_sheet = SIO.read_nofollow(prior_run_dir, "engine_build/admission_sheet.md")[0].decode("utf-8")
+    except (FileNotFoundError, SIO.LinkRefused, OSError, UnicodeDecodeError):
+        pass
+    banner = f"> **Reused from run `{os.path.abspath(prior_run_dir)}`** (reuse key `{expected_reuse_key[:16]}`; requires new sign-off).\n\n"
+    SIO.write_nofollow(target_run_dir, "engine_build/admission_sheet.md", (banner + prior_sheet).encode("utf-8"), atomic=True)
+    new_adm = dict(adm, reused_from=os.path.abspath(prior_run_dir))
+    SIO.write_nofollow(target_run_dir, "engine_build/admission.json",
+                       json.dumps(new_adm, indent=1, sort_keys=True).encode("utf-8"), atomic=True)
+    return new_adm
+
+
+# --------------------------------------------------------------------------- Admission sheet & orchestrator
+def render_admission_sheet(adm: Mapping) -> str:
+    """Render `engine_build/admission_sheet.md` (§5.3)."""
+    lines = [
+        f"# Agent-built engine admission sheet: `{adm.get('engine_id')}`",
+        "",
+        f"- **Kind:** `{adm.get('kind')}`",
+        f"- **Status:** `{adm.get('status')}`",
+        f"- **Snapshot sha256:** `{adm.get('snapshot_sha256')}`",
+        f"- **Request sha256:** `{adm.get('request_sha256')}`",
+        f"- **Reuse key:** `{adm.get('reuse_key')}`",
+        f"- **Hidden seed commitment:** `{adm.get('hidden_commitment')}`",
+        "",
+        "> **Scope of automated checks:** These checks verify mathematical, structural, wiring, and trial-consistency "
+        "properties against the signed request. They do not prove biological realism or catch errors shared by the "
+        "request itself; owner review of the request and this sheet is the safeguard.",
+        "",
+        "## Checks",
+        "| Check | Status | Passed / Total | Notes |",
+        "|---|---|---|---|",
+    ]
+    for cid, c in (adm.get("checks") or {}).items():
+        note = "; ".join(str(p) for p in (c.get("problems") or [])[:2]) or "ok"
+        lines.append(f"| {cid} | {c.get('status')} | {c.get('passed', 0)}/{c.get('total', 0)} | {note} |")
+    if adm.get("overfit_suspected"):
+        lines += ["", "> **HIGH (`engine_overfit_suspected`):** Public checks passed while hidden checks failed."]
+    a6 = (adm.get("checks") or {}).get("A6") or {}
+    if a6.get("wiring"):
+        lines += ["", "## Sensitivity wiring (A6 / A7)", "| Input | Output | Sign | Moved | Max rel change | A6 | A7 |", "|---|---|---|---|---|---|---|"]
+        for r in a6["wiring"]:
+            lines.append(f"| {r['input']} | {r['output']} | {r['sign']} | {r['moved_bases']}/{r['n_bases']} | "
+                         f"{r['max_rel_change']} | {r['a6_ok']} | {r['a7_ok']} |")
+    return "\n".join(lines) + "\n"
+
+
+def _load_or_commit_hidden_seed(run_dir: str) -> tuple[bytes, str]:
+    """Load an already-committed hidden seed on resume (BE31), or draw & commit a fresh `secrets.token_bytes(32)`."""
+    try:
+        raw, st = SIO.read_nofollow(run_dir, HIDDEN_SEED_REL)
+        if st.st_nlink == 1:
+            doc = json.loads(raw.decode("utf-8"))
+            if isinstance(doc, dict) and isinstance(doc.get("seed_hex"), str) and len(doc["seed_hex"]) == 64:
+                sb = bytes.fromhex(doc["seed_hex"])
+                return sb, _sha256_bytes(doc["seed_hex"].encode("ascii"))
+    except (FileNotFoundError, SIO.LinkRefused, OSError, UnicodeDecodeError, ValueError):
+        pass
+    sb = secrets.token_bytes(32)
+    shex = sb.hex()
+    commit = _sha256_bytes(shex.encode("ascii"))
+    SIO.write_nofollow(
+        run_dir,
+        HIDDEN_SEED_REL,
+        json.dumps({"seed_hex": shex, "commitment": commit,
+                    "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat()}, indent=1, sort_keys=True).encode("utf-8"),
+        atomic=True,
+    )
+    return sb, commit
+
+
+def admit(
+    run_dir: str,
+    snapshot_sha256: str,
+    build_decl: Mapping,
+    spec_raw: Mapping,
+    *,
+    config: Mapping | None = None,
+    reference_files: Mapping[str, bytes] | None = None,
+    require_reference: bool = True,
+    dossier_bytes: bytes | None = None,
+    dossier_benchmarks: list[dict] | None = None,
+    departures_status: str = "signed",
+    unsandboxed_ok: bool = False,
+    run_public_baseline: bool = True,
+    _force_sandbox: str | None = "auto",
+) -> dict:
+    """Run the full admission gate (S1-S4, A1-A11) on an immutable snapshot in `run_dir`,
+    writing `engine_build/bench/*`, `engine_build/admission_sheet.md`, and atomically
+    `engine_build/admission.json` last."""
+    import yaml
+    th = load_thresholds()
+    snaps_dir = os.path.join(run_dir, "engine_build", "snapshots")
+    verified_files = BSNAP.read_verified_snapshot(snaps_dir, snapshot_sha256)
+    seed_bytes, commitment = _load_or_commit_hidden_seed(run_dir)
+    reuse_key = compute_reuse_key(snapshot_sha256, build_decl, spec_raw, dossier_bytes=dossier_bytes, base_dir=run_dir)
+
+    # S1-S4 static checks BEFORE any run
+    static_probs = BSNAP.check_static(verified_files, request=build_decl)
+    if static_probs:
+        adm = {
+            "status": "not_admitted",
+            "engine_id": build_decl["id"],
+            "kind": build_decl["kind"],
+            "snapshot_sha256": snapshot_sha256,
+            "request_sha256": BREQ.request_sha256(build_decl),
+            "config_sha256": BADAPT.effective_config_sha256(config or {}),
+            "hidden_commitment": commitment,
+            "reuse_key": reuse_key,
+            "static_problems": static_probs,
+            "checks": {},
+            "digests": {},
+            "overfit_suspected": False,
+            "feedback": {"static_problems": static_probs},
+        }
+        SIO.write_nofollow(run_dir, "engine_build/admission_sheet.md", render_admission_sheet(adm).encode("utf-8"), atomic=True)
+        SIO.write_nofollow(run_dir, "engine_build/admission.json",
+                           json.dumps(adm, indent=1, sort_keys=True).encode("utf-8"), atomic=True)
+        return adm
+
+    cand = BCAND.CandidateEngine(
+        verified_files, build_decl, config=config, run_dir=run_dir,
+        unsandboxed_ok=unsandboxed_ok, id_salt=commitment[:16],
+    )
+    cand._force_sandbox = _force_sandbox
+
+    ref_cand = None
+    if reference_files is not None:
+        ref_build = copy.deepcopy(dict(build_decl))
+        ref_build["kind"] = "closed_form"
+        ref_cand = BCAND.CandidateEngine(
+            reference_files, ref_build, config=config, run_dir=run_dir,
+            unsandboxed_ok=unsandboxed_ok, id_salt=commitment[:16],
+        )
+        ref_cand._force_sandbox = _force_sandbox
+
+    # Optional public baseline for overfit detection (`engine_overfit_suspected`)
+    public_ok = False
+    if run_public_baseline:
+        public_ok = bool(run_public_checks(cand, build_decl, spec_raw)["ok"])
+
+    req = build_decl["request"]
+    hor = _default_horizon(spec_raw, req)
+    rng_h = _rng_from(seed_bytes, "hidden")
+    real_units, real_pkgs = _real_units_and_packages(
+        spec_raw, req, base_dir=run_dir,
+        max_units=int(th["hidden_max_units"]), max_packages=int(th["hidden_max_packages"]), rng=rng_h,
+    )
+    gen_units_a1 = generate_domain_units(req, 3, _rng_from(seed_bytes, "a1"), ref_units=real_units)
+    a1_units = gen_units_a1 + real_units
+    a2_units = generate_domain_units(req, int(th["a2_hidden_cases"]), _rng_from(seed_bytes, "a2"), ref_units=real_units)
+    a5_units = generate_domain_units(req, int(th["a5_hidden_cases"]), _rng_from(seed_bytes, "a5"), ref_units=real_units) + real_units
+
+    checks: dict[str, dict] = {}
+    checks["A1"] = check_a1(cand, build_decl, spec_raw, a1_units, real_pkgs, hor)
+    checks["A2"] = check_a2(cand, build_decl, a2_units, real_pkgs, hor, th=th, check_invariance=True)
+    checks["A3"] = check_a3(cand, a1_units[:4], real_pkgs, hor, th=th)
+    checks["A4"] = check_a4(cand, build_decl, spec_raw, _rng_from(seed_bytes, "a4"),
+                            n_free=int(th["a4_hidden_settings"]), th=th, ref_units=real_units)
+    checks["A5"] = check_a5(cand, build_decl, a5_units, real_pkgs, hor, th=th)
+    a6, a7 = check_a6_a7(cand, build_decl, spec_raw, _rng_from(seed_bytes, "a6"),
+                         n_bases=int(th["a6_base_points"]), min_moving=int(th["a6_min_moving_bases"]),
+                         th=th, ref_units=real_units)
+    checks["A6"] = a6
+    checks["A7"] = a7
+    a8, pack_doc, res_doc, cov_doc, fitted_doc = check_a8(cand, build_decl, spec_raw, departures_status=departures_status)
+    checks["A8"] = a8
+    checks["A9"] = check_a9(cand, build_decl, spec_raw, dossier_benchmarks=dossier_benchmarks)
+    checks["A10"] = check_a10(cand, build_decl, spec_raw, base_dir=run_dir)
+    a11_cases = [(dict(), u, real_pkgs[i % len(real_pkgs)], hor) for i, u in enumerate((real_units + gen_units_a1)[:4])]
+    checks["A11"] = check_a11(cand, ref_cand, build_decl, a11_cases, th=th, required=require_reference)
+
+    # Write authoritative engine_build/bench/* atomically via safe_io and compute digests
+    digests: dict[str, str] = {}
+    bench_blobs = {
+        "bench/pack.yaml": yaml.safe_dump(pack_doc, sort_keys=False).encode("utf-8"),
+        "bench/results.yaml": yaml.safe_dump(res_doc, sort_keys=False).encode("utf-8"),
+        "bench/benchmark_coverage.yaml": yaml.safe_dump(cov_doc, sort_keys=False).encode("utf-8"),
+    }
+    if fitted_doc is not None:
+        bench_blobs["bench/fitted.yaml"] = yaml.safe_dump(fitted_doc, sort_keys=False).encode("utf-8")
+    for rel, blob in bench_blobs.items():
+        SIO.write_nofollow(run_dir, f"engine_build/{rel}", blob, atomic=True)
+        digests[rel] = _sha256_bytes(blob)
+
+    gating_ids = ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A11")
+    failed_gating = [cid for cid in gating_ids if checks[cid]["status"] not in ("pass", "skipped", "not_applicable")]
+    admitted = not failed_gating
+    overfit = bool(public_ok and not admitted)
+    findings: list[dict] = []
+    if overfit:
+        findings.append({
+            "kind": "engine_overfit_suspected",
+            "severity": "HIGH",
+            "stage": "ENGINE_ADMIT",
+            "target_stage": "ENGINE",
+            "claim": f"agent-built engine passed public checks but failed hidden check(s) {failed_gating}",
+            "scope_declarable": False,
+        })
+    # Feedback for a hidden failure names ONLY check ids and output names (never hidden inputs/values, §4.6)
+    feedback = {
+        "failed_checks": failed_gating,
+        "routing": checks["A8"].get("routing"),
+    }
+    adm = {
+        "status": "admitted" if admitted else "not_admitted",
+        "engine_id": build_decl["id"],
+        "kind": build_decl["kind"],
+        "snapshot_sha256": snapshot_sha256,
+        "request_sha256": BREQ.request_sha256(build_decl),
+        "config_sha256": BADAPT.effective_config_sha256(config or {}),
+        "hidden_commitment": commitment,
+        "reuse_key": reuse_key,
+        "static_problems": [],
+        "checks": checks,
+        "digests": digests,
+        "overfit_suspected": overfit,
+        "findings": findings,
+        "feedback": feedback,
+        "admitted_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }
+    SIO.write_nofollow(run_dir, "engine_build/admission_sheet.md", render_admission_sheet(adm).encode("utf-8"), atomic=True)
+    SIO.write_nofollow(run_dir, "engine_build/admission.json",
+                       json.dumps(adm, indent=1, sort_keys=True, default=str).encode("utf-8"), atomic=True)
+    return adm
+
+
+# --------------------------------------------------------------------------- Self-test (BE1-BE11, BE13, BE15, BE17, BE32, BE33)
+def _self_test() -> int:
+    import tempfile
+    from agents import run_budget as RB
+    from toolkit.engines.built import fixtures as BFIX
+
+    fails: list[str] = []
+
+    def ok(cond, msg):
+        print(("PASS " if cond else "FAIL ") + msg)
+        if not cond:
+            fails.append(msg)
+
+    dev_un = BWORK.engine_sandbox_kind() is None
+
+    def _run_fixture(defect: str | None = None, *, stochastic: bool = False, stochastic_sd: float = 0.0,
+                     ref_bias: float = 0.0, include_trial_oob: bool = False,
+                     require_reference: bool = True, run_public: bool = False,
+                     with_ref: bool = True):
+        td = tempfile.TemporaryDirectory()
+        d = td.name
+        b = BFIX.two_group_sir_build(stochastic=stochastic, include_trial_oob=include_trial_oob)
+        sp = BFIX.two_group_sir_spec(b)
+        wdir = os.path.join(d, "models", "ext", f"engine_{b['id']}")
+        os.makedirs(wdir, exist_ok=True)
+        files = BFIX.two_group_sir_files(defect=defect, stochastic_sd=stochastic_sd)
+        for fn, data in files.items():
+            open(os.path.join(wdir, fn), "wb").write(data)
+        snaps = os.path.join(d, "engine_build", "snapshots")
+        man = BSNAP.create_snapshot(wdir, snaps, run_static=False)
+        ref_files = BFIX.two_group_sir_reference_files(rel_bias=ref_bias) if with_ref else None
+        adm = admit(
+            d, man["snapshot_sha256"], b, sp,
+            reference_files=ref_files, require_reference=require_reference,
+            unsandboxed_ok=dev_un, run_public_baseline=run_public,
+        )
+        return td, d, b, sp, man["snapshot_sha256"], adm
+
+    # BE1: healthy two-group SIR Starsim fixture passes every check -> status: admitted
+    td1, d1, b1, sp1, sha1, adm1 = _run_fixture(None, run_public=True)
+    try:
+        bad1 = {k: v.get("problems") for k, v in adm1["checks"].items() if v.get("status") not in ("pass", "skipped", "not_applicable")}
+        ok(adm1["status"] == "admitted" and not bad1 and os.path.isfile(os.path.join(d1, "engine_build", "admission_sheet.md")),
+           f"BE1 healthy two-group SIR Starsim fixture passes every check and is admitted (bad={bad1})")
+
+        # BE32: reuse key hit copies admission & bench/; changed calibration target or dep pin changes reuse key
+        key1 = adm1["reuse_key"]
+        sp_cal = copy.deepcopy(sp1)
+        sp_cal["calibration"] = {"method": "likelihood", "targets_csv": "data/other_targets.csv"}
+        key_cal = compute_reuse_key(sha1, b1, sp_cal, base_dir=d1)
+        key_dep = compute_reuse_key(sha1, b1, sp1, base_dir=d1, deps_digest="0" * 64)
+        with tempfile.TemporaryDirectory() as d_reuse:
+            reused = try_reuse_admission(d1, d_reuse, key1)
+            miss_reuse = try_reuse_admission(d1, d_reuse, key_cal)
+            ok(reused is not None and reused["status"] == "admitted" and reused.get("reused_from") == os.path.abspath(d1)
+               and not os.path.exists(os.path.join(d_reuse, "engine_build", "signoff.json"))
+               and miss_reuse is None and key_cal != key1 and key_dep != key1,
+               "BE32 reuse copies admission on matching key (without signoff.json) and invalidates on changed cal target or dep pin")
+    finally:
+        td1.cleanup()
+
+    # BE2: dead parameter fails A6 and names it
+    td, _, _, _, _, adm = _run_fixture("dead_param", require_reference=False, with_ref=False)
+    try:
+        a6 = adm["checks"]["A6"]
+        ok(adm["status"] == "not_admitted" and a6["status"] == "fail" and any("p_sev" in p for p in a6["problems"]),
+           f"BE2 dead parameter fails A6 and names p_sev ({a6['problems'][:2]})")
+    finally:
+        td.cleanup()
+
+    # BE3: 1e-12 * eff_a fails A6
+    td, _, _, _, _, adm = _run_fixture("tiny_eps", require_reference=False, with_ref=False)
+    try:
+        a6 = adm["checks"]["A6"]
+        ok(adm["status"] == "not_admitted" and a6["status"] == "fail" and any("eff_a" in p for p in a6["problems"]),
+           f"BE3 1e-12 * p added to output fails A6 ({a6['problems'][:2]})")
+    finally:
+        td.cleanup()
+
+    # BE4: parameter wired to wrong output fails A6 and A7 cannot pass vacuously
+    td, _, _, _, _, adm = _run_fixture("wrong_output", require_reference=False, with_ref=False)
+    try:
+        a6, a7 = adm["checks"]["A6"], adm["checks"]["A7"]
+        ok(a6["status"] == "fail" and a7["status"] == "fail" and any("eff_a" in p for p in a6["problems"]),
+           f"BE4 parameter wired to wrong output fails A6 and A7 cannot pass vacuously")
+    finally:
+        td.cleanup()
+
+    # BE5: parameter read only in read_outcomes without signed role fails A6
+    td, _, _, _, _, adm = _run_fixture("outcome_only_param", require_reference=False, with_ref=False)
+    try:
+        a6 = adm["checks"]["A6"]
+        ok(a6["status"] == "fail" and any("read_outcomes" in p and "p_sev" in p for p in a6["problems"]),
+           f"BE5 parameter read only in read_outcomes without signed role fails A6 ({a6['problems'][:2]})")
+    finally:
+        td.cleanup()
+
+    # BE6: unseeded numpy.random & order-dependent cache fail A2
+    td_a, _, _, _, _, adm_a = _run_fixture("unseeded", require_reference=False, with_ref=False)
+    td_b, _, _, _, _, adm_b = _run_fixture("order_cache", require_reference=False, with_ref=False)
+    try:
+        ok(adm_a["checks"]["A2"]["status"] == "fail" and adm_b["checks"]["A2"]["status"] == "fail",
+           "BE6 unseeded numpy.random and order-dependent cache both fail A2")
+    finally:
+        td_a.cleanup()
+        td_b.cleanup()
+
+    # BE7: leaky run_batch_state fails A3
+    td, _, _, _, _, adm = _run_fixture("leaky_batch", require_reference=False, with_ref=False)
+    try:
+        ok(adm["checks"]["A3"]["status"] == "fail", f"BE7 leaky batch path fails A3 ({adm['checks']['A3']['problems'][:1]})")
+    finally:
+        td.cleanup()
+
+    # BE8: 0.1%/step population growth under conservation=closed fails A5
+    td, _, _, _, _, adm = _run_fixture("mass_growth", require_reference=False, with_ref=False)
+    try:
+        ok(adm["checks"]["A5"]["status"] == "fail" and any("conservation" in p for p in adm["checks"]["A5"]["problems"]),
+           f"BE8 population growing 0.1%/step under closed conservation fails A5 ({adm['checks']['A5']['problems'][:1]})")
+    finally:
+        td.cleanup()
+
+    # BE9: severity computed from formula instead of compartment H transition fails A5
+    td, _, _, _, _, adm = _run_fixture("formula_severe", require_reference=False, with_ref=False)
+    try:
+        ok(adm["checks"]["A5"]["status"] == "fail" and any("witness" in p for p in adm["checks"]["A5"]["problems"]),
+           f"BE9 severity computed apart from compartment transition fails A5 ({adm['checks']['A5']['problems'][:1]})")
+    finally:
+        td.cleanup()
+
+    # BE10: public lookup table fails S4 static check AND fails hidden A4 when static check bypassed
+    td, _, b10, sp10, sha10, adm10 = _run_fixture("public_table", require_reference=False, with_ref=False)
+    try:
+        s4_caught = adm10["status"] == "not_admitted" and any("S4:" in p for p in adm10["static_problems"])
+        cand10 = BCAND.CandidateEngine(BFIX.two_group_sir_files("public_table"), b10, unsandboxed_ok=dev_un)
+        pub_a4 = check_a4(cand10, b10, sp10, _rng_from(PUBLIC_SEED_BYTES, "a4"), n_free=1, th=load_thresholds())
+        hid_a4 = check_a4(cand10, b10, sp10, _rng_from(b"hidden-be10", "a4"), n_free=3, th=load_thresholds())
+        ok(s4_caught and pub_a4["status"] == "pass" and hid_a4["status"] == "fail",
+           f"BE10 public lookup table caught by S4, passes public A4, and fails hidden A4 (pub={pub_a4['status']}, hid={hid_a4['status']})")
+    finally:
+        td.cleanup()
+
+    # BE11: real-unit defect passes synthetic cases and fails real-unit hidden set
+    td, _, _, _, _, adm = _run_fixture("real_unit_bad", require_reference=False, with_ref=False)
+    try:
+        ok(adm["checks"]["A1"]["status"] == "fail" and any("unit_beta" in p for p in adm["checks"]["A1"]["problems"]),
+           f"BE11 real-unit misbehavior caught on signed real-unit hidden set ({adm['checks']['A1']['problems'][:1]})")
+    finally:
+        td.cleanup()
+
+    # BE13: narrowed parameter range, empty window metric, negative cost driver all fail A1
+    be13 = {}
+    for df in ("narrow_range", "empty_window", "neg_driver"):
+        td, _, _, _, _, adm = _run_fixture(df, require_reference=False, with_ref=False)
+        try:
+            be13[df] = adm["checks"]["A1"]["status"] == "fail"
+        finally:
+            td.cleanup()
+    ok(all(be13.values()), f"BE13 narrowed param range, empty window metric, and negative cost driver each fail A1 ({be13})")
+
+    # BE15 (via admission): out-of-band trial fails A8 under built policy and sets routing='spec_amendment'
+    td, _, _, _, _, adm = _run_fixture(None, include_trial_oob=True, require_reference=False, with_ref=False)
+    try:
+        a8 = adm["checks"]["A8"]
+        ok(adm["status"] == "not_admitted" and a8["status"] == "fail" and a8.get("routing") == "spec_amendment",
+           f"BE15b out-of-band trial fails A8 under built policy with spec_amendment routing ({a8['problems'][:1]})")
+    finally:
+        td.cleanup()
+
+    # BE17: reference off by 6% fails deterministic A11; stochastic fixture with 5% bias & huge noise is inconclusive
+    td_det, _, _, _, _, adm_det = _run_fixture(None, ref_bias=0.06, require_reference=True, with_ref=True)
+    td_st, _, b_st, sp_st, _, _ = _run_fixture("stochastic_bias", stochastic=True, stochastic_sd=0.80,
+                                               require_reference=False, with_ref=False)
+    try:
+        cand_st = BCAND.CandidateEngine(BFIX.two_group_sir_files("stochastic_bias", stochastic_sd=0.80),
+                                        b_st, unsandboxed_ok=dev_un)
+        ref_b = copy.deepcopy(b_st)
+        ref_b["kind"] = "closed_form"
+        ref_st = BCAND.CandidateEngine(BFIX.two_group_sir_reference_files(rel_bias=0.0), ref_b, unsandboxed_ok=dev_un)
+        th_fast = dict(load_thresholds(), stochastic_seeds_init=4, stochastic_seeds_max=8)
+        hor = _default_horizon(sp_st, b_st["request"])
+        u_st = UnitSpec("u0", {"N": 10000.0, "s0": 0.9, "age_pop": [5000.0, 5000.0]})
+        a11_st = check_a11(cand_st, ref_st, b_st, [({}, u_st, Package("p0", {"comp_a": 0}), hor)],
+                           th=th_fast, required=True)
+        ok(adm_det["checks"]["A11"]["status"] == "fail" and a11_st["status"] == "inconclusive",
+           f"BE17 biased ref fails A11 ({adm_det['checks']['A11']['status']}); noisy biased stochastic is inconclusive ({a11_st['status']})")
+    finally:
+        td_det.cleanup()
+        td_st.cleanup()
+
+    # BE33: admission compute reservation against run balance pauses before dispatch when balance < cap
+    with tempfile.TemporaryDirectory() as d_bud:
+        ok_res, res_id = RB.reserve_compute(d_bud, 15.0, cap_usd=20.0)
+        ok_over, why_over = RB.reserve_compute(d_bud, 15.0, cap_usd=20.0)
+        RB.reconcile_compute(d_bud, res_id, 3.25, cap_usd=20.0)
+        rem = RB.remaining_budget(20.0, RB.load_budget_ledger(d_bud)["sessions"])
+        ok(ok_res and not ok_over and "insufficient budget" in str(why_over) and abs(rem - 16.75) < 1e-6,
+           f"BE33 compute reservation blocks when remaining < cap and reconciles to measured spend (rem={rem})")
+
+    if fails:
+        print(f"FAILED: {len(fails)} case(s)")
+        return 1
+    print("OK: all self-test cases passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--self-test"]:
+        sys.exit(_self_test())
+    print(__doc__)

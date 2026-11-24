@@ -531,20 +531,31 @@ def _make_balance_analyzer(state_vars: Mapping):
             super().__init__()
             self._sv = dict(sv)
             self.steps: list[dict[str, float]] = []
+            self.min_elem: float = float("inf")
 
         def _snap(self) -> dict[str, float]:
             row: dict[str, float] = {}
             for sname, loc in self._sv.items():
                 mod_name, attr_name = loc
-                target = self.sim.people if mod_name == "people" else (
-                    self.sim.diseases.get(mod_name) if hasattr(self.sim, "diseases") and mod_name in self.sim.diseases
-                    else getattr(self.sim, mod_name, None)
-                )
+                target = None
+                if mod_name == "people":
+                    target = self.sim.people
+                elif hasattr(self.sim, "diseases") and mod_name in self.sim.diseases:
+                    target = self.sim.diseases[mod_name]
+                elif hasattr(self.sim, "modules") and mod_name in self.sim.modules:
+                    target = self.sim.modules[mod_name]
+                else:
+                    target = getattr(self.sim, mod_name, None)
                 val = getattr(target, attr_name, None) if target is not None else None
                 if val is None:
                     row[str(sname)] = float("nan")
+                    self.min_elem = float("nan")
                 else:
                     arr = np.asarray(val, dtype=float)
+                    if arr.size:
+                        mn = float(np.min(arr))
+                        if not math.isfinite(mn) or (math.isfinite(self.min_elem) and mn < self.min_elem):
+                            self.min_elem = mn
                     row[str(sname)] = float(np.sum(arr))
             return row
 
@@ -614,11 +625,18 @@ def _run_one(model, kind: str, params_in: dict, unit_d: dict, pkg_d: dict, hor_d
         if an is not None:
             totals = [sum(step.values()) for step in an.steps] if an.steps else []
             mins = [min(step.values()) for step in an.steps if step]
+            min_elem = an.min_elem if an.min_elem != float("inf") else (min(mins) if mins else None)
+            max_rel_drift = None
+            if totals and totals[0] and math.isfinite(totals[0]):
+                max_rel_drift = max(abs(t - totals[0]) / max(abs(totals[0]), 1e-12) for t in totals)
             balance_info = {
                 "n_steps": len(an.steps),
                 "initial_total": totals[0] if totals else None,
                 "final_total": totals[-1] if totals else None,
-                "min_state": min(mins) if mins else None,
+                "max_rel_drift": max_rel_drift,
+                "min_state": min_elem,
+                "initial_states": dict(an.steps[0]) if an.steps else {},
+                "final_states": dict(an.steps[-1]) if an.steps else {},
                 "steps": an.steps[:200],
             }
     elif kind == "closed_form":
@@ -682,6 +700,8 @@ def _worker_child() -> int:
             result = _serialize_card(model.describe())
         elif action == "parameters":
             result = [_serialize_param(p) for p in model.parameters()]
+        elif action == "has_batch":
+            result = bool(callable(getattr(model, "run_batch_state", None)))
         elif action == "run":
             p = req["payload"]
             result = _run_one(
@@ -691,14 +711,49 @@ def _worker_child() -> int:
             )
         elif action == "run_batch":
             p = req["payload"]
-            results = []
-            for item in p["items"]:
-                results.append(_run_one(
-                    model, str(req["kind"]), item.get("params") or {}, item["unit"], item["package"],
-                    item["horizon"], int(item.get("seed", 0)), str(req.get("id_salt") or "s0"),
-                    item.get("age_shares"),
-                ))
-            result = results
+            items = p["items"]
+            if callable(getattr(model, "run_batch_state", None)) and items:
+                from toolkit.engines.contract import Horizon, Outcomes, Package, UnitSpec, resolve_params
+                card = model.describe()
+                id_salt = str(req.get("id_salt") or "s0")
+                first = items[0]
+                raw_attrs = copy.deepcopy(first["unit"].get("attributes") or {})
+                auth_shares = _compute_age_shares(list(card.age_groups), raw_attrs, first.get("age_shares"))
+                opaque_u = UnitSpec(_opaque_id(id_salt, str(first["unit"]["id"])), copy.deepcopy(raw_attrs))
+                hor_d = first["horizon"]
+                hor = Horizon(float(hor_d["start"]), float(hor_d["stop"]), tuple(hor_d["window"]),
+                              {str(k): list(v) for k, v in (hor_d.get("windows") or {}).items()})
+                p_list = [TrackedParams(resolve_params(model, it.get("params") or {})) for it in items]
+                pk_list = [Package(_opaque_id(id_salt, str(it["package"]["id"])),
+                                   copy.deepcopy(it["package"].get("components") or {})) for it in items]
+                seed0 = int(first.get("seed", 0))
+                outs = model.run_batch_state(p_list, opaque_u, pk_list, hor, seed0)
+                if not isinstance(outs, list) or len(outs) != len(items):
+                    raise WorkerError("run_batch_state must return one Outcomes per batch item")
+                results = []
+                for out, tp in zip(outs, p_list):
+                    if not isinstance(out, Outcomes):
+                        raise WorkerError(f"run_batch_state item is not Outcomes (got {type(out).__name__})")
+                    meta = dict(out.meta or {})
+                    meta.pop("balance", None)
+                    meta.pop("param_reads", None)
+                    meta.pop("age_shares", None)
+                    meta["age_shares"] = auth_shares
+                    meta["param_reads"] = {"build": sorted(tp.reads_by_phase["build"]), "read_outcomes": []}
+                    results.append(_serialize_outcomes(
+                        Outcomes(per_capita=out.per_capita, windows=out.windows,
+                                 cost_drivers=out.cost_drivers, meta=meta)
+                    ))
+                result = results
+            else:
+                results = []
+                for item in items:
+                    results.append(_run_one(
+                        model, str(req["kind"]), item.get("params") or {}, item["unit"], item["package"],
+                        item["horizon"], int(item.get("seed", 0)), str(req.get("id_salt") or "s0"),
+                        item.get("age_shares"),
+                    ))
+                result = results
         else:
             raise WorkerError(f"unknown worker action {action!r}")
         proto_out.write(json.dumps({"ok": True, "result": result}))

@@ -1,0 +1,36 @@
+# Harness-owned admission thresholds for agent-built engines
+# (docs/design/agent-built-engines.md §4.2, §4.4, §6.2).
+# Never overridden by the build request or agent code.
+
+move_abs_floor: 1.0e-9
+move_rel_floor: 1.0e-4
+move_ci_level: 0.95
+
+stochastic_seeds_init: 8
+stochastic_seeds_max: 64
+
+mass_balance_rel_tol: 1.0e-9
+transition_count_rel_tol: 1.0e-6
+batch_vs_run_rel_tol: 1.0e-12
+invariance_rel_tol: 1.0e-12
+
+reference_rel_ceiling: 0.05
+reference_abs_default: 1.0e-6
+
+hidden_max_units: 200
+hidden_max_packages: 64
+a2_hidden_cases: 8
+a4_hidden_settings: 3
+a5_hidden_cases: 6
+a6_base_points: 3
+a6_min_moving_bases: 2
+a10_replicates: 16
+a10_ident_points: 3
+
+try_max_calls: 30
+try_wall_s: 120
+try_memory_bytes: 2147483648
+try_summary_max_bytes: 8192
+
+engine_build_cap_usd: 40.0
+engine_admit_compute_cap_usd: 15.0

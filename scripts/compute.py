@@ -744,6 +744,52 @@ def recycle_every(procs: int) -> int:
 # Dask backend
 # --------------------------------------------------------------------------- #
 
+def _built_engine_prod_files(run_dir: str) -> list[str]:
+    """Production subset of `engine_build/` shipped to Coiled workers and fingerprinted (docs/design/
+    agent-built-engines.md §5.1, BE34): `admission.json`, `signoff.json`, `request.json`, the signed
+    snapshot (`snapshots/<sha>.json` + `snapshots/<sha>/*`), and `bench/*`. Never includes `.hidden/`,
+    `reference/`, `try/`, `hidden_reveal.json`, or working copies under `models/ext/engine_*`."""
+    eb = os.path.join(run_dir, "engine_build")
+    if not os.path.isdir(eb):
+        return []
+    out: list[str] = []
+    for name in ("admission.json", "signoff.json", "request.json"):
+        p = os.path.join(eb, name)
+        if os.path.isfile(p) and not os.path.islink(p):
+            out.append(p)
+    # Identify the signed snapshot sha256 (from signoff.json, else admission.json)
+    snap_sha = None
+    for cand in ("signoff.json", "admission.json"):
+        cp = os.path.join(eb, cand)
+        if os.path.isfile(cp) and not os.path.islink(cp):
+            try:
+                doc = json.load(open(cp, encoding="utf-8"))
+                s = doc.get("snapshot_sha256") if isinstance(doc, dict) else None
+                if isinstance(s, str) and len(s) == 64 and all(c in "0123456789abcdef" for c in s):
+                    snap_sha = s
+                    break
+            except (OSError, ValueError):
+                pass
+    if snap_sha:
+        snaps = os.path.join(eb, "snapshots")
+        man = os.path.join(snaps, f"{snap_sha}.json")
+        if os.path.isfile(man) and not os.path.islink(man):
+            out.append(man)
+        sdir = os.path.join(snaps, snap_sha)
+        if os.path.isdir(sdir) and not os.path.islink(sdir):
+            for fn in sorted(os.listdir(sdir)):
+                fp = os.path.join(sdir, fn)
+                if os.path.isfile(fp) and not os.path.islink(fp):
+                    out.append(fp)
+    bench = os.path.join(eb, "bench")
+    if os.path.isdir(bench) and not os.path.islink(bench):
+        for fn in sorted(os.listdir(bench)):
+            fp = os.path.join(bench, fn)
+            if os.path.isfile(fp) and not os.path.islink(fp):
+                out.append(fp)
+    return sorted(set(out))
+
+
 def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple[bytes, dict]:
     """tar.gz of the run's models/ and data/, the repo's scripts/ and toolkit/, and the declared data set
     (FP_DATA_SET: repo data/, .claude/orchestration/, and the non-Python files of scripts/ and toolkit/), with
@@ -771,7 +817,10 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                 if real in anc:
                     dirs[:] = []
                     continue
-                dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git") and not d.startswith("_truth")]
+                dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git") and not d.startswith("_truth")
+                           and not (root == os.path.join(run_dir, "models")
+                                    and os.path.realpath(dp) == os.path.realpath(os.path.join(run_dir, "models", "ext"))
+                                    and d.startswith("engine_"))]
                 for d in dirs:
                     ancestors[os.path.join(dp, d)] = anc | {real}
                 names, in_data = set(files), root == os.path.join(run_dir, "data")
@@ -792,6 +841,15 @@ def make_bundle(run_dir: str, max_file_mb: float = DEFAULT_MAX_FILE_MB) -> tuple
                     t.add(p, arcname=p.lstrip("/"))
                     added.add(p)
                     n += 1
+        for p in _built_engine_prod_files(run_dir):
+            if p in added:
+                continue
+            try:
+                t.add(p, arcname=p.lstrip("/"))
+            except OSError:
+                continue
+            added.add(p)
+            n += 1
         for p in sorted(data_set - added):     # repo data/ and .claude/orchestration/ (scripts/, toolkit/ are above)
             try:
                 t.add(p, arcname=p.lstrip("/"))
@@ -2887,6 +2945,8 @@ def _run_files_digest(run_dir: str, fn_spec: str, exclude=(), confined: bool = F
                 if _fp_ignored(fn, names, in_data, runner):
                     continue          # logs, figures, summaries, the ledger (never skipped under data/)
                 files.add(os.path.join(dp, fn))
+    for p in _built_engine_prod_files(run_dir):
+        files.add(p)
     for ln in sorted(links):
         h.update(b"link:" + ln.encode() + b"\0")
     for f in sorted(files):
@@ -4834,6 +4894,44 @@ def _self_test_bundle_data_set(ok) -> None:
            f"BD3 a large data-set file ships (the key hashes it), _truth and undeclared dirs do not ({info})")
         ok(info.get("data_set_files") == len(want) == 6,
            f"BD4 the bundle reports the data-set files it ships ({info})")
+        # BE34 (docs/design/agent-built-engines.md §5.1): make_bundle ships ONLY the production subset of engine_build/
+        # (admission.json, signoff.json, request.json, signed snapshot, bench/) and NEVER .hidden/, reference/, try/,
+        # hidden_reveal.json, or working copies models/ext/engine_*
+        sha_ok = "a" * 64
+        sha_old = "b" * 64
+        w("engine_build/admission.json", json.dumps({"status": "admitted", "snapshot_sha256": sha_ok}), rd)
+        w("engine_build/signoff.json", json.dumps({"by": "owner", "snapshot_sha256": sha_ok}), rd)
+        w("engine_build/request.json", json.dumps({"id": "m"}), rd)
+        w(f"engine_build/snapshots/{sha_ok}.json", "{}", rd)
+        w(f"engine_build/snapshots/{sha_ok}/engine.py", "X=1\n", rd)
+        w(f"engine_build/snapshots/{sha_old}.json", "{}", rd)
+        w(f"engine_build/snapshots/{sha_old}/engine.py", "X=0\n", rd)
+        w("engine_build/bench/results.yaml", "benchmarks: []\n", rd)
+        w("engine_build/.hidden/seed.json", '{"seed": "secret"}', rd)
+        w("engine_build/hidden_reveal.json", '{"seed": "secret"}', rd)
+        w("engine_build/reference/reference.py", "REF=1\n", rd)
+        w("engine_build/try/1.json", "{}", rd)
+        w("models/ext/engine_m/engine.py", "WORK=1\n", rd)
+        with mock.patch.dict(globals(), {"REPO": repo}):
+            b_be, _ = make_bundle(rd, max_file_mb=1)
+            fp_a = code_fingerprint(rd, "models/fn.py::f")
+            w(f"engine_build/snapshots/{sha_ok}/engine.py", "X=2\n", rd)
+            fp_b = code_fingerprint(rd, "models/fn.py::f")
+        be_names = {"/" + n for n in tarfile.open(fileobj=io.BytesIO(b_be)).getnames()}
+        want_in = {os.path.join(rd, rel) for rel in (
+            "engine_build/admission.json", "engine_build/signoff.json", "engine_build/request.json",
+            f"engine_build/snapshots/{sha_ok}.json", f"engine_build/snapshots/{sha_ok}/engine.py",
+            "engine_build/bench/results.yaml",
+        )}
+        want_out = {os.path.join(rd, rel) for rel in (
+            f"engine_build/snapshots/{sha_old}.json", f"engine_build/snapshots/{sha_old}/engine.py",
+            "engine_build/.hidden/seed.json", "engine_build/hidden_reveal.json",
+            "engine_build/reference/reference.py", "engine_build/try/1.json",
+            "models/ext/engine_m/engine.py",
+        )}
+        ok(want_in <= be_names and not (want_out & be_names) and fp_a != fp_b,
+           f"BE34 make_bundle ships only production subset of engine_build/ (never .hidden/reference/try/working copy) "
+           f"and batch fingerprint covers shipped snapshot (missing={sorted(want_in - be_names)}, leaked={sorted(want_out & be_names)})")
 
 
 def _self_test_fp_dispatch(ok) -> None:
