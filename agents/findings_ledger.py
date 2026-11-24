@@ -820,6 +820,26 @@ def _self_test() -> int:
     ok(g1 == g2 == g3 == {"R-001"} and g4 == g5 == set() and harness_gaps({"R-002": f21}) == set(),
        f"L20 a harness gap binds the finding's id, kind and remedy class, not the remedy's wording "
        f"({g1}, {g2}, {g3}, {g4}, {g5})")
+    # L20c (Codex r1 of #375 P1-1): a remedy reworded, within its class, into one that names a file the fix loop may
+    # edit (fix_loop.FIX_EDITABLE) reopens the gap: the loop can act on it now. The remedy as declared does not.
+    f23 = Finding(id="R-005", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                  fix_requires="Change the harness to increase the uncertainty draws.")
+    _event(f23, 1, HARNESS_GAP, "fix_planner", "only harness code", key=harness_gap_key(f23), remedy=f23.fix_requires)
+    c1 = harness_gaps({"R-005": f23})
+    f23.fix_requires = "Increase the draws in the harness code (reworded)."
+    c2 = harness_gaps({"R-005": f23})
+    f23.fix_requires = "Set `analysis_settings.yaml` uncertainty.draws to 64."
+    c3 = harness_gaps({"R-005": f23})
+    f23.fix_requires = "Add the missing draw step in models/ext/draws.py."
+    c4 = harness_gaps({"R-005": f23})
+    f24 = Finding(id="R-006", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                  fix_requires="Raise analysis_settings.yaml uncertainty.draws; the harness caps it.")
+    _event(f24, 1, HARNESS_GAP, "fix_planner", "the cap is harness code", key=harness_gap_key(f24),
+           remedy=f24.fix_requires)
+    c5 = harness_gaps({"R-006": f24})
+    ok(c1 == c2 == {"R-005"} and c3 == c4 == set() and c5 == {"R-006"},
+       f"L20c a reworded remedy naming an editable file reopens the gap; one without, or the remedy as declared, "
+       f"does not ({c1}, {c2}, {c3}, {c4}, {c5})")
     # L20b: a gap recorded under the key used before hb3 fix 6 (the remedy as written) holds while the remedy reads so
     f22 = Finding(id="R-003", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
                   fix_requires="Only harness code can draw it.")

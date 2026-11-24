@@ -890,6 +890,8 @@ def _self_test() -> int:
         ok(s20.get("harness_gaps") == ["R-001", "R-004"] and s20.get("harness_gaps_blocking") == ["R-001"]
            and s20["rows"] == 0 and impact_rows(d) == []
            and plan20.get("harness_gaps") == ["R-001", "R-004"] and ev20 and "harness code" in ev20[-1].get("note", "")
+           # Codex r1 of #375 P1-1: the event keeps the remedy as declared, so a later rewording can be compared
+           and ev20[-1].get("remedy") == FL.load(d)["R-001"].fix_requires
            and FL.load(d)["R-001"].status == "open" and "R-001" in FL.harness_gaps(FL.load(d))
            # Codex r1 of #357 P2-11: the harness's default plan plans no task for a declared gap
            and not any("R-001" in t["findings"] for t in default_plan(build_packet(d, FL.load(d), 2, 3, None,
