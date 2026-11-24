@@ -156,12 +156,32 @@ def _marker_problem(m) -> str | None:
     import smoke_check
     try:
         spec = smoke_check.parse_spec(m)
-    except (ValueError, re.error) as e:
-        return f"marker {m[:60]!r} does not parse ({e})"
+    except Exception as e:  # noqa: BLE001 -- re.error, OverflowError, RecursionError: all a refused marker (Codex r1)
+        return f"marker {m[:60]!r} does not parse ({type(e).__name__})"
     path = str(spec.get("path") or "")
-    if not path.strip() or os.path.isabs(path) or ".." in path.replace("\\", "/").split("/"):
-        return f"marker {m[:60]!r}: its path must be relative to the run directory"
+    if (not path.strip() or os.path.isabs(path) or path.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", path)
+            or ".." in path.replace("\\", "/").split("/")):
+        return f"marker {m[:60]!r}: its path must be relative to the run directory (no drive, root or '..')"
+    if spec.get("kind") in ("field", "equals", "prefix") and any(not k for k in str(spec.get("key") or "").split(".")):
+        return f"marker {m[:60]!r}: a field marker needs a key with no empty part (PATH:KEY)"
     return None
+
+
+def _duplicate_keys(text: str) -> list[str]:
+    """Top-level keys the header repeats (YAML keeps only the last one, silently)."""
+    try:
+        node = yaml.compose(text)
+    except (yaml.YAMLError, ValueError, RecursionError):
+        return []                  # the load below reports it
+    if not isinstance(node, yaml.MappingNode):
+        return []
+    seen, dup = set(), []
+    for k, _v in node.value:
+        kv = getattr(k, "value", None)
+        if kv in seen:
+            dup.append(str(kv))
+        seen.add(kv)
+    return dup
 
 
 def _same_entry(a: dict, b: dict) -> bool:
@@ -187,6 +207,9 @@ def parse_fragment(text: str, name: str = "fragment", goals: set[str] | None = N
         head = yaml.safe_load("\n".join(lines[1:end]))
     except (yaml.YAMLError, ValueError, RecursionError) as e:
         raise FragmentError(f"{name}: header is not valid YAML ({type(e).__name__})") from None
+    dup = _duplicate_keys("\n".join(lines[1:end]))
+    if dup:
+        raise FragmentError(f"{name}: header repeats {sorted(set(dup))} (only the last would count)")
     if not isinstance(head, dict):
         raise FragmentError(f"{name}: header must be a mapping")
     extra = set(map(str, head)) - KEYS
@@ -203,13 +226,13 @@ def parse_fragment(text: str, name: str = "fragment", goals: set[str] | None = N
         raise FragmentError(f"{name}: status_group must be a one-line string")
 
     goal = head.get("goal")
-    if goal is not None:
+    if "goal" in head:
         if not isinstance(goal, str) or not _GOAL_ID.fullmatch(goal):
             raise FragmentError(f"{name}: goal must be one id of {GOALS} (lowercase letters, digits and '-')")
         if goals is not None and goal not in goals:
             raise FragmentError(f"{name}: goal {goal!r} is not an id in {GOALS} ({', '.join(sorted(goals))})")
     markers = head.get("markers")
-    if markers is not None:
+    if "markers" in head:
         if not isinstance(markers, list) or not markers:
             raise FragmentError(f"{name}: markers must be a non-empty list of smoke-marker specs")
         for m in markers:
@@ -506,6 +529,13 @@ def check_pr(root: str, base: str, upstream: str | None = None) -> list[str]:
             parse_fragment(_decode(_show_bytes(root, "HEAD", p) or b"", p), p, goals=head_goals)
         except FragmentError as e:
             problems.append(f"{e}")
+    # Codex r1 of #382: a goal removed while a queued fragment still names it would block the next release, so every
+    # fragment at HEAD that names a goal is checked against the goals at HEAD, not only the ones this PR changes
+    queued, _errs = _fragments_at(root, "HEAD")
+    for p, fr in sorted(queued.items()):
+        if p not in added and fr.get("goal") and fr["goal"] not in head_goals:
+            problems.append(f"{p}: goal {fr['goal']!r} is no longer an id in {GOALS}; keep the goal (mark it retired) "
+                            f"or change the fragment")
     gone = []
     for p in deleted:
         try:
@@ -707,6 +737,17 @@ def _self_test() -> int:
             ok(False, f"CF-G4 rejects fragment: {label}")
         except FragmentError:
             ok(True, f"CF-G4 rejects fragment: {label}")
+    for label, extra in {"blank goal": "goal:\n", "blank markers": "markers:\n",
+                         "empty field key": "markers: ['goals.yaml:']\n", "empty key part": "markers: ['a.json:b..c=1']\n",
+                         "drive path": "markers: ['C:\\\\other\\\\events.log~stage']\n",
+                         "UNC path": "markers: ['\\\\\\\\host\\\\share\\\\x.json']\n",
+                         "regex overflow": "markers: ['events.log~x{4294967296}']\n",
+                         "duplicate markers": "markers: [a.json]\nmarkers: [b.json]\n"}.items():
+        try:
+            parse_fragment(hd + extra + "---\n## Changelog\nx\n", label, goals=gs)
+            ok(False, f"CF-G7 rejects fragment (Codex r1): {label}")
+        except FragmentError:
+            ok(True, f"CF-G7 rejects fragment (Codex r1): {label}")
     bad_files = {"no goals list": "version: 1\n", "duplicate id": "goals:\n  - {id: a, title: x}\n  - {id: a, title: y}\n",
                  "no title": "goals:\n  - {id: a}\n", "bad id": "goals:\n  - {id: A B, title: x}\n"}
     for label, txt in bad_files.items():
