@@ -1843,6 +1843,8 @@ def _kernel_roots(work: str, rw: list[str], hidden: list[str]) -> tuple[dict, st
     ro = {work} | {p for p in _SYSTEM_RO if os.path.isdir(p)}
     ro |= {v for k, v in sysconfig.get_paths().items() if k in ("stdlib", "platstdlib", "purelib", "platlib")
            and v and os.path.isdir(v)}
+    libdir = sysconfig.get_config_var("LIBDIR")      # the interpreter's own shared libraries (conda, /opt: review N-5)
+    ro |= {libdir} if isinstance(libdir, str) and os.path.isdir(libdir) else set()
     try:     # not sys.path: the harness puts the repository there, and run directories live inside it
         import site
         ro |= {p for p in site.getsitepackages() if os.path.isdir(p)}
@@ -1854,8 +1856,13 @@ def _kernel_roots(work: str, rw: list[str], hidden: list[str]) -> tuple[dict, st
         for root in sorted(ro | set(rw)):
             if h == root or h.startswith(root.rstrip("/") + "/"):
                 return {}, f"the granted root {root} contains {h}"
+    uid = None
+    if os.geteuid() == 0:       # the launcher leaves root for this uid, which owns the work dir (review N-3)
+        from lib.kernel_sandbox import DERIVATION_UID as uid
+        for dirpath, _dirs, _files in os.walk(work):
+            os.chown(dirpath, uid, uid)
     return {"ro": sorted(ro), "ro_files": [p for p in _SYSTEM_RO_FILES if os.path.isfile(p)],
-            "rw": sorted({os.path.realpath(p) for p in rw}),
+            "rw": sorted({os.path.realpath(p) for p in rw}), "uid": uid,
             "rw_files": [p for p in ("/dev/null",) if os.path.exists(p)]}, None
 
 
@@ -1945,8 +1952,10 @@ def container_network() -> str:
 # What the fallback does not give, in one sentence wherever its kind is reported (owner, 2026-11-23).
 SANDBOX_LIMIT = ("It is enforced by the kernel for the whole process, native code included, but unlike bubblewrap "
                  "it gives the derivation no private process, mount or IPC namespace: other processes, and the names, "
-                 "sizes and dates of files outside its grants, stay visible to it, though it cannot open those "
-                 "files, change their contents or metadata, or signal, trace or connect to those processes.")
+                 "sizes and dates of files outside its grants, stay visible to it; it cannot open those files or "
+                 "change their contents, permissions, owners, timestamps, extended attributes or inode flags, nor "
+                 "signal, trace or connect to those processes, but reading a file can still update its access time, "
+                 "so the ignored-column check is not proof against a script written to defeat it.")
 SANDBOX_TEXT = {
     "bwrap": "Linux namespaces (bubblewrap): no network, the run directory hidden and writes only to the "
              "derivation's work directory, all enforced by the kernel.",
@@ -2026,8 +2035,10 @@ def _child(argv: list) -> int:
     if policy is not None:
         sys.path.insert(0, HERE)
         from lib import kernel_sandbox as KS
-        KS.apply(policy["ro"], policy["rw"], policy.get("rw_files") or [], policy.get("ro_files") or [])  # raises
-        del KS              # the script gets neither ctypes nor the sandbox module from the launcher (review P3-3)
+        KS.apply(policy["ro"], policy["rw"], policy.get("rw_files") or [], policy.get("ro_files") or [],
+                 uid=policy.get("uid"))         # raises: the script never runs
+        del KS              # the launcher hands over neither ctypes nor this module (review P3-3; numpy.ctypeslib
+        #                     or gc can still reach ctypes: the kernel rules are what hold, review N-4)
         for m in [m for m in sys.modules if m.split(".")[0] in ("ctypes", "_ctypes", "lib")]:
             del sys.modules[m]
     sys.argv = [script] + rest
@@ -3826,6 +3837,8 @@ def _self_test_kernel_sandbox(rep, codes, need) -> None:
                   True),
         ("DI-K2", "utime of a run-directory file (review P2-1)",
                   "import os\nos.utime({run!r} + '/data/derivations.yaml', (0, 0))", True),
+        ("DI-K2", "inode flags through ioctl on an input copy (review N-1)", "import fcntl, os, struct\n"
+                  "fd = os.open(a.inputs[0], os.O_RDONLY)\nfcntl.ioctl(fd, 0x40086602, struct.pack('l', 0x40))", False),
         ("DI-K2", "an xattr on a run-directory file (review P2-1)",
                   "import os\nos.setxattr({run!r} + '/data/derivations.yaml', 'user.s', b'1')", True),
         ("DI-K5", "reading the run directory", "open({run!r} + '/data/inputs_provenance.json').read()", True),
@@ -3887,11 +3900,12 @@ def _self_test_kernel_sandbox(rep, codes, need) -> None:
         finally:
             victim.kill()
             victim.wait()
-        with tempfile.TemporaryDirectory() as d:          # DI-K7c: no ctypes, no sandbox module handed over
+        with tempfile.TemporaryDirectory() as d:          # DI-K7c: the launcher hands over no ctypes or sandbox module
             d = os.path.realpath(di_fixture(d, extra="import sys\nif {'ctypes', 'lib.kernel_sandbox'} & set(sys.modules):\n"
                                                     "    raise SystemExit(5)"))
             r = derive(d, limits=lim)
-            rep(r["ok"], f"DI-K7c the script finds neither ctypes nor the sandbox module in sys.modules: {codes(r)}")
+            rep(r["ok"], f"DI-K7c the launcher hands over neither ctypes nor the sandbox module in sys.modules (the "
+                         f"script can still import numpy.ctypeslib; the kernel rules hold regardless): {codes(r)}")
         work = tempfile.mkdtemp(prefix="derive_")
         try:            # DI-K11 (review P2-3): no /etc directory grant; a root holding the repository is refused
             pol, why = _kernel_roots(work, [], [])

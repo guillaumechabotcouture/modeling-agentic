@@ -315,45 +315,61 @@ reason is given.
   variable and operator settings never count. Owner decision (2026-11-23): containers only, and
   bubblewrap stays required on hosts.
 
-  **How it works.** The launcher confines itself before the script runs, after checking that it has
-  a single thread. It drops every capability, sets no_new_privs, applies a Landlock ruleset (ABI 3
-  or later, Linux 6.2 or later), then a seccomp-bpf filter. `scripts/lib/kernel_sandbox.py` lists
-  every refused call. Below ABI 3, Landlock cannot see truncation, so the fallback is refused.
-  After confinement, the launcher removes `ctypes` and its own module from `sys.modules`. A probe script must meet each refusal before the kind is used. If seccomp or
-  Landlock is unavailable, derivations fail closed. A first design, an audit hook in the child
-  Python, had 10 Python-level escapes (Codex r3 of #368). It was replaced by kernel enforcement on
-  the owner's decision.
+  **How it works.** The launcher confines itself before the script runs, in this order:
+  1. It checks that it has a single thread.
+  2. As root, it first becomes an unprivileged uid and gid (58999), which owns the work directory.
+  3. It drops every capability.
+  4. It sets no_new_privs.
+  5. It applies a Landlock ruleset (ABI 3 or later, Linux 6.2 or later). Below ABI 3 Landlock cannot see truncation, so the fallback is refused.
+  6. It installs a seccomp-bpf filter (#383, `scripts/lib/kernel_sandbox.py`, lists every refused call; `ioctl` is limited to six terminal and fd commands).
 
-  **Open question for the owner: Landlock unavailable.** As built, a container without Landlock
-  fails closed. The alternative, seccomp alone with read-only copies, hash checks and a record of
-  `landlock: unavailable`, would still block network, processes and raised limits. It would lose
-  the run directory's hiding and the write confinement. The recommendation is to keep failing
-  closed. Docker Desktop's kernel (ABI 8) and recent distribution kernels provide Landlock.
+  Read grants are the interpreter's own stdlib, site-packages and LIBDIR (from `sysconfig`, so
+  conda and `/opt` layouts work), the system library directories and five `/etc` files. A granted
+  root that contains the run directory, the temp directory, the repository or HOME refuses the
+  run. A probe script must meet each refusal before the kind is used. If seccomp or Landlock is
+  unavailable, derivations fail closed (owner decision). This excludes, for example, Ubuntu 22.04
+  GA (5.15), Debian 12 and Amazon Linux 2023 (6.1), and RHEL 9 (5.14) without a backport. A first
+  design, an audit hook in the child Python, had 10 Python-level escapes (Codex r3 of #368). It was
+  replaced by kernel enforcement on the owner's decision.
+
+  **What it does not give.**
+  - **No private namespace.** There is no private process, mount or IPC namespace. Other
+    processes, and the names, sizes and dates of files outside the grants, stay visible.
+  - **Access times leak.** Reading a file can update its access time, which a script can read back
+    in a later run. That is a low-bandwidth channel bubblewrap does not close either (review N-2).
+    So under this fallback, a passing `ignored_column_used` check is evidence against a mistaken
+    script, not against one written to defeat it.
+  - **ctypes is still reachable.** After confinement the launcher hands over neither `ctypes` nor
+    its own module, but `numpy.ctypeslib` or `gc` can still reach ctypes (review N-4). The kernel
+    rules are what hold.
 
   **Record and report.** The record holds the kind, the container evidence, why bubblewrap was not
   used, the Landlock ABI, `seccomp` and the container's network, read per derivation. Every report
   has a "Derivation sandbox" block, which says so when no derivation ran. Where the fallback ran,
-  it states in one sentence what the fallback does not give (`SANDBOX_LIMIT`). Such a record
-  raises no `derivation_unsandboxed` and stays current on a machine with another sandbox.
+  it states in one sentence what the fallback does not give (`SANDBOX_LIMIT`), including the
+  access-time limit. Such a record raises no `derivation_unsandboxed` and stays current on a machine
+  with another sandbox.
 
   | guarantee | `bwrap` / `bwrap-sudo` | `landlock-seccomp` |
   |---|---|---|
   | no network | network namespace | seccomp: no socket of any family, no io_uring; Landlock ABI 4+: no TCP |
-  | no capabilities | dropped by bubblewrap | all sets emptied (bounding, ambient, effective, permitted, inheritable), checked with capget |
+  | no root, no capabilities | bubblewrap's user and capability handling | root leaves for an unprivileged uid and gid; all capability sets emptied and checked with capget |
   | no process creation | PID namespace, process cap | seccomp: no fork, vfork, non-thread clone or exec |
-  | writes only where declared | `/` read-only, one writable bind | Landlock (ABI 3+, truncation included): only in the outputs' directories, regular files and directories only; seccomp: no chmod, chown, utime or xattr writes anywhere; inputs are read-only copies, hash-checked |
-  | state shared across runs | IPC namespace | seccomp: no SysV IPC or POSIX message queues |
-  | system files readable | all of `/`, read-only | only the library directories, zoneinfo, locale data and five files from `/etc` |
+  | writes only where declared | `/` read-only, one writable bind | Landlock (ABI 3+, truncation included): only in the outputs' directories, regular files and directories only; seccomp: no chmod, chown, utime, xattr writes or inode-flag ioctls anywhere; inputs are read-only copies, hash-checked |
+  | state shared across runs | IPC namespace | seccomp: no SysV IPC or POSIX message queues; access times still update (see above) |
+  | system files readable | all of `/`, read-only | the interpreter's own directories, the system library directories, zoneinfo, locale data and five `/etc` files |
   | the run directory hidden | an empty tmpfs over it | Landlock: not granted, so refused by any name (procfs aliases and other work directories included) |
   | other processes | not visible | visible by name; no kill, tgkill, F_SETOWN/F_SETSIG (SIGIO), ptrace or memory access |
   | syscalls newer than the review | n/a | answered ENOSYS (above number 462) |
   | resource caps | set | set, and cannot be raised (seccomp) |
   | native code, ctypes, a second interpreter | held by the kernel | held by the kernel |
 
-  Self-tests: KS1 to KS4 check the BPF program with an interpreter, for each architecture. DI-K0 to
-  DI-K10 cover detection, the round-3 escape reproductions (r3-1, 2 and 5 to 10), the record, the
-  report, and identical bytes under bwrap. r3-3 and r3-4 concerned the hook's own state; the hook
-  is gone.
+  Self-tests:
+  - #383: KS1 to KS9 check the BPF program with an interpreter for each architecture, the ABI
+    floor, the capabilities and uid, TSYNC and the thread check.
+  - DI-K0 to DI-K11 cover detection, the round-3 escape reproductions (r3-1, 2 and 5 to 10), the
+    review's attack cases, the record, the report, and identical bytes under bwrap. r3-3 and r3-4
+    concerned the hook's own state; the hook is gone.
 - **The column accounting** reads the header of each staged `.csv`/`.tsv`. A staged table that the
   spec cites directly counts as used. The removal test (`ignored_column_used`) runs only for the
   ignored columns of tabular inputs.
