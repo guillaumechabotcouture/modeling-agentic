@@ -5667,27 +5667,29 @@ def _self_test() -> int:
                           if t.get("status") == "not_run" and str(t.get("test_id")) in _decl36)
             led36 = FL.load(d)
             exp36 = "completed_scope_declared" if nr36 else "completed"
-            # Codex r1 of #375 P2-5 (seen here): once the not-run test goes to the owner and is accepted, no fix loop
-            # with nothing to do follows (no task, no owner amendment, no write-up)
+            # Codex r1 of #375 P2-5 (seen here): no fix loop with nothing to do (no task, no owner amendment, no
+            # write-up) runs: an accepted not-run test is declared at the gate, not sent to an empty fix loop
             hist36 = load_state(d).history
-            i_ask = next((i for i, h in enumerate(hist36) if isinstance(h.get("fix_loop"), dict)
-                          and set(nr36) & set(h["fix_loop"].get("owner_amendments") or [])), None)
-            empty36 = [] if i_ask is None else [
-                h["fix_loop"].get("round") for h in hist36[i_ask + 1:] if isinstance(h.get("fix_loop"), dict)
-                and not h["fix_loop"].get("tasks") and not h["fix_loop"].get("owner_amendments")
-                and not h["fix_loop"].get("write_up")]
-            ok(want and s == exp36 and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
-               and (nr36 or "The plan depends on inputs the lead accepted provisionally" in rep36[:sp36[0]])
-               and all(i in led36 for i in nr36) and (not nr36 or i_ask is not None) and empty36 == []
-               and led36["D-001"].status == "fixed" and prov36 == want
-               and not any(h.get("paused") for h in load_state(d).history)
-               and all(w in rep36[:sp36[0]] for w in want),
+            empty36 = [h["fix_loop"].get("round") for h in hist36 if isinstance(h.get("fix_loop"), dict)
+                       and not h["fix_loop"].get("tasks") and not h["fix_loop"].get("owner_amendments")
+                       and not h["fix_loop"].get("write_up")]
+            c36 = {"status": s == exp36, "manifest": bool(man), "fix_row": bool(rows) and rows[0]["files_changed"] == [
+                       "analysis_settings.yaml"],
+                   "dependence_top": bool(nr36) or "The plan depends on inputs the lead accepted provisionally"
+                   in rep36[:sp36[0]],
+                   "not_run_in_ledger": all(i in led36 for i in nr36), "no_empty_fix_loop": empty36 == [],
+                   "d001_fixed": led36["D-001"].status == "fixed", "provisional": prov36 == want,
+                   "never_paused": not any(h.get("paused") for h in hist36),
+                   "flagged_top": all(w in rep36[:sp36[0]] for w in want)}
+            bad36 = [k for k, v in c36.items() if not v]
+            ok(want and not bad36,
                f"T36 the default backend (workstream B) runs the machine end to end with engine: auto; each decision "
                f"test that changes the plan is answered provisionally and flagged above the draft ({s}, {want}, {prov36}, "
-               f"not run: {nr36}, empty fix loops after the owner request: {empty36}"
-               + ("" if s == exp36 else   # why it ended: CI showed only the status (flaky once on #156 and #160)
-                  f"; path {[h.get('to') for h in load_state(d).history if 'to' in h]}; "
-                  f"final {[h.get('why') for h in load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
+               f"not run: {nr36}, failing: {bad36}, empty fix loops: {empty36}"
+               + ("" if not bad36 else   # why it ended: CI showed only the status (flaky once on #156 and #160)
+                  f"; path {[h.get('to') for h in hist36 if 'to' in h]}; "
+                  f"final {[h.get('why') for h in hist36 if h.get('to') == 'FINAL'][-1:]}; "
+                  f"D-001 {led36['D-001'].status}") + ")")
         else:
             ok(True, "T36 skipped: workstream B's analysis engine is not on this branch")
 
