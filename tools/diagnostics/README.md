@@ -4,9 +4,8 @@ A read-only MCP server that lets Claude Desktop answer questions about runs, fol
 `docs/design/diagnostic-data.md`. Ask it, for example, "what is run X doing now?", "why did it pause?" or "which
 finding cost rounds?".
 
-- `mcp_server.py` is the server: MCP over stdio, standard library plus PyYAML. It makes no network calls and has
-  no tool that changes anything.
-- `diag_runs.py` holds the run records it returns. They are read through the review workbench's confined reader.
+- `mcp_server.py`: the server (MCP over stdio). No network calls and no tool that changes anything.
+- `diag_runs.py`: the run records it returns, read through the review workbench's confined reader.
 
 ## Add it to Claude Desktop
 
@@ -47,6 +46,3 @@ Restart Claude Desktop. The tools appear under the server's name, and Claude Des
 `list_runs`, `run_status`, `run_events`, `run_findings`, `run_spend`, `run_compare`, `run_artifact`,
 `owner_inbox` and `note_feedback`. Launches, clusters, the supervisor, PRs, baselines, check value, smoke markers,
 the machine's load and `follow.py` (local mirrors of cloud runs) come in the next PR.
-
-Self-tests: `python3 tools/diagnostics/mcp_server.py --self-test` and `python3 tools/diagnostics/diag_runs.py --self-test`.
-CI runs them.
