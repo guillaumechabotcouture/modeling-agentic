@@ -34,9 +34,13 @@ if ROOT not in sys.path:
 
 def _benchmark_eligibility(run_dir, spec, signer) -> list:
     """Departure shape, then the benchmark precondition: for a named (or resolved) engine, that engine; for engine:
-    auto still pending, every candidate the selection could choose, refused when none passes."""
+    auto still pending, every candidate the selection could choose, refused when none passes. A pending engine.build
+    request is checked at admission (A8) rather than against registered engine packs before build."""
     from toolkit.engines import benchmark_coverage as BC
+    from toolkit.spec import schema
     out = list(BC.departure_problems(spec.raw))
+    if getattr(spec, "engine_pending", False) and schema.engine_has_build(spec.raw.get("engine")):
+        return out
     if not getattr(spec, "engine_pending", False):
         return out + BC.spec_problems(spec, by=signer)
     import importlib.util
@@ -132,15 +136,19 @@ def _engine_registry(run_dir, spec, signer, spec_bytes=None, **_ctx) -> list:
     if isinstance(raw0, dict):
         out += [p for p in schema.engine_ref_problems(raw0) if p not in out]
     decl = raw0 if isinstance(raw0, dict) else spec.raw
-    auto = schema.engine_is_auto(decl.get("engine")) or getattr(spec, "engine_auto", False)
+    has_build = schema.engine_has_build(decl.get("engine")) or getattr(spec, "engine_build", None) is not None
+    auto = schema.engine_is_auto(decl.get("engine")) or getattr(spec, "engine_auto", False) or has_build
     cp = os.path.join(run_dir, schema.ENGINE_CHOICE) if run_dir and auto else None     # a named engine ignores it
     if cp and os.path.exists(cp):
         try:
-            ch = (json.load(open(cp, encoding="utf-8")) or {}).get("engine")
+            doc = json.load(open(cp, encoding="utf-8")) or {}
+            ch = doc.get("engine")
             ref = ch.get("ref") if isinstance(ch, dict) else None
         except (OSError, ValueError, AttributeError) as e:
             return out + [f"{schema.ENGINE_CHOICE}: unreadable: {type(e).__name__}: {e}"]
-        out += [p for p in schema.engine_ref_problems({"engine": {"ref": ref}}) if p not in out]
+        if ref is not None:
+            out += [p for p in schema.engine_ref_problems({"engine": {"ref": ref}}, allow_built=has_build)
+                    if p not in out]
     return out
 
 

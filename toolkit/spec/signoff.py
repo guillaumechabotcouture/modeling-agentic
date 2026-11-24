@@ -248,7 +248,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
         # it was generated from; it is refused, never skipped
         raise ValueError(f"{SHEET} predates source binding (no sources line); regenerate the sheet (python3 "
                          "toolkit/spec/signoff.py sheet <run_dir> --write) and read it again")
-    extra = {DERIVATIONS_RECORD: dsha, **({brel: bsha} if brel else {})}
+    extra = {DERIVATIONS_RECORD: dsha, SHEET: sheet_sha, **({brel: bsha} if brel else {})}
     if sheet_bytes is not None and (
             src.get("spec_sha256") != sha or src.get("derivations_sha256") != (dsha or "none")
             or (brel is not None and src.get("burden_references_sha256") != bsha)):
@@ -502,7 +502,10 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     out += UQ.exception_sheet_lines(raw)                # owner, 2026-11-20: a net-effect posterior exception, HIGH
     from toolkit.engines import effect_settings as ES
     out += ES.sheet_lines(raw, run_dir)                 # units outside the trials' settings, and what covers each
-    if candidates:
+    if schema.engine_has_build(raw.get("engine")):
+        from toolkit.engines.built import requested as BREQ
+        out += BREQ.sheet_lines(raw["engine"]["build"], full_registry_rows=candidates)
+    elif candidates:
         out.append("## Candidate engines (pre-sign check)")
         for r in candidates:
             out.append(f"- `{r.get('ref')}`: " + ("eligible" if r.get("eligible") else "ineligible: "
@@ -1188,6 +1191,26 @@ def _self_test_run_dir_forms(ok):
             os.chdir(cwd)
     ok(st3 == ("signed", "signed"), f"SG-RD3 a spec signed through a relative path in one tree is signed in a copy of "
                                     f"the tree under another root, checked through its absolute path: {st3}")
+    # BE26: the persisted sign-off record binds the sign-off sheet's sha256 (for every spec signature)
+    with tempfile.TemporaryDirectory() as d_sh:
+        schema.toy_spec(d_sh)
+        sp_sheet = write_sheet(d_sh)
+        want_sh = hashlib.sha256(open(sp_sheet, "rb").read()).hexdigest()
+        rec_sh = sign(d_sh, "owner", note="be26", expect_sheet_sha256=want_sh)
+        ok(rec_sh["sha256"].get(SHEET) == want_sh,
+           f"BE26 sign-off record persists {SHEET} sha256 ({rec_sh['sha256'].get(SHEET)} vs {want_sh})")
+    # Build-spec sheet renders the "Engine to be built" section with check plan and uncovered outputs/components
+    from toolkit.engines.built import requested as BREQ
+    with tempfile.TemporaryDirectory() as d_bs:
+        p_bs = schema.toy_spec(d_bs)
+        raw_bs = yaml.safe_load(open(p_bs))
+        raw_bs["engine"] = {"build": BREQ.example_build()}
+        yaml.safe_dump(raw_bs, open(p_bs, "w"), sort_keys=False)
+        txt_bs = sheet(d_bs, candidates=[{"ref": "toolkit.engines.contract:ToyEngine", "eligible": False,
+                                          "why_not": ["no component comp_a"]}])
+        ok("## Engine to be built" in txt_bs and "Generated check plan" in txt_bs
+           and "`severe`" in txt_bs and "Full-registry eligibility check" in txt_bs,
+           "BE26b build-spec sign-off sheet renders request, check plan, uncovered outputs, and full-registry rows")
 
 
 def main(argv=None) -> int:
