@@ -820,15 +820,13 @@ def check_value(dirs) -> dict:
             elif st_ in ("fixed", "declared", "owner_accepted") and (rows_ or st_ != "fixed") \
                     and all(t <= WORDING_ONLY for t in touched):
                 s["noise_wording"] += 1
-    out, seen = [], groups
-    for s in stats.values():
-        s["runs"], s["fix_tasks"] = len(s["runs"]), len(s.pop("tasks"))
-        s["fix_usd"] = round(s["fix_usd"], 2)
+    out = list(stats.values())
+    for s in out:
+        s["runs"], s["fix_tasks"], s["fix_usd"] = len(s["runs"]), len(s.pop("tasks")), round(s["fix_usd"], 2)
         s["class"] = ("productive" if s["productive_in_run"] + s["amended_changed"] else
                       "noisy" if s["noise_wording"] + s["noise_reraised"] else "no signal")
-        out.append(s)
     order = {"productive": 0, "noisy": 1, "no signal": 2}
-    return {"runs": len(seen), "checks": sorted(out, key=lambda s: (order[s["class"]], -s["rows"], s["check"])),
+    return {"runs": len(groups), "checks": sorted(out, key=lambda s: (order[s["class"]], -s["rows"], s["check"])),
             "amendments": prov, "by_kind": amendment_table(prov), "notes": notes}
 
 
