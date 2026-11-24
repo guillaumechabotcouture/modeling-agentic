@@ -99,6 +99,7 @@ class AwaitingBudget(Exception):
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
+CHECKLIST_MISSING = "missing required key 'checklist'"     # toolkit/spec/critique_checklist.py's error for a file without it
 MAX_SIGN_REPAIRS = 2          # a refused lead sign-off goes back to EVIDENCE or SPEC at most this often, then waits
 MAX_CALIBRATION_REFUSALS = 2  # a refused calibration goes back to SPEC at most this often, then the run ends run_failed
 CALIBRATION_REFUSED = "calibration_refused"      # its findings-ledger kind and id
@@ -533,13 +534,21 @@ def _earlier_round(path: str, round_n: int) -> int:
 
 def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra: list[dict],
             history: bool = True, critics=CRITICS, spec_violations=None, registry_violations=None,
-            strict_done_when: bool = False, append_history: bool | None = None, signoff: str = "owner") -> dict:
+            strict_done_when: bool = False, append_history: bool | None = None, signoff: str = "owner",
+            checklist_rules: bool = True) -> dict:
     """Today's rule functions, in today's order, on the v2 findings: the critic YAMLs, the
     harness's checks (`extra`), and optionally spec-compliance and registry findings. `signoff`:
     the run's mode, for whose answers to owner items count (apply_owner_rule)."""
     import done_when
     import validate_critique_yaml as V
     critiques, schema_errors, refused = {}, [], {}
+    # Owner 2026-11-23: the domain and red-team critics answer every item of the structural checklist
+    # (toolkit/spec/critique_checklist.py); a missing item is a schema error. Required in a run (its run_state.json or
+    # its decision spec exists); only a gate over critique files alone (the unit fixtures, no run) or a replay of
+    # stored gates (v2_rules off) needs none.
+    from toolkit.spec import critique_checklist as CL
+    in_run = any(os.path.lexists(os.path.join(run_dir, f)) for f in ("decision_spec.yaml", STATE_FILE))
+    checklist = bool(in_run and checklist_rules)
     draft = any(os.path.exists(os.path.join(run_dir, f)) for f in ("report.md", "manuscript.md"))
     extra = list(extra)
     names = list(critics) + [r for r in V.REVIEWERS if r not in critics and r != "critique-presentation"
@@ -563,7 +572,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
             # round, which cost a schema repair and a paid review of a draft about to be replaced.
             rn = _earlier_round(path, round_n)
         try:
-            critiques[reviewer] = V.validate_critique(path, reviewer, rn)
+            critiques[reviewer] = V.validate_critique(path, reviewer, rn, checklist=checklist)
         except V.SchemaError as e:
             # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
             # blockers still have their done_when tests checked below, for the same reason.
@@ -601,6 +610,8 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     if schema_errors:
         return {"schema_errors": schema_errors, "action": None}
     d = V.decide(critiques, max_rounds, round_n)
+    if checklist:        # a replay (checklist_rules off) never reads, so never records, a legacy field (Codex r3 P1-5)
+        d["critique_checklist"] = CL.record(critiques)
     d["declared"] = V._declared_ids(run_dir)
     d["declared_prev"] = V._previous_declared(run_dir, round_n)
     d = V._apply_brief_scope(d, critiques, run_dir, max_rounds, round_n)
@@ -2503,7 +2514,7 @@ class Machine:
                         spec_violations=sv(self.run_dir) if sv else None,
                         registry_violations=rv(self.run_dir) if rv else None,
                         strict_done_when=self.st.v2_rules and self.st.tries.get("schema", 0) < MAX_SCHEMA_REPAIRS,
-                        append_history=False, signoff=self.st.signoff)
+                        append_history=False, signoff=self.st.signoff, checklist_rules=self.st.v2_rules)
             opened = []
             if d.get("action") and self.st.v2_rules:
                 opened = open_findings(self.run_dir, d)
@@ -2591,7 +2602,13 @@ class Machine:
             return self._go("FINAL", "the report kept acceptance language after its repairs: withheld",
                             "completed_no_report")
         if nxt == "CRITIQUE":                               # schema errors: re-run the critics
-            n = self.st.tries.get("schema", 0) + 1
+            # Codex r3 of #366 (P1-3): a run started before the structural checklist (critique files without it) gets
+            # one repair to add it outside the schema-repair count, once per run, so the upgrade cannot end it.
+            upgrade = (not self.st.tries.get("checklist_upgrade")
+                       and any(CHECKLIST_MISSING in str(e) for e in d["schema_errors"]))
+            n = self.st.tries.get("schema", 0) + (0 if upgrade else 1)
+            if upgrade:
+                self.st.tries["checklist_upgrade"] = 1
             self.st.tries["schema"] = n
             if n > MAX_SCHEMA_REPAIRS:
                 return self._go("FINAL", "critique schema errors persist", "completed_gate_error")
@@ -4668,6 +4685,75 @@ def _self_test() -> int:
         ok(hist[:8] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
            and "FIX_LOOP" in hist
            and hist[-3:] == ["PRESENTATION", "GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
+        # SM-CK1-3 (owner 2026-11-23): the structural checklist. The gate records each critic's answers to all five
+        # items; a missing item is a schema repair, never a round; not_applicable answers raise nothing.
+        from toolkit.spec import critique_checklist as CLk
+        g1 = json.load(open(os.path.join(d, "gate_r1.json")))
+        ck = g1.get("critique_checklist") or {}
+        ok(set(ck) == set(CLk.ITEMS) and all(set(ck[i]["critics"]) == {"critique-domain", "critique-redteam"}
+                                             for i in CLk.ITEMS),
+           f"SM-CK1 the gate record holds both critics' answers to all five items: {json.dumps(ck)[:300]}")
+        dropped = []
+
+        def drop_once(reviewer, rn, answers):
+            if reviewer == "critique-domain" and not dropped:
+                dropped.append(rn)
+                answers.pop("surveillance_ranking")
+            return answers
+        dk, Tk, stk = new_run("ck_missing", {"checklist": drop_once})
+        status_k = _SpikeMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False).run()
+        s2 = load_state(dk)
+        ok(status_k == "completed" and Tk.calls.count("critique:critique-domain:1") == 2
+           and Tk.calls.count("critique:critique-redteam:1") == 1 and not any(c.endswith(":2") and c.startswith(
+               "critique:") for c in Tk.calls) and any("schema" in str(h.get("why", "")) for h in s2.history),
+           f"SM-CK2 a missing checklist item is a schema repair of that critic in the same round: {status_k}, "
+           f"{[c for c in Tk.calls if c.startswith('critique')]}")
+        runs_ck = {}
+        for name, edit in (("ck_pass", None), ("ck_na", lambda r, n, a: {i: {"answer": "not_applicable",
+                                                                             "reason": "stub: cannot arise"} for i in a})):
+            dk, Tk, stk = new_run(name, {"checklist": edit} if edit else {})
+            status_k = _SpikeMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False).run()
+            s3 = load_state(dk)
+            runs_ck[name] = (status_k, [h["to"] for h in s3.history if "to" in h], s3.round,
+                             len(json.load(open(os.path.join(dk, "gate_r1.json"))).get("unresolved_high") or []))
+        ok(runs_ck["ck_na"] == runs_ck["ck_pass"] and runs_ck["ck_na"][0] == "completed",
+           f"SM-CK3 not_applicable answers (with reasons) cost no round and raise no finding (same path as pass): "
+           f"{runs_ck['ck_na'][0]}, round {runs_ck['ck_na'][2]} vs {runs_ck['ck_pass'][2]}")
+        # SM-CK6 (Codex r3 of #366, P1-3): a run that had used its schema repairs before the upgrade, whose critics then
+        # write no checklist once, gets one repair outside the count and completes; a second missing checklist counts
+        mig = []
+
+        def no_checklist_once(reviewer, rn, answers):
+            if reviewer == "critique-domain" and not mig:
+                mig.append(rn)
+                return None
+            return answers
+        dk, Tk, stk = new_run("ck_upgrade", {"checklist": no_checklist_once})
+        stk.tries["schema"] = MAX_SCHEMA_REPAIRS
+        status_k = _SpikeMachine(dk, Tk, stk, log=lambda *a: None, cross_engine_check=False).run()
+        ok(status_k == "completed" and Tk.calls.count("critique:critique-domain:1") == 2
+           and load_state(dk).tries.get("checklist_upgrade") == 1 and CHECKLIST_MISSING in CLk.problems(None, "f", [])[0],
+           f"SM-CK6 a pre-upgrade run gets one checklist repair outside the schema count: {status_k}")
+        # SM-CK7 (P1-5): a replay of stored gates ignores a malformed legacy checklist field (here a date key)
+        rd7 = os.path.join(td, "ck_replay")
+        os.makedirs(rd7)
+        import datetime as _dt7
+        for r in CRITICS:
+            __import__("yaml").safe_dump({"reviewer": r, "round": 1, "verdict": "PASS",
+                                          "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                          "blockers": [], "checklist": {"burn_in_drift": {
+                                              "reason": {_dt7.date(2026, 11, 23): "reviewed"}}}},
+                                         open(os.path.join(rd7, __import__("validate_critique_yaml").FILENAMES[r]), "w"))
+        open(os.path.join(rd7, STATE_FILE), "w").write("{}")
+        g7 = v2_gate(rd7, 1, 3, False, [], history=False, checklist_rules=False)
+        try:
+            json.dumps(g7)
+            j7 = True
+        except TypeError:
+            j7 = False
+        ok(not g7.get("schema_errors") and "critique_checklist" not in g7 and j7,
+           f"SM-CK7 a replay (checklist_rules off) neither requires nor records a legacy checklist field: "
+           f"{g7.get('action')}, {g7.get('schema_errors')}")
         from toolkit.spec import evidence_draft as EDR_
         ok("draft_evidence" not in T.calls and (EDR_.read_record(d) or {}).get("status") == "not_required",
            f"T11b a spec whose options need no decision input passes EVIDENCE with no task ({EDR_.read_record(d)})")
@@ -5387,6 +5473,19 @@ def _self_test() -> int:
            f"fingerprinted item ({g['action']})")
         gn = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False, signoff="none")
         ok(gn["action"] == "RUN_FAILED", f"T30b under --signoff none nobody can accept it: not declarable ({gn['action']})")
+        open(os.path.join(dd, "decision_spec.yaml"), "w").write("not: [a spec\n")      # unreadable: every item is the critics'
+        gck = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        os.remove(os.path.join(dd, "decision_spec.yaml"))
+        open(os.path.join(dd, STATE_FILE), "w").write("{}")       # a run whose spec is gone (Codex r1 of #366, P1-3)
+        gck5 = v2_gate(dd, 2, 2, False, [dict(dtf)], history=False)
+        os.remove(os.path.join(dd, STATE_FILE))
+        ok(gck5.get("action") is None and len([e for e in gck5.get("schema_errors") or []
+                                               if "missing required key 'checklist'" in e]) == len(CRITICS),
+           f"SM-CK5 a run without its spec still requires every checklist item: {(gck5.get('schema_errors') or [])[:2]}")
+        ok(gck.get("action") is None and len([e for e in gck.get("schema_errors") or []
+                                              if "missing required key 'checklist'" in e]) == len(CRITICS),
+           f"SM-CK4 with a decision spec in the run, critiques without the checklist are "
+           f"schema errors: {(gck.get('schema_errors') or [])[:2]}")
         # T_OWNER_ANSWERED (1F): the harness-recorded answer to that item releases it; whose answer counts follows the
         # run's sign-off mode (a lead's only under --signoff lead, D2)
         import scope_signoff as _ss

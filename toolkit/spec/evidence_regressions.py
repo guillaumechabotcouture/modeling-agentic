@@ -247,11 +247,12 @@ def p_relaunch_fixture(d):
         def upload_file(self, *a, **k):
             raise _Reached("upload_file")
     saved = {k: getattr(RC, k) for k in ("_config_lock", "budget_guard", "existing_client", "_on_worker", "relaunch_refusal",
-                                         "code_tarball", "pipeline_preflight", "TEST_ENGINE_REFS")}
+                                         "code_tarball", "pipeline_preflight", "TEST_ENGINE_REFS", "read_keys")}
     saved_rb, saved_rs = RC.ws.record_blob, sys.modules.get("results_store")
     try:
         RC._config_lock = lambda cfg: contextlib.nullcontext()
         RC.budget_guard = lambda *a, **k: None
+        RC.read_keys = lambda *a, **k: {"ANTHROPIC_API_KEY": "k"}     # relaunch reads the keys before its checks
         RC.existing_client = lambda name: Client()
         RC._on_worker = lambda *a, **k: {"state": "idle"}
         RC.relaunch_refusal = lambda *a, **k: None
