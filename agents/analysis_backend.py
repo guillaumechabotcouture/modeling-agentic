@@ -133,8 +133,9 @@ def engine_needs(spec: dict) -> dict:
     for m in ((spec.get("options") or {}).get("engine_map") or {}).values():
         for k, v in (m or {}).items():
             comps.setdefault(k, []).append(v)
+    outs = [o for o in [(spec.get("objective") or {}).get("outcome")] + list(spec.get("outcomes_reported") or []) if o]
     return {"components": comps,
-            "outputs": [o for o in [(spec.get("objective") or {}).get("outcome")] if o],
+            "outputs": list(dict.fromkeys(outs)),
             "windows": [w for w in [cal.get("metric")] if w],
             "unit_attributes": [a for a in [cal.get("attribute")] if a]
             + list(((spec.get("decision_units") or {}).get("engine_attributes") or {}))}
@@ -248,17 +249,34 @@ def build_request_problems(spec: dict, engines=None, departures: str = "proposed
     if probs:
         return probs
     req_eng = BREQ.RequestedEngine(build)
-    fit_probs = card_fits(req_eng.describe(), engine_needs(spec))
+    if isinstance(spec.get("engine_needs"), dict):
+        needs = spec["engine_needs"]
+    else:
+        try:
+            from toolkit.analysis import api as _bapi
+            needs = _bapi.engine_needs(spec)
+        except Exception:  # noqa: BLE001
+            needs = engine_needs(spec)
+    fit_probs = card_fits(req_eng.describe(), needs)
     if fit_probs:
         return [f"engine.build does not satisfy spec needs: {w}" for w in fit_probs]
     # Check the FULL registry regardless of any `candidates` shortlist in spec["engine"]
-    full_spec = dict(spec, engine="auto")
-    rows = eligible_engines(full_spec, engines=ENGINES if engines is None else engines, departures=departures)
+    entries = list(ENGINES if engines is None else engines)
+    full_spec = dict(spec, engine="auto", engine_needs=needs)
+    rows = eligible_engines(full_spec, engines=entries, departures=departures)
     eligible = [r for r in rows if r.get("eligible")]
     if not eligible:
         return []
     why_low = str(build.get("why") or "").strip().lower()
-    el_mechs = {str(m).strip().lower() for r in eligible for m in (r.get("mechanisms") or [])}
+    card_paths = {e[0]: (tuple(e) + (None, None))[1] for e in entries}
+    el_mechs: set[str] = set()
+    for r in eligible:
+        try:
+            full_card = _card(r["ref"], card_paths.get(r["ref"]), r.get("config"))
+            mechs_list = list(getattr(full_card, "mechanisms", None) or [])
+        except Exception:  # noqa: BLE001
+            mechs_list = list(r.get("mechanisms") or [])
+        el_mechs.update(str(m).strip().lower() for m in mechs_list)
     novel = [str(m).strip() for m in (build.get("mechanisms") or []) if str(m).strip().lower() not in el_mechs]
     if not novel:
         return [f"engine.build: registered engine(s) {[r['ref'] for r in eligible]} are eligible and already cover "
@@ -686,7 +704,8 @@ class _ToolkitApi:
                 # Full-registry rows (ignoring any candidates shortlist) for both build_request_problems and the sheet
                 full_spec = dict(s.raw, engine="auto", _run_dir=s.base)
                 self.candidates = self._card_rows(full_spec, engines=ENGINES, departures="proposed")
-                return bad + build_request_problems(dict(s.raw, _run_dir=s.base), departures="proposed")
+                extra = build_request_problems(dict(s.raw, _run_dir=s.base), departures="proposed")
+                return bad + [p for p in extra if p not in bad]
             # The candidates are checked even when an engine-independent section fails, so one try of the draft
             # task hears every problem (MAX_SPEC_TRIES is small).
             rows = self.candidate_rows(s, departures="proposed")
@@ -1664,23 +1683,26 @@ def _self_test() -> int:
         rows2 = eligible_engines(dict(tspec, engine_needs=_api.engine_needs(tspec)), ENGINES)
         ok(not next(r for r in rows2 if r["ref"].endswith("RenewalEngine"))["eligible"],
            "B23b an allocation spec: the renewal engine is not eligible")
-    # BE25: build_request_problems inspects the FULL ENGINES registry even when candidates omits an eligible engine
+    # BE25: build_request_problems inspects the FULL ENGINES registry even when candidates omits an eligible engine,
+    # uses the same engine_needs (including outcomes_reported), checks all untruncated card mechanisms, and runs on
+    # direct schema.validate(..., pending_ok=True)
     from toolkit.engines.built import requested as _BREQ
     with _tf.TemporaryDirectory() as d_b:
         ts = toy_spec(os.path.join(d_b, "u.csv"))
         b_req = _BREQ.example_build()
-        # Construct a spec where ToyEngine IS eligible, but `candidates` omits ToyEngine
-        b_req["request"]["components"] = {"net": {"values": [0, 1], "absent": 0}}
+        # Construct a spec where ToyEngine IS eligible (component `a`, unit_attribute `x`, output `cases`),
+        # while `candidates` omits ToyEngine
+        b_req["request"]["components"] = {"a": {"values": [0, 1], "absent": 0}}
         b_req["request"]["unit_attributes"] = {
-            "x": {"type": "continuous", "range": [0.0, 1.0], "meaning": "baseline level"},
+            "x": {"type": "continuous", "range": [-2.0, 2.0], "meaning": "baseline level"},
         }
         b_req["request"]["attribute_binding"] = {"x": "required"}
         b_req["request"]["outputs"] = {"per_capita": ["cases"], "windows": {"w0": ["prev"]}, "cost_drivers": []}
         b_req["request"]["decision_inputs"] = {
-            "net": [{"kind": "parameter", "name": "eff_a", "why": "effect"}],
+            "a": [{"kind": "parameter", "name": "eff_a", "why": "effect"}],
         }
         b_req["request"]["expected_effects"] = {
-            "net": {"cases": "-"}, "eff_a": {"cases": "-"}, "sev_mult": {"cases": "+"},
+            "a": {"cases": "-"}, "eff_a": {"cases": "-"}, "sev_mult": {"cases": "+"},
             "n_strains": {"cases": "+"}, "x": {"cases": "+"},
         }
         b_req["request"]["inert"] = {}
@@ -1690,8 +1712,9 @@ def _self_test() -> int:
         b_bad = copy.deepcopy(b_req)
         b_bad["why"] = "prefer a bespoke build"
         sp_shortlist = dict(ts, engine={"auto": True, "candidates": [COMPARTMENTAL], "build": b_bad},
-                            options={"components": {"net": {}}, "engine_map": {"net": {"net": 1}}},
-                            objective={"outcome": "cases"}, calibration={"method": "none"},
+                            options={"components": {"a": {}}, "engine_map": {"a": {"a": 1}}},
+                            objective={"outcome": "cases"}, outcomes_reported=["cases"],
+                            calibration={"method": "none"},
                             decision_units={"csv": os.path.join(d_b, "u.csv"), "id": "id",
                                             "engine_attributes": {"x": {"column": "x"}}})
         toy_entry = [e for e in ENGINES if e[0] == "toolkit.engines.contract:ToyEngine"]
@@ -1700,8 +1723,35 @@ def _self_test() -> int:
         b_good["why"] = "needs multi-strain cross-immunity not present on registered cards"
         sp_good = dict(sp_shortlist, engine={"auto": True, "candidates": [COMPARTMENTAL], "build": b_good})
         p_good = build_request_problems(sp_good, engines=toy_entry)
-        ok(bool(p_bad) and "ToyEngine" in " ".join(p_bad) and p_good == [],
-           f"BE25 build_request_problems checks full registry despite candidates shortlist ({p_bad}, {p_good})")
+        # outcomes_reported mismatch: when spec also reports `severe` (which ToyEngine lacks), ToyEngine is ineligible
+        b_sev = copy.deepcopy(b_bad)
+        b_sev["request"]["outputs"]["per_capita"] = ["cases", "severe"]
+        b_sev["request"]["compartments"]["transitions"] = [{"from": "S", "to": "I1", "counts": ["cases", "severe"]}]
+        sp_sev = dict(sp_shortlist, engine={"build": b_sev}, outcomes_reported=["cases", "severe"])
+        p_sev = build_request_problems(sp_sev, engines=toy_entry)
+        # Mechanism beyond index 8 on a registered card (malaria has >8 mechanisms) is NOT treated as novel
+        mal_entry = [e for e in ENGINES if "MalariaEngine" in e[0]]
+        mal_card = _card(mal_entry[0][0], mal_entry[0][1])
+        ninth_mech = mal_card.mechanisms[8] if len(mal_card.mechanisms) > 8 else mal_card.mechanisms[-1]
+        from toolkit.engines.contract import EngineCard
+        orig_card = _card
+        try:
+            def _fake_9(ref, cp, cfg=None):
+                c = orig_card(ref, cp, cfg)
+                if ref == toy_entry[0][0]:
+                    return EngineCard(**{**c.__dict__, "mechanisms": [f"m{i}" for i in range(8)] + [ninth_mech]})
+                return c
+            globals()["_card"] = _fake_9
+            b_ninth = copy.deepcopy(b_bad)
+            b_ninth["mechanisms"] = [ninth_mech]
+            b_ninth["why"] = f"requires {ninth_mech}"
+            p_ninth = build_request_problems(dict(sp_shortlist, engine={"build": b_ninth}), engines=toy_entry)
+        finally:
+            globals()["_card"] = orig_card
+        ok(bool(p_bad) and "ToyEngine" in " ".join(p_bad) and p_good == [] and p_sev == []
+           and bool(p_ninth) and "already cover" in " ".join(p_ninth),
+           f"BE25 build_request_problems checks full registry despite shortlist, aligns outcomes_reported, and checks "
+           f"all untruncated card mechanisms (bad={p_bad[:1]}, good={p_good}, sev={p_sev}, ninth={p_ninth[:1]})")
     _self_test_engine_choice(ok)
     _self_test_benchmark_gate(ok)
     try:

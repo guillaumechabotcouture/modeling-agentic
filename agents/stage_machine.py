@@ -1258,8 +1258,16 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     if held:
         raise ValueError("spec not signable (engine_parameters): " + "; ".join(held[:10]))
     from toolkit.spec import signoff as SO      # F6 (#218): every registered precondition, recomputed, whoever signs
+    try:
+        sheet_bytes = read_nofollow(run_dir, SO.SHEET)[0]
+    except FileNotFoundError:
+        sheet_bytes = None
+    except LinkRefused as e:
+        raise ValueError(f"{SO.SHEET}: {e}") from None
+    sheet_sha = hashlib.sha256(sheet_bytes).hexdigest() if sheet_bytes is not None else "none"
     ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
-    rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
+    rec.update(evidence=ev["record"], evidence_sha256=ev["files"], sheet_sha256=sheet_sha,
+               sha256={AB.SPEC_FILE: rec["spec_sha256"], SO.SHEET: sheet_sha, **(ev.get("files") or {})})
     rec[RC.RECORD_KEY] = RC.sha_of(rc_bytes)
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals

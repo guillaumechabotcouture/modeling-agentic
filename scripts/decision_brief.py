@@ -456,7 +456,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     `evidence`: the binding the caller made (toolkit/spec/evidence_dossier.py bind); never trusted: this entry point
     recomputes it from the captured spec and the dossier and refuses one that differs."""
     import hashlib
-    from lib.safe_io import write_nofollow, LinkRefused
+    from lib.safe_io import read_nofollow, write_nofollow, LinkRefused
     captured = _capture(run_dir, FROZEN_AT_SIGNOFF)
     shas = {f: hashlib.sha256(b).hexdigest() if b is not None else None for f, b in captured.items()}
     for f, want in (expect or {}).items():
@@ -473,6 +473,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     missing = [q["id"] for q in qs if q["id"] not in answers and not accept_proposed]
     if missing:
         raise ValueError("no answer for " + ", ".join(missing) + " (give one, or --accept-proposed)")
+    sheet_sha_entry: dict = {}
     if captured.get(DECISION_SPEC) is not None:
         # Codex round 2 on #131: this sign-off also signs the decision spec, so it freezes the spec's geometry inputs
         # (and, signed by the owner, approves the spec's proposed HIGH geometry exceptions). Brief-only runs skip it.
@@ -498,6 +499,13 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
             raise ValueError("the evidence binding supplied is not the one this spec and its dossier give: read the "
                              "dossier and the sheet again before signing")
         evidence = mine
+        try:
+            sheet_bytes = read_nofollow(run_dir, SO.SHEET)[0]
+        except FileNotFoundError:
+            sheet_bytes = None
+        except LinkRefused as e:
+            raise ValueError(f"{SO.SHEET}: {e}") from None
+        sheet_sha_entry = {SO.SHEET: hashlib.sha256(sheet_bytes).hexdigest() if sheet_bytes is not None else "none"}
         from toolkit.spec import geometry
         if expect_geometry is None:
             # Codex on 4d20e23: every entry point (the CLI, the harness's lead sign-off) binds the geometry evidence
@@ -514,7 +522,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
         "answer_source": {q["id"]: "given" if q["id"] in answers else "proposed accepted" for q in qs},
         # W0-G (Codex r2 P1-3): the digest of the bytes validated above, after anything a caller supplies
-        "sha256": {**shas, **(extra_sha or {}), **((evidence or {}).get("files") or {}),
+        "sha256": {**shas, **(extra_sha or {}), **sheet_sha_entry, **((evidence or {}).get("files") or {}),
                    **_review_conditions_sha(rc_bytes if captured.get(DECISION_SPEC) is not None else None)},
         **({"evidence": evidence["record"]} if evidence else {}),
         "schema_version": schema_version(doc),

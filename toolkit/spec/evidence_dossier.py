@@ -182,8 +182,11 @@ def _engines(raw: dict, run_dir: str | None) -> tuple[list, list]:
                 return [(f"build:{eng['build'].get('id')}", eng["build"])], []
             return [], [f"engine: auto: the eligible engines cannot be determined ({type(e).__name__}: {e})"]
     el = [(r["ref"], r.get("config") or {}) for r in rows if r.get("eligible")]
-    if not el and schema.engine_has_build(eng):
-        return [(f"build:{eng['build'].get('id')}", eng["build"])], []
+    if schema.engine_has_build(eng):
+        # An auto + build signature authorizes running EITHER an eligible registered engine OR building the requested
+        # engine, so the dossier must cover the build request's decision inputs too (never hidden by a registered hit).
+        el.append((f"build:{eng['build'].get('id')}", eng["build"]))
+        return el, []
     why = "; ".join(f"{r.get('ref')}: {'; '.join(str(w) for w in (r.get('why_not') or [])[:2])}" for r in rows)[:600]
     return el, [] if el else [f"engine: auto: no engine is eligible, so the decision inputs cannot be resolved ({why})"]
 
@@ -857,11 +860,11 @@ def refusals(raw: dict, run_dir: str | None, data: bytes | None) -> list[str]:
     return _refusals(raw, run_dir, data)[0]
 
 
-def declaration_sha256(ref: str) -> str:
+def declaration_sha256(ref: str, config: dict | None = None) -> str:
     """sha256 of an engine's effective declaration (its decision and outcome inputs): a change to it after signing is
     detected by this hash, apart from the inputs it requires."""
     try:
-        return hashlib.sha256(_canon({"decision_inputs": engine_declaration(ref),
+        return hashlib.sha256(_canon({"decision_inputs": engine_declaration(ref, config),
                                       "outcome_inputs": engine_outcome_inputs(ref)}).encode()).hexdigest()
     except Exception as e:  # noqa: BLE001
         return f"unreadable: {type(e).__name__}"
@@ -935,19 +938,39 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
         return {"status": "refused", "problems": [f"decision_spec.yaml does not parse: {e}"], "binding": None}
     raw = raw if isinstance(raw, dict) else {}
     run = dict(raw)
+    from toolkit.spec import schema as _schema
+    from toolkit.engines.built import BUILT_ADAPTER_REF
     eng = raw.get("engine")
-    auto = eng == "auto" or (isinstance(eng, dict) and eng.get("auto") is True)
+    auto = _schema.engine_is_auto(eng)
+    has_build = _schema.engine_has_build(eng)
     if engine is not None:
-        run["engine"] = {"ref": engine[0], **({"config": dict(engine[1])} if engine[1] else {})}
-    elif auto:
+        if has_build and engine[0] == BUILT_ADAPTER_REF:
+            run["engine"] = {"build": eng["build"]}
+        else:
+            run["engine"] = {"ref": engine[0], **({"config": dict(engine[1])} if engine[1] else {})}
+    elif auto or has_build:
         ch = get(ENGINE_CHOICE)
         if ch is not None:
             try:
-                e = (json.loads(ch.decode()) or {}).get("engine") or {}
+                doc_ch = json.loads(ch.decode())
             except (ValueError, UnicodeDecodeError, AttributeError):
-                e = None
-            if isinstance(e, dict) and e.get("ref"):
-                run["engine"] = {"ref": e["ref"], **({"config": e["config"]} if e.get("config") else {})}
+                doc_ch = None
+            if (has_build and isinstance(doc_ch, dict) and isinstance(doc_ch.get("build"), dict)
+                    and "engine" not in doc_ch):
+                b = doc_ch["build"]
+                if b.get("status") in ("requested", "building", "admitted") and b.get("id") == eng["build"].get("id"):
+                    run["engine"] = {"build": eng["build"]}
+                else:
+                    probs.append(f"{ENGINE_CHOICE} is unreadable: malformed pending build choice record")
+            elif isinstance(doc_ch, dict) and isinstance(doc_ch.get("engine"), dict) and doc_ch["engine"].get("ref"):
+                e = doc_ch["engine"]
+                if has_build and not auto and e["ref"] != BUILT_ADAPTER_REF:
+                    probs.append(f"{ENGINE_CHOICE}: a plain engine.build spec may resolve only to "
+                                 f"{BUILT_ADAPTER_REF}, not {e['ref']!r}")
+                elif has_build and e["ref"] == BUILT_ADAPTER_REF:
+                    run["engine"] = {"build": eng["build"]}
+                else:
+                    run["engine"] = {"ref": e["ref"], **({"config": e["config"]} if e.get("config") else {})}
             else:
                 probs.append(f"{ENGINE_CHOICE} is unreadable: the chosen engine's inputs cannot be resolved")
     rel = dossier_reference(raw)
@@ -963,7 +986,7 @@ def state(run_dir: str | None = None, *, spec_bytes: bytes | None = None, read=N
         engines = _engines(run, run_dir)[0] if opts.get("components") else []   # no component can require any
     except Exception as e:  # noqa: BLE001
         engines, coverage = [], coverage + [f"the engines that may run cannot be resolved ({type(e).__name__}: {e})"]
-    decls = {ref: declaration_sha256(ref) for ref, _ in engines}
+    decls = {ref: declaration_sha256(ref, cfg) for ref, cfg in engines}
     # The run's data inputs are bound for every run, whether it needs a dossier or not. The engine's files (priors,
     # fitted values, benchmarks, card, declarations) are bound when the evidence is attested against them (needed); a
     # run that attests none keeps the analysis's own provenance check of those files (benchmark_sources: refit

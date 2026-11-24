@@ -323,6 +323,9 @@ def _resolve_engine_choice(s: "Spec") -> None:
         raise SpecError(f"{ENGINE_CHOICE}: engine must be {{ref: 'module:Class', config: {{...}}}}")
     from toolkit.engines.built import BUILT_ADAPTER_REF
     is_built_adapter = has_build and e["ref"] == BUILT_ADAPTER_REF
+    if has_build and not has_auto and not is_built_adapter:
+        raise SpecError(f"{ENGINE_CHOICE}: a plain engine.build spec may resolve only to {BUILT_ADAPTER_REF}, "
+                        f"not {e['ref']!r}")
     if cands and not is_built_adapter and e["ref"] not in cands:
         raise SpecError(f"{ENGINE_CHOICE}: engine {e['ref']} is not among the signed candidates {cands}")
     check_engine_ref(e["ref"], allow_built=has_build)
@@ -396,7 +399,7 @@ class Spec:
             raise SpecError(f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet")
         # loaded again when the spec's engine changed since (an engine set in place, with no key, is kept)
         if self._engine is None or (self._engine_ref is not None and self._engine_ref != self._engine_key()):
-            self._engine = load_engine(self.raw["engine"])
+            self._engine = load_engine(self.raw["engine"], allow_built=(self.engine_build is not None))
             self._engine_ref = self._engine_key()
         return self._engine
 
@@ -678,10 +681,10 @@ def engine_ref_problems(raw: Mapping, *, allow_built: bool = False) -> list[str]
     return out
 
 
-def engine_class(ref: str):
+def engine_class(ref: str, *, allow_built: bool = False):
     """The engine class an allowed reference names, checked against the Engine contract; never instantiated."""
     from toolkit import import_guard as G
-    check_engine_ref(ref)
+    check_engine_ref(ref, allow_built=allow_built)
     try:
         k = G.resolve("engine", ref)
     except G.ImportRefused as e:
@@ -691,7 +694,7 @@ def engine_class(ref: str):
     return k
 
 
-def load_engine(ref):
+def load_engine(ref, *, allow_built: bool = False):
     if isinstance(ref, str):
         ref = {"ref": ref}
     if not isinstance(ref, dict):
@@ -699,7 +702,7 @@ def load_engine(ref):
     config = ref.get("config") or {}
     if not isinstance(config, dict):
         raise SpecError("engine.config must be a mapping")
-    return engine_class(ref.get("ref"))(**config)
+    return engine_class(ref.get("ref"), allow_built=allow_built)(**config)
 
 
 def _num(v):
@@ -726,7 +729,11 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
     if derived is not None:
         spec.derived = derived
     try:
-        unreg = engine_ref_problems(spec.raw)         # an unregistered engine is refused first, before it is built
+        has_build_ctx = spec.engine_build is not None or engine_has_build(getattr(spec, "engine_declared", None))
+        unreg = engine_ref_problems(spec.raw, allow_built=has_build_ctx)
+        if has_build_ctx and getattr(spec, "engine_declared", None) is not None:
+            unreg += [p for p in engine_ref_problems({"engine": spec.engine_declared}, allow_built=False)
+                      if p not in unreg]
         if unreg:
             return unreg
         pres = presentation_refusal(spec.raw)         # every path, sign-off with engine: auto pending included
@@ -1383,6 +1390,10 @@ def _validate(s: Spec) -> list[str]:
     bad += [f"decision_units: the units table has no column {c}" for c in sorted(need - cols)]
     if bad:
         return bad
+    if callable(getattr(eng, "validate_unit_values", None)):
+        bad += eng.validate_unit_values(units, du.get("engine_attributes") or {})
+        if bad:
+            return bad
     a = s.alloc_spec()
     bad += [f"options: {e}" for e in acosts.validate(a, cols)]
     bad += [f"constraints: {e}" for e in apackages.validate(a, units)]

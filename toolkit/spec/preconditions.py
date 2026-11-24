@@ -32,6 +32,27 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
+_AB_MOD = None
+
+
+def _load_ab():
+    global _AB_MOD
+    if _AB_MOD is None:
+        import importlib.util
+        path = os.path.join(ROOT, "agents", "analysis_backend.py")
+        m = importlib.util.spec_from_file_location("_ab_preconditions", path)
+        mod = importlib.util.module_from_spec(m)
+        m.loader.exec_module(mod)
+        _AB_MOD = mod
+    return _AB_MOD
+
+
+def _departure_mode(run_dir, signer) -> str:
+    from toolkit.engines import benchmark_coverage as BC
+    return "proposed" if (signer is None and BC.signature(run_dir) == "proposed") or signer == "owner" else \
+        "provisional_lead" if signer == "lead" and run_dir and BC.lead_run(run_dir) else "signed"   # D2, lead runs only
+
+
 def _benchmark_eligibility(run_dir, spec, signer) -> list:
     """Departure shape, then the benchmark precondition: for a named (or resolved) engine, that engine; for engine:
     auto still pending, every candidate the selection could choose, refused when none passes. A pending engine.build
@@ -43,13 +64,8 @@ def _benchmark_eligibility(run_dir, spec, signer) -> list:
         return out
     if not getattr(spec, "engine_pending", False):
         return out + BC.spec_problems(spec, by=signer)
-    import importlib.util
-    path = os.path.join(ROOT, "agents", "analysis_backend.py")
-    m = importlib.util.spec_from_file_location("_ab_preconditions", path)
-    AB = importlib.util.module_from_spec(m)
-    m.loader.exec_module(AB)
-    mode = "proposed" if (signer is None and BC.signature(run_dir) == "proposed") or signer == "owner" else \
-        "provisional_lead" if signer == "lead" and run_dir and BC.lead_run(run_dir) else "signed"   # D2, lead runs only
+    AB = _load_ab()
+    mode = _departure_mode(run_dir, signer)
     raw = dict(spec.raw, _run_dir=run_dir)
     if signer is not None and mode == "signed":
         raw.pop("engine_departures", None)          # no other signer makes a departure count
@@ -58,6 +74,33 @@ def _benchmark_eligibility(run_dir, spec, signer) -> list:
         return out
     return out + ["engine benchmarks: no candidate engine passes the engine choice's checks"] + [
         f"engine benchmarks: [{r.get('ref')}] {w}" for r in rows for w in (r.get("why_not") or [])][:40]
+
+
+def _build_request(run_dir, spec, signer, spec_bytes=None, **_ctx) -> list:
+    """Full-registry justification check for every engine.build spec at validation and on every signing path
+    (docs/design/agent-built-engines.md §2.1, BE25): prevents direct signing from bypassing `build_request_problems`."""
+    import yaml
+    from toolkit.spec import schema
+    raw0 = None
+    if spec_bytes:
+        try:
+            raw0 = yaml.safe_load(spec_bytes.decode("utf-8"))
+        except (yaml.YAMLError, UnicodeDecodeError):
+            raw0 = None
+    decl_raw = raw0 if isinstance(raw0, dict) else dict(spec.raw)
+    if not schema.engine_has_build(decl_raw.get("engine")):
+        dec = getattr(spec, "engine_declared", None)
+        if not schema.engine_has_build(dec):
+            return []
+        decl_raw = dict(spec.raw, engine=dec)
+    if not getattr(spec, "engine_pending", False) and signer is None:
+        return []
+    AB = _load_ab()
+    mode = _departure_mode(run_dir, signer)
+    check_raw = dict(decl_raw, **({"_run_dir": run_dir} if run_dir else {}))
+    if signer is not None and mode == "signed":
+        check_raw.pop("engine_departures", None)
+    return AB.build_request_problems(check_raw, departures=mode)
 
 
 def _net_effect_posterior(run_dir, spec, signer) -> list:
@@ -128,16 +171,22 @@ def _engine_registry(run_dir, spec, signer, spec_bytes=None, **_ctx) -> list:
     import json
     import yaml
     from toolkit.spec import schema
-    out = list(schema.engine_ref_problems(spec.raw))
+    from toolkit.engines.built import BUILT_ADAPTER_REF
     try:
         raw0 = yaml.safe_load(spec_bytes.decode("utf-8")) if spec_bytes else None
     except (yaml.YAMLError, UnicodeDecodeError):
         raw0 = None         # an unreadable spec is refused by problems() itself
-    if isinstance(raw0, dict):
-        out += [p for p in schema.engine_ref_problems(raw0) if p not in out]
     decl = raw0 if isinstance(raw0, dict) else spec.raw
-    has_build = schema.engine_has_build(decl.get("engine")) or getattr(spec, "engine_build", None) is not None
-    auto = schema.engine_is_auto(decl.get("engine")) or getattr(spec, "engine_auto", False) or has_build
+    has_build = (schema.engine_has_build(decl.get("engine"))
+                 or schema.engine_has_build(getattr(spec, "engine_declared", None))
+                 or getattr(spec, "engine_build", None) is not None)
+    has_auto = (schema.engine_is_auto(decl.get("engine"))
+                or schema.engine_is_auto(getattr(spec, "engine_declared", None))
+                or getattr(spec, "engine_auto", False))
+    out = list(schema.engine_ref_problems(spec.raw, allow_built=has_build))
+    if isinstance(raw0, dict):
+        out += [p for p in schema.engine_ref_problems(raw0, allow_built=False) if p not in out]
+    auto = has_auto or has_build
     cp = os.path.join(run_dir, schema.ENGINE_CHOICE) if run_dir and auto else None     # a named engine ignores it
     if cp and os.path.exists(cp):
         try:
@@ -147,14 +196,18 @@ def _engine_registry(run_dir, spec, signer, spec_bytes=None, **_ctx) -> list:
         except (OSError, ValueError, AttributeError) as e:
             return out + [f"{schema.ENGINE_CHOICE}: unreadable: {type(e).__name__}: {e}"]
         if ref is not None:
+            if has_build and not has_auto and ref != BUILT_ADAPTER_REF:
+                out.append(f"{schema.ENGINE_CHOICE}: a plain engine.build spec may resolve only to "
+                           f"{BUILT_ADAPTER_REF}, not {ref!r}")
             out += [p for p in schema.engine_ref_problems({"engine": {"ref": ref}}, allow_built=has_build)
                     if p not in out]
     return out
 
 
-CHECKS = {"engine_registry": _engine_registry, "benchmark_eligibility": _benchmark_eligibility,
+CHECKS = {"engine_registry": _engine_registry, "build_request": _build_request,
+          "benchmark_eligibility": _benchmark_eligibility,
           "net_effect_posterior": _net_effect_posterior, "calibration_scale": _calibration_scale}
-CONTEXT_CHECKS: set = {"engine_registry"}  # checks called with the context: fn(run_dir, spec, signer, spec_bytes=, ...)
+CONTEXT_CHECKS: set = {"engine_registry", "build_request"}  # checks called with the context: fn(run_dir, spec, signer, spec_bytes=, ...)
 
 
 def register(name: str, fn, context: bool = False) -> None:
