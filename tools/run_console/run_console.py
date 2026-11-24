@@ -728,7 +728,8 @@ def _scope_answers(run_dir: str, name: str) -> tuple[dict, str | None]:
     if err or not isinstance(ans, dict) or not all(isinstance(a, dict) and a.get("decision") in SS.DECISIONS
                                                    for a in ans.values()):
         return {}, f"{name}: {err or 'answers must map fingerprints to {decision: accept|decline}'}"
-    return ans, None
+    refused = SS.owner_refusals(run_dir, ans)       # owner-sign (Codex r1 14): as load_answers, a refused one is none
+    return {fp: a for fp, a in ans.items() if fp not in refused}, None
 
 
 def inbox(run_dir: str) -> dict:

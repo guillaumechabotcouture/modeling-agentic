@@ -716,8 +716,8 @@ def sign(run_dir: str, by: str, answers: Optional[dict] = None, all_decision: Op
 def _sign_locked(run_dir: str, req: dict, by: str, answers: Optional[dict], all_decision: Optional[str],
                  note: str) -> dict:
     prior, bad = load_answers(run_dir)
-    if bad:
-        prior = {}
+    raw_ans = _raw_doc(run_dir).get("answers")     # Codex r1 11: an answer refused on read is kept in the record
+    prior = {} if bad else {**(raw_ans if isinstance(raw_ans, dict) else {}), **prior}
     answers = answers or {}
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     new, missing = {}, []
@@ -1330,9 +1330,13 @@ def _self_test() -> int:
         json.dump({"answers": raw}, open(os.path.join(d, SIGNOFF), "w"))
         ok(not _signer_ok(load_answers(d)[0]["fp4"]["by"], "owner") and "fp4" not in owner_refusals(d),
            "OS4 a lead's answer never counts as the owner's, even with an owner signature attached")
+        raw["fp9"] = {"finding": "f9", "decision": "decline", "by": "owner", "at": "2026-12-03T00:00:00+00:00"}
+        json.dump({"answers": raw}, open(os.path.join(d, SIGNOFF), "w"))
         sign(d, "owner", {"f1": "accept", "f2": "decline"})
-        ok(sorted(load_answers(d)[0]) == ["fp1", "fp2", "fp3", "fp4"] and not owner_refusals(d),
-           "OS5 the owner signs again over a refused answer, and the new signed answer counts")
+        ok(sorted(load_answers(d)[0]) == ["fp1", "fp2", "fp3", "fp4"] and list(owner_refusals(d)) == ["fp9"]
+           and "fp9" in json.load(open(os.path.join(d, SIGNOFF)))["answers"],
+           "OS5 the owner signs again over a refused answer, and the new signed answer counts; an unrelated refused "
+           "answer stays in the record (Codex r1 11)")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

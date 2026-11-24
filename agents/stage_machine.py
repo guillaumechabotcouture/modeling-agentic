@@ -1225,10 +1225,10 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
     rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
     rec[RC.RECORD_KEY] = RC.sha_of(rc_bytes)
-    if by == "owner":           # owner-sign: the owner's key signs the spec's hash before anything is frozen or written
+    if by == "owner":           # owner-sign: the owner's key signs the whole record before anything is frozen or written
         from lib import owner_key as OK
         try:
-            rec["owner_signature"] = OK.sign_spec(run_dir, {AB.SPEC_FILE: rec["spec_sha256"]})
+            rec["owner_signature"] = OK.sign_spec(run_dir, rec)
         except OK.OwnerKeyError as e:
             raise ValueError(f"not signed with the owner's key: {e}") from None
     from toolkit.spec import geometry as GEO
@@ -1725,10 +1725,21 @@ class Machine:
 
     def _spec_owner_problem(self) -> str | None:
         """On --resume past SIGN under --signoff owner: the owner's sign-off must still verify (owner-sign)."""
-        if self.st.signoff != "owner" or self._signed_by() is not None:
+        if self.st.signoff != "owner" or self._signed_by() == "owner":
             return None
-        st, why = getattr(self, "_owner_sig", ("", ""))
-        return why if st == "refused" else None
+        from lib import owner_key as OK       # Codex r1 1: a lead's record or no record is no owner sign-off either
+        st, why = OK.spec_check(self._spec_rec(self.run_dir), self.run_dir)
+        return why if st == "refused" else f"the spec carries no owner sign-off; {OK.HOW_SPEC}"
+
+    def _spec_rec(self, rd: str) -> dict:
+        """The sign-off record that covers the spec: the backend's (B) or the machine's."""
+        if getattr(self.backend, "sign", None):
+            try:
+                from toolkit.spec import signoff
+                return signoff._spec_record(rd) or {}
+            except Exception:  # noqa: BLE001
+                return {}
+        return _signoff(rd) or {}
 
     def fix_guard(self, run_dir: str) -> list[str]:
         """What a fix task may not do: change decision_spec.yaml (compared with its sign-off, or with
@@ -2258,7 +2269,8 @@ class Machine:
         self.st.paused = "awaiting_signoff"
         self.st.status = None
         save_state(self.run_dir, self.st)
-        st, why = getattr(self, "_owner_sig", ("", ""))
+        from lib import owner_key as OK
+        st, why = OK.spec_check(self._spec_rec(self.run_dir), self.run_dir)
         if st == "refused":
             self.log(f"[machine] the owner's sign-off record is refused: {why}")
         self.log(f"[machine] waiting for the owner: python3 agents/stage_machine.py sign {self.run_dir} --by owner")
@@ -4050,6 +4062,15 @@ def _t_owner_sign(ok, new_run, Spike, Stub) -> None:
     why = [h.get("why", "") for h in load_state(d).history if h.get("to") == "FINAL"][-1:]
     ok(s == "run_failed" and why and "does not verify on resume" in why[0],
        f"OS4 a resume past SIGN verifies the owner's signature again: a bad one fails closed ({s}, {why})")
+    got = []
+    for rec in (dict(good, by="lead"), None):        # Codex r1 1: a lead's record, or none, on an owner run's resume
+        stx = load_state(d)
+        stx.state, stx.status, stx.forced_status = "CONFIGURE", None, None
+        save_state(d, stx)
+        put(rec) if rec else os.remove(p)
+        got.append(Spike(d, Stub(T.s), None, log=quiet, cross_engine_check=False).run())
+    ok(got == ["run_failed", "run_failed"], f"OS4b an owner run resumed past SIGN with a lead's record or none fails "
+                                            f"closed ({got})")
     d, T, st = new_run("owner_legacy", {}, signoff="owner")
     Spike(d, T, st, log=quiet, cross_engine_check=False).run()
     _t_owner_disposes(d)

@@ -239,18 +239,39 @@ def _file_sha(run_dir: str, rel: str) -> str | None:
         return None
 
 
-def sign_spec(run_dir: str, artifacts: dict) -> dict:
-    """The owner's signature of a decision-spec sign-off: `artifacts` holds the spec's sha256, the sheet's and every
-    other hash the record binds."""
-    if not artifacts.get(SPEC):
+RECORD = "sign-off record"     # the artifact key of the record's own digest
+
+
+def _spec_hash(rec: dict):
+    return (rec.get("sha256") or {}).get(SPEC) if isinstance(rec.get("sha256"), dict) else rec.get("spec_sha256")
+
+
+def record_digest(rec: dict) -> str:
+    """sha256 of the whole record but its signature: every hash, answer, evidence binding and note it holds."""
+    return hashlib.sha256(canon({k: v for k, v in rec.items() if k != "owner_signature"})).hexdigest()
+
+
+def sign_spec(run_dir: str, rec: dict, sheet_sha: str | None = None) -> dict:
+    """The owner's signature of a decision-spec sign-off record, built and not yet written: the spec's sha256, the
+    sign-off sheet's and the digest of the whole record (so every binding in it is signed)."""
+    if not _spec_hash(rec):
         raise OwnerKeyError(f"no {SPEC} hash to sign")
-    return sign_payload("decision_spec", run_dir, artifacts, "sign")
+    sheet = sheet_sha if sheet_sha is not None else (_file_sha(run_dir, SHEET) or "none")
+    return sign_payload("decision_spec", run_dir, {SPEC: _spec_hash(rec), SHEET: sheet, RECORD: record_digest(rec)},
+                        "sign")
+
+
+def resign_ok(prior, run_dir: str) -> bool:
+    """The owner may sign again over an owner record that is refused only while the spec is still the bytes it
+    records (so the frozen copy is never replaced by other bytes)."""
+    return (isinstance(prior, dict) and spec_check(prior, run_dir)[0] == "refused"
+            and bool(_spec_hash(prior)) and _spec_hash(prior) == _file_sha(run_dir, SPEC))
 
 
 def spec_check(rec, run_dir: str) -> tuple[str, str]:
     """(status, why) of a spec sign-off record: not_owner | signed | legacy | refused. `signed` needs a valid signature
-    for this run whose spec hash is the file's now and whose every other hash (the sheet aside, which the harness
-    regenerates) is the record's."""
+    for this run whose spec hash is the record's and the file's now, and whose record digest is this record's (the
+    sheet is not compared: the harness regenerates it)."""
     rec = rec if isinstance(rec, dict) else {}
     if (rec.get("signed_by") or rec.get("by")) != "owner":
         return "not_owner", ""
@@ -263,11 +284,10 @@ def spec_check(rec, run_dir: str) -> tuple[str, str]:
         p = verify(sig, "decision_spec", run_dir)
     except OwnerKeyError as e:
         return "refused", f"the owner's sign-off of {SPEC} does not verify ({e}); {HOW_SPEC}"
-    hashes = rec.get("sha256") if isinstance(rec.get("sha256"), dict) else {SPEC: rec.get("spec_sha256")}
     arts = p.get("artifacts") if isinstance(p.get("artifacts"), dict) else {}
-    bad = sorted(k for k, v in arts.items() if k != SHEET and hashes.get(k) != v)
-    if not arts.get(SPEC) or arts.get(SPEC) != _file_sha(run_dir, SPEC):
-        bad = sorted(set(bad) | {SPEC})
+    bad = [] if arts.get(RECORD) == record_digest(rec) else [RECORD]
+    if not arts.get(SPEC) or arts.get(SPEC) != _spec_hash(rec) or arts.get(SPEC) != _file_sha(run_dir, SPEC):
+        bad.append(SPEC)
     if bad:
         return "refused", f"the owner's signature does not match {', '.join(bad)} (artifact hash mismatch); {HOW_SPEC}"
     return "signed", ""
@@ -298,8 +318,10 @@ def scope_check(run_dir: str, fp: str, a) -> tuple[str, str]:
         p = verify(sig, "scope_declarations", run_dir)
     except OwnerKeyError as e:
         return "refused", f"the owner's answer to {a.get('finding')} does not verify ({e}); {HOW_SCOPE}"
-    got = ((p.get("decision") or {}).get("answers") or {}).get(fp) if isinstance(p.get("decision"), dict) else None
-    if got != {"finding": a.get("finding"), "decision": a.get("decision")} or p.get("signed_at") != a.get("at"):
+    dec = p.get("decision") if isinstance(p.get("decision"), dict) else {}
+    got = (dec.get("answers") or {}).get(fp) if isinstance(dec.get("answers"), dict) else None
+    if got != {"finding": a.get("finding"), "decision": a.get("decision")} or p.get("signed_at") != a.get("at") \
+            or dec.get("round") != a.get("round"):
         return "refused", f"the owner's signature does not match the answer to {a.get('finding')}; {HOW_SCOPE}"
     return "signed", ""
 
@@ -323,14 +345,21 @@ def _self_test() -> int:
         os.makedirs(rd)
         open(os.path.join(rd, SPEC), "w").write("a: 1\n")
         sha = _file_sha(rd, SPEC)
-        sig = sign_spec(rd, {SPEC: sha, SHEET: "none", "data/x.json": "ab"})
         rec = {"signed_by": "owner", "signed_at": _now(), "sha256": {SPEC: sha, "data/x.json": "ab"},
-               "owner_signature": sig}
+               "answers": {"Q1": "yes"}, "review_conditions_sha256": "rc"}
+        sig = rec["owner_signature"] = sign_spec(rd, rec)
         ok(spec_check(rec, rd)[0] == "signed" and sig["payload"]["run_id"] == "2026-11-23_run"
-           and sorted(sig["payload"]) == ["artifacts", "decision", "kind", "purpose", "run_id", "signed_at"],
+           and sorted(sig["payload"]) == ["artifacts", "decision", "kind", "purpose", "run_id", "signed_at"]
+           and sorted(sig["payload"]["artifacts"]) == sorted([SPEC, SHEET, RECORD]),
            f"OK2 an owner spec sign-off verifies: run id, artifacts, decision and time are signed ({spec_check(rec, rd)})")
+        ok(all(spec_check(dict(rec, **{k: v}), rd)[0] == "refused"
+               for k, v in (("answers", {"Q1": "no"}), ("review_conditions_sha256", "x"), ("note", "added"))),
+           "OK2b (Codex r1 6-7) every binding in the record is signed: a changed answer, review-conditions hash or an "
+           "added field is refused")
+        ok(not resign_ok(rec, rd) and resign_ok(dict(rec, note="forged"), rd),
+           "OK2c the owner may sign again only over a refused record whose spec is unchanged")
         tamper = json.loads(json.dumps(rec))
-        tamper["owner_signature"]["payload"]["artifacts"]["data/x.json"] = "cd"
+        tamper["owner_signature"]["payload"]["artifacts"][RECORD] = "cd"
         other = os.path.join(td, "other_run")
         os.makedirs(other)
         open(os.path.join(other, SPEC), "w").write("a: 1\n")
@@ -338,8 +367,9 @@ def _self_test() -> int:
            "OK3 a changed payload, or the signature replayed in another run, is refused")
         open(os.path.join(rd, SPEC), "w").write("a: 2\n")
         st, why = spec_check(rec, rd)
-        ok(st == "refused" and "artifact hash mismatch" in why and "--by owner" in why,
-           f"OK4 a spec changed after signing is refused, saying how to sign: {why[:120]}")
+        ok(st == "refused" and "artifact hash mismatch" in why and "--by owner" in why
+           and not resign_ok(dict(rec, note="forged"), rd),
+           f"OK4 a spec changed after signing is refused, saying how to sign, and cannot be re-signed in place: {why[:120]}")
         open(os.path.join(rd, SPEC), "w").write("a: 1\n")
         bad_rec = dict(rec, sha256={SPEC: sha, "data/x.json": "ee"})
         ok(spec_check(bad_rec, rd)[0] == "refused", "OK4b a record hash that differs from the signed one is refused")
@@ -354,9 +384,10 @@ def _self_test() -> int:
         open(os.path.join(rd, SCOPE_REQUEST), "w").write("{}")
         now = _now()
         ssig = sign_scope(rd, {"fp1": {"finding": "F1", "decision": "accept"}}, 2, now)
-        a = {"finding": "F1", "decision": "accept", "by": "owner", "at": now, "owner_signature": ssig}
+        a = {"finding": "F1", "decision": "accept", "by": "owner", "at": now, "round": 2, "owner_signature": ssig}
         ok(scope_check(rd, "fp1", a)[0] == "signed" and scope_check(rd, "fp2", a)[0] == "refused"
            and scope_check(rd, "fp1", dict(a, decision="decline"))[0] == "refused"
+           and scope_check(rd, "fp1", dict(a, round=3))[0] == "refused"
            and scope_check(rd, "fp1", dict(a, at="2026-12-01T00:00:00+00:00"))[0] == "refused",
            "OK7 a scope answer verifies only for its fingerprint, finding, decision and time")
         ok(scope_check(rd, "fp1", {"finding": "F1", "decision": "accept", "by": "owner", "at": "2026-12-02T00:00:00Z"}

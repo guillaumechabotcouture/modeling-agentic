@@ -433,6 +433,12 @@ def is_signed(run_dir: str) -> bool:
     return _signoff(run_dir) is not None
 
 
+def _owner_resign_ok(run_dir: str) -> bool:
+    """owner-sign: the owner signs again over an owner record that does not verify while the spec is unchanged."""
+    from lib import owner_key as OK
+    return OK.resign_ok(_signoff(run_dir), run_dir)
+
+
 def _capture(run_dir: str, names) -> dict:
     """{name: bytes or None}: each file read once, through an fd opened with no link followed (lib.safe_io)."""
     from lib.safe_io import read_nofollow, LinkRefused
@@ -449,11 +455,11 @@ def _capture(run_dir: str, names) -> dict:
 
 def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
          accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None,
-         expect_geometry: str | None = None, evidence: dict | None = None, owner_signature: dict | None = None) -> dict:
+         expect_geometry: str | None = None, evidence: dict | None = None, sheet_sha256: str | None = None) -> dict:
     """Write the sign-off. Raises ValueError when the brief is not ready. The frozen files are read once: validated,
     hashed and copied from the same bytes, never through a link, and the record is published atomically.
-    `owner_signature`: the owner's key's signature of the spec's sign-off (toolkit/spec/signoff.py sign), recorded as
-    given; the harness verifies it against the record's hashes (scripts/lib/owner_key.py spec_check).
+    By the owner, with a spec: the owner's key signs the whole record before it is written (owner-sign,
+    scripts/lib/owner_key.py; `sheet_sha256`: the sign-off sheet the caller read, else read here).
     `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record;
     `evidence`: the binding the caller made (toolkit/spec/evidence_dossier.py bind); never trusted: this entry point
     recomputes it from the captured spec and the dossier and refuses one that differs."""
@@ -468,7 +474,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         f"{BRIEF} does not exist"])
     if errors:
         raise ValueError("brief not ready: " + "; ".join(errors))
-    if is_signed(run_dir):
+    if is_signed(run_dir) and not (by == "owner" and _owner_resign_ok(run_dir)):
         raise ValueError("already signed; framing changes go in " + AMENDMENTS)
     answers = {str(k): str(v) for k, v in (answers or {}).items()}
     qs = [q for q in doc.get("open_questions") or [] if isinstance(q, dict)]
@@ -521,8 +527,13 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         **({"evidence": evidence["record"]} if evidence else {}),
         "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
-        **({"owner_signature": owner_signature} if owner_signature else {}),
     }
+    if by == "owner" and record["sha256"].get(DECISION_SPEC):
+        from lib import owner_key as OK
+        try:
+            record["owner_signature"] = OK.sign_spec(run_dir, record, sheet_sha256)
+        except OK.OwnerKeyError as e:
+            raise ValueError(f"not signed with the owner's key: {e}") from None
     try:
         # Gemini review: keep the signed versions, so a changed file can be restored (the bytes that were hashed).
         for f, b in captured.items():
