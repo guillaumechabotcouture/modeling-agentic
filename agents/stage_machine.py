@@ -7039,6 +7039,35 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
            and "owner" in str(g.get("rationale")),
            f"WR6 the write-up declares it, and the gate says the owner answered it ({dec.get('declared')}, "
            f"{g.get('rule_matched')}, {g.get('rationale')!r})")
+        # T_LEAD_NO_CRITIC_HIGH (owner policy 2026-11-24): under --signoff lead, an open critic HIGH
+        # finding whose remedy is an owner amendment is NEVER provisionally accepted by the lead — it pauses for the
+        # owner at OWNER_DECISION, and releases once the owner answers.
+        import scope_signoff as _SS_hi
+        amend_hi = {"id": "D-002", "severity": "HIGH", "target_stage": "PLAN",
+                    "claim": "the recommended plan leaves part of the fixed supply unallocated",
+                    "fix_requires": "Owner amendment: require the full supply to be allocated.", "done_when": dw}
+        dh, Th, sth = new_run("wr_lead_critic_high", {"critics": {1: {"critique-domain": [amend_hi]}}},
+                              signoff="lead", max_rounds=2)
+        sh1 = mk(dh, Th, sth).run()
+        meta_h = json.load(open(os.path.join(dh, "metadata.json")))
+        req_h = json.load(open(os.path.join(dh, "scope_signoff_request.json")))
+        ok(sh1 == "paused:awaiting_scope_signoff" and load_state(dh).state == "OWNER_DECISION"
+           and [i.get("finding") for i in req_h.get("items") or []] == ["D-002"]
+           and req_h["items"][0].get("severity") == "HIGH"
+           and "critic HIGH" in str(meta_h.get("paused_why") or "")
+           and not _SS_hi.provisional(dh),
+           f"T_LEAD_NO_CRITIC_HIGH lead mode refuses to provisionally accept an open critic HIGH finding "
+           f"({sh1}, why={meta_h.get('paused_why')!r}, prov={_SS_hi.provisional(dh)})")
+        # Direct call to scope_signoff.provisional_answers with a critic HIGH item also fails closed
+        try:
+            _SS_hi.provisional_answers(dh, req_h["items"], 1)
+            ok(False, "T_LEAD_NO_CRITIC_HIGH_SS scope_signoff.provisional_answers refuses a critic HIGH item")
+        except ValueError as e:
+            ok("critic HIGH" in str(e), f"T_LEAD_NO_CRITIC_HIGH_SS scope_signoff refuses critic HIGH ({e})")
+        _SS_hi.sign(dh, "owner", all_decision="accept", note="owner accepts D-002")
+        sh2 = mk(dh, StubTasks(Th.s), None).run()
+        ok(sh2 == "completed_scope_declared",
+           f"T_LEAD_NO_CRITIC_HIGH_RESUME owner sign releases OWNER_DECISION in a lead run ({sh2})")
 
     def pending_post_write():
         # WR9 (Codex r2 of #344, P1-1): the owner accepted D-001 pre-write; the presentation review raises P-001, whose

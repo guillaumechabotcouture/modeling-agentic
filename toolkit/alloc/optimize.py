@@ -1012,6 +1012,30 @@ def _self_test() -> int:
        and ex.get("gap", "absent") is None and rf["objective"] == ex["objective"],
        f"TG2 a solve that stopped early reports its gap to the LP relaxation bound; a proven one reports none: "
        f"{rf.get('gap')}, {ex.get('gap', 'absent')}")
+    # TEX1-TEX3: exact-budget constraint (fixed already-held supply)
+    eb = {"u1": {"c0": 0.0, "c8": 100.0, "c11a": 100.0, "c11b": 95.0}}
+    ec = {"u1": {"c0": 0.0, "c8": 8.0, "c11a": 11.0, "c11b": 11.0}}
+    ef = {"u1": {"c0": True, "c8": True, "c11a": True, "c11b": True}}
+    try:
+        ri = solve(eb, ec, ef, 11.0, method="ilp", budget_exact=True)
+        rb = solve(eb, ec, ef, 11.0, method="brute", budget_exact=True)
+        ok(ri["status"] == "optimal" and rb["status"] == "optimal"
+           and ri["choice"] == {"u1": "c11a"} and rb["choice"] == {"u1": "c11a"} and ri["cost"] == 11.0,
+           f"TEX1 budget_exact=True allocates the exact budget even when a cheaper package ties on benefit ({ri}, {rb})")
+        rinf = solve(eb, ec, ef, 9.0, method="ilp", budget_exact=True)
+        rinf_b = solve(eb, ec, ef, 9.0, method="brute", budget_exact=True)
+        ok(rinf["status"] == "infeasible" and rinf_b["status"] == "infeasible",
+           f"TEX2 budget_exact=True proves infeasible when no package combination sums to budget ({rinf}, {rinf_b})")
+        under_err = check({"u1": "c8"}, eb, ec, ef, 11.0, budget_exact=True)
+        ok(bool(under_err) and not check({"u1": "c8"}, eb, ec, ef, 11.0, budget_exact=False),
+           f"TEX3a check(budget_exact=True) refuses an under-budget allocation ({under_err})")
+        try:
+            solve(eb, ec, ef, 11.0, method="greedy", budget_exact=True)
+            ok(False, "TEX3b greedy refuses budget_exact=True")
+        except ValueError:
+            ok(True, "TEX3b greedy refuses budget_exact=True")
+    except TypeError as e:
+        ok(False, f"TEX1-TEX3 budget_exact not yet supported ({e})")
     if fails:
         print("SELF-TEST FAILURES:")
         for m in fails:

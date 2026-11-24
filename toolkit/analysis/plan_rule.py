@@ -344,6 +344,48 @@ def _self_test() -> int:
         gr = {"error": f"{type(e).__name__}: {e}"}
     ok(gr == {k: v[2] for k, v in ref.items()}, f"PR12 the decision tests' reference plan agrees with the plan rule "
                                                 f"({gr})")
+    # PR13: expected_value with deliverable.by_group records per-group means and quantities
+    A_bg = _FakeA()
+    A_bg.spec = type("_S", (), {"raw": {"deliverable": {"plan": "expected_value", "headline": {"outcome": "cases"},
+                                                        "by_group": {"columns": {"group": "g", "quantity": "q",
+                                                                                 "value": "v"},
+                                                                     "quantity": {"g1": "d1", "g2": "d2"}}}}})()
+    rows_bg = []
+    for r_ in [_row(10.0, 8.0), _row(0.0, 8.0)]:
+        rb_ = {**r_, "out": {i: {**v,
+                                 "y_group": {k: {"cases": {"g1": 0.25 * yv["cases"], "g2": 0.75 * yv["cases"]}}
+                                             for k, yv in v["y"].items()},
+                                 "cost": {k: {"d1": 1.0 if k == "a" else 0.0, "d2": 2.0 if k == "a" else 0.0}
+                                          for k in v["y"]}}
+                             for i, v in r_["out"].items()}}
+        rows_bg.append(rb_)
+    r_bg = expected_value_plan(A_bg, rows_bg, point, cost0)["record"]
+    pgm = r_bg.get("per_unit_group_mean") or {}
+    pgq = r_bg.get("per_unit_group_quantity") or {}
+    ok(pgm == {"u1": {"g1": {"cases": 0.0}, "g2": {"cases": 0.0}},
+               "u2": {"g1": {"cases": 2.0}, "g2": {"cases": 6.0}}}
+       and pgq == {"u1": {"g1": 0.0, "g2": 0.0}, "u2": {"g1": 1.0, "g2": 2.0}},
+       f"PR13 expected_value with by_group computes per-group means summing to per_unit_mean ({pgm}, {pgq})")
+    bg_raw = {"deliverable": {"plan": "expected_value", "headline": {"outcome": "cases"},
+                              "by_group": {"columns": {"group": "g", "quantity": "q", "value": "v"},
+                                           "quantity": {"g1": "d1", "g2": "d2"}}}}
+    bg_pt = dict(good_pt, plan_rule=dict(good_pt["plan_rule"], per_unit_group_mean=pgm, per_unit_group_quantity=pgq))
+    bg_bad = dict(good_pt, plan_rule=dict(good_pt["plan_rule"], per_unit_group_mean={
+        "u1": {"g1": {"cases": 0.0}, "g2": {"cases": 0.0}}, "u2": {"g1": {"cases": 1.0}, "g2": {"cases": 1.0}}}))
+    ok(contract_findings(bg_raw, bg_pt, unc) == [] and len(contract_findings(bg_raw, good_pt, unc)) >= 1
+       and len(contract_findings(bg_raw, bg_bad, unc)) >= 1,
+       f"PR13b contract_findings verifies by_group per-group means ({contract_findings(bg_raw, bg_pt, unc)}, "
+       f"{contract_findings(bg_raw, bg_bad, unc)})")
+    # PR14: constraints.envelope_exact: true checked at contract gate on point & expected_value
+    ex_pt_raw = {"constraints": {"envelope_exact": True}}
+    ex_ev_raw = dict(ev_raw, constraints={"envelope_exact": True})
+    pt_ok = {"cost_allocated": 11.0, "budget_allocatable": 11.0}
+    pt_short = {"cost_allocated": 8.0, "budget_allocatable": 11.0}
+    ok(contract_findings(ex_pt_raw, pt_ok, unc) == [] and len(contract_findings(ex_pt_raw, pt_short, unc)) == 1
+       and contract_findings(ex_ev_raw, good_pt, unc) == []
+       and len(contract_findings(ex_ev_raw, dict(good_pt, cost_allocated=0.5,
+                                                plan_rule=dict(good_pt["plan_rule"], point_cost=0.5)), unc)) == 1,
+       "PR14 contract_findings checks constraints.envelope_exact on both point and expected_value plans")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

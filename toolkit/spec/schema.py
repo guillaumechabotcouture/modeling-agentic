@@ -2070,9 +2070,7 @@ def _self_test_plan_rule(ok):
                "estimates kind": lambda x: x["deliverable"].update(kind="estimates"),
                "headline variant": lambda x: x["analysis"].update(plan_variants={"headline": "v", "variants": []}),
                "variants, no headline": lambda x: x["analysis"].update(plan_variants={"variants": [
-                   {"id": "given", "type": "fixed_plan", "column": "given", "text": "t"}]}),
-               "by_group": lambda x: x["deliverable"].update(by_group={"columns": {"group": "g", "quantity": "q",
-                                                                                   "value": "v"}, "quantity": {}})}
+                   {"id": "given", "type": "fixed_plan", "column": "given", "text": "t"}]})}
         miss = []
         for k, mut in bad.items():
             r = copy.deepcopy(raw)
@@ -2080,6 +2078,40 @@ def _self_test_plan_rule(ok):
             mut(r)
             if not any("deliverable.plan" in e for e in _validate_deliverable(Spec(r, d))):
                 miss.append(k)
+        # expected_value is supported together with deliverable.by_group
+        r_bg = copy.deepcopy(raw)
+        r_bg["analysis"]["evaluation"] = "direct"
+        r_bg["analysis"]["cost_outputs"] = {"q_all": {"cost_driver": "a_doses"}}
+        r_bg["deliverable"]["plan"] = "expected_value"
+        r_bg["deliverable"]["by_group"] = {"columns": {"group": "age_group", "quantity": "doses", "value": "averted"},
+                                           "quantity": {"all": "q_all"}}
+        ev_bg_errs = _validate_deliverable(Spec(r_bg, d))
+        ok(ev_bg_errs == [], f"SPEV6 expected_value validates together with deliverable.by_group: {ev_bg_errs}")
+        # constraints.envelope_exact (fixed already-held supply)
+        r_ex = copy.deepcopy(raw)
+        r_ex["constraints"]["envelope_exact"] = True
+        r_ex["uncertainty"]["sources"] = [{"kind": "engine_parameters"}]
+        r_ex["uncertainty"]["excluded"] = [
+            {"kind": "calibration", "reason": "r"}, {"kind": "costs", "reason": "fixed supply"},
+            {"kind": "emulator", "reason": "r"}]
+        sp_ex_path = os.path.join(d, "spec_exact.yaml")
+        yaml.safe_dump(r_ex, open(sp_ex_path, "w"), sort_keys=False)
+        ex_errs = [e for e in validate(load(sp_ex_path)) if "envelope_exact" in e]
+        ok(ex_errs == [], f"SPEX1 constraints.envelope_exact: true validates with fixed unit costs: {ex_errs}")
+        ex_bad = {}
+        for tag, mut in (
+                ("non_bool", lambda x: x["constraints"].update(envelope_exact="yes")),
+                ("with_costs_uq", lambda x: x["uncertainty"].update(
+                    sources=[{"kind": "engine_parameters"}, {"kind": "costs"}],
+                    excluded=[{"kind": "calibration", "reason": "r"}, {"kind": "emulator", "reason": "r"}])),
+                ("with_affordability", lambda x: x["uncertainty"].update(
+                    affordability={"enforce": True, "max_share_over_budget": 0.05}))):
+            rb = copy.deepcopy(r_ex)
+            mut(rb)
+            pb = os.path.join(d, f"spec_exact_{tag}.yaml")
+            yaml.safe_dump(rb, open(pb, "w"), sort_keys=False)
+            ex_bad[tag] = [e for e in validate(load(pb)) if "envelope_exact" in e]
+        ok(all(ex_bad.values()), f"SPEX2 invalid envelope_exact combinations are refused: {ex_bad}")
         from toolkit.spec import estimates as ES
         es_bad = {}
         with tempfile.TemporaryDirectory() as de:
@@ -2094,7 +2126,7 @@ def _self_test_plan_rule(ok):
         ok(all(es_bad.values()), f"SPEV5 the public validate() refuses deliverable.plan on an estimates spec, whatever "
                                  f"its value (Codex r1 P1-4): {es_bad}")
         ok(not miss, f"SPEV4 expected_value is refused without an uncertainty source, with a reserve "
-                     f"(affordability enforce), with plan variants, on an estimates deliverable and with a by-group table (not refused: {miss})")
+                     f"(affordability enforce), with plan variants and on an estimates deliverable (not refused: {miss})")
 
 
 def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)) -> str:
