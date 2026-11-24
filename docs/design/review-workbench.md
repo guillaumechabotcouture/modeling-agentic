@@ -259,6 +259,85 @@ Acceptance (R4): OA-DUAL 0.54 and OA-PBO 0.73 against window 2024.0–2029.25; 5
 2026-11-18T00:49:44Z with an empty note; the sheet's one HIGH: an owner-set parameter range that
 lies outside the engine card's range.
 
+The generic Spec and evidence model (what `views/spec.py` returns), read from the verified
+signed spec (§3), with the spec on disk named when it differs. `facts`: `decision_maker`,
+`comparator`, `decision_date`, `window_start`, `window_end`, `delivery_start`, `delivery_end`,
+`envelope`, `n_components`, `n_effect_inputs`, `n_effect_beyond_evidence`,
+`n_effect_no_followup`, `n_dossier`, `n_dossier_observed`, `n_dossier_no_data`,
+`n_dossier_decided_by_owner`, `n_observations`, `n_observations_unchecked`, `n_signoffs`,
+`signed_by`, `signed_at`, `note_empty`, `n_presign_high`. `tables.decision`: `item, value,
+key` (the spec key it came from). `tables.effects`: one row per effect input applied to the
+outcome (`id, component, value, reference, source, follow_up_years, window_years, beyond`),
+where `follow_up_years` comes from a structured field of the spec or of the dossier entry the
+input cites, and is null when neither records it. `tables.dossier`: `key, kind, model_value,
+n_observations, chosen, low, high, decision_test, no_data, decided_by_owner`.
+`tables.signoffs`: `at, by, note, spec_hash, sections_changed` (oldest first, from the archived
+sign-offs and the current record). `tables.presign`: `section, severity, text` (from the
+sign-off sheet). Checks: `spec.effect_window` (C1): an effect input whose evidence follows up
+for less than the window it is applied over is `look`, and one with no recorded follow-up is
+`look` naming gap H1 (never `ok`: the workbench cannot tell); `spec.dossier_coverage` (C15):
+entries with no data and no decision test, and observations not marked as opened, are `look`;
+`spec.signoff_note`: an empty note on the current signature is `look`;
+`spec.presign_sections`: a section the sign-off code writes that this sheet lacks is `look`;
+`spec.presign_high`: a HIGH row on the sheet is `look` and names gap H14;
+`spec.decision_date`: a decision date that is not a date, or lies before the window, is `look`.
+Nothing here names a disease or an intervention: components, effect inputs and dossier keys
+are the run's own.
+
+Settled from the first acceptance pass on three runs (2026-11-19):
+
+- `tables.effects` holds every value the signed spec sets that scales an effect, with a column
+  `where`: the spec's outcome adjustments, and the engine parameter values the spec sets. So a
+  run with no outcome adjustment still has its spec-set values examined. Columns added:
+  `where`, `verified` (the record's own mark for the value's source, or null).
+  `spec.effect_window` applies to rows that are applied over the outcome window (outcome
+  adjustments); a check `spec.values_sourced` is `look` when a spec-set value's source is
+  marked unverified or carries no source, with the count.
+- Only structured fields count. No run records a follow-up duration, a checked mark on an
+  observation, or who decided a dossier entry, as data: the durations and marks are in prose.
+  `follow_up_years`, `n_observations_unchecked` and `n_dossier_decided_by_owner` are null where
+  no field holds them, the checks say what is not recorded (gaps H1, H2), and no text is
+  parsed for them. `spec.effect_window` is therefore `look` for every outcome adjustment today.
+- `spec.decision_date` follows the producer's own rule for the decision date against the
+  delivery period and the window (`toolkit/spec/spec_critique.py`), not a rule of the
+  workbench's.
+- `spec.presign_sections` compares the sheet with the sections the current sign-off code
+  writes for every spec, and says the sheet may predate a section.
+- `spec.signoff_note` also counts the spec sections the current signature changed, so an empty
+  note on a signature that changed many sections reads as such. `sections_changed` is by
+  top-level key of the parsed spec; a change in comments only is not seen, and the view says so.
+- `tables.decision` also holds the deliverable's own decision rule and windows where the kind
+  has them (an estimate's threshold and probability).
+
+Settled while the Spec and Scenarios fixtures were written (2026-11-19):
+
+- An outcome adjustment has no key that cites a dossier entry, and matching by its source text
+  is parsing prose. So an outcome adjustment's `follow_up_years` is null today and
+  `spec.effect_window` is `look` for each one (gap H1); with no outcome adjustment it is `ok`.
+  The clean fixture has none; every case with one is a variant.
+- `verified` on an effects row is the signed spec entry's own mark where it has one, else the
+  engine record's. `spec.values_sourced` is `ok` only when the signed spec's entry carries the
+  mark; a value marked unverified, or with no recorded mark, is `look`; an unknown mark is
+  `not_available`. A derived file can say a source is unverified, but cannot vouch for it.
+- A checked mark on an observation is the key `checked` on the observation; no producer writes
+  it yet (gap H2), so `n_observations_unchecked` counts observations without it only when at
+  least one observation in the dossier has it, and is null otherwise.
+- The producer's decision-date rule needs a "today"; the workbench uses the signature's date.
+- `info` rows of the dynamics checks raise nothing. The dynamics checks are read where the
+  producer stores them (the trajectories figure's entry in `analysis/figures.yaml`).
+- Steps: a file outside the manifest that records the spec among its inputs is held to the
+  verified signed spec's hash, so a trajectory record in the producer's shape can sit in a
+  clean run.
+- An archive folder with a sheet and no record makes `spec.signoff_note` `not_available` for
+  that sign-off and is listed.
+
+Settled in the build: `tables.signoffs` is oldest first, and a table `signature` (the current
+signature, what it changed, its note) comes before it when there are two or more sign-offs. A
+sheet whose own sources line names another spec, or that carries a refusal on a signed spec,
+is `problem`. A dossier changed since signing, or an entry with both or neither of
+observations and a no-data mark, is `problem`. A cell that holds a whole mapping is shown
+folded, not as raw text (page code, to do).
+
 ### 5.4 Model
 
 Reads: `engine_choice.json`; `analysis/engine.yaml` `data.card.benchmarks`, `data.parameters`,
@@ -419,6 +498,41 @@ trajectory run (gap H4); the harness dynamics checks, passed through.
 Acceptance (R4): delivery 2024–2027, outcome window 2024–2029.25; 423 schedule events in 13
 regions; trajectories, seasonality, seed noise and burn-in each "not produced" with the reason
 from `figures.yaml`.
+
+The generic Scenarios model (what `views/scenarios.py` returns). `facts`: `delivery_start`,
+`delivery_end`, `window_start`, `window_end`, `n_groups`, `n_events`, one count per event kind
+the run records, `has_trajectories`, `n_sampled_units`, `n_seeds`, `n_dynamics_checks`,
+`n_dynamics_failed`, `n_not_produced`. `tables.events`: `group, arm, kind, component, start,
+end, units, charged`. `tables.series` (when the run has a trajectory record): `group, arm,
+metric, t, value`, and `tables.dynamics`: `check, group, value, limit, passes, text` passed
+through from the harness's own checks. `tables.not_produced`: `figure, reason`. Charts: the
+schedule as a timeline per group and arm against the delivery period and the outcome window;
+the series per group, plan against comparator; each with the harness figure beside it. Checks:
+`scenarios.trajectories_present` (C5): a run that reached the outcome batch with no trajectory
+record is `problem` (the dynamics were never looked at); `scenarios.dynamics`: a harness
+dynamics check that failed is `problem`, and with no record `not_available`;
+`scenarios.schedule_window`: a decision event outside the delivery period, or any event after
+the outcome window, is `look`; `scenarios.arms`: the comparator arm holding a decision event
+is `problem`.
+
+Settled from the first acceptance pass (2026-11-19): the stored schedule records no arm; by
+the producer's rule (`toolkit/analysis/figure_data.py`) decision events are the plan's and
+all others the comparator's, and `charged` is true exactly for decision events, so `arm` and
+`charged` are derived and labelled so, and the check `scenarios.arms` is dropped (the producer
+removes what it would catch). `tables.events` gains `id` (the row's position) and `label`.
+`tables.dynamics` uses the producer's columns (`check, value, status, detail, panels`), and a
+status of flag is `problem`. A run "reached the outcome batch" when its batch and point files
+exist. A deliverable kind with no schedule has no Scenarios view content and says so.
+
+Settled in the build: a trajectory record that says the engine does not offer the hook counts
+as no trajectory run. A record that says it is complete but lacks its sample or series, or
+whose periods disagree with the schedule's, is `problem`; one whose engine identity cannot be
+checked against the analysis's is `not_available`. A dynamics check's word is recomputed
+against its own value where the producer's rule allows (§3). The timeline's lanes are
+components and its colour is the event kind, which gives the arm. Freshness of the record's
+inputs is the Steps view's. The page has a chart kind `timeline` (spans and point events per
+lane on one time axis, shaded `bands`, a legend by a named column) and `lines` may draw one
+panel per group; their keys are in `workbench.py`'s docstring.
 
 ### 5.7 Outcomes
 
@@ -1034,6 +1148,22 @@ The questions as they were put:
   Candidate checks not yet specified: targets matched by an equal number of free parameters
   (FLU: five targets, five free ratios, so they do not test fit); best point far from the
   posterior median along a ridge (DEN).
+- 2026-11-19, loop iteration 5, step 4: Spec-and-evidence and Scenarios views built by two
+  fresh agents in parallel (Spec: reader, seven checks; Scenarios: schedule timeline, series,
+  the harness's dynamics checks, a generic timeline chart). The lead re-ran everything: all
+  self-tests, both audits, 22 acceptance files and the leak check on six runs pass. On R4 all
+  seven Spec checks are `look`, and Scenarios reports the trajectory run missing (`problem`).
+- 2026-11-19: #282 (Outcomes fixtures) and #283 (Outcomes view, comparison between runs) merged
+  into v2 at green checks, after one external review round (9 P1, 1 P2, all fixed test first
+  and confirmed). Scorecard 20 of 32.
+- 2026-11-19, loop iteration 5, step 3: fixtures (19 Spec and 8 Scenarios variants) and failing
+  cases for both views by a fresh agent, resumed once after a network error. Acceptance
+  re-derived. Rules settled in §5.3.
+- 2026-11-19, loop iteration 5, step 2 for Spec and evidence, and Scenarios (acceptance derived
+  by a fresh agent on R4, FLU and DEN): no run records a follow-up duration, a checked mark or
+  a decided-by mark as data, so C1 and C15 cannot pass 1 before gaps H1 and H2. No stored run
+  has a trajectory record, so `scenarios.trajectories_present` is `problem` on both allocation
+  runs. Rules settled in §5.3 and §5.6.
 - 2026-11-19, external review of the Outcomes view: 9 P1 and 1 P2, each reproduced with a
   failing test and fixed; common cause, a status word trusted over the numbers beside it (rule
   added to §3). The walkthrough's reader findings were fixed in the same pass; the builder's
