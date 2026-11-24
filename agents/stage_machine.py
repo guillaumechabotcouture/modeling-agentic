@@ -5640,13 +5640,22 @@ def _self_test() -> int:
             prov36 = sorted({r["finding"] for r in _SS36.provisional(d) if r.get("plan_changing")})
             rep36 = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
             sp36 = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep36 else [0, 0]
-            exp36 = "completed"
-            ok(want and s == exp36 and "The plan depends on inputs the lead accepted provisionally" in rep36[:sp36[0]] and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
-               and FL.load(d)["D-001"].status == "fixed" and prov36 == want
+            # hb3 fix 4 (#375): a test the spec declares that did not run (the toy's DT1 has no benchmark results here)
+            # is a declarable HIGH, so the run is declared, not accepted, and the ledger holds it; read from the artifact
+            _decl36 = {str(t.get("id")) for t in (raw.get("analysis") or {}).get("decision_tests") or []}
+            nr36 = sorted(f"decision_test_not_run:{t.get('test_id')}" for t in _dt36.get("tests") or []
+                          if t.get("status") == "not_run" and str(t.get("test_id")) in _decl36)
+            led36 = FL.load(d)
+            exp36 = "completed_scope_declared" if nr36 else "completed"
+            ok(want and s == exp36 and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
+               and (nr36 or "The plan depends on inputs the lead accepted provisionally" in rep36[:sp36[0]])
+               and all(i in led36 for i in nr36)
+               and led36["D-001"].status == "fixed" and prov36 == want
                and not any(h.get("paused") for h in load_state(d).history)
                and all(w in rep36[:sp36[0]] for w in want),
                f"T36 the default backend (workstream B) runs the machine end to end with engine: auto; each decision "
-               f"test that changes the plan is answered provisionally and flagged above the draft ({s}, {want}, {prov36}"
+               f"test that changes the plan is answered provisionally and flagged above the draft ({s}, {want}, {prov36}, "
+               f"not run: {nr36}"
                + ("" if s == exp36 else   # why it ended: CI showed only the status (flaky once on #156 and #160)
                   f"; path {[h.get('to') for h in load_state(d).history if 'to' in h]}; "
                   f"final {[h.get('why') for h in load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
