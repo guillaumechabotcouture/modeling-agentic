@@ -877,16 +877,14 @@ def main(argv=None) -> int:
     if a.check_value:
         if a.cutoff:
             ap.error("--check-value reads every record a run holds: it takes no --cutoff")
-        cv = check_value(list(a.run_dirs) + [d for c in explicit for d in c])
-        print(check_value_text(cv))
-        if a.json:
-            safe_io.publish(a.json, json.dumps(cv, indent=1, default=str), os.path.dirname(os.path.abspath(a.json)))
-        return 0
-    rs = rows(list(a.run_dirs), explicit, a.cutoff, json.load(open(a.ledger)) if a.ledger else None)
-    print(table(rs))
+        doc = check_value(list(a.run_dirs) + [d for c in explicit for d in c])
+        print(check_value_text(doc))
+    else:
+        rs = rows(list(a.run_dirs), explicit, a.cutoff, json.load(open(a.ledger)) if a.ledger else None)
+        print(table(rs))
+        doc = {"rows": rs, "summary": wave_summary(rs)}
     if a.json:
-        safe_io.publish(a.json, json.dumps({"rows": rs, "summary": wave_summary(rs)}, indent=1, default=str),
-                        os.path.dirname(os.path.abspath(a.json)))
+        safe_io.publish(a.json, json.dumps(doc, indent=1, default=str), os.path.dirname(os.path.abspath(a.json)))
     return 0
 
 
