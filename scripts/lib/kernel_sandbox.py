@@ -21,7 +21,11 @@ import platform
 import struct
 import sys
 
-PR_SET_NO_NEW_PRIVS = 38
+PR_SET_NO_NEW_PRIVS, PR_CAPBSET_DROP, PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 38, 24, 47, 4
+CAP_V3 = 0x20080522
+LANDLOCK_MIN_ABI = 3        # ABI 3 adds the truncate right; below it truncate(2) and O_TRUNC escape the rules
+MAX_REVIEWED = 462          # a syscall numbered above this answers ENOSYS (a newer interface was never reviewed)
+F_SETOWN, F_SETSIG, F_SETOWN_EX = 8, 10, 15     # fcntl: an owner for SIGIO reaches another process
 SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC = 1, 1
 RET_ALLOW, RET_KILL, RET_ERRNO = 0x7FFF0000, 0x80000000, 0x00050000
 EPERM, ENOSYS = 1, 38
@@ -36,20 +40,27 @@ NR = {
                    io_uring_register=427, kill=62, tkill=200, tgkill=234, rt_sigqueueinfo=129,
                    rt_tgsigqueueinfo=297, pidfd_send_signal=424, pidfd_open=434, pidfd_getfd=438, add_key=248,
                    request_key=249, keyctl=250, open_tree=428, move_mount=429, fsopen=430, fsconfig=431,
-                   fsmount=432, fspick=433, mount_setattr=442, kcmp=312),
+                   fsmount=432, fspick=433, mount_setattr=442, kcmp=312, fcntl=72, chmod=90, fchmod=91, chown=92,
+                   fchown=93, lchown=94, utime=132, utimes=235, fchownat=260, futimesat=261, fchmodat=268,
+                   utimensat=280, fchmodat2=452, semtimedop=220),
     "aarch64": dict(seccomp=277, socket=198, socketpair=199, clone=220, clone3=435, execve=221, execveat=281,
                     ptrace=117, process_vm_readv=270, process_vm_writev=271, setrlimit=164, prlimit64=261, mount=40,
                     umount2=39, unshare=97, setns=268, pivot_root=41, chroot=51, bpf=280, perf_event_open=241,
                     userfaultfd=282, io_uring_setup=425, io_uring_enter=426, io_uring_register=427, kill=129,
                     tkill=130, tgkill=131, rt_sigqueueinfo=138, rt_tgsigqueueinfo=240, pidfd_send_signal=424,
                     pidfd_open=434, pidfd_getfd=438, add_key=217, request_key=218, keyctl=219, open_tree=428,
-                    move_mount=429, fsopen=430, fsconfig=431, fsmount=432, fspick=433, mount_setattr=442, kcmp=272)}
+                    move_mount=429, fsopen=430, fsconfig=431, fsmount=432, fspick=433, mount_setattr=442, kcmp=272,
+                    fcntl=25, fchmod=52, fchmodat=53, fchownat=54, fchown=55, utimensat=88, fchmodat2=452)}
+# contiguous ranges refused: xattr writes and removals, SysV IPC and POSIX message queues
+RANGES = {"x86_64": ((188, 190), (197, 199), (29, 31), (64, 71), (240, 245)),
+          "aarch64": ((5, 7), (14, 16), (180, 197))}
 DENY = ("socket", "socketpair", "fork", "vfork", "execve", "execveat", "ptrace", "process_vm_readv",
         "process_vm_writev", "setrlimit", "mount", "umount2", "unshare", "setns", "pivot_root", "chroot", "bpf",
         "perf_event_open", "userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "tkill",
         "rt_sigqueueinfo", "rt_tgsigqueueinfo", "pidfd_send_signal", "pidfd_open", "pidfd_getfd", "add_key",
         "request_key", "keyctl", "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount", "fspick",
-        "mount_setattr", "kcmp")
+        "mount_setattr", "kcmp", "chmod", "fchmod", "fchmodat", "fchmodat2", "chown", "fchown", "lchown",
+        "fchownat", "utime", "utimes", "utimensat", "futimesat", "semtimedop")
 # Landlock
 LL_CREATE_RULESET, LL_ADD_RULE, LL_RESTRICT_SELF = 444, 445, 446
 LL_RULE_PATH_BENEATH, LL_VERSION = 1, 1
@@ -84,9 +95,16 @@ def bpf_program(arch: str, pid: int) -> list[tuple]:
     prog = [_ld(4), _jeq(ARCH[arch], 1, 0), _ret(RET_KILL), _ld(0)]
     if arch == "x86_64":
         prog += [(0x35, 0, 1, 0x40000000), _ret(RET_KILL)]          # JGE: the x32 ABI
+    prog += [(0x35, 0, 1, MAX_REVIEWED + 1), _ret(RET_ERRNO | ENOSYS)]
     for name in DENY:
         if name in nr:
             prog += [_jeq(nr[name], 0, 1), _ret(perm)]
+    for lo, hi in RANGES[arch]:
+        prog += [(0x35, 0, 2, lo), (0x35, 1, 0, hi + 1), _ret(perm)]
+    # fcntl: no F_SETOWN, F_SETOWN_EX or F_SETSIG (arg 1), so no SIGIO to another process (Landlock scopes it only
+    # from ABI 6)
+    prog += [_jeq(nr["fcntl"], 0, 6), _ld(24), _jeq(F_SETOWN, 3, 0), _jeq(F_SETOWN_EX, 2, 0), _jeq(F_SETSIG, 1, 0),
+             _ret(RET_ALLOW), _ret(perm)]
     prog += [_jeq(nr["clone3"], 0, 1), _ret(RET_ERRNO | ENOSYS)]
     # clone: threads only
     prog += [_jeq(nr["clone"], 0, 4), _ld(16), (0x45, 0, 1, CLONE_THREAD), _ret(RET_ALLOW), _ret(perm)]
@@ -133,24 +151,60 @@ def landlock_abi() -> int:
     return int(r) if r > 0 else 0
 
 
-def _check(r, what):
-    if r < 0:
+def _check(r, what, exact=False):
+    if r < 0 or (exact and r != 0):     # exact: a positive return is a failure too (seccomp TSYNC names a thread)
         e = ctypes.get_errno()
-        raise OSError(e, f"{what}: {os.strerror(e)}")
+        raise OSError(e or EPERM, f"{what}: {os.strerror(e) if r < 0 else f'returned {r}'}")
     return r
 
 
-def apply(ro: list[str], rw: list[str], rw_files: list[str] = ()) -> dict:
-    """Confine this process for good: no_new_privs, Landlock (`ro` read-only roots, `rw` writable directories,
-    `rw_files` single files read and written, e.g. /dev/null), then seccomp. Returns what was applied. Any failure
-    raises OSError: the caller must not run the derivation."""
+def single_thread(tasks: str = "/proc/self/task") -> None:
+    """Landlock confines only the calling thread: refuse when any other thread exists."""
+    n = len(os.listdir(tasks))
+    t = sys.modules.get("threading")
+    if n != 1 or (t is not None and t.active_count() != 1):
+        raise OSError(EPERM, f"{n} threads before Landlock: confinement would miss the others")
+
+
+def drop_capabilities(libc) -> None:
+    """Empty every capability set: ambient, bounding (needs CAP_SETPCAP: a process without it has none to lose,
+    and exec is refused anyway), then effective, permitted and inheritable. Checked with capget."""
+    libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+    for cap in range(64):
+        if libc.prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) < 0:
+            break                       # EINVAL past the last capability, EPERM without CAP_SETPCAP
+    hdr, data = (ctypes.c_uint32 * 2)(CAP_V3, 0), (ctypes.c_uint32 * 6)()
+    _check(libc.capset(hdr, data), "capset")
+    _check(libc.capget(hdr, data), "capget")
+    if any(data):
+        raise OSError(EPERM, f"capabilities left after the drop: {list(data)}")
+
+
+def install_seccomp(libc, arch: str, pid: int) -> None:
+    prog = bpf_program(arch, pid)
+
+    class Fprog(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+    raw = b"".join(struct.pack("<HBBI", *i) for i in prog)
+    fbuf = ctypes.create_string_buffer(raw, len(raw))
+    fp = Fprog(len(prog), ctypes.cast(fbuf, ctypes.c_void_p))
+    _check(libc.syscall(ctypes.c_long(NR[arch]["seccomp"]), ctypes.c_uint(SECCOMP_SET_MODE_FILTER),
+                        ctypes.c_uint(SECCOMP_FILTER_FLAG_TSYNC), ctypes.byref(fp)), "seccomp(SET_MODE_FILTER)", True)
+
+
+def apply(ro: list[str], rw: list[str], rw_files: list[str] = (), ro_files: list[str] = ()) -> dict:
+    """Confine this process for good: one thread, no capabilities, no_new_privs, Landlock (`ro` read-only roots, `rw`
+    writable directories, `ro_files`/`rw_files` single files, e.g. /etc/ld.so.cache, /dev/null), then seccomp.
+    Returns what was applied. Any failure raises OSError: the caller must not run the derivation."""
     arch = platform.machine()
     if not sys.platform.startswith("linux") or arch not in ARCH:
         raise OSError(EPERM, f"no kernel sandbox for {sys.platform}/{arch}")
     abi = landlock_abi()
-    if abi < 1:
-        raise OSError(EPERM, "Landlock is not available")
+    if abi < LANDLOCK_MIN_ABI:
+        raise OSError(EPERM, f"Landlock ABI {abi} (at least {LANDLOCK_MIN_ABI}, Linux 6.2, is needed: truncation)")
+    single_thread()
     libc = _libc()
+    drop_capabilities(libc)
     _check(libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "prctl(PR_SET_NO_NEW_PRIVS)")
     handled = fs_handled(abi)
     attr = struct.pack("<QQQ", handled, 3 if abi >= 4 else 0, 3 if abi >= 6 else 0)    # net: bind, connect TCP
@@ -160,13 +214,14 @@ def apply(ro: list[str], rw: list[str], rw_files: list[str] = ()) -> dict:
                 "landlock_create_ruleset")
     try:
         read = FS_READ_FILE | FS_READ_DIR
-        write = read | FS_WRITE_FILE | FS_REMOVE_DIR | FS_REMOVE_FILE | FS_MAKE_DIR | FS_MAKE_REG | (
-            FS_TRUNCATE if abi >= 3 else 0)
-        for paths, access in ((ro, read), (rw, write), (rw_files, (FS_READ_FILE | FS_WRITE_FILE) & handled)):
+        write = read | FS_WRITE_FILE | FS_REMOVE_DIR | FS_REMOVE_FILE | FS_MAKE_DIR | FS_MAKE_REG | FS_TRUNCATE
+        for paths, access in ((ro, read), (ro_files, FS_READ_FILE), (rw, write),
+                              (rw_files, FS_READ_FILE | FS_WRITE_FILE)):
             for p in paths:
                 pfd = os.open(p, os.O_PATH | os.O_CLOEXEC)
                 try:
-                    acc = access & handled & (FS_FILE_ONLY if not os.path.isdir(p) else -1)
+                    import stat as _st      # the type of what was opened, not of the path now (no race)
+                    acc = access & handled & (-1 if _st.S_ISDIR(os.fstat(pfd).st_mode) else FS_FILE_ONLY)
                     rule = ctypes.create_string_buffer(struct.pack("<Qi", acc, pfd), 12)       # packed
                     _check(libc.syscall(LL_ADD_RULE, ctypes.c_int(fd), ctypes.c_int(LL_RULE_PATH_BENEATH), rule,
                                         ctypes.c_uint32(0)), f"landlock_add_rule {p}")
@@ -175,17 +230,9 @@ def apply(ro: list[str], rw: list[str], rw_files: list[str] = ()) -> dict:
         _check(libc.syscall(LL_RESTRICT_SELF, ctypes.c_int(fd), ctypes.c_uint32(0)), "landlock_restrict_self")
     finally:
         os.close(fd)
-    prog = bpf_program(arch, os.getpid())
-
-    class Fprog(ctypes.Structure):
-        _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
-    raw = b"".join(struct.pack("<HBBI", *i) for i in prog)
-    fbuf = ctypes.create_string_buffer(raw, len(raw))
-    fp = Fprog(len(prog), ctypes.cast(fbuf, ctypes.c_void_p))
-    _check(libc.syscall(ctypes.c_long(NR[arch]["seccomp"]), ctypes.c_uint(SECCOMP_SET_MODE_FILTER),
-                        ctypes.c_uint(SECCOMP_FILTER_FLAG_TSYNC), ctypes.byref(fp)), "seccomp(SET_MODE_FILTER)")
-    return {"landlock_abi": abi, "seccomp": "filter", "no_new_privs": True, "net_tcp_landlock": abi >= 4,
-            "scoped_signals": abi >= 6}
+    install_seccomp(libc, arch, os.getpid())
+    return {"landlock_abi": abi, "seccomp": "filter", "no_new_privs": True, "capabilities": "none",
+            "net_tcp_landlock": abi >= 4, "scoped_signals": abi >= 6}
 
 
 def _self_test() -> int:
@@ -210,9 +257,21 @@ def _self_test() -> int:
                  ("kill a group", n["kill"], (-1, 9), perm), ("tgkill self", n["tgkill"], (4242, 4243, 6), allow),
                  ("unshare", n["unshare"], (), perm), ("mount", n["mount"], (), perm),
                  ("io_uring_setup", n["io_uring_setup"], (), perm), ("seccomp itself", n["seccomp"], (), allow),
-                 ("an ordinary syscall (nr 63)", 63, (), allow)]
+                 ("an ordinary syscall (nr 63)", 63, (), allow),
+                 ("fcntl F_SETOWN", n["fcntl"], (3, F_SETOWN, 4242), perm),
+                 ("fcntl F_SETOWN_EX", n["fcntl"], (3, F_SETOWN_EX, 0), perm),
+                 ("fcntl F_SETSIG", n["fcntl"], (3, F_SETSIG, 9), perm),
+                 ("fcntl F_SETFL (allowed)", n["fcntl"], (3, 4, 0o4000), allow),
+                 ("fchmodat", n["fchmodat"], (), perm), ("fchownat", n["fchownat"], (), perm),
+                 ("utimensat", n["utimensat"], (), perm), ("fchmodat2", n["fchmodat2"], (), perm),
+                 ("a syscall newer than the review (467)", 467, (), RET_ERRNO | ENOSYS)]
+        cases += [(f"range {lo}-{hi} at {x}", x, (), perm) for lo, hi in RANGES[arch] for x in (lo, hi)]
+        cases += [(f"just outside range {lo}-{hi}", x, (), allow) for lo, hi in RANGES[arch] for x in (lo - 1, hi + 1)
+                  if x not in [v for v in n.values()] and not any(a <= x <= b for a, b in RANGES[arch])]
         if arch == "x86_64":
-            cases += [("fork", n["fork"], (), perm), ("vfork", n["vfork"], (), perm),
+            cases += [("chmod", n["chmod"], (), perm), ("lchown", n["lchown"], (), perm), ("shmget", 29, (), perm),
+                      ("msgget", 68, (), perm), ("mq_open", 240, (), perm),
+                      ("fork", n["fork"], (), perm), ("vfork", n["vfork"], (), perm),
                       ("the x32 ABI", 0x40000000 | 41, (), RET_KILL)]
         for label, nr, args, want in cases:
             got = run_bpf(prog, me, nr, tuple(args) + (0,) * (6 - len(args)))
@@ -221,6 +280,43 @@ def _self_test() -> int:
         ok(run_bpf(prog, other, 0) == RET_KILL, f"KS2 {arch}: a foreign architecture is killed")
     ok(fs_handled(1) == (1 << 13) - 1 and fs_handled(4) == (1 << 15) - 1 and fs_handled(8) == (1 << 16) - 1,
        "KS3 the handled filesystem rights follow the Landlock ABI")
+    from unittest import mock
+    with mock.patch.object(sys.modules[__name__], "landlock_abi", lambda: 2), \
+            mock.patch.object(sys, "platform", "linux"), mock.patch("platform.machine", lambda: "x86_64"):
+        try:
+            apply([], [])
+            ok(False, "KS5 apply refuses Landlock ABI < 3 (no truncate right)")
+        except OSError as e:
+            ok("ABI 2" in str(e), f"KS5 apply refuses Landlock ABI < 3 (no truncate right): {e}")
+
+    class Fake:
+        def syscall(self, *a):
+            return 1234                 # TSYNC failed: the tid of the thread that blocked it
+    try:
+        install_seccomp(Fake(), "x86_64", 1)
+        ok(False, "KS7 a positive seccomp return (TSYNC failure) is a failure")
+    except OSError:
+        ok(True, "KS7 a positive seccomp return (TSYNC failure) is a failure")
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        for t in ("1", "2"):
+            open(os.path.join(d, t), "w").close()
+        try:
+            single_thread(d)
+            ok(False, "KS8 two threads before Landlock are refused")
+        except OSError:
+            ok(True, "KS8 two threads before Landlock are refused")
+    if sys.platform.startswith("linux") and landlock_abi() >= LANDLOCK_MIN_ABI and platform.machine() in ARCH:
+        pid = os.fork()
+        if pid == 0:            # KS6: in a child, confine, then read the capability sets
+            try:
+                apply([sys.prefix], [])
+                hdr, data = (ctypes.c_uint32 * 2)(CAP_V3, 0), (ctypes.c_uint32 * 6)()
+                _libc().capget(hdr, data)
+                os._exit(0 if not any(data) else 9)
+            except BaseException:  # noqa: BLE001
+                os._exit(8)
+        ok(os.waitpid(pid, 0)[1] == 0, "KS6 apply leaves no effective, permitted or inheritable capability")
     if not sys.platform.startswith("linux"):
         try:
             apply([], [])

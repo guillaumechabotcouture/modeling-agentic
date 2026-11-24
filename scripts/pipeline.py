@@ -1828,16 +1828,19 @@ def _container_basis(exists=os.path.exists, cgroup: str | None = None) -> str | 
 # hash-checked after every run. No Landlock or no seccomp: fail closed. docs/design/v2-derived-inputs.md §7.
 SANDBOX_KERNEL = "landlock-seccomp"
 _SANDBOX_INFO: dict = {}
-_SYSTEM_RO = ("/usr", "/lib", "/lib64", "/etc")      # shared libraries, the loader cache, zoneinfo, locale
+# Shared libraries, zoneinfo and locale data; from /etc only the files the loader and the C library read (a whole
+# /etc can hold deployment secrets: review P2-3).
+_SYSTEM_RO = ("/usr/lib", "/usr/lib64", "/usr/local/lib", "/lib", "/lib64", "/usr/share/zoneinfo", "/usr/share/locale")
+_SYSTEM_RO_FILES = ("/etc/ld.so.cache", "/etc/localtime", "/etc/timezone", "/etc/nsswitch.conf", "/etc/locale.alias")
 
 
 def _kernel_roots(work: str, rw: list[str], hidden: list[str]) -> tuple[dict, str | None]:
-    """The Landlock policy for one run ({ro, rw, rw_files}) and why it cannot hold (None: it holds). Read-only: the
-    work directory, the Python installation and the system's library directories; writable: `rw`. A granted root that
-    contains a hidden directory (the run dir, another work dir) would expose it: refused."""
+    """The Landlock policy for one run ({ro, ro_files, rw, rw_files}) and why it cannot hold (None: it holds).
+    Read-only: the work directory, Python's library directories and the system's library directories, and a few
+    files from /etc; writable: `rw`. A granted root that contains a hidden path (the run dir, another work dir, the
+    repository, HOME) would expose it: refused."""
     import sysconfig
     ro = {work} | {p for p in _SYSTEM_RO if os.path.isdir(p)}
-    ro |= {p for p in (sys.prefix, sys.base_prefix, sys.exec_prefix) if p and os.path.isdir(p)}
     ro |= {v for k, v in sysconfig.get_paths().items() if k in ("stdlib", "platstdlib", "purelib", "platlib")
            and v and os.path.isdir(v)}
     try:     # not sys.path: the harness puts the repository there, and run directories live inside it
@@ -1846,16 +1849,17 @@ def _kernel_roots(work: str, rw: list[str], hidden: list[str]) -> tuple[dict, st
     except AttributeError:
         pass
     ro = {os.path.realpath(p) for p in ro}
-    for h in hidden:
+    for h in list(hidden) + [REPO, os.path.expanduser("~"), os.environ.get("HOME") or REPO]:
         h = os.path.realpath(h)
         for root in sorted(ro | set(rw)):
             if h == root or h.startswith(root.rstrip("/") + "/"):
                 return {}, f"the granted root {root} contains {h}"
-    return {"ro": sorted(ro), "rw": sorted({os.path.realpath(p) for p in rw}),
+    return {"ro": sorted(ro), "ro_files": [p for p in _SYSTEM_RO_FILES if os.path.isfile(p)],
+            "rw": sorted({os.path.realpath(p) for p in rw}),
             "rw_files": [p for p in ("/dev/null",) if os.path.exists(p)]}, None
 
 
-_KERNEL_PROBE = '''import os, resource, socket, sys
+_KERNEL_PROBE = '''import fcntl, os, resource, socket, sys
 out, outside, hidden = sys.argv[1], sys.argv[2], sys.argv[3]
 bad = []
 def refused(label, f):
@@ -1875,6 +1879,8 @@ refused("read hidden", lambda: open(hidden).read())
 refused("raise a cap", raise_cap)
 refused("mkfifo", lambda: os.mkfifo(os.path.join(os.path.dirname(out), "f")))
 refused("symlink", lambda: os.symlink("/", os.path.join(os.path.dirname(out), "l")))
+refused("chmod", lambda: os.chmod(hidden, 0))
+refused("F_SETOWN", lambda: fcntl.fcntl(os.pipe()[0], 8, os.getppid()))
 with open(out, "w") as f:
     f.write("ok" if not bad else ";".join(bad))
 '''
@@ -1938,9 +1944,9 @@ def container_network() -> str:
 
 # What the fallback does not give, in one sentence wherever its kind is reported (owner, 2026-11-23).
 SANDBOX_LIMIT = ("It is enforced by the kernel for the whole process, native code included, but unlike bubblewrap "
-                 "it gives the derivation no private process or mount namespace: other processes and files stay "
-                 "visible by name, though it can neither signal, trace nor connect to them nor open files outside "
-                 "its grants.")
+                 "it gives the derivation no private process, mount or IPC namespace: other processes, and the names, "
+                 "sizes and dates of files outside its grants, stay visible to it, though it cannot open those "
+                 "files, change their contents or metadata, or signal, trace or connect to those processes.")
 SANDBOX_TEXT = {
     "bwrap": "Linux namespaces (bubblewrap): no network, the run directory hidden and writes only to the "
              "derivation's work directory, all enforced by the kernel.",
@@ -2020,7 +2026,10 @@ def _child(argv: list) -> int:
     if policy is not None:
         sys.path.insert(0, HERE)
         from lib import kernel_sandbox as KS
-        KS.apply(policy["ro"], policy["rw"], policy.get("rw_files") or [])     # raises: the script never runs
+        KS.apply(policy["ro"], policy["rw"], policy.get("rw_files") or [], policy.get("ro_files") or [])  # raises
+        del KS              # the script gets neither ctypes nor the sandbox module from the launcher (review P3-3)
+        for m in [m for m in sys.modules if m.split(".")[0] in ("ctypes", "_ctypes", "lib")]:
+            del sys.modules[m]
     sys.argv = [script] + rest
     sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != os.path.realpath(HERE)]
     runpy.run_path(script, run_name="__main__")
@@ -3790,7 +3799,16 @@ def _self_test_kernel_sandbox(rep, codes, need) -> None:
         ("DI-K3", "os.system", f"import os\nraise SystemExit(7 if os.system('touch {esc}') else 0)", False),
         ("DI-K4", "raising the soft CPU cap to the hard one (r3-10)", "import resource\n"
                   "s, h = resource.getrlimit(resource.RLIMIT_CPU)\nresource.setrlimit(resource.RLIMIT_CPU, (h, h))", False),
+        ("DI-K2", "truncate(2) of a run-directory file (review P1-1)",
+                  "import os\nos.truncate({run!r} + '/data/inputs_provenance.json', 0)", True),
+        ("DI-K2", "chmod of a run-directory file (review P2-1)", "import os\nos.chmod({run!r} + '/data/derivations.yaml', 0)",
+                  True),
+        ("DI-K2", "utime of a run-directory file (review P2-1)",
+                  "import os\nos.utime({run!r} + '/data/derivations.yaml', (0, 0))", True),
+        ("DI-K2", "an xattr on a run-directory file (review P2-1)",
+                  "import os\nos.setxattr({run!r} + '/data/derivations.yaml', 'user.s', b'1')", True),
         ("DI-K5", "reading the run directory", "open({run!r} + '/data/inputs_provenance.json').read()", True),
+        ("DI-K5", "reading /etc beyond the loader's files (review P2-3)", "open('/etc/hostname').read()", True),
         ("DI-K5", "listing the run directory", "import os\nos.listdir({run!r})", True),
         ("DI-K5", "the run directory through a /proc alias (r3-5)",
                   "open('/proc/self/root' + {run!r} + '/data/inputs_provenance.json').read()", True),
@@ -3807,11 +3825,14 @@ def _self_test_kernel_sandbox(rep, codes, need) -> None:
                 open(sibf, "w").write("id,secret\n")
                 di_fixture(d, extra=extra.replace("{run!r}", repr(d)).replace("{sib!r}", repr(sibf)))
                 before = _sha(os.path.join(d, "data/inputs/raw.csv"))
+                meta = lambda p=os.path.join(d, "data/derivations.yaml"): (os.stat(p).st_mode, os.stat(p).st_mtime_ns)  # noqa: E731
+                m0, p0 = meta(), _sha(os.path.join(d, INPUTS_PROVENANCE))
                 r = derive(d, limits=lim)
                 e = json.load(open(os.path.join(d, DERIVATIONS_RECORD)))["derivations"]["units"]
+                escaped = escaped0 = meta() != m0 or _sha(os.path.join(d, INPUTS_PROVENANCE)) != p0
                 tail = e["stderr_tail"].lower()
-                escaped = os.path.exists(esc)
-                if escaped:
+                escaped = escaped0 or os.path.exists(esc)
+                if os.path.exists(esc):
                     os.remove(esc)
                 rep(codes(r) == ["derivation_failed"] and not escaped
                     and (not errno_text or any(x in tail for x in denied))
@@ -3831,6 +3852,35 @@ def _self_test_kernel_sandbox(rep, codes, need) -> None:
                 f"DI-K7 a kernel-sandboxed derivation runs, records its kind, Landlock ABI, seccomp, the container's "
                 f"network and why bubblewrap was not used, raises no derivation_unsandboxed, and the report block "
                 f"names it with its limit: {codes(r)} {sb} {kinds}")
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
+        try:            # DI-K7b (review P1-2): SIGIO through F_SETOWN reaches no other process
+            with tempfile.TemporaryDirectory() as d:
+                d = os.path.realpath(di_fixture(d, extra=f"import os, fcntl\nr, w = os.pipe()\nfcntl.fcntl(r, fcntl.F_SETOWN, "
+                                                        f"{victim.pid})\nfcntl.fcntl(r, fcntl.F_SETSIG, 9)\nfcntl.fcntl(r, "
+                                                        "fcntl.F_SETFL, os.O_ASYNC)\nos.write(w, b'x')\nimport time\ntime.sleep(1)"))
+                r = derive(d, limits=lim)
+                time.sleep(0.5)
+                rep(victim.poll() is None and codes(r) == ["derivation_failed"],
+                    f"DI-K7b a derivation cannot signal another process through F_SETOWN/SIGIO: {codes(r)} "
+                    f"victim={victim.poll()}")
+        finally:
+            victim.kill()
+            victim.wait()
+        with tempfile.TemporaryDirectory() as d:          # DI-K7c: no ctypes, no sandbox module handed over
+            d = os.path.realpath(di_fixture(d, extra="import sys\nif {'ctypes', 'lib.kernel_sandbox'} & set(sys.modules):\n"
+                                                    "    raise SystemExit(5)"))
+            r = derive(d, limits=lim)
+            rep(r["ok"], f"DI-K7c the script finds neither ctypes nor the sandbox module in sys.modules: {codes(r)}")
+        work = tempfile.mkdtemp(prefix="derive_")
+        try:            # DI-K11 (review P2-3): no /etc directory grant; a root holding the repository is refused
+            pol, why = _kernel_roots(work, [], [])
+            with _mock.patch.object(sys, "prefix", REPO), _mock.patch("sysconfig.get_paths", lambda: {"stdlib": REPO}):
+                why2 = _kernel_roots(work, [], [])[1]
+            rep(why is None and "/etc" not in pol["ro"] and "/etc/ld.so.cache" in pol["ro_files"] and why2 is not None,
+                f"DI-K11 /etc is granted file by file, never as a directory, and a root containing the repository is "
+                f"refused: {pol.get('ro')} {why2}")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
         outs = {}
         bw = [k for k in ("bwrap", "bwrap-sudo") if shutil.which("bwrap") and _bwrap_probe(k)][:1]
         for k in [SANDBOX_KERNEL] + bw:                    # DI-K8: a pandas derivation, the same bytes

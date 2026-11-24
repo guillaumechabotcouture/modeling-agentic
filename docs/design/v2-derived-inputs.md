@@ -315,9 +315,11 @@ reason is given.
   variable and operator settings never count. Owner decision (2026-11-23): containers only, and
   bubblewrap stays required on hosts.
 
-  **How it works.** The launcher confines itself before the script runs, with no_new_privs, a
-  Landlock ruleset and a seccomp-bpf filter (`scripts/lib/kernel_sandbox.py`, which lists every
-  refused call). A probe script must meet each refusal before the kind is used. If seccomp or
+  **How it works.** The launcher confines itself before the script runs, after checking that it has
+  a single thread. It drops every capability, sets no_new_privs, applies a Landlock ruleset (ABI 3
+  or later, Linux 6.2 or later), then a seccomp-bpf filter. `scripts/lib/kernel_sandbox.py` lists
+  every refused call. Below ABI 3, Landlock cannot see truncation, so the fallback is refused.
+  After confinement, the launcher removes `ctypes` and its own module from `sys.modules`. A probe script must meet each refusal before the kind is used. If seccomp or
   Landlock is unavailable, derivations fail closed. A first design, an audit hook in the child
   Python, had 10 Python-level escapes (Codex r3 of #368). It was replaced by kernel enforcement on
   the owner's decision.
@@ -336,11 +338,15 @@ reason is given.
 
   | guarantee | `bwrap` / `bwrap-sudo` | `landlock-seccomp` |
   |---|---|---|
-  | no network | network namespace | seccomp: no socket of any family; Landlock ABI 4+: no TCP |
+  | no network | network namespace | seccomp: no socket of any family, no io_uring; Landlock ABI 4+: no TCP |
+  | no capabilities | dropped by bubblewrap | all sets emptied (bounding, ambient, effective, permitted, inheritable), checked with capget |
   | no process creation | PID namespace, process cap | seccomp: no fork, vfork, non-thread clone or exec |
-  | writes only where declared | `/` read-only, one writable bind | Landlock: only in the outputs' directories, regular files and directories only; inputs are read-only copies, hash-checked |
+  | writes only where declared | `/` read-only, one writable bind | Landlock (ABI 3+, truncation included): only in the outputs' directories, regular files and directories only; seccomp: no chmod, chown, utime or xattr writes anywhere; inputs are read-only copies, hash-checked |
+  | state shared across runs | IPC namespace | seccomp: no SysV IPC or POSIX message queues |
+  | system files readable | all of `/`, read-only | only the library directories, zoneinfo, locale data and five files from `/etc` |
   | the run directory hidden | an empty tmpfs over it | Landlock: not granted, so refused by any name (procfs aliases and other work directories included) |
-  | other processes | not visible | visible by name; no signal, ptrace or memory access |
+  | other processes | not visible | visible by name; no kill, tgkill, F_SETOWN/F_SETSIG (SIGIO), ptrace or memory access |
+  | syscalls newer than the review | n/a | answered ENOSYS (above number 462) |
   | resource caps | set | set, and cannot be raised (seccomp) |
   | native code, ctypes, a second interpreter | held by the kernel | held by the kernel |
 
