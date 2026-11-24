@@ -1714,7 +1714,9 @@ class Machine:
         if by != "owner":
             return by
         from lib import owner_key as OK
-        st, why = OK.spec_check(dict(rec or {}, signed_by="owner"), rd)
+        st, why = OK.spec_check(rec or {}, rd)          # the record as written: its digest is signed
+        if st == "not_owner":
+            st, why = "refused", f"the sign-off record does not name the owner; {OK.HOW_SPEC}"
         self._owner_sig = (st, why)
         return None if st == "refused" else by
 
