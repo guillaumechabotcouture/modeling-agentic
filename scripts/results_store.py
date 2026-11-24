@@ -77,7 +77,7 @@ def _retry(what: str, fn, attempts: int):
         try:
             return fn()
         except Exception as e:  # noqa: BLE001 -- transient network/auth errors
-            if isinstance(e, (FileNotFoundError, KeyError)) or type(e).__name__ == "ResourceNotFoundError":
+            if isinstance(e, (FileNotFoundError, KeyError, BlobNameTaken)) or type(e).__name__ == "ResourceNotFoundError":
                 raise
             last = e
             if k + 1 < attempts:
@@ -290,26 +290,41 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def upload(path: str, blob: str, account: str | None = None, service=None) -> dict:
+class BlobNameTaken(RuntimeError):
+    """The blob name already holds another file: refused, never overwritten, never retried."""
+
+
+def upload(path: str, blob: str, account: str | None = None, service=None, overwrite: bool = True) -> dict:
     """Upload a file and read it back (sha256) so success is verified, not assumed. Bounded memory: the file is
-    streamed up and the read-back hashed chunk by chunk."""
+    streamed up and the read-back hashed chunk by chunk. overwrite=False never replaces a blob (Azure refuses it
+    atomically): the same bytes already there are this upload, landed on an earlier try; other bytes raise
+    BlobNameTaken (baseline hb3 §5.1)."""
     container, name = _split(blob)
     client = (service or _service(account)).get_blob_client(container, name)
     want, size = sha256_file(path), os.path.getsize(path)
     kw = _accepts(client.upload_blob, length=size, timeout=CALL_TIMEOUT_S)
-    with open(path, "rb") as f:
-        client.upload_blob(f if "length" in kw else f.read(), overwrite=True, **kw)
+    refused = False
+    try:
+        with open(path, "rb") as f:
+            client.upload_blob(f if "length" in kw else f.read(), overwrite=overwrite, **kw)
+    except Exception as e:  # noqa: BLE001 -- only a refused overwrite is handled here
+        if overwrite or type(e).__name__ != "ResourceExistsError":
+            raise
+        refused = True
     h = hashlib.sha256()
     for block in _blob_chunks(client):
         h.update(block)
     if h.hexdigest() != want:
+        if refused:
+            raise BlobNameTaken(f"{blob} already holds another file: not overwritten")
         raise RuntimeError(f"upload of {blob} did not verify")
     return {"blob": blob, "bytes": size, "sha256": want}
 
 
-def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = ATTEMPTS) -> dict:
+def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = ATTEMPTS,
+                 overwrite: bool = True) -> dict:
     _split(blob)
-    return _retry(f"upload of {blob}", lambda: upload(path, blob, account, service), attempts)
+    return _retry(f"upload of {blob}", lambda: upload(path, blob, account, service, overwrite=overwrite), attempts)
 
 
 upload_file = upload_retry      # the checkpointer's name for it; both stream

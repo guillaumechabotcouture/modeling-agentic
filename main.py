@@ -30,7 +30,7 @@ from agents.run_budget import (  # noqa: E402,F401  re-exported: the self-test's
     write_budget_ledger,
     remaining_budget,
 )
-from agents.run_finish import exit_code_for, store_run_results  # noqa: E402
+from agents.run_finish import exit_code_for, plain_tag, store_run_results  # noqa: E402
 
 REPO_ROOT = enforcement.REPO_ROOT
 PREFLIGHT_RETIRED = ("--preflight-only ran the v1 lead session's live preflight, retired with pipeline v1 "
@@ -59,7 +59,10 @@ def create_run_dir(question: str) -> str:
     # FileExistsError rather than silent overwrite.
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     slug = slugify(question)
-    base_name = f"{timestamp}_{slug}"
+    # baseline hb3 §5.1: replicates on separate VMs started in the same second and took one name (the check below is
+    # local to each VM). A cloud replicate's name carries its label; its launch id goes into metadata.json.
+    label, launch = plain_tag(os.environ.get("MA_RUN_LABEL")), plain_tag(os.environ.get("MA_LAUNCH_ID"))
+    base_name = f"{timestamp}_{slug}" + (f"_{label}" if label else "")
     run_name = base_name
     suffix = 2
     while os.path.exists(os.path.join(runs_root, run_name)):
@@ -76,6 +79,8 @@ def create_run_dir(question: str) -> str:
         # Phase 42 ε: trace times are naive local times; this is their zone.
         "utc_offset_s": int(datetime.now().astimezone().utcoffset().total_seconds()),
         "run_dir": run_name,
+        **({"run_label": label} if label else {}),
+        **({"launch_id": launch} if launch else {}),
     }
     with open(os.path.join(run_path, "metadata.json"), "x") as f:
         json.dump(metadata, f, indent=2)
@@ -1320,6 +1325,11 @@ def run_v2_and_store(run, run_path: str, store=None):
             mp = os.path.join(run_path, "metadata.json")
             meta = _metadata_dict(mp)
             meta["crash"] = f"{type(e).__name__}: {e}"[:500]
+            # every exit records its status (baseline hb3 §4.2): a terminal status the machine wrote stands (a
+            # parent that handed over to its child, say); a pause this exception ended, or none, does not
+            if not meta.get("status") or str(meta["status"]).startswith("paused:"):
+                meta["status"] = "interrupted" if isinstance(e, KeyboardInterrupt) else "crashed"
+                meta.pop("finished", None)
             os.makedirs(run_path, exist_ok=True)
             json.dump(meta, open(mp, "w"), indent=2)
         except Exception as fe:  # noqa: BLE001 -- never replace the run's exception

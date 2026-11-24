@@ -1823,7 +1823,45 @@ class Machine:
             self.st.history.append({"at": _now(), "paused": self.st.paused, "state": self.st.state,
                                     "round": self.st.round, "spent_usd": round(self.st.spent_usd, 4)})
         save_state(self.run_dir, self.st)
+        if self.st.paused and self.st.state != "FINAL":
+            # baseline hb3 §4.2: only FINAL wrote a status, so a paused run (flu R1) exited 2 with none in metadata.json
+            try:
+                self._write_meta(drop=("finished",), status=f"paused:{self.st.paused}", paused_state=self.st.state,
+                                 paused_why=self._pause_why())
+            except OSError as e:      # the pause stands (run_state.json holds it); said loudly, never a crash
+                self.log(f"[machine] ERROR the pause was not recorded in metadata.json: {type(e).__name__}: {e}")
         return self.st.status or (f"paused:{self.st.paused}" if self.st.paused else self.st.state)
+
+    def _pause_why(self) -> str:
+        """Why the run is paused, for metadata.json: the reason it entered its state, the allowance a budget pause
+        stopped at, and the lead's refusal of an amendment."""
+        h = self.st.history
+        why = next((x.get("why") for x in reversed(h) if x.get("to") == self.st.state and x.get("why")), "")
+        if self.st.paused == AWAITING_BUDGET:
+            b = next((x for x in reversed(h) if x.get("paused") == AWAITING_BUDGET), {})
+            why = (f"task {b.get('task')}: allowance ${b.get('allowance_usd')} is below the ${b.get('floor_usd')} "
+                   f"floor (cap ${b.get('cap_usd')})")
+        if self.st.paused == AWAITING_SPEC_AMENDMENT:
+            try:
+                la = json.load(open(os.path.join(self.run_dir, SPEC_RETHINK_REQUEST))).get("lead_amendment")
+            except (OSError, ValueError, AttributeError):
+                la = None
+            if isinstance(la, dict) and la.get("status") == "refused":
+                why = f"{why}; the lead amendment was refused: {la.get('why')}".lstrip("; ")
+        return str(why or f"paused at {self.st.state}")[:1000]
+
+    def _write_meta(self, drop=(), **fields) -> None:
+        """metadata.json with `fields` and the run's pipeline, engine, rounds and spend set, and `drop` removed."""
+        try:
+            meta = json.load(open(os.path.join(self.run_dir, "metadata.json")))
+        except (OSError, ValueError):
+            meta = {}
+        meta = meta if isinstance(meta, dict) else {}
+        for k in drop:
+            meta.pop(k, None)
+        meta.update(pipeline="v2", engine=self.st.engine, rounds=self.st.round, max_rounds=self.st.max_rounds,
+                    model_spend_usd=round(self.st.spent_usd, 4), **fields)
+        _write_json(self.run_dir, "metadata.json", meta)
 
     # -------------------------------------------------- handlers
     def h_SPEC(self):
@@ -2966,14 +3004,7 @@ class Machine:
             self.st.status = "completed_no_report"
 
     def _finish(self) -> None:
-        meta_p = os.path.join(self.run_dir, "metadata.json")
-        try:
-            meta = json.load(open(meta_p))
-        except (OSError, ValueError):
-            meta = {}
-        meta.update(status=self.st.status, pipeline="v2", engine=self.st.engine, rounds=self.st.round,
-                    max_rounds=self.st.max_rounds, model_spend_usd=round(self.st.spent_usd, 4), finished=_now())
-        _write_json(self.run_dir, "metadata.json", meta)
+        self._write_meta(drop=("paused_state", "paused_why"), status=self.st.status, finished=_now())
 
 
 # ------------------------------------------------------------------ helpers

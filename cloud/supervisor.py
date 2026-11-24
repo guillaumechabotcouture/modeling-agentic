@@ -10,7 +10,7 @@ work for about 8 hours). One loop on a small Coiled VM, all its state in blob st
       prefix, and scripts/harness_metrics.py runs over every collected run (metrics.json).
   (c) status.json, rewritten every loop: heartbeat, merge queue, collection, paused runs (resume is not automated
       here), errors. Layout under outputs/supervisor/<name>/: requests/ (write-once, from the laptop), state.json and
-      status.json (the loop's only), collected/<launch>/<label>.tar.gz, metrics.json. The storage account comes from
+      status.json (the loop's only), collected/<launch>/launch_<id>/<label>.tar.gz, metrics.json. The storage account comes from
       $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT or --account, never the code.
 
     python3 cloud/supervisor.py start [--name sv-supervisor-gcc] [--cap-usd 15] [--max-hours 24]
@@ -233,7 +233,8 @@ def fetch_from_storage(entry, label, work):
                                 storage_account=given)
     os.makedirs(cfg.out_dir, exist_ok=True)
     return rc.collect_from_storage(cfg, results_store, label, entry["assignments"][label]["launch_id"],
-                                   entry["assignments"][label])
+                                   entry["assignments"][label],
+                                   siblings={lb: a.get("launch_id") for lb, a in entry["assignments"].items()})
 
 
 def run_metrics(dirs, out_json):
@@ -281,7 +282,9 @@ def collect_step(blob, name, state, now, work, fetch=fetch_from_storage, metrics
                 tgz = os.path.join(td, f"{label}.tar.gz")
                 skipped = results_store.write_archive(src, label, tgz)
                 sha = results_store.sha256_file(tgz)
-                dst = f"{paths(name)['collected']}{lname}/{label}.tar.gz"
+                # per launch (baseline hb3 §5.1): a relaunch's archive never replaces the earlier launch's
+                launch = re.sub(r"[^A-Za-z0-9_.-]", "_", str(a.get("launch_id")))[:64]
+                dst = f"{paths(name)['collected']}{lname}/launch_{launch}/{label}.tar.gz"
                 blob.put_file(tgz, dst)
             lab.update(state="collected", blob=dst, sha256=sha, at=utc(now), note="",
                        exit_code=(meta or {}).get("exit_code"), left_out=len(skipped))

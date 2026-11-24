@@ -1607,10 +1607,39 @@ def _identity_note(label, assigned: dict | None, run_ident: dict) -> None:
         print(f"WARNING {label}: launched at {a['commit']}, the run records commit {run_ident['commit']}")
 
 
-def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = None):
+class StoredRunRefused(RuntimeError):
+    """A stored run that is not provably this label's: never collected for it (baseline hb3 §5.1)."""
+
+
+def _tar_run_label(t) -> str | None:
+    """The run_label the stored run's own metadata.json records (<run>/metadata.json), or None."""
+    for m in t.getmembers():
+        if m.isfile() and m.name.count("/") == 1 and m.name.endswith("/metadata.json"):
+            try:
+                meta = json.load(t.extractfile(m))
+            except (ValueError, OSError, tarfile.TarError):
+                return None
+            return meta.get("run_label") if isinstance(meta, dict) else None
+    return None
+
+
+def _sharers(cfg, store, label, blob, siblings: dict | None) -> list:
+    """The launch's other labels whose result records name the same stored run (`siblings`: label -> launch id)."""
+    out = []
+    for other, lid in sorted((siblings or {}).items()):
+        if other != label and lid:
+            rec = _download_json(store, ws.record_blob(cfg.storage_prefix, lid, other), cfg.storage_account)
+            if rec and rec.get("run_stored") == blob:
+                out.append(other)
+    return out
+
+
+def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = None, siblings: dict | None = None):
     """One label from storage: this launch's result record, then the run directory it names.
     result.json records the launch's pipeline and commit (`assigned`, from assignments.json)
-    and the run's own (`run_identity`, from its metadata.json)."""
+    and the run's own (`run_identity`, from its metadata.json). The stored run must be this label's: one whose
+    metadata.json records another label, or (recording none, as runs stored before baseline hb3 do) whose blob another
+    label's record of the launch (`siblings`: label -> launch id) also names, is refused, and nothing is extracted."""
     dest = os.path.join(cfg.out_dir, label)
     rj = os.path.join(cfg.out_dir, f"{label}.result.json")
     store.download(ws.record_blob(cfg.storage_prefix, launch_id, label), rj, cfg.storage_account)
@@ -1619,6 +1648,16 @@ def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = N
         raise SystemExit(f"{label}: the result record names no stored run")
     tgz = os.path.join(cfg.out_dir, f"{label}.run.tar.gz")
     store.download(meta["run_stored"], tgz, cfg.storage_account)
+    with tarfile.open(tgz, mode="r:gz") as t:
+        own = _tar_run_label(t)
+    shared = [] if own == label else _sharers(cfg, store, label, meta["run_stored"], siblings)
+    if (own and own != label) or shared:
+        os.remove(tgz)
+        raise StoredRunRefused(
+            f"{label}: the stored run {meta['run_stored']} "
+            + (f"records label {own}" if own and own != label else
+               f"is named by the records of {', '.join([label, *shared])} alike: whose run it holds is unknown")
+            + "; not collected")
     os.makedirs(os.path.join(dest, "runs"), exist_ok=True)
     with tarfile.open(tgz, mode="r:gz") as t:
         t.extractall(os.path.join(dest, "runs"), filter="data")
@@ -1885,10 +1924,14 @@ def collect(cfg, shutdown_after: bool = True, accept_partial: bool = False):
         if cur is False:   # an earlier launch's copy: keep it, out of the way
             os.rename(dest, f"{dest}.before_{assign[label]['launch_id']}_{int(time.time())}")
         try:
-            meta = collect_from_storage(cfg, results_store, label, assign[label]["launch_id"], assign[label])
+            meta = collect_from_storage(cfg, results_store, label, assign[label]["launch_id"], assign[label],
+                                        siblings={lb: (assign.get(lb) or {}).get("launch_id")
+                                                  for lb in recorded_labels(cfg, assign)})
             print(f"{label}: exit={meta['exit_code']} {meta['duration_s']}s -> {cfg.out_dir}/{label} (from storage)")
             continue
         except Exception as e:  # noqa: BLE001 — not (yet) in storage
+            if isinstance(e, StoredRunRefused):
+                print(f"{label}: REFUSED {e}")
             ck = checkpoint_record(cfg, results_store, label, assign[label]["launch_id"])
             ck_note = (f"; only a checkpoint exists, of {ck.get('time_utc')} (state {ck.get('run_state')}, "
                        f"{ck.get('cached_batches')} cached batches): fetch it with `checkpoint --label {label}`"

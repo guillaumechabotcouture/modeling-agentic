@@ -110,6 +110,12 @@ def load_run(run_dir: str) -> dict:
     for key in ("meta", "st"):
         if not isinstance(run.get(key), dict):
             run["errors"].append(f"{key}: missing or not a mapping")
+    # metadata.json records a pause too (baseline hb3 §4.2); read from the files as they are, not as of a cut-off. A
+    # run from before that records none there, which is no disagreement.
+    st, meta = _d(run.get("st")), _d(run.get("meta"))
+    ms, pz = str(meta.get("status") or ""), f"paused:{st.get('paused')}"
+    if not st.get("status") and ms.startswith("paused:") and ms != pz:
+        run["pause_mismatch"] = f"run_state.json {pz if st.get('paused') else 'not paused'}, metadata.json {ms}"
     run["report"] = _regular(run_dir, "report.md")
     run["withheld"] = os.path.lexists(os.path.join(run_dir, "report_withheld.md"))
     run["edited_inputs"] = _edited_inputs(run_dir, run.get("prov"))
@@ -161,6 +167,8 @@ def completion(run) -> dict:
         return no("no_status", "no terminal status or pause recorded by the cut-off")
     if st.get("status") and meta.get("status") != st["status"]:
         return no("status_mismatch", f"run_state.json {st['status']}, metadata.json {meta.get('status')}")
+    if run.get("pause_mismatch"):
+        return no("status_mismatch", run["pause_mismatch"])
     # Every withhold path moves report.md away (stage_machine._quarantine_report), so a regular report.md is the
     # delivered one; a report_withheld.md beside it is a repaired draft's leftover (baseline hb2 §5 fix 8).
     ok = bool(status in COMPLETES and run["report"])
