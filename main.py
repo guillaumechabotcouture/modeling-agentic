@@ -1384,7 +1384,8 @@ def main() -> int:
                              "(default: $MA_LAUNCHER, else 'direct').")
     parser.add_argument("--dev-unsandboxed-derivations", action="store_true",
                         help="v2 development only: run the spec's data derivations without a sandbox where there is "
-                             "none (macOS). The record says sandbox none and the run cannot be accepted "
+                             "none (macOS; a container without bubblewrap uses the kernel sandbox instead). The record "
+                             "says sandbox none and the run cannot be accepted "
                              "(docs/design/v2-derived-inputs.md).")
     args = parser.parse_args()
 

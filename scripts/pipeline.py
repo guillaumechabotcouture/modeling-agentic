@@ -1767,25 +1767,263 @@ def _bwrap_probe(kind: str) -> bool:
 
 def sandbox_kind() -> str | None:
     """`bwrap` (Linux namespaces, unprivileged), `bwrap-sudo` (the same, started by root and run as this user: in a
-    container whose host forbids unprivileged user namespaces, as on the Coiled VMs), or None (no sandbox: macOS,
-    or Linux without bubblewrap). Probed once per process."""
+    container whose host forbids unprivileged user namespaces, as on the Coiled VMs), `landlock-seccomp` (inside a
+    container where bubblewrap cannot run: kernel-enforced, unprivileged confinement, scripts/lib/kernel_sandbox.py;
+    only when its probe passes), or None (no sandbox: fail closed). Probed once per process; why bubblewrap was not
+    used is kept in _SANDBOX_INFO for the record."""
     if _SANDBOX:
         return _SANDBOX[0]
-    kind = None
-    if sys.platform.startswith("linux") and shutil.which("bwrap"):
-        if _bwrap_probe("bwrap"):
-            kind = "bwrap"
-        elif shutil.which("sudo") and shutil.which("setpriv") and _bwrap_probe("bwrap-sudo"):
-            kind = "bwrap-sudo"
+    kind, why = None, None
+    if not sys.platform.startswith("linux"):
+        why = f"not Linux ({sys.platform})"
+    elif not shutil.which("bwrap"):
+        why = "bubblewrap is not installed"
+    elif _bwrap_probe("bwrap"):
+        kind = "bwrap"
+    elif shutil.which("sudo") and shutil.which("setpriv") and _bwrap_probe("bwrap-sudo"):
+        kind = "bwrap-sudo"
+    else:
+        why = "bubblewrap is installed but cannot create its namespaces here (an unprivileged container)"
+    basis = _container_basis() if kind is None and sys.platform.startswith("linux") else None
+    if basis is None and kind is None and sys.platform.startswith("linux"):
+        _SANDBOX_INFO["kernel_probe"] = ("not tried: no evidence of a container (owner, 2026-11-23: the fallback is "
+                                         "for containers only; a host needs a working bubblewrap)")
+    if basis is not None and _kernel_probe():
+        kind = SANDBOX_KERNEL
+        _SANDBOX_INFO.update(bwrap_not_used=why, basis=basis)
     _SANDBOX.append(kind)
     return kind
 
 
+# The container runtimes' cgroup path forms (an ambiguous path is no evidence).
+_CONTAINER_CGROUP = re.compile(r"(^|/)docker/[0-9a-f]{12,}(/|$)|(^|/)docker-[0-9a-f]{12,}\.scope(/|$)|"
+                               r"(^|/)cri-containerd-[0-9a-f]{12,}\.scope(/|$)|(^|/)libpod-[0-9a-f]{12,}(\.scope)?(/|$)|"
+                               r"(^|/)kubepods([.-][a-z0-9_.-]*)?(/|$)|(^|/)lxc(\.payload)?[./][A-Za-z0-9_.-]+(/|$)")
+
+
+def _container_basis(exists=os.path.exists, cgroup: str | None = None) -> str | None:
+    """Filesystem or cgroup evidence that this process runs inside a container, whose isolation from the host is the
+    outer wall: a runtime's marker file or a runtime's cgroup path for PID 1. The `container` environment variable is
+    never evidence (Codex r3 P1-9: a launcher can set it on a host), and no operator setting overrides this (owner,
+    2026-11-23: the fallback is for containers only). `exists` and `cgroup` are for the self-test."""
+    for marker in ("/.dockerenv", "/run/.containerenv"):
+        if exists(marker):
+            return f"container: {marker}"
+    if cgroup is None:
+        try:
+            with open("/proc/1/cgroup") as f:
+                cgroup = f.read()
+        except OSError:
+            cgroup = ""
+    for line in cgroup.splitlines():
+        path = line.split(":", 2)[-1]
+        if _CONTAINER_CGROUP.search(path):
+            return f"container: /proc/1/cgroup {path[:120]}"
+    return None
+
+
+# ---- the kernel sandbox (a container where bubblewrap cannot run) -------- #
+# The launcher confines itself with no_new_privs, Landlock and seccomp-bpf before the derivation's code runs
+# (scripts/lib/kernel_sandbox.py), so the rules hold for the whole process, native code included. Inputs are copies,
+# hash-checked after every run. No Landlock or no seccomp: fail closed. docs/design/v2-derived-inputs.md §7.
+SANDBOX_KERNEL = "landlock-seccomp"
+_SANDBOX_INFO: dict = {}
+# Shared libraries, zoneinfo and locale data; from /etc only the files the loader and the C library read (a whole
+# /etc can hold deployment secrets: review P2-3).
+_SYSTEM_RO = ("/usr/lib", "/usr/lib64", "/usr/local/lib", "/lib", "/lib64", "/usr/share/zoneinfo", "/usr/share/locale")
+_SYSTEM_RO_FILES = ("/etc/ld.so.cache", "/etc/localtime", "/etc/timezone", "/etc/nsswitch.conf", "/etc/locale.alias")
+
+
+def _kernel_roots(work: str, rw: list[str], hidden: list[str]) -> tuple[dict, str | None]:
+    """The Landlock policy for one run ({ro, ro_files, rw, rw_files}) and why it cannot hold (None: it holds).
+    Read-only: the work directory, Python's library directories and the system's library directories, and a few
+    files from /etc; writable: `rw`. A granted root that contains a hidden path (the run dir, another work dir, the
+    repository, HOME) would expose it: refused."""
+    import sysconfig
+    ro = {work} | {p for p in _SYSTEM_RO if os.path.isdir(p)}
+    ro |= {v for k, v in sysconfig.get_paths().items() if k in ("stdlib", "platstdlib", "purelib", "platlib")
+           and v and os.path.isdir(v)}
+    libdir = sysconfig.get_config_var("LIBDIR")      # the interpreter's own shared libraries (conda, /opt: review N-5)
+    ro |= {libdir} if isinstance(libdir, str) and os.path.isdir(libdir) else set()
+    try:     # not sys.path: the harness puts the repository there, and run directories live inside it
+        import site
+        ro |= {p for p in site.getsitepackages() if os.path.isdir(p)}
+    except AttributeError:
+        pass
+    ro = {os.path.realpath(p) for p in ro}
+    for h in list(hidden) + [REPO, os.path.expanduser("~"), os.environ.get("HOME") or REPO]:
+        h = os.path.realpath(h)
+        for root in sorted(ro | set(rw)):
+            if h == root or h.startswith(root.rstrip("/") + "/"):
+                return {}, f"the granted root {root} contains {h}"
+    uid = None
+    if os.geteuid() == 0:       # the launcher leaves root for this uid, which owns the work dir (review N-3)
+        from lib.kernel_sandbox import DERIVATION_UID as uid
+        for dirpath, _dirs, _files in os.walk(work):
+            os.chown(dirpath, uid, uid)
+    return {"ro": sorted(ro), "ro_files": [p for p in _SYSTEM_RO_FILES if os.path.isfile(p)],
+            "rw": sorted({os.path.realpath(p) for p in rw}), "uid": uid,
+            "rw_files": [p for p in ("/dev/null",) if os.path.exists(p)]}, None
+
+
+_KERNEL_PROBE = '''import fcntl, os, resource, socket, sys
+out, outside, hidden = sys.argv[1], sys.argv[2], sys.argv[3]
+bad = []
+def refused(label, f):
+    try:
+        f()
+    except (OSError, ValueError):
+        return
+    bad.append(label)
+def raise_cap():
+    s, h = resource.getrlimit(resource.RLIMIT_CPU)
+    resource.setrlimit(resource.RLIMIT_CPU, (h, h))
+refused("socket", socket.socket)
+refused("fork", os.fork)
+refused("posix_spawn", lambda: os.posix_spawn("/bin/true", ["true"], {}))
+refused("write outside", lambda: open(outside, "w").write("x"))
+refused("read hidden", lambda: open(hidden).read())
+refused("raise a cap", raise_cap)
+refused("mkfifo", lambda: os.mkfifo(os.path.join(os.path.dirname(out), "f")))
+refused("symlink", lambda: os.symlink("/", os.path.join(os.path.dirname(out), "l")))
+refused("chmod", lambda: os.chmod(hidden, 0))
+refused("F_SETOWN", lambda: fcntl.fcntl(os.pipe()[0], 8, os.getppid()))
+with open(out, "w") as f:
+    f.write("ok" if not bad else ";".join(bad))
+'''
+
+
+def _kernel_probe() -> bool:
+    """Whether the kernel sandbox holds here: a probe script, run exactly as a derivation is, meets each refusal and
+    writes its result. Any other outcome, including no Landlock or no seccomp, is no fallback (fail closed)."""
+    if not sys.platform.startswith("linux"):
+        _SANDBOX_INFO["kernel_probe"] = f"not Linux ({sys.platform})"
+        return False
+    try:
+        base = os.path.realpath(tempfile.mkdtemp(prefix="derive_probe_"))
+    except OSError as e:
+        _SANDBOX_INFO["kernel_probe"] = f"no probe directory: {e}"
+        return False
+    try:
+        from lib import kernel_sandbox as KS
+        abi = KS.landlock_abi()
+        _SANDBOX_INFO["landlock_abi"] = abi
+        if abi < 1:
+            _SANDBOX_INFO["kernel_probe"] = "landlock: unavailable"
+            return False
+        work, hid = os.path.join(base, "work"), os.path.join(base, "hidden")
+        os.chmod(base, 0o711)           # a root launcher's unprivileged uid must reach work/ (traverse only)
+        os.makedirs(os.path.join(work, "out"))
+        os.makedirs(hid)
+        with open(os.path.join(hid, "secret.txt"), "w") as f:
+            f.write("x")
+        with open(os.path.join(work, "probe.py"), "w") as f:
+            f.write(_KERNEL_PROBE)
+        outside = os.path.join(base, "outside.txt")
+        policy, why = _kernel_roots(work, [os.path.join(work, "out")], [hid, base + "/outside.txt"])
+        if why:
+            _SANDBOX_INFO["kernel_probe"] = why
+            return False
+        cmd = [sys.executable, "-I", os.path.abspath(__file__), "_derive_child", json.dumps(LIMITS), "kernel",
+               json.dumps(policy), "probe.py", "out/r.txt", outside, os.path.join(hid, "secret.txt")]
+        r = subprocess.run(cmd, cwd=work, env=_env(work), capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
+        res = os.path.join(work, "out", "r.txt")
+        got = open(res).read() if os.path.isfile(res) else ""
+        _SANDBOX_INFO["kernel_probe"] = got or (r.stderr or b"").decode("utf-8", "replace")[-300:]
+        return r.returncode == 0 and got == "ok" and not os.path.exists(outside)
+    except (OSError, subprocess.SubprocessError, ValueError, ImportError) as e:
+        _SANDBOX_INFO["kernel_probe"] = f"the probe did not complete: {type(e).__name__}: {str(e)[:200]}"
+        return False
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def container_network() -> str:
+    """`none` (no interface but loopback is up), `present`, or `unknown` (/sys/class/net unreadable). Recorded with
+    a landlock-seccomp derivation (the filter refuses sockets either way)."""
+    try:
+        names = os.listdir("/sys/class/net")
+        up = [n for n in names if n != "lo"
+              and open(os.path.join("/sys/class/net", n, "operstate")).read().strip() != "down"]
+    except OSError:
+        return "unknown"
+    return "present" if up else "none"
+
+
+# What the fallback does not give, in one sentence wherever its kind is reported (owner, 2026-11-23).
+SANDBOX_LIMIT = ("It is enforced by the kernel for the whole process, native code included, but unlike bubblewrap "
+                 "it gives the derivation no private process, mount or IPC namespace: other processes, and the names, "
+                 "sizes, dates and changes of files outside its grants, stay observable to it (stat, access, "
+                 "readlink and inotify are not confined); it cannot open those files or "
+                 "change their contents, permissions, owners, timestamps, extended attributes or inode flags, nor "
+                 "signal, trace or connect to those processes, but reading a file can still update its access time, "
+                 "so the ignored-column check is not proof against a script written to defeat it.")
+SANDBOX_TEXT = {
+    "bwrap": "Linux namespaces (bubblewrap): no network, the run directory hidden and writes only to the "
+             "derivation's work directory, all enforced by the kernel.",
+    "bwrap-sudo": "Linux namespaces (bubblewrap started by root, the script run as the run's user with no "
+                  "capabilities): no network, the run directory hidden and writes only to the derivation's work "
+                  "directory, all enforced by the kernel.",
+    SANDBOX_KERNEL: "bubblewrap could not run in this container, so each derivation ran confined by the kernel "
+                    "without privileges: Landlock let it read only its input copies and the Python installation and "
+                    "write only in its output directories, and a seccomp filter refused sockets, new processes, "
+                    "program execution and raised resource limits (the owner accepted this fallback for containers "
+                    "only; a host without a working bubblewrap fails closed). " + SANDBOX_LIMIT,
+    "none": "no sandbox (the development flag): a run with such a derivation cannot be accepted.",
+}
+
+
+def sandbox_report_lines(run_dir: str) -> list[str]:
+    """The report's block, in every report: which sandbox made each recorded derivation and what that sandbox
+    guarantees (a run with no derivation says so)."""
+    head = [f"## Derivation sandbox (rendered from {DERIVATIONS_RECORD})", ""]
+    p = os.path.join(run_dir, DERIVATIONS_RECORD)
+    try:                        # an unreadable record is said, not dropped (Codex r1 P2-11)
+        with open(p) as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict) or not isinstance(raw.get("derivations"), dict):
+            raise ValueError("no derivations mapping")
+    except FileNotFoundError:
+        if os.path.lexists(os.path.join(run_dir, DERIVATIONS)):     # declared but no record (Codex r2 P2-4)
+            return head + [f"- {DERIVATIONS} declares derivations but {DERIVATIONS_RECORD} is missing: which sandbox "
+                           "ran them is unknown.", ""]
+    except (OSError, ValueError) as e:
+        return head + [f"- The record could not be read ({type(e).__name__}): which sandbox ran the derivations "
+                       "is unknown.", ""]
+    by: dict = {}
+    for sid, e in sorted(load_record(run_dir)["derivations"].items()):
+        sb = ((e or {}).get("sandbox") if isinstance(e, dict) else None) or {}
+        sb = sb if isinstance(sb, dict) else {}
+        k = str(sb.get("kind") or "unrecorded")
+        if isinstance(e, dict) and "runs" in e and not e.get("runs") and not e.get("ok"):
+            k = "not run"                    # refused before launch: no sandbox ran it (Codex r1 P2-10)
+        net = (str(sb.get("container_network") or "unknown"), str(sb.get("basis") or "")) if k == SANDBOX_KERNEL \
+            else None
+        by.setdefault((k, net), []).append(str(sid))    # the network kept per derivation (Codex r1 P2-12)
+    if not by:       # every report says which sandbox ran its derivations, also when none did
+        return head + ["- No derivation ran in this run: no data file was made by a script.", ""]
+    out = list(head)
+    for (k, net), ids in sorted(by.items(), key=lambda x: (x[0][0], x[0][1] or ("", ""))):
+        text = ("refused before it was launched, so no sandbox ran it." if k == "not run" else
+                SANDBOX_TEXT.get(k, "not a sandbox kind the harness knows, so the derivation is not trusted."))
+        if net:     # where it ran, from the record's own evidence; an older record has none (Codex r2 P2-5)
+            text += (f" Where it ran: {net[1]}." if net[1].startswith("container: ") else
+                     " Where it ran: not recorded (a record made before container evidence was required).")
+        out.append(f"- `{k}` (derivations: {', '.join(ids)}): {text}"
+                   + (f" The container's own network: {net[0]}." if net else ""))
+    return out + [""]
+
+
 def _child(argv: list) -> int:
-    """Inside the sandbox: set the caps, then run the derivation script as __main__ (this file is the launcher)."""
+    """Inside the sandbox: set the caps, then run the derivation script as __main__ (this file is the launcher).
+    Mode `strict` (bubblewrap), `kernel` (the container fallback: strict caps, then no_new_privs, Landlock and seccomp
+    on this very process, whose policy is the next argument) or `lenient` (the development flag)."""
     import resource
     import runpy
-    lim, strict, script, rest = json.loads(argv[0]), argv[1] == "strict", argv[2], argv[3:]
+    lim, mode = json.loads(argv[0]), argv[1]
+    policy = json.loads(argv[2]) if mode == "kernel" else None
+    script, rest = argv[3 if policy is not None else 2], argv[4 if policy is not None else 3:]
+    strict = mode in ("strict", "kernel")
     for name, key, extra in (("RLIMIT_AS", "memory_bytes", 0), ("RLIMIT_CPU", "cpu_s", 2),
                              ("RLIMIT_FSIZE", "file_bytes", 0), ("RLIMIT_NPROC", "nproc", 0)):
         r = getattr(resource, name, None)
@@ -1796,6 +2034,15 @@ def _child(argv: list) -> int:
         except (ValueError, OSError):
             if strict:
                 raise                    # a cap that cannot be set is a sandbox that does not hold
+    if policy is not None:
+        sys.path.insert(0, HERE)
+        from lib import kernel_sandbox as KS
+        KS.apply(policy["ro"], policy["rw"], policy.get("rw_files") or [], policy.get("ro_files") or [],
+                 uid=policy.get("uid"))         # raises: the script never runs
+        del KS              # the launcher hands over neither ctypes nor this module (review P3-3; numpy.ctypeslib
+        #                     or gc can still reach ctypes: the kernel rules are what hold, review N-4)
+        for m in [m for m in sys.modules if m.split(".")[0] in ("ctypes", "_ctypes", "lib")]:
+            del sys.modules[m]
     sys.argv = [script] + rest
     sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != os.path.realpath(HERE)]
     runpy.run_path(script, run_name="__main__")
@@ -1838,18 +2085,28 @@ def _run_derivation(d: dict, run_dir: str, kind: str, lim: dict, strip: dict | N
             src = alt
         dest = os.path.join(work, rel)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        if kind == "none":
-            shutil.copyfile(src, dest)         # a copy: an unsandboxed run cannot touch the original
+        if kind in ("none", SANDBOX_KERNEL):
+            shutil.copyfile(src, dest)         # a copy: the script cannot touch the original
+            if kind == SANDBOX_KERNEL:
+                os.chmod(dest, 0o444)
             copies[rel] = _sha(dest)
         else:
             open(dest, "w").close()            # the mount point
             mounts += ["--ro-bind", src, dest]
     for rel in d["outputs"]:
         os.makedirs(os.path.dirname(os.path.join(work, rel)), exist_ok=True)
-    child = [sys.executable, "-I", os.path.abspath(__file__), "_derive_child", json.dumps(lim),
-             "strict" if kind != "none" else "lenient", d["script"], "--inputs", *d["inputs"], "--outputs", *d["outputs"]]
+    mode = {"none": ["lenient"]}.get(kind, ["strict"])
+    if kind == SANDBOX_KERNEL:     # Landlock: the work dir read-only, the outputs' directories writable
+        policy, why = _kernel_roots(work, sorted({os.path.dirname(os.path.join(work, o)) for o in d["outputs"]}),
+                                    [run_dir, side, tempfile.gettempdir() + "/derive_"])
+        if why:
+            res.update(rc=-1, err=f"the kernel sandbox cannot hold: {why}", runtime_s=0.0)
+            return res
+        mode = ["kernel", json.dumps(policy)]
+    child = [sys.executable, "-I", os.path.abspath(__file__), "_derive_child", json.dumps(lim), *mode,
+             d["script"], "--inputs", *d["inputs"], "--outputs", *d["outputs"]]
     env = _env(work)
-    if kind == "none":
+    if kind in ("none", SANDBOX_KERNEL):
         cmd = child
     else:
         envargs = [a for k, v in env.items() for a in ("--setenv", k, v)]
@@ -1871,12 +2128,15 @@ def _run_derivation(d: dict, run_dir: str, kind: str, lim: dict, strip: dict | N
         for fn in fns:
             rel = os.path.relpath(os.path.join(dp, fn), work).replace(os.sep, "/")
             if rel in inputs:
-                if kind == "none" and _sha(os.path.join(dp, fn)) != copies.get(rel):
+                if rel in copies and _sha(os.path.join(dp, fn)) != copies.get(rel):
                     res["input_written"].append(rel)
             elif rel in d["outputs"]:
                 res["outputs"][rel] = _sha(os.path.join(dp, fn))
             else:
                 res["undeclared"].append(rel)
+    # a copied input that is gone (removed, or renamed onto a declared output) was written too (Codex r1 P1-5)
+    res["input_written"] += [rel for rel in copies if not os.path.isfile(os.path.join(work, rel))
+                             or os.path.islink(os.path.join(work, rel))]
     return res
 
 
@@ -1948,10 +2208,17 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
                 and (rk != "none" or found is None))
     if kind is None and not unsandboxed_ok and not all(current(d) for d in ders):
         rep.update(ok=False, problems=[{"code": "derivation_unsandboxed", "id": None, "claim":
-                   f"no sandbox on this machine ({sys.platform}): derivations run only in Linux namespaces (bubblewrap). "
-                   "The development flag runs them unsandboxed, and a run that uses it cannot be accepted"}])
+                   f"no sandbox on this machine ({sys.platform}): derivations run only in Linux namespaces (bubblewrap) "
+                   f"or, in a container where bubblewrap cannot run, under the {SANDBOX_KERNEL} fallback, which "
+                   f"did not hold here ({_SANDBOX_INFO.get('kernel_probe') or 'not Linux'}). The development flag "
+                   "runs them "
+                   "unsandboxed, and a run that uses it cannot be accepted"}])
         return rep
     kind = kind or "none"
+    sb = {"kind": kind, "limits": lim}
+    if kind == SANDBOX_KERNEL:
+        sb.update(bwrap_not_used=_SANDBOX_INFO.get("bwrap_not_used"), basis=_SANDBOX_INFO.get("basis"),
+                  landlock_abi=_SANDBOX_INFO.get("landlock_abi"), seccomp="filter", no_new_privs=True)
     prov = _prov_inputs(run_dir)
     entries, bad_outputs = {}, set()
     for d in ders:
@@ -1965,7 +2232,8 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
                  "script": {"path": d["script"], "sha256": _sha(os.path.join(run_dir, d["script"]))},
                  "inputs": {i: _sha(os.path.join(run_dir, i)) for i in d["inputs"]}, "outputs": {},
                  "ok": False, "code": "derivation_failed", "reason": "", "cap": None,
-                 "sandbox": {"kind": kind, "limits": lim}, "python": sys.version.split()[0], "libraries": _libraries(),
+                 "sandbox": dict(sb, **({"container_network": container_network()} if kind == SANDBOX_KERNEL
+                                        else {})), "python": sys.version.split()[0], "libraries": _libraries(),
                  "runtime_s": None, "stderr_tail": "", "runs": 0}
         entries[sid] = entry
         from lib.safe_io import remove_nofollow, LinkRefused
@@ -2017,6 +2285,12 @@ def derive(run_dir: str, unsandboxed_ok: bool = False, limits: dict | None = Non
                                                                                strip.items()) + ") the output "
                                + ("could not be made" if runs[-1]["rc"] != 0 else "changed")
                                + ", so the derivation uses them: move them to columns.uses")
+            wrote = sorted({i for rr in runs for i in rr["input_written"]})     # every run (Codex r2 P1-3)
+            if wrote and not any("wrote to its input" in w for w in why):
+                why.append(f"it wrote to its input(s): {', '.join(wrote)}")
+            extra = sorted({u for rr in runs[1:] for u in rr["undeclared"]})
+            if extra and not why:
+                why.append(f"undeclared output(s): {', '.join(extra[:5])}")
             if not why:
                 try:
                     published = _publish_outputs(runs[0]["work"], run_dir, d["outputs"])
@@ -3462,6 +3736,243 @@ def _self_test_durability(ok) -> None:
 
 
 
+_DI_PANDAS = '''import argparse
+import pandas as pd
+ap = argparse.ArgumentParser()
+ap.add_argument("--inputs", nargs="+")
+ap.add_argument("--outputs", nargs="+")
+a = ap.parse_args()
+df = pd.read_csv(a.inputs[0])
+df["x"] = (df["a"] - df["b"]).round(6)
+df[["id", "x", "pop"]].sort_values("id").to_csv(a.outputs[0], index=False)
+'''
+
+
+def _self_test_kernel_sandbox(rep, codes, need) -> None:
+    """DI-K0..DI-K8: the landlock-seccomp fallback in a container where bubblewrap cannot run. DI-K0 (the detection)
+    runs everywhere; the rest need Linux with Landlock and seccomp (the probe passes), else SKIP, or FAIL under
+    MA_REQUIRE_SANDBOX=1. DI-K1..DI-K6 include the Codex round-3 escapes of the audit-hook design (r3-n)."""
+    from unittest import mock as _mock
+    saved, info = list(_SANDBOX), dict(_SANDBOX_INFO)
+
+    def detect(platform, which, bw, probe, basis="container: /.dockerenv"):
+        _SANDBOX.clear()
+        _SANDBOX_INFO.clear()
+        calls = []
+        with _mock.patch.object(sys, "platform", platform), \
+                _mock.patch.object(shutil, "which", lambda n: f"/usr/bin/{n}" if n in which else None), \
+                _mock.patch(f"{__name__}._bwrap_probe", lambda k: bw.get(k, False)), \
+                _mock.patch(f"{__name__}._container_basis", lambda: basis), \
+                _mock.patch(f"{__name__}._kernel_probe", lambda: calls.append(1) or probe):
+            k = sandbox_kind()
+        return k, dict(_SANDBOX_INFO), calls
+
+    try:
+        k1, i1, _c = detect("linux", {"bwrap", "sudo", "setpriv"}, {}, True)
+        k2, _i, _c = detect("linux", {"bwrap"}, {}, False)
+        k3, _i, c3 = detect("linux", {"bwrap"}, {"bwrap": True}, True)
+        k4, i4, _c = detect("linux", set(), {}, True)
+        k5, _i, c5 = detect("darwin", {"bwrap"}, {}, True)
+        k6, i6, c6 = detect("linux", {"bwrap"}, {}, True, basis=None)
+        rep([k1, k2, k3, k4, k5, k6] == [SANDBOX_KERNEL, None, "bwrap", SANDBOX_KERNEL, None, None] and not c3
+            and not c5 and not c6 and "cannot create" in i1.get("bwrap_not_used", "") and "not installed" in
+            i4.get("bwrap_not_used", "") and "containers only" in i6.get("kernel_probe", "")
+            and i1.get("basis") == "container: /.dockerenv",
+            f"DI-K0 detection: a failing bwrap in a container gives the kernel sandbox, with reason and evidence; a "
+            f"failing probe, not Linux, or no container evidence gives none; a working bwrap is used: {i1}")
+        no = lambda _p: False  # noqa: E731
+        hid = "0123456789abcdef0123"
+        yes = [_container_basis(lambda p: p == "/.dockerenv", ""), _container_basis(no, f"12:cpu:/docker/{hid}"),
+               _container_basis(no, f"0::/system.slice/docker-{hid}.scope"),
+               _container_basis(no, "0::/kubepods.slice/kubepods-burstable.slice/x"),
+               _container_basis(no, f"0::/machine.slice/libpod-{hid}.scope")]
+        with _mock.patch.dict(os.environ, {"container": "podman", "MA_DERIVATION_SANDBOX": "audit-hook"}):
+            nay = [_container_basis(no, "0::/"), _container_basis(no, "0::/docker-build-host/init.scope"),
+                   _container_basis(no, "0::/user.slice/user-1000.slice/session-2.scope")]
+        rep(all(yes) and not any(nay),
+            f"DI-K0b container evidence is a runtime's marker file or PID 1 cgroup path; the container= variable "
+            f"(r3-9), an operator setting, a path that only contains the word, and a host cgroup are not: {yes} {nay}")
+    finally:
+        _SANDBOX[:] = saved
+        _SANDBOX_INFO.clear()
+        _SANDBOX_INFO.update(info)
+    _self_test_kernel_records(rep)
+    usable = sys.platform.startswith("linux") and _kernel_probe()
+    if not usable:
+        msg = f"the {SANDBOX_KERNEL} fallback does not hold here ({sys.platform}: {_SANDBOX_INFO.get('kernel_probe')!r})"
+        for t in ("DI-K1 network", "DI-K2 writes", "DI-K3 processes", "DI-K4 limits", "DI-K5 the run directory",
+                  "DI-K6 a second interpreter", "DI-K7 the record and report", "DI-K8 a pandas derivation and its bytes"):
+            if need:
+                rep(False, f"{t}: {msg} (MA_REQUIRE_SANDBOX=1)")
+            else:
+                print(f"SKIP {t}: {msg}")
+        return
+    _SANDBOX[:] = [SANDBOX_KERNEL]
+    lim = {"wall_s": 120}
+    esc = "/tmp/di_k_escape.txt"
+    import importlib.util
+    _SUBINTERP = next((n for n in ("_interpreters", "_xxsubinterpreters") if importlib.util.find_spec(n)), "_interpreters")
+    denied = ("operation not permitted", "permission denied")
+    # (id, label, code; {run} is the run dir, {sib} a file in a sibling derive_ work dir; must the error be the
+    # kernel's refusal? some calls report a failure without the errno text)
+    cases = (
+        ("DI-K1", "a socket", "import socket\nsocket.create_connection(('1.1.1.1', 53), timeout=5)", True),
+        ("DI-K1", "a URL read through pandas", "import pandas as pd\npd.read_csv('http://1.1.1.1/x.csv')", True),
+        ("DI-K1", "an AF_UNIX socket pair", "import socket\nsocket.socketpair()", True),
+        ("DI-K2", "a write outside", f"open({esc!r}, 'w').write('x')", True),
+        ("DI-K2", "a rename out of the work directory", f"import os\nos.rename(a.outputs[0], {esc!r})", False),
+        ("DI-K2", "removing its input", "import os\nos.remove(a.inputs[0])", True),
+        ("DI-K2", "renaming its input's directory (r3-7)", "import os\nos.rename('data/inputs', 'data/staged')", False),
+        ("DI-K2", "a symlink", "import os\nos.symlink('/tmp', 'data/derived/t')", True),
+        ("DI-K2", "a FIFO at an output (r3-6)", "import os\nos.mkfifo(a.outputs[0] + '.fifo')", True),
+        ("DI-K2", "a SQLite file outside (native code)", f"import sqlite3\nsqlite3.connect({esc!r}).execute('create "
+                  "table t(x)')", False),
+        ("DI-K3", "os.fork", "import os\nos.fork()", True),
+        ("DI-K3", "posix_spawn", "import os\nos.posix_spawn('/bin/true', ['true'], {})", True),
+        ("DI-K3", "subprocess, through its process backend (r3-2)", "import subprocess\nsubprocess.run(['true'])", True),
+        ("DI-K3", "os.system", f"import os\nraise SystemExit(7 if os.system('touch {esc}') else 0)", False),
+        ("DI-K4", "raising the soft CPU cap to the hard one (r3-10)", "import resource\n"
+                  "s, h = resource.getrlimit(resource.RLIMIT_CPU)\nresource.setrlimit(resource.RLIMIT_CPU, (h, h))", False),
+        ("DI-K2", "truncate(2) of a run-directory file (review P1-1)",
+                  "import os\nos.truncate({run!r} + '/data/inputs_provenance.json', 0)", True),
+        ("DI-K2", "chmod of a run-directory file (review P2-1)", "import os\nos.chmod({run!r} + '/data/derivations.yaml', 0)",
+                  True),
+        ("DI-K2", "utime of a run-directory file (review P2-1)",
+                  "import os\nos.utime({run!r} + '/data/derivations.yaml', (0, 0))", True),
+        ("DI-K2", "inode flags through ioctl on an input copy (review N-1)", "import fcntl, os, struct\n"
+                  "fd = os.open(a.inputs[0], os.O_RDONLY)\nfcntl.ioctl(fd, 0x40086602, struct.pack('l', 0x40))", False),
+        ("DI-K2", "an xattr on a run-directory file (review P2-1)",
+                  "import os\nos.setxattr({run!r} + '/data/derivations.yaml', 'user.s', b'1')", True),
+        ("DI-K5", "reading the run directory", "open({run!r} + '/data/inputs_provenance.json').read()", True),
+        ("DI-K5", "reading /etc beyond the loader's files (review P2-3)", "open('/etc/hostname').read()", True),
+        ("DI-K5", "listing the run directory", "import os\nos.listdir({run!r})", True),
+        ("DI-K5", "the run directory through a /proc alias (r3-5)",
+                  "open('/proc/self/root' + {run!r} + '/data/inputs_provenance.json').read()", True),
+        ("DI-K5", "a full input copy in another work directory (r3-8)", "open({sib!r}).read()", True),
+        ("DI-K6", "a write from a second interpreter (r3-1)", "import sys\n"
+                  f"import {_SUBINTERP} as I\n"
+                  f"i = I.create()\nr = (getattr(I, 'run_string', None) or I.exec)(i, \"open({esc!r}, 'w')\")\n"
+                  "raise SystemExit(0 if r is None else 3)", False))
+    try:
+        for tid, label, extra, errno_text in cases:
+            with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory(prefix="derive_") as sib:
+                d = os.path.realpath(d)
+                sibf = os.path.join(os.path.realpath(sib), "raw.csv")
+                open(sibf, "w").write("id,secret\n")
+                di_fixture(d, extra=extra.replace("{run!r}", repr(d)).replace("{sib!r}", repr(sibf)))
+                before = _sha(os.path.join(d, "data/inputs/raw.csv"))
+                meta = lambda p=os.path.join(d, "data/derivations.yaml"): (os.stat(p).st_mode, os.stat(p).st_mtime_ns)  # noqa: E731
+                m0, p0 = meta(), _sha(os.path.join(d, INPUTS_PROVENANCE))
+                r = derive(d, limits=lim)
+                e = json.load(open(os.path.join(d, DERIVATIONS_RECORD)))["derivations"]["units"]
+                escaped = escaped0 = meta() != m0 or _sha(os.path.join(d, INPUTS_PROVENANCE)) != p0
+                tail = e["stderr_tail"].lower()
+                escaped = escaped0 or os.path.exists(esc)
+                if os.path.exists(esc):
+                    os.remove(esc)
+                rep(codes(r) == ["derivation_failed"] and not escaped
+                    and (not errno_text or any(x in tail for x in denied))
+                    and _sha(os.path.join(d, "data/inputs/raw.csv")) == before
+                    and not os.path.exists(os.path.join(d, "data/derived/units.csv")),
+                    f"{tid} under the kernel sandbox, {label} is refused and the derivation fails: {codes(r)} "
+                    f"escaped={escaped} {e['stderr_tail'][-160:]!r}")
+        with tempfile.TemporaryDirectory() as d:          # DI-K7: the record, the gate and the report
+            d = os.path.realpath(di_fixture(d))
+            r = derive(d, limits=lim)
+            sb = json.load(open(os.path.join(d, DERIVATIONS_RECORD)))["derivations"]["units"]["sandbox"]
+            kinds = [f["kind"] for f in derivation_findings(d)]
+            txt = "\n".join(sandbox_report_lines(d))
+            rep(r["ok"] and sb["kind"] == SANDBOX_KERNEL and sb.get("container_network") in ("none", "present", "unknown")
+                and (sb.get("landlock_abi") or 0) >= 1 and sb.get("seccomp") == "filter" and "bwrap_not_used" in sb
+                and "derivation_unsandboxed" not in kinds and f"`{SANDBOX_KERNEL}`" in txt and SANDBOX_LIMIT in txt,
+                f"DI-K7 a kernel-sandboxed derivation runs, records its kind, Landlock ABI, seccomp, the container's "
+                f"network and why bubblewrap was not used, raises no derivation_unsandboxed, and the report block "
+                f"names it with its limit: {codes(r)} {sb} {kinds}")
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
+        try:            # DI-K7b (review P1-2): SIGIO through F_SETOWN reaches no other process
+            with tempfile.TemporaryDirectory() as d:
+                d = os.path.realpath(di_fixture(d, extra=f"import os, fcntl\nr, w = os.pipe()\nfcntl.fcntl(r, fcntl.F_SETOWN, "
+                                                        f"{victim.pid})\nfcntl.fcntl(r, fcntl.F_SETSIG, 9)\nfcntl.fcntl(r, "
+                                                        "fcntl.F_SETFL, os.O_ASYNC)\nos.write(w, b'x')\nimport time\ntime.sleep(1)"))
+                r = derive(d, limits=lim)
+                time.sleep(0.5)
+                rep(victim.poll() is None and codes(r) == ["derivation_failed"],
+                    f"DI-K7b a derivation cannot signal another process through F_SETOWN/SIGIO: {codes(r)} "
+                    f"victim={victim.poll()}")
+        finally:
+            victim.kill()
+            victim.wait()
+        with tempfile.TemporaryDirectory() as d:          # DI-K7c: the launcher hands over no ctypes or sandbox module
+            d = os.path.realpath(di_fixture(d, extra="import sys\nif {'ctypes', 'lib.kernel_sandbox'} & set(sys.modules):\n"
+                                                    "    raise SystemExit(5)"))
+            r = derive(d, limits=lim)
+            rep(r["ok"], f"DI-K7c the launcher hands over neither ctypes nor the sandbox module in sys.modules (the "
+                         f"script can still import numpy.ctypeslib; the kernel rules hold regardless): {codes(r)}")
+        work = tempfile.mkdtemp(prefix="derive_")
+        try:            # DI-K11 (review P2-3): no /etc directory grant; a root holding the repository is refused
+            pol, why = _kernel_roots(work, [], [])
+            with _mock.patch.object(sys, "prefix", REPO), _mock.patch("sysconfig.get_paths", lambda *a, **k: {"stdlib": REPO}):
+                why2 = _kernel_roots(work, [], [])[1]
+            rep(why is None and "/etc" not in pol["ro"] and "/etc/ld.so.cache" in pol["ro_files"] and why2 is not None,
+                f"DI-K11 /etc is granted file by file, never as a directory, and a root containing the repository is "
+                f"refused: {pol.get('ro')} {why2}")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        outs = {}
+        bw = [k for k in ("bwrap", "bwrap-sudo") if shutil.which("bwrap") and _bwrap_probe(k)][:1]
+        for k in [SANDBOX_KERNEL] + bw:                    # DI-K8: a pandas derivation, the same bytes
+            with tempfile.TemporaryDirectory() as d:
+                d = os.path.realpath(di_fixture(d, ignores={"c": "a label"}))
+                open(os.path.join(d, "data/derive/units.py"), "w").write(_DI_PANDAS)
+                _SANDBOX[:] = [k]
+                r = derive(d, limits=lim)
+                e = json.load(open(os.path.join(d, DERIVATIONS_RECORD)))["derivations"]["units"]
+                outs[k] = (r["ok"], _sha(os.path.join(d, "data/derived/units.csv")), codes(r), e["stderr_tail"][-200:])
+        rep(outs[SANDBOX_KERNEL][0], f"DI-K8a a pandas derivation runs under the kernel sandbox: {outs[SANDBOX_KERNEL]}")
+        if bw:
+            rep(outs[bw[0]][0] and outs[bw[0]][1] == outs[SANDBOX_KERNEL][1],
+                f"DI-K8b the same derivation gives the same bytes under {bw[0]} and the kernel sandbox: {outs}")
+        else:          # the fallback is a sandbox, so MA_REQUIRE_SANDBOX=1 does not ask for bubblewrap as well
+            print("SKIP DI-K8b bytes under bwrap and the kernel sandbox: bubblewrap cannot run here")
+    except Exception as e:  # noqa: BLE001 -- the failing case is reported
+        rep(False, f"DI-K kernel sandbox: {type(e).__name__}: {e}")
+    finally:
+        _SANDBOX[:] = saved
+
+
+def _self_test_kernel_records(rep) -> None:
+    """DI-K9 (a copied input that is gone counts as written) and DI-K10 (the report block: an unreadable record, a
+    derivation never launched, the network per derivation). Platform-independent."""
+    with tempfile.TemporaryDirectory() as d:
+        d = os.path.realpath(di_fixture(d, extra="import os\nos.remove(a.inputs[0])"))
+        ders, _i, _e = load_derivations(d)
+        r = _run_derivation(ders[0], d, "none", dict(LIMITS, wall_s=60))
+        shutil.rmtree(r["work"], ignore_errors=True)
+        shutil.rmtree(r["side"], ignore_errors=True)
+        rep(r["input_written"] == ["data/inputs/raw.csv"],
+            f"DI-K9 a copied input that is missing after the run counts as written: {r['input_written']} rc={r['rc']}")
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "data"))
+        rp = os.path.join(d, DERIVATIONS_RECORD)
+        open(rp, "w").write('{"derivations": {')
+        bad = "\n".join(sandbox_report_lines(d))
+        sb = {"kind": SANDBOX_KERNEL}
+        json.dump({"derivations": {"a": {"ok": True, "runs": 2, "sandbox": dict(sb, container_network="none")},
+                                   "b": {"ok": True, "runs": 2, "sandbox": dict(sb, container_network="present")},
+                                   "c": {"ok": False, "runs": 0, "sandbox": dict(sb, container_network="none")}}},
+                  open(rp, "w"))
+        good = "\n".join(sandbox_report_lines(d))
+        os.remove(rp)
+        open(os.path.join(d, DERIVATIONS), "w").write("derivations: []\n")
+        gone = "\n".join(sandbox_report_lines(d))
+        rep("could not be read" in bad and "`not run` (derivations: c)" in good and "is missing" in gone
+            and "not recorded (a record made before" in good
+            and "(derivations: a): " in good and "(derivations: b): " in good and "network: none" in good
+            and "network: present" in good,
+            f"DI-K10 the report block says an unreadable record, a derivation never launched, and the container network "
+            f"per derivation: {bad!r} {good!r}")
+
+
 def _self_test_derivations(ok) -> None:
     """DI2-DI6, DI10, DI13 and the fail-closed path (docs/design/v2-derived-inputs.md §4). DI2-DI5 need the Linux
     sandbox; without one they are reported SKIP, or FAIL when MA_REQUIRE_SANDBOX=1 (the VM run)."""
@@ -3511,7 +4022,9 @@ def _self_test_derivations(ok) -> None:
             d = os.path.realpath(di_fixture(d, extra="import socket\nsocket.create_connection(('1.1.1.1', 53), timeout=5)"))
             r = derive(d, limits=lim)
             e = json.load(open(os.path.join(d, DERIVATIONS_RECORD)))["derivations"]["units"]
-            rep(codes(r) == ["derivation_failed"] and not e["ok"] and "unreachable" in (e["reason"] + e["stderr_tail"]).lower(),
+            why = (e["reason"] + e["stderr_tail"]).lower()       # the kernel's error, or the fallback's refusal
+            rep(codes(r) == ["derivation_failed"] and not e["ok"] and (
+                "unreachable" in why or (kind == SANDBOX_KERNEL and "operation not permitted" in why)),
                 f"DI2 a derivation that opens a socket fails in the sandbox, the reason recorded: {codes(r)} "
                 f"{(e['reason'] + ' | ' + e['stderr_tail'][-160:])!r}")
         for label, extra in (("an input", "open(a.inputs[0], 'a').write('x')"),
@@ -3538,6 +4051,7 @@ def _self_test_derivations(ok) -> None:
                 rep(codes(r) == ["derivation_failed"] and e.get("cap") == cap and cap in e["reason"],
                     f"DI4 the {cap} cap kills a derivation and the record names it: {codes(r)} cap={e.get('cap')} "
                     f"{e['reason'][:120]!r}")
+    _self_test_kernel_sandbox(rep, codes, need)
     flag = not sandboxed          # DI5, DI6 and DI10 run everywhere: unsandboxed (flag) where there is no sandbox
     for label, extra in (("an unseeded random", "import random\nopen(a.outputs[0], 'a').write(str(random.random()))"),
                          ("a time-dependent", "import time\nopen(a.outputs[0], 'a').write(str(time.time_ns()))")):
