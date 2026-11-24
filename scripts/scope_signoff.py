@@ -607,6 +607,13 @@ def _test_md(t: dict) -> str:
 # Gate kinds whose owner accept lets the run ACCEPT with the dependence stated (owner decision (b), 2026-11-23;
 # agents/stage_machine.py DECISION_BEARING_KINDS)
 PLAN_CHANGING_TEST_KINDS = ("decision_test_changes_plan",)
+ACCEPT_DISPOSITION = "accept_with_dependence_stated"    # agents/stage_machine.py DT_DISPOSITION (an unstable allocation)
+
+
+def _accepts(it: dict) -> bool:
+    """An item whose accept lets the run finish accepted with the dependence stated (owner decision (b); check-value
+    item 5, owner 2026-11-23: the toolkit's unstable allocation, which carries the disposition)."""
+    return it.get("kind") in PLAN_CHANGING_TEST_KINDS or it.get("disposition") == ACCEPT_DISPOSITION
 
 
 def render_md(run_dir: str) -> str:
@@ -619,11 +626,11 @@ def render_md(run_dir: str) -> str:
     items_ = [it for it in req.get("items") or [] if isinstance(it, dict)]
     lines = ["# Scope declarations that need the owner's sign-off", "",
              f"Decision (signed brief): {brief.get('decision', '(no decision_brief.yaml)')}", ""]
-    if not items_ or any(it.get("kind") not in PLAN_CHANGING_TEST_KINDS for it in items_):
+    if not items_ or any(not _accepts(it) for it in items_):
         lines += ["The run would end with these findings declared as limitations. Each bears on the decision, so "
                   "the lead cannot accept it alone. Accept a declaration if the decision stands with it; decline it "
                   "if the finding must be fixed.", ""]
-    if any(it.get("kind") in PLAN_CHANGING_TEST_KINDS for it in req.get("items") or [] if isinstance(it, dict)):
+    if any(_accepts(it) for it in req.get("items") or [] if isinstance(it, dict)):
         # owner decision (b), 2026-11-23 (Codex r2 of #357, P1-3): what accepting one of these leads to
         lines += ["A measured decision test that changes the plan is not declared as a limitation. Accepting it lets "
                   "the run finish **accepted**, with the dependence (the input it varies, the units that change and "
@@ -650,6 +657,10 @@ def render_md(run_dir: str) -> str:
         elif it.get("kind") in PLAN_CHANGING_TEST_KINDS:      # the gate finding above is its measured result
             lines += ["Measured decision test: it changes the plan (the gate finding above). Accept: the run may "
                       "finish accepted with this dependence stated at the top of the report. Decline: it may not.", ""]
+        elif it.get("disposition") == ACCEPT_DISPOSITION:     # check-value item 5 (Codex r1 P1-2): measured
+            lines += ["Measured by the harness (leave-one-group-out stability): the gate finding above names the groups "
+                      "whose exclusion changes the plan and the share of units affected. Accept: the run may finish "
+                      "accepted with this stated at the top of the report. Decline: it may not.", ""]
         elif not it.get("declarations"):
             lines += ["Not declared in scope_declaration.yaml, and **untested**.", ""]
         for dcl in it.get("declarations") or []:

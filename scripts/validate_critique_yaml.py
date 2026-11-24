@@ -612,6 +612,8 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
     `unresolved_high` to `owner_accepted_high`, and the report states the
     dependence at its top. Declined or unanswered, it never accepts. Other
     owner items (policy-mapped kinds, scripts/scope_signoff.py) keep rule 3o.
+    An unstable allocation the toolkit measured (check-value item 5) follows
+    the same rule (owner, 2026-11-23).
     """
     moved = [b for b in d.get("unresolved_high") or [] if isinstance(b, dict) and b.get("owner_resolution")
              and b.get("owner_signed") and not b.get("owner_signoff") and not b.get("owner_declined")
@@ -5016,6 +5018,22 @@ def _run_self_test() -> int:
     _o7 = _incorporate_rigor_violations(_incorporate_rigor_violations(_e(), [dict(_acc)], 3, 1), [dict(_acc)], 3, 1)
     ok(_o7["action"] == "ACCEPT" and len(_o7.get("owner_accepted_high") or []) == 1,
        f"OR-V7 idempotent: folding the same accepted finding twice lists it once ({_o7.get('owner_accepted_high')})")
+    # OR-V8 (check-value item 5; owner, 2026-11-23): an unstable allocation is asked at the first gate like a
+    # plan-changing test, and an accept lets the run ACCEPT with the dependence stated; a decline never accepts
+    _us = {"kind": "allocation_unstable", "severity": "HIGH", "stage": "ANALYZE", "key": "stability",
+           "claim": "unstable", "scope_declarable": True, "owner_resolution": True}
+    _usp = dict(_us, owner_signoff=True, owner_item={"finding": "allocation_unstable:stability", "fingerprint": "fp3"})
+    _usa = dict(_us, owner_signed={"by": "owner", "at": "t", "fingerprint": "fp3"})
+    _u1 = _incorporate_rigor_violations(_e(), [dict(_usp)], 3, 1)
+    _u2 = _incorporate_rigor_violations(_e(), [dict(_usa)], 3, 1)
+    _u3 = _incorporate_rigor_violations(_e(), [dict(_usa), dict(_other)], 3, 1)
+    _u4 = _incorporate_rigor_violations(_e(), [dict(_us, owner_declined=True, scope_declarable=False)], 3, 3)
+    ok(_u1["rule_matched"] == "2o" and _u2["action"] == "ACCEPT" and not _u2["unresolved_high"]
+       and [b.get("kind") for b in _u2.get("owner_accepted_high") or []] == ["allocation_unstable"]
+       and _u3["action"] == "PATCH_OR_RETHINK" and _u4["action"] == "RUN_FAILED",
+       f"OR-V8 an unstable allocation: asked at the first gate, accepted it does not block ACCEPT, other HIGHs keep "
+       f"their rules, declined it never accepts ({_u1['rule_matched']}, {_u2['action']}, {_u3['action']}, "
+       f"{_u4['action']})")
     with tempfile.TemporaryDirectory() as d:
         yaml.safe_dump({"declarations": [{"id": "SD-7", "blocker_id": "allocation_unstable", "why_unresolved": "x"}]},
                        open(os.path.join(d, "scope_declaration.yaml"), "w"))

@@ -6,7 +6,8 @@
     headline(run_dir) -> dict[str, float]            numbers the impact ledger records before/after a fix
     gate_findings(run_dir) -> list[dict]             contract checks, common finding shape, then one
                                                      decision-bearing finding per decision test whose
-                                                     verdict changes the plan
+                                                     verdict changes the plan, then the allocation-
+                                                     stability findings (contract.stability_findings)
 
     python3 toolkit/analysis/api.py --self-test
 """
@@ -133,7 +134,8 @@ def gate_findings(run_dir: str) -> list[dict]:
     (lead-gaps α): the stage machine's owner rule (#316) takes them to the owner, or under --signoff lead answers them
     provisionally and flags them above the report's draft."""
     base = contract.gate_findings(run_dir)
-    dt = contract.decision_test_findings(run_dir)
+    # check-value item 5: the allocation's leave-one-group-out stability, read beside the decision tests
+    dt = contract.decision_test_findings(run_dir) + contract.stability_findings(run_dir)
     if any(f.get("kind") in ("analysis_contract_missing", "analysis_contract_incomplete", "analysis_contract_blocked")
            for f in base):      # the contract already says there is no completed analysis: not said twice
         dt = [f for f in dt if contract.NO_MANIFEST not in str(f.get("claim"))]
@@ -166,6 +168,14 @@ def _self_test() -> int:
             contract.decision_test_findings = _dtf
         ok(got[0] == "analysis_contract_missing" and got[-1] == "decision_test_changes_plan",
            f"AP9 gate_findings adds every plan-changing decision test after the contract checks: {got}")
+        _stf = getattr(contract, "stability_findings", None)
+        try:
+            contract.stability_findings = lambda rd: [{"kind": "allocation_unstable", "key": "stability"}]
+            got = [f["kind"] for f in gate_findings(d)]
+        finally:
+            contract.stability_findings = _stf
+        ok("allocation_unstable" in got and _stf is not None,
+           f"AP11 gate_findings adds the allocation-stability findings (check-value item 5): {got}")
         got = [f["kind"] for f in gate_findings(d)]
         ok(got.count("analysis_contract_missing") == 1 and "analysis_contract_decision_test" not in got,
            f"AP10 before the analysis ran the missing manifest is reported once, by the contract checks: {got}")
