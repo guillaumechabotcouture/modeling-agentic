@@ -127,7 +127,13 @@ def _extract_intervals_and_classes(cal_out: dict, level: float = 0.95) -> tuple[
     from a `fit_posterior_panel` output."""
     from toolkit.analysis import calibration as C
 
-    smp = C.sample_of(cal_out) if isinstance(cal_out, dict) else None
+    smp = (
+        C.sample_of(cal_out)
+        if isinstance(cal_out, dict) and isinstance(cal_out.get("sample"), dict)
+        else cal_out.get("posterior")
+        if isinstance(cal_out, dict) and isinstance(cal_out.get("posterior"), dict)
+        else None
+    )
     intervals: dict[str, list[float]] = {}
     classes: dict[str, str] = {}
     lik_classes: dict[str, str] = {}
@@ -361,7 +367,8 @@ def _self_test() -> int:
             "theta": {"p1": 0.5, "p2": 0.5},
             "z": {"u1": None},
             "fixed_z": {"u1": None},
-            "posterior": {
+            "sample": {
+                "sample_id": "toy-s1",
                 "names": ["p1", "p2"],
                 "rows": [[0.4, 0.6], [0.5, 0.5], [0.6, 0.4], [0.45, 0.55]],
             },

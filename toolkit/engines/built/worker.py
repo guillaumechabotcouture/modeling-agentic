@@ -241,6 +241,8 @@ def _minimal_env(hash_seed: str = "0") -> dict[str, str]:
         keep,
         HOME="/tmp",
         TMPDIR="/tmp",
+        USER="sandbox",
+        LOGNAME="sandbox",
         PYTHONHASHSEED=str(hash_seed),
         PYTHONDONTWRITEBYTECODE="1",
         PYTHONNOUSERSITE="1",

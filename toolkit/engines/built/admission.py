@@ -526,42 +526,44 @@ def check_a1(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
         if str(rp.get("source") or "") != str(gp.source or ""):
             probs.append(f"parameter {pname}: source {gp.source!r} != request {rp.get('source')!r}")
 
-    # 4. Run contract.check_engine + strict built-output checks on each case
+    # 4. Run contract.check_engine + strict built-output checks on each case (batched via run_many)
     req_win_metrics = req_outs.get("windows") or {}
-    n_total, n_pass = 0, 0
-    for u in units:
-        for pk in packages:
-            n_total += 1
-            case_probs: list[str] = []
-            if n_total == 1:
-                case_probs += C.check_engine(cand, u, pk, horizon, seed=seed)
-            out = cand.run({}, u, pk, horizon, seed=seed)
-            for k in req_outs.get("per_capita") or []:
-                if k not in out.per_capita:
-                    case_probs.append(f"missing per_capita.{k}")
-                    continue
-                for g in card.age_groups:
-                    v = (out.per_capita[k] or {}).get(g)
-                    if not _finite(v) or float(v) < 0.0:
-                        case_probs.append(f"{u.id}/{pk.id}: per_capita.{k}[{g}]={v!r} (must be finite >= 0)")
-            for wname, metrics in req_win_metrics.items():
-                if wname in horizon.windows:
-                    wmap = out.windows.get(wname)
-                    if not isinstance(wmap, Mapping) or not wmap:
-                        case_probs.append(f"{u.id}/{pk.id}: window {wname!r} missing or empty")
-                    else:
-                        for m in metrics:
-                            mv = wmap.get(m)
-                            if not _finite(mv):
-                                case_probs.append(f"{u.id}/{pk.id}: window {wname}.{m}={mv!r} not finite")
-            for drv in req_outs.get("cost_drivers") or []:
-                dv = (out.cost_drivers or {}).get(drv)
-                if not _finite(dv) or float(dv) < 0.0:
-                    case_probs.append(f"{u.id}/{pk.id}: cost_driver {drv}={dv!r} (must be finite >= 0)")
-            if not case_probs:
-                n_pass += 1
-            else:
-                probs.extend(case_probs[:3])
+    pairs = [(u, pk) for u in units for pk in packages]
+    n_total = len(pairs)
+    n_pass = 0
+    if pairs:
+        first_probs = C.check_engine(cand, pairs[0][0], pairs[0][1], horizon, seed=seed)
+        outs = cand.run_many([({}, u, pk, horizon, seed) for u, pk in pairs])
+    else:
+        first_probs, outs = [], []
+    for idx, ((u, pk), out) in enumerate(zip(pairs, outs)):
+        case_probs: list[str] = list(first_probs) if idx == 0 else []
+        for k in req_outs.get("per_capita") or []:
+            if k not in out.per_capita:
+                case_probs.append(f"missing per_capita.{k}")
+                continue
+            for g in card.age_groups:
+                v = (out.per_capita[k] or {}).get(g)
+                if not _finite(v) or float(v) < 0.0:
+                    case_probs.append(f"{u.id}/{pk.id}: per_capita.{k}[{g}]={v!r} (must be finite >= 0)")
+        for wname, metrics in req_win_metrics.items():
+            if wname in horizon.windows:
+                wmap = out.windows.get(wname)
+                if not isinstance(wmap, Mapping) or not wmap:
+                    case_probs.append(f"{u.id}/{pk.id}: window {wname!r} missing or empty")
+                else:
+                    for m in metrics:
+                        mv = wmap.get(m)
+                        if not _finite(mv):
+                            case_probs.append(f"{u.id}/{pk.id}: window {wname}.{m}={mv!r} not finite")
+        for drv in req_outs.get("cost_drivers") or []:
+            dv = (out.cost_drivers or {}).get(drv)
+            if not _finite(dv) or float(dv) < 0.0:
+                case_probs.append(f"{u.id}/{pk.id}: cost_driver {drv}={dv!r} (must be finite >= 0)")
+        if not case_probs:
+            n_pass += 1
+        else:
+            probs.extend(case_probs[:3])
     return {"id": "A1", "status": "pass" if not probs else "fail", "passed": n_pass, "total": n_total,
             "problems": probs[:12]}
 
@@ -693,6 +695,10 @@ def check_a4(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
     n_total, n_pass = 0, 0
     details: list[dict] = []
 
+    # Collect all A4 evaluations (reductions + absent identity + N-invariance) and execute in one run_many call
+    batch_cases: list[tuple[dict, UnitSpec, Package, Horizon, int]] = []
+    red_plan: list[tuple[int, str, int, object, dict]] = []
+
     # 1. Declared reductions × n_free settings of inputs left free by the reduction
     for red in (req.get("reductions") or []):
         rid = str(red["id"])
@@ -706,10 +712,8 @@ def check_a4(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
                 if isinstance(rhor_d, Mapping) else default_hor)
         free_units = generate_domain_units(req, n_free, rng, ref_units=ref_units)
         for fi, fu in enumerate(free_units):
-            # Apply declared unit overrides on top of free draw
             u_attrs = dict(fu.attributes)
             u_attrs.update(runit)
-            # Apply declared parameter & component overrides, varying free parameters slightly on hidden draws
             prm = {}
             pkg_c = dict(absent_pkg)
             for k, v in rset.items():
@@ -722,52 +726,71 @@ def check_a4(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapping
                     if pn not in prm and ps.get("kind") != "calibrated":
                         pts = _domain_points_param(ps)
                         prm[pn] = float(pts[int(rng.integers(0, len(pts)))])
-            out = cand.run(prm, UnitSpec(f"red_{rid}_{fi}", u_attrs), Package(f"red_{rid}", pkg_c), rhor, seed=11 + fi)
-            od = _out_dict(out)
-            for path, tol in (red.get("compare") or {}).items():
-                n_total += 1
-                ag_list = list(req.get("age_groups") or [])
-                if path.startswith("per_capita_vec."):
-                    onm = path.split(".", 1)[1]
-                    got = [float((out.per_capita.get(onm) or {}).get(g, float("nan"))) for g in ag_list]
-                    want_val = expected
-                else:
-                    got = BM.get(od, path)
-                    want_val = expected
-                    if (isinstance(expected, (list, tuple)) and path.startswith("per_capita.")
-                            and len(path.split(".")) == 3):
-                        grp = path.split(".")[2]
-                        if grp in ag_list and len(expected) == len(ag_list):
-                            want_val = expected[ag_list.index(grp)]
-                ok_, err = _within_tol(got, want_val, tol)
-                details.append({"id": f"{rid}[{fi}]:{path}", "expected": want_val, "computed": got, "ok": ok_})
-                if ok_:
-                    n_pass += 1
-                else:
-                    probs.append(f"{rid}[{fi}] {path}: computed={got!r}, expected={want_val!r} (err={err:.4g}, tol={tol})")
+            idx_case = len(batch_cases)
+            batch_cases.append((prm, UnitSpec(f"red_{rid}_{fi}", u_attrs), Package(f"red_{rid}", pkg_c), rhor, 11 + fi))
+            red_plan.append((idx_case, rid, fi, expected, dict(red.get("compare") or {})))
 
     # 2. Identity: all components at absent values equals empty package {}
     id_u = generate_domain_units(req, 1, rng, ref_units=ref_units)[0]
-    o_empty = cand.run({}, id_u, Package("empty", {}), default_hor, seed=17)
-    o_abs = cand.run({}, id_u, Package("absent", dict(absent_pkg)), default_hor, seed=17)
-    n_total += 1
-    same_abs, worst_abs = _outcomes_close(o_empty, o_abs, rel=1e-12, abs_tol=1e-12)
-    if same_abs:
-        n_pass += 1
-    else:
-        probs.append(f"absent-components identity failed (rel={worst_abs:.3g})")
+    idx_empty = len(batch_cases)
+    batch_cases.append(({}, id_u, Package("empty", {}), default_hor, 17))
+    idx_abs = len(batch_cases)
+    batch_cases.append(({}, id_u, Package("absent", dict(absent_pkg)), default_hor, 17))
 
     # 3. Identity: per_capita invariant to N when declared
-    if req.get("per_capita_invariant_to_N") and "N" in attr_specs and attr_specs["N"].get("type") in ("continuous", "integer"):
+    check_n_inv = (
+        bool(req.get("per_capita_invariant_to_N"))
+        and "N" in attr_specs
+        and attr_specs["N"].get("type") in ("continuous", "integer")
+    )
+    idx_n1 = idx_n2 = -1
+    n1 = n2 = 0.0
+    if check_n_inv:
         n_lo, n_hi = attr_specs["N"].get("range") or attr_specs["N"].get("test_range") or [1000.0, 10000.0]
         n1 = float(n_lo) + 0.25 * (float(n_hi) - float(n_lo))
         n2 = float(n_lo) + 0.75 * (float(n_hi) - float(n_lo))
         if attr_specs["N"].get("type") == "integer":
             n1, n2 = int(round(n1)), int(round(n2))
-        u1 = UnitSpec("n_inv_1", dict(id_u.attributes, N=n1))
-        u2 = UnitSpec("n_inv_2", dict(id_u.attributes, N=n2))
-        o1 = cand.run({}, u1, Package("none", dict(absent_pkg)), default_hor, seed=19)
-        o2 = cand.run({}, u2, Package("none", dict(absent_pkg)), default_hor, seed=19)
+        idx_n1 = len(batch_cases)
+        batch_cases.append(({}, UnitSpec("n_inv_1", dict(id_u.attributes, N=n1)), Package("none", dict(absent_pkg)), default_hor, 19))
+        idx_n2 = len(batch_cases)
+        batch_cases.append(({}, UnitSpec("n_inv_2", dict(id_u.attributes, N=n2)), Package("none", dict(absent_pkg)), default_hor, 19))
+
+    outs = cand.run_many(batch_cases) if batch_cases else []
+    ag_list = list(req.get("age_groups") or [])
+    for idx_case, rid, fi, expected, compare_map in red_plan:
+        out = outs[idx_case]
+        od = _out_dict(out)
+        for path, tol in compare_map.items():
+            n_total += 1
+            if path.startswith("per_capita_vec."):
+                onm = path.split(".", 1)[1]
+                got = [float((out.per_capita.get(onm) or {}).get(g, float("nan"))) for g in ag_list]
+                want_val = expected
+            else:
+                got = BM.get(od, path)
+                want_val = expected
+                if (isinstance(expected, (list, tuple)) and path.startswith("per_capita.")
+                        and len(path.split(".")) == 3):
+                    grp = path.split(".")[2]
+                    if grp in ag_list and len(expected) == len(ag_list):
+                        want_val = expected[ag_list.index(grp)]
+            ok_, err = _within_tol(got, want_val, tol)
+            details.append({"id": f"{rid}[{fi}]:{path}", "expected": want_val, "computed": got, "ok": ok_})
+            if ok_:
+                n_pass += 1
+            else:
+                probs.append(f"{rid}[{fi}] {path}: computed={got!r}, expected={want_val!r} (err={err:.4g}, tol={tol})")
+
+    n_total += 1
+    same_abs, worst_abs = _outcomes_close(outs[idx_empty], outs[idx_abs], rel=1e-12, abs_tol=1e-12)
+    if same_abs:
+        n_pass += 1
+    else:
+        probs.append(f"absent-components identity failed (rel={worst_abs:.3g})")
+
+    if check_n_inv:
+        o1, o2 = outs[idx_n1], outs[idx_n2]
         n_total += 1
         same_n = True
         tol_n = 0.05 if req.get("stochastic") else 1e-6
@@ -809,11 +832,11 @@ def check_a5(cand: BCAND.CandidateEngine, build_decl: Mapping, units: list[UnitS
         if to in in_edges:
             in_edges[to].append(tr)
 
-    for idx, u in enumerate(units):
-        pk = packages[idx % len(packages)]
+    a5_cases = [({}, u, packages[idx % len(packages)], horizon, 23 + idx) for idx, u in enumerate(units)]
+    a5_outs = cand.run_many(a5_cases) if a5_cases else []
+    for idx, (u, out) in enumerate(zip(units, a5_outs)):
         n_total += 1
         c_probs: list[str] = []
-        out = cand.run({}, u, pk, horizon, seed=23 + idx)
         bal = (out.meta or {}).get("balance")
         if not isinstance(bal, dict) or not bal.get("n_steps"):
             c_probs.append(f"{u.id}: missing harness balance trace (state_vars() empty or omitted)")
@@ -910,11 +933,6 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
     reads_outcomes_all: set[str] = set()
     pair_total, pair_pass_a6, pair_pass_a7 = 0, 0, 0
 
-    def _eval_vec(prm: dict, u: UnitSpec, pk: Package, seeds: list[int]) -> list[Outcomes]:
-        if len(seeds) == 1:
-            return [cand.run(prm, u, pk, hor, seed=seeds[0])]
-        return cand.run_many([(prm, u, pk, hor, s) for s in seeds])
-
     seeds = [31 + i for i in range(k_seeds)]
 
     for iname, out_signs in sorted(expected_effects.items()):
@@ -933,27 +951,38 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
         else:
             continue
 
+        # Run all (base_point, domain_point, seed) cases for this input ONCE via run_many
+        # (amortizing sandbox startup AND avoiding duplicate simulations across multiple outputs).
+        in_cases: list[tuple[dict, UnitSpec, Package, Horizon, int]] = []
+        for bi, bu in enumerate(base_units):
+            base_pkg = dict(absent_pkg)
+            if (ikind, iname) in input_to_comp:
+                oc, ov = input_to_comp[(ikind, iname)]
+                base_pkg[oc] = ov
+            for pt in pts:
+                prm = {iname: float(pt)} if ikind == "parameter" else {}
+                pk_map = dict(base_pkg, **{iname: pt}) if ikind == "component" else dict(base_pkg)
+                u_use = UnitSpec(f"a6_{bi}", dict(bu.attributes, **{iname: pt})) if ikind == "attribute" else bu
+                for s in seeds:
+                    in_cases.append((prm, u_use, Package(f"p_{bi}", pk_map), hor, s))
+        in_outs = cand.run_many(in_cases) if in_cases else []
+        for o in in_outs:
+            pr = (o.meta or {}).get("param_reads") or {}
+            reads_build_all.update(pr.get("build") or [])
+            reads_outcomes_all.update(pr.get("read_outcomes") or [])
+        n_pts = len(pts)
+        n_seeds = len(seeds)
+
         for oname, sign in sorted(out_signs.items()):
             pair_total += 1
             moved_bases = 0
             sign_ok_all = True
             max_rel_change = 0.0
-            for bi, bu in enumerate(base_units):
-                base_pkg = dict(absent_pkg)
-                if (ikind, iname) in input_to_comp:
-                    oc, ov = input_to_comp[(ikind, iname)]
-                    base_pkg[oc] = ov
+            for bi in range(len(base_units)):
                 ys_by_pt: list[list[float]] = []
-                for pt in pts:
-                    prm = {iname: float(pt)} if ikind == "parameter" else {}
-                    pk_map = dict(base_pkg, **{iname: pt}) if ikind == "component" else dict(base_pkg)
-                    u_use = UnitSpec(f"a6_{bi}", dict(bu.attributes, **{iname: pt})) if ikind == "attribute" else bu
-                    outs = _eval_vec(prm, u_use, Package(f"p_{bi}", pk_map), seeds)
-                    for o in outs:
-                        pr = (o.meta or {}).get("param_reads") or {}
-                        reads_build_all.update(pr.get("build") or [])
-                        reads_outcomes_all.update(pr.get("read_outcomes") or [])
-                    ys_by_pt.append([_extract_output(o, oname) for o in outs])
+                for pi in range(n_pts):
+                    off = (bi * n_pts + pi) * n_seeds
+                    ys_by_pt.append([_extract_output(o, oname) for o in in_outs[off:off + n_seeds]])
                 # Compare endpoints (pt[-1] vs pt[0]) and check monotonicity across ALL adjacent ordered steps
                 diffs = [ys_by_pt[-1][s] - ys_by_pt[0][s] for s in range(len(seeds))]
                 y0_mean = float(np.mean(ys_by_pt[0]))
@@ -1377,10 +1406,11 @@ def check_a11(cand: BCAND.CandidateEngine, ref_cand: BCAND.CandidateEngine | Non
     n_total, n_pass = 0, 0
     rows: list[dict] = []
 
-    for ci, (prm, u, pk, hor) in enumerate(cases):
-        if not stochastic:
-            oc = cand.run(prm, u, pk, hor, seed=71 + ci)
-            or_ = ref_cand.run(prm, u, pk, hor, seed=71 + ci)
+    if not stochastic:
+        det_cases = [(prm, u, pk, hor, 71 + ci) for ci, (prm, u, pk, hor) in enumerate(cases)]
+        c_det = cand.run_many(det_cases) if det_cases else []
+        r_det = ref_cand.run_many(det_cases) if det_cases else []
+        for ci, (oc, or_) in enumerate(zip(c_det, r_det)):
             for oname in out_names:
                 n_total += 1
                 vc, vr = _extract_output(oc, oname), _extract_output(or_, oname)
@@ -1392,7 +1422,8 @@ def check_a11(cand: BCAND.CandidateEngine, ref_cand: BCAND.CandidateEngine | Non
                     n_pass += 1
                 else:
                     probs.append(f"case {ci} {oname}: candidate={vc:.5g} vs ref={vr:.5g} (|diff|={diff:.4g} > tol={tol:.4g})")
-        else:
+    else:
+        for ci, (prm, u, pk, hor) in enumerate(cases):
             # Stochastic equivalence: double K until CI lies inside [-tol, +tol], clearly outside, or hits k_max
             k = k_init
             while True:

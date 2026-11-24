@@ -743,10 +743,10 @@ def _self_test() -> int:
     cov_efs = dict(cov, effects_from_spec={"y": "spec supplied"})
     g_reg_efs = gate(cov_efs, [], "e", both, rec, [], "unsigned", policy="registered")
     g_built_efs = gate(cov_efs, [], "e", both, rec, [], "unsigned", policy="built")
-    g_built_oob = gate(cov, [], "e", both, rec, [], "unsigned", trained={"B1": "any"}, policy="built")
-    ok(g_reg_efs["why_not"] == [] or not any("effects_from_spec" in w for w in g_reg_efs["why_not"])
+    g_built_oob = gate(cov, [], "e", both, rec, [], "unsigned", trained={"I": "dI"}, policy="built")
+    ok((not any("effects_from_spec" in w for w in g_reg_efs["why_not"]))
        and any("effects_from_spec" in w for w in g_built_efs["why_not"])
-       and any("B1" in w and "out_of_band" in w for w in g_built_oob["why_not"]),
+       and any("I" in w and "out_of_band" in w for w in g_built_oob["why_not"]),
        f"BE15 policy='built' refuses effects_from_spec and blocks out-of-band trial without departure "
        f"(efs={g_built_efs['why_not'][:1]}, oob={g_built_oob['why_not'][:1]})")
     if fails:

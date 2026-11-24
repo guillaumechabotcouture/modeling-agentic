@@ -589,7 +589,9 @@ class Runner:
 
     def _resolve_engine(self, job):
         ref, config = job[0], job[1]
-        if self._direct_engine and ref == self.ref and (config is None or config == self._default_cfg):
+        if getattr(self, "_direct_engine", False) and ref == self.ref and (
+            config is None or config == getattr(self, "_default_cfg", None)
+        ):
             return self.engine
         return _engine_of(job)
 
@@ -605,7 +607,7 @@ class Runner:
                              default=lambda x: x.tolist() if hasattr(x, "tolist") else repr(x)) if self._shared(j) else n
             by.setdefault(key, []).append(j)
         tasks = list(by.values())
-        if self._direct_engine:
+        if getattr(self, "_direct_engine", False):
             res = [_job_list_with_engine(t, self._resolve_engine(t[0])) for t in tasks]
         elif self.workers <= 1 or len(tasks) <= 1:
             res = [fn(t) for t in tasks]
