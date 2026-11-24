@@ -97,11 +97,11 @@ class AwaitingBudget(Exception):
 # Findings whose resolution bears on the primary decision: Phase 49 β's owner rule decides
 # whether they may be declared. Without that rule they are not declarable (fail closed).
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
-# Check-value item 5: decision-bearing toolkit findings no fix task can change, asked of the owner at the first gate
-# (rule 2o) like a plan-changing test, whose accept declares them (DECLARE_SCOPE, never ACCEPT) with the dependence
-# stated at the top of the report. The spike backend's allocation_unstable is not decision-bearing: the policy map
-# (scripts/scope_signoff.py) keeps it.
-OWNER_DECLARE_KINDS = ("allocation_unstable",)
+# Check-value item 5 (owner, 2026-11-23): the toolkit's measured unstable allocation, which no fix task can change, is
+# asked of the owner at the first gate (rule 2o) like a plan-changing test, and an accept (the owner's, or the lead's
+# provisional one) lets the run ACCEPT with the dependence stated at the top of the report; a decline never accepts.
+# The spike backend's allocation_unstable is not decision-bearing: the policy map (scripts/scope_signoff.py) keeps it.
+OWNER_STABILITY_KINDS = ("allocation_unstable",)
 TOOLKIT_SOURCE = "toolkit/analysis/contract.py"
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
@@ -409,7 +409,7 @@ def _bearing_record(run_dir: str, v: dict):
     """The producer's record of a decision-bearing finding's test: the toolkit's verified row (with its result file's
     hash) for a toolkit finding, the spike's analysis.json entry otherwise (Codex r1 of #327); None when absent."""
     ev = None
-    if _owner_declares(v):
+    if _stability_owned(v):
         # check-value item 5: the record the finding's claim was read from (its path and hash), never a second read
         # (Codex r1 P1-3: a rerun between the two would pair one record's claim with another's hash)
         rec = v.get("stability_record")
@@ -434,21 +434,18 @@ def _bearing_record(run_dir: str, v: dict):
 # ACCEPT with the dependence stated. Bound into the item's fingerprint, so an accept given under the earlier contract
 # (the finding declared, the run not accepted) does not authorize it (Codex r3 of #357, P1-1).
 DT_DISPOSITION = "accept_with_dependence_stated"
-DECLARE_DISPOSITION = "declare_with_dependence_stated"     # OWNER_DECLARE_KINDS: an accept declares the finding
 STABILITY_REASON = ("the allocation does not hold out of sample (leave-one-group-out), and the decision is the package "
                     "per allocation unit")
 
 
-def _owner_declares(v: dict) -> bool:
-    return v.get("kind") in OWNER_DECLARE_KINDS and v.get("source") == TOOLKIT_SOURCE and bool(v.get("decision_bearing"))
+def _stability_owned(v: dict) -> bool:
+    return v.get("kind") in OWNER_STABILITY_KINDS and v.get("source") == TOOLKIT_SOURCE and bool(v.get("decision_bearing"))
 
 
 def _bearing_fp(v: dict, ev) -> str:
     key = {"finding": FL.gate_id(v), "claim": v.get("claim", ""), "evidence": ev}
-    if v.get("kind") in DECISION_BEARING_KINDS:
+    if v.get("kind") in DECISION_BEARING_KINDS or _stability_owned(v):
         key["disposition"] = DT_DISPOSITION
-    elif _owner_declares(v):
-        key["disposition"] = DECLARE_DISPOSITION
     return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -460,12 +457,12 @@ def _bearing_item(run_dir: str, v: dict) -> dict:
     gid = FL.gate_id(v)
     fp = _bearing_fp(v, ev)
     return {"finding": gid, "kind": v.get("kind"),
-            "reason": STABILITY_REASON if _owner_declares(v) else "a measured decision test changes the plan",
+            "reason": STABILITY_REASON if _stability_owned(v) else "a measured decision test changes the plan",
             "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp,
             # the producer's record the answer binds, for the report's statement of it (Codex r1 of #357, P1-7/8)
             "record": "toolkit" if v.get("source") == "toolkit/analysis/contract.py" else "spike",
-            # an accept declares it (the sign-off page and the provisional list say so: Codex r1 P1-2)
-            **({"disposition": "declare"} if _owner_declares(v) else {}),
+            # what an accept authorizes (the sign-off page and the provisional list say so: Codex r1 P1-2)
+            **({"disposition": DT_DISPOSITION} if _stability_owned(v) else {}),
             "result_sha256": (ev or {}).get("result_sha256") if isinstance(ev, dict) else None}
 
 
@@ -511,10 +508,10 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
                     # first gate (rule 2o), and an accept lets the run ACCEPT with the dependence stated (owner
                     # decision (b), 2026-11-23); scripts/validate_critique_yaml.py _recompute_action
                     v["owner_resolution"] = True
-                elif _owner_declares(v):
+                elif _stability_owned(v):
                     # check-value item 5: no fix task can make an unstable allocation stable; asked at the first gate
-                    # (rule 2o), and an accept declares it (validate_critique_yaml rule 4d), never ACCEPT
-                    v["owner_resolution"], v["owner_disposition"] = True, "declare"
+                    # (rule 2o), and an accept lets the run ACCEPT with the dependence stated (owner, 2026-11-23)
+                    v["owner_resolution"] = True
                 item = _bearing_item(run_dir, v)
                 a = answers.get(item["fingerprint"]) or {}
                 if str(a.get("finding")) == item["finding"] and _answer_counts(a, mode):
@@ -530,9 +527,9 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
                                          f"({a.get('at')}): {str(a.get('note') or 'no note')[:300]}."})
                     continue
                 v["owner_signoff"], v["owner_item"] = True, item
-            # an owner-declared finding is this rule's item alone: the policy map would ask it again under its own
-            # fingerprint (scripts/scope_signoff.py maps allocation_unstable too)
-            rest = [v for v in viols if v.get("owner_disposition") != "declare"]
+            # the toolkit's unstable allocation is this rule's item alone: the policy map would ask it again under
+            # its own fingerprint (scripts/scope_signoff.py maps allocation_unstable too)
+            rest = [v for v in viols if not _stability_owned(v)]
             return out + list(rule.gate_findings(run_dir, round_n, rest, non_declarable=V.is_non_declarable,
                                                  mode=mode, provisional_only=True) or [])
         except Exception as e:  # noqa: BLE001 -- fail closed below
@@ -704,8 +701,7 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     for v in decision.get("rigor_violations") or []:
         if not (isinstance(v, dict) and str(v.get("severity")) in ("HIGH", "MEDIUM")):
             continue
-        if v.get("owner_resolution") and v.get("owner_signed") and not v.get("owner_signoff") \
-                and v.get("owner_disposition") != "declare":
+        if v.get("owner_resolution") and v.get("owner_signed") and not v.get("owner_signoff"):
             continue          # the owner accepted it: the report states the dependence (owner decision (b), hb2 fix 1)
         fid = FL.gate_id(v)
         # Every gate finding counts (a resolved blocker whose test fails is done_when_unmet; a missing
@@ -715,10 +711,8 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
         if (str(v.get("key") or "") in critic_open and v.get("kind") != "done_when_regressed") or fid in seen:
             continue
         seen.add(fid)
-        # (no fix task can change an owner-declared finding, nor one its check marks `fix_task: False`: declared)
         out.append({"id": fid, "source": "harness", "severity": v.get("severity"), "kind": str(v.get("kind") or ""),
-                    "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing")
-                    and v.get("fix_task") is not False and v.get("owner_disposition") != "declare",
+                    "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing"),
                     "claim": str(v.get("claim") or ""), "fix_requires": _remedy(v)})
     return out
 
@@ -783,9 +777,8 @@ def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int,
     declared (harness baseline hb1, malaria R2: two critique rounds ran for an accepted finding). Nor does a declared
     harness gap (`harness_gaps`, FL.harness_gaps: no file a fix task may edit can fix it; hb2 fix 4, dengue R2 R-001:
     two critique rounds ran for one): it is declared with what it needs.
-    The decision's action and rationale say what the machine then does. A gate that declares only owner-declared
-    findings (rule 4d, check-value item 5) is read as one that would ACCEPT: what has a test still goes to the loop."""
-    if (decision.get("action") != "ACCEPT" and str(decision.get("rule_matched")) != "4d") or not opened:
+    The decision's action and rationale say what the machine then does."""
+    if decision.get("action") != "ACCEPT" or not opened:
         return decision
     d = dict(decision)
     held = set(map(str, owner_held or ()))
@@ -3328,7 +3321,7 @@ def _plan_changing(item: dict) -> bool:
     conf = item.get("conflict")
     if item.get("kind") == "evidence_conflict_declared" and not isinstance(conf, dict):
         return True     # a request saved before the verdict was carried: it holds only plan-changing or untested ones
-    return item.get("kind") in DECISION_BEARING_KINDS or item.get("disposition") == "declare" \
+    return item.get("kind") in DECISION_BEARING_KINDS or item.get("disposition") == DT_DISPOSITION \
         or (isinstance(conf, dict) and conf.get("changes_plan") is True) \
         or any((d.get("test") or {}).get("decision_changes") is True
                for d in item.get("declarations") or [] if isinstance(d, dict))
@@ -3487,23 +3480,23 @@ def dependence_lines(run_dir: str, stale_out: list | None = None) -> list[str]:
     return out + ["\n"]
 
 
-def declared_dependence_lines(run_dir: str, stale_out: list | None = None) -> list[str]:
-    """Check-value item 5: an owner-declared finding (OWNER_DECLARE_KINDS: an unstable allocation) the owner (or, under
-    --signoff lead, the lead provisionally) accepted is stated at the top of the report, as decision (b) states an
-    accepted plan-changing test: the harness's claim (the groups whose exclusion changes the plan, the share of units
-    affected) and who accepted it. From the ledger's owner_accepted rows; one a later gate reads differently is asked
-    again (its row reopens) and one it no longer reports is closed (FL.sync), so neither is listed."""
+def stability_dependence_lines(run_dir: str, stale_out: list | None = None) -> list[str]:
+    """Check-value item 5 (owner, 2026-11-23): an unstable allocation the owner (or, under --signoff lead, the lead
+    provisionally) accepted lets the run ACCEPT, and the report states it at its top, as decision (b) states an accepted
+    plan-changing test: the harness's claim (the groups whose exclusion changes the plan, the share of units affected)
+    and who accepted it. Shown only while the record there now has the accepted fingerprint (Codex r1 P1-4: a rebuild
+    renders before the next gate); otherwise its id goes to `stale_out`, so an accepted report is withheld."""
     try:
         led = FL.load(run_dir)
     except Exception as e:  # noqa: BLE001 -- fail closed: the report says the list could not be read
-        return [f"**Declared limitations the owner accepted: the list could not be read ({type(e).__name__}).**\n\n"]
-    rows = sorted((f for f in led.values() if f.kind in OWNER_DECLARE_KINDS and f.status == "owner_accepted"),
-                  key=lambda f: f.id)
+        return [f"**Accepted allocation instability: the list could not be read ({type(e).__name__}).**\n\n"]
+    rows = sorted((f for f in led.values() if f.kind in OWNER_STABILITY_KINDS and f.status == "owner_accepted"
+                   and f.id in FL.OWNER_RESOLUTION_IDS), key=lambda f: f.id)
     if not rows:
         return []
-    try:        # the finding as the record there now reads (Codex r1 P1-4: a rebuild renders before the next gate)
+    try:
         from toolkit.analysis import contract as _CT
-        now = {FL.gate_id(v): v for v in _CT.stability_findings(run_dir) if _owner_declares(v)}
+        now = {FL.gate_id(v): v for v in _CT.stability_findings(run_dir) if _stability_owned(v)}
     except Exception:  # noqa: BLE001 -- not comparable: none shown as accepted
         now = {}
     out, by_lead = [], True
@@ -3520,10 +3513,11 @@ def declared_dependence_lines(run_dir: str, stale_out: list | None = None) -> li
             if stale_out is not None:
                 stale_out.append(f.id)
             continue
-        out.append(line + f" as a declared limitation of the per-unit plan. {' '.join(str(v.get('claim')).split())}\n")
-    return [f"## The plan holds only as far as a limitation {'the lead accepted provisionally' if by_lead else 'the owner accepted'}\n\n",
-            "The plan below is delivered with this finding declared, not resolved; the plan changes where it says "
-            "(harness-rendered).\n\n"] + out + ["\n"]
+        out.append(line + f". {' '.join(str(v.get('claim')).split())}\n")
+    whose = "the lead accepted provisionally" if by_lead else "the owner accepted"
+    return [f"## The per-unit plan changes out of sample, which {whose}\n\n",
+            "Leave-one-group-out stability: the plan re-solved with each group's calibration held out changes where "
+            "the line below says (harness-rendered).\n\n"] + out + ["\n"]
 
 
 def amendment_lines(run_dir: str) -> list[str]:
@@ -3618,13 +3612,13 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
         dec2 = (yaml.safe_load(open(os.path.join(run_dir, DECLARED_FILE))) or {})
     except OSError:
         dec2 = {}
-    try:        # Codex r1 P1-5: an owner-declared finding a later gate no longer reports is not still declared
-        led_ = FL.load(run_dir)
-        dec2["declared"] = [e for e in dec2.get("declared") or [] if not (
-            isinstance(e, dict) and str(e.get("id")) in FL.OWNER_DECLARED_IDS
-            and getattr(led_.get(str(e.get("id"))), "status", None) == "fixed")]
-    except Exception:  # noqa: BLE001 -- listed as written
-        pass
+    try:        # check-value item 5 (owner, 2026-11-23): a stability that did not run is an advisory note, never a finding
+        from toolkit.analysis import contract as _CT
+        note = _CT.stability_note(run_dir)
+    except Exception as e:  # noqa: BLE001 -- the report says the note could not be read
+        note = f"`stability_not_run` (advisory): the stability record could not be read ({type(e).__name__})."
+    if note:
+        lines += ["", "## Advisory notes (no effect on the outcome)", "", f"- {note}"]
     if dec2.get("declared"):
         lines += ["", "## Open findings, declared (not resolved)", "", str(dec2.get("rationale") or ""), ""]
         lines += [f"- **{e['id']}** ({e['severity']}, {e['source']}): {e['claim']} Required remedy: "
@@ -3664,7 +3658,7 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     lines += prov
     stale_dt: list = []
     head = (_status_line(run_dir, status) + "".join(amendment_lines(run_dir)) + "".join(top)
-            + "".join(dependence_lines(run_dir, stale_dt)) + "".join(declared_dependence_lines(run_dir, stale_dt)))
+            + "".join(dependence_lines(run_dir, stale_dt)) + "".join(stability_dependence_lines(run_dir, stale_dt)))
     body = draft.rstrip() + "\n"
     from toolkit.spec import review_conditions as RCN       # W0-G: conditions the lead deferred, at the top
     rcl = RCN.report_lines(run_dir)
@@ -5601,11 +5595,7 @@ def _self_test() -> int:
             prov36 = sorted({r["finding"] for r in _SS36.provisional(d) if r.get("plan_changing")})
             rep36 = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
             sp36 = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep36 else [0, 0]
-            # check-value item 5: an unstable (or not run) allocation stability is declared, never accepted; read from
-            # the artifact itself
-            _st36 = (yaml.safe_load(open(os.path.join(d, "analysis", "stability.yaml"))) or {}).get("data") or {}
-            _v36 = {_st36.get("verdict"), _st36.get("value_verdict")}
-            exp36 = "completed_scope_declared" if _v36 & {"UNSTABLE", "NOT_RUN"} else "completed"
+            exp36 = "completed"     # (check-value item 5: an unstable allocation accepted provisionally ends accepted too)
             ok(want and s == exp36 and "The plan depends on inputs the lead accepted provisionally" in rep36[:sp36[0]] and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
                and FL.load(d)["D-001"].status == "fixed" and prov36 == want
                and not any(h.get("paused") for h in load_state(d).history)
@@ -6733,8 +6723,9 @@ def _self_test_auto1a(ok, td: str, spike, new_run) -> None:
 
 
 def _self_test_stability_owner(ok, td: str) -> None:
-    """SO-ST1-SO-ST6 (check-value item 5): the toolkit's unstable allocation goes to its owner at the first gate (rule
-    2o, as a plan-changing test does); an accept declares it (never ACCEPT), and the report states it at its top."""
+    """SO-ST1-SO-ST6 (check-value item 5; owner, 2026-11-23): the toolkit's unstable allocation goes to its owner at the
+    first gate (rule 2o, as a plan-changing test does); an accept lets the run ACCEPT, with the groups and the share of
+    units affected stated at the top of the report."""
     d = os.path.join(td, "stab_owner")
     os.makedirs(d)
     us = {"kind": "allocation_unstable", "severity": "HIGH", "stage": "ANALYZE", "target_stage": "ANALYZE",
@@ -6754,56 +6745,47 @@ def _self_test_stability_owner(ok, td: str) -> None:
     vs = [dict(us)]
     apply_owner_rule(d, 1, vs, rule=Rule)
     it = vs[0].get("owner_item") or {}
-    ok(vs[0].get("owner_resolution") is True and vs[0].get("owner_disposition") == "declare"
-       and vs[0].get("owner_signoff") is True and "out of sample" in str(it.get("reason"))
-       and it.get("finding") == "allocation_unstable:stability" and seen.get("passed") == [],
-       f"SO-ST1 an unanswered unstable allocation is marked for its owner at the first gate, declared once accepted, "
-       f"and not also put through the policy map ({it}, {seen})")
+    ok(vs[0].get("owner_resolution") is True and vs[0].get("owner_signoff") is True
+       and "out of sample" in str(it.get("reason")) and it.get("finding") == "allocation_unstable:stability"
+       and it.get("disposition") == DT_DISPOSITION and _plan_changing(it) is True and seen.get("passed") == [],
+       f"SO-ST1 an unanswered unstable allocation is marked for its owner at the first gate, as a measured plan change "
+       f"whose accept lets the run ACCEPT, and is not also put through the policy map ({it}, {seen})")
     answers[it.get("fingerprint")] = {"finding": it.get("finding"), "decision": "accept", "by": "owner", "at": "t"}
     vs = [dict(us)]
     apply_owner_rule(d, 1, vs, rule=Rule)
-    ok(isinstance(vs[0].get("owner_signed"), dict) and not vs[0].get("owner_signoff")
-       and vs[0].get("owner_disposition") == "declare",
+    ok(isinstance(vs[0].get("owner_signed"), dict) and not vs[0].get("owner_signoff"),
        f"SO-ST2 the owner's accept is recorded on the finding: {vs[0].get('owner_signed')}")
-    nr = {"kind": "stability_not_run", "severity": "MEDIUM", "stage": "ANALYZE", "key": "stability", "claim": "not run",
-          "scope_declarable": True, "fix_task": False}
-    dec = {"action": "ACCEPT", "rigor_violations": [vs[0], nr]}
-    op = {o["id"]: o for o in open_findings(d, dec)}
-    ok(set(op) == {"allocation_unstable:stability", "stability_not_run:stability"}
-       and not any(o["tested"] for o in op.values()),
-       f"SO-ST3 the accepted unstable allocation and a stability not run are listed open, with no test a fix task "
-       f"can work to: {op}")
-    m1 = apply_medium_rule({"action": "DECLARE_SCOPE", "rule_matched": "4d"}, list(op.values()), 2, True)
-    m2 = apply_medium_rule({"action": "DECLARE_SCOPE", "rule_matched": "4d"},
-                           list(op.values()) + [{"id": "R-9", "tested": True, "severity": "MEDIUM", "claim": "c",
-                                                 "source": "critique-redteam"}], 2, True)
-    ok(m1["action"] == "DECLARE_SCOPE" and m1["rule_matched"] == "3m"
-       and "allocation_unstable:stability" in m1["declared_open"] and m2["rule_matched"] == "4m",
-       f"SO-ST4 the declared item is written up (rule 3m); a finding with a test still goes to the fix loop first "
-       f"({m1['rule_matched']}, {m2['rule_matched']})")
+    ok(open_findings(d, {"action": "ACCEPT", "rigor_violations": [vs[0]]}) == [],
+       "SO-ST3 an accepted unstable allocation is not an open finding: nothing for the medium rule or the fix loop")
+    answers[it.get("fingerprint")] = dict(answers[it.get("fingerprint")], decision="decline")
+    vs = [dict(us)]
+    got = apply_owner_rule(d, 1, vs, rule=Rule)
+    ok([f["kind"] for f in got] == ["scope_declaration_declined"] and vs[0].get("scope_declarable") is False,
+       f"SO-ST4 a declined unstable allocation is not declarable: the run cannot accept ({got})")
     from toolkit.analysis import contract as _CT
     cur = dict(us, stability_record={"path": "analysis/stability.yaml", "result_sha256": "h1"})
     FL.save(d, {"allocation_unstable:stability": FL.Finding(
         id="allocation_unstable:stability", kind="allocation_unstable", severity="HIGH", source="rigor-artifacts",
         key="stability", status="owner_accepted", claim=us["claim"],
-        events=[{"round": 1, "status": "owner_accepted", "by": "owner", "at": "t",
+        events=[{"round": 1, "status": "owner_accepted", "by": "lead", "provisional": True, "at": "t",
                  "fingerprint": _bearing_fp(cur, cur["stability_record"])}])})
     _sf = _CT.stability_findings
     try:
         _CT.stability_findings = lambda rd: [dict(cur)]
-        txt = "".join(declared_dependence_lines(d))
+        st5a = []
+        txt = "".join(stability_dependence_lines(d, st5a))
         _CT.stability_findings = lambda rd: [dict(cur, stability_record={"path": "x", "result_sha256": "h2"})]
         st5 = []
-        txt2 = "".join(declared_dependence_lines(d, st5))
+        txt2 = "".join(stability_dependence_lines(d, st5))
     finally:
         _CT.stability_findings = _sf
-    ok("the owner accepted" in txt and "groups g2, g3" in txt and "declared limitation" in txt
-       and "groups g2" not in txt2 and "asks again" in txt2 and st5 == ["allocation_unstable:stability"]
-       and _plan_changing(it) is True and it.get("disposition") == "declare",
-       f"SO-ST5 the report states the accepted unstable allocation at its top, only while the record it read is the "
-       f"accepted one (Codex r1 P1-4); it counts as plan-changing (P1-2): {txt!r} {txt2!r}")
+    ok("the lead accepted provisionally" in txt and "groups g2, g3" in txt and st5a == []
+       and "groups g2" not in txt2 and "asks again" in txt2 and st5 == ["allocation_unstable:stability"],
+       f"SO-ST5 the report states the accepted unstable allocation and who accepted it at its top, only while the "
+       f"record it read is the accepted one; otherwise it is stale, so an accepted report is withheld (Codex r1 P1-4): "
+       f"{txt!r} {txt2!r}")
     FL.sync(d, {"unresolved_high": [], "rigor_violations": []}, 2, post_write=True)
-    ok(FL.load(d)["allocation_unstable:stability"].status == "fixed" and declared_dependence_lines(d) == [],
+    ok(FL.load(d)["allocation_unstable:stability"].status == "fixed" and stability_dependence_lines(d) == [],
        "SO-ST6 an accepted unstable allocation a later gate no longer reports is closed and leaves the report")
 
 

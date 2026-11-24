@@ -412,15 +412,17 @@ def harness_gap_key(f) -> str:
 
 # hb2 fix 1: gate kinds whose resolution is the owner's (agents/stage_machine.py DECISION_BEARING_KINDS)
 OWNER_RESOLUTION_KINDS = ("decision_test_changes_plan",)
-# check-value item 5: the toolkit's owner-declared finding (agents/stage_machine.py OWNER_DECLARE_KINDS), by kind and key:
+# check-value item 5: the toolkit's unstable allocation (agents/stage_machine.py OWNER_STABILITY_KINDS), by kind and key:
 # the spike backend's allocation_unstable (key `loo`) keeps the policy map's lifecycle
-OWNER_DECLARED_IDS = ("allocation_unstable:stability",)
+OWNER_RESOLUTION_IDS = ("allocation_unstable:stability",)
 
 
 def owner_resolved(f) -> bool:
     """A ledger row whose resolution is the owner's answer to the gate finding itself (closed when a gate no longer
     reports it, reopened when the gate reads it as asked again)."""
-    return f.kind in OWNER_RESOLUTION_KINDS or f.id in OWNER_DECLARED_IDS
+    return f.kind in OWNER_RESOLUTION_KINDS or f.id in OWNER_RESOLUTION_IDS
+
+
 HARNESS_GAP = "harness_gap"          # the ledger event a declared harness gap leaves on its finding (agents/fix_loop.py)
 
 

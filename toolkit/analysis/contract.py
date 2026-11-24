@@ -20,7 +20,7 @@ harness wrote, for the spec that was signed:
   analysis_contract_stability  analysis/stability.yaml cannot be verified or read, or holds an unknown verdict
 All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding). Beside them, read by
 toolkit/analysis/api.py: decision_test_findings (decision_test_changes_plan) and stability_findings
-(allocation_unstable HIGH, declarable through the owner; stability_not_run MEDIUM on an allocation).
+(allocation_unstable HIGH, the owner's to accept); stability_note is the report's advisory note when it did not run.
 """
 from __future__ import annotations
 
@@ -780,8 +780,8 @@ def decision_test_findings(run_dir: str) -> list[dict]:
 
 STABILITY_ARTIFACT = "analysis/stability.yaml"
 STABILITY_VERDICTS = ("ROBUST", "FRAGILE", "UNSTABLE", "NOT_RUN")    # toolkit/analysis/stability.py run()
-STABILITY_KIND = "allocation_unstable"       # agents/stage_machine.py OWNER_DECLARE_KINDS
-STABILITY_NOT_RUN = "stability_not_run"
+STABILITY_KIND = "allocation_unstable"       # agents/stage_machine.py OWNER_STABILITY_KINDS
+STABILITY_NOT_RUN = "stability_not_run"     # an advisory note in the report, never a gate finding
 
 
 def _stability_doc(run_dir: str) -> tuple:
@@ -850,13 +850,31 @@ def _fold_problem(folds: list) -> str | None:
     return f"has folds that imply different unit totals {sorted(totals)}" if len(totals) > 1 else None
 
 
+def stability_note(run_dir: str) -> str | None:
+    """The report's advisory note (owner, 2026-11-23) when a verified stability record of an allocation run says NOT_RUN:
+    the reason (the skip reason or each fold's) and what would run it. Never a gate finding: it is not declared, not
+    planned as a fix task and does not change the outcome. None otherwise (an unusable record is stability_findings')."""
+    data, rec, problem = _stability_doc(run_dir)
+    if problem or not isinstance(data, dict) or data.get("verdict") != "NOT_RUN" or not rec["allocates"]:
+        return None
+    g = str(data.get("holdout_group") or "group")
+    why = [str(data["reason"])] if data.get("reason") else []
+    why += [f"{f.get('group')}: {f.get('reason')}" for f in data.get("folds_not_run") or [] if isinstance(f, dict)]
+    fix = ("a spec that names analysis.stability.holdout_group (and covariates under emulator inversion)"
+           if not data.get("holdout_group") and "holdout_group" in str(data.get("reason")) else
+           "a spec that removes the reason stated")
+    return (f"`{STABILITY_NOT_RUN}` (advisory): the leave-one-{g}-out allocation stability was not run, so nothing here "
+            f"shows whether the per-unit plan holds when a {g} is held out. Reason: "
+            f"{'; '.join(why)[:600] or 'no reason recorded'}. A relaunch with {fix} would run it.")
+
+
 def stability_findings(run_dir: str) -> list[dict]:
     """Check-value item 5: the leave-one-group-out allocation stability (the `stability` artifact) as a finding.
     UNSTABLE (package identity or value lost): a HIGH `allocation_unstable`, scope-declarable and decision-bearing, which
     names the groups whose exclusion changes the plan and the share of units affected, and carries the record it was
     read from (`stability_record`: the owner item binds that read, Codex r1 P1-3); the stage machine asks its owner at
-    the first gate and an accept declares it (agents/stage_machine.py OWNER_DECLARE_KINDS). NOT_RUN on an allocation
-    deliverable: a MEDIUM `stability_not_run` with the reason, which no fix task can change (`fix_task: False`).
+    the first gate and an accept lets the run ACCEPT with the dependence stated at the top of the report (owner,
+    2026-11-23; agents/stage_machine.py OWNER_STABILITY_KINDS). NOT_RUN is no finding: stability_note says it, advisory.
     A record that cannot be verified or read, or holds an unknown verdict or malformed folds: a non-declarable HIGH
     (fail closed). Not a contract finding: gate_findings is unchanged (toolkit/analysis/api.py gate_findings adds these)."""
     data, rec, problem = _stability_doc(run_dir)
@@ -881,19 +899,8 @@ def stability_findings(run_dir: str) -> list[dict]:
     g = str(data.get("holdout_group") or "group")
     base = {"stage": "ANALYZE", "target_stage": "ANALYZE", "key": "stability", "scope_declarable": True,
             "source": "toolkit/analysis/contract.py"}
-    if v == "NOT_RUN":
-        if not rec["allocates"]:
-            return []
-        why = [str(data["reason"])] if data.get("reason") else []
-        why += [f"{f.get('group')}: {f.get('reason')}" for f in skipped or [] if isinstance(f, dict)]
-        # the remedy fits the reason (Codex r1 P2-10): a holdout group only when the spec names none
-        fix = ("a relaunch with a spec that names analysis.stability.holdout_group (and covariates under emulator "
-               "inversion)" if not data.get("holdout_group") and "holdout_group" in str(data.get("reason"))
-               else "a relaunch whose spec removes the reason stated")
-        return [dict(base, kind=STABILITY_NOT_RUN, severity="MEDIUM", fix_task=False,
-                     claim=f"The leave-one-{g}-out allocation stability was not run, so nothing shows whether the "
-                           f"per-unit plan holds when a {g} is held out: {'; '.join(why)[:600] or 'no reason recorded'}.",
-                     fix_requires=f"Declared with its reason in the write-up. To run it: {fix}.")]
+    if v == "NOT_RUN":           # owner, 2026-11-23: an advisory note in the report (stability_note), not a finding
+        return []
     if "UNSTABLE" not in (v, vv):
         return []
     # Codex r1 P1-1: under deliverable.plan: expected_value the folds re-solve at the point values, against the
@@ -1376,18 +1383,20 @@ def _self_test_stability(ok, complete_run) -> None:
            f"K-ST3 an UNSTABLE value verdict raises it too: {got(d)[0]}")
         run_with(d, dict(unstable, verdict="ROBUST"))
         ok(got(d)[0] == [], f"K-ST4 a ROBUST record raises nothing: {got(d)[0]}")
+        note = lambda: (stability_note(d) if "stability_note" in globals() else None) or ""  # noqa: E731
         run_with(d, skipped)
-        g, fs = got(d)
-        ok(g == [("stability_not_run", "MEDIUM", True, "stability")] and fs[0].get("fix_task") is False
-           and "no analysis.stability.holdout_group in the spec" in fs[0]["claim"],
-           f"K-ST5 NOT_RUN on an allocation is a MEDIUM with the reason, never silent: {g}")
+        n5 = note()
+        ok(got(d)[0] == [] and "stability_not_run" in n5 and "(advisory)" in n5
+           and "no analysis.stability.holdout_group in the spec" in n5,
+           f"K-ST5 NOT_RUN on an allocation is no gate finding but an advisory note with the reason (owner, "
+           f"2026-11-23): {got(d)[0]} {n5!r}")
         run_with(d, dict(skipped, method="leave-one-grp-out", reason=None,
                          folds_not_run=[{"group": "g1", "status": "not_run", "reason": "too few units"}]))
-        g, fs = got(d)
-        ok(g and g[0][0] == "stability_not_run" and "too few units" in fs[0]["claim"],
-           f"K-ST5b no fold ran: each fold's reason is stated: {g}")
+        ok(got(d)[0] == [] and "too few units" in note(), f"K-ST5b no fold ran: each fold's reason is stated: {note()!r}")
         run_with(d, skipped, kind="estimates")
-        ok(got(d)[0] == [], f"K-ST6 an estimates run allocates nothing: no finding: {got(d)[0]}")
+        ok(got(d)[0] == [] and note() == "", f"K-ST6 an estimates run allocates nothing: no finding, no note")
+        run_with(d, unstable)
+        ok(note() == "", "K-ST6b a stability that ran has no not-run note")
         for bad in (dict(unstable, verdict="WOBBLY"), dict(unstable, folds="x"), dict(unstable, folds=[])):
             run_with(d, bad)
             g = got(d)[0]

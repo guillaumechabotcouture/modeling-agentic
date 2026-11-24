@@ -578,21 +578,17 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
     `unresolved_high` to `owner_accepted_high`, and the report states the
     dependence at its top. Declined or unanswered, it never accepts. Other
     owner items (policy-mapped kinds, scripts/scope_signoff.py) keep rule 3o.
-    One whose accept declares it (`owner_disposition: declare`, an unstable
-    allocation; check-value item 5) moves to `owner_declared_high`: it
-    blocks no other rule, and a gate that would ACCEPT declares it (4d).
+    An unstable allocation the toolkit measured (check-value item 5) follows
+    the same rule (owner, 2026-11-23).
     """
     moved = [b for b in d.get("unresolved_high") or [] if isinstance(b, dict) and b.get("owner_resolution")
              and b.get("owner_signed") and not b.get("owner_signoff") and not b.get("owner_declined")
              and not is_non_declarable(b.get("kind"), b.get("scope_declarable"))]
     if moved:
         d["unresolved_high"] = [b for b in d["unresolved_high"] if not any(b is m for m in moved)]
-        for name, part in (("owner_accepted_high", [b for b in moved if b.get("owner_disposition") != "declare"]),
-                           ("owner_declared_high", [b for b in moved if b.get("owner_disposition") == "declare"])):
-            if part:
-                held = list(d.get(name) or [])
-                seen = {(b.get("kind"), b.get("claim")) for b in held if isinstance(b, dict)}
-                d[name] = held + [b for b in part if (b.get("kind"), b.get("claim")) not in seen]
+        held = list(d.get("owner_accepted_high") or [])
+        seen = {(b.get("kind"), b.get("claim")) for b in held if isinstance(b, dict)}
+        d["owner_accepted_high"] = held + [b for b in moved if (b.get("kind"), b.get("claim")) not in seen]
     unresolved_high = d.get("unresolved_high") or []
     accept_blockers = d.get("accept_blockers") or []
     structural = d.get("structural_mismatch", False)
@@ -679,11 +675,6 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
         rationale = ("No unresolved HIGH blockers, no missing required "
                      "artifacts, no structural mismatch.")
         rule_matched = 4
-        if d.get("owner_declared_high"):
-            action, rule_matched = "DECLARE_SCOPE", "4d"
-            rationale = (f"{len(d['owner_declared_high'])} HIGH finding(s) the owner accepted as declared limitations "
-                         "are open: they are declared in the write-up (declared_findings.yaml), with the dependence "
-                         "stated at the top of the report, not accepted.")
 
     owner = [b for b in outstanding if b.get("owner_signoff")]
     if action == "DECLARE_SCOPE" and owner:
@@ -879,7 +870,6 @@ def _append_synthetic_blockers(d: dict, reviewer: str, prefix: str,
     function twice yields identical output."""
     # (an entry the owner accepted was moved to owner_accepted_high: still present, hb2 fix 1)
     existing = [b for b in list(d["unresolved_high"]) + list(d.get("owner_accepted_high") or [])
-                + list(d.get("owner_declared_high") or [])
                 if isinstance(b, dict) and b.get("reviewer") == reviewer]
     seen = {(b.get("kind"), b.get("claim")) for b in existing}
     n = len(existing)
@@ -4469,8 +4459,7 @@ def _incorporate_rigor_violations(decision: dict, violations: list[dict],
             # Phase 49 β: a finding the owner must sign off before it is declared.
             **({"owner_signoff": True, "owner_item": v.get("owner_item")} if v.get("owner_signoff") else {}),
             # hb2 fix 1: a finding whose resolution is the owner's, and the owner's recorded accept
-            **({k: v[k] for k in ("owner_resolution", "owner_signed", "owner_declined", "owner_disposition")
-                if v.get(k)}),
+            **({k: v[k] for k in ("owner_resolution", "owner_signed", "owner_declined") if v.get(k)}),
         })
     _append_synthetic_blockers(d, "rigor-artifacts", "RIG", entries)
 
@@ -4937,25 +4926,22 @@ def _run_self_test() -> int:
     _o7 = _incorporate_rigor_violations(_incorporate_rigor_violations(_e(), [dict(_acc)], 3, 1), [dict(_acc)], 3, 1)
     ok(_o7["action"] == "ACCEPT" and len(_o7.get("owner_accepted_high") or []) == 1,
        f"OR-V7 idempotent: folding the same accepted finding twice lists it once ({_o7.get('owner_accepted_high')})")
-    # OR-V8 (check-value item 5): an unstable allocation is asked at the first gate like a plan-changing test, but an
-    # accept declares it (owner_disposition: declare): it never yields ACCEPT
+    # OR-V8 (check-value item 5; owner, 2026-11-23): an unstable allocation is asked at the first gate like a
+    # plan-changing test, and an accept lets the run ACCEPT with the dependence stated; a decline never accepts
     _us = {"kind": "allocation_unstable", "severity": "HIGH", "stage": "ANALYZE", "key": "stability",
-           "claim": "unstable", "scope_declarable": True, "owner_resolution": True, "owner_disposition": "declare"}
+           "claim": "unstable", "scope_declarable": True, "owner_resolution": True}
     _usp = dict(_us, owner_signoff=True, owner_item={"finding": "allocation_unstable:stability", "fingerprint": "fp3"})
     _usa = dict(_us, owner_signed={"by": "owner", "at": "t", "fingerprint": "fp3"})
     _u1 = _incorporate_rigor_violations(_e(), [dict(_usp)], 3, 1)
     _u2 = _incorporate_rigor_violations(_e(), [dict(_usa)], 3, 1)
-    _u2c = _incorporate_rigor_violations(_e(), [dict(_usa)], 3, 3)
     _u3 = _incorporate_rigor_violations(_e(), [dict(_usa), dict(_other)], 3, 1)
-    _u4 = _incorporate_rigor_violations(_incorporate_rigor_violations(_e(), [dict(_usa)], 3, 1), [dict(_usa)], 3, 1)
-    ok(_u1["rule_matched"] == "2o" and _u2["action"] == "DECLARE_SCOPE" and _u2["rule_matched"] == "4d"
-       and _u2c["action"] == "DECLARE_SCOPE" and not _u2["unresolved_high"]
-       and [b.get("kind") for b in _u2.get("owner_declared_high") or []] == ["allocation_unstable"]
-       and not _u2.get("owner_accepted_high") and _u3["action"] == "PATCH_OR_RETHINK"
-       and len(_u4.get("owner_declared_high") or []) == 1 and _u4["action"] == "DECLARE_SCOPE",
-       f"OR-V8 an accepted owner-declared HIGH is declared, never accepted, at round 1 or at the cap; other HIGHs keep "
-       f"their rules; idempotent ({_u1['rule_matched']}, {_u2['action']}/{_u2['rule_matched']}, {_u2c['action']}, "
-       f"{_u3['action']}, {_u4.get('owner_declared_high')})")
+    _u4 = _incorporate_rigor_violations(_e(), [dict(_us, owner_declined=True, scope_declarable=False)], 3, 3)
+    ok(_u1["rule_matched"] == "2o" and _u2["action"] == "ACCEPT" and not _u2["unresolved_high"]
+       and [b.get("kind") for b in _u2.get("owner_accepted_high") or []] == ["allocation_unstable"]
+       and _u3["action"] == "PATCH_OR_RETHINK" and _u4["action"] == "RUN_FAILED",
+       f"OR-V8 an unstable allocation: asked at the first gate, accepted it does not block ACCEPT, other HIGHs keep "
+       f"their rules, declined it never accepts ({_u1['rule_matched']}, {_u2['action']}, {_u3['action']}, "
+       f"{_u4['action']})")
     with tempfile.TemporaryDirectory() as d:
         yaml.safe_dump({"declarations": [{"id": "SD-7", "blocker_id": "allocation_unstable", "why_unresolved": "x"}]},
                        open(os.path.join(d, "scope_declaration.yaml"), "w"))
