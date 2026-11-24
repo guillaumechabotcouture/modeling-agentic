@@ -380,9 +380,12 @@ def _fitted_in_use(engine, pack, toy: bool) -> tuple:
         return eff, None, [f"refit required: fitted values {fp} have no readable benchmark pack to be checked "
                            "against"], None
     try:
-        raw = open(fp, "rb").read()
+        if callable(getattr(engine, "read_verified_bench", None)):
+            raw = engine.read_verified_bench("bench/fitted.yaml")
+        else:
+            raw = open(fp, "rb").read()
         doc = yaml.safe_load(raw) or {}
-    except (OSError, yaml.YAMLError) as e:
+    except (OSError, ValueError, yaml.YAMLError) as e:
         return eff, None, [f"refit required: fitted values {fp} are unreadable ({e})"], None
     probs = fitted_problems(doc, pack) + _fit_context_problems(doc, engine)
     fparams = doc.get("parameters") or {}
@@ -402,12 +405,12 @@ def _fit_context_problems(doc: dict, engine) -> list[str]:
     """The fitting context (which engine the fit ran on) must be the current engine: the runner's stamp, and the same
     engine name, version, code and configured structure (and constructor configuration, when the engine has one).
     The stamp's params_sha256 is the pre-fit parameter identity, not part of the context, and is not compared."""
-    from toolkit.engines import contract as C
+    from toolkit.engines import identity as _ID
     from toolkit.engines.benchmark import PRODUCER, config_digest
     if doc.get("producer") != PRODUCER:
         return [f"refit required: the fitted values were not written by {PRODUCER} (no fitting context)"]
     try:
-        cur = C.engine_identity(engine)
+        cur = _ID.engine_identity(engine)
     except Exception as e:  # noqa: BLE001 -- no identity: the fitting context cannot be verified
         return [f"refit required: the engine's identity cannot be computed to check the fitting context ({e})"]
     st = doc.get("engine_identity") or {}
@@ -425,9 +428,10 @@ def load_evidence(engine, pack: dict | None = None, rows: list | None = None, pa
     benchmark list or fails the source check; rows scored against other declarations ('rerun required'); pack
     benchmarks with no stored row ('not yet run'); fitted values without current provenance ('refit required'). Only an exact self-test toy may have
     no pack."""
-    from toolkit.engines.contract import engine_identity
-    ref = f"{type(engine).__module__}:{type(engine).__name__}"
-    toy = ref in TOY_ENGINE_REFS
+    from toolkit.engines.identity import engine_identity
+    raw_ref = f"{type(engine).__module__}:{type(engine).__name__}"
+    ref = getattr(type(engine), "ENGINE_REF", None) or raw_ref
+    toy = raw_ref in TOY_ENGINE_REFS
     probs = []
     if pack is not None and isinstance(pack, dict) and pack.get("engine") != ref:   # an explicit pack, bound to the class
         probs.append(f"the pack is for engine {pack.get('engine')!r}, not the engine supplied ({ref})")

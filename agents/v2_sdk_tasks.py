@@ -469,15 +469,47 @@ def _engine_secret_path(path_str: str) -> bool:
     return any(seg in low for seg in ENGINE_SECRET_PARTS) or "/.hidden/" in low or low.endswith("/.hidden")
 
 
-def _outside_runs_tree(base: str, root: str) -> bool:
-    """True when `base` lies outside `root` (the current run dir) and inside ANY other run directory
-    or `runs/` tree (docs/design/agent-built-engines.md §3.1, BE21)."""
+def _outside_runs_tree(base: str, root: str, tool: str = "Read", limit: int = 20000) -> bool:
+    """True when `base` lies outside `root` (the current run dir) and inside or able to reach ANY
+    other run directory or `runs/` tree (docs/design/agent-built-engines.md §3.1, BE21)."""
     if _within(base, root):
         return False
     parts = [p.lower() for p in base.replace("\\", "/").split("/") if p]
     if "runs" in parts:
         return True
-    return _in_or_reaches_run(base, "Read")
+    RUN_MARKERS = _sio().RUN_MARKERS
+    marks = ("run_state.json",) + tuple(RUN_MARKERS)
+    up = base
+    while up != os.path.dirname(up):
+        if any(os.path.lexists(os.path.join(up, x)) for x in marks):
+            return True
+        up = os.path.dirname(up)
+    if tool in ("Grep", "Glob") and os.path.isdir(base):
+        n = 0
+        for cur, dirs, files in os.walk(base, followlinks=False):
+            cur_real = os.path.realpath(cur)
+            if _within(cur_real, root):
+                dirs[:] = []
+                continue
+            n += len(dirs) + len(files)
+            if any(x in files for x in marks) or n > limit:
+                return True
+            for d in list(dirs):
+                full = os.path.join(cur, d)
+                if os.path.islink(full):
+                    target_real = os.path.realpath(full)
+                    if not _within(target_real, root) and _in_or_reaches_run(target_real, "Read"):
+                        return True
+    return False
+
+
+_ENGINE_OWN_RE = re.compile(r"^models/ext/engine_([a-z0-9_]{3,24})/?$")
+
+
+def _engine_id_from_owns(owns: tuple) -> str | None:
+    """Extract the sole built-engine id owned by a `build_engine` task from its `owns` tuple (else None)."""
+    found = {m.group(1) for o in (owns or ()) for m in (_ENGINE_OWN_RE.match(str(o)),) if m}
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def _engine_read_denied(tool: str, ti: dict, run_dir: str, kind: str | None = None,
@@ -509,7 +541,7 @@ def _engine_read_denied(tool: str, ti: dict, run_dir: str, kind: str | None = No
                                     else "/" + "/".join(lit).lstrip("/"))
     if _engine_secret_path(base):
         return "engine_build/.hidden, hidden_reveal.json, and reference/ are not readable by any task"
-    if _outside_runs_tree(base, root):
+    if _outside_runs_tree(base, root, tool):
         return f"{tool} outside the current run directory into another run ({base}) is refused"
     # A Grep/Glob inside the run dir that targets engine_build/ directly could reach .hidden/ or reference/
     if tool in ("Grep", "Glob") and _within(base, root):
@@ -522,12 +554,15 @@ def _engine_read_denied(tool: str, ti: dict, run_dir: str, kind: str | None = No
         repo = os.path.realpath(_REPO)
         if _within(base, root):
             rel = os.path.relpath(base, root).replace(os.sep, "/")
-            work_prefix = f"models/ext/engine_{engine_id}/" if engine_id else "models/ext/engine_"
+            work_ok = (
+                bool(engine_id)
+                and (rel == f"models/ext/engine_{engine_id}" or rel.startswith(f"models/ext/engine_{engine_id}/"))
+            )
             allowed_run = (
                 rel in ("decision_spec.yaml", "evidence_dossier.yaml", "_task_input.json",
                         "engine_build/request.json")
-                or rel.startswith(("engine_build/try/", "data/derived/", "data/inputs/acquired/_views/", work_prefix))
-                or rel == work_prefix.rstrip("/")
+                or rel.startswith(("engine_build/try/", "data/derived/", "data/inputs/acquired/_views/"))
+                or work_ok
             )
             if not allowed_run:
                 return f"build_engine may not read {rel} (only request, spec, dossier, schema views, try/, and its working copy)"
@@ -813,7 +848,8 @@ class SdkTasks:
                 if why:
                     return enforcement.deny_output(f"{kind}: {why}")
             if name in ("Read", "Grep", "Glob"):
-                why = _engine_read_denied(name, ti, self.run_dir, kind=kind)
+                eid = _engine_id_from_owns(owns) if kind == "build_engine" else None
+                why = _engine_read_denied(name, ti, self.run_dir, kind=kind, engine_id=eid)
                 if not why and kind == "seed_world_model":
                     why = _seed_read_denied(name, ti, self.run_dir)
                 if why:
@@ -1124,6 +1160,29 @@ def _self_test() -> int:
            and _engine_read_denied("Read", {"file_path": "engine_build/request.json"},
                                    this_run, kind="build_engine", engine_id="x") is None,
            "BE21 read rules refuse .hidden/, reference/, and another run's hidden_reveal.json or files for every task")
+        # BE21b (Codex r1 P1-10 & P1-11): recursive Grep/Glob from neutral parent above two marked runs refused;
+        # build_engine derives engine_id from owns and refuses reading another working copy or with missing engine_id
+        neutral = os.path.join(d, "neutral_parent")
+        r_cur = os.path.join(neutral, "cur_case")
+        r_oth = os.path.join(neutral, "oth_case")
+        os.makedirs(os.path.join(r_cur, "models", "ext", "engine_one"), exist_ok=True)
+        os.makedirs(os.path.join(r_cur, "models", "ext", "engine_two"), exist_ok=True)
+        os.makedirs(r_oth, exist_ok=True)
+        open(os.path.join(r_cur, "run_state.json"), "w").write("{}")
+        open(os.path.join(r_oth, "run_state.json"), "w").write("{}")
+        open(os.path.join(r_cur, "models", "ext", "engine_one", "engine.py"), "w").write("X=1\n")
+        open(os.path.join(r_cur, "models", "ext", "engine_two", "engine.py"), "w").write("X=2\n")
+        eid_one = _engine_id_from_owns(("models/ext/engine_one/",))
+        ok(_engine_read_denied("Grep", {"path": neutral, "pattern": "x"}, r_cur, kind="critique") is not None
+           and _engine_read_denied("Glob", {"path": neutral, "pattern": "**/*.json"}, r_cur, kind="critique") is not None
+           and eid_one == "one"
+           and _engine_read_denied("Read", {"file_path": "models/ext/engine_one/engine.py"},
+                                   r_cur, kind="build_engine", engine_id=eid_one) is None
+           and _engine_read_denied("Read", {"file_path": "models/ext/engine_two/engine.py"},
+                                   r_cur, kind="build_engine", engine_id=eid_one) is not None
+           and _engine_read_denied("Read", {"file_path": "models/ext/engine_one/engine.py"},
+                                   r_cur, kind="build_engine", engine_id=None) is not None,
+           "BE21b neutral-parent Grep/Glob reaching another run is refused, and build_engine is scoped to its own engine_id")
         import validate_critique_yaml as V
         cp = PROMPTS["critique"].format(reviewer="critique-domain", round=1, prev_round=0, file="f", prefix="D", out=OUT,
                                         feedback="\n- X", severities="H", categories=" | ".join(sorted(V.VALID_CATEGORY)),

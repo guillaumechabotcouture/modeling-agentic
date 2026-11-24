@@ -256,7 +256,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         if shipped:
             # a batch computed elsewhere (VM shards) with its exact inputs: rows are checked against the shipped
             # jobs, and the analysis uses the shipped design (batch.load_shipped)
-            from toolkit.engines.contract import engine_identity
+            from toolkit.engines.identity import engine_identity
             design, jobs, res, info = Bt.load_shipped(shipped, spec, design, jobs, eng)
             _safe_io().write_nofollow(run_dir, "analysis/batch/design.json", json.dumps(design, indent=1).encode(),
                                       atomic=True)
@@ -382,7 +382,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
         log(f"expected-value plan: {evp['record']['n_units_differ']} of {len(A.ids)} units differ from the point plan")
     on_plan = []
     point = A.summary(plan, out0, cost0)
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     # Codex r3: the analysis's full engine identity (code, params, config), on both evaluation paths, so later steps
     # (the trajectory step) can be checked against it without batch rows
     point.update(engine_identity=engine_identity(eng))
@@ -691,7 +691,7 @@ def _self_test() -> int:
         pt = R["point"]
         ok(pt["solver"]["status"] == "optimal" and pt["cost_allocated"] <= 9000 * (1 + 1e-9),
            "R4 the plan is a proven optimum within the budget (toolkit/alloc ILP)")
-        from toolkit.engines.contract import engine_identity as _eid
+        from toolkit.engines.identity import engine_identity as _eid
         ok(pt.get("engine_identity") == _eid(spec.engine()),
            "R4b the point artifact records the analysis's full engine identity (emulator path; Codex r3 P1)")
         # F6 S2-4b: ranking near package switches, against engine runs at the calibrated values
@@ -990,7 +990,7 @@ def _self_test() -> int:
         th = R["calibration"]["theta"]
         ok(abs(th["lrr:a"] - math.log(0.6)) < 0.05 and abs(th["lrr:a+b"] - math.log(0.5)) < 0.05,
            f"D1 likelihood calibration recovers the planted package effects ({th})")
-        from toolkit.engines.contract import engine_identity as _eid
+        from toolkit.engines.identity import engine_identity as _eid
         ok((R["point"].get("engine_identity") or {}).get("code_sha256")
            == _eid(schema.load(os.path.join(d, "decision_spec.yaml")).engine())["code_sha256"],
            "D1b the point artifact records the analysis's full engine identity (direct path; Codex r3 P1)")

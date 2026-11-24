@@ -185,7 +185,8 @@ def tasks(A, theta, zs) -> list[dict]:
 def run_task(task: dict) -> dict:
     """The compute.py function: one task's engine runs, with the sha256 of its inputs and the engine identity."""
     from toolkit.analysis import batch as Bt
-    from toolkit.engines.contract import Package, UnitSpec, engine_identity
+    from toolkit.engines.contract import Package, UnitSpec
+    from toolkit.engines.identity import engine_identity
     from toolkit.engines.horizon import make_horizon
     eng = Bt._engine(task["engine"])
     hz = task["horizon"]
@@ -219,7 +220,8 @@ def prefetch(A, drawn, kw) -> list[dict]:
     task, a task whose inputs or engine identity do not match, or a missing member."""
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import compute
-    from toolkit.engines.contract import Outcomes, engine_identity
+    from toolkit.engines.contract import Outcomes
+    from toolkit.engines.identity import engine_identity
     per = [tasks(A, th, zs) for th, zs in drawn]
     flat = [t for ts in per for t in ts]
     t0 = time.time()

@@ -542,7 +542,7 @@ def rebuild(run_dir: str, log=print):
     from toolkit.analysis.artifacts import sha256
     from toolkit.analysis.core import Analysis
     from toolkit.analysis.model import EmulatorModel
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     from toolkit.spec import schema
     run_dir = os.path.abspath(run_dir)
     spec = schema.load(os.path.join(run_dir, "decision_spec.yaml"))

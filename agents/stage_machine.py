@@ -1696,6 +1696,8 @@ class Machine:
                 spec = None
             out += P.derivation_findings(self.run_dir, spec, required=self.st.derived_inputs)
         out += self._geometry_findings()
+        from toolkit.engines.built import worker as BWORK
+        out += BWORK.unsandboxed_findings(self.run_dir)
         return out
 
     def _geometry_findings(self) -> list[dict]:

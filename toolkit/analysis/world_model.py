@@ -1498,7 +1498,7 @@ def load_sweep(run_dir, identity="current", lam=None, use_plan=True):
     from toolkit.analysis.artifacts import read, sha256
     from toolkit.analysis.core import discount_factor
     from toolkit.analysis.model import _driver, _group
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     from toolkit.spec import schema
     need = {"spec": "decision_spec.yaml", "design": "analysis/batch/design.json",
             "results": "analysis/batch/results.jsonl"}

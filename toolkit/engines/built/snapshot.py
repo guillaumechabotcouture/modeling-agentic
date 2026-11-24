@@ -12,9 +12,11 @@ a disease.
 from __future__ import annotations
 
 import ast
+import codecs
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 from collections.abc import Mapping
@@ -30,6 +32,12 @@ MAX_SNAPSHOT_BYTES = 300 * 1024
 REQUIRED_FILES = ("engine.py", "card.yaml", "ENGINE_NOTES.md")
 ALLOWED_NON_PY = frozenset({"card.yaml", "ENGINE_NOTES.md"})
 MAX_INLINE_LITERALS = 16
+_CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+REQUIRED_SIGNOFF_FILES = (
+    "admission.json", "admission_sheet.md",
+    "bench/pack.yaml", "bench/results.yaml", "bench/benchmark_coverage.yaml",
+)
+OPTIONAL_SIGNOFF_FILES = ("bench/fitted.yaml",)
 
 # S2: strict AST import allowlist (§3.2). Anything outside this set is refused before execution.
 ALLOWED_TOP_IMPORTS = frozenset({
@@ -177,8 +185,9 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None) 
     """Run static checks S1-S4 over `{filename: bytes}` (fail closed). Returns list of problems."""
     import yaml
     bad: list[str] = []
-    # S1: file membership, UTF-8 text, no binary/NUL bytes, total size <= 300 KB
+    # S1: file membership, strict UTF-8 text, no binary/NUL bytes, total size <= 300 KB
     total = 0
+    decoded: dict[str, str] = {}
     for name, data in sorted(files.items()):
         if not _allowed_filename(name):
             bad.append(f"S1: disallowed file {name!r} (only .py, card.yaml, ENGINE_NOTES.md at top level)")
@@ -189,6 +198,11 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None) 
         total += len(data)
         if b"\x00" in data:
             bad.append(f"S1: {name} contains binary/NUL bytes")
+            continue
+        try:
+            decoded[name] = bytes(data).decode("utf-8")
+        except UnicodeDecodeError as e:
+            bad.append(f"S1: {name} is not valid UTF-8: {e}")
     for req_f in REQUIRED_FILES:
         if req_f not in files:
             bad.append(f"S1: missing required file {req_f}")
@@ -196,11 +210,11 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None) 
         bad.append(f"S1: total size {total} bytes exceeds limit {MAX_SNAPSHOT_BYTES}")
 
     card_doc = None
-    if "card.yaml" in files:
+    if "card.yaml" in decoded:
         try:
-            card_doc = yaml.safe_load(files["card.yaml"].decode("utf-8"))
-        except (UnicodeDecodeError, yaml.YAMLError) as e:
-            bad.append(f"S1: card.yaml is not valid UTF-8 YAML: {e}")
+            card_doc = yaml.safe_load(decoded["card.yaml"])
+        except yaml.YAMLError as e:
+            bad.append(f"S1: card.yaml is not valid YAML: {e}")
         else:
             if not isinstance(card_doc, Mapping):
                 bad.append("S1: card.yaml must be a YAML mapping")
@@ -212,11 +226,19 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None) 
     large_literal_sites: list[str] = []
 
     for name in py_files:
-        try:
-            src = files[name].decode("utf-8")
-        except UnicodeDecodeError as e:
-            bad.append(f"S1: {name} is not valid UTF-8: {e}")
+        if name not in decoded:
             continue
+        src = decoded[name]
+        # Reject PEP-263 non-UTF-8 coding cookies so static AST and compiled source can never diverge
+        for line in src.splitlines()[:2]:
+            m = _CODING_RE.match(line)
+            if m:
+                try:
+                    norm = codecs.lookup(m.group(1)).name
+                except LookupError:
+                    norm = ""
+                if norm != "utf-8":
+                    bad.append(f"S1: {name}: non-UTF-8 coding declaration {m.group(1)!r} is refused")
         try:
             tree = ast.parse(src, filename=name)
         except SyntaxError as e:
@@ -364,6 +386,21 @@ def create_snapshot(working_dir: str, snapshots_dir: str, *, run_static: bool = 
         if existing == files:
             return manifest
         raise SnapshotTampered(f"existing snapshot {sha[:12]} differs from working copy bytes")
+    if os.path.lexists(snap_dir):
+        # Recover cleanly from an interrupted snapshot creation (e.g. directory locked to 0555 before manifest write)
+        if os.path.islink(snap_dir) or not os.path.isdir(snap_dir):
+            raise SnapshotError(f"snapshot path {sha[:12]} is not a plain directory")
+        dfd_prev = SIO.dir_fd_nofollow(snapshots_dir, [sha])
+        try:
+            os.fchmod(dfd_prev, 0o755)
+            prev_entries = list(os.listdir(dfd_prev))
+        finally:
+            os.close(dfd_prev)
+        for entry in prev_entries:
+            try:
+                SIO.remove_nofollow(snapshots_dir, f"{sha}/{entry}")
+            except (SIO.LinkRefused, OSError) as e:
+                raise SnapshotError(f"cannot clean unpublished snapshot {sha[:12]} entry {entry!r}: {e}") from None
     # Write each file atomically via safe_io (no links followed), then lock down permissions 0444 / 0555
     for name in sorted(files):
         SIO.write_nofollow(snapshots_dir, f"{sha}/{name}", files[name], atomic=True)
@@ -448,6 +485,10 @@ def read_verified_snapshot(snapshots_dir: str, expected_sha: str) -> dict[str, b
     return verified
 
 
+def _is_sha64(v) -> bool:
+    return isinstance(v, str) and len(v) == 64 and all(c in "0123456789abcdef" for c in v)
+
+
 def verify_engine_snapshot(run_dir: str) -> list[str]:
     """Verify the signed built-engine snapshot and admission chain in `run_dir` (empty = intact).
     Called on resume, at every state entry after ENGINE_SIGN, before WRITE, and in the final gate."""
@@ -464,19 +505,46 @@ def verify_engine_snapshot(run_dir: str) -> list[str]:
     if not isinstance(so, dict) or not isinstance(so.get("sha256"), dict):
         return ["artifact_tampered: engine_build/signoff.json malformed"]
     bound = so["sha256"]
-    snap_sha = so.get("snapshot_sha256") or bound.get("snapshot")
-    if not isinstance(snap_sha, str):
-        return ["artifact_tampered: engine_build/signoff.json missing snapshot_sha256"]
+    snap_sha = so.get("snapshot_sha256")
+    bound_snap = bound.get("snapshot")
+    if not _is_sha64(snap_sha) or bound_snap != snap_sha:
+        return ["artifact_tampered: engine_build/signoff.json missing or inconsistent snapshot sha256"]
     snaps_dir = os.path.join(run_dir, "engine_build", "snapshots")
     try:
         read_verified_snapshot(snaps_dir, snap_sha)
     except SnapshotError as e:
         problems.append(f"artifact_tampered: {e}")
-    # Verify bound files (admission.json, admission_sheet.md, bench/*)
-    for rel_key in ("admission.json", "admission_sheet.md", "bench/pack.yaml",
-                    "bench/results.yaml", "bench/benchmark_coverage.yaml"):
+    # Verify ALL mandatory bound files (fail closed when any digest is absent or malformed)
+    adm_doc = None
+    for rel_key in REQUIRED_SIGNOFF_FILES:
         want = bound.get(rel_key)
-        if want is None:
+        if not _is_sha64(want):
+            problems.append(f"artifact_tampered: engine_build/signoff.json missing valid digest for {rel_key}")
+            continue
+        try:
+            b, st = SIO.read_nofollow(run_dir, f"engine_build/{rel_key}")
+            if st.st_nlink > 1:
+                problems.append(f"artifact_tampered: engine_build/{rel_key} has multiple hard links")
+            elif _sha256_bytes(b) != want:
+                problems.append(f"artifact_tampered: engine_build/{rel_key} digest mismatch")
+            elif rel_key == "admission.json":
+                try:
+                    adm_doc = json.loads(b.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError) as e:
+                    problems.append(f"artifact_tampered: engine_build/admission.json invalid JSON: {e}")
+        except (FileNotFoundError, SIO.LinkRefused, OSError) as e:
+            problems.append(f"artifact_tampered: engine_build/{rel_key} unreadable: {e}")
+    if isinstance(adm_doc, dict):
+        if adm_doc.get("status") != "admitted" or adm_doc.get("snapshot_sha256") != snap_sha:
+            problems.append("artifact_tampered: engine_build/admission.json status or snapshot_sha256 inconsistent")
+    # Optional bound files (e.g. bench/fitted.yaml): verify whenever signed OR present on disk
+    for rel_key in OPTIONAL_SIGNOFF_FILES:
+        want = bound.get(rel_key)
+        on_disk = os.path.lexists(os.path.join(run_dir, "engine_build", rel_key))
+        if want is None and not on_disk:
+            continue
+        if not _is_sha64(want):
+            problems.append(f"artifact_tampered: engine_build/{rel_key} present without valid signed digest")
             continue
         try:
             b, st = SIO.read_nofollow(run_dir, f"engine_build/{rel_key}")
@@ -586,6 +654,35 @@ def _self_test() -> int:
             mod_refused = "digest mismatch" in str(e)
         ok(mod_refused, "BE19d modified snapshot file is refused before compile")
         os.chmod(sdir, 0o755)
+
+    # Regressions: P3-1 non-UTF-8 ENGINE_NOTES.md, P1-16 latin-1 coding cookie, P2-5 interrupted snapshot, P1-5 empty sha256
+    ok(any("ENGINE_NOTES.md" in e and "UTF-8" in e for e in check_static({**base_files, "ENGINE_NOTES.md": b"\xff"})),
+       "BE12c S1 refuses non-UTF-8 ENGINE_NOTES.md")
+    ok(any("coding declaration" in e for e in check_static({**base_files, "engine.py": b"# coding: latin-1\nX = 'caf\xc3\xa9'\n"})),
+       "BE12d S1 refuses non-UTF-8 PEP-263 coding declaration")
+    with tempfile.TemporaryDirectory() as td:
+        work = os.path.join(td, "working")
+        snaps = os.path.join(td, "snapshots")
+        os.makedirs(work)
+        for n, b in base_files.items():
+            open(os.path.join(work, n), "wb").write(b)
+        man = create_snapshot(work, snaps)
+        sha = man["snapshot_sha256"]
+        os.remove(os.path.join(snaps, f"{sha}.json"))  # simulate crash after 0555 chmod, before manifest write
+        man2 = create_snapshot(work, snaps)
+        ok(man2["snapshot_sha256"] == sha and read_verified_snapshot(snaps, sha) == base_files,
+           "BE19f create_snapshot recovers cleanly when interrupted between 0555 lock and manifest publish")
+        # P1-5: verify_engine_snapshot refuses signoff.json with empty sha256 map even with intact snapshot
+        run_d = os.path.join(td, "run")
+        os.makedirs(os.path.join(run_d, "engine_build", "snapshots"))
+        man3 = create_snapshot(work, os.path.join(run_d, "engine_build", "snapshots"))
+        open(os.path.join(run_d, "engine_build", "signoff.json"), "w").write(
+            json.dumps({"by": "owner", "snapshot_sha256": man3["snapshot_sha256"], "sha256": {}})
+        )
+        empty_probs = verify_engine_snapshot(run_d)
+        ok(bool(empty_probs), f"BE19g verify_engine_snapshot fails closed on missing bound digests ({empty_probs[:2]})")
+        os.chmod(os.path.join(snaps, sha), 0o755)
+        os.chmod(os.path.join(run_d, "engine_build", "snapshots", man3["snapshot_sha256"]), 0o755)
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

@@ -156,7 +156,7 @@ def net_effect_sample(spec, eng, fitted: dict | None = None, priors: dict | None
     if "engine_parameters" in src:
         varied.update({k: tuple(v[:2]) for k, v in fitted.items()})
     varied = {k: v for k, v in varied.items() if k not in held}
-    from toolkit.engines.contract import engine_identity      # Codex r1 P2-3: the engine is part of what was verified
+    from toolkit.engines.identity import engine_identity      # Codex r1 P2-3: the engine is part of what was verified
     import json as _json
     key = (post["sha256"], post["margin"], tuple(sorted(varied)), tuple(sorted(engine_identity(eng).items())),
            _json.dumps(post.get("exception"), sort_keys=True))

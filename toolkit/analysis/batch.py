@@ -306,7 +306,7 @@ def _engine(ref):
 def run_job(job: dict) -> dict:
     """One engine run (the compute.py function), with its provenance: the job's input hash and the engine's identity
     and code fingerprint (Codex P1-3). Engine instances are cached per process."""
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     eng = _engine(job["engine"])
     hz = job["horizon"]
     h = make_horizon(hz["start"], hz["stop"], hz["window"], job.get("windows"), hz.get("delivery"))
@@ -333,7 +333,7 @@ def point_groups(jobs: list[dict]) -> list[dict]:
 def run_point(group: dict) -> dict:
     """The compute.py function for a shared-state engine: one point's jobs in one run_batch call. Each row carries
     its own job's provenance, as run_job's does."""
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     jobs = group["jobs"]
     j0 = jobs[0]
     for j in jobs[1:]:
@@ -360,7 +360,7 @@ def run(run_dir: str, jobs: list[dict], engine, out_rel: str = "analysis/batch/r
     import compute
     out = os.path.join(run_dir, out_rel)
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     key = {"engine": engine_identity(engine)}      # W0-A: the engine identity is a part of the rows' reuse key
     if not shares_state(engine):
         inputs = [{k: v for k, v in j.items() if k != "id"} for j in jobs]
@@ -391,7 +391,7 @@ def run(run_dir: str, jobs: list[dict], engine, out_rel: str = "analysis/batch/r
 def verify_rows(rows: list[dict], jobs: list[dict], engine) -> tuple[dict, list[str]]:
     """Keep a row only when it carries harness provenance matching its job's full inputs and the current engine
     identity and code (Codex P1-3). Rows: {"id", "result": {"result", "provenance"}} (compute.py format)."""
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     ident = engine_identity(engine)
     want = {j["id"]: job_sha(j) for j in jobs}
     res, bad = {}, []
@@ -432,7 +432,7 @@ def adopt(run_dir: str, src_results: str, src_jobs: str, src_design: str, jobs: 
     deterministic sample of jobs is re-run with the current engine and must reproduce the stored results. The adopted
     rows are then written with harness provenance (`adopted_from`); anything short of that fails closed."""
     from toolkit.analysis.artifacts import sha256
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     sd = json.load(open(src_design))
     if sd.get("platform") is not None and not same_platform(sd["platform"], platform_info()):
         # the replay below would recompute here what another platform computed; stochastic simulation amplifies

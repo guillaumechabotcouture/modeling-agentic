@@ -5,15 +5,17 @@
     python3 toolkit/engines/built/worker.py --self-test
 
 The harness reads verified snapshot bytes ONCE, sends them to this worker inside an explicit
-minimal-mount bubblewrap sandbox (`_bwrap_engine_cmd`: interpreter prefix, allowed site-packages,
+minimal-mount bubblewrap sandbox (`_bwrap_engine_cmd`: interpreter prefix, standard site-packages,
 `contract.py`, `hooks.py`, `/proc`, `/dev`, private tmpfs — no repo, no home, no run directory, no
-network), compiles each module from those verified bytes, enforces opaque unit/package IDs,
-`TrackedParams`, `BalanceAnalyzer`, and harness-computed `meta.age_shares`. Nothing here names a
-disease.
+network), compiles each module from decoded UTF-8 verified source, enforces opaque unit/package IDs,
+phased `TrackedParams`, `BalanceAnalyzer`, bounded output pipes, and harness-computed
+`meta.age_shares`. Nothing here names a disease.
 """
 from __future__ import annotations
 
 import base64
+import copy
+import datetime as _dt
 import hashlib
 import importlib.abc
 import importlib.machinery
@@ -21,9 +23,12 @@ import json
 import math
 import os
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 from collections.abc import Mapping
 
@@ -36,6 +41,15 @@ DEFAULT_LIMITS = {
     "memory_bytes": 4 * 1024 ** 3,
     "file_bytes": 64 * 1024 ** 2,
 }
+MAX_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_STDERR_BYTES = 256 * 1024
+UNSANDBOXED_MARKER = "engine_build/unsandboxed.json"
+AGE_POP_ATTR_PRIORITY = (
+    "age_population", "age_populations", "age_pop", "population_by_age", "pop_by_age",
+    "age_shares", "age_weights", "age_distribution",
+)
+_AGE_POP_INCLUDE = ("pop", "share", "weight", "dist")
+_AGE_POP_EXCLUDE = ("contact", "rate", "mort", "hazard", "eff")
 _SANDBOX_CACHE: list[str | None] = []
 
 
@@ -54,15 +68,71 @@ def unsandboxed_finding(reason: str = "no bubblewrap sandbox available (developm
         "severity": "HIGH",
         "stage": "ENGINE_ADMIT",
         "target_stage": "ENGINE",
+        "key": "engine_sandbox",
         "claim": f"agent-built engine ran without the bubblewrap sandbox ({reason}); a run using the "
                  "unsandboxed development override cannot reach ACCEPT",
         "scope_declarable": False,
     }
 
 
+def _safe_io():
+    scripts = os.path.join(ROOT, "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from lib import safe_io as SIO
+    return SIO
+
+
+def record_unsandboxed(run_dir: str, *, action: str, engine_id: str | None = None,
+                       reason: str = "no bubblewrap sandbox available (development override)") -> None:
+    """Atomically persist a durable harness marker whenever a built engine runs unsandboxed (BE35)."""
+    SIO = _safe_io()
+    existing_actions: list[str] = []
+    try:
+        raw, _ = SIO.read_nofollow(run_dir, UNSANDBOXED_MARKER)
+        prev = json.loads(raw.decode("utf-8"))
+        if isinstance(prev, dict) and isinstance(prev.get("actions"), list):
+            existing_actions = [str(a) for a in prev["actions"]]
+    except (FileNotFoundError, SIO.LinkRefused, OSError, UnicodeDecodeError, ValueError):
+        pass
+    if action not in existing_actions:
+        existing_actions.append(str(action))
+    rec = {
+        "unsandboxed": True,
+        "engine_id": engine_id,
+        "actions": existing_actions,
+        "reason": str(reason),
+        "platform": sys.platform,
+        "recorded_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }
+    SIO.write_nofollow(run_dir, UNSANDBOXED_MARKER, json.dumps(rec, indent=1, sort_keys=True).encode("utf-8"),
+                       atomic=True)
+
+
+def unsandboxed_findings(run_dir: str) -> list[dict]:
+    """Gate view of durable unsandboxed built-engine execution markers (empty = sandboxed / unused)."""
+    marker_path = os.path.join(run_dir, UNSANDBOXED_MARKER)
+    if not os.path.lexists(marker_path):
+        return []
+    SIO = _safe_io()
+    try:
+        raw, st = SIO.read_nofollow(run_dir, UNSANDBOXED_MARKER)
+        if st.st_nlink > 1:
+            return [unsandboxed_finding("engine_build/unsandboxed.json has multiple hard links")]
+        doc = json.loads(raw.decode("utf-8"))
+    except (SIO.LinkRefused, OSError, UnicodeDecodeError, ValueError) as e:
+        return [unsandboxed_finding(f"engine_build/unsandboxed.json unreadable or tampered ({e})")]
+    if isinstance(doc, dict) and doc.get("unsandboxed") is False:
+        return []
+    reason = doc.get("reason") if isinstance(doc, dict) and doc.get("reason") else (
+        "no bubblewrap sandbox available (development override)"
+    )
+    return [unsandboxed_finding(str(reason))]
+
+
 def _ro_mount_prefixes() -> list[str]:
-    """Minimal read-only runtime paths needed for `python -I` + numpy/scipy/starsim without mounting `/`
-    or the repository or the run directory or any home/temp directory."""
+    """Minimal read-only runtime paths needed for Python + numpy/scipy/starsim without mounting `/`,
+    the repository, any run directory, home/temp directories, or arbitrary `sys.path` entries."""
     mounts: list[str] = []
     seen: set[str] = set()
     repo_real = os.path.realpath(ROOT)
@@ -74,9 +144,13 @@ def _ro_mount_prefixes() -> list[str]:
         for target in dict.fromkeys((path, real)):
             if target in seen or target == "/":
                 continue
-            # Never mount the whole repo root or /tmp or /home directly
             if target in ("/tmp", "/var", "/home", "/root", repo_real):
                 continue
+            if target.startswith(repo_real + os.sep):
+                rel = os.path.relpath(target, repo_real).replace(os.sep, "/")
+                if not rel.startswith((".venv/", "venv/", ".venv", "venv")) or rel in (".venv", "venv"):
+                    if rel not in (".venv", "venv"):
+                        continue
             if any(target.startswith(m.rstrip("/") + "/") for m in seen if os.path.isdir(m)):
                 continue
             seen.add(target)
@@ -86,28 +160,30 @@ def _ro_mount_prefixes() -> list[str]:
     for base in ("/usr", "/etc/ld.so.cache", "/etc/alternatives"):
         if os.path.exists(base):
             add_ro(base)
-    # Python prefix & executable location (e.g. /opt/hostedtoolcache or venv, NOT its parent dirs)
-    for cand in (sys.prefix, sys.base_prefix, os.path.dirname(os.path.abspath(sys.executable)),
-                 os.path.dirname(os.path.realpath(sys.executable))):
+    # Python interpreter prefixes & executable directory (never arbitrary sys.path entries)
+    for cand in (
+        sys.prefix,
+        sys.base_prefix,
+        sys.exec_prefix,
+        sys.base_exec_prefix,
+        os.path.dirname(os.path.abspath(sys.executable)),
+        os.path.dirname(os.path.realpath(sys.executable)),
+    ):
         if cand:
             add_ro(cand)
-    # Also ensure sys.path library directories outside the repo are mounted
-    for sp in sys.path:
-        if not sp or not os.path.isdir(sp):
-            continue
-        r = os.path.realpath(sp)
-        if r == repo_real or r.startswith(repo_real + os.sep):
-            # Allow a repo-local venv (e.g. .venv/lib/...) without mounting the repo itself
-            rel = os.path.relpath(r, repo_real).replace(os.sep, "/")
-            if not rel.startswith((".venv/", "venv/")):
-                continue
-        add_ro(r)
+    # Official site-packages directories only (never user-site or arbitrary sys.path entries)
+    try:
+        for sp in site.getsitepackages():
+            if sp and os.path.isdir(sp):
+                add_ro(sp)
+    except AttributeError:
+        pass
     return mounts
 
 
 def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str]) -> list[str]:
     """Build the minimal-mount bubblewrap command (§5.1): NO `--ro-bind / /`.
-    Mounts ONLY the interpreter/library prefixes, `contract.py`, `hooks.py`, `worker.py`,
+    Mounts ONLY the interpreter/site-packages prefixes, `contract.py`, `hooks.py`, `worker.py`,
     `/proc`, `/dev`, and a private `--tmpfs /tmp`."""
     uid, gid = str(os.getuid()), str(os.getgid())
     if kind == "bwrap":
@@ -119,7 +195,6 @@ def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str]) -> list[s
                 "--inh-caps=-all", "--bounding-set=-all", "--"]
 
     binds: list[str] = []
-    # Top-level OS links or directories (/bin, /lib, /lib64)
     for top in ("/bin", "/lib", "/lib64"):
         if os.path.islink(top):
             binds += ["--symlink", os.readlink(top), top]
@@ -179,7 +254,7 @@ def _minimal_env(hash_seed: str = "0") -> dict[str, str]:
 def _probe_engine_bwrap(kind: str) -> bool:
     env = _minimal_env("0")
     envargs = [a for k, v in env.items() for a in ("--setenv", k, v)]
-    cmd = _bwrap_engine_cmd(kind, envargs, [sys.executable, "-I", "/harness/worker.py", "_probe"])
+    cmd = _bwrap_engine_cmd(kind, envargs, [sys.executable, "-s", "-B", "/harness/worker.py", "_probe"])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
         return r.returncode == 0 and r.stdout.strip() == "OK"
@@ -201,40 +276,147 @@ def engine_sandbox_kind() -> str | None:
     return kind
 
 
+def _run_bounded_subprocess(
+    cmd: list[str],
+    stdin_bytes: bytes,
+    *,
+    timeout_s: float,
+    cwd: str | None,
+    env: dict[str, str] | None,
+    max_stdout: int,
+    max_stderr: int,
+) -> tuple[int, bytes, bytes]:
+    """Run subprocess with hard parent-side bounds on stdout and stderr, killing child immediately
+    on overflow or timeout so runaway worker output can never exhaust harness memory."""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+    )
+    out_buf = bytearray()
+    err_buf = bytearray()
+    overflow: list[tuple[str, int]] = []
+    lock = threading.Lock()
+
+    def _feed():
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(stdin_bytes)
+            proc.stdin.flush()
+        except OSError:
+            pass
+        finally:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except OSError:
+                pass
+
+    def _drain(stream, buf: bytearray, cap: int, name: str):
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                if len(buf) + len(chunk) > cap:
+                    with lock:
+                        if not overflow:
+                            overflow.append((name, cap))
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    break
+                buf.extend(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    t_in = threading.Thread(target=_feed, daemon=True)
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, out_buf, max_stdout, "stdout"), daemon=True)
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, err_buf, max_stderr, "stderr"), daemon=True)
+    t_in.start()
+    t_out.start()
+    t_err.start()
+
+    deadline = time.monotonic() + max(timeout_s, 0.1)
+    timed_out = False
+    try:
+        rc = proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        rc = proc.wait()
+    for t in (t_in, t_out, t_err):
+        t.join(timeout=2.0)
+
+    if timed_out:
+        raise WorkerError(f"engine worker timed out after {timeout_s}s")
+    if overflow:
+        which, cap = overflow[0]
+        raise WorkerError(f"engine worker exceeded {which} output limit ({cap} bytes)")
+    return rc, bytes(out_buf), bytes(err_buf)
+
+
 # --------------------------------------------------------------------------- in-worker runtime
 class TrackedParams(dict):
-    """Parameter dict recording every parameter key accessed by model code."""
+    """Parameter dict recording every parameter key accessed per execution phase (`build` vs `read_outcomes`)."""
 
     def __init__(self, initial: Mapping[str, float]):
         super().__init__({str(k): float(v) for k, v in initial.items()})
+        self._phase = "build"
+        self.reads_by_phase: dict[str, set[str]] = {"build": set(), "read_outcomes": set()}
         self.reads: set[str] = set()
 
+    def set_phase(self, phase: str) -> None:
+        self._phase = phase
+        self.reads_by_phase.setdefault(phase, set())
+
+    def _record(self, key) -> None:
+        sk = str(key)
+        self.reads.add(sk)
+        self.reads_by_phase[self._phase].add(sk)
+
+    def _record_all(self) -> None:
+        for k in self.keys():
+            self._record(k)
+
     def __getitem__(self, key):
-        self.reads.add(str(key))
+        self._record(key)
         return super().__getitem__(key)
 
     def get(self, key, default=None):
-        if key in self:
-            self.reads.add(str(key))
+        if super().__contains__(key):
+            self._record(key)
             return super().__getitem__(key)
         return default
 
     def __contains__(self, key):
         if super().__contains__(key):
-            self.reads.add(str(key))
+            self._record(key)
             return True
         return False
 
     def values(self):
-        self.reads.update(self.keys())
+        self._record_all()
         return super().values()
 
     def items(self):
-        self.reads.update(self.keys())
+        self._record_all()
         return super().items()
 
     def copy(self):
-        self.reads.update(self.keys())
+        self._record_all()
         return dict(self)
 
 
@@ -242,23 +424,42 @@ def _opaque_id(salt: str, raw_id: str) -> str:
     return hashlib.sha256(f"{salt}:{raw_id}".encode("utf-8")).hexdigest()[:16]
 
 
+def _normalize_age_vec(age_groups: list[str], vec) -> dict[str, float] | None:
+    if not (isinstance(vec, (list, tuple)) and len(vec) == len(age_groups)):
+        return None
+    try:
+        fv = [float(x) for x in vec]
+    except (TypeError, ValueError):
+        return None
+    tot = sum(fv)
+    if tot > 0 and all(math.isfinite(x) and x >= 0 for x in fv):
+        return {str(g): x / tot for g, x in zip(age_groups, fv)}
+    return None
+
+
 def _compute_age_shares(age_groups: list[str], unit_attrs: Mapping, override_shares: Mapping | None) -> dict[str, float]:
-    """Harness-computed `meta.age_shares` — always overwrites whatever the model returned (BE14)."""
+    """Harness-computed `meta.age_shares` — always overwrites whatever the model returned (BE14).
+    Deterministic and independent of attribute dict insertion order; ignores non-population vectors."""
     if isinstance(override_shares, Mapping) and override_shares:
         vals = {str(g): float(override_shares.get(g, 0.0)) for g in age_groups}
         tot = sum(vals.values())
         if tot > 0 and all(math.isfinite(v) and v >= 0 for v in vals.values()):
             return {g: v / tot for g, v in vals.items()}
-    # Check for an age population vector attribute whose length matches age_groups
-    for k, v in (unit_attrs or {}).items():
-        if isinstance(v, (list, tuple)) and len(v) == len(age_groups) and "age" in str(k).lower():
-            try:
-                fv = [float(x) for x in v]
-            except (TypeError, ValueError):
-                continue
-            tot = sum(fv)
-            if tot > 0 and all(math.isfinite(x) and x >= 0 for x in fv):
-                return {str(g): x / tot for g, x in zip(age_groups, fv)}
+    attrs = unit_attrs or {}
+    lower_map = {str(k).lower(): attrs[k] for k in sorted(attrs, key=str)}
+    # 1. Exact priority population-vector attribute names
+    for pname in AGE_POP_ATTR_PRIORITY:
+        if pname in lower_map:
+            norm = _normalize_age_vec(age_groups, lower_map[pname])
+            if norm is not None:
+                return norm
+    # 2. Deterministic fallback: sorted keys containing 'age' + a population/share token, excluding non-population keys
+    for k in sorted(lower_map):
+        if ("age" in k and any(tok in k for tok in _AGE_POP_INCLUDE)
+                and not any(tok in k for tok in _AGE_POP_EXCLUDE)):
+            norm = _normalize_age_vec(age_groups, lower_map[k])
+            if norm is not None:
+                return norm
     n = max(len(age_groups), 1)
     return {str(g): 1.0 / n for g in age_groups}
 
@@ -288,29 +489,32 @@ class _SnapshotFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
 
 def _exec_verified_bytes(src_bytes: bytes, filename: str, namespace: dict) -> None:
-    """The ONE audited verified-bytes compile/exec site (scripts/import_audit.py, BE36)."""
-    code = compile(src_bytes, filename, "exec")
+    """The ONE audited verified-bytes compile/exec site (scripts/import_audit.py, BE36).
+    Decodes strict UTF-8 BEFORE compile so PEP-263 coding declarations can never diverge from S1-S4 AST."""
+    src_text = src_bytes.decode("utf-8")
+    code = compile(src_text, filename, "exec")
     exec(code, namespace)  # noqa: S102 -- verified snapshot bytes inside minimal-mount sandbox
 
 
 def _load_model_from_bytes(files: dict[str, bytes], config: dict):
-    """Compile verified snapshot bytes into isolated in-memory module namespace and construct Model."""
+    """Compile verified snapshot bytes into isolated in-memory module namespace and construct Model.
+    Keeps `_SnapshotFinder` active in `sys.meta_path` so method-local sibling imports resolve."""
     if "engine.py" not in files:
         raise WorkerError("snapshot has no engine.py")
+    # Remove any stale snapshot finder/modules from an earlier load
+    sys.meta_path[:] = [f for f in sys.meta_path if not isinstance(f, _SnapshotFinder)]
+    for mname in [m for m in sys.modules if m == "_built_snapshot" or m.startswith("_built_snapshot.")]:
+        sys.modules.pop(mname, None)
     pkg = types.ModuleType("_built_snapshot")
     pkg.__path__ = []
     sys.modules["_built_snapshot"] = pkg
     finder = _SnapshotFinder(files)
     sys.meta_path.insert(0, finder)
-    try:
-        mod = types.ModuleType("_built_snapshot.engine")
-        mod.__package__ = "_built_snapshot"
-        mod.__file__ = "<snapshot>/engine.py"
-        sys.modules["_built_snapshot.engine"] = mod
-        _exec_verified_bytes(files["engine.py"], mod.__file__, mod.__dict__)
-    finally:
-        if finder in sys.meta_path:
-            sys.meta_path.remove(finder)
+    mod = types.ModuleType("_built_snapshot.engine")
+    mod.__package__ = "_built_snapshot"
+    mod.__file__ = "<snapshot>/engine.py"
+    sys.modules["_built_snapshot.engine"] = mod
+    _exec_verified_bytes(files["engine.py"], mod.__file__, mod.__dict__)
     model_cls = getattr(mod, "Model", None)
     if not isinstance(model_cls, type):
         raise WorkerError("engine.py must define class Model")
@@ -382,14 +586,16 @@ def _run_one(model, kind: str, params_in: dict, unit_d: dict, pkg_d: dict, hor_d
 
     resolved = resolve_params(model, params_in)
     card = model.describe()
-    opaque_u = UnitSpec(_opaque_id(id_salt, str(unit_d["id"])), dict(unit_d.get("attributes") or {}))
-    opaque_p = Package(_opaque_id(id_salt, str(pkg_d["id"])), dict(pkg_d.get("components") or {}))
+    # Compute authoritative age_shares BEFORE invoking model code so in-place mutation cannot poison them
+    raw_attrs = copy.deepcopy(unit_d.get("attributes") or {})
+    auth_age_shares = _compute_age_shares(list(card.age_groups), raw_attrs, age_shares_override)
+    opaque_u = UnitSpec(_opaque_id(id_salt, str(unit_d["id"])), copy.deepcopy(raw_attrs))
+    opaque_p = Package(_opaque_id(id_salt, str(pkg_d["id"])), copy.deepcopy(pkg_d.get("components") or {}))
     hor = Horizon(float(hor_d["start"]), float(hor_d["stop"]), tuple(hor_d["window"]),
                   {str(k): list(v) for k, v in (hor_d.get("windows") or {}).items()})
 
     t_build = TrackedParams(resolved)
     balance_info: dict = {}
-    outcome_reads: list[str] = []
 
     if kind == "starsim_module":
         sim = model.build_sim(t_build, opaque_u, opaque_p, hor)
@@ -403,6 +609,7 @@ def _run_one(model, kind: str, params_in: dict, unit_d: dict, pkg_d: dict, hor_d
                 an = _make_balance_analyzer(sv)
                 sim.pars.analyzers += [an]
         sim.run()
+        t_build.set_phase("read_outcomes")
         out = model.read_outcomes(sim, opaque_u, opaque_p, hor)
         if an is not None:
             totals = [sum(step.values()) for step in an.steps] if an.steps else []
@@ -421,20 +628,35 @@ def _run_one(model, kind: str, params_in: dict, unit_d: dict, pkg_d: dict, hor_d
 
     if not isinstance(out, Outcomes):
         raise WorkerError(f"model did not return Outcomes (got {type(out).__name__})")
-    # Always overwrite meta.age_shares from harness computation (BE14)
+    # Always strip/overwrite harness-owned meta keys so model code can never forge them (BE14)
     meta = dict(out.meta or {})
-    meta["age_shares"] = _compute_age_shares(list(card.age_groups), opaque_u.attributes, age_shares_override)
-    meta["param_reads"] = {"build": sorted(t_build.reads), "read_outcomes": sorted(outcome_reads)}
+    meta.pop("balance", None)
+    meta.pop("param_reads", None)
+    meta.pop("age_shares", None)
+    meta["age_shares"] = auth_age_shares
+    meta["param_reads"] = {
+        "build": sorted(t_build.reads_by_phase["build"]),
+        "read_outcomes": sorted(t_build.reads_by_phase["read_outcomes"]),
+    }
     if balance_info:
         meta["balance"] = balance_info
     out = Outcomes(per_capita=out.per_capita, windows=out.windows, cost_drivers=out.cost_drivers, meta=meta)
     return _serialize_outcomes(out)
 
 
+def _strip_cwd_from_sys_path() -> None:
+    """Remove empty/cwd/temp entries from sys.path when running under `python -s -B`."""
+    bad = {"", os.getcwd(), os.path.realpath(os.getcwd()), "/tmp", tempfile.gettempdir()}
+    sys.path[:] = [p for p in sys.path if p not in bad and os.path.realpath(p) not in bad]
+
+
 def _worker_child() -> int:
     """Subprocess entrypoint inside the minimal-mount sandbox (or dev override). Reads one JSON
-    request from stdin, executes against verified bytes only, writes JSON response to stdout."""
-    # Under `python -I`, PYTHONPATH is ignored; add this script's own directory (/harness or repo root)
+    request from stdin, executes against verified bytes only, writes JSON response ONLY to the
+    saved protocol stdout (redirecting model `print(...)` to stderr)."""
+    proto_out = sys.stdout
+    sys.stdout = sys.stderr
+    _strip_cwd_from_sys_path()
     here_dir = os.path.dirname(os.path.abspath(__file__))
     if os.path.isfile(os.path.join(here_dir, "toolkit", "engines", "contract.py")):
         sys.path.insert(0, here_dir)
@@ -479,12 +701,14 @@ def _worker_child() -> int:
             result = results
         else:
             raise WorkerError(f"unknown worker action {action!r}")
-        sys.stdout.write(json.dumps({"ok": True, "result": result}))
+        proto_out.write(json.dumps({"ok": True, "result": result}))
+        proto_out.flush()
         return 0
     except Exception as e:  # noqa: BLE001 -- structured error back to harness
         import traceback
         tb = traceback.format_exc().splitlines()[-6:]
-        sys.stdout.write(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": tb}))
+        proto_out.write(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "traceback": tb}))
+        proto_out.flush()
         return 1
 
 
@@ -508,6 +732,9 @@ def run_in_worker(
         raise EngineUnsandboxed("engine_unsandboxed: no bubblewrap sandbox available (pass unsandboxed_ok=True "
                                 "for local development only; unsandboxed runs cannot reach ACCEPT)")
     lim = dict(DEFAULT_LIMITS, **(limits or {}))
+    file_cap = int(lim.get("file_bytes", DEFAULT_LIMITS["file_bytes"]))
+    max_stdout = min(MAX_STDOUT_BYTES, int(lim.get("max_stdout_bytes", file_cap)))
+    max_stderr = min(MAX_STDERR_BYTES, int(lim.get("max_stderr_bytes", file_cap)))
     req = {
         "files_b64": {str(k): base64.b64encode(bytes(v)).decode("ascii") for k, v in verified_files.items()},
         "kind": str(kind),
@@ -522,22 +749,28 @@ def run_in_worker(
     wall_s = float(lim.get("wall_s", 120))
     if sb is not None:
         envargs = [a for k, v in env.items() for a in ("--setenv", k, v)]
-        cmd = _bwrap_engine_cmd(sb, envargs, [sys.executable, "-I", "/harness/worker.py", "_worker_child"])
+        cmd = _bwrap_engine_cmd(sb, envargs, [sys.executable, "-s", "-B", "/harness/worker.py", "_worker_child"])
         run_cwd = None
         run_env = None
     else:
-        cmd = [sys.executable, "-I", os.path.abspath(__file__), "_worker_child"]
+        cmd = [sys.executable, "-s", "-B", os.path.abspath(__file__), "_worker_child"]
         run_cwd = tempfile.gettempdir()
         run_env = env
+    rc, out_b, err_b = _run_bounded_subprocess(
+        cmd,
+        json.dumps(req).encode("utf-8"),
+        timeout_s=wall_s,
+        cwd=run_cwd,
+        env=run_env,
+        max_stdout=max_stdout,
+        max_stderr=max_stderr,
+    )
+    out_s = out_b.decode("utf-8", errors="replace")
+    err_s = err_b.decode("utf-8", errors="replace")
     try:
-        proc = subprocess.run(cmd, input=json.dumps(req), capture_output=True, text=True,
-                              timeout=wall_s, cwd=run_cwd, env=run_env)
-    except subprocess.TimeoutExpired:
-        raise WorkerError(f"engine worker timed out after {wall_s}s") from None
-    try:
-        resp = json.loads(proc.stdout)
+        resp = json.loads(out_s)
     except ValueError:
-        raise WorkerError(f"engine worker failed (rc={proc.returncode}): {(proc.stderr or proc.stdout)[-400:]}") from None
+        raise WorkerError(f"engine worker failed (rc={rc}): {(err_s or out_s)[-400:]}") from None
     if not resp.get("ok"):
         raise WorkerError(f"engine worker error: {resp.get('error')} | {' / '.join(resp.get('traceback') or [])}")
     return {"result": resp["result"], "sandbox": sb or "unsandboxed", "unsandboxed": sb is None}
@@ -551,7 +784,7 @@ def _self_test() -> int:
         if not cond:
             fails.append(msg)
 
-    # Toy closed-form engine that tries to lie about meta.age_shares (BE14)
+    # Toy closed-form engine: mutates age_pop in place, prints to stdout, uses lazy sibling import, tries to lie about age_shares
     age_swap_py = (
         "from toolkit.engines.contract import EngineCard, Outcomes, ParamSpec\n"
         "class Model:\n"
@@ -559,18 +792,28 @@ def _self_test() -> int:
         "        pass\n"
         "    def describe(self):\n"
         "        return EngineCard(name='built:ag', version='0.1', mechanisms=['test'],\n"
-        "                          components={'c': [0, 1]}, unit_attributes={'age_pop': 'vec'},\n"
+        "                          components={'c': [0, 1]}, unit_attributes={'age_pop': 'vec', 'age_contact': 'vec', 'age_population': 'vec'},\n"
         "                          outputs={'per_capita': ['cases'], 'windows': [], 'cost_drivers': []},\n"
         "                          age_groups=['young', 'old'], valid_ranges={})\n"
         "    def parameters(self):\n"
         "        return [ParamSpec('rate', 0.1, 'fixed', source='assumption')]\n"
         "    def evaluate(self, params, unit, package, horizon):\n"
-        "        r = params['rate']\n"
+        "        from .helper import MULT\n"
+        "        print('model diagnostic log on stdout')\n"
+        "        if 'age_pop' in unit.attributes:\n"
+        "            unit.attributes['age_pop'].reverse()\n"
+        "        r = params['rate'] * MULT\n"
         "        return Outcomes(per_capita={'cases': {'young': r, 'old': 2 * r}},\n"
         "                        windows={}, cost_drivers={},\n"
-        "                        meta={'age_shares': {'young': 0.99, 'old': 0.01}, 'seen_uid': unit.id})\n"
+        "                        meta={'age_shares': {'young': 0.99, 'old': 0.01}, 'seen_uid': unit.id,\n"
+        "                              'hval': hash('probe_key')})\n"
     ).encode("utf-8")
-    files = {"engine.py": age_swap_py, "card.yaml": b"name: built:ag\n", "ENGINE_NOTES.md": b"# notes\n"}
+    files = {
+        "engine.py": age_swap_py,
+        "helper.py": b"MULT = 1.0\n",
+        "card.yaml": b"name: built:ag\n",
+        "ENGINE_NOTES.md": b"# notes\n",
+    }
 
     # BE35: no sandbox fails closed with EngineUnsandboxed; with unsandboxed_ok=True records unsandboxed + HIGH finding
     try:
@@ -578,22 +821,138 @@ def _self_test() -> int:
         be35_closed = False
     except EngineUnsandboxed as e:
         be35_closed = "engine_unsandboxed" in str(e)
+    base_payload = {
+        "params": {},
+        "unit": {"id": "real_unit_secret", "attributes": {"age_pop": [200, 800]}},
+        "package": {"id": "pkg1", "components": {"c": 1}},
+        "horizon": {"start": 0, "stop": 1, "window": [0, 1], "windows": {}},
+    }
     res_dev = run_in_worker(files, kind="closed_form", action="run", unsandboxed_ok=True, _force_sandbox=None,
-                            payload={"params": {}, "unit": {"id": "real_unit_secret", "attributes": {"age_pop": [200, 800]}},
-                                     "package": {"id": "pkg1", "components": {"c": 1}},
-                                     "horizon": {"start": 0, "stop": 1, "window": [0, 1], "windows": {}}})
+                            payload=base_payload, hash_seed="0")
     f_un = unsandboxed_finding()
     ok(be35_closed and res_dev["unsandboxed"] is True and f_un["kind"] == "engine_unsandboxed"
        and f_un["severity"] == "HIGH" and f_un["scope_declarable"] is False,
-       f"BE35 no sandbox fails closed with engine_unsandboxed; dev flag marks unsandboxed + HIGH non-declarable finding")
+       "BE35 no sandbox fails closed with engine_unsandboxed; dev flag marks unsandboxed + HIGH non-declarable finding")
 
-    # BE14: swapped meta.age_shares overwritten by harness from unit age_pop [200, 800] -> {young: 0.2, old: 0.8},
-    # and unit.id seen by model is opaque (never 'real_unit_secret')
+    # BE14 + P1-12 + P2-2 + P2-3: pre-run age_shares resist in-place mutation, lazy sibling import & print work
     sh = res_dev["result"]["meta"]["age_shares"]
     seen_uid = res_dev["result"]["meta"].get("seen_uid")
     ok(abs(sh["young"] - 0.2) < 1e-12 and abs(sh["old"] - 0.8) < 1e-12 and seen_uid != "real_unit_secret"
        and res_dev["result"]["meta"]["param_reads"]["build"] == ["rate"],
-       f"BE14 swapped meta.age_shares overwritten by harness ({sh}), unit.id opaque ({seen_uid}), param_reads tracked")
+       f"BE14 pre-run age_shares resist in-place reverse ({sh}), opaque id ({seen_uid}), lazy sibling import & stdout log")
+
+    # P1-13: age_shares independent of dict insertion order and ignores age_contact
+    p_a = {**base_payload, "unit": {"id": "u", "attributes": {"age_contact": [1, 1], "age_population": [10, 90]}}}
+    p_b = {**base_payload, "unit": {"id": "u", "attributes": {"age_population": [10, 90], "age_contact": [1, 1]}}}
+    r_a = run_in_worker(files, kind="closed_form", action="run", unsandboxed_ok=True, _force_sandbox=None, payload=p_a)
+    r_b = run_in_worker(files, kind="closed_form", action="run", unsandboxed_ok=True, _force_sandbox=None, payload=p_b)
+    sh_a, sh_b = r_a["result"]["meta"]["age_shares"], r_b["result"]["meta"]["age_shares"]
+    ok(abs(sh_a["young"] - 0.1) < 1e-12 and sh_a == sh_b,
+       f"BE14b age_shares deterministic across key order and ignores age_contact ({sh_a})")
+
+    # P2-4: PYTHONHASHSEED honored across worker processes
+    res_s0 = run_in_worker(files, kind="closed_form", action="run", unsandboxed_ok=True, _force_sandbox=None,
+                           payload=base_payload, hash_seed="0")
+    res_s42 = run_in_worker(files, kind="closed_form", action="run", unsandboxed_ok=True, _force_sandbox=None,
+                            payload=base_payload, hash_seed="42")
+    ok(res_dev["result"]["meta"]["hval"] == res_s0["result"]["meta"]["hval"]
+       and res_s0["result"]["meta"]["hval"] != res_s42["result"]["meta"]["hval"],
+       "BE14c worker honors PYTHONHASHSEED (same seed -> equal hash, different seed -> distinct hash)")
+
+    # P1-14 + P1-15: phased param_reads captures read_outcomes-only reads; forged meta.balance stripped when no analyzer ran
+    ss_mock_py = (
+        "from toolkit.engines.contract import EngineCard, Outcomes, ParamSpec\n"
+        "class _Pars:\n"
+        "    def __init__(self):\n"
+        "        self.rand_seed = 0\n"
+        "        self.analyzers = []\n"
+        "class _Sim:\n"
+        "    def __init__(self):\n"
+        "        self.initialized = False\n"
+        "        self.pars = _Pars()\n"
+        "    def run(self):\n"
+        "        self.initialized = True\n"
+        "class Model:\n"
+        "    def describe(self):\n"
+        "        return EngineCard(name='built:ss', version='0.1', mechanisms=['t'],\n"
+        "                          components={'c': [0, 1]}, unit_attributes={'x': 'x'},\n"
+        "                          outputs={'per_capita': ['cases'], 'windows': [], 'cost_drivers': []},\n"
+        "                          age_groups=['all'], valid_ranges={})\n"
+        "    def parameters(self):\n"
+        "        return [ParamSpec('rate', 0.2, 'fixed', source='assumption')]\n"
+        "    def state_vars(self):\n"
+        "        return {}\n"
+        "    def build_sim(self, params, unit, package, horizon):\n"
+        "        self._p = params\n"
+        "        return _Sim()\n"
+        "    def read_outcomes(self, sim, unit, package, horizon):\n"
+        "        r = self._p['rate']\n"
+        "        return Outcomes(per_capita={'cases': {'all': r}}, windows={}, cost_drivers={},\n"
+        "                        meta={'balance': {'forged': True}})\n"
+    ).encode("utf-8")
+    res_ss = run_in_worker(
+        {"engine.py": ss_mock_py, "card.yaml": b"name: built:ss\n", "ENGINE_NOTES.md": b"# n\n"},
+        kind="starsim_module", action="run", unsandboxed_ok=True, _force_sandbox=None,
+        payload={"params": {}, "unit": {"id": "u", "attributes": {"x": 1}},
+                 "package": {"id": "p", "components": {"c": 1}},
+                 "horizon": {"start": 0, "stop": 1, "window": [0, 1], "windows": {}}},
+    )
+    ss_meta = res_ss["result"]["meta"]
+    ok(ss_meta["param_reads"] == {"build": [], "read_outcomes": ["rate"]} and "balance" not in ss_meta,
+       f"BE14d read_outcomes-only param reads attributed to read_outcomes and forged meta.balance stripped ({ss_meta})")
+
+    # P1-16: decoded UTF-8 compiled (never reinterpreted via latin-1 coding comment)
+    coding_py = (
+        "# coding: latin-1\n"
+        "from toolkit.engines.contract import EngineCard, Outcomes\n"
+        "class Model:\n"
+        "    def describe(self):\n"
+        "        return EngineCard(name='built:c', version='0.1', mechanisms=['café'],\n"
+        "                          components={'c': [0]}, unit_attributes={'x': 'x'},\n"
+        "                          outputs={'per_capita': ['y'], 'windows': [], 'cost_drivers': []},\n"
+        "                          age_groups=['all'], valid_ranges={})\n"
+        "    def parameters(self):\n"
+        "        return []\n"
+    ).encode("utf-8")
+    res_cod = run_in_worker(
+        {"engine.py": coding_py, "card.yaml": b"name: built:c\n", "ENGINE_NOTES.md": b"# n\n"},
+        kind="closed_form", action="describe", unsandboxed_ok=True, _force_sandbox=None,
+    )
+    ok(res_cod["result"]["mechanisms"] == ["café"],
+       f"BE14e worker compiles decoded UTF-8 source without latin-1 reinterpretation ({res_cod['result']['mechanisms']})")
+
+    # P1-17: bounded stderr/stdout kills runaway output worker under file_bytes cap
+    noisy_py = (
+        "from toolkit.engines.contract import EngineCard\n"
+        "class Model:\n"
+        "    def describe(self):\n"
+        "        print('X' * 8192)\n"
+        "        return EngineCard(name='built:n', version='0.1', mechanisms=['t'],\n"
+        "                          components={'c': [0]}, unit_attributes={'x': 'x'},\n"
+        "                          outputs={'per_capita': ['y'], 'windows': [], 'cost_drivers': []},\n"
+        "                          age_groups=['all'], valid_ranges={})\n"
+    ).encode("utf-8")
+    try:
+        run_in_worker(
+            {"engine.py": noisy_py, "card.yaml": b"name: built:n\n", "ENGINE_NOTES.md": b"# n\n"},
+            kind="closed_form", action="describe", unsandboxed_ok=True, _force_sandbox=None,
+            limits={"file_bytes": 1024},
+        )
+        capped = False
+    except WorkerError as e:
+        capped = "exceeded" in str(e) and "output limit" in str(e)
+    ok(capped, "BE18b parent bounds worker stderr/stdout pipe memory and kills child on overflow")
+
+    # P1-9: _bwrap_engine_cmd never mounts arbitrary directories appended to sys.path
+    with tempfile.TemporaryDirectory() as ext_dir:
+        sys.path.append(ext_dir)
+        try:
+            cmd_ext = _bwrap_engine_cmd("bwrap", [], [sys.executable, "-s", "-B", "/harness/worker.py", "_probe"])
+        finally:
+            sys.path.remove(ext_dir)
+        ext_real = os.path.realpath(ext_dir)
+        ok(ext_dir not in cmd_ext and ext_real not in cmd_ext,
+           "BE18c _bwrap_engine_cmd ignores arbitrary sys.path directories")
 
     # BE18: in bubblewrap sandbox (Linux CI / Coiled VMs), sentinel file outside mount set cannot be read
     sb = engine_sandbox_kind()
@@ -628,8 +987,7 @@ def _self_test() -> int:
             ok(out_sb["unsandboxed"] is False and out_sb["result"]["meta"]["probe"] == "BLOCKED",
                f"BE18 minimal-mount {sb} sandbox blocks reading sentinel file outside mount set ({out_sb['result']['meta']})")
     else:
-        # On hosts without bwrap (macOS), verify _bwrap_engine_cmd mounts minimal set (no `--ro-bind / /`)
-        cmd = _bwrap_engine_cmd("bwrap", [], [sys.executable, "-I", "/harness/worker.py", "_probe"])
+        cmd = _bwrap_engine_cmd("bwrap", [], [sys.executable, "-s", "-B", "/harness/worker.py", "_probe"])
         no_root_bind = not any(cmd[i:i + 3] == ["--ro-bind", "/", "/"] for i in range(len(cmd) - 2))
         ok(no_root_bind and "--tmpfs" in cmd and "/harness/toolkit/engines/contract.py" in cmd,
            "BE18 minimal-mount _bwrap_engine_cmd omits `--ro-bind / /` and mounts only runtime + contract/hooks/worker")
@@ -643,6 +1001,7 @@ def _self_test() -> int:
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["_probe"]:
+        _strip_cwd_from_sys_path()
         sys.stdout.write("OK\n")
         sys.exit(0)
     if sys.argv[1:2] == ["_worker_child"]:
