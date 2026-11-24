@@ -650,6 +650,10 @@ def render_md(run_dir: str) -> str:
         elif it.get("kind") in PLAN_CHANGING_TEST_KINDS:      # the gate finding above is its measured result
             lines += ["Measured decision test: it changes the plan (the gate finding above). Accept: the run may "
                       "finish accepted with this dependence stated at the top of the report. Decline: it may not.", ""]
+        elif it.get("disposition") == "declare":      # check-value item 5 (Codex r1 P1-2): measured, not untested
+            lines += ["Measured by the harness: the gate finding above says where the plan changes. Accept: the run "
+                      "finishes with it declared as a limitation, stated at the top of the report (not accepted). "
+                      "Decline: the run may not finish with it.", ""]
         elif not it.get("declarations"):
             lines += ["Not declared in scope_declaration.yaml, and **untested**.", ""]
         for dcl in it.get("declarations") or []:
