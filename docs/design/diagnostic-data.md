@@ -209,11 +209,11 @@ from a signing command or a resume writing to the same file.
 |---|---|---|
 | `run_start` | `pipeline`, `commit`, `resume` | `Machine.run()` entry |
 | `stage` | `from`, `to`, `why`, `spent_usd`, `elapsed_in_from_s`, `status` (on `to: FINAL`) | `Machine._go` (every transition: one event is both the leave and the enter) |
-| `round` | `from`, `to` | `Machine._go`, when the round differs from the previous transition's |
+| `round` | `from`, `to` | `Machine._ev`, before the first event of a new round |
 | `task_start` | `key`, `task`, `allowance_usd` | `Machine._task`, after the journal records `started` |
 | `task_end` | `key`, `task`, `ok`, `elapsed_s`, `usd`, `spent_usd`, `note` (300 chars), `model` (when the task runner reports it) | `Machine._task`, after the journal records `completed` |
 | `heartbeat` | `step`, `elapsed_s`, `progress` (e.g. "rows 40 of 120"), `eta_s`, `basis` | a timer while `_task` or the analysis pipeline runs (default every 300 s); ETA from `pipeline_progress.json`'s projection or the batch's rows, else null |
-| `gate` | `post_write`, `action`, `rule`, `rounds_remaining`, `blocking` (count), `waiting` (count awaiting the owner) | `h_GATE`, where it sets `last_gate` |
+| `gate` | `post_write`, `action`, `rule`, `rounds_remaining`, `blocking` (count), `open_tested` (count), `waiting` (count awaiting the owner) | `h_GATE`, where it sets `last_gate` |
 | `finding` | `id`, `finding_kind`, `severity`, `from`, `to`, `by` | `findings_ledger.save`, from the difference with the ledger on disk |
 | `owner_question` | `question` (`spec_signoff`, `scope_signoff`, `spec_amendment`, `budget`), `request`, `items` (ids) | `Machine.run()` exit, when it ends paused |
 | `owner_answer` | `question`, `paused`, `by` (the spec's signer, for a sign-off) | `Machine._go`, when the run leaves the state it paused in (owner and lead answers alike, whichever command signed) |
@@ -221,17 +221,24 @@ from a signing command or a resume writing to the same file.
 
 **Rules.**
 
-- Appended through `lib.safe_io.write_nofollow(..., append=True)`, one `O_APPEND` write per line, so writers
-  in several processes do not interleave within a line on a local file system; a line is capped at 4 KB, with
-  long text cut.
+- Appended through `lib.safe_io.open_append_nofollow`: no link followed, a hard-linked file refused, and a
+  non-blocking open, so a FIFO at the name never hangs the run. Each line is one `O_APPEND` write, so writers in
+  several processes do not interleave within a line on a local file system. A line is capped at 4 KB: long text
+  is cut first, and a record that still does not fit keeps only its common fields. A line is never sliced into
+  invalid JSON.
 - Never fatal: an append that fails is counted in the process and reported in the next event that succeeds
-  (`dropped_before`) and in `run_state.json` (`events_dropped`).
-- Outside every hashed or protected record: not in the integrity record, not an input of any pipeline step,
-  not under `models/` or `data/` (so compute and pipeline reuse keys do not change). Agents may not write it:
-  it joins `agents/enforcement.py`'s harness-owned list beside `pipeline_progress.json`.
-- No secrets and no `_truth` content; finding text is the ledger's claim, cut to 300 characters.
-- Smoke markers for PR 1: `events.jsonl~"kind": "stage"`, `events.jsonl~"kind": "task_end"`,
-  `events.jsonl~"kind": "status"`, and `run_state.json:events_dropped=0`.
+  (`dropped_before`). `run_state.json` gains no field, because a lead hand-off binds the child to its bytes.
+- Outside every hashed or protected record. It is not in the integrity record and not under `models/` or
+  `data/`. Pipeline step inputs exclude it by name, pipeline outputs may not claim it, and the scratch check
+  ignores it, so compute and pipeline reuse keys do not change. An amended child starts its own stream; the
+  parent's is not copied. No task may write it (`agents/v2_sdk_tasks.py` `HARNESS_FILES`), and a change to it is
+  never counted as an agent's (`agents/fix_loop.py` `_HARNESS_OWNED`).
+- No secrets and no `_truth` content. Credential-like text is redacted from every string field. Finding text is
+  the ledger's claim, cut to 300 characters.
+- Known gaps: the world-model seed task does not run through `Machine._task`, so it has no task events yet; a
+  heartbeat can read a previous pipeline execution's progress record until the new step writes its own.
+- Smoke markers for PR 1: `events.jsonl~"kind": "run_start"`, `events.jsonl~"kind": "stage"`,
+  `events.jsonl~"kind": "task_end"` and `events.jsonl~"kind": "status"`.
 
 ## 8. MCP tools (PR 2)
 
