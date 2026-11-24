@@ -100,7 +100,8 @@ docs/design/v2-spec-and-analysis.md §1):
                                            # (toolkit/analysis/features.py, F6 S2-4)
       cost_outputs: {treated: {cost_driver: treated_all}}    # per_outcome cost items <- engine cost drivers
       diagnostics: {name: {window: cal, metric: m, summary: [max, median]}}
-      stability: {holdout_group: col, covariates: [..]}
+      stability: {holdout_group: col, covariates: [..]}   # holdout_group optional: decision_units.region, else
+                                           # one unit per fold up to stability.MAX_DEFAULT_UNIT_FOLDS
       sensitivity: {parameters: fitted | [names], cost_items: {id: [lo, hi]}}
       share_threshold: 0.10                # decision tests: share of units changing package
       decision_tests: [{id, type, text, finding, ...}]     # type perturb: set [{target, ..}] (W0-B, the one
@@ -1687,7 +1688,7 @@ def _validate_analysis(s, card, pnames, cols, pk) -> list[str]:
             bad.append(f"analysis.diagnostics.{name}: {d!r} is not an engine window metric")
     st = an.get("stability") or {}
     if st:
-        if st.get("holdout_group") not in cols:
+        if st.get("holdout_group") is not None and st.get("holdout_group") not in cols:   # absent: the default
             bad.append(f"analysis.stability.holdout_group: no column {st.get('holdout_group')}")
         bad += [f"analysis.stability.covariates: no column {c}" for c in st.get("covariates") or [] if c not in cols]
     sens = an.get("sensitivity") or {}

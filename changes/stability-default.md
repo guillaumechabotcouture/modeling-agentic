@@ -1,0 +1,8 @@
+---
+phase: "v2"
+commit: "stability-default"
+---
+
+## Changelog
+
+**The leave-one-group-out allocation stability runs by default on allocation runs (check-value item 5 follow-up; owner, 2026-11-23).** Of the 31 v2 runs in the check-value analysis, 14 recorded the stability step as NOT_RUN. In 13 of them the spec had no `analysis.stability.holdout_group`; they had 10 to 12 decision units, no `decision_units.region`, and calibration methods `posterior` (9), `none` (2) and `likelihood` (2). In the other one, `calibration.method` was `none` and there was nothing to hold out. Without a holdout group the step skipped. New `toolkit/analysis/stability.py holdout(A, st)` picks the holdout group in this order. (1) The spec's `analysis.stability.holdout_group`, as before. (2) Else `decision_units.region`. (3) Else the unit id, one fold per unit, when there are at most `MAX_DEFAULT_UNIT_FOLDS` (60) units. Beyond that, the step is NOT_RUN with a reason naming what to declare. The record says which source it used (`holdout_source`). A default holdout under emulator inversion with no covariates is NOT_RUN with the reason, not a crash of the analysis; a declared one still refuses as before. A group with fewer than two values is NOT_RUN with its reason. `toolkit/spec/schema.py` no longer refuses an `analysis.stability` block without `holdout_group`. The `decision-spec` skill says the step runs by default. Expected effect on the 14 records: 10 would run one-unit folds (2 likelihood, 8 posterior, 10 to 12 units each). 4 stay NOT_RUN, each with its reason (with #372, an advisory note): 3 with `calibration.method: none`, and 1 posterior run with a single unit. Self-tests SD1-SD5 (`toolkit/analysis/run.py`).

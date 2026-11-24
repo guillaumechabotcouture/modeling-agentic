@@ -109,7 +109,8 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    path an emulator feature.
 10. **Analysis.** `evaluation: emulator` for engines too slow to run per unit and draw (give
     the design: points, hold-out share, features), `direct` otherwise; the stability
-    hold-out group; sensitivity; and **decision tests** for each simplification,
+    hold-out group (it runs by default: without one, the region, else each unit; name one
+    for many units with no region, and covariates under the emulator); sensitivity; and **decision tests** for each simplification,
     decision-layer feature or known engine limit the owner should see tested (an
     interaction benchmark the engine misses, a group rule, the envelope). Give each a
     `finding:` id when it answers a gate finding. A new test is one `type: perturb` with a

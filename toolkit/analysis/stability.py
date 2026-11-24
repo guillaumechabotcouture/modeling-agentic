@@ -31,6 +31,32 @@ from toolkit.analysis.core import SolveFailed, auxiliary, best_known, merge_cost
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PRODUCER = "toolkit/analysis/stability.py"
 MIN_FOLD_UNITS = 5
+# Check-value item 5 (owner, 2026-11-23): the step runs by default on an allocation run. Without a declared holdout group
+# it holds out decision_units.region, else each unit in turn, up to this many one-unit folds (each a re-solve, and under
+# likelihood or posterior calibration a refit); beyond it, a holdout group must be declared.
+MAX_DEFAULT_UNIT_FOLDS = 60
+
+
+def holdout(A, st: dict) -> tuple:
+    """(group column, where it came from, reason it cannot run): the spec's analysis.stability.holdout_group; else the
+    decision units' region; else the unit id, one fold per unit, when there are at most MAX_DEFAULT_UNIT_FOLDS units.
+    13 of the 14 NOT_RUN records in the 31 v2 runs had no holdout group (10 to 12 units, no region)."""
+    if st.get("holdout_group"):
+        return st["holdout_group"], "spec", None
+    if getattr(A, "region", None):
+        return A.region, "default: decision_units.region (no analysis.stability.holdout_group)", None
+    try:
+        uid = A.spec["decision_units"].get("id")
+    except (KeyError, TypeError, AttributeError):
+        uid = None
+    if not uid:
+        return None, None, "no analysis.stability.holdout_group in the spec, and the decision units name no id column"
+    if len(A.ids) > MAX_DEFAULT_UNIT_FOLDS:
+        return None, None, (f"no analysis.stability.holdout_group in the spec and no decision_units.region, and "
+                            f"{len(A.ids)} units are more than {MAX_DEFAULT_UNIT_FOLDS} one-unit folds: declare a "
+                            "holdout group")
+    return uid, "default: each unit held out in turn (no analysis.stability.holdout_group, no decision_units.region)", \
+        None
 
 
 def thresholds() -> dict:
@@ -58,13 +84,20 @@ def _mean(v):
 
 def run(A, z0, out0, ben0, cost0, plan) -> dict:
     st = A.spec["analysis"].get("stability") or {}
-    g = st.get("holdout_group")
+    g, src, why = holdout(A, st)
+
+    def skip(reason):
+        return {"method": "skipped", "reason": reason, "holdout_source": src, "folds": [], "metrics": {},
+                "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"}
     if not g:
-        return {"method": "skipped", "reason": "no analysis.stability.holdout_group in the spec", "folds": [],
-                "metrics": {}, "verdict": "NOT_RUN", "value_verdict": "NOT_RUN"}
+        return skip(why)
     groups = sorted({A.by_id[i][g] for i in A.ids}, key=str)
+    if len(groups) < 2:
+        return skip(f"the holdout group {g} has {len(groups)} value(s): nothing to hold out")
     if A.method == "emulator_inversion":
         cov = st.get("covariates") or []
+        if not cov and src != "spec":       # a default holdout: the reason, never a crash of the analysis
+            return skip("emulator inversion needs analysis.stability.covariates to predict held-out units")
         if not cov:
             raise ValueError("analysis.stability.covariates: emulator inversion needs covariates to predict held-out units")
         Xall = np.array([[float(A.by_id[i][c]) for c in cov] for i in A.ids])
@@ -175,7 +208,7 @@ def run(A, z0, out0, ben0, cost0, plan) -> dict:
     w = met["total_benefit_loss_pct_worst_fold"]
     vv = ("NOT_RUN" if w is None else "ROBUST" if w <= th["value_loss_pct_robust"] else
           "FRAGILE" if w <= th["value_loss_pct_fragile"] else "UNSTABLE")
-    return {"method": f"leave-one-{g}-out", "holdout_group": g, "calibration_method": A.method,
+    return {"method": f"leave-one-{g}-out", "holdout_group": g, "holdout_source": src, "calibration_method": A.method,
             "n_folds": len(folds), "folds": folds, "folds_not_run": skipped, "metrics": met, "verdict": verdict,
             "value_verdict": vv,
             # 1C-b 2c-i: held-out predictions moved to the nearer end of calibration.range, over the folds that ran
