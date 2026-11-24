@@ -348,7 +348,7 @@ def harness_owned() -> tuple:
         "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*",
         "evidence_dossier.yaml", SIGNOFF_SHEET,    # v2 autonomy 1B-ii: the default dossier and the sign-off sheet
         AMENDMENT_RECORD,                          # lead-gaps β (Codex r1): toolkit/spec/amend.py's record
-        "calibration_patch_r*", SPEC_PATCH_PROPOSED)   # hb3 fix 2b: a refused calibration's proposed amendment
+        "calibration_patch_r*")                    # hb3 fix 2b: a refused calibration's planned amendment
 
 
 def owned_path(root: str, rel: str, owned) -> bool:
@@ -1359,21 +1359,22 @@ def spec_signed_once(run_dir: str) -> bool:
 def rethink_request(run_dir: str, round_n: int, signoff: str = "owner", calibration: dict | None = None) -> dict:
     """spec_rethink_request.json: why the run asks for a spec amendment (the latest fix plan's rethink briefs, the
     open findings the spec owns, with their remedies) and the signed spec it would amend (its sha256). `calibration`:
-    the refused calibration's planned amendment that routed here (run_state tries.calibration_patch); its plan, and
-    only its plan, is the request's when it is for this round and this signed spec (Codex r1 P1-7)."""
-    briefs = []
-    try:          # this round's fix plan only: an earlier round's (an engine rethink) is not this request's (#261 P2-6)
-        plan = json.load(open(os.path.join(run_dir, f"fix_plan_r{round_n}.json"))).get("plan") or {}
-    except (OSError, ValueError, AttributeError):
-        plan = {}
+    the route of a refused calibration that brought the run here (Machine._calibration_route: run_state
+    tries.calibration_patch, saved with the ANALYZE -> SPEC transition). Then the request is that route's alone: its
+    brief and its patch (none when the planner's was rejected), never a fix plan's (Codex r2 on #379, P1-2, P1-4)."""
+    route = calibration if isinstance(calibration, dict) else None
+    if route is not None:
+        p_ = route.get("patch") if isinstance(route.get("patch"), dict) else None
+        plan = {"tasks": [{"id": "calibration", "action": "rethink", "owner_state": "SPEC", "findings":
+                           [CALIBRATION_REFUSED], "brief": route.get("brief"), **({"patch": p_} if p_ else {})}]}
+    else:
+        try:      # this round's fix plan only: an earlier round's (an engine rethink) is not this request's (#261 P2-6)
+            plan = json.load(open(os.path.join(run_dir, f"fix_plan_r{round_n}.json"))).get("plan") or {}
+        except (OSError, ValueError, AttributeError):
+            plan = {}
     briefs = [{"task": t.get("id"), "findings": t.get("findings"), "brief": t.get("brief")}
               for t in plan.get("tasks") or [] if isinstance(t, dict) and t.get("action") == "rethink"
               and t.get("owner_state") == "SPEC"]
-    cal = _calibration_patch_plan(run_dir, round_n, calibration) if calibration else None    # hb3 fix 2b
-    if cal is not None:
-        plan = cal
-        briefs = [{"task": f"calibration:{t.get('id')}", "findings": t.get("findings"), "brief": t.get("brief")}
-                  for t in plan.get("tasks") or [] if isinstance(t, dict) and t.get("action") == "rethink"]
     led = FL.load(run_dir)
     fs = [{"id": f.id, "severity": f.severity, "claim": f.claim, "fix_requires": f.fix_requires}
           for f in FL.open_findings(led) if f.owner_state == "SPEC" or any(f.id in (b["findings"] or []) for b in briefs)]
@@ -1381,8 +1382,9 @@ def rethink_request(run_dir: str, round_n: int, signoff: str = "owner", calibrat
         prev = json.load(open(os.path.join(run_dir, SPEC_RETHINK_REQUEST)))
     except (OSError, ValueError):
         prev = None
-    if isinstance(prev, dict) and prev.get("round") == round_n:
-        return prev                  # a resume returns the request it made (Codex review of #261 P1-2)
+    ckey = route.get("key") if route is not None else None
+    if isinstance(prev, dict) and prev.get("round") == round_n and prev.get("calibration_key") == ckey:
+        return prev    # a resume returns the request it made (#261 P1-2), for the same route (Codex r2 on #379, P1-5)
     # lead-gaps β: the rethink's machine-readable amendment, under --signoff lead only (an owner keeps `amend --from-request
     # --patch` for their own patch: amend refuses a request patch beside --patch; Codex r1)
     planned = FX.spec_patch(plan)
@@ -1391,27 +1393,22 @@ def rethink_request(run_dir: str, round_n: int, signoff: str = "owner", calibrat
            "this run does not redraft or re-sign its spec")
     proposal = {}
     if planned is not None and signoff != "lead":
-        # hb3 fix 2b: under owner sign-off the planner's patch is a proposal the owner reviews, never applied here; it
-        # is written out as a patch file amend --patch reads (JSON is YAML), so the owner's own patch stays possible
-        _write_json(run_dir, SPEC_PATCH_PROPOSED, planned)
-        proposal = {"proposed_patch": planned, "proposed_patch_file": SPEC_PATCH_PROPOSED}
-        import shlex
-        q = shlex.quote(run_dir)
-        nxt = (f"review proposed_patch (also in {SPEC_PATCH_PROPOSED}). To apply it: python3 -m toolkit.spec.amend {q} "
-               f"--from-request --patch {shlex.quote(os.path.join(run_dir, SPEC_PATCH_PROPOSED))}; dispose of the "
-               "child's imported review conditions (review_conditions.yaml: this request's findings among them), then "
-               "python3 -m toolkit.spec.amend <child> --finish; then sign the child with the command its "
-               "amendment_record.json prints and relaunch it with reuse. Or amend with your own patch. This run does "
-               "not redraft or re-sign its spec")
+        # hb3 fix 2b: under owner sign-off the planner's patch is a proposal the owner reviews, never applied here.
+        # amend --proposed applies the request's own copy (no side file to drift from it: Codex r2 on #379, P1-10/11)
+        proposal = {"proposed_patch": planned}
+        nxt = (f"review proposed_patch. To apply it: python3 -m toolkit.spec.amend {shlex.quote(run_dir)} "
+               "--from-request --proposed, then sign the child with the command it prints. When its dry-sign fails on "
+               "open review conditions, dispose of them in the child's review_conditions.yaml and run python3 -m "
+               "toolkit.spec.amend <child> --finish first. Or amend with your own patch (--from-request --patch "
+               "<file>). This run does not redraft or re-sign its spec")
     doc = {"round": round_n, "requested_at": _now(), "signed_spec_sha256": _spec_signed_sha(run_dir),
            "working_spec_sha256": signed_hash(run_dir), "briefs": briefs, **({"patch": patch} if patch else {}),
-           **proposal, "findings": fs, "next": nxt}
+           **proposal, **({"calibration_key": ckey} if ckey else {}), "findings": fs, "next": nxt}
     _write_json(run_dir, SPEC_RETHINK_REQUEST, doc)
     return doc
 
 
 CALIBRATION_PATCH = "calibration_patch_r{round}.json"     # hb3 fix 2b: the planner's amendment of a refused calibration
-SPEC_PATCH_PROPOSED = "spec_patch_proposed.json"          # under owner sign-off: the proposed patch, as amend reads it
 CALIBRATION_PATCH_TASK = (
     "The harness refused this run's calibration at ANALYZE (calibration_refusal: its code and reason; "
     "spec_calibration: the signed spec's calibration block). The spec is signed, so this run cannot redraft it: the "
@@ -1421,22 +1418,6 @@ CALIBRATION_PATCH_TASK = (
     "or a reduced parameter set (a parameter removed from calibration.parameters with its prior, so its configured "
     "value holds). Choose the smallest change that addresses the stated cause, and say why in the patch's reason. "
     "No dossier operations, no harness_gaps and no other task.")
-
-
-def _calibration_patch_plan(run_dir: str, round_n, route: dict) -> dict | None:
-    """The calibration amendment plan the ANALYZE route recorded (`route`: its round, signed spec and key), when it
-    validated, is this round's and is for the spec signed now; else None."""
-    if not isinstance(route, dict) or route.get("round") != round_n \
-            or route.get("signed_spec_sha256") != _spec_signed_sha(run_dir):
-        return None
-    try:
-        doc = json.load(open(os.path.join(run_dir, CALIBRATION_PATCH.format(round=round_n))))
-    except (OSError, ValueError):
-        return None
-    good = isinstance(doc, dict) and doc.get("round") == round_n and not doc.get("rejected") \
-        and doc.get("signed_spec_sha256") == route.get("signed_spec_sha256") and doc.get("key") == route.get("key")
-    plan = doc.get("plan") if good else None
-    return plan if isinstance(plan, dict) else None
 
 
 def calibration_packet(run_dir: str, ref: dict, round_n, max_rounds, budget) -> dict:
@@ -1506,15 +1487,34 @@ def calibration_plan_problems(plan, packet: dict, run_dir: str | None = None) ->
         return [f"the patch does not apply to the signed spec: {e}"[:400]]
     except Exception as e:  # noqa: BLE001
         return [f"the signed spec cannot be read to check the patch ({type(e).__name__})"]
-    if spec1 == spec0:
+    def same(a, b):        # type- and key-presence-sensitive (True is not 1; a null key is not a missing one: r2 P1-7)
+        return json.dumps(a, sort_keys=True, default=repr) == json.dumps(b, sort_keys=True, default=repr)
+    if same(spec1, spec0):
         return ["the patch changes nothing"]
+    miss = object()
     out = [f"{k}: only the calibration may change" for k in sorted(set(spec0) | set(spec1), key=str)
-           if k != "calibration" and spec0.get(k) != spec1.get(k)]
-    c0, c1 = spec0.get("calibration") or {}, spec1.get("calibration")
+           if k != "calibration" and (k in spec0) != (k in spec1) or k != "calibration" and not same(spec0.get(k, miss),
+                                                                                                    spec1.get(k, miss))]
+    c0, c1 = spec0.get("calibration"), spec1.get("calibration")
     if not isinstance(c1, dict) or not isinstance(c0, dict):
         return out + ["calibration must stay a mapping"]
     out += [f"calibration.{k}: only {', '.join(CALIBRATION_PATCH_KEYS)} may change (paths under calibration)"
-            for k in sorted(set(c0) | set(c1), key=str) if c0.get(k) != c1.get(k) and k not in CALIBRATION_PATCH_KEYS]
+            for k in sorted(set(c0) | set(c1), key=str)
+            if k not in CALIBRATION_PATCH_KEYS and ((k in c0) != (k in c1) or not same(c0.get(k), c1.get(k)))]
+    # r2 P1-8: a reduced parameter set only, priors only for parameters the spec already declared, and a prior edit
+    # changes the prior (not only its cited source)
+    p0, p1 = c0.get("parameters") or [], c1.get("parameters") or []
+    if not isinstance(p1, list) or not set(map(str, p1)) <= set(map(str, p0 if isinstance(p0, list) else [])):
+        out.append("calibration.parameters: only a reduced set of the signed parameters")
+    q0, q1 = c0.get("priors") or {}, c1.get("priors") or {}
+    if not isinstance(q1, dict) or not set(q1) <= set(q0 if isinstance(q0, dict) else {}):
+        out.append("calibration.priors: only priors the signed spec declares (changed, or removed with their parameter)")
+    elif isinstance(q0, dict):
+        for k in q1:
+            a, b = q0.get(k), q1.get(k)
+            if isinstance(a, dict) and isinstance(b, dict) and not same(a, b) and same(
+                    {x: y for x, y in a.items() if x != "source"}, {x: y for x, y in b.items() if x != "source"}):
+                out.append(f"calibration.priors.{k}: a prior edit changes the prior, not only its source")
     return out
 
 
@@ -1888,8 +1888,6 @@ class Machine:
                                         default=str).encode()).hexdigest()[:16]
         doc = {"round": self.st.round, "refusal": ref, "by": "fix planner (calibration refusal)", "patch": None,
                "signed_spec_sha256": signed, "key": key}
-        # the route SPEC reads the plan from, and only from (Codex r1 P1-7)
-        self.st.tries["calibration_patch"] = {"round": self.st.round, "signed_spec_sha256": signed, "key": key}
         packet = calibration_packet(self.run_dir, ref, self.st.round, self.st.max_rounds, self._budget())
         J = _Journaled(self, f"ANALYZE:calibration_patch{k}:{key}")
         plan, errs = None, []
@@ -1907,10 +1905,27 @@ class Machine:
                 break
         patch = None if errs else FX.spec_patch(plan)
         _write_json(self.run_dir, rel, dict(doc, plan=None if errs else plan, rejected=errs, patch=patch))
+        # the route SPEC reads, and only it (Codex r1 P1-7): in run_state, with the accepted patch itself, so a record
+        # edited later moves nothing (r2 P1-4); set here, in memory, and saved with the ANALYZE -> SPEC transition
+        # (r2 P1-3)
+        brief = None if errs else next((t.get("brief") for t in plan["tasks"]), None)
+        self.st.tries["calibration_patch"] = {"round": self.st.round, "signed_spec_sha256": signed, "key": key,
+                                              "patch": patch, "brief": brief or f"calibration refused ({ref.get('code')})"}
         if patch is None:
             self.log(f"[machine] no calibration amendment was proposed ({'; '.join(errs)[:300]})")
             return "no patch proposed"
         return f"patch {patch.get('id') or 'unnamed'} proposed in {rel}"
+
+    def _calibration_route(self) -> dict | None:
+        """The calibration route (tries.calibration_patch) when it is what brought the run to SPEC: the last
+        transition into SPEC is ANALYZE's calibration back-edge of this round, for the spec signed now (r2 P1-3)."""
+        r = self.st.tries.get("calibration_patch")
+        last = next((h for h in reversed(self.st.history) if h.get("to") == "SPEC"), None)
+        if not isinstance(r, dict) or last is None or last.get("from") != "ANALYZE" \
+                or not str(last.get("why", "")).startswith("calibration refused") \
+                or r.get("round") != self.st.round or r.get("signed_spec_sha256") != _spec_signed_sha(self.run_dir):
+            return None
+        return r
 
     def _rethink_reasons(self, to: str, planned: bool) -> list[str]:
         import yaml
@@ -2015,7 +2030,7 @@ class Machine:
             # amended spec cannot be re-signed in a signed run dir): the request, then a pause; the owner amends and
             # relaunches with reuse
             req = rethink_request(self.run_dir, self.st.round, self.st.signoff,
-                                  calibration=self.st.tries.get("calibration_patch"))
+                                  calibration=self._calibration_route())
             sha = _spec_signed_sha(self.run_dir)
             ev = "present" if sha not in (None, "unreadable") else ("unreadable" if sha else "missing")
             if req.get("signing_evidence") != ev:        # a warning on the request, never a block (lead follow-up)
@@ -2033,7 +2048,7 @@ class Machine:
             save_state(self.run_dir, self.st)
             self.log(f"[machine] SPEC rethink of a signed spec: nothing redrafted. Read {SPEC_RETHINK_REQUEST} "
                      f"({len(req['findings'])} finding(s)); amend the spec and relaunch with reuse"
-                     + (f"; a patch is proposed in {SPEC_PATCH_PROPOSED}" if req.get("proposed_patch") else ""))
+                     + ("; a patch is proposed (amend --from-request --proposed)" if req.get("proposed_patch") else ""))
             return "SPEC"
         n = self.st.tries.get("spec", 0)
         if n >= MAX_SPEC_TRIES:
@@ -2633,6 +2648,8 @@ class Machine:
                 if n < MAX_CALIBRATION_REFUSALS:
                     record_calibration_refusal(self.run_dir, ref, self.st.round)
                     if self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir):
+                        # never redrafted, also when a restored copy lost its sign-off record (Codex r2, P1-6)
+                        self.st.tries["spec_amendment"] = True
                         note = self._calibration_patch(ref, n + 1)
                         self.st.tries[CALIBRATION_REFUSED] = n + 1
                         return self._rethink("SPEC", f"calibration refused ({ref['code']}): {ref['reason']}"[:200]
@@ -7656,7 +7673,7 @@ def _self_test_calibration_refused(ok, td: str, toy_run, Batch, quiet) -> None:
 
 
 def _self_test_calibration_patch(ok, td: str) -> None:
-    """CRF5-11 (hb3 fix 2b): a calibration refused under a signed spec gets a planned calibration patch before SPEC.
+    """CRF5-13 (hb3 fix 2b): a calibration refused under a signed spec gets a planned calibration patch before SPEC.
     Under --signoff lead the lead applies it (a provisional child run, no pause); under owner sign-off the run pauses
     with it proposed, and amend --patch applies the proposed file as written; a patch outside calibration is not
     proposed, and the lead's amendment is refused as before (the owner decides)."""
@@ -7726,13 +7743,12 @@ def _self_test_calibration_patch(ok, td: str) -> None:
            f"({st.state}, {st.status}, {rq.get('lead_amendment')})")
         d, spec0 = parent("cal_patch_owner", "owner")
         st, rq, cp, T = two_steps(d, patch)
-        prop = os.path.join(d, SPEC_PATCH_PROPOSED)
         ok(st.paused == AWAITING_SPEC_AMENDMENT and "patch" not in rq and rq.get("proposed_patch") == patch
-           and json.load(open(prop)) == patch and SPEC_PATCH_PROPOSED in rq.get("next", "")
+           and "--from-request --proposed" in rq.get("next", "") and st.tries.get("spec_amendment") is True
            and not os.path.lexists(d + ".amend1") and open(os.path.join(d, AB.SPEC_FILE), "rb").read() == spec0,
-           f"CRF7 under owner sign-off the run pauses with the patch proposed, never applied ({st.paused}, "
-           f"{sorted(rq)})")
-        rec = AM.amend(d, patch=prop, from_request=True, signoff="owner", log=lambda *a: None)
+           f"CRF7 under owner sign-off the run pauses with the patch proposed, never applied, and the run is marked a "
+           f"signed amendment (r2 P1-6) ({st.paused}, {sorted(rq)})")
+        rec = AM.amend(d, from_request=True, proposed=True, signoff="owner", log=lambda *a: None)
         c7 = rec["child"]
         rcf = os.path.join(c7, "review_conditions.yaml")      # the owner disposes of the imported conditions
         rows = yaml.safe_load(open(rcf)) if os.path.exists(rcf) else {"conditions": []}
@@ -7741,35 +7757,51 @@ def _self_test_calibration_patch(ok, td: str) -> None:
                 r_.update(disposition="deferred", owner="owner", due="2099-01-01")
         yaml.safe_dump(rows, open(rcf, "w"))
         rec7 = rec if rec["dry_sign"]["ok"] else AM.finish(c7, log=lambda *a: None)
+        try:
+            AM.amend(d, patch=os.path.join(d, "x.yaml"), from_request=True, proposed=True, log=lambda *a: None)
+            both = False
+        except AM.AmendError as e:
+            both = "--proposed" in str(e)
         ok(yaml.safe_load(open(os.path.join(c7, AB.SPEC_FILE)))["calibration"]["range"] == [-3, 3]
-           and rec7["dry_sign"]["ok"] and json.load(open(os.path.join(c7, STATE_FILE)))["state"] == "SIGN"
-           and "--finish" in rq.get("next", "") and "review_conditions.yaml" in rq.get("next", ""),
-           f"CRF7b the owner applies the proposed file as written (amend --from-request --patch), disposes of the "
-           f"imported conditions and finishes: the child can be signed ({rec7['dry_sign']})")
+           and rec7["dry_sign"]["ok"] and json.load(open(os.path.join(c7, STATE_FILE)))["state"] == "SIGN" and both,
+           f"CRF7b the owner applies the request's own proposal (amend --from-request --proposed), disposes of the "
+           f"imported conditions and finishes: the child can be signed; --proposed beside --patch is refused "
+           f"({rec7['dry_sign']})")
         bad = {"id": "C2", "reason": "r", "spec": [{"set": "constraints.envelope_usd", "value": 1}]}
         d, spec0 = parent("cal_patch_bad", "lead")
+        # r2 P1-2: a same-round fix plan's SPEC patch never stands in for a rejected calibration patch
+        _write_json(d, "fix_plan_r1.json", {"round": 1, "plan": {"tasks": [{
+            "id": "T1", "findings": [], "action": "rethink", "owner_state": "SPEC", "brief": "raise the envelope",
+            "patch": {"id": "A1", "reason": "r", "spec": [{"set": "constraints.envelope_usd", "value": 9500}]}}]}})
         st, rq, cp, T = two_steps(d, bad)
         la = rq.get("lead_amendment") or {}
         ok(st.paused == AWAITING_SPEC_AMENDMENT and T.calls.count("plan_fixes") == 2 and cp.get("patch") is None
            and any("only the calibration may change" in e for e in cp.get("rejected") or [])
            and "patch" not in rq and la.get("status") == "refused" and "no machine-readable patch" in la.get("why", "")
            and not os.path.lexists(d + ".amend1"),
-           f"CRF8 a patch outside calibration is rejected twice, not proposed; the lead's amendment is refused and the "
-           f"run waits for the owner ({cp.get('rejected')}, {la})")
-        # CRF9 (Codex r1 P1-5, P1-8, P2-9): a malformed plan is a problem, not an exception; a target binding, an
-        # operation that does not apply and a no-op are refused before the retry
+           f"CRF8 a patch outside calibration is rejected twice, not proposed, and a same-round fix plan's patch does "
+           f"not stand in; the lead's amendment is refused and the run waits for the owner ({cp.get('rejected')}, {la})")
+        # CRF9 (Codex r1 P1-5, P1-8, P2-9; r2 P1-7, P1-8): malformed plans, protected changes, inapplicable operations
+        # and no-ops are plan problems, never exceptions
         pk9 = calibration_packet(d, {"code": "posterior_mcmc"}, 1, 3, None)
 
         def task(p, **kw):
             return {"tasks": [dict({"id": "T1", "findings": [CALIBRATION_REFUSED], "action": "rethink",
                                     "owner_state": "SPEC", "brief": "b", "patch": p}, **kw)]}
         rng0 = yaml.safe_load(open(os.path.join(d, AB.SPEC_FILE)))["calibration"]["range"]
+        rg = {"set": "calibration.range", "value": [-3, 3]}
         cases = {"malformed": (task(patch, id=[]), "text id"),
                  "binding": (task({"reason": "r", "spec": [{"set": "calibration.target_column", "value": "cov"}]}),
                              "calibration.target_column"),
                  "no_value": (task({"reason": "r", "spec": [{"set": "calibration.method"}]}), "set and add need"),
                  "no_op": (task({"reason": "r", "spec": [{"set": "calibration.range", "value": rng0}]}),
-                           "changes nothing")}
+                           "changes nothing"),
+                 "null_key": (task({"reason": "r", "spec": [rg, {"add": "zz_new", "value": None}]}),
+                              "zz_new: only the calibration"),
+                 "more_params": (task({"reason": "r", "spec": [rg, {"add": "calibration.parameters", "value": ["x"]}]}),
+                                 "only a reduced set"),
+                 "new_prior": (task({"reason": "r", "spec": [rg, {"add": "calibration.priors", "value": {
+                     "x": {"dist": "uniform", "range": [0, 1], "source": "s"}}}]}), "only priors the signed spec")}
         got9 = {}
         for name, (pl, want) in cases.items():
             try:
@@ -7778,21 +7810,46 @@ def _self_test_calibration_patch(ok, td: str) -> None:
                 e9 = [f"raised {type(e).__name__}"]
             got9[name] = (any(want in x for x in e9), e9[:1])
         ok(all(v[0] for v in got9.values()) and calibration_plan_problems(task(patch), pk9, d) == [],
-           f"CRF9 malformed plans, target bindings, inapplicable operations and no-ops are plan problems ({got9})")
-        # CRF10 (Codex r1 P1-7): the request reads a calibration plan only from the route that recorded it
+           f"CRF9 malformed plans, protected or widened changes, inapplicable operations and no-ops are plan problems "
+           f"({got9})")
+        # CRF10 (r1 P1-7, r2 P1-2/4/5): a request built from a route is that route's alone, from the run state's copy
         os.remove(os.path.join(d, SPEC_RETHINK_REQUEST))
-        _write_json(d, CALIBRATION_PATCH.format(round=2), {"round": 2, "plan": task(patch), "rejected": [],
-                                                           "signed_spec_sha256": _spec_signed_sha(d), "key": "k"})
+        _write_json(d, CALIBRATION_PATCH.format(round=2), {"round": 2, "plan": task(bad), "rejected": []})
         r10 = rethink_request(d, 2, "lead")
         os.remove(os.path.join(d, SPEC_RETHINK_REQUEST))
-        r10b = rethink_request(d, 2, "lead", calibration={"round": 2, "signed_spec_sha256": "0" * 64, "key": "k"})
-        os.remove(os.path.join(d, SPEC_RETHINK_REQUEST))
-        r10c = rethink_request(d, 2, "lead", calibration={"round": 2, "signed_spec_sha256": _spec_signed_sha(d),
-                                                          "key": "k"})
-        ok("patch" not in r10 and "patch" not in r10b and r10c.get("patch") == patch,
-           "CRF10 a calibration plan is the request's only through its own route, for the spec signed now")
-        ok("spec_patch_proposed.json" in AM.NOT_COPIED and "calibration_patch_" in AM.NOT_COPIED_PREFIX,
-           "CRF11 a child never inherits the parent's proposed or planned calibration patch")
+        route = {"round": 2, "signed_spec_sha256": _spec_signed_sha(d), "key": "k1", "patch": patch, "brief": "b"}
+        r10c = rethink_request(d, 2, "lead", calibration=route)
+        r10d = rethink_request(d, 2, "lead", calibration=dict(route, key="k2", patch=None))
+        ok("patch" not in r10 and r10c.get("patch") == patch and r10c.get("calibration_key") == "k1"
+           and "patch" not in r10d and r10d.get("calibration_key") == "k2",
+           f"CRF10 the request is the route's patch, never a record on disk; a request for another route is not "
+           f"replayed ({r10c.get('calibration_key')}, {r10d.get('calibration_key')})")
+        ok(AM._skip("calibration_patch_r1.json", set()) and not AM._skip("calibration_patch_inputs.csv", set()),
+           "CRF11 a child never inherits the parent's planned calibration patch, and still copies an input of a "
+           "similar name (r2 P1-12)")
+        # CRF12 (r2 P1-3): the route counts only when ANALYZE's calibration back-edge brought the run to SPEC
+        m12 = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False)
+        m12.st.round = 2
+        m12.st.tries["calibration_patch"] = route
+        m12.st.history.append({"at": _now(), "from": "ANALYZE", "to": "SPEC", "why": "calibration refused (x): y"})
+        on = m12._calibration_route() is not None
+        m12.st.history.append({"at": _now(), "from": "FIX_LOOP", "to": "SPEC", "why": "the planner chose a rethink"})
+        ok(on and m12._calibration_route() is None,
+           "CRF12 a calibration route stands only when ANALYZE's calibration back-edge brought the run to SPEC")
+        # CRF13 (r2 P1-1): under a lead amendment a finding the owner declined is never deferred: the child does not
+        # dry-sign and the owner decides
+        d, spec0 = parent("cal_patch_declined", "lead")
+        FL.save(d, {"R-009": FL.Finding(id="R-009", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                        status="owner_declined", first_seen_round=1, claim="a declined blocker")})
+        st, rq, cp, T = two_steps(d, patch)
+        la = rq.get("lead_amendment") or {}
+        kept = la.get("child")
+        rows13 = yaml.safe_load(open(os.path.join(kept, "review_conditions.yaml")))["conditions"] if kept else []
+        dis = {r_["id"]: r_.get("disposition") for r_ in rows13}
+        ok(st.paused == AWAITING_SPEC_AMENDMENT and la.get("status") == "refused" and "would not sign" in la.get("why", "")
+           and dis.get("parent_run:R-009") in (None, "") and dis.get(f"parent_run:{CALIBRATION_REFUSED}") == "deferred",
+           f"CRF13 a declined finding stays open in a lead child (the owner decides); the refusal that asked for the "
+           f"amendment is deferred ({la.get('why', '')[:120]}, {dis})")
     finally:
         g["conflicts_policy_stop"] = orig
 

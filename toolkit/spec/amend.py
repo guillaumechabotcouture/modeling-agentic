@@ -55,9 +55,11 @@ NOT_COPIED = {STATE, "metadata.json", RECORD, REQUEST, "decision_spec.signoff.js
               "scope_signoff_request.json", "report.md", "report_withheld.md", "manuscript.md", "final_gate.json",
               "findings.jsonl", "declared_findings.yaml", "engine_choice.json", "figures", "trace.jsonl",
               "budget_ledger.json", "progress.md", "copied_run.json", "_task_input.json", "done_when_registry.json",
-              "scope_declaration.yaml", "spec_patch_proposed.json"}
-# calibration_patch_r*: a refused calibration's planned amendment (agents/stage_machine.py), the parent's own record
-NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact", "fix_progress", "calibration_patch_")
+              "scope_declaration.yaml"}
+NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact", "fix_progress")
+# a refused calibration's planned amendment (agents/stage_machine.py CALIBRATION_PATCH), the parent's own record;
+# matched exactly, so an input that merely starts with the same word is still copied (Codex r2 on #379, P1-12)
+NOT_COPIED_RE = re.compile(r"calibration_patch_r\d+\.json")
 NOT_COPIED_DIRS = ("models/decision_tests",)     # the parent's decision-test results: the child tests again
 OPS = ("set", "add", "remove")
 
@@ -90,6 +92,7 @@ def _derived_paths() -> set:
 def _skip(rel: str, derived: set) -> bool:
     parts = rel.split("/")
     return (parts[0] in NOT_COPIED or (len(parts) == 1 and parts[0].startswith(NOT_COPIED_PREFIX))
+            or (len(parts) == 1 and NOT_COPIED_RE.fullmatch(parts[0]) is not None)
             or parts[-1].endswith(".lock") or ".before_" in parts[-1] or rel in derived
             or any(rel == d or rel.startswith(d + "/") for d in NOT_COPIED_DIRS))
 
@@ -199,9 +202,14 @@ def _no_aliases(data: bytes, what: str) -> None:
         raise AmendError(f"{what} does not parse: {e}") from None
 
 
-def load_patch(path, request) -> dict:
+def load_patch(path, request, proposed: bool = False) -> dict:
     import yaml
     src = (request or {}).get("patch") if request is not None else None
+    if proposed:          # the owner applies the request's own proposal, as reviewed (Codex r2 on #379, P1-10/11)
+        if path or request is None or src is not None or not isinstance(request.get("proposed_patch"), dict):
+            raise AmendError("--proposed needs --from-request, no --patch, and a request with a proposed_patch")
+        src = request["proposed_patch"]
+        path = None
     if src is None:
         if not path:
             raise AmendError("no patch: pass --patch (" + ("the request carries none" if request is not None
@@ -380,15 +388,28 @@ def _review_conditions(child: str, parent: str) -> dict:
             "output": (r.stdout + r.stderr)[-1500:]}
 
 
-def _lead_defer(child: str, rc: dict, mode: str) -> dict:
-    """Under a lead amendment the child's imported open review conditions (the parent's findings that asked for the
-    amendment among them) are deferred to the owner provisionally (review_conditions.lead_defer, D2), as the lead
-    does at SIGN, before the sheet and the dry-sign: the child's report lists them for the owner (Codex r1 of the
-    calibration route, P1-4). An owner amendment leaves them for the owner to dispose of."""
+def _lead_defer(child: str, rc: dict, mode: str, parent: str, named) -> dict:
+    """Under a lead amendment, the child's imported open review conditions are deferred to the owner provisionally
+    (review_conditions.lead_defer, D2) before the sheet and the dry-sign, as the lead does at SIGN, so the child's
+    report lists them for the owner (Codex r1 P1-4). Of the parent's findings only those the request names (the ones
+    that asked for this amendment) are deferred, and never one the owner declined: the others stay open, the dry-sign
+    fails and the owner decides (Codex r2 on #379, P1-1). An owner amendment leaves every condition to the owner."""
     if mode != "lead" or rc.get("status") != "imported":
         return rc
     from toolkit.spec import review_conditions as RC
-    return dict(rc, lead_deferred=RC.lead_defer(child))
+    named = {str(x) for x in named or ()}
+    declined = set()
+    try:
+        for line in open(os.path.join(parent, "findings.jsonl"), encoding="utf-8"):
+            if line.strip():
+                f = json.loads(line)
+                if isinstance(f, dict) and f.get("status") != "open":
+                    declined.add(str(f.get("id")))
+    except (OSError, ValueError):
+        return dict(rc, lead_deferred=0, lead_defer_skipped="the parent's findings could not be read")
+    skip = {r["id"] for r in RC.parse(RC.read_bytes(child)) if str(r.get("source")) == "parent_run"
+            and (r["id"].split(":", 1)[-1] not in named or r["id"].split(":", 1)[-1] in declined)}
+    return dict(rc, lead_deferred=RC.lead_defer(child, skip=skip), lead_defer_kept_open=sorted(skip))
 
 
 def dry_sign(child: str, by: str, expect: dict) -> dict:
@@ -462,7 +483,8 @@ def _file_sha(d: str, rel: str) -> str:
     return _sha(open(os.path.join(d, rel), "rb").read()) if os.path.isfile(os.path.join(d, rel)) else "none"
 
 
-def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=ROOT, log=print) -> dict:
+def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=ROOT, log=print,
+          proposed=False) -> dict:
     """Make the child run (module docstring) and return its amendment record. AmendError: refused, no child."""
     import yaml
     from lib import pipeline_id
@@ -473,7 +495,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
     request = _request(parent, signed) if from_request else None
     if request and request.get("findings") and not os.path.isfile(os.path.join(parent, "findings.jsonl")):
         raise AmendError("the request names findings but the parent has no findings.jsonl to carry them")
-    p = load_patch(patch, request)
+    p = load_patch(patch, request, proposed)
     _no_aliases(spec_bytes, SPEC)
     spec0 = yaml.safe_load(spec_bytes.decode("utf-8")) or {}
     spec1, changes = apply_ops(spec0, p["spec"], SPEC) if p.get("spec") else (spec0, [])
@@ -542,7 +564,8 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
            "paused": "awaiting_signoff", "status": None, "tries": {}, "journal": {},
            "history": [{"at": meta["created"], "from": None, "to": "SIGN",
                         "why": f"amendment {label} of {parent} ({len(changes)} change(s)): {reason1}"[:500]}]}
-    rc = _lead_defer(child, _review_conditions(child, parent), mode)
+    rc = _lead_defer(child, _review_conditions(child, parent), mode, parent,
+                     [f.get("id") for f in (request or {}).get("findings") or [] if isinstance(f, dict)])
     _, cands = _pre_sign(child, st.get("derived_inputs"))   # the geometry record and candidates, at the final path
     SO.write_sheet(child, cands)
     expect = {"expect_sha256": _file_sha(child, SPEC), "expect_sheet_sha256": _file_sha(child, SO.SHEET),
@@ -590,7 +613,9 @@ def finish(child: str, log=print) -> dict:
         raise AmendError(f"{child}: no amendment record to finish ({e})") from None
     if os.path.lexists(os.path.join(child, STATE)):
         raise AmendError(f"{child} already has its run state")
-    rc = _lead_defer(child, _review_conditions(child, rec["parent_run"]["run_dir"]), rec["signoff"])
+    rc = _lead_defer(child, _review_conditions(child, rec["parent_run"]["run_dir"]), rec["signoff"],
+                     rec["parent_run"]["run_dir"], [f.get("id") for f in (rec.get("request") or {}).get("findings")
+                                                    or [] if isinstance(f, dict)])
     errs, cands = _pre_sign(child, cst.get("derived_inputs"))
     if errs:
         raise AmendError("the child fails the pre-sign checks: " + "; ".join(errs[:10]))
@@ -917,11 +942,13 @@ def main(argv=None) -> int:
     ap.add_argument("--finish", action="store_true", help="re-check a kept child whose dry-sign failed")
     ap.add_argument("--patch", default=None, help="the amendment (YAML: id, reason, spec, dossier)")
     ap.add_argument("--from-request", action="store_true", help=f"take the why (and a patch) from {REQUEST}")
+    ap.add_argument("--proposed", action="store_true", help="with --from-request: apply the request's proposed_patch")
     ap.add_argument("--out", default=None, help="the child run directory (default <parent>.amend<k>)")
     ap.add_argument("--signoff", choices=["owner", "lead"], default=None, help="default: the parent's mode")
     a = ap.parse_args(argv)
     try:
-        rec = finish(a.parent_run) if a.finish else amend(a.parent_run, a.patch, a.from_request, a.out, a.signoff)
+        rec = finish(a.parent_run) if a.finish else amend(a.parent_run, a.patch, a.from_request, a.out, a.signoff,
+                                                                       proposed=a.proposed)
     except AmendError as e:
         print(f"Refused: {e}", file=sys.stderr)
         return 1

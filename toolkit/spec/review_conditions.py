@@ -356,15 +356,16 @@ def missing_critique(run_dir: str) -> list:
             if (c["id"], c["source"], " ".join(c["text"].split())) not in have]
 
 
-def lead_defer(run_dir: str, today: datetime.date | None = None) -> int:
+def lead_defer(run_dir: str, today: datetime.date | None = None, skip=()) -> int:
     """Under --signoff lead: every open row is deferred to the owner, provisionally (D2), and the run proceeds; the
-    report lists them at its top. Rows already disposed are left as they are. The count deferred."""
+    report lists them at its top. Rows already disposed, and rows whose id is in `skip`, are left as they are. The
+    count deferred."""
     import yaml
     rows = parse(read_bytes(run_dir))
     due = ((today or datetime.date.today()) + datetime.timedelta(days=LEAD_DEFER_DAYS)).isoformat()
     n = 0
     for r in rows:
-        if r.get("disposition") in (None, ""):
+        if r.get("disposition") in (None, "") and r.get("id") not in set(skip):
             r.update(disposition="deferred", owner="owner", due=due, provisional=PROVISIONAL)
             n += 1
     if n:
