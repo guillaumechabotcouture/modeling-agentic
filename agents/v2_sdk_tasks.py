@@ -124,7 +124,13 @@ it out). A rate measured per unit from counts carries sampling error unit by uni
 card offers per-unit sampling (the package-rate engine's `baseline.sampling` in trial_priors mode,
 with each unit's event counts bound as `baseline_events`), declare it, then list the `unit_rates`
 uncertainty source, or exclude it with a reason; a headline interval with next to no width goes
-to the owner. Output:
+to the owner. For an estimates spec, when structural assumptions such as generation-interval
+uncertainty or constant versus time-varying transmissibility could move an output, vary
+`dynamics.generation_interval.scale_range` and/or pool alternative `dynamics.transmissibility`
+structures (`{{pool: [constant, {{knots: [...], priors: {{...}}}}], weighting}}`) and list
+`generation_interval` / `transmissibility_structure` in `uncertainty.sources`; otherwise list
+any held-fixed structural kind in `uncertainty.excluded` with a reason so the interval states
+what it omits. Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """

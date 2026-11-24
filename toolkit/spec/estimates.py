@@ -17,8 +17,9 @@ measurement models, a `posterior` calibration and the outputs:
         {kind: threshold, output: <name>, threshold: 1.0, direction: above | below, probability: 0.95,
          statements: {yes: "...", no: "...", undetermined: "..."}}
     dynamics:                                          # what the engine configuration is built from (engine-agnostic)
-      generation_interval: {csv, lag, probability, step: week | day, values: [w_1, ...]}   # values = the csv's
-      transmissibility: constant | {knots: [t_1, ...]}
+      generation_interval: {csv, lag, probability, step: week | day, values: [w_1, ...],
+                            scale_range?: {range: [lo, hi], steps?: 5, source}}   # values = the csv's
+      transmissibility: constant | {knots: [t_1, ...]} | {pool: [...], weighting?: marginal_likelihood | equal}
     observations:
       sources: [{id, measures, latent, frame, bias, noise, delay?}]   # toolkit/analysis/observation.py vocabulary;
                                                      # noise.dispersion: a number or {param, prior, source};
@@ -29,8 +30,11 @@ measurement models, a `posterior` calibration and the outputs:
       targets: {csv, source: <source id>, step: <1-based step column>, observed: <count column>,
                 frame: {band, source}}
 
-`uncertainty.sources` lists `calibration` (the joint posterior) and `observation` (each source's measurement
-parameters, carried by the same posterior); every other kind is excluded with a reason. Nothing here names a disease.
+`uncertainty.sources` always lists `calibration` (the joint posterior) and `observation` (each source's measurement
+parameters, carried by the same posterior), plus any declared structural kind (`generation_interval` when
+`scale_range` is declared; `transmissibility_structure` when `transmissibility.pool` is declared). A structural kind
+held fixed may be listed in `uncertainty.excluded` (`[{kind, reason}]`) so the interval label names what it omits.
+Nothing here names a disease.
 """
 from __future__ import annotations
 
@@ -50,6 +54,11 @@ NOT_APPLICABLE = ("options", "constraints", "comparator", "objective")
 SCALES = ("ratio", "proportion", "rate")
 DIRECTIONS = ("above", "below")
 UQ_KINDS = ("calibration", "observation")
+UQ_STRUCTURAL = ("generation_interval", "transmissibility_structure")
+UQ_ALL = UQ_KINDS + UQ_STRUCTURAL
+WEIGHTING = ("marginal_likelihood", "equal")
+MAX_VARIANTS = 15
+MAX_GI_LAGS = 10_000
 STEPS = ("week", "day")
 
 
@@ -103,11 +112,131 @@ def gi_from_spec(raw: dict, base: str | None = None) -> dict:
     return {"dt": gi["step"], "w": [float(v) for v in vals]}
 
 
+def rescale_gi(w, scale: float) -> list[float]:
+    """Piecewise-constant CDF rescaling of lag-1..L PMF `w` by `scale > 0`, normalised with trailing zeros trimmed."""
+    if not _isnum(scale) or float(scale) <= 0:
+        raise ValueError(f"rescale_gi: scale must be finite and > 0 (got {scale!r})")
+    w = w.tolist() if hasattr(w, "tolist") and not isinstance(w, (str, bytes)) else w
+    if not isinstance(w, (list, tuple)) or not w or not all(_isnum(v) and float(v) >= 0 for v in w):
+        raise ValueError("rescale_gi: w must be a non-empty list of finite non-negative numbers")
+    wf, s = [float(v) for v in w], float(scale)
+    if sum(wf) <= 0:
+        raise ValueError("rescale_gi: w must have positive sum")
+    if s == 1.0:
+        return list(wf)
+    L = len(wf)
+    n_out = max(1, int(math.ceil(s * L)))
+    if n_out > MAX_GI_LAGS:
+        raise ValueError(f"rescale_gi: scaled PMF length {n_out} exceeds cap {MAX_GI_LAGS}")
+    out = [0.0] * n_out
+    for i, wi in enumerate(wf):
+        if wi == 0.0:
+            continue
+        a, b = i * s, (i + 1) * s
+        k0, k1 = int(math.floor(a)), min(n_out - 1, int(math.floor(b)))
+        for k in range(k0, k1 + 1):
+            ov = min(b, float(k + 1)) - max(a, float(k))
+            if ov > 0.0:
+                out[k] += wi * (ov / s)
+    while len(out) > 1 and out[-1] == 0.0:
+        out.pop()
+    tot = math.fsum(out)
+    if tot <= 0:
+        raise ValueError("rescale_gi: rescaled PMF has zero mass")
+    return [x / tot for x in out]
+
+
+def gi_scales(raw: dict) -> list[float]:
+    """Scale-factor grid from dynamics.generation_interval.scale_range (default [1.0])."""
+    sr = ((raw.get("dynamics") or {}).get("generation_interval") or {}).get("scale_range")
+    if sr is None:
+        return [1.0]
+    if not isinstance(sr, dict) or set(sr) - {"range", "steps", "source"}:
+        raise ValueError("dynamics.generation_interval.scale_range: {range: [lo, hi], steps?: odd int in [3, 9], source}")
+    rng, steps = sr.get("range"), sr.get("steps", 5)
+    if not (isinstance(rng, list) and len(rng) == 2 and all(_isnum(v) for v in rng)
+            and 0 < float(rng[0]) < float(rng[1]) and float(rng[0]) <= 1.0 <= float(rng[1])):
+        raise ValueError("dynamics.generation_interval.scale_range.range: [lo, hi] with 0 < lo < hi and lo <= 1.0 <= hi")
+    if isinstance(steps, bool) or not isinstance(steps, int) or not (3 <= steps <= 9 and steps % 2 == 1):
+        raise ValueError("dynamics.generation_interval.scale_range.steps: odd integer in [3, 9]")
+    if not (isinstance(sr.get("source"), str) and sr["source"].strip()):
+        raise ValueError("dynamics.generation_interval.scale_range.source: non-empty string required")
+    lo, hi = float(rng[0]), float(rng[1])
+    return [1.0 if abs(v - 1.0) < 1e-12 else v for v in (lo + (hi - lo) * i / (steps - 1) for i in range(steps))]
+
+
+def _check_knots(knots, h, where: str, check_horizon: bool = True) -> list[float]:
+    if not (isinstance(knots, list) and knots and all(_isnum(x) for x in knots)):
+        raise ValueError(f"{where}: non-empty list of strictly increasing numbers inside the horizon")
+    ks = [float(x) for x in knots]
+    if any(b <= a for a, b in zip(ks, ks[1:])):
+        raise ValueError(f"{where}: knots must be strictly increasing ({ks})")
+    if check_horizon and isinstance(h, dict) and _isnum(h.get("start")) and _isnum(h.get("stop")) \
+            and any(not (float(h["start"]) < x < float(h["stop"])) for x in ks):
+        raise ValueError(f"{where}: each knot must lie strictly inside ({h['start']}, {h['stop']})")
+    return ks
+
+
+def transmissibility_structures(raw: dict, check_horizon: bool = True) -> tuple[list[dict], str]:
+    """(structures, weighting) from dynamics.transmissibility."""
+    tr, h = (raw.get("dynamics") or {}).get("transmissibility", "constant"), raw.get("horizon")
+    if tr == "constant":
+        return [{"transmissibility": "constant", "priors": {}, "label": "constant"}], "marginal_likelihood"
+    if isinstance(tr, dict) and "pool" in tr:
+        w, pool = tr.get("weighting", "marginal_likelihood"), tr.get("pool")
+        if set(tr) - {"pool", "weighting"} or w not in WEIGHTING or not isinstance(pool, list) or len(pool) < 2:
+            raise ValueError(f"dynamics.transmissibility: {{pool: [>=2 distinct structures], weighting?: {WEIGHTING}}}")
+        out, seen = [], set()
+        for i, item in enumerate(pool):
+            where = f"dynamics.transmissibility.pool[{i}]"
+            if item == "constant":
+                key, entry = ("constant",), {"transmissibility": "constant", "priors": {}, "label": "constant"}
+            elif isinstance(item, dict) and set(item) == {"knots", "priors"}:
+                ks = _check_knots(item["knots"], h, f"{where}.knots", check_horizon)
+                want = {f"transmissibility:{k}" for k in range(1, len(ks) + 1)}
+                if not isinstance(item["priors"], dict) or set(item["priors"]) != want:
+                    raise ValueError(f"{where}.priors: must provide exactly {sorted(want)}")
+                key = tuple(ks)
+                entry = {"transmissibility": {"knots": ks}, "priors": dict(item["priors"]),
+                         "label": "knots:" + ",".join(f"{x:.12g}" for x in ks)}
+            else:
+                raise ValueError(f"{where}: must be 'constant' or {{knots: [...], priors: {{...}}}}")
+            if key in seen:
+                raise ValueError(f"dynamics.transmissibility.pool: duplicate structure {entry['label']!r}")
+            seen.add(key)
+            out.append(entry)
+        return out, w
+    if isinstance(tr, dict) and set(tr) == {"knots"}:
+        ks = _check_knots(tr["knots"], h, "dynamics.transmissibility.knots", check_horizon)
+        return [{"transmissibility": {"knots": ks}, "priors": {},
+                 "label": "knots:" + ",".join(f"{x:.12g}" for x in ks)}], "marginal_likelihood"
+    raise ValueError("dynamics.transmissibility: constant | {knots: [t, ...]} | {pool: [...], weighting?}")
+
+
+def structural_variants(raw: dict) -> tuple[list[dict], str]:
+    """(variants, weighting): Cartesian product of generation-interval scales and transmissibility structures."""
+    gi, scales = gi_from_spec(raw), gi_scales(raw)
+    structs, weighting = transmissibility_structures(raw)
+    out = []
+    for sc in scales:
+        w_sc = rescale_gi(gi["w"], sc)
+        for st in structs:
+            vid = f"gi{sc:.12g}_{st['label'].replace(':', '_').replace(',', '_')}"
+            out.append({"id": vid, "gi_scale": sc, "gi": {"dt": gi["dt"], "w": w_sc},
+                        "transmissibility": st["transmissibility"], "transmissibility_label": st["label"],
+                        "priors": dict(st["priors"]),
+                        "config": {"generation_interval": {"dt": gi["dt"], "w": w_sc},
+                                   "dt": gi["dt"], "transmissibility": st["transmissibility"]}})
+    if len({v["id"] for v in out}) != len(out):
+        raise ValueError("dynamics: structural variants produced duplicate variant ids")
+    return out, weighting
+
+
 def engine_config(raw: dict) -> dict:
-    """The engine configuration an estimates spec implies (for engines configured from `dynamics`)."""
-    d = raw.get("dynamics") or {}
+    """Base engine configuration implied by `dynamics` (for a pool, its first structure)."""
     gi = gi_from_spec(raw)
-    return {"generation_interval": gi, "dt": gi["dt"], "transmissibility": d.get("transmissibility", "constant")}
+    return {"generation_interval": gi, "dt": gi["dt"],
+            "transmissibility": transmissibility_structures(raw, check_horizon=False)[0][0]["transmissibility"]}
 
 
 def integral(x, what="value") -> int:
@@ -178,14 +307,31 @@ def validate_pending(s) -> list[str]:
         return bad + [f"decision_units: units table unreadable: {e}"]
     if len(units) != 1:
         bad.append(f"decision_units: an estimates spec describes one population (one row); the table has {len(units)}")
+    gi_raw, tr_raw = (r.get("dynamics") or {}).get("generation_interval"), (r.get("dynamics") or {}).get("transmissibility", "constant")
+    has_gi_scale = isinstance(gi_raw, dict) and gi_raw.get("scale_range") is not None
+    has_tr_pool = isinstance(tr_raw, dict) and "pool" in tr_raw
+    gi_ok, scales, tr_structs = None, [1.0], None
     try:
-        gi_from_spec(r, s.base)
+        gi_ok = gi_from_spec(r, s.base)
+        from toolkit.engines.renewal.engine import check_generation_interval
+        check_generation_interval(gi_ok, gi_ok["dt"])
     except (OSError, ValueError) as e:
+        gi_ok = None
         bad.append(str(e))
-    tr = (r.get("dynamics") or {}).get("transmissibility", "constant")
-    if tr != "constant" and not (isinstance(tr, dict) and isinstance(tr.get("knots"), list) and tr["knots"]
-                                 and all(_isnum(x) and h["start"] < x < h["stop"] for x in tr["knots"])):
-        bad.append("dynamics.transmissibility: constant | {knots: [t, ...]} with each knot inside the horizon")
+    try:
+        scales = gi_scales(r)
+        if gi_ok is not None and has_gi_scale:
+            from toolkit.engines.renewal.engine import check_generation_interval
+            for sc in scales:
+                check_generation_interval({"dt": gi_ok["dt"], "w": rescale_gi(gi_ok["w"], sc)}, gi_ok["dt"])
+    except ValueError as e:
+        bad.append(str(e))
+    try:
+        tr_structs, _ = transmissibility_structures(r, check_horizon=True)
+    except ValueError as e:
+        bad.append(str(e))
+    if tr_structs is not None and len(scales) * len(tr_structs) > MAX_VARIANTS:
+        bad.append(f"dynamics: {len(scales) * len(tr_structs)} structural variants exceeds the cap of {MAX_VARIANTS}")
     # observation sources
     from toolkit.analysis import observation as ob
     srcs = (r.get("observations") or {}).get("sources")
@@ -259,6 +405,22 @@ def validate_pending(s) -> list[str]:
             Prior.from_decl(n, d)
         except ValueError as e:
             bad.append(f"observations: {n}: {e}")
+    if has_tr_pool and tr_structs:
+        pool_pnames = set()
+        for idx, st in enumerate(tr_structs):
+            for n, d in st["priors"].items():
+                pool_pnames.add(n)
+                where = f"dynamics.transmissibility.pool[{idx}].priors.{n}"
+                if n in pri or n in seen:
+                    bad.append(f"parameter_name_collision: {where}: {n} collides with {'calibration.priors' if n in pri else seen[n]}")
+                try:
+                    Prior.from_decl(n, d)
+                except ValueError as e:
+                    bad.append(f"{where}: {e}")
+                if not (isinstance(d, dict) and isinstance(d.get("source"), str) and d["source"].strip()):
+                    bad.append(f"{where}: a non-empty source is required")
+        bad += [f"calibration.priors.{n}: declare knot priors on each pooled structure, not calibration.priors"
+                for n in pri if str(n).startswith("transmissibility:") and n not in pool_pnames]
     t = cal.get("targets") or {}
     for k in ("csv", "source", "step", "observed"):
         if not str(t.get(k) or "").strip():
@@ -282,22 +444,47 @@ def validate_pending(s) -> list[str]:
         except (OSError, KeyError, ValueError) as e:
             bad.append(f"calibration.targets: {t.get('csv')} unreadable: {e}")
     # uncertainty
-    u = r["uncertainty"]
-    if isinstance(u, dict) and "affordability" in u:      # F6 S1-1: no allocation, so no plan cost to afford
+    u = r["uncertainty"] if isinstance(r["uncertainty"], dict) else {}
+    if not isinstance(r["uncertainty"], dict):
+        bad.append("uncertainty: must be a mapping")
+    if "affordability" in u:      # F6 S1-1: no allocation, so no plan cost to afford
         bad.append("uncertainty.affordability: not supported for an estimates spec (it has no plan to afford)")
-    srcs_k = [x.get("kind") for x in (u.get("sources") or []) if isinstance(x, dict)]
-    exc = [x for x in (u.get("excluded") or []) if isinstance(x, dict)]
-    for k in UQ_KINDS:
-        if k not in srcs_k:
-            bad.append(f"uncertainty: kind {k} must be a source (the joint posterior always carries it)")
-    if exc:
-        bad.append("uncertainty.excluded: not supported for an estimates spec (the posterior samples every declared "
-                   "prior and observation parameter; fix a quantity by declaring it as data instead)")
+    raw_srcs = u.get("sources")
+    if not isinstance(raw_srcs, list) or not all(isinstance(x, dict) and x.get("kind") for x in raw_srcs):
+        bad.append("uncertainty.sources: list of {kind} mappings")
+    srcs_k = [x.get("kind") for x in (raw_srcs if isinstance(raw_srcs, list) else []) if isinstance(x, dict)]
+    bad += [f"uncertainty.sources: duplicate kind {k!r}" for k in sorted({k for k in srcs_k if srcs_k.count(k) > 1})]
+    bad += [f"uncertainty: kind {k} must be a source (the joint posterior always carries it)" for k in UQ_KINDS
+            if k not in srcs_k]
+    bad += [f"uncertainty.sources: kind {k!r} not in {UQ_ALL} for an estimates spec" for k in srcs_k if k not in UQ_ALL]
+    raw_exc, exc_k = u.get("excluded"), []
+    if raw_exc is not None and not isinstance(raw_exc, list):
+        bad.append(f"uncertainty.excluded: list of {{kind, reason}} for structural kinds in {UQ_STRUCTURAL}")
+    for e in (raw_exc if isinstance(raw_exc, list) else []):
+        if not isinstance(e, dict) or set(e) != {"kind", "reason"}:
+            bad.append(f"uncertainty.excluded: each entry must be {{kind, reason}} for a structural kind in {UQ_STRUCTURAL}")
+            continue
+        k, reason = e["kind"], e["reason"]
+        if k in UQ_KINDS:
+            bad.append(f"uncertainty.excluded: kind {k!r} cannot be excluded (the joint posterior always carries it)")
+        elif k not in UQ_STRUCTURAL:
+            bad.append(f"uncertainty.excluded: kind {k!r} not in {UQ_STRUCTURAL} for an estimates spec")
+        else:
+            if not (isinstance(reason, str) and reason.strip()):
+                bad.append(f"uncertainty.excluded: kind {k!r} requires a non-empty string reason")
+            if k in exc_k:
+                bad.append(f"uncertainty.excluded: duplicate kind {k!r}")
+            exc_k.append(k)
+    bad += [f"uncertainty: kind {k!r} cannot be in both sources and excluded" for k in sorted(set(srcs_k) & set(exc_k))]
+    for kind, flag, decl in (("generation_interval", has_gi_scale, "dynamics.generation_interval.scale_range"),
+                             ("transmissibility_structure", has_tr_pool, "dynamics.transmissibility.pool")):
+        if flag and kind not in srcs_k:
+            bad.append(f"uncertainty.sources: {decl} requires {kind!r} in uncertainty.sources")
+        if kind in srcs_k and not flag:
+            bad.append(f"uncertainty.sources: {kind!r} requires {decl}")
     if (r.get("analysis") or {}).get("decision_tests"):
         bad.append("analysis.decision_tests: not run for an estimates spec (its automatic prior_range tests are); "
                    "remove them")
-    bad += [f"uncertainty.sources: kind {k!r} not in {UQ_KINDS} for an estimates spec" for k in srcs_k
-            if k not in UQ_KINDS]
     lv = u.get("level", 0.95)
     if not (_isnum(lv) and 0 < lv < 1):
         bad.append("uncertainty.level: in (0, 1)")
@@ -366,8 +553,12 @@ def validate(s, eng) -> list[str]:
                            "(a quantity is data or calibrated, not both)")
         else:
             bad.append(f"calibration.priors.{n}: neither an engine parameter nor a unit attribute of {card.name}")
-    miss = [p for p, v in pnames.items() if v.kind == "calibrated"
-            and p not in ((s.raw.get("calibration") or {}).get("priors") or {})]
+    cal_pri = (s.raw.get("calibration") or {}).get("priors") or {}
+    try:
+        base_pool_priors = set(transmissibility_structures(s.raw, check_horizon=False)[0][0]["priors"])
+    except ValueError:
+        base_pool_priors = set()
+    miss = [p for p, v in pnames.items() if v.kind == "calibrated" and p not in cal_pri and p not in base_pool_priors]
     if miss:
         bad.append(f"calibration.priors: the engine's calibrated parameters {miss} need a prior (no silent defaults)")
     wm = set((card.outputs or {}).get("windows") or [])
@@ -440,35 +631,46 @@ def prior_support_problems(s, eng) -> list[str]:
     refusal guards either way. Observation parameters do not reach the engine and are not probed."""
     from toolkit.analysis.calibration import Prior
     from toolkit.engines.contract import Horizon, Package, UnitSpec
-    card = eng.describe()
-    pnames = {p.name for p in eng.parameters()}
-    pri = (s.raw.get("calibration") or {}).get("priors") or {}
-    names = [n for n in pri if n in pnames or n in card.unit_attributes]
-    if not names:
-        return []
-    corners, info = probe_corners([support_ends(Prior.from_decl(n, pri[n])) for n in names])
+    cal_pri = (s.raw.get("calibration") or {}).get("priors") or {}
+    structs, _ = transmissibility_structures(s.raw, check_horizon=False)
     h = s.raw["horizon"]
     wins = {k: tuple(float(x) for x in v) for k, v in ((s.raw.get("deliverable") or {}).get("windows") or {}).items()}
     hz = Horizon(float(h["start"]), float(h["stop"]), (float(h["start"]), float(h["stop"])), wins)
     base = s.unit_attributes(s.units()[0])
-    bound = {k: v for k, v in base.items() if k not in names}
     fmt = lambda d: ", ".join(f"{k}={v:.3g}" if isinstance(v, (int, float)) else f"{k}={v}"  # noqa: E731
                               for k, v in d.items())
+    base_cfg = engine_config(s.raw) if (len(structs) > 1 or structs[0]["priors"]) else None
     out = []
-    for c in corners:
-        vals = dict(zip(names, c))
-        params = {k: float(v) for k, v in vals.items() if k in pnames}
-        unit = UnitSpec("probe", dict(base, **{k: float(v) for k, v in vals.items() if k not in pnames}))
-        try:
-            eng.run_batch([params], [unit], [Package("none", {})], hz, 1)
-        except (ValueError, RuntimeError) as e:
-            where = (f"; with the attributes bound to data or accepted defaults {fmt(bound)}: correct the binding or "
-                     "the prior ranges") if bound else "; narrow the prior ranges to values the engine accepts"
-            out.append(f"prior_support_infeasible: calibration.priors: the engine refuses the corner {fmt(vals)} of "
-                       f"the declared prior box ({e}){where}"
-                       + (f" ({info['probed']} of {info['total']} corners probed)" if info["sampled"] else ""))
-            if len(out) >= 3:
-                break
+    for st in structs:
+        if base_cfg is None or st["transmissibility"] == base_cfg["transmissibility"]:
+            eng_s = eng
+        else:
+            kw = dict(base_cfg, transmissibility=st["transmissibility"])
+            if hasattr(eng, "results_path"):
+                kw["results_path"] = eng.results_path
+            eng_s = type(eng)(**kw)
+        pri = dict(cal_pri, **st["priors"])
+        card, pnames = eng_s.describe(), {p.name for p in eng_s.parameters()}
+        names = [n for n in pri if n in pnames or n in card.unit_attributes]
+        if not names:
+            continue
+        corners, info = probe_corners([support_ends(Prior.from_decl(n, pri[n])) for n in names])
+        bound = {k: v for k, v in base.items() if k not in names}
+        tag = f" ({st['label']})" if base_cfg is not None else ""
+        for c in corners:
+            vals = dict(zip(names, c))
+            params = {k: float(v) for k, v in vals.items() if k in pnames}
+            unit = UnitSpec("probe", dict(base, **{k: float(v) for k, v in vals.items() if k not in pnames}))
+            try:
+                eng_s.run_batch([params], [unit], [Package("none", {})], hz, 1)
+            except (ValueError, RuntimeError) as e:
+                where = (f"; with the attributes bound to data or accepted defaults {fmt(bound)}: correct the binding "
+                         "or the prior ranges") if bound else "; narrow the prior ranges to values the engine accepts"
+                out.append(f"prior_support_infeasible: calibration.priors{tag}: the engine refuses the corner "
+                           f"{fmt(vals)} of the declared prior box ({e}){where}"
+                           + (f" ({info['probed']} of {info['total']} corners probed)" if info["sampled"] else ""))
+                if len(out) >= 3:
+                    return out
     return out
 
 
@@ -700,6 +902,90 @@ def _self_test() -> int:
         cs, info = probe_corners([[0.0, 1.0], [2.0, 3.0]], 64)
         ok(sorted(cs) == [(0.0, 2.0), (0.0, 3.0), (1.0, 2.0), (1.0, 3.0)] and not info["sampled"],
            f"ES28b up to the cap every corner is probed: {cs}")
+        # ---- structural uncertainty: excluded kinds, GI scale_range, transmissibility pool
+        def check_valid(fn, label):
+            raw, keep = copy.deepcopy(yaml.safe_load(open(sp))), open(sp).read()
+            fn(raw)
+            yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
+            e = schema.validate(schema.load(sp))
+            open(sp, "w").write(keep)
+            ok(e == [], f"{label}: {e[:2]}")
+
+        check_valid(lambda r: r["uncertainty"].update(excluded=[{"kind": "generation_interval", "reason": "toy: fixed"},
+                    {"kind": "transmissibility_structure", "reason": "toy: constant"}]), "ES29 structural excluded validates")
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import render_claims
+        lab = render_claims.interval_label({"level": 0.95, "covers": ["calibration", "observation"],
+                                            "excludes": ["generation_interval", "transmissibility_structure"]})
+        ok(lab == "95% UI over calibration, observation; not covered: generation interval, transmissibility structure", f"ES29a {lab!r}")
+        for desc, exc_val, needle in (
+            ("calibration", [{"kind": "calibration", "reason": "x"}], "cannot be excluded"),
+            ("observation", [{"kind": "observation", "reason": "x"}], "cannot be excluded"),
+            ("unknown", [{"kind": "costs", "reason": "x"}], "not in"),
+            ("empty reason", [{"kind": "generation_interval", "reason": " "}], "non-empty string reason"),
+            ("dup", [{"kind": "generation_interval", "reason": "a"}, {"kind": "generation_interval", "reason": "b"}], "duplicate"),
+        ):
+            mut(lambda r, v=exc_val: r["uncertainty"].update(excluded=v), needle, f"ES29b ({desc})")
+        mut(lambda r: (r["dynamics"]["generation_interval"].update(scale_range={"range": [0.8, 1.2], "source": "toy"}),
+                       r["uncertainty"]["sources"].append({"kind": "generation_interval"}),
+                       r["uncertainty"].update(excluded=[{"kind": "generation_interval", "reason": "x"}])),
+            "both sources and excluded", "ES29c both sources & excluded")
+        from toolkit.engines.renewal.engine import check_generation_interval
+        w0 = [0.2, 0.4, 0.3, 0.1]
+        rescaled = [rescale_gi(w0, sc) for sc in (0.6, 0.8, 1.0, 1.25, 1.6)]
+        for ws in rescaled:
+            check_generation_interval({"dt": "week", "w": ws}, "week")
+        means = [sum((i + 1) * v for i, v in enumerate(ws)) for ws in rescaled]
+        tail_w = rescale_gi([1.0, 1e-18], 2.0)
+        cap_refused = False
+        try:
+            rescale_gi([0.5, 0.5], 1e6)
+        except ValueError:
+            cap_refused = True
+        ok(rescaled[2] == w0 and all(abs(sum(ws) - 1.0) < 1e-12 and ws[-1] > 0.0 for ws in rescaled)
+           and all(b > a for a, b in zip(means, means[1:]))
+           and len(tail_w) == 4 and tail_w[2] > 0.0 and tail_w[3] > 0.0 and cap_refused,
+           f"ES30 rescale_gi exact, normalised, monotone, tail-preserving, lag-capped: {means}")
+        check_valid(lambda r: (r["dynamics"]["generation_interval"].update(scale_range={"range": [0.8, 1.2], "steps": 5, "source": "toy"}),
+                               r["uncertainty"]["sources"].append({"kind": "generation_interval"})), "ES31a scale_range")
+        raw_close = copy.deepcopy(yaml.safe_load(open(sp)))
+        raw_close["dynamics"]["generation_interval"]["scale_range"] = {"range": [0.9999999, 1.0000001], "steps": 3, "source": "toy"}
+        vs_close, _ = structural_variants(raw_close)
+        ok(len({v["id"] for v in vs_close}) == 3, f"ES31e distinct variant ids for close scales: {[v['id'] for v in vs_close]}")
+        # Base GI weights [1, 1] must be refused even under asymmetric scale_range omitting 1.0
+        mut(lambda r: (open(os.path.join(d, "data", "gi_bad.csv"), "w").write("lag,p\n1,1.0\n2,1.0\n"),
+                       r["dynamics"]["generation_interval"].update(csv="data/gi_bad.csv", values=[1.0, 1.0],
+                                                                   scale_range={"range": [0.8, 1.4], "steps": 3, "source": "toy"}),
+                       r["uncertainty"]["sources"].append({"kind": "generation_interval"})),
+            "sum", "ES31f invalid base GI refused even when asymmetric scale_range omits 1.0")
+        mut(lambda r: r["dynamics"]["generation_interval"].update(scale_range={"range": [0.8, 1.2], "source": "toy"}), "requires 'generation_interval'", "ES31b")
+        mut(lambda r: r["uncertainty"]["sources"].append({"kind": "generation_interval"}), "requires dynamics.generation_interval.scale_range", "ES31c")
+        for desc, sr, needle in (("lo<=0", {"range": [0.0, 1.2], "source": "toy"}, "0 < lo"), ("no 1.0", {"range": [1.1, 1.5], "source": "toy"}, "1.0"),
+                                 ("even", {"range": [0.8, 1.2], "steps": 4, "source": "toy"}, "odd"), ("no src", {"range": [0.8, 1.2], "source": ""}, "source")):
+            mut(lambda r, sr=sr: (r["dynamics"]["generation_interval"].update(scale_range=sr),
+                                  r["uncertainty"]["sources"].append({"kind": "generation_interval"})), needle, f"ES31d ({desc})")
+        wk, pr1 = 7.0 / 365.25, {"transmissibility:1": {"dist": "loguniform", "range": [0.2, 5.0], "source": "toy"}}
+        kn = lambda ks, pr: {"knots": ks, "priors": pr}  # noqa: E731
+        pool_ok = {"pool": ["constant", kn([8 * wk], pr1)]}
+        check_valid(lambda r: (r["dynamics"].update(transmissibility=copy.deepcopy(pool_ok)),
+                               r["uncertainty"]["sources"].append({"kind": "transmissibility_structure"})), "ES32a pool")
+        check_valid(lambda r: (r["dynamics"].update(transmissibility={"pool": [kn([8 * wk], pr1), "constant"], "weighting": "equal"}),
+                               r["engine"]["config"].update(transmissibility={"knots": [8 * wk]}),
+                               r["uncertainty"]["sources"].append({"kind": "transmissibility_structure"})), "ES32b knotted-first")
+        mut(lambda r: r["dynamics"].update(transmissibility=copy.deepcopy(pool_ok)), "requires 'transmissibility_structure'", "ES32c")
+        mut(lambda r: r["uncertainty"]["sources"].append({"kind": "transmissibility_structure"}), "requires dynamics.transmissibility.pool", "ES32d")
+        for desc, tr_v, needle in (("<2", {"pool": ["constant"]}, ">=2"), ("dup", {"pool": ["constant", "constant"]}, "duplicate"),
+                                   ("no prior", {"pool": ["constant", kn([8 * wk], {})]}, "must provide"),
+                                   ("unsorted", {"pool": ["constant", kn([8 * wk, 4 * wk], {"transmissibility:1": pr1["transmissibility:1"],
+                                                                                            "transmissibility:2": pr1["transmissibility:1"]})]}, "increasing"),
+                                   ("infeasible", {"pool": ["constant", kn([8 * wk], {"transmissibility:1": {"dist": "loguniform", "range": [0.001, 50.0], "source": "toy"}})]},
+                                    "prior_support_infeasible")):
+            mut(lambda r, tv=tr_v: (r["dynamics"].update(transmissibility=copy.deepcopy(tv)),
+                                    r["uncertainty"]["sources"].append({"kind": "transmissibility_structure"})), needle, f"ES32e ({desc})")
+        mut(lambda r: (r["dynamics"]["generation_interval"].update(scale_range={"range": [0.8, 1.2], "steps": 9, "source": "toy"}),
+                       r["dynamics"].update(transmissibility=copy.deepcopy(pool_ok)),
+                       r["uncertainty"]["sources"].extend([{"kind": "generation_interval"}, {"kind": "transmissibility_structure"}])),
+            "exceeds the cap", "ES32f >15 variants")
         with open(os.path.join(d, "data", "pop.csv"), "a") as f:
             f.write("b,5\n")
         e = schema.validate(schema.load(sp))
