@@ -1,7 +1,7 @@
 # Diagnostic data: inventory and contract
 
-Status: draft for the owner's review (2026-11-24). Nothing here is built yet. The owner reviews this
-document before PR 1 (`events.jsonl`) and PR 2 (the read-only MCP server) start.
+Status: reviewed by the owner on 2026-11-24 (decisions in §11). Nothing here is built yet: PR 1
+(`events.jsonl`) and PR 2 (the read-only MCP server) follow.
 
 ## 1. Purpose
 
@@ -126,14 +126,14 @@ are marked (owner) and quoted.
 | S1 | queued, merged, skipped PRs with reasons | supervisor `status.json` and `state.json` in blob storage; `supervisor.py pull` copies them to `~/modeling-agentic-keep/supervisor` | `follow.py` pulls on a schedule; `supervisor_status` reads the copy [PR 2] |
 | S2 | supervisor heartbeat, collection by launch and label, errors | the same `status.json` | as S1 |
 | P1 | open PRs: number, title, branch, head sha, checks state, review decision, updated time | `gh pr list` (network) | a cached `gh pr list --json ...` output with its fetch time [PR 2 `open_prs`] |
-| P2 | per PR: its markers; per collected run: which markers are present | markers are prose in PR descriptions and `ops/hb*_smoke_markers.md`; `scripts/smoke_check.py` checks them | markers in machine-readable form: a `markers:` list in each change fragment's front matter, read by a `smoke_markers` tool that runs `smoke_check` logic over the mirrored runs [proposed: PR 3, after review] |
-| P3 | goals and their status; open and merged PRs mapped to them | `docs/design/improvement-plan.md` Status, `changes/*.md`, `ops/work_queue.md` | a goal id per change fragment (front matter `goal:`), so PRs group under goals [proposed, after review] |
+| P2 | per PR: its markers; per collected run: which markers are present | markers are prose in PR descriptions and `ops/hb*_smoke_markers.md`; `scripts/smoke_check.py` checks them | markers in machine-readable form: a `markers:` list in each change fragment's front matter, read by a `smoke_markers` tool that runs `smoke_check` logic over the mirrored runs [fragment format: owner yes 2026-11-24, small PR; `smoke_markers` tool in PR 2] |
+| P3 | goals and their status; open and merged PRs mapped to them | `docs/design/improvement-plan.md` Status, `changes/*.md`, `ops/work_queue.md` | a goal id per change fragment (front matter `goal:`), so PRs group under the ids of `docs/design/goals.yaml` [owner yes 2026-11-24, same small PR] |
 | P4 | per baseline: findings by source (checklist rule vs free-form critic), share accepted, share productive | critique YAMLs (`checklist` key, `toolkit/spec/critique_checklist.py`), `findings.jsonl` `source` and `kind` | a per-baseline count by origin; `check_value` gains an `origin` column [proposed, with B2] |
 | P5 | every owner item: paused runs and their questions, PRs waiting on the owner, budgets near expiry, work-queue items marked OWNER | R6's files across runs; P1's cache; budget records; `ops/work_queue.md` | one `owner_inbox` tool [PR 2] |
 | B1 | per baseline: completion, interventions I1-I9, owner wait | `scripts/harness_metrics.py` output (`ops/hb*_triage_data/hb*_metrics.json`, supervisor `metrics.json`); triage prose `ops/baseline_hb*_triage.md` | `baseline_summary` reads the metrics files and says which baseline each came from [PR 2] |
 | B2 | per check: fired, productive, noise, never fired, cost in rounds | `harness_metrics.py --check-value` (open PR, branch `check-value-table`); `ops/check_value_analysis.md` | its JSON output cached per baseline; `check_value` reads it [PR 2, after that PR merges] |
 | B3 | per non-accepted run: root cause, whether right | triage prose `ops/baseline_hb*_triage.md` §5 | prose only; kept as prose (§9 says when to promote it) |
-| M1 | active agent sessions, their names and tasks; git worktrees and their branches | `git worktree list`; `.claude/worktrees/`; agent names exist only inside the lead's session | worktrees from git; agent sessions are not recorded anywhere a tool can read [gap, §10] |
+| M1 | active agent sessions, their names and tasks; git worktrees and their branches | `git worktree list`; `.claude/worktrees/`; agent names exist only inside the lead's session | worktrees from git; the lead's `agents.jsonl` (§9) [owner yes 2026-11-24] |
 | M2 | process counts by kind (shells, python, node, caffeinate, git), load average, CPU and memory share, thermal state | the OS (`ps`, `uptime`, `pmset -g therm`) | a `machine_status` tool that reads the process table and returns counts and the top consumers by command name, never arguments or environments [PR 2] |
 
 ## 5. Roots
@@ -243,7 +243,7 @@ state, status, last event age), `run_status`, `run_events`, `run_findings`, `run
 `decision_spec.signoff_sheet.md`, `engine_choice.json`, `budget_ledger.json`, `pipeline_progress.json`,
 `models/pipeline_report.json`, `models/compute_ledger.json`, `models/logs/*.log` (tail), `report.md`,
 `data/inputs_provenance.json`, `analysis/*.yaml`), `launches`, `clusters`, `supervisor_status`, `open_prs`,
-`owner_inbox`, `baseline_summary`, `check_value`, `machine_status`. One write tool, `note_feedback` (§9).
+`owner_inbox`, `baseline_summary`, `check_value`, `smoke_markers`, `machine_status`. One write tool, `note_feedback` (§9).
 
 It reuses the workbench's confined readers (`lib.safe_io`, the run-folder confinement of
 `tools/workbench/workbench.py`). `tools/diagnostics/README.md` shows the `claude_desktop_config.json` entry.
@@ -259,6 +259,12 @@ It reuses the workbench's confined readers (`lib.safe_io`, the run-folder confin
 - **Review at each baseline triage.** The lead reads both logs and updates this contract: add data that was
   missing, promote an analysis repeated three or more times into a standing summary tool, and retire a tool
   no call used across two baselines. Each change is a row in §11.
+- **Agent log.** The lead appends one line per agent it spawns, and one when it ends, to
+  `~/modeling-agentic-keep/diagnostics/agents.jsonl` (local, outside the repository):
+  `{"v": 1, "at", "event": "start" | "end", "name", "task" (one line, no run values), "worktree" (path or
+  null), "branch" (or null), "pr" (number or null), "outcome" (on `end`: done | stopped | failed, else
+  null)}`. An agent is active when its last line is `start`. `machine_status` reads it beside
+  `git worktree list` to answer M1.
 - **Triage template.** Every baseline triage (`ops/baseline_hb<N>_triage.md`) ends with:
 
   ```markdown
@@ -273,12 +279,12 @@ It reuses the workbench's confined readers (`lib.safe_io`, the run-folder confin
 
 | Item | Owner | Date |
 |---|---|---|
-| Owner review of this contract | owner | 2026-11-25 |
+| Owner review of this contract | owner | done 2026-11-24 |
 | PR 1: `events.jsonl` (§7) | lead | PR open by 2026-11-26 |
 | PR 2: MCP server, `follow.py`, README; `budget.py status --json` | lead | PR open by 2026-11-28 |
 | `check_value` tool depends on the open `check-value-table` PR merging | lead | with PR 2 |
-| P2 smoke markers and P3 goal ids in change-fragment front matter (proposed; changes `changes/README.md` and `scripts/assemble_changes.py`) | owner decides | at this review |
-| M1 agent sessions: no record a tool can read. Proposal: the lead appends one line per spawned agent (name, task, worktree, start, end) to `~/modeling-agentic-keep/diagnostics/agents.jsonl` | owner decides | at this review |
+| P2 and P3: `markers:` and `goal:` in change-fragment front matter, CI checks the format, old fragments stay prose; goal ids in `docs/design/goals.yaml` (small separate PR) | lead | PR open by 2026-11-25 |
+| M1 agent log `agents.jsonl` (shape in §9), written by the lead | lead | from 2026-11-24 |
 | B3 root causes stay prose until the review loop shows they are asked for repeatedly | lead | next triage |
 
 Tell us what is missing from §3, or which questions you would phrase differently, and we will use your version.
@@ -288,3 +294,4 @@ Tell us what is missing from §3, or which questions you would phrase differentl
 | Date | Change | Why |
 |---|---|---|
 | 2026-11-24 | First draft | owner decision: Claude Desktop as the diagnostic front end |
+| 2026-11-24 | Owner review: yes to `markers:` and `goal:` in change fragments (CI-checked, old fragments stay prose, goals in `docs/design/goals.yaml`); yes to the lead's `agents.jsonl` (§9); keep `run_compare`, `owner_inbox` and `machine_status` | owner decisions on #381 |
