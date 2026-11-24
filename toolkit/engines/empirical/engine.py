@@ -1049,6 +1049,10 @@ def _self_test_sampling_e2e(ok):
             R1 = _toy_trial_run(d1, draws=100, sampling=smp, unit_rates="source")
             rep0 = yaml.safe_load(open(os.path.join(d0, "uncertainty_report.yaml")))
             rep1 = yaml.safe_load(open(os.path.join(d1, "uncertainty_report.yaml")))
+            from toolkit.analysis import figure_data as FD
+            rp = FD.replay(R1["_A"], R1["point"]["plan"], R1["uncertainty"])
+            ok(rp["reproduced"] is True, f"SE5 (Codex r1 P1-2) the figure step's own replay redraws the unit rates and "
+                                         f"reproduces the interval: {rp.get('replayed')} vs {rp.get('stored')}")
     except Exception as ex:  # noqa: BLE001
         ok(False, f"SE1 the toy panel runs with and without unit_rates: {type(ex).__name__}: {ex}")
         return
@@ -1071,6 +1075,12 @@ def _self_test_sampling_e2e(ok):
             probs.append([x for x in SC.validate(SC.load(_toy_trial_spec(d, **kw))) if "unit_rates" in x])
         ok(probs[0] and probs[1] and probs[2] == [],
            f"SE4 a declared sampling neither drawn nor excluded, and unit_rates without one, are refused: {probs}")
+        p = _toy_trial_spec(d, sampling=smp, unit_rates="source")
+        raw = yaml.safe_load(open(p))
+        raw["decision_units"]["engine_attributes"][EVENTS_ATTRIBUTE]["columns"].pop("deaths")
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        miss = [x for x in SC.validate(SC.load(p)) if EVENTS_ATTRIBUTE in x and "deaths" in x]
+        ok(miss, f"SE4b (Codex r1 P2-5) a sampled outcome with no bound count is refused before sign-off: {miss}")
 
 
 def toy_trial_config() -> dict:

@@ -1616,9 +1616,18 @@ def unit_rates_problems(s, eng) -> list[str]:
     if dec is not None and UNIT_RATES not in inc and not str(exc.get(UNIT_RATES) or "").strip():
         bad.append(f"uncertainty: source {UNIT_RATES} (the engine's per-unit sampling of {dec['attribute']} "
                    f"{dec['outcomes']}) is neither declared in `sources` nor excluded with a reason")
-    if UNIT_RATES in inc and s.raw["analysis"].get("evaluation") != "direct":
-        bad.append(f"uncertainty.sources {UNIT_RATES}: needs analysis.evaluation: direct (an emulator does not take "
-                   "drawn unit values)")
+    if dec is not None:      # Codex r1 P2-5 of #377: every unit's count for every sampled outcome, before sign-off
+        ev = dec.get("events_attribute")
+        try:
+            for row in s.units():
+                a = s.unit_attributes(row).get(ev)
+                miss = [o for o in dec["outcomes"] if not (isinstance(a, dict) and _isnum(a.get(o)) and a[o] > 0)]
+                if miss:
+                    bad.append(f"decision_units.engine_attributes.{ev}: unit {row.get(s.uid)} has no count > 0 for "
+                               f"{miss} (the per-unit sampling draws each of {dec['outcomes']} from its count)")
+                    break
+        except (OSError, KeyError, TypeError, ValueError) as e:
+            bad.append(f"decision_units.engine_attributes.{ev}: the counts cannot be read ({type(e).__name__}: {e})")
     return bad
 
 
@@ -1685,6 +1694,9 @@ def _validate_uncertainty(s, pnames) -> list[str]:
                 bad.append("uncertainty.sources engine_parameters: the engine has no fitted parameters with ranges")
         if src.get("kind") == "emulator" and s.raw["analysis"].get("evaluation") != "emulator":
             bad.append("uncertainty.sources emulator: there is no emulator (analysis.evaluation is direct); exclude it")
+        if src.get("kind") == UNIT_RATES and s.raw["analysis"].get("evaluation") != "direct":   # also when pending
+            bad.append(f"uncertainty.sources {UNIT_RATES}: needs analysis.evaluation: direct (an emulator does not "
+                       "take drawn unit values)")
         if src.get("kind") == "calibration" and s.raw["calibration"].get("method") == "none":
             bad.append("uncertainty.sources calibration: calibration.method is none")
     return bad

@@ -555,6 +555,10 @@ class DirectModel:
         pair, a contract self-test of that engine) evaluates every (unit, package) pair in run_batch calls of up to
         BATCH members; any other engine runs pair by pair, as before."""
         pairs = [(i, k) for i in ids for k in self.packages]
+        if self._pre is not None and self.unit_draws:
+            # Codex r1 P1-3 of #377: prefetched runs are keyed on (theta, zs), not on drawn unit values
+            self._pre = None
+            raise ValueError("prefetched engine runs cannot carry drawn unit values (unit_rates): fails closed")
         if self._pre is not None:
             key, pre = self._pre
             self._pre = None
