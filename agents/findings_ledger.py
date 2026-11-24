@@ -507,6 +507,8 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         if f.id in signed:
             return f.status == "owner_accepted"
         a = answer_for(answers, f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim)
+        if not lead_answer_allowed(f, a):
+            return False
         # the answer that binds it now, and the status says that answer (Codex r2 of #357, P1-1)
         return a is not None and {"accept": "owner_accepted", "decline": "owner_declined"}.get(a.get("decision")) \
             == f.status
@@ -585,7 +587,16 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         if not f.scope_declarable:
             f.resolution_type = "fix"
         a = answer_for(answers, f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim)   # hb2 fix 3
+        if not lead_answer_allowed(f, a):
+            a = None
         ans = a.get("decision") if a and str(a.get("finding")) == f.id else None
+        if ans is None and f.status == "owner_accepted" and f.id not in signed \
+                and not lead_answer_allowed(f, {"by": "lead"}):
+            last_acc = next((e for e in reversed(f.events or []) if isinstance(e, dict)
+                             and e.get("status") == "owner_accepted"), {})
+            if last_acc.get("by") == "lead":
+                f.status, f.blocking = "open", True
+                _event(f, round_n, "open", "policy", "lead acceptance does not hold after escalation to critic HIGH")
         if ans is None and f.resolution_type == "owner_decision" and f.status in ("open", "declared") \
                 and any(isinstance(e, dict) and e.get("by") in ("owner", "lead") for e in f.events):
             f.resolution_type = "fix"        # answered as it was before; revised since, so it is asked again
@@ -616,6 +627,26 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             _event(f, round_n, "open", "gate", "the accepted decision test reads differently now")
     save(run_dir, led)
     return led, problems
+
+
+NON_HIGH_SEVERITIES = ("MEDIUM", "LOW", "INFO")
+
+
+def lead_answer_allowed(finding_or_item, answer: dict | None) -> bool:
+    """Owner policy (2026-11-24): a lead answer never counts for an open critic HIGH finding (fails closed when a
+    critic finding has missing or unrecognised severity). An owner answer always counts."""
+    if not isinstance(answer, dict) or answer.get("by") != "lead":
+        return True
+    if isinstance(finding_or_item, dict):
+        kind, src, sev = finding_or_item.get("kind"), finding_or_item.get("source"), finding_or_item.get("severity")
+    else:
+        kind = getattr(finding_or_item, "kind", None)
+        src = getattr(finding_or_item, "source", None)
+        sev = getattr(finding_or_item, "severity", None)
+    is_critic = (kind == CRITIC_KIND) or (isinstance(src, str) and src.startswith("critique"))
+    if not is_critic:
+        return True
+    return isinstance(sev, str) and sev.upper() in NON_HIGH_SEVERITIES
 
 
 def open_findings(led: dict[str, Finding], blocking_only: bool = False) -> list[Finding]:
@@ -953,7 +984,9 @@ def _self_test() -> int:
        f"malformed gate is reported ({a25}, {e25}, {p25})")
     ok(b24 is False and s24 == "fixed",
        f"L24 an accepted test does not block on a second sync; gone post-write, it is closed ({b24}, {s24})")
-    # L_OWNER_LEAD (1F, D2): a lead's recorded answer counts only when the run is a --signoff lead run
+    # L_OWNER_LEAD (1F, D2; updated 2026-11-24 policy): a lead's recorded answer counts only with lead_ok and only for
+    # non-HIGH critic findings; an open critic HIGH finding is never accepted by a lead provisional answer, and an
+    # earlier lead-accepted MEDIUM finding reopens if escalated to HIGH.
     with tempfile.TemporaryDirectory() as d:
         import scope_signoff as SS
         claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
@@ -961,13 +994,24 @@ def _self_test() -> int:
         json.dump({"answers": {fp: {"finding": "D-032", "decision": "accept", "by": "lead", "provisional": True}}},
                   open(os.path.join(d, "scope_signoff.json"), "w"))
         SS.harness_record(d)
-        save(d, {"D-032": Finding(id="D-032", kind="critique_blocker", severity="HIGH", source="harness", claim=claim,
+        save(d, {"D-032": Finding(id="D-032", kind="critique_blocker", severity="MEDIUM", source="harness", claim=claim,
                                   fix_requires=fix)})
         st_o = sync(d, None, 2)[0]["D-032"].status
         led_l = sync(d, None, 2, lead_ok=True)[0]
         ok(owner_answers(d) == {} and list(owner_answers(d, lead_ok=True)) == [fp] and st_o == "open"
            and led_l["D-032"].status == "owner_accepted" and led_l["D-032"].events[-1].get("by") == "lead",
            f"L_OWNER_LEAD a lead's answer counts only with lead_ok, and the ledger says it was the lead's ({st_o})")
+        # Escalation to HIGH reopens the lead-accepted finding
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 3, "verdict": "REVISE",
+                        "structural_mismatch": {"detected": False}, "carried_forward": [],
+                        "blockers": [{"id": "D-032", "severity": "HIGH", "category": "METHODS",
+                                      "target_stage": "PLAN", "first_seen_round": 1, "claim": claim,
+                                      "fix_requires": fix, "resolved": False}]},
+                       open(os.path.join(d, CRITIQUE_FILES["critique-domain"]), "w"))
+        led_hi = sync(d, None, 3, lead_ok=True)[0]
+        ok(led_hi["D-032"].status == "open" and led_hi["D-032"].severity == "HIGH",
+           f"L_OWNER_LEAD_NO_HIGH critic HIGH is never accepted by a lead provisional answer and escalation reopens it "
+           f"({led_hi['D-032'].status}, {led_hi['D-032'].severity})")
     # L_DICT_DW, L_FROZEN_DW, L_GATE_DW (v2 autonomy 1A, 4c and 4a): the test a fix task is checked against.
     with tempfile.TemporaryDirectory() as d:
         frozen, weaker = [{"file": "x.txt", "contains": "draws 32"}], [{"file": "x.txt", "exists": True}]

@@ -44,13 +44,16 @@ def component_totals(ccost: dict, plan: dict, ids) -> dict:
     return tot
 
 
-def infeasible_reasons(ids, plan, cost, feas, plan_budget) -> list[str]:
-    """Why the point plan cannot be kept under a test: its cost under the test's costs above the planning budget,
-    a package the test's feasibility rules out, a cap it exceeds, or a group rule it breaks. [] when it can."""
+def infeasible_reasons(ids, plan, cost, feas, plan_budget, budget_exact: bool = False) -> list[str]:
+    """Why the point plan cannot be kept under a test: its cost under the test's costs above the planning budget
+    (or below it when `budget_exact=True`), a package the test's feasibility rules out, a cap it exceeds, or a group
+    rule it breaks. [] when it can."""
     out = []
     spent = sum(float(cost[i][plan[i]]) for i in ids)
     if spent > float(plan_budget) * (1 + 1e-9):
         out.append(f"costs {spent:,.0f} under the test, above the planning budget {float(plan_budget):,.0f}")
+    if budget_exact and spent < float(plan_budget) * (1 - 1e-9):
+        out.append(f"costs {spent:,.0f} under the test, below the exact planning budget {float(plan_budget):,.0f}")
     if feas:
         bad = [i for i in ids if not feas["feasible"][i].get(plan[i], False)]
         if bad:
@@ -67,7 +70,7 @@ def infeasible_reasons(ids, plan, cost, feas, plan_budget) -> list[str]:
 
 
 def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, components, plan_budget=None,
-            feas=None) -> dict:
+            feas=None, budget_exact: bool = False) -> dict:
     """What moves from the point plan `plan` to the plan `ch` re-solved under a test (benefits `ben`, costs `ccost`
     split by component, re-optimised objective `objective`, solved within `plan_budget` (default `budget`) under
     `feas`). `pop`: {unit: population}; `region`: {unit: group} or None. Fails closed on a unit without a population
@@ -80,7 +83,8 @@ def compare(ids, plan, ch, ben, ccost, objective, pop, region, budget, thr, comp
     if miss:
         raise ValueError(f"decision summary: no population for units {miss[:5]}")
     cost = {i: {k: sum(ccost[i][k].values()) for k in {plan[i], ch[i]}} for i in ids}     # the two plans only
-    why = infeasible_reasons(ids, plan, cost, feas, budget if plan_budget is None else plan_budget)
+    why = infeasible_reasons(ids, plan, cost, feas, budget if plan_budget is None else plan_budget,
+                             budget_exact=budget_exact)
     changed = [i for i in ids if ch[i] != plan[i]]
     point = sum(ben[i][plan[i]] for i in ids)
     gap = float(objective) - point
@@ -277,7 +281,8 @@ def summarise(A, plan, ch, ben, cost, objective, budget=None, feas=None, gap=Non
     thr = thresholds(A.spec["analysis"])
     return solver_gap(compare(A.ids, plan, ch, ben, getattr(cost, "by_component", None), objective, population(A), reg,
                               A.budget, thr, list(A.spec["options"]["components"]),
-                              plan_budget=budget, feas=feas if feas is not None else getattr(A, "feas", None)),
+                              plan_budget=budget, feas=feas if feas is not None else getattr(A, "feas", None),
+                              budget_exact=bool(getattr(A, "budget_exact", False))),
                       gap, thr)
 
 

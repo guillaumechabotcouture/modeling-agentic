@@ -104,6 +104,28 @@ def expected_value_plan(A, rows, point_plan: dict, cost0, point_events=()) -> di
     if pp_hits:
         rec["point_plan_mean_benefit_not_computed"] = (f"model corrections bear on the point-value plan in {len(pp_hits)} "
                                                        f"draws (e.g. draw {pp_hits[0]})")
+    bg = (((getattr(A, "spec", None) and getattr(A.spec, "raw", None)) or {}).get("deliverable") or {}).get("by_group")
+    if isinstance(bg, dict) and isinstance(bg.get("quantity"), dict):
+        qmap = bg["quantity"]
+        rec["per_unit_group_mean"] = {
+            i: {g: {o: float(np.mean([
+                float(r["out"][i]["y_group"][A.comp][o].get(g, 0.0))
+                - float(r["out"][i]["y_group"][plan[i]][o].get(g, 0.0))
+                for r in rows])) for o in A.outcomes} for g in qmap}
+            for i in A.ids}
+        rec["per_unit_group_quantity"] = {
+            i: {g: float(np.mean([float(r["out"][i]["cost"][plan[i]][qname]) for r in rows]))
+                for g, qname in qmap.items()}
+            for i in A.ids}
+        all_groups = list(rows[0]["out"][A.ids[0]]["y_group"][A.comp][A.outcomes[0]])
+        other_groups = [g for g in all_groups if g not in qmap]
+        if other_groups:
+            rec["per_unit_group_other_mean"] = {
+                i: {o: float(np.mean([
+                    sum(float(r["out"][i]["y_group"][A.comp][o].get(g, 0.0))
+                        - float(r["out"][i]["y_group"][plan[i]][o].get(g, 0.0)) for g in other_groups)
+                    for r in rows])) for o in A.outcomes}
+                for i in A.ids}
     return {"solution": sol, "record": rec}
 
 
@@ -132,18 +154,41 @@ def reference_findings(point, dt_payload) -> list[str]:
 
 
 def _contract_findings(raw: dict, point, unc) -> list[str]:
+    import math
     want = rule(raw)
     if want not in RULES:
         return [f"deliverable.plan {want!r} is not one of {RULES}"]
     if not isinstance(point, dict):
         return ["point.yaml is unreadable, so the plan rule cannot be checked"]
+    exact = bool(((raw or {}).get("constraints") or {}).get("envelope_exact"))
+
+    def _exact_findings() -> list[str]:
+        if not exact:
+            return []
+        try:
+            ca, ba = float(point["cost_allocated"]), float(point["budget_allocatable"])
+            c_blk = (raw or {}).get("constraints") or {}
+            if "envelope_usd" in c_blk:
+                fixed = sum(float(v) for v in (c_blk.get("fixed_costs_usd") or {}).values())
+                target = float(c_blk["envelope_usd"]) - fixed
+            else:
+                target = ba
+            if not (math.isfinite(ca) and math.isfinite(ba) and math.isfinite(target)) \
+                    or abs(ba - target) > 1e-6 * max(1.0, abs(target)) \
+                    or abs(ca - target) > 1e-6 * max(1.0, abs(target)):
+                return [f"constraints.envelope_exact is true, but cost_allocated ({ca:g}) / budget_allocatable ({ba:g}) "
+                        f"differs from the exact allocatable envelope ({target:g})"]
+        except (KeyError, TypeError, ValueError):
+            return ["constraints.envelope_exact is true, but point.yaml has no finite cost_allocated and "
+                    "budget_allocatable"]
+        return []
+
     pr = point.get("plan_rule")
     if want == "point":
-        return [] if pr is None else ["point.yaml records a plan rule the spec does not ask for"]
+        return ([] if pr is None else ["point.yaml records a plan rule the spec does not ask for"]) + _exact_findings()
     if not isinstance(pr, dict) or pr.get("rule") != "expected_value":
         return ["the spec asks for deliverable.plan: expected_value and point.yaml records no expected-value plan "
                 "(a run by code that ignores the key?)"]
-    import math
     bad = []
     hl = ((raw.get("deliverable") or {}).get("headline") or {}).get("outcome")
     pu, plan, pp = point.get("per_unit"), point.get("plan"), pr.get("point_plan")
@@ -167,6 +212,7 @@ def _contract_findings(raw: dict, point, unc) -> list[str]:
                        "at the point values (a record from another rule?)")
     except (KeyError, TypeError, ValueError):
         bad.append("point.yaml has no cost_allocated or budget_allocatable to check the plan rule's point cost")
+    bad += _exact_findings()
     if not (isinstance(plan, dict) and isinstance(pp, dict) and set(pp) == set(plan)):
         bad.append("plan_rule.point_plan does not name the delivered plan's units (the decision tests' reference plan)")
     elif not isinstance(pr.get("units_differ"), list) or sorted(map(str, pr["units_differ"])) != sorted(str(i) for i in plan if plan[i] != pp[i]) \
@@ -174,6 +220,26 @@ def _contract_findings(raw: dict, point, unc) -> list[str]:
         bad.append("plan_rule.units_differ does not match the delivered and point-value plans")
     if isinstance(unc, dict) and pr.get("draws") != unc.get("draws"):
         bad.append("the expected-value plan was solved over a different number of draws than the uncertainty step's")
+    bg = (raw.get("deliverable") or {}).get("by_group") if isinstance(raw.get("deliverable"), dict) else None
+    if isinstance(bg, dict) and isinstance(bg.get("quantity"), dict):
+        pgm, pgq = pr.get("per_unit_group_mean"), pr.get("per_unit_group_quantity")
+        pgo = pr.get("per_unit_group_other_mean") or {}
+        groups = list(bg["quantity"])
+        try:
+            if not (isinstance(pgm, dict) and isinstance(pgq, dict) and isinstance(pu, dict)
+                    and set(pgm) == set(pu) and set(pgq) == set(pu)):
+                raise ValueError("missing per_unit_group_mean or per_unit_group_quantity")
+            for u_id, puv in pu.items():
+                tot = float(puv["averted_mean"][hl])
+                gvals = [float(pgm[u_id][g][hl]) for g in groups]
+                qvals = [float(pgq[u_id][g]) for g in groups]
+                oth = float((pgo.get(u_id) or {}).get(hl, 0.0)) if isinstance(pgo, dict) else 0.0
+                if not (all(math.isfinite(x) for x in gvals + qvals + [tot, oth])
+                        and abs(math.fsum(gvals + [oth]) - tot) <= 1e-6 * max(1.0, abs(tot))):
+                    raise ValueError(f"unit {u_id} group means do not sum to averted_mean")
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as e:
+            bad.append(f"deliverable.by_group under expected_value: plan_rule.per_unit_group_mean / "
+                       f"per_unit_group_quantity missing, non-finite, or inconsistent ({e})")
     return bad
 
 
@@ -344,6 +410,50 @@ def _self_test() -> int:
         gr = {"error": f"{type(e).__name__}: {e}"}
     ok(gr == {k: v[2] for k, v in ref.items()}, f"PR12 the decision tests' reference plan agrees with the plan rule "
                                                 f"({gr})")
+    # PR13: expected_value with deliverable.by_group records per-group means and quantities
+    A_bg = _FakeA()
+    A_bg.spec = type("_S", (), {"raw": {"deliverable": {"plan": "expected_value", "headline": {"outcome": "cases"},
+                                                        "by_group": {"columns": {"group": "g", "quantity": "q",
+                                                                                 "value": "v"},
+                                                                     "quantity": {"g1": "d1", "g2": "d2"}}}}})()
+    rows_bg = []
+    for r_ in [_row(10.0, 8.0), _row(0.0, 8.0)]:
+        rb_ = {**r_, "out": {i: {**v,
+                                 "y_group": {k: {"cases": {"g1": 0.25 * yv["cases"], "g2": 0.75 * yv["cases"]}}
+                                             for k, yv in v["y"].items()},
+                                 "cost": {k: {"d1": 1.0 if k == "a" else 0.0, "d2": 2.0 if k == "a" else 0.0}
+                                          for k in v["y"]}}
+                             for i, v in r_["out"].items()}}
+        rows_bg.append(rb_)
+    r_bg = expected_value_plan(A_bg, rows_bg, point, cost0)["record"]
+    pgm = r_bg.get("per_unit_group_mean") or {}
+    pgq = r_bg.get("per_unit_group_quantity") or {}
+    ok(pgm == {"u1": {"g1": {"cases": 0.0}, "g2": {"cases": 0.0}},
+               "u2": {"g1": {"cases": 2.0}, "g2": {"cases": 6.0}}}
+       and pgq == {"u1": {"g1": 0.0, "g2": 0.0}, "u2": {"g1": 1.0, "g2": 2.0}},
+       f"PR13 expected_value with by_group computes per-group means summing to per_unit_mean ({pgm}, {pgq})")
+    bg_raw = {"deliverable": {"plan": "expected_value", "headline": {"outcome": "cases"},
+                              "by_group": {"columns": {"group": "g", "quantity": "q", "value": "v"},
+                                           "quantity": {"g1": "d1", "g2": "d2"}}}}
+    bg_pt = dict(good_pt, plan_rule=dict(good_pt["plan_rule"], per_unit_group_mean=pgm, per_unit_group_quantity=pgq))
+    bg_bad = dict(good_pt, plan_rule=dict(good_pt["plan_rule"], per_unit_group_mean={
+        "u1": {"g1": {"cases": 0.0}, "g2": {"cases": 0.0}}, "u2": {"g1": {"cases": 1.0}, "g2": {"cases": 1.0}}}))
+    ok(contract_findings(bg_raw, bg_pt, unc) == [] and len(contract_findings(bg_raw, good_pt, unc)) >= 1
+       and len(contract_findings(bg_raw, bg_bad, unc)) >= 1,
+       f"PR13b contract_findings verifies by_group per-group means ({contract_findings(bg_raw, bg_pt, unc)}, "
+       f"{contract_findings(bg_raw, bg_bad, unc)})")
+    # PR14: constraints.envelope_exact: true checked at contract gate on point & expected_value
+    ex_pt_raw = {"constraints": {"envelope_exact": True, "envelope_usd": 11.0}}
+    ex_ev_raw = dict(ev_raw, constraints={"envelope_exact": True, "envelope_usd": 1.0})
+    pt_ok = {"cost_allocated": 11.0, "budget_allocatable": 11.0}
+    pt_short = {"cost_allocated": 8.0, "budget_allocatable": 11.0}
+    pt_tamper = {"cost_allocated": 8.0, "budget_allocatable": 8.0}
+    ok(contract_findings(ex_pt_raw, pt_ok, unc) == [] and len(contract_findings(ex_pt_raw, pt_short, unc)) == 1
+       and len(contract_findings(ex_pt_raw, pt_tamper, unc)) == 1
+       and contract_findings(ex_ev_raw, good_pt, unc) == []
+       and len(contract_findings(ex_ev_raw, dict(good_pt, cost_allocated=0.5,
+                                                plan_rule=dict(good_pt["plan_rule"], point_cost=0.5)), unc)) == 1,
+       "PR14 contract_findings checks constraints.envelope_exact against signed envelope on point & expected_value")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

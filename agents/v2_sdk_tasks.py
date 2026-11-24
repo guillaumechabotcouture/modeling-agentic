@@ -112,7 +112,9 @@ evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after 
 question asks to minimise or maximise an expected quantity (an objective stated in expectation), set
 `deliverable.plan: expected_value`; when the spec cannot carry it (the schema says which fields it
 excludes), declare `{{principle: 1, check: expected_value_plan, reason: ...}}` in principle_departures
-with the reason; the sign-off sheet flags the point plan otherwise. Three
+with the reason; the sign-off sheet flags the point plan otherwise. When the question specifies a fixed
+already-held supply that must be allocated in full with no unspent remainder, set
+`constraints.envelope_exact: true` (with fixed unit costs, `costs` excluded from uncertainty sources). Three
 rules the check refuses often: a decision test's `text` has no digits (it says in words what the
 test asks; the values tested are rendered from computed claims); nor have the yes, no and
 undetermined texts of deliverable.decision.statements (the harness renders the values); and `engine_parameters` gives no
@@ -123,13 +125,19 @@ card offers per-unit sampling (the package-rate engine's `baseline.sampling` in 
 with each unit's event counts bound as `baseline_events`; estimate empirical over-dispersion
 max(1, chi2/df) across rounds/years when a multi-period panel is over-dispersed), declare it, then
 list the `unit_rates` uncertainty source, or exclude it with a reason; a headline interval with next
-to no width goes to the owner. When both an administrative cohort coverage series and a finite-sample serosurvey exist for the
-compartmental engine, do not plug raw survey proportions into fixed `s0` (`initialiser: given`): where
-`structure: birth_cohorts` applies, bind the cohort series with `initialiser: cohort_history` and
-calibrate per-unit `coverage_scale` against the survey's `binomial` (or `betabinomial` with a design
-effect) observations (`targets.kind: observations`), or calibrate `per_group_parameters: [s0]` when
-`structure: age_groups_contact_matrix` is required, so the posterior shrinks sampling noise and
-propagates per-unit immunity uncertainty. Output:
+to no width goes to the owner. When both an administrative cohort coverage series and a finite-sample
+serosurvey exist for the compartmental engine, do not plug raw survey proportions into fixed `s0`
+(`initialiser: given`): where `structure: birth_cohorts` applies, bind the cohort series with
+`initialiser: cohort_history` and calibrate per-unit `coverage_scale` against the survey's `binomial`
+(or `betabinomial` with a design effect) observations (`targets.kind: observations`), or calibrate
+`per_group_parameters: [s0]` when `structure: age_groups_contact_matrix` is required, so the posterior
+shrinks sampling noise and propagates per-unit immunity uncertainty. For an estimates spec, when
+structural assumptions such as generation-interval uncertainty or constant versus time-varying
+transmissibility could move an output, vary `dynamics.generation_interval.scale_range` and/or pool
+alternative `dynamics.transmissibility` structures (`{{pool: [constant, {{knots: [...], priors: {{...}}}}],
+weighting}}`) and list `generation_interval` / `transmissibility_structure` in `uncertainty.sources`;
+otherwise list any held-fixed structural kind in `uncertainty.excluded` with a reason so the interval
+states what it omits. Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """

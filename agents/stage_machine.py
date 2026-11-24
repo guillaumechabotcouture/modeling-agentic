@@ -746,14 +746,22 @@ def owner_accepted_now(run_dir: str, opened: list[dict], lead_ok: bool) -> set[s
     """The open findings whose current kind and remedy class, as this gate reads them, carry the owner's (or, in a lead
     run, the lead's provisional) accept: the answer binds to that fingerprint (FL.answer_fingerprint; hb2 fix 3: not
     the critic's wording), so a finding revised into another kind or remedy class since is not among them (Codex r2 of
-    #344, P1-2: the ledger may keep an older remedy)."""
+    #344, P1-2: the ledger may keep an older remedy). A lead accept never counts for an open critic HIGH finding."""
     answers = FL.owner_answers(run_dir, lead_ok)
+    led = FL.load(run_dir) if lead_ok else {}
     out = set()
     for o in opened:
         fid = str(o.get("id"))
         a = FL.answer_for(answers, fid, kind=o.get("kind") or FL.CRITIC_KIND, fix_requires=o.get("fix_requires"),
                           claim=str(o.get("claim") or ""))
         if a and a.get("decision") == "accept":
+            if a.get("by") == "lead":
+                lf = led.get(fid)
+                chk_o = dict(o, kind=o.get("kind") or getattr(lf, "kind", None) or FL.CRITIC_KIND,
+                             source=o.get("source") or getattr(lf, "source", None),
+                             severity=o.get("severity") if o.get("severity") is not None else getattr(lf, "severity", None))
+                if not FL.lead_answer_allowed(chk_o, a) or (lf is not None and not FL.lead_answer_allowed(lf, a)):
+                    continue
             out.add(fid)
     return out
 
@@ -1474,7 +1482,9 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
             from toolkit.analysis import conflicts as CF
             opts = {"options": CF.options(run_dir, getattr(f, "key", "")),
                     "conflict": CF.verdict(run_dir, getattr(f, "key", ""))}     # Codex r4 of #316: the structured verdict
-        items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix, **opts,
+        items.append({"finding": fid, "kind": getattr(f, "kind", None) or FL.CRITIC_KIND,
+                      "severity": getattr(f, "severity", None), "source": getattr(f, "source", None),
+                      "claim": claim, "fix_requires": fix, **opts,
                       "reason": ("a held-out calibration target's automatic decision test changes the plan or could "
                                  "not run (conflicts.policy declare_and_test)") if conflict else
                       "its required remedy is an owner amendment of the signed decision spec",
@@ -1871,6 +1881,12 @@ class Machine:
                 la = None
             if isinstance(la, dict) and la.get("status") == "refused":
                 why = f"{why}; the lead amendment was refused: {la.get('why')}".lstrip("; ")
+        if self.st.paused == "awaiting_scope_signoff":
+            ent_idx = max((idx for idx, x in enumerate(h) if x.get("to") == "OWNER_DECISION"), default=-1)
+            ref_idx = max((idx for idx, x in enumerate(h)
+                           if x.get("state") == "OWNER_DECISION" and x.get("lead_refused_provisional")), default=-1)
+            if ref_idx >= ent_idx and ref_idx >= 0 and h[ref_idx].get("why"):
+                why = f"{why}; {h[ref_idx]['why']}".lstrip("; ")
         return str(why or f"paused at {self.st.state}")[:1000]
 
     def _write_meta(self, drop=(), **fields) -> None:
@@ -2877,11 +2893,30 @@ class Machine:
                 return self._go("FINAL", "the owner request cannot be read, so the lead cannot answer it: relaunch with "
                                          "reuse", "run_failed")
             todo = [items[fp] for fp in want if not done(fp)]
-            SS.provisional_answers(self.run_dir, todo, self.st.round,
-                                   plan_changing={i["fingerprint"]: _plan_changing(i) for i in todo})
-            self.st.history.append({"at": _now(), "provisional": [i.get("finding") for i in todo], "by": "lead",
-                                    "state": "OWNER_DECISION"})
-            answers, bad = SS.load_answers(self.run_dir)
+            led = FL.load(self.run_dir)
+            allow = [i for i in todo if _lead_may_accept(i, led)]
+            blocked = [i for i in todo if not _lead_may_accept(i, led)]
+            if allow:
+                allow_ss = [
+                    dict(i, severity=led[i["finding"]].severity)
+                    if i.get("severity") is None and i.get("finding") in led
+                    and getattr(led[i["finding"]], "severity", None) is not None else i
+                    for i in allow]
+                SS.provisional_answers(self.run_dir, allow_ss, self.st.round,
+                                       plan_changing={i["fingerprint"]: _plan_changing(i) for i in allow_ss})
+                self.st.history.append({"at": _now(), "provisional": [i.get("finding") for i in allow], "by": "lead",
+                                        "state": "OWNER_DECISION"})
+                answers, bad = SS.load_answers(self.run_dir)
+            if blocked:
+                b_ids = [str(i.get("finding")) for i in blocked]
+                last = self.st.history[-1] if self.st.history else {}
+                if not (last.get("state") == "OWNER_DECISION" and last.get("lead_refused_provisional") == b_ids
+                        and last.get("round") == self.st.round):
+                    self.st.history.append({
+                        "at": _now(), "lead_refused_provisional": b_ids, "round": self.st.round,
+                        "why": f"owner policy: the lead may not provisionally accept open critic HIGH finding(s) "
+                               f"{', '.join(b_ids)}",
+                        "state": "OWNER_DECISION"})
         answered = bool(want) and not bad and all(done(fp) for fp in want)
         if answered:
             SS.harness_record(self.run_dir)
@@ -3361,6 +3396,28 @@ def _status_line(run_dir: str, status: str | None) -> str:
         lines = {}
     text = lines.get(status) or (lines.get("pending") if status == "pending" else lines.get("other")) or "not accepted"
     return f"{STATUS_MARK}\n**Run status: {text}.** (`{status}`; rendered by the harness)\n\n"
+
+
+def _lead_may_accept(item: dict, ledger: dict | None = None) -> bool:
+    """Owner policy (2026-11-24): under --signoff lead, the lead may provisionally accept harness-known
+    decision-test / conflict / departure items and non-HIGH findings, never an open critic HIGH finding.
+    Fails closed on missing or unrecognised severity, or when either the ledger or the request item says critic HIGH."""
+    fid = item.get("finding")
+    f = (ledger or {}).get(fid) if fid else None
+    kind = item.get("kind") or (getattr(f, "kind", None) if f is not None else None)
+    src = item.get("source") or (getattr(f, "source", None) if f is not None else None)
+    is_critic = (kind == FL.CRITIC_KIND) or (isinstance(src, str) and src.startswith("critique"))
+    if not is_critic:
+        return True
+    lsev = getattr(f, "severity", None) if f is not None else None
+    isev = item.get("severity")
+    if lsev is None and isev is None:
+        return False
+    if lsev is not None and not (isinstance(lsev, str) and lsev.upper() in FL.NON_HIGH_SEVERITIES):
+        return False
+    if isev is not None and not (isinstance(isev, str) and isev.upper() in FL.NON_HIGH_SEVERITIES):
+        return False
+    return True
 
 
 def _plan_changing(item: dict) -> bool:
@@ -5411,8 +5468,10 @@ def _self_test() -> int:
             _CTk.decision_test_record = _rec
         ok(len({fa, fb, fc}) == 3 and fc2 == fc and fs1 != fs2,
            f"T_DT_TOOLKIT_FP each backend's finding binds its own decision-test record ({fa}, {fb}, {fc}, {fs1}, {fs2})")
-        # T_OWNER_LEAD_AMEND (1F, D2): an owner-amendment finding under --signoff lead is answered provisionally too
-        d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041")]}}},
+        # T_OWNER_LEAD_AMEND (1F, D2): a non-HIGH owner-amendment finding under --signoff lead is answered
+        # provisionally (owner policy 2026-11-24: critic HIGH amendments pause for the owner; tested by T_LEAD_NO_CRITIC_HIGH)
+        d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041",
+                                                                                   severity="MEDIUM")]}}},
                            signoff="lead", max_rounds=2)
         s_a = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         led_a = FL.load(d)
@@ -7039,6 +7098,48 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
            and "owner" in str(g.get("rationale")),
            f"WR6 the write-up declares it, and the gate says the owner answered it ({dec.get('declared')}, "
            f"{g.get('rule_matched')}, {g.get('rationale')!r})")
+        # T_LEAD_NO_CRITIC_HIGH (owner policy 2026-11-24): under --signoff lead, an open critic HIGH
+        # finding whose remedy is an owner amendment is NEVER provisionally accepted by the lead — it pauses for the
+        # owner at OWNER_DECISION, and releases once the owner answers.
+        import scope_signoff as _SS_hi
+        amend_hi = {"id": "D-002", "severity": "HIGH", "target_stage": "PLAN",
+                    "claim": "the recommended plan leaves part of the fixed supply unallocated",
+                    "fix_requires": "Owner amendment: require the full supply to be allocated.", "done_when": dw}
+        dh, Th, sth = new_run("wr_lead_critic_high", {"critics": {1: {"critique-domain": [amend_hi]}}},
+                              signoff="lead", max_rounds=2)
+        sh1 = mk(dh, Th, sth).run()
+        meta_h = json.load(open(os.path.join(dh, "metadata.json")))
+        req_h = json.load(open(os.path.join(dh, "scope_signoff_request.json")))
+        ok(sh1 == "paused:awaiting_scope_signoff" and load_state(dh).state == "OWNER_DECISION"
+           and [i.get("finding") for i in req_h.get("items") or []] == ["D-002"]
+           and req_h["items"][0].get("severity") == "HIGH"
+           and "critic HIGH" in str(meta_h.get("paused_why") or "")
+           and not _SS_hi.provisional(dh),
+           f"T_LEAD_NO_CRITIC_HIGH lead mode refuses to provisionally accept an open critic HIGH finding "
+           f"({sh1}, why={meta_h.get('paused_why')!r}, prov={_SS_hi.provisional(dh)})")
+        # Direct call to scope_signoff.provisional_answers with a critic HIGH item also fails closed
+        try:
+            _SS_hi.provisional_answers(dh, req_h["items"], 1)
+            ok(False, "T_LEAD_NO_CRITIC_HIGH_SS scope_signoff.provisional_answers refuses a critic HIGH item")
+        except ValueError as e:
+            ok("critic HIGH" in str(e), f"T_LEAD_NO_CRITIC_HIGH_SS scope_signoff refuses critic HIGH ({e})")
+        _SS_hi.sign(dh, "owner", all_decision="accept", note="owner accepts D-002")
+        sh2 = mk(dh, StubTasks(Th.s), None).run()
+        ok(sh2 == "completed_scope_declared",
+           f"T_LEAD_NO_CRITIC_HIGH_RESUME owner sign releases OWNER_DECISION in a lead run ({sh2})")
+        # Codex r1 P1-1 & P1-2: stale/unknown request severity never overrides a ledger HIGH, and a prior lead MEDIUM
+        # acceptance does not survive escalation to HIGH
+        led_hi = {"D-002": FL.Finding(id="D-002", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                      status="open")}
+        ok(not _lead_may_accept({"finding": "D-002", "kind": "critique_blocker", "severity": "MEDIUM"}, led_hi)
+           and not _lead_may_accept({"finding": "D-002", "kind": "critique_blocker", "severity": "unknown"}, led_hi)
+           and _lead_may_accept({"finding": "D-001", "kind": "critique_blocker"}, {
+               "D-001": FL.Finding(id="D-001", kind="critique_blocker", severity="MEDIUM", source="critique-domain")}),
+           "T_LEAD_NO_CRITIC_HIGH_GUARD stale/unknown severity refused; legacy MEDIUM request allowed via ledger")
+        esc_hi = {"id": "D-001", "severity": "HIGH", "claim": "net durability is untested",
+                  "fix_requires": "Owner amendment: add a durability decision test."}
+        ok(owner_accepted_now(os.path.join(td, "wr_owner_held"), [esc_hi], True) == set(),
+           "T_LEAD_NO_CRITIC_HIGH_ESC prior lead MEDIUM acceptance does not hold if finding escalates to HIGH")
 
     def pending_post_write():
         # WR9 (Codex r2 of #344, P1-1): the owner accepted D-001 pre-write; the presentation review raises P-001, whose

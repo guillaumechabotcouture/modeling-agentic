@@ -149,7 +149,7 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     pre-sign spec critique reads the question's wording: an objective stated in expectation
     ("minimise expected ...") with the point plan is a MEDIUM on the sign-off sheet
     (`expected_value_plan`, principle 1). When the spec cannot carry the expected-value plan
-    (the schema lists what it excludes, such as `by_group`), declare that check in
+    (the schema lists what it excludes, such as `plan_variants` or `uncertainty.affordability.enforce`), declare that check in
     `principle_departures` with the reason.
 12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
     parameters and card tables its effect depends on (`decision_inputs`, read by
@@ -233,8 +233,11 @@ by birth cohort, an outbreak's final size), the engine is
 - **Joint dose blocks within one unit.** Use one alloc component per (group, level), with `group:` the
   group so that a package takes at most one level per group. Map each to `{<engine component>: level}`
   and give it a fixed cost item. Use `packages: {generate: true, within_envelope: true}`: packages no
-  plan can afford are dropped. Use `deliverable.by_group` (columns `{group, quantity, value}`,
-  `quantity: {<group>: <cost_outputs name>}`) for one row per group.
+  plan can afford are dropped. When the question gives a fixed already-held supply that must be allocated in
+  full (no unspent remainder), set `constraints.envelope_exact: true` (requires fixed unit costs: exclude
+  `costs` from uncertainty sources and omit `affordability.enforce`). Use `deliverable.by_group` (columns
+  `{group, quantity, value}`, `quantity: {<group>: <cost_outputs name>}`) for one row per group; it works
+  with both `point` and `expected_value` plans.
 - **Calibration to surveys and counts by group.** Use `calibration: {method: posterior, parameters,
   [attribute, range, scale], priors, sources, targets: {kind: observations, ...}}`. The format is in
   `toolkit/analysis/observed_targets.py`.
@@ -263,8 +266,11 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
 - **One population.** The units table has one row (derived like any other), with the population column bound to the
   engine's population attribute.
 - **Dynamics.** `dynamics.generation_interval` cites the question's file and its columns, and copies its values, lag 1
-  first. The harness checks the values against the file. `dynamics.transmissibility` is `constant`, or
-  `{knots: [...]}` when the question allows the transmissibility to change.
+  first. The harness checks the values against the file. When generation-interval uncertainty could move an output,
+  declare `dynamics.generation_interval.scale_range: {range: [lo, hi], steps?: 5, source}` (`0 < lo <= 1 <= hi`, odd
+  `steps` in `[3, 9]`). `dynamics.transmissibility` is `constant`, `{knots: [...]}`, or a structural pool
+  `{pool: [constant, {knots: [...], priors: {"transmissibility:1": ...}}], weighting?: marginal_likelihood | equal}`
+  when alternative transmissibility structures could move the output (at most 15 combined variants).
 - **Observation sources.** Each data set is a source with a frame and a measurement model: a reporting fraction is
   an `under_ascertainment` bias with a prior and a source, never an engine parameter. A reporting delay is
   `delay: {pmf, source}` on the engine's step grid. Overdispersion is `noise: {model: negbin, dispersion: {param,
@@ -280,8 +286,10 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
   series. A reporting fraction's prior lies within [0, 1]. The engine must accept the corners of the prior box, taken
   at each prior's support ends. The validator runs the engine there; above 64 corners it samples them, and the
   analysis still stops on any refusal. For example, keep the susceptible share's lower end above the seed's upper end.
-- **Uncertainty.** List `calibration` and `observation` as sources. Exclusions and declared decision tests are
-  refused: the posterior carries every declared prior, and the automatic tests are run.
+- **Uncertainty.** List `calibration` and `observation` as sources, plus `generation_interval` whenever `scale_range`
+  is declared and `transmissibility_structure` whenever `transmissibility.pool` is declared. When a structural
+  assumption is held fixed instead of varied or pooled, list it in `uncertainty.excluded: [{kind, reason}]` so the
+  interval label states what it omits. Declared decision tests are refused: the automatic `prior_range` tests run.
 - **Outputs.** `deliverable.windows` names the windows. Each output in `deliverable.outputs` is an engine window
   metric (read its card) with the name the question asks for. Check which reproduction number the question means.
   For example, `reff_ref` is the end of the window with the transmissibility of its start; `reff_end` uses the last

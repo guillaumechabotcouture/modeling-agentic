@@ -411,15 +411,16 @@ def too_few(draws: int, report: dict, A) -> dict:
             "inputs": [], "not_drawn": not_drawn(report, A), "outcome": A.primary}
 
 
-def clean_solve(A, ben, cost, budget, ev, d):
+def clean_solve(A, ben, cost, budget, ev, d, budget_exact=None):
     """One draw's best plan at `budget` on which no model correction `ev` bears (run()'s clean()). Both solves are
     auxiliary solves of the same kind, so each is counted and may use a feasible plan within the stated gap (1C-c
     follow-up, Codex r2 P1). None when the first solve has no usable plan, a correction bears on every plan, or the
     solve without the corrected packages fails; a proven infeasibility of the first solve is raised, as before."""
     from toolkit.analysis.core import AnalysisBlocked, SolveFailed, auxiliary
+    kw = {"budget_exact": budget_exact} if budget_exact is not None else {}
     try:
         with auxiliary(A, "value_of_information"):
-            sol = A.solve(ben, cost, budget=budget)
+            sol = A.solve(ben, cost, budget=budget, **kw)
     except SolveFailed as e:
         if e.status == "infeasible":
             raise
@@ -437,7 +438,7 @@ def clean_solve(A, ben, cost, budget, ev, d):
             f["feasible"][str(e["unit"])][e["package"]] = False
     try:
         with auxiliary(A, "value_of_information"):
-            sol = A.solve(ben, cost, budget=budget, feas=f)
+            sol = A.solve(ben, cost, budget=budget, feas=f, **kw)
         A.guard(f"uncertainty draw {d}", [sol["choice"]], ev)
         return sol
     except (AnalysisBlocked, RuntimeError, ValueError):
@@ -541,11 +542,12 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
     if gap > 1e-6 * max(1.0, float(np.max(np.abs(obj)))):
         raise ValueError(f"value of information: a draw's re-optimised objective is not its benefit table summed at its "
                          f"plan (gap {gap:.3g})")
-    def clean(d, budget):
+    def clean(d, budget, budget_exact=None):
         """The draw's best plan at `budget` on which no model correction bears: when the optimum carries one, the
         corrected packages are taken out in that draw and it is solved again (None when a correction bears on every
         plan, on the comparator or a whole unit)."""
-        return clean_solve(A, tab(Bn[d]), tab(Cs[d]), budget, list(rows[d]["events"]) + pev, d)
+        return clean_solve(A, tab(Bn[d]), tab(Cs[d]), budget, list(rows[d]["events"]) + pev, d,
+                           budget_exact=budget_exact)
     pi = obj.copy()
     if pev:      # hb1 fix 11 (Codex r3 of #343 P1-2): a draw's optimum on a point-corrected package earns no credit
         for d, r in enumerate(rows):
@@ -584,12 +586,15 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
     if s > 0:          # perfect information may overspend: each draw's best plan without the budget (round 2 P2)
         nb_free = np.full(n, -np.inf)
         for d in range(n):
-            sol = clean(d, float(Cs[d].max(1).sum()) + 1.0)
+            sol = clean(d, float(Cs[d].max(1).sum()) + 1.0,
+                        budget_exact=False if getattr(A, "budget_exact", False) else None)
             if sol is None:
                 notes.setdefault("unbudgeted_left_out", []).append(d)
             else:
                 nb_free[d] = float(sol["objective"])
-    res = analyse(nb, pi, cost > B * (1 + 1e-9), inputs, groups, s, level, thr=th, seed=seed,
+    infeas = ((cost > B * (1 + 1e-9)) | (cost < B * (1 - 1e-9))) if getattr(A, "budget_exact", False) \
+        else (cost > B * (1 + 1e-9))
+    res = analyse(nb, pi, infeas, inputs, groups, s, level, thr=th, seed=seed,
                   ids=[c[0] for c in cand], excluded=excluded, exact_id="robust" if rb is not None else None,
                   nb_free=nb_free, cond=cond, halves=hv, state=np.column_stack([Bn.reshape(n, -1), Cs.reshape(n, -1)]))
     res.update(outcome=A.primary, discount_factor=float(A.dfac), budget_allocatable=B, groups=groups,
@@ -802,12 +807,14 @@ class _FakeA:
         self.spec = type("S", (), {"raw": raw or {}})()
         self.primary, self.dfac, self.method, self.joint = "y", 1.0, "none", None
 
-    def solve(self, ben, cost, budget=None, feas=None):
+    def solve(self, ben, cost, budget=None, feas=None, budget_exact=None):
         f = feas or self.feas
         if not any(v for t in cost.values() for v in t.values()) and not f.get("links"):   # free plans: the argmax
             ch = {u: max(ben[u], key=lambda k: (ben[u][k], -list(self.pk).index(k))) for u in ben}
             return {"choice": ch, "objective": sum(ben[u][ch[u]] for u in ben), "status": "optimal"}
-        r = self.aopt.solve(ben, cost, feas or self.feas, self.budget if budget is None else budget, method="ilp")
+        exact = bool(getattr(self, "budget_exact", False)) if budget_exact is None else bool(budget_exact)
+        r = self.aopt.solve(ben, cost, feas or self.feas, self.budget if budget is None else budget, method="ilp",
+                            budget_exact=exact)
         if r["status"] != "optimal":
             raise RuntimeError(f"optimizer status {r['status']}")
         return r

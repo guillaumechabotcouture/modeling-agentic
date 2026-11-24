@@ -1316,6 +1316,8 @@ def _validate(s: Spec) -> list[str]:
         bad.append("constraints.envelope_usd: a number")
     elif s.budget() <= 0:
         bad.append("constraints: envelope_usd must exceed the fixed costs")
+    if "envelope_exact" in c and not isinstance(c.get("envelope_exact"), bool):
+        bad.append("constraints.envelope_exact: true or false")
     for g in c.get("group_rules") or []:
         if not isinstance(g, dict) or not g.get("id"):
             bad.append("constraints.group_rules: each rule needs an id")
@@ -1699,6 +1701,20 @@ def _validate_uncertainty(s, pnames) -> list[str]:
                        "take drawn unit values)")
         if src.get("kind") == "calibration" and s.raw["calibration"].get("method") == "none":
             bad.append("uncertainty.sources calibration: calibration.method is none")
+    if (s.raw.get("constraints") or {}).get("envelope_exact") is True:
+        if "costs" in inc:
+            bad.append("constraints.envelope_exact: cannot be combined with uncertainty source costs "
+                       "(an exact fixed-supply envelope requires fixed unit costs)")
+        if isinstance(u.get("affordability"), dict) and u["affordability"].get("enforce"):
+            bad.append("constraints.envelope_exact: cannot be combined with uncertainty.affordability.enforce "
+                       "(a reserve would hold back part of an exact envelope)")
+        if any(isinstance(it, dict) and it.get("basis") == "per_outcome"
+               for it in (s.raw.get("options") or {}).get("cost_items") or []):
+            bad.append("constraints.envelope_exact: cannot be combined with per_outcome cost items "
+                       "(package costs must stay fixed across draws)")
+        if ((s.raw.get("analysis") or {}).get("sensitivity") or {}).get("cost_items"):
+            bad.append("constraints.envelope_exact: cannot be combined with analysis.sensitivity.cost_items "
+                       "(unit-cost multipliers can make an exact supply infeasible)")
     return bad
 
 
@@ -1961,9 +1977,6 @@ def _validate_deliverable(s) -> list[str]:
                        "solved and compared at the point values)")
         if d.get("kind") != "package_per_unit":
             bad.append("deliverable.plan: expected_value applies to a package_per_unit deliverable")
-        if d.get("by_group") is not None:
-            bad.append("deliverable.plan: expected_value does not yet write a by-group table (its values are at the "
-                       "point values); use the point plan or drop by_group")
     bg = d.get("by_group")
     if bg is not None:
         gc = (bg or {}).get("columns") if isinstance(bg, dict) else None
@@ -2070,9 +2083,7 @@ def _self_test_plan_rule(ok):
                "estimates kind": lambda x: x["deliverable"].update(kind="estimates"),
                "headline variant": lambda x: x["analysis"].update(plan_variants={"headline": "v", "variants": []}),
                "variants, no headline": lambda x: x["analysis"].update(plan_variants={"variants": [
-                   {"id": "given", "type": "fixed_plan", "column": "given", "text": "t"}]}),
-               "by_group": lambda x: x["deliverable"].update(by_group={"columns": {"group": "g", "quantity": "q",
-                                                                                   "value": "v"}, "quantity": {}})}
+                   {"id": "given", "type": "fixed_plan", "column": "given", "text": "t"}]})}
         miss = []
         for k, mut in bad.items():
             r = copy.deepcopy(raw)
@@ -2080,6 +2091,40 @@ def _self_test_plan_rule(ok):
             mut(r)
             if not any("deliverable.plan" in e for e in _validate_deliverable(Spec(r, d))):
                 miss.append(k)
+        # expected_value is supported together with deliverable.by_group
+        r_bg = copy.deepcopy(raw)
+        r_bg["analysis"]["evaluation"] = "direct"
+        r_bg["analysis"]["cost_outputs"] = {"q_all": {"cost_driver": "a_doses"}}
+        r_bg["deliverable"]["plan"] = "expected_value"
+        r_bg["deliverable"]["by_group"] = {"columns": {"group": "age_group", "quantity": "doses", "value": "averted"},
+                                           "quantity": {"all": "q_all"}}
+        ev_bg_errs = _validate_deliverable(Spec(r_bg, d))
+        ok(ev_bg_errs == [], f"SPEV6 expected_value validates together with deliverable.by_group: {ev_bg_errs}")
+        # constraints.envelope_exact (fixed already-held supply)
+        r_ex = copy.deepcopy(raw)
+        r_ex["constraints"]["envelope_exact"] = True
+        r_ex["uncertainty"]["sources"] = [{"kind": "engine_parameters"}]
+        r_ex["uncertainty"]["excluded"] = [
+            {"kind": "calibration", "reason": "r"}, {"kind": "costs", "reason": "fixed supply"},
+            {"kind": "emulator", "reason": "r"}]
+        sp_ex_path = os.path.join(d, "spec_exact.yaml")
+        yaml.safe_dump(r_ex, open(sp_ex_path, "w"), sort_keys=False)
+        ex_errs = [e for e in validate(load(sp_ex_path)) if "envelope_exact" in e]
+        ok(ex_errs == [], f"SPEX1 constraints.envelope_exact: true validates with fixed unit costs: {ex_errs}")
+        ex_bad = {}
+        for tag, mut in (
+                ("non_bool", lambda x: x["constraints"].update(envelope_exact="yes")),
+                ("with_costs_uq", lambda x: x["uncertainty"].update(
+                    sources=[{"kind": "engine_parameters"}, {"kind": "costs"}],
+                    excluded=[{"kind": "calibration", "reason": "r"}, {"kind": "emulator", "reason": "r"}])),
+                ("with_affordability", lambda x: x["uncertainty"].update(
+                    affordability={"enforce": True, "max_share_over_budget": 0.05}))):
+            rb = copy.deepcopy(r_ex)
+            mut(rb)
+            pb = os.path.join(d, f"spec_exact_{tag}.yaml")
+            yaml.safe_dump(rb, open(pb, "w"), sort_keys=False)
+            ex_bad[tag] = [e for e in validate(load(pb)) if "envelope_exact" in e]
+        ok(all(ex_bad.values()), f"SPEX2 invalid envelope_exact combinations are refused: {ex_bad}")
         from toolkit.spec import estimates as ES
         es_bad = {}
         with tempfile.TemporaryDirectory() as de:
@@ -2094,7 +2139,7 @@ def _self_test_plan_rule(ok):
         ok(all(es_bad.values()), f"SPEV5 the public validate() refuses deliverable.plan on an estimates spec, whatever "
                                  f"its value (Codex r1 P1-4): {es_bad}")
         ok(not miss, f"SPEV4 expected_value is refused without an uncertainty source, with a reserve "
-                     f"(affordability enforce), with plan variants, on an estimates deliverable and with a by-group table (not refused: {miss})")
+                     f"(affordability enforce), with plan variants and on an estimates deliverable (not refused: {miss})")
 
 
 def toy_spec(d: str, n: int = 12, bench: str | None = None, dt_values=(1.0, 3.0)) -> str:

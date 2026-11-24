@@ -537,14 +537,19 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     bg = d.get("by_group")
     if bg:
         # a joint package within a unit (e.g. dose blocks over groups): one row per (unit, engine group) with the
-        # plan's quantity in that group (a cost output) and the outcome averted in it
+        # plan's quantity in that group (a cost output) and the outcome averted in it (mean over draws under
+        # deliverable.plan: expected_value)
         gc = bg["columns"]
         w.writerow([gc["group"], gc["quantity"], gc["value"], cols["unit"], cols["package"]])
+        pgm = (evp["record"].get("per_unit_group_mean") or {}) if evp is not None else None
+        pgq = (evp["record"].get("per_unit_group_quantity") or {}) if evp is not None else None
         for i in A.ids:
             yg = out0[i]["y_group"]
             for g, qname in bg["quantity"].items():
-                w.writerow([g, round(float(out0[i]["cost"][plan[i]][qname]), 4),
-                            round(yg[A.comp][hl_o].get(g, 0.0) - yg[plan[i]][hl_o].get(g, 0.0), 4), i, plan[i]])
+                qv = float(pgq[i][g]) if pgq is not None else float(out0[i]["cost"][plan[i]][qname])
+                vv = float(pgm[i][g][hl_o]) if pgm is not None else (
+                    yg[A.comp][hl_o].get(g, 0.0) - yg[plan[i]][hl_o].get(g, 0.0))
+                w.writerow([g, round(qv, 4), round(vv, 4), i, plan[i]])
     else:
         fl = getattr(A, "flagged", {}) or {}
         w.writerow([cols["unit"], cols["package"], cols["value"], "cost_usd", "region"]

@@ -357,8 +357,8 @@ def _expected_value(raw) -> list:
         f = _f("MEDIUM", "expected_value_plan", f"The question states its objective in expectation (\"{said}\"), but "
                f"the deliverable carries the plan solved at the point values (deliverable.plan: {d.get('plan') or 'absent'}"
                "). That plan answers the question only when the outcome is linear in the uncertain inputs.",
-               "Set deliverable.plan: expected_value; when the spec cannot carry it (for example a by_group table), "
-               "declare this check in principle_departures with the reason")
+               "Set deliverable.plan: expected_value; when the spec cannot carry it (for example plan_variants or "
+               "uncertainty.affordability.enforce), declare this check in principle_departures with the reason")
     f["detected"] = said
     return [f]
 

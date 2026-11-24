@@ -91,7 +91,9 @@ else:
 METHOD_NAMES = {"ilp": "ilp_pulp", "greedy": "greedy", "brute": "brute_force"}   # optimization_quality.py vocabulary
 EXACT = ("ilp", "brute")
 BUDGET_RTOL = 1e-9       # every method allows cost <= budget * (1 + 1e-9)
+EXACT_BUDGET_RTOL = 1e-12  # exact-budget lower/upper tolerance in solve() (prevents 1e9 - 1 slipping past 1e9)
 CHECK_RTOL = 1e-7        # the independent check allows solver rounding up to this
+EXACT_CHECK_RTOL = 1e-10  # independent check tolerance for budget_exact=True
 BEAT_RTOL = 1e-7         # a method "beats" another when it is better by more than this (relative)
 
 
@@ -176,11 +178,13 @@ def _prepare(benefit, cost, feasible, budget, caps):
     return us, opts, caps, names, b0
 
 
-def prune(opts: dict, links=None) -> tuple[dict, int]:
+def prune(opts: dict, links=None, budget_exact: bool = False) -> tuple[dict, int]:
     """Drop packages dominated within a unit: another costs no more, gives no less benefit and uses no more of
     any capped resource. Safe with caps (unlike E7 attempt 7's pruning, which ignored caps and was therefore
     switched off whenever a cap existed). Exact ties keep the first package. With links (group rules), only a
-    package of the same class in every link can dominate, so each group's common choice stays available."""
+    package of the same class in every link can dominate, so each group's common choice stays available. With
+    `budget_exact=True` (an exact-budget constraint), only a package of the exact same cost can dominate, because a
+    costlier package may be required to sum to the exact budget."""
     out, n = {}, 0
     for u, o in opts.items():
         keep = []
@@ -188,11 +192,12 @@ def prune(opts: dict, links=None) -> tuple[dict, int]:
         for j, (p, b, c, w) in enumerate(o):
             dom = False
             for k, (q, b2, c2, w2) in enumerate(o):
-                if k == j or not (c2 <= c and b2 >= b and all(x <= y for x, y in zip(w2, w))):
+                cost_ok = (c2 == c) if budget_exact else (c2 <= c)
+                if k == j or not (cost_ok and b2 >= b and all(x <= y for x, y in zip(w2, w))):
                     continue
                 if any(cl.get(p) != cl.get(q) for cl in cls):
                     continue
-                if c2 < c or b2 > b or any(x < y for x, y in zip(w2, w)) or k < j:
+                if (not budget_exact and c2 < c) or b2 > b or any(x < y for x, y in zip(w2, w)) or k < j:
                     dom = True
                     break
             if dom:
@@ -226,17 +231,31 @@ def _limits(opts, caps, b0):
             [float(cp["max"]) + BUDGET_RTOL * _cap_scale(opts, k, float(cp["max"])) for k, cp in enumerate(caps)])
 
 
-def drop_impossible(opts, blim, cmax) -> tuple[dict, int]:
+def drop_impossible(opts, blim, cmax, blo=None) -> tuple[dict, int]:
     """Drop options that cannot be part of any feasible allocation: their own cost (or cap use) plus the
-    cheapest choice in every other unit already exceeds the limit."""
+    cheapest choice in every other unit already exceeds the limit, or (when `blo` is given for an exact budget)
+    their own cost plus the costliest choice in every other unit cannot reach `blo`."""
     K = len(cmax)
     mc = {u: min(x[2] for x in o) for u, o in opts.items()}
+    xc = {u: max(x[2] for x in o) for u, o in opts.items()} if blo is not None else None
     mw = {u: [min(x[3][k] for x in o) for k in range(K)] for u, o in opts.items()}
     tc, tw = sum(mc.values()), [sum(mw[u][k] for u in opts) for k in range(K)]
+    tc_max = sum(xc.values()) if xc is not None else None
     out, n = {}, 0
     for u, o in opts.items():
-        keep = [x for x in o if tc - mc[u] + x[2] <= blim
-                and all(tw[k] - mw[u][k] + x[3][k] <= cmax[k] for k in range(K))]
+        other_max = None
+        keep = []
+        for x in o:
+            if tc - mc[u] + x[2] > blim:
+                continue
+            if blo is not None and tc_max - xc[u] + x[2] < blo:
+                # re-check with fsum to avoid floating-point cancellation from outlier unit costs
+                if other_max is None:
+                    other_max = math.fsum(xc[v] for v in opts if v != u)
+                if other_max + x[2] < blo:
+                    continue
+            if all(tw[k] - mw[u][k] + x[3][k] <= cmax[k] for k in range(K)):
+                keep.append(x)
         n += len(o) - len(keep)
         out[u] = keep
     return out, n
@@ -247,9 +266,9 @@ def _baseline(opts) -> float:
     return sum(min(x[1] for x in o) for o in opts.values())
 
 
-def check(choice, benefit, cost, feasible, budget, caps=None, links=None) -> list[str]:
-    """Independent check of an allocation: one feasible package per unit, within budget and caps, and each
-    group of a link (group rule) on one class."""
+def check(choice, benefit, cost, feasible, budget, caps=None, links=None, budget_exact: bool = False) -> list[str]:
+    """Independent check of an allocation: one feasible package per unit, within budget (or equal to it when
+    `budget_exact=True`) and caps, and each group of a link (group rule) on one class."""
     lk = _links(feasible, links)
     us, opts, caps, names, b0 = _prepare(benefit, cost, feasible, budget, caps)
     errs = []
@@ -263,8 +282,11 @@ def check(choice, benefit, cost, feasible, budget, caps=None, links=None) -> lis
             continue
         tot += hit[0][2]
         use = [a + b for a, b in zip(use, hit[0][3])]
-    if tot > b0 + CHECK_RTOL * _scale(b0, tot):
+    rtol = EXACT_CHECK_RTOL if budget_exact else CHECK_RTOL
+    if tot > b0 + rtol * _scale(b0, tot):
         errs.append(f"cost {tot:,.4f} exceeds the budget {b0:,.4f}")
+    if budget_exact and tot < b0 - rtol * _scale(b0, tot):
+        errs.append(f"cost {tot:,.4f} is below the exact budget {b0:,.4f}")
     for k, (n, cp, x) in enumerate(zip(names, caps, use)):
         if x > float(cp["max"]) + CHECK_RTOL * _scale(float(cp["max"]), x):
             errs.append(f"cap {n}: use {x:g} exceeds {cp['max']:g}")
@@ -345,7 +367,7 @@ def _relaxation_gap(pulp, prob, time_limit):
     return float((bound - inc) / bound) if bound > 0 else None
 
 
-def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None, gap_rel=0.0, threads=None):
+def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None, gap_rel=0.0, threads=None, blo=None):
     pulp = _pulp()
     if pulp is None:
         raise ImportError("method ilp needs PuLP (requirements.txt pins PuLP==3.3.0)")
@@ -365,6 +387,9 @@ def _ilp(us, opts, caps, names, blim, cmax, time_limit, links=None, gap_rel=0.0,
         prob += pulp.lpSum(x[i, j] for j in range(len(opts[u]))) == 1
     prob += pulp.lpSum((opts[u][j][2] / cs) * x[i, j]
                        for i, u in enumerate(us) for j in range(len(opts[u]))) <= blim / cs
+    if blo is not None:
+        prob += pulp.lpSum((opts[u][j][2] / cs) * x[i, j]
+                           for i, u in enumerate(us) for j in range(len(opts[u]))) >= blo / cs
     for k, cp in enumerate(caps):
         ws = _cap_scale(opts, k, cmax[k])
         terms = [(opts[u][j][3][k] / ws) * x[i, j] for i, u in enumerate(us) for j in range(len(opts[u]))
@@ -479,17 +504,19 @@ def search_space(opts: dict) -> int:
     return n
 
 
-def _brute(us, opts, caps, names, blim, cmax, limit, links=None):
+def _brute(us, opts, caps, names, blim, cmax, limit, links=None, blo=None):
     t0 = time.time()
     if search_space(opts) > limit:
         raise ValueError(f"brute: search space {search_space(opts):.3g} exceeds brute_limit {limit:.3g}")
     n, K = len(us), len(caps)
     o = [sorted(opts[u], key=lambda x: -x[1]) for u in us]
     smin_c = [0.0] * (n + 1)
+    smax_c = [0.0] * (n + 1)
     smax_b = [0.0] * (n + 1)
     smin_w = [[0.0] * K for _ in range(n + 1)]
     for i in range(n - 1, -1, -1):
         smin_c[i] = smin_c[i + 1] + min(x[2] for x in o[i])
+        smax_c[i] = smax_c[i + 1] + max(x[2] for x in o[i])
         smax_b[i] = smax_b[i + 1] + max(x[1] for x in o[i])
         smin_w[i] = [smin_w[i + 1][k] + min(x[3][k] for x in o[i]) for k in range(K)]
     best = [-math.inf, None]
@@ -498,7 +525,8 @@ def _brute(us, opts, caps, names, blim, cmax, limit, links=None):
     fixed = {}                                    # (link, group) -> the class chosen so far on this branch
 
     def dfs(i, c, b, w):
-        if c + smin_c[i] > blim or any(w[k] + smin_w[i][k] > cmax[k] for k in range(K)):
+        if c + smin_c[i] > blim or (blo is not None and c + smax_c[i] < blo) \
+                or any(w[k] + smin_w[i][k] > cmax[k] for k in range(K)):
             return
         if b + smax_b[i] <= best[0]:
             return
@@ -529,7 +557,7 @@ def _brute(us, opts, caps, names, blim, cmax, limit, links=None):
 
 
 def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=300, brute_limit=2_000_000,
-          links=None, gap_rel=0.0, threads=None):
+          links=None, gap_rel=0.0, threads=None, budget_exact: bool = False):
     if method not in METHOD_NAMES:
         raise ValueError(f"method must be one of {', '.join(METHOD_NAMES)}")
     lk = _links(feasible, links)
@@ -537,25 +565,32 @@ def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=3
     lk = _check_links(lk, opts)
     if lk and method == "greedy":
         raise ValueError("greedy does not support group rules (links): no bound holds; use ilp or brute")
+    if budget_exact and method == "greedy":
+        raise ValueError("greedy does not support exact-budget constraints (budget_exact=True): use ilp or brute")
     base = _baseline(opts)
-    opts, npruned = prune(opts, lk)
+    opts, npruned = prune(opts, lk, budget_exact=budget_exact)
     blim, cmax = _limits(opts, caps, b0)
-    opts, nimp = drop_impossible(opts, blim, cmax)
+    if budget_exact:
+        etol = EXACT_BUDGET_RTOL * _cost_scale(opts, b0)
+        blim, blo = b0 + etol, b0 - etol
+    else:
+        blo = None
+    opts, nimp = drop_impossible(opts, blim, cmax, blo=blo)
     if any(not o for o in opts.values()):
         r = _result(method, us, opts, None, "infeasible" if method in EXACT else "no_feasible_found", time.time(),
                     names, bound=None)
     elif method == "ilp":
-        r = _ilp(us, opts, caps, names, blim, cmax, time_limit, lk, gap_rel, threads)
+        r = _ilp(us, opts, caps, names, blim, cmax, time_limit, lk, gap_rel, threads, blo=blo)
     elif method == "greedy":
         r = _greedy(us, opts, caps, names, blim, cmax)
     else:
-        r = _brute(us, opts, caps, names, blim, cmax, brute_limit, lk)
+        r = _brute(us, opts, caps, names, blim, cmax, brute_limit, lk, blo=blo)
     r["n_pruned_dominated"] = npruned
     r["n_impossible"] = nimp
     r["baseline"] = base
     r["search_space"] = search_space(opts)
     if r["choice"] is not None:
-        bad = check(r["choice"], benefit, cost, feasible, budget, caps, links=lk)
+        bad = check(r["choice"], benefit, cost, feasible, budget, caps, links=lk, budget_exact=budget_exact)
         if bad:
             raise OptimizerError(f"{method} returned an allocation that violates its constraints: {'; '.join(bad)}")
     return r
@@ -596,13 +631,14 @@ def assert_consistent(results: dict, primary: str) -> None:
                                  f"{g['bound']:.6g}: a greedy defect")
 
 
-def _one(benefit, cost, feasible, budget, caps, methods, time_limit, brute_limit):
-    return {m: solve(benefit, cost, feasible, budget, caps, m, time_limit, brute_limit) for m in methods}
+def _one(benefit, cost, feasible, budget, caps, methods, time_limit, brute_limit, budget_exact=False):
+    return {m: solve(benefit, cost, feasible, budget, caps, m, time_limit, brute_limit, budget_exact=budget_exact)
+            for m in methods}
 
 
 def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods=None, run_dir=None, out=None,
               objective_name="benefit", sweep_budgets=None, time_limit=300, brute_limit=2_000_000,
-              root=None) -> dict:
+              root=None, budget_exact: bool = False) -> dict:
     """Run every applicable method, check them against each other, and write the optimizer quality report.
     The report is written under a trusted root the caller names: `run_dir`, or `root` for an `out=` outside a run
     dir (an `out=` with neither is refused; the root is never taken from the output path)."""
@@ -610,7 +646,7 @@ def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods
     if caps is None:
         caps = caps_l
     lk = _check_links(_links(feasible, None), opts)
-    popts, npruned = prune(opts, lk)
+    popts, npruned = prune(opts, lk, budget_exact=budget_exact)
     skipped = {}
     if methods is None:
         methods = []
@@ -619,6 +655,8 @@ def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods
                 skipped[m] = "PuLP not installed"
             elif m == "greedy" and lk:
                 skipped[m] = "group rules (links): greedy has no bound"
+            elif m == "greedy" and budget_exact:
+                skipped[m] = "exact-budget constraint: greedy has no bound"
             elif m == "brute" and search_space(popts) > brute_limit:
                 skipped[m] = f"search space {search_space(popts):.3g} > brute_limit {brute_limit:.3g}"
             else:
@@ -627,11 +665,11 @@ def benchmark(benefit, cost, feasible, budget, caps=None, primary="ilp", methods
         raise ValueError(f"primary {primary} is not among the methods run ({methods}; skipped {skipped})")
     if len(methods) < 2:
         raise ValueError(f"a benchmark needs at least two methods; ran {methods}, skipped {skipped}")
-    res = _one(benefit, cost, feasible, budget, caps, methods, time_limit, brute_limit)
+    res = _one(benefit, cost, feasible, budget, caps, methods, time_limit, brute_limit, budget_exact=budget_exact)
     assert_consistent(res, primary)
     sweep = []
     for sb in sweep_budgets or []:
-        rs = _one(benefit, cost, feasible, sb, caps, methods, time_limit, brute_limit)
+        rs = _one(benefit, cost, feasible, sb, caps, methods, time_limit, brute_limit, budget_exact=budget_exact)
         assert_consistent(rs, primary)
         objs = {m: r["objective"] for m, r in rs.items() if r["objective"] is not None}
         bm = max(objs, key=objs.get)
@@ -1012,6 +1050,42 @@ def _self_test() -> int:
        and ex.get("gap", "absent") is None and rf["objective"] == ex["objective"],
        f"TG2 a solve that stopped early reports its gap to the LP relaxation bound; a proven one reports none: "
        f"{rf.get('gap')}, {ex.get('gap', 'absent')}")
+    # TEX1-TEX3: exact-budget constraint (fixed already-held supply)
+    eb = {"u1": {"c0": 0.0, "c8": 100.0, "c11a": 100.0, "c11b": 95.0}}
+    ec = {"u1": {"c0": 0.0, "c8": 8.0, "c11a": 11.0, "c11b": 11.0}}
+    ef = {"u1": {"c0": True, "c8": True, "c11a": True, "c11b": True}}
+    try:
+        ri = solve(eb, ec, ef, 11.0, method="ilp", budget_exact=True)
+        rb = solve(eb, ec, ef, 11.0, method="brute", budget_exact=True)
+        ok(ri["status"] == "optimal" and rb["status"] == "optimal"
+           and ri["choice"] == {"u1": "c11a"} and rb["choice"] == {"u1": "c11a"} and ri["cost"] == 11.0,
+           f"TEX1 budget_exact=True allocates the exact budget even when a cheaper package ties on benefit ({ri}, {rb})")
+        rinf = solve(eb, ec, ef, 9.0, method="ilp", budget_exact=True)
+        rinf_b = solve(eb, ec, ef, 9.0, method="brute", budget_exact=True)
+        ok(rinf["status"] == "infeasible" and rinf_b["status"] == "infeasible",
+           f"TEX2 budget_exact=True proves infeasible when no package combination sums to budget ({rinf}, {rinf_b})")
+        under_err = check({"u1": "c8"}, eb, ec, ef, 11.0, budget_exact=True)
+        ok(bool(under_err) and not check({"u1": "c8"}, eb, ec, ef, 11.0, budget_exact=False),
+           f"TEX3a check(budget_exact=True) refuses an under-budget allocation ({under_err})")
+        try:
+            solve(eb, ec, ef, 11.0, method="greedy", budget_exact=True)
+            ok(False, "TEX3b greedy refuses budget_exact=True")
+        except ValueError:
+            ok(True, "TEX3b greedy refuses budget_exact=True")
+        # Codex r1 P2 & P3: large integer supply exactness (1e9 vs 1e9-1) and outlier-cost cancellation
+        big_b = {"u1": {"short": 200.0, "exact": 100.0}}
+        big_c = {"u1": {"short": 999_999_999.0, "exact": 1_000_000_000.0}}
+        big_f = {"u1": {"short": True, "exact": True}}
+        rb_big = solve(big_b, big_c, big_f, 1_000_000_000.0, method="brute", budget_exact=True)
+        can_r = solve({"u1": {"a": 1.0, "big": 0.0}, "u2": {"a": 1.0}},
+                      {"u1": {"a": 1.0, "big": 1e16}, "u2": {"a": 1.0}},
+                      {"u1": {"a": True, "big": True}, "u2": {"a": True}}, 2.0, method="brute", budget_exact=True)
+        ok(rb_big["choice"] == {"u1": "exact"} and bool(check({"u1": "short"}, big_b, big_c, big_f, 1e9,
+                                                              budget_exact=True))
+           and can_r["choice"] == {"u1": "a", "u2": "a"},
+           f"TEX4 exact budget holds at 1e9 scale and with outlier costs ({rb_big}, {can_r})")
+    except TypeError as e:
+        ok(False, f"TEX1-TEX3 budget_exact not yet supported ({e})")
     if fails:
         print("SELF-TEST FAILURES:")
         for m in fails:

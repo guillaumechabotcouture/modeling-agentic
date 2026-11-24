@@ -66,7 +66,7 @@ def plan_within_gap(A, sol, plan, ben, cost) -> bool:
     from toolkit.alloc import optimize as aopt
     budget = A.budget if getattr(A, "plan_budget", None) is None else A.plan_budget
     try:      # the allocator's own check (Codex r1 P1-8); a plan it cannot read is not within the gap
-        if aopt.check(plan, ben, cost, A.feas, budget):
+        if aopt.check(plan, ben, cost, A.feas, budget, budget_exact=bool(getattr(A, "budget_exact", False))):
             return False
         short = float(sol["objective"]) - sum(float(ben[i][plan[i]]) for i in A.ids)
     except (KeyError, TypeError, ValueError):
