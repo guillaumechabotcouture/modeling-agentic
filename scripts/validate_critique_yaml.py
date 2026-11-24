@@ -425,10 +425,28 @@ def _validate_carried_forward(cf: Any, ctx: str, current_round: int,
 
 
 def validate_critique(path: str, expected_reviewer: str,
-                      current_round: int) -> dict:
-    """The parsed critique, or SchemaError listing every problem in the file (`.errors`)."""
-    doc = _load(path)
+                      current_round: int, checklist: bool = False) -> dict:
+    """The parsed critique, or SchemaError listing every problem in the file (`.errors`).
+    `checklist`: True for a v2 gate, where a checklist reviewer answers every item of the structural
+    checklist; False (the legacy gate) requires none."""
     ctx = os.path.basename(path)
+    if checklist and expected_reviewer in _checklist_module().CHECKLIST_REVIEWERS:
+        # Codex r3 of #366: read with no duplicate key, and a parse failure named by fixed text (the parser's report
+        # quotes the file; the repair's review message carries it as data, critique_checklist.repair_data).
+        CL0 = _checklist_module()
+        try:
+            with open(path, "rb") as fh:
+                raw0 = fh.read()
+        except FileNotFoundError:
+            raise SchemaError(f"missing file: {path}")
+        except OSError:
+            raise SchemaError(f"{ctx}: {CL0.LOAD_ERROR}")
+        doc, diag = CL0.strict_load(raw0)
+        if diag is not None:
+            raise SchemaError(f"{ctx}: {CL0.LOAD_ERROR}")
+        _require(isinstance(doc, dict), f"{ctx}: top-level must be a mapping")
+    else:
+        doc = _load(path)
     prefix = PREFIXES[expected_reviewer]
     errs = _Errors()
 
@@ -478,9 +496,25 @@ def validate_critique(path: str, expected_reviewer: str,
         _validate_carried_forward(doc.get("carried_forward"), ctx,
                                   current_round, blockers, errs)
 
+    # Owner 2026-11-23: the domain and red-team critics answer the structural checklist
+    # (toolkit/spec/critique_checklist.py); a missing or malformed item is a schema error.
+    if checklist:
+        CL = _checklist_module()
+        if expected_reviewer in CL.CHECKLIST_REVIEWERS:
+            errs.extend(CL.problems(doc.get("checklist"), ctx,
+                                    [b for b in blockers if isinstance(b, dict)]))
+
     if errs:
         raise SchemaError(errs[0], errs)
     return doc
+
+
+def _checklist_module():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from toolkit.spec import critique_checklist
+    return critique_checklist
 
 
 _ESCALATION_HIGH_THRESHOLD = 3  # patch_attempts >= 3 triggers mandatory escalation
@@ -4742,6 +4776,64 @@ def _run_self_test() -> int:
             except Exception as e:                            # noqa: BLE001 - the test is that it does not raise
                 bad.append((i, repr(e)))
         ok(not bad, f"SE7 unconstructible YAML is a SchemaError: {bad}")
+
+    # --- CK1-CK6 (owner 2026-11-23): the structural checklist of the domain and red-team critics ---
+    with tempfile.TemporaryDirectory() as d:
+        CLm = _checklist_module()
+        pth = os.path.join(d, "critique_domain.yaml")
+        ob = {"id": "D-001", "severity": "MEDIUM", "category": "METHODS", "target_stage": "ANALYZE",
+              "first_seen_round": 1, "claim": "c", "evidence": "e", "fix_requires": "f", "resolved": False}
+        mine = {i: {"answer": "not_applicable", "reason": "no burn-in"} for i in CLm.ITEMS}
+
+        def errs_of(doc, reviewer="critique-domain", cl=False):
+            with open(pth, "w") as fh:
+                yaml.safe_dump(dict({"reviewer": reviewer, "round": 1, "verdict": "REVISE",
+                                     "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                     "blockers": [dict(ob, id=PREFIXES[reviewer] + "001")]}, **doc), fh)
+            try:
+                validate_critique(pth, reviewer, 1, checklist=cl)
+                return []
+            except SchemaError as e:
+                return list(e.errors)
+        ok(errs_of({"checklist": mine}, cl=True) == [], "CK1 a domain critique answering every item is accepted")
+        e1 = errs_of({}, cl=True)
+        ok(len(e1) == 1 and "missing required key 'checklist'" in e1[0],
+           f"CK2 a v2 domain critique without a checklist fails closed: {e1}")
+        part = {k: v for k, v in mine.items() if k != "surveillance_ranking"}
+        e3 = errs_of({"checklist": dict(part, burn_in_drift={"answer": "not_applicable", "reason": ""})}, cl=True)
+        ok(len(e3) == 2 and any("surveillance_ranking" in x and "missing" in x for x in e3)
+           and any("burn_in_drift needs a non-empty reason" in x for x in e3),
+           f"CK3 a missing item and a not_applicable without a reason are schema errors, listed together: {e3}")
+        fin = dict(mine, burn_in_drift={"answer": "finding", "reason": "drift", "blockers": ["D-001"]})
+        ok(errs_of({"checklist": fin}, cl=True) == [], "CK4 a finding names an open blocker of the file")
+        e4 = errs_of({"checklist": {k: v for k, v in fin.items() if k != "comparator_symmetry"}}, cl=True)
+        ok(len(e4) == 1 and "comparator_symmetry" in e4[0],
+           f"CK4b no item is computed by the harness: the critic answers comparator_symmetry too: {e4}")
+        ok(errs_of({}) == [] and errs_of({}, reviewer="critique-presentation", cl=True) == [],
+           "CK5 the legacy gate (checklist=False) and the presentation critic need no checklist")
+        e6 = errs_of({"checklist": dict(mine, burn_in_drift={"answer": "finding", "reason": "r", "blockers": ["D-7"]})},
+                     cl=True)
+        ok(len(e6) == 1 and "[CK-B-burn_in_drift-1]" in e6[0] and "D-7" not in e6[0],
+           f"CK6 a finding naming no blocker of the file is refused, by marker (critic text is never quoted): {e6}")
+        # CK7-CK8 (Codex r3 of #366): a duplicate checklist key, and a value the parser cannot construct, are schema
+        # errors in fixed text; the legacy gate keeps its old reading
+        base_y = ("reviewer: critique-domain\nround: 1\nverdict: PASS\nstructural_mismatch: {detected: false}\n"
+                  "carried_forward: []\nblockers: []\nchecklist:\n"
+                  + "".join(f"  {i}: {{answer: pass, reason: r}}\n" for i in CLm.ITEMS))
+        for tag, extra in (("CK7", "  burn_in_drift: {answer: finding, reason: r}\n"),
+                           ("CK8", "  surveillance_ranking: {answer: pass, reason: !!bool observation_SECRET}\n")):
+            body = base_y if tag == "CK8" else base_y + extra
+            if tag == "CK8":
+                body = base_y.replace("  surveillance_ranking: {answer: pass, reason: r}\n", extra)
+            open(pth, "w").write(body)
+            try:
+                validate_critique(pth, "critique-domain", 1, checklist=True)
+                ek = []
+            except SchemaError as e:
+                ek = list(e.errors)
+            ok(len(ek) == 1 and "[CK-YAML]" in ek[0] and "observation_SECRET" not in ek[0],
+               f"{tag} a {'duplicate key' if tag == 'CK7' else 'value the parser cannot construct'} is one schema "
+               f"error in fixed text: {ek}")
 
     # --- Phase 39 α: presentation polish waits for the first draft ---
     with tempfile.TemporaryDirectory() as d:
