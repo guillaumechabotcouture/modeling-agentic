@@ -640,8 +640,8 @@ def _calibration(rel, d) -> list[dict]:
                                    "rows": np.asarray(smp["rows"], float)}, []):
                 out.append(_f("analysis_contract_uncovered_parameter", f"{rel}: the canonical sample does not match "
                                                                        "its recorded id", rel))
-        if "variant_samples" in data:
-            vs_map = data.get("variant_samples")
+        if "variant_samples" in d:
+            vs_map = d.get("variant_samples")
             if not isinstance(vs_map, dict) or not vs_map:
                 out.append(_f("analysis_contract_uncovered_parameter",
                               f"{rel}: variant_samples must be a non-empty mapping", rel))
