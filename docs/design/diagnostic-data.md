@@ -208,15 +208,15 @@ from a signing command or a resume writing to the same file.
 | kind | fields | written where (one place per kind) |
 |---|---|---|
 | `run_start` | `pipeline`, `commit`, `resume` | `Machine.run()` entry |
-| `stage` | `from`, `to`, `why`, `spent_usd`, `elapsed_in_from_s` | `Machine._go` (every transition: one event is both the leave and the enter) |
+| `stage` | `from`, `to`, `why`, `spent_usd`, `elapsed_in_from_s`, `status` (on `to: FINAL`) | `Machine._go` (every transition: one event is both the leave and the enter) |
 | `round` | `from`, `to` | `Machine._go`, when the round differs from the previous transition's |
-| `task_start` | `key`, `task`, `kind`, `model`, `allowance_usd` | `Machine._task`, after the journal records `started` |
-| `task_end` | `key`, `task`, `ok`, `elapsed_s`, `usd`, `spent_usd`, `note` (300 chars) | `Machine._task`, after the journal records `completed` |
+| `task_start` | `key`, `task`, `allowance_usd` | `Machine._task`, after the journal records `started` |
+| `task_end` | `key`, `task`, `ok`, `elapsed_s`, `usd`, `spent_usd`, `note` (300 chars), `model` (when the task runner reports it) | `Machine._task`, after the journal records `completed` |
 | `heartbeat` | `step`, `elapsed_s`, `progress` (e.g. "rows 40 of 120"), `eta_s`, `basis` | a timer while `_task` or the analysis pipeline runs (default every 300 s); ETA from `pipeline_progress.json`'s projection or the batch's rows, else null |
-| `gate` | `post_write`, `action`, `rule`, `rounds_remaining`, `blocking` (count) | `h_GATE`, where it sets `last_gate` |
+| `gate` | `post_write`, `action`, `rule`, `rounds_remaining`, `blocking` (count), `waiting` (count awaiting the owner) | `h_GATE`, where it sets `last_gate` |
 | `finding` | `id`, `finding_kind`, `severity`, `from`, `to`, `by` | `findings_ledger.save`, from the difference with the ledger on disk |
 | `owner_question` | `question` (`spec_signoff`, `scope_signoff`, `spec_amendment`, `budget`), `request`, `items` (ids) | `Machine.run()` exit, when it ends paused |
-| `owner_answer` | `question`, `by`, `items` | `stage_machine.sign` and `scripts/scope_signoff.py sign` |
+| `owner_answer` | `question`, `paused`, `by` (the spec's signer, for a sign-off) | `Machine._go`, when the run leaves the state it paused in (owner and lead answers alike, whichever command signed) |
 | `status` | `status`, `paused`, `terminal` | `Machine.run()` exit |
 
 **Rules.**
