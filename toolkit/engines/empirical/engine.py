@@ -36,6 +36,15 @@ outcomes as declared weighted sums (e.g. DALYs = YLL per death x deaths + YLD pe
 parameters `w:<target>:<part>`). Every value needs a source; anything missing is refused at
 construction. The rule, the interactions and every source are on the card.
 
+Per-unit sampling (version 3, hb3 fix 5). A baseline measured from a panel of counts is uncertain unit by unit. With
+`baseline.sampling: {model: poisson, dispersion, outcomes, source}` the card adds the unit attribute
+`baseline_events` ({outcome: the event count behind the unit's measured rate}) and the uncertainty step's source
+`unit_rates` draws each unit's rate of each listed outcome, independently across units and outcomes, as
+rate x Gamma(shape n / phi, scale phi / n): mean 1, coefficient of variation sqrt(phi / n), n the unit's count and phi
+the panel's over-dispersion (1 for Poisson). A count of 0 is refused (no multiplicative interval). Without it the card
+says the baseline rates are point values the uncertainty step does not draw. In calibrated mode the per-unit log_rate
+and the rate ratios are drawn jointly from the panel fit's covariance by the `calibration` source (method likelihood).
+
 Outputs: per-capita outcomes over the decision window, the rate in each named window, and one cost
 driver per component (person-years covered). Disease-agnostic: names and values come from the spec.
 """
@@ -55,6 +64,8 @@ RULES = ("multiplicative", "strongest")
 RATIO_DISTS = ("triangular", "uniform")         # drawn on the log scale
 WEIGHT_DISTS = ("triangular", "uniform", "loguniform")
 MEASURED_UNDER = ("coverage_attribute", "no_components")
+SAMPLING_MODELS = ("poisson",)      # baseline.sampling.model: a gamma multiplier from the unit's event count
+EVENTS_ATTRIBUTE = "baseline_events"
 OVERLAPS = ("independent", "comonotone")
 MEASURES = ("rate_ratio", "hazard_ratio", "risk_ratio", "odds_ratio")
 # The rare-outcome approximation (a risk ratio used as the rate ratio) is accepted only at a baseline risk of at most
@@ -139,7 +150,9 @@ def _measure(d, where, hi):
 
 
 VALUE_KEYS = {"range", "dist", "source", "verified", "note"}
-KEYS = {"outcome": {"baseline_source", "note"}, "baseline": {"measured_under", "source", "overlap", "note"},
+KEYS = {"outcome": {"baseline_source", "note"},
+        "baseline": {"measured_under", "source", "overlap", "sampling", "note"},
+        "sampling": {"model", "dispersion", "outcomes", "source", "note"},
         "effect": VALUE_KEYS | {"rr", "measure", "conversion"},
         "conversion": {"method", "p0", "then", "reason", "source"},
         "combination": {"rule", "source", "interactions"},
@@ -252,6 +265,26 @@ class PackageRateEngine:
         self.overlap = b.get("overlap", "independent")
         if self.overlap not in OVERLAPS:
             bad.append(f"baseline.overlap: one of {OVERLAPS} (how components' baseline coverages overlap)")
+        self.sampling, n0 = None, len(bad)
+        sm = b.get("sampling")
+        if sm is not None:
+            if not isinstance(sm, dict):
+                bad.append("baseline.sampling: a mapping {model, dispersion, outcomes, source}")
+                sm = {}
+            bad += _unknown(sm, "sampling", "baseline.sampling")
+            so, disp = sm.get("outcomes", list(self.outcomes)), sm.get("dispersion", 1.0)
+            if sm.get("model") not in SAMPLING_MODELS:
+                bad.append(f"baseline.sampling.model: one of {SAMPLING_MODELS}")
+            if not (_num(disp) and disp >= 1):
+                bad.append("baseline.sampling.dispersion: a number >= 1 (the panel's over-dispersion; 1 for Poisson)")
+            if not (isinstance(so, list) and so and all(isinstance(o, str) for o in so) and len(set(so)) == len(so)
+                    and set(so) <= set(self.outcomes)):
+                bad.append(f"baseline.sampling.outcomes: distinct declared outcomes (of {self.outcomes})")
+            if not str(sm.get("source") or "").strip():
+                bad.append("baseline.sampling.source: the basis of the counts and the dispersion")
+            if len(bad) == n0:
+                self.sampling = {"model": sm["model"], "dispersion": float(disp), "outcomes": list(so),
+                                 "source": str(sm["source"]).strip()}
         effects = effects if isinstance(effects, dict) else {}
         self.relative, self.conversions, self.conv = {}, [], {}
         for c in effects:
@@ -355,6 +388,36 @@ class PackageRateEngine:
                            for k, v in self._p.items() if v[1] is not None},
                 "fixed": {k: f"declared without a range: {v[4]}" for k, v in self._p.items() if v[1] is None}}
 
+    def unit_sampling(self) -> dict | None:
+        """The per-unit sampling the uncertainty step draws (source `unit_rates`), or None: {attribute, events_attribute,
+        model, dispersion, outcomes, source}. Only trial_priors mode with `baseline.sampling` declares one."""
+        if self.mode != "trial_priors" or self.sampling is None:
+            return None
+        return dict(self.sampling, attribute="baseline_rate", events_attribute=EVENTS_ATTRIBUTE,
+                    outcomes=list(self.sampling["outcomes"]))
+
+    def draw_unit_attributes(self, unit, rng) -> dict:
+        """One draw of the unit's sampled attributes ({baseline_rate: {outcome: rate}}): each listed outcome's measured
+        rate times Gamma(n / phi, scale phi / n) from `rng` (a numpy Generator), in the declared outcome order; the
+        other outcomes keep their value. Fails closed on a missing or non-positive count."""
+        s = self.unit_sampling()
+        if s is None:
+            raise ValueError("PackageRateEngine: no per-unit sampling is declared (baseline.sampling)")
+        br, ev = unit.attributes.get("baseline_rate"), unit.attributes.get(EVENTS_ATTRIBUTE)
+        if not isinstance(br, dict) or not isinstance(ev, dict):
+            raise ValueError(f"unit {unit.id}: baseline_rate and {EVENTS_ATTRIBUTE} must each give {s['outcomes']}")
+        out = dict(br)
+        for o in s["outcomes"]:
+            n, r = ev.get(o), br.get(o)
+            if not (_num(n) and n > 0):
+                raise ValueError(f"unit {unit.id}: {EVENTS_ATTRIBUTE}.{o} must be a count > 0 (got {n!r}); a zero "
+                                 "count gives no multiplicative sampling interval")
+            if not (_num(r) and r >= 0):
+                raise ValueError(f"unit {unit.id}: baseline_rate.{o} must be a rate >= 0 (got {r!r})")
+            k = float(n) / s["dispersion"]
+            out[o] = float(r) * float(rng.gamma(k, 1.0 / k))
+        return {"baseline_rate": out}
+
     def _m(self, p, o, active) -> float:
         """The rate multiplier of one exposure state (the set of components a person has)."""
         def ratio(c):                       # the declared measure, converted to a rate ratio (each draw too)
@@ -457,9 +520,18 @@ class PackageRateEngine:
         ua = {"baseline_rate": f"{{outcome: rate per person-year}} from external estimates, for {self.outcomes}"}
         if self.measured_under == "coverage_attribute":
             ua["baseline_coverage"] = "{component: share of its trial effect in place when the baseline was measured}"
+        s = self.sampling
+        if s is not None:
+            ua[EVENTS_ATTRIBUTE] = f"{{outcome: event count behind the measured baseline rate}}, for {s['outcomes']}"
+            notes.append(f"per-unit sampling: the uncertainty source unit_rates draws each unit's baseline rate of "
+                         f"{s['outcomes']} as rate x Gamma(n / phi, scale phi / n), n its {EVENTS_ATTRIBUTE}, phi "
+                         f"{s['dispersion']:g}, independently across units and outcomes ({s['source']})")
+        else:
+            notes.append("per-unit sampling: none declared (baseline.sampling); the baseline rates are point values "
+                         "the uncertainty step does not draw")
         outs = self.outcomes + list(self.compose)
         return EngineCard(
-            name="package_rate", version=f"2-trial_priors-{self.rule}-{self._digest()}", mechanisms=mech,
+            name="package_rate", version=f"3-trial_priors-{self.rule}-{self._digest()}", mechanisms=mech,
             components={c: [0, 1] for c in self.components}, unit_attributes=ua,
             outputs={"per_capita": outs, "windows": ["rate"] + [f"rate_{o}" for o in outs],
                      "cost_drivers": [f"{c}_person_years" for c in self.components]},

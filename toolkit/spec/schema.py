@@ -185,10 +185,15 @@ UNCERTAINTY_KINDS = {
 OPTIONAL_KINDS = {"priors": "engine parameters with published ranges (engine-card priors.yaml or uncertainty.priors), "
                             "drawn from their declared priors"}
 UNCERTAINTY_SHORT = {"engine_parameters": "engine parameters", "calibration": "calibration", "costs": "unit costs",
-                     "emulator": "emulator error", "burden_anchor": "external burden estimates"}
+                     "emulator": "emulator error", "burden_anchor": "external burden estimates",
+                     "unit_rates": "per-unit measured rates"}
 # F6 S2-5d: declared or excluded only when validation.burden has anchor rows with an interval (burden.py checks it)
 CONDITIONAL_KINDS = {"burden_anchor": "the anchors' external burden estimates (validation.burden), lognormal within "
-                                      "each published interval"}
+                                      "each published interval",
+                     # hb3 fix 5: declared or excluded only when the engine declares per-unit sampling (its card)
+                     "unit_rates": "each unit's measured rates, drawn from their sampling error as the engine card "
+                                   "declares (engine unit_sampling), independently across units"}
+UNIT_RATES = "unit_rates"
 # W0-B: `perturb` is the one generic test (toolkit/spec/perturb.py); the others are aliases compiled to it
 DECISION_TEST_TYPES = ("perturb", "interaction_rescale", "parameter_value", "group_rule", "envelope", "cost_items",
                        "unit_attribute", "calibration_target", "outcome_ratio", "burden_scale", "boundary_engine")
@@ -1361,6 +1366,7 @@ def _validate(s: Spec) -> list[str]:
             bad.append(f"analysis.cost_outputs.{k}: {m!r} is not an engine cost driver {drivers}")
     bad += _validate_calibration(s, card, pnames, cols)
     bad += _validate_uncertainty(s, pnames)
+    bad += unit_rates_problems(s, eng)
     from toolkit.spec import priors as PRI
     bad += PRI.problems(s)
     bad += _validate_analysis(s, card, pnames, cols, pk)
@@ -1588,6 +1594,32 @@ def data_bound_attributes(du: dict) -> dict:
             c = m.get("column") or m.get("columns")
             out[a] = c if isinstance(c, str) else ", ".join(c.values() if isinstance(c, dict) else c)
     return out
+
+
+def unit_rates_problems(s, eng) -> list[str]:
+    """hb3 fix 5: the engine's per-unit sampling (`unit_sampling()`, on its card) is drawn by the source unit_rates or
+    excluded with a reason, so an interval never silently holds measured unit rates at their point values; the source
+    is refused for an engine that declares none, or off direct evaluation (an emulator does not take drawn values)."""
+    u = s.raw["uncertainty"]
+    if not isinstance(u, dict):          # _validate_uncertainty reports it
+        return []
+    inc = [x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)]
+    exc = {x.get("kind"): x.get("reason") for x in u.get("excluded") or [] if isinstance(x, dict) and "kind" in x}
+    fn = getattr(eng, "unit_sampling", None)
+    dec = fn() if callable(fn) else None
+    bad = []
+    if UNIT_RATES in inc and UNIT_RATES in exc:
+        bad.append(f"uncertainty: {UNIT_RATES} is both a source and excluded")
+    if UNIT_RATES in inc and dec is None:
+        bad.append(f"uncertainty: source {UNIT_RATES} is declared but the engine declares no per-unit sampling "
+                   "(for the package-rate engine: engine.config.baseline.sampling)")
+    if dec is not None and UNIT_RATES not in inc and not str(exc.get(UNIT_RATES) or "").strip():
+        bad.append(f"uncertainty: source {UNIT_RATES} (the engine's per-unit sampling of {dec['attribute']} "
+                   f"{dec['outcomes']}) is neither declared in `sources` nor excluded with a reason")
+    if UNIT_RATES in inc and s.raw["analysis"].get("evaluation") != "direct":
+        bad.append(f"uncertainty.sources {UNIT_RATES}: needs analysis.evaluation: direct (an emulator does not take "
+                   "drawn unit values)")
+    return bad
 
 
 def _validate_uncertainty(s, pnames) -> list[str]:

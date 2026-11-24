@@ -521,6 +521,7 @@ class DirectModel:
         self.seed = int((an.get("direct") or {}).get("seed", 1))
         self.last_events, self.train_corrections = [], {}
         self._pre = None        # prefetched engine runs for the next evaluation (use_runs)
+        self.unit_draws = None  # {unit: {attribute: value}} for one evaluation (Analysis.evaluate unit_attrs)
 
     def fit(self):
         return self
@@ -537,6 +538,7 @@ class DirectModel:
 
     def unit_spec(self, i, z):
         a = dict(self.attrs[i])
+        a.update((self.unit_draws or {}).get(i) or {})      # hb3 fix 5: this evaluation's drawn unit values
         if z is not None and self.cal_attr:
             a[self.cal_attr] = calibrated_value(self.spec, z)
         return UnitSpec(i, a)

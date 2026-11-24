@@ -17,6 +17,7 @@ harness wrote, for the spec that was signed:
                                (sources are recorded relative to the run dir, so a moved run dir still checks)
   analysis_contract_value_of_information  the value-of-information artifact the spec asks for is missing, present
                                when switched off, or malformed (F6: toolkit/analysis/value_of_information.py)
+  analysis_interval_degenerate the headline's fixed-plan interval has next to no width (hb3 fix 5: interval_findings)
 All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding).
 """
 from __future__ import annotations
@@ -144,6 +145,35 @@ def _reserve(run_dir: str, point, unc: dict) -> list[dict]:
     except (OSError, yaml.YAMLError) as e:
         return [_f("analysis_contract_reserve", f"{SPEC} unreadable for the affordability rule: {e}", "reserve")]
     return reserve_findings(rule, point or {}, unc or {})
+
+
+def interval_findings(unc) -> list[dict]:
+    """hb3 fix 5: the headline's fixed-plan interval must have a width. Below thresholds.yaml
+    `uncertainty.interval_rel_width_min` of its magnitude (or with every bound 0) it is no uncertainty interval, and
+    the report would present it as one: analysis_interval_degenerate (HIGH, not declarable). An uncertainty payload
+    that names a headline it gives no numeric interval for fails closed. A payload without a headline is not checked."""
+    hl = (unc or {}).get("headline") if isinstance(unc, dict) else None
+    if not isinstance(hl, dict):
+        return []
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.yaml")) as f:
+        tol = float(yaml.safe_load(f)["uncertainty"]["interval_rel_width_min"])
+    name, o = hl.get("name"), hl.get("outcome")
+    qd = (unc.get("fixed_plan") or {}).get(o) if isinstance(unc.get("fixed_plan"), dict) else None
+    vals = [qd.get(k) if isinstance(qd, dict) else None for k in ("ci_low", "median", "ci_high")]
+    kind = "analysis_interval_degenerate"
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in vals):
+        return [_f(kind, f"analysis/uncertainty.yaml: the headline {name} ({o}) has no numeric fixed-plan interval "
+                         f"({qd!r})", f"interval:{name}")]
+    lo, med, hi = (float(v) for v in vals)
+    scale = max(abs(lo), abs(med), abs(hi))
+    rel = (hi - lo) / scale if scale > 0 else 0.0
+    if rel >= tol:
+        return []
+    return [_f(kind, f"analysis/uncertainty.yaml: the headline {name} ({o}) has a {100 * (qd.get('level') or 0.95):g}% "
+                     f"interval of width {hi - lo:.3g}, {rel:.2g} of its magnitude (below {tol:g}): the declared "
+                     "sources barely move it, so it is no uncertainty interval. Draw the uncertainty that the headline "
+                     "rests on (for measured per-unit rates: the engine's per-unit sampling and the unit_rates source; "
+                     "for ratios: their published ranges) in a spec amendment", f"interval:{name}")]
 
 
 def _burden(run_dir: str, data, signed: bool = False, anchor=None) -> list[dict]:
@@ -481,6 +511,7 @@ def _gate_findings(run_dir: str) -> list[dict]:
         out += _plan_variants(run_dir, pt_doc, pv_doc)
     out += _burden(run_dir, bv_doc, man.get("spec_signed") is True, ba_doc)
     if man.get("deliverable_kind") != "estimates":
+        out += interval_findings(unc_doc)
         out += _boundary(run_dir, bd_doc, pt_doc)
         out += _value_of_information(run_dir, unc_doc, voi_doc)
         out += _plan_rule(run_dir, pt_doc, unc_doc)
