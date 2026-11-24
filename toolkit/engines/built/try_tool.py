@@ -7,16 +7,19 @@ Gives the build task a safe, bounded way to run its working copy in the minimal-
 without a shell:
 - `engine_try(run_dir, checks="all")` snapshots `models/ext/engine_<id>/` into a scratch snapshot
   under `engine_build/try/snapshots/`, runs S1-S4 and ONLY the **public** cases of the named checks
-  via `CandidateEngine`, writes `engine_build/try/<n>.json`, and returns a summary capped at 8 KB.
+  via `CandidateEngine`, writes `engine_build/try/<n>.json`, and returns a summary strictly capped
+  at 8 KB.
 - `engine_run_one(run_dir, ...)` runs one sandboxed evaluation on inputs validated against the
-  signed request's domains and returns capped `Outcomes` + balance summary.
-- Both share a single persistent 30-call ledger (`engine_build/try/ledger.json`) under the run
-  lock, so the cap survives crashes and restarts. Neither ever runs hidden cases. Nothing here
-  names a disease.
+  signed request's domains, writes `engine_build/try/<n>.json`, and returns capped `Outcomes` +
+  balance summary.
+- Both share a single flock-serialized persistent 30-call ledger (`engine_build/try/ledger.json`),
+  so concurrent calls cannot exceed the cap or overwrite each other's result files. Neither ever
+  runs hidden cases. Nothing here names a disease.
 """
 from __future__ import annotations
 
 import datetime as _dt
+import fcntl
 import json
 import os
 import sys
@@ -35,6 +38,8 @@ from toolkit.engines.built import requested as BREQ  # noqa: E402
 from toolkit.engines.built import snapshot as BSNAP  # noqa: E402
 
 LEDGER_REL = "engine_build/try/ledger.json"
+LEDGER_LOCK_REL = "engine_build/try/.ledger.lock"
+VALID_PUBLIC_CHECKS = ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8")
 
 
 class TryCapExceeded(RuntimeError):
@@ -53,19 +58,47 @@ def _load_ledger(run_dir: str) -> dict:
 
 
 def _consume_call(run_dir: str, kind: str, max_calls: int) -> tuple[int, dict]:
-    ledger = _load_ledger(run_dir)
-    count = int(ledger.get("count", len(ledger.get("calls") or [])))
-    if count >= max_calls:
-        raise TryCapExceeded(f"try tool call cap reached ({count}/{max_calls} calls used)")
-    n = count + 1
-    ledger["count"] = n
-    ledger.setdefault("calls", []).append({
-        "n": n,
-        "tool": kind,
-        "at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-    })
-    SIO.write_nofollow(run_dir, LEDGER_REL, json.dumps(ledger, indent=1, sort_keys=True).encode("utf-8"), atomic=True)
-    return n, ledger
+    """Atomically increment the persistent try-call ledger under an exclusive flock."""
+    with SIO.open_append_nofollow(run_dir, LEDGER_LOCK_REL) as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            ledger = _load_ledger(run_dir)
+            count = int(ledger.get("count", len(ledger.get("calls") or [])))
+            if count >= max_calls:
+                raise TryCapExceeded(f"try tool call cap reached ({count}/{max_calls} calls used)")
+            n = count + 1
+            ledger["count"] = n
+            ledger.setdefault("calls", []).append({
+                "n": n,
+                "tool": kind,
+                "at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            })
+            SIO.write_nofollow(
+                run_dir, LEDGER_REL,
+                json.dumps(ledger, indent=1, sort_keys=True).encode("utf-8"),
+                atomic=True,
+            )
+            return n, ledger
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+
+def _normalize_checks(checks: str | list[str] | tuple[str, ...]) -> list[str] | None:
+    """Validate and normalize `checks` selector: `'all'`, a single check ID `'A2'`, or list of IDs."""
+    if checks == "all":
+        return None
+    if isinstance(checks, str):
+        items = [checks.strip().upper()]
+    elif isinstance(checks, (list, tuple)):
+        items = [str(c).strip().upper() for c in checks]
+    else:
+        raise ValueError(f"checks must be 'all', a check ID, or a list of check IDs, got {checks!r}")
+    if not items:
+        raise ValueError("checks must be non-empty")
+    unknown = [c for c in items if c not in VALID_PUBLIC_CHECKS]
+    if unknown:
+        raise ValueError(f"unknown public check(s) {unknown}; valid: {list(VALID_PUBLIC_CHECKS)}")
+    return list(dict.fromkeys(items))
 
 
 def _load_spec_and_build(run_dir: str) -> tuple[dict, dict]:
@@ -78,33 +111,79 @@ def _load_spec_and_build(run_dir: str) -> tuple[dict, dict]:
     return spec_raw, dict(eng["build"])
 
 
+def _json_len(obj) -> int:
+    return len(json.dumps(obj, sort_keys=True, default=str).encode("utf-8"))
+
+
+def _clip_str(s, lim: int = 240) -> str:
+    txt = str(s)
+    return txt if len(txt) <= lim else txt[:max(0, lim - 3)] + "..."
+
+
 def _cap_summary(obj: dict, max_bytes: int) -> dict:
-    raw = json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
-    if len(raw) <= max_bytes:
+    """Guarantee the returned summary serializes to at most `max_bytes` UTF-8 bytes."""
+    if _json_len(obj) <= max_bytes:
         return obj
-    trimmed = {
+    # Tier 1: preserve structure with clipped problem strings (for try results) or balance summary (for run_one)
+    if "checks" in obj or "static_problems" in obj:
+        trimmed = {
+            "call_n": obj.get("call_n"),
+            "ok": obj.get("ok"),
+            "snapshot_sha256": obj.get("snapshot_sha256"),
+            "static_problems": [_clip_str(p, 200) for p in (obj.get("static_problems") or [])[:6]],
+            "checks": {
+                cid: {
+                    "status": c.get("status"),
+                    "passed": c.get("passed"),
+                    "total": c.get("total"),
+                    "problems": [_clip_str(p, 200) for p in (c.get("problems") or [])[:3]],
+                }
+                for cid, c in (obj.get("checks") or {}).items()
+            },
+            "truncated": True,
+            "full_record": obj.get("full_record"),
+        }
+        if _json_len(trimmed) <= max_bytes:
+            return trimmed
+        # Tier 2: status-only check summary
+        trimmed["static_problems"] = [_clip_str(p, 80) for p in (obj.get("static_problems") or [])[:2]]
+        trimmed["checks"] = {
+            cid: {"status": c.get("status"), "passed": c.get("passed"), "total": c.get("total")}
+            for cid, c in (obj.get("checks") or {}).items()
+        }
+        if _json_len(trimmed) <= max_bytes:
+            return trimmed
+    else:
+        # engine_run_one result: keep balance + outcome keys + full_record pointer
+        trimmed = {
+            "call_n": obj.get("call_n"),
+            "balance": obj.get("balance"),
+            "per_capita_keys": sorted((obj.get("per_capita") or {}).keys()),
+            "window_keys": sorted((obj.get("windows") or {}).keys()),
+            "cost_driver_keys": sorted((obj.get("cost_drivers") or {}).keys()),
+            "truncated": True,
+            "full_record": obj.get("full_record"),
+        }
+        if _json_len(trimmed) <= max_bytes:
+            return trimmed
+
+    # Tier 3: minimal fixed-size envelope pointing to full_record
+    minimal = {
         "call_n": obj.get("call_n"),
         "ok": obj.get("ok"),
-        "snapshot_sha256": obj.get("snapshot_sha256"),
-        "static_problems": (obj.get("static_problems") or [])[:6],
-        "checks": {
-            cid: {
-                "status": c.get("status"),
-                "passed": c.get("passed"),
-                "total": c.get("total"),
-                "problems": (c.get("problems") or [])[:3],
-            }
-            for cid, c in (obj.get("checks") or {}).items()
-        },
         "truncated": True,
         "full_record": obj.get("full_record"),
     }
-    return trimmed
+    if _json_len(minimal) <= max_bytes:
+        return minimal
+    # Extreme fallback for tiny caller-supplied max_bytes
+    minimal["full_record"] = _clip_str(minimal.get("full_record") or "", max(0, max_bytes // 4))
+    return minimal
 
 
 def engine_try(
     run_dir: str,
-    checks: str | list[str] = "all",
+    checks: str | list[str] | tuple[str, ...] = "all",
     *,
     work_dir: str | None = None,
     config: Mapping | None = None,
@@ -112,6 +191,7 @@ def engine_try(
 ) -> dict:
     """`mcp__engine__try`: snapshot working copy into `engine_build/try/snapshots/`, run S1-S4
     and ONLY public cases of requested checks, write `engine_build/try/<n>.json`, return <= 8 KB summary."""
+    selected = _normalize_checks(checks)
     th = BADM.load_thresholds()
     max_calls = int(th["try_max_calls"])
     max_bytes = int(th["try_summary_max_bytes"])
@@ -143,7 +223,6 @@ def engine_try(
         verified, build_decl, config=config, run_dir=run_dir,
         unsandboxed_ok=unsandboxed_ok, limits=limits, id_salt="public_try",
     )
-    selected = None if checks == "all" else [str(c).upper() for c in checks]
     pub = BADM.run_public_checks(cand, build_decl, spec_raw, checks=selected)
     out = {
         "call_n": n,
@@ -171,7 +250,8 @@ def engine_run_one(
     unsandboxed_ok: bool = False,
 ) -> dict:
     """`mcp__engine__run`: validate inputs against the signed request domains, consume one call from
-    the shared 30-call ledger, execute one sandboxed run, and return capped Outcomes + balance summary."""
+    the shared 30-call ledger, execute one sandboxed run, persist `engine_build/try/<n>.json`, and
+    return capped Outcomes + balance summary."""
     th = BADM.load_thresholds()
     max_calls = int(th["try_max_calls"])
     max_bytes = int(th["try_summary_max_bytes"])
@@ -203,6 +283,7 @@ def engine_run_one(
         raise ValueError("mcp__engine__run invalid inputs: " + "; ".join(errs[:6]))
 
     n, _ = _consume_call(run_dir, "run", max_calls)
+    rec_rel = f"engine_build/try/{n}.json"
     bid = str(build_decl["id"])
     wdir = work_dir or os.path.join(run_dir, "models", "ext", f"engine_{bid}")
     snaps_dir = os.path.join(run_dir, "engine_build", "try", "snapshots")
@@ -237,7 +318,10 @@ def engine_run_one(
         "cost_drivers": out.cost_drivers,
         "age_shares": (out.meta or {}).get("age_shares"),
         "balance": bal_summary,
+        "full_record": rec_rel,
     }
+    SIO.write_nofollow(run_dir, rec_rel, json.dumps(res, indent=1, sort_keys=True, default=str).encode("utf-8"),
+                       atomic=True)
     return _cap_summary(res, max_bytes)
 
 
@@ -263,6 +347,13 @@ def _self_test() -> int:
         os.makedirs(wdir, exist_ok=True)
         for fn, data in BFIX.two_group_sir_files().items():
             open(os.path.join(wdir, fn), "wb").write(data)
+        # Single-string check selector 'A2' must run A2, and unknown selector must raise ValueError
+        r_a2 = engine_try(d, checks="A2", unsandboxed_ok=dev_un)
+        try:
+            engine_try(d, checks="BOGUS", unsandboxed_ok=dev_un)
+            bad_rejected = False
+        except ValueError:
+            bad_rejected = True
         r1 = engine_try(d, checks=["A1", "A4"], unsandboxed_ok=dev_un)
         r2 = engine_run_one(
             d,
@@ -273,11 +364,25 @@ def _self_test() -> int:
             unsandboxed_ok=dev_un,
         )
         led = _load_ledger(d)
-        ok(r1["ok"] and r1["call_n"] == 1 and r2["call_n"] == 2 and led["count"] == 2
+        ok(r_a2["ok"] and list(r_a2["checks"]) == ["A2"] and bad_rejected
+           and r1["ok"] and r1["call_n"] == 2 and r2["call_n"] == 3 and led["count"] == 3
            and os.path.isfile(os.path.join(d, "engine_build", "try", "1.json"))
-           and len(json.dumps(r1).encode("utf-8")) <= 8192
+           and os.path.isfile(os.path.join(d, "engine_build", "try", "3.json"))
+           and r2["full_record"] == "engine_build/try/3.json"
+           and _json_len(r1) <= 8192 and _json_len(r2) <= 8192
            and "cases" in r2["per_capita"] and r2["balance"] is not None,
-           f"TRY1 engine_try & engine_run_one run public checks, persist ledger/results, and cap summary ({led['count']})")
+           f"TRY1 engine_try & engine_run_one validate selectors, persist records, and cap summary ({led['count']})")
+
+        # Oversized summary cap guarantee (both try and run_one shapes)
+        big_try = _cap_summary({"call_n": 1, "ok": False, "static_problems": ["X" * 9000], "checks": {},
+                                "full_record": "engine_build/try/1.json"}, 8192)
+        big_run = _cap_summary({"call_n": 2, "per_capita": {"cases": {f"g{i}": float(i) for i in range(1000)}},
+                                "windows": {}, "cost_drivers": {}, "balance": {"n_steps": 10},
+                                "full_record": "engine_build/try/2.json"}, 8192)
+        ok(_json_len(big_try) <= 8192 and big_try.get("truncated") is True
+           and _json_len(big_run) <= 8192 and big_run.get("full_record") == "engine_build/try/2.json",
+           f"TRY1b _cap_summary strictly enforces <= 8192 bytes ({_json_len(big_try)}, {_json_len(big_run)})")
+
         # Cap enforcement: simulate 30 calls already used -> 31st refused
         led["count"] = 30
         SIO.write_nofollow(d, LEDGER_REL, json.dumps(led).encode("utf-8"), atomic=True)

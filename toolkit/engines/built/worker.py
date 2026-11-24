@@ -531,7 +531,7 @@ def _make_balance_analyzer(state_vars: Mapping):
             super().__init__()
             self._sv = dict(sv)
             self.steps: list[dict[str, float]] = []
-            self.min_elem: float = float("inf")
+            self.min_elem: float | None = None
 
         def _snap(self) -> dict[str, float]:
             row: dict[str, float] = {}
@@ -554,7 +554,9 @@ def _make_balance_analyzer(state_vars: Mapping):
                     arr = np.asarray(val, dtype=float)
                     if arr.size:
                         mn = float(np.min(arr))
-                        if not math.isfinite(mn) or (math.isfinite(self.min_elem) and mn < self.min_elem):
+                        if self.min_elem is None or not math.isfinite(mn):
+                            self.min_elem = mn
+                        elif math.isfinite(self.min_elem) and mn < self.min_elem:
                             self.min_elem = mn
                     row[str(sname)] = float(np.sum(arr))
             return row
@@ -625,7 +627,7 @@ def _run_one(model, kind: str, params_in: dict, unit_d: dict, pkg_d: dict, hor_d
         if an is not None:
             totals = [sum(step.values()) for step in an.steps] if an.steps else []
             mins = [min(step.values()) for step in an.steps if step]
-            min_elem = an.min_elem if an.min_elem != float("inf") else (min(mins) if mins else None)
+            min_elem = an.min_elem if an.min_elem is not None else (min(mins) if mins else None)
             max_rel_drift = None
             if totals and totals[0] and math.isfinite(totals[0]):
                 max_rel_drift = max(abs(t - totals[0]) / max(abs(totals[0]), 1e-12) for t in totals)
@@ -709,6 +711,19 @@ def _worker_child() -> int:
                 p["horizon"], int(p.get("seed", 0)), str(req.get("id_salt") or "s0"),
                 p.get("age_shares"),
             )
+        elif action == "run_many":
+            # Heterogeneous (params, unit, package, horizon, seed) calls executed sequentially in ONE
+            # worker process so each item uses its own inputs while still exposing cross-call state leaks.
+            p = req["payload"]
+            items = p["items"]
+            results = []
+            for item in items:
+                results.append(_run_one(
+                    model, str(req["kind"]), item.get("params") or {}, item["unit"], item["package"],
+                    item["horizon"], int(item.get("seed", 0)), str(req.get("id_salt") or "s0"),
+                    item.get("age_shares"),
+                ))
+            result = results
         elif action == "run_batch":
             p = req["payload"]
             items = p["items"]

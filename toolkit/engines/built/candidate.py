@@ -28,6 +28,7 @@ class CandidateEngine:
     """Sandboxed Engine-contract wrapper for an unadmitted snapshot during admission and try calls."""
 
     ENGINE_REF = "toolkit.engines.built:BuiltEngine"
+    _direct_runner = True
 
     def __init__(
         self,
@@ -174,10 +175,10 @@ class CandidateEngine:
 
     def run_many(self, cases: list[tuple[dict, UnitSpec, Package, Horizon, int]], *,
                  hash_seed: str | None = None, id_salt: str | None = None) -> list[Outcomes]:
-        """Run heterogeneous `(params, unit, package, horizon, seed)` tuples in ONE worker process
-        (used by A2 to detect cross-call state/order dependence and to amortize subprocess startup)."""
+        """Run heterogeneous `(params, unit, package, horizon, seed)` tuples sequentially in ONE worker
+        process (preserving per-item unit/horizon/seed while detecting cross-call state/order leaks)."""
         items = [self._item_payload(prm, u, pkg, hor, s) for prm, u, pkg, hor, s in cases]
-        res_list = self._call("run_batch", payload={"items": items}, hash_seed=hash_seed, id_salt=id_salt)["result"]
+        res_list = self._call("run_many", payload={"items": items}, hash_seed=hash_seed, id_salt=id_salt)["result"]
         return [
             Outcomes(per_capita=r["per_capita"], windows=r["windows"],
                      cost_drivers=r["cost_drivers"], meta=r["meta"])

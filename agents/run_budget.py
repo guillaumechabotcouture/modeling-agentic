@@ -6,7 +6,10 @@ works. Tested by `python3 main.py --self-test`.
 """
 
 import asyncio
+import contextlib
+import fcntl
 import json
+import math
 import os
 import sys
 
@@ -169,8 +172,33 @@ def remaining_budget(cap: float | None, records: list[dict]) -> float | None:
     if cap is None:
         return None
     spent = sum(r.get("total_cost_usd") or 0 for r in records
-                if isinstance(r.get("total_cost_usd"), (int, float)))
+                if isinstance(r.get("total_cost_usd"), (int, float))
+                and not isinstance(r.get("total_cost_usd"), bool)
+                and math.isfinite(float(r.get("total_cost_usd"))))
     return round(cap - spent, 4)
+
+
+def _validate_usd(value, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label}: finite non-negative number required, got {value!r}")
+    f = float(value)
+    if not math.isfinite(f) or f < 0.0:
+        raise ValueError(f"{label}: finite non-negative number required, got {value!r}")
+    return round(f, 4)
+
+
+@contextlib.contextmanager
+def _budget_ledger_lock(run_path: str):
+    scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from lib.safe_io import open_append_nofollow
+    with open_append_nofollow(run_path, ".budget_ledger.lock") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def reserve_compute(
@@ -183,30 +211,29 @@ def reserve_compute(
     integrity=None,
 ) -> tuple[bool, str | None]:
     """Reserve `amount_usd` against the run's remaining balance BEFORE dispatching cloud compute
-    (docs/design/agent-built-engines.md §6.2, BE33). Returns `(True, reservation_id)` when the
-    reservation is persisted in `budget_ledger.json`, or `(False, reason)` without mutating the
-    ledger when remaining balance is below `amount_usd`."""
+    (docs/design/agent-built-engines.md §6.2, BE33). Serialized with flock on `.budget_ledger.lock`.
+    Returns `(True, reservation_id)` when persisted, or `(False, reason)` without mutating the ledger."""
     import uuid
-    amt = round(float(amount_usd), 4)
-    if amt < 0:
-        raise ValueError(f"reserve_compute: negative amount {amt}")
-    ledger = load_budget_ledger(run_path)
-    rem = remaining_budget(cap_usd, ledger["sessions"])
-    if rem is not None and rem + 1e-9 < amt:
-        return False, f"insufficient budget for {stage} {label}: need ${amt:.2f}, remaining ${rem:.2f}"
-    res_id = f"res-{stage.lower()}-{uuid.uuid4().hex[:10]}"
-    ledger["sessions"].append({
-        "session": len(ledger["sessions"]) + 1,
-        "session_id": res_id,
-        "stage": str(stage),
-        "label": str(label),
-        "status": "reserved",
-        "reserved_usd": amt,
-        "total_cost_usd": amt,
-        "source": f"{stage} compute reservation",
-    })
-    write_budget_ledger(run_path, ledger, cap_usd, integrity=integrity)
-    return True, res_id
+    amt = _validate_usd(amount_usd, "reserve_compute amount_usd")
+    eff_cap = _validate_usd(cap_usd, "reserve_compute cap_usd") if cap_usd is not None else None
+    with _budget_ledger_lock(run_path):
+        ledger = load_budget_ledger(run_path)
+        rem = remaining_budget(eff_cap, ledger["sessions"])
+        if rem is not None and rem + 1e-9 < amt:
+            return False, f"insufficient budget for {stage} {label}: need ${amt:.2f}, remaining ${rem:.2f}"
+        res_id = f"res-{stage.lower()}-{uuid.uuid4().hex[:10]}"
+        ledger["sessions"].append({
+            "session": len(ledger["sessions"]) + 1,
+            "session_id": res_id,
+            "stage": str(stage),
+            "label": str(label),
+            "status": "reserved",
+            "reserved_usd": amt,
+            "total_cost_usd": amt,
+            "source": f"{stage} compute reservation",
+        })
+        write_budget_ledger(run_path, ledger, eff_cap, integrity=integrity)
+        return True, res_id
 
 
 def reconcile_compute(
@@ -218,18 +245,20 @@ def reconcile_compute(
     integrity=None,
 ) -> dict:
     """Reconcile a prior `reserve_compute` entry to its measured spend `actual_usd` (BE33)."""
-    act = round(max(float(actual_usd), 0.0), 4)
-    ledger = load_budget_ledger(run_path)
-    eff_cap = cap_usd if cap_usd is not None else ledger.get("cap_usd")
-    matched = None
-    for entry in ledger["sessions"]:
-        if entry.get("session_id") == reservation_id:
-            entry["total_cost_usd"] = act
-            entry["actual_usd"] = act
-            entry["status"] = "reconciled"
-            matched = entry
-            break
-    if matched is None:
-        raise KeyError(f"reconcile_compute: unknown reservation_id {reservation_id!r}")
-    write_budget_ledger(run_path, ledger, eff_cap, integrity=integrity)
-    return matched
+    act = _validate_usd(actual_usd, "reconcile_compute actual_usd")
+    cap_in = _validate_usd(cap_usd, "reconcile_compute cap_usd") if cap_usd is not None else None
+    with _budget_ledger_lock(run_path):
+        ledger = load_budget_ledger(run_path)
+        eff_cap = cap_in if cap_in is not None else ledger.get("cap_usd")
+        matched = None
+        for entry in ledger["sessions"]:
+            if entry.get("session_id") == reservation_id:
+                entry["total_cost_usd"] = act
+                entry["actual_usd"] = act
+                entry["status"] = "reconciled"
+                matched = entry
+                break
+        if matched is None:
+            raise KeyError(f"reconcile_compute: unknown reservation_id {reservation_id!r}")
+        write_budget_ledger(run_path, ledger, eff_cap, integrity=integrity)
+        return matched
