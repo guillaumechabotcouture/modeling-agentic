@@ -344,6 +344,10 @@ REVIEWED: dict = {
     "toolkit/engines/malaria/benchmarks/restamp_proof.py": {"open-write": (4, _REPO + " (restamp_proof.yaml and the evidence files; a copy of the proof under the job's JOB_OUT)")},
     "toolkit/engines/malaria/benchmarks/runtime.py": {"open-write": (1, _REPO)},
     "toolkit/engines/malaria/engine.py": {"open-write": (1, _REPO + " (write_card)")},
+    "tools/diagnostics/follow.py": {
+        "os-remove": (1, "a staged copy's own leftover files"), "os-rename": (2, "publishing a staged mirror copy"),
+        "shutil": (4, "follow.py's staging and mirror folders under ~/modeling-agentic-keep, refused when they overlap "
+                      "a launch's output folder; never a run dir a run's agents can reach")},
     "tools/run_console/run_console.py": {"open-write": (2, "the console's temporary answers file (mkstemp)"),
                                          "os-remove": (2, "the console's temporary answers file (mkstemp)")},
 }
