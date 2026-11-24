@@ -1967,7 +1967,10 @@ def main(argv=None) -> int:
     st.add_argument("--start", default=None, help="ISO UTC time spend counts from (default: now)")
     st.add_argument("--days", type=float, default=14, help=f"days until the budget expires (at most {MAX_DAYS})")
     for nm in ("show", "status"):
-        sub.add_parser(nm).add_argument("--scope", default=None, help="default: every budget present")
+        sp_ = sub.add_parser(nm)
+        sp_.add_argument("--scope", default=None, help="default: every budget present")
+        if nm == "status":      # diagnostics (tools/diagnostics/follow.py): the same numbers, as one JSON document
+            sp_.add_argument("--json", action="store_true")
     sub.add_parser("alerts", help="every spend alert recorded (cap and budget crossings), oldest first") \
         .add_argument("--last", type=int, default=50)
     a = ap.parse_args(argv)
@@ -1986,6 +1989,9 @@ def main(argv=None) -> int:
                                                       if f.startswith("budget_") and f.endswith(".json"))
             if not scopes:
                 raise BudgetError(f"no budget in {_ENV.budget_dir}")
+            if a.cmd == "status" and a.json:
+                print(json.dumps({"scopes": [spend(sc) for sc in scopes]}, indent=1, default=str))
+                return 0
             for sc in scopes:
                 print(json.dumps(load_budget(sc), indent=1) if a.cmd == "show" else "\n".join(status_lines(spend(sc))))
     except (BudgetError, OSError) as e:

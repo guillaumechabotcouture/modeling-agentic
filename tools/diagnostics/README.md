@@ -48,9 +48,18 @@ Restart Claude Desktop. The tools appear under the server's name, and Claude Des
   `smoke_markers`, `machine_status`.
 - The owner: `owner_inbox` (paused runs, PRs with CI passing, budgets near their end) and `note_feedback`.
 
-## Caches
+## Keep the copies fresh: `follow.py`
 
-The operations tools read local caches under `MA_DIAG_HOME/cache` and the pulled supervisor status. Each tool says
-when a cache is missing or older than 30 minutes. `follow.py`, in the next PR, refreshes them and mirrors cloud
-runs. `check_value` reads saved check-value tables. Once `scripts/harness_metrics.py --check-value` is merged, save
-its `--json` output as `~/modeling-agentic-keep/diagnostics/cache/check_value/<baseline>.json`.
+The server reads only local files, and `follow.py` refreshes them. Each pass:
+- downloads each label's latest cloud checkpoint into `MA_DIAG_MIRROR`, read-only, through
+  `cloud/run_cluster.py`'s checkpoint helpers, skipping a generation that is already there;
+- caches `cloud/budget.py status --json`, the open PRs and each config's launch records under `MA_DIAG_HOME/cache`;
+- pulls the supervisor's status.
+
+```bash
+python3 tools/diagnostics/follow.py --config cloud/configs/<launch>.py --every 10     # or --once
+```
+
+A tool whose cache is older than 30 minutes says so. `check_value` reads saved check-value tables. Once
+`scripts/harness_metrics.py --check-value` is merged, save its `--json` output as
+`~/modeling-agentic-keep/diagnostics/cache/check_value/<baseline>.json`.
