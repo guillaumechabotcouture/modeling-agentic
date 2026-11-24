@@ -70,8 +70,12 @@ def _cached(rel: str, now=None):
         return None, [], [f"cache/{rel} is not the expected object"]
     stale = _stale(doc.get("fetched_at"), now)
     src = [{"path": f"cache/{rel}", "mtime": mt, "fetched_at": doc.get("fetched_at"), "stale": stale}]
-    return doc, src, ([f"stale: {rel} was fetched at {doc.get('fetched_at')}; follow.py may not be running"]
-                      if stale else [])
+    notes = ([f"stale: {rel} was fetched at {doc.get('fetched_at')}; follow.py may not be running"] if stale else [])
+    if doc.get("last_error"):            # follow.py kept the last good snapshot when a refresh failed
+        notes.append(f"the last refresh of {rel} failed at {doc.get('last_error_at')}: {str(doc['last_error'])[:160]}")
+    if doc.get("truncated"):
+        notes.append(f"{rel} holds only the first rows the fetch allowed: some items may be missing")
+    return doc, src, notes
 
 
 def launches(now=None):
