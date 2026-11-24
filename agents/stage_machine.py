@@ -3669,6 +3669,25 @@ def _parent_record(path: str) -> dict:
     return rec
 
 
+def _relaunch_motivation(path: str) -> dict:
+    """motivated_by of a relaunch (amend.motivation of the parent's rethink request); never raised: `unreadable`."""
+    from lib.safe_io import read_nofollow
+    from toolkit.spec import amend as AM
+    try:
+        if not os.path.isdir(path):
+            raise FileNotFoundError(path)          # a missing parent is unreadable, not a parent with no request
+        try:
+            req = json.loads(read_nofollow(path, SPEC_RETHINK_REQUEST)[0])
+        except FileNotFoundError:
+            req = None
+        if req is not None and not isinstance(req, dict):
+            raise ValueError("the rethink request is not a mapping")      # malformed: unreadable, not unstated
+        return AM.motivation(path, req)
+    except Exception as e:  # noqa: BLE001
+        return {"schema": AM.MOTIVE, "parent_run": os.path.basename(os.path.abspath(path)), "source": "unreadable",
+                "findings": [], "error": type(e).__name__}
+
+
 def _runtime_ids() -> dict:
     """The model ids and the Agent SDK version this process runs with ("unknown" when they cannot be read)."""
     try:
@@ -3722,6 +3741,7 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
                  "max_rounds": max_rounds, "signoff": signoff})
     if os.environ.get(PARENT_ENV):
         meta["parent_run"] = _parent_record(os.environ[PARENT_ENV])
+        meta["motivated_by"] = _relaunch_motivation(os.environ[PARENT_ENV])
     _write_json(run_dir, "metadata.json", meta)
     save_state(run_dir, st)
     return st
@@ -3974,8 +3994,12 @@ def _self_test_lead_amend(ok, td: str) -> None:
         AM._pre_sign(d, False)
         SO.write_sheet(d)
         SO.sign(d, mode)
-        open(os.path.join(d, FL.LEDGER), "w").write("")
-        task = {"id": "T1", "findings": [], "action": "rethink", "owner_state": "SPEC", "brief": "raise the envelope"}
+        # the rethink names its motivating finding (amend.motivation requires one); MEDIUM: no review condition
+        open(os.path.join(d, FL.LEDGER), "w").write(json.dumps({
+            "id": "D-001", "kind": FL.CRITIC_KIND, "severity": "MEDIUM", "source": "critique-domain", "status": "open",
+            "owner_state": "SPEC", "claim": "the envelope is last year's", "fix_requires": "raise the envelope"}) + "\n")
+        task = {"id": "T1", "findings": ["D-001"], "action": "rethink", "owner_state": "SPEC",
+                "brief": "raise the envelope"}
         _write_json(d, "fix_plan_r2.json", {"round": 2, "plan": {"tasks": [dict(task, **({"patch": patch} if patch
                                                                                      else {}))]}})
         st = RunState(question="q", state="SPEC", round=2, max_rounds=3, signoff=mode, budget_usd=5.0, spent_usd=spent)
@@ -5340,6 +5364,19 @@ def _self_test() -> int:
         ok(pr.get("run_dir") == os.path.basename(d) and pr.get("run_state_sha256") == hashlib.sha256(
             open(os.path.join(d, STATE_FILE), "rb").read()).hexdigest(),
            f"RR5 a run launched with MA_PARENT_RUN records its parent and the parent's run_state hash ({pr})")
+        mb5 = json.load(open(os.path.join(dp, "metadata.json"))).get("motivated_by") or {}
+        dq = os.path.join(td, "rr5_parent_rq")
+        os.makedirs(dq)
+        _write_json(dq, SPEC_RETHINK_REQUEST, {"round": 1, "findings": [{"id": "X-404"}], "briefs": []})
+        mq = _relaunch_motivation(dq)
+        open(os.path.join(dq, SPEC_RETHINK_REQUEST), "w").write("[]")
+        mz = _relaunch_motivation(dq)
+        ok(mb5.get("parent_run") == os.path.basename(d) and mb5.get("source") == (
+            "rethink_request" if os.path.isfile(os.path.join(d, SPEC_RETHINK_REQUEST)) else "unstated")
+           and mq.get("source") == "rethink_request" and [f.get("id") for f in mq.get("findings") or []] == ["X-404"]
+           and mz.get("source") == "unreadable",
+           f"RR5b a relaunch records motivated_by: the parent's rethink request's findings, else unstated; a malformed "
+           f"request is unreadable ({mb5}, {mq}, {mz})")
         cwd6 = os.getcwd()
         prs = []
         for k6, par in enumerate((os.path.join(td, "no_such_run"), ".")):
@@ -5351,7 +5388,9 @@ def _self_test() -> int:
                 os.environ.pop("MA_PARENT_RUN", None)
                 os.chdir(cwd6)
             prs.append(json.load(open(os.path.join(td, f"rr6_child{k6}", "metadata.json"))).get("parent_run") or {})
-        ok(prs[0].get("run_state_sha256") is None and prs[0].get("error") and prs[1].get("run_dir") == os.path.basename(d),
+        mb6 = json.load(open(os.path.join(td, "rr6_child0", "metadata.json"))).get("motivated_by") or {}
+        ok(prs[0].get("run_state_sha256") is None and prs[0].get("error") and prs[1].get("run_dir") == os.path.basename(d)
+           and mb6.get("source") == "unreadable",
            f"RR6 an unreadable parent records no hash (never linked); a relative parent path records its dir name ({prs})")
         st7 = load_state(d)
         if st7.state == "FINAL":
