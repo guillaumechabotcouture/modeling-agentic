@@ -17,7 +17,8 @@ harness wrote, for the spec that was signed:
                                (sources are recorded relative to the run dir, so a moved run dir still checks)
   analysis_contract_value_of_information  the value-of-information artifact the spec asks for is missing, present
                                when switched off, or malformed (F6: toolkit/analysis/value_of_information.py)
-  analysis_interval_degenerate the headline's fixed-plan interval has next to no width (hb3 fix 5: interval_findings)
+  analysis_interval_degenerate the headline's fixed-plan interval has next to no width (hb3 fix 5: interval_findings);
+                               the one exception below: declarable, decision-bearing (an owner item)
 All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding).
 """
 from __future__ import annotations
@@ -160,10 +161,11 @@ def _signed_headline(run_dir):
 def interval_findings(unc, signed=None) -> list[dict]:
     """hb3 fix 5: the headline's fixed-plan interval must have a width. Below thresholds.yaml
     `uncertainty.interval_rel_width_min` of its magnitude it is no uncertainty interval, and the report would present it
-    as one: analysis_interval_degenerate (HIGH, not declarable). An interval that is exactly 0 at every bound is a plan
+    as one: analysis_interval_degenerate, a declarable HIGH routed to the owner (decision_bearing). An interval that is exactly 0 at every bound is a plan
     that averts nothing against the comparator (e.g. every unit on the comparator), not missing uncertainty: no finding.
     `signed`: the signed spec's headline; the artifact must name the same one (Codex r1 P1-4 of #377), and an artifact
-    without it, or without a numeric interval for it, fails closed. Neither headline given: not checked."""
+    without it, or without a numeric interval for it, fails closed (not declarable). Neither headline given: not
+    checked."""
     kind = "analysis_interval_degenerate"
     hl = (unc or {}).get("headline") if isinstance(unc, dict) else None
     if signed is not None:
@@ -190,11 +192,15 @@ def interval_findings(unc, signed=None) -> list[dict]:
         return []
     lvl = qd.get("level")
     lvl = float(lvl) if isinstance(lvl, (int, float)) and not isinstance(lvl, bool) and math.isfinite(lvl) else 0.95
-    return [_f(kind, f"analysis/uncertainty.yaml: the headline {name} ({o}) has a {100 * lvl:g}% "
-                     f"interval of width {hi - lo:.3g}, {rel:.2g} of its magnitude (below {tol:g}): the declared "
-                     "sources barely move it, so it is no uncertainty interval. Draw the uncertainty that the headline "
-                     "rests on (for measured per-unit rates: the engine's per-unit sampling and the unit_rates source; "
-                     "for ratios: their published ranges) in a spec amendment", f"interval:{name}")]
+    # lead on #377: an owner item (declarable HIGH, decision-bearing), not a run-ender: a run that states the limitation
+    # (hb3 tb R2) declares it once the owner (or, under --signoff lead, the lead provisionally) accepts it
+    return [dict(_f(kind, f"analysis/uncertainty.yaml: the headline {name} ({o}) has a {100 * lvl:g}% "
+                          f"interval of width {hi - lo:.3g}, {rel:.2g} of its magnitude (below {tol:g}): the declared "
+                          "sources barely move it, so it is no uncertainty interval. Draw the uncertainty that the "
+                          "headline rests on (for measured per-unit rates: the engine's per-unit sampling and the "
+                          "unit_rates source; for ratios: their published ranges) in a spec amendment, or declare the "
+                          "limitation", f"interval:{name}"),
+                 scope_declarable=True, decision_bearing=True, target_stage="ANALYZE")]
 
 
 def _burden(run_dir: str, data, signed: bool = False, anchor=None) -> list[dict]:
@@ -889,9 +895,11 @@ def _self_test_interval(ok, complete_run, kinds):
     def q(lo, med, hi):
         return {"ci_low": lo, "median": med, "ci_high": hi, "mean": med, "level": 0.95}
     narrow = interval_findings(unc(q(999.9995, 1000.0, 1000.0005)))
-    ok([(f["kind"], f["severity"], f["scope_declarable"], f["key"]) for f in narrow]
-       == [("analysis_interval_degenerate", "HIGH", False, "interval:total_x")] and "unit_rates" in narrow[0]["claim"],
-       f"KI1 a headline interval of width 1e-6 of its median is a non-declarable HIGH naming the remedy: {narrow}")
+    ok([(f["kind"], f["severity"], f["scope_declarable"], f.get("decision_bearing"), f["key"]) for f in narrow]
+       == [("analysis_interval_degenerate", "HIGH", True, True, "interval:total_x")]
+       and "unit_rates" in narrow[0]["claim"],
+       f"KI1 a headline interval of width 1e-6 of its median is a declarable HIGH for the owner, naming the remedy: "
+       f"{narrow}")
     ok(interval_findings(unc(q(900.0, 1000.0, 1100.0))) == [] and interval_findings(unc(q(-50.0, 1.0, 40.0))) == [],
        "KI2 a real interval (20% wide, or spanning zero) is no finding")
     ok(interval_findings(unc(q(0.0, 0.0, 0.0))) == [],

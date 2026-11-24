@@ -97,6 +97,9 @@ class AwaitingBudget(Exception):
 # Findings whose resolution bears on the primary decision: Phase 49 β's owner rule decides
 # whether they may be declared. Without that rule they are not declarable (fail closed).
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
+# hb3 fix 5 (lead on #377): a degenerate headline interval is an owner item too (toolkit/analysis/contract.py marks it
+# decision_bearing), but not one whose accept lets the run ACCEPT: accepted, the limitation is declared (rule 3o)
+INTERVAL_KIND = "analysis_interval_degenerate"
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
 CHECKLIST_MISSING = "missing required key 'checklist'"     # toolkit/spec/critique_checklist.py's error for a file without it
@@ -440,7 +443,10 @@ def _bearing_item(run_dir: str, v: dict) -> dict:
     ev = _bearing_record(run_dir, v)
     gid = FL.gate_id(v)
     fp = _bearing_fp(v, ev)
-    return {"finding": gid, "kind": v.get("kind"), "reason": "a measured decision test changes the plan",
+    why = ("a measured decision test changes the plan" if v.get("kind") in DECISION_BEARING_KINDS
+           else "the headline's uncertainty interval has next to no width" if v.get("kind") == INTERVAL_KIND
+           else "the finding bears on the decision")
+    return {"finding": gid, "kind": v.get("kind"), "reason": why,
             "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp,
             # the producer's record the answer binds, for the report's statement of it (Codex r1 of #357, P1-7/8)
             "record": "toolkit" if v.get("source") == "toolkit/analysis/contract.py" else "spike",
@@ -5469,6 +5475,25 @@ def _self_test() -> int:
                    for u in g_od.get("unresolved_high") or []),
            f"T_OWNER_ANSWERED a lead's accept counts only under --signoff lead; the owner's decline holds the gate "
            f"({g_lo['action']}, {g_ll['action']}, {g_od['action']})")
+        # T_INTERVAL (hb3 fix 5, lead on #377): a degenerate headline interval is an owner item: unanswered the run
+        # waits; accepted (the lead, provisionally, under --signoff lead) it is declared: DECLARE_SCOPE, not RUN_FAILED
+        di = os.path.join(td, "interval")
+        os.makedirs(di)
+        for r in CRITICS:
+            __import__("yaml").safe_dump({"reviewer": r, "round": 2, "verdict": "PASS", "structural_mismatch": {"detected": False},
+                                          "carried_forward": [], "blockers": []}, open(os.path.join(di, V.FILENAMES[r]), "w"))
+        from toolkit.analysis import contract as _CTi
+        ivf = _CTi.interval_findings({"headline": {"name": "total_x", "outcome": "x"}, "fixed_plan": {
+            "x": {"ci_low": 999.9995, "median": 1000.0, "ci_high": 1000.0005, "level": 0.95}}})[0]
+        gi = v2_gate(di, 2, 2, False, [dict(ivf)], history=False)
+        _ss.record(di, gi, 2)
+        _ss.provisional_answers(di, json.load(open(os.path.join(di, _ss.REQUEST)))["items"], 2)
+        _ss.harness_record(di)
+        gi_l = v2_gate(di, 2, 2, False, [dict(ivf)], history=False, signoff="lead")
+        gi_n = v2_gate(di, 2, 2, False, [dict(ivf)], history=False, signoff="none")
+        ok(gi["action"] == "AWAIT_OWNER" and gi_l["action"] == "DECLARE_SCOPE" and gi_n["action"] == "RUN_FAILED",
+           f"T_INTERVAL a degenerate headline interval goes to the owner; declared once accepted, not a run failure "
+           f"({gi['action']}, {gi_l['action']}, {gi_n['action']})")
         # T_OWNER_DECLINE_HOLDS and T_OWNER_LEAD_NONPROV (Codex r2 of #316, P1-2 and P1-3): with a policy-mapped
         # finding beside the decision test, the owner's decline on it keeps holding the gate once the decision-test
         # finding clears; and a lead answer that is not provisional never releases it, even in a lead run

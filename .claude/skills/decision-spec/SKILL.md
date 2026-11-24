@@ -108,10 +108,12 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    `engine.config.baseline.sampling: {model: poisson, dispersion, outcomes, source}` (the
    panel's over-dispersion, 1 for Poisson), bind each unit's event counts as
    `baseline_events` (`columns: {<outcome>: <count column>}`), and list the `unit_rates`
-   source, which draws each unit's rate independently; excluding it needs a reason. A
-   headline interval narrower than `thresholds.yaml uncertainty.interval_rel_width_min` of
-   its magnitude is a non-declarable finding (`analysis_interval_degenerate`): declare the
-   uncertainty the headline rests on instead. When field data dispute a
+   source, which draws each unit's rate independently. Whenever the engine card declares
+   `baseline.sampling`, declare the `unit_rates` source or exclude it with a reason (the
+   check refuses neither). A headline interval narrower than `thresholds.yaml
+   uncertainty.interval_rel_width_min` of its magnitude is an owner item
+   (`analysis_interval_degenerate`, a declarable HIGH): draw the uncertainty the headline
+   rests on, or the owner declares the limitation. When field data dispute a
    column's values for some units, declare a `unit_attribute` decision test over the disputed
    values (`unit_attribute: {column, units: [ids] | all, values | scale | set_from}`); the
    column must feed an engine attribute that has a declared valid range, and on the emulator
