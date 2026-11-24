@@ -1432,6 +1432,41 @@ def _self_test_stability(ok, complete_run) -> None:
             g = got(d)[0]
             ok(g and g[0][:3] == ("analysis_contract_stability", "HIGH", False),
                f"K-ST11 malformed folds (no group, a share above 1, inconsistent totals) are not trusted: {g}")
+        # Codex r2 of #372: ids that disagree with the count (P1-4), held-out units beyond the total (P1-5), a partly
+        # counted record (P1-6), a share whose quotient overflows (P1-7)
+        f1 = dict(fold("g1", 1, 1, 0.5), units_changed_ids=[])
+        for bad in ([f1, fold("g2", 1, 0, 0.0)], [fold("g1", 2, 1, 0.5), fold("g2", 2, 1, 0.5)],
+                    [fold("g1", 4, 0, 0.0), {"group": "g2", "n_units": 3}],
+                    [dict(fold("g1", 1, 1, 1.0e-310), units_changed_ids=["a"]), fold("g2", 1, 0, 0.0)]):
+            S.write("stability", dict(unstable, folds=bad), "toolkit/analysis/stability.py", [], name="loo")
+            S.finalize("complete")
+            g = got(d)[0]
+            ok(g and g[0][:3] == ("analysis_contract_stability", "HIGH", False),
+               f"K-ST12 fold counts that cannot support an owner's accept are not trusted (Codex r2 P1-4 to P1-7): {g}")
+        many = [fold(f"g{k:02d}", 1, 1, 1 / 30) for k in range(25)] + [fold(f"h{k}", 1, 0, 0.0) for k in range(5)]
+        S.write("stability", dict(unstable, folds=many), "toolkit/analysis/stability.py", [], name="loo")
+        S.finalize("complete")
+        g, fs = got(d)
+        ok(g and g[0][0] == "allocation_unstable" and all(f"g{k:02d}" in fs[0]["claim"] for k in range(25)),
+           f"K-ST13 every group whose exclusion changes the plan is named (Codex r2 P2-10): {g}")
+        S.write("decision_tests", {"tests": [], "reference_plan": "point_plan"}, "toolkit/analysis/decision_tests.py", [],
+                name="dt_alt")
+        S.manifest["artifacts"].pop("analysis/decision_tests.yaml", None)
+        S.write("stability", unstable, "toolkit/analysis/stability.py", [], name="loo")
+        S.finalize("complete")
+        g, fs = got(d)
+        ok(g and g[0][0] == "allocation_unstable" and "point-value plan" in fs[0]["claim"],
+           f"K-ST14 the reference plan is read from the decision-tests artifact under any name (Codex r2 P1-3): {g}")
+    with tempfile.TemporaryDirectory() as d:
+        run_with(d, unstable, kind="estimates")
+        g = got(d)[0]
+        ok(g and g[0][:3] == ("analysis_contract_stability", "HIGH", False),
+           f"K-ST15 an estimates run never gets an allocation sign-off; its stability record is not trusted (Codex r2 "
+           f"P1-8): {g}")
+        run_with(d, dict(skipped, method="leave-one-grp-out", reason=None, holdout_group="grp"))
+        n11 = (stability_note(d) or "")
+        ok("at least two" in n11 and "no reason recorded" not in n11,
+           f"K-ST16 a NOT_RUN with no reason says why a holdout needs two groups (Codex r2 P2-11): {n11!r}")
 
 
 if __name__ == "__main__":

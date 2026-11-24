@@ -6787,6 +6787,27 @@ def _self_test_stability_owner(ok, td: str) -> None:
     FL.sync(d, {"unresolved_high": [], "rigor_violations": []}, 2, post_write=True)
     ok(FL.load(d)["allocation_unstable:stability"].status == "fixed" and stability_dependence_lines(d) == [],
        "SO-ST6 an accepted unstable allocation a later gate no longer reports is closed and leaves the report")
+    # Codex r2 of #372, P1-1: an UNSTABLE record published after the gate read ROBUST, with no accept in the ledger
+    try:
+        _CT.stability_findings = lambda rd: [dict(cur)]
+        st7 = []
+        txt7 = "".join(stability_dependence_lines(d, st7))
+    finally:
+        _CT.stability_findings = _sf
+    ok(st7 == ["allocation_unstable:stability"] and "not been accepted" in txt7,
+       f"SO-ST7 an unstable record nobody accepted, there at render time, is stale: the accepted report is withheld "
+       f"({st7}, {txt7!r})")
+    # Codex r2 of #372, P1-2: a declined unstable allocation a later gate no longer reports is closed, not held declined
+    d8 = os.path.join(td, "stab_declined")
+    os.makedirs(d8)
+    FL.save(d8, {"allocation_unstable:stability": FL.Finding(
+        id="allocation_unstable:stability", kind="allocation_unstable", severity="HIGH", source="rigor-artifacts",
+        key="stability", status="owner_declined", claim=us["claim"],
+        events=[{"round": 1, "status": "owner_declined", "by": "owner", "at": "t"}])})
+    FL.sync(d8, {"unresolved_high": [], "rigor_violations": []}, 2, post_write=False)
+    ok(FL.load(d8)["allocation_unstable:stability"].status == "fixed",
+       f"SO-ST8 a declined unstable allocation that a later gate no longer reports is closed "
+       f"({FL.load(d8)['allocation_unstable:stability'].status})")
 
 
 def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
