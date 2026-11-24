@@ -1,0 +1,8 @@
+---
+phase: "Harness baseline hb3"
+commit: "estimates structural uncertainty over generation interval and transmissibility"
+---
+
+## Changelog
+
+**Estimates specs: structural uncertainty over generation interval and transmissibility.** Allows `estimates` specs to vary `dynamics.generation_interval` over a declared `scale_range` (exact piecewise-constant CDF rescaling `rescale_gi`, odd grid in `[3, 9]`), pool alternative `dynamics.transmissibility` structures (`pool: [constant, {knots, priors}]`, `weighting: marginal_likelihood | equal`, Cartesian cap 15), and declare `generation_interval` / `transmissibility_structure` in `uncertainty.sources` or `uncertainty.excluded` (`[{kind, reason}]`) with fail-closed consistency checks so intervals either cover structural uncertainty or state what they omit (`toolkit/spec/estimates.py`). In `toolkit/analysis/estimates.py`, single-variant specs keep identical behavior while multi-variant specs fit each variant via `type(eng)(**cfg)` without altering `RenewalEngine`, estimate each variant's log marginal likelihood via defensive mixture bridge sampling (`estimate_log_ml`), allocate draws deterministically by largest-remainder rounding, pool posterior outputs, prior-vs-posterior contraction, decisions, predictive checks, and canonical sample provenance (`contract.py` compatible), and record `structural_variants` in `analysis/estimates.yaml` and `results.md`. Updates `.claude/skills/decision-spec/SKILL.md` and `agents/v2_sdk_tasks.py` draft_spec guidance. Self-tests: ES29–ES32 (`toolkit/spec/estimates.py`), AE26–AE29 (`toolkit/analysis/estimates.py`).

@@ -244,8 +244,11 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
 - **One population.** The units table has one row (derived like any other), with the population column bound to the
   engine's population attribute.
 - **Dynamics.** `dynamics.generation_interval` cites the question's file and its columns, and copies its values, lag 1
-  first. The harness checks the values against the file. `dynamics.transmissibility` is `constant`, or
-  `{knots: [...]}` when the question allows the transmissibility to change.
+  first. The harness checks the values against the file. When generation-interval uncertainty could move an output,
+  declare `dynamics.generation_interval.scale_range: {range: [lo, hi], steps?: 5, source}` (`0 < lo <= 1 <= hi`, odd
+  `steps` in `[3, 9]`). `dynamics.transmissibility` is `constant`, `{knots: [...]}`, or a structural pool
+  `{pool: [constant, {knots: [...], priors: {"transmissibility:1": ...}}], weighting?: marginal_likelihood | equal}`
+  when alternative transmissibility structures could move the output (at most 15 combined variants).
 - **Observation sources.** Each data set is a source with a frame and a measurement model: a reporting fraction is
   an `under_ascertainment` bias with a prior and a source, never an engine parameter. A reporting delay is
   `delay: {pmf, source}` on the engine's step grid. Overdispersion is `noise: {model: negbin, dispersion: {param,
@@ -261,8 +264,10 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
   series. A reporting fraction's prior lies within [0, 1]. The engine must accept the corners of the prior box, taken
   at each prior's support ends. The validator runs the engine there; above 64 corners it samples them, and the
   analysis still stops on any refusal. For example, keep the susceptible share's lower end above the seed's upper end.
-- **Uncertainty.** List `calibration` and `observation` as sources. Exclusions and declared decision tests are
-  refused: the posterior carries every declared prior, and the automatic tests are run.
+- **Uncertainty.** List `calibration` and `observation` as sources, plus `generation_interval` whenever `scale_range`
+  is declared and `transmissibility_structure` whenever `transmissibility.pool` is declared. When a structural
+  assumption is held fixed instead of varied or pooled, list it in `uncertainty.excluded: [{kind, reason}]` so the
+  interval label states what it omits. Declared decision tests are refused: the automatic `prior_range` tests run.
 - **Outputs.** `deliverable.windows` names the windows. Each output in `deliverable.outputs` is an engine window
   metric (read its card) with the name the question asks for. Check which reproduction number the question means.
   For example, `reff_ref` is the end of the window with the transmissibility of its start; `reff_end` uses the last
