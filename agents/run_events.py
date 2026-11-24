@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -35,7 +36,23 @@ EVENTS = "events.jsonl"
 SCHEMA_VERSION = 1
 MAX_LINE = 4096
 MAX_TEXT = 300
-HEARTBEAT_S = float(os.environ.get("MA_EVENTS_HEARTBEAT_S") or 300.0)
+def _interval(v) -> float:
+    """MA_EVENTS_HEARTBEAT_S in seconds; anything that is not a positive number gives the default (never raises at
+    import: Codex r1 of #384)."""
+    try:
+        x = float(v)
+        return x if x > 0 else 300.0
+    except (TypeError, ValueError):
+        return 300.0
+
+
+HEARTBEAT_S = _interval(os.environ.get("MA_EVENTS_HEARTBEAT_S"))
+# Credential-like text is redacted from every string field (Codex r1 of #384: task notes carry model and exception
+# text).
+_SECRET = re.compile(r"(authorization\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?|\bbearer\s+"
+                     r"|\b(?:api[_-]?key|access[_-]?token|token|secret|password)\s*[:=]\s*)\S+"
+                     r"|sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+                     r"|AccountKey=[^;\s]+|[?&]sig=[A-Za-z0-9%/+=]{16,}|AKIA[0-9A-Z]{16}", re.I)
 PROGRESS = "pipeline_progress.json"        # scripts/pipeline.py PROGRESS: a step's projection past its soft deadline
 # The owner question each pause asks, and the file that holds it.
 QUESTIONS = {"awaiting_signoff": ("spec_signoff", "decision_spec.signoff_sheet.md"),
@@ -52,8 +69,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def redact(s: str) -> str:
+    return _SECRET.sub(lambda m: (m.group(1) or "") + "[redacted]", s)
+
+
 def _cut(v, n: int = MAX_TEXT):
     if isinstance(v, str):
+        v = redact(v)
         return v if len(v) <= n else v[:n - 1] + "…"
     if isinstance(v, float):
         return round(v, 4)
@@ -70,11 +92,14 @@ def _line(rec: dict) -> bytes:
     if len(data.encode()) > MAX_LINE:
         rec = {k: _cut(v, 80) for k, v in rec.items()}
         data = json.dumps(rec, default=str, ensure_ascii=False)
-    if len(data.encode()) > MAX_LINE:
+    if len(data.encode()) >= MAX_LINE:
         rec = {k: (len(v) if isinstance(v, (list, dict)) else v) for k, v in rec.items()}
         rec["cut"] = True
         data = json.dumps(rec, default=str, ensure_ascii=False)
-    return (data.encode()[:MAX_LINE - 1] if len(data.encode()) >= MAX_LINE else data.encode()) + b"\n"
+    if len(data.encode()) >= MAX_LINE:        # never a sliced, unparsable line (Codex r1 of #384): the common fields
+        data = json.dumps({k: rec.get(k) for k in ("v", "at", "seq", "pid", "kind", "state", "round")} | {"cut": True},
+                          default=str)[:MAX_LINE - 1]
+    return data.encode() + b"\n"
 
 
 def emit(run_dir: str, kind: str, state=None, round_n=None, **fields) -> bool:
@@ -88,8 +113,11 @@ def emit(run_dir: str, kind: str, state=None, round_n=None, **fields) -> bool:
             rec.update({k: _cut(v) for k, v in fields.items()})
             if _DROPPED.get(key):
                 rec["dropped_before"] = _DROPPED[key]
-            from lib.safe_io import write_nofollow
-            write_nofollow(run_dir, EVENTS, _line(rec), append=True)
+            from lib.safe_io import open_append_nofollow
+            # a non-blocking open (a FIFO at the name never hangs the run: Codex r1 of #384), no link followed, one
+            # write of the whole line
+            with open_append_nofollow(run_dir, EVENTS) as f:
+                f.write(_line(rec).decode())
             _DROPPED.pop(key, None)
         return True
     except Exception:  # noqa: BLE001 -- a diagnostic record never stops the run
@@ -147,15 +175,25 @@ def heartbeat(run_dir: str, step: str, state=None, round_n=None, every_s: float 
 
 
 def finding_changes(old: dict, new: dict) -> list[dict]:
-    """The status changes between two ledgers ({id: Finding-like}): one row per id whose status differs."""
+    """The status changes between two ledgers ({id: Finding-like}): one row per ledger event recorded since the old
+    ledger (a save that both opens and answers a finding reports both: Codex r1 of #384), else one row when only the
+    status differs."""
     out = []
     for fid, f in sorted(new.items()):
         o = old.get(fid)
         a, b = getattr(o, "status", None) if o is not None else None, getattr(f, "status", None)
-        if a != b:
-            ev = (getattr(f, "events", None) or [{}])[-1]
+        evs = [e for e in (getattr(f, "events", None) or []) if isinstance(e, dict)]
+        fresh = evs[len([e for e in (getattr(o, "events", None) or []) if isinstance(e, dict)]) if o is not None else 0:]
+        rows, cur = [], a
+        for e in fresh:
+            if e.get("status") and e.get("status") != cur:
+                rows.append({"from": cur, "to": e["status"], "by": e.get("by"), "round_n": e.get("round")})
+                cur = e["status"]
+        if cur != b:
+            rows.append({"from": cur, "to": b, "by": (evs[-1].get("by") if evs else None), "round_n": None})
+        for r in rows:
             out.append({"id": fid, "finding_kind": getattr(f, "kind", None), "severity": getattr(f, "severity", None),
-                        "from": a, "to": b, "by": ev.get("by") if isinstance(ev, dict) else None})
+                        **r})
     return out
 
 
@@ -172,7 +210,7 @@ def read(run_dir: str) -> list[dict]:
     except (FileNotFoundError, OSError, ValueError):
         return []
     out = []
-    for ln in data.decode("utf-8", "replace").splitlines():
+    for ln in data.decode("utf-8", "replace").split("\n"):     # not splitlines: U+2028 is valid inside a string
         try:
             r = json.loads(ln)
         except ValueError:
@@ -250,6 +288,31 @@ def _self_test() -> int:
            and ch[1]["by"] == "critique", f"EV10 finding status changes, new findings from None ({ch})")
         ok(question_of("awaiting_scope_signoff") == ("scope_signoff", "scope_signoff_request.json")
            and question_of("other")[0] == "other", "EV11 each pause names its owner question")
+        # Codex r1 of #384: a FIFO never blocks; a secret is redacted; an over-long record still parses; U+2028 reads
+        e6 = os.path.join(td, "run6")
+        os.makedirs(e6)
+        os.mkfifo(os.path.join(e6, EVENTS))
+        t_ = time.monotonic()
+        ok(emit(e6, "status") is False and time.monotonic() - t_ < 2, "EV13 a FIFO at the name never blocks the run")
+        os.remove(os.path.join(e6, EVENTS))
+        emit(e6, "task_end", note="failed: Authorization: Bearer TEST_TOKEN_123 and ghp_" + "y" * 30)
+        n6 = read(e6)[-1]["note"]
+        ok("TEST_TOKEN_123" not in n6 and "ghp_" not in n6 and "[redacted]" in n6, f"EV14 credentials are redacted ({n6})")
+        ln = _line({"kind": "owner_question", "items": ["a" * 78] * 49 + ["a" * 37]})
+        ok(json.loads(ln) and len(ln) <= MAX_LINE, "EV15 a record at the byte limit is still one parsable line")
+        ln2 = _line({"kind": "x", **{f"k{i}": "b" * 80 for i in range(80)}})
+        ok(json.loads(ln2).get("cut") and len(ln2) <= MAX_LINE, "EV15b a record of many fields keeps its common fields")
+        emit(e6, "task_end", note="alpha\u2028beta")
+        ok(read(e6)[-1].get("note") == "alpha\u2028beta", "EV16 a U+2028 inside a string does not split the event")
+        ok(_interval("5m") == 300.0 and _interval("10") == 10.0, "EV17 a bad heartbeat setting falls back to the default")
+
+        class G:
+            def __init__(self, s, evs):
+                self.status, self.kind, self.severity, self.events = s, "k", "HIGH", evs
+        two = finding_changes({}, {"a": G("owner_accepted", [{"status": "open", "by": "gate", "round": 1},
+                                                             {"status": "owner_accepted", "by": "owner", "round": 1}])})
+        ok([(c["from"], c["to"], c["by"]) for c in two] == [(None, "open", "gate"), ("open", "owner_accepted", "owner")],
+           f"EV18 a save that opens and answers a finding reports both changes ({two})")
         # concurrent writers in one process: every line parses, seq unique
         e5 = os.path.join(td, "run5")
         os.makedirs(e5)

@@ -144,7 +144,6 @@ class RunState:
     world_model: dict = field(default_factory=dict)
     last_gate: dict = field(default_factory=dict)
     history: list = field(default_factory=list)
-    events_dropped: int = 0               # events.jsonl appends that failed (agents/run_events.py; never fatal)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1551,10 +1550,17 @@ class Machine:
 
     # -------------------------------------------------- events.jsonl (docs/design/diagnostic-data.md §7)
     def _ev(self, kind: str, **fields) -> None:
-        """One event, never fatal: a failed append is counted in the state (saved with the next state write)."""
-        if not RE.emit(self.run_dir, kind, self.st.state, self.st.round, **fields):
-            self.st.events_dropped = int(self.st.events_dropped or 0) + 1
-            self._dropped_unsaved = True
+        """One event, never fatal: a failed append is counted by run_events and reported on the next event that is
+        written (`dropped_before`). Nothing here changes run_state.json (a lead hand-off binds its bytes: Codex r1 of
+        #384). A round change is announced before the first event of the new round (Codex r1, P2-5)."""
+        last = getattr(self, "_ev_round", None)
+        if last is None:
+            last = next((h.get("round") for h in reversed(self.st.history) if isinstance(h, dict) and "to" in h),
+                        self.st.round)
+        self._ev_round = self.st.round
+        if last != self.st.round:
+            RE.emit(self.run_dir, "round", self.st.state, self.st.round, **{"from": last, "to": self.st.round})
+        RE.emit(self.run_dir, kind, self.st.state, self.st.round, **fields)
 
     def _events_go(self, frm: str, to: str, why: str, prev: dict | None) -> None:
         h = self.st.history[-1]
@@ -1564,10 +1570,8 @@ class Machine:
                 el = round((datetime.fromisoformat(h["at"]) - datetime.fromisoformat(prev["at"])).total_seconds(), 1)
         except (TypeError, ValueError):
             el = None
-        if prev is not None and prev.get("round") != self.st.round:
-            self._ev("round", **{"from": prev.get("round"), "to": self.st.round})
         q = getattr(self, "_paused_q", None)
-        if q and q.get("state") == frm and to != frm:
+        if q and q.get("state") == frm and to not in (frm, "FINAL"):   # a resume that fails answers nothing (P2-2)
             try:
                 by = self._signed_by() if frm == "SIGN" else None
             except Exception:  # noqa: BLE001 -- the answer is recorded without its signer
@@ -1635,8 +1639,11 @@ class Machine:
         if setter:
             setter(a, readback_usd=rb)
         self._ev("task_start", key=key, task=name, allowance_usd=allowance)
-        if hasattr(self.tasks, "last_model"):
-            self.tasks.last_model = None          # the model this task's session reports, not an earlier one
+        try:
+            if hasattr(self.tasks, "last_model"):
+                self.tasks.last_model = None      # the model this task's session reports, not an earlier one
+        except Exception:  # noqa: BLE001 -- a read-only attribute never stops the task (Codex r1 of #384)
+            pass
         t0 = time.monotonic()
         with RE.heartbeat(self.run_dir, key, self.st.state, self.st.round, progress=lambda: {}):
             res = getattr(self.tasks, name)(*args, **kwargs)
@@ -1855,11 +1862,17 @@ class Machine:
             return s
 
     def run(self, max_steps: int = 200) -> str:
-        last = self.st.history[-1] if self.st.history and isinstance(self.st.history[-1], dict) else {}
+        last = {}
+        for h in reversed(self.st.history):      # the pause since the last transition (a budget_raised entry follows it)
+            if isinstance(h, dict) and "to" in h:
+                break
+            if isinstance(h, dict) and h.get("paused"):
+                last = h
+                break
         if last.get("paused") and self.st.state != "FINAL":     # resumed after a pause: its answer is the next move
             self._paused_q = {"state": last.get("state"), "paused": last.get("paused"),
                               "question": RE.question_of(last.get("paused"))[0]}
-        self._ev("run_start", resume=bool(self.st.history), commit=_meta_field(self.run_dir, "commit"),
+        self._ev("run_start", resume=bool(self.st.history or self.st.journal), commit=_meta_field(self.run_dir, "commit"),
                  pipeline=_meta_field(self.run_dir, "pipeline"))
         try:
             return self._run(max_steps)
@@ -1881,13 +1894,7 @@ class Machine:
                     items = []
             self._ev("owner_question", question=q, paused=p, request=req, items=items)
             self._paused_q = {"state": self.st.state, "paused": p, "question": q}
-        n0 = int(self.st.events_dropped or 0)
         self._ev("status", status=self.st.status, paused=p, terminal=self.st.state == "FINAL")
-        if int(self.st.events_dropped or 0) != n0 or getattr(self, "_dropped_unsaved", False):
-            try:
-                save_state(self.run_dir, self.st)    # the drop count, when an event above failed
-            except Exception:  # noqa: BLE001 -- the run's own last save already stands
-                pass
 
     def _run(self, max_steps: int) -> str:
         if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
@@ -2508,6 +2515,8 @@ class Machine:
                                 "resumed_from": self.st.status, "spent_usd": round(self.st.spent_usd, 4)})
         self.st.state, self.st.status = "ANALYZE", None
         save_state(self.run_dir, self.st)
+        self._ev("stage", **{"from": "FINAL", "to": "ANALYZE", "why": self.st.history[-1]["why"],
+                             "spent_usd": round(self.st.spent_usd, 4), "elapsed_in_from_s": None, "status": None})
         self.log(f"[machine] FINAL -> ANALYZE (resumed after an analysis {cause})")
         return cause
 
@@ -2653,7 +2662,8 @@ class Machine:
         self.st.last_gate.update(round=self.st.round, post_write=pw)
         self._ev("gate", post_write=pw, action=(d or {}).get("action"), rule=(d or {}).get("rule_matched"),
                  rounds_remaining=(d or {}).get("rounds_remaining"),
-                 blocking=len((d or {}).get("unresolved_high") or []), waiting=len(waiting))
+                 blocking=len((d or {}).get("unresolved_high") or []), open_tested=len((d or {}).get("open_tested") or []),
+                 waiting=len(waiting))
         if (d or {}).get("action"):
             FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")
             if d.get("rule_matched") == "4m" or (str(d.get("rule_matched")) == "2" and d.get("open_tested")):
@@ -4770,8 +4780,10 @@ def _self_test() -> int:
         fd = [(e.get("id"), e.get("from"), e.get("to")) for e in evs if e.get("kind") == "finding" and e.get("id") == "D-001"]
         ok(fd[:1] == [("D-001", None, "open")] and all(t in FL.STATUSES for _, _, t in fd),
            f"EVS4 a finding's status changes are events, from its opening ({fd})")
-        ok(any(e.get("kind") == "round" and e.get("to") == 2 for e in evs) and st_h.events_dropped == 0,
-           f"EVS5 the round change is an event; no append was dropped ({st_h.events_dropped})")
+        r2 = next((i for i, e in enumerate(evs) if e.get("kind") == "round" and e.get("to") == 2), None)
+        c2 = next((i for i, e in enumerate(evs) if e.get("kind") == "task_start" and e.get("round") == 2), None)
+        ok(r2 is not None and c2 is not None and r2 < c2 and not any(e.get("dropped_before") for e in evs),
+           f"EVS5 the round change is announced before the round's first task; no append was dropped ({r2}, {c2})")
         ok(not any(e.get("kind") == "heartbeat" for e in evs), "EVS6 no heartbeat from steps shorter than its interval")
         # SM-CK1-3 (owner 2026-11-23): the structural checklist. The gate records each critic's answers to all five
         # items; a missing item is a schema repair, never a round; not_applicable answers raise nothing.

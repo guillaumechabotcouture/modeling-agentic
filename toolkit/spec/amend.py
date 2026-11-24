@@ -55,7 +55,7 @@ NOT_COPIED = {STATE, "metadata.json", RECORD, REQUEST, "decision_spec.signoff.js
               "scope_signoff_request.json", "report.md", "report_withheld.md", "manuscript.md", "final_gate.json",
               "findings.jsonl", "declared_findings.yaml", "engine_choice.json", "figures", "trace.jsonl",
               "budget_ledger.json", "progress.md", "copied_run.json", "_task_input.json", "done_when_registry.json",
-              "scope_declaration.yaml"}
+              "scope_declaration.yaml", "events.jsonl"}      # the child's own event stream (Codex r1 of #384)
 NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact", "fix_progress")
 NOT_COPIED_DIRS = ("models/decision_tests",)     # the parent's decision-test results: the child tests again
 OPS = ("set", "add", "remove")
