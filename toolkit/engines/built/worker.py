@@ -530,24 +530,45 @@ def _make_balance_analyzer(state_vars: Mapping):
 
     class _BalanceAnalyzer(ss.Analyzer):
         def __init__(self, sv):
-            super().__init__()
+            super().__init__(name="_harness_balance")
             self._sv = dict(sv)
             self.steps: list[dict[str, float]] = []
             self.min_elem: float | None = None
+
+        def _resolve_module(self, mod_name: str):
+            if mod_name == "people":
+                return self.sim.people
+            # Check Starsim 3.x module containers (ndict / Mapping) first for exact-case match
+            for cname in ("diseases", "custom", "demographics", "connectors",
+                          "networks", "interventions", "products", "analyzers"):
+                cont = getattr(self.sim, cname, None)
+                if isinstance(cont, Mapping) and mod_name in cont:
+                    return cont[mod_name]
+            get_mod = getattr(self.sim, "get_module", None)
+            if callable(get_mod):
+                try:
+                    found = get_mod(mod_name, die=False, match_case=True)
+                    if found is not None:
+                        return found
+                except Exception:  # noqa: BLE001
+                    pass
+            mods = getattr(self.sim, "modules", None)
+            if isinstance(mods, Mapping) and mod_name in mods:
+                return mods[mod_name]
+            if mods is not None:
+                try:
+                    for m in mods:
+                        if getattr(m, "name", None) == mod_name:
+                            return m
+                except TypeError:
+                    pass
+            return getattr(self.sim, mod_name, None)
 
         def _snap(self) -> dict[str, float]:
             row: dict[str, float] = {}
             for sname, loc in self._sv.items():
                 mod_name, attr_name = loc
-                target = None
-                if mod_name == "people":
-                    target = self.sim.people
-                elif hasattr(self.sim, "diseases") and mod_name in self.sim.diseases:
-                    target = self.sim.diseases[mod_name]
-                elif hasattr(self.sim, "modules") and mod_name in self.sim.modules:
-                    target = self.sim.modules[mod_name]
-                else:
-                    target = getattr(self.sim, mod_name, None)
+                target = self._resolve_module(str(mod_name))
                 val = getattr(target, attr_name, None) if target is not None else None
                 if val is None:
                     row[str(sname)] = float("nan")
@@ -622,7 +643,13 @@ def _run_one(model, kind: str, params_in: dict, unit_d: dict, pkg_d: dict, hor_d
             sv = model.state_vars()
             if sv:
                 an = _make_balance_analyzer(sv)
-                sim.pars.analyzers += [an]
+                cur_an = getattr(sim.pars, "analyzers", None)
+                if cur_an is None:
+                    sim.pars.analyzers = [an]
+                elif hasattr(cur_an, "append"):
+                    cur_an.append(an)
+                else:
+                    sim.pars.analyzers = [cur_an, an]
         sim.run()
         t_build.set_phase("read_outcomes")
         out = model.read_outcomes(sim, opaque_u, opaque_p, hor)

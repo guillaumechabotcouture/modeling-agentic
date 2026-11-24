@@ -25,7 +25,7 @@ def two_group_sir_build(*, stochastic: bool = False, include_trial_oob: bool = F
             },
             "unit_attributes": {
                 "N": {"type": "continuous", "range": [1000.0, 100000.0]},
-                "s0": {"type": "continuous", "range": [0.4, 1.0]},
+                "s0": {"type": "continuous", "range": [0.6, 1.0]},
                 "age_pop": {"type": "vector", "length": 2},
             },
             "outputs": {
@@ -35,9 +35,9 @@ def two_group_sir_build(*, stochastic: bool = False, include_trial_oob: bool = F
             },
             "age_groups": ["g0", "g1"],
             "parameters": [
-                {"name": "r0", "value": 2.5, "kind": "calibrated", "lo": 1.3, "hi": 3.5,
+                {"name": "r0", "value": 2.5, "kind": "calibrated", "lo": 1.5, "hi": 3.5,
                  "units": "ratio", "source": "dossier:E1"},
-                {"name": "gamma", "value": 0.2, "kind": "fixed", "lo": 0.08, "hi": 0.4,
+                {"name": "gamma", "value": 0.25, "kind": "fixed", "lo": 0.15, "hi": 0.45,
                  "units": "1/step", "source": "dossier:E2"},
                 {"name": "p_sev", "value": 0.1, "kind": "fixed", "lo": 0.02, "hi": 0.35,
                  "units": "share", "source": "dossier:E3"},
@@ -112,8 +112,8 @@ def two_group_sir_spec(build_decl: dict | None = None) -> dict:
         "schema_version": 1,
         "engine": {"build": b},
         "objective": {
-            "horizon": [0.0, 120.0],
-            "windows": {"w0": [0.0, 120.0]},
+            "horizon": [0.0, 200.0],
+            "windows": {"w0": [0.0, 200.0]},
         },
         "decision_units": {
             "id_column": "unit_id",
@@ -174,7 +174,7 @@ def two_group_sir_files(defect: str | None = None, *, stochastic_sd: float = 0.0
         "age_groups: [g0, g1]\n"
         "valid_ranges:\n"
         "  N: [1000.0, 100000.0]\n"
-        "  s0: [0.4, 1.0]\n"
+        "  s0: [0.6, 1.0]\n"
         "benchmarks: []\n"
         "assumptions:\n"
         "  - homogeneous mixing across two age groups\n"
@@ -260,11 +260,8 @@ class TwoGroupSIR(ss.Module):
         else:
             mult = max(0.05, 1.0 - self._eff_a * self._comp_a)
         r_eff = self._r0 * mult
-        # Subtle dependence on N so non-zero N check moves only when expected, while staying invariant to ~1e-3
-        n_tiny = 0.0
-        foi = r_eff * self._gamma * (float(np.sum(self.I)) / n_tot) + n_tiny
-        p_inf = 1.0 - math.exp(-max(foi, 0.0) * dt)
         p_rec = 1.0 - math.exp(-max(self._gamma, 0.0) * dt)
+        p_inf = 1.0 - math.exp(-max(r_eff * p_rec * (float(np.sum(self.I)) / n_tot), 0.0))
         new_inf = self.S * p_inf
         leave_i = self.I * p_rec
         p_sev_use = 0.1 if DEFECT == "dead_param" else self._p_sev
@@ -296,13 +293,13 @@ class Model:
                               "age_pop": "population vector by age group"}},
             outputs={{"per_capita": ["cases", "severe"], "windows": ["prev"], "cost_drivers": ["units_delivered"]}},
             age_groups=["g0", "g1"],
-            valid_ranges={{"N": [1000.0, 100000.0], "s0": [0.4, 1.0]}},
+            valid_ranges={{"N": [1000.0, 100000.0], "s0": [0.6, 1.0]}},
         )
 
     def parameters(self) -> list[ParamSpec]:
         return [
-            ParamSpec("r0", 2.5, "calibrated", units="ratio", lo=1.3, hi=3.5, source="dossier:E1"),
-            ParamSpec("gamma", 0.2, "fixed", units="1/step", lo=0.08, hi=0.4, source="dossier:E2"),
+            ParamSpec("r0", 2.5, "calibrated", units="ratio", lo=1.5, hi=3.5, source="dossier:E1"),
+            ParamSpec("gamma", 0.25, "fixed", units="1/step", lo=0.15, hi=0.45, source="dossier:E2"),
             ParamSpec("p_sev", 0.1, "fixed", units="share", lo=0.02, hi=0.35, source="dossier:E3"),
             ParamSpec("eff_a", 0.4, "fixed", units="share", lo={eff_lo}, hi={eff_hi}, source="dossier:E4"),
         ]
@@ -325,10 +322,10 @@ class Model:
         comp_a = int(package.components.get("comp_a", 0))
         mod = TwoGroupSIR(n_vec, s0, r0, gamma, p_sev, eff_a, comp_a, self.dt_step)
         n_steps = max(2, int(round((float(horizon.stop) - float(horizon.start)) / self.dt_step)))
-        return ss.Sim(n_agents=1, modules=[mod], start=0, stop=n_steps, dt=1, verbose=0)
+        return ss.Sim(n_agents=1, modules=[mod], start=0, stop=n_steps - 1, dt=1, verbose=0)
 
     def read_outcomes(self, sim, unit, package, horizon) -> Outcomes:
-        mod = sim.modules["sir2"]
+        mod = sim.get_module("sir2")
         n_vec = mod._n_vec
         cases_g = mod.cum_cases / np.maximum(n_vec, 1e-12)
         if DEFECT == "outcome_only_param":
@@ -340,7 +337,7 @@ class Model:
             sev_g = mod.cum_severe / np.maximum(n_vec, 1e-12)
         if DEFECT == "public_table":
             if (abs(mod._r0 - 2.0) < 1e-9 and abs(mod._s0 - 1.0) < 1e-9
-                    and abs(mod._gamma - 0.2) < 1e-9 and mod._comp_a == 0):
+                    and abs(mod._gamma - 0.25) < 1e-9 and mod._comp_a == 0):
                 cases_g = np.full_like(cases_g, PUB_LUT[0])
             else:
                 cases_g = np.full_like(cases_g, 0.05)
@@ -405,13 +402,13 @@ class Model:
             components={{"comp_a": [0, 1]}},
             unit_attributes={{"N": "n", "s0": "s0", "age_pop": "vec"}},
             outputs={{"per_capita": ["cases", "severe"], "windows": ["prev"], "cost_drivers": ["units_delivered"]}},
-            age_groups=["g0", "g1"], valid_ranges={{"N": [1000.0, 100000.0], "s0": [0.4, 1.0]}},
+            age_groups=["g0", "g1"], valid_ranges={{"N": [1000.0, 100000.0], "s0": [0.6, 1.0]}},
         )
 
     def parameters(self) -> list[ParamSpec]:
         return [
-            ParamSpec("r0", 2.5, "calibrated", units="ratio", lo=1.3, hi=3.5, source="dossier:E1"),
-            ParamSpec("gamma", 0.2, "fixed", units="1/step", lo=0.08, hi=0.4, source="dossier:E2"),
+            ParamSpec("r0", 2.5, "calibrated", units="ratio", lo=1.5, hi=3.5, source="dossier:E1"),
+            ParamSpec("gamma", 0.25, "fixed", units="1/step", lo=0.15, hi=0.45, source="dossier:E2"),
             ParamSpec("p_sev", 0.1, "fixed", units="share", lo=0.02, hi=0.35, source="dossier:E3"),
             ParamSpec("eff_a", 0.4, "fixed", units="share", lo=0.15, hi=0.65, source="dossier:E4"),
         ]
@@ -434,8 +431,7 @@ class Model:
         prevs = []
         p_rec = 1.0 - math.exp(-max(gamma, 0.0) * dt)
         for _ in range(n_steps):
-            foi = r0 * mult * gamma * i
-            p_inf = 1.0 - math.exp(-max(foi, 0.0) * dt)
+            p_inf = 1.0 - math.exp(-max(r0 * mult * p_rec * i, 0.0))
             ni = s * p_inf
             li = i * p_rec
             nh = li * p_sev
