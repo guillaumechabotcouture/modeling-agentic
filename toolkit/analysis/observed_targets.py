@@ -931,7 +931,7 @@ def _self_test() -> int:
         # Order-independent check: malformed second unit is still caught even after a sensitive first unit
         r_bad2 = copy.deepcopy(sp_ok.raw)
         with open(os.path.join(d, "units_bad2.csv"), "w") as fh:
-            fh.write("id,pop,N\nu1,1000000,600000;200000;200000\nu2,500000,300000;100000\n")
+            fh.write("id,pop,N,cov1\nu1,1000000,600000;200000;200000,0;0.8;0.7\nu2,500000,300000;100000,0;0.9;0.6\n")
         r_bad2["decision_units"]["csv"] = "units_bad2.csv"
         e_bad2 = schema.validate(schema.Spec(r_bad2, d, os.path.join(d, "decision_spec.yaml")))
         ok(e_ok == [] and len(e_flat) == 1 and "pre-epidemic state" in e_flat[0]
