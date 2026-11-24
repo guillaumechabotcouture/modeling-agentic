@@ -19,9 +19,9 @@ This contract covers operations: what is running, what it costs, why it stopped,
 
 ## 2. Rules
 
-**Read-only.** The server has no tool that changes a run, a launch, a cluster, a PR or a budget. Its only
+**Read-only by default.** The PR 2 server has no tool that changes a run, a launch, a cluster, a PR or a budget. Its only
 writes are its own usage log and the feedback log (§9), outside the repository, through `lib.safe_io`. A
-failed log write never fails a call.
+failed log write never fails a call. Actions (§8a) come later, in a separate server entry with its own safeguards.
 
 **No network.** The server reads local files only. Anything remote (cloud checkpoints, cluster listings,
 `gh` output, the supervisor's status) reaches it as a local cache that `tools/diagnostics/follow.py`
@@ -248,6 +248,77 @@ state, status, last event age), `run_status`, `run_events`, `run_findings`, `run
 It reuses the workbench's confined readers (`lib.safe_io`, the run-folder confinement of
 `tools/workbench/workbench.py`). `tools/diagnostics/README.md` shows the `claude_desktop_config.json` entry.
 
+## 8a. Actions (design only; levels 2 to 4 come in a later PR 3)
+
+The modeller should be able to act from Claude Desktop, not only read. Actions come in four levels. PR 2's server
+stays read-only (level 1). Levels 2 to 4 come in PR 3, as a separate server entry (`--actions`), so the owner
+chooses in the Claude Desktop config whether a session can act at all.
+
+**Safeguards for every level.**
+
+- Nothing edits a run in place. An action either runs an existing signed command, which writes only its own
+  records, or works on a copy.
+- Each write is its own tool call, and the owner approves it in Claude Desktop. No tool chains a write after
+  another write. Preparing a write (`prepare_*`) is read-only and returns the exact command, what it will change
+  and a `prepared_sha256` that binds both. The write tool (`apply_*`) takes that hash and refuses if the run's
+  files changed since it was prepared.
+- Spend goes through the existing guards: the run's `--max-budget-usd` and, for cloud, `cloud/budget.py`'s
+  launch check and `launch_watch.py`'s cap. No action has its own spending path.
+- Every prepare and apply call is recorded in `usage.jsonl` with its arguments, the command, `prepared_sha256`,
+  the exit code and the records it wrote (§9).
+- The model can never sign. A signature is the owner's keychain prompt (the Ed25519 owner key, as
+  `cloud/budget.py` uses it today). The tool can only start the command that raises the prompt.
+
+| Level | What the modeller does | Tools | Must exist first |
+|---|---|---|---|
+| 1 Understand | read everything in §4 | §8 | PR 1 and PR 2 |
+| 2 Decide at the gate | answer owner-inbox items | `prepare_answer`, `apply_answer`, `prepare_resume`, `apply_resume` | owner-key signing on the sign commands (below) |
+| 3 What-if on a finished run | ask what the model would say with other inputs | `whatif` | a v2 what-if path over stored rows or the emulator (below) |
+| 4 Change a step and re-run | propose a spec amendment and launch it | `prepare_amendment`, `apply_amendment` | after #371 and the same-run amendment redesign; #373 (`motivated_by`) |
+
+**Level 2: decide at the gate.** These are the items `owner_inbox` lists: plan-changing decision tests, stability
+results, degenerate intervals, scope declarations, spec amendments and spec sign-offs.
+
+- `prepare_answer(run, item, decision: accept | decline | declare, reason)` returns `diag.prepare_answer/1`:
+  `{run, item, finding_fingerprint, decision, reason, command: [argv], effect: "what the gate will read next",
+  shown_sha256: {file: sha}, prepared_sha256}`. The command is the existing one: `scripts/scope_signoff.py sign
+  <run> --by owner --answers <file>` for findings and declarations, and `agents/stage_machine.py sign <run>
+  --by owner --expect-sha256 <spec> --expect-sheet-sha256 <sheet>` for the spec. The answers file is written to
+  the diagnostics folder, never into the run.
+- `apply_answer(prepared_sha256)` runs that command and returns its exit code, the record it wrote and the
+  finding's status after it.
+- `prepare_resume(run)` / `apply_resume(prepared_sha256)` is a separate, explicit action. It runs `main.py --v2
+  --resume <run>` with the run's recorded cap, locally, or prepares the cloud relaunch command and does not run
+  it. Answering never resumes a run on its own.
+- **Must exist first: owner-key signing on the two sign commands.** Today they refuse only inside the agents'
+  environment. A process started from Claude Desktop is not in that environment, so as they stand a tool call
+  could sign as the owner with no key. Level 2 ships only after `scope_signoff.py sign` and `stage_machine.py
+  sign --by owner` require the owner's Ed25519 signature over the answer, prompted from the keychain on every
+  use, and the harness checks it against the tracked public key.
+
+**Level 3: what-if on a finished run.**
+
+- `whatif(run, set: {input: value}, outputs?)` returns `diag.whatif/1`, shaped like `run_compare`:
+  `{run, set, refused: null | reason, source: stored_rows | emulator | outcome_fn, original: {headline,
+  plan}, changed: {headline, plan}, change: {...}, interval, cost_estimate_usd}`.
+- It wraps `scripts/ask.py <run> --set input=value`, which refuses anything outside the model card's valid
+  domain. It runs on a copy, with `--no-log`, so the run's `whatif_log.jsonl` is not touched; the query goes to
+  `usage.jsonl` instead.
+- No engine runs. When neither the stored rows nor a fitted emulator cover the setting, the tool returns
+  `refused` with the estimated cost of the engine runs it would need, and stops.
+- **Must exist first:** `ask.py` loads a run's `models/outcome_fn.py`, which v1-era runs have. v2 runs need a
+  what-if path over the analysis engine's stored rows and emulator, under the same domain refusal.
+
+**Level 4: change a step and re-run** (after #371 and the same-run amendment redesign).
+
+- `prepare_amendment(run, patch, motivated_by: [finding ids], reason)` returns `diag.prepare_amendment/1`:
+  `{run, patch, motivated_by, spec_diff, reuse: {steps reused, steps rerun}, cost_estimate_usd, budget_check:
+  {scope, remaining_usd, ok}, command: [argv], prepared_sha256}`. The command is the existing amendment path
+  (`toolkit/spec/amend.py`), with the motivating finding ids recorded per #373's `motivated_by`.
+- `apply_amendment(prepared_sha256)` runs the amendment. The owner then signs the amended spec through level 2's
+  signed command. Launching is a separate prepare and apply through `cloud/launch_watch.py` and the budget
+  check. Results come back through `run_compare`, with the parent run as the reference.
+
 ## 9. Learning from use
 
 - **Question log.** The server appends each call to `~/modeling-agentic-keep/diagnostics/usage.jsonl`:
@@ -285,6 +356,9 @@ It reuses the workbench's confined readers (`lib.safe_io`, the run-folder confin
 | `check_value` tool depends on the open `check-value-table` PR merging | lead | with PR 2 |
 | P2 and P3: `markers:` and `goal:` in change-fragment front matter, CI checks the format, old fragments stay prose; goal ids in `docs/design/goals.yaml` (small separate PR) | lead | PR open by 2026-11-25 |
 | M1 agent log `agents.jsonl` (shape in §9), written by the lead | lead | from 2026-11-24 |
+| Level 2 prerequisite: owner-key (Ed25519, keychain) signing on `scope_signoff.py sign` and `stage_machine.py sign` (§8a) | lead | design with PR 3 |
+| Level 3 prerequisite: a v2 what-if path over stored rows and the emulator (§8a) | lead | design with PR 3 |
+| PR 3: action tools, levels 2 and 3; level 4 after #371 and the same-run amendment redesign | lead | after PR 2 |
 | B3 root causes stay prose until the review loop shows they are asked for repeatedly | lead | next triage |
 
 Tell us what is missing from §3, or which questions you would phrase differently, and we will use your version.
@@ -294,4 +368,5 @@ Tell us what is missing from §3, or which questions you would phrase differentl
 | Date | Change | Why |
 |---|---|---|
 | 2026-11-24 | First draft | owner decision: Claude Desktop as the diagnostic front end |
+| 2026-11-24 | Owner yes: §8a Actions in four levels (understand; decide at the gate; what-if; change a step and re-run), design only; levels 2-4 in a later PR 3 | owner decision |
 | 2026-11-24 | Owner review: yes to `markers:` and `goal:` in change fragments (CI-checked, old fragments stay prose, goals in `docs/design/goals.yaml`); yes to the lead's `agents.jsonl` (§9); keep `run_compare`, `owner_inbox` and `machine_status` | owner decisions on #381 |
