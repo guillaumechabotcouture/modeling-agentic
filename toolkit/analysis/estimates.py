@@ -458,24 +458,35 @@ def _decision(dec, v: np.ndarray) -> dict:
 
 def _sample(P: C.Problem, seed: int) -> dict:
     """The canonical sample; problems evaluated with run_batch() use importance sampling up to the
-    run_batch dimension threshold (as calibration.posterior does)."""
-    mip = C.thresholds()["max_importance_params_run_batch"]
+    run_batch dimension threshold (as calibration.posterior does), and mode-started per-chain adaptive
+    Metropolis (toolkit/analysis/mode_start.py) above it or when importance sampling falls below its ESS floor."""
+    from toolkit.analysis import mode_start as MS
+    mip = int(C.thresholds()["max_importance_params_run_batch"])
     refused = []
-    # the calibration defaults, then once with the larger budget of thresholds.yaml estimates.importance_retry (a
-    # curved ridge can leave importance sampling below its ESS floor), then adaptive Metropolis (its own floors:
-    # R-hat and bulk ESS). Every stage fails closed; the floors are never lowered.
-    for over in ({}, thresholds()["importance_retry"], {"max_importance_params": 0}):
-        try:
-            out = C.sample(P, seed=int(seed), **dict({"max_importance_params": mip}, **over))
-        except C.CalibrationRefused as e:
-            if e.code not in ("posterior_ess", "posterior_mcmc"):
-                raise
-            refused.append(str(e))
-            continue
-        if refused:
-            out["diagnostics"] = dict(out["diagnostics"], earlier_attempts_refused=refused)
-        return out
-    raise C.CalibrationRefused("posterior_ess", "; ".join(refused))
+    # Up to the importance threshold, try calibration defaults then thresholds.yaml estimates.importance_retry
+    # (a curved ridge can leave importance sampling below its ESS floor); above the threshold or after ESS
+    # refusals, run mode-started per-chain adaptive Metropolis once (which handles its own single retry).
+    if len(P.names) <= mip:
+        for over in ({}, thresholds()["importance_retry"]):
+            try:
+                out = C.sample(P, seed=int(seed), **dict({"max_importance_params": mip}, **over))
+            except C.CalibrationRefused as e:
+                if e.code not in ("posterior_ess", "posterior_mcmc"):
+                    raise
+                refused.append(str(e))
+                continue
+            if refused:
+                out["diagnostics"] = dict(out["diagnostics"], earlier_attempts_refused=refused)
+            return out
+    try:
+        out = MS.sample(P, seed=int(seed), max_importance_params=0)
+    except C.CalibrationRefused as e:
+        if refused and e.code in ("posterior_ess", "posterior_mcmc"):
+            raise C.CalibrationRefused(e.code, "; ".join(refused + [str(e)])) from e
+        raise
+    if refused:
+        out["diagnostics"] = dict(out["diagnostics"], earlier_attempts_refused=refused)
+    return out
 
 
 def _rows_dict(names, rows):
@@ -1247,10 +1258,13 @@ def run(run_dir, spec, S, eng, arts: dict, data_in: list, eng_files: list, draws
     lab, scope = _label(spec, res)
     res["label"] = lab
     s, cls = res["sample"], res["classes"]
+    from toolkit.analysis import mode_start as MS
     cal = {"method": "posterior", "units": {}, "names": list(s["names"]),
            "diagnostics": dict({"converged": res["converged"], "message": res["message"],
                                 "n_targets": int(len(res["E"].target["y"])), "n_parameters": len(s["names"]),
-                                "sampler": s["method"], "at_bound": []}, **s["diagnostics"]),
+                                "sampler": s["method"],
+                                "at_bound": MS.near_bounds(res["P"], res["map"], classes=cls["classes"])},
+                               **s["diagnostics"]),
            "identifiability": {"method": cls["method"], "classes": cls["classes"],
                                "likelihood_classes": cls["likelihood_classes"], "contraction": cls["contraction"],
                                "ridges": cls["ridges"],
@@ -1596,6 +1610,16 @@ def _self_test_structural(ok, rows) -> None:
        and abs(sum(x["weight"] for x in sv_eq) - 1.0) < 1e-9
        and abs(med1 - med2) < 1e-12 and res_eq1["decision"]["verdict"] == res_eq2["decision"]["verdict"],
        f"AE29 equal weighting, unverified fallback, and pool-order symmetry ({med1:.4f} vs {med2:.4f})")
+    # AE30: above max_importance_params_run_batch, _sample runs mode-started Metropolis once (no 3x prior-start retry)
+    from toolkit.analysis import mode_start as MS
+    d_hi = int(C.thresholds()["max_importance_params_run_batch"]) + 1
+    Phi, mu_hi = MS._toy(d=d_hi, s=1e-3, mu=np.linspace(0.25, 0.75, d_hi))
+    shi = _sample(Phi, seed=0)
+    dg_hi = shi.get("diagnostics") or {}
+    ok(shi.get("method") == "adaptive_metropolis" and dg_hi.get("start") == "posterior_mode"
+       and "earlier_attempts_refused" not in dg_hi
+       and np.allclose(np.mean(shi["rows"], axis=0), mu_hi, atol=5e-3),
+       f"AE30 _sample uses mode-start Metropolis cleanly above max_importance_params_run_batch ({dg_hi})")
 
 
 def _self_test() -> int:

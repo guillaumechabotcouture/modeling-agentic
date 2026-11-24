@@ -67,8 +67,14 @@ attribute_binding:
         relative to the declared value (0.91 / 0.85, about 1.07), gives 1.1.
       applicability: >-
         Before copying the range, check its assumptions against the question: the reported coverage level, the
-        declared seroconversion, the pathogen and the setting's income group (Dolan and MacNeil: gaps of 27-34 points
-        in low-income and 8-15 in upper-middle-income countries). Recompute both ends when they differ, and cite a
-        local survey-versus-administrative comparison when one exists. A question that states the gap overrides it.
+        declared seroconversion, the pathogen, the setting's income group (Dolan and MacNeil: gaps of 27-34 points
+        in low-income and 8-15 in upper-middle-income countries), and the direction of the survey-versus-administrative
+        gap in every unit. The [0.5, 1.1] range assumes administrative over-reporting (effective immunity at most
+        about 1.1 times reported coverage times declared seroconversion): if any unit's observed survey positivity
+        approaches or exceeds that upper edge (e.g. from administrative under-counting, higher field seroconversion,
+        or prior natural infection), widen the upper bound (for example to 1.5, with effective coverage clipped at 1
+        by the engine) so the prior cap does not clip the survey fit. Recompute both ends when assumptions differ,
+        and cite a local survey-versus-administrative comparison when one exists. A question that states the gap
+        overrides it.
       verified: "read 2026-11-06: Dolan and MacNeil from the PMC author manuscript (results text); Lim, Murray and
         Uzicanin from their abstracts (Europe PMC)"

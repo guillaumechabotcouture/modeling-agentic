@@ -69,7 +69,7 @@ EDGES = {
     "ANALYZE": {"SCORE", "CRITIQUE", "SPEC", "FINAL"},
     "SCORE": {"CRITIQUE", "FINAL"},
     "CRITIQUE": {"GATE", "WRITE", "FINAL"},
-    "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "FINAL"},
+    "GATE": {"WRITE", "FIX_LOOP", "SPEC", "ENGINE_CHOICE", "OWNER_DECISION", "CRITIQUE", "PRESENTATION", "FINAL"},
     "FIX_LOOP": {"CRITIQUE", "SPEC", "ENGINE_CHOICE", "WRITE", "OWNER_DECISION", "FINAL"},
     "OWNER_DECISION": {"GATE", "OWNER_DECISION", "FINAL"},
     # hb1 cause G: a draft revised for write-up findings as a new round is re-reviewed (CRITIQUE) before the gate
@@ -2567,11 +2567,17 @@ class Machine:
             return self._go("FINAL", "round cap passed (gate did not stop the run)", "completed_gate_error")
         v = self._visit()
         fb = self.st.tries.get("schema_feedback") or {}
-        critics = list(CRITICS) if (not fb or "*" in fb) else [r for r in fb if r in CRITICS or r == "critique-presentation"]
+        if not fb:
+            critics = list(CRITICS)
+        elif "*" in fb:
+            critics = list(CRITICS) + (["critique-presentation"] if self.st.post_write else [])
+        else:
+            critics = [r for r in fb if r in CRITICS or r == "critique-presentation"]
         rereview = self._rereview_due()          # hb1 cause G: the domain and red-team critics, on the revised draft
         for reviewer in critics:
             args = (self.run_dir, reviewer, self.st.round) + ((fb.get(reviewer) or fb.get("*"),) if fb else ())
-            res = self._task(f"CRITIQUE#{v}:r{self.st.round}:{reviewer}", "critique", *args)
+            res = self._task(f"CRITIQUE#{v}:r{self.st.round}:{reviewer}", "critique", *args,
+                             writeup=(reviewer == "critique-presentation"))
             if res is None:
                 return self._budget_out("CRITIQUE")
         self.st.tries.pop("schema_feedback", None)
@@ -2691,15 +2697,23 @@ class Machine:
             self.st.tries["schema"] = n
             if n > MAX_SCHEMA_REPAIRS:
                 return self._go("FINAL", "critique schema errors persist", "completed_gate_error")
-            # Only the critics whose YAML failed are re-run, each told its own errors.
+            # Only the critics whose YAML failed are re-run, each told its own errors. Match any known
+            # critique filename anywhere in the error string (e.g. "invalid YAML in /.../critique_presentation.yaml: ...")
+            # and route presentation-only schema errors back to PRESENTATION so the presentation file is repaired.
             import validate_critique_yaml as V
             by_file = {f: r for r, f in V.FILENAMES.items()}
             fb: dict = {}
             for e in d["schema_errors"]:
-                f = str(e).split(":", 1)[0].strip().split()[0]
-                fb.setdefault(by_file.get(f, "*"), []).append(str(e))
+                s_err = str(e)
+                who = next(
+                    (r for fname, r in by_file.items()
+                     if re.search(rf"(?:^|[/\\\s'\"]){re.escape(fname)}(?:$|[:\s'\"])", s_err)),
+                    "*",
+                )
+                fb.setdefault(who, []).append(s_err)
             self.st.tries["schema_feedback"] = fb
-            return self._go("CRITIQUE", f"schema errors: {'; '.join(d['schema_errors'])[:200]}")
+            target = "PRESENTATION" if set(fb) == {"critique-presentation"} else "CRITIQUE"
+            return self._go(target, f"schema errors: {'; '.join(d['schema_errors'])[:200]}")
         self.st.tries.pop("schema", None)
         why = f"{(d or {}).get('action')} (rule {(d or {}).get('rule_matched')}){' post-write' if pw else ''}"
         if nxt in ("FIX_LOOP", "SPEC", "ENGINE_CHOICE"):
@@ -3033,10 +3047,13 @@ class Machine:
     def h_PRESENTATION(self):
         # The review of the draft is part of the write-up: like WRITE, it may use the write-up reserve (an accepted
         # run whose WRITE spent into the reserve ended budget_exhausted here, with most of the reserve unspent).
-        res = self._task(f"PRESENTATION#{self._visit()}:r{self.st.round}", "critique", self.run_dir,
-                         "critique-presentation", self.st.round, writeup=True)
+        fb = self.st.tries.get("schema_feedback") or {}
+        pres_fb = fb.get("critique-presentation") or fb.get("*")
+        args = (self.run_dir, "critique-presentation", self.st.round) + ((pres_fb,) if pres_fb else ())
+        res = self._task(f"PRESENTATION#{self._visit()}:r{self.st.round}", "critique", *args, writeup=True)
         if res is None:
             return self._budget_out("PRESENTATION")
+        self.st.tries.pop("schema_feedback", None)
         if self._rereview_due():
             return self._go("CRITIQUE", f"re-review of the revised draft, round {self.st.round}")
         return self._go("GATE", "presentation review of the draft")
@@ -5886,6 +5903,29 @@ def _self_test() -> int:
         ok(s in ("completed", "completed_scope_declared") and "feedback:critique-domain:True" in T.calls
            and T.calls.count("critique:critique-redteam:1") == 1,
            f"T37 a schema repair re-runs only the failing critic, with its errors ({s}, {[c for c in T.calls if 'critique' in c][:6]})")
+
+        # T37b: invalid YAML in critique_presentation.yaml ("invalid YAML in /.../critique_presentation.yaml: ...")
+        # routes directly back to PRESENTATION with its errors, never re-runs domain/redteam, and finishes cleanly.
+        class BadPresYaml(StubTasks):
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                res = super().critique(run_dir, reviewer, round_n)
+                if reviewer == "critique-presentation" and not feedback:
+                    p = os.path.join(run_dir, "critique_presentation.yaml")
+                    open(p, "w").write("reviewer: critique-presentation\nround: 1\nevidence: a (events: bad)\n")
+                self.calls.append(f"feedback:{reviewer}:{bool(feedback)}")
+                return res
+        d_p, T_p, st_p = new_run("pres_yaml_repair", {})
+        T_p = BadPresYaml(T_p.s)
+        s_p = _SpikeMachine(d_p, T_p, st_p, log=lambda *a: None, cross_engine_check=False).run()
+        hist_p = load_state(d_p).history
+        pres_route = any(h.get("from") == "GATE" and h.get("to") == "PRESENTATION" for h in hist_p)
+        ok(s_p in ("completed", "completed_scope_declared") and pres_route
+           and "feedback:critique-presentation:True" in T_p.calls
+           and T_p.calls.count("critique:critique-domain:1") == 1
+           and T_p.calls.count("critique:critique-redteam:1") == 1
+           and os.path.exists(os.path.join(d_p, "report.md")),
+           f"T37b invalid presentation YAML routes to PRESENTATION with errors and keeps report.md "
+           f"({s_p}, pres_route={pres_route}, calls={[c for c in T_p.calls if 'critique' in c or 'feedback' in c]})")
 
         # T74-T75 (two v2 eval runs, 2026-11-05, both completed_gate_error with no verdict): in round 2
         # the critics marked blockers resolved without resolved_in_round or resolved_evidence and wrote

@@ -236,7 +236,8 @@ class Analysis:
 
     def fit_calibration(self):
         if self.method in ("likelihood", "posterior"):
-            fit = C.fit_likelihood if self.method == "likelihood" else C.fit_posterior_panel
+            from toolkit.analysis import mode_start as MS
+            fit = C.fit_likelihood if self.method == "likelihood" else MS.fit_posterior_panel
             self.lik = fit(self.spec, self.model)
             self.theta0 = dict(self.theta0, **self.lik["theta"])
             # a unit in fixed_z is calibrated at a fixed value (None: a fit with no per-unit attribute, where every

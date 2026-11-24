@@ -131,7 +131,10 @@ serosurvey exist for the compartmental engine, do not plug raw survey proportion
 `initialiser: cohort_history` and calibrate per-unit `coverage_scale` against the survey's `binomial`
 (or `betabinomial` with a design effect) observations (`targets.kind: observations`), or calibrate
 `per_group_parameters: [s0]` when `structure: age_groups_contact_matrix` is required, so the posterior
-shrinks sampling noise and propagates per-unit immunity uncertainty. For an estimates spec, when
+shrinks sampling noise and propagates per-unit immunity uncertainty. Before copying any engine-card calibration
+prior range (such as a per-unit scaling factor), check both the direction and spread implied by the observed
+targets across all units and widen the range whenever observed data sit near or beyond either bound so the
+prior does not clip the fit. For an estimates spec, when
 structural assumptions such as generation-interval uncertainty or constant versus time-varying
 transmissibility could move an output, vary `dynamics.generation_interval.scale_range` and/or pool
 alternative `dynamics.transmissibility` structures (`{{pool: [constant, {{knots: [...], priors: {{...}}}}],
@@ -181,7 +184,8 @@ reviews only: the checklist below), blockers (ids {prefix}-NNN, this prefix;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
 first_seen_round, claim, evidence, fix_requires (when the fix needs the signed decision_spec.yaml changed, start it
 with "Owner amendment:": the owner decides it, no task can), resolved (true/false), and done_when (required for
-HIGH and MEDIUM). Use only those values: the gate refuses any other.
+HIGH and MEDIUM). Use only those values: the gate refuses any other. Quote any YAML scalar containing `: `
+(colon-space) or use a folded block scalar (`>-`) so the file parses cleanly.
 A blocker with resolved: true also needs resolved_in_round: {round} and resolved_evidence: "<where
 the fix is, file and section>"; keep its done_when (the harness re-runs the test and reopens the
 finding if it fails). From round 2, carried_forward has one mapping per blocker of the previous

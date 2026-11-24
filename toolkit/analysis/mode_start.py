@@ -332,6 +332,84 @@ def sample(P, seed: int = 0, modes: dict | None = None, **override) -> dict:
     return out
 
 
+BOUND_FRAC = 0.02                 # posterior mode within this fraction of a finite prior span is flagged at_bound
+
+
+def near_bounds(P, xh, frac: float = BOUND_FRAC, classes: dict | None = None) -> list[str]:
+    """Parameters whose posterior mode sits within `frac` of a finite prior bound (natural coordinates), excluding
+    parameters classified as prior-dominated. MAP optimisation in z = Phi^-1(F(x)) coordinates pulls modes slightly
+    inward from a hard prior wall, so an exact-boundary check misses clipped fits."""
+    if not P.names:
+        return []
+    if isinstance(xh, dict):
+        vals = xh
+    else:
+        vals = dict(zip(P.names, (float(v) for v in xh)))
+    cls = classes or {}
+    out = []
+    for n in P.names:
+        if n not in vals or cls.get(n) == "prior_dominated":
+            continue
+        pr = P.priors[n]
+        if pr.dist not in ("uniform", "loguniform", "triangular") and not (
+                pr.dist == "beta" and (pr.a or 0.0) >= 1.0 and (pr.b or 0.0) >= 1.0):
+            continue
+        lo, hi = pr.natural_support()
+        span = float(hi) - float(lo)
+        if not (math.isfinite(span) and span > 0.0):
+            continue
+        v = float(vals[n])
+        if not math.isfinite(v) or (pr.dist == "loguniform" and v <= 0.0):
+            continue
+        u = (float(pr.natural(v)) - float(lo)) / span
+        if u <= frac or u >= 1.0 - frac:
+            out.append(n)
+    return out
+
+
+def fit_posterior_panel(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, sample_it=True) -> dict:
+    """`posterior` calibration of a count panel using mode-started per-chain adaptive Metropolis above
+    `max_importance_params` (and `observed_targets.fit` for observation targets), keeping `calibration.py`
+    untouched and returning the exact shape of `calibration.fit_posterior_panel`."""
+    from toolkit.analysis import observed_targets as OT
+    if OT.applies(spec):
+        return OT.fit(spec, model, rows=rows, fixed_z=fixed_z, fixed_params=fixed_params, seed=seed,
+                      sample_it=sample_it)
+    C = _C()
+    P, L = C.panel_problem(spec, model, rows, fixed_z, fixed_params)
+    s = c = None
+    if sample_it:
+        sd = spec["calibration"].get("seed", 0) if seed is None else seed
+        s = sample(P, seed=int(sd))
+        c = C.classify(P, s)
+    if P.names:
+        xh, conv, msg = C._map_point(P, s["best"] if s else None)
+    else:
+        xh, conv, msg = [], True, "every parameter fixed: the configuration is evaluated as given"
+    x = dict(fixed_params or {}, **dict(zip(P.names, (float(v) for v in xh))))
+    out = {"method": "posterior", "x": x, "names": list(P.names), "params": L.params, "units_fitted": L.units,
+           "fixed_z": L.fixed_z, "fixed_params": dict(fixed_params or {}),
+           "theta": {p: x[p] for p in L.params}, "z": {u: x[f"z:{u}"] for u in L.units},
+           "diagnostics": {"converged": conv, "message": msg, "n_targets": len(L.rows), "n_parameters": len(P.names),
+                           "at_bound": near_bounds(P, xh, classes=(c or {}).get("classes")),
+                           "observation": (spec["calibration"].get("observation") or {}).get("model")}}
+    if s is not None:
+        out["sample"] = {"sample_id": s["sample_id"], "names": s["names"], "rows": s["rows"].tolist(),
+                         "method": s["method"], "seed": s["seed"]}
+        out["diagnostics"].update(sampler=s["method"], **{k: v for k, v in s["diagnostics"].items()})
+        pr_tests = C.prior_range_tests(c, P)
+        lab = C.label_parts(c, P)
+        out["identifiability"] = {"method": c["method"], "classes": c["classes"],
+                                  "likelihood_classes": c["likelihood_classes"], "contraction": c["contraction"],
+                                  "ridges": c["ridges"],
+                                  "status": ("well_identified" if all(v == "identified" for v in c["classes"].values())
+                                             else "partly_or_prior_dominated")}
+        out["prior_range_tests"] = pr_tests
+        out["prior_dominated"] = list(lab["prior_dominated"])
+        out["priors"] = {n: P.priors[n].describe() for n in P.names}
+    return out
+
+
 # --------------------------------------------------------------------------- self-test
 def _toy(d=6, s=1e-3, mu=None):
     """A unimodal posterior far narrower than its uniform priors (posterior sd `s` against a prior sd of 0.29): the
@@ -476,6 +554,45 @@ def _self_test() -> int:
     Hd = _hessian(Pd, np.zeros(HESS_FULL_MAX + 1))
     ok(Hd is not None and Pd.n_evals - n0 == 2 * (HESS_FULL_MAX + 1) + 1 and np.count_nonzero(Hd - np.diag(np.diag(Hd))) == 0,
        f"MS9 a {HESS_FULL_MAX + 1}-parameter Hessian is its diagonal ({Pd.n_evals - n0} points)")
+    # MS10: near_bounds flags modes pressed against a finite prior wall and ignores interior and prior-dominated ones
+    Pnb = C.Problem(
+        ["hi_clip", "lo_clip", "mid", "flat_edge"],
+        {
+            "hi_clip": C.Prior.from_decl("hi_clip", {"dist": "uniform", "range": [0.5, 1.1], "source": "toy"}),
+            "lo_clip": C.Prior.from_decl("lo_clip", {"dist": "loguniform", "range": [1.0, 10.0], "source": "toy"}),
+            "mid": C.Prior.from_decl("mid", {"dist": "uniform", "range": [0.5, 1.1], "source": "toy"}),
+            "flat_edge": C.Prior.from_decl("flat_edge", {"dist": "uniform", "range": [0.5, 1.1], "source": "toy"}),
+        },
+        lambda X: (np.zeros(len(X["mid"])), {}),
+    )
+    nb = near_bounds(Pnb, {"hi_clip": 1.092, "lo_clip": 1.01, "mid": 0.95, "flat_edge": 1.099},
+                     classes={"hi_clip": "identified", "lo_clip": "identified", "mid": "identified",
+                              "flat_edge": "prior_dominated"})
+    ok(nb == ["hi_clip", "lo_clip"], f"MS10 near_bounds detects clipped modes without flagging interior or flat ({nb})")
+    # MS11: fit_posterior_panel uses mode_start above max_importance_params and returns canonical sample + diagnostics
+    import tempfile
+    import yaml
+    from toolkit.analysis import run as R
+    from toolkit.analysis.model import DirectModel
+    from toolkit.spec.schema import load as load_spec
+    with tempfile.TemporaryDirectory() as td:
+        R._direct_toy(td)
+        sp = os.path.join(td, "decision_spec.yaml")
+        raw = yaml.safe_load(open(sp))
+        lrr = {"dist": "uniform", "range": [-2.0, 1.0], "source": "toy"}
+        raw["calibration"].update(method="posterior", observation={"model": "poisson"}, priors={
+            "lrr:a": lrr, "lrr:b": lrr, "lrr:a+b": lrr,
+            "log_rate": {"dist": "uniform", "range": [-8.0, 2.0], "source": "toy"}})
+        yaml.safe_dump(raw, open(sp, "w"))
+        spec_p = load_spec(sp)
+        m_p = DirectModel(spec_p, log=lambda *a: None)
+        m_p.fit()
+        fit_p = fit_posterior_panel(spec_p, m_p, seed=0)
+    dg_p = fit_p.get("diagnostics") or {}
+    ok(dg_p.get("start") == "posterior_mode" and dg_p.get("adaptation") == "per_chain"
+       and len(fit_p.get("names") or []) == 6 and bool((fit_p.get("sample") or {}).get("sample_id"))
+       and isinstance(dg_p.get("at_bound"), list),
+       f"MS11 fit_posterior_panel runs mode-start Metropolis for 6-param panel ({dg_p.get('start')}, {len(fit_p.get('names') or [])})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

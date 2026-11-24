@@ -566,12 +566,14 @@ def fit(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, samp
     refuse_failures("at the posterior mode")
     if not np.isfinite(ll_hat):
         raise C.CalibrationRefused("posterior_mode", "the posterior mode has no finite likelihood")
+    from toolkit.analysis import mode_start as MS
     out = {"method": "posterior", "targets_kind": KIND, "x": x, "names": list(P.names), "params": E.params,
            "units_fitted": E.units, "fixed_z": fixed, "fixed_params": dict(E.fixed_params),
            "nuisance": [p for p in E.nuisance if p not in E.fixed_params],
            "theta": {p: x[p] for p in E.params}, "z": z,
            "diagnostics": {"converged": conv, "message": msg, "n_targets": len(E.rows), "n_parameters": len(P.names),
-                           "at_bound": [], "observation": "per-source (calibration.sources)",
+                           "at_bound": MS.near_bounds(P, xh, classes=(c or {}).get("classes")),
+                           "observation": "per-source (calibration.sources)",
                            "evaluation": "initial_state" if E.state_only else "run_batch",
                            "loglik_at_mode": float(ll_hat), "start_search_refusals": scan_failed,
                            "fit": [_fit_row(E, r, exp[j]) for j, r in enumerate(E.rows)]}}
@@ -939,6 +941,18 @@ def _self_test() -> int:
            and e_assay == [] and any("u2" in e for e in e_bad2),
            f"OT25 state-only observation flatness check handles flat, clipped, zero-weight pooled, assay-only, "
            f"and order-independent malformed units ({e_ok}, {e_flat}, {e_clip}, {e_pool}, {e_assay}, {e_bad2})")
+        # OT26: diagnostics.at_bound flags a per-unit posterior mode pressed against a tight upper prior bound
+        r_ab = copy.deepcopy(sp_ok.raw)
+        r_ab["calibration"]["range"] = r_ab["calibration"]["priors"]["coverage_scale"]["range"] = [0.5, 1.1]
+        with open(os.path.join(d, "targets_hi.csv"), "w") as fh:
+            fh.write("unit,groups,source,latent,pos,n\nu1,c1;c2,sero,immunity,190,200\nu2,c1;c2,sero,immunity,120,200\n")
+        r_ab["calibration"]["targets"]["csv"] = "targets_hi.csv"
+        sp_ab = schema.Spec(r_ab, d, os.path.join(d, "decision_spec.yaml"))
+        m_ab = DirectModel(sp_ab, log=lambda *a: None)
+        m_ab.fit()
+        fit_ab = fit(sp_ab, m_ab, seed=0, sample_it=False)
+        ok("z:u1" in fit_ab["diagnostics"]["at_bound"] and "z:u2" not in fit_ab["diagnostics"]["at_bound"],
+           f"OT26 posterior mode clipped against upper prior bound is reported in at_bound ({fit_ab['diagnostics']['at_bound']}, z={fit_ab['z']})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
