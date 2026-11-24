@@ -91,7 +91,9 @@ else:
 METHOD_NAMES = {"ilp": "ilp_pulp", "greedy": "greedy", "brute": "brute_force"}   # optimization_quality.py vocabulary
 EXACT = ("ilp", "brute")
 BUDGET_RTOL = 1e-9       # every method allows cost <= budget * (1 + 1e-9)
+EXACT_BUDGET_RTOL = 1e-12  # exact-budget lower/upper tolerance in solve() (prevents 1e9 - 1 slipping past 1e9)
 CHECK_RTOL = 1e-7        # the independent check allows solver rounding up to this
+EXACT_CHECK_RTOL = 1e-10  # independent check tolerance for budget_exact=True
 BEAT_RTOL = 1e-7         # a method "beats" another when it is better by more than this (relative)
 
 
@@ -241,9 +243,19 @@ def drop_impossible(opts, blim, cmax, blo=None) -> tuple[dict, int]:
     tc_max = sum(xc.values()) if xc is not None else None
     out, n = {}, 0
     for u, o in opts.items():
-        keep = [x for x in o if tc - mc[u] + x[2] <= blim
-                and (blo is None or tc_max - xc[u] + x[2] >= blo)
-                and all(tw[k] - mw[u][k] + x[3][k] <= cmax[k] for k in range(K))]
+        other_max = None
+        keep = []
+        for x in o:
+            if tc - mc[u] + x[2] > blim:
+                continue
+            if blo is not None and tc_max - xc[u] + x[2] < blo:
+                # re-check with fsum to avoid floating-point cancellation from outlier unit costs
+                if other_max is None:
+                    other_max = math.fsum(xc[v] for v in opts if v != u)
+                if other_max + x[2] < blo:
+                    continue
+            if all(tw[k] - mw[u][k] + x[3][k] <= cmax[k] for k in range(K)):
+                keep.append(x)
         n += len(o) - len(keep)
         out[u] = keep
     return out, n
@@ -270,9 +282,10 @@ def check(choice, benefit, cost, feasible, budget, caps=None, links=None, budget
             continue
         tot += hit[0][2]
         use = [a + b for a, b in zip(use, hit[0][3])]
-    if tot > b0 + CHECK_RTOL * _scale(b0, tot):
+    rtol = EXACT_CHECK_RTOL if budget_exact else CHECK_RTOL
+    if tot > b0 + rtol * _scale(b0, tot):
         errs.append(f"cost {tot:,.4f} exceeds the budget {b0:,.4f}")
-    if budget_exact and tot < b0 - CHECK_RTOL * _scale(b0, tot):
+    if budget_exact and tot < b0 - rtol * _scale(b0, tot):
         errs.append(f"cost {tot:,.4f} is below the exact budget {b0:,.4f}")
     for k, (n, cp, x) in enumerate(zip(names, caps, use)):
         if x > float(cp["max"]) + CHECK_RTOL * _scale(float(cp["max"]), x):
@@ -557,7 +570,11 @@ def solve(benefit, cost, feasible, budget, caps=None, method="ilp", time_limit=3
     base = _baseline(opts)
     opts, npruned = prune(opts, lk, budget_exact=budget_exact)
     blim, cmax = _limits(opts, caps, b0)
-    blo = (b0 - BUDGET_RTOL * _cost_scale(opts, b0)) if budget_exact else None
+    if budget_exact:
+        etol = EXACT_BUDGET_RTOL * _cost_scale(opts, b0)
+        blim, blo = b0 + etol, b0 - etol
+    else:
+        blo = None
     opts, nimp = drop_impossible(opts, blim, cmax, blo=blo)
     if any(not o for o in opts.values()):
         r = _result(method, us, opts, None, "infeasible" if method in EXACT else "no_feasible_found", time.time(),
@@ -1055,6 +1072,18 @@ def _self_test() -> int:
             ok(False, "TEX3b greedy refuses budget_exact=True")
         except ValueError:
             ok(True, "TEX3b greedy refuses budget_exact=True")
+        # Codex r1 P2 & P3: large integer supply exactness (1e9 vs 1e9-1) and outlier-cost cancellation
+        big_b = {"u1": {"short": 200.0, "exact": 100.0}}
+        big_c = {"u1": {"short": 999_999_999.0, "exact": 1_000_000_000.0}}
+        big_f = {"u1": {"short": True, "exact": True}}
+        rb_big = solve(big_b, big_c, big_f, 1_000_000_000.0, method="brute", budget_exact=True)
+        can_r = solve({"u1": {"a": 1.0, "big": 0.0}, "u2": {"a": 1.0}},
+                      {"u1": {"a": 1.0, "big": 1e16}, "u2": {"a": 1.0}},
+                      {"u1": {"a": True, "big": True}, "u2": {"a": True}}, 2.0, method="brute", budget_exact=True)
+        ok(rb_big["choice"] == {"u1": "exact"} and bool(check({"u1": "short"}, big_b, big_c, big_f, 1e9,
+                                                              budget_exact=True))
+           and can_r["choice"] == {"u1": "a", "u2": "a"},
+           f"TEX4 exact budget holds at 1e9 scale and with outlier costs ({rb_big}, {can_r})")
     except TypeError as e:
         ok(False, f"TEX1-TEX3 budget_exact not yet supported ({e})")
     if fails:

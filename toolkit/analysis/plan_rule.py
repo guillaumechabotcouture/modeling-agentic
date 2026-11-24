@@ -117,6 +117,15 @@ def expected_value_plan(A, rows, point_plan: dict, cost0, point_events=()) -> di
             i: {g: float(np.mean([float(r["out"][i]["cost"][plan[i]][qname]) for r in rows]))
                 for g, qname in qmap.items()}
             for i in A.ids}
+        all_groups = list(rows[0]["out"][A.ids[0]]["y_group"][A.comp][A.outcomes[0]])
+        other_groups = [g for g in all_groups if g not in qmap]
+        if other_groups:
+            rec["per_unit_group_other_mean"] = {
+                i: {o: float(np.mean([
+                    sum(float(r["out"][i]["y_group"][A.comp][o].get(g, 0.0))
+                        - float(r["out"][i]["y_group"][plan[i]][o].get(g, 0.0)) for g in other_groups)
+                    for r in rows])) for o in A.outcomes}
+                for i in A.ids}
     return {"solution": sol, "record": rec}
 
 
@@ -158,9 +167,17 @@ def _contract_findings(raw: dict, point, unc) -> list[str]:
             return []
         try:
             ca, ba = float(point["cost_allocated"]), float(point["budget_allocatable"])
-            if not (math.isfinite(ca) and math.isfinite(ba)) or abs(ca - ba) > 1e-6 * max(1.0, abs(ba)):
-                return [f"constraints.envelope_exact is true, but cost_allocated ({ca:g}) differs from "
-                        f"budget_allocatable ({ba:g})"]
+            c_blk = (raw or {}).get("constraints") or {}
+            if "envelope_usd" in c_blk:
+                fixed = sum(float(v) for v in (c_blk.get("fixed_costs_usd") or {}).values())
+                target = float(c_blk["envelope_usd"]) - fixed
+            else:
+                target = ba
+            if not (math.isfinite(ca) and math.isfinite(ba) and math.isfinite(target)) \
+                    or abs(ba - target) > 1e-6 * max(1.0, abs(target)) \
+                    or abs(ca - target) > 1e-6 * max(1.0, abs(target)):
+                return [f"constraints.envelope_exact is true, but cost_allocated ({ca:g}) / budget_allocatable ({ba:g}) "
+                        f"differs from the exact allocatable envelope ({target:g})"]
         except (KeyError, TypeError, ValueError):
             return ["constraints.envelope_exact is true, but point.yaml has no finite cost_allocated and "
                     "budget_allocatable"]
@@ -206,6 +223,7 @@ def _contract_findings(raw: dict, point, unc) -> list[str]:
     bg = (raw.get("deliverable") or {}).get("by_group") if isinstance(raw.get("deliverable"), dict) else None
     if isinstance(bg, dict) and isinstance(bg.get("quantity"), dict):
         pgm, pgq = pr.get("per_unit_group_mean"), pr.get("per_unit_group_quantity")
+        pgo = pr.get("per_unit_group_other_mean") or {}
         groups = list(bg["quantity"])
         try:
             if not (isinstance(pgm, dict) and isinstance(pgq, dict) and isinstance(pu, dict)
@@ -215,8 +233,9 @@ def _contract_findings(raw: dict, point, unc) -> list[str]:
                 tot = float(puv["averted_mean"][hl])
                 gvals = [float(pgm[u_id][g][hl]) for g in groups]
                 qvals = [float(pgq[u_id][g]) for g in groups]
-                if not (all(math.isfinite(x) for x in gvals + qvals + [tot])
-                        and abs(math.fsum(gvals) - tot) <= 1e-6 * max(1.0, abs(tot))):
+                oth = float((pgo.get(u_id) or {}).get(hl, 0.0)) if isinstance(pgo, dict) else 0.0
+                if not (all(math.isfinite(x) for x in gvals + qvals + [tot, oth])
+                        and abs(math.fsum(gvals + [oth]) - tot) <= 1e-6 * max(1.0, abs(tot))):
                     raise ValueError(f"unit {u_id} group means do not sum to averted_mean")
         except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as e:
             bad.append(f"deliverable.by_group under expected_value: plan_rule.per_unit_group_mean / "
@@ -424,15 +443,17 @@ def _self_test() -> int:
        f"PR13b contract_findings verifies by_group per-group means ({contract_findings(bg_raw, bg_pt, unc)}, "
        f"{contract_findings(bg_raw, bg_bad, unc)})")
     # PR14: constraints.envelope_exact: true checked at contract gate on point & expected_value
-    ex_pt_raw = {"constraints": {"envelope_exact": True}}
-    ex_ev_raw = dict(ev_raw, constraints={"envelope_exact": True})
+    ex_pt_raw = {"constraints": {"envelope_exact": True, "envelope_usd": 11.0}}
+    ex_ev_raw = dict(ev_raw, constraints={"envelope_exact": True, "envelope_usd": 1.0})
     pt_ok = {"cost_allocated": 11.0, "budget_allocatable": 11.0}
     pt_short = {"cost_allocated": 8.0, "budget_allocatable": 11.0}
+    pt_tamper = {"cost_allocated": 8.0, "budget_allocatable": 8.0}
     ok(contract_findings(ex_pt_raw, pt_ok, unc) == [] and len(contract_findings(ex_pt_raw, pt_short, unc)) == 1
+       and len(contract_findings(ex_pt_raw, pt_tamper, unc)) == 1
        and contract_findings(ex_ev_raw, good_pt, unc) == []
        and len(contract_findings(ex_ev_raw, dict(good_pt, cost_allocated=0.5,
                                                 plan_rule=dict(good_pt["plan_rule"], point_cost=0.5)), unc)) == 1,
-       "PR14 contract_findings checks constraints.envelope_exact on both point and expected_value plans")
+       "PR14 contract_findings checks constraints.envelope_exact against signed envelope on point & expected_value")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

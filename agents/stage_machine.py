@@ -746,14 +746,22 @@ def owner_accepted_now(run_dir: str, opened: list[dict], lead_ok: bool) -> set[s
     """The open findings whose current kind and remedy class, as this gate reads them, carry the owner's (or, in a lead
     run, the lead's provisional) accept: the answer binds to that fingerprint (FL.answer_fingerprint; hb2 fix 3: not
     the critic's wording), so a finding revised into another kind or remedy class since is not among them (Codex r2 of
-    #344, P1-2: the ledger may keep an older remedy)."""
+    #344, P1-2: the ledger may keep an older remedy). A lead accept never counts for an open critic HIGH finding."""
     answers = FL.owner_answers(run_dir, lead_ok)
+    led = FL.load(run_dir) if lead_ok else {}
     out = set()
     for o in opened:
         fid = str(o.get("id"))
         a = FL.answer_for(answers, fid, kind=o.get("kind") or FL.CRITIC_KIND, fix_requires=o.get("fix_requires"),
                           claim=str(o.get("claim") or ""))
         if a and a.get("decision") == "accept":
+            if a.get("by") == "lead":
+                lf = led.get(fid)
+                chk_o = dict(o, kind=o.get("kind") or getattr(lf, "kind", None) or FL.CRITIC_KIND,
+                             source=o.get("source") or getattr(lf, "source", None),
+                             severity=o.get("severity") if o.get("severity") is not None else getattr(lf, "severity", None))
+                if not FL.lead_answer_allowed(chk_o, a) or (lf is not None and not FL.lead_answer_allowed(lf, a)):
+                    continue
             out.add(fid)
     return out
 
@@ -2889,8 +2897,13 @@ class Machine:
             allow = [i for i in todo if _lead_may_accept(i, led)]
             blocked = [i for i in todo if not _lead_may_accept(i, led)]
             if allow:
-                SS.provisional_answers(self.run_dir, allow, self.st.round,
-                                       plan_changing={i["fingerprint"]: _plan_changing(i) for i in allow})
+                allow_ss = [
+                    dict(i, severity=led[i["finding"]].severity)
+                    if i.get("severity") is None and i.get("finding") in led
+                    and getattr(led[i["finding"]], "severity", None) is not None else i
+                    for i in allow]
+                SS.provisional_answers(self.run_dir, allow_ss, self.st.round,
+                                       plan_changing={i["fingerprint"]: _plan_changing(i) for i in allow_ss})
                 self.st.history.append({"at": _now(), "provisional": [i.get("finding") for i in allow], "by": "lead",
                                         "state": "OWNER_DECISION"})
                 answers, bad = SS.load_answers(self.run_dir)
@@ -3388,16 +3401,22 @@ def _status_line(run_dir: str, status: str | None) -> str:
 def _lead_may_accept(item: dict, ledger: dict | None = None) -> bool:
     """Owner policy (2026-11-24): under --signoff lead, the lead may provisionally accept harness-known
     decision-test / conflict / departure items and non-HIGH findings, never an open critic HIGH finding.
-    Fails closed when a critic finding has missing severity."""
+    Fails closed on missing or unrecognised severity, or when either the ledger or the request item says critic HIGH."""
     fid = item.get("finding")
     f = (ledger or {}).get(fid) if fid else None
     kind = item.get("kind") or (getattr(f, "kind", None) if f is not None else None)
     src = item.get("source") or (getattr(f, "source", None) if f is not None else None)
-    sev = item.get("severity") if item.get("severity") is not None else (
-        getattr(f, "severity", None) if f is not None else None)
-    is_critic = (kind == FL.CRITIC_KIND) or (isinstance(src, str) and src.startswith("critique-"))
-    if is_critic:
-        return sev is not None and str(sev).upper() != "HIGH"
+    is_critic = (kind == FL.CRITIC_KIND) or (isinstance(src, str) and src.startswith("critique"))
+    if not is_critic:
+        return True
+    lsev = getattr(f, "severity", None) if f is not None else None
+    isev = item.get("severity")
+    if lsev is None and isev is None:
+        return False
+    if lsev is not None and not (isinstance(lsev, str) and lsev.upper() in FL.NON_HIGH_SEVERITIES):
+        return False
+    if isev is not None and not (isinstance(isev, str) and isev.upper() in FL.NON_HIGH_SEVERITIES):
+        return False
     return True
 
 
@@ -5449,8 +5468,10 @@ def _self_test() -> int:
             _CTk.decision_test_record = _rec
         ok(len({fa, fb, fc}) == 3 and fc2 == fc and fs1 != fs2,
            f"T_DT_TOOLKIT_FP each backend's finding binds its own decision-test record ({fa}, {fb}, {fc}, {fs1}, {fs2})")
-        # T_OWNER_LEAD_AMEND (1F, D2): an owner-amendment finding under --signoff lead is answered provisionally too
-        d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041")]}}},
+        # T_OWNER_LEAD_AMEND (1F, D2): a non-HIGH owner-amendment finding under --signoff lead is answered
+        # provisionally (owner policy 2026-11-24: critic HIGH amendments pause for the owner; tested by T_LEAD_NO_CRITIC_HIGH)
+        d, T, st = new_run("amend_lead", {"critics": {1: {"critique-domain": [dict(amend, id="D-041",
+                                                                                   severity="MEDIUM")]}}},
                            signoff="lead", max_rounds=2)
         s_a = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
         led_a = FL.load(d)
@@ -7106,6 +7127,19 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
         sh2 = mk(dh, StubTasks(Th.s), None).run()
         ok(sh2 == "completed_scope_declared",
            f"T_LEAD_NO_CRITIC_HIGH_RESUME owner sign releases OWNER_DECISION in a lead run ({sh2})")
+        # Codex r1 P1-1 & P1-2: stale/unknown request severity never overrides a ledger HIGH, and a prior lead MEDIUM
+        # acceptance does not survive escalation to HIGH
+        led_hi = {"D-002": FL.Finding(id="D-002", kind="critique_blocker", severity="HIGH", source="critique-domain",
+                                      status="open")}
+        ok(not _lead_may_accept({"finding": "D-002", "kind": "critique_blocker", "severity": "MEDIUM"}, led_hi)
+           and not _lead_may_accept({"finding": "D-002", "kind": "critique_blocker", "severity": "unknown"}, led_hi)
+           and _lead_may_accept({"finding": "D-001", "kind": "critique_blocker"}, {
+               "D-001": FL.Finding(id="D-001", kind="critique_blocker", severity="MEDIUM", source="critique-domain")}),
+           "T_LEAD_NO_CRITIC_HIGH_GUARD stale/unknown severity refused; legacy MEDIUM request allowed via ledger")
+        esc_hi = {"id": "D-001", "severity": "HIGH", "claim": "net durability is untested",
+                  "fix_requires": "Owner amendment: add a durability decision test."}
+        ok(owner_accepted_now(os.path.join(td, "wr_owner_held"), [esc_hi], True) == set(),
+           "T_LEAD_NO_CRITIC_HIGH_ESC prior lead MEDIUM acceptance does not hold if finding escalates to HIGH")
 
     def pending_post_write():
         # WR9 (Codex r2 of #344, P1-1): the owner accepted D-001 pre-write; the presentation review raises P-001, whose

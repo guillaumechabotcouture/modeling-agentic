@@ -1165,9 +1165,10 @@ def _run_one(A, dt, z0, ben0, cost0, plan, uq_data, out0=None) -> dict:
             if t == "boundary_engine" and str(e).strip() == "optimizer status infeasible":     # #252 review P2-5
                 return _not_run(A, dt, "with the engine's costs at the boundary units no allocation that meets the "
                                        "constraints fits the budget the plan is solved within (the solver proves it infeasible)")
-            if t == "envelope" and getattr(A, "budget_exact", False) and str(e).strip() == "optimizer status infeasible":
-                return _not_run(A, dt, f"at envelope {v} no feasible allocation matches the exact budget "
-                                       "(constraints.envelope_exact: true; the solver proves it infeasible)")
+            if getattr(A, "budget_exact", False) and str(e).strip() == "optimizer status infeasible":
+                return _not_run(A, dt, f"at {v} no feasible allocation matches the exact budget "
+                                       "(constraints.envelope_exact: true; the solver proves it infeasible)",
+                                {"cost_multipliers": dict(mult)} if t == "cost_items" else None)
             if t != "cost_items" or str(e).strip() != "optimizer status infeasible":
                 raise
             # Codex r1: the price case has no affordable plan; the record keeps the prices and says why

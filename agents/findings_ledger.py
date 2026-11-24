@@ -507,6 +507,8 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         if f.id in signed:
             return f.status == "owner_accepted"
         a = answer_for(answers, f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim)
+        if not lead_answer_allowed(f, a):
+            return False
         # the answer that binds it now, and the status says that answer (Codex r2 of #357, P1-1)
         return a is not None and {"accept": "owner_accepted", "decline": "owner_declined"}.get(a.get("decision")) \
             == f.status
@@ -585,7 +587,16 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         if not f.scope_declarable:
             f.resolution_type = "fix"
         a = answer_for(answers, f.id, kind=f.kind, fix_requires=f.fix_requires, claim=f.claim)   # hb2 fix 3
+        if not lead_answer_allowed(f, a):
+            a = None
         ans = a.get("decision") if a and str(a.get("finding")) == f.id else None
+        if ans is None and f.status == "owner_accepted" and f.id not in signed \
+                and not lead_answer_allowed(f, {"by": "lead"}):
+            last_acc = next((e for e in reversed(f.events or []) if isinstance(e, dict)
+                             and e.get("status") == "owner_accepted"), {})
+            if last_acc.get("by") == "lead":
+                f.status, f.blocking = "open", True
+                _event(f, round_n, "open", "policy", "lead acceptance does not hold after escalation to critic HIGH")
         if ans is None and f.resolution_type == "owner_decision" and f.status in ("open", "declared") \
                 and any(isinstance(e, dict) and e.get("by") in ("owner", "lead") for e in f.events):
             f.resolution_type = "fix"        # answered as it was before; revised since, so it is asked again
@@ -616,6 +627,26 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             _event(f, round_n, "open", "gate", "the accepted decision test reads differently now")
     save(run_dir, led)
     return led, problems
+
+
+NON_HIGH_SEVERITIES = ("MEDIUM", "LOW", "INFO")
+
+
+def lead_answer_allowed(finding_or_item, answer: dict | None) -> bool:
+    """Owner policy (2026-11-24): a lead answer never counts for an open critic HIGH finding (fails closed when a
+    critic finding has missing or unrecognised severity). An owner answer always counts."""
+    if not isinstance(answer, dict) or answer.get("by") != "lead":
+        return True
+    if isinstance(finding_or_item, dict):
+        kind, src, sev = finding_or_item.get("kind"), finding_or_item.get("source"), finding_or_item.get("severity")
+    else:
+        kind = getattr(finding_or_item, "kind", None)
+        src = getattr(finding_or_item, "source", None)
+        sev = getattr(finding_or_item, "severity", None)
+    is_critic = (kind == CRITIC_KIND) or (isinstance(src, str) and src.startswith("critique"))
+    if not is_critic:
+        return True
+    return isinstance(sev, str) and sev.upper() in NON_HIGH_SEVERITIES
 
 
 def open_findings(led: dict[str, Finding], blocking_only: bool = False) -> list[Finding]:

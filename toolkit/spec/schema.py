@@ -1708,6 +1708,13 @@ def _validate_uncertainty(s, pnames) -> list[str]:
         if isinstance(u.get("affordability"), dict) and u["affordability"].get("enforce"):
             bad.append("constraints.envelope_exact: cannot be combined with uncertainty.affordability.enforce "
                        "(a reserve would hold back part of an exact envelope)")
+        if any(isinstance(it, dict) and it.get("basis") == "per_outcome"
+               for it in (s.raw.get("options") or {}).get("cost_items") or []):
+            bad.append("constraints.envelope_exact: cannot be combined with per_outcome cost items "
+                       "(package costs must stay fixed across draws)")
+        if ((s.raw.get("analysis") or {}).get("sensitivity") or {}).get("cost_items"):
+            bad.append("constraints.envelope_exact: cannot be combined with analysis.sensitivity.cost_items "
+                       "(unit-cost multipliers can make an exact supply infeasible)")
     return bad
 
 
