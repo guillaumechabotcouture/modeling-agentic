@@ -20,13 +20,15 @@ Payload (canonical JSON, sorted keys): purpose, kind ("decision_spec" | "scope_d
 directory's name), artifacts ({file: sha256} approved), decision, signed_at. Verification fails closed: no public key,
 a bad signature, another run, or an artifact hash that differs from the record or the file refuses.
 
-Legacy. An owner record with no signature, made before LEGACY_CUTOFF_UTC, still counts, labelled "unsigned
-(legacy)", so in-flight runs are not stranded; one made after it is refused. A self-test's fixture record that has no
-time at all counts as legacy only while the test key is active.
+Legacy. An owner record with no signature counts, labelled "unsigned (legacy)", only while it is verified before
+LEGACY_CUTOFF_UTC by the verifier's clock (the record's own timestamp is unsigned and never consulted), so in-flight
+runs are not stranded; from the cutoff on every unsigned owner record is refused with the sign command.
 
-Test key. A process started with --self-test, or one whose MA_OWNER_TEST_KEY holds a hex key (such a process exports
-it for its children), signs and verifies with a throwaway key: no keychain, no tracked public key. main.py refuses a
-run with MA_OWNER_TEST_KEY set, and agents get it blanked (agents/enforcement.py filtered_env).
+Test key. Only an explicit in-process opt-in turns on a throwaway key: `enable_test_key()`, which a process started
+as a self-test (`--self-test` in its own argv: every entry point routes that flag to its self-test, never to a sign,
+resume or run path) calls on first use, and `keyed_argv`, with which a self-test starts a child that opts in
+explicitly. No environment variable is consulted, so a production sign or verification always uses the keychain
+and the tracked public key.
 
     python3 scripts/lib/owner_key.py --self-test
 """
@@ -45,7 +47,6 @@ PUB_FILE = os.path.join(ROOT, "cloud", "budget_owner.pub")
 KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT = "modeling-agentic-budget-owner", "owner"
 PURPOSE = "modeling-agentic/owner-signoff/v1"
 LEGACY_CUTOFF_UTC = "2026-11-25T00:00:00+00:00"   # the owner may move it (docs: changes/owner-sign.md)
-TEST_ENV = "MA_OWNER_TEST_KEY"
 SPEC, SHEET = "decision_spec.yaml", "decision_spec.signoff_sheet.md"
 SCOPE_REQUEST = "scope_signoff_request.json"
 HOW_SPEC = "the owner signs from their own shell: python3 agents/stage_machine.py sign <run_dir> --by owner"
@@ -163,12 +164,27 @@ def verify_bytes(msg: bytes, sig_hex, pub_hex: str) -> None:
         raise OwnerKeyError("the signature does not verify against the owner's public key") from None
 
 
+_TEST: dict = {"secret": None, "now": None}
+
+
+def enable_test_key(secret_hex: str | None = None) -> str:
+    """The explicit, in-process opt-in to a throwaway key (self-tests only): this process then signs and verifies with
+    it, never the keychain or the tracked public key. Nothing in the environment turns it on."""
+    _TEST["secret"] = secret_hex or _TEST["secret"] or os.urandom(32).hex()
+    return _TEST["secret"]
+
+
+def keyed_argv(cmd: list) -> list:
+    """A self-test's child command that opts in to this process's throwaway key (passed on its command line)."""
+    code = ("import runpy, sys; sys.path.insert(0, sys.argv[1]); from lib import owner_key as K; "
+            "K.enable_test_key(sys.argv[2]); sys.argv = sys.argv[3:]; runpy.run_path(sys.argv[0], run_name='__main__')")
+    return [cmd[0], "-c", code, os.path.join(ROOT, "scripts"), enable_test_key(), *cmd[1:]]
+
+
 def _test_secret() -> str | None:
-    s = os.environ.get(TEST_ENV) or None
-    if s is None and "--self-test" in sys.argv:
-        s = os.urandom(32).hex()
-        os.environ[TEST_ENV] = s          # the self-test's child processes sign with the same throwaway key
-    return s
+    if _TEST["secret"] is None and "--self-test" in sys.argv:
+        enable_test_key()       # a process started as a self-test (every entry point routes --self-test there)
+    return _TEST["secret"]
 
 
 def test_key_active() -> bool:
@@ -216,16 +232,21 @@ def verify(doc, kind: str, run_dir: str) -> dict:
     return p
 
 
-def _legacy(at) -> bool:
-    """An unsigned owner record that still counts: made before the cutoff (or, in a self-test, a fixture with no time)."""
-    if at is None:
-        return test_key_active()
-    try:
-        t = _dt.datetime.fromisoformat(str(at).replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    t = t if t.tzinfo else t.replace(tzinfo=_dt.timezone.utc)
-    return t < _dt.datetime.fromisoformat(LEGACY_CUTOFF_UTC)
+def set_test_now(iso: str | None) -> None:
+    """Self-tests only (with the test key): the verification time the legacy grace period is judged at."""
+    if not test_key_active():
+        raise OwnerKeyError("set_test_now needs the self-test key")
+    _TEST["now"] = iso
+
+
+def _legacy() -> bool:
+    """An unsigned owner record counts only while it is verified before the cutoff: the time is the verifier's clock,
+    never the record's own (unsigned, so forgeable) timestamp. After the cutoff every unsigned owner record is
+    refused. A self-test is judged at its set time, by default just before the cutoff (its fixtures are unsigned)."""
+    now = _dt.datetime.now(_dt.timezone.utc)
+    if test_key_active():
+        now = _dt.datetime.fromisoformat(_TEST["now"] or "2026-11-24T00:00:00+00:00")
+    return now < _dt.datetime.fromisoformat(LEGACY_CUTOFF_UTC)
 
 
 def _file_sha(run_dir: str, rel: str) -> str | None:
@@ -277,7 +298,7 @@ def spec_check(rec, run_dir: str) -> tuple[str, str]:
         return "not_owner", ""
     sig = rec.get("owner_signature")
     if sig is None:
-        if _legacy(rec.get("signed_at") or rec.get("at")):
+        if _legacy():
             return "legacy", "unsigned (legacy)"
         return "refused", f"the owner's sign-off of {SPEC} carries no owner signature; {HOW_SPEC}"
     try:
@@ -311,7 +332,7 @@ def scope_check(run_dir: str, fp: str, a) -> tuple[str, str]:
         return "not_owner", ""
     sig = a.get("owner_signature")
     if sig is None:
-        if _legacy(a.get("at")):
+        if _legacy():
             return "legacy", "unsigned (legacy)"
         return "refused", f"the owner's answer to {a.get('finding')} carries no owner signature; {HOW_SCOPE}"
     try:
@@ -327,6 +348,53 @@ def scope_check(run_dir: str, fp: str, a) -> tuple[str, str]:
 
 
 # ---- self-test -------------------------------------------------------------------------------
+
+_OK12_CHILD = r"""
+import json, os, sys
+root, rd = sys.argv[1], sys.argv[2]
+for p in ("", "scripts", "agents", "cloud", os.path.join("tools", "run_console")):
+    sys.path.insert(0, os.path.join(root, p))
+from lib import owner_key as K
+reached = []
+def deny(self):
+    reached.append(1)
+    raise K.OwnerKeyError("keychain reached")
+K.Keychain.read_into = deny       # never the owner's dialog: the real keychain path is proved by reaching this
+import budget as B, decision_brief as DB, run_console as RC, scope_signoff as SS, stage_machine as SM
+from toolkit.spec import signoff as SO
+out = {"active": K.test_key_active(), "scope_signoff": sorted(SS.load_answers(rd)[0]),
+       "run_console": sorted(RC._scope_answers(rd, SS.SIGNOFF)[0]),
+       "stage_machine": K.spec_check(SM._signoff(rd), rd)[0], "budget_keychain": isinstance(B._ENV.keys(), K.Keychain)}
+for name, rec in (("stage_machine sign", SM._signoff(rd)), ("decision_brief sign", dict(SM._signoff(rd), x=DB.BRIEF))):
+    try:
+        K.sign_spec(rd, rec)
+        out[name] = "signed"
+    except K.OwnerKeyError as e:
+        out[name] = str(e)
+out["keychain_reads"] = len(reached)
+print(json.dumps(out))
+"""
+
+
+def _ok12(ok, rd: str, rec: dict, answer: dict) -> None:
+    """OK12 (coordinator 2): a process that is not a self-test never uses the test key, whatever its environment: the
+    verification in each entry point (scope_signoff, run_console, stage_machine) refuses a test-key signature, signing
+    (stage_machine, decision_brief) goes to the keychain, and the budget signs with the keychain."""
+    json.dump(rec, open(os.path.join(rd, "decision_spec.signoff.json"), "w"))
+    json.dump({"answers": {"fp1": answer}}, open(os.path.join(rd, "scope_signoff.json"), "w"))
+    env = {**os.environ, "MA_OWNER_TEST_KEY": enable_test_key()}
+    r = subprocess.run([sys.executable, "-c", _OK12_CHILD, ROOT, rd], env=env, capture_output=True, text=True,
+                       timeout=300, cwd=ROOT)
+    try:
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        got = {"error": (r.stderr or r.stdout)[-600:]}
+    ok(got.get("active") is False and got.get("scope_signoff") == [] and got.get("run_console") == []
+       and got.get("stage_machine") == "refused" and got.get("budget_keychain") is True
+       and "keychain reached" in str(got.get("stage_machine sign")) and "keychain reached" in
+       str(got.get("decision_brief sign")) and got.get("keychain_reads") == 2,
+       f"OK12 (coordinator 2) outside a self-test, with MA_OWNER_TEST_KEY set, every entry point refuses a test-key "
+       f"signature and signs only through the keychain ({got})")
 
 def _self_test() -> int:
     import tempfile
@@ -373,11 +441,14 @@ def _self_test() -> int:
         open(os.path.join(rd, SPEC), "w").write("a: 1\n")
         bad_rec = dict(rec, sha256={SPEC: sha, "data/x.json": "ee"})
         ok(spec_check(bad_rec, rd)[0] == "refused", "OK4b a record hash that differs from the signed one is refused")
-        late = {"signed_by": "owner", "signed_at": "2026-12-01T00:00:00+00:00", "sha256": {SPEC: sha}}
-        early = dict(late, signed_at="2026-11-20T10:00:00+00:00")
-        ok(spec_check(late, rd)[0] == "refused" and spec_check(early, rd) == ("legacy", "unsigned (legacy)")
-           and spec_check(dict(early, signed_at="garbage"), rd)[0] == "refused",
-           "OK5 an unsigned owner record counts only before the cutoff, labelled unsigned (legacy)")
+        unsigned = {"signed_by": "owner", "signed_at": "2026-11-20T10:00:00+00:00", "sha256": {SPEC: sha}}
+        before = spec_check(unsigned, rd)
+        set_test_now(LEGACY_CUTOFF_UTC)
+        after = [spec_check(dict(unsigned, signed_at=t), rd)[0] for t in ("2026-11-20T10:00:00+00:00", None, "x")]
+        set_test_now(None)
+        ok(before == ("legacy", "unsigned (legacy)") and after == ["refused"] * 3,
+           f"OK5 (coordinator 1) an unsigned owner record counts, labelled unsigned (legacy), only while verified before "
+           f"the cutoff; from it on, back-dated or not, it is refused ({before}, {after})")
         ok(spec_check({"signed_by": "lead", "sha256": {SPEC: sha}}, rd)[0] == "not_owner"
            and spec_check(dict(rec, signed_by="lead"), rd)[0] == "not_owner",
            "OK6 a lead record is never the owner's, signature or not")
@@ -390,23 +461,28 @@ def _self_test() -> int:
            and scope_check(rd, "fp1", dict(a, round=3))[0] == "refused"
            and scope_check(rd, "fp1", dict(a, at="2026-12-01T00:00:00+00:00"))[0] == "refused",
            "OK7 a scope answer verifies only for its fingerprint, finding, decision and time")
-        ok(scope_check(rd, "fp1", {"finding": "F1", "decision": "accept", "by": "owner", "at": "2026-12-02T00:00:00Z"}
-                       )[0] == "refused" and scope_check(rd, "fp1", dict(a, by="lead"))[0] == "not_owner",
-           "OK7b an unsigned owner answer after the cutoff is refused; a lead's is never the owner's")
+        plain = {"finding": "F1", "decision": "accept", "by": "owner", "at": "2026-11-20T00:00:00Z"}
+        legacy_now = scope_check(rd, "fp1", plain)[0]
+        set_test_now("2026-12-02T00:00:00+00:00")
+        late = scope_check(rd, "fp1", plain)[0]
+        set_test_now(None)
+        ok(legacy_now == "legacy" and late == "refused" and scope_check(rd, "fp1", dict(a, by="lead"))[0] == "not_owner",
+           "OK7b an unsigned owner answer is refused once verified after the cutoff; a lead's is never the owner's")
         ok(spec_check(dict(rec, owner_signature=ssig), rd)[0] == "refused",
            "OK8 a scope signature never passes as a spec sign-off (kind is signed)")
         budget_like = {"alg": "ed25519", "payload": {"scope": "f6", "usd": 1.0}, "signature": sig["signature"]}
         ok(spec_check(dict(rec, owner_signature=budget_like), rd)[0] == "refused",
            "OK8b a document without the sign-off purpose is refused")
-        saved = os.environ.pop(TEST_ENV)
+        saved, _TEST["secret"] = _TEST["secret"], None
         argv, sys.argv = sys.argv, ["x"]
         try:
             import unittest.mock as um
             with um.patch(__name__ + ".PUB_FILE", os.path.join(td, "none.pub")):
                 st, why = spec_check(rec, rd)
         finally:
-            sys.argv, os.environ[TEST_ENV] = argv, saved
+            sys.argv, _TEST["secret"] = argv, saved
         ok(st == "refused" and "public key" in why, f"OK9 no public key: refused (fail closed): {why[:100]}")
+        _ok12(ok, rd, rec, a)
     k = Keychain(run=lambda argv, **kw: (_ for _ in ()).throw(FileNotFoundError("security")))
     try:
         k.read_into()

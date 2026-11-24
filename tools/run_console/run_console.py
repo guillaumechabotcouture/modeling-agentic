@@ -2590,7 +2590,9 @@ def _self_test() -> int:
         ok(r["ok"] and seen and seen[0][0][1:4] == ["cloud/run_cluster.py", "c.py", "sign"]
            and f"{FP}: decline" in seen[0][1] and seen[0][0][-1] == "remote note",
            "RC5c a mirrored run is answered through run_cluster.py <config> sign <answers.yaml> ... <note>")
-        r = answer_scope(rd, {FP: "accept"}, "the plan stands", True, fingerprints=FPS)
+        from lib import owner_key as OK          # the child signs with this self-test's throwaway key (owner-sign)
+        r = answer_scope(rd, {FP: "accept"}, "the plan stands", True, fingerprints=FPS,
+                         runner=lambda cmd, **k: subprocess.run(OK.keyed_argv(cmd), **k))
         ans, bad = SS.load_answers(rd)
         a = ans.get(FP) or {}
         ok(r["ok"] and not bad and a.get("decision") == "accept" and a.get("by") == "owner"

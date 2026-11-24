@@ -951,8 +951,6 @@ def filtered_env(environ: dict[str, str], allow_cloud: bool) -> dict[str, str]:
     overrides.update(cache_env(environ))
     if not allow_cloud:
         overrides.update({k: "" for k in environ if k.startswith(CLOUD_ENV_PREFIXES)})
-    if environ.get("MA_OWNER_TEST_KEY"):        # owner-sign: a self-test's throwaway owner key never reaches an agent
-        overrides["MA_OWNER_TEST_KEY"] = ""
     return overrides
 
 

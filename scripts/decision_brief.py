@@ -879,8 +879,9 @@ def _self_test_lead_and_geometry(ok) -> None:
                 g["features"][0]["properties"]["note"] = "changed after the sheet"
                 json.dump(g, open(os.path.join(d, "b.geojson"), "w"))
             import subprocess
-            r = subprocess.run([sys.executable, os.path.abspath(__file__), "sign", d, "--by", "owner",
-                                "--accept-proposed"], env=env, capture_output=True, text=True)
+            from lib import owner_key as OK     # the child signs with this self-test's throwaway key (owner-sign)
+            r = subprocess.run(OK.keyed_argv([sys.executable, os.path.abspath(__file__), "sign", d, "--by", "owner",
+                                              "--accept-proposed"]), env=env, capture_output=True, text=True)
             appr = {}
             if os.path.exists(os.path.join(d, GEO.SIGNOFF_FILE)):
                 appr = json.load(open(os.path.join(d, GEO.SIGNOFF_FILE))).get("approvals") or {}
@@ -1169,8 +1170,9 @@ def _self_test_held_out(ok) -> None:
                           f"{got}")
     with tempfile.TemporaryDirectory() as d:
         run_dir(d, {"value": 1.0, "source": "s", "reason": "r", "basis": "literature"})
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), "sign", d, "--by", "owner",
-                            "--accept-proposed"], env=env, capture_output=True, text=True, timeout=300)
+        from lib import owner_key as OK         # the child signs with this self-test's throwaway key (owner-sign)
+        r = subprocess.run(OK.keyed_argv([sys.executable, os.path.abspath(__file__), "sign", d, "--by", "owner",
+                                          "--accept-proposed"]), env=env, capture_output=True, text=True, timeout=300)
         ok(r.returncode == 0 and status(d) == "signed",
            f"DB39 a spec value with a literature basis signs through the brief CLI (exit {r.returncode}): "
            f"{r.stderr[-300:]!r}")

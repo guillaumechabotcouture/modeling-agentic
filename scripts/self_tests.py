@@ -169,11 +169,8 @@ def _run_one(python: str, repo: str, path: str, timeout_s: float | None = None):
     """(path, exit code or None when timed out, output, seconds). Each self-test runs in its own session; one that
     outlives `timeout_s` is killed with its whole process group (its children too)."""
     t0 = time.time()
-    # owner-sign (scripts/lib/owner_key.py): every self-test and its children sign with a throwaway owner key, never
-    # the keychain, even a child started before its parent first used the key (Codex r1 15)
-    env = {**os.environ, "MA_OWNER_TEST_KEY": os.environ.get("MA_OWNER_TEST_KEY") or os.urandom(32).hex()}
     p = subprocess.Popen([python, path, MARKER], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, text=True, start_new_session=True, env=env)
+                         stdin=subprocess.DEVNULL, text=True, start_new_session=True)
     try:
         out, _ = p.communicate(timeout=timeout_s if timeout_s and timeout_s > 0 else None)
         return path, p.returncode, out or "", time.time() - t0

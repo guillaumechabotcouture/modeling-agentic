@@ -4041,10 +4041,15 @@ def _t_owner_sign(ok, new_run, Spike, Stub) -> None:
     ok(s == "paused:awaiting_signoff" and any("refused" in str(x) and "--by owner" in str(x) for x in logs),
        f"OS1 a changed owner signature is refused at SIGN, saying how to sign ({s}; {logs[-2:]})")
     unsigned = {k: v for k, v in good.items() if k != "owner_signature"}
-    s, _ = at_sign(dict(unsigned, at="2026-12-01T00:00:00+00:00"))
+    from lib import owner_key as OK
+    OK.set_test_now(OK.LEGACY_CUTOFF_UTC)           # verified from the cutoff on: an unsigned record is refused
+    try:
+        s, _ = at_sign(dict(unsigned, at="2026-11-20T00:00:00+00:00"))
+    finally:
+        OK.set_test_now(None)
     s2, _ = at_sign(dict(good, by="lead"))
     ok(s == "paused:awaiting_signoff" and s2 == "paused:awaiting_signoff" and load_state(d).state == "SIGN",
-       f"OS2 an unsigned owner record after the cutoff, or a lead's record, does not release an owner run ({s}, {s2})")
+       f"OS2 an unsigned owner record verified from the cutoff on (even back-dated), or a lead's record, does not release an owner run ({s}, {s2})")
     put(good)
     m = Spike(d, Stub(T.s), None, log=quiet, cross_engine_check=False)
     for _ in range(4):
@@ -4081,7 +4086,7 @@ def _t_owner_sign(ok, new_run, Spike, Stub) -> None:
     m.step()
     left = [h for h in load_state(d).history if h.get("from") == "SIGN" and h.get("to") == "ENGINE_CHOICE"]
     ok(left and left[-1].get("owner_signature") == "unsigned (legacy)",
-       f"OS5 an unsigned owner record from before the cutoff counts, labelled unsigned (legacy) ({left[-1:]})")
+       f"OS5 an unsigned owner record verified before the cutoff counts, labelled unsigned (legacy) ({left[-1:]})")
 
 
 def _self_test_lead_amend(ok, td: str) -> None:

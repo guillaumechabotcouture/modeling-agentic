@@ -1320,21 +1320,26 @@ def _self_test() -> int:
         why = owner_refusals(d).get("fp2", "")
         ok(sorted(ans) == ["fp1"] and "--by owner" in why and status(d, verified=False) == "awaiting",
            f"OS2 an answer changed after signing is no answer, and the refusal says how to sign: {why[:120]}")
+        from lib import owner_key as OK
         raw["fp2"] = {"finding": "f2", "decision": "accept", "by": "owner", "at": "2026-12-01T00:00:00+00:00"}
         raw["fp3"] = {"finding": "f3", "decision": "accept", "by": "owner", "at": "2026-11-20T00:00:00+00:00"}
         json.dump({"answers": raw}, open(os.path.join(d, SIGNOFF), "w"))
-        ans, _ = load_answers(d)
-        ok(sorted(ans) == ["fp1", "fp3"] and owner_legacy(d, ["fp1", "fp3"]) == ["f3"],
-           f"OS3 an unsigned owner answer counts only before the cutoff, listed as unsigned (legacy) ({sorted(ans)})")
+        before = (sorted(load_answers(d)[0]), owner_legacy(d, ["fp1", "fp2", "fp3"]))
+        OK.set_test_now(OK.LEGACY_CUTOFF_UTC)
+        after = sorted(load_answers(d)[0])
+        OK.set_test_now(None)
+        ok(before == (["fp1", "fp2", "fp3"], ["f2", "f3"]) and after == ["fp1"],
+           f"OS3 unsigned owner answers count, listed as unsigned (legacy), only while verified before the cutoff, "
+           f"whatever their own time ({before}, {after})")
         raw["fp4"] = dict(raw["fp1"], by="lead")
         json.dump({"answers": raw}, open(os.path.join(d, SIGNOFF), "w"))
         ok(not _signer_ok(load_answers(d)[0]["fp4"]["by"], "owner") and "fp4" not in owner_refusals(d),
            "OS4 a lead's answer never counts as the owner's, even with an owner signature attached")
-        raw["fp9"] = {"finding": "f9", "decision": "decline", "by": "owner", "at": "2026-12-03T00:00:00+00:00"}
-        json.dump({"answers": raw}, open(os.path.join(d, SIGNOFF), "w"))
+        OK.set_test_now(OK.LEGACY_CUTOFF_UTC)
         sign(d, "owner", {"f1": "accept", "f2": "decline"})
-        ok(sorted(load_answers(d)[0]) == ["fp1", "fp2", "fp3", "fp4"] and list(owner_refusals(d)) == ["fp9"]
-           and "fp9" in json.load(open(os.path.join(d, SIGNOFF)))["answers"],
+        got5 = (sorted(load_answers(d)[0]), list(owner_refusals(d)))
+        OK.set_test_now(None)
+        ok(got5 == (["fp1", "fp2", "fp4"], ["fp3"]) and "fp3" in json.load(open(os.path.join(d, SIGNOFF)))["answers"],
            "OS5 the owner signs again over a refused answer, and the new signed answer counts; an unrelated refused "
            "answer stays in the record (Codex r1 11)")
     if fails:

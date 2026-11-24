@@ -648,9 +648,7 @@ def _run_self_test() -> int:
        f"V1b (Phase 31) 1-hour prompt cache for the lead and subagents, 5m on request: {ov}")
     ok("AZ_BATCH_ACCOUNT" not in enforcement.filtered_env(env, allow_cloud=True),
        "V1 cloud creds kept with --cloud")
-    # OSK1-OSK2 (owner-sign): no agent reaches the owner's key, and a self-test's throwaway key never reaches an agent
-    ok(enforcement.filtered_env({**env, "MA_OWNER_TEST_KEY": "ab"}, True).get("MA_OWNER_TEST_KEY") == "",
-       "OSK1 a self-test's owner key is blanked in the agents' environment")
+    # OSK2 (owner-sign): no agent reaches the owner's key
     keyed = ["security find-generic-password -s modeling-agentic-budget-owner -w", "echo x | security -i",
              "python3 cloud/budget.py init-key", "python3 -c 'from lib import owner_key'"]
     ok(all(enforcement.owner_command_reason(c) for c in keyed)
@@ -1398,10 +1396,6 @@ def main() -> int:
 
     if args.self_test:
         return _run_self_test()
-    if os.environ.get("MA_OWNER_TEST_KEY"):
-        # owner-sign (scripts/lib/owner_key.py): a self-test's throwaway owner key would verify its own signatures
-        print("REFUSED: MA_OWNER_TEST_KEY is set (a self-test's owner key); unset it to run", file=sys.stderr)
-        return 1
     try:
         pipeline = pipeline_id.select(args.v1, args.v2)
     except pipeline_id.PipelineError as e:    # --v1: pipeline v1 is retired (owner, 2026-11-20)
