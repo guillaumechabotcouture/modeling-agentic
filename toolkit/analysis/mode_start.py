@@ -11,11 +11,14 @@ and well identified. This module samples the same Problem another way:
 
 1. Modes. The 2^6 scrambled Sobol points over the prior (as observed_targets._scan_start) are scored; the best
    `MODE_STARTS` with a finite likelihood are each moved to the posterior mode in z = Phi^-1(F(x)) coordinates by
-   L-BFGS-B, with central-difference gradients evaluated as one batch per step. At each mode, the Laplace
-   covariance comes from a finite-difference Hessian, its eigenvalues floored at 1 (the prior's precision in z:
-   the covariance is never wider than the prior). A mode whose Laplace mass is below the best one's by more than
-   MODE_MASS_GAP holds a negligible share of the posterior and is dropped. The others seed the chains in turn, the
-   heaviest first, so modes that compete are each given chains and R-hat compares them.
+   L-BFGS-B, with central-difference gradients evaluated as one batch per step. An optimum is verified when every
+   point of its last gradient had a finite likelihood. At each mode, the Laplace covariance comes from a
+   finite-difference Hessian (its diagonal only above HESS_FULL_MAX parameters), its eigenvalues floored at 1 (the
+   prior's precision in z: the covariance is never wider than the prior). Optima of one basin (within one Laplace
+   sd of each other) are one mode. A mode is dropped only when both its peak density and its Laplace mass are far
+   below the best one's (DENSITY_GAP and MODE_MASS_GAP): a spike or a wide basin of equal height is kept. Every kept
+   mode gets at least one chain (more chains than the threshold when there are more modes), so modes that compete
+   are each sampled and R-hat compares them.
 2. Starts. Each chain starts at its mode plus DISPERSION times a draw from the Laplace covariance. The starts are
    overdispersed, so R-hat still compares chains that began apart.
 3. Adaptation per chain. Each chain's proposal starts from its mode's Laplace covariance and adapts on that chain's
@@ -45,7 +48,9 @@ if ROOT not in sys.path:
 
 SCAN_LOG2 = 6                     # the start scan: 2^6 scrambled Sobol points over the prior (one batch)
 MODE_STARTS = 8                   # the best scan points moved to a mode
-MODE_MASS_GAP = math.log(1000.0)  # a mode with under 1/1000 of the best one's Laplace mass is dropped
+MODE_MASS_GAP = math.log(1000.0)  # with DENSITY_GAP: a mode far below the best in both is dropped
+DENSITY_GAP = 20.0                # nats of peak log density
+HESS_FULL_MAX = 40                # above this many parameters the Hessian is its diagonal (2d + 1 points)
 DISPERSION = 2.0                  # starts: mode + DISPERSION x a Laplace draw (overdispersed)
 GRAD_H = 1e-3                     # central-difference step of the gradient, in z
 HESS_H = 2e-3                     # finite-difference step of the Hessian, in z
@@ -75,8 +80,9 @@ def _neg_log_post(P, Z):
 
 
 def _optimise(P, z0, maxiter: int = MAXITER, h: float = GRAD_H):
-    """(z, f, converged): z0 moved to a minimum of the negative log posterior by L-BFGS-B, one batch of 2d + 1 points
-    per gradient. A point with a non-finite neighbour gives no gradient (the search stops there)."""
+    """(z, f, verified): z0 moved to a minimum of the negative log posterior by L-BFGS-B, one batch of 2d + 1 points
+    per gradient. A point with a non-finite neighbour gives no gradient (the search stops there), so the optimum is
+    verified only when the search converged and every point of the gradient at it had a finite likelihood."""
     from scipy.optimize import minimize
     z0 = np.asarray(z0, float)
     d = len(z0)
@@ -85,47 +91,42 @@ def _optimise(P, z0, maxiter: int = MAXITER, h: float = GRAD_H):
     def fg(z):
         f = _neg_log_post(P, z[None, :] + offsets)
         if not np.isfinite(f[0]):
-            return 1e300, np.zeros(d)
+            return 1e300, np.zeros(d), False
         if not np.all(np.isfinite(f)):
-            return float(f[0]), np.zeros(d)
-        return float(f[0]), (f[1:d + 1] - f[d + 1:]) / (2.0 * h)
+            return float(f[0]), np.zeros(d), False
+        return float(f[0]), (f[1:d + 1] - f[d + 1:]) / (2.0 * h), True
     f0 = fg(z0)[0]
     try:
-        r = minimize(fg, z0, jac=True, method="L-BFGS-B", options={"maxiter": int(maxiter)})
+        r = minimize(lambda z: fg(z)[:2], z0, jac=True, method="L-BFGS-B", options={"maxiter": int(maxiter)})
         if np.all(np.isfinite(r.x)) and np.isfinite(r.fun) and r.fun <= f0:
-            return np.asarray(r.x, float), float(r.fun), bool(r.success)
+            x = np.asarray(r.x, float)
+            return x, float(r.fun), bool(r.success) and fg(x)[2]
     except (ValueError, FloatingPointError, np.linalg.LinAlgError):
         pass
     return z0, float(f0), False
 
 
 def _hessian(P, z, h: float = HESS_H):
-    """Central finite-difference Hessian of the negative log posterior at z (one batch of 1 + 2d + 2d(d-1)
-    points), or None when a point has no finite likelihood."""
+    """Central finite-difference Hessian of the negative log posterior at z, or None when a point has no finite
+    likelihood. The off-diagonal terms are evaluated one row of pairs at a time (bounded memory); above HESS_FULL_MAX
+    parameters only the diagonal (2d + 1 points)."""
     z = np.asarray(z, float)
     d = len(z)
-    pts = [np.zeros(d)]
-    for i in range(d):
-        for s in (1.0, -1.0):
-            e = np.zeros(d)
-            e[i] = s * h
-            pts.append(e)
-    pairs = [(i, k) for i in range(d) for k in range(i + 1, d)]
-    for i, k in pairs:
-        for si, sk in ((1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)):
-            e = np.zeros(d)
-            e[i], e[k] = si * h, sk * h
-            pts.append(e)
-    f = _neg_log_post(P, z + np.asarray(pts))
+    E = h * np.eye(d)
+    f = _neg_log_post(P, np.vstack([z, z + E, z - E]))
     if not np.all(np.isfinite(f)):
         return None
-    H = np.zeros((d, d))
-    for i in range(d):
-        H[i, i] = (f[1 + 2 * i] - 2.0 * f[0] + f[2 + 2 * i]) / h ** 2
-    base = 1 + 2 * d
-    for q, (i, k) in enumerate(pairs):
-        a, b, c, e = f[base + 4 * q: base + 4 * q + 4]
-        H[i, k] = H[k, i] = (a - b - c + e) / (4.0 * h * h)
+    f0 = f[0]
+    H = np.diag((f[1:d + 1] - 2.0 * f0 + f[d + 1:]) / h ** 2)
+    if d > HESS_FULL_MAX:
+        return H
+    for i in range(d - 1):
+        ks = np.arange(i + 1, d)
+        pts = [z + si * E[i] + sk * E[ks] for si, sk in ((1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0))]
+        g = _neg_log_post(P, np.vstack(pts)).reshape(4, len(ks))
+        if not np.all(np.isfinite(g)):
+            return None
+        H[i, ks] = H[ks, i] = (g[0] - g[1] - g[2] + g[3]) / (4.0 * h * h)
     return H
 
 
@@ -139,15 +140,46 @@ def laplace(H, d: int):
     return (V / w) @ V.T, float(np.sum(np.log(w)))
 
 
-def find_modes(P, starts: int = MODE_STARTS) -> dict:
-    """{modes, dropped, scanned, scan_finite}: the posterior modes reached from the best scan points, each with its z,
-    negative log posterior, Laplace covariance and log mass (-f - log det(H) / 2), heaviest first; the ones more than
-    MODE_MASS_GAP below the heaviest are counted in `dropped` and not kept."""
+def _select(found: list, d: int) -> tuple:
+    """(kept, dropped): the optima grouped into modes (an optimum within one Laplace sd, in the Mahalanobis sense, of
+    a better one is that mode), the verified ones ranked first; a mode is dropped only when both its peak density and
+    its Laplace mass are far below the best's (DENSITY_GAP, MODE_MASS_GAP). Heaviest first."""
+    pool = [m for m in found if m["converged"]] or list(found)
+    pool = sorted(pool, key=lambda m: m["neg_log_post"])
+    modes = []
+    for m in pool:
+        same = False
+        for r in modes:
+            dz = m["z"] - r["z"]
+            try:
+                same = float(dz @ np.linalg.solve(r["cov"], dz)) < 1.0
+            except np.linalg.LinAlgError:
+                same = bool(np.allclose(m["z"], r["z"]))
+            if same:
+                r["optima"] += 1
+                break
+        if not same:
+            modes.append(dict(m, optima=1))
+    if not modes:
+        return [], 0
+    fb = min(m["neg_log_post"] for m in modes)
+    mb = max(m["log_mass"] for m in modes)
+    kept = [m for m in modes if not (m["neg_log_post"] - fb > DENSITY_GAP and mb - m["log_mass"] > MODE_MASS_GAP)]
+    return sorted(kept, key=lambda m: -m["log_mass"]), len(modes) - len(kept)
+
+
+def find_modes(P, starts: int = MODE_STARTS, after_scan=None) -> dict:
+    """{modes, dropped, scanned, scan_finite}: the posterior modes reached from the best scan points (_select), each
+    with its z, negative log posterior, Laplace covariance, log mass (-f - log det(H) / 2) and number of optima.
+    `after_scan()` is called once the scan is evaluated and before any optimisation: the scan explores the prior, the
+    optimisation and the Hessian are part of the fit."""
     from scipy.stats import norm, qmc
     d = len(P.names)
     U = qmc.Sobol(d, scramble=True, seed=11).random_base2(SCAN_LOG2)
     Z0 = norm.ppf(np.clip(U, 1e-9, 1 - 1e-9))
     f = _neg_log_post(P, Z0)
+    if after_scan is not None:
+        after_scan()
     order = [int(i) for i in np.argsort(f, kind="stable") if np.isfinite(f[i])][:int(starts)]
     found = []
     for i in order:
@@ -155,17 +187,18 @@ def find_modes(P, starts: int = MODE_STARTS) -> dict:
         cov, logdet = laplace(_hessian(P, z), d)
         found.append({"z": z, "neg_log_post": fz, "converged": conv, "cov": cov,
                       "log_mass": float(-fz - 0.5 * logdet), "scan_point": i})
-    out = {"modes": [], "dropped": 0, "scanned": int(len(Z0)), "scan_finite": int(np.sum(np.isfinite(f)))}
-    if found:
-        best = max(m["log_mass"] for m in found)
-        kept = [m for m in found if m["log_mass"] >= best - MODE_MASS_GAP]
-        out["modes"] = sorted(kept, key=lambda m: -m["log_mass"])
-        out["dropped"] = len(found) - len(kept)
-    return out
+    kept, dropped = _select(found, d)
+    return {"modes": kept, "dropped": dropped, "optima": len(found), "scanned": int(len(Z0)),
+            "scan_finite": int(np.sum(np.isfinite(f)))}
 
 
 def _chol(S, d):
-    return np.linalg.cholesky((S + S.T) / 2.0 + 1e-12 * np.eye(d))
+    """The Cholesky factor of S as computed; a scale-relative jitter only when it does not factor."""
+    S = (S + S.T) / 2.0
+    try:
+        return np.linalg.cholesky(S)
+    except np.linalg.LinAlgError:
+        return np.linalg.cholesky(S + 1e-10 * max(float(np.trace(S)) / d, 1e-300) * np.eye(d))
 
 
 def _chains(P, rng, th, modes) -> dict:
@@ -173,7 +206,8 @@ def _chains(P, rng, th, modes) -> dict:
     sampling phase and its diagnostics as calibration._metropolis. CalibrationRefused(posterior_mcmc) below the
     floors after the allowed doublings."""
     C = _C()
-    d, K = len(P.names), int(th["chains"])
+    d = len(P.names)
+    K = max(int(th["chains"]), len(modes))          # every kept mode gets at least one chain
     own = [modes[c % len(modes)] for c in range(K)]
     cov0 = np.stack([m["cov"] for m in own])
     L0 = np.stack([_chol(cov0[c], d) for c in range(K)])
@@ -291,6 +325,7 @@ def sample(P, seed: int = 0, modes: dict | None = None, **override) -> dict:
             first = _text(e)
     out["diagnostics"].update(start="posterior_mode", adaptation="per_chain", attempt=attempt,
                               modes_kept=len(found["modes"]), modes_dropped=int(found.get("dropped", 0)),
+                              optima=int(found.get("optima", 0)),
                               **({"first_attempt": first} if first else {}))
     out.update(names=list(P.names), seed=int(seed), sample_id=C._sample_id(P.names, out["rows"]),
                evaluations=P.n_evals, priors={n: P.priors[n].describe() for n in P.names})
@@ -397,6 +432,50 @@ def _self_test() -> int:
     fn = find_modes(Pn)
     ok(fn["modes"] == [] and fn["scan_finite"] == 0, "MS5b no finite scan point: no mode (sample falls back to "
                                                      "calibration.sample's prior start)")
+    # MS6 (Codex r1 P1-1, P1-2): optima of one basin are one mode; a spike or an equal-height wide basin is kept; only a
+    # mode far below in both peak density and Laplace mass is dropped; unverified optima rank after verified ones
+    I6 = np.eye(6)
+
+    def opt(z0, f, cov, conv=True):
+        return {"z": np.full(6, float(z0)), "neg_log_post": f, "converged": conv, "cov": cov,
+                "log_mass": float(-f - 0.5 * np.linalg.slogdet(np.linalg.inv(cov))[1]), "scan_point": 0}
+    a_ = [opt(-1.0, 0.0, 0.01 * I6) for _ in range(4)]
+    b_ = [opt(1.0, 0.7, 0.01 * I6) for _ in range(4)]
+    spike = opt(2.0, 0.0, 1e-6 * I6)
+    stall = opt(-2.0, 50.0, I6)
+    kept, dropped = _select(a_ + b_ + [spike, stall], 6)
+    ok(len(kept) == 3 and dropped == 1 and [m["optima"] for m in kept].count(4) == 2
+       and any(np.allclose(m["z"], 2.0) for m in kept) and not any(np.allclose(m["z"], -2.0) for m in kept),
+       f"MS6 duplicate optima are one mode; a spike of equal height is kept; a stalled point far below is dropped "
+       f"({[(float(m['z'][0]), m['optima']) for m in kept]}, {dropped} dropped)")
+    kept_u, _ = _select([opt(1.0, 0.0, 0.01 * I6, conv=False), opt(-1.0, 0.5, 0.01 * I6)], 6)
+    ok(len(kept_u) == 1 and np.allclose(kept_u[0]["z"], -1.0),
+       "MS6b an unverified optimum is not ranked beside a verified one")
+    # MS7: every kept mode gets at least one chain, also when there are more modes than the chains threshold
+    Pb, _ = _toy(s=0.02)
+    six = [{"z": np.full(6, 0.1 * j), "cov": 1e-4 * I6} for j in range(6)]
+    seen7 = []
+    orig_eval = Pb.evaluate
+
+    def spy(X):
+        seen7.append(len(X))
+        return orig_eval(X)
+    Pb.evaluate = spy
+    try:
+        _chains(Pb, np.random.default_rng(0), dict(C.thresholds(), warmup=1, mcmc_draws=4, mcmc_max_doublings=0),
+                six)
+        ok(False, "MS7 a planted far-apart start refuses")
+    except C.CalibrationRefused:
+        ok(seen7 and seen7[0] == 6, f"MS7 six modes start six chains (more than the threshold's 4): {seen7[:1]}")
+    # MS8 (Codex r1 P2-12): a valid narrow covariance factors as computed, with no absolute jitter
+    Lt = _chol(1e-16 * I6, 6)
+    ok(np.allclose(np.diag(Lt), 1e-8, rtol=1e-6), f"MS8 a covariance of 1e-16 factors with no jitter ({Lt[0, 0]:.3g})")
+    # MS9 (Codex r1 P2-13): above HESS_FULL_MAX parameters the Hessian is its diagonal (2d + 1 points)
+    Pd, _ = _toy(d=HESS_FULL_MAX + 1, s=0.05, mu=[0.5] * (HESS_FULL_MAX + 1))
+    n0 = Pd.n_evals
+    Hd = _hessian(Pd, np.zeros(HESS_FULL_MAX + 1))
+    ok(Hd is not None and Pd.n_evals - n0 == 2 * (HESS_FULL_MAX + 1) + 1 and np.count_nonzero(Hd - np.diag(np.diag(Hd))) == 0,
+       f"MS9 a {HESS_FULL_MAX + 1}-parameter Hessian is its diagonal ({Pd.n_evals - n0} points)")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
