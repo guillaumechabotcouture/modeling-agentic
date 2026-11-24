@@ -33,11 +33,11 @@ REQUIRED_FILES = ("engine.py", "card.yaml", "ENGINE_NOTES.md")
 ALLOWED_NON_PY = frozenset({"card.yaml", "ENGINE_NOTES.md"})
 MAX_INLINE_LITERALS = 16
 _CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
-REQUIRED_SIGNOFF_FILES = (
+REQUIRED_BOUND_FILES = (
     "admission.json", "admission_sheet.md",
     "bench/pack.yaml", "bench/results.yaml", "bench/benchmark_coverage.yaml",
 )
-OPTIONAL_SIGNOFF_FILES = ("bench/fitted.yaml",)
+OPTIONAL_BOUND_FILES = ("bench/fitted.yaml",)
 
 # S2: strict AST import allowlist (§3.2). Anything outside this set is refused before execution.
 ALLOWED_TOP_IMPORTS = frozenset({
@@ -516,7 +516,7 @@ def verify_engine_snapshot(run_dir: str) -> list[str]:
         problems.append(f"artifact_tampered: {e}")
     # Verify ALL mandatory bound files (fail closed when any digest is absent or malformed)
     adm_doc = None
-    for rel_key in REQUIRED_SIGNOFF_FILES:
+    for rel_key in REQUIRED_BOUND_FILES:
         want = bound.get(rel_key)
         if not _is_sha64(want):
             problems.append(f"artifact_tampered: engine_build/signoff.json missing valid digest for {rel_key}")
@@ -538,7 +538,7 @@ def verify_engine_snapshot(run_dir: str) -> list[str]:
         if adm_doc.get("status") != "admitted" or adm_doc.get("snapshot_sha256") != snap_sha:
             problems.append("artifact_tampered: engine_build/admission.json status or snapshot_sha256 inconsistent")
     # Optional bound files (e.g. bench/fitted.yaml): verify whenever signed OR present on disk
-    for rel_key in OPTIONAL_SIGNOFF_FILES:
+    for rel_key in OPTIONAL_BOUND_FILES:
         want = bound.get(rel_key)
         on_disk = os.path.lexists(os.path.join(run_dir, "engine_build", rel_key))
         if want is None and not on_disk:
