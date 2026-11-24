@@ -325,6 +325,8 @@ def _self_test() -> int:
         # a stepped engine other than the analysis's is refused (Codex r2 P1-4)
         sp = os.path.join(d, "decision_spec.yaml")
         raw = yaml.safe_load(open(sp))
+        from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+        _G.register_test_engine("toolkit.engines.hooks:ToyScheduleEngine")
         raw["engine"]["ref"] = "toolkit.engines.hooks:ToyScheduleEngine"
         yaml.safe_dump(raw, open(sp, "w"), sort_keys=False)
         try:

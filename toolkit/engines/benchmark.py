@@ -1561,6 +1561,8 @@ def _self_test_initialisation(ok, pack, eng) -> None:
                "BP55 evidence names a benchmark of the pack or a file beside it (which must exist)")
         ok(validate(dict(p, initialisation={"method": "closed form", "evidence": ["not applicable: no state"]}),
                     eng) == [], "BP55b an engine without a dynamic state says so, with its reason")
+        from toolkit import import_guard as _G  # an unregistered toy, registered for this self-test only
+        _G.register_test_engine("toolkit.engines.benchmark:SharedStateToy")
         sp = dict(pack, engine="toolkit.engines.benchmark:SharedStateToy")
         Shared = importlib.import_module("toolkit.engines.benchmark").SharedStateToy   # the class load_engine builds
         Shared.calls.clear()

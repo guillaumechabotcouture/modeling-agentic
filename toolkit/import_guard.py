@@ -17,7 +17,9 @@ Policies (a module must also be a file of this repo, checked without importing i
 Attribute names starting with "_" are refused. Self-tests may allow a module of their own in-process
 (`allow_for_test`); nothing reads that from a file. The self-test toy engines (TEST_ONLY_REFS) are enabled only by
 code in a self-test process (`allow_test_refs`) and reach its worker processes as a pool initializer's argument
-(`pool_kwargs`), never through the environment.
+(`pool_kwargs`), never through the environment. A spec engine must also be registered (toolkit/spec/schema.py
+REGISTERED_ENGINES); a self-test adds its own toy to that list in-process with `register_test_engine`, carried the
+same way.
 """
 from __future__ import annotations
 
@@ -45,6 +47,11 @@ TEST_ONLY_REFS = {"engine": ("toolkit.spec.toy_engines:ToySpecEngine", "toolkit.
                              "toolkit.spec.toy_engines:ToyDossierEngine")}
 _TEST_REFS: set = set()          # "kind|ref", this process only
 _TEST_STATE: dict = {}           # plain values the self-test hands its workers with the registration (toy log root)
+# Engines a self-test adds to the engine registry (agents/analysis_backend.py ENGINES), this process and the workers it
+# starts with pool_kwargs only. A spec may name only a registered engine (toolkit/spec/schema.py check_engine_ref);
+# this is the one way a test fixture extends that list, and only code can call it: no spec field, file or environment
+# variable is read. The self-test toy engines enabled with allow_test_refs count as registered too.
+_TEST_ENGINES: set = set()
 ENGINE_METHODS = ("describe", "parameters", "run")      # the Engine contract (toolkit/engines/contract.py)
 _MOD = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 _ATTR = re.compile(r"[A-Za-z]\w*")
@@ -72,6 +79,18 @@ def allow_test_refs(kind: str, refs, state: dict | None = None) -> None:
         _TEST_STATE.update(state)
 
 
+def register_test_engine(*refs) -> None:
+    """Self-tests only: add engine references the import policy allows to the engine registry, in this process."""
+    for r in refs:
+        check_ref("engine", r)
+    _TEST_ENGINES.update(refs)
+
+
+def test_engine_registered(ref) -> bool:
+    """Whether a self-test in this process (or its parent, through init_worker) registered `ref` as an engine."""
+    return isinstance(ref, str) and (ref in _TEST_ENGINES or f"engine|{ref}" in _TEST_REFS)
+
+
 def test_state(key: str):
     """A value a self-test registered with allow_test_refs (in this process, or in its parent through init_worker)."""
     return _TEST_STATE.get(key)
@@ -79,9 +98,9 @@ def test_state(key: str):
 
 def worker_registration() -> dict | None:
     """This process's test registration, for a worker process's initializer; None in production."""
-    if not _TEST_REFS:
+    if not _TEST_REFS and not _TEST_ENGINES:
         return None
-    return {"refs": sorted(_TEST_REFS), "state": dict(_TEST_STATE)}
+    return {"refs": sorted(_TEST_REFS), "state": dict(_TEST_STATE), "engines": sorted(_TEST_ENGINES)}
 
 
 def init_worker(registration: dict | None) -> None:
@@ -93,6 +112,7 @@ def init_worker(registration: dict | None) -> None:
         _checked(kind, [ref])
         _TEST_REFS.add(f"{kind}|{ref}")
     _TEST_STATE.update(registration.get("state") or {})
+    register_test_engine(*(registration.get("engines") or []))
 
 
 def pool_kwargs() -> dict:

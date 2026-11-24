@@ -539,7 +539,7 @@ function decisionCard(c, head) {
     <label class="inline"><input type="checkbox" class="confirm"> I have read the sheet and sign the spec as the owner</label><button class="primary" data-act="sign-spec"${dis}>Sign</button>${blockNote}<div class="small result"></div></div></div>`;
   const items = (c.items || []).map((it, i) => `<div style="margin:12px 0"><b>${esc(it.finding)}</b>
       <div class="sub">Why it bears on the decision: ${esc(it.reason)}</div><div class="sub">Gate finding: ${esc(it.claim)}</div>
-      ${(it.declarations || []).map((d) => `<div class="sub">Declaration ${esc(d.id)}: ${inline(d.test)}</div>`).join("") || '<div class="sub">Not declared, and untested.</div>'}
+      ${it.outcome ? `<div class="sub">${esc(it.outcome)}</div>` : (it.declarations || []).map((d) => `<div class="sub">Declaration ${esc(d.id)}: ${inline(d.test)}</div>`).join("") || '<div class="sub">Not declared, and untested.</div>'}
       <div style="margin-top:6px"><label class="inline"><input type="radio" name="${esc(k + "_" + i)}" value="accept" data-f="${esc(it.fingerprint)}" ${it.answer === "accept" ? "checked" : ""}> accept</label>
       <label class="inline"><input type="radio" name="${esc(k + "_" + i)}" value="decline" data-f="${esc(it.fingerprint)}" ${it.answer === "decline" ? "checked" : ""}> decline</label>${it.answer ? `<span class="small muted">recorded: ${esc(it.answer)}</span>` : ""}</div></div>`).join("");
   return `<div class="card need" data-ck="need">${head(esc(c.title), c.status ? `<span class="tm">${esc(c.status)}</span>` : "")}${ctx("Findings that bear on the decision; only the owner may accept them.", "yes, answer below.")}<div class="body">${esc(c.body)}</div>${items}
