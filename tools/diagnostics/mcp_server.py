@@ -27,6 +27,8 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 for _p in (HERE, os.path.join(REPO, "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+import diag_ops as DO  # noqa: E402
+import diag_records as DX  # noqa: E402
 import diag_runs as DR  # noqa: E402
 
 VERSION = 1
@@ -150,6 +152,27 @@ def t_run_spend(args):
     return DR.run_spend(run)
 
 
+def t_run_artifact(args):
+    _, run = _run(args)
+    return DX.run_artifact(run, args.get("path"))
+
+
+def t_run_compare(args):
+    found, run = _run(args)
+    return DX.run_compare(run, list(found.values()))
+
+
+def t_owner_inbox(args):
+    data, srcs, notes, der = DX.owner_inbox(DR.discover(roots()))
+    data["items"] += DO.owner_items()          # PRs ready for the owner, budgets near their end (cached)
+    return data, srcs, notes, der
+
+
+def t_smoke_markers(args):
+    ids = args.get("runs")
+    return DO.smoke_markers(DR.discover(roots()), ids if isinstance(ids, list) else None, args.get("fragment"))
+
+
 def t_note_feedback(args):
     useful = args.get("useful")
     if useful not in ("yes", "no", "partly"):
@@ -176,6 +199,31 @@ TOOLS = {
                      {**_RUN, "status": {"type": "string"}}, ["run"]),
     "run_spend": (t_run_spend, "Model spend and time by stage and by task, and the cloud compute the run recorded.",
                   _RUN, ["run"]),
+    "run_artifact": (t_run_artifact, "One allow-listed harness record of a run (state, events, findings, gates, fix "
+                                     "plans, owner requests, spec, sign-off sheet, budget and compute ledgers, step "
+                                     "logs (tail), report, provenance, analysis YAML).",
+                     {**_RUN, "path": {"type": "string", "description": "relative to the run folder"}}, ["run", "path"]),
+    "run_compare": (t_run_compare, "This run's time and spend by stage against the finished runs of the same question.",
+                    _RUN, ["run"]),
+    "owner_inbox": (t_owner_inbox, "Everything waiting on the owner: paused runs, PRs with CI passing, budgets near "
+                                   "their end; with since when and how to answer.", {}, []),
+    "launches": (lambda a: DO.launches(), "Cloud launches (labels, clusters, spend against the cap and its alert level) "
+                                          "and each budget scope's used and remaining dollars, from follow.py's "
+                                          "cache; says when it is stale.", {}, []),
+    "clusters": (lambda a: DO.clusters(), "Coiled clusters counted by cloud/budget.py: state, live instances, billed "
+                                          "and estimated dollars (cached).", {}, []),
+    "supervisor_status": (lambda a: DO.supervisor_status(), "The off-laptop supervisor's status.json as last pulled: "
+                                                            "heartbeat, merge queue, collection, errors.", {}, []),
+    "open_prs": (lambda a: DO.open_prs(), "Open pull requests with their CI state and review decision, from the cached "
+                                          "gh output and its fetch time.", {}, []),
+    "baseline_summary": (lambda a: DO.baseline_summary(), "Harness baselines (hb1, hb2, ...): completion, rounds, "
+                                                          "spend and status per run, from the saved metrics.", {}, []),
+    "check_value": (lambda a: DO.check_value(), "Which checks are productive or noise, per baseline (the saved "
+                                                "harness_metrics --check-value tables).", {}, []),
+    "smoke_markers": (t_smoke_markers, "Which change fragments' smoke markers are present in which runs.",
+                      {"runs": {"type": "array", "items": {"type": "string"}}, "fragment": {"type": "string"}}, []),
+    "machine_status": (lambda a: DO.machine_status(), "This machine's load, thermal state, processes by command name "
+                                                      "(shells among them), worktrees and active agents.", {}, []),
     "note_feedback": (t_note_feedback, "Record whether the diagnostics answered a question, and what was missing "
                                        "(appended to the local feedback log; the only tool that writes).",
                       {"question": {"type": "string"}, "useful": {"type": "string", "enum": ["yes", "no", "partly"]},
@@ -321,6 +369,10 @@ def _self_test() -> int:
         ok(all(json.loads(x) for x in open(os.path.join(td, "home", "feedback.jsonl")).read().splitlines()),
            "MS10b a long feedback line is cut in its text, never in its JSON")
         ok(call("run_status", {"run": "runs/../runs/a_run"})[1], "MS12 a run id must be one list_runs named")
+        inbox = call("owner_inbox", {})[0]["data"]["items"]
+        ok([i["ref"] for i in inbox] == ["mirror/launch1/label1"], "MS13 the owner inbox covers mirrored cloud runs")
+        ok({"launches", "clusters", "open_prs", "machine_status", "smoke_markers", "run_artifact"} <= set(TOOLS)
+           and call("launches", {})[0]["schema"] == "diag.launches/1", "MS14 the operations tools answer in the envelope")
     for k in ("MA_DIAG_RUNS", "MA_DIAG_MIRROR", "MA_DIAG_HOME"):
         os.environ.pop(k, None)
     if fails:
