@@ -103,6 +103,7 @@ REPORT = os.path.join("models", "pipeline_report.json")
 # At the run root, not under models/ (Codex on #267, P1): compute.py's code fingerprint hashes models/ and data/,
 # so a progress write there would change a running batch's fingerprint and discard its rows on resume.
 PROGRESS = "pipeline_progress.json"
+EVENTS = "events.jsonl"     # the harness's event stream (agents/run_events.py): never a step input
 _RUN_ID = None           # the current run()'s id (MA_PIPELINE_RUN in its steps)
 _PROGRESS_DOC: dict = {}  # (run dir, run id) -> PROGRESS as this process last wrote it
 _PROGRESS_LOCK = threading.Lock()   # one check-and-write of PROGRESS at a time (Codex round 4 on #267)
@@ -168,7 +169,7 @@ def _reserved_patterns() -> tuple[str, ...]:
         outs = tuple(enf.SCRIPT_OUTPUTS) + tuple(enf.SIGNED_FILES) + tuple(enf.OWNED_BY)
     except Exception:  # noqa: BLE001 — fail closed: the families we know
         outs = ("report.md", "metadata.json", "artifact_integrity.json", "final_gate.json", "*.yaml")
-    return outs + ("critique_*.yaml", "critique_*.md", "fix_check_*.yaml", SPEC) + OWN_FILES
+    return outs + ("critique_*.yaml", "critique_*.md", "fix_check_*.yaml", SPEC, EVENTS) + OWN_FILES
 
 
 def script_env(environ=None) -> dict:
@@ -663,11 +664,13 @@ def fingerprint(step: dict, run_dir: str) -> dict:
     """What a step's result depends on: its definition, its input files and its code."""
     spec = {k: v for k, v in step.items() if not k.startswith("_")}
     ins, missing = {}, []
+    # events.jsonl too (agents/run_events.py): the harness appends heartbeats to it while a step runs.
     prog = os.path.realpath(os.path.join(run_dir, PROGRESS))
     for pat in step_inputs(step):
         # The runner rewrites PROGRESS while a step runs (Codex on #267): never an input, also through a link, and
-        # excluded before the missing check, so it alone never satisfies a glob.
-        m = [r for r in _matches(run_dir, pat) if os.path.realpath(os.path.join(run_dir, r)) != prog]
+        # excluded before the missing check, so it alone never satisfies a glob. EVENTS by its name only (Codex r1 of
+        # #384: a link at that name must not hide the real input it points to).
+        m = [r for r in _matches(run_dir, pat) if os.path.realpath(os.path.join(run_dir, r)) != prog and r != EVENTS]
         if not m:
             missing.append(pat)
         for rel in m:
@@ -1532,7 +1535,7 @@ def scratch(run_dir: str, step_id: str, python: str | None = None, keep: bool = 
     # No portable write sandbox: a step that still writes the real run dir (an absolute
     # path in its code) is reported and fails; the integrity record flags owned files.
     after = _stat_tree(run_dir)
-    live = {"trace.jsonl", "artifact_integrity.json", "budget_ledger.json", "harness_manifest.json"}
+    live = {"trace.jsonl", "artifact_integrity.json", "budget_ledger.json", "harness_manifest.json", EVENTS}
     changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k)
                      and k not in live and not k.endswith(".log"))   # written by the live harness meanwhile
     if changed:

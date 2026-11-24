@@ -59,7 +59,7 @@ def needs_owner_amendment(f) -> bool:
     g = f.get if isinstance(f, dict) else (lambda k, _f=f: getattr(_f, k, None))
     return g("resolution_type") != "owner_decision" and bool(_OWNER_AMENDMENT.search(str(g("fix_requires") or "")))
 # Files the harness writes; never counted as an agent's change.
-_HARNESS_OWNED = ("findings.jsonl", IMPACT, "budget_ledger.json", "_task_input.json", "_task_output.json", "run_state.json", "trace.jsonl", "validator_history.jsonl",
+_HARNESS_OWNED = ("findings.jsonl", IMPACT, "budget_ledger.json", "events.jsonl", "_task_input.json", "_task_output.json", "run_state.json", "trace.jsonl", "validator_history.jsonl",
                   "done_when_registry.json", "open_problems.md", "open_problems.json", "final_gate.json",
                   "gate_r", "fix_plan_r", "fix_progress_r", "models/pipeline_state.json", "models/pipeline_report.json", "analysis/")
 
