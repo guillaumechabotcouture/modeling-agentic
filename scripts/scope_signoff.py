@@ -745,7 +745,13 @@ def _provisional_locked(run_dir: str, items: list[dict], round_n: Optional[int],
         raise ValueError(bad[0]["claim"])
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     new = {}
+    non_high = ("MEDIUM", "LOW", "INFO")
     for it in items:
+        is_critic = (it.get("kind") == "critique_blocker"
+                     or str(it.get("source") or "").startswith("critique"))
+        if is_critic and not (isinstance(it.get("severity"), str) and it["severity"].upper() in non_high):
+            raise ValueError(f"provisional lead answer refused for open critic HIGH finding {it.get('finding')!r} "
+                             "(owner policy: only the owner may accept an open critic HIGH finding)")
         fp = it.get("fingerprint")
         if not fp or (prior.get(fp) or {}).get("by") == "owner":
             continue

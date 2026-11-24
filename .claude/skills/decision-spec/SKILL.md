@@ -147,7 +147,7 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     pre-sign spec critique reads the question's wording: an objective stated in expectation
     ("minimise expected ...") with the point plan is a MEDIUM on the sign-off sheet
     (`expected_value_plan`, principle 1). When the spec cannot carry the expected-value plan
-    (the schema lists what it excludes, such as `by_group`), declare that check in
+    (the schema lists what it excludes, such as `plan_variants` or `uncertainty.affordability.enforce`), declare that check in
     `principle_departures` with the reason.
 12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
     parameters and card tables its effect depends on (`decision_inputs`, read by
@@ -214,8 +214,11 @@ by birth cohort, an outbreak's final size), the engine is
 - **Joint dose blocks within one unit.** Use one alloc component per (group, level), with `group:` the
   group so that a package takes at most one level per group. Map each to `{<engine component>: level}`
   and give it a fixed cost item. Use `packages: {generate: true, within_envelope: true}`: packages no
-  plan can afford are dropped. Use `deliverable.by_group` (columns `{group, quantity, value}`,
-  `quantity: {<group>: <cost_outputs name>}`) for one row per group.
+  plan can afford are dropped. When the question gives a fixed already-held supply that must be allocated in
+  full (no unspent remainder), set `constraints.envelope_exact: true` (requires fixed unit costs: exclude
+  `costs` from uncertainty sources and omit `affordability.enforce`). Use `deliverable.by_group` (columns
+  `{group, quantity, value}`, `quantity: {<group>: <cost_outputs name>}`) for one row per group; it works
+  with both `point` and `expected_value` plans.
 - **Calibration to surveys and counts by group.** Use `calibration: {method: posterior, parameters,
   [attribute, range, scale], priors, sources, targets: {kind: observations, ...}}`. The format is in
   `toolkit/analysis/observed_targets.py`.
