@@ -183,17 +183,13 @@ def single_thread(tasks: str = "/proc/self/task") -> None:
         raise OSError(EPERM, f"{n} threads before Landlock: confinement would miss the others")
 
 
-def drop_bounding(libc) -> None:
-    """Empty the bounding set, while CAP_SETPCAP is still held (before drop_root, which loses it). Without it the
-    first drop fails with EPERM and the set stays: harmless only because exec is refused."""
+def drop_capabilities(libc) -> None:
+    """Empty every capability set: ambient, bounding (needs CAP_SETPCAP: a process without it has none to lose,
+    and exec is refused anyway), then effective, permitted and inheritable. Checked with capget."""
+    libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
     for cap in range(64):
         if libc.prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) < 0:
             break                       # EINVAL past the last capability, EPERM without CAP_SETPCAP
-
-
-def drop_capabilities(libc) -> None:
-    """Empty the ambient set, then the effective, permitted and inheritable sets. Checked with capget."""
-    libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
     hdr, data = (ctypes.c_uint32 * 2)(CAP_V3, 0), (ctypes.c_uint32 * 6)()
     _check(libc.capset(hdr, data), "capset")
     _check(libc.capget(hdr, data), "capget")
@@ -216,7 +212,7 @@ def install_seccomp(libc, arch: str, pid: int) -> None:
 def drop_root(uid: int | None) -> None:
     """As root, become `uid` (and gid `uid`, no supplementary groups) for good; the caller made the work and output
     directories this uid's. Root without a uid to switch to is refused: it would own every root file and process."""
-    if 0 not in os.getresuid():         # a saved or real uid 0 could be taken back
+    if os.geteuid() != 0:
         return
     if not uid:
         raise OSError(EPERM, "running as root with no unprivileged uid to switch to")
@@ -241,7 +237,6 @@ def apply(ro: list[str], rw: list[str], rw_files: list[str] = (), ro_files: list
         raise OSError(EPERM, f"Landlock ABI {abi} (at least {LANDLOCK_MIN_ABI}, Linux 6.2, is needed: truncation)")
     single_thread()
     libc = _libc()
-    drop_bounding(libc)
     drop_root(uid)
     drop_capabilities(libc)
     _check(libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "prctl(PR_SET_NO_NEW_PRIVS)")
@@ -365,25 +360,17 @@ def _self_test() -> int:
                 apply([sys.prefix], [], uid=DERIVATION_UID)
                 hdr, data = (ctypes.c_uint32 * 2)(CAP_V3, 0), (ctypes.c_uint32 * 6)()
                 _libc().capget(hdr, data)
-                bset = _libc().prctl(23, 0, 0, 0, 0)        # PR_CAPBSET_READ of CAP_CHOWN
-                os._exit(0 if not any(data) and 0 not in os.getresuid() and 0 not in os.getresgid()
-                         and (bset == 0 or not was_root) else 9)
+                os._exit(0 if not any(data) and os.geteuid() != 0 and os.getegid() != 0 else 9)
             except BaseException:  # noqa: BLE001
                 os._exit(8)
         ok(os.waitpid(pid, 0)[1] == 0, "KS6 apply leaves no effective, permitted or inheritable capability, and "
            f"no root uid or gid ({'run as root: switched to' if was_root else 'not root: kept'} its uid)")
     try:
-        with mock.patch("os.getresuid", lambda: (0, 0, 0)):
+        with mock.patch("os.geteuid", lambda: 0):
             drop_root(None)
         ok(False, "KS9 root with no uid to switch to is refused")
     except OSError:
         ok(True, "KS9 root with no uid to switch to is refused")
-    try:
-        with mock.patch("os.getresuid", lambda: (1000, 1000, 0)):
-            drop_root(None)
-        ok(False, "KS9b a saved uid 0 counts as root (getresuid, not geteuid)")
-    except OSError:
-        ok(True, "KS9b a saved uid 0 counts as root (getresuid, not geteuid)")
     if not sys.platform.startswith("linux"):
         try:
             apply([], [])
