@@ -55,8 +55,9 @@ NOT_COPIED = {STATE, "metadata.json", RECORD, REQUEST, "decision_spec.signoff.js
               "scope_signoff_request.json", "report.md", "report_withheld.md", "manuscript.md", "final_gate.json",
               "findings.jsonl", "declared_findings.yaml", "engine_choice.json", "figures", "trace.jsonl",
               "budget_ledger.json", "progress.md", "copied_run.json", "_task_input.json", "done_when_registry.json",
-              "scope_declaration.yaml"}
-NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact", "fix_progress")
+              "scope_declaration.yaml", "spec_patch_proposed.json"}
+# calibration_patch_r*: a refused calibration's planned amendment (agents/stage_machine.py), the parent's own record
+NOT_COPIED_PREFIX = ("critique_", "fix_plan_", "fix_impact", "fix_progress", "calibration_patch_")
 NOT_COPIED_DIRS = ("models/decision_tests",)     # the parent's decision-test results: the child tests again
 OPS = ("set", "add", "remove")
 
@@ -379,6 +380,17 @@ def _review_conditions(child: str, parent: str) -> dict:
             "output": (r.stdout + r.stderr)[-1500:]}
 
 
+def _lead_defer(child: str, rc: dict, mode: str) -> dict:
+    """Under a lead amendment the child's imported open review conditions (the parent's findings that asked for the
+    amendment among them) are deferred to the owner provisionally (review_conditions.lead_defer, D2), as the lead
+    does at SIGN, before the sheet and the dry-sign: the child's report lists them for the owner (Codex r1 of the
+    calibration route, P1-4). An owner amendment leaves them for the owner to dispose of."""
+    if mode != "lead" or rc.get("status") != "imported":
+        return rc
+    from toolkit.spec import review_conditions as RC
+    return dict(rc, lead_deferred=RC.lead_defer(child))
+
+
 def dry_sign(child: str, by: str, expect: dict) -> dict:
     """Sign a scratch copy with the hashes the owner will be shown; the child itself stays unsigned."""
     from toolkit.spec import signoff as SO
@@ -530,7 +542,7 @@ def amend(parent, patch=None, from_request=False, out=None, signoff=None, repo=R
            "paused": "awaiting_signoff", "status": None, "tries": {}, "journal": {},
            "history": [{"at": meta["created"], "from": None, "to": "SIGN",
                         "why": f"amendment {label} of {parent} ({len(changes)} change(s)): {reason1}"[:500]}]}
-    rc = _review_conditions(child, parent)
+    rc = _lead_defer(child, _review_conditions(child, parent), mode)
     _, cands = _pre_sign(child, st.get("derived_inputs"))   # the geometry record and candidates, at the final path
     SO.write_sheet(child, cands)
     expect = {"expect_sha256": _file_sha(child, SPEC), "expect_sheet_sha256": _file_sha(child, SO.SHEET),
@@ -578,7 +590,7 @@ def finish(child: str, log=print) -> dict:
         raise AmendError(f"{child}: no amendment record to finish ({e})") from None
     if os.path.lexists(os.path.join(child, STATE)):
         raise AmendError(f"{child} already has its run state")
-    rc = _review_conditions(child, rec["parent_run"]["run_dir"])
+    rc = _lead_defer(child, _review_conditions(child, rec["parent_run"]["run_dir"]), rec["signoff"])
     errs, cands = _pre_sign(child, cst.get("derived_inputs"))
     if errs:
         raise AmendError("the child fails the pre-sign checks: " + "; ".join(errs[:10]))
