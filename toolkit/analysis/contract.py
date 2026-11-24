@@ -801,7 +801,6 @@ def decision_test_not_run_findings(run_dir: str) -> list[dict]:
     made. Declarable with its reason (the finding says why the test did not run); its remedy is an owner amendment of
     the spec, so the fix loop takes it to the owner. Read only from the verified artifact: when it cannot be read,
     decision_test_findings already gives the non-declarable HIGH, so nothing is said twice."""
-    return []       # α: not raised yet (β)
     rows, _man, problem, _payload = _verified_doc(run_dir)
     if problem:
         return []

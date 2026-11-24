@@ -408,7 +408,7 @@ def harness_gap_key(f) -> str:
     baseline hb3 (fix 6) a critic reworded a declared gap's remedy within its class, the gap no longer matched and the
     fix planner declared it again, one round later. A remedy of another class (a fix become an owner amendment) or
     another kind is looked at again."""
-    return legacy_harness_gap_key(f)      # α: still the remedy as written (β binds the remedy class)
+    return finding_fingerprint(f)
 
 
 def legacy_harness_gap_key(f) -> str:

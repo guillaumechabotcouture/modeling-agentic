@@ -138,7 +138,7 @@ def gate_findings(run_dir: str) -> list[dict]:
     if any(f.get("kind") in ("analysis_contract_missing", "analysis_contract_incomplete", "analysis_contract_blocked")
            for f in base):      # the contract already says there is no completed analysis: not said twice
         dt = [f for f in dt if contract.NO_MANIFEST not in str(f.get("claim"))]
-    return base + dt
+    return base + dt + contract.decision_test_not_run_findings(run_dir)
 
 
 def _self_test() -> int:

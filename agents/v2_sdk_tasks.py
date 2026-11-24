@@ -108,7 +108,11 @@ parameter, never on a unit attribute bound to data. Note what each derivation do
 data/README.md. Every file the spec cites is a staged input or a derived output; paths are relative
 to the run directory. When the options use a component whose effect depends on decision inputs
 (each engine's decision_inputs.yaml), name the evidence dossier: `evidence: {{dossier:
-evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. Three
+evidence_dossier.yaml}}`; do not write the dossier: the harness drafts it after the spec. When the
+question asks to minimise or maximise an expected quantity (an objective stated in expectation), set
+`deliverable.plan: expected_value`; when the spec cannot carry it (the schema says which fields it
+excludes), declare `{{principle: 1, check: expected_value_plan, reason: ...}}` in principle_departures
+with the reason; the sign-off sheet flags the point plan otherwise. Three
 rules the check refuses often: a decision test's `text` has no digits (it says in words what the
 test asks; the values tested are rendered from computed claims); nor have the yes, no and
 undetermined texts of deliverable.decision.statements (the harness renders the values); and `engine_parameters` gives no

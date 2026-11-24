@@ -333,7 +333,6 @@ def _follow_up(raw, run_dir, dossier_bytes=None) -> list:
 
 def expected_objective(question) -> str | None:
     """The wording that states the question's objective in expectation, or None (hb3 fix 4)."""
-    return None     # α: not detected yet (β)
     m = EXPECTED_OBJECTIVE_RE.search(" ".join(str(question or "").split()))
     return m.group(0) if m else None
 
