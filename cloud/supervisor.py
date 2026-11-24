@@ -27,6 +27,8 @@ keychain holds it under the service "modeling-agentic-supervisor-github"; withou
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -36,6 +38,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -56,6 +59,20 @@ KEEP = 50              # last N acks / errors / finished merges kept in state
 
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}")           # supervisor and launch names
 _LABEL = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}")  # run labels: neither can leave its directory
+_ACCOUNT = re.compile(r"[a-z0-9]{3,24}")                  # Azure storage account names (vm_job.storage_account's rule)
+
+
+def storage_account(flag=None):
+    """--account, else $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT; refused (SystemExit, the value never echoed)
+    unless it is a bare storage account name, before any client is built or command run (Codex round 1 on #358)."""
+    acct = flag
+    if flag is None:                      # the first variable that is set decides, an empty one included
+        acct = next((os.environ[n] for n in ("MA_STORAGE_ACCOUNT", "COILED_STORAGE_ACCOUNT") if n in os.environ), None)
+    if acct is not None and not (isinstance(acct, str) and _ACCOUNT.fullmatch(acct)):
+        raise SystemExit("the storage account (--account, $MA_STORAGE_ACCOUNT or $COILED_STORAGE_ACCOUNT) must be a "
+                         "bare storage account name (3-24 lowercase letters and digits), not a connection string, URL "
+                         "or key: refusing")
+    return acct or None
 
 
 def utc(t: float) -> str:
@@ -74,7 +91,7 @@ class Blob:
     """results_store with one account: JSON and file put/get, listing. get_json returns None when absent."""
     def __init__(self, account=None):
         import results_store
-        self.rs, self.account = results_store, account or results_store.configured_account()
+        self.rs, self.account = results_store, storage_account(account)
         if not self.account:
             raise SystemExit("no storage account: set $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT or pass --account")
         self.svc = results_store._service(self.account)
@@ -209,8 +226,11 @@ def fetch_from_storage(entry, label, work):
     import types
     import results_store
     import run_cluster as rc
+    given = entry.get("storage_account")          # a state.json from before the check is covered too
+    if given is not None and not (isinstance(given, str) and _ACCOUNT.fullmatch(given)):
+        raise SystemExit("the collection's storage account is not a bare storage account name: not fetched")
     cfg = types.SimpleNamespace(out_dir=os.path.join(work, entry["name"]), storage_prefix=entry["storage_prefix"],
-                                storage_account=entry.get("storage_account"))
+                                storage_account=given)
     os.makedirs(cfg.out_dir, exist_ok=True)
     return rc.collect_from_storage(cfg, results_store, label, entry["assignments"][label]["launch_id"],
                                    entry["assignments"][label])
@@ -282,6 +302,9 @@ def valid_entry(pl) -> dict:
             isinstance(a, dict) and a and all(_LABEL.fullmatch(str(k)) and isinstance(v, dict) and v.get("launch_id")
                                                for k, v in a.items())):
         raise ValueError("collect request: needs a plain name, storage_prefix and a launch_id per plain label")
+    if pl.get("storage_account") is not None and not (isinstance(pl["storage_account"], str)
+                                                     and _ACCOUNT.fullmatch(pl["storage_account"])):
+        raise ValueError("collect request: storage_account is not a bare storage account name (not echoed)")
     return pl
 
 
@@ -449,6 +472,7 @@ def start_commands(a, job_id, token_present) -> list:
 
 
 def cmd_start(a):
+    storage_account(a.account)            # before anything runs or is printed
     r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"], capture_output=True,
                        text=True)                      # the owner's one-time step stores it there
     tok = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
@@ -476,6 +500,7 @@ def stop_own(name, live_id=None, stop=None):
 def _assignments(config_path):
     import run_cluster as rc
     cfg = rc.load_config(config_path)
+    storage_account(cfg.storage_account if cfg.storage_account is not None else None)   # never enqueued unchecked
     if not os.path.exists(cfg.state_file):
         raise SystemExit(f"no {cfg.state_file}: this machine did not launch {cfg.name}")
     return {"name": cfg.name, "storage_prefix": cfg.storage_prefix, "storage_account": cfg.storage_account,
@@ -752,6 +777,57 @@ def _self_test() -> int:
         b.put_json(f"{P['requests']}{i:06d}.json", {"kind": "noop"})
     st = run(b, [T0, T0 + 1])
     ok(len(st.get("seen", [])) == 1003 and st["acks"][-1]["at"] == utc(T0), "SV24 no processed request is replayed")
+
+    # SV50-SV51 (Codex round 1 on #358): a storage account that is not a bare name (an argument or the environment)
+    # is refused, unechoed, before any Blob client is built and before `start` runs or prints any vm_job command
+    from unittest import mock
+    import results_store
+    bad_ = "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=SECRETabc=="
+
+    def refused(fn, *a, **k):
+        try:
+            return fn(*a, **k)
+        except SystemExit as e:
+            return f"SystemExit: {e}"
+        except Exception as e:  # noqa: BLE001
+            return f"{type(e).__name__}: {e}"
+    built = []
+    with mock.patch.object(results_store, "_service", lambda acct: built.append(acct) or object()):
+        r_arg = refused(Blob, bad_)
+        with mock.patch.dict(os.environ, {"MA_STORAGE_ACCOUNT": "https://x.blob.core.windows.net"}):
+            r_env = refused(Blob, None)
+        good_ = refused(Blob, "acct1")
+    ok(r_arg.startswith("SystemExit") and "storage account" in r_arg and "SECRET" not in r_arg
+       and r_env.startswith("SystemExit") and built == ["acct1"] and isinstance(good_, Blob),
+       f"SV50 a connection string or URL as the account is refused, unechoed, before any client ({r_arg}; {r_env})")
+    runs_, out_ = [], io.StringIO()
+    a = argparse.Namespace(name=DEFAULT_NAME, cap_usd=15.0, max_hours=24.0, budget_scope=None, account=bad_, every=60)
+    with mock.patch.object(subprocess, "run", lambda cmd, **k: runs_.append(cmd) or types.SimpleNamespace(
+            returncode=0, stdout="")), contextlib.redirect_stdout(out_):
+        r_start = refused(cmd_start, a)
+    ok(r_start.startswith("SystemExit") and not runs_ and "SECRET" not in out_.getvalue() + r_start,
+       f"SV51 start refuses a bad account before any vm_job command runs or is printed ({r_start}, {len(runs_)} runs)")
+    with mock.patch.dict(os.environ, {"MA_STORAGE_ACCOUNT": "acct1"}):
+        r_empty = refused(storage_account, "")
+    ok(r_empty.startswith("SystemExit"), f"SV52 (Codex r1 on #362) an explicitly empty --account is refused, not "
+       f"replaced by the environment's ({r_empty})")
+    ent_bad = {"name": "ev-x", "storage_prefix": "runs/ev-x", "storage_account": bad_,
+               "assignments": {"q": {"launch_id": "L1"}}}
+    r_valid = refused(valid_entry, ent_bad)
+    r_fetch = refused(fetch_from_storage, ent_bad, "q", "/nonexistent")
+    ok("SECRET" not in r_valid + r_fetch and ("ValueError" in r_valid or "SystemExit" in r_valid)
+       and r_fetch.startswith("SystemExit"),
+       f"SV53 (Codex r1 on #362) a collection entry's account is checked when the request arrives and before each "
+       f"fetch, unechoed ({r_valid}; {r_fetch})")
+    with mock.patch.dict(os.environ, {"MA_STORAGE_ACCOUNT": ""}):
+        os.environ.pop("COILED_STORAGE_ACCOUNT", None)
+        r_envempty = refused(storage_account, None)
+    ok(r_envempty.startswith("SystemExit"), f"SV56 (Codex r2 on #362) an empty $MA_STORAGE_ACCOUNT is refused ({r_envempty})")
+    with mock.patch.dict(os.environ, {"MA_STORAGE_ACCOUNT": "fallbackacct"}):
+        r57 = [refused(valid_entry, {**ent_bad, "storage_account": v}) for v in (False, "", 7)]
+        r57f = [refused(fetch_from_storage, {**ent_bad, "storage_account": v}, "q", "/nonexistent") for v in (False, "")]
+    ok(all("ValueError" in x for x in r57) and all(x.startswith("SystemExit") for x in r57f),
+       f"SV57 (Codex r2 on #362) a collection account given but not a bare name never falls back to another ({r57}, {r57f})")
 
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0

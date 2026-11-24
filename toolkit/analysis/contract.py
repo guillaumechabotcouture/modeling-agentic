@@ -18,6 +18,8 @@ harness wrote, for the spec that was signed:
   analysis_contract_value_of_information  the value-of-information artifact the spec asks for is missing, present
                                when switched off, or malformed (F6: toolkit/analysis/value_of_information.py)
   analysis_contract_stability  analysis/stability.yaml cannot be verified or read, or holds an unknown verdict
+  analysis_interval_degenerate the headline's fixed-plan interval has next to no width (hb3 fix 5: interval_findings);
+                               the one exception below: declarable, decision-bearing (an owner item)
 All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding). Beside them, read by
 toolkit/analysis/api.py: decision_test_findings (decision_test_changes_plan) and stability_findings
 (allocation_unstable HIGH, the owner's to accept); stability_note is the report's advisory note when it did not run.
@@ -147,6 +149,61 @@ def _reserve(run_dir: str, point, unc: dict) -> list[dict]:
     except (OSError, yaml.YAMLError) as e:
         return [_f("analysis_contract_reserve", f"{SPEC} unreadable for the affordability rule: {e}", "reserve")]
     return reserve_findings(rule, point or {}, unc or {})
+
+
+def _signed_headline(run_dir):
+    """The signed spec's deliverable.headline ({name, outcome}), or None when the spec gives none."""
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC)))
+    except (OSError, yaml.YAMLError):
+        return None
+    hl = ((raw.get("deliverable") or {}) if isinstance(raw, dict) else {}).get("headline")
+    return hl if isinstance(hl, dict) else None
+
+
+def interval_findings(unc, signed=None) -> list[dict]:
+    """hb3 fix 5: the headline's fixed-plan interval must have a width. Below thresholds.yaml
+    `uncertainty.interval_rel_width_min` of its magnitude it is no uncertainty interval, and the report would present it
+    as one: analysis_interval_degenerate, a declarable HIGH routed to the owner (decision_bearing). An interval that is exactly 0 at every bound is a plan
+    that averts nothing against the comparator (e.g. every unit on the comparator), not missing uncertainty: no finding.
+    `signed`: the signed spec's headline; the artifact must name the same one (Codex r1 P1-4 of #377), and an artifact
+    without it, or without a numeric interval for it, fails closed (not declarable). Neither headline given: not
+    checked."""
+    kind = "analysis_interval_degenerate"
+    hl = (unc or {}).get("headline") if isinstance(unc, dict) else None
+    if signed is not None:
+        if not (isinstance(hl, dict) and hl.get("name") == signed.get("name")
+                and hl.get("outcome") == signed.get("outcome")):
+            return [_f(kind, f"analysis/uncertainty.yaml: headline {hl!r} is not the signed spec's {signed!r}",
+                       f"interval:{signed.get('name')}")]
+    if not isinstance(hl, dict):
+        return []
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.yaml")) as f:
+        tol = float(yaml.safe_load(f)["uncertainty"]["interval_rel_width_min"])
+    name, o = hl.get("name"), hl.get("outcome")
+    qd = (unc.get("fixed_plan") or {}).get(o) if isinstance(unc.get("fixed_plan"), dict) else None
+    vals = [qd.get(k) if isinstance(qd, dict) else None for k in ("ci_low", "median", "ci_high")]
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in vals):
+        return [_f(kind, f"analysis/uncertainty.yaml: the headline {name} ({o}) has no numeric fixed-plan interval "
+                         f"({qd!r})", f"interval:{name}")]
+    lo, med, hi = (float(v) for v in vals)
+    scale = max(abs(lo), abs(med), abs(hi))
+    if scale == 0:          # Codex r1 P1-1: nothing averted in any draw; more uncertainty cannot change that
+        return []
+    rel = (hi - lo) / scale
+    if rel >= tol:
+        return []
+    lvl = qd.get("level")
+    lvl = float(lvl) if isinstance(lvl, (int, float)) and not isinstance(lvl, bool) and math.isfinite(lvl) else 0.95
+    # lead on #377: an owner item (declarable HIGH, decision-bearing), not a run-ender: a run that states the limitation
+    # (hb3 tb R2) declares it once the owner (or, under --signoff lead, the lead provisionally) accepts it
+    return [dict(_f(kind, f"analysis/uncertainty.yaml: the headline {name} ({o}) has a {100 * lvl:g}% "
+                          f"interval of width {hi - lo:.3g}, {rel:.2g} of its magnitude (below {tol:g}): the declared "
+                          "sources barely move it, so it is no uncertainty interval. Draw the uncertainty that the "
+                          "headline rests on (for measured per-unit rates: the engine's per-unit sampling and the "
+                          "unit_rates source; for ratios: their published ranges) in a spec amendment, or declare the "
+                          "limitation", f"interval:{name}"),
+                 scope_declarable=True, decision_bearing=True, target_stage="ANALYZE")]
 
 
 def _burden(run_dir: str, data, signed: bool = False, anchor=None) -> list[dict]:
@@ -461,6 +518,9 @@ def _gate_findings(run_dir: str) -> list[dict]:
             voi_doc = doc.get("data")
         if kind == "estimates":
             est_doc = (rel, doc.get("data") or {})
+        if kind == "wiring":                  # owner 2026-11-23: a declared input that reaches no declared output
+            from toolkit.analysis.wiring import findings as wiring_findings
+            out += wiring_findings(rel, doc.get("data"))
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
             out.append(_f("analysis_contract_model_domain", f"{rel}: model corrections bear on the plan", rel))
     for rel, ent in sorted((man.get("deliverables") or {}).items()):
@@ -481,6 +541,7 @@ def _gate_findings(run_dir: str) -> list[dict]:
         out += _plan_variants(run_dir, pt_doc, pv_doc)
     out += _burden(run_dir, bv_doc, man.get("spec_signed") is True, ba_doc)
     if man.get("deliverable_kind") != "estimates":
+        out += interval_findings(unc_doc, _signed_headline(run_dir))
         out += _boundary(run_dir, bd_doc, pt_doc)
         out += _value_of_information(run_dir, unc_doc, voi_doc)
         out += _plan_rule(run_dir, pt_doc, unc_doc)
@@ -985,6 +1046,52 @@ def _figures(run_dir, man) -> list[dict]:
     return out
 
 
+def _self_test_interval(ok, complete_run, kinds):
+    """hb3 fix 5: a headline interval with next to no width is a finding, never reported as an interval."""
+    import tempfile
+
+    def unc(q, outcome="x"):
+        return {"draws": 2, "covers": ["priors"], "excludes": [], "label": "", "fixed_plan": {outcome: q},
+                "headline": {"name": "total_x", "outcome": "x"}}
+
+    def q(lo, med, hi):
+        return {"ci_low": lo, "median": med, "ci_high": hi, "mean": med, "level": 0.95}
+    narrow = interval_findings(unc(q(999.9995, 1000.0, 1000.0005)))
+    ok([(f["kind"], f["severity"], f["scope_declarable"], f.get("decision_bearing"), f["key"]) for f in narrow]
+       == [("analysis_interval_degenerate", "HIGH", True, True, "interval:total_x")]
+       and "unit_rates" in narrow[0]["claim"],
+       f"KI1 a headline interval of width 1e-6 of its median is a declarable HIGH for the owner, naming the remedy: "
+       f"{narrow}")
+    ok(interval_findings(unc(q(900.0, 1000.0, 1100.0))) == [] and interval_findings(unc(q(-50.0, 1.0, 40.0))) == [],
+       "KI2 a real interval (20% wide, or spanning zero) is no finding")
+    ok(interval_findings(unc(q(0.0, 0.0, 0.0))) == [],
+       "KI3 (Codex r1 P1-1) an all-zero interval is a plan that averts nothing (all comparator), not a finding")
+    sg = {"name": "total_x", "outcome": "x"}
+    mism = interval_findings(dict(unc(q(1.0, 1.0, 1.0)), headline={"name": "total_x", "outcome": "y"},
+                                  fixed_plan={"x": q(1.0, 1.0, 1.0), "y": q(0.0, 5.0, 9.0)}), sg)
+    gone = interval_findings({k: v for k, v in unc(q(1.0, 1.0, 1.0)).items() if k != "headline"}, sg)
+    ok([f["kind"] for f in mism] == ["analysis_interval_degenerate"] and [f["kind"] for f in gone] == [
+        "analysis_interval_degenerate"] and interval_findings(unc(q(900.0, 1000.0, 1100.0)), sg) == [],
+       "KI7 (Codex r1 P1-4) the artifact must name the signed headline; another outcome or none fails closed")
+    sl = interval_findings(unc(dict(q(1.0, 1.0, 1.0), level="0.95")))
+    ok([f["kind"] for f in sl] == ["analysis_interval_degenerate"],
+       f"KI8 (Codex r1 P2-8) a non-numeric level does not crash the check: {sl}")
+    bad = [interval_findings(unc(q(None, 1.0, 2.0))), interval_findings(unc(q(1.0, 2.0, 3.0), outcome="y")),
+           interval_findings(unc(q(float("nan"), 1.0, 2.0)))]
+    ok(all([f["kind"] for f in b] == ["analysis_interval_degenerate"] for b in bad),
+       f"KI4 a headline with no numeric interval (a missing bound, its outcome absent, NaN) fails closed: {bad}")
+    ok(interval_findings({"draws": 2, "fixed_plan": {}}) == [] and interval_findings(None) == [],
+       "KI5 a payload without a headline is not checked")
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, SPEC), "w").write("x: 1\n")
+        complete_run(d, unc=unc(q(999.9995, 1000.0, 1000.0005)))
+        k1 = kinds(d)
+        complete_run(d, unc=unc(q(900.0, 1000.0, 1100.0)))
+        k2 = kinds(d)
+        ok(k1 == {"analysis_interval_degenerate"} and k2 == set(),
+           f"KI6 the contract gate raises it for a completed run, and not for a real interval: {k1}, {k2}")
+
+
 def _self_test() -> int:
     import tempfile
     from toolkit.analysis.artifacts import Store
@@ -1329,6 +1436,7 @@ def _self_test() -> int:
         os.remove(os.path.join(d, SPEC))
         ok(decision_test_findings(d) == [], "K-DTP4b no spec and no manifest: nothing to read")
     _self_test_stability(ok, complete_run)
+    _self_test_interval(ok, complete_run, kinds)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

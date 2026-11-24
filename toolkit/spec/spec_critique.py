@@ -48,6 +48,11 @@ if ROOT not in sys.path:
 
 CHECKS = {"headline_comparator": 2, "decision_date": 2, "baseline_burden": 3, "decision_input_ranges": 6,
           "follow_up_window": 3}
+# Principles 8-12 (owner, 2026-11-23): the critics' checklist items (toolkit/spec/critique_checklist.py ITEMS). Nothing
+# here computes them, but a spec may declare a departure from one; the sheet lists it as declared (Codex r3 of #366).
+CHECKLIST_CHECKS = {"comparator_symmetry": 8, "holdout_shock_overlap": 9, "burn_in_drift": 10,
+                    "surveillance_ranking": 11, "natural_history_tension": 12}
+CHECKS.update(CHECKLIST_CHECKS)
 SECTION = "## Spec critique (decision design principles, before signing)"
 PAST_DAYS = 90             # an ISO decision date more than this before today is past
 CALENDAR_MIN = 1900        # a window starting earlier is in model years, not calendar years: not compared with today
@@ -372,6 +377,12 @@ def findings(raw: dict, run_dir: str | None = None, today: datetime.date | None 
     for f in out:
         if f["check"] in deps and f["severity"] in ("HIGH", "MEDIUM") and not f["error"]:
             f["declared"], f["severity"] = deps[f["check"]], "DECLARED"
+    for c in CHECKLIST_CHECKS:
+        if c in deps:
+            f = _f("DECLARED", c, f"The spec declares a departure from principle {CHECKLIST_CHECKS[c]} ({c}), a "
+                   "critics' checklist item; the critics report it as this declared limitation.", "None")
+            f["declared"] = deps[c]
+            out.append(f)
     return out + bad
 
 
@@ -576,6 +587,18 @@ def _self_test() -> int:
            "SC39 no flag when every declared follow-up covers the window")
         md = "\n".join(sheet_lines(r, d, T))
         ok("| MEDIUM | 3 | follow_up_window |" in md, "SC40 the flag is on the sheet")
+    # SC41 (Codex r3 of #366, P1-4): a declared departure from a checklist principle (8-12) is a declared row, not a
+    # malformed-departure HIGH
+    r = spec(principle_departures=[{"principle": 9, "check": "holdout_shock_overlap",
+                                    "reason": "the only holdout overlaps a service disruption"}])
+    fs = findings(r, today=T)
+    ok(not [f for f in fs if f["severity"] == "HIGH" and "malformed" in f["text"]]
+       and sev(fs, "holdout_shock_overlap") == ["DECLARED"]
+       and "service disruption" in "\n".join(sheet_lines(r, None, T)),
+       f"SC41 a declared departure from principle 9 is accepted and shown as declared: {fs}")
+    r = spec(principle_departures=[{"principle": 8, "check": "holdout_shock_overlap", "reason": "x"}])
+    ok(any(f["severity"] == "HIGH" and "malformed" in f["text"] for f in findings(r, today=T)),
+       "SC42 a checklist check with the wrong principle number is still malformed")
     print(f"{'FAIL' if fails else 'OK'}: " + (f"{len(fails)} case(s) failed" if fails else
                                                "all self-test cases passed."))
     return 1 if fails else 0

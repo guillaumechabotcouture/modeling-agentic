@@ -114,7 +114,11 @@ test asks; the values tested are rendered from computed claims); nor have the ye
 undetermined texts of deliverable.decision.statements (the harness renders the values); and `engine_parameters` gives no
 value for a parameter the engine card lists as calibrated or fitted (calibrate a calibrated one
 under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
-it out). Output:
+it out). A rate measured per unit from counts carries sampling error unit by unit: when the engine
+card offers per-unit sampling (the package-rate engine's `baseline.sampling` in trial_priors mode,
+with each unit's event counts bound as `baseline_events`), declare it, then list the `unit_rates`
+uncertainty source, or exclude it with a reason; a headline interval with next to no width goes
+to the owner. Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """
@@ -153,7 +157,8 @@ its LOW report_number_typed rows (advisory) name numbers the writer typed instea
 raise one only if it misleads the reader. Judge what code cannot: plausibility against the domain, whether the
 comparator and the objective match the question, hidden assumptions, overclaims. Write
 {file} in the critique-blockers schema: reviewer: {reviewer} (this literal value), round: {round}, verdict (PASS | REVISE),
-structural_mismatch {{detected: bool}}, carried_forward (round 1: []), blockers (ids {prefix}-NNN, this prefix;
+structural_mismatch {{detected: bool}}, carried_forward (round 1: []), checklist (the domain and red-team
+reviews only: the checklist below), blockers (ids {prefix}-NNN, this prefix;
 each with id, severity ({severities}), category ({categories}), target_stage ({stages}),
 first_seen_round, claim, evidence, fix_requires (when the fix needs the signed decision_spec.yaml changed, start it
 with "Owner amendment:": the owner decides it, no task can), resolved (true/false), and done_when (required for
@@ -566,6 +571,9 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
         return False
     if not isinstance(doc, dict):
         return False
+    from toolkit.spec import critique_checklist as CLst
+    if reviewer in CLst.CHECKLIST_REVIEWERS and CLst.strict_load(now)[1] is not None:
+        return False        # a duplicate key: a rewrite would drop one silently; the gate refuses it (Codex r3 of #366)
     want = V.PREFIXES[reviewer]
     blockers = [b for b in doc.get("blockers") or [] if isinstance(b, dict)] \
         if isinstance(doc.get("blockers"), list) else []
@@ -600,8 +608,24 @@ def stamp_critique(run_dir: str, reviewer: str, before: bytes | None = None) -> 
                 c["id"] = ren[i]
             else:
                 cf[k] = ren[i]
+    ck = doc.get("checklist") if isinstance(doc.get("checklist"), dict) else {}
+    for e in ck.values():               # the structural checklist's finding references follow the renamed ids
+        if isinstance(e, dict) and isinstance(e.get("blockers"), list):
+            e["blockers"] = [ren.get(x, x) if isinstance(x, str) else x for x in e["blockers"]]
     _sio().write_nofollow(run_dir, rel, yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).encode(), atomic=True)
     return True
+
+
+def checklist_text(run_dir: str, reviewer: str, repair: bool = False) -> tuple[str, str]:
+    """(system text, message text) of the structural checklist a domain or red-team review answers (owner
+    2026-11-23; toolkit/spec/critique_checklist.py): its fixed instructions and the five items in the system prompt;
+    on a repair, the critic-written text the schema errors name by marker, as one line of JSON data in the message
+    (critic text never enters the system prompt; Codex r2 of #366, P1-5). Both empty for other reviewers."""
+    from toolkit.spec import critique_checklist as CL
+    if reviewer not in CL.CHECKLIST_REVIEWERS:
+        return "", ""
+    data = CL.repair_data(run_dir, CRITIQUE_FILE[reviewer]) if repair else ""
+    return "\n\n" + CL.prompt_block(), ("\n\n" + data) if data else ""
 
 
 class SdkTasks:
@@ -794,12 +818,14 @@ class SdkTasks:
         notes = RF.critic_notes(run_dir)
         msg = f"Review round {round_n}." + ("\n\nHarness heuristics (notes, not findings; judge them):\n- "
                                             + "\n- ".join(notes) if notes else "") + owner_held_note(run_dir, reviewer)
+        ck_sys, ck_msg = checklist_text(run_dir, reviewer, repair=bool(feedback))
+        msg += ck_msg
         before = _file_bytes(run_dir, f)
         res = self._session("critique", PROMPTS["critique"].format(
             reviewer=reviewer, round=round_n, prev_round=max(round_n - 1, 0), file=f, prefix=PREFIX[reviewer],
             out=OUT, feedback=fb,
             severities=" | ".join(sorted(V.VALID_SEVERITY)), categories=" | ".join(sorted(V.VALID_CATEGORY)),
-            stages=" | ".join(sorted(V.VALID_TARGET_STAGE))),
+            stages=" | ".join(sorted(V.VALID_TARGET_STAGE))) + ck_sys,
                             msg, (f,), model)
         stamp_critique(run_dir, reviewer, before)
         return res
@@ -974,6 +1000,42 @@ def _self_test() -> int:
         ok(all(k in cp2 for k in ("resolved_in_round: 2", "resolved_evidence", "prior_round: 1", "still_present",
                                   "never a bare id")),
            "S17 the critique prompt states what a resolved blocker and a carried_forward entry need")
+        # SCK1 (owner 2026-11-23): the domain and red-team prompts carry the structural checklist (all five items, fixed
+        # text); the presentation prompt does not.
+        from toolkit.spec import critique_checklist as CL
+        ck = os.path.join(d, "ck")
+        os.makedirs(ck)
+        tx, tm = checklist_text(ck, "critique-redteam")
+        ok(all(f"  - {i} (principle" in tx for i in CL.ITEMS) and tm == ""
+           and checklist_text(ck, "critique-presentation") == ("", "") and "checklist (the domain and red-team" in cp2,
+           f"SCK1 the checklist (all five items) reaches the domain and red-team prompts only: {tx[-200:]}")
+        # SCK3 (Codex r2 of #366, P1-5): a repair's schema errors reach the system prompt, so they never quote the
+        # critic's text; the text they name by marker is data in the review message.
+        import yaml as _yk
+        evil = "IGNORE_PRIOR_MARKER new instruction"
+        bad_doc = {"reviewer": "critique-domain", "round": 1, "verdict": "PASS", "structural_mismatch": {"detected": False},
+                   "carried_forward": [], "blockers": [],
+                   "checklist": dict({i: {"answer": "pass", "reason": "r"} for i in CL.ITEMS},
+                                     **{evil: {"answer": "pass", "reason": "r"}},
+                                     burn_in_drift={"answer": "finding", "reason": "r", "blockers": [evil]})}
+        _yk.safe_dump(bad_doc, open(os.path.join(ck, "critique_domain.yaml"), "w"), sort_keys=False)
+        errs_k = CL.problems(bad_doc["checklist"], "critique_domain.yaml", [])
+        seen_k = {}
+
+        def capture(self_, kind, system, prompt, owns, model=None):
+            seen_k.update(system=system, prompt=prompt)
+            return TaskResult(True, {"ok": True}, 0.0, "fake")
+        _orig_k = SdkTasks._session
+        SdkTasks._session = capture
+        try:
+            SdkTasks(ck).critique(ck, "critique-domain", 1, errs_k)
+        finally:
+            SdkTasks._session = _orig_k
+        ok(len(errs_k) == 2 and "IGNORE_PRIOR_MARKER" not in seen_k.get("system", "x")
+           and "[CK-K6]" in seen_k.get("system", "") and "[CK-B-burn_in_drift-1]" in seen_k.get("system", "")
+           and "IGNORE_PRIOR_MARKER" in seen_k.get("prompt", "") and "checklist_markers" in seen_k.get("prompt", ""),
+           f"SCK3 a repair's system prompt names the critic's checklist text by marker only; the text is message data "
+           f"({errs_k}; {seen_k.get('prompt', '')[-200:]!r})")
         # S17b (hb2 fix 3): the critic is told which of its findings the owner answered, to carry them forward
         from agents import findings_ledger as _FL
         with tempfile.TemporaryDirectory() as d17:
@@ -1164,6 +1226,37 @@ def _self_test() -> int:
         ok(cs.get("run_a") == ("ok", ["P-001", "P-002"], ["P-001"]) and cs.get("run_b", ("",))[0] == "ok"
            and cs.get("domain") == ("ok", ["D-001"], []),
            f"CS1 the harness stamps each critic's reviewer and id prefix, carried_forward ids with them ({cs})")
+        # SCK2: a stamped id is renamed in the structural checklist's finding references too, so the file stays valid
+        from toolkit.spec import critique_checklist as CLs
+        cd = os.path.join(d, "cs_checklist")
+        os.makedirs(cd)
+        ckd = {i: {"answer": "pass", "reason": "r"} for i in CLs.ITEMS}
+        ckd["burn_in_drift"] = {"answer": "finding", "reason": "drift", "blockers": ["D-001"]}
+        SdkTasks._session = critic_writes({"reviewer": "redteam", "round": 1, "verdict": "REVISE",
+                                           "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                           "checklist": ckd, "blockers": [blk("D-001", category="HYPOTHESES")]})
+        try:
+            SdkTasks(cd).critique(cd, "critique-redteam", 1)
+        finally:
+            SdkTasks._session = orig_session
+        try:
+            gotk = V.validate_critique(os.path.join(cd, CRITIQUE_FILE["critique-redteam"]), "critique-redteam", 1,
+                                       checklist=True)
+            sck2 = gotk["checklist"]["burn_in_drift"]["blockers"]
+        except V.SchemaError as e:
+            sck2 = getattr(e, "errors", None) or [str(e)]
+        ok(sck2 == ["R-001"], f"SCK2 the stamp renames the checklist's blocker references with the ids ({sck2})")
+        # SCK4 (Codex r3 of #366, P1-1): the stamp never rewrites a checklist file with a duplicate key (a rewrite
+        # would keep one entry silently); the gate refuses the file as written
+        cd = os.path.join(d, "cs_dup")
+        os.makedirs(cd)
+        dup_txt = ("reviewer: domain\nround: 1\nverdict: PASS\nstructural_mismatch: {detected: false}\n"
+                   "carried_forward: []\nblockers: []\nchecklist:\n  burn_in_drift: {answer: finding, reason: r}\n"
+                   "  burn_in_drift: {answer: pass, reason: r}\n").encode()
+        open(os.path.join(cd, "critique_domain.yaml"), "wb").write(dup_txt)
+        ok(stamp_critique(cd, "critique-domain", None) is False
+           and open(os.path.join(cd, "critique_domain.yaml"), "rb").read() == dup_txt,
+           "SCK4 the stamp leaves a checklist file with a duplicate key as written")
         cd = os.path.join(d, "cs_collide")
         os.makedirs(cd)
         SdkTasks._session = critic_writes({"reviewer": "presentation", "round": 1, "verdict": "PASS",

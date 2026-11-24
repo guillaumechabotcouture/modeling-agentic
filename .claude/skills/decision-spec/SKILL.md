@@ -102,7 +102,18 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    `prior_range` decision test; do not declare one. A prior targets an engine parameter only
    (`prior_target_not_parameter`). A unit attribute bound to a data column is data: if the
    column is uncertain, declare that where it arises, as the observation of a latent quantity
-   through a source with a sampling frame and a bias model. When field data dispute a
+   through a source with a sampling frame and a bias model. A rate measured per unit from
+   counts (the package-rate engine in `trial_priors` mode, its `baseline_rate` bound to a
+   panel's pooled rates) has sampling error unit by unit: declare
+   `engine.config.baseline.sampling: {model: poisson, dispersion, outcomes, source}` (the
+   panel's over-dispersion, 1 for Poisson), bind each unit's event counts as
+   `baseline_events` (`columns: {<outcome>: <count column>}`), and list the `unit_rates`
+   source, which draws each unit's rate independently. Whenever the engine card declares
+   `baseline.sampling`, declare the `unit_rates` source or exclude it with a reason (the
+   check refuses neither). A headline interval narrower than `thresholds.yaml
+   uncertainty.interval_rel_width_min` of its magnitude is an owner item
+   (`analysis_interval_degenerate`, a declarable HIGH): draw the uncertainty the headline
+   rests on, or the owner declares the limitation. When field data dispute a
    column's values for some units, declare a `unit_attribute` decision test over the disputed
    values (`unit_attribute: {column, units: [ids] | all, values | scale | set_from}`); the
    column must feed an engine attribute that has a declared valid range, and on the emulator
@@ -115,6 +126,19 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `finding:` id when it answers a gate finding. A new test is one `type: perturb` with a
     `set:` of targets (what is moved, how, to what; format and targets in
     `toolkit/spec/perturb.py`); the older type names still work and compile to it.
+    **Wiring.** The analysis moves every input the spec declares as varying (sensitivity
+    ranges and cost items, drawn priors and scenario values, fitted and calibrated
+    parameters, decision-test inputs) to each end of its range and checks that it moves at
+    least one declared outcome or cost (`toolkit/analysis/wiring.py`, `analysis/wiring.yaml`).
+    An input that moves nothing, moves less than the engine's own noise, or (on the emulator
+    path) moves the emulator too little to show the engine reads it, gets an
+    `input_not_wired` finding. The check is advisory for now: the finding is MEDIUM and
+    never fails a run, and it is marked `would_block` so that false positives can be counted.
+    Only when the input is deliberately inert in this run, declare
+    `analysis.wiring_exempt: {parameters | cost_items | burden_anchors | decision_tests:
+    {<name>: <reason>}}`, using the name wiring.yaml gives it under its own kind. The results
+    list every exemption with its reason, including unused ones. Fix a dead input; do not
+    exempt it.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for. When the question asks for the options that maximise an *expected*
     outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
