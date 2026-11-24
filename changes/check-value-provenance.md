@@ -1,0 +1,8 @@
+---
+phase: "v2 autonomy"
+commit: "CV α–ζ"
+---
+
+## Changelog
+
+**Finding provenance: amendments record the findings that motivated them.** `toolkit/spec/amend.py` gains `motivation(parent, request, declared, required)`: the child's `metadata.json` and `amendment_record.json` carry `motivated_by` (schema `motivated_by/1`), the parent run's id and, for each motivating finding in the parent's `findings.jsonl`, its id, kind, source, severity, status, critic category (from the parent's critique YAMLs) and answer fingerprint (`findings_ledger.answer_fingerprint`). It is required for a rethink-driven amendment (`--from-request`, lead and owner paths: the request's own findings and its briefs' findings; a patch's declaration does not stand in), so a request naming none, or naming a finding whose id is not a non-empty string, is refused with no child. A manual patch may add `motivated_by: {findings: [ids], reason}` (each id a non-empty string in the parent's ledger; a declaration naming none needs a reason), else the record says `source: unstated`. The spec, its sign-off, the sheet, `patch_sha256`, `parent_run` and `_made_by` are unchanged; the amendment's smoke command gains two `motivated_by` markers. A child no longer copies the parent's `impact_ledger.jsonl`. A relaunch with `MA_PARENT_RUN` records `motivated_by` from the parent's rethink request (`stage_machine._relaunch_motivation`): `unstated` without one, `unreadable` for a missing parent or a malformed request. The reader, `scripts/harness_metrics.py --check-value`, is draft #378. Self-tests AM_MOTIVE_FROM_REQUEST, AM_MOTIVE_UNSTATED, AM_MOTIVE_REQUIRED, AM_MOTIVE_ID_REFUSED, AM_MOTIVE_DECLARED, AM_MOTIVE_REFUSED, RR5b, RR6; the lead-amendment fixture now names its motivating finding.

@@ -114,7 +114,11 @@ test asks; the values tested are rendered from computed claims); nor have the ye
 undetermined texts of deliverable.decision.statements (the harness renders the values); and `engine_parameters` gives no
 value for a parameter the engine card lists as calibrated or fitted (calibrate a calibrated one
 under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
-it out). Output:
+it out). A rate measured per unit from counts carries sampling error unit by unit: when the engine
+card offers per-unit sampling (the package-rate engine's `baseline.sampling` in trial_priors mode,
+with each unit's event counts bound as `baseline_events`), declare it, then list the `unit_rates`
+uncertainty source, or exclude it with a reason; a headline interval with next to no width goes
+to the owner. Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """

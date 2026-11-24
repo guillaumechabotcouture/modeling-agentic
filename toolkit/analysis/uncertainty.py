@@ -15,6 +15,12 @@ its two sources, so the stored spike batch reproduces):
                      drawn from the same residual rows so they keep their held-out correlation
   priors             (v2 priors, drawn whenever there is one) every prior parameter from its declared bounded
                      distribution (toolkit/spec/priors.py), on its own random stream, before calibration
+  unit_rates         (hb3 fix 5; an engine that declares per-unit sampling, direct evaluation) each unit's measured
+                     attributes from the engine's own sampling model (engine.draw_unit_attributes), on its own
+                     stream, independently across units; the draws reach the engine through DirectModel.unit_spec
+Per-unit values drawn by either route (unit_rates, or the calibration covariance's z of likelihood, posterior and joint
+calibration) are summarised in the report's `unit_values_drawn`, so a report never reads as if they were held fixed
+(hb3 malaria R1: `sampler_varied_parameters` counted the 6 rate ratios, not the 10 district rates drawn with them).
 The point plan is evaluated in every draw (the headline interval) and the plan is
 re-optimised in every draw (package stability). The point plan's cost is recorded in every draw
 too (F6 S1-1): costs move with treated cases and unit prices, so a plan within the budget at the
@@ -50,6 +56,7 @@ ORDER = ("engine_parameters", "calibration", "costs", "emulator")
 POINT_TOL = 1e-6           # v2-posterior-point: a value within the fit file's 6-decimal rounding of the chosen point
 PROGRESS_EVERY_S = 300.0    # a long per-draw loop logs its progress at most this often (and at its last item)
 NE_STREAM = 0x6E6566        # the net-effect posterior's row choice: its own stream, the other sources' draws unchanged
+UNIT_STREAM = 0x756E74      # unit_rates: its own stream, so declaring it leaves every other source's draws unchanged
 
 
 def posterior_input(spec) -> dict | None:
@@ -281,6 +288,18 @@ class Drawer:
         self.arng = np.random.default_rng([int(seed), BU.ANCHOR_STREAM]) if BU.ANCHOR_SOURCE in self.src else None
         if self.arng is not None and getattr(A, "anchor", None) is None:
             raise ValueError(f"uncertainty: source {BU.ANCHOR_SOURCE} is declared but the analysis has no anchor")
+        from toolkit.spec.schema import UNIT_RATES
+        self.urng, self.last_units, self.unit_first, self.unit_varied = None, None, {}, set()
+        if UNIT_RATES in self.src:
+            fn = getattr(A.eng, "unit_sampling", None)
+            if not callable(fn) or fn() is None:
+                raise ValueError(f"uncertainty: source {UNIT_RATES} is declared but the engine declares no per-unit "
+                                 "sampling")
+            if getattr(A.model, "kind", None) != "direct":
+                raise ValueError(f"uncertainty: source {UNIT_RATES} needs direct evaluation (an emulator does not "
+                                 "take drawn unit values)")
+            self.unit_sampling = fn()
+            self.urng = np.random.default_rng([int(seed), UNIT_STREAM])
         # uncertainty.net_effect_posterior (opt-in): every draw takes one whole row of the net-effect fit's accepted
         # joint sample for the sample's parameters, on its own stream, after the priors and fitted ranges are drawn
         # (so the other values are those drawn without it). Owner, 14 Nov (f6-posterior-ranges): the sample's hull
@@ -371,6 +390,8 @@ class Drawer:
             for k, v in zip(self.ne["names"], self.ne["rows"][i]):
                 theta[k] = sampled[k] = float(v)
             self.ne_rows.append(i)
+        # per-unit values drawn with the calibration (likelihood, posterior, joint): z sampled, not re-inverted
+        urow = {f"z:{i}": float(v) for i, v in (zs or {}).items() if v is not None}
         if zs is None:
             cz = A.calibrate(theta, shifts)
             zs = {i: v[0] for i, v in cz.items()}
@@ -378,7 +399,39 @@ class Drawer:
         if self.arng is not None:
             from toolkit.analysis import burden as BU
             sampled.update(BU.draw_external(A.anchor, self.arng))
+        self.last_units = None
+        if self.urng is not None:           # unit_rates: the engine's own sampling model, unit by unit in id order
+            s = self.unit_sampling
+            self.last_units = {}
+            for i in A.ids:
+                d = A.eng.draw_unit_attributes(A.model.unit_spec(i, zs.get(i)), self.urng)
+                self.last_units[i] = d
+                urow.update({f"{s['attribute']}:{i}:{o}": float(d[s["attribute"]][o]) for o in s["outcomes"]})
+        for k, v in urow.items():           # O(keys) memory: the first value of each key, and the keys that moved
+            if k not in self.unit_first:
+                self.unit_first[k] = v
+            elif v != self.unit_first[k]:
+                self.unit_varied.add(k)
         return theta, zs, noise, mult, sampled
+
+    def unit_values(self) -> dict:
+        """The report's `unit_values_drawn`: per route, the per-unit values that varied across the draws (counted, and
+        their attribute), so the report says which unit values the interval covers."""
+        varied = sorted(self.unit_varied)
+        out = {"n_varied": len(varied)}
+        z = [k for k in varied if k.startswith("z:")]
+        if z:
+            out["calibration"] = {"attribute": self.A.spec["calibration"].get("attribute"), "units": len(z),
+                                  "basis": "drawn jointly with the calibrated parameters (calibration source)"}
+        if self.urng is not None:
+            s = self.unit_sampling
+            n = [k for k in varied if not k.startswith("z:")]
+            out["unit_rates"] = {"attribute": s["attribute"], "outcomes": list(s["outcomes"]),
+                                 # key attribute:<unit>:<outcome>; an outcome name holds no ':' (the engine refuses it)
+                                 "units": len({k[len(s["attribute"]) + 1:].rsplit(":", 1)[0] for k in n}),
+                                 "values": len(n), "model": s["model"],
+                                 "dispersion": s["dispersion"], "source": s["source"]}
+        return out
 
 
 class Progress:
@@ -522,7 +575,8 @@ def _draw_rows(A, D, nd, label="uncertainty draws", log=None):
     of draws fan out first; every draw is then evaluated in order on its own runs, with the same results."""
     from toolkit.analysis import draw_fanout as DF
     P = Progress(log if log is not None else getattr(A, "log", None), label, nd)
-    kw = DF.config(A)
+    # unit_rates draws reach the engine through the coordinator's DirectModel only: such draws stay in-process
+    kw = DF.config(A) if getattr(D, "urng", None) is None else None
     if kw is not None:
         w = DF.wave_size(A)
         for a in range(0, nd, w):
@@ -546,7 +600,8 @@ def _draw_rows(A, D, nd, label="uncertainty draws", log=None):
         D.last_clamped = []
         theta, zs, noise, mult, sampled = D.draw()
         clamped = list(D.last_clamped)
-        out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=sampled)
+        ua = {} if getattr(D, "last_units", None) is None else {"unit_attrs": D.last_units}
+        out, ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=sampled, **ua)
         yield {"sampled": sampled, "clamped": clamped, "out": out, "ben": ben, "cost": cost,
                "events": list(A.last_events), "floors": list(getattr(A, "last_cost_floors", None) or [])}
         P.step()
@@ -722,6 +777,9 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
                                          "unmatched calibration")
     if D.ne is not None:        # f6-posterior-ranges: these columns' ranges came from the posterior, with its sha256
         report["net_effect_posterior_ranges"] = posterior_range_record(D.ne)
+    if callable(getattr(D, "unit_values", None)):     # hb3 fix 5: the per-unit values the draws varied, by route
+        data["unit_values_drawn"], report["unit_values_drawn"] = D.unit_values(), D.unit_values()
+        report["sampler_varied_unit_values"] = data["unit_values_drawn"]["n_varied"]
     return {"data": data, "report": report,
             "plan_draws": {"draws": nd, "seed": data["seed"], "primary": A.primary, "plan": {i: plan[i] for i in A.ids},
                            "primary_averted": list(fixed[A.primary]), "per_draw": plan_sums}}
