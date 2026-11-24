@@ -465,10 +465,20 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     if pv is not None:
         arts["plan_variants"] = S.write("plan_variants", pv, V.PRODUCER, [arts["point"]])
     # ---- sensitivity
-    sens = SE.run(A, z0, ben0, cost0, plan_pt, sol["objective"])
-    arts["sensitivity"] = S.write("sensitivity", sens, SE.PRODUCER, [arts["point"]])
-    # ---- decision tests
-    dts = DT.run_all(A, z0, out0, ben0, cost0, plan_pt, u["data"], run_dir)
+    from toolkit.analysis import wiring as WR      # the sensitivity ends and test evaluations, kept for the wiring check
+    rec = WR.start(A, out0, cost0)        # advisory: None when it cannot start; the analysis goes on
+    try:
+        sens = SE.run(A, z0, ben0, cost0, plan_pt, sol["objective"])
+        arts["sensitivity"] = S.write("sensitivity", sens, SE.PRODUCER, [arts["point"]])
+        # ---- decision tests
+        dts = DT.run_all(A, z0, out0, ben0, cost0, plan_pt, u["data"], run_dir)
+        # ---- wiring: every declared input reaches a declared output (owner, 2026-11-23)
+        ev_, fl_ = A.last_events, A.last_cost_floors      # as the decision tests left them: the check only measures
+        wr = WR.finish(A, rec, dts, z0, ben0)      # never raises: a failure is recorded in the artifact
+        A.last_events, A.last_cost_floors = ev_, fl_
+    finally:
+        if rec is not None:
+            rec.close()
     if jc is not None:      # owner decision R1 (F6 run 1): a declared calibration miss stands only with its test run
         from toolkit.analysis import joint_calibration as JC
         dp = JC.declared_test_problems(jc["unmatched_decision"], dts)
@@ -506,6 +516,9 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     for x in dts:
         if x["path"]:
             S.deliverable(os.path.join(run_dir, x["path"]), DT.PRODUCER, "decision_test")
+    arts["wiring"] = S.write("wiring", wr, WR.PRODUCER, [arts["sensitivity"], arts["decision_tests"]])
+    log(f"wiring (advisory): {wr.get('error') or wr['summary']}; {len(wr['not_wired'])} input(s) not shown to reach "
+        f"a declared output; {wr['evaluations'].get('extra', 0)} extra evaluation(s)")
     conf = (jc or {}).get("unmatched_decision", {}).get("conflicts") if jc is not None else None
     if conf is not None:      # W0-F: each held-out target, why, its tests' verdicts; who decides (empty: none)
         from toolkit.analysis import conflicts as CF
@@ -571,7 +584,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # ---- claims and results.md
     c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal,
                  dict(model.accuracy, **({"boundary_ranking": bnd} if bnd else {})), pv=pv, burden=bvd, anchor=anc,
-                 voi=voi)
+                 voi=voi, wiring=wr)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
                                                                           "decision_tests", "calibration")]
                              + ([arts["plan_variants"]] if pv is not None else [])
@@ -585,7 +598,7 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS)
                               + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
                               + (["burden_validation"] if bvd else []) + (["burden_anchor"] if anc else [])
-                              + (["value_of_information"] if voi is not None else []),
+                              + (["value_of_information"] if voi is not None else []) + ["wiring"],
                               "roles": list(EXPECTED_ROLES),
                               "decision_tests": {x["test_id"]: x["path"] for x in dts}}
     S.finalize("complete")
@@ -1015,6 +1028,7 @@ def _self_test() -> int:
         ok(open(os.path.join(out, "v")).read() == "untouched",
            "AR-RW1 an analysis artifact and the manifest are not written through a link or a planted .tmp")
     DG.check_capture(ok, failed=fails)
+    _self_test_wiring(ok, q)       # after the golden capture: its runs' decision tests are not golden records
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
@@ -3591,6 +3605,48 @@ def _self_test_round2(ok, d, q):
     ok(clean and st, f"R32 engine: auto runs on the harness's engine choice, and a changed choice makes the analysis "
                      f"stale ({len(st)} findings)")
     del math
+
+
+def _self_test_wiring(ok, q):
+    """Sensitivity wiring (owner, 2026-11-23; advisory) end to end on the toy engine, direct path: a wired run passes
+    reusing the sensitivity ends; an engine that ignores a declared parameter gives an advisory input_not_wired; an
+    exemption removes it and is listed in results.md."""
+    import tempfile
+    import yaml
+    from toolkit.analysis import contract
+    from toolkit.engines import contract as EC
+    with tempfile.TemporaryDirectory() as d:
+        r = schema.direct_toy(yaml.safe_load(open(schema.toy_spec(d, n=12))))
+        yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+
+        def go():
+            run(d, log=q, unsigned=True)
+            w = yaml.safe_load(open(os.path.join(d, "analysis", "wiring.yaml")))["data"]
+            man = json.load(open(os.path.join(d, "analysis", "manifest.json")))
+            return ({x["name"]: x for x in w["rows"]}, w,
+                    [f for f in contract.gate_findings(d) if f["kind"] == "input_not_wired"], man)
+        rows, w, f, man = go()
+        ok(rows["eff_a"]["verdict"] == rows["eff_b"]["verdict"] == "wired" and not f
+           and w["evaluations"]["extra"] == 0 and w["evaluations"]["noise_probe"] == 1
+           and rows["synergy"]["verdict"] == "held_fixed" and "wiring" in man["expected"]["kinds"],
+           f"R-WR1 a wired toy run passes, the sensitivity ends reused (only the noise probe runs): {w['evaluations']}")
+        orig = EC.ToyEngine.run
+        try:
+            EC.ToyEngine.run = lambda self, params, unit, package, horizon, seed: orig(  # noqa: E731
+                self, dict(params, eff_b=0.3), unit, package, horizon, seed)       # eff_b hard-coded: never read
+            rows, w, f, _m = go()
+            ok(rows["eff_b"]["verdict"] == "not_wired" and rows["eff_a"]["verdict"] == "wired"
+               and [(x["key"], x["severity"], x["scope_declarable"], x["would_block"]) for x in f]
+               == [("parameter:eff_b", "MEDIUM", True, True)],
+               f"R-WR2 a declared parameter the engine ignores gives an advisory input_not_wired: {[x['key'] for x in f]}")
+            r["analysis"]["wiring_exempt"] = {"parameters": {"eff_b": "toy: the engine holds it at its trial value"}}
+            yaml.safe_dump(r, open(os.path.join(d, "decision_spec.yaml"), "w"), sort_keys=False)
+            rows, w, f, _m = go()
+            res = open(os.path.join(d, "results.md")).read()
+            ok(not f and rows["eff_b"]["exempt"] and "`eff_b`" in res and "trial value" in res,
+               "R-WR3 an exempt input gives no finding and results.md lists it with its reason")
+        finally:
+            EC.ToyEngine.run = orig
 
 
 def _self_test_unit_attr(ok, q):

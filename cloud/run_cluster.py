@@ -421,14 +421,47 @@ def _on_worker(client, fn, *args, worker):
 
 
 def read_keys(path=ENV_FILE) -> dict:
-    """ANTHROPIC_API_KEY / OPENAI_API_KEY only; values are never printed."""
+    """ANTHROPIC_API_KEY / OPENAI_API_KEY only; values are never printed. A value is dotenv-parsed: a quoted one is
+    what is inside its quotes, an unquoted one ends at an inline ` #` comment (Codex r1 on #362: `KEY="" # later`
+    read as non-empty)."""
     keys = {}
     with open(path) as f:
         for line in f:
             k, _, v = line.strip().partition("=")
             if k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
-                keys[k] = v.strip().strip('"').strip("'")
+                v = v.strip()
+                if v[:1] in ("'", '"'):
+                    end = v.find(v[0], 1)
+                    v = v[1:end] if end > 0 else v[1:]
+                    if k and line.strip().partition("=")[2].strip()[:1] == '"':   # dotenv decodes these escapes
+                        v = re.sub(r"\\([nrt\\\"])", lambda m: {"n": "\n", "r": "\r", "t": "\t"}.get(m.group(1), m.group(1)), v)
+                else:
+                    v = v.split(" #", 1)[0].strip()
+                keys[k] = v
     return keys
+
+
+def api_keys() -> dict:
+    """read_keys, refused (SystemExit) when ANTHROPIC_API_KEY is missing or blank: launch and relaunch read the keys
+    through this before any cluster is created or task submitted (Codex round 1 on #358: a cluster was created and
+    recorded, then the submission failed on the key). Values are never printed."""
+    try:
+        keys = {k: str(v).strip() for k, v in read_keys().items()}
+    except (OSError, UnicodeDecodeError) as e:
+        raise SystemExit(f"{ENV_FILE} cannot be read ({type(e).__name__}): refusing before any cluster") from None
+    if not keys.get("ANTHROPIC_API_KEY"):
+        raise SystemExit(f"no ANTHROPIC_API_KEY (missing or blank) in {ENV_FILE}: refusing before any cluster")
+    return keys
+
+
+def _release(cfg, inv) -> None:
+    """Release this invocation's budget reservation after a refusal that came before any cluster (best effort)."""
+    try:
+        import budget
+        n = budget.release_reservation(inv, cfg.name, clusters_file=cfg.clusters_file)
+        print(f"budget: released {n} reservation(s) of {cfg.name} for invocation {inv}", flush=True)
+    except Exception as e:  # noqa: BLE001 -- an unreleased reservation lapses after 2 h with no cluster (budget.py)
+        print(f"budget: the reservation could not be released ({type(e).__name__}); it lapses after 2 h", flush=True)
 
 
 def code_tarball(cfg) -> tuple[bytes, str]:
@@ -1030,7 +1063,11 @@ def _launch_locked(cfg, inv) -> int:
     compute = _compute(cfg)
     vm = vm_request(cfg, compute)                 # every VM type priced, before the budget reserves anything
     budget_guard(cfg, inv=inv)                    # before any key is read or cluster created
-    keys = read_keys()
+    try:
+        keys = api_keys()                         # before any cluster: a missing or blank key refuses here
+    except SystemExit:
+        _release(cfg, inv)                        # the budget check above reserved the cap for this invocation
+        raise
     n0 = len(cfg.labels) + cfg.compute_start
     cluster = _construct(cfg, cfg.name, inv, lambda: coiled.Cluster(   # this invocation's, or refused unrecorded
         name=cfg.name, workspace=WORKSPACE, n_workers=n0, worker_vm_types=vm["run"]["worker_vm_types"],
@@ -2105,6 +2142,7 @@ def relaunch(cfg, label) -> int:
         if label not in assign:
             raise SystemExit(f"{label}: no assignment in {cfg.state_file}; not relaunching")
         budget_guard(cfg, reserve=False)  # more paid work on the live run cluster: the budget must still cover it
+        keys = api_keys()                 # before any call to storage or the cluster (Codex r1 on #362)
         results_store = _results_store()
         launch_id = assign[label]["launch_id"]
         names = {b["name"] for b in results_store.list_blobs(f"outputs/{cfg.storage_prefix}/launch_{launch_id}/",
@@ -2133,7 +2171,7 @@ def relaunch(cfg, label) -> int:
         if stale:
             raise SystemExit(f"{label}: refusing: " + "; ".join(stale))
         client.upload_file(os.path.join(HERE, "worker_side.py"))
-        question, keys = open(cfg.question_file).read().strip(), read_keys()
+        question = open(cfg.question_file).read().strip()
         assign[label].update(commit=commit, submitted=time.strftime("%F %T"), relaunched=True, pipeline=pipeline,
                              launcher=f"run_cluster:{cfg.name}", eval_inputs_sha256=eval_paths.archive_sha256(code),
                              submission="sent", invocation=inv, task_key=_task_key(label))
@@ -4328,6 +4366,89 @@ def _self_test_eval_configs(ok) -> None:
                 os.environ[k] = v
 
 
+def _self_test_api_keys(ok) -> None:
+    """RK1-RK3 (Codex round 1 on #358): a missing or blank Anthropic key refuses before any cluster is created, and
+    a launch refused there releases the reservation its budget check made."""
+    import types
+    from unittest import mock
+    import budget
+    for keys in ({}, {"ANTHROPIC_API_KEY": "   "}, {"ANTHROPIC_API_KEY": ""}):
+        with mock.patch.dict(globals(), {"read_keys": lambda: dict(keys)}):
+            try:
+                api_keys()
+                msg = None
+            except SystemExit as e:
+                msg = str(e)
+            except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+                msg = f"{type(e).__name__}"
+        ok(bool(msg) and "ANTHROPIC_API_KEY" in msg, f"RK1 a missing or blank key is refused: {sorted(keys)} ({msg})")
+    made, recs, released = [], [], []
+    fake = types.SimpleNamespace(Cluster=lambda **kw: made.append(kw))
+    with mock.patch.dict(sys.modules, {"coiled": fake}), \
+            mock.patch.object(budget, "release_reservation", lambda inv, name, clusters_file=None, env=None:
+                              released.append((inv, name)) or 1, create=True), \
+            mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
+                                        "pipeline_preflight": lambda c, code: "v2", "budget_guard": lambda *a, **k: None,
+                                        "stale_sheet_problems": lambda *a: [], "vm_request": lambda *a: {"run": {}},
+                                        "_compute": lambda c: types.SimpleNamespace(WORKER_VM_TYPES=["x"]),
+                                        "write_clusters": lambda *a, **k: recs.append(a),
+                                        "read_keys": lambda: {"ANTHROPIC_API_KEY": " "}}):
+        try:
+            _launch_locked(RunConfig(name="ev-t-gcc", question_file="/dev/null", pipeline="v2", cap_usd=5), "inv-9")
+            msg = None
+        except SystemExit as e:
+            msg = str(e)
+        except Exception as e:  # noqa: BLE001
+            msg = f"past the check: {type(e).__name__}"
+    ok(bool(msg) and "ANTHROPIC_API_KEY" in msg and not made and not recs and released == [("inv-9", "ev-t-gcc")],
+       f"RK2 a blank key: refused before any cluster is created or recorded, its reservation released ({msg}, "
+       f"{len(made)} made, {released})")
+    import inspect
+    src = inspect.getsource(relaunch)
+    ok("api_keys()" in src and src.index("budget_guard(") < src.index("api_keys()") < src.index("_results_store()"),
+       "RK3 relaunch reads the keys right after its budget check, before any call to storage or the cluster")
+    import tempfile
+    real_read = read_keys
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, ".env")
+        open(p, "w").write('ANTHROPIC_API_KEY="" # provision later\nOPENAI_API_KEY=sk-x # note\n')
+        with mock.patch.dict(globals(), {"read_keys": lambda: real_read(p)}):
+            try:
+                api_keys()
+                msg = None
+            except SystemExit as e:
+                msg = str(e)
+        open(p, "w").write('ANTHROPIC_API_KEY="\\t"\n')
+        with mock.patch.dict(globals(), {"read_keys": lambda: real_read(p)}):
+            try:
+                api_keys()
+                msg6 = None
+            except SystemExit as e:
+                msg6 = str(e)
+        ok(bool(msg6), f"RK6 (Codex r2 on #362) a double-quoted value is decoded before the blank check: \\t is blank ({msg6})")
+        open(p, "w").write('ANTHROPIC_API_KEY="" # provision later\nOPENAI_API_KEY=sk-x # note\n')
+        ok(bool(msg) and real_read(p).get("OPENAI_API_KEY") == "sk-x",
+           f"RK4 (Codex r1 on #362) a quoted empty value with an inline comment is blank; comments are not values ({msg})")
+    released.clear()
+    with mock.patch.dict(sys.modules, {"coiled": fake}), \
+            mock.patch.object(budget, "release_reservation", lambda inv, name, clusters_file=None, env=None:
+                              released.append((inv, name)) or 1, create=True), \
+            mock.patch.dict(globals(), {"is_running": lambda n: False, "code_tarball": lambda c: (b"", "abc"),
+                                        "pipeline_preflight": lambda c, code: "v2", "budget_guard": lambda *a, **k: None,
+                                        "stale_sheet_problems": lambda *a: [], "vm_request": lambda *a: {"run": {}},
+                                        "_compute": lambda c: types.SimpleNamespace(WORKER_VM_TYPES=["x"]),
+                                        "read_keys": lambda: open("/nonexistent/.env").read()}):
+        try:
+            _launch_locked(RunConfig(name="ev-t-gcc", question_file="/dev/null", pipeline="v2", cap_usd=5), "inv-8")
+            msg = None
+        except SystemExit as e:
+            msg = str(e)
+        except Exception as e:  # noqa: BLE001
+            msg = f"raised {type(e).__name__}"
+    ok(bool(msg) and not msg.startswith("raised") and released == [("inv-8", "ev-t-gcc")],
+       f"RK5 (Codex r1 on #362) an unreadable key file refuses the same way and releases the reservation ({msg})")
+
+
 def _self_test_budget(ok) -> None:
     """BU (F6 Stage 2, 2026-11-11: $106 spent of a $100 budget): `launch` refuses unless the owner-signed budget
     (cloud/budget.py) covers the scope's spend plus the config's cap_usd, before any key is read or cluster made."""
@@ -5765,6 +5886,10 @@ def _self_test() -> int:
         _self_test_eval_configs(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"EV: {type(e).__name__}: {e}")
+    try:
+        _self_test_api_keys(ok)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"RK: {type(e).__name__}: {e}")
     globals()["budget_guard"] = lambda cfg, reserve=True, inv=None: None   # the launch cases below predate the budget (BU1-BU4 test it)
     _self_test_42b(ok, RunConfig)
     _self_test_51c(ok)
