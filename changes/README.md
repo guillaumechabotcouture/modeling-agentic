@@ -13,6 +13,10 @@ so these entries no longer conflict.
 phase: "51"
 commit: "α"
 status_group: "Merged (Phase 51, development process)"   # optional
+goal: diagnostics                                         # optional
+markers:                                                  # optional
+  - "run_state.json:history"
+  - "events.jsonl~\"kind\": \"stage\""
 ---
 
 ## Changelog
@@ -47,3 +51,19 @@ queued under another name. Fragments are flat: a nested path or a non-`.md`
 file under `changes/` is an error for both the check and the release (one
 discovery rule). `phase`, `commit` and `status_group` are single lines. This
 README is not a fragment.
+
+Two optional, machine-readable fields (owner, 2026-11-24;
+`docs/design/diagnostic-data.md`), which the diagnostics tools read:
+
+- `goal`: the one goal this change builds toward, an `id` in
+  `docs/design/goals.yaml` as it stands at the PR's head. Add a goal there
+  in the same PR if none fits.
+- `markers`: the smoke markers only this change's code produces, as a list
+  of `scripts/smoke_check.py` specs (`PATH`, `PATH:KEY`, `PATH:KEY=VALUE`,
+  `PATH:KEY^=PREFIX`, `PATH~REGEX`), each path relative to the run
+  directory. They are the same markers the PR description names, so a
+  baseline's collected runs can be checked against them.
+
+The check refuses an unknown goal or a marker that does not parse. Older
+fragments, written before these fields, stay prose and still pass. The
+fold ignores both fields.

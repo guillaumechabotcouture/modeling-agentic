@@ -15,6 +15,9 @@ Fragment format (`changes/<branch-or-phase>.md`):
     phase: "51"
     commit: "α"
     status_group: "Merged (Phase 51, development process)"   # optional
+    goal: diagnostics                  # optional: an id in docs/design/goals.yaml
+    markers:                           # optional: smoke markers (scripts/smoke_check.py SPEC forms)
+      - "run_state.json:history"
     ---
 
     ## Changelog
@@ -33,6 +36,11 @@ Folding (`--write`):
     "## Status" section if that group exists, else a new group is placed
     above the marker line `<!-- change-fragments ... -->`;
   - the folded fragment files are deleted. The maintainer commits the result.
+
+Machine-readable fields (owner, 2026-11-24; docs/design/diagnostic-data.md §4, P2 and P3): `goal` names one
+id of docs/design/goals.yaml as it stands at the PR's head; `markers` is a list of one-line smoke-marker specs that
+scripts/smoke_check.py parses (PATH, PATH:KEY, PATH:KEY=VALUE, PATH:KEY^=PREFIX, PATH~REGEX), each path relative
+to the run directory. Both are optional, so fragments written before them stay prose. The fold ignores them.
 
 PR check (`--check-pr BASE`, run in CI on pull requests): every fragment the
 PR adds or changes must parse, and the ledger table and the Status section
@@ -72,7 +80,9 @@ MARKER_RE = re.compile(r"^<!-- change-fragments\b.*-->\s*$")
 MARKER = ("<!-- change-fragments: scripts/assemble_changes.py adds new Status groups "
           "above this line -->")
 GREEK = "αβγδεζηθικλμνξοπρστυφχψω"
-KEYS = {"phase", "commit", "status_group"}
+KEYS = {"phase", "commit", "status_group", "goal", "markers"}
+GOALS = "docs/design/goals.yaml"
+_GOAL_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 
 
 class FragmentError(ValueError):
@@ -116,15 +126,74 @@ def fragment_paths(paths, where: str = "") -> list[str]:
     return sorted(out)
 
 
+def goal_ids(text) -> set[str]:
+    """The ids in a goals file's text. Raises FragmentError when it is not the expected shape (fail closed)."""
+    try:
+        doc = yaml.safe_load(text) if isinstance(text, str) else None
+    except (yaml.YAMLError, ValueError, RecursionError) as e:
+        raise FragmentError(f"{GOALS}: not valid YAML ({type(e).__name__})") from None
+    rows = doc.get("goals") if isinstance(doc, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise FragmentError(f"{GOALS}: needs a non-empty 'goals' list")
+    ids: set[str] = set()
+    for g in rows:
+        gid = g.get("id") if isinstance(g, dict) else None
+        if not isinstance(gid, str) or not _GOAL_ID.fullmatch(gid) or gid in ids:
+            raise FragmentError(f"{GOALS}: every goal needs a unique id of lowercase letters, digits and '-'")
+        if not isinstance(g.get("title"), str) or not g["title"].strip():
+            raise FragmentError(f"{GOALS}: goal {gid} needs a title")
+        ids.add(gid)
+    return ids
+
+
+def _marker_problem(m) -> str | None:
+    """Why one smoke-marker spec is refused, or None. Parsed by scripts/smoke_check.py, the checker that runs it."""
+    if not isinstance(m, str) or not m.strip() or _multiline(m):
+        return "each marker must be a non-empty one-line string"
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import smoke_check
+    try:
+        spec = smoke_check.parse_spec(m)
+    except Exception as e:  # noqa: BLE001 -- re.error, OverflowError, RecursionError: all a refused marker (Codex r1)
+        return f"marker {m[:60]!r} does not parse ({type(e).__name__})"
+    path = str(spec.get("path") or "")
+    if (not path.strip() or os.path.isabs(path) or path.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", path)
+            or ".." in path.replace("\\", "/").split("/")):
+        return f"marker {m[:60]!r}: its path must be relative to the run directory (no drive, root or '..')"
+    if spec.get("kind") in ("field", "equals", "prefix") and any(not k for k in str(spec.get("key") or "").split(".")):
+        return f"marker {m[:60]!r}: a field marker needs a key with no empty part (PATH:KEY)"
+    return None
+
+
+def _duplicate_keys(text: str) -> list[str]:
+    """Top-level keys the header repeats (YAML keeps only the last one, silently)."""
+    try:
+        node = yaml.compose(text)
+    except (yaml.YAMLError, ValueError, RecursionError):
+        return []                  # the load below reports it
+    if not isinstance(node, yaml.MappingNode):
+        return []
+    seen, dup = set(), []
+    for k, _v in node.value:
+        kv = getattr(k, "value", None)
+        if kv in seen:
+            dup.append(str(kv))
+        seen.add(kv)
+    return dup
+
+
 def _same_entry(a: dict, b: dict) -> bool:
     """Same ledger row (phase, commit, Changelog text); the optional Status
     metadata does not change what would be folded into the ledger twice."""
     return all(a[k] == b[k] for k in ("phase", "commit", "changelog"))
 
 
-def parse_fragment(text: str, name: str = "fragment") -> dict:
-    """Return {phase, commit, status_group, changelog, status: [lines], name}.
-    Raises FragmentError on any structural problem (fail closed)."""
+def parse_fragment(text: str, name: str = "fragment", goals: set[str] | None = None) -> dict:
+    """Return {phase, commit, status_group, goal, markers, changelog, status: [lines], name}.
+    Raises FragmentError on any structural problem (fail closed). `goals`: the known goal ids, and a `goal` outside
+    them is refused; None checks only its form (a fragment read at another commit than the PR's head)."""
     if not isinstance(text, str):
         raise FragmentError(f"{name}: not text")
     lines = text.splitlines()
@@ -138,6 +207,9 @@ def parse_fragment(text: str, name: str = "fragment") -> dict:
         head = yaml.safe_load("\n".join(lines[1:end]))
     except (yaml.YAMLError, ValueError, RecursionError) as e:
         raise FragmentError(f"{name}: header is not valid YAML ({type(e).__name__})") from None
+    dup = _duplicate_keys("\n".join(lines[1:end]))
+    if dup:
+        raise FragmentError(f"{name}: header repeats {sorted(set(dup))} (only the last would count)")
     if not isinstance(head, dict):
         raise FragmentError(f"{name}: header must be a mapping")
     extra = set(map(str, head)) - KEYS
@@ -152,6 +224,21 @@ def parse_fragment(text: str, name: str = "fragment") -> dict:
     group = head.get("status_group")
     if group is not None and (not isinstance(group, str) or not group.strip() or _multiline(group)):
         raise FragmentError(f"{name}: status_group must be a one-line string")
+
+    goal = head.get("goal")
+    if "goal" in head:
+        if not isinstance(goal, str) or not _GOAL_ID.fullmatch(goal):
+            raise FragmentError(f"{name}: goal must be one id of {GOALS} (lowercase letters, digits and '-')")
+        if goals is not None and goal not in goals:
+            raise FragmentError(f"{name}: goal {goal!r} is not an id in {GOALS} ({', '.join(sorted(goals))})")
+    markers = head.get("markers")
+    if "markers" in head:
+        if not isinstance(markers, list) or not markers:
+            raise FragmentError(f"{name}: markers must be a non-empty list of smoke-marker specs")
+        for m in markers:
+            why = _marker_problem(m)
+            if why:
+                raise FragmentError(f"{name}: {why}")
 
     sections: dict[str, list[str]] = {}
     cur = None
@@ -181,7 +268,8 @@ def parse_fragment(text: str, name: str = "fragment") -> dict:
     if status and group is None:
         raise FragmentError(f"{name}: a '## Status' section needs 'status_group' in the header")
     return {"name": name, "phase": str(head["phase"]).strip(), "commit": str(head["commit"]).strip(),
-            "status_group": group.strip().rstrip(":").strip() if group else None, "changelog": body, "status": status}
+            "status_group": group.strip().rstrip(":").strip() if group else None, "changelog": body, "status": status,
+            "goal": goal, "markers": [m.strip() for m in markers] if markers else []}
 
 
 def _sort_key(fr: dict):
@@ -293,12 +381,16 @@ def load_fragments(root: str) -> list[dict]:
         rel += [os.path.relpath(os.path.join(dp, x), root).replace(os.sep, "/") for x in fns
                 if os.path.isfile(os.path.join(dp, x)) or os.path.islink(os.path.join(dp, x))]
     out = []
+    gp, goals = os.path.join(root, GOALS), set()
+    if os.path.isfile(gp) and not os.path.islink(gp):
+        with open(gp, "rb") as f:
+            goals = goal_ids(_decode(f.read(), GOALS))
     for r in fragment_paths(rel):
         p = os.path.join(root, r)
         if os.path.islink(p) or not os.path.isfile(p):
             raise FragmentError(f"{r}: must be a regular file")
         with open(p, "rb") as f:
-            out.append(parse_fragment(_decode(f.read(), r), r))
+            out.append(parse_fragment(_decode(f.read(), r), r, goals=goals))
     return out
 
 
@@ -426,11 +518,24 @@ def check_pr(root: str, base: str, upstream: str | None = None) -> list[str]:
                    and "/" not in p[len(CHANGES_DIR) + 1:] and not p.upper().endswith("/README.MD")}
     added = [p for st, p in pairs if p in changed and not st.startswith("D")]
     deleted = [p for st, p in pairs if p in changed and st.startswith("D")]
+    try:                       # the goals as they stand at the PR's head (a PR may add a goal and use it)
+        g_txt = _show(root, "HEAD", GOALS)
+        head_goals = goal_ids(g_txt) if g_txt is not None else set()
+    except FragmentError as e:
+        problems.append(str(e))
+        head_goals = set()
     for p in added:
         try:
-            parse_fragment(_decode(_show_bytes(root, "HEAD", p) or b"", p), p)
+            parse_fragment(_decode(_show_bytes(root, "HEAD", p) or b"", p), p, goals=head_goals)
         except FragmentError as e:
             problems.append(f"{e}")
+    # Codex r1 of #382: a goal removed while a queued fragment still names it would block the next release, so every
+    # fragment at HEAD that names a goal is checked against the goals at HEAD, not only the ones this PR changes
+    queued, _errs = _fragments_at(root, "HEAD")
+    for p, fr in sorted(queued.items()):
+        if p not in added and fr.get("goal") and fr["goal"] not in head_goals:
+            problems.append(f"{p}: goal {fr['goal']!r} is no longer an id in {GOALS}; keep the goal (mark it retired) "
+                            f"or change the fragment")
     gone = []
     for p in deleted:
         try:
@@ -611,6 +716,49 @@ def _self_test() -> int:
             ok(True, f"CF8 rejects fragment: {label}")
     f9 = parse_fragment(_frag(50, "β", "a | b\nwraps here"), "n")
     ok(ledger_row(f9) == "| 50 | β | a \\| b wraps here |", "CF9 pipes escaped, lines folded into one cell")
+
+    # CF-G1..G6: the machine-readable goal and markers (owner, 2026-11-24). A fragment with neither still parses.
+    gtxt = "version: 1\ngoals:\n  - {id: diagnostics, title: D}\n  - {id: autonomy, title: A}\n"
+    gs = goal_ids(gtxt)
+    ok(gs == {"diagnostics", "autonomy"}, "CF-G1 the goal ids are read from the goals file")
+    hd = '---\nphase: "1"\ncommit: "α"\n'
+    good = parse_fragment(hd + "goal: diagnostics\nmarkers:\n  - 'events.jsonl~\"kind\": \"stage\"'\n"
+                          "  - 'run_state.json:events_dropped=0'\n---\n## Changelog\nx\n", "g", goals=gs)
+    ok(good["goal"] == "diagnostics" and len(good["markers"]) == 2 and ledger_row(good) == "| 1 | α | x |",
+       "CF-G2 a fragment with a known goal and parsable markers parses; the fold ignores both")
+    ok(parse_fragment(_frag(1, "α", "x"), "old", goals=gs)["markers"] == [], "CF-G3 a prose-only fragment still parses")
+    bad_g = {"unknown goal": "goal: nope\n", "goal not a string": "goal: [a]\n", "markers not a list": "markers: x\n",
+             "empty markers": "markers: []\n", "marker not a string": "markers: [1]\n",
+             "absolute marker": "markers: ['/etc/hosts']\n", "parent marker": "markers: ['../x.json']\n",
+             "bad regex marker": "markers: ['a.json~(']\n"}
+    for label, extra in bad_g.items():
+        try:
+            parse_fragment(hd + extra + "---\n## Changelog\nx\n", label, goals=gs)
+            ok(False, f"CF-G4 rejects fragment: {label}")
+        except FragmentError:
+            ok(True, f"CF-G4 rejects fragment: {label}")
+    for label, extra in {"blank goal": "goal:\n", "blank markers": "markers:\n",
+                         "empty field key": "markers: ['goals.yaml:']\n", "empty key part": "markers: ['a.json:b..c=1']\n",
+                         "drive path": "markers: ['C:\\\\other\\\\events.log~stage']\n",
+                         "UNC path": "markers: ['\\\\\\\\host\\\\share\\\\x.json']\n",
+                         "regex overflow": "markers: ['events.log~x{4294967296}']\n",
+                         "duplicate markers": "markers: [a.json]\nmarkers: [b.json]\n"}.items():
+        try:
+            parse_fragment(hd + extra + "---\n## Changelog\nx\n", label, goals=gs)
+            ok(False, f"CF-G7 rejects fragment (Codex r1): {label}")
+        except FragmentError:
+            ok(True, f"CF-G7 rejects fragment (Codex r1): {label}")
+    bad_files = {"no goals list": "version: 1\n", "duplicate id": "goals:\n  - {id: a, title: x}\n  - {id: a, title: y}\n",
+                 "no title": "goals:\n  - {id: a}\n", "bad id": "goals:\n  - {id: A B, title: x}\n"}
+    for label, txt in bad_files.items():
+        try:
+            goal_ids(txt)
+            ok(False, f"CF-G5 rejects goals file: {label}")
+        except FragmentError:
+            ok(True, f"CF-G5 rejects goals file: {label}")
+    with open(os.path.join(ROOT, GOALS), encoding="utf-8") as fh:
+        ok(goal_ids(fh.read()) >= {"autonomy", "quality-vs-bare-agents", "architecture", "f6", "diagnostics"},
+           "CF-G6 the repository's goals file parses and holds the goals the owner named")
 
     # CF10-CF14 — the PR check on a scratch git repository.
     with tempfile.TemporaryDirectory() as td:

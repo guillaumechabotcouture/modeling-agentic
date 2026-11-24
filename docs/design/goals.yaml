@@ -1,0 +1,20 @@
+# The harness development goals a change fragment's `goal:` names (owner, 2026-11-24).
+# scripts/assemble_changes.py refuses a fragment whose goal is not an id here, as this file stands at the PR's head.
+# Ids are stable: retire a goal by adding `retired: <date>`, never by renaming its id.
+version: 1
+goals:
+  - id: autonomy
+    title: A harness that carries a modelling question from question to report with a human doing 10-20% of the work
+    doc: docs/design/improvement-plan.md
+  - id: quality-vs-bare-agents
+    title: Deliverable quality measured against bare agents on the same questions (the eval suite and baselines)
+    doc: docs/design/improvement-plan.md
+  - id: architecture
+    title: The v2 architecture, where code owns the flow and the harness computes every number
+    doc: docs/architecture-v2.md
+  - id: f6
+    title: The F6 run, end to end, to a report we can stand behind
+    doc: docs/design/f6-plan.md
+  - id: diagnostics
+    title: Diagnostic data for following and diagnosing runs and operations from Claude Desktop
+    doc: docs/design/diagnostic-data.md
