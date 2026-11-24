@@ -120,9 +120,14 @@ value for a parameter the engine card lists as calibrated or fitted (calibrate a
 under `calibration`, or leave it to the engine; a fitted one is set by the engine's own fit: leave
 it out). A rate measured per unit from counts carries sampling error unit by unit: when the engine
 card offers per-unit sampling (the package-rate engine's `baseline.sampling` in trial_priors mode,
-with each unit's event counts bound as `baseline_events`), declare it, then list the `unit_rates`
-uncertainty source, or exclude it with a reason; a headline interval with next to no width goes
-to the owner. Output:
+with each unit's event counts bound as `baseline_events`; estimate empirical over-dispersion
+max(1, chi2/df) across rounds/years when a multi-period panel is over-dispersed), declare it, then
+list the `unit_rates` uncertainty source, or exclude it with a reason; a headline interval with next
+to no width goes to the owner. When both an administrative cohort coverage series and a finite-sample
+serosurvey exist for the compartmental engine, do not plug raw survey proportions into fixed `s0`
+(`initialiser: given`): bind the cohort series with `initialiser: cohort_history` and calibrate
+per-unit `coverage_scale` against the survey's binomial observations (`targets.kind: observations`),
+so the posterior shrinks sampling noise and propagates per-unit immunity uncertainty. Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """

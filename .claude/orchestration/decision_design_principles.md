@@ -49,7 +49,10 @@ only the owner can amend the signed spec.
 5. When measured data and a modelled surface disagree about an input, compare them on the same estimand,
    after accounting for how each was measured: the sampling frame, ascertainment or reporting completeness,
    and known biases. Prefer the measured data when it is comparable on that basis, for example field
-   surveillance over a modelled map of the same quantity. Record the conflict and both values.
+   surveillance over a modelled map of the same quantity. Record the conflict and both values. When the
+   measured data come from a finite-sample survey alongside an administrative cohort or unit series, calibrate
+   the series to the survey's sampling likelihood (propagating survey uncertainty and shrinking sampling noise)
+   rather than discarding the series and plugging raw sample proportions in as fixed point values.
 
 6. An uncertain input that can move the decision is a range with a decision test, never a single point
    value.

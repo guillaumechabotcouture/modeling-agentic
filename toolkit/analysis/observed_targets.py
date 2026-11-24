@@ -199,7 +199,66 @@ def problems(spec, card, pnames) -> list[str]:
             bad.append(f"{w}: latent {lat!r} not in {STATE + ('attack_rate',)} or outcome:<output>")
         if r["package"] is not None and r["package"] not in pk:
             bad.append(f"{w}: package {r['package']!r} is not an option")
+    if not bad and rows and all(r["latent"] in STATE for r in rows):
+        bad += _state_targets_informed(spec, rows, attr, cal["parameters"], pri, pk, groups)
     return bad
+
+
+def _state_targets_informed(spec, rows, attr, params, pri_decl, pk, groups) -> list[str]:
+    """When every target observes pre-epidemic state (immunity or susceptible), at least one calibrated engine
+    parameter or per-unit attribute must move `s_start` on at least one observed group. Otherwise the observation
+    likelihood is flat and informs nothing (for example, binding raw survey ratios as fixed point values while
+    calibrating only transmission parameters)."""
+    eng = spec.engine()
+    if not callable(getattr(eng, "initial_state", None)):
+        return []
+    if not attr and not params:
+        return ["calibration.targets: every observation measures pre-epidemic state (immunity/susceptible), but "
+                "neither a per-unit attribute nor any engine parameter is calibrated (the observations inform nothing)"]
+    from toolkit.analysis.calibration import Prior
+    from toolkit.analysis.model import calibrated_value
+    from toolkit.engines.contract import Package, UnitSpec
+    from toolkit.spec import engine_parameters as PV
+    pri_p = {p: Prior.from_decl(p, pri_decl[p]) for p in params}
+    pri_a = Prior.from_decl(attr, pri_decl[attr]) if attr else None
+    u_rows = {str(u[spec.uid]): u for u in spec.units()}
+    comp = spec.comparator
+    by_pair: dict[tuple, set[int]] = {}
+    for r in rows:
+        by_pair.setdefault((r["unit"], r["package"] or comp), set()).update(groups.index(g) for g in r["groups"])
+    mid_vals = {p: float(pri_p[p].ppf(0.5)) for p in params}
+    th_mid = PV.params(spec, mid_vals)
+    z_mid = float(pri_a.ppf(0.5)) if pri_a is not None else None
+    for (uid, pkg_name), idxs in by_pair.items():
+        obs_idx = sorted(idxs)
+        epkg = Package(pkg_name, spec.engine_package(pk[pkg_name]))
+        base_attrs = spec.unit_attributes(u_rows[uid])
+
+        def eval_s(th, z):
+            a = dict(base_attrs)
+            if attr and z is not None:
+                a[attr] = calibrated_value(spec, z)
+            st = eng.initial_state(th, UnitSpec(uid, a), epkg)
+            return np.asarray(st["s_start"], float)[obs_idx]
+        try:
+            s0 = eval_s(th_mid, z_mid)
+            if pri_a is not None:
+                for q in (0.1, 0.9):
+                    if float(np.max(np.abs(eval_s(th_mid, float(pri_a.ppf(q))) - s0))) > 1e-12:
+                        return []
+            for p in params:
+                for q in (0.1, 0.9):
+                    th_q = PV.params(spec, {**mid_vals, p: float(pri_p[p].ppf(q))})
+                    if float(np.max(np.abs(eval_s(th_q, z_mid) - s0))) > 1e-12:
+                        return []
+        except (ValueError, KeyError, TypeError) as e:
+            return [f"calibration.targets: initial_state failed inside the declared prior for unit {uid} ({e})"]
+    return [f"calibration.targets: every observation measures pre-epidemic state (immunity/susceptible), which does "
+            f"not depend on any calibrated parameter ({params}) or unit attribute ({attr!r}) on the observed groups "
+            "(the likelihood is flat and the observations inform nothing). Calibrate a per-unit latent attribute "
+            "(for example coverage_scale with initialiser: cohort_history on an administrative cohort series) or "
+            "per-group initial-state parameters against the survey observations rather than binding noisy survey "
+            "ratios as fixed point values"]
 
 
 class ObservedProblem:

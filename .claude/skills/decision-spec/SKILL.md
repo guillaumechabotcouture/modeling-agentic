@@ -106,7 +106,9 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    counts (the package-rate engine in `trial_priors` mode, its `baseline_rate` bound to a
    panel's pooled rates) has sampling error unit by unit: declare
    `engine.config.baseline.sampling: {model: poisson, dispersion, outcomes, source}` (the
-   panel's over-dispersion, 1 for Poisson), bind each unit's event counts as
+   panel's over-dispersion, 1 for Poisson; for a multi-year or multi-round panel, estimate
+   empirical over-dispersion `max(1, chi2 / df)` from between-round residuals rather than
+   hardcoding 1 when variance exceeds the mean), bind each unit's event counts as
    `baseline_events` (`columns: {<outcome>: <count column>}`), and list the `unit_rates`
    source, which draws each unit's rate independently. Whenever the engine card declares
    `baseline.sampling`, declare the `unit_rates` source or exclude it with a reason (the
@@ -195,14 +197,24 @@ by birth cohort, an outbreak's final size), the engine is
 - **Generation interval.** `generation_interval: {seir: {latent_days, infectious_days}}`. The final size
   does not depend on it; timing does.
 - **Immunity.** `initialiser: given` takes the susceptible share per group. Make it a calibrated
-  parameter with `per_group_parameters: [s0]`. `cohort_history` takes dose coverage by birth year, and
-  `coverage_scale` is a per-unit latent multiplier on a reported coverage series. When you calibrate it, start
-  its prior from the card's sourced range (`attribute_binding.yaml`, `coverage_scale.prior`) and copy the
-  source. First check the card's `applicability` assumptions against the question (coverage level, declared
-  seroconversion, pathogen, setting), and recompute the ends where they differ. A narrower or wider range
-  needs its own source. The results list the card's limitation for it: it is a
-  simplification standing in for everything that separates reported from effective coverage. Repeat that in the
-  report's limitations.
+  parameter with `per_group_parameters: [s0]`. When both a cohort-level administrative coverage series
+  and a finite-sample serosurvey exist, do **not** discard the cohort series and plug raw `1 - k/n`
+  survey proportions into `initialiser: given` (`s0`) as fixed point values: small-sample binomial noise
+  distorts unit rankings, leaves per-unit sampling error out of the draws, and makes state-only
+  observation targets flat (refused by the validator). Instead, use `initialiser: cohort_history` (binding
+  the administrative dose coverages per birth cohort) and calibrate `coverage_scale` per unit
+  (`calibration: {method: posterior, attribute: coverage_scale, scale: linear, ...}`) against the
+  serosurvey's binomial observations (`targets: {kind: observations, latent: immunity}`). This shrinks
+  noisy bands toward the cohort series while letting genuine multi-SD discrepancies move effective
+  coverage, and propagates per-unit sampling uncertainty into both `expected_value` planning and the 95%
+  UI. When you calibrate `coverage_scale`, start its prior from the card's sourced range
+  (`attribute_binding.yaml`, `coverage_scale.prior`) and copy the source. First check the card's
+  `applicability` assumptions against the question (coverage level, declared seroconversion, pathogen,
+  setting), and recompute the ends where they differ. A narrower or wider range needs its own source. The
+  results list the card's limitation for it: it is a simplification standing in for everything that
+  separates reported from effective coverage; if a subset of age bands diverges from the administrative
+  series while older bands agree, keep the calibrated `cohort_history` posterior, repeat that limitation
+  in the report, and test sensitivity to band-specific susceptibility with a decision test.
 - **Outcomes.** An outcome per infection (`outcomes: [o]`) is a unit attribute `ratio:<o>`, or calibrated
   per group with `per_group_parameters: [ratio:<o>]`.
 - **Interventions.**
