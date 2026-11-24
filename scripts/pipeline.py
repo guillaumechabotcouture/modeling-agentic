@@ -3910,7 +3910,7 @@ def _self_test_kernel_sandbox(rep, codes, need) -> None:
         work = tempfile.mkdtemp(prefix="derive_")
         try:            # DI-K11 (review P2-3): no /etc directory grant; a root holding the repository is refused
             pol, why = _kernel_roots(work, [], [])
-            with _mock.patch.object(sys, "prefix", REPO), _mock.patch("sysconfig.get_paths", lambda: {"stdlib": REPO}):
+            with _mock.patch.object(sys, "prefix", REPO), _mock.patch("sysconfig.get_paths", lambda *a, **k: {"stdlib": REPO}):
                 why2 = _kernel_roots(work, [], [])[1]
             rep(why is None and "/etc" not in pol["ro"] and "/etc/ld.so.cache" in pol["ro_files"] and why2 is not None,
                 f"DI-K11 /etc is granted file by file, never as a directory, and a root containing the repository is "
