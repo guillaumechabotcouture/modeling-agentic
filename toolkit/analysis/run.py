@@ -1006,6 +1006,7 @@ def _self_test() -> int:
     _self_test_posterior(ok, q)
     _self_test_joint(ok, q)
     _self_test_stability_flagged(ok)
+    _self_test_stability_default(ok)
     _self_test_variants(ok, q)
     _self_test_voi(ok, q)
     _self_test_plan_rule(ok, q)
@@ -1948,6 +1949,65 @@ def _self_test_outcome_adjust(ok, A, z0, out0, ben0, cost0, plan, R):
     ok(OA.record(A2.adjust)[0]["value"] == 0.5 and OA.record(A2.adjust)[0]["pairs"] == {"a": "b"},
        "OA-R6 the adjustments are recorded (id, component, reference, value, source, pairs)")
 
+
+
+def _self_test_stability_default(ok):
+    """SD1-SD5 (check-value item 5, owner 2026-11-23): on an allocation run the leave-one-group-out stability runs by
+    default. 13 of the 14 NOT_RUN records in the 31 v2 runs had no analysis.stability.holdout_group (10-12 units, no
+    region); without one the step now holds out decision_units.region, else each unit (up to MAX_DEFAULT_UNIT_FOLDS),
+    and says which it chose. It is NOT_RUN only with a stated reason."""
+    from toolkit.analysis import stability as SB
+    from toolkit.analysis.core import CostTable
+
+    def ct(ids):
+        return CostTable({i: [1.0, 2.0] for i in ids}, {i: [{}, {"c": 2.0}] for i in ids})
+
+    class _A:
+        method, theta0, budget = "emulator_inversion", {}, 10.0
+        pk, alloc = {0: frozenset(), 1: frozenset({"c"})}, {"units": {"populations": {"total": "pop"}}}
+
+        def __init__(self, n, stab, region=None):
+            self.ids = [f"u{k}" for k in range(n)]
+            self.region = region
+            self.by_id = {i: {"id": i, "reg": f"r{k % 3}", "x": float(k), "pop": 1.0} for k, i in enumerate(self.ids)}
+            self.spec = {"analysis": {"stability": stab}, "decision_units": {"id": "id", "region": region},
+                         "options": {"components": {"c": {}}}, "calibration": {"range": [-1e6, 1e6]}}
+            self.flagged = {}
+
+        def evaluate(self, theta, zh, hid):
+            return {}, {i: [1.0 + zh[i], 0.5] for i in hid}, ct(hid)
+
+        def solve(self, ben, cost):
+            return {"choice": {i: 0 for i in self.ids}, "objective": sum(ben[i][0] for i in self.ids)}
+
+        def guard(self, *a):
+            pass
+
+    def go(A):
+        z0 = {i: 0.1 * k for k, i in enumerate(A.ids)}
+        try:
+            return SB.run(A, z0, {i: 0 for i in A.ids}, {i: [1.0, 0.5] for i in A.ids}, ct(A.ids),
+                          {i: 0 for i in A.ids})
+        except Exception as e:  # noqa: BLE001 -- a failing case, not a crash of the self-test
+            return {"crash": f"{type(e).__name__}: {e}"}
+    r1 = go(_A(10, {"covariates": ["x"]}))
+    ok(r1.get("n_folds") == 10 and r1.get("holdout_group") == "id" and "unit" in str(r1.get("holdout_source"))
+       and r1.get("verdict") != "NOT_RUN",
+       f"SD1 no holdout group and no region: each unit is held out in turn, and the record says so: "
+       f"{ {k: r1.get(k) for k in ('n_folds', 'holdout_group', 'holdout_source', 'verdict', 'crash')} }")
+    r2 = go(_A(9, {"covariates": ["x"]}, region="reg"))
+    ok(r2.get("n_folds") == 3 and r2.get("holdout_group") == "reg" and "region" in str(r2.get("holdout_source")),
+       f"SD2 with decision_units.region the regions are held out: {r2.get('n_folds')}, {r2.get('holdout_source')}")
+    r3 = go(_A(10, {}))
+    ok(r3.get("verdict") == "NOT_RUN" and "covariates" in str(r3.get("reason")) and "crash" not in r3,
+       f"SD3 a defaulted emulator-inversion fold without covariates is NOT_RUN with the reason, not a crash: {r3}")
+    big = getattr(SB, "MAX_DEFAULT_UNIT_FOLDS", 0) + 1
+    r4 = go(_A(big, {"covariates": ["x"]}))
+    ok(big > 1 and r4.get("verdict") == "NOT_RUN" and "holdout_group" in str(r4.get("reason")),
+       f"SD4 too many units for one-unit folds and no region: NOT_RUN, naming what to declare: {r4.get('reason')}")
+    r5 = go(_A(9, {"holdout_group": "reg", "covariates": ["x"]}))
+    ok(r5.get("n_folds") == 3 and r5.get("holdout_source") == "spec",
+       f"SD5 a declared holdout group is used as before: {r5.get('n_folds')}, {r5.get('holdout_source')}")
 
 
 def _self_test_stability_flagged(ok):
