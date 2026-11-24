@@ -644,7 +644,7 @@ def _self_test() -> int:
         json.dump({"rows": [os.path.basename(d) for d in dirs]}, open(out, "w"))
         return out
 
-    tgz = P["collected"] + "ev-x/q.tar.gz"
+    tgz = P["collected"] + "ev-x/launch_L1/q.tar.gz"      # per launch (baseline hb3 §5.1): a relaunch keeps this one
     with tempfile.TemporaryDirectory() as td:
         st = guard(tick, b, N, {}, T0 + 1, td, fetch=fetch, metrics=metrics)
         st = guard(tick, b, N, st, T0 + 2, td, fetch=fetch, metrics=metrics)
@@ -662,6 +662,11 @@ def _self_test() -> int:
         guard(enqueue, b, N, "collect", {**entry, "assignments": {"q": {"launch_id": "L2"}}}, T0 + 5001)
         st = guard(tick, b, N, st, T0 + 5002, td, fetch=fetch, metrics=metrics)
         ok(lab_of(st).get("launch_id") == "L2" and seen["fetch"] == 3, f"SV10 a relaunch is collected ({lab_of(st)})")
+        ok(tgz in b.d and lab_of(st).get("blob") == P["collected"] + "ev-x/launch_L2/q.tar.gz" and lab_of(st)["blob"] in b.d,
+           f"SV10b a relaunch is archived under its own launch; the earlier launch's archive stays ({sorted(b.d)})")
+        import inspect
+        ok("siblings=" in inspect.getsource(fetch_from_storage),
+           "SV10c the supervisor's fetch names the launch's other labels, so a stored run two labels share is refused")
         # SV12 pull: each collected run once, sha256-checked before extraction
         with tempfile.TemporaryDirectory() as dest:
             got, again = guard(pull, b, N, dest), guard(pull, b, N, dest)

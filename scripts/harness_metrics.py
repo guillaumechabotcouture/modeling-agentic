@@ -716,6 +716,14 @@ def _self_test() -> int:
         r = summarise([mk("r_mis", done, {"status": "run_failed"}, R)])
         ok(r["status"]["value"] == "status_mismatch" and not r["completes"]["value"],
            "HM18 run_state.json and metadata.json disagree on the status: not completed")
+        # HM18b/c (baseline hb3 §4.2): metadata.json now records a pause too; it must agree with run_state.json
+        pz = {"state": "SPEC", "paused": "awaiting_spec_amendment", "status": None}
+        r = summarise([mk("r_pz", pz, {"status": "paused:awaiting_spec_amendment"})])
+        ok(r["status"]["value"] == "paused:awaiting_spec_amendment" and r["class"] == "not_completed",
+           f"HM18b a pause recorded in both files counts as that pause, not completed ({r['status']})")
+        r = summarise([mk("r_pz2", pz, {"status": "paused:awaiting_signoff"})])
+        ok(r["status"]["value"] == "status_mismatch" and not r["completes"]["value"],
+           f"HM18c run_state.json and metadata.json disagree on the pause: a mismatch ({r['status']})")
         d, d2 = mk("r_dir", done), mk("r_dangle", done)
         os.makedirs(os.path.join(d, "report.md"))
         os.symlink(os.path.join(root, "nowhere"), os.path.join(d2, "report.md"))

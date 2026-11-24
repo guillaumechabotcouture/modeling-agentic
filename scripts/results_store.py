@@ -773,6 +773,36 @@ def _self_test_durable(fails) -> None:
             blob = run_finish.store_run_results(run, service=_Svc())
         if blob is None:
             fails.append("S26b a link in the run dir (left out on purpose) does not fail the store")
+        # S28 (baseline hb3 §5.1: one replicate's upload replaced another's): overwrite=False never replaces a blob.
+        # The same bytes already there are this upload, landed on an earlier try; other bytes are refused at once.
+        taken = type("ResourceExistsError", (Exception,), {})
+        st28, calls28 = {}, []
+
+        class _C28(_Client):
+            def upload_blob(self, data, overwrite=False, length=None, timeout=None):
+                calls28.append(overwrite)
+                if not overwrite and self.key in self.st:
+                    raise taken(self.key)
+                super().upload_blob(data, overwrite, length, timeout)
+        svc28 = types.SimpleNamespace(get_blob_client=lambda c, n: _C28(st28, (c, n), [], None))
+        mine, other = os.path.join(d, "mine.bin"), os.path.join(d, "other.bin")
+        open(mine, "wb").write(b"mine")
+        open(other, "wb").write(b"other")
+        try:
+            upload_retry(mine, "outputs/s/r.tar.gz", service=svc28, overwrite=False)
+            again = upload_retry(mine, "outputs/s/r.tar.gz", service=svc28, overwrite=False)["blob"]
+            n0 = len(calls28)
+            try:
+                upload_retry(other, "outputs/s/r.tar.gz", service=svc28, overwrite=False)
+                refused = "no error"
+            except BlobNameTaken:
+                refused = "BlobNameTaken"
+        except Exception as e:  # noqa: BLE001
+            again, n0, refused = None, 0, f"{type(e).__name__}: {e}"
+        if (again != "outputs/s/r.tar.gz" or refused != "BlobNameTaken" or len(calls28) != n0 + 1
+                or st28.get(("outputs", "s/r.tar.gz")) != b"mine" or calls28[:1] != [False]):
+            fails.append(f"S28 overwrite=False keeps another file's blob (refused once, not retried) and accepts its "
+                         f"own landed bytes: {again}, {refused}, {calls28}")
 
 
 def main() -> int:

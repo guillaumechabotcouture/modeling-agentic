@@ -5689,6 +5689,81 @@ def _self_test_sheet(ok) -> None:
        f"RC80e signoff none is not checked; --res is read; only the last --resume counts: {none_mode} {abbrev} {last}")
 
 
+def _self_test_replicate_names(ok, tb) -> None:
+    """UN1-UN5 (baseline hb3 §5.1: dengue R1 and R2 started in the same second, got one run dir name and one stored
+    blob, and R2's upload overwrote R1's). main.py is told each run's label and launch; collection maps a label to its
+    own stored run and refuses a stored run that two labels' records both name, or that names another label."""
+    import inspect
+    import shutil
+    import tempfile
+    import types
+    from unittest import mock
+
+    class Store:
+        def __init__(self, files):
+            self.files = files
+
+        def download(self, blob, path, account):
+            if blob not in self.files:
+                raise FileNotFoundError(blob)
+            open(path, "wb").write(self.files[blob])
+
+    def rec(blob):
+        return json.dumps({"exit_code": 0, "duration_s": 5, "run_stored": blob}).encode()
+
+    def run(label=None):
+        meta = {"run_dir": "r", **({"run_label": label} if label else {})}
+        return tb({"r/metadata.json": json.dumps(meta).encode(), "r/report.md": (label or "old").encode()})
+    p, lid, sib = "runs/t", "L1", {"R1": "L1", "R2": "L1"}
+    old = "outputs/runs/t/r.tar.gz"
+    b1, b2 = (f"outputs/runs/t/launch_L1/run_{x}_r.tar.gz" for x in ("R1", "R2"))
+    with tempfile.TemporaryDirectory() as d:
+        cfg = types.SimpleNamespace(out_dir=d, storage_prefix=p, storage_account=None)
+        st = Store({ws.record_blob(p, lid, "R1"): rec(old), ws.record_blob(p, lid, "R2"): rec(old), old: run()})
+        for lb in ("R1", "R2"):
+            try:
+                collect_from_storage(cfg, st, lb, lid, None, siblings=sib)
+                got = "collected"
+            except StoredRunRefused as e:
+                got = str(e)
+            ok("R1" in got and "R2" in got and not os.path.exists(os.path.join(d, lb, "runs")),
+               f"UN1 {lb}: a stored run that two labels' records both name is refused, nothing extracted ({got[:140]})")
+        st = Store({ws.record_blob(p, lid, "R1"): rec(b1), ws.record_blob(p, lid, "R2"): rec(b2),
+                    b1: run("R1"), b2: run("R2")})
+        for lb in ("R1", "R2"):
+            collect_from_storage(cfg, st, lb, lid, None, siblings=sib)
+        ok(all(open(os.path.join(d, lb, "runs", "r", "report.md")).read() == lb for lb in ("R1", "R2")),
+           "UN2 each label is collected from its own stored run")
+    with tempfile.TemporaryDirectory() as d:
+        cfg = types.SimpleNamespace(out_dir=d, storage_prefix=p, storage_account=None)
+        try:
+            collect_from_storage(cfg, Store({ws.record_blob(p, lid, "R2"): rec(b1), b1: run("R1")}), "R2", lid, None)
+            got = "collected"
+        except StoredRunRefused as e:
+            got = str(e)
+        ok("R1" in got and not os.path.exists(os.path.join(d, "R2", "runs")),
+           f"UN3 a stored run that records another label is refused for this one ({got[:140]})")
+        m = collect_from_storage(cfg, Store({ws.record_blob(p, lid, "R1"): rec(old), old: run()}), "R1", lid, None,
+                                 siblings={"R1": lid})
+        ok(m["exit_code"] == 0 and open(os.path.join(d, "R1", "runs", "r", "report.md")).read() == "old",
+           "UN4 a run stored under the old name, which no other label's record names, is still collected")
+    ok("siblings=" in inspect.getsource(collect), "UN4b collect names the launch's other labels to each fetch")
+    main_py = ("import json, os\nos.makedirs('runs/R_x')\njson.dump({k: os.environ.get(k) for k in "
+               "('MA_RUN_LABEL', 'MA_LAUNCH_ID')}, open('runs/R_x/env.json', 'w'))\n").encode()
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w:gz") as t:
+        ti = tarfile.TarInfo("main.py")
+        ti.size = len(main_py)
+        t.addfile(ti, io.BytesIO(main_py))
+    root = tempfile.mkdtemp()
+    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"):
+        ws.run_job_impl("R2", b.getvalue(), "q", [], "k", None, launch_id="L7")
+    env = json.load(open(os.path.join(root, "R2", "runs", "R_x", "env.json")))
+    ok(env == {"MA_RUN_LABEL": "R2", "MA_LAUNCH_ID": "L7"} and "launch_id=launch_id" in inspect.getsource(ws._run_to_disk),
+       f"UN5 the agent VM tells main.py its label and launch, so the run dir and the stored blob are its own ({env})")
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -5946,6 +6021,10 @@ def _self_test() -> int:
         _self_test_liveness(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"LV: {type(e).__name__}: {e}")
+    try:
+        _self_test_replicate_names(ok, tb)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"UN: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
