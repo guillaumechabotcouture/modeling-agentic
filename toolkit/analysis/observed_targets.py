@@ -534,11 +534,13 @@ def fit(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, samp
         scanned = [0]
 
         def after_scan():
-            scanned[0], E.failed = E.failed, 0
+            scanned[0] += E.failed
+            E.failed = 0
         modes = MS.find_modes(P, after_scan=after_scan) if MS.uses_metropolis(P) else None
         scan_failed = scanned[0]
         refuse_failures("while finding the posterior modes")
-        s = MS.sample(P, seed=int(sd), modes=modes)
+        s = MS.sample(P, seed=int(sd), modes=modes, after_scan=after_scan)
+        scan_failed = scanned[0]
         refuse_failures("in the posterior sample")
         c = C.classify(P, s)
         refuse_failures("in the identifiability classification")

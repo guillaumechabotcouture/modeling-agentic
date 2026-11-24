@@ -722,6 +722,7 @@ def _merge_classes(fits: list[dict], contrib: list[int], shared_names: list[str]
     cl_map = {}
     for i in contrib:
         cl_map[i] = C.classify(fits[i]["P"], fits[i]["s"])
+        fits[i]["cls"] = cl_map[i]
         refusal_guard(fits[i]["E"], f"the identifiability classes (variant {fits[i]['v']['id']})")
     extra_names = sorted({n for i in contrib for n in fits[i]["P"].names if n not in shared_names})
     all_names = list(shared_names) + extra_names
@@ -895,6 +896,16 @@ def _analyse_pooled(spec, eng, variants, weighting, validation, seed, n_draws, p
             sample_counts[i], sample_counts[j] = sample_counts[i] + 1, sample_counts[j] - 1
     contrib = [i for i, c in enumerate(draw_counts) if c > 0]
     merged_cls, P_merged = _merge_classes(fits, contrib, shared_names)
+    from toolkit.analysis import mode_start as MS
+    bound_set = set()
+    for i in contrib:
+        if i == ref_idx:
+            xh_i = xh
+        else:
+            xh_i, _, _ = C._map_point(fits[i]["P"], fits[i]["s"]["best"])
+            refusal_guard(fits[i]["E"], f"the posterior mode (variant {v_ids[i]})")
+        bound_set.update(MS.near_bounds(fits[i]["P"], xh_i, classes=fits[i]["cls"]["classes"]))
+    at_bound = [n for n in P_merged.names if n in bound_set]
     blocks, offsets, canon_rows, variant_samples, cur = [], [], [], {}, 0
     for i, mv in enumerate(sample_counts):
         offsets.append(cur)
@@ -980,7 +991,7 @@ def _analyse_pooled(spec, eng, variants, weighting, validation, seed, n_draws, p
     post = {n: {"median": float(np.median(pooled_rows[:, j])), "interval": C.interval(pooled_rows[:, j], lvl),
                 "prior": P_merged.priors[n].describe()} for j, n in enumerate(shared_names)}
     return {"E": E_ref, "P": P_merged, "sample": pooled_sample, "variant_samples": variant_samples, "classes": merged_cls,
-            "map": dict(zip(P_ref.names, (float(v) for v in xh))),
+            "map": dict(zip(P_ref.names, (float(v) for v in xh))), "at_bound": at_bound,
             "converged": conv, "message": msg, "validation": validation, "draws": dr, "values": vals, "level": lvl,
             "determined": determined, "decision": decision, "tests": tests, "ppc": ppc, "rt": rt, "posterior": post,
             "seed": seed, "structural_variants": sv_rows, "structural_weighting": actual_weighting,
@@ -1033,7 +1044,9 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     ppc, rt = _ppc_rt(yrep, outs, E, lvl)
     post = {n: {"median": float(np.median(smp["rows"][:, j])), "interval": C.interval(smp["rows"][:, j], lvl),
                 "prior": P.priors[n].describe()} for j, n in enumerate(smp["names"])}
+    from toolkit.analysis import mode_start as MS
     return {"E": E, "P": P, "sample": s, "classes": cls, "map": dict(zip(P.names, (float(v) for v in xh))),
+            "at_bound": MS.near_bounds(P, xh, classes=cls["classes"]),
             "converged": conv, "message": msg, "validation": validation, "draws": dr, "values": vals, "level": lvl,
             "determined": determined,
             "decision": decision, "tests": tests, "ppc": ppc, "rt": rt, "posterior": post, "seed": seed}
@@ -1258,12 +1271,10 @@ def run(run_dir, spec, S, eng, arts: dict, data_in: list, eng_files: list, draws
     lab, scope = _label(spec, res)
     res["label"] = lab
     s, cls = res["sample"], res["classes"]
-    from toolkit.analysis import mode_start as MS
     cal = {"method": "posterior", "units": {}, "names": list(s["names"]),
            "diagnostics": dict({"converged": res["converged"], "message": res["message"],
                                 "n_targets": int(len(res["E"].target["y"])), "n_parameters": len(s["names"]),
-                                "sampler": s["method"],
-                                "at_bound": MS.near_bounds(res["P"], res["map"], classes=cls["classes"])},
+                                "sampler": s["method"], "at_bound": list(res.get("at_bound") or [])},
                                **s["diagnostics"]),
            "identifiability": {"method": cls["method"], "classes": cls["classes"],
                                "likelihood_classes": cls["likelihood_classes"], "contraction": cls["contraction"],
@@ -1620,6 +1631,22 @@ def _self_test_structural(ok, rows) -> None:
        and "earlier_attempts_refused" not in dg_hi
        and np.allclose(np.mean(shi["rows"], axis=0), mu_hi, atol=5e-3),
        f"AE30 _sample uses mode-start Metropolis cleanly above max_importance_params_run_batch ({dg_hi})")
+    # AE31: pooled at_bound checks each contributing variant against its own fitted prior range and mode
+    P_v1 = C.Problem(["transmissibility:1"],
+                     {"transmissibility:1": C.Prior.from_decl("transmissibility:1",
+                                                              {"dist": "uniform", "range": [0.5, 1.0], "source": "toy"})},
+                     lambda X: (np.zeros(len(X["transmissibility:1"])), {}))
+    P_v2 = C.Problem(["transmissibility:1", "transmissibility:2"],
+                     {"transmissibility:1": C.Prior.from_decl("transmissibility:1",
+                                                              {"dist": "uniform", "range": [0.5, 2.0], "source": "toy"}),
+                      "transmissibility:2": C.Prior.from_decl("transmissibility:2",
+                                                              {"dist": "uniform", "range": [0.5, 1.0], "source": "toy"})},
+                     lambda X: (np.zeros(len(X["transmissibility:1"])), {}))
+    ab_v1 = MS.near_bounds(P_v1, {"transmissibility:1": 0.997}, classes={"transmissibility:1": "identified"})
+    ab_v2 = MS.near_bounds(P_v2, {"transmissibility:1": 0.997, "transmissibility:2": 0.502},
+                           classes={"transmissibility:1": "identified", "transmissibility:2": "identified"})
+    ok(ab_v1 == ["transmissibility:1"] and ab_v2 == ["transmissibility:2"],
+       f"AE31 per-variant near_bounds catches both tight-prior reference and variant-only hits ({ab_v1}, {ab_v2})")
 
 
 def _self_test() -> int:

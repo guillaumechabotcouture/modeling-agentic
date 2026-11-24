@@ -47,6 +47,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 SCAN_LOG2 = 6                     # the start scan: 2^6 scrambled Sobol points over the prior (one batch)
+PROBE_LOG2 = 10                   # post-sample missed-mode probe: 2^10 scrambled Sobol points (1D-stratified)
+PROBE_OUTSIDE_SD = 5.0            # probe points further than this many Laplace sds from every mode are checked
+PROBE_OPT_MAX = 4                 # maximum outside-basin probe candidates optimised per verification
 MODE_STARTS = 8                   # the best scan points moved to a mode
 MODE_MASS_GAP = math.log(1000.0)  # with DENSITY_GAP: a mode far below the best in both is dropped
 DENSITY_GAP = 20.0                # nats of peak log density
@@ -180,7 +183,21 @@ def find_modes(P, starts: int = MODE_STARTS, after_scan=None) -> dict:
     f = _neg_log_post(P, Z0)
     if after_scan is not None:
         after_scan()
-    order = [int(i) for i in np.argsort(f, kind="stable") if np.isfinite(f[i])][:int(starts)]
+    finite = [int(i) for i in np.argsort(f, kind="stable") if np.isfinite(f[i])]
+    k_want = min(int(starts), len(finite))
+    k_top = min(max(1, k_want // 2), k_want)
+    order = finite[:k_top]
+    # Fill remaining starts with spatially separated finite points so one wide basin cannot crowd out a narrow peak.
+    for i in finite[k_top:]:
+        if len(order) >= k_want:
+            break
+        if all(float(np.linalg.norm(Z0[i] - Z0[j])) >= 1.0 for j in order):
+            order.append(i)
+    for i in finite[k_top:]:
+        if len(order) >= k_want:
+            break
+        if i not in order:
+            order.append(i)
     found = []
     for i in order:
         z, fz, conv = _optimise(P, Z0[i])
@@ -190,6 +207,70 @@ def find_modes(P, starts: int = MODE_STARTS, after_scan=None) -> dict:
     kept, dropped = _select(found, d)
     return {"modes": kept, "dropped": dropped, "optima": len(found), "scanned": int(len(Z0)),
             "scan_finite": int(np.sum(np.isfinite(f)))}
+
+
+def _in_any_basin(z, modes: list, sd_cut: float = 1.0) -> bool:
+    """True when z lies within `sd_cut` Laplace standard deviations of any mode in `modes`."""
+    cut2 = float(sd_cut) ** 2
+    for m in modes:
+        dz = z - m["z"]
+        try:
+            if float(dz @ np.linalg.solve(m["cov"], dz)) < cut2:
+                return True
+        except np.linalg.LinAlgError:
+            if bool(np.allclose(z, m["z"])):
+                return True
+    return False
+
+
+def _probe_missed_modes(P, kept: list, seed: int, attempt: int, after_scan=None) -> list:
+    """Independent prior-space Sobol probe for competing modes outside every sampled mode's basin."""
+    from scipy.stats import norm, qmc
+    d = len(P.names)
+    pseed = int(np.random.default_rng([int(seed), 23, int(attempt)]).integers(0, 2 ** 31 - 1))
+    Up = qmc.Sobol(d, scramble=True, seed=pseed).random_base2(PROBE_LOG2)
+    Zp = norm.ppf(np.clip(Up, 1e-9, 1 - 1e-9))
+    fp = _neg_log_post(P, Zp)
+    if after_scan is not None:
+        after_scan()
+    f_cut = max(m["neg_log_post"] for m in kept) + DENSITY_GAP
+    cand = np.where(np.isfinite(fp) & (fp <= f_cut))[0]
+    if len(cand) == 0:
+        return []
+    Z_cand = Zp[cand]
+    cut2 = max(PROBE_OUTSIDE_SD ** 2, float(d) + PROBE_OUTSIDE_SD * math.sqrt(2.0 * d))
+    outside = np.ones(len(cand), dtype=bool)
+    for m in kept:
+        Lm = _chol(m["cov"], d)
+        diff = (Z_cand - m["z"]).T
+        try:
+            v = np.linalg.solve(Lm, diff)
+            d2 = np.sum(v * v, axis=0)
+        except np.linalg.LinAlgError:
+            d2 = np.sum(diff * diff, axis=0)
+        outside &= (d2 >= cut2)
+    out_idx = cand[outside]
+    if len(out_idx) == 0:
+        return []
+    ranked = out_idx[np.argsort(fp[out_idx], kind="stable")]
+    chosen = []
+    for idx in ranked:
+        if len(chosen) >= PROBE_OPT_MAX:
+            break
+        if all(float(np.linalg.norm(Zp[idx] - Zp[j])) >= 0.5 for j in chosen):
+            chosen.append(int(idx))
+    extra = []
+    for idx in chosen:
+        z, fz, conv = _optimise(P, Zp[idx])
+        if _in_any_basin(z, kept, sd_cut=1.0):
+            continue
+        cov, logdet = laplace(_hessian(P, z), d)
+        extra.append({"z": z, "neg_log_post": fz, "converged": conv, "cov": cov,
+                      "log_mass": float(-fz - 0.5 * logdet), "scan_point": -1})
+    if not extra:
+        return []
+    merged, _ = _select(list(kept) + extra, d)
+    return [m for m in merged if not _in_any_basin(m["z"], kept, sd_cut=1.0)]
 
 
 def _chol(S, d):
@@ -296,26 +377,27 @@ def _text(e) -> str:
     return s[len(e.code) + 2:] if s.startswith(f"{e.code}: ") else s
 
 
-def sample(P, seed: int = 0, modes: dict | None = None, **override) -> dict:
+def sample(P, seed: int = 0, modes: dict | None = None, after_scan=None, **override) -> dict:
     """The canonical joint posterior sample of a Problem, in calibration.sample's shape: importance sampling up to
     `max_importance_params` (calibration.sample itself); above, adaptive Metropolis started at the posterior modes
-    (`modes`: find_modes' result, computed here when not given), one proposal per chain, retried once from new starts
-    before it refuses. Deterministic for a seed; the floors are calibration's thresholds."""
+    (`modes`: find_modes' result, computed here when not given), one proposal per chain, verified against an
+    independent prior-space probe for missed competing modes, retried once from new starts before it refuses.
+    Deterministic for a seed; the floors are calibration's thresholds."""
     C = _C()
     th = dict(C.thresholds(), **override)
     if not P.names:
         raise ValueError("posterior: nothing to calibrate")
     if not uses_metropolis(P, **override):
         return C.sample(P, seed=seed, **override)
-    found = modes if modes is not None else find_modes(P)
+    found = modes if modes is not None else find_modes(P, after_scan=after_scan)
     if not found.get("modes"):
         return C.sample(P, seed=seed, **override)       # no finite scan point: the prior-draw start, as before
+    active_modes = list(found["modes"])
     first, out = None, None
     for attempt, stream in enumerate(RETRY_STREAMS, 1):
         rng = np.random.default_rng([int(seed), int(stream)])
         try:
-            out = _chains(P, rng, th, found["modes"])
-            break
+            cand = _chains(P, rng, th, active_modes)
         except C.CalibrationRefused as e:
             if e.code != "posterior_mcmc":
                 raise
@@ -323,9 +405,21 @@ def sample(P, seed: int = 0, modes: dict | None = None, **override) -> dict:
                 raise C.CalibrationRefused("posterior_mcmc", f"{_text(e)} (mode start, per-chain adaptation; retried "
                                                              f"once from new starts: the first attempt gave {first})")
             first = _text(e)
+            continue
+        missed = _probe_missed_modes(P, active_modes, int(seed), attempt, after_scan=after_scan)
+        if missed:
+            note = f"independent prior probe discovered {len(missed)} unsampled posterior mode(s)"
+            if attempt == len(RETRY_STREAMS):
+                tail = f" (retried once: the first attempt gave {first})" if first else ""
+                raise C.CalibrationRefused("posterior_mcmc", note + tail)
+            active_modes, _ = _select(active_modes + missed, len(P.names))
+            first = note
+            continue
+        out = cand
+        break
     out["diagnostics"].update(start="posterior_mode", adaptation="per_chain", attempt=attempt,
-                              modes_kept=len(found["modes"]), modes_dropped=int(found.get("dropped", 0)),
-                              optima=int(found.get("optima", 0)),
+                              modes_kept=len(active_modes), modes_dropped=int(found.get("dropped", 0)),
+                              optima=int(found.get("optima", 0)), missed_mode_probe=2 ** PROBE_LOG2,
                               **({"first_attempt": first} if first else {}))
     out.update(names=list(P.names), seed=int(seed), sample_id=C._sample_id(P.names, out["rows"]),
                evaluations=P.n_evals, priors={n: P.priors[n].describe() for n in P.names})
@@ -336,9 +430,11 @@ BOUND_FRAC = 0.02                 # posterior mode within this fraction of a fin
 
 
 def near_bounds(P, xh, frac: float = BOUND_FRAC, classes: dict | None = None) -> list[str]:
-    """Parameters whose posterior mode sits within `frac` of a finite prior bound (natural coordinates), excluding
-    parameters classified as prior-dominated. MAP optimisation in z = Phi^-1(F(x)) coordinates pulls modes slightly
-    inward from a hard prior wall, so an exact-boundary check misses clipped fits."""
+    """Parameters whose posterior mode is pushed within `frac` of a finite prior bound (both in natural coordinates
+    and in the prior's own tail CDF), excluding prior-dominated parameters. Beta bounds are evaluated per end so a
+    prior spike at one end (a < 1 or b < 1) cannot hide data pushing into the opposite bound; requiring the prior
+    tail CDF prevents prior-concentrated Beta/Triangular medians from flagging under flat likelihoods."""
+    from scipy import stats
     if not P.names:
         return []
     if isinstance(xh, dict):
@@ -351,8 +447,14 @@ def near_bounds(P, xh, frac: float = BOUND_FRAC, classes: dict | None = None) ->
         if n not in vals or cls.get(n) == "prior_dominated":
             continue
         pr = P.priors[n]
-        if pr.dist not in ("uniform", "loguniform", "triangular") and not (
-                pr.dist == "beta" and (pr.a or 0.0) >= 1.0 and (pr.b or 0.0) >= 1.0):
+        if pr.dist in ("uniform", "loguniform", "triangular"):
+            check_lo = check_hi = True
+        elif pr.dist == "beta":
+            check_lo = (pr.a or 0.0) >= 1.0
+            check_hi = (pr.b or 0.0) >= 1.0
+            if not (check_lo or check_hi):
+                continue
+        else:
             continue
         lo, hi = pr.natural_support()
         span = float(hi) - float(lo)
@@ -361,8 +463,14 @@ def near_bounds(P, xh, frac: float = BOUND_FRAC, classes: dict | None = None) ->
         v = float(vals[n])
         if not math.isfinite(v) or (pr.dist == "loguniform" and v <= 0.0):
             continue
-        u = (float(pr.natural(v)) - float(lo)) / span
-        if u <= frac or u >= 1.0 - frac:
+        u_nat = (float(pr.natural(v)) - float(lo)) / span
+        if pr.dist in ("uniform", "loguniform"):
+            u_cdf = u_nat
+        elif pr.dist == "beta":
+            u_cdf = float(stats.beta.cdf(v, pr.a, pr.b))
+        else:
+            u_cdf = float(stats.triang.cdf(v, (pr.mode - pr.lo) / (pr.hi - pr.lo), loc=pr.lo, scale=pr.hi - pr.lo))
+        if (check_lo and u_nat <= frac and u_cdf <= frac) or (check_hi and u_nat >= 1.0 - frac and u_cdf >= 1.0 - frac):
             out.append(n)
     return out
 
@@ -569,6 +677,19 @@ def _self_test() -> int:
                      classes={"hi_clip": "identified", "lo_clip": "identified", "mid": "identified",
                               "flat_edge": "prior_dominated"})
     ok(nb == ["hi_clip", "lo_clip"], f"MS10 near_bounds detects clipped modes without flagging interior or flat ({nb})")
+    # MS10b: Beta ends are evaluated separately (a < 1 does not suppress upper-bound detection) and prior-concentrated
+    # medians do not trigger under point-only (classes=None) fits
+    Pb_ends = C.Problem(
+        ["spike_lo_push_hi", "spike_lo_at_lo", "prior_hi_median"],
+        {
+            "spike_lo_push_hi": C.Prior.from_decl("spike_lo_push_hi", {"dist": "beta", "a": 0.5, "b": 2.0, "source": "toy"}),
+            "spike_lo_at_lo": C.Prior.from_decl("spike_lo_at_lo", {"dist": "beta", "a": 0.5, "b": 2.0, "source": "toy"}),
+            "prior_hi_median": C.Prior.from_decl("prior_hi_median", {"dist": "beta", "a": 100.0, "b": 1.0, "source": "toy"}),
+        },
+        lambda X: (np.zeros(len(X["spike_lo_push_hi"])), {}),
+    )
+    nb_b = near_bounds(Pb_ends, {"spike_lo_push_hi": 0.9962, "spike_lo_at_lo": 0.001, "prior_hi_median": 0.99309})
+    ok(nb_b == ["spike_lo_push_hi"], f"MS10b Beta per-end and prior-tail checks handle a<1 and Beta(100,1) ({nb_b})")
     # MS11: fit_posterior_panel uses mode_start above max_importance_params and returns canonical sample + diagnostics
     import tempfile
     import yaml
@@ -590,9 +711,28 @@ def _self_test() -> int:
         fit_p = fit_posterior_panel(spec_p, m_p, seed=0)
     dg_p = fit_p.get("diagnostics") or {}
     ok(dg_p.get("start") == "posterior_mode" and dg_p.get("adaptation") == "per_chain"
-       and len(fit_p.get("names") or []) == 6 and bool((fit_p.get("sample") or {}).get("sample_id"))
+       and len(fit_p.get("names") or []) == 9 and bool((fit_p.get("sample") or {}).get("sample_id"))
        and isinstance(dg_p.get("at_bound"), list),
-       f"MS11 fit_posterior_panel runs mode-start Metropolis for 6-param panel ({dg_p.get('start')}, {len(fit_p.get('names') or [])})")
+       f"MS11 fit_posterior_panel runs mode-start Metropolis for 9-param panel ({dg_p.get('start')}, {len(fit_p.get('names') or [])})")
+    # MS12: asymmetric bimodal mixture with a narrow second spike (50% posterior mass) must not be silently missed
+    from scipy.special import logsumexp
+    names12 = [f"p{j}" for j in range(6)]
+    pri12 = {n: C.Prior.from_decl(n, {"dist": "uniform", "range": [0.0, 1.0], "source": "toy"}) for n in names12}
+
+    def ll12(X):
+        x = np.asarray(X["p0"], float)
+        l1 = -0.5 * ((x - 0.25) / 0.025) ** 2 - math.log(0.025)
+        l2 = -0.5 * ((x - 0.75) / 0.0005) ** 2 - math.log(0.0005)
+        return logsumexp(np.stack([l1, l2], axis=0), axis=0), {}
+    P12 = C.Problem(names12, pri12, ll12)
+    refused12 = False
+    try:
+        r12 = sample(P12, seed=2, **fast)
+        ok(float(np.mean(r12["rows"][:, 0] > 0.5)) > 0.2,
+           f"MS12 narrow second mode must not be silently dropped (share >0.5 = {float(np.mean(r12['rows'][:, 0] > 0.5)):.4f})")
+    except C.CalibrationRefused as e:
+        refused12 = e.code == "posterior_mcmc"
+        ok(refused12, f"MS12 asymmetric bimodal mixture with narrow spike refuses rather than missing half the mass ({e})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

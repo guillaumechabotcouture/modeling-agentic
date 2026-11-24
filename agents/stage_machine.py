@@ -547,7 +547,7 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
     the run's mode, for whose answers to owner items count (apply_owner_rule)."""
     import done_when
     import validate_critique_yaml as V
-    critiques, schema_errors, refused = {}, [], {}
+    critiques, schema_errors, schema_errors_by_reviewer, refused = {}, [], {}, {}
     # Owner 2026-11-23: the domain and red-team critics answer every item of the structural checklist
     # (toolkit/spec/critique_checklist.py); a missing item is a schema error. Required in a run (its run_state.json or
     # its decision spec exists); only a gate over critique files alone (the unit fixtures, no run) or a replay of
@@ -568,7 +568,9 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                               "target_stage": "WRITE", "scope_declarable": True,
                               "claim": "A draft exists but critique_presentation.yaml does not."})
                 continue
-            schema_errors.append(f"{V.FILENAMES[reviewer]} is missing")
+            err = f"{V.FILENAMES[reviewer]} is missing"
+            schema_errors.append(err)
+            schema_errors_by_reviewer.setdefault(reviewer, []).append(err)
             continue
         rn = round_n
         if reviewer == "critique-presentation" and not post_write:
@@ -582,7 +584,9 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
         except V.SchemaError as e:
             # Every error in the file, so one repair fixes all of them (T74-T75). The refused file's
             # blockers still have their done_when tests checked below, for the same reason.
-            schema_errors.extend(getattr(e, "errors", None) or [str(e)])
+            errs = list(getattr(e, "errors", None) or [str(e)])
+            schema_errors.extend(errs)
+            schema_errors_by_reviewer.setdefault(reviewer, []).extend(errs)
             import yaml
             try:
                 with open(path) as fh:
@@ -606,15 +610,16 @@ def v2_gate(run_dir: str, round_n: int, max_rounds: int, post_write: bool, extra
                 except Exception as e:                       # a test that cannot be checked is a problem
                     probs = [f"done_when could not be checked ({type(e).__name__})"]
                 if probs:
-                    schema_errors.append(f"{V.FILENAMES[reviewer]}: blocker {b.get('id')} done_when: "
-                                         f"{'; '.join(probs)[:300]}")
+                    err = f"{V.FILENAMES[reviewer]}: blocker {b.get('id')} done_when: {'; '.join(probs)[:300]}"
+                    schema_errors.append(err)
+                    schema_errors_by_reviewer.setdefault(reviewer, []).append(err)
     for reviewer in V.OPTIONAL_REVIEWERS:
         doc, vs = V._load_optional_critique(run_dir, reviewer, round_n)
         if doc is not None:
             critiques[reviewer] = doc
         extra += vs
     if schema_errors:
-        return {"schema_errors": schema_errors, "action": None}
+        return {"schema_errors": schema_errors, "schema_errors_by_reviewer": schema_errors_by_reviewer, "action": None}
     d = V.decide(critiques, max_rounds, round_n)
     if checklist:        # a replay (checklist_rules off) never reads, so never records, a legacy field (Codex r3 P1-5)
         d["critique_checklist"] = CL.record(critiques)
@@ -2697,20 +2702,21 @@ class Machine:
             self.st.tries["schema"] = n
             if n > MAX_SCHEMA_REPAIRS:
                 return self._go("FINAL", "critique schema errors persist", "completed_gate_error")
-            # Only the critics whose YAML failed are re-run, each told its own errors. Match any known
-            # critique filename anywhere in the error string (e.g. "invalid YAML in /.../critique_presentation.yaml: ...")
-            # and route presentation-only schema errors back to PRESENTATION so the presentation file is repaired.
+            # Only the critics whose YAML failed are re-run, each told its own errors. Prefer the validator's exact
+            # per-reviewer attribution (`schema_errors_by_reviewer`) so a value quoting another filename inside an
+            # error body can never misroute; fall back to the leading filename / "invalid YAML in <path>" prefix only.
             import validate_critique_yaml as V
             by_file = {f: r for r, f in V.FILENAMES.items()}
-            fb: dict = {}
-            for e in d["schema_errors"]:
-                s_err = str(e)
-                who = next(
-                    (r for fname, r in by_file.items()
-                     if re.search(rf"(?:^|[/\\\s'\"]){re.escape(fname)}(?:$|[:\s'\"])", s_err)),
-                    "*",
-                )
-                fb.setdefault(who, []).append(s_err)
+            by_rev = d.get("schema_errors_by_reviewer")
+            if isinstance(by_rev, dict) and any(by_rev.values()):
+                fb = {str(r): [str(x) for x in errs] for r, errs in by_rev.items() if errs}
+            else:
+                fb = {}
+                for e in d["schema_errors"]:
+                    s_err = str(e)
+                    head = s_err.split(":", 1)[0].strip()
+                    cand = os.path.basename(head[len("invalid YAML in "):].strip()) if head.startswith("invalid YAML in ") else head.split()[0]
+                    fb.setdefault(by_file.get(cand, "*"), []).append(s_err)
             self.st.tries["schema_feedback"] = fb
             target = "PRESENTATION" if set(fb) == {"critique-presentation"} else "CRITIQUE"
             return self._go(target, f"schema errors: {'; '.join(d['schema_errors'])[:200]}")
@@ -5926,6 +5932,28 @@ def _self_test() -> int:
            and os.path.exists(os.path.join(d_p, "report.md")),
            f"T37b invalid presentation YAML routes to PRESENTATION with errors and keeps report.md "
            f"({s_p}, pres_route={pres_route}, calls={[c for c in T_p.calls if 'critique' in c or 'feedback' in c]})")
+        # T37c: a presentation schema error whose body mentions another critique filename (e.g. reviewer: critique_domain.yaml)
+        # still routes to PRESENTATION via schema_errors_by_reviewer, never to critique-domain.
+        class BadPresReviewer(StubTasks):
+            def critique(self, run_dir, reviewer, round_n, feedback=None):
+                res = super().critique(run_dir, reviewer, round_n)
+                if reviewer == "critique-presentation" and not feedback:
+                    import yaml
+                    p = os.path.join(run_dir, "critique_presentation.yaml")
+                    doc = yaml.safe_load(open(p))
+                    doc["reviewer"] = "critique_domain.yaml"
+                    yaml.safe_dump(doc, open(p, "w"))
+                self.calls.append(f"feedback:{reviewer}:{bool(feedback)}")
+                return res
+        d_p2, T_p2, st_p2 = new_run("pres_reviewer_repair", {})
+        T_p2 = BadPresReviewer(T_p2.s)
+        s_p2 = _SpikeMachine(d_p2, T_p2, st_p2, log=lambda *a: None, cross_engine_check=False).run()
+        hist_p2 = load_state(d_p2).history
+        ok(s_p2 in ("completed", "completed_scope_declared")
+           and any(h.get("from") == "GATE" and h.get("to") == "PRESENTATION" for h in hist_p2)
+           and "feedback:critique-presentation:True" in T_p2.calls
+           and T_p2.calls.count("critique:critique-domain:1") == 1,
+           f"T37c presentation error naming critique_domain.yaml routes to PRESENTATION ({s_p2})")
 
         # T74-T75 (two v2 eval runs, 2026-11-05, both completed_gate_error with no verdict): in round 2
         # the critics marked blockers resolved without resolved_in_round or resolved_evidence and wrote
