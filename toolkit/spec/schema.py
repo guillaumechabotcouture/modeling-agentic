@@ -279,19 +279,28 @@ def engine_is_auto(eng) -> bool:
     return eng == "auto" or (isinstance(eng, Mapping) and eng.get("auto") is True)
 
 
+def engine_has_build(eng) -> bool:
+    return isinstance(eng, Mapping) and isinstance(eng.get("build"), Mapping)
+
+
 def _resolve_engine_choice(s: "Spec") -> None:
-    """engine: auto (or {auto: true, candidates: [...]}) in the signed spec: the engine is the AI's choice, recorded by
-    the harness after sign-off in engine_choice.json beside the spec. Fail closed on a malformed choice or one outside
-    the signed candidates. An explicit engine in the spec wins and the choice file is ignored."""
+    """engine: auto (or {auto: true, candidates: [...]}) and/or engine: {build: {...}} in the signed spec: the engine
+    is chosen or built after sign-off and recorded by the harness in engine_choice.json beside the spec. Fail closed on
+    a malformed choice, reserved config keywords, or a choice outside the signed candidates. An explicit named engine
+    without `build` wins and the choice file is ignored."""
     eng = s.raw.get("engine")
-    if not engine_is_auto(eng):
+    has_auto = engine_is_auto(eng)
+    has_build = engine_has_build(eng)
+    if not (has_auto or has_build):
         return
-    s.engine_auto = True
+    s.engine_auto = has_auto
+    if has_build:
+        s.engine_build = eng["build"]
     cands = eng.get("candidates") if isinstance(eng, dict) else None
     if cands is not None and (not isinstance(cands, list) or not all(isinstance(c, str) and ":" in c for c in cands)):
         raise SpecError("engine.candidates: a list of 'module:Class' references")
     for c in (cands or []) + ([eng["ref"]] if isinstance(eng, dict) and eng.get("ref") is not None else []):
-        check_engine_ref(c)         # the candidates, and a ref written beside auto: true (Codex r1 of #367)
+        check_engine_ref(c)         # the candidates, and a ref written beside auto: true or build (Codex r1 of #367)
     cp = os.path.join(s.base, ENGINE_CHOICE)
     if not os.path.exists(cp):
         s.engine_pending = True
@@ -300,13 +309,31 @@ def _resolve_engine_choice(s: "Spec") -> None:
         doc = json.load(open(cp, encoding="utf-8"))
     except (OSError, ValueError) as e:
         raise SpecError(f"{ENGINE_CHOICE}: unreadable: {e}") from e
+    # Pending build choice record before ENGINE_SIGN: {"build": {"id", "status": "requested"|"building"|"admitted"}}
+    if has_build and isinstance(doc, dict) and isinstance(doc.get("build"), dict) and "engine" not in doc:
+        b = doc["build"]
+        if b.get("status") not in ("requested", "building", "admitted") or b.get("id") != eng["build"].get("id"):
+            raise SpecError(f"{ENGINE_CHOICE}: malformed pending build choice record")
+        s.engine_pending = True
+        s.engine_choice_path = cp
+        return
     e = doc.get("engine") if isinstance(doc, dict) else None
     if not isinstance(e, dict) or not isinstance(e.get("ref"), str) or ":" not in e["ref"] \
             or not isinstance(e.get("config") or {}, dict):
         raise SpecError(f"{ENGINE_CHOICE}: engine must be {{ref: 'module:Class', config: {{...}}}}")
-    if cands and e["ref"] not in cands:
+    from toolkit.engines.built import BUILT_ADAPTER_REF
+    is_built_adapter = has_build and e["ref"] == BUILT_ADAPTER_REF
+    if has_build and not has_auto and not is_built_adapter:
+        raise SpecError(f"{ENGINE_CHOICE}: a plain engine.build spec may resolve only to {BUILT_ADAPTER_REF}, "
+                        f"not {e['ref']!r}")
+    if cands and not is_built_adapter and e["ref"] not in cands:
         raise SpecError(f"{ENGINE_CHOICE}: engine {e['ref']} is not among the signed candidates {cands}")
-    check_engine_ref(e["ref"])
+    check_engine_ref(e["ref"], allow_built=has_build)
+    if is_built_adapter:
+        from toolkit.engines.built.requested import RESERVED_CONFIG_KEYS
+        res_hits = sorted(RESERVED_CONFIG_KEYS & set(e.get("config") or {}))
+        if res_hits:
+            raise SpecError(f"{ENGINE_CHOICE}: reserved harness keywords in built engine config: {res_hits}")
     s.raw["engine"] = {"ref": e["ref"], **({"config": dict(e["config"])} if e.get("config") else {})}
     s.engine_choice_path = cp
 
@@ -326,9 +353,13 @@ class Spec:
         self.raw, self.base, self.path = raw, base, path
         self.settings_path = None
         self.engine_auto, self.engine_pending, self.engine_choice_path = False, False, None
+        self.engine_build = None
         self.derived = None          # derived-input obligations: None = when the run declares derivations
-        if engine_is_auto(raw.get("engine")) and path is None:
-            self.engine_auto = self.engine_pending = True      # a mapping with no file beside it: no choice to read
+        if (engine_is_auto(raw.get("engine")) or engine_has_build(raw.get("engine"))) and path is None:
+            self.engine_auto = engine_is_auto(raw.get("engine"))
+            if engine_has_build(raw.get("engine")):
+                self.engine_build = raw["engine"]["build"]
+            self.engine_pending = True      # a mapping with no file beside it: no choice to read
         try:          # the engine declaration as signed (an engine choice replaces raw["engine"] later)
             self.engine_declared = copy.deepcopy(raw.get("engine"))
         except TypeError:
@@ -368,7 +399,7 @@ class Spec:
             raise SpecError(f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet")
         # loaded again when the spec's engine changed since (an engine set in place, with no key, is kept)
         if self._engine is None or (self._engine_ref is not None and self._engine_ref != self._engine_key()):
-            self._engine = load_engine(self.raw["engine"])
+            self._engine = load_engine(self.raw["engine"], allow_built=(self.engine_build is not None))
             self._engine_ref = self._engine_key()
         return self._engine
 
@@ -606,44 +637,54 @@ def registered_engines() -> list[str]:
     return list(REGISTERED_ENGINES)
 
 
-def check_engine_ref(ref) -> tuple[str, str]:
+def check_engine_ref(ref, *, allow_built: bool = False) -> tuple[str, str]:
     """(module, class) of an allowed engine reference, or SpecError. Imports nothing. The import guard's policy, then
     the registry (PR #363 question 15): a ref the policy allows but the registry does not hold (a hook or toy engine
     under toolkit/engines/) is refused, whether the signed spec names it, an engine: auto candidate lists it or an
-    engine choice picks it. Self-tests extend the registry in-process only (import_guard.register_test_engine)."""
+    engine choice picks it. `toolkit.engines.built:BuiltEngine` is accepted only when `allow_built=True` (resolved
+    from a signed build spec); `toolkit.engines.built.candidate` is always refused. Self-tests extend the registry
+    in-process only (import_guard.register_test_engine)."""
     from toolkit import import_guard as G
+    from toolkit.engines.built import BUILT_ADAPTER_REF, BUILT_REF_PREFIX, CANDIDATE_MODULE
+    if isinstance(ref, str) and (ref.startswith(CANDIDATE_MODULE) or (
+            (ref == BUILT_ADAPTER_REF or ref.startswith(BUILT_REF_PREFIX + ".")) and not (allow_built and ref == BUILT_ADAPTER_REF))):
+        raise UnregisteredEngine(f"engine {ref}: built-engine adapter is reachable only through a signed engine.build request")
     try:
         out = G.check_ref("engine", ref)
     except G.ImportRefused as e:
         raise SpecError(f"engine {str(ref)[:80]}: {e}") from None
+    if allow_built and ref == BUILT_ADAPTER_REF:
+        return out
     reg = registered_engines()
     if ref not in reg and not G.test_engine_registered(ref):
         raise UnregisteredEngine(f"engine {ref}: not a registered engine; a spec may name one of: {', '.join(reg)}")
     return out
 
 
-def engine_ref_problems(raw: Mapping) -> list[str]:
+def engine_ref_problems(raw: Mapping, *, allow_built: bool = False) -> list[str]:
     """check_engine_ref on the engine a spec mapping names, or on each engine: auto candidate and on a `ref` written
-    beside `auto: true` (never left unchecked behind auto): the refusals."""
+    beside `auto: true` or `build` (never left unchecked): the refusals."""
     eng = raw.get("engine")
     if engine_is_auto(eng):
         refs = eng.get("candidates") if isinstance(eng, Mapping) and isinstance(eng.get("candidates"), list) else []
         refs = list(refs) + ([eng["ref"]] if isinstance(eng, Mapping) and eng.get("ref") is not None else [])
+    elif engine_has_build(eng):
+        refs = [eng["ref"]] if eng.get("ref") is not None else []
     else:
         refs = [eng.get("ref") if isinstance(eng, Mapping) else eng] if eng is not None else []
     out = []
     for r in refs:
         try:
-            check_engine_ref(r)
+            check_engine_ref(r, allow_built=allow_built)
         except SpecError as e:
             out.append(str(e))
     return out
 
 
-def engine_class(ref: str):
+def engine_class(ref: str, *, allow_built: bool = False):
     """The engine class an allowed reference names, checked against the Engine contract; never instantiated."""
     from toolkit import import_guard as G
-    check_engine_ref(ref)
+    check_engine_ref(ref, allow_built=allow_built)
     try:
         k = G.resolve("engine", ref)
     except G.ImportRefused as e:
@@ -653,7 +694,7 @@ def engine_class(ref: str):
     return k
 
 
-def load_engine(ref):
+def load_engine(ref, *, allow_built: bool = False):
     if isinstance(ref, str):
         ref = {"ref": ref}
     if not isinstance(ref, dict):
@@ -661,7 +702,7 @@ def load_engine(ref):
     config = ref.get("config") or {}
     if not isinstance(config, dict):
         raise SpecError("engine.config must be a mapping")
-    return engine_class(ref.get("ref"))(**config)
+    return engine_class(ref.get("ref"), allow_built=allow_built)(**config)
 
 
 def _num(v):
@@ -688,7 +729,11 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
     if derived is not None:
         spec.derived = derived
     try:
-        unreg = engine_ref_problems(spec.raw)         # an unregistered engine is refused first, before it is built
+        has_build_ctx = spec.engine_build is not None or engine_has_build(getattr(spec, "engine_declared", None))
+        unreg = engine_ref_problems(spec.raw, allow_built=has_build_ctx)
+        if has_build_ctx and getattr(spec, "engine_declared", None) is not None:
+            unreg += [p for p in engine_ref_problems({"engine": spec.engine_declared}, allow_built=False)
+                      if p not in unreg]
         if unreg:
             return unreg
         pres = presentation_refusal(spec.raw)         # every path, sign-off with engine: auto pending included
@@ -697,6 +742,19 @@ def validate(spec: "Spec | dict", base: str | None = None, pending_ok: bool = Fa
         from toolkit.analysis import conflicts as CF       # W0-F: conflicts.policy, signed with the spec
         pres = pres + CF.spec_problems(spec.raw)
         if spec.engine_pending:
+            if engine_has_build(spec.raw.get("engine")):
+                from toolkit.engines.built import requested as BREQ
+                bprobs = BREQ.validate_build(spec.raw["engine"]["build"])
+                if bprobs:
+                    return pres + bprobs
+                if not pending_ok:
+                    return [f"engine: build {spec.raw['engine']['build'].get('id')!r} has not been built and signed "
+                            f"in {ENGINE_CHOICE} yet"] + pres
+                req_eng = BREQ.RequestedEngine(spec.raw["engine"]["build"])
+                s_req = with_engine(spec, req_eng)
+                from toolkit.spec import preconditions as PC
+                return pres + _validate(s_req) + (_derived_checks(s_req, req_eng) if obligations(spec) else []) \
+                    + PC.problems(spec.base, None, None, spec=spec)
             if not pending_ok:
                 return [f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet (engine-dependent sections "
                         "cannot be checked)"] + pres
@@ -923,7 +981,21 @@ def scale_cards(raw: Mapping, engine=None):
     if eng is None:
         return None
     if engine_is_auto(eng):
-        return _auto_cards(raw)
+        cards = _auto_cards(raw)
+        if engine_has_build(eng):
+            from toolkit.engines.built import requested as BREQ
+            try:
+                cards = [c for c in cards if c[0] != "engine: auto"] + [(f"build:{eng['build'].get('id')}",
+                                                                         BREQ.RequestedEngine(eng["build"]).describe())]
+            except Exception as e:  # noqa: BLE001
+                cards = list(cards) + [(f"build:{eng['build'].get('id')}", e)]
+        return cards
+    if engine_has_build(eng):
+        from toolkit.engines.built import requested as BREQ
+        try:
+            return [(f"build:{eng['build'].get('id')}", BREQ.RequestedEngine(eng["build"]).describe())]
+        except Exception as e:  # noqa: BLE001
+            return [(f"build:{eng['build'].get('id')}", e)]
     label = eng if isinstance(eng, str) else eng.get("ref") if isinstance(eng, Mapping) else repr(eng)
     return [(str(label), _card_or_error(dict(eng) if isinstance(eng, Mapping) else eng))]
 
@@ -1023,10 +1095,13 @@ def attribute_notes_markdown(notes: list[dict], problems=None) -> list[str]:
 
 
 def load_binding(engine) -> tuple[dict, list[str]]:
-    """The engine card's attribute binding ({attribute or glob: required | {default, meaning}}): `binding_path` on the
-    engine, else attribute_binding.yaml beside the module of the engine's class or of its nearest base class that has
-    one (the priors.yaml convention). No file: every attribute is required."""
+    """The engine card's attribute binding ({attribute or glob: required | {default, meaning}}): an engine's own
+    `attribute_binding()` method (RequestedEngine / BuiltEngine), else `binding_path` on the engine, else
+    attribute_binding.yaml beside the module of the engine's class or of its nearest base class that has one (the
+    priors.yaml convention). No file: every attribute is required."""
     import inspect
+    if not isinstance(engine, type) and callable(getattr(engine, "attribute_binding", None)):
+        return dict(engine.attribute_binding()), []
     p = getattr(engine, "binding_path", None) if not isinstance(engine, type) else None
     if p:
         return _read_binding(p)
@@ -1133,11 +1208,18 @@ def frame_problems(s: Spec) -> list[str]:
             f"{compared}; declare mapping {{to: {compared}, method, source}}, or compare it with the output for its band"]
 
 
-def with_engine(s: Spec, ref: str, config: dict | None = None) -> Spec:
-    """The spec with one candidate engine in place of `auto` (the pre-sign check of each candidate)."""
+def with_engine(s: Spec, ref, config: dict | None = None) -> Spec:
+    """The spec with one candidate engine (a `'module:Class'` ref or an `Engine` instance such as `RequestedEngine`)
+    in place of `auto` / pending `build` (the pre-sign check of each candidate)."""
     raw = copy.deepcopy(s.raw)
-    raw["engine"] = {"ref": ref, **({"config": dict(config)} if config else {})}
-    out = Spec(raw, s.base, s.path)
+    if isinstance(ref, str):
+        raw["engine"] = {"ref": ref, **({"config": dict(config)} if config else {})}
+        out = Spec(raw, s.base, s.path)
+    else:
+        out = Spec(raw, s.base, s.path)
+        out._engine = ref
+        out._engine_ref = None
+        out.engine_pending = False
     out.settings_path, out.derived = s.settings_path, s.derived
     return out
 
@@ -1308,6 +1390,10 @@ def _validate(s: Spec) -> list[str]:
     bad += [f"decision_units: the units table has no column {c}" for c in sorted(need - cols)]
     if bad:
         return bad
+    if callable(getattr(eng, "validate_unit_values", None)):
+        bad += eng.validate_unit_values(units, du.get("engine_attributes") or {})
+        if bad:
+            return bad
     a = s.alloc_spec()
     bad += [f"options: {e}" for e in acosts.validate(a, cols)]
     bad += [f"constraints: {e}" for e in apackages.validate(a, units)]

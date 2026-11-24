@@ -460,8 +460,12 @@ def signoff_refusals(raw, candidates=None, run_dir: str | None = None) -> list[s
     ents = {n: e for n, e in declared(r).items() if isinstance(e, dict)}
     targets = []
     eng = r.get("engine")
+    has_build = schema.engine_has_build(eng)
     if _auto(eng):        # the candidates the signed spec lists; else every engine pack (a later choice is not signed)
         refs = [c for c in (eng.get("candidates") if isinstance(eng, dict) else None) or [] if isinstance(c, str)]
+    elif has_build:
+        refs = []
+        targets = [(f"build:{eng['build'].get('id')}", None, "a requested built engine has no benchmark pack yet")]
     else:
         refs = [eng] if isinstance(eng, str) else [eng.get("ref")] if isinstance(eng, dict) else []
         if not all(isinstance(x, str) and x for x in refs):
@@ -891,6 +895,13 @@ def sheet_lines(raw: dict, candidates=None, run_dir: str | None = None) -> list[
             engines[ref] = schema.load_engine(decl)
         except Exception as e:  # noqa: BLE001 -- the sheet still shows the spec's entries
             engines[ref] = e
+    if schema.engine_has_build(raw.get("engine")):
+        from toolkit.engines.built import requested as BREQ
+        bid = f"build:{raw['engine']['build'].get('id')}"
+        try:
+            engines[bid] = BREQ.RequestedEngine(raw["engine"]["build"])
+        except Exception as e:  # noqa: BLE001
+            engines[bid] = e
     if not engines:
         out.append("- engine: auto, and no candidate engine is known yet: the card values are shown once the pre-sign "
                    "check lists the candidates or the harness has chosen the engine. A value outside the chosen card's "

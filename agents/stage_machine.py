@@ -1258,8 +1258,16 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     if held:
         raise ValueError("spec not signable (engine_parameters): " + "; ".join(held[:10]))
     from toolkit.spec import signoff as SO      # F6 (#218): every registered precondition, recomputed, whoever signs
+    try:
+        sheet_bytes = read_nofollow(run_dir, SO.SHEET)[0]
+    except FileNotFoundError:
+        sheet_bytes = None
+    except LinkRefused as e:
+        raise ValueError(f"{SO.SHEET}: {e}") from None
+    sheet_sha = hashlib.sha256(sheet_bytes).hexdigest() if sheet_bytes is not None else "none"
     ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
-    rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
+    rec.update(evidence=ev["record"], evidence_sha256=ev["files"], sheet_sha256=sheet_sha,
+               sha256={AB.SPEC_FILE: rec["spec_sha256"], SO.SHEET: sheet_sha, **(ev.get("files") or {})})
     rec[RC.RECORD_KEY] = RC.sha_of(rc_bytes)
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
@@ -2005,12 +2013,15 @@ class Machine:
         if bad:
             return bad
         try:
-            yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
+            spec_doc = yaml.safe_load(open(os.path.join(rd, AB.SPEC_FILE)))
             from toolkit.analysis import conflicts as CF     # owner default D5: declare, test and continue
             if CF.ensure_default(rd):                        # after the link checks: it replaces the file
                 self.log("[machine] the draft states no conflicts policy: declare_and_test (owner default D5)")
         except Exception as e:  # noqa: BLE001
             return [f"spec unreadable: {type(e).__name__}: {e}"]
+        from toolkit.spec import schema as _schema
+        if self.st.signoff == "none" and isinstance(spec_doc, dict) and _schema.engine_has_build(spec_doc.get("engine")):
+            return ["an engine build needs a signed request (--signoff none is refused at SPEC)"]
         out: list[str] = []
 
         def run(name, fn) -> bool:
@@ -2260,6 +2271,13 @@ class Machine:
             # Codex r1 P2-6: an unsigned run saved at SIGN under the earlier order has had no evidence stage
             return self._go("EVIDENCE", "earlier order: the evidence stage runs before sign-off")
         if mode == "none":
+            from toolkit.spec import schema as _schema
+            try:
+                _sdoc = self._spec(self.run_dir)
+            except Exception:  # noqa: BLE001
+                _sdoc = {}
+            if isinstance(_sdoc, dict) and _schema.engine_has_build(_sdoc.get("engine")):
+                return self._go("FINAL", "an engine build needs a signed request (--signoff none)", "run_failed")
             return self._go("ENGINE_CHOICE", "sign-off not required (--signoff none)")
         by = self._signed_by()
         if not by and not self._review_conditions(mode):
@@ -8162,6 +8180,22 @@ def _self_test_evidence(ok, td: str) -> None:
     ok(hist[:4] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", hist[3] if len(hist) > 3 else None]
        and m.st.state in ("PREREGISTER", "CONFIGURE"),
        f"T_EVIDENCE_NONE --signoff none passes ENGINE_CHOICE's coverage check with the drafted dossier ({hist})")
+    # BE27: --signoff none refuses an engine.build spec at SPEC so no paid build starts unsigned
+    from toolkit.engines.built import requested as _BREQ
+    d_b27 = os.path.join(td, "be27_build_none")
+    os.makedirs(d_b27)
+    raw_b27 = yaml.safe_load(open(ED.toy_dossier_spec(d_b27, dossier=False)))
+    raw_b27["engine"] = {"build": _BREQ.example_build()}
+    for f in (AB.SPEC_FILE, ED.DOSSIER_FILE):
+        if os.path.exists(os.path.join(d_b27, f)):
+            os.remove(os.path.join(d_b27, f))
+    st_b27 = init_run(d_b27, "toy build question", 3, "none", "v2", None, derived_inputs=False)
+    T_b27 = StubTasks({"spec": raw_b27})
+    m_b27 = Machine(d_b27, T_b27, st_b27, backend=toolkit, log=lambda *a: None, cross_engine_check=False)
+    m_b27.step()
+    fb27 = m_b27.st.tries.get("spec_feedback") or []
+    ok(m_b27.st.state == "SPEC" and any("signed request" in str(x) for x in fb27),
+       f"BE27 --signoff none refuses a build spec at SPEC ({m_b27.st.state}, {fb27})")
     # T_EVIDENCE_NAME: the options need inputs and the spec names no dossier: back to the draft, nothing written
     d = os.path.join(td, "ev_name")
     os.makedirs(d)

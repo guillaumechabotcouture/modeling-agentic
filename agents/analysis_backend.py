@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -132,8 +133,9 @@ def engine_needs(spec: dict) -> dict:
     for m in ((spec.get("options") or {}).get("engine_map") or {}).values():
         for k, v in (m or {}).items():
             comps.setdefault(k, []).append(v)
+    outs = [o for o in [(spec.get("objective") or {}).get("outcome")] + list(spec.get("outcomes_reported") or []) if o]
     return {"components": comps,
-            "outputs": [o for o in [(spec.get("objective") or {}).get("outcome")] if o],
+            "outputs": list(dict.fromkeys(outs)),
             "windows": [w for w in [cal.get("metric")] if w],
             "unit_attributes": [a for a in [cal.get("attribute")] if a]
             + list(((spec.get("decision_units") or {}).get("engine_attributes") or {}))}
@@ -231,6 +233,64 @@ def benchmark_gate(ref: str, card, config: dict, spec: dict, departures: str = "
     raw, status = _departures(spec, departures)
     return BC.assess(ref, config, raw, status, engine_name=card.name, card_benchmarks=card.benchmarks,
                      base=spec.get("_run_dir"))
+
+
+def build_request_problems(spec: dict, engines=None, departures: str = "proposed") -> list[str]:
+    """Check `engine.build` against the FULL registered `ENGINES` list, ignoring any `candidates` shortlist
+    (docs/design/agent-built-engines.md §2.1, BE25). When a registered engine is eligible for the spec, `why` must
+    justify the build by naming a declared mechanism of the request that no eligible registered card already has."""
+    from toolkit.engines.built import requested as BREQ
+    from toolkit.spec import schema
+    eng = spec.get("engine") if isinstance(spec, dict) else None
+    if not schema.engine_has_build(eng):
+        return []
+    build = eng["build"]
+    probs = BREQ.validate_build(build)
+    if probs:
+        return probs
+    req_eng = BREQ.RequestedEngine(build)
+    if isinstance(spec.get("engine_needs"), dict):
+        needs = spec["engine_needs"]
+    else:
+        try:
+            from toolkit.analysis import api as _bapi
+            needs = _bapi.engine_needs(spec)
+        except Exception:  # noqa: BLE001
+            needs = engine_needs(spec)
+    fit_probs = card_fits(req_eng.describe(), needs)
+    if fit_probs:
+        return [f"engine.build does not satisfy spec needs: {w}" for w in fit_probs]
+    # Check the FULL registry regardless of any `candidates` shortlist in spec["engine"]
+    entries = list(ENGINES if engines is None else engines)
+    full_spec = dict(spec, engine="auto", engine_needs=needs)
+    rows = eligible_engines(full_spec, engines=entries, departures=departures)
+    eligible = [r for r in rows if r.get("eligible")]
+    if not eligible:
+        return []
+    why_low = str(build.get("why") or "").strip().lower()
+    card_paths = {e[0]: (tuple(e) + (None, None))[1] for e in entries}
+    el_mechs: set[str] = set()
+    for r in eligible:
+        try:
+            full_card = _card(r["ref"], card_paths.get(r["ref"]), r.get("config"))
+            mechs_list = list(getattr(full_card, "mechanisms", None) or [])
+        except Exception:  # noqa: BLE001
+            mechs_list = list(r.get("mechanisms") or [])
+        el_mechs.update(str(m).strip().lower() for m in mechs_list)
+    novel = [str(m).strip() for m in (build.get("mechanisms") or []) if str(m).strip().lower() not in el_mechs]
+    if not novel:
+        return [f"engine.build: registered engine(s) {[r['ref'] for r in eligible]} are eligible and already cover "
+                "every mechanism declared in engine.build.mechanisms"]
+    def _mentions(mech: str) -> bool:
+        ml = mech.lower()
+        if ml in why_low:
+            return True
+        toks = [t for t in re.findall(r"[a-z0-9]+", ml) if len(t) >= 4]
+        return bool(toks) and all(t in why_low for t in toks)
+    if not any(_mentions(m) for m in novel):
+        return [f"engine.build.why: registered engine(s) {[r['ref'] for r in eligible]} are eligible; `why` must "
+                f"name a novel mechanism from engine.build.mechanisms ({novel}) that no eligible card provides"]
+    return []
 
 
 def eligible_engines(spec: dict, engines=None, departures: str = "signed") -> list[dict]:
@@ -640,6 +700,12 @@ class _ToolkitApi:
                 self.candidates = self._named_rows(s)       # the sheet shows the named engine's departures
                 return bad
             bad = list(schema.validate(s, pending_ok=True))
+            if schema.engine_has_build(s.raw.get("engine")):
+                # Full-registry rows (ignoring any candidates shortlist) for both build_request_problems and the sheet
+                full_spec = dict(s.raw, engine="auto", _run_dir=s.base)
+                self.candidates = self._card_rows(full_spec, engines=ENGINES, departures="proposed")
+                extra = build_request_problems(dict(s.raw, _run_dir=s.base), departures="proposed")
+                return bad + [p for p in extra if p not in bad]
             # The candidates are checked even when an engine-independent section fails, so one try of the draft
             # task hears every problem (MAX_SPEC_TRIES is small).
             rows = self.candidate_rows(s, departures="proposed")
@@ -1617,6 +1683,75 @@ def _self_test() -> int:
         rows2 = eligible_engines(dict(tspec, engine_needs=_api.engine_needs(tspec)), ENGINES)
         ok(not next(r for r in rows2 if r["ref"].endswith("RenewalEngine"))["eligible"],
            "B23b an allocation spec: the renewal engine is not eligible")
+    # BE25: build_request_problems inspects the FULL ENGINES registry even when candidates omits an eligible engine,
+    # uses the same engine_needs (including outcomes_reported), checks all untruncated card mechanisms, and runs on
+    # direct schema.validate(..., pending_ok=True)
+    from toolkit.engines.built import requested as _BREQ
+    with _tf.TemporaryDirectory() as d_b:
+        ts = toy_spec(os.path.join(d_b, "u.csv"))
+        b_req = _BREQ.example_build()
+        # Construct a spec where ToyEngine IS eligible (component `a`, unit_attribute `x`, output `cases`),
+        # while `candidates` omits ToyEngine
+        b_req["request"]["components"] = {"a": {"values": [0, 1], "absent": 0}}
+        b_req["request"]["unit_attributes"] = {
+            "x": {"type": "continuous", "range": [-2.0, 2.0], "meaning": "baseline level"},
+        }
+        b_req["request"]["attribute_binding"] = {"x": "required"}
+        b_req["request"]["outputs"] = {"per_capita": ["cases"], "windows": {"w0": ["prev"]}, "cost_drivers": []}
+        b_req["request"]["decision_inputs"] = {
+            "a": [{"kind": "parameter", "name": "eff_a", "why": "effect"}],
+        }
+        b_req["request"]["expected_effects"] = {
+            "a": {"cases": "-"}, "eff_a": {"cases": "-"}, "sev_mult": {"cases": "+"},
+            "n_strains": {"cases": "+"}, "x": {"cases": "+"},
+        }
+        b_req["request"]["inert"] = {}
+        b_req["request"]["compartments"]["transitions"] = [{"from": "S", "to": "I1", "counts": ["cases"]}]
+        b_req["request"]["reductions"] = []
+        b_req["request"]["trials"] = []
+        b_bad = copy.deepcopy(b_req)
+        b_bad["why"] = "prefer a bespoke build"
+        sp_shortlist = dict(ts, engine={"auto": True, "candidates": [COMPARTMENTAL], "build": b_bad},
+                            options={"components": {"a": {}}, "engine_map": {"a": {"a": 1}}},
+                            objective={"outcome": "cases"}, outcomes_reported=["cases"],
+                            calibration={"method": "none"},
+                            decision_units={"csv": os.path.join(d_b, "u.csv"), "id": "id",
+                                            "engine_attributes": {"x": {"column": "x"}}})
+        toy_entry = [e for e in ENGINES if e[0] == "toolkit.engines.contract:ToyEngine"]
+        p_bad = build_request_problems(sp_shortlist, engines=toy_entry)
+        b_good = copy.deepcopy(b_bad)
+        b_good["why"] = "needs multi-strain cross-immunity not present on registered cards"
+        sp_good = dict(sp_shortlist, engine={"auto": True, "candidates": [COMPARTMENTAL], "build": b_good})
+        p_good = build_request_problems(sp_good, engines=toy_entry)
+        # outcomes_reported mismatch: when spec also reports `severe` (which ToyEngine lacks), ToyEngine is ineligible
+        b_sev = copy.deepcopy(b_bad)
+        b_sev["request"]["outputs"]["per_capita"] = ["cases", "severe"]
+        b_sev["request"]["compartments"]["transitions"] = [{"from": "S", "to": "I1", "counts": ["cases", "severe"]}]
+        sp_sev = dict(sp_shortlist, engine={"build": b_sev}, outcomes_reported=["cases", "severe"])
+        p_sev = build_request_problems(sp_sev, engines=toy_entry)
+        # Mechanism beyond index 8 on a registered card (malaria has >8 mechanisms) is NOT treated as novel
+        mal_entry = [e for e in ENGINES if "MalariaEngine" in e[0]]
+        mal_card = _card(mal_entry[0][0], mal_entry[0][1])
+        ninth_mech = mal_card.mechanisms[8] if len(mal_card.mechanisms) > 8 else mal_card.mechanisms[-1]
+        from toolkit.engines.contract import EngineCard
+        orig_card = _card
+        try:
+            def _fake_9(ref, cp, cfg=None):
+                c = orig_card(ref, cp, cfg)
+                if ref == toy_entry[0][0]:
+                    return EngineCard(**{**c.__dict__, "mechanisms": [f"m{i}" for i in range(8)] + [ninth_mech]})
+                return c
+            globals()["_card"] = _fake_9
+            b_ninth = copy.deepcopy(b_bad)
+            b_ninth["mechanisms"] = [ninth_mech]
+            b_ninth["why"] = f"requires {ninth_mech}"
+            p_ninth = build_request_problems(dict(sp_shortlist, engine={"build": b_ninth}), engines=toy_entry)
+        finally:
+            globals()["_card"] = orig_card
+        ok(bool(p_bad) and "ToyEngine" in " ".join(p_bad) and p_good == [] and p_sev == []
+           and bool(p_ninth) and "already cover" in " ".join(p_ninth),
+           f"BE25 build_request_problems checks full registry despite shortlist, aligns outcomes_reported, and checks "
+           f"all untruncated card mechanisms (bad={p_bad[:1]}, good={p_good}, sev={p_sev}, ninth={p_ninth[:1]})")
     _self_test_engine_choice(ok)
     _self_test_benchmark_gate(ok)
     try:
