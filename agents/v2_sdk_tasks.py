@@ -35,7 +35,7 @@ HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "met
                  "data/input_checks.json", "data/geometry_signoff.json")
 # data/derived/ (v2-derived-inputs): the tables the spec reads are written only by the harness's derivation runner.
 HARNESS_PREFIXES = ("analysis/", "models/pipeline", "gate_r", "fix_plan_r", "evidence/", "data/inputs/", "data/derived/",
-                    "world_model/")
+                    "world_model/", "engine_build/")
 
 # The owner's decision design principles (2026-11-12): one file, the source of truth, in every task's system prompt.
 PRINCIPLES_FILE = os.path.join(_REPO, ".claude", "orchestration", "decision_design_principles.md")
@@ -461,7 +461,93 @@ def _search_denied(tool: str, ti: dict, run_dir: str) -> str | None:
     return None
 
 
-def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
+ENGINE_SECRET_PARTS = ("engine_build/.hidden", "engine_build/hidden_reveal.json", "engine_build/reference")
+
+
+def _engine_secret_path(path_str: str) -> bool:
+    low = path_str.replace("\\", "/").lower()
+    return any(seg in low for seg in ENGINE_SECRET_PARTS) or "/.hidden/" in low or low.endswith("/.hidden")
+
+
+def _outside_runs_tree(base: str, root: str) -> bool:
+    """True when `base` lies outside `root` (the current run dir) and inside ANY other run directory
+    or `runs/` tree (docs/design/agent-built-engines.md §3.1, BE21)."""
+    if _within(base, root):
+        return False
+    parts = [p.lower() for p in base.replace("\\", "/").split("/") if p]
+    if "runs" in parts:
+        return True
+    return _in_or_reaches_run(base, "Read")
+
+
+def _engine_read_denied(tool: str, ti: dict, run_dir: str, kind: str | None = None,
+                        engine_id: str | None = None) -> str | None:
+    """Read/search isolation rule for EVERY v2 task kind (docs/design/agent-built-engines.md §3.1, BE21):
+    - applies _search_denied first (answer keys & evals/);
+    - refuses engine_build/.hidden/, engine_build/hidden_reveal.json, and engine_build/reference/ (and symlinks/globs);
+    - refuses reading/searching outside the current run dir into any other run directory or `runs/` tree;
+    - for `build_engine`, restricts reads to its explicit allowlist."""
+    import glob as _glob
+    why = _search_denied(tool, ti, run_dir)
+    if why:
+        return why
+    root = os.path.realpath(run_dir)
+    target = str(ti.get("file_path") or ti.get("path") or "")
+    pattern = str(ti.get("pattern") or "") if tool == "Glob" else ""
+    filters = [str(ti.get(k) or "") for k in ("glob", "type")] + ([pattern] if pattern else [])
+    if (target and _engine_secret_path(target)) or any(f and _engine_secret_path(f) for f in filters):
+        return "engine_build/.hidden, hidden_reveal.json, and reference/ are not readable by any task"
+    base = os.path.realpath(os.path.join(run_dir, os.path.expanduser(target))) if target else root
+    if tool == "Glob" and pattern:
+        lit = []
+        for part in pattern.replace("\\", "/").split("/"):
+            if _glob.has_magic(part):
+                break
+            lit.append(part)
+        if lit:
+            base = os.path.realpath(os.path.join(base, "/".join(lit)) if not pattern.startswith("/")
+                                    else "/" + "/".join(lit).lstrip("/"))
+    if _engine_secret_path(base):
+        return "engine_build/.hidden, hidden_reveal.json, and reference/ are not readable by any task"
+    if _outside_runs_tree(base, root):
+        return f"{tool} outside the current run directory into another run ({base}) is refused"
+    # A Grep/Glob inside the run dir that targets engine_build/ directly could reach .hidden/ or reference/
+    if tool in ("Grep", "Glob") and _within(base, root):
+        eb = os.path.join(root, "engine_build")
+        if _within(eb, base) or base == eb:
+            for sub in (".hidden", "reference", "hidden_reveal.json"):
+                if os.path.lexists(os.path.join(eb, sub)) and not _within(base, os.path.join(eb, "try")):
+                    return f"{tool} from {base} would reach engine_build/{sub}"
+    if kind == "build_engine":
+        repo = os.path.realpath(_REPO)
+        if _within(base, root):
+            rel = os.path.relpath(base, root).replace(os.sep, "/")
+            work_prefix = f"models/ext/engine_{engine_id}/" if engine_id else "models/ext/engine_"
+            allowed_run = (
+                rel in ("decision_spec.yaml", "evidence_dossier.yaml", "_task_input.json",
+                        "engine_build/request.json")
+                or rel.startswith(("engine_build/try/", "data/derived/", "data/inputs/acquired/_views/", work_prefix))
+                or rel == work_prefix.rstrip("/")
+            )
+            if not allowed_run:
+                return f"build_engine may not read {rel} (only request, spec, dossier, schema views, try/, and its working copy)"
+        elif _within(base, repo):
+            rel = os.path.relpath(base, repo).replace(os.sep, "/")
+            if not (rel.startswith(("toolkit/engines/", ".claude/skills/starsim-dev")) or rel == "toolkit/engines"):
+                return f"build_engine may read only toolkit/engines/ and .claude/skills/starsim-dev*/ in the repo, not {rel}"
+        else:
+            # Allow installed starsim package source only outside run/repo
+            try:
+                import starsim as _ss
+                ss_dir = os.path.realpath(os.path.dirname(_ss.__file__))
+            except Exception:  # noqa: BLE001
+                ss_dir = None
+            if not (ss_dir and _within(base, ss_dir)):
+                return f"build_engine may not read {base} outside the run directory and allowed library sources"
+    return None
+
+
+def _allowed(path: str, run_dir: str, owns: tuple, kind: str | None = None) -> str | None:
     p = os.path.realpath(os.path.join(run_dir, path))
     root = os.path.realpath(run_dir)
     if not p.startswith(root + os.sep):
@@ -470,6 +556,8 @@ def _allowed(path: str, run_dir: str, owns: tuple) -> str | None:
     low = rel.lower()
     if low in {h.lower() for h in HARNESS_FILES} or low.startswith(tuple(h.lower() for h in HARNESS_PREFIXES)):
         return f"{rel} is written by the harness"
+    if low.startswith("models/ext/engine_") and kind != "build_engine":
+        return f"{rel} is an agent-built engine working copy: only build_engine may write models/ext/engine_*"
     if os.path.exists(p):
         try:
             if os.path.isfile(p) and os.stat(p).st_nlink > 1:
@@ -721,11 +809,13 @@ class SdkTasks:
                 # Fail closed (main #97): no shell, so no full pipeline build and no background call.
                 return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(TOOLS)})")
             if name in ("Write", "Edit"):
-                why = _allowed(ti.get("file_path", ""), self.run_dir, owns)
+                why = _allowed(ti.get("file_path", ""), self.run_dir, owns, kind=kind)
                 if why:
                     return enforcement.deny_output(f"{kind}: {why}")
             if name in ("Read", "Grep", "Glob"):
-                why = (_seed_read_denied if kind == "seed_world_model" else _search_denied)(name, ti, self.run_dir)
+                why = _engine_read_denied(name, ti, self.run_dir, kind=kind)
+                if not why and kind == "seed_world_model":
+                    why = _seed_read_denied(name, ti, self.run_dir)
                 if why:
                     return enforcement.deny_output(why)
             return {}
@@ -1009,6 +1099,31 @@ def _self_test() -> int:
            "S14 a search under an allowed root that can reach a _truth tree (directly, by glob, or by a link) is refused")
         ok(_search_denied("Read", {"file_path": "alias.json"}, os.path.join(rr, "run")),
            "S15 a Read of a link resolving into _truth is refused")
+        # BE20: write isolation — fix task refused on models/ext/engine_* and engine_build/*; build_engine allowed on its working copy
+        ok(_allowed("models/ext/engine_x/engine.py", d, FIX_EDITABLE, kind="fix") is not None
+           and _allowed("engine_build/admission.json", d, ("engine_build/",), kind="build_engine") is not None
+           and _allowed("models/ext/engine_x/engine.py", d, ("models/ext/engine_x/",), kind="build_engine") is None
+           and _allowed("models/ext/helper.py", d, FIX_EDITABLE, kind="fix") is None,
+           "BE20 write rules refuse fix writes to models/ext/engine_* and all writes to engine_build/*; build_engine allowed on its working copy")
+        # BE21: read isolation — Read of this run's .hidden/ or reference/ or another run's hidden_reveal.json refused
+        other_run = os.path.join(d, "runs", "other_run")
+        os.makedirs(os.path.join(other_run, "engine_build"), exist_ok=True)
+        open(os.path.join(other_run, "metadata.json"), "w").write("{}")
+        open(os.path.join(other_run, "engine_build", "hidden_reveal.json"), "w").write("{}")
+        this_run = os.path.join(d, "runs", "this_run")
+        os.makedirs(os.path.join(this_run, "engine_build", ".hidden"), exist_ok=True)
+        os.makedirs(os.path.join(this_run, "engine_build", "reference"), exist_ok=True)
+        open(os.path.join(this_run, "engine_build", ".hidden", "seed.json"), "w").write("{}")
+        open(os.path.join(this_run, "engine_build", "reference", "reference.py"), "w").write("")
+        ok(_engine_read_denied("Read", {"file_path": "engine_build/.hidden/seed.json"}, this_run, kind="critique") is not None
+           and _engine_read_denied("Read", {"file_path": "engine_build/reference/reference.py"}, this_run, kind="build_engine") is not None
+           and _engine_read_denied("Read", {"file_path": os.path.join(other_run, "engine_build", "hidden_reveal.json")},
+                                   this_run, kind="draft_spec") is not None
+           and _engine_read_denied("Read", {"file_path": os.path.join(other_run, "metadata.json")},
+                                   this_run, kind="critique") is not None
+           and _engine_read_denied("Read", {"file_path": "engine_build/request.json"},
+                                   this_run, kind="build_engine", engine_id="x") is None,
+           "BE21 read rules refuse .hidden/, reference/, and another run's hidden_reveal.json or files for every task")
         import validate_critique_yaml as V
         cp = PROMPTS["critique"].format(reviewer="critique-domain", round=1, prev_round=0, file="f", prefix="D", out=OUT,
                                         feedback="\n- X", severities="H", categories=" | ".join(sorted(V.VALID_CATEGORY)),

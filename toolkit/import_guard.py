@@ -132,12 +132,21 @@ def _repo_module(mod: str) -> bool:
     return os.path.isfile(rel + ".py") or os.path.isfile(os.path.join(rel, "__init__.py"))
 
 
+_ALWAYS_REFUSED_PREFIXES = ("toolkit.engines.built.candidate",)
+
+
+def _always_refused(mod: str) -> bool:
+    return any(mod == p or mod.startswith(p + ".") for p in _ALWAYS_REFUSED_PREFIXES)
+
+
 def check_module(kind: str, mod) -> str:
     """`mod` if the kind's policy allows it, else ImportRefused. Imports nothing."""
     if kind not in POLICIES:
         raise ImportRefused(f"unknown import kind {kind!r}")
     if not isinstance(mod, str) or not _MOD.fullmatch(mod):
         raise ImportRefused(f"{kind} module {str(mod)[:80]!r}: not a dotted module name")
+    if _always_refused(mod):
+        raise ImportRefused(f"{kind} {mod}: candidate built-engine runner is refused for every policy")
     if mod in _TEST_MODULES[kind]:
         return mod
     p = POLICIES[kind]
@@ -289,6 +298,20 @@ def _self_test() -> int:
     except Exception as e:  # noqa: BLE001 -- reported in the case
         ig6 = (f"{type(e).__name__}: {e}"[:200], None)
     ok(ig6 == ("allowed", "refused"), f"IG6 a worker allows a test reference only with the pool initializer ({ig6})")
+    # BE36b: toolkit.engines.built.candidate is refused across EVERY policy before any import
+    cand_refused = []
+    for k in POLICIES:
+        try:
+            check_module(k, "toolkit.engines.built.candidate")
+            cand_refused.append(False)
+        except ImportRefused:
+            cand_refused.append(True)
+        try:
+            check_ref(k, "toolkit.engines.built.candidate:CandidateEngine")
+            cand_refused.append(False)
+        except ImportRefused:
+            cand_refused.append(True)
+    ok(all(cand_refused), f"BE36b import_guard refuses toolkit.engines.built.candidate for every policy ({cand_refused})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

@@ -1251,7 +1251,7 @@ def verified_results(engine) -> tuple[dict | None, str | None]:
         return None, f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
     if config_digest(engine) is not None and doc.get("engine_config_sha256") != config_digest(engine):
         return None, f"{os.path.basename(path)} was computed for another engine configuration: re-run the pack"
-    pp = os.path.join(os.path.dirname(path), "pack.yaml")
+    pp = getattr(engine, "pack_path", None) or os.path.join(os.path.dirname(path), "pack.yaml")
     try:
         pack = yaml.safe_load(open(pp)) if os.path.exists(pp) else None
     except (OSError, yaml.YAMLError) as e:

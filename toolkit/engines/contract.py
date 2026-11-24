@@ -111,14 +111,27 @@ def resolve_params(engine, params: dict | None) -> dict:
 
 
 def code_fingerprint(engine) -> str:
-    """sha256 over the engine's own code: every .py file in its module's directory, plus this contract (v2,
-    Codex P1-3/P1-13). Batch results and benchmark results carry it, so results from other code are refused."""
+    """sha256 over the engine's own code: when the engine defines `fingerprint_files()` (e.g. BuiltEngine, which
+    returns its snapshot files plus the built-engine harness modules), those files plus this contract; otherwise every
+    .py file in its module's directory plus this contract (v2, Codex P1-3/P1-13)."""
     import hashlib
     import inspect
     import os
+    contract_path = os.path.abspath(__file__)
+    if callable(getattr(engine, "fingerprint_files", None)):
+        raw = [os.path.abspath(str(f)) for f in engine.fingerprint_files()]
+        files = sorted(set(raw) | {contract_path})
+        h = hashlib.sha256()
+        for f in files:
+            # Include parent directory name + basename so snapshot files and harness files never collide
+            tag = os.path.join(os.path.basename(os.path.dirname(f)), os.path.basename(f))
+            h.update(tag.encode() + b"\0")
+            with open(f, "rb") as fh:
+                h.update(fh.read())
+        return h.hexdigest()
     d = os.path.dirname(os.path.abspath(inspect.getfile(type(engine))))
     h = hashlib.sha256()
-    files = sorted({os.path.join(d, f) for f in os.listdir(d) if f.endswith(".py")} | {os.path.abspath(__file__)})
+    files = sorted({os.path.join(d, f) for f in os.listdir(d) if f.endswith(".py")} | {contract_path})
     for f in files:
         h.update(os.path.basename(f).encode() + b"\0")
         with open(f, "rb") as fh:
@@ -129,15 +142,21 @@ def code_fingerprint(engine) -> str:
 def engine_identity(engine) -> dict:
     """Name, version, code fingerprint, and (Codex r2 P1-6) hashes of the resolved parameters (values, kinds and
     ranges, so a changed fitted.yaml changes the identity) and of the configured structure (components, unit
-    attributes, outputs, age groups, valid ranges: what constructor configuration sets)."""
+    attributes, outputs, age groups, valid ranges: what constructor configuration sets). An engine defining
+    `identity_extra()` (e.g. BuiltEngine) appends its request, effective-config, starsim, and dependency digests."""
     import hashlib
     import json
     card = engine.describe()
     params = sorted((p.name, float(p.value), p.kind, p.lo, p.hi) for p in engine.parameters())
     struct = {k: getattr(card, k) for k in ("components", "unit_attributes", "outputs", "age_groups", "valid_ranges")}
     h = lambda x: hashlib.sha256(json.dumps(x, sort_keys=True, default=str).encode()).hexdigest()  # noqa: E731
-    return {"name": card.name, "version": card.version, "code_sha256": code_fingerprint(engine),
-            "params_sha256": h(params), "config_sha256": h(struct)}
+    out = {"name": card.name, "version": card.version, "code_sha256": code_fingerprint(engine),
+           "params_sha256": h(params), "config_sha256": h(struct)}
+    if callable(getattr(engine, "identity_extra", None)):
+        extra = engine.identity_extra()
+        if isinstance(extra, dict):
+            out.update(extra)
+    return out
 
 
 def _finite(x) -> bool:
