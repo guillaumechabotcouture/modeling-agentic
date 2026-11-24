@@ -134,11 +134,11 @@ def gate_findings(run_dir: str) -> list[dict]:
     provisionally and flags them above the report's draft. Then `decision_test_not_run` for every declared decision
     test that did not run (hb3 fix 4), declarable with the harness's reason."""
     base = contract.gate_findings(run_dir)
-    dt = contract.decision_test_findings(run_dir)
+    dt = contract.decision_test_findings(run_dir, not_run=True)      # one read of the artifact (Codex r1 of #375)
     if any(f.get("kind") in ("analysis_contract_missing", "analysis_contract_incomplete", "analysis_contract_blocked")
            for f in base):      # the contract already says there is no completed analysis: not said twice
         dt = [f for f in dt if contract.NO_MANIFEST not in str(f.get("claim"))]
-    return base + dt + contract.decision_test_not_run_findings(run_dir)
+    return base + dt
 
 
 def _self_test() -> int:
@@ -161,21 +161,22 @@ def _self_test() -> int:
         # AP9 (lead-gaps α): the backend's findings carry the decision-bearing ones the contract module reads
         _dtf = contract.decision_test_findings
         try:
-            contract.decision_test_findings = lambda rd: [{"kind": "decision_test_changes_plan", "key": "DT1"}]
+            contract.decision_test_findings = lambda rd, **k: [{"kind": "decision_test_changes_plan", "key": "DT1"}]
             got = [f["kind"] for f in gate_findings(d)]
         finally:
             contract.decision_test_findings = _dtf
         ok(got[0] == "analysis_contract_missing" and got[-1] == "decision_test_changes_plan",
            f"AP9 gate_findings adds every plan-changing decision test after the contract checks: {got}")
         # AP9b (hb3 fix 4): and every declared decision test that did not run, after those
-        _nrf = contract.decision_test_not_run_findings
+        # from the same read as the plan-changing ones (Codex r1 of #375, P1-2: a rerun between two reads lost it)
         try:
-            contract.decision_test_not_run_findings = lambda rd: [{"kind": "decision_test_not_run", "key": "DT2"}]
+            contract.decision_test_findings = lambda rd, **k: [{"kind": "decision_test_changes_plan", "key": "DT1"}] + (
+                [{"kind": "decision_test_not_run", "key": "DT2"}] if k.get("not_run") is True else [])
             got_nr = [f["kind"] for f in gate_findings(d)]
         finally:
-            contract.decision_test_not_run_findings = _nrf
+            contract.decision_test_findings = _dtf
         ok(got_nr[0] == "analysis_contract_missing" and got_nr[-1] == "decision_test_not_run",
-           f"AP9b gate_findings adds every declared decision test that did not run: {got_nr}")
+           f"AP9b gate_findings adds every declared decision test that did not run, from the same read: {got_nr}")
         got = [f["kind"] for f in gate_findings(d)]
         ok(got.count("analysis_contract_missing") == 1 and "analysis_contract_decision_test" not in got,
            f"AP10 before the analysis ran the missing manifest is reported once, by the contract checks: {got}")

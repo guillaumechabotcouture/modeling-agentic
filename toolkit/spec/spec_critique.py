@@ -61,12 +61,17 @@ SECTION = "## Spec critique (decision design principles, before signing)"
 PAST_DAYS = 90             # an ISO decision date more than this before today is past
 CALENDAR_MIN = 1900        # a window starting earlier is in model years, not calendar years: not compared with today
 # hb3 fix 4: an objective stated in expectation. An optimising verb, at most three words, then "expected" and the
-# quantity (not "expected to", "expected in <year>", ...); or "in expectation". No outcome, disease or unit is named.
+# quantity (not "expected to", "expected in <year>", ...); or the verb and the quantity "in expectation". No outcome,
+# disease or unit is named.
 _OPTIMISE = (r"(?:(?:minimi[sz]|maximi[sz]|optimi[sz]|reduc)(?:e|es|ed|ing)|(?:avert|prevent)(?:s|ed|ing)?"
-             r"|fewest|lowest|highest|greatest)")
+             r"|minimum|maximum|fewest|lowest|highest|greatest)")
+# the words between the verb and "expected" stay in the optimised quantity: a preposition or a conjunction ends it
+# ("minimise the cost at expected demand" optimises the cost; Codex r1 of #375, P2-7)
+_GAP = r"(?:\s+(?!(?:at|under|given|with|for|in|of|on|over|from|by|and|or|to)\b)[\w-]+)"
 EXPECTED_OBJECTIVE_RE = re.compile(
-    rf"\b{_OPTIMISE}\b(?:\s+[\w-]+){{0,3}}?\s+expected\s+"
-    r"(?!(?:to|in|by|that|from|at|when|if|for|with|under|of|as|on)\b)[a-z]+|\bin\s+expectation\b", re.I)
+    rf"\b{_OPTIMISE}\b{_GAP}{{0,3}}?\s+expected\s+"
+    r"(?!(?:to|in|by|that|from|at|when|if|for|with|under|of|as|on)\b)[a-z]+"
+    rf"|\b{_OPTIMISE}\b{_GAP}{{1,3}}?\s+in\s+expectation\b", re.I)
 
 
 def _year_frac(d: datetime.date) -> float:
@@ -645,7 +650,10 @@ def _self_test() -> int:
                     ("Choose the options that maximise expected cases averted, reported by unit.",
                      "maximise expected cases"),
                     ("Maximise the total expected number of deaths averted.", "Maximise the total expected number"),
-                    ("Which package minimises deaths in expectation?", "in expectation"),
+                    ("Which package minimises deaths in expectation?", "minimises deaths in expectation"),
+                    ("Find the minimum expected loss.", "minimum expected loss"),
+                    ("Minimise the cost at expected demand.", None),
+                    ("Minimise worst-case loss and report costs in expectation.", None),
                     ("Find the plan that minimises expected deaths.", "minimises expected deaths"),
                     ("Say whether a large outbreak is expected in 2026, and minimise cases.", None),
                     ("Reduce cases in the districts expected to grow fastest.", None),

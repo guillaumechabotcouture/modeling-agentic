@@ -742,12 +742,13 @@ def decision_test_record(run_dir: str, test_id) -> dict | None:
     return dict(row, result_sha256=(ent or {}).get("sha256"), point_sha256=pt.get("sha256"))
 
 
-def decision_test_findings(run_dir: str) -> list[dict]:
+def decision_test_findings(run_dir: str, not_run: bool = False) -> list[dict]:
     """lead-gaps α: one decision-bearing finding per decision test whose verdict changes the plan (CHANGES_PLAN in
     analysis/decision_tests.yaml), in the shape the owner lifecycle consumes (agents/stage_machine.py apply_owner_rule,
     #316): HIGH, scope-declarable only through the owner's (or, under --signoff lead, the lead's provisional) answer.
     Not a contract finding: gate_findings is unchanged. A completed manifest whose artifact cannot be read and verified
-    gives one non-declarable HIGH instead (fail closed: a plan-changing test is never dropped silently)."""
+    gives one non-declarable HIGH instead (fail closed: a plan-changing test is never dropped silently). `not_run`:
+    also the decision_test_not_run findings, from the same verified rows (one read: Codex r1 of #375, P1-2)."""
     rows, _man, problem, payload = _verified_doc(run_dir)
     if problem:
         return [_f("analysis_contract_decision_test", f"{DECISION_TESTS_ARTIFACT} {problem}: the decision tests that "
@@ -775,22 +776,30 @@ def decision_test_findings(run_dir: str) -> list[dict]:
                                                   and trig else "") + ")" if why else ""),
                         "key": tid, "scope_declarable": True, "decision_bearing": True,
                         "source": "toolkit/analysis/contract.py"})
-    return out
+    return out + (_not_run_findings(run_dir, rows) if not_run else [])
 
 
 DECISION_TEST_NOT_RUN_KIND = "decision_test_not_run"
 
 
 def _declared_test_ids(run_dir: str) -> set | None:
-    """The ids of the decision tests the run's spec declares (analysis.decision_tests); None when the spec cannot be
-    read, so that every test that did not run is reported (fail closed)."""
+    """The ids of the decision tests the run's spec declares (analysis.decision_tests); None when the spec, its
+    analysis block or its list of tests cannot be read, so that every test that did not run is reported (fail closed;
+    Codex r1 of #375, P2-6: `analysis: [..]` is unreadable, not empty)."""
     try:
-        an = (yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}).get("analysis") or {}
-        ts = an.get("decision_tests") if isinstance(an, dict) else None
-    except (OSError, yaml.YAMLError, AttributeError):
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC)))
+    except (OSError, yaml.YAMLError):
         return None
+    if not isinstance(raw, dict):
+        return None
+    an = raw.get("analysis")
+    if an is None:
+        return set()
+    ts = an.get("decision_tests") if isinstance(an, dict) else False
+    if ts is None:
+        return set()
     if not isinstance(ts, list):
-        return None if ts is not None else set()
+        return None
     return {str(t.get("id")) for t in ts if isinstance(t, dict)}
 
 
@@ -800,10 +809,13 @@ def decision_test_not_run_findings(run_dir: str) -> list[dict]:
     not_run and nothing at the gate said so; only a critic found it. HIGH: the decision rests on a test that was never
     made. Declarable with its reason (the finding says why the test did not run); its remedy is an owner amendment of
     the spec, so the fix loop takes it to the owner. Read only from the verified artifact: when it cannot be read,
-    decision_test_findings already gives the non-declarable HIGH, so nothing is said twice."""
+    decision_test_findings already gives the non-declarable HIGH, so nothing is said twice. The gate reads these with
+    decision_test_findings(run_dir, not_run=True), from one read of the artifact."""
     rows, _man, problem, _payload = _verified_doc(run_dir)
-    if problem:
-        return []
+    return [] if problem else _not_run_findings(run_dir, rows)
+
+
+def _not_run_findings(run_dir: str, rows: list) -> list[dict]:
     declared = _declared_test_ids(run_dir)
     out = []
     for t in rows:
@@ -1188,6 +1200,9 @@ def _self_test() -> int:
            "K-DTP8a a spec that declares no decision test: an automatic test that did not run is not reported")
         open(os.path.join(d, SPEC), "w").write("analysis:\n  decision_tests:\n  - {id: DT1}\n  - {id: DT3}\n")
         nr = decision_test_not_run_findings(d)
+        both = [(x["kind"], x["key"]) for x in decision_test_findings(d, not_run=True)]
+        open(os.path.join(d, SPEC), "w").write("analysis: [broken]\n")
+        nr_broken = [x["key"] for x in decision_test_not_run_findings(d)]
         open(os.path.join(d, SPEC), "w").write("[unreadable as a spec\n")
         nr_bad = decision_test_not_run_findings(d)
         open(os.path.join(d, SPEC), "w").write("x: 1\n")
@@ -1195,7 +1210,9 @@ def _self_test() -> int:
            == [("decision_test_not_run", "DT3", "HIGH", True, None)]
            and "not run" in nr[0]["claim"] and "did not run" in nr[0]["claim"]
            and nr[0]["fix_requires"].startswith("Owner amendment:")
-           and [x["key"] for x in nr_bad] == ["DT3"],
+           and [x["key"] for x in nr_bad] == ["DT3"] and nr_broken == ["DT3"]
+           and both == [("decision_test_changes_plan", "DT1"), ("decision_test_changes_plan", "DT4"),
+                        ("decision_test_not_run", "DT3")],
            f"K-DTP8 a declared decision test that did not run is a declarable HIGH with its reason, an owner "
            f"amendment; an unreadable spec reports it too (fail closed): {nr}, {nr_bad}")
         r1 = decision_test_record(d, "DT1") or {}

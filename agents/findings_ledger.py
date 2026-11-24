@@ -420,6 +420,9 @@ def legacy_harness_gap_key(f) -> str:
 
 # hb2 fix 1: gate kinds whose resolution is the owner's (agents/stage_machine.py DECISION_BEARING_KINDS)
 OWNER_RESOLUTION_KINDS = ("decision_test_changes_plan",)
+# hb3 fix 4: a declared decision test that did not run (toolkit/analysis/contract.py DECISION_TEST_NOT_RUN_KIND). The
+# harness check computes it at every gate, so its absence means the test ran: an owner answer to it is moot
+NOT_RUN_KINDS = ("decision_test_not_run",)
 HARNESS_GAP = "harness_gap"          # the ledger event a declared harness gap leaves on its finding (agents/fix_loop.py)
 
 
@@ -532,6 +535,11 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             if f.id not in seen and f.kind in OWNER_RESOLUTION_KINDS and f.status == "owner_accepted":
                 f.status, f.blocking = "fixed", False
                 _event(f, round_n, "fixed", "gate", "absent at this gate")
+            # a test that did not run and runs now: neither an accept nor a decline of going on without it holds the
+            # run any more (Codex r1 of #375, P1-4: a decline kept a corrected run from finishing)
+            elif f.id not in seen and f.kind in NOT_RUN_KINDS and f.status in ("owner_accepted", "owner_declined"):
+                f.status, f.blocking = "fixed", False
+                _event(f, round_n, "fixed", "gate", "absent at this gate: the decision test ran")
     frozen = frozen_tests(run_dir)
     for f in led.values():
         fk = f.id if f.source.startswith("critique") else f.key if f.kind in _DW_ROWS else None
@@ -781,6 +789,17 @@ def _self_test() -> int:
            and st2 == "open" and bl2 and a4.status == "fixed",
            f"L19 a gate finding the owner accepted is held; asked again it is open; gone, it is fixed "
            f"({a1.status}, {ev}, {st2}, {a4.status})")
+    # L19b (Codex r1 of #375, P1-4): a declared decision test that did not run, declined (or accepted) by the owner,
+    # is fixed once a gate no longer reports it (the test ran), post-write too: the decline no longer holds the run
+    for post in (False, True):
+        with tempfile.TemporaryDirectory() as d:
+            nf = Finding(id="decision_test_not_run:DT3", kind="decision_test_not_run", key="DT3", severity="HIGH",
+                         source="rigor-artifacts", status="owner_declined", resolution_type="owner_decision",
+                         fix_requires="Owner amendment: change the spec so that decision test DT3 can run.")
+            save(d, {nf.id: nf})
+            got = sync(d, {"rigor_violations": [], "unresolved_high": []}, 2, post_write=post)[0][nf.id]
+            ok(got.status == "fixed" and not got.blocking,
+               f"L19b an answered not-run test the gate no longer reports is fixed (post_write={post}: {got.status})")
     # L20 (hb2 fix 4, dengue R2 R-001): a declared harness gap is one while the finding keeps its kind and remedy class
     f20 = Finding(id="R-001", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
                   fix_requires="The ANALYZE stage emits claims.")

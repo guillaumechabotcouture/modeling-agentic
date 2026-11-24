@@ -3349,7 +3349,15 @@ def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:
            f"plan: {', '.join(map(str, flagged))}. The owner confirms or overturns each ({how}).\n\n"] if flagged else []
     sec = ["", "## Provisional decisions (the lead's, under --signoff lead; for the owner's review)", "",
            f"Each decision below is the owner's; the lead made it provisionally so the run could finish. Review: {how}.", ""]
-    sec += [f"- **{f}**: accepted provisionally; plan changes: {'yes' if pc else 'no'}; owner review: "
+    # a decision test that did not run has no verdict on the plan (Codex r1 of #375, P1-3): never "no"
+    untested = [f for f, _pc, _r in rows if str(f).startswith(tuple(f"{k}:" for k in FL.NOT_RUN_KINDS))]
+    if untested:
+        top.append(f"**Provisional decisions on decision tests that did not run.** The lead accepted, provisionally, "
+                   f"going on without {len(untested)} declared decision test(s) that did not run: "
+                   f"{', '.join(map(str, untested))}. The plan was not tested against them. The owner confirms or "
+                   f"overturns each ({how}).\n\n")
+    sec += [f"- **{f}**: accepted provisionally; plan changes: "
+            f"{'not tested (the decision test did not run)' if f in untested else 'yes' if pc else 'no'}; owner review: "
             f"{r or 'not yet'}." for f, pc, r in rows]
     return top, sec
 
@@ -5115,6 +5123,19 @@ def _self_test() -> int:
         ok(_plan_changing({"finding": "evidence_conflict_declared:g|1", "kind": "evidence_conflict_declared"}) is True
            and _plan_changing({"kind": "evidence_conflict_declared", "conflict": {"changes_plan": False}}) is False,
            "T_CONFLICT_OLD_REQUEST a conflict item without its verdict counts as changing the plan")
+        # T_NOT_RUN_PROVISIONAL (Codex r1 of #375, P1-3): a lead-accepted decision test that did not run reads "not
+        # tested", never "plan changes: no", and is named above the draft
+        import scope_signoff as _SSn
+        _prov = _SSn.provisional
+        _SSn.provisional = lambda rd: [{"finding": "decision_test_not_run:DT3", "plan_changing": False, "review": None}]
+        try:
+            os.makedirs(os.path.join(td, "not_run_prov"), exist_ok=True)
+            top_n, sec_n = provisional_lines(os.path.join(td, "not_run_prov"))
+        finally:
+            _SSn.provisional = _prov
+        ok(any("did not run" in x and "decision_test_not_run:DT3" in x for x in top_n)
+           and any("decision_test_not_run:DT3**: accepted provisionally; plan changes: not tested" in x for x in sec_n),
+           f"T_NOT_RUN_PROVISIONAL a provisionally accepted unrun test reads not tested ({top_n}, {sec_n[-1:]})")
         dn, Tn, sn = conflict_run("conflict_nochange", False)
         ok(sn in ACCEPTED_STATUSES and not os.path.exists(os.path.join(dn, "scope_signoff_request.json"))
            and FL.load(dn)["evidence_conflict_declared:g|1"].status == "declared"
