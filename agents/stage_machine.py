@@ -3663,7 +3663,9 @@ def _relaunch_motivation(path: str) -> dict:
             req = json.loads(read_nofollow(path, SPEC_RETHINK_REQUEST)[0])
         except FileNotFoundError:
             req = None
-        return AM.motivation(path, req if isinstance(req, dict) else None)
+        if req is not None and not isinstance(req, dict):
+            raise ValueError("the rethink request is not a mapping")      # malformed: unreadable, not unstated
+        return AM.motivation(path, req)
     except Exception as e:  # noqa: BLE001
         return {"schema": AM.MOTIVE, "parent_run": os.path.basename(os.path.abspath(path)), "source": "unreadable",
                 "findings": [], "error": type(e).__name__}
@@ -5281,10 +5283,14 @@ def _self_test() -> int:
         os.makedirs(dq)
         _write_json(dq, SPEC_RETHINK_REQUEST, {"round": 1, "findings": [{"id": "X-404"}], "briefs": []})
         mq = _relaunch_motivation(dq)
+        open(os.path.join(dq, SPEC_RETHINK_REQUEST), "w").write("[]")
+        mz = _relaunch_motivation(dq)
         ok(mb5.get("parent_run") == os.path.basename(d) and mb5.get("source") == (
             "rethink_request" if os.path.isfile(os.path.join(d, SPEC_RETHINK_REQUEST)) else "unstated")
-           and mq.get("source") == "rethink_request" and [f.get("id") for f in mq.get("findings") or []] == ["X-404"],
-           f"RR5b a relaunch records motivated_by: the parent's rethink request's findings, else unstated ({mb5}, {mq})")
+           and mq.get("source") == "rethink_request" and [f.get("id") for f in mq.get("findings") or []] == ["X-404"]
+           and mz.get("source") == "unreadable",
+           f"RR5b a relaunch records motivated_by: the parent's rethink request's findings, else unstated; a malformed "
+           f"request is unreadable ({mb5}, {mq}, {mz})")
         cwd6 = os.getcwd()
         prs = []
         for k6, par in enumerate((os.path.join(td, "no_such_run"), ".")):

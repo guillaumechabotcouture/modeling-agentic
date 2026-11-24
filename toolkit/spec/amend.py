@@ -274,14 +274,17 @@ def motivation(parent: str, request=None, declared=None, required=False) -> dict
     import findings_ledger as FL
     ids, mine, reason = [], [], None
     if request is not None:
-        ids = [f.get("id") for f in _list(request.get("findings")) if isinstance(f, dict)]
+        ids = [f.get("id") if isinstance(f, dict) else f for f in _list(request.get("findings"))]
         ids += [x for b in _list(request.get("briefs")) if isinstance(b, dict) for x in _list(b.get("findings"))]
-        ids = [str(x) for x in ids if x is not None and str(x).strip()]
+        bad = [x for x in ids if not (isinstance(x, str) and x.strip())]
+        if bad:                       # a finding id is a non-empty string, never coerced (Codex r2 of #373)
+            raise AmendError(f"the rethink request names a finding without a finding id: {bad[:3]!r}")
+        ids = [x.strip() for x in ids]
     if required and not ids:          # the request's own findings: a patch's declaration does not stand in for them
         raise AmendError("a rethink-driven amendment records the findings that motivated it: the request names none")
     if declared is not None:
         if not isinstance(declared, dict) or set(declared) - {"findings", "reason"} \
-                or not isinstance(declared.get("findings") or [], list) \
+                or not isinstance(declared.get("findings", []), list) \
                 or not isinstance(declared.get("reason") or "", str) \
                 or not all(isinstance(x, str) and x.strip() for x in declared.get("findings") or []):
             raise AmendError("motivated_by is a mapping of findings (a list of finding ids) and reason (text)")
