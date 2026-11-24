@@ -17,6 +17,8 @@ harness wrote, for the spec that was signed:
                                (sources are recorded relative to the run dir, so a moved run dir still checks)
   analysis_contract_value_of_information  the value-of-information artifact the spec asks for is missing, present
                                when switched off, or malformed (F6: toolkit/analysis/value_of_information.py)
+  analysis_interval_degenerate the headline's fixed-plan interval has next to no width (hb3 fix 5: interval_findings);
+                               the one exception below: declarable, decision-bearing (an owner item)
 All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding).
 """
 from __future__ import annotations
@@ -144,6 +146,61 @@ def _reserve(run_dir: str, point, unc: dict) -> list[dict]:
     except (OSError, yaml.YAMLError) as e:
         return [_f("analysis_contract_reserve", f"{SPEC} unreadable for the affordability rule: {e}", "reserve")]
     return reserve_findings(rule, point or {}, unc or {})
+
+
+def _signed_headline(run_dir):
+    """The signed spec's deliverable.headline ({name, outcome}), or None when the spec gives none."""
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC)))
+    except (OSError, yaml.YAMLError):
+        return None
+    hl = ((raw.get("deliverable") or {}) if isinstance(raw, dict) else {}).get("headline")
+    return hl if isinstance(hl, dict) else None
+
+
+def interval_findings(unc, signed=None) -> list[dict]:
+    """hb3 fix 5: the headline's fixed-plan interval must have a width. Below thresholds.yaml
+    `uncertainty.interval_rel_width_min` of its magnitude it is no uncertainty interval, and the report would present it
+    as one: analysis_interval_degenerate, a declarable HIGH routed to the owner (decision_bearing). An interval that is exactly 0 at every bound is a plan
+    that averts nothing against the comparator (e.g. every unit on the comparator), not missing uncertainty: no finding.
+    `signed`: the signed spec's headline; the artifact must name the same one (Codex r1 P1-4 of #377), and an artifact
+    without it, or without a numeric interval for it, fails closed (not declarable). Neither headline given: not
+    checked."""
+    kind = "analysis_interval_degenerate"
+    hl = (unc or {}).get("headline") if isinstance(unc, dict) else None
+    if signed is not None:
+        if not (isinstance(hl, dict) and hl.get("name") == signed.get("name")
+                and hl.get("outcome") == signed.get("outcome")):
+            return [_f(kind, f"analysis/uncertainty.yaml: headline {hl!r} is not the signed spec's {signed!r}",
+                       f"interval:{signed.get('name')}")]
+    if not isinstance(hl, dict):
+        return []
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.yaml")) as f:
+        tol = float(yaml.safe_load(f)["uncertainty"]["interval_rel_width_min"])
+    name, o = hl.get("name"), hl.get("outcome")
+    qd = (unc.get("fixed_plan") or {}).get(o) if isinstance(unc.get("fixed_plan"), dict) else None
+    vals = [qd.get(k) if isinstance(qd, dict) else None for k in ("ci_low", "median", "ci_high")]
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in vals):
+        return [_f(kind, f"analysis/uncertainty.yaml: the headline {name} ({o}) has no numeric fixed-plan interval "
+                         f"({qd!r})", f"interval:{name}")]
+    lo, med, hi = (float(v) for v in vals)
+    scale = max(abs(lo), abs(med), abs(hi))
+    if scale == 0:          # Codex r1 P1-1: nothing averted in any draw; more uncertainty cannot change that
+        return []
+    rel = (hi - lo) / scale
+    if rel >= tol:
+        return []
+    lvl = qd.get("level")
+    lvl = float(lvl) if isinstance(lvl, (int, float)) and not isinstance(lvl, bool) and math.isfinite(lvl) else 0.95
+    # lead on #377: an owner item (declarable HIGH, decision-bearing), not a run-ender: a run that states the limitation
+    # (hb3 tb R2) declares it once the owner (or, under --signoff lead, the lead provisionally) accepts it
+    return [dict(_f(kind, f"analysis/uncertainty.yaml: the headline {name} ({o}) has a {100 * lvl:g}% "
+                          f"interval of width {hi - lo:.3g}, {rel:.2g} of its magnitude (below {tol:g}): the declared "
+                          "sources barely move it, so it is no uncertainty interval. Draw the uncertainty that the "
+                          "headline rests on (for measured per-unit rates: the engine's per-unit sampling and the "
+                          "unit_rates source; for ratios: their published ranges) in a spec amendment, or declare the "
+                          "limitation", f"interval:{name}"),
+                 scope_declarable=True, decision_bearing=True, target_stage="ANALYZE")]
 
 
 def _burden(run_dir: str, data, signed: bool = False, anchor=None) -> list[dict]:
@@ -481,6 +538,7 @@ def _gate_findings(run_dir: str) -> list[dict]:
         out += _plan_variants(run_dir, pt_doc, pv_doc)
     out += _burden(run_dir, bv_doc, man.get("spec_signed") is True, ba_doc)
     if man.get("deliverable_kind") != "estimates":
+        out += interval_findings(unc_doc, _signed_headline(run_dir))
         out += _boundary(run_dir, bd_doc, pt_doc)
         out += _value_of_information(run_dir, unc_doc, voi_doc)
         out += _plan_rule(run_dir, pt_doc, unc_doc)
@@ -742,12 +800,13 @@ def decision_test_record(run_dir: str, test_id) -> dict | None:
     return dict(row, result_sha256=(ent or {}).get("sha256"), point_sha256=pt.get("sha256"))
 
 
-def decision_test_findings(run_dir: str) -> list[dict]:
+def decision_test_findings(run_dir: str, not_run: bool = False) -> list[dict]:
     """lead-gaps α: one decision-bearing finding per decision test whose verdict changes the plan (CHANGES_PLAN in
     analysis/decision_tests.yaml), in the shape the owner lifecycle consumes (agents/stage_machine.py apply_owner_rule,
     #316): HIGH, scope-declarable only through the owner's (or, under --signoff lead, the lead's provisional) answer.
     Not a contract finding: gate_findings is unchanged. A completed manifest whose artifact cannot be read and verified
-    gives one non-declarable HIGH instead (fail closed: a plan-changing test is never dropped silently)."""
+    gives one non-declarable HIGH instead (fail closed: a plan-changing test is never dropped silently). `not_run`:
+    also the decision_test_not_run findings, from the same verified rows (one read: Codex r1 of #375, P1-2)."""
     rows, _man, problem, payload = _verified_doc(run_dir)
     if problem:
         return [_f("analysis_contract_decision_test", f"{DECISION_TESTS_ARTIFACT} {problem}: the decision tests that "
@@ -775,6 +834,63 @@ def decision_test_findings(run_dir: str) -> list[dict]:
                                                   and trig else "") + ")" if why else ""),
                         "key": tid, "scope_declarable": True, "decision_bearing": True,
                         "source": "toolkit/analysis/contract.py"})
+    return out + (_not_run_findings(run_dir, rows) if not_run else [])
+
+
+DECISION_TEST_NOT_RUN_KIND = "decision_test_not_run"
+
+
+def _declared_test_ids(run_dir: str) -> set | None:
+    """The ids of the decision tests the run's spec declares (analysis.decision_tests); None when the spec, its
+    analysis block or its list of tests cannot be read, so that every test that did not run is reported (fail closed;
+    Codex r1 of #375, P2-6: `analysis: [..]` is unreadable, not empty)."""
+    try:
+        raw = yaml.safe_load(open(os.path.join(run_dir, SPEC)))
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    an = raw.get("analysis")
+    if an is None:
+        return set()
+    ts = an.get("decision_tests") if isinstance(an, dict) else False
+    if ts is None:
+        return set()
+    if not isinstance(ts, list):
+        return None
+    return {str(t.get("id")) for t in ts if isinstance(t, dict)}
+
+
+def decision_test_not_run_findings(run_dir: str) -> list[dict]:
+    """Harness baseline hb3 (fix 4): one finding per decision test the signed spec declares that did not run (status
+    not_run in analysis/decision_tests.yaml), with the harness's reason. In flu_vaccine R2 a declared test ended
+    not_run and nothing at the gate said so; only a critic found it. HIGH: the decision rests on a test that was never
+    made. Declarable with its reason (the finding says why the test did not run); its remedy is an owner amendment of
+    the spec, so the fix loop takes it to the owner. Read only from the verified artifact: when it cannot be read,
+    decision_test_findings already gives the non-declarable HIGH, so nothing is said twice. The gate reads these with
+    decision_test_findings(run_dir, not_run=True), from one read of the artifact."""
+    rows, _man, problem, _payload = _verified_doc(run_dir)
+    return [] if problem else _not_run_findings(run_dir, rows)
+
+
+def _not_run_findings(run_dir: str, rows: list) -> list[dict]:
+    declared = _declared_test_ids(run_dir)
+    out = []
+    for t in rows:
+        if not isinstance(t, dict) or not (t.get("status") == "not_run" or t.get("verdict") == "NOT_RUN"):
+            continue
+        tid = str(t.get("test_id"))
+        if declared is not None and tid not in declared:
+            continue        # an automatic test (prior_range_*, a conflict pair) the spec does not declare
+        why = " ".join(str(t.get("statement") or t.get("reason") or "").split())[:600] or "no reason was recorded"
+        out.append({"kind": DECISION_TEST_NOT_RUN_KIND, "severity": "HIGH", "stage": "ANALYZE",
+                    "target_stage": "ANALYZE", "key": tid, "scope_declarable": True,
+                    "claim": f"Decision test {tid}, declared in the signed spec, did not run, so the plan was not "
+                             f"tested against it. The harness's reason: {why}",
+                    "fix_requires": f"Owner amendment: change the spec so that decision test {tid} can run (the "
+                                    "reason above names what stops it), or drop it; otherwise declare it with this "
+                                    "reason.",
+                    "source": "toolkit/analysis/contract.py"})
     return out
 
 
@@ -824,6 +940,52 @@ def _figures(run_dir, man) -> list[dict]:
         for why in presentation_findings(run_dir, sc):
             out.append(_f("analysis_contract_figure", f"{rel}: presentation input {why}", rel))
     return out
+
+
+def _self_test_interval(ok, complete_run, kinds):
+    """hb3 fix 5: a headline interval with next to no width is a finding, never reported as an interval."""
+    import tempfile
+
+    def unc(q, outcome="x"):
+        return {"draws": 2, "covers": ["priors"], "excludes": [], "label": "", "fixed_plan": {outcome: q},
+                "headline": {"name": "total_x", "outcome": "x"}}
+
+    def q(lo, med, hi):
+        return {"ci_low": lo, "median": med, "ci_high": hi, "mean": med, "level": 0.95}
+    narrow = interval_findings(unc(q(999.9995, 1000.0, 1000.0005)))
+    ok([(f["kind"], f["severity"], f["scope_declarable"], f.get("decision_bearing"), f["key"]) for f in narrow]
+       == [("analysis_interval_degenerate", "HIGH", True, True, "interval:total_x")]
+       and "unit_rates" in narrow[0]["claim"],
+       f"KI1 a headline interval of width 1e-6 of its median is a declarable HIGH for the owner, naming the remedy: "
+       f"{narrow}")
+    ok(interval_findings(unc(q(900.0, 1000.0, 1100.0))) == [] and interval_findings(unc(q(-50.0, 1.0, 40.0))) == [],
+       "KI2 a real interval (20% wide, or spanning zero) is no finding")
+    ok(interval_findings(unc(q(0.0, 0.0, 0.0))) == [],
+       "KI3 (Codex r1 P1-1) an all-zero interval is a plan that averts nothing (all comparator), not a finding")
+    sg = {"name": "total_x", "outcome": "x"}
+    mism = interval_findings(dict(unc(q(1.0, 1.0, 1.0)), headline={"name": "total_x", "outcome": "y"},
+                                  fixed_plan={"x": q(1.0, 1.0, 1.0), "y": q(0.0, 5.0, 9.0)}), sg)
+    gone = interval_findings({k: v for k, v in unc(q(1.0, 1.0, 1.0)).items() if k != "headline"}, sg)
+    ok([f["kind"] for f in mism] == ["analysis_interval_degenerate"] and [f["kind"] for f in gone] == [
+        "analysis_interval_degenerate"] and interval_findings(unc(q(900.0, 1000.0, 1100.0)), sg) == [],
+       "KI7 (Codex r1 P1-4) the artifact must name the signed headline; another outcome or none fails closed")
+    sl = interval_findings(unc(dict(q(1.0, 1.0, 1.0), level="0.95")))
+    ok([f["kind"] for f in sl] == ["analysis_interval_degenerate"],
+       f"KI8 (Codex r1 P2-8) a non-numeric level does not crash the check: {sl}")
+    bad = [interval_findings(unc(q(None, 1.0, 2.0))), interval_findings(unc(q(1.0, 2.0, 3.0), outcome="y")),
+           interval_findings(unc(q(float("nan"), 1.0, 2.0)))]
+    ok(all([f["kind"] for f in b] == ["analysis_interval_degenerate"] for b in bad),
+       f"KI4 a headline with no numeric interval (a missing bound, its outcome absent, NaN) fails closed: {bad}")
+    ok(interval_findings({"draws": 2, "fixed_plan": {}}) == [] and interval_findings(None) == [],
+       "KI5 a payload without a headline is not checked")
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, SPEC), "w").write("x: 1\n")
+        complete_run(d, unc=unc(q(999.9995, 1000.0, 1000.0005)))
+        k1 = kinds(d)
+        complete_run(d, unc=unc(q(900.0, 1000.0, 1100.0)))
+        k2 = kinds(d)
+        ok(k1 == {"analysis_interval_degenerate"} and k2 == set(),
+           f"KI6 the contract gate raises it for a completed run, and not for a real interval: {k1}, {k2}")
 
 
 def _self_test() -> int:
@@ -1136,6 +1298,27 @@ def _self_test() -> int:
            and "(" not in fs[1]["claim"],
            f"K-DTP1 each test whose verdict changes the plan is a decision-bearing HIGH, keyed by its id, with the "
            f"criteria that decided it: {fs}")
+        # K-DTP8 (hb3 fix 4, flu_vaccine R2): a declared test that did not run is a declarable HIGH naming the
+        # harness's reason, whose remedy is an owner amendment; an automatic test the spec does not declare is not one
+        ok(decision_test_not_run_findings(d) == [],
+           "K-DTP8a a spec that declares no decision test: an automatic test that did not run is not reported")
+        open(os.path.join(d, SPEC), "w").write("analysis:\n  decision_tests:\n  - {id: DT1}\n  - {id: DT3}\n")
+        nr = decision_test_not_run_findings(d)
+        both = [(x["kind"], x["key"]) for x in decision_test_findings(d, not_run=True)]
+        open(os.path.join(d, SPEC), "w").write("analysis: [broken]\n")
+        nr_broken = [x["key"] for x in decision_test_not_run_findings(d)]
+        open(os.path.join(d, SPEC), "w").write("[unreadable as a spec\n")
+        nr_bad = decision_test_not_run_findings(d)
+        open(os.path.join(d, SPEC), "w").write("x: 1\n")
+        ok([(x["kind"], x["key"], x["severity"], x["scope_declarable"], x.get("decision_bearing")) for x in nr]
+           == [("decision_test_not_run", "DT3", "HIGH", True, None)]
+           and "not run" in nr[0]["claim"] and "did not run" in nr[0]["claim"]
+           and nr[0]["fix_requires"].startswith("Owner amendment:")
+           and [x["key"] for x in nr_bad] == ["DT3"] and nr_broken == ["DT3"]
+           and both == [("decision_test_changes_plan", "DT1"), ("decision_test_changes_plan", "DT4"),
+                        ("decision_test_not_run", "DT3")],
+           f"K-DTP8 a declared decision test that did not run is a declarable HIGH with its reason, an owner "
+           f"amendment; an unreadable spec reports it too (fail closed): {nr}, {nr_bad}")
         r1 = decision_test_record(d, "DT1") or {}
         ok(r1.get("statement") == rows[0]["statement"] and decision_test_record(d, "DT9") is None
            and r1.get("result_sha256") == sha256(os.path.join(d, "models", "decision_tests", "DT1.yaml"))
@@ -1169,6 +1352,7 @@ def _self_test() -> int:
            "K-DTP4 a spec with no manifest (withdrawn by a rerun after the contract checks read it): a non-declarable HIGH")
         os.remove(os.path.join(d, SPEC))
         ok(decision_test_findings(d) == [], "K-DTP4b no spec and no manifest: nothing to read")
+    _self_test_interval(ok, complete_run, kinds)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

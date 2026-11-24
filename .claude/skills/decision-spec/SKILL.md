@@ -102,7 +102,18 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    `prior_range` decision test; do not declare one. A prior targets an engine parameter only
    (`prior_target_not_parameter`). A unit attribute bound to a data column is data: if the
    column is uncertain, declare that where it arises, as the observation of a latent quantity
-   through a source with a sampling frame and a bias model. When field data dispute a
+   through a source with a sampling frame and a bias model. A rate measured per unit from
+   counts (the package-rate engine in `trial_priors` mode, its `baseline_rate` bound to a
+   panel's pooled rates) has sampling error unit by unit: declare
+   `engine.config.baseline.sampling: {model: poisson, dispersion, outcomes, source}` (the
+   panel's over-dispersion, 1 for Poisson), bind each unit's event counts as
+   `baseline_events` (`columns: {<outcome>: <count column>}`), and list the `unit_rates`
+   source, which draws each unit's rate independently. Whenever the engine card declares
+   `baseline.sampling`, declare the `unit_rates` source or exclude it with a reason (the
+   check refuses neither). A headline interval narrower than `thresholds.yaml
+   uncertainty.interval_rel_width_min` of its magnitude is an owner item
+   (`analysis_interval_degenerate`, a declarable HIGH): draw the uncertainty the headline
+   rests on, or the owner declares the limitation. When field data dispute a
    column's values for some units, declare a `unit_attribute` decision test over the disputed
    values (`unit_attribute: {column, units: [ids] | all, values | scale | set_from}`); the
    column must feed an engine attribute that has a declared valid range, and on the emulator
@@ -132,7 +143,12 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     the question asks for. When the question asks for the options that maximise an *expected*
     outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
     best mean over the uncertainty draws, per-unit means in the file and a mean claim
-    (`toolkit/analysis/plan_rule.py`). Without it the plan is solved at the point values.
+    (`toolkit/analysis/plan_rule.py`). Without it the plan is solved at the point values. The
+    pre-sign spec critique reads the question's wording: an objective stated in expectation
+    ("minimise expected ...") with the point plan is a MEDIUM on the sign-off sheet
+    (`expected_value_plan`, principle 1). When the spec cannot carry the expected-value plan
+    (the schema lists what it excludes, such as `by_group`), declare that check in
+    `principle_departures` with the reason.
 12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
     parameters and card tables its effect depends on (`decision_inputs`, read by
     `toolkit/engines/decision_inputs.py`). When the options use such a component, name the

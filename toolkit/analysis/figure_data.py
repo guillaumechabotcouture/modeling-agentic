@@ -316,7 +316,8 @@ def replay(A, plan, uq: dict, stored: dict | None = None, log=None) -> dict:
     for _ in range(nd):
         D.last_clamped = []
         theta, zs, noise, mult, _s = D.draw()
-        out, _ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=_s)
+        ua = {} if getattr(D, "last_units", None) is None else {"unit_attrs": D.last_units}    # hb3 fix 5
+        out, _ben, cost = A.evaluate(theta, zs, noise=noise, cost_mult=mult, sampled=_s, **ua)
         tot.append(sum(out[i]["y"][A.comp][A.primary] - out[i]["y"][plan[i]][A.primary] for i in A.ids))
         per.append(_package_sums(A, plan, out, cost))
         P.step()
