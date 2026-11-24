@@ -1303,6 +1303,11 @@ def _self_test() -> int:
            f"SD1 the draft task's message lists the staged input paths to cite ({dm[-300:]!r})")
         ok("deliverable.decision.statements" in " ".join(PROMPTS["draft_spec"].split()),
            "SD2 the draft prompt's no-digits rule names deliverable.decision.statements")
+        # SD3 (baseline hb3 fix 4, flu_vaccine R2): the question asked to minimise an expected quantity and the drafter
+        # left deliverable.plan out, so the point plan was delivered
+        _dp = " ".join(PROMPTS["draft_spec"].split())
+        ok("`deliverable.plan: expected_value`" in _dp and "check: expected_value_plan" in _dp,
+           "SD3 the draft prompt sets the expected-value plan for an objective stated in expectation, or declares it")
         cpp = where.get("critique_prompt") or ""
         ok("reviewer: critique-presentation" in cpp and "P-NNN" in cpp,
            "CS4 the critique prompt states the literal reviewer value and id prefix")

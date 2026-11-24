@@ -778,6 +778,53 @@ def decision_test_findings(run_dir: str) -> list[dict]:
     return out
 
 
+DECISION_TEST_NOT_RUN_KIND = "decision_test_not_run"
+
+
+def _declared_test_ids(run_dir: str) -> set | None:
+    """The ids of the decision tests the run's spec declares (analysis.decision_tests); None when the spec cannot be
+    read, so that every test that did not run is reported (fail closed)."""
+    try:
+        an = (yaml.safe_load(open(os.path.join(run_dir, SPEC))) or {}).get("analysis") or {}
+        ts = an.get("decision_tests") if isinstance(an, dict) else None
+    except (OSError, yaml.YAMLError, AttributeError):
+        return None
+    if not isinstance(ts, list):
+        return None if ts is not None else set()
+    return {str(t.get("id")) for t in ts if isinstance(t, dict)}
+
+
+def decision_test_not_run_findings(run_dir: str) -> list[dict]:
+    """Harness baseline hb3 (fix 4): one finding per decision test the signed spec declares that did not run (status
+    not_run in analysis/decision_tests.yaml), with the harness's reason. In flu_vaccine R2 a declared test ended
+    not_run and nothing at the gate said so; only a critic found it. HIGH: the decision rests on a test that was never
+    made. Declarable with its reason (the finding says why the test did not run); its remedy is an owner amendment of
+    the spec, so the fix loop takes it to the owner. Read only from the verified artifact: when it cannot be read,
+    decision_test_findings already gives the non-declarable HIGH, so nothing is said twice."""
+    return []       # α: not raised yet (β)
+    rows, _man, problem, _payload = _verified_doc(run_dir)
+    if problem:
+        return []
+    declared = _declared_test_ids(run_dir)
+    out = []
+    for t in rows:
+        if not isinstance(t, dict) or not (t.get("status") == "not_run" or t.get("verdict") == "NOT_RUN"):
+            continue
+        tid = str(t.get("test_id"))
+        if declared is not None and tid not in declared:
+            continue        # an automatic test (prior_range_*, a conflict pair) the spec does not declare
+        why = " ".join(str(t.get("statement") or t.get("reason") or "").split())[:600] or "no reason was recorded"
+        out.append({"kind": DECISION_TEST_NOT_RUN_KIND, "severity": "HIGH", "stage": "ANALYZE",
+                    "target_stage": "ANALYZE", "key": tid, "scope_declarable": True,
+                    "claim": f"Decision test {tid}, declared in the signed spec, did not run, so the plan was not "
+                             f"tested against it. The harness's reason: {why}",
+                    "fix_requires": f"Owner amendment: change the spec so that decision test {tid} can run (the "
+                                    "reason above names what stops it), or drop it; otherwise declare it with this "
+                                    "reason.",
+                    "source": "toolkit/analysis/contract.py"})
+    return out
+
+
 def _claims(run_dir, man) -> list[dict]:
     lp = os.path.join(run_dir, "models", "claims_ledger.yaml")
     if not any(e.get("role") == "claims_ledger" for e in (man.get("deliverables") or {}).values()):
@@ -1136,6 +1183,22 @@ def _self_test() -> int:
            and "(" not in fs[1]["claim"],
            f"K-DTP1 each test whose verdict changes the plan is a decision-bearing HIGH, keyed by its id, with the "
            f"criteria that decided it: {fs}")
+        # K-DTP8 (hb3 fix 4, flu_vaccine R2): a declared test that did not run is a declarable HIGH naming the
+        # harness's reason, whose remedy is an owner amendment; an automatic test the spec does not declare is not one
+        ok(decision_test_not_run_findings(d) == [],
+           "K-DTP8a a spec that declares no decision test: an automatic test that did not run is not reported")
+        open(os.path.join(d, SPEC), "w").write("analysis:\n  decision_tests:\n  - {id: DT1}\n  - {id: DT3}\n")
+        nr = decision_test_not_run_findings(d)
+        open(os.path.join(d, SPEC), "w").write("[unreadable as a spec\n")
+        nr_bad = decision_test_not_run_findings(d)
+        open(os.path.join(d, SPEC), "w").write("x: 1\n")
+        ok([(x["kind"], x["key"], x["severity"], x["scope_declarable"], x.get("decision_bearing")) for x in nr]
+           == [("decision_test_not_run", "DT3", "HIGH", True, None)]
+           and "not run" in nr[0]["claim"] and "did not run" in nr[0]["claim"]
+           and nr[0]["fix_requires"].startswith("Owner amendment:")
+           and [x["key"] for x in nr_bad] == ["DT3"],
+           f"K-DTP8 a declared decision test that did not run is a declarable HIGH with its reason, an owner "
+           f"amendment; an unreadable spec reports it too (fail closed): {nr}, {nr_bad}")
         r1 = decision_test_record(d, "DT1") or {}
         ok(r1.get("statement") == rows[0]["statement"] and decision_test_record(d, "DT9") is None
            and r1.get("result_sha256") == sha256(os.path.join(d, "models", "decision_tests", "DT1.yaml"))

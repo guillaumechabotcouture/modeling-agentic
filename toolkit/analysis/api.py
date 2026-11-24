@@ -131,7 +131,8 @@ def headline(run_dir: str) -> dict:
 def gate_findings(run_dir: str) -> list[dict]:
     """The contract checks, then `decision_test_changes_plan` for every decision test whose verdict changes the plan
     (lead-gaps α): the stage machine's owner rule (#316) takes them to the owner, or under --signoff lead answers them
-    provisionally and flags them above the report's draft."""
+    provisionally and flags them above the report's draft. Then `decision_test_not_run` for every declared decision
+    test that did not run (hb3 fix 4), declarable with the harness's reason."""
     base = contract.gate_findings(run_dir)
     dt = contract.decision_test_findings(run_dir)
     if any(f.get("kind") in ("analysis_contract_missing", "analysis_contract_incomplete", "analysis_contract_blocked")
@@ -166,6 +167,15 @@ def _self_test() -> int:
             contract.decision_test_findings = _dtf
         ok(got[0] == "analysis_contract_missing" and got[-1] == "decision_test_changes_plan",
            f"AP9 gate_findings adds every plan-changing decision test after the contract checks: {got}")
+        # AP9b (hb3 fix 4): and every declared decision test that did not run, after those
+        _nrf = contract.decision_test_not_run_findings
+        try:
+            contract.decision_test_not_run_findings = lambda rd: [{"kind": "decision_test_not_run", "key": "DT2"}]
+            got_nr = [f["kind"] for f in gate_findings(d)]
+        finally:
+            contract.decision_test_not_run_findings = _nrf
+        ok(got_nr[0] == "analysis_contract_missing" and got_nr[-1] == "decision_test_not_run",
+           f"AP9b gate_findings adds every declared decision test that did not run: {got_nr}")
         got = [f["kind"] for f in gate_findings(d)]
         ok(got.count("analysis_contract_missing") == 1 and "analysis_contract_decision_test" not in got,
            f"AP10 before the analysis ran the missing manifest is reported once, by the contract checks: {got}")

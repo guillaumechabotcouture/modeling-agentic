@@ -19,6 +19,9 @@ Checks (principle numbers from .claude/orchestration/decision_design_principles.
   follow_up_window (3)     a dossier input whose observations declare follow_up_years shorter than the objective
                            window (objective.horizon): the effect is carried past what the evidence observed
                            (MEDIUM, for the owner's judgment).
+  expected_value_plan (1)  the question's objective is stated in expectation ("minimise expected <outcome>"), and
+                           the deliverable carries the point-value plan (deliverable.plan absent or point): the plan
+                           would answer another question (MEDIUM; the detected wording is recorded on the finding).
   decision_input_ranges (6) a dossier decision input that is a parameter held at a point value (HIGH); an
                            engine_parameters value with a range that no decision test varies (HIGH), or a point value
                            nothing varies (MEDIUM); an allocated component's cost item with no uncertainty range and
@@ -40,6 +43,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -47,7 +51,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 CHECKS = {"headline_comparator": 2, "decision_date": 2, "baseline_burden": 3, "decision_input_ranges": 6,
-          "follow_up_window": 3}
+          "follow_up_window": 3, "expected_value_plan": 1}
 # Principles 8-12 (owner, 2026-11-23): the critics' checklist items (toolkit/spec/critique_checklist.py ITEMS). Nothing
 # here computes them, but a spec may declare a departure from one; the sheet lists it as declared (Codex r3 of #366).
 CHECKLIST_CHECKS = {"comparator_symmetry": 8, "holdout_shock_overlap": 9, "burn_in_drift": 10,
@@ -56,6 +60,13 @@ CHECKS.update(CHECKLIST_CHECKS)
 SECTION = "## Spec critique (decision design principles, before signing)"
 PAST_DAYS = 90             # an ISO decision date more than this before today is past
 CALENDAR_MIN = 1900        # a window starting earlier is in model years, not calendar years: not compared with today
+# hb3 fix 4: an objective stated in expectation. An optimising verb, at most three words, then "expected" and the
+# quantity (not "expected to", "expected in <year>", ...); or "in expectation". No outcome, disease or unit is named.
+_OPTIMISE = (r"(?:(?:minimi[sz]|maximi[sz]|optimi[sz]|reduc)(?:e|es|ed|ing)|(?:avert|prevent)(?:s|ed|ing)?"
+             r"|fewest|lowest|highest|greatest)")
+EXPECTED_OBJECTIVE_RE = re.compile(
+    rf"\b{_OPTIMISE}\b(?:\s+[\w-]+){{0,3}}?\s+expected\s+"
+    r"(?!(?:to|in|by|that|from|at|when|if|for|with|under|of|as|on)\b)[a-z]+|\bin\s+expectation\b", re.I)
 
 
 def _year_frac(d: datetime.date) -> float:
@@ -320,6 +331,34 @@ def _follow_up(raw, run_dir, dossier_bytes=None) -> list:
                "a decision test varies it", judgment=True)]
 
 
+def expected_objective(question) -> str | None:
+    """The wording that states the question's objective in expectation, or None (hb3 fix 4)."""
+    return None     # α: not detected yet (β)
+    m = EXPECTED_OBJECTIVE_RE.search(" ".join(str(question or "").split()))
+    return m.group(0) if m else None
+
+
+def _expected_value(raw) -> list:
+    """The question asks to optimise an expected quantity and the deliverable carries the point-value plan: the plan
+    answers it only when the outcome is linear in the uncertain inputs (toolkit/analysis/plan_rule.py). MEDIUM, for
+    the owner; declared with a reason when the spec cannot carry the expected-value plan."""
+    said = expected_objective(raw.get("question"))
+    d = raw.get("deliverable") if isinstance(raw.get("deliverable"), dict) else {}
+    if said is None or d.get("kind") == "estimates":
+        return []
+    if d.get("plan") == "expected_value":
+        f = _f("INFO", "expected_value_plan", f"The question states its objective in expectation (\"{said}\"); the "
+               "deliverable carries the expected-value plan (deliverable.plan: expected_value).", "None")
+    else:
+        f = _f("MEDIUM", "expected_value_plan", f"The question states its objective in expectation (\"{said}\"), but "
+               f"the deliverable carries the plan solved at the point values (deliverable.plan: {d.get('plan') or 'absent'}"
+               "). That plan answers the question only when the outcome is linear in the uncertain inputs.",
+               "Set deliverable.plan: expected_value; when the spec cannot carry it (for example a by_group table), "
+               "declare this check in principle_departures with the reason")
+    f["detected"] = said
+    return [f]
+
+
 def _num(x):
     if isinstance(x, bool):
         return None
@@ -367,7 +406,8 @@ def findings(raw: dict, run_dir: str | None = None, today: datetime.date | None 
                      ("decision_date", lambda: _decision_date(raw, today)),
                      ("baseline_burden", lambda: _burden(raw, run_dir, burden_data)),
                      ("decision_input_ranges", lambda: _ranges(raw, run_dir, dossier_bytes)),
-                     ("follow_up_window", lambda: _follow_up(raw, run_dir, dossier_bytes))):
+                     ("follow_up_window", lambda: _follow_up(raw, run_dir, dossier_bytes)),
+                     ("expected_value_plan", lambda: _expected_value(raw))):
         try:
             out += fn()
         except Exception as e:  # noqa: BLE001 -- fail closed: a check that cannot run is a finding
@@ -599,6 +639,43 @@ def _self_test() -> int:
     r = spec(principle_departures=[{"principle": 8, "check": "holdout_shock_overlap", "reason": "x"}])
     ok(any(f["severity"] == "HIGH" and "malformed" in f["text"] for f in findings(r, today=T)),
        "SC42 a checklist check with the wrong principle number is still malformed")
+    # SC43-SC47 (hb3 fix 4, flu_vaccine R2): an objective stated in expectation with the point plan is a MEDIUM the
+    # owner sees before signing, declarable with a reason; the detected wording is recorded on the finding
+    for q, want in (("Allocate whole blocks to groups to minimise expected hospitalisations next season.",
+                     "minimise expected hospitalisations"),
+                    ("Choose the options that maximise expected cases averted, reported by unit.",
+                     "maximise expected cases"),
+                    ("Maximise the total expected number of deaths averted.", "Maximise the total expected number"),
+                    ("Which package minimises deaths in expectation?", "in expectation"),
+                    ("Find the plan that minimises expected deaths.", "minimises expected deaths"),
+                    ("Say whether a large outbreak is expected in 2026, and minimise cases.", None),
+                    ("Reduce cases in the districts expected to grow fastest.", None),
+                    ("Which package per unit averts the most deaths within the budget?", None)):
+        ok(expected_objective(q) == want, f"SC43 the objective's wording is detected generically ({q!r}: "
+                                          f"{expected_objective(q)!r}, want {want!r})")
+    qe = "Allocate the budget across units to minimise expected deaths."
+    fs = [f for f in findings(spec(question=qe, deliverable={"kind": "package_per_unit"}), today=T)
+          if f["check"] == "expected_value_plan"]
+    ok([f["severity"] for f in fs] == ["MEDIUM"] and fs[0]["detected"] == "minimise expected deaths"
+       and fs[0]["principle"] == 1 and "minimise expected deaths" in fs[0]["text"],
+       f"SC44 an expected-value question with the point plan is a MEDIUM naming the detected wording: {fs}")
+    fs = [f for f in findings(spec(question=qe, deliverable={"kind": "package_per_unit", "plan": "expected_value"}),
+                              today=T) if f["check"] == "expected_value_plan"]
+    ok([f["severity"] for f in fs] == ["INFO"] and fs[0]["detected"] == "minimise expected deaths",
+       f"SC45 with deliverable.plan: expected_value the detection is recorded as INFO: {fs}")
+    r = spec(question=qe, deliverable={"kind": "package_per_unit"},
+             principle_departures=[{"principle": 1, "check": "expected_value_plan",
+                                    "reason": "the per-group table is not yet written for the expected-value plan"}])
+    fs = findings(r, today=T)
+    md = "\n".join(sheet_lines(r, None, T))
+    ok(sev(fs, "expected_value_plan") == ["DECLARED"] and "per-group table" in md
+       and not [f for f in fs if "malformed" in f["text"]],
+       f"SC46 the mismatch is declarable with a reason and shown declared on the sheet: {sev(fs, 'expected_value_plan')}")
+    md = "\n".join(sheet_lines(spec(question=qe, deliverable={"kind": "package_per_unit"}), None, T))
+    ok("| MEDIUM | 1 | expected_value_plan |" in md
+       and sev(findings(spec(question="Which package per unit?"), today=T), "expected_value_plan") == []
+       and sev(findings(spec(question=qe, deliverable={"kind": "estimates"}), today=T), "expected_value_plan") == [],
+       "SC47 the MEDIUM is on the sign-off sheet; a question not in expectation, or an estimates deliverable, has none")
     print(f"{'FAIL' if fails else 'OK'}: " + (f"{len(fails)} case(s) failed" if fails else
                                                "all self-test cases passed."))
     return 1 if fails else 0
