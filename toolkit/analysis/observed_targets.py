@@ -423,7 +423,13 @@ def fit(spec, model, rows=None, fixed_z=None, fixed_params=None, seed=None, samp
     scan_failed = 0
     if sample_it:
         sd = spec["calibration"].get("seed", 0) if seed is None else seed
-        s = C.sample(P, seed=int(sd))
+        # hb3 fix 2a: above max_importance_params the chains start at the posterior mode, one proposal per chain
+        # (toolkit/analysis/mode_start.py). The mode search is a start search over the prior, not part of the
+        # posterior: its refusals are counted and reported, as the scan's below.
+        from toolkit.analysis import mode_start as MS
+        modes = MS.find_modes(P) if MS.uses_metropolis(P) else None
+        scan_failed, E.failed = E.failed, 0
+        s = MS.sample(P, seed=int(sd), modes=modes)
         refuse_failures("in the posterior sample")
         c = C.classify(P, s)
         refuse_failures("in the identifiability classification")
