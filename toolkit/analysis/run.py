@@ -998,6 +998,10 @@ def _self_test() -> int:
            f"D3 the interaction ratio is computed from the point outcomes ({inter[('a', 'b')]['interaction_ratio']:.3f})")
         ok(R["stability"]["n_folds"] == 3 and R["uncertainty"]["covers"] == ["calibration"],
            "D4 likelihood path: refit-based stability and calibration-covariance uncertainty")
+        uv = R["uncertainty"].get("unit_values_drawn") or {}
+        ok((uv.get("calibration") or {}).get("units") == 6 and uv["calibration"].get("attribute") == "log_rate"
+           and uv.get("n_varied") == 6,
+           f"D4b hb3 fix 5: the report counts the 6 per-unit log rates drawn with the ratios from the covariance: {uv}")
         gr = next(x for x in R["decision_tests"] if x["type"] == "group_rule")
         ok(gr["can_move_plan"] and gr["recommendation"]["with"], "D5 a group-rule decision test re-solves the plan")
         from toolkit.analysis import contract
