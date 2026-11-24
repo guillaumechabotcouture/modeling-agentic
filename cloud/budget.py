@@ -12,7 +12,7 @@ clicks "Allow", never "Always Allow". The key is read only inside one signing ca
 the record the owner confirmed on the terminal (/dev/tty), never returns or stores the key, and zeroes the buffer
 it was read into. Residual: Python and `cryptography` make copies of the key while signing that cannot be zeroed,
 and they stay in that process's memory until it exits. The trust anchor is the tracked public key
-cloud/budget_owner.pub.
+cloud/budget_owner.pub. The key handling lives in scripts/lib/owner_key.py, which the owner sign commands share.
 
     python3 cloud/budget.py init-key            # once, by the owner; then commit cloud/budget_owner.pub
     python3 cloud/budget.py set --scope f6 --usd 200 --note "F6 refit + run" [--start <ISO UTC>] [--days 14]
@@ -61,19 +61,20 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from worker_side import WORKSPACE, state_of  # noqa: E402
+sys.path.insert(1, os.path.join(os.path.dirname(HERE), "scripts"))
+from lib import owner_key as OK  # noqa: E402   the owner's key, shared with the owner sign commands (owner-sign)
 
 PUB_FILE = os.path.join(HERE, "budget_owner.pub")
 BUDGET_DIR = os.path.expanduser("~/.config/modeling-agentic")
 SCOPES_FILE = os.path.join(HERE, "budget_scopes.yaml")
 PRICES_FILE = os.path.join(HERE, "vm_prices.yaml")
-KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT = "modeling-agentic-budget-owner", "owner"
+KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT = OK.KEYCHAIN_SERVICE, OK.KEYCHAIN_ACCOUNT
 USD_PER_CREDIT = 0.061
 RATE_SAMPLE = 5                 # stopped clusters the measured rate is the median of
 RESERVATION_S = 2 * 3600        # a reservation lapses this long after it was made, if no cluster of its name appears
@@ -147,37 +148,10 @@ FIELDS = ("scope", "usd", "start_utc", "note", "issued_utc", "expires_utc", "non
           "floor_usd_per_instance_hour")
 
 
-class BudgetError(Exception):
-    """A budget that cannot be verified or measured: the caller refuses."""
-
-
-class Keychain:
-    """The only access to the owner's private key: a generic password in the login keychain, trusted by no
-    application (`-T ""`), so each read raises the keychain's password dialog."""
-
-    def __init__(self, run=subprocess.run):
-        self.run = run
-
-    def _who(self):
-        return ["-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT]
-
-    def exists(self) -> bool:     # attributes only: reads no secret, raises no dialog
-        return self.run(["security", "find-generic-password", *self._who()], capture_output=True).returncode == 0
-
-    def put(self, secret_hex: str) -> None:
-        line = " ".join(["add-generic-password", *self._who(), "-l", "modeling-agentic-budget-owner-key",
-                         "-T", '""', "-w", secret_hex]) + "\n"
-        r = self.run(["security", "-i"], input=line, capture_output=True, text=True)
-        err = (r.stderr or "").replace(secret_hex, "<key>").strip()
-        if r.returncode != 0 or err:      # -i may exit 0 after a failed command: its error text counts
-            raise BudgetError(f"keychain refused the key (security exit {r.returncode}): {err[:200]}")
-
-    def read_into(self) -> bytearray:
-        """The key's hex in a bytearray the caller zeroes (the prompted read)."""
-        r = self.run(["security", "find-generic-password", *self._who(), "-w"], capture_output=True)
-        if r.returncode != 0:
-            raise BudgetError(f"the keychain read was refused or failed (security exit {r.returncode})")
-        return bytearray(r.stdout.strip())
+# A budget that cannot be verified or measured: the caller refuses. The shared key module's error class, so a refused
+# keychain read or a bad signature there is a BudgetError here (owner-sign).
+BudgetError = OK.OwnerKeyError
+Keychain = OK.Keychain       # the only access to the owner's private key (scripts/lib/owner_key.py)
 
 
 class _Env:
@@ -240,8 +214,7 @@ def _num(x, what, minimum=None) -> float:
     return float(x)
 
 
-def _canon(record) -> bytes:
-    return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+_canon = OK.canon
 
 
 def _scope_name(scope) -> str:
@@ -260,31 +233,13 @@ def _write_private(path, text) -> None:
 
 def init_key(env=None) -> str:
     """A new key pair: the private half into the keychain, the public half (hex) to the tracked public-key file.
-    Refuses to replace either."""
-    from cryptography.hazmat.primitives import serialization as ser
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    Refuses to replace either. The owner sign commands use the same key (scripts/lib/owner_key.py)."""
     env = env or _ENV
-    store = env.keys()
-    if os.path.exists(env.pub_file) or store.exists():
-        raise BudgetError(f"a key exists already ({env.pub_file} or the keychain item {KEYCHAIN_SERVICE}): refusing")
-    k = Ed25519PrivateKey.generate()
-    store.put(k.private_bytes(ser.Encoding.Raw, ser.PrivateFormat.Raw, ser.NoEncryption()).hex())
-    if not store.exists():
-        raise BudgetError("the keychain does not hold the new key: no public key written")
-    pub = k.public_key().public_bytes(ser.Encoding.Raw, ser.PublicFormat.Raw).hex()
-    with open(env.pub_file, "x") as f:
-        f.write(pub + "\n")
-    return pub
+    return OK.init_key(env.keys(), env.pub_file)
 
 
 def _read_pub(env) -> str:
-    try:
-        v = open(env.pub_file).read().strip()
-    except OSError as e:
-        raise BudgetError(f"no owner public key at {env.pub_file} ({e}): the owner runs `budget.py init-key`") from None
-    if not re.fullmatch(r"[0-9a-f]{64}", v):
-        raise BudgetError(f"{env.pub_file} is not an Ed25519 public key in hex")
-    return v
+    return OK.read_pub(env.pub_file)
 
 
 def load_scopes(path=SCOPES_FILE) -> dict:
@@ -447,29 +402,19 @@ def _check_record(rec) -> dict:
 
 
 def _verify(doc, pub_hex) -> dict:
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     try:
-        rec, sig = doc["record"], bytes.fromhex(doc["signature"])
-        Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex)).verify(sig, _canon(rec))
-    except (InvalidSignature, KeyError, TypeError, ValueError, AttributeError):
+        rec = doc["record"]
+        OK.verify_bytes(_canon(rec), doc["signature"], pub_hex)
+    except (BudgetError, KeyError, TypeError):
         raise BudgetError("the budget's signature does not verify against the owner's public key") from None
     return _check_record(rec)
 
 
 def _sign(rec, store) -> dict:
-    """The one place the private key is read: sign exactly `rec`, then zero the buffer. Returns the signed document
-    only, never the key."""
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    """Sign exactly `rec` (OK.sign_bytes is the one place the key is read, and zeroes the buffer). Returns the signed
+    document only, never the key."""
     msg = _canon(_check_record(rec))
-    buf = store.read_into()
-    try:
-        sig = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(buf.decode())).sign(msg)
-    except ValueError:
-        raise BudgetError("the keychain item is not an Ed25519 key") from None
-    finally:
-        buf[:] = b"\0" * len(buf)
-    return {"alg": "ed25519", "record": rec, "signature": sig.hex()}
+    return {"alg": "ed25519", "record": rec, "signature": OK.sign_bytes(msg, store)}
 
 
 def _read_seen(env, scope):
@@ -1194,8 +1139,8 @@ def _self_test() -> int:
             ok(st.reads == 1 and all(b == 0 for b in st.handed[0]) and st.secret not in open(p).read()
                and rec == shown[0] and oct(os.stat(p).st_mode)[-3:] == "600",
                "BK3b one keychain read signs exactly the record shown; the key buffer is zeroed and never written out")
-            ok("/dev/tty" in inspect.getsource(_confirm_on_tty) and "read_into" in inspect.getsource(_sign)
-               and "read_into" not in inspect.getsource(set_budget),
+            ok("/dev/tty" in inspect.getsource(_confirm_on_tty) and "read_into" in inspect.getsource(OK.sign_bytes)
+               and "sign_bytes" in inspect.getsource(_sign) and "read_into" not in inspect.getsource(set_budget),
                "BK3c the confirmation comes from the terminal; only _sign reads the key")
         case("BK3", bk3)
 

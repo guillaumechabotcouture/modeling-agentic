@@ -281,12 +281,21 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     # evidence check hands back the binding to record (its dossier read once, the sheet's dossier sha256 compared)
     evidence = sign_preconditions(run_dir, data)
     extra.update(evidence["files"])
-    if _spec_record(run_dir) is not None:
+    from lib import owner_key as OK
+    prior = _spec_record(run_dir)
+    if prior is not None and not (by == "owner" and OK.spec_check(prior, run_dir)[0] == "refused"):
         raise ValueError("the spec is already signed; a change needs a new sign-off by the owner")
+    owner_sig = None
+    if by == "owner":       # owner-sign: the owner's key signs what is approved, before anything is frozen or written
+        try:
+            owner_sig = OK.sign_spec(run_dir, {SPEC: sha, **extra, SHEET: sheet_sha})
+        except OK.OwnerKeyError as e:
+            raise ValueError(f"not signed with the owner's key: {e}") from None
     if os.path.lexists(os.path.join(run_dir, DB.BRIEF)):
         # decision_brief.sign freezes the spec's geometry too (#131), and binds this evidence
         return DB.sign(run_dir, by, answers=answers, note=note, accept_proposed=accept_proposed,
-                       expect={SPEC: sha}, extra_sha=extra, expect_geometry=geo_expect, evidence=evidence)
+                       expect={SPEC: sha}, extra_sha=extra, expect_geometry=geo_expect, evidence=evidence,
+                       owner_signature=owner_sig)
     # The geometry part of the unsigned presentation file and its input hashes are frozen with the spec; an owner's
     # sign-off also approves the HIGH geometry exceptions the spec proposes (docs/design/v2-input-geometry.md §2).
     # The spec is the bytes read, validated and hashed above, never read again (#129: SG15).
@@ -300,7 +309,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
               "sha256": {SPEC: sha, **extra}, "evidence": evidence["record"],
               "producer": "toolkit/spec/signoff.py",
-              "schema_version": schema.SCHEMA_VERSION}
+              "schema_version": schema.SCHEMA_VERSION, **({"owner_signature": owner_sig} if owner_sig else {})}
     try:
         write_nofollow(run_dir, f"{DB.SIGNED_DIR}/{SPEC}", data, atomic=True)   # the bytes that were hashed
         write_nofollow(run_dir, SPEC_SIGNOFF, json.dumps(record, indent=1).encode(), atomic=True)
@@ -528,6 +537,7 @@ def _self_test() -> int:
         ok(status(d) == "awaiting", "SG2 a valid unsigned spec: awaiting")
         rec = sign(d, "lead", note="test run")
         ok(status(d) == "signed" and rec["sha256"][SPEC] == signed_sha(d), "SG3 signed (spec-only record)")
+        ok("owner_signature" not in rec, "OSG0 a lead's sign-off is never signed with the owner's key")
         with open(os.path.join(d, SPEC), "a") as f:
             f.write("\n# edited\n")
         ok(status(d) == "changed", "SG4 an edit after sign-off: changed")
@@ -536,6 +546,27 @@ def _self_test() -> int:
             ok(False, "SG5 a signed spec cannot be re-signed in place")
         except ValueError:
             ok(True, "SG5 a signed spec cannot be re-signed in place")
+    with tempfile.TemporaryDirectory() as d:     # OSG1-OSG3 (owner-sign; the self-test's throwaway key, no keychain)
+        from lib import owner_key as OK
+        schema.toy_spec(d)
+        rec = sign(d, "owner", note="n")
+        arts = ((rec.get("owner_signature") or {}).get("payload") or {}).get("artifacts") or {}
+        ok(OK.spec_check(rec, d)[0] == "signed" and arts.get(SPEC) == rec["sha256"][SPEC] and SHEET in arts
+           and all(arts.get(k) == v for k, v in rec["sha256"].items()),
+           f"OSG1 the owner's sign-off carries a signature of the spec, the sheet and every hash it binds ({sorted(arts)})")
+        bad = dict(rec, owner_signature=dict(rec["owner_signature"], signature="00" * 64))
+        json.dump(bad, open(os.path.join(d, SPEC_SIGNOFF), "w"))
+        try:
+            again = sign(d, "owner", note="again")
+        except ValueError as e:
+            again = {"error": str(e)}
+        ok(OK.spec_check(again, d)[0] == "signed", f"OSG2 the owner signs again over a record that does not verify "
+                                                   f"({str(again)[:160]})")
+        try:
+            sign(d, "lead")
+            ok(False, "OSG3 a verified owner sign-off is not replaced")
+        except ValueError:
+            ok(True, "OSG3 a verified owner sign-off is not replaced")
     with tempfile.TemporaryDirectory() as d:
         p = schema.toy_spec(d)
         raw = yaml.safe_load(open(p))

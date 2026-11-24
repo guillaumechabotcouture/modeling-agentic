@@ -449,9 +449,11 @@ def _capture(run_dir: str, names) -> dict:
 
 def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
          accept_proposed: bool = False, expect: dict | None = None, extra_sha: dict | None = None,
-         expect_geometry: str | None = None, evidence: dict | None = None) -> dict:
+         expect_geometry: str | None = None, evidence: dict | None = None, owner_signature: dict | None = None) -> dict:
     """Write the sign-off. Raises ValueError when the brief is not ready. The frozen files are read once: validated,
     hashed and copied from the same bytes, never through a link, and the record is published atomically.
+    `owner_signature`: the owner's key's signature of the spec's sign-off (toolkit/spec/signoff.py sign), recorded as
+    given; the harness verifies it against the record's hashes (scripts/lib/owner_key.py spec_check).
     `expect`: {file: sha256 the owner was shown} (a mismatch is refused); `extra_sha`: further hashes to record;
     `evidence`: the binding the caller made (toolkit/spec/evidence_dossier.py bind); never trusted: this entry point
     recomputes it from the captured spec and the dossier and refuses one that differs."""
@@ -519,6 +521,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         **({"evidence": evidence["record"]} if evidence else {}),
         "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
+        **({"owner_signature": owner_signature} if owner_signature else {}),
     }
     try:
         # Gemini review: keep the signed versions, so a changed file can be restored (the bytes that were hashed).

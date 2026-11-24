@@ -1225,6 +1225,12 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
     ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
     rec.update(evidence=ev["record"], evidence_sha256=ev["files"])
     rec[RC.RECORD_KEY] = RC.sha_of(rc_bytes)
+    if by == "owner":           # owner-sign: the owner's key signs the spec's hash before anything is frozen or written
+        from lib import owner_key as OK
+        try:
+            rec["owner_signature"] = OK.sign_spec(run_dir, {AB.SPEC_FILE: rec["spec_sha256"]})
+        except OK.OwnerKeyError as e:
+            raise ValueError(f"not signed with the owner's key: {e}") from None
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
     GEO.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {})
@@ -1687,6 +1693,7 @@ class Machine:
     def _signed_by(self, rd: str | None = None):
         """Who signed the current spec (of `rd`, the run dir by default), or None when it is unsigned or changed since."""
         rd = rd or self.run_dir
+        self._owner_sig = ("", "")
         if getattr(self.backend, "sign", None):
             if self.backend.signoff_status(rd) != "signed":
                 return None
@@ -1695,9 +1702,33 @@ class Machine:
                 rec = signoff._spec_record(rd) or {}
             except Exception:  # noqa: BLE001
                 rec = {}
-            return rec.get("signed_by") or rec.get("by") or "owner"
-        rec = _signoff(rd)
-        return rec.get("by") if rec and rec.get("spec_sha256") == signed_hash(rd) else None
+            by = rec.get("signed_by") or rec.get("by") or "owner"
+        else:
+            rec = _signoff(rd)
+            by = rec.get("by") if rec and rec.get("spec_sha256") == signed_hash(rd) else None
+        return self._owner_verified(rec, by, rd)
+
+    def _owner_verified(self, rec, by, rd: str):
+        """owner-sign: an owner's sign-off counts only when the owner's key signed it for this run and these files (or
+        it is an unsigned legacy record from before the cutoff, labelled so); else it is no sign-off (fail closed)."""
+        if by != "owner":
+            return by
+        from lib import owner_key as OK
+        st, why = OK.spec_check(dict(rec or {}, signed_by="owner"), rd)
+        self._owner_sig = (st, why)
+        return None if st == "refused" else by
+
+    def _owner_sig_label(self) -> dict | None:
+        """The history label of the owner's sign-off: signed, or unsigned (legacy)."""
+        st, why = getattr(self, "_owner_sig", ("", ""))
+        return {"owner_signature": why if st == "legacy" else st} if st in ("legacy", "signed") else None
+
+    def _spec_owner_problem(self) -> str | None:
+        """On --resume past SIGN under --signoff owner: the owner's sign-off must still verify (owner-sign)."""
+        if self.st.signoff != "owner" or self._signed_by() is not None:
+            return None
+        st, why = getattr(self, "_owner_sig", ("", ""))
+        return why if st == "refused" else None
 
     def fix_guard(self, run_dir: str) -> list[str]:
         """What a fix task may not do: change decision_spec.yaml (compared with its sign-off, or with
@@ -1809,6 +1840,14 @@ class Machine:
             if miss:
                 _withhold_report(self.run_dir)       # never deliverable under run_failed (narrow Codex review of #272)
                 self._go("FINAL", "the run's preconditions do not hold on resume: " + "; ".join(miss[:5]), "run_failed")
+                save_state(self.run_dir, self.st)
+                return self.st.status or self.st.state
+        if self.st.state in POST_CHOICE_STATES + ("ENGINE_CHOICE",):
+            why = self._spec_owner_problem()        # owner-sign: a resume past SIGN verifies the owner's signature
+            if why:
+                _withhold_report(self.run_dir)
+                self._go("FINAL", f"the owner's sign-off does not verify on resume: {why}; then relaunch with reuse",
+                         "run_failed")
                 save_state(self.run_dir, self.st)
                 return self.st.status or self.st.state
         for _ in range(max_steps):
@@ -2186,7 +2225,7 @@ class Machine:
         # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
         pend = self._geometry_owner_pending()
         if by and (mode == "lead" or by == "owner") and not pend:
-            return self._go("ENGINE_CHOICE", f"spec signed by {by}")
+            return self._go("ENGINE_CHOICE", f"spec signed by {by}", extra=self._owner_sig_label() if by == "owner" else None)
         if pend:
             how = ("python3 toolkit/spec/geometry.py approve" if by else "python3 agents/stage_machine.py sign")
             self.log(f"[machine] {len(pend)} HIGH geometry exception(s) wait for the owner ({', '.join(pend[:4])}): "
@@ -2219,6 +2258,9 @@ class Machine:
         self.st.paused = "awaiting_signoff"
         self.st.status = None
         save_state(self.run_dir, self.st)
+        st, why = getattr(self, "_owner_sig", ("", ""))
+        if st == "refused":
+            self.log(f"[machine] the owner's sign-off record is refused: {why}")
         self.log(f"[machine] waiting for the owner: python3 agents/stage_machine.py sign {self.run_dir} --by owner")
         return "SIGN"
 
@@ -2822,7 +2864,9 @@ class Machine:
             self.st.tries.pop("owner_request", None)
             who = "the lead answered provisionally" if lead and any(answers[fp].get("by") == "lead" for fp in want) \
                 else "the owner answered"
-            nxt = self._go("GATE", f"{who} the scope declarations")    # persisted before the request closes
+            legacy = SS.owner_legacy(self.run_dir, want)        # owner-sign: unsigned answers from before the cutoff
+            nxt = self._go("GATE", f"{who} the scope declarations",    # persisted before the request closes
+                           extra={"owner_signature": "unsigned (legacy)", "legacy_answers": legacy} if legacy else None)
             if isinstance(req, dict):
                 from lib.safe_io import write_nofollow
                 write_nofollow(self.run_dir, OWNER_REQUEST, json.dumps(dict(req, pending=False, answered_at=_now()),
@@ -2830,6 +2874,8 @@ class Machine:
             return nxt
         self.st.paused = "awaiting_scope_signoff"
         save_state(self.run_dir, self.st)
+        for why in list(SS.owner_refusals(self.run_dir).values())[:5]:
+            self.log(f"[machine] an owner answer is refused: {why}")
         return "OWNER_DECISION"
 
     def h_WRITE(self):
@@ -3956,6 +4002,67 @@ def _t_owner_disposes(run_dir: str) -> None:
             SO.write_sheet(run_dir)
 
 
+def _t_owner_sign(ok, new_run, Spike, Stub) -> None:
+    """OS1-OS5 (owner-sign): the machine leaves SIGN on an owner's record only when the owner's key (the self-test's
+    throwaway key) signed it for this run and spec, or it is an unsigned legacy record, labelled so; a resume past SIGN
+    verifies it again. A lead's record never counts as the owner's."""
+    quiet = lambda *a: None  # noqa: E731
+    d, T, st = new_run("owner_sig", {}, signoff="owner")
+    Spike(d, T, st, log=quiet, cross_engine_check=False).run()
+    _t_owner_disposes(d)
+    sign(d, "owner", "ok")
+    p = os.path.join(d, SIGNOFF_FILE)
+    good = json.load(open(p))
+
+    def put(rec):
+        json.dump(rec, open(p, "w"))
+
+    def at_sign(rec):
+        put(rec)
+        logs = []
+        s = Spike(d, Stub(T.s), None, log=logs.append, cross_engine_check=False).run()
+        return s, logs
+
+    bad = json.loads(json.dumps(good))
+    bad["owner_signature"]["payload"]["artifacts"][AB.SPEC_FILE] = "0" * 64
+    s, logs = at_sign(bad)
+    ok(s == "paused:awaiting_signoff" and any("refused" in str(x) and "--by owner" in str(x) for x in logs),
+       f"OS1 a changed owner signature is refused at SIGN, saying how to sign ({s}; {logs[-2:]})")
+    unsigned = {k: v for k, v in good.items() if k != "owner_signature"}
+    s, _ = at_sign(dict(unsigned, at="2026-12-01T00:00:00+00:00"))
+    s2, _ = at_sign(dict(good, by="lead"))
+    ok(s == "paused:awaiting_signoff" and s2 == "paused:awaiting_signoff" and load_state(d).state == "SIGN",
+       f"OS2 an unsigned owner record after the cutoff, or a lead's record, does not release an owner run ({s}, {s2})")
+    put(good)
+    m = Spike(d, Stub(T.s), None, log=quiet, cross_engine_check=False)
+    for _ in range(4):
+        m.step()
+        if m.st.state in POST_CHOICE_STATES:
+            break
+    left = [h for h in load_state(d).history if h.get("from") == "SIGN" and h.get("to") == "ENGINE_CHOICE"]
+    ok(m.st.state in POST_CHOICE_STATES and left and left[-1].get("owner_signature") == "signed",
+       f"OS3 the owner's signed record releases SIGN, labelled signed ({m.st.state}, {left[-1:]})")
+    del m
+    forged = json.loads(json.dumps(good))
+    forged["owner_signature"]["signature"] = "00" * 64
+    put(forged)
+    s = Spike(d, Stub(T.s), None, log=quiet, cross_engine_check=False).run()
+    why = [h.get("why", "") for h in load_state(d).history if h.get("to") == "FINAL"][-1:]
+    ok(s == "run_failed" and why and "does not verify on resume" in why[0],
+       f"OS4 a resume past SIGN verifies the owner's signature again: a bad one fails closed ({s}, {why})")
+    d, T, st = new_run("owner_legacy", {}, signoff="owner")
+    Spike(d, T, st, log=quiet, cross_engine_check=False).run()
+    _t_owner_disposes(d)
+    sign(d, "owner", "ok")
+    rec = {k: v for k, v in json.load(open(os.path.join(d, SIGNOFF_FILE))).items() if k != "owner_signature"}
+    json.dump(dict(rec, at="2026-11-20T00:00:00+00:00"), open(os.path.join(d, SIGNOFF_FILE), "w"))
+    m = Spike(d, Stub(T.s), None, log=quiet, cross_engine_check=False)
+    m.step()
+    left = [h for h in load_state(d).history if h.get("from") == "SIGN" and h.get("to") == "ENGINE_CHOICE"]
+    ok(left and left[-1].get("owner_signature") == "unsigned (legacy)",
+       f"OS5 an unsigned owner record from before the cutoff counts, labelled unsigned (legacy) ({left[-1:]})")
+
+
 def _self_test_lead_amend(ok, td: str) -> None:
     """lead-gaps β self-tests: S7 (a rethink of a signed spec) under --signoff lead with the fix plan's patch becomes a
     child run signed provisionally by the lead; under owner sign-off, or without a valid patch, the run pauses."""
@@ -4804,6 +4911,7 @@ def _self_test() -> int:
         sign(d, "owner", "ok")
         ok(_SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")
+        _t_owner_sign(ok, new_run, _SpikeMachine, StubTasks)
 
         d, T, st = new_run("lead_rc", {}, signoff="lead")
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()
