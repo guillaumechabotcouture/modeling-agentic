@@ -430,10 +430,37 @@ def harness_gaps(led: dict) -> set[str]:
     """Open findings the fix planner declared harness gaps (no file a fix task may edit can fix them) as they read now:
     the gap's event carries harness_gap_key, so a finding whose kind or remedy class was revised since is not one (hb2
     fix 4: no task can work on it, so it is declared, not sent to the fix loop again; hb3 fix 6: a reworded remedy of
-    the same class still is one)."""
+    the same class still is one, unless it now names a file a fix task may edit: Codex r1 of #375, P1-1)."""
     return {f.id for f in led.values() if f.status in ("open", "declared")
-            and any(isinstance(e, dict) and e.get("status") == HARNESS_GAP
-                    and e.get("key") in (harness_gap_key(f), legacy_harness_gap_key(f)) for e in f.events or [])}
+            and any(_gap_holds(f, e) for e in f.events or [])}
+
+
+_PATH_TOKEN = re.compile(r"[\w][\w./-]*")
+
+
+def names_editable_file(text) -> bool:
+    """The text names a file a fix task may edit (agents/fix_loop.py in_edit_scope, FIX_EDITABLE). Unknown (the
+    scope cannot be read) counts as naming one, so the planner looks at the finding again (fail closed)."""
+    try:
+        import fix_loop as FX           # lazy: fix_loop imports this module
+    except Exception:  # noqa: BLE001
+        return True
+    toks = (t.rstrip(".,;:") for t in _PATH_TOKEN.findall(str(text or "")))
+    return any(("/" in t or "." in t) and FX.in_edit_scope(t) for t in toks)
+
+
+def _gap_holds(f, e) -> bool:
+    """One harness-gap event still declares f: its key binds f as it reads now (the remedy as written, the earlier
+    key; or the remedy class), and a remedy reworded since it was declared names no file a fix task may edit."""
+    if not (isinstance(e, dict) and e.get("status") == HARNESS_GAP):
+        return False
+    if e.get("key") == legacy_harness_gap_key(f):
+        return True                     # the remedy reads as it did when the gap was declared
+    if e.get("key") != harness_gap_key(f):
+        return False
+    if "remedy" in e and e.get("remedy") == f.fix_requires:
+        return True
+    return not names_editable_file(f.fix_requires)
 
 
 def owner_answers(run_dir: str, lead_ok: bool = False) -> dict[str, dict]:

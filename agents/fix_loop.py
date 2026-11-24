@@ -468,7 +468,7 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
                 # the gap binds the finding as it reads now (its kind and remedy class: hb2 fix 4)
                 FL._event(f, round_n, HARNESS_GAP, "fix_planner",
                           f"{str(g.get('reason')).strip()} Needs: {', '.join(map(str, g.get('needs') or []))}"[:600],
-                          key=FL.harness_gap_key(f))
+                          key=FL.harness_gap_key(f), remedy=f.fix_requires)    # the remedy as declared (#375)
         FL.save(run_dir, led)
         log(f"[fix loop] harness gap(s), not fix tasks: {', '.join(gap_ids)}")
     done = {r.get("task") for r in impact_rows(run_dir) if r.get("round") == round_n}
