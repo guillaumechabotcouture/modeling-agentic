@@ -244,10 +244,11 @@ class Analysis:
 
     # ------------------------------------------------------------ outcomes, benefits, costs
     def evaluate(self, theta, zs, ids=None, noise=None, cost_mult=None, sampled=None, anchor_factors=None,
-                 anchor_unit_factors=None, anchor_skip=None):
+                 anchor_unit_factors=None, anchor_skip=None, unit_attrs=None):
         """(outcomes, benefit, cost) for the units. benefit[u][p] = (comparator - package) x discount factor
         on the primary outcome; cost from toolkit/alloc (per-outcome items from the model's cost outputs),
-        with optional per-cost-item multipliers."""
+        with optional per-cost-item multipliers. `unit_attrs`: {unit: {attribute: value}} drawn for this evaluation
+        only (the unit_rates source; direct evaluation), set on the model and cleared after the prediction."""
         ids = ids or self.ids
         if self.anchor is not None and anchor_factors is None and anchor_unit_factors is None \
                 and len(ids) < len(self.ids):
@@ -261,7 +262,15 @@ class Analysis:
                         need |= set(r["members"])
                         grow = True
             ids = [i for i in self.ids if i in need]
-        out = self.model.predict(zs, theta, ids, noise=noise)
+        if unit_attrs is not None:
+            if not hasattr(self.model, "unit_draws"):
+                raise ValueError("drawn unit values need the direct model (analysis.evaluation: direct)")
+            self.model.unit_draws = unit_attrs
+        try:
+            out = self.model.predict(zs, theta, ids, noise=noise)
+        finally:
+            if unit_attrs is not None:
+                self.model.unit_draws = None
         self.last_events = list(getattr(self.model, "last_events", []) or [])
         if self.anchor is not None:      # F6 S2-5d: external level / this evaluation's own model value
             from toolkit.analysis import burden as BU

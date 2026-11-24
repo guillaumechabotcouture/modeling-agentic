@@ -36,6 +36,15 @@ outcomes as declared weighted sums (e.g. DALYs = YLL per death x deaths + YLD pe
 parameters `w:<target>:<part>`). Every value needs a source; anything missing is refused at
 construction. The rule, the interactions and every source are on the card.
 
+Per-unit sampling (version 3, hb3 fix 5). A baseline measured from a panel of counts is uncertain unit by unit. With
+`baseline.sampling: {model: poisson, dispersion, outcomes, source}` the card adds the unit attribute
+`baseline_events` ({outcome: the event count behind the unit's measured rate}) and the uncertainty step's source
+`unit_rates` draws each unit's rate of each listed outcome, independently across units and outcomes, as
+rate x Gamma(shape n / phi, scale phi / n): mean 1, coefficient of variation sqrt(phi / n), n the unit's count and phi
+the panel's over-dispersion (1 for Poisson). A count of 0 is refused (no multiplicative interval). Without it the card
+says the baseline rates are point values the uncertainty step does not draw. In calibrated mode the per-unit log_rate
+and the rate ratios are drawn jointly from the panel fit's covariance by the `calibration` source (method likelihood).
+
 Outputs: per-capita outcomes over the decision window, the rate in each named window, and one cost
 driver per component (person-years covered). Disease-agnostic: names and values come from the spec.
 """
@@ -55,6 +64,8 @@ RULES = ("multiplicative", "strongest")
 RATIO_DISTS = ("triangular", "uniform")         # drawn on the log scale
 WEIGHT_DISTS = ("triangular", "uniform", "loguniform")
 MEASURED_UNDER = ("coverage_attribute", "no_components")
+SAMPLING_MODELS = ("poisson",)      # baseline.sampling.model: a gamma multiplier from the unit's event count
+EVENTS_ATTRIBUTE = "baseline_events"
 OVERLAPS = ("independent", "comonotone")
 MEASURES = ("rate_ratio", "hazard_ratio", "risk_ratio", "odds_ratio")
 # The rare-outcome approximation (a risk ratio used as the rate ratio) is accepted only at a baseline risk of at most
@@ -139,7 +150,9 @@ def _measure(d, where, hi):
 
 
 VALUE_KEYS = {"range", "dist", "source", "verified", "note"}
-KEYS = {"outcome": {"baseline_source", "note"}, "baseline": {"measured_under", "source", "overlap", "note"},
+KEYS = {"outcome": {"baseline_source", "note"},
+        "baseline": {"measured_under", "source", "overlap", "sampling", "note"},
+        "sampling": {"model", "dispersion", "outcomes", "source", "note"},
         "effect": VALUE_KEYS | {"rr", "measure", "conversion"},
         "conversion": {"method", "p0", "then", "reason", "source"},
         "combination": {"rule", "source", "interactions"},
@@ -252,6 +265,26 @@ class PackageRateEngine:
         self.overlap = b.get("overlap", "independent")
         if self.overlap not in OVERLAPS:
             bad.append(f"baseline.overlap: one of {OVERLAPS} (how components' baseline coverages overlap)")
+        self.sampling, n0 = None, len(bad)
+        sm = b.get("sampling")
+        if sm is not None:
+            if not isinstance(sm, dict):
+                bad.append("baseline.sampling: a mapping {model, dispersion, outcomes, source}")
+                sm = {}
+            bad += _unknown(sm, "sampling", "baseline.sampling")
+            so, disp = sm.get("outcomes", list(self.outcomes)), sm.get("dispersion", 1.0)
+            if sm.get("model") not in SAMPLING_MODELS:
+                bad.append(f"baseline.sampling.model: one of {SAMPLING_MODELS}")
+            if not (_num(disp) and disp >= 1):
+                bad.append("baseline.sampling.dispersion: a number >= 1 (the panel's over-dispersion; 1 for Poisson)")
+            if not (isinstance(so, list) and so and all(isinstance(o, str) for o in so) and len(set(so)) == len(so)
+                    and set(so) <= set(self.outcomes)):
+                bad.append(f"baseline.sampling.outcomes: distinct declared outcomes (of {self.outcomes})")
+            if not str(sm.get("source") or "").strip():
+                bad.append("baseline.sampling.source: the basis of the counts and the dispersion")
+            if len(bad) == n0:
+                self.sampling = {"model": sm["model"], "dispersion": float(disp), "outcomes": list(so),
+                                 "source": str(sm["source"]).strip()}
         effects = effects if isinstance(effects, dict) else {}
         self.relative, self.conversions, self.conv = {}, [], {}
         for c in effects:
@@ -355,6 +388,36 @@ class PackageRateEngine:
                            for k, v in self._p.items() if v[1] is not None},
                 "fixed": {k: f"declared without a range: {v[4]}" for k, v in self._p.items() if v[1] is None}}
 
+    def unit_sampling(self) -> dict | None:
+        """The per-unit sampling the uncertainty step draws (source `unit_rates`), or None: {attribute, events_attribute,
+        model, dispersion, outcomes, source}. Only trial_priors mode with `baseline.sampling` declares one."""
+        if self.mode != "trial_priors" or self.sampling is None:
+            return None
+        return dict(self.sampling, attribute="baseline_rate", events_attribute=EVENTS_ATTRIBUTE,
+                    outcomes=list(self.sampling["outcomes"]))
+
+    def draw_unit_attributes(self, unit, rng) -> dict:
+        """One draw of the unit's sampled attributes ({baseline_rate: {outcome: rate}}): each listed outcome's measured
+        rate times Gamma(n / phi, scale phi / n) from `rng` (a numpy Generator), in the declared outcome order; the
+        other outcomes keep their value. Fails closed on a missing or non-positive count."""
+        s = self.unit_sampling()
+        if s is None:
+            raise ValueError("PackageRateEngine: no per-unit sampling is declared (baseline.sampling)")
+        br, ev = unit.attributes.get("baseline_rate"), unit.attributes.get(EVENTS_ATTRIBUTE)
+        if not isinstance(br, dict) or not isinstance(ev, dict):
+            raise ValueError(f"unit {unit.id}: baseline_rate and {EVENTS_ATTRIBUTE} must each give {s['outcomes']}")
+        out = dict(br)
+        for o in s["outcomes"]:
+            n, r = ev.get(o), br.get(o)
+            if not (_num(n) and n > 0):
+                raise ValueError(f"unit {unit.id}: {EVENTS_ATTRIBUTE}.{o} must be a count > 0 (got {n!r}); a zero "
+                                 "count gives no multiplicative sampling interval")
+            if not (_num(r) and r >= 0):
+                raise ValueError(f"unit {unit.id}: baseline_rate.{o} must be a rate >= 0 (got {r!r})")
+            k = float(n) / s["dispersion"]
+            out[o] = float(r) * float(rng.gamma(k, 1.0 / k))
+        return {"baseline_rate": out}
+
     def _m(self, p, o, active) -> float:
         """The rate multiplier of one exposure state (the set of components a person has)."""
         def ratio(c):                       # the declared measure, converted to a rate ratio (each draw too)
@@ -457,9 +520,18 @@ class PackageRateEngine:
         ua = {"baseline_rate": f"{{outcome: rate per person-year}} from external estimates, for {self.outcomes}"}
         if self.measured_under == "coverage_attribute":
             ua["baseline_coverage"] = "{component: share of its trial effect in place when the baseline was measured}"
+        s = self.sampling
+        if s is not None:
+            ua[EVENTS_ATTRIBUTE] = f"{{outcome: event count behind the measured baseline rate}}, for {s['outcomes']}"
+            notes.append(f"per-unit sampling: the uncertainty source unit_rates draws each unit's baseline rate of "
+                         f"{s['outcomes']} as rate x Gamma(n / phi, scale phi / n), n its {EVENTS_ATTRIBUTE}, phi "
+                         f"{s['dispersion']:g}, independently across units and outcomes ({s['source']})")
+        else:
+            notes.append("per-unit sampling: none declared (baseline.sampling); the baseline rates are point values "
+                         "the uncertainty step does not draw")
         outs = self.outcomes + list(self.compose)
         return EngineCard(
-            name="package_rate", version=f"2-trial_priors-{self.rule}-{self._digest()}", mechanisms=mech,
+            name="package_rate", version=f"3-trial_priors-{self.rule}-{self._digest()}", mechanisms=mech,
             components={c: [0, 1] for c in self.components}, unit_attributes=ua,
             outputs={"per_capita": outs, "windows": ["rate"] + [f"rate_{o}" for o in outs],
                      "cost_drivers": [f"{c}_person_years" for c in self.components]},
@@ -603,6 +675,8 @@ def _self_test_trial(ok):
     _self_test_review2(ok, cfg, h)
     _self_test_review3(ok, h)
     _self_test_review4(ok, h)
+    _self_test_sampling(ok, cfg)
+    _self_test_sampling_e2e(ok)
     with tempfile.TemporaryDirectory() as d:
         try:
             R = _toy_trial_run(d)
@@ -902,6 +976,113 @@ def _self_test_review4(ok, h):
     ok(not bad, f"X4 malformed scalar sections give the contextual ValueError, never a crash ({bad})")
 
 
+def _self_test_sampling(ok, cfg):
+    """hb3 fix 5: per-unit sampling of measured baseline rates, declared on the card and drawn by the engine."""
+    import copy
+    import numpy as np
+    from toolkit.engines.contract import UnitSpec
+    smp = {"model": "poisson", "dispersion": 1.0, "outcomes": ["cases"], "source": "toy panel counts"}
+
+    def with_s(s):
+        c = copy.deepcopy(cfg)
+        c["baseline"]["sampling"] = s
+        return c
+    try:
+        e = PackageRateEngine(**with_s(smp))
+    except Exception as ex:  # noqa: BLE001 -- a failing case, not a crash
+        ok(False, f"S1 a trial-prior configuration with baseline.sampling is accepted: {type(ex).__name__}: {ex}")
+        return
+    c, c0 = e.describe(), PackageRateEngine(**cfg).describe()
+    us = e.unit_sampling() or {}
+    ok(EVENTS_ATTRIBUTE in c.unit_attributes and any("unit_rates" in n and "toy panel counts" in n for n in c.notes)
+       and c.version.startswith("3-trial_priors") and us.get("outcomes") == ["cases"] and us.get("dispersion") == 1.0
+       and us.get("attribute") == "baseline_rate",
+       f"S1 the card declares the per-unit sampling (baseline_events, the unit_rates note) at version 3: {c.version}")
+    ok(PackageRateEngine(**cfg).unit_sampling() is None and EVENTS_ATTRIBUTE not in c0.unit_attributes
+       and any("point values the uncertainty step does not draw" in n for n in c0.notes)
+       and PackageRateEngine(["x", "y"]).unit_sampling() is None,
+       "S2 without it the card says the baseline rates are point values; calibrated mode declares no unit sampling")
+    bad = []
+    for what, s in (("dispersion below 1", dict(smp, dispersion=0.5)), ("an unknown model", dict(smp, model="normal")),
+                    ("an undeclared outcome", dict(smp, outcomes=["nope"])), ("no source", dict(smp, source=" ")),
+                    ("a misspelt key", dict(smp, dispresion=2.0)), ("a scalar", 3)):
+        try:
+            PackageRateEngine(**with_s(s))
+            bad.append(f"{what}: accepted")
+        except ValueError:
+            pass
+        except Exception as ex:  # noqa: BLE001
+            bad.append(f"{what}: {type(ex).__name__}")
+    ok(not bad, f"S3 a malformed baseline.sampling is refused with the contextual ValueError ({bad})")
+    u = UnitSpec("u", {"baseline_rate": {"cases": 0.4, "deaths": 0.002}, EVENTS_ATTRIBUTE: {"cases": 25}})
+    rng = np.random.default_rng(1)
+    xs = [e.draw_unit_attributes(u, rng)["baseline_rate"] for _ in range(4000)]
+    m = np.array([x["cases"] for x in xs]) / 0.4
+    e4 = PackageRateEngine(**with_s(dict(smp, dispersion=4.0)))
+    m4 = np.array([e4.draw_unit_attributes(u, rng)["baseline_rate"]["cases"] for _ in range(4000)]) / 0.4
+    ok(abs(m.mean() - 1) < 0.02 and abs(m.std() / m.mean() - 0.2) < 0.02 and abs(m4.std() / m4.mean() - 0.4) < 0.04
+       and all(x["deaths"] == 0.002 for x in xs),
+       f"S4 a drawn rate is the rate x Gamma(n/phi, phi/n): mean 1, CV sqrt(phi/n) (n 25: {m.std() / m.mean():.3f}; "
+       f"phi 4: {m4.std() / m4.mean():.3f}); an outcome not listed keeps its value")
+    refused = []
+    for attrs in ({"baseline_rate": {"cases": 0.4}, EVENTS_ATTRIBUTE: {"cases": 0}},
+                  {"baseline_rate": {"cases": 0.4}}, {"baseline_rate": {"cases": 0.4}, EVENTS_ATTRIBUTE: {"deaths": 3}}):
+        try:
+            e.draw_unit_attributes(UnitSpec("u", attrs), rng)
+            refused.append(False)
+        except ValueError:
+            refused.append(True)
+    ok(all(refused), f"S5 a zero, missing or other outcome's count fails closed ({refused})")
+
+
+def _self_test_sampling_e2e(ok):
+    """hb3 fix 5, end to end: on a toy panel whose per-unit counts are small, drawing their sampling error (unit_rates)
+    widens the headline interval; the point plan and the other sources' draws are unchanged; the report says what it
+    drew; the schema refuses the source where the engine declares no sampling, and an undeclared sampling."""
+    import tempfile
+    import yaml
+    from toolkit.spec import schema as SC
+    smp = {"model": "poisson", "dispersion": 1.0, "outcomes": ["cases", "deaths"], "source": "toy panel counts"}
+    try:
+        with tempfile.TemporaryDirectory() as d0, tempfile.TemporaryDirectory() as d1:
+            R0 = _toy_trial_run(d0, draws=100, sampling=smp, unit_rates="excluded")
+            R1 = _toy_trial_run(d1, draws=100, sampling=smp, unit_rates="source")
+            rep0 = yaml.safe_load(open(os.path.join(d0, "uncertainty_report.yaml")))
+            rep1 = yaml.safe_load(open(os.path.join(d1, "uncertainty_report.yaml")))
+            from toolkit.analysis import figure_data as FD
+            rp = FD.replay(R1["_A"], R1["point"]["plan"], R1["uncertainty"])
+            ok(rp["reproduced"] is True, f"SE5 (Codex r1 P1-2) the figure step's own replay redraws the unit rates and "
+                                         f"reproduces the interval: {rp.get('replayed')} vs {rp.get('stored')}")
+    except Exception as ex:  # noqa: BLE001
+        ok(False, f"SE1 the toy panel runs with and without unit_rates: {type(ex).__name__}: {ex}")
+        return
+    w = [R["uncertainty"]["fixed_plan"]["dalys"]["ci_high"] - R["uncertainty"]["fixed_plan"]["dalys"]["ci_low"]
+         for R in (R0, R1)]
+    ok(w[1] > 1.3 * w[0], f"SE1 per-unit sampling error widens the headline interval (width {w[0]:.4g} -> {w[1]:.4g})")
+    ok(R0["point"]["plan"] == R1["point"]["plan"]
+       and rep0["parameter_samples"]["lrr:a:cases"] == rep1["parameter_samples"]["lrr:a:cases"],
+       "SE2 the point plan and the priors' draws are unchanged by the unit_rates source (its own stream)")
+    uv = rep1.get("unit_values_drawn") or {}
+    ok("unit_rates" in rep1["sources_drawn"] and (uv.get("unit_rates") or {}).get("units") == 6
+       and uv["unit_rates"].get("values") == 12 and rep1.get("sampler_varied_unit_values") == 12
+       and "unit rates" in rep1["interval_label"] and (rep0.get("unit_values_drawn") or {}).get("n_varied") == 0
+       and {"kind": "unit_rates", "status": "excluded"} in [{k: x[k] for k in ("kind", "status")}
+                                                             for x in rep0["sources_not_drawn"]],
+       f"SE3 the report says which unit values it drew (6 units x 2 outcomes) and labels the interval: {uv}")
+    with tempfile.TemporaryDirectory() as d:
+        probs = []
+        for kw in ({"sampling": smp}, {"unit_rates": "source"}, {"sampling": smp, "unit_rates": "source"}):
+            probs.append([x for x in SC.validate(SC.load(_toy_trial_spec(d, **kw))) if "unit_rates" in x])
+        ok(probs[0] and probs[1] and probs[2] == [],
+           f"SE4 a declared sampling neither drawn nor excluded, and unit_rates without one, are refused: {probs}")
+        p = _toy_trial_spec(d, sampling=smp, unit_rates="source")
+        raw = yaml.safe_load(open(p))
+        raw["decision_units"]["engine_attributes"][EVENTS_ATTRIBUTE]["columns"].pop("deaths")
+        yaml.safe_dump(raw, open(p, "w"), sort_keys=False)
+        miss = [x for x in SC.validate(SC.load(p)) if EVENTS_ATTRIBUTE in x and "deaths" in x]
+        ok(miss, f"SE4b (Codex r1 P2-5) a sampled outcome with no bound count is refused before sign-off: {miss}")
+
+
 def toy_trial_config() -> dict:
     """A small trial-prior configuration (self-tests): a and b with trial effects, c relative to a, an a x b term."""
     def eff(rr, lo, hi, src):
@@ -922,23 +1103,37 @@ def toy_trial_config() -> dict:
                                   "cases": {"value": 0.01, "source": "toy YLD per case"}}}}
 
 
-def _toy_trial_run(d) -> dict:
-    """A 6-unit toy spec on the trial-prior engine, run through toolkit/analysis/run.py (direct evaluation, unsigned)."""
+def _toy_trial_spec(d, sampling=None, unit_rates=None) -> str:
+    """A 6-unit toy spec on the trial-prior engine (the path of decision_spec.yaml). `sampling`: engine
+    baseline.sampling, with each unit's event counts bound as baseline_events; `unit_rates`: "source" or "excluded"."""
     import yaml
-    from toolkit.analysis import run as RUN
     with open(os.path.join(d, "units.csv"), "w") as f:
-        f.write("id,zone,pop,inc,mort,cov_a,cov_b,cov_c\n")
+        f.write("id,zone,pop,inc,mort,cov_a,cov_b,cov_c,ev_inc,ev_mort\n")
         for i in range(6):
-            f.write(f"u{i},z{i % 3},{10000 + 1000 * i},{0.1 + 0.1 * i:.2f},{0.001 * (1 + i % 3):.4f},{0.1 * i:.1f},0.2,0.0\n")
+            f.write(f"u{i},z{i % 3},{10000 + 1000 * i},{0.1 + 0.1 * i:.2f},{0.001 * (1 + i % 3):.4f},{0.1 * i:.1f},0.2,0.0,"
+                    f"{2 + i % 2},{1 + i % 2}\n")
+    cfg = toy_trial_config()
+    attrs = {"baseline_rate": {"columns": {"cases": "inc", "deaths": "mort"}},
+             "baseline_coverage": {"columns": {"a": "cov_a", "b": "cov_b", "c": "cov_c"}}}
+    if sampling is not None:
+        cfg["baseline"]["sampling"] = sampling
+        attrs[EVENTS_ATTRIBUTE] = {"columns": {"cases": "ev_inc", "deaths": "ev_mort"}}
+    unc = {"draws": 8, "seed": 3, "sources": [{"kind": "priors"}],
+           "excluded": [{"kind": "calibration", "reason": "no calibration: external baselines"},
+                        {"kind": "engine_parameters", "reason": "no fitted parameters"},
+                        {"kind": "costs", "reason": "toy"}, {"kind": "emulator", "reason": "direct"}]}
+    if unit_rates == "source":
+        unc["sources"].append({"kind": "unit_rates"})
+    elif unit_rates == "excluded":
+        unc["excluded"].append({"kind": "unit_rates", "reason": "toy: the rates are held at their point values"})
     spec = {
         "schema_version": 1, "question": "Which package per unit (step 0)?", "decision_maker": "programme manager",
         "decision_date": 2026,
-        "engine": {"ref": "toolkit.engines.empirical.engine:PackageRateEngine", "config": toy_trial_config()},
+        "engine": {"ref": "toolkit.engines.empirical.engine:PackageRateEngine", "config": cfg},
         "horizon": {"start": 2024, "stop": 2027},
         "decision_units": {"csv": "units.csv", "id": "id",
                            "populations": {"all": {"column": "pop", "age_groups": ["all"]}},
-                           "engine_attributes": {"baseline_rate": {"columns": {"cases": "inc", "deaths": "mort"}},
-                                                 "baseline_coverage": {"columns": {"a": "cov_a", "b": "cov_b", "c": "cov_c"}}}},
+                           "engine_attributes": attrs},
         "options": {"populations": {"total": "pop"}, "components": {"a": {"group": "g"}, "b": {}, "c": {"group": "g"}},
                     "packages": {"generate": True},
                     "engine_map": {"a": {"a": 1}, "b": {"b": 1}, "c": {"c": 1}},
@@ -951,19 +1146,24 @@ def _toy_trial_run(d) -> dict:
         "comparator": {"package": "none", "text": "no package"},
         "outcomes_reported": ["dalys", "cases", "deaths"],
         "calibration": {"method": "none"},
-        "uncertainty": {"draws": 8, "seed": 3, "sources": [{"kind": "priors"}],
-                        "excluded": [{"kind": "calibration", "reason": "no calibration: external baselines"},
-                                     {"kind": "engine_parameters", "reason": "no fitted parameters"},
-                                     {"kind": "costs", "reason": "toy"}, {"kind": "emulator", "reason": "direct"}]},
+        "uncertainty": unc,
         "analysis": {"evaluation": "direct", "stability": {"holdout_group": "zone"},
                      "sensitivity": {"parameters": "fitted"}, "decision_tests": []},
         "deliverable": {"kind": "package_per_unit", "allocation_file": "allocation_optimized.csv",
                         "columns": {"unit": "unit", "package": "package", "value": "dalys_averted"},
                         "headline": {"name": "total_dalys_averted", "outcome": "dalys"}},
     }
-    with open(os.path.join(d, "decision_spec.yaml"), "w") as f:
+    p = os.path.join(d, "decision_spec.yaml")
+    with open(p, "w") as f:
         yaml.safe_dump(spec, f, sort_keys=False)
-    return RUN.run(d, unsigned=True, log=lambda *a, **k: None, compute_kw={"max_workers": 1}, draws=8)
+    return p
+
+
+def _toy_trial_run(d, draws=8, **kw) -> dict:
+    """The toy spec (_toy_trial_spec) run through toolkit/analysis/run.py (direct evaluation, unsigned)."""
+    from toolkit.analysis import run as RUN
+    _toy_trial_spec(d, **kw)
+    return RUN.run(d, unsigned=True, log=lambda *a, **k: None, compute_kw={"max_workers": 1}, draws=draws)
 
 
 if __name__ == "__main__":

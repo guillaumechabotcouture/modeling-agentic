@@ -102,7 +102,18 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
    `prior_range` decision test; do not declare one. A prior targets an engine parameter only
    (`prior_target_not_parameter`). A unit attribute bound to a data column is data: if the
    column is uncertain, declare that where it arises, as the observation of a latent quantity
-   through a source with a sampling frame and a bias model. When field data dispute a
+   through a source with a sampling frame and a bias model. A rate measured per unit from
+   counts (the package-rate engine in `trial_priors` mode, its `baseline_rate` bound to a
+   panel's pooled rates) has sampling error unit by unit: declare
+   `engine.config.baseline.sampling: {model: poisson, dispersion, outcomes, source}` (the
+   panel's over-dispersion, 1 for Poisson), bind each unit's event counts as
+   `baseline_events` (`columns: {<outcome>: <count column>}`), and list the `unit_rates`
+   source, which draws each unit's rate independently. Whenever the engine card declares
+   `baseline.sampling`, declare the `unit_rates` source or exclude it with a reason (the
+   check refuses neither). A headline interval narrower than `thresholds.yaml
+   uncertainty.interval_rel_width_min` of its magnitude is an owner item
+   (`analysis_interval_degenerate`, a declarable HIGH): draw the uncertainty the headline
+   rests on, or the owner declares the limitation. When field data dispute a
    column's values for some units, declare a `unit_attribute` decision test over the disputed
    values (`unit_attribute: {column, units: [ids] | all, values | scale | set_from}`); the
    column must feed an engine attribute that has a declared valid range, and on the emulator
