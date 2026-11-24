@@ -123,11 +123,13 @@ card offers per-unit sampling (the package-rate engine's `baseline.sampling` in 
 with each unit's event counts bound as `baseline_events`; estimate empirical over-dispersion
 max(1, chi2/df) across rounds/years when a multi-period panel is over-dispersed), declare it, then
 list the `unit_rates` uncertainty source, or exclude it with a reason; a headline interval with next
-to no width goes to the owner. When both an administrative cohort coverage series and a finite-sample
-serosurvey exist for the compartmental engine, do not plug raw survey proportions into fixed `s0`
-(`initialiser: given`): bind the cohort series with `initialiser: cohort_history` and calibrate
-per-unit `coverage_scale` against the survey's binomial observations (`targets.kind: observations`),
-so the posterior shrinks sampling noise and propagates per-unit immunity uncertainty. Output:
+to no width goes to the owner. When both an administrative cohort coverage series and a finite-sample serosurvey exist for the
+compartmental engine, do not plug raw survey proportions into fixed `s0` (`initialiser: given`): where
+`structure: birth_cohorts` applies, bind the cohort series with `initialiser: cohort_history` and
+calibrate per-unit `coverage_scale` against the survey's `binomial` (or `betabinomial` with a design
+effect) observations (`targets.kind: observations`), or calibrate `per_group_parameters: [s0]` when
+`structure: age_groups_contact_matrix` is required, so the posterior shrinks sampling noise and
+propagates per-unit immunity uncertainty. Output:
 decision_spec.yaml, analysis_settings.yaml, data/derivations.yaml, the scripts, and {out} =
 {{"ok": true, "notes": "..."}}.""",
     "draft_evidence": COMMON + """

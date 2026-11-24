@@ -201,13 +201,20 @@ by birth cohort, an outbreak's final size), the engine is
   and a finite-sample serosurvey exist, do **not** discard the cohort series and plug raw `1 - k/n`
   survey proportions into `initialiser: given` (`s0`) as fixed point values: small-sample binomial noise
   distorts unit rankings, leaves per-unit sampling error out of the draws, and makes state-only
-  observation targets flat (refused by the validator). Instead, use `initialiser: cohort_history` (binding
-  the administrative dose coverages per birth cohort) and calibrate `coverage_scale` per unit
-  (`calibration: {method: posterior, attribute: coverage_scale, scale: linear, ...}`) against the
-  serosurvey's binomial observations (`targets: {kind: observations, latent: immunity}`). This shrinks
-  noisy bands toward the cohort series while letting genuine multi-SD discrepancies move effective
-  coverage, and propagates per-unit sampling uncertainty into both `expected_value` planning and the 95%
-  UI. When you calibrate `coverage_scale`, start its prior from the card's sourced range
+  observation targets flat (refused by the validator). Instead, when the question fits `structure:
+  birth_cohorts` (homogeneous mixing across cohorts, which `cohort_history` requires), use `initialiser:
+  cohort_history` (binding the administrative dose coverages per birth cohort) and calibrate
+  `coverage_scale` per unit (`calibration: {method: posterior, attribute: coverage_scale, scale: linear,
+  ...}`) against the serosurvey's `binomial` (or `betabinomial` when a survey design effect is given)
+  observations (`targets: {kind: observations, csv: ..., unit: ..., groups: ..., source: ..., latent:
+  latent, observed: ..., n: ...}`, where the CSV's `latent` column holds `immunity` or `susceptible`,
+  e.g. `u1,c1;c2,sero,immunity,124,200`). Where an age-contact matrix (`structure:
+  age_groups_contact_matrix`) is required, keep that structure and calibrate per-group initial-state
+  parameters (`per_group_parameters: [s0]`) against the survey likelihood rather than switching away from
+  the contact matrix. This shrinks noisy bands toward the cohort series (or prior) while letting genuine
+  multi-SD discrepancies move effective coverage, and propagates per-unit sampling uncertainty into both
+  `expected_value` planning and the 95% UI. When you calibrate `coverage_scale`, start its prior from
+  the card's sourced range
   (`attribute_binding.yaml`, `coverage_scale.prior`) and copy the source. First check the card's
   `applicability` assumptions against the question (coverage level, declared seroconversion, pathogen,
   setting), and recompute the ends where they differ. A narrower or wider range needs its own source. The
