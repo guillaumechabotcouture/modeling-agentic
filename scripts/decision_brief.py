@@ -481,6 +481,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
     missing = [q["id"] for q in qs if q["id"] not in answers and not accept_proposed]
     if missing:
         raise ValueError("no answer for " + ", ".join(missing) + " (give one, or --accept-proposed)")
+    freeze = None       # owner-sign (Codex r2 3): the geometry approvals are written only after the owner's key signed
     if captured.get(DECISION_SPEC) is not None:
         # Codex round 2 on #131: this sign-off also signs the decision spec, so it freezes the spec's geometry inputs
         # (and, signed by the owner, approves the spec's proposed HIGH geometry exceptions). Brief-only runs skip it.
@@ -516,7 +517,7 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
             spec_doc = yaml.safe_load(captured[DECISION_SPEC].decode("utf-8")) or {}
         except (yaml.YAMLError, UnicodeDecodeError) as e:
             raise ValueError(f"{DECISION_SPEC} does not parse: {e}") from None
-        geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=expect_geometry)
+        freeze = (geometry, spec_doc if isinstance(spec_doc, dict) else {}, expect_geometry)
     record = {
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
@@ -534,6 +535,8 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
             record["owner_signature"] = OK.sign_spec(run_dir, record, sheet_sha256)
         except OK.OwnerKeyError as e:
             raise ValueError(f"not signed with the owner's key: {e}") from None
+    if freeze:
+        freeze[0].freeze(run_dir, by, spec=freeze[1], expect_evidence=freeze[2])
     try:
         # Gemini review: keep the signed versions, so a changed file can be restored (the bytes that were hashed).
         for f, b in captured.items():

@@ -25,8 +25,8 @@ LEGACY_CUTOFF_UTC by the verifier's clock (the record's own timestamp is unsigne
 runs are not stranded; from the cutoff on every unsigned owner record is refused with the sign command.
 
 Test key. Only an explicit in-process opt-in turns on a throwaway key: `enable_test_key()`, which a process started
-as a self-test (`--self-test` in its own argv: every entry point routes that flag to its self-test, never to a sign,
-resume or run path) calls on first use, and `keyed_argv`, with which a self-test starts a child that opts in
+as exactly `<entry point> --self-test` (every entry point routes that command line to its self-test, never to a
+sign, resume or run path) calls on first use, and `keyed_argv`, with which a self-test starts a child that opts in
 explicitly. No environment variable is consulted, so a production sign or verification always uses the keychain
 and the tracked public key.
 
@@ -49,6 +49,7 @@ PURPOSE = "modeling-agentic/owner-signoff/v1"
 LEGACY_CUTOFF_UTC = "2026-11-25T00:00:00+00:00"   # the owner may move it (docs: changes/owner-sign.md)
 SPEC, SHEET = "decision_spec.yaml", "decision_spec.signoff_sheet.md"
 SCOPE_REQUEST = "scope_signoff_request.json"
+SIGNED_DIR = "decision_brief.signed"      # scripts/decision_brief.py: the frozen copies a sign-off keeps
 HOW_SPEC = "the owner signs from their own shell: python3 agents/stage_machine.py sign <run_dir> --by owner"
 HOW_SCOPE = "the owner signs from their own shell: python3 scripts/scope_signoff.py sign <run_dir> --by owner"
 
@@ -182,8 +183,10 @@ def keyed_argv(cmd: list) -> list:
 
 
 def _test_secret() -> str | None:
-    if _TEST["secret"] is None and "--self-test" in sys.argv:
-        enable_test_key()       # a process started as a self-test (every entry point routes --self-test there)
+    if _TEST["secret"] is None and sys.argv[1:] == ["--self-test"]:
+        # a process started as exactly `<entry point> --self-test` (as scripts/self_tests.py starts each one): every
+        # entry point routes that command line to its self-test; a positional `-- --self-test` never matches (Codex r2 1)
+        enable_test_key()
     return _TEST["secret"]
 
 
@@ -283,10 +286,15 @@ def sign_spec(run_dir: str, rec: dict, sheet_sha: str | None = None) -> dict:
 
 
 def resign_ok(prior, run_dir: str) -> bool:
-    """The owner may sign again over an owner record that is refused only while the spec is still the bytes it
-    records (so the frozen copy is never replaced by other bytes)."""
-    return (isinstance(prior, dict) and spec_check(prior, run_dir)[0] == "refused"
-            and bool(_spec_hash(prior)) and _spec_hash(prior) == _file_sha(run_dir, SPEC))
+    """The owner may sign again over an owner record that is refused only while every file it froze (the spec and,
+    for a brief, the brief and its criteria) is still the bytes it records, live and in its frozen copy, so no frozen
+    copy is ever replaced by other bytes (Codex r2 4-5)."""
+    if not (isinstance(prior, dict) and spec_check(prior, run_dir)[0] == "refused" and _spec_hash(prior)):
+        return False
+    frozen = dict(prior["sha256"]) if isinstance(prior.get("sha256"), dict) else {SPEC: _spec_hash(prior)}
+    frozen = {k: v for k, v in frozen.items() if k in (SPEC, "decision_brief.yaml", "success_criteria.yaml") and v}
+    return all(_file_sha(run_dir, k) == v and _file_sha(run_dir, f"{SIGNED_DIR}/{k}") in (None, v)
+               for k, v in frozen.items())
 
 
 def spec_check(rec, run_dir: str) -> tuple[str, str]:
@@ -426,6 +434,11 @@ def _self_test() -> int:
            "added field is refused")
         ok(not resign_ok(rec, rd) and resign_ok(dict(rec, note="forged"), rd),
            "OK2c the owner may sign again only over a refused record whose spec is unchanged")
+        os.makedirs(os.path.join(rd, SIGNED_DIR))
+        open(os.path.join(rd, SIGNED_DIR, SPEC), "w").write("a: 0\n")
+        ok(not resign_ok(dict(rec, note="forged"), rd),
+           "OK2d (Codex r2 4-5) nor when a frozen copy holds other bytes than the record: it is never replaced")
+        os.remove(os.path.join(rd, SIGNED_DIR, SPEC))
         tamper = json.loads(json.dumps(rec))
         tamper["owner_signature"]["payload"]["artifacts"][RECORD] = "cd"
         other = os.path.join(td, "other_run")
@@ -482,6 +495,13 @@ def _self_test() -> int:
         finally:
             sys.argv, _TEST["secret"] = argv, saved
         ok(st == "refused" and "public key" in why, f"OK9 no public key: refused (fail closed): {why[:100]}")
+        saved, _TEST["secret"] = _TEST["secret"], None
+        argv, sys.argv = sys.argv, ["main.py", "--", "--self-test"]
+        try:
+            positional = test_key_active()
+        finally:
+            sys.argv, _TEST["secret"] = argv, saved
+        ok(positional is False, "OK13 (Codex r2 1) a positional `-- --self-test` never turns on the test key")
         _ok12(ok, rd, rec, a)
     k = Keychain(run=lambda argv, **kw: (_ for _ in ()).throw(FileNotFoundError("security")))
     try:
