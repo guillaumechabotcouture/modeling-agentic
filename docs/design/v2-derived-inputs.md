@@ -306,62 +306,48 @@ reason is given.
   recorded as ok, made in a sandbox, and unchanged since is up to date on any machine, so a run
   resumed past SIGN on a host without bubblewrap only checks hashes (`derivation_stale`). A record
   made with the development flag is re-made wherever a sandbox exists.
-- **The container sandbox (`audit-hook`, added 2026-11-23).** The outside benchmark runs the harness
-  inside an unprivileged Docker container. There bubblewrap cannot create namespaces, so every
-  derivation failed closed and, with the development flag, the run ended at SPEC on the HIGH
-  `derivation_unsandboxed`. On Linux, when neither `bwrap` nor `bwrap-sudo` passes its probe (or
-  bubblewrap is not installed), `sandbox_kind()` now probes a third kind, `audit-hook`. It is
-  used only with unambiguous evidence of a container, because there the container's isolation
-  from the host is the outer wall. The evidence can be a runtime's marker file (`/.dockerenv`,
-  `/run/.containerenv`), a runtime's own `container=` value, or a runtime's cgroup path for PID 1.
-  `container=0`, or a path that merely contains "docker", is not evidence. No operator setting
-  overrides this. The record names the evidence, and the report repeats it. On a plain host the planner's script would run with the host user's
-  permissions behind only the hook, so derivations fail closed there. Owner decision
-  (2026-11-23): the fallback is accepted for containers only, and bubblewrap stays required on
-  hosts. Every report has a "Derivation sandbox" block, which says so when no derivation ran. Where
-  the fallback ran, the block states its native-code limit in one sentence (`AUDIT_NATIVE_LIMIT`). The
-  derivation runs in a child Python (`-I`, the same scrubbed environment, cwd its private work
-  directory, the same caps set strictly). Inputs and the script are copied in read-only, and their
-  hashes are checked after the run. An audit hook (PEP 578), installed after numpy, pandas and pyyaml
-  are imported and before the script runs, refuses:
-  - every socket call;
-  - process creation and signals;
-  - ctypes, links, and the standard modules whose native code opens files itself (sqlite3,
-    dbm, shelve, readline, syslog);
-  - `os.open` with a relative path, since the audit event does not show its `dir_fd`;
-  - permission and ownership changes made through a file descriptor;
-  - raising a resource limit;
-  - writes, renames and removals outside the work directory or onto an input;
-  - reads and listings of the run directory;
-  - the introspection that could reach the hook.
+- **The container sandbox (`landlock-seccomp`, added 2026-11-23).** In the outside benchmark's
+  unprivileged Docker container, bubblewrap cannot create namespaces, so every derivation failed
+  closed (`derivation_unsandboxed`).
 
-  The script's own imports of network, process and foreign-code modules are refused, even when a
-  library has already loaded them. Outputs are still collected only from the declared paths. The
-  probe runs a script that tries each refusal, and a kind whose probe fails is not used. If no kind
-  passes, derivations fail closed as before. macOS is unchanged: it has no fallback, because
-  `RLIMIT_AS` cannot be set there. The record holds the kind, why bubblewrap was not used, and
-  whether the container itself has a network (`none`, `present` or `unknown`, read from
-  `/sys/class/net`). The report renders a "Derivation sandbox" block from the record. An
-  `audit-hook` record raises no `derivation_unsandboxed`. Like a bubblewrap record, it stays
-  current on a machine with another sandbox, so a resumed run does not change the record that
-  was signed.
+  **When it is used.** Only when no bubblewrap kind passes its probe, and only with filesystem or
+  cgroup evidence of a container (a runtime's marker file or PID 1 cgroup path). The `container`
+  variable and operator settings never count. Owner decision (2026-11-23): containers only, and
+  bubblewrap stays required on hosts.
 
-  | guarantee | `bwrap` / `bwrap-sudo` | `audit-hook` |
+  **How it works.** The launcher confines itself before the script runs, with no_new_privs, a
+  Landlock ruleset and a seccomp-bpf filter (`scripts/lib/kernel_sandbox.py`, which lists every
+  refused call). A probe script must meet each refusal before the kind is used. If seccomp or
+  Landlock is unavailable, derivations fail closed. A first design, an audit hook in the child
+  Python, had 10 Python-level escapes (Codex r3 of #368). It was replaced by kernel enforcement on
+  the owner's decision.
+
+  **Open question for the owner: Landlock unavailable.** As built, a container without Landlock
+  fails closed. The alternative, seccomp alone with read-only copies, hash checks and a record of
+  `landlock: unavailable`, would still block network, processes and raised limits. It would lose
+  the run directory's hiding and the write confinement. The recommendation is to keep failing
+  closed. Docker Desktop's kernel (ABI 8) and recent distribution kernels provide Landlock.
+
+  **Record and report.** The record holds the kind, the container evidence, why bubblewrap was not
+  used, the Landlock ABI, `seccomp` and the container's network, read per derivation. Every report
+  has a "Derivation sandbox" block, which says so when no derivation ran. Where the fallback ran,
+  it states in one sentence what the fallback does not give (`SANDBOX_LIMIT`). Such a record
+  raises no `derivation_unsandboxed` and stays current on a machine with another sandbox.
+
+  | guarantee | `bwrap` / `bwrap-sudo` | `landlock-seccomp` |
   |---|---|---|
-  | no network | kernel: a network namespace with no interface | harness: every socket call refused; the container's own network recorded |
-  | no process creation | kernel: a PID namespace, the process cap | harness: subprocess, os.system/exec/spawn/fork, pty and signals refused; the process cap (root ignores it) |
-  | writes only to the work directory | kernel: `/` read-only, the work directory the only writable bind | harness: writes, renames and removals refused outside it and on inputs; read-only input copies, hashes checked after |
-  | the run directory hidden | kernel: an empty read-only tmpfs over it | harness: reads and listings refused (by path text: a link elsewhere that points into it is not seen) |
-  | only the allowed imports | the scan before the run | the same scan, plus run-time refusal of network, process and foreign-code modules |
-  | no credentials | a cleared environment | the same scrubbed environment and `python -I` |
-  | resource caps | memory, CPU, file size, processes, wall clock | the same, set strictly |
-  | outputs from the declared paths only | yes | yes |
-  | holds against a script written to escape | yes, short of a kernel flaw | **no**: an audit hook sees Python-level calls, not system calls, and is not a security boundary (PEP 578). Native code reports only what CPython reports |
+  | no network | network namespace | seccomp: no socket of any family; Landlock ABI 4+: no TCP |
+  | no process creation | PID namespace, process cap | seccomp: no fork, vfork, non-thread clone or exec |
+  | writes only where declared | `/` read-only, one writable bind | Landlock: only in the outputs' directories, regular files and directories only; inputs are read-only copies, hash-checked |
+  | the run directory hidden | an empty tmpfs over it | Landlock: not granted, so refused by any name (procfs aliases and other work directories included) |
+  | other processes | not visible | visible by name; no signal, ptrace or memory access |
+  | resource caps | set | set, and cannot be raised (seccomp) |
+  | native code, ctypes, a second interpreter | held by the kernel | held by the kernel |
 
-  The threat this answers is a planner-written script that reaches the network, writes or reads
-  outside its declaration, or starts a process, by mistake or by design shortcut. It is not a
-  hostile script. Against such a script bubblewrap still holds and the fallback does not. The
-  report says this in its block. Self-tests DI-A0 to DI-A10 cover this kind.
+  Self-tests: KS1 to KS4 check the BPF program with an interpreter, for each architecture. DI-K0 to
+  DI-K10 cover detection, the round-3 escape reproductions (r3-1, 2 and 5 to 10), the record, the
+  report, and identical bytes under bwrap. r3-3 and r3-4 concerned the hook's own state; the hook
+  is gone.
 - **The column accounting** reads the header of each staged `.csv`/`.tsv`. A staged table that the
   spec cites directly counts as used. The removal test (`ignored_column_used`) runs only for the
   ignored columns of tabular inputs.

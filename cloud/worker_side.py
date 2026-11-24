@@ -22,9 +22,8 @@ def ensure_bwrap(run=None, which=None, platform=None) -> str:
     """Best effort: install bubblewrap, which the v2 derivation sandbox needs (scripts/pipeline.py sandbox_kind;
     docs/design/v2-derived-inputs.md §7). The Coiled image has passwordless sudo and setpriv but no bwrap. Tries
     `sudo -n apt-get install -y bubblewrap`, then again after `apt-get update`. Returns a one-line note for the
-    run's notes and never raises: without bwrap, a derivation runs under the weaker audit-hook fallback where its
-    probe passes, else fails closed (derivation_unsandboxed); a run past sign-off only checks hashes.
-    `run`/`which`/`platform` are for the self-test."""
+    run's notes and never raises: without bwrap, a derivation that must run fails closed (derivation_unsandboxed),
+    and a run past sign-off only checks hashes. `run`/`which`/`platform` are for the self-test."""
     import shutil
     import subprocess
     import sys
@@ -36,8 +35,7 @@ def ensure_bwrap(run=None, which=None, platform=None) -> str:
     if which("bwrap"):
         return "bwrap: present"
     if not which("sudo"):
-        return ("bwrap: missing and no sudo; derivations that must run fail closed unless the audit-hook "
-                "fallback holds")
+        return "bwrap: missing and no sudo; derivations that must run will fail closed"
 
     def sh(*cmd):
         try:
@@ -50,8 +48,7 @@ def ensure_bwrap(run=None, which=None, platform=None) -> str:
         rc = sh("apt-get", "install", "-y", "bubblewrap")
     if rc == 0 and which("bwrap"):
         return "bwrap: installed"
-    return (f"bwrap: install failed ({rc}); derivations that must run fail closed unless the audit-hook "
-            "fallback holds")
+    return f"bwrap: install failed ({rc}); derivations that must run will fail closed"
 
 
 def _run_main(cmd, cwd, env, log, timeout_s=None):

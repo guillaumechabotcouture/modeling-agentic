@@ -4384,16 +4384,16 @@ def _self_test() -> int:
            "T13 the ledger closes the finding; report and deliverable are rendered by the harness")
         import pipeline as P_
         _write_json(d, P_.DERIVATIONS_RECORD, {"derivations": {"units": {"ok": True, "sandbox": {
-            "kind": P_.SANDBOX_AUDIT, "container_network": "present"}}}})
+            "kind": P_.SANDBOX_KERNEL, "container_network": "present"}}}})
         render_report(d, AB, "completed")
         rep13 = open(os.path.join(d, "report.md")).read()
         os.remove(os.path.join(d, P_.DERIVATIONS_RECORD))
         render_report(d, AB, "completed")
-        ok("## Derivation sandbox" in rep13 and "`audit-hook` (derivations: units)" in rep13
-           and P_.AUDIT_NATIVE_LIMIT in rep13 and "present" in rep13
+        ok("## Derivation sandbox" in rep13 and "`landlock-seccomp` (derivations: units)" in rep13
+           and P_.SANDBOX_LIMIT in rep13 and "present" in rep13
            and "No derivation ran in this run" in open(os.path.join(d, "report.md")).read(),
-           "T13s the report names the sandbox kind each derivation ran in and, in one sentence, that the container "
-           "fallback does not hold against native code; a run with no derivation says so")
+           "T13s the report names the sandbox kind each derivation ran in and, in one sentence, what the container "
+           "fallback does not give; a run with no derivation says so")
         ok(json.load(open(os.path.join(d, "engine_choice.json")))["engine"]["ref"].endswith("ToyEngine")
            and AB.engine_choice_ref(d).endswith("ToyEngine") and "candidates" in json.load(open(os.path.join(d, AB.ENGINE_CHOICE)))
            and load_state(d).engine.endswith("ToyEngine"), "T14 the engine choice is automatic and recorded")
