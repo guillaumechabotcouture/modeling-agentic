@@ -772,6 +772,38 @@ def _self_test() -> int:
             err = f"{type(e).__name__}: {e}"
         ok(err is None and res["calibration"]["units"] == {"all": {"z": None}},
            f"OT15 (r1 P1-1) the analysis runs a calibration with no per-unit attribute: {err}")
+    with tempfile.TemporaryDirectory() as d:
+        # OT25: state-only observation targets whose likelihood is flat (no calibrated parameter or attribute moves
+        # the observed pre-epidemic state, e.g. fixed s0 from raw survey ratios with only r0 calibrated) are refused.
+        sp_ok = _toy(d, attr=True)
+        r_ok = copy.deepcopy(sp_ok.raw)
+        r_ok["calibration"]["parameters"] = ["r0"]
+        r_ok["calibration"]["priors"]["r0"] = {"dist": "uniform", "range": [12.0, 18.0], "source": "test"}
+        e_ok = schema.validate(schema.Spec(r_ok, d, os.path.join(d, "decision_spec.yaml")))
+        # Now switch to initialiser: given with fixed s0 and no attribute (only r0 calibrated)
+        with open(os.path.join(d, "units_fixed.csv"), "w") as fh:
+            fh.write("id,pop,N,s0\nu1,1000000,600000;200000;200000,0.0;0.38;0.38\n"
+                     "u2,500000,300000;100000;100000,0.0;0.305;0.305\n")
+        r_flat = copy.deepcopy(r_ok)
+        r_flat["engine"]["config"] = {
+            "groups": ["old", "c1", "c2"], "structure": "birth_cohorts", "initialiser": "given",
+            "generation_interval": [0.5, 0.5], "time_unit": "year",
+            "components": {"cu": {"kind": "campaign", "targets": ["c1", "c2"], "reach": 0.8}}}
+        r_flat["engine_parameters"] = {"efficacy:cu": {"value": 0.9, "source": "test", "reason": "test",
+                                                       "basis": "literature"}}
+        r_flat["decision_units"]["csv"] = "units_fixed.csv"
+        r_flat["decision_units"]["engine_attributes"] = {
+            "N": {"column": "N", "split": ";"}, "s0": {"column": "s0", "split": ";"},
+            "always_immune": {"value": ["old"], "source": "test"},
+            "contact_rate": {"value": 10.0, "source": "test"}, "seed": {"value": 1.0e-9, "source": "test"},
+            "intro": {"value": "c2", "source": "test"}, "reach:cu": {"value": 0.8, "source": "test"}}
+        r_flat["calibration"].pop("attribute")
+        r_flat["calibration"].pop("range")
+        r_flat["calibration"].pop("scale")
+        r_flat["calibration"]["priors"].pop("coverage_scale")
+        e_flat = schema.validate(schema.Spec(r_flat, d, os.path.join(d, "decision_spec.yaml")))
+        ok(e_ok == [] and any("pre-epidemic state" in e for e in e_flat),
+           f"OT25 flat state-only observation calibration is refused; attribute-calibrated passes ({e_ok}, {e_flat})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
