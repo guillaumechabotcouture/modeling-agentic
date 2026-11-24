@@ -33,8 +33,7 @@ Restart Claude Desktop. The tools appear under the server's name, and Claude Des
 ## What it reads and writes
 
 - **Reads:** run folders under `MA_DIAG_RUNS` and `MA_DIAG_MIRROR`. Anything under a `_truth` or `evals_private`
-  folder is skipped. Every read goes through `lib.safe_io` with no link followed. `run_artifact` returns only
-  allow-listed harness records.
+  folder is skipped. Every read goes through `lib.safe_io` with no link followed.
 - **Writes:** two files under `MA_DIAG_HOME`, both outside the repository. `usage.jsonl` gets one line per tool
   call: the tool, its arguments in short, how many records it returned, and any error. `feedback.jsonl` gets
   what `note_feedback` records. A failed write never fails a call.
@@ -43,6 +42,5 @@ Restart Claude Desktop. The tools appear under the server's name, and Claude Des
 
 ## Tools
 
-`list_runs`, `run_status`, `run_events`, `run_findings`, `run_spend`, `run_compare`, `run_artifact`,
-`owner_inbox` and `note_feedback`. Launches, clusters, the supervisor, PRs, baselines, check value, smoke markers,
-the machine's load and `follow.py` (local mirrors of cloud runs) come in the next PR.
+`list_runs`, `run_status`, `run_events`, `run_findings`, `run_spend` and `note_feedback`. The next PR adds
+`run_artifact`, `run_compare`, `owner_inbox`, the operations tools and `follow.py`.

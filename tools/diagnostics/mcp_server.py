@@ -32,6 +32,7 @@ import diag_runs as DR  # noqa: E402
 VERSION = 1
 SERVER = {"name": "modeling-agentic-diagnostics", "version": "1"}
 PROTOCOL = "2025-06-18"
+PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")     # what this server implements (tools only)
 KEEP = os.path.expanduser("~/modeling-agentic-keep")
 _SECRET = re.compile(r"(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
                      r"|AccountKey=[^;\s\"]+|SharedAccessSignature=[^\s\"]+|[?&]sig=[A-Za-z0-9%/+=]{16,}"
@@ -52,13 +53,25 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _redact_text(t: str) -> str:
+    """cloud/run_health.py's patterns (the repository's tested set: OpenAI project keys, bearer and JWT, signed URLs,
+    connection strings, quoted fields), then this module's own (Codex r1 of #386)."""
+    try:
+        sys.path.insert(0, os.path.join(REPO, "cloud")) if os.path.join(REPO, "cloud") not in sys.path else None
+        import run_health
+        t = run_health.redact(t)
+    except Exception:  # noqa: BLE001 -- this module's patterns still apply
+        pass
+    return _SECRET.sub("[redacted]", t)
+
+
 def redact(x):
     if isinstance(x, str):
-        return _SECRET.sub("[redacted]", x)
+        return _redact_text(x)
     if isinstance(x, list):
         return [redact(v) for v in x]
     if isinstance(x, dict):
-        return {k: redact(v) for k, v in x.items()}
+        return {_redact_text(str(k)): redact(v) for k, v in x.items()}      # keys too
     return x
 
 
@@ -75,7 +88,15 @@ def _append(name: str, rec: dict) -> bool:
         from lib.safe_io import write_nofollow
         h = home()
         os.makedirs(h, exist_ok=True)
-        line = json.dumps(redact(rec), default=str)[:4000] + "\n"
+        rec = redact(rec)
+        line = json.dumps(rec, default=str, ensure_ascii=False)
+        if len(line.encode()) > 4000:          # cut the text fields, never the JSON (Codex r1 of #386)
+            rec = {k: (v[:200] + "…" if isinstance(v, str) and len(v) > 200 else v) for k, v in rec.items()}
+            line = json.dumps(rec, default=str, ensure_ascii=False)
+        if len(line.encode()) > 4000:
+            line = json.dumps({k: rec.get(k) for k in ("v", "at", "tool", "useful", "error")} | {"cut": True},
+                              default=str)
+        line += "\n"
         write_nofollow(h, name, line.encode(), append=True)
         return True
     except Exception:  # noqa: BLE001 -- the log never fails a call
@@ -98,7 +119,7 @@ def t_list_runs(args):
         st = st or {}
         rows.append({"run": rid, "question": st.get("question"), "state": st.get("state"), "round": st.get("round"),
                      "status": st.get("status"), "paused": st.get("paused"), "spent_usd": st.get("spent_usd"),
-                     "last_written": run.written().get("utc"), **({"unreadable": why} if why else {})})
+                     "last_written": DR.last_written(run), **({"unreadable": why} if why else {})})
     return {"runs": rows}, [{"path": p} for p in roots().values()], [], {}
 
 
@@ -129,20 +150,6 @@ def t_run_spend(args):
     return DR.run_spend(run)
 
 
-def t_run_compare(args):
-    found, run = _run(args)
-    return DR.run_compare(run, list(found.values()))
-
-
-def t_run_artifact(args):
-    _, run = _run(args)
-    return DR.run_artifact(run, args.get("path"))
-
-
-def t_owner_inbox(args):
-    return DR.owner_inbox(DR.discover(roots()))
-
-
 def t_note_feedback(args):
     useful = args.get("useful")
     if useful not in ("yes", "no", "partly"):
@@ -169,14 +176,6 @@ TOOLS = {
                      {**_RUN, "status": {"type": "string"}}, ["run"]),
     "run_spend": (t_run_spend, "Model spend and time by stage and by task, and the cloud compute the run recorded.",
                   _RUN, ["run"]),
-    "run_compare": (t_run_compare, "This run's time and spend by stage against the finished runs of the same question.",
-                    _RUN, ["run"]),
-    "run_artifact": (t_run_artifact, "One allow-listed harness record of a run (state, events, findings, gates, fix "
-                                     "plans, owner requests, spec, sign-off sheet, budget and compute ledgers, step "
-                                     "logs (tail), report, provenance, analysis YAML).",
-                     {**_RUN, "path": {"type": "string", "description": "relative to the run folder"}}, ["run", "path"]),
-    "owner_inbox": (t_owner_inbox, "Everything waiting on the owner across runs, with since when and the command "
-                                   "that answers it.", {}, []),
     "note_feedback": (t_note_feedback, "Record whether the diagnostics answered a question, and what was missing "
                                        "(appended to the local feedback log; the only tool that writes).",
                       {"question": {"type": "string"}, "useful": {"type": "string", "enum": ["yes", "no", "partly"]},
@@ -206,11 +205,16 @@ def call(name: str, args: dict) -> tuple[dict, bool]:
 
 def handle(msg: dict):
     """The response to one JSON-RPC message, or None for a notification."""
-    mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+    mid, method, params = msg.get("id"), msg.get("method"), msg.get("params")
     if mid is None:
         return None
+    if params is None:
+        params = {}
+    if not isinstance(params, dict) or (method == "tools/call" and not isinstance(params.get("arguments") or {}, dict)):
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "invalid params: an object is expected"}}
     if method == "initialize":
-        result = {"protocolVersion": params.get("protocolVersion") or PROTOCOL, "capabilities": {"tools": {}},
+        asked = params.get("protocolVersion")
+        result = {"protocolVersion": asked if asked in PROTOCOLS else PROTOCOL, "capabilities": {"tools": {}},
                   "serverInfo": SERVER}
     elif method == "ping":
         result = {}
@@ -265,7 +269,7 @@ def _self_test() -> int:
                 {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                  "params": {"name": "run_status", "arguments": {"run": "runs/a_run"}}},
                 {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
-                 "params": {"name": "run_artifact", "arguments": {"run": "runs/a_run", "path": "../../etc/hosts"}}},
+                 "params": {"name": "run_status", "arguments": {"run": "runs/../etc"}}},
                 {"jsonrpc": "2.0", "id": 6, "method": "nope"}]
         out = io.StringIO()
         serve(io.StringIO("\n".join(json.dumps(m) for m in msgs) + "\nnot json\n"), out)
@@ -287,10 +291,18 @@ def _self_test() -> int:
            and by[4]["result"]["isError"] is False, "MS4 run_status returns the versioned envelope with its sources")
         bad = json.loads(by[5]["result"]["content"][0]["text"])
         ok(by[5]["result"]["isError"] is True and bad["data"]["available"] is False,
-           "MS5 a refused path is an error result, never a crash")
+           "MS5 a refused run id is an error result, never a crash")
         ok(by[6]["error"]["code"] == -32601, "MS6 an unknown method is a JSON-RPC error")
+        out2 = io.StringIO()
+        serve(io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": [1]}) + "\n"
+                          + json.dumps({"jsonrpc": "2.0", "id": 8, "method": "ping"}) + "\n"
+                          + json.dumps({"jsonrpc": "2.0", "id": 9, "method": "initialize",
+                                        "params": {"protocolVersion": "unknown"}}) + "\n"), out2)
+        r2 = {r["id"]: r for r in map(json.loads, out2.getvalue().splitlines())}
+        ok(r2[7]["error"]["code"] == -32602 and r2[8]["result"] == {} and r2[9]["result"]["protocolVersion"] == PROTOCOL,
+           "MS6b bad params are an error and the server keeps answering; an unknown protocol gets the server's own")
         usage = [json.loads(x) for x in open(os.path.join(td, "home", "usage.jsonl"))]
-        ok([u["tool"] for u in usage] == ["list_runs", "run_status", "run_artifact"] and usage[2]["error"]
+        ok([u["tool"] for u in usage] == ["list_runs", "run_status", "run_status"] and usage[2]["error"]
            and usage[0]["records"] == 2, f"MS7 every call is logged with its record count and error ({usage[:1]})")
         fb = call("note_feedback", {"question": "status?", "useful": "partly", "missing": "eta"})
         lines = open(os.path.join(td, "home", "feedback.jsonl")).read().splitlines()
@@ -300,10 +312,14 @@ def _self_test() -> int:
         r9, e9 = call("list_runs", {})
         ok(not e9 and r9["data"]["runs"], "MS9 a log that cannot be written never fails the call")
         os.environ["MA_DIAG_HOME"] = os.path.join(td, "home")
-        ok(redact({"a": "key ghp_" + "x" * 30 + " and AccountKey=abc123;"}) == {"a": "key [redacted] and [redacted];"},
-           "MS10 credential-like strings are redacted")
-        inbox = call("owner_inbox", {})[0]["data"]["items"]
-        ok([i["ref"] for i in inbox] == ["mirror/launch1/label1"], "MS11 the owner inbox covers mirrored cloud runs")
+        red = json.dumps(redact({"ghp_" + "k" * 30: "key ghp_" + "x" * 30 + " and AccountKey=abc123;",
+                                 "b": "sk-proj-AbCdEf0123456789AbCdEf0123456789",
+                                 "c": "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"}))
+        ok(not any(x in red for x in ("kkkkkkkkkk", "xxxxxxxxxx", "abc123", "AbCdEf0123456789", "c2lnbmF0dXJl")),
+           f"MS10 credential-like strings are redacted, in keys too ({red[:160]})")
+        call("note_feedback", {"question": "界" * 1000, "useful": "yes"})
+        ok(all(json.loads(x) for x in open(os.path.join(td, "home", "feedback.jsonl")).read().splitlines()),
+           "MS10b a long feedback line is cut in its text, never in its JSON")
         ok(call("run_status", {"run": "runs/../runs/a_run"})[1], "MS12 a run id must be one list_runs named")
     for k in ("MA_DIAG_RUNS", "MA_DIAG_MIRROR", "MA_DIAG_HOME"):
         os.environ.pop(k, None)
