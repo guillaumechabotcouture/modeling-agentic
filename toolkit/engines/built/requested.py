@@ -32,7 +32,10 @@ ATTR_TYPES = ("continuous", "integer", "categorical", "vector")
 PARAM_DOMAIN_TYPES = ("continuous", "integer", "categorical")
 EFFECT_SIGNS = ("+", "-", "nonzero")
 PARAM_ROLES = ("observation", "cost")
-RESERVED_CONFIG_KEYS = frozenset({"run_dir", "run_engine", "snapshot_sha256", "admission_sha256", "config_sha256"})
+RESERVED_CONFIG_KEYS = frozenset({
+    "run_dir", "run_engine", "snapshot_sha256", "admission_sha256", "config_sha256",
+    "unsandboxed_ok", "_unsandboxed_ok",
+})
 MAX_REFERENCE_REL_TOL = 0.05
 OPEN_ENDPOINTS = frozenset({"birth", "death", "external"})
 

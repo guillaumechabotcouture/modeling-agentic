@@ -545,7 +545,7 @@ class Runner:
         mode "fit": only the declarations must be clean; candidate fitted values are evaluated (fits, joint
         calibration). `evidence` (S1-2b): a snapshot loaded for this engine; `pack` then names the benchmarks to run,
         each equal to the snapshot's declaration."""
-        from toolkit.engines.contract import engine_identity
+        from toolkit.engines.identity import engine_identity
         if mode not in ("score", "fit"):
             raise ValueError(f"Runner mode {mode!r}: score or fit")
         ev = evidence if evidence is not None else load_evidence(engine, pack=pack)
@@ -1191,7 +1191,7 @@ def run_pack(pack: dict, engine, runner: Runner, fitted: dict, fit_info: dict | 
         print(f"{row['id']:6s} {row['role']:8s} computed {comp} target {row.get('target')}{ref} "
               f"band {row.get('band')} {row['status']}", flush=True)
     by = {s: sum(r["status"] == s for r in rows) for s in STATUSES}
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     used = sorted(runner.exercised)
     configs_validated = {c: {"config": pack["configs"][c], "engine_identity": engine_identity(runner.make_engine(c)),
                              "config_sha256": config_digest(runner.make_engine(c))} for c in used}
@@ -1221,7 +1221,7 @@ def config_digest(engine):
 
 def stamp(out: dict, engine) -> dict:
     """Provenance on a results or fitted file: who wrote it, for which engine and code (Codex P1-13)."""
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     extra = {"engine_config_sha256": config_digest(engine)} if config_digest(engine) else {}
     return {"producer": PRODUCER, "engine_identity": engine_identity(engine), **extra, **out}
 
@@ -1237,13 +1237,18 @@ def verified_results(engine) -> tuple[dict | None, str | None]:
     """(the whole results document, None) when its envelope (producer, the engine identity, which binds the fitted
     values in use, and configuration) and its rows pass the evidence snapshot; its rows are the snapshot's. Else
     (None, why)."""
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     path = getattr(engine, "results_path", None)
     if not path or not os.path.exists(path):
         return None, "the engine has no benchmark results file"
+    has_signed = callable(getattr(engine, "read_verified_bench", None))
     try:
-        doc = yaml.safe_load(open(path)) or {}
-    except (OSError, yaml.YAMLError) as e:
+        if has_signed:
+            raw_res = engine.read_verified_bench("bench/results.yaml")
+            doc = yaml.safe_load(raw_res.decode("utf-8")) or {}
+        else:
+            doc = yaml.safe_load(open(path)) or {}
+    except (OSError, ValueError, UnicodeDecodeError, yaml.YAMLError) as e:
         return None, f"benchmark results unreadable: {e}"
     if doc.get("producer") != PRODUCER:
         return None, f"{os.path.basename(path)} was not written by {PRODUCER} (no provenance): re-run the pack"
@@ -1251,10 +1256,14 @@ def verified_results(engine) -> tuple[dict | None, str | None]:
         return None, f"{os.path.basename(path)} was computed for another engine identity or code: re-run the pack"
     if config_digest(engine) is not None and doc.get("engine_config_sha256") != config_digest(engine):
         return None, f"{os.path.basename(path)} was computed for another engine configuration: re-run the pack"
-    pp = os.path.join(os.path.dirname(path), "pack.yaml")
+    pp = getattr(engine, "pack_path", None) or os.path.join(os.path.dirname(path), "pack.yaml")
     try:
-        pack = yaml.safe_load(open(pp)) if os.path.exists(pp) else None
-    except (OSError, yaml.YAMLError) as e:
+        if has_signed:
+            raw_pack = engine.read_verified_bench("bench/pack.yaml")
+            pack = yaml.safe_load(raw_pack.decode("utf-8")) or {}
+        else:
+            pack = yaml.safe_load(open(pp)) if os.path.exists(pp) else None
+    except (OSError, ValueError, UnicodeDecodeError, yaml.YAMLError) as e:
         return None, f"{os.path.basename(pp)} beside the results is unreadable: {e}"
     if not isinstance(doc.get("benchmarks"), list):
         return None, f"{os.path.basename(path)} has no benchmarks list"

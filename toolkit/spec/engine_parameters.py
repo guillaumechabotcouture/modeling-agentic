@@ -250,7 +250,7 @@ PACK_DEFAULT = os.path.join("benchmarks", "pack.yaml")
 
 
 def _class_ref(cls) -> str:
-    return f"{cls.__module__}:{cls.__qualname__}"
+    return getattr(cls, "ENGINE_REF", None) or f"{cls.__module__}:{cls.__qualname__}"
 
 
 class PackError(ValueError):
@@ -266,6 +266,17 @@ def benchmark_pack(engine_or_cls):
     import inspect
     import yaml
     cls = engine_or_cls if isinstance(engine_or_cls, type) else type(engine_or_cls)
+    if not isinstance(engine_or_cls, type) and callable(getattr(engine_or_cls, "read_verified_bench", None)):
+        try:
+            raw = engine_or_cls.read_verified_bench("bench/pack.yaml")
+            pack = yaml.safe_load(raw.decode("utf-8"))
+        except (ValueError, OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+            raise PackError(f"the benchmark pack of {_class_ref(cls)} failed verification: {e}") from None
+        if not isinstance(pack, dict) or pack.get("engine") != _class_ref(cls):
+            raise PackError(f"the benchmark pack of {_class_ref(cls)} is for "
+                            f"{pack.get('engine') if isinstance(pack, dict) else 'no engine'}")
+        pack_ids(pack, _class_ref(cls))
+        return pack, getattr(engine_or_cls, "pack_path", "engine_build/bench/pack.yaml")
     try:
         here = os.path.dirname(os.path.abspath(inspect.getfile(cls)))
     except (TypeError, OSError) as e:
@@ -611,7 +622,7 @@ def _check_pack_engine(pack: dict, spec, engine=None):
     """The engine the pack's runner builds (its reference and default configuration) must be the run's engine:
     the stamp and the record name the engine the arms ran with (review round 3, R3-2)."""
     from toolkit.engines import benchmark as BM
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     run_eng = spec.engine()
     pe = _pack_engine(pack)
     why = []
@@ -630,7 +641,7 @@ def _arm_records(pack: dict, runner, vals: dict) -> dict:
     """{benchmark id: {"arms": {role: {arm, setting, ref, config, engine_identity, superseded}}}}: the engine and
     configuration each arm actually ran with, and the spec values its setting's own parameters replaced."""
     from toolkit.engines import benchmark as BM
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     out = {}
     for b in pack.get("benchmarks") or []:
         est = b.get("estimand") or {}
@@ -694,7 +705,7 @@ def write_spec_benchmarks(run_dir: str, pack: dict, fitted: dict | None = None, 
     configuration). Returns the file's path."""
     import datetime as _dt
     import yaml
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     from toolkit.spec import schema
     if os.path.join(ROOT, "scripts") not in sys.path:
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -720,7 +731,7 @@ def verified_spec_benchmarks(engine, spec, bench_id: str | None = None) -> tuple
     give now. Else ([], why)."""
     import yaml
     from toolkit.engines import benchmark as BM
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     base = spec.base
     p, rp = os.path.join(base, SPEC_BENCH), os.path.join(base, SPEC_BENCH_RECORD)
     how = ("compute them with the harness step: python toolkit/spec/engine_parameters.py benchmarks <pack.yaml> "
@@ -1168,7 +1179,7 @@ def _self_test() -> int:
     # ------------------------------------------------------------ review round 2 (R2-1): interaction arms at spec values
     def interaction_cases():
         from toolkit.analysis import run as RUN, decision_tests as DTm
-        from toolkit.engines.contract import engine_identity
+        from toolkit.engines.identity import engine_identity
         with tempfile.TemporaryDirectory() as d:
             bench, _v_ok, _v_bad = RUN._toy_bench(d)
             p = schema.toy_spec(d, n=24, bench=bench)
@@ -1316,7 +1327,7 @@ def _self_test() -> int:
     def config_digest_cases():
         from toolkit.engines import benchmark as BM
         from toolkit.engines.compartmental.engine import CompartmentalEngine
-        from toolkit.engines.contract import engine_identity
+        from toolkit.engines.identity import engine_identity
         ref = "toolkit.engines.compartmental.engine:CompartmentalEngine"
         e1, e2 = CompartmentalEngine(generation_interval=[1.0]), CompartmentalEngine(generation_interval=[0.5, 0.5])
 

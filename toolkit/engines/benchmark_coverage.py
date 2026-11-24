@@ -403,9 +403,16 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
     return out
 
 
-def _pack(ref: str) -> dict | None:
-    """The benchmark pack the coverage file was written for (beside it)."""
-    p = os.path.join(os.path.dirname(path_for(ref)), "benchmarks", "pack.yaml")
+def _pack(ref: str, engine_obj=None) -> dict | None:
+    """The benchmark pack the coverage file was written for: verified bench/pack.yaml when defined
+    (BuiltEngine), else `engine_obj.pack_path`, else beside the coverage file."""
+    if engine_obj is not None and callable(getattr(engine_obj, "read_verified_bench", None)):
+        try:
+            return yaml.safe_load(engine_obj.read_verified_bench("bench/pack.yaml").decode("utf-8")) or {}
+        except (ValueError, UnicodeDecodeError, yaml.YAMLError):
+            return None
+    p = getattr(engine_obj, "pack_path", None) if engine_obj is not None else None
+    p = p or os.path.join(os.path.dirname(path_for(ref)), "benchmarks", "pack.yaml")
     return (yaml.safe_load(open(p)) or {}) if os.path.exists(p) else None
 
 
@@ -430,7 +437,11 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
     def engine():
         if "e" not in cache:
             from toolkit.spec import schema
-            cache["e"] = schema.engine_class(ref)(**(config or {}))
+            from toolkit.engines.built import BUILT_ADAPTER_REF
+            if ref == BUILT_ADAPTER_REF:
+                cache["e"] = schema.load_engine({"ref": ref, "config": config or {}}, allow_built=True, run_dir=base)
+            else:
+                cache["e"] = schema.engine_class(ref)(**(config or {}))
         return cache["e"]
 
     def record():
@@ -465,8 +476,17 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
                                                    base or os.getcwd()).packages().values()))
     except Exception:  # noqa: BLE001 -- a spec without the sections pruning needs: the declared packages
         pass
+    eng_cov_path = getattr(engine(), "coverage_path", None)
+    if callable(getattr(engine(), "read_verified_bench", None)) and cov is None:
+        try:
+            cov = yaml.safe_load(engine().read_verified_bench("bench/benchmark_coverage.yaml").decode("utf-8")) or {}
+            probs = problems(cov)
+        except (ValueError, UnicodeDecodeError, yaml.YAMLError) as e:
+            cov, probs = {}, [f"{FILE} failed signature verification: {e}"]
+    elif eng_cov_path and cov is None:
+        cov, probs = load(eng_cov_path)
     out = gate(cov, probs, name, raw, record, list(raw.get("engine_departures") or []), departures_status,
-               _pack(ref), has_benchmarks=bool(rp and os.path.exists(str(rp))), runs=runs, version=version,
+               _pack(ref, engine()), has_benchmarks=bool(rp and os.path.exists(str(rp))), runs=runs, version=version,
                param_names=pnames, trained=trained)
     if card_benchmarks and out["record"] == "verified":
         rows = {r.get("id"): r for r in record()[0]}

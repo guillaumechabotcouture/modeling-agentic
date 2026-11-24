@@ -389,7 +389,7 @@ def _job_keyed(child: str, spec_path: str) -> dict:
     job counted once when its engine identity and adapter digest are current; other files: compute.py's rule."""
     from toolkit.analysis import joint_calibration as JC, row_reuse as RR
     try:
-        from toolkit.engines.contract import engine_identity
+        from toolkit.engines.identity import engine_identity
         from toolkit.spec import schema
         ident = engine_identity(schema.load(spec_path).engine())
     except Exception:  # noqa: BLE001 -- engine: auto is chosen after SIGN: rows are listed, not counted

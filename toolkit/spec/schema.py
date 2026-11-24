@@ -399,7 +399,8 @@ class Spec:
             raise SpecError(f"engine: auto, and the harness has not written {ENGINE_CHOICE} yet")
         # loaded again when the spec's engine changed since (an engine set in place, with no key, is kept)
         if self._engine is None or (self._engine_ref is not None and self._engine_ref != self._engine_key()):
-            self._engine = load_engine(self.raw["engine"], allow_built=(self.engine_build is not None))
+            self._engine = load_engine(self.raw["engine"], allow_built=(self.engine_build is not None),
+                                       run_dir=self.base)
             self._engine_ref = self._engine_key()
         return self._engine
 
@@ -694,7 +695,7 @@ def engine_class(ref: str, *, allow_built: bool = False):
     return k
 
 
-def load_engine(ref, *, allow_built: bool = False):
+def load_engine(ref, *, allow_built: bool = False, run_dir: str | None = None):
     if isinstance(ref, str):
         ref = {"ref": ref}
     if not isinstance(ref, dict):
@@ -702,7 +703,15 @@ def load_engine(ref, *, allow_built: bool = False):
     config = ref.get("config") or {}
     if not isinstance(config, dict):
         raise SpecError("engine.config must be a mapping")
-    return engine_class(ref.get("ref"), allow_built=allow_built)(**config)
+    from toolkit.engines.built import BUILT_ADAPTER_REF
+    from toolkit.engines.built.requested import RESERVED_CONFIG_KEYS
+    res_hits = sorted(k for k in RESERVED_CONFIG_KEYS if k in config)
+    if res_hits:
+        raise SpecError(f"engine.config: reserved harness keywords refused: {res_hits}")
+    cls = engine_class(ref.get("ref"), allow_built=allow_built)
+    if ref.get("ref") == BUILT_ADAPTER_REF:
+        return cls(run_dir=run_dir, **config)
+    return cls(**config)
 
 
 def _num(v):

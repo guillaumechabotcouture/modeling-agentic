@@ -61,7 +61,8 @@ def needs_owner_amendment(f) -> bool:
 # Files the harness writes; never counted as an agent's change.
 _HARNESS_OWNED = ("findings.jsonl", IMPACT, "budget_ledger.json", "_task_input.json", "_task_output.json", "run_state.json", "trace.jsonl", "validator_history.jsonl",
                   "done_when_registry.json", "open_problems.md", "open_problems.json", "final_gate.json",
-                  "gate_r", "fix_plan_r", "fix_progress_r", "models/pipeline_state.json", "models/pipeline_report.json", "analysis/")
+                  "gate_r", "fix_plan_r", "fix_progress_r", "models/pipeline_state.json", "models/pipeline_report.json",
+                  "analysis/", "engine_build/")
 
 FIX_PLANNER_PROMPT = """\
 You are the fix planner of a modeling run. The harness runs the pipeline; you decide what
@@ -214,6 +215,9 @@ def in_edit_scope(path) -> bool:
         return False
     import posixpath
     n = posixpath.normpath(p)
+    # Agent-built engines (§3.1): fix tasks may never edit an engine working copy under models/ext/engine_*
+    if n.lower().startswith("models/ext/engine_"):
+        return False
     return any(n == e.rstrip("/") or n.startswith(e) if e.endswith("/") else n == e for e in FIX_EDITABLE)
 
 
@@ -942,6 +946,10 @@ def _self_test() -> int:
            f"F22b the packet lists the settings of the backend the machine runs ({pk22['edit_scope']})")
     ok(all(s in FIX_PLANNER_PROMPT for s in ("edit_scope", "harness_gaps")),
        "F21c the planner prompt explains the edit scope and harness gaps")
+    # BE20c: fix_loop refuses models/ext/engine_* and engine_build/* in edit scope
+    ok(not in_edit_scope("models/ext/engine_x/engine.py") and not in_edit_scope("models/ext/ENGINE_X/card.yaml")
+       and not in_edit_scope("engine_build/admission.json") and in_edit_scope("models/ext/helper.py"),
+       "BE20c fix_loop in_edit_scope refuses models/ext/engine_* and engine_build/* while allowing models/ext/helper.py")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

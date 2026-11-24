@@ -1115,7 +1115,7 @@ def reuse_check(spec, run_dir) -> dict:
     recorded (reported, not gated, as compute.py's reuse-check). A row is reused only when the calibration asks
     for its job (same job_sha); this check does not generate the jobs."""
     import glob
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     ident, adapter = engine_identity(spec.engine()), adapter_digest()
     legacy = os.environ.get(LEGACY_ADAPTER_ENV)
     calls, seen = {}, set()
@@ -1415,7 +1415,7 @@ def sim_signature(spec) -> dict:
     the horizon, the units' engine attributes, the comparator, the per-unit attribute and its scale, the held
     parameter values. Two specs with different signatures cannot share runs."""
     import hashlib
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     j = declared(spec) or {}
     raw = spec.raw
     sh = set(j.get("shared") or [])
@@ -1448,7 +1448,7 @@ def load_prior(spec, prior_dir, meta, log=print) -> tuple:
     import glob
     import yaml
     from toolkit.analysis import batch as Bt
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     runs = json.load(open(os.path.join(prior_dir, "runs.json")))
     rep = yaml.safe_load(open(os.path.join(prior_dir, "joint_calibration.yaml")))
     wins = (rep.get("adapter") or {}).get("windows")

@@ -124,7 +124,7 @@ def tasks(run_dir: str, per_region: int = 3, seeds: int = 3, metrics=None) -> tu
                 out.append({"unit": i, "region": r, "attributes": a, "arms": arms, "params": theta,
                             "engine": spec["engine"],     # engine: auto is resolved to the chosen engine on load
                             "horizon": hz, "seed": seed0 + 1000 * s + 7, "metrics": metrics})
-    from toolkit.engines.contract import engine_identity
+    from toolkit.engines.identity import engine_identity
     step = {"sample": smp, "per_region": per_region, "seeds": seeds, "metrics": metrics,
             "metric_info": {m: known[m] for m in metrics}, "plan": plan, "units": units,
             "engine": engine_identity(eng), "hooks_contract": hooks.HOOKS_CONTRACT,

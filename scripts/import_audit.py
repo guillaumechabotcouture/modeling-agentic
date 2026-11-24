@@ -27,6 +27,7 @@ PATTERNS = {
     "import_module": re.compile(r"\bimport_module\(\s*(?![\"'][^\"']*[\"']\s*\))"),
     "__import__": re.compile(r"\b__import__\(\s*(?![\"'][^\"']*[\"']\s*\))"),
     "spec_from_file_location": re.compile(r"\bspec_from_file_location\("),
+    "exec_compile": re.compile(r"(?<![A-Za-z0-9_.])exec\("),
 }
 _REPO_FILE = "a module of this repo, named by the code (not by data)"
 _RUN_CODE = ("the run's own model code, loaded by path to execute it (the v1 pipeline runs agent-written models "
@@ -35,7 +36,8 @@ _RUN_CODE = ("the run's own model code, loaded by path to execute it (the v1 pip
 # artifact. Counts are exact, so a new site in a reviewed file fails too.
 REVIEWED = {
     "agents/integrity.py": {"spec_from_file_location": (1, _REPO_FILE)},
-    "cloud/run_cluster.py": {"spec_from_file_location": (1, "the operator's cloud config file")},
+    "cloud/run_cluster.py": {"spec_from_file_location": (1, "the operator's cloud config file"),
+                             "exec_compile": (1, "its own self-test compiling the two-statement AST guard")},
     "cloud/worker_side.py": {"spec_from_file_location": (1, "a module uploaded by run_cluster.py (repo code)")},
     "scripts/alloc_toolkit_use.py": {"spec_from_file_location": (1, "a string inside its own self-test fixture")},
     "scripts/ask.py": {"__import__": (1, "_sibling(name): sibling script names written in the code")},
@@ -64,10 +66,14 @@ REVIEWED = {
     "scripts/stall_rule.py": {"spec_from_file_location": (1, _REPO_FILE)},
     "scripts/validate_critique_yaml.py": {"spec_from_file_location": (8, _REPO_FILE)},
     "toolkit/alloc/optimize.py": {"spec_from_file_location": (1, _REPO_FILE)},
+    "toolkit/engines/built/worker.py": {
+        "exec_compile": (1, "verified-bytes compile of an agent-built engine snapshot inside the minimal-mount "
+                            "sandbox, only after sha256 verification (docs/design/agent-built-engines.md §5.1)")},
     "toolkit/engines/compartmental/selftest_age.py": {
         "__import__": (1, "the literal module toolkit.engines.horizon, in its own self-test")},
     "toolkit/engines/malaria/benchmarks/restamp_proof.py": {
-        "import_module": (1, "a module under toolkit.engines.malaria.benchmarks named by the shipped proof file")},
+        "import_module": (1, "a module under toolkit.engines.malaria.benchmarks named by the shipped proof file"),
+        "exec_compile": (1, "its own constant source ENV_SRC shared with WORKER")},
     "toolkit/spec/preconditions.py": {"spec_from_file_location": (1, _REPO_FILE + ": the literal path "
                                                                  "agents/analysis_backend.py, the engine-choice filter "
                                                                  "(a script module, not a package import_guard serves)")},
@@ -136,6 +142,13 @@ def _self_test() -> int:
        "IA3 a reviewed entry with no site is stale")
     live = problems(sites(tracked()))
     ok(not live, "IA4 every dynamic import in the repo is guarded or reviewed:\n  " + "\n  ".join(live))
+    # BE36a: import audit accepts worker.py's verified-bytes compile and refuses any unreviewed dynamic exec/compile
+    fake_exec = {"toolkit/engines/built/worker.py": "code = compile(b, '<snap>', 'exec')\nexec(code, ns)\n",
+                 "toolkit/engines/rogue.py": "exec(compile(src, 'x', 'exec'), {})\n"}
+    fe = sites(fake_exec, read=lambda p: fake_exec[p])
+    ep = problems(fe, {"toolkit/engines/built/worker.py": REVIEWED["toolkit/engines/built/worker.py"]})
+    ok(len(ep) == 1 and "toolkit/engines/rogue.py: exec_compile" in ep[0],
+       f"BE36a import audit accepts worker.py verified-bytes compile and refuses unreviewed exec ({ep})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

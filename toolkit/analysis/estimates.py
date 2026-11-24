@@ -335,7 +335,7 @@ def benchmark_acceptance(eng, doc: dict | None = None) -> str:
     import inspect
     import yaml
     from toolkit.engines import benchmark as B
-    from toolkit.engines.contract import code_fingerprint
+    from toolkit.engines.identity import code_fingerprint
     name = eng.describe().name
     path = getattr(eng, "results_path", None)
     if not path or not os.path.exists(path) and doc is None:

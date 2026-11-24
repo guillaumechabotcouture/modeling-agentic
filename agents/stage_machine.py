@@ -349,6 +349,7 @@ def harness_owned() -> tuple:
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, "spec_rethink_request.json", FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*",
+        "engine_build", "engine_build/*", "models/ext/engine_*", "models/ext/engine_*/*",
         "evidence_dossier.yaml", SIGNOFF_SHEET,    # v2 autonomy 1B-ii: the default dossier and the sign-off sheet
         AMENDMENT_RECORD)                          # lead-gaps β (Codex r1): toolkit/spec/amend.py's record
 
@@ -1695,6 +1696,8 @@ class Machine:
                 spec = None
             out += P.derivation_findings(self.run_dir, spec, required=self.st.derived_inputs)
         out += self._geometry_findings()
+        from toolkit.engines.built import worker as BWORK
+        out += BWORK.unsandboxed_findings(self.run_dir)
         return out
 
     def _geometry_findings(self) -> list[dict]:
@@ -8196,6 +8199,11 @@ def _self_test_evidence(ok, td: str) -> None:
     fb27 = m_b27.st.tries.get("spec_feedback") or []
     ok(m_b27.st.state == "SPEC" and any("signed request" in str(x) for x in fb27),
        f"BE27 --signoff none refuses a build spec at SPEC ({m_b27.st.state}, {fb27})")
+    # BE20b: harness_owned() refuses deliverables targeting engine_build/* or models/ext/engine_*
+    ok(owned_path(d_b27, "engine_build/admission.json", harness_owned())
+       and owned_path(d_b27, "models/ext/engine_x/engine.py", harness_owned())
+       and not owned_path(d_b27, "allocation_out.csv", harness_owned()),
+       "BE20b harness_owned() covers engine_build/* and models/ext/engine_*")
     # T_EVIDENCE_NAME: the options need inputs and the spec names no dossier: back to the draft, nothing written
     d = os.path.join(td, "ev_name")
     os.makedirs(d)
