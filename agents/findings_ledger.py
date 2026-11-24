@@ -403,25 +403,64 @@ def answer_for(answers: dict, fid: str, *, kind, fix_requires, claim) -> dict | 
 
 
 def harness_gap_key(f) -> str:
-    """What a declared harness gap binds: the finding's fingerprint and its remedy as written. A remedy revised since
-    (even within its class) may name a fix a task can make, so the planner looks at it again (Codex r1 of #357, P1-5);
-    a reworded claim does not."""
+    """What a declared harness gap binds: the finding's answer fingerprint (its id, kind and remedy class; a harness
+    finding's claim and remedy as well), as an owner answer does. Not the critic's wording of the remedy: in harness
+    baseline hb3 (fix 6) a critic reworded a declared gap's remedy within its class, the gap no longer matched and the
+    fix planner declared it again, one round later. A remedy of another class (a fix become an owner amendment) or
+    another kind is looked at again."""
+    return finding_fingerprint(f)
+
+
+def legacy_harness_gap_key(f) -> str:
+    """The key a harness gap was recorded under before hb3 fix 6 (the fingerprint and the remedy as written): a resumed
+    run's gap still holds while its remedy reads as it did then."""
     return hashlib.sha256(json.dumps({"fp": finding_fingerprint(f), "fix_requires": f.fix_requires},
                                      sort_keys=True).encode()).hexdigest()[:16]
 
 
 # hb2 fix 1: gate kinds whose resolution is the owner's (agents/stage_machine.py DECISION_BEARING_KINDS)
 OWNER_RESOLUTION_KINDS = ("decision_test_changes_plan",)
+# hb3 fix 4: a declared decision test that did not run (toolkit/analysis/contract.py DECISION_TEST_NOT_RUN_KIND). The
+# harness check computes it at every gate, so its absence means the test ran: an owner answer to it is moot
+NOT_RUN_KINDS = ("decision_test_not_run",)
 HARNESS_GAP = "harness_gap"          # the ledger event a declared harness gap leaves on its finding (agents/fix_loop.py)
 
 
 def harness_gaps(led: dict) -> set[str]:
     """Open findings the fix planner declared harness gaps (no file a fix task may edit can fix them) as they read now:
-    the gap's event carries harness_gap_key, so a finding whose kind or remedy was revised since is not one (hb2 fix
-    4: no task can work on it, so it is declared, not sent to the fix loop again)."""
+    the gap's event carries harness_gap_key, so a finding whose kind or remedy class was revised since is not one (hb2
+    fix 4: no task can work on it, so it is declared, not sent to the fix loop again; hb3 fix 6: a reworded remedy of
+    the same class still is one, unless it now names a file a fix task may edit: Codex r1 of #375, P1-1)."""
     return {f.id for f in led.values() if f.status in ("open", "declared")
-            and any(isinstance(e, dict) and e.get("status") == HARNESS_GAP and e.get("key") == harness_gap_key(f)
-                    for e in f.events or [])}
+            and any(_gap_holds(f, e) for e in f.events or [])}
+
+
+_PATH_TOKEN = re.compile(r"[\w][\w./-]*")
+
+
+def names_editable_file(text) -> bool:
+    """The text names a file a fix task may edit (agents/fix_loop.py in_edit_scope, FIX_EDITABLE). Unknown (the
+    scope cannot be read) counts as naming one, so the planner looks at the finding again (fail closed)."""
+    try:
+        import fix_loop as FX           # lazy: fix_loop imports this module
+    except Exception:  # noqa: BLE001
+        return True
+    toks = (t.rstrip(".,;:") for t in _PATH_TOKEN.findall(str(text or "")))
+    return any(("/" in t or "." in t) and FX.in_edit_scope(t) for t in toks)
+
+
+def _gap_holds(f, e) -> bool:
+    """One harness-gap event still declares f: its key binds f as it reads now (the remedy as written, the earlier
+    key; or the remedy class), and a remedy reworded since it was declared names no file a fix task may edit."""
+    if not (isinstance(e, dict) and e.get("status") == HARNESS_GAP):
+        return False
+    if e.get("key") == legacy_harness_gap_key(f):
+        return True                     # the remedy reads as it did when the gap was declared
+    if e.get("key") != harness_gap_key(f):
+        return False
+    if "remedy" in e and e.get("remedy") == f.fix_requires:
+        return True
+    return not names_editable_file(f.fix_requires)
 
 
 def owner_answers(run_dir: str, lead_ok: bool = False) -> dict[str, dict]:
@@ -523,6 +562,11 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             if f.id not in seen and f.kind in OWNER_RESOLUTION_KINDS and f.status == "owner_accepted":
                 f.status, f.blocking = "fixed", False
                 _event(f, round_n, "fixed", "gate", "absent at this gate")
+            # a test that did not run and runs now: neither an accept nor a decline of going on without it holds the
+            # run any more (Codex r1 of #375, P1-4: a decline kept a corrected run from finishing)
+            elif f.id not in seen and f.kind in NOT_RUN_KINDS and f.status in ("owner_accepted", "owner_declined"):
+                f.status, f.blocking = "fixed", False
+                _event(f, round_n, "fixed", "gate", "absent at this gate: the decision test ran")
     frozen = frozen_tests(run_dir)
     for f in led.values():
         fk = f.id if f.source.startswith("critique") else f.key if f.kind in _DW_ROWS else None
@@ -772,6 +816,17 @@ def _self_test() -> int:
            and st2 == "open" and bl2 and a4.status == "fixed",
            f"L19 a gate finding the owner accepted is held; asked again it is open; gone, it is fixed "
            f"({a1.status}, {ev}, {st2}, {a4.status})")
+    # L19b (Codex r1 of #375, P1-4): a declared decision test that did not run, declined (or accepted) by the owner,
+    # is fixed once a gate no longer reports it (the test ran), post-write too: the decline no longer holds the run
+    for post in (False, True):
+        with tempfile.TemporaryDirectory() as d:
+            nf = Finding(id="decision_test_not_run:DT3", kind="decision_test_not_run", key="DT3", severity="HIGH",
+                         source="rigor-artifacts", status="owner_declined", resolution_type="owner_decision",
+                         fix_requires="Owner amendment: change the spec so that decision test DT3 can run.")
+            save(d, {nf.id: nf})
+            got = sync(d, {"rigor_violations": [], "unresolved_high": []}, 2, post_write=post)[0][nf.id]
+            ok(got.status == "fixed" and not got.blocking,
+               f"L19b an answered not-run test the gate no longer reports is fixed (post_write={post}: {got.status})")
     # L20 (hb2 fix 4, dengue R2 R-001): a declared harness gap is one while the finding keeps its kind and remedy class
     f20 = Finding(id="R-001", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
                   fix_requires="The ANALYZE stage emits claims.")
@@ -779,12 +834,46 @@ def _self_test() -> int:
     g1 = harness_gaps({"R-001": f20})
     f20.claim = "reworded"
     g2 = harness_gaps({"R-001": f20})
-    f20.fix_requires = "Set analysis_settings.yaml uncertainty.draws to 64."      # Codex r1 of #357 P1-5: same class
+    # hb3 fix 6 (tb_acf R1 D-001): the critic reworded the gap's remedy in round 2, within its class; the gap holds
+    f20.fix_requires = "The owner must authorise it: the change is outside the fix loop's edit scope (reworded)."
     g3 = harness_gaps({"R-001": f20})
+    f20.fix_requires = "Owner amendment: give the two weights ranges."           # another remedy class: looked at again
+    g4 = harness_gaps({"R-001": f20})
+    f20.fix_requires = "The ANALYZE stage emits claims."
+    f20.kind = "another_kind"                                                     # another kind: looked at again
+    g5 = harness_gaps({"R-001": f20})
     f21 = Finding(id="R-002", kind="critique_blocker", severity="MEDIUM", source="critique-redteam")
     _event(f21, 1, HARNESS_GAP, "fix_planner", "an older event without a key")
-    ok(g1 == g2 == {"R-001"} and g3 == set() and harness_gaps({"R-002": f21}) == set(),
-       f"L20 a harness gap binds the finding's kind and remedy class ({g1}, {g2}, {g3})")
+    ok(g1 == g2 == g3 == {"R-001"} and g4 == g5 == set() and harness_gaps({"R-002": f21}) == set(),
+       f"L20 a harness gap binds the finding's id, kind and remedy class, not the remedy's wording "
+       f"({g1}, {g2}, {g3}, {g4}, {g5})")
+    # L20c (Codex r1 of #375 P1-1): a remedy reworded, within its class, into one that names a file the fix loop may
+    # edit (fix_loop.FIX_EDITABLE) reopens the gap: the loop can act on it now. The remedy as declared does not.
+    f23 = Finding(id="R-005", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                  fix_requires="Change the harness to increase the uncertainty draws.")
+    _event(f23, 1, HARNESS_GAP, "fix_planner", "only harness code", key=harness_gap_key(f23), remedy=f23.fix_requires)
+    c1 = harness_gaps({"R-005": f23})
+    f23.fix_requires = "Increase the draws in the harness code (reworded)."
+    c2 = harness_gaps({"R-005": f23})
+    f23.fix_requires = "Set `analysis_settings.yaml` uncertainty.draws to 64."
+    c3 = harness_gaps({"R-005": f23})
+    f23.fix_requires = "Add the missing draw step in models/ext/draws.py."
+    c4 = harness_gaps({"R-005": f23})
+    f24 = Finding(id="R-006", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                  fix_requires="Raise analysis_settings.yaml uncertainty.draws; the harness caps it.")
+    _event(f24, 1, HARNESS_GAP, "fix_planner", "the cap is harness code", key=harness_gap_key(f24),
+           remedy=f24.fix_requires)
+    c5 = harness_gaps({"R-006": f24})
+    ok(c1 == c2 == {"R-005"} and c3 == c4 == set() and c5 == {"R-006"},
+       f"L20c a reworded remedy naming an editable file reopens the gap; one without, or the remedy as declared, "
+       f"does not ({c1}, {c2}, {c3}, {c4}, {c5})")
+    # L20b: a gap recorded under the key used before hb3 fix 6 (the remedy as written) holds while the remedy reads so
+    f22 = Finding(id="R-003", kind="critique_blocker", severity="MEDIUM", source="critique-redteam",
+                  fix_requires="Only harness code can draw it.")
+    _event(f22, 1, HARNESS_GAP, "fix_planner", "only harness code", key=legacy_harness_gap_key(f22))
+    h1 = harness_gaps({"R-003": f22})
+    ok(h1 == {"R-003"} and legacy_harness_gap_key(f22) != harness_gap_key(f22),
+       f"L20b a gap recorded under the earlier key still holds on a resumed run ({h1})")
     _fa = answer_fingerprint("k:x", kind="k", fix_requires="r", claim="verdict A")
     ok(_fa != answer_fingerprint("k:x", kind="k", fix_requires="r", claim="verdict B")
        and answer_fingerprint("D-1", kind=CRITIC_KIND, fix_requires="r", claim="a")

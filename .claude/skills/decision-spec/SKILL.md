@@ -143,7 +143,12 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     the question asks for. When the question asks for the options that maximise an *expected*
     outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
     best mean over the uncertainty draws, per-unit means in the file and a mean claim
-    (`toolkit/analysis/plan_rule.py`). Without it the plan is solved at the point values.
+    (`toolkit/analysis/plan_rule.py`). Without it the plan is solved at the point values. The
+    pre-sign spec critique reads the question's wording: an objective stated in expectation
+    ("minimise expected ...") with the point plan is a MEDIUM on the sign-off sheet
+    (`expected_value_plan`, principle 1). When the spec cannot carry the expected-value plan
+    (the schema lists what it excludes, such as `by_group`), declare that check in
+    `principle_departures` with the reason.
 12. **Evidence dossier.** Each engine card declares, per component, the unit attributes,
     parameters and card tables its effect depends on (`decision_inputs`, read by
     `toolkit/engines/decision_inputs.py`). When the options use such a component, name the

@@ -468,7 +468,7 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
                 # the gap binds the finding as it reads now (its kind and remedy class: hb2 fix 4)
                 FL._event(f, round_n, HARNESS_GAP, "fix_planner",
                           f"{str(g.get('reason')).strip()} Needs: {', '.join(map(str, g.get('needs') or []))}"[:600],
-                          key=FL.harness_gap_key(f))
+                          key=FL.harness_gap_key(f), remedy=f.fix_requires)    # the remedy as declared (#375)
         FL.save(run_dir, led)
         log(f"[fix loop] harness gap(s), not fix tasks: {', '.join(gap_ids)}")
     done = {r.get("task") for r in impact_rows(run_dir) if r.get("round") == round_n}
@@ -890,6 +890,8 @@ def _self_test() -> int:
         ok(s20.get("harness_gaps") == ["R-001", "R-004"] and s20.get("harness_gaps_blocking") == ["R-001"]
            and s20["rows"] == 0 and impact_rows(d) == []
            and plan20.get("harness_gaps") == ["R-001", "R-004"] and ev20 and "harness code" in ev20[-1].get("note", "")
+           # Codex r1 of #375 P1-1: the event keeps the remedy as declared, so a later rewording can be compared
+           and ev20[-1].get("remedy") == FL.load(d)["R-001"].fix_requires
            and FL.load(d)["R-001"].status == "open" and "R-001" in FL.harness_gaps(FL.load(d))
            # Codex r1 of #357 P2-11: the harness's default plan plans no task for a declared gap
            and not any("R-001" in t["findings"] for t in default_plan(build_packet(d, FL.load(d), 2, 3, None,

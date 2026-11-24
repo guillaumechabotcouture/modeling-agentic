@@ -794,10 +794,27 @@ def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int,
     return d
 
 
+def held_entry_id(b: dict, decision: dict) -> str | None:
+    """The ledger id of a gate's unresolved HIGH that the owner may hold: a critic's blocker (its id), or a harness
+    finding whose kind only the owner's answer resolves and no fix task can work on: a declared decision test that did
+    not run (hb3 fix 4; Codex r1 of #375 P2-5), whose RIG entry is matched to its rigor violation by kind and claim.
+    None for any other gate finding: it keeps the round."""
+    if str(b.get("reviewer") or "").startswith("critique"):
+        return str(b.get("id"))
+    if b.get("kind") not in FL.NOT_RUN_KINDS:
+        return None
+    for v in decision.get("rigor_violations") or []:
+        if isinstance(v, dict) and v.get("kind") == b.get("kind") \
+                and f"{v.get('stage', '?')}/{v.get('kind')}: {v.get('claim', '')}" == b.get("claim"):
+            return FL.gate_id(v)
+    return None
+
+
 def apply_held_rule(decision: dict, ledger: dict, owner_held=(), harness_gaps=(), opened=None) -> dict:
     """hb2 fix 1: a gate that patches (rule 2) only for critic findings the owner holds (accepted) or the fix planner
     declared harness gaps has nothing a fix task can do: they are declared now (rule 3h), as rule 3m declares them when
-    no HIGH is open, instead of a fix loop with no task and another critique round (malaria R2, dengue R2). Never with a
+    no HIGH is open, instead of a fix loop with no task and another critique round (malaria R2, dengue R2). An accepted
+    declared decision test that did not run is held the same way (held_entry_id; #375). Never with another
     gate finding, a required artifact missing or a structural mismatch open, nor while any open finding with a test
     (`opened`, a MEDIUM too) is neither the owner's nor a gap: the fix loop works to it (Codex r1 of #357, P1-3)."""
     if decision.get("action") != "PATCH_OR_RETHINK" or str(decision.get("rule_matched")) != "2" \
@@ -805,16 +822,16 @@ def apply_held_rule(decision: dict, ledger: dict, owner_held=(), harness_gaps=()
         return decision
     keep = set(map(str, owner_held or ())) | set(map(str, harness_gaps or ()))
     hi = [b for b in decision.get("unresolved_high") or [] if isinstance(b, dict)]
+    hid = [held_entry_id(b, decision) for b in hi]
     if not hi or len(hi) != len(decision.get("unresolved_high") or []) or not all(
-            str(b.get("reviewer") or "").startswith("critique") and str(b.get("id")) in keep and str(b.get("id")) in ledger
-            for b in hi):
+            i is not None and i in keep and i in ledger for i in hid):
         return decision
     if opened is None:
         return decision
     work = [str(o.get("id")) for o in opened if o.get("tested") and str(o.get("id")) not in keep]
     if work:      # these keep the round: they are what the fix loop works to (Codex r3 of #357, P2-12)
         return dict(decision, open_tested=work)
-    ids = sorted(str(b.get("id")) for b in hi)
+    ids = sorted(hid)
     return dict(decision, action="DECLARE_SCOPE", rule_matched="3h", declared_open=[o["id"] for o in opened],
                 rationale=(f"{len(ids)} HIGH finding(s) are open ({', '.join(ids)[:200]}), each one the owner answered "
                            "or a declared harness gap: no fix task can work on them, so they are declared in the "
@@ -2723,12 +2740,15 @@ class Machine:
         hi = d.get("unresolved_high") or []
         if str(d.get("rule_matched")) == "2" and not hi:
             return None
-        for b in hi:            # rule 2: every HIGH is a critic's, and the write-up's, the owner's or a gap
-            if not (isinstance(b, dict) and str(b.get("reviewer") or "").startswith("critique")):
+        hid = []
+        for b in hi:            # rule 2: every HIGH is a critic's (or an owner-held unrun test), and the write-up's,
+            i = held_entry_id(b, d) if isinstance(b, dict) else None      # the owner's or a gap (#375 P2-5)
+            if i is None:
                 return None
-            i = str(b.get("id"))
-            if not (i in led and (FX.is_write_up(led[i]) or i in keep)):
+            crit = str(b.get("reviewer") or "").startswith("critique")
+            if not (i in led and ((crit and FX.is_write_up(led[i])) or i in keep)):
                 return None
+            hid.append(i)
         ids = [str(i) for i in d.get("open_tested") or []]
         if not all(i in led and (FX.is_write_up(led[i]) or i in gaps) for i in ids):
             return None
@@ -2737,7 +2757,7 @@ class Machine:
         if not isinstance(tested, list) or any(str(i) not in keep and not (str(i) in led and FX.is_write_up(led[str(i)]))
                                                for i in tested):
             return None
-        named = set(ids) | {str(b.get("id")) for b in hi}
+        named = set(ids) | set(hid)
         return sorted(set(map(str, held)) | (gaps & named))
 
     def _fixable_open(self) -> list[str]:
@@ -3355,7 +3375,15 @@ def provisional_lines(run_dir: str) -> tuple[list[str], list[str]]:
            f"plan: {', '.join(map(str, flagged))}. The owner confirms or overturns each ({how}).\n\n"] if flagged else []
     sec = ["", "## Provisional decisions (the lead's, under --signoff lead; for the owner's review)", "",
            f"Each decision below is the owner's; the lead made it provisionally so the run could finish. Review: {how}.", ""]
-    sec += [f"- **{f}**: accepted provisionally; plan changes: {'yes' if pc else 'no'}; owner review: "
+    # a decision test that did not run has no verdict on the plan (Codex r1 of #375, P1-3): never "no"
+    untested = [f for f, _pc, _r in rows if str(f).startswith(tuple(f"{k}:" for k in FL.NOT_RUN_KINDS))]
+    if untested:
+        top.append(f"**Provisional decisions on decision tests that did not run.** The lead accepted, provisionally, "
+                   f"going on without {len(untested)} declared decision test(s) that did not run: "
+                   f"{', '.join(map(str, untested))}. The plan was not tested against them. The owner confirms or "
+                   f"overturns each ({how}).\n\n")
+    sec += [f"- **{f}**: accepted provisionally; plan changes: "
+            f"{'not tested (the decision test did not run)' if f in untested else 'yes' if pc else 'no'}; owner review: "
             f"{r or 'not yet'}." for f, pc, r in rows]
     return top, sec
 
@@ -5145,6 +5173,19 @@ def _self_test() -> int:
         ok(_plan_changing({"finding": "evidence_conflict_declared:g|1", "kind": "evidence_conflict_declared"}) is True
            and _plan_changing({"kind": "evidence_conflict_declared", "conflict": {"changes_plan": False}}) is False,
            "T_CONFLICT_OLD_REQUEST a conflict item without its verdict counts as changing the plan")
+        # T_NOT_RUN_PROVISIONAL (Codex r1 of #375, P1-3): a lead-accepted decision test that did not run reads "not
+        # tested", never "plan changes: no", and is named above the draft
+        import scope_signoff as _SSn
+        _prov = _SSn.provisional
+        _SSn.provisional = lambda rd: [{"finding": "decision_test_not_run:DT3", "plan_changing": False, "review": None}]
+        try:
+            os.makedirs(os.path.join(td, "not_run_prov"), exist_ok=True)
+            top_n, sec_n = provisional_lines(os.path.join(td, "not_run_prov"))
+        finally:
+            _SSn.provisional = _prov
+        ok(any("did not run" in x and "decision_test_not_run:DT3" in x for x in top_n)
+           and any("decision_test_not_run:DT3**: accepted provisionally; plan changes: not tested" in x for x in sec_n),
+           f"T_NOT_RUN_PROVISIONAL a provisionally accepted unrun test reads not tested ({top_n}, {sec_n[-1:]})")
         dn, Tn, sn = conflict_run("conflict_nochange", False)
         ok(sn in ACCEPTED_STATUSES and not os.path.exists(os.path.join(dn, "scope_signoff_request.json"))
            and FL.load(dn)["evidence_conflict_declared:g|1"].status == "declared"
@@ -5683,16 +5724,36 @@ def _self_test() -> int:
             prov36 = sorted({r["finding"] for r in _SS36.provisional(d) if r.get("plan_changing")})
             rep36 = open(os.path.join(d, "report.md")).read() if os.path.exists(os.path.join(d, "report.md")) else ""
             sp36 = json.load(open(os.path.join(d, "report_render.json")))["writer_span"] if rep36 else [0, 0]
-            exp36 = "completed"
-            ok(want and s == exp36 and "The plan depends on inputs the lead accepted provisionally" in rep36[:sp36[0]] and man and rows and rows[0]["files_changed"] == ["analysis_settings.yaml"]
-               and FL.load(d)["D-001"].status == "fixed" and prov36 == want
-               and not any(h.get("paused") for h in load_state(d).history)
-               and all(w in rep36[:sp36[0]] for w in want),
+            # hb3 fix 4 (#375): a test the spec declares that did not run (the toy's DT1 has no benchmark results here)
+            # is a declarable HIGH, so the run is declared, not accepted, and the ledger holds it; read from the artifact
+            _decl36 = {str(t.get("id")) for t in (raw.get("analysis") or {}).get("decision_tests") or []}
+            nr36 = sorted(f"decision_test_not_run:{t.get('test_id')}" for t in _dt36.get("tests") or []
+                          if t.get("status") == "not_run" and str(t.get("test_id")) in _decl36)
+            led36 = FL.load(d)
+            exp36 = "completed_scope_declared" if nr36 else "completed"
+            # Codex r1 of #375 P2-5 (seen here): no fix loop with nothing to do (no task, no owner amendment, no
+            # write-up) runs: an accepted not-run test is declared at the gate, not sent to an empty fix loop
+            hist36 = load_state(d).history
+            empty36 = [h["fix_loop"].get("round") for h in hist36 if isinstance(h.get("fix_loop"), dict)
+                       and not h["fix_loop"].get("tasks") and not h["fix_loop"].get("owner_amendments")
+                       and not h["fix_loop"].get("write_up")]
+            c36 = {"status": s == exp36, "manifest": bool(man), "fix_row": bool(rows) and rows[0]["files_changed"] == [
+                       "analysis_settings.yaml"],
+                   "dependence_top": bool(nr36) or "The plan depends on inputs the lead accepted provisionally"
+                   in rep36[:sp36[0]],
+                   "not_run_in_ledger": all(i in led36 for i in nr36), "no_empty_fix_loop": empty36 == [],
+                   "d001_fixed": led36["D-001"].status == "fixed", "provisional": prov36 == want,
+                   "never_paused": not any(h.get("paused") for h in hist36),
+                   "flagged_top": all(w in rep36[:sp36[0]] for w in want)}
+            bad36 = [k for k, v in c36.items() if not v]
+            ok(want and not bad36,
                f"T36 the default backend (workstream B) runs the machine end to end with engine: auto; each decision "
-               f"test that changes the plan is answered provisionally and flagged above the draft ({s}, {want}, {prov36}"
-               + ("" if s == exp36 else   # why it ended: CI showed only the status (flaky once on #156 and #160)
-                  f"; path {[h.get('to') for h in load_state(d).history if 'to' in h]}; "
-                  f"final {[h.get('why') for h in load_state(d).history if h.get('to') == 'FINAL'][-1:]}") + ")")
+               f"test that changes the plan is answered provisionally and flagged above the draft ({s}, {want}, {prov36}, "
+               f"not run: {nr36}, failing: {bad36}, empty fix loops: {empty36}"
+               + ("" if not bad36 else   # why it ended: CI showed only the status (flaky once on #156 and #160)
+                  f"; path {[h.get('to') for h in hist36 if 'to' in h]}; "
+                  f"final {[h.get('why') for h in hist36 if h.get('to') == 'FINAL'][-1:]}; "
+                  f"D-001 {led36['D-001'].status}") + ")")
         else:
             ok(True, "T36 skipped: workstream B's analysis engine is not on this branch")
 
@@ -7082,6 +7143,27 @@ def _self_test_writeup_rounds(ok, td: str, spike, new_run) -> None:
            f"HB2-2 a rule-2 gate holding only owner-held findings and harness gaps declares them now; a fixable one, a "
            f"gate finding or a missing artifact keeps rule 2 ({h1['action']}, {h2['action']}, {h3['action']}, "
            f"{h4['action']})")
+        # HB3-HELD (#375, Codex r1 P2-5; T36): an accepted decision_test_not_run is owner-held. A rule-2 gate whose only
+        # HIGH it is declares it now (rule 3h), and the shortcut takes it to WRITE: no fix loop with nothing to do
+        vn = {"kind": "decision_test_not_run", "stage": "ANALYZE", "key": "DT1", "severity": "HIGH", "claim": "c"}
+        fn = FL.gate_id(vn)
+        rn = {"action": "PATCH_OR_RETHINK", "rule_matched": "2", "accept_blockers": [], "rigor_violations": [vn],
+              "unresolved_high": [{"reviewer": "rigor-artifacts", "id": "RIG-001", "kind": "decision_test_not_run",
+                                   "claim": "ANALYZE/decision_test_not_run: c"}]}
+        ledn = {fn: FL.Finding(id=fn, kind="decision_test_not_run", key="DT1", severity="HIGH",
+                               source="rigor-artifacts", status="owner_accepted")}
+        opn = [{"id": fn, "tested": True}]
+        n1 = apply_held_rule(rn, ledn, [fn], [], opn)
+        n2 = apply_held_rule(rn, ledn, [], [], opn)                           # not answered: the fix loop asks
+        vk = dict(vn, kind="allocation_unstable")                            # another gate kind: never held here
+        rk = dict(rn, rigor_violations=[vk], unresolved_high=[dict(rn["unresolved_high"][0], kind="allocation_unstable",
+                                                                   claim="ANALYZE/allocation_unstable: c")])
+        n3 = apply_held_rule(rk, {FL.gate_id(vk): ledn[fn]}, [FL.gate_id(vk)], [], [{"id": FL.gate_id(vk),
+                                                                                   "tested": True}])
+        ok(n1["action"] == "DECLARE_SCOPE" and n1["rule_matched"] == "3h" and n1["declared_open"] == [fn]
+           and n2["action"] == n3["action"] == "PATCH_OR_RETHINK",
+           f"HB3-HELD an accepted unrun decision test, the only HIGH, is declared now (rule 3h); unanswered, or another "
+           f"gate kind, keeps rule 2 ({n1['action']}/{n1.get('rule_matched')}, {n2['action']}, {n3['action']})")
 
     def hb2_gap_prewrite():
         # HB2-4 (dengue R2 in miniature): pre-write, the fix loop declares the only tested finding a harness gap and
