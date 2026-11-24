@@ -586,7 +586,8 @@ def run(A, col: Collector, plan: dict, variants: dict | None, report: dict, leve
     if s > 0:          # perfect information may overspend: each draw's best plan without the budget (round 2 P2)
         nb_free = np.full(n, -np.inf)
         for d in range(n):
-            sol = clean(d, float(Cs[d].max(1).sum()) + 1.0, budget_exact=False)
+            sol = clean(d, float(Cs[d].max(1).sum()) + 1.0,
+                        budget_exact=False if getattr(A, "budget_exact", False) else None)
             if sol is None:
                 notes.setdefault("unbudgeted_left_out", []).append(d)
             else:
@@ -806,12 +807,14 @@ class _FakeA:
         self.spec = type("S", (), {"raw": raw or {}})()
         self.primary, self.dfac, self.method, self.joint = "y", 1.0, "none", None
 
-    def solve(self, ben, cost, budget=None, feas=None):
+    def solve(self, ben, cost, budget=None, feas=None, budget_exact=None):
         f = feas or self.feas
         if not any(v for t in cost.values() for v in t.values()) and not f.get("links"):   # free plans: the argmax
             ch = {u: max(ben[u], key=lambda k: (ben[u][k], -list(self.pk).index(k))) for u in ben}
             return {"choice": ch, "objective": sum(ben[u][ch[u]] for u in ben), "status": "optimal"}
-        r = self.aopt.solve(ben, cost, feas or self.feas, self.budget if budget is None else budget, method="ilp")
+        exact = bool(getattr(self, "budget_exact", False)) if budget_exact is None else bool(budget_exact)
+        r = self.aopt.solve(ben, cost, feas or self.feas, self.budget if budget is None else budget, method="ilp",
+                            budget_exact=exact)
         if r["status"] != "optimal":
             raise RuntimeError(f"optimizer status {r['status']}")
         return r

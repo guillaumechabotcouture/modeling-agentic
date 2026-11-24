@@ -984,7 +984,9 @@ def _self_test() -> int:
        f"malformed gate is reported ({a25}, {e25}, {p25})")
     ok(b24 is False and s24 == "fixed",
        f"L24 an accepted test does not block on a second sync; gone post-write, it is closed ({b24}, {s24})")
-    # L_OWNER_LEAD (1F, D2): a lead's recorded answer counts only when the run is a --signoff lead run
+    # L_OWNER_LEAD (1F, D2; updated 2026-11-24 policy): a lead's recorded answer counts only with lead_ok and only for
+    # non-HIGH critic findings; an open critic HIGH finding is never accepted by a lead provisional answer, and an
+    # earlier lead-accepted MEDIUM finding reopens if escalated to HIGH.
     with tempfile.TemporaryDirectory() as d:
         import scope_signoff as SS
         claim, fix = "the comparator omits the funded plan", "Owner amendment: add it."
@@ -992,13 +994,24 @@ def _self_test() -> int:
         json.dump({"answers": {fp: {"finding": "D-032", "decision": "accept", "by": "lead", "provisional": True}}},
                   open(os.path.join(d, "scope_signoff.json"), "w"))
         SS.harness_record(d)
-        save(d, {"D-032": Finding(id="D-032", kind="critique_blocker", severity="HIGH", source="harness", claim=claim,
+        save(d, {"D-032": Finding(id="D-032", kind="critique_blocker", severity="MEDIUM", source="harness", claim=claim,
                                   fix_requires=fix)})
         st_o = sync(d, None, 2)[0]["D-032"].status
         led_l = sync(d, None, 2, lead_ok=True)[0]
         ok(owner_answers(d) == {} and list(owner_answers(d, lead_ok=True)) == [fp] and st_o == "open"
            and led_l["D-032"].status == "owner_accepted" and led_l["D-032"].events[-1].get("by") == "lead",
            f"L_OWNER_LEAD a lead's answer counts only with lead_ok, and the ledger says it was the lead's ({st_o})")
+        # Escalation to HIGH reopens the lead-accepted finding
+        yaml.safe_dump({"reviewer": "critique-domain", "round": 3, "verdict": "REVISE",
+                        "structural_mismatch": {"detected": False}, "carried_forward": [],
+                        "blockers": [{"id": "D-032", "severity": "HIGH", "category": "METHODS",
+                                      "target_stage": "PLAN", "first_seen_round": 1, "claim": claim,
+                                      "fix_requires": fix, "resolved": False}]},
+                       open(os.path.join(d, CRITIQUE_FILES["critique-domain"]), "w"))
+        led_hi = sync(d, None, 3, lead_ok=True)[0]
+        ok(led_hi["D-032"].status == "open" and led_hi["D-032"].severity == "HIGH",
+           f"L_OWNER_LEAD_NO_HIGH critic HIGH is never accepted by a lead provisional answer and escalation reopens it "
+           f"({led_hi['D-032'].status}, {led_hi['D-032'].severity})")
     # L_DICT_DW, L_FROZEN_DW, L_GATE_DW (v2 autonomy 1A, 4c and 4a): the test a fix task is checked against.
     with tempfile.TemporaryDirectory() as d:
         frozen, weaker = [{"file": "x.txt", "contains": "draws 32"}], [{"file": "x.txt", "exists": True}]
