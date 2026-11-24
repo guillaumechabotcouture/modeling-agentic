@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -227,6 +228,12 @@ def stamp(run_path: str, ident: dict, now: str | None = None) -> dict:
     meta = meta if isinstance(meta, dict) else {}
     before = label(meta)[0]
     meta.update({k: ident[k] for k in ("pipeline", "commit", "launcher")})
+    # baseline hb3 §5.1 (Codex r1 on #374): a cloud replicate's label and launch are this invocation's, also on a
+    # resume and in an amendment's child, so collection maps the stored run to the label whose record names it
+    for k, env in (("run_label", "MA_RUN_LABEL"), ("launch_id", "MA_LAUNCH_ID")):
+        v = re.sub(r"[^A-Za-z0-9_.-]", "", os.environ.get(env) or "").lstrip(".")[:64]
+        if v:
+            meta[k] = v
     inv = meta.get("invocations") if isinstance(meta.get("invocations"), list) else []
     meta["invocations"] = inv + [{**{k: ident[k] for k in ("pipeline", "commit", "launcher")},
                                   "pipeline_before": before,
@@ -452,6 +459,11 @@ def _self_test() -> int:
            "PI18 stamp merges, keeps the question, and records each invocation")
         open(os.path.join(rd, "metadata.json"), "w").write("[]")
         ok(stamp(rd, ident, now="t")["pipeline"] == "v2", "PI19 a non-object metadata.json is replaced, not a crash")
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"MA_RUN_LABEL": "R2", "MA_LAUNCH_ID": "L2"}):
+            m = stamp(rd, ident, now="t")
+        ok((m.get("run_label"), m.get("launch_id")) == ("R2", "L2"),
+           f"PI19b a resumed cloud replicate's metadata.json takes this invocation's label and launch ({m.get('run_label')})")
         try:
             identity("v3", td)
             ok(False, "PI20 an unknown pipeline is refused")

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -283,7 +284,8 @@ def collect_step(blob, name, state, now, work, fetch=fetch_from_storage, metrics
                 skipped = results_store.write_archive(src, label, tgz)
                 sha = results_store.sha256_file(tgz)
                 # per launch (baseline hb3 §5.1): a relaunch's archive never replaces the earlier launch's
-                launch = re.sub(r"[^A-Za-z0-9_.-]", "_", str(a.get("launch_id")))[:64]
+                launch = str(a.get("launch_id"))      # a plain id as it is; any other by its digest (Codex r1)
+                launch = launch if _LABEL.fullmatch(launch) else hashlib.sha256(launch.encode()).hexdigest()[:24]
                 dst = f"{paths(name)['collected']}{lname}/launch_{launch}/{label}.tar.gz"
                 blob.put_file(tgz, dst)
             lab.update(state="collected", blob=dst, sha256=sha, at=utc(now), note="",

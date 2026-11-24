@@ -1851,9 +1851,11 @@ class Machine:
         return str(why or f"paused at {self.st.state}")[:1000]
 
     def _write_meta(self, drop=(), **fields) -> None:
-        """metadata.json with `fields` and the run's pipeline, engine, rounds and spend set, and `drop` removed."""
+        """metadata.json with `fields` and the run's pipeline, engine, rounds and spend set, and `drop` removed. Read
+        with no link followed, as it is written (Codex r1 on #374: a planted link's target was copied into it)."""
+        from lib.safe_io import read_nofollow
         try:
-            meta = json.load(open(os.path.join(self.run_dir, "metadata.json")))
+            meta = json.loads(read_nofollow(self.run_dir, "metadata.json")[0])
         except (OSError, ValueError):
             meta = {}
         meta = meta if isinstance(meta, dict) else {}

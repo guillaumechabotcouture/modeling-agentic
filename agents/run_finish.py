@@ -63,7 +63,7 @@ def exit_code_for(status: str) -> int:
 
 def plain_tag(value) -> str:
     """A label or launch id as it may appear in a run dir or blob name ('' when there is none)."""
-    return re.sub(r"[^A-Za-z0-9_.-]", "", str(value or "")).lstrip(".")[:40]
+    return re.sub(r"[^A-Za-z0-9_.-]", "", str(value or "")).lstrip(".")[:64]   # a supervisor label is <= 63
 
 
 def _store_blob_name(run_path: str) -> str:
@@ -78,15 +78,20 @@ def _store_blob_name(run_path: str) -> str:
     return f"outputs/{prefix}/{name}.tar.gz"
 
 
-def _upload_own(results_store, tmp: str, blob: str, account, service, stored_before) -> tuple[str, str | None]:
+def _upload_own(results_store, tmp: str, blob: str, account, service, before: dict) -> tuple[str, str | None]:
     """(the blob the run went to, the name it was refused, or None). A blob is replaced only when this run stored
-    it before (metadata.json `stored`: a resume); a name another run's blob holds is refused, never overwritten, and
-    the run goes under a fresh name beside it."""
+    it before, in the same account (metadata.json `stored`, `stored_account`: a resume), and a run stored under a
+    fresh name keeps it; a name another run's blob holds is refused, never overwritten, and the run goes under a
+    fresh name beside it (Codex r1 on #374)."""
+    stem = blob[:-len(".tar.gz")]
+    mine = before.get("stored") if before.get("stored_account") == (account or "") else None
+    if isinstance(mine, str) and re.fullmatch(re.escape(stem) + r"\.[0-9a-f]{8}\.tar\.gz", mine):
+        blob = mine
     try:
-        results_store.upload_retry(tmp, blob, account, service=service, overwrite=stored_before == blob)
+        results_store.upload_retry(tmp, blob, account, service=service, overwrite=mine == blob)
         return blob, None
     except results_store.BlobNameTaken:
-        fresh = f"{blob[:-len('.tar.gz')]}.{uuid.uuid4().hex[:8]}.tar.gz"
+        fresh = f"{stem}.{uuid.uuid4().hex[:8]}.tar.gz"
         print(f"[WARN] {blob} holds another run: not overwritten; this run is stored as {fresh}", file=sys.stderr,
               flush=True)
         results_store.upload_retry(tmp, fresh, account, service=service, overwrite=False)
@@ -115,7 +120,7 @@ def store_run_results(run_path: str, service=None) -> str | None:
         before = json.load(open(mp)) if os.path.exists(mp) else {}
     except (OSError, ValueError):
         before = {}
-    before = before.get("stored") if isinstance(before, dict) else None
+    before = before if isinstance(before, dict) else {}
     try:
         # Bounded memory (v2 autonomy 1E-i): the archive is streamed to disk and streamed up; a large run was
         # held three times over at this point, and a run killed here for memory stored nothing.
@@ -130,7 +135,7 @@ def store_run_results(run_path: str, service=None) -> str | None:
     try:
         meta = json.load(open(mp)) if os.path.exists(mp) else {}
         meta = meta if isinstance(meta, dict) else {}   # valid JSON that is not an object (ST6)
-        meta.update({"stored": blob, "store_error": err})
+        meta.update({"stored": blob, "store_error": err, "stored_account": account or ""})
         if taken:
             meta["store_collision"] = taken
         json.dump(meta, open(mp, "w"), indent=2)

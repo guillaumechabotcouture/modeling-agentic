@@ -152,6 +152,16 @@ def _self_test_replicates(ok, outcome, rs, crash, raise_) -> None:
         open(os.path.join(a, "report.md"), "w").write("A, resumed")
         ok(store_run_results(a, service=xs) == ba and xs.st[("outputs", ba[len("outputs/"):])] != first,
            "SN3 the same run stored again (a resume) replaces its own blob")
+        n0 = len(xs.st)
+        open(os.path.join(b, "report.md"), "w").write("B, resumed")
+        ok(store_run_results(b, service=xs) == bb and len(xs.st) == n0,
+           "SN4 (Codex r1) a run stored under a fresh name after a collision keeps that name on a resume")
+        m_ = json.load(open(os.path.join(a, "metadata.json")))
+        json.dump(dict(m_, stored_account="another"), open(os.path.join(a, "metadata.json"), "w"))
+        keep = xs.st[("outputs", ba[len("outputs/"):])]
+        open(os.path.join(a, "report.md"), "w").write("A, resumed again")
+        ok(store_run_results(a, service=xs) != ba and xs.st[("outputs", ba[len("outputs/"):])] == keep,
+           "SN5 (Codex r1) a receipt from another storage account never authorizes an overwrite")
         os.environ.update(MA_RUN_LABEL="R1", MA_LAUNCH_ID="L9")
         made.append(create_run_dir("rd replicate question"))
         os.environ["MA_RUN_LABEL"] = "R2"
@@ -169,9 +179,13 @@ def _self_test_replicates(ok, outcome, rs, crash, raise_) -> None:
         for n in made:
             shutil.rmtree(os.path.join(REPO_ROOT, "runs", n), ignore_errors=True)
     # SC1-SC3: a crash and an interrupt record their status; a status the machine wrote is never replaced
+    def finished_then_crash():          # the machine wrote a terminal status in this invocation, then something raised
+        json.dump({"status": "amended_provisional"}, open(os.path.join(d, "metadata.json"), "w"))
+        crash()
     for before, fn, want in (({"status": "paused:awaiting_signoff"}, crash, "crashed"),
                              ({}, raise_(KeyboardInterrupt()), "interrupted"),
-                             ({"status": "amended_provisional"}, crash, "amended_provisional")):
+                             ({}, finished_then_crash, "amended_provisional"),
+                             ({"status": "crashed"}, raise_(KeyboardInterrupt()), "interrupted")):
         d = tempfile.mkdtemp(dir=root)
         json.dump(before, open(os.path.join(d, "metadata.json"), "w"))
         outcome(lambda: rs(fn, d, store=lambda rp: None))
@@ -1312,6 +1326,7 @@ def run_v2_and_store(run, run_path: str, store=None):
     code survive (ST3-ST5)."""
     store = store or store_run_results
     locked = None
+    status0 = _metadata_dict(os.path.join(run_path, "metadata.json")).get("status")   # an earlier invocation's
     try:
         return run()
     except BaseException as e:
@@ -1322,13 +1337,22 @@ def run_v2_and_store(run, run_path: str, store=None):
             locked = os.path.realpath(getattr(e, "run_dir", None) or run_path)
             raise
         try:
-            mp = os.path.join(run_path, "metadata.json")
+            where, s0 = run_path, status0
+            try:        # Codex r1 on #374: a run that handed over to its child crashed in the child, the chain's last
+                from agents import stage_machine as _sm
+                chain = _sm.handoff_chain(run_path)
+                where, s0 = (chain[-1], None) if chain else (run_path, status0)
+            except Exception:  # noqa: BLE001 -- no chain read: the run itself
+                pass
+            mp = os.path.join(where, "metadata.json")
             meta = _metadata_dict(mp)
             meta["crash"] = f"{type(e).__name__}: {e}"[:500]
-            # every exit records its status (baseline hb3 §4.2): a terminal status the machine wrote stands (a
-            # parent that handed over to its child, say); a pause this exception ended, or none, does not
-            if not meta.get("status") or str(meta["status"]).startswith("paused:"):
+            # every exit records its status (baseline hb3 §4.2): a terminal status this invocation's machine wrote
+            # stands; none, a pause, or an earlier invocation's status (a resume) is replaced
+            cur = meta.get("status")
+            if not cur or cur == s0 or str(cur).startswith("paused:"):
                 meta["status"] = "interrupted" if isinstance(e, KeyboardInterrupt) else "crashed"
+                meta["crashed_at"] = datetime.now().isoformat(timespec="seconds")
                 meta.pop("finished", None)
             os.makedirs(run_path, exist_ok=True)
             json.dump(meta, open(mp, "w"), indent=2)

@@ -41,6 +41,7 @@ REFUSED_PARTS = ("_truth", "evals_private")
 CENSOR_H = 24.0
 COMPLETES = ("completed", "completed_scope_declared")
 NOT_ACCEPTED = ("completed_gate_not_accepted", "completed_scope_declined", "completed_no_report")
+EXCEPTION_STATUSES = ("crashed", "interrupted")   # main.py records these, with crash and crashed_at, when a run raises
 SIGNED_BY_OWNER = "spec signed by owner"
 SCOPE_ANSWERED = "the owner answered the scope declarations"
 PAUSE_STATES = {"SIGN": "awaiting_signoff", "OWNER_DECISION": "awaiting_scope_signoff", "SPEC": "awaiting_spec_amendment"}
@@ -162,7 +163,8 @@ def completion(run) -> dict:
     if run["errors"]:
         return no("unreadable", "; ".join(run["errors"]))
     st, meta = run["st"], run["meta"]
-    status = st.get("status") or (f"paused:{st['paused']}" if st.get("paused") else None)
+    status = st.get("status") or (f"paused:{st['paused']}" if st.get("paused") else None) or \
+        (meta.get("status") if meta.get("status") in EXCEPTION_STATUSES else None)    # main.py: the run raised
     if not status:
         return no("no_status", "no terminal status or pause recorded by the cut-off")
     if st.get("status") and meta.get("status") != st["status"]:
@@ -301,6 +303,11 @@ def as_of(run_list, cut):
         for _, p, e, _ in live:
             if (p["at"] is None or p["at"] <= cut) and (e is None or e > cut):     # no time: kept (fail closed)
                 st.update(paused=p["reason"], status=None, state=p["state"] or st.get("state"))
+        if meta.get("status") in EXCEPTION_STATUSES and not keep(utc(meta.get("crashed_at"), off)):
+            meta["status"] = None                          # it raised after the cut-off (Codex r1 on #374)
+        # the pause record's agreement is of the files as they are: it says nothing about a pause at an earlier
+        # cut-off (Codex r1 on #374)
+        pm = r.get("pause_mismatch") if st.get("paused") == _d(r.get("st")).get("paused") else None
         so = _d(r.get("signoff"))
         so = so if keep(utc(so.get("signed_at") or so.get("at"))) else {}
         sc = {"answers": {f: a for f, a in _d(_d(r.get("scope")).get("answers")).items()
@@ -309,7 +316,7 @@ def as_of(run_list, cut):
                              if keep(utc(_d(a).get("at")))}}
         req = _d(r.get("scope_req"))
         req = req if keep(utc(req.get("answered_at"))) else {}
-        out.append(dict(r, st=st, meta=meta, signoff=so, scope=sc, geometry=geo, scope_req=req))
+        out.append(dict(r, st=st, meta=meta, signoff=so, scope=sc, geometry=geo, scope_req=req, pause_mismatch=pm))
     return out
 
 
@@ -732,6 +739,10 @@ def _self_test() -> int:
         r = summarise([mk("r_pz2", pz, {"status": "paused:awaiting_signoff"})])
         ok(r["status"]["value"] == "status_mismatch" and not r["completes"]["value"],
            f"HM18c run_state.json and metadata.json disagree on the pause: a mismatch ({r['status']})")
+        r = summarise([mk("r_crash", {"state": "ANALYZE", "status": None},
+                          {"status": "crashed", "crashed_at": local(0), "crash": "KeyError: x"})])
+        ok(r["status"]["value"] == "crashed" and r["class"] == "not_completed",
+           f"HM18d (Codex r1) a run main.py recorded as crashed counts as crashed, not as no status ({r['status']})")
         d, d2 = mk("r_dir", done), mk("r_dangle", done)
         os.makedirs(os.path.join(d, "report.md"))
         os.symlink(os.path.join(root, "nowhere"), os.path.join(d2, "report.md"))
