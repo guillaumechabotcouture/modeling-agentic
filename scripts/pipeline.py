@@ -1953,7 +1953,8 @@ def container_network() -> str:
 # What the fallback does not give, in one sentence wherever its kind is reported (owner, 2026-11-23).
 SANDBOX_LIMIT = ("It is enforced by the kernel for the whole process, native code included, but unlike bubblewrap "
                  "it gives the derivation no private process, mount or IPC namespace: other processes, and the names, "
-                 "sizes and dates of files outside its grants, stay visible to it; it cannot open those files or "
+                 "sizes, dates and changes of files outside its grants, stay observable to it (stat, access, "
+                 "readlink and inotify are not confined); it cannot open those files or "
                  "change their contents, permissions, owners, timestamps, extended attributes or inode flags, nor "
                  "signal, trace or connect to those processes, but reading a file can still update its access time, "
                  "so the ignored-column check is not proof against a script written to defeat it.")

@@ -4,8 +4,10 @@ in #368 as kind `landlock-seccomp`; docs/design/v2-derived-inputs.md §7). The l
 the script runs:
 
   no_new_privs, then Landlock: reads only beneath the granted read-only roots, writes only in the granted
-  directories and only of regular files and directories; every other path, the run directory included, is refused
-  whatever name reaches it (ABI 2+: no cross-directory rename or link; 4+: no TCP; 6+: no outside signals), then
+  directories and only of regular files and directories; opening, listing or writing any other path, the run
+  directory included, is refused whatever name reaches it (ABI 2+: no cross-directory rename or link; 4+: no TCP;
+  6+: no outside signals). Landlock does not cover stat, access, readlink or inotify watches: names, sizes, dates
+  and changes of files outside the grants stay observable. Then
   seccomp-bpf: DENY below, ioctl only for IOCTL_ALLOW, clone only for threads (clone3 answers ENOSYS),
   prlimit64 only to read, kill and tgkill only to itself; a foreign architecture or the x32 ABI kills the process.
 
@@ -46,7 +48,9 @@ NR = {
                    io_uring_register=427, kill=62, tkill=200, tgkill=234, rt_sigqueueinfo=129,
                    rt_tgsigqueueinfo=297, pidfd_send_signal=424, pidfd_open=434, pidfd_getfd=438, add_key=248,
                    request_key=249, keyctl=250, open_tree=428, move_mount=429, fsopen=430, fsconfig=431,
-                   fsmount=432, fspick=433, mount_setattr=442, kcmp=312, fcntl=72, ioctl=16, chmod=90, fchmod=91,
+                   fsmount=432, fspick=433, mount_setattr=442, kcmp=312, setpriority=141, sched_setparam=142,
+                   sched_setscheduler=144, sched_setaffinity=203, ioprio_set=251, sched_setattr=314, fcntl=72,
+                   ioctl=16, chmod=90, fchmod=91,
                    chown=92, fchown=93, lchown=94, utime=132, utimes=235, fchownat=260, futimesat=261, fchmodat=268,
                    utimensat=280, fchmodat2=452, semtimedop=220),
     "aarch64": dict(seccomp=277, socket=198, socketpair=199, clone=220, clone3=435, execve=221, execveat=281,
@@ -56,6 +60,8 @@ NR = {
                     tkill=130, tgkill=131, rt_sigqueueinfo=138, rt_tgsigqueueinfo=240, pidfd_send_signal=424,
                     pidfd_open=434, pidfd_getfd=438, add_key=217, request_key=218, keyctl=219, open_tree=428,
                     move_mount=429, fsopen=430, fsconfig=431, fsmount=432, fspick=433, mount_setattr=442, kcmp=272,
+                    setpriority=140, sched_setparam=118, sched_setscheduler=119, sched_setaffinity=122, ioprio_set=30,
+                    sched_setattr=274,
                     fcntl=25, ioctl=29, fchmod=52, fchmodat=53, fchownat=54, fchown=55, utimensat=88, fchmodat2=452)}
 # contiguous ranges refused: xattr writes and removals, SysV IPC and POSIX message queues
 RANGES = {"x86_64": ((188, 190), (197, 199), (29, 31), (64, 71), (240, 245)),
@@ -66,7 +72,9 @@ DENY = ("socket", "socketpair", "fork", "vfork", "execve", "execveat", "ptrace",
         "rt_sigqueueinfo", "rt_tgsigqueueinfo", "pidfd_send_signal", "pidfd_open", "pidfd_getfd", "add_key",
         "request_key", "keyctl", "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount", "fspick",
         "mount_setattr", "kcmp", "chmod", "fchmod", "fchmodat", "fchmodat2", "chown", "fchown", "lchown",
-        "fchownat", "utime", "utimes", "utimensat", "futimesat", "semtimedop")
+        "fchownat", "utime", "utimes", "utimensat", "futimesat", "semtimedop",
+        # no renice, pinning or I/O priority of other processes of the same uid (review of #383)
+        "setpriority", "sched_setparam", "sched_setscheduler", "sched_setaffinity", "sched_setattr", "ioprio_set")
 # Landlock
 LL_CREATE_RULESET, LL_ADD_RULE, LL_RESTRICT_SELF = 444, 445, 446
 LL_RULE_PATH_BENEATH, LL_VERSION = 1, 1
@@ -175,13 +183,17 @@ def single_thread(tasks: str = "/proc/self/task") -> None:
         raise OSError(EPERM, f"{n} threads before Landlock: confinement would miss the others")
 
 
-def drop_capabilities(libc) -> None:
-    """Empty every capability set: ambient, bounding (needs CAP_SETPCAP: a process without it has none to lose,
-    and exec is refused anyway), then effective, permitted and inheritable. Checked with capget."""
-    libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+def drop_bounding(libc) -> None:
+    """Empty the bounding set, while CAP_SETPCAP is still held (before drop_root, which loses it). Without it the
+    first drop fails with EPERM and the set stays: harmless only because exec is refused."""
     for cap in range(64):
         if libc.prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) < 0:
             break                       # EINVAL past the last capability, EPERM without CAP_SETPCAP
+
+
+def drop_capabilities(libc) -> None:
+    """Empty the ambient set, then the effective, permitted and inheritable sets. Checked with capget."""
+    libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
     hdr, data = (ctypes.c_uint32 * 2)(CAP_V3, 0), (ctypes.c_uint32 * 6)()
     _check(libc.capset(hdr, data), "capset")
     _check(libc.capget(hdr, data), "capget")
@@ -204,7 +216,7 @@ def install_seccomp(libc, arch: str, pid: int) -> None:
 def drop_root(uid: int | None) -> None:
     """As root, become `uid` (and gid `uid`, no supplementary groups) for good; the caller made the work and output
     directories this uid's. Root without a uid to switch to is refused: it would own every root file and process."""
-    if os.geteuid() != 0:
+    if 0 not in os.getresuid():         # a saved or real uid 0 could be taken back
         return
     if not uid:
         raise OSError(EPERM, "running as root with no unprivileged uid to switch to")
@@ -229,6 +241,7 @@ def apply(ro: list[str], rw: list[str], rw_files: list[str] = (), ro_files: list
         raise OSError(EPERM, f"Landlock ABI {abi} (at least {LANDLOCK_MIN_ABI}, Linux 6.2, is needed: truncation)")
     single_thread()
     libc = _libc()
+    drop_bounding(libc)
     drop_root(uid)
     drop_capabilities(libc)
     _check(libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "prctl(PR_SET_NO_NEW_PRIVS)")
@@ -295,6 +308,11 @@ def _self_test() -> int:
                  ("ioctl TCGETS (allowed)", n["ioctl"], (1, 0x5401, 0), allow),
                  ("ioctl FIONCLEX (allowed)", n["ioctl"], (1, 0x5450, 0), allow),
                  ("ioctl FIOCLEX (allowed)", n["ioctl"], (1, 0x5451, 0), allow),
+                 ("setpriority", n["setpriority"], (0, 0, 19), perm),
+                 ("sched_setaffinity", n["sched_setaffinity"], (1, 8, 0), perm),
+                 ("sched_setscheduler", n["sched_setscheduler"], (1, 0, 0), perm),
+                 ("sched_setattr", n["sched_setattr"], (1, 0, 0), perm),
+                 ("ioprio_set", n["ioprio_set"], (1, 1, 0), perm),
                  ("fchmodat", n["fchmodat"], (), perm), ("fchownat", n["fchownat"], (), perm),
                  ("utimensat", n["utimensat"], (), perm), ("fchmodat2", n["fchmodat2"], (), perm),
                  ("a syscall newer than the review (467)", 467, (), RET_ERRNO | ENOSYS)]
@@ -347,17 +365,25 @@ def _self_test() -> int:
                 apply([sys.prefix], [], uid=DERIVATION_UID)
                 hdr, data = (ctypes.c_uint32 * 2)(CAP_V3, 0), (ctypes.c_uint32 * 6)()
                 _libc().capget(hdr, data)
-                os._exit(0 if not any(data) and os.geteuid() != 0 and os.getegid() != 0 else 9)
+                bset = _libc().prctl(23, 0, 0, 0, 0)        # PR_CAPBSET_READ of CAP_CHOWN
+                os._exit(0 if not any(data) and 0 not in os.getresuid() and 0 not in os.getresgid()
+                         and (bset == 0 or not was_root) else 9)
             except BaseException:  # noqa: BLE001
                 os._exit(8)
         ok(os.waitpid(pid, 0)[1] == 0, "KS6 apply leaves no effective, permitted or inheritable capability, and "
            f"no root uid or gid ({'run as root: switched to' if was_root else 'not root: kept'} its uid)")
     try:
-        with mock.patch("os.geteuid", lambda: 0):
+        with mock.patch("os.getresuid", lambda: (0, 0, 0)):
             drop_root(None)
         ok(False, "KS9 root with no uid to switch to is refused")
     except OSError:
         ok(True, "KS9 root with no uid to switch to is refused")
+    try:
+        with mock.patch("os.getresuid", lambda: (1000, 1000, 0)):
+            drop_root(None)
+        ok(False, "KS9b a saved uid 0 counts as root (getresuid, not geteuid)")
+    except OSError:
+        ok(True, "KS9b a saved uid 0 counts as root (getresuid, not geteuid)")
     if not sys.platform.startswith("linux"):
         try:
             apply([], [])

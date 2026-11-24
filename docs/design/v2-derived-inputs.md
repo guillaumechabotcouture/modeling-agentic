@@ -334,7 +334,8 @@ reason is given.
 
   **What it does not give.**
   - **No private namespace.** There is no private process, mount or IPC namespace. Other
-    processes, and the names, sizes and dates of files outside the grants, stay visible.
+    processes stay visible. The names, sizes, dates and changes of files outside the grants stay
+    observable, because Landlock does not cover stat, access, readlink or inotify.
   - **Access times leak.** Reading a file can update its access time, which a script can read back
     in a later run. That is a low-bandwidth channel bubblewrap does not close either (review N-2).
     So under this fallback, a passing `ignored_column_used` check is evidence against a mistaken
@@ -358,8 +359,8 @@ reason is given.
   | writes only where declared | `/` read-only, one writable bind | Landlock (ABI 3+, truncation included): only in the outputs' directories, regular files and directories only; seccomp: no chmod, chown, utime, xattr writes or inode-flag ioctls anywhere; inputs are read-only copies, hash-checked |
   | state shared across runs | IPC namespace | seccomp: no SysV IPC or POSIX message queues; access times still update (see above) |
   | system files readable | all of `/`, read-only | the interpreter's own directories, the system library directories, zoneinfo, locale data and five `/etc` files |
-  | the run directory hidden | an empty tmpfs over it | Landlock: not granted, so refused by any name (procfs aliases and other work directories included) |
-  | other processes | not visible | visible by name; no kill, tgkill, F_SETOWN/F_SETSIG (SIGIO), ptrace or memory access |
+  | the run directory hidden | an empty tmpfs over it | its contents: Landlock refuses opening, listing and writing it by any name (procfs aliases and other work directories included); its file names, sizes, dates and changes stay observable (stat, access, readlink and inotify are not confined) |
+  | other processes | not visible | visible by name; no kill, tgkill, F_SETOWN/F_SETSIG (SIGIO), ptrace, memory access, renice, CPU pinning or I/O priority |
   | syscalls newer than the review | n/a | answered ENOSYS (above number 462) |
   | resource caps | set | set, and cannot be raised (seccomp) |
   | native code, ctypes, a second interpreter | held by the kernel | held by the kernel |
