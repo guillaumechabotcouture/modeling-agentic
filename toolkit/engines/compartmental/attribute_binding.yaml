@@ -67,8 +67,17 @@ attribute_binding:
         relative to the declared value (0.91 / 0.85, about 1.07), gives 1.1.
       applicability: >-
         Before copying the range, check its assumptions against the question: the reported coverage level, the
-        declared seroconversion, the pathogen and the setting's income group (Dolan and MacNeil: gaps of 27-34 points
-        in low-income and 8-15 in upper-middle-income countries). Recompute both ends when they differ, and cite a
-        local survey-versus-administrative comparison when one exists. A question that states the gap overrides it.
+        declared seroconversion, the pathogen, the setting's income group (Dolan and MacNeil: gaps of 27-34 points
+        in low-income and 8-15 in upper-middle-income countries), and the direction of the survey-versus-administrative
+        gap in every unit. The [0.5, 1.1] range assumes administrative over-reporting (effective coverage at most
+        min(1, 1.1 * reported_coverage)): where scaling up reported coverage before clipping at 1 can raise predicted
+        immunity toward observed survey positivity (reported coverage below 1/1.1 ≈ 0.91) and any unit's survey
+        positivity approaches or exceeds what 1.1 allows, widen the upper bound (up to at most 1 / min_reported_coverage
+        where coverage_scale remains identifiable) so the prior cap does not clip the survey fit. When reported
+        coverage is already near 1 and survey positivity still exceeds the saturated vaccine-only ceiling (effective
+        coverage 1 times declared seroconversion), widening coverage_scale adds no new predictions and the excess
+        points instead to higher field seroconversion, prior natural infection, or assay bias. Recompute both ends
+        when assumptions differ, and cite a local survey-versus-administrative comparison when one exists. A question
+        that states the gap overrides it.
       verified: "read 2026-11-06: Dolan and MacNeil from the PMC author manuscript (results text); Lim, Murray and
         Uzicanin from their abstracts (Europe PMC)"

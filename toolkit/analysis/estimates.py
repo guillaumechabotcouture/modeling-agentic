@@ -458,24 +458,35 @@ def _decision(dec, v: np.ndarray) -> dict:
 
 def _sample(P: C.Problem, seed: int) -> dict:
     """The canonical sample; problems evaluated with run_batch() use importance sampling up to the
-    run_batch dimension threshold (as calibration.posterior does)."""
-    mip = C.thresholds()["max_importance_params_run_batch"]
+    run_batch dimension threshold (as calibration.posterior does), and mode-started per-chain adaptive
+    Metropolis (toolkit/analysis/mode_start.py) above it or when importance sampling falls below its ESS floor."""
+    from toolkit.analysis import mode_start as MS
+    mip = int(C.thresholds()["max_importance_params_run_batch"])
     refused = []
-    # the calibration defaults, then once with the larger budget of thresholds.yaml estimates.importance_retry (a
-    # curved ridge can leave importance sampling below its ESS floor), then adaptive Metropolis (its own floors:
-    # R-hat and bulk ESS). Every stage fails closed; the floors are never lowered.
-    for over in ({}, thresholds()["importance_retry"], {"max_importance_params": 0}):
-        try:
-            out = C.sample(P, seed=int(seed), **dict({"max_importance_params": mip}, **over))
-        except C.CalibrationRefused as e:
-            if e.code not in ("posterior_ess", "posterior_mcmc"):
-                raise
-            refused.append(str(e))
-            continue
-        if refused:
-            out["diagnostics"] = dict(out["diagnostics"], earlier_attempts_refused=refused)
-        return out
-    raise C.CalibrationRefused("posterior_ess", "; ".join(refused))
+    # Up to the importance threshold, try calibration defaults then thresholds.yaml estimates.importance_retry
+    # (a curved ridge can leave importance sampling below its ESS floor); above the threshold or after ESS
+    # refusals, run mode-started per-chain adaptive Metropolis once (which handles its own single retry).
+    if len(P.names) <= mip:
+        for over in ({}, thresholds()["importance_retry"]):
+            try:
+                out = C.sample(P, seed=int(seed), **dict({"max_importance_params": mip}, **over))
+            except C.CalibrationRefused as e:
+                if e.code not in ("posterior_ess", "posterior_mcmc"):
+                    raise
+                refused.append(str(e))
+                continue
+            if refused:
+                out["diagnostics"] = dict(out["diagnostics"], earlier_attempts_refused=refused)
+            return out
+    try:
+        out = MS.sample(P, seed=int(seed), max_importance_params=0)
+    except C.CalibrationRefused as e:
+        if refused and e.code in ("posterior_ess", "posterior_mcmc"):
+            raise C.CalibrationRefused(e.code, "; ".join(refused + [str(e)])) from e
+        raise
+    if refused:
+        out["diagnostics"] = dict(out["diagnostics"], earlier_attempts_refused=refused)
+    return out
 
 
 def _rows_dict(names, rows):
@@ -711,6 +722,7 @@ def _merge_classes(fits: list[dict], contrib: list[int], shared_names: list[str]
     cl_map = {}
     for i in contrib:
         cl_map[i] = C.classify(fits[i]["P"], fits[i]["s"])
+        fits[i]["cls"] = cl_map[i]
         refusal_guard(fits[i]["E"], f"the identifiability classes (variant {fits[i]['v']['id']})")
     extra_names = sorted({n for i in contrib for n in fits[i]["P"].names if n not in shared_names})
     all_names = list(shared_names) + extra_names
@@ -884,6 +896,16 @@ def _analyse_pooled(spec, eng, variants, weighting, validation, seed, n_draws, p
             sample_counts[i], sample_counts[j] = sample_counts[i] + 1, sample_counts[j] - 1
     contrib = [i for i, c in enumerate(draw_counts) if c > 0]
     merged_cls, P_merged = _merge_classes(fits, contrib, shared_names)
+    from toolkit.analysis import mode_start as MS
+    bound_set = set()
+    for i in contrib:
+        if i == ref_idx:
+            xh_i = xh
+        else:
+            xh_i, _, _ = C._map_point(fits[i]["P"], fits[i]["s"]["best"])
+            refusal_guard(fits[i]["E"], f"the posterior mode (variant {v_ids[i]})")
+        bound_set.update(MS.near_bounds(fits[i]["P"], xh_i, classes=fits[i]["cls"]["classes"]))
+    at_bound = [n for n in P_merged.names if n in bound_set]
     blocks, offsets, canon_rows, variant_samples, cur = [], [], [], {}, 0
     for i, mv in enumerate(sample_counts):
         offsets.append(cur)
@@ -969,7 +991,7 @@ def _analyse_pooled(spec, eng, variants, weighting, validation, seed, n_draws, p
     post = {n: {"median": float(np.median(pooled_rows[:, j])), "interval": C.interval(pooled_rows[:, j], lvl),
                 "prior": P_merged.priors[n].describe()} for j, n in enumerate(shared_names)}
     return {"E": E_ref, "P": P_merged, "sample": pooled_sample, "variant_samples": variant_samples, "classes": merged_cls,
-            "map": dict(zip(P_ref.names, (float(v) for v in xh))),
+            "map": dict(zip(P_ref.names, (float(v) for v in xh))), "at_bound": at_bound,
             "converged": conv, "message": msg, "validation": validation, "draws": dr, "values": vals, "level": lvl,
             "determined": determined, "decision": decision, "tests": tests, "ppc": ppc, "rt": rt, "posterior": post,
             "seed": seed, "structural_variants": sv_rows, "structural_weighting": actual_weighting,
@@ -1022,7 +1044,9 @@ def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=Tr
     ppc, rt = _ppc_rt(yrep, outs, E, lvl)
     post = {n: {"median": float(np.median(smp["rows"][:, j])), "interval": C.interval(smp["rows"][:, j], lvl),
                 "prior": P.priors[n].describe()} for j, n in enumerate(smp["names"])}
+    from toolkit.analysis import mode_start as MS
     return {"E": E, "P": P, "sample": s, "classes": cls, "map": dict(zip(P.names, (float(v) for v in xh))),
+            "at_bound": MS.near_bounds(P, xh, classes=cls["classes"]),
             "converged": conv, "message": msg, "validation": validation, "draws": dr, "values": vals, "level": lvl,
             "determined": determined,
             "decision": decision, "tests": tests, "ppc": ppc, "rt": rt, "posterior": post, "seed": seed}
@@ -1250,7 +1274,8 @@ def run(run_dir, spec, S, eng, arts: dict, data_in: list, eng_files: list, draws
     cal = {"method": "posterior", "units": {}, "names": list(s["names"]),
            "diagnostics": dict({"converged": res["converged"], "message": res["message"],
                                 "n_targets": int(len(res["E"].target["y"])), "n_parameters": len(s["names"]),
-                                "sampler": s["method"], "at_bound": []}, **s["diagnostics"]),
+                                "sampler": s["method"], "at_bound": list(res.get("at_bound") or [])},
+                               **s["diagnostics"]),
            "identifiability": {"method": cls["method"], "classes": cls["classes"],
                                "likelihood_classes": cls["likelihood_classes"], "contraction": cls["contraction"],
                                "ridges": cls["ridges"],
@@ -1596,6 +1621,32 @@ def _self_test_structural(ok, rows) -> None:
        and abs(sum(x["weight"] for x in sv_eq) - 1.0) < 1e-9
        and abs(med1 - med2) < 1e-12 and res_eq1["decision"]["verdict"] == res_eq2["decision"]["verdict"],
        f"AE29 equal weighting, unverified fallback, and pool-order symmetry ({med1:.4f} vs {med2:.4f})")
+    # AE30: above max_importance_params_run_batch, _sample runs mode-started Metropolis once (no 3x prior-start retry)
+    from toolkit.analysis import mode_start as MS
+    d_hi = int(C.thresholds()["max_importance_params_run_batch"]) + 1
+    Phi, mu_hi = MS._toy(d=d_hi, s=1e-3, mu=np.linspace(0.25, 0.75, d_hi))
+    shi = _sample(Phi, seed=0)
+    dg_hi = shi.get("diagnostics") or {}
+    ok(shi.get("method") == "adaptive_metropolis" and dg_hi.get("start") == "posterior_mode"
+       and "earlier_attempts_refused" not in dg_hi
+       and np.allclose(np.mean(shi["rows"], axis=0), mu_hi, atol=5e-3),
+       f"AE30 _sample uses mode-start Metropolis cleanly above max_importance_params_run_batch ({dg_hi})")
+    # AE31: pooled at_bound checks each contributing variant against its own fitted prior range and mode
+    P_v1 = C.Problem(["transmissibility:1"],
+                     {"transmissibility:1": C.Prior.from_decl("transmissibility:1",
+                                                              {"dist": "uniform", "range": [0.5, 1.0], "source": "toy"})},
+                     lambda X: (np.zeros(len(X["transmissibility:1"])), {}))
+    P_v2 = C.Problem(["transmissibility:1", "transmissibility:2"],
+                     {"transmissibility:1": C.Prior.from_decl("transmissibility:1",
+                                                              {"dist": "uniform", "range": [0.5, 2.0], "source": "toy"}),
+                      "transmissibility:2": C.Prior.from_decl("transmissibility:2",
+                                                              {"dist": "uniform", "range": [0.5, 1.0], "source": "toy"})},
+                     lambda X: (np.zeros(len(X["transmissibility:1"])), {}))
+    ab_v1 = MS.near_bounds(P_v1, {"transmissibility:1": 0.997}, classes={"transmissibility:1": "identified"})
+    ab_v2 = MS.near_bounds(P_v2, {"transmissibility:1": 0.997, "transmissibility:2": 0.502},
+                           classes={"transmissibility:1": "identified", "transmissibility:2": "identified"})
+    ok(ab_v1 == ["transmissibility:1"] and ab_v2 == ["transmissibility:2"],
+       f"AE31 per-variant near_bounds catches both tight-prior reference and variant-only hits ({ab_v1}, {ab_v2})")
 
 
 def _self_test() -> int:
