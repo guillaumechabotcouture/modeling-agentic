@@ -1474,7 +1474,9 @@ def request_owner_amendments(run_dir: str, round_n: int, ledger: dict, ids: list
             from toolkit.analysis import conflicts as CF
             opts = {"options": CF.options(run_dir, getattr(f, "key", "")),
                     "conflict": CF.verdict(run_dir, getattr(f, "key", ""))}     # Codex r4 of #316: the structured verdict
-        items.append({"finding": fid, "kind": getattr(f, "kind", None), "claim": claim, "fix_requires": fix, **opts,
+        items.append({"finding": fid, "kind": getattr(f, "kind", None) or FL.CRITIC_KIND,
+                      "severity": getattr(f, "severity", None), "source": getattr(f, "source", None),
+                      "claim": claim, "fix_requires": fix, **opts,
                       "reason": ("a held-out calibration target's automatic decision test changes the plan or could "
                                  "not run (conflicts.policy declare_and_test)") if conflict else
                       "its required remedy is an owner amendment of the signed decision spec",
@@ -1871,6 +1873,12 @@ class Machine:
                 la = None
             if isinstance(la, dict) and la.get("status") == "refused":
                 why = f"{why}; the lead amendment was refused: {la.get('why')}".lstrip("; ")
+        if self.st.paused == "awaiting_scope_signoff":
+            ent_idx = max((idx for idx, x in enumerate(h) if x.get("to") == "OWNER_DECISION"), default=-1)
+            ref_idx = max((idx for idx, x in enumerate(h)
+                           if x.get("state") == "OWNER_DECISION" and x.get("lead_refused_provisional")), default=-1)
+            if ref_idx >= ent_idx and ref_idx >= 0 and h[ref_idx].get("why"):
+                why = f"{why}; {h[ref_idx]['why']}".lstrip("; ")
         return str(why or f"paused at {self.st.state}")[:1000]
 
     def _write_meta(self, drop=(), **fields) -> None:
@@ -2877,11 +2885,25 @@ class Machine:
                 return self._go("FINAL", "the owner request cannot be read, so the lead cannot answer it: relaunch with "
                                          "reuse", "run_failed")
             todo = [items[fp] for fp in want if not done(fp)]
-            SS.provisional_answers(self.run_dir, todo, self.st.round,
-                                   plan_changing={i["fingerprint"]: _plan_changing(i) for i in todo})
-            self.st.history.append({"at": _now(), "provisional": [i.get("finding") for i in todo], "by": "lead",
-                                    "state": "OWNER_DECISION"})
-            answers, bad = SS.load_answers(self.run_dir)
+            led = FL.load(self.run_dir)
+            allow = [i for i in todo if _lead_may_accept(i, led)]
+            blocked = [i for i in todo if not _lead_may_accept(i, led)]
+            if allow:
+                SS.provisional_answers(self.run_dir, allow, self.st.round,
+                                       plan_changing={i["fingerprint"]: _plan_changing(i) for i in allow})
+                self.st.history.append({"at": _now(), "provisional": [i.get("finding") for i in allow], "by": "lead",
+                                        "state": "OWNER_DECISION"})
+                answers, bad = SS.load_answers(self.run_dir)
+            if blocked:
+                b_ids = [str(i.get("finding")) for i in blocked]
+                last = self.st.history[-1] if self.st.history else {}
+                if not (last.get("state") == "OWNER_DECISION" and last.get("lead_refused_provisional") == b_ids
+                        and last.get("round") == self.st.round):
+                    self.st.history.append({
+                        "at": _now(), "lead_refused_provisional": b_ids, "round": self.st.round,
+                        "why": f"owner policy: the lead may not provisionally accept open critic HIGH finding(s) "
+                               f"{', '.join(b_ids)}",
+                        "state": "OWNER_DECISION"})
         answered = bool(want) and not bad and all(done(fp) for fp in want)
         if answered:
             SS.harness_record(self.run_dir)
@@ -3361,6 +3383,22 @@ def _status_line(run_dir: str, status: str | None) -> str:
         lines = {}
     text = lines.get(status) or (lines.get("pending") if status == "pending" else lines.get("other")) or "not accepted"
     return f"{STATUS_MARK}\n**Run status: {text}.** (`{status}`; rendered by the harness)\n\n"
+
+
+def _lead_may_accept(item: dict, ledger: dict | None = None) -> bool:
+    """Owner policy (2026-11-24): under --signoff lead, the lead may provisionally accept harness-known
+    decision-test / conflict / departure items and non-HIGH findings, never an open critic HIGH finding.
+    Fails closed when a critic finding has missing severity."""
+    fid = item.get("finding")
+    f = (ledger or {}).get(fid) if fid else None
+    kind = item.get("kind") or (getattr(f, "kind", None) if f is not None else None)
+    src = item.get("source") or (getattr(f, "source", None) if f is not None else None)
+    sev = item.get("severity") if item.get("severity") is not None else (
+        getattr(f, "severity", None) if f is not None else None)
+    is_critic = (kind == FL.CRITIC_KIND) or (isinstance(src, str) and src.startswith("critique-"))
+    if is_critic:
+        return sev is not None and str(sev).upper() != "HIGH"
+    return True
 
 
 def _plan_changing(item: dict) -> bool:

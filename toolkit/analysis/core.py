@@ -114,10 +114,13 @@ def best_known(A, sol, plan, ben, cost, budget=None, feas=None) -> dict:
         # what the point plan adds, from per-unit differences: sums of two large objectives would round it away
         more = float(sum(ben[i][plan[i]] - ben[i][sol["choice"][i]] for i in A.ids))
         spent = float(sum(cost[i][plan[i]] for i in A.ids))
+        exact = bool(getattr(A, "budget_exact", False))
         # feasible by the allocator's check, by the rule compare() rows report, and within the solver's own budget
         # tolerance (the check allows more rounding than the solver does: Codex narrow round P1-1)
-        fits = (not aopt.check(plan, ben, cost, f, budget) and not MV.infeasible_reasons(A.ids, plan, cost, f, budget)
-                and spent <= float(budget) * (1 + aopt.BUDGET_RTOL))
+        fits = (not aopt.check(plan, ben, cost, f, budget, budget_exact=exact)
+                and not MV.infeasible_reasons(A.ids, plan, cost, f, budget, budget_exact=exact)
+                and spent <= float(budget) * (1 + aopt.BUDGET_RTOL)
+                and (not exact or spent >= float(budget) * (1 - aopt.BUDGET_RTOL)))
     except (KeyError, TypeError, ValueError):
         more, fits = 0.0, False
     if fits and more > 0:
@@ -127,7 +130,7 @@ def best_known(A, sol, plan, ben, cost, budget=None, feas=None) -> dict:
     return out
 
 
-def _problem_key(ben, cost, feas, budget):
+def _problem_key(ben, cost, feas, budget, budget_exact: bool = False):
     """A hash of one solve's inputs, or None (then nothing is kept) when they cannot be serialised or a unit or
     package id is not text (the encoding writes ids as text, so 1 and "1" would share a key: Codex r1 P1-6) or a table
     value or the budget is not a number."""
@@ -139,7 +142,7 @@ def _problem_key(ben, cost, feas, budget):
     try:
         tabs = [sorted((str(u), sorted((str(k), float(x)) for k, x in r.items())) for u, r in t.items())
                 for t in (ben, cost)]
-        rest = json.dumps([float(budget), feas], sort_keys=True,
+        rest = json.dumps([float(budget), bool(budget_exact), feas], sort_keys=True,
                           default=lambda o: sorted(map(str, o)) if isinstance(o, (set, frozenset)) else str(o))
         return hashlib.sha256((json.dumps(tabs) + rest).encode()).hexdigest()
     except (TypeError, ValueError):
@@ -161,6 +164,7 @@ class Analysis:
         self.alloc = spec.alloc_spec()
         self.feas = apackages.feasibility(self.alloc, spec.units())
         self.budget = spec.budget()
+        self.budget_exact = bool((spec.raw.get("constraints") or {}).get("envelope_exact", False))
         self.region = spec["decision_units"].get("region")
         self.fr = fitted_ranges(self.eng)
         from toolkit.spec import priors as PRI
@@ -314,7 +318,7 @@ class Analysis:
         if hits:
             raise AnalysisBlocked(where, hits)
 
-    def solve(self, ben, cost, budget=None, feas=None):
+    def solve(self, ben, cost, budget=None, feas=None, budget_exact=None):
         """One plan from toolkit/alloc at the settings of thresholds.yaml `optimizer` (decision D3). A headline solve
         (the point plan, the reserve search, a rebuild) must be proven optimal within `gap_rel`. Inside
         `auxiliary(A, kind)` a solve that stopped early is also used when its proven gap is at most `aux_gap_max`, and
@@ -324,17 +328,18 @@ class Analysis:
         st = solver_settings()
         if budget is None:
             budget = self.budget if self.plan_budget is None else self.plan_budget
+        exact = bool(getattr(self, "budget_exact", False)) if budget_exact is None else bool(budget_exact)
         f = feas or self.feas
         kind = getattr(self, "aux", None)
         log = self.__dict__.setdefault("solver_log", {}).setdefault(
             kind or "headline", {"solves": 0, "feasible_accepted": 0, "max_gap": 0.0, "not_solved": 0})
-        memo, key = self.__dict__.setdefault("solve_memo", {}), _problem_key(ben, cost, f, budget)
+        memo, key = self.__dict__.setdefault("solve_memo", {}), _problem_key(ben, cost, f, budget, budget_exact=exact)
         if key in memo and (kind or memo[key][1]["status"] == "optimal"):
             ch, meta = memo[key]
             return dict(meta, choice=dict(zip(self.ids, ch)))
         nt = min(int(st["threads"]), os.cpu_count() or 1) if len(ben) >= int(st["threads_min_units"]) else 1
         r = aopt.solve(ben, cost, f, budget, method="ilp", time_limit=float(st["time_limit_s"]),
-                       gap_rel=float(st["gap_rel"]), threads=nt)
+                       gap_rel=float(st["gap_rel"]), threads=nt, **({"budget_exact": True} if exact else {}))
         r["time_limit_s"] = float(st["time_limit_s"])
         log["solves"] += 1
         gap = r.get("gap")

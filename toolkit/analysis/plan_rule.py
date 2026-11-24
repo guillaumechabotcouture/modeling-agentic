@@ -104,6 +104,19 @@ def expected_value_plan(A, rows, point_plan: dict, cost0, point_events=()) -> di
     if pp_hits:
         rec["point_plan_mean_benefit_not_computed"] = (f"model corrections bear on the point-value plan in {len(pp_hits)} "
                                                        f"draws (e.g. draw {pp_hits[0]})")
+    bg = (((getattr(A, "spec", None) and getattr(A.spec, "raw", None)) or {}).get("deliverable") or {}).get("by_group")
+    if isinstance(bg, dict) and isinstance(bg.get("quantity"), dict):
+        qmap = bg["quantity"]
+        rec["per_unit_group_mean"] = {
+            i: {g: {o: float(np.mean([
+                float(r["out"][i]["y_group"][A.comp][o].get(g, 0.0))
+                - float(r["out"][i]["y_group"][plan[i]][o].get(g, 0.0))
+                for r in rows])) for o in A.outcomes} for g in qmap}
+            for i in A.ids}
+        rec["per_unit_group_quantity"] = {
+            i: {g: float(np.mean([float(r["out"][i]["cost"][plan[i]][qname]) for r in rows]))
+                for g, qname in qmap.items()}
+            for i in A.ids}
     return {"solution": sol, "record": rec}
 
 
@@ -132,18 +145,33 @@ def reference_findings(point, dt_payload) -> list[str]:
 
 
 def _contract_findings(raw: dict, point, unc) -> list[str]:
+    import math
     want = rule(raw)
     if want not in RULES:
         return [f"deliverable.plan {want!r} is not one of {RULES}"]
     if not isinstance(point, dict):
         return ["point.yaml is unreadable, so the plan rule cannot be checked"]
+    exact = bool(((raw or {}).get("constraints") or {}).get("envelope_exact"))
+
+    def _exact_findings() -> list[str]:
+        if not exact:
+            return []
+        try:
+            ca, ba = float(point["cost_allocated"]), float(point["budget_allocatable"])
+            if not (math.isfinite(ca) and math.isfinite(ba)) or abs(ca - ba) > 1e-6 * max(1.0, abs(ba)):
+                return [f"constraints.envelope_exact is true, but cost_allocated ({ca:g}) differs from "
+                        f"budget_allocatable ({ba:g})"]
+        except (KeyError, TypeError, ValueError):
+            return ["constraints.envelope_exact is true, but point.yaml has no finite cost_allocated and "
+                    "budget_allocatable"]
+        return []
+
     pr = point.get("plan_rule")
     if want == "point":
-        return [] if pr is None else ["point.yaml records a plan rule the spec does not ask for"]
+        return ([] if pr is None else ["point.yaml records a plan rule the spec does not ask for"]) + _exact_findings()
     if not isinstance(pr, dict) or pr.get("rule") != "expected_value":
         return ["the spec asks for deliverable.plan: expected_value and point.yaml records no expected-value plan "
                 "(a run by code that ignores the key?)"]
-    import math
     bad = []
     hl = ((raw.get("deliverable") or {}).get("headline") or {}).get("outcome")
     pu, plan, pp = point.get("per_unit"), point.get("plan"), pr.get("point_plan")
@@ -167,6 +195,7 @@ def _contract_findings(raw: dict, point, unc) -> list[str]:
                        "at the point values (a record from another rule?)")
     except (KeyError, TypeError, ValueError):
         bad.append("point.yaml has no cost_allocated or budget_allocatable to check the plan rule's point cost")
+    bad += _exact_findings()
     if not (isinstance(plan, dict) and isinstance(pp, dict) and set(pp) == set(plan)):
         bad.append("plan_rule.point_plan does not name the delivered plan's units (the decision tests' reference plan)")
     elif not isinstance(pr.get("units_differ"), list) or sorted(map(str, pr["units_differ"])) != sorted(str(i) for i in plan if plan[i] != pp[i]) \
@@ -174,6 +203,24 @@ def _contract_findings(raw: dict, point, unc) -> list[str]:
         bad.append("plan_rule.units_differ does not match the delivered and point-value plans")
     if isinstance(unc, dict) and pr.get("draws") != unc.get("draws"):
         bad.append("the expected-value plan was solved over a different number of draws than the uncertainty step's")
+    bg = (raw.get("deliverable") or {}).get("by_group") if isinstance(raw.get("deliverable"), dict) else None
+    if isinstance(bg, dict) and isinstance(bg.get("quantity"), dict):
+        pgm, pgq = pr.get("per_unit_group_mean"), pr.get("per_unit_group_quantity")
+        groups = list(bg["quantity"])
+        try:
+            if not (isinstance(pgm, dict) and isinstance(pgq, dict) and isinstance(pu, dict)
+                    and set(pgm) == set(pu) and set(pgq) == set(pu)):
+                raise ValueError("missing per_unit_group_mean or per_unit_group_quantity")
+            for u_id, puv in pu.items():
+                tot = float(puv["averted_mean"][hl])
+                gvals = [float(pgm[u_id][g][hl]) for g in groups]
+                qvals = [float(pgq[u_id][g]) for g in groups]
+                if not (all(math.isfinite(x) for x in gvals + qvals + [tot])
+                        and abs(math.fsum(gvals) - tot) <= 1e-6 * max(1.0, abs(tot))):
+                    raise ValueError(f"unit {u_id} group means do not sum to averted_mean")
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as e:
+            bad.append(f"deliverable.by_group under expected_value: plan_rule.per_unit_group_mean / "
+                       f"per_unit_group_quantity missing, non-finite, or inconsistent ({e})")
     return bad
 
 

@@ -1316,6 +1316,8 @@ def _validate(s: Spec) -> list[str]:
         bad.append("constraints.envelope_usd: a number")
     elif s.budget() <= 0:
         bad.append("constraints: envelope_usd must exceed the fixed costs")
+    if "envelope_exact" in c and not isinstance(c.get("envelope_exact"), bool):
+        bad.append("constraints.envelope_exact: true or false")
     for g in c.get("group_rules") or []:
         if not isinstance(g, dict) or not g.get("id"):
             bad.append("constraints.group_rules: each rule needs an id")
@@ -1699,6 +1701,13 @@ def _validate_uncertainty(s, pnames) -> list[str]:
                        "take drawn unit values)")
         if src.get("kind") == "calibration" and s.raw["calibration"].get("method") == "none":
             bad.append("uncertainty.sources calibration: calibration.method is none")
+    if (s.raw.get("constraints") or {}).get("envelope_exact") is True:
+        if "costs" in inc:
+            bad.append("constraints.envelope_exact: cannot be combined with uncertainty source costs "
+                       "(an exact fixed-supply envelope requires fixed unit costs)")
+        if isinstance(u.get("affordability"), dict) and u["affordability"].get("enforce"):
+            bad.append("constraints.envelope_exact: cannot be combined with uncertainty.affordability.enforce "
+                       "(a reserve would hold back part of an exact envelope)")
     return bad
 
 
@@ -1961,9 +1970,6 @@ def _validate_deliverable(s) -> list[str]:
                        "solved and compared at the point values)")
         if d.get("kind") != "package_per_unit":
             bad.append("deliverable.plan: expected_value applies to a package_per_unit deliverable")
-        if d.get("by_group") is not None:
-            bad.append("deliverable.plan: expected_value does not yet write a by-group table (its values are at the "
-                       "point values); use the point plan or drop by_group")
     bg = d.get("by_group")
     if bg is not None:
         gc = (bg or {}).get("columns") if isinstance(bg, dict) else None
