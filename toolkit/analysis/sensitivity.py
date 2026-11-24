@@ -17,7 +17,9 @@ import math
 PRODUCER = "toolkit/analysis/sensitivity.py"
 
 
-def _ranges(A) -> dict:
+def _ranges(A, select: bool = True) -> dict:
+    """{parameter: (lo, hi, basis)}. `select=False`: every range, before the spec's `parameters` list selects
+    (toolkit/analysis/wiring.py checks them all)."""
     sens = A.spec["analysis"].get("sensitivity") or {}
     sel = sens.get("parameters", "fitted")
     out = {}
@@ -39,7 +41,7 @@ def _ranges(A) -> dict:
             if p in A.lik["params"]:
                 lo, hi = np.quantile(rows[:, j], [0.025, 0.975])
                 out[p] = (float(lo), float(hi), "posterior 95% interval")
-    if isinstance(sel, list):
+    if select and isinstance(sel, list):
         bad = [p for p in sel if p not in out]
         if bad and A.model.kind == "emulator":
             raise ValueError(f"analysis.sensitivity: {bad} are not emulator inputs; vary them with engine runs "

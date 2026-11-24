@@ -53,6 +53,7 @@ KINDS = {
     "emulator_boundary": ("status", "units", "matched", "rows"),   # emulator path: F6 S2-4b (boundary.py)
     "value_of_information": ("status", "draws", "evpi", "inputs", "not_drawn"),   # F6: value_of_information.py
     "conflicts": ("policy", "declared", "needs_owner"),      # W0-F: toolkit/analysis/conflicts.py
+    "wiring": ("rows", "tolerance", "evaluations", "exemptions"),      # toolkit/analysis/wiring.py (expected per run)
 }
 
 

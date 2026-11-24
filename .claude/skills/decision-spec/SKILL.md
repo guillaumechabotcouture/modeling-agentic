@@ -115,6 +115,19 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
     `finding:` id when it answers a gate finding. A new test is one `type: perturb` with a
     `set:` of targets (what is moved, how, to what; format and targets in
     `toolkit/spec/perturb.py`); the older type names still work and compile to it.
+    **Wiring.** The analysis moves every input the spec declares as varying (sensitivity
+    ranges and cost items, drawn priors and scenario values, fitted and calibrated
+    parameters, decision-test inputs) to each end of its range and checks that it moves at
+    least one declared outcome or cost (`toolkit/analysis/wiring.py`, `analysis/wiring.yaml`).
+    An input that moves nothing, moves less than the engine's own noise, or (on the emulator
+    path) moves the emulator too little to show the engine reads it, gets an
+    `input_not_wired` finding. The check is advisory for now: the finding is MEDIUM and
+    never fails a run, and it is marked `would_block` so that false positives can be counted.
+    Only when the input is deliberately inert in this run, declare
+    `analysis.wiring_exempt: {parameters | cost_items | burden_anchors | decision_tests:
+    {<name>: <reason>}}`, using the name wiring.yaml gives it under its own kind. The results
+    list every exemption with its reason, including unused ones. Fix a dead input; do not
+    exempt it.
 11. **Deliverable.** The allocation file and its column names, and the headline output name
     the question asks for. When the question asks for the options that maximise an *expected*
     outcome over an uncertain input, write `deliverable.plan: expected_value`: the plan with the
@@ -295,6 +308,10 @@ when that test changes the plan (toolkit/analysis/conflicts.py). Declare known m
 - Do not put digits in a decision test's `text`: it says in words what the test asks
   ("does the plan change if the effect is at the low end of its range?"). The values tested
   and the results are rendered from computed claims, and a text with a number is refused.
+  The same holds for the yes, no and undetermined texts of `deliverable.decision.statements`:
+  the harness renders the threshold and the probability.
+- Cite a question's input files by their staged path (`data/inputs/<the path in the question>`),
+  never by the repository path: only the staged copy is in the run directory.
 - Do not give a value in `engine_parameters` for a parameter the engine card lists as
   `calibrated` or `fitted`: fitting sets it, and the entry is refused. Calibrate a `calibrated`
   one under `calibration`, or leave it to the engine; a `fitted` one is set by the engine's own

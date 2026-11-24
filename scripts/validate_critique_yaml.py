@@ -425,10 +425,28 @@ def _validate_carried_forward(cf: Any, ctx: str, current_round: int,
 
 
 def validate_critique(path: str, expected_reviewer: str,
-                      current_round: int) -> dict:
-    """The parsed critique, or SchemaError listing every problem in the file (`.errors`)."""
-    doc = _load(path)
+                      current_round: int, checklist: bool = False) -> dict:
+    """The parsed critique, or SchemaError listing every problem in the file (`.errors`).
+    `checklist`: True for a v2 gate, where a checklist reviewer answers every item of the structural
+    checklist; False (the legacy gate) requires none."""
     ctx = os.path.basename(path)
+    if checklist and expected_reviewer in _checklist_module().CHECKLIST_REVIEWERS:
+        # Codex r3 of #366: read with no duplicate key, and a parse failure named by fixed text (the parser's report
+        # quotes the file; the repair's review message carries it as data, critique_checklist.repair_data).
+        CL0 = _checklist_module()
+        try:
+            with open(path, "rb") as fh:
+                raw0 = fh.read()
+        except FileNotFoundError:
+            raise SchemaError(f"missing file: {path}")
+        except OSError:
+            raise SchemaError(f"{ctx}: {CL0.LOAD_ERROR}")
+        doc, diag = CL0.strict_load(raw0)
+        if diag is not None:
+            raise SchemaError(f"{ctx}: {CL0.LOAD_ERROR}")
+        _require(isinstance(doc, dict), f"{ctx}: top-level must be a mapping")
+    else:
+        doc = _load(path)
     prefix = PREFIXES[expected_reviewer]
     errs = _Errors()
 
@@ -478,9 +496,25 @@ def validate_critique(path: str, expected_reviewer: str,
         _validate_carried_forward(doc.get("carried_forward"), ctx,
                                   current_round, blockers, errs)
 
+    # Owner 2026-11-23: the domain and red-team critics answer the structural checklist
+    # (toolkit/spec/critique_checklist.py); a missing or malformed item is a schema error.
+    if checklist:
+        CL = _checklist_module()
+        if expected_reviewer in CL.CHECKLIST_REVIEWERS:
+            errs.extend(CL.problems(doc.get("checklist"), ctx,
+                                    [b for b in blockers if isinstance(b, dict)]))
+
     if errs:
         raise SchemaError(errs[0], errs)
     return doc
+
+
+def _checklist_module():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from toolkit.spec import critique_checklist
+    return critique_checklist
 
 
 _ESCALATION_HIGH_THRESHOLD = 3  # patch_attempts >= 3 triggers mandatory escalation
@@ -568,7 +602,25 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
 
     `accept_blockers` are required artifacts that are absent (Phase 21
     β): they forbid ACCEPT at every round, even when no HIGH is open.
+
+    Harness baseline hb2 fix 1, and the owner's decision (b) of 2026-11-23:
+    a HIGH whose resolution is the owner's (`owner_resolution`: a measured
+    decision test that changes the plan; agents/stage_machine.py
+    apply_owner_rule) is put to the owner at the first gate (rule 2o), not
+    at the round cap; once the owner (or, under --signoff lead, the lead
+    provisionally) accepts it, it no longer blocks ACCEPT: it moves from
+    `unresolved_high` to `owner_accepted_high`, and the report states the
+    dependence at its top. Declined or unanswered, it never accepts. Other
+    owner items (policy-mapped kinds, scripts/scope_signoff.py) keep rule 3o.
     """
+    moved = [b for b in d.get("unresolved_high") or [] if isinstance(b, dict) and b.get("owner_resolution")
+             and b.get("owner_signed") and not b.get("owner_signoff") and not b.get("owner_declined")
+             and not is_non_declarable(b.get("kind"), b.get("scope_declarable"))]
+    if moved:
+        d["unresolved_high"] = [b for b in d["unresolved_high"] if not any(b is m for m in moved)]
+        held = list(d.get("owner_accepted_high") or [])
+        seen = {(b.get("kind"), b.get("claim")) for b in held if isinstance(b, dict)}
+        d["owner_accepted_high"] = held + [b for b in moved if (b.get("kind"), b.get("claim")) not in seen]
     unresolved_high = d.get("unresolved_high") or []
     accept_blockers = d.get("accept_blockers") or []
     structural = d.get("structural_mismatch", False)
@@ -595,6 +647,17 @@ def _recompute_action(d: dict, max_rounds: int, current_round: int,
                 f"not answer the question. Do NOT spawn writer."
             )
         rule_matched = 1
+    elif rounds_remaining > 0 and any(b.get("owner_resolution") and b.get("owner_signoff") for b in outstanding):
+        # hb2 fix 1: no fix task can change a measured decision test, so its owner is asked now; the gate re-runs
+        # on the answers and the other findings keep their rules
+        ask = [b for b in outstanding if b.get("owner_resolution") and b.get("owner_signoff")]
+        action = "AWAIT_OWNER"
+        rationale = (
+            f"{len(ask)} HIGH finding(s) are the owner's to resolve "
+            f"({', '.join(str((b.get('owner_item') or {}).get('finding') or b.get('kind')) for b in ask)[:300]}): "
+            f"no fix task can change them, so the owner is asked now, with {rounds_remaining} round(s) left. The "
+            f"gate wrote scope_signoff_request.json; it re-runs on the answers.")
+        rule_matched = "2o"
     elif outstanding and rounds_remaining > 0 and _declared_early(outstanding, d):
         # Phase 39: a run whose only outstanding items are gate findings it
         # declared (with a justification) at this gate and the previous one
@@ -837,7 +900,9 @@ def _append_synthetic_blockers(d: dict, reviewer: str, prefix: str,
     """Phase 21 β: idempotent append. An entry already present (same
     reviewer + kind + claim) is not re-added, so calling an incorporate_*
     function twice yields identical output."""
-    existing = [b for b in d["unresolved_high"] if b.get("reviewer") == reviewer]
+    # (an entry the owner accepted was moved to owner_accepted_high: still present, hb2 fix 1)
+    existing = [b for b in list(d["unresolved_high"]) + list(d.get("owner_accepted_high") or [])
+                if isinstance(b, dict) and b.get("reviewer") == reviewer]
     seen = {(b.get("kind"), b.get("claim")) for b in existing}
     n = len(existing)
     for e in new_entries:
@@ -4425,6 +4490,8 @@ def _incorporate_rigor_violations(decision: dict, violations: list[dict],
                 v["kind"], v.get("scope_declarable")),
             # Phase 49 β: a finding the owner must sign off before it is declared.
             **({"owner_signoff": True, "owner_item": v.get("owner_item")} if v.get("owner_signoff") else {}),
+            # hb2 fix 1: a finding whose resolution is the owner's, and the owner's recorded accept
+            **({k: v[k] for k in ("owner_resolution", "owner_signed", "owner_declined") if v.get(k)}),
         })
     _append_synthetic_blockers(d, "rigor-artifacts", "RIG", entries)
 
@@ -4710,6 +4777,64 @@ def _run_self_test() -> int:
                 bad.append((i, repr(e)))
         ok(not bad, f"SE7 unconstructible YAML is a SchemaError: {bad}")
 
+    # --- CK1-CK6 (owner 2026-11-23): the structural checklist of the domain and red-team critics ---
+    with tempfile.TemporaryDirectory() as d:
+        CLm = _checklist_module()
+        pth = os.path.join(d, "critique_domain.yaml")
+        ob = {"id": "D-001", "severity": "MEDIUM", "category": "METHODS", "target_stage": "ANALYZE",
+              "first_seen_round": 1, "claim": "c", "evidence": "e", "fix_requires": "f", "resolved": False}
+        mine = {i: {"answer": "not_applicable", "reason": "no burn-in"} for i in CLm.ITEMS}
+
+        def errs_of(doc, reviewer="critique-domain", cl=False):
+            with open(pth, "w") as fh:
+                yaml.safe_dump(dict({"reviewer": reviewer, "round": 1, "verdict": "REVISE",
+                                     "structural_mismatch": {"detected": False}, "carried_forward": [],
+                                     "blockers": [dict(ob, id=PREFIXES[reviewer] + "001")]}, **doc), fh)
+            try:
+                validate_critique(pth, reviewer, 1, checklist=cl)
+                return []
+            except SchemaError as e:
+                return list(e.errors)
+        ok(errs_of({"checklist": mine}, cl=True) == [], "CK1 a domain critique answering every item is accepted")
+        e1 = errs_of({}, cl=True)
+        ok(len(e1) == 1 and "missing required key 'checklist'" in e1[0],
+           f"CK2 a v2 domain critique without a checklist fails closed: {e1}")
+        part = {k: v for k, v in mine.items() if k != "surveillance_ranking"}
+        e3 = errs_of({"checklist": dict(part, burn_in_drift={"answer": "not_applicable", "reason": ""})}, cl=True)
+        ok(len(e3) == 2 and any("surveillance_ranking" in x and "missing" in x for x in e3)
+           and any("burn_in_drift needs a non-empty reason" in x for x in e3),
+           f"CK3 a missing item and a not_applicable without a reason are schema errors, listed together: {e3}")
+        fin = dict(mine, burn_in_drift={"answer": "finding", "reason": "drift", "blockers": ["D-001"]})
+        ok(errs_of({"checklist": fin}, cl=True) == [], "CK4 a finding names an open blocker of the file")
+        e4 = errs_of({"checklist": {k: v for k, v in fin.items() if k != "comparator_symmetry"}}, cl=True)
+        ok(len(e4) == 1 and "comparator_symmetry" in e4[0],
+           f"CK4b no item is computed by the harness: the critic answers comparator_symmetry too: {e4}")
+        ok(errs_of({}) == [] and errs_of({}, reviewer="critique-presentation", cl=True) == [],
+           "CK5 the legacy gate (checklist=False) and the presentation critic need no checklist")
+        e6 = errs_of({"checklist": dict(mine, burn_in_drift={"answer": "finding", "reason": "r", "blockers": ["D-7"]})},
+                     cl=True)
+        ok(len(e6) == 1 and "[CK-B-burn_in_drift-1]" in e6[0] and "D-7" not in e6[0],
+           f"CK6 a finding naming no blocker of the file is refused, by marker (critic text is never quoted): {e6}")
+        # CK7-CK8 (Codex r3 of #366): a duplicate checklist key, and a value the parser cannot construct, are schema
+        # errors in fixed text; the legacy gate keeps its old reading
+        base_y = ("reviewer: critique-domain\nround: 1\nverdict: PASS\nstructural_mismatch: {detected: false}\n"
+                  "carried_forward: []\nblockers: []\nchecklist:\n"
+                  + "".join(f"  {i}: {{answer: pass, reason: r}}\n" for i in CLm.ITEMS))
+        for tag, extra in (("CK7", "  burn_in_drift: {answer: finding, reason: r}\n"),
+                           ("CK8", "  surveillance_ranking: {answer: pass, reason: !!bool observation_SECRET}\n")):
+            body = base_y if tag == "CK8" else base_y + extra
+            if tag == "CK8":
+                body = base_y.replace("  surveillance_ranking: {answer: pass, reason: r}\n", extra)
+            open(pth, "w").write(body)
+            try:
+                validate_critique(pth, "critique-domain", 1, checklist=True)
+                ek = []
+            except SchemaError as e:
+                ek = list(e.errors)
+            ok(len(ek) == 1 and "[CK-YAML]" in ek[0] and "observation_SECRET" not in ek[0],
+               f"{tag} a {'duplicate key' if tag == 'CK7' else 'value the parser cannot construct'} is one schema "
+               f"error in fixed text: {ek}")
+
     # --- Phase 39 α: presentation polish waits for the first draft ---
     with tempfile.TemporaryDirectory() as d:
         pres = {"kind": "critique_blocker", "id": "P-003", "category": "PRESENTATION", "target_stage": "ANALYZE",
@@ -4845,6 +4970,52 @@ def _run_self_test() -> int:
     ok(act([bdo, sa, ut], both, both)["action"] == "PATCH_OR_RETHINK"
        and act([bdo, sa, ut], both, both, cur=8)["action"] == "RUN_FAILED",
        "SO-V2 the owner is asked only when the run would otherwise declare scope")
+    # OR-V1..OR-V7 (harness baseline hb2 fix 1; owner decision (b), 2026-11-23): a HIGH whose resolution is the
+    # owner's (`owner_resolution`: a measured decision test that changes the plan) is asked at the first gate, not at
+    # the round cap; once accepted it no longer blocks ACCEPT; declined or unanswered it never accepts.
+    _dt = {"kind": "decision_test_changes_plan", "severity": "HIGH", "stage": "ANALYZE", "key": "DT1",
+           "claim": "DT1 changes the plan", "scope_declarable": True}
+    _pend = dict(_dt, owner_signoff=True, owner_resolution=True,
+                 owner_item={"finding": "decision_test_changes_plan:DT1", "fingerprint": "fp1"})
+    _acc = dict(_dt, owner_resolution=True, owner_signed={"by": "owner", "at": "t", "fingerprint": "fp1"})
+    _other = {"kind": "benchmark_drift", "severity": "HIGH", "stage": "MODEL", "key": "B1", "claim": "drift",
+              "scope_declarable": True}
+    _e = lambda: {"unresolved_high": [], "declared": [], "declared_prev": []}  # noqa: E731
+    _o1 = _incorporate_rigor_violations(_e(), [dict(_pend)], 3, 1)
+    ok(_o1["action"] == "AWAIT_OWNER" and _o1["rule_matched"] == "2o",
+       f"OR-V1 an unanswered owner-resolution HIGH goes to the owner at the first gate ({_o1['action']}, "
+       f"{_o1['rule_matched']})")
+    _o2 = _incorporate_rigor_violations(_e(), [dict(_pend), dict(_other)], 3, 1)
+    ok(_o2["action"] == "AWAIT_OWNER" and _o2["rule_matched"] == "2o",
+       f"OR-V2 it is asked first, beside a HIGH a fix may close ({_o2['action']})")
+    _o3 = _incorporate_rigor_violations(_e(), [dict(_acc)], 3, 1)
+    _o3c = _incorporate_rigor_violations(_e(), [dict(_acc)], 3, 3)
+    ok(_o3["action"] == "ACCEPT" and _o3c["action"] == "ACCEPT" and not _o3["unresolved_high"]
+       and [b.get("kind") for b in _o3.get("owner_accepted_high") or []] == ["decision_test_changes_plan"]
+       and (_o3["owner_accepted_high"][0].get("owner_signed") or {}).get("by") == "owner",
+       f"OR-V3 an owner-accepted plan-changing test does not block ACCEPT, at round 1 or at the cap; the gate lists it "
+       f"as accepted ({_o3['action']}, {_o3c['action']}, {_o3.get('owner_accepted_high')})")
+    _o4 = _incorporate_rigor_violations(_e(), [dict(_acc), dict(_other)], 3, 1)
+    _o4c = _incorporate_rigor_violations(_e(), [dict(_acc), dict(_other)], 3, 3)
+    ok(_o4["action"] == "PATCH_OR_RETHINK" and _o4c["action"] == "DECLARE_SCOPE"
+       and [b.get("kind") for b in _o4c["unresolved_high"]] == ["benchmark_drift"],
+       f"OR-V4 the other HIGHs keep their rules ({_o4['action']}, {_o4c['action']})")
+    _pol = dict(_other, owner_signed={"by": "owner", "at": "t", "fingerprint": "fp2"})
+    _o5 = _incorporate_rigor_violations(_e(), [dict(_pol)], 3, 3)
+    _o5p = _incorporate_rigor_violations(_e(), [dict(_other, owner_signoff=True, owner_item={"finding": "b"})], 3, 1)
+    ok(_o5["action"] == "DECLARE_SCOPE" and _o5p["action"] == "PATCH_OR_RETHINK",
+       f"OR-V5 a policy-mapped owner item (no owner_resolution) is unchanged: declared once accepted, asked only at "
+       f"the cap ({_o5['action']}, {_o5p['action']})")
+    _dec = dict(_dt, owner_resolution=True, owner_declined=True, scope_declarable=False)
+    _o6 = _incorporate_rigor_violations(_e(), [dict(_dec)], 3, 3)
+    _o6u = _incorporate_rigor_violations(_e(), [dict(_pend)], 3, 3)
+    _o6s = _incorporate_rigor_violations(_e(), [dict(_acc, scope_declarable=False)], 3, 3)
+    ok(_o6["action"] == "RUN_FAILED" and _o6u["action"] == "AWAIT_OWNER" and _o6s["action"] == "RUN_FAILED",
+       f"OR-V6 a declined, unanswered or non-declarable plan-changing test never accepts ({_o6['action']}, "
+       f"{_o6u['action']}, {_o6s['action']})")
+    _o7 = _incorporate_rigor_violations(_incorporate_rigor_violations(_e(), [dict(_acc)], 3, 1), [dict(_acc)], 3, 1)
+    ok(_o7["action"] == "ACCEPT" and len(_o7.get("owner_accepted_high") or []) == 1,
+       f"OR-V7 idempotent: folding the same accepted finding twice lists it once ({_o7.get('owner_accepted_high')})")
     with tempfile.TemporaryDirectory() as d:
         yaml.safe_dump({"declarations": [{"id": "SD-7", "blocker_id": "allocation_unstable", "why_unresolved": "x"}]},
                        open(os.path.join(d, "scope_declaration.yaml"), "w"))

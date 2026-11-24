@@ -142,7 +142,11 @@ def outcome_map(seed, obs, did, run) -> dict:
 
 def _card(run_dir) -> dict:
     import analysis_backend as AB
-    p = os.path.join(REPO, *(AB.engine_choice_ref(run_dir) or "").split(":")[0].split(".")[:-1], "card.yaml")
+    from toolkit.spec import schema
+    ref = AB.engine_choice_ref(run_dir)
+    if ref not in schema.REGISTERED_ENGINES:        # never another engine's card for an unregistered choice (#367)
+        return {}
+    p = os.path.join(REPO, *ref.split(":")[0].split(".")[:-1], "card.yaml")
     return (_yaml(p) or {}) if os.path.isfile(p) else {}
 
 

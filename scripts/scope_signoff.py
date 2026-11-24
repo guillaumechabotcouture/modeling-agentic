@@ -604,6 +604,11 @@ def _test_md(t: dict) -> str:
     return "**untested**: no decision test"
 
 
+# Gate kinds whose owner accept lets the run ACCEPT with the dependence stated (owner decision (b), 2026-11-23;
+# agents/stage_machine.py DECISION_BEARING_KINDS)
+PLAN_CHANGING_TEST_KINDS = ("decision_test_changes_plan",)
+
+
 def render_md(run_dir: str) -> str:
     req = _load_request(run_dir) or {}
     brief = {}
@@ -611,11 +616,18 @@ def render_md(run_dir: str) -> str:
         brief = _read_yaml(run_dir, "decision_brief.yaml") or {}
     except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError):
         pass
+    items_ = [it for it in req.get("items") or [] if isinstance(it, dict)]
     lines = ["# Scope declarations that need the owner's sign-off", "",
-             f"Decision (signed brief): {brief.get('decision', '(no decision_brief.yaml)')}", "",
-             "The run would end with these findings declared as limitations. Each bears on the decision, so "
-             "the lead cannot accept it alone. Accept a declaration if the decision stands with it; decline it "
-             "if the finding must be fixed.", ""]
+             f"Decision (signed brief): {brief.get('decision', '(no decision_brief.yaml)')}", ""]
+    if not items_ or any(it.get("kind") not in PLAN_CHANGING_TEST_KINDS for it in items_):
+        lines += ["The run would end with these findings declared as limitations. Each bears on the decision, so "
+                  "the lead cannot accept it alone. Accept a declaration if the decision stands with it; decline it "
+                  "if the finding must be fixed.", ""]
+    if any(it.get("kind") in PLAN_CHANGING_TEST_KINDS for it in req.get("items") or [] if isinstance(it, dict)):
+        # owner decision (b), 2026-11-23 (Codex r2 of #357, P1-3): what accepting one of these leads to
+        lines += ["A measured decision test that changes the plan is not declared as a limitation. Accepting it lets "
+                  "the run finish **accepted**, with the dependence (the input it varies, the units that change and "
+                  "who accepted it) stated at the top of the report; declining it keeps the run from accepting.", ""]
     for i, it in enumerate(req.get("items") or [], 1):
         lines += [f"## {i}. `{it.get('finding')}`", "", f"Why it bears on the decision: {it.get('reason')}", "",
                   f"Gate finding: {it.get('claim')}", ""]
@@ -635,6 +647,9 @@ def render_md(run_dir: str) -> str:
         elif it.get("kind") == "evidence_conflict_declared":    # a request written before the verdict was carried
             lines += ["Evidence-conflict decision tests: see analysis/conflicts.yaml (this request predates their "
                       "verdicts in it); the owner is asked only when a test changes the plan or could not run.", ""]
+        elif it.get("kind") in PLAN_CHANGING_TEST_KINDS:      # the gate finding above is its measured result
+            lines += ["Measured decision test: it changes the plan (the gate finding above). Accept: the run may "
+                      "finish accepted with this dependence stated at the top of the report. Decline: it may not.", ""]
         elif not it.get("declarations"):
             lines += ["Not declared in scope_declaration.yaml, and **untested**.", ""]
         for dcl in it.get("declarations") or []:
@@ -1212,6 +1227,18 @@ def _self_test() -> int:
         req_ = req_ if isinstance(req_, dict) else {"error": req_}
         ok(req_.get("pending") is True and [i.get("fingerprint") for i in req_.get("items") or []] == ["fpb"],
            f"SO40 a delayed record for round 1 leaves round 2's pending request in place ({req_})")
+    # SO43 (Codex r2 of #357, P1-3): a plan-changing decision test is shown with what accepting it leads to, not as an
+    # untested declaration
+    with tempfile.TemporaryDirectory() as d:
+        json.dump({"pending": True, "round": 1, "items": [{"finding": "decision_test_changes_plan:DT1",
+                                                           "kind": "decision_test_changes_plan", "fingerprint": "fp",
+                                                           "claim": "DT1 changes the plan (share 20%)",
+                                                           "declarations": []}]},
+                  open(os.path.join(d, REQUEST), "w"))
+        md = render_md(d)
+        ok("untested" not in md and "finish **accepted**" in md and "Measured decision test" in md
+           and "declared as limitations. Each" not in md,
+           f"SO43 a plan-changing test's item says accepting it lets the run finish accepted ({md[:700]!r})")
     # SO41 (Codex r4 of #316): an evidence-conflict item shows the owner its tests' verdicts, not "untested"
     with tempfile.TemporaryDirectory() as d:
         conf = {"status": "CHANGES_PLAN", "changes_plan": True, "tests": ["conflict_1_g_1_lo"],

@@ -752,7 +752,12 @@ def inbox(run_dir: str) -> dict:
                               "declarations": [{"id": d.get("id"), "test": SS._test_md(d.get("test") or {}),
                                                 "text": d.get("text") or {}} for d in it.get("declarations") or []
                                                if isinstance(d, dict)],
-                              "answer": (answers.get(it.get("fingerprint")) or {}).get("decision")})
+                              "answer": (answers.get(it.get("fingerprint")) or {}).get("decision"),
+                              # owner decision (b) (Codex r3 of #357, P1-2): what accepting a plan-changing test does
+                              **({"outcome": "A measured decision test that changes the plan, not a declaration. "
+                                             "Accept: the run may finish accepted, with this dependence stated at the "
+                                             "top of the report. Decline: it may not."}
+                                 if it.get("kind") in getattr(SS, "PLAN_CHANGING_TEST_KINDS", ()) else {})})
             done = items and all(i["answer"] for i in items)
             out["scope"] = {"pending": True, "round": req.get("round"), "items": items,
                             "fingerprints": sorted(str(i.get("fingerprint")) for i in items),
@@ -2593,6 +2598,12 @@ def _self_test() -> int:
         ok(bool((json.load(open(os.path.join(rd, SS.SIGNOFF))) or {}).get("answers")),
            "RC5e h_OWNER_DECISION's check (scope_signoff.json has answers) now holds")
         ok(inbox(rd)["scope"]["items"][0]["answer"] == "accept", "RC5f the inbox shows the recorded answer")
+        # RC5g (Codex r3 of #357, P1-2): a plan-changing test's card says what accepting it leads to
+        rq_ = json.load(open(os.path.join(rd, "scope_signoff_request.json")))
+        json.dump(dict(rq_, items=[dict(i, kind="decision_test_changes_plan") for i in rq_["items"]]),
+                  open(os.path.join(rd, "scope_signoff_request.json"), "w"))
+        ok("finish accepted" in str(inbox(rd)["scope"]["items"][0].get("outcome")),
+           "RC5g the inbox states what accepting a plan-changing test leads to")
         # RC6 spec sign-off
         SHA = "ab" * 32
         ok(not sign_spec(rd, "n", False, expect_sha256=SHA)["ok"], "RC6a spec sign-off refused without confirmation")

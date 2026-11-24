@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Kernel-enforced, unprivileged confinement of one derivation process (Linux; scripts/pipeline.py `_child`, kind
-`landlock-seccomp`; docs/design/v2-derived-inputs.md §7). The launcher applies it to itself before the script runs:
+"""Kernel-enforced, unprivileged confinement of one derivation process (Linux; wired by scripts/pipeline.py `_child`
+in #368 as kind `landlock-seccomp`; docs/design/v2-derived-inputs.md §7). The launcher applies it to itself before
+the script runs:
 
   no_new_privs, then Landlock: reads only beneath the granted read-only roots, writes only in the granted
   directories and only of regular files and directories; every other path, the run directory included, is refused

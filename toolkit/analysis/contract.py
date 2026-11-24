@@ -458,6 +458,9 @@ def _gate_findings(run_dir: str) -> list[dict]:
             voi_doc = doc.get("data")
         if kind == "estimates":
             est_doc = (rel, doc.get("data") or {})
+        if kind == "wiring":                  # owner 2026-11-23: a declared input that reaches no declared output
+            from toolkit.analysis.wiring import findings as wiring_findings
+            out += wiring_findings(rel, doc.get("data"))
         if kind == "point" and ((doc.get("data") or {}).get("model_corrections") or {}).get("on_plan"):
             out.append(_f("analysis_contract_model_domain", f"{rel}: model corrections bear on the plan", rel))
     for rel, ent in sorted((man.get("deliverables") or {}).items()):

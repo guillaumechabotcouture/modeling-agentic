@@ -75,8 +75,11 @@ def path_for(ref: str) -> str:
     """The coverage file beside the module that defines the engine class (OVERRIDES: self-tests)."""
     if ref in OVERRIDES:
         return OVERRIDES[ref]
+    from toolkit.spec import schema
     try:
         c, d = canonical(ref)
+    except schema.UnregisteredEngine:     # never the coverage or pack of the module's registered engine (#367)
+        return os.path.join(ROOT, "unregistered-engine", FILE)
     except Exception:  # noqa: BLE001 -- a reference that does not resolve: its own path (then no file: refused)
         return os.path.join(ROOT, *str(ref).split(":", 1)[0].split(".")[:-1], FILE)
     return OVERRIDES.get(c) or os.path.join(d, FILE)

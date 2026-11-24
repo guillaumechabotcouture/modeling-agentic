@@ -2406,6 +2406,27 @@ def _norm_rel(p: str, run_dir: str) -> str:
     return os.path.relpath(full, os.path.realpath(run_dir)).replace(os.sep, "/")
 
 
+def staged_copy_hint(rel: str, run_dir: str, derive: bool = False) -> str:
+    """Baseline hb2 (§4.6): a cited path that is not itself a staged input but names one, by its repository path
+    (`data/inputs/<rel>` exists) or, for a bare file name, by the name only one staged input has (a qualified path in
+    another folder, a derived table, is never matched by its name; Codex r1 of #355). The refusal's suffix naming it,
+    or ""."""
+    prov = _prov_inputs(run_dir)
+    r = _norm_rel(rel, run_dir)
+    if r.startswith(INPUTS_PREFIX) and r in prov:
+        return ""
+    hit = INPUTS_PREFIX + r if INPUTS_PREFIX + r in prov else None
+    if hit is None and "/" not in r:
+        same = [k for k in prov if k.rsplit("/", 1)[-1] == r.rsplit("/", 1)[-1]]
+        hit = same[0] if len(same) == 1 else None
+    if not hit:
+        return ""
+    if derive:     # a table that must be a derivation's output (the units table; Codex r2 of #355)
+        return (f" (the staged input is {hit}: read it in a derivation under {DERIVE_PREFIX} and cite the "
+                f"derivation's output)")
+    return f" (its staged copy is {hit}: cite that path)"
+
+
 def derivation_problems(run_dir: str, spec: dict | None = None, required: bool = False) -> list[dict]:
     """What blocks the spec's data before SIGN (and at the gate): [{code, claim}]. With `required` (a spec the
     stage machine drafted) the units table must be a derivation output and every other data path derived or staged;
@@ -2462,7 +2483,7 @@ def derivation_problems(run_dir: str, spec: dict | None = None, required: bool =
             if rel.startswith(INPUTS_PREFIX) and rel in prov:
                 continue
             out.append({"code": "data_ref_not_derived", "claim": f"the spec reads {rel}, which is neither a declared "
-                        f"derivation output nor a staged input"})
+                        f"derivation output nor a staged input" + staged_copy_hint(rel, run_dir)})
     return out
 
 
