@@ -412,6 +412,15 @@ def harness_gap_key(f) -> str:
 
 # hb2 fix 1: gate kinds whose resolution is the owner's (agents/stage_machine.py DECISION_BEARING_KINDS)
 OWNER_RESOLUTION_KINDS = ("decision_test_changes_plan",)
+# check-value item 5: the toolkit's owner-declared finding (agents/stage_machine.py OWNER_DECLARE_KINDS), by kind and key:
+# the spike backend's allocation_unstable (key `loo`) keeps the policy map's lifecycle
+OWNER_DECLARED_IDS = ("allocation_unstable:stability",)
+
+
+def owner_resolved(f) -> bool:
+    """A ledger row whose resolution is the owner's answer to the gate finding itself (closed when a gate no longer
+    reports it, reopened when the gate reads it as asked again)."""
+    return f.kind in OWNER_RESOLUTION_KINDS or f.id in OWNER_DECLARED_IDS
 HARNESS_GAP = "harness_gap"          # the ledger event a declared harness gap leaves on its finding (agents/fix_loop.py)
 
 
@@ -520,7 +529,7 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
         # an accepted plan-changing test this gate (pre- or post-write) no longer reports: the plan does not depend on
         # it now, and the report does not list it (Codex r2 of #357, P1-8)
         for f in led.values():
-            if f.id not in seen and f.kind in OWNER_RESOLUTION_KINDS and f.status == "owner_accepted":
+            if f.id not in seen and owner_resolved(f) and f.status == "owner_accepted":
                 f.status, f.blocking = "fixed", False
                 _event(f, round_n, "fixed", "gate", "absent at this gate")
     frozen = frozen_tests(run_dir)
@@ -566,7 +575,7 @@ def sync(run_dir: str, decision: dict | None, round_n: int | None, post_write: b
             _event(f, round_n, f.status, "lead" if s_.get("by") == "lead" else "owner",
                    **({"provisional": True} if s_.get("provisional") else {}),
                    **{k: s_[k] for k in ("at", "record", "result_sha256", "fingerprint") if s_.get(k)})
-        elif f.id not in signed and f.status == "owner_accepted" and f.kind in OWNER_RESOLUTION_KINDS \
+        elif f.id not in signed and f.status == "owner_accepted" and owner_resolved(f) \
                 and decision is not None and f.id in seen:
             f.status, f.resolution_type = "open", "owner_decision"     # asked again: its evidence changed
             _event(f, round_n, "open", "gate", "the accepted decision test reads differently now")

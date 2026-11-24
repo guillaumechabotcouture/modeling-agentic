@@ -97,6 +97,12 @@ class AwaitingBudget(Exception):
 # Findings whose resolution bears on the primary decision: Phase 49 β's owner rule decides
 # whether they may be declared. Without that rule they are not declarable (fail closed).
 DECISION_BEARING_KINDS = ("decision_test_changes_plan",)
+# Check-value item 5: decision-bearing toolkit findings no fix task can change, asked of the owner at the first gate
+# (rule 2o) like a plan-changing test, whose accept declares them (DECLARE_SCOPE, never ACCEPT) with the dependence
+# stated at the top of the report. The spike backend's allocation_unstable is not decision-bearing: the policy map
+# (scripts/scope_signoff.py) keeps it.
+OWNER_DECLARE_KINDS = ("allocation_unstable",)
+TOOLKIT_SOURCE = "toolkit/analysis/contract.py"
 MAX_SPEC_TRIES = 3
 MAX_SCHEMA_REPAIRS = 2
 MAX_SIGN_REPAIRS = 2          # a refused lead sign-off goes back to EVIDENCE or SPEC at most this often, then waits
@@ -403,7 +409,13 @@ def _bearing_record(run_dir: str, v: dict):
     """The producer's record of a decision-bearing finding's test: the toolkit's verified row (with its result file's
     hash) for a toolkit finding, the spike's analysis.json entry otherwise (Codex r1 of #327); None when absent."""
     ev = None
-    if v.get("source") == "toolkit/analysis/contract.py":      # lead-gaps α: analysis/decision_tests.yaml, verified
+    if _owner_declares(v):        # check-value item 5: the verified stability record's path and hash
+        try:
+            from toolkit.analysis import contract as _CT
+            ev = _CT.stability_record(run_dir)
+        except Exception:  # noqa: BLE001 -- no evidence: the item binds the claim alone
+            ev = None
+    elif v.get("source") == "toolkit/analysis/contract.py":      # lead-gaps α: analysis/decision_tests.yaml, verified
         try:
             from toolkit.analysis import contract as _CT
             ev = _CT.decision_test_record(run_dir, v.get("key"))
@@ -423,12 +435,21 @@ def _bearing_record(run_dir: str, v: dict):
 # ACCEPT with the dependence stated. Bound into the item's fingerprint, so an accept given under the earlier contract
 # (the finding declared, the run not accepted) does not authorize it (Codex r3 of #357, P1-1).
 DT_DISPOSITION = "accept_with_dependence_stated"
+DECLARE_DISPOSITION = "declare_with_dependence_stated"     # OWNER_DECLARE_KINDS: an accept declares the finding
+STABILITY_REASON = ("the allocation does not hold out of sample (leave-one-group-out), and the decision is the package "
+                    "per allocation unit")
+
+
+def _owner_declares(v: dict) -> bool:
+    return v.get("kind") in OWNER_DECLARE_KINDS and v.get("source") == TOOLKIT_SOURCE and bool(v.get("decision_bearing"))
 
 
 def _bearing_fp(v: dict, ev) -> str:
     key = {"finding": FL.gate_id(v), "claim": v.get("claim", ""), "evidence": ev}
     if v.get("kind") in DECISION_BEARING_KINDS:
         key["disposition"] = DT_DISPOSITION
+    elif _owner_declares(v):
+        key["disposition"] = DECLARE_DISPOSITION
     return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -439,7 +460,8 @@ def _bearing_item(run_dir: str, v: dict) -> dict:
     ev = _bearing_record(run_dir, v)
     gid = FL.gate_id(v)
     fp = _bearing_fp(v, ev)
-    return {"finding": gid, "kind": v.get("kind"), "reason": "a measured decision test changes the plan",
+    return {"finding": gid, "kind": v.get("kind"),
+            "reason": STABILITY_REASON if _owner_declares(v) else "a measured decision test changes the plan",
             "claim": v.get("claim", ""), "declarations": [], "declared": False, "fingerprint": fp,
             # the producer's record the answer binds, for the report's statement of it (Codex r1 of #357, P1-7/8)
             "record": "toolkit" if v.get("source") == "toolkit/analysis/contract.py" else "spike",
@@ -488,6 +510,10 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
                     # first gate (rule 2o), and an accept lets the run ACCEPT with the dependence stated (owner
                     # decision (b), 2026-11-23); scripts/validate_critique_yaml.py _recompute_action
                     v["owner_resolution"] = True
+                elif _owner_declares(v):
+                    # check-value item 5: no fix task can make an unstable allocation stable; asked at the first gate
+                    # (rule 2o), and an accept declares it (validate_critique_yaml rule 4d), never ACCEPT
+                    v["owner_resolution"], v["owner_disposition"] = True, "declare"
                 item = _bearing_item(run_dir, v)
                 a = answers.get(item["fingerprint"]) or {}
                 if str(a.get("finding")) == item["finding"] and _answer_counts(a, mode):
@@ -503,7 +529,10 @@ def apply_owner_rule(run_dir: str, round_n: int, viols: list[dict], rule="auto",
                                          f"({a.get('at')}): {str(a.get('note') or 'no note')[:300]}."})
                     continue
                 v["owner_signoff"], v["owner_item"] = True, item
-            return out + list(rule.gate_findings(run_dir, round_n, viols, non_declarable=V.is_non_declarable,
+            # an owner-declared finding is this rule's item alone: the policy map would ask it again under its own
+            # fingerprint (scripts/scope_signoff.py maps allocation_unstable too)
+            rest = [v for v in viols if v.get("owner_disposition") != "declare"]
+            return out + list(rule.gate_findings(run_dir, round_n, rest, non_declarable=V.is_non_declarable,
                                                  mode=mode, provisional_only=True) or [])
         except Exception as e:  # noqa: BLE001 -- fail closed below
             reason = f"the owner rule failed ({type(e).__name__}: {e})"
@@ -674,7 +703,8 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
     for v in decision.get("rigor_violations") or []:
         if not (isinstance(v, dict) and str(v.get("severity")) in ("HIGH", "MEDIUM")):
             continue
-        if v.get("owner_resolution") and v.get("owner_signed") and not v.get("owner_signoff"):
+        if v.get("owner_resolution") and v.get("owner_signed") and not v.get("owner_signoff") \
+                and v.get("owner_disposition") != "declare":
             continue          # the owner accepted it: the report states the dependence (owner decision (b), hb2 fix 1)
         fid = FL.gate_id(v)
         # Every gate finding counts (a resolved blocker whose test fails is done_when_unmet; a missing
@@ -684,8 +714,10 @@ def open_findings(run_dir: str, decision: dict) -> list[dict]:
         if (str(v.get("key") or "") in critic_open and v.get("kind") != "done_when_regressed") or fid in seen:
             continue
         seen.add(fid)
+        # (no fix task can change an owner-declared finding, nor one its check marks `fix_task: False`: declared)
         out.append({"id": fid, "source": "harness", "severity": v.get("severity"), "kind": str(v.get("kind") or ""),
-                    "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing"),
+                    "tested": not str(v.get("kind") or "").startswith("critique_done_when_missing")
+                    and v.get("fix_task") is not False and v.get("owner_disposition") != "declare",
                     "claim": str(v.get("claim") or ""), "fix_requires": _remedy(v)})
     return out
 
@@ -750,8 +782,9 @@ def apply_medium_rule(decision: dict, opened: list[dict], rounds_remaining: int,
     declared (harness baseline hb1, malaria R2: two critique rounds ran for an accepted finding). Nor does a declared
     harness gap (`harness_gaps`, FL.harness_gaps: no file a fix task may edit can fix it; hb2 fix 4, dengue R2 R-001:
     two critique rounds ran for one): it is declared with what it needs.
-    The decision's action and rationale say what the machine then does."""
-    if decision.get("action") != "ACCEPT" or not opened:
+    The decision's action and rationale say what the machine then does. A gate that declares only owner-declared
+    findings (rule 4d, check-value item 5) is read as one that would ACCEPT: what has a test still goes to the loop."""
+    if (decision.get("action") != "ACCEPT" and str(decision.get("rule_matched")) != "4d") or not opened:
         return decision
     d = dict(decision)
     held = set(map(str, owner_held or ()))
@@ -3452,6 +3485,33 @@ def dependence_lines(run_dir: str, stale_out: list | None = None) -> list[str]:
     return out + ["\n"]
 
 
+def declared_dependence_lines(run_dir: str) -> list[str]:
+    """Check-value item 5: an owner-declared finding (OWNER_DECLARE_KINDS: an unstable allocation) the owner (or, under
+    --signoff lead, the lead provisionally) accepted is stated at the top of the report, as decision (b) states an
+    accepted plan-changing test: the harness's claim (the groups whose exclusion changes the plan, the share of units
+    affected) and who accepted it. From the ledger's owner_accepted rows; one a later gate reads differently is asked
+    again (its row reopens) and one it no longer reports is closed (FL.sync), so neither is listed."""
+    try:
+        led = FL.load(run_dir)
+    except Exception as e:  # noqa: BLE001 -- fail closed: the report says the list could not be read
+        return [f"**Declared limitations the owner accepted: the list could not be read ({type(e).__name__}).**\n\n"]
+    rows = sorted((f for f in led.values() if f.kind in OWNER_DECLARE_KINDS and f.status == "owner_accepted"),
+                  key=lambda f: f.id)
+    if not rows:
+        return []
+    out, by_lead = [], True
+    for f in rows:
+        ev = next((e for e in reversed(f.events or []) if isinstance(e, dict) and e.get("status") == "owner_accepted"), {})
+        by_lead = by_lead and ev.get("by") == "lead"
+        who = ("the lead, provisionally (`--signoff lead`; the owner confirms or overturns it)" if ev.get("by") == "lead"
+               else "the owner")
+        out.append(f"- **{f.id}**: accepted by {who}" + (f" at {ev['at']}" if ev.get("at") else "")
+                   + f" as a declared limitation of the per-unit plan. {' '.join(str(f.claim).split())}\n")
+    return [f"## The plan holds only as far as a limitation {'the lead accepted provisionally' if by_lead else 'the owner accepted'}\n\n",
+            "The plan below is delivered with this finding declared, not resolved; the plan changes where it says "
+            "(harness-rendered).\n\n"] + out + ["\n"]
+
+
 def amendment_lines(run_dir: str) -> list[str]:
     """lead-gaps β: a run made by an amendment its owner has not signed (the lead's, provisional) heads its report with
     the amendment: its id, reason and changes, from toolkit/spec/amend.py's record. Nothing once the owner signs. The
@@ -3583,7 +3643,7 @@ def render_report(run_dir: str, backend=AB, status: str | None = None) -> str:
     lines += prov
     stale_dt: list = []
     head = (_status_line(run_dir, status) + "".join(amendment_lines(run_dir)) + "".join(top)
-            + "".join(dependence_lines(run_dir, stale_dt)))
+            + "".join(dependence_lines(run_dir, stale_dt)) + "".join(declared_dependence_lines(run_dir)))
     body = draft.rstrip() + "\n"
     from toolkit.spec import review_conditions as RCN       # W0-G: conditions the lead deferred, at the top
     rcl = RCN.report_lines(run_dir)

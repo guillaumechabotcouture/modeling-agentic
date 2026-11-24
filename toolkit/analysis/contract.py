@@ -17,7 +17,10 @@ harness wrote, for the spec that was signed:
                                (sources are recorded relative to the run dir, so a moved run dir still checks)
   analysis_contract_value_of_information  the value-of-information artifact the spec asks for is missing, present
                                when switched off, or malformed (F6: toolkit/analysis/value_of_information.py)
-All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding).
+  analysis_contract_stability  analysis/stability.yaml cannot be verified or read, or holds an unknown verdict
+All HIGH, none scope-declarable; each fails closed (an unreadable file is a finding). Beside them, read by
+toolkit/analysis/api.py: decision_test_findings (decision_test_changes_plan) and stability_findings
+(allocation_unstable HIGH, declarable through the owner; stability_not_run MEDIUM on an allocation).
 """
 from __future__ import annotations
 
@@ -773,6 +776,122 @@ def decision_test_findings(run_dir: str) -> list[dict]:
                         "key": tid, "scope_declarable": True, "decision_bearing": True,
                         "source": "toolkit/analysis/contract.py"})
     return out
+
+
+STABILITY_ARTIFACT = "analysis/stability.yaml"
+STABILITY_VERDICTS = ("ROBUST", "FRAGILE", "UNSTABLE", "NOT_RUN")    # toolkit/analysis/stability.py run()
+STABILITY_KIND = "allocation_unstable"       # agents/stage_machine.py OWNER_DECLARE_KINDS
+STABILITY_NOT_RUN = "stability_not_run"
+
+
+def _stability_doc(run_dir: str) -> tuple:
+    """(payload, manifest entry, problem) of analysis/stability.yaml, read once with no link followed and hashed on the
+    bytes parsed. problem None with no payload: nothing to read (no completed manifest, or one that lists no stability
+    artifact; the contract checks report either)."""
+    try:
+        man = json.load(open(os.path.join(run_dir, MANIFEST)))
+    except (OSError, ValueError):
+        return None, None, None
+    if not isinstance(man, dict) or man.get("status") != "complete" or man.get("complete") is not True:
+        return None, None, None
+    ent = (man.get("artifacts") or {}).get(STABILITY_ARTIFACT)
+    if not isinstance(ent, dict):
+        return None, None, None
+    from toolkit.analysis.artifacts import _safe_io
+    import hashlib
+    try:
+        raw = _safe_io().read_nofollow(run_dir, STABILITY_ARTIFACT)[0]
+    except Exception as e:  # noqa: BLE001 -- a link, a missing or unreadable file: not trusted
+        return None, ent, f"cannot be read with no link followed ({type(e).__name__})"
+    if hashlib.sha256(raw).hexdigest() != ent.get("sha256"):
+        return None, ent, "changed after the harness wrote it"
+    try:
+        data = (yaml.safe_load(raw.decode("utf-8")) or {}).get("data")
+    except (yaml.YAMLError, UnicodeDecodeError, AttributeError) as e:
+        return None, ent, f"does not parse ({type(e).__name__})"
+    return (data, ent, None) if isinstance(data, dict) else (None, ent, "has no payload mapping")
+
+
+def stability_record(run_dir: str) -> dict | None:
+    """The verified stability record's path and hash: the owner item's evidence (agents/stage_machine.py
+    _bearing_record), so an answer covers that record only and a changed one is asked again."""
+    data, ent, problem = _stability_doc(run_dir)
+    return None if data is None or problem else {"path": STABILITY_ARTIFACT, "result_sha256": ent.get("sha256"),
+                                                 "verdict": data.get("verdict"), "value_verdict": data.get("value_verdict")}
+
+
+def _num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def stability_findings(run_dir: str) -> list[dict]:
+    """Check-value item 5: the leave-one-group-out allocation stability (analysis/stability.yaml) as a finding.
+    UNSTABLE (package identity or value lost): a HIGH `allocation_unstable`, scope-declarable and decision-bearing, which
+    names the groups whose exclusion changes the plan and the share of units affected; the stage machine asks its owner
+    at the first gate and an accept declares it (agents/stage_machine.py OWNER_DECLARE_KINDS). NOT_RUN on an allocation
+    deliverable: a MEDIUM `stability_not_run` with the reason, which no fix task can change (`fix_task: False`).
+    A record that cannot be verified or read, or holds an unknown verdict: a non-declarable HIGH (fail closed). Not a
+    contract finding: gate_findings is unchanged (toolkit/analysis/api.py gate_findings adds these)."""
+    data, _ent, problem = _stability_doc(run_dir)
+
+    def bad(why):
+        return [_f("analysis_contract_stability", f"{STABILITY_ARTIFACT} {why}: the allocation's stability cannot be "
+                                                  "judged", STABILITY_ARTIFACT)]
+    if problem:
+        return bad(problem)
+    if data is None:
+        return []
+    try:
+        allocates = json.load(open(os.path.join(run_dir, MANIFEST))).get("deliverable_kind") != "estimates"
+    except (OSError, ValueError, AttributeError):
+        allocates = True                       # fail closed: cannot rule the allocation out
+    v, vv, folds, skipped = data.get("verdict"), data.get("value_verdict"), data.get("folds"), data.get("folds_not_run")
+    if v not in STABILITY_VERDICTS or vv not in STABILITY_VERDICTS or (v == "NOT_RUN") != (vv == "NOT_RUN"):
+        return bad(f"holds verdict {v!r} and value verdict {vv!r} (expected one of {', '.join(STABILITY_VERDICTS)}, "
+                   "NOT_RUN in both or neither)")
+    if not isinstance(folds, list) or not all(isinstance(f, dict) for f in folds) \
+            or not isinstance(skipped if skipped is not None else [], list) or (v != "NOT_RUN" and not folds):
+        return bad("has no list of fold records for its verdict")
+    g = str(data.get("holdout_group") or "group")
+    base = {"stage": "ANALYZE", "target_stage": "ANALYZE", "key": "stability", "scope_declarable": True,
+            "source": "toolkit/analysis/contract.py"}
+    if v == "NOT_RUN":
+        if not allocates:
+            return []
+        why = [str(data["reason"])] if data.get("reason") else []
+        why += [f"{f.get('group')}: {f.get('reason')}" for f in skipped or [] if isinstance(f, dict)]
+        return [dict(base, kind=STABILITY_NOT_RUN, severity="MEDIUM", fix_task=False,
+                     claim=f"The leave-one-{g}-out allocation stability was not run, so nothing shows whether the "
+                           f"per-unit plan holds when a {g} is held out: {'; '.join(why)[:600] or 'no reason recorded'}.",
+                     fix_requires="Declared with its reason in the write-up. To run it, a relaunch with a spec that names "
+                                  "analysis.stability.holdout_group (and covariates under emulator inversion).")]
+    if "UNSTABLE" not in (v, vv):
+        return []
+    moved = [f for f in folds if _num(f.get("units_changed")) and f["units_changed"] > 0]
+    total = next((round(f["units_changed"] / f["share_units_changed"]) for f in moved
+                  if _num(f.get("share_units_changed")) and f["share_units_changed"] > 0), None)
+    names = [str(f.get("group")) for f in moved]
+    claim = (f"Leave-one-{g}-out allocation stability is UNSTABLE (package identity {v}, value lost {vv}, "
+             f"{len(folds)} fold(s) run): ")
+    if moved:
+        worst = max(moved, key=lambda f: f["units_changed"])
+        ids = [f.get("units_changed_ids") for f in moved]
+        union = len({str(i) for x in ids for i in x}) if all(isinstance(x, list) for x in ids) else None
+        claim += (f"holding out any of {len(moved)} of {len(folds)} {g} values changes the plan "
+                  f"({', '.join(names[:20])}{f' and {len(names) - 20} more' if len(names) > 20 else ''}); the worst "
+                  f"fold ({worst.get('group')}) changes the package of {worst['units_changed']} unit(s)"
+                  + (f", {100.0 * worst['units_changed'] / total:.3g}% of the {total} units" if total else ""))
+        if union is not None and total:
+            claim += f"; {union} unit(s), {100.0 * union / total:.3g}% of the units, change package in at least one fold"
+    elif not any(_num(f.get("units_changed")) for f in folds):        # a record from before moves.py counted them
+        claim += "the fold records do not count the units whose package changes; see the worst-fold metrics"
+    else:
+        claim += "no fold changes a unit's package; the verdict comes from the worst-fold spend ranking or value lost"
+    if skipped:
+        claim += f"; {len(skipped)} fold(s) not run"
+    return [dict(base, kind=STABILITY_KIND, severity="HIGH", decision_bearing=True, claim=claim + ".",
+                 fix_requires="The owner decides: accept the per-unit plan as a declared limitation, stated at the top "
+                              "of the report, or decline it and decide at the granularity the evidence supports.")]
 
 
 def _claims(run_dir, man) -> list[dict]:
