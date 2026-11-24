@@ -1912,6 +1912,7 @@ def _kernel_probe() -> bool:
             _SANDBOX_INFO["kernel_probe"] = "landlock: unavailable"
             return False
         work, hid = os.path.join(base, "work"), os.path.join(base, "hidden")
+        os.chmod(base, 0o711)           # a root launcher's unprivileged uid must reach work/ (traverse only)
         os.makedirs(os.path.join(work, "out"))
         os.makedirs(hid)
         with open(os.path.join(hid, "secret.txt"), "w") as f:
