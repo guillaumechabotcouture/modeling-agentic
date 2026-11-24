@@ -6,11 +6,11 @@ the script runs:
   no_new_privs, then Landlock: reads only beneath the granted read-only roots, writes only in the granted
   directories and only of regular files and directories; every other path, the run directory included, is refused
   whatever name reaches it (ABI 2+: no cross-directory rename or link; 4+: no TCP; 6+: no outside signals), then
-  seccomp-bpf: DENY below, clone only for threads (clone3 answers ENOSYS), prlimit64 only to read, kill and tgkill
-  only to itself; a foreign architecture or the x32 ABI kills the process.
+  seccomp-bpf: DENY below, ioctl only for IOCTL_ALLOW, clone only for threads (clone3 answers ENOSYS),
+  prlimit64 only to read, kill and tgkill only to itself; a foreign architecture or the x32 ABI kills the process.
 
-Both hold for the whole process, native code and second interpreters included. `apply` raises OSError when any step
-fails (the caller fails closed).
+A root caller first becomes an unprivileged uid (`drop_root`). Both hold for the whole process, native code and
+second interpreters included. `apply` raises OSError when any step fails (the caller fails closed).
 
     python3 scripts/lib/kernel_sandbox.py --self-test
 """
@@ -27,6 +27,11 @@ CAP_V3 = 0x20080522
 LANDLOCK_MIN_ABI = 3        # ABI 3 adds the truncate right; below it truncate(2) and O_TRUNC escape the rules
 MAX_REVIEWED = 462          # a syscall numbered above this answers ENOSYS (a newer interface was never reviewed)
 F_SETOWN, F_SETSIG, F_SETOWN_EX = 8, 10, 15     # fcntl: an owner for SIGIO reaches another process
+# ioctl commands allowed (arg 1): TCGETS (isatty), TIOCGWINSZ, FIONREAD, FIONBIO, FIONCLEX, FIOCLEX; any other
+# answers ENOTTY, so no inode flags or versions (FS_IOC_SETFLAGS, FSSETXATTR, SETVERSION) are written (review N-1)
+IOCTL_ALLOW = (0x5401, 0x5413, 0x541B, 0x5421, 0x5450, 0x5451)
+ENOTTY = 25
+DERIVATION_UID = 58999      # the unprivileged uid and gid a root launcher switches to (review N-3)
 SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC = 1, 1
 RET_ALLOW, RET_KILL, RET_ERRNO = 0x7FFF0000, 0x80000000, 0x00050000
 EPERM, ENOSYS = 1, 38
@@ -41,8 +46,8 @@ NR = {
                    io_uring_register=427, kill=62, tkill=200, tgkill=234, rt_sigqueueinfo=129,
                    rt_tgsigqueueinfo=297, pidfd_send_signal=424, pidfd_open=434, pidfd_getfd=438, add_key=248,
                    request_key=249, keyctl=250, open_tree=428, move_mount=429, fsopen=430, fsconfig=431,
-                   fsmount=432, fspick=433, mount_setattr=442, kcmp=312, fcntl=72, chmod=90, fchmod=91, chown=92,
-                   fchown=93, lchown=94, utime=132, utimes=235, fchownat=260, futimesat=261, fchmodat=268,
+                   fsmount=432, fspick=433, mount_setattr=442, kcmp=312, fcntl=72, ioctl=16, chmod=90, fchmod=91,
+                   chown=92, fchown=93, lchown=94, utime=132, utimes=235, fchownat=260, futimesat=261, fchmodat=268,
                    utimensat=280, fchmodat2=452, semtimedop=220),
     "aarch64": dict(seccomp=277, socket=198, socketpair=199, clone=220, clone3=435, execve=221, execveat=281,
                     ptrace=117, process_vm_readv=270, process_vm_writev=271, setrlimit=164, prlimit64=261, mount=40,
@@ -51,7 +56,7 @@ NR = {
                     tkill=130, tgkill=131, rt_sigqueueinfo=138, rt_tgsigqueueinfo=240, pidfd_send_signal=424,
                     pidfd_open=434, pidfd_getfd=438, add_key=217, request_key=218, keyctl=219, open_tree=428,
                     move_mount=429, fsopen=430, fsconfig=431, fsmount=432, fspick=433, mount_setattr=442, kcmp=272,
-                    fcntl=25, fchmod=52, fchmodat=53, fchownat=54, fchown=55, utimensat=88, fchmodat2=452)}
+                    fcntl=25, ioctl=29, fchmod=52, fchmodat=53, fchownat=54, fchown=55, utimensat=88, fchmodat2=452)}
 # contiguous ranges refused: xattr writes and removals, SysV IPC and POSIX message queues
 RANGES = {"x86_64": ((188, 190), (197, 199), (29, 31), (64, 71), (240, 245)),
           "aarch64": ((5, 7), (14, 16), (180, 197))}
@@ -106,6 +111,9 @@ def bpf_program(arch: str, pid: int) -> list[tuple]:
     # from ABI 6)
     prog += [_jeq(nr["fcntl"], 0, 6), _ld(24), _jeq(F_SETOWN, 3, 0), _jeq(F_SETOWN_EX, 2, 0), _jeq(F_SETSIG, 1, 0),
              _ret(RET_ALLOW), _ret(perm)]
+    k = len(IOCTL_ALLOW)
+    prog += ([_jeq(nr["ioctl"], 0, k + 3), _ld(24)] + [_jeq(c, k - i, 0) for i, c in enumerate(IOCTL_ALLOW)]
+             + [_ret(RET_ERRNO | ENOTTY), _ret(RET_ALLOW)])
     prog += [_jeq(nr["clone3"], 0, 1), _ret(RET_ERRNO | ENOSYS)]
     # clone: threads only
     prog += [_jeq(nr["clone"], 0, 4), _ld(16), (0x45, 0, 1, CLONE_THREAD), _ret(RET_ALLOW), _ret(perm)]
@@ -193,10 +201,26 @@ def install_seccomp(libc, arch: str, pid: int) -> None:
                         ctypes.c_uint(SECCOMP_FILTER_FLAG_TSYNC), ctypes.byref(fp)), "seccomp(SET_MODE_FILTER)", True)
 
 
-def apply(ro: list[str], rw: list[str], rw_files: list[str] = (), ro_files: list[str] = ()) -> dict:
-    """Confine this process for good: one thread, no capabilities, no_new_privs, Landlock (`ro` read-only roots, `rw`
-    writable directories, `ro_files`/`rw_files` single files, e.g. /etc/ld.so.cache, /dev/null), then seccomp.
-    Returns what was applied. Any failure raises OSError: the caller must not run the derivation."""
+def drop_root(uid: int | None) -> None:
+    """As root, become `uid` (and gid `uid`, no supplementary groups) for good; the caller made the work and output
+    directories this uid's. Root without a uid to switch to is refused: it would own every root file and process."""
+    if os.geteuid() != 0:
+        return
+    if not uid:
+        raise OSError(EPERM, "running as root with no unprivileged uid to switch to")
+    os.setgroups([])
+    os.setresgid(uid, uid, uid)
+    os.setresuid(uid, uid, uid)
+    if os.getresuid() != (uid,) * 3 or os.getresgid() != (uid,) * 3:
+        raise OSError(EPERM, f"uid switch to {uid} did not hold: {os.getresuid()} {os.getresgid()}")
+
+
+def apply(ro: list[str], rw: list[str], rw_files: list[str] = (), ro_files: list[str] = (),
+          uid: int | None = None) -> dict:
+    """Confine this process for good: one thread, root left for `uid`, no capabilities, no_new_privs, Landlock
+    (`ro` read-only roots, `rw` writable directories, `ro_files`/`rw_files` single files, e.g. /etc/ld.so.cache,
+    /dev/null), then seccomp. Returns what was applied. Any failure raises OSError: the caller must not run the
+    derivation."""
     arch = platform.machine()
     if not sys.platform.startswith("linux") or arch not in ARCH:
         raise OSError(EPERM, f"no kernel sandbox for {sys.platform}/{arch}")
@@ -205,6 +229,7 @@ def apply(ro: list[str], rw: list[str], rw_files: list[str] = (), ro_files: list
         raise OSError(EPERM, f"Landlock ABI {abi} (at least {LANDLOCK_MIN_ABI}, Linux 6.2, is needed: truncation)")
     single_thread()
     libc = _libc()
+    drop_root(uid)
     drop_capabilities(libc)
     _check(libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "prctl(PR_SET_NO_NEW_PRIVS)")
     handled = fs_handled(abi)
@@ -232,7 +257,7 @@ def apply(ro: list[str], rw: list[str], rw_files: list[str] = (), ro_files: list
     finally:
         os.close(fd)
     install_seccomp(libc, arch, os.getpid())
-    return {"landlock_abi": abi, "seccomp": "filter", "no_new_privs": True, "capabilities": "none",
+    return {"landlock_abi": abi, "seccomp": "filter", "no_new_privs": True, "capabilities": "none", "uid": os.geteuid(),
             "net_tcp_landlock": abi >= 4, "scoped_signals": abi >= 6}
 
 
@@ -263,6 +288,13 @@ def _self_test() -> int:
                  ("fcntl F_SETOWN_EX", n["fcntl"], (3, F_SETOWN_EX, 0), perm),
                  ("fcntl F_SETSIG", n["fcntl"], (3, F_SETSIG, 9), perm),
                  ("fcntl F_SETFL (allowed)", n["fcntl"], (3, 4, 0o4000), allow),
+                 ("ioctl FS_IOC_SETFLAGS", n["ioctl"], (3, 0x40086602, 0), RET_ERRNO | ENOTTY),
+                 ("ioctl FS_IOC_FSSETXATTR", n["ioctl"], (3, 0x401C5820, 0), RET_ERRNO | ENOTTY),
+                 ("ioctl FS_IOC_SETVERSION", n["ioctl"], (3, 0x40087602, 0), RET_ERRNO | ENOTTY),
+                 ("ioctl FIOSETOWN", n["ioctl"], (3, 0x8901, 0), RET_ERRNO | ENOTTY),
+                 ("ioctl TCGETS (allowed)", n["ioctl"], (1, 0x5401, 0), allow),
+                 ("ioctl FIONCLEX (allowed)", n["ioctl"], (1, 0x5450, 0), allow),
+                 ("ioctl FIOCLEX (allowed)", n["ioctl"], (1, 0x5451, 0), allow),
                  ("fchmodat", n["fchmodat"], (), perm), ("fchownat", n["fchownat"], (), perm),
                  ("utimensat", n["utimensat"], (), perm), ("fchmodat2", n["fchmodat2"], (), perm),
                  ("a syscall newer than the review (467)", 467, (), RET_ERRNO | ENOSYS)]
@@ -309,15 +341,23 @@ def _self_test() -> int:
             ok(True, "KS8 two threads before Landlock are refused")
     if sys.platform.startswith("linux") and landlock_abi() >= LANDLOCK_MIN_ABI and platform.machine() in ARCH:
         pid = os.fork()
-        if pid == 0:            # KS6: in a child, confine, then read the capability sets
+        was_root = os.geteuid() == 0
+        if pid == 0:            # KS6: in a child, confine, then read the capability sets and the uid
             try:
-                apply([sys.prefix], [])
+                apply([sys.prefix], [], uid=DERIVATION_UID)
                 hdr, data = (ctypes.c_uint32 * 2)(CAP_V3, 0), (ctypes.c_uint32 * 6)()
                 _libc().capget(hdr, data)
-                os._exit(0 if not any(data) else 9)
+                os._exit(0 if not any(data) and os.geteuid() != 0 and os.getegid() != 0 else 9)
             except BaseException:  # noqa: BLE001
                 os._exit(8)
-        ok(os.waitpid(pid, 0)[1] == 0, "KS6 apply leaves no effective, permitted or inheritable capability")
+        ok(os.waitpid(pid, 0)[1] == 0, "KS6 apply leaves no effective, permitted or inheritable capability, and "
+           f"no root uid or gid ({'run as root: switched to' if was_root else 'not root: kept'} its uid)")
+    try:
+        with mock.patch("os.geteuid", lambda: 0):
+            drop_root(None)
+        ok(False, "KS9 root with no uid to switch to is refused")
+    except OSError:
+        ok(True, "KS9 root with no uid to switch to is refused")
     if not sys.platform.startswith("linux"):
         try:
             apply([], [])
