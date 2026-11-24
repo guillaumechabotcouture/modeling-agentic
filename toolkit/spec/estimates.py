@@ -58,6 +58,7 @@ UQ_STRUCTURAL = ("generation_interval", "transmissibility_structure")
 UQ_ALL = UQ_KINDS + UQ_STRUCTURAL
 WEIGHTING = ("marginal_likelihood", "equal")
 MAX_VARIANTS = 15
+MAX_GI_LAGS = 10_000
 STEPS = ("week", "day")
 
 
@@ -123,14 +124,23 @@ def rescale_gi(w, scale: float) -> list[float]:
         raise ValueError("rescale_gi: w must have positive sum")
     if s == 1.0:
         return list(wf)
-    L, cum = len(wf), [0.0]
-    for v in wf:
-        cum.append(cum[-1] + v)
-    cdf = lambda u: 0.0 if u <= 0.0 else cum[L] if u >= L else cum[int(u)] + (u - int(u)) * wf[int(u)]  # noqa: E731
-    out = [max(0.0, cdf(m / s) - cdf((m - 1) / s)) for m in range(1, max(1, int(math.ceil(s * L))) + 1)]
+    L = len(wf)
+    n_out = max(1, int(math.ceil(s * L)))
+    if n_out > MAX_GI_LAGS:
+        raise ValueError(f"rescale_gi: scaled PMF length {n_out} exceeds cap {MAX_GI_LAGS}")
+    out = [0.0] * n_out
+    for i, wi in enumerate(wf):
+        if wi == 0.0:
+            continue
+        a, b = i * s, (i + 1) * s
+        k0, k1 = int(math.floor(a)), min(n_out - 1, int(math.floor(b)))
+        for k in range(k0, k1 + 1):
+            ov = min(b, float(k + 1)) - max(a, float(k))
+            if ov > 0.0:
+                out[k] += wi * (ov / s)
     while len(out) > 1 and out[-1] == 0.0:
         out.pop()
-    tot = sum(out)
+    tot = math.fsum(out)
     if tot <= 0:
         raise ValueError("rescale_gi: rescaled PMF has zero mass")
     return [x / tot for x in out]
@@ -188,7 +198,7 @@ def transmissibility_structures(raw: dict, check_horizon: bool = True) -> tuple[
                     raise ValueError(f"{where}.priors: must provide exactly {sorted(want)}")
                 key = tuple(ks)
                 entry = {"transmissibility": {"knots": ks}, "priors": dict(item["priors"]),
-                         "label": "knots:" + ",".join(f"{x:g}" for x in ks)}
+                         "label": "knots:" + ",".join(f"{x:.12g}" for x in ks)}
             else:
                 raise ValueError(f"{where}: must be 'constant' or {{knots: [...], priors: {{...}}}}")
             if key in seen:
@@ -199,7 +209,7 @@ def transmissibility_structures(raw: dict, check_horizon: bool = True) -> tuple[
     if isinstance(tr, dict) and set(tr) == {"knots"}:
         ks = _check_knots(tr["knots"], h, "dynamics.transmissibility.knots", check_horizon)
         return [{"transmissibility": {"knots": ks}, "priors": {},
-                 "label": "knots:" + ",".join(f"{x:g}" for x in ks)}], "marginal_likelihood"
+                 "label": "knots:" + ",".join(f"{x:.12g}" for x in ks)}], "marginal_likelihood"
     raise ValueError("dynamics.transmissibility: constant | {knots: [t, ...]} | {pool: [...], weighting?}")
 
 
@@ -207,12 +217,19 @@ def structural_variants(raw: dict) -> tuple[list[dict], str]:
     """(variants, weighting): Cartesian product of generation-interval scales and transmissibility structures."""
     gi, scales = gi_from_spec(raw), gi_scales(raw)
     structs, weighting = transmissibility_structures(raw)
-    return [{"id": f"gi{sc:.6g}_{st['label'].replace(':', '_').replace(',', '_')}", "gi_scale": sc,
-             "gi": {"dt": gi["dt"], "w": rescale_gi(gi["w"], sc)}, "transmissibility": st["transmissibility"],
-             "transmissibility_label": st["label"], "priors": dict(st["priors"]),
-             "config": {"generation_interval": {"dt": gi["dt"], "w": rescale_gi(gi["w"], sc)},
-                        "dt": gi["dt"], "transmissibility": st["transmissibility"]}}
-            for sc in scales for st in structs], weighting
+    out = []
+    for sc in scales:
+        w_sc = rescale_gi(gi["w"], sc)
+        for st in structs:
+            vid = f"gi{sc:.12g}_{st['label'].replace(':', '_').replace(',', '_')}"
+            out.append({"id": vid, "gi_scale": sc, "gi": {"dt": gi["dt"], "w": w_sc},
+                        "transmissibility": st["transmissibility"], "transmissibility_label": st["label"],
+                        "priors": dict(st["priors"]),
+                        "config": {"generation_interval": {"dt": gi["dt"], "w": w_sc},
+                                   "dt": gi["dt"], "transmissibility": st["transmissibility"]}})
+    if len({v["id"] for v in out}) != len(out):
+        raise ValueError("dynamics: structural variants produced duplicate variant ids")
+    return out, weighting
 
 
 def engine_config(raw: dict) -> dict:
@@ -296,7 +313,10 @@ def validate_pending(s) -> list[str]:
     gi_ok, scales, tr_structs = None, [1.0], None
     try:
         gi_ok = gi_from_spec(r, s.base)
+        from toolkit.engines.renewal.engine import check_generation_interval
+        check_generation_interval(gi_ok, gi_ok["dt"])
     except (OSError, ValueError) as e:
+        gi_ok = None
         bad.append(str(e))
     try:
         scales = gi_scales(r)
@@ -916,10 +936,28 @@ def _self_test() -> int:
         for ws in rescaled:
             check_generation_interval({"dt": "week", "w": ws}, "week")
         means = [sum((i + 1) * v for i, v in enumerate(ws)) for ws in rescaled]
+        tail_w = rescale_gi([1.0, 1e-18], 2.0)
+        cap_refused = False
+        try:
+            rescale_gi([0.5, 0.5], 1e6)
+        except ValueError:
+            cap_refused = True
         ok(rescaled[2] == w0 and all(abs(sum(ws) - 1.0) < 1e-12 and ws[-1] > 0.0 for ws in rescaled)
-           and all(b > a for a, b in zip(means, means[1:])), f"ES30 rescale_gi exact, normalised, monotone: {means}")
+           and all(b > a for a, b in zip(means, means[1:]))
+           and len(tail_w) == 4 and tail_w[2] > 0.0 and tail_w[3] > 0.0 and cap_refused,
+           f"ES30 rescale_gi exact, normalised, monotone, tail-preserving, lag-capped: {means}")
         check_valid(lambda r: (r["dynamics"]["generation_interval"].update(scale_range={"range": [0.8, 1.2], "steps": 5, "source": "toy"}),
                                r["uncertainty"]["sources"].append({"kind": "generation_interval"})), "ES31a scale_range")
+        raw_close = copy.deepcopy(yaml.safe_load(open(sp)))
+        raw_close["dynamics"]["generation_interval"]["scale_range"] = {"range": [0.9999999, 1.0000001], "steps": 3, "source": "toy"}
+        vs_close, _ = structural_variants(raw_close)
+        ok(len({v["id"] for v in vs_close}) == 3, f"ES31e distinct variant ids for close scales: {[v['id'] for v in vs_close]}")
+        # Base GI weights [1, 1] must be refused even under asymmetric scale_range omitting 1.0
+        mut(lambda r: (open(os.path.join(d, "data", "gi_bad.csv"), "w").write("lag,p\n1,1.0\n2,1.0\n"),
+                       r["dynamics"]["generation_interval"].update(csv="data/gi_bad.csv", values=[1.0, 1.0],
+                                                                   scale_range={"range": [0.8, 1.4], "steps": 3, "source": "toy"}),
+                       r["uncertainty"]["sources"].append({"kind": "generation_interval"})),
+            "sum", "ES31f invalid base GI refused even when asymmetric scale_range omits 1.0")
         mut(lambda r: r["dynamics"]["generation_interval"].update(scale_range={"range": [0.8, 1.2], "source": "toy"}), "requires 'generation_interval'", "ES31b")
         mut(lambda r: r["uncertainty"]["sources"].append({"kind": "generation_interval"}), "requires dynamics.generation_interval.scale_range", "ES31c")
         for desc, sr, needle in (("lo<=0", {"range": [0.0, 1.2], "source": "toy"}, "0 < lo"), ("no 1.0", {"range": [1.1, 1.5], "source": "toy"}, "1.0"),

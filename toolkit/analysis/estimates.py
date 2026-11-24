@@ -375,7 +375,7 @@ def benchmark_acceptance(eng, doc: dict | None = None) -> str:
     return str(getattr(eng, "validation_label", "") or f"validated against its benchmark pack ({len(rows)} benchmarks)")
 
 
-def _z_of_x(P: C.Problem, X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+def _z_of_x(P: C.Problem, X: np.ndarray, eps: float = 1e-15) -> np.ndarray:
     """Inverse of P.x_of_z: map parameter rows X (N, d) back to standard-normal z-space."""
     from scipy import stats
     from scipy.special import ndtri
@@ -488,23 +488,31 @@ def _variant_engine(eng, cfg: dict):
     return type(eng)(**kw)
 
 
-def estimate_log_ml(P: C.Problem, s: dict, rng, n_prop: int = 2048) -> float:
-    """Log marginal likelihood via Meng-Wong (1996) bridge sampling in z-space against a defensive posterior mixture."""
+def _variant_seed(base_seed: int, vid: str, salt: int) -> list[int]:
+    import hashlib
+    h = int.from_bytes(hashlib.sha256(vid.encode("utf-8")).digest()[:4], "little")
+    return [int(base_seed), int(salt), h]
+
+
+def _bridge_fold(P: C.Problem, Z_fit: np.ndarray, Z_eval: np.ndarray, ll_eval: np.ndarray, rng, n_prop: int) -> float:
     from scipy.linalg import solve_triangular
     from scipy.special import logsumexp
-    Z1 = _z_of_x(P, s["rows"])
-    N1, d = Z1.shape
-    m = np.mean(Z1, axis=0)
-    cov = np.cov(Z1.T).reshape(d, d) if N1 > 1 else np.eye(d)
+    Nf, d = Z_fit.shape
+    N1 = len(Z_eval)
+    if Nf < 2 or N1 < 2:
+        return float("nan")
+    m = np.mean(Z_fit, axis=0)
+    cov = np.cov(Z_fit.T).reshape(d, d)
     cov = 0.5 * (cov + cov.T)
-    K = min(64, N1)
-    centres = Z1[np.linspace(0, N1 - 1, K).astype(int)]
+    K = min(64, Nf)
+    centres = Z_fit[np.linspace(0, Nf - 1, K).astype(int)]
     bw = (4.0 / ((d + 2) * K)) ** (1.0 / (d + 4))
     Lg, Ll = np.linalg.cholesky(2.0 * cov + 1e-4 * np.eye(d)), np.linalg.cholesky(bw * bw * cov + 1e-4 * np.eye(d))
     wp, wg, wl = 0.15, 0.25, 0.60
     n_pr, n_gl = int(round(wp * n_prop)), int(round(wg * n_prop))
+    n_lc = max(1, int(n_prop) - n_pr - n_gl)
     Z2 = np.vstack([rng.standard_normal((n_pr, d)), m + rng.standard_normal((n_gl, d)) @ Lg.T,
-                    centres[rng.integers(0, K, int(n_prop) - n_pr - n_gl)] + rng.standard_normal((int(n_prop) - n_pr - n_gl, d)) @ Ll.T])
+                    centres[rng.integers(0, K, n_lc)] + rng.standard_normal((n_lc, d)) @ Ll.T])
     log_norm = -float(np.sum(np.log(np.diag(Ll)))) - 0.5 * d * math.log(2.0 * math.pi)
 
     def log_q(Zq):
@@ -517,16 +525,37 @@ def estimate_log_ml(P: C.Problem, s: dict, rng, n_prop: int = 2048) -> float:
 
     ll2, _ = P.evaluate(P.x_of_z(Z2))
     a = np.where(np.isfinite(ll2), ll2 + C._logphi(Z2), -np.inf) - log_q(Z2)
-    b = np.asarray(s["ll_rows"], float) + C._logphi(Z1) - log_q(Z1)
+    b = np.asarray(ll_eval, float) + C._logphi(Z_eval) - log_q(Z_eval)
     N2 = len(Z2)
-    r, ls1, ls2 = float(logsumexp(a) - math.log(N2)), math.log(N1 / (N1 + N2)), math.log(N2 / (N1 + N2))
-    for _ in range(60 if math.isfinite(r) else 0):
+    r = float(logsumexp(a) - math.log(N2))
+    if not math.isfinite(r):
+        return float("nan")
+    ls1, ls2 = math.log(N1 / (N1 + N2)), math.log(N2 / (N1 + N2))
+    for _ in range(80):
         rn = float(logsumexp(a - np.logaddexp(ls1 + a - r, ls2)) - math.log(N2)
                    - (logsumexp(-np.logaddexp(ls1 + b - r, ls2)) - math.log(N1)))
-        if not math.isfinite(rn) or abs(rn - r) < 1e-8:
-            return rn if math.isfinite(rn) else r
+        if not math.isfinite(rn):
+            return float("nan")
+        if abs(rn - r) < 1e-7:
+            return rn
         r = rn
-    return r
+    return float("nan")
+
+
+def estimate_log_ml(P: C.Problem, s: dict, rng, n_prop: int = 2048) -> float:
+    """Log marginal likelihood via 2-fold cross-fitted Meng-Wong (1996) bridge sampling in z-space against a
+    defensive posterior mixture (eliminates in-sample proposal overfitting bias; returns NaN on non-convergence)."""
+    Z1 = _z_of_x(P, s["rows"])
+    ll = np.asarray(s["ll_rows"], float)
+    if len(Z1) < 4 or not np.all(np.isfinite(ll)):
+        return float("nan")
+    perm = rng.permutation(len(Z1))
+    half = len(Z1) // 2
+    ia, ib = perm[:half], perm[half:]
+    np_fold = max(256, int(n_prop) // 2)
+    r_ab = _bridge_fold(P, Z1[ia], Z1[ib], ll[ib], rng, np_fold)
+    r_ba = _bridge_fold(P, Z1[ib], Z1[ia], ll[ia], rng, np_fold)
+    return 0.5 * (r_ab + r_ba) if (math.isfinite(r_ab) and math.isfinite(r_ba)) else float("nan")
 
 
 def _softmax(vals) -> np.ndarray:
@@ -535,27 +564,33 @@ def _softmax(vals) -> np.ndarray:
     return w / float(np.sum(w))
 
 
-def _variant_weights(log_mls, ll_maxs, weighting: str, drop_max: float) -> np.ndarray:
-    if weighting == "equal":
+def _variant_weights(log_mls, ll_maxs, weighting: str, drop_max: float,
+                     ll_verified=None) -> tuple[np.ndarray, str]:
+    """Return (weights, actual_weighting_used). Equal weighting requires verified maxima for every variant; if any
+    maximum is unverified or fewer than 2 variants survive the drop screen, falls back to marginal_likelihood."""
+    if weighting == "equal" and (ll_verified is None or all(bool(v) for v in ll_verified)):
         best = max(ll_maxs)
         kept = [i for i, m in enumerate(ll_maxs) if (best - m) <= drop_max]
         if len(kept) >= 2:
-            return np.array([1.0 / len(kept) if i in kept else 0.0 for i in range(len(log_mls))], float)
-    return _softmax(log_mls)
+            return np.array([1.0 / len(kept) if i in kept else 0.0 for i in range(len(log_mls))], float), "equal"
+    return _softmax(log_mls), "marginal_likelihood"
 
 
-def _allocate_draws(weights, nd: int) -> list[int]:
-    """Deterministic largest-remainder allocation of `nd` draws summing to `nd`."""
+def _allocate_draws(weights, nd: int, keys=None) -> list[int]:
+    """Deterministic largest-remainder allocation of `nd` draws summing to `nd` (tie-broken by `keys` if given)."""
     w = np.asarray(weights, float)
     raw = w * int(nd)
     counts = np.floor(raw).astype(int)
-    for i in sorted(range(len(w)), key=lambda i: (-float(raw[i] - counts[i]), -float(w[i]), i))[:int(nd) - int(counts.sum())]:
+    ks = list(range(len(w))) if keys is None else list(keys)
+    order = sorted(range(len(w)), key=lambda i: (-round(float(raw[i] - counts[i]), 12), -round(float(w[i]), 12), ks[i]))
+    for i in order[:int(nd) - int(counts.sum())]:
         counts[i] += 1
     return [int(c) for c in counts]
 
 
-def _determined_summary(E, P, cls, best, auxp, vals, dep_xy, lvl, th, fallback_on) -> dict:
-    undetermined = [t["parameter"] for t in C.prior_range_tests(cls, P)]
+def _determined_summary(E, P, cls, best, auxp, vals, dep_xy, lvl, th, fallback_on, P_cls=None) -> dict:
+    Pc = P if P_cls is None else P_cls
+    undetermined = [t["parameter"] for t in C.prior_range_tests(cls, Pc)]
     on_ridges = sorted({q for r in cls.get("ridges") or [] for q in r.get("params") or []})
     cmin = float(C.thresholds()["contraction_prior_dominated"])
     flat = flat_dependence(P, best, [o["name"] for o in E.outputs])
@@ -576,7 +611,7 @@ def _determined_summary(E, P, cls, best, auxp, vals, dep_xy, lvl, th, fallback_o
         dep = {}
         for p in undetermined:
             xy = dep_xy(p, n)
-            dep[p] = dependence(P.priors[p].natural(xy[0]), xy[1], lvl) if xy is not None else 0.0
+            dep[p] = dependence(Pc.priors[p].natural(xy[0]), xy[1], lvl) if xy is not None else 0.0
         out[n] = {"prior_interval": C.interval(vp, lvl), "posterior_interval": C.interval(vq, lvl), "contraction": c,
                   "scale": "log" if pos else "linear", "flat_spread_per_prior_sd": flat[n], "flat_share": share,
                   "depends_on": on, "class": cl_, "dependence": dep}
@@ -656,53 +691,210 @@ def _run_prior_range_tests(spec, eng, E, P, cls, smp, s, xh, decision, dec, nd, 
     return tests
 
 
+def _variant_int_seed(base_seed: int, vid: str, salt: int) -> int:
+    import hashlib
+    return int.from_bytes(hashlib.sha256(f"{base_seed}:{salt}:{vid}".encode("utf-8")).digest()[:4], "little") & 0x7FFFFFFF
+
+
+class _PriorView:
+    """Lightweight Problem view exposing `.names` and `.priors` across pooled variants."""
+
+    def __init__(self, names: list[str], priors: dict):
+        self.names = list(names)
+        self.priors = dict(priors)
+
+
+def _merge_classes(fits: list[dict], contrib: list[int], shared_names: list[str]) -> tuple[dict, _PriorView]:
+    """Classify every contributing variant and merge classes, contractions, ridges, and priors deterministically."""
+    c_rank = {"identified": 0, "partly_identified": 1, "prior_dominated": 2}
+    l_rank = {"identified": 0, "partly_identified": 1, "on_ridge": 2, "unidentified": 2}
+    cl_map = {}
+    for i in contrib:
+        cl_map[i] = C.classify(fits[i]["P"], fits[i]["s"])
+        refusal_guard(fits[i]["E"], f"the identifiability classes (variant {fits[i]['v']['id']})")
+    extra_names = sorted({n for i in contrib for n in fits[i]["P"].names if n not in shared_names})
+    all_names = list(shared_names) + extra_names
+    classes, lclasses, contraction, priors = {}, {}, {}, {}
+    for n in all_names:
+        owners = [i for i in contrib if n in fits[i]["P"].names]
+        classes[n] = max((cl_map[i]["classes"][n] for i in owners), key=lambda k: c_rank.get(k, 2))
+        lclasses[n] = max((cl_map[i]["likelihood_classes"][n] for i in owners), key=lambda k: l_rank.get(k, 2))
+        contraction[n] = float(min(cl_map[i]["contraction"][n] for i in owners))
+        prs = [fits[i]["P"].priors[n] for i in owners]
+        ivs = [pr.interval() for pr in prs]
+        if all(iv == ivs[0] for iv in ivs):
+            priors[n] = prs[0]
+        else:
+            lo, hi = min(iv[0] for iv in ivs), max(iv[1] for iv in ivs)
+            priors[n] = C.Prior(n, "uniform", lo, hi, source="; ".join(dict.fromkeys(pr.source for pr in prs if pr.source)))
+    ridges, seen_r = [], set()
+    for i in sorted(contrib, key=lambda idx: fits[idx]["v"]["id"]):
+        for r in cl_map[i].get("ridges") or []:
+            key = tuple(sorted(r.get("params") or []))
+            if key not in seen_r:
+                seen_r.add(key)
+                ridges.append(r)
+    merged = {"method": cl_map[contrib[0]]["method"], "classes": classes, "likelihood_classes": lclasses,
+              "contraction": contraction, "ridges": ridges}
+    return merged, _PriorView(all_names, priors)
+
+
+def _run_pooled_prior_range_tests(spec, fits, weighting, merged_cls, P_merged, decision, dec, nd, seed, lvl, th,
+                                  prior_range, contrib, var_X) -> list:
+    """Automatic prior_range tests evaluated against the consistently pooled structural model."""
+    todo = [t for t in (C.prior_range_tests(merged_cls, P_merged) if prior_range else [])
+            if prior_range is True or t["parameter"] in prior_range]
+    if not todo:
+        return []
+    out_names = [o["name"] for o in fits[0]["E"].outputs]
+    v_ids = [f["v"]["id"] for f in fits]
+    base_max, base_ver = [], []
+    for f in fits:
+        if f["pair"] is None:
+            rv = np.asarray(f["s"]["rows"], float)
+            f["pair"] = max_loglik(f["P"], [f["s"]["best"]] + [rv[k] for k in np.linspace(0, len(rv) - 1, 4).astype(int)])
+            refusal_guard(f["E"], f"the likelihood maximisation (variant {f['v']['id']})")
+        base_max.append(float(f["pair"][0]))
+        base_ver.append(bool(f["pair"][1]))
+    n_ep = min(int(nd), 1000)
+    tests = []
+
+    def end_fit(p_name, v, kind, has_p):
+        lmls_e, lmaxs_e, lvers_e, auxs_e = [], [], [], []
+        for i, f in enumerate(fits):
+            vid = f["v"]["id"]
+            if i not in has_p:
+                lmls_e.append(float(f["lml"]))
+                lmaxs_e.append(base_max[i])
+                lvers_e.append(base_ver[i])
+                auxs_e.append(f["s"]["aux_rows"])
+                continue
+            lo_i, hi_i = f["P"].priors[p_name].interval()
+            v_use = min(max(float(v), float(lo_i)), float(hi_i))
+            stage = f"the fit at {p_name} = {v_use:g} (variant {vid})"
+            try:
+                Ef = EstimatesProblem(spec, f["eng"], fixed={p_name: v_use}, extra_priors=f["v"]["priors"])
+                sf = sample_checked(Ef, Ef.problem, _variant_int_seed(seed, vid, 41), stage)
+                lml_f = estimate_log_ml(Ef.problem, sf, np.random.default_rng(_variant_seed(seed, vid, 42)))
+                refusal_guard(Ef, stage)
+                if not math.isfinite(lml_f):
+                    raise C.CalibrationRefused("posterior_ess", f"{stage}: non-finite marginal likelihood")
+                rf = np.asarray(sf["rows"], float)
+                dr_f = C.draws({"sample_id": sf["sample_id"], "names": sf["names"], "rows": rf}, n_ep,
+                               _variant_int_seed(seed, vid, 43))
+                Xf = {n: np.array([d["values"][n] for d in dr_f]) for n in sf["names"]}
+                _, auxf = Ef.loglik(Xf)
+                mf, vf = max_loglik(Ef.problem, [sf["best"]] + [rf[k] for k in np.linspace(0, len(rf) - 1, 4).astype(int)])
+                refusal_guard(Ef, stage)
+            except C.CalibrationRefused as e:
+                return {"value": float(v), "kind": kind, "refused": str(e)}
+            lmls_e.append(float(lml_f))
+            lmaxs_e.append(float(mf))
+            lvers_e.append(bool(vf))
+            auxs_e.append(auxf)
+        w_e, _ = _variant_weights(lmls_e, lmaxs_e, weighting, th["end_loglik_drop_max"], lvers_e)
+        cnts = _allocate_draws(w_e, n_ep, keys=v_ids)
+        pooled = {on: [] for on in out_names}
+        for i, nv in enumerate(cnts):
+            if nv == 0:
+                continue
+            src = auxs_e[i]
+            m_avail = len(src[out_names[0]])
+            idx = np.random.default_rng(_variant_seed(seed, v_ids[i], 44)).choice(m_avail, size=nv, replace=nv > m_avail)
+            for on in out_names:
+                pooled[on].append(np.asarray(src[on], float)[idx])
+        vals_e = {on: np.concatenate(pooled[on]) for on in out_names}
+        drop = float(max(base_max[i] for i in has_p) - max(lmaxs_e[i] for i in has_p))
+        verified = all(base_ver[i] and lvers_e[i] for i in has_p)
+        end = {"value": float(v), "kind": kind,
+               "median": {on: float(np.median(vals_e[on])) for on in out_names},
+               "interval": {on: C.interval(vals_e[on], lvl) for on in out_names},
+               "loglik_drop": drop, "rejected_by_data": drop > th["end_loglik_drop_max"],
+               "fit_verified": bool(verified)}
+        if dec:
+            df = _decision(dec, vals_e[dec["output"]])
+            end.update(verdict=df["verdict"], probability=df["probability"])
+        return end
+
+    for t in todo:
+        p = t["parameter"]
+        has_p = [i for i, f in enumerate(fits) if p in f["P"].names]
+        res = {"id": t["id"], "parameter": p, "class": t["class"], "values": t["values"], "source": t["source"],
+               "status": "run", "ends": []}
+        p_draws = np.concatenate([var_X[i][p] for i in contrib if i in var_X and p in var_X[i]])
+        post_q = C.interval(p_draws, lvl)
+        sides_ok = True
+        for side, v in enumerate(t["values"]):
+            e = end_fit(p, v, "declared", has_p)
+            res["ends"].append(e)
+            if e.get("rejected_by_data"):
+                e2 = end_fit(p, post_q[side], "supported", has_p)
+                res["ends"].append(e2)
+                sides_ok = sides_ok and not e2.get("rejected_by_data", True)
+        if any("refused" in e or not e.get("fit_verified") for e in res["ends"]) or not sides_ok:
+            res["status"] = "not_assessable"
+        if dec and res["status"] == "run":
+            kept = [e for e in res["ends"] if not e["rejected_by_data"]]
+            res["decision_changes"] = any(e["verdict"] != decision["verdict"] for e in kept)
+            res["ends_rejected_by_data"] = [e["value"] for e in res["ends"] if e["rejected_by_data"]]
+        tests.append(res)
+    return tests
+
+
 def _analyse_pooled(spec, eng, variants, weighting, validation, seed, n_draws, prior_range) -> dict:
     """Multi-variant structural pooling over declared generation-interval scales and transmissibility structures."""
     from toolkit.spec import estimates as ESPEC
     raw, u = spec.raw, spec.raw["uncertainty"]
     lvl, th, fits = float(u.get("level", 0.95)), thresholds(), []
-    for i, v in enumerate(variants):
+    for v in variants:
+        vid = v["id"]
         ev = _variant_engine(eng, v["config"])
         Ev = EstimatesProblem(spec, ev, extra_priors=v["priors"])
-        sv = sample_checked(Ev, Ev.problem, seed + 1009 * i, f"the posterior sample (variant {v['id']})")
+        sv = sample_checked(Ev, Ev.problem, _variant_int_seed(seed, vid, 11), f"the posterior sample (variant {vid})")
         if np.any(~np.isfinite(sv["ll_rows"])):
-            raise C.CalibrationRefused("posterior_ess", f"variant {v['id']}: a canonical draw has no finite likelihood")
-        lml = estimate_log_ml(Ev.problem, sv, np.random.default_rng([seed, 29, i]))
-        refusal_guard(Ev, f"the marginal likelihood (variant {v['id']})")
+            raise C.CalibrationRefused("posterior_ess", f"variant {vid}: a canonical draw has no finite likelihood")
+        lml = estimate_log_ml(Ev.problem, sv, np.random.default_rng(_variant_seed(seed, vid, 29)))
+        refusal_guard(Ev, f"the marginal likelihood (variant {vid})")
         if not math.isfinite(lml):
-            raise C.CalibrationRefused("posterior_ess", f"variant {v['id']}: non-finite marginal likelihood")
+            raise C.CalibrationRefused("posterior_ess", f"variant {vid}: non-finite marginal likelihood")
         pair = None
         if weighting == "equal":
             rv = np.asarray(sv["rows"], float)
             pair = max_loglik(Ev.problem, [sv["best"]] + [rv[k] for k in np.linspace(0, len(rv) - 1, 4).astype(int)])
-            refusal_guard(Ev, f"the likelihood maximisation (variant {v['id']})")
+            refusal_guard(Ev, f"the likelihood maximisation (variant {vid})")
         fits.append({"v": v, "eng": ev, "E": Ev, "P": Ev.problem, "s": sv, "lml": lml,
-                     "pair": pair, "lmax": pair[0] if pair is not None else float(sv["best_ll"])})
-    weights = _variant_weights([f["lml"] for f in fits], [f["lmax"] for f in fits], weighting, th["end_loglik_drop_max"])
-    ref_idx = int(np.argmax(weights))
+                     "pair": pair, "lmax": pair[0] if pair is not None else float(sv["best_ll"]),
+                     "lver": bool(pair[1]) if pair is not None else False})
+    weights, actual_weighting = _variant_weights(
+        [f["lml"] for f in fits], [f["lmax"] for f in fits], weighting, th["end_loglik_drop_max"],
+        [f["lver"] for f in fits] if weighting == "equal" else None)
+    v_ids = [f["v"]["id"] for f in fits]
+    ref_idx = max(range(len(fits)), key=lambda i: (round(float(weights[i]), 12), v_ids[i]))
     ref = fits[ref_idx]
     v_ref, E_ref, P_ref, s_ref = ref["v"], ref["E"], ref["P"], ref["s"]
-    cls = C.classify(P_ref, s_ref)
-    refusal_guard(E_ref, "the identifiability classes")
     xh, conv, msg = C._map_point(P_ref, s_ref["best"])
     refusal_guard(E_ref, "the posterior mode")
-    smp_ref = {"sample_id": s_ref["sample_id"], "names": s_ref["names"], "rows": np.asarray(s_ref["rows"], float)}
     shared_names = [n for n in P_ref.names if n not in v_ref["priors"]]
     nd = int(n_draws or u.get("draws", 1000))
-    draw_counts = _allocate_draws(weights, nd)
-    sample_counts = _allocate_draws(weights, max(nd, len(s_ref["rows"])))
+    draw_counts = _allocate_draws(weights, nd, keys=v_ids)
+    sample_counts = _allocate_draws(weights, max(nd, len(s_ref["rows"])), keys=v_ids)
     for i in range(len(fits)):
         if draw_counts[i] > 0 and sample_counts[i] == 0:
-            j = max(range(len(fits)), key=lambda k: sample_counts[k] - draw_counts[k])
+            j = max(range(len(fits)), key=lambda k: (sample_counts[k] - draw_counts[k], v_ids[k]))
             sample_counts[i], sample_counts[j] = sample_counts[i] + 1, sample_counts[j] - 1
-    blocks, offsets, canon_rows, cur = [], [], [], 0
+    contrib = [i for i, c in enumerate(draw_counts) if c > 0]
+    merged_cls, P_merged = _merge_classes(fits, contrib, shared_names)
+    blocks, offsets, canon_rows, variant_samples, cur = [], [], [], {}, 0
     for i, mv in enumerate(sample_counts):
         offsets.append(cur)
         cv = None
         if mv > 0:
+            vid, names_i = v_ids[i], fits[i]["s"]["names"]
             rv = np.asarray(fits[i]["s"]["rows"], float)
-            cv = rv[np.random.default_rng([seed, 23, i]).choice(len(rv), size=mv, replace=mv > len(rv))]
-            blocks.append(cv[:, [fits[i]["s"]["names"].index(nm) for nm in shared_names]])
+            cv = rv[np.random.default_rng(_variant_seed(seed, vid, 23)).choice(len(rv), size=mv, replace=mv > len(rv))]
+            v_sid = C._sample_id(names_i, cv)
+            variant_samples[vid] = {"sample_id": v_sid, "names": list(names_i), "rows": cv}
+            blocks.append(cv[:, [names_i.index(nm) for nm in shared_names]])
             cur += mv
         canon_rows.append(cv)
     pooled_rows = np.vstack(blocks)
@@ -711,16 +903,18 @@ def _analyse_pooled(spec, eng, variants, weighting, validation, seed, n_draws, p
     for i, nv in enumerate(draw_counts):
         if nv == 0:
             continue
-        cv, names_i, Ei = canon_rows[i], fits[i]["s"]["names"], fits[i]["E"]
-        loc_idx = np.random.default_rng([seed, 13, i]).choice(len(cv), size=nv, replace=nv > len(cv))
+        vid, cv, names_i, Ei = v_ids[i], canon_rows[i], fits[i]["s"]["names"], fits[i]["E"]
+        v_sid = variant_samples[vid]["sample_id"]
+        loc_idx = np.random.default_rng(_variant_seed(seed, vid, 13)).choice(len(cv), size=nv, replace=nv > len(cv))
         sub = cv[loc_idx]
-        dr.extend({"sample_id": pooled_sid, "row": int(offsets[i] + int(li)), "variant": fits[i]["v"]["id"],
+        dr.extend({"sample_id": pooled_sid, "row": int(offsets[i] + int(li)), "variant": vid,
+                   "variant_sample_id": v_sid, "variant_row": int(li),
                    "values": {nm: float(row[j]) for j, nm in enumerate(names_i)}} for li, row in zip(loc_idx, sub))
         Xv = {nm: sub[:, j] for j, nm in enumerate(names_i)}
         llv, auxv = Ei.loglik(Xv)
         if Ei.failed or not np.all(np.isfinite(llv)):
             raise C.CalibrationRefused("posterior_engine_failure",
-                                       engine_failure_message(Ei, f"the uncertainty draws (variant {fits[i]['v']['id']})"))
+                                       engine_failure_message(Ei, f"the uncertainty draws (variant {vid})"))
         var_X[i], var_vals[i] = Xv, {o["name"]: auxv[o["name"]] for o in E_ref.outputs}
         for o in E_ref.outputs:
             vals_parts[o["name"]].append(auxv[o["name"]])
@@ -728,26 +922,40 @@ def _analyse_pooled(spec, eng, variants, weighting, validation, seed, n_draws, p
     X_pool = {n: np.array([d["values"][n] for d in dr]) for n in shared_names}
     dec = raw["deliverable"].get("decision")
     decision = _decision(dec, vals[dec["output"]]) if dec else None
-    tests = _run_prior_range_tests(spec, ref["eng"], E_ref, P_ref, cls, smp_ref, s_ref, xh, decision, dec, nd, seed,
-                                   lvl, th, prior_range, extra_priors=v_ref["priors"], ll_max_init=ref["pair"])
-    rng, auxp_parts = np.random.default_rng([seed, 17]), {o["name"]: [] for o in E_ref.outputs}
-    for i, kp in enumerate(_allocate_draws(weights, PRIOR_DRAWS)):
+    tests = _run_pooled_prior_range_tests(spec, fits, weighting, merged_cls, P_merged, decision, dec, nd, seed,
+                                          lvl, th, prior_range, contrib, var_X)
+    # Pre-data structural weights (uniform over all declared variants) for the prior-only comparison
+    prior_weights = np.full(len(fits), 1.0 / len(fits), float)
+    auxp_parts = {o["name"]: [] for o in E_ref.outputs}
+    for i, kp in enumerate(_allocate_draws(prior_weights, PRIOR_DRAWS, keys=v_ids)):
         if kp > 0:
             Ei, Pi = fits[i]["E"], fits[i]["P"]
-            _, auxp_i = Ei.loglik(_rows_dict(Pi.names, Pi.x_of_z(rng.standard_normal((kp, len(Pi.names))))))
-            refusal_guard(Ei, f"the outputs under the priors alone (variant {fits[i]['v']['id']})")
+            prng = np.random.default_rng(_variant_seed(seed, v_ids[i], 17))
+            _, auxp_i = Ei.loglik(_rows_dict(Pi.names, Pi.x_of_z(prng.standard_normal((kp, len(Pi.names))))))
+            refusal_guard(Ei, f"the outputs under the priors alone (variant {v_ids[i]})")
             for o in E_ref.outputs:
                 auxp_parts[o["name"]].append(auxp_i[o["name"]])
     auxp = {o["name"]: np.concatenate(auxp_parts[o["name"]]) for o in E_ref.outputs}
     active_struct = [k for k in ESPEC.UQ_STRUCTURAL if k in {x.get("kind") for x in u.get("sources") or [] if isinstance(x, dict)}]
-    dep_xy = lambda p, n: ((X_pool[p], vals[n]) if p in X_pool else (var_X[ref_idx][p], var_vals[ref_idx][n])  # noqa: E731
-                           if ref_idx in var_X and p in var_X[ref_idx] and len(var_X[ref_idx][p]) > 1 else None)
-    determined = _determined_summary(E_ref, P_ref, cls, s_ref["best"], auxp, vals, dep_xy, lvl, th, active_struct)
+
+    def dep_xy(p, n):
+        if p in X_pool:
+            return X_pool[p], vals[n]
+        xs = [var_X[i][p] for i in contrib if i in var_X and p in var_X[i]]
+        ys = [var_vals[i][n] for i in contrib if i in var_X and p in var_X[i]]
+        if not xs:
+            return None
+        xa, ya = np.concatenate(xs), np.concatenate(ys)
+        return (xa, ya) if len(xa) > 1 else None
+
+    determined = _determined_summary(E_ref, P_ref, merged_cls, s_ref["best"], auxp, vals, dep_xy, lvl, th,
+                                     active_struct, P_cls=P_merged)
     yrep_parts, outs_all = [], []
-    for i, kp in enumerate(_allocate_draws(np.asarray(draw_counts, float) / nd, min(PPC_DRAWS, nd))):
+    for i, kp in enumerate(_allocate_draws(np.asarray(draw_counts, float) / nd, min(PPC_DRAWS, nd), keys=v_ids)):
         if kp > 0:
-            yr_i, _, o_i = fits[i]["E"].predictive({n: val[:kp] for n, val in var_X[i].items()}, rng)
-            refusal_guard(fits[i]["E"], f"the posterior predictive check (variant {fits[i]['v']['id']})")
+            yr_i, _, o_i = fits[i]["E"].predictive({n: val[:kp] for n, val in var_X[i].items()},
+                                                   np.random.default_rng(_variant_seed(seed, v_ids[i], 31)))
+            refusal_guard(fits[i]["E"], f"the posterior predictive check (variant {v_ids[i]})")
             yrep_parts.append(yr_i)
             outs_all.extend(o_i)
     ppc, rt = _ppc_rt(np.vstack(yrep_parts), outs_all, E_ref, lvl)
@@ -759,11 +967,13 @@ def _analyse_pooled(spec, eng, variants, weighting, validation, seed, n_draws, p
     pooled_sample = {"sample_id": pooled_sid, "names": list(shared_names), "rows": pooled_rows, "method": s_ref["method"],
                      "seed": seed, "diagnostics": dict(s_ref["diagnostics"], structural_variants=len(fits), reference_variant=v_ref["id"])}
     post = {n: {"median": float(np.median(pooled_rows[:, j])), "interval": C.interval(pooled_rows[:, j], lvl),
-                "prior": P_ref.priors[n].describe()} for j, n in enumerate(shared_names)}
-    return {"E": E_ref, "P": P_ref, "sample": pooled_sample, "classes": cls, "map": dict(zip(P_ref.names, (float(v) for v in xh))),
+                "prior": P_merged.priors[n].describe()} for j, n in enumerate(shared_names)}
+    return {"E": E_ref, "P": P_merged, "sample": pooled_sample, "variant_samples": variant_samples, "classes": merged_cls,
+            "map": dict(zip(P_ref.names, (float(v) for v in xh))),
             "converged": conv, "message": msg, "validation": validation, "draws": dr, "values": vals, "level": lvl,
             "determined": determined, "decision": decision, "tests": tests, "ppc": ppc, "rt": rt, "posterior": post,
-            "seed": seed, "structural_variants": sv_rows, "structural_weighting": weighting, "reference_variant": v_ref["id"]}
+            "seed": seed, "structural_variants": sv_rows, "structural_weighting": actual_weighting,
+            "structural_weighting_requested": weighting, "reference_variant": v_ref["id"]}
 
 
 def analyse(spec, eng, seed: int = 0, n_draws: int | None = None, prior_range=True, log=print) -> dict:
@@ -983,8 +1193,11 @@ def results_template(spec, res) -> str:
                  f"[CLAIM:{n}.prior_hi] | {what} |")
     if res.get("structural_variants"):
         outs = [o["name"] for o in raw["deliverable"]["outputs"]]
+        w_used = res.get("structural_weighting", "marginal_likelihood")
+        w_req = res.get("structural_weighting_requested", w_used)
+        w_txt = f"{w_used} (requested: {w_req})" if w_req != w_used else w_used
         L += ["", "## Structural variants", "",
-              f"Pooled across {len(res['structural_variants'])} structural variants (weighting: {res.get('structural_weighting', 'marginal_likelihood')}).", "",
+              f"Pooled across {len(res['structural_variants'])} structural variants (weighting: {w_txt}).", "",
               "| Variant | GI scale | Transmissibility | Weight | Log ML | Draws | " + " | ".join(outs) + " |",
               "|---|---|---|---|---|---|" + "---|" * len(outs)]
         for sv in res["structural_variants"]:
@@ -1045,9 +1258,13 @@ def run(run_dir, spec, S, eng, arts: dict, data_in: list, eng_files: list, draws
                                           else "partly_or_prior_dominated")},
            "sample": {"sample_id": s["sample_id"], "names": s["names"], "rows": np.asarray(s["rows"]).tolist(),
                       "method": s["method"], "seed": s["seed"]},
-           "priors": {n: res["P"].priors[n].describe() for n in s["names"]}, "map": res["map"],
+           "priors": {n: res["P"].priors[n].describe() for n in res["P"].names}, "map": res["map"],
            "prior_range_tests": [t["id"] for t in C.prior_range_tests(cls, res["P"])],   # from the classes
            "prior_dominated": C.label_parts(cls, res["P"])["prior_dominated"]}
+    if res.get("variant_samples"):
+        cal["variant_samples"] = {
+            vid: {"sample_id": vs["sample_id"], "names": list(vs["names"]), "rows": np.asarray(vs["rows"], float).tolist()}
+            for vid, vs in res["variant_samples"].items()}
     arts["calibration"] = S.write("calibration", cal, C.PRODUCER, data_in)
     outs = {o["name"]: UQ.scalar_report([o], res["values"], res["level"], lab, len(res["draws"]),
                                         "posterior")["scalar_outputs"][o["name"]]
@@ -1076,6 +1293,7 @@ def run(run_dir, spec, S, eng, arts: dict, data_in: list, eng_files: list, draws
     if res.get("structural_variants"):
         est["structural_variants"] = res["structural_variants"]
         est["structural_weighting"] = res["structural_weighting"]
+        est["structural_weighting_requested"] = res.get("structural_weighting_requested", res["structural_weighting"])
     arts["estimates"] = S.write("estimates", est, PRODUCER, [arts["calibration"], arts["uncertainty"]] + data_in)
     figs = figures(run_dir, spec, res, arts["estimates"])
     arts["figures"] = S.write("figures", {"figures": figs, "not_produced": [], "tiers": {}, "groups": {},
@@ -1284,8 +1502,21 @@ def _self_test_structural(ok, rows) -> None:
     P2 = C.Problem(["x", "y"], {"x": C.Prior("x", "uniform", 0.0, 10.0), "y": C.Prior("y", "uniform", 0.0, 10.0)},
                    lambda X: (-0.5 * (((X["x"] - 5.0) / 0.5) ** 2 + ((X["y"] - 5.0) / 0.5) ** 2), {}))
     l1, l2 = estimate_log_ml(P1, C.sample(P1, seed=3), np.random.default_rng(7)), estimate_log_ml(P2, C.sample(P2, seed=4), np.random.default_rng(8))
+    # Cross-fitted bridge sampling avoids high-dimensional self-fit bias (exact log_ml == 0 for constant ll=0)
+    names12 = [f"p{k}" for k in range(12)]
+    P12 = C.Problem(names12, {n: C.Prior(n, "uniform", 0.0, 1.0) for n in names12},
+                    lambda X: (np.zeros(len(X["p0"])), {}))
+    rng12 = np.random.default_rng(11)
+    l12 = estimate_log_ml(P12, {"rows": P12.x_of_z(rng12.standard_normal((1000, 12))), "ll_rows": np.zeros(1000)}, rng12)
+    # Tail draws down to 1e-12 are not collapsed to a single coordinate (_z_of_x eps=1e-15)
+    Ptail = C.Problem(["x"], {"x": C.Prior("x", "uniform", 0.0, 1.0)},
+                      lambda X: (np.where(X["x"] <= 1e-12, 0.0, -np.inf), {}))
+    rngt = np.random.default_rng(19)
+    l_tail = estimate_log_ml(Ptail, {"rows": rngt.uniform(1e-15, 1e-12, size=(1000, 1)), "ll_rows": np.zeros(1000)}, rngt)
     alloc = _allocate_draws([1.0 / 3.0] * 3, 100)
-    ok(abs(l1 - exact) < 0.05 and abs(l2 - 2.0 * exact) < 0.08 and alloc == [34, 33, 33], f"AE26 log_ml ({l1:.4f}, {l2:.4f}) & alloc {alloc}")
+    ok(abs(l1 - exact) < 0.05 and abs(l2 - 2.0 * exact) < 0.08 and abs(l12) < 0.08
+       and abs(l_tail - math.log(1e-12)) < 0.15 and alloc == [34, 33, 33],
+       f"AE26 log_ml ({l1:.4f}, {l2:.4f}, 12D={l12:.4f}, tail={l_tail:.2f}) & alloc {alloc}")
     pool = ["constant", {"knots": [15 * 7.0 / 365.25], "priors": {"transmissibility:1": {"dist": "loguniform", "range": [0.3, 3.0], "source": "toy"}}}]
 
     def prep(d, fn):
@@ -1323,17 +1554,48 @@ def _self_test_structural(ok, rows) -> None:
            and "## Structural variants" in txt_p and "[CLAIM:" not in txt_p
            and "generation interval, transmissibility structure" in rep_p["interval_label"],
            f"AE28c pooled widens reff_next ({w_pool:.4f} > {w_fixed:.4f}) and renders results.md")
-    w_eq = _variant_weights([-10.0, -11.0, -20.0], [-5.0, -5.5, -12.0], "equal", 1.92)
-    w_fb = _variant_weights([-10.0, -15.0], [-5.0, -10.0], "equal", 1.92)
-    with tempfile.TemporaryDirectory() as d:
-        sp = prep(os.path.realpath(d), lambda r: (r["dynamics"].update(transmissibility={"pool": pool, "weighting": "equal"}),
-                                                  r["uncertainty"]["sources"].append({"kind": "transmissibility_structure"})))
-        s_eq = schema.load(sp)
-        res_eq = analyse(s_eq, s_eq.engine(), n_draws=100, prior_range=False, log=lambda *a: None)
-    sv_eq = res_eq.get("structural_variants") or []
-    ok(np.allclose(w_eq, [0.5, 0.5, 0.0]) and np.allclose(w_fb, _softmax([-10.0, -15.0]))
-       and len(sv_eq) == 2 and res_eq.get("structural_weighting") == "equal" and abs(sum(x["weight"] for x in sv_eq) - 1.0) < 1e-9,
-       f"AE29 equal weighting & fallback ({w_eq.tolist()})")
+        # Tampering with ONLY a variant's knot parameter or variant ID must fail provenance check
+        cal_p = yaml.safe_load(open(os.path.join(d, "analysis", "calibration.yaml")))["data"]
+        unc_p = yaml.safe_load(open(os.path.join(d, "analysis", "uncertainty.yaml")))["data"]
+        import copy as _cp
+        unc_bad_vid = _cp.deepcopy(unc_p)
+        unc_bad_vid["draw_provenance"]["applied"][0]["variant"] = "invented_variant"
+        unc_bad_extra = _cp.deepcopy(unc_p)
+        unc_bad_extra["draw_provenance"]["applied"][0]["values"]["transmissibility:99"] = -999.0
+        knot_idx = next((idx for idx, rec in enumerate(unc_p["draw_provenance"]["applied"])
+                         if "transmissibility:1" in rec.get("values", {})), None)
+        knot_rejected = True
+        if knot_idx is not None:
+            unc_bad_k = _cp.deepcopy(unc_p)
+            unc_bad_k["draw_provenance"]["applied"][knot_idx]["values"]["transmissibility:1"] = -999.0
+            knot_rejected = bool(contract._posterior_provenance("analysis/calibration.yaml", cal_p, unc_bad_k))
+        ok(bool(cal_p.get("variant_samples"))
+           and bool(contract._posterior_provenance("analysis/calibration.yaml", cal_p, unc_bad_vid))
+           and bool(contract._posterior_provenance("analysis/calibration.yaml", cal_p, unc_bad_extra))
+           and knot_rejected,
+           "AE28d pooled draw provenance rejects tampered variant ID, extra key, or tampered knot parameter")
+    w_eq, rule_eq = _variant_weights([-10.0, -11.0, -20.0], [-5.0, -5.5, -12.0], "equal", 1.92, [True, True, True])
+    w_fb, rule_fb = _variant_weights([-10.0, -15.0], [-5.0, -10.0], "equal", 1.92, [True, True])
+    w_uv, rule_uv = _variant_weights([-10.0, -11.0], [-5.0, -5.5], "equal", 1.92, [True, False])
+    with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+        sp1 = prep(os.path.realpath(d1), lambda r: (r["dynamics"].update(transmissibility={"pool": pool, "weighting": "equal"}),
+                                                    r["uncertainty"]["sources"].append({"kind": "transmissibility_structure"})))
+        sp2 = prep(os.path.realpath(d2), lambda r: (r["dynamics"].update(transmissibility={"pool": list(reversed(pool)), "weighting": "equal"}),
+                                                    r["engine"]["config"].update(transmissibility={"knots": pool[1]["knots"]}),
+                                                    r["uncertainty"]["sources"].append({"kind": "transmissibility_structure"})))
+        s_eq1, s_eq2 = schema.load(sp1), schema.load(sp2)
+        res_eq1 = analyse(s_eq1, s_eq1.engine(), n_draws=100, prior_range=["r0"], log=lambda *a: None)
+        res_eq2 = analyse(s_eq2, s_eq2.engine(), n_draws=100, prior_range=["r0"], log=lambda *a: None)
+    sv_eq = res_eq1.get("structural_variants") or []
+    med1 = float(np.median(res_eq1["values"]["reff_next"]))
+    med2 = float(np.median(res_eq2["values"]["reff_next"]))
+    ok(np.allclose(w_eq, [0.5, 0.5, 0.0]) and rule_eq == "equal"
+       and np.allclose(w_fb, _softmax([-10.0, -15.0])) and rule_fb == "marginal_likelihood"
+       and np.allclose(w_uv, _softmax([-10.0, -11.0])) and rule_uv == "marginal_likelihood"
+       and len(sv_eq) == 2 and res_eq1.get("structural_weighting") == "equal"
+       and abs(sum(x["weight"] for x in sv_eq) - 1.0) < 1e-9
+       and abs(med1 - med2) < 1e-12 and res_eq1["decision"]["verdict"] == res_eq2["decision"]["verdict"],
+       f"AE29 equal weighting, unverified fallback, and pool-order symmetry ({med1:.4f} vs {med2:.4f})")
 
 
 def _self_test() -> int:

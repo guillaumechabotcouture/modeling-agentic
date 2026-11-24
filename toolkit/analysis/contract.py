@@ -640,6 +640,22 @@ def _calibration(rel, d) -> list[dict]:
                                    "rows": np.asarray(smp["rows"], float)}, []):
                 out.append(_f("analysis_contract_uncovered_parameter", f"{rel}: the canonical sample does not match "
                                                                        "its recorded id", rel))
+        if "variant_samples" in data:
+            vs_map = data.get("variant_samples")
+            if not isinstance(vs_map, dict) or not vs_map:
+                out.append(_f("analysis_contract_uncovered_parameter",
+                              f"{rel}: variant_samples must be a non-empty mapping", rel))
+            else:
+                import numpy as np
+                from toolkit.analysis import calibration as C
+                for vid, vs in vs_map.items():
+                    if not isinstance(vs, dict) or not vs.get("sample_id") or not vs.get("names") or not vs.get("rows"):
+                        out.append(_f("analysis_contract_uncovered_parameter",
+                                      f"{rel}: variant sample {vid!r} is incomplete", rel))
+                    elif C.check_provenance({"sample_id": vs["sample_id"], "names": vs["names"],
+                                             "rows": np.asarray(vs["rows"], float)}, []):
+                        out.append(_f("analysis_contract_uncovered_parameter",
+                                      f"{rel}: variant sample {vid!r} does not match its recorded id", rel))
         if not idf.get("classes"):
             out.append(_f("analysis_contract_calibration", f"{rel}: no identifiability classes", rel))
     elif m != "none":
@@ -650,7 +666,8 @@ def _calibration(rel, d) -> list[dict]:
 def _posterior_provenance(rel, cal: dict, unc: dict) -> list[dict]:
     """v2d §3.3 (Codex r1-4): when the interval covers a posterior calibration, every uncertainty draw is a row of the
     canonical sample: one record per draw, citing the sample's id, with the applied values of every estimated name
-    equal to that row (re-read here, fail closed)."""
+    equal to that row (re-read here, fail closed). When structural variants are pooled, every draw is also bound to
+    its variant's canonical sample (variant id, sample_id, row, and exact full parameter set including knot priors)."""
     if "calibration" not in (unc.get("covers") or []):
         return []
     import numpy as np
@@ -668,8 +685,43 @@ def _posterior_provenance(rel, cal: dict, unc: dict) -> list[dict]:
                                     "rows": np.asarray(smp["rows"], float)}, prov["applied"])
     except (KeyError, TypeError, ValueError) as e:
         return [_f(kind, f"{rel}: the canonical sample is unreadable ({e})", rel)]
-    return [_f(kind, f"{rel}: {len(found)} draw values are not the canonical sample's rows (e.g. {found[0]})", rel)] \
-        if found else []
+    if found:
+        return [_f(kind, f"{rel}: {len(found)} draw values are not the canonical sample's rows (e.g. {found[0]})", rel)]
+    has_var = "variant_samples" in cal or any(
+        isinstance(d, dict) and any(k in d for k in ("variant", "variant_sample_id", "variant_row"))
+        for d in prov["applied"])
+    if not has_var:
+        return []
+    vs_map = cal.get("variant_samples")
+    if not isinstance(vs_map, dict) or not vs_map:
+        return [_f(kind, f"{rel}: pooled draws require variant_samples in calibration", rel)]
+    by_var: dict[str, list[dict]] = {}
+    for k, d in enumerate(prov["applied"]):
+        if not isinstance(d, dict):
+            return [_f(kind, f"{rel}: draw {k} provenance record is not a mapping", rel)]
+        vid = d.get("variant")
+        if not isinstance(vid, str) or vid not in vs_map:
+            return [_f(kind, f"{rel}: draw {k} cites unknown structural variant {vid!r}", rel)]
+        vs = vs_map[vid]
+        if not isinstance(vs, dict) or not vs.get("sample_id") or not vs.get("names") or not vs.get("rows"):
+            return [_f(kind, f"{rel}: variant sample {vid!r} is incomplete", rel)]
+        vals = d.get("values")
+        if not isinstance(vals, dict) or set(vals) != set(vs["names"]):
+            return [_f(kind, f"{rel}: draw {k} parameter keys {sorted(vals) if isinstance(vals, dict) else vals!r} "
+                             f"do not match variant {vid!r} names {list(vs['names'])}", rel)]
+        by_var.setdefault(vid, []).append(
+            {"sample_id": d.get("variant_sample_id"), "row": d.get("variant_row"), "values": vals})
+    for vid, recs in by_var.items():
+        vs = vs_map[vid]
+        try:
+            vfound = C.check_provenance({"sample_id": vs["sample_id"], "names": vs["names"],
+                                         "rows": np.asarray(vs["rows"], float)}, recs)
+        except (KeyError, TypeError, ValueError) as e:
+            return [_f(kind, f"{rel}: variant sample {vid!r} is unreadable ({e})", rel)]
+        if vfound:
+            return [_f(kind, f"{rel}: variant {vid!r}: {len(vfound)} draw values do not match its canonical sample "
+                             f"(e.g. {vfound[0]})", rel)]
+    return []
 
 
 def _plan_variants(run_dir: str, point: dict, pv) -> list[dict]:
