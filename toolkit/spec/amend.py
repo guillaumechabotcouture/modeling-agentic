@@ -887,6 +887,12 @@ def _self_test() -> int:
                                                        patch=dict(rq["patch"], motivated_by={"findings": ["D-1"]}))))
         refused(lambda: amend(par, from_request=True, log=lambda *a: None),
                 "AM_MOTIVE_REQUIRED a rethink whose request names no finding (a patch's declaration is no substitute)")
+        # Codex r2 of #373: a finding id is a non-empty string; [] or a number or blank text is refused, never coerced
+        for name, fs_, bf in (("id []", [{"id": []}], []), ("id blank", [{"id": " "}], []), ("id a number", [{"id": 5}],
+                              []), ("a brief's id []", [], [[]]), ("a finding without id", [{"claim": "c"}], [])):
+            w(par, "spec_rethink_request.json", json.dumps(dict(rq, findings=fs_, briefs=[{"task": "T1", "findings": bf,
+                                                                                         "brief": "b"}])))
+            refused(lambda: amend(par, from_request=True, log=lambda *a: None), f"AM_MOTIVE_ID_REFUSED {name}")
         os.remove(os.path.join(par, "spec_rethink_request.json"))
         w(par, "critique_domain.yaml", "blockers: 1\n")      # malformed but descriptive: no category, no refusal
         env = {"reason": "r", "spec": [{"set": "constraints.envelope_usd", "value": 9300}]}
@@ -899,7 +905,7 @@ def _self_test() -> int:
         shutil.rmtree(rec6["child"])
         w(par, "critique_domain.yaml", "stale\n")
         for name, mb in (("unknown id", {"findings": ["D-9"]}), ("no finding and no reason", {}),
-                         ("a blank id", {"findings": [" "]}),
+                         ("a blank id", {"findings": [" "]}), ("findings false", {"findings": False, "reason": "m"}),
                          ("findings not a list", {"findings": "D-1"}), ("another key", {"why": "x"})):
             yaml.safe_dump(dict(env, motivated_by=mb), open(pf, "w"))
             refused(lambda: amend(par, pf, log=lambda *a: None), f"AM_MOTIVE_REFUSED {name}")
