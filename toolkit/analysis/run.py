@@ -1956,6 +1956,7 @@ def _self_test_stability_default(ok):
     default. 13 of the 14 NOT_RUN records in the 31 v2 runs had no analysis.stability.holdout_group (10-12 units, no
     region); without one the step now holds out decision_units.region, else each unit (up to MAX_DEFAULT_UNIT_FOLDS),
     and says which it chose. It is NOT_RUN only with a stated reason."""
+    import yaml
     from toolkit.analysis import stability as SB
     from toolkit.analysis.core import CostTable
 
@@ -2008,6 +2009,69 @@ def _self_test_stability_default(ok):
     r5 = go(_A(9, {"holdout_group": "reg", "covariates": ["x"]}))
     ok(r5.get("n_folds") == 3 and r5.get("holdout_source") == "spec",
        f"SD5 a declared holdout group is used as before: {r5.get('n_folds')}, {r5.get('holdout_source')}")
+    # Codex r1 of #380, P1-1: a one-unit fold has no rank correlation; the exported YAML still validates
+    import tempfile
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import allocation_robustness as AR
+    with tempfile.TemporaryDirectory() as td_:
+        rp = os.path.join(td_, "r.yaml")
+        try:
+            yaml.safe_dump(plain(SB.robustness_yaml(r1)), open(rp, "w"))
+            vr = AR.validate_allocation_robustness(rp).get("verdict")
+        except Exception as e:  # noqa: BLE001
+            vr = f"crash {type(e).__name__}"
+    ok(vr == r1.get("verdict") and vr != "MALFORMED",
+       f"SD6 the one-unit folds' robustness YAML validates with the record's verdict ({vr}, {r1.get('verdict')})")
+
+    # Codex r1 of #380, P1-2: under likelihood calibration a default fold predicts the held-out unit's attribute from
+    # the other units, never from its own full-data fit
+    class _L(_A):
+        method = "likelihood"
+
+        def __init__(self, n):
+            super().__init__(n, {})
+            self.lik = {"x": {}, "params": [], "z": {i: 0.1 * k for k, i in enumerate(self.ids)}}
+            self.got = {}
+
+        def evaluate(self, theta, zh, hid=None):
+            self.got = dict(zh)
+            ids = hid or self.ids
+            return {}, {i: [1.0 + zh[i], 0.5] for i in ids}, ct(ids)
+    L = _L(4)
+    z0 = {i: 0.1 * k for k, i in enumerate(L.ids)}
+    _fl, _rt = SB.C.fit_likelihood, SB.C.read_targets
+    seen = {}
+    try:
+        SB.C.read_targets = lambda spec: [{"unit": i} for i in L.ids]
+
+        def fake_fit(spec, model, rows=None, fixed_z=None, **k):
+            held = sorted(fixed_z or {})
+            seen.setdefault("held", []).append(held)
+            return {"theta": {}, "z": {**{i: z0[i] for i in L.ids if i not in held}, **(fixed_z or {})}}
+        SB.C.fit_likelihood = fake_fit
+        r7 = SB.run(L, z0, {i: 0 for i in L.ids}, {i: [1.0, 0.5] for i in L.ids}, ct(L.ids), {i: 0 for i in L.ids})
+    except Exception as e:  # noqa: BLE001
+        r7 = {"crash": f"{type(e).__name__}: {e}"}
+    finally:
+        SB.C.fit_likelihood, SB.C.read_targets = _fl, _rt
+    last = L.ids[-1]
+    pred = sum(z0[i] for i in L.ids[:-1]) / (len(L.ids) - 1)
+    ok(r7.get("n_folds") == 4 and abs(L.got.get(last, -1) - pred) < 1e-9 and "other units" in str(r7.get("heldout_attribute")),
+       f"SD7 a default likelihood fold holds out the unit's own fit: its attribute is the other units' mean "
+       f"({L.got.get(last)} vs {pred}; {r7.get('heldout_attribute')}, {r7.get('crash')})")
+
+    # Codex r1 of #380, P1-3: a misspelled stability key is refused, not silently replaced by the default
+    from toolkit.spec import schema as SCH
+    with tempfile.TemporaryDirectory() as td_:
+        raw = yaml.safe_load(open(SCH.toy_spec(td_)))
+        raw["analysis"]["stability"] = {"holdout_groups": "grp", "covariates": ["cov"]}
+        yaml.safe_dump(raw, open(os.path.join(td_, "decision_spec.yaml"), "w"))
+        try:
+            probs = SCH.validate(SCH.load(os.path.join(td_, "decision_spec.yaml")))
+        except Exception as e:  # noqa: BLE001
+            probs = [f"crash {e}"]
+    ok(any("holdout_groups" in str(x) for x in probs),
+       f"SD8 an unknown analysis.stability key is a spec problem: {probs[:3]}")
 
 
 def _self_test_stability_flagged(ok):
