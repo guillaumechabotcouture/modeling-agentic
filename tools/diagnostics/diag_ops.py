@@ -27,6 +27,9 @@ for _p in (os.path.join(REPO, "scripts"), HERE):
         sys.path.insert(0, _p)
 KEEP = os.path.expanduser("~/modeling-agentic-keep")
 STALE_S = 30 * 60.0               # 3 x follow.py's default 10-minute pass
+CAP_KEYS = ("at", "usd", "cap_usd", "level", "usd_per_hour", "hours_to_cap", "hours_to_far_over_cap",
+            "projected_usd_at_deadline", "projected_usd_at_watch_limit", "invocation")
+PASSING = ("SUCCESS", "NEUTRAL", "SKIPPED")
 SHELLS = {"zsh", "bash", "sh", "dash", "fish"}
 
 
@@ -39,7 +42,8 @@ def keep() -> str:
 
 
 def _read(base: str, rel: str, max_bytes: int = 8 << 20):
-    """(parsed JSON, mtime ISO, why) of base/rel, no link followed; (None, None, why) when unreadable."""
+    """(parsed JSON, mtime ISO, why) of base/rel, no link followed at any component of `rel` (callers pass the
+    configured root as `base` and the whole path below it: Codex r1 of #388); (None, None, why) when unreadable."""
     try:
         from lib.safe_io import read_nofollow
         b, st = read_nofollow(base, rel, max_bytes=max_bytes)
@@ -59,9 +63,11 @@ def _stale(fetched_at, now: float) -> bool:
 
 def _cached(rel: str, now=None):
     now = time.time() if now is None else now
-    doc, mt, why = _read(os.path.join(home(), "cache"), rel)
+    doc, mt, why = _read(home(), f"cache/{rel}")
     if doc is None:
         return None, [], [why]
+    if not isinstance(doc, dict):          # a malformed cache is unavailable, never a crash (P2-1)
+        return None, [], [f"cache/{rel} is not the expected object"]
     stale = _stale(doc.get("fetched_at"), now)
     src = [{"path": f"cache/{rel}", "mtime": mt, "fetched_at": doc.get("fetched_at"), "stale": stale}]
     return doc, src, ([f"stale: {rel} was fetched at {doc.get('fetched_at')}; follow.py may not be running"]
@@ -74,23 +80,31 @@ def launches(now=None):
         doc, s, n = _cached(f"launches/{os.path.basename(p)}", now)
         srcs, notes = srcs + s, notes + n
         if doc:
-            cap = doc.get("cap_projection") or {}
+            cap = doc.get("cap_projection") if isinstance(doc.get("cap_projection"), dict) else {}
             labels = (doc.get("assignments") or {}) if isinstance(doc.get("assignments"), dict) else {}
             out.append({"config": doc.get("config"), "labels": sorted(k for k in labels if isinstance(labels[k], dict)),
                         "clusters": doc.get("clusters"),
-                        "cap": {k: cap.get(k) for k in ("cap_usd", "level", "spend_usd", "burn_usd_per_h",
-                                                       "hours_to_cap", "projected_usd") if k in cap} or None})
+                        # the producer's names (cloud/budget.py cap_projection, cloud/launch_watch.py): Codex r1 of #388
+                        "cap": {k: cap.get(k) for k in CAP_KEYS if k in cap} or None})
     b, s, n = _cached("budget_status.json", now)
-    scopes = ((b or {}).get("status") or {}).get("scopes") or []
+    scopes = _scopes(b)
     keys = ("scope", "budget_usd", "used_usd", "billed_usd", "reserved_usd", "remaining_usd", "expires_utc")
     return ({"launches": out, "scopes": [{k: sc.get(k) for k in keys} for sc in scopes if isinstance(sc, dict)]},
             srcs + s, notes + n + ([] if out else ["no launch records cached"]), {"cap": "record"})
 
 
+def _scopes(b) -> list:
+    st = (b or {}).get("status")
+    sc = st.get("scopes") if isinstance(st, dict) else None
+    return [x for x in sc if isinstance(x, dict)] if isinstance(sc, list) else []
+
+
 def clusters(now=None):
     b, s, n = _cached("budget_status.json", now)
+    if b is not None and not _scopes(b):
+        n = n + [f"the cached budget status holds no readable scope ({str((b.get('status') or {}).get('why'))[:120]})"]
     rows = []
-    for sc in ((b or {}).get("status") or {}).get("scopes") or []:
+    for sc in _scopes(b):
         for r in (sc or {}).get("clusters") or []:
             if isinstance(r, dict):
                 rows.append({"scope": sc.get("scope"), **{k: r.get(k) for k in ("name", "id", "state", "billed_usd",
@@ -101,14 +115,24 @@ def clusters(now=None):
 
 
 def supervisor_status(now=None):
-    doc, mt, why = _read(os.path.join(keep(), "supervisor"), "status.json")
-    if doc is None:
-        return None, [], [why], {}
+    doc, mt, why = _read(keep(), "supervisor/status.json")
+    if not isinstance(doc, dict):
+        return None, [], [why or "supervisor/status.json is not an object"], {}
     now = time.time() if now is None else now
+    hb = str(doc.get("heartbeat_utc") or "").replace("Z", "+00:00")
+    try:
+        hb_age = round(now - datetime.fromisoformat(hb).timestamp(), 1)
+    except ValueError:
+        hb_age = None
     stale = _stale(mt, now)
+    late = hb_age is None or hb_age > STALE_S
     cut = {k: (v[-50:] if isinstance(v, list) else v) for k, v in doc.items()}
-    return cut, [{"path": "supervisor/status.json", "mtime": mt, "stale": stale}], (
-        [f"stale: the pulled status is from {mt}"] if stale else []), {}
+    cut["omitted"] = {k: len(v) - 50 for k, v in doc.items() if isinstance(v, list) and len(v) > 50}
+    cut["heartbeat_age_s"] = hb_age
+    notes = ([f"stale: the local copy is from {mt}"] if stale else []) + (
+        [f"the supervisor's own heartbeat is {'unknown' if hb_age is None else f'{hb_age / 60:.0f} min old'}: it may "
+         "have stopped"] if late else [])
+    return cut, [{"path": "supervisor/status.json", "mtime": mt, "stale": stale}], notes, {"heartbeat_age_s": "record"}
 
 
 def _ci(rollup) -> str:
@@ -117,13 +141,15 @@ def _ci(rollup) -> str:
         return "failing"
     if any(x in ("PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED", "") for x in states):
         return "pending"
+    if any(x not in PASSING for x in states):       # cancelled, stale, startup failure: not passing (Codex r1 of #388)
+        return "incomplete"
     return "passing" if states else "none"
 
 
 def open_prs(now=None):
     doc, s, n = _cached("gh_prs.json", now)
-    if doc is None or doc.get("prs") is None:
-        return None, s, n + ([doc.get("why")] if doc else []), {}
+    if doc is None or not isinstance(doc.get("prs"), list):
+        return None, s, n + ([str(doc.get("why"))] if doc else []), {}
     rows = [{"number": p.get("number"), "title": p.get("title"), "branch": p.get("headRefName"),
              "head": str(p.get("headRefOid") or "")[:12], "draft": p.get("isDraft"), "review": p.get("reviewDecision"),
              "ci": _ci(p.get("statusCheckRollup")), "updated": p.get("updatedAt"), "url": p.get("url")}
@@ -136,37 +162,51 @@ def baseline_summary():
     files = sorted(glob.glob(os.path.join(keep(), "ops", "hb*_triage_data", "hb*_metrics.json")))
     files += [os.path.join(keep(), "supervisor", "metrics.json")]
     for p in files:
-        base, rel = os.path.dirname(p), os.path.basename(p)
-        doc, mt, why = _read(base, rel)
-        if doc is None:
+        rel = os.path.relpath(p, keep())
+        doc, mt, why = _read(keep(), rel)
+        if not isinstance(doc, dict):
             continue
-        name = rel.split("_metrics")[0] if "_metrics" in rel else "supervisor"
+        name = os.path.basename(rel).split("_metrics")[0] if "_metrics" in rel else "supervisor"
         cols = ("label", "status", "completes", "class", "question", "rounds", "model_usd", "stop_state")
         out.append({"baseline": name, "summary": doc.get("summary"),
                     "rows": [{k: r.get(k) for k in cols} for r in doc.get("rows") or [] if isinstance(r, dict)]})
-        srcs.append({"path": os.path.relpath(p, keep()), "mtime": mt})
+        srcs.append({"path": rel, "mtime": mt})
     return {"baselines": out}, srcs, [] if out else ["no baseline metrics found under the ops notes"], {}
 
 
-def check_value():
+def check_value(now=None):
     out, srcs = [], []
     for p in sorted(glob.glob(os.path.join(home(), "cache", "check_value", "*.json"))):
-        doc, mt, why = _read(os.path.dirname(p), os.path.basename(p))
+        doc, mt, why = _read(home(), f"cache/check_value/{os.path.basename(p)}")
         if isinstance(doc, dict):
             out.append({"baseline": os.path.basename(p)[:-5], "checks": doc.get("checks"), "method": doc.get("method")})
-            srcs.append({"path": f"cache/check_value/{os.path.basename(p)}", "mtime": mt})
-    return {"by_baseline": out}, srcs, [] if out else [
-        "no check-value table cached: save `scripts/harness_metrics.py --check-value <runs> --json "
-        "<home>/cache/check_value/<baseline>.json`"], {}
+            srcs.append({"path": f"cache/check_value/{os.path.basename(p)}", "mtime": mt,
+                         "stale": _stale(mt, time.time() if now is None else now)})
+    notes = [f"stale: {x['path']} is from {x['mtime']}" for x in srcs if x["stale"]]
+    return {"by_baseline": out}, srcs, notes if out else [
+        "no check-value table cached: once `scripts/harness_metrics.py --check-value` is merged, save its "
+        "`--json` output as <home>/cache/check_value/<baseline>.json"], {}
 
 
 def fragment_markers(repo: str = REPO) -> list[dict]:
-    """[{fragment, goal, markers}] of every change fragment that declares markers (scripts/assemble_changes.py)."""
-    import assemble_changes as AC
+    """[{fragment, goal, markers}] of every change fragment whose front matter names markers or a goal (the format
+    #382 adds; scripts/assemble_changes.py validates it). Read from the header itself, a fragment at a time."""
+    import yaml
     out = []
-    for fr in AC.load_fragments(repo):
-        if fr.get("markers") or fr.get("goal"):
-            out.append({"fragment": fr["name"], "goal": fr.get("goal"), "markers": fr.get("markers") or []})
+    for p in sorted(glob.glob(os.path.join(repo, "changes", "*.md"))):
+        if os.path.basename(p).upper() == "README.MD" or os.path.islink(p):
+            continue
+        try:
+            lines = open(p, encoding="utf-8").read().splitlines()
+            end = lines.index("---", 1) if lines and lines[0].strip() == "---" else None
+            head = yaml.safe_load("\n".join(lines[1:end])) if end else None
+        except (OSError, ValueError, yaml.YAMLError):
+            continue
+        if not isinstance(head, dict):
+            continue
+        ms = [m for m in head.get("markers") or [] if isinstance(m, str)] if isinstance(head.get("markers"), list) else []
+        if ms or head.get("goal"):
+            out.append({"fragment": f"changes/{os.path.basename(p)}", "goal": head.get("goal"), "markers": ms})
     return out
 
 
@@ -181,8 +221,8 @@ def check_marker(run, spec: str) -> str:
         return "missing"
     if m["kind"] == "exists":
         return "present"
-    if m["kind"] == "regex":
-        return "present" if re.search(m["value"], b.decode("utf-8", "replace")) else "missing"
+    if m["kind"] == "regex":             # as scripts/smoke_check.py check_marker: re.M
+        return "present" if re.search(m["value"], b.decode("utf-8", "replace"), re.M) else "missing"
     try:                       # parsed as smoke_check._load parses a file, from the confined read
         text = b.decode("utf-8", "replace")
         if m["path"].endswith((".yaml", ".yml")):
@@ -195,20 +235,23 @@ def check_marker(run, spec: str) -> str:
         v = SC._get(obj, m["key"])
     except Exception:  # noqa: BLE001
         return "missing"
-    if v is SC._MISSING:
+    if v is SC._MISSING or v is None:     # as scripts/smoke_check.py: a null field is a missing marker
         return "missing"
     if m["kind"] == "field":
-        return "present" if v is not None else "missing"
+        return "present"
     t = SC._text(v)
     return "present" if (t == m["value"] if m["kind"] == "equals" else t.startswith(m["value"])) else "missing"
 
 
 def smoke_markers(runs: dict, run_ids=None, fragment=None):
     frs = [f for f in fragment_markers() if f["markers"] and (fragment is None or f["fragment"].endswith(str(fragment)))]
-    ids = [r for r in (run_ids or sorted(runs)) if r in runs][:30]
+    want = [r for r in (run_ids or sorted(runs)) if r in runs]
+    ids = want[:30]
     rows = [{"fragment": f["fragment"], "goal": f["goal"], "run": rid,
              "markers": {m: check_marker(runs[rid], m) for m in f["markers"]}} for f in frs for rid in ids]
-    return {"results": rows}, [], ([] if frs else ["no change fragment declares markers yet"]), {}
+    notes = ([] if frs else ["no change fragment declares markers yet"]) + (
+        [f"{len(want) - 30} more run(s) not checked: pass `runs` to choose them"] if len(want) > 30 else [])
+    return {"results": rows, "runs_omitted": max(0, len(want) - 30)}, [], notes, {}
 
 
 def _cmd(argv, timeout=10):
@@ -222,6 +265,7 @@ def _cmd(argv, timeout=10):
 def machine_status(ps_out=None, worktrees_out=None):
     """Load, thermal state, processes by command name (never arguments), worktrees, and active agents."""
     ps_out = _cmd(["ps", "-axo", "pcpu=,pmem=,comm="]) if ps_out is None else ps_out
+    ps_ok = bool(ps_out.strip())
     procs, top = {}, []
     for ln in ps_out.splitlines():
         parts = ln.split(None, 2)
@@ -262,32 +306,42 @@ def machine_status(ps_out=None, worktrees_out=None):
     except OSError:
         load = None
     return ({"load": load, "cpus": os.cpu_count(), "thermal": [x.strip() for x in therm.splitlines() if x.strip()][:6],
-             "processes": dict(sorted(procs.items(), key=lambda kv: -kv[1])[:25]),
-             "shells": sum(n for k, n in procs.items() if k in SHELLS), "top": top[:10], "worktrees": trees,
+             "processes": dict(sorted(procs.items(), key=lambda kv: -kv[1])[:25]) if ps_ok else None,
+             "shells": sum(n for k, n in procs.items() if k in SHELLS) if ps_ok else None,
+             "top": top[:10], "worktrees": trees,
              "agents_active": [a for a in agents.values() if a.get("event") == "start"]},
-            [], [] if agents else ["no agents.jsonl: the lead's agent log is not written yet"], {"processes": "record"})
+            [], ([] if agents else ["no agents.jsonl: the lead's agent log is not written yet"])
+            + ([] if ps_ok else ["the process listing failed: process counts are unavailable"]),
+            {"processes": "record" if ps_ok else "unavailable"})
 
 
-def owner_items(now=None) -> list[dict]:
-    """PRs ready for the owner (CI passing, not draft) and budgets near their end, for owner_inbox."""
+def owner_items(now=None):
+    """(items, sources, notes): PRs ready for the owner (CI passing, not draft) and budgets near their end, for
+    owner_inbox, with the caches' freshness and availability (Codex r1 of #388)."""
     items = []
-    prs = (open_prs(now)[0] or {}).get("prs") or []
+    pr_doc, srcs, notes, _ = open_prs(now)
+    if pr_doc is None:
+        notes = notes + ["open PRs unavailable: no PR items"]
+    prs = (pr_doc or {}).get("prs") or []
     for p in prs:
         if p["ci"] == "passing" and not p["draft"]:
             items.append({"where": "pr", "ref": f"#{p['number']}", "question": "CI passing: review or merge",
                           "since": p["updated"], "how_to_answer": p["url"]})
     now = time.time() if now is None else now
-    for sc in launches(now)[0]["scopes"]:
+    la = launches(now)
+    srcs, notes = srcs + [x for x in la[1] if "budget_status" in str(x.get("path"))], notes + [
+        x for x in la[2] if "budget_status" in x or "launch records" not in x]
+    for sc in la[0]["scopes"]:
         try:
             left_days = (datetime.fromisoformat(str(sc.get("expires_utc")).replace("Z", "+00:00")).timestamp() - now) / 86400
         except (TypeError, ValueError):
             left_days = None
         low = sc.get("budget_usd") and sc.get("remaining_usd") is not None and sc["remaining_usd"] < 0.1 * sc["budget_usd"]
         if (left_days is not None and left_days < 3) or low:
-            items.append({"where": "budget", "ref": sc.get("scope"), "since": sc.get("expires_utc"),
+            items.append({"where": "budget", "ref": sc.get("scope"), "since": None, "deadline": sc.get("expires_utc"),
                           "question": "budget near its end (under 3 days or 10% left)",
                           "how_to_answer": f"python3 cloud/budget.py set --scope {sc.get('scope')} --usd <amount> --note ..."})
-    return items
+    return items, srcs, notes
 
 
 def _self_test() -> int:
@@ -330,8 +384,14 @@ def _self_test() -> int:
         ok(cl["live"] == 1 and cl["clusters"][0]["name"] == "c1", "DO2 clusters from the cached budget status")
         pr = open_prs(now)[0]["prs"]
         ok([p["ci"] for p in pr] == ["passing", "failing", "pending"], f"DO3 CI state per PR ({[p['ci'] for p in pr]})")
-        items = owner_items(now)
-        ok([i["where"] for i in items] == ["pr", "budget"], f"DO4 owner items: a ready PR and a budget ending soon ({items})")
+        items = owner_items(now)[0]
+        ok([i["where"] for i in items] == ["pr", "budget"] and items[1]["deadline"] == soon and items[1]["since"] is None,
+           f"DO4 owner items: a ready PR and a budget ending soon, its expiry a deadline ({items})")
+        ok(_ci([{"conclusion": "CANCELLED"}]) == "incomplete", "DO4b a cancelled check is not passing")
+        json.dump([], open(os.path.join(cache, "gh_prs.json"), "w"))
+        oi = owner_items(now)
+        ok([i["where"] for i in oi[0]] == ["budget"] and any("unavailable" in n for n in oi[2]),
+           "DO4c a malformed PR cache is unavailable, with a note, and the other items stay")
         ok(supervisor_status(now)[0] is None and "follow.py" in supervisor_status(now)[2][0],
            "DO5 no pulled supervisor status: unavailable, with what to run")
         os.makedirs(os.path.join(td, "keep", "ops", "hb9_triage_data"))
@@ -355,6 +415,21 @@ def _self_test() -> int:
                                               "analysis/*.yaml")]
         ok(got == ["present", "present", "present", "missing", "missing", "unsupported (a glob path)"],
            f"DO8 smoke markers checked through the confined reader ({got})")
+        open(os.path.join(rd, "report.md"), "w").write("heading\nready\nmore\n")
+        json.dump({"paused": None}, open(os.path.join(rd, "st.json"), "w"))
+        ok(check_marker(run, "report.md~^ready$") == "present" and check_marker(run, "st.json:paused=null") == "missing",
+           "DO9 the smoke checker's semantics: multiline regex, a null field is missing")
+        os.makedirs(os.path.join(td, "elsewhere"))
+        json.dump({"heartbeat_utc": "2026-01-01T00:00:00Z"}, open(os.path.join(td, "elsewhere", "status.json"), "w"))
+        os.symlink(os.path.join(td, "elsewhere"), os.path.join(td, "keep", "supervisor"))
+        ok(supervisor_status(now)[0] is None, "DO10 a linked supervisor folder is not followed")
+        os.remove(os.path.join(td, "keep", "supervisor"))
+        os.makedirs(os.path.join(td, "keep", "supervisor"))
+        json.dump({"heartbeat_utc": "2026-01-01T00:00:00Z", "paused": list(range(51))},
+                  open(os.path.join(td, "keep", "supervisor", "status.json"), "w"))
+        sv = supervisor_status(now)
+        ok(sv[0]["omitted"] == {"paused": 1} and sv[0]["heartbeat_age_s"] > STALE_S and any("heartbeat" in n for n in sv[2]),
+           "DO11 a fresh copy of an old heartbeat says the supervisor may have stopped; cut lists say how much")
     for k in ("MA_DIAG_HOME", "MA_DIAG_KEEP"):
         os.environ.pop(k, None)
     if fails:

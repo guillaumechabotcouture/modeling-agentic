@@ -52,5 +52,5 @@ Restart Claude Desktop. The tools appear under the server's name, and Claude Des
 
 The operations tools read local caches under `MA_DIAG_HOME/cache` and the pulled supervisor status. Each tool says
 when a cache is missing or older than 30 minutes. `follow.py`, in the next PR, refreshes them and mirrors cloud
-runs. Save a check-value table for `check_value` with
-`scripts/harness_metrics.py --check-value <runs> --json ~/modeling-agentic-keep/diagnostics/cache/check_value/<baseline>.json`.
+runs. `check_value` reads saved check-value tables. Once `scripts/harness_metrics.py --check-value` is merged, save
+its `--json` output as `~/modeling-agentic-keep/diagnostics/cache/check_value/<baseline>.json`.

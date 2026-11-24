@@ -102,20 +102,37 @@ def run_compare(run, others):
     seen = {x for h in st.get("history") or [] if isinstance(h, dict) and "to" in h for x in (h.get("from"), h.get("to"))}
     seen.add(st.get("state"))
     notes = [] if refs else ["no FINAL run of the same question under the roots: nothing to compare with"]
+    # Which stages are still ahead is not knowable (the fix path revisits CRITIQUE and GATE: Codex r1 of #388); the
+    # reference's stages this run has not entered yet are listed under that plain name.
     return ({"question": st.get("question"), "n_runs": len(refs),
              "this": {"state": st.get("state"), "by_stage": this.get("by_stage")}, "reference": reference,
-             "remaining_stages": [s for s in reference if s not in seen and st.get("state") != "FINAL"]},
+             "stages_not_yet_entered": [s for s in reference if s not in seen and st.get("state") != "FINAL"]},
             _src(run, ["run_state.json"]) + refs, notes, {"reference": "inferred"})
 
 
+def _signed_sha(rec) -> str | None:
+    """The spec digest a sign-off record binds: the spike's `spec_sha256` or toolkit/spec/signoff.py's
+    `sha256["decision_spec.yaml"]` (Codex r1 of #388)."""
+    if not isinstance(rec, dict):
+        return None
+    sh = rec.get("sha256")
+    return rec.get("spec_sha256") or (sh.get("decision_spec.yaml") if isinstance(sh, dict) else None)
+
+
 def _answered(run, paused, since) -> bool:
-    """The pause's answer is already on disk: the current spec is signed, or a scope sign-off newer than the pause."""
+    """The pause's answer is already on disk: the current spec is signed, or every pending scope item's fingerprint
+    has a recorded accept or decline (not a file time: Codex r1 of #388)."""
     if paused == "awaiting_signoff":
-        rec, _ = run.json("decision_spec.signoff.json")
-        return bool(rec and rec.get("spec_sha256") and rec.get("spec_sha256") == run.sha("decision_spec.yaml"))
+        cur = run.sha("decision_spec.yaml")
+        return bool(cur) and any(_signed_sha(run.json(f)[0]) == cur
+                                 for f in ("decision_spec.signoff.json", "decision_brief.signoff.json"))
     if paused == "awaiting_scope_signoff":
-        mt = _mtime(run, "scope_signoff.json")
-        return bool(mt and since and mt > str(since))
+        req, _ = run.json("scope_signoff_request.json")
+        rec, _ = run.json("scope_signoff.json")
+        fps = [i.get("fingerprint") for i in (req or {}).get("items") or [] if isinstance(i, dict)]
+        ans = (rec or {}).get("answers") if isinstance((rec or {}).get("answers"), dict) else {}
+        return bool(fps) and all(fp and isinstance(ans.get(fp), dict)
+                                 and ans[fp].get("decision") in ("accept", "decline") for fp in fps)
     return False
 
 
@@ -137,8 +154,8 @@ def owner_inbox(runs: dict):
         q, how = st["paused"], HOW.get(st["paused"], "see the run's history")
         if _answered(run, q, p.get("at")):
             q, how = f"{q}: answered, waiting for a resume", "python3 main.py --v2 --resume <run>"
-        if rid.startswith("mirror/"):         # a local copy of a cloud run: never sign the copy (Codex r1 of #386)
-            how = "a cloud run: answer on its cluster (the run console's sign-off), not on this local mirror"
+        if rid == "mirror" or rid.startswith("mirror/"):     # a local copy of a cloud run: never act on the copy
+            how = f"a cloud run: do this on its cluster (the run console), not on this local mirror: {how}"
         items.append({"where": "run", "ref": rid, "question": q, "state": st.get("state"), "since": p.get("at"),
                       "how_to_answer": how})
     return {"items": items}, [], [], {"items": "record"}
@@ -192,9 +209,24 @@ def _self_test() -> int:
         st.update(state="FINAL", paused=None)
         json.dump(st, open(os.path.join(b, "run_state.json"), "w"))
         cmp2 = run_compare(DR.discover({"runs": root})["runs/a_run"], list(DR.discover({"runs": root}).values()))
-        ok(cmp2[0]["n_runs"] == 1 and len(cmp2[1]) == 2 and "SPEC" not in cmp2[0]["remaining_stages"]
-           and "EVIDENCE" not in cmp2[0]["remaining_stages"],
-           f"DX8 the reference runs are sources; stages already passed are not remaining ({cmp2[0]['remaining_stages']})")
+        ok(cmp2[0]["n_runs"] == 1 and len(cmp2[1]) == 2 and "SPEC" not in cmp2[0]["stages_not_yet_entered"]
+           and "EVIDENCE" not in cmp2[0]["stages_not_yet_entered"],
+           f"DX8 the reference runs are sources; stages already entered are not listed ({cmp2[0]['stages_not_yet_entered']})")
+        rq = {"pending": True, "items": [{"finding": "D-001", "fingerprint": "f1"}, {"finding": "D-002", "fingerprint": "f2"}]}
+        dq = DR.make_fixture(root, "q_run", paused="awaiting_scope_signoff", events=False)
+        json.dump(rq, open(os.path.join(dq, "scope_signoff_request.json"), "w"))
+        json.dump({"answers": {"f1": {"decision": "accept"}}}, open(os.path.join(dq, "scope_signoff.json"), "w"))
+        q1 = [i for i in owner_inbox(DR.discover({"runs": root}))[0]["items"] if i["ref"] == "runs/q_run"][0]
+        json.dump({"answers": {"f1": {"decision": "accept"}, "f2": {"decision": "decline"}}},
+                  open(os.path.join(dq, "scope_signoff.json"), "w"))
+        q2 = [i for i in owner_inbox(DR.discover({"runs": root}))[0]["items"] if i["ref"] == "runs/q_run"][0]
+        ok("answered" not in q1["question"] and "answered" in q2["question"],
+           "DX9 a scope request is answered only when every pending item has a decision")
+        json.dump({"sha256": {"decision_spec.yaml": hashlib.sha256(b"x: 1\n").hexdigest()}},
+                  open(os.path.join(c, "decision_spec.signoff.json"), "w"))
+        c3 = owner_inbox(DR.discover({"mirror": os.path.join(td, "mirror")}))[0]["items"][0]
+        ok("answered" in c3["question"] and "main.py" in c3["how_to_answer"] and "cluster" in c3["how_to_answer"],
+           "DX10 a toolkit sign-off record counts; a mirrored run keeps the action, routed to its cluster")
     if fails:
         print(f"FAIL: {len(fails)} self-test case(s) failed")
         return 1

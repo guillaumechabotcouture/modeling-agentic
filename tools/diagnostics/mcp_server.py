@@ -42,6 +42,10 @@ _SECRET = re.compile(r"(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9]{20,}|gh[pousr]_[
                      r"|AKIA[0-9A-Z]{16})")
 
 
+_SECRET_KEY = re.compile(r"(?i)^(?:.*[_-])?(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|"
+                         r"accountkey|sas|sig|signature|authorization|credential|private[_-]?key)s?$")
+
+
 def roots() -> dict:
     return {"runs": os.environ.get("MA_DIAG_RUNS") or os.path.join(REPO, "runs"),
             "mirror": os.environ.get("MA_DIAG_MIRROR") or os.path.join(KEEP, "mirror")}
@@ -72,8 +76,9 @@ def redact(x):
         return _redact_text(x)
     if isinstance(x, list):
         return [redact(v) for v in x]
-    if isinstance(x, dict):
-        return {_redact_text(str(k)): redact(v) for k, v in x.items()}      # keys too
+    if isinstance(x, dict):            # keys too; a value under a credential-like key is withheld (Codex r1 of #388)
+        return {_redact_text(str(k)): ("[redacted]" if _SECRET_KEY.search(str(k)) and isinstance(v, str)
+                                       else redact(v)) for k, v in x.items()}
     return x
 
 
@@ -164,7 +169,12 @@ def t_run_compare(args):
 
 def t_owner_inbox(args):
     data, srcs, notes, der = DX.owner_inbox(DR.discover(roots()))
-    data["items"] += DO.owner_items()          # PRs ready for the owner, budgets near their end (cached)
+    try:                                       # PRs ready for the owner, budgets near their end (cached)
+        items, s2, n2 = DO.owner_items()
+        data["items"] += items
+        srcs, notes = srcs + s2, notes + n2    # their caches' freshness and availability (Codex r1 of #388)
+    except Exception as e:  # noqa: BLE001 -- a bad cache never hides the runs' items
+        notes = notes + [f"PR and budget items unavailable ({type(e).__name__})"]
     return data, srcs, notes, der
 
 
@@ -363,7 +373,9 @@ def _self_test() -> int:
         red = json.dumps(redact({"ghp_" + "k" * 30: "key ghp_" + "x" * 30 + " and AccountKey=abc123;",
                                  "b": "sk-proj-AbCdEf0123456789AbCdEf0123456789",
                                  "c": "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"}))
-        ok(not any(x in red for x in ("kkkkkkkkkk", "xxxxxxxxxx", "abc123", "AbCdEf0123456789", "c2lnbmF0dXJl")),
+        ok(redact({"password": "fixture-value", "api_key": "abc", "max_tokens": 5, "keys": "ok"}) == {"password": "[redacted]",
+                                                                                "api_key": "[redacted]", "max_tokens": 5, "keys": "ok"}
+           and not any(x in red for x in ("kkkkkkkkkk", "xxxxxxxxxx", "abc123", "AbCdEf0123456789", "c2lnbmF0dXJl")),
            f"MS10 credential-like strings are redacted, in keys too ({red[:160]})")
         call("note_feedback", {"question": "界" * 1000, "useful": "yes"})
         ok(all(json.loads(x) for x in open(os.path.join(td, "home", "feedback.jsonl")).read().splitlines()),
