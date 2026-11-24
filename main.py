@@ -648,6 +648,12 @@ def _run_self_test() -> int:
        f"V1b (Phase 31) 1-hour prompt cache for the lead and subagents, 5m on request: {ov}")
     ok("AZ_BATCH_ACCOUNT" not in enforcement.filtered_env(env, allow_cloud=True),
        "V1 cloud creds kept with --cloud")
+    # OSK2 (owner-sign): no agent reaches the owner's key
+    keyed = ["security find-generic-password -s modeling-agentic-budget-owner -w", "echo x | security -i",
+             "python3 cloud/budget.py init-key", "python3 -c 'from lib import owner_key'"]
+    ok(all(enforcement.owner_command_reason(c) for c in keyed)
+       and enforcement.owner_command_reason("python3 scripts/security_report.py") is None,
+       "OSK2 the keychain item, budget init-key and owner_key are owner commands; other commands are not")
     # V2 (Phase 21 α): agents' PATH starts with this interpreter's bin/,
     # so bare `python3` is the harness venv even when it wasn't activated.
     ok(ov["PATH"].split(os.pathsep)[0] == os.path.dirname(sys.executable)

@@ -356,7 +356,34 @@ def load_answers(run_dir: str) -> tuple[dict, list[dict]]:
                      "scope_declarable": False,
                      "claim": f"{SIGNOFF} cannot be read ({str(e)[:160]}); no owner answer counts. It is written by "
                               f"`scripts/scope_signoff.py sign`; restore it or sign again."}]
-    return ans, []
+    # owner-sign: an owner's answer counts only when the owner's key signed it (or it is an unsigned legacy answer from
+    # before the cutoff); a refused one is no answer, so the item waits for the owner (owner_refusals says why)
+    refused = owner_refusals(run_dir, ans)
+    return {fp: a for fp, a in ans.items() if fp not in refused}, []
+
+
+def owner_refusals(run_dir: str, ans: Optional[dict] = None) -> dict:
+    """{fingerprint: why} for the owner answers whose signature is missing (after the legacy cutoff) or does not
+    verify. `ans`: the raw answers (read from the record when None)."""
+    from lib import owner_key as OK
+    if ans is None:
+        ans = _raw_doc(run_dir).get("answers")
+        ans = ans if isinstance(ans, dict) else {}
+    out = {}
+    for fp, a in ans.items():
+        st, why = OK.scope_check(run_dir, fp, a)
+        if st == "refused":
+            out[fp] = why
+    return out
+
+
+def owner_legacy(run_dir: str, fps) -> list:
+    """The findings among `fps` answered by an unsigned legacy owner answer (labelled "unsigned (legacy)")."""
+    from lib import owner_key as OK
+    ans = _raw_doc(run_dir).get("answers")
+    ans = ans if isinstance(ans, dict) else {}
+    return [ans[fp].get("finding") for fp in fps if isinstance(ans.get(fp), dict)
+            and OK.scope_check(run_dir, fp, ans[fp])[0] == "legacy"]
 
 
 def _answer_sha(a: dict) -> str:
@@ -689,8 +716,8 @@ def sign(run_dir: str, by: str, answers: Optional[dict] = None, all_decision: Op
 def _sign_locked(run_dir: str, req: dict, by: str, answers: Optional[dict], all_decision: Optional[str],
                  note: str) -> dict:
     prior, bad = load_answers(run_dir)
-    if bad:
-        prior = {}
+    raw_ans = _raw_doc(run_dir).get("answers")     # Codex r1 11: an answer refused on read is kept in the record
+    prior = {} if bad else {**(raw_ans if isinstance(raw_ans, dict) else {}), **prior}
     answers = answers or {}
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     new, missing = {}, []
@@ -707,6 +734,15 @@ def _sign_locked(run_dir: str, req: dict, by: str, answers: Optional[dict], all_
                                   "round": req.get("round")}
     if missing:
         raise ValueError("no accept/decline answer for " + ", ".join(missing))
+    if by == "owner":       # owner-sign: the owner's key signs these answers to this request before anything is written
+        from lib import owner_key as OK
+        try:
+            sig = OK.sign_scope(run_dir, {fp: {"finding": a["finding"], "decision": a["decision"]}
+                                          for fp, a in new.items()}, req.get("round"), now)
+        except OK.OwnerKeyError as e:
+            raise ValueError(f"not signed with the owner's key: {e}") from None
+        for a in new.values():
+            a["owner_signature"] = sig
     doc = {**_raw_doc(run_dir), "answers": {**prior, **new}, "last_signed_by": by, "last_signed_at": now,
            "producer": "scripts/scope_signoff.py"}      # the owner's reviews of provisional answers are kept
     from lib.safe_io import LinkRefused, write_nofollow
@@ -1263,6 +1299,49 @@ def _self_test() -> int:
         md = render_md(d)
         ok("untested" not in md and "analysis/conflicts.yaml" in md,
            f"SO42 an older conflict item without its verdict points to the conflict record, not 'untested' ({md[-700:]!r})")
+    # OS1-OS5 (owner-sign): an owner's answer is signed with the owner's key (the self-test's throwaway key here) and
+    # counts only while the signature verifies; an unsigned one counts only before the legacy cutoff, labelled so
+    with tempfile.TemporaryDirectory() as td:
+        d = os.path.join(td, "run_os")
+        os.makedirs(d)
+        items = [{"finding": "f1", "fingerprint": "fp1"}, {"finding": "f2", "fingerprint": "fp2"}]
+        json.dump({"pending": True, "round": 3, "items": items}, open(os.path.join(d, REQUEST), "w"))
+        sign(d, "owner", {"f1": "accept", "f2": "decline"})
+        raw = json.load(open(os.path.join(d, SIGNOFF)))["answers"]
+        sig = raw["fp1"].get("owner_signature") or {}
+        ans, bad = load_answers(d)
+        ok(sorted(ans) == ["fp1", "fp2"] and not bad and sig.get("payload", {}).get("decision", {}).get("answers")
+           == {"fp1": {"finding": "f1", "decision": "accept"}, "fp2": {"finding": "f2", "decision": "decline"}}
+           and sig["payload"]["artifacts"].get(REQUEST) and not owner_refusals(d),
+           f"OS1 the owner's answers carry one signature of every fingerprint and decision, and count ({sorted(ans)})")
+        raw["fp2"]["decision"] = "accept"
+        json.dump({"answers": raw}, open(os.path.join(d, SIGNOFF), "w"))
+        ans, _ = load_answers(d)
+        why = owner_refusals(d).get("fp2", "")
+        ok(sorted(ans) == ["fp1"] and "--by owner" in why and status(d, verified=False) == "awaiting",
+           f"OS2 an answer changed after signing is no answer, and the refusal says how to sign: {why[:120]}")
+        from lib import owner_key as OK
+        raw["fp2"] = {"finding": "f2", "decision": "accept", "by": "owner", "at": "2026-12-01T00:00:00+00:00"}
+        raw["fp3"] = {"finding": "f3", "decision": "accept", "by": "owner", "at": "2026-11-20T00:00:00+00:00"}
+        json.dump({"answers": raw}, open(os.path.join(d, SIGNOFF), "w"))
+        before = (sorted(load_answers(d)[0]), owner_legacy(d, ["fp1", "fp2", "fp3"]))
+        OK.set_test_now(OK.LEGACY_CUTOFF_UTC)
+        after = sorted(load_answers(d)[0])
+        OK.set_test_now(None)
+        ok(before == (["fp1", "fp2", "fp3"], ["f2", "f3"]) and after == ["fp1"],
+           f"OS3 unsigned owner answers count, listed as unsigned (legacy), only while verified before the cutoff, "
+           f"whatever their own time ({before}, {after})")
+        raw["fp4"] = dict(raw["fp1"], by="lead")
+        json.dump({"answers": raw}, open(os.path.join(d, SIGNOFF), "w"))
+        ok(not _signer_ok(load_answers(d)[0]["fp4"]["by"], "owner") and "fp4" not in owner_refusals(d),
+           "OS4 a lead's answer never counts as the owner's, even with an owner signature attached")
+        OK.set_test_now(OK.LEGACY_CUTOFF_UTC)
+        sign(d, "owner", {"f1": "accept", "f2": "decline"})
+        got5 = (sorted(load_answers(d)[0]), list(owner_refusals(d)))
+        OK.set_test_now(None)
+        ok(got5 == (["fp1", "fp2", "fp4"], ["fp3"]) and "fp3" in json.load(open(os.path.join(d, SIGNOFF)))["answers"],
+           "OS5 the owner signs again over a refused answer, and the new signed answer counts; an unrelated refused "
+           "answer stays in the record (Codex r1 11)")
     if fails:
         print("SELF-TEST FAILURES:", *fails, sep="\n  - ")
         return 1

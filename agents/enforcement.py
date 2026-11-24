@@ -623,6 +623,11 @@ _OWNER_COMMANDS = tuple(re.compile(p, re.S) for p in (
     r"\bsignoff(?:\.py)?\b.*\bsign\b",                              # toolkit/spec/signoff.py sign
     r"\bscope_signoff(?:\.py)?\b.*\bsign\b",                        # scripts/scope_signoff.py sign
     r"\b(?:signoff|stage_machine|decision_brief|scope_signoff)\b.*\bsign\s*\(",
+    # owner-sign: the owner's key (scripts/lib/owner_key.py, cloud/budget.py init-key/set, the keychain item)
+    r"\bowner_key\b",
+    r"\bbudget(?:\.py)?\b.*\b(?:init-key|init_key|set_budget)\b",
+    r"\bsecurity\b.*\b(?:find|add|delete)-generic-password\b",
+    r"\bsecurity\s+(?:-\w+\s+)*-i\b",
 ))
 _BRIEF_NAMES = ("decision_brief.py", "decision_brief")
 
