@@ -826,6 +826,40 @@ def _figures(run_dir, man) -> list[dict]:
     return out
 
 
+def _self_test_interval(ok, complete_run, kinds):
+    """hb3 fix 5: a headline interval with next to no width is a finding, never reported as an interval."""
+    import tempfile
+
+    def unc(q, outcome="x"):
+        return {"draws": 2, "covers": ["priors"], "excludes": [], "label": "", "fixed_plan": {outcome: q},
+                "headline": {"name": "total_x", "outcome": "x"}}
+
+    def q(lo, med, hi):
+        return {"ci_low": lo, "median": med, "ci_high": hi, "mean": med, "level": 0.95}
+    narrow = interval_findings(unc(q(999.9995, 1000.0, 1000.0005)))
+    ok([(f["kind"], f["severity"], f["scope_declarable"], f["key"]) for f in narrow]
+       == [("analysis_interval_degenerate", "HIGH", False, "interval:total_x")] and "unit_rates" in narrow[0]["claim"],
+       f"KI1 a headline interval of width 1e-6 of its median is a non-declarable HIGH naming the remedy: {narrow}")
+    ok(interval_findings(unc(q(900.0, 1000.0, 1100.0))) == [] and interval_findings(unc(q(-50.0, 1.0, 40.0))) == [],
+       "KI2 a real interval (20% wide, or spanning zero) is no finding")
+    ok([f["kind"] for f in interval_findings(unc(q(0.0, 0.0, 0.0)))] == ["analysis_interval_degenerate"],
+       "KI3 an all-zero headline interval is degenerate (nothing to scale it by)")
+    bad = [interval_findings(unc(q(None, 1.0, 2.0))), interval_findings(unc(q(1.0, 2.0, 3.0), outcome="y")),
+           interval_findings(unc(q(float("nan"), 1.0, 2.0)))]
+    ok(all([f["kind"] for f in b] == ["analysis_interval_degenerate"] for b in bad),
+       f"KI4 a headline with no numeric interval (a missing bound, its outcome absent, NaN) fails closed: {bad}")
+    ok(interval_findings({"draws": 2, "fixed_plan": {}}) == [] and interval_findings(None) == [],
+       "KI5 a payload without a headline is not checked")
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, SPEC), "w").write("x: 1\n")
+        complete_run(d, unc=unc(q(999.9995, 1000.0, 1000.0005)))
+        k1 = kinds(d)
+        complete_run(d, unc=unc(q(900.0, 1000.0, 1100.0)))
+        k2 = kinds(d)
+        ok(k1 == {"analysis_interval_degenerate"} and k2 == set(),
+           f"KI6 the contract gate raises it for a completed run, and not for a real interval: {k1}, {k2}")
+
+
 def _self_test() -> int:
     import tempfile
     from toolkit.analysis.artifacts import Store
@@ -1169,6 +1203,7 @@ def _self_test() -> int:
            "K-DTP4 a spec with no manifest (withdrawn by a rerun after the contract checks read it): a non-declarable HIGH")
         os.remove(os.path.join(d, SPEC))
         ok(decision_test_findings(d) == [], "K-DTP4b no spec and no manifest: nothing to read")
+    _self_test_interval(ok, complete_run, kinds)
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
