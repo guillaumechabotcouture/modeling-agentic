@@ -103,6 +103,7 @@ REPORT = os.path.join("models", "pipeline_report.json")
 # At the run root, not under models/ (Codex on #267, P1): compute.py's code fingerprint hashes models/ and data/,
 # so a progress write there would change a running batch's fingerprint and discard its rows on resume.
 PROGRESS = "pipeline_progress.json"
+EVENTS = "events.jsonl"     # the harness's event stream (agents/run_events.py): never a step input
 _RUN_ID = None           # the current run()'s id (MA_PIPELINE_RUN in its steps)
 _PROGRESS_DOC: dict = {}  # (run dir, run id) -> PROGRESS as this process last wrote it
 _PROGRESS_LOCK = threading.Lock()   # one check-and-write of PROGRESS at a time (Codex round 4 on #267)
@@ -663,11 +664,12 @@ def fingerprint(step: dict, run_dir: str) -> dict:
     """What a step's result depends on: its definition, its input files and its code."""
     spec = {k: v for k, v in step.items() if not k.startswith("_")}
     ins, missing = {}, []
-    prog = os.path.realpath(os.path.join(run_dir, PROGRESS))
+    # events.jsonl too (agents/run_events.py): the harness appends heartbeats to it while a step runs.
+    prog = {os.path.realpath(os.path.join(run_dir, x)) for x in (PROGRESS, EVENTS)}
     for pat in step_inputs(step):
         # The runner rewrites PROGRESS while a step runs (Codex on #267): never an input, also through a link, and
         # excluded before the missing check, so it alone never satisfies a glob.
-        m = [r for r in _matches(run_dir, pat) if os.path.realpath(os.path.join(run_dir, r)) != prog]
+        m = [r for r in _matches(run_dir, pat) if os.path.realpath(os.path.join(run_dir, r)) not in prog]
         if not m:
             missing.append(pat)
         for rel in m:

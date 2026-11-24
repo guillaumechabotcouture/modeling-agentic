@@ -44,6 +44,7 @@ for _p in (REPO, os.path.join(REPO, "scripts"), HERE):
 import analysis_backend as AB  # noqa: E402
 import findings_ledger as FL  # noqa: E402
 import fix_loop as FX  # noqa: E402
+import run_events as RE  # noqa: E402
 
 STATE_FILE = "run_state.json"
 SIGNOFF_FILE = "decision_spec.signoff.json"
@@ -143,6 +144,7 @@ class RunState:
     world_model: dict = field(default_factory=dict)
     last_gate: dict = field(default_factory=dict)
     history: list = field(default_factory=list)
+    events_dropped: int = 0               # events.jsonl appends that failed (agents/run_events.py; never fatal)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -150,6 +152,16 @@ class RunState:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _meta_field(run_dir: str, key: str):
+    """One field of metadata.json (read with no link followed), or None."""
+    try:
+        from lib.safe_io import read_nofollow
+        v = json.loads(read_nofollow(run_dir, "metadata.json", max_bytes=1 << 22)[0]).get(key)
+        return v if isinstance(v, (str, int, float, bool)) else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def load_state(run_dir: str) -> RunState | None:
@@ -1519,6 +1531,7 @@ class Machine:
         frm = self.st.state
         if to not in EDGES[frm]:
             raise RuntimeError(f"transition {frm} -> {to} is not in the state table")
+        prev = next((h for h in reversed(self.st.history) if isinstance(h, dict) and "to" in h), None)
         self.st.history.append({"at": _now(), "from": frm, "to": to, "why": why, "round": self.st.round,
                                 "spent_usd": round(self.st.spent_usd, 4), **(extra or {})})
         self.st.state = to
@@ -1532,8 +1545,37 @@ class Machine:
         if before_save is not None:
             before_save()
         save_state(self.run_dir, self.st)
+        self._events_go(frm, to, why, prev)
         self.log(f"[machine] {frm} -> {to}" + (f" ({why})" if why else ""))
         return to
+
+    # -------------------------------------------------- events.jsonl (docs/design/diagnostic-data.md §7)
+    def _ev(self, kind: str, **fields) -> None:
+        """One event, never fatal: a failed append is counted in the state (saved with the next state write)."""
+        if not RE.emit(self.run_dir, kind, self.st.state, self.st.round, **fields):
+            self.st.events_dropped = int(self.st.events_dropped or 0) + 1
+            self._dropped_unsaved = True
+
+    def _events_go(self, frm: str, to: str, why: str, prev: dict | None) -> None:
+        h = self.st.history[-1]
+        el = None
+        try:
+            if prev and prev.get("at"):
+                el = round((datetime.fromisoformat(h["at"]) - datetime.fromisoformat(prev["at"])).total_seconds(), 1)
+        except (TypeError, ValueError):
+            el = None
+        if prev is not None and prev.get("round") != self.st.round:
+            self._ev("round", **{"from": prev.get("round"), "to": self.st.round})
+        q = getattr(self, "_paused_q", None)
+        if q and q.get("state") == frm and to != frm:
+            try:
+                by = self._signed_by() if frm == "SIGN" else None
+            except Exception:  # noqa: BLE001 -- the answer is recorded without its signer
+                by = None
+            self._ev("owner_answer", question=q.get("question"), paused=q.get("paused"), by=by)
+            self._paused_q = None
+        self._ev("stage", **{"from": frm, "to": to, "why": why, "spent_usd": round(self.st.spent_usd, 4),
+                             "elapsed_in_from_s": el, "status": self.st.status if to == "FINAL" else None})
 
     def _charge(self, res) -> None:
         self.st.spent_usd += float(getattr(res, "usd", 0.0) or 0.0)
@@ -1592,7 +1634,12 @@ class Machine:
         setter = getattr(self.tasks, "set_allowance", None)
         if setter:
             setter(a, readback_usd=rb)
-        res = getattr(self.tasks, name)(*args, **kwargs)
+        self._ev("task_start", key=key, task=name, allowance_usd=allowance)
+        if hasattr(self.tasks, "last_model"):
+            self.tasks.last_model = None          # the model this task's session reports, not an earlier one
+        t0 = time.monotonic()
+        with RE.heartbeat(self.run_dir, key, self.st.state, self.st.round, progress=lambda: {}):
+            res = getattr(self.tasks, name)(*args, **kwargs)
         self._charge(res)
         out = res.output
         try:
@@ -1601,6 +1648,9 @@ class Machine:
             out = None
         j.update(status="completed", completed=_now(), ok=bool(res.ok), output=out, usd=float(res.usd or 0.0),
                  note=(res.note or "")[:300], session_id=getattr(res, "session_id", None))
+        self._ev("task_end", key=key, task=name, ok=bool(res.ok), elapsed_s=round(time.monotonic() - t0, 1),
+                 usd=float(res.usd or 0.0), spent_usd=round(self.st.spent_usd, 4), note=j["note"],
+                 model=getattr(self.tasks, "last_model", None))
         save_state(self.run_dir, self.st)
         return res
 
@@ -1779,7 +1829,8 @@ class Machine:
         """The S1 pipeline, then the report again when a draft exists (a write-up fix edits
         manuscript.md; its check must read the re-rendered report)."""
         import pipeline as P
-        rep = P.run(run_dir)
+        with RE.heartbeat(self.run_dir, "pipeline", self.st.state, self.st.round):
+            rep = P.run(run_dir)
         if os.path.exists(os.path.join(run_dir, "manuscript.md")):
             render_report(run_dir, self.backend)
         return rep
@@ -1804,6 +1855,41 @@ class Machine:
             return s
 
     def run(self, max_steps: int = 200) -> str:
+        last = self.st.history[-1] if self.st.history and isinstance(self.st.history[-1], dict) else {}
+        if last.get("paused") and self.st.state != "FINAL":     # resumed after a pause: its answer is the next move
+            self._paused_q = {"state": last.get("state"), "paused": last.get("paused"),
+                              "question": RE.question_of(last.get("paused"))[0]}
+        self._ev("run_start", resume=bool(self.st.history), commit=_meta_field(self.run_dir, "commit"),
+                 pipeline=_meta_field(self.run_dir, "pipeline"))
+        try:
+            return self._run(max_steps)
+        finally:
+            self._events_exit()
+
+    def _events_exit(self) -> None:
+        """The run's last word in events.jsonl: the owner question of a pause, then the status."""
+        p = self.st.paused if self.st.state != "FINAL" else None
+        if p:
+            q, req = RE.question_of(p)
+            items = []
+            if p == "awaiting_scope_signoff":
+                try:
+                    from lib.safe_io import read_nofollow
+                    doc = json.loads(read_nofollow(self.run_dir, OWNER_REQUEST, max_bytes=1 << 22)[0])
+                    items = [str(i.get("finding")) for i in doc.get("items") or [] if isinstance(i, dict)]
+                except Exception:  # noqa: BLE001 -- the question is raised without its items
+                    items = []
+            self._ev("owner_question", question=q, paused=p, request=req, items=items)
+            self._paused_q = {"state": self.st.state, "paused": p, "question": q}
+        n0 = int(self.st.events_dropped or 0)
+        self._ev("status", status=self.st.status, paused=p, terminal=self.st.state == "FINAL")
+        if int(self.st.events_dropped or 0) != n0 or getattr(self, "_dropped_unsaved", False):
+            try:
+                save_state(self.run_dir, self.st)    # the drop count, when an event above failed
+            except Exception:  # noqa: BLE001 -- the run's own last save already stands
+                pass
+
+    def _run(self, max_steps: int) -> str:
         if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
             miss = evidence_gate(self.run_dir, signoff=self.st.signoff)
             if miss:
@@ -2565,6 +2651,9 @@ class Machine:
             remove_nofollow(self.run_dir, "final_gate.json")
         self.st.last_gate = {k: (d or {}).get(k) for k in ("action", "rule_matched", "rounds_remaining", "rationale")}
         self.st.last_gate.update(round=self.st.round, post_write=pw)
+        self._ev("gate", post_write=pw, action=(d or {}).get("action"), rule=(d or {}).get("rule_matched"),
+                 rounds_remaining=(d or {}).get("rounds_remaining"),
+                 blocking=len((d or {}).get("unresolved_high") or []), waiting=len(waiting))
         if (d or {}).get("action"):
             FL.sync(self.run_dir, d, self.st.round, post_write=pw, lead_ok=self.st.signoff == "lead")
             if d.get("rule_matched") == "4m" or (str(d.get("rule_matched")) == "2" and d.get("open_tested")):
@@ -4661,6 +4750,29 @@ def _self_test() -> int:
         ok(hist[:8] == ["EVIDENCE", "SIGN", "ENGINE_CHOICE", "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE"]
            and "FIX_LOOP" in hist
            and hist[-3:] == ["PRESENTATION", "GATE", "FINAL"], f"T11 the path SPEC..FIX_LOOP..WRITE..FINAL {hist}")
+        # EVS1-EVS6 (docs/design/diagnostic-data.md §7): the run's event stream, one place per event kind.
+        evs, st_h = RE.read(d), load_state(d)
+        kinds = [e.get("kind") for e in evs]
+        stages = [(e.get("from"), e.get("to")) for e in evs if e.get("kind") == "stage"]
+        trans = [(h["from"], h["to"]) for h in st_h.history if "to" in h]
+        ok(evs and all(e.get("v") == RE.SCHEMA_VERSION for e in evs) and stages == trans and kinds[0] == "run_start"
+           and kinds[-1] == "status" and evs[-1].get("status") == "completed" and evs[-1].get("terminal") is True,
+           f"EVS1 one stage event per transition, run_start first and the terminal status last ({len(stages)} vs "
+           f"{len(trans)}; {kinds[:1]}..{kinds[-1:]})")
+        paid = [k for k, j in st_h.journal.items() if j.get("task") != "harness" and j.get("status") == "completed"]
+        ends = [e["key"] for e in evs if e.get("kind") == "task_end"]
+        ok(sorted(ends) == sorted(paid) and kinds.count("task_start") == len(ends)
+           and all(isinstance(e.get("elapsed_s"), (int, float)) for e in evs if e.get("kind") == "task_end"),
+           f"EVS2 every paid task has a start and an end with its elapsed time ({len(ends)} of {len(paid)})")
+        gates = [e for e in evs if e.get("kind") == "gate"]
+        ok(len(gates) == sum(1 for f_, _t in trans if f_ == "GATE") and gates[-1].get("post_write")
+           and gates[-1].get("action"), f"EVS3 one gate event per gate decision ({len(gates)})")
+        fd = [(e.get("id"), e.get("from"), e.get("to")) for e in evs if e.get("kind") == "finding" and e.get("id") == "D-001"]
+        ok(fd[:1] == [("D-001", None, "open")] and all(t in FL.STATUSES for _, _, t in fd),
+           f"EVS4 a finding's status changes are events, from its opening ({fd})")
+        ok(any(e.get("kind") == "round" and e.get("to") == 2 for e in evs) and st_h.events_dropped == 0,
+           f"EVS5 the round change is an event; no append was dropped ({st_h.events_dropped})")
+        ok(not any(e.get("kind") == "heartbeat" for e in evs), "EVS6 no heartbeat from steps shorter than its interval")
         # SM-CK1-3 (owner 2026-11-23): the structural checklist. The gate records each critic's answers to all five
         # items; a missing item is a schema repair, never a round; not_applicable answers raise nothing.
         from toolkit.spec import critique_checklist as CLk
@@ -4804,6 +4916,17 @@ def _self_test() -> int:
         sign(d, "owner", "ok")
         ok(_SpikeMachine(d, StubTasks(T.s), None, log=lambda *a: None, cross_engine_check=False).run() == "completed",
            "T18 after the owner signs, the resumed run completes")
+        evq = RE.read(d)
+        qs = [e for e in evq if e.get("kind") == "owner_question"]
+        ans = [e for e in evq if e.get("kind") == "owner_answer"]
+        sts = [(e.get("status"), e.get("paused")) for e in evq if e.get("kind") == "status"]
+        ok(qs and qs[0].get("question") == "spec_signoff" and qs[0].get("request") == "decision_spec.signoff_sheet.md"
+           and ans and ans[0].get("question") == "spec_signoff" and ans[0].get("by") == "owner"
+           and evq.index(ans[0]) > evq.index(qs[0]) and sts[0] == (None, "awaiting_signoff")
+           and sts[-1] == ("completed", None)
+           and [e.get("resume") for e in evq if e.get("kind") == "run_start"][-1] is True,
+           f"EVS7 a pause raises its owner question, the resumed run records the answer when it leaves SIGN "
+           f"({[(e.get('kind'), e.get('question')) for e in qs + ans]}, {sts[:1]}..{sts[-1:]})")
 
         d, T, st = new_run("lead_rc", {}, signoff="lead")
         s = _SpikeMachine(d, T, st, log=lambda *a: None, cross_engine_check=False).run()

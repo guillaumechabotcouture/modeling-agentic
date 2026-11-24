@@ -29,6 +29,7 @@ OUT = "_task_output.json"
 SPEC_MAX_TURNS = 60
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
+                 "events.jsonl",  # agents/run_events.py: the run's event stream
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
                  "report.md", "allocation_optimized.csv", "data/inputs_provenance.json", "declared_findings.yaml",
                  "data/derivations_record.json", "decision_spec.signoff_sheet.md",
@@ -709,6 +710,7 @@ class SdkTasks:
                                   env=enforcement.filtered_env(dict(os.environ), self.cloud),
                                   hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[pre])]})
 
+        self.last_model = opts.model          # events.jsonl task_end (agents/run_events.py)
         seen = {"result": None, "sid": None}
         qf = self.query_fn or query
 

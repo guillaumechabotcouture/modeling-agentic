@@ -179,8 +179,28 @@ def save(run_dir: str, ledger: dict[str, Finding]) -> str:
     if _scripts not in sys.path:
         sys.path.insert(0, _scripts)
     from lib.safe_io import write_nofollow       # atomic, no link followed (review round 4, P1-2)
+    try:                                          # events.jsonl: the status changes against the ledger on disk
+        before = load(run_dir)
+    except Exception:  # noqa: BLE001 -- an unreadable ledger: every finding is reported as new
+        before = {}
     write_nofollow(run_dir, LEDGER.replace(os.sep, "/"), text.encode(), atomic=True)
+    _finding_events(run_dir, before, ledger)
     return p
+
+
+def _finding_events(run_dir: str, before: dict, after: dict) -> None:
+    """One `finding` event per status change (agents/run_events.py; never fatal)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import run_events as RE
+        for c in RE.finding_changes(before, after):
+            f = after.get(c["id"])
+            RE.emit(run_dir, "finding", None, (f.events[-1].get("round") if f is not None and f.events
+                                               and isinstance(f.events[-1], dict) else None), **c)
+    except Exception:  # noqa: BLE001 -- a diagnostic record never stops the ledger
+        pass
 
 
 def _event(f: Finding, rnd, status: str, by: str, note: str = "", **extra) -> None:
