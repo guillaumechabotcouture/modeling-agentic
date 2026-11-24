@@ -1846,7 +1846,47 @@ class Machine:
             self.st.history.append({"at": _now(), "paused": self.st.paused, "state": self.st.state,
                                     "round": self.st.round, "spent_usd": round(self.st.spent_usd, 4)})
         save_state(self.run_dir, self.st)
+        if self.st.paused and self.st.state != "FINAL":
+            # baseline hb3 §4.2: only FINAL wrote a status, so a paused run (flu R1) exited 2 with none in metadata.json
+            try:
+                self._write_meta(drop=("finished",), status=f"paused:{self.st.paused}", paused_state=self.st.state,
+                                 paused_why=self._pause_why())
+            except OSError as e:      # the pause stands (run_state.json holds it); said loudly, never a crash
+                self.log(f"[machine] ERROR the pause was not recorded in metadata.json: {type(e).__name__}: {e}")
         return self.st.status or (f"paused:{self.st.paused}" if self.st.paused else self.st.state)
+
+    def _pause_why(self) -> str:
+        """Why the run is paused, for metadata.json: the reason it entered its state, the allowance a budget pause
+        stopped at, and the lead's refusal of an amendment."""
+        h = self.st.history
+        why = next((x.get("why") for x in reversed(h) if x.get("to") == self.st.state and x.get("why")), "")
+        if self.st.paused == AWAITING_BUDGET:
+            b = next((x for x in reversed(h) if x.get("paused") == AWAITING_BUDGET), {})
+            why = (f"task {b.get('task')}: allowance ${b.get('allowance_usd')} is below the ${b.get('floor_usd')} "
+                   f"floor (cap ${b.get('cap_usd')})")
+        if self.st.paused == AWAITING_SPEC_AMENDMENT:
+            try:
+                la = json.load(open(os.path.join(self.run_dir, SPEC_RETHINK_REQUEST))).get("lead_amendment")
+            except (OSError, ValueError, AttributeError):
+                la = None
+            if isinstance(la, dict) and la.get("status") == "refused":
+                why = f"{why}; the lead amendment was refused: {la.get('why')}".lstrip("; ")
+        return str(why or f"paused at {self.st.state}")[:1000]
+
+    def _write_meta(self, drop=(), **fields) -> None:
+        """metadata.json with `fields` and the run's pipeline, engine, rounds and spend set, and `drop` removed. Read
+        with no link followed, as it is written (Codex r1 on #374: a planted link's target was copied into it)."""
+        from lib.safe_io import read_nofollow
+        try:
+            meta = json.loads(read_nofollow(self.run_dir, "metadata.json")[0])
+        except (OSError, ValueError):
+            meta = {}
+        meta = meta if isinstance(meta, dict) else {}
+        for k in drop:
+            meta.pop(k, None)
+        meta.update(pipeline="v2", engine=self.st.engine, rounds=self.st.round, max_rounds=self.st.max_rounds,
+                    model_spend_usd=round(self.st.spent_usd, 4), **fields)
+        _write_json(self.run_dir, "metadata.json", meta)
 
     # -------------------------------------------------- handlers
     def h_SPEC(self):
@@ -2992,14 +3032,7 @@ class Machine:
             self.st.status = "completed_no_report"
 
     def _finish(self) -> None:
-        meta_p = os.path.join(self.run_dir, "metadata.json")
-        try:
-            meta = json.load(open(meta_p))
-        except (OSError, ValueError):
-            meta = {}
-        meta.update(status=self.st.status, pipeline="v2", engine=self.st.engine, rounds=self.st.round,
-                    max_rounds=self.st.max_rounds, model_spend_usd=round(self.st.spent_usd, 4), finished=_now())
-        _write_json(self.run_dir, "metadata.json", meta)
+        self._write_meta(drop=("paused_state", "paused_why"), status=self.st.status, finished=_now())
 
 
 # ------------------------------------------------------------------ helpers
@@ -4100,6 +4133,11 @@ def _self_test_lead_amend(ok, td: str) -> None:
            and (mode == "lead" or "patch" not in rq),
            f"T_LEAD_AMEND_PAUSE {name}: the run pauses for the owner as before, nothing amended; an owner run's "
            f"request carries no generated patch, so `amend --from-request --patch` stays the owner's ({s}, {la})")
+        _mp = json.load(open(os.path.join(d, "metadata.json")))
+        ok(_mp.get("status") == s and _mp.get("paused_state") == "SPEC" and _mp.get("paused_why")
+           and (why is None or why in _mp["paused_why"]),
+           f"PS2 {name}: the amendment pause is recorded in metadata.json with its reason, the lead's refusal "
+           f"included ({_mp.get('status')}, {_mp.get('paused_why')})")
         if name == "lead_badpatch":
             s2 = Machine(d, StubTasks({}), log=lambda *a: None, cross_engine_check=False).run()
             la2 = json.load(open(os.path.join(d, SPEC_RETHINK_REQUEST))).get("lead_amendment")
@@ -4837,6 +4875,11 @@ def _self_test() -> int:
         ok(s == "paused:awaiting_signoff" and load_state(d).state == "SIGN", f"T17 owner mode pauses at SIGN ({s})")
         pz = [(h.get("paused"), h.get("state")) for h in load_state(d).history if "paused" in h]
         ok(pz == [("awaiting_signoff", "SIGN")], f"RR1 a SIGN pause writes one history entry ({pz})")
+        _mp = json.load(open(os.path.join(d, "metadata.json")))     # PS1 (baseline hb3 §4.2: a pause wrote no status)
+        ok(_mp.get("status") == "paused:awaiting_signoff" and _mp.get("paused_state") == "SIGN"
+           and _mp.get("paused_why") and "finished" not in _mp,
+           f"PS1 a paused run records paused:<reason>, its state and why in metadata.json, and no finish time "
+           f"({[_mp.get(k) for k in ('status', 'paused_state', 'paused_why', 'finished')]})")
         from toolkit.spec import review_conditions as _RC
         _rows = _RC.parse(_RC.read_bytes(d))
         try:
@@ -5390,6 +5433,9 @@ def _self_test() -> int:
            f"R3-4 a $0.13 allowance starts no task; the run pauses awaiting budget ({s}, {T.calls}, {T.allowances})")
         T2 = StubTasks(T.s)
         mp4 = os.path.join(d, "metadata.json")
+        _mp = json.load(open(mp4))
+        ok(_mp.get("status") == "paused:awaiting_budget" and "allowance" in str(_mp.get("paused_why")),
+           f"PS3 the budget pause is recorded in metadata.json with the task's allowance ({_mp.get('paused_why')})")
         json.dump(dict(json.load(open(mp4)), invocations=[{"at": "2020-01-01T00:00:00"}, {"at": "2020-01-01T01:00:00"}]),
                   open(mp4, "w"))
         s2 = run_v2("toy question", d, T2, signoff="none", budget_usd=60.0, log=lambda *a: None,
@@ -5398,7 +5444,8 @@ def _self_test() -> int:
         ok(m4["invocations"][-1].get("budget_usd") == 60.0 and m4["invocations"][-1].get("cap_usd") == 60.0
            and "budget_usd" not in m4["invocations"][0] and set(m4.get("models") or {}) == {"deep", "fast"}
            and m4.get("sdk_version") and m4["invocations"][-1].get("models") == m4["models"]
-           and sum(1 for h in h4 if h.get("paused") == AWAITING_BUDGET) == 1,
+           and sum(1 for h in h4 if h.get("paused") == AWAITING_BUDGET) == 1
+           and m4.get("status") == s2 and (s2.startswith("paused:") or "paused_state" not in m4),
            f"RR4 each invocation records its budget, the cap in force, the model ids and the SDK version; the budget "
            f"pause has one entry ({m4['invocations'][-1]}, {m4.get('sdk_version')})")
         dp = os.path.join(td, "rr5_child")

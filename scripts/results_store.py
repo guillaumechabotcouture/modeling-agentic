@@ -77,7 +77,7 @@ def _retry(what: str, fn, attempts: int):
         try:
             return fn()
         except Exception as e:  # noqa: BLE001 -- transient network/auth errors
-            if isinstance(e, (FileNotFoundError, KeyError)) or type(e).__name__ == "ResourceNotFoundError":
+            if isinstance(e, (FileNotFoundError, KeyError, BlobNameTaken)) or type(e).__name__ == "ResourceNotFoundError":
                 raise
             last = e
             if k + 1 < attempts:
@@ -290,26 +290,41 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def upload(path: str, blob: str, account: str | None = None, service=None) -> dict:
+class BlobNameTaken(RuntimeError):
+    """The blob name already holds another file: refused, never overwritten, never retried."""
+
+
+def upload(path: str, blob: str, account: str | None = None, service=None, overwrite: bool = True) -> dict:
     """Upload a file and read it back (sha256) so success is verified, not assumed. Bounded memory: the file is
-    streamed up and the read-back hashed chunk by chunk."""
+    streamed up and the read-back hashed chunk by chunk. overwrite=False never replaces a blob (Azure refuses it
+    atomically): the same bytes already there are this upload, landed on an earlier try; other bytes raise
+    BlobNameTaken (baseline hb3 §5.1)."""
     container, name = _split(blob)
     client = (service or _service(account)).get_blob_client(container, name)
     want, size = sha256_file(path), os.path.getsize(path)
     kw = _accepts(client.upload_blob, length=size, timeout=CALL_TIMEOUT_S)
-    with open(path, "rb") as f:
-        client.upload_blob(f if "length" in kw else f.read(), overwrite=True, **kw)
+    refused = False
+    try:
+        with open(path, "rb") as f:
+            client.upload_blob(f if "length" in kw else f.read(), overwrite=overwrite, **kw)
+    except Exception as e:  # noqa: BLE001 -- only a refused overwrite is handled here
+        if overwrite or type(e).__name__ != "ResourceExistsError":
+            raise
+        refused = True
     h = hashlib.sha256()
     for block in _blob_chunks(client):
         h.update(block)
     if h.hexdigest() != want:
+        if refused:
+            raise BlobNameTaken(f"{blob} already holds another file: not overwritten")
         raise RuntimeError(f"upload of {blob} did not verify")
     return {"blob": blob, "bytes": size, "sha256": want}
 
 
-def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = ATTEMPTS) -> dict:
+def upload_retry(path: str, blob: str, account: str | None = None, service=None, attempts: int = ATTEMPTS,
+                 overwrite: bool = True) -> dict:
     _split(blob)
-    return _retry(f"upload of {blob}", lambda: upload(path, blob, account, service), attempts)
+    return _retry(f"upload of {blob}", lambda: upload(path, blob, account, service, overwrite=overwrite), attempts)
 
 
 upload_file = upload_retry      # the checkpointer's name for it; both stream
@@ -773,6 +788,36 @@ def _self_test_durable(fails) -> None:
             blob = run_finish.store_run_results(run, service=_Svc())
         if blob is None:
             fails.append("S26b a link in the run dir (left out on purpose) does not fail the store")
+        # S28 (baseline hb3 §5.1: one replicate's upload replaced another's): overwrite=False never replaces a blob.
+        # The same bytes already there are this upload, landed on an earlier try; other bytes are refused at once.
+        taken = type("ResourceExistsError", (Exception,), {})
+        st28, calls28 = {}, []
+
+        class _C28(_Client):
+            def upload_blob(self, data, overwrite=False, length=None, timeout=None):
+                calls28.append(overwrite)
+                if not overwrite and self.key in self.st:
+                    raise taken(self.key)
+                super().upload_blob(data, overwrite, length, timeout)
+        svc28 = types.SimpleNamespace(get_blob_client=lambda c, n: _C28(st28, (c, n), [], None))
+        mine, other = os.path.join(d, "mine.bin"), os.path.join(d, "other.bin")
+        open(mine, "wb").write(b"mine")
+        open(other, "wb").write(b"other")
+        try:
+            upload_retry(mine, "outputs/s/r.tar.gz", service=svc28, overwrite=False)
+            again = upload_retry(mine, "outputs/s/r.tar.gz", service=svc28, overwrite=False)["blob"]
+            n0 = len(calls28)
+            try:
+                upload_retry(other, "outputs/s/r.tar.gz", service=svc28, overwrite=False)
+                refused = "no error"
+            except BlobNameTaken:
+                refused = "BlobNameTaken"
+        except Exception as e:  # noqa: BLE001
+            again, n0, refused = None, 0, f"{type(e).__name__}: {e}"
+        if (again != "outputs/s/r.tar.gz" or refused != "BlobNameTaken" or len(calls28) != n0 + 1
+                or st28.get(("outputs", "s/r.tar.gz")) != b"mine" or calls28[:1] != [False]):
+            fails.append(f"S28 overwrite=False keeps another file's blob (refused once, not retried) and accepts its "
+                         f"own landed bytes: {again}, {refused}, {calls28}")
 
 
 def main() -> int:

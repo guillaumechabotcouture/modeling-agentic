@@ -10,7 +10,7 @@ work for about 8 hours). One loop on a small Coiled VM, all its state in blob st
       prefix, and scripts/harness_metrics.py runs over every collected run (metrics.json).
   (c) status.json, rewritten every loop: heartbeat, merge queue, collection, paused runs (resume is not automated
       here), errors. Layout under outputs/supervisor/<name>/: requests/ (write-once, from the laptop), state.json and
-      status.json (the loop's only), collected/<launch>/<label>.tar.gz, metrics.json. The storage account comes from
+      status.json (the loop's only), collected/<launch>/launch_<id>/<label>.tar.gz, metrics.json. The storage account comes from
       $MA_STORAGE_ACCOUNT / $COILED_STORAGE_ACCOUNT or --account, never the code.
 
     python3 cloud/supervisor.py start [--name sv-supervisor-gcc] [--cap-usd 15] [--max-hours 24]
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -233,7 +234,8 @@ def fetch_from_storage(entry, label, work):
                                 storage_account=given)
     os.makedirs(cfg.out_dir, exist_ok=True)
     return rc.collect_from_storage(cfg, results_store, label, entry["assignments"][label]["launch_id"],
-                                   entry["assignments"][label])
+                                   entry["assignments"][label],
+                                   siblings={lb: a.get("launch_id") for lb, a in entry["assignments"].items()})
 
 
 def run_metrics(dirs, out_json):
@@ -281,7 +283,10 @@ def collect_step(blob, name, state, now, work, fetch=fetch_from_storage, metrics
                 tgz = os.path.join(td, f"{label}.tar.gz")
                 skipped = results_store.write_archive(src, label, tgz)
                 sha = results_store.sha256_file(tgz)
-                dst = f"{paths(name)['collected']}{lname}/{label}.tar.gz"
+                # per launch (baseline hb3 §5.1): a relaunch's archive never replaces the earlier launch's
+                launch = str(a.get("launch_id"))      # a plain id as it is; any other by its digest (Codex r1)
+                launch = launch if _LABEL.fullmatch(launch) else hashlib.sha256(launch.encode()).hexdigest()[:24]
+                dst = f"{paths(name)['collected']}{lname}/launch_{launch}/{label}.tar.gz"
                 blob.put_file(tgz, dst)
             lab.update(state="collected", blob=dst, sha256=sha, at=utc(now), note="",
                        exit_code=(meta or {}).get("exit_code"), left_out=len(skipped))
@@ -644,7 +649,7 @@ def _self_test() -> int:
         json.dump({"rows": [os.path.basename(d) for d in dirs]}, open(out, "w"))
         return out
 
-    tgz = P["collected"] + "ev-x/q.tar.gz"
+    tgz = P["collected"] + "ev-x/launch_L1/q.tar.gz"      # per launch (baseline hb3 §5.1): a relaunch keeps this one
     with tempfile.TemporaryDirectory() as td:
         st = guard(tick, b, N, {}, T0 + 1, td, fetch=fetch, metrics=metrics)
         st = guard(tick, b, N, st, T0 + 2, td, fetch=fetch, metrics=metrics)
@@ -662,6 +667,11 @@ def _self_test() -> int:
         guard(enqueue, b, N, "collect", {**entry, "assignments": {"q": {"launch_id": "L2"}}}, T0 + 5001)
         st = guard(tick, b, N, st, T0 + 5002, td, fetch=fetch, metrics=metrics)
         ok(lab_of(st).get("launch_id") == "L2" and seen["fetch"] == 3, f"SV10 a relaunch is collected ({lab_of(st)})")
+        ok(tgz in b.d and lab_of(st).get("blob") == P["collected"] + "ev-x/launch_L2/q.tar.gz" and lab_of(st)["blob"] in b.d,
+           f"SV10b a relaunch is archived under its own launch; the earlier launch's archive stays ({sorted(b.d)})")
+        import inspect
+        ok("siblings=" in inspect.getsource(fetch_from_storage),
+           "SV10c the supervisor's fetch names the launch's other labels, so a stored run two labels share is refused")
         # SV12 pull: each collected run once, sha256-checked before extraction
         with tempfile.TemporaryDirectory() as dest:
             got, again = guard(pull, b, N, dest), guard(pull, b, N, dest)

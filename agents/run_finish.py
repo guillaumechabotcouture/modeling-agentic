@@ -10,7 +10,9 @@ removed with pipeline v1 (owner, 2026-11-20; docs/design/v1-retirement.md)."""
 
 import json
 import os
+import re
 import sys
+import uuid
 
 from agents import enforcement
 
@@ -59,18 +61,52 @@ def exit_code_for(status: str) -> int:
     return 1
 
 
+def plain_tag(value) -> str:
+    """A label or launch id as it may appear in a run dir or blob name ('' when there is none)."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "", str(value or "")).lstrip(".")[:64]   # a supervisor label is <= 63
+
+
 def _store_blob_name(run_path: str) -> str:
+    """Where the run is stored. A cloud replicate (main.py told its launch and label: $MA_LAUNCH_ID, $MA_RUN_LABEL)
+    is stored under its launch and label, beside its result record, so two replicates whose run dirs share a name
+    never share a blob (baseline hb3 §5.1). A run with neither keeps the earlier name, outputs/<prefix>/<run>."""
     name = os.path.basename(os.path.normpath(run_path))
-    return f"outputs/{os.environ.get('MA_STORAGE_PREFIX', 'runs')}/{name}.tar.gz"
+    prefix = os.environ.get("MA_STORAGE_PREFIX", "runs")
+    launch, label = plain_tag(os.environ.get("MA_LAUNCH_ID")), plain_tag(os.environ.get("MA_RUN_LABEL"))
+    if launch and label:
+        return f"outputs/{prefix}/launch_{launch}/run_{label}_{name}.tar.gz"
+    return f"outputs/{prefix}/{name}.tar.gz"
+
+
+def _upload_own(results_store, tmp: str, blob: str, account, service, before: dict) -> tuple[str, str | None]:
+    """(the blob the run went to, the name it was refused, or None). A blob is replaced only when this run stored
+    it before, in the same account (metadata.json `stored`, `stored_account`: a resume), and a run stored under a
+    fresh name keeps it; a name another run's blob holds is refused, never overwritten, and the run goes under a
+    fresh name beside it (Codex r1 on #374)."""
+    stem = blob[:-len(".tar.gz")]
+    mine = before.get("stored") if before.get("stored_account") == (account or "") else None
+    if isinstance(mine, str) and re.fullmatch(re.escape(stem) + r"\.[0-9a-f]{8}\.tar\.gz", mine):
+        blob = mine
+    try:
+        results_store.upload_retry(tmp, blob, account, service=service, overwrite=mine == blob)
+        return blob, None
+    except results_store.BlobNameTaken:
+        fresh = f"{stem}.{uuid.uuid4().hex[:8]}.tar.gz"
+        print(f"[WARN] {blob} holds another run: not overwritten; this run is stored as {fresh}", file=sys.stderr,
+              flush=True)
+        results_store.upload_retry(tmp, fresh, account, service=service, overwrite=False)
+        return fresh, blob
 
 
 def store_run_results(run_path: str, service=None) -> str | None:
     """Phase 26: when a storage account is configured ($MA_STORAGE_ACCOUNT or
     $COILED_STORAGE_ACCOUNT), upload the finished run directory to
-    outputs/<prefix>/<run name>.tar.gz so the result never depends on someone
-    collecting it from the VM. Answer keys and credential files are left out
-    and API keys redacted. The outcome is recorded in metadata.json
-    (`stored` / `store_error`); a failure is loud but never fatal."""
+    outputs/<prefix>/<run name>.tar.gz (a cloud replicate: under its launch and
+    label, _store_blob_name) so the result never depends on someone collecting it
+    from the VM. Another run's blob is never overwritten (_upload_own). Answer keys
+    and credential files are left out and API keys redacted. The outcome is recorded
+    in metadata.json (`stored` / `store_error`, `store_collision`); a failure is loud
+    but never fatal."""
     sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
     import results_store
     account = results_store.configured_account()
@@ -78,7 +114,13 @@ def store_run_results(run_path: str, service=None) -> str | None:
         return None
     import tempfile
     name = os.path.basename(os.path.normpath(run_path))
-    blob, err = None, None
+    blob, err, taken = None, None, None
+    mp = os.path.join(run_path, "metadata.json")
+    try:
+        before = json.load(open(mp)) if os.path.exists(mp) else {}
+    except (OSError, ValueError):
+        before = {}
+    before = before if isinstance(before, dict) else {}
     try:
         # Bounded memory (v2 autonomy 1E-i): the archive is streamed to disk and streamed up; a large run was
         # held three times over at this point, and a run killed here for memory stored nothing.
@@ -86,16 +128,16 @@ def store_run_results(run_path: str, service=None) -> str | None:
         with tempfile.TemporaryDirectory() as stage:     # outside the run dir; removed whatever happens
             tmp = os.path.join(stage, f"{name}.tar.gz")
             results_store.write_archive(run_path, name, tmp, secrets, strict=True)
-            blob = _store_blob_name(run_path)
-            results_store.upload_retry(tmp, blob, account, service=service)
+            blob, taken = _upload_own(results_store, tmp, _store_blob_name(run_path), account, service, before)
     except Exception as e:  # noqa: BLE001 — the local copy remains; say so loudly
         blob, err = None, f"{type(e).__name__}: {e}"[:500]
         print(f"[ERROR] RUN RESULTS NOT STORED (only the VM copy exists): {err}", file=sys.stderr, flush=True)
     try:
-        mp = os.path.join(run_path, "metadata.json")
         meta = json.load(open(mp)) if os.path.exists(mp) else {}
         meta = meta if isinstance(meta, dict) else {}   # valid JSON that is not an object (ST6)
-        meta.update({"stored": blob, "store_error": err})
+        meta.update({"stored": blob, "store_error": err, "stored_account": account or ""})
+        if taken:
+            meta["store_collision"] = taken
         json.dump(meta, open(mp, "w"), indent=2)
     except (OSError, ValueError):
         pass

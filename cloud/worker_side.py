@@ -77,9 +77,11 @@ def _hold(d, hold_s, sleep=None, clock=None):
 
 
 def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds=8, max_sessions=5,
-                 timeout_s=None, on_start=None):
+                 timeout_s=None, on_start=None, launch_id=None):
     """Unpack the code, run main.py (killed past `timeout_s`), return the run directory as a tarball.
-    `on_start(work)` is called once the work dir is unpacked, just before main.py starts (the checkpoint thread)."""
+    `on_start(work)` is called once the work dir is unpacked, just before main.py starts (the checkpoint thread).
+    main.py is told the label and launch ($MA_RUN_LABEL, $MA_LAUNCH_ID): its run dir and stored blob carry them, so
+    replicates started in the same second never share either (baseline hb3 §5.1)."""
     import glob, io, json, os, shutil, subprocess, sys, tarfile, time, urllib.request, uuid
     work = f"{WORK}/{label}"
     shutil.rmtree(work, ignore_errors=True)
@@ -88,6 +90,11 @@ def run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_ro
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "OPENAI", "AZ_", "AZURE_"))}
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "/usr/bin:/bin")
     env["ANTHROPIC_API_KEY"] = anthropic_key
+    env["MA_RUN_LABEL"] = str(label)
+    if launch_id:
+        env["MA_LAUNCH_ID"] = str(launch_id)
+    else:
+        env.pop("MA_LAUNCH_ID", None)
     # Phase 50 α: this fresh VM's work dir is the launch archive (no evals/, no .git), the only
     # place main.py lets an eval-suite question run (scripts/lib/eval_paths.py).
     env["MA_EVAL_ISOLATED"] = "cloud-worker"
@@ -800,7 +807,7 @@ def _run_to_disk(td, label, code, question, flags, anthropic_key, openai_key, la
             ck(work)
     try:
         res = run_job_impl(label, code, question, flags, anthropic_key, openai_key, max_rounds, max_sessions,
-                           timeout_s=run_timeout_s, on_start=on_start)
+                           timeout_s=run_timeout_s, on_start=on_start, launch_id=launch_id)
     finally:
         health.append(stop_checkpointer(ck))
     phase("storing")

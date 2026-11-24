@@ -151,7 +151,7 @@ local SKILL.md), allowed via `_MCP_SKILLS`.
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
 | 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`, `amended_provisional`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff`, `paused:awaiting_budget`, `paused:awaiting_spec_amendment` (v2) |
-| 1    | `harness_tampered`, `artifact_tampered`, errors |
+| 1    | `harness_tampered`, `artifact_tampered`, `crashed` (v2: an exception, recorded in `crash`), errors |
 | 130  | `interrupted` |
 
 `awaiting_signoff` and `awaiting_scope_signoff` (unprefixed) are statuses of
@@ -165,7 +165,8 @@ agents/stage_machine.py sign <run_dir> --by owner`) or at OWNER_DECISION
 <run_dir> --by owner`), or before a paid task whose
 allowance is below the floor (`paused:awaiting_budget`: resume with a higher `--max-budget-usd`), or at SPEC when
 a rethink would change a signed spec (`paused:awaiting_spec_amendment`: read `spec_rethink_request.json`, amend the
-spec and relaunch with reuse), and exits 2;
+spec and relaunch with reuse), and exits 2; `metadata.json` records the pause as its `status`, with `paused_state`
+and `paused_why`;
 `main.py --resume <run_dir>` continues from `run_state.json`.
 Under `--signoff lead` only, a rethink of a signed spec whose fix plan wrote a valid `patch` does not pause: the
 machine runs `toolkit/spec/amend.py --from-request`, the lead signs the child run's spec provisionally, the parent

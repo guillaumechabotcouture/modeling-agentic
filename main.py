@@ -30,7 +30,7 @@ from agents.run_budget import (  # noqa: E402,F401  re-exported: the self-test's
     write_budget_ledger,
     remaining_budget,
 )
-from agents.run_finish import exit_code_for, store_run_results  # noqa: E402
+from agents.run_finish import exit_code_for, plain_tag, store_run_results  # noqa: E402
 
 REPO_ROOT = enforcement.REPO_ROOT
 PREFLIGHT_RETIRED = ("--preflight-only ran the v1 lead session's live preflight, retired with pipeline v1 "
@@ -59,7 +59,10 @@ def create_run_dir(question: str) -> str:
     # FileExistsError rather than silent overwrite.
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     slug = slugify(question)
-    base_name = f"{timestamp}_{slug}"
+    # baseline hb3 §5.1: replicates on separate VMs started in the same second and took one name (the check below is
+    # local to each VM). A cloud replicate's name carries its label; its launch id goes into metadata.json.
+    label, launch = plain_tag(os.environ.get("MA_RUN_LABEL")), plain_tag(os.environ.get("MA_LAUNCH_ID"))
+    base_name = f"{timestamp}_{slug}" + (f"_{label}" if label else "")
     run_name = base_name
     suffix = 2
     while os.path.exists(os.path.join(runs_root, run_name)):
@@ -76,6 +79,8 @@ def create_run_dir(question: str) -> str:
         # Phase 42 ε: trace times are naive local times; this is their zone.
         "utc_offset_s": int(datetime.now().astimezone().utcoffset().total_seconds()),
         "run_dir": run_name,
+        **({"run_label": label} if label else {}),
+        **({"launch_id": launch} if launch else {}),
     }
     with open(os.path.join(run_path, "metadata.json"), "x") as f:
         json.dump(metadata, f, indent=2)
@@ -84,6 +89,111 @@ def create_run_dir(question: str) -> str:
         f.write(f"# Progress\n\n## Question: {question}\n\n## Completed Stages:\n\n## Notes:\n")
 
     return run_name
+
+
+def _self_test_replicates(ok, outcome, rs, crash, raise_) -> None:
+    """SN1-SN3, RD1, SC1-SC3 (baseline hb3: dengue R1 and R2 started in the same second, got one run dir name and one
+    stored blob, and R2's upload overwrote R1's; flu R1 crashed or paused with no status in metadata.json)."""
+    import shutil
+    import tempfile
+
+    class _Exists(Exception):
+        pass
+    _Exists.__name__ = "ResourceExistsError"      # what Azure's upload_blob(overwrite=False) raises
+
+    class _XS:       # a store that, like Azure, overwrites a blob only when told to
+        def __init__(self):
+            self.st = {}
+
+        def get_blob_client(self, c, n):
+            st = self.st
+
+            class _B:
+                def upload_blob(self, data, overwrite=False, **kw):
+                    if not overwrite and (c, n) in st:
+                        raise _Exists(n)
+                    st[(c, n)] = data.read() if hasattr(data, "read") else bytes(data)
+
+                def download_blob(self, **kw):
+                    v = st[(c, n)]
+                    return type("D", (), {"readall": lambda _s: v})()
+            return _B()
+    keys = ("MA_RUN_LABEL", "MA_LAUNCH_ID", "MA_STORAGE_PREFIX")
+    env0 = {k: os.environ.get(k) for k in keys}
+    root, xs, made = tempfile.mkdtemp(), _XS(), []
+
+    def mk(where, name="2026-11-23_233523_q"):
+        p = os.path.join(root, where, name)
+        os.makedirs(p)
+        open(os.path.join(p, "report.md"), "w").write(where)
+        json.dump({}, open(os.path.join(p, "metadata.json"), "w"))
+        return p
+    try:
+        os.environ.update(MA_STORAGE_PREFIX="t", MA_LAUNCH_ID="L1")
+        got = {}
+        for lb in ("R1", "R2"):
+            os.environ["MA_RUN_LABEL"] = lb
+            got[lb] = store_run_results(mk(lb), service=xs)
+        ok(got == {lb: f"outputs/t/launch_L1/run_{lb}_2026-11-23_233523_q.tar.gz" for lb in ("R1", "R2")}
+           and len(xs.st) == 2, f"SN1 two replicates whose run dirs share a name are stored under their launch and "
+                                f"label, one blob each ({got})")
+        for k in ("MA_RUN_LABEL", "MA_LAUNCH_ID"):
+            os.environ.pop(k)
+        a, b = mk("A"), mk("B")
+        ba = store_run_results(a, service=xs)
+        first = xs.st.get(("outputs", "t/2026-11-23_233523_q.tar.gz"))
+        bb = store_run_results(b, service=xs)
+        mb = json.load(open(os.path.join(b, "metadata.json")))
+        ok(ba == "outputs/t/2026-11-23_233523_q.tar.gz" and first and bb and bb != ba
+           and xs.st[("outputs", ba[len("outputs/"):])] == first and mb.get("stored") == bb
+           and mb.get("store_collision") == ba,
+           f"SN2 a name another run's blob holds is refused, never overwritten; the run is stored under a fresh "
+           f"name, and the collision recorded ({ba}, {bb}, {mb.get('store_collision')})")
+        open(os.path.join(a, "report.md"), "w").write("A, resumed")
+        ok(store_run_results(a, service=xs) == ba and xs.st[("outputs", ba[len("outputs/"):])] != first,
+           "SN3 the same run stored again (a resume) replaces its own blob")
+        n0 = len(xs.st)
+        open(os.path.join(b, "report.md"), "w").write("B, resumed")
+        ok(store_run_results(b, service=xs) == bb and len(xs.st) == n0,
+           "SN4 (Codex r1) a run stored under a fresh name after a collision keeps that name on a resume")
+        m_ = json.load(open(os.path.join(a, "metadata.json")))
+        json.dump(dict(m_, stored_account="another"), open(os.path.join(a, "metadata.json"), "w"))
+        keep = xs.st[("outputs", ba[len("outputs/"):])]
+        open(os.path.join(a, "report.md"), "w").write("A, resumed again")
+        ok(store_run_results(a, service=xs) != ba and xs.st[("outputs", ba[len("outputs/"):])] == keep,
+           "SN5 (Codex r1) a receipt from another storage account never authorizes an overwrite")
+        os.environ.update(MA_RUN_LABEL="R1", MA_LAUNCH_ID="L9")
+        made.append(create_run_dir("rd replicate question"))
+        os.environ["MA_RUN_LABEL"] = "R2"
+        made.append(create_run_dir("rd replicate question"))
+        m2 = json.load(open(os.path.join(REPO_ROOT, "runs", made[1], "metadata.json")))
+        ok(made[0] != made[1] and made[0].endswith("_R1") and made[1].endswith("_R2")
+           and m2.get("run_label") == "R2" and m2.get("launch_id") == "L9",
+           f"RD1 a replicate's run dir carries its label, and metadata.json its label and launch ({made})")
+    finally:
+        for k, v in env0.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        for n in made:
+            shutil.rmtree(os.path.join(REPO_ROOT, "runs", n), ignore_errors=True)
+    # SC1-SC3: a crash and an interrupt record their status; a status the machine wrote is never replaced
+    def finished_then_crash():          # the machine wrote a terminal status in this invocation, then something raised
+        json.dump({"status": "amended_provisional"}, open(os.path.join(d, "metadata.json"), "w"))
+        crash()
+    for before, fn, want in (({"status": "paused:awaiting_signoff"}, crash, "crashed"),
+                             ({}, raise_(KeyboardInterrupt()), "interrupted"),
+                             ({}, finished_then_crash, "amended_provisional"),
+                             ({"status": "crashed"}, raise_(KeyboardInterrupt()), "interrupted")):
+        d = tempfile.mkdtemp(dir=root)
+        json.dump(before, open(os.path.join(d, "metadata.json"), "w"))
+        outcome(lambda: rs(fn, d, store=lambda rp: None))
+        m = json.load(open(os.path.join(d, "metadata.json")))
+        ok(m.get("status") == want and m.get("crash"),
+           f"SC {before or 'no status'}: a run ended by an exception records status {want} and the exception "
+           f"({m.get('status')}, {m.get('crash')})")
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def _self_test_pipeline(ok, _outcome) -> None:
@@ -1044,6 +1154,10 @@ def _run_self_test() -> int:
        f"ST6 store_run_results with a non-object metadata.json neither raises nor keeps the bad value ({_got})")
     shutil.rmtree(_sr6, ignore_errors=True)
     shutil.rmtree(_cr, ignore_errors=True)
+    try:
+        _self_test_replicates(ok, _outcome, _rs, _crash, _raise)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"SN/RD/SC: {type(e).__name__}: {e}")
     # ST7 (Codex r3 on #342, P1-7): resuming a lead run whose amendment lock another process holds writes nothing:
     # no identity stamp, no crash record, no upload of the active run
     import argparse as _ap7
@@ -1212,6 +1326,7 @@ def run_v2_and_store(run, run_path: str, store=None):
     code survive (ST3-ST5)."""
     store = store or store_run_results
     locked = None
+    status0 = _metadata_dict(os.path.join(run_path, "metadata.json")).get("status")   # an earlier invocation's
     try:
         return run()
     except BaseException as e:
@@ -1222,9 +1337,23 @@ def run_v2_and_store(run, run_path: str, store=None):
             locked = os.path.realpath(getattr(e, "run_dir", None) or run_path)
             raise
         try:
-            mp = os.path.join(run_path, "metadata.json")
+            where, s0 = run_path, status0
+            try:        # Codex r1 on #374: a run that handed over to its child crashed in the child, the chain's last
+                from agents import stage_machine as _sm
+                chain = _sm.handoff_chain(run_path)
+                where, s0 = (chain[-1], None) if chain else (run_path, status0)
+            except Exception:  # noqa: BLE001 -- no chain read: the run itself
+                pass
+            mp = os.path.join(where, "metadata.json")
             meta = _metadata_dict(mp)
             meta["crash"] = f"{type(e).__name__}: {e}"[:500]
+            # every exit records its status (baseline hb3 §4.2): a terminal status this invocation's machine wrote
+            # stands; none, a pause, or an earlier invocation's status (a resume) is replaced
+            cur = meta.get("status")
+            if not cur or cur == s0 or str(cur).startswith("paused:"):
+                meta["status"] = "interrupted" if isinstance(e, KeyboardInterrupt) else "crashed"
+                meta["crashed_at"] = datetime.now().isoformat(timespec="seconds")
+                meta.pop("finished", None)
             os.makedirs(run_path, exist_ok=True)
             json.dump(meta, open(mp, "w"), indent=2)
         except Exception as fe:  # noqa: BLE001 -- never replace the run's exception

@@ -1607,10 +1607,51 @@ def _identity_note(label, assigned: dict | None, run_ident: dict) -> None:
         print(f"WARNING {label}: launched at {a['commit']}, the run records commit {run_ident['commit']}")
 
 
-def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = None):
+class StoredRunRefused(RuntimeError):
+    """A stored run that is not provably this label's: never collected for it (baseline hb3 §5.1)."""
+
+
+def _tar_identity(t) -> tuple:
+    """(run_label, launch_id) the stored run's own metadata.json records (<run>/metadata.json); None for each absent."""
+    for m in t.getmembers():
+        if m.isfile() and m.name.count("/") == 1 and m.name.endswith("/metadata.json"):
+            try:
+                meta = json.load(t.extractfile(m))
+            except (ValueError, OSError, tarfile.TarError):
+                return None, None
+            meta = meta if isinstance(meta, dict) else {}
+            return meta.get("run_label"), meta.get("launch_id")
+    return None, None
+
+
+def _sharers(cfg, store, label, blob, siblings: dict | None) -> list:
+    """The launch's other labels whose result records name the same stored run (`siblings`: label -> launch id). A
+    record not stored yet names nothing; one that cannot be read raises (Codex r1 on #374: never collected on a doubt)."""
+    import tempfile
+    out = []
+    for other, lid in sorted((siblings or {}).items()):
+        if other == label or not lid:
+            continue
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                store.download(ws.record_blob(cfg.storage_prefix, lid, other), os.path.join(td, "r.json"),
+                               cfg.storage_account)
+            except Exception as e:  # noqa: BLE001 -- absent: that label has stored nothing yet
+                if isinstance(e, (FileNotFoundError, KeyError)) or type(e).__name__ == "ResourceNotFoundError":
+                    continue
+                raise
+            rec = json.load(open(os.path.join(td, "r.json")))
+        if isinstance(rec, dict) and rec.get("run_stored") == blob:
+            out.append(other)
+    return out
+
+
+def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = None, siblings: dict | None = None):
     """One label from storage: this launch's result record, then the run directory it names.
     result.json records the launch's pipeline and commit (`assigned`, from assignments.json)
-    and the run's own (`run_identity`, from its metadata.json)."""
+    and the run's own (`run_identity`, from its metadata.json). The stored run must be this label's: one whose
+    metadata.json records another label, or (recording none, as runs stored before baseline hb3 do) whose blob another
+    label's record of the launch (`siblings`: label -> launch id) also names, is refused, and nothing is extracted."""
     dest = os.path.join(cfg.out_dir, label)
     rj = os.path.join(cfg.out_dir, f"{label}.result.json")
     store.download(ws.record_blob(cfg.storage_prefix, launch_id, label), rj, cfg.storage_account)
@@ -1619,6 +1660,17 @@ def collect_from_storage(cfg, store, label, launch_id, assigned: dict | None = N
         raise SystemExit(f"{label}: the result record names no stored run")
     tgz = os.path.join(cfg.out_dir, f"{label}.run.tar.gz")
     store.download(meta["run_stored"], tgz, cfg.storage_account)
+    with tarfile.open(tgz, mode="r:gz") as t:
+        own, own_launch = _tar_identity(t)
+    # a run that records this label is this label's (a record of another label naming it is that record's error)
+    shared = [] if own == label else _sharers(cfg, store, label, meta["run_stored"], siblings)
+    why = (f"records label {own}" if own and own != label else
+           f"records launch {own_launch}, not {launch_id}" if own_launch and own_launch != launch_id else
+           f"is named by the records of {', '.join([label, *shared])} alike: whose run it holds is unknown"
+           if shared else None)
+    if why:
+        os.remove(tgz)
+        raise StoredRunRefused(f"{label}: the stored run {meta['run_stored']} {why}; not collected")
     os.makedirs(os.path.join(dest, "runs"), exist_ok=True)
     with tarfile.open(tgz, mode="r:gz") as t:
         t.extractall(os.path.join(dest, "runs"), filter="data")
@@ -1875,7 +1927,7 @@ def collect(cfg, shutdown_after: bool = True, accept_partial: bool = False):
     running = is_running(cfg.name)
     if not os.path.exists(cfg.state_file):
         raise SystemExit(f"no {cfg.state_file}: this machine did not launch {cfg.name}")
-    assign, client, pending = json.load(open(cfg.state_file)), None, []
+    assign, client, pending, refused = json.load(open(cfg.state_file)), None, [], set()
     for label in recorded_labels(cfg, assign):
         dest = os.path.join(cfg.out_dir, label)
         cur = local_is_current(dest, assign[label]["launch_id"])
@@ -1885,10 +1937,15 @@ def collect(cfg, shutdown_after: bool = True, accept_partial: bool = False):
         if cur is False:   # an earlier launch's copy: keep it, out of the way
             os.rename(dest, f"{dest}.before_{assign[label]['launch_id']}_{int(time.time())}")
         try:
-            meta = collect_from_storage(cfg, results_store, label, assign[label]["launch_id"], assign[label])
+            meta = collect_from_storage(cfg, results_store, label, assign[label]["launch_id"], assign[label],
+                                        siblings={lb: (assign.get(lb) or {}).get("launch_id")
+                                                  for lb in recorded_labels(cfg, assign)})
             print(f"{label}: exit={meta['exit_code']} {meta['duration_s']}s -> {cfg.out_dir}/{label} (from storage)")
             continue
         except Exception as e:  # noqa: BLE001 — not (yet) in storage
+            if isinstance(e, StoredRunRefused):
+                print(f"{label}: REFUSED {e}")
+                refused.add(label)
             ck = checkpoint_record(cfg, results_store, label, assign[label]["launch_id"])
             ck_note = (f"; only a checkpoint exists, of {ck.get('time_utc')} (state {ck.get('run_state')}, "
                        f"{ck.get('cached_batches')} cached batches): fetch it with `checkpoint --label {label}`"
@@ -1922,8 +1979,11 @@ def collect(cfg, shutdown_after: bool = True, accept_partial: bool = False):
         ident = _run_identity_on_disk(dest)
         _identity_note(label, assign[label], ident)
         # a record from a worker before 1E-ii has no unstored_large_files: every large file it left out counts
-        lost = None if meta.get("run_stored") or accept_partial else \
-            meta.get("unstored_large_files", meta.get("skipped_large_files"))
+        # Codex r1 on #374: after a refused stored run, the VM left out large files on a receipt that is not this
+        # label's: every file it left out counts as in no store
+        lost = None if (meta.get("run_stored") and label not in refused) or accept_partial else \
+            (meta.get("skipped_large_files") if label in refused else
+             meta.get("unstored_large_files", meta.get("skipped_large_files")))
         if lost:
             # 1E-ii: the VM's tarball lacks large files that are in no store. The label stays pending: no result.json
             # (so a later `collect` fetches it again), not marked collected (the VM keeps holding), no shutdown.
@@ -5689,6 +5749,103 @@ def _self_test_sheet(ok) -> None:
        f"RC80e signoff none is not checked; --res is read; only the last --resume counts: {none_mode} {abbrev} {last}")
 
 
+def _self_test_replicate_names(ok, tb) -> None:
+    """UN1-UN5 (baseline hb3 §5.1: dengue R1 and R2 started in the same second, got one run dir name and one stored
+    blob, and R2's upload overwrote R1's). main.py is told each run's label and launch; collection maps a label to its
+    own stored run and refuses a stored run that two labels' records both name, or that names another label."""
+    import inspect
+    import shutil
+    import tempfile
+    import types
+    from unittest import mock
+
+    class Store:
+        def __init__(self, files):
+            self.files = files
+
+        def download(self, blob, path, account):
+            if blob not in self.files:
+                raise FileNotFoundError(blob)
+            open(path, "wb").write(self.files[blob])
+
+    def rec(blob):
+        return json.dumps({"exit_code": 0, "duration_s": 5, "run_stored": blob}).encode()
+
+    def run(label=None):
+        meta = {"run_dir": "r", **({"run_label": label} if label else {})}
+        return tb({"r/metadata.json": json.dumps(meta).encode(), "r/report.md": (label or "old").encode()})
+    p, lid, sib = "runs/t", "L1", {"R1": "L1", "R2": "L1"}
+    old = "outputs/runs/t/r.tar.gz"
+    b1, b2 = (f"outputs/runs/t/launch_L1/run_{x}_r.tar.gz" for x in ("R1", "R2"))
+    with tempfile.TemporaryDirectory() as d:
+        cfg = types.SimpleNamespace(out_dir=d, storage_prefix=p, storage_account=None)
+        st = Store({ws.record_blob(p, lid, "R1"): rec(old), ws.record_blob(p, lid, "R2"): rec(old), old: run()})
+        for lb in ("R1", "R2"):
+            try:
+                collect_from_storage(cfg, st, lb, lid, None, siblings=sib)
+                got = "collected"
+            except StoredRunRefused as e:
+                got = str(e)
+            ok("R1" in got and "R2" in got and not os.path.exists(os.path.join(d, lb, "runs")),
+               f"UN1 {lb}: a stored run that two labels' records both name is refused, nothing extracted ({got[:140]})")
+        st = Store({ws.record_blob(p, lid, "R1"): rec(b1), ws.record_blob(p, lid, "R2"): rec(b2),
+                    b1: run("R1"), b2: run("R2")})
+        for lb in ("R1", "R2"):
+            collect_from_storage(cfg, st, lb, lid, None, siblings=sib)
+        ok(all(open(os.path.join(d, lb, "runs", "r", "report.md")).read() == lb for lb in ("R1", "R2")),
+           "UN2 each label is collected from its own stored run")
+    with tempfile.TemporaryDirectory() as d:
+        cfg = types.SimpleNamespace(out_dir=d, storage_prefix=p, storage_account=None)
+        try:
+            collect_from_storage(cfg, Store({ws.record_blob(p, lid, "R2"): rec(b1), b1: run("R1")}), "R2", lid, None)
+            got = "collected"
+        except StoredRunRefused as e:
+            got = str(e)
+        ok("R1" in got and not os.path.exists(os.path.join(d, "R2", "runs")),
+           f"UN3 a stored run that records another label is refused for this one ({got[:140]})")
+        m = collect_from_storage(cfg, Store({ws.record_blob(p, lid, "R1"): rec(old), old: run()}), "R1", lid, None,
+                                 siblings={"R1": lid})
+        ok(m["exit_code"] == 0 and open(os.path.join(d, "R1", "runs", "r", "report.md")).read() == "old",
+           "UN4 a run stored under the old name, which no other label's record names, is still collected")
+        l1 = tb({"r/metadata.json": json.dumps({"run_label": "R3", "launch_id": "L0"}).encode()})
+        try:
+            collect_from_storage(cfg, Store({ws.record_blob(p, lid, "R3"): rec(b1), b1: l1}), "R3", lid, None)
+            got = "collected"
+        except StoredRunRefused as e:
+            got = str(e)
+        ok("L0" in got and not os.path.exists(os.path.join(d, "R3", "runs")),
+           f"UN6 (Codex r1) a stored run that records another launch is refused for this one ({got[:140]})")
+
+        class Flaky(Store):
+            def download(self, blob, path, account):
+                if blob == ws.record_blob(p, lid, "R2"):
+                    raise OSError("timed out")
+                return super().download(blob, path, account)
+        try:
+            collect_from_storage(cfg, Flaky({ws.record_blob(p, lid, "R4"): rec(old), old: run()}), "R4", lid, None,
+                                 siblings={"R4": lid, "R2": lid})
+            got = "collected"
+        except OSError as e:
+            got = str(e)
+        ok(got == "timed out" and not os.path.exists(os.path.join(d, "R4", "runs")),
+           f"UN7 (Codex r1) a sibling record that cannot be read stops an unlabelled run's collection ({got})")
+    ok("siblings=" in inspect.getsource(collect), "UN4b collect names the launch's other labels to each fetch")
+    main_py = ("import json, os\nos.makedirs('runs/R_x')\njson.dump({k: os.environ.get(k) for k in "
+               "('MA_RUN_LABEL', 'MA_LAUNCH_ID')}, open('runs/R_x/env.json', 'w'))\n").encode()
+    b = io.BytesIO()
+    with tarfile.open(fileobj=b, mode="w:gz") as t:
+        ti = tarfile.TarInfo("main.py")
+        ti.size = len(main_py)
+        t.addfile(ti, io.BytesIO(main_py))
+    root = tempfile.mkdtemp()
+    with mock.patch.object(ws, "WORK", root), mock.patch.object(ws, "ensure_bwrap", lambda: "bwrap: test"):
+        ws.run_job_impl("R2", b.getvalue(), "q", [], "k", None, launch_id="L7")
+    env = json.load(open(os.path.join(root, "R2", "runs", "R_x", "env.json")))
+    ok(env == {"MA_RUN_LABEL": "R2", "MA_LAUNCH_ID": "L7"} and "launch_id=launch_id" in inspect.getsource(ws._run_to_disk),
+       f"UN5 the agent VM tells main.py its label and launch, so the run dir and the stored blob are its own ({env})")
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def _self_test() -> int:
     import datetime as dt
     import io
@@ -5946,6 +6103,10 @@ def _self_test() -> int:
         _self_test_liveness(ok)
     except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
         ok(False, f"LV: {type(e).__name__}: {e}")
+    try:
+        _self_test_replicate_names(ok, tb)
+    except Exception as e:  # noqa: BLE001 -- before the change these cases fail here
+        ok(False, f"UN: {type(e).__name__}: {e}")
     for f in sorted(os.listdir(os.path.join(HERE, "configs"))):
         if f.endswith(".py") and not f.startswith("_"):   # _*.py: shared helpers (configs/_eval.py)
             try:
