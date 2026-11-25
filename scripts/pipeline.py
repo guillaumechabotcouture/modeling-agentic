@@ -1804,7 +1804,7 @@ def _child(argv: list) -> int:
 
 def _env(work: str) -> dict:
     """A minimal environment: no credentials and nothing the run's machine set (determinism)."""
-    keep = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TZ") if k in os.environ}
+    keep = {k: os.environ[k] for k in ("PATH", "LD_LIBRARY_PATH", "LANG", "LC_ALL", "TZ") if k in os.environ}
     return dict(keep, HOME=work, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE="1",
                 OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
 

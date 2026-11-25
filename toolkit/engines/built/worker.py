@@ -51,6 +51,7 @@ AGE_POP_ATTR_PRIORITY = (
 _AGE_POP_INCLUDE = ("pop", "share", "weight", "dist")
 _AGE_POP_EXCLUDE = ("contact", "rate", "mort", "hazard", "eff")
 _SANDBOX_CACHE: list[str | None] = []
+_SANDBOX_DIAG: list[str] = []
 
 
 class EngineUnsandboxed(RuntimeError):
@@ -133,55 +134,73 @@ def unsandboxed_findings(run_dir: str) -> list[dict]:
 def _ro_mount_prefixes() -> list[str]:
     """Minimal read-only runtime paths needed for Python + numpy/scipy/starsim without mounting `/`,
     the repository, any run directory, home/temp directories, or arbitrary `sys.path` entries."""
-    mounts: list[str] = []
-    seen: set[str] = set()
+    candidates: list[str] = []
     repo_real = os.path.realpath(ROOT)
+    forbidden = {"/", "/tmp", "/var", "/home", "/root", repo_real}
 
-    def add_ro(path: str) -> None:
+    def collect(path: str) -> None:
         if not path or not os.path.exists(path):
             return
         real = os.path.realpath(path)
-        for target in dict.fromkeys((path, real)):
-            if target in seen or target == "/":
-                continue
-            if target in ("/tmp", "/var", "/home", "/root", repo_real):
+        for target in dict.fromkeys((os.path.normpath(path), os.path.normpath(real))):
+            if target in forbidden:
                 continue
             if target.startswith(repo_real + os.sep):
                 rel = os.path.relpath(target, repo_real).replace(os.sep, "/")
-                if not rel.startswith((".venv/", "venv/", ".venv", "venv")) or rel in (".venv", "venv"):
-                    if rel not in (".venv", "venv"):
-                        continue
-            if any(target.startswith(m.rstrip("/") + "/") for m in seen if os.path.isdir(m)):
-                continue
-            seen.add(target)
-            mounts.append(target)
+                if not (rel in (".venv", "venv") or rel.startswith((".venv/", "venv/"))):
+                    continue
+            candidates.append(target)
 
-    # Standard OS runtime libs
-    for base in ("/usr", "/etc/ld.so.cache", "/etc/alternatives"):
+    # Standard OS runtime libs and dynamic-linker config (no secrets)
+    for base in ("/usr", "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d",
+                 "/etc/alternatives", "/etc/ssl/certs"):
         if os.path.exists(base):
-            add_ro(base)
+            collect(base)
     # Python interpreter prefixes & executable directory (never arbitrary sys.path entries)
+    exe_real = os.path.realpath(sys.executable)
+    exe_gp = os.path.dirname(os.path.dirname(exe_real))
     for cand in (
         sys.prefix,
         sys.base_prefix,
         sys.exec_prefix,
         sys.base_exec_prefix,
         os.path.dirname(os.path.abspath(sys.executable)),
-        os.path.dirname(os.path.realpath(sys.executable)),
+        os.path.dirname(exe_real),
+        exe_gp if exe_gp not in (*forbidden, "/opt", "/usr") and not exe_gp.startswith(repo_real + os.sep) else "",
     ):
         if cand:
-            add_ro(cand)
+            collect(cand)
     # Official site-packages directories only (never user-site or arbitrary sys.path entries)
     try:
         for sp in site.getsitepackages():
             if sp and os.path.isdir(sp):
-                add_ro(sp)
+                collect(sp)
     except AttributeError:
         pass
+    # Shared-library dirs needed by dynamic libpython / conda / setup-python (never repo/home/tmp)
+    for lp in (os.environ.get("LD_LIBRARY_PATH") or "").split(os.pathsep):
+        lp = lp.strip()
+        if lp and os.path.isdir(lp):
+            collect(lp)
+
+    # Mount shallowest paths first so parents precede children; drop children covered by a mounted dir
+    mounts: list[str] = []
+    seen_dirs: list[str] = []
+    seen: set[str] = set()
+    for target in sorted(dict.fromkeys(candidates), key=lambda p: (p.count("/"), p)):
+        if target in seen:
+            continue
+        if any(target.startswith(d.rstrip("/") + "/") for d in seen_dirs):
+            continue
+        seen.add(target)
+        mounts.append(target)
+        if os.path.isdir(target) and not os.path.islink(target):
+            seen_dirs.append(target)
     return mounts
 
 
-def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str]) -> list[str]:
+def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str],
+                      *, ro_prefixes: list[str] | None = None) -> list[str]:
     """Build the minimal-mount bubblewrap command (§5.1): NO `--ro-bind / /`.
     Mounts ONLY the interpreter/site-packages prefixes, `contract.py`, `hooks.py`, `worker.py`,
     `/proc`, `/dev`, and a private `--tmpfs /tmp`."""
@@ -195,16 +214,17 @@ def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str]) -> list[s
                 "--inh-caps=-all", "--bounding-set=-all", "--"]
 
     binds: list[str] = []
-    for top in ("/bin", "/lib", "/lib64"):
+    for top in ("/bin", "/sbin", "/lib", "/lib64", "/lib32"):
         if os.path.islink(top):
             binds += ["--symlink", os.readlink(top), top]
         elif os.path.isdir(top):
             binds += ["--ro-bind", top, top]
 
-    for p in _ro_mount_prefixes():
+    for p in (_ro_mount_prefixes() if ro_prefixes is None else ro_prefixes):
         binds += ["--ro-bind", p, p]
 
-    # Harness files ONLY, mounted under /harness (never mounting the repo directory)
+    # Harness files ONLY, mounted read-only under /harness using PEP 420 namespace packages
+    # (never mounting the repo directory and never binding /dev/null onto regular files).
     contract_py = os.path.join(ROOT, "toolkit", "engines", "contract.py")
     hooks_py = os.path.join(ROOT, "toolkit", "engines", "hooks.py")
     worker_py = os.path.abspath(__file__)
@@ -212,11 +232,10 @@ def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str]) -> list[s
         "--tmpfs", "/harness",
         "--dir", "/harness/toolkit",
         "--dir", "/harness/toolkit/engines",
-        "--ro-bind", "/dev/null", "/harness/toolkit/__init__.py",
-        "--ro-bind", "/dev/null", "/harness/toolkit/engines/__init__.py",
         "--ro-bind", contract_py, "/harness/toolkit/engines/contract.py",
         "--ro-bind", hooks_py, "/harness/toolkit/engines/hooks.py",
         "--ro-bind", worker_py, "/harness/worker.py",
+        "--remount-ro", "/harness",
     ]
     return (["sudo", "-n"] if kind == "bwrap-sudo" else []) + [
         "bwrap",
@@ -235,8 +254,25 @@ def _bwrap_engine_cmd(kind: str, envargs: list[str], child: list[str]) -> list[s
     ]
 
 
-def _minimal_env(hash_seed: str = "0") -> dict[str, str]:
-    keep = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TZ") if k in os.environ}
+def _minimal_env(hash_seed: str = "0", mounted_prefixes: list[str] | None = None) -> dict[str, str]:
+    keep = {k: os.environ[k] for k in ("LANG", "LC_ALL", "TZ") if k in os.environ}
+    raw_path = os.environ.get("PATH") or "/usr/bin:/bin"
+    path_parts = [p for p in raw_path.split(os.pathsep) if p]
+    for req_p in ("/usr/bin", "/bin"):
+        if req_p not in path_parts:
+            path_parts.append(req_p)
+    keep["PATH"] = os.pathsep.join(path_parts)
+    if os.environ.get("LD_LIBRARY_PATH"):
+        if mounted_prefixes is None:
+            keep["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+        else:
+            ok_ld = []
+            for lp in os.environ["LD_LIBRARY_PATH"].split(os.pathsep):
+                lp_n = os.path.normpath(lp.strip()) if lp.strip() else ""
+                if lp_n and any(lp_n == m or lp_n.startswith(m.rstrip("/") + "/") for m in mounted_prefixes):
+                    ok_ld.append(lp_n)
+            if ok_ld:
+                keep["LD_LIBRARY_PATH"] = os.pathsep.join(ok_ld)
     return dict(
         keep,
         HOME="/tmp",
@@ -253,15 +289,19 @@ def _minimal_env(hash_seed: str = "0") -> dict[str, str]:
     )
 
 
-def _probe_engine_bwrap(kind: str) -> bool:
-    env = _minimal_env("0")
+def _probe_engine_bwrap(kind: str) -> tuple[bool, str]:
+    prefixes = _ro_mount_prefixes()
+    env = _minimal_env("0", mounted_prefixes=prefixes)
     envargs = [a for k, v in env.items() for a in ("--setenv", k, v)]
-    cmd = _bwrap_engine_cmd(kind, envargs, [sys.executable, "-s", "-B", "/harness/worker.py", "_probe"])
+    cmd = _bwrap_engine_cmd(kind, envargs, [sys.executable, "-s", "-B", "/harness/worker.py", "_probe"],
+                            ro_prefixes=prefixes)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
-        return r.returncode == 0 and r.stdout.strip() == "OK"
-    except (OSError, subprocess.SubprocessError):
-        return False
+        if r.returncode == 0 and r.stdout.strip() == "OK":
+            return True, ""
+        return False, f"{kind}: rc={r.returncode} err={r.stderr.strip()[-200:]!r} out={r.stdout.strip()[-80:]!r}"
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"{kind}: {type(e).__name__}: {e}"
 
 
 def engine_sandbox_kind() -> str | None:
@@ -269,12 +309,25 @@ def engine_sandbox_kind() -> str | None:
     if _SANDBOX_CACHE:
         return _SANDBOX_CACHE[0]
     kind: str | None = None
+    diags: list[str] = []
     if sys.platform.startswith("linux") and shutil.which("bwrap"):
-        if _probe_engine_bwrap("bwrap"):
+        ok_b, d_b = _probe_engine_bwrap("bwrap")
+        if ok_b:
             kind = "bwrap"
-        elif shutil.which("sudo") and shutil.which("setpriv") and _probe_engine_bwrap("bwrap-sudo"):
-            kind = "bwrap-sudo"
+        else:
+            diags.append(d_b)
+            if shutil.which("sudo") and shutil.which("setpriv"):
+                ok_s, d_s = _probe_engine_bwrap("bwrap-sudo")
+                if ok_s:
+                    kind = "bwrap-sudo"
+                else:
+                    diags.append(d_s)
+    elif sys.platform.startswith("linux"):
+        diags.append("bwrap binary not on PATH")
+    else:
+        diags.append(f"platform={sys.platform}")
     _SANDBOX_CACHE.append(kind)
+    _SANDBOX_DIAG[:] = diags
     return kind
 
 
@@ -834,8 +887,9 @@ def run_in_worker(
     Raises `EngineUnsandboxed` when no sandbox is available unless `unsandboxed_ok=True`."""
     sb = engine_sandbox_kind() if _force_sandbox == "auto" else _force_sandbox
     if sb is None and not unsandboxed_ok:
+        diag = f" [probe: {'; '.join(_SANDBOX_DIAG)}]" if _force_sandbox == "auto" and _SANDBOX_DIAG else ""
         raise EngineUnsandboxed("engine_unsandboxed: no bubblewrap sandbox available (pass unsandboxed_ok=True "
-                                "for local development only; unsandboxed runs cannot reach ACCEPT)")
+                                f"for local development only; unsandboxed runs cannot reach ACCEPT){diag}")
     lim = dict(DEFAULT_LIMITS, **(limits or {}))
     file_cap = int(lim.get("file_bytes", DEFAULT_LIMITS["file_bytes"]))
     max_stdout = min(MAX_STDOUT_BYTES, int(lim.get("max_stdout_bytes", file_cap)))
@@ -850,14 +904,17 @@ def run_in_worker(
         "strict_limits": sb is not None,
         "id_salt": str(id_salt),
     }
-    env = _minimal_env(hash_seed=hash_seed)
     wall_s = float(lim.get("wall_s", 120))
     if sb is not None:
+        prefixes = _ro_mount_prefixes()
+        env = _minimal_env(hash_seed=hash_seed, mounted_prefixes=prefixes)
         envargs = [a for k, v in env.items() for a in ("--setenv", k, v)]
-        cmd = _bwrap_engine_cmd(sb, envargs, [sys.executable, "-s", "-B", "/harness/worker.py", "_worker_child"])
+        cmd = _bwrap_engine_cmd(sb, envargs, [sys.executable, "-s", "-B", "/harness/worker.py", "_worker_child"],
+                                ro_prefixes=prefixes)
         run_cwd = None
         run_env = None
     else:
+        env = _minimal_env(hash_seed=hash_seed)
         cmd = [sys.executable, "-s", "-B", os.path.abspath(__file__), "_worker_child"]
         run_cwd = tempfile.gettempdir()
         run_env = env
@@ -1092,10 +1149,14 @@ def _self_test() -> int:
             ok(out_sb["unsandboxed"] is False and out_sb["result"]["meta"]["probe"] == "BLOCKED",
                f"BE18 minimal-mount {sb} sandbox blocks reading sentinel file outside mount set ({out_sb['result']['meta']})")
     else:
-        cmd = _bwrap_engine_cmd("bwrap", [], [sys.executable, "-s", "-B", "/harness/worker.py", "_probe"])
-        no_root_bind = not any(cmd[i:i + 3] == ["--ro-bind", "/", "/"] for i in range(len(cmd) - 2))
-        ok(no_root_bind and "--tmpfs" in cmd and "/harness/toolkit/engines/contract.py" in cmd,
-           "BE18 minimal-mount _bwrap_engine_cmd omits `--ro-bind / /` and mounts only runtime + contract/hooks/worker")
+        if os.environ.get("MA_REQUIRE_SANDBOX") == "1":
+            ok(False, f"BE18 MA_REQUIRE_SANDBOX=1 but engine_sandbox_kind() is None (diag={_SANDBOX_DIAG})")
+        else:
+            cmd = _bwrap_engine_cmd("bwrap", [], [sys.executable, "-s", "-B", "/harness/worker.py", "_probe"])
+            no_root_bind = not any(cmd[i:i + 3] == ["--ro-bind", "/", "/"] for i in range(len(cmd) - 2))
+            no_devnull = "/dev/null" not in cmd
+            ok(no_root_bind and no_devnull and "--tmpfs" in cmd and "/harness/toolkit/engines/contract.py" in cmd,
+               "BE18 minimal-mount _bwrap_engine_cmd omits `--ro-bind / /` and `/dev/null` bind and mounts only runtime + contract/hooks/worker")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
@@ -1107,6 +1168,10 @@ def _self_test() -> int:
 if __name__ == "__main__":
     if sys.argv[1:2] == ["_probe"]:
         _strip_cwd_from_sys_path()
+        here_dir = os.path.dirname(os.path.abspath(__file__))
+        if os.path.isfile(os.path.join(here_dir, "toolkit", "engines", "contract.py")):
+            sys.path.insert(0, here_dir)
+        from toolkit.engines.contract import EngineCard  # noqa: F401
         sys.stdout.write("OK\n")
         sys.exit(0)
     if sys.argv[1:2] == ["_worker_child"]:
