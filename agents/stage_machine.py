@@ -9771,6 +9771,7 @@ def _self_test_built_engine(ok, td: str) -> None:
     A8 spec-amendment routing, single post-analysis ENGINE repair edge, committed hidden-seed reuse
     + run-lock enforcement in owner mode, pre-dispatch compute reservation, build-cap pause/resume,
     lead provisional sign-off + first-paragraph report disclaimer, and snapshot tamper detection."""
+    import shutil
     import threading
     from agents import run_finish as RF
     from toolkit.engines.built import BUILT_ADAPTER_REF
