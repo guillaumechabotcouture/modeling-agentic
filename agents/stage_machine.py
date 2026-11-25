@@ -9976,19 +9976,16 @@ def _self_test_built_engine(ok, td: str) -> None:
         def pipeline_steps(self, spec_path, run_dir):
             import shlex
             code = (
-                "import json, os, yaml; "
-                "os.makedirs('analysis', exist_ok=True); os.makedirs('models', exist_ok=True); "
-                "json.dump({'headline': {'point': 10.0}}, open('analysis/analysis.json', 'w')); "
-                "yaml.safe_dump({'claims': [{'id': 'headline.point', 'claim_kind': 'scalar', 'units': 'cases', "
-                "'source_artifact': 'analysis/analysis.json', 'source_field': 'headline.point', "
-                "'produced_by': 'harness', 'value': 10.0}]}, open('models/claims_ledger.yaml', 'w')); "
-                "open('results.md', 'w').write('# Results\\n')"
+                "import json, os; "
+                "os.makedirs('analysis', exist_ok=True); "
+                "open('analysis/analysis.json', 'w').write(json.dumps({'headline': {'point': 10.0}})); "
+                "open('analysis/allocation_optimized.csv', 'w').write('unit,package,cases_averted\\n0,comp_a,10.0\\n')"
             )
             return [{
                 "id": "analyze",
                 "run": f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
                 "inputs": ["decision_spec.yaml", "engine_choice.json", "engine_build/admission.json"],
-                "outputs": ["analysis/analysis.json", "models/claims_ledger.yaml", "results.md"],
+                "outputs": ["analysis/analysis.json", "analysis/allocation_optimized.csv"],
             }]
 
         def gate_findings(self, rd):
@@ -10041,7 +10038,7 @@ def _self_test_built_engine(ok, td: str) -> None:
     fast_b.sign(d28, "owner", "approved spec")
     s_wait = Machine(d28, StubTasks(T28.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
     ch_wait = json.load(open(os.path.join(d28, AB.ENGINE_CHOICE)))
-    pending_ok = (s_wait == f"paused:{AWAITING_ENGINE_SIGNOFF}" and RF.exit_code_for(s_wait) == 2
+    pending_ok = (s_wait == f"paused:{AWAITING_ENGINE_SIGNOFF}" and RF.exit_code_for(AWAITING_ENGINE_SIGNOFF) == 2
                   and "engine" not in ch_wait and (ch_wait.get("build") or {}).get("status") == "admitted"
                   and BSIG.status(d28) == "awaiting")
     BSIG.sign(d28, "owner", note="approved engine")
