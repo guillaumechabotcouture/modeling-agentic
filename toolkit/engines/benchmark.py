@@ -330,12 +330,12 @@ def validate(pack: dict, engine, base: str | None = None) -> list[str]:
     return bad
 
 
-_PATH_PARTS = {"windows": 3, "per_capita": 3, "per_capita_all": 2, "cost": 2}
+_PATH_PARTS = {"windows": 3, "per_capita": 3, "per_capita_all": 2, "per_capita_vec": 2, "cost": 2}
 
 
 def value_path_ok(path) -> bool:
     """A value path `get` can read: windows.<w>.<metric>, per_capita.<outcome>.<age>,
-    per_capita_all.<outcome> or cost.<driver>, with no empty part."""
+    per_capita_all.<outcome>, per_capita_vec.<outcome>, or cost.<driver>, with no empty part."""
     if not isinstance(path, str):
         return False
     parts = path.split(".")
@@ -440,6 +440,18 @@ def _job_list(jobs):
     ref, config, _, unit, _, horizon, seed = jobs[0]
     outs = _engine_of(jobs[0]).run_batch([j[2] for j in jobs], UnitSpec("bench", unit), [Package("p", j[4]) for j in jobs],
                                          _h(horizon), seed)
+    return [_result(o) for o in outs]
+
+
+def _job_list_with_engine(jobs, eng):
+    """Execute one task list directly against an already-instantiated engine (e.g. an unadmitted
+    CandidateEngine during built-engine admission, which is not importable through the registry)."""
+    if len(jobs) == 1 and not shares_state(eng):
+        _, _, params, unit, package, horizon, seed = jobs[0]
+        return [_result(eng.run(params, UnitSpec("bench", unit), Package("p", package), _h(horizon), seed))]
+    _, _, _, unit, _, horizon, seed = jobs[0]
+    outs = eng.run_batch([j[2] for j in jobs], UnitSpec("bench", unit), [Package("p", j[4]) for j in jobs],
+                         _h(horizon), seed)
     return [_result(o) for o in outs]
 
 
@@ -572,6 +584,16 @@ class Runner:
         self.nsims = 0
         self._engines = {}
         self.exercised = set()           # configurations a benchmark ran (arms or probes)
+        self._default_cfg = engine.config() if callable(getattr(engine, "config", None)) else None
+        self._direct_engine = bool(getattr(engine, "_direct_runner", False))
+
+    def _resolve_engine(self, job):
+        ref, config = job[0], job[1]
+        if getattr(self, "_direct_engine", False) and ref == self.ref and (
+            config is None or config == getattr(self, "_default_cfg", None)
+        ):
+            return self.engine
+        return _engine_of(job)
 
     def _map(self, jobs, chunk: int = 300):
         """Run jobs; a fresh process pool per chunk (one long-lived pool broke on worker memory at
@@ -585,7 +607,9 @@ class Runner:
                              default=lambda x: x.tolist() if hasattr(x, "tolist") else repr(x)) if self._shared(j) else n
             by.setdefault(key, []).append(j)
         tasks = list(by.values())
-        if self.workers <= 1 or len(tasks) <= 1:
+        if getattr(self, "_direct_engine", False):
+            res = [_job_list_with_engine(t, self._resolve_engine(t[0])) for t in tasks]
+        elif self.workers <= 1 or len(tasks) <= 1:
             res = [fn(t) for t in tasks]
         else:
             res = []
@@ -603,7 +627,7 @@ class Runner:
         return out
 
     def _shared(self, job) -> bool:
-        return shares_state(_engine_of(job))
+        return shares_state(self._resolve_engine(job))
 
     def _setting(self, name):
         s = self._p["settings"][name]

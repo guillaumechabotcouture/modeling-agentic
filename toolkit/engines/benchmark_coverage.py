@@ -271,17 +271,22 @@ def lead_run(run_dir: str) -> bool:
 
 # ------------------------------------------------------------------ the check
 def gate(cov, cov_problems, engine_name, raw, record, departures, departures_status, pack=None,
-         has_benchmarks: bool = False, runs=None, version: str = "0", param_names=None, trained=None) -> dict:
+         has_benchmarks: bool = False, runs=None, version: str = "0", param_names=None, trained=None,
+         policy: str = "registered") -> dict:
     """Benchmark precondition for one engine. `record()` returns (rows, problem) for the configuration in use;
     `pack` is the pack the coverage file was written for; `runs(test_id, effect, rows)` -> (ok, why) says whether a
     departure's decision test runs and changes the effect (toolkit/spec/preconditions.decision_test_runs).
     `trained` {id: declaration digest}: the benchmarks a declared net-effect posterior's fit trains on
     (posterior_trained); one whose record row is bound to that same declaration (band_sha256) takes its status from the
-    fit's verified chosen point, every other one from the record. Returns {why_not, departures, blocking,
+    fit's verified chosen point, every other one from the record. `policy="built"` (docs/design/agent-built-engines.md
+    §4.2, BE15): refuses `effects_from_spec`, disables the trained-posterior exemption, and accepts only `in_band`
+    unless a valid signed departure covers the failing or uncovered component. Returns {why_not, departures, blocking,
     reported, uncovered, record, status_source {benchmark: posterior_chosen_point | results.yaml}}."""
+    if policy not in ("registered", "built"):
+        raise ValueError(f"unknown benchmark_coverage policy {policy!r} (expected 'registered' or 'built')")
     out = {"why_not": [], "departures": [], "blocking": [], "reported": [], "uncovered": {}, "record": None,
            "card_rows_disagree": [], "status_source": {}}
-    trained = dict(trained or {})
+    trained = {} if policy == "built" else dict(trained or {})
     if cov is None:
         if pack is not None or has_benchmarks:
             out["why_not"].append(f"the engine has a benchmark pack but no {FILE} saying which components it covers")
@@ -309,7 +314,11 @@ def gate(cov, cov_problems, engine_name, raw, record, departures, departures_sta
             if isinstance(d, dict) and d.get("engine") == engine_name}
     pending = []          # (key, why_not text, effect parameters, spec components, failing record)
     covered = {(c, v) for e in entries.values() for c, vals in (e.get("covers") or {}).items() for v in vals}
-    nob, efs = cov.get("components_without_benchmark") or {}, cov.get("effects_from_spec") or {}
+    nob = cov.get("components_without_benchmark") or {}
+    efs = cov.get("effects_from_spec") or {}
+    if policy == "built" and efs:
+        out["why_not"].append(f"built coverage policy refuses effects_from_spec ({sorted(efs)})")
+        efs = {}
     for c in sorted({c for c, v in used - covered}):
         if c in efs or "*" in efs:
             out["uncovered"][c] = efs.get(c, efs.get("*"))
@@ -417,9 +426,11 @@ def _pack(ref: str, engine_obj=None) -> dict | None:
 
 
 def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_name: str | None = None,
-           card_benchmarks=None, base: str | None = None) -> dict:
+           card_benchmarks=None, base: str | None = None, policy: str | None = None) -> dict:
     """The check for one engine reference and configuration (the one the run uses)."""
     from toolkit.engines import benchmark_sources as BS
+    from toolkit.engines.built import BUILT_ADAPTER_REF
+    eff_policy = policy if policy is not None else ("built" if ref == BUILT_ADAPTER_REF else "registered")
     try:
         cref = canonical(ref)[0]
     except Exception:  # noqa: BLE001
@@ -487,7 +498,7 @@ def assess(ref: str, config: dict, raw: dict, departures_status: str, engine_nam
         cov, probs = load(eng_cov_path)
     out = gate(cov, probs, name, raw, record, list(raw.get("engine_departures") or []), departures_status,
                _pack(ref, engine()), has_benchmarks=bool(rp and os.path.exists(str(rp))), runs=runs, version=version,
-               param_names=pnames, trained=trained)
+               param_names=pnames, trained=trained, policy=eff_policy)
     if card_benchmarks and out["record"] == "verified":
         rows = {r.get("id"): r for r in record()[0]}
         out["card_rows_disagree"] = sorted(str(c.get("id")) for c in card_benchmarks if isinstance(c, dict)
@@ -727,6 +738,17 @@ def _self_test() -> int:
        and "net_kill_shift" in effect_parameters(mdoc["benchmarks"]["B8"], "0.17"),
        f"BC10 the malaria coverage's effect parameters exist in the engine; net_kill_shift counts from v0.17 ({bad})")
     _self_test_posterior(ok, cov, both)
+    # BE15 (docs/design/agent-built-engines.md §4.2): built coverage policy refuses effects_from_spec,
+    # ignores posterior_trained exemption, and blocks any out_of_band or uncovered component without a departure
+    cov_efs = dict(cov, effects_from_spec={"y": "spec supplied"})
+    g_reg_efs = gate(cov_efs, [], "e", both, rec, [], "unsigned", policy="registered")
+    g_built_efs = gate(cov_efs, [], "e", both, rec, [], "unsigned", policy="built")
+    g_built_oob = gate(cov, [], "e", both, rec, [], "unsigned", trained={"I": "dI"}, policy="built")
+    ok((not any("effects_from_spec" in w for w in g_reg_efs["why_not"]))
+       and any("effects_from_spec" in w for w in g_built_efs["why_not"])
+       and any("I" in w and "out_of_band" in w for w in g_built_oob["why_not"]),
+       f"BE15 policy='built' refuses effects_from_spec and blocks out-of-band trial without departure "
+       f"(efs={g_built_efs['why_not'][:1]}, oob={g_built_oob['why_not'][:1]})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

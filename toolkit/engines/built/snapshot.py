@@ -301,7 +301,14 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None) 
             elif isinstance(node, ast.Attribute):
                 attr = node.attr
                 if attr.startswith("__") and attr.endswith("__"):
-                    bad.append(f"S3: {name}:{node.lineno}: dunder attribute access .{attr} is refused")
+                    is_super_init = (
+                        attr == "__init__"
+                        and isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Name)
+                        and node.value.func.id == "super"
+                    )
+                    if not is_super_init:
+                        bad.append(f"S3: {name}:{node.lineno}: dunder attribute access .{attr} is refused")
                 elif attr in BANNED_ATTRS:
                     bad.append(f"S3: {name}:{node.lineno}: banned file/serialization/env attribute .{attr}")
             elif isinstance(node, ast.FunctionDef):

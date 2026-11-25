@@ -112,13 +112,14 @@ def _check_tol_map(tol, label: str, *, max_rel: float | None = None) -> list[str
 def _output_path_declared(path, per_cap: set[str], age_groups: set[str],
                           windows: dict[str, set[str]], drivers: set[str]) -> bool:
     """Match toolkit.engines.benchmark.get() paths exactly:
-    per_capita.<outcome>.<age>, per_capita_all.<outcome>, windows.<w>.<metric>, cost.<driver>."""
+    per_capita.<outcome>.<age>, per_capita_all.<outcome>, per_capita_vec.<outcome>,
+    windows.<w>.<metric>, cost.<driver>."""
     if not isinstance(path, str):
         return False
     parts = path.split(".")
     if len(parts) == 3 and parts[0] == "per_capita":
         return parts[1] in per_cap and parts[2] in age_groups
-    if len(parts) == 2 and parts[0] == "per_capita_all":
+    if len(parts) == 2 and parts[0] in ("per_capita_all", "per_capita_vec"):
         return parts[1] in per_cap
     if len(parts) == 3 and parts[0] == "windows":
         return parts[1] in windows and parts[2] in windows[parts[1]]
