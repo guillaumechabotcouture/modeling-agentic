@@ -151,13 +151,14 @@ def impact_rows(run_dir: str) -> list[dict]:
 
 
 def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate: dict | None,
-                 budget: dict | None, history_rows: int = 30, settings=None) -> dict:
+                 budget: dict | None, history_rows: int = 30, settings=None,
+                 built_engine: bool = False) -> dict:
     att = attempts(run_dir)
     fs, write_up, owner = [], [], []
     current_gaps = FL.harness_gaps(ledger)
     for f in FL.open_findings(ledger):
         row = {"id": f.id, "kind": f.kind, "severity": f.severity, "blocking": f.blocking,
-               "owner_state": f.owner_state, "resolution_type": f.resolution_type,
+               "owner_state": f.owner_state, "target_stage": f.target_stage, "resolution_type": f.resolution_type,
                "scope_declarable": f.scope_declarable, "label": FL.short_label(f.claim), "claim": f.claim,
                "fix_requires": f.fix_requires, "done_when": f.done_when,
                "first_seen_round": f.first_seen_round, "attempts": att.get(f.id, 0)}
@@ -177,6 +178,7 @@ def build_packet(run_dir: str, ledger: dict, round_n: int, max_rounds: int, gate
     return {"round": round_n, "max_rounds": max_rounds,
             # not plannable here: the WRITE stage's findings, and those the owner must amend (OWNER_DECISION)
             "write_up": by_id(write_up), "owner_amendments": by_id(owner),
+            "built_engine": bool(built_engine),
             "gate": {"action": g.get("action"), "rule": g.get("rule_matched"), "rationale": g.get("rationale"),
                      "escalation_required": g.get("escalation_required"),
                      "stalled": g.get("stalled_findings") or []},
@@ -265,6 +267,19 @@ def validate_plan(plan, packet: dict) -> list[str]:
             errs.append(f"{tid}: groups {len(fids)} findings, so it must name the files they share")
         if t.get("action") == "rethink" and t.get("owner_state") not in RETHINK_STATES:
             errs.append(f"{tid}: a rethink names owner_state SPEC or ENGINE_CHOICE (or ENGINE_BUILD for a built engine)")
+        elif t.get("action") == "rethink" and t.get("owner_state") == "ENGINE_BUILD":
+            if not packet.get("built_engine"):
+                errs.append(f"{tid}: ENGINE_BUILD rethink is valid only for an agent-built engine run")
+            else:
+                non_eng = [
+                    fid for fid in fids
+                    if fid in by_id
+                    and by_id[fid].get("target_stage") != "ENGINE"
+                    and by_id[fid].get("owner_state") != "ENGINE_BUILD"
+                    and by_id[fid].get("kind") != "engine_overfit_suspected"
+                ]
+                if non_eng:
+                    errs.append(f"{tid}: ENGINE_BUILD rethink only covers findings targeting ENGINE (got {', '.join(non_eng)})")
         if not str(t.get("brief") or "").strip():
             errs.append(f"{tid}: empty brief")
         if t.get("action") != "rethink":
@@ -430,7 +445,8 @@ def _restore(run_dir: str, saved: dict) -> None:
 
 
 def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tasks, rebuild, harness_ids,
-             headline, budget=None, log=print, guard=None, protect=(), settings=None) -> dict:
+             headline, budget=None, log=print, guard=None, protect=(), settings=None,
+             built_engine: bool = False) -> dict:
     """One fix loop. `tasks` is the machine's Tasks (plan_fixes, fix); `rebuild(run_dir)` is the S1
     runner, returning its report; `harness_ids(run_dir)` the ledger ids the harness checks report
     now; `headline(run_dir)` the numbers to record; `budget()` -> {spent, cap, left} or None.
@@ -443,7 +459,8 @@ def run_loop(run_dir: str, round_n: int, max_rounds: int, gate: dict | None, tas
     started keeps the snapshot taken before it (fix_progress_r<N>.json), so its row still
     measures the change."""
     ledger = FL.load(run_dir)
-    packet = build_packet(run_dir, ledger, round_n, max_rounds, gate, budget() if budget else None, settings=settings)
+    packet = build_packet(run_dir, ledger, round_n, max_rounds, gate, budget() if budget else None,
+                          settings=settings, built_engine=built_engine)
     plan, errs, tries = None, [], 0
     while tries < 2:
         tries += 1

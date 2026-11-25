@@ -154,6 +154,9 @@ class RunState:
     # The development flag (owner, 2026-11-01): where there is no sandbox (macOS) derivations run unsandboxed, the
     # record says so, and the gate holds a HIGH non-declarable finding: such a run cannot be accepted.
     derive_unsandboxed: bool = False
+    # Dedicated development flag (--dev-unsandboxed-engine) for agent-built engine execution on hosts without
+    # bubblewrap; strictly separate from derive_unsandboxed and persists a HIGH non-declarable gate finding.
+    engine_unsandboxed: bool = False
     # Every paid task: key -> {task, status started|completed, allowance_usd, usd, session_id,
     # started, completed, ok, output, note}. Written before and after each call, so a resumed run
     # never repeats a completed task or loses its charge, and charges an interrupted one its allowance.
@@ -1317,6 +1320,47 @@ POST_ENGINE_SIGN_STATES = ("PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRIT
                            "OWNER_DECISION", "WRITE", "PRESENTATION")
 
 
+def spec_has_engine_build(run_dir: str) -> bool:
+    """True when `decision_spec.yaml` in `run_dir` declares an `engine.build` request (single-link no-follow read)."""
+    import yaml
+    from lib.safe_io import read_nofollow
+    from toolkit.spec import schema as _SCH
+    try:
+        raw, st_f = read_nofollow(run_dir, AB.SPEC_FILE)
+        if st_f.st_nlink > 1:
+            return False
+        doc = yaml.safe_load(raw.decode("utf-8"))
+        return isinstance(doc, dict) and _SCH.engine_has_build(doc.get("engine"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _extract_dossier_benchmarks(dossier_bytes: bytes | None) -> list[dict]:
+    """Extract A9 literature/dossier benchmark entries (`{id, unit, package, params, path, band}`)
+    from the signed evidence dossier YAML bytes (empty list when absent or none declared)."""
+    if not dossier_bytes:
+        return []
+    import yaml
+    try:
+        doc = yaml.safe_load(dossier_bytes.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(doc, dict):
+        return []
+    raw_items = doc.get("benchmarks")
+    if not isinstance(raw_items, list):
+        raw_items = doc.get("literature_benchmarks")
+    if not isinstance(raw_items, list):
+        return []
+    out: list[dict] = []
+    for item in raw_items:
+        if (isinstance(item, dict) and item.get("id") is not None
+                and isinstance(item.get("path"), str) and item["path"].strip()
+                and isinstance(item.get("band"), (list, tuple)) and len(item["band"]) == 2):
+            out.append(dict(item))
+    return out
+
+
 def evidence_gate(run_dir: str, engine: tuple | None = None, signoff: str | None = None) -> list[str]:
     """F6 (#218): the registered preconditions of a signed run, recomputed from its files (the sign-off record
     compared; the engine chosen in engine_choice.json, or `engine`): checked at ENGINE_CHOICE on the engine picked and
@@ -1560,8 +1604,9 @@ class Machine:
         eff = st or state
         need_lock = eff is not None and (
             eff.signoff == "lead"
-            or eff.state in ("ENGINE_BUILD", "ENGINE_ADMIT")
+            or eff.state in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN")
             or bool(getattr(eff, "engine_build", None))
+            or spec_has_engine_build(self.run_dir)
         )
         if need_lock:
             # a lead or built-engine run's state is read again and written back under the run lock, so two
@@ -1587,14 +1632,25 @@ class Machine:
         # agents/world_model_stage.py), so it was not changed.
         save_state(self.run_dir, self.st)
 
+    def _charge_interrupted_entry(self, j: dict) -> None:
+        chg = self._interrupted_charge(j)
+        self.st.spent_usd += chg
+        if (j.get("build_budget") or j.get("task") in ("build_engine", "critique_engine")) and isinstance(
+            self.st.engine_build, dict
+        ):
+            self.st.engine_build["spent_usd"] = round(
+                float(self.st.engine_build.get("spent_usd") or 0.0) + chg, 4
+            )
+        j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
+        j["status"] = "interrupted"
+
     def _settle_interrupted(self) -> None:
         """Every journal entry left `started` by a previous process was interrupted: charge its
-        allowance once (the task cap when it had none) and mark it, before anything else runs."""
+        allowance once (the task cap when it had none) to the run and (for build-lane tasks) the
+        build budget, then mark it interrupted before anything else runs."""
         for j in self.st.journal.values():
             if isinstance(j, dict) and j.get("status") == "started":
-                self.st.spent_usd += self._interrupted_charge(j)
-                j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
-                j["status"] = "interrupted"
+                self._charge_interrupted_entry(j)
 
     def _interrupted_charge(self, j: dict) -> float:
         """What an interrupted task is charged: its allowance (the task cap when it had none) and, for a write-up
@@ -1654,13 +1710,12 @@ class Machine:
         if j and j.get("status") == "completed":
             return TaskResult(bool(j.get("ok")), j.get("output"), 0.0, j.get("note", ""), j.get("session_id"))
         if j and j.get("status") == "started":
-            self.st.spent_usd += self._interrupted_charge(j)
-            j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
-            j["status"] = "interrupted"
+            self._charge_interrupted_entry(j)
             save_state(self.run_dir, self.st)
         allowance = self._allowance(writeup)
         if cap_override is not None:
             allowance = round(min(cap_override, allowance), 4) if allowance is not None else float(cap_override)
+        bleft = None
         if build_budget:
             bcap = float(self.st.engine_build_cap_usd or ENGINE_BUILD_CAP_USD)
             bspent = float((self.st.engine_build or {}).get("spent_usd") or 0.0)
@@ -1692,12 +1747,14 @@ class Machine:
         a = allowance if allowance is not None else float(cap_override or self.st.task_cap_usd)
         b = self._budget(writeup)
         # A crash read-back is a paid call too: a small cap, from what is left after this allowance (for a
-        # write-up task, left of the reserve it may use).
+        # write-up task, left of the reserve it may use; for a build-lane task, also bounded by lane balance).
         rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
-        # A write-up task spends up to the cap itself, so its read-back allowance is part of what an interrupted
-        # one is charged (_interrupted_charge): the cap holds on resume.
+        if bleft is not None:
+            rb = max(0.0, min(rb, round(bleft - a, 4)))
+        # A write-up or build-lane task spends up to the cap itself, so its read-back allowance is part of what
+        # an interrupted one is charged (_interrupted_charge): both run and lane caps hold on resume.
         j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance, writeup=bool(writeup),
-                 readback_usd=rb if writeup else 0.0)
+                 build_budget=bool(build_budget), readback_usd=rb if (writeup or build_budget) else 0.0)
         self.st.journal[key] = j
         save_state(self.run_dir, self.st)
         setter = getattr(self.tasks, "set_allowance", None)
@@ -1948,7 +2005,9 @@ class Machine:
         if s in LLM_STATES and s != "PRESENTATION" and self._out_of_budget():
             return self._budget_out(s)
         try:
-            if s in ("ENGINE_BUILD", "ENGINE_ADMIT"):
+            if s in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN") or (
+                s == "ENGINE_CHOICE" and spec_has_engine_build(self.run_dir)
+            ):
                 with _amend_lock(self.run_dir):
                     return getattr(self, "h_" + s)()
             return getattr(self, "h_" + s)()
@@ -1956,12 +2015,20 @@ class Machine:
             return s
 
     def run(self, max_steps: int = 200) -> str:
-        if self.st.state in POST_ENGINE_SIGN_STATES:
+        if self.st.state in POST_ENGINE_SIGN_STATES or (
+            self.st.state == "FINAL" and (self.st.engine_build or {}).get("status") == "signed"
+        ):
             tamper = self._engine_tamper_problems()
             if tamper:
                 _withhold_report(self.run_dir)
-                self._go("FINAL", "agent-built engine snapshot tampered on resume: " + "; ".join(tamper[:4]),
-                         "artifact_tampered")
+                why = "agent-built engine snapshot tampered on resume: " + "; ".join(tamper[:4])
+                if self.st.state == "FINAL":
+                    self.st.status = "artifact_tampered"
+                    self.st.history.append({"at": _now(), "from": "FINAL", "to": "FINAL", "why": why,
+                                            "round": self.st.round, "spent_usd": round(self.st.spent_usd, 4)})
+                    self._finish()
+                else:
+                    self._go("FINAL", why, "artifact_tampered")
                 save_state(self.run_dir, self.st)
                 return self.st.status or self.st.state
         if self.st.state in POST_CHOICE_STATES:     # F6 (#218): a resume past ENGINE_CHOICE re-checks, before compute
@@ -2596,6 +2663,7 @@ class Machine:
         if has_build and (not has_auto or not eligible):
             if self.st.signoff == "none":
                 return self._go("FINAL", "an engine build needs a signed request (--signoff none refused)", "run_failed")
+            from lib.safe_io import remove_nofollow
             from toolkit.engines.built import requested as BREQ
             build_decl = dict(raw_eng["build"])
             bid = str(build_decl["id"])
@@ -2613,6 +2681,11 @@ class Machine:
                 _write_json(self.run_dir, AB.ENGINE_CHOICE, dict(rec, evidence_refused={"build": bid, "why": miss}))
                 return self._go("FINAL", f"the signed evidence dossier does not cover built engine {bid}'s decision "
                                          "inputs: " + "; ".join(miss[:5]), "run_failed")
+            # Clear stale sign-off/review/seed state when entering or re-entering build via ENGINE_CHOICE
+            for stale_rel in ("engine_build/signoff.json", "engine_build/decline.json",
+                              "engine_build/review_status.json", "engine_build/.hidden/seed.json",
+                              "critique_engine.yaml"):
+                remove_nofollow(self.run_dir, stale_rel, missing_ok=True)
             prev_eb = self.st.engine_build if isinstance(self.st.engine_build, dict) else {}
             self.st.engine_build = {
                 "id": bid,
@@ -2622,9 +2695,11 @@ class Machine:
                 "repairs": int(prev_eb.get("repairs") or 0),
                 "spent_usd": float(prev_eb.get("spent_usd") or 0.0),
                 "compute_reserved_usd": 0.0,
-                "snapshot_sha256": prev_eb.get("snapshot_sha256"),
-                "admission_sha256": prev_eb.get("admission_sha256"),
-                "hidden_commitment": prev_eb.get("hidden_commitment"),
+                "compute_reservation_id": None,
+                "snapshot_sha256": None,
+                "admission_sha256": None,
+                "hidden_commitment": None,
+                "hidden_seed_snapshot": None,
             }
             self.st.engine = None
             return self._go("ENGINE_BUILD", f"requested agent-built engine {bid}")
@@ -2690,7 +2765,10 @@ class Machine:
         return {
             "build": build_decl,
             "contract_docstring": inspect.getdoc(_C) or "",
-            "allowed_imports": sorted(BSNAP.ALLOWED_IMPORTS),
+            "allowed_imports": {
+                "top_level": sorted(BSNAP.ALLOWED_TOP_IMPORTS),
+                "qualified": sorted(BSNAP.ALLOWED_QUALIFIED_IMPORTS),
+            },
             "oracle_signatures": oracle_sigs,
             "layout": {
                 "work_dir": f"models/ext/engine_{build_decl['id']}/",
@@ -2728,21 +2806,44 @@ class Machine:
 
     def _ensure_hidden_seed(self, snap_sha: str) -> tuple[bytes, str]:
         """Draw and commit the hidden seed once per snapshot before any hidden case runs, reusing the exact
-        committed seed if admission resumes mid-way after a crash (BE31). Uses the same ASCII-hex commitment
-        formula as `toolkit.engines.built.admission._load_or_commit_hidden_seed`."""
+        committed seed if admission resumes mid-way after a crash (BE31). Fails closed if a commitment was
+        already recorded for `snap_sha` in run_state.json but `engine_build/.hidden/seed.json` is missing
+        or mismatched (never silently swaps a committed hidden seed)."""
         import secrets
         from lib.safe_io import read_nofollow
         seed_rel = "engine_build/.hidden/seed.json"
+        eb = self.st.engine_build
+        prior_snap = eb.get("hidden_seed_snapshot")
+        prior_commit = eb.get("hidden_commitment")
+        if prior_commit and prior_snap in (snap_sha, None):
+            try:
+                raw, st_f = read_nofollow(self.run_dir, seed_rel)
+                if st_f.st_nlink != 1:
+                    raise RuntimeError(f"{seed_rel} has multiple hard links")
+                doc = json.loads(raw.decode("utf-8"))
+                shex = doc.get("seed_hex") if isinstance(doc, dict) else None
+                if not isinstance(shex, str) or len(shex) != 64:
+                    raise RuntimeError(f"{seed_rel} missing valid 64-hex seed_hex")
+                sb = bytes.fromhex(shex)
+                commit = hashlib.sha256(shex.encode("ascii")).hexdigest()
+                if commit != prior_commit:
+                    raise RuntimeError(f"{seed_rel} commitment mismatch ({commit[:12]} != {prior_commit[:12]})")
+                eb["hidden_seed_snapshot"] = snap_sha
+                return sb, commit
+            except (FileNotFoundError, OSError, ValueError) as e:
+                raise RuntimeError(f"committed hidden seed for {snap_sha[:12]} missing or unreadable: {e}") from None
         try:
             raw, st_f = read_nofollow(self.run_dir, seed_rel)
             if st_f.st_nlink == 1:
                 doc = json.loads(raw.decode("utf-8"))
                 shex = doc.get("seed_hex") if isinstance(doc, dict) else None
-                if (isinstance(doc, dict) and doc.get("snapshot_sha256") in (snap_sha, None)
+                if (isinstance(doc, dict) and doc.get("snapshot_sha256") == snap_sha
                         and isinstance(shex, str) and len(shex) == 64):
                     sb = bytes.fromhex(shex)
                     commit = hashlib.sha256(shex.encode("ascii")).hexdigest()
-                    self.st.engine_build["hidden_commitment"] = commit
+                    eb["hidden_commitment"] = commit
+                    eb["hidden_seed_snapshot"] = snap_sha
+                    save_state(self.run_dir, self.st)
                     return sb, commit
         except (FileNotFoundError, OSError, ValueError):
             pass
@@ -2755,7 +2856,8 @@ class Machine:
             "commitment": commit,
             "committed_at": _now(),
         })
-        self.st.engine_build["hidden_commitment"] = commit
+        eb["hidden_commitment"] = commit
+        eb["hidden_seed_snapshot"] = snap_sha
         save_state(self.run_dir, self.st)
         return sb, commit
 
@@ -2784,14 +2886,17 @@ class Machine:
         eb["repairs"] = int(eb.get("repairs") or 0) + 1
         eb["status"] = "building"
         eb["admission_sha256"] = None
+        eb["hidden_commitment"] = None
+        eb["hidden_seed_snapshot"] = None
+        eb["compute_reservation_id"] = None
         self.st.round_pending = True
         self.st.post_write = False
         self.st.engine = None
         _withhold_report(self.run_dir)
-        remove_nofollow(self.run_dir, "engine_build/signoff.json", missing_ok=True)
-        remove_nofollow(self.run_dir, "engine_build/decline.json", missing_ok=True)
-        remove_nofollow(self.run_dir, "engine_build/review_status.json", missing_ok=True)
-        remove_nofollow(self.run_dir, "engine_build/.hidden/seed.json", missing_ok=True)
+        for stale_rel in ("engine_build/signoff.json", "engine_build/decline.json",
+                          "engine_build/review_status.json", "engine_build/.hidden/seed.json",
+                          "critique_engine.yaml"):
+            remove_nofollow(self.run_dir, stale_rel, missing_ok=True)
         self._update_pending_choice_status(str(eb["id"]), "building")
         fb = list(findings or []) or [f"post-analysis engine repair: {why}"]
         self.st.tries["engine_build_feedback"] = fb
@@ -2870,41 +2975,62 @@ class Machine:
         except Exception as e:  # noqa: BLE001
             return self._go("FINAL", f"cannot read decision_spec.yaml for admission: {e}", "run_failed")
 
-        # BE33: reserve admission compute against the run balance BEFORE any dispatch
+        # BE33: reserve admission compute against the run balance BEFORE any dispatch, reusing an
+        # existing active reservation if an earlier admission attempt was interrupted before reconciling.
         cap_usd = self.st.budget_usd
-        if cap_usd is not None:
-            rem_state = round(cap_usd - self.st.spent_usd, 4)
-            if rem_state + 1e-9 < ENGINE_ADMIT_COMPUTE_CAP_USD:
+        res_id = None
+        prev_res_id = eb.get("compute_reservation_id")
+        if isinstance(prev_res_id, str) and prev_res_id:
+            ledger0 = RB.load_budget_ledger(self.run_dir)
+            for sess in ledger0.get("sessions") or []:
+                if (isinstance(sess, dict) and sess.get("session_id") == prev_res_id
+                        and sess.get("status") == "reserved"
+                        and float(sess.get("reserved_usd") or 0.0) + 1e-9 >= ENGINE_ADMIT_COMPUTE_CAP_USD):
+                    res_id = prev_res_id
+                    break
+        if res_id is None:
+            if cap_usd is not None:
+                rem_state = round(cap_usd - self.st.spent_usd, 4)
+                if rem_state + 1e-9 < ENGINE_ADMIT_COMPUTE_CAP_USD:
+                    self.st.paused, self.st.status = AWAITING_BUDGET, None
+                    self.st.history.append({
+                        "at": _now(), "paused": AWAITING_BUDGET, "reason": "engine_admit_compute",
+                        "state": "ENGINE_ADMIT", "need_usd": ENGINE_ADMIT_COMPUTE_CAP_USD,
+                        "left_usd": rem_state, "cap_usd": cap_usd, "spent_usd": round(self.st.spent_usd, 4),
+                    })
+                    save_state(self.run_dir, self.st)
+                    self.log(f"[machine] ENGINE_ADMIT paused before dispatch: remaining ${rem_state:.2f} < "
+                             f"${ENGINE_ADMIT_COMPUTE_CAP_USD:.2f} admission compute cap")
+                    return "ENGINE_ADMIT"
+            ok_res, res_or_why = RB.reserve_compute(
+                self.run_dir, ENGINE_ADMIT_COMPUTE_CAP_USD, cap_usd=cap_usd,
+                stage="ENGINE_ADMIT", label="admission_compute",
+            )
+            if not ok_res:
                 self.st.paused, self.st.status = AWAITING_BUDGET, None
                 self.st.history.append({
                     "at": _now(), "paused": AWAITING_BUDGET, "reason": "engine_admit_compute",
                     "state": "ENGINE_ADMIT", "need_usd": ENGINE_ADMIT_COMPUTE_CAP_USD,
-                    "left_usd": rem_state, "cap_usd": cap_usd, "spent_usd": round(self.st.spent_usd, 4),
+                    "left_usd": None, "why": str(res_or_why), "cap_usd": cap_usd,
+                    "spent_usd": round(self.st.spent_usd, 4),
                 })
                 save_state(self.run_dir, self.st)
-                self.log(f"[machine] ENGINE_ADMIT paused before dispatch: remaining ${rem_state:.2f} < "
-                         f"${ENGINE_ADMIT_COMPUTE_CAP_USD:.2f} admission compute cap")
                 return "ENGINE_ADMIT"
-        ok_res, res_or_why = RB.reserve_compute(
-            self.run_dir, ENGINE_ADMIT_COMPUTE_CAP_USD, cap_usd=cap_usd,
-            stage="ENGINE_ADMIT", label="admission_compute",
-        )
-        if not ok_res:
-            self.st.paused, self.st.status = AWAITING_BUDGET, None
-            self.st.history.append({
-                "at": _now(), "paused": AWAITING_BUDGET, "reason": "engine_admit_compute",
-                "state": "ENGINE_ADMIT", "need_usd": ENGINE_ADMIT_COMPUTE_CAP_USD,
-                "left_usd": None, "why": str(res_or_why), "cap_usd": cap_usd,
-                "spent_usd": round(self.st.spent_usd, 4),
-            })
+            res_id = str(res_or_why)
+            eb["compute_reservation_id"] = res_id
+            eb["compute_reserved_usd"] = ENGINE_ADMIT_COMPUTE_CAP_USD
             save_state(self.run_dir, self.st)
-            return "ENGINE_ADMIT"
-        res_id = str(res_or_why)
-        eb["compute_reserved_usd"] = ENGINE_ADMIT_COMPUTE_CAP_USD
-        save_state(self.run_dir, self.st)
 
-        # BE31: draw or reuse committed hidden seed for this snapshot (loaded by BADM.admit from seed.json)
-        _seed_bytes, commit = self._ensure_hidden_seed(snap_sha)
+        # BE31: draw or reuse committed hidden seed for this snapshot (fails closed if missing/tampered)
+        try:
+            _seed_bytes, commit = self._ensure_hidden_seed(snap_sha)
+        except RuntimeError as e:
+            RB.reconcile_compute(self.run_dir, res_id, 0.0, cap_usd=cap_usd)
+            eb["compute_reservation_id"] = None
+            eb["compute_reserved_usd"] = 0.0
+            _withhold_report(self.run_dir)
+            return self._go("FINAL", f"hidden seed tampered: {e}", "artifact_tampered")
+
         # Check optional reference implementation in engine_build/reference/ (PR epsilon adds build_reference task)
         ref_files = None
         ref_dir = os.path.join(self.run_dir, "engine_build", "reference")
@@ -2927,7 +3053,10 @@ class Machine:
                     dossier_bytes = d_raw
             except OSError:
                 dossier_bytes = None
-        req_ref = bool(eb.get("require_reference")) if "require_reference" in eb else (ref_files is not None)
+        dossier_benchmarks = _extract_dossier_benchmarks(dossier_bytes)
+        # §7 Q2: A11 reference comparison is ON by default (matches pre-sign sheet `A11_reference: 1`); never
+        # silently waived when reference.py is missing unless explicitly disabled in state.
+        req_ref = bool(eb.get("require_reference")) if "require_reference" in eb else True
         cfg_map = (build_decl.get("request") or {}).get("configs") or {}
         default_cfg = dict(cfg_map.get("default") or {}) if isinstance(cfg_map, dict) else {}
         actual_compute_usd = 0.0
@@ -2941,12 +3070,14 @@ class Machine:
                 reference_files=ref_files,
                 require_reference=req_ref,
                 dossier_bytes=dossier_bytes,
+                dossier_benchmarks=dossier_benchmarks,
                 departures_status="signed",
-                unsandboxed_ok=self.st.derive_unsandboxed,
+                unsandboxed_ok=self.st.engine_unsandboxed,
                 run_public_baseline=True,
             )
         finally:
             RB.reconcile_compute(self.run_dir, res_id, actual_compute_usd, cap_usd=cap_usd)
+            eb["compute_reservation_id"] = None
             eb["compute_reserved_usd"] = 0.0
             self.st.spent_usd = round(self.st.spent_usd + actual_compute_usd, 4)
 
@@ -2955,12 +3086,8 @@ class Machine:
         eb["admission_sha256"] = adm_sha
         eb["hidden_commitment"] = adm.get("hidden_commitment") or commit
 
-        if adm.get("status") == "admitted":
-            eb["status"] = "admitted"
-            self._update_pending_choice_status(str(eb["id"]), "admitted")
-            return self._go("ENGINE_REVIEW", f"admitted snapshot {snap_sha[:12]}")
-
-        # Check SPEC amendment routing (A8 out-of-band/uncovered without departure, or A10 unidentified decision-moving param)
+        # Check SPEC amendment routing BEFORE accepting admission (A10 is non-gating in admit(), so an
+        # otherwise-admitted engine with an unidentified decision-moving parameter still routes to SPEC).
         checks = adm.get("checks") or {}
         a8 = checks.get("A8") or {}
         a10 = checks.get("A10") or {}
@@ -2994,22 +3121,28 @@ class Machine:
             self.st.tries["spec_amendment"] = True
             return self._go("SPEC", "admission requires signed spec amendment (" + ("A8" if a8_amend else "A10") + ")")
 
-        # Failed admission: retry ENGINE_BUILD if tries remain, else FINAL completed_engine_not_admitted
+        if adm.get("status") == "admitted":
+            eb["status"] = "admitted"
+            self._update_pending_choice_status(str(eb["id"]), "admitted")
+            return self._go("ENGINE_REVIEW", f"admitted snapshot {snap_sha[:12]}")
+
+        # Failed admission: retry ENGINE_BUILD if tries remain, else FINAL completed_engine_not_admitted.
+        # NEVER copy hidden check problem strings (`adm["checks"][cid]["problems"]`) into builder feedback (§4.6).
         fb_lines: list[str] = []
         if adm.get("static_problems"):
             fb_lines += [f"static: {p}" for p in adm["static_problems"][:12]]
         pub_failed = list((adm.get("feedback") or {}).get("public_failed") or [])
         failed_ids = list((adm.get("feedback") or {}).get("failed_checks") or [])
         if pub_failed:
-            fb_lines.append(f"public checks failed: {pub_failed}")
-            for cid in pub_failed:
-                for p in ((checks.get(cid) or {}).get("problems") or [])[:4]:
-                    fb_lines.append(f"{cid}: {p}")
-        else:
-            # Hidden failure: name ONLY check ids and output names, NEVER hidden input values (§4.6)
-            fb_lines.append(f"hidden admission failed on check(s): {failed_ids}")
-            if adm.get("overfit_suspected"):
-                fb_lines.append("engine_overfit_suspected: public checks passed but hidden checks failed")
+            fb_lines.append(
+                f"public checks failed: {pub_failed} — run mcp__engine__try(checks={pub_failed!r}) on your "
+                "working copy to inspect public diagnostics"
+            )
+        hidden_only = [cid for cid in failed_ids if cid != "public" and cid not in pub_failed]
+        if hidden_only:
+            fb_lines.append(f"hidden admission failed on check(s): {hidden_only}")
+        if adm.get("overfit_suspected"):
+            fb_lines.append("engine_overfit_suspected: public checks passed but hidden checks failed")
         n_used = int(eb.get("tries") or 0)
         max_tries = self._max_engine_build_tries()
         if n_used < max_tries:
@@ -3021,11 +3154,16 @@ class Machine:
                         ENGINE_NOT_ADMITTED)
 
     def h_ENGINE_REVIEW(self):
+        from lib.safe_io import remove_nofollow
         from toolkit.engines.built import signoff as BSIG
         eb = self.st.engine_build
+        snap_sha = eb.get("snapshot_sha256")
         v = self._visit()
         repairs = int(self.st.tries.get("engine_review_repairs") or 0)
         fb = self.st.tries.get("engine_review_feedback")
+        if repairs == 0:
+            # Remove any stale critique_engine.yaml from a prior snapshot so a failed task can never reuse it
+            remove_nofollow(self.run_dir, BSIG.REVIEW_FILE, missing_ok=True)
         res = self._task(
             f"ENGINE_REVIEW#{v}:r{self.st.round}:a{repairs + 1}",
             "critique_engine",
@@ -3038,7 +3176,10 @@ class Machine:
         if res is None:
             return self._budget_out("ENGINE_REVIEW")
         cpath = os.path.join(self.run_dir, BSIG.REVIEW_FILE)
-        doc, errs = BSIG.validate_engine_critique(cpath, self.st.round)
+        if not res.ok:
+            doc, errs = None, [f"critique_engine task failed: {res.note or 'no output'}"]
+        else:
+            doc, errs = BSIG.validate_engine_critique(cpath, self.st.round)
         if doc is None:
             if repairs < 1:
                 self.st.tries["engine_review_repairs"] = repairs + 1
@@ -3047,7 +3188,7 @@ class Machine:
             self.st.tries.pop("engine_review_repairs", None)
             self.st.tries.pop("engine_review_feedback", None)
             _write_json(self.run_dir, BSIG.REVIEW_STATUS_REL, {
-                "review_unavailable": True, "errors": errs, "recorded_at": _now(),
+                "snapshot_sha256": snap_sha, "review_unavailable": True, "errors": errs, "recorded_at": _now(),
             })
             eb["status"] = "reviewed"
             return self._go("ENGINE_SIGN", "engine review unavailable after repair (blocks lead sign-off)")
@@ -3057,6 +3198,7 @@ class Machine:
         open_high = [b for b in (doc.get("blockers") or []) if not b.get("resolved") and b.get("severity") == "HIGH"]
         open_med = [b for b in (doc.get("blockers") or []) if not b.get("resolved") and b.get("severity") == "MEDIUM"]
         _write_json(self.run_dir, BSIG.REVIEW_STATUS_REL, {
+            "snapshot_sha256": snap_sha,
             "review_unavailable": False,
             "verdict": doc.get("verdict"),
             "high_count": len(open_high),
@@ -3080,6 +3222,11 @@ class Machine:
         st_sig = BSIG.status(self.run_dir)
         if st_sig == "declined":
             dec, _ = BSIG._read_json_optional(self.run_dir, BSIG.DECLINE_REL)
+            dec_by = (dec or {}).get("by")
+            if self.st.signoff == "owner" and dec_by != "owner":
+                self.st.paused = AWAITING_ENGINE_SIGNOFF
+                save_state(self.run_dir, self.st)
+                return "ENGINE_SIGN"
             note = (dec or {}).get("note") or "declined"
             n_used = int(eb.get("tries") or 0)
             if n_used < self._max_engine_build_tries():
@@ -3105,6 +3252,10 @@ class Machine:
             so, _ = BSIG._read_json_optional(self.run_dir, BSIG.SIGNOFF_REL)
             by = (so or {}).get("by")
             if self.st.signoff == "owner" and by != "owner":
+                self.st.paused = AWAITING_ENGINE_SIGNOFF
+                save_state(self.run_dir, self.st)
+                return "ENGINE_SIGN"
+            if by == "lead" and BSIG.review_blocks_lead(self.run_dir):
                 self.st.paused = AWAITING_ENGINE_SIGNOFF
                 save_state(self.run_dir, self.st)
                 return "ENGINE_SIGN"
@@ -3438,7 +3589,8 @@ class Machine:
                            _Journaled(self, f"FIX_LOOP#{v}:r{self.st.round}"),
                            rebuild=self.rebuild, harness_ids=self.harness_ids, headline=self.backend.headline,
                            budget=self._budget, log=self.log, guard=self.fix_guard, protect=PROTECTED_BY_FIX,
-                           settings=getattr(self.backend, "settings_paths", AB.SETTINGS_PATHS))
+                           settings=getattr(self.backend, "settings_paths", AB.SETTINGS_PATHS),
+                           built_engine=self._has_built_engine())
         self.st.history.append({"at": _now(), "fix_loop": summ})
         if summ.get("owner_amendments"):
             # F6 run 3: their remedy is an owner amendment of the signed spec; the owner answers, no redraft runs.
@@ -3447,7 +3599,9 @@ class Machine:
                                               f"({', '.join(summ['owner_amendments'])[:120]})")
         if summ.get("rethink"):
             if summ["rethink"] == "ENGINE_BUILD":
-                if self._has_built_engine() and self._engine_repairs_left():
+                if not self._has_built_engine():
+                    return self._go("FINAL", "ENGINE_BUILD rethink is invalid for a registered engine", "run_failed")
+                if self._engine_repairs_left():
                     return self._begin_engine_repair("the fix planner routed to ENGINE_BUILD",
                                                      self._rethink_reasons("ENGINE_BUILD", planned=True))
                 self.st.history.append({
@@ -4580,7 +4734,8 @@ def _record_invocation(run_dir: str, budget_usd, cap_usd) -> None:
 
 def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "owner", gate_mode: str = "v2",
              budget_usd: float | None = None, derived_inputs: bool = True, derive_unsandboxed: bool = False,
-             world_model: bool = True, engine_build_usd: float | None = None) -> RunState:
+             world_model: bool = True, engine_build_usd: float | None = None,
+             engine_unsandboxed: bool = False) -> RunState:
     os.makedirs(run_dir, exist_ok=True)
     st = load_state(run_dir)
     if st is not None:
@@ -4589,7 +4744,8 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
         max(float(engine_build_usd), MIN_TASK_ALLOWANCE_USD), ENGINE_BUILD_CAP_MAX_USD
     )
     st = RunState(question=question, max_rounds=max_rounds, signoff=signoff, gate_mode=gate_mode, budget_usd=budget_usd,
-                  derived_inputs=derived_inputs, derive_unsandboxed=derive_unsandboxed, world_model_stages=world_model,
+                  derived_inputs=derived_inputs, derive_unsandboxed=derive_unsandboxed,
+                  engine_unsandboxed=engine_unsandboxed, world_model_stages=world_model,
                   engine_build_cap_usd=eb_cap)
     try:   # keep what main.py recorded first (run_dir, pipeline, commit, launcher: scripts/lib/pipeline_id.py)
         meta = json.load(open(os.path.join(run_dir, "metadata.json")))
@@ -4609,11 +4765,11 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
 def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str = "owner",
            budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False, backend=None,
            cross_engine_check: bool = True, _depth: int = 0, _stamp: dict | None = None,
-           engine_build_usd: float | None = None) -> str:
+           engine_build_usd: float | None = None, engine_unsandboxed: bool = False) -> str:
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
     (Machine.reopen_interrupted_analysis). Holds the whole-run lock across --signoff lead runs AND across every
-    built-engine run / ENGINE_BUILD / ENGINE_ADMIT state in any mode (owner decision on #330, BE31)."""
+    built-engine run / build-lane state in any mode (owner decision on #330, BE31)."""
     try:
         prev = load_state(run_dir)
     except (OSError, ValueError):
@@ -4622,24 +4778,26 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
         signoff == "lead"
         or (prev is not None and (
             prev.signoff == "lead"
-            or prev.state in ("ENGINE_BUILD", "ENGINE_ADMIT")
+            or prev.state in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN")
             or bool(getattr(prev, "engine_build", None))
         ))
+        or spec_has_engine_build(run_dir)
     )
     if not need_lock:
         return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
-                             backend, cross_engine_check, _depth, _stamp, engine_build_usd)
+                             backend, cross_engine_check, _depth, _stamp, engine_build_usd, engine_unsandboxed)
     os.makedirs(run_dir, exist_ok=True)
     with _amend_lock(run_dir):     # held through hand-off, child run, and built-engine stages (BE31)
         return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
-                             backend, cross_engine_check, _depth, _stamp, engine_build_usd)
+                             backend, cross_engine_check, _depth, _stamp, engine_build_usd, engine_unsandboxed)
 
 
 def _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
-                  cross_engine_check, _depth, _stamp, engine_build_usd=None) -> str:
+                  cross_engine_check, _depth, _stamp, engine_build_usd=None, engine_unsandboxed=False) -> str:
     """One run dir, then the child its provisional amendment handed it to (run_v2, under the caller's lock)."""
     child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
-                                 derive_unsandboxed, backend, cross_engine_check, _stamp, engine_build_usd)
+                                 derive_unsandboxed, backend, cross_engine_check, _stamp,
+                                 engine_build_usd, engine_unsandboxed)
     if child is None or _depth >= 8:          # a bounded chain (a restored cycle cannot recurse: Codex r2)
         return status
     # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher);
@@ -4655,11 +4813,12 @@ def _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log
     return run_v2(cst.question, child, tasks.for_run_dir(child), max_rounds=cst.max_rounds, signoff="lead",
                   budget_usd=cst.budget_usd, log=log, derive_unsandboxed=derive_unsandboxed, backend=backend,
                   cross_engine_check=cross_engine_check, _depth=_depth + 1, _stamp=ident,
-                  engine_build_usd=getattr(cst, "engine_build_cap_usd", None))
+                  engine_build_usd=getattr(cst, "engine_build_cap_usd", None),
+                  engine_unsandboxed=engine_unsandboxed)
 
 
 def _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
-                 cross_engine_check, stamp, engine_build_usd=None) -> tuple:
+                 cross_engine_check, stamp, engine_build_usd=None, engine_unsandboxed=False) -> tuple:
     """(the child to continue in or None, the status) of one run dir."""
     if stamp:
         try:
@@ -4668,7 +4827,7 @@ def _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
         except Exception as e:  # noqa: BLE001 -- the identity stamp only; the run records its own invocation below
             log(f"[machine] the child run's identity was not stamped: {type(e).__name__}: {e}")
     st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed,
-                  engine_build_usd=engine_build_usd)
+                  engine_build_usd=engine_build_usd, engine_unsandboxed=engine_unsandboxed)
     if st.paused == AWAITING_BUDGET and budget_usd and budget_usd > (st.budget_usd or 0):
         # the owner resumes a run paused below the allowance floor with a higher cap: recorded, never lowered
         st.history.append({"at": _now(), "budget_raised": {"from": st.budget_usd, "to": budget_usd},
@@ -9857,9 +10016,14 @@ def _self_test_built_engine(ok, td: str) -> None:
 
     def _mk_run(name: str, *, signoff: str = "owner", include_trial_oob: bool = False,
                 build_fn=None, critics=None, budget: float | None = None,
-                engine_build_usd: float | None = None, max_rounds: int = 3):
+                engine_build_usd: float | None = None, max_rounds: int = 3,
+                with_ref: bool = True):
         rd = os.path.join(td, name)
         os.makedirs(rd, exist_ok=True)
+        if with_ref:
+            ref_dir = os.path.join(rd, "engine_build", "reference")
+            os.makedirs(ref_dir, exist_ok=True)
+            open(os.path.join(ref_dir, "reference.py"), "wb").write(_cf_files(tag="ref")["engine.py"])
         sp = _cf_spec(rd, include_trial_oob=include_trial_oob)
         sc = {
             "spec": sp,
@@ -9868,12 +10032,12 @@ def _self_test_built_engine(ok, td: str) -> None:
             "critics": critics or {},
         }
         st = init_run(rd, "Which package per unit?", max_rounds=max_rounds, signoff=signoff,
-                      budget_usd=budget, derived_inputs=False, derive_unsandboxed=dev_un,
+                      budget_usd=budget, derived_inputs=False, engine_unsandboxed=dev_un,
                       world_model=False, engine_build_usd=engine_build_usd)
         return rd, StubTasks(sc), st
 
     # BE28: owner lifecycle (pause awaiting_engine_signoff -> sign -> FINAL + hidden_reveal + owner disclaimer),
-    # lead provisional auto-sign + provisional disclaimer, and post-sign snapshot tamper -> artifact_tampered
+    # lead provisional auto-sign + provisional disclaimer, and post-sign & FINAL snapshot tamper -> artifact_tampered
     d28, T28, st28 = _mk_run("be28_owner", signoff="owner")
     s_sign = Machine(d28, T28, st28, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
     _dispose_owner_conditions(d28)
@@ -9892,7 +10056,7 @@ def _self_test_built_engine(ok, td: str) -> None:
     s_lead = Machine(lead_d, lead_T, lead_st, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
     rep_lead = open(os.path.join(lead_d, "report.md"), encoding="utf-8").read() if os.path.exists(os.path.join(lead_d, "report.md")) else ""
     so_lead = json.load(open(os.path.join(lead_d, BSIG.SIGNOFF_REL))) if os.path.exists(os.path.join(lead_d, BSIG.SIGNOFF_REL)) else {}
-    # Tamper snapshot on a post-ENGINE_SIGN copy -> artifact_tampered
+    # Tamper snapshot on a completed FINAL copy -> resuming FINAL detects tamper and withholds report
     tamp_d = os.path.join(td, "be28_tamper")
     shutil.copytree(lead_d, tamp_d)
     st_t = load_state(tamp_d)
@@ -9902,8 +10066,6 @@ def _self_test_built_engine(ok, td: str) -> None:
     ep_t = os.path.join(sdir_t, "engine.py")
     os.chmod(ep_t, 0o644)
     open(ep_t, "ab").write(b"\n# tampered\n")
-    st_t.state, st_t.status = "CONFIGURE", None
-    save_state(tamp_d, st_t)
     s_tamp = Machine(tamp_d, StubTasks(lead_T.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
     ok(s_sign == "paused:awaiting_signoff" and pending_ok
        and (s_done == "completed" or (dev_un and s_done == "run_failed"))
@@ -9913,12 +10075,15 @@ def _self_test_built_engine(ok, td: str) -> None:
        and so_lead.get("by") == "lead" and so_lead.get("provisional") is True
        and "Agent-built engine (lead-signed, provisional)" in rep_lead[:600]
        and s_tamp == "artifact_tampered" and not os.path.exists(os.path.join(tamp_d, "report.md")),
-       f"BE28 owner sign-off lifecycle, lead provisional sign-off + disclaimer, hidden_reveal, and tamper detection "
+       f"BE28 owner sign-off lifecycle, lead provisional sign-off + disclaimer, hidden_reveal, and FINAL tamper detection "
        f"(pending={pending_ok}, done={s_done}, lead={s_lead}, tamp={s_tamp})")
 
-    # BE29a: static/admission failure twice -> completed_engine_not_admitted (exit 2) + request_for_owner.md
+    # BE29a: static/admission failure twice -> completed_engine_not_admitted (exit 2) + request_for_owner.md;
+    # missing A11 reference.py also fails closed (A11 unavailable -> not admitted)
     d29a, T29a, st29a = _mk_run("be29_fail", signoff="lead", build_fn=_cf_files(bad_static=True))
     s29a = Machine(d29a, T29a, st29a, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
+    d29r, T29r, st29r = _mk_run("be29_noref", signoff="lead", with_ref=False)
+    s29r = Machine(d29r, T29r, st29r, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
     # BE29b: A8 out-of-band without departure -> ENGINE_ADMIT -> SPEC -> paused:awaiting_spec_amendment
     d29b, T29b, st29b = _mk_run("be29_a8", signoff="owner", include_trial_oob=True)
     Machine(d29b, T29b, st29b, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
@@ -9943,12 +10108,13 @@ def _self_test_built_engine(ok, td: str) -> None:
     BSIG.decline(d29c, "owner", note="still unacceptable on try 2")
     s29c3 = Machine(d29c, StubTasks(T29c.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
     ok(s29a == ENGINE_NOT_ADMITTED and RF.exit_code_for(s29a) == 2
+       and s29r == ENGINE_NOT_ADMITTED
        and os.path.isfile(os.path.join(d29a, "engine_build", "request_for_owner.md"))
        and s29b == f"paused:{AWAITING_SPEC_AMENDMENT}" and rq29b.get("source") == "ENGINE_ADMIT"
        and s29c1 == f"paused:{AWAITING_ENGINE_SIGNOFF}" and s29c2 == f"paused:{AWAITING_ENGINE_SIGNOFF}"
        and decl_n[0] == 2 and s29c3 == ENGINE_DECLINED and RF.exit_code_for(s29c3) == 2,
-       f"BE29 not-admitted (exit 2), A8 spec-amendment pause, and decline-rebuild/decline-terminal "
-       f"({s29a}, {s29b}, {s29c1}->{s29c2}->{s29c3}, builds={decl_n[0]})")
+       f"BE29 not-admitted (exit 2), missing-A11 fail-closed, A8 spec-amendment pause, and decline-rebuild/decline-terminal "
+       f"({s29a}, noref={s29r}, {s29b}, {s29c1}->{s29c2}->{s29c3}, builds={decl_n[0]})")
 
     # BE30: post-analysis GATE finding with target_stage=ENGINE triggers 1 repair (new hidden seed) and refuses 2nd
     rep_n = [0]
@@ -9982,7 +10148,8 @@ def _self_test_built_engine(ok, td: str) -> None:
        f"(visits={eb_visits}, repairs={(st30_end.engine_build or {}).get('repairs')}, "
        f"commits={len(commits_30)}, refused={refused_30})")
 
-    # BE31: committed hidden seed reused on resume; _amend_lock held in another thread refuses owner resume
+    # BE31: committed hidden seed reused on resume; missing seed file after commitment fails closed;
+    # _amend_lock held in another thread refuses concurrent owner resume
     d31, T31, st31 = _mk_run("be31_lock", signoff="owner")
     st31.state = "ENGINE_ADMIT"
     st31.engine_build = {"id": "cf_mod", "kind": "closed_form", "status": "building",
@@ -9991,6 +10158,12 @@ def _self_test_built_engine(ok, td: str) -> None:
     m31 = Machine(d31, T31, None, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
     sb1, cm1 = m31._ensure_hidden_seed("a" * 64)
     sb2, cm2 = m31._ensure_hidden_seed("a" * 64)
+    os.remove(os.path.join(d31, "engine_build", ".hidden", "seed.json"))
+    missing_seed_refused = False
+    try:
+        m31._ensure_hidden_seed("a" * 64)
+    except RuntimeError:
+        missing_seed_refused = True
     locked_ok = [False]
     ready_ev, release_ev = threading.Event(), threading.Event()
 
@@ -10010,11 +10183,12 @@ def _self_test_built_engine(ok, td: str) -> None:
     finally:
         release_ev.set()
         th.join(5.0)
-    ok(sb1 == sb2 and cm1 == cm2 and locked_ok[0],
-       f"BE31 committed hidden seed reused on resume and _amend_lock refuses concurrent owner resume "
-       f"(same_seed={sb1 == sb2}, locked={locked_ok[0]})")
+    ok(sb1 == sb2 and cm1 == cm2 and missing_seed_refused and locked_ok[0],
+       f"BE31 committed hidden seed reused on resume, missing seed fails closed, and _amend_lock refuses concurrent owner resume "
+       f"(same_seed={sb1 == sb2}, miss_ref={missing_seed_refused}, locked={locked_ok[0]})")
 
-    # BE33: pre-dispatch compute reservation pauses before BADM.admit; engine_build_cap pauses & resumes
+    # BE33: pre-dispatch compute reservation pauses before BADM.admit; interrupted build task charges lane budget;
+    # engine_build_cap pauses & resumes via run_v2(..., engine_build_usd=40.0)
     d33, T33, st33 = _mk_run("be33_budget", signoff="lead", budget=20.0)
     m33_prep = Machine(d33, T33, st33, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
     for _ in range(10):
@@ -10036,7 +10210,7 @@ def _self_test_built_engine(ok, td: str) -> None:
         s33_adm = Machine(d33, StubTasks(T33.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
     finally:
         BADM.admit = orig_admit
-    # Build-cap pause & resume via run_v2(..., engine_build_usd=40.0)
+    # Build-cap pause (including interrupted build task charging engine_build.spent_usd) & resume via engine_build_usd=40
     d33b, T33b, st33b = _mk_run("be33_bcap", signoff="lead", budget=100.0, engine_build_usd=1.0)
     m33b_prep = Machine(d33b, T33b, st33b, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
     for _ in range(10):
@@ -10044,20 +10218,24 @@ def _self_test_built_engine(ok, td: str) -> None:
             break
         m33b_prep.step()
     st33b = load_state(d33b)
-    st33b.engine_build["spent_usd"] = 0.80   # left $0.20 < $0.50 floor
+    st33b.journal["ENGINE_BUILD#0:interrupted"] = {
+        "task": "build_engine", "status": "started", "allowance_usd": 0.80, "build_budget": True, "readback_usd": 0.0,
+    }
     save_state(d33b, st33b)
     s33_bcap = Machine(d33b, StubTasks(T33b.s), None, backend=fast_b, log=lambda *a: None, cross_engine_check=False).run()
+    lane_charged = abs(float((load_state(d33b).engine_build or {}).get("spent_usd") or 0.0) - 0.80) < 1e-6
     # Raise build cap via run_v2 -> verify cap raised and build runs
     s33_res = run_v2("Which package per unit?", d33b, StubTasks(T33b.s), signoff="lead", budget_usd=100.0,
-                     engine_build_usd=40.0, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
+                     engine_build_usd=40.0, engine_unsandboxed=dev_un, backend=fast_b,
+                     log=lambda *a: None, cross_engine_check=False)
     st33b_end = load_state(d33b)
     ok(s33_adm == f"paused:{AWAITING_BUDGET}" and admit_calls[0] == 0
-       and s33_bcap == f"paused:{AWAITING_BUDGET}"
+       and lane_charged and s33_bcap == f"paused:{AWAITING_BUDGET}"
        and st33b_end.engine_build_cap_usd == 40.0
        and any(h.get("engine_build_cap_raised") for h in st33b_end.history)
        and not s33_res.startswith("paused:"),
        f"BE33 compute reservation pauses before BADM.admit (calls={admit_calls[0]}, {s33_adm}); "
-       f"engine_build_cap pauses ({s33_bcap}) and resumes via engine_build_usd=40 ({s33_res})")
+       f"interrupted build charges lane ({lane_charged}), engine_build_cap pauses ({s33_bcap}) and resumes ({s33_res})")
 
 
 def main(argv=None) -> int:

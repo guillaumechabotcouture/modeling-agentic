@@ -1405,8 +1405,9 @@ def main_v2(args, ident: dict | None = None) -> int:
     lock = contextlib.nullcontext()
     need_lock = args.resume and (
         "lead" in (args.signoff, st.signoff)
-        or st.state in ("ENGINE_BUILD", "ENGINE_ADMIT")
+        or st.state in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN")
         or bool(getattr(st, "engine_build", None))
+        or stage_machine.spec_has_engine_build(run_path)
     )
     if need_lock:
         # Codex r3 on #342 (P1-7) & #363 (BE31): lock is taken before anything is written (run_v2 holds it
@@ -1463,11 +1464,13 @@ def _main_v2_run(args, ident: dict, run_path: str, question: str) -> int:
     from agents import stage_machine, v2_sdk_tasks
     pipeline_id.stamp(run_path, ident)
     print(f"Run (v2): {run_path}", flush=True)
-    unsandboxed = getattr(args, "dev_unsandboxed_derivations", False)
-    tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud, unsandboxed_ok=unsandboxed)
+    derive_un = getattr(args, "dev_unsandboxed_derivations", False)
+    engine_un = getattr(args, "dev_unsandboxed_engine", False)
+    tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud, unsandboxed_ok=engine_un)
     status = run_v2_and_store(lambda: stage_machine.run_v2(
         question, run_path, tasks, max_rounds=args.max_rounds, signoff=args.signoff,
-        budget_usd=args.max_budget_usd, derive_unsandboxed=unsandboxed,
+        budget_usd=args.max_budget_usd, derive_unsandboxed=derive_un,
+        engine_unsandboxed=engine_un,
         engine_build_usd=getattr(args, "engine_build_usd", None)),
         run_path,
         store=_store_chain)
@@ -1525,6 +1528,10 @@ def main() -> int:
                         help="v2 development only: run the spec's data derivations without a sandbox where there is "
                              "none (macOS). The record says sandbox none and the run cannot be accepted "
                              "(docs/design/v2-derived-inputs.md).")
+    parser.add_argument("--dev-unsandboxed-engine", action="store_true",
+                        help="v2 development only: execute agent-built engine code without bubblewrap where there is "
+                             "no sandbox (macOS). Persists a HIGH non-declarable gate finding so the run cannot be "
+                             "accepted (docs/design/agent-built-engines.md §5.1).")
     args = parser.parse_args()
 
     if args.self_test:

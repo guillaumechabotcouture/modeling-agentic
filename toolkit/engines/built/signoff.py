@@ -104,7 +104,7 @@ def validate_engine_critique(path: str, round_n: int = 1) -> tuple[dict | None, 
     if isinstance(rn, bool) or not isinstance(rn, int) or rn != int(round_n):
         errs.append(f"round must be {int(round_n)} (got {rn!r})")
     verdict = doc.get("verdict")
-    if verdict not in _VALID_VERDICTS:
+    if not isinstance(verdict, str) or verdict not in _VALID_VERDICTS:
         errs.append(f"verdict must be one of {sorted(_VALID_VERDICTS)} (got {verdict!r})")
     blockers = doc.get("blockers")
     if not isinstance(blockers, list):
@@ -124,7 +124,7 @@ def validate_engine_critique(path: str, round_n: int = 1) -> tuple[dict | None, 
         else:
             seen_ids.add(bid)
         sev = b.get("severity")
-        if sev not in _VALID_SEVERITIES:
+        if not isinstance(sev, str) or sev not in _VALID_SEVERITIES:
             errs.append(f"blocker {bid}: severity must be one of {sorted(_VALID_SEVERITIES)}")
         for req_k in ("claim", "evidence", "fix_requires"):
             if not isinstance(b.get(req_k), str) or not str(b.get(req_k)).strip():
@@ -142,27 +142,43 @@ def validate_engine_critique(path: str, round_n: int = 1) -> tuple[dict | None, 
 
 def review_blocks_lead(run_dir: str) -> str | None:
     """Return a reason why `--by lead` cannot sign the admitted engine, or None when allowed.
-    `review_unavailable` or an unresolved HIGH finding in `critique_engine.yaml` blocks the lead (§2.2)."""
+    Fail closed: a missing, unreadable, or stale-snapshot `review_status.json`, `review_unavailable`,
+    or any unresolved HIGH finding in `critique_engine.yaml` blocks the lead (§2.2, §4.5)."""
+    adm, adm_err = _read_json_optional(run_dir, ADMISSION_REL)
+    if adm_err or not isinstance(adm, dict):
+        return f"admission record unreadable ({adm_err or 'missing'})"
+    snap_sha = adm.get("snapshot_sha256")
     rst, err = _read_json_optional(run_dir, REVIEW_STATUS_REL)
     if err:
         return f"engine review status unreadable ({err})"
-    if isinstance(rst, dict):
-        if rst.get("review_unavailable"):
-            return "engine review is unavailable (blocks lead signature; owner review required)"
-        if int(rst.get("high_count") or 0) > 0:
-            return f"engine review has {rst.get('high_count')} unresolved HIGH finding(s) (blocks lead signature)"
+    if not isinstance(rst, dict):
+        return "engine review status is missing (critique-engine must complete before lead sign-off)"
+    if not isinstance(snap_sha, str) or rst.get("snapshot_sha256") != snap_sha:
+        return "engine review status does not match current admitted snapshot (re-review required before lead sign-off)"
+    if rst.get("review_unavailable"):
+        return "engine review is unavailable (blocks lead signature; owner review required)"
+    if int(rst.get("high_count") or 0) > 0:
+        return f"engine review has {rst.get('high_count')} unresolved HIGH finding(s) (blocks lead signature)"
     return None
 
 
 def _verify_admitted_evidence(run_dir: str) -> tuple[dict, bytes, bytes, dict[str, str]]:
     """Read and verify admission.json, admission_sheet.md, snapshot, bench/*, and optional reference digests."""
     adm_bytes = _read_single(run_dir, ADMISSION_REL)
+    adm_sha = _sha256_bytes(adm_bytes)
     try:
         adm = json.loads(adm_bytes.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as e:
         raise ValueError(f"{ADMISSION_REL} invalid JSON: {e}") from None
     if not isinstance(adm, dict) or adm.get("status") != "admitted":
         raise ValueError(f"built engine is not admitted (status={adm.get('status') if isinstance(adm, dict) else None!r})")
+    rs, rs_err = _read_json_optional(run_dir, "run_state.json")
+    if rs_err:
+        raise ValueError(f"run_state.json unreadable: {rs_err}")
+    if isinstance(rs, dict) and isinstance(rs.get("engine_build"), dict):
+        rec_adm_sha = rs["engine_build"].get("admission_sha256")
+        if isinstance(rec_adm_sha, str) and len(rec_adm_sha) == 64 and rec_adm_sha != adm_sha:
+            raise ValueError("admission.json changed since ENGINE_ADMIT recorded its digest in run_state.json")
     snap_sha = adm.get("snapshot_sha256")
     if not isinstance(snap_sha, str) or len(snap_sha) != 64:
         raise ValueError(f"{ADMISSION_REL} missing valid snapshot_sha256")
@@ -175,7 +191,7 @@ def _verify_admitted_evidence(run_dir: str) -> tuple[dict, bytes, bytes, dict[st
     sheet_bytes = _read_single(run_dir, SHEET_REL)
     adm_digests = adm.get("digests") if isinstance(adm.get("digests"), Mapping) else {}
     bound: dict[str, str] = {
-        "admission.json": _sha256_bytes(adm_bytes),
+        "admission.json": adm_sha,
         "admission_sheet.md": _sha256_bytes(sheet_bytes),
         "snapshot": snap_sha,
     }
@@ -229,6 +245,8 @@ def status(run_dir: str) -> str:
         for k, v in bound.items():
             if recorded.get(k) != v:
                 return "changed"
+        if so.get("by") == "lead" and review_blocks_lead(run_dir):
+            return "changed"
         return "signed"
 
     dec, dec_err = _read_json_optional(run_dir, DECLINE_REL)
@@ -305,6 +323,11 @@ def decline(run_dir: str, by: str, *, note: str) -> dict:
     """Decline an admitted agent-built engine with a required explanation note."""
     if by not in ("owner", "lead"):
         raise ValueError(f"--by must be 'owner' or 'lead' (got {by!r})")
+    mode = _run_signoff_mode(run_dir)
+    if mode not in BADAPT.ALLOWED_RUN_MODES:
+        raise ValueError(f"cannot decline built engine in run with signoff mode {mode!r}")
+    if mode == "owner" and by != "owner":
+        raise ValueError("owner-mode run requires --by owner (lead decline refused)")
     if not isinstance(note, str) or not note.strip():
         raise ValueError("decline requires a non-empty --note explaining what is missing")
     if os.path.lexists(os.path.join(run_dir, SIGNOFF_REL)):
@@ -362,13 +385,19 @@ def _self_test() -> int:
         SIO.remove_nofollow(d, SIGNOFF_REL, missing_ok=True)
         ok(status(d) == "awaiting", f"BSIG2 admitted unsigned run is awaiting ({status(d)})")
 
-        # Owner-mode run refuses lead signature
+        # Owner-mode run refuses lead signature and lead decline
         try:
             sign(d, "lead")
             lead_blocked = False
         except ValueError:
             lead_blocked = True
-        ok(lead_blocked and status(d) == "awaiting", "BSIG3 owner-mode run refuses --by lead")
+        try:
+            decline(d, "lead", note="lead trying to decline owner run")
+            lead_decl_blocked = False
+        except ValueError:
+            lead_decl_blocked = True
+        ok(lead_blocked and lead_decl_blocked and status(d) == "awaiting",
+           "BSIG3 owner-mode run refuses --by lead for both sign and decline")
 
         # Decline with note transitions status -> declined; empty note refused
         try:
@@ -392,23 +421,43 @@ def _self_test() -> int:
         ok(status(d) == "changed", f"BSIG6 tampered bench/results.yaml turns status changed ({status(d)})")
 
     with tempfile.TemporaryDirectory() as d2:
-        BADAPT._self_test_fixture(d2, py_src=b"class Model:\n    pass\n", sign_by="lead", run_mode="lead")
+        info2 = BADAPT._self_test_fixture(d2, py_src=b"class Model:\n    pass\n", sign_by="lead", run_mode="lead")
         SIO.remove_nofollow(d2, SIGNOFF_REL, missing_ok=True)
-        SIO.write_nofollow(d2, REVIEW_STATUS_REL, json.dumps({"review_unavailable": True}).encode("utf-8"), atomic=True)
+        # Missing review_status.json blocks lead (fail closed)
+        try:
+            sign(d2, "lead")
+            missing_rev_blocked = False
+        except ValueError:
+            missing_rev_blocked = True
+        SIO.write_nofollow(d2, REVIEW_STATUS_REL,
+                           json.dumps({"snapshot_sha256": info2["snapshot_sha256"], "review_unavailable": True}).encode("utf-8"),
+                           atomic=True)
         try:
             sign(d2, "lead")
             unavail_blocked = False
         except ValueError:
             unavail_blocked = True
-        SIO.write_nofollow(d2, REVIEW_STATUS_REL, json.dumps({"review_unavailable": False, "high_count": 0}).encode("utf-8"),
+        # Stale snapshot in review_status.json blocks lead
+        SIO.write_nofollow(d2, REVIEW_STATUS_REL,
+                           json.dumps({"snapshot_sha256": "0" * 64, "review_unavailable": False, "high_count": 0}).encode("utf-8"),
+                           atomic=True)
+        try:
+            sign(d2, "lead")
+            stale_rev_blocked = False
+        except ValueError:
+            stale_rev_blocked = True
+        SIO.write_nofollow(d2, REVIEW_STATUS_REL,
+                           json.dumps({"snapshot_sha256": info2["snapshot_sha256"],
+                                       "review_unavailable": False, "high_count": 0}).encode("utf-8"),
                            atomic=True)
         rec_l = sign(d2, "lead", note="provisional")
         disc_l = "".join(report_disclaimer_lines(d2))
-        ok(unavail_blocked and rec_l["by"] == "lead" and rec_l["provisional"] is True
+        ok(missing_rev_blocked and unavail_blocked and stale_rev_blocked
+           and rec_l["by"] == "lead" and rec_l["provisional"] is True
            and "lead-signed, provisional" in disc_l,
-           "BSIG7 review_unavailable blocks lead sign; once clear, lead signs provisionally with disclaimer")
+           "BSIG7 missing/unavailable/stale review_status blocks lead sign; once clear for snapshot, lead signs provisionally")
 
-    # Engine critique YAML validator
+    # Engine critique YAML validator (including unhashable list-valued verdict/severity)
     with tempfile.TemporaryDirectory() as d3:
         import yaml
         good_c = {
@@ -420,13 +469,13 @@ def _self_test() -> int:
         p_c = os.path.join(d3, REVIEW_FILE)
         SIO.write_nofollow(d3, REVIEW_FILE, yaml.safe_dump(good_c).encode("utf-8"), atomic=True)
         doc_ok, errs_ok = validate_engine_critique(p_c, 1)
-        bad_c = {"reviewer": "wrong", "round": 1, "verdict": "PASS",
-                 "blockers": [{"id": "X-1", "severity": "HIGH", "claim": "c", "evidence": "e",
+        bad_c = {"reviewer": "wrong", "round": 1, "verdict": [],
+                 "blockers": [{"id": "E-001", "severity": [], "claim": "c", "evidence": "e",
                                "fix_requires": "f", "resolved": False}]}
         SIO.write_nofollow(d3, REVIEW_FILE, yaml.safe_dump(bad_c).encode("utf-8"), atomic=True)
         doc_bad, errs_bad = validate_engine_critique(p_c, 1)
         ok(doc_ok is not None and not errs_ok and doc_bad is None and len(errs_bad) >= 3,
-           f"BSIG8 validate_engine_critique accepts valid review and catches malformed fields ({errs_bad[:3]})")
+           f"BSIG8 validate_engine_critique accepts valid review and catches malformed/unhashable fields ({errs_bad[:3]})")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

@@ -814,6 +814,31 @@ def checklist_text(run_dir: str, reviewer: str, repair: bool = False) -> tuple[s
     return "\n\n" + CL.prompt_block(), ("\n\n" + data) if data else ""
 
 
+def _default_engine_config(run_dir: str) -> dict:
+    """Resolve `request.configs.default` from `engine_build/request.json` or `decision_spec.yaml` so
+    `mcp__engine__try` and `mcp__engine__run` evaluate the exact default config used by admission."""
+    try:
+        raw, st = _sio().read_nofollow(run_dir, "engine_build/request.json")
+        if st.st_nlink == 1:
+            req_doc = json.loads(raw.decode("utf-8"))
+            cfg = ((req_doc.get("build") or {}).get("request") or {}).get("configs", {}).get("default")
+            if isinstance(cfg, dict):
+                return dict(cfg)
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        import yaml
+        raw, st = _sio().read_nofollow(run_dir, "decision_spec.yaml")
+        if st.st_nlink == 1:
+            spec = yaml.safe_load(raw.decode("utf-8")) or {}
+            cfg = (((spec.get("engine") or {}).get("build") or {}).get("request") or {}).get("configs", {}).get("default")
+            if isinstance(cfg, dict):
+                return dict(cfg)
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
 def _make_engine_mcp_server(run_dir: str, *, unsandboxed_ok: bool = False):
     """In-process MCP server exposing `mcp__engine__try` and `mcp__engine__run` ONLY for `build_engine`
     (docs/design/agent-built-engines.md §3.1 & §3.3)."""
@@ -829,7 +854,8 @@ def _make_engine_mcp_server(run_dir: str, *, unsandboxed_ok: bool = False):
     async def _try_fn(args):
         checks = args.get("checks", "all") if isinstance(args, dict) else "all"
         try:
-            res = BTRY.engine_try(run_dir, checks=checks, unsandboxed_ok=unsandboxed_ok)
+            res = BTRY.engine_try(run_dir, checks=checks, config=_default_engine_config(run_dir),
+                                  unsandboxed_ok=unsandboxed_ok)
             return {"content": [{"type": "text", "text": json.dumps(res, sort_keys=True, default=str)}]}
         except Exception as e:  # noqa: BLE001 -- structured tool error back to build agent
             return {"content": [{"type": "text", "text": json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})}],
@@ -861,6 +887,7 @@ def _make_engine_mcp_server(run_dir: str, *, unsandboxed_ok: bool = False):
                 params=a.get("params") or {},
                 horizon=a.get("horizon") or {},
                 seed=int(a.get("seed", 1)),
+                config=_default_engine_config(run_dir),
                 unsandboxed_ok=unsandboxed_ok,
             )
             return {"content": [{"type": "text", "text": json.dumps(res, sort_keys=True, default=str)}]}
