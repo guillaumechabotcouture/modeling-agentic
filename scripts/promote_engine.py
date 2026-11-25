@@ -591,7 +591,7 @@ def promote(
 
 
 def _self_test() -> int:
-    import importlib.util
+    import importlib
     import tempfile
     import yaml
     from toolkit.engines import contract as _C
@@ -642,7 +642,7 @@ def _self_test() -> int:
             "unit_attributes": {
                 "N": {"type": "continuous", "range": [100.0, 10000.0]},
                 "rate_in": {"type": "continuous", "range": [0.01, 0.5]},
-                "age_pop": {"type": "vector", "len": 2, "test_range": [10.0, 100.0]},
+                "age_pop": {"type": "vector", "length": 2, "test_range": [10.0, 100.0]},
             },
             "outputs": {"per_capita": ["cases"], "windows": {"w0": ["prev"]}, "cost_drivers": ["units_delivered"]},
             "age_groups": ["young", "old"],
@@ -837,7 +837,7 @@ def _self_test() -> int:
         ss_code = _render_promoted_engine_py(
             "ss_demo",
             {"engine.py": ss_src, "card.yaml": b"name: built:ss_demo\n", "ENGINE_NOTES.md": b"# n\n"},
-            {"id": "ss_demo", "kind": "starsim_module", "request": req_decl["request"]},
+            {"id": "ss_demo", "kind": "starsim_module", "request": dict(req_decl["request"], configs={})},
         )
         ss_root = os.path.join(td, "ss_out")
         os.makedirs(os.path.join(ss_root, "ss_demo"), exist_ok=True)
