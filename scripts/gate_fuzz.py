@@ -440,12 +440,24 @@ def _fkey(f) -> str:
 
 
 class _Recorder:
-    """Patch open() to record run files opened for reading and for writing."""
+    """Patch open() and lib.safe_io.read_nofollow() to record run files opened for reading and for writing."""
 
     def __init__(self, run_dir: str):
         self.root = os.path.realpath(run_dir)
         self.reads, self.writes = set(), set()
         self._orig = builtins.open
+        self._sio_mod = None
+        self._orig_rnf = None
+
+    def _record_path(self, path_str: str, is_write: bool = False) -> None:
+        try:
+            p = os.path.abspath(path_str)
+            p = os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
+            if p.startswith(self.root + os.sep):
+                rel = os.path.relpath(p, self.root)
+                (self.writes if is_write else self.reads).add(rel)
+        except (TypeError, ValueError):
+            pass
 
     def __enter__(self):
         orig = self._orig
@@ -454,22 +466,35 @@ class _Recorder:
             fh = orig(file, mode, *a, **k)
             try:
                 if not isinstance(file, int):
-                    p = os.path.abspath(os.fspath(file))
-                    p = os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
-                    if p.startswith(self.root + os.sep):
-                        rel = os.path.relpath(p, self.root)
-                        (self.writes if any(c in mode for c in "wax+") else self.reads).add(rel)
+                    self._record_path(os.fspath(file), is_write=any(c in mode for c in "wax+"))
             except TypeError:
                 pass
             return fh
 
         builtins.open = rec_open
         io.open = rec_open
+        try:
+            from lib import safe_io as _sio
+            self._sio_mod = _sio
+            self._orig_rnf = _sio.read_nofollow
+            orig_rnf = self._orig_rnf
+
+            def rec_rnf(base, rel, *a, **k):
+                if isinstance(base, str) and isinstance(rel, str):
+                    self._record_path(os.path.join(base, rel), is_write=False)
+                return orig_rnf(base, rel, *a, **k)
+
+            _sio.read_nofollow = rec_rnf
+        except Exception:  # noqa: BLE001
+            self._sio_mod = None
+            self._orig_rnf = None
         return self
 
     def __exit__(self, *exc):
         builtins.open = self._orig
         io.open = self._orig
+        if self._sio_mod is not None and self._orig_rnf is not None:
+            self._sio_mod.read_nofollow = self._orig_rnf
         return False
 
 
@@ -703,6 +728,59 @@ def _supplement(run_dir: str, round_n: int) -> None:
         json.dumps({"round": r, "post_write": False, "at": f"2026-01-0{r}T00:00:00+00:00",
                     "findings": [{"kind": "plan_minimum_bar_failed", "severity": "MEDIUM", "stage": "PLAN_CRITERIA",
                                   "key": "MB-001"}]}) + "\n" for r in range(1, max(2, round_n))))
+    # PR epsilon of #363 (§6.4): populate a clean admitted+signed engine_build/ fixture (without touching
+    # decision_spec.yaml, run_state.json, or models/) so `built_engine_gate` is fuzzed across malformed
+    # admission.json, snapshot manifests (<sha>.json), and signoff.json.
+    if not os.path.exists(os.path.join(run_dir, "engine_build")):
+        import hashlib as _hl
+        if ROOT not in sys.path:
+            sys.path.insert(0, ROOT)
+        from toolkit.engines.built import snapshot as _bsnap
+        _snap_files = {
+            "engine.py": b"class Model:\n    pass\n",
+            "card.yaml": b"name: built:fuzz_mod\nversion: '0.1'\nmechanisms: [m]\n",
+            "ENGINE_NOTES.md": b"# fuzz fixture\n",
+        }
+        _fhashes = {k: _hl.sha256(v).hexdigest() for k, v in sorted(_snap_files.items())}
+        _sha = _bsnap.snapshot_digest(_fhashes)
+        for _fn, _raw in sorted(_snap_files.items()):
+            w(f"engine_build/snapshots/{_sha}/{_fn}", _raw.decode("utf-8"))
+        _man = {
+            "snapshot_sha256": _sha,
+            "files": [{"name": k, "sha256": _fhashes[k], "size": len(_snap_files[k])} for k in sorted(_snap_files)],
+        }
+        w(f"engine_build/snapshots/{_sha}.json", json.dumps(_man, indent=1, sort_keys=True))
+        _bench = {
+            "bench/pack.yaml": "benchmarks: []\n",
+            "bench/results.yaml": "benchmarks: []\n",
+            "bench/benchmark_coverage.yaml": "engine: built:fuzz_mod\nbenchmarks: {}\n",
+        }
+        _digests = {}
+        for _rel, _txt in _bench.items():
+            w(f"engine_build/{_rel}", _txt)
+            _digests[_rel] = _hl.sha256(_txt.encode("utf-8")).hexdigest()
+        _sheet = "# Admission sheet\n"
+        w("engine_build/admission_sheet.md", _sheet)
+        _adm = {
+            "status": "admitted",
+            "engine_id": "fuzz_mod",
+            "snapshot_sha256": _sha,
+            "checks": {"A1": {"status": "pass", "passed": 1, "total": 1}},
+            "digests": _digests,
+        }
+        _adm_txt = json.dumps(_adm, indent=1, sort_keys=True)
+        w("engine_build/admission.json", _adm_txt)
+        _so = {
+            "by": "owner",
+            "snapshot_sha256": _sha,
+            "sha256": {
+                "admission.json": _hl.sha256(_adm_txt.encode("utf-8")).hexdigest(),
+                "admission_sheet.md": _hl.sha256(_sheet.encode("utf-8")).hexdigest(),
+                "snapshot": _sha,
+                **_digests,
+            },
+        }
+        w("engine_build/signoff.json", json.dumps(_so, indent=1, sort_keys=True))
 
 
 def sweep(scripts_dir: str = HERE, modules=None, base: str | None = None, round_n: int = FIXTURE_ROUND,

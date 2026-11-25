@@ -48,6 +48,7 @@ class Tasks(Protocol):
     def draft_evidence(self, run_dir: str, rel: str, required: dict, feedback: list) -> TaskResult: ...
     def pick_engine(self, spec: dict, eligible: list[dict], rethink: dict | None = None) -> TaskResult: ...
     def build_engine(self, run_dir: str, packet: dict, engine_id: str) -> TaskResult: ...
+    def build_reference(self, run_dir: str, packet: dict, engine_id: str) -> TaskResult: ...
     def critique_engine(self, run_dir: str, round_n: int, feedback: list | None = None) -> TaskResult: ...
     def critique(self, run_dir: str, reviewer: str, round_n: int, feedback: list | None = None) -> TaskResult: ...
     def plan_fixes(self, packet: dict) -> TaskResult: ...
@@ -170,6 +171,18 @@ class StubTasks:
         if files is False:
             return self._r(f"build_engine:{engine_id}", False, note="stub build failed")
         return self._r(f"build_engine:{engine_id}", output={"ok": True, "notes": "stub build (no files written)"})
+
+    def build_reference(self, run_dir, packet, engine_id):
+        """script['build_reference']: callable(run_dir, packet, engine_id) -> bytes|str|False|None, or bytes|str|False."""
+        br = self.s.get("build_reference")
+        content = br(run_dir, packet, engine_id) if callable(br) else br
+        if content is False:
+            return self._r(f"build_reference:{engine_id}", False, note="stub reference build failed")
+        if isinstance(content, (bytes, str)):
+            raw = content if isinstance(content, bytes) else content.encode("utf-8")
+            _sio().write_nofollow(run_dir, "engine_build/reference/reference.py", raw, atomic=True)
+            return self._r(f"build_reference:{engine_id}", output={"ok": True, "notes": "stub reference"})
+        return self._r(f"build_reference:{engine_id}", False, note="no reference scripted")
 
     def critique_engine(self, run_dir, round_n, feedback=None):
         """script['critique_engine']: callable(run_dir, round_n, feedback) -> dict | str | None, or dict/str."""

@@ -192,7 +192,56 @@ def run_eval(seeds=SEEDS) -> dict:
                 out["detected"][key] = _kind_hit(d["class"], kinds)
                 truth_all.append((key, d))
         out["spurious"] = sorted(k for k, d in truth_all if _kind_hit(d["class"], clean_kinds))
+    # PR epsilon of #363 (§6.4): deterministic built-engine planted-defect tripwires (BE2, BE8, BE10)
+    for key, cls, caught in _run_built_engine_defects():
+        out["planted"][key] = cls
+        out["detected"][key] = caught
     return out
+
+
+def _run_built_engine_defects() -> list[tuple[str, str, bool]]:
+    """Deterministic planted-defect tripwires BE2 (dead parameter -> A6), BE8 (closed-conservation
+    population growth -> A5), and BE10 (public lookup table -> S4 + hidden A4)."""
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    import numpy as np
+    from toolkit.engines.built import admission as BADM
+    from toolkit.engines.built import candidate as BCAND
+    from toolkit.engines.built import fixtures as BFIX
+    from toolkit.engines.built import snapshot as BSNAP
+    from toolkit.engines.built import worker as BWORK
+    from toolkit.engines.contract import Package
+
+    dev_un = BWORK.engine_sandbox_kind() is None
+    th = BADM.load_thresholds()
+    b = BFIX.two_group_sir_build()
+    sp = BFIX.two_group_sir_spec(b)
+    hor = BADM._default_horizon(sp, b["request"])
+    units = BADM.generate_domain_units(b["request"], 1, np.random.default_rng(7))
+    pkgs = [Package("none", {"comp_a": 0}), Package("a", {"comp_a": 1})]
+
+    # BE2: dead parameter p_sev caught by A6
+    c2 = BCAND.CandidateEngine(BFIX.two_group_sir_files("dead_param"), b, unsandboxed_ok=dev_un)
+    a6_2, _ = BADM.check_a6_a7(c2, b, sp, np.random.default_rng(11), n_bases=1, min_moving=1, th=th)
+    be2_ok = a6_2.get("status") == "fail" and any("p_sev" in str(p) for p in a6_2.get("problems") or [])
+
+    # BE8: 0.1%/step population growth under conservation=closed caught by A5
+    c8 = BCAND.CandidateEngine(BFIX.two_group_sir_files("mass_growth"), b, unsandboxed_ok=dev_un)
+    a5_8 = BADM.check_a5(c8, b, units, pkgs, hor, th=th)
+    be8_ok = a5_8.get("status") == "fail" and any("conservation" in str(p) for p in a5_8.get("problems") or [])
+
+    # BE10: public lookup table caught by S4 static audit and hidden A4 (n_free=3 matches admission.py)
+    f10 = BFIX.two_group_sir_files("public_table")
+    s4_probs = BSNAP.check_static(f10, request=b)
+    c10 = BCAND.CandidateEngine(f10, b, unsandboxed_ok=dev_un)
+    hid_a4 = BADM.check_a4(c10, b, sp, np.random.default_rng(19), n_free=3, th=th)
+    be10_ok = any("S4:" in p for p in s4_probs) and hid_a4.get("status") == "fail"
+
+    return [
+        ("built_engine:BE2", "built_dead_param", bool(be2_ok)),
+        ("built_engine:BE8", "built_mass_growth", bool(be8_ok)),
+        ("built_engine:BE10", "built_public_table", bool(be10_ok)),
+    ]
 
 
 def compare(res: dict, base: dict) -> list[str]:

@@ -46,6 +46,8 @@ ALLOWED_TOP_IMPORTS = frozenset({
 ALLOWED_QUALIFIED_IMPORTS = frozenset({
     "scipy.special", "scipy.stats", "toolkit.engines.contract", "toolkit.engines.hooks",
 })
+# §4.4 & §7 Q10: independent A11 reference may additionally use scipy.integrate (never allowed for engines).
+REFERENCE_ALLOWED_QUALIFIED = ALLOWED_QUALIFIED_IMPORTS | frozenset({"scipy.integrate"})
 
 # S3: banned names, dynamic reflection, and library file/serialization helpers (§3.2 & §4.1).
 BANNED_NAMES = frozenset({
@@ -132,7 +134,7 @@ def _count_num_literals(node: ast.AST) -> int:
     return 0
 
 
-def _import_allowed(mod: str, siblings: set[str]) -> bool:
+def _import_allowed(mod: str, siblings: set[str], *, allow_scipy_integrate: bool = False) -> bool:
     if not mod:
         return False
     if mod in siblings:
@@ -140,7 +142,8 @@ def _import_allowed(mod: str, siblings: set[str]) -> bool:
     top = mod.split(".", 1)[0]
     if top in ALLOWED_TOP_IMPORTS:
         return True
-    for q in ALLOWED_QUALIFIED_IMPORTS:
+    qual = REFERENCE_ALLOWED_QUALIFIED if allow_scipy_integrate else ALLOWED_QUALIFIED_IMPORTS
+    for q in qual:
         if mod == q or mod.startswith(q + "."):
             return True
     return False
@@ -181,7 +184,8 @@ def _card_tables_ok(card_doc, request: Mapping | None = None) -> tuple[int, list
     return valid, bad
 
 
-def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None) -> list[str]:
+def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None,
+                 allow_scipy_integrate: bool = False) -> list[str]:
     """Run static checks S1-S4 over `{filename: bytes}` (fail closed). Returns list of problems."""
     import yaml
     bad: list[str] = []
@@ -265,7 +269,7 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None) 
             # S2: imports
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if not _import_allowed(alias.name, siblings):
+                    if not _import_allowed(alias.name, siblings, allow_scipy_integrate=allow_scipy_integrate):
                         bad.append(f"S2: {name}:{node.lineno}: import {alias.name!r} is not in the allowlist")
             elif isinstance(node, ast.ImportFrom):
                 if node.level > 1:
@@ -281,9 +285,9 @@ def check_static(files: Mapping[str, bytes], *, request: Mapping | None = None) 
                     if mod == "scipy":
                         for alias in node.names:
                             full = f"scipy.{alias.name}"
-                            if not _import_allowed(full, siblings):
+                            if not _import_allowed(full, siblings, allow_scipy_integrate=allow_scipy_integrate):
                                 bad.append(f"S2: {name}:{node.lineno}: from scipy import {alias.name!r} is not allowed")
-                    elif not _import_allowed(mod, siblings):
+                    elif not _import_allowed(mod, siblings, allow_scipy_integrate=allow_scipy_integrate):
                         bad.append(f"S2: {name}:{node.lineno}: from {mod!r} import ... is not in the allowlist")
                     else:
                         for alias in node.names:
@@ -369,14 +373,33 @@ def read_working_copy(working_dir: str) -> dict[str, bytes]:
 
 
 def create_snapshot(working_dir: str, snapshots_dir: str, *, run_static: bool = True,
-                    request: Mapping | None = None) -> dict:
+                    request: Mapping | None = None, allow_scipy_integrate: bool = False) -> dict:
     """Create an immutable content-addressed snapshot under `snapshots_dir/<sha>/` and manifest
     `snapshots_dir/<sha>.json`. The working copy stays writable. Returns manifest dict."""
     files = read_working_copy(working_dir)
     if run_static:
-        probs = check_static(files, request=request)
+        probs = check_static(files, request=request, allow_scipy_integrate=allow_scipy_integrate)
         if probs:
             raise SnapshotError("static checks failed: " + "; ".join(probs[:6]))
+    return _publish_snapshot_files(files, snapshots_dir)
+
+
+def create_reference_snapshot(ref_py_bytes: bytes, snapshots_dir: str, *,
+                              request: Mapping | None = None) -> dict:
+    """Validate and snapshot an independent A11 reference implementation (`reference.py`, §4.4)
+    into content-addressed read-only `snapshots_dir/<sha>/`, allowing `scipy.integrate`."""
+    files = {
+        "engine.py": bytes(ref_py_bytes),
+        "card.yaml": b"name: built_reference\nkind: reference\nbenchmarks: []\n",
+        "ENGINE_NOTES.md": b"# Independent reference implementation\n",
+    }
+    probs = check_static(files, request=request, allow_scipy_integrate=True)
+    if probs:
+        raise SnapshotError("reference static checks failed: " + "; ".join(probs[:6]))
+    return _publish_snapshot_files(files, snapshots_dir)
+
+
+def _publish_snapshot_files(files: Mapping[str, bytes], snapshots_dir: str) -> dict:
     file_hashes = {name: _sha256_bytes(data) for name, data in sorted(files.items())}
     sha = snapshot_digest(file_hashes)
     manifest = {
@@ -688,6 +711,21 @@ def _self_test() -> int:
         )
         empty_probs = verify_engine_snapshot(run_d)
         ok(bool(empty_probs), f"BE19g verify_engine_snapshot fails closed on missing bound digests ({empty_probs[:2]})")
+        # BSNAP_REF1 (§4.4, §7 Q10): scipy.integrate refused for engines, allowed for A11 reference snapshots
+        ref_src = (
+            "from scipy.integrate import solve_ivp\n"
+            "import numpy as np\n"
+            "class Model:\n"
+            "    def evaluate(self, params, unit, package, horizon):\n"
+            "        return solve_ivp(lambda t, y: -0.1 * y, [0.0, 1.0], [1.0])\n"
+        ).encode("utf-8")
+        eng_blocked = bool(check_static({**base_files, "engine.py": ref_src}, allow_scipy_integrate=False))
+        ref_snaps = os.path.join(td, "ref_snaps")
+        ref_man = create_reference_snapshot(ref_src, ref_snaps)
+        ref_ver = read_verified_snapshot(ref_snaps, ref_man["snapshot_sha256"])
+        ok(eng_blocked and ref_ver["engine.py"] == ref_src,
+           "BSNAP_REF1 scipy.integrate refused for built engines but allowed and snapshotted for A11 references")
+        os.chmod(os.path.join(ref_snaps, ref_man["snapshot_sha256"]), 0o755)
         os.chmod(os.path.join(snaps, sha), 0o755)
         os.chmod(os.path.join(run_d, "engine_build", "snapshots", man3["snapshot_sha256"]), 0o755)
 

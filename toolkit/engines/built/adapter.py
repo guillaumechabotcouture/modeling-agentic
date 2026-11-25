@@ -391,6 +391,7 @@ def _self_test_fixture(d: str, *, py_src: bytes, sign_by: str = "lead", spec_sig
         "request_sha256": BREQ.request_sha256(b),
         "snapshot_sha256": snap_sha,
         "config_sha256": effective_config_sha256(config or {}),
+        "checks": {"A1": {"status": "pass", "passed": 1, "total": 1}},
         "digests": digests,
     }
     adm_bytes = json.dumps(adm, indent=1, sort_keys=True).encode("utf-8")

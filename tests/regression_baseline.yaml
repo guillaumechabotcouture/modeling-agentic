@@ -1,6 +1,9 @@
 # Written by `python3 scripts/regression_eval.py --update-baseline`.
 # A detected: true entry may only flip to false with a stated reason in the PR.
 detected:
+  built_engine:BE10: true
+  built_engine:BE2: true
+  built_engine:BE8: true
   s11:budget_overspend:column cost: true
   s11:ci_inverted:cost_per_child.ci_low: false
   s11:ledger_mismatch:claims[dalys_det].value: true

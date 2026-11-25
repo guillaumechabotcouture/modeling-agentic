@@ -1479,8 +1479,9 @@ def check_a11(cand: BCAND.CandidateEngine, ref_cand: BCAND.CandidateEngine | Non
         status = "inconclusive" if inconclusive and not any("ref mismatch" in p for p in probs) else "fail"
     else:
         status = "pass"
+    comp_sha = _sha256_json(rows)
     return {"id": "A11", "status": status, "passed": n_pass, "total": n_total,
-            "problems": probs[:12], "rows": rows[:12]}
+            "problems": probs[:12], "rows": rows[:12], "comparison_sha256": comp_sha}
 
 
 # --------------------------------------------------------------------------- Public checks (try tool & overfit baseline)
@@ -1595,11 +1596,61 @@ def _is_sha64(x) -> bool:
     return isinstance(x, str) and len(x) == 64 and all(c in "0123456789abcdef" for c in x)
 
 
+def _publish_verified_snapshot(target_snaps: str, snap_sha: str, verified_files: Mapping[str, bytes]) -> None:
+    """Idempotently publish a verified immutable content-addressed snapshot (`0444` files, `0555` dir,
+    and `<sha>.json` manifest) under `target_snaps`, verifying with `BSNAP.read_verified_snapshot`."""
+    os.makedirs(target_snaps, exist_ok=True)
+    already_ok = False
+    try:
+        existing = BSNAP.read_verified_snapshot(target_snaps, snap_sha)
+        already_ok = existing == dict(verified_files)
+    except BSNAP.SnapshotError:
+        already_ok = False
+    if already_ok:
+        return
+    snap_dir = os.path.join(target_snaps, snap_sha)
+    if os.path.isdir(snap_dir) and not os.path.islink(snap_dir):
+        dfd0 = SIO.dir_fd_nofollow(target_snaps, [snap_sha])
+        try:
+            os.fchmod(dfd0, 0o755)
+        finally:
+            os.close(dfd0)
+        for fn in sorted(os.listdir(snap_dir)):
+            fp = os.path.join(snap_dir, fn)
+            if os.path.isfile(fp) and not os.path.islink(fp):
+                ffd = SIO.open_nofollow(target_snaps, f"{snap_sha}/{fn}")
+                try:
+                    os.fchmod(ffd, 0o644)
+                finally:
+                    os.close(ffd)
+            SIO.remove_nofollow(target_snaps, f"{snap_sha}/{fn}", missing_ok=True)
+    for name in sorted(verified_files):
+        raw = bytes(verified_files[name])
+        SIO.write_nofollow(target_snaps, f"{snap_sha}/{name}", raw, atomic=True)
+        fd = SIO.open_nofollow(target_snaps, f"{snap_sha}/{name}")
+        try:
+            os.fchmod(fd, 0o444)
+        finally:
+            os.close(fd)
+    dfd = SIO.dir_fd_nofollow(target_snaps, [snap_sha])
+    try:
+        os.fchmod(dfd, 0o555)
+    finally:
+        os.close(dfd)
+    man = {
+        "snapshot_sha256": snap_sha,
+        "files": [{"name": n, "sha256": _sha256_bytes(bytes(verified_files[n])), "size": len(verified_files[n])}
+                  for n in sorted(verified_files)],
+    }
+    SIO.write_nofollow(target_snaps, f"{snap_sha}.json", json.dumps(man, indent=1, sort_keys=True).encode("utf-8"), atomic=True)
+    BSNAP.read_verified_snapshot(target_snaps, snap_sha)
+
+
 def try_reuse_admission(prior_run_dir: str, target_run_dir: str, expected_reuse_key: str) -> dict | None:
     """Reuse a prior run's admission when `reuse_key` matches, the prior run is sandboxed, and
-    every mandatory snapshot + bench artifact verifies (BE32). Never copies `signoff.json`
-    (the owner signs the engine again for the new run, §5.4). Idempotent over an existing immutable
-    target snapshot."""
+    every mandatory snapshot, optional reference snapshot, and bench artifact verifies (BE32). Never
+    copies `signoff.json` (the owner signs the engine again for the new run, §5.4). Idempotent over
+    existing immutable target snapshots."""
     # Refuse reuse of any unsandboxed development run so unsandboxed.json can never be washed away
     if os.path.lexists(os.path.join(prior_run_dir, "engine_build", "unsandboxed.json")):
         return None
@@ -1629,8 +1680,23 @@ def try_reuse_admission(prior_run_dir: str, target_run_dir: str, expected_reuse_
             return None
     if os.path.lexists(os.path.join(prior_run_dir, "engine_build", "bench", "fitted.yaml")) and "bench/fitted.yaml" not in digests:
         return None
+    verified_ref_files: dict[str, bytes] | None = None
+    ref_sha: str | None = None
+    if "reference_snapshot" in digests:
+        ref_sha = digests.get("reference_snapshot")
+        if not _is_sha64(ref_sha):
+            return None
+        prior_ref_snaps = os.path.join(prior_run_dir, "engine_build", "reference", "snapshots")
+        try:
+            verified_ref_files = BSNAP.read_verified_snapshot(prior_ref_snaps, ref_sha)
+        except BSNAP.SnapshotError:
+            return None
+    if "reference_comparison" in digests and not _is_sha64(digests.get("reference_comparison")):
+        return None
     copied_bench: dict[str, bytes] = {}
     for rel, want in digests.items():
+        if rel in ("reference_snapshot", "reference_comparison"):
+            continue
         if not _is_sha64(want):
             return None
         try:
@@ -1641,51 +1707,14 @@ def try_reuse_admission(prior_run_dir: str, target_run_dir: str, expected_reuse_
         except (FileNotFoundError, SIO.LinkRefused, OSError):
             return None
 
-    # Publish verified snapshot idempotently (if target already holds the verified immutable snapshot, keep it!)
-    target_snaps = os.path.join(target_run_dir, "engine_build", "snapshots")
-    os.makedirs(target_snaps, exist_ok=True)
-    already_ok = False
-    try:
-        existing = BSNAP.read_verified_snapshot(target_snaps, snap_sha)
-        already_ok = existing == verified_files
-    except BSNAP.SnapshotError:
-        already_ok = False
-    if not already_ok:
-        snap_dir = os.path.join(target_snaps, snap_sha)
-        if os.path.isdir(snap_dir) and not os.path.islink(snap_dir):
-            dfd0 = SIO.dir_fd_nofollow(target_snaps, [snap_sha])
-            try:
-                os.fchmod(dfd0, 0o755)
-            finally:
-                os.close(dfd0)
-            for fn in sorted(os.listdir(snap_dir)):
-                fp = os.path.join(snap_dir, fn)
-                if os.path.isfile(fp) and not os.path.islink(fp):
-                    ffd = SIO.open_nofollow(target_snaps, f"{snap_sha}/{fn}")
-                    try:
-                        os.fchmod(ffd, 0o644)
-                    finally:
-                        os.close(ffd)
-                SIO.remove_nofollow(target_snaps, f"{snap_sha}/{fn}", missing_ok=True)
-        for name in sorted(verified_files):
-            SIO.write_nofollow(target_snaps, f"{snap_sha}/{name}", verified_files[name], atomic=True)
-            fd = SIO.open_nofollow(target_snaps, f"{snap_sha}/{name}")
-            try:
-                os.fchmod(fd, 0o444)
-            finally:
-                os.close(fd)
-        dfd = SIO.dir_fd_nofollow(target_snaps, [snap_sha])
-        try:
-            os.fchmod(dfd, 0o555)
-        finally:
-            os.close(dfd)
-        man = {
-            "snapshot_sha256": snap_sha,
-            "files": [{"name": n, "sha256": _sha256_bytes(verified_files[n]), "size": len(verified_files[n])}
-                      for n in sorted(verified_files)],
-        }
-        SIO.write_nofollow(target_snaps, f"{snap_sha}.json", json.dumps(man, indent=1, sort_keys=True).encode("utf-8"), atomic=True)
-        BSNAP.read_verified_snapshot(target_snaps, snap_sha)
+    # Publish verified candidate (and optional reference) snapshots idempotently
+    _publish_verified_snapshot(os.path.join(target_run_dir, "engine_build", "snapshots"), snap_sha, verified_files)
+    if verified_ref_files is not None and ref_sha is not None:
+        _publish_verified_snapshot(
+            os.path.join(target_run_dir, "engine_build", "reference", "snapshots"),
+            ref_sha,
+            verified_ref_files,
+        )
 
     if "bench/fitted.yaml" not in copied_bench:
         SIO.remove_nofollow(target_run_dir, "engine_build/bench/fitted.yaml", missing_ok=True)
@@ -1936,6 +1965,20 @@ def admit(
             digests[rel] = _sha256_bytes(blob)
     else:
         SIO.remove_nofollow(run_dir, "engine_build/bench/fitted.yaml", missing_ok=True)
+    if reference_files is not None:
+        ref_map = {str(k): bytes(v) for k, v in sorted(reference_files.items())}
+        ref_hashes = {k: _sha256_bytes(v) for k, v in ref_map.items()}
+        ref_sha = BSNAP.snapshot_digest(ref_hashes)
+        _publish_verified_snapshot(
+            os.path.join(run_dir, "engine_build", "reference", "snapshots"),
+            ref_sha,
+            ref_map,
+        )
+        digests["reference_snapshot"] = ref_sha
+        comp_sha = checks["A11"].get("comparison_sha256")
+        digests["reference_comparison"] = (
+            comp_sha if isinstance(comp_sha, str) else _sha256_json(checks["A11"].get("rows") or [])
+        )
 
     gating_ids = ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A11")
     failed_gating = [cid for cid in gating_ids if checks[cid]["status"] not in ("pass", "skipped", "not_applicable")]
@@ -2051,12 +2094,21 @@ def _self_test() -> int:
             reused = try_reuse_admission(d1, d_reuse, key1)
             reused2 = try_reuse_admission(d1, d_reuse, key1)
             miss_reuse = try_reuse_admission(d1, d_reuse, key_cal)
-            ok(blocked_un is None and reused is not None and reused2 is not None
+            ref_sha1 = (adm1.get("digests") or {}).get("reference_snapshot")
+            ref_copied_ok = bool(
+                ref_sha1 and BSNAP.read_verified_snapshot(
+                    os.path.join(d_reuse, "engine_build", "reference", "snapshots"), ref_sha1
+                )
+            )
+            # Removing the source reference snapshot manifest must make reuse fail closed
+            SIO.remove_nofollow(d1, f"engine_build/reference/snapshots/{ref_sha1}.json", missing_ok=True)
+            miss_ref = try_reuse_admission(d1, d_reuse, key1)
+            ok(blocked_un is None and reused is not None and reused2 is not None and ref_copied_ok and miss_ref is None
                and reused["status"] == "admitted" and reused.get("reused_from") == os.path.abspath(d1)
                and not os.path.exists(os.path.join(d_reuse, "engine_build", "signoff.json"))
                and miss_reuse is None and key_cal != key1 and key_dep != key1
                and key_noref != key1 and key_cfg != key1,
-               "BE32 reuse refuses unsandboxed runs, copies idempotently on matching key (no signoff.json), and invalidates on changed inputs")
+               "BE32 reuse refuses unsandboxed/missing-ref runs, copies snapshots+ref idempotently (no signoff.json), and invalidates on changed inputs")
     finally:
         td1.cleanup()
 
