@@ -77,8 +77,21 @@ def pipeline_steps(spec_path: str, run_dir: str) -> list[dict]:
     deps = [os.path.relpath(spec_path, run_dir), os.path.relpath(spec.resolve(spec["decision_units"]["csv"]), run_dir)]
     if spec.settings_path:
         deps.append(os.path.relpath(spec.settings_path, run_dir))
-    if spec.engine_auto:
+    if spec.engine_auto or spec.engine_build:
         deps.append(schema.ENGINE_CHOICE)
+    if spec.engine_build:
+        adm_rel = "engine_build/admission.json"
+        if os.path.exists(os.path.join(run_dir, adm_rel)):
+            deps.append(adm_rel)
+            try:
+                import json as _json
+                adm_doc = _json.load(open(os.path.join(run_dir, adm_rel), encoding="utf-8"))
+                snap = adm_doc.get("snapshot_sha256") if isinstance(adm_doc, dict) else None
+                snap_rel = f"engine_build/snapshots/{snap}.json" if isinstance(snap, str) else None
+                if snap_rel and os.path.exists(os.path.join(run_dir, snap_rel)):
+                    deps.append(snap_rel)
+            except (OSError, ValueError):
+                pass
     if spec["calibration"].get("method") in ("likelihood", "posterior"):
         deps.append(os.path.relpath(spec.resolve(spec["calibration"]["targets"]["csv"]), run_dir))
     gi = ((spec.raw.get("dynamics") or {}).get("generation_interval") or {}).get("csv")

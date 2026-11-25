@@ -150,7 +150,7 @@ local SKILL.md), allowed via `_MCP_SKILLS`.
 | Exit | Statuses |
 |------|----------|
 | 0    | `completed`, `completed_with_report_restored` |
-| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `completed_scope_declined`, `amended_provisional`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff`, `paused:awaiting_budget`, `paused:awaiting_spec_amendment` (v2) |
+| 2    | `completed_scope_declared`, `completed_gate_not_accepted`, `completed_gate_error`, `completed_gate_not_run`, `completed_no_report`, `run_failed`, `budget_exhausted`, `awaiting_signoff`, `awaiting_scope_signoff`, `awaiting_engine_signoff`, `completed_scope_declined`, `completed_engine_not_admitted`, `completed_engine_declined`, `amended_provisional`, `paused:awaiting_signoff`, `paused:awaiting_scope_signoff`, `paused:awaiting_engine_signoff`, `paused:awaiting_budget`, `paused:awaiting_spec_amendment` (v2) |
 | 1    | `harness_tampered`, `artifact_tampered`, `crashed` (v2: an exception, recorded in `crash`), errors |
 | 130  | `interrupted` |
 

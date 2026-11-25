@@ -1403,8 +1403,14 @@ def main_v2(args, ident: dict | None = None) -> int:
         question = args.question
         run_path = os.path.join(REPO_ROOT, "runs", create_run_dir(question))
     lock = contextlib.nullcontext()
-    if args.resume and "lead" in (args.signoff, st.signoff):
-        # Codex r3 on #342 (P1-7): a lead run's amendment lock is taken before anything is written (run_v2 holds it
+    need_lock = args.resume and (
+        "lead" in (args.signoff, st.signoff)
+        or st.state in ("ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN")
+        or bool(getattr(st, "engine_build", None))
+        or stage_machine.spec_has_engine_build(run_path)
+    )
+    if need_lock:
+        # Codex r3 on #342 (P1-7) & #363 (BE31): lock is taken before anything is written (run_v2 holds it
         # again, nested): a resume another process holds stops here with nothing stamped, recorded or stored
         lock = stage_machine._amend_lock(run_path)
         try:
@@ -1458,10 +1464,14 @@ def _main_v2_run(args, ident: dict, run_path: str, question: str) -> int:
     from agents import stage_machine, v2_sdk_tasks
     pipeline_id.stamp(run_path, ident)
     print(f"Run (v2): {run_path}", flush=True)
-    tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud)
+    derive_un = getattr(args, "dev_unsandboxed_derivations", False)
+    engine_un = getattr(args, "dev_unsandboxed_engine", False)
+    tasks = v2_sdk_tasks.SdkTasks(run_path, allow_cloud=args.cloud, unsandboxed_ok=engine_un)
     status = run_v2_and_store(lambda: stage_machine.run_v2(
         question, run_path, tasks, max_rounds=args.max_rounds, signoff=args.signoff,
-        budget_usd=args.max_budget_usd, derive_unsandboxed=getattr(args, "dev_unsandboxed_derivations", False)),
+        budget_usd=args.max_budget_usd, derive_unsandboxed=derive_un,
+        engine_unsandboxed=engine_un,
+        engine_build_usd=getattr(args, "engine_build_usd", None)),
         run_path,
         store=_store_chain)
     print(f"v2 status: {status}", flush=True)
@@ -1491,6 +1501,9 @@ def main() -> int:
                         help="Hard dollar cap for the whole run (all sessions, including "
                              "earlier invocations of a resumed run). Stops with status "
                              "budget_exhausted; the final gate still runs.")
+    parser.add_argument("--engine-build-usd", type=float, default=None,
+                        help="Dollar cap for the agent-built engine lane (default $40, clamped to harness max); "
+                             "pass a higher cap on --resume after an engine_build_cap budget pause.")
     parser.add_argument("--methods-critic", action="store_true",
                         help="Accepted for existing launch configs; unused by v2 (it added critique-methods to v1's STAGE 6).")
     parser.add_argument("--signoff", choices=["owner", "lead", "none"], default="owner",
@@ -1515,6 +1528,10 @@ def main() -> int:
                         help="v2 development only: run the spec's data derivations without a sandbox where there is "
                              "none (macOS). The record says sandbox none and the run cannot be accepted "
                              "(docs/design/v2-derived-inputs.md).")
+    parser.add_argument("--dev-unsandboxed-engine", action="store_true",
+                        help="v2 development only: execute agent-built engine code without bubblewrap where there is "
+                             "no sandbox (macOS). Persists a HIGH non-declarable gate finding so the run cannot be "
+                             "accepted (docs/design/agent-built-engines.md §5.1).")
     args = parser.parse_args()
 
     if args.self_test:

@@ -23,10 +23,12 @@ from agents.v2_tasks import CRITIQUE_FILE, PREFIX, TaskResult
 from agents.fix_loop import FIX_EDITABLE, FIX_PLANNER_PROMPT, task_scope
 
 TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"]
+ENGINE_MCP_TOOLS = ("mcp__engine__try", "mcp__engine__run")
 OUT = "_task_output.json"
 # baseline hb1: 4 of 10 runs lost a SPEC try to the 30-turn cap (the draft reads inputs, writes derivations and
 # iterates); the spec draft gets its own cap, still bounded by the call's dollar allowance.
 SPEC_MAX_TURNS = 60
+BUILD_ENGINE_MAX_TURNS = 150
 # Files only the harness writes in a v2 run.
 HARNESS_FILES = ("run_state.json", "findings.jsonl", "impact_ledger.jsonl", "metadata.json", "final_gate.json",
                  "decision_spec.signoff.json", "engine_choice.json", "validator_history.jsonl", "done_when_registry.json",
@@ -90,7 +92,10 @@ and the engine's card say which and list the fields), name it with its configura
 `engine: {{ref: '<module>:<Class>', config: {{...}}}}`. Name the engine the same way to run it in a
 mode other than its default, or to use an engine that `auto` configures only from an estimates spec
 in a spec that is not one. A named configuration is used as written, and the named engine is then
-the only one considered. The harness has copied the question's input files into data/inputs/ (same
+the only one considered. Only when no registered engine card represents a mechanism the decision turns on
+(checked against the full registry, or with a `why` naming a request mechanism no eligible card has),
+you may declare `engine: {{build: {{id, kind, why, mechanisms, request}}}}` (or `{{auto: true, candidates: [...], build: {{...}}}}`)
+following `toolkit/engines/built/requested.py`. The harness has copied the question's input files into data/inputs/ (same
 relative paths; their sha256 in data/inputs_provenance.json): read them. You write code, never
 tables. For each file the spec reads that is not a staged input (the units table, calibration
 targets, cost tables), write one script under data/derive/ and declare it in data/derivations.yaml
@@ -167,6 +172,41 @@ cannot locate. Output: {dossier} and {out} = {{"ok": true, "notes": "..."}}.""",
 Task: choose the engine. {out_in} lists the registered engines, which are eligible, and why the
 others are not. Pick one eligible engine and say why in two sentences (mechanisms the question
 needs, validated benchmarks). Output: {out} = {{"engine": "<ref>", "why": "..."}}.""",
+    "build_engine": COMMON + """
+
+Task: build the agent-built engine `{engine_id}` into `{work_dir}` from the signed request in {out_in}
+and `engine_build/request.json`. You have no shell; use `mcp__engine__try` (runs static checks S1-S4
+and public cases of checks A1-A8) and `mcp__engine__run` (one sandboxed evaluation within request domains)
+to test your working copy (shared 30-call cap). Write ONLY inside `{work_dir}`:
+- `engine.py` defining `class Model` implementing the signed contract (and optional sibling `.py` helpers)
+- `card.yaml` matching `describe()` with `benchmarks: []`, `assumptions`, and `limitations`
+- `ENGINE_NOTES.md` documenting equations, assumptions, and limitations in plain language
+Rules:
+- The engine carries trial effects over to the setting (principle 3); its own burden is a validation
+  check, not the basis of the decision.
+- It must declare and use EXACTLY the parameters the signed request names (name, kind, value, lo, hi,
+  units, source). Every non-inert input must move its declared `expected_effects` outputs with the
+  declared sign inside the dynamics (never via post-hoc formulas or tiny epsilon terms).
+- Obey the import and AST allowlist in {out_in} (no file/process/network/interpreter access, no
+  `scipy.integrate`, no undeclared literal tables > 16 numbers).
+- Never attempt to read `engine_build/.hidden/`, `engine_build/reference/`, `analysis/`, or any other run.
+When `mcp__engine__try(checks="all")` passes cleanly, write {out} = {{"ok": true, "notes": "<summary>"}} and stop.""",
+    "critique_engine": COMMON + """
+
+Task: engine review (`critique-engine`), round {round}. Inspect the admitted built engine's snapshot
+(listed in {out_in}), `ENGINE_NOTES.md`, `card.yaml`, `engine_build/admission.json`, `engine_build/admission_sheet.md`,
+and `engine_build/request.json`. Do not read `engine_build/.hidden/` or `engine_build/reference/`.
+Check every item:
+1. `ENGINE_NOTES.md` matches the equations and behavior implemented in the snapshot code.
+2. Every state used in the model dynamics is among the signed compartment states (`request.compartments.states`).
+3. No additive hack terms exist merely to move an output (e.g. an `epsilon * p` pattern).
+4. Each parameter's declared source and range matches the signed request and dossier.
+5. Structural assumptions and limitations are stated honestly on `card.yaml` and `ENGINE_NOTES.md`.
+Write `critique_engine.yaml` with keys: `reviewer: critique-engine`, `round: {round}`,
+`verdict: PASS | REVISE`, and `blockers: [...]` (ids `E-NNN`, each with `id`, `severity` in
+HIGH|MEDIUM|LOW, `category`, `target_stage: ENGINE`, `claim`, `evidence`, `fix_requires`, `resolved: bool`).
+Raise HIGH only for genuine scientific, structural, or contract defects; otherwise PASS.{feedback}
+Output: `critique_engine.yaml` and {out} = {{"ok": true}}.""",
     "critique": COMMON + """
 
 Task: {reviewer} review, round {round}. Review the computed facts: the analysis artifacts in
@@ -316,7 +356,7 @@ PROMPTS["seed_world_model"] = seed_prompt_text().replace("{", "{{").replace("}",
     .replace("{{out_in}}", "{out_in}").replace("{{out}}", "{out}")
 OWNS = {"draft_spec": ("decision_spec.yaml", "analysis_settings.yaml", "data/derive/", "data/derivations.yaml",
                        "data/README.md"), "pick_engine": (), "plan_fixes": (),
-        "critique": (), "fix": FIX_EDITABLE, "write": ("manuscript.md",),
+        "critique": (), "critique_engine": ("critique_engine.yaml",), "fix": FIX_EDITABLE, "write": ("manuscript.md",),
         "seed_world_model": (SEED_FILE,),
         # v2 autonomy 1B-ii: the dossier the spec names (draft_evidence(rel=...)); this is the default name
         "draft_evidence": ("evidence_dossier.yaml",)}
@@ -774,6 +814,90 @@ def checklist_text(run_dir: str, reviewer: str, repair: bool = False) -> tuple[s
     return "\n\n" + CL.prompt_block(), ("\n\n" + data) if data else ""
 
 
+def _default_engine_config(run_dir: str) -> dict:
+    """Resolve `request.configs.default` from `engine_build/request.json` or `decision_spec.yaml` so
+    `mcp__engine__try` and `mcp__engine__run` evaluate the exact default config used by admission."""
+    try:
+        raw, st = _sio().read_nofollow(run_dir, "engine_build/request.json")
+        if st.st_nlink == 1:
+            req_doc = json.loads(raw.decode("utf-8"))
+            cfg = ((req_doc.get("build") or {}).get("request") or {}).get("configs", {}).get("default")
+            if isinstance(cfg, dict):
+                return dict(cfg)
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        import yaml
+        raw, st = _sio().read_nofollow(run_dir, "decision_spec.yaml")
+        if st.st_nlink == 1:
+            spec = yaml.safe_load(raw.decode("utf-8")) or {}
+            cfg = (((spec.get("engine") or {}).get("build") or {}).get("request") or {}).get("configs", {}).get("default")
+            if isinstance(cfg, dict):
+                return dict(cfg)
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _make_engine_mcp_server(run_dir: str, *, unsandboxed_ok: bool = False):
+    """In-process MCP server exposing `mcp__engine__try` and `mcp__engine__run` ONLY for `build_engine`
+    (docs/design/agent-built-engines.md §3.1 & §3.3)."""
+    from claude_agent_sdk import create_sdk_mcp_server, tool
+    from toolkit.engines.built import try_tool as BTRY
+
+    @tool(
+        "try",
+        "Snapshot the built-engine working copy, run static checks S1-S4 and public cases of requested checks "
+        "(A1-A8 or 'all'), persist engine_build/try/<n>.json, and return a <=8KB summary.",
+        {"checks": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}},
+    )
+    async def _try_fn(args):
+        checks = args.get("checks", "all") if isinstance(args, dict) else "all"
+        try:
+            res = BTRY.engine_try(run_dir, checks=checks, config=_default_engine_config(run_dir),
+                                  unsandboxed_ok=unsandboxed_ok)
+            return {"content": [{"type": "text", "text": json.dumps(res, sort_keys=True, default=str)}]}
+        except Exception as e:  # noqa: BLE001 -- structured tool error back to build agent
+            return {"content": [{"type": "text", "text": json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})}],
+                    "is_error": True}
+
+    @tool(
+        "run",
+        "Run one sandboxed evaluation of the built-engine working copy on validated inputs within the signed "
+        "request domains (unit, package, params, horizon, seed).",
+        {
+            "type": "object",
+            "properties": {
+                "unit": {"type": "object"},
+                "package": {"type": "object"},
+                "params": {"type": "object"},
+                "horizon": {"type": "object"},
+                "seed": {"type": "integer"},
+            },
+            "required": ["unit", "package", "horizon"],
+        },
+    )
+    async def _run_fn(args):
+        a = args if isinstance(args, dict) else {}
+        try:
+            res = BTRY.engine_run_one(
+                run_dir,
+                unit=a.get("unit") or {},
+                package=a.get("package") or {},
+                params=a.get("params") or {},
+                horizon=a.get("horizon") or {},
+                seed=int(a.get("seed", 1)),
+                config=_default_engine_config(run_dir),
+                unsandboxed_ok=unsandboxed_ok,
+            )
+            return {"content": [{"type": "text", "text": json.dumps(res, sort_keys=True, default=str)}]}
+        except Exception as e:  # noqa: BLE001 -- structured tool error back to build agent
+            return {"content": [{"type": "text", "text": json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})}],
+                    "is_error": True}
+
+    return create_sdk_mcp_server(name="engine", version="1.0.0", tools=[_try_fn, _run_fn])
+
+
 class SdkTasks:
     """Each call's dollar cap is the allowance the machine sets just before it (set_allowance: the
     run's remaining budget less the write-up reserve, at most the task cap). Spend is charged
@@ -783,12 +907,13 @@ class SdkTasks:
     Every charge is also written to budget_ledger.json."""
 
     def __init__(self, run_dir: str, allow_cloud: bool = False, task_cap_usd: float = 3.0, max_turns: int | None = None,
-                 query_fn=None, io_root: str | None = None):
+                 query_fn=None, io_root: str | None = None, unsandboxed_ok: bool = False):
         self.run_dir = os.path.abspath(run_dir)
         # lib.safe_io's trusted root: the run dir. A world-model seed session runs in <run>/world_model/seed/, and
         # safe_io refuses a root inside a run dir (smoke4, 2026-11-16), so its root is the run dir itself.
         self.io_root = os.path.abspath(io_root or run_dir)
         self.cloud = allow_cloud
+        self.unsandboxed_ok = bool(unsandboxed_ok)
         self.cap = task_cap_usd
         self.allowance = task_cap_usd
         self.readback = 0.0          # no read-back unless the machine grants a budget for it
@@ -801,15 +926,22 @@ class SdkTasks:
         self.n = 0
 
     def turns_for(self, kind: str) -> int:
-        """The turn cap of one session: the caller's cap when it gave one; else SPEC_MAX_TURNS for the spec draft and
-        the default of 30 for the others."""
-        return SPEC_MAX_TURNS if kind == "draft_spec" and not self.turns_explicit else self.turns
+        """The turn cap of one session: the caller's cap when it gave one; else BUILD_ENGINE_MAX_TURNS for
+        build_engine, SPEC_MAX_TURNS for the spec draft, and the default of 30 for the others."""
+        if self.turns_explicit:
+            return self.turns
+        if kind == "build_engine":
+            return BUILD_ENGINE_MAX_TURNS
+        if kind == "draft_spec":
+            return SPEC_MAX_TURNS
+        return self.turns
 
     def for_run_dir(self, run_dir: str) -> "SdkTasks":
         """The same tasks for another run dir (lead-gaps β: the child run a provisional lead amendment continues in),
         with this one's settings; its own budget ledger is the child's."""
         return SdkTasks(run_dir, allow_cloud=self.cloud, task_cap_usd=self.cap,
-                        max_turns=self.turns if self.turns_explicit else None, query_fn=self.query_fn)
+                        max_turns=self.turns if self.turns_explicit else None, query_fn=self.query_fn,
+                        unsandboxed_ok=self.unsandboxed_ok)
 
     def set_allowance(self, usd: float, readback_usd: float | None = None) -> None:
         """The call's dollar cap, and the cap of one crash read-back (0: none; the whole allowance
@@ -817,17 +949,21 @@ class SdkTasks:
         self.allowance = float(usd)
         self.readback = max(0.0, float(readback_usd or 0.0))
 
-    def _charge(self, result, allowance: float, sid: str | None, source: str) -> float:
+    def _charge(self, result, allowance: float, sid: str | None, source: str, stage: str | None = None) -> float:
         """Exactly the reported cost when there is one; otherwise the whole allowance. Never the
         duration estimate charge_session uses for a session with no id (Codex R2-2)."""
         from agents import run_budget as RB
         ledger = RB.load_budget_ledger(self.run_dir)
         self.n += 1
         RB.charge_session(ledger, self.n, result, allowance, session_id=sid, elapsed_s=None, source=source)
+        if stage and ledger.get("sessions"):
+            ledger["sessions"][-1]["stage"] = stage
         RB.write_budget_ledger(self.run_dir, ledger, None)
         return float(ledger["sessions"][-1].get("total_cost_usd") or 0.0)
 
-    def _session(self, kind: str, system: str, prompt: str, owns: tuple, model: str | None = None) -> TaskResult:
+    def _session(self, kind: str, system: str, prompt: str, owns: tuple, model: str | None = None,
+                 *, mcp_servers: dict | None = None, extra_tools: list[str] | None = None,
+                 force_no_cloud: bool = False, stage: str | None = None) -> TaskResult:
         import time
         from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
         from agents import run_budget as RB
@@ -836,13 +972,17 @@ class SdkTasks:
             return TaskResult(False, None, 0.0, "no allowance: the call was not made")
         out = os.path.join(self.run_dir, OUT)
         _sio().remove_path(out, self.io_root)
+        allowed_tool_list = list(TOOLS) + list(extra_tools or ())
+        allowed_tool_set = set(allowed_tool_list)
 
         async def pre(input_data, tool_use_id, context):
             name = input_data.get("tool_name")
             ti = input_data.get("tool_input") or {}
-            if name not in TOOLS:
+            if isinstance(name, str) and name.startswith("mcp__engine__") and kind != "build_engine":
+                return enforcement.deny_output(f"{kind}: {name} is available only to build_engine")
+            if name not in allowed_tool_set:
                 # Fail closed (main #97): no shell, so no full pipeline build and no background call.
-                return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(TOOLS)})")
+                return enforcement.deny_output(f"{kind}: {name} is not one of this task's tools ({', '.join(allowed_tool_list)})")
             if name in ("Write", "Edit"):
                 why = _allowed(ti.get("file_path", ""), self.run_dir, owns, kind=kind)
                 if why:
@@ -856,11 +996,22 @@ class SdkTasks:
                     return enforcement.deny_output(why)
             return {}
 
-        opts = ClaudeAgentOptions(system_prompt=system, model=model or enforcement.MODEL_DEEP, tools=TOOLS,
-                                  allowed_tools=TOOLS, permission_mode="bypassPermissions", cwd=self.run_dir,
-                                  max_turns=self.turns_for(kind), max_budget_usd=allowance, setting_sources=[],
-                                  env=enforcement.filtered_env(dict(os.environ), self.cloud),
-                                  hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[pre])]})
+        opt_kw: dict = {
+            "system_prompt": system,
+            "model": model or enforcement.MODEL_DEEP,
+            "tools": TOOLS,
+            "allowed_tools": allowed_tool_list,
+            "permission_mode": "bypassPermissions",
+            "cwd": self.run_dir,
+            "max_turns": self.turns_for(kind),
+            "max_budget_usd": allowance,
+            "setting_sources": [],
+            "env": enforcement.filtered_env(dict(os.environ), False if force_no_cloud else self.cloud),
+            "hooks": {"PreToolUse": [HookMatcher(matcher=None, hooks=[pre])]},
+        }
+        if mcp_servers:
+            opt_kw["mcp_servers"] = mcp_servers
+        opts = ClaudeAgentOptions(**opt_kw)
 
         seen = {"result": None, "sid": None}
         qf = self.query_fn or query
@@ -902,7 +1053,7 @@ class SdkTasks:
                 result, source = None, "read-back failed"
         elif result is None:
             source = "unknown cost: the whole allowance"
-        usd = self._charge(result, charge_cap, seen["sid"], source)
+        usd = self._charge(result, charge_cap, seen["sid"], source, stage=stage)
         if isinstance(err, (KeyboardInterrupt, SystemExit)):
             raise err
         if err is not None:
@@ -955,6 +1106,54 @@ class SdkTasks:
                       "which of the reasons it cannot answer.")
         return self._session("pick_engine", PROMPTS["pick_engine"].format(out_in=inp, out=OUT),
                              msg, OWNS["pick_engine"], enforcement.MODEL_FAST)
+
+    def build_engine(self, run_dir, packet, engine_id):
+        """Bounded `build_engine` task (§3): writes `models/ext/engine_<id>/`, no shell, only in-process
+        `mcp__engine__try` and `mcp__engine__run`, `allow_cloud=False`, `max_turns=150`, `MODEL_DEEP`."""
+        inp = self._input(packet)
+        work_rel = f"models/ext/engine_{engine_id}/"
+        srv = _make_engine_mcp_server(self.run_dir, unsandboxed_ok=self.unsandboxed_ok)
+        msg = f"Build engine `{engine_id}` into `{work_rel}` from `{inp}` and verify with `mcp__engine__try`."
+        if isinstance(packet, dict) and packet.get("feedback"):
+            msg += "\n\nFeedback from the previous try (fix every problem):\n- " + "\n- ".join(
+                map(str, packet["feedback"][:40])
+            )
+        return self._session(
+            "build_engine",
+            PROMPTS["build_engine"].format(engine_id=engine_id, work_dir=work_rel, out_in=inp, out=OUT),
+            msg,
+            (work_rel,),
+            enforcement.MODEL_DEEP,
+            mcp_servers={"engine": srv},
+            extra_tools=list(ENGINE_MCP_TOOLS),
+            force_no_cloud=True,
+            stage="ENGINE_BUILD",
+        )
+
+    def critique_engine(self, run_dir, round_n, feedback=None):
+        """Bounded `critique-engine` task (§4.5): reviews snapshot, notes, admission.json, and request."""
+        snap_info = {}
+        try:
+            adm = json.loads(_sio().read_nofollow(self.run_dir, "engine_build/admission.json")[0].decode("utf-8"))
+            snap_sha = adm.get("snapshot_sha256")
+            snap_info = {
+                "engine_id": adm.get("engine_id"),
+                "snapshot_sha256": snap_sha,
+                "snapshot_dir": f"engine_build/snapshots/{snap_sha}/" if snap_sha else None,
+            }
+        except (OSError, ValueError):
+            pass
+        inp = self._input(snap_info)
+        fb = ("\n\nThis is a repair: your previous `critique_engine.yaml` failed schema validation:\n- "
+              + "\n- ".join(map(str, feedback[:20]))) if feedback else ""
+        return self._session(
+            "critique_engine",
+            PROMPTS["critique_engine"].format(round=round_n, out_in=inp, out=OUT, feedback=fb),
+            f"Review the admitted built engine (round {round_n}) and write critique_engine.yaml.",
+            OWNS["critique_engine"],
+            enforcement.MODEL_DEEP,
+            stage="ENGINE_REVIEW",
+        )
 
     def critique(self, run_dir, reviewer, round_n, feedback=None):
         import validate_critique_yaml as V
@@ -1299,6 +1498,45 @@ def _self_test() -> int:
         t._session("pick_engine", "x", "y", ())
         ok(verdicts == {"Bash": True, "Agent": True, "NotebookEdit": True, "Read": False},
            f"S16 tools outside the task's file tools are refused at PreToolUse; a Read is not ({verdicts})")
+        # BE20b: mcp__engine__* tools are allowed ONLY for build_engine (with max_turns=150 and cloud env blanked)
+        mcp_check = {}
+
+        async def probe_mcp(prompt=None, options=None):
+            pre = options.hooks["PreToolUse"][0].hooks[0]
+            mcp_check["turns"] = options.max_turns
+            mcp_check["has_srv"] = "engine" in (options.mcp_servers or {})
+            mcp_check["cloud_blank"] = options.env.get("AZ_BATCH_ACCOUNT") == ""
+            for tname in ("mcp__engine__try", "mcp__engine__run", "Bash"):
+                out = await pre({"tool_name": tname, "tool_input": {}}, "tm", None)
+                mcp_check[tname] = (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+            yield NS(total_cost_usd=0.01, session_id="s_be", is_error=False)
+        saved_az = os.environ.get("AZ_BATCH_ACCOUNT")
+        os.environ["AZ_BATCH_ACCOUNT"] = "secret_acct"
+        try:
+            t_be = SdkTasks(d, allow_cloud=True, query_fn=probe_mcp)
+            t_be.set_allowance(5.0)
+            t_be.build_engine(d, {"request": {"id": "mod1"}}, "mod1")
+        finally:
+            if saved_az is None:
+                os.environ.pop("AZ_BATCH_ACCOUNT", None)
+            else:
+                os.environ["AZ_BATCH_ACCOUNT"] = saved_az
+        other_mcp = {}
+
+        async def probe_other_mcp(prompt=None, options=None):
+            pre = options.hooks["PreToolUse"][0].hooks[0]
+            for tname in ("mcp__engine__try", "mcp__engine__run"):
+                out = await pre({"tool_name": tname, "tool_input": {}}, "tm2", None)
+                other_mcp[tname] = (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+            yield NS(total_cost_usd=0.01, session_id="s_ot", is_error=False)
+        t_ot = SdkTasks(d, query_fn=probe_other_mcp)
+        t_ot.set_allowance(1.0)
+        t_ot._session("fix", "x", "y", FIX_EDITABLE)
+        ok(mcp_check.get("turns") == BUILD_ENGINE_MAX_TURNS and mcp_check.get("has_srv")
+           and mcp_check.get("cloud_blank") and mcp_check.get("mcp__engine__try") is False
+           and mcp_check.get("mcp__engine__run") is False and mcp_check.get("Bash") is True
+           and other_mcp == {"mcp__engine__try": True, "mcp__engine__run": True},
+           f"BE20b mcp__engine__* allowed only for build_engine (150 turns, no cloud); refused for other tasks ({mcp_check}, {other_mcp})")
         # DI1 (docs/design/v2-derived-inputs.md §3.1): the planner writes code, never tables. A Write to the derived
         # tables (or anywhere else in data/) is refused; the derivation scripts, their declaration and the note are
         # the task's own.
@@ -1339,13 +1577,15 @@ def _self_test() -> int:
         seen_prompts, errors = {}, {}
         t = SdkTasks(d, query_fn=stream(init, res))
 
-        def fake_session(kind, system, prompt, owns, model=None):
+        def fake_session(kind, system, prompt, owns, model=None, **kw):
             seen_prompts[kind] = system
             return TaskResult(True, {"ok": True}, 0.0, "fake")
         t._session = fake_session
         calls = {
             "draft_spec": lambda: t.draft_spec("Q?", d, ["e1"]),
             "pick_engine": lambda: t.pick_engine({}, {"eligible": ["e"]}),
+            "build_engine": lambda: t.build_engine(d, {"request": {"id": "e1"}}, "e1"),
+            "critique_engine": lambda: t.critique_engine(d, 1, ["err1"]),
             "critique": lambda: t.critique(d, "critique-domain", 1, ["fb"]),
             "plan_fixes": lambda: t.plan_fixes({"round": 1, "findings": [{"id": "R-001"}]}),
             "fix": lambda: t.fix({"id": "T1", "brief": "b {x}", "findings": ["R-001"], "owner_state": "MODEL"},
