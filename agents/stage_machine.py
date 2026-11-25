@@ -9777,7 +9777,6 @@ def _self_test_built_engine(ok, td: str) -> None:
     from toolkit.engines.built import admission as BADM
     from toolkit.engines.built import signoff as BSIG
     from toolkit.engines.built import worker as BWORK
-    from toolkit.spec import review_conditions as RCN
     from v2_tasks import StubTasks
 
     real_b = AB.backend()
@@ -9978,8 +9977,9 @@ def _self_test_built_engine(ok, td: str) -> None:
                 "import json, os, yaml; "
                 "os.makedirs('analysis', exist_ok=True); os.makedirs('models', exist_ok=True); "
                 "json.dump({'headline': {'point': 10.0}}, open('analysis/analysis.json', 'w')); "
-                "yaml.safe_dump({'claims': [{'id': 'headline.point', 'claim_kind': 'scalar', 'value': 10.0}]}, "
-                "open('models/claims_ledger.yaml', 'w')); "
+                "yaml.safe_dump({'claims': [{'id': 'headline.point', 'claim_kind': 'scalar', 'units': 'cases', "
+                "'source_artifact': 'analysis/analysis.json', 'source_field': 'headline.point', "
+                "'produced_by': 'harness', 'value': 10.0}]}, open('models/claims_ledger.yaml', 'w')); "
                 "open('results.md', 'w').write('# Results\\n')"
             )
             return [{
@@ -10007,12 +10007,7 @@ def _self_test_built_engine(ok, td: str) -> None:
     fast_b = _FastBuiltBackend()
 
     def _dispose_owner_conditions(rd: str) -> None:
-        doc = RCN.load(rd)
-        if not isinstance(doc, dict):
-            return
-        rows = [c for c in doc.get("conditions") or [] if isinstance(c, dict) and not c.get("disposition")]
-        for c in rows:
-            RCN.dispose(rd, c["id"], "accepted", "owner", note="self-test")
+        _t_owner_disposes(rd)
 
     def _mk_run(name: str, *, signoff: str = "owner", include_trial_oob: bool = False,
                 build_fn=None, critics=None, budget: float | None = None,
