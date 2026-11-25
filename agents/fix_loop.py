@@ -38,7 +38,7 @@ IMPACT = "impact_ledger.jsonl"
 FIX_EDITABLE = ("analysis_settings.yaml", "models/ext/")
 ACTIONS = ("fix", "rethink", "decision_test")
 HARNESS_GAP = FL.HARNESS_GAP          # the ledger event a declared harness gap leaves on its finding
-RETHINK_STATES = ("SPEC", "ENGINE_CHOICE")
+RETHINK_STATES = ("SPEC", "ENGINE_CHOICE", "ENGINE_BUILD")
 # F6 run 3: a write-up finding (report or manuscript text) is the WRITE stage's. A FIX_LOOP task may edit only
 # analysis_settings.yaml and models/ext/, so a task for one can never pass its check; the writer gets it instead.
 WRITE_STATES = ("WRITE", "PRESENTATION")
@@ -62,7 +62,7 @@ def needs_owner_amendment(f) -> bool:
 _HARNESS_OWNED = ("findings.jsonl", IMPACT, "budget_ledger.json", "_task_input.json", "_task_output.json", "run_state.json", "trace.jsonl", "validator_history.jsonl",
                   "done_when_registry.json", "open_problems.md", "open_problems.json", "final_gate.json",
                   "gate_r", "fix_plan_r", "fix_progress_r", "models/pipeline_state.json", "models/pipeline_report.json",
-                  "analysis/", "engine_build/")
+                  "analysis/", "engine_build/", "models/ext/engine_")
 
 FIX_PLANNER_PROMPT = """\
 You are the fix planner of a modeling run. The harness runs the pipeline; you decide what
@@ -106,8 +106,9 @@ Rules:
 - Order: what unblocks most first; a finding that other findings depend on before them.
 - Rethink, not patch, when the finding is structural, when the impact history shows the same
   finding patched twice without its check passing, or when several blocking findings point at one
-  mechanism. A rethink names owner_state SPEC (the decision spec is wrong) or ENGINE_CHOICE
-  (the engine or its configuration cannot represent what the question needs).
+  mechanism. A rethink names owner_state SPEC (the decision spec is wrong), ENGINE_CHOICE
+  (the engine or its configuration cannot represent what the question needs), or ENGINE_BUILD
+  (an agent-built engine defect targeting ENGINE, at most one repair per run).
 - A SPEC rethink also carries "patch": the amendment it asks for, in machine-readable form:
   {"id": "<short id>", "reason": "<why, in words>", "spec": [{"set": "<path>", "value": <new value>},
   {"add": "<path>", "value": <value>}, {"remove": "<path>"}]}. A path is a dotted key of
@@ -263,7 +264,7 @@ def validate_plan(plan, packet: dict) -> list[str]:
         if len(fids) > 1 and not (isinstance(t.get("files"), list) and t["files"]):
             errs.append(f"{tid}: groups {len(fids)} findings, so it must name the files they share")
         if t.get("action") == "rethink" and t.get("owner_state") not in RETHINK_STATES:
-            errs.append(f"{tid}: a rethink names owner_state SPEC or ENGINE_CHOICE")
+            errs.append(f"{tid}: a rethink names owner_state SPEC or ENGINE_CHOICE (or ENGINE_BUILD for a built engine)")
         if not str(t.get("brief") or "").strip():
             errs.append(f"{tid}: empty brief")
         if t.get("action") != "rethink":

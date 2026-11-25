@@ -163,6 +163,40 @@ def _self_test() -> int:
         rc = main([td, "--pipeline", "v2", "--commit", "abc1234", "--expect", "run_state.json:stage=DONE"])
         ok(rc == 0, f"SC8 the CLI passes a run that holds every marker ({rc})")
         ok(main([v1, "--pipeline", "v2"]) == 1, "SC9 the CLI fails the 2026-11-05 run (no pipeline recorded)")
+        # BE37 (docs/design/agent-built-engines.md §6.3): the 11 built-engine smoke markers pass on a fixture run dir
+        be_dir = os.path.join(td, "be_smoke")
+        os.makedirs(os.path.join(be_dir, "engine_build", "bench"), exist_ok=True)
+        json.dump({"pipeline": "v2", "commit": "abc1234def"}, open(os.path.join(be_dir, "metadata.json"), "w"))
+        json.dump({"state": "FINAL", "history": [{"to": "ENGINE_BUILD"}, {"to": "ENGINE_REVIEW"}]},
+                  open(os.path.join(be_dir, "run_state.json"), "w"))
+        json.dump({"request_sha256": "a" * 64}, open(os.path.join(be_dir, "engine_build", "request.json"), "w"))
+        json.dump({"status": "admitted", "hidden_commitment": "b" * 64, "reuse_key": "c" * 64},
+                  open(os.path.join(be_dir, "engine_build", "admission.json"), "w"))
+        open(os.path.join(be_dir, "engine_build", "admission_sheet.md"), "w").write("# Admission sheet\n")
+        json.dump({"by": "lead", "snapshot_sha256": "d" * 64},
+                  open(os.path.join(be_dir, "engine_build", "signoff.json"), "w"))
+        json.dump({"engine": {"ref": "toolkit.engines.built:BuiltEngine", "config": {}}},
+                  open(os.path.join(be_dir, "engine_choice.json"), "w"))
+        open(os.path.join(be_dir, "engine_build", "bench", "results.yaml"), "w").write(
+            "engine_identity:\n  code_sha256: " + "e" * 64 + "\n"
+        )
+        json.dump({"sessions": [{"stage": "ENGINE_ADMIT", "total_cost_usd": 0.0}]},
+                  open(os.path.join(be_dir, "budget_ledger.json"), "w"))
+        be_markers = [
+            'run_state.json~"ENGINE_BUILD"',
+            'run_state.json~"ENGINE_REVIEW"',
+            "engine_build/request.json:request_sha256",
+            "engine_build/admission.json:status=admitted",
+            "engine_build/admission.json:hidden_commitment",
+            "engine_build/admission.json:reuse_key",
+            "engine_build/admission_sheet.md",
+            "engine_build/signoff.json:by",
+            "engine_choice.json:engine.ref=toolkit.engines.built:BuiltEngine",
+            "engine_build/bench/results.yaml:engine_identity.code_sha256",
+            "budget_ledger.json~ENGINE_ADMIT",
+        ]
+        be_miss = check(be_dir, be_markers)
+        ok(be_miss == [], f"BE37 all §6.3 built-engine smoke markers pass on fixture run dir ({be_miss})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

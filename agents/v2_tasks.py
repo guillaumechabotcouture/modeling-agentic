@@ -47,6 +47,8 @@ class Tasks(Protocol):
     def sign_spec(self, run_dir: str) -> TaskResult: ...
     def draft_evidence(self, run_dir: str, rel: str, required: dict, feedback: list) -> TaskResult: ...
     def pick_engine(self, spec: dict, eligible: list[dict], rethink: dict | None = None) -> TaskResult: ...
+    def build_engine(self, run_dir: str, packet: dict, engine_id: str) -> TaskResult: ...
+    def critique_engine(self, run_dir: str, round_n: int, feedback: list | None = None) -> TaskResult: ...
     def critique(self, run_dir: str, reviewer: str, round_n: int, feedback: list | None = None) -> TaskResult: ...
     def plan_fixes(self, packet: dict) -> TaskResult: ...
     def fix(self, task: dict, run_dir: str, evidence: dict | None) -> TaskResult: ...
@@ -154,6 +156,33 @@ class StubTasks:
         if pick not in refs:
             return self._r("pick_engine", False, note=f"{pick} is not eligible")
         return self._r("pick_engine", output={"engine": pick, "why": "stub: first eligible engine"})
+
+    def build_engine(self, run_dir, packet, engine_id):
+        """script['build_engine']: callable(run_dir, packet, engine_id) -> {rel: bytes|str} | None, or that mapping."""
+        be = self.s.get("build_engine")
+        files = be(run_dir, packet, engine_id) if callable(be) else be
+        if isinstance(files, dict):
+            base = f"models/ext/engine_{engine_id}"
+            for rel, content in files.items():
+                raw = content if isinstance(content, bytes) else str(content).encode("utf-8")
+                _sio().write_nofollow(run_dir, f"{base}/{rel}", raw, atomic=True)
+            return self._r(f"build_engine:{engine_id}", output={"ok": True, "notes": "stub build"})
+        if files is False:
+            return self._r(f"build_engine:{engine_id}", False, note="stub build failed")
+        return self._r(f"build_engine:{engine_id}", output={"ok": True, "notes": "stub build (no files written)"})
+
+    def critique_engine(self, run_dir, round_n, feedback=None):
+        """script['critique_engine']: callable(run_dir, round_n, feedback) -> dict | str | None, or dict/str."""
+        ce = self.s.get("critique_engine")
+        doc = ce(run_dir, round_n, feedback) if callable(ce) else ce
+        if isinstance(doc, str):
+            _sio().write_nofollow(run_dir, "critique_engine.yaml", doc.encode("utf-8"), atomic=True)
+        elif isinstance(doc, dict):
+            _yaml_dump(doc, os.path.join(run_dir, "critique_engine.yaml"), run_dir)
+        elif doc is None:
+            _yaml_dump({"reviewer": "critique-engine", "round": round_n, "verdict": "PASS", "blockers": []},
+                       os.path.join(run_dir, "critique_engine.yaml"), run_dir)
+        return self._r(f"critique_engine:{round_n}")
 
     def critique(self, run_dir, reviewer, round_n, feedback=None):
         import done_when as DW
