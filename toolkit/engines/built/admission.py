@@ -911,8 +911,9 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
     hor = _default_horizon(spec_raw, req)
 
     # Map intervention decision inputs (BOTH parameter AND unit_attribute) to their owning component
-    # so base points turn that component ON when perturbing the input.
-    input_to_comp: dict[tuple[str, str], tuple[str, object]] = {}
+    # so base points activate that component (evaluating across all active values up to 4 when a
+    # component has multiple active modes so value ordering never hides an effect).
+    input_to_comp: dict[tuple[str, str], tuple[str, list]] = {}
     for cname, spec_or_items in (req.get("decision_inputs") or {}).items():
         items = spec_or_items if isinstance(spec_or_items, list) else (spec_or_items.get("inputs") or [])
         active_vals = [v for v in (comp_specs.get(cname, {}).get("values") or []) if v != comp_specs.get(cname, {}).get("absent")]
@@ -920,7 +921,7 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
             for it in items:
                 if isinstance(it, Mapping) and it.get("kind") in ("parameter", "unit_attribute"):
                     k_norm = "attribute" if it["kind"] == "unit_attribute" else "parameter"
-                    input_to_comp[(k_norm, str(it["name"]))] = (cname, active_vals[-1])
+                    input_to_comp[(k_norm, str(it["name"]))] = (cname, list(active_vals[:4]))
 
     # Generate base units (interior of domains)
     base_units = generate_domain_units(req, n_bases, rng, ref_units=ref_units)
@@ -936,7 +937,7 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
 
     # Build the complete A6/A7 evaluation plan across ALL inputs and run in a SINGLE worker batch
     all_cases: list[tuple[dict, UnitSpec, Package, Horizon, int]] = []
-    input_plan: list[tuple[str, dict, list, int, int]] = []
+    input_plan: list[tuple[str, dict, list, int, int, int]] = []
     for iname, out_signs in sorted(expected_effects.items()):
         if iname in inert:
             continue
@@ -952,85 +953,100 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
             pts = _domain_points_attr(attr_specs[iname], ref_vec=ref_v)
         else:
             continue
+        if (ikind, iname) in input_to_comp:
+            oc, ovas = input_to_comp[(ikind, iname)]
+            base_pkgs = [dict(absent_pkg, **{oc: ov}) for ov in ovas]
+        else:
+            base_pkgs = [dict(absent_pkg)]
         start_idx = len(all_cases)
-        for bi, bu in enumerate(base_units):
-            base_pkg = dict(absent_pkg)
-            if (ikind, iname) in input_to_comp:
-                oc, ov = input_to_comp[(ikind, iname)]
-                base_pkg[oc] = ov
-            for pt in pts:
-                prm = {iname: float(pt)} if ikind == "parameter" else {}
-                pk_map = dict(base_pkg, **{iname: pt}) if ikind == "component" else dict(base_pkg)
-                u_use = UnitSpec(f"a6_{bi}", dict(bu.attributes, **{iname: pt})) if ikind == "attribute" else bu
-                for s in seeds:
-                    all_cases.append((prm, u_use, Package(f"p_{bi}", pk_map), hor, s))
-        input_plan.append((iname, dict(out_signs), pts, start_idx, len(all_cases)))
+        for base_pkg in base_pkgs:
+            for bi, bu in enumerate(base_units):
+                for pt in pts:
+                    prm = {iname: float(pt)} if ikind == "parameter" else {}
+                    pk_map = dict(base_pkg, **{iname: pt}) if ikind == "component" else dict(base_pkg)
+                    u_use = UnitSpec(f"a6_{bi}", dict(bu.attributes, **{iname: pt})) if ikind == "attribute" else bu
+                    for s in seeds:
+                        all_cases.append((prm, u_use, Package(f"p_{bi}", pk_map), hor, s))
+        input_plan.append((iname, dict(out_signs), pts, len(base_pkgs), start_idx, len(all_cases)))
 
-    all_outs = cand.run_many(all_cases) if all_cases else []
+    chunk_sz = 256 if cand.kind == "closed_form" else 32
+    all_outs: list[Outcomes] = []
+    for a in range(0, len(all_cases), chunk_sz):
+        all_outs.extend(cand.run_many(all_cases[a:a + chunk_sz]))
     for o in all_outs:
         pr = (o.meta or {}).get("param_reads") or {}
         reads_build_all.update(pr.get("build") or [])
         reads_outcomes_all.update(pr.get("read_outcomes") or [])
     n_seeds = len(seeds)
 
-    for iname, out_signs, pts, start_idx, end_idx in input_plan:
+    for iname, out_signs, pts, n_modes, start_idx, end_idx in input_plan:
         in_outs = all_outs[start_idx:end_idx]
         n_pts = len(pts)
+        stride_mode = len(base_units) * n_pts * n_seeds
 
         for oname, sign in sorted(out_signs.items()):
             pair_total += 1
-            moved_bases = 0
+            best_moved_bases = 0
             sign_ok_all = True
             max_rel_change = 0.0
-            for bi in range(len(base_units)):
-                ys_by_pt: list[list[float]] = []
-                for pi in range(n_pts):
-                    off = (bi * n_pts + pi) * n_seeds
-                    ys_by_pt.append([_extract_output(o, oname) for o in in_outs[off:off + n_seeds]])
-                # Compare endpoints (pt[-1] vs pt[0]) and check monotonicity across ALL adjacent ordered steps
-                diffs = [ys_by_pt[-1][s] - ys_by_pt[0][s] for s in range(len(seeds))]
-                y0_mean = float(np.mean(ys_by_pt[0]))
-                floor = max(abs_floor, rel_floor * abs(y0_mean))
-                d_mean = float(np.mean(diffs))
-                rel_ch = abs(d_mean) / max(abs(y0_mean), 1e-12)
-                max_rel_change = max(max_rel_change, rel_ch)
-                if stochastic and len(seeds) > 1:
-                    se = float(np.std(diffs, ddof=1)) / math.sqrt(len(seeds))
-                    lo_ci, hi_ci = d_mean - z_crit * se, d_mean + z_crit * se
-                    moved = (lo_ci > floor) or (hi_ci < -floor)
-                else:
-                    span = max(float(np.mean(ys)) for ys in ys_by_pt) - min(float(np.mean(ys)) for ys in ys_by_pt)
-                    moved = (span > floor) if sign == "nonzero" else (abs(d_mean) > floor)
-                if moved:
-                    moved_bases += 1
-                    outputs_moved.add(oname)
-                    ordered = all(isinstance(p, (int, float, bool)) for p in pts) and len(ys_by_pt) >= 2
-                    if sign == "+":
-                        if not (d_mean > 0):
-                            sign_ok_all = False
-                        elif ordered:
-                            for j in range(len(ys_by_pt) - 1):
-                                s_diffs = [ys_by_pt[j + 1][s] - ys_by_pt[j][s] for s in range(len(seeds))]
-                                s_mean = float(np.mean(s_diffs))
-                                if stochastic and len(seeds) > 1:
-                                    s_se = float(np.std(s_diffs, ddof=1)) / math.sqrt(len(seeds))
-                                    if s_mean + z_crit * s_se < -floor:
-                                        sign_ok_all = False
-                                elif s_mean < -floor:
-                                    sign_ok_all = False
-                    elif sign == "-":
-                        if not (d_mean < 0):
-                            sign_ok_all = False
-                        elif ordered:
-                            for j in range(len(ys_by_pt) - 1):
-                                s_diffs = [ys_by_pt[j + 1][s] - ys_by_pt[j][s] for s in range(len(seeds))]
-                                s_mean = float(np.mean(s_diffs))
-                                if stochastic and len(seeds) > 1:
-                                    s_se = float(np.std(s_diffs, ddof=1)) / math.sqrt(len(seeds))
-                                    if s_mean - z_crit * s_se > floor:
-                                        sign_ok_all = False
-                                elif s_mean > floor:
-                                    sign_ok_all = False
+            for mi in range(n_modes):
+                mode_outs = in_outs[mi * stride_mode:(mi + 1) * stride_mode]
+                moved_bases = 0
+                mode_sign_ok = True
+                for bi in range(len(base_units)):
+                    ys_by_pt: list[list[float]] = []
+                    for pi in range(n_pts):
+                        off = (bi * n_pts + pi) * n_seeds
+                        ys_by_pt.append([_extract_output(o, oname) for o in mode_outs[off:off + n_seeds]])
+                    # Compare endpoints (pt[-1] vs pt[0]) and check monotonicity across ALL adjacent ordered steps
+                    diffs = [ys_by_pt[-1][s] - ys_by_pt[0][s] for s in range(len(seeds))]
+                    y0_mean = float(np.mean(ys_by_pt[0]))
+                    floor = max(abs_floor, rel_floor * abs(y0_mean))
+                    d_mean = float(np.mean(diffs))
+                    rel_ch = abs(d_mean) / max(abs(y0_mean), 1e-12)
+                    max_rel_change = max(max_rel_change, rel_ch)
+                    if stochastic and len(seeds) > 1:
+                        se = float(np.std(diffs, ddof=1)) / math.sqrt(len(seeds))
+                        lo_ci, hi_ci = d_mean - z_crit * se, d_mean + z_crit * se
+                        moved = (lo_ci > floor) or (hi_ci < -floor)
+                    else:
+                        span = max(float(np.mean(ys)) for ys in ys_by_pt) - min(float(np.mean(ys)) for ys in ys_by_pt)
+                        moved = (span > floor) if sign == "nonzero" else (abs(d_mean) > floor)
+                    if moved:
+                        moved_bases += 1
+                        outputs_moved.add(oname)
+                        ordered = all(isinstance(p, (int, float, bool)) for p in pts) and len(ys_by_pt) >= 2
+                        if sign == "+":
+                            if not (d_mean > 0):
+                                mode_sign_ok = False
+                            elif ordered:
+                                for j in range(len(ys_by_pt) - 1):
+                                    s_diffs = [ys_by_pt[j + 1][s] - ys_by_pt[j][s] for s in range(len(seeds))]
+                                    s_mean = float(np.mean(s_diffs))
+                                    if stochastic and len(seeds) > 1:
+                                        s_se = float(np.std(s_diffs, ddof=1)) / math.sqrt(len(seeds))
+                                        if s_mean + z_crit * s_se < -floor:
+                                            mode_sign_ok = False
+                                    elif s_mean < -floor:
+                                        mode_sign_ok = False
+                        elif sign == "-":
+                            if not (d_mean < 0):
+                                mode_sign_ok = False
+                            elif ordered:
+                                for j in range(len(ys_by_pt) - 1):
+                                    s_diffs = [ys_by_pt[j + 1][s] - ys_by_pt[j][s] for s in range(len(seeds))]
+                                    s_mean = float(np.mean(s_diffs))
+                                    if stochastic and len(seeds) > 1:
+                                        s_se = float(np.std(s_diffs, ddof=1)) / math.sqrt(len(seeds))
+                                        if s_mean - z_crit * s_se > floor:
+                                            mode_sign_ok = False
+                                    elif s_mean > floor:
+                                        mode_sign_ok = False
+                if moved_bases > best_moved_bases:
+                    best_moved_bases = moved_bases
+                if moved_bases > 0 and not mode_sign_ok:
+                    sign_ok_all = False
+            moved_bases = best_moved_bases
             ok_a6 = moved_bases >= min(min_moving, n_bases)
             ok_a7 = ok_a6 and sign_ok_all  # A7 CANNOT pass vacuously if A6 failed (BE4)
             wiring_rows.append({
