@@ -9929,13 +9929,13 @@ def _self_test_built_engine(ok, td: str) -> None:
             "outcomes_reported": ["cases"],
             "calibration": {"method": "none"},
             "uncertainty": {
-                "sources": [{"kind": "engine_parameters"}],
-                "excluded": [{"kind": k, "reason": "test"} for k in ("costs", "calibration", "emulator")],
+                "sources": [{"kind": "costs", "items": {"ca": [0.8, 1.2]}}],
+                "excluded": [{"kind": k, "reason": "test"} for k in ("engine_parameters", "calibration", "emulator")],
             },
             "analysis": {
                 "evaluation": "direct",
                 "stability": {"holdout_group": "grp", "covariates": ["haz"]},
-                "sensitivity": {"parameters": "fitted"},
+                "sensitivity": {"parameters": ["base_scale"]},
                 "decision_tests": [],
             },
             "deliverable": {
