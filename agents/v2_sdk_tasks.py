@@ -96,7 +96,13 @@ in a spec that is not one. A named configuration is used as written, and the nam
 the only one considered. Only when no registered engine card represents a mechanism the decision turns on
 (checked against the full registry, or with a `why` naming a request mechanism no eligible card has),
 you may declare `engine: {{build: {{id, kind, why, mechanisms, request}}}}` (or `{{auto: true, candidates: [...], build: {{...}}}}`)
-following `toolkit/engines/built/requested.py`. The harness has copied the question's input files into data/inputs/ (same
+following `toolkit/engines/built/requested.py`. Built engines implement `describe()`, `parameters()`, and
+`evaluate()` (or `build_sim()`/`read_outcomes()`), never `initial_state()`: when pairing `engine.build` with
+`calibration.targets.kind: observations` observing `latent: immunity` or `susceptible`, declare `immunity`
+(or `susceptible`) in `request.outputs.per_capita` so the harness reads per-group shares from `Outcomes.per_capita`.
+Under `engine.build`, every active component value used by `options.engine_map` must be covered by a
+`request.trials` entry (or an explicit `engine_departures` entry with a decision test) for admission check A8.
+Quote ISO `decision_date` values (e.g. `"2026-01-01"`) or write an integer year. The harness has copied the question's input files into data/inputs/ (same
 relative paths; their sha256 in data/inputs_provenance.json): read them. You write code, never
 tables. For each file the spec reads that is not a staged input (the units table, calibration
 targets, cost tables), write one script under data/derive/ and declare it in data/derivations.yaml
