@@ -113,20 +113,26 @@ class CandidateEngine:
                 BWORK.record_unsandboxed(self.run_dir, action=action, engine_id=self.id)
         return res
 
+    def _introspect(self) -> None:
+        if self._card_cache is None or self._params_cache is None or self._has_batch_cache is None:
+            info = self._call("introspect")["result"]
+            d = info["card"]
+            self._card_cache = EngineCard(**{k: d[k] for k in EngineCard.__dataclass_fields__ if k in d})
+            self._params_cache = [ParamSpec(**p) for p in info["parameters"]]
+            self._has_batch_cache = bool(info["has_batch"])
+
     def has_batch(self) -> bool:
-        if self._has_batch_cache is None:
-            self._has_batch_cache = bool(self._call("has_batch")["result"])
-        return self._has_batch_cache
+        self._introspect()
+        return bool(self._has_batch_cache)
 
     def describe(self) -> EngineCard:
-        if self._card_cache is None:
-            d = self._call("describe")["result"]
-            self._card_cache = EngineCard(**{k: d[k] for k in EngineCard.__dataclass_fields__ if k in d})
+        self._introspect()
+        assert self._card_cache is not None
         return self._card_cache
 
     def parameters(self) -> list[ParamSpec]:
-        if self._params_cache is None:
-            self._params_cache = [ParamSpec(**p) for p in self._call("parameters")["result"]]
+        self._introspect()
+        assert self._params_cache is not None
         return list(self._params_cache)
 
     def _item_payload(self, params: dict, unit: UnitSpec, package: Package, horizon: Horizon,

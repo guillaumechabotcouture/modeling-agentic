@@ -595,8 +595,7 @@ def check_a2(cand: BCAND.CandidateEngine, build_decl: Mapping, units: list[UnitS
     else:
         su = units[0]
     spkg = packages[0]
-    o_s1 = cand.run({}, su, spkg, horizon, seed=101, hash_seed="0")
-    o_s2 = cand.run({}, su, spkg, horizon, seed=202, hash_seed="0")
+    o_s1, o_s2 = cand.run_many([({}, su, spkg, horizon, 101), ({}, su, spkg, horizon, 202)], hash_seed="0")
     same_seeds, _ = _outcomes_close(o_s1, o_s2, rel=tol, abs_tol=tol)
     if stochastic and same_seeds:
         probs.append("stochastic engine produced identical outcomes for different seeds at seed_test_setting")
@@ -650,9 +649,9 @@ def check_a3(cand: BCAND.CandidateEngine, units: list[UnitSpec], packages: list[
     n_total, n_pass = 0, 0
     for u in units[:4]:
         b_outs = cand.run_batch(p_sets, u, batch_pkgs, horizon, seed=7)
-        for prm, pk, bo in zip(p_sets, batch_pkgs, b_outs):
+        s_outs = cand.run_many([(prm, u, pk, horizon, 7) for prm, pk in zip(p_sets, batch_pkgs)])
+        for prm, pk, bo, so in zip(p_sets, batch_pkgs, b_outs, s_outs):
             n_total += 1
-            so = cand.run(prm, u, pk, horizon, seed=7)
             same, worst = _outcomes_close(bo, so, rel=tol, abs_tol=tol)
             if same:
                 n_pass += 1
@@ -935,6 +934,9 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
 
     seeds = [31 + i for i in range(k_seeds)]
 
+    # Build the complete A6/A7 evaluation plan across ALL inputs and run in a SINGLE worker batch
+    all_cases: list[tuple[dict, UnitSpec, Package, Horizon, int]] = []
+    input_plan: list[tuple[str, dict, list, int, int]] = []
     for iname, out_signs in sorted(expected_effects.items()):
         if iname in inert:
             continue
@@ -950,10 +952,7 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
             pts = _domain_points_attr(attr_specs[iname], ref_vec=ref_v)
         else:
             continue
-
-        # Run all (base_point, domain_point, seed) cases for this input ONCE via run_many
-        # (amortizing sandbox startup AND avoiding duplicate simulations across multiple outputs).
-        in_cases: list[tuple[dict, UnitSpec, Package, Horizon, int]] = []
+        start_idx = len(all_cases)
         for bi, bu in enumerate(base_units):
             base_pkg = dict(absent_pkg)
             if (ikind, iname) in input_to_comp:
@@ -964,14 +963,19 @@ def check_a6_a7(cand: BCAND.CandidateEngine, build_decl: Mapping, spec_raw: Mapp
                 pk_map = dict(base_pkg, **{iname: pt}) if ikind == "component" else dict(base_pkg)
                 u_use = UnitSpec(f"a6_{bi}", dict(bu.attributes, **{iname: pt})) if ikind == "attribute" else bu
                 for s in seeds:
-                    in_cases.append((prm, u_use, Package(f"p_{bi}", pk_map), hor, s))
-        in_outs = cand.run_many(in_cases) if in_cases else []
-        for o in in_outs:
-            pr = (o.meta or {}).get("param_reads") or {}
-            reads_build_all.update(pr.get("build") or [])
-            reads_outcomes_all.update(pr.get("read_outcomes") or [])
+                    all_cases.append((prm, u_use, Package(f"p_{bi}", pk_map), hor, s))
+        input_plan.append((iname, dict(out_signs), pts, start_idx, len(all_cases)))
+
+    all_outs = cand.run_many(all_cases) if all_cases else []
+    for o in all_outs:
+        pr = (o.meta or {}).get("param_reads") or {}
+        reads_build_all.update(pr.get("build") or [])
+        reads_outcomes_all.update(pr.get("read_outcomes") or [])
+    n_seeds = len(seeds)
+
+    for iname, out_signs, pts, start_idx, end_idx in input_plan:
+        in_outs = all_outs[start_idx:end_idx]
         n_pts = len(pts)
-        n_seeds = len(seeds)
 
         for oname, sign in sorted(out_signs.items()):
             pair_total += 1
@@ -2166,10 +2170,10 @@ def _self_test() -> int:
 
     # BE17: reference off by 6% fails deterministic A11; stochastic fixture with 5% bias & huge noise is inconclusive
     td_det, _, _, _, _, adm_det = _run_fixture(None, ref_bias=0.06, require_reference=True, with_ref=True)
-    td_st, _, b_st, sp_st, _, _ = _run_fixture("stochastic_bias", stochastic=True, stochastic_sd=0.80,
-                                               require_reference=False, with_ref=False)
+    b_st = BFIX.two_group_sir_build(stochastic=True)
+    sp_st = BFIX.two_group_sir_spec(b_st)
     try:
-        cand_st = BCAND.CandidateEngine(BFIX.two_group_sir_files("stochastic_bias", stochastic_sd=0.80),
+        cand_st = BCAND.CandidateEngine(BFIX.two_group_sir_files("stochastic_bias", stochastic_sd=0.60),
                                         b_st, unsandboxed_ok=dev_un)
         ref_b = copy.deepcopy(b_st)
         ref_b["kind"] = "closed_form"
@@ -2183,7 +2187,6 @@ def _self_test() -> int:
            f"BE17 biased ref fails A11 ({adm_det['checks']['A11']['status']}); noisy biased stochastic is inconclusive ({a11_st['status']})")
     finally:
         td_det.cleanup()
-        td_st.cleanup()
 
     # BE33: admission compute reservation against run balance pauses before dispatch when balance < cap
     # and rejects non-finite (NaN/inf) amounts

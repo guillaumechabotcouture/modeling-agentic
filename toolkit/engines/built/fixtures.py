@@ -279,7 +279,7 @@ class TwoGroupSIR(ss.Module):
 
 
 class Model:
-    def __init__(self, dt_step: float = 0.5):
+    def __init__(self, dt_step: float = 1.0):
         self.dt_step = float(dt_step)
         self._saved_params = None
 
@@ -350,7 +350,7 @@ class Model:
             cases_g = np.array([-0.5, -0.5])
         if STOCH_SD > 0.0:
             rng = np.random.default_rng(int(sim.pars.rand_seed))
-            noise = float(rng.normal(0.0, STOCH_SD))
+            noise = float(rng.uniform(-STOCH_SD, STOCH_SD))
             cases_g = np.maximum(0.0, cases_g * (1.0 + noise))
             sev_g = np.maximum(0.0, sev_g * (1.0 + noise))
         if DEFECT == "stochastic_bias":
@@ -393,7 +393,7 @@ REL_BIAS = {float(rel_bias)!r}
 
 
 class Model:
-    def __init__(self, dt_step: float = 0.5):
+    def __init__(self, dt_step: float = 1.0):
         self.dt_step = float(dt_step)
 
     def describe(self) -> EngineCard:

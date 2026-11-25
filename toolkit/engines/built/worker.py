@@ -727,7 +727,13 @@ def _worker_child() -> int:
         files = {str(k): base64.b64decode(v) for k, v in req["files_b64"].items()}
         model = _load_model_from_bytes(files, req.get("config") or {})
         action = req["action"]
-        if action == "describe":
+        if action == "introspect":
+            result = {
+                "card": _serialize_card(model.describe()),
+                "parameters": [_serialize_param(p) for p in model.parameters()],
+                "has_batch": bool(callable(getattr(model, "run_batch_state", None))),
+            }
+        elif action == "describe":
             result = _serialize_card(model.describe())
         elif action == "parameters":
             result = [_serialize_param(p) for p in model.parameters()]
