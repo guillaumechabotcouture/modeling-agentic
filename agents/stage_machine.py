@@ -9816,9 +9816,9 @@ def _self_test_built_engine(ok, td: str) -> None:
                     "comp_a": {"inputs": [], "none_reason": "synthetic self-test component"},
                 },
                 "expected_effects": {
-                    "comp_a": {"cases": "-", "units_delivered": "+"},
-                    "base_scale": {"cases": "+"},
-                    "haz": {"cases": "+"},
+                    "comp_a": {"cases": "-", "surv": "+", "units_delivered": "+"},
+                    "base_scale": {"cases": "+", "surv": "-"},
+                    "haz": {"cases": "+", "surv": "-"},
                 },
                 "inert": {"N": {"reason": "per-capita outcomes invariant to N"}},
                 "seed_test_setting": {"unit": {"N": 5000.0, "haz": 0.25}},
@@ -9973,6 +9973,7 @@ def _self_test_built_engine(ok, td: str) -> None:
             return []
 
         def pipeline_steps(self, spec_path, run_dir):
+            import shlex
             code = (
                 "import json, os, yaml; "
                 "os.makedirs('analysis', exist_ok=True); os.makedirs('models', exist_ok=True); "
@@ -9984,7 +9985,7 @@ def _self_test_built_engine(ok, td: str) -> None:
             )
             return [{
                 "id": "analyze",
-                "cmd": [sys.executable, "-c", code],
+                "run": f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}",
                 "inputs": ["decision_spec.yaml", "engine_choice.json", "engine_build/admission.json"],
                 "outputs": ["analysis/analysis.json", "models/claims_ledger.yaml", "results.md"],
             }]
@@ -10126,7 +10127,7 @@ def _self_test_built_engine(ok, td: str) -> None:
     d30, T30, st30 = _mk_run("be30_repair", signoff="lead", build_fn=_build_30, max_rounds=2,
                              critics={1: {"critique-domain": [eng_bl1]}, 2: {"critique-domain": [eng_bl2]}})
     m30 = Machine(d30, T30, st30, backend=fast_b, log=lambda *a: None, cross_engine_check=False)
-    for _ in range(40):
+    for _ in range(60):
         if m30.st.state == "FINAL" or m30.st.paused:
             break
         m30.step()
