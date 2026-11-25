@@ -1082,11 +1082,11 @@ def _self_test() -> int:
                     components={"comp_a": [0, 1]}, unit_attributes={"N": "n", "rate_in": "r"},
                     outputs={"per_capita": ["cases", "severe", "immunity"], "windows": {"w0": ["prev"]},
                              "cost_drivers": ["units_delivered"]},
-                    age_groups=["g1", "g2"],
+                    age_groups=["g1", "g2"], valid_ranges={"rate_in": [0.01, 0.5]},
                 )
 
             def parameters(self):
-                return [ParamSpec("eff_a", "fixed", 0.6, 0.2, 0.9, "fraction", "test")]
+                return [ParamSpec(name="eff_a", value=0.6, kind="fixed", units="fraction", lo=0.2, hi=0.9, source="test")]
 
             def run(self, params, unit, package, horizon, seed):
                 r_in = float(unit.attributes["rate_in"])
