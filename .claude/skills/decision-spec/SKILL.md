@@ -31,7 +31,9 @@ draft with `python3 toolkit/spec/schema.py <run_dir>/decision_spec.yaml` until i
 2. **Engine.** Pick an engine whose card (`describe()`) covers the interventions, outputs
    and unit attributes the question needs. Read its card: components and their values,
    unit attributes and ranges, outputs, age groups, fitted parameters and benchmarks. If no
-   engine covers the question, say so; do not bend the question to an engine. Or write
+   registered engine covers the mechanisms the question requires, declare an agent-built
+   engine request under `engine.build` (see **Agent-built engines (`engine.build`)** below;
+   never bend the question to an engine that omits an essential mechanism). Or write
    `engine: auto` (optionally `{auto: true, candidates: [...]}`): the engine is then chosen
    after sign-off by the harness, which records it in `engine_choice.json`; the decision
    sections are checked at sign-off and the engine-dependent ones once the choice exists.
@@ -298,6 +300,31 @@ with nothing to allocate. Write `deliverable.kind: estimates`. The sections are 
 - **What the data do and do not determine** is computed, not written. Each undetermined parameter gets an automatic
   test at both ends of its declared range, and each output is classed `determined_by_data` or
   `set_by_declared_ranges`.
+
+## Agent-built engines (`engine.build`)
+
+When no registered engine in `toolkit/engines/registry.yaml` captures the mechanisms a
+question requires, declare `engine.build` instead of forcing an ill-fitting engine (the full
+request schema and example are in `toolkit/engines/built/requested.py`). After spec sign-off,
+the harness builds, admits (`A1`–`A11`), and signs the engine before analysis runs.
+
+- **Contract and outputs.** Declare `kind: starsim_module` or `kind: closed_form`, the
+  requested `age_groups`, `components`, `unit_attributes` (with valid ranges), `parameters`
+  (with `kind`, `default`, `range`, and `decision_inputs` mapping components to their
+  parameters and expected sign), `outputs` (`per_capita`, `windows`, `cost_drivers`), and
+  `trials` (every published or stated efficacy/rate benchmark).
+- **State observation targets.** When using `calibration: {method: posterior, targets: {kind:
+  observations, ...}}` with `latent: immunity` or `latent: susceptible`, include `immunity`
+  or `susceptible` in `engine.build.request.outputs.per_capita` so the admitted engine
+  exposes per-group state shares through the standard `Outcomes` contract (agent-built
+  engines do not implement `initial_state()`).
+- **Benchmark coverage (A8).** Every active component value used in `options.engine_map`
+  must be covered by either a benchmark entry in `engine.build.request.trials` (naming that
+  component value in its arms) or an explicit `engine_departures` entry with a
+  `decision_test` that varies its effect parameters; otherwise admission pauses for a spec
+  amendment.
+- **YAML types.** Quote ISO dates such as `decision_date: "2026-04-01"` so YAML loads them
+  as strings rather than `datetime.date` objects.
 
 ## Engine benchmarks that are not in band
 

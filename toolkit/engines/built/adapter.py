@@ -143,6 +143,7 @@ class BuiltEngine:
     """Sandboxed Engine-contract adapter for an admitted, signed agent-built engine snapshot."""
 
     ENGINE_REF = "toolkit.engines.built:BuiltEngine"
+    batch_equals_run = True
 
     def __init__(self, *, run_dir: str, _unsandboxed_ok: bool = False, **config):
         import yaml
@@ -329,8 +330,8 @@ class BuiltEngine:
             self._params_cache = [ParamSpec(**p) for p in res["result"]]
         return list(self._params_cache)
 
-    def run(self, params: dict, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> Outcomes:
-        payload = {
+    def _item_payload(self, params: dict, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> dict:
+        return {
             "params": dict(params or {}),
             "unit": {"id": unit.id, "attributes": dict(unit.attributes or {})},
             "package": {"id": package.id, "components": dict(package.components or {})},
@@ -339,10 +340,39 @@ class BuiltEngine:
                         "windows": {str(k): list(v) for k, v in (horizon.windows or {}).items()}},
             "seed": int(seed),
         }
+
+    def run(self, params: dict, unit: UnitSpec, package: Package, horizon: Horizon, seed: int) -> Outcomes:
+        payload = self._item_payload(params, unit, package, horizon, seed)
         res = self._call_worker("run", payload=payload)
         r = res["result"]
         return Outcomes(per_capita=r["per_capita"], windows=r["windows"],
                         cost_drivers=r["cost_drivers"], meta=r["meta"])
+
+    def run_batch(self, param_sets: list[dict], unit_or_units, packages,
+                  horizon: Horizon, seed: int) -> list[Outcomes]:
+        """Run a batch of `(params, unit, package)` evaluations inside chunked sandboxed workers (`run_many`).
+        Accepts either a single `UnitSpec`/`Package` (broadcast across items) or per-item sequences."""
+        n = len(param_sets)
+        if n == 0:
+            return []
+        units = [unit_or_units] * n if isinstance(unit_or_units, UnitSpec) else list(unit_or_units)
+        pkgs = [packages] * n if isinstance(packages, Package) else list(packages)
+        if len(units) != n or len(pkgs) != n:
+            raise ValueError(f"run_batch length mismatch: params={n}, units={len(units)}, packages={len(pkgs)}")
+        chunk_sz = 256 if self.kind == "closed_form" else 32
+        out: list[Outcomes] = []
+        for a in range(0, n, chunk_sz):
+            items = [
+                self._item_payload(p, u, pk, horizon, seed)
+                for p, u, pk in zip(param_sets[a:a + chunk_sz], units[a:a + chunk_sz], pkgs[a:a + chunk_sz])
+            ]
+            res_list = self._call_worker("run_many", payload={"items": items})["result"]
+            out.extend(
+                Outcomes(per_capita=r["per_capita"], windows=r["windows"],
+                         cost_drivers=r["cost_drivers"], meta=r["meta"])
+                for r in res_list
+            )
+        return out
 
 
 def _self_test_fixture(d: str, *, py_src: bytes, sign_by: str = "lead", spec_sign_by: str | None = None,
@@ -598,6 +628,19 @@ def _self_test() -> int:
             ok(v_doc is not None and v_why is None and t_doc is None and "tampered" in str(t_why),
                f"BE23b verified_results accepts public BuiltEngine ref + fitted.yaml and refuses post-construction edit "
                f"(ok={v_why}, tampered={t_why})")
+
+        # BE_BATCH1: run_batch matches run pair-by-pair for heterogeneous (params, unit, package) inputs
+        u_b0 = UnitSpec("b0", {"N": 1000.0, "rate_in": 0.15})
+        u_b1 = UnitSpec("b1", {"N": 2000.0, "rate_in": 0.30})
+        p_b0, p_b1 = Package("p0", {"comp_a": 0}), Package("p1", {"comp_a": 1})
+        h_b = Horizon(0.0, 1.0, (0.0, 1.0), {"w0": [0.0, 1.0]})
+        rb_outs = eng1.run_batch([{"eff_a": 0.3}, {"eff_a": 0.6}], [u_b0, u_b1], [p_b0, p_b1], h_b, 7)
+        s0 = eng1.run({"eff_a": 0.3}, u_b0, p_b0, h_b, 7)
+        s1 = eng1.run({"eff_a": 0.6}, u_b1, p_b1, h_b, 7)
+        ok(eng1.batch_equals_run is True and len(rb_outs) == 2
+           and rb_outs[0].per_capita == s0.per_capita and rb_outs[1].per_capita == s1.per_capita
+           and rb_outs[0].cost_drivers == s0.cost_drivers and rb_outs[1].cost_drivers == s1.cost_drivers,
+           "BE_BATCH1 BuiltEngine.run_batch matches run() pair-by-pair on heterogeneous units/packages")
 
         # BE19e + P1-18: tampered snapshot file refused on new construction, while live adapter keeps cached code_sha256
         sdir = os.path.join(d1, "engine_build", "snapshots", info1["snapshot_sha256"])

@@ -29,6 +29,7 @@ class CandidateEngine:
 
     ENGINE_REF = "toolkit.engines.built:BuiltEngine"
     _direct_runner = True
+    batch_equals_run = True
 
     def __init__(
         self,
@@ -165,19 +166,38 @@ class CandidateEngine:
         return Outcomes(per_capita=r["per_capita"], windows=r["windows"],
                         cost_drivers=r["cost_drivers"], meta=r["meta"])
 
-    def run_batch(self, param_sets: list[dict], unit: UnitSpec, packages: list[Package],
+    def run_batch(self, param_sets: list[dict], unit_or_units, packages,
                   horizon: Horizon, seed: int, *, hash_seed: str | None = None,
                   id_salt: str | None = None, age_shares: Mapping | None = None) -> list[Outcomes]:
-        items = [
-            self._item_payload(prm, unit, pkg, horizon, seed, age_shares=age_shares)
-            for prm, pkg in zip(param_sets, packages)
-        ]
-        res_list = self._call("run_batch", payload={"items": items}, hash_seed=hash_seed, id_salt=id_salt)["result"]
-        return [
-            Outcomes(per_capita=r["per_capita"], windows=r["windows"],
-                     cost_drivers=r["cost_drivers"], meta=r["meta"])
-            for r in res_list
-        ]
+        n = len(param_sets)
+        if n == 0:
+            return []
+        pkgs = [packages] * n if isinstance(packages, Package) else list(packages)
+        if len(pkgs) != n:
+            raise ValueError(f"run_batch length mismatch: params={n}, packages={len(pkgs)}")
+        if isinstance(unit_or_units, UnitSpec):
+            items = [
+                self._item_payload(prm, unit_or_units, pkg, horizon, seed, age_shares=age_shares)
+                for prm, pkg in zip(param_sets, pkgs)
+            ]
+            res_list = self._call("run_batch", payload={"items": items}, hash_seed=hash_seed, id_salt=id_salt)["result"]
+            return [
+                Outcomes(per_capita=r["per_capita"], windows=r["windows"],
+                         cost_drivers=r["cost_drivers"], meta=r["meta"])
+                for r in res_list
+            ]
+        units = list(unit_or_units)
+        if len(units) != n:
+            raise ValueError(f"run_batch length mismatch: params={n}, units={len(units)}, packages={len(pkgs)}")
+        chunk_sz = 256 if self.kind == "closed_form" else 32
+        out: list[Outcomes] = []
+        for a in range(0, n, chunk_sz):
+            cases = [
+                (prm, u, pkg, horizon, seed)
+                for prm, u, pkg in zip(param_sets[a:a + chunk_sz], units[a:a + chunk_sz], pkgs[a:a + chunk_sz])
+            ]
+            out.extend(self.run_many(cases, hash_seed=hash_seed, id_salt=id_salt))
+        return out
 
     def run_many(self, cases: list[tuple[dict, UnitSpec, Package, Horizon, int]], *,
                  hash_seed: str | None = None, id_salt: str | None = None) -> list[Outcomes]:

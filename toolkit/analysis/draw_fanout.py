@@ -125,6 +125,8 @@ def config(A) -> dict | None:
     off = None
     if getattr(A.eng, "batch_equals_run", False) is not True:
         off = "the engine does not declare batch_equals_run, so its results may depend on the worker process"
+    elif isinstance(A.spec.raw.get("engine"), dict) and "build" in A.spec.raw["engine"]:
+        off = "agent-built engines execute locally inside the run's verified bubblewrap sandbox"
     else:
         out = [f for f in _engine_files(A) if not _shipped(f, kw["run_dir"])]
         if out:

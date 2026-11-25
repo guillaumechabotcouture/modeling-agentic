@@ -204,6 +204,21 @@ def problems(spec, card, pnames) -> list[str]:
     return bad
 
 
+def _extract_s_start(o, groups: list[str]) -> np.ndarray | None:
+    """Per-group susceptible share from `o.meta['s_start']` (compartmental engines), or from
+    `o.per_capita['susceptible']` / `1 - o.per_capita['immunity']` for standard Engine contracts
+    (including agent-built engines) that do not expose `initial_state()`."""
+    meta = getattr(o, "meta", None)
+    if isinstance(meta, dict) and "s_start" in meta:
+        return np.asarray(meta["s_start"], float)
+    pc = getattr(o, "per_capita", None) or {}
+    if isinstance(pc.get("susceptible"), dict) and all(g in pc["susceptible"] for g in groups):
+        return np.asarray([float(pc["susceptible"][g]) for g in groups], float)
+    if isinstance(pc.get("immunity"), dict) and all(g in pc["immunity"] for g in groups):
+        return np.asarray([1.0 - float(pc["immunity"][g]) for g in groups], float)
+    return None
+
+
 def _state_targets_informed(spec, rows, attr, params, pri_decl, pk, groups, nuis=()) -> list[str]:
     """When every target observes pre-epidemic state (immunity or susceptible), at least one calibrated engine
     parameter or per-unit attribute (or observation bias parameter when no engine parameter/attribute is calibrated)
@@ -218,9 +233,17 @@ def _state_targets_informed(spec, rows, attr, params, pri_decl, pk, groups, nuis
                 "(the observations inform nothing)"]
     from toolkit.analysis.calibration import Prior
     from toolkit.analysis.model import calibrated_value, group_sizes
+    from toolkit.engines.built.requested import RequestedEngine
     from toolkit.engines.contract import Package, UnitSpec
     from toolkit.spec import engine_parameters as PV
     eng = spec.engine()
+    if isinstance(eng, RequestedEngine):
+        pc_outs = set((eng.describe().outputs or {}).get("per_capita") or [])
+        if "immunity" not in pc_outs and "susceptible" not in pc_outs:
+            return ["calibration.targets: agent-built engines expose per-group state shares through "
+                    "`outputs.per_capita` (`immunity` or `susceptible`), not `initial_state()`; declare "
+                    "`immunity` or `susceptible` in `engine.build.request.outputs.per_capita`"]
+        return []
     has_init = callable(getattr(eng, "initial_state", None))
     horizon = None if has_init else spec.horizon()
     seed = int(((spec.raw.get("analysis") or {}).get("direct") or {}).get("seed", 1))
@@ -246,6 +269,10 @@ def _state_targets_informed(spec, rows, attr, params, pri_decl, pk, groups, nuis
             w = N[idx]
             wsum = float(w.sum())
             if wsum <= 0.0:
+                if len(idx) == 1:
+                    v = float(s[idx[0]])
+                    out.append(1.0 - v if r["latent"] == "immunity" else v)
+                    continue
                 raise ValueError(f"observed groups {r['groups']} have zero population weight")
             val = float(np.dot(w, 1.0 - s[idx]) / wsum) if r["latent"] == "immunity" else float(np.dot(w, s[idx]) / wsum)
             out.append(val)
@@ -268,10 +295,11 @@ def _state_targets_informed(spec, rows, attr, params, pri_decl, pk, groups, nuis
                 s = np.asarray(st["s_start"], float)
             else:
                 o = eng.run(th, us, epkg, horizon, seed)
-                if "s_start" not in o.meta:
-                    raise ValueError("engine output meta lacks s_start for pre-epidemic state target")
+                s = _extract_s_start(o, groups)
+                if s is None:
+                    raise ValueError("engine output lacks meta['s_start'] and per_capita['immunity'|'susceptible'] "
+                                     "for pre-epidemic state target")
                 gsz = group_sizes({"meta": o.meta}, pops, u_rows[uid])
-                s = np.asarray(o.meta["s_start"], float)
             N = np.asarray([float(gsz.get(g, 0.0)) for g in groups])
             return row_shares(pair_rows, N, s)
 
@@ -394,7 +422,11 @@ class ObservedProblem:
             from toolkit.analysis.model import group_sizes
             gsz = group_sizes({"meta": o.meta}, self.pops, self.unit_rows[u])   # as the aggregate outcomes weight
             N = np.asarray([float(gsz.get(g, 0.0)) for g in self.groups])
-            res[i][(u, k)] = (N, np.asarray(o.meta["s_start"], float), o)
+            s_arr = _extract_s_start(o, self.groups)
+            if s_arr is None and any(r["latent"] in STATE for r in self.rows):
+                ok[i] = False
+                continue
+            res[i][(u, k)] = (N, s_arr, o)
         return [r if ok[i] else None for i, r in enumerate(res)]
 
     def _run(self, params, units, packages):
@@ -404,27 +436,46 @@ class ObservedProblem:
         return out
 
     def _run_split(self, params, units, packages):
-        try:
-            return self.eng.run_batch(params, units, packages, self.horizon, int(self.model.seed))
-        except RuntimeError:
-            if len(params) == 1:
+        if callable(getattr(self.eng, "run_batch", None)):
+            try:
+                return self.eng.run_batch(params, units, packages, self.horizon, int(self.model.seed))
+            except RuntimeError:
+                if len(params) == 1:
+                    self.failed += 1
+                    return [None]
+                h = len(params) // 2
+                return (self._run_split(params[:h], units[:h], packages[:h])
+                        + self._run_split(params[h:], units[h:], packages[h:]))
+        out = []
+        seed = int(self.model.seed)
+        for th, us, pk in zip(params, units, packages):
+            try:
+                out.append(self.eng.run(th, us, pk, self.horizon, seed))
+            except RuntimeError:
                 self.failed += 1
-                return [None]
-            h = len(params) // 2
-            return (self._run_split(params[:h], units[:h], packages[:h])
-                    + self._run_split(params[h:], units[h:], packages[h:]))
+                out.append(None)
+        return out
 
     def latent(self, r, st) -> float:
         N, s, o = st[(r["unit"], r["package"] or self.comp)]
         idx = [self.groups.index(g) for g in r["groups"]]
         w = N[idx]
+        wsum = float(w.sum())
         lat = r["latent"]
-        if lat == "immunity":
-            return float(np.dot(w, 1.0 - s[idx]) / w.sum())
-        if lat == "susceptible":
-            return float(np.dot(w, s[idx]) / w.sum())
-        if lat == "attack_rate":
-            return float(sum(o.per_capita["infections"][g] * N[j] for g, j in zip(r["groups"], idx)) / w.sum())
+        if lat in ("immunity", "susceptible", "attack_rate"):
+            if wsum <= 0.0:
+                if len(idx) == 1:
+                    if lat == "immunity":
+                        return float(1.0 - s[idx[0]])
+                    if lat == "susceptible":
+                        return float(s[idx[0]])
+                    return float(o.per_capita["infections"][r["groups"][0]])
+                raise ValueError(f"observed groups {r['groups']} have zero population weight")
+            if lat == "immunity":
+                return float(np.dot(w, 1.0 - s[idx]) / wsum)
+            if lat == "susceptible":
+                return float(np.dot(w, s[idx]) / wsum)
+            return float(sum(o.per_capita["infections"][g] * N[j] for g, j in zip(r["groups"], idx)) / wsum)
         oc = lat[8:]
         return float(sum(o.per_capita[oc][g] * N[j] for g, j in zip(r["groups"], idx)))
 
@@ -955,6 +1006,116 @@ def _self_test() -> int:
         fit_ab = fit(sp_ab, m_ab, seed=0, sample_it=False)
         ok("z:u1" in fit_ab["diagnostics"]["at_bound"] and "z:u2" not in fit_ab["diagnostics"]["at_bound"],
            f"OT26 posterior mode clipped against upper prior bound is reported in at_bound ({fit_ab['diagnostics']['at_bound']}, z={fit_ab['z']})")
+        # OT27: RequestedEngine defers live state probe until admission (requiring immunity/susceptible in
+        # outputs.per_capita), and a standard Engine without initial_state() calibrates a single unmapped group
+        # via per_capita['immunity'].
+        from toolkit.engines.built import requested as BREQ
+        from toolkit.engines.contract import EngineCard, Outcomes, ParamSpec
+        b_no = BREQ.example_build()
+        b_no["kind"] = "closed_form"
+        b_no["request"].pop("compartments", None)
+        b_no["request"]["age_groups"] = ["g1", "g2"]
+        b_no["request"]["reductions"][0]["compare"] = {"per_capita.cases.g1": {"abs": 1.0e-3}}
+        b_no["request"]["trials"][0]["estimand_mapping"]["value"] = "per_capita.cases.g1"
+        b_yes = copy.deepcopy(b_no)
+        b_yes["request"]["outputs"]["per_capita"] = ["cases", "severe", "immunity"]
+        with open(os.path.join(d, "u_ot27.csv"), "w") as fh:
+            fh.write("id,pop\nu1,10000\n")
+        with open(os.path.join(d, "t_ot27.csv"), "w") as fh:
+            fh.write("unit,groups,source,latent,pos,n\nu1,g2,sero,immunity,63,100\n")
+        base_ot27 = {
+            "schema_version": 1, "question": "test", "decision_maker": "test", "decision_date": "2026-01-01",
+            "engine": {"build": b_no},
+            "horizon": {"start": 0.0, "stop": 5.0},
+            "decision_units": {
+                "csv": "u_ot27.csv", "id": "id",
+                "populations": {"target": {"column": "pop", "age_groups": ["g1"]}},
+                "engine_attributes": {"N": {"column": "pop"}},
+            },
+            "options": {
+                "populations": {"total": "pop"},
+                "components": {"comp_a": {}},
+                "packages": {"generate": True},
+                "engine_map": {"comp_a": {"comp_a": 1}},
+                "prices": {"base_year": "2026", "index": {"2026": 1.0}},
+                "cost_items": [{"id": "c_a", "component": "comp_a", "value": 1.0, "price_year": "2026",
+                                "price_rule": "as_published", "basis": "fixed", "includes": ["comp_a"]}],
+            },
+            "objective": {"outcome": "cases", "horizon": [0.0, 5.0], "discounting": "none"},
+            "constraints": {"envelope_usd": 100.0},
+            "comparator": {"package": "none", "text": "none"},
+            "outcomes_reported": ["cases"],
+            "calibration": {
+                "method": "posterior", "parameters": [], "attribute": "rate_in", "range": [0.01, 0.5], "scale": "linear",
+                "priors": {"rate_in": {"dist": "uniform", "range": [0.01, 0.5], "source": "test"}},
+                "sources": [{"id": "sero", "measures": "seropositivity", "latent": {"quantity": "immunity"},
+                             "frame": {"design": "cluster_survey"}, "bias": {"none": "test"},
+                             "noise": {"model": "binomial"}}],
+                "targets": {"kind": KIND, "csv": "t_ot27.csv", "unit": "unit", "groups": "groups",
+                            "source": "source", "latent": "latent", "observed": "pos", "n": "n"},
+            },
+            "uncertainty": {
+                "draws": 4, "seed": 1, "sources": [{"kind": "calibration"}],
+                "excluded": [{"kind": "engine_parameters", "reason": "test"}, {"kind": "costs", "reason": "t"},
+                             {"kind": "emulator", "reason": "test"}],
+            },
+            "analysis": {"evaluation": "direct"},
+            "deliverable": {
+                "kind": "package_per_unit", "allocation_file": "allocation_optimized.csv",
+                "columns": {"unit": "unit", "package": "package", "value": "averted"},
+                "headline": {"name": "total_averted", "outcome": "cases"},
+            },
+        }
+        sp_no = schema.with_engine(schema.Spec(base_ot27, d, os.path.join(d, "spec_no.yaml")), BREQ.RequestedEngine(b_no))
+        e_req_no = problems(sp_no, sp_no.engine().describe(), {p.name: p for p in sp_no.engine().parameters()})
+        r_yes = copy.deepcopy(base_ot27)
+        r_yes["engine"] = {"build": b_yes}
+        sp_yes = schema.with_engine(schema.Spec(r_yes, d, os.path.join(d, "spec_yes.yaml")), BREQ.RequestedEngine(b_yes))
+        e_req_yes = problems(sp_yes, sp_yes.engine().describe(), {p.name: p for p in sp_yes.engine().parameters()})
+
+        class _NoInitEngine:
+            batch_equals_run = True
+
+            def describe(self):
+                return EngineCard(
+                    name="built:two_stage_mod", version="0.1", mechanisms=["m"],
+                    components={"comp_a": [0, 1]}, unit_attributes={"N": "n", "rate_in": "r"},
+                    outputs={"per_capita": ["cases", "severe", "immunity"], "windows": {"w0": ["prev"]},
+                             "cost_drivers": ["units_delivered"]},
+                    age_groups=["g1", "g2"], valid_ranges={"rate_in": [0.01, 0.5]},
+                )
+
+            def parameters(self):
+                return [ParamSpec(name="eff_a", value=0.6, kind="fixed", units="fraction", lo=0.2, hi=0.9, source="test")]
+
+            def run(self, params, unit, package, horizon, seed):
+                r_in = float(unit.attributes["rate_in"])
+                imm1 = 1.0 - float(np.exp(-r_in * 3.0))
+                imm2 = 1.0 - float(np.exp(-r_in * 10.0))
+                eff = float(params.get("eff_a", 0.6)) if package.components.get("comp_a") else 0.0
+                c = r_in * (1.0 - eff)
+                return Outcomes(
+                    per_capita={"cases": {"g1": c, "g2": c}, "severe": {"g1": 0.1 * c, "g2": 0.1 * c},
+                                "immunity": {"g1": imm1, "g2": imm2}},
+                    windows={"w0": {"prev": c}},
+                    cost_drivers={"units_delivered": float(package.components.get("comp_a", 0))},
+                    meta={"age_shares": {"g1": 0.5, "g2": 0.5}},
+                )
+
+            def run_batch(self, param_sets, units, packages, horizon, seed):
+                return [self.run(p, u, pk, horizon, seed) for p, u, pk in zip(param_sets, units, packages)]
+
+        eng_ni = _NoInitEngine()
+        sp_ni = schema.with_engine(schema.Spec(r_yes, d, os.path.join(d, "spec_ni.yaml")), eng_ni)
+        e_ni = problems(sp_ni, eng_ni.describe(), {p.name: p for p in eng_ni.parameters()})
+        m_ni = DirectModel(sp_ni, log=lambda *a: None)
+        fit_ni = fit(sp_ni, m_ni, seed=0, sample_it=False)
+        z_est = float(fit_ni["z"]["u1"])
+        ok(any("outputs.per_capita" in e for e in e_req_no) and e_req_yes == [] and e_ni == []
+           and abs(z_est - 0.0994) < 0.01 and fit_ni["diagnostics"]["evaluation"] == "run_batch",
+           f"OT27 RequestedEngine defers state probe if immunity/susceptible declared, and standard Engine without "
+           f"initial_state() calibrates single unmapped group via per_capita['immunity'] (no={e_req_no}, yes={e_req_yes}, "
+           f"ni={e_ni}, z={z_est:.4f})")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1
