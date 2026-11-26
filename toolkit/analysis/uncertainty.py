@@ -57,6 +57,7 @@ POINT_TOL = 1e-6           # v2-posterior-point: a value within the fit file's 6
 PROGRESS_EVERY_S = 300.0    # a long per-draw loop logs its progress at most this often (and at its last item)
 NE_STREAM = 0x6E6566        # the net-effect posterior's row choice: its own stream, the other sources' draws unchanged
 UNIT_STREAM = 0x756E74      # unit_rates: its own stream, so declaring it leaves every other source's draws unchanged
+HEALTH_WEIGHT_STREAM = 0x687774   # health_weights (CEA): its own stream so other sources' draws are unchanged
 
 
 def posterior_input(spec) -> dict | None:
@@ -311,6 +312,19 @@ class Drawer:
                            **({k: tuple(v[:2]) for k, v in fr_.items()} if "engine_parameters" in self.src else {}))
         if self.ne is not None:
             self.ne_rng = np.random.default_rng([int(seed), NE_STREAM])
+        self.hwrng, self.hw_items = None, []
+        if "health_weights" in self.src:
+            ce = A.spec.raw.get("cost_effectiveness") or {}
+            hm = ce.get("health_measure") or {}
+            hkind = hm.get("kind")
+            wkey = "yld" if hkind == "dalys" else "qaly"
+            for oc in sorted(hm.get("events") or {}):
+                cfg = hm["events"][oc]
+                if isinstance(cfg, dict) and not cfg.get("death") and isinstance(cfg.get(wkey), dict):
+                    rng = cfg[wkey].get("range")
+                    if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                        self.hw_items.append((str(oc), float(rng[0]), float(rng[1])))
+            self.hwrng = np.random.default_rng([int(seed), HEALTH_WEIGHT_STREAM])
 
     def posterior_provenance(self) -> dict | None:
         """The sample's path, sha256 and names, and the row index each draw took (None without the field)."""
@@ -399,6 +413,9 @@ class Drawer:
         if self.arng is not None:
             from toolkit.analysis import burden as BU
             sampled.update(BU.draw_external(A.anchor, self.arng))
+        if self.hwrng is not None:
+            for oc, lo, hi in self.hw_items:
+                sampled[f"hw:{oc}"] = float(self.hwrng.uniform(lo, hi))
         self.last_units = None
         if self.urng is not None:           # unit_rates: the engine's own sampling model, unit by unit in id order
             s = self.unit_sampling
@@ -616,12 +633,20 @@ def evaluate_draws(A, draws=None, seed=None) -> dict:
     return {"draws": nd, "seed": int(sd), "drawer": D, "rows": list(_draw_rows(A, D, nd))}
 
 
+def _on_draw_takes_sampled(fn) -> bool:
+    import inspect
+    try:
+        ps = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in ps) or len(ps) >= 4
+
+
 def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=None, on_solve=None) -> dict:
-    """`on_draw(out, events, cost)`: called with each draw's outcomes, model corrections and cost table, precomputed
-    draws included (F6 S2-5: the burden references' values, and the guard on the validation arm; S2-6: each fixed
-    plan's outcome and cost). `on_solve(d, sampled, ben, cost, solution, events)`: called after each draw's
-    re-optimised plan is solved and guarded (F6 value of information); it only reads, so the outputs are the same with
-    or without it."""
+    """`on_draw(out, events, cost[, sampled])`: called with each draw's outcomes, model corrections, cost table, and
+    optionally `sampled` when the callback accepts 4 positional args (F6 S2-5, S2-6, and CEA §5.7).
+    `on_solve(d, sampled, ben, cost, solution, events)`: called after each draw's re-optimised plan is solved and
+    guarded (F6 value of information); it only reads, so the outputs are the same with or without it."""
     sp = A.spec["uncertainty"]
     nd, sd = _n_seed(A, draws, seed)
     scope = A.spec.uncertainty_scope()
@@ -644,13 +669,17 @@ def run(A, plan, headline_name: str, draws=None, seed=None, pre=None, on_draw=No
     hl_outcome = A.spec["deliverable"]["headline"]["outcome"]
     from toolkit.analysis.figure_data import _package_sums
     plan_sums = []           # each draw's per-package sums of the fixed plan (the figure step reads them)
+    on_draw_4 = _on_draw_takes_sampled(on_draw) if on_draw is not None else False
     for d, r in enumerate(rows):
         sampled, out, ben, cost = r["sampled"], r["out"], r["ben"], r["cost"]
         if r["clamped"]:
             clamped_draws.append({"draw": d, "units": len(r["clamped"]), "examples": r["clamped"][:5]})
         corr_any += bool(r["events"])
         if on_draw is not None:
-            on_draw(out, r["events"], cost)
+            if on_draw_4:
+                on_draw(out, r["events"], cost, sampled)
+            else:
+                on_draw(out, r["events"], cost)
         floors.append(r["floors"])
         row = {}
         for o in A.outcomes:

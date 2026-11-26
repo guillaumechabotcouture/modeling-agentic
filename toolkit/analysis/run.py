@@ -427,16 +427,36 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     bcol = bcol if bcol is None or bcol.refs else None          # S2-5d: anchor rows alone validate nothing
     # F6 S2-6: each fixed plan's outcome and cost in every draw; each solved variant's too (its cost against the budget)
     fcol = V.Draws(A, V.solved_plans(A, ben0, cost0)) if V.config(spec.raw).get("variants") else None
+    from toolkit.spec import cea as CEASPEC
+    from toolkit.analysis import cea as CEA
+    ccol = CEA.Collector(A) if CEASPEC.has_cea(spec.raw) else None
     hooks = [h.add for h in (bcol, fcol) if h is not None]
     from toolkit.analysis import value_of_information as VOI
     nd_ = UQ._n_seed(A, draws)[0]
     vcol = VOI.Collector(A) if VOI.expected(spec.raw) and nd_ >= VOI.thresholds()["min_draws"] else None
+
+    def _on_draw(out, ev, cost, sampled=None):
+        for h in hooks:
+            h(out, ev, cost)
+        if ccol is not None:
+            ccol.add(out, ev, cost, sampled)
+
     u = UQ.run(A, plan, spec["deliverable"]["headline"]["name"], draws=draws, pre=pre,
-               on_draw=(lambda out, ev, cost: [h(out, ev, cost) for h in hooks]) if hooks else None,
+               on_draw=_on_draw if (hooks or ccol is not None) else None,
                on_solve=vcol.add if vcol is not None else None)
     arts["uncertainty"] = S.write("uncertainty", u["data"], UQ.PRODUCER, [arts["point"]] + eng_files)
     S.deliverable(UQ.write_report(run_dir, u["report"]), UQ.PRODUCER, "uncertainty_report")
     log(f"UQ: {u['data']['fixed_plan'][A.primary]} ({u['data']['label']})")
+    cea_res = None
+    if ccol is not None:
+        cea_res = CEA.run_cea(A, out0, cost0, collector=ccol, uq_level=u["data"]["interval"].get("level", 0.95))
+        cea_in = [arts["point"], arts["uncertainty"]]
+        lt_p = ((spec.raw.get("cost_effectiveness") or {}).get("health_measure") or {}).get("life_table")
+        lt_csv = lt_p.get("csv") if isinstance(lt_p, dict) else (lt_p if isinstance(lt_p, str) else None)
+        if isinstance(lt_csv, str) and lt_csv:
+            cea_in.append(spec.resolve(lt_csv))
+        arts["cost_effectiveness"] = S.write("cost_effectiveness", cea_res, CEA.PRODUCER, cea_in)
+        log(f"cost_effectiveness: perspectives={list(cea_res['perspectives'])}")
     voi = None
     if VOI.expected(spec.raw):        # F6: which drawn input is worth better data, from the same draws
         voi = VOI.run(A, vcol, plan, dict(fcol.plans) if fcol is not None else None, u["report"],
@@ -589,11 +609,12 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     # ---- claims and results.md
     c = CL.write(A, run_dir, arts, point, u["data"], stab, sens, dts, cal,
                  dict(model.accuracy, **({"boundary_ranking": bnd} if bnd else {})), pv=pv, burden=bvd, anchor=anc,
-                 voi=voi, wiring=wr)
+                 voi=voi, wiring=wr, cea=cea_res)
     arts["claims"] = S.write("claims", c, CL.PRODUCER, [arts[k] for k in ("point", "uncertainty", "stability",
                                                                           "decision_tests", "calibration")]
                              + ([arts["plan_variants"]] if pv is not None else [])
                              + ([arts["value_of_information"]] if voi is not None else [])
+                             + ([arts["cost_effectiveness"]] if cea_res is not None else [])
                              + ([arts["burden_validation"]] if bvd else [])
                              + ([arts["burden_anchor"]] if anc else []))
     for rel, role in ((c["spec"], "claims_spec"), (c["ledger"], "claims_ledger"), (c["results"], "results")):
@@ -603,7 +624,8 @@ def _run(run_dir, spec_rel, adopt, draws, unsigned, log, compute_kw, holder) -> 
     S.manifest["expected"] = {"kinds": list(EXPECTED_KINDS)
                               + (["emulator", "emulator_boundary"] if model.kind == "emulator" else [])
                               + (["burden_validation"] if bvd else []) + (["burden_anchor"] if anc else [])
-                              + (["value_of_information"] if voi is not None else []) + ["wiring"],
+                              + (["value_of_information"] if voi is not None else [])
+                              + (["cost_effectiveness"] if cea_res is not None else []) + ["wiring"],
                               "roles": list(EXPECTED_ROLES),
                               "decision_tests": {x["test_id"]: x["path"] for x in dts}}
     S.finalize("complete")
