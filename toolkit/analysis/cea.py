@@ -372,6 +372,9 @@ def compose_perspective_totals(
     life_table: list[tuple[float, float]] | None = None,
     weight_overrides: Mapping[str, float] | None = None,
     cost_mult: Mapping[str, float] | None = None,
+    discount_overrides: Mapping[str, float] | None = None,
+    timing_override: str | None = None,
+    consequence_overrides: Mapping[str, float] | None = None,
 ) -> dict:
     """Compose discounted total costs and health (relative to reference) per perspective and strategy (§5.1).
 
@@ -384,9 +387,18 @@ def compose_perspective_totals(
     disc = ce["discounting"]
     t0, t1 = float(th["start"]), float(th["stop"])
     b_yr = float(disc["base_year"])
-    r_c, r_h = float(disc["costs"]["rate"]), float(disc["health"]["rate"])
-    df_c = discount_uniform(t0, t1, r_c, b_yr)
-    df_h = discount_uniform(t0, t1, r_h, b_yr)
+    d_ov = dict(discount_overrides or {})
+    r_c = float(d_ov.get("costs", disc["costs"]["rate"]))
+    r_h = float(d_ov.get("health", disc["health"]["rate"]))
+    if timing_override == "start":
+        df_c = (1.0 + r_c) ** (-(t0 - b_yr)) if r_c > 0.0 else 1.0
+        df_h = (1.0 + r_h) ** (-(t0 - b_yr)) if r_h > 0.0 else 1.0
+    elif timing_override == "end":
+        df_c = (1.0 + r_c) ** (-(t1 - b_yr)) if r_c > 0.0 else 1.0
+        df_h = (1.0 + r_h) ** (-(t1 - b_yr)) if r_h > 0.0 else 1.0
+    else:
+        df_c = discount_uniform(t0, t1, r_c, b_yr)
+        df_h = discount_uniform(t0, t1, r_h, b_yr)
     df_start = (1.0 + r_c) ** (-(t0 - b_yr)) if r_c > 0.0 else 1.0
     df_annual = discount_start_of_year(t0, t1, r_c, b_yr) / max(t1 - t0, 1e-12)
 
@@ -399,6 +411,7 @@ def compose_perspective_totals(
     hkind = hm["kind"]
     w_ov = dict(weight_overrides or {})
     c_mult = dict(cost_mult or {})
+    cc_ov = dict(consequence_overrides or {})
 
     if life_table is None and th.get("deaths") == "lifetime" and any(
         isinstance(cfg, Mapping) and cfg.get("death") is True for cfg in (hm.get("events") or {}).values()
@@ -429,7 +442,8 @@ def compose_perspective_totals(
         for cc in cc_list:
             oc = str(cc["outcome"])
             n_ev = sum(float(v) for v in (ev_s.get(oc) or {}).values())
-            unit_val = float(cc["value"]) * acosts._factor(cc, prices_cfg) * float(c_mult.get(str(cc["id"]), 1.0))
+            base_v = float(cc_ov.get(str(cc["id"]), cc["value"]))
+            unit_val = base_v * acosts._factor(cc, prices_cfg) * float(c_mult.get(str(cc["id"]), 1.0))
             p_tot[str(cc["payer"])] += n_ev * unit_val * df_c
         costs_by_payer[s] = p_tot
 
@@ -709,7 +723,319 @@ def _strategy_record_with_status(row: dict, is_ref: bool) -> dict:
     return out
 
 
-def run_cea(A, out0: Mapping, cost0: Mapping, collector: Collector | None = None, *, uq_level: float = 0.95) -> dict:
+def find_switching_bracket(
+    eval_fn: Callable[[float], Mapping[str, tuple[float, float]]],
+    lo: float,
+    hi: float,
+    lam: float,
+    *,
+    reference: str | None = None,
+    max_evals: int | None = None,
+    bracket_rel: float | None = None,
+) -> dict:
+    """Bisection switching-value search on real evaluations within `[lo, hi]` (§6).
+    Never extrapolates; returns evaluated bracket `flips_at: [a, b]` or `no_flip_in_range`."""
+    th = load_thresholds()
+    cap = int(th["max_switch_evaluations"]) if max_evals is None else int(max_evals)
+    rel_tol = float(th["switch_bracket_rel"]) if bracket_rel is None else float(bracket_rel)
+    lo_f, hi_f, lam_f = float(lo), float(hi), float(lam)
+    span = hi_f - lo_f
+    if span <= 0.0:
+        raise ValueError(f"find_switching_bracket: invalid range [{lo_f}, {hi_f}]")
+
+    def _eval(x: float) -> tuple[str, dict[str, float]]:
+        st = eval_fn(float(x))
+        ref = reference if reference in st else next(iter(st))
+        ch = nmb_choice(st, lam_f, reference=ref)
+        return ch["chosen"], ch["nmb"]
+
+    c_lo, nmb_lo = _eval(lo_f)
+    c_hi, nmb_hi = _eval(hi_f)
+    evals = 2
+    if c_lo == c_hi:
+        return {
+            "verdict": "no_flip_in_range",
+            "chosen_lo": c_lo,
+            "chosen_hi": c_hi,
+            "flips_at": None,
+            "flip_lo": None,
+            "flip_hi": None,
+            "evaluations": evals,
+            "non_monotone": False,
+        }
+
+    # Track NMB margin (NMB[c_hi] - NMB[c_lo]) across evaluated x to flag non-monotonicity
+    pts: list[tuple[float, float]] = [
+        (lo_f, nmb_lo[c_hi] - nmb_lo[c_lo]),
+        (hi_f, nmb_hi[c_hi] - nmb_hi[c_lo]),
+    ]
+    a, b = lo_f, hi_f
+    ca, cb = c_lo, c_hi
+    while evals < cap and (b - a) > rel_tol * span:
+        mid = 0.5 * (a + b)
+        cm, nmb_m = _eval(mid)
+        evals += 1
+        pts.append((mid, nmb_m[c_hi] - nmb_m[c_lo]))
+        if cm == ca:
+            a = mid
+        else:
+            b, cb = mid, cm
+    pts.sort(key=lambda t: t[0])
+    diffs = [p1[1] - p0[1] for p0, p1 in zip(pts, pts[1:])]
+    non_mono = any(d < -1e-9 for d in diffs) and any(d > 1e-9 for d in diffs)
+    return {
+        "verdict": "flips",
+        "chosen_lo": ca,
+        "chosen_hi": cb,
+        "flips_at": [float(a), float(b)],
+        "flip_lo": float(a),
+        "flip_hi": float(b),
+        "evaluations": evals,
+        "non_monotone": non_mono,
+    }
+
+
+def run_switching_tests(A, out0: Mapping, *, life_table=None) -> list[dict]:
+    """Generate and execute harness §6 CEA decision tests (discount_rate, health_weight, consequence_cost, timing)."""
+    ce = A.spec.raw["cost_effectiveness"]
+    first_p = ce["perspectives"][0]
+    ref = ce["reference"]
+    thresholds = list(ce["thresholds"])
+    units = [A.by_id[i] for i in A.ids]
+    evs0, prog0 = extract_events_and_prog_costs(A, out0)
+    base_tot = compose_perspective_totals(A.spec, units, evs0, prog0, life_table=life_table)[first_p]["strategies_ce"]
+    base_chosen = {
+        str(t["id"]): nmb_choice(base_tot, float(t["lambda"] if "lambda" in t else t["usd_per_unit"]),
+                                 reference=ref)["chosen"]
+        for t in thresholds
+    }
+
+    rows: list[dict] = []
+
+    def _discrete_row(tid: str, inp: str, cases: list[tuple[str, dict]]) -> dict:
+        th_map: dict[str, dict] = {}
+        max_nmb_span = 0.0
+        for j, t in enumerate(thresholds):
+            t_id = str(t["id"])
+            lam = float(t["lambda"] if "lambda" in t else t["usd_per_unit"])
+            changed = []
+            nmbs_case = []
+            for label, kw in cases:
+                ce_c = compose_perspective_totals(A.spec, units, evs0, prog0, life_table=life_table, **kw)[first_p]["strategies_ce"]
+                ch = nmb_choice(ce_c, lam, reference=ref)
+                nmbs_case.append(max(ch["nmb"].values()) - ch["nmb"][ref])
+                if ch["chosen"] != base_chosen[t_id]:
+                    changed.append({"case": label, "chosen": ch["chosen"]})
+            if j == 0 and len(nmbs_case) >= 2:
+                max_nmb_span = max(nmbs_case) - min(nmbs_case)
+            th_map[t_id] = {
+                "verdict": "flips" if changed else "no_flip_in_range",
+                "flips_at": None,
+                "flip_lo": None,
+                "flip_hi": None,
+                "changes": changed,
+                "evaluations": len(cases),
+            }
+        return {"test_id": tid, "input": inp, "range": None, "nmb_span": float(max_nmb_span), "thresholds": th_map}
+
+    # 1. Discount rate tests (0% both; 0% health only)
+    rows.append(_discrete_row("discount_rate", "discount_rate", [
+        ("zero_both", {"discount_overrides": {"costs": 0.0, "health": 0.0}}),
+        ("zero_health_only", {"discount_overrides": {"health": 0.0}}),
+    ]))
+
+    # 2. Timing bounds when uniform_accrual
+    if (ce.get("discounting") or {}).get("timing", "uniform_accrual") == "uniform_accrual":
+        rows.append(_discrete_row("timing", "timing", [
+            ("start_of_window", {"timing_override": "start"}),
+            ("end_of_window", {"timing_override": "end"}),
+        ]))
+
+    # 3. Health-weight range tests with switching bisection
+    hm = ce["health_measure"]
+    wkey = "yld" if hm["kind"] == "dalys" else "qaly"
+    for oc, cfg in sorted((hm.get("events") or {}).items()):
+        if not isinstance(cfg, Mapping) or cfg.get("death") is True:
+            continue
+        wsub = cfg.get(wkey) or {}
+        rng = wsub.get("range")
+        if isinstance(rng, (list, tuple)) and len(rng) == 2:
+            lo, hi = float(rng[0]), float(rng[1])
+
+            def _eval_w(v: float, _oc: str = oc) -> dict[str, tuple[float, float]]:
+                return compose_perspective_totals(
+                    A.spec, units, evs0, prog0, life_table=life_table, weight_overrides={_oc: float(v)},
+                )[first_p]["strategies_ce"]
+
+            th_map = {}
+            span_0 = 0.0
+            for j, t in enumerate(thresholds):
+                t_id = str(t["id"])
+                lam = float(t["lambda"] if "lambda" in t else t["usd_per_unit"])
+                sw = find_switching_bracket(_eval_w, lo, hi, lam, reference=ref)
+                th_map[t_id] = sw
+                if j == 0:
+                    s_lo, s_hi = _eval_w(lo), _eval_w(hi)
+                    m_lo = max(lam * e - c for c, e in s_lo.values()) - (lam * s_lo[ref][1] - s_lo[ref][0])
+                    m_hi = max(lam * e - c for c, e in s_hi.values()) - (lam * s_hi[ref][1] - s_hi[ref][0])
+                    span_0 = abs(m_hi - m_lo)
+            rows.append({"test_id": f"health_weight_{_cid(oc)}", "input": f"health_weight:{oc}",
+                         "range": [lo, hi], "nmb_span": float(span_0), "thresholds": th_map})
+
+    # 4. Consequence-cost range tests with switching bisection
+    for cc in (ce.get("consequence_costs") or []):
+        rng = cc.get("range")
+        if isinstance(rng, (list, tuple)) and len(rng) == 2:
+            cid_cc = str(cc["id"])
+            lo, hi = float(rng[0]), float(rng[1])
+
+            def _eval_cc(v: float, _cid: str = cid_cc) -> dict[str, tuple[float, float]]:
+                return compose_perspective_totals(
+                    A.spec, units, evs0, prog0, life_table=life_table, consequence_overrides={_cid: float(v)},
+                )[first_p]["strategies_ce"]
+
+            th_map = {}
+            span_0 = 0.0
+            for j, t in enumerate(thresholds):
+                t_id = str(t["id"])
+                lam = float(t["lambda"] if "lambda" in t else t["usd_per_unit"])
+                sw = find_switching_bracket(_eval_cc, lo, hi, lam, reference=ref)
+                th_map[t_id] = sw
+                if j == 0:
+                    s_lo, s_hi = _eval_cc(lo), _eval_cc(hi)
+                    m_lo = max(lam * e - c for c, e in s_lo.values()) - (lam * s_lo[ref][1] - s_lo[ref][0])
+                    m_hi = max(lam * e - c for c, e in s_hi.values()) - (lam * s_hi[ref][1] - s_hi[ref][0])
+                    span_0 = abs(m_hi - m_lo)
+            rows.append({"test_id": f"consequence_cost_{_cid(cid_cc)}", "input": f"consequence_cost:{cid_cc}",
+                         "range": [lo, hi], "nmb_span": float(span_0), "thresholds": th_map})
+
+    rows.sort(key=lambda r: (-float(r["nmb_span"]), r["test_id"]))
+    return rows
+
+
+def allocation_addon(A, out0: Mapping, cost0: Mapping, plan: Mapping[str, str], *, life_table=None) -> dict:
+    """§9 Composition with allocation: per-unit frontiers, per-package totals, plan vs comparator,
+    and no-envelope NMB-optimal plan solved via `A.solve` with the budget row removed (CE14)."""
+    ce = A.spec.raw["cost_effectiveness"]
+    first_p = ce["perspectives"][0]
+    ref = ce["reference"]
+    thresholds = list(ce["thresholds"])
+    hm_events = list((ce["health_measure"].get("events") or {}).keys())
+    cc_outcomes = [str(cc["outcome"]) for cc in (ce.get("consequence_costs") or [])]
+    needed = list(dict.fromkeys([*hm_events, *cc_outcomes]))
+
+    units = [A.by_id[i] for i in A.ids]
+    fn = lambda u, p: out0[str(u[A.spec.uid])]["cost"][p]  # noqa: E731
+    cm = acosts.cost_matrix(A.alloc, units, outcome=fn, floor=False)
+
+    # 1. Per-unit totals & incremental frontier over each unit's feasible packages
+    per_unit: dict[str, dict] = {}
+    unit_ce: dict[str, dict[str, tuple[float, float]]] = {}
+    for u_id in A.ids:
+        u_row = A.by_id[u_id]
+        feas_pks = [p for p in ce["strategies"] if p in A.feas.get(u_id, set())]
+        if ref not in feas_pks:
+            feas_pks = [ref, *feas_pks]
+        evs_u: dict[str, dict[str, dict[str, float]]] = {}
+        prog_u: dict[str, dict[str, float]] = {}
+        for s in ce["strategies"]:
+            evs_u[s] = {}
+            yg_u = out0[u_id].get("y_group") or {}
+            y_u = out0[u_id].get("y") or {}
+            for oc in needed:
+                by_g = (yg_u.get(s) or {}).get(oc)
+                if isinstance(by_g, Mapping) and by_g:
+                    evs_u[s][oc] = {str(g): float(v) for g, v in by_g.items()}
+                else:
+                    evs_u[s][oc] = {"all": float((y_u.get(s) or {}).get(oc, 0.0))}
+            prog_u[s] = {iid: float(v) for iid, v in cm[u_id][s]["items"].items()}
+        tot_u = compose_perspective_totals(A.spec, [u_row], evs_u, prog_u, life_table=life_table)[first_p]
+        ce_feas = {p: tot_u["strategies_ce"][p] for p in feas_pks}
+        unit_ce[u_id] = tot_u["strategies_ce"]
+        inc_u = incremental_analysis(ce_feas, ref, ref_health_loss=tot_u["ref_health_loss"]) if len(ce_feas) >= 2 else {
+            "frontier": list(ce_feas.keys()), "strategies": {},
+        }
+        chosen_by_t = {
+            str(t["id"]): nmb_choice(ce_feas, float(t["lambda"] if "lambda" in t else t["usd_per_unit"]),
+                                     reference=ref, frontier=inc_u["frontier"])["chosen"]
+            for t in thresholds
+        }
+        per_unit[u_id] = {
+            "feasible": feas_pks,
+            "frontier": inc_u["frontier"],
+            "strategies": {s: _strategy_record_with_status(r, s == ref) for s, r in inc_u["strategies"].items()},
+            "chosen_by_threshold": chosen_by_t,
+            "plan_package": plan[u_id],
+        }
+
+    # 2. Per-package summary across units receiving each package in `plan`
+    by_pkg: dict[str, dict] = {}
+    for pk in ce["strategies"]:
+        u_ids = [i for i in A.ids if plan[i] == pk]
+        if not u_ids:
+            continue
+        dc = sum(unit_ce[i][pk][0] - unit_ce[i][ref][0] for i in u_ids)
+        de = sum(unit_ce[i][pk][1] - unit_ce[i][ref][1] for i in u_ids)
+        st_p, iv_p = evaluate_ratio_guard(dc, de)
+        by_pkg[pk] = {"units": len(u_ids), "delta_cost": float(dc), "delta_health": float(de),
+                      "status": st_p, "icer": iv_p}
+
+    # 3. Recommended plan vs comparator (funded plan)
+    plan_c = sum(unit_ce[i][plan[i]][0] for i in A.ids)
+    plan_e = sum(unit_ce[i][plan[i]][1] for i in A.ids)
+    ref_c = sum(unit_ce[i][ref][0] for i in A.ids)
+    ref_e = sum(unit_ce[i][ref][1] for i in A.ids)
+    p_dc, p_de = plan_c - ref_c, plan_e - ref_e
+    p_st, p_iv = evaluate_ratio_guard(p_dc, p_de)
+    plan_vs_ref = {
+        "cost": float(plan_c), "health": float(plan_e),
+        "delta_cost": float(p_dc), "delta_health": float(p_de),
+        "status": p_st, "icer": p_iv,
+        "nmb_by_threshold": {
+            str(t["id"]): float(float(t["lambda"] if "lambda" in t else t["usd_per_unit"]) * p_de - p_dc)
+            for t in thresholds
+        },
+    }
+
+    # 4. No-envelope plan at each threshold using toolkit ILP (`A.solve` with unbinding budget)
+    from toolkit.analysis.core import auxiliary
+    no_env: dict[str, dict] = {}
+    zero_cost = {i: {p: 0.0 for p in A.pk} for i in A.ids}
+    for t in thresholds:
+        tid = str(t["id"])
+        lam = float(t["lambda"] if "lambda" in t else t["usd_per_unit"])
+        nmb_ben = {
+            i: {p: (lam * unit_ce[i][p][1] - unit_ce[i][p][0]) if p in unit_ce[i] else -1e18 for p in A.pk}
+            for i in A.ids
+        }
+        with auxiliary(A, "cea_no_envelope"):
+            sol_ne = A.solve(nmb_ben, zero_cost, budget=1e18, budget_exact=False)
+        ch_ne = sol_ne["choice"]
+        ne_c = sum(unit_ce[i][ch_ne[i]][0] for i in A.ids)
+        ne_e = sum(unit_ce[i][ch_ne[i]][1] for i in A.ids)
+        diff_u = [i for i in A.ids if ch_ne[i] != plan[i]]
+        no_env[tid] = {
+            "lambda": lam,
+            "choice": ch_ne,
+            "cost": float(ne_c),
+            "health": float(ne_e),
+            "n_units_differ": len(diff_u),
+            "units_differ": diff_u,
+            "savings_note": "consequence savings are reported beside the envelope and never added to it",
+        }
+
+    return {
+        "perspective": first_p,
+        "per_unit": per_unit,
+        "by_package": by_pkg,
+        "plan_vs_reference": plan_vs_ref,
+        "no_envelope": no_env,
+        "implied_price_note": "derived from frontier marginal cost per unit health at envelope; LP relaxation solver.budget_dual is not used",
+    }
+
+
+def run_cea(A, out0: Mapping, cost0: Mapping, collector: Collector | None = None, *,
+            plan: Mapping[str, str] | None = None, uq_level: float = 0.95) -> dict:
     """Compute the full `analysis/cost_effectiveness.yaml` payload (§7) from the point evaluation and UQ collector."""
     ce = A.spec.raw["cost_effectiveness"]
     ref = ce["reference"]
@@ -857,15 +1183,22 @@ def run_cea(A, out0: Mapping, cost0: Mapping, collector: Collector | None = None
         "delta_health": hl_row["delta_health_vs_ref"],
         "icer": hl_row["icer"] if hl_row["status"] == "icer" else None,
     }
-    return {
+    switching = run_switching_tests(A, out0, life_table=life_table)
+    addon = allocation_addon(A, out0, cost0, plan, life_table=life_table) if (
+        plan is not None and not CEASPEC.is_cea(A.spec.raw)
+    ) else None
+    res_doc = {
         "perspectives": persp_out,
         "perspectives_agree": agree,
         "headline": headline,
         "health_measure": {"kind": hm["kind"], "events": hm["events"]},
         "timing": (ce.get("discounting") or {}).get("timing", "uniform_accrual"),
         "population": pop,
-        "switching": [],
+        "switching": switching,
     }
+    if addon is not None:
+        res_doc["plan"] = addon
+    return res_doc
 
 
 def claims(_c, art_rel: str, cea_data: dict, spec, uq_interval: dict | None = None) -> list[dict]:
@@ -931,6 +1264,16 @@ def claims(_c, art_rel: str, cea_data: dict, spec, uq_interval: dict | None = No
         tc = _cid(tid)
         out.append(_c(f"cea.perspectives_agree.{tc}", "label", art_rel, f"data.perspectives_agree.{tid}"))
 
+    for j, sw in enumerate(cea_data.get("switching") or []):
+        sw_id = _cid(sw["test_id"])
+        for tid, tr in (sw.get("thresholds") or {}).items():
+            tc = _cid(tid)
+            sf = f"data.switching[{j}].thresholds.{tid}"
+            out.append(_c(f"cea.dt.{sw_id}.{tc}.verdict", "label", art_rel, f"{sf}.verdict"))
+            if tr.get("flip_lo") is not None and tr.get("flip_hi") is not None:
+                out.append(_c(f"cea.dt.{sw_id}.{tc}.flip_lo", "scalar", art_rel, f"{sf}.flip_lo"))
+                out.append(_c(f"cea.dt.{sw_id}.{tc}.flip_hi", "scalar", art_rel, f"{sf}.flip_hi"))
+
     hl = cea_data["headline"]
     out.append(_c("cea.headline.chosen", "label", art_rel, "data.headline.chosen"))
     out.append(_c("cea.headline.status", "label", art_rel, "data.headline.status"))
@@ -994,6 +1337,22 @@ def results_lines(cea_data: dict, spec) -> list[str]:
         L += ["", "Perspective agreement by threshold: " + ", ".join(
             f"{tid}: [CLAIM:cea.perspectives_agree.{_cid(tid)}]" for tid in cea_data["perspectives_agree"]
         ) + "."]
+    if cea_data.get("switching"):
+        th_ids = [str(t["id"]) for t in (spec.raw if hasattr(spec, "raw") else spec)["cost_effectiveness"]["thresholds"]]
+        L += ["", "### Switching tests", "",
+              "| Input | " + " | ".join(th_ids) + " |",
+              "|---|" + "|".join("---" for _ in th_ids) + "|"]
+        for sw in cea_data["switching"]:
+            sw_id = _cid(sw["test_id"])
+            cells = []
+            for tid in th_ids:
+                tc = _cid(tid)
+                tr = (sw.get("thresholds") or {}).get(tid) or {}
+                if tr.get("flip_lo") is not None and tr.get("flip_hi") is not None:
+                    cells.append(f"[CLAIM:cea.dt.{sw_id}.{tc}.verdict] ([CLAIM:cea.dt.{sw_id}.{tc}.flip_lo]–[CLAIM:cea.dt.{sw_id}.{tc}.flip_hi])")
+                else:
+                    cells.append(f"[CLAIM:cea.dt.{sw_id}.{tc}.verdict]")
+            L.append(f"| {sw['input']} | " + " | ".join(cells) + " |")
     L.append("")
     return L
 
@@ -1238,6 +1597,36 @@ def _self_test() -> int:
            and cea_doc15["perspectives"]["health_system"]["uncertainty"]["status"] == "indicative"
            and not berrs15 and not (bdoc15 or {}).get("unresolved") and not unres15,
            f"CE15 uncertainty draws identical with/without CEA & with health_weights stream (runs={m_ce.runs}), collector reads exact 15 draws, claims+results render ({len(loaded15)} claims, unres={unres15})")
+
+    # CE_SW1: switching-value bisection brackets a true flip on real evaluations and detects no-flip
+    def _sw_eval(x: float) -> dict[str, tuple[float, float]]:
+        return {"A": (0.0, 0.0), "B": (100.0, float(x))}
+
+    sw_flip = find_switching_bracket(_sw_eval, 0.0, 2.0, 100.0, reference="A", max_evals=12, bracket_rel=0.01)
+    sw_none = find_switching_bracket(_sw_eval, 0.0, 0.5, 100.0, reference="A")
+    ok(sw_flip["verdict"] == "flips" and sw_flip["flip_lo"] <= 1.0 <= sw_flip["flip_hi"]
+       and (sw_flip["flip_hi"] - sw_flip["flip_lo"]) <= 0.02 + 1e-9
+       and sw_none["verdict"] == "no_flip_in_range" and sw_none["flips_at"] is None,
+       f"CE_SW1 switching bisection brackets flip at 1.0 ({sw_flip['flips_at']}) and reports no_flip_in_range")
+
+    # CE14: allocation add-on (§9) on four units, three packages, binding budget
+    with tempfile.TemporaryDirectory() as d14:
+        raw14 = CEASPEC.toy_cea_spec(d14, standalone=False)
+        with open(os.path.join(d14, "units.csv"), "w", encoding="utf-8") as f:
+            f.write("id,pop,x\nu1,10000,-0.5\nu2,10000,0.0\nu3,10000,0.5\nu4,10000,1.0\n")
+        raw14["constraints"] = {"envelope_usd": 350000.0}  # binds: all pkg_b would cost 1,000,000
+        raw14["cost_effectiveness"]["thresholds"] = [{"id": "t_hi", "usd_per_unit": 500000.0, "source": "test"}]
+        sp14 = schema.Spec(raw14, d14, os.path.join(d14, "spec14.yaml"))
+        A14 = CORE.Analysis(sp14, MOD.DirectModel(sp14))
+        out14, ben14, cost14 = A14.evaluate(A14.theta0, {i: None for i in A14.ids})
+        plan14 = A14.solve(ben14, cost14)["choice"]
+        addon14 = allocation_addon(A14, out14, cost14, plan14)
+        ne_choice = addon14["no_envelope"]["t_hi"]["choice"]
+        unit_argmax = {u: addon14["per_unit"][u]["chosen_by_threshold"]["t_hi"] for u in A14.ids}
+        ok(len(addon14["per_unit"]) == 4 and ne_choice == unit_argmax
+           and addon14["plan_vs_reference"]["delta_health"] > 0.0
+           and "budget_dual" in addon14["implied_price_note"],
+           f"CE14 allocation add-on: 4 per-unit frontiers, no-envelope ILP == per-unit NMB argmax ({ne_choice}), plan vs ref delta_E={addon14['plan_vs_reference']['delta_health']:.2f}")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

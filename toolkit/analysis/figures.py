@@ -44,9 +44,11 @@ TIERS = {
 DECISION_SETS = {
     "package_per_unit": ("headline", "allocation_map", "stability_map", "burden_map", "dollars", "frontier",
                          "cost_per_outcome", "decision_tests", "comparison"),
+    "cost_effectiveness": ("ce_frontier", "ce_plane", "ceac", "price_grid", "threshold_price", "evpi", "switching"),
 }
 TIER_OF = {n: k for k, v in TIERS.items() for n in v}
 TIER_OF.update({n: "decision" for v in DECISION_SETS.values() for n in v})
+TIER_OF["ce_by_package"] = "decision"
 
 
 def deliverable_kind(spec: dict):
@@ -56,11 +58,15 @@ def deliverable_kind(spec: dict):
 
 
 def tiers_for(spec: dict) -> dict:
-    return dict(TIERS, decision=DECISION_SETS.get(deliverable_kind(spec), ()))
+    kind = deliverable_kind(spec)
+    dec = list(DECISION_SETS.get(kind, ()))
+    if kind == "package_per_unit" and isinstance((spec or {}).get("cost_effectiveness"), dict):
+        dec.append("ce_by_package")
+    return dict(TIERS, decision=tuple(dec))
 
 
 ORDER = TIERS["data_model"] + TIERS["simulation"] + tuple(n for v in DECISION_SETS.values() for n in v
-                                                         if n not in TIERS["data_model"] + TIERS["simulation"])
+                                                         if n not in TIERS["data_model"] + TIERS["simulation"]) + ("ce_by_package",)
 TITLE_MAX = 95
 CAPTION_MAX = 230          # two lines of the report's caption width
 
@@ -2253,6 +2259,198 @@ FUNCS.update({n: _joint_figure(n) for n in ("calibration_region", "calibration_t
                                             "calibration_waves")})
 
 
+# --------------------------------------------------------------------------- Cost-effectiveness figures (§8)
+def _cea_art(R):
+    doc = R.art("cost_effectiveness")
+    if not isinstance(doc, dict) or not doc.get("perspectives"):
+        raise Missing("analysis/cost_effectiveness.yaml absent or has no perspectives")
+    first_p = next(iter(doc["perspectives"]))
+    return doc, first_p, doc["perspectives"][first_p]
+
+
+def _cea_frontier(R, t):
+    doc, p, pdoc = _cea_art(R)
+    st = pdoc.get("strategies") or {}
+    fr = list(pdoc.get("frontier") or [])
+    if len(st) < 2:
+        raise Missing("cost_effectiveness artifact has fewer than 2 strategies")
+    fig, ax = _fig(t, 6.8, 4.4)
+    xs = [float(st[s]["health"]) for s in st]
+    ys = [float(st[s]["cost"]) for s in st]
+    ax.scatter(xs, ys, color=t["muted"], s=45, zorder=3)
+    if fr:
+        ax.plot([float(st[s]["health"]) for s in fr], [float(st[s]["cost"]) for s in fr],
+                color=t["accent"], lw=2.0, marker="o", ms=7, zorder=4, label="Frontier")
+    for s, r in st.items():
+        ax.annotate(s, (float(r["health"]), float(r["cost"])), textcoords="offset points", xytext=(5, 4),
+                    fontsize=8, color=t["ink"])
+    ax.set_xlabel("Incremental health gained vs reference")
+    ax.set_ylabel("Discounted cost")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    ax.legend(frameon=False, fontsize=8)
+    rows = [{"strategy": s, "cost": r["cost"], "health": r["health"], "status": r["status"], "icer": r.get("icer")}
+            for s, r in st.items()]
+    return fig, f"Cost-effectiveness frontier ({p})", f"Discounted cost against health gained ({p}); frontier: {', '.join(fr)}.", rows, "cost-effectiveness frontier"
+
+
+def _cea_plane(R, t):
+    doc, p, pdoc = _cea_art(R)
+    st = pdoc.get("strategies") or {}
+    uq = pdoc.get("uncertainty") or {}
+    if not st:
+        raise Missing("no strategies in cost_effectiveness artifact")
+    fig, ax = _fig(t, 6.8, 4.4)
+    ax.axhline(0.0, color=t["grid"], lw=1.0)
+    ax.axvline(0.0, color=t["grid"], lw=1.0)
+    rows = []
+    for s, r in st.items():
+        de, dc = float(r.get("delta_health_vs_ref", 0.0)), float(r.get("delta_cost_vs_ref", 0.0))
+        ax.scatter([de], [dc], s=55, zorder=4, label=s)
+        ax.annotate(s, (de, dc), textcoords="offset points", xytext=(5, 4), fontsize=8, color=t["ink"])
+        qs = (uq.get("quadrant_share") or {}).get(s) or {}
+        rows.append({"strategy": s, "delta_health": de, "delta_cost": dc, **qs})
+    ax.set_xlabel("Incremental health (ΔE vs reference)")
+    ax.set_ylabel("Incremental cost (ΔC vs reference)")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    ax.legend(frameon=False, fontsize=8)
+    return fig, f"Cost-effectiveness plane ({p})", f"Incremental cost vs incremental health against reference ({p}).", rows, "cost-effectiveness plane"
+
+
+def _cea_ceac(R, t):
+    doc, p, pdoc = _cea_art(R)
+    ceac = pdoc.get("ceac") or {}
+    lams = ceac.get("lambda") or []
+    shares = ceac.get("share") or {}
+    if not lams or not shares:
+        raise Missing("no CEAC draws recorded in cost_effectiveness artifact")
+    fig, ax = _fig(t, 6.8, 4.4)
+    for s, vals in shares.items():
+        ax.plot(lams, [100.0 * float(v) for v in vals], lw=1.8, label=s)
+    for tid, td in (pdoc.get("thresholds") or {}).items():
+        ax.axvline(float(td["lambda"]), color=t["muted"], ls="--", lw=1.0)
+    ax.set_xlabel("Threshold λ (cost per unit health)")
+    ax.set_ylabel("Probability cost-effective (%)")
+    ax.set_ylim(-2, 102)
+    ax.ticklabel_format(style="plain", useOffset=False)
+    ax.legend(frameon=False, fontsize=8)
+    rows = [{"lambda": lams[j], **{s: shares[s][j] for s in shares}} for j in range(len(lams))]
+    return fig, f"Cost-effectiveness acceptability curves ({p})", f"Share of draws with highest NMB across threshold λ ({p}).", rows, "CEAC and frontier"
+
+
+def _cea_price_grid(R, t):
+    doc, p, pdoc = _cea_art(R)
+    prices = pdoc.get("prices") or {}
+    if not prices:
+        raise Missing("no price grids declared in cost_effectiveness artifact")
+    pid = next(iter(prices))
+    cells = prices[pid].get("cells") or []
+    if not cells:
+        raise Missing(f"price grid {pid} has no evaluated cells")
+    fig, ax = _fig(t, 6.6, 4.0)
+    xs = [float(c["price"]) for c in cells]
+    ys = [float(c["margin"]) for c in cells]
+    ax.plot(xs, ys, marker="o", color=t["accent"], lw=2.0)
+    ax.axhline(0.0, color=t["muted"], ls="--", lw=1.0)
+    ax.set_xlabel(f"Evaluated price ({pid})")
+    ax.set_ylabel("NMB margin vs best alternative")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    rows = [{"price": c["price"], "chosen": c["chosen"], "margin": c["margin"]} for c in cells]
+    return fig, f"Evaluated price grid ({pid})", f"Net monetary benefit margin across evaluated prices for {pid}.", rows, "evaluated price grid"
+
+
+def _cea_threshold_price(R, t):
+    doc, p, pdoc = _cea_art(R)
+    prices = pdoc.get("prices") or {}
+    if not prices:
+        raise Missing("no threshold prices declared in cost_effectiveness artifact")
+    pid = next(iter(prices))
+    th_map = prices[pid].get("threshold") or {}
+    th_defs = pdoc.get("thresholds") or {}
+    pts = [(float(th_defs[tid]["lambda"]), tr) for tid, tr in th_map.items() if tid in th_defs]
+    if not pts:
+        raise Missing(f"no threshold-price evaluations for {pid}")
+    fig, ax = _fig(t, 6.6, 4.0)
+    rows = []
+    for lam, tr in sorted(pts):
+        v = tr.get("value")
+        if v is not None:
+            ax.scatter([lam], [float(v)], color=t["accent"], s=55, zorder=4)
+        rows.append({"lambda": lam, "status": tr.get("status"), "threshold_price": v})
+    ax.set_xlabel("Threshold λ")
+    ax.set_ylabel(f"Threshold price ({pid})")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    return fig, f"Threshold price ({pid})", f"Computed threshold prices at declared λ values for {pid}.", rows, "threshold price by lambda"
+
+
+def _cea_evpi(R, t):
+    doc, p, pdoc = _cea_art(R)
+    ths = pdoc.get("thresholds") or {}
+    pts = [(float(td["lambda"]), float(td["evpi"]), float(td.get("evpi_per_person", 0.0)))
+           for td in ths.values() if td.get("evpi") is not None]
+    if not pts:
+        raise Missing("no EVPI values recorded in cost_effectiveness artifact")
+    pts.sort()
+    fig, ax = _fig(t, 6.6, 4.0)
+    ax.plot([x[0] for x in pts], [x[1] for x in pts], marker="o", color=t["accent"], lw=2.0)
+    ax.set_xlabel("Threshold λ")
+    ax.set_ylabel("Total EVPI")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    rows = [{"lambda": lam, "evpi": ev, "evpi_per_person": pp} for lam, ev, pp in pts]
+    return fig, f"Expected value of perfect information ({p})", f"EVPI at declared decision thresholds ({p}).", rows, "EVPI across thresholds"
+
+
+def _cea_switching(R, t):
+    doc, p, pdoc = _cea_art(R)
+    sw = [r for r in (doc.get("switching") or []) if isinstance(r.get("range"), list) and len(r["range"]) == 2]
+    if not sw:
+        raise Missing("no ranged switching tests recorded in cost_effectiveness artifact")
+    fig, ax = _fig(t, 6.8, max(3.4, 0.55 * len(sw) + 1.5))
+    rows = []
+    for idx, r in enumerate(sw):
+        lo, hi = float(r["range"][0]), float(r["range"][1])
+        ax.plot([lo, hi], [idx, idx], color=t["muted"], lw=4.0, solid_capstyle="round")
+        for tid, tr in (r.get("thresholds") or {}).items():
+            if tr.get("flip_lo") is not None and tr.get("flip_hi") is not None:
+                ax.plot([float(tr["flip_lo"]), float(tr["flip_hi"])], [idx, idx], color=t["accent"], lw=6.0)
+        rows.append({"test_id": r["test_id"], "input": r["input"], "lo": lo, "hi": hi})
+    ax.set_yticks(range(len(sw)))
+    ax.set_yticklabels([r["input"] for r in sw], fontsize=8)
+    ax.set_xlabel("Tested input range (switching bracket highlighted)")
+    ax.ticklabel_format(axis="x", style="plain", useOffset=False)
+    return fig, "Switching-value tests", "Tested ranges with evaluated switching brackets marked.", rows, "CEA switching tests"
+
+
+def _cea_by_package(R, t):
+    doc, p, pdoc = _cea_art(R)
+    plan_doc = doc.get("plan") or {}
+    by_pkg = plan_doc.get("by_package") or {}
+    if not by_pkg:
+        raise Missing("no allocation add-on by_package summary in cost_effectiveness artifact")
+    fig, ax = _fig(t, 6.6, 4.2)
+    rows = []
+    for pk, r in by_pkg.items():
+        de, dc = float(r["delta_health"]), float(r["delta_cost"])
+        ax.scatter([de], [dc], s=60, zorder=4)
+        ax.annotate(pk, (de, dc), textcoords="offset points", xytext=(5, 4), fontsize=8, color=t["ink"])
+        rows.append({"package": pk, "units": r["units"], "delta_cost": dc, "delta_health": de, "status": r["status"]})
+    ax.set_xlabel("Incremental health gained vs comparator")
+    ax.set_ylabel("Incremental discounted cost vs comparator")
+    ax.ticklabel_format(style="plain", useOffset=False)
+    return fig, "Cost-effectiveness by package in plan", "Incremental discounted cost against health gained per allocated package.", rows, "CEA by package"
+
+
+FUNCS.update({
+    "ce_frontier": _cea_frontier,
+    "ce_plane": _cea_plane,
+    "ceac": _cea_ceac,
+    "price_grid": _cea_price_grid,
+    "threshold_price": _cea_threshold_price,
+    "evpi": _cea_evpi,
+    "switching": _cea_switching,
+    "ce_by_package": _cea_by_package,
+})
+
+
 # --------------------------------------------------------------------------- rendering
 def _offset_free(fig) -> bool:
     fig.canvas.draw()
@@ -3537,6 +3735,38 @@ def _self_test() -> int:
            and all(f.get("group") in ("decision", "diagnostics") for f in idx["figures"]),
            f"F27 figures.yaml separates decision figures from modeller diagnostics: {grp}")
         _self_test_isolation(ok, base)
+        # F_CEA1: cost_effectiveness decision figure set renders cleanly from analysis/cost_effectiveness.yaml
+        d_cea = os.path.join(base, "cea_run")
+        os.makedirs(os.path.join(d_cea, "analysis"), exist_ok=True)
+        open(os.path.join(d_cea, "units.csv"), "w").write("id,pop,x\nu1,1000,0.1\n")
+        yaml.safe_dump({
+            "schema_version": 1, "deliverable": {"kind": "cost_effectiveness"},
+            "decision_units": {"csv": "units.csv", "id": "id"},
+            "options": {"components": {"a": {}}, "packages": {"none": [], "pkg_a": ["a"]}},
+            "comparator": {"package": "none"},
+        }, open(os.path.join(d_cea, "decision_spec.yaml"), "w"))
+        yaml.safe_dump({"schema": "analysis.cost_effectiveness/1", "data": {
+            "perspectives": {"health_system": {
+                "strategies": {
+                    "none": {"cost": 0.0, "health": 0.0, "delta_cost_vs_ref": 0.0, "delta_health_vs_ref": 0.0, "status": "reference", "icer": None},
+                    "pkg_a": {"cost": 1000.0, "health": 5.0, "delta_cost_vs_ref": 1000.0, "delta_health_vs_ref": 5.0, "status": "icer", "icer": 200.0},
+                },
+                "frontier": ["none", "pkg_a"],
+                "thresholds": {"t1": {"lambda": 500.0, "chosen": "pkg_a", "evpi": 25.0, "evpi_per_person": 0.025}},
+                "uncertainty": {"draws": 100, "status": "computed", "quadrant_share": {"pkg_a": {"ne": 0.9, "se": 0.1, "sw": 0.0, "nw": 0.0}}},
+                "ceac": {"lambda": [0.0, 200.0, 500.0], "share": {"none": [1.0, 0.5, 0.1], "pkg_a": [0.0, 0.5, 0.9]}, "ceaf": ["none", "pkg_a", "pkg_a"]},
+                "prices": {"p_a": {"cells": [{"price": 5.0, "chosen": "pkg_a", "margin": 200.0}, {"price": 20.0, "chosen": "none", "margin": -100.0}],
+                                   "threshold": {"t1": {"status": "threshold", "value": 15.0}}}},
+            }},
+            "health_measure": {"kind": "dalys", "events": {}},
+            "switching": [{"test_id": "hw_cases", "input": "health_weight:cases", "range": [0.05, 0.15],
+                           "thresholds": {"t1": {"verdict": "flips", "flip_lo": 0.09, "flip_hi": 0.10}}}],
+        }}, open(os.path.join(d_cea, "analysis", "cost_effectiveness.yaml"), "w"))
+        out_cea = os.path.join(base, "cea_figs")
+        r_cea = render(d_cea, out_cea, only=list(DECISION_SETS["cost_effectiveness"]))
+        drawn_cea = {f["figure"] for f in r_cea["figures"]}
+        ok(drawn_cea == set(DECISION_SETS["cost_effectiveness"]) and all(f["offset_free"] for f in r_cea["figures"]),
+           f"F_CEA1 all 7 cost_effectiveness decision figures render offset-free ({sorted(drawn_cea)}, notp={r_cea['not_produced']})")
     print("OK: all self-test cases passed." if not fails else f"FAILED: {len(fails)} case(s)")
     return 1 if fails else 0
 

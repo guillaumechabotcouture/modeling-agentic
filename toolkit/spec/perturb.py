@@ -51,18 +51,26 @@ ALIASES = {"parameter_value": "parameter", "prior_range": "parameter", "fitted_r
            "scenario_excluded": "parameter", "interaction_rescale": "interaction", "group_rule": "group_rule",
            "envelope": "envelope", "cost_items": "cost_item", "unit_attribute": "unit_column",
            "calibration_target": "calibration_target", "outcome_ratio": "outcome", "burden_scale": "burden",
-           "boundary_engine": "boundary_engine", "anchor_range": "anchor"}
+           "boundary_engine": "boundary_engine", "anchor_range": "anchor",
+           "discount_rate": "discount_rate", "health_weight": "health_weight",
+           "consequence_cost": "consequence_cost", "timing": "timing"}
 # kind -> the alias a native perturb test of that kind executes as
 EXEC = {"parameter": "parameter_value", "interaction": "interaction_rescale", "group_rule": "group_rule",
         "envelope": "envelope", "cost_item": "cost_items", "unit_column": "unit_attribute",
         "calibration_target": "calibration_target", "outcome": "outcome_ratio", "burden": "burden_scale",
-        "boundary_engine": "boundary_engine", "anchor": "anchor_range"}
+        "boundary_engine": "boundary_engine", "anchor": "anchor_range",
+        "discount_rate": "discount_rate", "health_weight": "health_weight",
+        "consequence_cost": "consequence_cost", "timing": "timing"}
 # the fields each kind's target takes in a spec (besides `target`)
 FIELDS = {"parameter": {"name", "values", "value"}, "interaction": {"benchmark", "components", "with_any", "values"},
           "group_rule": {"remove", "add"}, "envelope": {"values"}, "cost_item": {"name", "scale"},
           "unit_column": {"name", "units", "values", "scale", "shift", "set_from"},
           "calibration_target": {"units", "scale"}, "outcome": {"component", "reference", "values"},
-          "burden": {"references", "shares"}, "boundary_engine": set()}
+          "burden": {"references", "shares"}, "boundary_engine": set(),
+          "discount_rate": {"costs", "health"}, "health_weight": {"outcome", "values"},
+          "consequence_cost": {"id", "values"}, "timing": {"values"}}
+CRITERIA = ("plan", "chosen_strategy")
+TIMING_OPS = ("start", "end", "uniform_accrual")
 AUTOMATIC = ("anchor",)                       # kinds only the harness generates
 UNIT_OPS = ("values", "scale", "shift", "set_from")
 NESTED = {"unit_attribute": "unit_attribute", "calibration_target": "calibration_target",
@@ -70,7 +78,7 @@ NESTED = {"unit_attribute": "unit_attribute", "calibration_target": "calibration
 EVALUATED = ("parameter", "unit_column", "cost_item", "calibration_target", "anchor")   # kinds that evaluate the model
 META = ("type", "set", "alias", "conditional", "layer")
 STASH = "as_given"            # an older test's fields named like META, kept apart by compile (W0-B review r2)
-TOP = ("id", "type", "text", "finding", "set", "conditional")     # a spec's perturb test, at its top level
+TOP = ("id", "type", "text", "finding", "set", "conditional", "criterion")     # a spec's perturb test, at its top level
 
 
 def _isnum(x) -> bool:
@@ -117,9 +125,11 @@ def compile(dt: dict) -> dict:  # noqa: A001 -- the alias compiler
         if isinstance(b, dict) and b and "target" not in b and "name" not in b:     # absent or {} stays as given
             rest.pop(NESTED[t])
             tgt.update({("name" if (k == "column" and kind == "unit_column") else k): v for k, v in b.items()})
-    else:                                   # interaction, envelope, boundary_engine, anchor: flat fields
+    else:                                   # interaction, envelope, boundary_engine, anchor, CEA targets: flat fields
         for k in ({"interaction": ("benchmark", "components", "with_any", "values"), "envelope": ("values",),
-                   "anchor": ("anchors", "ends", "values")}.get(kind) or ()):
+                   "anchor": ("anchors", "ends", "values"),
+                   "discount_rate": ("costs", "health"), "health_weight": ("outcome", "values"),
+                   "consequence_cost": ("id", "values"), "timing": ("values",)}.get(kind) or ()):
             if k in rest:
                 tgt[k] = rest.pop(k)
     return {"type": TYPE, "alias": t, "set": targets, **rest}
@@ -223,6 +233,8 @@ def problems(p: dict) -> list[str]:
     if "conditional" in p and p["conditional"] is not conditional(p):
         bad.append(f"decision test {i}: conditional is {conditional(p)} for this set (true exactly when a second "
                    "parameter is held); it is derived, so leave it out or state it as derived")
+    if "criterion" in p and p["criterion"] not in CRITERIA:
+        bad.append(f"decision test {i}: criterion must be one of {CRITERIA}")
     return bad
 
 
@@ -297,6 +309,26 @@ def _field_problems(k, t, n) -> list:
             bad.append("units: a non-empty list of unit ids")
         if not (_isnum(t.get("scale")) and t["scale"] > 0):
             bad.append("scale: a positive number")
+    elif k == "discount_rate":
+        if not (set(t) & {"costs", "health"}):
+            bad.append("costs and/or health: list of discount rates in [0, 0.25]")
+        for sub_k in ("costs", "health"):
+            if sub_k in t and not _nums(t[sub_k], lo=0, hi=0.25, strict_lo=False):
+                bad.append(f"{sub_k}: non-empty list of rates in [0, 0.25]")
+    elif k == "health_weight":
+        if not _isname(t.get("outcome")):
+            bad.append("outcome: health-measure event outcome name")
+        if not _nums(t.get("values"), lo=0, hi=1, strict_lo=False):
+            bad.append("values: non-empty list of weights in [0, 1]")
+    elif k == "consequence_cost":
+        if not _isname(t.get("id")):
+            bad.append("id: consequence cost id")
+        if not _nums(t.get("values"), lo=0, strict_lo=False):
+            bad.append("values: non-empty list of non-negative unit costs")
+    elif k == "timing":
+        vs = t.get("values")
+        if not (isinstance(vs, list) and vs and all(v in TIMING_OPS for v in vs)):
+            bad.append(f"values: non-empty list from {TIMING_OPS}")
     return bad
 
 
@@ -488,6 +520,26 @@ def _self_test() -> int:
        and layer(by_id["DTb"], "emulator", 10, 4) == {"layer": "post_emulator", "cases": 2, "engine_rows": 0}
        and layer(nu, "direct", 5, 3)["engine_rows"] == 15 and layer(nc, "direct", 5, 3)["engine_rows"] == 15,
        "PT21 DT_PERTURB_LAYER_COST: post_emulator, emulator_design or engine, with the engine row count")
+
+    # PT_CEA1 / PT_CEA2: CEA criterion=chosen_strategy and 4 new targets (discount_rate, health_weight, consequence_cost, timing)
+    cea_tests = [
+        {"id": "cea_dr", "type": "perturb", "criterion": "chosen_strategy", "text": "zero discount rate",
+         "set": [{"target": "discount_rate", "costs": [0.0], "health": [0.0]}]},
+        {"id": "cea_hw", "type": "perturb", "criterion": "chosen_strategy", "text": "disability weight bounds",
+         "set": [{"target": "health_weight", "outcome": "cases", "values": [0.05, 0.15]}]},
+        {"id": "cea_cc", "type": "perturb", "criterion": "chosen_strategy", "text": "consequence cost bounds",
+         "set": [{"target": "consequence_cost", "id": "case_hs", "values": [50.0, 120.0]}]},
+        {"id": "cea_tm", "type": "perturb", "criterion": "chosen_strategy", "text": "window timing bounds",
+         "set": [{"target": "timing", "values": ["start", "end"]}]},
+    ]
+    ok(all(problems(x) == [] and view(x)["type"] == x["set"][0]["target"] for x in cea_tests),
+       "PT_CEA1 CEA targets & chosen_strategy criterion validate and compile cleanly")
+    bad_crit = problems({"id": "bad_c", "type": "perturb", "criterion": "invalid", "text": "x",
+                         "set": [{"target": "timing", "values": ["start"]}]})
+    bad_tm = problems({"id": "bad_t", "type": "perturb", "text": "x",
+                       "set": [{"target": "timing", "values": ["bogus"]}]})
+    ok(any("criterion" in e for e in bad_crit) and any("timing" in e for e in bad_tm),
+       f"PT_CEA2 unknown criterion and invalid timing value refused ({bad_crit}, {bad_tm})")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
