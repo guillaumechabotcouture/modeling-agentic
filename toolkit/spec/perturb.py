@@ -120,6 +120,10 @@ def compile(dt: dict) -> dict:  # noqa: A001 -- the alias compiler
         for k_from, k_to in (("rule", "remove"), ("add", "add")):
             if k_from in rest:
                 tgt[k_to] = rest.pop(k_from)
+    elif kind == "consequence_cost":
+        for k_from, k_to in (("cost_id", "id"), ("values", "values")):
+            if k_from in rest:
+                tgt[k_to] = rest.pop(k_from)
     elif t in NESTED:
         b = rest.get(NESTED[t])
         if isinstance(b, dict) and b and "target" not in b and "name" not in b:     # absent or {} stays as given
@@ -129,7 +133,7 @@ def compile(dt: dict) -> dict:  # noqa: A001 -- the alias compiler
         for k in ({"interaction": ("benchmark", "components", "with_any", "values"), "envelope": ("values",),
                    "anchor": ("anchors", "ends", "values"),
                    "discount_rate": ("costs", "health"), "health_weight": ("outcome", "values"),
-                   "consequence_cost": ("id", "values"), "timing": ("values",)}.get(kind) or ()):
+                   "timing": ("values",)}.get(kind) or ()):
             if k in rest:
                 tgt[k] = rest.pop(k)
     return {"type": TYPE, "alias": t, "set": targets, **rest}
@@ -172,6 +176,10 @@ def _view(p: dict) -> dict:
             out["multipliers"] = {t["name"]: t["scale"] for t in targets}
     elif kind == "group_rule":
         for k_from, k_to in (("remove", "rule"), ("add", "add")):
+            if k_from in first:
+                out[k_to] = first[k_from]
+    elif kind == "consequence_cost":
+        for k_from, k_to in (("id", "cost_id"), ("values", "values")):
             if k_from in first:
                 out[k_to] = first[k_from]
     elif out["type"] in NESTED:
@@ -416,6 +424,10 @@ def _self_test() -> int:
         {"id": "BS", "type": "burden_scale"}, {"id": "BS0", "type": "burden_scale", "burden_scale": {}},
         {"id": "anchor_range_N", "type": "anchor_range", "anchors": ["N0"], "values": [0.025, 0.975],
          "ends": {0.025: {"anchor:N0": 1.0}, 0.975: {"anchor:N0": 2.0}}, "automatic": True},
+        {"id": "DTdr", "type": "discount_rate", "costs": [0.0], "health": [0.0]},
+        {"id": "DThw", "type": "health_weight", "outcome": "cases", "values": [0.05, 0.15]},
+        {"id": "DTcc", "type": "consequence_cost", "cost_id": "case_hs", "values": [50.0, 120.0]},
+        {"id": "DTtm", "type": "timing", "values": ["start", "end"]},
     ]
     seen, by_id = set(), {dt["id"]: dt for dt in shapes}
     for dt in shapes:

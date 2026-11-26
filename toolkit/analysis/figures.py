@@ -128,7 +128,8 @@ class RunData:
         from toolkit.alloc import costs as acosts
         self.pk = acosts.packages(self.spec["options"])
         self.components = list(self.spec["options"]["components"])
-        self.primary = self.spec["objective"]["outcome"]
+        self.primary = ((self.spec.get("objective") or {}).get("outcome")
+                        or ((self.spec.get("cost_effectiveness") or {}).get("health_measure") or {}).get("kind", "health"))
         self.comparator = self.spec["comparator"]["package"]
 
     def _load(self, rel):
@@ -3199,7 +3200,8 @@ def _self_test() -> int:
         d = toy_run(os.path.join(base, "run1"))
         res = render(d)
         got = {f["figure"] for f in res["figures"]} | {x["figure"] for x in res["not_produced"]}
-        ok(got == set(ORDER) and all(x["reason"] for x in res["not_produced"]),
+        want_f1 = {n for v in tiers_for(yaml.safe_load(open(os.path.join(d, "decision_spec.yaml"), encoding="utf-8"))).values() for n in v}
+        ok(got == want_f1 and all(x["reason"] for x in res["not_produced"]),
            f"F1 every figure is produced or has a not-produced reason: {sorted(f['figure'] for f in res['figures'])} / "
            f"{[(x['figure'], x['reason'][:40]) for x in res['not_produced']]}")
         want = {"headline", "allocation_map", "stability_map", "burden_map", "calibration_fit", "frontier", "dollars",

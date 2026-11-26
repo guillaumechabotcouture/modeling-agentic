@@ -929,11 +929,13 @@ def allocation_addon(A, out0: Mapping, cost0: Mapping, plan: Mapping[str, str], 
     cm = acosts.cost_matrix(A.alloc, units, outcome=fn, floor=False)
 
     # 1. Per-unit totals & incremental frontier over each unit's feasible packages
+    feas_map = (A.feas.get("feasible") if isinstance(A.feas, Mapping) and "feasible" in A.feas else A.feas) or {}
     per_unit: dict[str, dict] = {}
     unit_ce: dict[str, dict[str, tuple[float, float]]] = {}
     for u_id in A.ids:
         u_row = A.by_id[u_id]
-        feas_pks = [p for p in ce["strategies"] if p in A.feas.get(u_id, set())]
+        u_feas = feas_map.get(u_id) or {}
+        feas_pks = [p for p in ce["strategies"] if (bool(u_feas.get(p)) if isinstance(u_feas, Mapping) else p in u_feas)]
         if ref not in feas_pks:
             feas_pks = [ref, *feas_pks]
         evs_u: dict[str, dict[str, dict[str, float]]] = {}
