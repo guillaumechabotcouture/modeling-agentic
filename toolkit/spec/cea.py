@@ -485,6 +485,7 @@ def toy_cea_spec(d: str, *, standalone: bool = True) -> dict:
             "sources": [{"kind": "health_weights"}],
             "excluded": [
                 {"kind": "engine_parameters", "reason": "toy test"},
+                {"parameter": "synergy", "reason": "toy test"},
                 {"kind": "calibration", "reason": "toy test"},
                 {"kind": "costs", "reason": "negotiated price grid"},
                 {"kind": "emulator", "reason": "direct evaluation"},
