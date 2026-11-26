@@ -112,6 +112,22 @@ def dossier_changed(run_dir: str, rec: dict) -> list[str]:
     return preconditions_state(run_dir, rec)[1]
 
 
+def acquired_changed(run_dir: str, rec: dict) -> list[str]:
+    """Verify acquired input inventory against sign-off record (`acquired_inventory_sha256`), even with no dossier (§5)."""
+    from agents import acquire as ACQ
+    rec_inv = rec.get("acquired_inventory_sha256") if isinstance(rec, dict) else None
+    has_acq = ACQ.has_acquired(run_dir)
+    if not has_acq and rec_inv is None:
+        return []
+    try:
+        v = ACQ.verify_inventory(run_dir)
+    except (ACQ.ArtifactTampered, LinkRefused, OSError):
+        return [ACQ.ACQUIRED_ROOT]
+    if v.get("inventory_sha256") != rec_inv:
+        return [ACQ.MANIFEST_REL]
+    return []
+
+
 def status(run_dir: str) -> str:
     """absent | invalid | awaiting | changed | signed, or a precondition's status for a signed run whose
     preconditions do not hold now: unsigned_evidence (signed without a complete evidence binding where the options
@@ -122,7 +138,7 @@ def status(run_dir: str) -> str:
         return "changed" if rec is not None else "absent"
     if rec is not None:
         if DB._sha(path) != (rec.get("sha256") or {}).get(SPEC) or derived_changed(run_dir, rec) \
-                or burden_changed(run_dir, rec):
+                or burden_changed(run_dir, rec) or acquired_changed(run_dir, rec):
             return "changed"
         st = preconditions_state(run_dir, rec)[0]
         return "signed" if st == "ok" else st
@@ -259,6 +275,21 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     rc_sha = RC.sha_of(rc_bytes)
     if rc_sha != "none":
         extra[RC.FILE] = rc_sha
+    from agents import acquire as ACQ
+    acq_inv_sha = None
+    if ACQ.has_acquired(run_dir):
+        try:
+            v_acq = ACQ.verify_inventory(run_dir)
+        except (ACQ.ArtifactTampered, LinkRefused, OSError) as e:
+            raise ValueError(f"acquired inventory invalid: {e}") from None
+        acq_inv_sha = v_acq.get("inventory_sha256")
+        if acq_inv_sha is not None:
+            _, mbytes = ACQ.read_manifest(run_dir)
+            if mbytes is not None:
+                extra[ACQ.MANIFEST_REL] = hashlib.sha256(mbytes).hexdigest()
+            if sheet_bytes is not None and src is not None and src.get("acquired_inventory_sha256") != acq_inv_sha:
+                raise ValueError(f"{SHEET} was generated from another acquired inventory (it is stale): "
+                                 "regenerate the sheet and read it again")
     # Codex on 08f96a9: the geometry evidence the sheet showed must still be current when the freeze approves
     geo_expect = None
     if src is not None:
@@ -299,6 +330,7 @@ def sign(run_dir: str, by: str, note: str = "", answers: dict | None = None, acc
     geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=geo_expect)
     record = {"signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
               "sha256": {SPEC: sha, **extra}, "evidence": evidence["record"],
+              **({"acquired_inventory_sha256": acq_inv_sha} if acq_inv_sha is not None else {}),
               "producer": "toolkit/spec/signoff.py",
               "schema_version": schema.SCHEMA_VERSION}
     try:
@@ -391,8 +423,18 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
         rsha = RC.sha_of(rbytes)
     except ValueError:
         rbytes, rsha = None, "unreadable"
+    from agents import acquire as ACQ
+    mbytes, acq_inv_sha = None, None
+    if ACQ.has_acquired(run_dir):
+        try:
+            v_acq = ACQ.verify_inventory(run_dir)
+            acq_inv_sha = v_acq.get("inventory_sha256")
+            _, mbytes = ACQ.read_manifest(run_dir)
+        except (ACQ.ArtifactTampered, LinkRefused, OSError):
+            acq_inv_sha = "unreadable"
     text = sheet(run_dir, candidates, spec_bytes=spec_bytes, record_bytes=rec_bytes, geometry_section=section,
-                 burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure, review_bytes=rbytes)
+                 burden_bytes=bbytes, dossier_bytes=ebytes, closure=closure, review_bytes=rbytes,
+                 manifest_bytes=mbytes)
     src = json.dumps({"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
                       "burden_references_sha256": bsha,
                       "evidence_dossier_sha256": esha,
@@ -400,7 +442,8 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
                       "input_closure": closure, "input_closure_owners": owners,
                       "derivations_sha256": hashlib.sha256(rec_bytes).hexdigest() if rec_bytes is not None else "none",
                       "review_conditions_sha256": rsha,
-                      "geometry_evidence_sha256": section[1]},
+                      "geometry_evidence_sha256": section[1],
+                      **({"acquired_inventory_sha256": acq_inv_sha} if acq_inv_sha is not None else {})},
                      sort_keys=True)
     write_nofollow(run_dir, SHEET, (text.rstrip("\n") + f"\n\n{SHEET_SOURCES}{src} -->\n").encode(), atomic=True)
     return os.path.join(run_dir, SHEET)
@@ -409,7 +452,7 @@ def write_sheet(run_dir: str, candidates: list | None = None) -> str:
 def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None = None,
           record_bytes: bytes | None = None, geometry_section: tuple | None = None,
           burden_bytes: bytes | None = None, dossier_bytes: bytes | None = None, closure: dict | None = None,
-          review_bytes: bytes | None = None) -> str:
+          review_bytes: bytes | None = None, manifest_bytes: bytes | None = None) -> str:
     """The sign-off sheet (markdown): what signing accepts beyond the spec's text. Each engine default the spec
     accepts by name, with the card's meaning and the spec's reason; the staged columns and tables the derivations
     do not use, with their reasons; the derivations; each engine parameter value the spec sets, with the card value
@@ -496,6 +539,8 @@ def sheet(run_dir: str, candidates: list | None = None, spec_bytes: bytes | None
     from toolkit.analysis import burden as BV
     out += BV.sheet_lines(raw, run_dir, burden_bytes)   # F6 S2-5: reference sources the owner attests are independent
     out += ED.sheet_lines(raw, run_dir, dossier_bytes, closure)   # F6: each input, execution's vs the chosen value
+    from agents import acquire as ACQ
+    out += ACQ.acquired_sheet_lines(run_dir, manifest_bytes=manifest_bytes, spec_doc=raw, dossier_bytes=dossier_bytes)
     from toolkit.engines import benchmark_coverage as BC
     out += BC.sheet_lines(raw, candidates)              # owner decision 2026-11-12: departures the signature accepts
     from toolkit.analysis import uncertainty as UQ

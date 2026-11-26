@@ -517,14 +517,29 @@ def sign(run_dir: str, by: str, answers: dict | None = None, note: str = "",
         except (yaml.YAMLError, UnicodeDecodeError) as e:
             raise ValueError(f"{DECISION_SPEC} does not parse: {e}") from None
         geometry.freeze(run_dir, by, spec=spec_doc if isinstance(spec_doc, dict) else {}, expect_evidence=expect_geometry)
+    acq_inv_sha = None
+    acq_sha_entry: dict = {}
+    if captured.get(DECISION_SPEC) is not None:
+        from agents import acquire as ACQ
+        if ACQ.has_acquired(run_dir):
+            try:
+                v_acq = ACQ.verify_inventory(run_dir)
+                acq_inv_sha = v_acq.get("inventory_sha256")
+                _, mbytes = ACQ.read_manifest(run_dir)
+                if mbytes is not None:
+                    acq_sha_entry[ACQ.MANIFEST_REL] = hashlib.sha256(mbytes).hexdigest()
+            except (ACQ.ArtifactTampered, LinkRefused, OSError) as e:
+                raise ValueError(f"acquired inventory invalid: {e}") from None
     record = {
         "signed_by": by, "signed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(), "note": note,
         "answers": {q["id"]: answers.get(q["id"], q.get("proposed")) for q in qs},
         "answer_source": {q["id"]: "given" if q["id"] in answers else "proposed accepted" for q in qs},
         # W0-G (Codex r2 P1-3): the digest of the bytes validated above, after anything a caller supplies
         "sha256": {**shas, **(extra_sha or {}), **sheet_sha_entry, **((evidence or {}).get("files") or {}),
+                   **acq_sha_entry,
                    **_review_conditions_sha(rc_bytes if captured.get(DECISION_SPEC) is not None else None)},
         **({"evidence": evidence["record"]} if evidence else {}),
+        **({"acquired_inventory_sha256": acq_inv_sha} if acq_inv_sha is not None else {}),
         "schema_version": schema_version(doc),
         "producer": "scripts/decision_brief.py",
     }

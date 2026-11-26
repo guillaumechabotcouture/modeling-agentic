@@ -866,6 +866,31 @@ def identity_problem(proc, launch) -> tuple[str, str] | None:
     return None
 
 
+def acquired_content_problem(run_dir) -> tuple[str, str] | None:
+    """AQ21 (docs/design/acquire.md §8): refuse grading any eval run that carries acquired content,
+    in every mode, regardless of what metadata.json claims."""
+    rd = os.path.abspath(run_dir)
+    hits: list[str] = []
+    if os.path.lexists(os.path.join(rd, "data", "inputs", "acquired")):
+        hits.append("data/inputs/acquired/")
+    if os.path.lexists(os.path.join(rd, "acquire")):
+        hits.append("acquire/")
+    if os.path.lexists(os.path.join(rd, "evidence", "acquired_manifest.json")):
+        hits.append("evidence/acquired_manifest.json")
+    prov = _read_json(os.path.join(rd, "data", "inputs_provenance.json"))
+    if isinstance(prov, dict):
+        if "acquired_inventory_sha256" in prov:
+            hits.append("data/inputs_provenance.json:acquired_inventory_sha256")
+        if any(isinstance(v, dict) and v.get("origin") == "acquired" for v in (prov.get("inputs") or {}).values()):
+            hits.append("data/inputs_provenance.json:origin=acquired")
+    meta = _read_json(os.path.join(rd, "metadata.json"))
+    if isinstance(meta, dict) and meta.get("acquire") == "auto":
+        hits.append("metadata.json:acquire=auto")
+    if hits:
+        return "acquired_content_refused", "eval grading refused: run contains acquired content (" + ", ".join(hits) + ")"
+    return None
+
+
 def grade_run(q, run_dir, private_dir=None, data_dir=DATA, truth=None, launch=None, verify_inputs=True) -> dict:
     """Score one run. The answer key is `truth` when given (with the current rubric),
     else the key in the hidden tree whose input hashes match the run's (select_truth)."""
@@ -883,10 +908,10 @@ def grade_run(q, run_dir, private_dir=None, data_dir=DATA, truth=None, launch=No
     out.update(run_dir=os.path.abspath(run_dir), answer=answer, truth_seed=truth.get("seed"), truth_key=key,
                truth_selected_by=how, inputs_sha256=truth.get("inputs_sha256"), inputs_verified=verify_inputs,
                grader="scripts/eval_suite.py", schema_version=1)
-    prob = None
-    if how.startswith(INPUTS_CONTRADICT):
+    prob = acquired_content_problem(run_dir)
+    if prob is None and how.startswith(INPUTS_CONTRADICT):
         prob = ("inputs_mismatch", how[len(INPUTS_CONTRADICT):])
-    elif verify_inputs:
+    elif prob is None and verify_inputs:
         prob = input_hash_problem(q, truth, launch)
     prob = prob or identity_problem(answer.get("process"), launch)   # a run that is not what was launched
     if prob:   # refuse: a score against the wrong answer key means nothing
@@ -1608,7 +1633,7 @@ def _self_test(with_private=False, private_dir=None) -> int:
                          ("S14", _test_s14_grade_fails_closed), ("S15", _test_s15_no_truth_in_details),
                          ("S16", _test_s16_conflicting_copies), ("S17", _test_s17_plaintext_not_in_checkout),
                          ("S18", _test_s18_incomplete_bundle), ("S19", _self_test_s19_pipeline),
-                         ("S20", _test_s20_run_never_decrypts)):
+                         ("S20", _test_s20_run_never_decrypts), ("AQ21", _self_test_aq21_acquired_refused)):
             try:
                 fn(ok, os.path.join(td, name))
             except (Exception, SystemExit) as e:  # noqa: BLE001 — a missing piece is a failed case
@@ -2001,6 +2026,49 @@ def _test_s20_run_never_decrypts(ok, td):
             src = f.read()
         ok(not re.search(r"eval_private|decrypt|keychain_key|use_private", src),
            f"S20f the launcher ({rel}) never reaches the bundle's key or plaintext")
+
+
+def _self_test_aq21_acquired_refused(ok, td):
+    """AQ21 (docs/design/acquire.md §8): grade_run refuses any eval run holding acquired content,
+    in every grading mode (verified and unverified), regardless of metadata.json."""
+    import eval_private
+    rubric, truth = _toy()
+    priv = os.path.join(td, "priv")
+    eval_private._write_private(priv, "toy", rubric, dict(truth, question="toy"))
+    cases = (
+        ("acquired_dir", lambda r: os.makedirs(os.path.join(r, "data", "inputs", "acquired", "svc"), exist_ok=True)),
+        ("acquire_dir", lambda r: os.makedirs(os.path.join(r, "acquire"), exist_ok=True)),
+        ("manifest", lambda r: (os.makedirs(os.path.join(r, "evidence"), exist_ok=True),
+                                open(os.path.join(r, "evidence", "acquired_manifest.json"), "w").write("{}"))),
+        ("prov_origin", lambda r: (os.makedirs(os.path.join(r, "data"), exist_ok=True),
+                                   json.dump({"inputs": {"data/inputs/x.csv": {"origin": "acquired"}}},
+                                             open(os.path.join(r, "data", "inputs_provenance.json"), "w")))),
+        ("prov_digest", lambda r: (os.makedirs(os.path.join(r, "data"), exist_ok=True),
+                                   json.dump({"inputs": {}, "acquired_inventory_sha256": "0" * 64},
+                                             open(os.path.join(r, "data", "inputs_provenance.json"), "w")))),
+        ("meta_auto", lambda r: json.dump({"acquire": "auto"}, open(os.path.join(r, "metadata.json"), "w"))),
+    )
+    res_map = {}
+    for cname, plant in cases:
+        run = os.path.join(td, "aq21_" + cname)
+        build_fixture(run, rubric, truth, "perfect")
+        # Metadata claims acquire: off on every marker except meta_auto to prove grader ignores metadata claim
+        if cname != "meta_auto":
+            meta_p = os.path.join(run, "metadata.json")
+            m = _read_json(meta_p) or {}
+            m["acquire"] = "off"
+            json.dump(m, open(meta_p, "w"))
+        plant(run)
+        s_unv = grade_run("toy", run, private_dir=priv, verify_inputs=False)
+        s_ver = grade_run("toy", run, private_dir=priv, verify_inputs=True,
+                          launch={"eval_inputs_sha256": {"data/evals/toy/a.csv": "x"}})
+        res_map[cname] = (
+            s_unv.get("refused") and s_unv["quality"] == 0.0
+            and any(f.get("code") == "acquired_content_refused" for f in s_unv.get("failures", []))
+            and s_ver.get("refused") and s_ver["quality"] == 0.0
+            and any(f.get("code") == "acquired_content_refused" for f in s_ver.get("failures", []))
+        )
+    ok(all(res_map.values()), f"AQ21 grade_run refuses any run with acquired content in every mode ({res_map})")
 
 
 def _archive_of(repo) -> bytes:

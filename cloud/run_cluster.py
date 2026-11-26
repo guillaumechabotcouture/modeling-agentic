@@ -1049,8 +1049,39 @@ def launch(cfg) -> int:
         return _launch_locked(cfg, inv)
 
 
+def acquire_flag_problems(cfg) -> list[str]:
+    """AQ20 (docs/design/acquire.md §§8, 10): refuse `--acquire` on eval-suite configs or on any question
+    file marked `private: true`."""
+    flags = [str(f) for f in (getattr(cfg, "flags", None) or ())]
+    if not any(f == "--acquire" or f.startswith("--acquire=") for f in flags):
+        return []
+    probs: list[str] = []
+    qfile = str(getattr(cfg, "question_file", None) or "").replace("\\", "/")
+    spref = str(getattr(cfg, "storage_prefix", None) or "").replace("\\", "/")
+    reqs = [str(x).replace("\\", "/") for x in (getattr(cfg, "required_files", None) or ())]
+    is_eval = (
+        spref.startswith("runs/evals/")
+        or any("data/evals/" in r for r in reqs)
+        or qfile.startswith("evals/")
+        or "/evals/" in qfile
+    )
+    if is_eval:
+        probs.append("AQ20: --acquire is refused on evaluation-suite configs")
+    if qfile and os.path.isfile(qfile):
+        try:
+            qtxt = open(qfile, encoding="utf-8", errors="replace").read()
+            if re.search(r"(?mi)^\s*private\s*:\s*true\s*$", qtxt):
+                probs.append(f"AQ20: --acquire is refused for question marked `private: true` ({qfile})")
+        except OSError:
+            pass
+    return probs
+
+
 def _launch_locked(cfg, inv) -> int:
     import coiled
+    acq_probs = acquire_flag_problems(cfg)
+    if acq_probs:
+        raise SystemExit("refusing: " + "; ".join(acq_probs))
     if is_running(cfg.name):
         raise SystemExit(f"{cfg.name} is already running: use status / relaunch")
     question = open(cfg.question_file).read().strip()
@@ -6114,6 +6145,23 @@ def _self_test() -> int:
                 ok(c.storage_prefix.startswith(("runs/", "_checks/")), f"RC16 configs/{f} loads")
             except Exception as e:  # noqa: BLE001
                 ok(False, f"RC16 configs/{f} loads: {e}")
+    # AQ20 (docs/design/acquire.md §§8, 10): refuse --acquire on eval configs and private: true questions
+    with tempfile.TemporaryDirectory() as td_aq:
+        q_priv = os.path.join(td_aq, "q_priv.md")
+        q_pub = os.path.join(td_aq, "q_pub.md")
+        open(q_priv, "w", encoding="utf-8").write("private: true\nHow to allocate?\n")
+        open(q_pub, "w", encoding="utf-8").write("How to allocate?\n")
+        c_eval = types.SimpleNamespace(flags=["--v2", "--acquire"], storage_prefix="runs/evals/q1",
+                                       required_files=["data/evals/q1/u.csv"], question_file=q_pub)
+        c_priv = types.SimpleNamespace(flags=["--v2", "--acquire"], storage_prefix="runs/custom/q2",
+                                       required_files=[], question_file=q_priv)
+        c_ok = types.SimpleNamespace(flags=["--v2", "--acquire"], storage_prefix="runs/custom/q3",
+                                     required_files=[], question_file=q_pub)
+        c_eval_off = types.SimpleNamespace(flags=["--v2"], storage_prefix="runs/evals/q1",
+                                           required_files=["data/evals/q1/u.csv"], question_file=q_pub)
+        ok(bool(acquire_flag_problems(c_eval)) and bool(acquire_flag_problems(c_priv))
+           and not acquire_flag_problems(c_ok) and not acquire_flag_problems(c_eval_off),
+           "AQ20 run_cluster refuses --acquire on eval configs and private: true questions, allows public custom runs")
     if fails:
         print(f"FAILED: {len(fails)} case(s)")
         return 1

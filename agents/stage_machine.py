@@ -49,18 +49,20 @@ STATE_FILE = "run_state.json"
 SIGNOFF_FILE = "decision_spec.signoff.json"
 SCOPE_SIGNOFF = "scope_signoff.json"      # Phase 49 β (PR #85)
 SIGNOFF_SHEET = "decision_spec.signoff_sheet.md"   # v2-derived-inputs: what signing accepts beyond the spec's text
-STATES = ("SPEC", "EVIDENCE", "SIGN", "ENGINE_CHOICE",
+STATES = ("ACQUIRE", "SPEC", "EVIDENCE", "SIGN", "ENGINE_CHOICE",
           "ENGINE_BUILD", "ENGINE_ADMIT", "ENGINE_REVIEW", "ENGINE_SIGN",
           "PREREGISTER", "CONFIGURE", "ANALYZE", "SCORE", "CRITIQUE",
           "GATE", "FIX_LOOP", "OWNER_DECISION", "WRITE", "PRESENTATION", "FINAL")
 # The state table: every transition the machine may take. A transition outside it is a bug
 # (raised, never taken).
 EDGES = {
+    # v2 ACQUIRE (docs/design/acquire.md §2.1): public data acquisition before SPEC, with at most one pre-SIGN top-up.
+    "ACQUIRE": {"SPEC", "ACQUIRE", "FINAL"},
     # v2 autonomy 1B-ii (D1): EVIDENCE drafts the evidence dossier before SIGN, so the signer sees it (a run signed
     # under the earlier order, SIGN before EVIDENCE, goes back to SIGN, which checks its signature); SIGN -> EVIDENCE
     # | SPEC is the lead's repair of a refused sign-off (at most MAX_SIGN_REPAIRS), only before any signature.
-    "SPEC": {"EVIDENCE", "SPEC", "FINAL"},
-    "EVIDENCE": {"SIGN", "SPEC", "FINAL"},
+    "SPEC": {"EVIDENCE", "SPEC", "ACQUIRE", "FINAL"},
+    "EVIDENCE": {"SIGN", "SPEC", "ACQUIRE", "FINAL"},
     "SIGN": {"ENGINE_CHOICE", "EVIDENCE", "SPEC", "SIGN", "FINAL"},
     "ENGINE_CHOICE": {"ENGINE_BUILD", "PREREGISTER", "CONFIGURE", "FINAL"},
     # Agent-built engine lane (#363, docs/design/agent-built-engines.md §2.2)
@@ -84,7 +86,7 @@ EDGES = {
     "PRESENTATION": {"GATE", "CRITIQUE", "FINAL"},
     "FINAL": set(),
 }
-LLM_STATES = ("SPEC", "ENGINE_CHOICE", "ENGINE_BUILD", "ENGINE_REVIEW", "CRITIQUE", "FIX_LOOP", "PRESENTATION")
+LLM_STATES = ("ACQUIRE", "SPEC", "ENGINE_CHOICE", "ENGINE_BUILD", "ENGINE_REVIEW", "CRITIQUE", "FIX_LOOP", "PRESENTATION")
 CRITICS = ("critique-domain", "critique-redteam")
 # The owner signs the whole decision_spec.yaml (its sha256). Fix tasks never edit it: they edit
 # analysis_settings.yaml, which holds only computational leaves (analysis_backend.SETTINGS_PATHS;
@@ -126,6 +128,11 @@ ENGINE_ADMIT_COMPUTE_CAP_USD = 15.0
 AWAITING_ENGINE_SIGNOFF = "awaiting_engine_signoff"
 ENGINE_NOT_ADMITTED = "completed_engine_not_admitted"
 ENGINE_DECLINED = "completed_engine_declined"
+# v2 ACQUIRE (docs/design/acquire.md §§2.1, 6.2)
+MAX_ACQUIRE_ROUNDS = 2
+MAX_ACQUIRE_RETRIES = 1
+ACQUIRE_CAP_USD = 6.0
+AWAITING_INPUTS = "awaiting_inputs"
 
 
 @dataclass
@@ -171,6 +178,9 @@ class RunState:
     # snapshot_sha256, admission_sha256, hidden_commitment}. Empty for runs using registered engines.
     engine_build: dict = field(default_factory=dict)
     engine_build_cap_usd: float = ENGINE_BUILD_CAP_USD
+    # v2 ACQUIRE (docs/design/acquire.md §2.1): off | auto; older states without these fields load as off / {}
+    acquire: str = "off"
+    acquired: dict = field(default_factory=dict)
     last_gate: dict = field(default_factory=dict)
     history: list = field(default_factory=list)
 
@@ -333,6 +343,19 @@ def spec_signoff_findings(run_dir: str, signoff: str, backend=None) -> list[dict
         return [{"kind": "review_conditions_changed_after_signoff", "severity": "HIGH", "stage": "PLAN",
                  "target_stage": "PLAN", "key": "review_conditions", "scope_declarable": False,
                  "claim": "; ".join(bad)[:600]}]
+    from agents import acquire as ACQ
+    if rec.get("acquired_inventory_sha256") or ACQ.has_acquired(run_dir):
+        try:
+            v_acq = ACQ.verify_inventory(run_dir)
+            cur_inv = v_acq.get("inventory_sha256")
+        except ACQ.ArtifactTampered as e:
+            return [{"kind": "spec_changed_after_signoff", "severity": "HIGH", "stage": "PLAN",
+                     "target_stage": "PLAN", "key": "acquired_inventory", "scope_declarable": False,
+                     "claim": f"acquired inventory changed after sign-off: {e}"[:600]}]
+        if rec.get("acquired_inventory_sha256") != cur_inv:
+            return [{"kind": "spec_changed_after_signoff", "severity": "HIGH", "stage": "PLAN",
+                     "target_stage": "PLAN", "key": "acquired_inventory", "scope_declarable": False,
+                     "claim": "acquired inventory changed after sign-off: restore the signed inputs or re-sign"}]
     return []
 
 
@@ -387,6 +410,7 @@ def harness_owned() -> tuple:
         STATE_FILE, SIGNOFF_FILE, SCOPE_SIGNOFF, "spec_rethink_request.json", FL.LEDGER, FX.IMPACT, "report.md", "manuscript.md", "metadata.json",
         "report_render.json", "report_withheld.md", "final_gate.json", AB.ENGINE_CHOICE, "validator_history.jsonl", "gate_r*", "fix_plan_r*", "fix_progress_r*",
         "analysis/*", "models/pipeline*", "evidence/*", "data/*", "world_model", "world_model/*",
+        "acquire", "acquire/*",
         "engine_build", "engine_build/*", "models/ext/engine_*", "models/ext/engine_*/*",
         "evidence_dossier.yaml", SIGNOFF_SHEET,    # v2 autonomy 1B-ii: the default dossier and the sign-off sheet
         AMENDMENT_RECORD)                          # lead-gaps β (Codex r1): toolkit/spec/amend.py's record
@@ -1066,14 +1090,25 @@ def record_cited_inputs(run_dir: str, derived_inputs: bool = True) -> list[str]:
     found = P.cited_paths(spec, run_dir)       # one walk, shared with the derived-input checks
     prov, probs, root = _provenance(run_dir), [], os.path.realpath(run_dir)
     # The staged copies must still be the files the question named (the draft task may not touch
-    # them; this checks it).
+    # them; this checks it). Acquired inputs have no repository source and are verified via verify_inventory (§4).
+    from agents import acquire as ACQ
+    saw_acq = False
     for dest, e in (prov.get("inputs") or {}).items():
+        if isinstance(e, dict) and e.get("origin") == "acquired":
+            saw_acq = True
+            continue
         p = os.path.join(run_dir, dest)
         src = os.path.join(REPO, e.get("source", ""))
         if not os.path.isfile(p) or os.path.islink(p) or _sha256(p) != e.get("sha256"):
             probs.append(f"the staged input {dest} was changed or removed after it was copied")
         elif os.path.isfile(src) and _sha256(src) != e.get("sha256"):
             probs.append(f"the staged input {dest} no longer matches its source {e.get('source')}")
+    if saw_acq or ACQ.has_acquired(run_dir):
+        try:
+            ACQ.verify_inventory(run_dir)
+        except ACQ.ArtifactTampered as e:
+            probs.append(f"acquired inventory failed verification: {e}")
+    probs.extend(ACQ.unlisted_acquired_citations(run_dir, spec if isinstance(spec, dict) else {}))
     units = (spec.get("decision_units") or {}).get("csv") if isinstance(spec, dict) \
         and isinstance(spec.get("decision_units"), dict) else None
     for rel in sorted(set(found)):
@@ -1310,8 +1345,20 @@ def sign(run_dir: str, by: str, note: str = "", expect_sha256: str | None = None
         raise ValueError(f"{SO.SHEET}: {e}") from None
     sheet_sha = hashlib.sha256(sheet_bytes).hexdigest() if sheet_bytes is not None else "none"
     ev = SO.sign_preconditions(run_dir, data)  # (the sheet must show this dossier: refused without one when needed)
+    from agents import acquire as ACQ
+    acq_inv_sha, acq_extra = None, {}
+    if ACQ.has_acquired(run_dir):
+        try:
+            v_acq = ACQ.verify_inventory(run_dir)
+            acq_inv_sha = v_acq.get("inventory_sha256")
+            _, mbytes = ACQ.read_manifest(run_dir)
+            if mbytes is not None:
+                acq_extra[ACQ.MANIFEST_REL] = hashlib.sha256(mbytes).hexdigest()
+        except ACQ.ArtifactTampered as e:
+            raise ValueError(f"acquired inventory invalid: {e}") from None
     rec.update(evidence=ev["record"], evidence_sha256=ev["files"], sheet_sha256=sheet_sha,
-               sha256={AB.SPEC_FILE: rec["spec_sha256"], SO.SHEET: sheet_sha, **(ev.get("files") or {})})
+               **({"acquired_inventory_sha256": acq_inv_sha} if acq_inv_sha is not None else {}),
+               sha256={AB.SPEC_FILE: rec["spec_sha256"], SO.SHEET: sheet_sha, **(ev.get("files") or {}), **acq_extra})
     rec[RC.RECORD_KEY] = RC.sha_of(rc_bytes)
     from toolkit.spec import geometry as GEO
     # the geometry declaration and input hashes of this content; the owner's approvals
@@ -1648,6 +1695,10 @@ class Machine:
             self.st.engine_build["spent_usd"] = round(
                 float(self.st.engine_build.get("spent_usd") or 0.0) + chg, 4
             )
+        if (j.get("acquire_budget") or j.get("task") == "acquire") and isinstance(self.st.acquired, dict):
+            self.st.acquired["spent_usd"] = round(
+                float(self.st.acquired.get("spent_usd") or 0.0) + chg, 4
+            )
         j["interrupted_charged"] = j.get("interrupted_charged", 0) + 1
         j["status"] = "interrupted"
 
@@ -1704,7 +1755,8 @@ class Machine:
         return sum(1 for h in self.st.history if h.get("to") == self.st.state)
 
     def _task(self, key: str, name: str, *args, writeup: bool = False,
-              cap_override: float | None = None, build_budget: bool = False, **kwargs):
+              cap_override: float | None = None, build_budget: bool = False,
+              acquire_budget: bool = False, **kwargs):
         """One paid task through the journal. Returns its TaskResult, or None when the run has no
         allowance left for it (the caller takes the budget path). A completed task is not run
         again (its result is replayed, already charged); a task found started but not completed
@@ -1713,6 +1765,9 @@ class Machine:
         tamper = self._engine_tamper_problems()
         if tamper:
             raise RuntimeError("artifact_tampered: " + "; ".join(tamper[:4]))
+        acq_tamper = self._acquired_tamper_problem()
+        if acq_tamper:
+            raise RuntimeError("artifact_tampered: " + acq_tamper)
         j = self.st.journal.get(key)
         if j and j.get("status") == "completed":
             return TaskResult(bool(j.get("ok")), j.get("output"), 0.0, j.get("note", ""), j.get("session_id"))
@@ -1739,6 +1794,23 @@ class Machine:
                          f"--engine-build-usd <higher cap>")
                 raise AwaitingBudget(name)
             allowance = round(min(bleft, allowance), 4) if allowance is not None else bleft
+        aleft = None
+        if acquire_budget:
+            acap = float(ACQUIRE_CAP_USD)
+            aspent = float((self.st.acquired or {}).get("spent_usd") or 0.0)
+            aleft = round(acap - aspent, 4)
+            if aleft < MIN_TASK_ALLOWANCE_USD:
+                self.st.paused, self.st.status = AWAITING_BUDGET, None
+                self.st.history.append({"at": _now(), "paused": AWAITING_BUDGET, "reason": "acquire_cap",
+                                        "state": self.st.state, "task": name, "key": key,
+                                        "allowance_usd": aleft, "floor_usd": MIN_TASK_ALLOWANCE_USD,
+                                        "spent_usd": round(aspent, 4), "cap_usd": acap})
+                save_state(self.run_dir, self.st)
+                self.log(f"[machine] {name} not started: acquisition balance ${aleft:.2f} is below the "
+                         f"${MIN_TASK_ALLOWANCE_USD:.2f} floor (spent ${aspent:.2f} of ${acap:.2f}).")
+                raise AwaitingBudget(name)
+            acq_cap_call = round(min(self.st.task_cap_usd, aleft), 4)
+            allowance = round(min(acq_cap_call, allowance), 4) if allowance is not None else acq_cap_call
         if allowance is not None and allowance <= 0:
             return None
         if allowance is not None and allowance < MIN_TASK_ALLOWANCE_USD:
@@ -1754,14 +1826,17 @@ class Machine:
         a = allowance if allowance is not None else float(cap_override or self.st.task_cap_usd)
         b = self._budget(writeup)
         # A crash read-back is a paid call too: a small cap, from what is left after this allowance (for a
-        # write-up task, left of the reserve it may use; for a build-lane task, also bounded by lane balance).
+        # write-up task, left of the reserve it may use; for build/acquire tasks, also bounded by lane balance).
         rb = READBACK_CAP_USD if b is None else max(0.0, min(READBACK_CAP_USD, round(b["left"] - a, 4)))
         if bleft is not None:
             rb = max(0.0, min(rb, round(bleft - a, 4)))
-        # A write-up or build-lane task spends up to the cap itself, so its read-back allowance is part of what
-        # an interrupted one is charged (_interrupted_charge): both run and lane caps hold on resume.
+        if aleft is not None:
+            rb = max(0.0, min(rb, round(aleft - a, 4)))
+        # A write-up, build-lane, or acquire task spends up to the cap itself, so its read-back allowance is part
+        # of what an interrupted one is charged (_interrupted_charge): both run and lane caps hold on resume.
         j = dict(j or {}, task=name, status="started", started=_now(), allowance_usd=allowance, writeup=bool(writeup),
-                 build_budget=bool(build_budget), readback_usd=rb if (writeup or build_budget) else 0.0)
+                 build_budget=bool(build_budget), acquire_budget=bool(acquire_budget),
+                 readback_usd=rb if (writeup or build_budget or acquire_budget) else 0.0)
         self.st.journal[key] = j
         save_state(self.run_dir, self.st)
         setter = getattr(self.tasks, "set_allowance", None)
@@ -1772,6 +1847,10 @@ class Machine:
         if build_budget and isinstance(self.st.engine_build, dict):
             self.st.engine_build["spent_usd"] = round(
                 float(self.st.engine_build.get("spent_usd") or 0.0) + float(getattr(res, "usd", 0.0) or 0.0), 4
+            )
+        if acquire_budget and isinstance(self.st.acquired, dict):
+            self.st.acquired["spent_usd"] = round(
+                float(self.st.acquired.get("spent_usd") or 0.0) + float(getattr(res, "usd", 0.0) or 0.0), 4
             )
         out = res.output
         try:
@@ -1841,7 +1920,62 @@ class Machine:
                 "scope_declarable": False,
                 "claim": "agent-built engine snapshot failed verification: " + "; ".join(tamper[:4]),
             })
+        from agents import acquire as ACQ
+        if ACQ.has_acquired(self.run_dir):
+            try:
+                from toolkit.spec import evidence_dossier as ED
+                from lib.safe_io import read_nofollow
+                spec_q = self._spec() if os.path.exists(os.path.join(self.run_dir, AB.SPEC_FILE)) else {}
+                drel = ED.dossier_reference(spec_q) or ED.DOSSIER_FILE
+                if os.path.isfile(os.path.join(self.run_dir, drel)):
+                    db = read_nofollow(self.run_dir, drel)[0]
+                    out += ED.quote_findings(spec_q, self.run_dir, db)
+            except Exception:  # noqa: BLE001 -- invalid dossier is reported by preconditions/evidence checks
+                pass
         return out
+
+    def _acquired_tamper_problem(self) -> str | None:
+        """Verify acquired inventory integrity before any task reads or on resume (§§2.4, 4, T_ACQ_TAMPER_PRESPEC)."""
+        from agents import acquire as ACQ
+        rec_sha = (self.st.acquired or {}).get("inventory_sha256") if isinstance(self.st.acquired, dict) else None
+        if not rec_sha and not ACQ.has_acquired(self.run_dir):
+            return None
+        try:
+            v = ACQ.verify_inventory(self.run_dir)
+        except ACQ.ArtifactTampered as e:
+            return str(e)
+        if rec_sha and v.get("inventory_sha256") != rec_sha:
+            return f"acquired_inventory_sha256 mismatch ({v.get('inventory_sha256')} != {rec_sha})"
+        return None
+
+    def _acquire_closed(self) -> bool:
+        """True once acquisition is closed (SIGN exited to ENGINE_CHOICE in any mode, or restored past SIGN)."""
+        if isinstance(self.st.acquired, dict) and self.st.acquired.get("closed"):
+            return True
+        if self._signed_before():
+            return True
+        return any(h.get("from") == "SIGN" and h.get("to") == "ENGINE_CHOICE" for h in self.st.history)
+
+    def _close_acquire(self) -> None:
+        """Close acquisition permanently before the first exit from SIGN to ENGINE_CHOICE (§2.2, T_ACQ_CLOSED)."""
+        if not isinstance(self.st.acquired, dict):
+            self.st.acquired = {}
+        if not self.st.acquired.get("closed"):
+            self.st.acquired["closed"] = True
+            save_state(self.run_dir, self.st)
+
+    @staticmethod
+    def _missing_inputs_from(probs: list[str]) -> list[str]:
+        """Extract `missing_input: <wanted_kind>:<detail>` tokens from SPEC or EVIDENCE problems (§2.3)."""
+        found: list[str] = []
+        for p in probs or ():
+            s = str(p or "")
+            m = re.search(r"missing_input:\s*([A-Za-z0-9_.:/\-]+)", s)
+            if m:
+                tok = m.group(1).strip()
+                if tok and tok not in found:
+                    found.append(tok)
+        return found
 
     def _has_built_engine(self) -> bool:
         return bool(isinstance(self.st.engine_build, dict) and self.st.engine_build.get("id"))
@@ -1903,7 +2037,16 @@ class Machine:
                 rec = {}
             return rec.get("signed_by") or rec.get("by") or "owner"
         rec = _signoff(rd)
-        return rec.get("by") if rec and rec.get("spec_sha256") == signed_hash(rd) else None
+        if not rec or rec.get("spec_sha256") != signed_hash(rd):
+            return None
+        from agents import acquire as ACQ
+        if rec.get("acquired_inventory_sha256") or ACQ.has_acquired(rd):
+            try:
+                if ACQ.verify_inventory(rd).get("inventory_sha256") != rec.get("acquired_inventory_sha256"):
+                    return None
+            except ACQ.ArtifactTampered:
+                return None
+        return rec.get("by")
 
     def fix_guard(self, run_dir: str) -> list[str]:
         """What a fix task may not do: change decision_spec.yaml (compared with its sign-off, or with
@@ -2007,6 +2150,12 @@ class Machine:
                 _withhold_report(self.run_dir)
                 return self._go("FINAL", "agent-built engine snapshot tampered: " + "; ".join(tamper[:4]),
                                 "artifact_tampered")
+        # acquire.md §§2.4, 4: verify acquired inventory before any task reads in SPEC/EVIDENCE/SIGN/post-choice
+        if s in ("SPEC", "EVIDENCE", "SIGN") or s in POST_CHOICE_STATES:
+            acq_tamper = self._acquired_tamper_problem()
+            if acq_tamper:
+                _withhold_report(self.run_dir)
+                return self._go("FINAL", f"acquired inventory tampered: {acq_tamper}", "artifact_tampered")
         # PRESENTATION is not checked here: its one task is a write-up task, and _task replays a completed review
         # before it looks at the budget (h_PRESENTATION takes the budget path when there is no allowance).
         if s in LLM_STATES and s != "PRESENTATION" and self._out_of_budget():
@@ -2022,6 +2171,19 @@ class Machine:
             return s
 
     def run(self, max_steps: int = 200) -> str:
+        acq_tamper = self._acquired_tamper_problem()
+        if acq_tamper:
+            _withhold_report(self.run_dir)
+            why = f"acquired inventory tampered on resume: {acq_tamper}"
+            if self.st.state == "FINAL":
+                self.st.status = "artifact_tampered"
+                self.st.history.append({"at": _now(), "from": "FINAL", "to": "FINAL", "why": why,
+                                        "round": self.st.round, "spent_usd": round(self.st.spent_usd, 4)})
+                self._finish()
+            else:
+                self._go("FINAL", why, "artifact_tampered")
+            save_state(self.run_dir, self.st)
+            return self.st.status or self.st.state
         if self.st.state in POST_ENGINE_SIGN_STATES or (
             self.st.state == "FINAL" and (self.st.engine_build or {}).get("status") == "signed"
         ):
@@ -2079,9 +2241,15 @@ class Machine:
             elif b.get("reason") == "engine_admit_compute":
                 why = (f"engine_admit_compute: remaining budget ${b.get('left_usd')} is below admission compute "
                        f"reservation ${b.get('need_usd')} (resume with higher --max-budget-usd)")
+            elif b.get("reason") == "acquire_cap":
+                why = (f"acquire_cap: acquisition balance ${b.get('allowance_usd')} is below floor "
+                       f"${b.get('floor_usd')} (cap ${b.get('cap_usd')})")
             else:
                 why = (f"task {b.get('task')}: allowance ${b.get('allowance_usd')} is below the ${b.get('floor_usd')} "
                        f"floor (cap ${b.get('cap_usd')})")
+        if self.st.paused == AWAITING_INPUTS:
+            why = ("acquisition promoted no inputs: inspect acquire/inputs_request.md and relaunch with a question "
+                   "that names the required input files")
         if self.st.paused == AWAITING_ENGINE_SIGNOFF:
             why = ("admitted agent-built engine awaits sign-off: inspect engine_build/admission_sheet.md and run "
                    f"`python3 toolkit/engines/built/signoff.py sign {self.run_dir} --by owner` (or `decline --note ...`)")
@@ -2113,9 +2281,158 @@ class Machine:
             meta.pop(k, None)
         meta.update(pipeline="v2", engine=self.st.engine, rounds=self.st.round, max_rounds=self.st.max_rounds,
                     model_spend_usd=round(self.st.spent_usd, 4), **fields)
+        acq = self.st.acquired if isinstance(self.st.acquired, dict) else {}
+        if acq.get("inventory_sha256"):
+            meta["acquired_inventory_sha256"] = acq["inventory_sha256"]
+        if acq.get("allowlist_version") is not None:
+            meta["allowlist_version"] = acq["allowlist_version"]
+        if acq.get("allowlist_sha256"):
+            meta["allowlist_sha256"] = acq["allowlist_sha256"]
         _write_json(self.run_dir, "metadata.json", meta)
 
     # -------------------------------------------------- handlers
+    def _write_inputs_request(self, wanted: list[str], note: str = "") -> None:
+        """Write `acquire/inputs_request.md` when acquisition promotes nothing (§2.2, T_ACQ_EMPTY)."""
+        from agents import acquire as ACQ
+        lines = [
+            "# Public data acquisition promoted no inputs",
+            "",
+            "No usable public input files were promoted under the current allowlist.",
+            "Recovery in v1: relaunch a new run whose question names the required input files.",
+            "",
+            "## Wanted kinds",
+            "",
+        ]
+        lines += [f"- `{w}`" for w in (wanted or ["(unspecified)"])]
+        if note:
+            lines += ["", f"Note: {note}"]
+        try:
+            from lib.safe_io import read_nofollow
+            raw_r, _ = read_nofollow(self.run_dir, ACQ.RECORD_REL)
+            rec = json.loads(raw_r.decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            rec = {}
+        fetches = rec.get("fetches") if isinstance(rec, dict) and isinstance(rec.get("fetches"), dict) else {}
+        rejected = rec.get("rejected") if isinstance(rec, dict) and isinstance(rec.get("rejected"), dict) else {}
+        lines += ["", "## Queries tried", ""]
+        if not fetches:
+            lines.append("- (none)")
+        for fid, r in sorted(fetches.items()):
+            lines.append(f"- `{r.get('source_id')}.{r.get('endpoint')}` params=`{json.dumps(r.get('params') or {}, sort_keys=True)}` status=`{r.get('status')}`")
+        lines += ["", "## Rejected fetches", ""]
+        if not rejected:
+            lines.append("- (none)")
+        for fid, r in sorted(rejected.items()):
+            lines.append(f"- `{fid[:12]}` `{r.get('code')}`: {r.get('reason')}")
+        _put(self.run_dir, "acquire/inputs_request.md", "\n".join(lines) + "\n")
+
+    def h_ACQUIRE(self):
+        """Thin handler for ACQUIRE state (docs/design/acquire.md §2.2)."""
+        from agents import acquire as ACQ
+        if not isinstance(self.st.acquired, dict):
+            self.st.acquired = {}
+        # 1. Closed guard
+        if self._acquire_closed():
+            return self._go("FINAL", "acquisition is closed", "run_failed")
+        rounds_done = int(self.st.acquired.get("rounds") or 0)
+        # 2. Off-switch: if the question supplies repository files, turn ACQUIRE off at $0 cost
+        if rounds_done == 0:
+            staged = stage_inputs(self.run_dir, self.st.question)
+            if staged:
+                self.st.acquired.update(status="skipped_question_supplies_inputs", closed=True, rounds=0)
+                self.st.acquire = "off"
+                return self._go("SPEC", "question supplies inputs: acquisition skipped")
+        else:
+            tamp = self._acquired_tamper_problem()
+            if tamp:
+                _withhold_report(self.run_dir)
+                return self._go("FINAL", f"acquired inventory tampered: {tamp}", "artifact_tampered")
+        # 3. Plan & fetch
+        al_path = getattr(self, "acquire_allowlist", None) or ACQ.DEFAULT_ALLOWLIST
+        try:
+            allowlist, al_sha = ACQ.load_allowlist(al_path)
+        except ACQ.AllowlistError as e:
+            return self._go("FINAL", f"acquire allowlist invalid: {e}", "run_failed")
+        round_n = rounds_done + 1
+        wanted = list(self.st.tries.get("acquire_wanted") or allowlist["wanted_kinds"])
+        sources_summary = [
+            {
+                "id": s["id"],
+                "holds": s["holds"],
+                "endpoints": {
+                    en: {"wanted_kinds": list(ep["wanted_kinds"]), "params": dict(ep["params"])}
+                    for en, ep in s["endpoints"].items()
+                },
+            }
+            for s in allowlist["sources"] if s["status"] == "enabled" and not s["requires_key"]
+        ]
+        packet = {
+            "question": self.st.question,
+            "round": round_n,
+            "wanted_kinds": list(allowlist["wanted_kinds"]),
+            "wanted": wanted,
+            "sources": sources_summary,
+        }
+        att = int(self.st.tries.get("acquire_attempt") or 0)
+        res = self._task(f"ACQUIRE#r{round_n}:a{att + 1}", "acquire", self.st.question, self.run_dir, packet,
+                         acquire_budget=True)
+        if res is None:
+            return self._budget_out("ACQUIRE")
+        if not res.ok:
+            if att < MAX_ACQUIRE_RETRIES:
+                self.st.tries["acquire_attempt"] = att + 1
+                return self._go("ACQUIRE", f"acquire task failed (attempt {att + 1}): {res.note[:160]}")
+            self.st.tries.pop("acquire_attempt", None)
+            self._write_inputs_request(wanted, note=f"acquire task failed: {res.note}")
+            self.st.acquired.update(status=AWAITING_INPUTS, rounds=round_n,
+                                    allowlist_version=int(allowlist["version"]), allowlist_sha256=al_sha)
+            self.st.paused, self.st.status = AWAITING_INPUTS, None
+            save_state(self.run_dir, self.st)
+            self.log(f"[machine] ACQUIRE paused ({AWAITING_INPUTS}): inspect acquire/inputs_request.md")
+            return "ACQUIRE"
+        # 4. Promote
+        before_prov = ACQ._load_provenance(self.run_dir)
+        before_paths = {p for p, e in (before_prov.get("inputs") or {}).items()
+                        if isinstance(e, dict) and e.get("origin") == "acquired"}
+        out_d = res.output if isinstance(res.output, dict) else {}
+        keep = list(out_d.get("keep") or [])
+        wanted_map = dict(out_d.get("wanted_map") or {}) if isinstance(out_d.get("wanted_map"), dict) else {}
+        try:
+            promo = ACQ.promote(self.run_dir, keep, wanted_map, allowlist_path=al_path)
+        except ACQ.ArtifactTampered as e:
+            _withhold_report(self.run_dir)
+            return self._go("FINAL", f"acquired promotion tampered: {e}", "artifact_tampered")
+        after_prov = ACQ._load_provenance(self.run_dir)
+        after_acq = {p: e for p, e in (after_prov.get("inputs") or {}).items()
+                     if isinstance(e, dict) and e.get("origin") == "acquired"}
+        newly_promoted = sorted(set(after_acq) - before_paths)
+        rec = ACQ._load_record(self.run_dir, int(allowlist["version"]), al_sha)
+        self.st.acquired.update(
+            rounds=round_n,
+            fetches=len(rec.get("fetches") or {}),
+            bytes=sum(int(e.get("bytes") or 0) for e in after_acq.values()),
+            inventory_sha256=promo.get("inventory_sha256"),
+            allowlist_version=int(allowlist["version"]),
+            allowlist_sha256=al_sha,
+        )
+        self.st.tries.pop("acquire_attempt", None)
+        # 5. Exit
+        if not newly_promoted:
+            self._write_inputs_request(wanted, note="no new files promoted")
+            self.st.acquired["status"] = AWAITING_INPUTS
+            self.st.paused, self.st.status = AWAITING_INPUTS, None
+            save_state(self.run_dir, self.st)
+            self.log(f"[machine] ACQUIRE promoted nothing: paused ({AWAITING_INPUTS}); see acquire/inputs_request.md")
+            return "ACQUIRE"
+        self.st.acquired["status"] = "promoted"
+        self.st.tries.pop("acquire_wanted", None)
+        src_stage = self.st.tries.pop("acquire_from", None)
+        if round_n > 1:
+            self.st.tries["spec_bonus"] = 1
+            if src_stage == "EVIDENCE":
+                self.st.tries["evidence_bonus"] = 1
+        self._write_meta()
+        return self._go("SPEC", f"acquired {len(newly_promoted)} file(s) (round {round_n})")
     def h_SPEC(self):
         if self.st.signoff == "lead" and (self.st.tries.get("spec_amendment") or spec_signed_once(self.run_dir)) \
                 and not getattr(self, "_in_amend_lock", False):
@@ -2151,7 +2468,8 @@ class Machine:
                      f"({len(req['findings'])} finding(s)); amend the spec and relaunch with reuse")
             return "SPEC"
         n = self.st.tries.get("spec", 0)
-        if n >= MAX_SPEC_TRIES:
+        max_spec = MAX_SPEC_TRIES + (1 if self.st.tries.get("spec_bonus") else 0)
+        if n >= max_spec:
             return self._go("FINAL", "the spec did not validate", "run_failed")
         rd = self.run_dir
         stage_inputs(rd, self.st.question)
@@ -2181,6 +2499,14 @@ class Machine:
             if errs and not res.ok:
                 errs = [f"draft_spec failed: {res.note} (its draft was checked)"] + errs
         if errs:
+            missing = self._missing_inputs_from(errs)
+            if (missing and self.st.acquire == "auto" and not self._acquire_closed()
+                    and int((self.st.acquired or {}).get("rounds") or 0) < MAX_ACQUIRE_ROUNDS):
+                self.st.tries["acquire_wanted"] = missing
+                self.st.tries["acquire_from"] = "SPEC"
+                self.st.tries["spec_feedback"] = _carry_feedback(errs, fb if not drafted else None)
+                return self._go("ACQUIRE", f"missing input(s) at SPEC: {', '.join(missing[:4])}",
+                                extra={"missing_inputs": missing})
             self.st.tries["spec_feedback"] = _carry_feedback(errs, fb if not drafted else None)
             if drafted or recheckable:
                 # these checks' own output (or, with no draft on disk, what they wrote before plus that note): a capped
@@ -2476,6 +2802,7 @@ class Machine:
                 _sdoc = {}
             if isinstance(_sdoc, dict) and _schema.engine_has_build(_sdoc.get("engine")):
                 return self._go("FINAL", "an engine build needs a signed request (--signoff none)", "run_failed")
+            self._close_acquire()
             return self._go("ENGINE_CHOICE", "sign-off not required (--signoff none)")
         by = self._signed_by()
         if not by and not self._review_conditions(mode):
@@ -2486,6 +2813,7 @@ class Machine:
         # a lead sign-off approves nothing, so the run waits for the owner here, as for a spec sign-off.
         pend = self._geometry_owner_pending()
         if by and (mode == "lead" or by == "owner") and not pend:
+            self._close_acquire()
             return self._go("ENGINE_CHOICE", f"spec signed by {by}")
         if pend:
             how = ("python3 toolkit/spec/geometry.py approve" if by else "python3 agents/stage_machine.py sign")
@@ -2510,6 +2838,7 @@ class Machine:
                     remove_nofollow(self.run_dir, SIGNOFF_FILE)   # the lead's note; B writes its own record
                 try:
                     self._sign("lead", (note + " " + self._evidence_note()).strip())   # the harness records the hash
+                    self._close_acquire()
                     return self._go("ENGINE_CHOICE", "spec signed by the lead")
                 except ValueError as e:
                     self.log(f"[machine] the spec could not be signed: {e}")
@@ -2617,7 +2946,8 @@ class Machine:
             a = EDR.assess(rd, raw)
             if a["problems"] and not a.get("draftable"):
                 notes.append(f"the spec names {a['rel']}: only {EDR.ED.DOSSIER_FILE} is drafted in the run")
-            while a["problems"] and a.get("draftable") and drafts() < EDR.MAX_TRIES:
+            max_ev = EDR.MAX_TRIES + (1 if self.st.tries.get("evidence_bonus") else 0)
+            while a["problems"] and a.get("draftable") and drafts() < max_ev:
                 n = drafts()
                 res = self._task(f"EVIDENCE#{self._visit()}:try{n + 1}", "draft_evidence", rd, a["rel"],
                                  EDR.packet(a), fb + a["problems"])
@@ -2631,6 +2961,13 @@ class Machine:
                     a = EDR.assess(rd, raw)
                 except Exception as e:  # noqa: BLE001 -- the task left a dossier the harness cannot read
                     a = dict(a, problems=[f"the dossier cannot be read: {type(e).__name__}: {e}"])
+            missing_ev = self._missing_inputs_from(a.get("problems") or [])
+            if (missing_ev and self.st.acquire == "auto" and not self._acquire_closed()
+                    and int((self.st.acquired or {}).get("rounds") or 0) < MAX_ACQUIRE_ROUNDS):
+                self.st.tries["acquire_wanted"] = missing_ev
+                self.st.tries["acquire_from"] = "EVIDENCE"
+                return self._go("ACQUIRE", f"missing input(s) at EVIDENCE: {', '.join(missing_ev[:4])}",
+                                extra={"missing_inputs": missing_ev})
         self.st.tries.pop("evidence_feedback", None)
         rec = EDR.finish(rd, a, sc, drafts(), raw, notes)
         if a["needed"]:
@@ -4863,7 +5200,9 @@ def _record_invocation(run_dir: str, budget_usd, cap_usd) -> None:
 def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "owner", gate_mode: str = "v2",
              budget_usd: float | None = None, derived_inputs: bool = True, derive_unsandboxed: bool = False,
              world_model: bool = True, engine_build_usd: float | None = None,
-             engine_unsandboxed: bool = False) -> RunState:
+             engine_unsandboxed: bool = False, acquire: str = "off") -> RunState:
+    if acquire not in ("off", "auto"):
+        raise ValueError(f"acquire must be 'off' or 'auto', got {acquire!r}")
     os.makedirs(run_dir, exist_ok=True)
     st = load_state(run_dir)
     if st is not None:
@@ -4871,17 +5210,18 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
     eb_cap = ENGINE_BUILD_CAP_USD if engine_build_usd is None else min(
         max(float(engine_build_usd), MIN_TASK_ALLOWANCE_USD), ENGINE_BUILD_CAP_MAX_USD
     )
-    st = RunState(question=question, max_rounds=max_rounds, signoff=signoff, gate_mode=gate_mode, budget_usd=budget_usd,
+    st = RunState(question=question, state="ACQUIRE" if acquire == "auto" else "SPEC",
+                  max_rounds=max_rounds, signoff=signoff, gate_mode=gate_mode, budget_usd=budget_usd,
                   derived_inputs=derived_inputs, derive_unsandboxed=derive_unsandboxed,
                   engine_unsandboxed=engine_unsandboxed, world_model_stages=world_model,
-                  engine_build_cap_usd=eb_cap)
+                  engine_build_cap_usd=eb_cap, acquire=acquire)
     try:   # keep what main.py recorded first (run_dir, pipeline, commit, launcher: scripts/lib/pipeline_id.py)
         meta = json.load(open(os.path.join(run_dir, "metadata.json")))
     except (OSError, ValueError):
         meta = {}
     meta = meta if isinstance(meta, dict) else {}
     meta.update({"question": question, "started": meta.get("started") or _now(), "pipeline": "v2",
-                 "max_rounds": max_rounds, "signoff": signoff})
+                 "max_rounds": max_rounds, "signoff": signoff, "acquire": acquire})
     if os.environ.get(PARENT_ENV):
         meta["parent_run"] = _parent_record(os.environ[PARENT_ENV])
         meta["motivated_by"] = _relaunch_motivation(os.environ[PARENT_ENV])
@@ -4893,7 +5233,8 @@ def init_run(run_dir: str, question: str, max_rounds: int = 3, signoff: str = "o
 def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str = "owner",
            budget_usd: float | None = None, log=print, derive_unsandboxed: bool = False, backend=None,
            cross_engine_check: bool = True, _depth: int = 0, _stamp: dict | None = None,
-           engine_build_usd: float | None = None, engine_unsandboxed: bool = False) -> str:
+           engine_build_usd: float | None = None, engine_unsandboxed: bool = False,
+           acquire: str = "off") -> str:
     """Entry point for main.py --v2 (and the dry run). Resumes when run_state.json exists, also a run that ended
     run_failed because its analysis step timed out, was killed or lost engine rows to the machine
     (Machine.reopen_interrupted_analysis). Holds the whole-run lock across --signoff lead runs AND across every
@@ -4913,19 +5254,22 @@ def run_v2(question: str, run_dir: str, tasks, max_rounds: int = 3, signoff: str
     )
     if not need_lock:
         return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
-                             backend, cross_engine_check, _depth, _stamp, engine_build_usd, engine_unsandboxed)
+                             backend, cross_engine_check, _depth, _stamp, engine_build_usd, engine_unsandboxed,
+                             acquire=acquire)
     os.makedirs(run_dir, exist_ok=True)
     with _amend_lock(run_dir):     # held through hand-off, child run, and built-engine stages (BE31)
         return _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed,
-                             backend, cross_engine_check, _depth, _stamp, engine_build_usd, engine_unsandboxed)
+                             backend, cross_engine_check, _depth, _stamp, engine_build_usd, engine_unsandboxed,
+                             acquire=acquire)
 
 
 def _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
-                  cross_engine_check, _depth, _stamp, engine_build_usd=None, engine_unsandboxed=False) -> str:
+                  cross_engine_check, _depth, _stamp, engine_build_usd=None, engine_unsandboxed=False,
+                  acquire="off") -> str:
     """One run dir, then the child its provisional amendment handed it to (run_v2, under the caller's lock)."""
     child, status = _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
                                  derive_unsandboxed, backend, cross_engine_check, _stamp,
-                                 engine_build_usd, engine_unsandboxed)
+                                 engine_build_usd, engine_unsandboxed, acquire=acquire)
     if child is None or _depth >= 8:          # a bounded chain (a restored cycle cannot recurse: Codex r2)
         return status
     # lead-gaps β: the run continues in the child its provisional amendment made (same process, commit and launcher);
@@ -4942,11 +5286,13 @@ def _run_v2_chain(question, run_dir, tasks, max_rounds, signoff, budget_usd, log
                   budget_usd=cst.budget_usd, log=log, derive_unsandboxed=derive_unsandboxed, backend=backend,
                   cross_engine_check=cross_engine_check, _depth=_depth + 1, _stamp=ident,
                   engine_build_usd=getattr(cst, "engine_build_cap_usd", None),
-                  engine_unsandboxed=engine_unsandboxed)
+                  engine_unsandboxed=engine_unsandboxed,
+                  acquire=getattr(cst, "acquire", "off"))
 
 
 def _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log, derive_unsandboxed, backend,
-                 cross_engine_check, stamp, engine_build_usd=None, engine_unsandboxed=False) -> tuple:
+                 cross_engine_check, stamp, engine_build_usd=None, engine_unsandboxed=False,
+                 acquire="off") -> tuple:
     """(the child to continue in or None, the status) of one run dir."""
     if stamp:
         try:
@@ -4955,7 +5301,7 @@ def _run_v2_once(question, run_dir, tasks, max_rounds, signoff, budget_usd, log,
         except Exception as e:  # noqa: BLE001 -- the identity stamp only; the run records its own invocation below
             log(f"[machine] the child run's identity was not stamped: {type(e).__name__}: {e}")
     st = init_run(run_dir, question, max_rounds, signoff, "v2", budget_usd, derive_unsandboxed=derive_unsandboxed,
-                  engine_build_usd=engine_build_usd, engine_unsandboxed=engine_unsandboxed)
+                  engine_build_usd=engine_build_usd, engine_unsandboxed=engine_unsandboxed, acquire=acquire)
     if st.paused == AWAITING_BUDGET and budget_usd and budget_usd > (st.budget_usd or 0):
         # the owner resumes a run paused below the allowance floor with a higher cap: recorded, never lowered
         st.history.append({"at": _now(), "budget_raised": {"from": st.budget_usd, "to": budget_usd},
@@ -7377,6 +7723,12 @@ def _self_test() -> int:
             import traceback
             traceback.print_exc()
             ok(False, f"BE28-BE33 built-engine stage machine: {type(e).__name__}: {e}")
+        try:
+            _self_test_acquire(ok, td)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            ok(False, f"T_ACQ_* acquire stage machine: {type(e).__name__}: {e}")
 
         # T23: a transition outside the table is refused.
         m = _SpikeMachine(os.path.join(td, "ref"), StubTasks({}), None, log=lambda *a: None)
@@ -10440,6 +10792,367 @@ def _self_test_built_engine(ok, td: str) -> None:
        and any(f.get("kind") == "built_engine_snapshot_invalid" and "size mismatch" in str(f.get("claim")) for f in hf_rr),
        f"BE17_REF_RESUME budget pause during build_reference resumes cleanly on final try ({paused_ok}, {s_rr_end}) "
        f"and harness_findings runs built_engine_gate ({[f.get('kind') for f in hf_rr]})")
+
+
+def _self_test_acquire(ok, td: str) -> None:
+    """All 14 stage-machine ACQUIRE self-tests (docs/design/acquire.md §9.1):
+    T_ACQ_OFF, T_ACQ_OFF_GOLDEN, T_ACQ_SUPPLIED, T_ACQ_PROMOTE, T_ACQ_EMPTY, T_ACQ_TOPUP,
+    T_ACQ_CLOSED, T_ACQ_TAMPER_PRESPEC, T_ACQ_BALANCE, T_ACQ_OLD_STATE, T_ACQ_SIGN,
+    T_ACQ_QUOTE, T_ACQ_DELIVERABLE, T_ACQ_AMEND."""
+    import shutil
+    import yaml
+    from agents import acquire as ACQ
+    from agents import v2_sdk_tasks as VSDK
+    from v2_tasks import StubTasks, TaskResult
+    from toolkit.spec import amend as AM, evidence_dossier as ED, preconditions as PC, schema, signoff as SO
+
+    # T_ACQ_OFF: default acquire="off" starts at SPEC and history never names ACQUIRE
+    d_off = os.path.join(td, "t_acq_off")
+    st_off = init_run(d_off, "Bare question?", signoff="none", derived_inputs=False, world_model=False)
+    meta_off = json.load(open(os.path.join(d_off, "metadata.json")))
+    m_off = Machine(d_off, StubTasks({}), st_off, log=lambda *a: None, cross_engine_check=False)
+    m_off.step()
+    ok(st_off.acquire == "off" and meta_off.get("acquire") == "off"
+       and not any(h.get("from") == "ACQUIRE" or h.get("to") == "ACQUIRE" for h in m_off.st.history),
+       f"T_ACQ_OFF acquire='off' starts at SPEC and history never names ACQUIRE ({m_off.st.history[:2]})")
+
+    # T_ACQ_OFF_GOLDEN (§8): off-path provenance has no origin/acquired_inventory_sha256, draft_spec has no
+    # manifest sentence, TOOLS is unchanged, and history never names ACQUIRE
+    d_gold = os.path.join(td, "t_acq_gold")
+    st_gold = init_run(d_gold, "Use requirements.txt for allocation.", signoff="none",
+                       derived_inputs=False, world_model=False)
+    staged_g = stage_inputs(d_gold, st_gold.question)
+    prov_g = json.load(open(os.path.join(d_gold, PROVENANCE)))
+    gold_prompts = {}
+    orig_sess = VSDK.SdkTasks._session
+
+    def _cap_sess(self_, kind, system, prompt, owns, model=None, **kw):
+        gold_prompts[kind] = (system, prompt, owns)
+        return TaskResult(True, {"ok": True}, 0.0, "fake")
+
+    VSDK.SdkTasks._session = _cap_sess
+    try:
+        VSDK.SdkTasks(d_gold).draft_spec(st_gold.question, d_gold, None)
+    finally:
+        VSDK.SdkTasks._session = orig_sess
+    ok(bool(staged_g) and "acquired_inventory_sha256" not in prov_g
+       and all("origin" not in v for v in (prov_g.get("inputs") or {}).values())
+       and "acquired_manifest.json" not in (gold_prompts.get("draft_spec", ("", "", ()))[1])
+       and VSDK.TOOLS == ["Read", "Glob", "Grep", "Write", "Edit"]
+       and st_gold.state == "SPEC",
+       f"T_ACQ_OFF_GOLDEN off-path provenance, prompt, tools, and state are unchanged ({list(prov_g.keys())})")
+
+    # T_ACQ_SUPPLIED: acquire="auto" with a question naming a repo file skips ACQUIRE at $0 and closes back-edges
+    d_sup = os.path.join(td, "t_acq_sup")
+    st_sup = init_run(d_sup, "Allocate using requirements.txt.", signoff="none", acquire="auto",
+                      derived_inputs=False, world_model=False)
+    T_sup = StubTasks({"usd": 1.0})
+    m_sup = Machine(d_sup, T_sup, st_sup, log=lambda *a: None, cross_engine_check=False)
+    nxt_sup = m_sup.step()
+    ok(nxt_sup == "SPEC" and not T_sup.calls and m_sup.st.spent_usd == 0.0
+       and m_sup.st.acquire == "off"
+       and (m_sup.st.acquired or {}).get("status") == "skipped_question_supplies_inputs"
+       and m_sup._acquire_closed(),
+       f"T_ACQ_SUPPLIED question supplying files skips ACQUIRE at $0 and closes back-edges ({nxt_sup}, {m_sup.st.acquired})")
+
+    # Fixture server for T_ACQ_PROMOTE, T_ACQ_EMPTY, T_ACQ_TOPUP, T_ACQ_CLOSED, T_ACQ_TAMPER_PRESPEC,
+    # T_ACQ_BALANCE, T_ACQ_SIGN, T_ACQ_QUOTE, T_ACQ_AMEND
+    routes = {
+        "/api/catalogue": (200, "application/json", json.dumps([{"code": "IND1"}, {"code": "IND2"}]).encode("utf-8"), {}),
+        "/api/slice/IND1?mode=csv": (200, "text/csv", b"unit,pop\nU1,1000\nU2,2000\n", {}),
+        "/api/slice/IND2?mode=csv": (200, "text/csv", b"unit,inc\nU1,0.12\nU2,0.25\n", {}),
+        "/api/slice/IND1?mode=xml_ok": (
+            200, "application/xml",
+            b"<article><body><p>Trial result showed efficacy 0.65 (95% CI 0.50-0.78) in 500 sites.</p></body></article>",
+            {},
+        ),
+    }
+    with ACQ.AcquireFixtureServer(routes) as srv:
+        al_p = os.path.join(td, "acq_sm_allowlist.yaml")
+        yaml.safe_dump(ACQ._test_allowlist_yaml(srv.port), open(al_p, "w"), sort_keys=False)
+
+        def _fetch_keep(rd, code="IND1", mode="csv", wanted=None):
+            F = ACQ.Fetcher(rd, al_p, resolver=lambda h, p: ["127.0.0.1"],
+                            _allow_test_http=True, _test_port=srv.port, _allow_loopback_ip=True)
+            F.search("svc_data", "catalogue", {})
+            fid = F.fetch("svc_data", "slice", {"code": code, "mode": mode})["fetch_id"]
+            return {"keep": [fid], "wanted_map": {fid: wanted or ["population"]}}
+
+        # T_ACQ_PROMOTE: fixture fetch -> promoted files, manifest, views, SPEC prompt sees manifest
+        d_pr = os.path.join(td, "t_acq_promote")
+        st_pr = init_run(d_pr, "Bare policy question.", signoff="none", acquire="auto",
+                         derived_inputs=False, world_model=False)
+        T_pr = StubTasks({"acquire": lambda q, rd, pkt: _fetch_keep(rd, "IND1", "csv", ["population"])})
+        m_pr = Machine(d_pr, T_pr, st_pr, log=lambda *a: None, cross_engine_check=False)
+        m_pr.acquire_allowlist = al_p
+        nxt_pr = m_pr.step()
+        pr_prompts = {}
+        VSDK.SdkTasks._session = lambda self_, k, s, p, o, model=None, **kw: (
+            pr_prompts.__setitem__(k, p) or TaskResult(True, {"ok": True}, 0.0, "fake")
+        )
+        try:
+            VSDK.SdkTasks(d_pr).draft_spec(st_pr.question, d_pr, None)
+        finally:
+            VSDK.SdkTasks._session = orig_sess
+        views_pr = os.listdir(os.path.join(d_pr, ACQ.VIEWS_ROOT)) if os.path.isdir(os.path.join(d_pr, ACQ.VIEWS_ROOT)) else []
+        ok(nxt_pr == "SPEC" and os.path.isfile(os.path.join(d_pr, ACQ.MANIFEST_REL)) and bool(views_pr)
+           and "evidence/acquired_manifest.json" in pr_prompts.get("draft_spec", "")
+           and "data/inputs/acquired/_views/" in pr_prompts.get("draft_spec", ""),
+           f"T_ACQ_PROMOTE promotes files, writes manifest & views, and SPEC receives them ({nxt_pr}, {views_pr})")
+
+        # T_ACQ_EMPTY: nothing promoted -> paused:awaiting_inputs and acquire/inputs_request.md written
+        d_em = os.path.join(td, "t_acq_empty")
+        st_em = init_run(d_em, "Bare question.", signoff="owner", acquire="auto",
+                         derived_inputs=False, world_model=False)
+        T_em = StubTasks({"acquire": {"keep": [], "wanted_map": {}}})
+        m_em = Machine(d_em, T_em, st_em, log=lambda *a: None, cross_engine_check=False)
+        m_em.acquire_allowlist = al_p
+        res_em = m_em.run()
+        ok(res_em == f"paused:{AWAITING_INPUTS}"
+           and os.path.isfile(os.path.join(d_em, "acquire", "inputs_request.md"))
+           and "Wanted kinds" in open(os.path.join(d_em, "acquire", "inputs_request.md")).read(),
+           f"T_ACQ_EMPTY nothing promoted pauses awaiting_inputs and writes inputs_request.md ({res_em})")
+
+        # T_ACQ_TOPUP: missing_input after 3rd SPEC try goes to ACQUIRE once, grants 4th SPEC try; 2nd gap does not go back
+        d_tu = os.path.join(td, "t_acq_topup")
+        st_tu = init_run(d_tu, "Bare question.", signoff="none", acquire="auto",
+                         derived_inputs=False, world_model=False)
+        acq_rounds_seen = []
+
+        def _acq_tu(q, rd, pkt):
+            acq_rounds_seen.append(pkt.get("round"))
+            return _fetch_keep(rd, "IND1" if pkt.get("round") == 1 else "IND2", "csv",
+                               ["population"] if pkt.get("round") == 1 else ["burden"])
+
+        T_tu = StubTasks({"acquire": _acq_tu, "spec": {"schema_version": 1}})
+
+        class _TopupMachine(Machine):
+            def _spec_checks(self, rd):
+                tr = int(self.st.tries.get("spec") or 0)
+                if tr in (1, 2):
+                    return ["plain spec error"]
+                if tr == 3:
+                    return ["missing_input: burden:incidence"]
+                return ["missing_input: coverage:second_gap"]
+
+        m_tu = _TopupMachine(d_tu, T_tu, st_tu, log=lambda *a: None, cross_engine_check=False)
+        m_tu.acquire_allowlist = al_p
+        res_tu = m_tu.run(max_steps=20)
+        ok(res_tu == "run_failed" and acq_rounds_seen == [1, 2]
+           and m_tu.st.tries.get("spec") == MAX_SPEC_TRIES + 1 and m_tu.st.tries.get("spec_bonus") == 1
+           and int((m_tu.st.acquired or {}).get("rounds") or 0) == MAX_ACQUIRE_ROUNDS,
+           f"T_ACQ_TOPUP missing_input after 3rd SPEC try tops up once and grants bonus try; 2nd gap does not loop "
+           f"(res={res_tu}, acq_rounds={acq_rounds_seen}, tries={m_tu.st.tries})")
+
+        # T_ACQ_CLOSED: --signoff none closes acquisition on SIGN -> ENGINE_CHOICE; later calibration refusal to SPEC
+        # never reaches ACQUIRE; restored state past SIGN without closed flag is treated as closed
+        d_cl = os.path.join(td, "t_acq_closed")
+        st_cl = init_run(d_cl, "Bare question.", signoff="none", acquire="auto",
+                         derived_inputs=False, world_model=False)
+        T_cl = StubTasks({"acquire": lambda q, rd, pkt: _fetch_keep(rd, "IND1", "csv"), "spec": {"schema_version": 1}})
+
+        class _ClosedMachine(Machine):
+            def _spec_checks(self, rd):
+                return ["missing_input: burden:after_sign"]
+
+        m_cl = _ClosedMachine(d_cl, T_cl, st_cl, log=lambda *a: None, cross_engine_check=False)
+        m_cl.acquire_allowlist = al_p
+        m_cl.step()  # ACQUIRE -> SPEC (round 1 promoted)
+        # Simulate reaching SIGN -> ENGINE_CHOICE under --signoff none
+        _write_json(d_cl, "evidence/dossier_draft.json", {"status": "not_required", "required": [], "tries": 0})
+        yaml.safe_dump({"schema_version": 1}, open(os.path.join(d_cl, AB.SPEC_FILE), "w"))
+        m_cl.st.state = "SIGN"
+        nxt_ec = m_cl.step()
+        closed_after_sign = bool((m_cl.st.acquired or {}).get("closed"))
+        # Simulate ANALYZE calibration refusal back to SPEC
+        m_cl.st.state = "SPEC"
+        m_cl.st.tries["spec"] = 0
+        nxt_after_ref = m_cl.step()
+        # Part B: restored state past SIGN missing closed flag
+        d_cl2 = os.path.join(td, "t_acq_closed_restored")
+        st_cl2 = init_run(d_cl2, "Bare question.", signoff="none", acquire="auto",
+                          derived_inputs=False, world_model=False)
+        st_cl2.acquired = {"rounds": 1}  # deliberately omit closed flag
+        st_cl2.history.append({"at": _now(), "from": "SIGN", "to": "ENGINE_CHOICE", "why": "sign-off none"})
+        st_cl2.state = "ACQUIRE"
+        save_state(d_cl2, st_cl2)
+        m_cl2 = Machine(d_cl2, StubTasks({}), None, log=lambda *a: None, cross_engine_check=False)
+        nxt_cl2 = m_cl2.step()
+        ok(nxt_ec == "ENGINE_CHOICE" and closed_after_sign and nxt_after_ref == "SPEC"
+           and m_cl2._acquire_closed() and nxt_cl2 == "FINAL" and m_cl2.st.status == "run_failed",
+           f"T_ACQ_CLOSED --signoff none closes acquisition at SIGN and restored state past SIGN stays closed "
+           f"({nxt_ec}, closed={closed_after_sign}, after_ref={nxt_after_ref}, restored={nxt_cl2}/{m_cl2.st.status})")
+
+        # T_ACQ_TAMPER_PRESPEC: tampering promoted file between ACQUIRE and SPEC -> artifact_tampered before draft_spec
+        d_tp = os.path.join(td, "t_acq_tamper")
+        st_tp = init_run(d_tp, "Bare question.", signoff="none", acquire="auto",
+                         derived_inputs=False, world_model=False)
+        T_tp = StubTasks({"acquire": lambda q, rd, pkt: _fetch_keep(rd, "IND1", "csv"), "spec": {"schema_version": 1}})
+        m_tp = Machine(d_tp, T_tp, st_tp, log=lambda *a: None, cross_engine_check=False)
+        m_tp.acquire_allowlist = al_p
+        m_tp.step()  # ACQUIRE -> SPEC
+        prov_tp = json.load(open(os.path.join(d_tp, PROVENANCE)))
+        acq_p = next(p for p, e in prov_tp["inputs"].items() if isinstance(e, dict) and e.get("origin") == "acquired")
+        abs_tp = os.path.join(d_tp, acq_p)
+        os.chmod(abs_tp, 0o644)
+        open(abs_tp, "ab").write(b"TAMPER\n")
+        os.chmod(abs_tp, 0o444)
+        m_tp.step()
+        ok(m_tp.st.state == "FINAL" and m_tp.st.status == "artifact_tampered" and "draft_spec" not in T_tp.calls,
+           f"T_ACQ_TAMPER_PRESPEC tampered acquired file stops artifact_tampered before draft_spec "
+           f"({m_tp.st.state}/{m_tp.st.status}, calls={T_tp.calls})")
+
+        # T_ACQ_BALANCE: interrupted call + retry + top-up + read-backs cannot exceed ACQUIRE_CAP_USD ($6)
+        d_bal = os.path.join(td, "t_acq_balance")
+        st_bal = init_run(d_bal, "Bare question.", signoff="none", acquire="auto", budget_usd=50.0,
+                          derived_inputs=False, world_model=False)
+        st_bal.journal["ACQUIRE#r1:a0"] = {
+            "task": "acquire", "status": "started", "allowance_usd": 3.0, "readback_usd": 0.25, "acquire_budget": True,
+        }
+        save_state(d_bal, st_bal)
+        T_bal = StubTasks({"acquire": lambda q, rd, pkt: _fetch_keep(rd, "IND1", "csv"), "usd": 2.50})
+        m_bal = Machine(d_bal, T_bal, None, log=lambda *a: None, cross_engine_check=False)
+        m_bal.acquire_allowlist = al_p
+        after_int = float((m_bal.st.acquired or {}).get("spent_usd") or 0.0)
+        m_bal.step()  # retry runs with allowance <= 2.75, spends 2.50 -> total 5.75
+        after_retry = float((m_bal.st.acquired or {}).get("spent_usd") or 0.0)
+        # Attempt top-up round 2 with only $0.25 left (< $0.50 floor) -> must pause awaiting_budget
+        m_bal.st.state = "ACQUIRE"
+        res_bal2 = m_bal.run()
+        ok(abs(after_int - 3.25) < 1e-6 and T_bal.allowances and T_bal.allowances[0] <= 2.75 + 1e-9
+           and abs(after_retry - 5.75) < 1e-6 and after_retry <= ACQUIRE_CAP_USD
+           and res_bal2 == f"paused:{AWAITING_BUDGET}"
+           and float((m_bal.st.acquired or {}).get("spent_usd") or 0.0) <= ACQUIRE_CAP_USD,
+           f"T_ACQ_BALANCE interrupted + retry + top-up + read-backs bounded by ACQUIRE_CAP_USD "
+           f"(int={after_int}, retry={after_retry}, allow={T_bal.allowances}, res2={res_bal2})")
+
+        # T_ACQ_OLD_STATE: run_state.json without acquire/acquired loads as off and resumes cleanly
+        d_old = os.path.join(td, "t_acq_old")
+        os.makedirs(d_old)
+        json.dump({"question": "Old Q?", "state": "SPEC", "round": 1, "max_rounds": 3, "signoff": "none"},
+                  open(os.path.join(d_old, STATE_FILE), "w"))
+        st_old = load_state(d_old)
+        ok(st_old is not None and st_old.acquire == "off" and st_old.acquired == {} and st_old.state == "SPEC",
+           f"T_ACQ_OLD_STATE old run_state.json without acquire loads as off ({st_old})")
+
+        # T_ACQ_SIGN: sheet shows acquired-inputs tables; changing raw file, adding extra file, or changing manifest
+        # URL after signing makes signature stale through sign, status, preconditions, and resume (even with NO dossier)
+        d_sg = os.path.join(td, "t_acq_sign")
+        os.makedirs(d_sg)
+        _write_json(d_sg, "metadata.json", {"pipeline": "v2", "commit": "0" * 40, "launcher": "t", "acquire": "auto"})
+        raw_sg = yaml.safe_load(open(schema.toy_spec(d_sg)))
+        raw_sg["principle_departures"] = [{"principle": 2, "check": "headline_comparator", "reason": "toy"},
+                                          {"principle": 3, "check": "baseline_burden", "reason": "toy"}]
+        yaml.safe_dump(raw_sg, open(os.path.join(d_sg, AB.SPEC_FILE), "w"), sort_keys=False)
+        AM._pre_sign(d_sg, False)
+        fk_sg = _fetch_keep(d_sg, "IND1", "csv", ["population"])
+        promo_sg = ACQ.promote(d_sg, fk_sg["keep"], fk_sg["wanted_map"], allowlist_path=al_p)
+        SO.write_sheet(d_sg)
+        sheet_txt = open(os.path.join(d_sg, SIGNOFF_SHEET), encoding="utf-8").read()
+        rec_sg = SO.sign(d_sg, "owner")
+        st_sg = RunState(question="q", state="CONFIGURE", signoff="owner", acquire="auto",
+                         acquired={"rounds": 1, "closed": True, "inventory_sha256": promo_sg["inventory_sha256"]})
+        save_state(d_sg, st_sg)
+        signed_clean = (
+            "### Acquired inputs (fetched by the harness)" in sheet_txt
+            and "#### Outgoing acquisition queries" in sheet_txt
+            and "#### Fetched and not promoted" in sheet_txt
+            and SO.status(d_sg) == "signed"
+            and rec_sg.get("acquired_inventory_sha256") == promo_sg["inventory_sha256"]
+            and PC.problems(d_sg, None, None, mode="resume") == []
+        )
+        tamper_results = {}
+        acq_sg_rel = promo_sg["promoted"][0]
+        for tname in ("raw_file", "extra_file", "manifest_url"):
+            cp = os.path.join(td, f"t_acq_sign_{tname}")
+            shutil.copytree(d_sg, cp)
+            if tname == "raw_file":
+                ap = os.path.join(cp, acq_sg_rel)
+                os.chmod(ap, 0o644)
+                open(ap, "ab").write(b"changed\n")
+                os.chmod(ap, 0o444)
+            elif tname == "extra_file":
+                open(os.path.join(cp, ACQ.ACQUIRED_ROOT, "svc_data", "extra.csv"), "w").write("x\n1\n")
+            elif tname == "manifest_url":
+                mp = os.path.join(cp, ACQ.MANIFEST_REL)
+                mdoc = json.load(open(mp))
+                mdoc["files"][acq_sg_rel]["url"] = "https://tampered.example/x"
+                json.dump(mdoc, open(mp, "w"))
+            st_chg = SO.status(cp) == "changed"
+            pc_bad = bool(PC.problems(cp, None, None, mode="resume"))
+            try:
+                SO.sign(cp, "owner")
+                sign_ref = False
+            except ValueError:
+                sign_ref = True
+            res_cp = Machine(cp, StubTasks({}), None, log=lambda *a: None, cross_engine_check=False).run()
+            tamper_results[tname] = (st_chg and pc_bad and sign_ref and res_cp == "artifact_tampered")
+        ok(signed_clean and all(tamper_results.values()),
+           f"T_ACQ_SIGN sheet renders acquired tables; tampering raw/extra/manifest invalidates sign, status, "
+           f"preconditions, and resume with no dossier (clean={signed_clean}, tampers={tamper_results})")
+
+        # T_ACQ_QUOTE: acquired literature quote verification (bad quote -> HIGH observation_quote_not_found;
+        # allowlisted URL without acquired block -> HIGH observation_acquired_unbound; exact quote passes)
+        d_qt = os.path.join(td, "t_acq_quote")
+        os.makedirs(d_qt)
+        fk_qt = _fetch_keep(d_qt, "IND1", "xml_ok", ["trial_effect"])
+        promo_qt = ACQ.promote(d_qt, fk_qt["keep"], fk_qt["wanted_map"], allowlist_path=al_p)
+        fid_qt = fk_qt["keep"][0]
+        sha_qt = json.load(open(os.path.join(d_qt, ACQ.MANIFEST_REL)))["files"][promo_qt["promoted"][0]]["sha256"]
+        base_obs = {"source": "Trial X", "where": "Results", "year": 2025, "sites": 1, "n": 500,
+                    "sampling_frame": "adults", "value": 0.65}
+        doss_bad_q = yaml.safe_dump({"inputs": {"parameter:eff": {
+            "observations": [dict(base_obs, acquired={"id": fid_qt, "sha256": sha_qt, "locator": "p1",
+                                                      "quote": "not present in xml"})]}}}, sort_keys=False).encode()
+        doss_unb = yaml.safe_dump({"inputs": {"parameter:eff": {
+            "observations": [dict(base_obs, where="https://fixture.local/api/slice/IND1")]}}}, sort_keys=False).encode()
+        doss_ok = yaml.safe_dump({"inputs": {"parameter:eff": {
+            "observations": [dict(base_obs, acquired={
+                "id": fid_qt, "sha256": sha_qt, "locator": "p1",
+                "quote": "Trial result showed efficacy 0.65 (95% CI 0.50-0.78)"})]}}}, sort_keys=False).encode()
+        f_bad = ED.quote_findings({}, d_qt, doss_bad_q)
+        f_unb = ED.quote_findings({}, d_qt, doss_unb)
+        f_ok = ED.quote_findings({}, d_qt, doss_ok)
+        ok(len(f_bad) == 1 and f_bad[0]["kind"] == "observation_quote_not_found" and f_bad[0]["severity"] == "HIGH"
+           and f_bad[0]["scope_declarable"] is False
+           and len(f_unb) == 1 and f_unb[0]["kind"] == "observation_acquired_unbound" and f_unb[0]["severity"] == "HIGH"
+           and f_unb[0]["scope_declarable"] is False and f_ok == [],
+           f"T_ACQ_QUOTE quote mismatch and unbound allowlisted URL are HIGH non-declarable; exact quote passes "
+           f"({f_bad}, {f_unb}, {f_ok})")
+
+        # T_ACQ_DELIVERABLE: deliverable_file.path under acquire/ is refused
+        d_del = os.path.join(td, "t_acq_deliv")
+        os.makedirs(d_del)
+        yaml.safe_dump({"deliverable_file": {"path": "acquire/out.csv", "columns": {"u": "unit"}}},
+                       open(os.path.join(d_del, AB.SPEC_FILE), "w"))
+        dp_probs = deliverable_problems(d_del)
+        ok(bool(dp_probs), f"T_ACQ_DELIVERABLE deliverable path under acquire/ is refused ({dp_probs})")
+
+        # T_ACQ_AMEND: amendment child carries acquired bytes, provenance, record, manifest, metadata fields,
+        # and closed acquisition state (without copying acquire/quarantine/)
+        os.makedirs(os.path.join(d_sg, "acquire", "quarantine"), exist_ok=True)
+        open(os.path.join(d_sg, "acquire", "quarantine", "scratch.part"), "w").write("drop")
+        m_sg_meta = json.load(open(os.path.join(d_sg, "metadata.json")))
+        m_sg_meta.update(acquired_inventory_sha256=promo_sg["inventory_sha256"], allowlist_version=1,
+                         allowlist_sha256=ACQ.load_allowlist(al_p)[1])
+        _write_json(d_sg, "metadata.json", m_sg_meta)
+        child_am = os.path.join(td, "t_acq_amend_child")
+        AM.amend(d_sg, patch={"id": "A_ACQ", "reason": "amend envelope",
+                              "spec": [{"set": "constraints.envelope_usd", "value": 9500}]},
+                 out=child_am, signoff=None, log=lambda *a: None)
+        c_meta = json.load(open(os.path.join(child_am, "metadata.json")))
+        c_st = load_state(child_am)
+        ok(os.path.isfile(os.path.join(child_am, acq_sg_rel))
+           and os.path.isfile(os.path.join(child_am, ACQ.RECORD_REL))
+           and os.path.isfile(os.path.join(child_am, ACQ.MANIFEST_REL))
+           and os.path.isfile(os.path.join(child_am, PROVENANCE))
+           and not os.path.exists(os.path.join(child_am, "acquire", "quarantine"))
+           and c_meta.get("acquire") == "auto"
+           and c_meta.get("acquired_inventory_sha256") == promo_sg["inventory_sha256"]
+           and c_st is not None and (c_st.acquired or {}).get("closed") is True
+           and ACQ.verify_inventory(child_am)["inventory_sha256"] == promo_sg["inventory_sha256"],
+           f"T_ACQ_AMEND amendment child carries acquired bytes, record, manifest, metadata, and closed state "
+           f"(meta_keys={sorted(c_meta)}, closed={(c_st.acquired if c_st else None)})")
 
 
 def main(argv=None) -> int:

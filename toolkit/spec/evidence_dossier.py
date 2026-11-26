@@ -579,6 +579,150 @@ def _blank_value(v) -> bool:
     return _blank(v)
 
 
+def _value_in_quote(val, quote: str) -> bool:
+    """True when observation `val` appears in `quote` (exact text or equivalent numeric representation)."""
+    q = " ".join(str(quote or "").split())
+    if not q:
+        return False
+    s = str(val).strip()
+    if s and s in q:
+        return True
+    if _num(val):
+        fv = float(val)
+        import re as _re
+        for m in _re.finditer(r"[-+]?\d[\d,]*(?:\.\d+)?%?", q):
+            tok = m.group(0)
+            pct = tok.endswith("%")
+            try:
+                num = float(tok.rstrip("%").replace(",", ""))
+            except ValueError:
+                continue
+            if math.isclose(num, fv, rel_tol=1e-4, abs_tol=1e-6):
+                return True
+            if pct and math.isclose(num / 100.0, fv, rel_tol=1e-4, abs_tol=1e-6):
+                return True
+    return False
+
+
+def _acquired_context(run_dir: str | None, memo: dict) -> dict:
+    key = ("_acq_ctx", run_dir)
+    if key in memo:
+        return memo[key]
+    ctx: dict = {"manifest": None, "by_id": {}, "manifest_hosts": set(), "manifest_sources": set(), "allow_hosts": set()}
+    if run_dir:
+        try:
+            from agents import acquire as ACQ
+            man, _ = ACQ.read_manifest(run_dir)
+            if isinstance(man, dict):
+                ctx["manifest"] = man
+                import urllib.parse as _up
+                for path, entry in (man.get("files") or {}).items():
+                    if not isinstance(entry, dict):
+                        continue
+                    fid = str(entry.get("fetch_id") or "")
+                    if fid:
+                        ctx["by_id"][fid] = (path, entry)
+                    url = str(entry.get("url") or "")
+                    host = (_up.urlsplit(url).hostname or "").lower()
+                    if host:
+                        ctx["manifest_hosts"].add(host)
+                    sid = str(entry.get("source_id") or "").lower()
+                    if sid:
+                        ctx["manifest_sources"].add(sid)
+                ctx["allow_hosts"] = ACQ.allowlisted_hosts()
+        except Exception:  # noqa: BLE001
+            pass
+    memo[key] = ctx
+    return ctx
+
+
+def _acquired_obs_problems(key: str, j: int, o: dict, run_dir: str | None, memo: dict) -> list[str]:
+    """Enforce §5 quoted-span verification for observations citing acquired files or allowlisted sources."""
+    ctx = _acquired_context(run_dir, memo)
+    acq = o.get("acquired")
+    if acq is not None:
+        if not isinstance(acq, dict):
+            return [f"observation_quote_not_found: entry {key} observations[{j}].acquired must be a mapping"]
+        for req_f in ("id", "sha256", "locator", "quote"):
+            if not _text(acq.get(req_f)):
+                return [f"observation_quote_not_found: entry {key} observations[{j}].acquired.{req_f} is blank"]
+        quote = str(acq["quote"]).strip()
+        if len(quote) > 300:
+            return [f"observation_quote_not_found: entry {key} observations[{j}].acquired.quote exceeds 300 chars"]
+        hit = ctx["by_id"].get(str(acq["id"]).strip())
+        if hit is None:
+            return [f"observation_quote_not_found: entry {key} observations[{j}]: acquired id {acq['id']!r} not in manifest"]
+        rel_path, entry = hit
+        if str(entry.get("sha256") or "") != str(acq["sha256"]).strip():
+            return [f"observation_quote_not_found: entry {key} observations[{j}]: acquired sha256 does not match manifest"]
+        try:
+            from agents import acquire as ACQ
+            from lib.safe_io import read_nofollow
+            raw_b, _ = read_nofollow(run_dir, rel_path)
+            if hashlib.sha256(raw_b).hexdigest() != str(acq["sha256"]).strip():
+                return [f"observation_quote_not_found: entry {key} observations[{j}]: file sha256 mismatch"]
+            plain = ACQ.extract_plain_text(raw_b, str(entry.get("content_type") or "text/plain"))
+        except Exception as e:  # noqa: BLE001
+            return [f"observation_quote_not_found: entry {key} observations[{j}]: unreadable acquired file ({e})"]
+        if " ".join(quote.split()) not in " ".join(plain.split()):
+            return [f"observation_quote_not_found: entry {key} observations[{j}]: quote not found in {rel_path}"]
+        if not _value_in_quote(o.get("value"), quote):
+            return [f"observation_quote_not_found: entry {key} observations[{j}]: value {o.get('value')!r} does not appear in quote"]
+        return []
+    # No `acquired` block: check if `where` cites an acquired path or an allowlisted/manifest host while the manifest holds files
+    if not ctx["by_id"]:
+        return []
+    import re as _re
+    import urllib.parse as _up
+    where_s = str(o.get("where") or "")
+    where_l = where_s.lower()
+    if "data/inputs/acquired/" in where_l:
+        return [f"observation_acquired_unbound: entry {key} observations[{j}]: cites acquired path without `acquired` block"]
+    for url_m in _re.findall(r"https?://[^\s,;)>\"]+", where_s):
+        host = (_up.urlsplit(url_m).hostname or "").lower()
+        if host and (host in ctx["manifest_hosts"] or host in ctx["allow_hosts"]):
+            return [f"observation_acquired_unbound: entry {key} observations[{j}]: `where` names allowlisted host {host} without `acquired` block"]
+    if _re.search(r"\b(?:table|figure|fig\.|section|abstract)\s*\d*", where_l):
+        if any(s in where_l or s in str(o.get("source") or "").lower() for s in ctx["manifest_sources"]):
+            return [f"observation_acquired_unbound: entry {key} observations[{j}]: cites acquired source table/section without `acquired` block"]
+    return []
+
+
+def quote_findings(raw: dict, run_dir: str | None, data: bytes | None) -> list[dict]:
+    """Return HIGH non-declarable findings for any acquired-quote violation in the evidence dossier (§5, T_ACQ_QUOTE)."""
+    import yaml
+    if data is None or not run_dir:
+        return []
+    try:
+        doc = yaml.safe_load(data.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError):
+        return []
+    ins = doc.get("inputs") if isinstance(doc, dict) else None
+    if not isinstance(ins, dict):
+        return []
+    memo: dict = {}
+    out: list[dict] = []
+    for k in sorted(ins):
+        e = ins[k]
+        if not isinstance(e, dict) or not isinstance(e.get("observations"), list):
+            continue
+        for j, o in enumerate(e["observations"]):
+            if not isinstance(o, dict):
+                continue
+            for p in _acquired_obs_problems(k, j, o, run_dir, memo):
+                kind = p.split(":", 1)[0].strip()
+                out.append({
+                    "kind": kind,
+                    "severity": "HIGH",
+                    "stage": "EVIDENCE",
+                    "target_stage": "PLAN",
+                    "key": f"{k}[{j}]",
+                    "scope_declarable": False,
+                    "claim": p,
+                })
+    return out
+
+
 def _entry_problems(key: str, e, r: dict, run: dict, run_dir: str | None, memo: dict) -> list[str]:
     """Coverage and validity only (#218 review round 5): a complete, sourced, non-blank entry, and for a range a
     decision test the run executes. What the entry says against what execution uses is advice on the sheet."""
@@ -603,6 +747,7 @@ def _entry_problems(key: str, e, r: dict, run: dict, run_dir: str | None, memo: 
                     for f in ("source", "where", "sampling_frame") if not _text(o.get(f))]
             bad += [f"entry {key}: observations[{j}].{f} is blank" for f in ("year", "sites", "n", "value")
                     if f not in o or _blank_value(o[f])]
+            bad += _acquired_obs_problems(key, j, o, run_dir, memo)
         if not _text(e.get("comparison")):
             bad.append(f"entry {key}: comparison is blank (how the observations compare with the model value)")
     if has_nd:
