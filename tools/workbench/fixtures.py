@@ -172,7 +172,7 @@ REACHED = {"launch": 1, "sign-off": 4, "calibration": 5, "analysis": 6, "final":
 POINT, STAB, VOI, PV, BV, EMU, EMB = (f"analysis/{n}.yaml" for n in (
     "point", "stability", "value_of_information", "plan_variants", "burden_validation", "emulator", "emulator_boundary"))
 BURDEN_CSV, TESTS_DIR = "data/derived/burden_references.csv", "models/decision_tests/"
-KINDS = ("package_per_unit", "estimates")              # toolkit/spec/schema.py DELIVERABLE_KINDS
+KINDS = ("package_per_unit", "estimates", "cost_effectiveness")   # toolkit/spec/schema.py DELIVERABLE_KINDS
 OUTCOME, HEADLINE, TIER = "outcome", "total_outcome_averted", "tier"
 PRICE = {"A": 1.0, "B": 2.0, "C": 3.0}                 # per person; B and C are the two options of one group, C the dearer
 ENVELOPE, RESERVE_SHARE, ALLOWANCE, DRAWS = 100000.0, 0.95, 0.1, 500

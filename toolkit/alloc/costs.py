@@ -269,10 +269,12 @@ def _factor(it: dict, prices: dict) -> float:
 
 
 def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outcome=None, pk=None,
-              floors: list | None = None) -> float:
+              floors: list | None = None, *, floor: bool = True) -> float:
     """One item's cost for one unit over the window, in base-year prices. A per_outcome item
-    needs the package and `outcome(unit, package) -> {name: value}` (the run's model). An
-    incremental increment below zero is floored, and recorded in `floors` when given."""
+    needs the package and `outcome(unit, package) -> {name: value}` (the run's model). When
+    `floor=True` (the budget/allocation default), an incremental increment below zero is floored
+    at zero and recorded in `floors`; when `floor=False` (cost-effectiveness offsets), negative
+    increments are preserved as savings."""
     comps, pops = spec["components"], spec["units"]["populations"]
     cd = comps[it["component"]] or {}
     basis = it["basis"]
@@ -292,10 +294,13 @@ def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outc
             b = _num(outcome(unit, base).get(it["outcome"]))
             if b is None:
                 raise ValueError(f"outcome {it['outcome']} for package {base} is not a number")
-            if v - b < 0 and floors is not None:
-                floors.append({"unit": str(unit.get(spec["units"]["id"])), "package": package, "item": it["id"],
-                               "increment": v - b})
-            v = max(v - b, 0.0)
+            if floor:
+                if v - b < 0 and floors is not None:
+                    floors.append({"unit": str(unit.get(spec["units"]["id"])), "package": package, "item": it["id"],
+                                   "increment": v - b})
+                v = max(v - b, 0.0)
+            else:
+                v = v - b
         q = v
     elif basis in PER_UNIT:
         q = 1.0
@@ -310,10 +315,11 @@ def item_cost(it: dict, unit: dict, spec: dict, package: str | None = None, outc
             * float(it.get("times", 1.0)) * float(it.get("years", 1.0)))
 
 
-def cost_matrix(spec: dict, units: list[dict], outcome=None, floors: list | None = None) -> dict:
+def cost_matrix(spec: dict, units: list[dict], outcome=None, floors: list | None = None,
+                *, floor: bool = True) -> dict:
     """{unit_id: {package: {"total": $, "items": {item_id: $}}}} in base-year prices.
     `outcome(unit_row, package) -> {name: value}` supplies model outputs for per_outcome items;
-    `floors`, a list, receives each incremental per_outcome cost floored at zero."""
+    `floors`, a list, receives each incremental per_outcome cost floored at zero when `floor=True`."""
     errs = validate(spec, set(units[0]) if units else None)
     if errs:
         raise ValueError("invalid cost spec: " + "; ".join(errs))
@@ -339,7 +345,7 @@ def cost_matrix(spec: dict, units: list[dict], outcome=None, floors: list | None
                      if it["component"] in cs}
             for it in out_items:
                 if it["component"] in cs:
-                    items[it["id"]] = item_cost(it, u, spec, name, cached, pk, floors)
+                    items[it["id"]] = item_cost(it, u, spec, name, cached, pk, floors, floor=floor)
             row[name] = {"total": sum(items.values()), "items": items}
         out[str(u[uid])] = row
     return out
@@ -575,6 +581,10 @@ def _self_test_structure(ok, spec, units, po, treated) -> None:
         fl2: list = []
         cost_matrix(po, units, outcome=treated, floors=fl2)
         ok(floor_report(fl2).get("n_unit_packages") == 0, "TC34 no floor applied: a count of zero")
+        fl3: list = []
+        munf = cost_matrix(po, units, outcome=neg, floors=fl3, floor=False)
+        ok(munf["u0"]["c1+c2"]["items"]["c2_per_case"] < 0.0 and fl3 == [],
+           f"TC35 floor=False preserves negative incremental savings for cost-effectiveness ({munf['u0']['c1+c2']['items']['c2_per_case']})")
     except Exception as e:   # noqa: BLE001
         ok(False, f"TC33 floored increments are reported: {e!r}")
 
