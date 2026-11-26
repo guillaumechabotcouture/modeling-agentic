@@ -56,7 +56,7 @@ docs/design/v2-spec-and-analysis.md §1):
                                            # supports_delivery (toolkit/engines/horizon.py)
       discounting: none | {rate: 0.03, base_year: 2024}
     constraints:
-      envelope_usd: 1.0e6
+      envelope_usd: 1000000                # plain number (in YAML 1.1 write 1000000 or 1.0e+6, not 1.0e6)
       fixed_costs_usd: {name: amount}      # spent outside the allocation
       eligibility: {c2: {column: elig}}    # toolkit/alloc packages.py rules
       caps: {c2: {max_units: 10}}
@@ -1411,12 +1411,15 @@ def _validate(s: Spec) -> list[str]:
         if bad:
             return bad
     a = s.alloc_spec()
-    bad += [f"options: {e}" for e in acosts.validate(a, cols)]
-    bad += [f"constraints: {e}" for e in apackages.validate(a, units)]
+    struct_bad = [f"options: {e}" for e in acosts.validate(a, cols)]
+    struct_bad += [f"constraints: {e}" for e in apackages.validate(a, units)]
+    bad += struct_bad
     c = r.get("constraints") or {}
     if not CEA.is_cea(r):
         if not _isnum(c.get("envelope_usd")):
-            bad.append("constraints.envelope_usd: a number")
+            raw_env = c.get("envelope_usd")
+            hint = " (YAML 1.1 parses '1.0e6' as a string; write an integer or '1.0e+6')" if isinstance(raw_env, str) else ""
+            bad.append(f"constraints.envelope_usd: a number{hint}")
         elif s.budget() <= 0:
             bad.append("constraints: envelope_usd must exceed the fixed costs")
         if "envelope_exact" in c and not isinstance(c.get("envelope_exact"), bool):
@@ -1424,7 +1427,7 @@ def _validate(s: Spec) -> list[str]:
     for g in c.get("group_rules") or []:
         if not isinstance(g, dict) or not g.get("id"):
             bad.append("constraints.group_rules: each rule needs an id")
-    if bad:
+    if struct_bad or any(not isinstance(g, dict) for g in c.get("group_rules") or []):
         return bad
     try:
         apackages.feasibility(a, units)

@@ -419,10 +419,19 @@ def validate_build(build: Mapping) -> list[str]:
                 bad.append(f"engine.build.request.decision_inputs.{cname}: must be a non-empty list or "
                            "{{inputs, none_reason}}")
                 continue
+            from toolkit.engines import decision_inputs as DI
             for j, item in enumerate(items):
                 if not isinstance(item, Mapping):
                     bad.append(f"engine.build.request.decision_inputs.{cname}[{j}]: must be a mapping")
                     continue
+                extra_di = sorted(str(k) for k in item if k not in DI.INPUT_FIELDS)
+                if extra_di:
+                    bad.append(
+                        f"engine.build.request.decision_inputs.{cname}[{j}]: unknown field(s) {extra_di} "
+                        f"(allowed: {list(DI.INPUT_FIELDS)}; quote text values containing commas in YAML flow mappings)"
+                    )
+                if "if_on_card" in item and not isinstance(item["if_on_card"], bool):
+                    bad.append(f"engine.build.request.decision_inputs.{cname}[{j}].if_on_card: true or false")
                 ik, iname, iwhy = item.get("kind"), item.get("name"), item.get("why")
                 if not isinstance(ik, str) or ik not in ("parameter", "unit_attribute"):
                     bad.append(f"engine.build.request.decision_inputs.{cname}[{j}].kind {ik!r}: parameter or unit_attribute")
@@ -1188,6 +1197,10 @@ def _self_test() -> int:
         r_res = copy.deepcopy(spec_raw)
         r_res["engine"]["build"]["request"]["configs"] = {"default": {"run_dir": "/tmp"}}
         e_res = schema.validate(schema.Spec(r_res, d), pending_ok=True)
+        # Unknown field in decision_inputs (e.g. unquoted comma in YAML flow mapping) caught at validate_build
+        r_di = copy.deepcopy(spec_raw)
+        r_di["engine"]["build"]["request"]["decision_inputs"]["comp_a"][0]["stray_key"] = None
+        e_di = schema.validate(schema.Spec(r_di, d), pending_ok=True)
         # Plain build with engine_choice.json naming unrelated registered engine is refused
         ch_path = os.path.join(d, schema.ENGINE_CHOICE)
         json.dump({"engine": {"ref": "toolkit.engines.contract:ToyEngine"}}, open(ch_path, "w"))
@@ -1201,10 +1214,11 @@ def _self_test() -> int:
         ok(e_ok == [] and any("integer" in x for x in e_int) and bool(e_miss)
            and any("published" in x for x in e_trial)
            and any("oracle" in x for x in e_red) and any("undeclared output" in x for x in e_red)
-           and bool(e_dir) and any("reserved" in x for x in e_res) and plain_choice_refused,
+           and bool(e_dir) and any("reserved" in x for x in e_res)
+           and any("unknown field" in x and "stray_key" in x for x in e_di) and plain_choice_refused,
            f"BE24 build spec validates via RequestedEngine and refuses bad int unit attr, missing component, bad trial, "
-           f"bad reduction, direct BuiltEngine ref, reserved config, and stale choice "
-           f"(ok={e_ok}, int={e_int[:1]}, miss={e_miss[:1]}, trial={e_trial[:1]}, red={e_red[:2]}, dir={e_dir[:1]}, res={e_res[:1]})")
+           f"bad reduction, direct BuiltEngine ref, reserved config, unknown decision_inputs field, and stale choice "
+           f"(ok={e_ok}, int={e_int[:1]}, miss={e_miss[:1]}, trial={e_trial[:1]}, red={e_red[:2]}, dir={e_dir[:1]}, res={e_res[:1]}, di={e_di[:1]})")
 
     # Starsim 3.3.2 spike (§3.2): harness can attach an ss.Analyzer to an unrun ss.Sim via s.pars.analyzers and set rand_seed
     try:
