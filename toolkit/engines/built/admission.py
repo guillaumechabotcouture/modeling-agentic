@@ -266,6 +266,10 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
     ea = (du or {}).get("engine_attributes") if isinstance(du, Mapping) else {}
     ea = ea if isinstance(ea, Mapping) else {}
     ab = req.get("attribute_binding") or {}
+    cal = spec_raw.get("calibration") if isinstance(spec_raw, Mapping) else {}
+    cal_attr = str(cal.get("attribute") or "").strip() if isinstance(cal, Mapping) else ""
+    cal_scale = str(cal.get("scale") or "linear") if isinstance(cal, Mapping) else "linear"
+    cal_range = cal.get("range") if isinstance(cal, Mapping) else None
 
     def _coerce_attr(raw_val, aspec: Mapping):
         at = aspec.get("type")
@@ -318,6 +322,18 @@ def _real_units_and_packages(spec_raw: Mapping, req: Mapping, *, base_dir: str |
                 val = _coerce_attr(row[aname], aspec)
             elif isinstance(ab.get(aname), Mapping) and "default" in ab[aname]:
                 val = copy.deepcopy(ab[aname]["default"])
+            elif cal_attr and aname == cal_attr:
+                # Calibrated per-unit attribute: calibration supplies per-unit values rather than a column binding.
+                rng = aspec.get("range") if "range" in aspec else aspec.get("test_range")
+                if isinstance(cal_range, (list, tuple)) and len(cal_range) == 2:
+                    mid = 0.5 * (float(cal_range[0]) + float(cal_range[1]))
+                    val = math.exp(mid) if cal_scale == "log" else mid
+                elif isinstance(rng, (list, tuple)) and len(rng) == 2:
+                    val = 0.5 * (float(rng[0]) + float(rng[1]))
+                else:
+                    raise ValueError(f"real unit {uid!r}: calibrated attribute {aname!r} has no declared range")
+                if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                    val = max(float(rng[0]), min(float(rng[1]), float(val)))
             else:
                 raise ValueError(f"real unit {uid!r}: missing required attribute {aname!r} (no binding or default)")
             attrs[aname] = val
@@ -2304,6 +2320,35 @@ def _self_test() -> int:
     ok(not close_empty and h_warm.start == 2010.0 and h_warm.stop == 2035.0 and h_warm.window == (2025.0, 2030.0)
        and len(pkgs_30) == 16 and not both_active and a9_miss["status"] == "fail" and nr_ok,
        "BE_REG1 outcomes key parity, warm-up horizon, 30-bool/group packages, A9 missing gating, and non-overfit unavailable A11")
+
+    # BE_CAL_ATTR1: _real_units_and_packages supplies interior midpoint for calibration.attribute (log & linear)
+    # without requiring a column binding, while still refusing unbound non-calibrated required attributes
+    req_cal = {
+        "components": {"c": {"values": [0, 1], "absent": 0}},
+        "unit_attributes": {
+            "rate": {"type": "continuous", "range": [0.001, 0.5]},
+            "base": {"type": "continuous", "range": [0.0, 1.0]},
+        },
+        "attribute_binding": {"rate": "required", "base": "required"},
+    }
+    sp_cal_log = {
+        "decision_units": {"id": "id", "units_inline": [{"id": "u1", "base": 0.1}],
+                           "engine_attributes": {"base": {"column": "base"}}},
+        "calibration": {"method": "posterior", "attribute": "rate", "scale": "log", "range": [-6.0, -2.0]},
+    }
+    u_log, _ = _real_units_and_packages(sp_cal_log, req_cal, rng=np.random.default_rng(1))
+    sp_cal_lin = copy.deepcopy(sp_cal_log)
+    sp_cal_lin["calibration"] = {"method": "posterior", "attribute": "rate", "scale": "linear", "range": [0.1, 0.3]}
+    u_lin, _ = _real_units_and_packages(sp_cal_lin, req_cal, rng=np.random.default_rng(1))
+    sp_unb = {"decision_units": sp_cal_log["decision_units"]}
+    unb_refused = False
+    try:
+        _real_units_and_packages(sp_unb, req_cal, rng=np.random.default_rng(1))
+    except ValueError:
+        unb_refused = True
+    ok(len(u_log) == 1 and abs(u_log[0].attributes["rate"] - math.exp(-4.0)) < 1e-12
+       and len(u_lin) == 1 and abs(u_lin[0].attributes["rate"] - 0.2) < 1e-12 and unb_refused,
+       f"BE_CAL_ATTR1 calibrated per-unit attribute gets prior midpoint in A1 real units while unbound non-calibrated fails")
 
     if fails:
         print(f"FAILED: {len(fails)} case(s)")

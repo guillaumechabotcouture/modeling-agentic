@@ -102,7 +102,11 @@ following `toolkit/engines/built/requested.py`. Built engines implement `describ
 (or `susceptible`) in `request.outputs.per_capita` so the harness reads per-group shares from `Outcomes.per_capita`.
 Under `engine.build`, every active component value used by `options.engine_map` must be covered by a
 `request.trials` entry (or an explicit `engine_departures` entry with a decision test) for admission check A8.
-Quote ISO `decision_date` values (e.g. `"2026-01-01"`) or write an integer year. The harness has copied the question's input files into data/inputs/ (same
+In `engine.build.mechanisms`, state unambiguously what each declared `outputs.per_capita` output equals on
+every declared `age_groups` entry and how `horizon.window` length (`stop - start`) is applied, so an
+independent A11 reference implementation agrees on every `(output, age_group)` cell. In
+`request.expected_effects`, declare `nonzero` rather than `+`/`-` whenever an output can be non-monotone
+across an input's declared domain. Quote ISO `decision_date` values (e.g. `"2026-01-01"`) or write an integer year. The harness has copied the question's input files into data/inputs/ (same
 relative paths; their sha256 in data/inputs_provenance.json): read them. You write code, never
 tables. For each file the spec reads that is not a staged input (the units table, calibration
 targets, cost tables), write one script under data/derive/ and declare it in data/derivations.yaml
@@ -184,18 +188,32 @@ needs, validated benchmarks). Output: {out} = {{"engine": "<ref>", "why": "..."}
 Task: build the agent-built engine `{engine_id}` into `{work_dir}` from the signed request in {out_in}
 and `engine_build/request.json`. You have no shell; use `mcp__engine__try` (runs static checks S1-S4
 and public cases of checks A1-A8) and `mcp__engine__run` (one sandboxed evaluation within request domains)
-to test your working copy (shared 30-call cap). Write ONLY inside `{work_dir}`:
+to test your working copy (shared 30-call cap). You may read `{repo}/toolkit/engines/contract.py` (always
+use that full repo path, not a relative path inside the run directory). Write ONLY inside `{work_dir}`:
 - `engine.py` defining `class Model` implementing the signed contract (and optional sibling `.py` helpers)
 - `card.yaml` matching `describe()` with `benchmarks: []`, `assumptions`, and `limitations`
 - `ENGINE_NOTES.md` documenting equations, assumptions, and limitations in plain language
+Contract (`from toolkit.engines.contract import EngineCard, ParamSpec, Outcomes`):
+- `EngineCard(name, version, mechanisms, components, unit_attributes, outputs, age_groups, valid_ranges, fitted={{}}, benchmarks=[], notes=[])`
+- `ParamSpec(name=..., value=..., kind=..., units=..., lo=..., hi=..., source=...)` (use keyword args)
+- `Outcomes(per_capita={{out: {{age: float}}}}, windows={{win: {{metric: float}}}}, cost_drivers={{drv: float}}, meta={{}})`
+- Required `Model` methods: `describe(self) -> EngineCard`, `parameters(self) -> list[ParamSpec]`, plus:
+  - for `kind: closed_form`: `evaluate(self, params, unit, package, horizon) -> Outcomes` (called by the
+    sandboxed worker with resolved `params` mapping, `UnitSpec(id, attributes)`, `Package(id, components)`,
+    and `Horizon(start, stop, window, windows)`; note `horizon.window = (t0, t1)` may be calendar or relative
+    years, so use duration `t1 - t0` rather than assuming `t0 == 0`).
+  - for `kind: starsim_module`: `state_vars(self) -> dict`, `build_sim(self, params, unit, package, horizon) -> sim`,
+    and `read_outcomes(self, sim, unit, package, horizon) -> Outcomes`.
 Rules:
 - The engine carries trial effects over to the setting (principle 3); its own burden is a validation
   check, not the basis of the decision.
 - It must declare and use EXACTLY the parameters the signed request names (name, kind, value, lo, hi,
   units, source). Every non-inert input must move its declared `expected_effects` outputs with the
   declared sign inside the dynamics (never via post-hoc formulas or tiny epsilon terms).
-- Obey the import and AST allowlist in {out_in} (no file/process/network/interpreter access, no
-  `scipy.integrate`, no undeclared literal tables > 16 numbers).
+- Obey static checks S1-S4 in {out_in}: module top level may contain ONLY imports, simple constant
+  assignments, `def`, and `class` (NO module-level `try/except`, `if`, `for`, or bare expression calls);
+  no dynamic `getattr(obj, var_name)` with non-literal attribute names; no file/process/network/interpreter
+  access; no `scipy.integrate`; no single literal container > 16 numbers.
 - Never attempt to read `engine_build/.hidden/`, `engine_build/reference/`, `analysis/`, or any other run.
 When `mcp__engine__try(checks="all")` passes cleanly, write {out} = {{"ok": true, "notes": "<summary>"}} and stop.""",
     "build_reference": COMMON + """
@@ -204,14 +222,23 @@ Task: build an independent reference oracle for agent-built engine `{engine_id}`
 `engine_build/reference/reference.py` from the signed request in {out_in} and `engine_build/request.json`
 (plus `evidence_dossier.yaml` if present). You work ONLY from the request and dossier — you cannot read
 the candidate working copy (`models/ext/engine_*`) or its snapshots, and you have no shell or MCP tools.
+You may read `{repo}/toolkit/engines/contract.py` (use that full repo path, not a relative path).
 Write ONLY `engine_build/reference/reference.py`:
-- Define `class Model` implementing `describe() -> EngineCard`, `parameters() -> list[ParamSpec]`, and
-  `evaluate(params, unit, package, horizon) -> Outcomes` matching the exact signed request schema.
+- Import `from toolkit.engines.contract import EngineCard, ParamSpec, Outcomes` directly at top level
+  (the sandbox always provides `toolkit.engines.contract`; NEVER wrap imports in module-level `try/except`).
+- Define `class Model` implementing `describe(self) -> EngineCard`, `parameters(self) -> list[ParamSpec]`, and
+  `evaluate(self, params, unit, package, horizon) -> Outcomes` matching the exact signed request schema
+  (`EngineCard` requires `name, version, mechanisms, components, unit_attributes, outputs, age_groups, valid_ranges`;
+  `ParamSpec(name=..., value=..., kind=..., units=..., lo=..., hi=..., source=...)`; `unit.attributes`,
+  `package.components`, `horizon.window = (t0, t1)` where duration is `t1 - t0` whether calendar or relative years).
 - You may use plain loops, `numpy`, `math`, `scipy.special`, `scipy.stats`, and `scipy.integrate`
   (this reference is a test oracle for admission check A11, never exposed to the analysis).
+- Obey static checks S1-S4 strictly: module top level may contain ONLY imports, simple constant assignments,
+  `def`, and `class` (NO module-level `try/except`, `if`, `for`, or bare expression calls — put helper calls
+  inside functions/methods); no dynamic `getattr(obj, var_name)`; no file/process/network/interpreter access;
+  no single literal container > 16 numbers.
 - Follow every signed mechanism, parameter, unit attribute, compartment rule, reduction, and output
-  independently from first principles (no file/process/network/interpreter access, no undeclared lookup
-  tables > 16 numbers).
+  independently from first principles.
 When `engine_build/reference/reference.py` is complete, write {out} = {{"ok": true, "notes": "<summary>"}} and stop.""",
     "critique_engine": COMMON + """
 
@@ -1204,7 +1231,7 @@ class SdkTasks:
             )
         return self._session(
             "build_engine",
-            PROMPTS["build_engine"].format(engine_id=engine_id, work_dir=work_rel, out_in=inp, out=OUT),
+            PROMPTS["build_engine"].format(engine_id=engine_id, work_dir=work_rel, repo=_REPO, out_in=inp, out=OUT),
             msg,
             (work_rel,),
             enforcement.MODEL_DEEP,
@@ -1225,7 +1252,7 @@ class SdkTasks:
             )
         return self._session(
             "build_reference",
-            PROMPTS["build_reference"].format(engine_id=engine_id, out_in=inp, out=OUT),
+            PROMPTS["build_reference"].format(engine_id=engine_id, repo=_REPO, out_in=inp, out=OUT),
             msg,
             OWNS["build_reference"],
             enforcement.MODEL_DEEP,

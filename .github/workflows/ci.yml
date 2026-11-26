@@ -41,6 +41,8 @@ jobs:
       # agents get the venv interpreter first on PATH.
       - name: Install
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
           python -m venv .venv
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
@@ -56,6 +58,7 @@ jobs:
         env:
           OPENBLAS_NUM_THREADS: "2"
           OMP_NUM_THREADS: "2"
+          MA_REQUIRE_SANDBOX: "1"
 
   checks:
     runs-on: ubuntu-latest
@@ -77,6 +80,8 @@ jobs:
       # agents get the venv interpreter first on PATH.
       - name: Install
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
           python -m venv .venv
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
